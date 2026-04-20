@@ -15,7 +15,7 @@
 
 use core::ptr::addr_of_mut;
 
-use crate::{guest_mem, kprintln};
+use crate::{guest_mem, kprintln, peripherals};
 
 // VMSAv8-64 stage-2 descriptor bits
 const DESC_VALID: u64 = 1 << 0;
@@ -111,7 +111,7 @@ pub unsafe fn init() {
 
     // Flash (internal store): 8 MiB R/W at guest PA 0x0200_0000. Persistent
     // across guest reboots within a single hypervisor lifetime.
-    let flash_pa = guest_mem::flash_host_pa();
+    let flash_pa = peripherals::flash::host_pa();
     // SAFETY: helper bounds-checks.
     unsafe {
         set_l2_blocks(

@@ -1,0 +1,8 @@
+//! Ports of Einstein's Newton peripheral state machines into Rust.
+//!
+//! Each submodule owns the backing storage and observable behaviour of
+//! one Newton peripheral. The module layout mirrors the Einstein class
+//! names so cross-referencing `docs/peripherals.md` and
+//! `Emulator/T*.cpp` stays straightforward.
+
+pub mod flash;

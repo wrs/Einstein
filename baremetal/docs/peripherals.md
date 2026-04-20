@@ -27,20 +27,23 @@ Semantics that matter:
 - **Word order is big-endian inside the backing store**; `TFlash::Read`
   does `UByteSex_FromBigEndian` on the raw word. Byte reads select the
   matching byte within the big-endian word (`TFlash.cpp:269-279`).
-- **Write supports a bit mask** (`TFlash::Write`): only bytes where
-  `mask` is set come from the new word; bits outside the mask preserve
-  their prior value. `mask = 0xFFFFFFFF` is a full-word write.
+- **Write takes a bit mask** (`TFlash::Write`): `*word = (existing & ~mask)
+  | new_word`. Bits where `mask` is set come from the new word; bits
+  outside the mask preserve their prior value. `mask = 0xFFFFFFFF` is
+  a full-word write.
 - **Erase is straight `0xFFFFFFFF` fill** of `block_size` bytes starting
   at `offset` within the selected bank.
 - **First-boot seeding.** When the backing file is new (detected via
   `mFlashFile.GetCreated()`), `TFlash`'s constructor writes a Newton
-  filesystem header to both banks (`TFlash.cpp:137-172`):
+  filesystem header at the start of block 0 (bank-0 offset 0) and
+  duplicates it at the start of block 1 (bank-0 offset 0x10000). Bank 1
+  is left zeroed. See `TFlash.cpp:137-172`:
   - offset `0x00`: `0x444C4453` ("DLDS")
   - offset `0x04`: `0x4F534344` ("OSCD")
   - offset `0x08`: `0x0000010C` (block-size or block-1 offset)
   - offset `0x50`: `0x444C4453` (second "DLDS")
   - offset `0x54`: `0xD7ECCC66` (checksum)
-  - offset `0x58`: `0xFFFFFFFC` (bank 0) / `0xFFFFFFF0` (bank 1)
+  - offset `0x58`: `0xFFFFFFFC` (block 0) / `0xFFFFFFF0` (block 1)
   - offset `0x8C`: `0xFFFFFFFF` (calibration-valid flag)
   - a few calibration words at `0x24` / `0x34` / `0x3C` and a zero
     "manufacture date" at `0x40`.
@@ -50,8 +53,9 @@ Semantics that matter:
   explicitly written.
 
 The hypervisor backs flash as stage-2 RW over raw memory; there's no
-trap path required for plain R/W. We do need to run the Einstein
-header-seed on fresh boots.
+trap path required for plain R/W. We run the Einstein header seed on
+every boot (our flash isn't yet persisted across hypervisor runs; once
+it is, only a fresh backing should seed — see `peripherals/flash.rs`).
 
 ## Interrupt controller (VIC)
 

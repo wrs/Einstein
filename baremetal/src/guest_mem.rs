@@ -17,7 +17,6 @@ use crate::kprintln;
 // block-descriptor mapping strategy.
 pub const ROM_SIZE: usize = 16 * 1024 * 1024;
 pub const RAM_SIZE: usize = 4 * 1024 * 1024;
-pub const FLASH_SIZE: usize = 8 * 1024 * 1024;       // MP2x00 internal store
 pub const FRAMEBUFFER_SIZE: usize = 2 * 1024 * 1024; // enough for 320x480 several times over
 
 // 2 MiB alignment requirement on the backing stores.
@@ -30,14 +29,10 @@ struct Rom([u8; ROM_SIZE]);
 struct Ram([u8; RAM_SIZE]);
 
 #[repr(C, align(0x200000))]
-struct Flash([u8; FLASH_SIZE]);
-
-#[repr(C, align(0x200000))]
 struct Framebuffer([u8; FRAMEBUFFER_SIZE]);
 
 static mut GUEST_ROM: Rom = Rom([0; ROM_SIZE]);
 static mut GUEST_RAM: Ram = Ram([0; RAM_SIZE]);
-static mut GUEST_FLASH: Flash = Flash([0xFF; FLASH_SIZE]); // erased flash reads as 0xFF
 static mut GUEST_FB: Framebuffer = Framebuffer([0; FRAMEBUFFER_SIZE]);
 
 // Big-endian ROM dump captured from hardware. Each 32-bit word is stored
@@ -60,11 +55,6 @@ pub fn rom_host_pa() -> u64 {
 /// Host physical base of the guest RAM backing store.
 pub fn ram_host_pa() -> u64 {
     addr_of_mut!(GUEST_RAM) as u64
-}
-
-/// Host physical base of the persistent flash backing store.
-pub fn flash_host_pa() -> u64 {
-    addr_of_mut!(GUEST_FLASH) as u64
 }
 
 /// Host physical base of the framebuffer RAM. Guest writes land here;
@@ -289,7 +279,6 @@ fn hex_block(bytes: &[u8]) {
 
 const _: () = assert!(ROM_SIZE % TWO_MIB == 0);
 const _: () = assert!(RAM_SIZE % TWO_MIB == 0);
-const _: () = assert!(FLASH_SIZE % TWO_MIB == 0);
 const _: () = assert!(FRAMEBUFFER_SIZE % TWO_MIB == 0);
 
 /// Copy the embedded ROM into `GUEST_ROM`, byteswapping each 32-bit word to

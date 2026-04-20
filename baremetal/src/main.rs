@@ -10,6 +10,7 @@ mod guest_mem;
 mod mmio;
 mod mmu;
 mod panic;
+mod peripherals;
 mod stage2;
 mod timer;
 mod trap;
@@ -39,6 +40,11 @@ pub extern "C" fn kmain() -> ! {
 
     // SAFETY: load ROM bytes into guest backing store before stage-2 maps it.
     unsafe { guest_mem::load_rom(); }
+
+    // Seed the Newton flash filesystem header before stage-2 exposes
+    // the backing to the guest. Safe because the backing is a static
+    // mut touched only from core 0 during boot.
+    peripherals::flash::init();
 
     // SAFETY: stage-2 tables reference the backing store we just populated.
     unsafe {

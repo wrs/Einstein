@@ -1637,6 +1637,7 @@ T_ROM_INJECTION(0x002F1A48, kROMPatchVoid, kROMPatchVoid, kROMPatchVoid, "DoProt
 }
 #endif
 
+#ifndef NEWTON_PROBE_MAIN
 static void
 clip_callback(int source, void* data)
 {
@@ -1804,6 +1805,7 @@ main(int argc, char** argv)
 	gApp->Run(argc, argv);
 	return 0;
 }
+#endif // !NEWTON_PROBE_MAIN
 
 // ======================================================================= //
 // We build our computer (systems) the way we build our cities: over time,

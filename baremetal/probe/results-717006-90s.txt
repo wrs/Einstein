@@ -1,0 +1,123 @@
+probe: booting ROM for 90 seconds wall-clock...
+probe: MMU came up at PC=0x001E0000
+
+probe: PC=0x00058410  MMU enabled=1  TTB=0x04000000  DACR=0x00055555
+=====> Dumping MMU state
+Primary MMU table at 0x04000000
+VA 0x00000000 to 0x00100000 (1024 kB): large pages
+VA 0x00100000 to 0x01000000 (15360 kB): section
+VA 0x01000000 to 0x01800000 (8192 kB): fault
+VA 0x01800000 to 0x01810000 (64 kB): small pages
+VA 0x01810000 to 0x01900000 (960 kB): page fault
+VA 0x01900000 to 0x01A00000 (1024 kB): fault
+VA 0x01A00000 to 0x01C20000 (2176 kB): small pages
+VA 0x01C20000 to 0x01D80000 (1408 kB): page fault
+VA 0x01D80000 to 0x01DA0000 (128 kB): small pages
+VA 0x01DA0000 to 0x01E00000 (384 kB): page fault
+VA 0x01E00000 to 0x01F00000 (1024 kB): small pages
+VA 0x01F00000 to 0x02200000 (3072 kB): page fault
+VA 0x02200000 to 0x03500000 (19456 kB): fault
+VA 0x03500000 to 0x03D00000 (8192 kB): section
+VA 0x03D00000 to 0x04000000 (3072 kB): fault
+VA 0x04000000 to 0x04100000 (1024 kB): section
+VA 0x04100000 to 0x05000000 (15360 kB): fault
+VA 0x05000000 to 0x05200000 (2048 kB): section
+VA 0x05200000 to 0x0C000000 (112640 kB): fault
+VA 0x0C000000 to 0x0C001000 (4 kB): small pages
+VA 0x0C001000 to 0x0C002000 (4 kB): page fault
+VA 0x0C002000 to 0x0C009000 (28 kB): small pages
+VA 0x0C009000 to 0x0C100000 (988 kB): page fault
+VA 0x0C100000 to 0x0C110000 (64 kB): small pages
+VA 0x0C110000 to 0x0C111000 (4 kB): page fault
+VA 0x0C111000 to 0x0C126000 (84 kB): small pages
+VA 0x0C126000 to 0x0C200000 (872 kB): page fault
+VA 0x0C200000 to 0x0C206000 (24 kB): small pages
+VA 0x0C206000 to 0x0C310000 (1064 kB): page fault
+VA 0x0C310000 to 0x0C311000 (4 kB): small pages
+VA 0x0C311000 to 0x0C318000 (28 kB): page fault
+VA 0x0C318000 to 0x0C319000 (4 kB): small pages
+VA 0x0C319000 to 0x0C320000 (28 kB): page fault
+VA 0x0C320000 to 0x0C321000 (4 kB): small pages
+VA 0x0C321000 to 0x0C328000 (28 kB): page fault
+VA 0x0C328000 to 0x0C329000 (4 kB): small pages
+VA 0x0C329000 to 0x0C400000 (860 kB): page fault
+VA 0x0C400000 to 0x0C600000 (2048 kB): fault
+VA 0x0C600000 to 0x0C66F000 (444 kB): small pages
+VA 0x0C66F000 to 0x0C700000 (580 kB): page fault
+VA 0x0C700000 to 0x0C900000 (2048 kB): fault
+VA 0x0C900000 to 0x0C984000 (528 kB): page fault
+VA 0x0C984000 to 0x0C985000 (4 kB): small pages
+VA 0x0C985000 to 0x0CA6B000 (920 kB): page fault
+VA 0x0CA6B000 to 0x0CA6E000 (12 kB): small pages
+VA 0x0CA6E000 to 0x0CB00000 (584 kB): page fault
+VA 0x0CB00000 to 0x0CC00000 (1024 kB): fault
+VA 0x0CC00000 to 0x0CC79000 (484 kB): page fault
+VA 0x0CC79000 to 0x0CC7B000 (8 kB): small pages
+VA 0x0CC7B000 to 0x0CC81000 (24 kB): page fault
+VA 0x0CC81000 to 0x0CC83000 (8 kB): small pages
+VA 0x0CC83000 to 0x0CC84000 (4 kB): page fault
+VA 0x0CC84000 to 0x0CC88000 (16 kB): small pages
+VA 0x0CC88000 to 0x0CC9B000 (76 kB): page fault
+VA 0x0CC9B000 to 0x0CC9C000 (4 kB): small pages
+VA 0x0CC9C000 to 0x0CCA3000 (28 kB): page fault
+VA 0x0CCA3000 to 0x0CCA4000 (4 kB): small pages
+VA 0x0CCA4000 to 0x0CCAB000 (28 kB): page fault
+VA 0x0CCAB000 to 0x0CCAD000 (8 kB): small pages
+VA 0x0CCAD000 to 0x0CCC3000 (88 kB): page fault
+VA 0x0CCC3000 to 0x0CCC5000 (8 kB): small pages
+VA 0x0CCC5000 to 0x0CCC9000 (16 kB): page fault
+VA 0x0CCC9000 to 0x0CCCD000 (16 kB): small pages
+VA 0x0CCCD000 to 0x0CCD4000 (28 kB): page fault
+VA 0x0CCD4000 to 0x0CCD5000 (4 kB): small pages
+VA 0x0CCD5000 to 0x0CCDD000 (32 kB): page fault
+VA 0x0CCDD000 to 0x0CCDE000 (4 kB): small pages
+VA 0x0CCDE000 to 0x0CCE4000 (24 kB): page fault
+VA 0x0CCE4000 to 0x0CCE6000 (8 kB): small pages
+VA 0x0CCE6000 to 0x0CCED000 (28 kB): page fault
+VA 0x0CCED000 to 0x0CCEF000 (8 kB): small pages
+VA 0x0CCEF000 to 0x0CD07000 (96 kB): page fault
+VA 0x0CD07000 to 0x0CD08000 (4 kB): small pages
+VA 0x0CD08000 to 0x0CD20000 (96 kB): page fault
+VA 0x0CD20000 to 0x0CD21000 (4 kB): small pages
+VA 0x0CD21000 to 0x0CD38000 (92 kB): page fault
+VA 0x0CD38000 to 0x0CD39000 (4 kB): small pages
+VA 0x0CD39000 to 0x0CD58000 (124 kB): page fault
+VA 0x0CD58000 to 0x0CD59000 (4 kB): small pages
+VA 0x0CD59000 to 0x0CD60000 (28 kB): page fault
+VA 0x0CD60000 to 0x0CD63000 (12 kB): small pages
+VA 0x0CD63000 to 0x0CD7A000 (92 kB): page fault
+VA 0x0CD7A000 to 0x0CD7B000 (4 kB): small pages
+VA 0x0CD7B000 to 0x0CD83000 (32 kB): page fault
+VA 0x0CD83000 to 0x0CD84000 (4 kB): small pages
+VA 0x0CD84000 to 0x0CDA2000 (120 kB): page fault
+VA 0x0CDA2000 to 0x0CDA7000 (20 kB): small pages
+VA 0x0CDA7000 to 0x0CDE3000 (240 kB): page fault
+VA 0x0CDE3000 to 0x0CDE7000 (16 kB): small pages
+VA 0x0CDE7000 to 0x0CDFE000 (92 kB): page fault
+VA 0x0CDFE000 to 0x0CDFF000 (4 kB): small pages
+VA 0x0CDFF000 to 0x0CE17000 (96 kB): page fault
+VA 0x0CE17000 to 0x0CE18000 (4 kB): small pages
+VA 0x0CE18000 to 0x0CE30000 (96 kB): page fault
+VA 0x0CE30000 to 0x0CE31000 (4 kB): small pages
+VA 0x0CE31000 to 0x0CE49000 (96 kB): page fault
+VA 0x0CE49000 to 0x0CE4A000 (4 kB): small pages
+VA 0x0CE4A000 to 0x0CE61000 (92 kB): page fault
+VA 0x0CE61000 to 0x0CE63000 (8 kB): small pages
+VA 0x0CE63000 to 0x0CE73000 (64 kB): page fault
+VA 0x0CE73000 to 0x0CE74000 (4 kB): small pages
+VA 0x0CE74000 to 0x0CF00000 (560 kB): page fault
+VA 0x0CF00000 to 0x0D600000 (7168 kB): fault
+VA 0x0D600000 to 0x0D700000 (1024 kB): page fault
+VA 0x0D700000 to 0x0F000000 (25600 kB): fault
+VA 0x0F000000 to 0x30800000 (548864 kB): section
+VA 0x30800000 to 0x34000000 (57344 kB): fault
+VA 0x34000000 to 0x34800000 (8192 kB): section
+VA 0x34800000 to 0x78000000 (1105920 kB): fault
+VA 0x78000000 to 0x80000000 (131072 kB): fine: fault
+VA 0x80000000 to 0x90000000 (262144 kB): fault
+VA 0x90000000 to 0x9C000000 (196608 kB): fine: fault
+VA 0x9C000000 to 0xA0000000 (65536 kB): section
+VA 0xA0000000 to 0xAC000000 (196608 kB): fine: fault
+VA 0xAC000000 to 0xB0000000 (65536 kB): section
+VA 0xB0000000 to 0x00000000 (1310720 kB): fault
+<===== End of MMU state dump

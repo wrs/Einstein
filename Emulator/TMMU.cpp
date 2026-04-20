@@ -1115,10 +1115,33 @@ TMMU::FDump(FILE* f)
 					last = ((i + 1) << 20);
 					addBlock(f, first, last, 2, "section");
 					break;
-				case 3: // Reserved
-					first = (i << 20);
-					last = ((i + 1) << 20);
-					addBlock(f, first, last, 2, "RESERVED");
+				case 3: // Fine page table (ARMv4/v5 VMSAv4 only).
+					// L1 descriptor bits [1:0] = 0b11 encodes a fine second-level
+					// table containing 1024 entries covering 4 KiB each; tiny
+					// pages live only here. This is removed from ARMv7+ short
+					// descriptors, so the presence of any of these invalidates
+					// the "hardware walks the guest tables" plan for this region.
+					for (j = 0; j < 1024; j++)
+					{
+						sp = mMemoryIntf->ReadP((p & 0xfffff000) + (j << 2), err);
+						first = (i << 20) + (j << 10);
+						last = (i << 20) + ((j + 1) << 10);
+						switch (sp & 3)
+						{
+							case 0:
+								addBlock(f, first, last, 23, "fine: fault");
+								break;
+							case 1:
+								addBlock(f, first, last, 22, "fine: large pages");
+								break;
+							case 2:
+								addBlock(f, first, last, 22, "fine: small pages");
+								break;
+							case 3:
+								addBlock(f, first, last, 21, "fine: TINY PAGES");
+								break;
+						}
+					}
 					break;
 					/*
 					 Supersections: 16 MB memory blocks (24-bit offsets)

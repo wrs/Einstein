@@ -69,6 +69,9 @@ public:
 	/// MMU needs to access some physical memory access routines.
 	friend class TMMU;
 
+	/// Access to the MMU object, for the bare-metal probe and instrumentation.
+	TMMU* GetMMU() { return &mMMU; }
+
 	///
 	/// Constructor from the ROM Image and the amount of RAM to use
 	/// in the emulator.

@@ -435,6 +435,16 @@ elseif ( ${CMAKE_SYSTEM_NAME} STREQUAL "Linux" OR ${CMAKE_SYSTEM_NAME} STREQUAL 
 		${test_sources}
 		${cmake_sources}
 	)
+	# Headless instrumentation harness for the bare-metal port. Reuses the
+	# same ${common_sources} as Einstein so the emulator, JIT, and MMU are
+	# identical; replaces the FLTK-driven main with baremetal/probe/probe.cpp.
+	# Deliberately excludes ${app_sources} and the Toolkit — the probe provides
+	# its own stubs for the handful of globals those layers supply.
+	add_executable ( NewtonProbe
+		${common_sources}
+		${cmake_sources}
+		baremetal/probe/probe.cpp
+	)
 	add_library ( EinsteinFLGUI STATIC
 		${fluid_sources}
 	)
@@ -449,6 +459,10 @@ elseif ( ${CMAKE_SYSTEM_NAME} STREQUAL "Linux" OR ${CMAKE_SYSTEM_NAME} STREQUAL 
 		-Wall -Wno-multichar -Wno-misleading-indentation -Wno-unused-result
 		-Wno-missing-field-initializers -Wno-stringop-truncation -Werror
 	)
+	target_compile_options ( NewtonProbe PUBLIC
+		-Wall -Wno-multichar -Wno-misleading-indentation -Wno-unused-result
+		-Wno-missing-field-initializers -Wno-stringop-truncation
+	)
 	target_compile_options ( EinsteinFLGUI PUBLIC
 		-Wall -Wno-multichar -Wno-misleading-indentation -Wno-unused-result
 		-Wno-missing-field-initializers -Wno-stringop-truncation -Werror
@@ -458,6 +472,9 @@ elseif ( ${CMAKE_SYSTEM_NAME} STREQUAL "Linux" OR ${CMAKE_SYSTEM_NAME} STREQUAL 
 	)
 	target_compile_definitions ( EinsteinTests PRIVATE
 		TARGET_UI_FLTK=1 TARGET_OS_LINUX=1
+	)
+	target_compile_definitions ( NewtonProbe PRIVATE
+		TARGET_UI_FLTK=1 TARGET_OS_LINUX=1 NEWTON_PROBE_MAIN=1
 	)
 	target_compile_definitions ( EinsteinFLGUI PRIVATE
 		TARGET_UI_FLTK=1 TARGET_OS_LINUX=1
@@ -471,6 +488,12 @@ elseif ( ${CMAKE_SYSTEM_NAME} STREQUAL "Linux" OR ${CMAKE_SYSTEM_NAME} STREQUAL 
 	target_link_libraries ( EinsteinTests
 		${system_libs}
 		fltk::fltk
+		EinsteinFLGUI
+		pthread
+	)
+	target_link_libraries ( NewtonProbe
+		${system_libs}
+		fltk::fltk fltk::images fltk::png fltk::z
 		EinsteinFLGUI
 		pthread
 	)

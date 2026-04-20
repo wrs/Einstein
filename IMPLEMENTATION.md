@@ -61,27 +61,35 @@ Avoid: anything that pulls in `alloc` or `std` transitively. No global allocator
 
 ### 2.3 Project layout
 
+All new code lives under `baremetal/` at the repo root so upstream Einstein
+stays untouched and porting this work is a subdirectory merge.
+
 ```
-hypervisor/
+baremetal/
   Cargo.toml
+  Cargo.lock
   rust-toolchain.toml
-  build.rs               # invokes CMake for the C++ core, emits link flags
-  linker.ld              # EL2 layout: text, rodata, bss, stacks, vectors
+  .cargo/config.toml     # target, rustflags, cargo-run QEMU runner
+  linker.ld              # image layout: load at 0x80000, 16 KiB stack
+  scripts/run-qemu.sh    # cargo runner: ELF -> kernel8.img -> QEMU
   src/
-    main.rs              # EL2 entry, parks extra cores, hands off to init
-    arch/                # aarch64/aarch32 helpers, system-reg wrappers
-    boot/                # firmware handoff shim, early UART
+    main.rs              # no_std entry, kmain, banner
+    boot.s               # _start: park non-zero cores, SP, bss, call kmain
+    cpu.rs               # CurrentEL, MPIDR_EL1, halt()
+    uart.rs              # PL011 driver + kprint!/kprintln! macros
+    panic.rs             # panic handler: print + halt
+    # Landing later as the scope grows:
+    arch/                # aarch32 helpers for the guest side
     mmu/                 # stage-2 tables, TLB ops
     trap/                # vector table, ESR_EL2 dispatch
-    cp15/                # CP15 shim, trap handlers per (op1,CRn,CRm,op2)
+    cp15/                # CP15 shim, handlers per (op1,CRn,CRm,op2)
     vic/                 # Newton VIC bridge, vIRQ/vFIQ injection
-    drivers/             # mini-UART, mailbox, framebuffer, SD, USB, I2S
+    drivers/             # mailbox, framebuffer, SD, USB, I2S
     peripherals/         # thin Rust wrappers over C++ shim handles
-    panic.rs
-  tests/                 # host-side unit tests (see §6)
-cxx-core/                # C++ peripheral core (reused Einstein)
-  CMakeLists.txt
-  shim/                  # C ABI exposed to Rust
+  cxx-core/              # (future) C++ peripheral core (reused Einstein)
+    CMakeLists.txt
+    shim/                # C ABI exposed to Rust
+  tests/                 # (future) host-side unit tests (see §6)
 ```
 
 ## 3. C++ side

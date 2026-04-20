@@ -1,0 +1,5 @@
+[toolchain]
+channel = "1.94.1"
+targets = ["aarch64-unknown-none-softfloat"]
+components = ["rust-src", "llvm-tools-preview", "rustfmt", "clippy"]
+profile = "minimal"

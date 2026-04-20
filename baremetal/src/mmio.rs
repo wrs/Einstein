@@ -25,7 +25,7 @@
 //! build a probe run and check Einstein's behaviour first — see
 //! `probe/FINDINGS.md`.
 
-use crate::{kprintln, peripherals::{dma, pcmcia, vic}};
+use crate::{kprintln, peripherals::{dma, pcmcia, serial, vic}};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 const HW_BASE: u64 = 0x0F00_0000;
@@ -48,6 +48,7 @@ pub fn read(ipa: u64, sas: u8) -> u32 {
         a if vic::owns(a) => vic::read(a),
         a if dma::owns(a) => dma::read(a),
         a if pcmcia::owns(a) => pcmcia::read(a),
+        a if serial::owns(a) => serial::read(a),
 
         HW_RAM_SIZE_1 => 0x4040_0040,
         HW_RAM_SIZE_2 => 0,
@@ -91,6 +92,10 @@ pub fn write(ipa: u64, sas: u8, value: u32) {
     }
     if pcmcia::owns(ipa) {
         pcmcia::write(ipa, value);
+        return;
+    }
+    if serial::owns(ipa) {
+        serial::write(ipa, value);
         return;
     }
     if (HW_BASE..HW_END).contains(&ipa) {

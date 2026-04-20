@@ -7,3 +7,4 @@ test_cp15_fault_regs
 test_finetable_rewrite
 test_und_handler
 test_cp15_strongarm_clock
+test_serial

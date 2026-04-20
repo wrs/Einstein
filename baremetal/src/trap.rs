@@ -100,6 +100,23 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
 /// and update HCR_EL2.VI so the guest takes a virtual IRQ on ERET.
 #[no_mangle]
 pub extern "C" fn trap_irq(_ctx: &mut TrapContext) {
+    // Diagnostic heartbeat: sample guest PC so we can see where it's
+    // executing when no MMIO traps are firing. Only print when the PC
+    // moves — keeps a steady-state spin from flooding the console,
+    // while still flagging every distinct program-counter the guest
+    // reaches between timer fires.
+    static mut HB_LAST_PC: u64 = u64::MAX;
+    static mut HB_PRINT_BUDGET: usize = 16;
+    let elr = read_sysreg!("elr_el2");
+    // SAFETY: single-threaded.
+    unsafe {
+        if elr != HB_LAST_PC && HB_PRINT_BUDGET > 0 {
+            HB_LAST_PC = elr;
+            HB_PRINT_BUDGET -= 1;
+            let spsr = read_sysreg!("spsr_el2");
+            kprintln!("timer_irq: guest ELR={:#x} SPSR={:#x}", elr, spsr);
+        }
+    }
     timer::on_irq();
     update_virq();
 }

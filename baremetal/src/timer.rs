@@ -76,6 +76,10 @@ pub fn init() {
         "timer: CNTHP armed, CNTFRQ={} Hz, CNTHPIRQ -> core0 IRQ",
         read_cntfrq()
     );
+
+    // Kick off the heartbeat so the EL2 IRQ handler gets control
+    // periodically even before the guest arms any Newton match.
+    rearm();
 }
 
 fn program_cval(cval: u64) {
@@ -107,14 +111,23 @@ fn newton_ticks_to_cntpct(newton_ticks: u32) -> u64 {
 /// Called after any write to match_reg[i] or int_ctrl, and from the IRQ
 /// handler after clearing a fired match bit.
 pub fn rearm() {
-    let next_match = match vic::next_pending_match() {
-        Some(t) => t,
+    let cval = match vic::next_pending_match() {
+        Some(t) => newton_ticks_to_cntpct(t),
+        // No guest-visible timer match pending — arm the heartbeat so
+        // EL2 periodically gets control back and we can observe guest
+        // progress even when the guest isn't trapping. ~100 ms wall at
+        // the observed CNTPCT rate.
         None => {
-            program_cval(CVAL_FAR_FUTURE);
-            return;
+            let cnt_hz = read_cntfrq();
+            // SAFETY: read-only sysreg.
+            let now: u64;
+            unsafe {
+                core::arch::asm!("mrs {}, cntpct_el0", out(reg) now,
+                    options(nomem, nostack, preserves_flags));
+            }
+            now.wrapping_add(cnt_hz / 10)
         }
     };
-    let cval = newton_ticks_to_cntpct(next_match);
     program_cval(cval);
 }
 

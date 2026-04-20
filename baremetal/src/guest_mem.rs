@@ -353,17 +353,13 @@ pub unsafe fn load_newton_rom() {
         first, second
     );
 
-    // Bring-up shim #1: patch the fault-class exception vectors to a
-    // bare `movs pc, lr` so any early fault whose real handler lives
-    // in a ROM VA we haven't yet been able to reach doesn't loop
-    // forever. Experimentally, patching only undef / prefetch-abort /
-    // data-abort (offsets 0x04, 0x0C, 0x10) is sufficient for the
-    // 717006 ROM to get through its pre-scheduler boot — SWI (0x08),
-    // IRQ (0x18), and FIQ (0x1C) can stay pristine because the ROM
-    // doesn't exercise them before it stalls waiting for peripheral
-    // responses. This shim comes off once we have enough of the
-    // peripheral + CP15 surface that none of these vectors would
-    // fire during early boot.
+    // Bring-up shim #1: patch the fault-class exception vectors to
+    // `movs pc, lr`. This is wrong-but-useful: it skips the faulting
+    // instruction when the vector is taken as an exception entry
+    // (the right thing early on when the real handler lives in an
+    // unmapped VA). It also has no effect when the vector is jumped
+    // to as regular code (just returns). We only patch undef / pabt
+    // / dabt; SWI / IRQ / FIQ stay pristine.
     unsafe {
         rom_ptr.add(1).write(0xE1B0_F00E); // undef
         rom_ptr.add(3).write(0xE1B0_F00E); // prefetch abort

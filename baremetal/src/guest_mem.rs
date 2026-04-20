@@ -89,21 +89,18 @@ pub unsafe fn load_rom() {
         first, second
     );
 
-    // Bring-up shim: the ROM's exception vectors branch into the high ROM
-    // jump-table region (e.g. 0x01A03xxx), which is only reachable once the
-    // guest has installed its stage-1 MMU. Until M3+ we have no way to
-    // service those branches, and any undef/SWI fired by the kernel during
-    // early init chases into unmapped territory.
+    // Bring-up shim: patch the ROM's exception vectors (undef/SWI/P-abort/
+    // D-abort/IRQ/FIQ) to `movs pc, lr` so early EL1 exceptions silently
+    // return to the next instruction. Without this, any UNDEF fired by an
+    // unimplemented CP15 op would branch into the ROM jump-table region,
+    // which is only reachable via guest stage-1 — itself not yet set up.
     //
-    // Patch ROM words 1..7 (undef / SWI / prefetch-abort / data-abort / irq
-    // / fiq vectors — reset at word 0 is untouched) with `movs pc, lr`
-    // (0xE1B0F00E) so each exception returns to the next instruction
-    // instead of branching. This loses exception handling fidelity but
-    // lets the guest progress past its early CP15 probe, at which point
-    // our own CP15 shim and interrupt manager take over.
+    // Ideal path once the CP15 shim is more complete: keep vectors pristine
+    // and route everything to EL2 via a combination of HCR_EL2 trap bits
+    // + an emulated guest stage-1 setup.
     unsafe {
         for i in 1..=6 {
-            rom_ptr.add(i).write(0xE1B0_F00E);
+            rom_ptr.add(i).write(0xE1B0_F00E); // movs pc, lr
         }
     }
     kprintln!(

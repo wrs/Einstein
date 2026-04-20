@@ -49,10 +49,21 @@ unsafe fn eret_to_guest(entry_ipa: u64) -> ! {
         asm!("msr hcr_el2, {}", "isb", in(reg) hcr,
             options(nostack, preserves_flags));
 
-        // Zero guest SCTLR_EL1 so its stage-1 is off. The ROM's own
-        // boot code will configure SCTLR_EL1 / TTBR0 / DACR etc. on
+        // Zero guest SCTLR_EL1 so its stage-1 is off at reset. The ROM's
+        // own boot code will configure SCTLR_EL1 / TTBR0 / DACR etc. on
         // its way up.
         asm!("msr sctlr_el1, xzr", "isb",
+            options(nostack, preserves_flags));
+
+        // Zero TCR_EL1 so guest-stage-1 uses short-descriptor VMSAv7
+        // format (TTBCR.EAE = 0). This is what the 717006 ROM expects;
+        // A53's reset value isn't architecturally guaranteed to be 0.
+        asm!("msr tcr_el1, xzr", "isb",
+            options(nostack, preserves_flags));
+
+        // Clear TTBR0_EL1 / TTBR1_EL1 to known state; ROM will write
+        // its real tables via the CP15 shim.
+        asm!("msr ttbr0_el1, xzr", "msr ttbr1_el1, xzr", "isb",
             options(nostack, preserves_flags));
 
         asm!(

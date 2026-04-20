@@ -13,6 +13,7 @@ mod panic;
 mod stage2;
 mod trap;
 pub mod uart;
+mod vic;
 
 global_asm!(include_str!("boot.s"));
 global_asm!(include_str!("vectors.s"));
@@ -43,6 +44,8 @@ pub extern "C" fn kmain() -> ! {
         stage2::init();
         stage2::enable();
     }
+
+    vic::init();
 
     kprintln!();
     kprintln!("Entering Newton ROM...");

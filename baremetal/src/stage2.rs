@@ -49,6 +49,10 @@ pub const ROM_IPA_BASE: u64 = 0x0000_0000;
 pub const ROM_IPA_SIZE: u64 = 0x0100_0000; // 16 MiB
 pub const RAM_IPA_BASE: u64 = 0x0400_0000;
 pub const RAM_IPA_SIZE: u64 = 0x0040_0000; // 4 MiB
+// Kernel expects RAM at VA 0x0C000000 after stage-1 MMU is on. Until our
+// CP15 shim cleanly enables guest stage-1, mirror the RAM at IPA 0x0C000000
+// so guest stage-1-off accesses to that region work against the same bytes.
+pub const RAM_MIRROR_IPA_BASE: u64 = 0x0C00_0000;
 
 const VTCR_EL2_VAL: u64 = (32 << 0)
     | (0b01 << 6)          // SL0 = start at level 1
@@ -108,6 +112,15 @@ pub unsafe fn init() {
             RAM_IPA_SIZE / TWO_MIB,
             BLOCK_NORMAL_RW,
         );
+        // Mirror of the same 4 MiB at IPA 0x0C00_0000 so the guest's
+        // VA=PA accesses to the kernel RAM window work before its
+        // own stage-1 MMU comes up. Backing is the SAME bytes.
+        set_l2_blocks(
+            RAM_MIRROR_IPA_BASE,
+            ram_pa,
+            RAM_IPA_SIZE / TWO_MIB,
+            BLOCK_NORMAL_RW,
+        );
     }
 
     // L1[0] → L2. L1[1..] stay invalid (any IPA ≥ 1 GiB faults).
@@ -144,6 +157,10 @@ pub unsafe fn init() {
     kprintln!(
         "stage2: RAM @ IPA {:#x}..{:#x} -> host PA {:#x} (RW)",
         RAM_IPA_BASE, RAM_IPA_BASE + RAM_IPA_SIZE, ram_pa
+    );
+    kprintln!(
+        "stage2: RAM mirror @ IPA {:#x}..{:#x} -> SAME host PA (RW)",
+        RAM_MIRROR_IPA_BASE, RAM_MIRROR_IPA_BASE + RAM_IPA_SIZE
     );
     kprintln!("stage2: all other IPAs fault to EL2");
 }

@@ -13,7 +13,7 @@
 //! `TFlash`, ...) lands in M3 / M4. For now we just want the guest to
 //! continue past its initial probe.
 
-use crate::kprintln;
+use crate::{kprintln, vic};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 const FLASH1_BASE: u64 = 0x0200_0000;
@@ -38,22 +38,16 @@ pub fn read(ipa: u64, sas: u8) -> u32 {
         // Empty / erased flash: 0xFF bytes everywhere.
         a if (FLASH1_BASE..FLASH1_END).contains(&a) => 0xFFFF_FFFF,
 
-        // RAM size register: MP2100 has 4 MiB. TMemory.cpp:868 computes
-        //   (pages << 24) | (pages << 16) | pages
-        // with pages = (RAMSize >> 16) & 0xFF = 0x40. Result = 0x40404040.
         HW_RAM_SIZE_1 => 0x4040_0040,
-
-        // Secondary bank size: no secondary bank.
         HW_RAM_SIZE_2 => 0,
 
-        // Anything else in the HW window: zero. Log the first few
-        // unknown addresses for diagnostic purposes.
+        a if vic::owns(a) => vic::read(a),
+
         a if (HW_BASE..HW_END).contains(&a) => {
             log_unknown("hw read", a, sas);
             0
         }
 
-        // Fully off-map address: log and zero.
         a => {
             log_unknown("unmapped read", a, sas);
             0
@@ -66,6 +60,10 @@ pub fn read(ipa: u64, sas: u8) -> u32 {
 pub fn write(ipa: u64, sas: u8, value: u32) {
     if (FLASH1_BASE..FLASH1_END).contains(&ipa) {
         log_unknown("flash write (ignored)", ipa, sas);
+        return;
+    }
+    if vic::owns(ipa) {
+        vic::write(ipa, value);
         return;
     }
     if (HW_BASE..HW_END).contains(&ipa) {

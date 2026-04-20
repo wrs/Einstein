@@ -100,11 +100,19 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
     let srt = ((iss >> 16) & 0x1F) as usize;
 
     if isv == 0 {
-        // Without a decodable syndrome we can't safely emulate. Log and halt.
+        // No decodable syndrome — typically LDM/STM or exclusive access.
+        // Log enough to diagnose and halt.
         let elr = read_sysreg!("elr_el2");
+        let spsr = read_sysreg!("spsr_el2");
+        let sctlr_el1 = read_sysreg!("sctlr_el1");
         kprintln!(
-            "*** data abort with ISV=0 at ELR={:#x} IPA={:#x} (can't decode) iss={:#x}",
-            elr, ipa, iss
+            "*** data abort ISV=0 at ELR={:#x} SPSR={:#x} IPA={:#x} FAR={:#x} iss={:#x}",
+            elr, spsr, ipa, far, iss
+        );
+        kprintln!(
+            "    SCTLR_EL1 (guest) M-bit = {} (stage-1 {})",
+            sctlr_el1 & 1,
+            if (sctlr_el1 & 1) != 0 { "ON" } else { "OFF" }
         );
         cpu::halt();
     }
@@ -152,53 +160,139 @@ fn handle_hvc(_ctx: &mut TrapContext, iss: u32) {
 //   [0]      Direction: 0 = write (MCR), 1 = read (MRC)
 fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
     let is_read = (iss & 1) != 0;
-    let crm = ((iss >> 1) & 0xF) as u32;
+    let _crm = ((iss >> 1) & 0xF) as u32;
     let rt = ((iss >> 5) & 0x1F) as usize;
     let crn = ((iss >> 10) & 0xF) as u32;
     let opc1 = ((iss >> 14) & 0x7) as u32;
     let opc2 = ((iss >> 17) & 0x7) as u32;
+    let crm = _crm;
 
-    static mut CP15_LOG_COUNT: usize = 0;
-    // SAFETY: single-threaded bringup context.
-    let n = unsafe {
-        let n = CP15_LOG_COUNT;
-        CP15_LOG_COUNT += 1;
-        n
+    // Budget-limited CP15 logging for bring-up diagnostics. Prints only the
+    // first N unique (CRn, CRm, Opc1, Opc2, dir) tuples.
+    static mut CP15_SEEN: [u32; 32] = [0; 32];
+    static mut CP15_N: usize = 0;
+    let key = ((is_read as u32) << 13)
+        | (crn << 9)
+        | (crm << 5)
+        | (opc1 << 2)
+        | opc2;
+    // SAFETY: single-threaded.
+    let already = unsafe {
+        let mut found = false;
+        for i in 0..CP15_N {
+            if CP15_SEEN[i] == key { found = true; break; }
+        }
+        if !found && CP15_N < 32 {
+            CP15_SEEN[CP15_N] = key;
+            CP15_N += 1;
+            let value_log = if is_read { 0 } else { ctx.x[rt] as u32 };
+            let elr = read_sysreg!("elr_el2");
+            kprintln!(
+                "cp15: {} p15,{},Rt=r{},c{},c{},{{{}}} val={:#010x} @ELR={:#x}",
+                if is_read { "MRC" } else { "MCR" },
+                opc1, rt, crn, crm, opc2, value_log, elr
+            );
+            true
+        } else {
+            found
+        }
     };
-    if n < 32 {
-        let elr = read_sysreg!("elr_el2");
-        kprintln!(
-            "cp15[{:2}] {} p15,{},c{},c{},{{{}}} Rt=r{} @ELR={:#x}",
-            n,
-            if is_read { "MRC" } else { "MCR" },
-            opc1,
-            crn,
-            crm,
-            opc2,
-            rt,
-            elr
-        );
-    } else if n == 32 {
-        kprintln!("cp15: log budget exhausted — silencing further output");
-    }
+    let _ = already;
 
-    // Stub responses, matching the probe findings for 717006:
-    //   (0, 0, 0, 0, MRC)  = read CPU ID → return StrongARM ID (0x4401A100,
-    //                         as TARMProcessor.cpp:94 does).
-    //   other reads        → 0
-    //   all writes         → accepted but ignored
+    // The 717006 ROM uses StrongARM's lax CP15 encoding where CRm==CRn for
+    // most register accesses. We dispatch purely on CRn to cover all the
+    // observed variants with a single handler per group.
     if is_read {
-        let value = match (opc1, crn, crm, opc2) {
-            (0, 0, 0, 0) => 0x4401_A100_u32, // MIDR-equivalent for StrongARM
-            _ => 0,
+        let value: u32 = match crn {
+            0 => 0x4401_A100, // MIDR — StrongARM-equivalent CPU ID
+            1 => cp15::read_sctlr_el1() as u32,
+            2 => cp15::read_ttbr0_el1() as u32,
+            3 => cp15::read_dacr32() as u32,
+            _ => 0, // FSR/FAR/impl-def reads: return 0 (no pending fault info)
         };
         ctx.x[rt] = value as u64;
     } else {
-        // Writes: silently accept; real CP15 shim will land in M3+.
-        let _ = ctx.x[rt];
+        let value = ctx.x[rt] as u32;
+        match crn {
+            1 => cp15::write_sctlr_el1(value as u64),
+            2 => cp15::write_ttbr0_el1(value as u64),
+            3 => cp15::write_dacr32(value as u64),
+            7 => cp15::cache_maintenance_nop(), // A53 handles coherency
+            8 => cp15::invalidate_tlb(),
+            _ => { /* FSR/FAR writes + impl-def ignored */ }
+        }
     }
 
     advance_elr(4);
+}
+
+// Small inline module with the raw sysreg touches, kept close to the
+// dispatch above so the trap handler stays readable.
+mod cp15 {
+    pub fn read_sctlr_el1() -> u64 { sysreg_read!("sctlr_el1") }
+    pub fn write_sctlr_el1(v: u64) { sysreg_write!("sctlr_el1", v); sync(); }
+
+    pub fn read_ttbr0_el1() -> u64 { sysreg_read!("ttbr0_el1") }
+    pub fn write_ttbr0_el1(v: u64) { sysreg_write!("ttbr0_el1", v); sync(); }
+
+    pub fn read_dacr32() -> u64 { sysreg_read!("dacr32_el2") }
+    pub fn write_dacr32(v: u64) { sysreg_write!("dacr32_el2", v); sync(); }
+
+    pub fn cache_maintenance_nop() {
+        // StrongARM c7 cache ops don't all map cleanly to A53 encodings and
+        // A53 handles coherency natively for our configuration. DSB to keep
+        // the guest's memory-ordering expectations.
+        sync();
+    }
+
+    pub fn invalidate_tlb() {
+        // SAFETY: TLBI variants are defined sysreg writes.
+        unsafe {
+            core::arch::asm!(
+                "tlbi vmalle1",
+                "dsb ish",
+                "isb",
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    fn sync() {
+        // SAFETY: barrier instructions only.
+        unsafe {
+            core::arch::asm!(
+                "dsb ish",
+                "isb",
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    macro_rules! sysreg_read {
+        ($reg:literal) => {{
+            let v: u64;
+            unsafe {
+                core::arch::asm!(
+                    concat!("mrs {}, ", $reg),
+                    out(reg) v,
+                    options(nomem, nostack, preserves_flags),
+                );
+            }
+            v
+        }};
+    }
+    macro_rules! sysreg_write {
+        ($reg:literal, $val:expr) => {{
+            unsafe {
+                core::arch::asm!(
+                    concat!("msr ", $reg, ", {}"),
+                    in(reg) $val,
+                    options(nostack, preserves_flags),
+                );
+            }
+        }};
+    }
+    pub(crate) use {sysreg_read, sysreg_write};
 }
 
 fn handle_unknown(iss: u32) {

@@ -6,6 +6,7 @@ use core::arch::global_asm;
 
 mod cpu;
 mod guest;
+mod guest_mem;
 mod mmu;
 mod panic;
 mod stage2;
@@ -33,21 +34,20 @@ pub extern "C" fn kmain() -> ! {
     unsafe { mmu::init(); }
     install_vectors();
 
-    // SAFETY: stage-2 tables must be programmed before we enable VM and
-    // ERET to the guest. Both functions are idempotent but only called once.
+    // SAFETY: load ROM bytes into guest backing store before stage-2 maps it.
+    unsafe { guest_mem::load_rom(); }
+
+    // SAFETY: stage-2 tables reference the backing store we just populated.
     unsafe {
         stage2::init();
         stage2::enable();
     }
 
     kprintln!();
-    kprintln!("Vectors + stage-2 installed. Entering toy AArch32 guest...");
+    kprintln!("Entering Newton ROM...");
 
-    // SAFETY: MMU, caches, vectors and stage-2 are up; the guest drops to
-    // EL1 AArch32, takes a stage-2 data abort reading from TRAP_IPA, and
-    // control resumes at the EL2 vector table for AArch32 synchronous
-    // exceptions. Never returns here.
-    unsafe { guest::run_toy_guest(); }
+    // SAFETY: every subsystem the guest relies on is up.
+    unsafe { guest::run_newton_rom(); }
 
     // If we ever reach this (we won't) — halt so the machine is safe.
     #[allow(unreachable_code)]

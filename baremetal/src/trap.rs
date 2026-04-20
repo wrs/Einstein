@@ -322,70 +322,140 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
     };
     let _ = already;
 
-    // The 717006 ROM uses StrongARM's lax CP15 encoding where CRm==CRn for
-    // most register accesses. We dispatch purely on CRn to cover all the
-    // observed variants with a single handler per group.
-    if is_read {
-        let value: u32 = match crn {
-            0 => 0x4401_A100, // MIDR — StrongARM-equivalent CPU ID
-            1 => cp15::read_sctlr_el1() as u32,
-            2 => cp15::read_ttbr0_el1() as u32,
-            3 => cp15::read_dacr32() as u32,
-            _ => 0, // FSR/FAR/impl-def reads: return 0 (no pending fault info)
-        };
-        ctx.x[rt] = value as u64;
-    } else {
-        let value = ctx.x[rt] as u32;
-        match crn {
-            1 => {
-                cp15::write_sctlr_el1(value as u64);
-                // Log every SCTLR write — there are only a few and each is
-                // architecturally significant (MMU enable, V bit, etc.).
-                static mut SCTLR_N: usize = 0;
-                let n = unsafe { let v = SCTLR_N; SCTLR_N += 1; v };
-                if n < 6 {
-                    let sctlr_now = cp15::read_sctlr_el1();
-                    kprintln!(
-                        "cp15.sctlr[{}] wrote {:#010x} (M={} V={} C={} I={})",
-                        n, value,
-                        value & 1,
-                        (value >> 13) & 1,
-                        (value >> 2) & 1,
-                        (value >> 12) & 1,
-                    );
-                    kprintln!("   SCTLR_EL1 after write = {:#018x}", sctlr_now);
-                }
-                // When MMU comes on for the first time, dump the guest's
-                // first-level page-table entries so we can see what the
-                // kernel mapped and where it points.
-                if (value & 1) != 0 && n < 10 {
-                    guest_mem::dump_guest_l1_table();
-                }
-            }
-            2 => {
-                cp15::write_ttbr0_el1(value as u64);
-                // First TTBR write locks in where the guest's page tables
-                // live. Walk them and strip the XN bits that ARMv7/v8
-                // would honour but the Newton's ARMv4 tables don't
-                // intend, before the guest switches stage-1 on.
-                static mut TTBR_FIXED: bool = false;
-                let already = unsafe {
-                    let v = TTBR_FIXED;
-                    TTBR_FIXED = true;
-                    v
-                };
-                if !already {
-                    guest_mem::fix_stage1_xn_bits();
-                }
-            }
-            3 => cp15::write_dacr32(value as u64),
-            7 => cp15::cache_maintenance_nop(), // A53 handles coherency
-            8 => cp15::invalidate_tlb(),
-            _ => { /* FSR/FAR writes + impl-def ignored */ }
+    // Dispatch on the full (opc1, CRn, CRm, opc2, dir) tuple. The
+    // surface is fixed at 15 tuples for the 717006 ROM (see
+    // probe/FINDINGS.md §16.4). The load-time CP15 patcher in
+    // guest_mem.rs rewrites the StrongARM lax CRm=CRn encodings for
+    // CRn ∈ {1,2,3,5,6} to the ARMv7 canonical CRm=0 form before the
+    // guest runs, so we only see the ARMv7 encodings here; the three
+    // cache and TLB groups (CRn=7, CRn=8) and the one-off StrongARM
+    // clock-control write (CRn=15, CRm=1, opc2=2) keep their native
+    // encodings.
+    let tuple = (opc1, crn, crm, opc2, is_read);
+    match tuple {
+        // --- reads ---
+        (0, 0, 0, 0, true) => {
+            // MIDR — report a StrongARM-compatible CPU ID so the ROM's
+            // probe doesn't reject us.
+            ctx.x[rt] = 0x4401_A100u64;
+        }
+        (0, 1, 0, 0, true) => ctx.x[rt] = cp15::read_sctlr_el1(),
+        (0, 2, 0, 0, true) => ctx.x[rt] = cp15::read_ttbr0_el1(),
+        (0, 3, 0, 0, true) => ctx.x[rt] = cp15::read_dacr32(),
+        (0, 5, 0, 0, true) => {
+            // DFSR — pass through the AArch32-compat view of the last
+            // EL1 stage-1 data abort. Accessible from EL2 because the
+            // guest is AArch32 (HCR_EL2.RW=0).
+            ctx.x[rt] = cp15::read_dfsr32();
+        }
+        (0, 6, 0, 0, true) => {
+            // DFAR — pass through the faulting address.
+            ctx.x[rt] = cp15::read_far_el1();
+        }
+
+        // --- writes ---
+        (0, 1, 0, 0, false) => {
+            let value = ctx.x[rt] as u32;
+            cp15::write_sctlr_el1(value as u64);
+            log_sctlr_write(value);
+            if (value & 1) != 0 { maybe_dump_l1_once(); }
+        }
+        (0, 2, 0, 0, false) => {
+            let value = ctx.x[rt] as u32;
+            cp15::write_ttbr0_el1(value as u64);
+            // First TTBR write locks in the guest's stage-1 table
+            // location. Walk it once and normalise the XN / SBZ bits
+            // before the guest turns stage-1 on.
+            static mut TTBR_FIXED: bool = false;
+            // SAFETY: single-threaded.
+            let already = unsafe {
+                let v = TTBR_FIXED;
+                TTBR_FIXED = true;
+                v
+            };
+            if !already { guest_mem::fix_stage1_xn_bits(); }
+        }
+        (0, 3, 0, 0, false) => cp15::write_dacr32(ctx.x[rt]),
+        (0, 5, 0, 0, false) => {
+            // Guest can write DFSR to prime the register or clear
+            // stale state. The probe didn't capture writes on its
+            // boot window but the ROM does emit them (e.g. at PC
+            // 0x18944 with `0x050e7130`), so reflect into DFSR32_EL2
+            // and let subsequent MRCs read back what the guest wrote
+            // until a real fault overwrites it.
+            cp15::write_dfsr32(ctx.x[rt]);
+        }
+        (0, 6, 0, 0, false) => {
+            // Guest writes to DFAR — reflect into FAR_EL1.
+            cp15::write_far_el1(ctx.x[rt]);
+        }
+
+        // Cache maintenance (CRn=7). Per probe/FINDINGS.md §16.7:
+        //   c7, c6, op2=0  Invalidate entire data cache
+        //   c7, c6, op2=1  Clean+invalidate DC line (MVA)
+        //   c7, c7, op2=0  Invalidate unified cache
+        //   c7, c10, op2=1 Clean DC line (MVA)
+        //   c7, c10, op2=4 Drain write buffer / DSB
+        // A53 handles coherency natively for our config, so a DSB is
+        // the only operation we actually need to preserve ordering
+        // the guest expects. The other c7 ops are no-ops.
+        (0, 7, _, _, false) => cp15::cache_maintenance_barrier(),
+
+        // TLB invalidation (CRn=8):
+        //   c8, c5, op2=0  ITLB invalidate all
+        //   c8, c6, op2=1  DTLB invalidate by MVA
+        //   c8, c7, op2=0  TLB invalidate all
+        (0, 8, _, _, false) => cp15::invalidate_tlb(),
+
+        // StrongARM-specific clock-control write (c15, c1, op1=0, op2=2).
+        // Fires exactly once at boot; no observable effect from EL2.
+        (0, 15, 1, 2, false) => { /* nop */ }
+
+        _ => {
+            // Unrecognised tuple — log (budget is applied above) and
+            // fall through to ignored.
+            log_unknown_cp15(is_read, opc1, crn, crm, opc2, rt, ctx);
         }
     }
 
     advance_elr(4);
+}
+
+fn log_sctlr_write(value: u32) {
+    static mut SCTLR_N: usize = 0;
+    // SAFETY: single-threaded.
+    let n = unsafe { let v = SCTLR_N; SCTLR_N += 1; v };
+    if n < 6 {
+        let sctlr_now = cp15::read_sctlr_el1();
+        kprintln!(
+            "cp15.sctlr[{}] wrote {:#010x} (M={} V={} C={} I={})",
+            n, value,
+            value & 1,
+            (value >> 13) & 1,
+            (value >> 2) & 1,
+            (value >> 12) & 1,
+        );
+        kprintln!("   SCTLR_EL1 after write = {:#018x}", sctlr_now);
+    }
+}
+
+fn maybe_dump_l1_once() {
+    static mut L1_DUMPS: usize = 0;
+    // SAFETY: single-threaded.
+    let n = unsafe { let v = L1_DUMPS; L1_DUMPS += 1; v };
+    if n < 10 {
+        guest_mem::dump_guest_l1_table();
+    }
+}
+
+fn log_unknown_cp15(is_read: bool, opc1: u32, crn: u32, crm: u32, opc2: u32, rt: usize, ctx: &TrapContext) {
+    let value = if is_read { 0 } else { ctx.x[rt] as u32 };
+    let elr = read_sysreg!("elr_el2");
+    kprintln!(
+        "cp15 UNHANDLED: {} p15,{},Rt=r{},c{},c{},{{{}}} val={:#010x} @ELR={:#x}",
+        if is_read { "MRC" } else { "MCR" },
+        opc1, rt, crn, crm, opc2, value, elr
+    );
 }
 
 // Small inline module with the raw sysreg touches, kept close to the
@@ -400,10 +470,37 @@ mod cp15 {
     pub fn read_dacr32() -> u64 { sysreg_read!("dacr32_el2") }
     pub fn write_dacr32(v: u64) { sysreg_write!("dacr32_el2", v); sync(); }
 
-    pub fn cache_maintenance_nop() {
-        // StrongARM c7 cache ops don't all map cleanly to A53 encodings and
-        // A53 handles coherency natively for our configuration. DSB to keep
-        // the guest's memory-ordering expectations.
+    /// AArch32 DFSR, via the DFSR32_EL2 AArch64 alias. The guest must
+    /// be AArch32 at EL1 (HCR_EL2.RW=0) for this register to be
+    /// accessible from EL2; callers should only hit this path from
+    /// the CP15 trap handler, which by construction runs because the
+    /// guest executed MRC — i.e. the guest is AArch32.
+    /// AArch32 DFSR — architecturally accessible as DFSR32_EL2 from
+    /// EL2 AArch64 when the guest at EL1 is AArch32 (HCR_EL2.RW=0).
+    /// Per ARM ARM D10.2.32 the S-encoding is op0=3, op1=4, CRn=5,
+    /// CRm=0, op2=0, and the register is present whenever a lower EL
+    /// supports AArch32 (FEAT_AA32EL1) — confirmed on A53 by
+    /// `ID_AA64PFR0_EL1.EL1 == 0x2`.
+    ///
+    /// In this configuration on QEMU raspi3b both MRS and MSR to the
+    /// register take an EC=0 "Unknown reason" exception at EL2.
+    /// Suspected a QEMU quirk or an ARM ARM access rule we haven't
+    /// decoded; stubbed until the real path is verified on hardware.
+    /// Guests that rely on their own DFSR reading to dispatch aborts
+    /// currently see 0 here.
+    pub fn read_dfsr32() -> u64 { 0 }
+    pub fn write_dfsr32(_v: u64) { /* see read_dfsr32 note */ }
+
+    /// FAR_EL1 — common register for both AArch32 DFAR/IFAR and
+    /// AArch64 FAR stage-1 faults at EL1.
+    pub fn read_far_el1() -> u64 { sysreg_read!("far_el1") }
+    pub fn write_far_el1(v: u64) { sysreg_write!("far_el1", v); sync(); }
+
+    pub fn cache_maintenance_barrier() {
+        // StrongARM c7 cache ops don't all map cleanly to A53 encodings
+        // and A53 handles coherency natively for our configuration. A
+        // `dsb ish` covers the write-buffer-drain encoding the guest
+        // issues most often; the rest are no-ops.
         sync();
     }
 

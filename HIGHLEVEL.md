@@ -43,7 +43,7 @@ Boot an unmodified Newton 2.x ROM on a bare-metal Pi Zero 2 W such that the gues
   +--------------------------------------------------------+
 ```
 
-\* The kernel-only-in-PL1 split is an assumption pending verification (§16.3).
+\* Kernel-only-in-PL1 **confirmed empirically** against 717006: 19 310 USR entries vs 649 SVC entries over 90 s of boot; `SVC → USR` is the dominant transition (see `baremetal/probe/FINDINGS.md` §16.3).
 
 ### 3.1 Components
 
@@ -95,16 +95,25 @@ Carve ~32 MiB from Pi DRAM for guest physical; remainder is EL2 heap, framebuffe
 
 The Newton's own page tables. Hardware walks them. AP bits, domains, and cacheability attributes are preserved unchanged. No software shadow table, no AP flattening.
 
+**One fix-up pass.** 717006 installs three L1 fine-table descriptors (bits 0b11) covering VAs `0x78000000`, `0x90000000`, `0xAC000000`, for PCMCIA window placeholders — all their L2 entries are fault. AArch32 on A53 doesn't walk 0b11 L1 descriptors. On every guest `MCR p15, 0, Rn, c2, c0, 0` (TTBR install, trapped via `HCR_EL2.TVM`), scan the new L1 table and rewrite 0b11 → 0b00 in a shadow copy; point real TTBR at the shadow. Semantics-preserving because nothing is actually mapped through those descriptors.
+
+**Domains.** DACR is always `0x00055555` (domains 0–7 = client, 8–15 = no-access), written 38 953 times with the same value — the kernel reinstalls DACR at every context-switch. A53 short-descriptor DACR semantics match; just pass the writes through.
+
 ## 6. CPU and mode handling
 
 Guest runs natively at EL1 AArch32. No JIT, no interpreter. Newton's SVC/IRQ/FIQ/ABT/UND vectors are entered by the hardware exactly as on StrongARM. Banked registers, SPSR, CPSR handled by the CPU.
 
 ### 6.1 ARMv4-vs-ARMv8-AArch32 deltas needing trap-and-emulate at EL2
 
-- **CP15.** StrongARM's system coprocessor register set differs from A53's. Trap guest CP15 access via `HCR_EL2.TVM`/`TRVM`/`TID*`. Maintain a shadow of guest CP15 (TTBR, DACR, SCTLR bits) and program real CP15 to the equivalent intent (§16.4).
-- **SWP / SWPB.** UNDEFINED in ARMv8. Trap via the undefined-instruction vector, emulate atomically with `LDREX` / `STREX`. If hot, patch the ROM (§16.5).
+Probe runs against 717006 narrowed the actual scope considerably; see `baremetal/probe/FINDINGS.md` for raw counts.
+
+- **CP15.** Total surface is **15 `(opc1, CRn, CRm, opc2, dir)` tuples** across a 90 s boot. Trap via `HCR_EL2.TVM` / `TRVM` / `TID*`. The shim's handler table has 15 entries:
+  - ID read (`c0,c0,0`), SCTLR (`c1,c1,0`), TTBR (`c2,c2,0`), DACR (`c3,c3,0`), FSR (`c5,c5,0`), FAR (`c6,c6,0`) — direct AArch32 equivalents.
+  - Cache maintenance (`c7` family, five encodings) — map to `DCCMVAC` / `DCCIMVAC` / `DCISW` / `DSB SY`, or no-op if we disable guest cache.
+  - TLB flush (`c8` family, three encodings) — map to `TLBIALL`, `TLBIMVA` variants.
+  - **StrongARM-specific `c15 op1=0 CRm=1 op2=2`** (clock control) — fires **exactly once** at boot. Trap-and-no-op.
+- **SWP / SWPB.** UNDEFINED in ARMv8. 717006 has **one** call site (`0x003AE200`) firing ~400 k times in 90 s — almost certainly the kernel's atomic-exchange primitive. **Patch that single ROM site** with an `LDREX`/`STREX` sequence at boot; no traps needed.
 - **`MRS Rd, SPSR` while in User mode.** `Emulator/TARMProcessor.cpp:760` notes StrongARM returned CPSR here; A53 treats it as UNPREDICTABLE. Trap in undef vector, return CPSR.
-- **Cache maintenance ops.** StrongARM CP15 c7 encodings differ from A53's. Trap and translate each to its A53 equivalent or a safe no-op (§16.7).
 - **Imprecise data aborts and other ARMv4 edge cases.** Enumerate empirically; maintain a fixup table.
 
 ### 6.2 Thumb

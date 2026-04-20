@@ -38,6 +38,22 @@ Rust (`no_std`, `aarch64-unknown-none-softfloat`) for the novel code; C++ for th
 - Their interface surface (per-peripheral register read/write + occasional callbacks) is narrow enough that a C shim is cheap.
 - Translation to Rust is a reasonable v2 cleanup, not a v1 requirement.
 
+### 1.3 Concrete scope from the probe runs
+
+Against the 717006 ROM with the Einstein REx (90 s boot; see `baremetal/probe/FINDINGS.md` for the raw capture), the probe nailed down the implementation scope for several sections that were previously described as "to be enumerated empirically":
+
+- **CP15 shim:** 15 unique `(opc1, CRn, CRm, opc2, dir)` tuples total. Of those, 14 have direct AArch32-on-A53 equivalents (SCTLR, TTBR0, DACR, IFSR/DFSR, IFAR/DFAR, `DCCMVAC` and friends, TLBI variants). The 15th is a StrongARM `c15, op1=0, CRm=1, op2=2` clock-control write that fires **exactly once** at boot; trap-and-no-op. The shim's dispatch table is one Rust `match` with 15 arms — the compiler can enforce exhaustiveness.
+
+- **SWP:** Exactly **one** call site (`0x003AE200`) emits every SWP in the kernel. Implementation: at ROM-load time in the hypervisor, patch that site with an `LDREX`/`STREX`/branch-back sequence. No trap handler needed. (Keep one as a safety net for variants: if we ever see a SWP fault from a PC other than the patched site, trap-and-emulate and log.)
+
+- **MMU fixup:** Guest L1 table contains three fine-table descriptors (bits `0b11`) at VA `0x78000000`, `0x90000000`, `0xAC000000`, all with fault-only L2 contents (PCMCIA window placeholders). AArch32 on A53 doesn't walk `0b11` L1 entries. Handle by trapping writes to TTBR (`HCR_EL2.TVM`) and rewriting `0b11` → `0b00` in a shadow table; point real TTBR at the shadow. Leaves the guest's view of memory unchanged because the only accessible side of those descriptors is faults either way.
+
+- **DACR:** Always `0x00055555`. The write path in the shim can be a single-value passthrough; no per-value decoding needed.
+
+- **Privilege:** Guest spends its time overwhelmingly in USR mode (19 310 entries vs 649 SVC over 90 s). AP enforcement stays on; no flattening.
+
+These findings mean several items that `HIGHLEVEL.md` §6 flagged as "enumerate empirically" are now concrete tables we can hand off to Rust `match` or to a ROM-patch descriptor. Implementation is no longer blocked on instrumentation runs; it's blocked on the remaining design gate (`HIGHLEVEL.md` §16.1, EL2 handoff on real Pi firmware) and peripheral bring-up milestones.
+
 ## 2. Rust side
 
 ### 2.1 Target and toolchain

@@ -5,5 +5,6 @@
 //! names so cross-referencing `docs/peripherals.md` and
 //! `Emulator/T*.cpp` stays straightforward.
 
+pub mod dma;
 pub mod flash;
 pub mod vic;

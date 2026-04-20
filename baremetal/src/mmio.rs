@@ -13,7 +13,7 @@
 //! `TFlash`, ...) lands in M3 / M4. For now we just want the guest to
 //! continue past its initial probe.
 
-use crate::{kprintln, peripherals::vic};
+use crate::{kprintln, peripherals::{dma, vic}};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 const FLASH1_BASE: u64 = 0x0200_0000;
@@ -58,6 +58,7 @@ pub fn read(ipa: u64, sas: u8) -> u32 {
         0x1000_0000 | 0x1080_0000 | 0x3800_0000 | 0x4800_0000 => 0xFFFF_FFFF,
 
         a if vic::owns(a) => vic::read(a),
+        a if dma::owns(a) => dma::read(a),
 
         a if (HW_BASE..HW_END).contains(&a) => {
             log_unknown("hw read", a, sas);
@@ -81,6 +82,10 @@ pub fn read(ipa: u64, sas: u8) -> u32 {
 pub fn write(ipa: u64, sas: u8, value: u32) {
     if vic::owns(ipa) {
         vic::write(ipa, value);
+        return;
+    }
+    if dma::owns(ipa) {
+        dma::write(ipa, value);
         return;
     }
     if (HW_BASE..HW_END).contains(&ipa) {

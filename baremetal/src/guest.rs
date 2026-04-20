@@ -44,7 +44,11 @@ unsafe fn eret_to_guest(entry_ipa: u64) -> ! {
         hcr &= !(1u64 << 31); // RW = 0 (AArch32)
         hcr |= 1u64 << 20;    // TIDCP: trap implementation-defined CP15
         hcr |= 1u64 << 26;    // TVM:   trap guest writes to virtual-memory CP15 regs
-        hcr |= 1u64 << 30;    // TRVM:  trap guest reads of the same
+                              //        (SCTLR/TTBR/DACR change what's translated,
+                              //        so we need to mediate them; we intentionally
+                              //        do NOT set TRVM — guest reads of DFSR/DFAR
+                              //        etc. should go straight to hardware so the
+                              //        kernel's abort handler sees real fault info)
         hcr |= 1u64 << 22;    // TSW:   trap set/way cache maintenance
         hcr |= 1u64 << 3;     // FMO:   route physical FIQ to EL2 (needed for VF to deliver)
         hcr |= 1u64 << 4;     // IMO:   route physical IRQ to EL2 (needed for VI to deliver)

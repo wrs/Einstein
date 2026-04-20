@@ -127,18 +127,23 @@ test_main:
     mov     r0, #1
     hvc     #5                     @ mark 1: abort taken, handler ran, DFAR matches
 
-
-    @ Check 3: DFSR reflects the fault. With the current shim
-    @ (DFSR32_EL2 stubbed to 0 on A53/QEMU) the read returns 0 —
-    @ document that explicitly so a future real-DFSR wiring flips
-    @ this assertion and surfaces the change.
+    @ Check 3: DFSR reports an alignment fault. In the short-descriptor
+    @ format (TTBCR.EAE=0) the fault status is encoded in bits
+    @ [10, 3:0] with the FS[4]=0 FS[3:0]=0b0001 combination meaning
+    @ "Alignment fault". Verify the low nybble is 1 and bit 10 is 0.
     ldr     r0, =DFSR_SAVE_ADDR
-    ldr     r1, [r0]
+    ldr     r3, [r0]
+    mov     r0, r3
+    hvc     #2                     @ print the raw DFSR for the log
+    and     r1, r3, #0xF
+    cmp     r1, #1
+    bne     .Lfail_dfsr_class
+    and     r1, r3, #(1 << 10)
     cmp     r1, #0
-    bne     .Lfail_dfsr_stub_gone
+    bne     .Lfail_dfsr_class
 
     mov     r0, #2
-    hvc     #5                     @ mark 2: DFSR observed as stub (=0)
+    hvc     #5                     @ mark 2: DFSR reports alignment fault
 
     hvc     #3                     @ PASS
     bx      lr
@@ -154,10 +159,8 @@ test_main:
     hvc     #2
     mov     r0, #0x61
     hvc     #4
-.Lfail_dfsr_stub_gone:
-    @ If this fires the DFSR read is no longer a stub: good news,
-    @ but the expected value check above needs updating.
-    mov     r0, r1
+.Lfail_dfsr_class:
+    mov     r0, r3
     hvc     #2
     mov     r0, #0x62
     hvc     #4

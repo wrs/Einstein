@@ -331,29 +331,19 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
     // cache and TLB groups (CRn=7, CRn=8) and the one-off StrongARM
     // clock-control write (CRn=15, CRm=1, opc2=2) keep their native
     // encodings.
+    // Writes to virtual-memory CP15 regs (SCTLR/TTBR/DACR/FSR/FAR)
+    // trap via HCR_EL2.TVM. Reads of the same registers are NOT
+    // trapped (we don't set TRVM): the hardware already holds the
+    // right values — for SCTLR/TTBR/DACR because we synced them on
+    // the trapped write, for DFSR/DFAR because the CPU writes them
+    // when it takes an EL1 stage-1 abort. Guest MRC reads go straight
+    // to hardware and return the real values.
+    //
+    // Cache-maintenance (CRn=7) and TLB invalidation (CRn=8) are not
+    // covered by TVM; they trap via HCR_EL2.TIDCP / TSW.
     let tuple = (opc1, crn, crm, opc2, is_read);
     match tuple {
-        // --- reads ---
-        (0, 0, 0, 0, true) => {
-            // MIDR — report a StrongARM-compatible CPU ID so the ROM's
-            // probe doesn't reject us.
-            ctx.x[rt] = 0x4401_A100u64;
-        }
-        (0, 1, 0, 0, true) => ctx.x[rt] = cp15::read_sctlr_el1(),
-        (0, 2, 0, 0, true) => ctx.x[rt] = cp15::read_ttbr0_el1(),
-        (0, 3, 0, 0, true) => ctx.x[rt] = cp15::read_dacr32(),
-        (0, 5, 0, 0, true) => {
-            // DFSR — pass through the AArch32-compat view of the last
-            // EL1 stage-1 data abort. Accessible from EL2 because the
-            // guest is AArch32 (HCR_EL2.RW=0).
-            ctx.x[rt] = cp15::read_dfsr32();
-        }
-        (0, 6, 0, 0, true) => {
-            // DFAR — pass through the faulting address.
-            ctx.x[rt] = cp15::read_far_el1();
-        }
-
-        // --- writes ---
+        // --- writes to virtual-memory CP15 regs ---
         (0, 1, 0, 0, false) => {
             let value = ctx.x[rt] as u32;
             cp15::write_sctlr_el1(value as u64);
@@ -377,16 +367,12 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
         }
         (0, 3, 0, 0, false) => cp15::write_dacr32(ctx.x[rt]),
         (0, 5, 0, 0, false) => {
-            // Guest can write DFSR to prime the register or clear
-            // stale state. The probe didn't capture writes on its
-            // boot window but the ROM does emit them (e.g. at PC
-            // 0x18944 with `0x050e7130`), so reflect into DFSR32_EL2
-            // and let subsequent MRCs read back what the guest wrote
-            // until a real fault overwrites it.
+            // Guest writes to DFSR — pass through to hardware so
+            // subsequent guest reads see the intended value.
             cp15::write_dfsr32(ctx.x[rt]);
         }
         (0, 6, 0, 0, false) => {
-            // Guest writes to DFAR — reflect into FAR_EL1.
+            // Guest writes to DFAR — pass through to FAR_EL1.
             cp15::write_far_el1(ctx.x[rt]);
         }
 
@@ -461,40 +447,32 @@ fn log_unknown_cp15(is_read: bool, opc1: u32, crn: u32, crm: u32, opc2: u32, rt:
 // Small inline module with the raw sysreg touches, kept close to the
 // dispatch above so the trap handler stays readable.
 mod cp15 {
-    pub fn read_sctlr_el1() -> u64 { sysreg_read!("sctlr_el1") }
+    // Only the write paths are used by the hypervisor: we intercept
+    // guest MCRs to these CP15 registers via HCR_EL2.TVM and mirror
+    // the value into the corresponding EL2 sysreg. Guest reads are
+    // not trapped (we don't set TRVM) so they go straight to hardware
+    // and return the current value, which is either what we synced
+    // on the last trapped write (SCTLR/TTBR/DACR) or what the CPU
+    // wrote on the last EL1 abort (DFSR/DFAR).
+
     pub fn write_sctlr_el1(v: u64) { sysreg_write!("sctlr_el1", v); sync(); }
-
-    pub fn read_ttbr0_el1() -> u64 { sysreg_read!("ttbr0_el1") }
     pub fn write_ttbr0_el1(v: u64) { sysreg_write!("ttbr0_el1", v); sync(); }
-
-    pub fn read_dacr32() -> u64 { sysreg_read!("dacr32_el2") }
     pub fn write_dacr32(v: u64) { sysreg_write!("dacr32_el2", v); sync(); }
 
-    /// AArch32 DFSR, via the DFSR32_EL2 AArch64 alias. The guest must
-    /// be AArch32 at EL1 (HCR_EL2.RW=0) for this register to be
-    /// accessible from EL2; callers should only hit this path from
-    /// the CP15 trap handler, which by construction runs because the
-    /// guest executed MRC — i.e. the guest is AArch32.
-    /// AArch32 DFSR — architecturally accessible as DFSR32_EL2 from
-    /// EL2 AArch64 when the guest at EL1 is AArch32 (HCR_EL2.RW=0).
-    /// Per ARM ARM D10.2.32 the S-encoding is op0=3, op1=4, CRn=5,
-    /// CRm=0, op2=0, and the register is present whenever a lower EL
-    /// supports AArch32 (FEAT_AA32EL1) — confirmed on A53 by
-    /// `ID_AA64PFR0_EL1.EL1 == 0x2`.
-    ///
-    /// In this configuration on QEMU raspi3b both MRS and MSR to the
-    /// register take an EC=0 "Unknown reason" exception at EL2.
-    /// Suspected a QEMU quirk or an ARM ARM access rule we haven't
-    /// decoded; stubbed until the real path is verified on hardware.
-    /// Guests that rely on their own DFSR reading to dispatch aborts
-    /// currently see 0 here.
-    pub fn read_dfsr32() -> u64 { 0 }
-    pub fn write_dfsr32(_v: u64) { /* see read_dfsr32 note */ }
+    /// AArch32 DFSR, written via DFSR32_EL2 (op0=3 op1=4 CRn=5 CRm=0
+    /// op2=0, ARM ARM D10.2.32).
+    pub fn write_dfsr32(v: u64) {
+        // SAFETY: sysreg write; S-form encoding.
+        unsafe {
+            core::arch::asm!("msr S3_4_C5_C0_0, {}", in(reg) v,
+                options(nostack, preserves_flags));
+        }
+        sync();
+    }
 
-    /// FAR_EL1 — common register for both AArch32 DFAR/IFAR and
-    /// AArch64 FAR stage-1 faults at EL1.
-    pub fn read_far_el1() -> u64 { sysreg_read!("far_el1") }
     pub fn write_far_el1(v: u64) { sysreg_write!("far_el1", v); sync(); }
+
+    pub fn read_sctlr_el1() -> u64 { sysreg_read!("sctlr_el1") }
 
     pub fn cache_maintenance_barrier() {
         // StrongARM c7 cache ops don't all map cleanly to A53 encodings

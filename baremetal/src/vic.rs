@@ -1,4 +1,4 @@
-//! Minimal Newton virtual interrupt controller + timer.
+//! Minimal Newton virtual interrupt controller + tick clock.
 //!
 //! Stores the state the ROM touches early and returns sensible values:
 //!
@@ -6,14 +6,14 @@
 //!   timer (CNTPCT_EL0 scaled by CNTFRQ_EL0), reset on init. Reading this
 //!   register is the main unblocker for the guest's early polling loop.
 //!
-//!   Interrupt enable/mask/control registers — stored as plain state. No
-//!   actual interrupts delivered in this iteration; the guest's kernel
-//!   proceeds as if no peripheral has raised anything yet.
+//!   Interrupt enable/mask/control registers — stored as plain state;
+//!   writes that change the delivery gate (`int_present & int_ctrl & ~fiq_mask`)
+//!   are reflected into HCR_EL2.VI / VF on trap return.
 //!
-//!   Timer match registers — stored, not yet compared against ticks.
-//!
-//! A later iteration will inject vIRQ/vFIQ via HCR_EL2.VI / VF when the
-//! scheduler match register fires.
+//!   Timer match registers — each write rearms the CNTHP_CVAL_EL2 deadline
+//!   through `timer::rearm`. When the EL2 physical timer fires, the IRQ
+//!   handler in `trap.rs` calls `poll_timer_matches` here to latch the
+//!   crossed bit(s) into `int_present`, so the next `update_virq` sets VI.
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -121,9 +121,11 @@ const INT_TIMER_3: u32 = 0x0000_0040;
 #[allow(dead_code)]
 const INT_GPIO: u32 = 0x0100_0000;
 
-/// Called periodically (right now, after every MMIO trap). If any timer
-/// match register has been crossed, latches the matching interrupt bit
-/// into int_present so that update_virq_pending() will assert VI.
+/// Latch any timer-match bits whose deadline has passed into `int_present`
+/// so the next `update_virq` can assert HCR_EL2.VI. Called from the EL2
+/// IRQ handler after CNTHP fires (the primary path), and from the sync
+/// trap return as a safety net so MMIO writes that change VIC state see
+/// their delivery consequence without waiting for a timer expiry.
 pub fn poll_timer_matches() {
     // SAFETY: single-threaded.
     let s = unsafe { &mut *VIC.0.get() };

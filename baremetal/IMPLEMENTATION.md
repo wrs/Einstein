@@ -36,20 +36,20 @@
 
 ### 1.2 Why not link Einstein's C++
 
-We tried. See `baremetal/cxx-core/` at commit `26c1816` (now removed):
+We tried. See `cxx-core/` at commit `26c1816` (now removed):
 
 - The simple peripherals (`TFlash`, `TDMAManager`) are 30-60 lines of actual logic once you strip Einstein's save/restore and stdio plumbing. Rust ports are comparable in size.
 - The one with real mass, `TInterruptManager`, is mostly a `TThread` / `clock_gettime` scheduling wrapper around a small state machine — and none of that wrapper applies to a trap-driven hypervisor that polls from trap handlers instead of blocking a main thread on a condvar.
 - Freestanding Einstein means stubbing pthread, stdio, exceptions, RTTI, mmap, and maintaining an FFI boundary on both sides. We never actually succeeded in linking the bare-metal target against any Einstein object — all cxx-core tests were host-side (glibc + pthread). The freestanding port stayed perpetually "next".
-- Einstein is still the authority on register bit semantics. Instead of linking it, we keep it as a documentation source: [`baremetal/docs/peripherals.md`](./baremetal/docs/peripherals.md) captures what we learned about each peripheral with pointers into Einstein's files.
+- Einstein is still the authority on register bit semantics. Instead of linking it, we keep it as a documentation source: [`docs/peripherals.md`](docs/peripherals.md) captures what we learned about each peripheral with pointers into Einstein's files.
 
 ### 1.3 Peripheral ports — where they live
 
-Each peripheral is one Rust module under `baremetal/src/peripherals/`, with `#[cfg(test)]` unit tests that run under `cargo test` on the host. They cannot import `core::arch::asm!` or other bare-metal-only features in test mode; the state machine proper is platform-neutral, separated from the MMIO trap glue in `baremetal/src/mmio.rs`.
+Each peripheral is one Rust module under `src/peripherals/`, with `#[cfg(test)]` unit tests that run under `cargo test` on the host. They cannot import `core::arch::asm!` or other bare-metal-only features in test mode; the state machine proper is platform-neutral, separated from the MMIO trap glue in `src/mmio.rs`.
 
 ### 1.3 Concrete scope from the probe runs
 
-Against the 717006 ROM with the Einstein REx (90 s boot; see `baremetal/probe/FINDINGS.md` for the raw capture), the probe nailed down the implementation scope for several sections that were previously described as "to be enumerated empirically":
+Against the 717006 ROM with the Einstein REx (90 s boot; see [`probe/FINDINGS.md`](probe/FINDINGS.md) for the raw capture), the probe nailed down the implementation scope for several sections that were previously described as "to be enumerated empirically":
 
 - **CP15 shim:** 15 unique `(opc1, CRn, CRm, opc2, dir)` tuples total. Of those, 14 have direct AArch32-on-A53 equivalents (SCTLR, TTBR0, DACR, IFSR/DFSR, IFAR/DFAR, `DCCMVAC` and friends, TLBI variants). The 15th is a StrongARM `c15, op1=0, CRm=1, op2=2` clock-control write that fires **exactly once** at boot; trap-and-no-op. The shim's dispatch table is one Rust `match` with 15 arms — the compiler can enforce exhaustiveness.
 
@@ -87,55 +87,55 @@ Avoid: anything that pulls in `alloc` or `std` transitively. No global allocator
 ### 2.3 Project layout
 
 All new code lives under `baremetal/` at the repo root so upstream Einstein
-stays untouched and porting this work is a subdirectory merge.
+stays untouched and porting this work is a subdirectory merge. Paths
+below are relative to `baremetal/`.
 
 ```
-baremetal/
-  Cargo.toml
-  Cargo.lock
-  rust-toolchain.toml
-  build.rs               # NH_GUEST_TEST env var -> embed a test image
-  .cargo/config.toml     # target, rustflags, cargo-run QEMU runner
-  linker.ld              # image layout: load at 0x80000, 16 KiB stack
-  scripts/run-qemu.sh    # cargo runner: ELF -> kernel8.img -> QEMU
-  src/
-    main.rs              # no_std entry, kmain, banner
-    boot.s               # _start: park non-zero cores, SP, bss, call kmain
-    vectors.s            # EL2 vector table
-    cpu.rs               # CurrentEL, MPIDR_EL1, ID_AA64*_EL1, halt()
-    uart.rs              # PL011 driver + kprint!/kprintln! macros
-    panic.rs             # panic handler: print + halt
-    mmu.rs               # EL2 stage-1 identity map
-    stage2.rs            # guest-physical stage-2 tables
-    guest_mem.rs         # ROM / RAM / flash / framebuffer backing stores
-    guest.rs             # ERET to EL1 AArch32
-    trap.rs              # EL2 trap dispatch (data/insn abort, CP15, HVC)
-    mmio.rs              # address -> peripheral routing
-    vic.rs               # Newton VIC state + match-register edge detection
-    peripherals/         # (coming) Rust ports of Einstein's peripherals
-      flash.rs
-      dma.rs
-      ...
-  docs/
-    peripherals.md       # spec capturing Einstein's observable behaviour
-  roms/                  # .gitignore'd — developer-provided Newton ROM dumps
-  probe/                 # headless Einstein harness (C++, host build only)
-    probe.cpp
-    FINDINGS.md
-  guest-tests/           # AArch32 peripheral tests loaded as the guest
-    common/test_runtime.S
-    common/linker.ld
-    tests/*.S
-    scripts/{build-tests,run-test,run-all}.sh
+Cargo.toml
+Cargo.lock
+rust-toolchain.toml
+build.rs               # NH_GUEST_TEST env var -> embed a test image
+.cargo/config.toml     # target, rustflags, cargo-run QEMU runner
+linker.ld              # image layout: load at 0x80000, 16 KiB stack
+scripts/run-qemu.sh    # cargo runner: ELF -> kernel8.img -> QEMU
+src/
+  main.rs              # no_std entry, kmain, banner
+  boot.s               # _start: park non-zero cores, SP, bss, call kmain
+  vectors.s            # EL2 vector table
+  cpu.rs               # CurrentEL, MPIDR_EL1, ID_AA64*_EL1, halt()
+  uart.rs              # PL011 driver + kprint!/kprintln! macros
+  panic.rs             # panic handler: print + halt
+  mmu.rs               # EL2 stage-1 identity map
+  stage2.rs            # guest-physical stage-2 tables
+  guest_mem.rs         # ROM / RAM / flash / framebuffer backing stores
+  guest.rs             # ERET to EL1 AArch32
+  trap.rs              # EL2 trap dispatch (data/insn abort, CP15, HVC)
+  mmio.rs              # address -> peripheral routing
+  vic.rs               # Newton VIC state + match-register edge detection
+  timer.rs             # CNTHP async match delivery
+  peripherals/         # (coming) Rust ports of Einstein's peripherals
+    flash.rs
+    dma.rs
+    ...
+docs/
+  peripherals.md       # spec capturing Einstein's observable behaviour
+roms/                  # .gitignore'd — developer-provided Newton ROM dumps
+probe/                 # headless Einstein harness (C++, host build only)
+  probe.cpp
+  FINDINGS.md
+guest-tests/           # AArch32 peripheral tests loaded as the guest
+  common/test_runtime.S
+  common/linker.ld
+  tests/*.S
+  scripts/{build-tests,run-test,run-all}.sh
 ```
 
 ## 3. Peripheral ports
 
 We port each peripheral's state machine directly into Rust as a module
-under `baremetal/src/peripherals/`. The spec for each peripheral lives
-in [`baremetal/docs/peripherals.md`](./baremetal/docs/peripherals.md),
-which cross-references the Einstein C++ file + line numbers for
-ground truth.
+under `src/peripherals/`. The spec for each peripheral lives
+in [`docs/peripherals.md`](docs/peripherals.md), which cross-references
+the Einstein C++ file + line numbers for ground truth.
 
 ### 3.1 Scope per peripheral
 
@@ -157,7 +157,7 @@ Two tiers, both cheap:
   `#[cfg(test)]` module. Runs under `cargo test --target x86_64-unknown-linux-gnu`
   against the same Rust code that ships in the hypervisor — the state
   machine must not depend on bare-metal-only features.
-- **ARM-guest integration tests** under `baremetal/guest-tests/`.
+- **ARM-guest integration tests** under `guest-tests/`.
   AArch32 binaries loaded in place of the Newton ROM, poking MMIO from
   the guest side and reporting PASS/FAIL via HVC. Validates the full
   stack: MMU, stage-2, trap dispatch, Rust dispatcher, peripheral
@@ -165,10 +165,10 @@ Two tiers, both cheap:
 
 ### 3.3 Einstein as oracle, not dependency
 
-- Source-level: `baremetal/docs/peripherals.md` is the authoritative
-  spec for peripheral behaviour; when something there doesn't match
-  Einstein's C++, Einstein wins and the doc gets corrected.
-- Runtime: `baremetal/probe/` boots the full Einstein emulator
+- Source-level: [`docs/peripherals.md`](docs/peripherals.md) is the
+  authoritative spec for peripheral behaviour; when something there
+  doesn't match Einstein's C++, Einstein wins and the doc gets corrected.
+- Runtime: `probe/` boots the full Einstein emulator
   against the real ROM and captures observable state (MMU tables,
   CP15 op set, SWP call sites, etc.). That's how we validate our
   assumptions about what the Newton actually does. The probe is
@@ -190,7 +190,7 @@ Each peripheral is a Rust module with:
 Example sketch:
 
 ```rust
-// baremetal/src/peripherals/flash.rs
+// src/peripherals/flash.rs
 pub struct State {
     banks: [[u8; BANK_SIZE]; 2],
     fresh: bool,
@@ -205,7 +205,7 @@ impl State {
 }
 ```
 
-The MMIO dispatcher in `baremetal/src/mmio.rs` routes the IPA + size +
+The MMIO dispatcher in `src/mmio.rs` routes the IPA + size +
 value to the right peripheral's `read` / `write`. No FFI, no opaque
 handles — the Rust type system is the contract.
 

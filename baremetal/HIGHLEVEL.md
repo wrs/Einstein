@@ -43,7 +43,7 @@ Boot an unmodified Newton 2.x ROM on a bare-metal Pi Zero 2 W such that the gues
   +--------------------------------------------------------+
 ```
 
-\* Kernel-only-in-PL1 **confirmed empirically** against 717006: 19 310 USR entries vs 649 SVC entries over 90 s of boot; `SVC → USR` is the dominant transition (see `baremetal/probe/FINDINGS.md` §16.3).
+\* Kernel-only-in-PL1 **confirmed empirically** against 717006: 19 310 USR entries vs 649 SVC entries over 90 s of boot; `SVC → USR` is the dominant transition (see [`probe/FINDINGS.md`](probe/FINDINGS.md) §16.3).
 
 ### 3.1 Components
 
@@ -105,7 +105,7 @@ Guest runs natively at EL1 AArch32. No JIT, no interpreter. Newton's SVC/IRQ/FIQ
 
 ### 6.1 ARMv4-vs-ARMv8-AArch32 deltas needing trap-and-emulate at EL2
 
-Probe runs against 717006 narrowed the actual scope considerably; see `baremetal/probe/FINDINGS.md` for raw counts.
+Probe runs against 717006 narrowed the actual scope considerably; see [`probe/FINDINGS.md`](probe/FINDINGS.md) for raw counts.
 
 - **CP15.** Total surface is **15 `(opc1, CRn, CRm, opc2, dir)` tuples** across a 90 s boot. Trap via `HCR_EL2.TVM` / `TRVM` / `TID*`. The shim's handler table has 15 entries:
   - ID read (`c0,c0,0`), SCTLR (`c1,c1,0`), TTBR (`c2,c2,0`), DACR (`c3,c3,0`), FSR (`c5,c5,0`), FAR (`c6,c6,0`) — direct AArch32 equivalents.
@@ -229,11 +229,11 @@ JIT, recompilation, any software CPU emulation, Einstein's UI layer, Linux depen
 
 ## 16. Open questions
 
-All of these want verification against the actual ROM or hardware rather than memory or inference. As of the first probe pass (see `baremetal/probe/FINDINGS.md`), §16.2–§16.7 are answered for the 717006 ROM; §16.1 (EL2 handoff on real Pi firmware) is the only remaining design-level gate.
+All of these want verification against the actual ROM or hardware rather than memory or inference. As of the first probe pass (see [`probe/FINDINGS.md`](probe/FINDINGS.md)), §16.2–§16.7 are answered for the 717006 ROM; §16.1 (EL2 handoff on real Pi firmware) is the only remaining design-level gate.
 
 1. **EL2 availability at boot on Pi Zero 2 W.** Cortex-A53 has EL2. Does the Pi Zero 2 W firmware hand control to `kernel.img` at EL2, or has it already dropped to EL1? Needs RPi Foundation docs plus boot-time experiment.
-2. **Descriptor formats used by 2.x ROMs.** *Partially answered for 717006 — see `baremetal/probe/FINDINGS.md`.* Only sections, 64 KiB large pages, and 4 KiB small pages are actively mapped. No tiny pages. Three L1 slots (at VA 0x78000000, 0x90000000, 0xAC000000) hold fine-table descriptors but their L2 entries are all fault — placeholder reservations for PCMCIA card windows. Fine tables don't walk on A53 short descriptor, but since nothing is actually mapped through them, a straightforward hypervisor-side rewrite (L1 0b11 → 0b00) at guest TTBR-install time preserves semantics. Still needs verification against 737041, localised variants, and eMate ROMs.
-3. **Privilege levels of ROM regions.** *Answered — see `baremetal/probe/FINDINGS.md`.* 19 310 USR entries vs 649 SVC entries over 90 s of boot; kernel-only-PL1 confirmed. `SVC → USR` is the dominant edge. AP enforcement is the operative protection model; preserve it.
+2. **Descriptor formats used by 2.x ROMs.** *Partially answered for 717006 — see [`probe/FINDINGS.md`](probe/FINDINGS.md).* Only sections, 64 KiB large pages, and 4 KiB small pages are actively mapped. No tiny pages. Three L1 slots (at VA 0x78000000, 0x90000000, 0xAC000000) hold fine-table descriptors but their L2 entries are all fault — placeholder reservations for PCMCIA card windows. Fine tables don't walk on A53 short descriptor, but since nothing is actually mapped through them, a straightforward hypervisor-side rewrite (L1 0b11 → 0b00) at guest TTBR-install time preserves semantics. Still needs verification against 737041, localised variants, and eMate ROMs.
+3. **Privilege levels of ROM regions.** *Answered — see [`probe/FINDINGS.md`](probe/FINDINGS.md).* 19 310 USR entries vs 649 SVC entries over 90 s of boot; kernel-only-PL1 confirmed. `SVC → USR` is the dominant edge. AP enforcement is the operative protection model; preserve it.
 4. **Complete CP15 op set emitted by the kernel.** *Answered.* 15 unique `(opc1, CRn, CRm, opc2, dir)` tuples. All standard ARMv4 except one StrongARM-specific clock-control op that fires exactly once at boot. Hot path is cache maintenance; each op has a direct AArch32-on-A53 equivalent.
 5. **SWP / SWPB frequency and call sites.** *Answered.* 405 810 SWPs from **one** PC (`0x003AE200`), zero SWPB. Single ROM patch at that site replaces the entire SWP surface with `LDREX`/`STREX`. Trap-and-emulate also viable at ~4.5 k/s peak.
 6. **Domain usage.** *Answered.* DACR is written 38 953 times with the same value `0x00055555` — eight client domains, eight no-access domains, no manager domains, no StrongARM-specific side effects. A53 short-descriptor DACR semantics match exactly.

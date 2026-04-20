@@ -67,13 +67,10 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
         }
     }
 
-    // Re-evaluate virtual IRQ state after every trap. Real timer-match
-    // delivery happens asynchronously through `trap_irq` now, but keeping
-    // this poll as a safety net means any code path that mutates VIC
-    // state via an MMIO write (IntCtrl, FIQMask, IntClear...) promptly
-    // sees the HCR_EL2.VI consequence without waiting for the next timer
-    // IRQ.
-    vic::poll_timer_matches();
+    // Guest MMIO writes to IntCtrl / FIQMask / IntClear change the
+    // effective (`int_present & int_ctrl & ~fiq_mask`) pending set and
+    // must be reflected into HCR_EL2.VI / VF before ERET, or a cleared
+    // interrupt keeps re-firing (or an unmasked one never delivers).
     update_virq();
 
     // Periodically produce a "screenshot" of the guest's RAM + framebuffer

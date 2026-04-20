@@ -11,12 +11,8 @@
 //! On the BCM2836/2837 (Pi 3B, Pi Zero 2 W, QEMU raspi3b) the CNTHP PPI is
 //! routed through the per-core "ARM local" peripheral at 0x4000_0000 rather
 //! than a GIC. We program the core-0 timer IRQ-control register to route
-//! CNTHPIRQ to the IRQ input.
-//!
-//! The older "poll on every sync trap" path in `trap.rs` is left in place as
-//! a safety net for machines where the generic timer IRQ isn't wired up, but
-//! correctness no longer depends on it: a guest sitting in WFI with no MMIO
-//! traffic will still receive timer interrupts.
+//! CNTHPIRQ to the IRQ input. A Pi 4/5 port would need a GIC init pass
+//! instead.
 
 use crate::{kprintln, vic};
 

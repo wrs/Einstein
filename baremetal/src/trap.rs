@@ -42,6 +42,12 @@ const EC_HVC_A32: u32 = 0x12;
 const EC_INSN_ABORT_LOWER: u32 = 0x20;
 const EC_DATA_ABORT_LOWER: u32 = 0x24;
 
+/// HVC immediate used by the guest's UND-vector trampoline at VA 0x04.
+/// ARMv7 AArch32 has no HCR_EL2 bit that traps UND directly to EL2, so
+/// we install a one-word `HVC #UND_TAG` at the UND vector and decode
+/// the faulting instruction ourselves in `handle_und`.
+pub const UND_TAG: u32 = 0x10;
+
 /// Synchronous exception from a lower EL running AArch32.
 #[no_mangle]
 pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
@@ -265,6 +271,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         0x05 => {
             kprintln!("guest-mark: {:#010x}", r0);
         }
+        v if v == UND_TAG => {
+            handle_und(ctx);
+        }
         _ => {
             let elr = read_sysreg!("elr_el2");
             kprintln!();
@@ -273,6 +282,293 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         }
     }
     // HVC is a 4-byte ARM instruction; advance past it on return.
+}
+
+/// Trampoline-based undefined-instruction handler at EL2.
+///
+/// Flow: the guest's UND vector at VA 0x04 branches to a small AArch32
+/// stub (see `UND_CTX_SAVE_*` constants below). The stub runs in UND
+/// mode, saves R14_und (faulting_pc + 4) and SPSR_und (pre-UND CPSR)
+/// to fixed RAM slots, then issues `HVC #UND_TAG` to enter EL2. We
+/// decode the faulting instruction from guest memory, emulate, then
+/// override ELR_EL2 / SPSR_EL2 so ERET resumes in the original mode
+/// at the correct address.
+///
+/// Why the RAM-save stub: reading the AArch32 banked registers
+/// (LR_und / SPSR_und) from AArch64 EL2 via MRS returns 0 under QEMU
+/// raspi3b — the banked state doesn't propagate into the AArch64 view
+/// even though it's set correctly on the AArch32 side (verified with
+/// a pure-AArch32 probe; see the commit). So the trampoline persists
+/// what we need before bouncing to EL2.
+///
+/// Covered instructions (PLAN.md Phase A.2):
+/// - SWP / SWPB (any encoding). Emulated by plain load-store on the
+///   translated guest PA; no atomic primitive needed because we hold
+///   DAIF.I at EL2 for the entire emulation and the guest is single-
+///   core.
+/// - `0xE6000010` SystemBootUND: ELR += 8 (opcode + payload slot).
+/// - `0xE6000510` DebuggerUND:   ELR += 8, log the payload word.
+/// - `0xE6000810` TapFileCntlUND: ELR += 8, log the payload word.
+///   (Einstein's JIT uses GETCALLER()+4 for TapFileCntl; we match the
+///   JIT's page-compilation step for now — Phase B revisit when the
+///   ROM actually exercises filesystem UNDs.)
+/// - Anything else: log opcode + PC, halt loudly.
+///
+/// Fixed RAM slots used by the trampoline (must match guest tests and,
+/// eventually, the ROM's patch_und_vector):
+///   0x04000400  — saved LR_und (faulting_pc + 4)
+///   0x04000404  — saved SPSR_und (pre-UND CPSR)
+pub const UND_SAVE_LR_IPA: u32 = 0x0400_0400;
+pub const UND_SAVE_SPSR_IPA: u32 = 0x0400_0404;
+
+fn handle_und(ctx: &mut TrapContext) {
+    let lr_und = match read_guest_word_pa(UND_SAVE_LR_IPA) {
+        Some(v) => v,
+        None => {
+            kprintln!("*** handle_und: UND_SAVE_LR slot unreadable");
+            cpu::halt();
+        }
+    };
+    let spsr_und = read_guest_word_pa(UND_SAVE_SPSR_IPA).unwrap_or(0) as u64;
+    let faulting_pc = lr_und.wrapping_sub(4);
+
+    let insn = match read_guest_word_pa(faulting_pc) {
+        Some(w) => w,
+        None => {
+            kprintln!(
+                "*** handle_und: faulting PC {:#x} is outside mapped guest memory",
+                faulting_pc
+            );
+            cpu::halt();
+        }
+    };
+
+    // Einstein's JIT (TJITGenericPage.cpp) advances PC by 8 past each
+    // of these three UNDs — opcode + a 4-byte payload slot. We mirror
+    // that; the payload interpretation varies per UND (debugger logs
+    // a string, TapFileCntl takes a command word in R0) but early-boot
+    // just needs the PC advance + budgeted visibility.
+    match insn {
+        0xE6000010 => {
+            log_und_budgeted("SystemBootUND", faulting_pc, None);
+            return_to_guest(ctx, (faulting_pc + 8) as u64, spsr_und);
+        }
+        0xE6000510 => {
+            let payload = read_guest_word_pa(faulting_pc + 4).unwrap_or(0);
+            log_und_budgeted("DebuggerUND", faulting_pc, Some(payload));
+            return_to_guest(ctx, (faulting_pc + 8) as u64, spsr_und);
+        }
+        0xE6000810 => {
+            let payload = read_guest_word_pa(faulting_pc + 4).unwrap_or(0);
+            log_und_budgeted("TapFileCntlUND", faulting_pc, Some(payload));
+            return_to_guest(ctx, (faulting_pc + 8) as u64, spsr_und);
+        }
+        _ if is_swp_encoding(insn) => {
+            emulate_swp(ctx, insn, faulting_pc);
+            return_to_guest(ctx, (faulting_pc + 4) as u64, spsr_und);
+        }
+        _ => {
+            kprintln!(
+                "*** unrecognised UND: insn={:#010x} at PC={:#x} SPSR_und={:#x}",
+                insn, faulting_pc, spsr_und
+            );
+            kprintln!(
+                "    (extend handle_und in trap.rs to handle this opcode)"
+            );
+            cpu::halt();
+        }
+    }
+}
+
+fn is_swp_encoding(insn: u32) -> bool {
+    // ARMv7 A8.8.229: SWP  cond 0001_0000 Rn Rd SBZ 1001 Rm  (word)
+    //                 SWPB cond 0001_0100 Rn Rd SBZ 1001 Rm  (byte)
+    // Mask zeros cond (bits 31:28), Rn (19:16), Rd (15:12), SBZ (11:8),
+    // Rm (3:0). Leaves bits [27:20] + [7:4] for the opcode check.
+    (insn & 0x0FB0_0FF0) == 0x0100_0090
+}
+
+/// Emulate a SWP / SWPB instruction. The CPU took UND on A53 (SCTLR.SW
+/// = 0 by default on ARMv8). AArch32 R0..R12 are non-banked for the
+/// USR/SYS/SVC/ABT/UND/IRQ modes the Newton kernel actually uses and
+/// map directly to ctx.x[0..12], so we can read/write the operand regs
+/// through the saved context.
+fn emulate_swp(ctx: &mut TrapContext, insn: u32, faulting_pc: u32) {
+    let is_byte = (insn & 0x0040_0000) != 0;
+    let rn = ((insn >> 16) & 0xF) as usize;
+    let rd = ((insn >> 12) & 0xF) as usize;
+    let rm = (insn & 0xF) as usize;
+
+    // FIQ-mode and banked-SP/LR operands would need the banked-register
+    // machinery. The Newton kernel's one SWP site (probe/FINDINGS.md
+    // §16.5) uses low regs, and our tests stay below r13.
+    if rn >= 13 || rd >= 13 || rm >= 13 {
+        kprintln!(
+            "*** SWP with banked reg operand: insn={:#010x} PC={:#x} Rn=r{} Rd=r{} Rm=r{}",
+            insn, faulting_pc, rn, rd, rm
+        );
+        cpu::halt();
+    }
+
+    let addr = ctx.x[rn] as u32;
+    let new_value = ctx.x[rm] as u32;
+
+    if is_byte {
+        let old = match read_guest_byte_pa(addr) {
+            Some(v) => v,
+            None => {
+                kprintln!("*** SWPB [r{}]={:#x} — address not writable", rn, addr);
+                cpu::halt();
+            }
+        };
+        if !write_guest_byte_pa(addr, new_value as u8) {
+            kprintln!("*** SWPB [r{}]={:#x} — address not writable", rn, addr);
+            cpu::halt();
+        }
+        ctx.x[rd] = old as u64;
+    } else {
+        if addr & 3 != 0 {
+            kprintln!(
+                "*** SWP with unaligned address r{}={:#x} (ignored, guest may fault)",
+                rn, addr
+            );
+        }
+        let old = match read_guest_word_pa(addr) {
+            Some(v) => v,
+            None => {
+                kprintln!("*** SWP [r{}]={:#x} — address not readable", rn, addr);
+                cpu::halt();
+            }
+        };
+        if !write_guest_word_pa(addr, new_value) {
+            kprintln!("*** SWP [r{}]={:#x} — address not writable", rn, addr);
+            cpu::halt();
+        }
+        ctx.x[rd] = old as u64;
+    }
+
+    log_swp_budgeted(faulting_pc, is_byte, rn, rd, rm, addr);
+}
+
+fn return_to_guest(_ctx: &mut TrapContext, elr: u64, spsr: u64) {
+    // SAFETY: writing EL2 sysregs; restore tail ERETs using these values.
+    unsafe {
+        core::arch::asm!(
+            "msr elr_el2, {elr}",
+            "msr spsr_el2, {spsr}",
+            "isb",
+            elr = in(reg) elr,
+            spsr = in(reg) spsr,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Read a 32-bit guest word by guest PA. Returns None if the address
+/// doesn't land inside a backing store we know about (ROM / RAM). Used
+/// for reading the faulting instruction and UND-payload words out of
+/// ROM, and for the SWP load side when the target is in RAM. MMU-off
+/// paths (early ROM boot, guest tests) have VA == IPA == PA, which is
+/// the only case this helper handles; post-MMU-on use AT S12E1R first
+/// to translate VA -> PA.
+fn read_guest_word_pa(pa: u32) -> Option<u32> {
+    let pa = pa as usize;
+    if pa.checked_add(4)? > 0 && pa + 4 <= guest_mem::ROM_SIZE {
+        let host = (guest_mem::rom_host_pa() as usize) + pa;
+        // SAFETY: bounds-checked against the ROM backing store.
+        return Some(unsafe { core::ptr::read_volatile(host as *const u32) });
+    }
+    const RAM_BASE: usize = 0x0400_0000;
+    if (RAM_BASE..RAM_BASE + guest_mem::RAM_SIZE).contains(&pa)
+        && pa + 4 <= RAM_BASE + guest_mem::RAM_SIZE
+    {
+        let host = (guest_mem::ram_host_pa() as usize) + (pa - RAM_BASE);
+        // SAFETY: bounds-checked.
+        return Some(unsafe { core::ptr::read_volatile(host as *const u32) });
+    }
+    None
+}
+
+fn write_guest_word_pa(pa: u32, value: u32) -> bool {
+    let pa = pa as usize;
+    const RAM_BASE: usize = 0x0400_0000;
+    if (RAM_BASE..RAM_BASE + guest_mem::RAM_SIZE).contains(&pa)
+        && pa + 4 <= RAM_BASE + guest_mem::RAM_SIZE
+    {
+        let host = (guest_mem::ram_host_pa() as usize) + (pa - RAM_BASE);
+        // SAFETY: bounds-checked against RAM backing store.
+        unsafe {
+            core::ptr::write_volatile(host as *mut u32, value);
+        }
+        return true;
+    }
+    // Refuse writes to ROM / unmapped regions — SWP into ROM is a bug.
+    false
+}
+
+fn read_guest_byte_pa(pa: u32) -> Option<u8> {
+    let pa = pa as usize;
+    if pa < guest_mem::ROM_SIZE {
+        let host = (guest_mem::rom_host_pa() as usize) + pa;
+        return Some(unsafe { core::ptr::read_volatile(host as *const u8) });
+    }
+    const RAM_BASE: usize = 0x0400_0000;
+    if (RAM_BASE..RAM_BASE + guest_mem::RAM_SIZE).contains(&pa) {
+        let host = (guest_mem::ram_host_pa() as usize) + (pa - RAM_BASE);
+        return Some(unsafe { core::ptr::read_volatile(host as *const u8) });
+    }
+    None
+}
+
+fn write_guest_byte_pa(pa: u32, value: u8) -> bool {
+    let pa = pa as usize;
+    const RAM_BASE: usize = 0x0400_0000;
+    if (RAM_BASE..RAM_BASE + guest_mem::RAM_SIZE).contains(&pa) {
+        let host = (guest_mem::ram_host_pa() as usize) + (pa - RAM_BASE);
+        unsafe {
+            core::ptr::write_volatile(host as *mut u8, value);
+        }
+        return true;
+    }
+    false
+}
+
+fn log_und_budgeted(name: &str, pc: u32, payload: Option<u32>) {
+    static mut UND_LOG_BUDGET: usize = 16;
+    // SAFETY: single-threaded.
+    let ok = unsafe {
+        if UND_LOG_BUDGET > 0 {
+            UND_LOG_BUDGET -= 1;
+            true
+        } else {
+            false
+        }
+    };
+    if ok {
+        match payload {
+            Some(p) => kprintln!("und: {} @PC={:#x} payload={:#010x}", name, pc, p),
+            None => kprintln!("und: {} @PC={:#x}", name, pc),
+        }
+    }
+}
+
+fn log_swp_budgeted(pc: u32, is_byte: bool, rn: usize, rd: usize, rm: usize, addr: u32) {
+    static mut SWP_LOG_BUDGET: usize = 8;
+    // SAFETY: single-threaded.
+    let ok = unsafe {
+        if SWP_LOG_BUDGET > 0 {
+            SWP_LOG_BUDGET -= 1;
+            true
+        } else {
+            false
+        }
+    };
+    if ok {
+        kprintln!(
+            "und: SWP{} @PC={:#x} r{} <- [r{}={:#x}] <- r{}",
+            if is_byte { "B" } else { "" }, pc, rd, rn, addr, rm
+        );
+    }
 }
 
 // ISS layout for EC=0x03 (trapped MCR/MRC to CP15):

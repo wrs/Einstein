@@ -402,11 +402,14 @@ pub unsafe fn load_newton_rom() {
         first, second
     );
 
-    // Exception vectors are left pristine. Earlier iterations patched
-    // undef / prefetch-abort / data-abort to `movs pc, lr` because
-    // DFSR/DFAR reads were going through a broken shim; that was
-    // fixed by dropping HCR_EL2.TRVM. The ROM's own handler now has
-    // everything it needs to dispatch the fault — if we can reach it.
+    // Exception vectors are left pristine. The UND handler at EL2
+    // (src/trap.rs::handle_und) can dispatch SWP / Einstein UND
+    // opcodes, but to hook it we need to install a small AArch32
+    // trampoline (save LR_und + SPSR_und to fixed RAM slots, then
+    // HVC #UND_TAG) somewhere the guest will execute. Guest-tests
+    // place that trampoline inline; ROM-mode install is a Phase A.2
+    // follow-on (needs a free ROM region to host the trampoline
+    // body + a branch from VA 0x04 that reaches it).
 
     // Bring-up shim #2: the 717006 kernel uses StrongARM's lax CP15 encoding
     // where CRm == CRn for most system-control registers. On ARMv7+ those

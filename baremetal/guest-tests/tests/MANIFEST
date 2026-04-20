@@ -5,3 +5,4 @@ test_dma
 test_pcmcia
 test_cp15_fault_regs
 test_finetable_rewrite
+test_und_handler

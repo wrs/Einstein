@@ -47,12 +47,19 @@ const TWO_MIB: u64 = 0x0020_0000;
 // Einstein side.
 pub const ROM_IPA_BASE: u64 = 0x0000_0000;
 pub const ROM_IPA_SIZE: u64 = 0x0100_0000; // 16 MiB
+pub const FLASH_IPA_BASE: u64 = 0x0200_0000;
+pub const FLASH_IPA_SIZE: u64 = 0x0080_0000; // 8 MiB internal store (MP2x00)
 pub const RAM_IPA_BASE: u64 = 0x0400_0000;
 pub const RAM_IPA_SIZE: u64 = 0x0040_0000; // 4 MiB
 // Kernel expects RAM at VA 0x0C000000 after stage-1 MMU is on. Until our
 // CP15 shim cleanly enables guest stage-1, mirror the RAM at IPA 0x0C000000
 // so guest stage-1-off accesses to that region work against the same bytes.
 pub const RAM_MIRROR_IPA_BASE: u64 = 0x0C00_0000;
+// Framebuffer scratch: a dumpable RAM region where guest screen drivers can
+// deposit pixels. Not yet wired to any Newton display emulation; the region
+// exists so M5 can point `TScreenManager`-equivalent code at it.
+pub const FB_IPA_BASE: u64 = 0x0E00_0000;
+pub const FB_IPA_SIZE: u64 = 0x0020_0000; // 2 MiB
 
 const VTCR_EL2_VAL: u64 = (32 << 0)
     | (0b01 << 6)          // SL0 = start at level 1
@@ -102,6 +109,19 @@ pub unsafe fn init() {
         );
     }
 
+    // Flash (internal store): 8 MiB R/W at guest PA 0x0200_0000. Persistent
+    // across guest reboots within a single hypervisor lifetime.
+    let flash_pa = guest_mem::flash_host_pa();
+    // SAFETY: helper bounds-checks.
+    unsafe {
+        set_l2_blocks(
+            FLASH_IPA_BASE,
+            flash_pa,
+            FLASH_IPA_SIZE / TWO_MIB,
+            BLOCK_NORMAL_RW,
+        );
+    }
+
     // RAM: 4 MiB read-write at guest PA 0x0400_0000.
     let ram_pa = guest_mem::ram_host_pa();
     // SAFETY: as above.
@@ -119,6 +139,18 @@ pub unsafe fn init() {
             RAM_MIRROR_IPA_BASE,
             ram_pa,
             RAM_IPA_SIZE / TWO_MIB,
+            BLOCK_NORMAL_RW,
+        );
+    }
+
+    // Framebuffer: dumpable RAM for future screen-manager code.
+    let fb_pa = guest_mem::fb_host_pa();
+    // SAFETY: as above.
+    unsafe {
+        set_l2_blocks(
+            FB_IPA_BASE,
+            fb_pa,
+            FB_IPA_SIZE / TWO_MIB,
             BLOCK_NORMAL_RW,
         );
     }
@@ -161,6 +193,16 @@ pub unsafe fn init() {
     kprintln!(
         "stage2: RAM mirror @ IPA {:#x}..{:#x} -> SAME host PA (RW)",
         RAM_MIRROR_IPA_BASE, RAM_MIRROR_IPA_BASE + RAM_IPA_SIZE
+    );
+    kprintln!(
+        "stage2: flash @ IPA {:#x}..{:#x} -> host PA {:#x} (RW, {} MiB)",
+        FLASH_IPA_BASE, FLASH_IPA_BASE + FLASH_IPA_SIZE, flash_pa,
+        FLASH_IPA_SIZE / (1024 * 1024)
+    );
+    kprintln!(
+        "stage2: framebuffer @ IPA {:#x}..{:#x} -> host PA {:#x} (RW, {} MiB)",
+        FB_IPA_BASE, FB_IPA_BASE + FB_IPA_SIZE, fb_pa,
+        FB_IPA_SIZE / (1024 * 1024)
     );
     kprintln!("stage2: all other IPAs fault to EL2");
 }

@@ -35,9 +35,6 @@ static MMIO_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub fn read(ipa: u64, sas: u8) -> u32 {
     let value = match ipa {
-        // Empty / erased flash: 0xFF bytes everywhere.
-        a if (FLASH1_BASE..FLASH1_END).contains(&a) => 0xFFFF_FFFF,
-
         HW_RAM_SIZE_1 => 0x4040_0040,
         HW_RAM_SIZE_2 => 0,
 
@@ -47,6 +44,11 @@ pub fn read(ipa: u64, sas: u8) -> u32 {
             log_unknown("hw read", a, sas);
             0
         }
+
+        // Flash is now stage-2-mapped and never reaches this dispatcher,
+        // but keep the fallback for any IPA below flash end in case we
+        // ever hit an unaligned / out-of-range access.
+        a if (FLASH1_BASE..FLASH1_END).contains(&a) => 0xFFFF_FFFF,
 
         a => {
             log_unknown("unmapped read", a, sas);
@@ -58,16 +60,18 @@ pub fn read(ipa: u64, sas: u8) -> u32 {
 }
 
 pub fn write(ipa: u64, sas: u8, value: u32) {
-    if (FLASH1_BASE..FLASH1_END).contains(&ipa) {
-        log_unknown("flash write (ignored)", ipa, sas);
-        return;
-    }
     if vic::owns(ipa) {
         vic::write(ipa, value);
         return;
     }
     if (HW_BASE..HW_END).contains(&ipa) {
         log_unknown("hw write (ignored)", ipa, sas);
+        let _ = value;
+        return;
+    }
+    // Flash writes come through stage-2 directly (the region is mapped RW).
+    if (FLASH1_BASE..FLASH1_END).contains(&ipa) {
+        log_unknown("flash write via trap (ignored)", ipa, sas);
         let _ = value;
         return;
     }

@@ -101,7 +101,8 @@ VBAR_EL2 = 0x0000000000080800
 guest_mem: loading 8388608 bytes of ROM (byteswap big-endian -> little-endian)
 stage2: ROM @ IPA 0x0..0x1000000  ... (RO)
 stage2: RAM @ IPA 0x4000000..0x4400000 ... (RW)
-stage2: flash @ IPA 0x2000000..0x2800000 ... (RW, 8 MiB)
+stage2: flash bank 0 @ IPA 0x2000000..0x2400000 ... (RW, 4 MiB)
+stage2: flash bank 1 @ IPA 0x10000000..0x10400000 ... (RW, 4 MiB)
 stage2: framebuffer @ IPA 0xe000000..0xe200000 ... (RW, 2 MiB)
 vic: timer epoch = ... CNTFRQ_EL0 = 62500000 Hz  (Newton tick = 3686400 Hz)
 timer: CNTHP armed, CNTFRQ=62500000 Hz, CNTHPIRQ -> core0 IRQ

@@ -1,26 +1,26 @@
 @ tests/test_flash.S
 @
-@ Exercises the flash region at guest IPA 0x0200_0000. The hypervisor
-@ maps flash stage-2 RW (no trap) onto a zero-initialised backing that
-@ peripherals::flash::init seeds with a Newton "DLDS"/"OSCD" header at
-@ block 0 (offset 0) and block 1 (offset 0x10000). Tests:
+@ Exercises the flash regions at guest IPAs 0x0200_0000 (bank 0,
+@ Einstein kFlashBank1) and 0x1000_0000 (bank 1, kFlashBank2). Each
+@ bank is 4 MiB, mapped stage-2 RW onto its half of the single 8 MiB
+@ backing in peripherals::flash. Bank 0 is seeded with Einstein's
+@ "DLDS" / "OSCD" header at block 0 (offset 0) and block 1 (offset
+@ 0x10000); bank 1 is left zero. Tests:
 @
-@   * Header: the seeded words are readable at their documented offsets
-@     in both blocks of bank 0.
-@   * Unwritten region: reads as 0x00000000 (matches Einstein's
-@     zero-initialised mmap behaviour).
-@   * Plain store / load round-trips land in the backing.
-@   * Byte granularity: an STRB changes only the target byte.
-@   * Bank 1 (0x0240_0000) is a distinct region, not a mirror of bank 0.
+@   * Bank 0 header readable at its documented offsets.
+@   * Unwritten region in bank 0 reads as 0.
+@   * Word store + load round-trips (bank 0 and bank 1).
+@   * Byte granularity: STRB changes only the target byte.
+@   * Bank 0 and bank 1 are independent (no aliasing).
 
 #include "../common/test_runtime.S"
 
     .equ FLASH_BANK0, 0x02000000
-    .equ FLASH_BANK1, 0x02400000
+    .equ FLASH_BANK1, 0x10000000
 
     .global test_main
 test_main:
-    @ --- Header, block 0 ---
+    @ --- Header, block 0 of bank 0 ---
     ldr     r4, =FLASH_BANK0
     ldr     r0, [r4, #0x00]
     ldr     r1, =0x444C4453         @ "DLDS"
@@ -42,9 +42,7 @@ test_main:
     cmp     r0, r1
     bne     .Lfail_n_block0
 
-    @ --- Header, block 1 (inside bank 0, not bank 1) ---
-    @ Offsets past 4095 don't fit in the LDR immediate field, so build
-    @ block-1's base address in r7 and use small offsets from there.
+    @ --- Header, block 1 within bank 0 (offset 0x10000, not bank 1) ---
     add     r7, r4, #0x10000
     ldr     r0, [r7, #0]
     ldr     r1, =0x444C4453
@@ -59,29 +57,26 @@ test_main:
     mov     r0, #1
     hvc     #5                      @ mark 1: header intact
 
-    @ --- Unwritten region reads as zero ---
+    @ --- Unwritten region of bank 0 reads zero ---
     ldr     r0, [r4, #0x200]
     cmp     r0, #0
     bne     .Lfail_unwritten
 
-    @ --- Write / readback ---
+    @ --- Bank 0: write / readback ---
     ldr     r6, =0xDEADBEEF
     str     r6, [r4, #0x200]
     ldr     r0, [r4, #0x200]
     cmp     r0, r6
-    bne     .Lfail_readback
+    bne     .Lfail_bank0_readback
 
-    @ Neighbouring word untouched.
-    ldr     r0, [r4, #0x204]
+    ldr     r0, [r4, #0x204]        @ neighbour untouched
     cmp     r0, #0
     bne     .Lfail_neighbour
 
     mov     r0, #2
-    hvc     #5                      @ mark 2: word write + neighbour
+    hvc     #5                      @ mark 2: bank 0 word write
 
-    @ --- Byte write changes only one byte ---
-    @ Write 0xAABBCCDD at 0x300, then overwrite the LSB with 0x11 via
-    @ STRB. Expect 0xAABBCC11.
+    @ --- Byte granularity: STRB changes only the target byte ---
     ldr     r6, =0xAABBCCDD
     str     r6, [r4, #0x300]
     mov     r1, #0x11
@@ -94,17 +89,15 @@ test_main:
     mov     r0, #3
     hvc     #5                      @ mark 3: byte granularity
 
-    @ --- Bank 1 is a separate region ---
-    @ Bank 1 isn't seeded by Einstein (or us), so offset 0 reads zero.
+    @ --- Bank 1 (kFlashBank2) is a separate 4 MiB region ---
     ldr     r5, =FLASH_BANK1
     ldr     r0, [r5, #0]
     cmp     r0, #0
     bne     .Lfail_bank1_seeded
 
-    @ A write in bank 1 doesn't affect bank 0 (no aliasing).
     ldr     r6, =0xCAFEF00D
     str     r6, [r5, #0x400]
-    ldr     r0, [r4, #0x400]        @ bank 0 at same relative offset
+    ldr     r0, [r4, #0x400]        @ bank 0 at same offset must be unaffected
     cmp     r0, #0
     bne     .Lfail_bank_alias
 
@@ -139,7 +132,7 @@ test_main:
 .Lfail_unwritten:
     hvc     #2
     hvc_fail 0x26
-.Lfail_readback:
+.Lfail_bank0_readback:
     hvc     #2
     hvc_fail 0x27
 .Lfail_neighbour:

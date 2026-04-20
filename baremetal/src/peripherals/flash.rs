@@ -1,10 +1,17 @@
 //! Newton internal-store flash — Rust port of Einstein's `TFlash`.
 //!
-//! Two 4 MiB banks back-to-back, mapped to guest IPAs 0x02000000 (bank 0)
-//! and 0x02400000 (bank 1). Stage-2 maps the backing RW with no trap
-//! path: the Newton kernel manages the AMD-style programming state
-//! machine in software, so plain CPU loads / stores to the mapped
-//! pages are all the guest ever needs.
+//! Two 4 MiB banks held back-to-back in a single 8 MiB backing, but
+//! surfaced to the guest at two disjoint IPAs matching the real
+//! hardware map:
+//!
+//!   guest IPA 0x02000000..0x02400000 → bytes 0..0x400000 of backing (bank 0)
+//!   guest IPA 0x10000000..0x10400000 → bytes 0x400000..0x800000   (bank 1)
+//!
+//! Stage-2 maps both windows RW with no trap path: the Newton kernel
+//! manages the AMD-style programming state machine in software, so
+//! plain CPU loads / stores to the mapped pages are all the guest
+//! ever needs. Cross-reference `Emulator/TMemoryConsts.h` for
+//! `kFlashBank1` (0x02000000) and `kFlashBank2` (0x10000000).
 //!
 //! On a fresh boot, `init()` seeds the Newton filesystem header
 //! (duplicated at block 0 / offset 0 and block 1 / offset 0x10000 of

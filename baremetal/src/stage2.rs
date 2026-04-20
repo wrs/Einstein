@@ -47,8 +47,14 @@ const TWO_MIB: u64 = 0x0020_0000;
 // Einstein side.
 pub const ROM_IPA_BASE: u64 = 0x0000_0000;
 pub const ROM_IPA_SIZE: u64 = 0x0100_0000; // 16 MiB
-pub const FLASH_IPA_BASE: u64 = 0x0200_0000;
-pub const FLASH_IPA_SIZE: u64 = 0x0080_0000; // 8 MiB internal store (MP2x00)
+// Flash is split in two disjoint windows on real Newton hardware:
+// bank 0 at `kFlashBank1` (0x02000000..0x02400000) and bank 1 at
+// `kFlashBank2` (0x10000000..0x10400000), each 4 MiB. Einstein keeps
+// both banks back-to-back in a single 8 MiB backing; the mapping
+// below surfaces each half at the right guest IPA.
+pub const FLASH_BANK_IPA_SIZE: u64 = 0x0040_0000; // 4 MiB per bank
+pub const FLASH_BANK0_IPA_BASE: u64 = 0x0200_0000;
+pub const FLASH_BANK1_IPA_BASE: u64 = 0x1000_0000;
 pub const RAM_IPA_BASE: u64 = 0x0400_0000;
 pub const RAM_IPA_SIZE: u64 = 0x0040_0000; // 4 MiB
 // Kernel expects RAM at VA 0x0C000000 after stage-1 MMU is on. Until our
@@ -109,15 +115,24 @@ pub unsafe fn init() {
         );
     }
 
-    // Flash (internal store): 8 MiB R/W at guest PA 0x0200_0000. Persistent
-    // across guest reboots within a single hypervisor lifetime.
+    // Flash bank 0 (internal store): 4 MiB R/W at guest PA 0x0200_0000.
+    // Backed by the first half of peripherals::flash's static buffer;
+    // persistent across guest reboots within a single hypervisor lifetime.
     let flash_pa = peripherals::flash::host_pa();
-    // SAFETY: helper bounds-checks.
+    // SAFETY: helper bounds-checks; flash_pa is 2-MiB aligned.
     unsafe {
         set_l2_blocks(
-            FLASH_IPA_BASE,
+            FLASH_BANK0_IPA_BASE,
             flash_pa,
-            FLASH_IPA_SIZE / TWO_MIB,
+            FLASH_BANK_IPA_SIZE / TWO_MIB,
+            BLOCK_NORMAL_RW,
+        );
+        // Flash bank 1 (kFlashBank2): 4 MiB R/W at guest PA 0x1000_0000.
+        // Backed by the second half of the same static buffer.
+        set_l2_blocks(
+            FLASH_BANK1_IPA_BASE,
+            flash_pa + FLASH_BANK_IPA_SIZE,
+            FLASH_BANK_IPA_SIZE / TWO_MIB,
             BLOCK_NORMAL_RW,
         );
     }
@@ -195,9 +210,14 @@ pub unsafe fn init() {
         RAM_MIRROR_IPA_BASE, RAM_MIRROR_IPA_BASE + RAM_IPA_SIZE
     );
     kprintln!(
-        "stage2: flash @ IPA {:#x}..{:#x} -> host PA {:#x} (RW, {} MiB)",
-        FLASH_IPA_BASE, FLASH_IPA_BASE + FLASH_IPA_SIZE, flash_pa,
-        FLASH_IPA_SIZE / (1024 * 1024)
+        "stage2: flash bank 0 @ IPA {:#x}..{:#x} -> host PA {:#x} (RW, {} MiB)",
+        FLASH_BANK0_IPA_BASE, FLASH_BANK0_IPA_BASE + FLASH_BANK_IPA_SIZE,
+        flash_pa, FLASH_BANK_IPA_SIZE / (1024 * 1024)
+    );
+    kprintln!(
+        "stage2: flash bank 1 @ IPA {:#x}..{:#x} -> host PA {:#x} (RW, {} MiB)",
+        FLASH_BANK1_IPA_BASE, FLASH_BANK1_IPA_BASE + FLASH_BANK_IPA_SIZE,
+        flash_pa + FLASH_BANK_IPA_SIZE, FLASH_BANK_IPA_SIZE / (1024 * 1024)
     );
     kprintln!(
         "stage2: framebuffer @ IPA {:#x}..{:#x} -> host PA {:#x} (RW, {} MiB)",

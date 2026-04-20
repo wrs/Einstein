@@ -28,10 +28,11 @@ const HW_END: u64 = 0x0F40_0000;
 const HW_RAM_SIZE_1: u64 = 0x0F00_1800;
 const HW_RAM_SIZE_2: u64 = 0x0F00_1C00;
 
-/// Upper bound on chatty log lines before we go silent (stops runaway
-/// output when the guest spins on an MMIO poll).
-const MMIO_LOG_BUDGET: usize = 128;
-static MMIO_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Per-region bucket: IPA rounded to 4 KiB, decide once whether to log.
+const MAX_UNIQUE_BUCKETS: usize = 256;
+static BUCKET_KEYS: [AtomicUsize; MAX_UNIQUE_BUCKETS] =
+    [const { AtomicUsize::new(0) }; MAX_UNIQUE_BUCKETS];
+static BUCKET_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub fn read(ipa: u64, sas: u8) -> u32 {
     let value = match ipa {
@@ -88,16 +89,30 @@ fn mask_for_size(value: u32, sas: u8) -> u32 {
 }
 
 fn log_unknown(what: &str, ipa: u64, sas: u8) {
-    let n = MMIO_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < MMIO_LOG_BUDGET {
-        let width = match sas {
-            0 => "B ",
-            1 => "H ",
-            2 => "W ",
-            _ => "D ",
-        };
-        kprintln!("mmio[{:3}] {}{} IPA={:#010x}", n, width, what, ipa);
-    } else if n == MMIO_LOG_BUDGET {
-        kprintln!("mmio log budget exhausted — silencing further output");
+    // Dedup by 4 KiB page so a spin-loop on one address only logs once.
+    let key = (ipa >> 12) as usize | 1; // 1-based so 0 means "empty slot"
+    for i in 0..MAX_UNIQUE_BUCKETS {
+        let cur = BUCKET_KEYS[i].load(Ordering::Relaxed);
+        if cur == key {
+            return; // already logged this page
+        }
+        if cur == 0 {
+            // Try to claim the slot.
+            if BUCKET_KEYS[i]
+                .compare_exchange(0, key, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                let n = BUCKET_COUNT.fetch_add(1, Ordering::Relaxed);
+                let width = match sas {
+                    0 => "B ", 1 => "H ", 2 => "W ", _ => "D ",
+                };
+                kprintln!(
+                    "mmio[uniq {:3}] {}{} IPA={:#010x}",
+                    n, width, what, ipa
+                );
+                return;
+            }
+        }
     }
+    // Table full — silently drop further new pages.
 }

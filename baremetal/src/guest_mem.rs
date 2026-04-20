@@ -66,6 +66,153 @@ pub fn fb_host_pa() -> u64 {
     addr_of_mut!(GUEST_FB) as u64
 }
 
+/// Walk the guest's stage-1 L1 table at TTBR=0x0400_0000 and, for every
+/// coarse L2 table we can reach, clear the XN (execute-never) bit on
+/// entries whose type field is large/small page.
+///
+/// Rationale: ARMv4 second-level descriptors treat bit 15 as SBZ, but
+/// ARMv7/v8 short-descriptor re-interpret the same bit as XN. The
+/// 717006 ROM's prebuilt L2 tables happen to have bit 15 set in many
+/// entries, so A53's stage-1 walker treats the corresponding ROM code
+/// pages as non-executable and every instruction fetch aborts.
+///
+/// We walk the tables once, when the guest first writes TTBR0 (CP15
+/// c2 c0 0). Tables in ROM are modified via our backing store — guests
+/// see ROM as stage-2 read-only, but from EL2 we own the bytes.
+pub fn fix_stage1_xn_bits() {
+    use crate::kprintln;
+    let ram = addr_of_mut!(GUEST_RAM) as *mut u32;
+    let rom = addr_of_mut!(GUEST_ROM) as *mut u32;
+
+    let mut l2_tables = 0usize;
+    let mut patched = 0usize;
+    let mut sections_patched = 0usize;
+
+    // L1 sits at the start of guest RAM (TTBR0 = 0x0400_0000 per probe).
+    for i in 0..4096 {
+        // SAFETY: L1 is 16 KiB = 4096 × 4 bytes, at RAM[0..16384].
+        let entry = unsafe { ram.add(i).read() };
+        let typ = entry & 3;
+
+        // Normalise section descriptor to minimal-valid ARMv7 form:
+        // preserve PA (bits 31:20) + domain (8:5), clear XN/AP[2]/TEX/S/nG,
+        // force AP[1:0] = 0b11 (RW both levels) + C/B = 1.
+        if typ == 2 {
+            let new = (entry & 0xFFF0_01E0) | 0x0000_0C0E;
+            if new != entry {
+                // SAFETY: i < 4096.
+                unsafe { ram.add(i).write(new); }
+                sections_patched += 1;
+            }
+        }
+
+        // Normalise coarse descriptor: preserve L2 ptr (bits 31:10) + domain
+        // (8:5), clear the ARMv4 SBO bits (4) and NS (3).
+        if typ == 1 {
+            let new = (entry & 0xFFFF_FC00) | (entry & 0x0000_01E0) | 0x01;
+            if new != entry {
+                // SAFETY: i < 4096.
+                unsafe { ram.add(i).write(new); }
+            }
+        }
+
+        if typ != 1 {
+            continue; // only coarse L2 tables for the XN-on-page-entries pass
+        }
+        let l2_pa = (entry & 0xFFFF_FC00) as usize;
+        // Pick backing store pointer by region.
+        let (base, region_start, region_size) = if l2_pa < ROM_SIZE {
+            (rom, 0usize, ROM_SIZE)
+        } else if (0x04000000..0x04000000 + RAM_SIZE as u64)
+            .contains(&(l2_pa as u64))
+        {
+            (ram, 0x04000000usize, RAM_SIZE)
+        } else {
+            continue;
+        };
+        let l2_idx_start = (l2_pa - region_start) / 4;
+        if l2_idx_start + 256 > region_size / 4 {
+            continue;
+        }
+        l2_tables += 1;
+
+        // Coarse L2 has 256 entries, each 4 bytes. Rewrite each non-fault
+        // entry into minimal valid ARMv7 form: preserve the PA, force
+        // AP = 0b11 (RW both levels), C = B = 1, XN = 0. This strips the
+        // ARMv4 subpage-permission bits which ARMv7 would reinterpret as
+        // XN/AP[2]/TEX etc.
+        for j in 0..256 {
+            // SAFETY: bounds checked above.
+            let ptr = unsafe { base.add(l2_idx_start + j) };
+            let e = unsafe { ptr.read() };
+            let typ = e & 3;
+            let new = match typ {
+                0 => continue,                         // fault, leave alone
+                1 => (e & 0xFFFF_0000) | 0x0000_003D,  // large page, RW/RW, CB
+                2 | 3 => (e & 0xFFFF_F000) | 0x0000_003E, // small page, XN=0
+                _ => unreachable!(),
+            };
+            if new != e {
+                unsafe { ptr.write(new); }
+                patched += 1;
+            }
+        }
+    }
+
+    kprintln!(
+        "fix_stage1_xn_bits: {} sections de-XN'd, {} L2 tables walked, {} L2 entries de-XN'd",
+        sections_patched, l2_tables, patched
+    );
+}
+
+/// Dump the first 32 entries of the guest's stage-1 L1 page table, which we
+/// assume lives at the start of guest RAM (TTBR0 = 0x0400_0000 per the
+/// 717006 probe; stage-2 maps that IPA to the host ram backing). Each
+/// entry covers 1 MiB of VA, so this is the VA 0..32 MiB window.
+pub fn dump_guest_l1_table() {
+    use crate::kprintln;
+    let ram = addr_of_mut!(GUEST_RAM) as *const u32;
+    let rom = addr_of_mut!(GUEST_ROM) as *const u32;
+    kprintln!("guest L1 (TTBR=0x0400_0000) first 32 entries (each covers 1 MiB):");
+    for i in 0..32 {
+        // SAFETY: i < 32; guest L1 table is 4 KiB = 1024 entries so well
+        // inside GUEST_RAM bounds.
+        let entry = unsafe { ram.add(i).read() };
+        let kind = match entry & 3 {
+            0 => "fault",
+            1 => "coarse",
+            2 => "section",
+            3 => "fine",
+            _ => unreachable!(),
+        };
+        let va_start = (i as u32) << 20;
+        if entry != 0 {
+            kprintln!(
+                "  L1[{:3}] VA {:#010x}+1MB = {:#010x} ({})",
+                i, va_start, entry, kind
+            );
+            if (entry & 3) == 1 {
+                let l2_pa = (entry & 0xFFFF_FC00) as usize;
+                let src_ptr = if l2_pa < ROM_SIZE { rom }
+                              else if (0x04000000..0x04400000).contains(&(l2_pa as u64)) {
+                                  ram
+                              } else { core::ptr::null() };
+                if !src_ptr.is_null() {
+                    kprintln!("         L2 table @ PA {:#x}:", l2_pa);
+                    // print L2[0x00] and L2[0x18..0x1f] — the range covering
+                    // VA 0x18000 where we see the fetches fail.
+                    for j in [0usize, 0x18, 0x19, 0x1a, 0x1b] {
+                        let off = (l2_pa & 0x00FF_FFFF) / 4 + j;
+                        // SAFETY: l2_pa is in-bounds for the region we chose.
+                        let e = unsafe { src_ptr.add(off).read() };
+                        kprintln!("           L2[{:#04x}] = {:#010x}", j, e);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Emit a compact hex summary of the framebuffer to the UART for offline
 /// inspection. Prints the first 512 bytes plus a histogram of non-zero
 /// pages so a reviewer can see if the guest has actually drawn anything.
@@ -144,11 +291,17 @@ pub unsafe fn load_rom() {
         first, second
     );
 
-    // Bring-up shim #1: patch the ROM's exception vectors (undef/SWI/P-abort/
-    // D-abort/IRQ/FIQ) to `movs pc, lr` so early EL1 exceptions silently
-    // return to the next instruction. Without this, any UNDEF fired by an
-    // unimplemented CP15 op would branch into the ROM jump-table region,
-    // which is only reachable via guest stage-1 — itself not yet set up.
+    // Vector patches: keep the undef / prefetch-abort / data-abort vectors
+    // rewritten to `movs pc, lr` so that any fault during early boot — or
+    // any fault whose real handler lives in a ROM jump-table VA we haven't
+    // yet been able to reach — breaks out of the otherwise-infinite
+    // exception-to-vector-to-exception loop. Once the guest is far enough
+    // along for its own handlers to work, it can overwrite these through
+    // its kernel (ROM is stage-2 read-only to the guest but writable from
+    // EL2; a future pass can unpatch at a specific milestone).
+    //
+    // Keep word 0 (reset) pristine. Patch 1..=6 = undef / SWI / P-abort /
+    // D-abort / IRQ / FIQ.
     unsafe {
         for i in 1..=6 {
             rom_ptr.add(i).write(0xE1B0_F00E); // movs pc, lr

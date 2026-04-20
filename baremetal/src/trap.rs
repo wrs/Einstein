@@ -8,7 +8,7 @@
 //! return — the vector trailer restores the context and ERETs. Handlers that
 //! don't want to resume never return (they call `cpu::halt`).
 
-use crate::{cpu, kprintln, mmio};
+use crate::{cpu, guest_mem, kprintln, mmio};
 
 macro_rules! read_sysreg {
     ($reg:literal) => {{
@@ -134,14 +134,27 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
 fn handle_instruction_abort(iss: u32) {
     let far = read_sysreg!("far_el2");
     let hpfar = read_sysreg!("hpfar_el2");
-    let elr = read_sysreg!("elr_el2");
     let ipa = ((hpfar >> 4) << 12) | (far & 0xFFF);
-    kprintln!();
-    kprintln!("*** guest instruction abort ***");
-    kprintln!("ELR_EL2={:#x}  FAR={:#x}  IPA={:#x}  IFSC={:#x}",
-        elr, far, ipa, iss & 0x3f);
-    kprintln!("(no code mapped here — halting until M3+ wires the jump-table area)");
-    cpu::halt();
+    static mut SEEN: [u64; 32] = [u64::MAX; 32];
+    static mut NEXT: usize = 0;
+    let already = unsafe {
+        let mut hit = false;
+        for i in 0..SEEN.len() { if SEEN[i] == ipa { hit = true; break; } }
+        if !hit && NEXT < SEEN.len() { SEEN[NEXT] = ipa; NEXT += 1; }
+        hit
+    };
+    if !already {
+        let elr = read_sysreg!("elr_el2");
+        kprintln!(
+            "iabort[uniq] ELR={:#x} FAR={:#x} IPA={:#x} IFSC={:#x} — skipping",
+            elr, far, ipa, iss & 0x3f
+        );
+    }
+    // Skip the 32-bit ARM instruction that couldn't be fetched. Execution
+    // resumes at PC+4. This is aggressive — if the instruction was supposed
+    // to run, we've just silently dropped it — but it lets boot continue
+    // past the chained-abort loops that otherwise trap us.
+    advance_elr(4);
 }
 
 fn handle_hvc(_ctx: &mut TrapContext, iss: u32) {
@@ -214,8 +227,47 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
     } else {
         let value = ctx.x[rt] as u32;
         match crn {
-            1 => cp15::write_sctlr_el1(value as u64),
-            2 => cp15::write_ttbr0_el1(value as u64),
+            1 => {
+                cp15::write_sctlr_el1(value as u64);
+                // Log every SCTLR write — there are only a few and each is
+                // architecturally significant (MMU enable, V bit, etc.).
+                static mut SCTLR_N: usize = 0;
+                let n = unsafe { let v = SCTLR_N; SCTLR_N += 1; v };
+                if n < 6 {
+                    let sctlr_now = cp15::read_sctlr_el1();
+                    kprintln!(
+                        "cp15.sctlr[{}] wrote {:#010x} (M={} V={} C={} I={})",
+                        n, value,
+                        value & 1,
+                        (value >> 13) & 1,
+                        (value >> 2) & 1,
+                        (value >> 12) & 1,
+                    );
+                    kprintln!("   SCTLR_EL1 after write = {:#018x}", sctlr_now);
+                }
+                // When MMU comes on for the first time, dump the guest's
+                // first-level page-table entries so we can see what the
+                // kernel mapped and where it points.
+                if (value & 1) != 0 && n < 10 {
+                    guest_mem::dump_guest_l1_table();
+                }
+            }
+            2 => {
+                cp15::write_ttbr0_el1(value as u64);
+                // First TTBR write locks in where the guest's page tables
+                // live. Walk them and strip the XN bits that ARMv7/v8
+                // would honour but the Newton's ARMv4 tables don't
+                // intend, before the guest switches stage-1 on.
+                static mut TTBR_FIXED: bool = false;
+                let already = unsafe {
+                    let v = TTBR_FIXED;
+                    TTBR_FIXED = true;
+                    v
+                };
+                if !already {
+                    guest_mem::fix_stage1_xn_bits();
+                }
+            }
             3 => cp15::write_dacr32(value as u64),
             7 => cp15::cache_maintenance_nop(), // A53 handles coherency
             8 => cp15::invalidate_tlb(),

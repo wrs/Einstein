@@ -343,6 +343,19 @@ fn handle_und(ctx: &mut TrapContext) {
         }
     };
 
+    // StrongARM CP15 clock-control write (MCR p15, 0, Rt, c15, c1, 2).
+    // ARMv8 doesn't define that register, so the instruction raises UND
+    // locally at EL1 rather than trapping via HCR_EL2.TIDCP — which is
+    // why we handle it here and not in handle_cp15_trap. Fires exactly
+    // once during 717006 boot (probe/FINDINGS.md §16.4); treat as a
+    // no-op and advance past it. Mask clears Rt (bits 15:12); the
+    // encoding otherwise matches MCR p15,0,Rt,c15,c1,2 (0xEE0F_0F51).
+    if (insn & 0xFFFF_0FFF) == 0xEE0F_0F51 {
+        log_cp15_strongarm_clock(faulting_pc);
+        return_to_guest(ctx, (faulting_pc + 4) as u64, spsr_und);
+        return;
+    }
+
     // Einstein's JIT (TJITGenericPage.cpp) advances PC by 8 past each
     // of these three UNDs — opcode + a 4-byte payload slot. We mirror
     // that; the payload interpretation varies per UND (debugger logs
@@ -549,6 +562,22 @@ fn log_und_budgeted(name: &str, pc: u32, payload: Option<u32>) {
             Some(p) => kprintln!("und: {} @PC={:#x} payload={:#010x}", name, pc, p),
             None => kprintln!("und: {} @PC={:#x}", name, pc),
         }
+    }
+}
+
+fn log_cp15_strongarm_clock(pc: u32) {
+    static mut LOG_BUDGET: usize = 2;
+    // SAFETY: single-threaded.
+    let ok = unsafe {
+        if LOG_BUDGET > 0 {
+            LOG_BUDGET -= 1;
+            true
+        } else {
+            false
+        }
+    };
+    if ok {
+        kprintln!("und: MCR p15,0,Rt,c15,c1,2 (StrongARM clock) @PC={:#x} — no-op", pc);
     }
 }
 

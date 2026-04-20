@@ -402,14 +402,20 @@ pub unsafe fn load_newton_rom() {
         first, second
     );
 
-    // Exception vectors are left pristine. The UND handler at EL2
-    // (src/trap.rs::handle_und) can dispatch SWP / Einstein UND
-    // opcodes, but to hook it we need to install a small AArch32
-    // trampoline (save LR_und + SPSR_und to fixed RAM slots, then
-    // HVC #UND_TAG) somewhere the guest will execute. Guest-tests
-    // place that trampoline inline; ROM-mode install is a Phase A.2
-    // follow-on (needs a free ROM region to host the trampoline
-    // body + a branch from VA 0x04 that reaches it).
+    // UND vector (VA 0x04) + trampoline body: overwrite the ROM's
+    // branch-to-REx-handler with a branch to a small AArch32 stub we
+    // install at ROM offset 0x80. The stub saves R14_und and SPSR_und
+    // to fixed RAM slots (0x04000400 / 0x04000404), then issues
+    // HVC #UND_TAG so src/trap.rs::handle_und can decode and emulate
+    // the faulting instruction. Without this the A53-only CP15 UNDs
+    // (c15 c1 op2=2) and the Einstein UND opcodes would take the
+    // REx handler's path, which our hypervisor isn't set up to
+    // service. Phase A.2 of PLAN.md.
+    // SAFETY: rom_ptr covers ROM_SIZE bytes; patch_und_vector writes
+    // 4 bytes at offset 0x04 and 36 bytes starting at offset 0x80 —
+    // both in the first 256 bytes of ROM, confirmed zero from offset
+    // 0x58 onwards on Newton 2.x ROMs.
+    unsafe { patch_und_vector(rom_ptr); }
 
     // Bring-up shim #2: the 717006 kernel uses StrongARM's lax CP15 encoding
     // where CRm == CRn for most system-control registers. On ARMv7+ those
@@ -424,6 +430,61 @@ pub unsafe fn load_newton_rom() {
         "guest_mem: rewrote {} CP15 c1/c2/c3/c5/c6 encodings (StrongARM CRm=n -> ARMv7 CRm=0)",
         patched
     );
+}
+
+/// Install the AArch32 UND-vector trampoline.
+///
+/// The trampoline body lives in the 16 MiB ROM region at offset
+/// `UND_TRAMP_OFFSET` — well past the REx tail (Einstein.rex ends
+/// ~0x0084_7000) and in guaranteed-zero padding that the kernel
+/// can't plausibly touch. A 64-byte ROM region this deep is free
+/// game for us. The vector at VA 0x04 branches to it.
+///
+/// An earlier iteration parked the body at ROM offset 0x80 (inside
+/// the 256-byte header that reads as zeros in the raw dump). That
+/// broke boot: the 717006 kernel reads that region as a table, so
+/// turning zeros into instructions shifted the DABT/PABT loop the
+/// boot gets stuck in. Moving the body far beyond the REx tail
+/// avoids any such aliasing.
+///
+/// Trampoline body (arm-none-eabi-as disassembly):
+///   +0x00:  e92d0003   push {r0, r1}
+///   +0x04:  e59f0014   ldr r0, [pc, #20]      ; literal at +0x20
+///   +0x08:  e580e000   str lr, [r0]            ; LR_und -> UND_SAVE_LR_IPA
+///   +0x0C:  e14f1000   mrs r1, SPSR            ; r1 = SPSR_und
+///   +0x10:  e5801004   str r1, [r0, #4]        ; SPSR -> UND_SAVE_SPSR_IPA
+///   +0x14:  e8bd0003   pop {r0, r1}
+///   +0x18:  e1400170   hvc #0x10               ; UND_TAG — enter EL2
+///   +0x1C:  eafffffe   b .                     ; trap if we ever return
+///   +0x20:  04000400   .word UND_SAVE_LR_IPA
+///
+/// Branch encoding at VA 0x04: `b UND_TRAMP_OFFSET`.
+///   imm24 = (UND_TRAMP_OFFSET - (0x04 + 8)) / 4
+///
+/// Safety: caller must hold exclusive access to the ROM backing
+/// store. Writes 9 words at the trampoline offset + 1 word at 0x04.
+const UND_TRAMP_OFFSET: usize = 0x00FF_FF00;
+
+unsafe fn patch_und_vector(rom: *mut u32) {
+    let imm24 = ((UND_TRAMP_OFFSET as u32 - 0x0C) / 4) & 0x00FF_FFFF;
+    let branch_insn = 0xEA00_0000 | imm24;
+
+    // SAFETY: offsets below all sit in 0x00FF_FF00..0x00FF_FF24,
+    // well under ROM_SIZE (= 16 MiB = 0x0100_0000).
+    unsafe {
+        rom.add(1).write(branch_insn);              // 0x04: b UND_TRAMP_OFFSET
+
+        let base = UND_TRAMP_OFFSET / 4;
+        rom.add(base).write(0xE92D_0003);           // push {r0, r1}
+        rom.add(base + 1).write(0xE59F_0014);       // ldr r0, [pc, #20]
+        rom.add(base + 2).write(0xE580_E000);       // str lr, [r0]
+        rom.add(base + 3).write(0xE14F_1000);       // mrs r1, SPSR
+        rom.add(base + 4).write(0xE580_1004);       // str r1, [r0, #4]
+        rom.add(base + 5).write(0xE8BD_0003);       // pop {r0, r1}
+        rom.add(base + 6).write(0xE140_0170);       // hvc #0x10
+        rom.add(base + 7).write(0xEAFF_FFFE);       // b . (trap)
+        rom.add(base + 8).write(0x0400_0400);       // literal: UND_SAVE_LR_IPA
+    }
 }
 
 /// Scan ROM words and rewrite MCR/MRC to CP15 c{1,2,3,5,6} with non-zero CRm

@@ -43,7 +43,14 @@ static mut GUEST_FB: Framebuffer = Framebuffer([0; FRAMEBUFFER_SIZE]);
 // Big-endian ROM dump captured from hardware. Each 32-bit word is stored
 // with the MSB first in memory. Guest runs little-endian, so we byteswap
 // word-by-word during load.
+#[cfg(not(nh_guest_test))]
 static ROM_BE: &[u8] = include_bytes!("../roms/newton.rom");
+
+// Guest-test mode: `build.rs` picked up $NH_GUEST_TEST and set this cfg.
+// The embedded bytes are an AArch32 flat binary with reset vector at
+// offset 0, built by baremetal/guest-tests/scripts/build-tests.sh.
+#[cfg(nh_guest_test)]
+static GUEST_TEST_BIN: &[u8] = include_bytes!(env!("NH_GUEST_TEST_PATH"));
 
 /// Host physical base of the guest ROM backing store.
 pub fn rom_host_pa() -> u64 {
@@ -290,6 +297,37 @@ const _: () = assert!(FRAMEBUFFER_SIZE % TWO_MIB == 0);
 /// beyond the embedded file's length are left zero (so the 8 MiB "Opt. ROM"
 /// half reads as zeros until we start supplying a real REx).
 pub unsafe fn load_rom() {
+    #[cfg(nh_guest_test)]
+    {
+        return unsafe { load_guest_test() };
+    }
+    #[cfg(not(nh_guest_test))]
+    {
+        unsafe { load_newton_rom() }
+    }
+}
+
+#[cfg(nh_guest_test)]
+pub unsafe fn load_guest_test() {
+    let rom_ptr = addr_of_mut!(GUEST_ROM) as *mut u8;
+    kprintln!(
+        "guest_mem: GUEST-TEST MODE — embedding {} bytes",
+        GUEST_TEST_BIN.len()
+    );
+    for (i, b) in GUEST_TEST_BIN.iter().enumerate() {
+        // SAFETY: i < GUEST_TEST_BIN.len() <= ROM_SIZE.
+        unsafe { rom_ptr.add(i).write(*b); }
+    }
+    kprintln!(
+        "guest_mem: guest-test @ host PA {:#x}, RAM @ host PA {:#x}",
+        rom_host_pa(), ram_host_pa()
+    );
+    // No vector patching, no CP15 rewriting — guest-test binaries are
+    // already ARMv7-correct.
+}
+
+#[cfg(not(nh_guest_test))]
+pub unsafe fn load_newton_rom() {
     let rom_ptr = addr_of_mut!(GUEST_ROM) as *mut u32;
     let be_words = ROM_BE.len() / 4;
 

@@ -210,11 +210,41 @@ fn handle_instruction_abort(iss: u32) {
     advance_elr(4);
 }
 
-fn handle_hvc(_ctx: &mut TrapContext, iss: u32) {
-    let elr = read_sysreg!("elr_el2");
-    kprintln!();
-    kprintln!("*** guest HVC #{:#x} at ELR={:#x} (halting)", iss & 0xFFFF, elr);
-    cpu::halt();
+fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
+    // Guest-test protocol — see baremetal/guest-tests/README.md.
+    let imm = iss & 0xFFFF;
+    let r0 = ctx.x[0] as u32;
+    match imm {
+        0x01 => {
+            // Print one ASCII byte from r0.
+            let b = r0 as u8;
+            if b == b'\n' { crate::uart::write_byte(b'\r'); }
+            crate::uart::write_byte(b);
+        }
+        0x02 => {
+            kprintln!("guest-hex: {:#010x}", r0);
+        }
+        0x03 => {
+            kprintln!();
+            kprintln!("*** guest test PASSED (r0={:#x}) ***", r0);
+            cpu::halt();
+        }
+        0x04 => {
+            kprintln!();
+            kprintln!("*** guest test FAILED (code={:#x}) ***", r0);
+            cpu::halt();
+        }
+        0x05 => {
+            kprintln!("guest-mark: {:#010x}", r0);
+        }
+        _ => {
+            let elr = read_sysreg!("elr_el2");
+            kprintln!();
+            kprintln!("*** unknown HVC #{:#x} at ELR={:#x} (halting)", imm, elr);
+            cpu::halt();
+        }
+    }
+    // HVC is a 4-byte ARM instruction; advance past it on return.
 }
 
 // ISS layout for EC=0x03 (trapped MCR/MRC to CP15):

@@ -61,6 +61,12 @@ struct VicState {
     int_ed_2: u32,          // 0x0F184400
     int_ed_3: u32,          // 0x0F184800
     match_reg: [u32; 4],    // 0x0F182000/400/800/C00
+    // Edge-detection state: bit i is set once the corresponding match
+    // register has fired since its last write. We only raise the timer
+    // interrupt on the rising edge; otherwise the handler clearing
+    // int_present would immediately re-raise because `ticks >= match`
+    // stays true.
+    match_fired: u32,
     // GPIO-adjacent registers the ROM hits during early probe.
     gpio_r: u32,            // 0x0F18C000
     gpio_e: u32,            // 0x0F18C400
@@ -81,6 +87,7 @@ static VIC: VicCell = VicCell(UnsafeCell::new(VicState {
     int_ed_2: 0,
     int_ed_3: 0,
     match_reg: [0; 4],
+    match_fired: 0,
     gpio_r: 0,
     gpio_e: 0,
     gpio_c: 0,
@@ -107,9 +114,9 @@ const INT_TIMER_3: u32 = 0x0000_0040;
 #[allow(dead_code)]
 const INT_GPIO: u32 = 0x0100_0000;
 
-/// Called periodically (after every MMIO trap). Inject whatever timer /
-/// enabled-IRQ bits look "due" into int_present so the VI/VF update
-/// path can deliver them on the next ERET.
+/// Called periodically (right now, after every MMIO trap). If any timer
+/// match register has been crossed, latches the matching interrupt bit
+/// into int_present so that update_virq_pending() will assert VI.
 pub fn poll_timer_matches() {
     // SAFETY: single-threaded.
     let s = unsafe { &mut *VIC.0.get() };
@@ -121,29 +128,15 @@ pub fn poll_timer_matches() {
         (2, INT_TIMER_2),
         (3, INT_TIMER_3),
     ] {
-        if s.match_reg[i] != 0
-            && now.wrapping_sub(s.match_reg[i]) < 0x8000_0000
-            && (s.int_present & bit) == 0
-        {
+        let slot_bit = 1u32 << i;
+        let already_fired = (s.match_fired & slot_bit) != 0;
+        let crossed = s.match_reg[i] != 0
+            && now.wrapping_sub(s.match_reg[i]) < 0x8000_0000;
+        if crossed && !already_fired {
             raise |= bit;
+            s.match_fired |= slot_bit;
         }
     }
-
-    // If the kernel has enabled any IRQ / FIQ source but no timer matches
-    // have fired yet, raise whatever IS enabled once every ~10000 ticks
-    // so the kernel can make progress past its "waiting for first
-    // interrupt" state. This is a pure bring-up shim and is not what the
-    // real hardware does — remove once the guest is past scheduler init.
-    static mut LAST_WAKE: u32 = 0;
-    let last = unsafe { LAST_WAKE };
-    if now.wrapping_sub(last) > 10_000 {
-        let enabled_no_timer = s.int_ctrl & !(INT_TIMER_0 | INT_TIMER_1 | INT_TIMER_2 | INT_TIMER_3);
-        if enabled_no_timer != 0 && (s.int_present & enabled_no_timer) == 0 {
-            raise |= enabled_no_timer & (INT_RTC_ALARM | INT_TIMER_3 | 0x0100_0000);
-            unsafe { LAST_WAKE = now; }
-        }
-    }
-
     if raise != 0 {
         s.int_present |= raise;
     }
@@ -295,10 +288,10 @@ pub fn write(ipa: u64, value: u32) {
         K_HDWR_P0F110000 => s.p0f110000 = value,
         K_HDWR_P0F111400 => s.p0f111400 = value,
         K_HDWR_P0F180400 => { /* misc write, ignore */ }
-        K_HDWR_MATCH_0 => s.match_reg[0] = value,
-        K_HDWR_MATCH_1 => s.match_reg[1] = value,
-        K_HDWR_MATCH_2 => s.match_reg[2] = value,
-        K_HDWR_MATCH_3 => s.match_reg[3] = value,
+        K_HDWR_MATCH_0 => { s.match_reg[0] = value; s.match_fired &= !0b0001; }
+        K_HDWR_MATCH_1 => { s.match_reg[1] = value; s.match_fired &= !0b0010; }
+        K_HDWR_MATCH_2 => { s.match_reg[2] = value; s.match_fired &= !0b0100; }
+        K_HDWR_MATCH_3 => { s.match_reg[3] = value; s.match_fired &= !0b1000; }
         K_HDWR_INT_CTRL => s.int_ctrl = value,
         K_HDWR_INT_CLEAR => {
             // Writing clears the matching bits in int_present.

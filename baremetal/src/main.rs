@@ -17,6 +17,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub extern "C" fn kmain() -> ! {
     uart::init();
     print_banner();
+    print_caps();
+    kprintln!();
     kprintln!("Halted on core 0. Cores 1-3 parked in WFE.");
     kprintln!("Connect gdb via `target remote :1234` when running with `-s -S`.");
     cpu::halt();
@@ -30,4 +32,41 @@ fn print_banner() {
     kprintln!("===============================================");
     kprintln!("Current EL: {}", cpu::current_el());
     kprintln!("Core ID:    {}", cpu::core_id());
+}
+
+/// Dump the capability registers we need to confirm before M1.5 — EL2
+/// presence, stage-2 / virtualization support, cache and MMU granularity
+/// support. We only print; interpretation is in the user-facing output.
+fn print_caps() {
+    let midr = cpu::midr_el1();
+    let pfr0 = cpu::id_aa64pfr0_el1();
+    let mmfr0 = cpu::id_aa64mmfr0_el1();
+    let mmfr1 = cpu::id_aa64mmfr1_el1();
+    let isar0 = cpu::id_aa64isar0_el1();
+    let hcr = cpu::hcr_el2();
+
+    kprintln!();
+    kprintln!("--- CPU capability registers ---");
+    kprintln!("MIDR_EL1          = {:#018x}", midr);
+    kprintln!("  implementer     = {:#04x}", (midr >> 24) & 0xff);
+    kprintln!("  part number     = {:#05x}", (midr >> 4) & 0xfff);
+    kprintln!("  variant/rev     = {:#x}/{:#x}", (midr >> 20) & 0xf, midr & 0xf);
+    kprintln!("ID_AA64PFR0_EL1   = {:#018x}", pfr0);
+    kprintln!("  EL0             = {:#x}  (0=not, 1=AArch64, 2=AArch64+AArch32)", (pfr0 >> 0) & 0xf);
+    kprintln!("  EL1             = {:#x}", (pfr0 >> 4) & 0xf);
+    kprintln!("  EL2             = {:#x}  (non-zero = virtualisation supported)", (pfr0 >> 8) & 0xf);
+    kprintln!("  EL3             = {:#x}", (pfr0 >> 12) & 0xf);
+    kprintln!("ID_AA64MMFR0_EL1  = {:#018x}", mmfr0);
+    kprintln!("  PARange         = {:#x}  (0=32b, 1=36b, 2=40b, 3=42b, 4=44b, 5=48b)", (mmfr0 >> 0) & 0xf);
+    kprintln!("  ASIDBits        = {:#x}  (0=8-bit, 2=16-bit)", (mmfr0 >> 4) & 0xf);
+    kprintln!("  TGran4          = {:#x}  (0=supported, F=not)", (mmfr0 >> 28) & 0xf);
+    kprintln!("  TGran16         = {:#x}  (1=supported, 0=not)", (mmfr0 >> 20) & 0xf);
+    kprintln!("  TGran64         = {:#x}  (0=supported, F=not)", (mmfr0 >> 24) & 0xf);
+    kprintln!("ID_AA64MMFR1_EL1  = {:#018x}", mmfr1);
+    kprintln!("  HAFDBS          = {:#x}  (hardware access flag / dirty state)", (mmfr1 >> 0) & 0xf);
+    kprintln!("  VMIDBits        = {:#x}  (0=8-bit, 2=16-bit)", (mmfr1 >> 4) & 0xf);
+    kprintln!("  VH              = {:#x}  (virtualisation host extensions)", (mmfr1 >> 8) & 0xf);
+    kprintln!("ID_AA64ISAR0_EL1  = {:#018x}", isar0);
+    kprintln!("HCR_EL2 (current) = {:#018x}", hcr);
+    kprintln!("--- end capability registers ---");
 }

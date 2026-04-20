@@ -33,12 +33,19 @@ unsafe fn eret_to_guest(entry_ipa: u64) -> ! {
     // SPSR = AArch32 SVC, interrupts masked.
     let spsr_aarch32_svc: u64 = 0x0000_01D3;
 
-    // SAFETY: preserves stage-2 enable; only sets RW=0 for AArch32 execution.
+    // SAFETY: preserves stage-2 enable; adds CP15 trap bits so the Newton's
+    // ARMv4-era writes route to EL2 (where we can emulate or skip them)
+    // instead of becoming undef exceptions the guest's own handler can't
+    // service without its stage-1 MMU.
     unsafe {
         let mut hcr: u64;
         asm!("mrs {}, hcr_el2", out(reg) hcr,
             options(nomem, nostack, preserves_flags));
         hcr &= !(1u64 << 31); // RW = 0 (AArch32)
+        hcr |= 1u64 << 20;    // TIDCP: trap implementation-defined CP15
+        hcr |= 1u64 << 26;    // TVM:   trap guest writes to virtual-memory CP15 regs
+        hcr |= 1u64 << 30;    // TRVM:  trap guest reads of the same
+        hcr |= 1u64 << 22;    // TSW:   trap set/way cache maintenance
         asm!("msr hcr_el2, {}", "isb", in(reg) hcr,
             options(nostack, preserves_flags));
 

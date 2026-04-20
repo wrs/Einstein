@@ -88,4 +88,25 @@ pub unsafe fn load_rom() {
         "guest_mem: ROM[0..2] (LE after swap) = {:#010x} {:#010x}",
         first, second
     );
+
+    // Bring-up shim: the ROM's exception vectors branch into the high ROM
+    // jump-table region (e.g. 0x01A03xxx), which is only reachable once the
+    // guest has installed its stage-1 MMU. Until M3+ we have no way to
+    // service those branches, and any undef/SWI fired by the kernel during
+    // early init chases into unmapped territory.
+    //
+    // Patch ROM words 1..7 (undef / SWI / prefetch-abort / data-abort / irq
+    // / fiq vectors — reset at word 0 is untouched) with `movs pc, lr`
+    // (0xE1B0F00E) so each exception returns to the next instruction
+    // instead of branching. This loses exception handling fidelity but
+    // lets the guest progress past its early CP15 probe, at which point
+    // our own CP15 shim and interrupt manager take over.
+    unsafe {
+        for i in 1..=6 {
+            rom_ptr.add(i).write(0xE1B0_F00E);
+        }
+    }
+    kprintln!(
+        "guest_mem: patched exception vectors 1..=6 to `movs pc, lr` for bring-up"
+    );
 }

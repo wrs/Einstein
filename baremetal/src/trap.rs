@@ -8,7 +8,7 @@
 //! return — the vector trailer restores the context and ERETs. Handlers that
 //! don't want to resume never return (they call `cpu::halt`).
 
-use crate::{cpu, guest_mem, kprintln, mmio};
+use crate::{cpu, guest_mem, kprintln, mmio, vic};
 
 macro_rules! read_sysreg {
     ($reg:literal) => {{
@@ -64,6 +64,40 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
                 read_sysreg!("elr_el2")
             );
             cpu::halt();
+        }
+    }
+
+    // Re-evaluate virtual IRQ state after every trap. The guest spends
+    // most of its time taking MMIO data aborts; piggy-backing VI updates
+    // onto that loop gives a steady update rate without needing a
+    // standalone host-timer interrupt.
+    vic::poll_timer_matches();
+    update_virq();
+}
+
+/// Set HCR_EL2.VI / VF according to whether the VIC has any enabled IRQ
+/// or FIQ pending. Sampled on every trap exit.
+fn update_virq() {
+    let irq = vic::irq_pending();
+    let fiq = vic::fiq_pending();
+    let mut hcr: u64;
+    // SAFETY: sysreg access at EL2.
+    unsafe {
+        core::arch::asm!("mrs {}, hcr_el2", out(reg) hcr,
+            options(nomem, nostack, preserves_flags));
+    }
+    let mut new = hcr & !((1u64 << 6) | (1u64 << 7)); // clear VF and VI
+    if irq { new |= 1u64 << 7; }
+    if fiq { new |= 1u64 << 6; }
+    if new != hcr {
+        // SAFETY: writing HCR_EL2.VI/VF toggles virtual IRQ/FIQ pending.
+        unsafe {
+            core::arch::asm!(
+                "msr hcr_el2, {}",
+                "isb",
+                in(reg) new,
+                options(nostack, preserves_flags),
+            );
         }
     }
 }

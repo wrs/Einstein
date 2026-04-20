@@ -46,6 +46,9 @@ unsafe fn eret_to_guest(entry_ipa: u64) -> ! {
         hcr |= 1u64 << 26;    // TVM:   trap guest writes to virtual-memory CP15 regs
         hcr |= 1u64 << 30;    // TRVM:  trap guest reads of the same
         hcr |= 1u64 << 22;    // TSW:   trap set/way cache maintenance
+        hcr |= 1u64 << 3;     // FMO:   route physical FIQ to EL2 (needed for VF to deliver)
+        hcr |= 1u64 << 4;     // IMO:   route physical IRQ to EL2 (needed for VI to deliver)
+        hcr |= 1u64 << 5;     // AMO:   route SError to EL2
         asm!("msr hcr_el2, {}", "isb", in(reg) hcr,
             options(nostack, preserves_flags));
 

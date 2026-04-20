@@ -98,6 +98,67 @@ pub fn init() {
     );
 }
 
+// Interrupt bit layout in int_present — from TInterruptManager.h.
+const INT_RTC_ALARM: u32 = 0x0000_0004;
+const INT_TIMER_0: u32 = 0x0000_0008;
+const INT_TIMER_1: u32 = 0x0000_0010;
+const INT_TIMER_2: u32 = 0x0000_0020;
+const INT_TIMER_3: u32 = 0x0000_0040;
+#[allow(dead_code)]
+const INT_GPIO: u32 = 0x0100_0000;
+
+/// Called periodically (right now, after every MMIO trap). If any timer
+/// match register has been crossed, latches the matching interrupt bit
+/// into int_present so that update_virq_pending() will assert VI.
+pub fn poll_timer_matches() {
+    // SAFETY: single-threaded.
+    let s = unsafe { &mut *VIC.0.get() };
+    let now = ticks();
+    let mut raise = 0u32;
+    // Match register treated as "fire when ticks >= match" once, then the
+    // guest re-arms it by rewriting. We use a sticky pending bit.
+    for (i, bit) in [
+        (0usize, INT_TIMER_0),
+        (1, INT_TIMER_1),
+        (2, INT_TIMER_2),
+        (3, INT_TIMER_3),
+    ] {
+        if s.match_reg[i] != 0
+            && now.wrapping_sub(s.match_reg[i]) < 0x8000_0000
+            && (s.int_present & bit) == 0
+        {
+            raise |= bit;
+        }
+    }
+    if raise != 0 {
+        s.int_present |= raise;
+    }
+}
+
+/// Whether any IRQ-class interrupt is currently pending and unmasked.
+/// Per TInterruptManager the gate is `int_present & int_ctrl & ~fiq_mask`.
+pub fn irq_pending() -> bool {
+    // SAFETY: single-threaded.
+    let s = unsafe { &*VIC.0.get() };
+    let pending = s.int_present & s.int_ctrl & !s.fiq_mask;
+    pending != 0
+}
+
+/// Likewise for FIQ.
+pub fn fiq_pending() -> bool {
+    // SAFETY: single-threaded.
+    let s = unsafe { &*VIC.0.get() };
+    let pending = s.int_present & s.int_ctrl & s.fiq_mask;
+    pending != 0
+}
+
+/// Current raised interrupt bits. For diagnostics.
+pub fn raised() -> u32 {
+    // SAFETY: single-threaded.
+    let s = unsafe { &*VIC.0.get() };
+    s.int_present
+}
+
 // ---------- Hardware register addresses --------------------------------------
 // Mirroring the subset of TMemoryConsts.h relevant to early boot.
 
@@ -202,6 +263,20 @@ pub fn read(ipa: u64) -> u32 {
 pub fn write(ipa: u64, value: u32) {
     // SAFETY: single-threaded access.
     let s = unsafe { &mut *VIC.0.get() };
+    // Log architecturally-significant VIC writes for diagnostic purposes.
+    // Budget-limited so we don't drown in logs.
+    static mut LOG_N: usize = 0;
+    let interesting = matches!(ipa,
+        K_HDWR_MATCH_0 | K_HDWR_MATCH_1 | K_HDWR_MATCH_2 | K_HDWR_MATCH_3
+        | K_HDWR_INT_CTRL | K_HDWR_FIQ_MASK
+        | K_HDWR_INT_ED_1 | K_HDWR_INT_ED_2 | K_HDWR_INT_ED_3
+    );
+    if interesting {
+        let n = unsafe { let v = LOG_N; LOG_N += 1; v };
+        if n < 32 {
+            crate::kprintln!("vic: write IPA={:#010x} <- {:#010x}", ipa, value);
+        }
+    }
     match ipa {
         K_HDWR_P0F110000 => s.p0f110000 = value,
         K_HDWR_P0F111400 => s.p0f111400 = value,

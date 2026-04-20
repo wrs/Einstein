@@ -8,6 +8,7 @@ mod cpu;
 mod guest;
 mod mmu;
 mod panic;
+mod stage2;
 mod trap;
 pub mod uart;
 
@@ -32,12 +33,20 @@ pub extern "C" fn kmain() -> ! {
     unsafe { mmu::init(); }
     install_vectors();
 
-    kprintln!();
-    kprintln!("Vectors installed. Entering toy AArch32 guest...");
+    // SAFETY: stage-2 tables must be programmed before we enable VM and
+    // ERET to the guest. Both functions are idempotent but only called once.
+    unsafe {
+        stage2::init();
+        stage2::enable();
+    }
 
-    // SAFETY: MMU, caches and vectors are up; the guest drops to EL1
-    // AArch32, runs 4 ops + HVC, and control resumes at the EL2 vector
-    // table for AArch32 synchronous exceptions. Never returns here.
+    kprintln!();
+    kprintln!("Vectors + stage-2 installed. Entering toy AArch32 guest...");
+
+    // SAFETY: MMU, caches, vectors and stage-2 are up; the guest drops to
+    // EL1 AArch32, takes a stage-2 data abort reading from TRAP_IPA, and
+    // control resumes at the EL2 vector table for AArch32 synchronous
+    // exceptions. Never returns here.
     unsafe { guest::run_toy_guest(); }
 
     // If we ever reach this (we won't) — halt so the machine is safe.

@@ -48,10 +48,12 @@ What's still scaffolding (see HIGHLEVEL.md §16 and
   VIC/ticks window. The plan is to replace each stub with a module
   under `src/peripherals/`, porting Einstein's C++ state machine into
   Rust.
-- `guest_mem.rs::load_newton_rom` patches ROM words 1..=6 to
-  `movs pc, lr` so early exceptions don't fall into the unmapped ROM
-  jump-table VAs. This bring-up cheat comes off once the full
-  peripheral / interrupt stack runs.
+- `guest_mem.rs::load_newton_rom` patches ROM words 1 / 3 / 4 (undef /
+  prefetch-abort / data-abort vectors) to `movs pc, lr` so early
+  faults don't loop through jump-table VAs we haven't reached yet.
+  SWI / IRQ / FIQ vectors stay pristine. This bring-up cheat comes
+  off once the peripheral stack is complete enough that these
+  vectors no longer fire during early boot.
 - CP15 encoding rewrite (`guest_mem.rs::patch_cp15_encodings`) is a
   static in-place patch at ROM load. Runtime translation of the
   StrongARM variants is a follow-on.

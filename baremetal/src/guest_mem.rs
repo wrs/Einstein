@@ -353,24 +353,24 @@ pub unsafe fn load_newton_rom() {
         first, second
     );
 
-    // Vector patches: keep the undef / prefetch-abort / data-abort vectors
-    // rewritten to `movs pc, lr` so that any fault during early boot — or
-    // any fault whose real handler lives in a ROM jump-table VA we haven't
-    // yet been able to reach — breaks out of the otherwise-infinite
-    // exception-to-vector-to-exception loop. Once the guest is far enough
-    // along for its own handlers to work, it can overwrite these through
-    // its kernel (ROM is stage-2 read-only to the guest but writable from
-    // EL2; a future pass can unpatch at a specific milestone).
-    //
-    // Keep word 0 (reset) pristine. Patch 1..=6 = undef / SWI / P-abort /
-    // D-abort / IRQ / FIQ.
+    // Bring-up shim #1: patch the fault-class exception vectors to a
+    // bare `movs pc, lr` so any early fault whose real handler lives
+    // in a ROM VA we haven't yet been able to reach doesn't loop
+    // forever. Experimentally, patching only undef / prefetch-abort /
+    // data-abort (offsets 0x04, 0x0C, 0x10) is sufficient for the
+    // 717006 ROM to get through its pre-scheduler boot — SWI (0x08),
+    // IRQ (0x18), and FIQ (0x1C) can stay pristine because the ROM
+    // doesn't exercise them before it stalls waiting for peripheral
+    // responses. This shim comes off once we have enough of the
+    // peripheral + CP15 surface that none of these vectors would
+    // fire during early boot.
     unsafe {
-        for i in 1..=6 {
-            rom_ptr.add(i).write(0xE1B0_F00E); // movs pc, lr
-        }
+        rom_ptr.add(1).write(0xE1B0_F00E); // undef
+        rom_ptr.add(3).write(0xE1B0_F00E); // prefetch abort
+        rom_ptr.add(4).write(0xE1B0_F00E); // data abort
     }
     kprintln!(
-        "guest_mem: patched exception vectors 1..=6 to `movs pc, lr`"
+        "guest_mem: patched exception vectors 1/3/4 (undef/pabt/dabt) to `movs pc, lr`"
     );
 
     // Bring-up shim #2: the 717006 kernel uses StrongARM's lax CP15 encoding

@@ -13,7 +13,7 @@
 //! `TFlash`, ...) lands in M3 / M4. For now we just want the guest to
 //! continue past its initial probe.
 
-use crate::{kprintln, peripherals::{dma, vic}};
+use crate::{kprintln, peripherals::{dma, pcmcia, vic}};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 const FLASH1_BASE: u64 = 0x0200_0000;
@@ -53,12 +53,16 @@ pub fn read(ipa: u64, sas: u8) -> u32 {
         // Power status / miscellaneous — "all OK" = high.
         0x0F18_4C00 => 0xFFFF_FFFF,
 
-        // PCMCIA / ROM card probe reads return all-1s ("no card" /
-        // "empty").
-        0x1000_0000 | 0x1080_0000 | 0x3800_0000 | 0x4800_0000 => 0xFFFF_FFFF,
+        // Flash bank 2 probes (kFlashBank2 = 0x1000_0000). Newton
+        // hardware exposes the second 4 MiB of flash here; until we
+        // stage-2-map it through peripherals::flash, return "all
+        // erased" so the kernel doesn't try to address real data
+        // there.
+        0x1000_0000 | 0x1080_0000 => 0xFFFF_FFFF,
 
         a if vic::owns(a) => vic::read(a),
         a if dma::owns(a) => dma::read(a),
+        a if pcmcia::owns(a) => pcmcia::read(a),
 
         a if (HW_BASE..HW_END).contains(&a) => {
             log_unknown("hw read", a, sas);
@@ -86,6 +90,10 @@ pub fn write(ipa: u64, sas: u8, value: u32) {
     }
     if dma::owns(ipa) {
         dma::write(ipa, value);
+        return;
+    }
+    if pcmcia::owns(ipa) {
+        pcmcia::write(ipa, value);
         return;
     }
     if (HW_BASE..HW_END).contains(&ipa) {

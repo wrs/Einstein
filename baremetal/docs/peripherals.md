@@ -14,9 +14,12 @@ some regions byte-swapped internally (the captured ROM in particular).
 Einstein class: `TFlash` (`Emulator/TFlash.{h,cpp}`).
 
 Shape:
-- Two 4 MiB banks. Bank 0 at guest PA `0x02000000`; bank 1 at `0x02400000`.
-- Einstein keeps both banks back-to-back in a single 8 MiB mmap-backed
-  file.
+- Two 4 MiB banks at disjoint guest addresses: bank 0 at
+  `0x02000000..0x02400000` (Einstein `kInternalFlash`), bank 1 at
+  `0x10000000..0x10400000` (Einstein `kFlashBank2`). Einstein keeps
+  both banks back-to-back in a single 8 MiB mmap-backed file, but the
+  kernel sees them at their hardware addresses (not contiguous in
+  guest-physical space).
 
 Semantics that matter:
 
@@ -184,9 +187,13 @@ method call is needed.
 
 - `TSerialPorts` / `TSerialChip*` — serial UARTs. Kernel touches them
   during early init but we don't need a response for boot.
-- `TPCMCIAController` — PCMCIA socket registers at `0x3C00_0000` /
-  `0x4C00_0000`. Returning "card not present" (all-ones for probes,
-  silent drops on writes) is correct.
+- `TPCMCIAController` — two 256 MiB socket windows at
+  `0x3000_0000..0x4000_0000` (slot 0, `kPCMCIA0Base`) and
+  `0x4000_0000..0x5000_0000` (slot 1, `kPCMCIA1Base`). Einstein
+  also declares slots 2 and 3 but typical Newton hardware doesn't
+  wire them up. Returning "card not present" (all-ones for probes,
+  silent drops on writes) is correct. Ported as
+  `peripherals/pcmcia.rs`.
 - `TNativePrimitives` — coprocessor 10/11 gateway used by NewtonOS
   native drivers (screen, sound, tablet, battery). We'll need this
   eventually to drive the display. It's not on the pre-scheduler

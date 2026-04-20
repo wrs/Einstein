@@ -7,4 +7,5 @@
 
 pub mod dma;
 pub mod flash;
+pub mod pcmcia;
 pub mod vic;

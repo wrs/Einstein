@@ -38,6 +38,6 @@ exec qemu-system-aarch64 \
     -serial stdio \
     -display none \
     -no-reboot \
-    "${debug_args[@]}" \
+    ${debug_args[@]+"${debug_args[@]}"} \
     ${QEMU_EXTRA:-} \
     "$@"

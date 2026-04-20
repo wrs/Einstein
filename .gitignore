@@ -3,6 +3,7 @@
 .idea/
 build/
 bin/
+/.claude/settings.local.json
 lib/
 DerivedData/
 *.mode1v3

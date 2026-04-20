@@ -32,6 +32,6 @@ while read -r name; do
         -I"$root" \
         -o "$elf" "$src"
     $OBJCOPY -O binary "$elf" "$bin"
-    size=$(stat -c %s "$bin")
+    size=$(wc -c < "$bin" | tr -d ' ')
     printf "  built %-20s  %5d bytes\n" "$name" "$size"
 done < "$root/tests/MANIFEST"

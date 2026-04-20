@@ -13,7 +13,7 @@
 //! `TFlash`, ...) lands in M3 / M4. For now we just want the guest to
 //! continue past its initial probe.
 
-use crate::{kprintln, vic};
+use crate::{kprintln, peripherals::vic};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 const FLASH1_BASE: u64 = 0x0200_0000;

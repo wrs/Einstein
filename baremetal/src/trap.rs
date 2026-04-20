@@ -8,7 +8,7 @@
 //! return — the vector trailer restores the context and ERETs. Handlers that
 //! don't want to resume never return (they call `cpu::halt`).
 
-use crate::{cpu, guest_mem, kprintln, mmio, timer, vic};
+use crate::{cpu, guest_mem, kprintln, mmio, peripherals::vic, timer};
 
 macro_rules! read_sysreg {
     ($reg:literal) => {{

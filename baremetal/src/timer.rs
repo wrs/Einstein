@@ -14,7 +14,7 @@
 //! CNTHPIRQ to the IRQ input. A Pi 4/5 port would need a GIC init pass
 //! instead.
 
-use crate::{kprintln, vic};
+use crate::{kprintln, peripherals::vic};
 
 /// BCM2836 per-core timer IRQ-control register, core 0. Bit layout:
 ///   [0] CNTPSIRQ  -> IRQ

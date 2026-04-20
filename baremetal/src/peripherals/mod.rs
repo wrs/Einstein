@@ -6,3 +6,4 @@
 //! `Emulator/T*.cpp` stays straightforward.
 
 pub mod flash;
+pub mod vic;

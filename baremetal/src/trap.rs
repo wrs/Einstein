@@ -8,7 +8,7 @@
 //! return — the vector trailer restores the context and ERETs. Handlers that
 //! don't want to resume never return (they call `cpu::halt`).
 
-use crate::{cpu, guest_mem, kprintln, mmio, vic};
+use crate::{cpu, guest_mem, kprintln, mmio, timer, vic};
 
 macro_rules! read_sysreg {
     ($reg:literal) => {{
@@ -67,10 +67,12 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
         }
     }
 
-    // Re-evaluate virtual IRQ state after every trap. The guest spends
-    // most of its time taking MMIO data aborts; piggy-backing VI updates
-    // onto that loop gives a steady update rate without needing a
-    // standalone host-timer interrupt.
+    // Re-evaluate virtual IRQ state after every trap. Real timer-match
+    // delivery happens asynchronously through `trap_irq` now, but keeping
+    // this poll as a safety net means any code path that mutates VIC
+    // state via an MMIO write (IntCtrl, FIQMask, IntClear...) promptly
+    // sees the HCR_EL2.VI consequence without waiting for the next timer
+    // IRQ.
     vic::poll_timer_matches();
     update_virq();
 
@@ -92,6 +94,17 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
             n, elr, spsr, vic::raised()
         );
     }
+}
+
+/// Asynchronous IRQ taken at EL2. On this target the only physical IRQ
+/// source we wire up is CNTHP (EL2 physical timer). Any fire is a Newton
+/// timer-match deadline expiring: we latch the crossed match bit(s) into
+/// `vic::int_present`, rearm CNTHP_CVAL_EL2 to the next pending deadline,
+/// and update HCR_EL2.VI so the guest takes a virtual IRQ on ERET.
+#[no_mangle]
+pub extern "C" fn trap_irq(_ctx: &mut TrapContext) {
+    timer::on_irq();
+    update_virq();
 }
 
 /// Set HCR_EL2.VI / VF according to whether the VIC has any enabled IRQ

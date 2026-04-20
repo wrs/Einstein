@@ -25,7 +25,14 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// what the guest expects at reset.
 static TICK_EPOCH: AtomicU64 = AtomicU64::new(0);
 
-const NEWTON_TICK_HZ: u64 = 3_686_400;
+pub const NEWTON_TICK_HZ: u64 = 3_686_400;
+
+/// CNTPCT_EL0 reading captured at `init()`. Callers doing rate-conversion
+/// between CNTPCT and Newton-tick domains anchor at this point (Newton
+/// ticks = 0 by definition at the same moment).
+pub fn timer_epoch() -> u64 {
+    TICK_EPOCH.load(Ordering::Acquire)
+}
 
 fn read_cntpct() -> u64 {
     let v: u64;
@@ -140,6 +147,35 @@ pub fn poll_timer_matches() {
     if raise != 0 {
         s.int_present |= raise;
     }
+}
+
+/// Earliest pending Newton match deadline, or None if all four matches
+/// have already fired (or are zero). Returned in the Newton tick domain;
+/// callers wanting a CNTPCT-domain deadline must translate themselves.
+pub fn next_pending_match() -> Option<u32> {
+    // SAFETY: single-threaded.
+    let s = unsafe { &*VIC.0.get() };
+    let now = ticks();
+    let mut best: Option<u32> = None;
+    for i in 0..4usize {
+        let slot_bit = 1u32 << i;
+        if (s.match_fired & slot_bit) != 0 { continue; }
+        if s.match_reg[i] == 0 { continue; }
+        // Only consider matches in the near future (or already crossed).
+        // Distant future deadlines (> 2^31 ticks away) we treat as stale.
+        let delta = s.match_reg[i].wrapping_sub(now);
+        if delta >= 0x8000_0000 {
+            // Already crossed — fire ASAP.
+            return Some(now);
+        }
+        best = Some(match best {
+            None => s.match_reg[i],
+            Some(cur) => {
+                if delta < cur.wrapping_sub(now) { s.match_reg[i] } else { cur }
+            }
+        });
+    }
+    best
 }
 
 /// Whether any IRQ-class interrupt is currently pending and unmasked.
@@ -284,14 +320,15 @@ pub fn write(ipa: u64, value: u32) {
             crate::kprintln!("vic: write IPA={:#010x} <- {:#010x}", ipa, value);
         }
     }
+    let mut match_reprogrammed = false;
     match ipa {
         K_HDWR_P0F110000 => s.p0f110000 = value,
         K_HDWR_P0F111400 => s.p0f111400 = value,
         K_HDWR_P0F180400 => { /* misc write, ignore */ }
-        K_HDWR_MATCH_0 => { s.match_reg[0] = value; s.match_fired &= !0b0001; }
-        K_HDWR_MATCH_1 => { s.match_reg[1] = value; s.match_fired &= !0b0010; }
-        K_HDWR_MATCH_2 => { s.match_reg[2] = value; s.match_fired &= !0b0100; }
-        K_HDWR_MATCH_3 => { s.match_reg[3] = value; s.match_fired &= !0b1000; }
+        K_HDWR_MATCH_0 => { s.match_reg[0] = value; s.match_fired &= !0b0001; match_reprogrammed = true; }
+        K_HDWR_MATCH_1 => { s.match_reg[1] = value; s.match_fired &= !0b0010; match_reprogrammed = true; }
+        K_HDWR_MATCH_2 => { s.match_reg[2] = value; s.match_fired &= !0b0100; match_reprogrammed = true; }
+        K_HDWR_MATCH_3 => { s.match_reg[3] = value; s.match_fired &= !0b1000; match_reprogrammed = true; }
         K_HDWR_INT_CTRL => s.int_ctrl = value,
         K_HDWR_INT_CLEAR => {
             // Writing clears the matching bits in int_present.
@@ -305,5 +342,10 @@ pub fn write(ipa: u64, value: u32) {
         K_HDWR_GPIO_E => s.gpio_e = value,
         K_HDWR_GPIO_C => s.int_present &= !value, // many devices clear via this pattern
         _ => {}
+    }
+    if match_reprogrammed {
+        // A match register changed — recompute the nearest deadline and
+        // reprogram CNTHP_CVAL_EL2 so the async timer path delivers.
+        crate::timer::rearm();
     }
 }

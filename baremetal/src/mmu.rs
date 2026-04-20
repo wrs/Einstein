@@ -5,7 +5,9 @@
 //!
 //!   L1 table: 512 × 1 GiB entries.
 //!     [0]       -> table descriptor pointing at L2
-//!     [1..=511] -> invalid (any VA above 1 GiB faults at EL2)
+//!     [1]       -> 1 GiB Device block at 0x40000000..0x80000000 (BCM2836
+//!                  local peripheral, including per-core timer IRQ routing)
+//!     [2..=511] -> invalid (any VA above 2 GiB faults at EL2)
 //!
 //!   L2 table: 512 × 2 MiB block entries.
 //!     [0..=503]   identity map, Normal WB cacheable (our image + RAM)
@@ -105,11 +107,16 @@ pub unsafe fn init() {
         unsafe { l2_ptr.add(i as usize).write(pa | attr); }
     }
 
-    // L1[0] -> L2 as a table descriptor. All other L1 entries stay zero.
+    // L1[0] -> L2 as a table descriptor. L1[1] is a 1 GiB Device block
+    // covering 0x40000000..0x80000000 so we can program the BCM2836 per-core
+    // peripheral (local timer IRQ routing). All other L1 entries stay zero.
     let l1_ptr = addr_of_mut!(L1) as *mut u64;
     let l2_addr = addr_of_mut!(L2) as u64;
-    // SAFETY: L1 has 512 entries; we only touch index 0.
-    unsafe { l1_ptr.write(l2_addr | DESC_VALID | DESC_TABLE); }
+    // SAFETY: L1 has 512 entries; we only touch indices 0 and 1.
+    unsafe {
+        l1_ptr.write(l2_addr | DESC_VALID | DESC_TABLE);
+        l1_ptr.add(1).write(0x4000_0000 | BLOCK_DEVICE);
+    }
 
     // Publish the tables to the MMU walker before enabling. dsb ish is
     // enough for the stage-1 walker; ic iallu flushes any stale I-cache

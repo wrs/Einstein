@@ -11,6 +11,7 @@ mod mmio;
 mod mmu;
 mod panic;
 mod stage2;
+mod timer;
 mod trap;
 pub mod uart;
 mod vic;
@@ -46,6 +47,7 @@ pub extern "C" fn kmain() -> ! {
     }
 
     vic::init();
+    timer::init();
 
     kprintln!();
     kprintln!("Entering Newton ROM...");

@@ -76,13 +76,18 @@
     eret
 .endm
 
-// Resumable entry: save context, pass ctx ptr, call handler, restore + ERET.
+// Resumable entry: save context, pass ctx ptr, call handler, branch to
+// the shared tail that restores context and ERETs. Keeping the tail
+// out-of-line is what lets each vector slot stay within its 128-byte
+// budget — an inline restore_context_and_eret pushes the slot to ~148
+// bytes, overflows, and the ACTUAL vector addresses shift as subsequent
+// `.balign 0x80` directives realign forward.
 .macro entry_resume handler
     .balign 0x80
     save_context
     mov     x0, sp
     bl      \handler
-    restore_context_and_eret
+    b       .Lresume_tail
 .endm
 
 // Terminal entry: save context, pass ctx, call handler -> !.
@@ -97,18 +102,24 @@
 
 el2_vector_table:
     entry_halt   trap_unexpected          // 0x000
-    entry_halt   trap_unexpected          // 0x080
+    entry_resume trap_irq                 // 0x080  IRQ from EL2 (SP0, shouldn't fire)
     entry_halt   trap_unexpected          // 0x100
     entry_halt   trap_unexpected          // 0x180
     entry_halt   trap_unexpected          // 0x200
-    entry_halt   trap_unexpected          // 0x280
+    entry_resume trap_irq                 // 0x280  IRQ from EL2 (SPx)
     entry_halt   trap_unexpected          // 0x300
     entry_halt   trap_unexpected          // 0x380
     entry_halt   trap_unexpected          // 0x400
-    entry_halt   trap_unexpected          // 0x480
+    entry_resume trap_irq                 // 0x480  IRQ from lower EL AArch64
     entry_halt   trap_unexpected          // 0x500
     entry_halt   trap_unexpected          // 0x580
     entry_resume trap_sync_lower_aarch32  // 0x600  *** guest sync exceptions
-    entry_halt   trap_unexpected          // 0x680
+    entry_resume trap_irq                 // 0x680  IRQ from lower EL AArch32 *** Newton guest
     entry_halt   trap_unexpected          // 0x700
     entry_halt   trap_unexpected          // 0x780
+
+// Shared tail for resumable entries: restore the spilled context and ERET.
+// Pulled out of the per-vector macro to keep each vector slot under the
+// 128-byte cap; see the entry_resume comment above.
+.Lresume_tail:
+    restore_context_and_eret

@@ -92,12 +92,28 @@ pub fn fix_stage1_xn_bits() {
     let mut l2_tables = 0usize;
     let mut patched = 0usize;
     let mut sections_patched = 0usize;
+    let mut fine_to_fault = 0usize;
 
     // L1 sits at the start of guest RAM (TTBR0 = 0x0400_0000 per probe).
     for i in 0..4096 {
         // SAFETY: L1 is 16 KiB = 4096 × 4 bytes, at RAM[0..16384].
         let entry = unsafe { ram.add(i).read() };
         let typ = entry & 3;
+
+        // Rewrite fine-table (0b11) descriptors to fault (0b00). The ARMv4
+        // fine-table format was dropped in ARMv7 short descriptors; A53's
+        // walker treats it as UNPREDICTABLE. The 717006 ROM installs three
+        // fine-table L1 entries at VA 0x78000000 / 0x90000000 / 0xAC000000
+        // as PCMCIA placeholders whose L2 slots are all fault (see
+        // probe/FINDINGS.md). Converting to an L1 fault preserves intent:
+        // any access to those VAs must raise a stage-1 translation fault
+        // our abort handler can dispatch.
+        if typ == 3 {
+            // SAFETY: i < 4096.
+            unsafe { ram.add(i).write(0); }
+            fine_to_fault += 1;
+            continue;
+        }
 
         // Normalise section descriptor to minimal-valid ARMv7 form:
         // preserve PA (bits 31:20) + domain (8:5), clear XN/AP[2]/TEX/S/nG,
@@ -165,8 +181,8 @@ pub fn fix_stage1_xn_bits() {
     }
 
     kprintln!(
-        "fix_stage1_xn_bits: {} sections de-XN'd, {} L2 tables walked, {} L2 entries de-XN'd",
-        sections_patched, l2_tables, patched
+        "fix_stage1_xn_bits: {} sections de-XN'd, {} L2 tables walked, {} L2 entries de-XN'd, {} fine -> fault",
+        sections_patched, l2_tables, patched, fine_to_fault
     );
 }
 

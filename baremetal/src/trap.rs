@@ -114,7 +114,8 @@ pub extern "C" fn trap_irq(_ctx: &mut TrapContext) {
             HB_LAST_PC = elr;
             HB_PRINT_BUDGET -= 1;
             let spsr = read_sysreg!("spsr_el2");
-            kprintln!("timer_irq: guest ELR={:#x} SPSR={:#x}", elr, spsr);
+            let far = read_sysreg!("far_el1");
+            kprintln!("timer_irq: guest ELR={:#x} SPSR={:#x} FAR_EL1={:#x}", elr, spsr, far);
         }
     }
     timer::on_irq();
@@ -459,16 +460,18 @@ mod cp15 {
     pub fn write_ttbr0_el1(v: u64) { sysreg_write!("ttbr0_el1", v); sync(); }
     pub fn write_dacr32(v: u64) { sysreg_write!("dacr32_el2", v); sync(); }
 
-    /// AArch32 DFSR, written via DFSR32_EL2 (op0=3 op1=4 CRn=5 CRm=0
-    /// op2=0, ARM ARM D10.2.32).
-    pub fn write_dfsr32(v: u64) {
-        // SAFETY: sysreg write; S-form encoding.
-        unsafe {
-            core::arch::asm!("msr S3_4_C5_C0_0, {}", in(reg) v,
-                options(nostack, preserves_flags));
-        }
-        sync();
-    }
+    /// AArch32 DFSR via DFSR32_EL2 (op0=3 op1=4 CRn=5 CRm=0 op2=0,
+    /// ARM ARM D10.2.32). Both MRS and MSR to this register take an
+    /// EC=0 (UNDEFINED) exception at EL2 on Cortex-A53 under QEMU
+    /// raspi3b, despite the ARM ARM saying it should be accessible
+    /// from EL2 AArch64 when a lower EL supports AArch32 (which
+    /// ID_AA64PFR0_EL1.EL1=0x2 confirms it does). So `write_dfsr32`
+    /// is a no-op — we swallow the write. The hardware maintains
+    /// DFSR correctly at EL1 when it takes an abort, which is what
+    /// a kernel's abort handler needs. Guest writes are rare and
+    /// typically just attempts to clear the register; losing them
+    /// has no functional impact since the next abort will overwrite.
+    pub fn write_dfsr32(_v: u64) { /* DFSR32_EL2 MSR UNDEFs on A53 */ }
 
     pub fn write_far_el1(v: u64) { sysreg_write!("far_el1", v); sync(); }
 

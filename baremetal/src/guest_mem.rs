@@ -353,13 +353,18 @@ pub unsafe fn load_newton_rom() {
         first, second
     );
 
-    // Bring-up shim #1: patch the fault-class exception vectors to
-    // `movs pc, lr`. This is wrong-but-useful: it skips the faulting
-    // instruction when the vector is taken as an exception entry
-    // (the right thing early on when the real handler lives in an
-    // unmapped VA). It also has no effect when the vector is jumped
-    // to as regular code (just returns). We only patch undef / pabt
-    // / dabt; SWI / IRQ / FIQ stay pristine.
+    // Bring-up shim #1: the guest's real abort handlers live at VAs
+    // the guest's own stage-1 map doesn't cover yet during early
+    // boot, so a prefetch abort at an unmapped VA branches to the
+    // handler, fetching the handler instruction also faults, we
+    // recurse infinitely. Rewrite the undef / prefetch-abort /
+    // data-abort vectors to `movs pc, lr` — the fault gets skipped
+    // and the caller continues. SWI / IRQ / FIQ stay pristine.
+    // Dropping HCR_EL2.TRVM fixed the CP15 pass-through path, so the
+    // ROM's handler would dispatch correctly if we could reach it.
+    // This shim comes off once we either map the abort-handler VAs
+    // or inject faults via the hypervisor instead of letting the
+    // guest take them.
     unsafe {
         rom_ptr.add(1).write(0xE1B0_F00E); // undef
         rom_ptr.add(3).write(0xE1B0_F00E); // prefetch abort

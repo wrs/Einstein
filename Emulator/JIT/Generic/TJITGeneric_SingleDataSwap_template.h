@@ -31,6 +31,8 @@ SingleDataSwap_Template(FLAG_B, Rn, Rd, Rm)
 #if Rn != 15 || Rd != 15 || Rm != 15
 	POPPC();
 
+	probe_record_swp(ioCPU->mCurrentRegisters[15] - 8, FLAG_B);
+
 	TMemory* theMemoryInterface = ioCPU->GetMemory();
 	TMemory::VAddr theAddress = (TMemory::VAddr) ioCPU->mCurrentRegisters[Rn];
 #if FLAG_B

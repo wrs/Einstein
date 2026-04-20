@@ -5,10 +5,13 @@ Einstein REx, on a Linux x86-64 host (`TEmulator::Run` + generic JIT, 90
 wall-clock seconds).
 
 Raw captures:
-- [`results-717006-30s.txt`](results-717006-30s.txt) — 30 s cook, minimal
-  boot past the MMU-enable point.
-- [`results-717006-90s.txt`](results-717006-90s.txt) — 90 s cook, gives the
-  kernel more time to install per-task stacks and heap pages.
+- [`results-717006-30s.txt`](results-717006-30s.txt) — 30 s cook, MMU-only
+  dump from the first pass (before full instrumentation was wired).
+- [`results-717006-90s.txt`](results-717006-90s.txt) — 90 s cook, MMU-only,
+  used to confirm no late-boot tiny-page emergence.
+- [`results-717006-90s-full.txt`](results-717006-90s-full.txt) — 90 s cook
+  with the full instrumentation set (CP15 / SWP / mode transitions). The
+  authoritative capture.
 
 ## Answer to HIGHLEVEL.md §16.2: descriptor formats in use
 
@@ -77,13 +80,115 @@ the A53 walker actually reads them.
 - §16.8 — **physical aliases and mirrors**, partially: the dump enumerates
   every mapped L2 region. Cross-check against the intended stage-2 map.
 
-### What it does not answer
+## Answer to §16.4: complete CP15 op set
 
-- §16.3 (PL0 vs PL1 by region), §16.4 (CP15 ops), §16.5 (SWP frequency),
-  §16.6 (domain usage patterns). These need additional instrumentation
-  inside `TARMProcessor` — not added in this first probe pass.
-- Other 2.x ROM variants (737041, localised builds, eMate). Rerun the
-  probe against each when available.
+Only **15 unique (opc1, CRn, CRm, opc2, dir) tuples** emitted in 90 seconds
+of boot. This is the entire surface a bare-metal CP15 shim has to cover:
+
+| dir | op1 | CRn | CRm | op2 | count | purpose |
+|---|---|---|---|---|---|---|
+| MRC | 0 | 0  | 0  | 0 |    37 026 | read CPU ID |
+| MCR | 0 | 1  | 1  | 0 |    56 165 | write control register (MMU / S / R bits) |
+| MCR | 0 | 2  | 2  | 0 |         1 | install TTBR — **once**, at boot |
+| MCR | 0 | 3  | 3  | 0 |    38 953 | write DACR (always `0x00055555`) |
+| MRC | 0 | 5  | 5  | 0 |       328 | read fault status register |
+| MRC | 0 | 6  | 6  | 0 |       115 | read fault address register |
+| MCR | 0 | 7  | 6  | 0 |     1 419 | cache op (invalidate data cache) |
+| MCR | 0 | 7  | 6  | 1 |   427 067 | cache op (clean/invalidate DC entry) |
+| MCR | 0 | 7  | 7  | 0 |         1 | cache op (invalidate unified cache) |
+| MCR | 0 | 7  | 10 | 1 |   427 067 | cache op (clean data cache entry) |
+| MCR | 0 | 7  | 10 | 4 |   427 067 | cache op (drain write buffer) |
+| MCR | 0 | 8  | 5  | 0 |     1 259 | TLB flush — ITLB |
+| MCR | 0 | 8  | 6  | 1 |     1 259 | TLB flush — DTLB entry |
+| MCR | 0 | 8  | 7  | 0 |        13 | TLB flush — all |
+| MCR | 0 | 15 | 1  | 2 |         1 | StrongARM-specific: clock control |
+
+Every entry except the last is a standard ARMv4 CP15 op with a direct
+AArch32-on-A53 equivalent (SCTLR, TTBR0, DACR, IFSR/DFSR, IFAR/DFAR, DC/IC/BPI
+maintenance, TLBI). The StrongARM `c15 op1=0 CRm=1 op2=2` clock-control write
+fires **once** at boot; trap-and-no-op is fine. The hot path is cache
+maintenance (~1.28 M ops in 90 s); each op has a one-line AArch32 equivalent
+(`mcr p15, 0, Rn, c7, c10, 1` → `DCCMVAC`, etc.), or we can trust A53
+coherency and emit no-ops if we disable the guest cache entirely.
+
+## Answer to §16.5: SWP frequency and sites
+
+**405 810 word SWPs, 0 byte SWPs, from exactly one PC: `0x003AE200`.**
+
+The kernel has a single atomic-exchange primitive (almost certainly a
+compare-and-swap or lock-acquire wrapper). Because every SWP comes from the
+same instruction, the bare-metal port has two clean options:
+
+1. **Patch the ROM** at `0x003AE200` to a `LDREX`/`STREX` sequence. One
+   patch covers 100 % of observed SWP traffic.
+2. **Trap-and-emulate** via the ARMv8 UNDEFINED-instruction vector. At
+   ~4.5 k SWPs/second under heavy boot load, hypervisor trap overhead is
+   tolerable; in steady-state use it will be much lower.
+
+## Answer to §16.3: privilege levels
+
+Mode-transition counts over 90 s confirm Walter's recollection: **kernel-only
+PL1, everything else PL0**. The guest's entries-into-mode tally:
+
+| mode | entries |
+|---|---|
+| USR | **19 310** |
+| SVC |    649 |
+| IRQ |     44 |
+| ABT |    232 |
+| FIQ |      5 |
+| UND |      1 |
+
+The dominant transition is `SVC → USR` (19 143 events) — kernel returning
+to user code. Every exception entry either comes from USR (IRQ, ABT, UND) or
+is re-entered from kernel itself. No code path enters USR-to-USR directly, as
+expected. AP enforcement is the operative protection model; hypervisor must
+preserve it (which A53 short descriptor does trivially).
+
+## Answer to §16.6: domain usage
+
+DACR is written 38 953 times with the value `0x00055555` — the *same* value
+every write. Decoded:
+
+| domain | bits | meaning |
+|---|---|---|
+| 0–7 | `01` | client (AP bits honoured per descriptor) |
+| 8–15 | `00` | no access |
+
+No manager-domain usage, no dynamic domain reconfiguration, no weird
+StrongARM-specific side effects. Eight client domains for the kernel to
+assign to task isolation groups; the rest permanently faulting. Cortex-A53
+short-descriptor DACR semantics match exactly. The high write count is the
+kernel reinstalling DACR at context-switch boundaries — no behavioral
+concern.
+
+## Answer to §16.7: cache-line op encodings
+
+Subset of the CP15 table above: six distinct c7 op encodings, all standard
+ARMv4. AArch32-on-A53 equivalents:
+
+| CP15 op | ARMv4 meaning | AArch32 A53 equivalent |
+|---|---|---|
+| `c7 c6 op2=0` | Invalidate entire data cache | `MCR p15,0,Rn,c7,c6,0` (still defined) or `DCISW` loop |
+| `c7 c6 op2=1` | Clean+invalidate DC line (MVA) | `DCCIMVAC` |
+| `c7 c7 op2=0` | Invalidate unified cache | deprecated; loop `DCISW` + `ICIALLU` |
+| `c7 c10 op2=1` | Clean DC line (MVA) | `DCCMVAC` |
+| `c7 c10 op2=4` | Drain write buffer / DSB | `DSB SY` |
+
+All mappable to A53 with a one-line trap handler each, or no-op when we
+treat the guest caches as pass-through.
+
+## What remains open
+
+- **Other 2.x ROMs** (737041, localised, eMate). Per your judgement, unlikely
+  to differ meaningfully; rerun the probe against each when captured just
+  to confirm the CP15 surface matches.
+- **§16.8 physical aliases** — `FDump` enumerates mapped guest VAs but not
+  the set of distinct guest PAs. Trivial extension: dump the PA range for
+  each region. Do when needed for stage-2 sizing.
+- **§16.9 RAM-size assumptions, §16.10 PCMCIA, §16.11 display geometry,
+  §16.12 SMC, §16.14 input device.** Mostly not probe-answerable; they
+  need either hypervisor-level experiments or design decisions.
 
 ## Reproduction
 

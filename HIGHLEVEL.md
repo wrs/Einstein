@@ -220,15 +220,15 @@ JIT, recompilation, any software CPU emulation, Einstein's UI layer, Linux depen
 
 ## 16. Open questions
 
-All of these want verification against the actual ROM or hardware rather than memory or inference. The ones that gate the whole design are §16.1, §16.2, and §16.4.
+All of these want verification against the actual ROM or hardware rather than memory or inference. As of the first probe pass (see `baremetal/probe/FINDINGS.md`), §16.2–§16.7 are answered for the 717006 ROM; §16.1 (EL2 handoff on real Pi firmware) is the only remaining design-level gate.
 
 1. **EL2 availability at boot on Pi Zero 2 W.** Cortex-A53 has EL2. Does the Pi Zero 2 W firmware hand control to `kernel.img` at EL2, or has it already dropped to EL1? Needs RPi Foundation docs plus boot-time experiment.
 2. **Descriptor formats used by 2.x ROMs.** *Partially answered for 717006 — see `baremetal/probe/FINDINGS.md`.* Only sections, 64 KiB large pages, and 4 KiB small pages are actively mapped. No tiny pages. Three L1 slots (at VA 0x78000000, 0x90000000, 0xAC000000) hold fine-table descriptors but their L2 entries are all fault — placeholder reservations for PCMCIA card windows. Fine tables don't walk on A53 short descriptor, but since nothing is actually mapped through them, a straightforward hypervisor-side rewrite (L1 0b11 → 0b00) at guest TTBR-install time preserves semantics. Still needs verification against 737041, localised variants, and eMate ROMs.
-3. **Privilege levels of ROM regions.** Instrument `mMode` transitions in `TARMProcessor`; correlate with PC ranges. Needed to justify "kernel-only-PL1" and to decide how aggressively to lean on AP enforcement.
-4. **Complete CP15 op set emitted by the kernel.** Instrument Einstein's CP15 dispatch; log unique `(opcode1, CRn, CRm, opcode2, direction)` tuples over a representative boot and workload. This set defines the CP15 shim's surface area.
-5. **SWP / SWPB frequency and call sites.** Count in JIT dispatch. If more than a few dozen per second in steady state, patch the ROM.
-6. **Domain usage.** Dump DACR transitions and per-descriptor domain tags; confirm manager/client/no-access usage is conventional and has no StrongARM-specific side-effect dependency.
-7. **Cache-line op encodings.** Enumerate exact CP15 c7 ops the ROM issues; map each to an A53 equivalent or a documented no-op.
+3. **Privilege levels of ROM regions.** *Answered — see `baremetal/probe/FINDINGS.md`.* 19 310 USR entries vs 649 SVC entries over 90 s of boot; kernel-only-PL1 confirmed. `SVC → USR` is the dominant edge. AP enforcement is the operative protection model; preserve it.
+4. **Complete CP15 op set emitted by the kernel.** *Answered.* 15 unique `(opc1, CRn, CRm, opc2, dir)` tuples. All standard ARMv4 except one StrongARM-specific clock-control op that fires exactly once at boot. Hot path is cache maintenance; each op has a direct AArch32-on-A53 equivalent.
+5. **SWP / SWPB frequency and call sites.** *Answered.* 405 810 SWPs from **one** PC (`0x003AE200`), zero SWPB. Single ROM patch at that site replaces the entire SWP surface with `LDREX`/`STREX`. Trap-and-emulate also viable at ~4.5 k/s peak.
+6. **Domain usage.** *Answered.* DACR is written 38 953 times with the same value `0x00055555` — eight client domains, eight no-access domains, no manager domains, no StrongARM-specific side effects. A53 short-descriptor DACR semantics match exactly.
+7. **Cache-line op encodings.** *Answered.* Six distinct c7 ops, all standard ARMv4, all trivially mappable to AArch32-on-A53 (`DCCMVAC`, `DCCIMVAC`, `DSB SY`, etc.) or safely no-oppable if we pass through A53 coherency.
 8. **Physical aliases and mirrors.** Enumerate every distinct guest-physical region the ROM actually touches; confirm stage-2 coverage.
 9. **RAM-size assumptions.** Does 2.x handle arbitrary RAM sizes via the `kHdWr_04RAMSize` register, or are there hard-coded assumptions somewhere? `TMemory.cpp:868–876` suggests the register is honored; verify for each ROM.
 10. **PCMCIA and modem runtime assumptions.** Does 2.x require a card present at boot? How is modem absence tolerated?

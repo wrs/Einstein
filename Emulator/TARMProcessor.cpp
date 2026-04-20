@@ -22,6 +22,7 @@
 // ==============================
 
 #include "Emulator/TARMProcessor.h"
+#include "baremetal/probe/probe_sink.h"
 
 // POSIX
 #include <signal.h>
@@ -71,6 +72,10 @@ TARMProcessor::SystemCoprocRegisterTransfer(KUInt32 inInstruction)
 	KUInt32 CRn = (inInstruction & 0x000F0000) >> 16;
 	KUInt32 CPOpc = (inInstruction & 0x00E00000) >> 21;
 	KUInt32 theValue;
+
+	probe_record_cp15(mCurrentRegisters[kR15] - 8, CPOpc, CRn, CRm, CP,
+		(inInstruction & 0x00100000) ? 1 : 0,
+		(inInstruction & 0x00100000) ? 0 : mCurrentRegisters[Rd]);
 
 	if (inInstruction & 0x00100000)
 	{
@@ -662,6 +667,7 @@ TARMProcessor::SetCPSR(KUInt32 inNewValue)
 	KUInt32 theMode = inNewValue & kPSR_ModeMask;
 	if (theMode != (KUInt32) mMode)
 	{
+		probe_record_mode(mCurrentRegisters[kR15] - 4, (KUInt32) mMode, theMode);
 		BackupBankRegisters();
 		if (theMode == kFIQMode)
 		{

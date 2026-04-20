@@ -107,16 +107,14 @@ const INT_TIMER_3: u32 = 0x0000_0040;
 #[allow(dead_code)]
 const INT_GPIO: u32 = 0x0100_0000;
 
-/// Called periodically (right now, after every MMIO trap). If any timer
-/// match register has been crossed, latches the matching interrupt bit
-/// into int_present so that update_virq_pending() will assert VI.
+/// Called periodically (after every MMIO trap). Inject whatever timer /
+/// enabled-IRQ bits look "due" into int_present so the VI/VF update
+/// path can deliver them on the next ERET.
 pub fn poll_timer_matches() {
     // SAFETY: single-threaded.
     let s = unsafe { &mut *VIC.0.get() };
     let now = ticks();
     let mut raise = 0u32;
-    // Match register treated as "fire when ticks >= match" once, then the
-    // guest re-arms it by rewriting. We use a sticky pending bit.
     for (i, bit) in [
         (0usize, INT_TIMER_0),
         (1, INT_TIMER_1),
@@ -130,6 +128,22 @@ pub fn poll_timer_matches() {
             raise |= bit;
         }
     }
+
+    // If the kernel has enabled any IRQ / FIQ source but no timer matches
+    // have fired yet, raise whatever IS enabled once every ~10000 ticks
+    // so the kernel can make progress past its "waiting for first
+    // interrupt" state. This is a pure bring-up shim and is not what the
+    // real hardware does — remove once the guest is past scheduler init.
+    static mut LAST_WAKE: u32 = 0;
+    let last = unsafe { LAST_WAKE };
+    if now.wrapping_sub(last) > 10_000 {
+        let enabled_no_timer = s.int_ctrl & !(INT_TIMER_0 | INT_TIMER_1 | INT_TIMER_2 | INT_TIMER_3);
+        if enabled_no_timer != 0 && (s.int_present & enabled_no_timer) == 0 {
+            raise |= enabled_no_timer & (INT_RTC_ALARM | INT_TIMER_3 | 0x0100_0000);
+            unsafe { LAST_WAKE = now; }
+        }
+    }
+
     if raise != 0 {
         s.int_present |= raise;
     }

@@ -73,6 +73,25 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
     // standalone host-timer interrupt.
     vic::poll_timer_matches();
     update_virq();
+
+    // Periodically produce a "screenshot" of the guest's RAM + framebuffer
+    // state, so we have something to look at even while the kernel is
+    // stuck pre-scheduler. Fires once after 1 000 000 traps (~25 s on
+    // QEMU) and then halts so the output window is bounded.
+    // Budget-limited "progress beacon": print PC every 100k traps so we
+    // can see if the guest is making forward progress or looping in one
+    // place. Doesn't halt — lets boot continue.
+    static mut TRAP_COUNTER: u64 = 0;
+    // SAFETY: single-threaded.
+    let n = unsafe { TRAP_COUNTER += 1; TRAP_COUNTER };
+    if n % 10_000 == 0 {
+        let elr = read_sysreg!("elr_el2");
+        let spsr = read_sysreg!("spsr_el2");
+        kprintln!(
+            "beacon: {} traps, ELR={:#x} SPSR={:#x} int_present={:#x}",
+            n, elr, spsr, vic::raised()
+        );
+    }
 }
 
 /// Set HCR_EL2.VI / VF according to whether the VIC has any enabled IRQ

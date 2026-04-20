@@ -213,34 +213,69 @@ pub fn dump_guest_l1_table() {
     }
 }
 
-/// Emit a compact hex summary of the framebuffer to the UART for offline
-/// inspection. Prints the first 512 bytes plus a histogram of non-zero
-/// pages so a reviewer can see if the guest has actually drawn anything.
+/// Emit a compact hex summary of a guest memory region to the UART.
 #[allow(dead_code)]
 pub fn dump_framebuffer_to_uart() {
     use crate::kprintln;
     let ptr = addr_of_mut!(GUEST_FB) as *const u8;
     // SAFETY: framebuffer is statically allocated; we only read.
     let bytes: &[u8] = unsafe { core::slice::from_raw_parts(ptr, FRAMEBUFFER_SIZE) };
+    summarise_region("framebuffer @ IPA 0x0E000000", bytes);
+}
 
-    let nonzero_pages = bytes.chunks(4096).filter(|p| p.iter().any(|&b| b != 0)).count();
-    let total_pages = FRAMEBUFFER_SIZE / 4096;
+/// Dump a histogram + 16 rows of hex for the guest's RAM (at IPA
+/// 0x0400_0000). This is our best proxy for a screenshot when the
+/// kernel doesn't hand us an explicit framebuffer: whatever data
+/// structures the kernel has populated in RAM show up here.
+pub fn dump_ram_to_uart() {
+    use crate::kprintln;
+    let ptr = addr_of_mut!(GUEST_RAM) as *const u8;
+    // SAFETY: static allocation.
+    let bytes: &[u8] = unsafe { core::slice::from_raw_parts(ptr, RAM_SIZE) };
+    summarise_region("RAM @ IPA 0x04000000", bytes);
+    kprintln!();
+    kprintln!("First 512 bytes of kernel L1 page table at RAM offset 0:");
+    hex_block(&bytes[0..512]);
+}
+
+fn summarise_region(label: &str, bytes: &[u8]) {
+    use crate::kprintln;
+    let page = 4096;
+    let total_pages = bytes.len() / page;
+    let nonzero = bytes.chunks(page).filter(|p| p.iter().any(|&b| b != 0)).count();
+    let ff_pages = bytes.chunks(page).filter(|p| p.iter().all(|&b| b == 0xFF)).count();
+    let active = nonzero.saturating_sub(ff_pages);
     kprintln!(
-        "framebuffer: {} of {} pages non-zero ({} KiB with content)",
-        nonzero_pages, total_pages, nonzero_pages * 4
+        "{}: {} pages populated ({} KiB), {} pages all-0xFF, {} pages mixed",
+        label, nonzero, nonzero * (page / 1024), ff_pages, active
     );
-    // First 16 rows of 32 bytes, hex.
-    for row in 0..16 {
+    // 16 rows × 32 bytes at the start.
+    hex_block(&bytes[0..(16 * 32)]);
+
+    // If there's interesting content further in, show it.
+    for chunk_start in [0x1000usize, 0x4000, 0x10000, 0x40000].iter().copied() {
+        if chunk_start + 32 >= bytes.len() { continue; }
+        if bytes[chunk_start..chunk_start + 256].iter().any(|&b| b != 0 && b != 0xFF) {
+            kprintln!("  ... active at offset {:#x}:", chunk_start);
+            hex_block(&bytes[chunk_start..chunk_start + 128]);
+        }
+    }
+}
+
+fn hex_block(bytes: &[u8]) {
+    use crate::kprintln;
+    for (row, chunk) in bytes.chunks(32).enumerate() {
         let off = row * 32;
-        let mut s = [0u8; 32];
-        s.copy_from_slice(&bytes[off..off + 32]);
+        let mut line = [0u8; 32];
+        let n = chunk.len().min(32);
+        line[..n].copy_from_slice(&chunk[..n]);
         kprintln!(
-            "  fb[{:#06x}]: {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x}",
+            "  +{:#06x}: {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x}  {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x}",
             off,
-            s[0],s[1],s[2],s[3], s[4],s[5],s[6],s[7],
-            s[8],s[9],s[10],s[11], s[12],s[13],s[14],s[15],
-            s[16],s[17],s[18],s[19], s[20],s[21],s[22],s[23],
-            s[24],s[25],s[26],s[27], s[28],s[29],s[30],s[31],
+            line[0],line[1],line[2],line[3], line[4],line[5],line[6],line[7],
+            line[8],line[9],line[10],line[11], line[12],line[13],line[14],line[15],
+            line[16],line[17],line[18],line[19], line[20],line[21],line[22],line[23],
+            line[24],line[25],line[26],line[27], line[28],line[29],line[30],line[31],
         );
     }
 }

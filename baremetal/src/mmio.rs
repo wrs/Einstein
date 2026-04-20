@@ -39,6 +39,24 @@ pub fn read(ipa: u64, sas: u8) -> u32 {
         HW_RAM_SIZE_1 => 0x4040_0040,
         HW_RAM_SIZE_2 => 0,
 
+        // Chipset revision ID register the kernel probes early.
+        // Typical observed value per TMemoryConsts notes.
+        0x0F24_2400 => 0x01F9_4573,
+
+        // Bank control / memory speed registers — return 0.
+        0x0F00_1000 => 0,
+        0x0F24_1000 => 0,
+
+        // GPIO input data (PCMCIA door lock etc.) — Einstein returns all 1s.
+        0x0F18_D400 => 0xFFFF_FFFF,
+
+        // Power status / miscellaneous — "all OK" = high.
+        0x0F18_4C00 => 0xFFFF_FFFF,
+
+        // PCMCIA / ROM card probe reads return all-1s ("no card" /
+        // "empty").
+        0x1000_0000 | 0x1080_0000 | 0x3800_0000 | 0x4800_0000 => 0xFFFF_FFFF,
+
         a if vic::owns(a) => vic::read(a),
 
         a if (HW_BASE..HW_END).contains(&a) => {

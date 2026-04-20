@@ -5,10 +5,18 @@
 use core::arch::global_asm;
 
 mod cpu;
+mod guest;
+mod mmu;
 mod panic;
+mod trap;
 pub mod uart;
 
 global_asm!(include_str!("boot.s"));
+global_asm!(include_str!("vectors.s"));
+
+extern "C" {
+    static el2_vector_table: u8;
+}
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -18,10 +26,41 @@ pub extern "C" fn kmain() -> ! {
     uart::init();
     print_banner();
     print_caps();
+
+    // SAFETY: called exactly once from boot.s on core 0 before any
+    // cache- or virtual-addressing-dependent code runs.
+    unsafe { mmu::init(); }
+    install_vectors();
+
     kprintln!();
-    kprintln!("Halted on core 0. Cores 1-3 parked in WFE.");
-    kprintln!("Connect gdb via `target remote :1234` when running with `-s -S`.");
+    kprintln!("Vectors installed. Entering toy AArch32 guest...");
+
+    // SAFETY: MMU, caches and vectors are up; the guest drops to EL1
+    // AArch32, runs 4 ops + HVC, and control resumes at the EL2 vector
+    // table for AArch32 synchronous exceptions. Never returns here.
+    unsafe { guest::run_toy_guest(); }
+
+    // If we ever reach this (we won't) — halt so the machine is safe.
+    #[allow(unreachable_code)]
     cpu::halt();
+}
+
+fn install_vectors() {
+    // SAFETY: `el2_vector_table` is defined in vectors.s, is 2 KiB-aligned
+    // per the `.balign 0x800` there, and lives in rodata/text that the
+    // stage-1 identity map covers.
+    let vbar: u64 = unsafe { &el2_vector_table as *const u8 as u64 };
+    // SAFETY: writing VBAR_EL2 only takes effect on the next exception;
+    // isb ensures the write is visible before we return.
+    unsafe {
+        core::arch::asm!(
+            "msr vbar_el2, {}",
+            "isb",
+            in(reg) vbar,
+            options(nostack, preserves_flags),
+        );
+    }
+    kprintln!("VBAR_EL2 = {:#018x}", vbar);
 }
 
 fn print_banner() {

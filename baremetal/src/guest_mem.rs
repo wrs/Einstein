@@ -41,6 +41,14 @@ static mut GUEST_FB: Framebuffer = Framebuffer([0; FRAMEBUFFER_SIZE]);
 #[cfg(not(nh_guest_test))]
 static ROM_BE: &[u8] = include_bytes!("../roms/newton.rom");
 
+// Einstein's REx goes into the second 8 MB of the 16 MB ROM region, at
+// PA 0x00800000..0x01000000. Same big-endian → little-endian byteswap as
+// the main ROM. Maps the Newton kernel's high-half VA 0x01000000 onwards
+// once the guest programs its stage-1 to point there.
+// See Emulator/ROM/TFlatROMImageWithREX.cpp:139-178 for the layout.
+#[cfg(not(nh_guest_test))]
+static REX_BE: &[u8] = include_bytes!("../../_Data_/Einstein.rex");
+
 // Guest-test mode: `build.rs` picked up $NH_GUEST_TEST and set this cfg.
 // The embedded bytes are an AArch32 flat binary with reset vector at
 // offset 0, built by baremetal/guest-tests/scripts/build-tests.sh.
@@ -338,6 +346,31 @@ pub unsafe fn load_newton_rom() {
         unsafe { rom_ptr.add(i).write(word_le); }
     }
 
+    // Load Einstein's REx at PA 0x00800000 (= the second 8 MB of the 16 MB
+    // ROM region). The kernel's stage-1 MMU maps this to VA 0x01000000
+    // once it programs its page tables. Same BE->LE byteswap as the main
+    // ROM, because the guest runs little-endian.
+    const REX_PA_OFFSET: usize = 0x00800000;
+    let rex_words = REX_BE.len() / 4;
+    kprintln!(
+        "guest_mem: loading {} bytes of Einstein.rex at PA {:#x} (byteswap BE->LE)",
+        REX_BE.len(), REX_PA_OFFSET,
+    );
+    assert!(REX_BE.len() <= ROM_SIZE - REX_PA_OFFSET);
+    let rex_base_word = REX_PA_OFFSET / 4;
+    for i in 0..rex_words {
+        let off = i * 4;
+        let word_be = u32::from_ne_bytes([
+            REX_BE[off],
+            REX_BE[off + 1],
+            REX_BE[off + 2],
+            REX_BE[off + 3],
+        ]);
+        let word_le = word_be.swap_bytes();
+        // SAFETY: rex_base_word + i stays below ROM_SIZE / 4 via the assert above.
+        unsafe { rom_ptr.add(rex_base_word + i).write(word_le); }
+    }
+
     kprintln!(
         "guest_mem: ROM @ host PA {:#x}, RAM @ host PA {:#x}",
         rom_host_pa(),
@@ -353,26 +386,11 @@ pub unsafe fn load_newton_rom() {
         first, second
     );
 
-    // Bring-up shim #1: the guest's real abort handlers live at VAs
-    // the guest's own stage-1 map doesn't cover yet during early
-    // boot, so a prefetch abort at an unmapped VA branches to the
-    // handler, fetching the handler instruction also faults, we
-    // recurse infinitely. Rewrite the undef / prefetch-abort /
-    // data-abort vectors to `movs pc, lr` — the fault gets skipped
-    // and the caller continues. SWI / IRQ / FIQ stay pristine.
-    // Dropping HCR_EL2.TRVM fixed the CP15 pass-through path, so the
-    // ROM's handler would dispatch correctly if we could reach it.
-    // This shim comes off once we either map the abort-handler VAs
-    // or inject faults via the hypervisor instead of letting the
-    // guest take them.
-    unsafe {
-        rom_ptr.add(1).write(0xE1B0_F00E); // undef
-        rom_ptr.add(3).write(0xE1B0_F00E); // prefetch abort
-        rom_ptr.add(4).write(0xE1B0_F00E); // data abort
-    }
-    kprintln!(
-        "guest_mem: patched exception vectors 1/3/4 (undef/pabt/dabt) to `movs pc, lr`"
-    );
+    // Exception vectors are left pristine. Earlier iterations patched
+    // undef / prefetch-abort / data-abort to `movs pc, lr` because
+    // DFSR/DFAR reads were going through a broken shim; that was
+    // fixed by dropping HCR_EL2.TRVM. The ROM's own handler now has
+    // everything it needs to dispatch the fault — if we can reach it.
 
     // Bring-up shim #2: the 717006 kernel uses StrongARM's lax CP15 encoding
     // where CRm == CRn for most system-control registers. On ARMv7+ those

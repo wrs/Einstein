@@ -8,7 +8,7 @@
 //! return — the vector trailer restores the context and ERETs. Handlers that
 //! don't want to resume never return (they call `cpu::halt`).
 
-use crate::{cpu, guest_mem, kprintln, mmio, peripherals::vic, timer};
+use crate::{cpu, guest_mem, kprintln, mmio, peripherals::{native_primitives, vic}, timer};
 
 macro_rules! read_sysreg {
     ($reg:literal) => {{
@@ -38,6 +38,7 @@ const EC_UNKNOWN: u32 = 0x00;
 // combinations). This is what we see when HCR_EL2.TVM/TRVM/TIDCP steer a
 // guest CP15 access to EL2 instead of letting it go through on real CP15.
 const EC_TRAPPED_CP15: u32 = 0x03;
+const EC_FP_SIMD: u32 = 0x07;
 const EC_HVC_A32: u32 = 0x12;
 const EC_INSN_ABORT_LOWER: u32 = 0x20;
 const EC_DATA_ABORT_LOWER: u32 = 0x24;
@@ -60,6 +61,7 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
         EC_INSN_ABORT_LOWER => handle_instruction_abort(iss),
         EC_HVC_A32 => handle_hvc(ctx, iss),
         EC_TRAPPED_CP15 => handle_cp15_trap(ctx, iss),
+        EC_FP_SIMD => handle_fp_simd(ctx, iss),
         EC_UNKNOWN => handle_unknown(iss),
         _ => {
             kprintln!(
@@ -733,6 +735,78 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
     advance_elr(4);
 }
 
+/// FP / SIMD access trap from a lower EL (EC=0x07), routed to EL2 by
+/// CPTR_EL2.TFP. On Newton this is how native-primitive calls arrive:
+/// the guest executes `MCR p10, 0, Rd, cN, cM, {opc2}` and Einstein's
+/// convention is that the CPU register Rd holds the "native call code"
+/// (driver ID << 8 | sub-function). We decode the faulting instruction
+/// from guest memory, read the named register, and hand it to
+/// peripherals::native_primitives::execute.
+///
+/// MRC reads from CP10/CP11 (and any other FP/SIMD shape we don't
+/// expect from Newton OS) halt loudly — extend the handler when a
+/// ROM boot trips one.
+fn handle_fp_simd(ctx: &mut TrapContext, _iss: u32) {
+    let elr = read_sysreg!("elr_el2") as u32;
+    let insn = match read_guest_word_pa(elr) {
+        Some(w) => w,
+        None => {
+            kprintln!(
+                "*** fp_simd: faulting PC {:#x} unreadable from EL2 backing stores",
+                elr
+            );
+            cpu::halt();
+        }
+    };
+
+    // Decode ARMv7 MCR / MRC (load/store to coprocessor, single
+    // register). Encoding: cond 1110 opc1 L CRn Rd coproc opc2 1 CRm
+    // Mask for (MCR or MRC) with bit 4 = 1 and the fixed 1110 prefix
+    // is (insn & 0x0F00_0010) == 0x0E00_0010.
+    let is_mcr_mrc = (insn & 0x0F00_0010) == 0x0E00_0010;
+    let cop = (insn >> 8) & 0xF;
+    let l_bit = (insn >> 20) & 1; // 0 = MCR, 1 = MRC
+
+    if !(is_mcr_mrc && (cop == 10 || cop == 11)) {
+        kprintln!(
+            "*** fp_simd trap on unexpected instruction {:#010x} @PC={:#x}, halting",
+            insn, elr
+        );
+        cpu::halt();
+    }
+
+    let rd = ((insn >> 12) & 0xF) as usize;
+    let crn = (insn >> 16) & 0xF;
+    let crm = insn & 0xF;
+    let opc1 = (insn >> 21) & 0x7;
+    let opc2 = (insn >> 5) & 0x7;
+
+    if l_bit != 0 {
+        kprintln!(
+            "*** MRC from CP{} not supported: insn={:#010x} @PC={:#x} (opc1={} Rd=r{} CRn=c{} CRm=c{} opc2={})",
+            cop, insn, elr, opc1, rd, crn, crm, opc2
+        );
+        cpu::halt();
+    }
+
+    // Einstein's NativeCoprocRegisterTransfer reads CPU register Rd as
+    // the "native call" code. ARMv4 MCR with Rd=PC reads PC+12, but
+    // the Newton kernel never uses PC there; flag it if we ever see
+    // one so we can match Einstein's quirk.
+    if rd == 15 {
+        kprintln!(
+            "*** MCR p{}: Rd=PC is an Einstein quirk (mCurrentRegisters[15]+4); halting to investigate",
+            cop
+        );
+        cpu::halt();
+    }
+
+    let native_insn = ctx.x[rd] as u32;
+    native_primitives::execute(ctx, native_insn, elr);
+
+    advance_elr(4);
+}
+
 fn log_sctlr_write(value: u32) {
     static mut SCTLR_N: usize = 0;
     // SAFETY: single-threaded.
@@ -892,6 +966,7 @@ fn advance_elr(bytes: u64) {
 pub fn describe_ec(ec: u32) -> &'static str {
     match ec {
         0x00 => "Unknown reason",
+        0x07 => "SIMD/FP access trap (CPTR_EL2.TFP)",
         0x0E => "Illegal execution state",
         0x11 => "SVC from AArch32",
         0x12 => "HVC from AArch32",

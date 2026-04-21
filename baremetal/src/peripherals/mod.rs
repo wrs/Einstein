@@ -7,6 +7,7 @@
 
 pub mod dma;
 pub mod flash;
+pub mod native_primitives;
 pub mod pcmcia;
 pub mod serial;
 pub mod vic;

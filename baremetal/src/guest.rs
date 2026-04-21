@@ -56,6 +56,34 @@ unsafe fn eret_to_guest(entry_ipa: u64) -> ! {
         asm!("msr hcr_el2, {}", "isb", in(reg) hcr,
             options(nostack, preserves_flags));
 
+        // CPTR_EL2.TFP = 1 traps every AArch32 MCR/MRC/LDC/STC/CDP to
+        // CP10/CP11 from lower EL to EL2 as an FP/SIMD access
+        // (EC=0x07). Newton OS doesn't use FPU — it uses MCR p10 as
+        // the "native primitive" call gateway (Emulator/TARMProcessor.cpp
+        // :374, Emulator/TNativePrimitives.cpp:177). Trapping gets
+        // every such call into peripherals::native_primitives::execute
+        // where we emulate or halt loudly on unknown codes. EL2's own
+        // FP is untouched (TFP only affects lower EL when E2H=0).
+        let mut cptr: u64;
+        asm!("mrs {}, cptr_el2", out(reg) cptr,
+            options(nomem, nostack, preserves_flags));
+        cptr |= 1u64 << 10;    // TFP
+        asm!("msr cptr_el2, {}", "isb", in(reg) cptr,
+            options(nostack, preserves_flags));
+
+        // CPACR_EL1: enable CP10 and CP11 access at EL1. The default
+        // value has both disabled, so an AArch32 MCR p10,... would
+        // raise UND locally at EL1 (taking the guest's UND vector)
+        // before CPTR_EL2.TFP has a chance to route it to EL2.
+        // Setting FPEN = 0b11 (bits 21:20) — which also covers the
+        // AArch32 CPACR cp10/cp11 fields at 23:22 / 21:20 — removes
+        // that local UND so MCR p10 propagates through the TFP trap.
+        // Newton doesn't use FP itself; enabling these bits is
+        // side-effect-free for the guest's own code paths.
+        let cpacr: u64 = (0b11 << 20) | (0b11 << 22);
+        asm!("msr cpacr_el1, {}", "isb", in(reg) cpacr,
+            options(nostack, preserves_flags));
+
         // Zero guest SCTLR_EL1 so its stage-1 is off at reset. The ROM's
         // own boot code will configure SCTLR_EL1 / TTBR0 / DACR etc. on
         // its way up.

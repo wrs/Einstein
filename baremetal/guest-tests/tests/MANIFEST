@@ -11,3 +11,4 @@ test_serial
 test_native_primitives
 test_screen_blit
 test_snapshot
+test_shadow_stub

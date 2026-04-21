@@ -15,10 +15,10 @@
 //!     interrupt-mask registers are consumed. We log TX bytes (to a
 //!     budget) so diagnostic dumps show up on the console.
 //!
-//! Unknown offsets inside a window return 0 with a one-shot log per
-//! (port, offset) pair — the trip-wire for cases Phase A's scope
-//! missed. Addresses outside the four windows never reach this
-//! module (mmio.rs dispatches elsewhere).
+//! Unknown offsets inside a window halt loudly — the trip-wire for
+//! cases Phase A's scope missed, per baremetal/PLAN.md. Addresses
+//! outside the four windows never reach this module (mmio.rs
+//! dispatches elsewhere).
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -91,10 +91,7 @@ pub fn read(ipa: u64) -> u32 {
         // leaves the (empty) RX FIFO empty.
         reg::RX_BYTE => 0,
 
-        _ => {
-            log_unknown(port, off, /*write=*/ false, 0);
-            0
-        }
+        _ => halt_unknown(port, off, /*write=*/ false, 0),
     }
 }
 
@@ -111,7 +108,7 @@ pub fn write(ipa: u64, value: u32) {
         | 0x3000 | 0x3400 | 0x3800 | 0x3C00 | 0x5000 | 0x5400 | 0x5800 | 0x5C00
         | 0x8000 => {}
 
-        _ => log_unknown(port, off, /*write=*/ true, value),
+        _ => halt_unknown(port, off, /*write=*/ true, value),
     }
 }
 
@@ -142,42 +139,17 @@ fn log_tx_byte(port: u8, byte: u8) {
     }
 }
 
-// Dedup unknown-offset logs on a (port, offset) key — 256 slots
-// total is far more than the early-boot probe actually hits, but
-// keeps the table sized for any stray late-boot curiosity.
-const UNKNOWN_SLOTS: usize = 256;
-static UNK_KEYS: [AtomicUsize; UNKNOWN_SLOTS] =
-    [const { AtomicUsize::new(0) }; UNKNOWN_SLOTS];
-static UNK_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-fn log_unknown(port: u8, off: u64, write: bool, value: u32) {
-    // Key: top bit marks write; next 8 bits hold port; low bits the
-    // offset. Offset is <= 0xFFFF so bits 0..16. Plus 1 so zero means
-    // "empty slot" in the table.
-    let key = ((write as usize) << 30)
-        | ((port as usize) << 20)
-        | ((off as usize) & 0x000F_FFFF)
-        | 1;
-    for i in 0..UNKNOWN_SLOTS {
-        let cur = UNK_KEYS[i].load(Ordering::Relaxed);
-        if cur == key {
-            return;
-        }
-        if cur == 0
-            && UNK_KEYS[i]
-                .compare_exchange(0, key, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
-            let n = UNK_COUNT.fetch_add(1, Ordering::Relaxed);
-            kprintln!(
-                "serial[{}] UNKNOWN {} +{:#06x} val={:#010x} (#{})",
-                port_name(port),
-                if write { "W" } else { "R" },
-                off,
-                value,
-                n
-            );
-            return;
-        }
-    }
+fn halt_unknown(port: u8, off: u64, write: bool, value: u32) -> ! {
+    kprintln!();
+    kprintln!("*** serial[{}] UNKNOWN {} +{:#06x} val={:#010x} halted ***",
+        port_name(port),
+        if write { "W" } else { "R" },
+        off, value);
+    kprintln!(
+        "  (extend peripherals/serial.rs to model this register — see"
+    );
+    kprintln!(
+        "   Emulator/Serial/TVoyagerSerialPort.cpp for the register layout.)"
+    );
+    crate::cpu::halt();
 }

@@ -75,14 +75,16 @@ pub fn read(ipa: u64) -> u32 {
     match ipa {
         K_HDWR_ASSIGN => s.assign,
         K_HDWR_ENABLE_STATUS | K_HDWR_WORD_STATUS => 0,
-        // Per-channel reads: Einstein's channel 0/1 path would
-        // delegate to the external-serial driver; everything else
-        // returns 0. We don't have a serial driver yet, so all
-        // channels read 0.
-        _ => {
-            log_stub("dma read", ipa, 0);
+        // Per-channel reads inside bank 1 / bank 2 windows — Einstein
+        // reads 0 for all per-channel registers it doesn't delegate
+        // to the serial driver. This matches Einstein's TDMAManager
+        // behaviour (`Emulator/TDMAManager.cpp:69-95`) explicitly:
+        // deliberate stub, not a silent default.
+        _ if is_channel_reg(ipa) => {
+            log_stub("dma channel read (modeled 0 per Einstein)", ipa, 0);
             0
         }
+        _ => halt_unknown_dma("read", ipa, 0),
     }
 }
 
@@ -93,8 +95,19 @@ pub fn write(ipa: u64, value: u32) {
         K_HDWR_ASSIGN => s.assign = value,
         K_HDWR_ENABLE_STATUS | K_HDWR_DISABLE => log_stub("dma enable/disable", ipa, value),
         // Per-channel writes mirror Einstein: log once, do nothing.
-        _ => log_stub("dma write", ipa, value),
+        _ if is_channel_reg(ipa) => log_stub("dma channel write (modeled drop per Einstein)", ipa, value),
+        _ => halt_unknown_dma("write", ipa, value),
     }
+}
+
+/// True if `ipa` falls inside one of the two per-channel register
+/// banks. Einstein models these as "read 0, write drop" for all
+/// channels except 0/1 which would route to the serial driver. We
+/// don't have a serial DMA driver wired up yet, so every channel
+/// register is treated identically.
+fn is_channel_reg(ipa: u64) -> bool {
+    (BANK1_BASE..BANK1_END).contains(&ipa)
+        || (BANK2_BASE..BANK2_END).contains(&ipa)
 }
 
 fn log_stub(what: &str, ipa: u64, value: u32) {
@@ -102,4 +115,17 @@ fn log_stub(what: &str, ipa: u64, value: u32) {
     if n < LOG_MAX {
         kprintln!("{} IPA={:#010x} val={:#010x}", what, ipa, value);
     }
+}
+
+fn halt_unknown_dma(op: &'static str, ipa: u64, value: u32) -> ! {
+    kprintln!();
+    kprintln!("*** dma::{} IPA={:#010x} val={:#010x} — owns() said mine, no match ***",
+        op, ipa, value);
+    kprintln!(
+        "  (IPA is inside DMA register window but outside any modeled register."
+    );
+    kprintln!(
+        "   Extend peripherals/dma.rs — see Emulator/TDMAManager.cpp.)"
+    );
+    crate::cpu::halt();
 }

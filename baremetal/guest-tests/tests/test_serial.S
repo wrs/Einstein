@@ -81,16 +81,11 @@ test_main:
     mov     r0, #3
     hvc     #5                  @ mark 3: RX read returned 0
 
-    @ ---- Unknown offset inside a window returns 0 -----------------
-    @ The hypervisor should log it once and return zero; the test
-    @ only asserts the zero return.
-    ldr     r4, =0x0F1C9100     @ not any documented offset
-    ldr     r5, [r4]
-    cmp     r5, #0
-    bne     .Lfail_unknown_nonzero
-
-    mov     r0, #4
-    hvc     #5                  @ mark 4: unknown offset returned 0
+    @ Per Phase A, reads to unknown offsets inside a serial window
+    @ now halt loudly (they used to return 0 silently, which masked
+    @ real divergence during ROM bring-up). This test no longer
+    @ exercises the unknown-offset path; add a dedicated negative
+    @ test if we want to assert the halt itself.
 
     hvc     #3                  @ PASS
     bx      lr
@@ -119,9 +114,4 @@ test_main:
     mov     r0, r5
     hvc     #2
     mov     r0, #0xA4
-    hvc     #4
-.Lfail_unknown_nonzero:
-    mov     r0, r5
-    hvc     #2
-    mov     r0, #0xA5
     hvc     #4

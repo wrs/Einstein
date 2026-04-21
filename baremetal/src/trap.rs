@@ -49,12 +49,48 @@ const EC_DATA_ABORT_LOWER: u32 = 0x24;
 /// the faulting instruction ourselves in `handle_und`.
 pub const UND_TAG: u32 = 0x10;
 
+/// Generic "inspect-then-halt" HVC immediate, used by temporary
+/// vector-intercept patches during Phase B debugging. When we need to
+/// see the CPU state at the moment of an abort we don't otherwise see
+/// from EL2 (stage-1 aborts handled entirely by the guest), we patch
+/// the relevant guest-mode vector to `HVC #DIAG_TAG`. The handler
+/// dumps registers / banked SPSR / FAR and walks the guest stage-1
+/// table for the faulting VA, then halts. Remove the patch once the
+/// root cause is identified.
+pub const DIAG_TAG: u32 = 0x11;
+
+/// Second-stage diagnostic HVC used to read AArch32 banked R14 (LR)
+/// from the mode we came from. AArch64 at EL2 does plumb x14 = LR of
+/// the source mode on HVC entry in principle, but QEMU raspi3b leaves
+/// x14 = 0 when the source was taken into ABT via a stage-1 abort.
+/// Workaround: ERET into a small AArch32 stub in guest RAM that does
+/// `mov r0, lr; hvc #DIAG_LR_TAG`. At the second HVC, x0 = LR of the
+/// source mode (= faulting_pc + 8 for a data abort). Installed by
+/// `handle_diag`; see the stub assembly comment in that function.
+pub const DIAG_LR_TAG: u32 = 0x12;
+
 /// Synchronous exception from a lower EL running AArch32.
 #[no_mangle]
 pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
     let esr = read_sysreg!("esr_el2");
     let ec = ((esr >> 26) & 0x3f) as u32;
     let iss = (esr & 0x01ff_ffff) as u32;
+
+    // DIAG: log the first N sync traps' EC + ELR + ESR, no dedup, so
+    // we can see the guest PC timeline in the window leading up to a
+    // stall. Remove once Phase B stall is past.
+    static mut TRAP_LOG_BUDGET: usize = 50;
+    // SAFETY: single-threaded.
+    unsafe {
+        if TRAP_LOG_BUDGET > 0 {
+            TRAP_LOG_BUDGET -= 1;
+            let elr = read_sysreg!("elr_el2");
+            kprintln!(
+                "trap: EC={:#x} ({}) ELR={:#x} ESR={:#x}",
+                ec, describe_ec(ec), elr, esr
+            );
+        }
+    }
 
     match ec {
         EC_DATA_ABORT_LOWER => handle_data_abort(ctx, iss),
@@ -81,11 +117,7 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
     // interrupt keeps re-firing (or an unmasked one never delivers).
     update_virq();
 
-    // Periodically produce a "screenshot" of the guest's RAM + framebuffer
-    // state, so we have something to look at even while the kernel is
-    // stuck pre-scheduler. Fires once after 1 000 000 traps (~25 s on
-    // QEMU) and then halts so the output window is bounded.
-    // Budget-limited "progress beacon": print PC every 100k traps so we
+    // Budget-limited "progress beacon": print PC every 10k traps so we
     // can see if the guest is making forward progress or looping in one
     // place. Doesn't halt — lets boot continue.
     static mut TRAP_COUNTER: u64 = 0;
@@ -107,7 +139,7 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
 /// `vic::int_present`, rearm CNTHP_CVAL_EL2 to the next pending deadline,
 /// and update HCR_EL2.VI so the guest takes a virtual IRQ on ERET.
 #[no_mangle]
-pub extern "C" fn trap_irq(_ctx: &mut TrapContext) {
+pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     // Diagnostic heartbeat: sample guest PC so we can see where it's
     // executing when no MMIO traps are firing. Only print when the PC
     // moves — keeps a steady-state spin from flooding the console,
@@ -128,6 +160,12 @@ pub extern "C" fn trap_irq(_ctx: &mut TrapContext) {
     }
     timer::on_irq();
     update_virq();
+    // Wall-clock-paced snapshot save. Timer IRQ is a cleaner hook
+    // than sync traps: it fires regardless of whether the guest is
+    // making forward progress, so we keep rolling a fresh snapshot
+    // into the ring even when the guest is wedged. See
+    // src/snapshot.rs.
+    crate::snapshot::maybe_autosave(ctx);
 }
 
 /// Set HCR_EL2.VI / VF according to whether the VIC has any enabled IRQ
@@ -206,11 +244,12 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
         cpu::halt();
     }
 
+    let elr = read_sysreg!("elr_el2");
     if wnr {
         let value = ctx.x[srt] as u32;
-        mmio::write(ipa, sas, value);
+        mmio::write(ipa, sas, value, elr);
     } else {
-        let value = mmio::read(ipa, sas);
+        let value = mmio::read(ipa, sas, elr);
         // Sign-extension (SSE) is ignored for stub reads — everything we
         // return here is either zero or a known non-negative constant.
         ctx.x[srt] = value as u64;
@@ -224,26 +263,23 @@ fn handle_instruction_abort(iss: u32) {
     let far = read_sysreg!("far_el2");
     let hpfar = read_sysreg!("hpfar_el2");
     let ipa = ((hpfar >> 4) << 12) | (far & 0xFFF);
-    static mut SEEN: [u64; 32] = [u64::MAX; 32];
-    static mut NEXT: usize = 0;
-    let already = unsafe {
-        let mut hit = false;
-        for i in 0..SEEN.len() { if SEEN[i] == ipa { hit = true; break; } }
-        if !hit && NEXT < SEEN.len() { SEEN[NEXT] = ipa; NEXT += 1; }
-        hit
-    };
-    if !already {
-        let elr = read_sysreg!("elr_el2");
-        kprintln!(
-            "iabort[uniq] ELR={:#x} FAR={:#x} IPA={:#x} IFSC={:#x} — skipping",
-            elr, far, ipa, iss & 0x3f
-        );
-    }
-    // Skip the 32-bit ARM instruction that couldn't be fetched. Execution
-    // resumes at PC+4. This is aggressive — if the instruction was supposed
-    // to run, we've just silently dropped it — but it lets boot continue
-    // past the chained-abort loops that otherwise trap us.
-    advance_elr(4);
+    let elr = read_sysreg!("elr_el2");
+    kprintln!();
+    kprintln!("*** instruction abort from lower EL (no silent skip per Phase A) ***");
+    kprintln!(
+        "  ELR={:#x}  FAR_EL2={:#x}  IPA={:#x}  IFSC={:#x}",
+        elr, far, ipa, iss & 0x3f
+    );
+    kprintln!(
+        "  (guest tried to fetch an instruction at an IPA our stage-2 doesn't map."
+    );
+    kprintln!(
+        "   Either widen the stage-2 map to cover this IPA, or figure out why the"
+    );
+    kprintln!(
+        "   guest's PC went here — the instruction preceding this is a suspect.)"
+    );
+    cpu::halt();
 }
 
 fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
@@ -273,8 +309,28 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         0x05 => {
             kprintln!("guest-mark: {:#010x}", r0);
         }
+        0x20 => {
+            // Save snapshot — see src/snapshot.rs. The guest's x0..x14
+            // at HVC entry alias the active AArch32 mode's R0..R14;
+            // ELR_EL2 / SPSR_EL2 give the PC and CPSR to resume at.
+            let gprs: [u64; 15] = [
+                ctx.x[0],  ctx.x[1],  ctx.x[2],  ctx.x[3],
+                ctx.x[4],  ctx.x[5],  ctx.x[6],  ctx.x[7],
+                ctx.x[8],  ctx.x[9],  ctx.x[10], ctx.x[11],
+                ctx.x[12], ctx.x[13], ctx.x[14],
+            ];
+            if let Err(e) = crate::snapshot::save(&gprs) {
+                kprintln!("snapshot: save failed: {}", e);
+            }
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
+        }
+        v if v == DIAG_TAG => {
+            handle_diag(ctx);
+        }
+        v if v == DIAG_LR_TAG => {
+            handle_diag_lr(ctx);
         }
         _ => {
             let elr = read_sysreg!("elr_el2");
@@ -324,6 +380,17 @@ pub const UND_SAVE_LR_IPA: u32 = 0x0400_0400;
 pub const UND_SAVE_SPSR_IPA: u32 = 0x0400_0404;
 
 fn handle_und(ctx: &mut TrapContext) {
+    // DIAG: prove handle_und is being reached at all. Single-shot log.
+    static mut UND_ENTRY_LOGGED: bool = false;
+    // SAFETY: single-threaded.
+    unsafe {
+        if !UND_ENTRY_LOGGED {
+            UND_ENTRY_LOGGED = true;
+            let elr = read_sysreg!("elr_el2");
+            kprintln!("und: handle_und first entry, ELR_EL2={:#x}", elr);
+        }
+    }
+
     let lr_und = match read_guest_word_pa(UND_SAVE_LR_IPA) {
         Some(v) => v,
         None => {
@@ -392,6 +459,288 @@ fn handle_und(ctx: &mut TrapContext) {
             );
             cpu::halt();
         }
+    }
+}
+
+/// Generic "inspect-then-halt" diagnostic HVC handler.
+///
+/// Invoked when a vector (typically 0x10 DABT or 0x0C PABT) has been
+/// patched to `HVC #DIAG_TAG` during Phase B debugging. Dumps:
+/// - ELR_EL2 (PC after HVC), SPSR_EL2, ESR (via caller's trap path)
+/// - FAR_EL1 (original faulting VA, preserved across HVC)
+/// - Banked SPSR_<mode> for all non-current exception modes
+/// - Guest x0..x14 (= AArch32 R0..R14 of the mode that executed HVC,
+///   where R13/R14 are banked)
+/// - Guest stage-1 translation walk for FAR_EL1
+///
+/// Then halts loudly. Useful for any abort we don't see at EL2 because
+/// the guest handles it at EL1; patching the vector and running lets
+/// us catch the abort context once before the guest's own handler
+/// clobbers it.
+fn handle_diag(ctx: &mut TrapContext) {
+    let far = read_sysreg!("far_el1");
+    let spsr_el2 = read_sysreg!("spsr_el2");
+    let elr_el2 = read_sysreg!("elr_el2");
+
+    let spsr_abt = read_banked_spsr("abt");
+    let spsr_und = read_banked_spsr("und");
+    let spsr_irq = read_banked_spsr("irq");
+    let spsr_fiq = read_banked_spsr("fiq");
+
+    let pre_abort_mode = spsr_el2 & 0x1F;
+    let mode_name = describe_aarch32_mode(pre_abort_mode as u32);
+
+    kprintln!();
+    kprintln!("*** DIAG vector intercept (HVC #DIAG_TAG from mode {}) ***", mode_name);
+    kprintln!(
+        "  ELR_EL2   = {:#010x}  (PC of insn after HVC)",
+        elr_el2
+    );
+    kprintln!(
+        "  SPSR_EL2  = {:#010x}  (CPSR at HVC entry)",
+        spsr_el2
+    );
+    kprintln!(
+        "  FAR_EL1   = {:#010x}  (most-recent EL1 faulting VA)",
+        far
+    );
+    kprintln!(
+        "  SPSR_abt  = {:#010x}  SPSR_und = {:#010x}  SPSR_irq = {:#010x}  SPSR_fiq = {:#010x}",
+        spsr_abt, spsr_und, spsr_irq, spsr_fiq
+    );
+    kprintln!("  guest regs at HVC entry (x13/x14 are banked for the current mode):");
+    for chunk in 0..3 {
+        let base = chunk * 5;
+        kprintln!(
+            "    r{:<2}={:#010x} r{:<2}={:#010x} r{:<2}={:#010x} r{:<2}={:#010x} r{:<2}={:#010x}",
+            base, ctx.x[base] as u32,
+            base+1, ctx.x[base+1] as u32,
+            base+2, ctx.x[base+2] as u32,
+            base+3, ctx.x[base+3] as u32,
+            base+4, ctx.x[base+4] as u32,
+        );
+    }
+    guest_mem::dump_stage1_walk(far as u32);
+    // Also walk a handful of VAs that are relevant to Newton boot —
+    // SVC stack, ABT stack target, REx window start, RAM base — so we
+    // can tell at a glance whether the kernel's L1 table has the
+    // expected mappings in place at the time of the abort.
+    for va in [0x04004400u32, 0x0C004C00, 0x01000000, 0x04000000, 0x00800000] {
+        guest_mem::dump_stage1_walk(va);
+    }
+
+    // Before halting, try to recover LR / SP of the pre-abort mode
+    // and the SVC banked SP/LR (the kernel runs in SVC, so its stack
+    // lives there) by ERET'ing into an AArch32 stub we plant in guest
+    // RAM. On entry the stub runs in whatever mode SPSR_EL2 describes
+    // (ABT for a DABT intercept); it captures the current mode's LR/SP
+    // and SPSR, briefly switches to SVC to capture SP_svc / LR_svc,
+    // then HVCs back with everything in r0..r5.
+    //
+    // Stub (at guest IPA 0x04005F00, reached via VA 0x0C004F00 which
+    // the kernel maps through L1[0xC0] coarse -> L2[0x04] small page):
+    //   +0x00: e1a0000e   mov r0, lr       ; r0 = LR_<src_mode>
+    //   +0x04: e1a0100d   mov r1, sp       ; r1 = SP_<src_mode>
+    //   +0x08: e14f4000   mrs r4, spsr     ; r4 = SPSR_<src_mode>
+    //   +0x0C: e321f0d3   msr cpsr_c, #0xd3 ; switch to SVC
+    //   +0x10: e1a0200d   mov r2, sp       ; r2 = SP_svc
+    //   +0x14: e1a0300e   mov r3, lr       ; r3 = LR_svc
+    //   +0x18: e321f0d7   msr cpsr_c, #0xd7 ; switch back to ABT
+    //   +0x1C: e1400172   hvc #0x12        ; DIAG_LR_TAG
+    const LR_STUB_PA: u32 = 0x0400_5F00;
+    const LR_STUB_VA: u32 = 0x0C00_4F00;
+    let stub: [u32; 8] = [
+        0xE1A0_000E, 0xE1A0_100D, 0xE14F_4000, 0xE321_F0D3,
+        0xE1A0_200D, 0xE1A0_300E, 0xE321_F0D7, 0xE140_0172,
+    ];
+    for (i, w) in stub.iter().enumerate() {
+        if !guest_mem::write_word_pa(LR_STUB_PA + (i as u32) * 4, *w) {
+            kprintln!("  (stub write at +{} failed; halting)", i * 4);
+            cpu::halt();
+        }
+    }
+    kprintln!("  ERET'ing to LR/stack-trace stub at VA {:#x} ...", LR_STUB_VA);
+    // SAFETY: single-use ERET. ELR_EL2 set to the stub VA, SPSR_EL2
+    // kept as-is so the stub runs in the pre-abort mode. Caller is
+    // halted on return from handle_diag_lr.
+    unsafe {
+        core::arch::asm!(
+            "msr elr_el2, {elr}",
+            "isb",
+            "eret",
+            elr = in(reg) LR_STUB_VA as u64,
+            options(noreturn),
+        );
+    }
+}
+
+/// Second-stage diagnostic: the stub installed by `handle_diag` runs
+/// in the source AArch32 mode, captures that mode's LR/SP plus the
+/// SVC banked SP/LR, then HVCs back with:
+///   x0 = LR_<src_mode>  (for DABT: faulting_pc + 8, bit 0 = pre-abort T)
+///   x1 = SP_<src_mode>
+///   x2 = SP_svc
+///   x3 = LR_svc
+///   x4 = SPSR_<src_mode>  (raw AArch32 SPSR — more reliable than QEMU's
+///                          AArch64 view, which returned 0 for us)
+/// Prints all of that, the faulting instruction bytes, walks the
+/// kernel's SVC stack (fp-chain + raw dump + return-address
+/// heuristic), then halts.
+fn handle_diag_lr(ctx: &mut TrapContext) -> ! {
+    let lr_src   = ctx.x[0] as u32;
+    let sp_src   = ctx.x[1] as u32;
+    let sp_svc   = ctx.x[2] as u32;
+    let lr_svc   = ctx.x[3] as u32;
+    let spsr_src = ctx.x[4] as u32;
+    let thumb = (lr_src & 1) != 0;
+    let faulting_pc = if thumb { lr_src.wrapping_sub(4) & !1 }
+                      else      { lr_src.wrapping_sub(8) };
+
+    kprintln!();
+    kprintln!("*** DIAG stage 2 (LR + stack-trace recovery) ***");
+    kprintln!(
+        "  LR_<src>  = {:#010x}  SPSR_<src> = {:#010x}  (T={})",
+        lr_src, spsr_src, thumb as u32
+    );
+    kprintln!(
+        "  SP_<src>  = {:#010x}  SP_svc  = {:#010x}  LR_svc = {:#010x}",
+        sp_src, sp_svc, lr_svc
+    );
+    let mode_name = describe_aarch32_mode(spsr_src);
+    kprintln!(
+        "  source mode from SPSR = {:#x} ({}); T={}, I={}, F={}",
+        spsr_src & 0x1F, mode_name,
+        (spsr_src >> 5) & 1, (spsr_src >> 7) & 1, (spsr_src >> 6) & 1
+    );
+    kprintln!(
+        "  faulting PC  = {:#010x}  ({})",
+        faulting_pc, if thumb { "Thumb" } else { "ARM" }
+    );
+
+    // Dump the faulting instruction(s). For Thumb at an aligned addr,
+    // two halfwords. For ARM, one word.
+    if let Some(w) = guest_mem::read_word_pa(faulting_pc) {
+        if thumb {
+            kprintln!(
+                "  insn halfwords @ {:#x} = {:#06x} {:#06x}",
+                faulting_pc, w & 0xFFFF, (w >> 16) & 0xFFFF
+            );
+        } else {
+            kprintln!("  insn word @ {:#x} = {:#010x}", faulting_pc, w);
+        }
+    }
+
+    // Walk the SVC stack symbolically. `lr_svc` is the return
+    // address of whoever is currently executing in SVC — i.e. the BL
+    // that led us here. From SP_svc we scan upward (growing address)
+    // looking for values that plausibly point back into the ROM's
+    // executable range; each such word is a likely saved-LR. This is
+    // a cheap substitute for a full fp-chain walk when fp = 0 (which
+    // BootOS deliberately sets at 0x187d4).
+    kprintln!("  symbolic stack trace (SVC):");
+    kprintln!(
+        "    #0  {:#010x}  ({})   <- faulting PC",
+        faulting_pc, if thumb { "Thumb" } else { "ARM" }
+    );
+    kprintln!(
+        "    #1  {:#010x}  ARM    <- LR_svc (caller of faulting fn)",
+        lr_svc & !1
+    );
+
+    // Scan 64 words up from SP_svc; any word that looks like a return
+    // address (points into ROM, word-aligned modulo Thumb bit, and
+    // the preceding word is a plausible BL / BLX) is printed. The
+    // word-before-BL filter cuts almost all false positives.
+    let mut frame = 2usize;
+    for i in 0..64u32 {
+        let va = sp_svc.wrapping_add(i * 4);
+        let pa_opt = guest_translate_va(va);
+        if pa_opt.is_none() { continue; }
+        let pa = pa_opt.unwrap();
+        let w = match guest_mem::read_word_pa(pa) {
+            Some(x) => x, None => continue,
+        };
+        // Heuristic for "plausible return address": points to ROM
+        // (< 0x0100_0000 after stripping Thumb bit) and aligned.
+        let tgt = w & !1;
+        if tgt == 0 || tgt >= 0x0100_0000 { continue; }
+        if tgt & 3 != 0 { continue; }
+        // Preceding word should look like a BL (`cond_101L_...`) —
+        // which means bits[27:24] = 0b101_ (any BL/B).
+        if let Some(prev) = guest_mem::read_word_pa(tgt.wrapping_sub(4)) {
+            let is_bl = ((prev >> 24) & 0xF) == 0xB;       // BL (unconditional)
+            let is_blx_imm = ((prev >> 25) & 0x7F) == 0x7D; // BLX imm (v5+)
+            if is_bl || is_blx_imm {
+                kprintln!(
+                    "    #{}  {:#010x}  (called via {:#010x} @ {:#x})",
+                    frame, tgt, prev, tgt - 4
+                );
+                frame += 1;
+                if frame >= 8 { break; }
+            }
+        }
+    }
+    kprintln!("  (end of trace — cross-reference PCs against _Data_/symbols.txt)");
+    cpu::halt();
+}
+
+/// Translate a guest VA to its guest PA via the current stage-1
+/// tables. Returns None on a fault (unmapped / wrong descriptor type).
+/// Uses the same logic as `guest_mem::dump_stage1_walk` but returns
+/// the PA instead of printing.
+fn guest_translate_va(va: u32) -> Option<u32> {
+    // Assume TTBR0 = 0x04000000 (per probe findings) and walk the
+    // short-descriptor tables via guest_mem's PA accessors.
+    let l1_idx = (va >> 20) as usize;
+    let l1_entry = guest_mem::read_word_pa(0x0400_0000 + (l1_idx as u32) * 4)?;
+    let ty = l1_entry & 3;
+    match ty {
+        2 => Some((l1_entry & 0xFFF0_0000) | (va & 0x000F_FFFF)),
+        1 => {
+            let l2_pa = l1_entry & 0xFFFF_FC00;
+            let l2_idx = (va >> 12) & 0xFF;
+            let l2_entry = guest_mem::read_word_pa(l2_pa + l2_idx * 4)?;
+            match l2_entry & 3 {
+                1 => Some((l2_entry & 0xFFFF_0000) | (va & 0x0000_FFFF)),
+                2 | 3 => Some((l2_entry & 0xFFFF_F000) | (va & 0x0000_0FFF)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn read_banked_spsr(which: &'static str) -> u64 {
+    // SAFETY: these are defined AArch64 system registers at EL2.
+    unsafe {
+        let v: u64;
+        match which {
+            "abt" => core::arch::asm!("mrs {}, spsr_abt", out(reg) v,
+                options(nomem, nostack, preserves_flags)),
+            "und" => core::arch::asm!("mrs {}, spsr_und", out(reg) v,
+                options(nomem, nostack, preserves_flags)),
+            "irq" => core::arch::asm!("mrs {}, spsr_irq", out(reg) v,
+                options(nomem, nostack, preserves_flags)),
+            "fiq" => core::arch::asm!("mrs {}, spsr_fiq", out(reg) v,
+                options(nomem, nostack, preserves_flags)),
+            _ => { v = 0; }
+        }
+        v
+    }
+}
+
+fn describe_aarch32_mode(mode: u32) -> &'static str {
+    match mode & 0x1F {
+        0x10 => "USR",
+        0x11 => "FIQ",
+        0x12 => "IRQ",
+        0x13 => "SVC",
+        0x16 => "MON",
+        0x17 => "ABT",
+        0x1A => "HYP",
+        0x1B => "UND",
+        0x1F => "SYS",
+        _    => "?",
     }
 }
 
@@ -664,9 +1013,11 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
         (0, 15, 1, 2, false) => { /* nop */ }
 
         _ => {
-            // Unrecognised tuple — log (budget is applied above) and
-            // fall through to ignored.
-            log_unknown_cp15(is_read, opc1, crn, crm, opc2, rt, ctx);
+            // Unrecognised tuple — Phase A contract: halt loudly so
+            // we model it here rather than silently returning zero /
+            // dropping the write. probe/FINDINGS.md §16.4 enumerates
+            // the 15 tuples 717006 uses.
+            halt_unknown_cp15(is_read, opc1, crn, crm, opc2, rt, ctx);
         }
     }
 
@@ -772,14 +1123,23 @@ fn maybe_dump_l1_once() {
     }
 }
 
-fn log_unknown_cp15(is_read: bool, opc1: u32, crn: u32, crm: u32, opc2: u32, rt: usize, ctx: &TrapContext) {
+fn halt_unknown_cp15(is_read: bool, opc1: u32, crn: u32, crm: u32, opc2: u32, rt: usize, ctx: &TrapContext) -> ! {
     let value = if is_read { 0 } else { ctx.x[rt] as u32 };
     let elr = read_sysreg!("elr_el2");
+    kprintln!();
+    kprintln!("*** unhandled CP15 access halted (no silent stub per Phase A) ***");
     kprintln!(
-        "cp15 UNHANDLED: {} p15,{},Rt=r{},c{},c{},{{{}}} val={:#010x} @ELR={:#x}",
+        "  {} p15,{},Rt=r{},c{},c{},{{{}}}  val={:#010x}  @ELR={:#x}",
         if is_read { "MRC" } else { "MCR" },
         opc1, rt, crn, crm, opc2, value, elr
     );
+    kprintln!(
+        "  (extend handle_cp15_trap in trap.rs to service this tuple; cross-reference"
+    );
+    kprintln!(
+        "   probe/FINDINGS.md §16.4 for the 15 tuples the 717006 ROM exercises.)"
+    );
+    cpu::halt();
 }
 
 // Small inline module with the raw sysreg touches, kept close to the
@@ -872,18 +1232,20 @@ mod cp15 {
     pub(crate) use {sysreg_read, sysreg_write};
 }
 
-fn handle_unknown(iss: u32) {
+fn handle_unknown(iss: u32) -> ! {
     let elr = read_sysreg!("elr_el2");
     let spsr = read_sysreg!("spsr_el2");
-    // EC=0 "unknown reason" usually means an illegal AArch32 instruction
-    // trapped to EL1 naturally — but when HCR_EL2.VM=1 some end up here.
-    // Skip the instruction so the guest's kernel can continue if it was
-    // probing for CPU features.
-    kprintln!(
-        "unknown sync at ELR={:#x} SPSR={:#x} ISS={:#x} (skipping)",
-        elr, spsr, iss
-    );
-    advance_elr(4);
+    // EC=0 "unknown reason" — an illegal / undefined AArch32 instruction.
+    // Phase A contract: halt loudly with the faulting PC so we can see
+    // what instruction the guest tried to execute and add handling for
+    // it. No silent skip.
+    kprintln!();
+    kprintln!("*** EC=0 'unknown' trap halted (no silent skip per Phase A) ***");
+    kprintln!("  ELR={:#x}  SPSR={:#x}  ISS={:#x}", elr, spsr, iss);
+    if let Some(w) = guest_mem::read_word_pa(elr as u32) {
+        kprintln!("  insn at ELR = {:#010x}", w);
+    }
+    cpu::halt();
 }
 
 // ----------------- helpers -----------------

@@ -11,6 +11,7 @@ mod mmio;
 mod mmu;
 mod panic;
 mod peripherals;
+mod snapshot;
 mod stage2;
 mod timer;
 mod trap;
@@ -53,6 +54,19 @@ pub extern "C" fn kmain() -> ! {
 
     peripherals::vic::init();
     timer::init();
+
+    // Seed the snapshot ring's sequence counter from existing slots
+    // (so resumed runs don't reuse seq numbers), then attempt to
+    // load the newest valid slot. If nothing qualifies we fall
+    // through to a cold boot.
+    snapshot::init();
+    if let Some(state) = snapshot::load_latest() {
+        kprintln!();
+        kprintln!("Resuming guest from snapshot at PC={:#x}", state.pc);
+        // SAFETY: snapshot::load already restored EL1 sysregs; we
+        // configure EL2 traps and ERET to the saved PC.
+        unsafe { guest::eret_to_restored(state); }
+    }
 
     kprintln!();
     kprintln!("Entering Newton ROM...");

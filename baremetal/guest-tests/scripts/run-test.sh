@@ -30,7 +30,8 @@ objcopy="$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)"
 # Run. Capture output, check for PASS / FAIL markers.
 log=/tmp/guest-${test_name}.out
 timeout 10 qemu-system-aarch64 -M raspi3b -kernel "$img" \
-    -serial stdio -display none -no-reboot > "$log" 2>&1 || true
+    -serial stdio -display none -no-reboot \
+    -semihosting-config enable=on,target=native > "$log" 2>&1 || true
 
 if grep -q 'guest test PASSED' "$log"; then
     echo "PASS: $test_name"

@@ -28,15 +28,11 @@ static TOY: ToyImage = ToyImage([
     0xEAFF_FFFE,
 ]);
 
-/// Enter AArch32 SVC mode at the given guest IPA. Never returns.
-unsafe fn eret_to_guest(entry_ipa: u64) -> ! {
-    // SPSR = AArch32 SVC, interrupts masked.
-    let spsr_aarch32_svc: u64 = 0x0000_01D3;
-
-    // SAFETY: preserves stage-2 enable; adds CP15 trap bits so the Newton's
-    // ARMv4-era writes route to EL2 (where we can emulate or skip them)
-    // instead of becoming undef exceptions the guest's own handler can't
-    // service without its stage-1 MMU.
+/// Configure the EL2 trap bits that stay constant for the life of
+/// the guest. Called unconditionally from both cold boot and
+/// snapshot-resume paths; does not touch guest EL1 sysregs.
+unsafe fn configure_el2_traps() {
+    // SAFETY: sysreg writes at EL2, barrier in the final msr.
     unsafe {
         let mut hcr: u64;
         asm!("mrs {}, hcr_el2", out(reg) hcr,
@@ -44,62 +40,61 @@ unsafe fn eret_to_guest(entry_ipa: u64) -> ! {
         hcr &= !(1u64 << 31); // RW = 0 (AArch32)
         hcr |= 1u64 << 20;    // TIDCP: trap implementation-defined CP15
         hcr |= 1u64 << 26;    // TVM:   trap guest writes to virtual-memory CP15 regs
-                              //        (SCTLR/TTBR/DACR change what's translated,
-                              //        so we need to mediate them; we intentionally
-                              //        do NOT set TRVM — guest reads of DFSR/DFAR
-                              //        etc. should go straight to hardware so the
-                              //        kernel's abort handler sees real fault info)
         hcr |= 1u64 << 22;    // TSW:   trap set/way cache maintenance
-        hcr |= 1u64 << 3;     // FMO:   route physical FIQ to EL2 (needed for VF to deliver)
-        hcr |= 1u64 << 4;     // IMO:   route physical IRQ to EL2 (needed for VI to deliver)
+        hcr |= 1u64 << 3;     // FMO:   route physical FIQ to EL2
+        hcr |= 1u64 << 4;     // IMO:   route physical IRQ to EL2
         hcr |= 1u64 << 5;     // AMO:   route SError to EL2
         asm!("msr hcr_el2, {}", "isb", in(reg) hcr,
             options(nostack, preserves_flags));
 
-        // CPTR_EL2.TFP = 1 traps every AArch32 MCR/MRC/LDC/STC/CDP to
-        // CP10/CP11 from lower EL to EL2 as an FP/SIMD access
-        // (EC=0x07). Newton OS doesn't use FPU — it uses MCR p10 as
-        // the "native primitive" call gateway (Emulator/TARMProcessor.cpp
-        // :374, Emulator/TNativePrimitives.cpp:177). Trapping gets
-        // every such call into peripherals::native_primitives::execute
-        // where we emulate or halt loudly on unknown codes. EL2's own
-        // FP is untouched (TFP only affects lower EL when E2H=0).
+        // CPTR_EL2.TFP routes lower-EL FP/SIMD (and thus AArch32
+        // MCR/MRC to CP10/11 — the native-primitive gateway) to EL2
+        // as EC=0x07. See peripherals/native_primitives.rs.
         let mut cptr: u64;
         asm!("mrs {}, cptr_el2", out(reg) cptr,
             options(nomem, nostack, preserves_flags));
-        cptr |= 1u64 << 10;    // TFP
+        cptr |= 1u64 << 10;
         asm!("msr cptr_el2, {}", "isb", in(reg) cptr,
             options(nostack, preserves_flags));
+    }
+}
 
-        // CPACR_EL1: enable CP10 and CP11 access at EL1. The default
-        // value has both disabled, so an AArch32 MCR p10,... would
-        // raise UND locally at EL1 (taking the guest's UND vector)
-        // before CPTR_EL2.TFP has a chance to route it to EL2.
-        // Setting FPEN = 0b11 (bits 21:20) — which also covers the
-        // AArch32 CPACR cp10/cp11 fields at 23:22 / 21:20 — removes
-        // that local UND so MCR p10 propagates through the TFP trap.
-        // Newton doesn't use FP itself; enabling these bits is
-        // side-effect-free for the guest's own code paths.
+/// Cold-boot EL1 state: guest stage-1 off, TTBRs cleared, CPACR
+/// opened so MCR p10 can propagate through CPTR_EL2.TFP. Called only
+/// on cold boot; snapshot resume restores EL1 sysregs from the file.
+unsafe fn zero_el1_guest_state() {
+    // SAFETY: sysreg writes before ERET; barriers serialise them.
+    unsafe {
         let cpacr: u64 = (0b11 << 20) | (0b11 << 22);
         asm!("msr cpacr_el1, {}", "isb", in(reg) cpacr,
             options(nostack, preserves_flags));
 
-        // Zero guest SCTLR_EL1 so its stage-1 is off at reset. The ROM's
-        // own boot code will configure SCTLR_EL1 / TTBR0 / DACR etc. on
-        // its way up.
+        // SCTLR off — ROM boot code programs it as it brings the
+        // stage-1 MMU up.
         asm!("msr sctlr_el1, xzr", "isb",
             options(nostack, preserves_flags));
 
-        // Zero TCR_EL1 so guest-stage-1 uses short-descriptor VMSAv7
-        // format (TTBCR.EAE = 0). This is what the 717006 ROM expects;
-        // A53's reset value isn't architecturally guaranteed to be 0.
+        // TCR zero so guest-stage-1 uses short-descriptor VMSAv7
+        // (TTBCR.EAE = 0); A53 reset isn't architecturally zero.
         asm!("msr tcr_el1, xzr", "isb",
             options(nostack, preserves_flags));
 
-        // Clear TTBR0_EL1 / TTBR1_EL1 to known state; ROM will write
-        // its real tables via the CP15 shim.
+        // TTBR{0,1} to known state; ROM overwrites via the CP15 shim.
         asm!("msr ttbr0_el1, xzr", "msr ttbr1_el1, xzr", "isb",
             options(nostack, preserves_flags));
+    }
+}
+
+/// Enter AArch32 SVC mode at the given guest IPA. Never returns.
+unsafe fn eret_to_guest(entry_ipa: u64) -> ! {
+    // SPSR = AArch32 SVC, I=F=A=1.
+    let spsr_aarch32_svc: u64 = 0x0000_01D3;
+
+    // SAFETY: caller has invoked us exactly once, after the hypervisor's
+    // own MMU / stage-2 / vector setup.
+    unsafe {
+        configure_el2_traps();
+        zero_el1_guest_state();
 
         asm!(
             "msr elr_el2, {entry}",
@@ -108,6 +103,47 @@ unsafe fn eret_to_guest(entry_ipa: u64) -> ! {
             "eret",
             entry = in(reg) entry_ipa,
             spsr = in(reg) spsr_aarch32_svc,
+            options(noreturn),
+        );
+    }
+}
+
+/// ERET into a guest restored from a snapshot. Assumes
+/// `snapshot::load` has already re-applied EL1 sysregs (SCTLR, TTBRx,
+/// TCR, DACR, VBAR, CPACR, banked SPSRs).
+pub unsafe fn eret_to_restored(state: crate::snapshot::RestoreState) -> ! {
+    // Widen u32 GPRs to u64 so we can pair-load with LDP.
+    let mut gprs_u64: [u64; 15] = [0; 15];
+    for i in 0..15 {
+        gprs_u64[i] = state.gprs[i] as u64;
+    }
+    let pc = state.pc as u64;
+    let cpsr = state.cpsr as u64;
+    let ptr = gprs_u64.as_ptr() as u64;
+
+    // SAFETY: sysreg writes to ELR_EL2 / SPSR_EL2 set the post-ERET
+    // guest PC and CPSR; ERET consumes them. Named registers x24-x26
+    // keep our address scratch pointers out of the x0..x14 range the
+    // LDPs load into, and out of x29 (FP) which Rust reserves.
+    unsafe {
+        configure_el2_traps();
+
+        asm!(
+            "msr elr_el2, x24",
+            "msr spsr_el2, x25",
+            "isb",
+            "ldp x0, x1,   [x26, #0]",
+            "ldp x2, x3,   [x26, #16]",
+            "ldp x4, x5,   [x26, #32]",
+            "ldp x6, x7,   [x26, #48]",
+            "ldp x8, x9,   [x26, #64]",
+            "ldp x10, x11, [x26, #80]",
+            "ldp x12, x13, [x26, #96]",
+            "ldr x14,      [x26, #112]",
+            "eret",
+            in("x24") pc,
+            in("x25") cpsr,
+            in("x26") ptr,
             options(noreturn),
         );
     }

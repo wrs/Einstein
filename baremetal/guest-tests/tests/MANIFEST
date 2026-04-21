@@ -10,3 +10,4 @@ test_cp15_strongarm_clock
 test_serial
 test_native_primitives
 test_screen_blit
+test_snapshot

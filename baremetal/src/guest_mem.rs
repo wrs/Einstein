@@ -282,6 +282,68 @@ pub fn fix_stage1_xn_bits() {
     );
 }
 
+/// Manually walk the guest's stage-1 tables for a given VA and print
+/// each level. Useful during Phase B debugging of stage-1 aborts we
+/// don't see from EL2 — the diagnostic HVC handler calls this to show
+/// what the guest's own page-table walker would have produced for the
+/// faulting VA.
+pub fn dump_stage1_walk(va: u32) {
+    use crate::kprintln;
+    let ram = addr_of_mut!(GUEST_RAM) as *const u32;
+    let rom = addr_of_mut!(GUEST_ROM) as *const u32;
+
+    let l1_idx = (va >> 20) as usize;
+    // L1 sits at the start of guest RAM (TTBR0 = 0x04000000 per probe).
+    // SAFETY: l1_idx < 4096 and GUEST_RAM is 4 MiB so the whole 16 KiB
+    // L1 table fits.
+    let l1 = unsafe { ram.add(l1_idx).read() };
+    let ty = l1 & 3;
+    let tname = match ty { 0=>"fault", 1=>"coarse", 2=>"section", 3=>"fine", _=>"?" };
+    kprintln!(
+        "  stage1 walk VA={:#010x}:  L1[{:#x}] = {:#010x}  ({})",
+        va, l1_idx, l1, tname
+    );
+    if ty == 2 {
+        let pa_base = l1 & 0xFFF0_0000;
+        let pa = pa_base | (va & 0x000F_FFFF);
+        kprintln!(
+            "    section → PA {:#010x}  AP[1:0]={:#x} AP[2]={} XN={} domain={:#x}",
+            pa, (l1 >> 10) & 3, (l1 >> 15) & 1, (l1 >> 4) & 1, (l1 >> 5) & 0xF
+        );
+    }
+    if ty == 1 {
+        let l2_pa = (l1 & 0xFFFF_FC00) as usize;
+        // Pick backing store.
+        let (base, region_start) = if l2_pa < ROM_SIZE {
+            (rom, 0usize)
+        } else if (0x04000000..0x04000000 + RAM_SIZE as u64).contains(&(l2_pa as u64)) {
+            (ram, 0x04000000usize)
+        } else {
+            kprintln!("    coarse L2 @ PA {:#x} — no backing store mapped", l2_pa);
+            return;
+        };
+        let l2_off = (l2_pa - region_start) / 4;
+        let l2_idx = ((va >> 12) & 0xFF) as usize;
+        // SAFETY: l2_off + l2_idx < (region_size / 4) for all valid L2 tables
+        // we've produced; fix_stage1_xn_bits enforces the same bound.
+        let l2 = unsafe { base.add(l2_off + l2_idx).read() };
+        let l2_ty = l2 & 3;
+        let l2_name = match l2_ty { 0=>"fault", 1=>"large", 2|3=>"small", _=>"?" };
+        kprintln!(
+            "    coarse L2 @ PA {:#x}, L2[{:#x}] = {:#010x}  ({})",
+            l2_pa, l2_idx, l2, l2_name
+        );
+        let pa = match l2_ty {
+            1 => (l2 & 0xFFFF_0000) | (va & 0x0000_FFFF), // large page
+            2 | 3 => (l2 & 0xFFFF_F000) | (va & 0x0000_0FFF), // small page
+            _ => 0,
+        };
+        if l2_ty != 0 {
+            kprintln!("    → PA {:#010x}", pa);
+        }
+    }
+}
+
 /// Dump the first 32 entries of the guest's stage-1 L1 page table, which we
 /// assume lives at the start of guest RAM (TTBR0 = 0x0400_0000 per the
 /// 717006 probe; stage-2 maps that IPA to the host ram backing). Each
@@ -512,6 +574,19 @@ pub unsafe fn load_newton_rom() {
     // both in the first 256 bytes of ROM, confirmed zero from offset
     // 0x58 onwards on Newton 2.x ROMs.
     unsafe { patch_und_vector(rom_ptr); }
+
+    // TEMPORARY diagnostic — DABT-vector intercept.
+    // Replace the ROM's branch at VA 0x10 with `HVC #DABT_TAG` so the
+    // very first stage-1 data abort traps to EL2 with the original
+    // FAR_EL1 / SPSR_abt intact. Without this the ROM handler at
+    // 0x393114 runs with SP_abt = 0xFFFFFFFF (poison primed by
+    // BootOS at 0x187e8 before SetUpStacks), its first STMDB
+    // recursively aborts at 0xFFFFFFF7, and FAR is clobbered by the
+    // second abort before any heartbeat fires. Remove once the root
+    // cause of the first abort is identified and fixed.
+    // SAFETY: single-word write to ROM offset 0x10 (DABT vector);
+    // guest sees this via the stage-2 read-only ROM map.
+    unsafe { rom_ptr.add(4).write(0xE140_0171); } // hvc #0x11
 
     // Bring-up shim #2: the 717006 kernel uses StrongARM's lax CP15 encoding
     // where CRm == CRn for most system-control registers. On ARMv7+ those

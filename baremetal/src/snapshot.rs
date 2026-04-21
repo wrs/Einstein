@@ -1,0 +1,640 @@
+//! Guest-state snapshot save/load via QEMU semihosting.
+//!
+//! The goal is to let a debugging session skip past the part of the
+//! 717006 boot we already understand. Periodic auto-saves write into
+//! a small ring of slots during boot; when the guest eventually
+//! fails, we rebuild the hypervisor and resume from the newest valid
+//! slot — or from an earlier one if the failure mode is in the last
+//! saved window.
+//!
+//! Because we persist only guest state — not EL2 code addresses —
+//! snapshots survive hypervisor rebuilds. That's what makes the
+//! workflow useful: edit hypervisor code, rebuild, resume.
+//!
+//! ## Slots
+//!
+//! `NUM_SLOTS` files in `/tmp/newton-snapshot-{0..N}.bin`. Saves
+//! round-robin on a monotonic sequence counter; the slot with the
+//! highest seq on load is the winner. On hypervisor startup,
+//! `init()` scans existing slots and seeds the counter so rolling
+//! continues across hypervisor restarts — a boot that crashes at
+//! seq=12 leaves slots with seqs 9, 10, 11, 12, and the next run
+//! resumes from 12 (or, if the user wants an earlier point, they
+//! can copy slot 9 onto slot 12 before rerunning).
+//!
+//! ## Triggers
+//!
+//! - Periodic: `maybe_autosave()` called from the trap dispatcher.
+//!   It saves when `CNTPCT_EL0` has advanced at least
+//!   `AUTOSAVE_INTERVAL_MS` since the last save. Wall-clock rather
+//!   than trap count because the point is to save developer time —
+//!   a pathological abort loop would generate many traps per second
+//!   and thrash saves; a quiet guest would barely save at all.
+//!   Wall-clock pacing smooths both.
+//! - Guest-triggered: HVC `#0x20` from the guest issues an immediate
+//!   save (useful inside tests or wedged into specific code paths).
+//!
+//! ## Semihosting
+//!
+//! AArch64 HLT `#0xF000` with SYS_OPEN / SYS_WRITE / SYS_READ /
+//! SYS_CLOSE (Arm Semihosting for AArch32/64, section 5.3). Paths
+//! are resolved against the host process's cwd when QEMU is started
+//! with `-semihosting-config enable=on,target=native`.
+//!
+//! ## Format
+//!
+//! Little-endian throughout. Header followed by raw memory regions
+//! (RAM, FB, flash) in a fixed order. Bump `VERSION` when the
+//! layout changes so stale files get rejected loudly. A FNV-1a
+//! fingerprint of the first 1 KiB of GUEST_ROM is included so a
+//! snapshot taken from one guest binary can't accidentally load
+//! into a different one.
+
+use core::arch::asm;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use crate::{guest_mem, kprintln, peripherals, trap::TrapContext};
+
+// ---- semihosting primitives ---------------------------------------
+
+const SYS_OPEN: u64 = 0x01;
+const SYS_CLOSE: u64 = 0x02;
+const SYS_WRITE: u64 = 0x05;
+const SYS_READ: u64 = 0x06;
+
+/// Arm Semihosting SYS_OPEN mode flags (C fopen-style).
+const MODE_READ_BINARY: u64 = 0x01; // "rb"
+const MODE_WRITE_BINARY: u64 = 0x05; // "wb"
+
+/// Execute one semihosting call. `op` is the SYS_* subfunction ID;
+/// `arg` is a pointer to an array of u64 parameters matching the op.
+/// Returns the value the semihosting handler places in x0.
+#[inline]
+unsafe fn semihost(op: u64, arg: *const u64) -> i64 {
+    let result: u64;
+    // SAFETY: HLT #0xF000 with semihosting enabled in QEMU is a
+    // controlled trap the emulator intercepts; it does not crash or
+    // drop EL2 state. The arg pointer lifetime covers the call.
+    unsafe {
+        asm!(
+            "hlt #0xF000",
+            inout("x0") op => result,
+            in("x1") arg as u64,
+            options(nostack, preserves_flags),
+        );
+    }
+    result as i64
+}
+
+struct FileHandle(u64);
+
+fn open(path: &[u8], mode: u64) -> Option<FileHandle> {
+    let args: [u64; 3] = [path.as_ptr() as u64, mode, (path.len() - 1) as u64];
+    let h = unsafe { semihost(SYS_OPEN, args.as_ptr()) };
+    if h < 0 {
+        None
+    } else {
+        Some(FileHandle(h as u64))
+    }
+}
+
+fn close(h: FileHandle) {
+    let args: [u64; 1] = [h.0];
+    let _ = unsafe { semihost(SYS_CLOSE, args.as_ptr()) };
+}
+
+fn write_all(h: &FileHandle, data: &[u8]) -> Result<(), &'static str> {
+    let args: [u64; 3] = [h.0, data.as_ptr() as u64, data.len() as u64];
+    let unwritten = unsafe { semihost(SYS_WRITE, args.as_ptr()) };
+    if unwritten == 0 {
+        Ok(())
+    } else {
+        Err("semihost SYS_WRITE short write")
+    }
+}
+
+fn read_all(h: &FileHandle, buf: &mut [u8]) -> Result<(), &'static str> {
+    let args: [u64; 3] = [h.0, buf.as_mut_ptr() as u64, buf.len() as u64];
+    let not_read = unsafe { semihost(SYS_READ, args.as_ptr()) };
+    if not_read == 0 {
+        Ok(())
+    } else {
+        Err("semihost SYS_READ short read")
+    }
+}
+
+// ---- snapshot layout ---------------------------------------------
+
+/// "NHSNAP\0\x01" encoded little-endian.
+const MAGIC: u64 = 0x0150_414E_5348_4E00;
+const VERSION: u32 = 1;
+
+/// Number of rolling slots. Each slot is ~14 MiB, so four slots cost
+/// ~56 MiB of host disk and give the user three save windows of
+/// rewind space before the oldest gets overwritten.
+const NUM_SLOTS: usize = 4;
+
+/// Slot paths. Must be NUL-terminated so `open` can hand them to
+/// semihosting SYS_OPEN directly.
+const SLOT_PATHS: [&[u8]; NUM_SLOTS] = [
+    b"/tmp/newton-snapshot-0.bin\0",
+    b"/tmp/newton-snapshot-1.bin\0",
+    b"/tmp/newton-snapshot-2.bin\0",
+    b"/tmp/newton-snapshot-3.bin\0",
+];
+
+/// Minimum wall-clock gap between periodic autosaves. Measured
+/// against CNTPCT_EL0 in `maybe_autosave`. Chosen to save ~once
+/// every couple of seconds during a ROM boot — fast enough to
+/// capture progress before an oncoming failure, slow enough to
+/// not dominate wall time with 14 MiB semihosting writes.
+pub const AUTOSAVE_INTERVAL_MS: u64 = 2_000;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Header {
+    magic: u64,
+    version: u32,
+    _pad0: u32,
+
+    saved_pc: u32,
+    saved_cpsr: u32,
+    gprs: [u32; 15],
+
+    sctlr_el1: u32,
+    ttbr0_el1: u64,
+    ttbr1_el1: u64,
+    tcr_el1: u64,
+    dacr32_el2: u32,
+    vbar_el1: u64,
+    cpacr_el1: u64,
+
+    spsr_svc: u32,
+    spsr_abt: u32,
+    spsr_und: u32,
+    spsr_irq: u32,
+    spsr_fiq: u32,
+    _pad1: u32,
+
+    ram_size: u32,
+    fb_size: u32,
+    flash_size: u32,
+
+    /// FNV-1a over the first 1024 bytes of GUEST_ROM post-patches.
+    /// On load, we recompute and reject the snapshot if it doesn't
+    /// match — catches the common error of carrying a guest-test
+    /// snapshot into a ROM boot (or vice versa) and ERET-ing into
+    /// someone else's code.
+    rom_fingerprint: u32,
+
+    /// Monotonically increasing save sequence. The slot with the
+    /// highest seq across all `NUM_SLOTS` files is the one `load()`
+    /// picks; seq also persists across hypervisor runs so a resumed
+    /// session's new saves don't masquerade as older than the
+    /// snapshots it started from.
+    seq: u64,
+}
+
+// ---- save --------------------------------------------------------
+
+/// Monotonically increasing save sequence, persisted across the ring
+/// via the Header::seq field.
+static SAVE_SEQ: AtomicU64 = AtomicU64::new(1);
+/// CNTPCT_EL0 reading at the last successful autosave (0 = never).
+static LAST_SAVE_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// Current value of the save sequence counter — number of rolling
+/// saves performed so far in this hypervisor run. Used by debug
+/// triggers that want to halt / diverge after a known number of
+/// snapshots have been taken (see the `FAKE BUG` demo in trap.rs
+/// for the pattern).
+#[allow(dead_code)]
+pub fn current_seq() -> u64 {
+    SAVE_SEQ.load(Ordering::Relaxed)
+}
+
+/// Scan the ring for existing saves and seed `SAVE_SEQ` so resumed
+/// runs don't reuse sequence numbers. Call exactly once before the
+/// first `save()` / `load()`.
+pub fn init() {
+    let mut max_seq: u64 = 0;
+    for slot in 0..NUM_SLOTS {
+        if let Some(seq) = peek_seq(SLOT_PATHS[slot]) {
+            if seq > max_seq {
+                max_seq = seq;
+            }
+        }
+    }
+    SAVE_SEQ.store(max_seq + 1, Ordering::Relaxed);
+}
+
+/// Periodic-save hook. Called from the EL2 timer IRQ path
+/// (`trap.rs::trap_irq`) so wall-clock progression drives the
+/// cadence even when the guest is spinning in an abort loop that
+/// never reaches a synchronous trap. Saves iff CNTPCT_EL0 has
+/// advanced at least `AUTOSAVE_INTERVAL_MS` since the last save.
+pub fn maybe_autosave(ctx: &TrapContext) {
+    let now = cntpct();
+    let freq = cntfrq();
+    let last = LAST_SAVE_TICKS.load(Ordering::Relaxed);
+    let interval_ticks = (AUTOSAVE_INTERVAL_MS * freq) / 1_000;
+    if last != 0 && now.wrapping_sub(last) < interval_ticks {
+        return;
+    }
+    // Either first save, or enough wall-clock has passed.
+    let gprs: [u64; 15] = [
+        ctx.x[0],  ctx.x[1],  ctx.x[2],  ctx.x[3],
+        ctx.x[4],  ctx.x[5],  ctx.x[6],  ctx.x[7],
+        ctx.x[8],  ctx.x[9],  ctx.x[10], ctx.x[11],
+        ctx.x[12], ctx.x[13], ctx.x[14],
+    ];
+    if save(&gprs).is_ok() {
+        LAST_SAVE_TICKS.store(now, Ordering::Relaxed);
+    }
+}
+
+/// Write a snapshot to the next ring slot. Called from periodic
+/// autosaves and from the HVC #0x20 handler.
+///
+/// `gprs` must hold x0..x14 of the guest at save time; ELR_EL2 and
+/// SPSR_EL2 give the PC and CPSR to resume at.
+pub fn save(gprs: &[u64; 15]) -> Result<(), &'static str> {
+    let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let slot = (seq as usize) % NUM_SLOTS;
+    let path = SLOT_PATHS[slot];
+
+    let header = build_header(gprs, seq);
+
+    let fh = open(path, MODE_WRITE_BINARY).ok_or("semihost SYS_OPEN failed")?;
+
+    // SAFETY: header is a plain-old-data struct on the stack.
+    let header_bytes = unsafe {
+        core::slice::from_raw_parts(
+            &header as *const Header as *const u8,
+            core::mem::size_of::<Header>(),
+        )
+    };
+    write_all(&fh, header_bytes)?;
+
+    // SAFETY: the backing stores are static mut u8 arrays; we take a
+    // read-only view for the duration of the semihosting write, no
+    // concurrent writer is possible on single-core EL2.
+    let ram = unsafe {
+        core::slice::from_raw_parts(
+            guest_mem::ram_host_pa() as *const u8,
+            guest_mem::RAM_SIZE,
+        )
+    };
+    write_all(&fh, ram)?;
+
+    let fb = unsafe {
+        core::slice::from_raw_parts(
+            guest_mem::fb_host_pa() as *const u8,
+            guest_mem::FRAMEBUFFER_SIZE,
+        )
+    };
+    write_all(&fh, fb)?;
+
+    let flash = unsafe {
+        core::slice::from_raw_parts(
+            peripherals::flash::host_pa() as *const u8,
+            peripherals::flash::SIZE,
+        )
+    };
+    write_all(&fh, flash)?;
+
+    close(fh);
+
+    kprintln!(
+        "snapshot: seq={} saved PC={:#x} CPSR={:#x} to slot {}",
+        header.seq,
+        header.saved_pc,
+        header.saved_cpsr,
+        slot,
+    );
+    Ok(())
+}
+
+fn build_header(gprs_u64: &[u64; 15], seq: u64) -> Header {
+    let mut gprs = [0u32; 15];
+    for i in 0..15 {
+        gprs[i] = gprs_u64[i] as u32;
+    }
+    Header {
+        magic: MAGIC,
+        version: VERSION,
+        _pad0: 0,
+        saved_pc: read_sysreg64("elr_el2") as u32,
+        saved_cpsr: read_sysreg64("spsr_el2") as u32,
+        gprs,
+        sctlr_el1: read_sysreg64("sctlr_el1") as u32,
+        ttbr0_el1: read_sysreg64("ttbr0_el1"),
+        ttbr1_el1: read_sysreg64("ttbr1_el1"),
+        tcr_el1: read_sysreg64("tcr_el1"),
+        dacr32_el2: read_sysreg64("dacr32_el2") as u32,
+        vbar_el1: read_sysreg64("vbar_el1"),
+        cpacr_el1: read_sysreg64("cpacr_el1"),
+        spsr_svc: read_sysreg64("spsr_svc") as u32,
+        spsr_abt: read_sysreg64("spsr_abt") as u32,
+        spsr_und: read_sysreg64("spsr_und") as u32,
+        spsr_irq: read_sysreg64("spsr_irq") as u32,
+        spsr_fiq: read_sysreg64("spsr_fiq") as u32,
+        _pad1: 0,
+        ram_size: guest_mem::RAM_SIZE as u32,
+        fb_size: guest_mem::FRAMEBUFFER_SIZE as u32,
+        flash_size: peripherals::flash::SIZE as u32,
+        rom_fingerprint: rom_fingerprint(),
+        seq,
+    }
+}
+
+// ---- generic timer (wall clock) ----------------------------------
+
+fn cntpct() -> u64 {
+    let v: u64;
+    // SAFETY: MRS of a RO sysreg has no side effects.
+    unsafe {
+        asm!("mrs {}, cntpct_el0", out(reg) v,
+            options(nomem, nostack, preserves_flags));
+    }
+    v
+}
+
+fn cntfrq() -> u64 {
+    let v: u64;
+    // SAFETY: as above.
+    unsafe {
+        asm!("mrs {}, cntfrq_el0", out(reg) v,
+            options(nomem, nostack, preserves_flags));
+    }
+    v
+}
+
+fn rom_fingerprint() -> u32 {
+    // FNV-1a over the first 1 KiB of GUEST_ROM after all load-time
+    // patches have been applied. Distinct guest binaries (different
+    // test builds, ROM vs test) diverge in those bytes.
+    // SAFETY: reading static backing store; single-threaded.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(guest_mem::rom_host_pa() as *const u8, 1024)
+    };
+    let mut h: u32 = 0x811c_9dc5;
+    for &b in bytes {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+// ---- load --------------------------------------------------------
+
+/// State recovered from a snapshot, ready for `eret_to_restored`.
+#[derive(Clone, Copy)]
+pub struct RestoreState {
+    pub pc: u32,
+    pub cpsr: u32,
+    pub gprs: [u32; 15],
+}
+
+/// Scan the ring for the slot with the highest `seq` and load it.
+/// Missing files / bad magic / mismatched fingerprint are dropped
+/// silently; if no slot qualifies we return None and the caller
+/// cold-boots.
+pub fn load_latest() -> Option<RestoreState> {
+    let mut best: Option<(u64, &[u8])> = None;
+    for slot in 0..NUM_SLOTS {
+        let path = SLOT_PATHS[slot];
+        if let Some(seq) = peek_seq(path) {
+            if best.map_or(true, |(s, _)| seq > s) {
+                best = Some((seq, path));
+            }
+        }
+    }
+    let (seq, path) = best?;
+    kprintln!("snapshot: latest valid slot is seq={}", seq);
+    load(path)
+}
+
+/// Read just the `seq` field of a slot without pulling in the rest
+/// of the file. Used by `load_latest` to pick the winner and by
+/// `init` to seed the save counter across runs.
+fn peek_seq(path: &[u8]) -> Option<u64> {
+    let fh = open(path, MODE_READ_BINARY)?;
+    let mut header_buf = [0u8; core::mem::size_of::<Header>()];
+    let read_result = read_all(&fh, &mut header_buf);
+    close(fh);
+    read_result.ok()?;
+    let header: Header =
+        unsafe { core::ptr::read_unaligned(header_buf.as_ptr() as *const Header) };
+    if header.magic != MAGIC || header.version != VERSION {
+        return None;
+    }
+    if header.rom_fingerprint != rom_fingerprint() {
+        return None;
+    }
+    Some(header.seq)
+}
+
+/// Load a specific slot by path. Public so callers can resume from
+/// a user-selected slot (e.g. when the latest slot is at the
+/// failure and you want the one before).
+pub fn load(path: &[u8]) -> Option<RestoreState> {
+    let fh = open(path, MODE_READ_BINARY)?;
+
+    let mut header_buf = [0u8; core::mem::size_of::<Header>()];
+    if read_all(&fh, &mut header_buf).is_err() {
+        close(fh);
+        return None;
+    }
+    // SAFETY: read-unaligned in case the buffer alignment is <8; the
+    // bytes were written from a valid Header on the same target ABI.
+    let header: Header =
+        unsafe { core::ptr::read_unaligned(header_buf.as_ptr() as *const Header) };
+
+    if header.magic != MAGIC {
+        kprintln!(
+            "snapshot: bad magic {:#x} (want {:#x}); ignoring",
+            header.magic, MAGIC
+        );
+        close(fh);
+        return None;
+    }
+    if header.version != VERSION {
+        kprintln!(
+            "snapshot: version {} doesn't match expected {}; ignoring",
+            header.version, VERSION
+        );
+        close(fh);
+        return None;
+    }
+    if header.ram_size as usize != guest_mem::RAM_SIZE
+        || header.fb_size as usize != guest_mem::FRAMEBUFFER_SIZE
+        || header.flash_size as usize != peripherals::flash::SIZE
+    {
+        kprintln!(
+            "snapshot: region sizes don't match (ram={} fb={} flash={}); ignoring",
+            header.ram_size, header.fb_size, header.flash_size
+        );
+        close(fh);
+        return None;
+    }
+
+    let current_fp = rom_fingerprint();
+    if header.rom_fingerprint != current_fp {
+        kprintln!(
+            "snapshot: ROM fingerprint mismatch (file={:#010x} current={:#010x}); ignoring (snapshot is from a different guest binary)",
+            header.rom_fingerprint, current_fp
+        );
+        close(fh);
+        return None;
+    }
+
+    // SAFETY: backing stores are static mut u8 arrays; we overwrite
+    // them entirely before the guest runs again.
+    let ram = unsafe {
+        core::slice::from_raw_parts_mut(
+            guest_mem::ram_host_pa() as *mut u8,
+            guest_mem::RAM_SIZE,
+        )
+    };
+    if read_all(&fh, ram).is_err() {
+        close(fh);
+        return None;
+    }
+
+    let fb = unsafe {
+        core::slice::from_raw_parts_mut(
+            guest_mem::fb_host_pa() as *mut u8,
+            guest_mem::FRAMEBUFFER_SIZE,
+        )
+    };
+    if read_all(&fh, fb).is_err() {
+        close(fh);
+        return None;
+    }
+
+    let flash = unsafe {
+        core::slice::from_raw_parts_mut(
+            peripherals::flash::host_pa() as *mut u8,
+            peripherals::flash::SIZE,
+        )
+    };
+    if read_all(&fh, flash).is_err() {
+        close(fh);
+        return None;
+    }
+    close(fh);
+
+    restore_sysregs(&header);
+
+    // Seed SAVE_SEQ so saves after this resume extend the ring
+    // rather than reusing the same slot we just loaded.
+    SAVE_SEQ.store(header.seq + 1, Ordering::Relaxed);
+    // Reset the autosave pacing so the first post-resume save
+    // happens after AUTOSAVE_INTERVAL_MS, not immediately.
+    LAST_SAVE_TICKS.store(cntpct(), Ordering::Relaxed);
+
+    kprintln!(
+        "snapshot: loaded seq={} guest PC={:#x} CPSR={:#x} from {}",
+        header.seq,
+        header.saved_pc,
+        header.saved_cpsr,
+        core::str::from_utf8(&path[..path.len() - 1]).unwrap_or("?"),
+    );
+
+    Some(RestoreState {
+        pc: header.saved_pc,
+        cpsr: header.saved_cpsr,
+        gprs: header.gprs,
+    })
+}
+
+fn restore_sysregs(h: &Header) {
+    write_sysreg64("sctlr_el1", h.sctlr_el1 as u64);
+    write_sysreg64("ttbr0_el1", h.ttbr0_el1);
+    write_sysreg64("ttbr1_el1", h.ttbr1_el1);
+    write_sysreg64("tcr_el1", h.tcr_el1);
+    write_sysreg64("dacr32_el2", h.dacr32_el2 as u64);
+    write_sysreg64("vbar_el1", h.vbar_el1);
+    write_sysreg64("cpacr_el1", h.cpacr_el1);
+    write_sysreg64("spsr_svc", h.spsr_svc as u64);
+    write_sysreg64("spsr_abt", h.spsr_abt as u64);
+    write_sysreg64("spsr_und", h.spsr_und as u64);
+    write_sysreg64("spsr_irq", h.spsr_irq as u64);
+    write_sysreg64("spsr_fiq", h.spsr_fiq as u64);
+    // SAFETY: barrier only.
+    unsafe {
+        asm!("dsb ish", "isb", options(nostack, preserves_flags));
+    }
+}
+
+// ---- sysreg helpers ----------------------------------------------
+
+macro_rules! sr_reader {
+    ($name:expr) => {{
+        let v: u64;
+        // SAFETY: MRS has no side effects.
+        unsafe {
+            asm!(
+                concat!("mrs {}, ", $name),
+                out(reg) v,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        v
+    }};
+}
+
+fn read_sysreg64(reg: &'static str) -> u64 {
+    match reg {
+        "elr_el2" => sr_reader!("elr_el2"),
+        "spsr_el2" => sr_reader!("spsr_el2"),
+        "sctlr_el1" => sr_reader!("sctlr_el1"),
+        "ttbr0_el1" => sr_reader!("ttbr0_el1"),
+        "ttbr1_el1" => sr_reader!("ttbr1_el1"),
+        "tcr_el1" => sr_reader!("tcr_el1"),
+        "dacr32_el2" => sr_reader!("dacr32_el2"),
+        "vbar_el1" => sr_reader!("vbar_el1"),
+        "cpacr_el1" => sr_reader!("cpacr_el1"),
+        // AArch32 SPSR_svc is the AArch64 SPSR_EL1 — a quirk of the
+        // AArch32/AArch64 view mapping. LLVM accepts spsr_el1.
+        "spsr_svc" => sr_reader!("spsr_el1"),
+        "spsr_abt" => sr_reader!("spsr_abt"),
+        "spsr_und" => sr_reader!("spsr_und"),
+        "spsr_irq" => sr_reader!("spsr_irq"),
+        "spsr_fiq" => sr_reader!("spsr_fiq"),
+        _ => 0,
+    }
+}
+
+macro_rules! sr_writer {
+    ($name:expr, $v:expr) => {{
+        // SAFETY: sysreg writes are point-effect; callers follow up
+        // with a barrier / isb when ordering matters.
+        unsafe {
+            asm!(
+                concat!("msr ", $name, ", {}"),
+                in(reg) $v,
+                options(nostack, preserves_flags),
+            );
+        }
+    }};
+}
+
+fn write_sysreg64(reg: &'static str, v: u64) {
+    match reg {
+        "sctlr_el1" => sr_writer!("sctlr_el1", v),
+        "ttbr0_el1" => sr_writer!("ttbr0_el1", v),
+        "ttbr1_el1" => sr_writer!("ttbr1_el1", v),
+        "tcr_el1" => sr_writer!("tcr_el1", v),
+        "dacr32_el2" => sr_writer!("dacr32_el2", v),
+        "vbar_el1" => sr_writer!("vbar_el1", v),
+        "cpacr_el1" => sr_writer!("cpacr_el1", v),
+        "spsr_svc" => sr_writer!("spsr_el1", v),
+        "spsr_abt" => sr_writer!("spsr_abt", v),
+        "spsr_und" => sr_writer!("spsr_und", v),
+        "spsr_irq" => sr_writer!("spsr_irq", v),
+        "spsr_fiq" => sr_writer!("spsr_fiq", v),
+        _ => {}
+    }
+}

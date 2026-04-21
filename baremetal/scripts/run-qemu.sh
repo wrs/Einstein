@@ -32,12 +32,18 @@ fi
 
 # QEMU's raspi3b routes the first `-serial` to the PL011 and the second to
 # the mini-UART. We use PL011 for the console.
+#
+# Semihosting is enabled so the hypervisor can save/load snapshots via
+# HLT #0xF000 (see src/snapshot.rs). target=native makes the hypervisor
+# itself own the semihosting surface; paths are resolved against the
+# host's cwd.
 exec qemu-system-aarch64 \
     -M raspi3b \
     -kernel "$img" \
     -serial stdio \
     -display none \
     -no-reboot \
+    -semihosting-config enable=on,target=native \
     ${debug_args[@]+"${debug_args[@]}"} \
     ${QEMU_EXTRA:-} \
     "$@"

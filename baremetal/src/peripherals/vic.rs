@@ -309,7 +309,7 @@ pub fn read(ipa: u64) -> u32 {
         K_HDWR_INT_ED_3 => s.int_ed_3,
         K_HDWR_GPIO_R => s.gpio_r,
         K_HDWR_GPIO_E => s.gpio_e,
-        _ => 0,
+        _ => halt_vic_unreachable("read", ipa, 0),
     }
 }
 
@@ -333,8 +333,24 @@ pub fn write(ipa: u64, value: u32) {
     let mut match_reprogrammed = false;
     match ipa {
         K_HDWR_P0F110000 => s.p0f110000 = value,
+        // High-speed clock control: the kernel writes the expected
+        // configuration value (`kHighSpeedClockVal` = 0x90) once at
+        // boot. Modeled as a no-op write — the clock is always
+        // configured from our perspective.
+        K_HDWR_HIGH_SPEED_CLCK => { /* no-op per Einstein */ }
         K_HDWR_P0F111400 => s.p0f111400 = value,
         K_HDWR_P0F180400 => { /* misc write, ignore */ }
+        // Tick counter is derived from CNTPCT; the kernel writes this
+        // occasionally to reset the tick epoch (e.g. during calibration
+        // loops). We could re-anchor TICK_EPOCH but Einstein's tick
+        // register is also free-running from the host clock, so the
+        // kernel works either way. Accept the write as a no-op; if the
+        // guest later depends on the reset, halt here.
+        K_HDWR_TICKS => { /* no-op — we derive ticks from CNTPCT */ }
+        // Calendar / alarm regs — stub writes to accept "set calendar"
+        // / "set alarm" without modeling RTC.
+        K_HDWR_CALENDAR_REG => { /* no-op — RTC not modeled */ }
+        K_HDWR_ALARM_REG => { /* no-op — RTC alarm not modeled */ }
         K_HDWR_MATCH_0 => { s.match_reg[0] = value; s.match_fired &= !0b0001; match_reprogrammed = true; }
         K_HDWR_MATCH_1 => { s.match_reg[1] = value; s.match_fired &= !0b0010; match_reprogrammed = true; }
         K_HDWR_MATCH_2 => { s.match_reg[2] = value; s.match_fired &= !0b0100; match_reprogrammed = true; }
@@ -351,11 +367,26 @@ pub fn write(ipa: u64, value: u32) {
         K_HDWR_P0F185000 => { /* misc, ignore */ }
         K_HDWR_GPIO_E => s.gpio_e = value,
         K_HDWR_GPIO_C => s.int_present &= !value, // many devices clear via this pattern
-        _ => {}
+        _ => halt_vic_unreachable("write", ipa, value),
     }
     if match_reprogrammed {
         // A match register changed — recompute the nearest deadline and
         // reprogram CNTHP_CVAL_EL2 so the async timer path delivers.
         crate::timer::rearm();
     }
+}
+
+/// Fallback halt for match-arm branches that shouldn't be reachable
+/// because `owns()` filters the same address set. If they do fire,
+/// Phase A says halt loudly rather than silently stubbing.
+fn halt_vic_unreachable(op: &'static str, ipa: u64, value: u32) -> ! {
+    crate::kprintln!();
+    crate::kprintln!(
+        "*** vic::{} IPA={:#010x} val={:#010x} — owns() says mine but match has no arm ***",
+        op, ipa, value
+    );
+    crate::kprintln!(
+        "  (bug in peripherals/vic.rs: owns() and read/write disagree.)"
+    );
+    crate::cpu::halt();
 }

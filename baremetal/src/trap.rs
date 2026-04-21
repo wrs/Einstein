@@ -1016,17 +1016,25 @@ use guest_mem::{read_byte_pa as read_guest_byte_pa,
                 write_word_pa as write_guest_word_pa};
 
 fn log_und_budgeted(name: &str, pc: u32, payload: Option<u32>) {
-    static mut UND_LOG_BUDGET: usize = 16;
+    // Dedup SystemBootUND / TapFileCntlUND by PC — only 6 sites in ROM
+    // total. Same rationale as log_debugger_und: one log per site gives
+    // us clear bring-up breadcrumbs without flooding on tight loops.
+    const SEEN_CAP: usize = 16;
+    static mut SEEN: [u32; SEEN_CAP] = [0; SEEN_CAP];
+    static mut SEEN_N: usize = 0;
     // SAFETY: single-threaded.
-    let ok = unsafe {
-        if UND_LOG_BUDGET > 0 {
-            UND_LOG_BUDGET -= 1;
+    let first = unsafe {
+        let mut found = false;
+        for i in 0..SEEN_N { if SEEN[i] == pc { found = true; break; } }
+        if !found && SEEN_N < SEEN_CAP {
+            SEEN[SEEN_N] = pc;
+            SEEN_N += 1;
             true
         } else {
             false
         }
     };
-    if ok {
+    if first {
         match payload {
             Some(p) => kprintln!("und: {} @PC={:#x} payload={:#010x}", name, pc, p),
             None => kprintln!("und: {} @PC={:#x}", name, pc),
@@ -1059,7 +1067,13 @@ fn scan_to_null_word_aligned(start: u32, max_words: u32) -> u32 {
     let mut va = start & !0x3;
     for _ in 0..max_words {
         let w = read_guest_word_pa(va).unwrap_or(0);
-        let bytes = w.to_le_bytes();
+        // The ROM is stored big-endian (original 1990s Newton bytes)
+        // and our load_rom byteswaps each word so LDR in our LE guest
+        // returns the same u32 the original BE CPU saw. That means a
+        // byte-level string search has to examine the word in BE byte
+        // order — the null terminator is *BE-byte-order* inside a
+        // word, which is why we use to_be_bytes here, not to_le_bytes.
+        let bytes = w.to_be_bytes();
         if bytes[0] == 0 || bytes[1] == 0 || bytes[2] == 0 || bytes[3] == 0 {
             return va.wrapping_add(4);
         }
@@ -1072,19 +1086,34 @@ fn scan_to_null_word_aligned(start: u32, max_words: u32) -> u32 {
 }
 
 fn log_debugger_und(pc: u32, msg_start: u32, msg_end: u32) {
-    static mut LOG_BUDGET: usize = 8;
+    // Dedup by PC: each DebuggerUND site in the ROM is a distinct panic
+    // message (e.g. "_stack_overflow called - panic!", "Undefined SWI",
+    // "SWI from non-user mode (rebooting)"), and the first time the guest
+    // hits any one of them tells us something specific about where we've
+    // diverged. There are ~22 sites across ROM + REx, so an unfiltered
+    // log of first-hits isn't noisy. Repeated hits at the same PC are
+    // suppressed.
+    const SEEN_CAP: usize = 32;
+    static mut SEEN: [u32; SEEN_CAP] = [0; SEEN_CAP];
+    static mut SEEN_N: usize = 0;
     // SAFETY: single-threaded.
-    let ok = unsafe {
-        if LOG_BUDGET > 0 {
-            LOG_BUDGET -= 1;
+    let first = unsafe {
+        let mut found = false;
+        for i in 0..SEEN_N { if SEEN[i] == pc { found = true; break; } }
+        if !found && SEEN_N < SEEN_CAP {
+            SEEN[SEEN_N] = pc;
+            SEEN_N += 1;
             true
         } else {
             false
         }
     };
-    if ok {
-        // Extract the string (first up to 80 bytes) for the log.
-        let mut buf = [0u8; 80];
+    if first {
+        // Extract the string (first up to 120 bytes) for the log.
+        // See scan_to_null_word_aligned for why we iterate bytes in
+        // BE order — the ROM's strings are laid out that way within
+        // each 32-bit word on an LE host.
+        let mut buf = [0u8; 120];
         let mut n = 0;
         let mut va = msg_start;
         'outer: while n < buf.len() && va < msg_end {
@@ -1092,7 +1121,7 @@ fn log_debugger_und(pc: u32, msg_start: u32, msg_end: u32) {
                 Some(v) => v,
                 None => break,
             };
-            for byte in w.to_le_bytes() {
+            for byte in w.to_be_bytes() {
                 if byte == 0 { break 'outer; }
                 buf[n] = byte;
                 n += 1;

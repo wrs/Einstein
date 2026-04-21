@@ -15,7 +15,7 @@
 
 use core::ptr::addr_of_mut;
 
-use crate::{guest_mem, kprintln, peripherals};
+use crate::{guest_mem, kprintln, peripherals, shadow_stub};
 
 // VMSAv8-64 stage-2 descriptor bits
 const DESC_VALID: u64 = 1 << 0;
@@ -224,6 +224,19 @@ pub unsafe fn init() {
     // SAFETY: see the called helper's contract.
     unsafe { install_tick_page(); }
 
+    // Shadow-stub pool (2 MiB). Writable at stage-2 is harmless (only
+    // EL2 writes into it via the host backing), and executable-from-
+    // guest is the whole point. 2 MiB block aligned.
+    let stub_pa = shadow_stub::pool_host_pa();
+    // SAFETY: helper bounds-checks.
+    unsafe {
+        set_l2_blocks(
+            shadow_stub::STUB_POOL_IPA as u64,
+            stub_pa,
+            (shadow_stub::STUB_POOL_SIZE as u64) / TWO_MIB,
+            BLOCK_NORMAL_RW,
+        );
+    }
     // L1[0] → L2. L1[1..] stay invalid (any IPA ≥ 1 GiB faults).
     let l1_ptr = addr_of_mut!(S2_L1) as *mut u64;
     let l2_phys = addr_of_mut!(S2_L2) as u64;
@@ -277,6 +290,12 @@ pub unsafe fn init() {
         "stage2: framebuffer @ IPA {:#x}..{:#x} -> host PA {:#x} (RW, {} MiB)",
         FB_IPA_BASE, FB_IPA_BASE + FB_IPA_SIZE, fb_pa,
         FB_IPA_SIZE / (1024 * 1024)
+    );
+    kprintln!(
+        "stage2: shadow-stub pool @ IPA {:#x}..{:#x} -> host PA {:#x} (RW, {} MiB)",
+        shadow_stub::STUB_POOL_IPA,
+        shadow_stub::STUB_POOL_IPA as u64 + shadow_stub::STUB_POOL_SIZE as u64,
+        stub_pa, shadow_stub::STUB_POOL_SIZE / (1024 * 1024)
     );
     kprintln!("stage2: all other IPAs fault to EL2");
 }

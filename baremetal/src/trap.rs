@@ -317,6 +317,18 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         0x05 => {
             kprintln!("guest-mark: {:#010x}", r0);
         }
+        0x30 => {
+            // Shadow-stub patch request: r0=start_ipa, r1=end_ipa (exclusive).
+            // Scans that IPA range of the ROM backing (the guest-test image)
+            // and patches every LDRB/STRB/LDRH/STRH/LDRSB/LDRSH. Emits stubs
+            // into the shadow-stub pool and rewrites originals to Bcc stub.
+            let start = ctx.x[0] as u32;
+            let end = ctx.x[1] as u32;
+            let stats = crate::shadow_stub::patch_code_range(start, end);
+            crate::shadow_stub::log_stats(&stats);
+            // Echo the patched count back to r0 so the guest can check it.
+            ctx.x[0] = stats.patched as u64;
+        }
         0x20 => {
             // Save snapshot — see src/snapshot.rs. The guest's x0..x14
             // at HVC entry alias the active AArch32 mode's R0..R14;

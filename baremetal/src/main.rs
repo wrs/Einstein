@@ -11,6 +11,7 @@ mod mmio;
 mod mmu;
 mod panic;
 mod peripherals;
+mod shadow_stub;
 mod snapshot;
 mod stage2;
 mod timer;
@@ -56,6 +57,11 @@ pub extern "C" fn kmain() -> ! {
 
     peripherals::vic::init();
     timer::init();
+
+    // Shadow-stub mechanism lives in `src/shadow_stub`. It's not
+    // automatically invoked at boot — a guest test triggers it via
+    // `HVC #0x30` once the test has its vector table in place and is
+    // ready to exercise the patched instructions.
 
     // Seed the snapshot ring's sequence counter from existing slots
     // (so resumed runs don't reuse seq numbers), then attempt to

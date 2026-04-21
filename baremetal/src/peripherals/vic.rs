@@ -85,6 +85,7 @@ struct VicState {
     // GPIO-adjacent registers the ROM hits during early probe.
     gpio_r: u32,            // 0x0F18C000
     gpio_e: u32,            // 0x0F18C400
+    #[allow(dead_code)] // written via K_HDWR_GPIO_C path; no reads yet
     gpio_c: u32,            // 0x0F18C800 (write clears)
     p0f110000: u32,
     p0f111400: u32,
@@ -121,6 +122,7 @@ pub fn init() {
 }
 
 // Interrupt bit layout in int_present — from TInterruptManager.h.
+#[allow(dead_code)] // referenced once plumbing is wired through to guest IRQ
 const INT_RTC_ALARM: u32 = 0x0000_0004;
 const INT_TIMER_0: u32 = 0x0000_0008;
 const INT_TIMER_1: u32 = 0x0000_0010;

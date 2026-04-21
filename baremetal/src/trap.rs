@@ -59,6 +59,11 @@ pub const UND_TAG: u32 = 0x10;
 /// root cause is identified.
 pub const DIAG_TAG: u32 = 0x11;
 
+/// Records the PA where `handle_diag`'s stub deposited its banked-reg
+/// dump, so `handle_diag_lr` knows where to read from.
+static LR_SAVE_PA_RECORD: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
 /// Second-stage diagnostic HVC used to read AArch32 banked R14 (LR)
 /// from the mode we came from. AArch64 at EL2 does plumb x14 = LR of
 /// the source mode on HVC entry in principle, but QEMU raspi3b leaves
@@ -79,17 +84,19 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
     // DIAG: log the first N sync traps' EC + ELR + ESR, no dedup, so
     // we can see the guest PC timeline in the window leading up to a
     // stall. Remove once Phase B stall is past.
-    static mut TRAP_LOG_BUDGET: usize = 50;
-    // SAFETY: single-threaded.
-    unsafe {
-        if TRAP_LOG_BUDGET > 0 {
-            TRAP_LOG_BUDGET -= 1;
-            let elr = read_sysreg!("elr_el2");
-            kprintln!(
-                "trap: EC={:#x} ({}) ELR={:#x} ESR={:#x}",
-                ec, describe_ec(ec), elr, esr
-            );
-        }
+    static mut TRAP_LOG_BUDGET: usize = 500;
+    // SAFETY: single-threaded; only core 0 services EL2 traps.
+    let should_log = unsafe {
+        let go = TRAP_LOG_BUDGET > 0;
+        if go { TRAP_LOG_BUDGET -= 1; }
+        go
+    };
+    if should_log {
+        let elr = read_sysreg!("elr_el2");
+        kprintln!(
+            "trap: EC={:#x} ({}) ELR={:#x} ESR={:#x}",
+            ec, describe_ec(ec), elr, esr
+        );
     }
 
     match ec {
@@ -149,14 +156,15 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     static mut HB_PRINT_BUDGET: usize = 16;
     let elr = read_sysreg!("elr_el2");
     // SAFETY: single-threaded.
-    unsafe {
-        if elr != HB_LAST_PC && HB_PRINT_BUDGET > 0 {
-            HB_LAST_PC = elr;
-            HB_PRINT_BUDGET -= 1;
-            let spsr = read_sysreg!("spsr_el2");
-            let far = read_sysreg!("far_el1");
-            kprintln!("timer_irq: guest ELR={:#x} SPSR={:#x} FAR_EL1={:#x}", elr, spsr, far);
-        }
+    let should_log = unsafe {
+        let go = elr != HB_LAST_PC && HB_PRINT_BUDGET > 0;
+        if go { HB_LAST_PC = elr; HB_PRINT_BUDGET -= 1; }
+        go
+    };
+    if should_log {
+        let spsr = read_sysreg!("spsr_el2");
+        let far = read_sysreg!("far_el1");
+        kprintln!("timer_irq: guest ELR={:#x} SPSR={:#x} FAR_EL1={:#x}", elr, spsr, far);
     }
     timer::on_irq();
     update_virq();
@@ -383,12 +391,14 @@ fn handle_und(ctx: &mut TrapContext) {
     // DIAG: prove handle_und is being reached at all. Single-shot log.
     static mut UND_ENTRY_LOGGED: bool = false;
     // SAFETY: single-threaded.
-    unsafe {
-        if !UND_ENTRY_LOGGED {
-            UND_ENTRY_LOGGED = true;
-            let elr = read_sysreg!("elr_el2");
-            kprintln!("und: handle_und first entry, ELR_EL2={:#x}", elr);
-        }
+    let first = unsafe {
+        let was = UND_ENTRY_LOGGED;
+        UND_ENTRY_LOGGED = true;
+        !was
+    };
+    if first {
+        let elr = read_sysreg!("elr_el2");
+        kprintln!("und: handle_und first entry, ELR_EL2={:#x}", elr);
     }
 
     let lr_und = match read_guest_word_pa(UND_SAVE_LR_IPA) {
@@ -520,38 +530,119 @@ fn handle_diag(ctx: &mut TrapContext) {
             base+4, ctx.x[base+4] as u32,
         );
     }
+    let esr = read_sysreg!("esr_el2");
+    let esr_el1 = read_sysreg!("esr_el1");
+    let sctlr = read_sysreg!("sctlr_el1");
+    let ttbr0 = read_sysreg!("ttbr0_el1");
+    let ttbr1 = read_sysreg!("ttbr1_el1");
+    let tcr   = read_sysreg!("tcr_el1");
+    kprintln!(
+        "  ESR_EL2   = {:#010x}  EC={:#x} ISS={:#x}",
+        esr, (esr >> 26) & 0x3F, esr & 0x1FFFFFF
+    );
+    // ESR_EL1 holds the EL1 fault syndrome the CPU wrote when the
+    // guest took its own DABT. For AArch32 DABT, EC=0x24 with
+    // ISS[5:0] = DFSC (fault class).
+    kprintln!(
+        "  ESR_EL1   = {:#010x}  EC={:#x} ISS={:#x}  DFSC={:#x}",
+        esr_el1, (esr_el1 >> 26) & 0x3F, esr_el1 & 0x1FFFFFF, esr_el1 & 0x3F
+    );
+    kprintln!(
+        "  SCTLR_EL1 = {:#010x}  (M={}, C={}, I={}, V={})",
+        sctlr, sctlr & 1, (sctlr >> 2) & 1, (sctlr >> 12) & 1, (sctlr >> 13) & 1
+    );
+    kprintln!(
+        "  TTBR0_EL1 = {:#010x}  TTBR1_EL1 = {:#010x}  TCR_EL1 = {:#010x}",
+        ttbr0, ttbr1, tcr
+    );
     guest_mem::dump_stage1_walk(far as u32);
     // Also walk a handful of VAs that are relevant to Newton boot —
     // SVC stack, ABT stack target, REx window start, RAM base — so we
     // can tell at a glance whether the kernel's L1 table has the
     // expected mappings in place at the time of the abort.
-    for va in [0x04004400u32, 0x0C004C00, 0x01000000, 0x04000000, 0x00800000] {
+    // 0x02Axxxxx added because recent DIAG runs show SP_svc and PC
+    // both landing there; need to see the stage-1 layout. Also
+    // 0x00FFFF00 (our UND trampoline body) to confirm the guest can
+    // actually fetch from there post-MMU.
+    for va in [0x04004400u32, 0x0C004C00, 0x01000000, 0x04000000, 0x00800000,
+               0x02A00000, 0x02A04000, 0x02A04AA4, 0x00FFFF00] {
         guest_mem::dump_stage1_walk(va);
     }
 
-    // Before halting, try to recover LR / SP of the pre-abort mode
-    // and the SVC banked SP/LR (the kernel runs in SVC, so its stack
-    // lives there) by ERET'ing into an AArch32 stub we plant in guest
-    // RAM. On entry the stub runs in whatever mode SPSR_EL2 describes
-    // (ABT for a DABT intercept); it captures the current mode's LR/SP
-    // and SPSR, briefly switches to SVC to capture SP_svc / LR_svc,
-    // then HVCs back with everything in r0..r5.
+    // Before halting, ERET into an AArch32 stub we plant in guest
+    // RAM that dumps banked R13/R14/SPSR of the source mode plus SVC
+    // and UND as well. We write them to a scratch area in RAM and
+    // hvc back; EL2 then reads the saved words directly. This is more
+    // reliable than trying to carry values through ctx.x[0..4] because
+    // QEMU raspi3b's AArch32→AArch64 banked register plumbing is
+    // already known to be flaky (SPSR_abt reads as 0 from AArch64,
+    // x14 doesn't reliably carry LR_<src_mode>).
     //
-    // Stub (at guest IPA 0x04005F00, reached via VA 0x0C004F00 which
-    // the kernel maps through L1[0xC0] coarse -> L2[0x04] small page):
-    //   +0x00: e1a0000e   mov r0, lr       ; r0 = LR_<src_mode>
-    //   +0x04: e1a0100d   mov r1, sp       ; r1 = SP_<src_mode>
-    //   +0x08: e14f4000   mrs r4, spsr     ; r4 = SPSR_<src_mode>
-    //   +0x0C: e321f0d3   msr cpsr_c, #0xd3 ; switch to SVC
-    //   +0x10: e1a0200d   mov r2, sp       ; r2 = SP_svc
-    //   +0x14: e1a0300e   mov r3, lr       ; r3 = LR_svc
-    //   +0x18: e321f0d7   msr cpsr_c, #0xd7 ; switch back to ABT
-    //   +0x1C: e1400172   hvc #0x12        ; DIAG_LR_TAG
+    // Stub at guest IPA 0x04005F00, reached via VA 0x0C004F00 (the
+    // kernel maps 0x0C004000-0x0C004FFF through L1[0xC0] coarse ->
+    // L2[0x04] small page -> PA 0x04005xxx). Saves to IPA 0x04005F80+,
+    // which is inside the same small page so it's writable from the
+    // guest's view.
+    //
+    //   +0x00: e59f0050   ldr r0, [pc, #0x50]  ; r0 = &SAVE_BASE (VA 0x0C004F80)
+    //   +0x04: e1a0100e   mov r1, lr            ; r1 = R14_abt
+    //   +0x08: e5801000   str r1, [r0]          ; save LR_abt at +0x00
+    //   +0x0C: e1a0100d   mov r1, sp            ; r1 = R13_abt
+    //   +0x10: e5801004   str r1, [r0, #4]      ; save SP_abt at +0x04
+    //   +0x14: e14f1000   mrs r1, spsr          ; r1 = SPSR_abt
+    //   +0x18: e5801008   str r1, [r0, #8]      ; save SPSR_abt at +0x08
+    //   +0x1C: e321f0db   msr cpsr_c, #0xdb     ; → UND
+    //   +0x20: e1a0100e   mov r1, lr            ; r1 = R14_und
+    //   +0x24: e580100c   str r1, [r0, #12]     ; save LR_und at +0x0C
+    //   +0x28: e1a0100d   mov r1, sp            ; r1 = R13_und
+    //   +0x2C: e5801010   str r1, [r0, #16]     ; save SP_und at +0x10
+    //   +0x30: e14f1000   mrs r1, spsr          ; r1 = SPSR_und
+    //   +0x34: e5801014   str r1, [r0, #20]     ; save SPSR_und at +0x14
+    //   +0x38: e321f0d3   msr cpsr_c, #0xd3     ; → SVC
+    //   +0x3C: e1a0100e   mov r1, lr            ; r1 = R14_svc
+    //   +0x40: e5801018   str r1, [r0, #24]     ; save LR_svc at +0x18
+    //   +0x44: e1a0100d   mov r1, sp            ; r1 = R13_svc
+    //   +0x48: e580101c   str r1, [r0, #28]     ; save SP_svc at +0x1C
+    //   +0x4C: e321f0d7   msr cpsr_c, #0xd7     ; → ABT
+    //   +0x50: ee151f10   mrc p15,0,r1,c5,c0,0  ; r1 = DFSR
+    //   +0x54: e5801020   str r1, [r0, #0x20]    ; save DFSR at +0x20
+    //   +0x58: ee161f10   mrc p15,0,r1,c6,c0,0   ; r1 = DFAR
+    //   +0x5C: e5801024   str r1, [r0, #0x24]    ; save DFAR at +0x24
+    //   +0x60: e1400172   hvc #0x12             ; DIAG_LR_TAG
+    //   +0x64: eafffffe   b .                   ; trap if returns
+    //   +0x68: 0c004f80   .word SAVE_BASE_VA
     const LR_STUB_PA: u32 = 0x0400_5F00;
     const LR_STUB_VA: u32 = 0x0C00_4F00;
-    let stub: [u32; 8] = [
-        0xE1A0_000E, 0xE1A0_100D, 0xE14F_4000, 0xE321_F0D3,
-        0xE1A0_200D, 0xE1A0_300E, 0xE321_F0D7, 0xE140_0172,
+    const LR_SAVE_VA: u32 = 0x0C00_4F80;
+    const LR_SAVE_PA: u32 = 0x0400_5F80;
+    let stub: [u32; 27] = [
+        0xE59F_0060, // ldr r0, [pc, #0x60]  (literal at end)
+        0xE1A0_100E, // mov r1, lr
+        0xE580_1000, // str r1, [r0]
+        0xE1A0_100D, // mov r1, sp
+        0xE580_1004, // str r1, [r0, #4]
+        0xE14F_1000, // mrs r1, spsr
+        0xE580_1008, // str r1, [r0, #8]
+        0xE321_F0DB, // msr cpsr_c, #0xdb  (UND)
+        0xE1A0_100E, // mov r1, lr  (LR_und)
+        0xE580_100C, // str r1, [r0, #0xc]
+        0xE1A0_100D, // mov r1, sp  (SP_und)
+        0xE580_1010, // str r1, [r0, #0x10]
+        0xE14F_1000, // mrs r1, spsr  (SPSR_und)
+        0xE580_1014, // str r1, [r0, #0x14]
+        0xE321_F0D3, // msr cpsr_c, #0xd3  (SVC)
+        0xE1A0_100E, // mov r1, lr  (LR_svc)
+        0xE580_1018, // str r1, [r0, #0x18]
+        0xE1A0_100D, // mov r1, sp  (SP_svc)
+        0xE580_101C, // str r1, [r0, #0x1C]
+        0xE321_F0D7, // msr cpsr_c, #0xd7  (back to ABT)
+        0xEE15_1F10, // mrc p15,0,r1,c5,c0,0 — DFSR
+        0xE580_1020, // str r1, [r0, #0x20]
+        0xEE16_1F10, // mrc p15,0,r1,c6,c0,0 — DFAR
+        0xE580_1024, // str r1, [r0, #0x24]
+        0xE140_0172, // hvc #0x12
+        0xEAFF_FFFE, // b .
+        LR_SAVE_VA,  // literal for first ldr
     ];
     for (i, w) in stub.iter().enumerate() {
         if !guest_mem::write_word_pa(LR_STUB_PA + (i as u32) * 4, *w) {
@@ -559,6 +650,9 @@ fn handle_diag(ctx: &mut TrapContext) {
             cpu::halt();
         }
     }
+    // Record the save-base PA in a module-private location that the
+    // DIAG_LR_TAG handler knows how to find.
+    LR_SAVE_PA_RECORD.store(LR_SAVE_PA, core::sync::atomic::Ordering::Relaxed);
     kprintln!("  ERET'ing to LR/stack-trace stub at VA {:#x} ...", LR_STUB_VA);
     // SAFETY: single-use ERET. ELR_EL2 set to the stub VA, SPSR_EL2
     // kept as-is so the stub runs in the pre-abort mode. Caller is
@@ -574,24 +668,35 @@ fn handle_diag(ctx: &mut TrapContext) {
     }
 }
 
-/// Second-stage diagnostic: the stub installed by `handle_diag` runs
-/// in the source AArch32 mode, captures that mode's LR/SP plus the
-/// SVC banked SP/LR, then HVCs back with:
-///   x0 = LR_<src_mode>  (for DABT: faulting_pc + 8, bit 0 = pre-abort T)
-///   x1 = SP_<src_mode>
-///   x2 = SP_svc
-///   x3 = LR_svc
-///   x4 = SPSR_<src_mode>  (raw AArch32 SPSR — more reliable than QEMU's
-///                          AArch64 view, which returned 0 for us)
-/// Prints all of that, the faulting instruction bytes, walks the
-/// kernel's SVC stack (fp-chain + raw dump + return-address
-/// heuristic), then halts.
+/// Second-stage diagnostic: the stub installed by `handle_diag` stored
+/// banked R13/R14/SPSR for ABT, UND, and SVC modes to fixed RAM slots
+/// (base recorded in `LR_SAVE_PA_RECORD`). We read them back here and
+/// print a symbolic stack trace. Reading from RAM avoids QEMU's
+/// flaky AArch32→AArch64 banked-register plumbing.
 fn handle_diag_lr(ctx: &mut TrapContext) -> ! {
-    let lr_src   = ctx.x[0] as u32;
-    let sp_src   = ctx.x[1] as u32;
-    let sp_svc   = ctx.x[2] as u32;
-    let lr_svc   = ctx.x[3] as u32;
-    let spsr_src = ctx.x[4] as u32;
+    let _ = ctx; // guest x0 was clobbered as stub scratch
+    let base = LR_SAVE_PA_RECORD.load(core::sync::atomic::Ordering::Relaxed);
+    let read = |off: u32| guest_mem::read_word_pa(base + off).unwrap_or(0xdeadbeef);
+    let lr_abt   = read(0x00);
+    let sp_abt   = read(0x04);
+    let spsr_abt = read(0x08);
+    let lr_und   = read(0x0C);
+    let sp_und   = read(0x10);
+    let spsr_und = read(0x14);
+    let lr_svc   = read(0x18);
+    let sp_svc   = read(0x1C);
+    let dfsr     = read(0x20);
+    let dfar     = read(0x24);
+
+    // The "source mode" of the DABT is whichever mode SPSR_abt names.
+    // Reconstruct the faulting PC from LR of that mode, with the
+    // correct adjustment (+8 for DABT/ARM, +4/T for DABT/Thumb).
+    let src_mode = spsr_abt & 0x1F;
+    let (lr_src, sp_src, spsr_src) = match src_mode {
+        0x1B => (lr_und, sp_und, spsr_und),
+        0x13 => (lr_svc, sp_svc, spsr_abt /* SPSR_abt holds pre-abt CPSR */),
+        _    => (lr_abt, sp_abt, spsr_abt),
+    };
     let thumb = (lr_src & 1) != 0;
     let faulting_pc = if thumb { lr_src.wrapping_sub(4) & !1 }
                       else      { lr_src.wrapping_sub(8) };
@@ -616,6 +721,19 @@ fn handle_diag_lr(ctx: &mut TrapContext) -> ! {
         "  faulting PC  = {:#010x}  ({})",
         faulting_pc, if thumb { "Thumb" } else { "ARM" }
     );
+    kprintln!(
+        "  DFSR      = {:#010x}  (FS[4:0]={:#x}, WnR={}, domain={:#x})",
+        dfsr,
+        ((dfsr >> 10) & 1) << 4 | (dfsr & 0xF),
+        (dfsr >> 11) & 1,
+        (dfsr >> 4) & 0xF
+    );
+    kprintln!("  DFAR      = {:#010x}", dfar);
+    kprintln!("  SP_abt    = {:#010x}  LR_abt = {:#010x}  SPSR_abt = {:#010x}",
+        sp_abt, lr_abt, spsr_abt);
+    kprintln!("  SP_und    = {:#010x}  LR_und = {:#010x}  SPSR_und = {:#010x}",
+        sp_und, lr_und, spsr_und);
+    kprintln!("  src_mode = {:#x}", src_mode);
 
     // Dump the faulting instruction(s). For Thumb at an aligned addr,
     // two halfwords. For ARM, one word.
@@ -915,7 +1033,7 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
         | (opc1 << 2)
         | opc2;
     // SAFETY: single-threaded.
-    let already = unsafe {
+    let should_log = unsafe {
         let mut found = false;
         for i in 0..CP15_N {
             if CP15_SEEN[i] == key { found = true; break; }
@@ -923,19 +1041,20 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
         if !found && CP15_N < 32 {
             CP15_SEEN[CP15_N] = key;
             CP15_N += 1;
-            let value_log = if is_read { 0 } else { ctx.x[rt] as u32 };
-            let elr = read_sysreg!("elr_el2");
-            kprintln!(
-                "cp15: {} p15,{},Rt=r{},c{},c{},{{{}}} val={:#010x} @ELR={:#x}",
-                if is_read { "MRC" } else { "MCR" },
-                opc1, rt, crn, crm, opc2, value_log, elr
-            );
             true
         } else {
-            found
+            false
         }
     };
-    let _ = already;
+    if should_log {
+        let value_log = if is_read { 0 } else { ctx.x[rt] as u32 };
+        let elr = read_sysreg!("elr_el2");
+        kprintln!(
+            "cp15: {} p15,{},Rt=r{},c{},c{},{{{}}} val={:#010x} @ELR={:#x}",
+            if is_read { "MRC" } else { "MCR" },
+            opc1, rt, crn, crm, opc2, value_log, elr
+        );
+    }
 
     // Dispatch on the full (opc1, CRn, CRm, opc2, dir) tuple. The
     // surface is fixed at 15 tuples for the 717006 ROM (see

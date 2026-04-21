@@ -181,7 +181,6 @@ pub fn write_byte_pa(pa: u32, value: u8) -> bool {
 /// c2 c0 0). Tables in ROM are modified via our backing store — guests
 /// see ROM as stage-2 read-only, but from EL2 we own the bytes.
 pub fn fix_stage1_xn_bits() {
-    use crate::kprintln;
     let ram = addr_of_mut!(GUEST_RAM) as *mut u32;
     let rom = addr_of_mut!(GUEST_ROM) as *mut u32;
 
@@ -288,7 +287,6 @@ pub fn fix_stage1_xn_bits() {
 /// what the guest's own page-table walker would have produced for the
 /// faulting VA.
 pub fn dump_stage1_walk(va: u32) {
-    use crate::kprintln;
     let ram = addr_of_mut!(GUEST_RAM) as *const u32;
     let rom = addr_of_mut!(GUEST_ROM) as *const u32;
 
@@ -349,7 +347,6 @@ pub fn dump_stage1_walk(va: u32) {
 /// 717006 probe; stage-2 maps that IPA to the host ram backing). Each
 /// entry covers 1 MiB of VA, so this is the VA 0..32 MiB window.
 pub fn dump_guest_l1_table() {
-    use crate::kprintln;
     let ram = addr_of_mut!(GUEST_RAM) as *const u32;
     let rom = addr_of_mut!(GUEST_ROM) as *const u32;
     kprintln!("guest L1 (TTBR=0x0400_0000) first 32 entries (each covers 1 MiB):");
@@ -395,7 +392,6 @@ pub fn dump_guest_l1_table() {
 /// Emit a compact hex summary of a guest memory region to the UART.
 #[allow(dead_code)]
 pub fn dump_framebuffer_to_uart() {
-    use crate::kprintln;
     let ptr = addr_of_mut!(GUEST_FB) as *const u8;
     // SAFETY: framebuffer is statically allocated; we only read.
     let bytes: &[u8] = unsafe { core::slice::from_raw_parts(ptr, FRAMEBUFFER_SIZE) };
@@ -406,8 +402,8 @@ pub fn dump_framebuffer_to_uart() {
 /// 0x0400_0000). This is our best proxy for a screenshot when the
 /// kernel doesn't hand us an explicit framebuffer: whatever data
 /// structures the kernel has populated in RAM show up here.
+#[allow(dead_code)]
 pub fn dump_ram_to_uart() {
-    use crate::kprintln;
     let ptr = addr_of_mut!(GUEST_RAM) as *const u8;
     // SAFETY: static allocation.
     let bytes: &[u8] = unsafe { core::slice::from_raw_parts(ptr, RAM_SIZE) };
@@ -418,9 +414,8 @@ pub fn dump_ram_to_uart() {
 }
 
 fn summarise_region(label: &str, bytes: &[u8]) {
-    use crate::kprintln;
     let page = 4096;
-    let total_pages = bytes.len() / page;
+    let _total_pages = bytes.len() / page;
     let nonzero = bytes.chunks(page).filter(|p| p.iter().any(|&b| b != 0)).count();
     let ff_pages = bytes.chunks(page).filter(|p| p.iter().all(|&b| b == 0xFF)).count();
     let active = nonzero.saturating_sub(ff_pages);
@@ -442,7 +437,6 @@ fn summarise_region(label: &str, bytes: &[u8]) {
 }
 
 fn hex_block(bytes: &[u8]) {
-    use crate::kprintln;
     for (row, chunk) in bytes.chunks(32).enumerate() {
         let off = row * 32;
         let mut line = [0u8; 32];

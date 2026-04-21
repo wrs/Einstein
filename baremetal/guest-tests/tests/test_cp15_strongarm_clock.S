@@ -15,8 +15,10 @@
     .syntax unified
     .arch armv7ve
 
-    .equ UND_SAVE_LR_ADDR,   0x04000400
-    .equ UND_SAVE_SPSR_ADDR, 0x04000404
+    @ Match src/trap.rs UND_SAVE_LR_IPA / _SPSR_IPA — see test_und_handler.S
+    @ for why we moved off of 0x04000400 (it overlaps the kernel's L1 table).
+    .equ UND_SAVE_LR_ADDR,   0x04005F00
+    .equ UND_SAVE_SPSR_ADDR, 0x04005F04
 
     .section .text.vectors, "ax"
     .global _start

@@ -384,8 +384,14 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
 /// eventually, the ROM's patch_und_vector):
 ///   0x04000400  — saved LR_und (faulting_pc + 4)
 ///   0x04000404  — saved SPSR_und (pre-UND CPSR)
-pub const UND_SAVE_LR_IPA: u32 = 0x0400_0400;
-pub const UND_SAVE_SPSR_IPA: u32 = 0x0400_0404;
+// Old (buggy) slots at 0x0400_0400 — those live inside the kernel's L1
+// table (TTBR0 points at PA 0x0400_0000, and 0x0400_0400 is L1[0x100]).
+// Writing there both (a) fails post-MMU because the guest's L1[0x40]
+// maps VA 0x0400_0400 to PA 0x0000_0400 (ROM, RO under stage-2) and
+// (b) would corrupt the guest's own L1 if it ever did succeed. New
+// slots live in the RAM-mirror window the DIAG stub also uses.
+pub const UND_SAVE_LR_IPA: u32 = 0x0400_5F00;
+pub const UND_SAVE_SPSR_IPA: u32 = 0x0400_5F04;
 
 fn handle_und(ctx: &mut TrapContext) {
     // DIAG: prove handle_und is being reached at all. Single-shot log.
@@ -398,7 +404,20 @@ fn handle_und(ctx: &mut TrapContext) {
     };
     if first {
         let elr = read_sysreg!("elr_el2");
-        kprintln!("und: handle_und first entry, ELR_EL2={:#x}", elr);
+        let spsr = read_sysreg!("spsr_el2");
+        let far = read_sysreg!("far_el1");
+        kprintln!(
+            "und: handle_und first entry, ELR_EL2={:#x} SPSR_EL2={:#x} FAR_EL1={:#x}",
+            elr, spsr, far
+        );
+        kprintln!(
+            "und:   x13(=SP_<src>)={:#x}  x14(=LR_<src>)={:#x} — x14-4 is pre-UND PC if AArch32 x14 is plumbed",
+            ctx.x[13] as u32, ctx.x[14] as u32
+        );
+        kprintln!(
+            "und:   r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}",
+            ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32
+        );
     }
 
     let lr_und = match read_guest_word_pa(UND_SAVE_LR_IPA) {
@@ -435,6 +454,21 @@ fn handle_und(ctx: &mut TrapContext) {
         return;
     }
 
+    // Deprecated ARMv4 "Invalidate Unified Cache" encoding
+    // `MCR p15, 0, Rt, c7, c7, 0` — ARMv7+/A53 UND this, but the ROM
+    // emits it from FlushTheCache at 0x18924 (see the 717006 BootOS
+    // flow; Einstein treats this as a valid deprecated cache op and
+    // no-ops it). On A53 the JIT probe showed this opcode firing
+    // exactly once at boot, from inside FlushTheCache. Emulate as a
+    // cache-clean-all via `dsb ish; ic ialluis; isb` and advance past
+    // it. Mask clears Rt (15:12).
+    if (insn & 0xFFFF_0FFF) == 0xEE07_0F17 {
+        log_cp15_deprecated_cache_all(faulting_pc);
+        cp15::invalidate_icache_all();
+        return_to_guest(ctx, (faulting_pc + 4) as u64, spsr_und);
+        return;
+    }
+
     // Einstein's JIT (TJITGenericPage.cpp) advances PC by 8 past each
     // of these three UNDs — opcode + a 4-byte payload slot. We mirror
     // that; the payload interpretation varies per UND (debugger logs
@@ -446,9 +480,20 @@ fn handle_und(ctx: &mut TrapContext) {
             return_to_guest(ctx, (faulting_pc + 8) as u64, spsr_und);
         }
         0xE6000510 => {
-            let payload = read_guest_word_pa(faulting_pc + 4).unwrap_or(0);
-            log_und_budgeted("DebuggerUND", faulting_pc, Some(payload));
-            return_to_guest(ctx, (faulting_pc + 8) as u64, spsr_und);
+            // DebuggerUND: opcode followed by a null-terminated ASCII
+            // string (typically the debug-log message), padded to the
+            // next 4-byte boundary. Einstein's TEmulator::DebuggerUND
+            // reads the string byte-by-byte starting at inPAddr+4
+            // until it hits a null. We do the same and advance PC past
+            // the final word containing the null. If we got this wrong
+            // (advance only by 8), the CPU would fall into the middle
+            // of the ASCII payload and UND on a random "instruction"
+            // (what we saw as insn=0x2d757365 at 0x3ae1ac — "esu-" bytes
+            // of "non-user mode.").
+            let msg_start = faulting_pc + 4;
+            let msg_end = scan_to_null_word_aligned(msg_start, 256);
+            log_debugger_und(faulting_pc, msg_start, msg_end);
+            return_to_guest(ctx, msg_end as u64, spsr_und);
         }
         0xE6000810 => {
             let payload = read_guest_word_pa(faulting_pc + 4).unwrap_or(0);
@@ -565,7 +610,24 @@ fn handle_diag(ctx: &mut TrapContext) {
     // 0x00FFFF00 (our UND trampoline body) to confirm the guest can
     // actually fetch from there post-MMU.
     for va in [0x04004400u32, 0x0C004C00, 0x01000000, 0x04000000, 0x00800000,
-               0x02A00000, 0x02A04000, 0x02A04AA4, 0x00FFFF00] {
+               0x02A00000, 0x02A04000, 0x02A04AA4, 0x00FFFF00,
+               // 0x0008Exxx: where SP_und / LR_und point per the stub
+               // readout. ROM region so identity-mapped through L2, but
+               // we want to confirm there's no surprise.
+               0x0008EA8C, 0x0008EB00, 0x0008EB08,
+               // 0x01000xxx: the faulting VA region. L1[0x10] = fault in
+               // Einstein's map; we want to dump L2 subentries only if
+               // somehow a fine/coarse table got installed.
+               0x0100018B, 0x01000180, 0x01000190, 0x01000193,
+               // 0x01A00xxx: IRQ vector target (REx jump table). If
+               // L1[0x1A] isn't populated, PABTs from the IRQ path
+               // become a hidden source of chained exceptions.
+               0x01A00000, 0x01A00004,
+               // 0x0C100xxx: kernel domain heap / globals per Einstein's
+               // MMU map. L1[0xC1] should be a coarse-into-L2 with small
+               // pages; our post-fix_stage1_xn_bits normalisation may
+               // have stripped domain bits needed for writes.
+               0x0C100000, 0x0C100800, 0x0C104000] {
         guest_mem::dump_stage1_walk(va);
     }
 
@@ -988,6 +1050,83 @@ fn log_cp15_strongarm_clock(pc: u32) {
     }
 }
 
+/// Scan guest memory from `start` word-by-word for a null byte in
+/// any of the bytes of each word, and return the VA one past the end
+/// of the word that contains the null (aligned, since words are
+/// 4-byte aligned). `max_words` bounds the search so a missing null
+/// doesn't infinite-loop.
+fn scan_to_null_word_aligned(start: u32, max_words: u32) -> u32 {
+    let mut va = start & !0x3;
+    for _ in 0..max_words {
+        let w = read_guest_word_pa(va).unwrap_or(0);
+        let bytes = w.to_le_bytes();
+        if bytes[0] == 0 || bytes[1] == 0 || bytes[2] == 0 || bytes[3] == 0 {
+            return va.wrapping_add(4);
+        }
+        va = va.wrapping_add(4);
+    }
+    // No null found within bound — return (start + max_words*4) as a
+    // best-effort stop. Caller will log + the guest may fault on the
+    // next fetch, which makes the miss visible.
+    va
+}
+
+fn log_debugger_und(pc: u32, msg_start: u32, msg_end: u32) {
+    static mut LOG_BUDGET: usize = 8;
+    // SAFETY: single-threaded.
+    let ok = unsafe {
+        if LOG_BUDGET > 0 {
+            LOG_BUDGET -= 1;
+            true
+        } else {
+            false
+        }
+    };
+    if ok {
+        // Extract the string (first up to 80 bytes) for the log.
+        let mut buf = [0u8; 80];
+        let mut n = 0;
+        let mut va = msg_start;
+        'outer: while n < buf.len() && va < msg_end {
+            let w = match read_guest_word_pa(va) {
+                Some(v) => v,
+                None => break,
+            };
+            for byte in w.to_le_bytes() {
+                if byte == 0 { break 'outer; }
+                buf[n] = byte;
+                n += 1;
+                if n >= buf.len() { break 'outer; }
+            }
+            va = va.wrapping_add(4);
+        }
+        let s = core::str::from_utf8(&buf[..n]).unwrap_or("<bad utf-8>");
+        kprintln!(
+            "und: DebuggerUND @PC={:#x} msg={:?} (resume at PC={:#x})",
+            pc, s, msg_end
+        );
+    }
+}
+
+fn log_cp15_deprecated_cache_all(pc: u32) {
+    static mut LOG_BUDGET: usize = 2;
+    // SAFETY: single-threaded.
+    let ok = unsafe {
+        if LOG_BUDGET > 0 {
+            LOG_BUDGET -= 1;
+            true
+        } else {
+            false
+        }
+    };
+    if ok {
+        kprintln!(
+            "und: MCR p15,0,Rt,c7,c7,0 (deprecated invalidate-unified-cache) @PC={:#x} — emulated as ICIALLU",
+            pc
+        );
+    }
+}
+
 fn log_swp_budgeted(pc: u32, is_byte: bool, rn: usize, rd: usize, rm: usize, addr: u32) {
     static mut SWP_LOG_BUDGET: usize = 8;
     // SAFETY: single-threaded.
@@ -1080,9 +1219,25 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
         // --- writes to virtual-memory CP15 regs ---
         (0, 1, 0, 0, false) => {
             let value = ctx.x[rt] as u32;
+            // Detect M=0→M=1 transitions and re-walk the stage-1 tables
+            // then. The TTBR-write pass catches what was reachable at
+            // that moment but misses coarse L1 entries populated after.
+            // (ARMv4 small-page descriptors use bits[11:4] as four
+            // subpage AP fields; ARMv7 reinterprets bit 9 as AP[2] and
+            // bits[5:4] as AP[1:0], so entries like 0x04007F0E read as
+            // AP[2:0]=100 (reserved) = no-access on A53 and writes
+            // permission-fault.) Running fix on every M=1 write would
+            // cost ~60k calls/sec under task switching, so we gate it
+            // on the rising edge only. The rewrite is idempotent.
+            let prev_sctlr = cp15::read_sctlr_el1() as u32;
+            let was_off = (prev_sctlr & 1) == 0;
+            let now_on = (value & 1) != 0;
             cp15::write_sctlr_el1(value as u64);
             log_sctlr_write(value);
-            if (value & 1) != 0 { maybe_dump_l1_once(); }
+            if was_off && now_on {
+                guest_mem::fix_stage1_xn_bits();
+                maybe_dump_l1_once();
+            }
         }
         (0, 2, 0, 0, false) => {
             let value = ctx.x[rt] as u32;
@@ -1306,6 +1461,24 @@ mod cp15 {
         unsafe {
             core::arch::asm!(
                 "tlbi vmalle1",
+                "dsb ish",
+                "isb",
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    pub fn invalidate_icache_all() {
+        // ARMv8 equivalent of ARMv4 `MCR p15, 0, Rt, c7, c7, 0`
+        // (invalidate unified cache). A53 has split I/D caches with
+        // broadcast; `IC IALLUIS` covers the inner-shareable domain.
+        // The D-cache is handled by A53's native coherency for our
+        // config, so no explicit DCCISW loop is needed here.
+        // SAFETY: cache maintenance sysreg writes.
+        unsafe {
+            core::arch::asm!(
+                "dsb ish",
+                "ic ialluis",
                 "dsb ish",
                 "isb",
                 options(nostack, preserves_flags),

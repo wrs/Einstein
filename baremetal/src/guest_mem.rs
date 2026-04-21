@@ -275,10 +275,15 @@ pub fn fix_stage1_xn_bits() {
         }
     }
 
-    kprintln!(
-        "fix_stage1_xn_bits: {} sections de-XN'd, {} L2 tables walked, {} L2 entries de-XN'd, {} fine -> fault",
-        sections_patched, l2_tables, patched, fine_to_fault
-    );
+    // Only log when we actually rewrote something, to avoid flooding
+    // the serial when the kernel re-enables stage-1 on every task
+    // switch and we re-walk idempotently.
+    if sections_patched != 0 || patched != 0 || fine_to_fault != 0 {
+        kprintln!(
+            "fix_stage1_xn_bits: {} sections de-XN'd, {} L2 tables walked, {} L2 entries de-XN'd, {} fine -> fault",
+            sections_patched, l2_tables, patched, fine_to_fault
+        );
+    }
 }
 
 /// Manually walk the guest's stage-1 tables for a given VA and print
@@ -640,15 +645,41 @@ unsafe fn patch_und_vector(rom: *mut u32) {
         rom.add(1).write(branch_insn);              // 0x04: b UND_TRAMP_OFFSET
 
         let base = UND_TRAMP_OFFSET / 4;
-        rom.add(base).write(0xE92D_0003);           // push {r0, r1}
-        rom.add(base + 1).write(0xE59F_0014);       // ldr r0, [pc, #20]
-        rom.add(base + 2).write(0xE580_E000);       // str lr, [r0]
-        rom.add(base + 3).write(0xE14F_1000);       // mrs r1, SPSR
-        rom.add(base + 4).write(0xE580_1004);       // str r1, [r0, #4]
-        rom.add(base + 5).write(0xE8BD_0003);       // pop {r0, r1}
-        rom.add(base + 6).write(0xE140_0170);       // hvc #0x10
-        rom.add(base + 7).write(0xEAFF_FFFE);       // b . (trap)
-        rom.add(base + 8).write(0x0400_0400);       // literal: UND_SAVE_LR_IPA
+        // DIAGNOSTIC trampoline that bypasses SP_und:
+        // Saves LR_und (and SPSR_und) to a fixed RAM slot via a
+        // literal-loaded pointer, then HVCs. Does not use push/pop,
+        // so it works even when SP_und is uninitialized post-MMU-on.
+        // Save slot is at IPA 0x0400_5F00 — the same small-page slot
+        // the DIAG stage-2 stub uses (VA 0x0C00_4F00), but at an
+        // offset that doesn't overlap its data area (0x04005F80..+0x28).
+        //   +0x00: e59f0018  ldr r0, [pc, #24]   ; literal at +0x20 = IPA save
+        //   +0x04: e580e000  str lr, [r0]         ; save R14_und
+        //   +0x08: e14f1000  mrs r1, SPSR        ; r1 = SPSR_und
+        //   +0x0C: e5801004  str r1, [r0, #4]    ; save SPSR_und
+        //   +0x10: e1400170  hvc #0x10            ; UND_TAG
+        //   +0x14: eafffffe  b .                  ; trap if we return
+        //   +0x18: e1a00000  nop
+        //   +0x1C: e1a00000  nop
+        //   +0x20: 04005f00  .word UND_SAVE slot (IPA, read directly
+        //                    from EL2 via guest_mem::read_word_pa)
+        // Note: the guest's stage-1 L1[0x0F] maps VA 0x00F00000-
+        // 0x00FFFFFF identity to the ROM, so VA 0x00FFFF00 is the PC
+        // the CPU lands at. The literal holds an IPA, which the guest's
+        // stage-1 translates through L1[0x40] (section → PA 0) -- i.e.
+        // a WRITE to VA 0x04005F00 post-MMU goes to PA 0x00005F00 (ROM,
+        // RO) and aborts at stage-2. So we have to write to a VA that
+        // translates to a RAM IPA. VA 0x0C004F00 via L1[0xC0] coarse
+        // -> L2[0x04] small page -> PA 0x04005F00 is RAM. Use THAT VA
+        // in the literal, not the raw IPA.
+        rom.add(base).write(0xE59F_0018);           // ldr r0, [pc, #24]
+        rom.add(base + 1).write(0xE580_E000);       // str lr, [r0]
+        rom.add(base + 2).write(0xE14F_1000);       // mrs r1, SPSR
+        rom.add(base + 3).write(0xE580_1004);       // str r1, [r0, #4]
+        rom.add(base + 4).write(0xE140_0170);       // hvc #0x10
+        rom.add(base + 5).write(0xEAFF_FFFE);       // b . (trap)
+        rom.add(base + 6).write(0xE1A0_0000);       // nop
+        rom.add(base + 7).write(0xE1A0_0000);       // nop
+        rom.add(base + 8).write(0x0C00_4F00);       // literal: VA of save slot (RAM mirror)
     }
 }
 

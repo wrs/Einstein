@@ -27,6 +27,13 @@ img=/tmp/kernel8-guest-${test_name}.img
 objcopy="$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)"
 "$objcopy" -O binary "$elf" "$img"
 
+# Remove any snapshot left over from a previous run. The hypervisor's
+# snapshot fingerprint is keyed on the first 1 KiB of ROM, which is
+# stable within a single test binary; a prior invocation of the SAME
+# test (or a cached slot whose fingerprint happens to collide) will
+# resume mid-run and break reproducibility.
+rm -f /tmp/newton-snapshot-*.bin
+
 # Run. Capture output, check for PASS / FAIL markers.
 log=/tmp/guest-${test_name}.out
 timeout 10 qemu-system-aarch64 -M raspi3b -kernel "$img" \

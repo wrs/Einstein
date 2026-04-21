@@ -22,8 +22,12 @@
     .syntax unified
     .arch armv7ve
 
-    .equ UND_SAVE_LR_ADDR,   0x04000400
-    .equ UND_SAVE_SPSR_ADDR, 0x04000404
+    @ UND save slots live in the RAM-mirror-accessible portion of RAM,
+    @ not at IPA 0x04000400 (which overlaps the Newton kernel's L1 table
+    @ at PA 0x04000000 — writing there corrupts the page table once the
+    @ ROM installs it). Match src/trap.rs UND_SAVE_LR_IPA / _SPSR_IPA.
+    .equ UND_SAVE_LR_ADDR,   0x04005F00
+    .equ UND_SAVE_SPSR_ADDR, 0x04005F04
 
     @ === Vector table ===============================================
     .section .text.vectors, "ax"

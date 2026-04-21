@@ -21,6 +21,10 @@ use crate::{guest_mem, kprintln, peripherals};
 const DESC_VALID: u64 = 1 << 0;
 const DESC_TABLE: u64 = 1 << 1;
 const DESC_BLOCK: u64 = 0 << 1;
+// At L3 the descriptor-type field is `11` (valid + page). Same bit
+// positions as a table descriptor at L1/L2 — architecture disambiguates
+// by level rather than by bits.
+const DESC_PAGE: u64 = 1 << 1;
 
 const S2_MEMATTR_NORMAL_WB: u64 = 0b1111 << 2;
 const S2_AP_READ: u64 = 0b01 << 6;
@@ -35,11 +39,55 @@ const BLOCK_COMMON: u64 = DESC_VALID | DESC_BLOCK
 const BLOCK_NORMAL_RO: u64 = BLOCK_COMMON | S2_AP_RO;
 const BLOCK_NORMAL_RW: u64 = BLOCK_COMMON | S2_AP_RW;
 
+// L3 page descriptor — same attribute bits as a block descriptor, just
+// different type field and naturally smaller (4 KiB).
+const PAGE_COMMON: u64 = DESC_VALID | DESC_PAGE
+    | S2_MEMATTR_NORMAL_WB | S2_SH_INNER | S2_AF;
+const PAGE_NORMAL_RO: u64 = PAGE_COMMON | S2_AP_RO;
+
 #[repr(C, align(4096))]
 struct PageTable([u64; 512]);
 
 static mut S2_L1: PageTable = PageTable([0; 512]);
 static mut S2_L2: PageTable = PageTable([0; 512]);
+
+// L3 table refining the single 2 MiB L2 slot that covers the Newton
+// peripheral window at IPA 0x0F00_0000..0x0F20_0000. Used so we can
+// install one 4 KiB non-trapping page (the tick register) without
+// exposing the whole peripheral range as RAM — other 4 KiB entries
+// in this L3 stay invalid and continue to stage-2-fault into mmio::.
+static mut S2_L3_HW_TICKS: PageTable = PageTable([0; 512]);
+
+// Backing page for the Newton tick clock, mapped read-only at stage-2
+// at IPA 0x0F181000. The guest reads K_HDWR_TICKS (0x0F181800) hot in
+// busy-wait delay loops — ~75 % of all stage-2 faults before this page
+// existed. With stage-2 pointing the whole 4 KiB page at this RAM
+// backing, reads become cache-coherent loads from the guest's
+// perspective, no trap. EL2 periodically writes the current
+// `vic::ticks()` value into offset 0x800 from the CNTHP IRQ handler
+// and from a few other forward-progress hooks; see `tick_page::update`.
+//
+// Offsets 0x000 (calendar) and 0x400 (alarm) also live in this page;
+// they currently always read as 0 from `vic::read`, which matches the
+// page's zero-initialised state, so the non-trapping fast path returns
+// the right value for them too. Writes to anywhere in the page still
+// stage-2-fault (RO), so vic::write is still reached for register
+// writes the kernel does.
+#[repr(C, align(4096))]
+pub(crate) struct TickPage(pub [u8; 4096]);
+pub(crate) static mut TICK_PAGE: TickPage = TickPage([0; 4096]);
+
+// Offset of K_HDWR_TICKS within the 4 KiB page. The other registers
+// that share this page (calendar at +0x000, alarm at +0x400) are read
+// as zero by the guest today; the zero-initialised backing matches
+// what `vic::read` returns for them, so we don't need to wire them up
+// explicitly.
+pub(crate) const TICK_OFFSET_TICKS: usize = 0x800;
+
+// Base IPA of the 4 KiB page holding the tick cluster (calendar / alarm
+// / ticks). The L3 slot index is `(base / 4 KiB) % 512` — we pick
+// whichever L3 is covering the enclosing 2 MiB block.
+const TICK_PAGE_IPA: u64 = 0x0F18_1000;
 
 const TWO_MIB: u64 = 0x0020_0000;
 
@@ -170,6 +218,12 @@ pub unsafe fn init() {
         );
     }
 
+    // Refine one 2 MiB L2 slot into 4 KiB pages so we can plant the
+    // non-trapping tick register inside the otherwise-MMIO peripheral
+    // window. See TICK_PAGE / tick_page::update for the rationale.
+    // SAFETY: see the called helper's contract.
+    unsafe { install_tick_page(); }
+
     // L1[0] → L2. L1[1..] stay invalid (any IPA ≥ 1 GiB faults).
     let l1_ptr = addr_of_mut!(S2_L1) as *mut u64;
     let l2_phys = addr_of_mut!(S2_L2) as u64;
@@ -225,6 +279,74 @@ pub unsafe fn init() {
         FB_IPA_SIZE / (1024 * 1024)
     );
     kprintln!("stage2: all other IPAs fault to EL2");
+}
+
+/// Wire the 4 KiB page containing K_HDWR_TICKS into stage-2 as a
+/// normal-memory RO mapping backed by `TICK_PAGE`. Replaces the single
+/// 2 MiB L2 slot covering the peripheral window with a table
+/// descriptor pointing at `S2_L3_HW_TICKS`, then installs one valid
+/// L3 entry for the tick page. Invalid L3 entries still fault into
+/// handle_data_abort → mmio:: like before, so peripherals outside this
+/// one page keep their trap-based register model.
+unsafe fn install_tick_page() {
+    // Seed the page with the "current" ticks() value so any read before
+    // the first timer IRQ returns something non-zero-but-consistent.
+    // Calendar / alarm offsets stay zero-initialised, which matches the
+    // values `vic::read` returns for those registers today.
+    tick_page::update();
+
+    // L2 index for the 2 MiB block containing TICK_PAGE_IPA.
+    let l2_index = (TICK_PAGE_IPA / TWO_MIB) as usize; // = 0x78 (120) for 0x0F000000
+    let l3_ptr = addr_of_mut!(S2_L3_HW_TICKS) as *mut u64;
+    let tick_pa = addr_of_mut!(TICK_PAGE) as u64;
+
+    // Clear the L3 table (all invalid).
+    for i in 0..512usize {
+        // SAFETY: 0 ≤ i < 512.
+        unsafe { l3_ptr.add(i).write(0); }
+    }
+    // L3 slot for the tick page within this L2-covered 2 MiB window.
+    let l3_index =
+        ((TICK_PAGE_IPA - (l2_index as u64) * TWO_MIB) / 0x1000) as usize;
+    // SAFETY: 0 ≤ l3_index < 512.
+    unsafe { l3_ptr.add(l3_index).write(tick_pa | PAGE_NORMAL_RO); }
+
+    // Replace the L2 slot with a table descriptor pointing at the L3.
+    let l2_ptr = addr_of_mut!(S2_L2) as *mut u64;
+    let l3_phys = l3_ptr as u64;
+    // SAFETY: l2_index < 512.
+    unsafe { l2_ptr.add(l2_index).write(l3_phys | DESC_VALID | DESC_TABLE); }
+
+    kprintln!(
+        "stage2: tick page (calendar / alarm / ticks) @ IPA {:#x} -> host PA {:#x} (RO, 4 KiB)",
+        TICK_PAGE_IPA, tick_pa
+    );
+}
+
+/// Writer-side helpers for `TICK_PAGE`. Invoked from the CNTHP IRQ
+/// handler so the guest's non-trapping reads observe a monotonically
+/// advancing tick value in lockstep with EL2 wall-clock heartbeats.
+pub mod tick_page {
+    use super::*;
+
+    /// Write the current `vic::ticks()` value into the tick-register
+    /// offset of `TICK_PAGE`. The caller is expected to run this in an
+    /// EL2 context; DSBs ensure the store is visible to the guest via
+    /// Normal-WB stage-2 coherency before the next ERET.
+    pub fn update() {
+        let ticks = crate::peripherals::vic::ticks();
+        // SAFETY: TICK_PAGE is a statically allocated 4 KiB-aligned
+        // buffer; writing a u32 at a fixed offset is in-bounds.
+        unsafe {
+            let ptr = addr_of_mut!(TICK_PAGE) as *mut u8;
+            let slot = ptr.add(TICK_OFFSET_TICKS) as *mut u32;
+            core::ptr::write_volatile(slot, ticks);
+            // Ensure the store is globally visible before the guest's
+            // next load. DSB ISH covers the inner-shareable domain which
+            // is what S2_SH_INNER selects for this page.
+            core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+        }
+    }
 }
 
 /// Enable stage-2 translation via HCR_EL2.VM. Takes effect on the next ERET

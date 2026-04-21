@@ -110,35 +110,54 @@ fn newton_ticks_to_cntpct(newton_ticks: u32) -> u64 {
 /// Recompute the nearest pending Newton match and reprogram CNTHP_CVAL_EL2.
 /// Called after any write to match_reg[i] or int_ctrl, and from the IRQ
 /// handler after clearing a fired match bit.
+///
+/// Also clamps the deadline to a 1 ms fallback heartbeat even if the VIC
+/// match is far in the future. The non-trapping tick page
+/// (`stage2::TICK_PAGE`) only advances when `stage2::tick_page::update()`
+/// runs, and that is driven off the CNTHP IRQ — if CNTHP is only armed
+/// for rare VIC matches the guest's busy-wait delay loops would spin
+/// forever on a stale tick value. 1 ms is short enough that every
+/// typical guest delay sees at least one update before it times out,
+/// and long enough that the IRQ overhead is negligible (~0.1% host CPU).
 pub fn rearm() {
+    let cnt_hz = read_cntfrq();
+    // SAFETY: read-only sysreg.
+    let now: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) now,
+            options(nomem, nostack, preserves_flags));
+    }
+    let heartbeat_cval = now.wrapping_add(cnt_hz / 1000); // +1 ms
     let cval = match vic::next_pending_match() {
-        Some(t) => newton_ticks_to_cntpct(t),
-        // No guest-visible timer match pending — arm the heartbeat so
-        // EL2 periodically gets control back and we can observe guest
-        // progress even when the guest isn't trapping. ~100 ms wall at
-        // the observed CNTPCT rate.
-        None => {
-            let cnt_hz = read_cntfrq();
-            // SAFETY: read-only sysreg.
-            let now: u64;
-            unsafe {
-                core::arch::asm!("mrs {}, cntpct_el0", out(reg) now,
-                    options(nomem, nostack, preserves_flags));
+        Some(t) => {
+            let vic_cval = newton_ticks_to_cntpct(t);
+            // Fire whichever deadline comes first.
+            if vic_cval.wrapping_sub(now) < heartbeat_cval.wrapping_sub(now) {
+                vic_cval
+            } else {
+                heartbeat_cval
             }
-            now.wrapping_add(cnt_hz / 10)
         }
+        None => heartbeat_cval,
     };
     program_cval(cval);
 }
 
 /// Called from the EL2 IRQ vector on any physical-IRQ delivery. We only
 /// wire up CNTHP, so any IRQ here is a timer expiry: latch whatever Newton
-/// matches have been crossed, rearm for the next one, and let trap.rs's
-/// shared `update_virq` set HCR_EL2.VI for delivery to the guest.
+/// matches have been crossed, refresh the non-trapping tick page, rearm
+/// for the next deadline, and let trap.rs's shared `update_virq` set
+/// HCR_EL2.VI for delivery to the guest.
 pub fn on_irq() {
     // Re-evaluate the Newton VIC and decide which matches have crossed
     // their threshold.
     vic::poll_timer_matches();
+    // Refresh the non-trapping tick register so the guest's busy-wait
+    // delay loops observe a fresh counter value on their next load.
+    // Without this the loops at BootOS:0x19FCC / 0x18F38 would spin
+    // against a stale tick value until the next IRQ fired for some
+    // other reason.
+    crate::stage2::tick_page::update();
     // The match that woke us is now latched in vic::int_present; rearm
     // for the next pending deadline so we don't re-fire immediately.
     rearm();

@@ -541,6 +541,23 @@ struct BuiltStub {
     access_off: usize, // byte offset of the inner access instruction
 }
 
+/// Per-slot metadata kept for abort transparency.
+#[derive(Clone, Copy)]
+struct SlotMeta {
+    /// XOR mask the stub applied to the guest's effective address
+    /// (3 for byte accesses / SWPB, 2 for halfword).
+    xor_mask: u32,
+}
+
+static mut SLOT_META: [Option<SlotMeta>; STUB_POOL_CAPACITY] =
+    [None; STUB_POOL_CAPACITY];
+
+pub fn slot_xor_mask(slot: usize) -> Option<u32> {
+    if slot >= STUB_POOL_CAPACITY { return None; }
+    // SAFETY: slot bounded; single-threaded writer.
+    unsafe { SLOT_META[slot].map(|m| m.xor_mask) }
+}
+
 /// Build the full set of words for one stub. Returns the number of
 /// words actually emitted (into words 0..n-1), plus the byte offset of
 /// the inner access instruction. Words from n to STUB_SLOT_WORDS-3 get
@@ -792,6 +809,7 @@ pub fn patch_code_range(start_ipa: u32, end_ipa: u32) -> PatchStats {
         unsafe {
             SLOT_ORIGINAL_PC[slot] = pc;
             SLOT_ACCESS_OFF[slot] = built.access_off as u8;
+            SLOT_META[slot] = Some(SlotMeta { xor_mask: decoded.kind.xor_mask() });
         }
 
         // Patch original site.

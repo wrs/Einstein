@@ -130,6 +130,7 @@ test_main:
     bl      subtest_16_sp_post_index
     bl      subtest_17_swpb
     bl      subtest_18_ldrd_verify
+    bl      subtest_19_abort_transparency
 
     pop     {r4-r11, lr}
     @ Print PASS banner via unpatched HVC_PUTC.
@@ -629,6 +630,127 @@ subtest_18_ldrd_verify:
     hvc     #2
     fail_st 18
 
+    @ ---- subtest 19: abort transparency --------------------------
+    @ Performs a PATCHED LDRB whose target IPA is unmapped at stage-2.
+    @ The stub triggers a stage-2 fault while executing the inner
+    @ LDRB; the hypervisor must re-inject the abort to the guest with
+    @ FAR showing the un-XOR'd guest-view VA and LR pointing at
+    @ original_pc + 8 — exactly what the guest would have seen without
+    @ the stub mechanism.
+    @
+    @ The custom DABT vector at VBAR+0x10 records FAR and LR to fixed
+    @ RAM slots, then HVC #3 (PASS).
+subtest_19_abort_transparency:
+    @ Install our mini vector table at 0x04000800 in RAM. Layout:
+    @   +0x00..0x0C: b . (reset/und/svc/pabt)
+    @   +0x10:       ldr pc, [pc, #24] (DABT) — pulls abort_handler
+    @                                           from the literal at +0x30
+    @   +0x14..0x1C: b . (reserved/irq/fiq)
+    @   +0x20..0x2C: (padding)
+    @   +0x30:       .word abort_handler
+    @
+    @ We use an indirect load-to-PC rather than B since abort_handler
+    @ sits in the ROM region (~0x0900), which is more than 32 MiB
+    @ below the vector table in RAM — out of B's ±32 MiB reach.
+    load_u32 r4, 0x04000800
+
+    @ Vector words: b . everywhere except DABT slot.
+    load_u32 r9, 0xEAFFFFFE              @ b . (branch to self)
+    str     r9, [r4, #0x00]
+    str     r9, [r4, #0x04]
+    str     r9, [r4, #0x08]
+    str     r9, [r4, #0x0C]
+    @ DABT slot: `LDR PC, [PC, #24]` — reads abort_handler literal at
+    @ +0x30 (24 byte offset from PC+8 at the LDR site (0x10+8=0x18)
+    @ to 0x30 is 0x18).
+    load_u32 r9, 0xE59FF018              @ ldr pc, [pc, #24]
+    str     r9, [r4, #0x10]
+    load_u32 r9, 0xEAFFFFFE
+    str     r9, [r4, #0x14]
+    str     r9, [r4, #0x18]
+    str     r9, [r4, #0x1C]
+    @ Literal pool entry at offset 0x30.
+    load_sym r7, abort_handler
+    str     r7, [r4, #0x30]
+
+    @ Flush I-cache by MVA so CPU refetches the vector table bytes.
+    @ Flush two cache lines: the vector table and the literal at +0x30.
+    mcr     p15, 0, r4, c7, c5, 1
+    add     r9, r4, #0x20
+    mcr     p15, 0, r9, c7, c5, 1
+    dsb
+    isb
+
+    @ Program VBAR_EL1 = 0x04000800 (CP15 c12, c0, opc2=0).
+    mcr     p15, 0, r4, c12, c0, 0
+
+    @ Reset captures in RAM.
+    load_u32 r0, 0x04000900
+    mov     r1, #0
+    str     r1, [r0, #0]                @ captured FAR
+    str     r1, [r0, #4]                @ captured LR
+
+    @ Target unmapped IPA. 0x5000_0000 is outside our stage-2 map;
+    @ both 0x5000_0000 and 0x5000_0003 (XOR'd) are unmapped.
+    load_u32 r4, 0x50000000
+.Lst19_faulting_pc:
+    ldrb    r5, [r4]                    @ PATCHED — stage-2 fault expected
+
+    @ If we reach here the abort wasn't delivered. That's a fail.
+    mov     r0, #0x19
+    hvc     #2
+    fail_st 19
+
     .global patch_end
 patch_end:
     .ltorg                              @ flush any pending literals OUTSIDE
+
+    @ === Abort handler (outside patch range) =======================
+    @ The shadow_stub scanner is called with [patch_start, patch_end),
+    @ so code below patch_end is not patched. The handler itself uses
+    @ only word-sized LDR/STR and MRC, so the absence of stubs is fine.
+abort_handler:
+    @ Running in AArch32 ABT mode after EL2 injected the abort.
+    @ LR = original_pc + 8, FAR_EL1 holds the un-XOR'd guest VA.
+    load_u32 r0, 0x04000900
+    mrc     p15, 0, r1, c6, c0, 0       @ DFAR = FAR_EL1
+    str     r1, [r0, #0]
+    str     lr, [r0, #4]
+
+    load_u32 r2, 0x50000000
+    cmp     r1, r2
+    bne     .Lst19_fail_far
+    load_sym r2, .Lst19_faulting_pc
+    add     r2, r2, #8
+    cmp     lr, r2
+    bne     .Lst19_fail_lr
+
+    @ Success — signal PASS directly (we're in ABT mode; no need to
+    @ return to SVC mode since this is the last subtest).
+    mov     r0, #0x50                   @ 'P'
+    hvc     #1
+    mov     r0, #0x41                   @ 'A'
+    hvc     #1
+    mov     r0, #0x53                   @ 'S'
+    hvc     #1
+    mov     r0, #0x53                   @ 'S'
+    hvc     #1
+    mov     r0, #0x0a
+    hvc     #1
+    mov     r0, #0x19
+    hvc     #3
+.Lst19_hang:
+    b       .Lst19_hang
+
+.Lst19_fail_far:
+    mov     r0, r1
+    hvc     #2
+    mov     r0, #0x91
+    hvc     #4
+    b       .Lst19_hang
+.Lst19_fail_lr:
+    mov     r0, lr
+    hvc     #2
+    mov     r0, #0x92
+    hvc     #4
+    b       .Lst19_hang

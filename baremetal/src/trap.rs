@@ -8,7 +8,7 @@
 //! return — the vector trailer restores the context and ERETs. Handlers that
 //! don't want to resume never return (they call `cpu::halt`).
 
-use crate::{cpu, guest_mem, kprintln, mmio, peripherals::{native_primitives, vic}, timer};
+use crate::{cpu, guest_mem, kprintln, mmio, peripherals::{native_primitives, vic}, shadow_stub, timer};
 
 macro_rules! read_sysreg {
     ($reg:literal) => {{
@@ -234,6 +234,18 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
     let sas = ((iss >> 22) & 3) as u8;
     let srt = ((iss >> 16) & 0x1F) as usize;
 
+    let elr = read_sysreg!("elr_el2") as u32;
+
+    // Shadow-stub abort transparency: if the aborting PC is inside the
+    // stub pool, the guest just hit a fault on the real LDRB/STRB/...
+    // that the stub is executing on its behalf. Redirect the abort so
+    // the guest's own DABT handler sees it at the original PC with
+    // an un-XOR'd FAR, exactly as if the site had never been patched.
+    if shadow_stub::is_stub_ipa(elr) {
+        inject_shadow_stub_abort(ctx, iss, far, elr);
+        return;
+    }
+
     if isv == 0 {
         // No decodable syndrome — typically LDM/STM or exclusive access.
         // Log enough to diagnose and halt.
@@ -252,12 +264,11 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
         cpu::halt();
     }
 
-    let elr = read_sysreg!("elr_el2");
     if wnr {
         let value = ctx.x[srt] as u32;
-        mmio::write(ipa, sas, value, elr);
+        mmio::write(ipa, sas, value as u32, elr as u64);
     } else {
-        let value = mmio::read(ipa, sas, elr);
+        let value = mmio::read(ipa, sas, elr as u64);
         // Sign-extension (SSE) is ignored for stub reads — everything we
         // return here is either zero or a known non-negative constant.
         ctx.x[srt] = value as u64;
@@ -265,6 +276,206 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
 
     // Advance past the 32-bit ARM instruction that faulted.
     advance_elr(4);
+}
+
+/// Handle a data abort whose ELR_EL2 is inside the shadow-stub pool.
+///
+/// Steps:
+///   1. Identify the stub slot and its original guest PC.
+///   2. If the aborting PC is NOT at the slot's "access offset" (the
+///      real LDRB/STRB inside the stub), halt loudly — we shouldn't
+///      be faulting anywhere else inside a stub.
+///   3. Compute the un-XOR'd guest VA by XOR'ing FAR_EL2 with the
+///      stub's xor_mask. That's the address the guest thinks it
+///      accessed.
+///   4. Write FAR_EL1 (= DFAR from AArch32's view) to the un-XOR'd VA
+///      so the guest's abort handler sees its expected address.
+///   5. Set ELR_EL2 to the guest's DABT vector (0x10, or 0xFFFF0010
+///      if the guest uses high vectors), switch SPSR_EL2 to AArch32
+///      ABT mode with IRQs/FIQs masked, and set ctx.x[14] so that
+///      after ERET LR_abt = original_pc + 8 — the exact state the
+///      guest would have if the faulting instruction had been at
+///      the original site and never been patched.
+fn inject_shadow_stub_abort(
+    ctx: &mut TrapContext, iss: u32, far: u64, elr: u32,
+) {
+    let (slot, off) = match shadow_stub::ipa_to_slot_offset(elr) {
+        Some(v) => v,
+        None => {
+            kprintln!("*** shadow_stub abort: ELR {:#x} not in pool (impossible)", elr);
+            cpu::halt();
+        }
+    };
+
+    let access_off = shadow_stub::slot_access_offset(slot);
+    let original_pc = shadow_stub::slot_original_pc(slot);
+    let xor_mask = shadow_stub::slot_xor_mask(slot).unwrap_or(0);
+
+    let original_pc = match original_pc {
+        Some(pc) => pc,
+        None => {
+            kprintln!("*** shadow_stub abort: slot {} has no original PC", slot);
+            cpu::halt();
+        }
+    };
+
+    // Expected abort offset is the inner access instruction. SWPB
+    // uses a 2-insn LDRB/STRB pair so both are "the access" — accept
+    // `access_off` or `access_off + 4`.
+    let expected = match access_off {
+        Some(off) => off,
+        None => {
+            kprintln!("*** shadow_stub abort: slot {} has no access_off", slot);
+            cpu::halt();
+        }
+    };
+    if off != expected && off != expected + 4 {
+        kprintln!();
+        kprintln!("*** shadow_stub abort at UNEXPECTED stub PC ***");
+        kprintln!(
+            "  ELR={:#x}  slot={}  off={:#x} expected={:#x} (inner access)",
+            elr, slot, off, expected
+        );
+        kprintln!("  original guest PC={:#x}", original_pc);
+        kprintln!(
+            "  (the faulting instruction in the stub should be the inner"
+        );
+        kprintln!(
+            "   LDRB/STRB/... only. A fault on the save/restore/branch-back"
+        );
+        kprintln!(
+            "   would indicate corrupt stub code or a broken stage-2 mapping.)"
+        );
+        cpu::halt();
+    }
+
+    // Guest-visible faulting VA: reverse the XOR the stub applied.
+    // The stub only XORs addresses below XOR_LIMIT (MMIO pass-through);
+    // addresses >= XOR_LIMIT reach the real access unchanged, so
+    // FAR_EL2 already holds the guest-view address.
+    let far_u32 = far as u32;
+    let guest_far = if far_u32 >= shadow_stub::XOR_LIMIT {
+        far_u32
+    } else {
+        far_u32 ^ xor_mask
+    };
+
+    // Determine the guest DABT vector. AArch32 lays it at
+    //   VBAR_EL1 + 0x10     (base vectors)
+    //   0xFFFF0000  + 0x10  (high vectors, SCTLR_EL1.V = 1)
+    // VBAR_EL1 provides the base for the guest's low-vectors case.
+    let sctlr_el1 = read_sysreg!("sctlr_el1");
+    let high_vectors = (sctlr_el1 & (1 << 13)) != 0;
+    let vbar_el1 = read_sysreg!("vbar_el1");
+    let dabt_vector: u32 = if high_vectors {
+        0xFFFF_0010
+    } else {
+        (vbar_el1 as u32).wrapping_add(0x10)
+    };
+
+    // AArch32 DABT semantics (ARM ARM B1.9.8): LR_abt = faulting_pc + 8.
+    // On QEMU raspi3b, AArch64 ERET to AArch32 ABT mode does NOT
+    // propagate x14 to the banked R14_abt reliably (same class of
+    // issue documented for the UND/DIAG paths — banked register
+    // plumbing across the AArch64<->AArch32 boundary is flaky).
+    //
+    // Workaround: route through an AArch32 trampoline installed in
+    // guest RAM. ERET to the trampoline in ABT mode; the trampoline
+    // is 4 instructions + 2 literals, executes `ldr lr, [pc, #0]`
+    // to set R14_abt from its own literal pool, then `ldr pc, [pc, #0]`
+    // to jump to the real DABT vector. Both values are written from
+    // EL2 via the RAM backing immediately before each ERET.
+    let target_lr = original_pc.wrapping_add(8);
+    install_abt_trampoline(target_lr, dabt_vector);
+
+    // Build the AArch32 CPSR value for ABT mode with I=1, F=1 so the
+    // handler runs with aborts masked. Keep the same AArch32 ISA state
+    // (ARM) by not setting T bit. E bit (endianness) = 0. Mode = 0x17.
+    let cpsr_abt: u32 = 0x000000D7; // I=1, F=1, mode=ABT, ARM
+    let spsr_el2: u64 = cpsr_abt as u64;
+
+    // Write FAR_EL1 so the guest sees the un-XOR'd VA as DFAR.
+    // SAFETY: sysreg write.
+    unsafe {
+        core::arch::asm!(
+            "msr far_el1, {}",
+            "isb",
+            in(reg) guest_far as u64,
+            options(nostack, preserves_flags),
+        );
+    }
+
+    // Log once so the operator sees what happened. Subsequent fires
+    // stay quiet to avoid flooding.
+    static mut ABORT_LOG_BUDGET: usize = 4;
+    // SAFETY: single-threaded.
+    let log = unsafe {
+        let ok = ABORT_LOG_BUDGET > 0;
+        if ok { ABORT_LOG_BUDGET -= 1; }
+        ok
+    };
+    if log {
+        kprintln!(
+            "shadow_stub: delivering DABT -> guest (original PC={:#x}, \
+             stub ELR={:#x}, guest FAR={:#x}, iss={:#x}, \
+             vbar_el1={:#x}, dabt_vector={:#x}, spsr={:#x})",
+            original_pc, elr, guest_far, iss,
+            vbar_el1, dabt_vector, spsr_el2
+        );
+    }
+
+    // SAFETY: writing EL2 sysregs; on ERET the guest enters ABT mode
+    // at the trampoline, which sets R14_abt from its literal pool
+    // and branches to the real DABT vector.
+    unsafe {
+        core::arch::asm!(
+            "msr elr_el2, {elr}",
+            "msr spsr_el2, {spsr}",
+            "isb",
+            elr = in(reg) ABT_TRAMPOLINE_IPA as u64,
+            spsr = in(reg) spsr_el2,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// IPA where we install the ABT-trampoline. Sits in a RAM page that
+/// the guest doesn't use (far above the test stack / Newton kernel
+/// working set).
+const ABT_TRAMPOLINE_IPA: u32 = 0x0400_0A00;
+
+/// Write the 4-instruction + 2-literal trampoline into RAM, populating
+/// the literal-pool slots with the desired LR_abt and the DABT vector
+/// target. Called from EL2 each time we inject an abort.
+///
+/// Layout (5 words at ABT_TRAMPOLINE_IPA):
+///   +0x00: ldr  lr, [pc, #4]      ; R14_abt <- [+0x0C]
+///   +0x04: ldr  pc, [pc, #4]      ; PC <- [+0x10]
+///   +0x08: (unused slot)
+///   +0x0C: <target_lr>            ; R14_abt value = original_pc + 8
+///   +0x10: <target_pc>            ; DABT vector address
+fn install_abt_trampoline(target_lr: u32, target_pc: u32) {
+    // SAFETY: writing to guest RAM backing from EL2; stage-2 maps the
+    // same page, so the guest sees these words after our icache sync.
+    unsafe {
+        let base = (guest_mem::ram_host_pa() as usize)
+            + (ABT_TRAMPOLINE_IPA as usize - 0x0400_0000);
+        core::ptr::write_volatile((base) as *mut u32, 0xE59F_E004); // ldr lr, [pc, #4]
+        core::ptr::write_volatile((base + 4) as *mut u32, 0xE59F_F004); // ldr pc, [pc, #4]
+        core::ptr::write_volatile((base + 8) as *mut u32, 0xE320_F000); // nop
+        core::ptr::write_volatile((base + 12) as *mut u32, target_lr);
+        core::ptr::write_volatile((base + 16) as *mut u32, target_pc);
+        // DC CVAU + IC IVAU so the guest fetches the freshly-written
+        // trampoline instructions rather than stale cache lines.
+        core::arch::asm!(
+            "dc cvau, {0}",
+            "ic ivau, {0}",
+            "dsb ish",
+            "isb",
+            in(reg) base as u64,
+            options(nostack, preserves_flags),
+        );
+    }
 }
 
 fn handle_instruction_abort(iss: u32) {
@@ -1349,6 +1560,25 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
         // StrongARM-specific clock-control write (c15, c1, op1=0, op2=2).
         // Fires exactly once at boot; no observable effect from EL2.
         (0, 15, 1, 2, false) => { /* nop */ }
+
+        // Guest VBAR_EL1 write (CP15 c12, c0, opc1=0, opc2=0). Needed
+        // so tests that want a non-default exception-vector table can
+        // install one; the real Newton ROM never writes VBAR (it uses
+        // low vectors at 0), but the shadow_stub abort-transparency
+        // test does.
+        (0, 12, 0, 0, false) => {
+            let value = ctx.x[rt] as u64;
+            // SAFETY: VBAR_EL1 is writable at EL2; on ERET the guest
+            // sees it as its own CP15 VBAR.
+            unsafe {
+                core::arch::asm!(
+                    "msr vbar_el1, {}",
+                    "isb",
+                    in(reg) value,
+                    options(nostack, preserves_flags),
+                );
+            }
+        }
 
         _ => {
             // Unrecognised tuple — Phase A contract: halt loudly so

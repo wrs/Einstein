@@ -45,6 +45,11 @@ const PAGE_COMMON: u64 = DESC_VALID | DESC_PAGE
     | S2_MEMATTR_NORMAL_WB | S2_SH_INNER | S2_AF;
 const PAGE_NORMAL_RO: u64 = PAGE_COMMON | S2_AP_RO;
 
+/// Stage-2 XN bit (bit 54) — single-bit on ARMv8.0-A (Cortex-A53).
+/// Setting this raises an instruction abort on any fetch to this
+/// IPA from the guest.
+const S2_XN_NEVER: u64 = 1 << 54;
+
 #[repr(C, align(4096))]
 struct PageTable([u64; 512]);
 
@@ -123,6 +128,40 @@ const VTCR_EL2_VAL: u64 = (32 << 0)
     | (0b00 << 14)         // TG0 = 4 KiB
     | (0b010 << 16);       // PS = 40-bit
 
+/// Clear the stage-2 XN bits on the 2 MiB block that contains
+/// `ipa`, making that block executable at EL1. Called from the
+/// shadow_stub lazy-RAM-patch path after the hypervisor has scanned
+/// the block and installed stubs for every byte/halfword access.
+pub unsafe fn clear_xn_for_block(ipa: u32) {
+    let idx = ((ipa as u64) / TWO_MIB) as usize;
+    if idx >= 512 {
+        return;
+    }
+    let l2_ptr = addr_of_mut!(S2_L2) as *mut u64;
+    // SAFETY: idx bounded to 0..512.
+    let entry = unsafe { l2_ptr.add(idx).read() };
+    if entry & DESC_VALID == 0 {
+        return;
+    }
+    let new = entry & !(1u64 << 54);
+    if new != entry {
+        // SAFETY: writing a block descriptor with a tighter /
+        // identical permission.
+        unsafe { l2_ptr.add(idx).write(new); }
+        // Flush stage-2 TLB for this VMID and inner-shareable so the
+        // guest's next instruction fetch sees the new permission.
+        unsafe {
+            core::arch::asm!(
+                "dsb ish",
+                "tlbi vmalls12e1is",
+                "dsb ish",
+                "isb",
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+}
+
 /// Write a contiguous range of stage-2 L2 block descriptors that identity
 /// (or non-identity) map `count` × 2 MiB blocks starting at IPA
 /// `ipa_base`, all backed by host PA starting at `host_pa_base`, with
@@ -185,7 +224,12 @@ pub unsafe fn init() {
         );
     }
 
-    // RAM: 4 MiB read-write at guest PA 0x0400_0000.
+    // RAM: 4 MiB read-write at guest PA 0x0400_0000. Marked XN
+    // initially — the shadow-stub mechanism flips XN off on the
+    // first instruction abort in each 2 MiB block, after scanning
+    // and patching every byte/halfword access in that block
+    // (src/shadow_stub.rs::handle_ram_fetch_fault). Copy-from-ROM
+    // RAM-resident code wouldn't otherwise see byte-access stubs.
     let ram_pa = guest_mem::ram_host_pa();
     // SAFETY: as above.
     unsafe {
@@ -193,16 +237,17 @@ pub unsafe fn init() {
             RAM_IPA_BASE,
             ram_pa,
             RAM_IPA_SIZE / TWO_MIB,
-            BLOCK_NORMAL_RW,
+            BLOCK_NORMAL_RW | S2_XN_NEVER,
         );
         // Mirror of the same 4 MiB at IPA 0x0C00_0000 so the guest's
         // VA=PA accesses to the kernel RAM window work before its
         // own stage-1 MMU comes up. Backing is the SAME bytes.
+        // Mirror gets the same XN treatment.
         set_l2_blocks(
             RAM_MIRROR_IPA_BASE,
             ram_pa,
             RAM_IPA_SIZE / TWO_MIB,
-            BLOCK_NORMAL_RW,
+            BLOCK_NORMAL_RW | S2_XN_NEVER,
         );
     }
 
@@ -224,15 +269,24 @@ pub unsafe fn init() {
     // SAFETY: see the called helper's contract.
     unsafe { install_tick_page(); }
 
-    // Shadow-stub pool (2 MiB). Writable at stage-2 is harmless (only
-    // EL2 writes into it via the host backing), and executable-from-
-    // guest is the whole point. 2 MiB block aligned.
-    let stub_pa = shadow_stub::pool_host_pa();
-    // SAFETY: helper bounds-checks.
+    // Shadow-stub pool A (2 MiB) — ROM-reach stubs at 0x01800000.
+    // Pool B (2 MiB) — RAM-reach stubs at 0x03000000. Both map 2 MiB
+    // blocks of the combined shadow_stub backing. Writable is harmless
+    // (only EL2 writes via the host backing) and executable-from-guest
+    // is the whole point.
+    let stub_pa_a = shadow_stub::pool_host_pa();
+    let stub_pa_b = shadow_stub::pool_b_host_pa();
+    // SAFETY: helpers bounds-check.
     unsafe {
         set_l2_blocks(
             shadow_stub::STUB_POOL_IPA as u64,
-            stub_pa,
+            stub_pa_a,
+            (shadow_stub::STUB_POOL_SIZE as u64) / TWO_MIB,
+            BLOCK_NORMAL_RW,
+        );
+        set_l2_blocks(
+            shadow_stub::STUB_POOL_B_IPA as u64,
+            stub_pa_b,
             (shadow_stub::STUB_POOL_SIZE as u64) / TWO_MIB,
             BLOCK_NORMAL_RW,
         );
@@ -292,10 +346,16 @@ pub unsafe fn init() {
         FB_IPA_SIZE / (1024 * 1024)
     );
     kprintln!(
-        "stage2: shadow-stub pool @ IPA {:#x}..{:#x} -> host PA {:#x} (RW, {} MiB)",
+        "stage2: shadow-stub pool A @ IPA {:#x}..{:#x} -> host PA {:#x} (RW, {} MiB)",
         shadow_stub::STUB_POOL_IPA,
         shadow_stub::STUB_POOL_IPA as u64 + shadow_stub::STUB_POOL_SIZE as u64,
-        stub_pa, shadow_stub::STUB_POOL_SIZE / (1024 * 1024)
+        stub_pa_a, shadow_stub::STUB_POOL_SIZE / (1024 * 1024)
+    );
+    kprintln!(
+        "stage2: shadow-stub pool B @ IPA {:#x}..{:#x} -> host PA {:#x} (RW, {} MiB)",
+        shadow_stub::STUB_POOL_B_IPA,
+        shadow_stub::STUB_POOL_B_IPA as u64 + shadow_stub::STUB_POOL_SIZE as u64,
+        stub_pa_b, shadow_stub::STUB_POOL_SIZE / (1024 * 1024)
     );
     kprintln!("stage2: all other IPAs fault to EL2");
 }

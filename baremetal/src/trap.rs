@@ -483,11 +483,71 @@ fn handle_instruction_abort(iss: u32) {
     let hpfar = read_sysreg!("hpfar_el2");
     let ipa = ((hpfar >> 4) << 12) | (far & 0xFFF);
     let elr = read_sysreg!("elr_el2");
+
+    // Lazy shadow-stub discovery for RAM-resident code.
+    //
+    // RAM is mapped XN at stage-2 so the first fetch into any 2 MiB
+    // RAM block traps here. We scan the block for byte/halfword
+    // accesses, install stubs, and flip XN off on that block. ERET
+    // retries the fetch, which now succeeds.
+    //
+    // IFSC values (ISS bits [5:0]) we care about:
+    //   0b000101  Translation fault, level 1 (page isn't mapped)
+    //   0b001111  Permission fault, level 3 (XN)
+    //   0b001110..0b001111 various permission-fault levels
+    // We act on any permission fault whose IPA is inside a RAM range.
+    let ifsc = (iss & 0x3f) as u32;
+    let is_permission = (ifsc & 0b111100) == 0b001100; // 0x0C..0x0F
+    let ram_base = guest_mem::RAM_IPA_BASE as u64;
+    let ram_end = ram_base + guest_mem::RAM_SIZE as u64;
+    let mirror_base = 0x0C00_0000u64;
+    let mirror_end = mirror_base + guest_mem::RAM_SIZE as u64;
+    let in_ram = (ram_base..ram_end).contains(&ipa)
+        || (mirror_base..mirror_end).contains(&ipa);
+
+    if is_permission && in_ram {
+        // Map mirror IPA back to the RAM IPA space for scanning — the
+        // mirror shares the same backing but the stub emitter writes
+        // via code_write_word which only knows the canonical RAM
+        // range.
+        let scan_ipa = if (mirror_base..mirror_end).contains(&ipa) {
+            (ipa - mirror_base + ram_base) as u32
+        } else {
+            ipa as u32
+        };
+
+        // Align down to the 2 MiB block boundary; scan the entire
+        // block so subsequent fetches within it don't re-fault.
+        let block_size = 0x0020_0000u32;
+        let block_start = scan_ipa & !(block_size - 1);
+        let block_end = block_start.wrapping_add(block_size);
+
+        kprintln!(
+            "shadow_stub: lazy RAM patch — block {:#x}..{:#x} (fetch at {:#x})",
+            block_start, block_end, ipa
+        );
+        let stats = shadow_stub::patch_code_range(block_start, block_end);
+        shadow_stub::log_stats(&stats);
+
+        // Flip XN off on the RAM block AND its mirror so both aliases
+        // become fetch-able.
+        // SAFETY: stage2 TLB maintenance done inside the helper.
+        unsafe {
+            crate::stage2::clear_xn_for_block(block_start);
+            let mirror_block = (mirror_base as u32)
+                .wrapping_add(block_start - (ram_base as u32));
+            crate::stage2::clear_xn_for_block(mirror_block);
+        }
+
+        // Retry the fetch — don't advance ELR, just return.
+        return;
+    }
+
     kprintln!();
     kprintln!("*** instruction abort from lower EL (no silent skip per Phase A) ***");
     kprintln!(
         "  ELR={:#x}  FAR_EL2={:#x}  IPA={:#x}  IFSC={:#x}",
-        elr, far, ipa, iss & 0x3f
+        elr, far, ipa, ifsc
     );
     kprintln!(
         "  (guest tried to fetch an instruction at an IPA our stage-2 doesn't map."

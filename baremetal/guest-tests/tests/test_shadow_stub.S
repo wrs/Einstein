@@ -130,6 +130,7 @@ test_main:
     bl      subtest_16_sp_post_index
     bl      subtest_17_swpb
     bl      subtest_18_ldrd_verify
+    bl      subtest_20_ram_resident
     bl      subtest_19_abort_transparency
 
     pop     {r4-r11, lr}
@@ -630,6 +631,79 @@ subtest_18_ldrd_verify:
     hvc     #2
     fail_st 18
 
+    @ ---- subtest 20: RAM-resident code ---------------------------
+    @ Copies a small helper function from ROM into RAM, calls it, and
+    @ verifies that the LDRB inside the RAM-resident copy produces
+    @ the BE-32-correct byte. This exercises item 5 (lazy stage-2
+    @ discovery): RAM pages are XN initially, first fetch triggers a
+    @ stage-2 instruction abort, the hypervisor scans the 2 MiB RAM
+    @ block for byte/halfword accesses, installs stubs, and flips XN
+    @ off on that block.
+subtest_20_ram_resident:
+    push    {r4, r5, r6, r7, r8, r9, lr}
+    @ Source: ram_helper in ROM. Destination: 0x04002000 in RAM (far
+    @ enough from stack and other scratch to be in its own 2 MiB
+    @ block — actually same 2 MiB as RAM base since RAM is 4 MiB. Use
+    @ 0x04300000 to force a fresh block (still within 4 MiB RAM).
+    load_sym r4, ram_helper
+    load_sym r5, ram_helper_end
+    load_u32 r6, 0x04300000
+    mov     r7, r6
+.Lst20_copy_loop:
+    ldr     r8, [r4], #4
+    str     r8, [r6], #4
+    cmp     r4, r5
+    bne     .Lst20_copy_loop
+
+    @ Flush D-cache so the just-copied bytes are visible for
+    @ instruction fetch, invalidate I-cache.
+    mov     r8, r7
+.Lst20_dcache:
+    mcr     p15, 0, r8, c7, c10, 1      @ DCCMVAC: clean DC by MVA
+    add     r8, r8, #32
+    cmp     r8, r6
+    blo     .Lst20_dcache
+    mov     r8, r7
+.Lst20_icache:
+    mcr     p15, 0, r8, c7, c5, 1       @ ICIMVAU
+    add     r8, r8, #32
+    cmp     r8, r6
+    blo     .Lst20_icache
+    dsb
+    isb
+
+    @ Store a known word at SCRATCH_BASE. The RAM-resident helper
+    @ will LDRB it and return the byte in r0.
+    load_u32 r4, SCRATCH_BASE
+    load_u32 r5, 0xC0DEF00D
+    str     r5, [r4]
+
+    @ Call the RAM-resident helper. It expects r4 = address,
+    @ r1 = byte offset; returns r0 = loaded byte.
+    mov     r1, #0                      @ offset 0 -> phys[addr+3] = 0xC0
+    blx     r7
+    cmp     r0, #0xC0
+    bne     .Lst20_fail
+
+    mov     r1, #1                      @ offset 1 -> phys[addr+2] = 0xDE
+    blx     r7
+    cmp     r0, #0xDE
+    bne     .Lst20_fail
+
+    mov     r1, #3                      @ offset 3 -> phys[addr+0] = 0x0D
+    blx     r7
+    cmp     r0, #0x0D
+    bne     .Lst20_fail
+
+    pop     {r4, r5, r6, r7, r8, r9, lr}
+    bx      lr
+.Lst20_fail:
+    mov     r10, r0
+    pop     {r4, r5, r6, r7, r8, r9, lr}
+    mov     r0, r10
+    hvc     #2
+    fail_st 20
+
     @ ---- subtest 19: abort transparency --------------------------
     @ Performs a PATCHED LDRB whose target IPA is unmapped at stage-2.
     @ The stub triggers a stage-2 fault while executing the inner
@@ -704,6 +778,18 @@ subtest_19_abort_transparency:
     .global patch_end
 patch_end:
     .ltorg                              @ flush any pending literals OUTSIDE
+
+    @ === RAM-resident helper template (outside patch range) =======
+    @ Copied verbatim to RAM by subtest 20. The copy lives in RAM
+    @ where it's picked up by the lazy-RAM-patch path as a new 2 MiB
+    @ block gets unXN'd on first fetch.
+    @   r4 = base address
+    @   r1 = byte offset
+    @   returns: r0 = byte at [r4 + r1]
+ram_helper:
+    ldrb    r0, [r4, r1]
+    bx      lr
+ram_helper_end:
 
     @ === Abort handler (outside patch range) =======================
     @ The shadow_stub scanner is called with [patch_start, patch_end),

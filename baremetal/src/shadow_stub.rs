@@ -49,10 +49,16 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::kprintln;
 
-/// IPA where the stub pool is mapped into the guest's address space.
-/// Chosen to sit inside the +-32 MiB reach of any ARM `B` instruction
-/// from anywhere in the 0..16 MiB ROM region.
+/// Two stub pools cover the full guest-code address range:
+///   Pool A at 0x01800000 reaches ROM  [0x00000000..0x01000000]
+///                                + flash bank 0 [0x02000000..0x02400000].
+///   Pool B at 0x03000000 reaches RAM  [0x04000000..0x04400000]
+///                                + the RAM mirror [0x0C000000..0x0C400000].
+/// Each pool is 2 MiB (one stage-2 block descriptor) and they share a
+/// single backing buffer for simplicity — pool B lives at offset
+/// STUB_POOL_SIZE within the buffer.
 pub const STUB_POOL_IPA: u32 = 0x0180_0000;
+pub const STUB_POOL_B_IPA: u32 = 0x0300_0000;
 
 /// Stub-pool size. 2 MiB = 1 stage-2 block descriptor.
 pub const STUB_POOL_SIZE: usize = 2 * 1024 * 1024;
@@ -76,50 +82,83 @@ pub const STUB_RETURN_PC_OFF: usize = STUB_SLOT_SIZE - 8;
 /// Byte offset within a slot of the scratch save slot (last word).
 pub const STUB_SAVE_SLOT_OFF: usize = STUB_SLOT_SIZE - 4;
 
-/// Pool capacity — number of stubs that fit.
+/// Per-pool capacity — number of stubs that fit.
 pub const STUB_POOL_CAPACITY: usize = STUB_POOL_SIZE / STUB_SLOT_SIZE;
 
+/// Total capacity across both pools. Slot indices are packed with pool
+/// A in [0..STUB_POOL_CAPACITY), pool B in [STUB_POOL_CAPACITY..TOTAL).
+pub const STUB_POOL_TOTAL_CAPACITY: usize = STUB_POOL_CAPACITY * 2;
+
 #[repr(C, align(0x200000))]
-struct StubPool([u8; STUB_POOL_SIZE]);
+struct StubPool([u8; STUB_POOL_SIZE * 2]);
 
-static mut STUB_POOL: StubPool = StubPool([0; STUB_POOL_SIZE]);
+static mut STUB_POOL: StubPool = StubPool([0; STUB_POOL_SIZE * 2]);
 
-/// How many slots have been handed out so far.
-static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
+/// How many slots have been handed out in pool A (ROM reach).
+static NEXT_SLOT_A: AtomicUsize = AtomicUsize::new(0);
+/// How many slots have been handed out in pool B (RAM reach).
+static NEXT_SLOT_B: AtomicUsize = AtomicUsize::new(0);
 
 /// Map from stub-slot index to the original guest PC that the stub was
 /// emitted for. Used by trap.rs when a data abort fires inside a stub:
 /// we un-XOR FAR_EL2 and retarget ELR_EL2 to the original PC so the
 /// guest's abort handler sees the state it expects.
 ///
-/// Entry is `u32::MAX` for unused slots.
-static mut SLOT_ORIGINAL_PC: [u32; STUB_POOL_CAPACITY] =
-    [u32::MAX; STUB_POOL_CAPACITY];
+/// Entry is `u32::MAX` for unused slots. Indexed by packed slot index
+/// (pool A entries at [0..STUB_POOL_CAPACITY), pool B at
+/// [STUB_POOL_CAPACITY..STUB_POOL_TOTAL_CAPACITY)).
+static mut SLOT_ORIGINAL_PC: [u32; STUB_POOL_TOTAL_CAPACITY] =
+    [u32::MAX; STUB_POOL_TOTAL_CAPACITY];
 
-/// Host physical base of the stub pool backing store.
+/// Host physical base of the stub pool A backing store.
 pub fn pool_host_pa() -> u64 {
     addr_of_mut!(STUB_POOL) as u64
 }
 
-/// Is `ipa` inside the shadow-stub pool range?
-pub fn is_stub_ipa(ipa: u32) -> bool {
+/// Host physical base of the stub pool B backing store (offset by
+/// one pool's worth from the base of the combined buffer).
+pub fn pool_b_host_pa() -> u64 {
+    addr_of_mut!(STUB_POOL) as u64 + STUB_POOL_SIZE as u64
+}
+
+/// Is `ipa` inside the shadow-stub pool A range?
+fn is_pool_a_ipa(ipa: u32) -> bool {
     ipa >= STUB_POOL_IPA
         && (ipa as usize) < (STUB_POOL_IPA as usize) + STUB_POOL_SIZE
 }
 
-/// Given an IPA inside the stub pool, return `(slot_index, byte_offset_in_slot)`.
+/// Is `ipa` inside the shadow-stub pool B range?
+fn is_pool_b_ipa(ipa: u32) -> bool {
+    ipa >= STUB_POOL_B_IPA
+        && (ipa as usize) < (STUB_POOL_B_IPA as usize) + STUB_POOL_SIZE
+}
+
+/// Is `ipa` inside either stub pool?
+pub fn is_stub_ipa(ipa: u32) -> bool {
+    is_pool_a_ipa(ipa) || is_pool_b_ipa(ipa)
+}
+
+/// Given an IPA inside either stub pool, return
+/// `(packed_slot_index, byte_offset_in_slot)`. Pool-A slots are packed
+/// at [0..STUB_POOL_CAPACITY), pool-B slots at
+/// [STUB_POOL_CAPACITY..STUB_POOL_TOTAL_CAPACITY).
 pub fn ipa_to_slot_offset(ipa: u32) -> Option<(usize, usize)> {
-    if !is_stub_ipa(ipa) {
-        return None;
+    if is_pool_a_ipa(ipa) {
+        let rel = (ipa - STUB_POOL_IPA) as usize;
+        return Some((rel / STUB_SLOT_SIZE, rel % STUB_SLOT_SIZE));
     }
-    let rel = (ipa - STUB_POOL_IPA) as usize;
-    Some((rel / STUB_SLOT_SIZE, rel % STUB_SLOT_SIZE))
+    if is_pool_b_ipa(ipa) {
+        let rel = (ipa - STUB_POOL_B_IPA) as usize;
+        return Some((STUB_POOL_CAPACITY + rel / STUB_SLOT_SIZE,
+                     rel % STUB_SLOT_SIZE));
+    }
+    None
 }
 
 /// Look up the original guest PC that owned the stub at this slot.
-/// Returns None if the slot is unused.
+/// Returns None if the slot is unused. `slot` is the packed index.
 pub fn slot_original_pc(slot: usize) -> Option<u32> {
-    if slot >= STUB_POOL_CAPACITY {
+    if slot >= STUB_POOL_TOTAL_CAPACITY {
         return None;
     }
     // SAFETY: slot bounded; single-threaded updates in patch_code_range.
@@ -134,11 +173,11 @@ pub fn slot_original_pc(slot: usize) -> Option<u32> {
 /// instruction (the only in-stub PC at which a data abort is expected).
 ///
 /// Entry is `u8::MAX` for unused slots.
-static mut SLOT_ACCESS_OFF: [u8; STUB_POOL_CAPACITY] =
-    [u8::MAX; STUB_POOL_CAPACITY];
+static mut SLOT_ACCESS_OFF: [u8; STUB_POOL_TOTAL_CAPACITY] =
+    [u8::MAX; STUB_POOL_TOTAL_CAPACITY];
 
 pub fn slot_access_offset(slot: usize) -> Option<usize> {
-    if slot >= STUB_POOL_CAPACITY { return None; }
+    if slot >= STUB_POOL_TOTAL_CAPACITY { return None; }
     // SAFETY: see SLOT_ORIGINAL_PC.
     let off = unsafe { SLOT_ACCESS_OFF[slot] };
     if off == u8::MAX { None } else { Some(off as usize) }
@@ -549,11 +588,11 @@ struct SlotMeta {
     xor_mask: u32,
 }
 
-static mut SLOT_META: [Option<SlotMeta>; STUB_POOL_CAPACITY] =
-    [None; STUB_POOL_CAPACITY];
+static mut SLOT_META: [Option<SlotMeta>; STUB_POOL_TOTAL_CAPACITY] =
+    [None; STUB_POOL_TOTAL_CAPACITY];
 
 pub fn slot_xor_mask(slot: usize) -> Option<u32> {
-    if slot >= STUB_POOL_CAPACITY { return None; }
+    if slot >= STUB_POOL_TOTAL_CAPACITY { return None; }
     // SAFETY: slot bounded; single-threaded writer.
     unsafe { SLOT_META[slot].map(|m| m.xor_mask) }
 }
@@ -668,11 +707,44 @@ fn build_stub(d: &Decoded, _stub_pc: u32, return_pc: u32,
     Ok(BuiltStub { words: idx, access_off })
 }
 
-fn pool_write_word(off: usize, word: u32) {
+fn pool_write_word(pool_b: bool, off: usize, word: u32) {
     assert!(off + 4 <= STUB_POOL_SIZE);
-    let host = pool_host_pa() as usize + off;
+    let host = if pool_b {
+        pool_b_host_pa() as usize + off
+    } else {
+        pool_host_pa() as usize + off
+    };
     // SAFETY: bounds-checked.
     unsafe { core::ptr::write_volatile(host as *mut u32, word); }
+}
+
+/// Pick the right stub pool for a given source IPA. ROM + flash
+/// bank 0 use pool A; RAM + mirror use pool B. Anything else halts.
+fn select_pool(source_ipa: u32) -> bool {
+    // Pool A reaches 0x00000000..about 0x03800000.
+    // Pool B reaches about 0x01000000..0x05000000.
+    // ROM < 0x01000000, flash0 0x02000000..0x02400000 -> pool A.
+    // RAM 0x04000000..0x04400000 -> pool B.
+    // Mirror 0x0C000000..0x0C400000 is FAR from both — won't work.
+    if (source_ipa as usize) < crate::guest_mem::ROM_SIZE {
+        return false; // pool A
+    }
+    let ram_base = crate::guest_mem::RAM_IPA_BASE;
+    let ram_end = ram_base + crate::guest_mem::RAM_SIZE as u32;
+    if source_ipa >= ram_base && source_ipa < ram_end {
+        return true; // pool B
+    }
+    // Flash bank 0.
+    if source_ipa >= 0x0200_0000 && source_ipa < 0x0240_0000 {
+        return false; // pool A
+    }
+    // Unsupported source — caller has already validated this is a
+    // code region, so halt.
+    kprintln!(
+        "shadow_stub: select_pool — unsupported source IPA {:#x}",
+        source_ipa
+    );
+    crate::cpu::halt();
 }
 
 /// Write `word` into a backing store that owns this IPA. Used to replace
@@ -732,6 +804,8 @@ pub fn patch_code_range(start_ipa: u32, end_ipa: u32) -> PatchStats {
     assert!(end_ipa & 3 == 0);
     assert!(end_ipa >= start_ipa);
 
+    let use_pool_b = select_pool(start_ipa);
+
     let mut stats = PatchStats::default();
     let mut pc = start_ipa;
     while pc < end_ipa {
@@ -766,15 +840,26 @@ pub fn patch_code_range(start_ipa: u32, end_ipa: u32) -> PatchStats {
             }
         }
 
-        let slot = NEXT_SLOT.fetch_add(1, Ordering::SeqCst);
-        if slot >= STUB_POOL_CAPACITY {
+        let (local_slot, stub_base_ipa) = if use_pool_b {
+            let s = NEXT_SLOT_B.fetch_add(1, Ordering::SeqCst);
+            (s, STUB_POOL_B_IPA)
+        } else {
+            let s = NEXT_SLOT_A.fetch_add(1, Ordering::SeqCst);
+            (s, STUB_POOL_IPA)
+        };
+        if local_slot >= STUB_POOL_CAPACITY {
             kprintln!(
-                "shadow_stub: ERROR - stub pool exhausted at PC {:#x} ({} stubs)",
-                pc, slot
+                "shadow_stub: ERROR - stub pool {} exhausted at PC {:#x} ({} stubs)",
+                if use_pool_b { "B" } else { "A" }, pc, local_slot
             );
             crate::cpu::halt();
         }
-        let stub_ipa = STUB_POOL_IPA + (slot * STUB_SLOT_SIZE) as u32;
+        let stub_ipa = stub_base_ipa + (local_slot * STUB_SLOT_SIZE) as u32;
+        let packed_slot = if use_pool_b {
+            STUB_POOL_CAPACITY + local_slot
+        } else {
+            local_slot
+        };
 
         let mut words = [0u32; STUB_SLOT_WORDS];
         let built = match build_stub(&decoded, stub_ipa, pc.wrapping_add(4), &mut words) {
@@ -799,17 +884,17 @@ pub fn patch_code_range(start_ipa: u32, end_ipa: u32) -> PatchStats {
             words[i] = 0xE7F0_00F0;
         }
 
-        let pool_off = slot * STUB_SLOT_SIZE;
+        let pool_off = local_slot * STUB_SLOT_SIZE;
         for (i, w) in words.iter().enumerate() {
-            pool_write_word(pool_off + i * 4, *w);
+            pool_write_word(use_pool_b, pool_off + i * 4, *w);
         }
 
         // Record slot metadata for abort transparency.
         // SAFETY: single-threaded callers; bounded slot.
         unsafe {
-            SLOT_ORIGINAL_PC[slot] = pc;
-            SLOT_ACCESS_OFF[slot] = built.access_off as u8;
-            SLOT_META[slot] = Some(SlotMeta { xor_mask: decoded.kind.xor_mask() });
+            SLOT_ORIGINAL_PC[packed_slot] = pc;
+            SLOT_ACCESS_OFF[packed_slot] = built.access_off as u8;
+            SLOT_META[packed_slot] = Some(SlotMeta { xor_mask: decoded.kind.xor_mask() });
         }
 
         // Patch original site.
@@ -833,9 +918,13 @@ pub fn patch_code_range(start_ipa: u32, end_ipa: u32) -> PatchStats {
         pc = pc.wrapping_add(4);
     }
 
-    let slots_used = NEXT_SLOT.load(Ordering::SeqCst);
-    if slots_used > 0 {
-        icache_sync_range(pool_host_pa(), slots_used * STUB_SLOT_SIZE);
+    let slots_used_a = NEXT_SLOT_A.load(Ordering::SeqCst);
+    if slots_used_a > 0 {
+        icache_sync_range(pool_host_pa(), slots_used_a * STUB_SLOT_SIZE);
+    }
+    let slots_used_b = NEXT_SLOT_B.load(Ordering::SeqCst);
+    if slots_used_b > 0 {
+        icache_sync_range(pool_b_host_pa(), slots_used_b * STUB_SLOT_SIZE);
     }
     // Sync the patched code region, whether ROM or RAM.
     if (end_ipa as usize) <= crate::guest_mem::ROM_SIZE {
@@ -857,12 +946,12 @@ pub fn log_stats(stats: &PatchStats) {
     kprintln!(
         "shadow_stub: scanned {} words, patched {} insns \
          (LDRB/STRB={}, LDRH/STRH={}, LDRSB/LDRSH={}, SWPB={}), \
-         skipped {} PC-operand, pool slots used {} / {}",
+         skipped {} PC-operand, pool A {}/{}, pool B {}/{}",
         stats.words_scanned, stats.patched,
         stats.ldrb_strb, stats.ldrh_strh, stats.ldrsb_ldrsh, stats.swpb,
         stats.skipped_pc_operand,
-        NEXT_SLOT.load(Ordering::SeqCst),
-        STUB_POOL_CAPACITY,
+        NEXT_SLOT_A.load(Ordering::SeqCst), STUB_POOL_CAPACITY,
+        NEXT_SLOT_B.load(Ordering::SeqCst), STUB_POOL_CAPACITY,
     );
 }
 

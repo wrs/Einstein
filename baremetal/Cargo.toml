@@ -9,6 +9,25 @@ description = "Bare-metal hypervisor for running Newton 2.x ROMs natively on Cor
 name = "newton-hypervisor"
 path = "src/main.rs"
 
+[features]
+# Function-level execution trace. When enabled, build.rs parses
+# ../_Data_/unified_symbols.tsv and embeds a compact address + name
+# table; at ROM load time each word-aligned function entry whose first
+# instruction matches a known ARM prologue is overwritten with
+# `UDF #index` (0xE7F1_xxxx) and the original word is stashed in an
+# EL2-side table. The UND handler logs the function name, restores
+# the original instruction, invalidates the icache line, and rewinds
+# ELR — so each function logs once per boot ("first-touch" trace).
+# Off by default because the symbol blob adds ~400 KiB to the image
+# and mutates the ROM in ways that invalidate existing snapshots.
+trace = []
+
+# Silence recurring diagnostic logs that dominate the console during
+# phase-B development (stage-1 XN re-walks on every MMU toggle, etc.).
+# Off by default; enable with `--features quiet` alongside `trace` to
+# get a clean function-trace log.
+quiet = []
+
 [profile.dev]
 panic = "abort"
 opt-level = 1

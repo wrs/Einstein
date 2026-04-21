@@ -279,7 +279,7 @@ pub fn fix_stage1_xn_bits() {
     // the serial when the kernel re-enables stage-1 on every task
     // switch and we re-walk idempotently.
     if sections_patched != 0 || patched != 0 || fine_to_fault != 0 {
-        kprintln!(
+        crate::dprintln!(
             "fix_stage1_xn_bits: {} sections de-XN'd, {} L2 tables walked, {} L2 entries de-XN'd, {} fine -> fault",
             sections_patched, l2_tables, patched, fine_to_fault
         );
@@ -600,6 +600,11 @@ pub unsafe fn load_newton_rom() {
         "guest_mem: rewrote {} CP15 c1/c2/c3/c5/c6 encodings (StrongARM CRm=n -> ARMv7 CRm=0)",
         patched
     );
+
+    // Register the tracer; actual ROM patching is deferred until the
+    // guest turns on its stage-1 MMU (see src/tracer.rs for why).
+    #[cfg(feature = "trace")]
+    crate::tracer::init();
 }
 
 /// Install the AArch32 UND-vector trampoline.

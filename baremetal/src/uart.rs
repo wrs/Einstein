@@ -98,3 +98,22 @@ macro_rules! kprintln {
         let _ = writeln!($crate::uart::Writer, $($arg)*);
     }};
 }
+
+/// Debug-log variant of `kprintln!` for recurring diagnostic messages
+/// that dominate the console during phase-B bring-up (e.g., per-trap
+/// ELR logs, stage-1 walk summaries, SCTLR writes). Expands to the
+/// regular `kprintln!` by default and to a no-op when the `quiet`
+/// feature is enabled.
+#[cfg(not(feature = "quiet"))]
+#[macro_export]
+macro_rules! dprintln {
+    () => { $crate::kprintln!(); };
+    ($($arg:tt)*) => { $crate::kprintln!($($arg)*); };
+}
+
+#[cfg(feature = "quiet")]
+#[macro_export]
+macro_rules! dprintln {
+    () => {};
+    ($($arg:tt)*) => {{ let _ = format_args!($($arg)*); }};
+}

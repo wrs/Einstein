@@ -504,6 +504,16 @@ fn handle_und(ctx: &mut TrapContext) {
             emulate_swp(ctx, insn, faulting_pc);
             return_to_guest(ctx, (faulting_pc + 4) as u64, spsr_und);
         }
+        #[cfg(feature = "trace")]
+        _ if (insn & 0xFFF0_00F0) == 0xE7F0_00F0 => {
+            if !crate::tracer::handle_trace_und(ctx, faulting_pc, spsr_und, insn) {
+                kprintln!(
+                    "*** trace: UDF-shaped insn at PC={:#x} not handled by tracer (insn={:#010x})",
+                    faulting_pc, insn
+                );
+                cpu::halt();
+            }
+        }
         _ => {
             kprintln!(
                 "*** unrecognised UND: insn={:#010x} at PC={:#x} SPSR_und={:#x}",
@@ -994,6 +1004,11 @@ fn emulate_swp(ctx: &mut TrapContext, insn: u32, faulting_pc: u32) {
     log_swp_budgeted(faulting_pc, is_byte, rn, rd, rm, addr);
 }
 
+#[cfg(feature = "trace")]
+pub(crate) fn return_to_guest_trace(ctx: &mut TrapContext, elr: u64, spsr: u64) {
+    return_to_guest(ctx, elr, spsr);
+}
+
 fn return_to_guest(_ctx: &mut TrapContext, elr: u64, spsr: u64) {
     // SAFETY: writing EL2 sysregs; restore tail ERETs using these values.
     unsafe {
@@ -1266,6 +1281,14 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
             if was_off && now_on {
                 guest_mem::fix_stage1_xn_bits();
                 maybe_dump_l1_once();
+                // Install function-tracing UDFs now that the guest's
+                // stage-1 L1 maps VA 0x0C00_4F00 to the UND-trampoline
+                // save slot. Earlier patches would lose LR_und and
+                // land the handler at a bogus PC. Idempotent: the
+                // tracer gates itself on a one-shot flag.
+                #[cfg(feature = "trace")]
+                // SAFETY: single-threaded EL2 trap context.
+                unsafe { crate::tracer::enable_patches(); }
             }
         }
         (0, 2, 0, 0, false) => {

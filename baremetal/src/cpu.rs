@@ -57,6 +57,28 @@ read_sysreg!(id_aa64isar0_el1, "ID_AA64ISAR0_EL1");
 read_sysreg!(midr_el1, "MIDR_EL1");
 read_sysreg!(hcr_el2, "HCR_EL2");
 
+/// Invalidate one icache line by virtual address (`IC IVAU`) and fence.
+/// The VA must be accessible to EL2 — on our setup EL2's stage-1 identity
+/// map covers the host view of the ROM backing, so passing the host VA
+/// of the patched word works. A53's icache is PIPT so invalidating via
+/// the host VA invalidates any guest alias to the same PA.
+#[cfg(feature = "trace")]
+#[inline]
+pub fn ic_ivau(va: u64) {
+    // SAFETY: cache maintenance; `dsb ish` + `isb` fence the effect.
+    unsafe {
+        core::arch::asm!(
+            "dc cvau, {va}",
+            "dsb ish",
+            "ic ivau, {va}",
+            "dsb ish",
+            "isb",
+            va = in(reg) va,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// Low-power wait loop. Never returns.
 pub fn halt() -> ! {
     loop {

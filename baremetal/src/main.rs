@@ -14,6 +14,8 @@ mod peripherals;
 mod snapshot;
 mod stage2;
 mod timer;
+#[cfg(feature = "trace")]
+mod tracer;
 mod trap;
 pub mod uart;
 

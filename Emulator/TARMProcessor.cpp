@@ -470,6 +470,12 @@ TARMProcessor::DoSWI(void)
 void
 TARMProcessor::PrefetchAbort(void)
 {
+	// Record before we mutate mode/regs. R15 at entry = faulting_pc + 4 for
+	// prefetch abort per ARMv7 convention; IFSR lives in the MMU's FSR slot.
+	probe_record_prefetch_abort(
+		mCurrentRegisters[kR15] - 4,
+		mMemory->GetFaultStatusRegister(),
+		(KUInt32) mMode);
 	BackupBankRegisters();
 	mSPSRabt = GetCPSR();
 	// mR14abt_Bkup = address of the aborted instruction + 4
@@ -535,6 +541,13 @@ TARMProcessor::DataAbort(void)
 	 Data Abort at 0x002ddf34
 	 Data Abort at 0x002595c0
 	 */
+	// Record before we mutate mode/regs. R15 at entry = faulting_pc + 8 for
+	// data abort per ARMv7 convention.
+	probe_record_data_abort(
+		mCurrentRegisters[kR15] - 8,
+		mMemory->GetFaultAddressRegister(),
+		mMemory->GetFaultStatusRegister(),
+		(KUInt32) mMode);
 	BackupBankRegisters();
 	mSPSRabt = GetCPSR();
 	// mR14abt_Bkup = address of the aborted instruction + 8

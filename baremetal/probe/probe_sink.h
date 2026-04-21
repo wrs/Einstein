@@ -34,6 +34,17 @@ void probe_record_mode(uint32_t pc, uint32_t old_mode, uint32_t new_mode);
 /// image itself after the MMU has remapped ROM windows into RAM.
 void probe_record_rom_write(uint32_t pc, uint32_t vaddr, uint32_t value);
 
+/// Guest data abort. `pc` is the faulting instruction address (R15 - 8 at
+/// abort entry per ARMv7 convention), `far`/`fsr` the fault address and
+/// fault status registers at that moment, `mode` the CPSR mode[4:0] value
+/// of the mode the CPU was in when the abort was taken.
+void probe_record_data_abort(uint32_t pc, uint32_t far, uint32_t fsr, uint32_t mode);
+
+/// Guest prefetch abort. `pc` is the faulting instruction address
+/// (R15 - 4 at abort entry per ARMv7 convention), `ifsr` the instruction
+/// fault status register, `mode` the pre-abort CPSR mode[4:0].
+void probe_record_prefetch_abort(uint32_t pc, uint32_t ifsr, uint32_t mode);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
@@ -45,6 +56,8 @@ void probe_record_rom_write(uint32_t pc, uint32_t vaddr, uint32_t value);
 #define probe_record_swp(pc, is_byte) ((void) 0)
 #define probe_record_mode(pc, old_mode, new_mode) ((void) 0)
 #define probe_record_rom_write(pc, vaddr, value) ((void) 0)
+#define probe_record_data_abort(pc, far, fsr, mode) ((void) 0)
+#define probe_record_prefetch_abort(pc, ifsr, mode) ((void) 0)
 
 #endif
 

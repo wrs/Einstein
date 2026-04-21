@@ -326,6 +326,16 @@ if ( ${CMAKE_SYSTEM_NAME} STREQUAL "Darwin" )
 		${test_sources}
 		${cmake_sources}
 	)
+	# Headless instrumentation harness for the bare-metal port, same as in
+	# the Linux block below. Reuses ${common_sources} so the emulator/JIT/MMU
+	# are identical to a normal Einstein run; swaps the app main for
+	# baremetal/probe/probe.cpp and enables NEWTON_PROBE_INSTRUMENT=1 which
+	# toggles the probe_record_* hooks in TARMProcessor / JIT templates.
+	add_executable ( NewtonProbe
+		${common_sources}
+		${cmake_sources}
+		baremetal/probe/probe.cpp
+	)
 	if ( EINSTEIN_FLTK_FRONTEND )
 		add_library ( EinsteinFLGUI STATIC
 			${fluid_sources}
@@ -338,6 +348,10 @@ if ( ${CMAKE_SYSTEM_NAME} STREQUAL "Darwin" )
 	)
 	target_compile_options( EinsteinTests PUBLIC
 		-Wall -Wextra -Wpedantic -Wno-missing-field-initializers -Werror
+	)
+	target_compile_options( NewtonProbe PUBLIC
+		-Wall -Wno-multichar -Wno-misleading-indentation -Wno-unused-result
+		-Wno-missing-field-initializers -Wno-stringop-truncation
 	)
 	if ( EINSTEIN_FLTK_FRONTEND )
 		target_compile_options( EinsteinFLGUI PUBLIC
@@ -359,6 +373,14 @@ if ( ${CMAKE_SYSTEM_NAME} STREQUAL "Darwin" )
 	target_compile_definitions ( EinsteinTests PRIVATE
 		TARGET_UI_FLTK=1 NO_PORT_AUDIO NO_X11 TARGET_OS_OPENSTEP=1
 		TARGET_OS_MAC=1 NS_BLOCK_ASSERTIONS=1
+	)
+	# NewtonProbe is headless — no FLTK frontend. Defining TARGET_UI_FLTK=1
+	# would require the fluid-generated app/FLTK/TFL*.h files which live
+	# only in EinsteinFLGUI, a dep we don't want for a probe-only link.
+	target_compile_definitions ( NewtonProbe PRIVATE
+		NO_PORT_AUDIO NO_X11 TARGET_OS_OPENSTEP=1
+		TARGET_OS_MAC=1 NS_BLOCK_ASSERTIONS=1
+		NEWTON_PROBE_MAIN=1 NEWTON_PROBE_INSTRUMENT=1
 	)
 	if ( EINSTEIN_FLTK_FRONTEND )
 		target_compile_definitions ( EinsteinFLGUI PRIVATE
@@ -407,6 +429,15 @@ if ( ${CMAKE_SYSTEM_NAME} STREQUAL "Darwin" )
 			fltk::fltk fltk::images fltk::png fltk::z
 		)
   	endif ()
+	target_link_libraries ( NewtonProbe
+		${system_libs}
+		pthread
+		"-framework AddressBook"
+		"-framework AudioUnit"
+		"-framework AppKit"
+		"-framework CoreAudio"
+		"-framework Cocoa"
+	)
 
 	set_target_properties ( Einstein PROPERTIES
 		MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/Resources/macOS/Info.plist.in"
@@ -666,6 +697,19 @@ if ( EINSTEIN_FLTK_FRONTEND )
 		EinsteinFLGUI PUBLIC
 		${CMAKE_SOURCE_DIR}
 		${FLTK_INCLUDE_DIRS}
+	)
+endif ()
+if ( TARGET NewtonProbe )
+	# The probe reuses ${common_sources} so it needs the same include root
+	# as Einstein does — source-tree absolute paths like
+	# <K/Defines/KDefinitions.h> resolve against CMAKE_SOURCE_DIR.
+	target_include_directories (
+		NewtonProbe PUBLIC
+		${CMAKE_SOURCE_DIR}
+		${FLTK_INCLUDE_DIRS}
+	)
+	target_compile_definitions ( NewtonProbe PUBLIC
+		"$<$<CONFIG:DEBUG>:_DEBUG>" USE_CMAKE
 	)
 endif ()
 

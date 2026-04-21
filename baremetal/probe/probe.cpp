@@ -19,6 +19,7 @@
 #include <set>
 #include <thread>
 #include <tuple>
+#include <vector>
 
 #include "Emulator/TEmulator.h"
 #include "Emulator/TMMU.h"
@@ -81,6 +82,53 @@ std::map<ModeKey, ModeVal> mode_transitions;
 // transition, so mode_stays[m] is "entries into mode m".
 std::map<uint32_t, uint64_t> mode_entries;
 
+// Data aborts. Two views:
+// - `dabort_by_pc`: counts per faulting PC (so a spin-in-one-place shows as
+//   one big count instead of flooding the chronological list).
+// - `dabort_first`: the first `kDabortCap` aborts in order, with full
+//   context. This is the boot-time diagnostic — if we're trying to find
+//   where Einstein diverges from another emulator, the first handful of
+//   aborts are what matter.
+struct DabortKey {
+	uint32_t pc;
+	uint32_t far;
+	uint32_t fsr;
+	uint32_t mode;
+	bool operator<(const DabortKey& o) const {
+		return std::tie(pc, far, fsr, mode) < std::tie(o.pc, o.far, o.fsr, o.mode);
+	}
+};
+std::map<DabortKey, uint64_t> dabort_by_key;
+struct DabortEvent {
+	uint64_t seq;
+	uint32_t pc;
+	uint32_t far;
+	uint32_t fsr;
+	uint32_t mode;
+};
+constexpr size_t kDabortCap = 64;
+std::vector<DabortEvent> dabort_first;
+uint64_t dabort_total { 0 };
+
+// Prefetch aborts (instruction fetch faults): same shape, fewer fields.
+struct PabortKey {
+	uint32_t pc;
+	uint32_t ifsr;
+	uint32_t mode;
+	bool operator<(const PabortKey& o) const {
+		return std::tie(pc, ifsr, mode) < std::tie(o.pc, o.ifsr, o.mode);
+	}
+};
+std::map<PabortKey, uint64_t> pabort_by_key;
+struct PabortEvent {
+	uint64_t seq;
+	uint32_t pc;
+	uint32_t ifsr;
+	uint32_t mode;
+};
+std::vector<PabortEvent> pabort_first;
+uint64_t pabort_total { 0 };
+
 } // namespace probe_state
 
 extern "C" void probe_record_cp15(uint32_t pc, uint32_t cpopc, uint32_t crn,
@@ -111,6 +159,28 @@ extern "C" void probe_record_mode(uint32_t pc, uint32_t old_mode, uint32_t new_m
 
 extern "C" void probe_record_rom_write(uint32_t, uint32_t, uint32_t) {
 	// Not wired to any emitter yet; keeping the symbol for the header.
+}
+
+extern "C" void probe_record_data_abort(uint32_t pc, uint32_t far,
+	uint32_t fsr, uint32_t mode) {
+	std::lock_guard<std::mutex> lock(probe_state::mu);
+	probe_state::dabort_by_key[probe_state::DabortKey{pc, far, fsr, mode}]++;
+	if (probe_state::dabort_first.size() < probe_state::kDabortCap) {
+		probe_state::dabort_first.push_back(
+			{probe_state::dabort_total, pc, far, fsr, mode});
+	}
+	probe_state::dabort_total++;
+}
+
+extern "C" void probe_record_prefetch_abort(uint32_t pc, uint32_t ifsr,
+	uint32_t mode) {
+	std::lock_guard<std::mutex> lock(probe_state::mu);
+	probe_state::pabort_by_key[probe_state::PabortKey{pc, ifsr, mode}]++;
+	if (probe_state::pabort_first.size() < probe_state::kDabortCap) {
+		probe_state::pabort_first.push_back(
+			{probe_state::pabort_total, pc, ifsr, mode});
+	}
+	probe_state::pabort_total++;
 }
 
 namespace {
@@ -169,6 +239,41 @@ void dump_instrumentation(FILE* f) {
 		std::fprintf(f, "  %s: %llu\n",
 			mode_name(m), static_cast<unsigned long long>(n));
 	}
+
+	std::fprintf(f, "\n=====> Data aborts: %llu total, %zu unique (pc,far,fsr,mode) tuples\n",
+		static_cast<unsigned long long>(probe_state::dabort_total),
+		probe_state::dabort_by_key.size());
+	std::fprintf(f, "first %zu aborts in order (seq : pc far fsr mode):\n",
+		probe_state::dabort_first.size());
+	for (const auto& e : probe_state::dabort_first) {
+		std::fprintf(f, "  #%-5llu  PC=0x%08X  FAR=0x%08X  FSR=0x%08X  mode=%s\n",
+			static_cast<unsigned long long>(e.seq),
+			e.pc, e.far, e.fsr, mode_name(e.mode));
+	}
+	std::fprintf(f, "aggregated by tuple (count : pc far fsr mode):\n");
+	for (const auto& [k, n] : probe_state::dabort_by_key) {
+		std::fprintf(f, "  %8llu  PC=0x%08X  FAR=0x%08X  FSR=0x%08X  mode=%s\n",
+			static_cast<unsigned long long>(n),
+			k.pc, k.far, k.fsr, mode_name(k.mode));
+	}
+
+	std::fprintf(f, "\n=====> Prefetch aborts: %llu total, %zu unique (pc,ifsr,mode) tuples\n",
+		static_cast<unsigned long long>(probe_state::pabort_total),
+		probe_state::pabort_by_key.size());
+	std::fprintf(f, "first %zu prefetch aborts in order:\n",
+		probe_state::pabort_first.size());
+	for (const auto& e : probe_state::pabort_first) {
+		std::fprintf(f, "  #%-5llu  PC=0x%08X  IFSR=0x%08X  mode=%s\n",
+			static_cast<unsigned long long>(e.seq),
+			e.pc, e.ifsr, mode_name(e.mode));
+	}
+	std::fprintf(f, "aggregated by tuple:\n");
+	for (const auto& [k, n] : probe_state::pabort_by_key) {
+		std::fprintf(f, "  %8llu  PC=0x%08X  IFSR=0x%08X  mode=%s\n",
+			static_cast<unsigned long long>(n),
+			k.pc, k.ifsr, mode_name(k.mode));
+	}
+
 	std::fprintf(f, "<===== End of instrumentation summary\n");
 }
 

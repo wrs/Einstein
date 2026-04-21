@@ -479,74 +479,12 @@ fn return_to_guest(_ctx: &mut TrapContext, elr: u64, spsr: u64) {
     }
 }
 
-/// Read a 32-bit guest word by guest PA. Returns None if the address
-/// doesn't land inside a backing store we know about (ROM / RAM). Used
-/// for reading the faulting instruction and UND-payload words out of
-/// ROM, and for the SWP load side when the target is in RAM. MMU-off
-/// paths (early ROM boot, guest tests) have VA == IPA == PA, which is
-/// the only case this helper handles; post-MMU-on use AT S12E1R first
-/// to translate VA -> PA.
-fn read_guest_word_pa(pa: u32) -> Option<u32> {
-    let pa = pa as usize;
-    if pa.checked_add(4)? > 0 && pa + 4 <= guest_mem::ROM_SIZE {
-        let host = (guest_mem::rom_host_pa() as usize) + pa;
-        // SAFETY: bounds-checked against the ROM backing store.
-        return Some(unsafe { core::ptr::read_volatile(host as *const u32) });
-    }
-    const RAM_BASE: usize = 0x0400_0000;
-    if (RAM_BASE..RAM_BASE + guest_mem::RAM_SIZE).contains(&pa)
-        && pa + 4 <= RAM_BASE + guest_mem::RAM_SIZE
-    {
-        let host = (guest_mem::ram_host_pa() as usize) + (pa - RAM_BASE);
-        // SAFETY: bounds-checked.
-        return Some(unsafe { core::ptr::read_volatile(host as *const u32) });
-    }
-    None
-}
-
-fn write_guest_word_pa(pa: u32, value: u32) -> bool {
-    let pa = pa as usize;
-    const RAM_BASE: usize = 0x0400_0000;
-    if (RAM_BASE..RAM_BASE + guest_mem::RAM_SIZE).contains(&pa)
-        && pa + 4 <= RAM_BASE + guest_mem::RAM_SIZE
-    {
-        let host = (guest_mem::ram_host_pa() as usize) + (pa - RAM_BASE);
-        // SAFETY: bounds-checked against RAM backing store.
-        unsafe {
-            core::ptr::write_volatile(host as *mut u32, value);
-        }
-        return true;
-    }
-    // Refuse writes to ROM / unmapped regions — SWP into ROM is a bug.
-    false
-}
-
-fn read_guest_byte_pa(pa: u32) -> Option<u8> {
-    let pa = pa as usize;
-    if pa < guest_mem::ROM_SIZE {
-        let host = (guest_mem::rom_host_pa() as usize) + pa;
-        return Some(unsafe { core::ptr::read_volatile(host as *const u8) });
-    }
-    const RAM_BASE: usize = 0x0400_0000;
-    if (RAM_BASE..RAM_BASE + guest_mem::RAM_SIZE).contains(&pa) {
-        let host = (guest_mem::ram_host_pa() as usize) + (pa - RAM_BASE);
-        return Some(unsafe { core::ptr::read_volatile(host as *const u8) });
-    }
-    None
-}
-
-fn write_guest_byte_pa(pa: u32, value: u8) -> bool {
-    let pa = pa as usize;
-    const RAM_BASE: usize = 0x0400_0000;
-    if (RAM_BASE..RAM_BASE + guest_mem::RAM_SIZE).contains(&pa) {
-        let host = (guest_mem::ram_host_pa() as usize) + (pa - RAM_BASE);
-        unsafe {
-            core::ptr::write_volatile(host as *mut u8, value);
-        }
-        return true;
-    }
-    false
-}
+// Guest-PA memory accessors live in guest_mem; this was an earlier
+// in-module stub. Use `guest_mem::read_word_pa` etc. directly.
+use guest_mem::{read_byte_pa as read_guest_byte_pa,
+                read_word_pa as read_guest_word_pa,
+                write_byte_pa as write_guest_byte_pa,
+                write_word_pa as write_guest_word_pa};
 
 fn log_und_budgeted(name: &str, pc: u32, payload: Option<u32>) {
     static mut UND_LOG_BUDGET: usize = 16;

@@ -17,7 +17,7 @@
 //! unknown code halts loudly with a full context dump so the next
 //! ROM boot that hits one points exactly at the missing table entry.
 
-use crate::{cpu, kprintln, trap::TrapContext};
+use crate::{cpu, kprintln, peripherals::screen, trap::TrapContext};
 
 /// Dispatch a native-primitive call.
 ///
@@ -45,6 +45,12 @@ pub fn execute(ctx: &mut TrapContext, native_insn: u32, pc: u32) {
         // an Einstein-hypervisor-only slot reserved for testing.
         (0x00_0000, 0x00) => {
             ctx.x[0] = 0;
+        }
+
+        // Screen-class: driver=4 -> TMainDisplayDriver method per
+        // subfn. See peripherals/screen.rs.
+        (d, s) if d == screen::DRIVER_ID => {
+            screen::handle(ctx, s, pc);
         }
 
         _ => {

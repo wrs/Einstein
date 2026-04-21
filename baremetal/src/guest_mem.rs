@@ -71,6 +71,102 @@ pub fn fb_host_pa() -> u64 {
     addr_of_mut!(GUEST_FB) as u64
 }
 
+/// Framebuffer guest IPA base (stage-2 maps this to `fb_host_pa`).
+pub const FB_IPA_BASE: u32 = 0x0E00_0000;
+/// Framebuffer size in bytes.
+pub const FB_SIZE: usize = FRAMEBUFFER_SIZE;
+
+/// Guest RAM IPA base (stage-2 maps this to `ram_host_pa`).
+pub const RAM_IPA_BASE: u32 = 0x0400_0000;
+
+const RAM_BASE_USIZE: usize = RAM_IPA_BASE as usize;
+const FB_BASE_USIZE: usize = FB_IPA_BASE as usize;
+
+/// Read a 32-bit word from a guest physical address by resolving the
+/// backing store directly. Returns None if `pa` is outside the ROM /
+/// RAM / framebuffer regions we own. Pre-MMU (VA == IPA == PA) this
+/// is exactly a guest load; post-MMU callers need to translate VA
+/// to PA first (e.g. via `AT S12E1R`).
+pub fn read_word_pa(pa: u32) -> Option<u32> {
+    let pa = pa as usize;
+    if pa + 4 <= ROM_SIZE {
+        let host = (rom_host_pa() as usize) + pa;
+        // SAFETY: bounds-checked against ROM backing.
+        return Some(unsafe { core::ptr::read_volatile(host as *const u32) });
+    }
+    if (RAM_BASE_USIZE..RAM_BASE_USIZE + RAM_SIZE).contains(&pa)
+        && pa + 4 <= RAM_BASE_USIZE + RAM_SIZE
+    {
+        let host = (ram_host_pa() as usize) + (pa - RAM_BASE_USIZE);
+        // SAFETY: bounds-checked.
+        return Some(unsafe { core::ptr::read_volatile(host as *const u32) });
+    }
+    if (FB_BASE_USIZE..FB_BASE_USIZE + FB_SIZE).contains(&pa)
+        && pa + 4 <= FB_BASE_USIZE + FB_SIZE
+    {
+        let host = (fb_host_pa() as usize) + (pa - FB_BASE_USIZE);
+        // SAFETY: bounds-checked.
+        return Some(unsafe { core::ptr::read_volatile(host as *const u32) });
+    }
+    None
+}
+
+/// Read one byte from a guest PA.
+pub fn read_byte_pa(pa: u32) -> Option<u8> {
+    let pa = pa as usize;
+    if pa < ROM_SIZE {
+        let host = (rom_host_pa() as usize) + pa;
+        return Some(unsafe { core::ptr::read_volatile(host as *const u8) });
+    }
+    if (RAM_BASE_USIZE..RAM_BASE_USIZE + RAM_SIZE).contains(&pa) {
+        let host = (ram_host_pa() as usize) + (pa - RAM_BASE_USIZE);
+        return Some(unsafe { core::ptr::read_volatile(host as *const u8) });
+    }
+    if (FB_BASE_USIZE..FB_BASE_USIZE + FB_SIZE).contains(&pa) {
+        let host = (fb_host_pa() as usize) + (pa - FB_BASE_USIZE);
+        return Some(unsafe { core::ptr::read_volatile(host as *const u8) });
+    }
+    None
+}
+
+/// Write a 32-bit word to a guest PA. Returns true on success. Writes
+/// to ROM (or unmapped regions) are refused — callers should halt on
+/// a false return if the write was supposed to succeed.
+pub fn write_word_pa(pa: u32, value: u32) -> bool {
+    let pa = pa as usize;
+    if (RAM_BASE_USIZE..RAM_BASE_USIZE + RAM_SIZE).contains(&pa)
+        && pa + 4 <= RAM_BASE_USIZE + RAM_SIZE
+    {
+        let host = (ram_host_pa() as usize) + (pa - RAM_BASE_USIZE);
+        unsafe { core::ptr::write_volatile(host as *mut u32, value); }
+        return true;
+    }
+    if (FB_BASE_USIZE..FB_BASE_USIZE + FB_SIZE).contains(&pa)
+        && pa + 4 <= FB_BASE_USIZE + FB_SIZE
+    {
+        let host = (fb_host_pa() as usize) + (pa - FB_BASE_USIZE);
+        unsafe { core::ptr::write_volatile(host as *mut u32, value); }
+        return true;
+    }
+    false
+}
+
+/// Write one byte to a guest PA. See `write_word_pa` for semantics.
+pub fn write_byte_pa(pa: u32, value: u8) -> bool {
+    let pa = pa as usize;
+    if (RAM_BASE_USIZE..RAM_BASE_USIZE + RAM_SIZE).contains(&pa) {
+        let host = (ram_host_pa() as usize) + (pa - RAM_BASE_USIZE);
+        unsafe { core::ptr::write_volatile(host as *mut u8, value); }
+        return true;
+    }
+    if (FB_BASE_USIZE..FB_BASE_USIZE + FB_SIZE).contains(&pa) {
+        let host = (fb_host_pa() as usize) + (pa - FB_BASE_USIZE);
+        unsafe { core::ptr::write_volatile(host as *mut u8, value); }
+        return true;
+    }
+    false
+}
+
 /// Walk the guest's stage-1 L1 table at TTBR=0x0400_0000 and, for every
 /// coarse L2 table we can reach, clear the XN (execute-never) bit on
 /// entries whose type field is large/small page.

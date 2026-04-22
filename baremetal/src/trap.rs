@@ -84,9 +84,19 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
     // DIAG: log the first N sync traps' EC + ELR + ESR, no dedup, so
     // we can see the guest PC timeline in the window leading up to a
     // stall. Remove once Phase B stall is past.
+    //
+    // When the `trace` feature is on, suppress the trap log for
+    // HVC #TRACE_TAG: the tracer's own `trace <seq> ...` line
+    // carries the same signal, and pairing each with a `trap: EC=...`
+    // line doubles the output volume for no added information.
+    #[cfg(feature = "trace")]
+    let is_trace_hvc = ec == EC_HVC_A32 && (iss & 0xFFFF) == crate::tracer::TRACE_TAG;
+    #[cfg(not(feature = "trace"))]
+    let is_trace_hvc = false;
+
     static mut TRAP_LOG_BUDGET: usize = 500;
     // SAFETY: single-threaded; only core 0 services EL2 traps.
-    let should_log = unsafe {
+    let should_log = !is_trace_hvc && unsafe {
         let go = TRAP_LOG_BUDGET > 0;
         if go { TRAP_LOG_BUDGET -= 1; }
         go
@@ -571,6 +581,10 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == DIAG_LR_TAG => {
             handle_diag_lr(ctx);
         }
+        #[cfg(feature = "trace")]
+        v if v == crate::tracer::TRACE_TAG => {
+            crate::tracer::handle_trace_hvc(ctx);
+        }
         _ => {
             let elr = read_sysreg!("elr_el2");
             kprintln!();
@@ -792,16 +806,6 @@ fn handle_und(ctx: &mut TrapContext) {
                 kprintln!(
                     "*** guest_bp: marker at PC={:#x} with no matching table entry — halting",
                     faulting_pc
-                );
-                cpu::halt();
-            }
-        }
-        #[cfg(feature = "trace")]
-        _ if (insn & 0xFFF0_00F0) == 0xE7F0_00F0 => {
-            if !crate::tracer::handle_trace_und(ctx, faulting_pc, spsr_und, insn) {
-                kprintln!(
-                    "*** trace: UDF-shaped insn at PC={:#x} not handled by tracer (insn={:#010x})",
-                    faulting_pc, insn
                 );
                 cpu::halt();
             }
@@ -1164,14 +1168,6 @@ fn handle_diag_lr(ctx: &mut TrapContext) -> ! {
     }
     kprintln!("  (end of trace — cross-reference PCs against _Data_/symbols.txt)");
     cpu::halt();
-}
-
-/// Phase B diagnostic shim used by `tracer::dump_rex_state`: wrapper
-/// around `guest_translate_va` exposed with a shorter name so the
-/// tracer doesn't need to import `guest_translate_va` directly.
-#[cfg(feature = "trace")]
-pub fn guest_tl_translate(va: u32) -> Option<u32> {
-    guest_translate_va(va)
 }
 
 /// Translate a guest VA to its guest PA via the current stage-1
@@ -1628,14 +1624,6 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
             if was_off && now_on {
                 guest_mem::fix_stage1_xn_bits();
                 maybe_dump_l1_once();
-                // Install function-tracing UDFs now that the guest's
-                // stage-1 L1 maps VA 0x0C00_4F00 to the UND-trampoline
-                // save slot. Earlier patches would lose LR_und and
-                // land the handler at a bogus PC. Idempotent: the
-                // tracer gates itself on a one-shot flag.
-                #[cfg(feature = "trace")]
-                // SAFETY: single-threaded EL2 trap context.
-                unsafe { crate::tracer::enable_patches(); }
                 // Swap the UND trampoline's save-slot literal to the
                 // kernel VA that L1[0xC0] maps to the RAM slot. Done
                 // outside `enable_patches()` so a soft-reboot that

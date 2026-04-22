@@ -53,24 +53,30 @@ fn main() {
 }
 
 fn build_trace_tables() {
-    // The symbol file lives one directory up from baremetal/ in the
-    // Einstein checkout. Fall back to an absolute path via CARGO_MANIFEST_DIR.
+    // Source of truth: `scripts/classify-out/code-symbols.txt`, the
+    // curated code-only symbol list produced by classify-symbols.py.
+    // It's the same list that seeds the shadow-stub classifier's walker,
+    // so anything in it has already been vetted as a real function entry
+    // (not a global, string-table, or mislabelled data symbol). This
+    // lets the tracer trust the address list without applying first-word
+    // prologue heuristics at patch time.
     let manifest = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
-    let sym_path = Path::new(&manifest).join("../_Data_/demangled_symbols.txt");
-    let sym_path = sym_path
-        .canonicalize()
-        .unwrap_or_else(|_| panic!("trace: cannot locate {:?}", sym_path));
+    let sym_path = Path::new(&manifest).join("scripts/classify-out/code-symbols.txt");
+    if !sym_path.is_file() {
+        panic!(
+            "trace: {} missing. Run baremetal/scripts/regen-classify.sh (or \
+             baremetal/scripts/classify-symbols.py) to generate it.",
+            sym_path.display()
+        );
+    }
     println!("cargo:rerun-if-changed={}", sym_path.display());
 
     let text = fs::read_to_string(&sym_path)
         .unwrap_or_else(|e| panic!("trace: read {:?}: {e}", sym_path));
 
-    // Collect (addr, name) pairs that look like ARM functions:
-    //   - addr is word-aligned
-    //   - addr is inside the 16 MiB ROM region (< 0x0100_0000)
-    //   - name looks function-ish (C++ `::`/`(`, or starts with an
-    //     ASCII uppercase letter — catches `Reset`, `BootOS`, etc.)
-    // Dedupe on addr (first name wins).
+    // Strict tab-separated parse: `<hex addr>\t<name>`. Classify-symbols.py
+    // has already applied the address/name filters; we only defend against
+    // blatantly wrong entries (unaligned, out of ROM range).
     let mut entries: Vec<(u32, String)> = Vec::new();
     let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
@@ -91,31 +97,6 @@ fn build_trace_tables() {
 
         if addr & 3 != 0 { continue; }
         if addr >= 0x0100_0000 { continue; }
-
-        // Linker-generated section markers point at data, not code.
-        // Drop them so we don't waste table slots on symbols we'll
-        // always reject at patch time anyway.
-        if name.contains("$$")
-            || name.starts_with("Image$")
-            || name.ends_with("$Size")
-            || name.ends_with("$Length")
-            || name.ends_with("$Base")
-            || name.ends_with("$Limit")
-            || name.ends_with("$End")
-            || name.ends_with("$ZI")
-        {
-            continue;
-        }
-
-        // Newton convention: functions start with an uppercase letter
-        // (`Reset`, `BootOS`, `TInterpreter::TInterpreter`, …) or are
-        // demangled C++ signatures containing `::` / `(`. A leading
-        // lowercase letter — especially `g` — marks a global, not a
-        // function.
-        let looks_func = name.contains("::")
-            || name.contains('(')
-            || name.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false);
-        if !looks_func { continue; }
 
         if seen.insert(addr) {
             entries.push((addr, name.to_string()));

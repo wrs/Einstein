@@ -188,57 +188,61 @@ saw in a log), skip the install: `bg <addr>` and `c` is enough.
 
 ## Function-level execution trace
 
-`cargo run --release --features trace,quiet` produces a "first-touch"
-chronological log of every recognised Newton function as the guest
-enters it for the first time:
+`cargo run --release --features trace,quiet` produces a chronological
+log of *every* call to a recognised Newton function, with the
+argument registers at the moment of entry:
 
 ```
-trace     1 PC=0x000188f8 LR=0x0001889c (svc) FlushTheCache
-trace     2 PC=0x00045b78 LR=0x000188a4 (svc) HandleDebugCard
+trace     1 0x000188f8 FlushTheCache (svc) r0=0x... r1=0x... r2=0x... r3=0x...
+trace     2 0x00045b78 HandleDebugCard (svc) r0=0x... r1=0x... r2=0x... r3=0x...
 ...
 ```
 
-Useful for Phase-B bisection: a stall at some PC is immediately
-readable as "N functions deep into the boot, right after `FooBar`".
+Every call, not first-touch — a function that's invoked ten times
+produces ten trace lines. Useful for Phase-B bisection: you see not
+just *which* function is at the top of the stall, but what arguments
+it's being called with over time (loop counter advancing, page index,
+etc.).
 
 ### Mechanism (`src/tracer.rs`)
 
-1. `build.rs` parses `../_Data_/demangled_symbols.txt` when the
-   `trace` feature is on, keeps word-aligned ROM-range entries whose
-   names look like functions (uppercase-leading, C++ `::` / `(`),
-   drops linker markers (`Image$$…`, `…$Size`), and emits three
-   blobs into `OUT_DIR`: `fn_addrs.bin`, `fn_name_offs.bin`,
-   `fn_names.bin`.
-2. At ROM load time `tracer::init()` registers the table but does
-   **not** patch yet — the UND trampoline's save slot at VA
-   `0x0C00_4F00` only translates to the correct RAM IPA once the
-   guest's own stage-1 L1 is in place.
-3. On the first `SCTLR_EL1.M = 0 → 1` transition (intercepted via
-   `HCR_EL2.TVM`), `tracer::enable_patches()` walks `FN_ADDRS`,
-   reads each entry's current first word, and if it matches a
-   known ARM function-start allowlist (PUSH/STMFD sp!, SUB sp,
-   ADD ip-sp, STR lr / MOV ip-sp, MOV Rd-imm / MVN / MOV reg, LDR
-   pc-relative, MRC/MCR p15, B-cond-AL), stashes the original and
-   overwrites with `UDF #index` (A1 encoding `0xE7F0_00F0` with a
-   16-bit imm split). After the loop it does `dsb ish; ic ialluis;
-   dsb ish; isb` to publish the new instructions to the guest's
-   fetch path.
-4. On each trace UND the handler logs, restores the original word
-   in the ROM backing, invalidates the icache line via
-   `cpu::ic_ivau`, and rewinds `ELR_EL2` to the faulting PC.
+1. `build.rs` reads `scripts/classify-out/code-symbols.txt` (the
+   curated code-only symbol list produced by `classify-symbols.py`,
+   i.e. the same vetted list the shadow-stub classifier's walker
+   uses as its root set) and emits `fn_addrs.bin`,
+   `fn_name_offs.bin`, `fn_names.bin` into OUT_DIR. The address list
+   is trusted — no runtime prologue heuristic, no "does this word
+   look like a function start" check.
+2. At ROM load time (after rom_patches have been applied)
+   `tracer::init()` installs a 5-word trampoline per function inside
+   the ROM backing store at IPA 0x00900000..0x00E00000 (past the REx
+   tail, before the UND-trampoline region at 0x00FFFF00), and
+   rewrites each function's first word to `B trampoline_slot`.
+3. Trampoline layout per slot (20 bytes):
+   - slot[0]: `HVC #TRACE_TAG`  — log + args
+   - slot[1]: original first insn, rewritten if PC-relative:
+     `LDR Rd, [pc, #imm]` → `LDR Rd, [pc, #0]` + literal at slot[3];
+     `B <label>`         → `LDR PC, [pc, #0]` + target at slot[3].
+     Anything else copies verbatim.
+   - slot[2]: `LDR PC, [pc, #0]`  — loads branch-back target
+   - slot[3]: literal (only used by rewrite cases)
+   - slot[4]: `orig_pc + 4`  — branch-back target
+4. At HVC-entry time, `handle_trace_hvc` derives the slot index from
+   ELR_EL2, looks up the function name, prints `seq PC name (mode)
+   r0..r3`, and returns. Natural ERET resumes at slot[1] — the
+   original first instruction — and the trampoline falls through to
+   the branch-back at slot[4]. The trampoline never disarms itself,
+   so every subsequent call retraces.
 
-### UND trampoline extension
+### Why the classifier list, not prologue detection
 
-To capture the caller's LR, the UND-vector trampoline
-(`patch_und_vector` in `src/guest_mem.rs`) briefly switches to SVC
-mode (`msr cpsr_c, #0xd3`), snapshots `R14_svc` into
-`UND_SAVE_LR_SVC_IPA = 0x0400_5F08`, and switches back before HVC.
-Reason: `MRS X, ELR_EL1` from AArch64 EL2 returns 0 under QEMU
-raspi3b for AArch32 banked state — same plumbing limitation that
-forces `LR_und` / `SPSR_und` to be persisted via RAM. The trampoline
-body is now 13 words at `0x00FFFF00..0x00FFFF34`; extend the
-reserved range in `tracer::in_reserved_range` if you grow it
-further.
+The prior implementation filtered `demangled_symbols.txt` entries by
+first-word shape (must match PUSH / SUB sp / MOV imm / …). That was
+a heuristic fence against mislabelled data entries. The classifier's
+`code-symbols.txt` has already partitioned symbols into code / data /
+drop; using it directly removes an independent heuristic and keeps
+the tracer's coverage in lock-step with shadow_stub's definition of
+"real code".
 
 ### Logging budget
 
@@ -250,14 +254,19 @@ further.
 
 ### Gotchas
 
-- `trace` mutates many ROM words, so snapshots saved pre-patch are
-  rejected on load. Tracing runs are cold-boot runs — clear
-  `/tmp/newton-snapshot-*.bin` before the first boot.
-- Functions called before the guest's stage-1 MMU comes on
-  (`Reset` → early `ROMBoot` up through the first SCTLR.M=1 write)
-  are not in the trace. The first trace line today is
-  `FlushTheCache` at `0x000188f8`, which is just after the kernel
-  installs its initial L1 tables.
-- The `(svc)` mode label on each trace line is authoritative; the
-  LR value is only reliable when mode == svc. For other modes the
-  slot still holds the last stored `R14_svc` from the SVC bounce.
+- `trace` mutates many ROM words (both the function first-word
+  patches and the in-ROM trampoline slots), so snapshots saved with
+  trace off are rejected on load, and vice-versa. Tracing runs are
+  cold-boot runs — clear `/tmp/newton-snapshot-*.bin` before the
+  first boot.
+- Functions called before the hypervisor's `tracer::init()` completes
+  (i.e. before the ROM is handed off to the guest) obviously can't
+  fire. In practice all Newton functions are called after
+  handover — the reset vector runs guest-side.
+- If `code-symbols.txt` lists an address whose first word is a PC-
+  relative form the rewriter can't handle (very rare, e.g. an
+  indirect-to-PC via register), that entry is counted in the
+  `rewrite-skip` column at install time and left unpatched. The
+  function still runs correctly; it just isn't traced.
+- Every call fires an HVC. On a long boot the trace volume can
+  saturate the mini-UART; lean on `quiet` and/or grep.

@@ -84,10 +84,6 @@ pub fn ic_ivau(va: u64) {
 // EL2 on it, matching the same "AArch32 banked register accessors
 // from AArch64 are unreliable" limitation that forces the UND
 // trampoline's SVC bounce and the DFSR32_EL2 no-op in cp15::write_dfsr32.
-// The shadow-stub abort injection therefore preserves SP_abt through
-// AArch32 (an MSR CPSR mode-switch inside the trampoline, which
-// doesn't touch any bank's SP) rather than reading it out of band.
-// See `trap::install_abt_trampoline` for the 8-instruction stub.
 
 /// Low-power wait loop. On a hypervisor tripwire we also ask QEMU to
 /// exit via semihosting so the caller isn't left waiting on an

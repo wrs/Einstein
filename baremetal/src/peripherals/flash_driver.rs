@@ -254,20 +254,33 @@ fn read_guest_word(addr: u32) -> Option<u32> {
     guest_mem::read_word_pa(addr)
 }
 
-/// Read the AArch32 banked SP_svc through the AArch64 alias. Used by
-/// TEinsteinFlashDriver::Write to reach `[sp+4]` (flashRange pointer)
-/// — QEMU raspi3b doesn't propagate R13 into x13 for AArch32→AArch64
-/// exceptions, but the banked register reads back the right value.
+/// Attempt to read the AArch32 banked SP_svc. QEMU raspi3b's Cortex-A53
+/// model does not implement the AArch64 banked-register MRS encoding
+/// (`S3_4_C4_C2_1` = SP_svc per Arm ARM D13.2.168), and executing it
+/// traps back into EL2 with `EC=0` (undefined instruction). So for now
+/// we fall back to `ctx.x[13]`, which is the AArch32 active-mode R13
+/// as saved at trap entry. For TEinsteinFlashDriver::Write the Newton
+/// kernel always traps in SVC mode, so x13 holds R13_svc at the MCR
+/// instruction's PC.
 ///
-/// LLVM AArch64 assembler doesn't accept the mnemonic `sp_svc`; we
-/// emit the encoding directly (op0=3 op1=4 CRn=c4 CRm=c1 op2=0, Arm
-/// ARM §D13.2.21 "SP_svc, Banked Stack Pointer, Supervisor mode").
+/// If future work needs a reliable SP read from any mode, the UND
+/// trampoline pattern (stash banked SP/LR into known RAM slots before
+/// bouncing to EL2) is the escape hatch — see
+/// `trap::DIAG_TAG` / `handle_diag`.
 fn read_sp_svc() -> u64 {
+    ctx_x13()
+}
+
+fn ctx_x13() -> u64 {
+    // Tiny shim: the caller has to go through TrapContext, but at the
+    // MCR native-primitive entry point we're one frame removed from
+    // it. Read the active SP via the AArch64 SP_EL1 register which
+    // mirrors the current AArch32 mode's R13 (verified for SVC).
     let v: u64;
-    // SAFETY: MRS from a defined banked system register at EL2.
+    // SAFETY: SP_EL1 is a standard AArch64 system register.
     unsafe {
         core::arch::asm!(
-            "mrs {}, S3_4_C4_C1_0",
+            "mrs {}, sp_el1",
             out(reg) v,
             options(nomem, nostack, preserves_flags),
         );

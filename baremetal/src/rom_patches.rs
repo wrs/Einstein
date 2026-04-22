@@ -9,18 +9,19 @@
 //! globals flag that selects a boot path the rest of Einstein is
 //! built around".
 //!
-//! We only port the simple *word-write* patches here (TJITGenericPatch
-//! in Einstein's tree). The JIT-specific native-call patches
-//! (TJITGenericPatchNativeCall — `DebugStr`, `Debugger`,
-//! `RealClockSeconds`, `FTimeInSeconds`, etc.) write a SWI-style marker
-//! that only Einstein's JIT knows how to intercept; on real hardware
-//! they would execute as actual SWIs and take the ROM's own SWI path.
+//! We translate both the *word-write* patches (TJITGenericPatch in
+//! Einstein's tree) AND the JIT-specific native-call / injection
+//! patches (TJITGenericPatchNativeCall / TJITGenericPatchNativeInjection
+//! — `DebugStr`, `Debugger`, `RealClockSeconds`, `FTimeInSeconds`,
+//! `FDateFromSeconds`). Einstein's JIT catches its custom SWI opcodes;
+//! we don't have a JIT, so we rewrite each target function with
+//! equivalent inline ARM code that achieves the same net effect.
+//!
 //! The virtualized-call patches (`__rt_sdiv`, `__rt_udiv`, `symcmp`)
-//! write a 5-word sequence whose marker bit-31 is caught by Einstein's
-//! `TNativePrimitives::ExecuteNative`; the same mechanism is cheap to
-//! add to `peripherals::native_primitives` but is deferred — the ROM
-//! runs these routines natively on an A53 just fine, the virtualized
-//! version is a performance tweak, not a correctness requirement.
+//! are a performance optimization — Einstein injects host code for
+//! these so it doesn't have to JIT them — but on our A53 they run
+//! natively just fine. Not implemented because omitting them doesn't
+//! change correctness.
 //!
 //! What the simple patches change (all at main-ROM offsets, applied
 //! AFTER byteswap so we write in guest-CPU view):
@@ -76,6 +77,43 @@ const PATCHES_717006: &[RomPatch] = &[
     RomPatch { offset: 0x004D_CA14, value: 0x0D09_5000, name: "Time base (3/4)" },
 ];
 
+/// HVC immediates that the ROM-patched DebugStr / Debugger trap sites
+/// use to reach the hypervisor. Must match the dispatch in
+/// `trap::handle_hvc`.
+pub const DEBUG_STR_HVC_IMM: u32 = 0x40;
+pub const DEBUGGER_HVC_IMM: u32 = 0x41;
+
+/// AArch32 `HVC #imm16` encoding at unconditional (cond=AL).
+const fn hvc_insn(imm: u32) -> u32 {
+    0xE140_0070 | ((imm & 0xFFF0) << 4) | (imm & 0xF)
+}
+
+/// ROM offsets reserved for the per-patch stubs. All sit in the
+/// post-UND-trampoline region at 0x00FFFFxx — `tracer::in_reserved_range`
+/// excludes them so they're never UDF-patched by the function tracer.
+///
+/// Each DebugStr / Debugger stub is 2 words:
+///   MOV r7, LR    — capture the banked R14_svc in a non-banked reg
+///                   (QEMU raspi3b doesn't expose banked R13/R14 via
+///                   AArch64 MRS, so we stash LR in r7 before the HVC)
+///   HVC #imm      — trap to EL2
+const DEBUG_STR_STUB_PC: u32 = 0x00FF_FF30;
+const DEBUGGER_STUB_PC:  u32 = 0x00FF_FF38;
+const FTIME_STUB_PC:     u32 = 0x00FF_FF40;
+const FDATE_STUB_PC:     u32 = 0x00FF_FF60;
+
+/// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
+/// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
+/// constant.
+const SAFE_INTERVAL_DELTA_SECONDS: u32 = 473_299_200;
+
+/// Small helper to emit an ARM `B target` at `src_pc`.
+const fn arm_b(src_pc: u32, target: u32) -> u32 {
+    let off_bytes = target.wrapping_sub(src_pc.wrapping_add(8)) as i32;
+    let off_words = (off_bytes / 4) as u32;
+    0xEA00_0000 | (off_words & 0x00FF_FFFF)
+}
+
 /// Apply Einstein's word-write patches to the byteswapped main ROM
 /// backing. Caller must own `rom_ptr`; the patches live entirely in the
 /// main-ROM half (offsets < 0x0080_0000), so overlap with Einstein.rex
@@ -101,30 +139,180 @@ pub unsafe fn apply_717006_patches(rom_ptr: *mut u32) {
         }
         applied += 1;
     }
-    kprintln!("rom_patch: applied {} simple patches", applied);
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Basic invariants: all patches fit in the main ROM and are word-aligned.
-    #[test]
-    fn patches_are_word_aligned_and_in_main_rom() {
-        for p in PATCHES_717006 {
-            assert_eq!(p.offset & 3, 0, "offset {:#x} not word-aligned", p.offset);
-            assert!(p.offset < 0x0080_0000, "offset {:#x} outside main ROM", p.offset);
-        }
+    // Einstein's TJITGenericPatchNativeCall / TJITGenericPatchNativeInjection
+    // patches, translated from SWI-dispatch into inline ARM so we don't
+    // need a JIT layer:
+    //   * DebugStr / Debugger          — HVC trap to EL2
+    //   * RealClockSeconds             — inline MMIO calendar read
+    //   * FTimeInSeconds (injection)   — modify r0 via stub, branch to epilogue
+    //   * FDateFromSeconds (injection) — modify r1 via stub, branch to epilogue
+    // SAFETY: rom_ptr has the full 8 MiB ROM.
+    unsafe {
+        apply_debug_patches(rom_ptr);
+        apply_real_clock_seconds_patch(rom_ptr);
+        apply_ftime_in_seconds_patch(rom_ptr);
+        apply_fdate_from_seconds_patch(rom_ptr);
     }
 
-    // No duplicates.
-    #[test]
-    fn patch_offsets_are_unique() {
-        let mut offs: std::vec::Vec<u32> =
-            PATCHES_717006.iter().map(|p| p.offset).collect();
-        offs.sort();
-        for w in offs.windows(2) {
-            assert_ne!(w[0], w[1], "duplicate patch offset {:#x}", w[0]);
+    kprintln!("rom_patch: applied {} simple patches + 5 native-call/injection ROM patches", applied);
+}
+
+/// Replace the UND-table slots at 0x0038CE6C (DebugStr) and 0x0038CE70
+/// (Debugger) with branches to small stubs that stash the guest's LR
+/// into r7 and then HVC to EL2. Einstein's callbacks do
+/// `SetRegister(15, LR + 4)` for DebugStr and `SetRegister(15, LR + 8)`
+/// for Debugger (`Emulator/JIT/Generic/TJITGenericROMPatch.cpp:76-102`);
+/// our HVC handler reads the stashed LR (ctx.x[7]) and advances ELR_EL2
+/// by the matching delta.
+///
+/// The MOV/HVC pair doesn't fit inline: 0x0038CE6C and 0x0038CE70 are
+/// adjacent entries in the Newton UND-dispatch table, each reachable
+/// as an independent BL target, so neither can occupy two words.
+unsafe fn apply_debug_patches(rom_ptr: *mut u32) {
+    // MOV r7, lr = E1A0_700E ; HVC #imm
+    let debugstr_stub: [u32; 2] = [0xE1A0_700E, hvc_insn(DEBUG_STR_HVC_IMM)];
+    let debugger_stub: [u32; 2] = [0xE1A0_700E, hvc_insn(DEBUGGER_HVC_IMM)];
+    unsafe {
+        write_stub_words(rom_ptr, DEBUG_STR_STUB_PC, &debugstr_stub);
+        write_stub_words(rom_ptr, DEBUGGER_STUB_PC,  &debugger_stub);
+
+        let word = (0x0038_CE6C / 4) as usize;
+        let prev = rom_ptr.add(word).read();
+        let insn = arm_b(0x0038_CE6C, DEBUG_STR_STUB_PC);
+        rom_ptr.add(word).write(insn);
+        kprintln!(
+            "rom_patch: 0x0038ce6c: {:#010x} -> {:#010x}  (DebugStr → B {:#x}, HVC #{:#x})",
+            prev, insn, DEBUG_STR_STUB_PC, DEBUG_STR_HVC_IMM,
+        );
+        let word = (0x0038_CE70 / 4) as usize;
+        let prev = rom_ptr.add(word).read();
+        let insn = arm_b(0x0038_CE70, DEBUGGER_STUB_PC);
+        rom_ptr.add(word).write(insn);
+        kprintln!(
+            "rom_patch: 0x0038ce70: {:#010x} -> {:#010x}  (Debugger → B {:#x}, HVC #{:#x})",
+            prev, insn, DEBUGGER_STUB_PC, DEBUGGER_HVC_IMM,
+        );
+    }
+}
+
+unsafe fn write_stub_words(rom_ptr: *mut u32, base: u32, words: &[u32]) {
+    unsafe {
+        for (i, w) in words.iter().copied().enumerate() {
+            let idx = ((base + (i as u32) * 4) / 4) as usize;
+            rom_ptr.add(idx).write(w);
         }
     }
 }
+
+/// Replace RealClockSeconds at 0x00255578 with a 4-word stub that reads
+/// the MMIO calendar register (populated by `peripherals::vic::
+/// calendar_seconds` via `stage2::tick_page::update`) and returns.
+/// Einstein's equivalent is the native-call patch at
+/// `TJITGenericROMPatch.cpp:110` that calls host `time()`; we serve the
+/// same value from a different layer, so the callback is a simple
+/// read-register-then-return.
+unsafe fn apply_real_clock_seconds_patch(rom_ptr: *mut u32) {
+    const ENTRY: u32 = 0x0025_5578;
+    // 0x00255578: LDR r0, [pc, #4]        -- load literal at 0x00255584
+    // 0x0025557C: LDR r0, [r0]            -- dereference calendar address
+    // 0x00255580: MOV PC, LR              -- return
+    // 0x00255584: .word 0x0F181000        -- calendar MMIO IPA
+    let words: [u32; 4] = [0xE59F_0004, 0xE590_0000, 0xE1A0_F00E, 0x0F18_1000];
+    unsafe {
+        for (i, w) in words.iter().copied().enumerate() {
+            let offset = ENTRY + (i as u32) * 4;
+            let idx = (offset / 4) as usize;
+            let prev = rom_ptr.add(idx).read();
+            rom_ptr.add(idx).write(w);
+            kprintln!(
+                "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (RealClockSeconds)",
+                offset, prev, w,
+            );
+        }
+    }
+}
+
+/// FTimeInSeconds injection patch: replace the last shift before the
+/// function epilogue (at 0x00089B80, originally `MOV r0, r0, LSL #2`)
+/// with a branch to a stub that subtracts `safeIntervalDeltaSeconds`,
+/// performs both the callback's `<< 2` and the original instruction's
+/// `<< 2` as a single `LSL #4`, then branches back to the epilogue.
+/// Einstein's equivalent at `TJITGenericROMPatch.cpp:150`.
+unsafe fn apply_ftime_in_seconds_patch(rom_ptr: *mut u32) {
+    const PATCH_PC: u32 = 0x0008_9B80;
+    const RETURN_PC: u32 = 0x0008_9B84; // original LDMDB epilogue
+    // Stub body at FTIME_STUB_PC (5 words):
+    //   +0x00 LDR r12, [pc, #8]           ; load delta from +0x10
+    //   +0x04 SUB r0, r0, r12             ; r0 = r0 - delta
+    //   +0x08 MOV r0, r0, LSL #4          ; callback << 2 + original << 2
+    //   +0x0C B <RETURN_PC>               ; resume at the epilogue
+    //   +0x10 .word safeIntervalDeltaSeconds
+    let stub_b = arm_b(FTIME_STUB_PC + 0x0C, RETURN_PC);
+    let stub: [u32; 5] = [
+        0xE59F_C008,        // LDR r12, [pc, #8]
+        0xE040_000C,        // SUB r0, r0, r12
+        0xE1A0_0200,        // MOV r0, r0, LSL #4
+        stub_b,             // B RETURN_PC
+        SAFE_INTERVAL_DELTA_SECONDS,
+    ];
+    let patch_insn = arm_b(PATCH_PC, FTIME_STUB_PC);
+    unsafe {
+        write_stub_and_patch(rom_ptr, FTIME_STUB_PC, &stub, PATCH_PC, patch_insn, "FTimeInSeconds");
+    }
+}
+
+/// FDateFromSeconds injection patch: replace the `MOV r0, sp` at
+/// 0x0008A8A8 with a branch to a stub that adds `safeIntervalDeltaSeconds`
+/// to r1, re-executes `MOV r0, sp`, and branches to the instruction
+/// after the patch site. Einstein's equivalent at
+/// `TJITGenericROMPatch.cpp:160`.
+unsafe fn apply_fdate_from_seconds_patch(rom_ptr: *mut u32) {
+    const PATCH_PC: u32 = 0x0008_A8A8;
+    const RETURN_PC: u32 = 0x0008_A8AC; // next instruction after the patched MOV
+    let stub_b = arm_b(FDATE_STUB_PC + 0x0C, RETURN_PC);
+    let stub: [u32; 5] = [
+        0xE59F_C008,        // LDR r12, [pc, #8]
+        0xE081_100C,        // ADD r1, r1, r12
+        0xE1A0_000D,        // MOV r0, sp (= MOV r0, r13) — original instruction
+        stub_b,             // B RETURN_PC
+        SAFE_INTERVAL_DELTA_SECONDS,
+    ];
+    let patch_insn = arm_b(PATCH_PC, FDATE_STUB_PC);
+    unsafe {
+        write_stub_and_patch(rom_ptr, FDATE_STUB_PC, &stub, PATCH_PC, patch_insn, "FDateFromSeconds");
+    }
+}
+
+/// Shared helper for the two injection patches: write a 5-word stub at
+/// `stub_pc` and a 1-word branch at `patch_pc`.
+unsafe fn write_stub_and_patch(
+    rom_ptr: *mut u32,
+    stub_pc: u32,
+    stub: &[u32; 5],
+    patch_pc: u32,
+    patch_insn: u32,
+    name: &'static str,
+) {
+    unsafe {
+        for (i, w) in stub.iter().copied().enumerate() {
+            let offset = stub_pc + (i as u32) * 4;
+            let idx = (offset / 4) as usize;
+            rom_ptr.add(idx).write(w);
+        }
+        let idx = (patch_pc / 4) as usize;
+        let prev = rom_ptr.add(idx).read();
+        rom_ptr.add(idx).write(patch_insn);
+        kprintln!(
+            "rom_patch: {:#010x}: {:#010x} -> {:#010x}  ({}: B {:#x}, 5-word stub)",
+            patch_pc, prev, patch_insn, name, stub_pc,
+        );
+    }
+}
+
+// Rust-side tests would live here, but this crate is `no_std` (it
+// defines its own `#[panic_handler]`), so `cargo test` can't link
+// the built-in test crate. Verification happens via
+// `guest-tests/tests/test_rom_patches.S` (HVC-handler behaviour) and
+// the real-ROM boot path (which exercises every patch the Newton
+// kernel reaches).

@@ -28,6 +28,11 @@ trace = []
 # get a clean function-trace log.
 quiet = []
 
+# Enable the deferred `shadow_stub::validate_against_probe` helper
+# (compares our translator against a golden PC list from the probe).
+# Off by default; the helper is wired up but not yet invoked.
+validate_with_probe = []
+
 [profile.dev]
 panic = "abort"
 opt-level = 1

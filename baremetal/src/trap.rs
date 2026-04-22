@@ -353,7 +353,7 @@ fn aarch32_mode_label(mode: u32) -> &'static str {
 ///      guest would have if the faulting instruction had been at
 ///      the original site and never been patched.
 fn inject_shadow_stub_abort(
-    ctx: &mut TrapContext, iss: u32, far: u64, elr: u32,
+    _ctx: &mut TrapContext, iss: u32, far: u64, elr: u32,
 ) {
     let (slot, off) = match shadow_stub::ipa_to_slot_offset(elr) {
         Some(v) => v,
@@ -628,6 +628,45 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         }
         0x05 => {
             kprintln!("guest-mark: {:#010x}", r0);
+        }
+        0x40 => {
+            // DebugStr ROM-patch trap: the ROM-patched stub at
+            // DEBUG_STR_STUB_PC does `MOV r7, LR` before this HVC so we
+            // can read LR without relying on AArch64 banked-register
+            // accesses (MRS LR_svc is unimplemented on QEMU raspi3b's
+            // Cortex-A53 model). r0 is the guest's string pointer; we
+            // log it and resume at LR + 4, matching Einstein's callback
+            // (Emulator/JIT/Generic/TJITGenericROMPatch.cpp:76).
+            let addr = r0;
+            log_guest_string("DebugStr", addr);
+            let lr = ctx.x[7] as u32;
+            // SAFETY: ELR_EL2 controls the post-ERET guest PC.
+            unsafe {
+                core::arch::asm!(
+                    "msr elr_el2, {}",
+                    in(reg) lr.wrapping_add(4) as u64,
+                    options(nostack, preserves_flags),
+                );
+            }
+            return;
+        }
+        0x41 => {
+            // Debugger ROM-patch trap. Stub stashed LR into r7 for the
+            // same reason as DebugStr above. Einstein's callback breaks
+            // into the host debugger and returns PC = LR + 8
+            // (TJITGenericROMPatch.cpp:96); we have no host debugger, so
+            // log the site and continue.
+            let elr = read_sysreg!("elr_el2");
+            kprintln!("Debugger trap @ELR={:#x}", elr);
+            let lr = ctx.x[7] as u32;
+            unsafe {
+                core::arch::asm!(
+                    "msr elr_el2, {}",
+                    in(reg) lr.wrapping_add(8) as u64,
+                    options(nostack, preserves_flags),
+                );
+            }
+            return;
         }
         0x30 => {
             // Shadow-stub patch request: r0=start_ipa, r1=end_ipa (exclusive).
@@ -1433,6 +1472,50 @@ fn log_cp15_strongarm_clock(pc: u32) {
 /// of the word that contains the null (aligned, since words are
 /// 4-byte aligned). `max_words` bounds the search so a missing null
 /// doesn't infinite-loop.
+/// Log a guest C string pointed to by `addr`.
+///
+/// The Newton 717006 ROM is stored big-endian in the image file and
+/// byteswapped per word at load time so LDR in our LE guest returns
+/// the u32 the original BE CPU saw (see `guest_mem::load_newton_rom`).
+/// Bytes within each 4-byte word end up reversed in host memory: a
+/// word originally `0x48 0x65 0x6C 0x6C` ("Hell" in BE) is laid out
+/// as `0x6C 0x6C 0x65 0x48` in host LE memory. To recover the
+/// original byte sequence we re-swap each loaded word via
+/// `to_be_bytes()`.
+///
+/// Guest-test binaries are LE-native (no ROM byteswap on load), so
+/// the bytes in host memory are already in natural order — use
+/// `to_le_bytes()`. We pick at compile time via `nh_guest_test`.
+fn log_guest_string(prefix: &'static str, addr: u32) {
+    const CAP: usize = 256;
+    let mut buf = [0u8; CAP];
+    let mut len = 0usize;
+    let mut va = addr;
+    'outer: while len < CAP {
+        let w = match read_guest_word_pa(va & !0x3) {
+            Some(v) => v,
+            None => break,
+        };
+        #[cfg(nh_guest_test)]
+        let bytes = w.to_le_bytes();
+        #[cfg(not(nh_guest_test))]
+        let bytes = w.to_be_bytes();
+        let first = (va & 0x3) as usize;
+        for i in first..4 {
+            let b = bytes[i];
+            if b == 0 { break 'outer; }
+            buf[len] = b;
+            len += 1;
+            if len == CAP { break 'outer; }
+        }
+        va = (va & !0x3).wrapping_add(4);
+    }
+    match core::str::from_utf8(&buf[..len]) {
+        Ok(s) => kprintln!("{}: {:?}", prefix, s),
+        Err(_) => kprintln!("{}: <{} non-utf8 bytes @ {:#x}>", prefix, len, addr),
+    }
+}
+
 fn scan_to_null_word_aligned(start: u32, max_words: u32) -> u32 {
     let mut va = start & !0x3;
     for _ in 0..max_words {

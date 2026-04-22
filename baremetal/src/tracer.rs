@@ -153,7 +153,16 @@ fn fn_name(i: usize) -> &'static str {
 ///     delivers the trap we're trying to see.
 fn in_reserved_range(addr: u32) -> bool {
     if addr < 0x0000_0020 { return true; }
+    // UND-trampoline body (see guest_mem::patch_und_vector).
     if (0x00FF_FF00..0x00FF_FF34).contains(&addr) { return true; }
+    // DebugStr / Debugger 2-word stubs (see
+    // rom_patches::apply_debug_patches).
+    if (0x00FF_FF30..0x00FF_FF40).contains(&addr) { return true; }
+    // FTimeInSeconds injection stub (5 words at 0x00FF_FF40, see
+    // rom_patches::apply_ftime_in_seconds_patch).
+    if (0x00FF_FF40..0x00FF_FF54).contains(&addr) { return true; }
+    // FDateFromSeconds injection stub (5 words at 0x00FF_FF60).
+    if (0x00FF_FF60..0x00FF_FF74).contains(&addr) { return true; }
     false
 }
 

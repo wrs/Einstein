@@ -10,6 +10,7 @@ test_cp15_strongarm_clock
 test_midr
 test_mmio_regs
 test_rtc_calendar
+test_rom_patches
 test_serial
 test_native_primitives
 test_flash_driver

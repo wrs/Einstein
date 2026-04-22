@@ -602,7 +602,7 @@ pub fn slot_xor_mask(slot: usize) -> Option<u32> {
 /// the inner access instruction. Words from n to STUB_SLOT_WORDS-3 get
 /// filled with UDF by the caller. The last two words are the return_pc
 /// literal and the scratch save slot.
-fn build_stub(d: &Decoded, _stub_pc: u32, return_pc: u32,
+fn build_stub(d: &Decoded, _stub_pc: u32, _return_pc: u32,
               out: &mut [u32; STUB_SLOT_WORDS]) -> Result<BuiltStub, &'static str>
 {
     let scratch = pick_scratch(d);

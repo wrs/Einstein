@@ -62,7 +62,6 @@ read_sysreg!(hcr_el2, "HCR_EL2");
 /// map covers the host view of the ROM backing, so passing the host VA
 /// of the patched word works. A53's icache is PIPT so invalidating via
 /// the host VA invalidates any guest alias to the same PA.
-#[cfg(feature = "trace")]
 #[inline]
 pub fn ic_ivau(va: u64) {
     // SAFETY: cache maintenance; `dsb ish` + `isb` fence the effect.

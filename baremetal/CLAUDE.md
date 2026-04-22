@@ -109,6 +109,64 @@ early ROM bytes.
   the Newton kernel arms its match registers very early and
   CNTHP fires steadily; this hasn't been an issue.
 
+## gdb workflow
+
+```bash
+# term 1
+DEBUG=1 cargo run --release
+
+# term 2 (Linux: gdb-multiarch; macOS: aarch64-elf-gdb)
+aarch64-elf-gdb -x scripts/gdb-init \
+  target/aarch64-unknown-none-softfloat/release/newton-hypervisor
+```
+
+- EL2 hypervisor breakpoints (`break kmain`, `break
+  trap_sync_lower_aarch32`, source-line, `stepi`, `bt`, locals) all
+  work. Stack unwinding is reliable within Rust frames; it degrades
+  across the EL2 exception vector boundary because the asm stubs have
+  no DWARF.
+- **Guest AArch32 breakpoints don't work directly** —
+  qemu-system-aarch64's gdbstub is aarch64-only and drops the mode
+  switch. Use the helpers in `scripts/gdb-init`:
+  - **`bg <addr>`** — conditional stop at `trap_sync_lower_aarch32`
+    when `$ELR_EL2 == <addr>`. Fires only at naturally-trapping guest
+    instructions (data/insn abort, SVC/HVC, CP15). Does **not** catch
+    UND-class traps because the UND trampoline HVCs into EL2 — by the
+    time we're at trap_sync entry, `ELR_EL2` points at the trampoline,
+    not the original PC.
+  - **`bp <addr>`** — install a one-shot guest software BP (see
+    `src/guest_bp.rs`). Patches the ROM word with `UDF #0xFFFE` and
+    stops in `handle_user_bp_und` with `faulting_pc` = the guest PC.
+    Works for any ROM-range PC regardless of whether it naturally
+    traps. One-shot: `bp <addr>` again to re-arm. Snapshot autosaves
+    are gated while any BP is live, so a debug session never corrupts
+    a persisted snapshot.
+  - `tt N`, `guest-state`, `bp-clear`, `bp-list` — convenience.
+
+### Breakpoint pattern for agents
+
+The typical recipe:
+
+```bash
+# term 1
+DEBUG=1 cargo run --release
+
+# term 2
+aarch64-elf-gdb -x scripts/gdb-init \
+  target/aarch64-unknown-none-softfloat/release/newton-hypervisor
+(gdb) break trap_sync_lower_aarch32     # land anywhere in EL2 context
+(gdb) c                                  # stop at first guest sync-trap
+(gdb) bp 0x<guest_pc_of_interest>        # install sw BP + arm stop
+(gdb) delete 1                           # remove the trap_sync bp
+(gdb) c                                  # run until guest hits your BP
+(gdb) p/x faulting_pc                    # which BP fired
+(gdb) guest-state                        # ELR/ESR/FAR/CPSR at trap
+(gdb) c                                  # resume (handler restores word)
+```
+
+For a guest PC that naturally traps (e.g., the MMIO access you already
+saw in a log), skip the install: `bg <addr>` and `c` is enough.
+
 ## General Phase-B debugging guidance
 
 - Every handler in `src/trap.rs` / `src/peripherals/*` halts

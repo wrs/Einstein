@@ -6,6 +6,7 @@ use core::arch::global_asm;
 
 mod cpu;
 mod guest;
+mod guest_bp;
 mod guest_mem;
 mod mmio;
 mod mmu;

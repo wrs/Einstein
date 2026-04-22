@@ -418,7 +418,7 @@ pub fn handle_trace_und(
     cpu::ic_ivau(host_va);
 
     // Rewind to re-execute the restored instruction.
-    crate::trap::return_to_guest_trace(ctx, faulting_pc as u64, spsr_und);
+    crate::trap::return_to_guest_from_und(ctx, faulting_pc as u64, spsr_und);
     true
 }
 

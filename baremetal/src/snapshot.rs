@@ -51,7 +51,7 @@
 //! into a different one.
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::{guest_mem, kprintln, peripherals, trap::TrapContext};
 
@@ -241,6 +241,26 @@ pub fn maybe_autosave(ctx: &TrapContext) {
     if last != 0 && now.wrapping_sub(last) < interval_ticks {
         return;
     }
+
+    // Gate autosaves while guest BPs are live: the saved ROM would
+    // contain our marker UDF, and the loader on the next boot would
+    // halt with "marker at PC=… with no matching table entry". Log
+    // the transition (gating on → off) so the user can tell their
+    // debug session is suppressing autosave, without spamming every
+    // 2 s. See `src/guest_bp.rs`.
+    static AUTOSAVE_GATED: AtomicBool = AtomicBool::new(false);
+    if crate::guest_bp::any_installed() {
+        let was = AUTOSAVE_GATED.swap(true, Ordering::Relaxed);
+        if !was {
+            kprintln!(
+                "snapshot: autosave gated — guest_bp active (autosaves will resume when all BPs are cleared)"
+            );
+        }
+        return;
+    } else if AUTOSAVE_GATED.swap(false, Ordering::Relaxed) {
+        kprintln!("snapshot: autosave resumed — no guest_bp active");
+    }
+
     // Either first save, or enough wall-clock has passed.
     let gprs: [u64; 15] = [
         ctx.x[0],  ctx.x[1],  ctx.x[2],  ctx.x[3],

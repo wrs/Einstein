@@ -66,7 +66,8 @@ What's still scaffolding (see HIGHLEVEL.md §16 and
 - `qemu-system-aarch64` with `raspi3b` support.
 - `arm-none-eabi-gcc` + `arm-none-eabi-objcopy` for cross-compiling the
   guest-test images.
-- `gdb-multiarch` for source-level debugging.
+- A cross-aarch64 gdb for source-level debugging: `gdb-multiarch` on
+  Linux, `aarch64-elf-gdb` (Homebrew) on macOS.
 - A Newton 2.x ROM at `roms/newton.rom` (8 MiB, byteswapped inside the
   hypervisor on load; gitignored — **never commit the ROM**).
 
@@ -207,16 +208,78 @@ The runner adds `-s -S` so QEMU exposes a gdb stub on `:1234` and
 pauses at the reset vector. In another terminal:
 
 ```
-gdb-multiarch target/aarch64-unknown-none-softfloat/release/newton-hypervisor \
-  -ex 'target remote :1234' \
-  -ex 'break kmain' \
-  -ex 'continue'
+# Linux:
+gdb-multiarch -x scripts/gdb-init \
+  target/aarch64-unknown-none-softfloat/release/newton-hypervisor
+
+# macOS:
+aarch64-elf-gdb -x scripts/gdb-init \
+  target/aarch64-unknown-none-softfloat/release/newton-hypervisor
 ```
 
-DWARF is enabled in both `dev` and `release`, so `break src/main.rs:40`,
-`backtrace`, `info registers`, `stepi`, `next` all work. Setting
-`break trap_sync_lower_aarch32` is the easiest way to step through
-guest → EL2 transitions.
+`scripts/gdb-init` connects to :1234, sets sane defaults, and defines a
+few helpers (`guest-state`, `bg`, `bp`, `bp-clear`, `bp-list`, `tt`) —
+see the comment at the top of that file.
+
+### EL2 hypervisor (AArch64) breakpoints — fully work
+
+DWARF is enabled in both `dev` and `release`. Source breakpoints,
+backtraces, `info locals`, `stepi`, `next` all work against the
+hypervisor:
+
+```
+(gdb) break kmain
+(gdb) break trap_sync_lower_aarch32
+(gdb) break src/trap.rs:103
+(gdb) continue
+```
+
+### EL1 guest (AArch32) breakpoints — a QEMU limitation
+
+`qemu-system-aarch64`'s gdbstub is aarch64-only and does **not** handle
+the AArch32 mode switch. Software breakpoints at guest VAs set via
+`break` are ignored, and register inspection while the guest is running
+returns garbage.
+(See
+[qemu-arm 2020-07](https://lists.gnu.org/archive/html/qemu-arm/2020-07/msg00122.html).)
+We work around this with a pair of hypervisor-side helpers:
+
+#### `bg <addr>` — break on *naturally-trapping* guest PCs
+
+Sets a conditional gdb breakpoint at `trap_sync_lower_aarch32 if
+$ELR_EL2 == addr`. Fires when the guest takes a sync trap (data/insn
+abort, SVC/HVC, trapped CP15) at that PC. Zero setup but does **not**
+catch UND-class traps (tracer / SWP / Einstein UNDs) because the UND
+trampoline bounces through HVC before reaching EL2.
+
+```
+(gdb) bg 0x3957a0
+(gdb) tt 20                  # log the next 20 sync traps + stop
+(gdb) guest-state            # dump guest PC/ESR/FAR/CPSR at a stop
+```
+
+#### `bp <addr>` — break on *any* guest PC (sw BP via UDF patch)
+
+Patches the ROM word at `<addr>` with a marker `UDF #0xFFFE` and sets
+a gdb breakpoint at the hypervisor's `handle_user_bp_und`. When the
+guest executes `<addr>`, the UDF traps into EL2; `handle_user_bp_und`
+restores the original instruction (one-shot) and gdb stops with
+`faulting_pc == <addr>` visible as a local. Implemented in
+`src/guest_bp.rs`; gdb invokes the extern "C" entry points via
+`call`.
+
+```
+(gdb) bp 0x188f8             # install + arm stop at FlushTheCache
+(gdb) c                      # run; stops in handle_user_bp_und
+(gdb) p/x faulting_pc        # confirms which BP fired
+(gdb) c                      # continue; hypervisor restores the word
+```
+
+Limits: ROM range only (`0..0x01000000`); max `TABLE_SIZE` live BPs
+(16); one-shot (re-run `bp` to re-arm). The snapshot autosaver is
+gated while any BP is live (logged as `autosave gated — guest_bp
+active`), so a debug session never leaves a stale UDF in a persisted
+snapshot. See `src/guest_bp.rs` for the full story.
 
 ## Layout
 

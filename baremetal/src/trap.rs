@@ -1034,6 +1034,19 @@ fn handle_und(ctx: &mut TrapContext) {
             emulate_swp(ctx, insn, faulting_pc);
             return_to_guest(ctx, (faulting_pc + 4) as u64, spsr_und);
         }
+        // User-driven guest software breakpoint — must be checked
+        // before the tracer path because the marker encoding
+        // (UDF #0xFFFE) is also a UDF-shape instruction. See
+        // `src/guest_bp.rs`.
+        _ if insn == crate::guest_bp::BP_UDF_INSN => {
+            if !crate::guest_bp::handle_user_bp_und(ctx, faulting_pc, spsr_und, insn) {
+                kprintln!(
+                    "*** guest_bp: marker at PC={:#x} with no matching table entry — halting",
+                    faulting_pc
+                );
+                cpu::halt();
+            }
+        }
         #[cfg(feature = "trace")]
         _ if (insn & 0xFFF0_00F0) == 0xE7F0_00F0 => {
             if !crate::tracer::handle_trace_und(ctx, faulting_pc, spsr_und, insn) {
@@ -1542,8 +1555,11 @@ fn emulate_swp(ctx: &mut TrapContext, insn: u32, faulting_pc: u32) {
     log_swp_budgeted(faulting_pc, is_byte, rn, rd, rm, addr);
 }
 
-#[cfg(feature = "trace")]
-pub(crate) fn return_to_guest_trace(ctx: &mut TrapContext, elr: u64, spsr: u64) {
+/// UND-path version of `return_to_guest`: same sysreg writes, different
+/// name so it's obvious at call sites that the caller came from the
+/// trampoline-based UND handler. Used by `tracer` and `guest_bp` after
+/// they restore the faulting instruction's original word.
+pub(crate) fn return_to_guest_from_und(ctx: &mut TrapContext, elr: u64, spsr: u64) {
     return_to_guest(ctx, elr, spsr);
 }
 

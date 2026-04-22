@@ -79,8 +79,37 @@ pub fn ic_ivau(va: u64) {
     }
 }
 
-/// Low-power wait loop. Never returns.
+// NOTE: There is no `read_sp_abt()` helper. `MRS <Xt>, SP_abt`
+// (S3_4_C4_C1_1) is architecturally defined (DDI 0487 D19.2) but
+// QEMU raspi3b's Cortex-A53 model takes an EC=0 UNDEFINED trap at
+// EL2 on it, matching the same "AArch32 banked register accessors
+// from AArch64 are unreliable" limitation that forces the UND
+// trampoline's SVC bounce and the DFSR32_EL2 no-op in cp15::write_dfsr32.
+// The shadow-stub abort injection therefore preserves SP_abt through
+// AArch32 (an MSR CPSR mode-switch inside the trampoline, which
+// doesn't touch any bank's SP) rather than reading it out of band.
+// See `trap::install_abt_trampoline` for the 8-instruction stub.
+
+/// Low-power wait loop. On a hypervisor tripwire we also ask QEMU to
+/// exit via semihosting so the caller isn't left waiting on an
+/// external `timeout`. If semihosting isn't available we fall through
+/// to the WFE loop.
+///
+/// Semihosting SYS_EXIT_EXTENDED (op 0x20): x1 → [reason, exit_code].
+/// Reason `0x20026` = ADP_Stopped_ApplicationExit.
 pub fn halt() -> ! {
+    // SAFETY: HLT #0xF000 with semihosting enabled in QEMU is a
+    // controlled trap that terminates QEMU. The parameter block
+    // pointer lifetime spans the call.
+    unsafe {
+        let params: [u64; 2] = [0x20026, 1];
+        core::arch::asm!(
+            "hlt #0xF000",
+            in("x0") 0x20u64,
+            in("x1") params.as_ptr() as u64,
+            options(nostack, preserves_flags),
+        );
+    }
     loop {
         // SAFETY: `wfe` has no operands and no memory effects.
         unsafe {

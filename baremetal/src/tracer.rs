@@ -118,7 +118,14 @@ fn is_known_function_start(w: u32) -> bool {
     // MRC/MCR p15: bits[27:24]=0xE, [11:8]=0xF (coproc 15), bit 4=1,
     //   bit 20 = 1 (MRC) or 0 (MCR). Match both.
     if (w & 0x0FE0_0F10) == 0x0E00_0F10 { return true; }
-    // B <label> with cond=AL
+    // B <label> with cond=AL. This is broad (0xEA00_0000..0xEAFF_FFFF),
+    // but the allowlist only runs at addresses already vouched for by
+    // the symbol table, so "function entry that begins with a raw B"
+    // is a thunk / tail-call stub we want to trace. The rare false
+    // positive (data word at a symbol-table function address whose
+    // top byte happens to be 0xEA) is absorbed by the one-shot UDF
+    // restore: the first UDF fire restores the original word and the
+    // site is never re-patched.
     if (w & 0x0F00_0000) == 0x0A00_0000 { return true; }
 
     false
@@ -181,6 +188,45 @@ pub fn init() {
         "trace: deferred patching of {} candidate entries until guest stage-1 MMU is on",
         FN_COUNT
     );
+    // Phase B diagnostic: eagerly patch a few REx-scanner entries so that
+    // pre-MMU calls (which happen before `enable_patches` fires) still
+    // trace. Must run at ROM load time before stage-2 is enabled.
+    // SAFETY: single-threaded at boot.
+    unsafe { early_patch_for_rex_scanner(); }
+}
+
+/// Early-patch a handful of REx-related function entries with UDF so we
+/// can see them called pre-MMU. Runs once at load time; `enable_patches`
+/// later sees these sites as already-UDF'd and skips them.
+unsafe fn early_patch_for_rex_scanner() {
+    let targets: [u32; 3] = [0x003137dc, 0x00313818, 0x00313888];
+    let rom_base = guest_mem::rom_host_pa() as *mut u32;
+    for addr in targets {
+        // Find the index in the tracer's FN_ADDRS table.
+        let mut idx_opt: Option<usize> = None;
+        for i in 0..FN_COUNT {
+            if fn_addr(i) == addr {
+                idx_opt = Some(i);
+                break;
+            }
+        }
+        let Some(idx) = idx_opt else {
+            kprintln!("trace: early-patch: {:#x} not in symbol table, skipping", addr);
+            continue;
+        };
+        let word_idx = (addr / 4) as usize;
+        // SAFETY: addr is < ROM_SIZE.
+        let orig = unsafe { rom_base.add(word_idx).read() };
+        // SAFETY: single-threaded at boot.
+        unsafe { ORIG_INSN[idx] = orig; }
+        let udf = encode_udf(idx as u16);
+        // SAFETY: writing to ROM backing (host RAM).
+        unsafe { rom_base.add(word_idx).write(udf); }
+        kprintln!(
+            "trace: early-patch: {:#x} idx={} orig={:#010x} → UDF",
+            addr, idx, orig
+        );
+    }
 }
 
 /// Install the trace UDFs. Invoked from the CP15 SCTLR write path in
@@ -230,6 +276,7 @@ pub unsafe fn enable_patches() {
         unsafe { rom_base.add(word_index).write(patched_word); }
         patched += 1;
     }
+
 
     // Publish the stores and flush the entire guest icache so the
     // next fetch from any patched site sees the UDF.
@@ -335,6 +382,27 @@ pub fn handle_trace_und(
         fn_name(index)
     );
 
+    // Phase B diagnostic: for REx-scanner functions, also dump r0-r4 to
+    // see the arguments. These are early-patched so trace fires pre-MMU.
+    if matches!(faulting_pc, 0x003137dc | 0x00313818 | 0x00313888) {
+        kprintln!(
+            "  args: r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r4={:#010x}",
+            ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32, ctx.x[4] as u32
+        );
+    }
+
+
+    // Phase B diagnostic: at SearchForFlashDrivers entry, dump the REx
+    // base table the kernel uses to index REx blocks. Per our disasm of
+    // PrimNextRExConfigEntry (0x11ee60), REx[id] lives at
+    //   gGlobalsThatLiveAcrossReboot (VA 0x0c1061c4) + 0x2e8 + id*4
+    //   = VA 0x0c1064ac + id*4
+    // Also dump ctx.x[0] (r0, i.e. `this` pointer for this TNewInternalFlash
+    // method) and the flash-driver registry fields it reads from [r0+*].
+    if faulting_pc == 0x0013b908 {
+        dump_rex_state(ctx);
+    }
+
     // Restore the original instruction in the ROM backing. A direct
     // host-side write bypasses stage-2 RO (which only governs guest
     // writes). The guest's icache may still hold the UDF — flush the
@@ -352,4 +420,112 @@ pub fn handle_trace_und(
     // Rewind to re-execute the restored instruction.
     crate::trap::return_to_guest_trace(ctx, faulting_pc as u64, spsr_und);
     true
+}
+
+/// Phase B diagnostic: dump the REx state the kernel sees at the moment
+/// SearchForFlashDrivers is entered. Purpose: find out if our external
+/// REx at PA 0x00800000 actually made it into the kernel's REx base
+/// table, and what entries the kernel sees there.
+fn dump_rex_state(ctx: &TrapContext) {
+    kprintln!("  === REx diagnostic at SearchForFlashDrivers entry ===");
+    kprintln!(
+        "  r0 (this) = {:#010x}  r1 = {:#010x}  r2 = {:#010x}  r3 = {:#010x}",
+        ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
+    );
+
+    // REx base table: VA 0x0c1064ac + id*4 for id in 0..4.
+    for id in 0u32..4 {
+        let va = 0x0c1064ac + id * 4;
+        let pa = crate::trap::guest_tl_translate(va);
+        let val = pa.and_then(guest_mem::read_word_pa);
+        kprintln!(
+            "  REx[{}] at VA {:#x} → PA {:?} → {:?}",
+            id, va, pa, val
+        );
+    }
+
+    // Dump 256 bytes around gGlobalsThatLiveAcrossReboot (VA 0x0c1061c4)
+    // to see the whole struct including fields around the REx table at +0x2e8.
+    for off in (0..0x400_u32).step_by(16) {
+        let va = 0x0c1061c4 + off;
+        let pa = crate::trap::guest_tl_translate(va);
+        match pa {
+            Some(p) => {
+                let w0 = guest_mem::read_word_pa(p).unwrap_or(0);
+                let w1 = guest_mem::read_word_pa(p + 4).unwrap_or(0);
+                let w2 = guest_mem::read_word_pa(p + 8).unwrap_or(0);
+                let w3 = guest_mem::read_word_pa(p + 12).unwrap_or(0);
+                if (w0 | w1 | w2 | w3) != 0 {
+                    kprintln!(
+                        "  gGlob[+{:#05x}] VA {:#010x}: {:#010x} {:#010x} {:#010x} {:#010x}",
+                        off, va, w0, w1, w2, w3
+                    );
+                }
+            }
+            None => { break; }
+        }
+    }
+
+    // Check what's at the REx physical addresses. VAs:
+    for (label, va) in [
+        ("ROM[0x71FC4C]", 0x0071FC4C_u32),
+        ("ROM[0x800000] (external REx)", 0x00800000_u32),
+    ] {
+        let pa = crate::trap::guest_tl_translate(va);
+        let w0 = pa.and_then(guest_mem::read_word_pa);
+        let w1 = pa.map(|p| p.wrapping_add(4)).and_then(guest_mem::read_word_pa);
+        kprintln!(
+            "  {} VA {:#x} → PA {:?}: magic={:?} {:?}",
+            label, va, pa, w0, w1
+        );
+    }
+
+    // Compare two PAs: 0x0400d1c4 (pre-MMU globals per rex-dabt r4) vs
+    // 0x0401_01c4 (what our stage-1 walker claims VA 0x0c1061c4 maps to).
+    // If these contain the same bytes, either both were written or they alias.
+    kprintln!("  --- Pre-MMU globals PA 0x0400d1c4 ---");
+    for off in [0u32, 0x4, 0x8, 0x10, 0x18, 0x1c, 0x20, 0x24, 0x28, 0x30, 0x220, 0x228, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8, 0x2fc, 0x30c] {
+        let pa = 0x0400_d1c4 + off;
+        let v = guest_mem::read_word_pa(pa);
+        kprintln!("    +{:#05x} PA {:#x} = {:?}", off, pa, v);
+    }
+    kprintln!("  --- Walker-claimed post-MMU PA 0x0401_01c4 (stage-1 walk of VA 0x0c1061c4) ---");
+    for off in [0u32, 0x4, 0x8, 0x220, 0x228, 0x2e8, 0x2ec, 0x2f0, 0x2f4, 0x2f8] {
+        let pa = 0x0401_01c4 + off;
+        let v = guest_mem::read_word_pa(pa);
+        kprintln!("    PA {:#x} = {:?}", pa, v);
+    }
+    // Also dump the raw stage-1 L1 entry for VA 0x0c100000 to confirm.
+    let l1_pa = 0x0400_0000 + 0xC1 * 4;
+    let l1 = guest_mem::read_word_pa(l1_pa);
+    kprintln!("  guest L1[0xC1] at PA {:#x} = {:?}", l1_pa, l1);
+    if let Some(l1_v) = l1 {
+        // Decode: ty = bits[1:0]. For coarse (01), L2 base = entry & 0xFFFFFC00.
+        let ty = l1_v & 3;
+        kprintln!("    type = {} ({})", ty,
+            match ty { 0 => "fault", 1 => "coarse", 2 => "section", _ => "fine/super" });
+        if ty == 1 {
+            let l2_base = l1_v & 0xFFFF_FC00;
+            kprintln!("    L2 base PA = {:#x}", l2_base);
+            // Dump the full L2 table (256 entries)
+            for i in 0..16 {
+                let pa = l2_base + (i as u32) * 4;
+                let v = guest_mem::read_word_pa(pa);
+                kprintln!("    L2[{:#04x}] at PA {:#x} = {:?}", i, pa, v);
+            }
+            // And the specific L2 entry for VA 0x0c1061c4: l2_idx = 0x6
+            let va = 0x0c1061c4_u32;
+            let l2_idx = (va >> 12) & 0xFF;
+            let l2_entry_pa = l2_base + l2_idx * 4;
+            let l2_entry = guest_mem::read_word_pa(l2_entry_pa);
+            kprintln!(
+                "    L2[{:#x}] for VA {:#x} at PA {:#x} = {:?}",
+                l2_idx, va, l2_entry_pa, l2_entry
+            );
+        } else if ty == 2 {
+            let pa = (l1_v & 0xFFF00000) | (0x0c1061c4 & 0x000FFFFF);
+            kprintln!("    section → PA {:#x}", pa);
+        }
+    }
+    kprintln!("  === end REx diagnostic ===");
 }

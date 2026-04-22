@@ -494,6 +494,23 @@ int main(int argc, char** argv) {
 		static_cast<unsigned>(mem->GetTranslationTableBase()),
 		static_cast<unsigned>(mem->GetDomainAccessControl()));
 
+	// PHASE B diagnostic: dump gGlobalsThatLiveAcrossReboot around +0x20
+	// on Einstein post-boot. On baremetal this word reads 0x6db60000 at
+	// RExScanner entry (poison in high halfword) which sends the scanner
+	// to base 0xB1FC4C instead of 0x71FC4C. If Einstein has 0 there, we
+	// know something in Einstein prevents the poison from landing.
+	std::fprintf(stdout, "\n=====> gGlobalsThatLiveAcrossReboot (Einstein post-boot)\n");
+	for (int off = 0x00; off <= 0x30; off += 4) {
+		Boolean fault = false;
+		KUInt32 v = mem->ReadP(0x0400d1c4u + off, fault);
+		std::fprintf(stdout, "  PA 0x%08X (+%#04x) = 0x%08X%s\n",
+			0x0400d1c4u + off, off, (unsigned) v, fault ? " (FAULT)" : "");
+	}
+	std::fprintf(stdout, "  PA 0x%08X (+0x2e8 REx[0]) = 0x%08X\n",
+		0x0400d1c4u + 0x2e8, (unsigned) mem->ReadP(0x0400d1c4u + 0x2e8, *(Boolean*)alloca(sizeof(Boolean))));
+	std::fprintf(stdout, "  PA 0x%08X (+0x2ec REx[1]) = 0x%08X\n",
+		0x0400d1c4u + 0x2ec, (unsigned) mem->ReadP(0x0400d1c4u + 0x2ec, *(Boolean*)alloca(sizeof(Boolean))));
+
 	mmu->FDump(stdout);
 	dump_instrumentation(stdout);
 	dump_classifier_bitmaps(romPath, rexPath);

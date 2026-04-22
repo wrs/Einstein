@@ -44,10 +44,155 @@ is `SPSR_svc.mode == USR` — it's not (we're kernel-internal) so it
 hits `DebuggerUND "SWI from non-user mode (rebooting)"`. That
 panic is the SAME one we'd been parking earlier; it turns out to
 be the tail of the PowerOffAndReboot path, not an independent
-issue. Resolving the **flash-identify failure** is the next
-Phase-B cliff: give `T28F016_SA_SVDriver::Identify` a plausible
-manufacturer/device ID or emulate the Intel 28F016 command set on
-the flash banks.
+issue.
+
+## Root cause (2026-04-22, via early-patched tracer)
+
+**The bug: `MemoryTest` leaves `gGlobalsThatLiveAcrossReboot + 0x20` as
+the 0xb6db6db6 RAM-test poison pattern, and `RExScanner` reads the high
+16 bits of that field to decide whether to scan at base 0x0071FC4C or
+0x00B1FC4C (= base + 0x400000). On our platform post-MemoryTest
+hi16 = 0xb6db ≠ 0, so the scanner looks at 0x00B1FC4C — which has no
+RExBlock magic — and `REx[0..3]` never get populated.**
+
+Evidence: installing three pre-MMU UDF trace patches at `RExScanner`
+(0x313888), `ScanForREx` (0x313818), and `TestForREx` (0x3137dc)
+immediately at ROM-load time (before stage-2 enables), then dumping
+r0-r4 on the first fire of each:
+
+```
+trace 1 RExScanner   r0=0x0400d1c4 r1=0x00400004 r2=0x4 r3=0xe038 r4=0x0400d1c4
+trace 2 ScanForREx   r0=0x0400d1c4 r1=0x00b1fc4c r2=0x0400d4dc r3=0xe038 r4=0x0400d1c4
+trace 3 TestForREx   r0=0x00b1fc4c r1=0x00b1fc4c r2=0x0400d4dc r3=0xe038 r4=0x0400d1c4
+```
+
+`r1` is the cursor that `ScanForREx` was asked to probe — 0x00b1fc4c
+instead of the 0x0071fc4c literal in RExScanner's pool. The scan
+therefore reads the zero-filled trailing ROM at 0x00b1fc4c, finds no
+magic, returns without populating REx[].
+
+RExScanner's code (host PA 0x023138c8..0x023138d8, read over gdb
+`monitor xp`):
+
+```
+0x3138c8: ldr r1, [pc, #0x4c]   r1 = literal 0x0071FC4C
+0x3138cc: ldr r0, [r4, #0x20]   r0 = gGlobals[0x20]
+0x3138d0: lsrs r0, r0, #0x10    r0 >>= 16; set flags
+0x3138d4: addne r1, r1, #0x400000  if hi16(gGlobals[0x20]) != 0: r1 += 4 MiB
+0x3138d8: mov r0, r4
+0x3138dc: bl ScanForREx         call(globals, r1)
+```
+
+Fix: zero `*(r0 + 0x20)` on every `RExScanner` entry. With that one
+word cleared, `ScanForREx` is called with base 0x71FC4C and populates
+`REx[0]=0x71FC4C` (embedded). `RExScanner`'s conditional second call
+then scans at 0x800000 and populates `REx[1]=0x800000` (the external
+Einstein REx). Confirmed at `SearchForFlashDrivers` entry:
+
+```
+REx[0] at VA 0xc1064ac → PA 0x0400d4ac → 0x0071FC4C
+REx[1] at VA 0xc1064b0 → PA 0x0400d4b0 → 0x00800000
+```
+
+So `PrimNextRExConfigEntry` now returns the Einstein FDRV entries and
+the kernel no longer falls through to `T28F016_SA_SVDriver::Sizeof` /
+`::Init` / `::Identify`. The T28F016 traces are gone from the 72-deep
+boot.
+
+### Still stalling past the REx fix
+
+With REx registered correctly, boot still ends at `PowerOffAndReboot`
+(trace 67) via `CheckFor{4,2,1}LaneFlash` → `FindDriverAble` failing.
+The Einstein FDRV driver is findable but its `Identify` native-primitive
+isn't getting invoked — probably a separate issue in how
+`TNewInternalFlash::FindDriverAble` walks the driver classes we now
+registered. That's the next thing to pin down (likely involves setting
+up `peripherals::flash_driver::identify`'s native-primitive dispatch
+path and/or more of the fdrv class-info struct). The REx-visibility
+blocker is clear.
+
+### Why Einstein doesn't hit this
+
+Einstein emulates the Newton the same way but presents RAM differently:
+its `TMemory` zeros the backing on allocate or the RAM-test fill
+doesn't reach `gGlobals[0x20]` before `RExScanner` reads it.
+Alternatively Einstein's emulated MemoryTest pass follows a different
+code path that leaves the first page of the globals struct cleared.
+Either way, Einstein's `gGlobals[0x20]` is 0 when `RExScanner` fires,
+so the scanner takes the 0x71FC4C branch.
+
+## Earlier root-cause attempts (2026-04-22, superseded)
+
+Using `aarch64-elf-gdb` against QEMU's `-s` stub plus a one-shot
+diagnostic in `tracer::handle_trace_und` that dumps guest RAM at
+`SearchForFlashDrivers` entry:
+
+- Our external `Einstein.rex` IS loaded correctly at guest PA
+  `0x00800000`: magic `RExBlock`, manufacturer `Eins`, id=1 (patched
+  from 2 by our loader), startAddr=`0x00800000`, numEntries=3
+  (entries `fdrv` / `FDRV` / `pkgl`). The ROM-backing bytes match
+  what `xxd` on the file shows.
+- The kernel's REx base table (three parallel arrays inside
+  `gGlobalsThatLiveAcrossReboot` at guest VA `0x0c1061c4`) is
+  **all zero** when `SearchForFlashDrivers` runs. Specifically:
+  - Table A at `gGlobals+0x2e8+id*4` (REx startAddr per id) = 0
+  - Table B at `gGlobals+0x2fc+id*4` (REx ROM pointer per id)  = 0
+  - Table C at `gGlobals+0x30c+id*4` (REx size per id)         = 0
+- `PrimNextRExConfigEntry` (0x11ee60) first loads Table A[id] and
+  returns immediately if the slot is zero. So every
+  `PrimNextRExConfigEntry` call returns no entry, the flash-driver
+  search never sees any `fdrv` record, and the kernel falls through
+  to the built-in `T28F016_SA_SVDriver` which then fails `Identify`.
+- The function that SHOULD have populated the REx tables,
+  `RExScanner` (0x313888), is NOT called on first boot in our setup
+  — it doesn't appear in the 72-deep trace. On *re-boot* (after
+  PowerOffAndReboot → SWIBoot → ROMBoot), the trace DOES show it
+  (traces 81–83 in a `trace,quiet` run): `RExScanner → ScanForREx →
+  TestForREx`. So the reboot code path runs the scan but the first-
+  boot code path (which we're stuck in) does not.
+
+RExScanner's logic, from the ROM bytes read over gdb `monitor xp`:
+  1. Clear all three tables for id=0..3.
+  2. Load base cursor from a literal pool entry = `0x0071FC4C`
+     (i.e., the embedded-REx base for 717006).
+  3. Adjust base by +0x40000 if `gGlobals[0x20] >> 16 != 0`.
+  4. Call `ScanForREx(globals, 0x0071FC4C)` → walks contiguous
+     `RExBlock` magic from the base, registering each REx it finds.
+  5. If the returned cursor is still `< 0x00800000`, call
+     `ScanForREx(globals, 0x00800000)` — scans our external REx
+     aperture.
+  6. Call `ScanForREx(globals, 0x10000000)` — scans flash bank 2.
+
+So the kernel DOES know about our `0x00800000` aperture; step 5 is
+the explicit fallback Einstein also uses in its host-side
+`LookForREXes`. We just never get there because step 1 isn't being
+triggered on the first-boot code path.
+
+A test patch that writes into all three REx tables at
+`SearchForFlashDrivers` entry (id=0 → embedded REx, id=1 → external)
+changes the subsequent trace: `T28F016_SA_SVDriver::Sizeof/Init`
+vanishes, meaning the kernel did find a driver class via
+`PrimNextRExConfigEntry`. But `TEinsteinFlashDriver::Identify` also
+isn't called, and boot still falls through to CheckFor{4,2,1}Lane
+and ends up in `PowerOffAndReboot`. So something else downstream
+(class-info entry format, driver registration chain) also needs
+setup beyond the three-table write. The REx-table population is
+necessary but not sufficient. **Next:** figure out what callers of
+`RExScanner` the first-boot path takes instead, by pre-patching a
+UDF at `0x313888` *before* the tracer's usual MMU-rising-edge trigger
+so we can see whether it's called at all pre-MMU-on.
+
+Alternative Phase-B unblock ideas if the first-boot REx registration
+is too hard to fix directly:
+
+- Patch ROM to make the first-boot path also call `RExScanner`
+  before `SearchForFlashDrivers` runs.
+- Supply the REx tables from the hypervisor side right after
+  `SetGlobalsInitialized` (trace 25) and before the TNewInternalFlash
+  init chain (trace 41+), which is the natural-feeling injection
+  point since the kernel isn't mid-flow at that moment.
+
+## What's been resolved since this file was last written
 
 ## What's been resolved since this file was last written
 

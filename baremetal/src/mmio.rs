@@ -72,9 +72,20 @@ pub fn read(ipa: u64, sas: u8, elr: u64) -> u32 {
         HW_RAM_SIZE_2 => 0,
 
         // kHdWr_P0F242400: chipset revision ID. TMemoryConsts.h:144
-        // documents observed values 0, 0x01F9453C, 0x01F94573. Return
-        // the mid-life value since the ROM accepts any of them.
-        0x0F24_2400 => 0x01F9_4573,
+        // documents observed values 0, 0x01F9453C, 0x01F94573 and we
+        // initially returned 0x01F94573 on the assumption that "the
+        // ROM accepts any of them". It doesn't: ROMBoot at 0x186D0
+        // does `BICS r0, r0, #0xFF000000 ; BNE 0x191D0`, so a non-zero
+        // low-24 payload takes the WARM-reset fast-path that expects
+        // `gParamBlockFromImagePhysical` (RAM 0x0400_6400) to already
+        // hold the per-mode stack-table. On cold boot that RAM is
+        // zero and SP_und ends up 0, producing a zero-SP STMDB abort
+        // at ROM 0x19410. Einstein returns 0 for this register
+        // (unknown-Bank-#4 default in TMemory.cpp), so the BNE isn't
+        // taken and the kernel falls through to the COLD-boot path
+        // that calls SetFIQStack/SetIRQStack/... with explicit stack
+        // values. Match Einstein.
+        0x0F24_2400 => 0,
 
         // kHdWr_P0F001000: memory-access-speed-related. R/W; kernel
         // reads 0 during probe. TMemoryConsts.h:56.
@@ -181,6 +192,14 @@ pub fn write(ipa: u64, sas: u8, value: u32, elr: u64) {
         0x0F28_0000 => {} // P0F280000        W (0x465A, 0xC044)
         0x0F28_0400 => {} // P0F280400        W (0x181A, 0x2C34)
         0x0F28_0800 => {} // P0F280800        W (0x2003)
+        // P0F280C00 and P0F282000 aren't cited in TMemoryConsts.h but
+        // the unrolled bus-config init at ROM 0x192c8..0x19330 writes
+        // to both alongside the documented 0x0F28_{0000,0400,0800,
+        // 3000,3400}. Einstein's TMemory silently no-ops all unmapped
+        // Bank #4 writes; we accept each explicitly so the Phase A
+        // whitelist stays a closed set.
+        0x0F28_0C00 => {}
+        0x0F28_2000 => {}
         0x0F28_3000 => {} // P0F283000        W (0, 0x255, 0x257)
         // kHdWr_P0F283400 isn't documented in TMemoryConsts.h but is
         // written with value 0x23 by the same init routine (PC 0x19598

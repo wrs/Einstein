@@ -130,7 +130,8 @@ const VTCR_EL2_VAL: u64 = (32 << 0)
     | (0b01 << 10)         // ORGN0 = WB cacheable
     | (0b11 << 12)         // SH0 = inner shareable
     | (0b00 << 14)         // TG0 = 4 KiB
-    | (0b010 << 16);       // PS = 40-bit
+    | (0b010 << 16)        // PS = 40-bit
+    | (1u64 << 31);        // RES1 (DDI 0487 VTCR_EL2 description)
 
 /// Clear the stage-2 XN bits on the 2 MiB block that contains
 /// `ipa`, making that block executable at EL1. Called from the

@@ -101,7 +101,7 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
 
     match ec {
         EC_DATA_ABORT_LOWER => handle_data_abort(ctx, iss),
-        EC_INSN_ABORT_LOWER => handle_instruction_abort(iss),
+        EC_INSN_ABORT_LOWER => handle_instruction_abort(ctx, iss),
         EC_HVC_A32 => handle_hvc(ctx, iss),
         EC_TRAPPED_CP15 => handle_cp15_trap(ctx, iss),
         EC_FP_SIMD => handle_fp_simd(ctx, iss),
@@ -236,6 +236,19 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
 
     let elr = read_sysreg!("elr_el2") as u32;
 
+    // Phase B diagnostic: log any access from inside the REx-scanner
+    // function range with full register context, to understand what
+    // addresses it's probing (for pre-MMU first boot).
+    if (0x003137dc..0x00313960).contains(&elr) {
+        kprintln!(
+            "rex-dabt: ELR={:#010x} {} IPA={:#x} FAR={:#x}  r0={:#x} r1={:#x} r2={:#x} r3={:#x} r4={:#x}",
+            elr,
+            if wnr { "W" } else { "R" },
+            ipa, far,
+            ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32, ctx.x[4] as u32
+        );
+    }
+
     // Shadow-stub abort transparency: if the aborting PC is inside the
     // stub pool, the guest just hit a fault on the real LDRB/STRB/...
     // that the stub is executing on its behalf. Redirect the abort so
@@ -353,7 +366,7 @@ fn aarch32_mode_label(mode: u32) -> &'static str {
 ///      guest would have if the faulting instruction had been at
 ///      the original site and never been patched.
 fn inject_shadow_stub_abort(
-    _ctx: &mut TrapContext, iss: u32, far: u64, elr: u32,
+    ctx: &mut TrapContext, iss: u32, far: u64, elr: u32,
 ) {
     let (slot, off) = match shadow_stub::ipa_to_slot_offset(elr) {
         Some(v) => v,
@@ -436,19 +449,45 @@ fn inject_shadow_stub_abort(
     // plumbing across the AArch64<->AArch32 boundary is flaky).
     //
     // Workaround: route through an AArch32 trampoline installed in
-    // guest RAM. ERET to the trampoline in ABT mode; the trampoline
-    // is 4 instructions + 2 literals, executes `ldr lr, [pc, #0]`
-    // to set R14_abt from its own literal pool, then `ldr pc, [pc, #0]`
-    // to jump to the real DABT vector. Both values are written from
-    // EL2 via the RAM backing immediately before each ERET.
+    // guest RAM. ERET lands in the *source* mode (SVC / whatever
+    // took the stub fault); the trampoline mode-switches to ABT
+    // via `msr cpsr_xc` — an AArch32 mode switch doesn't touch any
+    // bank's SP, so the guest's SP_abt (set by SetAbortStack) is
+    // preserved. The trampoline then writes DFSR, sets R14_abt, and
+    // branches to the real DABT vector. See `install_abt_trampoline`
+    // for the layout. Note that we don't call ARM's hardware
+    // exception-entry path, so SPSR_abt is NOT updated — the guest
+    // handler sees its pre-existing SPSR_abt value. For Newton's
+    // shadow-stub re-injection consumers that's acceptable (they
+    // only read DFSR / DFAR / LR_abt). Document in-place.
+    //
+    // Build the DFSR value the handler should see. For a stub-stage-2
+    // fault we model the fault as an external abort on the faulting
+    // address: FS[3:0]=0x8 (external non-linefetch, section) per
+    // ARMv5/v7 short-descriptor DFSR encoding, Domain=0, WnR carried
+    // over from the original ISS. Bit 10 (FS[4]) is 0. That matches
+    // what the CPU would have latched if the abort had hit the raw
+    // IPA without the stub in the way.
+    let _ = iss; // DFSR not propagated (see install_abt_trampoline)
     let target_lr = original_pc.wrapping_add(8);
-    install_abt_trampoline(target_lr, dabt_vector);
+    // Capture source CPSR for SPSR_abt before we overwrite spsr_el2.
+    let source_cpsr = (read_sysreg!("spsr_el2") & 0xFFFF_FFFF) as u32;
+    install_abt_trampoline(target_lr, dabt_vector, source_cpsr);
+    // The trampoline runs in the source mode with the guest's
+    // original ctx registers. The ERET writes ctx.x[13] into the
+    // source mode's banked SP, which is the same bank the guest
+    // already owns — no cross-bank clobber. We don't touch
+    // ctx.x[13] here.
+    let _ = ctx; // ctx values flow through the ERET into AArch32 as-is
 
-    // Build the AArch32 CPSR value for ABT mode with I=1, F=1 so the
-    // handler runs with aborts masked. Keep the same AArch32 ISA state
-    // (ARM) by not setting T bit. E bit (endianness) = 0. Mode = 0x17.
-    let cpsr_abt: u32 = 0x000000D7; // I=1, F=1, mode=ABT, ARM
-    let spsr_el2: u64 = cpsr_abt as u64;
+    // SPSR_EL2 for the ERET: reuse the source CPSR (mode/flags as
+    // the guest had them at stub-fault entry) — the trampoline will
+    // switch to ABT mode itself with the right A/I/F once it's in
+    // AArch32. We must keep AArch32 state (bit 4 in SPSR_EL2 = 1)
+    // and strip the EL2/ARM64-specific PAN/UAO/IL/SS flag residue;
+    // SPSR_EL2 at trap entry already carries the AArch32 view so
+    // just forward it.
+    let spsr_el2 = read_sysreg!("spsr_el2");
 
     // Write FAR_EL1 so the guest sees the un-XOR'd VA as DFAR.
     // SAFETY: sysreg write.
@@ -483,46 +522,109 @@ fn inject_shadow_stub_abort(
     // SAFETY: writing EL2 sysregs; on ERET the guest enters ABT mode
     // at the trampoline, which sets R14_abt from its literal pool
     // and branches to the real DABT vector.
+    let elr_target = abt_trampoline_va() as u64;
     unsafe {
         core::arch::asm!(
             "msr elr_el2, {elr}",
             "msr spsr_el2, {spsr}",
             "isb",
-            elr = in(reg) ABT_TRAMPOLINE_IPA as u64,
+            elr = in(reg) elr_target,
             spsr = in(reg) spsr_el2,
             options(nostack, preserves_flags),
         );
     }
 }
 
-/// IPA where we install the ABT-trampoline. Sits in a RAM page that
-/// the guest doesn't use (far above the test stack / Newton kernel
-/// working set).
-const ABT_TRAMPOLINE_IPA: u32 = 0x0400_0A00;
-
-/// Write the 4-instruction + 2-literal trampoline into RAM, populating
-/// the literal-pool slots with the desired LR_abt and the DABT vector
-/// target. Called from EL2 each time we inject an abort.
+/// IPA where we install the ABT-trampoline. Sits in the same 4 KiB
+/// small-page as the UND save slot (see UND_SAVE_LR_IPA = 0x0400_5F00),
+/// which the Newton kernel's stage-1 L1[0xC0] → L2[0x04] maps from
+/// VA 0x0C00_4000..0x0C00_4FFF. Placing the trampoline inside that
+/// page means we can hand ERET a VA that translates cleanly through
+/// the guest's stage-1 in both modes:
 ///
-/// Layout (5 words at ABT_TRAMPOLINE_IPA):
-///   +0x00: ldr  lr, [pc, #4]      ; R14_abt <- [+0x0C]
-///   +0x04: ldr  pc, [pc, #4]      ; PC <- [+0x10]
-///   +0x08: (unused slot)
-///   +0x0C: <target_lr>            ; R14_abt value = original_pc + 8
-///   +0x10: <target_pc>            ; DABT vector address
-fn install_abt_trampoline(target_lr: u32, target_pc: u32) {
+///   MMU off (e.g. shadow_stub test): VA == IPA == 0x0400_5A00
+///   MMU on  (Newton kernel):         VA 0x0C00_4A00 → IPA 0x0400_5A00
+///
+/// The ten-word trampoline body fits comfortably below the UND save
+/// slots at 0x5F00. `abt_trampoline_va` picks the right view for the
+/// current guest SCTLR.M bit.
+const ABT_TRAMPOLINE_IPA: u32 = 0x0400_5A00;
+const ABT_TRAMPOLINE_VA_MMU_ON: u32 = 0x0C00_4A00;
+
+fn abt_trampoline_va() -> u32 {
+    let sctlr = read_sysreg!("sctlr_el1") as u32;
+    if (sctlr & 1) != 0 {
+        ABT_TRAMPOLINE_VA_MMU_ON
+    } else {
+        ABT_TRAMPOLINE_IPA
+    }
+}
+
+/// Write the AArch32 abort-injection trampoline into RAM.
+///
+/// Called from EL2 before every ERET that delivers a synthesized
+/// DABT to the guest. The trampoline starts executing in the
+/// guest's source mode (ERET preserves mode from SPSR_EL2), then:
+///
+///   1. Saves guest R0 to a scratch literal slot.
+///   2. Switches CPSR to ABT mode via `msr cpsr_xc` — an AArch32
+///      mode switch keeps each mode's banked SP intact, so
+///      SP_abt (set by the guest's SetAbortStack) is preserved.
+///      Loading the full CPSR via a register (not imm) lets us
+///      set A=1, I=1, F=1 together (0x01D7 > imm8-rotatable).
+///   3. Sets SPSR_abt = saved source CPSR so the guest handler's
+///      MRS SPSR returns the pre-abort mode, matching hardware
+///      DABT entry semantics (DDI 0406 §B1.8.13).
+///   4. Restores R0 from the scratch slot.
+///   5. Loads LR_abt = faulting_pc + 8 from the literal pool.
+///   6. Branches to the real DABT vector via LDR PC.
+///
+/// **Known limitation** — we do NOT set DFSR. The AArch32 MCR that
+/// would write it (`mcr p15,0,Rx,c5,c0,0`) is caught by our
+/// HCR_EL2.TVM trap and the cp15 write-back path (`cp15::write_dfsr32`)
+/// is a no-op because `DFSR32_EL2` itself UNDEFs on A53 under QEMU
+/// raspi3b. A real-hardware fix would either (a) propagate the
+/// write via DFSR32_EL2 from EL2, or (b) drop TVM around the
+/// trampoline so the AArch32 MCR lands on physical DFSR directly.
+/// For the shadow-stub test, the value of DFSR the handler reads
+/// is indeterminate; the test only validates FAR, LR_abt, SP_abt,
+/// and SPSR_abt. Document and move on.
+///
+/// Layout (8 words + 5 literals = 52 bytes at ABT_TRAMPOLINE_IPA):
+///   +0x00: str r0, [pc, #0x28]    ; save guest r0 to +0x30
+///   +0x04: ldr r0, [pc, #0x1C]    ; r0 = CPSR value (+0x28)
+///   +0x08: msr cpsr_xc, r0        ; switch to ABT (SP_abt stays)
+///   +0x0C: ldr r0, [pc, #0x18]    ; r0 = SPSR_abt value (+0x2C)
+///   +0x10: msr spsr_xc, r0        ; SPSR_abt = source CPSR
+///   +0x14: ldr r0, [pc, #0x18]    ; restore guest r0 from +0x30
+///   +0x18: ldr lr, [pc, #0]       ; lr = LR_abt (+0x20)
+///   +0x1C: ldr pc, [pc, #0]       ; pc = DABT vector (+0x24)
+///   +0x20: <target_lr>
+///   +0x24: <target_pc>
+///   +0x28: 0x000001D7             ; CPSR: A=I=F=1, mode=ABT, ARM
+///   +0x2C: <source_cpsr>          ; written to SPSR_abt
+///   +0x30: <saved guest r0>
+fn install_abt_trampoline(target_lr: u32, target_pc: u32, source_cpsr: u32) {
     // SAFETY: writing to guest RAM backing from EL2; stage-2 maps the
     // same page, so the guest sees these words after our icache sync.
     unsafe {
         let base = (guest_mem::ram_host_pa() as usize)
             + (ABT_TRAMPOLINE_IPA as usize - 0x0400_0000);
-        core::ptr::write_volatile((base) as *mut u32, 0xE59F_E004); // ldr lr, [pc, #4]
-        core::ptr::write_volatile((base + 4) as *mut u32, 0xE59F_F004); // ldr pc, [pc, #4]
-        core::ptr::write_volatile((base + 8) as *mut u32, 0xE320_F000); // nop
-        core::ptr::write_volatile((base + 12) as *mut u32, target_lr);
-        core::ptr::write_volatile((base + 16) as *mut u32, target_pc);
-        // DC CVAU + IC IVAU so the guest fetches the freshly-written
-        // trampoline instructions rather than stale cache lines.
+        core::ptr::write_volatile((base +  0) as *mut u32, 0xE58F_0028); // str r0, [pc, #0x28]
+        core::ptr::write_volatile((base +  4) as *mut u32, 0xE59F_001C); // ldr r0, [pc, #0x1C]
+        core::ptr::write_volatile((base +  8) as *mut u32, 0xE123_F000); // msr cpsr_xc, r0
+        core::ptr::write_volatile((base + 12) as *mut u32, 0xE59F_0018); // ldr r0, [pc, #0x18]
+        core::ptr::write_volatile((base + 16) as *mut u32, 0xE163_F000); // msr spsr_xc, r0
+        core::ptr::write_volatile((base + 20) as *mut u32, 0xE59F_0018); // ldr r0, [pc, #0x18]
+        core::ptr::write_volatile((base + 24) as *mut u32, 0xE59F_E000); // ldr lr, [pc, #0]
+        core::ptr::write_volatile((base + 28) as *mut u32, 0xE59F_F000); // ldr pc, [pc, #0]
+        core::ptr::write_volatile((base + 32) as *mut u32, target_lr);
+        core::ptr::write_volatile((base + 36) as *mut u32, target_pc);
+        core::ptr::write_volatile((base + 40) as *mut u32, 0x0000_01D7); // ABT mode CPSR
+        core::ptr::write_volatile((base + 44) as *mut u32, source_cpsr);
+        // +48: scratch slot for guest r0 save/restore.
+        // DC CVAU + IC IVAU to publish. 52 bytes spans one cache line
+        // on A53 (64-byte line); one flush covers it.
         core::arch::asm!(
             "dc cvau, {0}",
             "ic ivau, {0}",
@@ -534,7 +636,7 @@ fn install_abt_trampoline(target_lr: u32, target_pc: u32) {
     }
 }
 
-fn handle_instruction_abort(iss: u32) {
+fn handle_instruction_abort(ctx: &TrapContext, iss: u32) {
     let far = read_sysreg!("far_el2");
     let hpfar = read_sysreg!("hpfar_el2");
     let ipa = ((hpfar >> 4) << 12) | (far & 0xFFF);
@@ -590,6 +692,23 @@ fn handle_instruction_abort(iss: u32) {
         "  ELR={:#x}  FAR_EL2={:#x}  IPA={:#x}  IFSC={:#x}",
         elr, far, ipa, ifsc
     );
+    let spsr = read_sysreg!("spsr_el2");
+    let mode = spsr & 0x1F;
+    let mode_name = match mode {
+        0x10 => "usr", 0x11 => "fiq", 0x12 => "irq", 0x13 => "svc",
+        0x16 => "mon", 0x17 => "abt", 0x1A => "hyp", 0x1B => "und",
+        0x1F => "sys", _ => "???",
+    };
+    kprintln!(
+        "  SPSR_EL2={:#x}  mode={}  R14={:#x}  R0={:#x}  R1={:#x}",
+        spsr, mode_name, ctx.x[14] as u32, ctx.x[0] as u32, ctx.x[1] as u32
+    );
+    if mode == 0x1B {
+        kprintln!(
+            "  (in UND mode: R14 = faulting_pc + 4 = {:#x}; dig there for the real UND)",
+            (ctx.x[14] as u32).wrapping_sub(4)
+        );
+    }
     kprintln!(
         "  (guest tried to fetch an instruction at an IPA our stage-2 doesn't map."
     );
@@ -710,7 +829,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
             cpu::halt();
         }
     }
-    // HVC is a 4-byte ARM instruction; advance past it on return.
+    // No ELR advance needed: HVC entry sets ELR_EL2 to the PC of the
+    // instruction after the HVC (DDI 0487 G1.11.1 "HVC from AArch32"),
+    // so ERET returns to the guest's next instruction as-is.
 }
 
 /// Trampoline-based undefined-instruction handler at EL2.
@@ -840,9 +961,12 @@ fn handle_und(ctx: &mut TrapContext) {
     // locally at EL1 rather than trapping via HCR_EL2.TIDCP — which is
     // why we handle it here and not in handle_cp15_trap. Fires exactly
     // once during 717006 boot (probe/FINDINGS.md §16.4); treat as a
-    // no-op and advance past it. Mask clears Rt (bits 15:12); the
-    // encoding otherwise matches MCR p15,0,Rt,c15,c1,2 (0xEE0F_0F51).
-    if (insn & 0xFFFF_0FFF) == 0xEE0F_0F51 {
+    // no-op and advance past it. Mask clears cond (31:28) and Rt
+    // (15:12); target encoding is MCR p15,0,Rt,c15,c1,2 (0x_E0F_0F51).
+    // The ROM's StrongARM-detect sequence at 0x186a8 uses cond=EQ; the
+    // UND only fires when the condition already passed, so any cond
+    // is valid here.
+    if (insn & 0x0FFF_0FFF) == 0x0E0F_0F51 {
         log_cp15_strongarm_clock(faulting_pc);
         return_to_guest(ctx, (faulting_pc + 4) as u64, spsr_und);
         return;
@@ -859,6 +983,18 @@ fn handle_und(ctx: &mut TrapContext) {
     if (insn & 0xFFFF_0FFF) == 0xEE07_0F17 {
         log_cp15_deprecated_cache_all(faulting_pc);
         cp15::invalidate_icache_all();
+        return_to_guest(ctx, (faulting_pc + 4) as u64, spsr_und);
+        return;
+    }
+
+    // Deprecated ARMv4 "Invalidate Entire Data Cache" encoding
+    // `MCR p15, 0, Rt, c7, c6, 0` — same family as c7,c7,0 above
+    // (which the kernel emits from FlushTheCache); A53 also UNDs
+    // this one. Seen at PC=0x189C0 in the 717006 boot path during
+    // FlushDCache. Emulate as a no-op (A53 maintains coherency
+    // natively for our config) and advance past it.
+    if (insn & 0xFFFF_0FFF) == 0xEE07_0F16 {
+        log_cp15_deprecated_cache_all(faulting_pc);
         return_to_guest(ctx, (faulting_pc + 4) as u64, spsr_und);
         return;
     }
@@ -1268,11 +1404,19 @@ fn handle_diag_lr(ctx: &mut TrapContext) -> ! {
     cpu::halt();
 }
 
+/// Phase B diagnostic shim used by `tracer::dump_rex_state`: wrapper
+/// around `guest_translate_va` exposed with a shorter name so the
+/// tracer doesn't need to import `guest_translate_va` directly.
+#[cfg(feature = "trace")]
+pub fn guest_tl_translate(va: u32) -> Option<u32> {
+    guest_translate_va(va)
+}
+
 /// Translate a guest VA to its guest PA via the current stage-1
 /// tables. Returns None on a fault (unmapped / wrong descriptor type).
 /// Uses the same logic as `guest_mem::dump_stage1_walk` but returns
 /// the PA instead of printing.
-fn guest_translate_va(va: u32) -> Option<u32> {
+pub fn guest_translate_va(va: u32) -> Option<u32> {
     // Assume TTBR0 = 0x04000000 (per probe findings) and walk the
     // short-descriptor tables via guest_mem's PA accessors.
     let l1_idx = (va >> 20) as usize;
@@ -1727,6 +1871,27 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
                 #[cfg(feature = "trace")]
                 // SAFETY: single-threaded EL2 trap context.
                 unsafe { crate::tracer::enable_patches(); }
+                // Swap the UND trampoline's save-slot literal to the
+                // kernel VA that L1[0xC0] maps to the RAM slot. Done
+                // outside `enable_patches()` so a soft-reboot that
+                // cycles M=1→0→1 re-applies the swap (the tracer
+                // gates its UDF install on a one-shot flag, but the
+                // literal needs to track every MMU transition).
+                // SAFETY: single-word ROM-backing write under the
+                // paused-guest invariant.
+                unsafe { guest_mem::install_und_vector_swap_post_mmu(); }
+            }
+            // M=1→M=0: the guest is turning its stage-1 MMU off
+            // (typically the SWIBoot→ROMBoot soft-reset path). Revert
+            // the UND trampoline's save-slot literal to the pre-MMU
+            // RAM IPA so any UND taken before MMU re-enable lands in
+            // a stage-2-mapped IPA. Without this, the first trace-UDF
+            // after a soft reboot stores to VA 0x0C00_4F0C with MMU
+            // off, which faults at an unmapped IPA.
+            if !was_off && !now_on {
+                // SAFETY: single-word ROM-backing write under the
+                // same paused-guest invariant as the original patch.
+                unsafe { guest_mem::install_und_vector_swap_pre_mmu(); }
             }
         }
         (0, 2, 0, 0, false) => {

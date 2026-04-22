@@ -63,6 +63,19 @@ pub extern "C" fn kmain() -> ! {
     // automatically invoked at boot — a guest test triggers it via
     // `HVC #0x30` once the test has its vector table in place and is
     // ready to exercise the patched instructions.
+    //
+    // Not patching the Newton ROM here yet: blanket `patch_code_range(0,
+    // ROM_SIZE)` scans 16 MiB of mixed code/data and exhausts the 32k-slot
+    // stub pool long before it reaches the end of the ROM. The REx-scan
+    // investigation (INVESTIGATION.md §root-cause) traces the kernel
+    // boot stall to exactly this gap: the pre-RExScanner globals init does
+    // `STRH #0, [gGlobals, #0x20]` expecting BE-32 word-invariant
+    // semantics (high halfword cleared), and on our LE CPU without
+    // shadow-stub coverage the low halfword clears instead — leaving
+    // poison in the high bits that RExScanner then branches on. The
+    // proper fix is to drive the patch pass from the classifier bitmap
+    // (`baremetal/tools/classify-rom`) so stubs land on actual insns,
+    // not literal-pool data. Deferred to a follow-up change.
 
     // Seed the snapshot ring's sequence counter from existing slots
     // (so resumed runs don't reuse seq numbers), then attempt to

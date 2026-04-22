@@ -776,6 +776,15 @@ pub unsafe fn load_newton_rom() {
 const UND_TRAMP_OFFSET: usize = 0x00FF_FF00;
 
 unsafe fn patch_und_vector(rom: *mut u32) {
+    // The trampoline's save-slot address is held in the literal at
+    // offset 0x30. Pre-MMU we use the RAM *IPA* 0x0400_5F00 directly
+    // (since VA == IPA with the MMU off, and 0x0400_5F00 is inside
+    // our stage-2 RAM mapping). Once the guest enables its stage-1
+    // MMU, VA 0x0400_xxxx aliases ROM (read-only) under the kernel's
+    // L1[0x40] section, so `install_und_vector_swap_post_mmu()` swaps
+    // the literal to the VA 0x0C00_4F00, which the kernel's
+    // L1[0xC0] coarse → L2[0x04] small page maps back to RAM.
+
     let imm24 = ((UND_TRAMP_OFFSET as u32 - 0x0C) / 4) & 0x00FF_FFFF;
     let branch_insn = 0xEA00_0000 | imm24;
 
@@ -797,7 +806,38 @@ unsafe fn patch_und_vector(rom: *mut u32) {
         rom.add(base +  9).write(0xE321_F0DB);      // msr cpsr_c, #0xdb  (UND, I/F)
         rom.add(base + 10).write(0xE140_0170);      // hvc #0x10
         rom.add(base + 11).write(0xEAFF_FFFE);      // b . (trap)
-        rom.add(base + 12).write(0x0C00_4F00);      // literal: VA of save slot
+        rom.add(base + 12).write(0x0400_5F00);      // literal: RAM IPA (pre-MMU)
+    }
+}
+
+/// Swap the trampoline's save-slot literal from the pre-MMU RAM IPA
+/// (0x0400_5F00) to the post-MMU kernel VA (0x0C00_4F00). Called when
+/// the guest turns on its stage-1 MMU — past that point, VA
+/// 0x0400_xxxx aliases ROM under the kernel's L1[0x40] section and
+/// the pre-MMU literal would make the first STR in the trampoline
+/// fault on a read-only page.
+pub unsafe fn install_und_vector_swap_post_mmu() {
+    // SAFETY: single-word write to the trampoline's literal slot at
+    // ROM offset UND_TRAMP_OFFSET + 0x30, in bounds. Caller must
+    // hold exclusive access to the ROM backing.
+    unsafe {
+        let rom = rom_host_pa() as *mut u32;
+        let base = UND_TRAMP_OFFSET / 4;
+        rom.add(base + 12).write(0x0C00_4F00);
+    }
+}
+
+/// Revert the trampoline's save-slot literal back to the pre-MMU RAM
+/// IPA (0x0400_5F00). Called when the guest turns its stage-1 MMU
+/// off — typically the SWIBoot→ROMBoot soft-reset path. Without this,
+/// a UND taken before the next MMU re-enable would store to an
+/// unmapped IPA via the stale kernel-VA literal.
+pub unsafe fn install_und_vector_swap_pre_mmu() {
+    // SAFETY: same as the post-MMU swap above.
+    unsafe {
+        let rom = rom_host_pa() as *mut u32;
+        let base = UND_TRAMP_OFFSET / 4;
+        rom.add(base + 12).write(0x0400_5F00);
     }
 }
 

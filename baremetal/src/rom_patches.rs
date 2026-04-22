@@ -158,6 +158,17 @@ pub unsafe fn apply_717006_patches(rom_ptr: *mut u32) {
     kprintln!("rom_patch: applied {} simple patches + 5 native-call/injection ROM patches", applied);
 }
 
+/// (Previously we patched every `T28F016_SA_SVDriver` method to emit
+/// a NATIVE_PRIM(0, subfn) call, short-circuiting the real-Intel-chip
+/// protocol the ROM driver speaks against our plain-RAM flash backing.
+/// That worked as far as trace 142 but left the ROM's own method
+/// prologues half-overwritten, and the write-verify path still
+/// rebooted because endianness/lane assumptions didn't line up with
+/// what the kernel then read back. The correct fix is to restore the
+/// REx-based substitution so the kernel picks Einstein.rex's
+/// `TEinsteinFlashDriver` from the 'fdrv' entry — the same mechanism
+/// every other Einstein-provided driver uses. That investigation is
+/// parked.)
 /// Replace the UND-table slots at 0x0038CE6C (DebugStr) and 0x0038CE70
 /// (Debugger) with branches to small stubs that stash the guest's LR
 /// into r7 and then HVC to EL2. Einstein's callbacks do

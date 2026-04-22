@@ -761,8 +761,22 @@ subtest_19_abort_transparency:
     @ Reset captures in RAM.
     load_u32 r0, 0x04000900
     mov     r1, #0
-    str     r1, [r0, #0]                @ captured FAR
-    str     r1, [r0, #4]                @ captured LR
+    str     r1, [r0, #0x00]             @ captured FAR
+    str     r1, [r0, #0x04]             @ captured LR
+    str     r1, [r0, #0x08]             @ captured SP_abt
+    str     r1, [r0, #0x0C]             @ captured DFSR
+    str     r1, [r0, #0x10]             @ captured SPSR_abt
+
+    @ Seed SP_abt with a recognisable sentinel. The hypervisor's
+    @ inject_shadow_stub_abort must preserve this across ERET; a
+    @ bug where ctx.x[13] (= SP_svc) is left alone would land the
+    @ handler with SP_abt = SP_svc = 0x04001000 instead of the
+    @ sentinel.
+    mrs     r2, cpsr
+    msr     cpsr_c, #0xD7               @ ABT mode, I=F=1
+    load_u32 sp, 0x04001100             @ SP_abt sentinel
+    msr     cpsr_c, #0xD3               @ back to SVC, I=F=1
+    isb
 
     @ Target unmapped IPA. 0x5000_0000 is outside our stage-2 map;
     @ both 0x5000_0000 and 0x5000_0003 (XOR'd) are unmapped.
@@ -798,18 +812,59 @@ ram_helper_end:
 abort_handler:
     @ Running in AArch32 ABT mode after EL2 injected the abort.
     @ LR = original_pc + 8, FAR_EL1 holds the un-XOR'd guest VA.
+    @ Capture FAR, LR, SP_abt, DFSR, SPSR_abt, CPSR before anything
+    @ else can perturb them.
     load_u32 r0, 0x04000900
     mrc     p15, 0, r1, c6, c0, 0       @ DFAR = FAR_EL1
-    str     r1, [r0, #0]
-    str     lr, [r0, #4]
+    str     r1, [r0, #0x00]
+    str     lr, [r0, #0x04]
+    str     sp, [r0, #0x08]             @ SP_abt at injection-entry
+    mrc     p15, 0, r3, c5, c0, 0       @ DFSR
+    str     r3, [r0, #0x0C]
+    mrs     r6, spsr
+    str     r6, [r0, #0x10]
+    mrs     r7, cpsr
+    str     r7, [r0, #0x14]             @ current CPSR at handler entry
 
+    @ Check FAR: expect un-XOR'd guest VA 0x5000_0000.
     load_u32 r2, 0x50000000
     cmp     r1, r2
     bne     .Lst19_fail_far
+    @ Check LR: expect faulting_pc + 8.
     load_sym r2, .Lst19_faulting_pc
     add     r2, r2, #8
     cmp     lr, r2
     bne     .Lst19_fail_lr
+    @ Check SP_abt preserved: expect 0x0400_1100 sentinel.
+    load_u32 r2, 0x04001100
+    cmp     sp, r2
+    bne     .Lst19_fail_sp
+    @ Known QEMU raspi3b limitation: the hypervisor cannot propagate
+    @ a synthesized DFSR into the guest's ABT view. An AArch64 MSR
+    @ DFSR32_EL2 UNDEFs (cp15::write_dfsr32 is a no-op), and an
+    @ AArch32 `mcr p15,0,Rx,c5,c0,0` inside the trampoline is caught
+    @ by HCR_EL2.TVM and dropped. We skip the DFSR assertion here;
+    @ see install_abt_trampoline for the doc + rationale.
+    @ (Left `r3` with the observed DFSR so log inspection still shows it.)
+    @ Check SPSR_abt: expected to hold the source-mode CPSR at the
+    @ moment of the stub fault (DDI 0406 §B1.8.13 "TakeDataAbortException"
+    @ — SPSR_abt = CPSR_before). The hypervisor ERETs into this test
+    @ with A=I=F=1 (see src/guest.rs), so CPSR at fault is 0x1D3.
+    @ NZCV in the upper bits reflect flags at trap entry; mask them
+    @ off and compare the low 16 bits only.
+    ldr     r2, =0x0000FFFF
+    and     r6, r6, r2
+    ldr     r2, =0x000001D3
+    cmp     r6, r2
+    bne     .Lst19_fail_spsr
+
+    @ Check CPSR at handler entry: A=1, I=1, F=1, mode=ABT, ARM state.
+    @ Low 16 bits = 0x01D7 per DDI 0406 §B1.8.13 TakeDataAbortException.
+    ldr     r2, =0x0000FFFF
+    and     r7, r7, r2
+    ldr     r2, =0x000001D7
+    cmp     r7, r2
+    bne     .Lst19_fail_cpsr
 
     @ Success — signal PASS directly (we're in ABT mode; no need to
     @ return to SVC mode since this is the last subtest).
@@ -838,5 +893,29 @@ abort_handler:
     mov     r0, lr
     hvc     #2
     mov     r0, #0x92
+    hvc     #4
+    b       .Lst19_hang
+.Lst19_fail_sp:
+    mov     r0, sp
+    hvc     #2
+    mov     r0, #0x93
+    hvc     #4
+    b       .Lst19_hang
+.Lst19_fail_dfsr:
+    mov     r0, r3
+    hvc     #2
+    mov     r0, #0x94
+    hvc     #4
+    b       .Lst19_hang
+.Lst19_fail_spsr:
+    mov     r0, r6
+    hvc     #2
+    mov     r0, #0x95
+    hvc     #4
+    b       .Lst19_hang
+.Lst19_fail_cpsr:
+    mov     r0, r7
+    hvc     #2
+    mov     r0, #0x96
     hvc     #4
     b       .Lst19_hang

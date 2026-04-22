@@ -1,12 +1,24 @@
 #!/usr/bin/env bash
 # Cargo runner: convert the linked ELF to a flat kernel8.img and launch QEMU.
 # Usage (via cargo): `cargo run`. Extra QEMU args come from env var QEMU_EXTRA.
-# Set DEBUG=1 to pause at entry with a gdb stub on :1234.
+# Set DEBUG=1, or pass --gdb, to pause at entry with a gdb stub on :1234.
+# (DEBUG=1 and --gdb are equivalent.)
 
 set -euo pipefail
 
 elf="${1:?usage: run-qemu.sh <elf> [qemu args...]}"
 shift || true
+
+# Capture --gdb before forwarding remaining args to QEMU.
+gdb_flag=0
+qemu_passthrough=()
+for arg in "$@"; do
+    case "$arg" in
+        --gdb) gdb_flag=1 ;;
+        *)     qemu_passthrough+=("$arg") ;;
+    esac
+done
+set -- ${qemu_passthrough[@]+"${qemu_passthrough[@]}"}
 
 # Locate rust-objcopy from the active toolchain.
 sysroot="$(rustc --print sysroot)"
@@ -25,9 +37,11 @@ fi
 "$objcopy" -O binary "$elf" "$img"
 
 debug_args=()
-if [[ "${DEBUG:-0}" == "1" ]]; then
+if [[ "${DEBUG:-0}" == "1" || "$gdb_flag" == "1" ]]; then
     debug_args=(-s -S)
     echo "[run-qemu] gdb stub on :1234; machine paused at entry." >&2
+    echo "[run-qemu]   attach from another terminal:" >&2
+    echo "[run-qemu]     aarch64-elf-gdb -ex 'target remote :1234' '$elf'" >&2
 fi
 
 # QEMU's raspi3b routes the first `-serial` to the PL011 and the second to

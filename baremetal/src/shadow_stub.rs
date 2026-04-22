@@ -66,6 +66,24 @@ pub const STUB_POOL_SIZE: usize = 2 * 1024 * 1024;
 /// Addresses < XOR_LIMIT are treated as real memory (XOR applied);
 /// addresses >= XOR_LIMIT are treated as MMIO and passed through.
 /// Chosen to cover everything in the Newton IPA map below flash bank 1.
+///
+/// A previous review questioned whether the peripheral window
+/// 0x0F00_0000..0x0F40_0000 (below this limit) should be excluded so
+/// that patched LDRB/LDRH to a register doesn't land on a neighbouring
+/// byte. In practice the XOR is *correct* for those addresses too:
+/// the Newton kernel is big-endian-32 (see PLAN.md, `Emulator/Network/*`
+/// — every BE32 constant in the ROM gets swapped at load time), and a
+/// byte access to word-aligned MMIO yields byte[3] of the 32-bit value
+/// from the kernel's BE view, which is byte[0] from our LE view —
+/// exactly the XOR-by-3 transform the stub applies. The only MMIO
+/// region currently plumbed as RAM at stage-2 is the read-only tick
+/// page at 0x0F18_1000; a stubbed LDRB targeting any offset in that
+/// page still lands inside the same 4 KiB mapping and reads the
+/// BE-correct byte. Stubbed byte accesses to trap-for-dispatch MMIO
+/// addresses (e.g., 0x0F18_3000 int_present) stage-2-fault at the
+/// XOR'd EA; mmio::read will halt loudly on the unrecognised IPA
+/// rather than silently mishandling the access, which is the Phase A
+/// tripwire we want. Keep XOR_LIMIT at 0x1000_0000.
 pub const XOR_LIMIT: u32 = 0x1000_0000;
 
 /// Fixed bytes per stub slot. 16 words x 4 = 64 bytes. Worst case

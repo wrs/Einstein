@@ -127,3 +127,79 @@ early ROM bytes.
   isolation. A Phase B regression in handler code should show
   up as a failing test; run `guest-tests/scripts/run-all.sh`
   before committing.
+
+## Function-level execution trace
+
+`cargo run --release --features trace,quiet` produces a "first-touch"
+chronological log of every recognised Newton function as the guest
+enters it for the first time:
+
+```
+trace     1 PC=0x000188f8 LR=0x0001889c (svc) FlushTheCache
+trace     2 PC=0x00045b78 LR=0x000188a4 (svc) HandleDebugCard
+...
+```
+
+Useful for Phase-B bisection: a stall at some PC is immediately
+readable as "N functions deep into the boot, right after `FooBar`".
+
+### Mechanism (`src/tracer.rs`)
+
+1. `build.rs` parses `../_Data_/demangled_symbols.txt` when the
+   `trace` feature is on, keeps word-aligned ROM-range entries whose
+   names look like functions (uppercase-leading, C++ `::` / `(`),
+   drops linker markers (`Image$$…`, `…$Size`), and emits three
+   blobs into `OUT_DIR`: `fn_addrs.bin`, `fn_name_offs.bin`,
+   `fn_names.bin`.
+2. At ROM load time `tracer::init()` registers the table but does
+   **not** patch yet — the UND trampoline's save slot at VA
+   `0x0C00_4F00` only translates to the correct RAM IPA once the
+   guest's own stage-1 L1 is in place.
+3. On the first `SCTLR_EL1.M = 0 → 1` transition (intercepted via
+   `HCR_EL2.TVM`), `tracer::enable_patches()` walks `FN_ADDRS`,
+   reads each entry's current first word, and if it matches a
+   known ARM function-start allowlist (PUSH/STMFD sp!, SUB sp,
+   ADD ip-sp, STR lr / MOV ip-sp, MOV Rd-imm / MVN / MOV reg, LDR
+   pc-relative, MRC/MCR p15, B-cond-AL), stashes the original and
+   overwrites with `UDF #index` (A1 encoding `0xE7F0_00F0` with a
+   16-bit imm split). After the loop it does `dsb ish; ic ialluis;
+   dsb ish; isb` to publish the new instructions to the guest's
+   fetch path.
+4. On each trace UND the handler logs, restores the original word
+   in the ROM backing, invalidates the icache line via
+   `cpu::ic_ivau`, and rewinds `ELR_EL2` to the faulting PC.
+
+### UND trampoline extension
+
+To capture the caller's LR, the UND-vector trampoline
+(`patch_und_vector` in `src/guest_mem.rs`) briefly switches to SVC
+mode (`msr cpsr_c, #0xd3`), snapshots `R14_svc` into
+`UND_SAVE_LR_SVC_IPA = 0x0400_5F08`, and switches back before HVC.
+Reason: `MRS X, ELR_EL1` from AArch64 EL2 returns 0 under QEMU
+raspi3b for AArch32 banked state — same plumbing limitation that
+forces `LR_und` / `SPSR_und` to be persisted via RAM. The trampoline
+body is now 13 words at `0x00FFFF00..0x00FFFF34`; extend the
+reserved range in `tracer::in_reserved_range` if you grow it
+further.
+
+### Logging budget
+
+- `quiet` feature silences `fix_stage1_xn_bits:` summaries via
+  `dprintln!` in `src/uart.rs`. Route further recurring diagnostic
+  logs through `dprintln!` (not `kprintln!`) to keep trace output
+  readable. `dprintln!` is a no-op under `quiet`; `kprintln!` is
+  always emitted.
+
+### Gotchas
+
+- `trace` mutates many ROM words, so snapshots saved pre-patch are
+  rejected on load. Tracing runs are cold-boot runs — clear
+  `/tmp/newton-snapshot-*.bin` before the first boot.
+- Functions called before the guest's stage-1 MMU comes on
+  (`Reset` → early `ROMBoot` up through the first SCTLR.M=1 write)
+  are not in the trace. The first trace line today is
+  `FlushTheCache` at `0x000188f8`, which is just after the kernel
+  installs its initial L1 tables.
+- The `(svc)` mode label on each trace line is authoritative; the
+  LR value is only reliable when mode == svc. For other modes the
+  slot still holds the last stored `R14_svc` from the SVC bounce.

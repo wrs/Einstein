@@ -622,69 +622,84 @@ pub unsafe fn load_newton_rom() {
 /// boot gets stuck in. Moving the body far beyond the REx tail
 /// avoids any such aliasing.
 ///
-/// Trampoline body (arm-none-eabi-as disassembly):
-///   +0x00:  e92d0003   push {r0, r1}
-///   +0x04:  e59f0014   ldr r0, [pc, #20]      ; literal at +0x20
-///   +0x08:  e580e000   str lr, [r0]            ; LR_und -> UND_SAVE_LR_IPA
-///   +0x0C:  e14f1000   mrs r1, SPSR            ; r1 = SPSR_und
-///   +0x10:  e5801004   str r1, [r0, #4]        ; SPSR -> UND_SAVE_SPSR_IPA
-///   +0x14:  e8bd0003   pop {r0, r1}
-///   +0x18:  e1400170   hvc #0x10               ; UND_TAG — enter EL2
-///   +0x1C:  eafffffe   b .                     ; trap if we ever return
-///   +0x20:  04000400   .word UND_SAVE_LR_IPA
+/// Trampoline body:
+///   +0x00: e59fc028  ldr r12, [pc, #0x28]  ; literal at +0x30: save VA
+///   +0x04: e58c000c  str r0, [r12, #0x0C]  ; save pre-UND R0      (+0x0C)
+///   +0x08: e58c1010  str r1, [r12, #0x10]  ; save pre-UND R1      (+0x10)
+///   +0x0C: e58ce000  str lr, [r12]         ; save R14_und         (+0x00)
+///   +0x10: e14f0000  mrs r0, SPSR          ; r0 = SPSR_und
+///   +0x14: e58c0004  str r0, [r12, #4]     ; save SPSR_und        (+0x04)
+///   +0x18: e321f0d3  msr cpsr_c, #0xd3     ; → SVC (I/F masked)
+///   +0x1C: e1a0000e  mov r0, lr            ; r0 = R14_svc
+///   +0x20: e58c0008  str r0, [r12, #8]     ; save LR_svc          (+0x08)
+///   +0x24: e321f0db  msr cpsr_c, #0xdb     ; → UND (I/F masked)
+///   +0x28: e1400170  hvc #0x10             ; UND_TAG — enter EL2
+///   +0x2C: eafffffe  b .                   ; trap if we ever return
+///   +0x30: 0c004f00  .word UND_SAVE_BASE_VA (RAM-mirror VA)
+///
+/// Why the SVC bounce: `MRS X, LR_svc` and `MRS X, ELR_EL1` from
+/// AArch64 EL2 return 0 under QEMU raspi3b for AArch32 banked state
+/// (same issue that forces LR_und/SPSR_und to be persisted here).
+/// The two `msr cpsr_c` instructions briefly switch the CPU mode so
+/// the trampoline can read R14_svc in-mode and store it; the handler
+/// at EL2 then reads the slot via `read_guest_word_pa`. The assumption
+/// is that the caller was in SVC — true for the Newton 2.x kernel.
+/// For callers in USR/IRQ/ABT the slot holds a stale R14_svc; trace
+/// consumers can tell from the SPSR_und mode field.
+///
+/// Why save R0 and R1 first: the trampoline clobbers R0 (to hold the
+/// save-slot VA for the SPSR/LR stores) and R1 (to carry SPSR_und
+/// across the mode bounce). Without persisting the pre-UND values,
+/// the guest's first two argument registers are scrambled whenever
+/// the tracer UDFs a function entry — caught in Phase B as a bogus
+/// PA 0x78 write from StoreToPhysAddress, which was actually
+/// AddPgPAndPermWithPageTable's prologue shuffling the clobbered R0
+/// (0x0C00_4F00) and R1 (LR_svc) into R7 and R4 before using them
+/// as a page-table base. `handle_und` restores `ctx.x[0]` and
+/// `ctx.x[1]` from these slots at entry; by the time execution ERETs
+/// back to the guest the registers are intact. R12 is NOT preserved —
+/// it ends up holding the save-slot VA — but every Newton 2.x kernel
+/// function we've observed starts with `MOV R12, R13`, so R12 is
+/// effectively scratch at the sites where the tracer patches.
 ///
 /// Branch encoding at VA 0x04: `b UND_TRAMP_OFFSET`.
 ///   imm24 = (UND_TRAMP_OFFSET - (0x04 + 8)) / 4
 ///
+/// Note: the guest's stage-1 L1[0x0F] maps VA 0x00F00000-
+/// 0x00FFFFFF identity to the ROM, so VA 0x00FFFF00 is the PC
+/// the CPU lands at. The literal holds a VA, which the guest's
+/// stage-1 translates through L1[0xC0] coarse -> L2[0x04] small
+/// page -> PA 0x04005F00 (RAM). We can't use the raw IPA 0x04005F00
+/// as the literal because the guest's L1[0x40] section maps VA
+/// 0x0400_xxxx to PA 0x0000_xxxx (ROM, RO under stage-2) post-MMU.
+///
 /// Safety: caller must hold exclusive access to the ROM backing
-/// store. Writes 9 words at the trampoline offset + 1 word at 0x04.
+/// store. Writes 13 words at the trampoline offset + 1 word at 0x04.
 const UND_TRAMP_OFFSET: usize = 0x00FF_FF00;
 
 unsafe fn patch_und_vector(rom: *mut u32) {
     let imm24 = ((UND_TRAMP_OFFSET as u32 - 0x0C) / 4) & 0x00FF_FFFF;
     let branch_insn = 0xEA00_0000 | imm24;
 
-    // SAFETY: offsets below all sit in 0x00FF_FF00..0x00FF_FF24,
+    // SAFETY: offsets below all sit in 0x00FF_FF00..0x00FF_FF34,
     // well under ROM_SIZE (= 16 MiB = 0x0100_0000).
     unsafe {
         rom.add(1).write(branch_insn);              // 0x04: b UND_TRAMP_OFFSET
 
         let base = UND_TRAMP_OFFSET / 4;
-        // DIAGNOSTIC trampoline that bypasses SP_und:
-        // Saves LR_und (and SPSR_und) to a fixed RAM slot via a
-        // literal-loaded pointer, then HVCs. Does not use push/pop,
-        // so it works even when SP_und is uninitialized post-MMU-on.
-        // Save slot is at IPA 0x0400_5F00 — the same small-page slot
-        // the DIAG stage-2 stub uses (VA 0x0C00_4F00), but at an
-        // offset that doesn't overlap its data area (0x04005F80..+0x28).
-        //   +0x00: e59f0018  ldr r0, [pc, #24]   ; literal at +0x20 = IPA save
-        //   +0x04: e580e000  str lr, [r0]         ; save R14_und
-        //   +0x08: e14f1000  mrs r1, SPSR        ; r1 = SPSR_und
-        //   +0x0C: e5801004  str r1, [r0, #4]    ; save SPSR_und
-        //   +0x10: e1400170  hvc #0x10            ; UND_TAG
-        //   +0x14: eafffffe  b .                  ; trap if we return
-        //   +0x18: e1a00000  nop
-        //   +0x1C: e1a00000  nop
-        //   +0x20: 04005f00  .word UND_SAVE slot (IPA, read directly
-        //                    from EL2 via guest_mem::read_word_pa)
-        // Note: the guest's stage-1 L1[0x0F] maps VA 0x00F00000-
-        // 0x00FFFFFF identity to the ROM, so VA 0x00FFFF00 is the PC
-        // the CPU lands at. The literal holds an IPA, which the guest's
-        // stage-1 translates through L1[0x40] (section → PA 0) -- i.e.
-        // a WRITE to VA 0x04005F00 post-MMU goes to PA 0x00005F00 (ROM,
-        // RO) and aborts at stage-2. So we have to write to a VA that
-        // translates to a RAM IPA. VA 0x0C004F00 via L1[0xC0] coarse
-        // -> L2[0x04] small page -> PA 0x04005F00 is RAM. Use THAT VA
-        // in the literal, not the raw IPA.
-        rom.add(base).write(0xE59F_0018);           // ldr r0, [pc, #24]
-        rom.add(base + 1).write(0xE580_E000);       // str lr, [r0]
-        rom.add(base + 2).write(0xE14F_1000);       // mrs r1, SPSR
-        rom.add(base + 3).write(0xE580_1004);       // str r1, [r0, #4]
-        rom.add(base + 4).write(0xE140_0170);       // hvc #0x10
-        rom.add(base + 5).write(0xEAFF_FFFE);       // b . (trap)
-        rom.add(base + 6).write(0xE1A0_0000);       // nop
-        rom.add(base + 7).write(0xE1A0_0000);       // nop
-        rom.add(base + 8).write(0x0C00_4F00);       // literal: VA of save slot (RAM mirror)
+        rom.add(base +  0).write(0xE59F_C028);      // ldr r12, [pc, #0x28]
+        rom.add(base +  1).write(0xE58C_000C);      // str r0, [r12, #0x0C]
+        rom.add(base +  2).write(0xE58C_1010);      // str r1, [r12, #0x10]
+        rom.add(base +  3).write(0xE58C_E000);      // str lr, [r12]
+        rom.add(base +  4).write(0xE14F_0000);      // mrs r0, SPSR
+        rom.add(base +  5).write(0xE58C_0004);      // str r0, [r12, #4]
+        rom.add(base +  6).write(0xE321_F0D3);      // msr cpsr_c, #0xd3  (SVC, I/F)
+        rom.add(base +  7).write(0xE1A0_000E);      // mov r0, lr  (= R14_svc)
+        rom.add(base +  8).write(0xE58C_0008);      // str r0, [r12, #8]
+        rom.add(base +  9).write(0xE321_F0DB);      // msr cpsr_c, #0xdb  (UND, I/F)
+        rom.add(base + 10).write(0xE140_0170);      // hvc #0x10
+        rom.add(base + 11).write(0xEAFF_FFFE);      // b . (trap)
+        rom.add(base + 12).write(0x0C00_4F00);      // literal: VA of save slot
     }
 }
 

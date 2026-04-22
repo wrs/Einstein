@@ -119,6 +119,57 @@ The guest eventually stalls in a pre-scheduler wait loop; the `beacon:`
 lines keep printing every 10 000 sync traps so you can see progress.
 Stop QEMU with `Ctrl-A X`.
 
+## Function-level execution trace
+
+Two cargo features gate the function-tracing facility:
+
+- `trace` — at boot, walks a compact function-address table embedded
+  from `_Data_/demangled_symbols.txt` and overwrites the first word of
+  each recognised ARM function entry with `UDF #index`. On the
+  resulting undefined-instruction trap the UND handler logs one line
+  (sequence, PC, caller LR, caller mode, function name), restores the
+  original word, invalidates the icache line, and rewinds ELR so the
+  guest re-executes the restored instruction natively. Each function
+  logs **once per boot** — a chronological "first-touch" trace of the
+  kernel. Patching is deferred until the guest enables its stage-1
+  MMU, because the UND trampoline's save slot relies on stage-1
+  translation; functions called before that (`Reset`, early
+  `ROMBoot`) are not traced. Adds ~1 MiB of embedded symbol data to
+  the image and mutates the ROM in ways that invalidate existing
+  snapshots, so cold-boot every run.
+
+- `quiet` — silences recurring diagnostic log lines
+  (`fix_stage1_xn_bits:` summaries, etc.). Pair with `trace` to keep
+  the trace output readable.
+
+```
+cargo run --release --features trace,quiet     # clean function trace
+cargo run --release --features trace           # function trace + full bring-up logs
+cargo run --release --features quiet           # no trace, no diag noise
+cargo run --release                            # default: no trace, full diag logs
+```
+
+Sample output (abridged):
+
+```
+trace: deferred patching of 31482 candidate entries until guest stage-1 MMU is on
+trace: patched 15143 / 31482 entries; 1 skipped (reserved range), 16338 skipped (non-function shape)
+trace     1 PC=0x000188f8 LR=0x0001889c (svc) FlushTheCache
+trace     2 PC=0x00045b78 LR=0x000188a4 (svc) HandleDebugCard
+trace     3 PC=0x0011efb4 LR=0x000188a8 (svc) InitSpecialStacks
+...
+```
+
+The `(svc)` label is the pre-UND CPSR mode from `SPSR_und`. The LR
+column is captured reliably for SVC callers (the UND trampoline
+briefly switches to SVC to read `R14_svc`); for other modes the
+value may be stale and the mode label makes that visible.
+
+Cross-reference PCs with `../_Data_/symbols.txt` if a function you
+expect isn't in the embedded blob — the build-time filter accepts
+uppercase-leading names and demangled C++ (`::` / `(`), dropping
+linker-generated data markers (`Image$$…`, `…$Size`).
+
 ## Guest-test tier
 
 An ARM-guest test framework lives in [`guest-tests/`](guest-tests/) —
@@ -224,6 +275,7 @@ Defer until there's more in the image worth testing on real hardware.
 ```
 cargo build --release                       # just build
 cargo run --release                         # build + boot Newton ROM in QEMU
+cargo run --release --features trace,quiet  # boot with function-level trace, quiet diag
 DEBUG=1 cargo run --release                 # same, paused with gdb stub
 guest-tests/scripts/run-all.sh              # run every guest test
 guest-tests/scripts/run-test.sh test_vic    # one test, verbose output in /tmp

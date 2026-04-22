@@ -31,7 +31,7 @@
 use crate::cpu;
 use crate::guest_mem;
 use crate::kprintln;
-use crate::trap::TrapContext;
+use crate::trap::{TrapContext, UND_SAVE_LR_SVC_IPA};
 
 const FN_ADDRS_RAW: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fn_addrs.bin"));
 const FN_NAME_OFFS_RAW: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fn_name_offs.bin"));
@@ -147,13 +147,13 @@ fn fn_name(i: usize) -> &'static str {
 ///     entry at 0x00 UDFs on the first fetch before the guest has
 ///     valid banked state; patching 0x04/0x10 collides with the
 ///     hypervisor's own UND-trampoline and DABT-intercept patches.
-///   - VA 0x00FFFF00..0x00FFFF24 holds the UND-trampoline body
+///   - VA 0x00FFFF00..0x00FFFF34 holds the UND-trampoline body
 ///     installed by `patch_und_vector` in guest_mem.rs. Any symbol
 ///     coincidentally landing in there would replace the code that
 ///     delivers the trap we're trying to see.
 fn in_reserved_range(addr: u32) -> bool {
     if addr < 0x0000_0020 { return true; }
-    if (0x00FF_FF00..0x00FF_FF24).contains(&addr) { return true; }
+    if (0x00FF_FF00..0x00FF_FF34).contains(&addr) { return true; }
     false
 }
 
@@ -290,11 +290,39 @@ pub fn handle_trace_und(
         TRACE_SEQ
     };
 
+    // SPSR_und preserves the pre-UND CPSR. Bits[4:0] name the mode the
+    // caller was running in. The UND trampoline briefly switches to
+    // SVC and saves R14_svc at `UND_SAVE_LR_SVC_IPA`; for SVC callers
+    // (the common Newton-kernel case) that slot holds the real caller
+    // LR. For other modes the slot holds whatever the last SVC R14
+    // happened to be, so we label the column with the mode name to
+    // make staleness obvious.
+    let mode = (spsr_und as u32) & 0x1F;
+    let mode_label = match mode {
+        0x10 => "usr",
+        0x11 => "fiq",
+        0x12 => "irq",
+        0x13 => "svc",
+        0x17 => "abt",
+        0x1B => "und",
+        0x1F => "sys",
+        _    => "???",
+    };
+    let lr = if mode == 0x13 {
+        guest_mem::read_word_pa(UND_SAVE_LR_SVC_IPA).unwrap_or(0)
+    } else {
+        // Caller-mode LR not reliably reachable without a mode-
+        // specific save — leave ctx.x[14] here as the best-effort
+        // value. Under QEMU raspi3b it's usually 0 on this path.
+        ctx.x[14] as u32
+    };
+
     kprintln!(
-        "trace {:5} PC={:#010x} LR={:#010x} {}",
+        "trace {:5} PC={:#010x} LR={:#010x} ({}) {}",
         seq,
         faulting_pc,
-        ctx.x[14] as u32,
+        lr,
+        mode_label,
         fn_name(index)
     );
 

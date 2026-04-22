@@ -264,6 +264,39 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
         cpu::halt();
     }
 
+    // Before dispatching an "unknown IPA" write to the MMIO halt path,
+    // dump the caller context. Cheap enough (runs once, then halt) and
+    // decisive for diagnosing MCR-then-STR patterns where the faulting
+    // instruction is in a tight helper far from where the bad address
+    // was computed. The check mirrors the regions mmio::write would
+    // silently accept — anything outside an MMIO window AND outside
+    // the stage-2 RW RAM/flash/FB blocks is obviously unreachable.
+    if wnr && is_obviously_unreachable_ipa(ipa) {
+        let spsr = read_sysreg!("spsr_el2");
+        let mode = (spsr as u32) & 0x1F;
+        let mode_label = aarch32_mode_label(mode);
+        kprintln!(
+            "dabt-trip: PC={:#010x} mode={} writing {:#010x} -> IPA={:#x}",
+            elr, mode_label, ctx.x[srt] as u32, ipa
+        );
+        kprintln!(
+            "           r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}",
+            ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32
+        );
+        kprintln!(
+            "           r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x}",
+            ctx.x[4] as u32, ctx.x[5] as u32, ctx.x[6] as u32, ctx.x[7] as u32
+        );
+        kprintln!(
+            "           r8={:#010x} r9={:#010x} r10={:#010x} r11={:#010x}",
+            ctx.x[8] as u32, ctx.x[9] as u32, ctx.x[10] as u32, ctx.x[11] as u32
+        );
+        kprintln!(
+            "           r12={:#010x} sp={:#010x} lr={:#010x}",
+            ctx.x[12] as u32, ctx.x[13] as u32, ctx.x[14] as u32
+        );
+    }
+
     if wnr {
         let value = ctx.x[srt] as u32;
         mmio::write(ipa, sas, value as u32, elr as u64);
@@ -276,6 +309,29 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
 
     // Advance past the 32-bit ARM instruction that faulted.
     advance_elr(4);
+}
+
+/// IPA ranges that the stage-2 map intentionally leaves as fault /
+/// read-only and that no peripheral module owns. A write here is
+/// almost certainly a wild pointer — worth dumping context before
+/// halting.
+fn is_obviously_unreachable_ipa(ipa: u64) -> bool {
+    // Inside ROM (stage-2 RO). Any write is doomed.
+    if ipa < 0x0100_0000 { return true; }
+    false
+}
+
+fn aarch32_mode_label(mode: u32) -> &'static str {
+    match mode {
+        0x10 => "usr",
+        0x11 => "fiq",
+        0x12 => "irq",
+        0x13 => "svc",
+        0x17 => "abt",
+        0x1B => "und",
+        0x1F => "sys",
+        _    => "???",
+    }
 }
 
 /// Handle a data abort whose ELR_EL2 is inside the shadow-stub pool.
@@ -675,8 +731,39 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
 // slots live in the RAM-mirror window the DIAG stub also uses.
 pub const UND_SAVE_LR_IPA: u32 = 0x0400_5F00;
 pub const UND_SAVE_SPSR_IPA: u32 = 0x0400_5F04;
+/// LR_svc captured by the trampoline's brief SVC-mode bounce. Only
+/// meaningful when SPSR_und's mode field says the caller was SVC
+/// (which is the case for all Newton 2.x kernel-internal calls).
+pub const UND_SAVE_LR_SVC_IPA: u32 = 0x0400_5F08;
+
+/// Pre-UND R0 and R1. The trampoline persists them here before
+/// clobbering R0 (to hold the save-slot VA) and R1 (to read SPSR /
+/// LR_svc). `handle_und` restores `ctx.x[0]` and `ctx.x[1]` from
+/// these slots at entry so the traced guest sees its arguments
+/// intact across the UND round-trip.
+pub const UND_SAVE_R0_IPA: u32 = 0x0400_5F0C;
+pub const UND_SAVE_R1_IPA: u32 = 0x0400_5F10;
 
 fn handle_und(ctx: &mut TrapContext) {
+    // Restore pre-UND R0 and R1 from the RAM slots the trampoline
+    // stashed them in. The trampoline unavoidably clobbers R0 (to
+    // hold the save-slot VA) and R1 (to carry SPSR_und and then
+    // LR_svc through the SVC bounce). Without this restore the
+    // guest's function-arg registers get scrambled across every UND
+    // round-trip — caught in Phase B as a bogus PA 0x78 write from
+    // StoreToPhysAddress, root-caused to R0/R1 surviving into
+    // AddPgPAndPermWithPageTable's prologue.
+    //
+    // R12 is also clobbered by the trampoline (used as the base
+    // register for the slot STRs) but is deliberately not restored:
+    // every Newton 2.x kernel function we've observed begins with
+    // `MOV R12, R13`, so R12 is effectively scratch at function-
+    // entry UDF sites. Non-function-entry UND sites (SWP, Einstein
+    // UND opcodes, CP15 quirks) are few enough that the tests catch
+    // any regression if one of them ends up relying on R12.
+    ctx.x[0] = read_guest_word_pa(UND_SAVE_R0_IPA).unwrap_or(ctx.x[0] as u32) as u64;
+    ctx.x[1] = read_guest_word_pa(UND_SAVE_R1_IPA).unwrap_or(ctx.x[1] as u32) as u64;
+
     // DIAG: prove handle_und is being reached at all. Single-shot log.
     static mut UND_ENTRY_LOGGED: bool = false;
     // SAFETY: single-threaded.

@@ -32,11 +32,21 @@ live in `INVESTIGATION.md`; the high-level state is:
   "SWI from non-user mode (rebooting)", etc.) and each unique site
   logs once via a per-PC seen-set.
 
-**Current stall**: the two SWI-from-non-user-mode DebuggerUND
-panics (`PC=0x3ae188` and `PC=0x3ad660`). These are likely resolved
-by the byte-level endianness work on a parallel track — a scrambled
-CPSR-mode byte in a register/memory save would look exactly like
-this to the kernel's SWI entry check. Parked pending that work.
+**Current stall** (after function-trace + tracer-transparency fix):
+the 717006 kernel reaches 72 trace-able functions deep and fails
+flash-chip identify inside
+`TNewInternalFlash::CheckFor1LaneFlash` / ...4Lane / ...2Lane.
+The kernel then invokes `PowerOffAndReboot`, which runs the power-
+off sequence and tails out through `SWIBoot` → the "SWI from
+non-user mode (rebooting)" `DebuggerUND`. That panic (and the
+accompanying `Zot! GenericSWI called from non-user mode.`) turn
+out to be the *reboot tail*, not an independent bug — the earlier
+parallel-track endianness hypothesis can be dropped. The real
+cliff is **flash identify**: our stage-2 maps `0x0200_0000..`/
+`0x1000_0000..` as RW-RAM but doesn't model the Intel 28F016
+command-set ("Read Identifier Codes" 0x90 → manufacturer 0x89,
+device 0xA0, etc.). Give the flash window a real driver model or
+short-circuit identify.
 
 ## Context
 
@@ -102,7 +112,9 @@ Concrete checkpoints — current status:
 - ✅ **Reach `FlushTheCache` / `FlushTheMMU`** (`0x000188F8`, `0x0001892C`).
 - ✅ **Survive post-MMU-on** — the `MCR c7 c7 0` UND at 0x18924 is handled; the DebuggerUND advance-past-string is fixed; `fix_stage1_xn_bits` re-runs on M=0→M=1 edges so late-populated coarse L2 entries are normalised.
 - ✅ **Tick polling no longer dominates runtime** — non-trapping K_HDWR_TICKS via stage-2 RAM-backed page, 13.6× trap reduction.
-- 🟡 **Pass the SWI-from-non-user-mode panics** (`0x3ae188`, `0x3ad660`) — current stall. Parked pending byte-level endianness work on the parallel track. The ROM's own debug strings are now surfaced in the log (via BE byte-order reading + per-PC dedup) so the next panic, whatever it is, will be diagnostic by default.
+- ✅ **Function-level chronological trace wired up** — `cargo run --features trace,quiet` UDFs every recognised function entry and logs (sequence, PC, LR_svc, mode, name) on first touch. Pinpointed the tracer-transparency bug instantly.
+- ✅ **UND trampoline preserves R0 / R1** — the SVC-bounce version was clobbering the guest's first two argument registers; the fix saves them to RAM slots (`UND_SAVE_R0/R1_IPA`) and restores `ctx.x[0]/ctx.x[1]` in `handle_und`. Boot progresses 50× further as a result.
+- 🟡 **Flash-chip identify fails** (`T28F016_SA_SVDriver::Identify` returns "no chip" on all four lane configurations). Kernel falls into `PowerOffAndReboot` → `SWIBoot` → the two "SWI from non-user mode" DebuggerUNDs. The SWI panics were the reboot tail, not an independent issue — the parallel-track endianness hypothesis can be dropped. Fix: model the Intel 28F016 command set on flash banks 0/1, or short-circuit the identify protocol to return a matching chip ID.
 - ⬜ **Pass `InitCirrusHW` (main-ROM, `0x000E6C44`)**.
 - ⬜ **Pass `TDMAManager::Init` (`0x0007CC4C`)** — will exercise our DMA port.
 - ⬜ **Pass `TAppWorld::Init` (`0x00030F54`)** — first application-world init; likely trips TInterruptManager-backed delays (now cheap thanks to the non-trapping tick page).
@@ -175,7 +187,7 @@ matching that count is the cleanest "progress is real" signal.
 - Exhaustively implementing every TNativePrimitives encoding upfront — only the encodings the early-boot path can realistically hit get transcribed in Phase A; others are discovered (with a loud halt) during Phase B and transcribed then. The handler itself is real; the table grows as evidence demands.
 - Real screen emulation beyond a framebuffer dump — no compositor, no pen input.
 - Any work past TInterpreter — scheduler, app world, package loading — waits for the next milestone.
-- **Byte-level endianness equivalence** — tracked on a parallel work stream. This plan relies on it: the current Phase B stall (SWI-from-non-user-mode panics) is most-likely a symptom of it. Don't fix those panics here until the endianness track has landed; it's likely to obviate them.
+- **Byte-level endianness equivalence** — the parallel work stream has landed. The SWI-from-non-user-mode panics we'd previously attributed to an endianness mismatch turned out to be the tail of `PowerOffAndReboot`, triggered by the flash-identify failure. No remaining endianness dependency for Phase B.
 
 ## Still-in-place diagnostic scaffolding
 

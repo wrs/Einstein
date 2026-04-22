@@ -955,63 +955,97 @@ pub fn log_stats(stats: &PatchStats) {
     );
 }
 
-/// Validation entry point (item 6). Consumes a list of 32-bit PCs the
-/// real Einstein JIT translated during a boot run, and checks that
-/// every PC in [range_start, range_end) is either patched (i.e., was
-/// decoded as byte/halfword/SWPB by our decoder) or was not a
-/// byte/halfword access in the first place. Any PC Einstein translated
-/// that our decoder rejected halts loudly.
+/// Outcome of a single-PC probe-list validation check.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ValidatePcResult {
+    /// PC isn't inside the caller-supplied range; ignored.
+    OutOfRange,
+    /// PC read back as a branch-to-stub — the shadow_stub patcher
+    /// successfully installed a stub at this site.
+    Patched,
+    /// PC's instruction word decodes as something our decoder
+    /// intentionally skips (not a byte/halfword access). Fine.
+    NotByteAccess,
+    /// The word at PC still looks like a byte/halfword access but
+    /// no branch-to-stub is installed. This is a MISS — Einstein
+    /// considered this PC code but the shadow_stub mechanism did
+    /// not patch it.
+    Missed,
+    /// PC was outside any backing store we could read.
+    Unreadable,
+}
+
+/// Check one PC against the current state of the patched code.
+pub fn validate_one(pc: u32, range_start: u32, range_end: u32) -> ValidatePcResult {
+    if pc < range_start || pc >= range_end {
+        return ValidatePcResult::OutOfRange;
+    }
+    let insn = match code_read_word(pc) {
+        Some(w) => w,
+        None => return ValidatePcResult::Unreadable,
+    };
+    // Check "branch to a stub pool".
+    if (insn & 0x0F00_0000) == 0x0A00_0000 {
+        let imm24 = insn & 0x00FF_FFFF;
+        let signed = if imm24 & 0x0080_0000 != 0 {
+            (imm24 | 0xFF00_0000) as i32
+        } else {
+            imm24 as i32
+        };
+        let tgt = pc.wrapping_add(8).wrapping_add((signed << 2) as u32);
+        if is_stub_ipa(tgt) {
+            return ValidatePcResult::Patched;
+        }
+    }
+    if decode(insn).is_none() {
+        ValidatePcResult::NotByteAccess
+    } else {
+        ValidatePcResult::Missed
+    }
+}
+
+/// Validation pass against a probe-derived PC list (item 6). Consumes
+/// a slice of 32-bit PCs the real Einstein ARM-JIT translated during a
+/// boot run, and verifies every PC in [range_start, range_end) is
+/// either patched or was legitimately not a byte/halfword access.
 ///
-/// The PC list is in little-endian u32 units. `pc_list` is typically
-/// the contents of `probe/translated-pcs-717006.bin`; we embed it at
-/// compile time via the probe-side integration (deferred; see writeup).
+/// Any PC Einstein translated that our decoder rejected halts loudly
+/// — that's a classification bug we want to catch before the guest
+/// silently miscomputes.
 ///
-/// Returns the number of PCs validated. Halts on any miss.
-#[cfg(feature = "validate_with_probe")]
+/// The PC list is typically loaded at build time from
+/// `probe/translated-pcs-717006.bin`; the probe-side integration that
+/// emits this file is a follow-up and not yet landed in this workspace.
+///
+/// Returns the number of in-range PCs validated (Patched or NotByteAccess).
+#[allow(dead_code)]
 pub fn validate_against_probe(
     pc_list: &[u32], range_start: u32, range_end: u32,
 ) -> usize {
-    let mut n = 0;
+    let mut ok = 0;
     for &pc in pc_list {
-        if pc < range_start || pc >= range_end { continue; }
-        let insn = match code_read_word(pc) {
-            Some(w) => w,
-            None => continue,
-        };
-        // After patching, the site holds a Bcc to the stub pool. Read
-        // from an "unpatched" shadow copy if available — for now we
-        // accept "Bcc stub_ipa" as proof the site was patched.
-        let is_patched_branch = {
-            let op = insn & 0x0F00_0000;
-            let target_in_stub_range = {
-                // Decode imm24, sign-extend, compute target.
-                let imm24 = insn & 0x00FF_FFFF;
-                let signed = if imm24 & 0x0080_0000 != 0 {
-                    (imm24 | 0xFF00_0000) as i32
-                } else {
-                    imm24 as i32
-                };
-                let tgt = pc.wrapping_add(8).wrapping_add((signed << 2) as u32);
-                is_stub_ipa(tgt)
-            };
-            op == 0x0A00_0000 && target_in_stub_range
-        };
-        if is_patched_branch { n += 1; continue; }
-        // Not a branch-to-stub. Re-decode to confirm it was legitimately
-        // skipped.
-        if decode(insn).is_none() {
-            // Fine - decoder doesn't consider this a byte/halfword access.
-            n += 1;
-            continue;
+        match validate_one(pc, range_start, range_end) {
+            ValidatePcResult::OutOfRange => continue,
+            ValidatePcResult::Patched | ValidatePcResult::NotByteAccess => ok += 1,
+            ValidatePcResult::Unreadable => {
+                kprintln!(
+                    "shadow_stub: validate_against_probe — PC {:#x} unreadable",
+                    pc
+                );
+                crate::cpu::halt();
+            }
+            ValidatePcResult::Missed => {
+                let insn = code_read_word(pc).unwrap_or(0);
+                kprintln!(
+                    "shadow_stub: VALIDATION MISS — PC {:#x} insn {:#010x} \
+                     was translated by Einstein but our decoder left it unpatched",
+                    pc, insn
+                );
+                crate::cpu::halt();
+            }
         }
-        kprintln!(
-            "shadow_stub: VALIDATION MISS - PC {:#x} insn {:#010x} \
-             was translated by Einstein but our decoder left it unpatched",
-            pc, insn
-        );
-        crate::cpu::halt();
     }
-    n
+    ok
 }
 
 #[cfg(test)]
@@ -1052,5 +1086,17 @@ mod tests {
     fn decode_ldrh_immediate() {
         let d = decode(0xE1D1_00B4).unwrap();
         assert_eq!(d.kind, AccessKind::Ldrh);
+    }
+
+    #[test]
+    fn validate_one_out_of_range() {
+        // validate_one should not touch backing stores for PCs outside
+        // the requested range. We just check the Range check.
+        let r = validate_one(0x1_0000_0000u64 as u32, 0, 16);
+        // PC above u32 max wraps — the real check is range_start/end.
+        // Use 100 > end.
+        let _ = r;
+        let r2 = validate_one(100, 0, 16);
+        assert_eq!(r2, ValidatePcResult::OutOfRange);
     }
 }

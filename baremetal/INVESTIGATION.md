@@ -5,23 +5,49 @@ we move past the current stall.
 
 ## Currently at
 
-The ROM boot runs past MMU-on, past the early CP15 setup, past
-FlushTheCache, past the REx platform-probe path, and into deep
-initialisation code (beacon PCs span `0x186B8` through `0x0E6B94`
-with stops in the `0x3134xx` / `0x3AD5xx` / `0x3945xx` regions).
-No hard stall — the guest is making forward progress. The two
-most-diagnostic panic messages that keep firing are
+With the function-tracing feature and the UND-trampoline R0/R1 fix
+below, the boot now runs deterministically **72 kernel-internal
+functions deep** before the first fatal stall. Trace order:
 
 ```
-und: DebuggerUND @PC=0x3ae188 msg="Zot!  GenericSWI called from non-user mode." (resume at PC=0x3ae1b8)
-und: DebuggerUND @PC=0x3ad660 msg="SWI from non-user mode (rebooting)" (resume at PC=0x3ad688)
+ 1..10  FlushTheCache → HandleDebugCard → InitSpecialStacks → ...
+        → InitCGlobals
+11..24  InitKernelHeapArea → PrimSetDomainRangeWithPageTable
+        → AddPgPAndPermWithPageTable → CleanPageInDcache
+        → FlushTheMMU
+25..40  SetGlobalsInitialized → UseROMJumpTables
+        → BuildPatchTablePageTable → FPE_Install
+        → QueryMemoryReservation → ReserveContiguousMemory
+        → FindHighROMProtocol → EarlyBootGetTempPage
+        → TNoReuseAllocator::Allocate → TClassInfo::MakeAt
+41..54  TNewInternalFlash::InitForReservedBlock
+        → InitializeState → SearchForFlashDrivers
+        → ConfigureFlashBank → SetBankControlRegister
+55..61  CheckFor4LaneFlash → FindDriverAble
+        → T28F016_SA_SVDriver::Identify
+        → ConfigureNot32BitFlashBank
+        → CheckFor2LaneFlash → CheckFor1LaneFlash
+62      PowerOffAndReboot     ← kernel bails
+63..70  IOPowerOffAll → GetPlatformDriver → DisableAllInterrupts
+        → GetGPIOInterfaceObject → TGPIOInterface::Init
+        → RegisterPowerSwitchInterrupt → PowerOffSystem
+71      SWIBoot               ← "SWI from non-user mode (rebooting)"
+72      ROMBoot               ← cold reboot cycle begins
 ```
 
-Both are ROM-side assertions that a SWI instruction executed while
-CPSR.mode != USR. Likely resolved by the in-flight byte-level
-endianness work on the parallel track — a byte-swapped CPSR-mode
-field (or any register/memory value going through a byte path)
-would look exactly like this to the kernel.
+Terminal condition: `TNewInternalFlash` tries all four (4-lane,
+2-lane, 1-lane variants) and can't identify a flash chip. The
+kernel gives up and calls `PowerOffAndReboot(long)`, which walks
+IOPowerOffAll / DisableAllInterrupts / PowerOffSystem, then
+triggers the soft-reset via an SWI. The SWI handler's first check
+is `SPSR_svc.mode == USR` — it's not (we're kernel-internal) so it
+hits `DebuggerUND "SWI from non-user mode (rebooting)"`. That
+panic is the SAME one we'd been parking earlier; it turns out to
+be the tail of the PowerOffAndReboot path, not an independent
+issue. Resolving the **flash-identify failure** is the next
+Phase-B cliff: give `T28F016_SA_SVDriver::Identify` a plausible
+manufacturer/device ID or emulate the Intel 28F016 command set on
+the flash banks.
 
 ## What's been resolved since this file was last written
 
@@ -121,7 +147,64 @@ Writes to any register in the tick page still stage-2-fault (RO),
 so `vic::write` is still reached for the registers the guest
 occasionally writes (calendar, alarm).
 
-### 5. ROM debug-logging surfaced properly
+### 5. UND trampoline clobbered R0 / R1 (tracer transparency bug)
+
+With function-level tracing wired up (`cargo run --features trace,quiet`
+— embeds 31k UDF patches across ROM function entries, restores the
+original word on first-touch), the trace stalled at trace 22 on
+a DABT to IPA `0x00000078` from `StoreToPhysAddress`. The write
+value (`0x04007c0e` — an ARMv7 section descriptor) plus the
+register dump made the call chain obvious:
+
+```
+dabt-trip: PC=0x00018d10 mode=svc writing 0x04007c0e -> IPA=0x78
+           r0=0x00000078 r1=0x04007c0e r4=0x0011e7c4 r7=0x0c004f00
+           r5=0x04007000 r11=0x0c000378 sp=0x0c004f00 lr=0x00000000
+```
+
+`r7 == 0x0c004f00` (the UND-trampoline save-slot VA) and
+`r4 == 0x0011e7c4` (= LR_svc inside MapInKernelGlobals, which the
+SVC-bounce stashed as `R1`) were the clobber values surviving into
+the traced function's prologue. `AddPgPAndPermWithPageTable`'s first
+five instructions are
+
+```
+0x15a828  MOV  R7, R0    ; R7 <- pgP (arg1)
+0x15a82c  MOV  R4, R1    ; R4 <- va  (arg2)
+0x15a830  MOV  R6, R2
+0x15a834  MOV  R5, R3
+0x15a838  LDR  R0, [R11, #4]  ; arg5
+```
+
+— so the trampoline's R0/R1 clobber shuffled garbage straight into
+the page-table-walk state. The L2 base from the bogus R7/R4 was
+zero, which is why the subsequent `StoreToPhysAddress(addr, value)`
+landed on IPA `0x78` (entry index 0x1E × 4 = 0x78 from base 0).
+
+Fix (this change): rewrite the trampoline to clobber R12 only
+(APCS-scratch; every Newton 2.x kernel function observed starts
+with `MOV R12, R13` so it's effectively scratch at function-entry
+UDF sites). Persist the pre-UND R0 and R1 into new RAM slots at
+`UND_SAVE_R0_IPA = 0x0400_5F0C` / `UND_SAVE_R1_IPA = 0x0400_5F10`
+before the SPSR/LR_svc writes. `handle_und` restores `ctx.x[0]` and
+`ctx.x[1]` from those slots at entry so the ERET back to the
+guest resumes with intact argument registers.
+
+With the fix the trace walks 72 functions deep before the flash-
+identify failure; no other regressions surfaced in the 14 guest
+tests.
+
+### 6. Data-abort halt enriched with caller context
+
+`src/trap.rs::handle_data_abort` now prints the full AArch32
+register context when an obviously-unreachable IPA (currently any
+IPA in `0..0x0100_0000` — i.e., stage-2 read-only ROM) is
+targeted by a write, before falling through to the MMIO halt.
+Covers the common "MCR-then-STR inside a small helper far from
+where the bad address was computed" pattern, which made the PA
+0x78 cause directly visible in the log.
+
+### 8. ROM debug-logging surfaced properly
 
 The 717006 ROM carries **22 DebuggerUND sites** (15 main ROM + 7
 REx) + 1 SystemBootUND + 5 TapFileCntlUND, each with a plain-ASCII

@@ -3,7 +3,114 @@
 Live notes. Update as we learn more; archive to a dated file when
 we move past the current stall.
 
-## Currently at
+## Currently at (2026-04-22, post-trace-rewrite)
+
+**First guest abort is a PABT with fault PC = 0x0100017C, from SVC
+mode, right after trace 244 (`FlushTheMMU`).** The guest's stage-1
+has `L1[0x10] = 0 (fault)` (that's the 1 MiB range 0x01000000..
+0x01100000), so any fetch there raises a guest PABT. The kernel has
+not yet installed its own exception vectors, so the PABT goes to the
+ROM's default vector at VA 0x0C, which branches to `0x01A00010` —
+also unmapped (that's the HAL-REx PrefetchAbortHandler on real
+MP2100 hardware, backed by a patch REx our image doesn't carry).
+
+Captured via patching VA 0x0C to `HVC #DIAG_TAG` (same pattern as the
+DABT-vector intercept at 0x10) and reading LR_abt from the banked-reg
+dump stub:
+
+```
+LR_abt    = 0x01000180   (PABT sets LR_abt = fault_PC + 4, ARM)
+SPSR_abt  = 0x800001D3   (pre-PABT mode = SVC, N flag, I=F=A=1)
+SP_abt    = 0x001191BD   (uninitialised — SP_abt never set by kernel)
+LR_svc    = 0x00000000   (pre-PABT SVC LR was zero — so the jump to
+                          0x0100017C was NOT via BL; candidates are
+                          `MOV PC, Rn`, `BX Rn`, `LDR PC, [Rn, #imm]`)
+SP_svc    = 0x0C004C00
+guest r0..r12 at PABT:
+   r0 =0x00000000 r1 =0x0c100800 r2 =0x0c106528 r3 =0x0c100800
+   r4 =0x00000040 r5 =0x0c1061c4 r6 =0x00000000 r7 =0x0400d1c4
+   r8 =0x04000000 r9 =0x00400000 r10=0x4401a100 r11=0x0c0003fc
+   r12=0x0c004f00
+```
+
+`r10 = 0x4401A100` is suspiciously close to StrongARM SA-1100's CPU
+ID (`0x4401A10x`) — probably the result of a `MRC p15,0,Rt,c0,c0,0`
+masked to the top 28 bits. Our Cortex-A53 MIDR_EL1 is `0x410FD034`,
+not a StrongARM ID, so the kernel's CPU-dispatch logic is taking a
+branch keyed on an unexpected MIDR value. No hits for the literals
+`0x0100017C` / `0x01000180` as B/BL targets in the ROM, so the call
+is computed, not compiled-in.
+
+Trace tail before the PABT (244 function entries deep):
+
+```
+...
+239 AddPgPAndPermWithPageTable(r0=0x04000000, r1=0x0c107000,
+                               r2=0xff, r3=0x0400e000)
+240 CleanPageInDcache        (r0=0x0c107000)
+241 LoadFromPhysAddress      (r0=0x04000304)
+242 StoreToPhysAddress       (r0=0x0400681c, r1=0x0400effe)
+243 PurgePageFromTLB         (r0=0x0c107000)
+244 FlushTheMMU              (r0=0x00000000)
+        <PABT here>
+```
+
+The cycle 221..244 is `MapTable(3, 0)` walking RAM-area page-table
+entries. After `FlushTheMMU` returns, whatever the caller of
+`MapTable(3, 0)` does next branches PC to 0x0100017C. That branch is
+the first thing to root-cause.
+
+### Einstein vs. us — concrete page-table state
+
+Einstein's `probe/results-717006-30s.txt` shows, *after* 30 s of boot:
+
+```
+VA 0x00000000 to 0x00100000 (1024 kB): large pages   ← identity ROM
+VA 0x00100000 to 0x01000000 (15360 kB): section      ← rest of ROM
+VA 0x01000000 to 0x01800000 (8192 kB): fault         ← our fault range!
+VA 0x01800000 to 0x01810000 (64 kB): small pages
+VA 0x01900000 to 0x01A00000 (1024 kB): fault
+VA 0x01A00000 to 0x01C20000 (2176 kB): small pages   ← ROM Jump Tables
+```
+
+Key facts:
+1. **The ROM bytes at VAs 0x04/0x08/0x0C/0x18/0x1C really are `B 0x01A00xxx`.** Einstein runs the same ROM with the same bytes. The REx targets resolve via the "ROM Jump Tables" stage-1 mapping that `UseROMJumpTables()` (0x001832E8) installs early in boot. That mapping is what makes the stock ROM vectors work.
+2. **`UseROMJumpTables` has not yet fired in our 244-trace boot.** In the older 72-trace boot (documented below) it fired at trace ~25; in the current boot the same kernel path is reaching trace 244 deep in `MapTable(3, 0)` without ever having called it. That's an ordering difference between our boot and Einstein's.
+3. **Einstein ALSO leaves 0x01000000..0x01800000 as fault** — so a guest fetch at 0x0100017C would PABT in Einstein too. The fact that Einstein logs zero real kernel-mode aborts means Einstein's kernel simply doesn't compute PC = 0x0100017C on this code path. Something in our execution state is making the kernel branch there.
+
+### What's verified vs. unverified
+
+Verified:
+- The PABT fires at fault_PC = 0x0100017C, SVC source mode.
+- LR_svc = 0 at PABT entry (so the branch was not via BL).
+- `UseROMJumpTables` has not been called yet.
+- `r10 = 0x4401A100` at PABT — close but not identical to SA-1100
+  MIDR; the kernel derives this from CP15 `c0 c0 0` via BIC+EOR+EOR.
+
+Unverified (next-session hypotheses, don't act on without data):
+- That the branch target 0x0100017C came from MIDR-based dispatch.
+- That porting the remaining `TJITGenericPatchNativeCall` /
+  `TVirtualizedCallsPatches` entries would prevent the branch.
+
+### Next investigation step
+
+Instrument the single guest instruction that computes the branch.
+Options, in order of simplicity:
+
+1. `bp 0x00018948` (the `MOV PC, LR` at FlushTheMMU's return). Single
+   step ISN'T available through QEMU's AArch64 gdbstub for a 32-bit
+   guest, so you'd need a cascade of `bp`s at plausible PCs following
+   the return. But R14_svc at `FlushTheMMU` entry tells you the
+   immediate return target — dump it via a modified `handle_trace_hvc`.
+2. Add a `bp 0x0011F0F0` (MapTable entry) to catch each iteration and
+   dump R14_svc — the caller's PC trail will narrow down who's about
+   to branch astray.
+3. Re-enable the `handle_diag_from_bp` path (kept in `guest_bp.rs`)
+   and `bp 0x0100017C` itself; when vectors PABT there the guest-BP
+   logic doesn't help since 0x0100017C is unmapped — you need `bp`
+   at the *branching* instruction, which we don't yet know.
+
+## Historical — 72-function stall (pre-trace-rewrite)
 
 With the function-tracing feature and the UND-trampoline R0/R1 fix
 below, the boot now runs deterministically **72 kernel-internal

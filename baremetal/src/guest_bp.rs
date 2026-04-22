@@ -323,6 +323,24 @@ pub fn handle_user_bp_und(
         faulting_pc, slot_idx
     );
 
+    // DIAG: dump AArch32 banked regs so we can reconstruct what drove
+    // the guest to `faulting_pc`. Useful when the BP is placed at an
+    // exception vector (0x04..0x1C) and we need the pre-exception state.
+    // Dump AArch32 state. AArch64 at EL2 only exposes the banked SPSRs
+    // directly; banked SP/LR of non-current modes require a brief ERET
+    // into an AArch32 stub. `trap::handle_diag` already implements that
+    // pattern (it ERETs into the stub at VA 0x0C00_4F00 which dumps
+    // LR/SP/SPSR of ABT/UND/SVC plus DFSR/DFAR into RAM, then HVCs back
+    // into `handle_diag_lr` which prints them and halts). Hand off now,
+    // before we restore the ROM word, so the LR_abt from the PABT that
+    // landed us at the vector is still intact.
+    kprintln!("guest_bp: handing off to handle_diag for banked-reg dump...");
+    // Don't restore the ROM word: handle_diag halts, so the BP slot and
+    // the original word both stay in their current (BP-consumed) state.
+    // If we ever remove the halt, the restore below will run.
+    trap::handle_diag_from_bp(ctx);
+
+    #[allow(unreachable_code)]
     restore_word(faulting_pc, s.orig);
 
     // Rewind ELR so the restored instruction re-executes at native

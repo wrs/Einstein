@@ -699,6 +699,13 @@ pub unsafe fn load_newton_rom() {
     // guest sees this via the stage-2 read-only ROM map.
     unsafe { rom_ptr.add(4).write(0xE140_0171); } // hvc #0x11
 
+    // TEMPORARY diagnostic — PABT-vector intercept.
+    // The stock ROM vector at VA 0x0C branches to 0x01A00010 (a HAL
+    // REx address that our image doesn't back). Patch to HVC #DIAG_TAG
+    // so any prefetch abort halts with a full banked-reg dump and we
+    // can see the faulting fetch PC (= LR_abt − 4 for ARM).
+    unsafe { rom_ptr.add(3).write(0xE140_0171); } // hvc #0x11
+
     // Bring-up shim #2: the 717006 kernel uses StrongARM's lax CP15 encoding
     // where CRm == CRn for most system-control registers. On ARMv7+ those
     // encodings are undefined (c1 c1 0, c2 c2 0, c3 c3 0, c5 c5 0, c6 c6 0),

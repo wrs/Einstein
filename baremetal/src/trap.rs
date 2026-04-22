@@ -838,6 +838,16 @@ fn handle_und(ctx: &mut TrapContext) {
 /// the guest handles it at EL1; patching the vector and running lets
 /// us catch the abort context once before the guest's own handler
 /// clobbers it.
+/// Entry point for callers outside `trap.rs` that want a full banked-
+/// reg dump (e.g. `guest_bp::handle_user_bp_und` at a vector-intercept
+/// BP). Reuses the same stub path as the `HVC #DIAG_TAG` case.
+pub fn handle_diag_from_bp(ctx: &mut TrapContext) -> ! {
+    handle_diag(ctx);
+    // handle_diag ERETs and never returns, but the function signature
+    // is `fn -> ()` so Rust doesn't know; halt defensively.
+    cpu::halt();
+}
+
 fn handle_diag(ctx: &mut TrapContext) {
     let far = read_sysreg!("far_el1");
     let spsr_el2 = read_sysreg!("spsr_el2");
@@ -983,7 +993,14 @@ fn handle_diag(ctx: &mut TrapContext) {
     const LR_STUB_VA: u32 = 0x0C00_4F00;
     const LR_SAVE_VA: u32 = 0x0C00_4F80;
     const LR_SAVE_PA: u32 = 0x0400_5F80;
-    let stub: [u32; 27] = [
+    // The stub expects to start in ABT mode (that's the case when
+    // invoked from the DABT-vector HVC intercept at VA 0x10). It can
+    // also be invoked from UND mode via `handle_diag_from_bp` (a
+    // guest-BP hit at a patched vector). Switch to ABT up front so the
+    // first-block reads always capture ABT-mode banked regs regardless
+    // of entry mode. If we're already in ABT the MSR is a no-op.
+    let stub: [u32; 28] = [
+        0xE321_F0D7, // msr cpsr_c, #0xd7  (-> ABT)
         0xE59F_0060, // ldr r0, [pc, #0x60]  (literal at end)
         0xE1A0_100E, // mov r1, lr
         0xE580_1000, // str r1, [r0]

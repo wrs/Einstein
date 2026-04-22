@@ -1,0 +1,18 @@
+[package]
+name = "classify-rom"
+version = "0.0.1"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "Host-side code-vs-data classifier for Newton 2.x ROM + Einstein.rex."
+
+# Explicitly not a workspace member of ../../Cargo.toml. Kept standalone so
+# the no_std baremetal crate's target / toolchain pinning does not leak in.
+[workspace]
+
+[[bin]]
+name = "classify-rom"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1

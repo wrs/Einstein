@@ -30,6 +30,7 @@
 // Einstein
 #include "Emulator/TARMProcessor.h"
 #include "Emulator/TMemory.h"
+#include "baremetal/probe/probe_sink.h"
 
 #include "TJITGeneric_Macros.h"
 

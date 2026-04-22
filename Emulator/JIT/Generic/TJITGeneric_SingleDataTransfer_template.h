@@ -46,6 +46,14 @@ SingleDataTransfer_Template(BITS_FLAGS, Rn, Rd)
 
 	POPPC();
 
+#if FLAG_B
+	// Endianness-patch classifier: this unit body only runs when the guest
+	// actually executes an LDRB/STRB with its condition satisfied. Record
+	// the original PC (pushed as inVAddr+8 in Translate_SingleDataTransfer,
+	// see TJITGeneric_SingleDataTransfer.cpp:118).
+	probe_record_ba_site(GETPC() - 8, 0);
+#endif
+
 	TMemory* theMemoryInterface = ioCPU->GetMemory();
 
 #if FLAG_P || (WRITEBACK && Rn != 15)

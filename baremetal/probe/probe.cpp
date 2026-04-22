@@ -14,9 +14,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <errno.h>
 #include <map>
 #include <mutex>
 #include <set>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <thread>
 #include <tuple>
 #include <vector>
@@ -129,6 +132,17 @@ struct PabortEvent {
 std::vector<PabortEvent> pabort_first;
 uint64_t pabort_total { 0 };
 
+// Endianness-patch classifier bitmap. One bit per 32-bit word in guest ROM
+// space (0..0x01000000). Index = addr / 4; LSB-first within each byte.
+// 16 MiB / 4 bytes / 8 bits = 524 288 bytes. Bit set ≡ the JIT actually
+// executed an endianness-sensitive subword access instruction at this PC.
+constexpr size_t kClassifyWordCount = (16u * 1024u * 1024u) / 4u; // 4 Mi words
+constexpr size_t kClassifyBitmapBytes = kClassifyWordCount / 8u;  // 524 288
+std::vector<uint8_t> ba_site_bitmap(kClassifyBitmapBytes, 0);
+uint64_t ba_site_records { 0 };
+// Per-kind tallies for the byte/halfword/swpb breakdown in summary.
+uint64_t ba_site_by_kind[4] { 0, 0, 0, 0 };
+
 } // namespace probe_state
 
 extern "C" void probe_record_cp15(uint32_t pc, uint32_t cpopc, uint32_t crn,
@@ -181,6 +195,15 @@ extern "C" void probe_record_prefetch_abort(uint32_t pc, uint32_t ifsr,
 			{probe_state::pabort_total, pc, ifsr, mode});
 	}
 	probe_state::pabort_total++;
+}
+
+extern "C" void probe_record_ba_site(uint32_t pc, uint32_t kind) {
+	if (pc >= 16u * 1024u * 1024u || (pc & 3u) != 0) return;
+	const uint32_t word_idx = pc >> 2;
+	std::lock_guard<std::mutex> lock(probe_state::mu);
+	probe_state::ba_site_bitmap[word_idx >> 3] |= uint8_t(1u << (word_idx & 7u));
+	probe_state::ba_site_records++;
+	if (kind < 4) probe_state::ba_site_by_kind[kind]++;
 }
 
 namespace {
@@ -277,6 +300,110 @@ void dump_instrumentation(FILE* f) {
 	std::fprintf(f, "<===== End of instrumentation summary\n");
 }
 
+// ==========================================================================
+//  Classifier bitmap dump
+// ==========================================================================
+
+// FNV-1a-32. Streamed via a state parameter so we can hash ROM+REX in sequence.
+uint32_t fnv1a_32(const void* data, size_t len, uint32_t state = 0x811C9DC5u) {
+	const uint8_t* p = static_cast<const uint8_t*>(data);
+	for (size_t i = 0; i < len; ++i) {
+		state ^= p[i];
+		state *= 0x01000193u;
+	}
+	return state;
+}
+
+bool read_file_bytes(const char* path, std::vector<uint8_t>& out) {
+	std::FILE* f = std::fopen(path, "rb");
+	if (!f) return false;
+	std::fseek(f, 0, SEEK_END);
+	long sz = std::ftell(f);
+	std::fseek(f, 0, SEEK_SET);
+	if (sz < 0) { std::fclose(f); return false; }
+	out.resize(static_cast<size_t>(sz));
+	size_t got = std::fread(out.data(), 1, out.size(), f);
+	std::fclose(f);
+	return got == out.size();
+}
+
+// mkdir -p for a single path. Returns true on success (created or existed).
+bool mkdir_p(const char* path) {
+	std::string buf(path);
+	for (size_t i = 1; i < buf.size(); ++i) {
+		if (buf[i] == '/') {
+			buf[i] = 0;
+			if (::mkdir(buf.c_str(), 0755) != 0 && errno != EEXIST) return false;
+			buf[i] = '/';
+		}
+	}
+	if (::mkdir(buf.c_str(), 0755) != 0 && errno != EEXIST) return false;
+	return true;
+}
+
+uint64_t popcount_bytes(const std::vector<uint8_t>& b) {
+	uint64_t n = 0;
+	for (uint8_t x : b) n += __builtin_popcount(x);
+	return n;
+}
+
+bool write_file(const char* path, const void* data, size_t len) {
+	std::FILE* f = std::fopen(path, "wb");
+	if (!f) return false;
+	size_t got = std::fwrite(data, 1, len, f);
+	std::fclose(f);
+	return got == len;
+}
+
+// Dump the classifier bitmaps to baremetal/classify/<hash>/. Returns 0 on
+// success, nonzero on failure (caller logs but continues shutdown).
+int dump_classifier_bitmaps(const char* romPath, const char* rexPath) {
+	std::vector<uint8_t> romBytes;
+	if (!read_file_bytes(romPath, romBytes)) {
+		std::fprintf(stderr, "classify: failed to read %s for hashing\n", romPath);
+		return 1;
+	}
+	uint32_t hash = fnv1a_32(romBytes.data(), romBytes.size());
+	if (rexPath) {
+		std::vector<uint8_t> rexBytes;
+		if (!read_file_bytes(rexPath, rexBytes)) {
+			std::fprintf(stderr, "classify: failed to read %s for hashing\n", rexPath);
+			return 1;
+		}
+		hash = fnv1a_32(rexBytes.data(), rexBytes.size(), hash);
+	}
+
+	char dir[256];
+	std::snprintf(dir, sizeof(dir), "baremetal/classify/%08x", hash);
+	if (!mkdir_p(dir)) {
+		std::fprintf(stderr, "classify: mkdir_p(%s) failed: %s\n", dir, std::strerror(errno));
+		return 1;
+	}
+
+	std::lock_guard<std::mutex> lock(probe_state::mu);
+	uint64_t ba_bits = popcount_bytes(probe_state::ba_site_bitmap);
+
+	char p1[320];
+	std::snprintf(p1, sizeof(p1), "%s/byte-access.bitmap", dir);
+	if (!write_file(p1, probe_state::ba_site_bitmap.data(), probe_state::ba_site_bitmap.size())) {
+		std::fprintf(stderr, "classify: write %s failed\n", p1);
+		return 1;
+	}
+
+	std::fprintf(stdout,
+		"\n=====> Endianness-patch classifier bitmap written to %s/\n"
+		"  rom+rex fnv1a32 = 0x%08x%s\n"
+		"  byte-access.bitmap popcount=%llu  executions=%llu\n"
+		"    (byte=%llu  halfword/signed/dword=%llu  swpb=%llu)\n",
+		dir, hash, rexPath ? "" : " (rom only; no rex on cmdline)",
+		static_cast<unsigned long long>(ba_bits),
+		static_cast<unsigned long long>(probe_state::ba_site_records),
+		static_cast<unsigned long long>(probe_state::ba_site_by_kind[0]),
+		static_cast<unsigned long long>(probe_state::ba_site_by_kind[1]),
+		static_cast<unsigned long long>(probe_state::ba_site_by_kind[3]));
+	return 0;
+}
+
 } // namespace
 
 // The probe intentionally links without the Toolkit/app layer. Provide the
@@ -369,6 +496,7 @@ int main(int argc, char** argv) {
 
 	mmu->FDump(stdout);
 	dump_instrumentation(stdout);
+	dump_classifier_bitmaps(romPath, rexPath);
 	std::fflush(stdout);
 
 	// Skip destructors: the interrupt-manager thread + network thread need

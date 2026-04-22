@@ -1,0 +1,6 @@
+# Regenerated from newton.rom + Einstein.rex via NewtonProbe and classify-rom.
+# See README.md for how. The bitmaps and per-hash directories are never
+# committed; only this .gitignore and README.md live in the tree.
+*
+!.gitignore
+!README.md

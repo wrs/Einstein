@@ -1,0 +1,4 @@
+[toolchain]
+channel = "1.94.1"
+profile = "minimal"
+# Host tool: no cross targets — builds for the host triple via rustup's default.

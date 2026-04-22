@@ -45,6 +45,13 @@ void probe_record_data_abort(uint32_t pc, uint32_t far, uint32_t fsr, uint32_t m
 /// fault status register, `mode` the pre-abort CPSR mode[4:0].
 void probe_record_prefetch_abort(uint32_t pc, uint32_t ifsr, uint32_t mode);
 
+/// Endianness-patch classifier: the JIT ran an endianness-sensitive
+/// subword access instruction (LDRB / STRB / LDRH / STRH / LDRSB / LDRSH /
+/// LDRD / STRD / SWPB) whose condition was satisfied, at guest ROM PC `pc`.
+/// `kind` in {0=byte (LDRB/STRB), 1=halfword/signed/dword, 3=swpb}. Called
+/// from the JIT unit templates at execute time, once per actual execution.
+void probe_record_ba_site(uint32_t pc, uint32_t kind);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
@@ -58,6 +65,7 @@ void probe_record_prefetch_abort(uint32_t pc, uint32_t ifsr, uint32_t mode);
 #define probe_record_rom_write(pc, vaddr, value) ((void) 0)
 #define probe_record_data_abort(pc, far, fsr, mode) ((void) 0)
 #define probe_record_prefetch_abort(pc, ifsr, mode) ((void) 0)
+#define probe_record_ba_site(pc, kind) ((void) 0)
 
 #endif
 

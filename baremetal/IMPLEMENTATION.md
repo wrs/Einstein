@@ -275,6 +275,80 @@ USB, real SD timing, display, audio. These land on real Pi 3B during the relevan
 - `gdb-multiarch` handles Rust DWARF; demangling is flakier than C but usable. Set `set print asm-demangle on`.
 - Consider `probe-rs` + JTAG on real Pi for M5+ when USB/display debugging over serial alone becomes painful.
 
+### 8.4 Classifier-driven endianness patching
+
+The Newton ROM is BE-32 word-invariant: aligned word accesses are
+identical to the LE view after a load-time word swap, but byte and
+halfword accesses target a different byte lane and must be fixed up.
+`src/shadow_stub.rs` handles that by replacing each LDRB/STRB/LDRH/
+STRH/LDRSB/LDRSH/SWPB in the ROM with a `Bcc` to a per-site stub
+that XORs the effective address before the real load/store. For that
+to be both correct (every real byte/halfword access patched) and
+safe (no data bytes overwritten), the patcher needs an exact list
+of byte-access PCs.
+
+The list is built by two host-side tools in `tools/` and `scripts/`:
+
+1. **`scripts/classify-symbols.py`** — partitions every entry in
+   `_Data_/demangled_symbols.txt` into `code` / `data` / `drop` via
+   an ordered ruleset. Rules are name prefixes (`g[A-Z]` → data,
+   `F[A-Z]` → code, `::` or `(` → code, `SYM*` / `rat*` / `BiGS*`
+   → data tables, …), address-range rules (exception vectors +
+   early-boot text), and a first-word-shape fallback (cond=AL plus
+   any recognised ARM encoding → code; top byte 0x00 → data).
+   Outputs a curated `classify-out/code-symbols.txt` plus
+   `classify-out/data-ranges.txt` (contiguous data-symbol extents
+   + hand-maintained DATA_RANGES for things like the recognition-
+   table block at `[0x00366f2c, 0x00382324)` and the inline-string
+   run at the tail of `MonitorEntryGlue`). Weird outliers go in
+   `CODE_EXCEPTIONS` / `DATA_EXCEPTIONS` sets rather than contorted
+   rules.
+
+2. **`tools/classify-rom`** — consumes the code list as walker roots
+   and the data-ranges as walker termination boundaries, walks
+   every basic block via a full ARM decoder (the `step()` function
+   recognises B / BL / Bcc / LDR pc / BX / LDM-with-pc / SWI / UDF
+   as terminators; `MOV LR, PC` followed by a PC-write as a
+   manual-BL idiom; conditional DP writing PC as jump-table
+   dispatch). Walker stops on entering any data range — no leakage
+   into string tables, vtable data, or literal pools. Finally
+   intersects reachability with an `is_byte_access` decoder
+   (mirror of `shadow_stub::decode`) and writes
+   `classify/<hash>/byte-access-static.bitmap` — one bit per 32-bit
+   word across the 16 MiB ROM+REX aperture.
+
+Additional seeds the walker needs:
+
+- **REx header entry table.** `_Data_/Einstein.rex` has no symbol
+  file; the walker parses the `"RExBlock"` header at PA 0x00800000
+  and for each `fdrv` / `FDRV` / `pkgl` entry extracts the
+  pointers inside the class-info block that point at prologue-
+  shaped code, seeds those as method roots.
+- **Vtable install pattern.** Constructors install a vtable with
+  the two-instruction sequence `LDR Rt, [pc, #imm]` followed by
+  `STR Rt, [Rn, #0]` (where Rn is whatever register holds `this`
+  — often R4 after the APCS prologue, not R0). The classifier
+  scans reached code for this pair, chases the literal to a
+  vtable address, and enumerates pointer entries until a non-
+  code-looking word.
+
+Invariants:
+- Every bit in the final bitmap decodes as a byte/halfword access
+  `shadow_stub::decode` accepts, including PC-operand rejection
+  (PC-as-Rn/Rt/Rm/Rt2 is filtered at the classifier level, not
+  silently skipped at patch time).
+- `oracle ⊆ static` when a NewtonProbe-generated oracle bitmap is
+  present (execute-time set must be a subset of the static set;
+  a missing bit is a classifier reachability gap, not a
+  classifier false positive).
+
+`build.rs` embeds the bitmap into the hypervisor via `include_bytes!`
+and a FNV-1a-32 hash of `rom_bytes || rex_bytes` so a stale bitmap
+on a newer ROM halts the hypervisor at boot rather than silently
+patching wrong PCs. `scripts/regen-classify.sh` is the one-stop
+regen: it runs `classify-symbols.py` if needed, rebuilds the
+classifier, runs it with the curated inputs.
+
 ## 9. Open questions (implementation-specific)
 
 Design-level open questions are in `HIGHLEVEL.md` §16. These are narrower and implementation-only.

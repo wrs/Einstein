@@ -55,6 +55,20 @@ static REX_BE: &[u8] = include_bytes!("../../_Data_/Einstein.rex");
 #[cfg(nh_guest_test)]
 static GUEST_TEST_BIN: &[u8] = include_bytes!(env!("NH_GUEST_TEST_PATH"));
 
+/// Raw big-endian on-disk bytes of the Newton ROM, pre-byteswap. Used by
+/// `shadow_stub::patch_rom_from_bitmap` to verify the embedded classify
+/// bitmap matches the current ROM.
+#[cfg(not(nh_guest_test))]
+pub fn rom_be_bytes() -> &'static [u8] {
+    ROM_BE
+}
+
+/// Raw big-endian on-disk bytes of the external Einstein.rex, pre-byteswap.
+#[cfg(not(nh_guest_test))]
+pub fn rex_be_bytes() -> &'static [u8] {
+    REX_BE
+}
+
 /// Host physical base of the guest ROM backing store.
 pub fn rom_host_pa() -> u64 {
     addr_of_mut!(GUEST_ROM) as u64

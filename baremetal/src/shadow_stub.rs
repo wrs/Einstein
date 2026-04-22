@@ -49,19 +49,41 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::kprintln;
 
+// FNV-1a-32 of `rom_bytes || rex_bytes` as classify-rom hashes them. Used
+// at boot to prove the bitmap below was generated against this exact ROM
+// + REX pair.
+include!(concat!(env!("OUT_DIR"), "/rom_rex_hash.rs"));
+
+/// Per-hash byte-access-static bitmap produced by
+/// `baremetal/tools/classify-rom` and staged by `build.rs`. One bit per
+/// 32-bit word across the 16 MiB guest ROM aperture; a set bit marks an
+/// instruction that `decode()` accepts as an endianness-sensitive
+/// subword access.
+static BYTE_ACCESS_STATIC_BITMAP: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/byte-access-static.bitmap"));
+
 /// Two stub pools cover the full guest-code address range:
-///   Pool A at 0x01800000 reaches ROM  [0x00000000..0x01000000]
+///   Pool A at 0x01800000..0x02000000 reaches ROM  [0x00000000..0x01000000]
 ///                                + flash bank 0 [0x02000000..0x02400000].
-///   Pool B at 0x03000000 reaches RAM  [0x04000000..0x04400000]
+///   Pool B at 0x03000000..0x03800000 reaches RAM  [0x04000000..0x04400000]
 ///                                + the RAM mirror [0x0C000000..0x0C400000].
-/// Each pool is 2 MiB (one stage-2 block descriptor) and they share a
-/// single backing buffer for simplicity — pool B lives at offset
-/// STUB_POOL_SIZE within the buffer.
+/// Each pool is 8 MiB (four stage-2 2 MiB block descriptors) so pool A
+/// can hold a stub for every instruction in the ~78 k-site ROM+REX
+/// classify bitmap with headroom. Pool B is sized the same for
+/// consistency; its current ceiling is the RAM-resident text copied by
+/// `UseROMJumpTables` plus some scratch pad, well inside 131 k slots.
+/// Both pools share one backing buffer — pool B lives at offset
+/// `STUB_POOL_SIZE` within it.
+///
+/// Pool A spans IPA 0x01800000..0x02000000, ending right before flash
+/// bank 0 at 0x02000000 — no stage-2 collision. Pool B spans
+/// 0x03000000..0x03800000, inside the 0x02400000..0x04000000 gap that
+/// stage-2 otherwise leaves unmapped.
 pub const STUB_POOL_IPA: u32 = 0x0180_0000;
 pub const STUB_POOL_B_IPA: u32 = 0x0300_0000;
 
-/// Stub-pool size. 2 MiB = 1 stage-2 block descriptor.
-pub const STUB_POOL_SIZE: usize = 2 * 1024 * 1024;
+/// Stub-pool size. 8 MiB = four stage-2 2 MiB block descriptors.
+pub const STUB_POOL_SIZE: usize = 8 * 1024 * 1024;
 
 /// Addresses < XOR_LIMIT are treated as real memory (XOR applied);
 /// addresses >= XOR_LIMIT are treated as MMIO and passed through.
@@ -815,8 +837,126 @@ pub fn icache_sync_range(host_va: u64, length: usize) {
     }
 }
 
+/// Emit a single stub for the byte/halfword access at `pc` and overwrite
+/// the original site with a branch to the stub. Shared between the
+/// range-scanning `patch_code_range` (ROM cold fallback + lazy-RAM) and
+/// the bitmap-driven `patch_rom_from_bitmap`. Updates `stats` in place.
+///
+/// Returns without touching anything if the word doesn't decode as a
+/// byte/halfword access or references PC as an operand. Halts if the
+/// decoded instruction exists but we can't emit or install its stub.
+fn patch_one_site(pc: u32, use_pool_b: bool, stats: &mut PatchStats) {
+    let insn = match code_read_word(pc) {
+        Some(w) => w,
+        None => return,
+    };
+    let decoded = match decode(insn) {
+        Some(d) => d,
+        None => return,
+    };
+
+    // Reject PC as any operand. The stub would need to emulate PC-
+    // relative addressing from the original site (not the stub site),
+    // which build_stub doesn't support. Most of these hits are not even
+    // real code: classify-rom's prologue-sweep is generous enough to
+    // scoop in data words (string tables, dispatch tables) that happen
+    // to decode as byte-access-shape with Rn=PC, and this check is the
+    // safety net that keeps us from corrupting them. The aggregate
+    // count lands in `log_stats`; the per-site log is debug-level only.
+    if decoded.rn == 15
+        || decoded.rt == 15
+        || (matches!(decoded.kind, AccessKind::Swpb) && decoded.rt2 == 15)
+    {
+        stats.skipped_pc_operand += 1;
+        crate::dprintln!(
+            "shadow_stub: skipping insn {:#010x} at PC {:#x} - PC operand",
+            insn, pc
+        );
+        return;
+    }
+    if let OffsetForm::Reg { rm, .. } = decoded.offset {
+        if rm == 15 {
+            stats.skipped_pc_operand += 1;
+            return;
+        }
+    }
+
+    let (local_slot, stub_base_ipa) = if use_pool_b {
+        let s = NEXT_SLOT_B.fetch_add(1, Ordering::SeqCst);
+        (s, STUB_POOL_B_IPA)
+    } else {
+        let s = NEXT_SLOT_A.fetch_add(1, Ordering::SeqCst);
+        (s, STUB_POOL_IPA)
+    };
+    if local_slot >= STUB_POOL_CAPACITY {
+        kprintln!(
+            "shadow_stub: ERROR - stub pool {} exhausted at PC {:#x} ({} stubs)",
+            if use_pool_b { "B" } else { "A" }, pc, local_slot
+        );
+        crate::cpu::halt();
+    }
+    let stub_ipa = stub_base_ipa + (local_slot * STUB_SLOT_SIZE) as u32;
+    let packed_slot = if use_pool_b {
+        STUB_POOL_CAPACITY + local_slot
+    } else {
+        local_slot
+    };
+
+    let mut words = [0u32; STUB_SLOT_WORDS];
+    let built = match build_stub(&decoded, stub_ipa, pc.wrapping_add(4), &mut words) {
+        Ok(b) => b,
+        Err(e) => {
+            kprintln!(
+                "shadow_stub: FATAL - couldn't build stub for {:#010x} at PC {:#x}: {}",
+                insn, pc, e
+            );
+            crate::cpu::halt();
+        }
+    };
+
+    words[STUB_RETURN_PC_OFF / 4] = pc.wrapping_add(4);
+    words[STUB_SAVE_SLOT_OFF / 4] = 0;
+    // Fill any gap between the emitted code and the return_pc literal
+    // with UDF #0xDEAD so stray execution past the branch-back faults
+    // loudly.
+    for i in built.words..(STUB_RETURN_PC_OFF / 4) {
+        words[i] = 0xE7F0_00F0;
+    }
+
+    let pool_off = local_slot * STUB_SLOT_SIZE;
+    for (i, w) in words.iter().enumerate() {
+        pool_write_word(use_pool_b, pool_off + i * 4, *w);
+    }
+
+    // SAFETY: single-threaded callers; bounded slot.
+    unsafe {
+        SLOT_ORIGINAL_PC[packed_slot] = pc;
+        SLOT_ACCESS_OFF[packed_slot] = built.access_off as u8;
+        SLOT_META[packed_slot] = Some(SlotMeta { xor_mask: decoded.kind.xor_mask() });
+    }
+
+    let patched = enc_bcond(decoded.cond, pc, stub_ipa);
+    if let Err(e) = code_write_word(pc, patched) {
+        kprintln!(
+            "shadow_stub: FATAL - couldn't write patched insn at PC {:#x}: {}",
+            pc, e
+        );
+        crate::cpu::halt();
+    }
+
+    match decoded.kind {
+        AccessKind::Ldrb | AccessKind::Strb => stats.ldrb_strb += 1,
+        AccessKind::Ldrh | AccessKind::Strh => stats.ldrh_strh += 1,
+        AccessKind::Ldrsb | AccessKind::Ldrsh => stats.ldrsb_ldrsh += 1,
+        AccessKind::Swpb => stats.swpb += 1,
+    }
+    stats.patched += 1;
+}
+
 /// Patch every LDRB/STRB/LDRH/STRH/LDRSB/LDRSH/SWPB in [start_ipa, end_ipa)
-/// of the ROM or RAM backing.
+/// of the ROM or RAM backing. Used for the lazy-RAM path (RAM-resident
+/// code copied out of ROM at boot) where there is no pre-computed
+/// classifier bitmap to drive a bit-walk.
 pub fn patch_code_range(start_ipa: u32, end_ipa: u32) -> PatchStats {
     assert!(start_ipa & 3 == 0);
     assert!(end_ipa & 3 == 0);
@@ -828,111 +968,7 @@ pub fn patch_code_range(start_ipa: u32, end_ipa: u32) -> PatchStats {
     let mut pc = start_ipa;
     while pc < end_ipa {
         stats.words_scanned += 1;
-        let insn = match code_read_word(pc) {
-            Some(w) => w,
-            None => { pc = pc.wrapping_add(4); continue; }
-        };
-
-        let decoded = match decode(insn) {
-            Some(d) => d,
-            None => { pc = pc.wrapping_add(4); continue; }
-        };
-
-        // Reject PC as any operand.
-        if decoded.rn == 15 || decoded.rt == 15
-            || (matches!(decoded.kind, AccessKind::Swpb) && decoded.rt2 == 15)
-        {
-            stats.skipped_pc_operand += 1;
-            kprintln!(
-                "shadow_stub: skipping insn {:#010x} at PC {:#x} - PC operand",
-                insn, pc
-            );
-            pc = pc.wrapping_add(4);
-            continue;
-        }
-        if let OffsetForm::Reg { rm, .. } = decoded.offset {
-            if rm == 15 {
-                stats.skipped_pc_operand += 1;
-                pc = pc.wrapping_add(4);
-                continue;
-            }
-        }
-
-        let (local_slot, stub_base_ipa) = if use_pool_b {
-            let s = NEXT_SLOT_B.fetch_add(1, Ordering::SeqCst);
-            (s, STUB_POOL_B_IPA)
-        } else {
-            let s = NEXT_SLOT_A.fetch_add(1, Ordering::SeqCst);
-            (s, STUB_POOL_IPA)
-        };
-        if local_slot >= STUB_POOL_CAPACITY {
-            kprintln!(
-                "shadow_stub: ERROR - stub pool {} exhausted at PC {:#x} ({} stubs)",
-                if use_pool_b { "B" } else { "A" }, pc, local_slot
-            );
-            crate::cpu::halt();
-        }
-        let stub_ipa = stub_base_ipa + (local_slot * STUB_SLOT_SIZE) as u32;
-        let packed_slot = if use_pool_b {
-            STUB_POOL_CAPACITY + local_slot
-        } else {
-            local_slot
-        };
-
-        let mut words = [0u32; STUB_SLOT_WORDS];
-        let built = match build_stub(&decoded, stub_ipa, pc.wrapping_add(4), &mut words) {
-            Ok(b) => b,
-            Err(e) => {
-                kprintln!(
-                    "shadow_stub: FATAL - couldn't build stub for {:#010x} at PC {:#x}: {}",
-                    insn, pc, e
-                );
-                crate::cpu::halt();
-            }
-        };
-
-        // Place the return_pc literal at STUB_RETURN_PC_OFF and zero
-        // the scratch save slot.
-        words[STUB_RETURN_PC_OFF / 4] = pc.wrapping_add(4);
-        words[STUB_SAVE_SLOT_OFF / 4] = 0;
-        // Fill any gap between the emitted code and the return_pc
-        // literal with UDF #0xDEAD so stray execution past the
-        // branch-back faults loudly.
-        for i in built.words..(STUB_RETURN_PC_OFF / 4) {
-            words[i] = 0xE7F0_00F0;
-        }
-
-        let pool_off = local_slot * STUB_SLOT_SIZE;
-        for (i, w) in words.iter().enumerate() {
-            pool_write_word(use_pool_b, pool_off + i * 4, *w);
-        }
-
-        // Record slot metadata for abort transparency.
-        // SAFETY: single-threaded callers; bounded slot.
-        unsafe {
-            SLOT_ORIGINAL_PC[packed_slot] = pc;
-            SLOT_ACCESS_OFF[packed_slot] = built.access_off as u8;
-            SLOT_META[packed_slot] = Some(SlotMeta { xor_mask: decoded.kind.xor_mask() });
-        }
-
-        // Patch original site.
-        let patched = enc_bcond(decoded.cond, pc, stub_ipa);
-        if let Err(e) = code_write_word(pc, patched) {
-            kprintln!(
-                "shadow_stub: FATAL - couldn't write patched insn at PC {:#x}: {}",
-                pc, e
-            );
-            crate::cpu::halt();
-        }
-
-        match decoded.kind {
-            AccessKind::Ldrb | AccessKind::Strb => stats.ldrb_strb += 1,
-            AccessKind::Ldrh | AccessKind::Strh => stats.ldrh_strh += 1,
-            AccessKind::Ldrsb | AccessKind::Ldrsh => stats.ldrsb_ldrsh += 1,
-            AccessKind::Swpb => stats.swpb += 1,
-        }
-        stats.patched += 1;
-
+        patch_one_site(pc, use_pool_b, &mut stats);
         pc = pc.wrapping_add(4);
     }
 
@@ -956,6 +992,70 @@ pub fn patch_code_range(start_ipa: u32, end_ipa: u32) -> PatchStats {
             icache_sync_range(ram_host, (end_ipa - start_ipa) as usize);
         }
     }
+
+    stats
+}
+
+/// FNV-1a-32 of `rom || rex` using the same seed + multiplier as
+/// `baremetal/tools/classify-rom` (and `baremetal/build.rs`).
+#[cfg(not(nh_guest_test))]
+fn rom_rex_hash_runtime() -> u32 {
+    let mut h: u32 = 0x811C_9DC5;
+    for &b in crate::guest_mem::rom_be_bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    for &b in crate::guest_mem::rex_be_bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+/// Pre-patch every ROM site the classifier marked as an
+/// endianness-sensitive subword access. Intended for the boot path:
+/// call once after stage2::enable() with the Newton ROM backing in
+/// place. Halts loudly if the embedded bitmap doesn't hash-match the
+/// loaded ROM + REX.
+///
+/// Counterpart to `patch_code_range` for the RAM-lazy path: both share
+/// `patch_one_site`, so the emitted stubs and metadata are bit-identical.
+#[cfg(not(nh_guest_test))]
+pub fn patch_rom_from_bitmap() -> PatchStats {
+    let runtime_hash = rom_rex_hash_runtime();
+    if runtime_hash != ROM_REX_FNV1A32 {
+        kprintln!(
+            "shadow_stub: ROM+REX hash mismatch (build-time {:#010x}, runtime {:#010x}) — \
+             regenerate the classify bitmap via baremetal/scripts/regen-classify.sh",
+            ROM_REX_FNV1A32, runtime_hash
+        );
+        crate::cpu::halt();
+    }
+
+    let mut stats = PatchStats::default();
+    // Pool A reaches the entire 16 MiB ROM aperture; the bitmap covers
+    // ROM only, so use_pool_b is always false here.
+    for (byte_idx, byte) in BYTE_ACCESS_STATIC_BITMAP.iter().enumerate() {
+        if *byte == 0 { continue; }
+        let mut b = *byte;
+        while b != 0 {
+            let bit = b.trailing_zeros() as usize;
+            b &= b - 1;
+            let word_idx = byte_idx * 8 + bit;
+            let pc = (word_idx * 4) as u32;
+            stats.words_scanned += 1;
+            patch_one_site(pc, false, &mut stats);
+        }
+    }
+
+    let slots_used_a = NEXT_SLOT_A.load(Ordering::SeqCst);
+    if slots_used_a > 0 {
+        icache_sync_range(pool_host_pa(), slots_used_a * STUB_SLOT_SIZE);
+    }
+    icache_sync_range(
+        crate::guest_mem::rom_host_pa(),
+        crate::guest_mem::ROM_SIZE,
+    );
 
     stats
 }

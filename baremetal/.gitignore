@@ -1,6 +1,7 @@
 /target
 Cargo.lock.bak
 *.img
+scripts/classify-out/*
 
 # Newton ROMs are not redistributable. Each developer places their own dump
 # under roms/; the directory itself is tracked (for the README) but all

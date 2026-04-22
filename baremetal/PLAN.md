@@ -1,68 +1,8 @@
 # Plan — Reach the TInterpreter constructor
 
-## Status (as of 2026-04-21)
+## Status
 
-**Phase A is done. Phase B is mid-flight.** Detailed progress notes
-live in `INVESTIGATION.md`; the high-level state is:
-
-- Every Phase A item (fine-table rewrite, UND handler,
-  StrongARM-clock no-op, TSerialChip, CP10/11 native primitives,
-  screen blit) landed with its own guest test. All 13 guest tests
-  pass.
-- The first hard Phase B stall — a DABT at FAR `0x0100018B` —
-  was traced to `MCR p15, 0, r0, c7, c7, 0` at PC `0x18924`
-  inside FlushTheCache (ARMv4 "invalidate unified cache", UNDEFINED
-  on A53). Fixed: `handle_und` now recognises the encoding and
-  emulates as `IC IALLUIS`. Cascade fixes: the UND trampoline no
-  longer depends on SP_und (4-instruction stack-free variant), its
-  save slot moved off the L1-table-overlap at IPA `0x04000400`,
-  `DebuggerUND` properly advances past its null-terminated string,
-  and `fix_stage1_xn_bits` now re-runs on every M=0→M=1 SCTLR
-  transition (the kernel populates L2 tables incrementally).
-- Tick-polling throughput was the next cliff: ~75% of all stage-2
-  traps were reads of K_HDWR_TICKS in BootOS delay loops. Fixed
-  by splitting the 2 MiB stage-2 block at IPA `0x0F000000` into an
-  L3 table and planting a 4 KiB RAM-backed RO page at
-  `0x0F181000`, updated from the CNTHP IRQ. Throughput on a 90 s
-  boot: **1.23 M traps (13.6× fewer)**, no hot PC.
-- ROM debug logging (22 DebuggerUND sites + SystemBootUND +
-  TapFileCntlUND) is now surfaced correctly — strings are read in
-  BE byte order so the original ROM panic messages come through
-  verbatim ("Zot! GenericSWI called from non-user mode.",
-  "SWI from non-user mode (rebooting)", etc.) and each unique site
-  logs once via a per-PC seen-set.
-
-**Current stall** (after function-trace + tracer-transparency fix):
-the 717006 kernel reaches 72 trace-able functions deep and fails
-flash-chip identify inside
-`TNewInternalFlash::CheckFor1LaneFlash` / ...4Lane / ...2Lane.
-The kernel then invokes `PowerOffAndReboot`, which runs the power-
-off sequence and tails out through `SWIBoot` → the "SWI from
-non-user mode (rebooting)" `DebuggerUND`. That panic (and the
-accompanying `Zot! GenericSWI called from non-user mode.`) turn
-out to be the *reboot tail*, not an independent bug — the earlier
-parallel-track endianness hypothesis can be dropped. The real
-cliff is **flash identify**: our stage-2 maps `0x0200_0000..`/
-`0x1000_0000..` as RW-RAM but doesn't model the Intel 28F016
-command-set ("Read Identifier Codes" 0x90 → manufacturer 0x89,
-device 0xA0, etc.). Give the flash window a real driver model or
-short-circuit identify.
-
-## Context
-
-The target boot chain per `_Data_/symbols.txt` is:
-
-1. `0x00018688 BootOS` → cache/MMU flushes, stack setup
-2. `0x00021B70 TADC::Init` (touchscreen ADC)
-3. `0x000307D4 InitAlertManager`
-4. `0x000E6C44 InitCirrusHW` (main-ROM entry — not the REx stub we've been looking at)
-5. `0x0007CC4C TDMAManager::Init`
-6. `0x00030F54 TAppWorld::Init`
-7. `0x00034500 TApplication::InitToolbox`
-8. `0x0038C89C __main`
-9. `0x002F40E0 TInterpreter::TInterpreter` ← midterm goal
-
-All of these are in the main ROM (< `0x00800000`). That means the REx references we've been chasing may be side paths — the primary path only needs the main ROM mapped, the peripheral devices actually modelled (not stubbed), and the CPU-level behaviours (SWP, CP15 quirks, fine-table descriptors, UND opcodes) handled correctly at EL2.
+**Phase A is done. Phase B is mid-flight.**
 
 ## Approach (two phases)
 
@@ -114,27 +54,16 @@ Phase A end state: 14/14 guest tests passing. Every CPU instruction and every MM
 
 Run the Newton ROM under the hypervisor and drive toward TInterpreter. For each stall:
 
+If it's clearly a loud failure for an unimplemented Einstein driver, implement that driver.
+
+If it's another kind of failure:
+
 1. Identify the exact PC where the guest is stuck (heartbeat sampler is already in `trap.rs::trap_irq`; DIAG HVC at VA 0x10 catches any DABT with full context).
 2. Disassemble the ROM at that PC and consult `_Data_/symbols.txt` to name the function.
 3. Run the same offset under Einstein (`build/NewtonProbe baremetal/roms/newton.rom _Data_/Einstein.rex 30`) and compare — the probe now also records every guest data abort with `{PC, FAR, FSR, mode}`, and every prefetch abort with `{PC, IFSR, mode}`, plus the existing CP15 / SWP / mode-transition counts. Diff vs. our hypervisor trap log isolates the divergence.
 4. Reproduce the gap with a focused guest test if feasible, or directly cross-reference against Einstein / `_Data_/symbols.txt` to identify the cause.
 5. Fix the hypervisor.
 6. Re-run ROM, go to next stall.
-
-Concrete checkpoints — current status:
-
-- ✅ **Reach `BootOS+8`** — `cp15.sctlr.mmu_on` at PC `0x18898`.
-- ✅ **Reach `FlushTheCache` / `FlushTheMMU`** (`0x000188F8`, `0x0001892C`).
-- ✅ **Survive post-MMU-on** — the `MCR c7 c7 0` UND at 0x18924 is handled; the DebuggerUND advance-past-string is fixed; `fix_stage1_xn_bits` re-runs on M=0→M=1 edges so late-populated coarse L2 entries are normalised.
-- ✅ **Tick polling no longer dominates runtime** — non-trapping K_HDWR_TICKS via stage-2 RAM-backed page, 13.6× trap reduction.
-- ✅ **Function-level chronological trace wired up** — `cargo run --features trace,quiet` UDFs every recognised function entry and logs (sequence, PC, LR_svc, mode, name) on first touch. Pinpointed the tracer-transparency bug instantly.
-- ✅ **UND trampoline preserves R0 / R1** — the SVC-bounce version was clobbering the guest's first two argument registers; the fix saves them to RAM slots (`UND_SAVE_R0/R1_IPA`) and restores `ctx.x[0]/ctx.x[1]` in `handle_und`. Boot progresses 50× further as a result.
-- 🟡 **Flash-chip identify fails** (`T28F016_SA_SVDriver::Identify` returns "no chip" on all four lane configurations). Kernel falls into `PowerOffAndReboot` → `SWIBoot` → the two "SWI from non-user mode" DebuggerUNDs. The SWI panics were the reboot tail, not an independent issue — the parallel-track endianness hypothesis can be dropped. Fix: model the Intel 28F016 command set on flash banks 0/1, or short-circuit the identify protocol to return a matching chip ID.
-- ⬜ **Pass `InitCirrusHW` (main-ROM, `0x000E6C44`)**.
-- ⬜ **Pass `TDMAManager::Init` (`0x0007CC4C`)** — will exercise our DMA port.
-- ⬜ **Pass `TAppWorld::Init` (`0x00030F54`)** — first application-world init; likely trips TInterruptManager-backed delays (now cheap thanks to the non-trapping tick page).
-- ⬜ **Reach `__main` (`0x0038C89C`)** — C++ runtime static initialisers.
-- ⬜ **Break on `0x002F40E0` (`TInterpreter::TInterpreter`)** — declare midterm victory.
 
 ## Critical files
 
@@ -172,8 +101,7 @@ cd baremetal && timeout 30 cargo run --release
 
 Boot reaches deep initialisation code past `0x0E6B94`. No tight loops
 from tick polling; traps are evenly distributed across task-switch
-SCTLR toggles and scattered MMIO touches. Current terminal condition
-is the SWI-from-non-user-mode DebuggerUND panics visible in the log.
+SCTLR toggles and scattered MMIO touches.
 
 End of Phase B / midterm goal (pending):
 
@@ -202,7 +130,6 @@ matching that count is the cleanest "progress is real" signal.
 - Exhaustively implementing every TNativePrimitives encoding upfront — only the encodings the early-boot path can realistically hit get transcribed in Phase A; others are discovered (with a loud halt) during Phase B and transcribed then. The handler itself is real; the table grows as evidence demands.
 - Real screen emulation beyond a framebuffer dump — no compositor, no pen input.
 - Any work past TInterpreter — scheduler, app world, package loading — waits for the next milestone.
-- **Byte-level endianness equivalence** — the parallel work stream has landed. The SWI-from-non-user-mode panics we'd previously attributed to an endianness mismatch turned out to be the tail of `PowerOffAndReboot`, triggered by the flash-identify failure. No remaining endianness dependency for Phase B.
 
 ## Still-in-place diagnostic scaffolding
 

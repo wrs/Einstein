@@ -93,7 +93,14 @@ pub fn write(ipa: u64, value: u32) {
     let s = unsafe { &mut *DMA.0.get() };
     match ipa {
         K_HDWR_ASSIGN => s.assign = value,
-        K_HDWR_ENABLE_STATUS | K_HDWR_DISABLE => log_stub("dma enable/disable", ipa, value),
+        K_HDWR_ENABLE_STATUS | K_HDWR_DISABLE => {
+            // Einstein's `TDMAManager::WriteEnableRegister` and
+            // `WriteDisableRegister` have the DMA-complete IRQ fire
+            // commented out (`Emulator/TDMAManager.cpp:112,147`). We
+            // match: log the write, don't latch a per-channel bit
+            // into int_present.
+            log_stub("dma enable/disable", ipa, value);
+        }
         // Per-channel writes mirror Einstein: log once, do nothing.
         _ if is_channel_reg(ipa) => log_stub("dma channel write (modeled drop per Einstein)", ipa, value),
         _ => halt_unknown_dma("write", ipa, value),

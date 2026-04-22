@@ -151,6 +151,63 @@ pub fn write_word_pa(pa: u32, value: u32) -> bool {
     false
 }
 
+/// Write a 32-bit word to a guest VA by walking the live stage-1
+/// short-descriptor tables (rooted at TTBR0 = 0x0400_0000 per the
+/// 717006 probe). Mirrors `trap::guest_translate_va`. Used from EL2
+/// when we need to land a value in a kernel data structure named
+/// by a VA the guest passed us (e.g. SFlashChipInformation pointer).
+pub fn write_word_va(va: u32, value: u32) -> bool {
+    let pa = match translate_va(va) {
+        Some(p) => p,
+        None => return false,
+    };
+    write_word_pa(pa, value)
+}
+
+/// Read a 32-bit word from a guest VA through the live stage-1 walk.
+/// Mirrors `write_word_va`. Returns None when the VA is unmapped or
+/// the translated PA lies outside a readable region.
+pub fn read_word_va(va: u32) -> Option<u32> {
+    let pa = translate_va(va)?;
+    read_word_pa(pa)
+}
+
+/// Walk the guest stage-1 short-descriptor tables rooted at
+/// TTBR0=0x0400_0000 and translate `va` to a guest PA. Handles L1
+/// sections, L1 coarse-table references, and L2 large/small pages.
+/// Returns None when the guest's stage-1 MMU is disabled (SCTLR.M=0)
+/// — callers treat `va` as a PA in that case.
+pub fn translate_va(va: u32) -> Option<u32> {
+    let sctlr: u64;
+    // SAFETY: SCTLR_EL1 read is non-destructive.
+    unsafe {
+        core::arch::asm!(
+            "mrs {}, sctlr_el1",
+            out(reg) sctlr,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    if sctlr & 1 == 0 {
+        return None;
+    }
+    let l1_idx = (va >> 20) as usize;
+    let l1_entry = read_word_pa(0x0400_0000 + (l1_idx as u32) * 4)?;
+    match l1_entry & 3 {
+        2 => Some((l1_entry & 0xFFF0_0000) | (va & 0x000F_FFFF)),
+        1 => {
+            let l2_pa = l1_entry & 0xFFFF_FC00;
+            let l2_idx = (va >> 12) & 0xFF;
+            let l2_entry = read_word_pa(l2_pa + l2_idx * 4)?;
+            match l2_entry & 3 {
+                1 => Some((l2_entry & 0xFFFF_0000) | (va & 0x0000_FFFF)),
+                2 | 3 => Some((l2_entry & 0xFFFF_F000) | (va & 0x0000_0FFF)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Write one byte to a guest PA. See `write_word_pa` for semantics.
 pub fn write_byte_pa(pa: u32, value: u8) -> bool {
     let pa = pa as usize;
@@ -544,6 +601,42 @@ pub unsafe fn load_newton_rom() {
         unsafe { rom_ptr.add(rex_base_word + i).write(word_le); }
     }
 
+    // Patch the external REx's id field to one past the last embedded-REx
+    // id. Mirrors Einstein/Emulator/ROM/TROMImage.cpp::LookForREXes
+    // (line 311-313): "Patch the REx to have a sequential ID, or NewtonOS
+    // will be very confused and erase the user's Flash image." The 717006
+    // ROM has exactly one embedded REx (id=0) living at base_size
+    // 0x71FC4C, so the first external REx at 0x00800000 must claim id=1.
+    // Without the patch, NewtonOS's PrimNextRExConfigEntry indexes a
+    // per-id config table and never finds our REx — SearchForFlashDrivers
+    // therefore never sees the 'fdrv' entry that registers
+    // TEinsteinFlashDriver, and the kernel falls back to the built-in
+    // T28F016_SA_SVDriver whose Identify fails against our stub flash.
+    //
+    // REx header layout (offsets from block start):
+    //   +0x00 "RExBlock" magic (8 bytes)
+    //   +0x08 checksum
+    //   +0x0C header version (=1)
+    //   +0x10 manufacturer ('Eins')
+    //   +0x14 version
+    //   +0x18 size
+    //   +0x1C id             <-- the field we patch
+    //   +0x20 startAddr
+    //   +0x24 numEntries
+    const NUM_EMBEDDED_REXES_717006: u32 = 1;
+    let rex_id_word_index = rex_base_word + (0x1C / 4);
+    // SAFETY: rex_id_word_index < rex_base_word + 8 < ROM_SIZE / 4 (checked by assert above).
+    unsafe {
+        let old_id = rom_ptr.add(rex_id_word_index).read();
+        rom_ptr.add(rex_id_word_index).write(NUM_EMBEDDED_REXES_717006);
+        kprintln!(
+            "guest_mem: Einstein.rex id patch {} -> {} (first free slot after embedded REx)",
+            old_id, NUM_EMBEDDED_REXES_717006,
+        );
+    }
+
+
+
     kprintln!(
         "guest_mem: ROM @ host PA {:#x}, RAM @ host PA {:#x}",
         rom_host_pa(),
@@ -558,6 +651,11 @@ pub unsafe fn load_newton_rom() {
         "guest_mem: ROM[0..2] (LE after swap) = {:#010x} {:#010x}",
         first, second
     );
+
+    // Phase A baseline: Einstein's word-write ROM patches. Skipping
+    // these left the kernel in the wrong boot path during Phase B —
+    // see src/rom_patches.rs for the list and rationale.
+    unsafe { crate::rom_patches::apply_717006_patches(rom_ptr); }
 
     // UND vector (VA 0x04) + trampoline body: overwrite the ROM's
     // branch-to-REx-handler with a branch to a small AArch32 stub we

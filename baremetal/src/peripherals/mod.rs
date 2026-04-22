@@ -7,7 +7,9 @@
 
 pub mod dma;
 pub mod flash;
+pub mod flash_driver;
 pub mod native_primitives;
+pub mod platform;
 pub mod pcmcia;
 pub mod screen;
 pub mod serial;

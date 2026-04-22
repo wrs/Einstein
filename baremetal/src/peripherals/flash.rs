@@ -90,3 +90,63 @@ fn write_u32(byte_offset: u32, value: u32) {
         (base.add(byte_offset as usize) as *mut u32).write(value);
     }
 }
+
+/// Guest PA of flash bank 0 (Einstein `kFlashBank1`).
+pub const BANK0_PA_BASE: u32 = 0x0200_0000;
+/// Guest PA of flash bank 1 (Einstein `kFlashBank2`).
+pub const BANK1_PA_BASE: u32 = 0x1000_0000;
+
+/// Translate a guest flash PA to a byte offset in the backing store.
+/// Returns None for addresses outside either bank's window.
+pub fn pa_to_offset(pa: u32) -> Option<usize> {
+    if pa >= BANK0_PA_BASE && pa < BANK0_PA_BASE + BANK_SIZE as u32 {
+        Some((pa - BANK0_PA_BASE) as usize)
+    } else if pa >= BANK1_PA_BASE && pa < BANK1_PA_BASE + BANK_SIZE as u32 {
+        Some(BANK_SIZE + (pa - BANK1_PA_BASE) as usize)
+    } else {
+        None
+    }
+}
+
+/// Masked 32-bit program into flash, following Einstein's
+/// `TFlash::Write` semantics (`Emulator/TFlash.cpp:192-208`): the
+/// stored word becomes `(existing & ~mask) | word`. Returns false if
+/// `pa` is outside the flash windows or not word-aligned.
+pub fn program_word(pa: u32, word: u32, mask: u32) -> bool {
+    if pa & 3 != 0 {
+        return false;
+    }
+    let Some(off) = pa_to_offset(pa) else {
+        return false;
+    };
+    if off + 4 > SIZE {
+        return false;
+    }
+    // SAFETY: `off` bounded above; single-writer under the EL2 trap
+    // handler.
+    unsafe {
+        let base = addr_of_mut!(GUEST_FLASH) as *mut u8;
+        let slot = base.add(off) as *mut u32;
+        let prev = core::ptr::read_volatile(slot);
+        core::ptr::write_volatile(slot, (prev & !mask) | word);
+    }
+    true
+}
+
+/// Erase a block by filling `size` bytes with `0xFF` starting at
+/// `pa`. Matches `TFlash::Erase` (`Emulator/TFlash.cpp:214-235`);
+/// whole block assumed to lie in one bank. Returns false on
+/// out-of-range.
+pub fn erase_block(pa: u32, size: u32) -> bool {
+    let Some(off) = pa_to_offset(pa) else { return false };
+    let end = off + size as usize;
+    if end > SIZE {
+        return false;
+    }
+    // SAFETY: bounds-checked.
+    unsafe {
+        let base = addr_of_mut!(GUEST_FLASH) as *mut u8;
+        core::ptr::write_bytes(base.add(off), 0xFF, size as usize);
+    }
+    true
+}

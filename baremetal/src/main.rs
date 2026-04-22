@@ -11,6 +11,7 @@ mod mmio;
 mod mmu;
 mod panic;
 mod peripherals;
+mod rom_patches;
 mod shadow_stub;
 mod snapshot;
 mod stage2;

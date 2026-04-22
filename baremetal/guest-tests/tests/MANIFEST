@@ -7,8 +7,13 @@ test_cp15_fault_regs
 test_finetable_rewrite
 test_und_handler
 test_cp15_strongarm_clock
+test_midr
+test_mmio_regs
+test_rtc_calendar
 test_serial
 test_native_primitives
+test_flash_driver
+test_platform_driver
 test_screen_blit
 test_snapshot
 test_shadow_stub

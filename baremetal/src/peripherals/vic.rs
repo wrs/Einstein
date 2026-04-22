@@ -16,7 +16,7 @@
 //!   crossed bit(s) into `int_present`, so the next `update_virq` sets VI.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 // ---------- Newton tick clock (3.6864 MHz). ----------------------------------
 
@@ -113,12 +113,70 @@ static VIC: VicCell = VicCell(UnsafeCell::new(VicState {
 
 pub fn init() {
     TICK_EPOCH.store(read_cntpct(), Ordering::Release);
+    init_calendar();
     crate::kprintln!(
         "vic: timer epoch = {}  CNTFRQ_EL0 = {} Hz  (Newton tick = {} Hz)",
         TICK_EPOCH.load(Ordering::Acquire),
         read_cntfrq(),
         NEWTON_TICK_HZ
     );
+}
+
+/// Seconds between 1904-01-01 00:00:00 UTC and 1970-01-01 00:00:00 UTC.
+/// Newton OS counts wall-clock seconds since 1904-01-01; host `SYS_TIME`
+/// returns seconds since 1970-01-01; the difference is a fixed constant.
+const SECS_1904_TO_1970: u32 = 2_082_844_800;
+
+/// Host `time()` seconds since 1904, captured once at hypervisor boot.
+/// Paired with `CALENDAR_CNTPCT_BASELINE` to derive "now" without
+/// calling back out to semihosting on every guest read.
+static CALENDAR_SECONDS_AT_BOOT: AtomicU32 = AtomicU32::new(0);
+/// CNTPCT_EL0 at the moment `CALENDAR_SECONDS_AT_BOOT` was captured.
+static CALENDAR_CNTPCT_BASELINE: AtomicU64 = AtomicU64::new(0);
+
+/// Capture host wall-clock and pair it with CNTPCT so guest reads of
+/// the calendar register return a plausible "seconds since 1904"
+/// value. Einstein achieves the same thing by patching the ROM's
+/// `RealClockSeconds` routine (`TJITGenericROMPatch.cpp:110`) to call
+/// host `time()` — we do it at the MMIO layer instead so we don't
+/// depend on the ROM patch firing.
+fn init_calendar() {
+    const SYS_TIME: u64 = 0x11;
+    // The ARM semihosting SYS_TIME call ignores the parameter block;
+    // pass a dummy pointer to satisfy the shared `semihost` helper.
+    let unix_time: u64 = unsafe {
+        let ret: u64;
+        core::arch::asm!(
+            "hlt #0xF000",
+            inout("x0") SYS_TIME => ret,
+            in("x1") 0u64,
+            options(nostack, preserves_flags),
+        );
+        ret
+    };
+    let secs_since_1904 = (unix_time as u32).wrapping_add(SECS_1904_TO_1970);
+    CALENDAR_SECONDS_AT_BOOT.store(secs_since_1904, Ordering::Release);
+    CALENDAR_CNTPCT_BASELINE.store(read_cntpct(), Ordering::Release);
+    // Re-publish the tick page now that calendar_seconds() returns a
+    // real value — `stage2::init` already called `tick_page::update`
+    // once before this, while the baseline was still zero.
+    crate::stage2::tick_page::update();
+    crate::kprintln!(
+        "vic: calendar = {} seconds since 1904-01-01 (host unix_time={})",
+        secs_since_1904, unix_time
+    );
+}
+
+/// Current "seconds since 1904" as seen by a guest read of the
+/// calendar register. Combines the boot-time baseline with elapsed
+/// wall seconds computed from CNTPCT_EL0.
+pub fn calendar_seconds() -> u32 {
+    let base = CALENDAR_SECONDS_AT_BOOT.load(Ordering::Acquire);
+    let baseline = CALENDAR_CNTPCT_BASELINE.load(Ordering::Acquire);
+    let elapsed_cnt = read_cntpct().wrapping_sub(baseline);
+    let freq = read_cntfrq();
+    let elapsed_secs = (elapsed_cnt / freq as u64) as u32;
+    base.wrapping_add(elapsed_secs)
 }
 
 // Interrupt bit layout in int_present — from TInterruptManager.h.
@@ -292,11 +350,15 @@ pub fn read(ipa: u64) -> u32 {
     // SAFETY: single-threaded access from the trap handler.
     let s = unsafe { &mut *VIC.0.get() };
     match ipa {
-        K_HDWR_PLATFORM_VERS => 0,
+        // Einstein's TPlatformManager::GetVersion returns the constant
+        // 5 (`Emulator/Platform/TPlatformManager.cpp:110`). Newton's
+        // native apps read this register to know the Einstein-era
+        // platform driver revision.
+        K_HDWR_PLATFORM_VERS => 5,
         K_HDWR_P0F110000 => s.p0f110000,
         K_HDWR_HIGH_SPEED_CLCK => 0x0000_0090, // kHighSpeedClockVal per TMemoryConsts
         K_HDWR_P0F111400 => s.p0f111400,
-        K_HDWR_CALENDAR_REG => 0, // seconds since epoch; 0 is acceptable
+        K_HDWR_CALENDAR_REG => calendar_seconds(),
         K_HDWR_ALARM_REG => 0,
         K_HDWR_TICKS => ticks(),
         K_HDWR_MATCH_0 => s.match_reg[0],

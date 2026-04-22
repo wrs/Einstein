@@ -93,7 +93,22 @@ Each item lands as its own commit + its own `guest-tests/tests/test_<name>.S`. I
 
 6. **`peripherals/screen.rs` — Blit/screen primitive handler.** ✅ Done. Test: `test_screen_blit`. Registered as the screen-class dispatch target in `native_primitives`. Real blit copies into `GUEST_FB` via stage-1 + stage-2 translation.
 
-Phase A end state: 13/13 guest tests passing. Every CPU instruction and every MMIO region touched by the early-boot path has a real handler behind it. "Unknown sub-case" responses are intentional, loud, and act as trip-wires for Phase B.
+7. **Einstein's ROM patches (word-write set).** ✅ Done (retroactively). `src/rom_patches.rs::apply_717006_patches` applies every `TJITGenericPatch` entry from `Einstein/Emulator/JIT/Generic/TJITGenericROMPatch.cpp` that targets the 717006 ROM: `gDebugger = 1`, `gNewtConfig = 0x8202`, "ignore setting time", "BeaconDetect no-op", "avoid screen calibration", time-base (4 words). These are known preconditions Einstein relies on — several disable code paths that would otherwise spin on hardware we don't model, and at least one (`gDebugger`) selects the driver-enabled boot path. Missing from Phase A by oversight — the omission forced us to debug Einstein-specific symptoms in Phase B that had nothing to do with our hypervisor.
+
+   Not yet ported (deferred, out of early-boot critical path):
+   - `TJITGenericPatchNativeCall` entries (`DebugStr`, `Debugger`,
+     `RealClockSeconds`, `FTimeInSeconds`, `FDateFromSeconds`). These
+     write a `SWI #0x8xxxxx` marker that only Einstein's JIT intercepts;
+     on real hardware the SWI would take the ROM's own SWI path. To
+     port them we'd replace the `SWI` marker with our tracer-style
+     UDF + EL2 Rust handler.
+   - `TVirtualizedCallsPatches` entries (`__rt_sdiv`, `__rt_udiv`,
+     `symcmp`). 5-word sequence with a bit-31 marker caught by
+     Einstein's `TNativePrimitives::ExecuteNative`. Safe no-op on a
+     native A53 — the ROM's own software-division routines run fine,
+     the virtualized version is only a JIT speed-up.
+
+Phase A end state: 14/14 guest tests passing. Every CPU instruction and every MMIO region touched by the early-boot path has a real handler behind it, and every known-required ROM patch Einstein applies is in place. "Unknown sub-case" responses are intentional, loud, and act as trip-wires for Phase B.
 
 ### Phase B — boot the 717006 ROM and debug failures one at a time
 

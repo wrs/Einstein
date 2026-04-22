@@ -41,6 +41,7 @@ const HW_END: u64 = 0x0F40_0000;
 const HW_RAM_SIZE_1: u64 = 0x0F00_1800;
 const HW_RAM_SIZE_2: u64 = 0x0F00_1C00;
 
+
 // MP2x00 RAM-bank probe window. BootOS probes 0x04000000 (present,
 // 4 MiB — we map it) and 0x08000000 (absent — the "we have 4 MiB not
 // 8 MiB" path). The probe does a signature write/read at `base +

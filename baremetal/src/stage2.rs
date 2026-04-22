@@ -87,6 +87,7 @@ pub(crate) static mut TICK_PAGE: TickPage = TickPage([0; 4096]);
 // as zero by the guest today; the zero-initialised backing matches
 // what `vic::read` returns for them, so we don't need to wire them up
 // explicitly.
+pub(crate) const TICK_OFFSET_CALENDAR: usize = 0x000;
 pub(crate) const TICK_OFFSET_TICKS: usize = 0x800;
 
 // Base IPA of the 4 KiB page holding the tick cluster (calendar / alarm
@@ -110,10 +111,13 @@ pub const FLASH_BANK0_IPA_BASE: u64 = 0x0200_0000;
 pub const FLASH_BANK1_IPA_BASE: u64 = 0x1000_0000;
 pub const RAM_IPA_BASE: u64 = 0x0400_0000;
 pub const RAM_IPA_SIZE: u64 = 0x0040_0000; // 4 MiB
-// Kernel expects RAM at VA 0x0C000000 after stage-1 MMU is on. Until our
-// CP15 shim cleanly enables guest stage-1, mirror the RAM at IPA 0x0C000000
-// so guest stage-1-off accesses to that region work against the same bytes.
-pub const RAM_MIRROR_IPA_BASE: u64 = 0x0C00_0000;
+// There is intentionally no IPA 0x0C mirror. Einstein's `TMemoryConsts`
+// and `TMMU.cpp:1186-1193` document the real Newton layout: `kRAMStart =
+// 0x04000000` is the only RAM PA; VA `0x0C000000+` is purely a stage-1
+// remap to discrete 4 KiB pages in PA `0x04xxxxxx`. A blanket mirror at
+// IPA `0x0C` would alias every pre-MMU 0x0C access to a contiguous RAM
+// window that stage-1 will then remap to a *different* PA, causing
+// pre-MMU writes and post-MMU reads to land in different host cells.
 // Framebuffer scratch: a dumpable RAM region where guest screen drivers can
 // deposit pixels. Not yet wired to any Newton display emulation; the region
 // exists so M5 can point `TScreenManager`-equivalent code at it.
@@ -239,16 +243,6 @@ pub unsafe fn init() {
             RAM_IPA_SIZE / TWO_MIB,
             BLOCK_NORMAL_RW | S2_XN_NEVER,
         );
-        // Mirror of the same 4 MiB at IPA 0x0C00_0000 so the guest's
-        // VA=PA accesses to the kernel RAM window work before its
-        // own stage-1 MMU comes up. Backing is the SAME bytes.
-        // Mirror gets the same XN treatment.
-        set_l2_blocks(
-            RAM_MIRROR_IPA_BASE,
-            ram_pa,
-            RAM_IPA_SIZE / TWO_MIB,
-            BLOCK_NORMAL_RW | S2_XN_NEVER,
-        );
     }
 
     // Framebuffer: dumpable RAM for future screen-manager code.
@@ -325,10 +319,6 @@ pub unsafe fn init() {
     kprintln!(
         "stage2: RAM @ IPA {:#x}..{:#x} -> host PA {:#x} (RW)",
         RAM_IPA_BASE, RAM_IPA_BASE + RAM_IPA_SIZE, ram_pa
-    );
-    kprintln!(
-        "stage2: RAM mirror @ IPA {:#x}..{:#x} -> SAME host PA (RW)",
-        RAM_MIRROR_IPA_BASE, RAM_MIRROR_IPA_BASE + RAM_IPA_SIZE
     );
     kprintln!(
         "stage2: flash bank 0 @ IPA {:#x}..{:#x} -> host PA {:#x} (RW, {} MiB)",
@@ -414,13 +404,14 @@ pub mod tick_page {
     /// Normal-WB stage-2 coherency before the next ERET.
     pub fn update() {
         let ticks = crate::peripherals::vic::ticks();
+        let calendar = crate::peripherals::vic::calendar_seconds();
         // SAFETY: TICK_PAGE is a statically allocated 4 KiB-aligned
-        // buffer; writing a u32 at a fixed offset is in-bounds.
+        // buffer; writing u32s at fixed offsets is in-bounds.
         unsafe {
             let ptr = addr_of_mut!(TICK_PAGE) as *mut u8;
-            let slot = ptr.add(TICK_OFFSET_TICKS) as *mut u32;
-            core::ptr::write_volatile(slot, ticks);
-            // Ensure the store is globally visible before the guest's
+            core::ptr::write_volatile(ptr.add(TICK_OFFSET_TICKS) as *mut u32, ticks);
+            core::ptr::write_volatile(ptr.add(TICK_OFFSET_CALENDAR) as *mut u32, calendar);
+            // Ensure the stores are globally visible before the guest's
             // next load. DSB ISH covers the inner-shareable domain which
             // is what S2_SH_INNER selects for this page.
             core::arch::asm!("dsb ish", options(nostack, preserves_flags));

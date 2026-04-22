@@ -556,21 +556,10 @@ fn handle_instruction_abort(iss: u32) {
     let is_permission = (ifsc & 0b111100) == 0b001100; // 0x0C..0x0F
     let ram_base = guest_mem::RAM_IPA_BASE as u64;
     let ram_end = ram_base + guest_mem::RAM_SIZE as u64;
-    let mirror_base = 0x0C00_0000u64;
-    let mirror_end = mirror_base + guest_mem::RAM_SIZE as u64;
-    let in_ram = (ram_base..ram_end).contains(&ipa)
-        || (mirror_base..mirror_end).contains(&ipa);
+    let in_ram = (ram_base..ram_end).contains(&ipa);
 
     if is_permission && in_ram {
-        // Map mirror IPA back to the RAM IPA space for scanning — the
-        // mirror shares the same backing but the stub emitter writes
-        // via code_write_word which only knows the canonical RAM
-        // range.
-        let scan_ipa = if (mirror_base..mirror_end).contains(&ipa) {
-            (ipa - mirror_base + ram_base) as u32
-        } else {
-            ipa as u32
-        };
+        let scan_ipa = ipa as u32;
 
         // Align down to the 2 MiB block boundary; scan the entire
         // block so subsequent fetches within it don't re-fault.
@@ -585,14 +574,10 @@ fn handle_instruction_abort(iss: u32) {
         let stats = shadow_stub::patch_code_range(block_start, block_end);
         shadow_stub::log_stats(&stats);
 
-        // Flip XN off on the RAM block AND its mirror so both aliases
-        // become fetch-able.
+        // Flip XN off on the RAM block.
         // SAFETY: stage2 TLB maintenance done inside the helper.
         unsafe {
             crate::stage2::clear_xn_for_block(block_start);
-            let mirror_block = (mirror_base as u32)
-                .wrapping_add(block_start - (ram_base as u32));
-            crate::stage2::clear_xn_for_block(mirror_block);
         }
 
         // Retry the fetch — don't advance ELR, just return.

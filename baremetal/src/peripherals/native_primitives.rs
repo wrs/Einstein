@@ -17,7 +17,7 @@
 //! unknown code halts loudly with a full context dump so the next
 //! ROM boot that hits one points exactly at the missing table entry.
 
-use crate::{cpu, kprintln, peripherals::screen, trap::TrapContext};
+use crate::{cpu, kprintln, peripherals::{flash_driver, platform, screen}, trap::TrapContext};
 
 /// Dispatch a native-primitive call.
 ///
@@ -47,6 +47,19 @@ pub fn execute(ctx: &mut TrapContext, native_insn: u32, pc: u32) {
             ctx.x[0] = 0;
         }
 
+        // Flash-class: driver=0 -> TEinsteinFlashDriver subfn dispatch.
+        // Subfn 0x00 is reserved for the null-primitive test above;
+        // anything else routes into the flash driver.
+        (d, s) if d == flash_driver::DRIVER_ID => {
+            flash_driver::handle(ctx, s, pc);
+        }
+
+        // Platform-class: driver=1 -> TMainPlatformDriver subfn dispatch.
+        // See peripherals/platform.rs.
+        (d, s) if d == platform::DRIVER_ID => {
+            platform::handle(ctx, s, pc);
+        }
+
         // Screen-class: driver=4 -> TMainDisplayDriver method per
         // subfn. See peripherals/screen.rs.
         (d, s) if d == screen::DRIVER_ID => {
@@ -69,3 +82,4 @@ pub fn execute(ctx: &mut TrapContext, native_insn: u32, pc: u32) {
         }
     }
 }
+

@@ -56,6 +56,16 @@ unsafe fn configure_el2_traps() {
         cptr |= 1u64 << 10;
         asm!("msr cptr_el2, {}", "isb", in(reg) cptr,
             options(nostack, preserves_flags));
+
+        // Virtualise MIDR_EL1 so guest `MRC p15, 0, Rt, c0, c0, 0`
+        // reads return the StrongARM SA-1100 value Newton OS branches
+        // on rather than the Cortex-A53 ID. Einstein hard-codes the
+        // same value at `Emulator/TARMProcessor.cpp:99`. VPIDR_EL2
+        // overrides MIDR_EL1 reads from EL1/EL0 without trapping
+        // (see Arm ARM "MIDR_EL1, Main ID Register").
+        asm!("msr vpidr_el2, {}", "isb",
+            in(reg) 0x4401_A100u64,
+            options(nostack, preserves_flags));
     }
 }
 

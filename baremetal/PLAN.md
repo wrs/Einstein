@@ -80,7 +80,8 @@ Current layout:
 - `src/peripherals/vic.rs` — interrupt controller + tick clock; `K_HDWR_TICKS` now advances the non-trapping RAM page instead of returning from a trap.
 - `src/mmio.rs` — routes `0x0F1C_0000..0x0F20_0000` to `serial`, plus existing VIC / DMA / PCMCIA / stub dispatch.
 - `src/snapshot.rs` — rolling ring under `/tmp/newton-snapshot-{0..3}.bin`.
-- `guest-tests/tests/` — 13 tests (test_hello, test_vic, test_flash, test_dma, test_pcmcia, test_cp15_fault_regs, test_finetable_rewrite, test_und_handler, test_cp15_strongarm_clock, test_serial, test_native_primitives, test_screen_blit, test_snapshot).
+- `src/shadow_stub.rs` — BE-32 byte/halfword-access patcher. Pool A (ROM-resident patch sites) at IPA 0x00E00000..0x01000000 inside the guest ROM aperture; reachable pre- AND post-MMU via the guest kernel's own ROM section descriptors. Pool B (lazy-RAM-resident) at IPA 0x03000000..0x03200000. Stub scratch save/restore uses TPIDR_EL0 (an ARMv6+ per-CPU register SA-1100 doesn't implement); return-to-caller is a direct `B orig_pc+4` (±32 MiB reach). See IMPLEMENTATION.md §8.4 for the full design.
+- `guest-tests/tests/` — 20 tests (test_hello, test_vic, test_flash, test_dma, test_pcmcia, test_cp15_fault_regs, test_finetable_rewrite, test_und_handler, test_cp15_strongarm_clock, test_midr, test_mmio_regs, test_rtc_calendar, test_rom_patches, test_serial, test_native_primitives, test_flash_driver, test_platform_driver, test_screen_blit, test_snapshot, test_shadow_stub).
 - `guest-tests/scripts/run-test.sh` — clears `/tmp/newton-snapshot-*.bin` before each run so a stale snapshot can't cause a test to resume mid-run.
 
 ## Verification
@@ -91,7 +92,7 @@ Each Phase A / Phase B commit:
 baremetal/guest-tests/scripts/run-all.sh
 ```
 
-All 13 tests pass at the current commit.
+All 20 tests pass at the current commit.
 
 End-of-Phase-A milestone (met):
 
@@ -110,6 +111,16 @@ cd baremetal && timeout 60 cargo run --release
 ```
 
 Trap log shows guest PC sampled at or near `0x002F40E0` — the TInterpreter constructor.
+
+Current Phase B progress (2026-04-22):
+
+- Post-MMU shadow-stub dispatch PABT resolved by moving pool A into the
+  ROM aperture. See `INVESTIGATION.md` and the commit `baremetal:
+  shadow_stub pool A in ROM aperture — fixes post-MMU dispatch`.
+- Boot now runs ~345k function-tracer entries in 90 s, then spins in
+  `TPrivatePackageIterator` (11,888 calls to `NumberOfParts` inside a
+  hot loop over REx entries). No PABT, no halt. This is the next
+  stall to root-cause — see `INVESTIGATION.md` "Currently at".
 
 Einstein as reference:
 
@@ -137,7 +148,9 @@ These items should come off once Phase B is stable — leave them in
 for now because they're load-bearing for the current debugging loop:
 
 - DABT-vector HVC patch at ROM offset 0x10 (`guest_mem.rs`) → two-stage `handle_diag` / `handle_diag_lr` in `trap.rs`. Catches every stage-1 DABT with full banked-register context.
-- 500-entry trap log budget at the top of `trap_sync_lower_aarch32`.
+- PABT-vector HVC patch at ROM offset 0x0C (`guest_mem.rs`) — same DIAG path; added during the pool-A-in-ROM investigation and kept as tripwire for future prefetch aborts.
+- `handle_diag_from_bp` hook in `guest_bp.rs::handle_user_bp_und` — lets a `bp <addr>` hit hand off to the banked-reg dump stub.
+- 500-entry trap log budget at the top of `trap_sync_lower_aarch32`; HVC #0x50 (tracer TAG) suppressed to avoid doubling trace output.
 - Bring-up-critical VA walks in `handle_diag`.
 
 Once we're past TInterpreter and confident no silent abort is

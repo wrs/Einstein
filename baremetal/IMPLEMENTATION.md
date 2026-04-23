@@ -349,6 +349,69 @@ patching wrong PCs. `scripts/regen-classify.sh` is the one-stop
 regen: it runs `classify-symbols.py` if needed, rebuilds the
 classifier, runs it with the curated inputs.
 
+### 8.5 Stub pool placement and layout
+
+Stub code lives inside the guest ROM aperture, not in a separate
+EL2-only region. Placement and the reasoning behind the layout:
+
+- **Pool A** — ROM-resident patch sites (ROM at 0..0x01000000, flash
+  bank 0 at 0x02000000..0x02400000). Stubs at IPA 0x00E00000..0x01000000
+  (2 MiB, one stage-2 L2 block, inside the guest's 16 MiB ROM aperture).
+  The guest kernel's own stage-1 L1[0xE..0xF] section descriptors
+  identity-map the ROM aperture post-MMU (Einstein's MMU dump:
+  `VA 0x00100000 to 0x01000000 (15360 kB): section`), so dispatched
+  stubs are reachable from every patched site regardless of MMU
+  state. Pool A was previously at IPA 0x01800000 outside the kernel's
+  stage-1 map; a post-MMU dispatch PABT'd on stub fetch. Fix in
+  commit `baremetal: shadow_stub pool A in ROM aperture — fixes
+  post-MMU dispatch`; see INVESTIGATION.md.
+
+- **Pool B** — lazy-RAM-resident patch sites (RAM at 0x04000000..
+  0x04400000). Stubs at IPA 0x03000000 (pre-RAM, 2 MiB stage-2 RW
+  block). ±32 MiB `B` reach constrains this: pool A at 0x00E00000
+  can't reach RAM at 0x04000000+ from a single pool. Pool B is
+  currently exercised only pre-MMU by `test_shadow_stub` subtest 20;
+  the real Newton boot hasn't yet reached `UseROMJumpTables` (the
+  first post-MMU lazy-RAM consumer), so pool B's post-MMU
+  reachability story is TBD.
+
+- **Stub body layout** — 48-byte slot, 12 words, worst-case 11 insns
+  of real code + padding filled with UDF #0xDEAD:
+  ```
+    MCR p15,0,<scratch>,c13,c0,2   ; save <scratch> to TPIDR_EL0
+    <compute EA into <scratch>>    ; 1-2 insns (imm12 may split)
+    CMP <scratch>, #0x10000000     ; MMIO-skip check
+    BHS skip                       ; skip EOR for MMIO
+    EOR <scratch>, <scratch>, #N   ; N = 3 (byte) or 2 (halfword)
+  skip:
+    <LDRB/STRB/... Rt, [<scratch>]> ; the real access
+    [optional writeback to Rn]     ; 1-2 insns
+    MRC p15,0,<scratch>,c13,c0,2   ; restore <scratch> from TPIDR_EL0
+    B orig_pc + 4                  ; direct return (±32 MiB)
+  ```
+  TPIDR_EL0 (TPIDRURW, ARMv6+) is the save slot because it's a
+  per-CPU architectural register the SA-1100 doesn't implement and
+  the Newton kernel therefore never touches; HCR_EL2 doesn't trap
+  CP15 c13 so the MCR/MRC executes natively. Nested-exception
+  caveat: if a higher-priority exception's handler itself fires a
+  shadow-stub the saved value is clobbered; in practice kernel
+  byte-access paths run with I/F masked and this hasn't surfaced.
+
+  Alternatives considered and rejected: in-slot PC-relative STR
+  (stubs in RO ROM can't self-write); `PUSH/POP` on the current-mode
+  banked SP (breaks if the patched access's Rn is SP); VFP register
+  scratch (blocked by `CPTR_EL2.TFP=1` which dispatches native
+  primitives).
+
+- **Fault forwarding** — when the inner access in a stub faults
+  (stage-2 IA on an unmapped or MMIO IPA), `trap.rs::handle_data_abort`
+  recognises the ELR is in a stub slot via `shadow_stub::is_stub_ipa`,
+  un-XORs the effective address back to what the guest would have
+  computed natively via `slot_xor_mask`, and forwards the fault to
+  the guest's abort handler as if it had fired at the original
+  patched PC (via `slot_original_pc`). Keeps the abort-transparent
+  invariant end-to-end.
+
 ## 9. Open questions (implementation-specific)
 
 Design-level open questions are in `HIGHLEVEL.md` §16. These are narrower and implementation-only.

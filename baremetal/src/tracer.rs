@@ -115,6 +115,7 @@ pub fn in_reserved_range(addr: u32) -> bool {
     if addr < 0x0000_0020 { return true; }
     if (0x00FF_FF00..0x00FF_FFB0).contains(&addr) { return true; }
     if addr == crate::rom_patches::POWEROFF_REBOOT_PC { return true; }
+    if addr == crate::rom_patches::REBOOT_PC { return true; }
     false
 }
 
@@ -350,6 +351,20 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
         0x17 => "abt", 0x1B => "und", 0x1F => "sys", _ => "???",
     };
 
+    // putc (0x0034F7E0) is called once per character by the ROM's
+    // `_vfprintf` / printf family — most commonly when UnhandledException
+    // formats an unhandled-exception message, but any guest printf
+    // ultimately lands here. Accumulate the characters and emit a
+    // `putc:` line on each newline (or when the buffer fills); suppress
+    // the per-call trace line since the buffered view is strictly more
+    // useful than 100+ one-char-each trace entries. The caller of putc
+    // is shown once per emitted line via the LR captured on first char.
+    let fa = fn_addr(idx);
+    if fa == 0x0034F7E0 {
+        buffer_putc_char(ctx.x[0] as u32, ctx.x[14] as u32, seq);
+        return;
+    }
+
     kprintln!(
         "trace {:5} {:#010x} {} ({}) r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} lr={:#010x}",
         seq,
@@ -362,7 +377,6 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
 
     // Targeted one-shot-style dumps. Gated on function index to avoid log
     // spam.
-    let fa = fn_addr(idx);
     if mode == 0x10 {
         if fa == 0x0025BC14 || fa == 0x0025BBD4 || fa == 0x001F8EAC {
             // KSRVTask spawn path — dump guest stack so we see env_id /
@@ -598,6 +612,51 @@ fn dump_env_config_table() {
             names[0], names[1], names[2], names[3],
             names[4], names[5], names[6], names[7],
         );
+    }
+}
+
+/// Buffer a single character passed to the guest's `putc` (0x0034F7E0).
+/// Emitted as a `putc:` line when we see '\n', a non-printable control,
+/// or the buffer fills. This turns the UnhandledException / vfprintf /
+/// developer printf paths into human-readable output on our UART
+/// without re-implementing the ROM's FILE buffering.
+///
+/// `lr` is recorded on the first char of each line so the emitted line
+/// can name its caller (`__vfprintf` for printf-family, plus whatever
+/// called that).
+fn buffer_putc_char(ch: u32, lr: u32, seq: u32) {
+    const CAP: usize = 512;
+    static mut BUF: [u8; CAP] = [0u8; CAP];
+    static mut LEN: usize = 0;
+    static mut FIRST_LR: u32 = 0;
+    static mut FIRST_SEQ: u32 = 0;
+
+    let byte = (ch & 0xff) as u8;
+    // SAFETY: single-threaded on core 0 under EL2.
+    unsafe {
+        if LEN == 0 {
+            FIRST_LR = lr;
+            FIRST_SEQ = seq;
+        }
+        let newline = byte == b'\n' || byte == b'\r';
+        let printable = byte >= 0x20 && byte < 0x7f;
+        if !newline && printable && LEN < CAP {
+            BUF[LEN] = byte;
+            LEN += 1;
+        }
+        // Flush on newline, on unprintable-control (other than CR/LF),
+        // or when the buffer is about to overflow.
+        let should_flush = newline
+            || (!printable && !newline)
+            || LEN == CAP;
+        if should_flush && LEN > 0 {
+            let s = core::str::from_utf8(&BUF[..LEN]).unwrap_or("<non-utf8>");
+            kprintln!(
+                "putc {:5}..{:5} lr={:#010x}: {}",
+                FIRST_SEQ, seq, FIRST_LR, s
+            );
+            LEN = 0;
+        }
     }
 }
 

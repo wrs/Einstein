@@ -158,23 +158,39 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
 #[no_mangle]
 pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     // Diagnostic heartbeat: sample guest PC so we can see where it's
-    // executing when no MMIO traps are firing. Only print when the PC
-    // moves — keeps a steady-state spin from flooding the console,
-    // while still flagging every distinct program-counter the guest
-    // reaches between timer fires.
+    // executing when no MMIO traps are firing.
+    //
+    // Two-phase behaviour: the first `HB_FIRST_BUDGET` distinct PCs
+    // get logged unconditionally — useful while early boot is still
+    // walking new code. After that we switch to a "stuck detector":
+    // every `HB_LATE_STRIDE`-th IRQ we log the current PC+SPSR, so a
+    // guest that's wedged in an idle / alarm loop shows its actual
+    // steady-state PC rather than just the first time we saw it.
     static mut HB_LAST_PC: u64 = u64::MAX;
-    static mut HB_PRINT_BUDGET: usize = 16;
+    static mut HB_FIRST_BUDGET: usize = 16;
+    static mut HB_IRQ_COUNT: u64 = 0;
+    const HB_LATE_STRIDE: u64 = 64;
     let elr = read_sysreg!("elr_el2");
     // SAFETY: single-threaded.
-    let should_log = unsafe {
-        let go = elr != HB_LAST_PC && HB_PRINT_BUDGET > 0;
-        if go { HB_LAST_PC = elr; HB_PRINT_BUDGET -= 1; }
-        go
+    let (should_log, tag) = unsafe {
+        HB_IRQ_COUNT += 1;
+        if HB_FIRST_BUDGET > 0 && elr != HB_LAST_PC {
+            HB_LAST_PC = elr;
+            HB_FIRST_BUDGET -= 1;
+            (true, "first")
+        } else if HB_IRQ_COUNT % HB_LATE_STRIDE == 0 {
+            (true, "late")
+        } else {
+            (false, "")
+        }
     };
     if should_log {
         let spsr = read_sysreg!("spsr_el2");
         let far = read_sysreg!("far_el1");
-        kprintln!("timer_irq: guest ELR={:#x} SPSR={:#x} FAR_EL1={:#x}", elr, spsr, far);
+        kprintln!(
+            "timer_irq[{}]: guest ELR={:#x} SPSR={:#x} FAR_EL1={:#x}",
+            tag, elr, spsr, far
+        );
     }
     timer::on_irq();
     update_virq();
@@ -534,6 +550,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::POWEROFF_REBOOT_HVC_IMM => {
             handle_poweroff_reboot(ctx);
         }
+        v if v == crate::rom_patches::REBOOT_HVC_IMM => {
+            handle_reboot(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -820,6 +839,23 @@ fn handle_und(ctx: &mut TrapContext) {
             crate::tracer::log_trace_at(ctx, faulting_pc, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
         }
+        // Reboot canary (rom_patches::REBOOT_PC = 0x000D_9884). The
+        // kernel calls `Reboot(long, ...)` from USR mode on
+        // UnhandledException; HVC at EL0 is UNDEFINED, so our
+        // patched `HVC #REBOOT_HVC_IMM` lands here. Route into the
+        // same halt handler the HVC path uses.
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::REBOOT_HVC_IMM)
+            && faulting_pc == crate::rom_patches::REBOOT_PC =>
+        {
+            handle_reboot(ctx);
+        }
+        // PowerOffAndReboot canary, symmetric case for the USR-mode
+        // call path.
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::POWEROFF_REBOOT_HVC_IMM)
+            && faulting_pc == crate::rom_patches::POWEROFF_REBOOT_PC =>
+        {
+            handle_poweroff_reboot(ctx);
+        }
         // User-driven guest software breakpoint — must be checked
         // before the tracer path because the marker encoding
         // (UDF #0xFFFE) is also a UDF-shape instruction. See
@@ -939,6 +975,52 @@ fn handle_poweroff_reboot(ctx: &TrapContext) -> ! {
     );
     kprintln!(
         "   function called before PowerOffAndReboot.)"
+    );
+    cpu::halt();
+}
+
+/// Canary handler for `Reboot(long, unsigned long, unsigned char)` at
+/// 0x000D_9884. Symmetric with `handle_poweroff_reboot`: halt on the
+/// first hit with R0..R3 (reboot reason / flags / ...) and the preceding
+/// tracer line naming the caller.
+/// AArch32 `HVC #imm16` encoding at unconditional (cond=AL). Mirror of
+/// `rom_patches::hvc_insn` — duplicated here because that helper is
+/// `const fn` and not exported.
+const fn rom_patches_hvc_insn(imm: u32) -> u32 {
+    0xE140_0070 | ((imm & 0xFFF0) << 4) | (imm & 0xF)
+}
+
+fn handle_reboot(ctx: &TrapContext) -> ! {
+    let spsr_el2 = read_sysreg!("spsr_el2");
+    let elr_el2 = read_sysreg!("elr_el2");
+    let mode = (spsr_el2 & 0x1F) as u32;
+    kprintln!();
+    kprintln!("*** Reboot canary fired — guest kernel is rebooting ***");
+    kprintln!(
+        "  ELR_EL2  = {:#010x}  (= Reboot entry PC)",
+        elr_el2
+    );
+    kprintln!(
+        "  SPSR_EL2 = {:#010x}  mode={} ({:#x})",
+        spsr_el2, describe_aarch32_mode(mode), mode
+    );
+    kprintln!(
+        "  R0 = {:#010x}  R1 = {:#010x}  R2 = {:#010x}  R3 = {:#010x}",
+        ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
+    );
+    kprintln!(
+        "  R12={:#010x}  R14(mode)={:#010x}  (caller LR; mode-banked, may be stale)",
+        ctx.x[12] as u32, ctx.x[14] as u32
+    );
+    kprintln!();
+    kprintln!(
+        "  (Preceding tracer entries show the caller chain. A typical trigger"
+    );
+    kprintln!(
+        "   is UnhandledException → Reboot; in that case the exception name"
+    );
+    kprintln!(
+        "   is at the r0 pointer passed to `Throw` a few entries earlier.)"
     );
     cpu::halt();
 }

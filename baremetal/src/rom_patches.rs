@@ -96,6 +96,16 @@ pub const DEBUGGER_HVC_IMM: u32 = 0x41;
 pub const POWEROFF_REBOOT_PC: u32 = 0x000E_6BBC;
 pub const POWEROFF_REBOOT_HVC_IMM: u32 = 0x42;
 
+/// Phase-B canary: `Reboot(long, unsigned long, unsigned char)` at
+/// 0x000D_9884. This is the "soft-reboot" path the kernel's exception
+/// unwinder calls on an UnhandledException (the path that bypassed
+/// our PowerOffAndReboot canary and wedged into a reboot loop during
+/// the 2026-04-23 StartupProtocolRegistry stall). Same canary shape:
+/// patch the first word to `HVC #REBOOT_HVC_IMM` so we halt on the
+/// first hit with the caller's R0 = reboot reason.
+pub const REBOOT_PC: u32 = 0x000D_9884;
+pub const REBOOT_HVC_IMM: u32 = 0x43;
+
 /// AArch32 `HVC #imm16` encoding at unconditional (cond=AL).
 const fn hvc_insn(imm: u32) -> u32 {
     0xE140_0070 | ((imm & 0xFFF0) << 4) | (imm & 0xF)
@@ -167,9 +177,10 @@ pub unsafe fn apply_717006_patches(rom_ptr: *mut u32) {
         apply_ftime_in_seconds_patch(rom_ptr);
         apply_fdate_from_seconds_patch(rom_ptr);
         apply_poweroff_reboot_trap(rom_ptr);
+        apply_reboot_trap(rom_ptr);
     }
 
-    kprintln!("rom_patch: applied {} simple patches + 5 native-call/injection ROM patches + PowerOffAndReboot canary", applied);
+    kprintln!("rom_patch: applied {} simple patches + 5 native-call/injection ROM patches + PowerOffAndReboot + Reboot canaries", applied);
 }
 
 /// (Previously we patched every `T28F016_SA_SVDriver` method to emit
@@ -324,6 +335,26 @@ unsafe fn apply_poweroff_reboot_trap(rom_ptr: *mut u32) {
         kprintln!(
             "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (PowerOffAndReboot canary, HVC #{:#x})",
             POWEROFF_REBOOT_PC, prev, insn, POWEROFF_REBOOT_HVC_IMM,
+        );
+    }
+}
+
+/// Same canary pattern as `apply_poweroff_reboot_trap`, but for the
+/// soft-reboot path `Reboot(long, unsigned long, unsigned char)` at
+/// 0x000D_9884. UnhandledException → Reboot → ROMBoot is the loop the
+/// kernel falls into when an exception isn't caught (observed during
+/// StartupProtocolRegistry); catching here reports the reboot reason
+/// (R0) immediately rather than letting the second boot cycle mask
+/// it.
+unsafe fn apply_reboot_trap(rom_ptr: *mut u32) {
+    let idx = (REBOOT_PC / 4) as usize;
+    let insn = hvc_insn(REBOOT_HVC_IMM);
+    unsafe {
+        let prev = rom_ptr.add(idx).read();
+        rom_ptr.add(idx).write(insn);
+        kprintln!(
+            "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (Reboot canary, HVC #{:#x})",
+            REBOOT_PC, prev, insn, REBOOT_HVC_IMM,
         );
     }
 }

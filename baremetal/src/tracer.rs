@@ -349,14 +349,54 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
     };
 
     kprintln!(
-        "trace {:5} {:#010x} {} ({}) r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}",
+        "trace {:5} {:#010x} {} ({}) r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} lr={:#010x}",
         seq,
         fn_addr(idx),
         fn_name(idx),
         mode_label,
         ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
+        ctx.x[14] as u32,
     );
+
+    // Targeted one-shot-style dump: for the specific USR-mode call sites
+    // we're investigating (KSRVTask spawn path — TUTask::Init + FMNewStack
+    // caller in UserBoot), also dump the guest's stack-top so we can see
+    // args 5..7 (env_id, priority, name) that are passed via the stack.
+    // ctx.x[13] carries SP_usr in the AArch32→AArch64-on-HVC path; reading
+    // it and translating through stage-1 gives us the caller's stack frame.
+    // Gated on mode=USR and the function index so we don't spam the log.
+    if mode == 0x10 {
+        let fa = fn_addr(idx);
+        if fa == 0x0025BC14 || fa == 0x0025BBD4 || fa == 0x001F8EAC {
+            dump_guest_stack(ctx.x[13] as u32, 8);
+        }
+    }
     let _ = cpu::halt; // suppress unused-import warning under some cfgs
+}
+
+fn dump_guest_stack(sp: u32, words: usize) {
+    if sp == 0 {
+        kprintln!("  stack dump: sp=0 (banked SP not plumbed)");
+        return;
+    }
+    // Gather into a small fixed-size array so we can print as one line.
+    let mut buf = [0u32; 8];
+    let n = words.min(8);
+    let mut got_any = false;
+    for i in 0..n {
+        match guest_mem::read_word_va(sp.wrapping_add((i as u32) * 4)) {
+            Some(v) => { buf[i] = v; got_any = true; }
+            None => { buf[i] = 0xDEAD_BEEF; }
+        }
+    }
+    if !got_any {
+        kprintln!("  stack dump @sp={:#010x}: all translations failed", sp);
+        return;
+    }
+    kprintln!(
+        "  stack @sp={:#010x}: {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}",
+        sp, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]
+    );
 }
 
 /// The HVC #TRACE_TAG instruction as it appears in slot[0] of a tracer

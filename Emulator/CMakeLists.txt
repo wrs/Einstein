@@ -39,4 +39,6 @@ list ( APPEND common_sources
 	Emulator/TMemoryConsts.h
 	Emulator/TNativePrimitives.cpp
 	Emulator/TNativePrimitives.h
+	Emulator/TTracer.cpp
+	Emulator/TTracer.h
 )

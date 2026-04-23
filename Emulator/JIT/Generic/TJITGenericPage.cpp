@@ -46,6 +46,8 @@
 #include "TJITPerformance.h"
 #endif
 
+#include "Emulator/TTracer.h"
+
 // -------------------------------------------------------------------------- //
 // Constantes
 // -------------------------------------------------------------------------- //
@@ -140,6 +142,20 @@ JITInstructionProto(instrCount)
 }
 #endif
 
+// Injected by Translate() when the next instruction's VAddr matches a known
+// function entry loaded by TTracer::Enable. Layout: [this unit][pc][name].
+// POPVALUE reads the .fValue 32-bit member — fine for pc, but the name ptr
+// is host-sized (64-bit on arm64), so read it through .fPtr directly.
+JITInstructionProto(traceFunctionEntry)
+{
+	KUInt32 pc;
+	POPVALUE(pc);
+	const char* name = reinterpret_cast<const char*>(ioUnit[1].fPtr);
+	ioUnit++;
+	TTracer::LogEntry(ioCPU, pc, name);
+	EXECUTENEXTUNIT;
+}
+
 // -------------------------------------------------------------------------- //
 //  * Translate( JITUnit*, KUInt32, KUInt32, KUInt32 )
 // -------------------------------------------------------------------------- //
@@ -154,6 +170,14 @@ TJITGenericPage::Translate(
 	PushUnit(ioUnitCrsr, instrCount);
 	PushUnit(ioUnitCrsr, inVAddr);
 #endif
+
+	if (TTracer::IsEnabled()) {
+		if (const char* name = TTracer::Lookup(inVAddr)) {
+			PushUnit(ioUnitCrsr, traceFunctionEntry);
+			PushUnit(ioUnitCrsr, inVAddr);
+			PushUnit(ioUnitCrsr, reinterpret_cast<KUIntPtr>(name));
+		}
+	}
 
 	// handle injections before anything else
 	if (TJITGenericPatchObject::IsNativeInjection(inInstruction))

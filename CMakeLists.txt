@@ -336,6 +336,15 @@ if ( ${CMAKE_SYSTEM_NAME} STREQUAL "Darwin" )
 		${cmake_sources}
 		baremetal/probe/probe.cpp
 	)
+	# Function-entry trace harness. Same ${common_sources} as NewtonProbe,
+	# but its main calls TTracer::Enable so the JIT translator injects a
+	# trace unit at each known function entry. Output format matches the
+	# bare-metal hypervisor's tracer so the two logs can be diffed.
+	add_executable ( NewtonTrace
+		${common_sources}
+		${cmake_sources}
+		baremetal/probe/trace.cpp
+	)
 	if ( EINSTEIN_FLTK_FRONTEND )
 		add_library ( EinsteinFLGUI STATIC
 			${fluid_sources}
@@ -350,6 +359,10 @@ if ( ${CMAKE_SYSTEM_NAME} STREQUAL "Darwin" )
 		-Wall -Wextra -Wpedantic -Wno-missing-field-initializers -Werror
 	)
 	target_compile_options( NewtonProbe PUBLIC
+		-Wall -Wno-multichar -Wno-misleading-indentation -Wno-unused-result
+		-Wno-missing-field-initializers -Wno-stringop-truncation
+	)
+	target_compile_options( NewtonTrace PUBLIC
 		-Wall -Wno-multichar -Wno-misleading-indentation -Wno-unused-result
 		-Wno-missing-field-initializers -Wno-stringop-truncation
 	)
@@ -381,6 +394,10 @@ if ( ${CMAKE_SYSTEM_NAME} STREQUAL "Darwin" )
 		NO_PORT_AUDIO NO_X11 TARGET_OS_OPENSTEP=1
 		TARGET_OS_MAC=1 NS_BLOCK_ASSERTIONS=1
 		NEWTON_PROBE_MAIN=1 NEWTON_PROBE_INSTRUMENT=1
+	)
+	target_compile_definitions ( NewtonTrace PRIVATE
+		NO_PORT_AUDIO NO_X11 TARGET_OS_OPENSTEP=1
+		TARGET_OS_MAC=1 NS_BLOCK_ASSERTIONS=1
 	)
 	if ( EINSTEIN_FLTK_FRONTEND )
 		target_compile_definitions ( EinsteinFLGUI PRIVATE
@@ -438,6 +455,15 @@ if ( ${CMAKE_SYSTEM_NAME} STREQUAL "Darwin" )
 		"-framework CoreAudio"
 		"-framework Cocoa"
 	)
+	target_link_libraries ( NewtonTrace
+		${system_libs}
+		pthread
+		"-framework AddressBook"
+		"-framework AudioUnit"
+		"-framework AppKit"
+		"-framework CoreAudio"
+		"-framework Cocoa"
+	)
 
 	set_target_properties ( Einstein PROPERTIES
 		MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/Resources/macOS/Info.plist.in"
@@ -476,6 +502,12 @@ elseif ( ${CMAKE_SYSTEM_NAME} STREQUAL "Linux" OR ${CMAKE_SYSTEM_NAME} STREQUAL 
 		${cmake_sources}
 		baremetal/probe/probe.cpp
 	)
+	# Function-entry trace harness — see the Darwin block above for details.
+	add_executable ( NewtonTrace
+		${common_sources}
+		${cmake_sources}
+		baremetal/probe/trace.cpp
+	)
 	add_library ( EinsteinFLGUI STATIC
 		${fluid_sources}
 	)
@@ -494,6 +526,10 @@ elseif ( ${CMAKE_SYSTEM_NAME} STREQUAL "Linux" OR ${CMAKE_SYSTEM_NAME} STREQUAL 
 		-Wall -Wno-multichar -Wno-misleading-indentation -Wno-unused-result
 		-Wno-missing-field-initializers -Wno-stringop-truncation
 	)
+	target_compile_options ( NewtonTrace PUBLIC
+		-Wall -Wno-multichar -Wno-misleading-indentation -Wno-unused-result
+		-Wno-missing-field-initializers -Wno-stringop-truncation
+	)
 	target_compile_options ( EinsteinFLGUI PUBLIC
 		-Wall -Wno-multichar -Wno-misleading-indentation -Wno-unused-result
 		-Wno-missing-field-initializers -Wno-stringop-truncation -Werror
@@ -506,6 +542,9 @@ elseif ( ${CMAKE_SYSTEM_NAME} STREQUAL "Linux" OR ${CMAKE_SYSTEM_NAME} STREQUAL 
 	)
 	target_compile_definitions ( NewtonProbe PRIVATE
 		TARGET_UI_FLTK=1 TARGET_OS_LINUX=1 NEWTON_PROBE_MAIN=1 NEWTON_PROBE_INSTRUMENT=1
+	)
+	target_compile_definitions ( NewtonTrace PRIVATE
+		TARGET_UI_FLTK=1 TARGET_OS_LINUX=1
 	)
 	target_compile_definitions ( EinsteinFLGUI PRIVATE
 		TARGET_UI_FLTK=1 TARGET_OS_LINUX=1
@@ -523,6 +562,12 @@ elseif ( ${CMAKE_SYSTEM_NAME} STREQUAL "Linux" OR ${CMAKE_SYSTEM_NAME} STREQUAL 
 		pthread
 	)
 	target_link_libraries ( NewtonProbe
+		${system_libs}
+		fltk::fltk fltk::images fltk::png fltk::z
+		EinsteinFLGUI
+		pthread
+	)
+	target_link_libraries ( NewtonTrace
 		${system_libs}
 		fltk::fltk fltk::images fltk::png fltk::z
 		EinsteinFLGUI
@@ -709,6 +754,17 @@ if ( TARGET NewtonProbe )
 		${FLTK_INCLUDE_DIRS}
 	)
 	target_compile_definitions ( NewtonProbe PUBLIC
+		"$<$<CONFIG:DEBUG>:_DEBUG>" USE_CMAKE
+	)
+endif ()
+if ( TARGET NewtonTrace )
+	# Same rationale as NewtonProbe above.
+	target_include_directories (
+		NewtonTrace PUBLIC
+		${CMAKE_SOURCE_DIR}
+		${FLTK_INCLUDE_DIRS}
+	)
+	target_compile_definitions ( NewtonTrace PUBLIC
 		"$<$<CONFIG:DEBUG>:_DEBUG>" USE_CMAKE
 	)
 endif ()

@@ -270,3 +270,24 @@ the tracer's coverage in lock-step with shadow_stub's definition of
   function still runs correctly; it just isn't traced.
 - Every call fires an HVC. On a long boot the trace volume can
   saturate the mini-UART; lean on `quiet` and/or grep.
+
+## Reference docs
+
+When debugging or investigating, consult these FIRST before
+re-deriving state from disassembly or tool output:
+
+- [`docs/DISASM.md`](docs/DISASM.md) — how to use
+  `scripts/disasm-out/rom.dis`, the full symbol-annotated ROM+REx
+  disassembly. **Don't hex-decode ROM bytes by hand; use the disasm.**
+- [`docs/NEWTON_INTERNALS.md`](docs/NEWTON_INTERNALS.md) — APCS
+  calling convention, two-level object dispatch, ROM jump-table
+  (0x01A00000..0x01C20000) as the post-ship patch mechanism, DDK
+  header locations.
+- [`docs/QEMU_BUGS.md`](docs/QEMU_BUGS.md) — QEMU raspi3b bugs at
+  the AArch64↔AArch32 boundary. Grep this before suspecting our
+  own code at that boundary.
+- [`docs/WORKFLOW.md`](docs/WORKFLOW.md) — process notes: review
+  Einstein-driver ports with a sub-agent, test-per-feature rule,
+  finish-the-phase semantics.
+- [`docs/peripherals.md`](docs/peripherals.md) — peripheral
+  implementations.

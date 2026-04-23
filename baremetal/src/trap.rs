@@ -647,6 +647,7 @@ pub const UND_SAVE_SPSR_IPA: u32 = 0x0400_5F04;
 /// LR_svc captured by the trampoline's brief SVC-mode bounce. Only
 /// meaningful when SPSR_und's mode field says the caller was SVC
 /// (which is the case for all Newton 2.x kernel-internal calls).
+#[allow(dead_code)]
 pub const UND_SAVE_LR_SVC_IPA: u32 = 0x0400_5F08;
 
 /// Pre-UND R0 and R1. The trampoline persists them here before
@@ -659,6 +660,7 @@ pub const UND_SAVE_R1_IPA: u32 = 0x0400_5F10;
 
 /// R2 stash — the trampoline briefly clobbers R2 while executing the
 /// mode-switch dance that reads the faulting mode's banked SP/LR.
+#[allow(dead_code)]
 pub const UND_SAVE_R2_IPA: u32 = 0x0400_5F14;
 
 /// Banked SP (R13) and LR (R14) of the faulting mode. Populated by the
@@ -929,6 +931,7 @@ fn handle_und(ctx: &mut TrapContext) {
 /// Entry point for callers outside `trap.rs` that want a full banked-
 /// reg dump (e.g. `guest_bp::handle_user_bp_und` at a vector-intercept
 /// BP). Reuses the same stub path as the `HVC #DIAG_TAG` case.
+#[allow(dead_code)]
 pub fn handle_diag_from_bp(ctx: &mut TrapContext) -> ! {
     handle_diag(ctx);
     // handle_diag ERETs and never returns, but the function signature
@@ -1709,20 +1712,6 @@ pub(crate) fn return_to_guest_from_und(_ctx: &mut TrapContext, elr: u64, _spsr: 
             "msr elr_el2, {elr}",
             "isb",
             elr = in(reg) guest_mem::UND_RETURN_STUB_VA as u64,
-            options(nostack, preserves_flags),
-        );
-    }
-}
-
-fn return_to_guest(_ctx: &mut TrapContext, elr: u64, spsr: u64) {
-    // SAFETY: writing EL2 sysregs; restore tail ERETs using these values.
-    unsafe {
-        core::arch::asm!(
-            "msr elr_el2, {elr}",
-            "msr spsr_el2, {spsr}",
-            "isb",
-            elr = in(reg) elr,
-            spsr = in(reg) spsr,
             options(nostack, preserves_flags),
         );
     }

@@ -240,8 +240,5 @@ fn build_classify_bitmap() {
     fs::write(out.join("rom_rex_hash.rs"), hash_src)
         .unwrap_or_else(|e| panic!("classify: write rom_rex_hash.rs: {e}"));
 
-    println!(
-        "cargo:warning=nh-baremetal: classify bitmap {hash_hex} ({} bytes) staged for embed",
-        bitmap_meta.len()
-    );
+    let _ = (hash_hex, bitmap_meta);
 }

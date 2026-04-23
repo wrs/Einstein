@@ -173,12 +173,10 @@ fn write(ctx: &mut TrapContext, pc: u32) {
         // the subsequent linear read will match.
         let bank0_base = flash::BANK0_PA_BASE;
         let bank1_base = flash::BANK1_PA_BASE;
-        let (bank_base, bank_size) = if pa >= bank0_base
-            && pa < bank0_base + flash::BANK_SIZE as u32
-        {
-            (bank0_base, flash::BANK_SIZE as u32)
+        let bank_base = if pa >= bank0_base && pa < bank0_base + flash::BANK_SIZE as u32 {
+            bank0_base
         } else if pa >= bank1_base && pa < bank1_base + flash::BANK_SIZE as u32 {
-            (bank1_base, flash::BANK_SIZE as u32)
+            bank1_base
         } else {
             ctx.x[0] = ERR_FLASH_ADDR_OUT_OF_RANGE as u64;
             return;

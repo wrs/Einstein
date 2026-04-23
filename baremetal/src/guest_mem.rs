@@ -607,6 +607,10 @@ pub unsafe fn load_guest_test() {
         // SAFETY: i < GUEST_TEST_BIN.len() <= ROM_SIZE.
         unsafe { rom_ptr.add(i).write(*b); }
     }
+    // Make the freshly-written bytes visible to the guest's instruction
+    // fetcher. Without this the I-cache misses, hits memory, and reads
+    // pre-init zeros (the writes are still in the D-cache).
+    crate::cpu::icache_publish_range(rom_ptr as u64, GUEST_TEST_BIN.len());
     kprintln!(
         "guest_mem: guest-test @ host PA {:#x}, RAM @ host PA {:#x}",
         rom_host_pa(), ram_host_pa()

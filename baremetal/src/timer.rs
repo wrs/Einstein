@@ -8,22 +8,12 @@
 //! the match into `vic::int_present`, sets HCR_EL2.VI if appropriate, and
 //! reprograms CNTHP for the next deadline.
 //!
-//! On the BCM2836/2837 (Pi 3B, Pi Zero 2 W, QEMU raspi3b) the CNTHP PPI is
-//! routed through the per-core "ARM local" peripheral at 0x4000_0000 rather
-//! than a GIC. We program the core-0 timer IRQ-control register to route
-//! CNTHPIRQ to the IRQ input. A Pi 4/5 port would need a GIC init pass
-//! instead.
+//! Routing the CNTHP PPI to the CPU's IRQ input is host-specific:
+//!   raspi3b  — BCM2836 per-core "ARM local" peripheral at 0x4000_0040.
+//!   fvp-base — GICv3 (TODO; currently a no-op — see platform::fvp_base).
+//! See `crate::platform::install_cnthp_irq_routing`.
 
-use crate::{kprintln, peripherals::vic};
-
-/// BCM2836 per-core timer IRQ-control register, core 0. Bit layout:
-///   [0] CNTPSIRQ  -> IRQ
-///   [1] CNTPNSIRQ -> IRQ
-///   [2] CNTHPIRQ  -> IRQ     <- we set this
-///   [3] CNTVIRQ   -> IRQ
-///   [4..7] same sources routed to FIQ
-const BCM_LOCAL_CORE0_TIMER_IRQCNTL: *mut u32 = 0x4000_0040 as *mut u32;
-const BCM_CNTHPIRQ_IRQ: u32 = 1 << 2;
+use crate::{kprintln, peripherals::vic, platform};
 
 /// CNTHP_CTL_EL2: ENABLE=1, IMASK=0 → timer fires an IRQ when
 /// CNTPCT_EL0 crosses CNTHP_CVAL_EL2.
@@ -49,13 +39,10 @@ fn read_cntfrq() -> u64 {
 /// once, from kmain before the first guest ERET.
 pub fn init() {
     // Route CNTHPIRQ (PPI from the EL2 physical timer) to the core's IRQ
-    // line via the BCM2836 per-core timer control register. Without this
-    // the timer signal fires internally but never reaches the IRQ pin.
-    // SAFETY: the 1 GiB block covering 0x40000000 is mapped Device-nGnRE
-    // by mmu::init().
-    unsafe {
-        BCM_LOCAL_CORE0_TIMER_IRQCNTL.write_volatile(BCM_CNTHPIRQ_IRQ);
-    }
+    // line. Implementation differs per host (BCM local peripheral vs
+    // GICv3); without it the timer signal fires internally but never
+    // reaches the IRQ pin.
+    platform::install_cnthp_irq_routing();
 
     // Start with the deadline far in the future and IMASK clear so the
     // timer never accidentally fires before the first guest match arm.

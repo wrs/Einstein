@@ -106,6 +106,22 @@ unsafe fn eret_to_guest(entry_ipa: u64) -> ! {
         configure_el2_traps();
         zero_el1_guest_state();
 
+        // Point-of-unification sync. `guest_mem::load_rom` /
+        // `load_guest_test` wrote instruction bytes into Normal-WB DRAM
+        // through the data-cache path; the guest's first fetch comes
+        // through the I-cache. Without a DSB+IC+ISB the guest can fetch
+        // stale (zero) bytes on platforms that honour I/D cache
+        // separation — we saw this as an EC=0x20 abort at IPA 0x1000000
+        // on FVP_Base_RevC (guest fell through 16 MiB of zero-NOPs to
+        // the end of the ROM aperture).
+        asm!(
+            "dsb ish",
+            "ic iallu",
+            "dsb ish",
+            "isb",
+            options(nostack, preserves_flags),
+        );
+
         asm!(
             "msr elr_el2, {entry}",
             "msr spsr_el2, {spsr}",

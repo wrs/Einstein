@@ -19,9 +19,13 @@ fn main() {
     println!("cargo:rerun-if-env-changed=NH_GUEST_TEST");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=roms/newton.rom");
+    println!("cargo:rerun-if-changed=linker.ld");
+    println!("cargo:rerun-if-changed=linker-fvp.ld");
 
     // Tell rustc that `nh_guest_test` is a known cfg so it doesn't warn.
     println!("cargo:rustc-check-cfg=cfg(nh_guest_test)");
+
+    select_platform_linker_script();
 
     let guest_test = env::var("NH_GUEST_TEST").ok();
     if let Some(path) = &guest_test {
@@ -50,6 +54,29 @@ fn main() {
     // keeps the layout simple and catches a stale file earlier.
     let _ = guest_test;
     build_classify_bitmap();
+}
+
+/// Select the linker script based on the platform-* feature. Panics if
+/// zero or multiple platform features are enabled (they are mutually
+/// exclusive — they fix the load address, MMIO addresses, and UART base
+/// into the image). The `.cargo/config.toml` deliberately doesn't set
+/// `-Tlinker.ld` so this is the single source of truth.
+fn select_platform_linker_script() {
+    let raspi3b = env::var("CARGO_FEATURE_PLATFORM_RASPI3B").is_ok();
+    let fvp_base = env::var("CARGO_FEATURE_PLATFORM_FVP_BASE").is_ok();
+
+    let script = match (raspi3b, fvp_base) {
+        (true, false) => "linker.ld",
+        (false, true) => "linker-fvp.ld",
+        (false, false) => panic!(
+            "no platform selected: enable exactly one of \
+             --features platform-raspi3b or --features platform-fvp-base"
+        ),
+        (true, true) => panic!(
+            "platform-raspi3b and platform-fvp-base are mutually exclusive"
+        ),
+    };
+    println!("cargo:rustc-link-arg=-T{script}");
 }
 
 fn build_trace_tables() {

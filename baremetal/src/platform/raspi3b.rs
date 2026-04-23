@@ -1,0 +1,50 @@
+//! QEMU raspi3b / real BCM2837 (Pi 3B, Pi Zero 2 W).
+//!
+//! Load address 0x80000 is set by linker.ld; this module declares only
+//! what the running hypervisor code needs to read at runtime.
+
+pub const NAME: &str = "Cortex-A53 / BCM2837 (Pi 3B, Zero 2 W, QEMU raspi3b)";
+
+// PL011 UART0 on the BCM2837 peripheral window.
+pub const UART_BASE: usize = 0x3F20_1000;
+pub const UART_CLOCK_HZ: u32 = 48_000_000; // Default Pi firmware / QEMU clock.
+
+/// Identity-map this PA window as Device-nGnRE (else Normal WB). On the Pi
+/// this is the BCM2837 peripheral window; everything below is DRAM.
+pub const DEVICE_MMIO_START: u64 = 0x3F00_0000;
+pub const DEVICE_MMIO_END: u64 = 0x4000_0000;
+
+/// A second Device-nGnRE region (BCM2836 per-core local peripheral), mapped
+/// via a 1 GiB L1 block directly. `None` on platforms without a second
+/// device window.
+pub const DEVICE_MMIO_1GIB_BLOCK: Option<u64> = Some(0x4000_0000);
+
+/// Optional 1 GiB Normal WB DRAM block at the given PA, mapped at L1
+/// directly. `None` when DRAM falls inside the L2-table-covered region
+/// (true for raspi3b — image + RAM live in L1[0]).
+pub const DRAM_1GIB_BLOCK: Option<u64> = None;
+
+/// Newton ticks are nominally 3.6864 MHz. QEMU raspi3b's CNTPCT_EL0
+/// advances at ~0.8 MHz of wall time, so if we report ticks at the real
+/// rate the kernel's calibrated delay loops stall for tens of seconds.
+/// Scaling up 128× keeps boot-wall-clock under a minute. Matches a
+/// similar fudge in Einstein's TInterruptManager::GetTimer.
+pub const NEWTON_TICK_HZ: u64 = 3_686_400 * 128;
+
+/// Route the EL2 physical timer PPI (CNTHPIRQ) to core 0's IRQ input.
+///
+/// The BCM2836 has no GIC; PPI delivery is done via a per-core local
+/// peripheral at `0x4000_0040`. Without this write the timer fires
+/// internally but the IRQ never reaches the CPU.
+pub fn install_cnthp_irq_routing() {
+    const BCM_LOCAL_CORE0_TIMER_IRQCNTL: *mut u32 = 0x4000_0040 as *mut u32;
+    const BCM_CNTHPIRQ_IRQ: u32 = 1 << 2;
+    // SAFETY: MMIO at fixed address; the 1 GiB block covering 0x40000000
+    // is mapped Device-nGnRE by mmu::init() via DEVICE_MMIO_1GIB_BLOCK.
+    unsafe { BCM_LOCAL_CORE0_TIMER_IRQCNTL.write_volatile(BCM_CNTHPIRQ_IRQ) }
+}
+
+/// Early per-platform CPU sysreg fixups before we touch anything that
+/// reads them. On raspi3b both QEMU and Pi firmware program CNTFRQ_EL0
+/// for us, so this is a no-op.
+pub fn init_cpu_sysregs() {}

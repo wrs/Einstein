@@ -10,6 +10,15 @@ name = "newton-hypervisor"
 path = "src/main.rs"
 
 [features]
+default = ["platform-raspi3b"]
+
+# Host-platform selection. Exactly one must be enabled; build.rs panics
+# otherwise. Controls UART/GIC addresses, MMU memory map, load address
+# (via linker script selection), and timer-IRQ routing. The AArch32
+# guest ISA and the guest's simulated Newton hardware are unaffected.
+platform-raspi3b = []
+platform-fvp-base = []
+
 # Function-level execution trace. When enabled, build.rs parses
 # ../_Data_/unified_symbols.tsv and embeds a compact address + name
 # table; at ROM load time each word-aligned function entry whose first

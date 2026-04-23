@@ -78,6 +78,31 @@ pub fn ic_ivau(va: u64) {
     }
 }
 
+/// I-cache–coherent publish of a freshly-written code range.
+///
+/// After the host CPU writes instruction bytes through a Normal-WB
+/// mapping (e.g. `guest_mem::load_*` populating the ROM backing, or any
+/// inline patcher), those writes sit in the data cache and are not
+/// visible to the I-cache fetch path on cores whose I/D caches are
+/// non-coherent (Cortex-A53, AEM v8-A — i.e. both QEMU raspi3b and FVP
+/// Base RevC).
+///
+/// This walks the range one cache line at a time and issues
+/// `DC CVAU; DSB ISH; IC IVAU; DSB ISH; ISB` per line. Cache line size
+/// hard-coded to 64 bytes — the value for both A53 and AEMvA. (If we
+/// ever target a part with a different `CTR_EL0.IminLine`, query CTR
+/// for line size instead.)
+pub fn icache_publish_range(va: u64, len: usize) {
+    const LINE: u64 = 64;
+    let start = va & !(LINE - 1);
+    let end = (va + len as u64 + LINE - 1) & !(LINE - 1);
+    let mut p = start;
+    while p < end {
+        ic_ivau(p);
+        p += LINE;
+    }
+}
+
 // NOTE: There is no `read_sp_abt()` helper. `MRS <Xt>, SP_abt`
 // (S3_4_C4_C1_1) is architecturally defined (DDI 0487 D19.2) but
 // QEMU raspi3b's Cortex-A53 model takes an EC=0 UNDEFINED trap at

@@ -1,17 +1,25 @@
-//! EL2 stage-1 MMU setup for identity-mapping the low 1 GiB of the Pi
+//! EL2 stage-1 MMU setup for identity-mapping the low N GiB of the host's
 //! physical address space.
 //!
-//! Layout we install:
+//! The MMIO and DRAM windows differ between hosts; the layout itself is
+//! parameterised by `crate::platform`:
+//!
+//!   raspi3b  — DRAM 0x0..0x3F00_0000, MMIO 0x3F00_0000..0x4000_0000,
+//!              BCM2836 local peripheral 0x4000_0000..0x8000_0000.
+//!   fvp-base — MMIO 0x0800_0000..0x4000_0000 (covers UART0, GICv3, …),
+//!              DRAM 0x8000_0000..0xC000_0000 (image lives here).
+//!
+//! Layout we install (generic):
 //!
 //!   L1 table: 512 × 1 GiB entries.
-//!     [0]       -> table descriptor pointing at L2
-//!     [1]       -> 1 GiB Device block at 0x40000000..0x80000000 (BCM2836
-//!                  local peripheral, including per-core timer IRQ routing)
-//!     [2..=511] -> invalid (any VA above 2 GiB faults at EL2)
+//!     [0]    table descriptor → L2 (covers low 1 GiB of MMIO / RAM)
+//!     [1]    optional 1 GiB Device block (set on raspi3b only)
+//!     [2]    optional 1 GiB Normal WB block (set on fvp-base for DRAM)
+//!     others invalid
 //!
 //!   L2 table: 512 × 2 MiB block entries.
-//!     [0..=503]   identity map, Normal WB cacheable (our image + RAM)
-//!     [504..=511] identity map, Device-nGnRE (BCM2837 MMIO window at 0x3F000000)
+//!     identity-map PA == VA, Device-nGnRE inside the platform's
+//!     [DEVICE_MMIO_START..DEVICE_MMIO_END), Normal WB elsewhere.
 //!
 //! Attribute encoding via MAIR_EL2:
 //!   index 0: Normal inner+outer WB write-allocate cacheable (0xFF)
@@ -23,6 +31,7 @@
 use core::ptr::addr_of_mut;
 
 use crate::kprintln;
+use crate::platform;
 
 // --------------- Descriptor layout (VMSAv8-64 short form) ---------------
 
@@ -51,7 +60,7 @@ static mut L1: PageTable = PageTable([0; 512]);
 static mut L2: PageTable = PageTable([0; 512]);
 
 const TWO_MIB: u64 = 0x20_0000;
-const MMIO_BASE: u64 = 0x3F00_0000;
+const ONE_GIB: u64 = 0x4000_0000;
 
 // --------------------------- MAIR / TCR values --------------------------
 
@@ -98,24 +107,39 @@ const SCTLR_EL2_RES1: u64 = (1 << 4) | (1 << 5) | (1 << 11)
 /// low 1 GiB is identity-mapped: RAM as Normal WB, the BCM2837 MMIO window
 /// (0x3F000000–0x40000000) as Device-nGnRE.
 pub unsafe fn init() {
-    // Populate L2: 504 × Normal + 8 × Device, identity PA.
+    // Populate L2 (covers PAs 0..1 GiB): identity-map each 2 MiB block as
+    // Device-nGnRE inside the platform's MMIO window, Normal WB elsewhere.
     let l2_ptr = addr_of_mut!(L2) as *mut u64;
     for i in 0..512_u64 {
         let pa = i * TWO_MIB;
-        let attr = if pa >= MMIO_BASE { BLOCK_DEVICE } else { BLOCK_NORMAL };
+        let attr = if pa >= platform::DEVICE_MMIO_START && pa < platform::DEVICE_MMIO_END {
+            BLOCK_DEVICE
+        } else {
+            BLOCK_NORMAL
+        };
         // SAFETY: i < 512 and the array has 512 entries.
         unsafe { l2_ptr.add(i as usize).write(pa | attr); }
     }
 
-    // L1[0] -> L2 as a table descriptor. L1[1] is a 1 GiB Device block
-    // covering 0x40000000..0x80000000 so we can program the BCM2836 per-core
-    // peripheral (local timer IRQ routing). All other L1 entries stay zero.
+    // L1[0] -> L2 as a table descriptor. The other L1 entries are filled in
+    // per-platform: raspi3b adds a 1 GiB Device block at 0x4000_0000 for the
+    // BCM2836 per-core peripheral; fvp-base adds a 1 GiB Normal WB block at
+    // 0x8000_0000 covering the DRAM where the hypervisor image and guest ROM
+    // both live. Anything else stays zero so a stray VA above the mapped
+    // ranges takes a translation fault at EL2 instead of escaping silently.
     let l1_ptr = addr_of_mut!(L1) as *mut u64;
     let l2_addr = addr_of_mut!(L2) as u64;
-    // SAFETY: L1 has 512 entries; we only touch indices 0 and 1.
+    // SAFETY: L1 has 512 entries; we only touch indices 0 and one optional slot per platform.
     unsafe {
         l1_ptr.write(l2_addr | DESC_VALID | DESC_TABLE);
-        l1_ptr.add(1).write(0x4000_0000 | BLOCK_DEVICE);
+        if let Some(pa) = platform::DEVICE_MMIO_1GIB_BLOCK {
+            let idx = (pa / ONE_GIB) as usize;
+            l1_ptr.add(idx).write(pa | BLOCK_DEVICE);
+        }
+        if let Some(pa) = platform::DRAM_1GIB_BLOCK {
+            let idx = (pa / ONE_GIB) as usize;
+            l1_ptr.add(idx).write(pa | BLOCK_NORMAL);
+        }
     }
 
     // Publish the tables to the MMU walker before enabling. dsb ish is

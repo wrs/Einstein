@@ -27,13 +27,11 @@ static TICK_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// Real Newton hardware clocks the tick register at 3.6864 MHz of wall
 /// time. QEMU raspi3b's CNTPCT_EL0 advances at roughly 0.8 MHz of wall
-/// time (virtual time, not realtime), so if we report ticks at the
-/// real rate the kernel's calibrated delay loops stall for tens of
-/// seconds. Report a scaled rate that advances at roughly wall-clock
-/// speed to keep boot under a minute on QEMU. Matches a similar fudge
-/// in Einstein's TInterruptManager::GetTimer when built against a
-/// non-realtime host clock.
-pub const NEWTON_TICK_HZ: u64 = 3_686_400 * 128;
+/// time, so the raspi3b platform reports a scaled rate (3.6864 MHz × 128)
+/// to keep boot-wall-time under a minute. FVP runs the generic timer at
+/// the architectural 100 MHz, so it uses the unscaled rate. The choice
+/// lives in `crate::platform::NEWTON_TICK_HZ`.
+pub use crate::platform::NEWTON_TICK_HZ;
 
 /// CNTPCT_EL0 reading captured at `init()`. Callers doing rate-conversion
 /// between CNTPCT and Newton-tick domains anchor at this point (Newton

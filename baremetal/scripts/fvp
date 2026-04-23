@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# Run an AArch64 bare-metal ELF under FVP_Base_RevC-2xAEMvA.
+#
+# Hides the Docker invocation and the FVP -C parameters that took an
+# evening to converge on (see reference_fvp_base_revc.md). The FVP runs
+# inside the armswdev/aemfvp-cca-v2-image container via OrbStack — native
+# arm64 on Apple Silicon.
+#
+# Usage:
+#   scripts/fvp <elf>                Boot the ELF, stream UART to stdout,
+#                                    exit when guest emits EOT (0x04).
+#   scripts/fvp --gdb <elf>          Same but pause at entry with an Iris
+#                                    debug server on host port 7100.
+#   scripts/fvp --timeout=N <elf>    Kill the sim after N seconds.
+#
+# Env:
+#   FVP_IMAGE   Override the Docker image (default armswdev/aemfvp-cca-v2-image:latest)
+#   FVP_EXTRA   Extra '-C ...' arguments forwarded to the FVP.
+
+set -euo pipefail
+
+IMAGE="${FVP_IMAGE:-armswdev/aemfvp-cca-v2-image:latest}"
+FVP_BIN=/tmp/cca-stack/Base_RevC_AEMvA_pkg/models/Linux64_armv8l_GCC-9.3/FVP_Base_RevC-2xAEMvA
+
+gdb=0
+# FVP runs the generic timer and cache model accurately, so long-running
+# memory operations (e.g. the hypervisor zeroing ~28 MiB of BSS) can
+# take tens of seconds of wall time — much longer than the equivalent
+# QEMU TCG run. Default timeout is generous enough for a cold boot into
+# a guest test.
+timeout_secs=300
+elf=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --gdb)           gdb=1; shift ;;
+        --timeout=*)     timeout_secs="${1#--timeout=}"; shift ;;
+        --image=*)       IMAGE="${1#--image=}"; shift ;;
+        -h|--help)
+            sed -n '3,/^set -e/p' "$0" | sed -n '1,/^set -e/p' | head -n -1 | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        --) shift; break ;;
+        -*) echo "unknown flag: $1" >&2; exit 2 ;;
+        *)  elf="$1"; shift ;;
+    esac
+done
+
+if [[ -z "$elf" ]]; then
+    echo "usage: $0 [--gdb] [--timeout=N] <elf>" >&2
+    exit 2
+fi
+if [[ ! -f "$elf" ]]; then
+    echo "$0: $elf not found" >&2
+    exit 2
+fi
+
+# Resolve to absolute host path so the Docker bind-mount always finds it.
+elf_abs="$(cd "$(dirname "$elf")" && pwd)/$(basename "$elf")"
+
+# Mount the project root so relative paths in the ELF (e.g. snapshot
+# files opened via semihosting) resolve against the host as expected.
+here="$(cd "$(dirname "$0")" && pwd)"
+mount_root="$(cd "$here/../.." && pwd)"
+rel_elf="${elf_abs#$mount_root/}"
+
+# FVP parameters. See reference_fvp_base_revc.md for why each matters.
+fvp_args=(
+    -a "cluster0.cpu0=/work/$rel_elf"
+    -C cluster0.has_el3=0
+    -C cluster0.NUM_CORES=1
+    -C cluster1.NUM_CORES=1
+    -C cluster0.cpu0.RVBAR=0x80000000
+    -C bp.secure_memory=0
+    -C bp.pl011_uart0.uart_enable=1
+    -C bp.pl011_uart0.out_file=-
+    -C bp.pl011_uart0.unbuffered_output=1
+    -C bp.pl011_uart0.shutdown_on_eot=1
+    -C bp.terminal_0.start_telnet=0
+    -C bp.terminal_0.mode=raw
+    -C bp.terminal_1.start_telnet=0
+    -C bp.terminal_2.start_telnet=0
+    -C bp.terminal_3.start_telnet=0
+)
+
+docker_args=(
+    run --rm --platform linux/arm64
+    -v "$mount_root:/work"
+    -w /work
+)
+
+if [[ "$gdb" == "1" ]]; then
+    fvp_args+=(-I --iris-port 7100 -p)
+    docker_args+=(-p 7100:7100)
+    echo "[fvp] Iris debug server will listen on host :7100 (paused at entry)." >&2
+fi
+
+# Forward any FVP_EXTRA argument string as additional -C params.
+if [[ -n "${FVP_EXTRA:-}" ]]; then
+    # shellcheck disable=SC2206
+    extra=($FVP_EXTRA)
+    fvp_args+=("${extra[@]}")
+fi
+
+exec timeout "$timeout_secs" docker "${docker_args[@]}" \
+    --entrypoint "$FVP_BIN" "$IMAGE" "${fvp_args[@]}"

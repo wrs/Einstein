@@ -12,6 +12,7 @@ mod mmio;
 mod mmu;
 mod panic;
 mod peripherals;
+mod platform;
 mod rom_patches;
 mod shadow_stub;
 mod snapshot;
@@ -34,6 +35,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Entry point called from `boot.s` on core 0 after stack and bss are ready.
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
+    platform::init_cpu_sysregs();
     uart::init();
     print_banner();
     print_caps();
@@ -137,7 +139,7 @@ fn print_banner() {
     kprintln!();
     kprintln!("===============================================");
     kprintln!(" Newton Hypervisor v{}  (baremetal, M0)", VERSION);
-    kprintln!(" Target: Cortex-A53 / BCM2837 (Pi 3B, Zero 2 W)");
+    kprintln!(" Target: {}", platform::NAME);
     kprintln!("===============================================");
     kprintln!("Current EL: {}", cpu::current_el());
     kprintln!("Core ID:    {}", cpu::core_id());

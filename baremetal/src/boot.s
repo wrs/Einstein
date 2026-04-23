@@ -1,13 +1,17 @@
-// Entry point. Loaded at 0x80000 by QEMU raspi3b and by Pi firmware.
-// All four cores start here; we run core 0 and park the others.
+// Entry point. Load address is per-platform (linker.ld puts us at
+// 0x80000 for raspi3b, linker-fvp.ld at 0x80000000 for FVP). Multiple
+// cores may arrive here at reset; we run only the unique primary
+// (Aff2|Aff1|Aff0 == 0) and park everything else.
 
 .section .text.boot, "ax"
 .global _start
 
 _start:
-    // Read CPU ID (affinity level 0) from MPIDR_EL1; park cores 1-3.
+    // Park anything that isn't the primary. Mask to bits[23:0] of
+    // MPIDR_EL1 (Aff2|Aff1|Aff0): on raspi3b this correctly parks
+    // cluster0 cores 1-3; on FVP it also parks cluster1.cpu0 (Aff1=1).
     mrs     x0, mpidr_el1
-    and     x0, x0, #0xff
+    ubfx    x0, x0, #0, #24
     cbnz    x0, .Lpark
 
     // Install our stack pointer.

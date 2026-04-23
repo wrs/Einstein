@@ -264,21 +264,23 @@ pub unsafe fn init() {
     // SAFETY: see the called helper's contract.
     unsafe { install_tick_page(); }
 
-    // Shadow-stub pool A (2 MiB) — ROM-reach stubs at 0x01800000.
-    // Pool B (2 MiB) — RAM-reach stubs at 0x03000000. Both map 2 MiB
-    // blocks of the combined shadow_stub backing. Writable is harmless
-    // (only EL2 writes via the host backing) and executable-from-guest
-    // is the whole point.
-    let stub_pa_a = shadow_stub::pool_host_pa();
+    // Shadow-stub pool A (ROM-resident patch sites) now lives inside
+    // the guest ROM aperture at IPA 0x00E00000..0x00F80000. Stage-2
+    // already RO-maps the entire ROM, so there's nothing extra to
+    // install here for pool A — and crucially, the guest kernel's
+    // own stage-1 ROM sections cover it post-MMU. That's the fix for
+    // the post-MMU stub-dispatch PABT documented in INVESTIGATION.md.
+    //
+    // Pool B (lazy-RAM-resident patch sites) still lives at IPA
+    // 0x03000000 — the ARM `B` instruction's ±32 MiB reach can't cover
+    // both RAM (0x04000000+) and the ROM aperture from a single pool.
+    // Pool B is only used pre-MMU in practice (test_shadow_stub), since
+    // post-MMU the guest kernel doesn't map VA 0x03xxxxxx; when the
+    // real Newton boot eventually reaches `UseROMJumpTables` we'll need
+    // to revisit pool-B placement.
     let stub_pa_b = shadow_stub::pool_b_host_pa();
-    // SAFETY: helpers bounds-check.
+    // SAFETY: helper bounds-checks.
     unsafe {
-        set_l2_blocks(
-            shadow_stub::STUB_POOL_IPA as u64,
-            stub_pa_a,
-            (shadow_stub::STUB_POOL_SIZE as u64) / TWO_MIB,
-            BLOCK_NORMAL_RW,
-        );
         set_l2_blocks(
             shadow_stub::STUB_POOL_B_IPA as u64,
             stub_pa_b,
@@ -337,10 +339,9 @@ pub unsafe fn init() {
         FB_IPA_SIZE / (1024 * 1024)
     );
     kprintln!(
-        "stage2: shadow-stub pool A @ IPA {:#x}..{:#x} -> host PA {:#x} (RW, {} MiB)",
+        "stage2: shadow-stub pool A @ IPA {:#x}..{:#x} (inside ROM aperture, RO)",
         shadow_stub::STUB_POOL_IPA,
         shadow_stub::STUB_POOL_IPA as u64 + shadow_stub::STUB_POOL_SIZE as u64,
-        stub_pa_a, shadow_stub::STUB_POOL_SIZE / (1024 * 1024)
     );
     kprintln!(
         "stage2: shadow-stub pool B @ IPA {:#x}..{:#x} -> host PA {:#x} (RW, {} MiB)",

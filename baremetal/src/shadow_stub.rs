@@ -62,28 +62,48 @@ include!(concat!(env!("OUT_DIR"), "/rom_rex_hash.rs"));
 static BYTE_ACCESS_STATIC_BITMAP: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/byte-access-static.bitmap"));
 
-/// Two stub pools cover the full guest-code address range:
-///   Pool A at 0x01800000..0x02000000 reaches ROM  [0x00000000..0x01000000]
-///                                + flash bank 0 [0x02000000..0x02400000].
-///   Pool B at 0x03000000..0x03800000 reaches RAM  [0x04000000..0x04400000]
-///                                + the RAM mirror [0x0C000000..0x0C400000].
-/// Each pool is 8 MiB (four stage-2 2 MiB block descriptors) so pool A
-/// can hold a stub for every instruction in the ~78 k-site ROM+REX
-/// classify bitmap with headroom. Pool B is sized the same for
-/// consistency; its current ceiling is the RAM-resident text copied by
-/// `UseROMJumpTables` plus some scratch pad, well inside 131 k slots.
-/// Both pools share one backing buffer — pool B lives at offset
-/// `STUB_POOL_SIZE` within it.
+/// The stub pool lives inside the guest ROM aperture at IPA
+/// 0x00E00000..0x00F80000 — 1.5 MiB in the gap between the function-
+/// tracer trampoline pool (ends at 0x00E00000) and the UND/ROM-patch
+/// stub region at 0x00FFFF00. This placement is the key correctness
+/// fix for post-MMU stub dispatch: the guest kernel's stage-1 L1
+/// descriptors for VA 0x00000000..0x01000000 map the entire ROM
+/// aperture as identity-mapped sections once the MMU is enabled, so
+/// stubs in this range are reachable from every patched site, pre-
+/// MMU (via stage-1-off identity) AND post-MMU (via the kernel's own
+/// ROM sections). Previous pools at 0x01800000 / 0x03000000 were
+/// stage-2-mapped by us but lay outside the kernel's stage-1 map —
+/// fetches into them PABT'd once the MMU was on (see INVESTIGATION.md
+/// "Currently at" section).
 ///
-/// Pool A spans IPA 0x01800000..0x02000000, ending right before flash
-/// bank 0 at 0x02000000 — no stage-2 collision. Pool B spans
-/// 0x03000000..0x03800000, inside the 0x02400000..0x04000000 gap that
-/// stage-2 otherwise leaves unmapped.
-pub const STUB_POOL_IPA: u32 = 0x0180_0000;
+/// No separate pool B. A single pool reaches any patched site (ROM in
+/// 0..0x01000000, flash in 0x02000000..0x02400000, RAM in
+/// 0x04000000..0x04400000, RAM mirror at 0x0C000000..0x0C400000) within
+/// the ARM AArch32 `B` instruction's ±32 MiB range.
+///
+/// Stubs are written directly into the GUEST_ROM backing buffer (same
+/// storage the Newton ROM bytes occupy); stage-2 read-only mapping of
+/// the ROM aperture serves them without any extra mapping.
+pub const STUB_POOL_IPA: u32 = 0x00E0_0000;
+
+/// Second pool for RAM-resident code that the kernel lazy-patches once
+/// a RAM block becomes executable. The `B` instruction reaches ±32 MiB,
+/// so a stub for a patch site in RAM (IPAs 0x04000000..0x04400000) can't
+/// be in the ROM-aperture pool (~53 MiB away). This pool sits just
+/// before RAM at IPA 0x03000000..0x03180000; stage-2 still maps it
+/// separately because the guest kernel's stage-1 never covers 0x030xxxxx
+/// post-MMU. Currently only used by `test_shadow_stub`'s pre-MMU path;
+/// the real Newton boot hasn't yet reached `UseROMJumpTables` which
+/// would be the first post-MMU lazy-RAM consumer.
 pub const STUB_POOL_B_IPA: u32 = 0x0300_0000;
 
-/// Stub-pool size. 8 MiB = four stage-2 2 MiB block descriptors.
-pub const STUB_POOL_SIZE: usize = 8 * 1024 * 1024;
+/// Pool size. 2 MiB = one stage-2 L2 block, the minimum granularity
+/// of `set_l2_blocks`. At 48-byte slots that's 43,690 stubs, well over
+/// the ~27,700 current static-bitmap census. Pool A spans IPA
+/// 0x00E00000..0x01000000 inside the ROM aperture — i.e., the last
+/// 2 MiB of ROM, past the UND/ROM-patch stubs at 0x00FFFF00 (which
+/// shadow_stub won't scan, since those bytes aren't Newton ROM).
+pub const STUB_POOL_SIZE: usize = 0x0020_0000;
 
 /// Addresses < XOR_LIMIT are treated as real memory (XOR applied);
 /// addresses >= XOR_LIMIT are treated as MMIO and passed through.
@@ -108,35 +128,34 @@ pub const STUB_POOL_SIZE: usize = 8 * 1024 * 1024;
 /// tripwire we want. Keep XOR_LIMIT at 0x1000_0000.
 pub const XOR_LIMIT: u32 = 0x1000_0000;
 
-/// Fixed bytes per stub slot. 16 words x 4 = 64 bytes. Worst case
-/// instruction count (13 insns including save/restore and branch-back)
-/// plus return_pc literal and save_slot fits in 16 words.
-pub const STUB_SLOT_SIZE: usize = 64;
+/// Fixed bytes per stub slot. 10 words x 4 = 40 bytes.
+///
+/// Worst-case stub body after the ROM-resident refactor (see
+/// `build_stub`): MCR save (1) + EA compute (up to 2 for imm/reg-shift) +
+/// CMP + BHS + EOR (3) + access (1) + writeback (1) + MRC restore (1) +
+/// B back (1) = 10 words. No save-slot / return-pc literal needed — the
+/// save register is TPIDR_EL0 (a per-CPU register SA-1100 didn't have,
+/// unused by the Newton kernel) and the return is a direct `B` with the
+/// offset baked in at stub-generation time.
+pub const STUB_SLOT_SIZE: usize = 48;
 
 /// Words per stub slot.
 pub const STUB_SLOT_WORDS: usize = STUB_SLOT_SIZE / 4;
 
-/// Byte offset within a slot of the `return_pc` literal (second-to-last word).
-pub const STUB_RETURN_PC_OFF: usize = STUB_SLOT_SIZE - 8;
-
-/// Byte offset within a slot of the scratch save slot (last word).
-pub const STUB_SAVE_SLOT_OFF: usize = STUB_SLOT_SIZE - 4;
-
 /// Per-pool capacity — number of stubs that fit.
 pub const STUB_POOL_CAPACITY: usize = STUB_POOL_SIZE / STUB_SLOT_SIZE;
 
-/// Total capacity across both pools. Slot indices are packed with pool
-/// A in [0..STUB_POOL_CAPACITY), pool B in [STUB_POOL_CAPACITY..TOTAL).
+/// Total capacity across both pools. Packed indices: pool A in
+/// [0..CAPACITY), pool B in [CAPACITY..2*CAPACITY).
 pub const STUB_POOL_TOTAL_CAPACITY: usize = STUB_POOL_CAPACITY * 2;
 
+/// Backing store for pool B (RAM-reach). Pool A writes into `GUEST_ROM`
+/// directly, so it has no separate backing here.
 #[repr(C, align(0x200000))]
-struct StubPool([u8; STUB_POOL_SIZE * 2]);
+struct StubPoolB([u8; STUB_POOL_SIZE]);
+static mut STUB_POOL_B: StubPoolB = StubPoolB([0; STUB_POOL_SIZE]);
 
-static mut STUB_POOL: StubPool = StubPool([0; STUB_POOL_SIZE * 2]);
-
-/// How many slots have been handed out in pool A (ROM reach).
 static NEXT_SLOT_A: AtomicUsize = AtomicUsize::new(0);
-/// How many slots have been handed out in pool B (RAM reach).
 static NEXT_SLOT_B: AtomicUsize = AtomicUsize::new(0);
 
 /// Map from stub-slot index to the original guest PC that the stub was
@@ -150,30 +169,28 @@ static NEXT_SLOT_B: AtomicUsize = AtomicUsize::new(0);
 static mut SLOT_ORIGINAL_PC: [u32; STUB_POOL_TOTAL_CAPACITY] =
     [u32::MAX; STUB_POOL_TOTAL_CAPACITY];
 
-/// Host physical base of the stub pool A backing store.
+/// Host PA of pool A. Stubs live inside the GUEST_ROM backing buffer
+/// at offset `STUB_POOL_IPA` (= 0x00E00000).
 pub fn pool_host_pa() -> u64 {
-    addr_of_mut!(STUB_POOL) as u64
+    crate::guest_mem::rom_host_pa() + STUB_POOL_IPA as u64
 }
 
-/// Host physical base of the stub pool B backing store (offset by
-/// one pool's worth from the base of the combined buffer).
+/// Host PA of pool B (RAM-reach, backed by `STUB_POOL_B`).
 pub fn pool_b_host_pa() -> u64 {
-    addr_of_mut!(STUB_POOL) as u64 + STUB_POOL_SIZE as u64
+    addr_of_mut!(STUB_POOL_B) as u64
 }
 
-/// Is `ipa` inside the shadow-stub pool A range?
 fn is_pool_a_ipa(ipa: u32) -> bool {
     ipa >= STUB_POOL_IPA
         && (ipa as usize) < (STUB_POOL_IPA as usize) + STUB_POOL_SIZE
 }
 
-/// Is `ipa` inside the shadow-stub pool B range?
 fn is_pool_b_ipa(ipa: u32) -> bool {
     ipa >= STUB_POOL_B_IPA
         && (ipa as usize) < (STUB_POOL_B_IPA as usize) + STUB_POOL_SIZE
 }
 
-/// Is `ipa` inside either stub pool?
+/// Is `ipa` inside either shadow-stub pool?
 pub fn is_stub_ipa(ipa: u32) -> bool {
     is_pool_a_ipa(ipa) || is_pool_b_ipa(ipa)
 }
@@ -181,7 +198,7 @@ pub fn is_stub_ipa(ipa: u32) -> bool {
 /// Given an IPA inside either stub pool, return
 /// `(packed_slot_index, byte_offset_in_slot)`. Pool-A slots are packed
 /// at [0..STUB_POOL_CAPACITY), pool-B slots at
-/// [STUB_POOL_CAPACITY..STUB_POOL_TOTAL_CAPACITY).
+/// [STUB_POOL_CAPACITY..2*STUB_POOL_CAPACITY).
 pub fn ipa_to_slot_offset(ipa: u32) -> Option<(usize, usize)> {
     if is_pool_a_ipa(ipa) {
         let rel = (ipa - STUB_POOL_IPA) as usize;
@@ -486,34 +503,25 @@ fn enc_cmp_imm_modified(rn: u32, imm8: u32, rot4: u32) -> u32 {
     0xE350_0000 | (rn << 16) | (rot4 << 8) | imm8
 }
 
-/// `STR Rt, [Rn, #+-imm12]` (pre-indexed, no writeback).
-/// Used to save scratch to the per-stub save slot with Rn = PC.
-fn enc_str_pc_rel(rt: u32, disp: i32) -> u32 {
-    assert!(disp.unsigned_abs() <= 0xFFF);
-    let u = if disp >= 0 { 1u32 } else { 0 };
-    // cond=AL 010 P=1 U B=0 W=0 L=0 Rn=PC(15) Rt imm12
-    0xE500_0000
-        | (u << 23)
-        | (15u32 << 16)
-        | (rt << 12)
-        | disp.unsigned_abs()
+/// `MCR p15, 0, Rt, c13, c0, 2` — write TPIDR_EL0 (TPIDRURW).
+/// Used as the stub's scratch-preservation channel. TPIDR_EL0 is
+/// ARMv6+ architectural state; the SA-1100 (ARMv4) has no equivalent
+/// register, so the Newton ROM never touches it. Our HCR_EL2 doesn't
+/// trap c13, so this executes natively at any EL1 mode.
+fn enc_mcr_tpidr_el0(rt: u32) -> u32 {
+    // cond 1110 op1=000 L=0 CRn=13 Rt cp=15 op2=2 1 CRm=0
+    0xEE0D_0F50 | (rt << 12)
 }
 
-/// `LDR Rt, [pc, #+-imm12]`.
-fn enc_ldr_pc_rel(rt: u32, disp: i32) -> u32 {
-    assert!(disp.unsigned_abs() <= 0xFFF);
-    let u = if disp >= 0 { 1u32 } else { 0 };
-    // cond=AL 010 P=1 U B=0 W=0 L=1 Rn=PC(15) Rt imm12
-    0xE510_0000
-        | (u << 23)
-        | (15u32 << 16)
-        | (rt << 12)
-        | disp.unsigned_abs()
+/// `MRC p15, 0, Rt, c13, c0, 2` — read TPIDR_EL0.
+fn enc_mrc_tpidr_el0(rt: u32) -> u32 {
+    0xEE1D_0F50 | (rt << 12)
 }
 
-/// `LDR pc, [pc, #-4]` — branch via a literal immediately before this instruction.
-fn enc_ldr_pc_pc_lit(disp: i32) -> u32 {
-    enc_ldr_pc_rel(15, disp)
+/// Unconditional `B #imm24` from `from_pc` to `target`. Used as the
+/// stub's return-to-caller instruction.
+fn enc_b_uncond(from_pc: u32, target: u32) -> u32 {
+    enc_bcond(0xE, from_pc, target)
 }
 
 /// `Bcc #imm24` from `from_pc` to `target`.
@@ -642,19 +650,23 @@ pub fn slot_xor_mask(slot: usize) -> Option<u32> {
 /// the inner access instruction. Words from n to STUB_SLOT_WORDS-3 get
 /// filled with UDF by the caller. The last two words are the return_pc
 /// literal and the scratch save slot.
-fn build_stub(d: &Decoded, _stub_pc: u32, _return_pc: u32,
+fn build_stub(d: &Decoded, stub_pc: u32, return_pc: u32,
               out: &mut [u32; STUB_SLOT_WORDS]) -> Result<BuiltStub, &'static str>
 {
     let scratch = pick_scratch(d);
     let ea = scratch;
     let mut idx = 0usize;
 
-    // 1. Save scratch to the per-stub save slot via PC-relative STR.
-    //    At the instruction position idx*4, PC=(idx*4 + 8). Save slot
-    //    at byte offset STUB_SAVE_SLOT_OFF. Displacement from PC:
-    //      STUB_SAVE_SLOT_OFF - (idx*4 + 8).
-    let disp = (STUB_SAVE_SLOT_OFF as i32) - (idx as i32 * 4 + 8);
-    out[idx] = enc_str_pc_rel(scratch, disp);
+    // 1. Save scratch to TPIDR_EL0 (per-CPU, not memory — stubs live in
+    //    RO ROM so PC-relative STR to a save-slot isn't an option).
+    //    Nested-exception caveat: if a higher-priority exception fires
+    //    between the save and the matching restore, and its handler
+    //    itself invokes a shadow-stub in the same CPU, TPIDR_EL0 gets
+    //    clobbered. In practice the kernel runs with I/F masked inside
+    //    byte-access-rich code paths, so this races only with FIQ +
+    //    abort vectors. Accept for now; document in shadow_stub header.
+    if idx >= STUB_SLOT_WORDS { return Err("stub slot overflow"); }
+    out[idx] = enc_mcr_tpidr_el0(scratch);
     idx += 1;
 
     // 2. Compute the effective address into `ea`.
@@ -665,6 +677,7 @@ fn build_stub(d: &Decoded, _stub_pc: u32, _return_pc: u32,
     if computes_ea_from_rn {
         match d.offset {
             OffsetForm::None => {
+                if idx >= STUB_SLOT_WORDS { return Err("stub slot overflow"); }
                 out[idx] = enc_mov_reg(ea, d.rn); idx += 1;
             }
             OffsetForm::Imm { imm } => {
@@ -732,16 +745,17 @@ fn build_stub(d: &Decoded, _stub_pc: u32, _return_pc: u32,
         }
     }
 
-    // 7. Restore scratch via PC-relative LDR.
-    let disp_r = (STUB_SAVE_SLOT_OFF as i32) - (idx as i32 * 4 + 8);
+    // 7. Restore scratch from TPIDR_EL0.
     if idx >= STUB_SLOT_WORDS { return Err("stub slot overflow"); }
-    out[idx] = enc_ldr_pc_rel(scratch, disp_r);
+    out[idx] = enc_mrc_tpidr_el0(scratch);
     idx += 1;
 
-    // 8. Branch back: `LDR pc, [pc, #disp]` targeting the return_pc literal.
-    let disp_b = (STUB_RETURN_PC_OFF as i32) - (idx as i32 * 4 + 8);
+    // 8. Branch back to return_pc. Direct unconditional B — reach is
+    //    ±32 MiB, which covers any patched site from a stub in the ROM
+    //    aperture.
     if idx >= STUB_SLOT_WORDS { return Err("stub slot overflow"); }
-    out[idx] = enc_ldr_pc_pc_lit(disp_b);
+    let from_pc = stub_pc + (idx as u32) * 4;
+    out[idx] = enc_b_uncond(from_pc, return_pc);
     idx += 1;
 
     Ok(BuiltStub { words: idx, access_off })
@@ -758,14 +772,11 @@ fn pool_write_word(pool_b: bool, off: usize, word: u32) {
     unsafe { core::ptr::write_volatile(host as *mut u32, word); }
 }
 
-/// Pick the right stub pool for a given source IPA. ROM + flash
-/// bank 0 use pool A; RAM + mirror use pool B. Anything else halts.
+/// Pool A (inside ROM aperture, reachable pre+post-MMU via the guest
+/// kernel's ROM sections) serves ROM + flash-bank-0 patch sites.
+/// Pool B (at IPA 0x03000000, pre-RAM) serves lazy-RAM-resident code.
+/// B's ±32 MiB reach constraint dictates this split.
 fn select_pool(source_ipa: u32) -> bool {
-    // Pool A reaches 0x00000000..about 0x03800000.
-    // Pool B reaches about 0x01000000..0x05000000.
-    // ROM < 0x01000000, flash0 0x02000000..0x02400000 -> pool A.
-    // RAM 0x04000000..0x04400000 -> pool B.
-    // Mirror 0x0C000000..0x0C400000 is FAR from both — won't work.
     if (source_ipa as usize) < crate::guest_mem::ROM_SIZE {
         return false; // pool A
     }
@@ -774,12 +785,9 @@ fn select_pool(source_ipa: u32) -> bool {
     if source_ipa >= ram_base && source_ipa < ram_end {
         return true; // pool B
     }
-    // Flash bank 0.
     if source_ipa >= 0x0200_0000 && source_ipa < 0x0240_0000 {
-        return false; // pool A
+        return false; // flash bank 0 — still in ROM-aperture reach
     }
-    // Unsupported source — caller has already validated this is a
-    // code region, so halt.
     kprintln!(
         "shadow_stub: select_pool — unsupported source IPA {:#x}",
         source_ipa
@@ -914,12 +922,10 @@ fn patch_one_site(pc: u32, use_pool_b: bool, stats: &mut PatchStats) {
         }
     };
 
-    words[STUB_RETURN_PC_OFF / 4] = pc.wrapping_add(4);
-    words[STUB_SAVE_SLOT_OFF / 4] = 0;
-    // Fill any gap between the emitted code and the return_pc literal
-    // with UDF #0xDEAD so stray execution past the branch-back faults
-    // loudly.
-    for i in built.words..(STUB_RETURN_PC_OFF / 4) {
+    // Fill any unused tail words with UDF #0xDEAD so stray execution
+    // past the terminal B faults loudly rather than silently executing
+    // adjacent stubs.
+    for i in built.words..STUB_SLOT_WORDS {
         words[i] = 0xE7F0_00F0;
     }
 

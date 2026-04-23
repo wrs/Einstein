@@ -105,15 +105,17 @@ fn fn_name(i: usize) -> &'static str {
 ///   - VA 0x00..0x20: ARM vector table. The reset vector at 0x00 runs
 ///     before we've built trampolines, and vectors at 0x04/0x0C/0x10 are
 ///     claimed by the hypervisor's UND / DIAG patches.
-///   - VA 0x00FF_FF00..0x00FF_FFB0: UND trampoline (0xFF00..0xFF80) +
-///     SBA post-emulation trampoline (0xFF80..0xFFB0) + ROM-patch
-///     injection stubs. See guest_mem::patch_und_vector and
-///     rom_patches::*.
+///   - VA 0x00FF_FF00..0x00FF_FFF0: UND trampoline (0xFF00..0xFF80) +
+///     SBA post-emulation trampoline (0xFF80..0xFFA8) + DABT
+///     diagnostic trampoline (0xFFA8..0xFFE4, ends at the literal word
+///     at `db+14`) + UND return stub (0xFFE4..0xFFF0). See
+///     guest_mem::patch_und_vector, rom_patches::*, and the layout
+///     notes at UND_RETURN_STUB_OFFSET.
 ///   - PowerOffAndReboot: rom_patches installs a one-word HVC canary
 ///     there; the tracer overwriting it would silently mask the trap.
 pub fn in_reserved_range(addr: u32) -> bool {
     if addr < 0x0000_0020 { return true; }
-    if (0x00FF_FF00..0x00FF_FFB0).contains(&addr) { return true; }
+    if (0x00FF_FF00..0x00FF_FFF0).contains(&addr) { return true; }
     if addr == crate::rom_patches::POWEROFF_REBOOT_PC { return true; }
     if addr == crate::rom_patches::REBOOT_PC { return true; }
     if addr == crate::rom_patches::BOOTOS_PC { return true; }

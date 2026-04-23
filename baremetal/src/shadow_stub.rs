@@ -329,15 +329,42 @@ fn code_read_word(ipa: u32) -> Option<u32> {
     crate::guest_mem::read_word_pa(ipa)
 }
 
-/// DC CVAC + IC IVAU + DSB/ISB on a host VA range.
+/// Publish a freshly-written code range to the instruction stream.
+///
+/// Two passes — first `DC CVAU` every line to push D-cache dirty lines
+/// to the Point of Unification, DSB ISH, then `IC IVAU` every line and
+/// DSB+ISB. The DSB between the two passes is load-bearing: without it
+/// IC IVAU can complete ahead of DC CVAU on cores that model I/D cache
+/// non-coherence strictly (FVP Base RevC does; QEMU raspi3b TCG doesn't
+/// model it), so the invalidated I-cache line refills from L2 before
+/// the D-side writeback has reached it, and the guest fetches stale
+/// bytes. Symptom: on FVP, patched ROM sites (tracer trampoline entries,
+/// VA-0xC PABT canary, etc.) appear to the guest as their pre-patch
+/// values, so post-MMU fetches take PABTs that loop in the PABT vector.
 pub fn icache_sync_range(host_va: u64, length: usize) {
-    let mut addr = host_va & !0x3F;
+    let start = host_va & !0x3F;
     let end = host_va + length as u64;
+    let mut addr = start;
     while addr < end {
         // SAFETY: cache-maintenance only touches caches.
         unsafe {
             core::arch::asm!(
                 "dc cvau, {0}",
+                in(reg) addr,
+                options(nostack, preserves_flags),
+            );
+        }
+        addr += 64;
+    }
+    // SAFETY: barrier.
+    unsafe {
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    }
+    addr = start;
+    while addr < end {
+        // SAFETY: cache-maintenance only touches caches.
+        unsafe {
+            core::arch::asm!(
                 "ic ivau, {0}",
                 in(reg) addr,
                 options(nostack, preserves_flags),

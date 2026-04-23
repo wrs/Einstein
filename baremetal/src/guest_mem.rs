@@ -1003,10 +1003,21 @@ pub const DABT_SAVE_PA: u32 = 0x0400_5FA0;
 
 /// `movs pc, lr` stub in the ROM trampoline region. See the installation
 /// site in `patch_und_vector` and `return_to_guest_from_und` in trap.rs
-/// for rationale. Lives past the DABT trampoline which ends at
-/// 0x00FF_FFE0. Three words (stub code + literal) fit in the 32-byte
-/// window from 0x00FF_FFE0..0x0100_0000.
-pub const UND_RETURN_STUB_OFFSET: usize = 0x00FF_FFE0;
+/// for rationale. Must not overlap the DABT trampoline, which spans
+/// `DABT_TRAMP_OFFSET .. DABT_TRAMP_OFFSET + 15*4`  (= 0x00FF_FFA8 ..
+/// 0x00FF_FFE4 inclusive of the literal word at `db+14`). Placing the
+/// stub at the first aligned word past that literal keeps both
+/// trampolines non-overlapping; the stub is 3 words (12 bytes) so it
+/// ends at 0x00FF_FFF0, still inside ROM.
+///
+/// Prior layout placed the stub at 0x00FF_FFE0, which coincided
+/// byte-for-byte with the DABT-trampoline's literal slot. On QEMU
+/// raspi3b the clobbered first word (0x0400_5FA0 / 0x0C00_4FA0, written
+/// by `install_und_vector_swap_*`) happened to decode as an
+/// EQ-conditional LDC that the TCG model treated as a NOP. On FVP Base
+/// RevC the same encoding raises an UNDEFINED exception, so the UND
+/// return path halted with an "unrecognised UND" in early boot.
+pub const UND_RETURN_STUB_OFFSET: usize = 0x00FF_FFE4;
 pub const UND_RETURN_STUB_VA: u32 = UND_RETURN_STUB_OFFSET as u32;
 /// Offset of the target-PC literal inside the stub (written by Rust
 /// handler before ERET).

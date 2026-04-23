@@ -2028,6 +2028,25 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
                 // hit) falls through as VA=IPA and stage-2-faults.
                 crate::guest::set_dc_for_stage1_off(false);
                 guest_mem::fix_stage1_xn_bits();
+                // Flush ROM + RAM backing to the Point-of-Coherency so
+                // the guest's stage-1 walker — which (with TTBCR=0 /
+                // default-walker attributes) may read page tables as
+                // Non-cacheable — sees the modifications from
+                // fix_stage1_xn_bits and from earlier ROM patches.
+                // FVP Base RevC models I/D cache + mismatched-attribute
+                // semantics strictly; without this clean, the walker
+                // picks up the original ROM bytes of the L2 tables and
+                // takes PABTs on supposedly-mapped VAs. QEMU raspi3b
+                // TCG doesn't exhibit the problem because its cache
+                // model is a stub.
+                crate::shadow_stub::icache_sync_range(
+                    crate::guest_mem::rom_host_pa(),
+                    crate::guest_mem::ROM_SIZE,
+                );
+                crate::shadow_stub::icache_sync_range(
+                    crate::guest_mem::ram_host_pa(),
+                    crate::guest_mem::RAM_SIZE,
+                );
                 maybe_dump_l1_once();
                 // Swap the UND trampoline's save-slot literal to the
                 // kernel VA that L1[0xC0] maps to the RAM slot. Done

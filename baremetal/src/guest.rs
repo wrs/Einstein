@@ -41,6 +41,22 @@ unsafe fn configure_el2_traps() {
         hcr |= 1u64 << 20;    // TIDCP: trap implementation-defined CP15
         hcr |= 1u64 << 26;    // TVM:   trap guest writes to virtual-memory CP15 regs
         hcr |= 1u64 << 22;    // TSW:   trap set/way cache maintenance
+        hcr |= 1u64 << 23;    // TPC:   trap EL1 DC maintenance by VA to PoC
+                              //        (DC CVAC / CIVAC / IVAC). The Newton
+                              //        kernel's AddPgPAndPermWithPageTable
+                              //        calls CleanPageInDcache on a VA before
+                              //        populating that VA's L2 entry, relying
+                              //        on SA-1100 semantics where DC-by-MVA
+                              //        on an unmapped VA is a no-op. ARMv8-A
+                              //        (FVP Base RevC) raises a translation
+                              //        fault instead; trapping to EL2 lets
+                              //        our CP15 c7 handler NOP it, matching
+                              //        SA-1100 and QEMU TCG behaviour.
+        hcr |= 1u64 << 24;    // TPU:   trap EL1 DC/IC maintenance by VA to PoU
+                              //        (DC CVAU / IC IVAU). Same rationale
+                              //        as TPC; CleanPageInDcache also issues
+                              //        these on unmapped VAs. Emulated as a
+                              //        no-op by the c7/c8 CP15 handler.
         hcr |= 1u64 << 12;    // DC:    force Normal-WB cacheable while
                               //        guest stage-1 MMU is off. Without
                               //        this the guest's reset-time

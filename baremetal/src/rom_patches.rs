@@ -106,6 +106,23 @@ pub const POWEROFF_REBOOT_HVC_IMM: u32 = 0x42;
 pub const REBOOT_PC: u32 = 0x000D_9884;
 pub const REBOOT_HVC_IMM: u32 = 0x43;
 
+/// Phase-B canary: `BootOS` / `ROMBoot` at 0x0001_8688. The AArch32
+/// reset vector at VA 0 is `B 0x18688`, so the first execution after
+/// the hypervisor's ERET-to-guest lands here. Any subsequent entry is
+/// a SOFTWARE RESET — regardless of whether the kernel took the
+/// `Reboot` / `PowerOffAndReboot` path (already canaried) or jumped
+/// directly to the reset vector via some other mechanism (watchdog,
+/// MOV PC,#0, etc.). Canary: patch the first word to `HVC #0x44`; the
+/// handler allows the first entry through by emulating the original
+/// first insn (`mov r0, #0xb0`) and then halts on every subsequent
+/// entry.
+pub const BOOTOS_PC: u32 = 0x0001_8688;
+pub const BOOTOS_HVC_IMM: u32 = 0x44;
+/// The original first instruction of `BootOS`: `mov r0, #0xb0`
+/// (0xE3A000B0). The HVC handler emulates this on the legitimate
+/// first boot by setting r0 = 0xb0 and advancing ELR past the HVC.
+pub const BOOTOS_ORIG_INSN: u32 = 0xE3A0_00B0;
+
 /// AArch32 `HVC #imm16` encoding at unconditional (cond=AL).
 const fn hvc_insn(imm: u32) -> u32 {
     0xE140_0070 | ((imm & 0xFFF0) << 4) | (imm & 0xF)
@@ -178,9 +195,10 @@ pub unsafe fn apply_717006_patches(rom_ptr: *mut u32) {
         apply_fdate_from_seconds_patch(rom_ptr);
         apply_poweroff_reboot_trap(rom_ptr);
         apply_reboot_trap(rom_ptr);
+        apply_bootos_trap(rom_ptr);
     }
 
-    kprintln!("rom_patch: applied {} simple patches + 5 native-call/injection ROM patches + PowerOffAndReboot + Reboot canaries", applied);
+    kprintln!("rom_patch: applied {} simple patches + 5 native-call/injection ROM patches + PowerOffAndReboot + Reboot + BootOS canaries", applied);
 }
 
 /// (Previously we patched every `T28F016_SA_SVDriver` method to emit
@@ -357,6 +375,33 @@ unsafe fn apply_reboot_trap(rom_ptr: *mut u32) {
             REBOOT_PC, prev, insn, REBOOT_HVC_IMM,
         );
     }
+}
+
+/// Software-reset canary at `BootOS` (0x0001_8688). Overwrite the
+/// first word with `HVC #BOOTOS_HVC_IMM`; the handler distinguishes
+/// the legitimate first boot from a reset by counting entries. Panics
+/// at install time if the current first word isn't the expected
+/// `mov r0, #0xb0` (0xE3A000B0) — a ROM change would silently break
+/// the emulation path, so we want a loud notification at install.
+unsafe fn apply_bootos_trap(rom_ptr: *mut u32) {
+    let idx = (BOOTOS_PC / 4) as usize;
+    // SAFETY: bounded; patch runs on the main ROM half.
+    let prev = unsafe { rom_ptr.add(idx).read() };
+    if prev != BOOTOS_ORIG_INSN {
+        kprintln!(
+            "rom_patch: ERROR — BootOS first word is {:#010x}, expected {:#010x}; skipping canary",
+            prev, BOOTOS_ORIG_INSN,
+        );
+        return;
+    }
+    let insn = hvc_insn(BOOTOS_HVC_IMM);
+    unsafe {
+        rom_ptr.add(idx).write(insn);
+    }
+    kprintln!(
+        "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (BootOS canary, HVC #{:#x})",
+        BOOTOS_PC, prev, insn, BOOTOS_HVC_IMM,
+    );
 }
 
 /// Shared helper for the two injection patches: write a 5-word stub at

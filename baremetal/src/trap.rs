@@ -553,6 +553,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::REBOOT_HVC_IMM => {
             handle_reboot(ctx);
         }
+        v if v == crate::rom_patches::BOOTOS_HVC_IMM => {
+            handle_bootos_canary(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -988,6 +991,75 @@ fn handle_poweroff_reboot(ctx: &TrapContext) -> ! {
 /// `const fn` and not exported.
 const fn rom_patches_hvc_insn(imm: u32) -> u32 {
     0xE140_0070 | ((imm & 0xFFF0) << 4) | (imm & 0xF)
+}
+
+/// Canary handler for `BootOS` / `ROMBoot` (0x0001_8688). The AArch32
+/// reset vector at VA 0 branches here, so the first entry after the
+/// hypervisor ERETs the guest is legitimate — we emulate the original
+/// first instruction (`mov r0, #0xb0`) and advance ELR so the kernel
+/// continues. Every SUBSEQUENT entry is a software reset (watchdog,
+/// `Reboot`, `PowerOffAndReboot`, or a direct jump to the reset
+/// vector); we dump state and halt. Complements the already-canaried
+/// `Reboot` / `PowerOffAndReboot` entry points by catching reset
+/// paths that bypass them.
+fn handle_bootos_canary(ctx: &mut TrapContext) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static ENTRIES: AtomicU32 = AtomicU32::new(0);
+    let n = ENTRIES.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 {
+        // First boot. Emulate `mov r0, #0xb0` (the word we overwrote
+        // with the HVC) and ERET to BootOS + 4 so the kernel runs
+        // through its normal boot sequence.
+        ctx.x[0] = 0xb0;
+        let next_pc = (crate::rom_patches::BOOTOS_PC + 4) as u64;
+        // SAFETY: ELR_EL2 controls the post-ERET guest PC.
+        unsafe {
+            core::arch::asm!(
+                "msr elr_el2, {}",
+                in(reg) next_pc,
+                options(nostack, preserves_flags),
+            );
+        }
+        kprintln!("BootOS canary: first boot — emulated mov r0,#0xb0 and passing through");
+        return;
+    }
+
+    // Second+ entry — software reset.
+    let spsr_el2 = read_sysreg!("spsr_el2");
+    let elr_el2 = read_sysreg!("elr_el2");
+    let mode = (spsr_el2 & 0x1F) as u32;
+    kprintln!();
+    kprintln!("*** BootOS canary fired on entry #{} — software reset detected ***", n);
+    kprintln!(
+        "  ELR_EL2  = {:#010x}  (= BootOS entry PC)",
+        elr_el2
+    );
+    kprintln!(
+        "  SPSR_EL2 = {:#010x}  mode={} ({:#x})",
+        spsr_el2, describe_aarch32_mode(mode), mode
+    );
+    kprintln!(
+        "  R0 = {:#010x}  R1 = {:#010x}  R2 = {:#010x}  R3 = {:#010x}",
+        ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
+    );
+    kprintln!(
+        "  R12={:#010x}  R14(mode)={:#010x}  (caller LR; mode-banked, may be stale)",
+        ctx.x[12] as u32, ctx.x[14] as u32
+    );
+    kprintln!();
+    kprintln!(
+        "  Preceding tracer entries show what the kernel was doing before"
+    );
+    kprintln!(
+        "  the reset. Common triggers: watchdog timeout, Reboot() / "
+    );
+    kprintln!(
+        "  PowerOffAndReboot (separately canaried), or a direct jump to"
+    );
+    kprintln!(
+        "  the reset vector at VA 0."
+    );
+    cpu::halt();
 }
 
 fn handle_reboot(ctx: &TrapContext) -> ! {

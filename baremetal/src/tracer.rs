@@ -116,6 +116,7 @@ pub fn in_reserved_range(addr: u32) -> bool {
     if (0x00FF_FF00..0x00FF_FFB0).contains(&addr) { return true; }
     if addr == crate::rom_patches::POWEROFF_REBOOT_PC { return true; }
     if addr == crate::rom_patches::REBOOT_PC { return true; }
+    if addr == crate::rom_patches::BOOTOS_PC { return true; }
     false
 }
 

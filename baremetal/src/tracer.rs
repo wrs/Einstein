@@ -300,36 +300,47 @@ pub fn handle_trace_hvc(ctx: &TrapContext) {
     let elr = read_elr_el2() as u32;
     // HVC sets ELR_EL2 to (hvc_pc + 4) = slot[1]. Slot base is elr - 4.
     let slot_base = elr.wrapping_sub(4);
+    let spsr = unsafe {
+        let v: u64;
+        core::arch::asm!("mrs {}, spsr_el2", out(reg) v,
+            options(nomem, nostack, preserves_flags));
+        v as u32
+    };
+    log_trace_at(ctx, slot_base, spsr);
+}
+
+/// Log a trace entry for a trampoline hit at `slot_base`, given the
+/// pre-HVC CPSR in `spsr`. Shared between the normal HVC path (where
+/// slot_base = ELR_EL2 - 4) and the USR-mode UND fallback in
+/// `trap::handle_und`: HVC in USR mode is UNDEFINED, so the tracer's
+/// slot[0] `hvc #TRACE_TAG` raises an UND instead of entering EL2
+/// directly. Callers in either path need the same log line; the caller
+/// is responsible for advancing the PC past slot[0] afterwards.
+pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
     if slot_base < TRAMPOLINE_IPA || slot_base >= TRAMPOLINE_END {
         kprintln!(
-            "trace: HVC #TRACE_TAG from ELR={:#x} outside trampoline pool ({:#x}..{:#x})",
-            elr, TRAMPOLINE_IPA, TRAMPOLINE_END
+            "trace: slot_base={:#x} outside trampoline pool ({:#x}..{:#x})",
+            slot_base, TRAMPOLINE_IPA, TRAMPOLINE_END
         );
         return;
     }
     let slot_offset = slot_base - TRAMPOLINE_IPA;
     if slot_offset % SLOT_SIZE != 0 {
         kprintln!(
-            "trace: HVC at ELR={:#x} not aligned to slot boundary (offset={:#x})",
-            elr, slot_offset
+            "trace: slot_base={:#x} not aligned (offset={:#x})",
+            slot_base, slot_offset
         );
         return;
     }
     let idx = (slot_offset / SLOT_SIZE) as usize;
     if idx >= FN_COUNT {
-        kprintln!("trace: HVC slot index {} >= FN_COUNT {}", idx, FN_COUNT);
+        kprintln!("trace: slot index {} >= FN_COUNT {}", idx, FN_COUNT);
         return;
     }
 
     let seq = unsafe {
         TRACE_SEQ = TRACE_SEQ.wrapping_add(1);
         TRACE_SEQ
-    };
-    let spsr = unsafe {
-        let v: u64;
-        core::arch::asm!("mrs {}, spsr_el2", out(reg) v,
-            options(nomem, nostack, preserves_flags));
-        v as u32
     };
     let mode = spsr & 0x1F;
     let mode_label = match mode {
@@ -346,6 +357,20 @@ pub fn handle_trace_hvc(ctx: &TrapContext) {
         ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
     );
     let _ = cpu::halt; // suppress unused-import warning under some cfgs
+}
+
+/// The HVC #TRACE_TAG instruction as it appears in slot[0] of a tracer
+/// trampoline. In USR mode HVC is UNDEFINED, so `trap::handle_und`
+/// looks for exactly this encoding and treats it as an out-of-band
+/// trace dispatch.
+pub const TRACE_HVC_INSN: u32 = 0xE140_0570;
+
+/// Check whether an address lies inside the tracer trampoline pool.
+/// Used by `trap::handle_und` to disambiguate a USR-mode UND of
+/// HVC #TRACE_TAG from a stray UND that happens to match the same
+/// 32-bit encoding elsewhere in the guest.
+pub fn in_trampoline_pool(pc: u32) -> bool {
+    pc >= TRAMPOLINE_IPA && pc < TRAMPOLINE_END
 }
 
 fn read_elr_el2() -> u64 {

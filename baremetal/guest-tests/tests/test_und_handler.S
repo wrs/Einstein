@@ -2,8 +2,8 @@
 @
 @ Verifies the EL2 undefined-instruction handler dispatches the three
 @ Einstein UND opcodes correctly:
-@   - 0xE6000010 SystemBootUND   (ELR += 8)
-@   - 0xE6000510 DebuggerUND     (ELR += 8, hypervisor logs payload)
+@   - 0xE6000010 SystemBootUND   (ELR += 4, single-instruction NOP)
+@   - 0xE6000510 DebuggerUND     (ELR past null-terminated ASCII payload)
 @   - 0xE6000810 TapFileCntlUND  (ELR += 8, hypervisor logs payload)
 @
 @ Not tested here: SWP / SWPB. A53 under QEMU executes SWP natively
@@ -71,9 +71,9 @@ _und_trampoline:
 
 test_main:
     @ ---- SystemBootUND (0xE6000010) -------------------------------
-    @ Hypervisor advances PC by 8 past (opcode + payload slot).
+    @ Single-instruction NOP semantic: handler advances ELR by 4 so the
+    @ instruction after the UND executes normally.
     .word   0xE6000010
-    .word   0x11111111          @ payload slot — skipped by handler
     mov     r6, #0x42
     cmp     r6, #0x42
     bne     .Lfail_boot_und
@@ -81,9 +81,14 @@ test_main:
     mov     r0, #1
     hvc     #5                  @ mark 1: SystemBootUND dispatch ok
 
-    @ ---- DebuggerUND (0xE6000510) + payload ----------------------
+    @ ---- DebuggerUND (0xE6000510) + null-terminated ASCII payload ---
+    @ Handler scans from opcode+4 for a NUL byte and resumes at the
+    @ next word boundary past the terminator. The .balign pushes the
+    @ resume PC to a word-aligned location matching the handler's
+    @ expected landing point.
     .word   0xE6000510
-    .word   0x22334455          @ payload — hypervisor logs it
+    .asciz  "dbg"
+    .balign 4
     mov     r6, #0x55
     cmp     r6, #0x55
     bne     .Lfail_dbg_und

@@ -30,10 +30,26 @@
 //! build a probe run and check Einstein's behaviour first — see
 //! `probe/FINDINGS.md`.
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use crate::{cpu, kprintln, peripherals::{dma, pcmcia, serial, vic}};
 
 const HW_BASE: u64 = 0x0F00_0000;
 const HW_END: u64 = 0x0F40_0000;
+
+// ROM serial-chip (kHdWr_P0F243000). Einstein models this as a 1-Wire
+// serial-ROM bit stream (TMemory.cpp:984-999, 2723-2762): a 65-tick
+// loop that returns the "end marker" (0) once, then 64 bits of the
+// 2-word `mSerialNumber`, derived from the emulator's `mNewtonID[2]`
+// via `TMemory::ComputeSerialNumber`. Einstein's default NewtonID is
+// {0, 0} (TEmulator.h:515); the resulting mSerialNumber is computed at
+// compile time below — matches Python port of TMemory::ComputeSerialNumber.
+// The kernel reads bit-by-bit via TSerialNumberROM::Init; each read
+// returns `(bit & 1) << 1` and advances the index mod 65.
+const ROM_SERIAL_CHIP_IPA: u64 = 0x0F24_3000;
+const ROM_SERIAL_NUMBER_0: u32 = 0x3D00_0000;
+const ROM_SERIAL_NUMBER_1: u32 = 0x0000_0001;
+static ROM_SERIAL_IX: AtomicU32 = AtomicU32::new(64);
 
 // Specific register reads the Newton kernel does very early.
 //   TMemoryConsts::kHdWr_04RAMSize = 0x0F00_1800  — encodes installed RAM
@@ -98,6 +114,33 @@ pub fn read(ipa: u64, sas: u8, elr: u64) -> u32 {
 
         // kHdWr_P0F048000: R/W, typical value 0. TMemoryConsts.h:63.
         0x0F04_8000 => 0,
+
+        // ROM serial chip — see constants above. Returns (bit & 1) << 1
+        // following Einstein's bit-stream model of TMemory.cpp:984-999.
+        ROM_SERIAL_CHIP_IPA => {
+            let ix = ROM_SERIAL_IX.load(Ordering::Relaxed);
+            let bit = if ix == 64 {
+                0
+            } else if ix >= 32 {
+                ROM_SERIAL_NUMBER_0 >> (ix - 32)
+            } else {
+                ROM_SERIAL_NUMBER_1 >> ix
+            };
+            ROM_SERIAL_IX.store((ix + 1) % 65, Ordering::Relaxed);
+            (bit & 1) << 1
+        }
+
+        // BIO-interface register window (TMemoryConsts.h:64-70). Einstein
+        // doesn't model these — TMemory's "unknown bank #3" fallback
+        // returns 0 for all of them (TMemory.cpp:952-959). Match that by
+        // returning 0 for the specific registers the 717006 kernel
+        // writes + reads via TBIOInterface::BIOReadRegister /
+        // BIOReadCommand. Don't use a general bank-#3 fallback — we want
+        // any other address we don't know about to keep halting loudly.
+        0x0F05_2C00 => 0, // R/W (0000004E)
+        0x0F05_3000 => 0, // R/W (00007000)
+        0x0F05_3400 => 0, // R/W (00008C00)
+        0x0F05_3800 => 0, // R/W (00000000)
 
         // GPIO input (PCMCIA door-lock + misc sense lines).
         // Einstein returns all-ones = "no cards / switches open".

@@ -622,8 +622,15 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
 ///   translated guest PA; no atomic primitive needed because we hold
 ///   DAIF.I at EL2 for the entire emulation and the guest is single-
 ///   core.
-/// - `0xE6000010` SystemBootUND: ELR += 8 (opcode + payload slot).
-/// - `0xE6000510` DebuggerUND:   ELR += 8, log the payload word.
+/// - `0xE6000010` SystemBootUND: ELR += 4 (single-instruction NOP).
+///   Einstein's JIT sets R15 = inVAddr + 8, which in its pipeline
+///   convention (GetJITUnitForPC does `pc = inPC - 4`) resumes at
+///   inVAddr + 4 — one-instruction advance. The only SystemBootUND
+///   site in 717006 is at 0x000188cc; the word at 0x188d0 is a real
+///   `LDR R0, [PC, #0xc40]` instruction that feeds the following
+///   `LDR PC, [R0]` at 0x188d8 — not a payload.
+/// - `0xE6000510` DebuggerUND: ELR advances past the null-terminated
+///   ASCII payload (aligned to next word boundary); log the string.
 /// - `0xE6000810` TapFileCntlUND: ELR += 8, log the payload word.
 ///   (Einstein's JIT uses GETCALLER()+4 for TapFileCntl; we match the
 ///   JIT's page-compilation step for now — Phase B revisit when the
@@ -773,7 +780,7 @@ fn handle_und(ctx: &mut TrapContext) {
     match insn {
         0xE6000010 => {
             log_und_budgeted("SystemBootUND", faulting_pc, None);
-            return_to_guest(ctx, (faulting_pc + 8) as u64, spsr_und);
+            return_to_guest(ctx, (faulting_pc + 4) as u64, spsr_und);
         }
         0xE6000510 => {
             // DebuggerUND: opcode followed by a null-terminated ASCII
@@ -798,6 +805,45 @@ fn handle_und(ctx: &mut TrapContext) {
         }
         _ if is_swp_encoding(insn) => {
             emulate_swp(ctx, insn, faulting_pc);
+            return_to_guest(ctx, (faulting_pc + 4) as u64, spsr_und);
+        }
+        // `MRS Rd, SPSR` executed in USR mode. On ARMv4 / SA-1100 this
+        // returns the CPSR (no SPSR exists for USR); the A53 UNDs it.
+        // Einstein models this at `TARMProcessor::GetSPSR()`
+        // (TARMProcessor.cpp:774-781): "At MonitorEntryGlue and
+        // elsewhere, the OS accesses SPSR in User mode and apparently
+        // gets CPSR." Emulate by writing the pre-UND CPSR (i.e.
+        // `spsr_und`, which the UND trampoline captured from the
+        // hardware-saved SPSR_und) into Rd and advancing PC by 4. Rd
+        // is extracted from bits[15:12]; per the MRS encoding, r15 is
+        // UNPREDICTABLE here, so bail if the guest asked for it.
+        _ if (insn & 0x0FFF_0FFF) == 0x014F_0000
+            && (spsr_und & 0x1F) == 0x10 =>
+        {
+            let rd = ((insn >> 12) & 0xF) as usize;
+            if rd == 15 {
+                kprintln!(
+                    "*** MRS R15, SPSR (USR): UNPREDICTABLE at PC={:#x}",
+                    faulting_pc
+                );
+                cpu::halt();
+            }
+            ctx.x[rd] = spsr_und;
+            return_to_guest(ctx, (faulting_pc + 4) as u64, spsr_und);
+        }
+        // Tracer trampoline slot[0] executed in USR mode. HVC is
+        // UNDEFINED at EL0, so the trampoline's `hvc #TRACE_TAG`
+        // raises an UND exception instead of entering EL2 directly.
+        // Log the entry (same content as the normal HVC path) and
+        // resume at slot[1] — the original first instruction copy —
+        // restoring the USR-mode CPSR. Without this, any traced
+        // function the Newton kernel calls in user mode (e.g. OsBoot
+        // per the `code-symbols.txt` classification) halts here.
+        #[cfg(feature = "trace")]
+        _ if insn == crate::tracer::TRACE_HVC_INSN
+            && crate::tracer::in_trampoline_pool(faulting_pc) =>
+        {
+            crate::tracer::log_trace_at(ctx, faulting_pc, spsr_und as u32);
             return_to_guest(ctx, (faulting_pc + 4) as u64, spsr_und);
         }
         // User-driven guest software breakpoint — must be checked

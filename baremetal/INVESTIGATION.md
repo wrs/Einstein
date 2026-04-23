@@ -3,54 +3,96 @@
 Live notes. Update as we learn more; archive to a dated file when
 we move past the current stall.
 
-## Currently at (2026-04-22, post-flash-NATIVE_PRIM-rewrite)
+## Currently at (2026-04-22, post-PlatformDriver-gap)
 
-**Boot reaches trace 1841 in ~6 s, then halts at the
-`PowerOffAndReboot` canary because the flash header write/verify
-round-trip diverges.** The canary fires at the FIRST reboot now
-(see "Diagnostic scaffolding" below for the patch site).
+**Boot reaches ~trace 198655 in ~90 s, then DABTs at FAR=0xEA3FFFC5
+because `GetPlatformDriver()` returns NULL.** The kernel's
+`TPlatformDriver::PauseSystem` at `0x00387EB8` starts with
+`LDR R0, [R0, #4]` on a NULL `this` — R0 reads our UND-vector patch
+word at VA 4 (`0xEA3FFFBD`), then `LDR R12, [R0, #8]` tries to
+dereference `0xEA3FFFC5` → unmapped → DABT.
 
-Trace tail at the halt:
+Trace tail:
 
 ```
-trace 1815  TFlashDriver::ReportWriteResult       (last write subfn)
-trace 1816  TReservedBlockAccessor::CompareFlashAndMemRebootIfDifferent
-trace 1818  TFlashRange::Read                      (256 bytes from 0x30000000)
-trace 1826  BlockMove(src=0x30000000, dst=RAM)
-trace 1833  TReservedBlockAccessor::CompareAndRebootIfDifferent
-trace 1841  ConfigureFlashBankDataSize             (last before halt)
-PowerOffAndReboot canary fires (R0=0xFFFFD6BC, SVC mode)
+trace 198652 SpecialCPUIntDisable (svc)
+trace 198653 GetPlatformDriver    (svc)   — returns 0 (global *(0x0C101764) is NULL)
+trace 198654 GetPlatformDriver    (svc)
+trace 198655 TPlatformDriver::PauseSystem (svc) r0=0  →  DABT FAR=0xEA3FFFC5
 ```
 
-Mechanism: kernel erases the flash header block, programs ~256 bytes
-of `DLDS`/`OSCD` header, reads it back via `TFlashRange::Read` from
-the read-window VA `0x30000000`, then byte-compares against the buffer
-just written. If they differ, reboot. The compare is failing.
+Root cause: `LoadPlatformDriver()` at `0x0018B23C` is never called
+in our boot — it does a named-class registry lookup for
+`"TMainPlatformDriver"` which would populate the global at
+`0x0C101764`. Einstein installs the class via its REx; in our setup
+the registry entry is either missing or the init path that triggers
+the lookup was skipped. `LoadPlatformDriver` is in
+`scripts/classify-out/code-symbols.txt`, so if it had run the tracer
+would show it.
 
-Hypotheses (in order of plausibility):
+Next step: cross-check whether Einstein's REx registers
+`TMainPlatformDriver` with the ROM's class registry, and if not,
+which subsystem init function in the ROM/REx is responsible for
+instantiating the platform driver. The tracer's `GetPlatformDriver`
+hits at trace ~19468 (the first one) are the earliest clue — trace
+back from there to find the missing initialisation.
 
-1. **`0x30000000` flash read-window unmapped at stage-1 → reads zeros
-   or stage-2 fault.** The kernel's `AddNewSecPNJT` for write at
-   `VA 0x34000000 → IPA 0x02000000` is traced explicitly; the read
-   window's mapping is set up elsewhere (probably during
-   `TFlashRange::StartReadingArray`). Verify whether `0x30000000`
-   actually translates to flash bank 0 IPA via the live stage-1.
-2. **16-bit lane endianness mismatch in `flash_driver::write`.** Our
-   `program_word` shifts the 16-bit half into `pa & 2 == 0 → high`
-   or `pa & 2 != 0 → low`, but the BE-32 invariant view may need the
-   opposite. Double-check against `TMemory::WriteToFlash16Bits` and
-   the actual byte expected at LE offsets after the shadow_stub XOR.
-3. **`ConfigureFlashBankDataSize` MMIO writes are no-ops** — the
-   kernel toggles bank-control bits between every flash op (the
-   trace shows `0x0c1008c8` writes around every Read/Write). If the
-   bank control reg is supposed to gate access width, ignoring it
-   could leave the next read picking up the wrong byte lanes.
+## Resolved — flash header verify, BIO registers, ROM serial chip, USR-mode tracer (2026-04-22)
 
-Next step: dump the bytes actually written to flash bank 0 backing
-after the kernel finishes the header-write loop, and the 256 bytes
-the kernel reads back from `0x30000000`. If they differ, the bug is
-in the read path; if they match, the kernel is reading the wrong
-bytes for some other reason (alignment, bank, lane).
+Several independent Phase B blockers fixed in sequence to get from
+trace 1841 to trace ~198655:
+
+1. **SystemBootUND PC advance wrong.** `handle_und` advanced ELR by
+   8 (opcode + payload word), but Einstein's JIT (TJITGeneric_Other.cpp
+   +TJITGenericPage.cpp) treats 0xE6000010 as a single-instruction NOP:
+   `PushUnit(SystemBootUND); ... PushUnit(inVAddr + 8)`, combined with
+   `GetJITUnitForPC(pc = inPC - 4)`, resumes at `inVAddr + 4`. The only
+   SystemBootUND site in 717006 is at `0x000188CC`; the word at
+   `0x000188D0` is a real `LDR R0, [PC, #0xc40]` feeding the
+   `LDR PC, [R0]` at `0x000188D8`. Skipping it left a stale R0
+   (= 0x800001D3, a CPSR value from earlier) and DABT'd when the
+   indirect LDR PC tried to dereference it.
+
+2. **BIO interface register window (0x0F05_xxxx) reads halting.**
+   Einstein's TMemory.cpp:952-959 falls through to "unknown bank #3"
+   = return 0 for reads of 0x0F052C00..0x0F055000. Added explicit
+   read-returns-0 entries for the four R/W registers the 717006
+   kernel's TBIOInterface::BIOReadCommand accesses
+   (`0x0F05_2C00`, `0x0F05_3000`, `0x0F05_3400`, `0x0F05_3800`).
+   Matches Einstein behaviour; no tracked state.
+
+3. **kROMSerialChip (0x0F24_3000) not modelled.** Einstein implements
+   this as a 1-Wire serial-ROM bit stream in TMemory.cpp:984-999 /
+   2723-2762. Ported verbatim: `mSerialNumber[2]` computed from
+   `mNewtonID = {0, 0}` (Einstein's default) yields
+   `[0x3D000000, 0x00000001]`; each read returns `(bit & 1) << 1`
+   and advances an index mod 65 (with 64 as the end-marker return-0
+   slot).
+
+4. **Tracer HVC in USR mode UND'd.** The tracer trampoline's
+   slot[0] `hvc #TRACE_TAG` is undefined at EL0, so any traced
+   function the kernel calls in USR mode (OsBoot was the first to
+   fire) raised an UND instead of entering EL2. Added a fallback in
+   `handle_und`: if `insn == TRACE_HVC_INSN` (= 0xE1400570) and the
+   faulting PC is in the trampoline pool, log the trace entry
+   (via `log_trace_at`) and advance PC to slot[1] preserving USR
+   CPSR.
+
+5. **MRS Rd, SPSR in USR mode UND'd.** `MonitorEntryGlue` and peers
+   legitimately execute `MRS R12, SPSR` in USR mode — the SA-1100
+   returns the CPSR in that case (ARMv4 "UNPREDICTABLE" but Einstein
+   models it explicitly at TARMProcessor.cpp:774-781: `case
+   kUserMode: return GetCPSR()`). The A53 UNDs. Ported: in
+   `handle_und`, detect `MRS Rd, SPSR` encoding + USR mode in SPSR_und
+   and emulate by writing `spsr_und` (= pre-UND CPSR captured by the
+   UND trampoline) into Rd, then advancing ELR by 4.
+
+6. **Flash header verify (prior work at 88a5d47c).** 16-bit write
+   `/2` stride bug + ROM/REx checksum seeding + erased-flash default.
+   See commit message for details.
+
+These were landed in sequence; each uncovered the next once the
+previous stall cleared.
 
 ## Resolved — flash chip identification failure (2026-04-22)
 
@@ -232,11 +274,11 @@ ctx-carried values for mode-switch-sensitive reasoning.
 
 ```bash
 rm -f /tmp/newton-snapshot-*.bin
-cd baremetal && timeout 30 cargo run --release --features trace,quiet
+cd baremetal && timeout 90 cargo run --release --features trace,quiet
 ```
 
-The boot reaches ~trace 1841 in a few seconds and halts at the
-`PowerOffAndReboot` canary with `R0 = 0xFFFFD6BC`. The preceding
-trace lines show the failed flash header write/verify round-trip.
-All 20 guest tests pass at the current commit
-(`guest-tests/scripts/run-all.sh`).
+The boot reaches ~trace 198655 in ~90 s and halts in the DIAG DABT
+intercept with `DFAR=0xEA3FFFC5`. The preceding trace lines show
+`GetPlatformDriver` returning NULL and `TPlatformDriver::PauseSystem`
+dereferencing the null `this`. All 20 guest tests pass at the current
+commit (`guest-tests/scripts/run-all.sh`).

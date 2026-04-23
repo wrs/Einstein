@@ -888,6 +888,17 @@ fn handle_poweroff_reboot(ctx: &TrapContext) -> ! {
         "  R12={:#010x}  R14(mode)={:#010x}  (caller LR; mode-banked, may be stale)",
         ctx.x[12] as u32, ctx.x[14] as u32
     );
+    kprintln!();
+    kprintln!("  Flash bank 0 host bytes [0..0x40]:");
+    dump_flash_bytes(0x0200_0000, 0x40);
+    kprintln!("  Flash bank 0 host bytes [0x40..0x90]:");
+    dump_flash_bytes(0x0200_0040, 0x50);
+    kprintln!();
+    kprintln!("  RAM read-back buffer 0x034af38c..0x034af3ac (LE host bytes):");
+    dump_ram_bytes(0x034a_f38c, 0x20);
+    kprintln!("  RAM expected buffer  0x034af228..0x034af2b0 (LE host bytes):");
+    dump_ram_bytes(0x034a_f228, 0x90);
+    kprintln!();
     kprintln!(
         "  (See the tracer entries immediately preceding this line for the"
     );
@@ -898,6 +909,60 @@ fn handle_poweroff_reboot(ctx: &TrapContext) -> ! {
         "   function called before PowerOffAndReboot.)"
     );
     cpu::halt();
+}
+
+fn dump_flash_bytes(ipa: u32, count: u32) {
+    let base = crate::peripherals::flash::host_pa() as *const u8;
+    let flash_off = ipa.wrapping_sub(crate::peripherals::flash::BANK0_PA_BASE) as usize;
+    for row in 0..((count + 15) / 16) {
+        let off = row * 16;
+        let mut hex = [0u8; 48]; // " %02x" * 16 = 48 chars + nul
+        let mut i = 0;
+        for j in 0..16 {
+            if off + j >= count { break; }
+            // SAFETY: host_pa + flash_off + off + j bounded by BANK_SIZE.
+            let b = unsafe { *base.add(flash_off + (off as usize) + j as usize) };
+            let hi = b >> 4;
+            let lo = b & 0xF;
+            hex[i] = if hi < 10 { b'0' + hi } else { b'a' + hi - 10 };
+            hex[i+1] = if lo < 10 { b'0' + lo } else { b'a' + lo - 10 };
+            hex[i+2] = b' ';
+            i += 3;
+        }
+        let s = core::str::from_utf8(&hex[..i]).unwrap_or("<?>");
+        kprintln!("    {:#010x}: {}", ipa + off, s);
+    }
+}
+
+fn dump_ram_bytes(va: u32, count: u32) {
+    // Walk guest stage-1 to resolve VA -> PA first.
+    let pa = match guest_mem::translate_va(va) {
+        Some(p) => p,
+        None => {
+            kprintln!("    {:#010x}: <no stage-1 mapping>", va);
+            return;
+        }
+    };
+    for row in 0..((count + 15) / 16) {
+        let off = row * 16;
+        let mut hex = [0u8; 48];
+        let mut i = 0;
+        for j in 0..16 {
+            if off + j >= count { break; }
+            let b = match guest_mem::read_byte_pa(pa + off + j) {
+                Some(b) => b,
+                None => { kprintln!("    {:#010x}: <pa {:#x} unmapped>", va + off + j, pa + off + j); return; }
+            };
+            let hi = b >> 4;
+            let lo = b & 0xF;
+            hex[i] = if hi < 10 { b'0' + hi } else { b'a' + hi - 10 };
+            hex[i+1] = if lo < 10 { b'0' + lo } else { b'a' + lo - 10 };
+            hex[i+2] = b' ';
+            i += 3;
+        }
+        let s = core::str::from_utf8(&hex[..i]).unwrap_or("<?>");
+        kprintln!("    VA {:#010x} (PA {:#010x}): {}", va + off, pa + off, s);
+    }
 }
 
 fn handle_diag(ctx: &mut TrapContext) {

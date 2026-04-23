@@ -42,7 +42,11 @@ pub const SIZE: usize = BANK_SIZE * 2;
 #[repr(C, align(0x200000))]
 struct Flash([u8; SIZE]);
 
-static mut GUEST_FLASH: Flash = Flash([0; SIZE]);
+static mut GUEST_FLASH: Flash = Flash([0xFF; SIZE]);
+// Note: start in erased state (0xFF), matching a fresh flash chip.
+// `init()` then seeds the DLDS/OSCD header via the same 16-bit
+// halfword path the kernel itself uses for writes, so the seeded
+// layout is indistinguishable from what the kernel would produce.
 
 /// Host physical base of the flash backing store.
 pub fn host_pa() -> u64 {
@@ -56,6 +60,129 @@ pub fn host_pa() -> u64 {
 pub fn init() {
     seed_block(0x00000000);
     seed_block(0x00010000);
+}
+
+/// Compute the 10-entry ROM-REx checksum table the kernel's
+/// `TReservedBlockAccessor` uses for its post-read validation pass
+/// (`trace 1628 operator==(TROMREXCheckSums...)`), and seed it into
+/// flash at `0x64..0x8C` of both block 0 and block 1.
+///
+/// Each `ComputeSegmentChecksums` entry is two u32s (`highBits`,
+/// `lowBits`) where `highBits += word >> 16` and
+/// `lowBits += word & 0xFFFF` for every u32 in the segment. Mirrors
+/// `TROMImage::DoComputeChecksums` (`Emulator/ROM/TROMImage.cpp:164-229`).
+///
+/// Without this, the kernel sees zeros where checksums should be,
+/// declares the flash header stale, and runs
+/// `UpdateBlock0FromBlock1` → block-1 → block-0 restore. That restore
+/// round-trips through the 16-bit `DoWrite` stride expansion, which
+/// makes the kernel's subsequent `CompareFlashAndMemRebootIfDifferent`
+/// fail (read-back is sparse; source buffer is dense). The kernel
+/// then calls `PowerOffAndReboot`.
+///
+/// `rom_le_words` is the byteswapped-to-LE view of the full 16 MiB
+/// ROM+REx aperture that the guest sees (`guest_mem::rom_host_pa()`
+/// as `*const u32`). We compute checksums over it as LE-host u32
+/// values — the same ones the kernel will see via LE LDR at runtime.
+pub fn seed_rom_rex_checksums(rom_le_words: *const u32, rom_len_bytes: usize) {
+    // Read the base-ROM size from ROM+0x3C (as Einstein does). This
+    // is a u32 word; the ROM is already byteswapped to LE, so the
+    // value matches what the guest would read.
+    // SAFETY: caller asserts rom_le_words covers rom_len_bytes bytes.
+    let base_size = unsafe { rom_le_words.add(0x3C / 4).read() };
+    if base_size == 0 || (base_size as usize) > rom_len_bytes {
+        return;
+    }
+
+    // Find embedded REx(es) — scan from base_size forwards for
+    // "RExB" / "lock" magic. The ROM was byteswapped BE→LE on load, so
+    // an ASCII string stored in BE order reads as a u32 with the
+    // bytes in BE order = `from_be_bytes`. Einstein caps at 4 REx
+    // slots.
+    const MAGIC_REXB: u32 = u32::from_be_bytes(*b"RExB");
+    const MAGIC_LOCK: u32 = u32::from_be_bytes(*b"lock");
+    let mut rex_bases = [0u32; 4];
+    let mut rex_sizes = [0u32; 4];
+    let mut nb_rexes = 0usize;
+    let mut cursor = base_size;
+    while nb_rexes < 4 && (cursor as usize) < rom_len_bytes.saturating_sub(0x20) {
+        let m0 = unsafe { rom_le_words.add((cursor / 4) as usize).read() };
+        let m1 = unsafe { rom_le_words.add((cursor / 4) as usize + 1).read() };
+        if m0 != MAGIC_REXB || m1 != MAGIC_LOCK {
+            break;
+        }
+        let sz = unsafe { rom_le_words.add(((cursor + 0x18) / 4) as usize).read() };
+        if sz < 0x20 || (cursor + sz) as usize > rom_len_bytes {
+            break;
+        }
+        rex_bases[nb_rexes] = cursor;
+        rex_sizes[nb_rexes] = sz;
+        nb_rexes += 1;
+        cursor += sz;
+    }
+    // Also scan at the external-REx anchor 0x00800000.
+    if nb_rexes < 4 {
+        let anchor = 0x0080_0000u32;
+        if (anchor as usize) < rom_len_bytes {
+            let m0 = unsafe { rom_le_words.add((anchor / 4) as usize).read() };
+            let m1 = unsafe { rom_le_words.add((anchor / 4) as usize + 1).read() };
+            if m0 == MAGIC_REXB && m1 == MAGIC_LOCK {
+                let sz = unsafe { rom_le_words.add(((anchor + 0x18) / 4) as usize).read() };
+                if sz >= 0x20 && (anchor + sz) as usize <= rom_len_bytes {
+                    rex_bases[nb_rexes] = anchor;
+                    rex_sizes[nb_rexes] = sz;
+                    nb_rexes += 1;
+                }
+            }
+        }
+    }
+
+    let mut checksums = [0u32; 10];
+    compute_segment_checksum(rom_le_words, 0, base_size, &mut checksums[0..2]);
+    for i in 0..4 {
+        let (base, size) = (rex_bases[i], rex_sizes[i]);
+        let slot = &mut checksums[(2 * i) + 2..(2 * i) + 4];
+        if size == 0 {
+            slot[0] = 0xFFFF_FFFF;
+            slot[1] = 0xFFFF_FFFF;
+        } else {
+            compute_segment_checksum(rom_le_words, base, size, slot);
+        }
+    }
+
+    // Write the 10 u32 checksums at flash[block + 0x64 .. block + 0x8C]
+    // for both block 0 and block 1. Einstein does this via its
+    // BE-aware Write helper; we store raw LE u32s (matching what the
+    // kernel will read via LE LDR).
+    crate::kprintln!(
+        "flash: ROM/REx checksums seeded (base_size={:#x}, nb_rexes={})",
+        base_size, nb_rexes
+    );
+    for block_base in [0x0000_0000u32, 0x0001_0000u32] {
+        for (i, csum) in checksums.iter().enumerate() {
+            write_u32(block_base + 0x64 + (i as u32) * 4, *csum);
+        }
+    }
+}
+
+fn compute_segment_checksum(
+    rom_le_words: *const u32,
+    base: u32,
+    size: u32,
+    out: &mut [u32],
+) {
+    let mut high: u32 = 0;
+    let mut low: u32 = 0;
+    let start_word = (base / 4) as usize;
+    let word_count = (size / 4) as usize;
+    for i in 0..word_count {
+        // SAFETY: caller bounds-checked that base + size <= rom_len_bytes.
+        let value = unsafe { rom_le_words.add(start_word + i).read() };
+        low = low.wrapping_add(value & 0x0000_FFFF);
+        high = high.wrapping_add(value >> 16);
+    }
+    out[0] = high;
+    out[1] = low;
 }
 
 fn seed_block(base: u32) {

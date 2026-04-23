@@ -42,6 +42,12 @@ const VTABLES_32BIT: [u32; 3] = [0x0001_E3D4, 0x0001_E3E0, 0x0001_E180];
 pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
     match subfn {
         0x01 => identify(ctx, pc),
+        // CleanUp / Init / InitializeDriverData / CleanUpDriverData /
+        // StartReadingArray / DoneReadingArray / ResetBlockStatus /
+        // LockBlock / ReportWriteResult — Einstein returns r0=0 with
+        // no further work (all flash-chip state that the real hardware
+        // would care about is hidden behind the native-prim layer on
+        // emulation).
         0x02 | 0x03 | 0x04 | 0x05 | 0x06 | 0x07 | 0x0A | 0x0C | 0x0E => {
             ctx.x[0] = 0;
         }
@@ -49,6 +55,7 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         0x09 => start_erase(ctx, pc),
         0x0B => is_erase_complete(ctx, pc),
         0x0D => begin_write(ctx, pc),
+        0x0F => do_write(ctx, pc),
         0x10 => do_erase(ctx, pc),
         _ => {
             kprintln!(
@@ -146,17 +153,46 @@ fn write(ctx: &mut TrapContext, pc: u32) {
     let ok = if is_32bit {
         flash::program_word(pa, word, mask)
     } else {
-        // 16-bit path: TMemory::WriteToFlash16Bits
-        // (TMemory.cpp:2616-2668). Splits the word into the high
-        // or low 16-bit lane based on (PA & 2), then programs the
-        // containing u32 with masked data.
-        let aligned_pa = pa & !0x3;
-        let (w, m) = if pa & 0x2 != 0 {
-            (word & 0x0000_FFFF, mask & 0x0000_FFFF)
+        // 16-bit path. Real Newton hardware with 16-bit flash wires
+        // the CPU's 32-bit write-address bus to addresses flash at
+        // 2x stride: `T16BitFlashRange::DoWrite` issues halfword
+        // writes every 4 bytes because the memory controller only
+        // accepts the upper-half lane of each 32-bit word. The
+        // kernel's corresponding READ path (via `TFlashRange::Read`
+        // /`memcpy` over the 0x30000000 alias) reads linearly from
+        // the flash byte stream — so each 4-byte-stride write must
+        // land at 2 consecutive flash bytes, NOT at one halfword
+        // within a 4-byte word with the other halfword left 0xFF.
+        //
+        // Einstein handles this by mapping the 0x34000000 write
+        // aperture through `TMemory::WriteToFlash16Bits`, which
+        // divides the incoming physical address by 2 before writing
+        // the halfword to the flash backing. We mirror that contraction
+        // here: the halfword from the kernel lands at flash byte
+        // `(pa - flash_base) / 2`, preserving a dense layout that
+        // the subsequent linear read will match.
+        let bank0_base = flash::BANK0_PA_BASE;
+        let bank1_base = flash::BANK1_PA_BASE;
+        let (bank_base, bank_size) = if pa >= bank0_base
+            && pa < bank0_base + flash::BANK_SIZE as u32
+        {
+            (bank0_base, flash::BANK_SIZE as u32)
+        } else if pa >= bank1_base && pa < bank1_base + flash::BANK_SIZE as u32 {
+            (bank1_base, flash::BANK_SIZE as u32)
         } else {
-            ((word & 0x0000_FFFF) << 16, (mask & 0x0000_FFFF) << 16)
+            ctx.x[0] = ERR_FLASH_ADDR_OUT_OF_RANGE as u64;
+            return;
         };
-        flash::program_word(aligned_pa, w, m)
+        let byte_off = (pa - bank_base) / 2;
+        let hw = (word & 0x0000_FFFF) as u16;
+        let m = (mask & 0x0000_FFFF) as u16;
+        let contracted_pa = bank_base + (byte_off & !0x3);
+        let (w, m32) = if byte_off & 0x2 != 0 {
+            (hw as u32, m as u32)
+        } else {
+            ((hw as u32) << 16, (m as u32) << 16)
+        };
+        flash::program_word(contracted_pa, w, m32)
     };
 
     if ok {
@@ -223,6 +259,16 @@ fn begin_write(ctx: &mut TrapContext, _pc: u32) {
     } else {
         ctx.x[0] = ERR_FLASH_ADDR_OUT_OF_RANGE as u64;
     }
+}
+
+/// TEinsteinFlashDriver::DoWrite(word=r1, mask=r2, addr=r3,
+/// startOfBlock=[sp+4]). Einstein's case 0x0F just logs and returns
+/// r0=0 — `startOfBlock` is informational only. We mirror that
+/// behaviour: `BeginWrite` already programmed the masked word into
+/// flash, and DoWrite is the kernel-side bookkeeping wrapper around
+/// the per-word loop. Our state has nothing to update.
+fn do_write(ctx: &mut TrapContext, _pc: u32) {
+    ctx.x[0] = 0;
 }
 
 /// TEinsteinFlashDriver::DoErase(start=r1, size=r2). Erase a range

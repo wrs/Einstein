@@ -57,9 +57,10 @@ test_main:
     mov     r0, #1
     hvc     #5                      @ mark 1: header intact
 
-    @ --- Unwritten region of bank 0 reads zero ---
+    @ --- Unwritten region of bank 0 reads 0xFFFFFFFF (erased state) ---
     ldr     r0, [r4, #0x200]
-    cmp     r0, #0
+    ldr     r1, =0xFFFFFFFF
+    cmp     r0, r1
     bne     .Lfail_unwritten
 
     @ --- Bank 0: write / readback ---
@@ -69,8 +70,9 @@ test_main:
     cmp     r0, r6
     bne     .Lfail_bank0_readback
 
-    ldr     r0, [r4, #0x204]        @ neighbour untouched
-    cmp     r0, #0
+    ldr     r0, [r4, #0x204]        @ neighbour untouched (erased)
+    ldr     r1, =0xFFFFFFFF
+    cmp     r0, r1
     bne     .Lfail_neighbour
 
     mov     r0, #2
@@ -89,16 +91,18 @@ test_main:
     mov     r0, #3
     hvc     #5                      @ mark 3: byte granularity
 
-    @ --- Bank 1 (kFlashBank2) is a separate 4 MiB region ---
+    @ --- Bank 1 (kFlashBank2) is a separate 4 MiB region (erased) ---
     ldr     r5, =FLASH_BANK1
     ldr     r0, [r5, #0]
-    cmp     r0, #0
+    ldr     r1, =0xFFFFFFFF
+    cmp     r0, r1
     bne     .Lfail_bank1_seeded
 
     ldr     r6, =0xCAFEF00D
     str     r6, [r5, #0x400]
-    ldr     r0, [r4, #0x400]        @ bank 0 at same offset must be unaffected
-    cmp     r0, #0
+    ldr     r0, [r4, #0x400]        @ bank 0 at same offset must be unaffected (erased)
+    ldr     r1, =0xFFFFFFFF
+    cmp     r0, r1
     bne     .Lfail_bank_alias
 
     ldr     r0, [r5, #0x400]

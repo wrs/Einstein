@@ -51,6 +51,17 @@ pub extern "C" fn kmain() -> ! {
     // mut touched only from core 0 during boot.
     peripherals::flash::init();
 
+    // Seed the 10-entry ROM+REx checksum table into both blocks of
+    // flash bank 0. The kernel's `TReservedBlockAccessor` reads these
+    // during early init.
+    #[cfg(not(nh_guest_test))]
+    {
+        peripherals::flash::seed_rom_rex_checksums(
+            guest_mem::rom_host_pa() as *const u32,
+            guest_mem::ROM_SIZE,
+        );
+    }
+
     // SAFETY: stage-2 tables reference the backing store we just populated.
     unsafe {
         stage2::init();

@@ -112,44 +112,71 @@ functions. Next steps:
   traced PC (e.g. start of `CArrayIterator::Init`) to catch the
   faulting instruction.
 
-## Known broken — snapshot resume + tracer (2026-04-23)
+## Partially resolved — snapshot resume PABT loop (2026-04-23)
 
-Snapshots silently corrupt resume when the `trace` feature is on.
-Observed symptoms:
+Symptom was: resume ERETs to the saved PC and the guest immediately
+lands at PC=0x0C (PABT vector) in ABT mode and steady-state loops
+there. No sync trap ever fires (the guest stage-1 maps VA=0x0C
+without execute permission, so the PABT-vector fetch itself PABTs
+and the kernel never unwinds).
 
-- Save taken while guest is at PC inside the tracer trampoline pool
-  (`0x00900000..0x00E00000`) or UND stub (`0x00FFFFE0`) in some
-  non-SVC mode.
-- Resume loads the snapshot, ERETs to the saved PC, and the guest
-  immediately lands at PC=0x0C (PABT vector) in ABT mode and
-  steady-state loops there without the HVC patch at 0x0C ever
-  firing.
-- `AT S12E1R` shows stage-1 permission fault for VA=0x0C (guest
-  kernel's post-MMU map doesn't keep VA=0x0C executable — at
-  cold-boot time the guest never took a PABT so this didn't matter),
-  so the guest can't even fetch its own PABT vector, and loops at
-  PC=0xC with stage-1 PABTs that guest-handles itself.
+Three contributing causes; Header `VERSION` bumped to 2:
 
-Root cause is the combination of:
-1. Tracer saves at PCs that are fragile to mid-execution restore
-   (tracer trampoline slots, UND stub body).
-2. QEMU raspi3b's flaky AArch32↔AArch64 banked-SP/LR plumbing means
-   saved `ctx.x[13]` / `ctx.x[14]` may not fully reflect SP/LR of
-   the guest's active mode, and non-active modes' banked SPs aren't
-   saved at all.
-3. Guest stage-1 maps VA=0x0C without execute permission once MMU
-   is fully up — on cold boot this is fine because the guest never
-   PABTs, but on resume we trigger a PABT on something and it can't
-   unwind.
+1. **Autosave PC inside a hypervisor-transient region.** The
+   tracer trampoline pool (`0x00900000..0x00E00000`) and the
+   hypervisor ROM tail (`0x00FFFF00..0x01000000`:
+   UND/SBA/DABT trampolines + UND return stub) are reached via
+   transient state — TPIDRURW scratch, RAM save slots, staged
+   ERET PC literals, brief mode-switch dances. A snapshot taken
+   mid-trampoline captures the PC but not the scaffolding; on
+   resume the guest ERETs back into the stub with garbage
+   scratch. Fix: `snapshot::maybe_autosave` now skips when
+   `ELR_EL2` falls in those ranges.
 
-Workaround for now: cold-boot every run with tracer on. Per
-CLAUDE.md: "Tracing runs are cold-boot runs — clear
-`/tmp/newton-snapshot-*.bin` before the first boot."
+2. **Autosave in an exception mode with banked SP/LR.** IRQ /
+   FIQ / ABT / UND each have their own banked R13 / R14. LLVM
+   AArch64 doesn't expose `sp_abt` / `sp_und` / `sp_irq` /
+   `sp_fiq` or the matching LRs as named sysregs, and QEMU
+   raspi3b's banked-reg plumbing is flaky anyway (CLAUDE.md
+   "QEMU banked-register caveat"). Fix: skip autosaves taken
+   with the guest CPSR mode in
+   `{FIQ=0x11, IRQ=0x12, ABT=0x17, UND=0x1B}`; keep SVC/USR/SYS.
 
-Proper fix would need: (a) save banked SP/LR for all modes, (b)
-gate autosave to exclude PCs inside tracer trampolines / stubs, or
-(c) detect the PABT-at-VA-0xC on resume and rewrite the guest's
-page tables to map the vector page executable.
+3. **Missing EL1 sysregs in the snapshot Header.** Saved:
+   SCTLR, TTBR0, TTBR1, TCR, DACR32, VBAR, CPACR, SPSR_{svc,
+   abt, und, irq, fiq}. NOT previously saved:
+     - `SP_EL0`   — AArch32 R13_usr / R13_sys
+     - `SP_EL1`   — AArch32 R13_svc
+     - `ELR_EL1`  — AArch32 R14_svc
+     - `MAIR_EL1` — AArch32 PRRR / NMRR (TEX remap under
+       short-descriptor) or MAIR0 / MAIR1 (long-descriptor)
+   AArch64 ERET to AArch32 does not propagate x13 / x14 into
+   the banked R13 / R14 of the target mode, so SP_svc and
+   LR_svc have to be staged via `sp_el1` / `elr_el1` before
+   ERET; USR via `sp_el0`. Without this, the first SVC-mode
+   instruction that touched SP faulted on garbage. MAIR_EL1
+   was the silent culprit for stage-1 attribute mismatch when
+   the guest had already programmed PRRR/NMRR before the save.
+   Fix: save all four in Header, restore in `restore_sysregs`.
+
+Post-fix status: resume works for many SVC / USR-mode snapshots
+(e.g. PC=`0x18ddc` in `ZeroPhysSubPage`, PC=`0x14811c` in kernel
+code — both advance into forward progress). Some resumes still
+break, particularly from PCs in kernel fast paths where we may
+still be missing state (FPU registers aren't saved; banked
+SP/LR for non-active exception modes aren't saved either). The
+workaround "cold-boot every tracer run" is no longer the
+required default, but some failure modes remain.
+
+Proper future work:
+- Save / restore FPU state (Q0..Q31 + FPSCR).
+- Save / restore banked SP/LR for all AArch32 modes via
+  raw-encoded `msr`/`mrs` or an AArch32 stub.
+- Save / restore CONTEXTIDR_EL1 (ASID) and any other CP15
+  state the guest relies on (AMAIR, TPIDR_EL*, PAR_EL1).
+- Detect PABT-at-VA-0xC on resume and rewrite the guest's
+  stage-1 vector page to executable so at least the failure
+  mode reports a usable ESR.
 
 ## Previously-current — DABT at 0x003AE3E4 (pre-SPSR-fix)
 

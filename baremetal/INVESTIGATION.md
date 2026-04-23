@@ -5,37 +5,118 @@ we move past the current stall.
 
 ## Currently at (2026-04-22, post-PlatformDriver-gap)
 
-**Boot reaches ~trace 198655 in ~90 s, then DABTs at FAR=0xEA3FFFC5
+**Boot reaches ~trace 63160 in ~90 s (number varies with wall-clock;
+~198k with the longer historical run), then DABTs at FAR=0xEA3FFFC5
 because `GetPlatformDriver()` returns NULL.** The kernel's
-`TPlatformDriver::PauseSystem` at `0x00387EB8` starts with
-`LDR R0, [R0, #4]` on a NULL `this` — R0 reads our UND-vector patch
-word at VA 4 (`0xEA3FFFBD`), then `LDR R12, [R0, #8]` tries to
-dereference `0xEA3FFFC5` → unmapped → DABT.
+`TPlatformDriver::PauseSystem` at `0x00387EB8` does:
+
+```arm
+LDR  R0,  [R0, #4]       ; vtable → ClassInfo pointer
+LDR  R12, [R0, #8]       ; method-array base
+ADD  PC,  R12, #0x38     ; jump to PauseSystem method
+```
+
+On a NULL `this`, `R0 = *(VA 4) = 0xEA3FFFBD` (our UND-vector patch
+word), then `LDR R12, [R0, #8]` dereferences `0xEA3FFFC5` → unmapped
+→ DABT. (Newton's dispatch is a two-level `this`→ClassInfo→method-array
+lookup, not a flat C++ vtable — see memory `project_newton_object_layout`.)
 
 Trace tail:
 
 ```
-trace 198652 SpecialCPUIntDisable (svc)
-trace 198653 GetPlatformDriver    (svc)   — returns 0 (global *(0x0C101764) is NULL)
-trace 198654 GetPlatformDriver    (svc)
-trace 198655 TPlatformDriver::PauseSystem (svc) r0=0  →  DABT FAR=0xEA3FFFC5
+trace 63151 DoSchedulerSWI   (usr)    — idle yield
+trace 63152 SWIBoot
+trace 63153 SleepTask        (usr)
+trace 63154 PauseSystem      (usr)    — ROM wrapper at 0x001925DC
+trace 63155 GenericSWI r0=0x45       — SWI #0x45 (PauseSystem kernel call)
+trace 63156 SWIBoot
+trace 63158 PauseSystemKernelGlue
+trace 63159 SpecialCPUIntDisable
+trace 63160 GetPlatformDriver        — returns 0 (*(0x0C101764) is NULL)
+trace 63161 TPlatformDriver::PauseSystem r0=0 → DABT FAR=0xEA3FFFC5
 ```
 
-Root cause: `LoadPlatformDriver()` at `0x0018B23C` is never called
-in our boot — it does a named-class registry lookup for
-`"TMainPlatformDriver"` which would populate the global at
-`0x0C101764`. Einstein installs the class via its REx; in our setup
-the registry entry is either missing or the init path that triggers
-the lookup was skipped. `LoadPlatformDriver` is in
-`scripts/classify-out/code-symbols.txt`, so if it had run the tracer
-would show it.
+The path is the idle loop: scheduler has nothing to run, so
+`SleepTask` → `PauseSystem()` (ROM wrapper at `0x001925DC`) → SWI 0x45
+→ `PauseSystemKernelGlue` → `SpecialCPUIntDisable` + guarded call to
+`TPlatformDriver::PauseSystem` on `gPlatformDriver`. The ROM
+wrapper's NULL guard uses `gWantDeferred` (at `0x0C101028`), NOT
+`gPlatformDriver` — so a null driver isn't caught. On real hardware
+`gPlatformDriver` is populated by `LoadPlatformDriver()` long before
+the first idle, and Einstein mirrors this.
 
-Next step: cross-check whether Einstein's REx registers
-`TMainPlatformDriver` with the ROM's class registry, and if not,
-which subsystem init function in the ROM/REx is responsible for
-instantiating the platform driver. The tracer's `GetPlatformDriver`
-hits at trace ~19468 (the first one) are the earliest clue — trace
-back from there to find the missing initialisation.
+Root cause: **`TLoader::TheMain` (`0x0011401C`) never runs**, so
+`LoadPlatformDriver()` (called from its body at ROM offset 0x114038)
+never runs, so `NewByName("TPlatformDriver", "TMainPlatformDriver")`
+never populates `gPlatformDriver`.
+
+What we've verified (2026-04-22):
+- `LoadPlatformDriver` has 0 tracer hits.
+- `TLoader::MainConstructor` (`0x00113CAC`) has 0 hits.
+- `TheMain__7TLoaderFv` (`0x0011401C`) has 0 hits.
+- Einstein.rex TOC has only `fdrv/FDRV/pkgl` entries — **no**
+  class-registration entry for `TMainPlatformDriver`. The class must
+  therefore be registered via the ROM-resident path, which only the
+  Loader task exercises.
+- The jump-table trampoline `B 0x0011401C` for `TLoader::TheMain`
+  lives at ROM PA `0xAA84` (computed from ROM imm24 + VA
+  `0x01B15A84`, where stage-1 maps `0x01B15A84 → PA 0xAA84`). Only
+  one ROM reference to it: `0x0001FC74: B 0x01B15A84` — part of the
+  big "B-trampoline table" at `0x0001FC00..0x0001FCFC+` which looks
+  like the ROM's jump-table *source* (copied/installed at boot).
+- Only one `TUTask::Init` call fires in a full run (trace 62397),
+  targeting `InitialKSRVTask` (`0x01AFDE80`). The Loader world task
+  is never constructed.
+
+Candidate interpretations (none yet verified):
+
+1. The ROM-resident ClassInfo for `TLoader` is reached via a static
+   init table we haven't found. Search so far:
+   - No ROM BL to `0x0011401C` directly (only the `B 0x01B15A84` at
+     `0x0001FC74`).
+   - No literal-u32 reference to `0x0011401C`, `0x00113CAC/B0/B4`,
+     `0x01B15A84`, `0x0001FC44/68/6C/74/78` in either ROM or REx.
+   - The "TLoader" string (or its per-word-swapped form) does not
+     appear anywhere in ROM or REx — the class does not register by
+     name.
+
+2. Some init step we're skipping would call a kernel API that
+   spawns the Loader task. InitGlobalWorld (trace 20530) runs, then
+   kernel-heap / object-manager init, and eventually the scheduler
+   starts. The Loader-task spawn must be somewhere in this sequence
+   and isn't happening.
+
+3. Einstein's JIT may short-circuit the idle stall by never actually
+   reaching `PauseSystem`, OR it may follow the same path but
+   effectively NOP it (Einstein's `ExecutePlatformDriverNative`
+   case 0x0D just calls `mEmulator->PauseSystem()` — but that only
+   fires if `gPlatformDriver` is non-NULL, so Einstein must also
+   populate it somehow).
+
+Near-term options:
+
+- **(a) Keep digging for the real Loader-task spawn site.** Find the
+  init table / data structure that pairs the four trampolines at
+  `0x0001FC44..0x0001FC74` (TLoader's ClassInfo) with a kernel
+  task-spawn. High investment, correct fix.
+- **(b) Fake `gPlatformDriver`.** Inject a RAM-resident TPlatformDriver
+  object + ClassInfo + method-array such that `gPlatformDriver->
+  PauseSystem` lands on a small no-op stub. Store the pointer at
+  `0x0C101764` at a one-shot early hook. Feasible using the
+  object-layout notes above. Moderate investment, brittle but
+  unblocks idle.
+- **(c) Patch the ROM wrapper `PauseSystem` at `0x001925DC`.** Change
+  the `bne 0x19260c` at `0x00192600` to unconditional `b`, skipping
+  the driver call. Minimal patch, trivial to revert. Matches what a
+  working Einstein boot effectively does post-idle (no-op the call).
+  Downside: this doesn't fix any other code path that uses
+  `gPlatformDriver` later — we'd just hit the next NULL-deref
+  elsewhere.
+
+Option (c) is the cheapest experiment to see what the *next* stall
+looks like, without committing to a real fix. Recommended as the
+next step if we choose to advance the boot pointer; (a) remains the
+correct long-term solution.
 
 ## Resolved — flash header verify, BIO registers, ROM serial chip, USR-mode tracer (2026-04-22)
 

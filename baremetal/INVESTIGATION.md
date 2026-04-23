@@ -93,30 +93,98 @@ Candidate interpretations (none yet verified):
    fires if `gPlatformDriver` is non-NULL, so Einstein must also
    populate it somehow).
 
-Near-term options:
+### Deeper root cause (2026-04-22 afternoon)
 
-- **(a) Keep digging for the real Loader-task spawn site.** Find the
-  init table / data structure that pairs the four trampolines at
-  `0x0001FC44..0x0001FC74` (TLoader's ClassInfo) with a kernel
-  task-spawn. High investment, correct fix.
-- **(b) Fake `gPlatformDriver`.** Inject a RAM-resident TPlatformDriver
-  object + ClassInfo + method-array such that `gPlatformDriver->
-  PauseSystem` lands on a small no-op stub. Store the pointer at
-  `0x0C101764` at a one-shot early hook. Feasible using the
-  object-layout notes above. Moderate investment, brittle but
-  unblocks idle.
-- **(c) Patch the ROM wrapper `PauseSystem` at `0x001925DC`.** Change
-  the `bne 0x19260c` at `0x00192600` to unconditional `b`, skipping
-  the driver call. Minimal patch, trivial to revert. Matches what a
-  working Einstein boot effectively does post-idle (no-op the call).
-  Downside: this doesn't fix any other code path that uses
-  `gPlatformDriver` later — we'd just hit the next NULL-deref
-  elsewhere.
+Kept digging past the "TLoader never runs" observation. The actual
+failure is one level up: **the kernel-server task itself never
+starts, even though it gets `Init`'d**.
 
-Option (c) is the cheapest experiment to see what the *next* stall
-looks like, without committing to a real fix. Recommended as the
-next step if we choose to advance the boot pointer; (a) remains the
-correct long-term solution.
+Facts established:
+
+- ROM's `InitClasses__Fv` (0x002BEDD8) is called from `InitObjects__Fv`
+  (0x0031C608), which is called from `TNewtWorld::MainConstructor`
+  (0x0030D20C). In our trace none of these three run — so no
+  `TClassInfoRegistryImpl::Register` call ever fires.
+- 73 ROM ClassInfo structures exist in the `0x38XXXX` band
+  (discovered by brute-force pattern scan), including
+  `TVoyagerPlatform` at 0x00387D18 (the fallback `LoadPlatformDriver`
+  would create). None are registered in our run — `Register` has 0
+  hits.
+- `TPrivatePackageIterator` + `PrivateClassInfoInterfaceName` run
+  early and iterate 14 ClassInfos in the REx / high-ROM (`0x7a5600`,
+  `0x800448..0x8039B8`, `0x9589E8`) — package-side registrations,
+  distinct from the 73 kernel-class table. This path works; it's
+  the *kernel* side that's dead.
+- Only one `TUTask::Init` call in a 90-s boot (trace 62397). It sets
+  up the KSRV task with entry `InitialKSRVTask` (JT 0x01AFDE80 →
+  direct 0x002F7198), stack 0x6800, env "ksrv" (0x6B737276).
+  Everything looks healthy: `TTask::TTask` allocates the object
+  (ID 0x15F3), `TTask::Init` (0x002522B0) assigns fn+stack+env,
+  `ObjectTable::Add` registers it.
+- `TUTask::Start` (0x0025BCC4) is **never called** — the trampoline
+  is installed (trace would fire on first byte) but the function is
+  never executed. `InitialKSRVTask` itself never runs.
+- Sequence observed between task creation and destruction (~700
+  traces apart): `TUTask::Init` → `TUSharedMem::Init` →
+  `TUObject::MakeObject` → SWI dispatch → `TTask::TTask` in SVC →
+  `TTask::Init` → `ObjectTable::Add`(id=0x15F3) → `_MonitorExitSWI`
+  r0=0xFFFFD822 → … → `TUObject::~TUObject` (trace 63074, on the
+  same 0xC111CF0 TUTask object) → `DeleteTask` → `TTask::~TTask` →
+  `UnScheduleTask` → `FreeStack` → `operator delete`. The task is
+  **created, briefly attached, then torn down without running.**
+- After KSRV teardown the Global-World task runs `SetBequeathId` +
+  `BadExit` + `TaskKillSelf`, then the scheduler has no runnable
+  work and falls into the idle `PauseSystem` path → NULL
+  `gPlatformDriver` → DABT at `FAR=0xEA3FFFC5`.
+
+### Working hypotheses for why `Start` isn't called
+
+1. The USR-mode caller of `TUTask::Init` tests the return value
+   (0xFFFFD822 shows up in r0 at `_MonitorExitSWI`, which might be
+   a real -10206 error, or might just be a stale scratch value) and
+   short-circuits before reaching `Start`. Need to disassemble the
+   calling function and look at its control flow.
+2. The caller's TUTask is a stack local with RAII destructor; if
+   the caller's normal path is "Init → extract task ID → reparent
+   ownership → return ID for a different entity to Start", our
+   hypervisor is breaking the reparenting step and the task dies
+   with the local. `TObjectTable::ReassignOwnership(id=0x15F3,
+   new_owner=0)` does fire (trace 62734), which supports this —
+   but something after that is tearing the task down anyway.
+3. Something in the early kernel boot (before the tracer even
+   installed its trampolines) left a subsystem in a state where
+   this specific path trips a guard. E.g., domains not fully
+   initialised, ports not created, environment "ksrv" not
+   registered.
+
+### Fresh facts that changed the picture
+
+- The "jump table" (VA 0x01A00000+) is the post-shipping ROM-patch
+  thunk mechanism, not a dispatch or registry structure. Jump-table
+  references in code don't imply registration. (Saved to memory as
+  `project_newton_jump_table`.)
+- Newton's `TPlatformDriver` method dispatch is two-level: `this+4`
+  is a `ClassInfo*`, and `ClassInfo+8` is a method-array base; the
+  method lives at `base + offset`. Not a flat C++ vtable. (Saved as
+  `project_newton_object_layout`.)
+
+### Next step (still option (a))
+
+Find the USR-mode function that calls `TUTask::Init` at trace 62397.
+Disassemble it, trace its control flow after the SWI returns, and
+identify why it takes the "skip Start" branch. Candidate approach:
+
+1. From the BL target backtrack — trace 62397's caller PC must be
+   obtainable via the guest's SVC stack walk at the time of the
+   SWI (the stored LR in the kernel TTask frame). `handle_diag_lr`
+   already pulls banked regs, so we can add a one-shot BP to dump
+   the return-to-caller just before the Init SWI dispatch.
+2. Once we have the caller function, single-step through its
+   control flow. Its body should expose the condition that gates
+   the `Start()` call.
+
+Options (b) and (c) from earlier remain as fallback workarounds,
+but the correct fix is wherever the `Start()` is being skipped.
 
 ## Resolved — flash header verify, BIO registers, ROM serial chip, USR-mode tracer (2026-04-22)
 

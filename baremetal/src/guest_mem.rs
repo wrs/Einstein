@@ -649,6 +649,46 @@ pub unsafe fn load_newton_rom() {
         );
     }
 
+    // Rewrite NATIVE_PRIM call sites in the REx from Rd=LR to Rd=R12.
+    //
+    // Einstein's Drivers/NativePrimitives.s macro emits:
+    //     stmdb sp!, {lr}
+    //     mov   lr, #id                ; or: ldr lr, [pc, #4]; .word native_insn
+    //     [add  lr, lr, #impl*0x100]
+    //     mcr   p10, 0, lr, c0, c0, 0  ; Rd = 14 (LR) — current-mode banked
+    //     ldmia sp!, {pc}
+    //
+    // QEMU raspi3b does not propagate the AArch32 current-mode banked
+    // LR into x14 on lower-EL AArch32 → AArch64 EL2 trap entry, so the
+    // MCR fires with ctx.x[14] == 0 instead of the native-call ID the
+    // preceding MOV wrote into LR. That makes every native primitive
+    // decode as (driver=0, subfn=0) — the null-primitive test slot —
+    // and the real flash/platform/etc. handlers are never reached.
+    //
+    // Fix at load time: rewrite every MCR p10 Rd=LR in the REx to use
+    // Rd=R12 (IP, non-banked and call-clobbered per AAPCS), and rewrite
+    // the matching MOV / ADD / LDR that produced LR's value to target
+    // R12 instead. LR is still pushed/popped by the outer STMDB/LDMIA
+    // so control-flow return is unchanged; R12 was scratch on entry so
+    // no caller is disturbed. The 32-bit MCR encoding only changes
+    // bits [15:12] (Rd); the DP-immediate encodings additionally change
+    // Rn bits [19:16] on the ADD form.
+    //
+    // See INVESTIGATION.md for the debug trace that exposed this.
+    // SAFETY: operates within the REx window we just loaded; bounds
+    // checked against REX_BE.len().
+    unsafe {
+        let patched = patch_native_prim_mcr_lr_to_r12(
+            rom_ptr,
+            REX_PA_OFFSET as u32,
+            (REX_PA_OFFSET + REX_BE.len()) as u32,
+        );
+        kprintln!(
+            "guest_mem: rewrote {} NATIVE_PRIM MCR/MOV/ADD/LDR sites in REx (Rd=lr → Rd=r12)",
+            patched,
+        );
+    }
+
 
 
     kprintln!(
@@ -829,6 +869,87 @@ unsafe fn patch_und_vector(rom: *mut u32) {
         rom.add(base + 11).write(0xEAFF_FFFE);      // b . (trap)
         rom.add(base + 12).write(0x0400_5F00);      // literal: RAM IPA (pre-MMU)
     }
+}
+
+/// Scan the REx window (PA `start` .. `end`) for Einstein's
+/// `NATIVE_PRIM` MCR p10 call sites (Rd = LR / R14) and rewrite each
+/// triplet to use R12 (IP) instead. See the block comment at the call
+/// site in `load_newton_rom` for why.
+///
+/// Three lead-in patterns are recognised, all targeting LR:
+///   1. `MOV LR, #imm`                (`0xE3A0_EXXX`)
+///   2. `MOV LR, #imm; ADD LR, LR, #imm` (`0xE3A0_EXXX; 0xE28E_EXXX`)
+///   3. `LDR LR, [PC, #imm]`          (`0xE59F_EXXX`)
+///
+/// Each `MCR p10, 0, LR, ...` word (`0xEE00_EA10`) has its Rd field
+/// rewritten to R12 (`0xEE00_CA10`); each identified lead-in word is
+/// rewritten to write to R12 instead of LR.
+///
+/// Returns the number of MCR sites rewritten.
+///
+/// SAFETY: `rom` is the hypervisor-owned ROM backing and `start`/`end`
+/// must bound the REx-loaded range. Reads and writes are word-aligned.
+unsafe fn patch_native_prim_mcr_lr_to_r12(rom: *mut u32, start: u32, end: u32) -> usize {
+    const MCR_P10_LR: u32 = 0xEE00_EA10;
+    const MCR_P10_R12: u32 = 0xEE00_CA10;
+    // DP-immediate: cond 001 opc S Rn Rd imm12. We identify MOV and ADD
+    // by masking out the imm12 and S bit. Encoding for MOV (opcode 0xD):
+    // bits [27:20] = 0b00111010, Rn ignored.
+    // For ADD (opcode 0x4): bits [27:20] = 0b00101000.
+    const MOV_LR_IMM_MASK: u32 = 0xFFFF_F000;
+    const MOV_LR_IMM_BITS: u32 = 0xE3A0_E000; // mov lr, #imm
+    const ADD_LR_IMM_MASK: u32 = 0xFFFF_F000;
+    const ADD_LR_IMM_BITS: u32 = 0xE28E_E000; // add lr, lr, #imm
+    const LDR_LR_PC_MASK:  u32 = 0xFFFF_F000;
+    const LDR_LR_PC_BITS:  u32 = 0xE59F_E000; // ldr lr, [pc, #imm]
+
+    let start_idx = (start / 4) as usize;
+    let end_idx = (end / 4) as usize;
+    let mut patched = 0usize;
+
+    for j in (start_idx + 2)..end_idx {
+        // SAFETY: j < end_idx, and end_idx is word-bounded.
+        let mcr = unsafe { rom.add(j).read() };
+        if mcr != MCR_P10_LR {
+            continue;
+        }
+
+        // Look at the immediately preceding word(s).
+        let prev = unsafe { rom.add(j - 1).read() };
+        let (mov_idx, add_idx) = if (prev & MOV_LR_IMM_MASK) == MOV_LR_IMM_BITS {
+            (j - 1, None)
+        } else if (prev & ADD_LR_IMM_MASK) == ADD_LR_IMM_BITS {
+            // Need `mov lr, #id` two words back.
+            let prev2 = unsafe { rom.add(j - 2).read() };
+            if (prev2 & MOV_LR_IMM_MASK) != MOV_LR_IMM_BITS {
+                continue;
+            }
+            (j - 2, Some(j - 1))
+        } else if (prev & LDR_LR_PC_MASK) == LDR_LR_PC_BITS {
+            (j - 1, None)
+        } else {
+            continue;
+        };
+
+        // Rewrite Rd field (bits [15:12]) of the lead-in word from E to C.
+        // For ADD we also rewrite Rn (bits [19:16]) from E to C so
+        // `add lr, lr, #imm` becomes `add r12, r12, #imm`.
+        let lead = unsafe { rom.add(mov_idx).read() };
+        let new_lead = (lead & !0x0000_F000) | 0x0000_C000;
+        unsafe { rom.add(mov_idx).write(new_lead); }
+
+        if let Some(ai) = add_idx {
+            let add = unsafe { rom.add(ai).read() };
+            let new_add = (add & !0x000F_F000) | 0x000C_C000;
+            unsafe { rom.add(ai).write(new_add); }
+        }
+
+        let new_mcr = MCR_P10_R12;
+        unsafe { rom.add(j).write(new_mcr); }
+        patched += 1;
+    }
+
+    patched
 }
 
 /// Swap the trampoline's save-slot literal from the pre-MMU RAM IPA

@@ -42,13 +42,14 @@ const VTABLES_32BIT: [u32; 3] = [0x0001_E3D4, 0x0001_E3E0, 0x0001_E180];
 pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
     match subfn {
         0x01 => identify(ctx, pc),
-        0x02 | 0x03 | 0x04 | 0x05 | 0x06 | 0x07 | 0x0A | 0x0C => {
+        0x02 | 0x03 | 0x04 | 0x05 | 0x06 | 0x07 | 0x0A | 0x0C | 0x0E => {
             ctx.x[0] = 0;
         }
         0x08 => write(ctx, pc),
         0x09 => start_erase(ctx, pc),
         0x0B => is_erase_complete(ctx, pc),
         0x0D => begin_write(ctx, pc),
+        0x10 => do_erase(ctx, pc),
         _ => {
             kprintln!(
                 "*** flash_driver: unknown subfn {:#x} @PC={:#x} r1={:#x} r2={:#x} r3={:#x}",
@@ -104,25 +105,24 @@ fn write(ctx: &mut TrapContext, pc: u32) {
     let mask = ctx.x[2] as u32;
     let addr = ctx.x[3] as u32;
 
-    // flashRange pointer at [sp+4]; first word of *flashRange is
-    // the virtual table address — 32-bit vs. 16-bit lane detection.
+    // Einstein's TNativePrimitives reads `flashRange` from `*(r13 + 4)`
+    // — the 5th argument the caller pushed before BL'ing into the ROM
+    // vtable trampoline. Doing that read from EL2 is unreliable on
+    // QEMU raspi3b: the AArch32 SVC-mode banked SP is not propagated
+    // into any of the AArch64 SP views (ctx.x[13] / SP_EL0 / SP_EL1
+    // disagree, with SP_EL0 = SP_EL1 = 0 and ctx.x[13] pointing into
+    // an already-popped stack region that reads poison).
     //
-    // QEMU raspi3b doesn't reliably propagate the AArch32 banked R13
-    // to AArch64 x13 on exception entry (see the similar workaround
-    // comment in trap.rs for the UND/DIAG paths). Read SP_svc through
-    // the AArch64 banked-register alias instead — native primitives
-    // are only ever called from the Newton kernel in SVC mode.
-    let sp = read_sp_svc() as u32;
-    let flash_range = match read_guest_word(sp + 4) {
-        Some(v) => v,
-        None => {
-            kprintln!(
-                "*** flash_driver.Write: cannot read flashRange at SP+4 = {:#x} @PC={:#x}",
-                sp + 4, pc
-            );
-            cpu::halt();
-        }
-    };
+    // Workaround: every caller of the `TFlashDriver::Write` vtable
+    // trampoline at 0x00384790 is a `T{8,16,32}BitFlashRange::DoWrite`
+    // method whose prologue saves `this` into r4 (`mov r4, r0`). `this`
+    // is the TFlashRange instance — the flashRange pointer. r4 is
+    // callee-saved per AAPCS, so it survives the intermediate vtable
+    // BL and the NATIVE_PRIM `stmdb sp!, {lr}` and still holds the
+    // flashRange at MCR trap entry. Read it from ctx.x[4]. If a
+    // future caller outside DoWrite invokes TFlashDriver::Write, the
+    // vtable first-word check below will catch the mismatch.
+    let flash_range = ctx.x[4] as u32;
     let v_table = match read_guest_word(flash_range) {
         Some(v) => v,
         None => {
@@ -225,6 +225,30 @@ fn begin_write(ctx: &mut TrapContext, _pc: u32) {
     }
 }
 
+/// TEinsteinFlashDriver::DoErase(start=r1, size=r2). Erase a range
+/// of bytes (set to 0xFF). Mirrors Einstein's case 0x10 in
+/// `TNativePrimitives::ExecuteFlashDriverNative`: returns 0 on success,
+/// `kError_Flash_AddressOutOfRange` if `start` is outside a flash bank
+/// or the range doesn't fit.
+fn do_erase(ctx: &mut TrapContext, _pc: u32) {
+    let start = ctx.x[1] as u32;
+    let size = ctx.x[2] as u32;
+
+    let pa = match resolve_flash_pa(start) {
+        Some(p) => p,
+        None => {
+            ctx.x[0] = ERR_FLASH_ADDR_OUT_OF_RANGE as u64;
+            return;
+        }
+    };
+
+    if flash::erase_block(pa, size) {
+        ctx.x[0] = 0;
+    } else {
+        ctx.x[0] = ERR_FLASH_ADDR_OUT_OF_RANGE as u64;
+    }
+}
+
 /// Resolve a flash address (either a kernel VA or a flash PA) to the
 /// guest PA within one of the two flash windows. Tries stage-1
 /// translation first; falls back to treating `addr` as a PA if that
@@ -254,36 +278,3 @@ fn read_guest_word(addr: u32) -> Option<u32> {
     guest_mem::read_word_pa(addr)
 }
 
-/// Attempt to read the AArch32 banked SP_svc. QEMU raspi3b's Cortex-A53
-/// model does not implement the AArch64 banked-register MRS encoding
-/// (`S3_4_C4_C2_1` = SP_svc per Arm ARM D13.2.168), and executing it
-/// traps back into EL2 with `EC=0` (undefined instruction). So for now
-/// we fall back to `ctx.x[13]`, which is the AArch32 active-mode R13
-/// as saved at trap entry. For TEinsteinFlashDriver::Write the Newton
-/// kernel always traps in SVC mode, so x13 holds R13_svc at the MCR
-/// instruction's PC.
-///
-/// If future work needs a reliable SP read from any mode, the UND
-/// trampoline pattern (stash banked SP/LR into known RAM slots before
-/// bouncing to EL2) is the escape hatch — see
-/// `trap::DIAG_TAG` / `handle_diag`.
-fn read_sp_svc() -> u64 {
-    ctx_x13()
-}
-
-fn ctx_x13() -> u64 {
-    // Tiny shim: the caller has to go through TrapContext, but at the
-    // MCR native-primitive entry point we're one frame removed from
-    // it. Read the active SP via the AArch64 SP_EL1 register which
-    // mirrors the current AArch32 mode's R13 (verified for SVC).
-    let v: u64;
-    // SAFETY: SP_EL1 is a standard AArch64 system register.
-    unsafe {
-        core::arch::asm!(
-            "mrs {}, sp_el1",
-            out(reg) v,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-    v
-}

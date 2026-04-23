@@ -582,9 +582,21 @@ fn restore_sysregs(h: &Header) {
     write_sysreg64("spsr_und", h.spsr_und as u64);
     write_sysreg64("spsr_irq", h.spsr_irq as u64);
     write_sysreg64("spsr_fiq", h.spsr_fiq as u64);
-    // SAFETY: barrier only.
+    // The guest's stage-1 MMU config just jumped from whatever cold-boot
+    // EL1 state happened to be (all zeros) to the saved post-boot state.
+    // Any TLB entries cached during EL2 setup are stale and will cause
+    // the resumed guest to fault on its own vector table. Invalidate all
+    // EL1 TLB entries (stage-1 + intermediate stage-1→stage-2) for this
+    // VMID, then DSB + ISB so the guest's first fetch sees fresh walks.
+    // SAFETY: TLBI is an unprivileged operation at EL2 that only affects
+    // cached translations.
     unsafe {
-        asm!("dsb ish", "isb", options(nostack, preserves_flags));
+        asm!(
+            "tlbi alle1",
+            "dsb ish",
+            "isb",
+            options(nostack, preserves_flags),
+        );
     }
 }
 

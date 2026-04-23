@@ -111,14 +111,15 @@ fn newton_ticks_to_cntpct(newton_ticks: u32) -> u64 {
 /// Called after any write to match_reg[i] or int_ctrl, and from the IRQ
 /// handler after clearing a fired match bit.
 ///
-/// Also clamps the deadline to a 1 ms fallback heartbeat even if the VIC
+/// Also clamps the deadline to a 16 ms fallback heartbeat even if the VIC
 /// match is far in the future. The non-trapping tick page
 /// (`stage2::TICK_PAGE`) only advances when `stage2::tick_page::update()`
 /// runs, and that is driven off the CNTHP IRQ — if CNTHP is only armed
 /// for rare VIC matches the guest's busy-wait delay loops would spin
-/// forever on a stale tick value. 1 ms is short enough that every
-/// typical guest delay sees at least one update before it times out,
-/// and long enough that the IRQ overhead is negligible (~0.1% host CPU).
+/// forever on a stale tick value. 16 ms (~60 Hz) is fast enough that
+/// early calibration loops see at least one tick update per poll cycle,
+/// and slow enough to keep trace volume manageable once the kernel is
+/// past early boot.
 pub fn rearm() {
     let cnt_hz = read_cntfrq();
     // SAFETY: read-only sysreg.
@@ -127,7 +128,7 @@ pub fn rearm() {
         core::arch::asm!("mrs {}, cntpct_el0", out(reg) now,
             options(nomem, nostack, preserves_flags));
     }
-    let heartbeat_cval = now.wrapping_add(cnt_hz / 1000); // +1 ms
+    let heartbeat_cval = now.wrapping_add(cnt_hz / 64); // ~16 ms
     let cval = match vic::next_pending_match() {
         Some(t) => {
             let vic_cval = newton_ticks_to_cntpct(t);

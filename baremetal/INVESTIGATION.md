@@ -64,12 +64,101 @@ All 22 guest tests pass (the verification agent added two new
 
 Commits: (pending bundle).
 
-## Currently at (2026-04-23, post-UDF-trap)
+## Currently at (2026-04-23, post-SPSR-fix + heartbeat tuning)
 
-**Boot reaches ~trace 20 640 in 80 s, then DABTs at guest PC
-`0x003AE3E4` (inside `SWIBoot`-land) on `LDR R5, [R13, #0xC]` with
-`DFAR = 0x0C001000` — stage-1 translation-fault section.** The
-preceding trace shows:
+**Boot reaches ~trace 335 000 in 90 s** (in-USR `CArrayIterator::Init`
+or similar task-init code) before non-IRQ progress stops. Two
+independent changes in this session:
+
+1. **Timer heartbeat 1 ms → 16 ms** (`src/timer.rs::rearm`). The
+   CNTHP fallback deadline was firing every 1 ms to refresh the
+   non-trapping tick page. Now that the guest is well past the early
+   delay-loop calibration phase, 1 ms was pure IRQ noise; 60 Hz is
+   plenty. Trace volume drops ~5×, and previously-hidden USR-mode
+   work becomes visible in the trace.
+
+2. **`snapshot::restore_sysregs` now issues `TLBI alle1`** before
+   the DSB/ISB. Was missing, and while the stage-1 TLB shouldn't
+   carry anything useful across a fresh EL2 boot, it's the right
+   shape for a complete sysreg restore.
+
+Cold boot (`rm -f /tmp/newton-snapshot-*.bin; cargo run --release
+--features trace,quiet`) now advances through:
+- Early ROM init, REx scan, flash identify/init (as before)
+- SWIBoot / kernel glue storms around trace 20 k (was the SPSR stall
+  before 44578122)
+- Deep userland: `InitDomainsAndEnvironments`, `MemObjManager::
+  FindEnvironmentId`, `BuildDomainsAndHeaps`, `TUMonitor`,
+  `TStackManager::Init`, `TUDomainManager::Init`,
+  `TSharedMemMsg::Init`, `TObjectManager::MonitorProc`,
+  `CList::Search` / `CListIterator` / `CArrayIterator::Init`
+- Eventually the last task's non-IRQ activity stops, IRQ-only loop
+  continues (scheduler fires alarms with no task advancing)
+
+The run does **not** hit `PowerOffAndReboot`, `PauseSystem` on a
+NULL `gPlatformDriver`, or any DIAG halt — so the old Phase B
+stalls (PABT at `0x003AE3E4`, PauseSystem idle loop, `SP_svc` stack
+guard) are all resolved. What's unclear is whether the new
+post-trace-335k state is a genuine stall or just a long stretch of
+userland code that happens to loop in regions without traced
+functions. Next steps:
+
+- Bump `HB_PRINT_BUDGET` in `trap_irq` or make heartbeat log only
+  on repeated ELR, to sample guest PC during the apparent stall.
+- Check whether any task ever resumes traced-function activity —
+  run 5+ minutes cold-boot and count distinct traced-fn PCs over
+  time.
+- If the task is genuinely stuck, install a guest BP near the last
+  traced PC (e.g. start of `CArrayIterator::Init`) to catch the
+  faulting instruction.
+
+## Known broken — snapshot resume + tracer (2026-04-23)
+
+Snapshots silently corrupt resume when the `trace` feature is on.
+Observed symptoms:
+
+- Save taken while guest is at PC inside the tracer trampoline pool
+  (`0x00900000..0x00E00000`) or UND stub (`0x00FFFFE0`) in some
+  non-SVC mode.
+- Resume loads the snapshot, ERETs to the saved PC, and the guest
+  immediately lands at PC=0x0C (PABT vector) in ABT mode and
+  steady-state loops there without the HVC patch at 0x0C ever
+  firing.
+- `AT S12E1R` shows stage-1 permission fault for VA=0x0C (guest
+  kernel's post-MMU map doesn't keep VA=0x0C executable — at
+  cold-boot time the guest never took a PABT so this didn't matter),
+  so the guest can't even fetch its own PABT vector, and loops at
+  PC=0xC with stage-1 PABTs that guest-handles itself.
+
+Root cause is the combination of:
+1. Tracer saves at PCs that are fragile to mid-execution restore
+   (tracer trampoline slots, UND stub body).
+2. QEMU raspi3b's flaky AArch32↔AArch64 banked-SP/LR plumbing means
+   saved `ctx.x[13]` / `ctx.x[14]` may not fully reflect SP/LR of
+   the guest's active mode, and non-active modes' banked SPs aren't
+   saved at all.
+3. Guest stage-1 maps VA=0x0C without execute permission once MMU
+   is fully up — on cold boot this is fine because the guest never
+   PABTs, but on resume we trigger a PABT on something and it can't
+   unwind.
+
+Workaround for now: cold-boot every run with tracer on. Per
+CLAUDE.md: "Tracing runs are cold-boot runs — clear
+`/tmp/newton-snapshot-*.bin` before the first boot."
+
+Proper fix would need: (a) save banked SP/LR for all modes, (b)
+gate autosave to exclude PCs inside tracer trampolines / stubs, or
+(c) detect the PABT-at-VA-0xC on resume and rewrite the guest's
+page tables to map the vector page executable.
+
+## Previously-current — DABT at 0x003AE3E4 (pre-SPSR-fix)
+
+**Boot previously wedged ~trace 20 640 in 80 s, then DABT'd at guest
+PC `0x003AE3E4` (inside `SWIBoot`-land) on `LDR R5, [R13, #0xC]`
+with `DFAR = 0x0C001000`.** This was the symptom of the QEMU
+`msr spsr_el2` SPSR_EL1 clobber (see "Resolved — QEMU `msr spsr_el2`
+clobbers SPSR_EL1" above, landed in 44578122). The preceding trace
+showed:
 
 ```
 trace 20 632  SMemCopyToSharedSWI   (usr)

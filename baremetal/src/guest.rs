@@ -48,9 +48,18 @@ unsafe fn configure_el2_traps() {
                               //        (AArch32) or Device (AArch64),
                               //        which makes them incoherent with
                               //        the hypervisor's own Normal-WB
-                              //        view of the same DRAM. Falls off
-                              //        automatically once the guest
-                              //        enables its stage-1 MMU.
+                              //        view of the same DRAM. DC=1 is
+                              //        NOT harmless once the guest turns
+                              //        its MMU on: per DDI 0487 D13.2.50
+                              //        it also forces SCTLR_EL1.M to
+                              //        behave as 0 for the Non-secure
+                              //        EL1&0 translation regime — i.e.
+                              //        the guest's stage-1 page tables
+                              //        are ignored from EL2's side. So
+                              //        `set_dc_for_stage1_off(false)` is
+                              //        called at the M=0→M=1 rising edge
+                              //        (and the inverse at the falling
+                              //        edge of a soft reboot).
         hcr |= 1u64 << 3;     // FMO:   route physical FIQ to EL2
         hcr |= 1u64 << 4;     // IMO:   route physical IRQ to EL2
         hcr |= 1u64 << 5;     // AMO:   route SError to EL2
@@ -89,6 +98,29 @@ unsafe fn configure_el2_traps() {
         // (see Arm ARM "MIDR_EL1, Main ID Register").
         asm!("msr vpidr_el2, {}", "isb",
             in(reg) 0x4401_A100u64,
+            options(nostack, preserves_flags));
+    }
+}
+
+/// Toggle HCR_EL2.DC. Set (true) while the guest's stage-1 MMU is
+/// disabled to force its data accesses to Normal-WB so they share the
+/// hypervisor's cache view of DRAM. Cleared (false) at the M=0→M=1
+/// transition: with DC=1 the guest's own stage-1 translation is
+/// suppressed from EL2's side (DDI 0487 D13.2.50), which breaks every
+/// guest VA→IPA that differs from identity — e.g. the post-MMU UND
+/// trampoline's save slot at VA 0x0C00_4F00 → IPA 0x0400_5F00.
+pub fn set_dc_for_stage1_off(enable: bool) {
+    // SAFETY: single bit in HCR_EL2; read-modify-write, ISB barrier.
+    unsafe {
+        let mut hcr: u64;
+        asm!("mrs {}, hcr_el2", out(reg) hcr,
+            options(nomem, nostack, preserves_flags));
+        if enable {
+            hcr |= 1u64 << 12;
+        } else {
+            hcr &= !(1u64 << 12);
+        }
+        asm!("msr hcr_el2, {}", "isb", in(reg) hcr,
             options(nostack, preserves_flags));
     }
 }

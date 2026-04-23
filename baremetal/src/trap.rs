@@ -2017,6 +2017,16 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
             cp15::write_sctlr_el1(value as u64);
             log_sctlr_write(value);
             if was_off && now_on {
+                // Drop HCR_EL2.DC. While the guest ran with stage-1
+                // off, DC=1 gave its data accesses Normal-WB semantics
+                // so they hit the same cache lines the hypervisor
+                // writes. But DC=1 also suppresses the guest's stage-1
+                // translation from EL2's side (DDI 0487 D13.2.50):
+                // leaving it set past this point means every non-
+                // identity VA → IPA mapping the guest sets up (the
+                // UND trampoline's save slot being the first one we
+                // hit) falls through as VA=IPA and stage-2-faults.
+                crate::guest::set_dc_for_stage1_off(false);
                 guest_mem::fix_stage1_xn_bits();
                 maybe_dump_l1_once();
                 // Swap the UND trampoline's save-slot literal to the
@@ -2037,6 +2047,10 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
             // after a soft reboot stores to VA 0x0C00_4F0C with MMU
             // off, which faults at an unmapped IPA.
             if !was_off && !now_on {
+                // Soft reboot: the guest turned its stage-1 MMU off.
+                // Re-enable HCR_EL2.DC so data accesses stay Normal-WB
+                // cacheable while we're back in the "MMU off" regime.
+                crate::guest::set_dc_for_stage1_off(true);
                 // SAFETY: single-word ROM-backing write under the
                 // same paused-guest invariant as the original patch.
                 unsafe { guest_mem::install_und_vector_swap_pre_mmu(); }

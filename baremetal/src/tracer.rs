@@ -190,14 +190,53 @@ fn rewrite_first_insn(orig: u32, orig_pc: u32) -> Option<(u32, u32, bool)> {
         return Some((new_insn, target, true));
     }
 
+    // ADD/SUB Rd, PC, #imm (the ADR idiom, ARMv7 data-processing
+    // form). Some Newton accessors are just
+    //     sub r0, pc, #K
+    //     mov pc, lr
+    // — compile-time `ClassInfo()` / static-data getters
+    // (TClassInfoRegistryImpl::ClassInfo at 0x38607c is an example).
+    // Copying verbatim into the trampoline slot silently returns a
+    // pointer into the tracer pool instead of the ROM, and that
+    // garbage propagates through the whole downstream chain as a
+    // corrupted `this`. Rewrite to a pc-relative literal load so
+    // slot[1] puts (orig_pc + 8 ± imm12) into Rd.
+    //
+    // Data-processing immediate encoding:
+    //     cccc 001 opcode S Rn    Rd    imm12
+    //     ADD: opcode = 0b0100 → bits 24:21 = 0100
+    //     SUB: opcode = 0b0010 → bits 24:21 = 0010
+    // cond=AL, I=1, S=0, Rn=PC=0xF gives:
+    //     ADD:  0xE28F_Rxxx   (mask 0x0FFF_0000 == 0x028F_0000)
+    //     SUB:  0xE24F_Rxxx   (mask 0x0FFF_0000 == 0x024F_0000)
+    // imm12 is an 8-bit value rotated right by 2*rot4 (bits 11:8),
+    // per the modified-immediate encoding.
+    let is_add_pc = (orig & 0x0FFF_0000) == 0x028F_0000;
+    let is_sub_pc = (orig & 0x0FFF_0000) == 0x024F_0000;
+    if is_add_pc || is_sub_pc {
+        let rd = (orig >> 12) & 0xF;
+        if rd == 0xF { return None; }  // PC destination — bail.
+        let imm8 = orig & 0xFF;
+        let rot = ((orig >> 8) & 0xF) * 2;
+        let imm = imm8.rotate_right(rot);
+        let pc_plus_8 = orig_pc.wrapping_add(8);
+        let literal = if is_add_pc {
+            pc_plus_8.wrapping_add(imm)
+        } else {
+            pc_plus_8.wrapping_sub(imm)
+        };
+        // Rewrite to LDR Rd, [pc, #0]; literal goes in slot[3].
+        let new_insn = 0xE59F_0000 | (rd << 12);
+        return Some((new_insn, literal, false));
+    }
+
     // Everything else: copy verbatim. Handles PUSH / STMFD, SUB sp imm,
     // MOV ip sp, MOV Rd imm, MVN Rd imm, MOV Rd Rm, MRC/MCR p15, STR lr
     // [sp,#-4]!, and any other non-PC-relative function entry insn.
-    // Instructions that DO read PC but aren't matched above (e.g. a raw
-    // `ADR Rd, #imm` encoded as ADD Rd, pc, #imm) will execute with the
-    // trampoline's PC — their semantics shift. These are vanishingly
-    // rare as function entries in the Newton kernel; if one shows up,
-    // the HVC will log it but subsequent execution will be wrong.
+    // Remaining PC-relative forms we DON'T handle (MOV Rd, PC; LDR
+    // with register offset involving PC; anything that branches via
+    // PC) are very rare as function entries — if one shows up, the
+    // HVC will log it but subsequent execution will be wrong.
     Some((orig, 0, false))
 }
 

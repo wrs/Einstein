@@ -105,13 +105,15 @@ fn fn_name(i: usize) -> &'static str {
 ///   - VA 0x00..0x20: ARM vector table. The reset vector at 0x00 runs
 ///     before we've built trampolines, and vectors at 0x04/0x0C/0x10 are
 ///     claimed by the hypervisor's UND / DIAG patches.
-///   - VA 0x00FF_FF00..0x00FF_FF74: UND trampoline + ROM-patch injection
-///     stubs (see guest_mem::patch_und_vector and rom_patches::*).
+///   - VA 0x00FF_FF00..0x00FF_FFB0: UND trampoline (0xFF00..0xFF80) +
+///     SBA post-emulation trampoline (0xFF80..0xFFB0) + ROM-patch
+///     injection stubs. See guest_mem::patch_und_vector and
+///     rom_patches::*.
 ///   - PowerOffAndReboot: rom_patches installs a one-word HVC canary
 ///     there; the tracer overwriting it would silently mask the trap.
 pub fn in_reserved_range(addr: u32) -> bool {
     if addr < 0x0000_0020 { return true; }
-    if (0x00FF_FF00..0x00FF_FF80).contains(&addr) { return true; }
+    if (0x00FF_FF00..0x00FF_FFB0).contains(&addr) { return true; }
     if addr == crate::rom_patches::POWEROFF_REBOOT_PC { return true; }
     false
 }
@@ -358,20 +360,245 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
         ctx.x[14] as u32,
     );
 
-    // Targeted one-shot-style dump: for the specific USR-mode call sites
-    // we're investigating (KSRVTask spawn path — TUTask::Init + FMNewStack
-    // caller in UserBoot), also dump the guest's stack-top so we can see
-    // args 5..7 (env_id, priority, name) that are passed via the stack.
-    // ctx.x[13] carries SP_usr in the AArch32→AArch64-on-HVC path; reading
-    // it and translating through stage-1 gives us the caller's stack frame.
-    // Gated on mode=USR and the function index so we don't spam the log.
+    // Targeted one-shot-style dumps. Gated on function index to avoid log
+    // spam.
+    let fa = fn_addr(idx);
     if mode == 0x10 {
-        let fa = fn_addr(idx);
         if fa == 0x0025BC14 || fa == 0x0025BBD4 || fa == 0x001F8EAC {
+            // KSRVTask spawn path — dump guest stack so we see env_id /
+            // name / priority stack args passed to TUTask::Init /
+            // FMNewStack.
             dump_guest_stack(ctx.x[13] as u32, 8);
         }
     }
+
+    // SVC-mode SP tracking: the Phase-B stall is a stage-1 DABT at
+    // DFAR=0x0c001000 with pre-abort mode = SVC. That's the guard
+    // page right below the SVC stack at 0x0c002000. Log SP at each
+    // SVC-mode function entry in the relevant call chain so we can
+    // see exactly where SP_svc crosses the boundary.
+    if mode == 0x13 {
+        match fa {
+            0x003AD698  // SWIBoot
+            | 0x001DFDE8 // LowLevelCopyDoneFromKernelGlue
+            | 0x001E0754 // ConvertMemOrMsgIdToObj
+            | 0x00191E80 // LocalToGlobalId
+            | 0x00191F14 // ConvertIdToObj
+            | 0x00319F14 // TObjectTable::Get
+            | 0x0009C9B0 // TDoubleQContainer::Add
+            | 0x0009C9AC // TDoubleQContainer::CheckBeforeAdd
+            | 0x0009C7C4 // TDoubleQContainer::RemoveFromQueue
+            | 0x001DFA70 // SMemCopyToKernelGlue
+                => {
+                kprintln!(
+                    "  @{} SP_svc={:#010x} LR={:#010x}",
+                    fn_name(idx), ctx.x[13] as u32, ctx.x[14] as u32
+                );
+            }
+            _ => {}
+        }
+    }
+
+    // USR-mode SMemCopyToSharedSWI entry: the Phase-B stall is here.
+    // Dump SP, LR, and the stage-1 mappings around SP so we can see
+    // which USR stack pages are actually backed. One-shot to avoid
+    // flooding if we ever get past the stall and re-enter.
+    if fa == 0x003AE3DC && mode == 0x10 {
+        static DONE: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        if !DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            let sp = ctx.x[13] as u32;
+            let lr = ctx.x[14] as u32;
+            kprintln!(
+                "  @SMemCopyToSharedSWI entry: SP={:#010x} LR={:#010x}",
+                sp, lr
+            );
+            // Walk the USR task's TT for every 4-KiB slot in
+            // 0x0c000000..0x0c010000 so we see the actual stack layout.
+            let ttbr: u64;
+            unsafe {
+                core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr,
+                    options(nomem, nostack, preserves_flags));
+            }
+            let l1_base = (ttbr & 0xFFFF_C000) as u32;
+            let l1_c0 = guest_mem::read_word_pa(l1_base + 0xC0 * 4).unwrap_or(0);
+            kprintln!(
+                "  L1[0xC0] @ {:#010x} = {:#010x}",
+                l1_base + 0xC0 * 4, l1_c0
+            );
+            if (l1_c0 & 3) == 1 {
+                let l2_pa = l1_c0 & 0xFFFF_FC00;
+                kprintln!("  L2 for 0x0c000000..0x0c010000 (coarse table @ PA {:#010x}):", l2_pa);
+                for i in 0..16u32 {
+                    let e = guest_mem::read_word_pa(l2_pa + i * 4).unwrap_or(0);
+                    let va = 0x0c000000u32 + i * 0x1000;
+                    let kind = match e & 3 {
+                        0 => "fault",
+                        1 => "large",
+                        2 | 3 => "small",
+                        _ => unreachable!(),
+                    };
+                    let pa = if (e & 3) == 1 { e & 0xFFFF_0000 }
+                             else if (e & 3) != 0 { e & 0xFFFF_F000 }
+                             else { 0 };
+                    kprintln!(
+                        "    L2[{:#04x}] VA={:#010x} raw={:#010x} ({}) -> PA {:#010x}",
+                        i, va, e, kind, pa
+                    );
+                }
+            }
+        }
+    }
+    if fa == 0x0011D254 {
+        // PrimGetEnvDomainName (kernel-side). We want to observe both
+        // the env-config table source AND the byte-level state of the
+        // fKernelParams buffer the kernel will read/write. One-shot.
+        static DONE: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        if !DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            dump_env_config_table();
+            dump_param_buffer(ctx.x[2] as u32, ctx.x[3] as u32);
+        }
+    }
+    if fa == 0x0011D7B8 {
+        // USR-side MemObjManager::GetEnvDomainName entry. One-shot.
+        static DONE: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        if !DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            let gcg = guest_mem::read_word_va(0x0c10105c).unwrap_or(0);
+            let r8 = gcg.wrapping_sub(0x54);
+            kprintln!("  USR GetEnvDomainName entry: gCurrentGlobals={:#010x} r8={:#010x}",
+                      gcg, r8);
+        }
+    }
+    if fa == 0x0011D544 {
+        // First RegisterEnvironmentId — this runs right after USR
+        // GetEnvDomainName wrapper returns. Dump the fParams buffer
+        // via the LIVE TTBR0 (not the hardcoded 0x04000000 in
+        // guest_mem::translate_va) so we see whatever the current task
+        // actually has mapped at VA 0x0c111d0c.
+        static DONE: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        if !DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            let ttbr: u64;
+            let sctlr: u64;
+            unsafe {
+                core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr,
+                    options(nomem, nostack, preserves_flags));
+                core::arch::asm!("mrs {}, sctlr_el1", out(reg) sctlr,
+                    options(nomem, nostack, preserves_flags));
+            }
+            let gcg = guest_mem::read_word_va(0x0c10105c).unwrap_or(0);
+            kprintln!("  @RegisterEnvironmentId: TTBR0_EL1={:#x} SCTLR.M={} gCurrentGlobals={:#010x}",
+                      ttbr, sctlr & 1, gcg);
+            let fparams = 0x0c111d0cu32;
+            for off in [0x00u32, 0x04, 0x08, 0x0C, 0x10] {
+                let addr = fparams.wrapping_add(off);
+                let word = guest_mem::read_word_va(addr).unwrap_or(0xDEADBEEF);
+                kprintln!("    [{:#010x}] = {:#010x}", addr, word);
+            }
+        }
+    }
     let _ = cpu::halt; // suppress unused-import warning under some cfgs
+}
+
+/// Dump the env-config table source that the kernel's PrimGetEnvDomainName
+/// reads. The kernel's InitCGlobals / PostCGlobalsHWInit selects either the
+/// "small" table (0x0c1011bc, ≤1 MiB RAM) or the "large" table (0x0c1012ac,
+/// >1 MiB RAM) based on GetRamSize; the selected ROM-resident table pointer
+/// lands in *(0x0c1011b8). BuildMemObjDatabase copies entries out of that
+/// table into the runtime memobj database. Dumping both the selector value
+/// and the first few entries helps localize an init-time divergence.
+/// Check whether the shadow_stub patched the byte-access instructions
+/// that matter for the GetEnvDomainName loop. A patched site has its
+/// word replaced with a branch (B / Bcond). The top byte's low nibble is
+/// 0xA for a branch; the high nibble preserves the original condition.
+fn check_byte_access_patches() {
+    let sites: [(u32, u32, &str); 4] = [
+        (0x0011D2BC, 0x05c30000, "PrimGetEnvDomainName: strbeq r0, [r3]"),
+        (0x0011D300, 0xe5c36000, "PrimGetEnvDomainName: strb r6, [r3]"),
+        (0x0011D304, 0xe5c56000, "PrimGetEnvDomainName: strb r6, [r5]"),
+        (0x0011D840, 0xe5d8100d, "MemObjManager::GetEnvDomainName: ldrb r1, [r8, #13]"),
+    ];
+    for (pa, orig_insn, label) in sites {
+        let live = guest_mem::read_word_va(pa).unwrap_or(0xDEAD_BEEF);
+        // Patched sites are a branch — bits [27:25] = 0b101 → (w >> 25) & 7 == 5.
+        let is_branch = ((live >> 25) & 0x7) == 0x5;
+        kprintln!(
+            "  byte_access_check: {:#010x}={:#010x} (orig={:#010x}, is_branch={}) {}",
+            pa, live, orig_insn, is_branch, label
+        );
+    }
+}
+
+/// Dump 32 bytes around a kernel-params buffer address to see what byte
+/// value the kernel actually sees in the flag slot. PrimGetEnvDomainName
+/// receives r2 = &fParams[domain_name_out] and r3 = &fParams[byte_flag_out].
+/// We print both regions so we can compare against what the USR wrapper
+/// will read via LDRB offset+13.
+fn dump_param_buffer(r2: u32, r3: u32) {
+    kprintln!("  param buffers: r2={:#010x} r3={:#010x} delta={}",
+              r2, r3, r3 as i64 - r2 as i64);
+    for (label, addr) in [("r2", r2), ("r3", r3)] {
+        if addr == 0 { continue; }
+        let base = addr & !0x1F;  // round down to 32-byte line
+        let mut buf = [0u32; 8];
+        for i in 0..8 {
+            buf[i] = guest_mem::read_word_va(base.wrapping_add((i as u32) * 4))
+                .unwrap_or(0xDEAD_BEEF);
+        }
+        kprintln!(
+            "  buf({}) @{:#010x}: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+            label, base, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]
+        );
+    }
+}
+
+fn dump_env_config_table() {
+    check_byte_access_patches();
+    // PrimGetEnvDomainName's lookup: iterate `*(0x0c10143c + idx*24)` treating
+    // each 24-byte row as (env_name, ?, ?, ?, list_ptr, list_ptr2). When env
+    // matches, dereference field +16 to get a pointer to a NUL-terminated 4cc
+    // list of domain names.
+    let base = 0x0c10143cu32;
+    let mut buf = [0u32; 96];
+    for i in 0..96 {
+        buf[i] = guest_mem::read_word_va(base.wrapping_add((i as u32) * 4))
+            .unwrap_or(0xDEAD_BEEF);
+    }
+    kprintln!("  env_config: flat table at {:#010x}:", base);
+    for row in 0..8 {
+        let addr = base.wrapping_add((row as u32) * 24);
+        let off = (row * 24) / 4;
+        if off + 5 >= buf.len() { break; }
+        kprintln!(
+            "  [{:#010x}] env={:08x} d0={:08x} d1={:08x} d2={:08x} list={:08x} list2={:08x}",
+            addr, buf[off], buf[off+1], buf[off+2], buf[off+3], buf[off+4], buf[off+5],
+        );
+    }
+
+    // Now dereference each entry's list pointer (field +16) and dump the
+    // domain-name list until we hit a zero terminator. Limit per-list dump
+    // to avoid runaway reads.
+    for row in 0..8 {
+        let off = (row * 24) / 4;
+        if off + 4 >= buf.len() { break; }
+        let env = buf[off];
+        let list_ptr = buf[off + 4];
+        if env == 0 || list_ptr == 0 || list_ptr == 0xDEAD_BEEF { continue; }
+        let mut names = [0u32; 10];
+        for i in 0..10 {
+            names[i] = guest_mem::read_word_va(list_ptr.wrapping_add((i as u32) * 4))
+                .unwrap_or(0);
+            if names[i] == 0 { break; }
+        }
+        kprintln!(
+            "  env {:#010x} list@{:#010x}: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+            env, list_ptr,
+            names[0], names[1], names[2], names[3],
+            names[4], names[5], names[6], names[7],
+        );
+    }
 }
 
 fn dump_guest_stack(sp: u32, words: usize) {

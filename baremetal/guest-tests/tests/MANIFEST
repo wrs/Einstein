@@ -18,3 +18,5 @@ test_platform_driver
 test_screen_blit
 test_snapshot
 test_shadow_stub
+test_spsr_eret
+test_spsr_eret_und

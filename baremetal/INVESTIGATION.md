@@ -3,188 +3,108 @@
 Live notes. Update as we learn more; archive to a dated file when
 we move past the current stall.
 
-## Currently at (2026-04-22, post-PlatformDriver-gap)
+## Resolved — QEMU `msr spsr_el2` clobbers SPSR_EL1 (2026-04-23)
 
-**Boot reaches ~trace 63160 in ~90 s (number varies with wall-clock;
-~198k with the longer historical run), then DABTs at FAR=0xEA3FFFC5
-because `GetPlatformDriver()` returns NULL.** The kernel's
-`TPlatformDriver::PauseSystem` at `0x00387EB8` does:
+Boot previously wedged at `DFAR=0x0c001000` in SVC mode on `pop {r4, r5}`
+at PC `0x003ae3ec` (inside `SMemCopyToSharedSWI`). Einstein's trace
+showed the kernel correctly transitioning SVC → USR between the last
+`LocalToGlobalId (svc)` and `TEnvironment::IncrRefCount (usr)`; our
+hypervisor stayed in SVC mode at the same code point and immediately
+faulted on the user-space `pop` because `SP_svc` happened to land at
+the kernel's stack guard.
 
-```arm
-LDR  R0,  [R0, #4]       ; vtable → ClassInfo pointer
-LDR  R12, [R0, #8]       ; method-array base
-ADD  PC,  R12, #0x38     ; jump to PauseSystem method
+Root cause (verified with targeted test): **QEMU raspi3b's AArch64
+`msr spsr_el2, <val>` from EL2 has a side effect — it clobbers
+SPSR_EL1 (= AArch32 SPSR_svc) with the value being written.** The
+auto-saved SPSR_EL2 on HVC entry doesn't trigger the bug, only the
+explicit `msr` write.
+
+Our `return_to_guest_from_und` in `src/trap.rs` did
+`msr spsr_el2, <pre-UND CPSR>` to set up ERET back to the faulting
+mode. Since the UND trampoline HVCs from UND mode, the written value
+is the pre-UND CPSR — often `0x1d3` (SVC). That pollutes the guest's
+live SPSR_svc from USR (set by the user-mode SVC instruction) → SVC.
+The kernel's subsequent `movs pc, lr` at the SWIBoot epilog restores
+CPSR = SPSR_svc = SVC and stays in SVC at the user caller's return PC.
+`SP_svc` happens to be in the stack-guard region, so the first load
+faults.
+
+Workaround: UND-path return no longer writes SPSR_EL2. Instead, the
+handler writes the target PC to a ROM-resident literal and ERETs into
+a small stub in AArch32 UND mode (SPSR_EL2 left at its auto-saved
+value of `0x1db`). The stub is
+```
+  ldr lr, [pc, #0]    ; lr = target PC from literal
+  movs pc, lr          ; CPSR = SPSR_und (pre-UND), PC = lr
+  <literal>            ; rewritten by Rust handler each ERET
+```
+The architectural `movs pc, lr` copies SPSR_und (preserved since UND
+entry) into CPSR, so the guest's SPSR_svc is never touched by the
+hypervisor. Lives at `0x00FFFFE0` in the ROM trampoline region.
+
+Related QEMU bug discovered along the way: AArch64 ERET to AArch32
+UND doesn't reliably plumb `x14` into `R14_und`, which is why the
+stub uses a literal instead of relying on `ctx.x[14]`.
+
+Also dropped the UND trampoline's SVC-mode bounce (the `msr cpsr_c,
+#0xd3 / mov r0, lr / str / msr cpsr_c, #0xdb` sequence at
+`UND_TRAMP_OFFSET + 0x44`). `UND_SAVE_LR_SVC_IPA` was never read —
+dead code since an earlier refactor — and the bounce would also have
+tripped the QEMU bug if another code path had relied on SPSR_svc.
+
+After the fix, cold boot advances from the old 20 k-trace stall to
+400 k+ trace events in 60 s. The new loop is in scheduler/alarm land
+(`WantSchedule`, `GetClock`, `SetAlarm`, `TDoubleQContainer::Peek`)
+with `GetPlatformDriver` being called repeatedly — which ties back to
+the original PauseSystem idle-loop stall `INVESTIGATION.md` noted
+before the UDF-trap work: `gPlatformDriver` is still NULL.
+
+All 22 guest tests pass (the verification agent added two new
+`test_spsr_eret*` regression tests covering the bug).
+
+Commits: (pending bundle).
+
+## Currently at (2026-04-23, post-UDF-trap)
+
+**Boot reaches ~trace 20 640 in 80 s, then DABTs at guest PC
+`0x003AE3E4` (inside `SWIBoot`-land) on `LDR R5, [R13, #0xC]` with
+`DFAR = 0x0C001000` — stage-1 translation-fault section.** The
+preceding trace shows:
+
+```
+trace 20 632  SMemCopyToSharedSWI   (usr)
+trace 20 633  SWIBoot               (svc)
+trace 20 634  SMemCopyToKernelGlue  (svc)
+trace 20 635  ConvertMemOrMsgIdToObj
+trace 20 636  LocalToGlobalId
+trace 20 637  TObjectTable::Get
+trace 20 638  TDoubleQContainer::Add
+...
+trace 20 644  ConvertIdToObj
+trace 20 645  LocalToGlobalId       → DABT on LDR [R13, #0xC]
 ```
 
-On a NULL `this`, `R0 = *(VA 4) = 0xEA3FFFBD` (our UND-vector patch
-word), then `LDR R12, [R0, #8]` dereferences `0xEA3FFFC5` → unmapped
-→ DABT. (Newton's dispatch is a two-level `this`→ClassInfo→method-array
-lookup, not a flat C++ vtable — see memory `project_newton_object_layout`.)
+The path is SMem user→kernel transition. Something in the SWI bounce
+is leaving SP pointing at a VA the kernel hasn't mapped; needs
+root-cause on which frame's SP is stale.
 
-Trace tail:
+This replaced the earlier `GetPlatformDriver() returns NULL` /
+`TPlatformDriver::PauseSystem` idle-loop stall at trace 63 160 — that
+was downstream of the shadow-stub flag-corruption bug in
+`MemObjManager::PrimGetEnvDomainName` (see resolved-fixes below).
+With the UDF-trap emulator in place, PRIM returns correct results,
+ksrv env has its domains, and `InitialKSRVTask` / `InitClasses` /
+`TLoader::TheMain` progress — so the boot takes a different (and
+shorter-through-tracer-events) path before hitting this new stall.
 
-```
-trace 63151 DoSchedulerSWI   (usr)    — idle yield
-trace 63152 SWIBoot
-trace 63153 SleepTask        (usr)
-trace 63154 PauseSystem      (usr)    — ROM wrapper at 0x001925DC
-trace 63155 GenericSWI r0=0x45       — SWI #0x45 (PauseSystem kernel call)
-trace 63156 SWIBoot
-trace 63158 PauseSystemKernelGlue
-trace 63159 SpecialCPUIntDisable
-trace 63160 GetPlatformDriver        — returns 0 (*(0x0C101764) is NULL)
-trace 63161 TPlatformDriver::PauseSystem r0=0 → DABT FAR=0xEA3FFFC5
-```
-
-The path is the idle loop: scheduler has nothing to run, so
-`SleepTask` → `PauseSystem()` (ROM wrapper at `0x001925DC`) → SWI 0x45
-→ `PauseSystemKernelGlue` → `SpecialCPUIntDisable` + guarded call to
-`TPlatformDriver::PauseSystem` on `gPlatformDriver`. The ROM
-wrapper's NULL guard uses `gWantDeferred` (at `0x0C101028`), NOT
-`gPlatformDriver` — so a null driver isn't caught. On real hardware
-`gPlatformDriver` is populated by `LoadPlatformDriver()` long before
-the first idle, and Einstein mirrors this.
-
-Root cause: **`TLoader::TheMain` (`0x0011401C`) never runs**, so
-`LoadPlatformDriver()` (called from its body at ROM offset 0x114038)
-never runs, so `NewByName("TPlatformDriver", "TMainPlatformDriver")`
-never populates `gPlatformDriver`.
-
-What we've verified (2026-04-22):
-- `LoadPlatformDriver` has 0 tracer hits.
-- `TLoader::MainConstructor` (`0x00113CAC`) has 0 hits.
-- `TheMain__7TLoaderFv` (`0x0011401C`) has 0 hits.
-- Einstein.rex TOC has only `fdrv/FDRV/pkgl` entries — **no**
-  class-registration entry for `TMainPlatformDriver`. The class must
-  therefore be registered via the ROM-resident path, which only the
-  Loader task exercises.
-- The jump-table trampoline `B 0x0011401C` for `TLoader::TheMain`
-  lives at ROM PA `0xAA84` (computed from ROM imm24 + VA
-  `0x01B15A84`, where stage-1 maps `0x01B15A84 → PA 0xAA84`). Only
-  one ROM reference to it: `0x0001FC74: B 0x01B15A84` — part of the
-  big "B-trampoline table" at `0x0001FC00..0x0001FCFC+` which looks
-  like the ROM's jump-table *source* (copied/installed at boot).
-- Only one `TUTask::Init` call fires in a full run (trace 62397),
-  targeting `InitialKSRVTask` (`0x01AFDE80`). The Loader world task
-  is never constructed.
-
-Candidate interpretations (none yet verified):
-
-1. The ROM-resident ClassInfo for `TLoader` is reached via a static
-   init table we haven't found. Search so far:
-   - No ROM BL to `0x0011401C` directly (only the `B 0x01B15A84` at
-     `0x0001FC74`).
-   - No literal-u32 reference to `0x0011401C`, `0x00113CAC/B0/B4`,
-     `0x01B15A84`, `0x0001FC44/68/6C/74/78` in either ROM or REx.
-   - The "TLoader" string (or its per-word-swapped form) does not
-     appear anywhere in ROM or REx — the class does not register by
-     name.
-
-2. Some init step we're skipping would call a kernel API that
-   spawns the Loader task. InitGlobalWorld (trace 20530) runs, then
-   kernel-heap / object-manager init, and eventually the scheduler
-   starts. The Loader-task spawn must be somewhere in this sequence
-   and isn't happening.
-
-3. Einstein's JIT may short-circuit the idle stall by never actually
-   reaching `PauseSystem`, OR it may follow the same path but
-   effectively NOP it (Einstein's `ExecutePlatformDriverNative`
-   case 0x0D just calls `mEmulator->PauseSystem()` — but that only
-   fires if `gPlatformDriver` is non-NULL, so Einstein must also
-   populate it somehow).
-
-### Deeper root cause (2026-04-22 afternoon)
-
-Kept digging past the "TLoader never runs" observation. The actual
-failure is one level up: **the kernel-server task itself never
-starts, even though it gets `Init`'d**.
-
-Facts established:
-
-- ROM's `InitClasses__Fv` (0x002BEDD8) is called from `InitObjects__Fv`
-  (0x0031C608), which is called from `TNewtWorld::MainConstructor`
-  (0x0030D20C). In our trace none of these three run — so no
-  `TClassInfoRegistryImpl::Register` call ever fires.
-- 73 ROM ClassInfo structures exist in the `0x38XXXX` band
-  (discovered by brute-force pattern scan), including
-  `TVoyagerPlatform` at 0x00387D18 (the fallback `LoadPlatformDriver`
-  would create). None are registered in our run — `Register` has 0
-  hits.
-- `TPrivatePackageIterator` + `PrivateClassInfoInterfaceName` run
-  early and iterate 14 ClassInfos in the REx / high-ROM (`0x7a5600`,
-  `0x800448..0x8039B8`, `0x9589E8`) — package-side registrations,
-  distinct from the 73 kernel-class table. This path works; it's
-  the *kernel* side that's dead.
-- Only one `TUTask::Init` call in a 90-s boot (trace 62397). It sets
-  up the KSRV task with entry `InitialKSRVTask` (JT 0x01AFDE80 →
-  direct 0x002F7198), stack 0x6800, env "ksrv" (0x6B737276).
-  Everything looks healthy: `TTask::TTask` allocates the object
-  (ID 0x15F3), `TTask::Init` (0x002522B0) assigns fn+stack+env,
-  `ObjectTable::Add` registers it.
-- `TUTask::Start` (0x0025BCC4) is **never called** — the trampoline
-  is installed (trace would fire on first byte) but the function is
-  never executed. `InitialKSRVTask` itself never runs.
-- Sequence observed between task creation and destruction (~700
-  traces apart): `TUTask::Init` → `TUSharedMem::Init` →
-  `TUObject::MakeObject` → SWI dispatch → `TTask::TTask` in SVC →
-  `TTask::Init` → `ObjectTable::Add`(id=0x15F3) → `_MonitorExitSWI`
-  r0=0xFFFFD822 → … → `TUObject::~TUObject` (trace 63074, on the
-  same 0xC111CF0 TUTask object) → `DeleteTask` → `TTask::~TTask` →
-  `UnScheduleTask` → `FreeStack` → `operator delete`. The task is
-  **created, briefly attached, then torn down without running.**
-- After KSRV teardown the Global-World task runs `SetBequeathId` +
-  `BadExit` + `TaskKillSelf`, then the scheduler has no runnable
-  work and falls into the idle `PauseSystem` path → NULL
-  `gPlatformDriver` → DABT at `FAR=0xEA3FFFC5`.
-
-### Working hypotheses for why `Start` isn't called
-
-1. The USR-mode caller of `TUTask::Init` tests the return value
-   (0xFFFFD822 shows up in r0 at `_MonitorExitSWI`, which might be
-   a real -10206 error, or might just be a stale scratch value) and
-   short-circuits before reaching `Start`. Need to disassemble the
-   calling function and look at its control flow.
-2. The caller's TUTask is a stack local with RAII destructor; if
-   the caller's normal path is "Init → extract task ID → reparent
-   ownership → return ID for a different entity to Start", our
-   hypervisor is breaking the reparenting step and the task dies
-   with the local. `TObjectTable::ReassignOwnership(id=0x15F3,
-   new_owner=0)` does fire (trace 62734), which supports this —
-   but something after that is tearing the task down anyway.
-3. Something in the early kernel boot (before the tracer even
-   installed its trampolines) left a subsystem in a state where
-   this specific path trips a guard. E.g., domains not fully
-   initialised, ports not created, environment "ksrv" not
-   registered.
-
-### Fresh facts that changed the picture
-
-- The "jump table" (VA 0x01A00000+) is the post-shipping ROM-patch
-  thunk mechanism, not a dispatch or registry structure. Jump-table
-  references in code don't imply registration. (Saved to memory as
-  `project_newton_jump_table`.)
-- Newton's `TPlatformDriver` method dispatch is two-level: `this+4`
-  is a `ClassInfo*`, and `ClassInfo+8` is a method-array base; the
-  method lives at `base + offset`. Not a flat C++ vtable. (Saved as
-  `project_newton_object_layout`.)
-
-### Next step (still option (a))
-
-Find the USR-mode function that calls `TUTask::Init` at trace 62397.
-Disassemble it, trace its control flow after the SWI returns, and
-identify why it takes the "skip Start" branch. Candidate approach:
-
-1. From the BL target backtrack — trace 62397's caller PC must be
-   obtainable via the guest's SVC stack walk at the time of the
-   SWI (the stored LR in the kernel TTask frame). `handle_diag_lr`
-   already pulls banked regs, so we can add a one-shot BP to dump
-   the return-to-caller just before the Init SWI dispatch.
-2. Once we have the caller function, single-step through its
-   control flow. Its body should expose the condition that gates
-   the `Start()` call.
-
-Options (b) and (c) from earlier remain as fallback workarounds,
-but the correct fix is wherever the `Start()` is being skipped.
+Next step: disassemble around `0x003AE3E4` (user has `/tmp/rom.dis`
+from earlier sessions), identify which `SWIBoot` → kernel-glue path
+is landing there with a stale SP, and check whether it's the
+post-Init reparent → Start path for the newly-runnable
+`InitialKSRVTask` (now that PrimGetEnvDomainName returns correctly).
+The previous "TLoader never runs" / "Start never called" analysis
+in earlier revisions of this doc was downstream of the
+flag-corruption bug — superseded by the resolved entry below.
 
 ## Resolved — flash header verify, BIO registers, ROM serial chip, USR-mode tracer (2026-04-22)
 
@@ -299,6 +219,89 @@ The "iterator loop" symptom turned out to be a red herring — the
 at the same `PowerOffAndReboot` site after the same flash-identify
 failure. The iterator was working correctly; the boot was just
 restarting and re-running the early-init code over and over.
+
+## Resolved — shadow-stub flag-preservation via UDF-trap (2026-04-23)
+
+The in-guest shadow-stub approach (emit a trampoline at each
+byte/halfword-access site, replace the original word with `Bcc
+shadow`) survived every earlier Phase-B hurdle but finally broke on
+`MemObjManager::PrimGetEnvDomainName` (ROM `0x0011D2A0..0x0011D34C`).
+The PRIM walks a per-env linked list scanning each entry's byte
+fields with patched `LDRB` / `STRBcond` instructions and then
+dispatches on the flags left behind. Our stub's MMIO-skip gate
+(`CMP <scratch>, #0x10000000; BHS skip_xor; EOR <scratch>, #3`)
+clobbered NZCV, so the caller's `Bcond` immediately after stub
+return took the wrong branch. The guest diverged from Einstein's
+behaviour at `0x0011D2C0` (STRBEQ-patched site): Einstein's JIT sees
+Z=1 and falls into the fast-match exit at `0x0011D308`; we saw the
+wrong-Z path and took the end-of-list-2 exit at `0x0011D328`. The
+cascade: PRIM returned "no match" → ksrv env had no domains →
+`TUTask::Init` → `NewStack` failed with `-10206` → `TUTask::Start`
+skipped → `InitialKSRVTask` never ran → `InitClasses` /
+`TNewtWorld::MainConstructor` / `TLoader::TheMain` /
+`LoadPlatformDriver` never ran → idle loop hit a NULL
+`gPlatformDriver` in `PauseSystem` and DABT'd.
+
+Attempts to fix in-place:
+
+1. **Stack-based CPSR save** (`STMFD SP!, {scratch, flags_scratch}`
+   around the CMP, `LDMFD` after the access). DABT'd immediately in
+   early boot: `SafeShortTimerDelay` runs before `SetUpStacks`, so
+   SP_svc isn't pointing at valid writable RAM yet. Stack-based
+   save isn't a universal-mode strategy.
+
+2. **Fixed RAM save slot at a known IPA.** Works pre-MMU (VA=PA,
+   slot is in stage-2-mapped RAM) and works in kernel mode post-MMU
+   if the kernel linearly maps main RAM (it does). Breaks in user
+   mode: user task page tables are domain-restricted and don't
+   include a slot we carved out of hypervisor-owned RAM. Broken.
+
+3. **Single CP15 scratch register (TPIDRURW)** holds the scratch
+   register OR the flags, not both. Needs two slots.
+
+4. **Second CP15 slot via PMCCNTR** (PL1 R/W unconditionally, PL0
+   R/W iff `PMUSERENR.EN=1`). Works architecturally, works in every
+   mode + every MMU state. But leaks across preemption: if the
+   kernel context-switches mid-stub, TPIDRURW / PMCCNTR get
+   overwritten by the next task's stub entry, and when the original
+   task is rescheduled the stub's saved state is gone. Newton's
+   scheduler doesn't save/restore TPIDRURW or PMCCNTR (SA-1100 had
+   neither, so the kernel doesn't know they exist). User-mode stubs
+   can't disable IRQs to paper over this (`MSR CPSR_c` from PL0 is
+   filtered, the I bit write is a no-op). For the specific
+   `PrimGetEnvDomainName` bug the preemption hazard doesn't trip —
+   early boot, single task, kernel mode — but it's a latent
+   correctness issue for any multi-task user-mode byte-access site.
+
+Fix: **replace the in-guest stub with a UDF-trap emulator.** Each
+byte-access site becomes `UDF #(0x8000 | idx)`; the existing UND
+trampoline HVCs the trap into EL2, where `shadow_stub::handle_sba_udf`
+decodes the original instruction from a side table and emulates the
+access in Rust. CPSR flag preservation is trivial — SPSR_EL2 carries
+the pre-UDF NZCV across the trap, and EL2 code never manipulates
+it. Atomic with respect to guest preemption (EL2 runs with DAIF.I
+masked). Works in every mode, every MMU state, every preemption
+regime.
+
+Details: see IMPLEMENTATION.md §8.5. Key additions to the hypervisor
+were the extended UND trampoline (R12 save via TPIDRURW + faulting-
+mode SP/LR capture via a brief mode-switch dance) and the
+post-emulation trampoline at `0x00FFFF80` that handles R13/R14
+writeback (AArch64 ERET doesn't propagate `x13` / `x14` into the
+target mode's banked slots).
+
+After the fix, cold boot advances from the old PrimGetEnvDomainName
+stall into `PrimGetDomainInfoByName` → `PrimGetEntryByName` →
+`TUSharedMem::CopyToShared` → `SMemCopyToSharedSWI` — 20 000+ trace
+events in 80 s. The next stall is a DABT at guest PC `0x003AE3E4`
+(inside `SWIBoot`-land, `LDR R5, [R13, #0xC]` faulting at VA
+`0x0C001000`) — a new Phase-B frontier, not a regression.
+
+All 20 guest tests (`run-all.sh`) pass, including every subtest of
+`test_shadow_stub` (reg-offset, SP-imm/neg/reg/writeback/post-index,
+SWPB, LDRD-ignored, RAM-resident).
+
+Commits: (pending bundle).
 
 ## Resolved — post-MMU PABT on shadow-stub pool A (2026-04-22)
 

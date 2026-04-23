@@ -80,7 +80,7 @@ Current layout:
 - `src/peripherals/vic.rs` — interrupt controller + tick clock; `K_HDWR_TICKS` now advances the non-trapping RAM page instead of returning from a trap.
 - `src/mmio.rs` — routes `0x0F1C_0000..0x0F20_0000` to `serial`, plus existing VIC / DMA / PCMCIA / stub dispatch.
 - `src/snapshot.rs` — rolling ring under `/tmp/newton-snapshot-{0..3}.bin`.
-- `src/shadow_stub.rs` — BE-32 byte/halfword-access patcher. Pool A (ROM-resident patch sites) at IPA 0x00E00000..0x01000000 inside the guest ROM aperture; reachable pre- AND post-MMU via the guest kernel's own ROM section descriptors. Pool B (lazy-RAM-resident) at IPA 0x03000000..0x03200000. Stub scratch save/restore uses TPIDR_EL0 (an ARMv6+ per-CPU register SA-1100 doesn't implement); return-to-caller is a direct `B orig_pc+4` (±32 MiB reach). See IMPLEMENTATION.md §8.4 for the full design.
+- `src/shadow_stub.rs` — BE-32 byte/halfword-access patcher. Each patched site is replaced in place with `UDF #(0x8000 | idx)`; the UND trampoline at IPA 0x00FFFF00 routes into EL2 where `handle_sba_udf` decodes the original instruction from a 32 K-entry site table and emulates the access in Rust (with the BE-32 XOR for real memory, passthrough for MMIO). Writeback to banked R13 / R14 exits through a post-emulation trampoline at IPA 0x00FFFF80 that writes SP / LR natively in the faulting mode. See IMPLEMENTATION.md §8.5 for the full design; `INVESTIGATION.md` records why the earlier in-guest stub approach couldn't preserve CPSR flags across every mode and MMU state.
 - `guest-tests/tests/` — 20 tests (test_hello, test_vic, test_flash, test_dma, test_pcmcia, test_cp15_fault_regs, test_finetable_rewrite, test_und_handler, test_cp15_strongarm_clock, test_midr, test_mmio_regs, test_rtc_calendar, test_rom_patches, test_serial, test_native_primitives, test_flash_driver, test_platform_driver, test_screen_blit, test_snapshot, test_shadow_stub).
 - `guest-tests/scripts/run-test.sh` — clears `/tmp/newton-snapshot-*.bin` before each run so a stale snapshot can't cause a test to resume mid-run.
 
@@ -112,15 +112,20 @@ cd baremetal && timeout 60 cargo run --release
 
 Trap log shows guest PC sampled at or near `0x002F40E0` — the TInterpreter constructor.
 
-Current Phase B progress (2026-04-22):
+Current Phase B progress (2026-04-23):
 
-- Post-MMU shadow-stub dispatch PABT resolved by moving pool A into the
-  ROM aperture. See `INVESTIGATION.md` and the commit `baremetal:
-  shadow_stub pool A in ROM aperture — fixes post-MMU dispatch`.
-- Boot now runs ~345k function-tracer entries in 90 s, then spins in
-  `TPrivatePackageIterator` (11,888 calls to `NumberOfParts` inside a
-  hot loop over REx entries). No PABT, no halt. This is the next
-  stall to root-cause — see `INVESTIGATION.md` "Currently at".
+- Shadow-byte-access flag-preservation resolved by replacing the
+  in-guest stub with a UDF-trap emulator in EL2 Rust. See
+  `IMPLEMENTATION.md` §8.5 and `INVESTIGATION.md` "Resolved —
+  shadow-stub flag-preservation via UDF-trap".
+- Boot now advances past `MemObjManager::PrimGetEnvDomainName` into
+  `TUSharedMem::CopyToShared` / `SMemCopyToSharedSWI`, DABTs at guest
+  PC 0x003AE3E4 (stage-1 translation fault at VA 0x0C001000 during
+  `LDR R5, [R13, #0xC]`). Next stall to root-cause — see
+  `INVESTIGATION.md` "Currently at".
+- Post-MMU shadow-stub dispatch PABT was resolved earlier by moving
+  pool A into the ROM aperture; the pool is gone entirely under
+  UDF-trap.
 
 Einstein as reference:
 

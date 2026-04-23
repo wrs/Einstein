@@ -68,6 +68,27 @@ bool ParseLine(char* line, KUInt32* outAddr, char** outName)
 	return true;
 }
 
+// Detail-dump PCs: when the JIT fires traceFunctionEntry at one of these,
+// we emit a second "detail" line with all 16 GPRs + CPSR, to diff against
+// the bare-metal hypervisor at the same PC.
+const KUInt32 kDetailPCs[] = {
+	0x0011D844,  // MemObjManager::GetEnvDomainName wrapper, immediately
+	             // after LDRB r1, [r8, #13] — inspects the byte flag the
+	             // PRIM left for the loop-iteration terminator.
+	0x003AE3DC,  // SMemCopyToSharedSWI entry (USR)
+	0x003AD698,  // SWIBoot entry
+	0x001DFA70,  // SMemCopyToKernelGlue entry
+	0x001DFDE8,  // LowLevelCopyDoneFromKernelGlue entry
+};
+
+bool IsDetailPC(KUInt32 pc)
+{
+	for (KUInt32 dp : kDetailPCs) {
+		if (dp == pc) return true;
+	}
+	return false;
+}
+
 } // namespace
 
 volatile Boolean TTracer::sEnabled = false;
@@ -94,6 +115,19 @@ TTracer::Enable(const char* symbolsPath, const char* outputPath)
 		count++;
 	}
 	std::fclose(f);
+
+	// Register detail PCs so the JIT injects traceFunctionEntry for them
+	// even though they're not function starts in code-symbols.txt. The
+	// synthetic name is a stable pooled string per the pattern above.
+	for (KUInt32 dp : kDetailPCs) {
+		char buf[32];
+		std::snprintf(buf, sizeof(buf), "DETAIL_%08x", dp);
+		auto owned = std::make_unique<std::string>(buf);
+		const char* cstr = owned->c_str();
+		sNamePool.push_back(std::move(owned));
+		sSymbols[dp] = cstr;
+		count++;
+	}
 
 	sOutFile = std::fopen(outputPath, "w");
 	if (!sOutFile) {
@@ -144,6 +178,23 @@ TTracer::LogEntry(TARMProcessor* ioCPU, KUInt32 pc, const char* name)
 		static_cast<unsigned>(r1),
 		static_cast<unsigned>(r2),
 		static_cast<unsigned>(r3));
+
+	if (IsDetailPC(pc)) {
+		KUInt32 regs[16];
+		for (int i = 0; i < 15; ++i) {
+			regs[i] = ioCPU->GetRegister(i);
+		}
+		regs[15] = pc;  // PC at the moment of the hook
+		const KUInt32 cpsr = ioCPU->GetCPSR();
+		std::fprintf(sOutFile,
+			"  detail pc=0x%08x mode=%s cpsr=0x%08x\n",
+			static_cast<unsigned>(pc), ModeLabel(mode),
+			static_cast<unsigned>(cpsr));
+		for (int i = 0; i < 16; ++i) {
+			std::fprintf(sOutFile, "    r%-2d = 0x%08x\n", i,
+				static_cast<unsigned>(regs[i]));
+		}
+	}
 }
 
 void

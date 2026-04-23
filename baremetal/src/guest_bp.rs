@@ -323,24 +323,71 @@ pub fn handle_user_bp_und(
         faulting_pc, slot_idx
     );
 
-    // DIAG: dump AArch32 banked regs so we can reconstruct what drove
-    // the guest to `faulting_pc`. Useful when the BP is placed at an
-    // exception vector (0x04..0x1C) and we need the pre-exception state.
-    // Dump AArch32 state. AArch64 at EL2 only exposes the banked SPSRs
-    // directly; banked SP/LR of non-current modes require a brief ERET
-    // into an AArch32 stub. `trap::handle_diag` already implements that
-    // pattern (it ERETs into the stub at VA 0x0C00_4F00 which dumps
-    // LR/SP/SPSR of ABT/UND/SVC plus DFSR/DFAR into RAM, then HVCs back
-    // into `handle_diag_lr` which prints them and halts). Hand off now,
-    // before we restore the ROM word, so the LR_abt from the PABT that
-    // landed us at the vector is still intact.
-    kprintln!("guest_bp: handing off to handle_diag for banked-reg dump...");
-    // Don't restore the ROM word: handle_diag halts, so the BP slot and
-    // the original word both stay in their current (BP-consumed) state.
-    // If we ever remove the halt, the restore below will run.
-    trap::handle_diag_from_bp(ctx);
+    // Dump-and-continue path: print ctx.x[0..14] (aliases AArch32 R0..R14
+    // for the mode SPSR_und identifies), plus the saved CPSR. Then restore
+    // the original ROM word and ERET so the breakpointed instruction runs
+    // at native speed. For vector-intercept use cases that need the full
+    // banked-reg dump, call `trap::handle_diag_from_bp(ctx)` instead from
+    // your handler site (it halts, so only useful as a one-shot).
+    let cpsr = spsr_und as u32;
+    kprintln!(
+        "  bp detail pc={:#010x} cpsr={:#010x} mode={:#x}",
+        faulting_pc, cpsr, cpsr & 0x1F
+    );
+    for i in 0..15 {
+        kprintln!("    r{:<2} = {:#010x}", i, ctx.x[i] as u32);
+    }
+    kprintln!("    r15 = {:#010x}  (= pc at bp)", faulting_pc);
 
-    #[allow(unreachable_code)]
+    // If we're at the LDRB-post hook, also dump the word the LDRB was
+    // targeting so we can see the raw bytes in memory. Address is
+    // r8 + 12..15 (word containing [r8+13]).
+    if faulting_pc == 0x0011_D844 {
+        let r8 = ctx.x[8] as u32;
+        let word_addr = r8.wrapping_add(12);
+        let w = crate::guest_mem::read_word_va(word_addr).unwrap_or(0xDEADBEEF);
+        kprintln!(
+            "    mem @[r8+12]={:#010x} word={:#010x}  bytes=[{:02x},{:02x},{:02x},{:02x}]",
+            word_addr, w,
+            w as u8, (w >> 8) as u8, (w >> 16) as u8, (w >> 24) as u8
+        );
+    }
+    // If we're at PrimGetEnvDomainName's exit (right after both STRBs),
+    // dump the two target bytes so we can see if the writes landed.
+    if faulting_pc == 0x0011_D308 || faulting_pc == 0x0011_D328 || faulting_pc == 0x0011_D34C {
+        let r3 = ctx.x[3] as u32;
+        let r5 = ctx.x[5] as u32;
+        kprintln!("    PRIM exit: r3={:#010x} r5={:#010x}", r3, r5);
+        for (label, addr) in [("r3-word-aligned", r3 & !3), ("r5-word-aligned", r5 & !3)] {
+            let w = crate::guest_mem::read_word_va(addr).unwrap_or(0xDEADBEEF);
+            kprintln!(
+                "    {} @{:#010x} word={:#010x}  bytes=[{:02x},{:02x},{:02x},{:02x}]",
+                label, addr, w,
+                w as u8, (w >> 8) as u8, (w >> 16) as u8, (w >> 24) as u8
+            );
+        }
+    }
+    if faulting_pc == 0x0011_D29C {
+        // Inside PrimGetEnvDomainName, right after `ldr r4, [r7, #16]`
+        // loaded list1_ptr into r4. Dump r4 + r7 + env-name match check.
+        let r4 = ctx.x[4] as u32;
+        let r7 = ctx.x[7] as u32;
+        kprintln!("    PRIM @list1_load: r4=list1_ptr={:#010x} r7=entry_base={:#010x}", r4, r7);
+        if r4 != 0 {
+            let first = crate::guest_mem::read_word_va(r4).unwrap_or(0xDEADBEEF);
+            kprintln!("    *list1 = {:#010x}", first);
+        }
+        let entry_env = crate::guest_mem::read_word_va(r7.wrapping_sub(16))
+            .unwrap_or(0xDEADBEEF);
+        kprintln!("    entry[0] (env_name) = {:#010x}", entry_env);
+    }
+
+    // Halt after our key observation to avoid waiting out the timeout.
+    if faulting_pc == 0x0011_D844 {
+        kprintln!("    (halting after USR LDRB-post dump — diagnostic scaffolding)");
+        crate::cpu::halt();
+    }
+
     restore_word(faulting_pc, s.orig);
 
     // Rewind ELR so the restored instruction re-executes at native

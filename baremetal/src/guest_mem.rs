@@ -125,6 +125,54 @@ pub fn read_word_pa(pa: u32) -> Option<u32> {
     None
 }
 
+/// Read one halfword (16 bits) from a guest PA. Alignment is the
+/// caller's responsibility; misaligned reads silently split across the
+/// host pointer the way the CPU would cross bytes.
+pub fn read_halfword_pa(pa: u32) -> Option<u16> {
+    let pa = pa as usize;
+    if pa + 2 <= ROM_SIZE {
+        let host = (rom_host_pa() as usize) + pa;
+        // SAFETY: bounds-checked.
+        return Some(unsafe { core::ptr::read_volatile(host as *const u16) });
+    }
+    if (RAM_BASE_USIZE..RAM_BASE_USIZE + RAM_SIZE).contains(&pa)
+        && pa + 2 <= RAM_BASE_USIZE + RAM_SIZE
+    {
+        let host = (ram_host_pa() as usize) + (pa - RAM_BASE_USIZE);
+        // SAFETY: bounds-checked.
+        return Some(unsafe { core::ptr::read_volatile(host as *const u16) });
+    }
+    if (FB_BASE_USIZE..FB_BASE_USIZE + FB_SIZE).contains(&pa)
+        && pa + 2 <= FB_BASE_USIZE + FB_SIZE
+    {
+        let host = (fb_host_pa() as usize) + (pa - FB_BASE_USIZE);
+        // SAFETY: bounds-checked.
+        return Some(unsafe { core::ptr::read_volatile(host as *const u16) });
+    }
+    None
+}
+
+/// Write one halfword to a guest PA. Returns true on success; writes
+/// to ROM / unmapped regions are refused.
+pub fn write_halfword_pa(pa: u32, value: u16) -> bool {
+    let pa = pa as usize;
+    if (RAM_BASE_USIZE..RAM_BASE_USIZE + RAM_SIZE).contains(&pa)
+        && pa + 2 <= RAM_BASE_USIZE + RAM_SIZE
+    {
+        let host = (ram_host_pa() as usize) + (pa - RAM_BASE_USIZE);
+        unsafe { core::ptr::write_volatile(host as *mut u16, value); }
+        return true;
+    }
+    if (FB_BASE_USIZE..FB_BASE_USIZE + FB_SIZE).contains(&pa)
+        && pa + 2 <= FB_BASE_USIZE + FB_SIZE
+    {
+        let host = (fb_host_pa() as usize) + (pa - FB_BASE_USIZE);
+        unsafe { core::ptr::write_volatile(host as *mut u16, value); }
+        return true;
+    }
+    false
+}
+
 /// Read one byte from a guest PA.
 pub fn read_byte_pa(pa: u32) -> Option<u8> {
     let pa = pa as usize;
@@ -563,8 +611,13 @@ pub unsafe fn load_guest_test() {
         "guest_mem: guest-test @ host PA {:#x}, RAM @ host PA {:#x}",
         rom_host_pa(), ram_host_pa()
     );
-    // No vector patching, no CP15 rewriting — guest-test binaries are
-    // already ARMv7-correct.
+    // Install the UND trampoline so shadow-byte-access UDF markers,
+    // guest_bp UDFs, and tracer USR-fallback UDFs reach EL2. The ROM
+    // patching that `load_newton_rom` does to rewrite CP15 encodings
+    // is still skipped — guest-test binaries are already ARMv7-correct.
+    unsafe {
+        patch_und_vector(addr_of_mut!(GUEST_ROM) as *mut u32);
+    }
 }
 
 #[cfg(not(nh_guest_test))]
@@ -727,17 +780,64 @@ pub unsafe fn load_newton_rom() {
     unsafe { patch_und_vector(rom_ptr); }
 
     // TEMPORARY diagnostic — DABT-vector intercept.
-    // Replace the ROM's branch at VA 0x10 with `HVC #DABT_TAG` so the
-    // very first stage-1 data abort traps to EL2 with the original
-    // FAR_EL1 / SPSR_abt intact. Without this the ROM handler at
-    // 0x393114 runs with SP_abt = 0xFFFFFFFF (poison primed by
-    // BootOS at 0x187e8 before SetUpStacks), its first STMDB
-    // recursively aborts at 0xFFFFFFF7, and FAR is clobbered by the
-    // second abort before any heartbeat fires. Remove once the root
-    // cause of the first abort is identified and fixed.
-    // SAFETY: single-word write to ROM offset 0x10 (DABT vector);
-    // guest sees this via the stage-2 read-only ROM map.
-    unsafe { rom_ptr.add(4).write(0xE140_0171); } // hvc #0x11
+    // Patch VA 0x10 to branch to a stub at ROM offset DABT_TRAMP_OFFSET
+    // (0x00FF_FFA8). The stub saves LR_abt/SP_abt/SPSR_abt natively from
+    // ABT mode, then bounces to SVC to capture SP_svc/SPSR_svc/LR_svc
+    // (which QEMU raspi3b's AArch64-MRS-banked-SP reads don't give
+    // reliably), before HVCing to EL2.
+    //
+    // Stub layout (14 words = 56 bytes):
+    //   +0x00: ee0d_0f50  mcr p15,0,r0,c13,c0,2  ; save r0 → TPIDRURW
+    //   +0x04: e59f_002c  ldr r0, [pc, #0x2c]    ; r0 = DABT_SAVE_VA (literal at +0x38)
+    //   +0x08: e580_e000  str lr, [r0]           ; save LR_abt (= faulting_pc + 8 for ARM)
+    //   +0x0C: e580_d004  str sp, [r0, #4]       ; save SP_abt
+    //   +0x10: e14f_1000  mrs r1, spsr           ; r1 = SPSR_abt = pre-abort CPSR
+    //   +0x14: e580_1008  str r1, [r0, #8]       ; save SPSR_abt
+    //   +0x18: e321_f0d3  msr cpsr_c, #0xd3      ; → SVC (I=1,F=1,T=0)
+    //   +0x1C: e1a0_200d  mov r2, sp             ; r2 = SP_svc
+    //   +0x20: e14f_3000  mrs r3, spsr           ; r3 = SPSR_svc
+    //   +0x24: e1a0_400e  mov r4, lr             ; r4 = LR_svc
+    //   +0x28: e321_f0d7  msr cpsr_c, #0xd7      ; → ABT (restore)
+    //   +0x2C: e880_001c  stmia r0+0xC, {r2,r3,r4} ; but that's the wrong store;
+    //                     -- use individual STRs via r0 instead for clarity
+    //   (We use individual STRs so we don't need stmia; see stub array below.)
+    //
+    // DABT_SAVE at IPA 0x0400_5FA0 (pre-MMU), VA 0x0C00_4FA0 (post-MMU).
+    // handle_diag in trap.rs reads the PA and prints the reliable state.
+    //
+    // The pre/post-MMU literal swap is piggy-backed on the existing
+    // UND trampoline's swap in install_und_vector_swap_{pre,post}_mmu.
+    //
+    // SAFETY: 1 + ~14 words of ROM backing; both regions are reserved
+    // per tracer::in_reserved_range.
+    unsafe {
+        let imm24 = ((DABT_TRAMP_OFFSET as u32).wrapping_sub(0x10 + 8) / 4) & 0x00FF_FFFF;
+        let branch_insn = 0xEA00_0000 | imm24;
+        rom_ptr.add(4).write(branch_insn);              // 0x10: b DABT_TRAMP_OFFSET
+
+        let db = DABT_TRAMP_OFFSET / 4;
+        rom_ptr.add(db +  0).write(0xEE0D_0F50);         // mcr p15,0,r0,c13,c0,2  (save r0)
+        rom_ptr.add(db +  1).write(0xE59F_002C);         // ldr r0, [pc, #0x2c]    (lit at +0x38)
+        rom_ptr.add(db +  2).write(0xE580_E000);         // str lr, [r0]           LR_abt
+        rom_ptr.add(db +  3).write(0xE580_D004);         // str sp, [r0, #4]       SP_abt
+        rom_ptr.add(db +  4).write(0xE14F_1000);         // mrs r1, spsr           SPSR_abt
+        rom_ptr.add(db +  5).write(0xE580_1008);         // str r1, [r0, #8]       SPSR_abt
+        rom_ptr.add(db +  6).write(0xE321_F0D3);         // msr cpsr_c, #0xd3      → SVC
+        rom_ptr.add(db +  7).write(0xE580_D00C);         // str sp, [r0, #0xC]     SP_svc
+        rom_ptr.add(db +  8).write(0xE14F_1000);         // mrs r1, spsr           SPSR_svc
+        rom_ptr.add(db +  9).write(0xE580_1010);         // str r1, [r0, #0x10]    SPSR_svc
+        rom_ptr.add(db + 10).write(0xE580_E014);         // str lr, [r0, #0x14]    LR_svc
+        rom_ptr.add(db + 11).write(0xE321_F0D7);         // msr cpsr_c, #0xd7      → ABT
+        rom_ptr.add(db + 12).write(0xE140_0171);         // hvc #0x11
+        rom_ptr.add(db + 13).write(0xEAFF_FFFE);         // b . (guard if return)
+        rom_ptr.add(db + 14).write(0x0400_5FA0);         // literal (pre-MMU IPA)
+        // Note: `ldr r0, [pc, #0x30]` uses pc = instruction_addr + 8.
+        // instruction at db+1 = offset +4. pc for that ldr = +0x0C.
+        // pc + 0x30 = +0x3C. Literal at word index 14, byte offset +0x38.
+        // Wait — let me recompute. db+14 byte offset = 14 * 4 = 0x38. pc+0x30 = 0x0C + 0x30 = 0x3C ≠ 0x38.
+        // Fix: literal at +0x38. ldr offset should be pc_at_ldr + 8 + N = 0x38 →
+        // N = 0x38 - 0x0C = 0x2C. Use `ldr r0, [pc, #0x2c]`.
+    }
 
     // TEMPORARY diagnostic — PABT-vector intercept.
     // The stock ROM vector at VA 0x0C branches to 0x01A00010 (a HAL
@@ -782,19 +882,30 @@ pub unsafe fn load_newton_rom() {
 /// avoids any such aliasing.
 ///
 /// Trampoline body:
-///   +0x00: e59fc028  ldr r12, [pc, #0x28]  ; literal at +0x30: save VA
-///   +0x04: e58c000c  str r0, [r12, #0x0C]  ; save pre-UND R0      (+0x0C)
-///   +0x08: e58c1010  str r1, [r12, #0x10]  ; save pre-UND R1      (+0x10)
-///   +0x0C: e58ce000  str lr, [r12]         ; save R14_und         (+0x00)
-///   +0x10: e14f0000  mrs r0, SPSR          ; r0 = SPSR_und
-///   +0x14: e58c0004  str r0, [r12, #4]     ; save SPSR_und        (+0x04)
-///   +0x18: e321f0d3  msr cpsr_c, #0xd3     ; → SVC (I/F masked)
-///   +0x1C: e1a0000e  mov r0, lr            ; r0 = R14_svc
-///   +0x20: e58c0008  str r0, [r12, #8]     ; save LR_svc          (+0x08)
-///   +0x24: e321f0db  msr cpsr_c, #0xdb     ; → UND (I/F masked)
-///   +0x28: e1400170  hvc #0x10             ; UND_TAG — enter EL2
-///   +0x2C: eafffffe  b .                   ; trap if we ever return
-///   +0x30: 0c004f00  .word UND_SAVE_BASE_VA (RAM-mirror VA)
+///   +0x00: ee0dcf50  mcr p15,0,r12,c13,c0,2 ; TPIDRURW <- R12 (save orig R12)
+///   +0x04: e59fc050  ldr r12, [pc, #0x50]  ; literal at +0x5C: save VA
+///   +0x08: e58c000c  str r0, [r12, #0x0C]  ; save pre-UND R0      (+0x0C)
+///   +0x0C: e58c1010  str r1, [r12, #0x10]  ; save pre-UND R1      (+0x10)
+///   +0x10: e58ce000  str lr, [r12]         ; save R14_und         (+0x00)
+///   +0x14: e14f0000  mrs r0, SPSR          ; r0 = SPSR_und
+///   +0x18: e58c0004  str r0, [r12, #4]     ; save SPSR_und        (+0x04)
+///   +0x1C: e58c2014  str r2, [r12, #0x14]  ; save pre-UND R2      (+0x14)
+///   +0x20: e200101f  and r1, r0, #0x1F     ; r1 = faulting mode bits
+///   +0x24: e38110c0  orr r1, r1, #0xC0     ; r1 |= I/F mask
+///   +0x28: e35100d0  cmp r1, #0xD0         ; == USR (0x10) + IF ?
+///   +0x2C: 03a010df  moveq r1, #0xDF       ; if USR → use SYS (same bank)
+///   +0x30: e129f001  msr cpsr_c, r1        ; switch to faulting mode
+///   +0x34: e58cd018  str sp, [r12, #0x18]  ; save banked SP       (+0x18)
+///   +0x38: e58ce01c  str lr, [r12, #0x1C]  ; save banked LR       (+0x1C)
+///   +0x3C: e321f0db  msr cpsr_c, #0xdb     ; → UND (I/F masked)
+///   +0x40: e59c2014  ldr r2, [r12, #0x14]  ; restore pre-UND R2
+///   +0x44: e321f0d3  msr cpsr_c, #0xd3     ; → SVC (I/F masked)
+///   +0x48: e1a0000e  mov r0, lr            ; r0 = R14_svc
+///   +0x4C: e58c0008  str r0, [r12, #8]     ; save LR_svc          (+0x08)
+///   +0x50: e321f0db  msr cpsr_c, #0xdb     ; → UND (I/F masked)
+///   +0x54: e1400170  hvc #0x10             ; UND_TAG — enter EL2
+///   +0x58: eafffffe  b .                   ; trap if we ever return
+///   +0x5C: 0c004f00  .word UND_SAVE_BASE_VA (RAM-mirror VA)
 ///
 /// Why the SVC bounce: `MRS X, LR_svc` and `MRS X, ELR_EL1` from
 /// AArch64 EL2 return 0 under QEMU raspi3b for AArch32 banked state
@@ -816,10 +927,16 @@ pub unsafe fn load_newton_rom() {
 /// (0x0C00_4F00) and R1 (LR_svc) into R7 and R4 before using them
 /// as a page-table base. `handle_und` restores `ctx.x[0]` and
 /// `ctx.x[1]` from these slots at entry; by the time execution ERETs
-/// back to the guest the registers are intact. R12 is NOT preserved —
-/// it ends up holding the save-slot VA — but every Newton 2.x kernel
-/// function we've observed starts with `MOV R12, R13`, so R12 is
-/// effectively scratch at the sites where the tracer patches.
+/// back to the guest the registers are intact. R12 is preserved by the
+/// opening `MCR p15,0,r12,c13,c0,2` which stashes the original R12 into
+/// TPIDRURW (TPIDR_EL0 in AArch64); `handle_und` reads `tpidr_el0` and
+/// restores `ctx.x[12]`. TPIDRURW is ARMv6+ architectural state that
+/// SA-1100 (ARMv4) did not have, and the Newton ROM never touches it,
+/// so claiming it as the R12 save slot is safe. This matters for the
+/// shadow-byte-access UDF-trap path, where the faulting instruction
+/// can legitimately use R12 as base/data/offset; the tracer's
+/// function-entry assumption (`MOV R12, R13` on every prologue) does
+/// not hold for mid-function sites.
 ///
 /// Branch encoding at VA 0x04: `b UND_TRAMP_OFFSET`.
 ///   imm24 = (UND_TRAMP_OFFSET - (0x04 + 8)) / 4
@@ -836,6 +953,61 @@ pub unsafe fn load_newton_rom() {
 /// store. Writes 13 words at the trampoline offset + 1 word at 0x04.
 const UND_TRAMP_OFFSET: usize = 0x00FF_FF00;
 
+/// Post-emulation trampoline used by the SBA handler when byte-access
+/// writeback targets Rn ∈ {13, 14} (banked SP / LR). AArch64 ERET from
+/// EL2 doesn't propagate x13 / x14 into the target mode's banked SP /
+/// LR — R0..R12 propagate, R13/R14 retain their banked values across
+/// the ERET. So we instead ERET into this trampoline *in the faulting
+/// mode*, which writes SP / LR natively (hitting the banked slot for
+/// that mode) and then branches to the final PC. NEW_SP / NEW_LR live
+/// in the `UND_SAVE_BANKED_{SP,LR}_IPA` RAM slots; the NEW_PC literal
+/// lives inline in the trampoline body and the SBA handler rewrites it
+/// (plus a DC CVAU flush) before each ERET.
+///
+/// Trampoline body (7 words + 2 literals):
+///   +0x00: ee0dcf50  mcr p15,0,r12,c13,c0,2  ; save R12 → TPIDRURW
+///   +0x04: e59fc014  ldr r12, [pc, #0x14]    ; R12 = slot-base literal at +0x20
+///   +0x08: e59cd018  ldr sp, [r12, #0x18]    ; SP = NEW_SP slot
+///   +0x0C: e59ce01c  ldr lr, [r12, #0x1C]    ; LR = NEW_LR slot
+///   +0x10: ee1dcf50  mrc p15,0,r12,c13,c0,2  ; R12 = orig R12 from TPIDRURW
+///   +0x14: e59ff008  ldr pc, [pc, #0x08]     ; branch via NEW_PC literal at +0x24
+///   +0x18: eafffffe  b .                     ; guard
+///   +0x1C: eafffffe  b .                     ; guard
+///   +0x20: slot_base_va                      ; set at install, swapped post-MMU
+///   +0x24: NEW_PC                            ; dynamically written by SBA handler
+pub const SBA_POST_TRAMP_OFFSET: usize = 0x00FF_FF80;
+pub const SBA_POST_TRAMP_NEW_PC_OFFSET: usize = SBA_POST_TRAMP_OFFSET + 0x24;
+
+/// DABT-vector trampoline body. Installed at ROM offset 0x00FF_FFA8
+/// (past the SBA post-emulation trampoline at 0x00FF_FF80, ends
+/// around 0x00FF_FFA8). Saves LR_abt/SP_abt/SPSR_abt natively from
+/// ABT mode, then bounces to SVC to save SP_svc/SPSR_svc/LR_svc
+/// (sidestepping QEMU raspi3b's flaky AArch64-MRS-banked-SP reads),
+/// before HVCing to EL2. The literal at the end of the trampoline is
+/// swapped between pre/post-MMU VAs by
+/// `install_und_vector_swap_{pre,post}_mmu`.
+///
+/// Save layout at DABT_SAVE_PA:
+///   +0x00: LR_abt
+///   +0x04: SP_abt
+///   +0x08: SPSR_abt (= pre-abort CPSR)
+///   +0x0C: SP_svc
+///   +0x10: SPSR_svc
+///   +0x14: LR_svc
+pub const DABT_TRAMP_OFFSET: usize = 0x00FF_FFA8;
+pub const DABT_SAVE_PA: u32 = 0x0400_5FA0;
+
+/// `movs pc, lr` stub in the ROM trampoline region. See the installation
+/// site in `patch_und_vector` and `return_to_guest_from_und` in trap.rs
+/// for rationale. Lives past the DABT trampoline which ends at
+/// 0x00FF_FFE0. Three words (stub code + literal) fit in the 32-byte
+/// window from 0x00FF_FFE0..0x0100_0000.
+pub const UND_RETURN_STUB_OFFSET: usize = 0x00FF_FFE0;
+pub const UND_RETURN_STUB_VA: u32 = UND_RETURN_STUB_OFFSET as u32;
+/// Offset of the target-PC literal inside the stub (written by Rust
+/// handler before ERET).
+pub const UND_RETURN_STUB_LITERAL_OFFSET: usize = UND_RETURN_STUB_OFFSET + 8;
+
 unsafe fn patch_und_vector(rom: *mut u32) {
     // The trampoline's save-slot address is held in the literal at
     // offset 0x30. Pre-MMU we use the RAM *IPA* 0x0400_5F00 directly
@@ -849,25 +1021,74 @@ unsafe fn patch_und_vector(rom: *mut u32) {
     let imm24 = ((UND_TRAMP_OFFSET as u32 - 0x0C) / 4) & 0x00FF_FFFF;
     let branch_insn = 0xEA00_0000 | imm24;
 
-    // SAFETY: offsets below all sit in 0x00FF_FF00..0x00FF_FF34,
-    // well under ROM_SIZE (= 16 MiB = 0x0100_0000).
+    // SAFETY: offsets below all sit in 0x00FF_FF00..0x00FF_FF60,
+    // well under ROM_SIZE (= 16 MiB = 0x0100_0000) and inside the
+    // 128-byte reserved window checked by `tracer::in_reserved_range`.
+    //
+    // SAFETY: offsets below all sit in 0x00FF_FF00..0x00FF_FF60,
+    // well under ROM_SIZE (= 16 MiB = 0x0100_0000) and inside the
+    // 128-byte reserved window checked by `tracer::in_reserved_range`.
     unsafe {
         rom.add(1).write(branch_insn);              // 0x04: b UND_TRAMP_OFFSET
 
         let base = UND_TRAMP_OFFSET / 4;
-        rom.add(base +  0).write(0xE59F_C028);      // ldr r12, [pc, #0x28]
-        rom.add(base +  1).write(0xE58C_000C);      // str r0, [r12, #0x0C]
-        rom.add(base +  2).write(0xE58C_1010);      // str r1, [r12, #0x10]
-        rom.add(base +  3).write(0xE58C_E000);      // str lr, [r12]
-        rom.add(base +  4).write(0xE14F_0000);      // mrs r0, SPSR
-        rom.add(base +  5).write(0xE58C_0004);      // str r0, [r12, #4]
-        rom.add(base +  6).write(0xE321_F0D3);      // msr cpsr_c, #0xd3  (SVC, I/F)
-        rom.add(base +  7).write(0xE1A0_000E);      // mov r0, lr  (= R14_svc)
-        rom.add(base +  8).write(0xE58C_0008);      // str r0, [r12, #8]
-        rom.add(base +  9).write(0xE321_F0DB);      // msr cpsr_c, #0xdb  (UND, I/F)
-        rom.add(base + 10).write(0xE140_0170);      // hvc #0x10
-        rom.add(base + 11).write(0xEAFF_FFFE);      // b . (trap)
-        rom.add(base + 12).write(0x0400_5F00);      // literal: RAM IPA (pre-MMU)
+        rom.add(base +  0).write(0xEE0D_CF50);      // mcr p15,0,r12,c13,c0,2
+        rom.add(base +  1).write(0xE59F_C050);      // ldr r12, [pc, #0x50]
+        rom.add(base +  2).write(0xE58C_000C);      // str r0, [r12, #0x0C]
+        rom.add(base +  3).write(0xE58C_1010);      // str r1, [r12, #0x10]
+        rom.add(base +  4).write(0xE58C_E000);      // str lr, [r12]
+        rom.add(base +  5).write(0xE14F_0000);      // mrs r0, SPSR
+        rom.add(base +  6).write(0xE58C_0004);      // str r0, [r12, #4]
+        rom.add(base +  7).write(0xE58C_2014);      // str r2, [r12, #0x14]
+        rom.add(base +  8).write(0xE200_101F);      // and r1, r0, #0x1F
+        rom.add(base +  9).write(0xE381_10C0);      // orr r1, r1, #0xC0
+        rom.add(base + 10).write(0xE351_00D0);      // cmp r1, #0xD0
+        rom.add(base + 11).write(0x03A0_10DF);      // moveq r1, #0xDF
+        rom.add(base + 12).write(0xE129_F001);      // msr cpsr_c, r1
+        rom.add(base + 13).write(0xE58C_D018);      // str sp, [r12, #0x18]
+        rom.add(base + 14).write(0xE58C_E01C);      // str lr, [r12, #0x1C]
+        rom.add(base + 15).write(0xE321_F0DB);      // msr cpsr_c, #0xdb (UND)
+        rom.add(base + 16).write(0xE59C_2014);      // ldr r2, [r12, #0x14]
+        rom.add(base + 17).write(0xE321_F0D3);      // msr cpsr_c, #0xd3 (SVC)
+        rom.add(base + 18).write(0xE1A0_000E);      // mov r0, lr
+        rom.add(base + 19).write(0xE58C_0008);      // str r0, [r12, #8]
+        rom.add(base + 20).write(0xE321_F0DB);      // msr cpsr_c, #0xdb (UND)
+        rom.add(base + 21).write(0xE140_0170);      // hvc #0x10
+        rom.add(base + 22).write(0xEAFF_FFFE);      // b . (trap)
+        rom.add(base + 23).write(0x0400_5F00);      // literal: RAM IPA (pre-MMU)
+
+        // UND-return stub. See `return_to_guest_from_und` in trap.rs for
+        // why this exists — QEMU raspi3b's `msr spsr_el2, <val>` from
+        // AArch64 EL2 clobbers SPSR_EL1 (= AArch32 SPSR_svc) as a side
+        // effect. The UND-return path must avoid writing SPSR_EL2, so
+        // we ERET into this stub while still in UND mode, then
+        // architecturally restore CPSR via `movs pc, lr`.
+        //
+        // Layout: load target PC from a PC-relative literal (which the
+        // Rust handler writes before each ERET), then `movs pc, lr`.
+        // Using a literal instead of `ctx.x[14] → R14_und` side-steps a
+        // related QEMU bug: AArch64 ERET to AArch32 UND doesn't reliably
+        // plumb x14 into R14_und.
+        //   +0x00: e59fe000  ldr lr, [pc, #0]    ; lr = *(stub + 8)
+        //   +0x04: e1b0f00e  movs pc, lr         ; CPSR = SPSR_und, PC = lr
+        //   +0x08: <target PC literal, updated per ERET>
+        let stub = UND_RETURN_STUB_OFFSET / 4;
+        rom.add(stub + 0).write(0xE59F_E000); // ldr lr, [pc, #0]
+        rom.add(stub + 1).write(0xE1B0_F00E); // movs pc, lr
+        rom.add(stub + 2).write(0xDEAD_C0DE); // placeholder literal
+
+        // SBA post-emulation trampoline, at SBA_POST_TRAMP_OFFSET.
+        let pt = SBA_POST_TRAMP_OFFSET / 4;
+        rom.add(pt + 0).write(0xEE0D_CF50);          // mcr p15,0,r12,c13,c0,2
+        rom.add(pt + 1).write(0xE59F_C014);          // ldr r12, [pc, #0x14]  → literal at +0x20
+        rom.add(pt + 2).write(0xE59C_D018);          // ldr sp, [r12, #0x18]
+        rom.add(pt + 3).write(0xE59C_E01C);          // ldr lr, [r12, #0x1C]
+        rom.add(pt + 4).write(0xEE1D_CF50);          // mrc p15,0,r12,c13,c0,2
+        rom.add(pt + 5).write(0xE59F_F008);          // ldr pc, [pc, #0x08]
+        rom.add(pt + 6).write(0xEAFF_FFFE);          // b . (guard)
+        rom.add(pt + 7).write(0xEAFF_FFFE);          // b . (guard)
+        rom.add(pt + 8).write(0x0400_5F00);          // slot base (pre-MMU)
+        rom.add(pt + 9).write(0xDEAD_C0DE);          // NEW_PC placeholder
     }
 }
 
@@ -959,13 +1180,18 @@ unsafe fn patch_native_prim_mcr_lr_to_r12(rom: *mut u32, start: u32, end: u32) -
 /// the pre-MMU literal would make the first STR in the trampoline
 /// fault on a read-only page.
 pub unsafe fn install_und_vector_swap_post_mmu() {
-    // SAFETY: single-word write to the trampoline's literal slot at
-    // ROM offset UND_TRAMP_OFFSET + 0x30, in bounds. Caller must
-    // hold exclusive access to the ROM backing.
+    // SAFETY: single-word write to each trampoline's slot-base literal.
+    // Caller must hold exclusive access to the ROM backing. Swaps the
+    // UND trampoline, the SBA post-emulation trampoline, and the DABT
+    // diagnostic trampoline.
     unsafe {
         let rom = rom_host_pa() as *mut u32;
         let base = UND_TRAMP_OFFSET / 4;
-        rom.add(base + 12).write(0x0C00_4F00);
+        rom.add(base + 23).write(0x0C00_4F00);
+        let pt = SBA_POST_TRAMP_OFFSET / 4;
+        rom.add(pt + 8).write(0x0C00_4F00);
+        let db = DABT_TRAMP_OFFSET / 4;
+        rom.add(db + 14).write(0x0C00_4FA0);
     }
 }
 
@@ -979,7 +1205,11 @@ pub unsafe fn install_und_vector_swap_pre_mmu() {
     unsafe {
         let rom = rom_host_pa() as *mut u32;
         let base = UND_TRAMP_OFFSET / 4;
-        rom.add(base + 12).write(0x0400_5F00);
+        rom.add(base + 23).write(0x0400_5F00);
+        let pt = SBA_POST_TRAMP_OFFSET / 4;
+        rom.add(pt + 8).write(0x0400_5F00);
+        let db = DABT_TRAMP_OFFSET / 4;
+        rom.add(db + 14).write(0x0400_5FA0);
     }
 }
 

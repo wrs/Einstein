@@ -100,6 +100,10 @@ pub extern "C" fn kmain() -> ! {
         unsafe { guest::eret_to_restored(state); }
     }
 
+    // Auto-install one-shot BPs to dump processor state and memory at
+    // two key points on the PrimGetEnvDomainName path — post-both-STRBs
+    // in the kernel, and post-LDRB in USR — so we can compare byte flag
+    // state with Einstein at the same cycle.
     kprintln!();
     kprintln!("Entering Newton ROM...");
 

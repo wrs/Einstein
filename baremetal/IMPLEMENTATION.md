@@ -281,11 +281,13 @@ The Newton ROM is BE-32 word-invariant: aligned word accesses are
 identical to the LE view after a load-time word swap, but byte and
 halfword accesses target a different byte lane and must be fixed up.
 `src/shadow_stub.rs` handles that by replacing each LDRB/STRB/LDRH/
-STRH/LDRSB/LDRSH/SWPB in the ROM with a `Bcc` to a per-site stub
-that XORs the effective address before the real load/store. For that
-to be both correct (every real byte/halfword access patched) and
-safe (no data bytes overwritten), the patcher needs an exact list
-of byte-access PCs.
+STRH/LDRSB/LDRSH/SWPB in the ROM with a `UDF #imm16` marker that
+traps into EL2, where the handler decodes the original instruction
+from a site-index table and emulates the access (XOR'ing the
+effective address on real memory, passing through for MMIO). For
+that to be both correct (every real byte/halfword access patched)
+and safe (no data bytes overwritten), the patcher needs an exact
+list of byte-access PCs.
 
 The list is built by two host-side tools in `tools/` and `scripts/`:
 
@@ -349,68 +351,126 @@ patching wrong PCs. `scripts/regen-classify.sh` is the one-stop
 regen: it runs `classify-symbols.py` if needed, rebuilds the
 classifier, runs it with the curated inputs.
 
-### 8.5 Stub pool placement and layout
+### 8.5 UDF-trap emulator: layout and dispatch
 
-Stub code lives inside the guest ROM aperture, not in a separate
-EL2-only region. Placement and the reasoning behind the layout:
+Byte/halfword-access patching replaces the original ROM word in
+place with `UDF #(SBA_UDF_BASE | idx)` (SBA_UDF_BASE = 0x8000, idx
+in `0..0x7FFE`). No in-guest stub code is emitted. When the guest
+executes the UDF, it raises UND, the existing UND trampoline at
+`0x00FFFF00` routes into EL2, and `shadow_stub::handle_sba_udf`
+decodes the original instruction from a site table and emulates the
+access in Rust.
 
-- **Pool A** — ROM-resident patch sites (ROM at 0..0x01000000, flash
-  bank 0 at 0x02000000..0x02400000). Stubs at IPA 0x00E00000..0x01000000
-  (2 MiB, one stage-2 L2 block, inside the guest's 16 MiB ROM aperture).
-  The guest kernel's own stage-1 L1[0xE..0xF] section descriptors
-  identity-map the ROM aperture post-MMU (Einstein's MMU dump:
-  `VA 0x00100000 to 0x01000000 (15360 kB): section`), so dispatched
-  stubs are reachable from every patched site regardless of MMU
-  state. Pool A was previously at IPA 0x01800000 outside the kernel's
-  stage-1 map; a post-MMU dispatch PABT'd on stub fetch. Fix in
-  commit `baremetal: shadow_stub pool A in ROM aperture — fixes
-  post-MMU dispatch`; see INVESTIGATION.md.
+This approach was adopted after the earlier in-guest-stub design ran
+into a CPSR-flag-preservation wall the in-guest code couldn't clear
+across every mode and MMU state the Newton ROM exercises. See the
+resolved INVESTIGATION.md entry for the full story; the short
+version:
 
-- **Pool B** — lazy-RAM-resident patch sites (RAM at 0x04000000..
-  0x04400000). Stubs at IPA 0x03000000 (pre-RAM, 2 MiB stage-2 RW
-  block). ±32 MiB `B` reach constrains this: pool A at 0x00E00000
-  can't reach RAM at 0x04000000+ from a single pool. Pool B is
-  currently exercised only pre-MMU by `test_shadow_stub` subtest 20;
-  the real Newton boot hasn't yet reached `UseROMJumpTables` (the
-  first post-MMU lazy-RAM consumer), so pool B's post-MMU
-  reachability story is TBD.
+- The in-guest stub's MMIO-skip `CMP` clobbered NZCV, breaking any
+  patched conditional byte access (e.g., `STRBEQ`) whose caller did
+  a `Bcond` right after the stub returned.
+- Every candidate CPSR-save slot failed at least one axis:
+  stack SP isn't valid before `SetUpStacks`; a fixed RAM IPA isn't
+  mapped in user-mode page tables; a single CP15 scratch register
+  (TPIDRURW) can hold the working register OR the flags, not both;
+  the PMCCNTR second-scratch candidate works in every mode but
+  leaks through preemptive context switches because the Newton
+  kernel doesn't save/restore it.
+- UDF-trap dodges the problem by emulating in EL2 Rust: SPSR_EL2
+  carries the pre-UDF CPSR and flags through the trap; EL2 doesn't
+  need to manipulate flags, just preserve them.
 
-- **Stub body layout** — 48-byte slot, 12 words, worst-case 11 insns
-  of real code + padding filled with UDF #0xDEAD:
-  ```
-    MCR p15,0,<scratch>,c13,c0,2   ; save <scratch> to TPIDR_EL0
-    <compute EA into <scratch>>    ; 1-2 insns (imm12 may split)
-    CMP <scratch>, #0x10000000     ; MMIO-skip check
-    BHS skip                       ; skip EOR for MMIO
-    EOR <scratch>, <scratch>, #N   ; N = 3 (byte) or 2 (halfword)
-  skip:
-    <LDRB/STRB/... Rt, [<scratch>]> ; the real access
-    [optional writeback to Rn]     ; 1-2 insns
-    MRC p15,0,<scratch>,c13,c0,2   ; restore <scratch> from TPIDR_EL0
-    B orig_pc + 4                  ; direct return (±32 MiB)
-  ```
-  TPIDR_EL0 (TPIDRURW, ARMv6+) is the save slot because it's a
-  per-CPU architectural register the SA-1100 doesn't implement and
-  the Newton kernel therefore never touches; HCR_EL2 doesn't trap
-  CP15 c13 so the MCR/MRC executes natively. Nested-exception
-  caveat: if a higher-priority exception's handler itself fires a
-  shadow-stub the saved value is clobbered; in practice kernel
-  byte-access paths run with I/F masked and this hasn't surfaced.
+**SBA UDF encoding band** — `UDF #imm16` for `imm16 ∈ [0x8000, 0xFFFD]`.
+32 766 slots, enough for the full 717006 census (~27 630 ROM sites)
+plus the lazy-RAM path. `0xFFFE` is reserved for `guest_bp`; the
+tracer uses `HVC #imm16` (not UDF), so it doesn't collide.
 
-  Alternatives considered and rejected: in-slot PC-relative STR
-  (stubs in RO ROM can't self-write); `PUSH/POP` on the current-mode
-  banked SP (breaks if the patched access's Rn is SP); VFP register
-  scratch (blocked by `CPTR_EL2.TFP=1` which dispatches native
-  primitives).
+**Site metadata table** — indexed by `imm16 - SBA_UDF_BASE`. One
+`u32` for the original instruction word, one `u32` for the original
+PC (cross-checked at trap time). `patch_one_site` calls `decode()`
+to validate the instruction, allocates the next slot, writes both
+into the table, then overwrites the ROM word with the UDF. On trap,
+the handler re-runs `decode()` on the stored word; keeps the
+decoder the single source of truth.
 
-- **Fault forwarding** — when the inner access in a stub faults
-  (stage-2 IA on an unmapped or MMIO IPA), `trap.rs::handle_data_abort`
-  recognises the ELR is in a stub slot via `shadow_stub::is_stub_ipa`,
-  un-XORs the effective address back to what the guest would have
-  computed natively via `slot_xor_mask`, and forwards the fault to
-  the guest's abort handler as if it had fired at the original
-  patched PC (via `slot_original_pc`). Keeps the abort-transparent
-  invariant end-to-end.
+**Emulator flow** (`handle_sba_udf`):
+
+1. Check the UDF imm16 lies in the SBA band; look up the site.
+2. Evaluate the instruction's condition code against `spsr_und`'s
+   NZCV. Cond failed → ERET to `faulting_pc + 4` with no side effect.
+3. Snapshot R0..R14. R0..R12 alias `ctx.x[0..12]` (the UND
+   trampoline restored R0/R1/R12). R13/R14 come from
+   `UND_SAVE_BANKED_{SP,LR}_IPA` — RAM slots the trampoline fills
+   by mode-switching to the faulting mode (or SYS for USR) and
+   stashing the banked registers.
+4. Compute the effective address from Rn + offset (with optional
+   Rm-shift); pre/post-index as encoded.
+5. If `ea < XOR_LIMIT` (= 0x1000_0000), XOR with 3 (byte) or 2
+   (halfword) — the BE-32 byte-lane transform. Otherwise pass
+   through (MMIO range).
+6. Translate VA→PA via the live stage-1 tables if `SCTLR_EL1.M=1`;
+   identity otherwise.
+7. Perform the load / store. For IPAs in ROM / RAM / FB / flash
+   bank 0 / flash bank 1, go through the host-side backing; else
+   route to `mmio::read/write`. SWPB = LDRB + STRB pair with
+   interrupts already masked by EL2.
+8. Apply Rn writeback for pre-W=1 / post-index.
+9. Commit R0..R12 into `ctx.x[]` and return via `dispatch_return`.
+
+**Return dispatch**:
+
+- No writeback to R13 / R14: plain ERET to `faulting_pc + 4`. The
+  AArch64 ERET tail writes `ctx.x[0..12]` into the target mode's
+  shared R0..R12; the target mode's banked R13 / R14 are
+  untouched, which is correct because we didn't modify them.
+- Writeback to R13 / R14: route via a post-emulation trampoline at
+  `SBA_POST_TRAMP_OFFSET` (= `0x00FFFF80`). AArch64 ERET does
+  *not* propagate `x13` / `x14` into the target mode's banked
+  slots — they retain their pre-trap values across ERET. The
+  trampoline sidesteps this by running *in the faulting mode*:
+  ERET lands in the trampoline, which loads new SP / LR from the
+  `UND_SAVE_BANKED_{SP,LR}_IPA` slots natively (hitting the banked
+  registers of its current mode), restores R12 from TPIDRURW, and
+  branches via a PC-relative literal containing `faulting_pc + 4`.
+  The handler rewrites that literal and issues a DC CVAU before
+  each ERET so the in-order prefetch sees the fresh value.
+
+**UND trampoline** (`guest_mem::patch_und_vector`) — extended to
+support the emulator:
+
+- Saves R12 via `MCR p15,0,r12,c13,c0,2` (TPIDRURW) as its first
+  instruction, before the `LDR r12, [pc, ...]` that loads the
+  save-slot base. `handle_und` then reads `tpidr_el0` into
+  `ctx.x[12]`. R12 is regularly live at shadow-byte-access sites
+  (unlike the tracer's function-entry sites, where the APCS
+  prologue's `MOV R12, R13` makes R12 scratch).
+- After saving R0 / R1 / LR_und / SPSR_und, executes a short mode
+  dance to capture the faulting mode's banked SP / LR: extracts
+  `SPSR.M`, ORs with `#0xC0` to keep I/F masked, converts USR
+  (0x10) to SYS (0x1F) so the switch-back stays within PL1, does
+  `MSR CPSR_c, r1`, `STR sp / lr, [r12, #0x18 / 0x1C]`, then `MSR
+  CPSR_c, #0xdb` back to UND. R2 is the scratch register for the
+  mode compute; the trampoline saves it to slot +0x14 before use
+  and restores it before the HVC.
+- Finishes with the pre-existing SVC-bounce to capture `LR_svc`
+  (for the tracer's caller printout) and the `HVC #0x10` into EL2.
+
+Total trampoline body is 23 words + 1 literal (slot base), fitting
+in the reserved `0x00FFFF00..0x00FFFF60` window. The SBA
+post-emulation trampoline occupies the next 0x20 bytes
+(`0x00FFFF80..0x00FFFFA8`); `tracer::in_reserved_range` is widened
+to cover both so function-tracer trampoline installation skips
+this whole region.
+
+**Fault handling** — if the emulator encounters an unresolvable
+address (VA→PA walk fails, or the computed PA is outside every
+backed region and every MMIO window), it halts with full context.
+The old in-guest-stub abort-forwarding path (un-XOR FAR, retarget
+ELR to orig_pc) is gone — no guest PC ever lies inside a stub any
+more. Reflecting emulator-side aborts back as guest data aborts is
+not required for the current Phase B boot and can be added if a
+concrete need arises.
 
 ## 9. Open questions (implementation-specific)
 

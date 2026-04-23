@@ -237,7 +237,7 @@ pub extern "C" fn trap_unexpected(_ctx: &mut TrapContext) -> ! {
 fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
     let far = read_sysreg!("far_el2");
     let hpfar = read_sysreg!("hpfar_el2");
-    let mut ipa = ((hpfar >> 4) << 12) | (far & 0xFFF);
+    let ipa = ((hpfar >> 4) << 12) | (far & 0xFFF);
 
     let isv = (iss >> 24) & 1;
     let wnr = ((iss >> 6) & 1) != 0;
@@ -259,53 +259,12 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
         );
     }
 
-    // If the aborting PC is inside a shadow stub, the stub is performing
-    // the real byte/halfword access on behalf of the original guest
-    // instruction. It runs in the same guest mode as the unpatched code
-    // would have, so there's nothing special to reflect back — we just
-    // need the guest-view IPA. The stub XOR's the effective address for
-    // BE-32 byte-lane correctness on real memory, so un-XOR it here
-    // before dispatching to `mmio::{read,write}`. That matches the
-    // source-level address the kernel's code asked for (and the address
-    // the peripheral register map is keyed on).
-    //
-    // Sanity-check the stub PC: the only legal fault site inside a stub
-    // is the inner access instruction (or the STRB half of a SWPB pair).
-    // A fault anywhere else means stub emission or stage-2 is broken.
-    if shadow_stub::is_stub_ipa(elr) {
-        let (slot, off) = match shadow_stub::ipa_to_slot_offset(elr) {
-            Some(v) => v,
-            None => {
-                kprintln!("*** shadow_stub dabt: ELR {:#x} not in pool (impossible)", elr);
-                cpu::halt();
-            }
-        };
-        let expected = match shadow_stub::slot_access_offset(slot) {
-            Some(v) => v,
-            None => {
-                kprintln!("*** shadow_stub dabt: slot {} has no access_off (ELR={:#x})",
-                    slot, elr);
-                cpu::halt();
-            }
-        };
-        if off != expected && off != expected + 4 {
-            let original_pc = shadow_stub::slot_original_pc(slot).unwrap_or(u32::MAX);
-            kprintln!();
-            kprintln!("*** shadow_stub abort at UNEXPECTED stub PC ***");
-            kprintln!("  ELR={:#x} slot={} off={:#x} expected={:#x}", elr, slot, off, expected);
-            kprintln!("  original guest PC={:#x}", original_pc);
-            cpu::halt();
-        }
-
-        let xor_mask = shadow_stub::slot_xor_mask(slot).unwrap_or(0);
-        let far_u32 = far as u32;
-        let guest_far = if far_u32 >= shadow_stub::XOR_LIMIT {
-            far_u32
-        } else {
-            far_u32 ^ xor_mask
-        };
-        ipa = ((hpfar >> 4) << 12) | (guest_far as u64 & 0xFFF);
-    }
+    // Under the UDF-trap shadow-byte-access path, byte/halfword
+    // accesses are emulated in EL2 Rust (see shadow_stub::handle_sba_udf)
+    // rather than by an in-guest stub. No guest PC therefore lies
+    // inside a "stub pool" any more, and a stage-2 abort from the SBA
+    // emulator is a bug in the emulator itself — those fall through
+    // to the normal `mmio` dispatch with the actual (un-XORed) IPA.
 
     if isv == 0 {
         // No decodable syndrome — typically LDM/STM or exclusive access.
@@ -662,25 +621,40 @@ pub const UND_SAVE_LR_SVC_IPA: u32 = 0x0400_5F08;
 pub const UND_SAVE_R0_IPA: u32 = 0x0400_5F0C;
 pub const UND_SAVE_R1_IPA: u32 = 0x0400_5F10;
 
+/// R2 stash — the trampoline briefly clobbers R2 while executing the
+/// mode-switch dance that reads the faulting mode's banked SP/LR.
+pub const UND_SAVE_R2_IPA: u32 = 0x0400_5F14;
+
+/// Banked SP (R13) and LR (R14) of the faulting mode. Populated by the
+/// trampoline after switching to the faulting mode (or SYS when the
+/// faulting mode is USR) and saving its SP/LR. `handle_und` reads these
+/// so the shadow-byte-access emulator can access `[SP, #imm]`-style
+/// addressing with the right bank. The SBA post-emulation trampoline
+/// (see `guest_mem::patch_und_vector`) also reads these slots on the
+/// way out to write the updated values into the faulting mode's banked
+/// SP / LR, for sites that writeback Rn ∈ {13, 14}.
+pub const UND_SAVE_BANKED_SP_IPA: u32 = 0x0400_5F18;
+pub const UND_SAVE_BANKED_LR_IPA: u32 = 0x0400_5F1C;
+
 fn handle_und(ctx: &mut TrapContext) {
-    // Restore pre-UND R0 and R1 from the RAM slots the trampoline
-    // stashed them in. The trampoline unavoidably clobbers R0 (to
-    // hold the save-slot VA) and R1 (to carry SPSR_und and then
-    // LR_svc through the SVC bounce). Without this restore the
-    // guest's function-arg registers get scrambled across every UND
-    // round-trip — caught in Phase B as a bogus PA 0x78 write from
-    // StoreToPhysAddress, root-caused to R0/R1 surviving into
-    // AddPgPAndPermWithPageTable's prologue.
+    // Restore pre-UND R0, R1, R12 from the stash slots the trampoline
+    // populated at entry. R0/R1 go through RAM slots (the trampoline
+    // unavoidably clobbers R0 to hold the save-slot VA and R1 across
+    // the SVC bounce). R12 goes through TPIDR_EL0 (= AArch32
+    // TPIDRURW), which the trampoline writes with `MCR p15,0,r12,...`
+    // as its very first instruction before clobbering R12 to hold the
+    // save-slot base. TPIDRURW is ARMv6+ state the SA-1100-era Newton
+    // ROM never touches, so using it as the R12 save slot is safe.
     //
-    // R12 is also clobbered by the trampoline (used as the base
-    // register for the slot STRs) but is deliberately not restored:
-    // every Newton 2.x kernel function we've observed begins with
-    // `MOV R12, R13`, so R12 is effectively scratch at function-
-    // entry UDF sites. Non-function-entry UND sites (SWP, Einstein
-    // UND opcodes, CP15 quirks) are few enough that the tests catch
-    // any regression if one of them ends up relying on R12.
+    // Restoring R12 matters for the shadow-byte-access UDF-trap path,
+    // where the faulting instruction can legitimately use R12 as base
+    // / data / offset. The tracer's function-entry UDF sites don't
+    // need R12 (every Newton 2.x prologue begins `MOV R12, R13`), but
+    // doing the restore unconditionally is cheaper than branching on
+    // the UDF kind.
     ctx.x[0] = read_guest_word_pa(UND_SAVE_R0_IPA).unwrap_or(ctx.x[0] as u32) as u64;
     ctx.x[1] = read_guest_word_pa(UND_SAVE_R1_IPA).unwrap_or(ctx.x[1] as u32) as u64;
+    ctx.x[12] = read_sysreg!("tpidr_el0");
 
     // DIAG: prove handle_und is being reached at all. Single-shot log.
     static mut UND_ENTRY_LOGGED: bool = false;
@@ -741,7 +715,7 @@ fn handle_und(ctx: &mut TrapContext) {
     // is valid here.
     if (insn & 0x0FFF_0FFF) == 0x0E0F_0F51 {
         log_cp15_strongarm_clock(faulting_pc);
-        return_to_guest(ctx, (faulting_pc + 4) as u64, spsr_und);
+        return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
         return;
     }
 
@@ -756,7 +730,7 @@ fn handle_und(ctx: &mut TrapContext) {
     if (insn & 0xFFFF_0FFF) == 0xEE07_0F17 {
         log_cp15_deprecated_cache_all(faulting_pc);
         cp15::invalidate_icache_all();
-        return_to_guest(ctx, (faulting_pc + 4) as u64, spsr_und);
+        return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
         return;
     }
 
@@ -768,7 +742,7 @@ fn handle_und(ctx: &mut TrapContext) {
     // natively for our config) and advance past it.
     if (insn & 0xFFFF_0FFF) == 0xEE07_0F16 {
         log_cp15_deprecated_cache_all(faulting_pc);
-        return_to_guest(ctx, (faulting_pc + 4) as u64, spsr_und);
+        return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
         return;
     }
 
@@ -780,7 +754,7 @@ fn handle_und(ctx: &mut TrapContext) {
     match insn {
         0xE6000010 => {
             log_und_budgeted("SystemBootUND", faulting_pc, None);
-            return_to_guest(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
         }
         0xE6000510 => {
             // DebuggerUND: opcode followed by a null-terminated ASCII
@@ -796,16 +770,16 @@ fn handle_und(ctx: &mut TrapContext) {
             let msg_start = faulting_pc + 4;
             let msg_end = scan_to_null_word_aligned(msg_start, 256);
             log_debugger_und(faulting_pc, msg_start, msg_end);
-            return_to_guest(ctx, msg_end as u64, spsr_und);
+            return_to_guest_from_und(ctx, msg_end as u64, spsr_und);
         }
         0xE6000810 => {
             let payload = read_guest_word_pa(faulting_pc + 4).unwrap_or(0);
             log_und_budgeted("TapFileCntlUND", faulting_pc, Some(payload));
-            return_to_guest(ctx, (faulting_pc + 8) as u64, spsr_und);
+            return_to_guest_from_und(ctx, (faulting_pc + 8) as u64, spsr_und);
         }
         _ if is_swp_encoding(insn) => {
             emulate_swp(ctx, insn, faulting_pc);
-            return_to_guest(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
         }
         // `MRS Rd, SPSR` executed in USR mode. On ARMv4 / SA-1100 this
         // returns the CPSR (no SPSR exists for USR); the A53 UNDs it.
@@ -829,7 +803,7 @@ fn handle_und(ctx: &mut TrapContext) {
                 cpu::halt();
             }
             ctx.x[rd] = spsr_und;
-            return_to_guest(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
         }
         // Tracer trampoline slot[0] executed in USR mode. HVC is
         // UNDEFINED at EL0, so the trampoline's `hvc #TRACE_TAG`
@@ -844,7 +818,7 @@ fn handle_und(ctx: &mut TrapContext) {
             && crate::tracer::in_trampoline_pool(faulting_pc) =>
         {
             crate::tracer::log_trace_at(ctx, faulting_pc, spsr_und as u32);
-            return_to_guest(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
         }
         // User-driven guest software breakpoint — must be checked
         // before the tracer path because the marker encoding
@@ -855,6 +829,18 @@ fn handle_und(ctx: &mut TrapContext) {
                 kprintln!(
                     "*** guest_bp: marker at PC={:#x} with no matching table entry — halting",
                     faulting_pc
+                );
+                cpu::halt();
+            }
+        }
+        // Shadow-byte-access UDF — the patched byte/halfword-access
+        // site raises UND, this arm emulates the access in EL2 Rust.
+        // See `src/shadow_stub.rs`.
+        _ if shadow_stub::is_sba_udf_insn(insn) => {
+            if !shadow_stub::handle_sba_udf(ctx, faulting_pc, spsr_und, insn) {
+                kprintln!(
+                    "*** shadow_stub: SBA UDF at PC={:#x} insn={:#010x} failed — halting",
+                    faulting_pc, insn
                 );
                 cpu::halt();
             }
@@ -1078,6 +1064,33 @@ fn handle_diag(ctx: &mut TrapContext) {
     kprintln!(
         "  TTBR0_EL1 = {:#010x}  TTBR1_EL1 = {:#010x}  TCR_EL1 = {:#010x}",
         ttbr0, ttbr1, tcr
+    );
+    // Reliable banked state: the DABT trampoline at
+    // ROM DABT_TRAMP_OFFSET stores LR_abt, SP_abt, SPSR_abt (all from
+    // ABT mode) and then bounces to SVC to capture SP_svc, SPSR_svc,
+    // LR_svc. All reads are AArch32-native so they sidestep QEMU
+    // raspi3b's flaky AArch64-MRS-banked-SP plumbing.
+    let lr_abt = guest_mem::read_word_pa(guest_mem::DABT_SAVE_PA).unwrap_or(0);
+    let sp_abt = guest_mem::read_word_pa(guest_mem::DABT_SAVE_PA + 4).unwrap_or(0);
+    let spsr_abt_reliable = guest_mem::read_word_pa(guest_mem::DABT_SAVE_PA + 8).unwrap_or(0);
+    let sp_svc_reliable = guest_mem::read_word_pa(guest_mem::DABT_SAVE_PA + 0xC).unwrap_or(0);
+    let spsr_svc_reliable = guest_mem::read_word_pa(guest_mem::DABT_SAVE_PA + 0x10).unwrap_or(0);
+    let lr_svc_reliable = guest_mem::read_word_pa(guest_mem::DABT_SAVE_PA + 0x14).unwrap_or(0);
+    let pre_mode = spsr_abt_reliable & 0x1F;
+    let thumb = (spsr_abt_reliable & (1 << 5)) != 0;
+    let faulting_pc = if thumb { (lr_abt.wrapping_sub(4)) & !1 } else { lr_abt.wrapping_sub(8) };
+    let insn = guest_mem::read_word_pa(faulting_pc & !3).unwrap_or(0xDEAD_BEEF);
+    kprintln!(
+        "  DABT-trampoline saved: LR_abt={:#010x} SP_abt={:#010x} SPSR_abt={:#010x}",
+        lr_abt, sp_abt, spsr_abt_reliable
+    );
+    kprintln!(
+        "                         SP_svc={:#010x} SPSR_svc={:#010x} LR_svc={:#010x}",
+        sp_svc_reliable, spsr_svc_reliable, lr_svc_reliable
+    );
+    kprintln!(
+        "  pre-abort mode = {:#x} ({}), T={}  -> faulting PC {:#010x}  insn={:#010x}",
+        pre_mode, describe_aarch32_mode(spsr_abt_reliable), thumb as u32, faulting_pc, insn
     );
     guest_mem::dump_stage1_walk(far as u32);
     // Also walk a handful of VAs that are relevant to Newton boot —
@@ -1480,12 +1493,57 @@ fn emulate_swp(ctx: &mut TrapContext, insn: u32, faulting_pc: u32) {
     log_swp_budgeted(faulting_pc, is_byte, rn, rd, rm, addr);
 }
 
-/// UND-path version of `return_to_guest`: same sysreg writes, different
-/// name so it's obvious at call sites that the caller came from the
-/// trampoline-based UND handler. Used by `tracer` and `guest_bp` after
-/// they restore the faulting instruction's original word.
-pub(crate) fn return_to_guest_from_und(ctx: &mut TrapContext, elr: u64, spsr: u64) {
-    return_to_guest(ctx, elr, spsr);
+/// UND-path return. Must NOT use `return_to_guest` — that calls
+/// `msr spsr_el2, <val>`, which on QEMU raspi3b has a documented side
+/// effect: it clobbers SPSR_EL1 (= AArch32 SPSR_svc) with the value
+/// being written. Since the UND trampoline HVCs from UND mode, `<val>`
+/// is the pre-UND CPSR (e.g. 0x1D3 for SVC mode); that pollutes the
+/// guest's live SPSR_svc from USR → SVC, and the kernel's subsequent
+/// `movs pc, lr` at SWIBoot's epilog stays in SVC instead of returning
+/// to USR. Stalls Phase B at DFAR=0x0c001000 in SVC on `pop {r4, r5}`
+/// at PC 0x3ae3ec.
+///
+/// Workaround (suggested by the verification agent on 2026-04-23):
+/// don't write SPSR_EL2 at all. Instead, stash the desired return PC in
+/// `R14_und` via `ctx.x[14]` and ERET into a `movs pc, lr` stub at
+/// `UND_RETURN_STUB_VA`. SPSR_EL2 stays as the CPU's auto-saved value
+/// from HVC entry (= UND, mode 0x1B), so the ERET lands in UND mode.
+/// The stub then does `movs pc, lr` architecturally — the CPU copies
+/// SPSR_und (still the pre-UND CPSR, preserved since UND entry) into
+/// CPSR, and R14_und into PC. No `msr spsr_el2`, no SPSR_EL1
+/// side-effect.
+pub(crate) fn return_to_guest_from_und(_ctx: &mut TrapContext, elr: u64, _spsr: u64) {
+    // Write target PC to the stub's literal slot, then ERET into the
+    // stub in UND mode (by leaving SPSR_EL2 alone). The stub does
+    // `ldr lr, [pc, #0]; movs pc, lr` — CPU restores CPSR from SPSR_und
+    // (preserved since UND entry) and PC from the literal.
+    //
+    // Using a literal instead of `ctx.x[14] → R14_und` side-steps a
+    // QEMU raspi3b bug: AArch64 ERET to AArch32 UND doesn't reliably
+    // plumb x14 into R14_und.
+    let literal_host =
+        guest_mem::rom_host_pa() as usize + guest_mem::UND_RETURN_STUB_LITERAL_OFFSET;
+    // SAFETY: bounded write in ROM backing; EL2-owned. Flush via D-cache
+    // clean + I-cache invalidate so the guest fetch path sees the new
+    // literal.
+    unsafe {
+        core::ptr::write_volatile(literal_host as *mut u32, elr as u32);
+        core::arch::asm!(
+            "dc cvau, {0}",
+            "dsb ish",
+            "ic ivau, {0}",
+            "dsb ish",
+            "isb",
+            in(reg) literal_host as u64,
+            options(nostack, preserves_flags),
+        );
+        core::arch::asm!(
+            "msr elr_el2, {elr}",
+            "isb",
+            elr = in(reg) guest_mem::UND_RETURN_STUB_VA as u64,
+            options(nostack, preserves_flags),
+        );
+    }
 }
 
 fn return_to_guest(_ctx: &mut TrapContext, elr: u64, spsr: u64) {

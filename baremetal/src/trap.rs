@@ -572,6 +572,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
                 kprintln!("snapshot: save failed: {}", e);
             }
         }
+        v if v == crate::rom_patches::POWEROFF_REBOOT_HVC_IMM => {
+            handle_poweroff_reboot(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -845,6 +848,55 @@ pub fn handle_diag_from_bp(ctx: &mut TrapContext) -> ! {
     handle_diag(ctx);
     // handle_diag ERETs and never returns, but the function signature
     // is `fn -> ()` so Rust doesn't know; halt defensively.
+    cpu::halt();
+}
+
+/// Canary handler: the guest hit `PowerOffAndReboot` (ROM PC 0x000E_6BBC).
+/// rom_patches patched the first word to `HVC #POWEROFF_REBOOT_HVC_IMM`,
+/// so we land here BEFORE the function's prologue runs — ctx.x[0..14]
+/// alias the caller's AArch32 R0..R14, and ELR_EL2 == PowerOffAndReboot
+/// entry PC.
+///
+/// The kernel calls this whenever some fatal init-time check fails
+/// (flash identification, memory test, ROM checksum, etc.). Rebooting
+/// is the kernel's response; under the hypervisor the same failure
+/// will recur indefinitely, so we dump state and halt loudly on the
+/// first hit — no ERET.
+fn handle_poweroff_reboot(ctx: &TrapContext) -> ! {
+    let spsr_el2 = read_sysreg!("spsr_el2");
+    let elr_el2 = read_sysreg!("elr_el2");
+    let mode = (spsr_el2 & 0x1F) as u32;
+    kprintln!();
+    kprintln!("*** PowerOffAndReboot canary fired — guest is giving up ***");
+    kprintln!(
+        "  ELR_EL2  = {:#010x}  (= PowerOffAndReboot entry PC)",
+        elr_el2
+    );
+    kprintln!(
+        "  SPSR_EL2 = {:#010x}  mode={} ({:#x})",
+        spsr_el2, describe_aarch32_mode(mode), mode
+    );
+    kprintln!(
+        "  R0 = {:#010x}  (reboot reason code, passed in by caller)",
+        ctx.x[0] as u32
+    );
+    kprintln!(
+        "  R1 = {:#010x}  R2 = {:#010x}  R3 = {:#010x}",
+        ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32
+    );
+    kprintln!(
+        "  R12={:#010x}  R14(mode)={:#010x}  (caller LR; mode-banked, may be stale)",
+        ctx.x[12] as u32, ctx.x[14] as u32
+    );
+    kprintln!(
+        "  (See the tracer entries immediately preceding this line for the"
+    );
+    kprintln!(
+        "   caller chain. The check that failed is the last non-trivial"
+    );
+    kprintln!(
+        "   function called before PowerOffAndReboot.)"
+    );
     cpu::halt();
 }
 

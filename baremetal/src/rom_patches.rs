@@ -83,6 +83,19 @@ const PATCHES_717006: &[RomPatch] = &[
 pub const DEBUG_STR_HVC_IMM: u32 = 0x40;
 pub const DEBUGGER_HVC_IMM: u32 = 0x41;
 
+/// Phase-B canary: PowerOffAndReboot at 0x000E_6BBC. The kernel calls
+/// this whenever a fatal init-time check fails (e.g. flash chip
+/// identification yields no driver match — see INVESTIGATION.md).
+/// Under our hypervisor that means the boot has gone wrong but the
+/// kernel thinks rebooting will help — it won't, the same failure
+/// recurs and the trace fills with hundreds of post-mortem repetitions.
+///
+/// Patch the first word with `HVC #POWEROFF_REBOOT_HVC_IMM` so we
+/// halt loudly the FIRST time it fires, with the caller's R0 (reboot
+/// reason) and the trace context immediately preceding the call.
+pub const POWEROFF_REBOOT_PC: u32 = 0x000E_6BBC;
+pub const POWEROFF_REBOOT_HVC_IMM: u32 = 0x42;
+
 /// AArch32 `HVC #imm16` encoding at unconditional (cond=AL).
 const fn hvc_insn(imm: u32) -> u32 {
     0xE140_0070 | ((imm & 0xFFF0) << 4) | (imm & 0xF)
@@ -153,9 +166,10 @@ pub unsafe fn apply_717006_patches(rom_ptr: *mut u32) {
         apply_real_clock_seconds_patch(rom_ptr);
         apply_ftime_in_seconds_patch(rom_ptr);
         apply_fdate_from_seconds_patch(rom_ptr);
+        apply_poweroff_reboot_trap(rom_ptr);
     }
 
-    kprintln!("rom_patch: applied {} simple patches + 5 native-call/injection ROM patches", applied);
+    kprintln!("rom_patch: applied {} simple patches + 5 native-call/injection ROM patches + PowerOffAndReboot canary", applied);
 }
 
 /// (Previously we patched every `T28F016_SA_SVDriver` method to emit
@@ -292,6 +306,25 @@ unsafe fn apply_fdate_from_seconds_patch(rom_ptr: *mut u32) {
     let patch_insn = arm_b(PATCH_PC, FDATE_STUB_PC);
     unsafe {
         write_stub_and_patch(rom_ptr, FDATE_STUB_PC, &stub, PATCH_PC, patch_insn, "FDateFromSeconds");
+    }
+}
+
+/// Replace the first word of `PowerOffAndReboot` (0x000E_6BBC) with a
+/// single `HVC #POWEROFF_REBOOT_HVC_IMM`. The handler in
+/// `trap::handle_hvc` dumps the calling context (R0 = reboot reason,
+/// LR via banked-reg path, mode, ELR) and halts — we never resume.
+/// This catches the boot-fail-and-reboot loop the FIRST time it fires
+/// instead of seeing 350k repeated tracer entries before timeout.
+unsafe fn apply_poweroff_reboot_trap(rom_ptr: *mut u32) {
+    let idx = (POWEROFF_REBOOT_PC / 4) as usize;
+    let insn = hvc_insn(POWEROFF_REBOOT_HVC_IMM);
+    unsafe {
+        let prev = rom_ptr.add(idx).read();
+        rom_ptr.add(idx).write(insn);
+        kprintln!(
+            "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (PowerOffAndReboot canary, HVC #{:#x})",
+            POWEROFF_REBOOT_PC, prev, insn, POWEROFF_REBOOT_HVC_IMM,
+        );
     }
 }
 

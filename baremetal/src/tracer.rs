@@ -107,9 +107,12 @@ fn fn_name(i: usize) -> &'static str {
 ///     claimed by the hypervisor's UND / DIAG patches.
 ///   - VA 0x00FF_FF00..0x00FF_FF74: UND trampoline + ROM-patch injection
 ///     stubs (see guest_mem::patch_und_vector and rom_patches::*).
+///   - PowerOffAndReboot: rom_patches installs a one-word HVC canary
+///     there; the tracer overwriting it would silently mask the trap.
 pub fn in_reserved_range(addr: u32) -> bool {
     if addr < 0x0000_0020 { return true; }
     if (0x00FF_FF00..0x00FF_FF80).contains(&addr) { return true; }
+    if addr == crate::rom_patches::POWEROFF_REBOOT_PC { return true; }
     false
 }
 

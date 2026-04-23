@@ -42,37 +42,40 @@ pub const DRAM_1GIB_BLOCK: Option<u64> = Some(0x8000_0000);
 /// needed.
 pub const NEWTON_TICK_HZ: u64 = 3_686_400;
 
-/// Route CNTHP to the CPU's IRQ input.
-///
-/// TODO(fvp): this is a stub until the GICv3 init lands. Booting
-/// guest-tests that never arm a timer works without it; anything that
-/// depends on CNTHP delivery (the 1 ms tick-page heartbeat, guest
-/// Newton match registers) will stall here until we wire up:
-///   - GICD_CTLR.EnableGrp1NS
-///   - GICR_WAKER (clear ProcessorSleep, wait ChildrenAsleep)
-///   - GICR_ISENABLER0 bit 26 (CNTHP PPI, INTID 26)
-///   - GICR_IPRIORITYR[26], GICR_IGROUPR0 bit 26
-///   - ICC_PMR_EL1, ICC_IGRPEN1_EL1
+/// Route CNTHP to the CPU's IRQ input via the GICv3. Brings the whole
+/// GIC up (ICC_SRE_EL2, distributor, redistributor, CPU interface)
+/// because nothing else will: on FVP with `has_el3=0` there is no
+/// secure firmware to do it. See `super::gicv3` for the bare-metal
+/// initialisation sequence.
 pub fn install_cnthp_irq_routing() {
-    // No-op for now — see TODO above.
+    super::gicv3::init();
+    super::gicv3::enable_ppi(super::gicv3::INTID_CNTHP);
+}
+
+/// Ack the currently-asserted IRQ and return its INTID. Called at the
+/// top of the EL2 IRQ handler before touching any physical state.
+#[inline]
+pub fn irq_ack() -> u32 {
+    super::gicv3::ack()
+}
+
+/// End-of-interrupt for an INTID previously returned by `irq_ack`.
+/// Deasserts the CPU's IRQ line and re-arms the GIC for the next one.
+#[inline]
+pub fn irq_eoi(intid: u32) {
+    super::gicv3::eoi(intid);
+}
+
+/// Spurious INTID (no pending interrupt). The handler skips `on_irq`
+/// but still runs the common tail when it sees this.
+#[inline]
+pub fn irq_spurious() -> u32 {
+    super::gicv3::INTID_SPURIOUS
 }
 
 /// Early per-platform CPU sysreg fixups before we touch anything that
-/// reads them. FVP boots with `has_el3=0` so there's no secure firmware
-/// to program CNTFRQ_EL0; the generic-timer counter ticks at the Base
-/// Platform's architectural 100 MHz regardless, so we publish that
-/// rate to software. Writable from EL2 because EL2 is the highest
-/// implemented exception level.
-pub fn init_cpu_sysregs() {
-    const CNTFRQ_HZ: u64 = 100_000_000;
-    // SAFETY: sysreg write with no memory side effects; CNTFRQ_EL0 is
-    // writable at EL2 when EL3 is not implemented.
-    unsafe {
-        core::arch::asm!(
-            "msr cntfrq_el0, {}",
-            "isb",
-            in(reg) CNTFRQ_HZ,
-            options(nostack, preserves_flags),
-        );
-    }
-}
+/// reads them. On FVP with `has_el3=1` (our chosen config — see
+/// `scripts/fvp` and the EL3 stub in `boot.s` for why), CNTFRQ_EL0 is
+/// writable only at EL3; the stub programs it before ERETing to EL2,
+/// so this is a no-op.
+pub fn init_cpu_sysregs() {}

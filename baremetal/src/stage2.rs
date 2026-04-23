@@ -382,12 +382,29 @@ pub mod tick_page {
         // buffer; writing u32s at fixed offsets is in-bounds.
         unsafe {
             let ptr = addr_of_mut!(TICK_PAGE) as *mut u8;
-            core::ptr::write_volatile(ptr.add(TICK_OFFSET_TICKS) as *mut u32, ticks);
-            core::ptr::write_volatile(ptr.add(TICK_OFFSET_CALENDAR) as *mut u32, calendar);
-            // Ensure the stores are globally visible before the guest's
-            // next load. DSB ISH covers the inner-shareable domain which
-            // is what S2_SH_INNER selects for this page.
-            core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+            let cal_addr = ptr.add(TICK_OFFSET_CALENDAR);
+            let ticks_addr = ptr.add(TICK_OFFSET_TICKS);
+            core::ptr::write_volatile(ticks_addr as *mut u32, ticks);
+            core::ptr::write_volatile(cal_addr as *mut u32, calendar);
+            // Clean the cache lines to the Point of Coherency. When
+            // the guest boots with stage-1 MMU off (as every
+            // guest-test does — see `guest-tests/common/test_runtime.S`),
+            // its loads are treated as Device accesses that bypass
+            // the cache; a plain `dsb ish` publishes the stores to
+            // the inner-shareable domain but leaves them sitting in
+            // the hypervisor's cache, invisible to a Device read.
+            // `dc cvac` pushes the line to DRAM where the Device
+            // read will see it. The two addresses sit in different
+            // 64-byte lines (calendar at 0x000, ticks at 0x800) so
+            // we clean both.
+            core::arch::asm!(
+                "dc cvac, {cal}",
+                "dc cvac, {ticks}",
+                "dsb ish",
+                cal = in(reg) cal_addr,
+                ticks = in(reg) ticks_addr,
+                options(nostack, preserves_flags),
+            );
         }
     }
 }

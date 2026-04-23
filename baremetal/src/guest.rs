@@ -41,11 +41,35 @@ unsafe fn configure_el2_traps() {
         hcr |= 1u64 << 20;    // TIDCP: trap implementation-defined CP15
         hcr |= 1u64 << 26;    // TVM:   trap guest writes to virtual-memory CP15 regs
         hcr |= 1u64 << 22;    // TSW:   trap set/way cache maintenance
+        hcr |= 1u64 << 12;    // DC:    force Normal-WB cacheable while
+                              //        guest stage-1 MMU is off. Without
+                              //        this the guest's reset-time
+                              //        accesses are Normal Non-cacheable
+                              //        (AArch32) or Device (AArch64),
+                              //        which makes them incoherent with
+                              //        the hypervisor's own Normal-WB
+                              //        view of the same DRAM. Falls off
+                              //        automatically once the guest
+                              //        enables its stage-1 MMU.
         hcr |= 1u64 << 3;     // FMO:   route physical FIQ to EL2
         hcr |= 1u64 << 4;     // IMO:   route physical IRQ to EL2
         hcr |= 1u64 << 5;     // AMO:   route SError to EL2
         asm!("msr hcr_el2, {}", "isb", in(reg) hcr,
             options(nostack, preserves_flags));
+
+        // Set AArch32 FPEXC.EN = 1 on behalf of the guest before
+        // touching CPTR_EL2.TFP. Without EN=1 the guest's first
+        // access to CP10/CP11 (any VFP or MCR p10 / MRC p10 — the
+        // native-primitive gateway) UNDEFs at EL1 *before*
+        // CPTR_EL2.TFP has a chance to trap it. Must happen before
+        // TFP is set: writing FPEXC32_EL2 at EL2 with TFP=1 would
+        // trap to EL2 itself and recurse.
+        asm!(
+            "msr S3_4_C5_C3_0, {}",   // FPEXC32_EL2
+            "isb",
+            in(reg) 1u64 << 30,       // EN
+            options(nostack, preserves_flags),
+        );
 
         // CPTR_EL2.TFP routes lower-EL FP/SIMD (and thus AArch32
         // MCR/MRC to CP10/11 — the native-primitive gateway) to EL2
@@ -113,7 +137,10 @@ unsafe fn eret_to_guest(entry_ipa: u64) -> ! {
         // stale (zero) bytes on platforms that honour I/D cache
         // separation — we saw this as an EC=0x20 abort at IPA 0x1000000
         // on FVP_Base_RevC (guest fell through 16 MiB of zero-NOPs to
-        // the end of the ROM aperture).
+        // the end of the ROM aperture). HCR_EL2.DC (set above) keeps
+        // the guest's data accesses Normal-WB cacheable while its
+        // stage-1 MMU is off, so they share our cache and no data-
+        // side flush is needed.
         asm!(
             "dsb ish",
             "ic iallu",

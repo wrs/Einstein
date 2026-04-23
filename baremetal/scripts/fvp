@@ -64,9 +64,15 @@ mount_root="$(cd "$here/../.." && pwd)"
 rel_elf="${elf_abs#$mount_root/}"
 
 # FVP parameters. See reference_fvp_base_revc.md for why each matters.
+#
+# has_el3=1: we enter at EL3, run a tiny stub in boot.s that wakes the
+# GICv3 redistributor (GICR_WAKER is Secure-only), sets GICD_CTLR.DS=1,
+# and ERETs to EL2. Without EL3 the hypervisor cannot wake the RD at
+# all — GICR_WAKER writes from NS are ignored and the CPU interface
+# never sees any PPI deliveries.
 fvp_args=(
     -a "cluster0.cpu0=/work/$rel_elf"
-    -C cluster0.has_el3=0
+    -C cluster0.has_el3=1
     -C cluster0.NUM_CORES=1
     -C cluster1.NUM_CORES=1
     -C cluster0.cpu0.RVBAR=0x80000000
@@ -82,8 +88,21 @@ fvp_args=(
     -C bp.terminal_3.start_telnet=0
 )
 
+# Give the container a unique name so we can forcibly stop it on exit.
+# `--rm` alone is not enough: if this script is killed (e.g. `timeout`
+# firing the outer deadline, or a grep|head upstream closing the pipe)
+# the docker CLI exits without signalling the container, which then
+# keeps running the FVP binary at 100% CPU until reboot. `--init`
+# runs tini as PID 1 inside the container so SIGTERM reaches the FVP
+# process cleanly when we do stop it.
+cname="newton-fvp-$$-$RANDOM"
+cleanup() {
+    docker rm -f "$cname" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM HUP
+
 docker_args=(
-    run --rm --platform linux/arm64
+    run --rm --init --name "$cname" --platform linux/arm64
     -v "$mount_root:/work"
     -w /work
 )
@@ -101,5 +120,10 @@ if [[ -n "${FVP_EXTRA:-}" ]]; then
     fvp_args+=("${extra[@]}")
 fi
 
-exec timeout "$timeout_secs" docker "${docker_args[@]}" \
+# `timeout -k 5` escalates to SIGKILL 5 s after the initial SIGTERM
+# if docker is still alive; combined with the EXIT trap above this
+# guarantees no orphaned container survives the script's death.
+# NB: not using `exec` — exec replaces the shell and the trap would
+# never fire.
+timeout -k 5 "$timeout_secs" docker "${docker_args[@]}" \
     --entrypoint "$FVP_BIN" "$IMAGE" "${fvp_args[@]}"

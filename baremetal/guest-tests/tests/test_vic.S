@@ -12,12 +12,22 @@
 @
 @   * The EL2 physical timer (CNTHP_CVAL_EL2) is armed from the guest's
 @     MATCH write.
-@   * CNTHPIRQ is routed via the BCM2836 per-core peripheral to the IRQ
-@     pin, taken at EL2 (HCR_EL2.IMO=1), handled, and reflected back as
-@     a virtual IRQ (HCR_EL2.VI).
-@   * The shared runtime's _irq_entry handler services IntPresent / IntClear
-@     correctly, and a second arm of MATCH_2 (followed by another WFI)
-@     produces a second interrupt — no stuck state, no double-fire.
+@   * CNTHPIRQ is routed via the BCM2836 per-core peripheral / GICv3 PPI
+@     to the IRQ pin, taken at EL2 (HCR_EL2.IMO=1), handled, and
+@     reflected back as a virtual IRQ (HCR_EL2.VI).
+@   * The shared runtime's _irq_entry handler services IntPresent /
+@     IntClear correctly, and a second arm of MATCH_2 (followed by
+@     another WFI) produces a second interrupt — no stuck state,
+@     no double-fire.
+@
+@ WFI wakes on any physical IRQ, including the 1 ms tick-page
+@ heartbeat that fires between match deadlines. On raspi3b the
+@ Newton-tick scaling (128x) puts match and heartbeat in the same
+@ microsecond window so a single WFI suffices; on FVP the unscaled
+@ 3.6864 MHz rate means a match at `now + 0x4000` ticks is several
+@ heartbeats away. We loop WFI until irq_count reaches the expected
+@ value — this matches how a real kernel's "wait for interrupt"
+@ primitive is written.
 
 #include "../common/test_runtime.S"
 
@@ -85,16 +95,16 @@ test_main:
     cmp     r5, #0
     bne     .Lfail_irq_premature
 
-    @ Unmask IRQs globally and park in WFI. We must not touch any MMIO
-    @ after this point or the trap-return poll path could deliver the IRQ
-    @ for us and invalidate the test.
+    @ Unmask IRQs globally and park in WFI. Loop WFI until the IRQ
+    @ handler has run once — spurious wakes (from the hypervisor's
+    @ 1 ms tick heartbeat) just re-enter WFI.
     cpu_enable_irq
+.Lwfi_loop_1:
     wfi
-
-    @ If WFI returned without the IRQ handler running, irq_count is still 0.
     ldr     r4, =IRQ_COUNT_ADDR
     ldr     r5, [r4]
     cmp     r5, #1
+    blt     .Lwfi_loop_1
     bne     .Lfail_wfi_no_irq
 
     @ Verify the pending snapshot had TIMER_2 set.
@@ -123,11 +133,12 @@ test_main:
     ldr     r4, =MATCH_2
     str     r5, [r4]
 
+.Lwfi_loop_2:
     wfi
-
     ldr     r4, =IRQ_COUNT_ADDR
     ldr     r5, [r4]
     cmp     r5, #2
+    blt     .Lwfi_loop_2
     bne     .Lfail_second_count
 
     mov     r0, #3

@@ -103,6 +103,7 @@ pub fn icache_publish_range(va: u64, len: usize) {
     }
 }
 
+
 // NOTE: There is no `read_sp_abt()` helper. `MRS <Xt>, SP_abt`
 // (S3_4_C4_C1_1) is architecturally defined (DDI 0487 D19.2) but
 // QEMU raspi3b's Cortex-A53 model takes an EC=0 UNDEFINED trap at

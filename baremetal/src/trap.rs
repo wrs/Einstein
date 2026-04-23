@@ -8,7 +8,7 @@
 //! return — the vector trailer restores the context and ERETs. Handlers that
 //! don't want to resume never return (they call `cpu::halt`).
 
-use crate::{cpu, guest_mem, kprintln, mmio, peripherals::{native_primitives, vic}, shadow_stub, timer};
+use crate::{cpu, guest_mem, kprintln, mmio, peripherals::{native_primitives, vic}, platform, shadow_stub, timer};
 
 macro_rules! read_sysreg {
     ($reg:literal) => {{
@@ -157,6 +157,13 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
 /// and update HCR_EL2.VI so the guest takes a virtual IRQ on ERET.
 #[no_mangle]
 pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
+    // Acknowledge the interrupt on the host CPU-interface (GICv3 on
+    // FVP, no-op on BCM2836) before doing any work. On GICv3 the
+    // returned INTID identifies which source fired; a spurious ACK
+    // means nothing is pending and we skip timer::on_irq.
+    let intid = platform::irq_ack();
+    let spurious = intid == platform::irq_spurious();
+
     // Diagnostic heartbeat: sample guest PC so we can see where it's
     // executing when no MMIO traps are firing.
     //
@@ -188,11 +195,14 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
         let spsr = read_sysreg!("spsr_el2");
         let far = read_sysreg!("far_el1");
         kprintln!(
-            "timer_irq[{}]: guest ELR={:#x} SPSR={:#x} FAR_EL1={:#x}",
-            tag, elr, spsr, far
+            "timer_irq[{}]: guest ELR={:#x} SPSR={:#x} FAR_EL1={:#x} intid={}",
+            tag, elr, spsr, far, intid
         );
     }
-    timer::on_irq();
+
+    if !spurious {
+        timer::on_irq();
+    }
     update_virq();
     // Wall-clock-paced snapshot save. Timer IRQ is a cleaner hook
     // than sync traps: it fires regardless of whether the guest is
@@ -200,6 +210,10 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     // into the ring even when the guest is wedged. See
     // src/snapshot.rs.
     crate::snapshot::maybe_autosave(ctx);
+
+    // EOI last so the GIC is ready to deliver the next interrupt.
+    // No-op on BCM2836.
+    platform::irq_eoi(intid);
 }
 
 /// Set HCR_EL2.VI / VF according to whether the VIC has any enabled IRQ

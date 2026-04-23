@@ -23,4 +23,7 @@ mod imp;
 #[path = "fvp_base.rs"]
 mod imp;
 
+#[cfg(feature = "platform-fvp-base")]
+pub mod gicv3;
+
 pub use imp::*;

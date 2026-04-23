@@ -48,3 +48,19 @@ pub fn install_cnthp_irq_routing() {
 /// reads them. On raspi3b both QEMU and Pi firmware program CNTFRQ_EL0
 /// for us, so this is a no-op.
 pub fn init_cpu_sysregs() {}
+
+/// The BCM2836 local peripheral does not latch IRQs the way a GIC
+/// does: asserting / deasserting happens purely in the timer
+/// comparator, so there's no CPU-interface state to ACK or EOI. The
+/// handler still calls these so the FVP GICv3 path can hook in.
+#[inline]
+pub fn irq_ack() -> u32 { 0 }
+
+#[inline]
+pub fn irq_eoi(_intid: u32) {}
+
+/// BCM has no "spurious" INTID — the IRQ line is only asserted while a
+/// real source is firing. `irq_ack` always returns 0, so we pick
+/// u32::MAX as a sentinel the handler will never see from `irq_ack`.
+#[inline]
+pub fn irq_spurious() -> u32 { u32::MAX }

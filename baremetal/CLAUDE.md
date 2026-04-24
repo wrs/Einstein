@@ -1,8 +1,36 @@
 # Hypervisor notes for Claude
 
 Newton Hypervisor — pure-Rust Type-1 hypervisor running an unmodified
-Newton OS 2.x ROM on Cortex-A53 under QEMU `raspi3b`. See
-`README.md` for the user-facing project overview and
+Newton OS 2.x ROM on Cortex-A53. Two host platforms are supported; the
+guest ISA and modelled Newton hardware are identical on both.
+
+- **QEMU `raspi3b`** — the original target. Selected with
+  `--features platform-raspi3b` (default). Runs via
+  `cargo run --release` (wraps `scripts/run-qemu.sh`). Uses a legacy
+  BCM2835 VIC; AArch32↔AArch64 banked-register plumbing is flaky
+  (see `docs/QEMU_BUGS.md`).
+- **ARM FVP `FVP_Base_RevC-2xAEMvA`** — the accurate reference model.
+  Selected with `--no-default-features --features platform-fvp-base`.
+  Uses GICv3 (the hypervisor brings it up through an EL3 stub). Runs
+  via `scripts/fvp <elf>` — the script wraps a dockerised FVP
+  (OrbStack + `armswdev/aemfvp-cca-v2-image`). Typical cold boot:
+  ```bash
+  rm -f /tmp/newton-snapshot-*.bin
+  cargo build --release --no-default-features \
+    --features "platform-fvp-base quiet"
+  scripts/fvp --timeout=90 \
+    target/aarch64-unknown-none-softfloat/release/newton-hypervisor
+  ```
+  Add `--gdb` for an Iris debug server on host port 7100; add
+  `--features trace` for the function-level tracer. FVP runs the
+  generic timer + cache model accurately, so wall-clock is much
+  slower than QEMU TCG — use longer timeouts.
+
+Both platforms must stay green: `guest-tests/scripts/run-all.sh` runs
+the 22 guest tests on QEMU, and any new divergence should be tracked
+down rather than papered over with a feature gate.
+
+See `README.md` for the user-facing project overview and
 `PLAN.md` / `HIGHLEVEL.md` / `IMPLEMENTATION.md` for the phasing.
 
 Phase A is done. Phase B's goal is booting the 717006 ROM through to

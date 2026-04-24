@@ -900,6 +900,18 @@ fn handle_und(ctx: &mut TrapContext) {
                 cpu::halt();
             }
         }
+        // FPA control/status register access: RFS / WFS / RFC / WFC.
+        // These UND on A53 (no FPA coprocessor) and — per ARMv8 B2.2.4 —
+        // may UND even when their condition is false. Emulate as a NOP:
+        // reads return 0 in Rt, writes are discarded. Nothing Newton boot
+        // actually runs exercises the FPA control/status registers —
+        // FPE_Install's helper at 0x392704 uses `rfceq`/`wfceq` to init
+        // the emulator state, and the context-word semantic (rounding
+        // mode, trap enables) is never consulted by integer-math boot
+        // code. See INVESTIGATION.md for the full FPE_Install analysis.
+        _ if is_fpa_ctrl_reg_insn(insn) => {
+            emulate_fpa_ctrl_reg(ctx, insn, faulting_pc, spsr_und);
+        }
         _ => {
             kprintln!(
                 "*** unrecognised UND: insn={:#010x} at PC={:#x} SPSR_und={:#x}",
@@ -910,6 +922,121 @@ fn handle_und(ctx: &mut TrapContext) {
             );
             cpu::halt();
         }
+    }
+}
+
+/// Does `insn` match one of the four FPA control/status register
+/// encodings — RFS, WFS, RFC, WFC — targeting CP1?
+///
+///   RFS: cccc 1110 0011 0000 Rt 0001 0001 0000  (MRC p1, 1, Rt, c0, c0, 0)
+///   WFS: cccc 1110 0010 0000 Rt 0001 0001 0000  (MCR p1, 1, Rt, c0, c0, 0)
+///   RFC: cccc 1110 0101 0000 Rt 0001 0001 0000  (MRC p1, 2, Rt, c0, c0, 0)
+///   WFC: cccc 1110 0100 0000 Rt 0001 0001 0000  (MCR p1, 2, Rt, c0, c0, 0)
+///
+/// The common bits fix the shape as `0x?E00_?110` with bits 23:20 ∈
+/// {2, 3, 4, 5}. Mask 0x0F0F_0FFF preserves everything except cond
+/// (31:28), opc1/L (23:20), and Rt (15:12); the fixed pattern is
+/// 0x0E00_0110. We then require bits 23:20 to be one of the four
+/// control/status register values — this leaves FPA data ops (ADF, LDF,
+/// …) and non-CP1 accesses to halt loudly, which is the right Phase-A
+/// trip-wire behaviour.
+fn is_fpa_ctrl_reg_insn(insn: u32) -> bool {
+    if (insn & 0x0F0F_0FFF) != 0x0E00_0110 {
+        return false;
+    }
+    matches!((insn >> 20) & 0xF, 2 | 3 | 4 | 5)
+}
+
+/// Emulate an FPA control/status register access (RFS / WFS / RFC /
+/// WFC) as a NOP: reads return 0 in Rt, writes are discarded, PC
+/// advances by 4. Respects the ARM condition code — an FVP-taken UND
+/// on a false-condition `rfceq` etc. leaves Rt alone, matching the
+/// architecturally-specified NOP behaviour (ARMv8 B2.2.4).
+fn emulate_fpa_ctrl_reg(
+    ctx: &mut TrapContext,
+    insn: u32,
+    faulting_pc: u32,
+    spsr_und: u64,
+) {
+    let cond = (insn >> 28) & 0xF;
+    let passed = arm_condition_passed(cond, spsr_und as u32);
+    if passed {
+        let is_read = ((insn >> 20) & 1) != 0;
+        let rt = ((insn >> 12) & 0xF) as usize;
+        // Rt == r15 is UNPREDICTABLE for RFS/RFC on FPA; ignore the
+        // write rather than scribble on the AArch64 context's x15.
+        if is_read && rt < 15 {
+            ctx.x[rt] = 0;
+        }
+        // Write path: discard the source value. The FPA control word
+        // holds rounding mode + trap enables, neither observable under
+        // our emulation.
+    }
+    log_fpa_ctrl_reg(faulting_pc, insn, passed);
+    return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+}
+
+/// Evaluate an ARM A1 condition field against NZCV flags from a CPSR
+/// snapshot. Cond == 0xF (unconditional) is not reachable here because
+/// the FPA control/status encodings always have a real condition in
+/// bits 31:28; defensively we treat it as AL.
+fn arm_condition_passed(cond: u32, cpsr: u32) -> bool {
+    let n = (cpsr >> 31) & 1;
+    let z = (cpsr >> 30) & 1;
+    let c = (cpsr >> 29) & 1;
+    let v = (cpsr >> 28) & 1;
+    match cond & 0xF {
+        0x0 => z == 1,                  // EQ
+        0x1 => z == 0,                  // NE
+        0x2 => c == 1,                  // CS / HS
+        0x3 => c == 0,                  // CC / LO
+        0x4 => n == 1,                  // MI
+        0x5 => n == 0,                  // PL
+        0x6 => v == 1,                  // VS
+        0x7 => v == 0,                  // VC
+        0x8 => c == 1 && z == 0,        // HI
+        0x9 => c == 0 || z == 1,        // LS
+        0xA => n == v,                  // GE
+        0xB => n != v,                  // LT
+        0xC => z == 0 && n == v,        // GT
+        0xD => z == 1 || n != v,        // LE
+        0xE => true,                    // AL
+        _ => true,                      // 0xF: defensive
+    }
+}
+
+fn log_fpa_ctrl_reg(pc: u32, insn: u32, cond_passed: bool) {
+    const SEEN_CAP: usize = 16;
+    static mut SEEN: [u32; SEEN_CAP] = [0; SEEN_CAP];
+    static mut SEEN_N: usize = 0;
+    // SAFETY: single-threaded EL2.
+    let first = unsafe {
+        let mut found = false;
+        for i in 0..SEEN_N { if SEEN[i] == pc { found = true; break; } }
+        if !found && SEEN_N < SEEN_CAP {
+            SEEN[SEEN_N] = pc;
+            SEEN_N += 1;
+            true
+        } else {
+            false
+        }
+    };
+    if first {
+        let name = match (insn >> 20) & 0xF {
+            2 => "WFS",
+            3 => "RFS",
+            4 => "WFC",
+            5 => "RFC",
+            _ => "FPA-CR?",
+        };
+        let rt = (insn >> 12) & 0xF;
+        kprintln!(
+            "und: FPA {} r{} @PC={:#x} — NOP (cond {})",
+            name,
+            rt,
+            pc,
+            if cond_passed { "passed" } else { "failed" },
+        );
     }
 }
 

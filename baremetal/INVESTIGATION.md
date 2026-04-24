@@ -3,6 +3,65 @@
 Live notes. Update as we learn more; archive to a dated file when
 we move past the current stall.
 
+## Resolved — FPA CP1 rfc/wfc at 0x392718 (FVP, 2026-04-23)
+
+`FPE_Install` at `0x3928A0` calls a helper at `0x392704` that
+conditionally executes `rfceq r1` at `0x392718` and `wfceq r1` at
+`0x39272C`. On the A53 both UND because CP1 (FPA) is unimplemented.
+Per ARMv8 A-profile B2.2.4, an UNDEFINED instruction whose condition
+evaluates false is permitted to either NOP or raise the Undefined
+Instruction exception — implementation-defined. FVP chooses to
+exception; QEMU raspi3b would NOP. Hence the stall only surfaces on
+FVP.
+
+Fix in `src/trap.rs::handle_und`: direct NOP emulation of the four
+FPA control/status-register encodings, guarded by the ARM condition
+bits in `spsr_und` so false-condition UNDs don't scribble on `Rt`.
+
+```
+  RFS  cccc 1110 0011 0000 Rt 0001 0001 0000   (MRC p1, 1, Rt, c0, c0, 0)
+  WFS  cccc 1110 0010 0000 Rt 0001 0001 0000   (MCR p1, 1, Rt, c0, c0, 0)
+  RFC  cccc 1110 0101 0000 Rt 0001 0001 0000   (MRC p1, 2, Rt, c0, c0, 0)
+  WFC  cccc 1110 0100 0000 Rt 0001 0001 0000   (MCR p1, 2, Rt, c0, c0, 0)
+```
+
+Read path returns 0 in `Rt`; write path discards the value. Nothing
+Newton boot actually runs depends on real FPA state — the control
+word only holds rounding mode + trap enables, which no integer-math
+boot code consults. All other FPA / CP1 shapes (data ops, load/store
+FP regs) still halt as Phase-A trip-wires; we'll add emulation if any
+ever fire during boot.
+
+Why not forward to the guest's own FPE emulator? Tried it — it
+forwards the UND through `FP_UndefHandlers_Start`, whose dispatch
+table at `0x38EA34..0x38EA70` classifies `rfc`/`wfc`/`rfs`/`wfs` as
+"not a recognized FP instruction" (bits\[23:20] ∈ {2,3,4,5} all map to
+`b 0x38F028`). From `0x38F028` control chains into `ReportException`,
+which with our `gDebugger = 1` patch takes the `StopImage` branch and
+wedges polling BIO register `0x0F183000` for a halt-acknowledge bit
+that nothing will ever set. Direct EL2 emulation sidesteps the entire
+chain.
+
+Notes on the surrounding code:
+
+- The probe at `0x392630` calls stubs at `0x39291C` (pre-probe) and
+  `0x392924` (post-probe), both 2-word `push {r0,lr}; pop {r0,pc}`
+  functional NOPs with no symbol in `_Data_/symbols.txt`. With
+  `0x39291C` as a plain return, the `bl`→`mvn r0, #0`→`bne` sequence
+  at `0x392650..0x392660` always stores `-1` as the FPA type and
+  skips the `rfs r2` probe entirely. That path is consistent with the
+  SA-1100 having no FPA; the `rfceq`/`wfceq` calls in the helper at
+  `0x392704` are gated on `r0 == 0x81`, which is never true, so those
+  instructions are architecturally NOPs and the only reason they
+  matter is FVP's choice to UND on a false-condition undefined
+  encoding.
+- The `gDebugger = 1` ROM patch (`src/rom_patches.rs`, VA `0x13F4`)
+  is still correct for the normal boot path — it's only reached from
+  `ReportException` in our previous failure mode, which shouldn't
+  happen any more now that we don't forward the FPA UND.
+
+Commits: pending bundle.
+
 ## Resolved — QEMU `msr spsr_el2` clobbers SPSR_EL1 (2026-04-23)
 
 Boot previously wedged at `DFAR=0x0c001000` in SVC mode on `pop {r4, r5}`

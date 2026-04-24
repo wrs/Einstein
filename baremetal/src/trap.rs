@@ -2028,25 +2028,16 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
                 // hit) falls through as VA=IPA and stage-2-faults.
                 crate::guest::set_dc_for_stage1_off(false);
                 guest_mem::fix_stage1_xn_bits();
-                // Flush ROM + RAM backing to the Point-of-Coherency so
-                // the guest's stage-1 walker — which (with TTBCR=0 /
-                // default-walker attributes) may read page tables as
-                // Non-cacheable — sees the modifications from
-                // fix_stage1_xn_bits and from earlier ROM patches.
-                // FVP Base RevC models I/D cache + mismatched-attribute
-                // semantics strictly; without this clean, the walker
-                // picks up the original ROM bytes of the L2 tables and
-                // takes PABTs on supposedly-mapped VAs. QEMU raspi3b
-                // TCG doesn't exhibit the problem because its cache
-                // model is a stub.
-                crate::shadow_stub::icache_sync_range(
-                    crate::guest_mem::rom_host_pa(),
-                    crate::guest_mem::ROM_SIZE,
-                );
-                crate::shadow_stub::icache_sync_range(
-                    crate::guest_mem::ram_host_pa(),
-                    crate::guest_mem::RAM_SIZE,
-                );
+                // No cache maintenance here: the TTBR0 write handler
+                // below OR's Inner/Outer-WB cacheability bits into
+                // every guest TTBR0 write, so stage-1 walks share the
+                // D-cache view of the producer (kernel's own page-
+                // table writes, and our in-place rewrites in
+                // fix_stage1_xn_bits). Producer + walker matched-
+                // attributes keeps them coherent per ARM ARM §B2.8
+                // without any DC CVAC burst. See the comment block at
+                // the (0, 2, 0, 0) CP15-write case for the full
+                // rationale.
                 maybe_dump_l1_once();
                 // Swap the UND trampoline's save-slot literal to the
                 // kernel VA that L1[0xC0] maps to the RAM slot. Done
@@ -2076,7 +2067,53 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
             }
         }
         (0, 2, 0, 0, false) => {
-            let value = ctx.x[rt] as u32;
+            // The 717006 kernel writes TTBR0 = 0x0400_0000 with the
+            // low 14 bits cleared — IRGN = RGN = S = 0, so stage-1
+            // page-table walks are Normal **Non-cacheable**
+            // Non-shareable (DDI 0406C §B4.1.154 TTBR0 layout +
+            // Table B3-17 attribute encodings). The kernel populates
+            // its page tables via cacheable Normal-WB mappings (DC=1
+            // while MMU is off, normal sections once MMU is on);
+            // fix_stage1_xn_bits also edits L2 entries in place
+            // through the hypervisor's Normal-WB view. Cacheable
+            // producer + Non-cacheable walker is an ARM ARM §B2.8
+            // mismatched-memory-attributes case: the walker bypasses
+            // the D-cache and reads stale DRAM until a DC CVAC to
+            // PoC. StrongARM's simpler cache model let the Newton ROM
+            // get away without any table-side cache maintenance; on
+            // Cortex-A53 under FVP the first walk after SCTLR.M=1
+            // fetches pre-guest zeros (or post-rewrite L2 bytes that
+            // never made it to DRAM) and prefetch-aborts on whatever
+            // VA it tries, wedging the guest in a PABT-vector loop.
+            //
+            // Rather than bursting DC CVAC over all of RAM + ROM on
+            // every M=0→M=1 (which costs ~64 Ki maintenance ops and
+            // still leaves later, untraceable kernel-side table
+            // updates to hit the same trap), rewrite the walker
+            // attributes to match the producer: OR Inner WB/WA and
+            // Outer WB/WA cacheability into every guest TTBR0 write.
+            // Walker and producer then share the D-cache and stay
+            // coherent without any explicit maintenance — including
+            // for the kernel's runtime page-table updates we don't
+            // trap.
+            //
+            // Fields set:
+            //   bit 0 IRGN[1] = 0, bit 6 IRGN[0] = 1 → IRGN = 0b01 = WB/WA
+            //   bits[4:3] RGN[1:0] = 0b01           → ORGN = 0b01 = WB/WA
+            // (Encoding per DDI 0406C Table B3-17.)
+            // S (bit 1) left as the guest wrote it: the boot kernel
+            // leaves it 0 = Non-shareable, which matches our single-
+            // core stage-2 RAM mapping's effective shareability.
+            //
+            // Guest MRC reads of TTBR0 aren't trapped (HCR_EL2.TRVM
+            // is off) so they go through to hardware and see the
+            // modified value. The Newton kernel writes TTBR0 during
+            // MMU setup and doesn't read it back in a way that
+            // inspects cacheability bits, so the asymmetry is
+            // invisible to it in practice.
+            const TTBR_WB_WA: u32 = (1 << 6) | (1 << 3);
+            let raw = ctx.x[rt] as u32;
+            let value = raw | TTBR_WB_WA;
             cp15::write_ttbr0_el1(value as u64);
             // First TTBR write locks in the guest's stage-1 table
             // location. Walk it once and normalise the XN / SBZ bits

@@ -23,6 +23,7 @@ IMAGE="${FVP_IMAGE:-armswdev/aemfvp-cca-v2-image:latest}"
 FVP_BIN=/tmp/cca-stack/Base_RevC_AEMvA_pkg/models/Linux64_armv8l_GCC-9.3/FVP_Base_RevC-2xAEMvA
 
 gdb=0
+tarmac=""
 # FVP runs the generic timer and cache model accurately, so long-running
 # memory operations (e.g. the hypervisor zeroing ~28 MiB of BSS) can
 # take tens of seconds of wall time — much longer than the equivalent
@@ -33,6 +34,8 @@ elf=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --gdb)           gdb=1; shift ;;
+        --tarmac)        tarmac="/work/baremetal/tarmac.log"; shift ;;
+        --tarmac=*)      tarmac="${1#--tarmac=}"; shift ;;
         --timeout=*)     timeout_secs="${1#--timeout=}"; shift ;;
         --image=*)       IMAGE="${1#--image=}"; shift ;;
         -h|--help)
@@ -111,6 +114,32 @@ if [[ "$gdb" == "1" ]]; then
     fvp_args+=(-I --iris-port 7100 -p)
     docker_args+=(-p 7100:7100)
     echo "[fvp] Iris debug server will listen on host :7100 (paused at entry)." >&2
+fi
+
+# TarmacTrace plugin — instruction-level trace of every retired guest
+# instruction. Output goes to the host path we give as --tarmac=
+# (resolved relative to the host; written inside the container under
+# /work). Volume is reduced by disabling load/store / cache / MMU-walk
+# / VFP / GIC records — we're after the INSN + mode-change + CP15
+# stream, which is enough to pinpoint boot-time stalls.
+if [[ -n "$tarmac" ]]; then
+    plugin="/tmp/cca-stack/Base_RevC_AEMvA_pkg/plugins/Linux64_armv8l_GCC-9.3/TarmacTrace.so"
+    if [[ "$tarmac" = "$mount_root"/* ]]; then
+        rel_tarmac="/work/${tarmac#$mount_root/}"
+    else
+        rel_tarmac="$tarmac"
+    fi
+    fvp_args+=(
+        --plugin "$plugin"
+        -C "TRACE.TarmacTrace.trace-file=$rel_tarmac"
+        -C "TRACE.TarmacTrace.trace_loads_stores=0"
+        -C "TRACE.TarmacTrace.trace_cache=0"
+        -C "TRACE.TarmacTrace.trace_mmu=0"
+        -C "TRACE.TarmacTrace.trace_vfp=0"
+        -C "TRACE.TarmacTrace.trace_gicv3=0"
+        -C "TRACE.TarmacTrace.trace_dap=0"
+    )
+    echo "[fvp] TarmacTrace -> $tarmac (filtered: insn+events+cp15)" >&2
 fi
 
 # Forward any FVP_EXTRA argument string as additional -C params.

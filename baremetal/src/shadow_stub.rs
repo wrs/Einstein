@@ -42,7 +42,7 @@
 //! semantics at the original site would need to be emulated against
 //! the site's own PC, not the handler's.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::kprintln;
 use crate::trap::TrapContext;
@@ -84,9 +84,42 @@ pub const SBA_UDF_MAX: u16 = 0xFFFD;
 /// the UDF imm16 band `SBA_UDF_BASE..=SBA_UDF_MAX`.
 pub const SBA_MAX_SITES: usize = (SBA_UDF_MAX - SBA_UDF_BASE) as usize + 1;
 
+// ---- Inline-stub pool ---------------------------------------------------
+//
+// Each inline-eligible site gets a 7-word (28-byte) stub inside the ROM
+// aperture. The original faulting word is rewritten to `B stub_slot`; the
+// stub uses two LIVENESS-PROVED dead registers as scratches (no save/
+// restore — they were going to be overwritten anyway), computes the EA
+// with the BE-32 XOR correction, does the load/store natively (so a
+// cross-page EA takes a real DABT and the kernel's own demand-pager
+// handles it), then branches back to `orig_pc + 4`. See
+// `encode_inline_stub` for the precise layout.
+//
+// Sites where liveness analysis can't find 2 dead candidate registers
+// halt loudly at install time — the ROM is fixed, so we discover any
+// such sites once and address them individually (extend the analyzer
+// or special-case the site).
+//
+// Sits between the tracer pool (0x0090_0000..0x00E0_0000) and the ROM-tail
+// trampoline cluster (0x00FF_FF00..0x00FF_FFF0). Tracer's
+// `in_reserved_range` excludes this window too.
+pub const SBA_STUB_POOL_IPA: u32 = 0x00E0_0000;
+pub const SBA_STUB_POOL_END: u32 = 0x00FF_FF00;
+pub const SBA_STUB_WORDS: usize = 7;
+pub const SBA_STUB_BYTES: u32 = (SBA_STUB_WORDS as u32) * 4;
+pub const SBA_STUB_MAX: usize =
+    ((SBA_STUB_POOL_END - SBA_STUB_POOL_IPA) / SBA_STUB_BYTES) as usize;
+
+static NEXT_STUB: AtomicUsize = AtomicUsize::new(0);
+
 /// Per-site stash of the original instruction word. Indexed by the UDF
 /// `imm16 - SBA_UDF_BASE`. 0 marks "slot unused" — 0 is not a valid
 /// byte/halfword-access encoding in any form `decode()` accepts.
+///
+/// Only UDF-path sites allocate an entry here. Inline-stub sites
+/// don't need a stash — the stub itself is self-contained, no walk-fail
+/// retry path goes through them, and a UND inside an inline stub is a
+/// bug (we halt rather than emulate).
 static mut SBA_ORIG_INSN: [u32; SBA_MAX_SITES] = [0; SBA_MAX_SITES];
 
 /// Per-site stash of the original guest PC. Cross-checked against
@@ -96,11 +129,31 @@ static mut SBA_ORIG_PC: [u32; SBA_MAX_SITES] = [u32::MAX; SBA_MAX_SITES];
 
 static NEXT_SITE: AtomicUsize = AtomicUsize::new(0);
 
+// ---- Pre-fault retry state --------------------------------------------
+//
+// When a UDF-fallback site hits a walk-fail during emulation, the handler
+// ERETs into the pre-fault stub at `SBA_PREFAULT_STUB_VA` with the EA in
+// R0. The stub does `LDRB r0, [r0]` — if the page is unmapped, the
+// kernel's DataAbortHandler pages it in and retries. On success the stub
+// HVCs back (`SBA_RETRY_TAG`) and `handle_sba_retry` restores the stashed
+// ctx + re-runs the emulator body against the now-mapped EA.
+//
+// Single-in-flight: the stub HVCs back synchronously before another UDF
+// can fire. If a second SBA UDF somehow landed while a retry was pending,
+// the pending flag catches it.
+static SBA_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
+static mut SBA_RETRY_CTX: [u64; 15] = [0; 15];
+static mut SBA_RETRY_FAULTING_PC: u32 = 0;
+static mut SBA_RETRY_SPSR_UND: u64 = 0;
+static mut SBA_RETRY_IDX: usize = 0;
+
 /// Summary statistics returned by `patch_code_range` / `patch_rom_from_bitmap`.
 #[derive(Default, Debug)]
 pub struct PatchStats {
     pub words_scanned: usize,
     pub patched: usize,
+    pub inline_stubs: usize,
+    pub udf_fallback: usize,
     pub skipped_pc_operand: usize,
     pub ldrb_strb: usize,
     pub ldrh_strh: usize,
@@ -382,12 +435,867 @@ pub fn icache_sync_range(host_va: u64, length: usize) {
     }
 }
 
-/// Decode + record the site and overwrite the original word with a
-/// UDF marker. Halts if the SBA site table is exhausted or the write
-/// fails. Silently ignores words that don't decode as a byte/halfword
-/// access, or that reference PC as an operand (classifier false
-/// positives on data words that happen to decode byte-access-shaped).
-fn patch_one_site(pc: u32, stats: &mut PatchStats) {
+// =======================================================================
+// Encoder helpers (inline-stub emission)
+// =======================================================================
+
+mod encode {
+    pub const AL: u32 = 0xE;
+    pub const LO: u32 = 0x3;
+
+    /// Encode a 32-bit value as an ARMv7 modified-immediate (imm8 rotated
+    /// right by 2*rot). Returns None if the value isn't representable in
+    /// one instruction.
+    pub fn arm_imm12(value: u32) -> Option<u32> {
+        for rot in 0..16u32 {
+            // value = imm8 ROR (2*rot) ⇔ imm8 = value ROL (2*rot).
+            let imm8 = value.rotate_left(rot * 2);
+            if imm8 < 256 {
+                return Some((rot << 8) | imm8);
+            }
+        }
+        None
+    }
+
+    /// MRS Rd, CPSR  — read CPSR into Rd.
+    pub fn mrs_cpsr(rd: u32) -> u32 {
+        (AL << 28) | 0x010F_0000 | (rd << 12)
+    }
+
+    /// MSR CPSR_f, Rm — write only the flag field (NZCV) from Rm.
+    pub fn msr_cpsr_f(rm: u32) -> u32 {
+        (AL << 28) | 0x0128_F000 | rm
+    }
+
+    /// ADD Rd, Rn, #imm12  (modified-immediate encoded).
+    pub fn add_imm(cond: u32, rd: u32, rn: u32, imm12: u32) -> u32 {
+        (cond << 28) | 0x0280_0000 | (rn << 16) | (rd << 12) | (imm12 & 0xFFF)
+    }
+
+    /// SUB Rd, Rn, #imm12  (modified-immediate encoded).
+    pub fn sub_imm(cond: u32, rd: u32, rn: u32, imm12: u32) -> u32 {
+        (cond << 28) | 0x0240_0000 | (rn << 16) | (rd << 12) | (imm12 & 0xFFF)
+    }
+
+    /// ADD Rd, Rn, Rm, <shift_type> #shift_amount.
+    pub fn add_reg_shifted(
+        cond: u32, rd: u32, rn: u32, rm: u32, shift_type: u32, shift_amount: u32,
+    ) -> u32 {
+        (cond << 28)
+            | 0x0080_0000
+            | (rn << 16)
+            | (rd << 12)
+            | ((shift_amount & 0x1F) << 7)
+            | ((shift_type & 3) << 5)
+            | (rm & 0xF)
+    }
+
+    /// SUB Rd, Rn, Rm, <shift_type> #shift_amount.
+    pub fn sub_reg_shifted(
+        cond: u32, rd: u32, rn: u32, rm: u32, shift_type: u32, shift_amount: u32,
+    ) -> u32 {
+        (cond << 28)
+            | 0x0040_0000
+            | (rn << 16)
+            | (rd << 12)
+            | ((shift_amount & 0x1F) << 7)
+            | ((shift_type & 3) << 5)
+            | (rm & 0xF)
+    }
+
+    /// CMP Rn, #imm12  (modified-immediate encoded).
+    pub fn cmp_imm(rn: u32, imm12: u32) -> u32 {
+        (AL << 28) | 0x0350_0000 | (rn << 16) | (imm12 & 0xFFF)
+    }
+
+    /// EOR[cond] Rd, Rn, #imm12  (modified-immediate encoded).
+    pub fn eor_imm_cond(cond: u32, rd: u32, rn: u32, imm12: u32) -> u32 {
+        (cond << 28) | 0x0220_0000 | (rn << 16) | (rd << 12) | (imm12 & 0xFFF)
+    }
+
+    /// B <label>. `from_pc` is the PC of the B itself; `target` is the
+    /// destination. None if out of ±32 MiB range.
+    pub fn b(from_pc: u32, target: u32) -> Option<u32> {
+        let pc_plus_8 = from_pc.wrapping_add(8);
+        let off = (target as i64) - (pc_plus_8 as i64);
+        if off & 3 != 0 { return None; }
+        let off_words = off >> 2;
+        if !(-(1i64 << 23)..(1i64 << 23)).contains(&off_words) {
+            return None;
+        }
+        let imm24 = (off_words as u32) & 0x00FF_FFFF;
+        Some((AL << 28) | 0x0A00_0000 | imm24)
+    }
+
+    /// Encode the zero-offset access insn at slot 7 for the given
+    /// AccessKind. Rn is the scratch-EA register; Rt is the data register
+    /// from the original site; cond is the original site's cond.
+    pub fn access_zero_offset(
+        kind: super::AccessKind, cond: u32, rt: u32, rn: u32,
+    ) -> u32 {
+        match kind {
+            super::AccessKind::Ldrb  => (cond << 28) | 0x05D0_0000 | (rn << 16) | (rt << 12),
+            super::AccessKind::Strb  => (cond << 28) | 0x05C0_0000 | (rn << 16) | (rt << 12),
+            super::AccessKind::Ldrh  => (cond << 28) | 0x01D0_00B0 | (rn << 16) | (rt << 12),
+            super::AccessKind::Strh  => (cond << 28) | 0x01C0_00B0 | (rn << 16) | (rt << 12),
+            super::AccessKind::Ldrsb => (cond << 28) | 0x01D0_00D0 | (rn << 16) | (rt << 12),
+            super::AccessKind::Ldrsh => (cond << 28) | 0x01D0_00F0 | (rn << 16) | (rt << 12),
+            super::AccessKind::Swpb  => unreachable!("SWPB is UDF-fallback, not inline"),
+        }
+    }
+}
+
+// =======================================================================
+// Liveness analysis
+// =======================================================================
+//
+// To avoid saving and restoring scratch register values across the inline
+// stub, we walk forward from the byte-access site and identify which of
+// {R0..R3, R12, R14} are GENUINELY DEAD — i.e. the next reference to
+// each is a write, not a read. Two such registers can be used as
+// scratch_ea / scratch_flags without preserving their pre-stub values.
+//
+// The analyzer is deliberately conservative: anything we can't decode,
+// any branch instruction, and any "max instructions" bound all mark the
+// remaining unwritten registers as live. False positives (claiming
+// "live" when actually dead) cost us inline coverage; false negatives
+// (claiming "dead" when actually live) are correctness bugs and must
+// not happen.
+
+type RegMask = u16;
+
+const REG_PC: u32 = 15;
+
+/// Branch kind returned by `analyze_insn`. Classifies how the
+/// instruction transfers (or doesn't transfer) control flow, so the
+/// CFG-aware liveness walker can follow branch targets explicitly.
+#[derive(Debug, Clone, Copy)]
+enum BranchKind {
+    /// Linear instruction. No control transfer; analyzer continues at
+    /// PC+4. The reported (read, write) masks are exact.
+    Linear,
+    /// BL or BL-like — eventually returns. APCS-clobbers
+    /// {R0..R3, R12, R14}; analyzer continues at PC+4 with those regs
+    /// effectively "written" (i.e. dead from the caller's perspective).
+    BLink { target: u32 },
+    /// Unconditional branch. Analyzer follows `target` and stops.
+    Direct { target: u32 },
+    /// Conditional branch (Bcc, no link). Analyzer must consider both
+    /// paths: branch-taken to `target`, and fall-through to PC+4.
+    Cond { target: u32 },
+    /// APCS function return (BX LR, POP {…, PC}, MOV PC, LR, etc.):
+    /// control leaves to the caller. The reported `read` mask names
+    /// the caller-observable registers (R0 return value, R4–R11
+    /// callee-preserved, SP, LR); no other unwritten regs are live.
+    Return,
+    /// Indirect branch with unknown target (BX register where we can't
+    /// tell it's a return, function-pointer call, jump table, etc.).
+    /// CFG stops; remaining unwritten regs conservatively live.
+    Indirect,
+    /// Unknown / unhandled instruction — give up conservatively.
+    Unknown,
+}
+
+/// Compute the absolute target of a B/BL/Bcc/BLcc instruction.
+fn branch_target(insn: u32, pc: u32) -> u32 {
+    let imm24 = insn & 0x00FF_FFFF;
+    // Sign-extend imm24 to 32 bits, shift left 2.
+    let signed = ((imm24 as i32) << 8) >> 6; // ((<<8)>>8) sign-extends to 32; <<2 for word
+    pc.wrapping_add(8).wrapping_add(signed as u32)
+}
+
+/// Decode reads / writes / branch-classification for a single ARM
+/// A1-encoded instruction. Reads / writes are GPR bitmasks (R0..R15);
+/// the branch classification tells the CFG walker how to proceed.
+///
+/// Conservative for anything we don't handle: returns Unknown so the
+/// walker treats remaining unwritten regs as live.
+fn analyze_insn(insn: u32, pc: u32) -> (RegMask, RegMask, BranchKind) {
+    let cond = (insn >> 28) & 0xF;
+    if cond == 0xF {
+        // Unconditional class (NEON, PLD, etc.) — give up.
+        return (0, 0, BranchKind::Unknown);
+    }
+    let cond_al = cond == 0xE;
+
+    // Branch (B / BL): cond 101 L imm24
+    if (insn & 0x0E00_0000) == 0x0A00_0000 {
+        let l = (insn >> 24) & 1;
+        let target = branch_target(insn, pc);
+        let kind = if l == 1 {
+            // BL: writes LR; eventually returns. Treat APCS caller-
+            // saved {R0..R3, R12, LR} as written-by-call from the
+            // caller's view (the callee may clobber them) and continue
+            // analysis at PC+4.
+            BranchKind::BLink { target }
+        } else if cond_al {
+            BranchKind::Direct { target }
+        } else {
+            BranchKind::Cond { target }
+        };
+        // For BL the returned read/write masks reflect only the BL
+        // itself; the BLink walker logic OR's in {R0..R3, R12, R14}.
+        return (0, 0, kind);
+    }
+    // BX / BLX register: cond 0001 0010 SBO 00LM Rm
+    if (insn & 0x0FFF_FFD0) == 0x012F_FF10 {
+        let rm = insn & 0xF;
+        // BX LR is the standard APCS function return.
+        if rm == 14 {
+            return (APCS_RETURN_LIVE, 0, BranchKind::Return);
+        }
+        // BLX register: writes LR, like a function call.
+        let is_blx = (insn & 0x20) != 0;
+        if is_blx {
+            return (1u16 << rm, 0, BranchKind::BLink { target: pc.wrapping_add(4) });
+        }
+        // BX to a non-LR register: a tail-call / jump-table / function
+        // pointer dispatch. We can't infer the target's reads — drop
+        // back to conservative behaviour.
+        return (1u16 << rm, 0, BranchKind::Indirect);
+    }
+    // SVC / SWI: cond 1111 imm24. Functionally a call — handler runs
+    // and returns to PC+4. APCS caller-saved are observably clobbered;
+    // analyzer continues at PC+4.
+    if (insn & 0x0F00_0000) == 0x0F00_0000 {
+        return (0, 0, BranchKind::BLink { target: pc.wrapping_add(4) });
+    }
+    // BKPT (BRK in ARM)
+    if (insn & 0x0FF0_00F0) == 0x0120_0070 {
+        return (0, 0, BranchKind::Unknown);
+    }
+
+    // HVC: cond 0001 0100 imm12 0111 imm4. Treat like a function call:
+    // APCS caller-saved are observably clobbered (the EL2 handler can
+    // do anything with them; for shadow-stub HVCs in particular, the
+    // handler may modify R0..R3 with a return value). Continue analysis
+    // at PC+4 since HVC returns there. Caught here BEFORE the DP-reg-
+    // shifted matcher, which it would otherwise match.
+    if (insn & 0x0FF0_00F0) == 0x0140_0070 {
+        return (0, 0, BranchKind::BLink { target: pc.wrapping_add(4) });
+    }
+    // SMC: cond 0001 0110 imm12 0111 imm4 — same shape as HVC, treat
+    // identically.
+    if (insn & 0x0FF0_00F0) == 0x0160_0070 {
+        return (0, 0, BranchKind::BLink { target: pc.wrapping_add(4) });
+    }
+
+    // MOVW (A2): cond 0011 0000 imm4 Rd imm12 — writes Rd, no GPR reads.
+    // bits 27:20 = 0011_0000. Distinct from DP-imm AND (bit 24 differs).
+    if (insn & 0x0FF0_0000) == 0x0300_0000 {
+        let rd = (insn >> 12) & 0xF;
+        let write = if cond_al { 1u16 << rd } else { 0 };
+        if rd == REG_PC {
+            return (0, 0, BranchKind::Indirect);
+        }
+        return (0, write, BranchKind::Linear);
+    }
+    // MOVT (A1): cond 0011 0100 imm4 Rd imm12 — reads Rd (top half preserved low), writes Rd.
+    // Equivalent: read the existing low 16 bits of Rd, OR-in imm16 into top.
+    if (insn & 0x0FF0_0000) == 0x0340_0000 {
+        let rd = (insn >> 12) & 0xF;
+        let read = 1u16 << rd; // movt preserves Rd's low 16 bits
+        let write = if cond_al { 1u16 << rd } else { 0 };
+        if rd == REG_PC {
+            return (read, 0, BranchKind::Indirect);
+        }
+        return (read, write, BranchKind::Linear);
+    }
+
+    // Data-processing (immediate): cond 001 opc S Rn Rd imm12
+    if (insn & 0x0E00_0000) == 0x0200_0000 {
+        let opc = (insn >> 21) & 0xF;
+        let rn = (insn >> 16) & 0xF;
+        let rd = (insn >> 12) & 0xF;
+        let no_writeback = matches!(opc, 0b1000 | 0b1001 | 0b1010 | 0b1011);
+        let no_rn_read = matches!(opc, 0b1101 | 0b1111);
+        let read = if no_rn_read { 0 } else { 1u16 << rn };
+        let write = if !no_writeback && cond_al { 1u16 << rd } else { 0 };
+        if !no_writeback && rd == REG_PC {
+            return (read, 0, BranchKind::Indirect);
+        }
+        return (read, write, BranchKind::Linear);
+    }
+
+    // Data-processing (register, immediate shift): cond 000 opc S Rn Rd imm5 type 0 Rm
+    if (insn & 0x0E00_0010) == 0x0000_0000 {
+        let opc = (insn >> 21) & 0xF;
+        let rn = (insn >> 16) & 0xF;
+        let rd = (insn >> 12) & 0xF;
+        let rm = insn & 0xF;
+        let no_writeback = matches!(opc, 0b1000 | 0b1001 | 0b1010 | 0b1011);
+        let no_rn_read = matches!(opc, 0b1101 | 0b1111);
+        let read = (if no_rn_read { 0 } else { 1u16 << rn }) | (1u16 << rm);
+        let write = if !no_writeback && cond_al { 1u16 << rd } else { 0 };
+        if !no_writeback && rd == REG_PC {
+            // MOV PC, LR (opc=MOV=0b1101, no_rn_read, Rm=14, no shift)
+            // is the canonical APCS return. Detect it explicitly so
+            // we don't fall back to all-live.
+            if opc == 0b1101 && rm == 14 && (insn & 0x0000_0F80) == 0 {
+                return (APCS_RETURN_LIVE, 0, BranchKind::Return);
+            }
+            return (read, 0, BranchKind::Indirect);
+        }
+        return (read, write, BranchKind::Linear);
+    }
+    // Data-processing (register-shifted): cond 000 opc S Rn Rd Rs 0 type 1 Rm
+    if (insn & 0x0E00_0090) == 0x0000_0010 {
+        let opc = (insn >> 21) & 0xF;
+        let rn = (insn >> 16) & 0xF;
+        let rd = (insn >> 12) & 0xF;
+        let rs = (insn >> 8) & 0xF;
+        let rm = insn & 0xF;
+        let no_writeback = matches!(opc, 0b1000 | 0b1001 | 0b1010 | 0b1011);
+        let no_rn_read = matches!(opc, 0b1101 | 0b1111);
+        let read = (if no_rn_read { 0 } else { 1u16 << rn })
+                 | (1u16 << rm) | (1u16 << rs);
+        let write = if !no_writeback && cond_al { 1u16 << rd } else { 0 };
+        if !no_writeback && rd == REG_PC {
+            return (read, 0, BranchKind::Indirect);
+        }
+        return (read, write, BranchKind::Linear);
+    }
+
+    // LDR/STR (immediate): cond 010 P U B W L Rn Rt imm12
+    if (insn & 0x0E00_0000) == 0x0400_0000 {
+        let l = (insn >> 20) & 1;
+        let p = (insn >> 24) & 1;
+        let w = (insn >> 21) & 1;
+        let rn = (insn >> 16) & 0xF;
+        let rt = (insn >> 12) & 0xF;
+        let writes_rn = (p == 0) || (w == 1);
+        let read = (1u16 << rn) | if l == 0 { 1u16 << rt } else { 0 };
+        let mut write = 0u16;
+        if cond_al {
+            if l == 1 { write |= 1u16 << rt; }
+            if writes_rn { write |= 1u16 << rn; }
+        }
+        if l == 1 && rt == REG_PC {
+            // `LDR PC, [SP], #4` (or any LDR PC sourced from SP) is
+            // the single-register pop-return form.
+            if rn == 13 {
+                return (read | APCS_RETURN_LIVE, 0, BranchKind::Return);
+            }
+            return (read, 0, BranchKind::Indirect);
+        }
+        return (read, write, BranchKind::Linear);
+    }
+    // LDR/STR (register): cond 011 P U B W L Rn Rt imm5 type 0 Rm
+    if (insn & 0x0E00_0010) == 0x0600_0000 {
+        let l = (insn >> 20) & 1;
+        let p = (insn >> 24) & 1;
+        let w = (insn >> 21) & 1;
+        let rn = (insn >> 16) & 0xF;
+        let rt = (insn >> 12) & 0xF;
+        let rm = insn & 0xF;
+        let writes_rn = (p == 0) || (w == 1);
+        let read = (1u16 << rn) | (1u16 << rm)
+                 | if l == 0 { 1u16 << rt } else { 0 };
+        let mut write = 0u16;
+        if cond_al {
+            if l == 1 { write |= 1u16 << rt; }
+            if writes_rn { write |= 1u16 << rn; }
+        }
+        if l == 1 && rt == REG_PC {
+            return (read, 0, BranchKind::Indirect);
+        }
+        return (read, write, BranchKind::Linear);
+    }
+
+    // Extra load/store (LDRH/STRH/LDRSB/LDRSH/LDRD/STRD):
+    //   cond 000 P U I W L Rn Rt imm4h 1 op 1 imm4l
+    // Bits 7=1, 4=1, op ∈ {01,10,11}.
+    if (insn & 0x0E00_0090) == 0x0000_0090 && ((insn >> 5) & 0x3) != 0 {
+        let p = (insn >> 24) & 1;
+        let i_bit = (insn >> 22) & 1;
+        let w = (insn >> 21) & 1;
+        let l = (insn >> 20) & 1;
+        let op = (insn >> 5) & 0x3;
+        let rn = (insn >> 16) & 0xF;
+        let rt = (insn >> 12) & 0xF;
+        let writes_rn = (p == 0) || (w == 1);
+        let is_ldrd_strd = l == 0 && (op == 0b10 || op == 0b11);
+        let mut read = 1u16 << rn;
+        if i_bit == 0 {
+            read |= 1u16 << (insn & 0xF);
+        }
+        let mut write = 0u16;
+        if cond_al {
+            if l == 1 { write |= 1u16 << rt; }
+            if is_ldrd_strd {
+                if op == 0b10 {
+                    write |= 1u16 << rt;
+                    if rt + 1 < 16 { write |= 1u16 << (rt + 1); }
+                } else {
+                    read |= 1u16 << rt;
+                    if rt + 1 < 16 { read |= 1u16 << (rt + 1); }
+                }
+            } else if l == 0 {
+                read |= 1u16 << rt;
+            }
+            if writes_rn { write |= 1u16 << rn; }
+        } else if l == 0 && !is_ldrd_strd {
+            read |= 1u16 << rt;
+        }
+        return (read, write, BranchKind::Linear);
+    }
+
+    // LDM / STM: cond 100 P U S W L Rn register_list
+    if (insn & 0x0E00_0000) == 0x0800_0000 {
+        let l = (insn >> 20) & 1;
+        let w = (insn >> 21) & 1;
+        let rn = (insn >> 16) & 0xF;
+        let reglist = (insn & 0xFFFF) as u16;
+        let mut read = 1u16 << rn;
+        if l == 0 { read |= reglist; }
+        let mut write = 0u16;
+        if cond_al {
+            if l == 1 { write |= reglist; }
+            if w == 1 { write |= 1u16 << rn; }
+        }
+        if l == 1 && (reglist & (1u16 << 15)) != 0 {
+            // LDM-with-PC: branch. If Rn is SP (POP {…, PC}), this is
+            // an APCS return — caller-observable regs only.
+            if rn == 13 {
+                return (APCS_RETURN_LIVE | read, 0, BranchKind::Return);
+            }
+            return (read, 0, BranchKind::Indirect);
+        }
+        return (read, write, BranchKind::Linear);
+    }
+
+    // MUL / MLA: cond 0000 00AS Rd Ra Rs 1001 Rm
+    if (insn & 0x0FC0_00F0) == 0x0000_0090 {
+        let a_bit = (insn >> 21) & 1;
+        let rd = (insn >> 16) & 0xF;
+        let ra = (insn >> 12) & 0xF;
+        let rs = (insn >> 8) & 0xF;
+        let rm = insn & 0xF;
+        let mut read = (1u16 << rs) | (1u16 << rm);
+        if a_bit == 1 { read |= 1u16 << ra; }
+        let write = if cond_al { 1u16 << rd } else { 0 };
+        return (read, write, BranchKind::Linear);
+    }
+    // UMULL / SMULL / UMLAL / SMLAL: cond 0000 1UAS RdHi RdLo Rs 1001 Rm
+    if (insn & 0x0F80_00F0) == 0x0080_0090 {
+        let a_bit = (insn >> 21) & 1;
+        let rdhi = (insn >> 16) & 0xF;
+        let rdlo = (insn >> 12) & 0xF;
+        let rs = (insn >> 8) & 0xF;
+        let rm = insn & 0xF;
+        let mut read = (1u16 << rs) | (1u16 << rm);
+        if a_bit == 1 { read |= (1u16 << rdhi) | (1u16 << rdlo); }
+        let write = if cond_al { (1u16 << rdhi) | (1u16 << rdlo) } else { 0 };
+        return (read, write, BranchKind::Linear);
+    }
+
+    // MRS Rd, CPSR/SPSR: cond 0001 0R00 SBZ Rd SBZ
+    if (insn & 0x0FBF_0FFF) == 0x010F_0000 {
+        let rd = (insn >> 12) & 0xF;
+        let write = if cond_al { 1u16 << rd } else { 0 };
+        return (0, write, BranchKind::Linear);
+    }
+    // MSR (immediate): cond 0011 0R10 mask SBO imm12
+    if (insn & 0x0FB0_F000) == 0x0320_F000 {
+        return (0, 0, BranchKind::Linear);
+    }
+    // MSR (register): cond 0001 0R10 mask SBO 0000 0000 Rn
+    if (insn & 0x0FB0_FFF0) == 0x0120_F000 {
+        let rn = insn & 0xF;
+        return (1u16 << rn, 0, BranchKind::Linear);
+    }
+
+    // MCR / MRC: cond 1110 opc1 L CRn Rt cp opc2 1 CRm
+    if (insn & 0x0F00_0010) == 0x0E00_0010 {
+        let l = (insn >> 20) & 1;
+        let rt = (insn >> 12) & 0xF;
+        let read = if l == 0 { 1u16 << rt } else { 0 };
+        let write = if l == 1 && cond_al { 1u16 << rt } else { 0 };
+        return (read, write, BranchKind::Linear);
+    }
+
+    // SWP / SWPB
+    if (insn & 0x0FB0_0FF0) == 0x0100_0090 {
+        let rn = (insn >> 16) & 0xF;
+        let rt = (insn >> 12) & 0xF;
+        let rm = insn & 0xF;
+        let read = (1u16 << rn) | (1u16 << rm);
+        let write = if cond_al { 1u16 << rt } else { 0 };
+        return (read, write, BranchKind::Linear);
+    }
+
+    // CLZ
+    if (insn & 0x0FFF_0FF0) == 0x016F_0F10 {
+        let rd = (insn >> 12) & 0xF;
+        let rm = insn & 0xF;
+        return (1u16 << rm, if cond_al { 1u16 << rd } else { 0 }, BranchKind::Linear);
+    }
+
+    // Unknown.
+    (0, 0, BranchKind::Unknown)
+}
+
+/// CFG-aware live-out registers starting at `start_pc`.
+///
+/// Returns the set of registers that may be READ before being WRITTEN
+/// on any path of execution from `start_pc`. Walks linearly, following
+/// branches with bounded depth and cycle detection. Indirect branches
+/// and unrecognised instructions stop the analysis with all-unwritten-
+/// regs marked live.
+///
+/// APCS abstraction for BL: a function call writes {R0..R3, R12, R14}
+/// from the caller's perspective — those registers are caller-saved,
+/// so any value they held before the BL is observably gone after the
+/// BL even if the callee preserves them. We treat BL as a linear
+/// instruction that writes those regs and otherwise continues.
+///
+/// Cycle detection: tracks up to `MAX_VISITED` block-entry PCs. If a
+/// branch target lands on an already-visited start, we return 0
+/// (the cycle introduces no NEW reads beyond what the linear walk
+/// already counted at first visit). This soundly handles tight halt
+/// loops (`b .`), retry loops, and any back-edge within the budget.
+const APCS_CALLER_SAVED: RegMask =
+    (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 12) | (1 << 14);
+
+/// Registers the caller observably depends on at function return: R0
+/// (return value), R4–R11 (callee-preserved), R13 (SP), R14 (LR).
+/// R1–R3 and R12 are caller-saved; the caller doesn't expect any
+/// particular value in them at return, so they're "dead" at BX LR.
+const APCS_RETURN_LIVE: RegMask =
+    (1 << 0)
+    | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7)
+    | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11)
+    | (1 << 13) | (1 << 14);
+
+const LIVE_AT_MAX_VISITED: usize = 64;
+
+struct Visited {
+    pcs: [u32; LIVE_AT_MAX_VISITED],
+    n: usize,
+}
+
+impl Visited {
+    fn new() -> Self {
+        Self { pcs: [0; LIVE_AT_MAX_VISITED], n: 0 }
+    }
+    fn contains(&self, pc: u32) -> bool {
+        self.pcs[..self.n].iter().any(|&p| p == pc)
+    }
+    fn push(&mut self, pc: u32) -> bool {
+        if self.n >= LIVE_AT_MAX_VISITED { return false; }
+        self.pcs[self.n] = pc;
+        self.n += 1;
+        true
+    }
+}
+
+fn live_at(start_pc: u32, max_instrs: u32) -> RegMask {
+    live_at_with_reader(start_pc, max_instrs, &code_read_word)
+}
+
+/// Liveness analysis with an injectable instruction reader. Production
+/// callers use `code_read_word`; tests pass an in-memory closure.
+fn live_at_with_reader<R>(start_pc: u32, max_instrs: u32, read_insn: &R) -> RegMask
+where R: Fn(u32) -> Option<u32> {
+    let mut visited = Visited::new();
+    live_at_recursive(start_pc, max_instrs, &mut visited, read_insn)
+}
+
+fn live_at_recursive<R>(
+    start_pc: u32, max_instrs: u32, visited: &mut Visited, read_insn: &R,
+) -> RegMask
+where R: Fn(u32) -> Option<u32> {
+    // Cycle detection: revisiting a block we've already analyzed adds
+    // no new reads — the original visit already captured them.
+    if visited.contains(start_pc) {
+        return 0;
+    }
+    if !visited.push(start_pc) {
+        // Visited budget exhausted — conservative.
+        return 0xFFFF;
+    }
+
+    let mut live: RegMask = 0;
+    let mut written: RegMask = 0;
+    let mut pc = start_pc;
+    for _ in 0..max_instrs {
+        let insn = match read_insn(pc) {
+            Some(w) => w,
+            None => {
+                live |= !written & 0xFFFF;
+                return live;
+            }
+        };
+        let (read, write, kind) = analyze_insn(insn, pc);
+        let new_live = read & !written & !live;
+        live |= new_live;
+        let new_written = write & !live & !written;
+        written |= new_written;
+
+        match kind {
+            BranchKind::Linear => {
+                pc = pc.wrapping_add(4);
+                continue;
+            }
+            BranchKind::BLink { .. } => {
+                // BL: APCS caller-saved are observably clobbered.
+                let bl_clobber = APCS_CALLER_SAVED & !live;
+                written |= bl_clobber;
+                pc = pc.wrapping_add(4);
+                continue;
+            }
+            BranchKind::Direct { target } => {
+                if target == pc {
+                    return live;
+                }
+                let tgt_live = live_at_recursive(target, max_instrs, visited, read_insn);
+                live |= tgt_live & !written;
+                return live;
+            }
+            BranchKind::Cond { target } => {
+                if target == pc {
+                    let fall = live_at_recursive(pc.wrapping_add(4), max_instrs, visited, read_insn);
+                    live |= fall & !written;
+                    return live;
+                }
+                let taken = live_at_recursive(target, max_instrs, visited, read_insn);
+                let fall = live_at_recursive(pc.wrapping_add(4), max_instrs, visited, read_insn);
+                live |= (taken | fall) & !written;
+                return live;
+            }
+            BranchKind::Return => {
+                return live;
+            }
+            BranchKind::Indirect | BranchKind::Unknown => {
+                live |= !written & 0xFFFF;
+                return live;
+            }
+        }
+    }
+    live |= !written & 0xFFFF;
+    live
+}
+
+/// Pick (scratch_ea, scratch_flags) — both DEAD at orig_pc+4 — from
+/// {R12, R0..R3, R14} \ {Rt, Rn, Rm}. Returns None if liveness analysis
+/// can't find 2 dead candidates; caller must halt loudly.
+fn pick_scratch_regs(d: &Decoded, orig_pc: u32) -> Option<(u32, u32)> {
+    const CANDIDATES: &[u32] = &[12, 0, 1, 2, 3, 14];
+    let live = live_at(orig_pc.wrapping_add(4), 16);
+    let operand_mask: RegMask = (1u16 << d.rt) | (1u16 << d.rn) | match d.offset {
+        OffsetForm::Reg { rm, .. } => 1u16 << rm,
+        _ => 0,
+    };
+    let mut picks: [u32; 2] = [u32::MAX; 2];
+    let mut n = 0;
+    for &r in CANDIDATES {
+        let rmask: RegMask = 1u16 << r;
+        if rmask & operand_mask != 0 { continue; }
+        if rmask & live != 0 { continue; }
+        picks[n] = r;
+        n += 1;
+        if n == 2 { return Some((picks[0], picks[1])); }
+    }
+    None
+}
+
+/// True when the site's operand shape is a simple non-writeback
+/// `[Rn, ±imm]` or `[Rn, ±Rm, shift]`. Writeback, post-index, SWPB
+/// always go through the UDF emulator.
+fn is_inline_eligible(d: &Decoded) -> bool {
+    if matches!(d.kind, AccessKind::Swpb) { return false; }
+    // No writeback, no post-index.
+    if !d.p || d.w { return false; }
+    match d.offset {
+        OffsetForm::None => false, // SWPB only, handled above
+        OffsetForm::Imm { .. } => true,
+        OffsetForm::Reg { .. } => true,
+    }
+}
+
+/// BE-32 XOR mask for this access kind.
+fn xor_mask(kind: AccessKind) -> u32 {
+    match kind {
+        AccessKind::Ldrb | AccessKind::Strb | AccessKind::Ldrsb | AccessKind::Swpb => 3,
+        AccessKind::Ldrh | AccessKind::Strh | AccessKind::Ldrsh => 2,
+    }
+}
+
+/// Build the 7-word inline stub for a site whose liveness analysis
+/// found 2 dead scratch registers. No save/restore needed — the stub
+/// freely clobbers scratch_ea (computed EA) and scratch_fl (NZCV
+/// snapshot).
+///
+/// Slot layout (28 bytes):
+///   0:  MRS  scratch_fl, cpsr            ; snapshot NZCV
+///   1:  <ADD|SUB> scratch_ea, Rn, <off>  ; compute EA
+///   2:  CMP  scratch_ea, #XOR_LIMIT      ; clobbers NZCV
+///   3:  EORLO scratch_ea, scratch_ea, #<xor_mask>
+///   4:  MSR  cpsr_f, scratch_fl          ; restore NZCV
+///   5:  <access>[cond] Rt, [scratch_ea]  ; native — may DABT naturally
+///   6:  B    orig_pc + 4
+///
+/// Returns Err with a descriptive reason if the immediate isn't
+/// ARM-imm12-encodable or the back-branch is out of B-imm24 range.
+/// Liveness failure is reported separately by `pick_scratch_regs`
+/// returning None.
+fn encode_inline_stub(
+    d: &Decoded,
+    orig_pc: u32,
+    stub_ipa: u32,
+    sea: u32,
+    sfl: u32,
+) -> Result<[u32; 7], &'static str> {
+    // Slot 1: compute EA into `sea`.
+    let slot1 = match d.offset {
+        OffsetForm::Imm { imm } => {
+            let enc = encode::arm_imm12(imm).ok_or("imm not encodable")?;
+            if d.u {
+                encode::add_imm(encode::AL, sea, d.rn, enc)
+            } else {
+                encode::sub_imm(encode::AL, sea, d.rn, enc)
+            }
+        }
+        OffsetForm::Reg { rm, shift_type, shift_amount } => {
+            if d.u {
+                encode::add_reg_shifted(encode::AL, sea, d.rn, rm, shift_type, shift_amount)
+            } else {
+                encode::sub_reg_shifted(encode::AL, sea, d.rn, rm, shift_type, shift_amount)
+            }
+        }
+        OffsetForm::None => return Err("OffsetForm::None not inline-eligible"),
+    };
+
+    let xor_limit_imm = encode::arm_imm12(XOR_LIMIT).ok_or("XOR_LIMIT not encodable")?;
+    let slot2 = encode::cmp_imm(sea, xor_limit_imm);
+
+    let xor_enc = encode::arm_imm12(xor_mask(d.kind)).ok_or("xor mask not encodable")?;
+    let slot3 = encode::eor_imm_cond(encode::LO, sea, sea, xor_enc);
+
+    let slot5 = encode::access_zero_offset(d.kind, d.cond, d.rt, sea);
+
+    let slot6_pc = stub_ipa.wrapping_add(6 * 4);
+    let slot6 = encode::b(slot6_pc, orig_pc.wrapping_add(4))
+        .ok_or("back-branch out of B-imm24 range")?;
+
+    Ok([
+        encode::mrs_cpsr(sfl),       // 0
+        slot1,                       // 1
+        slot2,                       // 2
+        slot3,                       // 3
+        encode::msr_cpsr_f(sfl),     // 4
+        slot5,                       // 5
+        slot6,                       // 6
+    ])
+}
+
+/// Emit an inline stub into the pool and overwrite `orig_pc` with
+/// `B stub_slot`. Halts at install time on any encoding or pool failure
+/// — the ROM is fixed, so an install-time failure means we discovered
+/// a site that needs a code change to handle, not a runtime fallback.
+fn emit_inline_stub(d: &Decoded, orig_pc: u32) {
+    let (sea, sfl) = match pick_scratch_regs(d, orig_pc) {
+        Some(p) => p,
+        None => {
+            let live = live_at(orig_pc.wrapping_add(4), 16);
+            kprintln!(
+                "shadow_stub: FATAL — liveness can't find 2 dead scratch regs at PC={:#x}",
+                orig_pc
+            );
+            kprintln!(
+                "  insn={:#010x} kind={:?} Rt={} Rn={} live_mask={:#06x}",
+                code_read_word(orig_pc).unwrap_or(0xDEAD_BEEF),
+                d.kind, d.rt, d.rn, live
+            );
+            kprintln!(
+                "  candidates {{R12, R0..R3, R14}} \\ operands all live in next 16 insns"
+            );
+            crate::cpu::halt();
+        }
+    };
+
+    let slot_ix = NEXT_STUB.fetch_add(1, Ordering::SeqCst);
+    if slot_ix >= SBA_STUB_MAX {
+        kprintln!(
+            "shadow_stub: FATAL — inline stub pool exhausted at PC={:#x} ({} slots)",
+            orig_pc, slot_ix
+        );
+        crate::cpu::halt();
+    }
+    let stub_ipa = SBA_STUB_POOL_IPA + (slot_ix as u32) * SBA_STUB_BYTES;
+
+    let br = match encode::b(orig_pc, stub_ipa) {
+        Some(w) => w,
+        None => {
+            kprintln!(
+                "shadow_stub: FATAL — forward B from PC={:#x} to stub IPA={:#x} \
+                 out of imm24 range",
+                orig_pc, stub_ipa
+            );
+            crate::cpu::halt();
+        }
+    };
+    let stub_words = match encode_inline_stub(d, orig_pc, stub_ipa, sea, sfl) {
+        Ok(ws) => ws,
+        Err(reason) => {
+            kprintln!(
+                "shadow_stub: FATAL — encode_inline_stub at PC={:#x}: {}",
+                orig_pc, reason
+            );
+            crate::cpu::halt();
+        }
+    };
+
+    for (i, w) in stub_words.iter().enumerate() {
+        let ipa = stub_ipa.wrapping_add((i as u32) * 4);
+        if let Err(e) = code_write_word(ipa, *w) {
+            kprintln!(
+                "shadow_stub: FATAL — couldn't write stub word at IPA {:#x}: {}",
+                ipa, e
+            );
+            crate::cpu::halt();
+        }
+    }
+    if let Err(e) = code_write_word(orig_pc, br) {
+        kprintln!(
+            "shadow_stub: FATAL — couldn't write B->stub at PC {:#x}: {}",
+            orig_pc, e
+        );
+        crate::cpu::halt();
+    }
+}
+
+/// Install a UDF marker at `pc` for the site. Halts if the UDF table is
+/// exhausted.
+fn emit_udf_site(pc: u32, insn: u32) {
+    let idx = NEXT_SITE.fetch_add(1, Ordering::SeqCst);
+    if idx >= SBA_MAX_SITES {
+        kprintln!(
+            "shadow_stub: ERROR - SBA UDF table exhausted at PC {:#x} ({} sites)",
+            pc, idx
+        );
+        crate::cpu::halt();
+    }
+    let imm16 = SBA_UDF_BASE | (idx as u16);
+    let udf_insn = enc_udf(imm16);
+    // SAFETY: idx just allocated, single-threaded writer.
+    unsafe {
+        SBA_ORIG_INSN[idx] = insn;
+        SBA_ORIG_PC[idx] = pc;
+    }
+    if let Err(e) = code_write_word(pc, udf_insn) {
+        kprintln!(
+            "shadow_stub: FATAL - couldn't write UDF at PC {:#x}: {}",
+            pc, e
+        );
+        crate::cpu::halt();
+    }
+}
+
+/// Decode + install a stub at `pc`. Picks inline vs UDF based on the
+/// site's operand shape, `force_udf` (RAM-resident blocks), and the
+/// inline stub pool's encoding constraints.
+fn patch_one_site(pc: u32, force_udf: bool, stats: &mut PatchStats) {
     let insn = match code_read_word(pc) {
         Some(w) => w,
         None => return,
@@ -421,30 +1329,17 @@ fn patch_one_site(pc: u32, stats: &mut PatchStats) {
         }
     }
 
-    let idx = NEXT_SITE.fetch_add(1, Ordering::SeqCst);
-    if idx >= SBA_MAX_SITES {
-        kprintln!(
-            "shadow_stub: ERROR - SBA site table exhausted at PC {:#x} ({} sites)",
-            pc, idx
-        );
-        crate::cpu::halt();
-    }
-
-    let imm16 = SBA_UDF_BASE | (idx as u16);
-    let udf_insn = enc_udf(imm16);
-
-    // SAFETY: idx just allocated, single-threaded writer.
-    unsafe {
-        SBA_ORIG_INSN[idx] = insn;
-        SBA_ORIG_PC[idx] = pc;
-    }
-
-    if let Err(e) = code_write_word(pc, udf_insn) {
-        kprintln!(
-            "shadow_stub: FATAL - couldn't write UDF at PC {:#x}: {}",
-            pc, e
-        );
-        crate::cpu::halt();
+    let use_inline = !force_udf && is_inline_eligible(&decoded);
+    if use_inline {
+        // Halts at install time on any failure (liveness, encoding,
+        // pool-full, branch-range). The ROM is fixed, so a failure
+        // means we discovered a site that needs handler work — not a
+        // condition to silently fall back.
+        emit_inline_stub(&decoded, pc);
+        stats.inline_stubs += 1;
+    } else {
+        emit_udf_site(pc, insn);
+        stats.udf_fallback += 1;
     }
 
     match decoded.kind {
@@ -456,22 +1351,45 @@ fn patch_one_site(pc: u32, stats: &mut PatchStats) {
     stats.patched += 1;
 }
 
+/// Flush the inline-stub pool byte range covering `[first, first+count)`
+/// slots to the point of unification so the guest can fetch freshly-
+/// emitted stubs natively.
+fn flush_stub_pool(first_slot: usize, count: usize) {
+    if count == 0 { return; }
+    let start_ipa = SBA_STUB_POOL_IPA + (first_slot as u32) * SBA_STUB_BYTES;
+    let byte_len = (count as u32) * SBA_STUB_BYTES;
+    let host = crate::guest_mem::rom_host_pa() + start_ipa as u64;
+    icache_sync_range(host, byte_len as usize);
+}
+
 /// Patch every LDRB/STRB/LDRH/STRH/LDRSB/LDRSH/SWPB in `[start_ipa, end_ipa)`
 /// of the ROM or RAM backing. Used for the lazy-RAM path (RAM-resident
 /// code copied out of ROM at boot) where there is no pre-computed
 /// classifier bitmap, and by the `test_shadow_stub` guest test which
 /// scans its own code range.
+///
+/// RAM-aperture ranges go through the UDF emulator unconditionally — the
+/// inline-stub pool in ROM is out of B-instruction range from RAM, and
+/// the UDF path has an equivalent pre-fault retry round-trip for cross-
+/// page DABTs (see `handle_sba_udf`).
 pub fn patch_code_range(start_ipa: u32, end_ipa: u32) -> PatchStats {
     assert!(start_ipa & 3 == 0);
     assert!(end_ipa & 3 == 0);
     assert!(end_ipa >= start_ipa);
 
+    let force_udf = (start_ipa as usize) >= crate::guest_mem::ROM_SIZE;
+
+    let first_stub = NEXT_STUB.load(Ordering::SeqCst);
     let mut stats = PatchStats::default();
     let mut pc = start_ipa;
     while pc < end_ipa {
         stats.words_scanned += 1;
-        patch_one_site(pc, &mut stats);
+        patch_one_site(pc, force_udf, &mut stats);
         pc = pc.wrapping_add(4);
+    }
+    let last_stub = NEXT_STUB.load(Ordering::SeqCst);
+    if last_stub > first_stub {
+        flush_stub_pool(first_stub, last_stub - first_stub);
     }
 
     if (end_ipa as usize) <= crate::guest_mem::ROM_SIZE {
@@ -522,6 +1440,7 @@ pub fn patch_rom_from_bitmap() -> PatchStats {
         crate::cpu::halt();
     }
 
+    let first_stub = NEXT_STUB.load(Ordering::SeqCst);
     let mut stats = PatchStats::default();
     for (byte_idx, byte) in BYTE_ACCESS_STATIC_BITMAP.iter().enumerate() {
         if *byte == 0 { continue; }
@@ -532,8 +1451,12 @@ pub fn patch_rom_from_bitmap() -> PatchStats {
             let word_idx = byte_idx * 8 + bit;
             let pc = (word_idx * 4) as u32;
             stats.words_scanned += 1;
-            patch_one_site(pc, &mut stats);
+            patch_one_site(pc, /*force_udf=*/ false, &mut stats);
         }
+    }
+    let last_stub = NEXT_STUB.load(Ordering::SeqCst);
+    if last_stub > first_stub {
+        flush_stub_pool(first_stub, last_stub - first_stub);
     }
 
     icache_sync_range(
@@ -547,12 +1470,15 @@ pub fn patch_rom_from_bitmap() -> PatchStats {
 pub fn log_stats(stats: &PatchStats) {
     kprintln!(
         "shadow_stub: scanned {} words, patched {} insns \
-         (LDRB/STRB={}, LDRH/STRH={}, LDRSB/LDRSH={}, SWPB={}), \
-         skipped {} PC-operand, site table {}/{}",
+         (inline={}, UDF={}; LDRB/STRB={}, LDRH/STRH={}, LDRSB/LDRSH={}, SWPB={}), \
+         skipped {} PC-operand, \
+         site table {}/{}, inline pool {}/{}",
         stats.words_scanned, stats.patched,
+        stats.inline_stubs, stats.udf_fallback,
         stats.ldrb_strb, stats.ldrh_strh, stats.ldrsb_ldrsh, stats.swpb,
         stats.skipped_pc_operand,
         NEXT_SITE.load(Ordering::SeqCst), SBA_MAX_SITES,
+        NEXT_STUB.load(Ordering::SeqCst), SBA_STUB_MAX,
     );
 }
 
@@ -848,69 +1774,6 @@ fn backed_halfword_write(pa: u32, val: u16) -> bool {
 /// Dispatch a byte load: try backed memory (with XOR) first; fall back
 /// to MMIO for IPAs outside our backing stores, or unconditionally for
 /// `ea >= XOR_LIMIT`.
-/// Probe whether a guest VA is mapped under the current EL1 stage-1
-/// state using the hardware AT (Address Translate) instruction. Runs
-/// `AT S1E1R, Xn` which performs a stage-1 translation as if the guest
-/// were doing a normal read at EL1; the result lands in PAR_EL1 where
-/// bit 0 == 0 means success and bit 0 == 1 means fault.
-///
-/// This is strictly more correct than the SW walk in
-/// `guest_mem::translate_va`, which hard-codes TTBR0 = 0x0400_0000 and
-/// doesn't handle per-task TTBR swaps.
-fn va_is_mapped_s1e1(va: u32) -> bool {
-    let par_el1: u64;
-    let par_el0: u64;
-    // SAFETY: AT has no observable side effects other than updating
-    // PAR_EL1 (a dedicated diagnostic register).
-    unsafe {
-        core::arch::asm!(
-            "at s1e1r, {0}",
-            "isb",
-            "mrs {1}, par_el1",
-            "at s1e0r, {0}",
-            "isb",
-            "mrs {2}, par_el1",
-            in(reg) va as u64,
-            out(reg) par_el1,
-            out(reg) par_el0,
-            options(nostack, preserves_flags),
-        );
-    }
-    // Treat the address as mapped if *either* EL0 or EL1 stage-1 walk
-    // succeeds — the patched site could have been in either mode.
-    (par_el1 & 1) == 0 || (par_el0 & 1) == 0
-}
-
-/// Budgeted log for SBA walk-fail → DABT injection. One line per
-/// unique (PC, mode) pair so we see the first occurrence of each
-/// injection site without flooding.
-#[allow(dead_code)]
-fn log_sba_dabt_inject(pc: u32, ea: u32, cpsr: u32) {
-    const SEEN_CAP: usize = 16;
-    static mut SEEN: [(u32, u32); SEEN_CAP] = [(0, 0); SEEN_CAP];
-    static mut SEEN_N: usize = 0;
-    let first = unsafe {
-        let mode = cpsr & 0x1F;
-        let mut found = false;
-        for i in 0..SEEN_N {
-            if SEEN[i] == (pc, mode) { found = true; break; }
-        }
-        if !found && SEEN_N < SEEN_CAP {
-            SEEN[SEEN_N] = (pc, mode);
-            SEEN_N += 1;
-            true
-        } else {
-            false
-        }
-    };
-    if first {
-        kprintln!(
-            "shadow_stub: walk-fail → DABT inject @PC={:#x} ea={:#x} cpsr={:#010x} mode={:#x}",
-            pc, ea, cpsr, cpsr & 0x1F
-        );
-    }
-}
-
 fn dispatch_byte_read(ea: u32, faulting_pc: u32) -> u8 {
     if ea < XOR_LIMIT {
         let addr = ea ^ 3;
@@ -929,16 +1792,15 @@ fn dispatch_byte_read(ea: u32, faulting_pc: u32) -> u8 {
             }
         }
     }
-    let pa = match resolve_addr(ea) {
-        Some(p) => p,
-        None => {
-            kprintln!(
-                "*** shadow_stub: byte read walk-fail ea={:#x} pc={:#x}",
-                ea, faulting_pc
-            );
-            crate::cpu::halt();
-        }
-    };
+    let pa = resolve_addr(ea).unwrap_or_else(|| {
+        // Unreachable: handle_sba_udf pre-filters walk-fails through the
+        // pre-fault retry path before reaching dispatch_*. Defensive halt.
+        kprintln!(
+            "*** shadow_stub: byte read walk-fail ea={:#x} pc={:#x} (retry path bug)",
+            ea, faulting_pc
+        );
+        crate::cpu::halt();
+    });
     crate::mmio::read(pa as u64, 0, faulting_pc as u64) as u8
 }
 
@@ -957,16 +1819,13 @@ fn dispatch_byte_write(ea: u32, val: u8, faulting_pc: u32) {
             }
         }
     }
-    let pa = match resolve_addr(ea) {
-        Some(p) => p,
-        None => {
-            kprintln!(
-                "*** shadow_stub: byte write walk-fail ea={:#x} pc={:#x}",
-                ea, faulting_pc
-            );
-            crate::cpu::halt();
-        }
-    };
+    let pa = resolve_addr(ea).unwrap_or_else(|| {
+        kprintln!(
+            "*** shadow_stub: byte write walk-fail ea={:#x} pc={:#x} (retry path bug)",
+            ea, faulting_pc
+        );
+        crate::cpu::halt();
+    });
     crate::mmio::write(pa as u64, 0, val as u32, faulting_pc as u64);
 }
 
@@ -985,16 +1844,13 @@ fn dispatch_halfword_read(ea: u32, faulting_pc: u32) -> u16 {
             }
         }
     }
-    let pa = match resolve_addr(ea) {
-        Some(p) => p,
-        None => {
-            kprintln!(
-                "*** shadow_stub: halfword read walk-fail ea={:#x} pc={:#x}",
-                ea, faulting_pc
-            );
-            crate::cpu::halt();
-        }
-    };
+    let pa = resolve_addr(ea).unwrap_or_else(|| {
+        kprintln!(
+            "*** shadow_stub: halfword read walk-fail ea={:#x} pc={:#x} (retry path bug)",
+            ea, faulting_pc
+        );
+        crate::cpu::halt();
+    });
     crate::mmio::read(pa as u64, 1, faulting_pc as u64) as u16
 }
 
@@ -1013,16 +1869,13 @@ fn dispatch_halfword_write(ea: u32, val: u16, faulting_pc: u32) {
             }
         }
     }
-    let pa = match resolve_addr(ea) {
-        Some(p) => p,
-        None => {
-            kprintln!(
-                "*** shadow_stub: halfword write walk-fail ea={:#x} pc={:#x}",
-                ea, faulting_pc
-            );
-            crate::cpu::halt();
-        }
-    };
+    let pa = resolve_addr(ea).unwrap_or_else(|| {
+        kprintln!(
+            "*** shadow_stub: halfword write walk-fail ea={:#x} pc={:#x} (retry path bug)",
+            ea, faulting_pc
+        );
+        crate::cpu::halt();
+    });
     crate::mmio::write(pa as u64, 1, val as u32, faulting_pc as u64);
 }
 
@@ -1062,6 +1915,94 @@ pub fn handle_sba_udf(
         return false;
     }
 
+    emulate_sba_site(ctx, faulting_pc, spsr_und, orig_insn, idx, /*is_retry=*/ false)
+}
+
+/// Continuation of `handle_sba_udf` after a pre-fault retry round-trip.
+/// Called from `handle_hvc` on `SBA_RETRY_TAG`. Restores the stashed
+/// ctx and resumes the emulator body.
+pub fn handle_sba_retry(ctx: &mut TrapContext) {
+    if !SBA_RETRY_PENDING.swap(false, Ordering::SeqCst) {
+        kprintln!("*** shadow_stub: SBA_RETRY HVC without pending retry — halting");
+        crate::cpu::halt();
+    }
+    // SAFETY: pending flag just consumed; single-threaded.
+    let (faulting_pc, spsr_und, idx, orig_insn) = unsafe {
+        for i in 0..15 {
+            ctx.x[i] = SBA_RETRY_CTX[i];
+        }
+        (
+            SBA_RETRY_FAULTING_PC,
+            SBA_RETRY_SPSR_UND,
+            SBA_RETRY_IDX,
+            SBA_ORIG_INSN[SBA_RETRY_IDX],
+        )
+    };
+    if !emulate_sba_site(ctx, faulting_pc, spsr_und, orig_insn, idx, /*is_retry=*/ true) {
+        kprintln!(
+            "*** shadow_stub: retry emulator failed at PC={:#x} insn={:#010x}",
+            faulting_pc, orig_insn
+        );
+        crate::cpu::halt();
+    }
+}
+
+/// Stash the emulator state and ERET into the pre-fault stub. Returns
+/// control to the vector trailer; the trailer's ERET lands in UND mode
+/// at `SBA_PREFAULT_STUB_VA` with `ctx.x[0] = access_addr`. The stub's
+/// `LDRB r0, [r0]` either succeeds immediately (EA already mapped
+/// post-kernel-pager), or takes a natural DABT that the kernel's
+/// handler pages in and retries via `subs pc, lr, #8`. The stub's
+/// subsequent `HVC #SBA_RETRY_TAG` returns to `handle_sba_retry`.
+fn trigger_pre_fault_retry(
+    ctx: &mut TrapContext,
+    access_addr: u32,
+    faulting_pc: u32,
+    spsr_und: u64,
+    idx: usize,
+) {
+    if SBA_RETRY_PENDING.swap(true, Ordering::SeqCst) {
+        kprintln!(
+            "*** shadow_stub: nested SBA retry at PC={:#x} (pending already) — halting",
+            faulting_pc
+        );
+        crate::cpu::halt();
+    }
+    // SAFETY: single-threaded EL2; pending flag just flipped.
+    unsafe {
+        for i in 0..15 {
+            SBA_RETRY_CTX[i] = ctx.x[i];
+        }
+        SBA_RETRY_FAULTING_PC = faulting_pc;
+        SBA_RETRY_SPSR_UND = spsr_und;
+        SBA_RETRY_IDX = idx;
+    }
+    ctx.x[0] = access_addr as u64;
+    // ERET target: the pre-fault stub. SPSR_EL2 is left as the HVC's
+    // auto-saved value (= UND), so the stub runs in UND mode at PL1.
+    // SAFETY: ELR_EL2 write only — vector trailer does the actual ERET.
+    unsafe {
+        core::arch::asm!(
+            "msr elr_el2, {elr}",
+            "isb",
+            elr = in(reg) crate::guest_mem::SBA_PREFAULT_STUB_VA as u64,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Core emulator body. Called both from `handle_sba_udf` (first-time
+/// emulation) and from `handle_sba_retry` (after the pre-fault retry
+/// has paged the EA in). On a walk-fail it triggers the retry round-
+/// trip — unless already on the retry path, in which case it halts.
+fn emulate_sba_site(
+    ctx: &mut TrapContext,
+    faulting_pc: u32,
+    spsr_und: u64,
+    orig_insn: u32,
+    idx: usize,
+    is_retry: bool,
+) -> bool {
     let d = match decode(orig_insn) {
         Some(d) => d,
         None => {
@@ -1103,27 +2044,25 @@ pub fn handle_sba_udf(
     // Post-index (P=0): access uses rn, writeback stores rn +- offset.
     let access_addr = if d.p { ea_offsetted } else { rn_val };
 
-    // If the access VA doesn't have a valid stage-1 mapping, the
-    // instruction would have taken a data abort on unpatched hardware.
-    // Inject the DABT into the guest so its DataAbortHandler can fault
-    // the page in (e.g. heap growth across a page boundary, which is
-    // how Newton's allocator populates the second page of a cross-page
-    // heap object on first access). The XOR that `dispatch_*` would
-    // apply only affects the low two bits — same 4 KiB page — so a
-    // single resolve check covers both the raw EA and its BE-32 alias.
-    // NOTE: when `resolve_addr(access_addr)` fails later in the dispatch
-    // helpers, we halt loudly. The natural-DABT-injection approach
-    // (fake a translation fault so the kernel's DataAbortHandler grows
-    // the heap/stack) is blocked on A53: DFSR32_EL2 writes UNDEF from
-    // EL2 (see `cp15::write_dfsr32` in trap.rs), so we can't force the
-    // kernel's `mrc p15,0,r1,c5,c0,0 / add pc,pc,r1,LSL #2` jump-table
-    // dispatch to land on the translation-fault handler — the stale
-    // DFSR from a previous fault (typically 0x1 from the alignment
-    // emulator) sends it to UnhandledException → Reboot instead. Any
-    // future walk-fail site needs a different strategy: pre-fault-in
-    // the page from EL2 before emulation, or reroute the originating
-    // instruction through a natural-fault retry. See INVESTIGATION.md.
-    let _ = va_is_mapped_s1e1; // keep the helper available for diagnostics
+    // Walk the guest's stage-1 for the EA. If the walk fails, the
+    // unpatched site would have taken a DABT on hardware. Route through
+    // the pre-fault retry stub so the kernel's own DataAbortHandler
+    // grows the heap / stack / on-demand-paging range; the retry HVC
+    // resumes this emulator body with the same idx, but now
+    // `resolve_addr` succeeds. The XOR inside `dispatch_*` only touches
+    // the low two bits (same 4 KiB page), so this single check covers
+    // both the raw EA and its BE-32 alias.
+    if access_addr < XOR_LIMIT && resolve_addr(access_addr).is_none() {
+        if is_retry {
+            kprintln!(
+                "*** shadow_stub: retry probe succeeded but EA {:#x} still unmapped at pc={:#x}",
+                access_addr, faulting_pc
+            );
+            crate::cpu::halt();
+        }
+        trigger_pre_fault_retry(ctx, access_addr, faulting_pc, spsr_und, idx);
+        return true;
+    }
 
     // Perform the access.
     match d.kind {
@@ -1277,11 +2216,320 @@ mod tests {
 
     #[test]
     fn enc_udf_shape() {
-        // imm16 = 0xFFFE (guest_bp marker) should match the known encoding.
-        assert_eq!(enc_udf(0xFFFE), 0xE7FF_F0FE);
+        // imm16 = 0xFFFE (guest_bp marker) — UDF A1 encoding fixes
+        // bits 7:4 to 0xF (imm12<<8 covers bits 19:8, imm4 covers
+        // bits 3:0; the SBO at bits 7:4 is part of the opcode).
+        assert_eq!(enc_udf(0xFFFE), 0xE7FF_FFFE);
         // imm16 = 0x8000 (first SBA slot).
         let w = enc_udf(0x8000);
         assert!(is_sba_udf_insn(w));
         assert_eq!(udf_imm16(w), 0x8000);
+    }
+
+    #[test]
+    fn arm_imm12_roundtrip() {
+        use super::encode::arm_imm12;
+        // 0, small positives, the XOR_LIMIT constant, and a few rotated
+        // values should all encode.
+        assert!(arm_imm12(0).is_some());
+        assert!(arm_imm12(3).is_some());
+        assert!(arm_imm12(255).is_some());
+        assert!(arm_imm12(XOR_LIMIT).is_some());         // 0x10000000 = 1 ROR 4
+        assert!(arm_imm12(0x0000_FF00).is_some());       // 0xFF << 8
+        assert!(arm_imm12(0x00FF_0000).is_some());       // 0xFF << 16
+        // 12-bit all-ones doesn't encode as a rotated 8-bit value.
+        assert!(arm_imm12(0x0000_0FFF).is_none());
+        // 0x101 isn't either (two separate bits).
+        assert!(arm_imm12(0x0000_0101).is_none());
+    }
+
+    #[test]
+    fn inline_stub_7_word_layout() {
+        // LDRB r0, [r1, #4]. With scratch picks (R12, sea-or-sfl) vary
+        // depending on liveness, but the structural layout is fixed:
+        //   slot 0: MRS Rd, CPSR  — pattern 0xE10F_0000 | (Rd<<12)
+        //   slot 1: ADD/SUB scratch_ea, Rn, #4
+        //   slot 2: CMP scratch_ea, #XOR_LIMIT
+        //   slot 3: EORLO scratch_ea, scratch_ea, #3
+        //   slot 4: MSR cpsr_f, Rm  — pattern 0xE128_F000 | Rm
+        //   slot 5: LDRB Rt, [scratch_ea]  — re-decodable
+        //   slot 6: B orig_pc+4
+        let d = decode(0xE5D1_0004).unwrap();
+        let stub = encode_inline_stub(&d, 0x0004_0000, 0x00E0_0000, 12, 0)
+            .expect("stub");
+        // Slot 0: MRS Rd, CPSR.
+        assert_eq!(stub[0] & 0xFFFF_0FFF, 0xE10F_0000);
+        // Slot 4: MSR cpsr_f, Rm. Lower 4 bits = Rm; upper bits fixed.
+        assert_eq!(stub[4] & 0xFFFF_FFF0, 0xE128_F000);
+        // Slot 5: re-decodes as LDRB with Rt preserved.
+        let decoded_access = decode(stub[5]).expect("access decodes");
+        assert_eq!(decoded_access.kind, AccessKind::Ldrb);
+        assert_eq!(decoded_access.rt, d.rt);
+        if let OffsetForm::Imm { imm } = decoded_access.offset {
+            assert_eq!(imm, 0);
+        } else {
+            panic!("expected zero-imm offset at slot 5");
+        }
+        // Slot 6: back-branch to orig_pc + 4 = 0x0004_0004.
+        let slot6_pc = 0x00E0_0000u32 + 6 * 4;
+        let expected = encode::b(slot6_pc, 0x0004_0004).unwrap();
+        assert_eq!(stub[6], expected);
+    }
+
+    /// Helper: classify whether a BranchKind ended the basic block.
+    fn is_block_terminator(kind: BranchKind) -> bool {
+        !matches!(kind, BranchKind::Linear | BranchKind::BLink { .. })
+    }
+
+    #[test]
+    fn analyze_dp_immediate() {
+        // MOV r0, #0 — writes r0, no reads.
+        let (read, write, kind) = analyze_insn(0xE3A0_0000, 0);
+        assert_eq!(read, 0);
+        assert_eq!(write, 1u16 << 0);
+        assert!(!is_block_terminator(kind));
+
+        // CMP r0, #0 — reads r0, no write (CMP is no-writeback opcode).
+        let (read, write, kind) = analyze_insn(0xE350_0000, 0);
+        assert_eq!(read, 1u16 << 0);
+        assert_eq!(write, 0);
+        assert!(!is_block_terminator(kind));
+    }
+
+    #[test]
+    fn analyze_dp_register() {
+        // MOV r0, r1 — reads r1, writes r0.
+        let (read, write, kind) = analyze_insn(0xE1A0_0001, 0);
+        assert_eq!(read, 1u16 << 1);
+        assert_eq!(write, 1u16 << 0);
+        assert!(!is_block_terminator(kind));
+
+        // ADD r0, r1, r2 — reads r1, r2; writes r0.
+        let (read, write, kind) = analyze_insn(0xE081_0002, 0);
+        assert_eq!(read, (1u16 << 1) | (1u16 << 2));
+        assert_eq!(write, 1u16 << 0);
+        assert!(!is_block_terminator(kind));
+    }
+
+    #[test]
+    fn analyze_branch_classification() {
+        // BL <imm24>=0 — call to PC+8.
+        let (_, _, kind) = analyze_insn(0xEB00_0000, 0x100);
+        assert!(matches!(kind, BranchKind::BLink { target } if target == 0x108));
+        // B <imm24>=0 — direct branch to PC+8.
+        let (_, _, kind) = analyze_insn(0xEA00_0000, 0x100);
+        assert!(matches!(kind, BranchKind::Direct { target } if target == 0x108));
+        // BNE <imm24>=0 — conditional branch.
+        let (_, _, kind) = analyze_insn(0x1A00_0000, 0x100);
+        assert!(matches!(kind, BranchKind::Cond { target } if target == 0x108));
+        // BX LR — APCS return.
+        let (read, _, kind) = analyze_insn(0xE12F_FF1E, 0);
+        assert!(matches!(kind, BranchKind::Return));
+        assert_eq!(read & APCS_RETURN_LIVE, APCS_RETURN_LIVE);
+        // BX r3 (non-LR) — indirect.
+        let (read, _, kind) = analyze_insn(0xE12F_FF13, 0);
+        assert!(matches!(kind, BranchKind::Indirect));
+        assert_eq!(read, 1u16 << 3);
+        // BLX r3 — like a function call.
+        let (read, _, kind) = analyze_insn(0xE12F_FF33, 0x100);
+        assert!(matches!(kind, BranchKind::BLink { target } if target == 0x104));
+        assert_eq!(read, 1u16 << 3);
+    }
+
+    #[test]
+    fn analyze_returns() {
+        // MOV PC, LR (e1a0_f00e) — APCS return via DP-reg.
+        let (_, _, kind) = analyze_insn(0xE1A0_F00E, 0);
+        assert!(matches!(kind, BranchKind::Return));
+        // POP {r0, pc} — LDM SP!, {r0, pc}.
+        // cond 100 P=0 U=1 S=0 W=1 L=1 Rn=13 reglist=0x8001 (r0+pc)
+        // = E8BD_8001
+        let (_, _, kind) = analyze_insn(0xE8BD_8001, 0);
+        assert!(matches!(kind, BranchKind::Return));
+        // LDR PC, [SP], #4 — single-reg pop-return.
+        // cond 010 P=0 U=1 B=0 W=0 L=1 Rn=13 Rt=15 imm=4 = E49D_F004
+        let (_, _, kind) = analyze_insn(0xE49D_F004, 0);
+        assert!(matches!(kind, BranchKind::Return));
+    }
+
+    #[test]
+    fn analyze_loads_stores() {
+        // LDR r0, [r1] — reads r1, writes r0.
+        let (read, write, kind) = analyze_insn(0xE591_0000, 0);
+        assert_eq!(read, 1u16 << 1);
+        assert_eq!(write, 1u16 << 0);
+        assert!(!is_block_terminator(kind));
+        // STR r0, [r1] — reads r0, r1; no GPR write.
+        let (read, write, kind) = analyze_insn(0xE581_0000, 0);
+        assert_eq!(read, (1u16 << 0) | (1u16 << 1));
+        assert_eq!(write, 0);
+        assert!(!is_block_terminator(kind));
+        // LDR r0, [r1, #4]! — pre-index writeback.
+        let (read, write, kind) = analyze_insn(0xE5B1_0004, 0);
+        assert_eq!(read, 1u16 << 1);
+        assert_eq!(write, (1u16 << 0) | (1u16 << 1));
+        assert!(!is_block_terminator(kind));
+        // LDR r0, [r1], #4 — post-index.
+        let (read, write, kind) = analyze_insn(0xE491_0004, 0);
+        assert_eq!(read, 1u16 << 1);
+        assert_eq!(write, (1u16 << 0) | (1u16 << 1));
+        assert!(!is_block_terminator(kind));
+    }
+
+    #[test]
+    fn analyze_movw_movt() {
+        // MOVW r4, #0x3000 — `e3034000`. Writes r4, no GPR reads.
+        // (The imm4h in bits 19:16 must NOT be misread as Rn.)
+        let (read, write, kind) = analyze_insn(0xE303_4000, 0);
+        assert_eq!(read, 0);
+        assert_eq!(write, 1u16 << 4);
+        assert!(matches!(kind, BranchKind::Linear));
+        // MOVT r4, #0x400 — `e3404400`. Reads r4 (preserves low half), writes r4.
+        let (read, write, kind) = analyze_insn(0xE340_4400, 0);
+        assert_eq!(read, 1u16 << 4);
+        assert_eq!(write, 1u16 << 4);
+        assert!(matches!(kind, BranchKind::Linear));
+    }
+
+    #[test]
+    fn analyze_hvc_classification() {
+        // HVC #2 — should NOT be misclassified as DP-reg-shifted.
+        let (read, write, kind) = analyze_insn(0xE140_0072, 0x100);
+        assert!(matches!(kind, BranchKind::BLink { .. }));
+        assert_eq!(read, 0);
+        assert_eq!(write, 0);
+    }
+
+    #[test]
+    fn analyze_svc_is_blink() {
+        // SVC #0 — function-call-shaped. Caller's APCS-saved regs are
+        // observably clobbered; analyzer must continue at PC+4 rather
+        // than bailing conservatively.
+        let (read, write, kind) = analyze_insn(0xEF00_0000, 0x100);
+        assert!(matches!(kind, BranchKind::BLink { target } if target == 0x104));
+        assert_eq!(read, 0);
+        assert_eq!(write, 0);
+    }
+
+    #[test]
+    fn liveness_linear_finds_dead_reg() {
+        // Synthetic insn stream:
+        //   MOV r12, #0   ; writes r12 (no read)
+        //   BX LR         ; APCS return; reads APCS_RETURN_LIVE
+        // → r12 is dead at start (written before any read).
+        let stream = [0xE3A0_C000u32, 0xE12F_FF1Eu32];
+        let live = live_at_with_reader(0, 16, &|pc| stream.get((pc / 4) as usize).copied());
+        assert_eq!(live & (1u16 << 12), 0, "r12 should be dead");
+        // R0 should be live (return value reg).
+        assert_ne!(live & (1u16 << 0), 0, "r0 should be live (return value)");
+        // R4..R11 should be live (callee-preserved).
+        for r in 4..=11 {
+            assert_ne!(live & (1u16 << r), 0, "r{} should be live (callee-preserved)", r);
+        }
+        // R1, R2, R3 should be dead (caller-saved scratch, not preserved).
+        assert_eq!(live & (1u16 << 1), 0, "r1 should be dead");
+        assert_eq!(live & (1u16 << 2), 0, "r2 should be dead");
+        assert_eq!(live & (1u16 << 3), 0, "r3 should be dead");
+    }
+
+    #[test]
+    fn liveness_bl_clobbers_caller_saved() {
+        // Stream:
+        //   MOV r4, #0   ; r4 dead
+        //   BL +0        ; APCS-clobbers R0..R3, R12, LR
+        //   BX LR        ; return
+        // After this, R0..R3 and R12 are "written" by the BL → dead at start.
+        let stream = [0xE3A0_4000u32, 0xEB00_0000u32, 0xE12F_FF1Eu32];
+        let live = live_at_with_reader(0, 16, &|pc| stream.get((pc / 4) as usize).copied());
+        // R12 written by MOV at slot 0... actually no, MOV writes r4 not r12.
+        // BL clobbers R0..R3, R12, LR. So those are dead at start.
+        for r in [0u16, 1, 2, 3, 12] {
+            // R0 is in APCS_RETURN_LIVE (return value), but it's also
+            // clobbered by BL. The BL clobber happens BEFORE the BX LR,
+            // so R0 is "written" by the BL and the BX LR's read is the
+            // post-BL R0 (not the pre-BL one). So R0 ends up dead at
+            // start.
+            assert_eq!(live & (1u16 << r), 0,
+                "r{} should be dead (BL clobber before any read)", r);
+        }
+    }
+
+    #[test]
+    fn liveness_cycle_handled() {
+        // Branch-to-self halt:
+        //   B .   ; cycle, no reads
+        let stream = [0xEAFF_FFFEu32];
+        let live = live_at_with_reader(0, 16, &|pc| stream.get((pc / 4) as usize).copied());
+        assert_eq!(live, 0, "b . should yield no reads");
+    }
+
+    #[test]
+    fn liveness_conditional_split_unions_paths() {
+        // Stream layout:
+        //   pc=0: BNE +1        ; cond → target=PC+8+(1<<2)=0x10
+        //   pc=4: MOV r0, #0    ; fall-through writes r0
+        //   pc=8: BX LR         ; fall-through return
+        //   pc=12: nop
+        //   pc=16 (target): MOV r1, #0  ; taken-path writes r1
+        //   pc=20: BX LR        ; taken-path return
+        // Both paths return without reading r12 → r12 is dead.
+        // Fall-through path writes r0 before BX LR → r0 dead on that path.
+        // Taken path doesn't write r0 → BX LR reads r0 (return value live) → r0 live on that path.
+        // Union: r0 live (live on at least one path).
+        let stream = [
+            0x1A00_0001u32, // BNE +1 (target = 0+8+4 = 0xC) — let's recompute
+            // Actually with imm24=1, target=pc+8+(1<<2)=0+8+4=0xC. So target=0xC.
+            // Adjust stream layout:
+            0xE3A0_0000u32, // MOV r0, #0 (pc=4)
+            0xE12F_FF1Eu32, // BX LR (pc=8)
+            0xE3A0_1000u32, // MOV r1, #0 (pc=0xC, target)
+            0xE12F_FF1Eu32, // BX LR (pc=0x10)
+        ];
+        let live = live_at_with_reader(0, 16, &|pc| stream.get((pc / 4) as usize).copied());
+        // r12 should be dead on both paths (neither writes nor reads it).
+        assert_eq!(live & (1u16 << 12), 0, "r12 dead on both paths");
+        // r1 dead on taken path (it's the path's own write target),
+        // dead on fall-through (not used). Either way dead.
+        // r0 dead on fall-through (written before return), live on taken
+        // path (taken path's BX LR reads return-value-live r0). Union: live.
+        assert_ne!(live & (1u16 << 0), 0, "r0 live (taken path needs it)");
+    }
+
+    #[test]
+    fn pick_scratch_finds_dead_pair() {
+        // Stream where R12 and R1 are dead at PC=4 (start of analysis):
+        //   pc=4: MOV r12, r4
+        //   pc=8: MOV r1, r4
+        //   pc=12: BX LR
+        // After pc=4 and pc=8, both r12 and r1 are written before any read.
+        // At BX LR, APCS_RETURN_LIVE doesn't include r1 or r12.
+        let stream = [
+            0xDEAD_DEADu32, // pc=0 (the byte-access site, ignored by walker)
+            0xE1A0_C004u32, // MOV r12, r4
+            0xE1A0_1004u32, // MOV r1, r4
+            0xE12F_FF1Eu32, // BX LR
+        ];
+        // Decoded site (placeholder — operand-exclusion uses Rt, Rn, Rm).
+        // Pretend Rt=6, Rn=4 (matches the failing test's case).
+        let d = Decoded {
+            kind: AccessKind::Ldrb, cond: 0xE, rn: 4, rt: 6, rt2: 0,
+            offset: OffsetForm::Imm { imm: 0 },
+            p: true, u: true, w: false,
+        };
+        let live = live_at_with_reader(4, 16,
+            &|pc| stream.get((pc / 4) as usize).copied());
+        let candidates: &[u32] = &[12, 0, 1, 2, 3, 14];
+        let operand_mask: u16 = (1u16 << d.rt) | (1u16 << d.rn);
+        let mut picks: [u32; 2] = [u32::MAX; 2];
+        let mut n = 0;
+        for &r in candidates {
+            let rmask: u16 = 1u16 << r;
+            if rmask & operand_mask != 0 { continue; }
+            if rmask & live != 0 { continue; }
+            picks[n] = r;
+            n += 1;
+            if n == 2 { break; }
+        }
+        assert_eq!(n, 2, "should find 2 dead regs; live mask was {:#x}", live);
     }
 }

@@ -3,6 +3,9 @@ use core::sync::atomic::{compiler_fence, Ordering};
 
 use crate::kprintln;
 
+// When building under `cargo test --target=<host>`, std provides the
+// panic_impl lang item; gate ours out so we don't hit a duplicate.
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     // Best-effort: the UART may be the thing that panicked, but retrying

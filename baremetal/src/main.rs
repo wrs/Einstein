@@ -1,7 +1,8 @@
-#![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+#[cfg(not(test))]
 use core::arch::global_asm;
 
 mod cpu;
@@ -25,7 +26,9 @@ mod trap;
 pub mod uart;
 mod unaligned;
 
+#[cfg(not(test))]
 global_asm!(include_str!("boot.s"));
+#[cfg(not(test))]
 global_asm!(include_str!("vectors.s"));
 
 extern "C" {

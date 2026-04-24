@@ -97,6 +97,15 @@ fn in_bio_bank(ipa: u64) -> bool {
 }
 
 pub fn read(ipa: u64, sas: u8, elr: u64) -> u32 {
+    // Inline-stub byte / halfword reads apply the BE-32 XOR before the
+    // native access, so the IPA we see here for sub-word accesses is
+    // `original ^ 3` (byte) or `original ^ 2` (halfword). MMIO handlers
+    // dispatch on word-aligned register addresses, so un-XOR to recover
+    // the original register. The UDF emulator path already passes the
+    // un-XOR'd IPA, so this is a no-op there (sas < 2 MMIO never enters
+    // the UDF-fallback-to-mmio arm with an XOR'd IPA). See the XOR_LIMIT
+    // commentary in `src/shadow_stub.rs`.
+    let ipa = unxor_sub_word(ipa, sas);
     let value = match ipa {
         a if vic::owns(a) => vic::read(a),
         a if dma::owns(a) => dma::read(a),
@@ -200,6 +209,32 @@ pub fn read(ipa: u64, sas: u8, elr: u64) -> u32 {
 }
 
 pub fn write(ipa: u64, sas: u8, value: u32, elr: u64) {
+    // See `read` for the rationale on un-XOR'ing sub-word MMIO IPAs.
+    let ipa = unxor_sub_word(ipa, sas);
+    // Tick-page sub-word write catch-net. The tick cluster at
+    // 0x0F18_1000..0x0F18_2000 is stage-2 RO (see
+    // `stage2::install_tick_page`). The old UDF emulator routed
+    // byte / halfword writes here through `backed_byte_write` /
+    // `backed_halfword_write` directly to the tick-page RAM backing,
+    // but inline-stub byte / halfword writes from the guest will
+    // stage-2-fault into this function with `sas ∈ {0, 1}`. This
+    // halt surfaces that case loudly — if it ever fires, the fix is
+    // to route those IPAs back through a `backed_*_write` call on
+    // `stage2::TICK_PAGE` instead of halting.
+    if sas < 2 && (0x0F18_1000..0x0F18_2000).contains(&ipa) {
+        kprintln!();
+        kprintln!(
+            "*** tick-page sub-word write reached mmio::write — \
+             IPA={:#010x} size={} value={:#010x} @ELR={:#x}",
+            ipa, if sas == 0 { "B" } else { "H" }, value, elr
+        );
+        kprintln!(
+            "  (inline stub wrote to stage-2 RO tick page. See the \
+             'MMIO routing' section of the inline-stub plan — route \
+             back through backed_*_write on stage2::TICK_PAGE.)"
+        );
+        cpu::halt();
+    }
     if vic::owns(ipa) {
         vic::write(ipa, value);
         return;
@@ -295,6 +330,20 @@ pub fn write(ipa: u64, sas: u8, value: u32, elr: u64) {
         a => halt_on_unknown("write", a, sas, value, elr),
     }
     let _ = value;
+}
+
+/// Un-XOR the BE-32 byte / halfword XOR that the inline-stub emitter
+/// applies before an MMIO-range access. Only affects sub-word accesses
+/// whose IPA is below XOR_LIMIT (= 0x1000_0000). Above XOR_LIMIT
+/// (PCMCIA etc.), inline stubs skip the XOR and we shouldn't un-XOR.
+fn unxor_sub_word(ipa: u64, sas: u8) -> u64 {
+    const XOR_LIMIT: u64 = 0x1000_0000;
+    if ipa >= XOR_LIMIT { return ipa; }
+    match sas {
+        0 => ipa ^ 3,
+        1 => ipa ^ 2,
+        _ => ipa,
+    }
 }
 
 fn mask_for_size(value: u32, sas: u8) -> u32 {

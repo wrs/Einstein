@@ -32,7 +32,7 @@
 _start:
     b       _reset              @ 0x00: reset
     b       .Lhalt_undef        @ 0x04: UND
-    b       .Lhalt_swi          @ 0x08: SWI
+    b       _swi_dispatch       @ 0x08: SWI (subtest_23 routes here)
     b       .Lhalt_pabt         @ 0x0C: PABT
     b       .Lhalt_dabt         @ 0x10: DABT
     b       .                   @ 0x14: reserved
@@ -96,6 +96,39 @@ _reset:
     hvc     #4
     b       .Lhang
 
+    @ SWI vector dispatcher. Reads a "SWI mode" flag at 0x04003F08:
+    @   0 = no test active → halt (treat as test failure)
+    @   1 = subtest_23 active → run an SBA byte access from inside
+    @       the SWI handler, then return to the caller via
+    @       `movs pc, lr` (which restores CPSR from SPSR_svc).
+    @
+    @ The handler exercises the same path an IRQ would: an exception
+    @ taken mid-routine in SVC mode, with banked LR_svc/SPSR_svc, the
+    @ handler does its own byte access (which goes through an inline
+    @ stub), then returns. We use SWI rather than a real IRQ because
+    @ a real IRQ-firing-mid-stub isn't deterministic from a guest
+    @ test, and the banked-register / inline-stub semantics we care
+    @ about are identical.
+_swi_dispatch:
+    movw    r12, #0x3F08
+    movt    r12, #0x0400
+    ldr     r12, [r12]
+    cmp     r12, #1
+    bne     .Lhalt_swi
+    @ Save caller-saved registers (we'll do byte ops here).
+    push    {r0, r1, r2, r3, lr}
+    @ The "SWI handler" byte access: read the byte at r4+0 (caller
+    @ left SCRATCH_BASE in r4, with a known word stored there). This
+    @ access goes through whatever stub the patcher installed.
+    @ Bump a counter to prove the handler ran.
+    movw    r12, #0x3F0C
+    movt    r12, #0x0400
+    ldr     r0, [r12]
+    add     r0, r0, #1
+    str     r0, [r12]
+    pop     {r0, r1, r2, r3, lr}
+    movs    pc, lr
+
     @ Jump target: r0 = subtest number, prints and halts FAIL.
 .Lfail:
     hvc     #2                          @ print subtest number
@@ -130,7 +163,17 @@ test_main:
     bl      subtest_16_sp_post_index
     bl      subtest_17_swpb
     bl      subtest_18_ldrd_verify
+    @ subtest_19_cross_page_dabt: deferred. The stub's natural-DABT
+    @ recovery path is heavily exercised by the FVP ROM boot
+    @ (kernel's own DataAbortHandler runs many times during heap +
+    @ stack growth). Re-creating the same shape from a guest test
+    @ requires a non-trivial stage-1 MMU setup, a vector-dispatcher
+    @ patch, and hypervisor cooperation around `fix_stage1_xn_bits`.
+    @ See INVESTIGATION.md for the gating constraints.
     bl      subtest_20_ram_resident
+    bl      subtest_21_ram_reload
+    bl      subtest_22_inline_stub_modes
+    bl      subtest_23_swi_during_stubs
 
     pop     {r4-r11, lr}
     @ Print PASS banner via unpatched HVC_PUTC.
@@ -703,6 +746,300 @@ subtest_20_ram_resident:
     hvc     #2
     fail_st 20
 
+
+    @ ---- subtest 21: RAM page reload (demand-pager re-scan) ------
+    @ Validates the stage-2 RW+XN ↔ RO+¬XN per-page state machine.
+    @ (1) Copy reload_helper_a into a 4 KiB-aligned RAM target. First
+    @     fetch traps (XN), hypervisor scans+patches+marks RO+¬XN,
+    @     subsequent fetches succeed. helper_a does `ldrb r0, [r4]`
+    @     and returns — BE-32 should give byte at phys[0^3] = phys[3].
+    @ (2) Overwrite the RAM target with reload_helper_b. First store
+    @     traps (RO permission), hypervisor flips page back to RW+XN,
+    @     store retries and succeeds. After redoing cache-coherency,
+    @     calling the new helper traps on fetch again (XN), hypervisor
+    @     re-scans the now-reloaded bytes, flips RO+¬XN. helper_b does
+    @     `ldrb r0, [r4, #3]` — BE-32 phys[3^3] = phys[0].
+    @     If the re-scan didn't happen, the ldrb would hit the old
+    @     stub layout and return the wrong byte.
+subtest_21_ram_reload:
+    push    {r4, r5, r6, r7, r8, r9, r10, lr}
+
+    @ Pick an aligned RAM target far from the subtest_20 target so
+    @ the two tests don't interact.
+    load_u32 r7, 0x04302000             @ 4 KiB-aligned
+    @ Set up a known scratch word.
+    load_u32 r4, SCRATCH_BASE
+    load_u32 r5, 0xDEADBEEF
+    str     r5, [r4]
+
+    @ (1) Copy reload_helper_a.
+    load_sym r5, reload_helper_a
+    load_sym r6, reload_helper_a_end
+    mov     r8, r7
+.Lst21_copy_a:
+    ldr     r9, [r5], #4
+    str     r9, [r8], #4
+    cmp     r5, r6
+    bne     .Lst21_copy_a
+
+    @ Cache-coherency dance: clean D, invalidate I for the target.
+    mov     r8, r7
+.Lst21_dcache_a:
+    mcr     p15, 0, r8, c7, c10, 1      @ DCCMVAC
+    add     r8, r8, #32
+    cmp     r8, r7
+    addlo   r8, r8, #0                  @ noop to keep the loop shape
+    @ The copy is 8 bytes — one 32-byte cache line covers it.
+    @ Just emit one more clean + invalidate for safety:
+    mov     r8, r7
+    mcr     p15, 0, r8, c7, c10, 1      @ DCCMVAC
+    mcr     p15, 0, r8, c7, c5, 1       @ ICIMVAU
+    dsb
+    isb
+
+    @ Call helper_a. r4 already holds SCRATCH_BASE; r5=0xDEADBEEF.
+    @ helper_a: ldrb r0, [r4] → phys[r4^3] = low byte of BE-32 view.
+    @ With 0xDEADBEEF stored via word-aligned STR, the host memory
+    @ holds EF-BE-AD-DE in LE byte order, so phys[0]=EF phys[3]=DE.
+    @ The BE-32 LDRB at [r4+0] XORs to [r4^3] = phys[3] = 0xDE.
+    blx     r7
+    cmp     r0, #0xDE
+    bne     .Lst21_fail
+
+    @ (2) Overwrite with reload_helper_b. The first STR to the RAM
+    @ target triggers a stage-2 RO permission fault (page is RO+X
+    @ after the helper_a scan). The hypervisor flips the page to
+    @ RW+XN and retries the store. Subsequent stores proceed natively.
+    load_sym r5, reload_helper_b
+    load_sym r6, reload_helper_b_end
+    mov     r8, r7
+.Lst21_copy_b:
+    ldr     r9, [r5], #4
+    str     r9, [r8], #4
+    cmp     r5, r6
+    bne     .Lst21_copy_b
+
+    @ Redo cache-coherency so the new bytes are visible to I-cache.
+    mov     r8, r7
+    mcr     p15, 0, r8, c7, c10, 1      @ DCCMVAC
+    mcr     p15, 0, r8, c7, c5, 1       @ ICIMVAU
+    dsb
+    isb
+
+    @ Call helper_b: `ldrb r0, [r4, #3]` → phys[(r4+3)^3] = phys[r4].
+    @ With 0xDEADBEEF in SCRATCH_BASE, phys[r4] = 0xEF.
+    blx     r7
+    cmp     r0, #0xEF
+    bne     .Lst21_fail
+
+    pop     {r4, r5, r6, r7, r8, r9, r10, lr}
+    bx      lr
+.Lst21_fail:
+    mov     r10, r0
+    pop     {r4, r5, r6, r7, r8, r9, r10, lr}
+    mov     r0, r10
+    hvc     #2
+    fail_st 21
+
+    @ ---- subtest 22: inline-stub correctness across modes ---------
+    @ Each mode block is its own BL'd helper so the liveness analyzer
+    @ at any byte-access site walks only the helper (small CFG, ends
+    @ at BX LR), and the caller's BL clears caller-saved (including
+    @ R12) from the post-BL liveness — keeping inline coverage high.
+    @
+    @ Each helper:
+    @   1. switch to its target mode + set per-mode SP
+    @   2. do byte op against SCRATCH_BASE
+    @   3. switch back to SVC, return via BX LR (helper code itself
+    @      is in SVC mode at entry/exit)
+    @
+    @ NOTE: helpers run in their target mode but are entered/exited
+    @ in SVC. They MSR-flip into the target mode, then back out before
+    @ BX LR.
+subtest_22_inline_stub_modes:
+    push    {r4, lr}
+    bl      st22_helper_sys
+    cmp     r0, #0
+    bne     .Lst22_fail
+    bl      st22_helper_fiq
+    cmp     r0, #0
+    bne     .Lst22_fail
+    bl      st22_helper_irq
+    cmp     r0, #0
+    bne     .Lst22_fail
+    bl      st22_helper_abt
+    cmp     r0, #0
+    bne     .Lst22_fail
+    bl      st22_helper_und
+    cmp     r0, #0
+    bne     .Lst22_fail
+    pop     {r4, lr}
+    bx      lr
+
+.Lst22_fail:
+    @ r0 holds the failure subcode (each helper returns its own).
+    pop     {r4, lr}
+    hvc     #2
+    fail_st 22
+
+    @ ---- per-mode helpers ----------------------------------------
+    @ Each helper takes no args. Returns r0 = 0 on pass, non-zero
+    @ failure code on fail. Must save/restore any callee-saved regs
+    @ they touch — they push only what they use.
+
+st22_helper_sys:
+    push    {r4, r5, r6, lr}
+    msr     cpsr_c, #0xDF              @ SYS mode
+    load_u32 sp, 0x04001500
+    load_u32 r4, SCRATCH_BASE
+    load_u32 r5, 0xDEADBEEF
+    str     r5, [r4]
+    ldrb    r6, [r4]                   @ phys[r4^3] = 0xDE
+    msr     cpsr_c, #0xD3              @ back to SVC
+    cmp     r6, #0xDE
+    movne   r0, #0x22
+    moveq   r0, #0
+    pop     {r4, r5, r6, lr}
+    bx      lr
+
+st22_helper_fiq:
+    push    {r4, r5, r6, lr}
+    msr     cpsr_c, #0xD1              @ FIQ
+    load_u32 sp, 0x04001100
+    load_u32 r4, SCRATCH_BASE
+    load_u32 r5, 0x12345678
+    str     r5, [r4]
+    ldrb    r6, [r4, #1]               @ phys[r4+2] = 0x34
+    msr     cpsr_c, #0xD3
+    cmp     r6, #0x34
+    movne   r0, #0x23
+    moveq   r0, #0
+    pop     {r4, r5, r6, lr}
+    bx      lr
+
+st22_helper_irq:
+    push    {r4, r5, r6, lr}
+    msr     cpsr_c, #0xD2              @ IRQ
+    load_u32 sp, 0x04001200
+    load_u32 r4, SCRATCH_BASE
+    load_u32 r5, 0x11223344
+    str     r5, [r4]
+    ldrb    r6, [r4, #2]               @ phys[r4+1] = 0x33
+    msr     cpsr_c, #0xD3
+    cmp     r6, #0x33
+    movne   r0, #0x24
+    moveq   r0, #0
+    pop     {r4, r5, r6, lr}
+    bx      lr
+
+st22_helper_abt:
+    push    {r4, r5, r6, lr}
+    msr     cpsr_c, #0xD7              @ ABT
+    load_u32 sp, 0x04001300
+    load_u32 r4, SCRATCH_BASE
+    load_u32 r5, 0xCAFEBABE
+    str     r5, [r4]
+    ldrb    r6, [r4, #3]               @ phys[r4] = 0xBE
+    msr     cpsr_c, #0xD3
+    cmp     r6, #0xBE
+    movne   r0, #0x25
+    moveq   r0, #0
+    pop     {r4, r5, r6, lr}
+    bx      lr
+
+st22_helper_und:
+    push    {r4, r5, r7, r8, lr}
+    msr     cpsr_c, #0xDB              @ UND
+    load_u32 sp, 0x04001400
+    load_u32 r4, SCRATCH_BASE
+    @ Pre-fill the scratch word so the post-STRB state is predictable.
+    load_u32 r5, 0x11223344
+    str     r5, [r4]
+    load_u32 r5, 0xDEADBEEF
+    @ STRB writes 0xEF at phys[r4^3]=phys[r4+3]. Host LE before:
+    @ 44 33 22 11. After: 44 33 22 EF. Word read: 0xEF223344.
+    strb    r5, [r4]
+    ldr     r7, [r4]
+    msr     cpsr_c, #0xD3
+    load_u32 r8, 0xEF223344
+    cmp     r7, r8
+    movne   r0, #0x26
+    moveq   r0, #0
+    pop     {r4, r5, r7, r8, lr}
+    bx      lr
+
+    @ ---- subtest 23: SWI-as-IRQ during byte-access sequence ------
+    @ Validates that an exception taken mid-byte-access-sequence (in
+    @ this case a SWI standing in for an IRQ — same banked-register +
+    @ inline-stub semantics) does not corrupt the surrounding accesses.
+    @
+    @ Sequence:
+    @   1. Arm the SWI dispatcher's mode flag.
+    @   2. Set up SCRATCH_BASE with a known word.
+    @   3. Do a pre-SWI LDRB → verify byte 0xDE.
+    @   4. SWI #0  → SWI handler bumps counter slot 0x04003F0C.
+    @   5. Do a post-SWI LDRB → verify byte 0xDE again. SWI handler
+    @      must have preserved R4 (it pushes/pops everything it uses).
+    @   6. Verify the SWI handler ran exactly once.
+    @   7. Disarm the flag.
+subtest_23_swi_during_stubs:
+    push    {r4, r5, r6, lr}
+    @ Reset the counter slot at 0x04003F0C.
+    movw    r0, #0x3F0C
+    movt    r0, #0x0400
+    mov     r1, #0
+    str     r1, [r0]
+    @ Arm the SWI mode flag.
+    movw    r0, #0x3F08
+    movt    r0, #0x0400
+    mov     r1, #1
+    str     r1, [r0]
+    @ Set up the scratch word.
+    load_u32 r4, SCRATCH_BASE
+    load_u32 r5, 0xDEADBEEF
+    str     r5, [r4]
+    @ Pre-SWI LDRB. BE-32 phys[r4^3] = phys[r4+3] = 0xDE.
+    ldrb    r6, [r4]
+    cmp     r6, #0xDE
+    bne     .Lst23_fail_pre
+    @ Now SWI #0. Handler runs in SVC, bumps counter, returns.
+    swi     #0
+    @ Post-SWI LDRB. R4 must still hold SCRATCH_BASE.
+    ldrb    r6, [r4]
+    cmp     r6, #0xDE
+    bne     .Lst23_fail_post
+    @ Verify SWI handler ran exactly once.
+    movw    r0, #0x3F0C
+    movt    r0, #0x0400
+    ldr     r1, [r0]
+    cmp     r1, #1
+    bne     .Lst23_fail_count
+    @ Disarm SWI mode flag.
+    movw    r0, #0x3F08
+    movt    r0, #0x0400
+    mov     r1, #0
+    str     r1, [r0]
+    pop     {r4, r5, r6, lr}
+    bx      lr
+
+.Lst23_fail_pre:
+    mov     r0, #0x231
+    b       .Lst23_fail_done
+.Lst23_fail_post:
+    mov     r0, #0x232
+    b       .Lst23_fail_done
+.Lst23_fail_count:
+    mov     r0, #0x233
+.Lst23_fail_done:
+    @ Disarm flag so subsequent halt path doesn't re-trigger SWI.
+    movw    r1, #0x3F08
+    movt    r1, #0x0400
+    mov     r2, #0
+    str     r2, [r1]
+    hvc     #2
+    pop     {r4, r5, r6, lr}
+    fail_st 23
+
     .global patch_end
 patch_end:
     .ltorg                              @ flush any pending literals OUTSIDE
@@ -718,4 +1055,21 @@ ram_helper:
     ldrb    r0, [r4, r1]
     bx      lr
 ram_helper_end:
+
+    @ === subtest 21 reload helpers ==================================
+    @ Two 8-byte functions used to exercise the RAM page-reload re-
+    @ scan path. Both have the same prologue-less shape: a single
+    @ LDRB followed by BX LR. Copy either into a fresh 4 KiB RAM
+    @ page, call it, then overwrite with the other variant and call
+    @ again — if the hypervisor re-scans the page correctly, the
+    @ second call hits the updated BE-32 lane.
+reload_helper_a:
+    ldrb    r0, [r4]
+    bx      lr
+reload_helper_a_end:
+
+reload_helper_b:
+    ldrb    r0, [r4, #3]
+    bx      lr
+reload_helper_b_end:
 

@@ -58,6 +58,15 @@ pub const UND_TAG: u32 = 0x10;
 /// insn. See `unaligned.rs`.
 pub const ALIGN_TAG: u32 = 0x13;
 
+/// Shadow-byte-access retry HVC. Issued by the pre-fault stub at
+/// `SBA_PREFAULT_STUB_VA` after its LDRB probe completes (either
+/// natively, or after the kernel's DABT path paged in the missing
+/// page and the kernel's `subs pc, lr, #8` retried the probe).
+/// Handler restores the stashed emulator context and resumes in
+/// `shadow_stub::handle_sba_retry`.
+pub const SBA_RETRY_TAG: u32 = 0x14;
+
+
 /// Generic "inspect-then-halt" HVC immediate, used by temporary
 /// vector-intercept patches during Phase B debugging. When we need to
 /// see the CPU state at the moment of an abort we don't otherwise see
@@ -283,8 +292,26 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
     let wnr = ((iss >> 6) & 1) != 0;
     let sas = ((iss >> 22) & 3) as u8;
     let srt = ((iss >> 16) & 0x1F) as usize;
+    let ifsc = (iss & 0x3f) as u32;
 
     let elr = read_sysreg!("elr_el2") as u32;
+
+    // Stage-2 RO-permission fault on a RAM code page. Newton's
+    // demand-pager is overwriting a page the hypervisor previously
+    // froze RO+X after shadow-stub patching; flip the page back to
+    // RW+XN and retry the write natively. The next fetch into the
+    // page will trap again (XN) so the handler re-scans the fresh
+    // bytes. See `src/stage2.rs::set_ram_page_{ro_x,rw_xn}`.
+    let ram_base = guest_mem::RAM_IPA_BASE as u64;
+    let ram_end = ram_base + guest_mem::RAM_SIZE as u64;
+    let is_permission = (ifsc & 0b111100) == 0b001100;
+    if wnr && is_permission && (ram_base..ram_end).contains(&ipa) {
+        let page = (ipa as u32) & !0xFFF;
+        // SAFETY: helper performs its own TLB maintenance.
+        unsafe { crate::stage2::set_ram_page_rw_xn(page); }
+        // Don't advance ELR — the CPU retries the write.
+        return;
+    }
 
     // Phase B diagnostic: log any access from inside the REx-scanner
     // function range with full register context, to understand what
@@ -421,23 +448,28 @@ fn handle_instruction_abort(ctx: &TrapContext, iss: u32) {
     if is_permission && in_ram {
         let scan_ipa = ipa as u32;
 
-        // Align down to the 2 MiB block boundary; scan the entire
-        // block so subsequent fetches within it don't re-fault.
-        let block_size = 0x0020_0000u32;
-        let block_start = scan_ipa & !(block_size - 1);
-        let block_end = block_start.wrapping_add(block_size);
+        // Scan one 4 KiB page — Newton's demand-pager operates at
+        // 4 KiB granularity, so re-arming a whole 2 MiB block on
+        // every fresh code page would force us to re-patch already-
+        // patched pages (and potentially double-emit UDFs). The
+        // stage-2 state machine (RW+XN ↔ RO+¬X per page) lets us
+        // track each page independently.
+        let page_start = scan_ipa & !0xFFFu32;
+        let page_end = page_start.wrapping_add(0x1000);
 
         kprintln!(
-            "shadow_stub: lazy RAM patch — block {:#x}..{:#x} (fetch at {:#x})",
-            block_start, block_end, ipa
+            "shadow_stub: lazy RAM patch — page {:#x}..{:#x} (fetch at {:#x})",
+            page_start, page_end, ipa
         );
-        let stats = shadow_stub::patch_code_range(block_start, block_end);
+        let stats = shadow_stub::patch_code_range(page_start, page_end);
         shadow_stub::log_stats(&stats);
 
-        // Flip XN off on the RAM block.
-        // SAFETY: stage2 TLB maintenance done inside the helper.
+        // Flip the page to RO + executable. The next write will
+        // stage-2-fault into the data-abort handler and re-arm it
+        // RW + XN, forcing a re-scan on the subsequent fetch.
+        // SAFETY: helper performs its own TLB maintenance.
         unsafe {
-            crate::stage2::clear_xn_for_block(block_start);
+            crate::stage2::set_ram_page_ro_x(page_start);
         }
 
         // Retry the fetch — don't advance ELR, just return.
@@ -591,6 +623,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         }
         v if v == ALIGN_TAG => {
             crate::unaligned::handle_align_fault(ctx);
+        }
+        v if v == SBA_RETRY_TAG => {
+            crate::shadow_stub::handle_sba_retry(ctx);
         }
         #[cfg(feature = "trace")]
         v if v == crate::tracer::TRACE_TAG => {
@@ -1437,7 +1472,11 @@ fn handle_diag(ctx: &mut TrapContext) {
         // ERET to DataAbortHandler in ABT mode (SPSR_EL2 unchanged).
         // The CPU stays in ABT with LR_abt / SP_abt / SPSR_abt as
         // hardware populated them on DABT entry — exactly the state
-        // the kernel's handler expects at VA 0x0039_3114.
+        // the kernel's handler expects.
+        //
+        // Forward to the Newton kernel's DataAbortHandler at VA
+        // 0x0039_3114 (the original target of the ROM's VA 0x10
+        // branch before we patched it).
         const DATA_ABORT_HANDLER_VA: u32 = 0x0039_3114;
         unsafe {
             core::arch::asm!(
@@ -2029,131 +2068,6 @@ fn resolve_guest_pa(addr: u32) -> Option<u32> {
 /// SPSR_und (still the pre-UND CPSR, preserved since UND entry) into
 /// CPSR, and R14_und into PC. No `msr spsr_el2`, no SPSR_EL1
 /// side-effect.
-/// **Dead-end** — kept for reference but no current caller.
-///
-/// Attempted to synthesise an AArch32 data abort for the kernel's
-/// `DataAbortHandler` when the shadow-stub byte-access emulator
-/// encountered an unmapped effective address. The scheme ERETed into
-/// an in-ROM stub that switched to ABT mode and branched to
-/// `DataAbortHandler` at VA 0x0039_3114, with the banked LR_abt and
-/// SPSR_abt staged from EL2.
-///
-/// The approach is blocked on A53: the kernel's handler dispatches on
-/// the AArch32 DFSR value via `mrc p15,0,r1,c5,c0,0 / add pc,pc,r1,LSL#2`
-/// (0x393288..0x393294), and we cannot force that register from EL2 —
-/// writing DFSR32_EL2 UNDEFs on A53 (see `cp15::write_dfsr32`). Without
-/// a valid DFSR, the jump-table lands on the stale value (typically
-/// 0x1 from the previous alignment fault) and the handler reaches the
-/// UnhandledException / Reboot path.
-///
-/// A working alternative would pre-fault the page from EL2 (e.g. via a
-/// targeted guest memory touch before emulation) or re-route the
-/// originating instruction through a natural-fault retry.
-#[allow(dead_code)]
-pub(crate) fn return_as_dabt(ctx: &mut TrapContext, faulting_pc: u32, ea: u32, pre_fault_cpsr: u32) {
-    static INJECT_LOG_BUDGET: core::sync::atomic::AtomicUsize =
-        core::sync::atomic::AtomicUsize::new(4);
-    if INJECT_LOG_BUDGET
-        .fetch_update(
-            core::sync::atomic::Ordering::Relaxed,
-            core::sync::atomic::Ordering::Relaxed,
-            |n| if n > 0 { Some(n - 1) } else { None },
-        )
-        .is_ok()
-    {
-        let esr_el1: u64 = read_sysreg!("esr_el1");
-        let far_pre: u64 = read_sysreg!("far_el1");
-        kprintln!(
-            "return_as_dabt: PC={:#x} ea={:#x} pre_cpsr={:#010x} mode={:#x}",
-            faulting_pc, ea, pre_fault_cpsr, pre_fault_cpsr & 0x1F,
-        );
-        kprintln!(
-            "  ESR_EL1={:#x} FAR_EL1(pre)={:#x} ctx.x[0]={:#x} ctx.x[13]={:#x}",
-            esr_el1, far_pre, ctx.x[0] as u32, ctx.x[13] as u32,
-        );
-    }
-    // Write LR_abt literal into the ROM-resident stub.
-    let rom_base = guest_mem::rom_host_pa() as usize;
-    let lr_lit_host = rom_base + guest_mem::DABT_INJECT_LR_LITERAL_OFFSET;
-    let lr_abt = faulting_pc.wrapping_add(8);
-    // SAFETY: writes to our own ROM backing, flushed for the guest's
-    // instruction/data fetch view.
-    unsafe {
-        core::ptr::write_volatile(lr_lit_host as *mut u32, lr_abt);
-        core::arch::asm!(
-            "dc cvau, {0}",
-            "dsb ish",
-            "ic ivau, {0}",
-            "dsb ish",
-            "isb",
-            in(reg) lr_lit_host as u64,
-            options(nostack, preserves_flags),
-        );
-    }
-    // Set SPSR_abt directly — the stub leaves this untouched; we own it
-    // from EL2 via the AArch64 banked-register MSR, which LLVM accepts.
-    unsafe {
-        core::arch::asm!(
-            "msr spsr_abt, {0}",
-            "isb",
-            in(reg) pre_fault_cpsr as u64,
-            options(nostack, preserves_flags),
-        );
-    }
-    // Set FAR_EL1 (= AArch32 DFAR) so the kernel's DFAR read returns
-    // the actual faulting address. Set DFSR32_EL2 (= AArch32 DFSR view
-    // from EL2) to a translation-page-fault syndrome so the kernel's
-    // fault-classification jump table lands on the translation-fault
-    // handling path (0x393314) rather than the unhandled path
-    // (0x3932dc). WnR is inferred from the original patched
-    // instruction encoding; we don't have it readily available here,
-    // so use 0 (read) as a conservative default — the kernel's
-    // handler cares more about the fault class than W/R for
-    // translation faults.
-    //
-    // Short-descriptor DFSR for "translation fault, page":
-    //   FS[3:0] = 0b0111  (=7)
-    //   FS[4]   = 0        (bit 10)
-    //   Domain  = 0        (bits 7:4, we don't track it)
-    //   WnR     = 0        (bit 11, read; doesn't matter for class)
-    //   ExT     = 0
-    //   LPAE    = 0        (short-descriptor)
-    // → DFSR = 0x0000_0007
-    // SAFETY: FAR_EL1 / DFSR32_EL2 writes have no side effects other
-    // than setting the registers; they're re-written by the next real
-    // DABT the CPU takes.
-    const DFSC_TRANSLATION_PAGE: u64 = 0x7;
-    unsafe {
-        core::arch::asm!(
-            "msr far_el1, {0}",
-            // DFSR32_EL2 — AArch32 DFSR view at EL2. LLVM doesn't
-            // accept the mnemonic, so use the S<op0>_<op1>_<CRn>_<CRm>_<op2>
-            // form (op0=3, op1=4, CRn=5, CRm=2, op2=0).
-            "msr S3_4_C5_C2_0, {1}",
-            "isb",
-            in(reg) ea as u64,
-            in(reg) DFSC_TRANSLATION_PAGE,
-            options(nostack, preserves_flags),
-        );
-    }
-    // Emit the tarmac-window start marker right before the ERET so
-    // `scripts/fvp --tarmac-window` captures from the stub entry
-    // through to `handle_reboot`'s `emit_stop` (if the injected DABT
-    // fails to resolve and the kernel gives up). Idempotent.
-    crate::tarmac::emit_start();
-    // ERET into the stub. SPSR_EL2 is left at its auto-saved value from
-    // the HVC entry (= UND mode) — the stub's first instruction
-    // switches to ABT.
-    unsafe {
-        core::arch::asm!(
-            "msr elr_el2, {elr}",
-            "isb",
-            elr = in(reg) guest_mem::DABT_INJECT_VA as u64,
-            options(nostack, preserves_flags),
-        );
-    }
-}
-
 pub(crate) fn return_to_guest_from_und(_ctx: &mut TrapContext, elr: u64, _spsr: u64) {
     // Write target PC to the stub's literal slot, then ERET into the
     // stub in UND mode (by leaving SPSR_EL2 alone). The stub does
@@ -2548,7 +2462,16 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
                 // UND trampoline's save slot being the first one we
                 // hit) falls through as VA=IPA and stage-2-faults.
                 crate::guest::set_dc_for_stage1_off(false);
-                guest_mem::fix_stage1_xn_bits();
+                // The XN-rewrite walks RAM[0..0x4000] interpreting it
+                // as the L1 table — that's correct only when the
+                // guest's TTBR0 actually points there. Guest tests
+                // that pick a different L1 base (e.g. their own table
+                // at 0x04004000) would otherwise have RAM[0..0x4000]
+                // (stack / scratch) corrupted by the walker. Gate on
+                // the live TTBR0 value.
+                if (cp15::read_ttbr0_el1() as u32 & 0xFFFF_C000) == 0x0400_0000 {
+                    guest_mem::fix_stage1_xn_bits();
+                }
                 // No cache maintenance here: the TTBR0 write handler
                 // below OR's Inner/Outer-WB cacheability bits into
                 // every guest TTBR0 write, so stage-1 walks share the
@@ -2646,7 +2569,9 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
                 TTBR_FIXED = true;
                 v
             };
-            if !already { guest_mem::fix_stage1_xn_bits(); }
+            if !already && (raw & 0xFFFF_C000) == 0x0400_0000 {
+                guest_mem::fix_stage1_xn_bits();
+            }
         }
         (0, 3, 0, 0, false) => cp15::write_dacr32(ctx.x[rt]),
         (0, 5, 0, 0, false) => {
@@ -2860,6 +2785,7 @@ mod cp15 {
     pub fn write_far_el1(v: u64) { sysreg_write!("far_el1", v); sync(); }
 
     pub fn read_sctlr_el1() -> u64 { sysreg_read!("sctlr_el1") }
+    pub fn read_ttbr0_el1() -> u64 { sysreg_read!("ttbr0_el1") }
 
     pub fn cache_maintenance_barrier() {
         // StrongARM c7 cache ops don't all map cleanly to A53 encodings

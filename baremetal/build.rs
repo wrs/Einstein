@@ -62,6 +62,15 @@ fn main() {
 /// into the image). The `.cargo/config.toml` deliberately doesn't set
 /// `-Tlinker.ld` so this is the single source of truth.
 fn select_platform_linker_script() {
+    // Skip linker-script selection when building for a host target
+    // (e.g. `cargo test --target aarch64-apple-darwin`) — the host
+    // linker doesn't accept GNU-style `-T script.ld` and the bare-
+    // metal memory layout is irrelevant under `cfg(test)`.
+    let target = env::var("TARGET").unwrap_or_default();
+    if !target.contains("none") {
+        return;
+    }
+
     let raspi3b = env::var("CARGO_FEATURE_PLATFORM_RASPI3B").is_ok();
     let fvp_base = env::var("CARGO_FEATURE_PLATFORM_FVP_BASE").is_ok();
 

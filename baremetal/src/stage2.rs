@@ -44,11 +44,12 @@ const BLOCK_NORMAL_RW: u64 = BLOCK_COMMON | S2_AP_RW;
 const PAGE_COMMON: u64 = DESC_VALID | DESC_PAGE
     | S2_MEMATTR_NORMAL_WB | S2_SH_INNER | S2_AF;
 const PAGE_NORMAL_RO: u64 = PAGE_COMMON | S2_AP_RO;
+const PAGE_NORMAL_RW: u64 = PAGE_COMMON | S2_AP_RW;
 
 /// Stage-2 XN bit (bit 54) — single-bit on ARMv8.0-A (Cortex-A53).
 /// Setting this raises an instruction abort on any fetch to this
 /// IPA from the guest.
-const S2_XN_NEVER: u64 = 1 << 54;
+const S2_XN: u64 = 1 << 54;
 
 #[repr(C, align(4096))]
 struct PageTable([u64; 512]);
@@ -62,6 +63,16 @@ static mut S2_L2: PageTable = PageTable([0; 512]);
 // exposing the whole peripheral range as RAM — other 4 KiB entries
 // in this L3 stay invalid and continue to stage-2-fault into mmio::.
 static mut S2_L3_HW_TICKS: PageTable = PageTable([0; 512]);
+
+// L3 tables refining the two 2 MiB L2 slots covering guest RAM
+// (IPA 0x0400_0000..0x0440_0000). Each L3 slot is a 4 KiB page; the
+// shadow-stub flips per-page permissions between `RW + XN` (initial,
+// and re-armed after a write to a previously-executed code page) and
+// `RO + ¬XN` (post-scan, the page is executable and frozen). The
+// state machine lets us re-scan a code page when it's overwritten by
+// Newton's demand-pager.
+static mut S2_L3_RAM_0: PageTable = PageTable([0; 512]);
+static mut S2_L3_RAM_1: PageTable = PageTable([0; 512]);
 
 // Backing page for the Newton tick clock, mapped read-only at stage-2
 // at IPA 0x0F181000. The guest reads K_HDWR_TICKS (0x0F181800) hot in
@@ -133,38 +144,75 @@ const VTCR_EL2_VAL: u64 = (32 << 0)
     | (0b010 << 16)        // PS = 40-bit
     | (1u64 << 31);        // RES1 (DDI 0487 VTCR_EL2 description)
 
-/// Clear the stage-2 XN bits on the 2 MiB block that contains
-/// `ipa`, making that block executable at EL1. Called from the
-/// shadow_stub lazy-RAM-patch path after the hypervisor has scanned
-/// the block and installed stubs for every byte/halfword access.
-pub unsafe fn clear_xn_for_block(ipa: u32) {
-    let idx = ((ipa as u64) / TWO_MIB) as usize;
-    if idx >= 512 {
-        return;
+/// Return a mutable pointer to the L3 entry covering the 4 KiB RAM page
+/// at `ipa`. None if `ipa` is outside the 4 MiB RAM aperture.
+fn ram_l3_entry_ptr(ipa: u32) -> Option<*mut u64> {
+    let ipa64 = ipa as u64;
+    if ipa64 < RAM_IPA_BASE || ipa64 >= RAM_IPA_BASE + RAM_IPA_SIZE {
+        return None;
     }
-    let l2_ptr = addr_of_mut!(S2_L2) as *mut u64;
-    // SAFETY: idx bounded to 0..512.
-    let entry = unsafe { l2_ptr.add(idx).read() };
-    if entry & DESC_VALID == 0 {
-        return;
+    let off = ipa64 - RAM_IPA_BASE;
+    let table_ix = (off / TWO_MIB) as usize;         // 0 or 1
+    let slot_ix = ((off % TWO_MIB) / 0x1000) as usize; // 0..512
+    let base = match table_ix {
+        0 => addr_of_mut!(S2_L3_RAM_0) as *mut u64,
+        1 => addr_of_mut!(S2_L3_RAM_1) as *mut u64,
+        _ => return None,
+    };
+    // SAFETY: slot_ix < 512.
+    Some(unsafe { base.add(slot_ix) })
+}
+
+fn invalidate_ipa_s2(ipa: u32) {
+    // IPA shift for TLBI IPAS2E1IS is 12 (the instruction takes bits [47:12]).
+    let arg = (ipa as u64) >> 12;
+    // SAFETY: stage-2 TLB maintenance.
+    unsafe {
+        core::arch::asm!(
+            "dsb ish",
+            "tlbi ipas2e1is, {0}",
+            "dsb ish",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            in(reg) arg,
+            options(nostack, preserves_flags),
+        );
     }
-    let new = entry & !(1u64 << 54);
-    if new != entry {
-        // SAFETY: writing a block descriptor with a tighter /
-        // identical permission.
-        unsafe { l2_ptr.add(idx).write(new); }
-        // Flush stage-2 TLB for this VMID and inner-shareable so the
-        // guest's next instruction fetch sees the new permission.
-        unsafe {
-            core::arch::asm!(
-                "dsb ish",
-                "tlbi vmalls12e1is",
-                "dsb ish",
-                "isb",
-                options(nostack, preserves_flags),
-            );
-        }
-    }
+}
+
+/// Flip the stage-2 L3 entry for the 4 KiB RAM page at `ipa` to
+/// `RO + executable`. Called by the shadow-stub after scan+patch on
+/// an instruction-abort from guest code in RAM: subsequent fetches
+/// succeed, and writes fault so the hypervisor can re-arm RW+XN and
+/// re-scan the page on the next execute.
+///
+/// No-op when `ipa` is outside the RAM aperture.
+pub unsafe fn set_ram_page_ro_x(ipa: u32) {
+    let page = ipa & !0xFFF;
+    let Some(entry_ptr) = ram_l3_entry_ptr(page) else { return; };
+    let host_pa = guest_mem::ram_host_pa() + (page as u64 - RAM_IPA_BASE);
+    let new = host_pa | PAGE_NORMAL_RO;
+    // SAFETY: entry_ptr bounded to one of two 512-entry L3 tables.
+    unsafe { entry_ptr.write(new); }
+    invalidate_ipa_s2(page);
+}
+
+/// Flip the stage-2 L3 entry for the 4 KiB RAM page at `ipa` to
+/// `RW + execute-never`. Called by the data-abort handler when the
+/// guest writes into a page that was previously frozen as `RO + X`
+/// (i.e. Newton's demand-pager is overwriting a code page). The
+/// next fetch takes another XN trap so we re-scan the fresh bytes.
+///
+/// No-op when `ipa` is outside the RAM aperture.
+pub unsafe fn set_ram_page_rw_xn(ipa: u32) {
+    let page = ipa & !0xFFF;
+    let Some(entry_ptr) = ram_l3_entry_ptr(page) else { return; };
+    let host_pa = guest_mem::ram_host_pa() + (page as u64 - RAM_IPA_BASE);
+    let new = host_pa | PAGE_NORMAL_RW | S2_XN;
+    // SAFETY: entry_ptr bounded to one of two 512-entry L3 tables.
+    unsafe { entry_ptr.write(new); }
+    invalidate_ipa_s2(page);
 }
 
 /// Write a contiguous range of stage-2 L2 block descriptors that identity
@@ -229,22 +277,15 @@ pub unsafe fn init() {
         );
     }
 
-    // RAM: 4 MiB read-write at guest PA 0x0400_0000. Marked XN
-    // initially — the shadow-stub mechanism flips XN off on the
-    // first instruction abort in each 2 MiB block, after scanning
-    // and patching every byte/halfword access in that block
-    // (src/shadow_stub.rs::handle_ram_fetch_fault). Copy-from-ROM
-    // RAM-resident code wouldn't otherwise see byte-access stubs.
-    let ram_pa = guest_mem::ram_host_pa();
-    // SAFETY: as above.
-    unsafe {
-        set_l2_blocks(
-            RAM_IPA_BASE,
-            ram_pa,
-            RAM_IPA_SIZE / TWO_MIB,
-            BLOCK_NORMAL_RW | S2_XN_NEVER,
-        );
-    }
+    // RAM: 4 MiB at guest PA 0x0400_0000. Refined to 4 KiB L3 pages;
+    // each page starts `RW + XN` and flips to `RO + executable` on
+    // first fetch, after the shadow-stub scan+patch pass. A subsequent
+    // write (Newton's demand-pager overwriting a code page) takes a
+    // stage-2 RO permission fault; the handler re-arms the page as
+    // `RW + XN`, the write retries, and the next fetch re-scans the
+    // fresh bytes. See `set_ram_page_{ro_x,rw_xn}`.
+    // SAFETY: installs two L3 tables and points L2[32], L2[33] at them.
+    unsafe { install_ram_l3(); }
 
     // Framebuffer: dumpable RAM for future screen-manager code.
     let fb_pa = guest_mem::fb_host_pa();
@@ -302,8 +343,8 @@ pub unsafe fn init() {
         ROM_IPA_BASE, ROM_IPA_BASE + ROM_IPA_SIZE, rom_pa
     );
     kprintln!(
-        "stage2: RAM @ IPA {:#x}..{:#x} -> host PA {:#x} (RW)",
-        RAM_IPA_BASE, RAM_IPA_BASE + RAM_IPA_SIZE, ram_pa
+        "stage2: RAM @ IPA {:#x}..{:#x} -> host PA {:#x} (per-page RW+XN initially)",
+        RAM_IPA_BASE, RAM_IPA_BASE + RAM_IPA_SIZE, guest_mem::ram_host_pa()
     );
     kprintln!(
         "stage2: flash bank 0 @ IPA {:#x}..{:#x} -> host PA {:#x} (RW, {} MiB)",
@@ -321,6 +362,39 @@ pub unsafe fn init() {
         FB_IPA_SIZE / (1024 * 1024)
     );
     kprintln!("stage2: all other IPAs fault to EL2");
+}
+
+/// Refine the 4 MiB RAM aperture into 4 KiB pages across two L3 tables.
+/// Each page starts `RW + XN`; the shadow-stub flips pages to `RO + X`
+/// after scan+patch, and the data-abort handler flips them back on
+/// write.
+unsafe fn install_ram_l3() {
+    let ram_pa = guest_mem::ram_host_pa();
+    let n_blocks = (RAM_IPA_SIZE / TWO_MIB) as usize;
+    assert!(n_blocks <= 2, "RAM L3 tables assume ≤ 2 × 2 MiB; widen if RAM grows");
+
+    for block in 0..n_blocks {
+        let l3_base = match block {
+            0 => addr_of_mut!(S2_L3_RAM_0) as *mut u64,
+            1 => addr_of_mut!(S2_L3_RAM_1) as *mut u64,
+            _ => unreachable!(),
+        };
+        let block_ipa_base = RAM_IPA_BASE + (block as u64) * TWO_MIB;
+        let block_host_base = ram_pa + (block as u64) * TWO_MIB;
+        for slot in 0..512usize {
+            let host_pa = block_host_base + (slot as u64) * 0x1000;
+            // Initial permissions: RW, execute-never.
+            let entry = host_pa | PAGE_NORMAL_RW | S2_XN;
+            // SAFETY: slot < 512.
+            unsafe { l3_base.add(slot).write(entry); }
+        }
+        // Point the L2 slot at the L3 table.
+        let l2_index = (block_ipa_base / TWO_MIB) as usize;
+        let l2_ptr = addr_of_mut!(S2_L2) as *mut u64;
+        let l3_phys = l3_base as u64;
+        // SAFETY: l2_index < 512 (RAM IPAs are within the L2 table).
+        unsafe { l2_ptr.add(l2_index).write(l3_phys | DESC_VALID | DESC_TABLE); }
+    }
 }
 
 /// Wire the 4 KiB page containing K_HDWR_TICKS into stage-2 as a

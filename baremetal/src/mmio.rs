@@ -77,6 +77,25 @@ const RAM_PROBE_ABSENT_END:  u64 = 0x0900_0000;
 const NO_REX_PROBE_BASE: u64 = 0x1040_0000;
 const NO_REX_PROBE_END:  u64 = 0x2000_0000;
 
+// BIO interface register bank. `TBIOInterface::BIOReadRegister` /
+// `BIOWriteCommand` / etc. at ROM `0x26b878..0x26ba10` compute the
+// target register address as `0x0F05_0000 + (bank_index << 10)`, so
+// the 32 registers live at `0x0F05_0000`, `0x0F05_0400`, …,
+// `0x0F05_7C00`. The early-boot kernel iterates over several banks
+// (14, 15, 16, 17, 18, 19, 20, …) during BIO init; Einstein's TMemory
+// doesn't model these registers — the "unknown bank #3" fallback
+// accepts writes silently and returns 0 for reads (TMemory.cpp:952-959).
+// Rather than whack-a-mole each register as the iterator advances,
+// accept the whole known-stride range in one explicit entry. This is
+// still a closed whitelist — addresses outside the stride or outside
+// the 32-register window continue to halt loudly.
+const BIO_BANK_BASE: u64 = 0x0F05_0000;
+const BIO_BANK_END:  u64 = 0x0F05_8000;
+
+fn in_bio_bank(ipa: u64) -> bool {
+    ipa >= BIO_BANK_BASE && ipa < BIO_BANK_END && (ipa & 0x3FF) == 0
+}
+
 pub fn read(ipa: u64, sas: u8, elr: u64) -> u32 {
     let value = match ipa {
         a if vic::owns(a) => vic::read(a),
@@ -112,6 +131,19 @@ pub fn read(ipa: u64, sas: u8, elr: u64) -> u32 {
         // to match Einstein's TMemory default (read-zero on unmodelled).
         0x0F24_1000 => 0,
 
+        // ExtDataAbt1/2/3 — external data-abort status registers. The
+        // kernel's DataAbortHandler at 0x0039_3268 reads all three
+        // (0x0F24_0000 / 0x0F24_0800 then ANDs with 0x1FF, plus
+        // 0x0F24_0400 on the bne strne path) to classify the abort
+        // source. Return 0 so the kernel falls through to its normal
+        // translation-fault path rather than the "external data abort"
+        // diagnostic branch at 0x0039_3894. Matches Einstein's TMemory
+        // "unknown bank #3" default of 0. Writes are already accepted
+        // as no-ops in the write path below.
+        0x0F24_0000 => 0,
+        0x0F24_0400 => 0,
+        0x0F24_0800 => 0,
+
         // kHdWr_P0F048000: R/W, typical value 0. TMemoryConsts.h:63.
         0x0F04_8000 => 0,
 
@@ -130,17 +162,14 @@ pub fn read(ipa: u64, sas: u8, elr: u64) -> u32 {
             (bit & 1) << 1
         }
 
-        // BIO-interface register window (TMemoryConsts.h:64-70). Einstein
-        // doesn't model these — TMemory's "unknown bank #3" fallback
-        // returns 0 for all of them (TMemory.cpp:952-959). Match that by
-        // returning 0 for the specific registers the 717006 kernel
-        // writes + reads via TBIOInterface::BIOReadRegister /
-        // BIOReadCommand. Don't use a general bank-#3 fallback — we want
-        // any other address we don't know about to keep halting loudly.
-        0x0F05_2C00 => 0, // R/W (0000004E)
-        0x0F05_3000 => 0, // R/W (00007000)
-        0x0F05_3400 => 0, // R/W (00008C00)
-        0x0F05_3800 => 0, // R/W (00000000)
+        // BIO-interface register bank (0x0F05_0000 + bank<<10, 32 banks).
+        // See `BIO_BANK_BASE` / `in_bio_bank` near the top of the file.
+        // Einstein returns 0 for all of these (TMemory.cpp:952-959 unknown-
+        // bank-#3 fallback); match it. Covers the TMemoryConsts-named
+        // registers (0x2C00 / 0x3000 / 0x3400 / 0x3800 / 0x4400 / 0x4800
+        // / 0x5000) plus the anonymous banks the 717006 kernel's BIO init
+        // loop touches (0x3C00, 0x4C00, …).
+        a if in_bio_bank(a) => 0,
 
         // GPIO input (PCMCIA door-lock + misc sense lines).
         // Einstein returns all-ones = "no cards / switches open".
@@ -213,13 +242,10 @@ pub fn write(ipa: u64, sas: u8, value: u32, elr: u64) {
         0x0F04_3000 => {} // P0F043000        W (0x7400)
         0x0F04_3800 => {} // P0F043800        W (0x2000)
         0x0F04_8000 => {} // P0F048000        R/W (0)
-        0x0F05_2C00 => {} // P0F052C00        R/W (0x4E)
-        0x0F05_3000 => {} // P0F053000        R/W (0x7000)
-        0x0F05_3400 => {} // P0F053400        R/W (0x8C00)
-        0x0F05_3800 => {} // P0F053800        R/W (0)
-        0x0F05_4400 => {} // P0F054400        W (0x8400)
-        0x0F05_4800 => {} // P0F054800        W (0x8400)
-        0x0F05_5000 => {} // P0F055000        W (0x8400)
+        // BIO-interface register bank — see read path / `in_bio_bank`
+        // for the stride + Einstein rationale. Writes are accepted as
+        // no-ops.
+        a if in_bio_bank(a) => {}
 
         // --- External data-abort / bank-control / chip-rev area ---
         0x0F24_0000 => {} // ExtDataAbt1      R (write path accepted no-op)

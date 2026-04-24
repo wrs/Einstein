@@ -1041,6 +1041,16 @@ pub const UND_RETURN_STUB_VA: u32 = UND_RETURN_STUB_OFFSET as u32;
 /// handler before ERET).
 pub const UND_RETURN_STUB_LITERAL_OFFSET: usize = UND_RETURN_STUB_OFFSET + 8;
 
+/// DABT-injection stub — see the extended block comment in
+/// `patch_und_vector` for design rationale. Sits in the free 32-byte
+/// window between the UND trampoline body (ends at 0x00FF_FF60) and
+/// the SBA post-emulation trampoline (starts at 0x00FF_FF80). 8 words
+/// total; last two words are literals the Rust handler updates per
+/// injection.
+pub const DABT_INJECT_OFFSET: usize = 0x00FF_FF60;
+pub const DABT_INJECT_VA: u32 = DABT_INJECT_OFFSET as u32;
+pub const DABT_INJECT_LR_LITERAL_OFFSET: usize = DABT_INJECT_OFFSET + 0x10;
+
 unsafe fn patch_und_vector(rom: *mut u32) {
     // The trampoline's save-slot address is held in the literal at
     // offset 0x30. Pre-MMU we use the RAM *IPA* 0x0400_5F00 directly
@@ -1089,6 +1099,46 @@ unsafe fn patch_und_vector(rom: *mut u32) {
         rom.add(base + 21).write(0xE140_0170);      // hvc #0x10
         rom.add(base + 22).write(0xEAFF_FFFE);      // b . (trap)
         rom.add(base + 23).write(0x0400_5F00);      // literal: RAM IPA (pre-MMU)
+
+        // DABT-injection stub. When the shadow-stub byte-access emulator
+        // walks stage-1 for the faulting EA and the walk fails (i.e. the
+        // page isn't mapped yet), the instruction would have taken a
+        // real DABT on unpatched hardware. We can't drive the CPU's DABT
+        // entry directly from EL2 — banked LR_abt needs real AArch32
+        // code to set up (AArch64 doesn't expose SP_abt / LR_abt as
+        // named sysregs, and ctx.x[14] on AArch64→AArch32 ERET
+        // propagates to the *target* mode's LR, overwriting whichever
+        // mode we arrive in). This stub runs in UND mode (we ERET to
+        // it with SPSR_EL2 left at its auto-saved UND value), switches
+        // to ABT natively, loads LR_abt from a literal the Rust
+        // handler wrote, and branches to `DataAbortHandler` at
+        // VA 0x0039_3114.
+        //
+        //   +0x00: e321f0d7  msr cpsr_c, #0xD7   ; UND → ABT (I/F masked)
+        //   +0x04: e59fe004  ldr lr, [pc, #0x04] ; LR_abt ← literal at +0x10
+        //   +0x08: ea??????  b DataAbortHandler  ; computed offset to 0x0039_3114
+        //   +0x0C: eafffffe  b .                 ; guard
+        //   +0x10: <LR_abt literal — written by Rust before each ERET>
+        //
+        // SPSR_abt is set by the Rust handler via `msr spsr_abt, <x>`
+        // before ERET (LLVM's AArch64 assembler accepts that encoding).
+        // SP_abt and R0..R12 are left untouched — the stub doesn't need
+        // a scratch register because LR is banked to ABT mode by the
+        // `msr cpsr_c` switch.
+        let di = DABT_INJECT_OFFSET / 4;
+        rom.add(di + 0).write(0xE321_F0D7);
+        rom.add(di + 1).write(0xE59F_E004);
+        // Branch target = 0x0039_3114. PC of the `b` = offset + 0x08.
+        // PC+8 used for target computation = offset + 0x10.
+        let b_pc_plus8 = (DABT_INJECT_OFFSET as u32) + 0x10;
+        let off = 0x0039_3114u32.wrapping_sub(b_pc_plus8);
+        let imm24 = (off >> 2) & 0x00FF_FFFF;
+        rom.add(di + 2).write(0xEA00_0000 | imm24);
+        rom.add(di + 3).write(0xEAFF_FFFE);          // guard
+        rom.add(di + 4).write(0xDEAD_C0DE);          // LR_abt placeholder
+        rom.add(di + 5).write(0xEAFF_FFFE);          // (padding)
+        rom.add(di + 6).write(0xEAFF_FFFE);
+        rom.add(di + 7).write(0xEAFF_FFFE);
 
         // UND-return stub. See `return_to_guest_from_und` in trap.rs for
         // why this exists — QEMU raspi3b's `msr spsr_el2, <val>` from

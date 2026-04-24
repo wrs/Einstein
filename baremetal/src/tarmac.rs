@@ -54,26 +54,33 @@ pub fn maybe_emit_start(trap_counter: u64) {
     }
 }
 
-/// Emit the stop marker. Idempotent.
+/// Emit the stop marker. Re-emittable after a subsequent `emit_start`.
 pub fn emit_stop() {
     // SAFETY: single-threaded EL2.
     if unsafe { STOPPED } {
         return;
     }
-    unsafe { STOPPED = true; }
+    unsafe {
+        STOPPED = true;
+        STARTED = false;
+    }
     emit_marker(STOP_MARKER);
 }
 
-/// Emit the start marker on demand. Idempotent. Use this when the
-/// interesting window is triggered by a specific EL2 event rather than
-/// a trap count (e.g., "SCTLR.A=1 just became live and I want to trace
-/// from here").
+/// Emit the start marker on demand. Re-emittable after a subsequent
+/// `emit_stop`, so multiple windows in one boot are possible. Use this
+/// when the interesting window is triggered by a specific EL2 event
+/// rather than a trap count (e.g., "SCTLR.A=1 just became live and I
+/// want to trace from here").
 pub fn emit_start() {
     // SAFETY: single-threaded EL2.
     if unsafe { STARTED } {
         return;
     }
-    unsafe { STARTED = true; }
+    unsafe {
+        STARTED = true;
+        STOPPED = false;
+    }
     emit_marker(START_MARKER);
 }
 

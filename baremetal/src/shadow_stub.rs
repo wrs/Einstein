@@ -848,6 +848,69 @@ fn backed_halfword_write(pa: u32, val: u16) -> bool {
 /// Dispatch a byte load: try backed memory (with XOR) first; fall back
 /// to MMIO for IPAs outside our backing stores, or unconditionally for
 /// `ea >= XOR_LIMIT`.
+/// Probe whether a guest VA is mapped under the current EL1 stage-1
+/// state using the hardware AT (Address Translate) instruction. Runs
+/// `AT S1E1R, Xn` which performs a stage-1 translation as if the guest
+/// were doing a normal read at EL1; the result lands in PAR_EL1 where
+/// bit 0 == 0 means success and bit 0 == 1 means fault.
+///
+/// This is strictly more correct than the SW walk in
+/// `guest_mem::translate_va`, which hard-codes TTBR0 = 0x0400_0000 and
+/// doesn't handle per-task TTBR swaps.
+fn va_is_mapped_s1e1(va: u32) -> bool {
+    let par_el1: u64;
+    let par_el0: u64;
+    // SAFETY: AT has no observable side effects other than updating
+    // PAR_EL1 (a dedicated diagnostic register).
+    unsafe {
+        core::arch::asm!(
+            "at s1e1r, {0}",
+            "isb",
+            "mrs {1}, par_el1",
+            "at s1e0r, {0}",
+            "isb",
+            "mrs {2}, par_el1",
+            in(reg) va as u64,
+            out(reg) par_el1,
+            out(reg) par_el0,
+            options(nostack, preserves_flags),
+        );
+    }
+    // Treat the address as mapped if *either* EL0 or EL1 stage-1 walk
+    // succeeds — the patched site could have been in either mode.
+    (par_el1 & 1) == 0 || (par_el0 & 1) == 0
+}
+
+/// Budgeted log for SBA walk-fail → DABT injection. One line per
+/// unique (PC, mode) pair so we see the first occurrence of each
+/// injection site without flooding.
+#[allow(dead_code)]
+fn log_sba_dabt_inject(pc: u32, ea: u32, cpsr: u32) {
+    const SEEN_CAP: usize = 16;
+    static mut SEEN: [(u32, u32); SEEN_CAP] = [(0, 0); SEEN_CAP];
+    static mut SEEN_N: usize = 0;
+    let first = unsafe {
+        let mode = cpsr & 0x1F;
+        let mut found = false;
+        for i in 0..SEEN_N {
+            if SEEN[i] == (pc, mode) { found = true; break; }
+        }
+        if !found && SEEN_N < SEEN_CAP {
+            SEEN[SEEN_N] = (pc, mode);
+            SEEN_N += 1;
+            true
+        } else {
+            false
+        }
+    };
+    if first {
+        kprintln!(
+            "shadow_stub: walk-fail → DABT inject @PC={:#x} ea={:#x} cpsr={:#010x} mode={:#x}",
+            pc, ea, cpsr, cpsr & 0x1F
+        );
+    }
+}
+
 fn dispatch_byte_read(ea: u32, faulting_pc: u32) -> u8 {
     if ea < XOR_LIMIT {
         let addr = ea ^ 3;
@@ -1039,6 +1102,28 @@ pub fn handle_sba_udf(
     // Pre-index / plain (P=1): access uses rn +- offset.
     // Post-index (P=0): access uses rn, writeback stores rn +- offset.
     let access_addr = if d.p { ea_offsetted } else { rn_val };
+
+    // If the access VA doesn't have a valid stage-1 mapping, the
+    // instruction would have taken a data abort on unpatched hardware.
+    // Inject the DABT into the guest so its DataAbortHandler can fault
+    // the page in (e.g. heap growth across a page boundary, which is
+    // how Newton's allocator populates the second page of a cross-page
+    // heap object on first access). The XOR that `dispatch_*` would
+    // apply only affects the low two bits — same 4 KiB page — so a
+    // single resolve check covers both the raw EA and its BE-32 alias.
+    // NOTE: when `resolve_addr(access_addr)` fails later in the dispatch
+    // helpers, we halt loudly. The natural-DABT-injection approach
+    // (fake a translation fault so the kernel's DataAbortHandler grows
+    // the heap/stack) is blocked on A53: DFSR32_EL2 writes UNDEF from
+    // EL2 (see `cp15::write_dfsr32` in trap.rs), so we can't force the
+    // kernel's `mrc p15,0,r1,c5,c0,0 / add pc,pc,r1,LSL #2` jump-table
+    // dispatch to land on the translation-fault handler — the stale
+    // DFSR from a previous fault (typically 0x1 from the alignment
+    // emulator) sends it to UnhandledException → Reboot instead. Any
+    // future walk-fail site needs a different strategy: pre-fault-in
+    // the page from EL2 before emulation, or reroute the originating
+    // instruction through a natural-fault retry. See INVESTIGATION.md.
+    let _ = va_is_mapped_s1e1; // keep the helper available for diagnostics
 
     // Perform the access.
     match d.kind {

@@ -123,6 +123,19 @@ docker_args=(
     -w /work
 )
 
+# When tarmac logging is active, cap the container's per-process file
+# size to FVP_TARMAC_MAX bytes (default 1 GiB). A run-away TarmacTrace
+# plugin otherwise silently fills the host disk — an 11.6 GB log from a
+# 120s run is typical with loads/stores enabled. `--ulimit fsize=N` is
+# honoured by the container's kernel: when exceeded, writes fail with
+# SIGXFSZ and the FVP process dies rather than wasting more CPU time
+# producing bytes we'd discard in the post-run truncate anyway.
+tarmac_max="${FVP_TARMAC_MAX:-1073741824}"
+if [[ -n "$tarmac" || -n "$tarmac_window" ]]; then
+    docker_args+=(--ulimit "fsize=$tarmac_max")
+    echo "[fvp] tarmac output capped at ${tarmac_max} bytes (~1 GB); FVP will be killed on overflow." >&2
+fi
+
 if [[ "$gdb" == "1" ]]; then
     fvp_args+=(-I --iris-port 7100 -p)
     docker_args+=(-p 7100:7100)
@@ -209,9 +222,9 @@ timeout -k 5 "$timeout_secs" docker "${docker_args[@]}" \
 
 # Post-run: if a tarmac file was produced and exceeds the size cap,
 # truncate it in place so a run-away trace can't silently fill the
-# host disk across repeated runs. Override the cap with
-# FVP_TARMAC_MAX (bytes); default 1 GiB.
-tarmac_max="${FVP_TARMAC_MAX:-1073741824}"
+# host disk across repeated runs. Belt-and-braces with the container's
+# --ulimit fsize above: if the file-size limit triggered mid-run the
+# file is already at (or near) the cap, so this is usually a no-op.
 for path in "$tarmac" "$tarmac_window"; do
     if [[ -n "$path" && -f "$path" ]]; then
         size=$(stat -f%z "$path" 2>/dev/null || stat -c%s "$path" 2>/dev/null || echo 0)

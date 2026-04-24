@@ -823,10 +823,63 @@ fn handle_und(ctx: &mut TrapContext) {
             log_debugger_und(faulting_pc, msg_start, msg_end);
             return_to_guest_from_und(ctx, msg_end as u64, spsr_und);
         }
-        0xE6000810 => {
-            let payload = read_guest_word_pa(faulting_pc + 4).unwrap_or(0);
-            log_und_budgeted("TapFileCntlUND", faulting_pc, Some(payload));
-            return_to_guest_from_und(ctx, (faulting_pc + 8) as u64, spsr_und);
+        // Newton DDK debug-primitive function-entry UNDs. Each
+        // `0xE60000XX10` opcode sits at a symbol in the ROM (ExitToShell,
+        // Debugger, DebugStr, SendTestResult, TapFileCntl, RawDebugStr,
+        // RawDebugger — see 0x38ce6c..0x38ce84 in rom.dis) and is called
+        // via `BL <symbol>`. Einstein's JIT (TJITGeneric_Other.cpp)
+        // emulates TapFileCntl with `POPNIL(); SETPC(GETCALLER() + 4)` —
+        // i.e. return to the caller's LR. The rest fall through Einstein's
+        // generic UndefinedInstruction path and take a real ARM UND
+        // exception; on our guest that wedges because `gDebugger = 1`
+        // makes the ROM's 0x38ce88 handler jump to ReportException →
+        // StopImage. So every one of these must be emulated in EL2 as
+        // a "log and return to caller" NOP.
+        //
+        // The caller's LR is captured by the UND trampoline into the
+        // `UND_SAVE_BANKED_LR_IPA` RAM slot (the trampoline briefly
+        // switches to the faulting mode — SYS for USR — and stores that
+        // mode's banked LR there). ERETing to that address resumes the
+        // caller's instruction stream after the BL.
+        0xE6000110 | 0xE6000210 | 0xE6000310 | 0xE6000710 | 0xE6000810 => {
+            let name = match insn {
+                0xE6000110 => "ExitToShell",
+                0xE6000210 => "Debugger",
+                0xE6000310 => "DebugStr",
+                0xE6000710 => "SendTestResult",
+                0xE6000810 => "TapFileCntl",
+                _ => "DDK-UND",
+            };
+            let r0 = ctx.x[0] as u32;
+            log_und_budgeted(name, faulting_pc, Some(r0));
+            // Each of these UND opcodes is a Newton-DDK function entry,
+            // called from ROM code via `BL <symbol>` (see rom.dis around
+            // 0x38ce6c..0x38ce84). Einstein's JIT returns to the caller
+            // via `POPNIL; SETPC(GETCALLER()+4)` for TapFileCntl and the
+            // same shape applies to the rest. The UND trampoline
+            // captures the faulting mode's banked LR (via its mode-
+            // switch dance — see `patch_und_vector` in `guest_mem.rs`)
+            // into the `UND_SAVE_BANKED_LR_IPA` RAM slot so we can ERET
+            // there.
+            let banked_lr = read_guest_word_pa(UND_SAVE_BANKED_LR_IPA).unwrap_or(0);
+            if banked_lr == 0 {
+                kprintln!(
+                    "*** {} @PC={:#x}: banked LR slot @{:#x} is 0 — UND trampoline must \
+                     stage the faulting mode's LR before HVC (see ROM trampoline mode-\
+                     switch dance in patch_und_vector). Halting.",
+                    name, faulting_pc, UND_SAVE_BANKED_LR_IPA,
+                );
+                cpu::halt();
+            }
+            // TapFileCntl has an Einstein-modelled dispatch table
+            // (do_sys_open / read / write / …) — we don't implement the
+            // file protocol, so write -1 to R0 as a "call failed" result
+            // that the caller can observe. The other primitives leave R0
+            // alone.
+            if insn == 0xE6000810 {
+                ctx.x[0] = 0xFFFF_FFFFu32 as u64;
+            }
+            return_to_guest_from_und(ctx, banked_lr as u64, spsr_und);
         }
         _ if is_swp_encoding(insn) => {
             emulate_swp(ctx, insn, faulting_pc);
@@ -1237,6 +1290,7 @@ fn handle_bootos_canary(ctx: &mut TrapContext) {
 }
 
 fn handle_reboot(ctx: &TrapContext) -> ! {
+    crate::tarmac::emit_stop();
     let spsr_el2 = read_sysreg!("spsr_el2");
     let elr_el2 = read_sysreg!("elr_el2");
     let mode = (spsr_el2 & 0x1F) as u32;
@@ -1329,6 +1383,72 @@ fn handle_diag(ctx: &mut TrapContext) {
     let far = read_sysreg!("far_el1");
     let spsr_el2 = read_sysreg!("spsr_el2");
     let elr_el2 = read_sysreg!("elr_el2");
+
+    // Fast path: for DABTs whose DFSC matches a translation or permission
+    // fault, forward to the kernel's DataAbortHandler at VA 0x0039_3114
+    // (the original target of the ROM's VA 0x10 branch before we overwrote
+    // it with our diagnostic trampoline). This lets the kernel handle
+    // routine faults like stack-collision growth (e.g. a USR task's
+    // `stmfd sp!, {…}` prologue crossing into an unmapped page —
+    // TStackManager::CopyPagesAfterStackCollided) without the hypervisor
+    // needing to model every on-demand paging decision.
+    //
+    // Alignment faults (DFSC=0x01) take a separate HVC #ALIGN_TAG path
+    // in the DABT trampoline and never reach here. Anything we don't
+    // recognise as forwardable falls through to the loud halt below —
+    // that's the Phase-B trip-wire behaviour.
+    //
+    // DFSC values (short-descriptor, ARMv7 DFSR.FS[3:0]):
+    //   0x05 = translation, section (L1 entry fault)
+    //   0x07 = translation, page    (L2 entry fault)
+    //   0x0D = permission, section
+    //   0x0F = permission, page
+    //   0x03 = access flag, section
+    //   0x06 = access flag, page
+    //
+    // R0 and R1 were clobbered by the DABT trampoline (which stashed
+    // them in TPIDRURW / TPIDRRO before reading DFSR / SPSR_abt into
+    // them); restore them from those scratch slots so the kernel's
+    // handler sees the pre-abort register state.
+    let esr_el1 = read_sysreg!("esr_el1");
+    let dfsc = (esr_el1 & 0x3F) as u32;
+    let forwardable = matches!(dfsc, 0x03 | 0x05 | 0x06 | 0x07 | 0x0D | 0x0F);
+    if forwardable {
+        log_dabt_forward(dfsc, far as u32, (spsr_el2 & 0x1F) as u32);
+        let saved_r0: u64;
+        let saved_r1: u64;
+        // SAFETY: nomem reads of TPIDR_EL0 / TPIDRRO_EL0 — our DABT
+        // trampoline's MCR p15,0,r{0,1},c13,c0,{2,3} stored the pre-abort
+        // values there before clobbering the AArch32 registers.
+        unsafe {
+            core::arch::asm!(
+                "mrs {}, tpidr_el0",
+                out(reg) saved_r0,
+                options(nomem, nostack, preserves_flags),
+            );
+            core::arch::asm!(
+                "mrs {}, tpidrro_el0",
+                out(reg) saved_r1,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        ctx.x[0] = saved_r0;
+        ctx.x[1] = saved_r1;
+        // ERET to DataAbortHandler in ABT mode (SPSR_EL2 unchanged).
+        // The CPU stays in ABT with LR_abt / SP_abt / SPSR_abt as
+        // hardware populated them on DABT entry — exactly the state
+        // the kernel's handler expects at VA 0x0039_3114.
+        const DATA_ABORT_HANDLER_VA: u32 = 0x0039_3114;
+        unsafe {
+            core::arch::asm!(
+                "msr elr_el2, {elr}",
+                "isb",
+                elr = in(reg) DATA_ABORT_HANDLER_VA as u64,
+                options(nostack, preserves_flags),
+            );
+        }
+        return;
+    }
 
     let spsr_abt = read_banked_spsr("abt");
     let spsr_und = read_banked_spsr("und");
@@ -1909,6 +2029,131 @@ fn resolve_guest_pa(addr: u32) -> Option<u32> {
 /// SPSR_und (still the pre-UND CPSR, preserved since UND entry) into
 /// CPSR, and R14_und into PC. No `msr spsr_el2`, no SPSR_EL1
 /// side-effect.
+/// **Dead-end** — kept for reference but no current caller.
+///
+/// Attempted to synthesise an AArch32 data abort for the kernel's
+/// `DataAbortHandler` when the shadow-stub byte-access emulator
+/// encountered an unmapped effective address. The scheme ERETed into
+/// an in-ROM stub that switched to ABT mode and branched to
+/// `DataAbortHandler` at VA 0x0039_3114, with the banked LR_abt and
+/// SPSR_abt staged from EL2.
+///
+/// The approach is blocked on A53: the kernel's handler dispatches on
+/// the AArch32 DFSR value via `mrc p15,0,r1,c5,c0,0 / add pc,pc,r1,LSL#2`
+/// (0x393288..0x393294), and we cannot force that register from EL2 —
+/// writing DFSR32_EL2 UNDEFs on A53 (see `cp15::write_dfsr32`). Without
+/// a valid DFSR, the jump-table lands on the stale value (typically
+/// 0x1 from the previous alignment fault) and the handler reaches the
+/// UnhandledException / Reboot path.
+///
+/// A working alternative would pre-fault the page from EL2 (e.g. via a
+/// targeted guest memory touch before emulation) or re-route the
+/// originating instruction through a natural-fault retry.
+#[allow(dead_code)]
+pub(crate) fn return_as_dabt(ctx: &mut TrapContext, faulting_pc: u32, ea: u32, pre_fault_cpsr: u32) {
+    static INJECT_LOG_BUDGET: core::sync::atomic::AtomicUsize =
+        core::sync::atomic::AtomicUsize::new(4);
+    if INJECT_LOG_BUDGET
+        .fetch_update(
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+            |n| if n > 0 { Some(n - 1) } else { None },
+        )
+        .is_ok()
+    {
+        let esr_el1: u64 = read_sysreg!("esr_el1");
+        let far_pre: u64 = read_sysreg!("far_el1");
+        kprintln!(
+            "return_as_dabt: PC={:#x} ea={:#x} pre_cpsr={:#010x} mode={:#x}",
+            faulting_pc, ea, pre_fault_cpsr, pre_fault_cpsr & 0x1F,
+        );
+        kprintln!(
+            "  ESR_EL1={:#x} FAR_EL1(pre)={:#x} ctx.x[0]={:#x} ctx.x[13]={:#x}",
+            esr_el1, far_pre, ctx.x[0] as u32, ctx.x[13] as u32,
+        );
+    }
+    // Write LR_abt literal into the ROM-resident stub.
+    let rom_base = guest_mem::rom_host_pa() as usize;
+    let lr_lit_host = rom_base + guest_mem::DABT_INJECT_LR_LITERAL_OFFSET;
+    let lr_abt = faulting_pc.wrapping_add(8);
+    // SAFETY: writes to our own ROM backing, flushed for the guest's
+    // instruction/data fetch view.
+    unsafe {
+        core::ptr::write_volatile(lr_lit_host as *mut u32, lr_abt);
+        core::arch::asm!(
+            "dc cvau, {0}",
+            "dsb ish",
+            "ic ivau, {0}",
+            "dsb ish",
+            "isb",
+            in(reg) lr_lit_host as u64,
+            options(nostack, preserves_flags),
+        );
+    }
+    // Set SPSR_abt directly — the stub leaves this untouched; we own it
+    // from EL2 via the AArch64 banked-register MSR, which LLVM accepts.
+    unsafe {
+        core::arch::asm!(
+            "msr spsr_abt, {0}",
+            "isb",
+            in(reg) pre_fault_cpsr as u64,
+            options(nostack, preserves_flags),
+        );
+    }
+    // Set FAR_EL1 (= AArch32 DFAR) so the kernel's DFAR read returns
+    // the actual faulting address. Set DFSR32_EL2 (= AArch32 DFSR view
+    // from EL2) to a translation-page-fault syndrome so the kernel's
+    // fault-classification jump table lands on the translation-fault
+    // handling path (0x393314) rather than the unhandled path
+    // (0x3932dc). WnR is inferred from the original patched
+    // instruction encoding; we don't have it readily available here,
+    // so use 0 (read) as a conservative default — the kernel's
+    // handler cares more about the fault class than W/R for
+    // translation faults.
+    //
+    // Short-descriptor DFSR for "translation fault, page":
+    //   FS[3:0] = 0b0111  (=7)
+    //   FS[4]   = 0        (bit 10)
+    //   Domain  = 0        (bits 7:4, we don't track it)
+    //   WnR     = 0        (bit 11, read; doesn't matter for class)
+    //   ExT     = 0
+    //   LPAE    = 0        (short-descriptor)
+    // → DFSR = 0x0000_0007
+    // SAFETY: FAR_EL1 / DFSR32_EL2 writes have no side effects other
+    // than setting the registers; they're re-written by the next real
+    // DABT the CPU takes.
+    const DFSC_TRANSLATION_PAGE: u64 = 0x7;
+    unsafe {
+        core::arch::asm!(
+            "msr far_el1, {0}",
+            // DFSR32_EL2 — AArch32 DFSR view at EL2. LLVM doesn't
+            // accept the mnemonic, so use the S<op0>_<op1>_<CRn>_<CRm>_<op2>
+            // form (op0=3, op1=4, CRn=5, CRm=2, op2=0).
+            "msr S3_4_C5_C2_0, {1}",
+            "isb",
+            in(reg) ea as u64,
+            in(reg) DFSC_TRANSLATION_PAGE,
+            options(nostack, preserves_flags),
+        );
+    }
+    // Emit the tarmac-window start marker right before the ERET so
+    // `scripts/fvp --tarmac-window` captures from the stub entry
+    // through to `handle_reboot`'s `emit_stop` (if the injected DABT
+    // fails to resolve and the kernel gives up). Idempotent.
+    crate::tarmac::emit_start();
+    // ERET into the stub. SPSR_EL2 is left at its auto-saved value from
+    // the HVC entry (= UND mode) — the stub's first instruction
+    // switches to ABT.
+    unsafe {
+        core::arch::asm!(
+            "msr elr_el2, {elr}",
+            "isb",
+            elr = in(reg) guest_mem::DABT_INJECT_VA as u64,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 pub(crate) fn return_to_guest_from_und(_ctx: &mut TrapContext, elr: u64, _spsr: u64) {
     // Write target PC to the stub's literal slot, then ERET into the
     // stub in UND mode (by leaving SPSR_EL2 alone). The stub does
@@ -1949,6 +2194,36 @@ use guest_mem::{read_byte_pa as read_guest_byte_pa,
                 read_word_pa as read_guest_word_pa,
                 write_byte_pa as write_guest_byte_pa,
                 write_word_pa as write_guest_word_pa};
+
+/// Budgeted log for the DABT→kernel forward path. Prints once per unique
+/// (FAR, mode) pair so we see the first sample of each fault site without
+/// flooding on tight-loop faults (e.g. a page-table walk the kernel is
+/// filling in one entry at a time).
+fn log_dabt_forward(dfsc: u32, far: u32, mode: u32) {
+    const SEEN_CAP: usize = 16;
+    static mut SEEN: [(u32, u32); SEEN_CAP] = [(0, 0); SEEN_CAP];
+    static mut SEEN_N: usize = 0;
+    // SAFETY: single-threaded EL2.
+    let first = unsafe {
+        let mut found = false;
+        for i in 0..SEEN_N {
+            if SEEN[i] == (far, mode) { found = true; break; }
+        }
+        if !found && SEEN_N < SEEN_CAP {
+            SEEN[SEEN_N] = (far, mode);
+            SEEN_N += 1;
+            true
+        } else {
+            false
+        }
+    };
+    if first {
+        kprintln!(
+            "dabt: forwarding to kernel DataAbortHandler — DFSC={:#x} FAR={:#010x} mode={:#x}",
+            dfsc, far, mode
+        );
+    }
+}
 
 fn log_und_budgeted(name: &str, pc: u32, payload: Option<u32>) {
     // Dedup SystemBootUND / TapFileCntlUND by PC — only 6 sites in ROM

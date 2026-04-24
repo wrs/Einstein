@@ -1,33 +1,39 @@
 @ tests/test_und_handler.S
 @
-@ Verifies the EL2 undefined-instruction handler dispatches the three
-@ Einstein UND opcodes correctly:
-@   - 0xE6000010 SystemBootUND   (ELR += 4, single-instruction NOP)
-@   - 0xE6000510 DebuggerUND     (ELR past null-terminated ASCII payload)
-@   - 0xE6000810 TapFileCntlUND  (ELR += 8, hypervisor logs payload)
+@ Verifies the EL2 undefined-instruction handler dispatches the Newton
+@ DDK UND opcodes correctly:
+@   - 0xE6000010 SystemBootUND    (inline NOP marker; ELR += 4)
+@   - 0xE6000510 DebuggerUND      (inline + null-terminated ASCII payload;
+@                                  ELR advances past the aligned message)
+@   - 0xE6000810 TapFileCntlUND   (function-entry UND, called via BL;
+@                                  handler returns to the caller's LR
+@                                  — matches Einstein's JIT
+@                                  `POPNIL(); SETPC(GETCALLER()+4)`.)
+@
+@ Trampoline contract (matches src/trap.rs::handle_und):
+@   - UND vector at VA 0x04 branches to our stub.
+@   - Stub runs in UND mode. It stages:
+@       [UND_SAVE_LR]         <- R14_und (= faulting_pc + 4)
+@       [UND_SAVE_SPSR]       <- SPSR_und (= pre-UND CPSR)
+@       [UND_SAVE_BANKED_LR]  <- LR of the faulting mode (the caller's
+@                                return address for BL-invoked UNDs)
+@     The last one is mandatory for the DDK-UND dispatch; the
+@     hypervisor halts if the slot is 0 rather than silently advancing.
+@   - Stub then issues `hvc #0x10` (UND_TAG).
 @
 @ Not tested here: SWP / SWPB. A53 under QEMU executes SWP natively
 @ regardless of SCTLR.SW, so the hypervisor's emulator is bypassed on
 @ this host; it stays in place for ROM-mode SWPs that do trap (or for
 @ alternative hosts). The emulator's encoding decode is exercised by
 @ inspection.
-@
-@ Trampoline contract (matches src/trap.rs::handle_und):
-@   - UND vector at VA 0x04 branches to our stub.
-@   - Stub runs in UND mode, writes R14_und to 0x04000400 and SPSR
-@     to 0x04000404, then issues `hvc #0x10` (UND_TAG).
-@   - Hypervisor reads those RAM slots, decodes, emulates, and ERETs
-@     us back to the original mode at the address past the UND.
 
     .syntax unified
     .arch armv7ve
 
-    @ UND save slots live in the RAM-mirror-accessible portion of RAM,
-    @ not at IPA 0x04000400 (which overlaps the Newton kernel's L1 table
-    @ at PA 0x04000000 — writing there corrupts the page table once the
-    @ ROM installs it). Match src/trap.rs UND_SAVE_LR_IPA / _SPSR_IPA.
-    .equ UND_SAVE_LR_ADDR,   0x04005F00
-    .equ UND_SAVE_SPSR_ADDR, 0x04005F04
+    @ Save slots must match src/trap.rs UND_SAVE_* IPAs.
+    .equ UND_SAVE_LR_ADDR,         0x04005F00
+    .equ UND_SAVE_SPSR_ADDR,       0x04005F04
+    .equ UND_SAVE_BANKED_LR_ADDR,  0x04005F1C
 
     @ === Vector table ===============================================
     .section .text.vectors, "ax"
@@ -55,9 +61,14 @@ _reset:
     b       .Lhang
 
     @ ---- UND trampoline -------------------------------------------
-    @ Entry: UND mode, R14_und = faulting_pc + 4, SPSR = old CPSR.
-    @ Writes both to fixed RAM slots, then HVCs to EL2. Uses the UND
-    @ stack to avoid clobbering r0/r1 the faulting code had live.
+    @ Runs in UND mode with R14_und = faulting_pc + 4, SPSR_und = pre-
+    @ UND CPSR. Replicates the ROM trampoline's mode-switch dance
+    @ (src/guest_mem.rs::patch_und_vector) so the hypervisor's
+    @ handle_und sees banked state populated regardless of source
+    @ mode. The hypervisor reads the slots via `read_word_pa` and
+    @ ERETs us back to the original mode at the address the handler
+    @ chose (for DDK UNDs, the faulting mode's LR = caller's return
+    @ address).
 _und_trampoline:
     push    {r0, r1}
     ldr     r0, =UND_SAVE_LR_ADDR
@@ -65,14 +76,27 @@ _und_trampoline:
     mrs     r1, spsr
     ldr     r0, =UND_SAVE_SPSR_ADDR
     str     r1, [r0]
+
+    @ Capture the faulting mode's banked LR into UND_SAVE_BANKED_LR.
+    @ Extract the mode field of SPSR and switch to it (or SYS when the
+    @ source was USR, since USR/SYS share the same bank). Reading LR
+    @ in that mode yields the pre-UND banked LR; store and switch back.
+    and     r1, r1, #0x1F        @ r1 = SPSR.mode
+    orr     r1, r1, #0xC0        @ r1 |= I|F mask (needed by MSR CPSR_c)
+    cmp     r1, #0xD0            @ USR (0x10) + IF ?
+    moveq   r1, #0xDF            @ → SYS (0x1F) + IF (shares USR's R13/R14 bank)
+    msr     cpsr_c, r1           @ switch to faulting mode
+    ldr     r0, =UND_SAVE_BANKED_LR_ADDR
+    str     lr, [r0]             @ [UND_SAVE_BANKED_LR] = LR of the source mode
+    msr     cpsr_c, #0xDB        @ back to UND, I=1 F=1
+
     pop     {r0, r1}
-    hvc     #0x10               @ UND_TAG — hypervisor decodes and ERETs
-    b       .Lhang              @ unreachable
+    hvc     #0x10                @ UND_TAG — hypervisor decodes and ERETs
+    b       .Lhang               @ unreachable
 
 test_main:
     @ ---- SystemBootUND (0xE6000010) -------------------------------
-    @ Single-instruction NOP semantic: handler advances ELR by 4 so the
-    @ instruction after the UND executes normally.
+    @ Inline NOP marker: handler advances ELR by 4.
     .word   0xE6000010
     mov     r6, #0x42
     cmp     r6, #0x42
@@ -82,10 +106,8 @@ test_main:
     hvc     #5                  @ mark 1: SystemBootUND dispatch ok
 
     @ ---- DebuggerUND (0xE6000510) + null-terminated ASCII payload ---
-    @ Handler scans from opcode+4 for a NUL byte and resumes at the
-    @ next word boundary past the terminator. The .balign pushes the
-    @ resume PC to a word-aligned location matching the handler's
-    @ expected landing point.
+    @ Inline marker + message. Handler scans from opcode+4 for a NUL
+    @ byte and resumes at the next word boundary past the terminator.
     .word   0xE6000510
     .asciz  "dbg"
     .balign 4
@@ -96,18 +118,34 @@ test_main:
     mov     r0, #2
     hvc     #5                  @ mark 2: DebuggerUND dispatch ok
 
-    @ ---- TapFileCntlUND (0xE6000810) + payload -------------------
-    .word   0xE6000810
-    .word   0x66778899          @ payload — hypervisor logs it
+    @ ---- TapFileCntl (0xE6000810) — BL-invoked function entry ----
+    @ The UND lives at a named ROM symbol (the kernel's BL target).
+    @ Handler emulates the file-protocol dispatch — here we call with
+    @ command=0 (unsupported), so the handler writes -1 to R0 as the
+    @ "call failed" result — and returns to the caller's banked LR.
+    @ Execution resumes at the instruction after the BL, which is
+    @ exactly how the Newton kernel invokes this.
+    mov     r0, #0                @ command = 0 (unsupported)
+    bl      tap_file_cntl_stub
+    @ <-- handler should return here (LR = address of next insn)
+    cmn     r0, #1                @ r0 should be 0xFFFFFFFF (= -1)
+    bne     .Lfail_tap_und
+
     mov     r6, #0x77
     cmp     r6, #0x77
     bne     .Lfail_tap_und
 
     mov     r0, #3
-    hvc     #5                  @ mark 3: TapFileCntlUND dispatch ok
+    hvc     #5                  @ mark 3: TapFileCntl dispatch ok
 
     hvc     #3                  @ PASS
     bx      lr
+
+tap_file_cntl_stub:
+    @ Single-word function body, called via BL above. On entry LR =
+    @ address of the `cmn r0, #1` instruction.
+    .word   0xE6000810
+    b       .                    @ handler must return to LR, not fall through
 
     @ === Failure paths ============================================
 .Lfail_boot_und:

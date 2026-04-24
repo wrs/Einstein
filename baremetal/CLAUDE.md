@@ -38,6 +38,11 @@ Phase A is done. Phase B's goal is booting the 717006 ROM through to
 Every iteration is "run, see where it stops, fix, rerun" — which
 means the snapshot workflow below matters a lot.
 
+**Important:** Do not trust your memory for details of ARM architecture,
+especially EL2-related registers and coprocessor instruction encodings.
+ALWAYS check against the actual ARMv7 reference, which is in
+docs/ARM_Reference.txt.
+
 ## Snapshot / resume workflow (Phase B)
 
 `src/snapshot.rs` rolls four guest-state snapshots on disk at

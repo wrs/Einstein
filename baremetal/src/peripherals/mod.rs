@@ -13,4 +13,5 @@ pub mod platform;
 pub mod pcmcia;
 pub mod screen;
 pub mod serial;
+pub mod sound;
 pub mod vic;

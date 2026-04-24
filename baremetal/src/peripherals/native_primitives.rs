@@ -17,7 +17,7 @@
 //! unknown code halts loudly with a full context dump so the next
 //! ROM boot that hits one points exactly at the missing table entry.
 
-use crate::{cpu, kprintln, peripherals::{flash_driver, platform, screen}, trap::TrapContext};
+use crate::{cpu, kprintln, peripherals::{flash_driver, platform, screen, sound}, trap::TrapContext};
 
 /// Dispatch a native-primitive call.
 ///
@@ -58,6 +58,12 @@ pub fn execute(ctx: &mut TrapContext, native_insn: u32, pc: u32) {
         // See peripherals/platform.rs.
         (d, s) if d == platform::DRIVER_ID => {
             platform::handle(ctx, s, pc);
+        }
+
+        // Sound-class: driver=2 -> PMainSoundDriver subfn dispatch.
+        // See peripherals/sound.rs.
+        (d, s) if d == sound::DRIVER_ID => {
+            sound::handle(ctx, s, pc);
         }
 
         // Screen-class: driver=4 -> TMainDisplayDriver method per

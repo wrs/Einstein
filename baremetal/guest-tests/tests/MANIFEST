@@ -20,3 +20,4 @@ test_snapshot
 test_shadow_stub
 test_spsr_eret
 test_spsr_eret_und
+test_rotate_ldr

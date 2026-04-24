@@ -49,6 +49,15 @@ const EC_DATA_ABORT_LOWER: u32 = 0x24;
 /// the faulting instruction ourselves in `handle_und`.
 pub const UND_TAG: u32 = 0x10;
 
+/// Alignment-fault fast path. DABT trampoline at `DABT_TRAMP_OFFSET`
+/// checks `DFSR.FS[3:0] == 1` (alignment fault, ARMv7 short descriptor)
+/// right after saving R0/R1 to TPIDR scratch, and issues
+/// `HVC #ALIGN_TAG` directly instead of the DIAG state-capture path.
+/// `handle_align_fault` decodes the faulting LDR/STR and emulates it
+/// with SA-1100 rotate-LDR semantics, then ERETs past the faulting
+/// insn. See `unaligned.rs`.
+pub const ALIGN_TAG: u32 = 0x13;
+
 /// Generic "inspect-then-halt" HVC immediate, used by temporary
 /// vector-intercept patches during Phase B debugging. When we need to
 /// see the CPU state at the moment of an abort we don't otherwise see
@@ -579,6 +588,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         }
         v if v == DIAG_LR_TAG => {
             handle_diag_lr(ctx);
+        }
+        v if v == ALIGN_TAG => {
+            crate::unaligned::handle_align_fault(ctx);
         }
         #[cfg(feature = "trace")]
         v if v == crate::tracer::TRACE_TAG => {
@@ -1381,17 +1393,37 @@ fn handle_diag(ctx: &mut TrapContext) {
         "  TTBR0_EL1 = {:#010x}  TTBR1_EL1 = {:#010x}  TCR_EL1 = {:#010x}",
         ttbr0, ttbr1, tcr
     );
-    // Reliable banked state: the DABT trampoline at
-    // ROM DABT_TRAMP_OFFSET stores LR_abt, SP_abt, SPSR_abt (all from
-    // ABT mode) and then bounces to SVC to capture SP_svc, SPSR_svc,
-    // LR_svc. All reads are AArch32-native so they sidestep QEMU
-    // raspi3b's flaky AArch64-MRS-banked-SP plumbing.
+    // Reliable banked state. The DABT trampoline at ROM
+    // DABT_TRAMP_OFFSET stores LR_abt / SP_abt / SPSR_abt (all from
+    // ABT mode) — those are AArch32-native reads and survive QEMU
+    // raspi3b's flaky banked-reg plumbing. SP_svc / SPSR_svc / LR_svc
+    // come from AArch64 banked MRS now that the stub no longer does
+    // the SVC-mode bounce (removed to make room for the alignment-
+    // fault fast path — see guest_mem.rs). Banked MRS works on FVP;
+    // on QEMU raspi3b these reads may be zero, but the DIAG path is
+    // only used for "kernel hit an unexpected DABT" halts and FVP is
+    // the primary Phase-B platform.
     let lr_abt = guest_mem::read_word_pa(guest_mem::DABT_SAVE_PA).unwrap_or(0);
     let sp_abt = guest_mem::read_word_pa(guest_mem::DABT_SAVE_PA + 4).unwrap_or(0);
     let spsr_abt_reliable = guest_mem::read_word_pa(guest_mem::DABT_SAVE_PA + 8).unwrap_or(0);
-    let sp_svc_reliable = guest_mem::read_word_pa(guest_mem::DABT_SAVE_PA + 0xC).unwrap_or(0);
-    let spsr_svc_reliable = guest_mem::read_word_pa(guest_mem::DABT_SAVE_PA + 0x10).unwrap_or(0);
-    let lr_svc_reliable = guest_mem::read_word_pa(guest_mem::DABT_SAVE_PA + 0x14).unwrap_or(0);
+    let (sp_svc_reliable, spsr_svc_reliable, lr_svc_reliable) = {
+        let sp: u64; let spsr: u64; let lr: u64;
+        // SP_svc / SPSR_svc / LR_svc are the AArch32 aliases of AArch64's
+        // SP_EL1 / SPSR_EL1 / ELR_EL1 (same physical registers). LLVM's
+        // AArch64 assembler accepts the EL1 forms but rejects the AArch32
+        // banked-mode forms for these three (it does accept SPSR_abt etc.
+        // which are distinct from any EL mapping). Reads have no side
+        // effects.
+        unsafe {
+            core::arch::asm!("mrs {}, sp_el1",   out(reg) sp,
+                options(nomem, nostack, preserves_flags));
+            core::arch::asm!("mrs {}, spsr_el1", out(reg) spsr,
+                options(nomem, nostack, preserves_flags));
+            core::arch::asm!("mrs {}, elr_el1",  out(reg) lr,
+                options(nomem, nostack, preserves_flags));
+        }
+        (sp as u32, spsr as u32, lr as u32)
+    };
     let pre_mode = spsr_abt_reliable & 0x1F;
     let thumb = (spsr_abt_reliable & (1 << 5)) != 0;
     let faulting_pc = if thumb { (lr_abt.wrapping_sub(4)) & !1 } else { lr_abt.wrapping_sub(8) };
@@ -2208,7 +2240,27 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
             let prev_sctlr = cp15::read_sctlr_el1() as u32;
             let was_off = (prev_sctlr & 1) == 0;
             let now_on = (value & 1) != 0;
-            cp15::write_sctlr_el1(value as u64);
+            // Force SCTLR.A=1 on the guest so unaligned LDR/STR raises
+            // an alignment fault at EL1. The DABT-vector trampoline
+            // routes alignment faults to unaligned::handle_align_fault.
+            let value_with_a = value | 0x2;
+            cp15::write_sctlr_el1(value_with_a as u64);
+            // One-time cross-check: read SCTLR back to verify A-bit stuck,
+            // and emit <<TRM_START>> so the tarmac-window capture begins
+            // at the moment A=1 becomes live. Paired with emit_stop()
+            // in handle_align_fault so we get the exact window from
+            // "A=1 applied" through "first alignment fault decoded".
+            static LOGGED_SCTLR_A_ONCE: core::sync::atomic::AtomicBool =
+                core::sync::atomic::AtomicBool::new(false);
+            if !LOGGED_SCTLR_A_ONCE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                let readback = cp15::read_sctlr_el1() as u32;
+                kprintln!(
+                    "sctlr: first guest write {:#010x} → hw {:#010x} (A={}, M={}, V={})",
+                    value, readback, (readback >> 1) & 1, readback & 1,
+                    (readback >> 13) & 1,
+                );
+                crate::tarmac::emit_start();
+            }
             log_sctlr_write(value);
             if was_off && now_on {
                 // Drop HCR_EL2.DC. While the guest ran with stage-1

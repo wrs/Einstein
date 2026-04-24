@@ -313,7 +313,13 @@ re-deriving state from disassembly or tool output:
   header locations.
 - [`docs/QEMU_BUGS.md`](docs/QEMU_BUGS.md) — QEMU raspi3b bugs at
   the AArch64↔AArch32 boundary. Grep this before suspecting our
-  own code at that boundary.
+  own code at that boundary. **Especially relevant for banked
+  registers at AArch32 EL1 ↔ AArch64 EL2 exception entry — the
+  apparent "flaky `ctx.x[13]` / `ctx.x[14]`" has been
+  misdiagnosed as a QEMU bug multiple times; it is architected
+  behaviour per ARM ARM Table D1-79. `ctx.x[14]` is `LR_usr`,
+  `LR_abt` lives in `ctx.x[20]`, etc. Read the file before
+  assuming banked-reg weirdness is a bug.**
 - [`docs/WORKFLOW.md`](docs/WORKFLOW.md) — process notes: review
   Einstein-driver ports with a sub-agent, test-per-feature rule,
   finish-the-phase semantics.

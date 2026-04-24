@@ -104,6 +104,52 @@ listed here for completeness; they pre-date this file.
   guest-side mode bounce stashes the value to a RAM slot before EL2
   reads it (the UND trampoline pattern).
 
-- **`ctx.x[13]` / `ctx.x[14]` at EL2 entry from AArch32 are not
-  reliable aliases** for the active mode's banked R13/R14. Same root
-  cause as the banked-MRS bug; same workaround.
+- **NOT A BUG — `ctx.x[13]` / `ctx.x[14]` at EL2 AArch64 entry from
+  AArch32 are `SP_usr` / `LR_usr`, NOT the active mode's banked
+  R13/R14.** This is architected behavior per ARM ARM DDI 0487
+  D1.21.1 Table D1-79 "Base instruction set register mapping between
+  AArch32 state and AArch64 state": the AArch64 GPR file always maps
+  AArch32 banked regs **by bank name**, not by the mode active at
+  exception entry. Specifically:
+  ```
+    R0..R7            x0..x7      (shared / always)
+    R8..R12           x8..x12     (R8_usr..R12_usr — for non-FIQ modes
+                                  these are the same physical regs)
+    SP_usr            x13         ← NOT SP_<current-mode>
+    LR_usr            x14         ← NOT LR_<current-mode>
+    SP_hyp            x15
+    LR_irq            x16
+    SP_irq            x17
+    LR_svc            x18
+    SP_svc            x19
+    LR_abt            x20         ← read this for LR_abt, not x14
+    SP_abt            x21
+    LR_und            x22
+    SP_und            x23
+    R8_fiq..R12_fiq   x24..x28    (FIQ-mode R8-R12 live here)
+    SP_fiq            x29
+    LR_fiq            x30
+  ```
+  So when HVC fires from AArch32 ABT mode, `ctx.x[14]` is whatever
+  `LR_usr` happens to contain at that moment (a ROM-parked user-mode
+  return address, possibly Thumb-bit-set, possibly zero) — not
+  `LR_abt`. **This was misdiagnosed as "QEMU banked-reg plumbing is
+  flaky" for months.** FVP and QEMU both faithfully implement the
+  architected mapping; the wrong expectation was ours.
+
+  **Fix pattern**: in the EL2 HVC handler, read the banked reg from
+  the architected slot: `ctx.x[20]` for `LR_abt`, `ctx.x[21]` for
+  `SP_abt`, `ctx.x[18..19]` for `LR_svc`/`SP_svc`, `ctx.x[22..23]`
+  for UND, `ctx.x[16..17]` for IRQ, `ctx.x[24..30]` for FIQ-banked
+  R8-R12 + SP + LR. For SPSR_<mode>, the AArch64 named sysregs
+  `spsr_abt` / `spsr_und` / `spsr_irq` / `spsr_fiq` work (LLVM's
+  assembler accepts them); SPSR_svc is available as `spsr_el1` when
+  EL1 is AArch32 SVC at entry time. SP_usr can be read via the
+  `sp_el0` alias. There is **no** AArch64-named sysreg for SP/LR in
+  ABT/UND/IRQ/FIQ modes — Table D1-79 is the only access path from
+  AArch64 EL2 (MRS Banked Register is AArch32-only per F7.1.115).
+
+- **Upper 32 bits of x16..x30 on AArch32→AArch64 exception entry are
+  CONSTRAINED UNPREDICTABLE** per ARM ARM D1.21.2 Table D1-85. Always
+  w-view (`ctx.x[N] as u32`) when reading banked values. Don't rely
+  on the upper halves being zero-extended.

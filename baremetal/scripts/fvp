@@ -196,10 +196,30 @@ if [[ -n "${FVP_EXTRA:-}" ]]; then
     fvp_args+=("${extra[@]}")
 fi
 
+set -o pipefail
+
 # `timeout -k 5` escalates to SIGKILL 5 s after the initial SIGTERM
 # if docker is still alive; combined with the EXIT trap above this
 # guarantees no orphaned container survives the script's death.
 # NB: not using `exec` — exec replaces the shell and the trap would
 # never fire.
+rc=0
 timeout -k 5 "$timeout_secs" docker "${docker_args[@]}" \
-    --entrypoint "$FVP_BIN" "$IMAGE" "${fvp_args[@]}"
+    --entrypoint "$FVP_BIN" "$IMAGE" "${fvp_args[@]}" || rc=$?
+
+# Post-run: if a tarmac file was produced and exceeds the size cap,
+# truncate it in place so a run-away trace can't silently fill the
+# host disk across repeated runs. Override the cap with
+# FVP_TARMAC_MAX (bytes); default 1 GiB.
+tarmac_max="${FVP_TARMAC_MAX:-1073741824}"
+for path in "$tarmac" "$tarmac_window"; do
+    if [[ -n "$path" && -f "$path" ]]; then
+        size=$(stat -f%z "$path" 2>/dev/null || stat -c%s "$path" 2>/dev/null || echo 0)
+        if [[ "$size" -gt "$tarmac_max" ]]; then
+            head -c "$tarmac_max" "$path" > "$path.trunc" && mv "$path.trunc" "$path"
+            echo "[fvp] tarmac log truncated to ${tarmac_max} bytes (was ${size})." >&2
+        fi
+    fi
+done
+
+exit "$rc"

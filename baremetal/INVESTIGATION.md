@@ -3,7 +3,87 @@
 Live notes. Update as we learn more; archive to a dated file when
 we move past the current stall.
 
-## Currently at — BootOS canary entry #2 → soft-reset via stale task frame (FVP + QEMU, 2026-04-23)
+## Currently at — unrecognised Einstein UND 0xe6000210 at PC 0x38ce84 (FVP, 2026-04-24)
+
+Boot now advances past the BootOS-canary-entry-2 stall (resolved by
+hypervisor-wide rotate-LDR emulation — see below). The new frontier:
+
+```
+und: TapFileCntlUND @PC=0x38ce7c payload=0xe6000310
+*** unrecognised UND: insn=0xe6000210 at PC=0x38ce84 SPSR_und=0x20000110
+    (extend handle_und in trap.rs to handle this opcode)
+```
+
+The preceding TapFileCntlUND at `0x38ce7c` dispatches cleanly. The
+instruction at `0x38ce84` is `0xe6000210` — another Einstein UND
+opcode (all `0xe60000x0` forms are Einstein / Newton-specific UND
+markers per `Emulator/JIT/Generic/TJITGenericPatchManager.cpp` and
+`Emulator/TARMProcessor::DoUND`). This one isn't in our current
+`handle_und` dispatch table (see `src/trap.rs`). Next-session work:
+grep the Einstein source for `0xe6000210` / `0xe6_00_02_10`, decode
+the semantic (payload width, PC advance, side effect), add it to
+the handler. The payload `0xe6000310` captured in the previous
+TapFileCntlUND log-line suggests this region of the ROM is heavy
+on Newton-specific UND markers — several more variants may follow.
+
+Reproduce:
+
+```
+rm -f /tmp/newton-snapshot-*.bin
+cargo build --release --no-default-features --features "platform-fvp-base quiet"
+scripts/fvp --timeout=90 target/aarch64-unknown-none-softfloat/release/newton-hypervisor
+```
+
+## Resolved — hypervisor-wide rotate-LDR emulation via SCTLR.A + alignment fault (2026-04-24)
+
+The BootOS-canary-entry-2 stall (documented below) was caused by
+ARMv4 rotate-LDR semantics. SA-1100 (BE-32 + SCTLR.U=0) on an
+unaligned `LDR` aligns the address down and rotates right by
+`(addr & 3) * 8`; A53 AArch32 forces `SCTLR.U=1` and does a true
+unaligned load (four contiguous bytes, no rotate). The 717006 ROM
+has ~1300 sites depending on rotate semantics — patching each is
+not viable.
+
+**Fix**: hypervisor-wide alignment-fault emulation. The CP15 shim
+ORs `SCTLR.A=1` into every guest SCTLR write, so unaligned LDR/STR
+raise a stage-1 alignment fault at EL1. The DABT trampoline at
+VA 0x10 detects `DFSR.FS[3:0]==1` (unique to alignment in the
+short-descriptor FS encoding) and fast-paths to `HVC #ALIGN_TAG`;
+`src/unaligned.rs::handle_align_fault` decodes the faulting LDR/
+STR and performs the aligned word load + ROR in EL2 Rust,
+advancing ELR_EL2 past the faulting insn.
+
+Notable subtleties:
+
+- **Banked-register access at HVC from ABT mode.** Per ARM ARM
+  DDI 0487 D1.21.1 Table D1-79, the AArch32→AArch64 exception-
+  entry register map is by bank name, not by active mode. So
+  `ctx.x[14]` is `LR_usr`, `LR_abt` lives in `ctx.x[20]`, etc.
+  This had been misdiagnosed as a "QEMU banked-reg bug" more
+  than once — see `docs/QEMU_BUGS.md` for the full mapping. The
+  emulator uses `ctx_slot_for_reg(reg, pre_mode)` to read/write
+  Rn/Rt/Rm correctly for any pre-abt AArch32 mode.
+- **R0/R1 recovery.** The DABT stub uses R0/R1 as scratch; it
+  saves them to `TPIDRURW` / `TPIDRRO` before clobbering. The
+  handler reads them back via `tpidr_el0` / `tpidrro_el0`.
+- **SPSR_abt read.** QEMU raspi3b's named `mrs spsr_abt` is
+  still flaky (returns 0), so the stub persists SPSR_abt to the
+  `DABT_SAVE_PA` RAM slot and the handler reads it from there.
+  LR_abt comes from `ctx.x[20]` directly (reliable on FVP).
+- **Boot progress.** Reaches the same ~620K-trap horizon that
+  the earlier hand-patched CountMatches + ResolveFault commits
+  landed at. Those targeted patches are superseded and removed
+  — the trap-based emulator covers every static unaligned
+  immediate-offset LDR and every `[Rn, Rm, LSL #1]` register-
+  offset site without a ROM-patch whitelist.
+
+New guest test: `test_rotate_ldr` verifies offsets +1/+2/+3
+produce SA-1100 ROR-by-8/16/24 results plus the aligned control
+case. All 23 guest tests pass.
+
+Commit: (this commit).
+
+## Previously at — BootOS canary entry #2 → soft-reset via stale task frame (FVP + QEMU, 2026-04-23)
 
 Boot advances past the SWP-VA-translation and FPA fixes (see below)
 and reaches beacon trap ~620 000 before the canary fires. The canary

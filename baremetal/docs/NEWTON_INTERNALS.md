@@ -76,35 +76,63 @@ Note: `MainConstructor` / `TheMain` / `GetSizeOf` are NOT virtual —
 they're part of ClassInfo. Virtual-dispatch targets live in the
 method-array reached via ClassInfo+8.
 
-## ROM jump-table at VA 0x01A00000..0x01C20000 — post-ship patch mechanism
+## ROM patch table at VA 0x01A00000..0x01C20880 — post-ship patch mechanism
 
 Not a class registry, dispatch table, or symbol table. It's a **thunk
 table for post-shipping patches**: the ROM shipped non-reprogrammable,
 so Apple introduced this indirection layer.
 
 - Default entry: `B <real_rom_function>` — still in the ROM image,
-  mapped into the VA range via stage-1 small pages. Calling the
-  jump-table VA jumps straight to the ROM function (1-cycle
+  aliased into the VA range via stage-1 small pages. Calling the
+  patch-table VA jumps straight to the ROM function (1-cycle
   indirection).
-- Patched entry: the small page is remapped from ROM to a RAM copy,
-  and the RAM copy's word is rewritten to `B <ram_patch_function>`.
-  Patch bodies live in a separate "patch RAM" area.
+- Patched entry: the one 4KB VA page carrying that slot is remapped
+  from ROM to a RAM copy, and the RAM copy's word is rewritten to
+  `B <ram_patch_function>`. Patch bodies live in a separate "patch
+  RAM" area.
+
+### Layout
+
+Physical (patchtable only; jumptable-proper and page-tables live
+elsewhere and are not VA-mapped into this range):
+
+  Patchtable  phys 0x02000 - 0x1285C   (529 slots × 0x80 bytes = 32 × B-thunk per slot)
+
+Virtual:
+
+  17 *buckets* of 0x20000 bytes at `0x01A00000 + B * 0x20000`,
+  `B ∈ 0..16`. Each bucket contains 32 VA 4KB pages, **all aliased
+  to the same** physical 4KB page at `0x2000 + B * 0x1000`.
+
+  Within a bucket, slot `P ∈ 0..31` is a 0x80-byte (32-entry)
+  region at `VA = bucket_start + P*0x1000 + P*0x80`, entries at
+  `phys = bucket_phys + P*0x80`. The intra-page offset shift
+  (`P*0x80`) puts each slot on its own VA 4KB page, so remapping
+  only that page to RAM patches only its 32 thunks while leaving
+  the other 31 slots of the same physical page untouched — that's
+  the whole point of the aliasing scheme.
+
+  For the Ghidra setup, see `/Users/walter/Projects/newton/ghidra/`
+  scripts: `RebuildNewtonJumpTableMapping.py` creates the 544
+  byte-mapped blocks, and `SetNewtonJumpTableThunks.py` converts
+  every slot entry to a Ghidra thunk so the decompiler sees through
+  to the ROM target.
 
 Implications:
 
 - A BL to `0x01Axxxxx` / `0x01Bxxxxx` / `0x01Cxxxxx` is calling the
   *patchable* version of the default ROM target.
-- ClassInfo method slots using the jump-table VA are opting into
+- ClassInfo method slots using the patch-table VA are opting into
   patchability.
 - The tracer DOES see through these thunks — the target is an
   ordinary ROM function, so its first-word tracer trampoline fires
-  normally. What the tracer does NOT see is the jump-table thunk
+  normally. What the tracer does NOT see is the patch-table thunk
   itself (not in `scripts/classify-out/code-symbols.txt`).
 
 For real class/task registration hunts, search
 `TPrivatePackageIterator`, `FindHighROMProtocol`,
 `TClassInfoRegistryImpl::Register`, etc. — the actual registration
-path. The jump table is not it.
+path. The patch table is not it.
 
 ## DDK headers — authoritative struct / API definitions
 
@@ -133,6 +161,8 @@ Public `TUTask` / `TUDomain` classes in these headers match what ROM
 exposes; internal `TTask` etc. may not be here but the public wrappers
 constrain the surface.
 
-Nearby: `/Users/walter/Projects/newton/ghidra/` has Ghidra projects for
-both the 717006 ROM and NewtonOS plus `NOTES.md` describing the
-MMU-mapped jump-table layout (`01A00000 → 00002000 ×32`).
+Nearby: `/Users/walter/Projects/newton/ghidra/` has Ghidra projects
+for both the 717006 ROM and NewtonOS. `mmu.txt` describes the
+post-ship patch-table aliasing (17 buckets × 32 aliased VA pages);
+`RebuildNewtonJumpTableMapping.py`, `SetNewtonJumpTableThunks.py`,
+and `ReclassifyRomDataRanges.py` are the import helpers.

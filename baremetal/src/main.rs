@@ -23,6 +23,7 @@ mod timer;
 mod tracer;
 mod trap;
 pub mod uart;
+mod unaligned;
 
 global_asm!(include_str!("boot.s"));
 global_asm!(include_str!("vectors.s"));

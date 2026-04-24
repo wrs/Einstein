@@ -622,6 +622,13 @@ pub unsafe fn load_guest_test() {
     unsafe {
         patch_und_vector(addr_of_mut!(GUEST_ROM) as *mut u32);
     }
+    // Don't install the DABT trampoline here: test_cp15_fault_regs
+    // installs its own VA 0x10 handler to probe the CP15 shim's DFAR /
+    // DFSR pass-through, and unconditionally patching would break it.
+    // Tests that want the hypervisor's alignment-fault emulator (e.g.
+    // test_rotate_ldr) hand-roll the trampoline shape inline so the
+    // DABT enters EL2 via HVC #ALIGN_TAG the same way the real ROM
+    // path does.
 }
 
 #[cfg(not(nh_guest_test))]
@@ -783,65 +790,8 @@ pub unsafe fn load_newton_rom() {
     // 0x58 onwards on Newton 2.x ROMs.
     unsafe { patch_und_vector(rom_ptr); }
 
-    // TEMPORARY diagnostic — DABT-vector intercept.
-    // Patch VA 0x10 to branch to a stub at ROM offset DABT_TRAMP_OFFSET
-    // (0x00FF_FFA8). The stub saves LR_abt/SP_abt/SPSR_abt natively from
-    // ABT mode, then bounces to SVC to capture SP_svc/SPSR_svc/LR_svc
-    // (which QEMU raspi3b's AArch64-MRS-banked-SP reads don't give
-    // reliably), before HVCing to EL2.
-    //
-    // Stub layout (14 words = 56 bytes):
-    //   +0x00: ee0d_0f50  mcr p15,0,r0,c13,c0,2  ; save r0 → TPIDRURW
-    //   +0x04: e59f_002c  ldr r0, [pc, #0x2c]    ; r0 = DABT_SAVE_VA (literal at +0x38)
-    //   +0x08: e580_e000  str lr, [r0]           ; save LR_abt (= faulting_pc + 8 for ARM)
-    //   +0x0C: e580_d004  str sp, [r0, #4]       ; save SP_abt
-    //   +0x10: e14f_1000  mrs r1, spsr           ; r1 = SPSR_abt = pre-abort CPSR
-    //   +0x14: e580_1008  str r1, [r0, #8]       ; save SPSR_abt
-    //   +0x18: e321_f0d3  msr cpsr_c, #0xd3      ; → SVC (I=1,F=1,T=0)
-    //   +0x1C: e1a0_200d  mov r2, sp             ; r2 = SP_svc
-    //   +0x20: e14f_3000  mrs r3, spsr           ; r3 = SPSR_svc
-    //   +0x24: e1a0_400e  mov r4, lr             ; r4 = LR_svc
-    //   +0x28: e321_f0d7  msr cpsr_c, #0xd7      ; → ABT (restore)
-    //   +0x2C: e880_001c  stmia r0+0xC, {r2,r3,r4} ; but that's the wrong store;
-    //                     -- use individual STRs via r0 instead for clarity
-    //   (We use individual STRs so we don't need stmia; see stub array below.)
-    //
-    // DABT_SAVE at IPA 0x0400_5FA0 (pre-MMU), VA 0x0C00_4FA0 (post-MMU).
-    // handle_diag in trap.rs reads the PA and prints the reliable state.
-    //
-    // The pre/post-MMU literal swap is piggy-backed on the existing
-    // UND trampoline's swap in install_und_vector_swap_{pre,post}_mmu.
-    //
-    // SAFETY: 1 + ~14 words of ROM backing; both regions are reserved
-    // per tracer::in_reserved_range.
-    unsafe {
-        let imm24 = ((DABT_TRAMP_OFFSET as u32).wrapping_sub(0x10 + 8) / 4) & 0x00FF_FFFF;
-        let branch_insn = 0xEA00_0000 | imm24;
-        rom_ptr.add(4).write(branch_insn);              // 0x10: b DABT_TRAMP_OFFSET
-
-        let db = DABT_TRAMP_OFFSET / 4;
-        rom_ptr.add(db +  0).write(0xEE0D_0F50);         // mcr p15,0,r0,c13,c0,2  (save r0)
-        rom_ptr.add(db +  1).write(0xE59F_002C);         // ldr r0, [pc, #0x2c]    (lit at +0x38)
-        rom_ptr.add(db +  2).write(0xE580_E000);         // str lr, [r0]           LR_abt
-        rom_ptr.add(db +  3).write(0xE580_D004);         // str sp, [r0, #4]       SP_abt
-        rom_ptr.add(db +  4).write(0xE14F_1000);         // mrs r1, spsr           SPSR_abt
-        rom_ptr.add(db +  5).write(0xE580_1008);         // str r1, [r0, #8]       SPSR_abt
-        rom_ptr.add(db +  6).write(0xE321_F0D3);         // msr cpsr_c, #0xd3      → SVC
-        rom_ptr.add(db +  7).write(0xE580_D00C);         // str sp, [r0, #0xC]     SP_svc
-        rom_ptr.add(db +  8).write(0xE14F_1000);         // mrs r1, spsr           SPSR_svc
-        rom_ptr.add(db +  9).write(0xE580_1010);         // str r1, [r0, #0x10]    SPSR_svc
-        rom_ptr.add(db + 10).write(0xE580_E014);         // str lr, [r0, #0x14]    LR_svc
-        rom_ptr.add(db + 11).write(0xE321_F0D7);         // msr cpsr_c, #0xd7      → ABT
-        rom_ptr.add(db + 12).write(0xE140_0171);         // hvc #0x11
-        rom_ptr.add(db + 13).write(0xEAFF_FFFE);         // b . (guard if return)
-        rom_ptr.add(db + 14).write(0x0400_5FA0);         // literal (pre-MMU IPA)
-        // Note: `ldr r0, [pc, #0x30]` uses pc = instruction_addr + 8.
-        // instruction at db+1 = offset +4. pc for that ldr = +0x0C.
-        // pc + 0x30 = +0x3C. Literal at word index 14, byte offset +0x38.
-        // Wait — let me recompute. db+14 byte offset = 14 * 4 = 0x38. pc+0x30 = 0x0C + 0x30 = 0x3C ≠ 0x38.
-        // Fix: literal at +0x38. ldr offset should be pc_at_ldr + 8 + N = 0x38 →
-        // N = 0x38 - 0x0C = 0x2C. Use `ldr r0, [pc, #0x2c]`.
-    }
+    // Install the DABT-vector intercept. See `patch_dabt_vector` below.
+    unsafe { patch_dabt_vector(rom_ptr); }
 
     // TEMPORARY diagnostic — PABT-vector intercept.
     // The stock ROM vector at VA 0x0C branches to 0x01A00010 (a HAL
@@ -1000,6 +950,74 @@ pub const SBA_POST_TRAMP_NEW_PC_OFFSET: usize = SBA_POST_TRAMP_OFFSET + 0x24;
 ///   +0x14: LR_svc
 pub const DABT_TRAMP_OFFSET: usize = 0x00FF_FFA8;
 pub const DABT_SAVE_PA: u32 = 0x0400_5FA0;
+
+/// Install the DABT-vector intercept stub at `DABT_TRAMP_OFFSET` and
+/// patch VA 0x10 to branch to it. Serves two roles:
+///   (1) `HVC #DIAG_TAG` for Phase-B debugging: halt with banked-reg
+///       dump on any unexpected DABT the kernel doesn't own.
+///   (2) `HVC #ALIGN_TAG` for hypervisor-wide rotate-LDR emulation.
+///       SCTLR.A=1 (forced by our CP15 shim) means every unaligned
+///       LDR/STR alignment-faults here; the handler decodes+emulates
+///       SA-1100 rotate-LDR semantics and ERETs past the faulting insn.
+///
+/// Stub layout (15 words = 60 bytes). Saves R0 / R1 to TPIDR scratch
+/// regs and LR_abt / SP_abt / SPSR_abt to a fixed RAM slot *before*
+/// the DFSR check. AArch64 EL2 banked-reg reads (`ctx.x[14]`, `mrs
+/// {}, spsr_abt`) have been unreliable on QEMU raspi3b and at least
+/// some FVP configurations for AArch32 EL1 ABT state, so we persist
+/// via RAM and let the handler read the save area directly.
+///
+///   +0x00: ee0d_0f50  mcr p15,0,r0,c13,c0,2  ; save r0 → TPIDRURW
+///   +0x04: ee0d_1f70  mcr p15,0,r1,c13,c0,3  ; save r1 → TPIDRRO
+///   +0x08: e59f_0028  ldr r0, [pc, #0x28]    ; r0 = DABT_SAVE_VA literal
+///   +0x0C: e580_e000  str lr, [r0]           ; save LR_abt  @ +0x00
+///   +0x10: e580_d004  str sp, [r0, #4]       ; save SP_abt  @ +0x04
+///   +0x14: e14f_1000  mrs r1, spsr           ; r1 = SPSR_abt
+///   +0x18: e580_1008  str r1, [r0, #8]       ; save SPSR_abt @ +0x08
+///   +0x1C: ee15_0f10  mrc p15,0,r0,c5,c0,0   ; r0 = DFSR
+///   +0x20: e200_000f  and r0, r0, #0xF       ; mask FS[3:0]
+///   +0x24: e350_0001  cmp r0, #1             ; alignment fault?
+///   +0x28: 0a00_0000  beq align_path (+0x30) ; → HVC #ALIGN_TAG
+///   +0x2C: e140_0171  hvc #0x11 (DIAG_TAG)
+///   +0x30: e140_0173  hvc #0x13 (ALIGN_TAG) — align path target
+///   +0x34: eaff_fffe  b .                    ; guard
+///   +0x38: literal     DABT_SAVE_VA
+///
+/// DABT_SAVE layout at IPA 0x0400_5FA0 (pre-MMU) / VA 0x0C00_4FA0
+/// (post-MMU):
+///   +0x00: LR_abt    (= faulting_pc + 8 for ARM DABT)
+///   +0x04: SP_abt
+///   +0x08: SPSR_abt  (= pre-abt CPSR)
+///
+/// The pre/post-MMU literal swap is piggy-backed on the UND
+/// trampoline's swap in `install_und_vector_swap_{pre,post}_mmu`.
+///
+/// SAFETY: writes 1 word at VA 0x10 + 15 words in the ROM tail
+/// reserved region; caller must own the ROM backing.
+pub unsafe fn patch_dabt_vector(rom_ptr: *mut u32) {
+    unsafe {
+        let imm24 = ((DABT_TRAMP_OFFSET as u32).wrapping_sub(0x10 + 8) / 4) & 0x00FF_FFFF;
+        let branch_insn = 0xEA00_0000 | imm24;
+        rom_ptr.add(4).write(branch_insn);              // 0x10: b DABT_TRAMP_OFFSET
+
+        let db = DABT_TRAMP_OFFSET / 4;
+        rom_ptr.add(db +  0).write(0xEE0D_0F50);         // mcr p15,0,r0,c13,c0,2
+        rom_ptr.add(db +  1).write(0xEE0D_1F70);         // mcr p15,0,r1,c13,c0,3
+        rom_ptr.add(db +  2).write(0xE59F_0028);         // ldr r0, [pc, #0x28] → DABT_SAVE_VA
+        rom_ptr.add(db +  3).write(0xE580_E000);         // str lr, [r0]           LR_abt
+        rom_ptr.add(db +  4).write(0xE580_D004);         // str sp, [r0, #4]       SP_abt
+        rom_ptr.add(db +  5).write(0xE14F_1000);         // mrs r1, spsr
+        rom_ptr.add(db +  6).write(0xE580_1008);         // str r1, [r0, #8]       SPSR_abt
+        rom_ptr.add(db +  7).write(0xEE15_0F10);         // mrc p15,0,r0,c5,c0,0   DFSR
+        rom_ptr.add(db +  8).write(0xE200_000F);         // and r0, r0, #0xF
+        rom_ptr.add(db +  9).write(0xE350_0001);         // cmp r0, #1
+        rom_ptr.add(db + 10).write(0x0A00_0000);         // beq +0x0 (word 12 = ALIGN hvc)
+        rom_ptr.add(db + 11).write(0xE140_0171);         // hvc #0x11 (DIAG_TAG)
+        rom_ptr.add(db + 12).write(0xE140_0173);         // hvc #0x13 (ALIGN_TAG)
+        rom_ptr.add(db + 13).write(0xEAFF_FFFE);         // b . (guard)
+        rom_ptr.add(db + 14).write(0x0400_5FA0);         // literal (pre-MMU IPA)
+    }
+}
 
 /// `movs pc, lr` stub in the ROM trampoline region. See the installation
 /// site in `patch_und_vector` and `return_to_guest_from_und` in trap.rs

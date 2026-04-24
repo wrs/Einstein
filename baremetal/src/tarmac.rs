@@ -18,15 +18,19 @@
 //!
 //! To disable windowing, set `START_AT_TRAP = 0`.
 //!
-//! Active investigation (2026-04-23): soft-reset → BootOS canary entry
-//! #2 fires at trap count ~620 k on both QEMU and FVP. Starting at
-//! 619 000 gives ~1 000 traps of runway before the reset.
+//! Active investigation (2026-04-24): alignment-fault emulator's first
+//! fault shows an impossible R14_abt (0x97 for an ARM-mode DABT). We
+//! want a tarmac trace of exactly the window from "SCTLR.A=1 becomes
+//! live" to "alignment-fault handler entry", so the SCTLR write
+//! handler calls `emit_start()` explicitly and
+//! `unaligned::handle_align_fault` calls `emit_stop()` on first entry.
+//! `START_AT_TRAP = 0` disables the trap-count path.
 
 use crate::uart;
 
 /// If non-zero, emit `<<TRM_START>>` once when the sync-trap counter
 /// reaches this value. See module docs.
-const START_AT_TRAP: u64 = 619_900;
+const START_AT_TRAP: u64 = 0;
 
 const START_MARKER: &str = "<<TRM_START>>";
 const STOP_MARKER: &str = "<<TRM_STOP>>";
@@ -58,6 +62,19 @@ pub fn emit_stop() {
     }
     unsafe { STOPPED = true; }
     emit_marker(STOP_MARKER);
+}
+
+/// Emit the start marker on demand. Idempotent. Use this when the
+/// interesting window is triggered by a specific EL2 event rather than
+/// a trap count (e.g., "SCTLR.A=1 just became live and I want to trace
+/// from here").
+pub fn emit_start() {
+    // SAFETY: single-threaded EL2.
+    if unsafe { STARTED } {
+        return;
+    }
+    unsafe { STARTED = true; }
+    emit_marker(START_MARKER);
 }
 
 fn emit_marker(s: &str) {

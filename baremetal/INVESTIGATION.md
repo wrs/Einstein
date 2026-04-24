@@ -63,21 +63,105 @@ is somewhere else — either:
   and our hypervisor silently broke that sequence. But no direct
   writes to 0x0401b[0-3]xx appear in the window after the remap.
 
-Still open: why doesn't Einstein hit this, and what should the
-hypervisor do differently? Candidate investigations:
+### Update (2026-04-23 follow-up) — root cause is `CopyPhysicalPage` never runs its inner copy
 
-- Trace through multiple `MakeObject` invocations — see whether the
-  remap always happens on this path, or only under specific
-  conditions (e.g., only when creating the Nth monitor).
-- Check if there's a stage-1 attribute we're stripping
-  (`fix_stage1_xn_bits` L2-rewrite mask `0xFFFF_F000 | 0x003E`)
-  that the kernel's remap relies on — e.g., if the kernel set a
-  non-global (nG) bit and our rewrite clears it, TLB semantics
-  could differ.
-- Look for a missing cache-maintenance op: the kernel writes the
-  L2 entry with MMU off (walks through DC=1 attributes on our
-  side). Subsequent guest accesses through stage-1 may see stale
-  cached values.
+A fresh tarmac-window walk at `/tmp/guest-trace.log` (the one
+referenced above) shows the remap path is driven by
+`TStackManager::CopyPagesAfterStackCollided` at `0x1f7540`, which
+SVC-enters at tarmac time 9823635900000 and calls
+`CopyPhysicalPage` at `0x15b8a4` at time 9828946380000 — well before
+the kernel's `StoreToPhysAddress` write of `0x0401b0ce` at 9840502600000.
+The design is:
+
+1. Allocate new PA (here `0x0401b000`).
+2. `CopyPhysicalPage` copies the OLD PA's contents into the NEW PA
+   subpage-by-subpage (`PhysSubPageCopy` at `0x18df4`, which toggles
+   SCTLR.M off, does 4× `LDM/STM` of 128 bytes via direct PA, toggles
+   SCTLR.M on).
+3. Kernel rewrites the L2 entry to point at the new PA
+   (`StoreToPhysAddress`).
+4. Kernel `MCR p15,0,r0,c8,c6,1 / c8,c5,0` — DTLB-by-MVA + ITLB-all
+   — at `0x3ad538/0x3ad53c`, invalidating the old VA mapping.
+5. Task resumes; LDMDB sees the new PA, which now holds the copied
+   stack.
+
+**Tarmac on our hypervisor shows step 2 is architecturally silent:**
+
+```
+$ grep -c "00018df4:" /tmp/guest-trace.log   # PhysSubPageCopy entry
+0
+$ grep -cE "0015b8e[048]" /tmp/guest-trace.log  # inner loop body
+0
+```
+
+Instead, `CopyPhysicalPage` enters at `0x15b8a4`, runs its outer
+loop 4×, and each iteration falls through via:
+
+```
+0x15b8c0: LDR r2, [r11, #-0x2c]      ; r2 = subpage-to-copy bitmap
+0x15b8c4: LSR r0, r2, r7             ; shift by subpage index r7
+0x15b8c8: TST r0, #1                 ; test bit 0
+0x15b8cc: BEQ 0x15b8fc               ; ← ALWAYS TAKEN
+0x15b8fc: ADD r7, r7, #1             ; next iter without copying
+```
+
+The bitmap at `[r11, #-0x2c]` is the saved-r2 slot from
+`CopyPhysicalPage`'s own prologue; r2 was the 3rd parameter supplied
+by `CopyPagesAfterStackCollided` via:
+
+```
+0x1f7658: ldr r2, [sp, #0x10]   ; bitmap from the params struct
+0x1f7668: bl 0x1af5ac8          ; → CopyPhysicalPage
+```
+
+The value that `0x1f7658` loads traces back to the
+`TCopyPageAfterStackCollisionParams` struct's fields 0x1c / 0x14
+copied to sp by the prologue at `0x1f7568..0x1f7578`.
+
+Tarmac confirms `0x0401b03e` appears at L2[0x10] of table
+`0x04023800` (= VA `0x0c310xxx`) AND at L2[0x18] (= VA `0x0c318xxx`)
+— both aliasing to the same PA. So the kernel DID set up two VA
+windows into PA `0x0401b000` (the "new" page aliased via a scratch
+VA before the remap), but no data ever arrived there because the
+subpage bitmap is zero.
+
+**Next-session concrete leads:**
+
+1. Dump the `TCopyPageAfterStackCollisionParams` struct at entry to
+   `CopyPagesAfterStackCollided` — log `[r1+0x00..0x28]` from EL2
+   on the first SVC-entry at `0x1f7540`. The field at 0x1c is
+   the observed-zero bitmap.
+2. Who populates that field? Trace back to `CopyPageAfterCollisionSWI`
+   at `0x1f796c` (the SWI trampoline) and its caller —
+   `SafeUserRequestEntry__13TStackManager` at `0x1f779c`, request
+   code dispatch at `0x1f77e8`. Candidate request slots branch to
+   `FMCopyPagesAfterStackCollided__13TStackManager` (not in the
+   dumped table above; grep `classify-out/code-symbols.txt`).
+3. If the request dispatch is emitting a zero bitmap, check whether
+   a preceding shadow-stub-emulated byte access (e.g., the
+   `ldrb r0, [r4, #0x26]` at `0x1f7578` or `[r4, #0x24]` at
+   `0x1f75a8`) is returning 0 where it should return non-zero —
+   that would gate whether the kernel goes into the copy-needed or
+   copy-not-needed branch.
+4. Less likely but possible: the bitmap is legitimately zero because
+   the kernel tracks sub-page dirtiness, and on Einstein the dirty
+   tracking gets set by some path we don't run. Compare to Einstein
+   via probe — e.g., instrument the probe to log `CopyPhysicalPage`
+   entries with (r0, r1, r2) and see whether Einstein's bitmap is
+   non-zero at the equivalent call.
+
+Original prior-session candidates retained below (largely superseded
+by the above, but kept for completeness):
+
+- `fix_stage1_xn_bits` L2-rewrite mask — ruled out: we strip TEX bits
+  but nG is 0 in both kernel's and our rewrite, so TLB semantics are
+  unaffected. The L2 rewrite happens correctly (`0x0401b0ce` →
+  `0x0401b03e`, PA preserved).
+- D-cache coherence around MMU-off STR — ruled out: HCR_EL2.DC=1 is
+  set on M=1→0 and the direct-PA store of `0x0401b0ce` to
+  `0x04023840` is captured by tarmac, so the write path itself is
+  coherent. The *missing* path is the sub-page copy that would
+  populate PA `0x0401b000`.
 
 Repro / tracing tools:
 

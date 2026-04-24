@@ -17,6 +17,7 @@ mod rom_patches;
 mod shadow_stub;
 mod snapshot;
 mod stage2;
+mod tarmac;
 mod timer;
 #[cfg(feature = "trace")]
 mod tracer;

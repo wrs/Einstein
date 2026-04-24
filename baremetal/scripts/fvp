@@ -24,6 +24,12 @@ FVP_BIN=/tmp/cca-stack/Base_RevC_AEMvA_pkg/models/Linux64_armv8l_GCC-9.3/FVP_Bas
 
 gdb=0
 tarmac=""
+# --tarmac-window enables the plugin but starts with tracing DISABLED.
+# The hypervisor's src/tarmac.rs emits `<<TRM_START>>` / `<<TRM_STOP>>`
+# on UART; bp.pl011_uart0.toggle_mti toggles TarmacTrace on/off when
+# those tokens appear. Useful for capturing a focused slice around a
+# Phase B stall rather than a 10+ GiB full-boot trace.
+tarmac_window=""
 # FVP runs the generic timer and cache model accurately, so long-running
 # memory operations (e.g. the hypervisor zeroing ~28 MiB of BSS) can
 # take tens of seconds of wall time — much longer than the equivalent
@@ -33,11 +39,13 @@ timeout_secs=300
 elf=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --gdb)           gdb=1; shift ;;
-        --tarmac)        tarmac="/work/baremetal/tarmac.log"; shift ;;
-        --tarmac=*)      tarmac="${1#--tarmac=}"; shift ;;
-        --timeout=*)     timeout_secs="${1#--timeout=}"; shift ;;
-        --image=*)       IMAGE="${1#--image=}"; shift ;;
+        --gdb)                  gdb=1; shift ;;
+        --tarmac)               tarmac="/work/baremetal/tarmac.log"; shift ;;
+        --tarmac=*)             tarmac="${1#--tarmac=}"; shift ;;
+        --tarmac-window)        tarmac_window="/work/baremetal/tarmac-window.log"; shift ;;
+        --tarmac-window=*)      tarmac_window="${1#--tarmac-window=}"; shift ;;
+        --timeout=*)            timeout_secs="${1#--timeout=}"; shift ;;
+        --image=*)              IMAGE="${1#--image=}"; shift ;;
         -h|--help)
             sed -n '3,/^set -e/p' "$0" | sed -n '1,/^set -e/p' | head -n -1 | sed 's/^# \{0,1\}//'
             exit 0
@@ -47,6 +55,11 @@ while [[ $# -gt 0 ]]; do
         *)  elf="$1"; shift ;;
     esac
 done
+
+if [[ -n "$tarmac" && -n "$tarmac_window" ]]; then
+    echo "$0: --tarmac and --tarmac-window are mutually exclusive" >&2
+    exit 2
+fi
 
 if [[ -z "$elf" ]]; then
     echo "usage: $0 [--gdb] [--timeout=N] <elf>" >&2
@@ -140,6 +153,40 @@ if [[ -n "$tarmac" ]]; then
         -C "TRACE.TarmacTrace.trace_dap=0"
     )
     echo "[fvp] TarmacTrace -> $tarmac (filtered: insn+events+cp15)" >&2
+fi
+
+# TarmacTrace with UART-token-gated windowing. Plugin is loaded but
+# tracing is OFF until the hypervisor emits `<<TRM_START>>` on UART0,
+# and resumes OFF again on `<<TRM_STOP>>`. Paired with src/tarmac.rs
+# which emits those markers around the stall site currently being
+# investigated.
+if [[ -n "$tarmac_window" ]]; then
+    plugin="/tmp/cca-stack/Base_RevC_AEMvA_pkg/plugins/Linux64_armv8l_GCC-9.3/TarmacTrace.so"
+    if [[ "$tarmac_window" = "$mount_root"/* ]]; then
+        rel_tarmac="/work/${tarmac_window#$mount_root/}"
+    else
+        rel_tarmac="$tarmac_window"
+    fi
+    # JSON for toggle_mti: tracing is OFF at boot because start_substr
+    # is supplied (see `-C bp.pl011_uart0.toggle_mti=help`).
+    toggle_json='{"start_substr":"<<TRM_START>>","stop_substr":"<<TRM_STOP>>","units":["TarmacTrace"],"required":"true"}'
+    # LS tracing is ON for the windowed variant — the typical use case
+    # is "something corrupted memory at address X, find the writer."
+    # Filtering load/stores makes that impossible; keep the window tight
+    # via toggle_mti instead.
+    fvp_args+=(
+        --plugin "$plugin"
+        -C "TRACE.TarmacTrace.trace-file=$rel_tarmac"
+        -C "TRACE.TarmacTrace.trace_loads_stores=1"
+        -C "TRACE.TarmacTrace.trace_cache=0"
+        -C "TRACE.TarmacTrace.trace_mmu=0"
+        -C "TRACE.TarmacTrace.trace_vfp=0"
+        -C "TRACE.TarmacTrace.trace_gicv3=0"
+        -C "TRACE.TarmacTrace.trace_dap=0"
+        -C "bp.pl011_uart0.toggle_mti=$toggle_json"
+    )
+    echo "[fvp] TarmacTrace (windowed, with loads/stores) -> $tarmac_window" >&2
+    echo "[fvp]   start=<<TRM_START>>  stop=<<TRM_STOP>>" >&2
 fi
 
 # Forward any FVP_EXTRA argument string as additional -C params.

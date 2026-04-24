@@ -3,6 +3,8 @@ Cargo.lock.bak
 *.img
 scripts/classify-out/*
 scripts/disasm-out/*
+tarmac.log
+tarmac-window.log
 
 # Newton ROMs are not redistributable. Each developer places their own dump
 # under roms/; the directory itself is tracked (for the README) but all

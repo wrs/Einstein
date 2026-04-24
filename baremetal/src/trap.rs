@@ -148,6 +148,7 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
             n, elr, spsr, vic::raised()
         );
     }
+    crate::tarmac::maybe_emit_start(n);
 }
 
 /// Asynchronous IRQ taken at EL2. On this target the only physical IRQ
@@ -875,6 +876,19 @@ fn handle_und(ctx: &mut TrapContext) {
         {
             handle_poweroff_reboot(ctx);
         }
+        // BootOS / ROMBoot canary (rom_patches::BOOTOS_PC = 0x0001_8688).
+        // The initial hypervisor-ERET lands here in SVC mode (HVC traps
+        // normally to EL2). Any later entry from USR mode is a software
+        // reset reached via a task branching to the reset vector — HVC
+        // from EL0 is UNDEFINED and arrives here instead of handle_hvc.
+        // Route into the same handler so the canary's "2nd+ entry →
+        // halt" logic applies regardless of the source mode.
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::BOOTOS_HVC_IMM)
+            && faulting_pc == crate::rom_patches::BOOTOS_PC =>
+        {
+            handle_bootos_canary(ctx);
+            return;
+        }
         // User-driven guest software breakpoint — must be checked
         // before the tracer path because the marker encoding
         // (UDF #0xFFFE) is also a UDF-shape instruction. See
@@ -1169,6 +1183,10 @@ fn handle_bootos_canary(ctx: &mut TrapContext) {
     }
 
     // Second+ entry — software reset.
+    // Stop the tarmac-window capture before any further EL2 work runs
+    // (the halt message itself will appear in the trace if we emit the
+    // stop AFTER the `*** BootOS canary fired ...` line).
+    crate::tarmac::emit_stop();
     let spsr_el2 = read_sysreg!("spsr_el2");
     let elr_el2 = read_sysreg!("elr_el2");
     let mode = (spsr_el2 & 0x1F) as u32;
@@ -1751,19 +1769,41 @@ fn emulate_swp(ctx: &mut TrapContext, insn: u32, faulting_pc: u32) {
         cpu::halt();
     }
 
-    let addr = ctx.x[rn] as u32;
+    let va = ctx.x[rn] as u32;
     let new_value = ctx.x[rm] as u32;
+
+    // The SWP target is a VA when the guest stage-1 MMU is on — the only
+    // in-ROM SWP site is `Swap` at PC 0x3ae204, reached from kernel code
+    // that hands us user/kernel VAs (e.g. 0x0c1xxxxx, which stage-1
+    // remaps into RAM per TMemoryConsts). Pre-MMU it's identity and we
+    // can feed `va` straight through.
+    let addr = match resolve_guest_pa(va) {
+        Some(pa) => pa,
+        None => {
+            kprintln!(
+                "*** SWP{} [r{}]={:#x} — stage-1 translation failed at PC={:#x}",
+                if is_byte { "B" } else { "" }, rn, va, faulting_pc
+            );
+            cpu::halt();
+        }
+    };
 
     if is_byte {
         let old = match read_guest_byte_pa(addr) {
             Some(v) => v,
             None => {
-                kprintln!("*** SWPB [r{}]={:#x} — address not writable", rn, addr);
+                kprintln!(
+                    "*** SWPB [r{}]={:#x} (PA={:#x}) — address not readable",
+                    rn, va, addr
+                );
                 cpu::halt();
             }
         };
         if !write_guest_byte_pa(addr, new_value as u8) {
-            kprintln!("*** SWPB [r{}]={:#x} — address not writable", rn, addr);
+            kprintln!(
+                "*** SWPB [r{}]={:#x} (PA={:#x}) — address not writable",
+                rn, va, addr
+            );
             cpu::halt();
         }
         ctx.x[rd] = old as u64;
@@ -1771,24 +1811,51 @@ fn emulate_swp(ctx: &mut TrapContext, insn: u32, faulting_pc: u32) {
         if addr & 3 != 0 {
             kprintln!(
                 "*** SWP with unaligned address r{}={:#x} (ignored, guest may fault)",
-                rn, addr
+                rn, va
             );
         }
         let old = match read_guest_word_pa(addr) {
             Some(v) => v,
             None => {
-                kprintln!("*** SWP [r{}]={:#x} — address not readable", rn, addr);
+                kprintln!(
+                    "*** SWP [r{}]={:#x} (PA={:#x}) — address not readable",
+                    rn, va, addr
+                );
                 cpu::halt();
             }
         };
         if !write_guest_word_pa(addr, new_value) {
-            kprintln!("*** SWP [r{}]={:#x} — address not writable", rn, addr);
+            kprintln!(
+                "*** SWP [r{}]={:#x} (PA={:#x}) — address not writable",
+                rn, va, addr
+            );
             cpu::halt();
         }
         ctx.x[rd] = old as u64;
     }
 
     log_swp_budgeted(faulting_pc, is_byte, rn, rd, rm, addr);
+}
+
+/// Resolve a guest address as seen by an AArch32 load/store instruction
+/// into a guest PA. Identity when the stage-1 MMU is off (SCTLR_EL1.M=0);
+/// stage-1 walk otherwise. Returns `None` only when the MMU is on and
+/// the VA is unmapped.
+fn resolve_guest_pa(addr: u32) -> Option<u32> {
+    let sctlr: u64;
+    // SAFETY: SCTLR_EL1 read has no side effects.
+    unsafe {
+        core::arch::asm!(
+            "mrs {}, sctlr_el1",
+            out(reg) sctlr,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    if sctlr & 1 == 0 {
+        Some(addr)
+    } else {
+        guest_mem::translate_va(addr)
+    }
 }
 
 /// UND-path return. Must NOT use `return_to_guest` — that calls

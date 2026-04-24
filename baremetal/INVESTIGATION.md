@@ -3,6 +3,103 @@
 Live notes. Update as we learn more; archive to a dated file when
 we move past the current stall.
 
+## Currently at — BootOS canary entry #2 → soft-reset via stale task frame (FVP + QEMU, 2026-04-23)
+
+Boot advances past the SWP-VA-translation and FPA fixes (see below)
+and reaches beacon trap ~620 000 before the canary fires. The canary
+halts on a second entry to `BootOS` from **USR mode** (HVC #0x44 at
+PC 0x18688 → UND since HVC is UNDEFINED at EL0 — we now route the USR-
+mode canary path through `handle_bootos_canary` via `handle_und`).
+
+Root-cause chain (reconstructed from FVP TarmacTrace window around
+the reset):
+
+1. User task calls `TUMonitor::Init` at 0x2594b4. Local stack frame
+   set up at `sp = 0x0c31030c`; `MakeObject(8, sp, 36, …)` invoked
+   via jump-table `BL 0x1bd6b64 → B 0x2595b4`.
+
+2. `MakeObject` prologue pushes `{r4, r5, r6, fp, ip, lr, pc}` at
+   0x2595b8. Trace confirms `R r14_usr = 0x2594fc` at BL time; the
+   push stores it at `[0x0c310304]` (saved LR slot). The body runs
+   through shadow-stub emulation of `LDRB r0, [r0, #4]` at 0x2595c8,
+   calls `MonitorDispatchSWI` (SVC #0x1b) at 0x2595fc.
+
+3. Deep inside the SWI handler, the kernel executes
+   `StoreToPhysAddress` at 0x18ce0 to rewrite an L2 page-table entry
+   *with stage-1 MMU disabled*:
+   - 0x18d0c: `MCR p15, 0, r2, c1, c1, 0` (SCTLR ← 0x1100|0xb0, M=0)
+   - 0x18d10: `STR r1, [r0]` writes `r1=0x0401b0ce` to `r0=0x04023840`
+     (the L2 entry covering VA `0x0c310000..0x0c311000`)
+   - 0x18d14: `MCR p15, 0, r3, c1, c1, 0` (SCTLR ← with M=1 again)
+
+   This **remaps VA 0x0c310xxx from PA 0x04026000 → PA 0x0401b000**.
+   The old PA still holds the task's stack contents (saved LR=
+   0x2594fc at offset 0x304) but is no longer mapped. The new PA is
+   a fresh page that's zero at offset 0x304.
+
+4. Kernel returns via SWIBoot epilog `MOVS pc, lr` at 0x3ada6c to
+   USR mode, resuming inside `MakeObject` at 0x259600 with the
+   task's saved registers (`r11=0x0c310308`, `sp_usr=0x0c3102f0`).
+
+5. `MakeObject`'s epilogue at 0x25961c executes
+   `LDMDB r11, {r4-r6, r11, sp, pc}`: tarmac shows
+   `MR4 0c310304 00000000` (reads 0 because VA→PA now hits the fresh
+   new page), `R pc 00000000`. Guest executes the reset vector
+   `B 0x18688` at VA 0, lands in USR mode at `BootOS` — canary #2.
+
+Einstein's probe hits the same SCTLR-off/on pattern 56 165 times
+(`MCR p15, 0, r0, c1, c1, 0` at first_pc=0x18690), so the kernel's
+`StoreToPhysAddress` path is normal behaviour, **not** a hypervisor-
+induced stall. Einstein boots through it; we don't. The divergence
+is somewhere else — either:
+
+- The task being resumed is *not* the same task that entered
+  `MakeObject` (a context switch happened mid-SWI). Our hypervisor
+  restores the registers correctly but the VA→PA mapping under
+  those register values changed, so the resume reads garbage. This
+  matches what tarmac shows.
+- Or the kernel expected to initialise the new page at PA 0x0401b000
+  with valid stack contents (copy from old PA?) before the remap,
+  and our hypervisor silently broke that sequence. But no direct
+  writes to 0x0401b[0-3]xx appear in the window after the remap.
+
+Still open: why doesn't Einstein hit this, and what should the
+hypervisor do differently? Candidate investigations:
+
+- Trace through multiple `MakeObject` invocations — see whether the
+  remap always happens on this path, or only under specific
+  conditions (e.g., only when creating the Nth monitor).
+- Check if there's a stage-1 attribute we're stripping
+  (`fix_stage1_xn_bits` L2-rewrite mask `0xFFFF_F000 | 0x003E`)
+  that the kernel's remap relies on — e.g., if the kernel set a
+  non-global (nG) bit and our rewrite clears it, TLB semantics
+  could differ.
+- Look for a missing cache-maintenance op: the kernel writes the
+  L2 entry with MMU off (walks through DC=1 attributes on our
+  side). Subsequent guest accesses through stage-1 may see stale
+  cached values.
+
+Repro / tracing tools:
+
+```bash
+# Windowed tarmac around the reset (1.5 GiB file, ~10M lines).
+rm -f /tmp/newton-snapshot-*.bin tarmac-window.log
+scripts/fvp --tarmac-window \
+  target/aarch64-unknown-none-softfloat/release/newton-hypervisor
+
+# Guest-mode only slice.
+awk '!/EL2h_n/' tarmac-window.log > /tmp/guest-trace.log
+# Writes to MakeObject's saved-LR slot:
+awk '/MW. 0c310304/' /tmp/guest-trace.log
+# L2-entry updates for VA 0x0c310xxx:
+awk '/MW. 04023840/' tarmac-window.log
+```
+
+`src/tarmac.rs` emits `<<TRM_START>>` when TRAP_COUNTER crosses
+`START_AT_TRAP = 619_900` and `<<TRM_STOP>>` from the canary halt
+path; `scripts/fvp --tarmac-window` gates the TarmacTrace plugin on
+those UART tokens via `bp.pl011_uart0.toggle_mti`.
+
 ## Resolved — FPA CP1 rfc/wfc at 0x392718 (FVP, 2026-04-23)
 
 `FPE_Install` at `0x3928A0` calls a helper at `0x392704` that

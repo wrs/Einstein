@@ -3,12 +3,121 @@
 Live notes. Update as we learn more; remove old updates as we move on to
 new stalls.
 
-## Currently at — STKU wedge persists post banked-reg fix (QEMU, 2026-04-26)
+## Currently at — kernel-mode "newt" UnhandledException (QEMU + FVP, 2026-04-26)
 
-Re-ran the fresh-cold-boot trace after the banked-register handling
-overhaul (commit `mz` 21497bd6 + merge-resolution `xn`). Result confirms
-the prior wedge diagnosis is still real — the banked-reg work did not
-unstick the STKU page-copy SWI on QEMU.
+After resolving the STKU wedge (see "Resolved — STKU wedge: QEMU
+Bug #1 leak from unaligned `msr spsr_el2`" below), QEMU now reaches
+the same `0x6e657774` ("newt" ASCII) recursive kernel-mode DABT that
+FVP has hit since Apr 24 — both platforms now agree.
+
+A fresh cold-boot QEMU trace runs to ~213k entries with **1262
+unique functions** (vs. ~1087 / 156k pre-fix), advances `gCurrentTask`
+past STKU → cdsv → and into `Throw`/`UnhandledException` /
+`Subexception` / `__vfprintf` user-mode reporting code. The trace
+ends with the Reboot canary firing at IPA 0x00FFFF58, mode UND:
+
+```
+trace 213650 0x00393114 DataAbortHandler (abt) ... lr=0x003ae240
+trace 213652 0x0011fc60 FaultMonitorEntry(unsigned long) (abt) ...
+trace 213657 0x00250864 RebootIfFaultWasInStack (abt) r0=0x6e657774 ...
+trace 213658 0x000b00c8 Throw (usr) r0=0x000afda0 r1=0x6e657774 ...
+trace 213663 0x000b0220 UnhandledException(char *, ...) (usr) ...
+putc 213671..213722: "Unhandled exception evt.ex.abt.bus, warm reboot!"
+```
+
+Decode (from the prior FVP-side finding still applies verbatim):
+
+- Faulting PC = `LR_abt - 8 = 0x259d40` = `ldr r0, [r0]` in
+  `TUPort::Receive` (just before `bl PortReceiveSWI` at `0x259d44`).
+- Faulting VA = `0x6e657774` = "newt" ASCII — `r0` was loaded from
+  `[fp, #4]` (caller's saved arg0 = `self`) and dereferenced. The
+  TUPort `self` pointer is occupying "newt" ASCII bytes.
+- mode=0x17 (ABT) → recursive abort: kernel was inside its DABT
+  handler when the next access faulted.
+
+Pre-failure path now passes through `cdsv` task initialisation
+(`SwapInGlobals 0xc118dd8 → 0x00393114 DataAbortHandler` at trace
+213649/213650), which means the cdsv task struct itself contains
+"newt" ASCII at the offset that `TUPort::Receive` dereferences. This
+is the same Apr 24 finding from the QEMU run that briefly
+"transient-cleared" before the regression we just resolved hid it.
+
+### Open next steps
+
+1. Read the saved `cdsv` task struct at `0xc118dd8` — specifically
+   the per-task-globals area at `task+0xa0` and the TUPort field that
+   `TUPort::Receive` reads — to identify which slot holds the "newt"
+   ASCII bytes.
+2. Find which symbol-table entry holds the literal `0x6e657774`
+   pattern (per Apr 24 hypothesis: a runtime symbol-name lookup
+   returned a name string instead of a code/data pointer). The
+   symbol prefixes `newtConnects`, `SYMnewtaboutview`, `SYMnewtinfobox`
+   are candidates.
+3. Walk back from the SwapInGlobals at trace 213649 in the function
+   trace to find what *created* the cdsv task and what it intended to
+   pass as the TUPort `self`. The corruption could be the kernel
+   storing the symbol name into a pointer slot (off-by-one in a
+   shared-memory layout), or our hypervisor mishandling a prior
+   write to that slot (symbol-table region or RAM page alias).
+
+## Resolved — STKU wedge: QEMU Bug #1 leak from unaligned `msr spsr_el2` (2026-04-26)
+
+The STKU page-copy SWI wedge (PC=0x3ae1bc / SVC mode, persistent for
+several minutes) was caused by **QEMU Bug #1** triggered from
+`unaligned::set_return`. The fix is in `src/unaligned.rs::set_return`:
+delegate to `trap::return_to_guest_from_und`, which ERETs into the
+existing `UND_RETURN_STUB` at IPA `0x00FFFFE4` while leaving SPSR_EL2
+untouched. The mode switch happens AArch32-side via `movs pc, lr` and
+never goes through QEMU's buggy MSR helper.
+
+### Root cause
+
+The Newton ROM has ~1300 sites that depend on SA-1100 rotate-LDR
+semantics for unaligned word loads (`UstrlenPrivate` at 0x1944b8
+alone fires a fault on every other call — UTF-16 strings are 2-byte
+aligned). With `SCTLR_EL1.A` forced on, each unaligned LDR raises an
+alignment fault that the DABT-vector trampoline forwards to EL2 via
+`HVC #ALIGN_TAG`. `handle_align_fault` decodes and emulates the
+load, then called `set_return` to `msr elr_el2 / msr spsr_el2` and
+ERET back to the pre-fault mode.
+
+Per `docs/QEMU_BUGS.md` Bug #1, **`msr spsr_el2, x` from EL2 leaks
+`x` into AArch32 SPSR_svc (banked_spsr[1])**. A direct probe
+(`mrs spsr_el1` before/after the buggy write) confirmed the leak:
+
+```
+qemu-clobber-probe[4]: SPSR_EL1 pre=0x000001d3 post=0x000001d3 (wrote spsr_el2=0x200001d3)
+qemu-clobber-probe[5]: SPSR_EL1 pre=0x200001d3 post=0x200001d3 (wrote spsr_el2=0x600001d3)
+qemu-clobber-probe[6]: SPSR_EL1 pre=0x600001d3 post=0x600001d3 (wrote spsr_el2=0x800001d3)
+```
+
+(Each pre value matches the previous probe's wrote-value — the leak
+is exact.) Pre-fault mode at every observed alignment fault was
+0x1d3 = SVC, so SPSR_svc was being clobbered to a SVC-mode value
+during the kernel's SVC handler. When the SVC handler eventually ran
+its `movs pc, lr` epilogue (at 0x3ada6c / 0x3adb10 in `SWIBoot`),
+CPSR was restored from the corrupted SPSR_svc → CPSR=SVC instead of
+USR. The post-`svc #5` `mov pc, lr` at GenericSWI 0x3ae1bc then
+self-looped because LR_svc = 0x3ae1bc and the instruction is the
+non-mode-restoring form (no `s` suffix).
+
+### Why FVP got past it before
+
+FVP doesn't have Bug #1 — the AArch64 banked-SPSR helper handles
+SPSR_EL2 writes correctly. So FVP's STKU iteration completed
+normally and it advanced to cdsv → newt-exception. QEMU stuck at
+STKU because every unaligned access during the SVC handler corrupted
+SPSR_svc.
+
+### Verification
+
+- All 23 guest tests pass (no regression).
+- Cold-boot QEMU trace: 213k entries / 1262 unique functions,
+  task_dump shows `curr=0xc11b2c0` (cdsv) past the STKU state.
+- Trajectory now matches FVP (both reach the "newt"
+  UnhandledException as the next stall).
+
+## Resolved (was) — wedge isolated to STKU monitor task body (QEMU, 2026-04-25 night)
 
 ### Pre-flight: restored DABT→kernel forward fast-path
 

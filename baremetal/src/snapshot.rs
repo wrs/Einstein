@@ -129,7 +129,18 @@ fn read_all(h: &FileHandle, buf: &mut [u8]) -> Result<(), &'static str> {
 const MAGIC: u64 = 0x0150_414E_5348_4E00;
 /// Bump whenever the Header layout changes. Old snapshot files get
 /// rejected loudly by `peek_seq` / `load`.
-const VERSION: u32 = 2;
+///
+/// v3: replaced the 15-entry `gprs` array with the full 31-entry
+/// AArch64 GPR view (`x0..x30`). At AArch32→AArch64 exception entry
+/// the AArch64 GPR file aliases AArch32 banked registers per ARM ARM
+/// DDI 0487 D1.21.1 Table D1-79, so capturing all 31 X registers
+/// preserves R0..R12 and the per-mode banked SP/LR (USR/SVC/ABT/UND/
+/// IRQ/FIQ) without any AArch32-side stash dance. Removed the
+/// `sp_el0 / sp_el1 / elr_el1` fields: those are AArch64-only EL0/EL1
+/// special-purpose registers with **no** architectural alias to any
+/// AArch32 banked R13/R14, so writing them at restore did nothing
+/// useful for an AArch32 guest.
+const VERSION: u32 = 3;
 
 /// Number of rolling slots. Each slot is ~14 MiB, so four slots cost
 /// ~56 MiB of host disk and give the user three save windows of
@@ -161,7 +172,23 @@ struct Header {
 
     saved_pc: u32,
     saved_cpsr: u32,
-    gprs: [u32; 15],
+
+    /// AArch64 GPRs x0..x30 captured at save time. Per Table D1-79
+    /// these alias AArch32 banked registers by bank name:
+    ///   gprs[0..7]     = R0..R7            (always shared)
+    ///   gprs[8..12]    = R8_usr..R12_usr   (= R8..R12 in non-FIQ modes)
+    ///   gprs[13]       = SP_usr            gprs[14]       = LR_usr
+    ///   gprs[15]       = SP_hyp            (unused — guest is at EL1)
+    ///   gprs[16]       = LR_irq            gprs[17]       = SP_irq
+    ///   gprs[18]       = LR_svc            gprs[19]       = SP_svc
+    ///   gprs[20]       = LR_abt            gprs[21]       = SP_abt
+    ///   gprs[22]       = LR_und            gprs[23]       = SP_und
+    ///   gprs[24..28]   = R8_fiq..R12_fiq
+    ///   gprs[29]       = SP_fiq            gprs[30]       = LR_fiq
+    /// Per Table D1-85, the upper 32 bits of x16..x30 on AArch32→
+    /// AArch64 exception entry are CONSTRAINED UNPREDICTABLE — we
+    /// truncate to u32.
+    gprs: [u32; 31],
 
     sctlr_el1: u32,
     ttbr0_el1: u64,
@@ -172,19 +199,10 @@ struct Header {
     cpacr_el1: u64,
     mair_el1: u64,
 
-    /// AArch32 banked SP / LR exposed via named AArch64 sysregs.
-    /// Required because AArch64 ERET to AArch32 does NOT propagate
-    /// x13 / x14 into the target mode's banked R13 / R14 slot, so
-    /// the guest needs these staged in the banked sysreg before we
-    /// return control.
-    ///
-    /// - SP_EL0   aliases AArch32 R13_usr / R13_sys.
-    /// - SP_EL1   aliases AArch32 R13_svc.
-    /// - ELR_EL1  aliases AArch32 R14_svc when running AArch32 at EL1.
-    sp_el0: u64,
-    sp_el1: u64,
-    elr_el1: u64,
-
+    /// SPSR_<mode> banked sysregs (AArch64-named, accessible via
+    /// `mrs/msr spsr_abt` etc.). SPSR_svc is the AArch64 SPSR_EL1
+    /// alias (DDI 0487 D13.2 — SPSR_EL1 bits[31:0] are architecturally
+    /// mapped to AArch32 SPSR_svc).
     spsr_svc: u32,
     spsr_abt: u32,
     spsr_und: u32,
@@ -277,11 +295,9 @@ pub fn maybe_autosave(ctx: &TrapContext) {
         kprintln!("snapshot: autosave resumed — no guest_bp active");
     }
 
-    // Gate autosaves when the guest state at the moment of the IRQ
-    // is one we can't faithfully restore. Two reasons a given IRQ
-    // may be a bad moment to snapshot:
-    //
-    // 1. Guest PC inside a hypervisor-owned transient region.
+    // Gate autosaves when the guest PC is inside a hypervisor-owned
+    // transient region whose correct execution depends on hidden
+    // scratch state (TPIDRURW, RAM stash slots, staged ERET PC).
     //
     //    - Tracer trampoline pool (0x00900000..0x00E00000): each slot
     //      HVCs, ERETs to the original first instruction, then chains
@@ -290,44 +306,29 @@ pub fn maybe_autosave(ctx: &TrapContext) {
     //      a resume ERETs back there without the HVC-side state the
     //      slot was written to assume.
     //
-    //    - Hypervisor ROM tail 0x00FFFF00..0x01000000: UND
-    //      trampoline, SBA post-emulation trampoline, DABT-bounce
-    //      trampoline, and the UND return stub. These depend on
-    //      TPIDRURW scratch, RAM save slots (0x04005F00 region), and
-    //      banked-mode SP/LR that we stage immediately before ERET.
-    //      A snapshot taken with the guest PC inside any of them
-    //      captures the target PC but not the staged state.
+    //    - Hypervisor ROM tail 0x00FFFF00..0x01000000: UND trampoline,
+    //      SBA post-emulation trampoline, DABT-bounce trampoline, UND
+    //      return stub. These depend on TPIDRURW scratch and RAM save
+    //      slots staged immediately before ERET.
     //
-    // 2. Guest mode is one of the exception modes (IRQ / FIQ / ABT /
-    //    UND). These modes have private banked SP/LR, and QEMU
-    //    raspi3b's AArch32↔AArch64 banked-register plumbing is flaky
-    //    (see CLAUDE.md "QEMU banked-register caveat"): ctx.x[13] /
-    //    x[14] at EL2 trap entry aren't reliable aliases, and ERET
-    //    from EL2 doesn't reliably propagate x13 / x14 back into the
-    //    banked slot of the target mode. SVC and USR/SYS are safe
-    //    enough in practice — the kernel runs the overwhelming
-    //    majority of time in SVC, and the exception-mode window is
-    //    short.
+    // Banked SP/LR for non-USR modes are NOT a reason to skip: the
+    // trap context already captures all 31 X registers, which alias
+    // every AArch32 banked R8..R14 per Table D1-79.
     //
     // Skipping here costs nothing: the bad moments are transient
     // (microseconds), and the next IRQ (≤16 ms later) retries and
     // almost always finds a stable state. LAST_SAVE_TICKS is NOT
     // updated on a skip, so net autosave cadence stays ~2 s.
     let guest_pc = read_sysreg64("elr_el2") as u32;
-    let guest_cpsr = read_sysreg64("spsr_el2") as u32;
-    if pc_in_hypervisor_transient_region(guest_pc)
-        || cpsr_mode_is_unrestorable(guest_cpsr)
-    {
+    if pc_in_hypervisor_transient_region(guest_pc) {
         return;
     }
 
     // Either first save, or enough wall-clock has passed.
-    let gprs: [u64; 15] = [
-        ctx.x[0],  ctx.x[1],  ctx.x[2],  ctx.x[3],
-        ctx.x[4],  ctx.x[5],  ctx.x[6],  ctx.x[7],
-        ctx.x[8],  ctx.x[9],  ctx.x[10], ctx.x[11],
-        ctx.x[12], ctx.x[13], ctx.x[14],
-    ];
+    let mut gprs = [0u64; 31];
+    for i in 0..31 {
+        gprs[i] = ctx.x[i];
+    }
     if save(&gprs).is_ok() {
         LAST_SAVE_TICKS.store(now, Ordering::Relaxed);
     }
@@ -360,27 +361,14 @@ fn pc_in_hypervisor_transient_region(pc: u32) -> bool {
     false
 }
 
-/// True if `cpsr`'s mode is an ARM exception mode whose banked SP / LR
-/// we can't faithfully capture or restore on QEMU raspi3b. ARM AArch32
-/// banks SP and LR per mode for IRQ / FIQ / ABT / UND; AArch64 at EL2
-/// does not expose those banked mnemonics as MRS-readable sysregs, and
-/// the EL2-visible x13 / x14 at trap entry aren't reliable aliases for
-/// the source mode's banked pair (see CLAUDE.md "QEMU banked-register
-/// caveat"). SVC (0x13) and USR/SYS (0x10 / 0x1F) share banked slots
-/// the hypervisor handles safely in practice.
-fn cpsr_mode_is_unrestorable(cpsr: u32) -> bool {
-    match cpsr & 0x1F {
-        0x11 | 0x12 | 0x17 | 0x1B => true,  // FIQ | IRQ | ABT | UND
-        _ => false,
-    }
-}
-
 /// Write a snapshot to the next ring slot. Called from periodic
 /// autosaves and from the HVC #0x20 handler.
 ///
-/// `gprs` must hold x0..x14 of the guest at save time; ELR_EL2 and
-/// SPSR_EL2 give the PC and CPSR to resume at.
-pub fn save(gprs: &[u64; 15]) -> Result<(), &'static str> {
+/// `gprs` must hold x0..x30 of the guest at save time (the AArch64
+/// view that aliases AArch32 R0..R12 and every banked SP/LR per
+/// Table D1-79); ELR_EL2 and SPSR_EL2 give the PC and CPSR to resume
+/// at.
+pub fn save(gprs: &[u64; 31]) -> Result<(), &'static str> {
     let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
     let slot = (seq as usize) % NUM_SLOTS;
     let path = SLOT_PATHS[slot];
@@ -437,9 +425,9 @@ pub fn save(gprs: &[u64; 15]) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn build_header(gprs_u64: &[u64; 15], seq: u64) -> Header {
-    let mut gprs = [0u32; 15];
-    for i in 0..15 {
+fn build_header(gprs_u64: &[u64; 31], seq: u64) -> Header {
+    let mut gprs = [0u32; 31];
+    for i in 0..31 {
         gprs[i] = gprs_u64[i] as u32;
     }
     Header {
@@ -457,9 +445,6 @@ fn build_header(gprs_u64: &[u64; 15], seq: u64) -> Header {
         vbar_el1: read_sysreg64("vbar_el1"),
         cpacr_el1: read_sysreg64("cpacr_el1"),
         mair_el1: read_sysreg64("mair_el1"),
-        sp_el0: read_sysreg64("sp_el0"),
-        sp_el1: read_sysreg64("sp_el1"),
-        elr_el1: read_sysreg64("elr_el1"),
         spsr_svc: read_sysreg64("spsr_svc") as u32,
         spsr_abt: read_sysreg64("spsr_abt") as u32,
         spsr_und: read_sysreg64("spsr_und") as u32,
@@ -519,7 +504,10 @@ fn rom_fingerprint() -> u32 {
 pub struct RestoreState {
     pub pc: u32,
     pub cpsr: u32,
-    pub gprs: [u32; 15],
+    /// Full AArch64 x0..x30 view; `eret_to_restored` writes these
+    /// back to the GPR file before ERET so AArch32 banked R0..R14
+    /// land in the right slot per Table D1-79.
+    pub gprs: [u32; 31],
 }
 
 /// Scan the ring for the slot with the highest `seq` and load it.
@@ -684,9 +672,10 @@ fn restore_sysregs(h: &Header) {
     write_sysreg64("vbar_el1", h.vbar_el1);
     write_sysreg64("cpacr_el1", h.cpacr_el1);
     write_sysreg64("mair_el1", h.mair_el1);
-    write_sysreg64("sp_el0", h.sp_el0);
-    write_sysreg64("sp_el1", h.sp_el1);
-    write_sysreg64("elr_el1", h.elr_el1);
+    // SP_EL0 / SP_EL1 / ELR_EL1 are AArch64-only EL0/EL1 registers
+    // with no architectural alias to AArch32 banked R13/R14. AArch32
+    // SP_usr / SP_svc / LR_svc are restored via the GPR file (x13,
+    // x19, x18) per Table D1-79 in `eret_to_restored`.
     write_sysreg64("spsr_svc", h.spsr_svc as u64);
     write_sysreg64("spsr_abt", h.spsr_abt as u64);
     write_sysreg64("spsr_und", h.spsr_und as u64);
@@ -739,11 +728,8 @@ fn read_sysreg64(reg: &'static str) -> u64 {
         "vbar_el1" => sr_reader!("vbar_el1"),
         "cpacr_el1" => sr_reader!("cpacr_el1"),
         "mair_el1" => sr_reader!("mair_el1"),
-        "sp_el0" => sr_reader!("sp_el0"),
-        "sp_el1" => sr_reader!("sp_el1"),
-        "elr_el1" => sr_reader!("elr_el1"),
-        // AArch32 SPSR_svc is the AArch64 SPSR_EL1 — a quirk of the
-        // AArch32/AArch64 view mapping. LLVM accepts spsr_el1.
+        // AArch32 SPSR_svc is architecturally mapped to AArch64
+        // SPSR_EL1 (DDI 0487 D13.2). Read via spsr_el1.
         "spsr_svc" => sr_reader!("spsr_el1"),
         "spsr_abt" => sr_reader!("spsr_abt"),
         "spsr_und" => sr_reader!("spsr_und"),
@@ -777,9 +763,6 @@ fn write_sysreg64(reg: &'static str, v: u64) {
         "vbar_el1" => sr_writer!("vbar_el1", v),
         "cpacr_el1" => sr_writer!("cpacr_el1", v),
         "mair_el1" => sr_writer!("mair_el1", v),
-        "sp_el0" => sr_writer!("sp_el0", v),
-        "sp_el1" => sr_writer!("sp_el1", v),
-        "elr_el1" => sr_writer!("elr_el1", v),
         "spsr_svc" => sr_writer!("spsr_el1", v),
         "spsr_abt" => sr_writer!("spsr_abt", v),
         "spsr_und" => sr_writer!("spsr_und", v),

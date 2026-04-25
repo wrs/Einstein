@@ -19,6 +19,7 @@ mod shadow_stub;
 mod snapshot;
 mod stage2;
 mod tarmac;
+mod task_dump;
 mod timer;
 #[cfg(feature = "trace")]
 mod tracer;

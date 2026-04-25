@@ -230,8 +230,49 @@ Implication for state inference:
 
 So our dump's "BLK" classification means **alive, not in any run
 queue, not in either of the two TDoubleQItem wait-links we know
-about** — most likely "blocked on a port", but we haven't yet
-identified the specific link.
+about**. The task is waiting on the *blocking object* — see "How
+ports track waiters" below.
+
+### How ports track waiters
+
+`TPort::Receive` at ROM `0x192330` reveals the port layout. When a
+port has no message ready and the receiver is allowed to block:
+
+```c
+struct TPort /* : TKernelObject */ {
+    // +0x00 / +0x04   id, hash-chain next  (TKernelObject base)
+    // +0x08..+0x0F    unknown
+    TDoubleQContainer  pending_messages;   // +0x10  msgs already sent
+                                           //        (length 20 B)
+    TDoubleQContainer  waiting_receivers;  // +0x24  TSharedMemMsg*'s
+                                           //        of blocked receivers
+};
+```
+
+Citations: `TPort::Receive` at `0x192330`:
+```
+add r0, r6, #16    ; r0 = port + 16 = pending-messages queue
+bl Peek/GetNext on TDoubleQContainer
+...
+add r0, r6, #36    ; r0 = port + 36 (=0x24) = receivers/waiters queue
+mov r1, r4         ; r1 = TSharedMemMsg* msg (the receiver token)
+bl Add__17TDoubleQContainerFPv
+```
+
+**Crucial:** the link in the waiter queue points to a
+`TSharedMemMsg`, **not** to the `TTask` itself. The msg presumably
+records the requesting task (some field within — TODO map). So
+"who's blocked on what" must be enumerated by walking ports and
+their waiter queues, then chasing each msg back to its owner task.
+
+To enumerate blocked tasks comprehensively from the hypervisor:
+1. Walk `gObjectTable` for `type=Port` (TODO: identify Port type bits
+   — it's neither 3, 8, nor 9; observe more types in trace).
+2. For each port, walk `port+0x24`'s TDoubleQContainer.
+3. Each entry is a `TSharedMemMsg` — read the owner-task field
+   (TODO: identify offset).
+
+Same pattern likely for semaphores / shared-mem.
 
 ### Observed task IDs and names (this run)
 

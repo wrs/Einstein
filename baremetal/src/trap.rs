@@ -213,9 +213,14 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     if should_log {
         let spsr = read_sysreg!("spsr_el2");
         let far = read_sysreg!("far_el1");
+        let hcr = read_sysreg!("hcr_el2");
+        let vi = (hcr >> 7) & 1;
+        let int_present = vic::int_present_raw();
+        let int_ctrl = vic::int_ctrl_raw();
+        let irq_pend = vic::irq_pending();
         kprintln!(
-            "timer_irq[{}]: guest ELR={:#x} SPSR={:#x} FAR_EL1={:#x} intid={}",
-            tag, elr, spsr, far, intid
+            "timer_irq[{}]: guest ELR={:#x} SPSR={:#x} FAR_EL1={:#x} intid={} VI={} int_present={:#x} int_ctrl={:#x} irq_pend={}",
+            tag, elr, spsr, far, intid, vi, int_present, int_ctrl, irq_pend
         );
     }
 

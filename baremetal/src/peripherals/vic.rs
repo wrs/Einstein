@@ -270,6 +270,20 @@ pub fn raised() -> u32 {
     s.int_present
 }
 
+/// Diagnostic: raw `int_present` register.
+pub fn int_present_raw() -> u32 {
+    // SAFETY: single-threaded.
+    let s = unsafe { &*VIC.0.get() };
+    s.int_present
+}
+
+/// Diagnostic: raw `int_ctrl` register (per-bit IRQ enable).
+pub fn int_ctrl_raw() -> u32 {
+    // SAFETY: single-threaded.
+    let s = unsafe { &*VIC.0.get() };
+    s.int_ctrl
+}
+
 // ---------- Hardware register addresses --------------------------------------
 // Mirroring the subset of TMemoryConsts.h relevant to early boot.
 

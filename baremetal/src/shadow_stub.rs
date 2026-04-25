@@ -620,6 +620,16 @@ enum BranchKind {
     /// the caller-observable registers (R0 return value, R4–R11
     /// callee-preserved, SP, LR); no other unwritten regs are live.
     Return,
+    /// Conditional APCS function return (`MOVNE pc, lr`,
+    /// `LDMDBNE fp, {…, pc}`, etc.). When the condition is true, the
+    /// instruction returns; when false, control falls through to PC+4.
+    /// The walker must merge live-sets from both paths or it will miss
+    /// reads that occur only on the fall-through (a real Newton ROM
+    /// motif: `MakeObject` at 0x2595c8 has a conditional ldmdbne
+    /// followed by `STR r1, …`/`STR r3, …` that the walker would
+    /// otherwise never see). Without this, the inline-stub picker
+    /// concludes those registers are dead and clobbers them.
+    CondReturn,
     /// Indirect branch with unknown target (BX register where we can't
     /// tell it's a return, function-pointer call, jump table, etc.).
     /// CFG stops; remaining unwritten regs conservatively live.
@@ -760,6 +770,12 @@ where R: Fn(u32) -> Option<u32> {
                 // APCS preserved state, so we can treat it as dead.
                 return true;
             }
+            BranchKind::CondReturn => {
+                // Conditional return: taken-path is dead (return),
+                // fall-through must be checked.
+                let fall = nzcv_dead_recursive(pc.wrapping_add(4), max_instrs, visited, read_insn);
+                return fall;
+            }
             BranchKind::Indirect | BranchKind::Unknown => return false,
         }
     }
@@ -804,7 +820,8 @@ fn analyze_insn(insn: u32, pc: u32) -> (RegMask, RegMask, BranchKind) {
         let rm = insn & 0xF;
         // BX LR is the standard APCS function return.
         if rm == 14 {
-            return (APCS_RETURN_LIVE, 0, BranchKind::Return);
+            let kind = if cond_al { BranchKind::Return } else { BranchKind::CondReturn };
+            return (APCS_RETURN_LIVE, 0, kind);
         }
         // BLX register: writes LR, like a function call.
         let is_blx = (insn & 0x20) != 0;
@@ -894,7 +911,8 @@ fn analyze_insn(insn: u32, pc: u32) -> (RegMask, RegMask, BranchKind) {
             // is the canonical APCS return. Detect it explicitly so
             // we don't fall back to all-live.
             if opc == 0b1101 && rm == 14 && (insn & 0x0000_0F80) == 0 {
-                return (APCS_RETURN_LIVE, 0, BranchKind::Return);
+                let kind = if cond_al { BranchKind::Return } else { BranchKind::CondReturn };
+                return (APCS_RETURN_LIVE, 0, kind);
             }
             return (read, 0, BranchKind::Indirect);
         }
@@ -936,7 +954,8 @@ fn analyze_insn(insn: u32, pc: u32) -> (RegMask, RegMask, BranchKind) {
             // `LDR PC, [SP], #4` (or any LDR PC sourced from SP) is
             // the single-register pop-return form.
             if rn == 13 {
-                return (read | APCS_RETURN_LIVE, 0, BranchKind::Return);
+                let kind = if cond_al { BranchKind::Return } else { BranchKind::CondReturn };
+                return (read | APCS_RETURN_LIVE, 0, kind);
             }
             return (read, 0, BranchKind::Indirect);
         }
@@ -1032,7 +1051,8 @@ fn analyze_insn(insn: u32, pc: u32) -> (RegMask, RegMask, BranchKind) {
             // Indirect (could be a switch jump or a load-from-data
             // tail-call).
             if rn == 13 || rn == 11 {
-                return (APCS_RETURN_LIVE | read, 0, BranchKind::Return);
+                let kind = if cond_al { BranchKind::Return } else { BranchKind::CondReturn };
+                return (APCS_RETURN_LIVE | read, 0, kind);
             }
             return (read, 0, BranchKind::Indirect);
         }
@@ -1263,6 +1283,16 @@ where R: Fn(u32) -> Option<u32> {
                 return live;
             }
             BranchKind::Return => {
+                return live;
+            }
+            BranchKind::CondReturn => {
+                // Conditional return: merge the return path's live-set
+                // (APCS_RETURN_LIVE — already counted via the analyzer's
+                // `read` mask) with the fall-through. Without the
+                // fall-through walk, reads that occur only after the
+                // conditional return are missed entirely.
+                let fall = live_at_recursive(pc.wrapping_add(4), max_instrs, visited, read_insn);
+                live |= fall & !written;
                 return live;
             }
             BranchKind::Indirect | BranchKind::Unknown => {
@@ -2900,6 +2930,34 @@ mod tests {
         // r0, r2 are param-live (BL reads them, never written locally).
         assert_ne!(live & (1u16 << 0), 0, "r0 param-live");
         assert_ne!(live & (1u16 << 2), 0, "r2 param-live");
+    }
+
+    #[test]
+    fn liveness_cond_return_walks_fallthrough() {
+        // Newton ROM @ 0x2595c8 motif: a conditional return is followed
+        // by code that reads parameter registers (used by the function
+        // tail). The walker must walk the fall-through, or those reads
+        // are missed and the inline-stub picker concludes the regs are
+        // dead. Stream:
+        //   pc= 0: TEQ r0, #0
+        //   pc= 4: LDMDBNE fp, {r4,fp,sp,pc}   ; cond return
+        //   pc= 8: STR r1, [r4, #8]            ; reads r1 (and r4)
+        //   pc=12: STR r3, [r4]                ; reads r3
+        //   pc=16: BX LR                       ; return
+        let stream = [
+            0xE330_0000u32, // TEQ r0, #0
+            0x191B_A810u32, // LDMDBNE fp, {r4, fp, sp, pc}
+            0xE584_1008u32, // STR r1, [r4, #8]
+            0xE584_3000u32, // STR r3, [r4]
+            0xE12F_FF1Eu32, // BX LR
+        ];
+        let live = live_at_with_reader(0, 16, &|pc| stream.get((pc / 4) as usize).copied());
+        assert_ne!(live & (1u16 << 1), 0,
+            "r1 must be live — read on the post-cond-return fall-through");
+        assert_ne!(live & (1u16 << 3), 0,
+            "r3 must be live — read on the post-cond-return fall-through");
+        assert_ne!(live & (1u16 << 4), 0,
+            "r4 must be live — read on both paths");
     }
 
     #[test]

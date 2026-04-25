@@ -3,7 +3,126 @@
 Live notes. Update as we learn more; remove old updates as we move on to
 new stalls.
 
-## Currently at — kernel page-mapping loop, PC=0x3ae1bc (FVP/QEMU, 2026-04-24)
+## Currently at — kernel idle waiting for non-timer IRQ after stack-collision SWI (QEMU 16×+ratchet+ROM-patch, 2026-04-25)
+
+After both the ratchet fix (hypervisor-side) and the
+addls→addcc ROM patch (kernel-side) below, the timer/alarm
+subsystem is fully working. In a 180-s run:
+
+- `TTimerEngine::Alarm` fires 45× (was 1× before)
+- `RestartTimerOverflowDetect` fires 45× (was 0× before — never)
+- `UpdateClock` fires 46× (was 1×)
+- `TTimerEngine::QueueTimer` runs 46× (was 1×)
+
+The kernel's gClock now properly tracks tick wraps; alarm.high
+matches gClock.high in snapshots; alarms queued at `gClock + delay`
+fire at the right moment.
+
+Boot reaches the same stack-collision page-copy SWI as the
+shorter runs (TSoundServer::TheMain → LockStack →
+CopyPageAfterCollisionSWI → CopyPagesAfterStackCollided →
+PhysSubPageCopy → CleanPageInDcache → PurgePageFromTLB →
+_ExitFIQAtomic, last traced call ~155350). After that, no new
+unique functions appear for the remaining ~25 seconds of the run.
+
+Heartbeats show steady-state:
+- PC=0x3ae1bc CPSR=0x60000113 (SVC mode, IRQs enabled, Z=1)
+- int_present=0x0 (no timer match latched at sample time)
+- int_ctrl=0xc401420 (TIMER_2 + DMA3/DMA5 + power-off enabled,
+  TIMER_3 / GPIO disabled)
+- VI=0, irq_pend=false
+
+The alarm engine cycles through `RestartTimerOverflowDetect`
+once per ~3.7s (delay = 0x0d2f0000 ticks at 59 MHz scaled), but
+no other code progresses between alarm IRQs.
+
+Hypothesis: the kernel set DMA channel 3 (Sound input,
+0x400) and DMA channel 5 (Sound output / Tablet rcv, 0x1000)
+IRQ enables in `int_ctrl` during sound subsystem init, then
+called a `WaitOn` that depends on sound DMA completion to
+deliver an IRQ. We don't model sound DMA, so that IRQ never
+fires, the kernel sits idle through alarm cycles.
+
+Next steps:
+1. Confirm by inspecting the saved task struct at the heartbeat
+   PC: which task is running, what semaphore it's blocked on.
+2. Either implement minimal sound DMA stubs (return
+   "transfer complete" immediately) or short-circuit the
+   sound subsystem entirely if it's optional for early boot.
+3. Cross-check Einstein's TDMAManager / sound-driver path —
+   what does it return for these channels?
+
+## Resolved — alarm-loop wedge from spurious wrap detection (QEMU, 2026-04-25)
+
+**Two complementary fixes** ended up needed:
+
+1. Hypervisor-side: `peripherals/vic.rs::ticks()` now ratchets
+   via `LAST_TICKS` so consecutive in-hypervisor calls return
+   strictly increasing values.
+
+2. ROM patch in `rom_patches.rs`: replace `addls` with `addcc`
+   (`ls`→`cc` swap on cond field) at the three wrap-detect
+   sites in the kernel — `GetClock` 0x3ad430, and
+   `SetAlarm` 0x3ad46c / 0x3ad49c. The kernel reads the live
+   tick register via the non-trapping `stage2::TICK_PAGE`
+   mapping, which only refreshes on hypervisor heartbeat
+   (~16 ms) — so the hypervisor-side ratchet doesn't help when
+   the kernel reads the same page twice in quick succession.
+   The ROM patch makes wrap-detect strictly less-than instead
+   of less-or-equal, so equal successive reads don't fire a
+   false wrap.
+
+Without the ROM patch alone, the alarm engine still wedges
+because `addls` treats `current_ticks == gClock.low` as a wrap
+(see "Verified by reading guest RAM" below). Without the
+ratchet, hypervisor-side `ticks()` calls (e.g. for the tick
+page itself) can return equal values across two close calls,
+which is harmless after the ROM patch but still violates the
+"strictly monotonic" contract that other code might rely on.
+
+QEMU boot was getting stuck in a `TTimerEngine::Alarm` →
+`SetAlarm` → `SetAlarm1` → `DisableAlarm1` tight loop right after
+`UserBoot`, never advancing past trace 27313. Symptom: same alarm
+time (low word) being re-armed forever, with current ticks already
+past it.
+
+Root cause: the Newton kernel's `GetClock` (0x003ad41c) reads
+gClock from RAM, then reads the live tick register, then bumps
+the output's `high` word if `current_ticks <= gClock.low` — that
+is, equality counts as "wrapped". Designed for an environment where
+two consecutive ticks reads are guaranteed to differ.
+
+In QEMU TCG, `CNTPCT_EL0` advances slowly relative to instruction
+count, so two `ticks()` calls in quick succession (e.g., the
+`UpdateClock` call in `StartTimerOverflowDetect` followed
+immediately by `QueueTimer`'s `GetClock`) can return the same
+value. That trips the equal-counts-as-wrapped path and bumps the
+local TTime.high to 1, even though no wrap occurred. The freshly
+queued alarm gets `alarm.high = 1` while the global `gClock.high`
+in RAM stays at 0, so `CompCompare(now, alarm)` permanently
+returns -1 and the alarm engine wedges.
+
+Verified by reading guest RAM out of a snapshot: gClock at IPA
+0x04008_56c (VA 0x0c10156c via stage-1 walk through L1[0xc1] →
+L2[1] = 0x0400803e) was `(0, 0x1A52512C)` — exactly the ticks
+value at the boot's first-and-only `UpdateClock` call. The alarm
+queue head at IPA 0x040085a0 had `(1, 0x2781512C)` = gClock +
+0x0d2f0000, but with the +1 in the high word — the smoking gun.
+
+Fix in `peripherals/vic.rs::ticks()`: ratchet via static
+`LAST_TICKS` so consecutive calls always return strictly
+increasing values. If the raw computation lands at-or-below the
+previous reading, return `last + 1` instead. Real wraps still
+work because the raw value drops by ~2^32 and the ratchet steps
+naturally past 0xFFFFFFFF on subsequent calls.
+
+After fix: boot advances from trace 27313 to trace 156638, past
+`UserBoot` / `InitDomainsAndEnvironments` / `BuildDomainsAndHeaps`
+/ `MakeSystemStackManager` / `TPageManager::Register` / sound
+hardware probe, into the page-copy SWI for stack-collision
+handling.
+
+## Resolved — kernel page-mapping loop, PC=0x3ae1bc (FVP/QEMU, 2026-04-24)
 
 The BLTG-reboot from `BuildDomainsAndHeaps` is **resolved**. Root cause
 was in `shadow_stub::analyze_insn`: a *conditional* APCS return (e.g.

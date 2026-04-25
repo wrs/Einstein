@@ -17,7 +17,10 @@
 //! unknown code halts loudly with a full context dump so the next
 //! ROM boot that hits one points exactly at the missing table entry.
 
-use crate::{cpu, kprintln, peripherals::{flash_driver, platform, screen, sound}, trap::TrapContext};
+use crate::{cpu, kprintln, peripherals::{
+    battery, flash_driver, host_call, in_translator, network, out_translator,
+    platform, printer, screen, serial_driver, sound, tablet,
+}, trap::TrapContext};
 
 /// Dispatch a native-primitive call.
 ///
@@ -66,10 +69,54 @@ pub fn execute(ctx: &mut TrapContext, native_insn: u32, pc: u32) {
             sound::handle(ctx, s, pc);
         }
 
+        // Battery-class: driver=3 -> PMainBatteryDriver subfn dispatch.
+        // See peripherals/battery.rs.
+        (d, s) if d == battery::DRIVER_ID => {
+            battery::handle(ctx, s, pc);
+        }
+
         // Screen-class: driver=4 -> TMainDisplayDriver method per
         // subfn. See peripherals/screen.rs.
         (d, s) if d == screen::DRIVER_ID => {
             screen::handle(ctx, s, pc);
+        }
+
+        // Tablet-class: driver=5 -> TMainTabletDriver subfn dispatch.
+        // See peripherals/tablet.rs.
+        (d, s) if d == tablet::DRIVER_ID => {
+            tablet::handle(ctx, s, pc);
+        }
+
+        // Serial-chip-class: driver=6 -> TSerialChipEinstein subfn dispatch.
+        // See peripherals/serial_driver.rs.
+        (d, s) if d == serial_driver::DRIVER_ID => {
+            serial_driver::handle(ctx, s, pc);
+        }
+
+        // In-translator: driver=7. See peripherals/in_translator.rs.
+        (d, s) if d == in_translator::DRIVER_ID => {
+            in_translator::handle(ctx, s, pc);
+        }
+
+        // Out-translator: driver=8. See peripherals/out_translator.rs.
+        (d, s) if d == out_translator::DRIVER_ID => {
+            out_translator::handle(ctx, s, pc);
+        }
+
+        // Host-call: driver=9 -> TEinsteinNativeCalls subfn dispatch.
+        // See peripherals/host_call.rs.
+        (d, s) if d == host_call::DRIVER_ID => {
+            host_call::handle(ctx, s, pc);
+        }
+
+        // Network-manager: driver=0xA. See peripherals/network.rs.
+        (d, s) if d == network::DRIVER_ID => {
+            network::handle(ctx, s, pc);
+        }
+
+        // Printer: driver=0xC. See peripherals/printer.rs.
+        (d, s) if d == printer::DRIVER_ID => {
+            printer::handle(ctx, s, pc);
         }
 
         _ => {

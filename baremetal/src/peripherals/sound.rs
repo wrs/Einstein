@@ -64,7 +64,13 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
                 (0x18, 0x00000001),
             ];
             for (off, val) in words {
-                let _ = crate::guest_mem::write_word_va(info_addr + off, val);
+                let addr = info_addr + off;
+                // VA write fails when the guest's stage-1 MMU is off
+                // (e.g. inside a guest test); fall back to a direct PA
+                // write so the caller still sees the populated struct.
+                if !crate::guest_mem::write_word_va(addr, val) {
+                    let _ = crate::guest_mem::write_word_pa(addr, val);
+                }
             }
             ctx.x[0] = 0;
         }

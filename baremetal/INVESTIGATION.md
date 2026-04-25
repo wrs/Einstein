@@ -135,6 +135,60 @@ Likely culprits to check next on FVP:
 FVP tarmac trace across the suspected wedge window would tell us
 which.
 
+### FVP cross-check (180s wall, 2026-04-25)
+
+```
+scripts/fvp --timeout=180 \
+    target/aarch64-unknown-none-softfloat/release/newton-hypervisor
+```
+
+Periodic task_dump output:
+
+```
+task_dump: gSched=0xc1084b4 curr=0xc108624  highest_pri=0  bitmap=0x0     # OBJM, idle setup
+task_dump: gSched=0xc1084b4 curr=0xc113dd8  highest_pri=10 bitmap=0x400   # STKU, same as QEMU wedge state
+task_dump: gSched=0xc1084b4 curr=0xc11b2c0  highest_pri=0  bitmap=0x0     # cdsv (CardServer)
+task_dump: gSched=0xc1084b4 curr=0xc11b2c0  highest_pri=0  bitmap=0x0
+task_dump: gSched=0xc1084b4 curr=0xc11b2c0  highest_pri=0  bitmap=0x0
+```
+
+**FVP gets past STKU.** The STKU dump appears once (transient,
+probably during page-collision handling) and then the scheduler
+moves on to `cdsv` (CardServer). On QEMU, STKU stays as
+gCurrentTask forever. So **the STKU wedge is QEMU-specific.**
+
+After ~180s on FVP, boot crashes with a different failure: the
+"newt" (`0x6e657774`) exception in `UnhandledException` —
+matches the Apr 24 finding (kernel-mode DABT with FAR ASCII =
+"newt") that was previously seen on QEMU. So FVP doesn't deadlock
+on STKU but DOES hit a separate kernel-state corruption later.
+
+**Most likely culprit for the QEMU-specific STKU wedge** (per
+`docs/QEMU_BUGS.md` "AArch64↔AArch32 boundary"): the EL2 trap entry
+or ERET path mishandles the SVC-mode banked LR (`R14_svc`). When an
+IRQ is taken from SVC-mode AArch32 to AArch64 EL2, ELR_EL2 holds
+the trap PC (= 0x3ae1bc) and SPSR_EL2 holds the AArch32 CPSR
+(= 0x60000113 SVC). On ERET back, `R14_svc` should be unchanged
+from before the trap. If QEMU is corrupting it (or our trap stub
+inadvertently writes through `LR_svc`), `mov pc, lr` at 0x3ae1bc
+would jump to a wrong PC.
+
+Two falsifiable next steps to confirm:
+
+1. **Save+restore SP_EL1 / ELR_EL1 explicitly** in the EL2 IRQ
+   trap stub to bypass any QEMU bug. If the QEMU wedge clears,
+   the bug is in QEMU's banked-reg plumbing.
+2. **Tarmac trace on FVP across one STKU iteration** — capture the
+   exact instruction sequence STKU executes after SVC return so
+   we know what the "correct" path looks like and can compare
+   against QEMU's stuck state.
+
+Lower priority once the wedge is QEMU-side: the FVP "newt"
+exception (kernel state corruption around `gCurrentGlobals`-relative
+addressing) — that was previously chased on QEMU and presumably
+masked when the STKU wedge started covering it. We'll see it again
+when the wedge is fixed.
+
 ## Resolved (was) — sound subfn map known; wedge in StackManager page-copy persists (QEMU, 2026-04-25 late)
 
 Captured the actual native-primitive subfn sequence the Newton kernel

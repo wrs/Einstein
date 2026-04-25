@@ -62,19 +62,78 @@ Open next steps:
 
 1. **Run on FVP** to (a) confirm the wedge reproduces, (b) read
    SP_EL1/ELR_EL1 reliably, (c) get a bounded tarmac trace across a
-   single iteration of the supposed STKU loop body — that should
-   reveal whether STKU is genuinely spinning at a single PC or
-   advancing in untraced code.
-2. **Walk gObjectTable** (`*0x0c10fc34`) from the dump to enumerate
-   ALL tasks (not just the run-queue ones) and their state — gives
-   a picture of which tasks are blocked on what semaphore /
-   message port. The run-queue dump only shows ready tasks; blocked
-   tasks live in object-specific waiter lists.
-3. **Mirror dump in NewtonProbe** so we can compare the same
-   scheduler state at the matching boot point in Einstein. If
-   Einstein gets past this with the same task layout, the bug is
-   in our hypervisor; if Einstein wedges similarly, it's a ROM
-   patch or oracle issue.
+   single iteration of the supposed STKU loop body.
+2. **Identify what makes STKU return to its idle/Receive loop** in
+   Einstein. The smoking gun is below: in Einstein STKU is BLK
+   (blocked), our hypervisor it's RUN forever. Find the SVC return
+   path or unscheduling that we're missing.
+
+### Einstein-vs-hypervisor task census (Phase B oracle, 2026-04-25)
+
+`baremetal/probe/probe.cpp::task_dump` dumps the same scheduler
+state on the Einstein side (every 2s). Diffing at matching boot
+phases:
+
+| field            | hypervisor (wedge) | Einstein (t=12s) |
+|------------------|--------------------|------------------|
+| total tasks      | 16                 | 29               |
+| total kernel obj | 119                | 404              |
+| gCurrentTask     | STKU id=0x12e3     | fser id=0x4793   |
+| highest_pri      | 10                 | 12               |
+| ready tasks      | 1 (drvl)           | 4 (Tmux, cdsv, scpl, codc) |
+| STKU state       | **RUN** (stuck)    | **BLK** (idle waiting for next msg) |
+| OBJM/PMGR/PTBL/STKF/STKP/STKU/ROMF/ROMP | all BLK (q=0/0 wq=0/0) | all BLK (same pattern) |
+
+So **the wedge is STKU failing to return to its idle blocked state
+after the CopyPageAfterCollisionSWI completes**. Einstein's STKU
+finishes the same SVC, returns to its TUMonitor main loop, calls
+some Receive() that blocks, and `fser` / `Tmux` / etc. take over.
+Our hypervisor's STKU never reaches that block — it's stuck at
+PC=0x3ae1bc in SVC mode, the post-svc-#5 `mov pc, lr` of GenericSWI.
+
+**The empty-link `q=0/0 wq1=0/0 wq2=0/0` pattern IS the normal
+blocked state in Newton**: blocked tasks have empty task-side
+links and live only on the blocking object's (port/sem/etc.)
+waiter queue. So our 14 BLK tasks are correctly blocked — STKU is
+the one anomaly.
+
+Tasks Einstein has that we don't (at this boot phase): Tmux, cdsv,
+codc, cdfm, cdpr, pg&e, newt, pssm, scrn, inkr, cmgr, scpl, fser.
+These are post-monitor-init tasks (GUI / ink / file server / power
+mgmt) — boot can't reach them while STKU holds whatever resource
+they're transitively waiting on.
+
+### Investigation plan from here
+
+The SVC handler ran ~110 traced functions inside CopyPagesAfter-
+StackCollided and then stopped emitting traces after `_ExitFIQAtomic`
+at trace 154686. The handler's return-to-user path normally:
+1. Restores user-mode CPSR (USER) from SPSR_svc.
+2. ERETs back to PC after the `svc 0x05` (= 0x3ae1bc).
+3. Executes `mov pc, lr` → resumes user-mode caller at LR_usr.
+4. Caller (TStackManager::ResolveFault @0x1f7cc4) cleans stack +
+   loops back to Release semaphore + check for more work.
+5. Eventually returns to TUMonitor::Main which calls Receive() to
+   block until next request.
+
+We're observing CPSR=SVC at 0x3ae1bc with LR_svc apparently
+(via QEMU snapshot) = 0x1f7cc4. But the task-dump comparison says
+this should ultimately end in STKU being BLK. So somewhere between
+trace 154686 (last svc trace) and the would-be Receive() block,
+control is lost.
+
+Likely culprits to check next on FVP:
+- `ldmdb fp, {…, pc}`-style multi-register restore in SVC handler
+  exits — if the saved registers on the kernel stack are corrupted
+  (bad page-copy interaction?) the wrong PC is restored.
+- A `subs pc, lr, #4` from IRQ context that maps SPSR back to SVC
+  mode by accident (we set HCR_EL2.IMO so EL2 takes IRQs — does
+  the AArch32→AArch64 SPSR plumbing on QEMU corrupt the SPSR?).
+- Re-entrant `svc` from SVC mode somewhere in the SVC handler
+  itself, clobbering LR_svc — would make `mov pc, lr` self-loop.
+
+FVP tarmac trace across the suspected wedge window would tell us
+which.
 
 ## Resolved (was) — sound subfn map known; wedge in StackManager page-copy persists (QEMU, 2026-04-25 late)
 

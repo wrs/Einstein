@@ -419,6 +419,163 @@ namespace {
 constexpr KUInt32 kDefaultBootSeconds = 30;
 constexpr KUInt32 kDefaultRAMSize = 4 * 1024 * 1024; // MP2x00 bare RAM, 4 MiB.
 
+// ==========================================================================
+//  task_dump — mirror of baremetal/src/task_dump.rs
+//
+// Walks gScheduler's per-priority run queues and gObjectTable's task
+// entries, printing the same one-line-per-task format. Lets us diff
+// the Phase B wedge state against Einstein at matching boot points.
+// See baremetal/docs/STRUCTURES.md for the kernel struct layouts.
+// ==========================================================================
+
+constexpr KUInt32 kGScheduler    = 0x0c100fd0;
+constexpr KUInt32 kGCurrentTask  = 0x0c101000;
+constexpr KUInt32 kGWantSchedule = 0x0c100fd4;
+constexpr KUInt32 kGHoldSchedule = 0x0c100fd8;
+constexpr KUInt32 kGCurrGlobals  = 0x0c10105c;
+constexpr KUInt32 kGObjectTable  = 0x0c10fc34;
+
+constexpr KUInt32 kTSHighestPri  = 0x14;
+constexpr KUInt32 kTSPriBitmap   = 0x18;
+constexpr KUInt32 kTSQueuesBase  = 0x1c;
+constexpr KUInt32 kTSLastRemoved = 0x11c;
+
+constexpr KUInt32 kTTPriority    = 0x80;
+constexpr KUInt32 kTTQItem       = 0x94;
+constexpr KUInt32 kTTGlobals     = 0xa0;
+
+constexpr KUInt32 kOTBucketsBase = 0x10;
+constexpr KUInt32 kOTNumBuckets  = 128;
+constexpr KUInt32 kObjTypeTask   = 3; // 717006-empirical (DDK enum is wrong)
+
+bool td_read(TMemory* mem, KUInt32 va, KUInt32& out) {
+	// ReadAligned returns true on fault, false on success.
+	return !mem->ReadAligned(va, out);
+}
+
+bool td_find_task_name(TMemory* mem, KUInt32 globals_va, KUInt32& out_name) {
+	if (globals_va == 0 || globals_va == ~0u) return false;
+	for (int off = 4; off <= 128; off += 4) {
+		KUInt32 v;
+		if (!td_read(mem, globals_va - off, v)) continue;
+		KUInt8 b0 = (v >> 24) & 0xff, b1 = (v >> 16) & 0xff;
+		KUInt8 b2 = (v >> 8) & 0xff,  b3 = v & 0xff;
+		auto printable = [](KUInt8 b) { return b >= 0x20 && b <= 0x7e; };
+		if (!printable(b0) || !printable(b1) || !printable(b2) || !printable(b3)) continue;
+		auto alpha = [](KUInt8 b) { return (b>='a'&&b<='z')||(b>='A'&&b<='Z'); };
+		int alpha_n = alpha(b0)+alpha(b1)+alpha(b2)+alpha(b3);
+		if (alpha_n >= 2) { out_name = v; return true; }
+	}
+	return false;
+}
+
+void td_dump_task_line(TMemory* mem, KUInt32 task_va, const char* state_label) {
+	KUInt32 prio=0, globals=0, qnext=0, qprev=0;
+	KUInt32 wq1n=0, wq1p=0, wq2n=0, wq2p=0;
+	td_read(mem, task_va + kTTPriority, prio);
+	td_read(mem, task_va + kTTGlobals,  globals);
+	td_read(mem, task_va + kTTQItem,    qnext);
+	td_read(mem, task_va + kTTQItem+4,  qprev);
+	td_read(mem, task_va + 0xbc, wq1n);
+	td_read(mem, task_va + 0xc0, wq1p);
+	td_read(mem, task_va + 0xc8, wq2n);
+	td_read(mem, task_va + 0xcc, wq2p);
+	KUInt32 idword=0; td_read(mem, task_va, idword);
+	KUInt32 nm=0;
+	bool has_name = td_find_task_name(mem, globals, nm);
+	if (has_name) {
+		std::fprintf(stdout,
+			"  [%s] task 0x%08x id=0x%x prio=%u name='%c%c%c%c' globals=0x%08x q=0x%08x/0x%08x wq1=0x%08x/0x%08x wq2=0x%08x/0x%08x\n",
+			state_label, task_va, idword, prio,
+			(int)((nm>>24)&0xff), (int)((nm>>16)&0xff),
+			(int)((nm>>8)&0xff),  (int)(nm&0xff),
+			globals, qnext, qprev, wq1n, wq1p, wq2n, wq2p);
+	} else {
+		std::fprintf(stdout,
+			"  [%s] task 0x%08x id=0x%x prio=%u name=? globals=0x%08x q=0x%08x/0x%08x wq1=0x%08x/0x%08x wq2=0x%08x/0x%08x\n",
+			state_label, task_va, idword, prio,
+			globals, qnext, qprev, wq1n, wq1p, wq2n, wq2p);
+	}
+}
+
+const char* td_classify(TMemory* mem, KUInt32 task_va, KUInt32 current) {
+	if (task_va == current) return "RUN";
+	KUInt32 qn=0, qp=0, w1=0, w2=0;
+	td_read(mem, task_va + kTTQItem,   qn);
+	td_read(mem, task_va + kTTQItem+4, qp);
+	td_read(mem, task_va + 0xbc, w1);
+	td_read(mem, task_va + 0xc8, w2);
+	if (w1 != 0 || w2 != 0) return "WAIT";
+	if (qn != 0 || qp != 0) return "RDY";
+	return "BLK";
+}
+
+void task_dump(TMemory* mem, const char* tag) {
+	KUInt32 sched=0, curr=0, want=0, hold=0, glob=0;
+	td_read(mem, kGScheduler,    sched);
+	td_read(mem, kGCurrentTask,  curr);
+	td_read(mem, kGWantSchedule, want);
+	td_read(mem, kGHoldSchedule, hold);
+	td_read(mem, kGCurrGlobals,  glob);
+	if (sched == 0) {
+		std::fprintf(stdout, "task_dump[%s]: gScheduler unset\n", tag);
+		return;
+	}
+	KUInt32 highest=0, bitmap=0, lastrem=0;
+	td_read(mem, sched + kTSHighestPri,  highest);
+	td_read(mem, sched + kTSPriBitmap,   bitmap);
+	td_read(mem, sched + kTSLastRemoved, lastrem);
+	std::fprintf(stdout,
+		"task_dump[%s]: gSched=0x%x curr=0x%x highest_pri=%u bitmap=0x%x last_rem=0x%x want=%u hold=%u curr_glob=0x%x\n",
+		tag, sched, curr, highest, bitmap, lastrem, want, hold, glob);
+	if (curr) {
+		std::fprintf(stdout, "  current:\n");
+		td_dump_task_line(mem, curr, "RUN");
+	}
+	for (int p = 0; p < 32; ++p) {
+		if (((bitmap >> p) & 1) == 0) continue;
+		KUInt32 qva = sched + kTSQueuesBase + p * 8;
+		std::fprintf(stdout, "  prio %d queue@0x%x:\n", p, qva);
+		KUInt32 head=0; td_read(mem, qva, head);
+		KUInt32 cur = head;
+		int steps = 0;
+		while (cur != 0 && steps < 32) {
+			td_dump_task_line(mem, cur, td_classify(mem, cur, curr));
+			KUInt32 next=0;
+			td_read(mem, cur + kTTQItem, next);
+			if (next == cur) break;
+			cur = next;
+			++steps;
+		}
+	}
+	std::fprintf(stdout, "  all tasks (object table walk):\n");
+	int total = 0, tasks = 0;
+	int by_type[16] = {0};
+	for (KUInt32 b = 0; b < kOTNumBuckets; ++b) {
+		KUInt32 head_va = kGObjectTable + kOTBucketsBase + b * 4;
+		KUInt32 node=0; td_read(mem, head_va, node);
+		int steps = 0;
+		while (node != 0 && steps < 128) {
+			++total;
+			KUInt32 id=0; td_read(mem, node, id);
+			by_type[id & 0xf]++;
+			if ((id & 0xf) == kObjTypeTask) {
+				++tasks;
+				td_dump_task_line(mem, node, td_classify(mem, node, curr));
+			}
+			KUInt32 nxt=0; td_read(mem, node + 4, nxt);
+			node = nxt;
+			++steps;
+		}
+	}
+	std::fprintf(stdout,
+		"  object table: %d tasks (of %d kernel objects); types[0..15]=", tasks, total);
+	for (int i = 0; i < 16; ++i)
+		std::fprintf(stdout, "%d ", by_type[i]);
+	std::fprintf(stdout, " (3=Task, 8=Mon, 9=Phys are confirmed)\n");
+	std::fflush(stdout);
+}
+
 void usage(const char* argv0) {
 	std::fprintf(stderr,
 		"usage: %s <rom.bin> [rex.bin|-] [wall-seconds]\n"
@@ -472,13 +629,23 @@ int main(int argc, char** argv) {
 	// state regardless of how far boot has progressed.
 	bool mmuReported = false;
 	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(wallSeconds);
+	auto next_dump = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+	int dump_n = 0;
 	while (std::chrono::steady_clock::now() < deadline) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(500));
+		auto now = std::chrono::steady_clock::now();
 		if (!mmuReported && emu.GetMemory()->IsMMUEnabled()) {
 			std::fprintf(stdout, "probe: MMU came up at PC=0x%08X\n",
 				static_cast<unsigned>(emu.GetProcessor()->GetRegister(TARMProcessor::kR15)));
 			std::fflush(stdout);
 			mmuReported = true;
+		}
+		if (mmuReported && now >= next_dump) {
+			char tag[32];
+			std::snprintf(tag, sizeof(tag), "t=%ds", dump_n * 2 + 2);
+			task_dump(emu.GetMemory(), tag);
+			next_dump += std::chrono::seconds(2);
+			++dump_n;
 		}
 	}
 
@@ -510,6 +677,9 @@ int main(int argc, char** argv) {
 		0x0400d1c4u + 0x2e8, (unsigned) mem->ReadP(0x0400d1c4u + 0x2e8, *(Boolean*)alloca(sizeof(Boolean))));
 	std::fprintf(stdout, "  PA 0x%08X (+0x2ec REx[1]) = 0x%08X\n",
 		0x0400d1c4u + 0x2ec, (unsigned) mem->ReadP(0x0400d1c4u + 0x2ec, *(Boolean*)alloca(sizeof(Boolean))));
+
+	std::fprintf(stdout, "\n=====> task_dump (final state)\n");
+	task_dump(mem, "final");
 
 	mmu->FDump(stdout);
 	dump_instrumentation(stdout);

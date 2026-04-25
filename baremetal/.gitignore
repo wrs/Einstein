@@ -5,7 +5,7 @@ scripts/classify-out/*
 scripts/disasm-out/*
 tarmac.log
 tarmac-window.log
-docs/ARM_Reference.txt
+docs/ARM_*
 
 # Newton ROMs are not redistributable. Each developer places their own dump
 # under roms/; the directory itself is tracked (for the README) but all

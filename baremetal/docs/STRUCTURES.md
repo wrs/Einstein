@@ -193,6 +193,46 @@ add r0, r0, r2, lsl #2
 ldr r0, [r0, #16]        ; bucket head at table+16+bucket*4
 ```
 
+### How tasks change state
+
+The kernel uses two non-virtual helpers (`ScheduleTask` /
+`UnScheduleTask`) to add and remove a task from the scheduler's
+per-priority run queues:
+
+```
+0x1918e8 <ScheduleTask(TTask*)>:
+  ldr r0, [&gScheduler]; r0 = *gScheduler
+  b   TScheduler::AddWhenNotCurrent(scheduler, task)
+
+0x1918fc <UnScheduleTask(TTask*)>:
+  ldr r2, [&gScheduler]
+  ldr pc, [r2, #16]   ; vtable[+16] tail-call (a "Remove"-style virtual)
+```
+
+Implication for state inference:
+
+- **A "blocked" task has *empty* run-queue links** (`q.next=0,
+  q.prev=0`) because `UnScheduleTask` → `TScheduler::Remove` calls
+  `RemoveFromQueue` on the priority bucket. The task is *not* moved
+  to any kernel-owned "blocked list" — it's just dangling from the
+  scheduler's perspective.
+- The blocked task is **reachable from whatever it's waiting on**
+  (a port's waiter queue, a semaphore's waiter queue, etc.) — that
+  object holds a TDoubleQContainer linking the task in via one of
+  the embedded `TDoubleQItem` slots at `task+0xbc` or `task+0xc8`.
+  *But* in the current Phase B wedge, every BLK task has both wq
+  links zeroed. Either:
+  - the per-port waiter mechanism lives at a *different* offset
+    (TODO: trace `TUPort::Receive` blocking flow to find it), or
+  - those tasks are waiting via a kernel mechanism that doesn't
+    use TDoubleQContainer at all (e.g., a state field at
+    `task+0xd4..+0xf4`, all zeroed in the ctor — TODO inspect).
+
+So our dump's "BLK" classification means **alive, not in any run
+queue, not in either of the two TDoubleQItem wait-links we know
+about** — most likely "blocked on a port", but we haven't yet
+identified the specific link.
+
 ### Observed task IDs and names (this run)
 
 | id     | prio | name | role (inferred from name) |

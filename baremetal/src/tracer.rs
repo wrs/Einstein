@@ -437,6 +437,36 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
         cur_lr,
     );
 
+    // newt-tripwire (per-trace-event poll): catches the first trace
+    // event after PA 0x0402a250 (= pckm's user stack at sp_usr+8) is
+    // populated with 0x6e657774 ("newt"). Bounds the corruption write
+    // to between this trace event and the previous one. See
+    // INVESTIGATION.md "Currently at — pckm task at sp_usr=0x0cc7a248".
+    {
+        static FIRED: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        if !FIRED.load(core::sync::atomic::Ordering::Relaxed) {
+            if let Some(v) = crate::guest_mem::read_word_pa(0x0402_a250) {
+                if v == 0x6e65_7774 {
+                    FIRED.store(true, core::sync::atomic::Ordering::Relaxed);
+                    let v2 = crate::guest_mem::read_word_pa(0x0402_a254).unwrap_or(0);
+                    kprintln!(
+                        "*** newt-tripwire fired AT trace {} (PA 0x0402a250=0x{:08x} 0x0402a254=0x{:08x})",
+                        seq, v, v2
+                    );
+                    // Verify the suspected alias: VA 0x0cc82250 (where
+                    // TCardMessage::TCardMessage writes "newt"+"cdsv")
+                    // and VA 0x0cc7a250 (pckm's user stack at sp+8).
+                    // Both should walk to PA 0x0402a250 if aliased.
+                    kprintln!("   stage-1 walk for VA 0x0cc82250:");
+                    crate::guest_mem::dump_stage1_walk(0x0cc82250);
+                    kprintln!("   stage-1 walk for VA 0x0cc7a250 (pckm sp+8):");
+                    crate::guest_mem::dump_stage1_walk(0x0cc7a250);
+                }
+            }
+        }
+    }
+
     // Targeted one-shot-style dumps. Gated on function index to avoid log
     // spam.
     if mode == 0x10 {

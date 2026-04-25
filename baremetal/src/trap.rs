@@ -224,6 +224,28 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     // tracer (which only sees calls into traced ROM functions).
     crate::task_dump::periodic();
 
+    // One-shot tripwire: poll PA 0x0402a250 every heartbeat and log the
+    // first time it transitions to 0x6e657774 ("newt"). Lets us bound
+    // the trace event range during which the corruption was written
+    // (see INVESTIGATION.md "Currently at — pckm task at sp_usr=
+    // 0x0cc7a248"). Cleared once it fires.
+    {
+        static FIRED: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        if !FIRED.load(core::sync::atomic::Ordering::Relaxed) {
+            if let Some(v) = guest_mem::read_word_pa(0x0402_a250) {
+                if v == 0x6e65_7774 {
+                    FIRED.store(true, core::sync::atomic::Ordering::Relaxed);
+                    let next_v = guest_mem::read_word_pa(0x0402_a254).unwrap_or(0);
+                    kprintln!(
+                        "*** newt-tripwire: PA 0x0402a250=0x{:08x} 0x0402a254=0x{:08x} at heartbeat ELR={:#x}",
+                        v, next_v, elr
+                    );
+                }
+            }
+        }
+    }
+
     // Wedge probe: if the guest's PC parks at the same value across many
     // consecutive heartbeats AND the int_ctrl mask says sound-DMA IRQs
     // are enabled (TSoundServer::TheMain has run and registered them),
@@ -1493,6 +1515,20 @@ fn handle_diag(ctx: &mut TrapContext) {
         let forwardable = matches!(dfsc, 0x03 | 0x05 | 0x06 | 0x07 | 0x0D | 0x0F);
         if forwardable {
             log_dabt_forward(dfsc, far as u32, hvc_src_mode);
+            // One-shot diagnostic: when the recursive-abort "newt" DABT
+            // fires (FAR=0x6e657774, mode=ABT), dump the SWIBoot save
+            // area of every cdsv-named task before forwarding to the
+            // kernel handler — the kernel's own response is to reboot,
+            // so this is our only chance to see the corrupt slot.
+            if far as u32 == 0x6e65_7774 {
+                static FIRED: core::sync::atomic::AtomicBool =
+                    core::sync::atomic::AtomicBool::new(false);
+                if !FIRED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                    kprintln!("=== one-shot newt-DABT diagnostic: cdsv save areas ===");
+                    crate::task_dump::dump_save_area_for_named(b"cdsv");
+                    kprintln!("=== end one-shot newt-DABT diagnostic ===");
+                }
+            }
             let saved_r0: u64;
             let saved_r1: u64;
             unsafe {

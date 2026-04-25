@@ -3,7 +3,149 @@
 Live notes. Update as we learn more; remove old updates as we move on to
 new stalls.
 
-## Currently at — kernel-mode "newt" UnhandledException (QEMU + FVP, 2026-04-26)
+## Currently at — pckm task at sp_usr=0x0cc7a248 reads TAEventHandler bytes instead of stack frame (QEMU + FVP, 2026-04-27)
+
+**Root divergence narrowed**: the recursive "newt" DABT
+(FAR=0x6e657774) is caused by the pckm task (id=0x1753, struct at
+0x0c118dd8) resuming with sp_usr=0x0cc7a248 and reading user RAM at
+sp+8 / sp+12 that contains the literal ASCII fourccs `'newt'` and
+`'cdsv'` instead of the stack pointers TUPort::Receive's prologue
+(0x259d2c) should have pushed there.
+
+### Evidence (one-shot diagnostic dump in DABT-fast-path)
+
+`src/task_dump.rs::dump_save_area_for_named` fires once at the FAR=
+0x6e657774 forward and prints the SWIBoot context-save area
+(task+0x10..0x54) plus a ±0x80 user-stack window plus a stage-1 walk.
+
+For task `0x0c118dd8` (id=0x1753, named `cdsv` in our run, named
+`pckm` in Einstein's run — same struct slot, same task throughout
+the boot, just different `find_task_name` heuristic hits as the
+globals area gets repopulated by the AppWorld over time):
+
+```
+Our hypervisor                          Einstein (NewtonProbe)
+sp_usr  = 0x0cc7a248                    sp_usr  = 0x0cc7a248        (SAME)
+saved-PC = 0x003ae230                   saved-PC = 0x003ae230        (SAME)
+lr_usr  = 0x00259d48                    lr_usr  = 0x00259d48         (SAME)
+fp/ip   = 0x0cc7a29c / 0x0cc7a2b0       fp/ip   = 0x0cc7a29c / 0x0cc7a2b0  (SAME)
+
+stage-1 walk: VA 0x0cc7a248 → PA 0x0402a248
+                                stage-1 walk: VA 0x0cc7a248 → PA 0x0402a248  (SAME PA)
+
+user-stack window @ sp_usr:
+  [+0]=0  [+4]=0                        [+0]=0x0c600d2c  [+4]=0x0c600d1c  (pushed r4,r5 from PortReceiveSWI)
+  [+8]=0x6e657774  ("newt")             [+8]=0x0cc7a270   (push of r0=sp+16 from 259d2c)
+  [+12]=0x63647376 ("cdsv")             [+12]=0x0cc7a26c  (push of r1=sp+12)
+  [+16..+20]=0,0                        [+16]=0x0cc7a264  [+20]=0x0cc7a268  (push of r2,r3)
+```
+
+Both implementations pick the same VA→PA, save the same context.
+Only the contents at PA 0x0402a248..0x0402a25f differ. Einstein has
+the four valid stack pointers from TUPort::Receive's `push {r0..r3}`;
+ours has the literal pattern of a `TAEventHandler{ signal='newt',
+class='cdsv', ...}` (signal at +0x08, class at +0x0c — see
+`docs/STRUCTURES.md` "TAEventHandler"). Trace 183155 in our run is
+the only `TAEventHandler::Init(handler, 'cdsv', 'newt')` call, but
+its handler address was `0x0c602e2c`, not `0x0cc7a248` — so the
+pattern at PA 0x0402a248 came from somewhere else.
+
+### Faulting site
+
+When pckm resumes at PC=0x3ae230 (= post-`svc #2` in `PortReceiveSWI`
+at 0x3ae228):
+
+```
+003ae228 <PortReceiveSWI>:
+  3ae228: push {r4, r5}
+  3ae22c: svc  #2
+  3ae230: ldr  r5, [sp, #8]    ; r5 ← 0x6e657774 ("newt")
+  3ae234: cmp  r5, #0
+  3ae238: strne r1, [r5]       ; ← DABT here, FAR=0x6e657774, DFSC=0x05
+                                 ;   (translation, section — no L1 entry
+                                 ;    for the 0x6e000000..0x70000000 range)
+```
+
+The L1 fault recurses through DataAbortHandler → ConvertIdToObj →
+Throw → UnhandledException → "Unhandled exception evt.ex.abt.bus,
+warm reboot!".
+
+### Root cause confirmed: stage-1 page-table aliasing
+
+Per-trace-event tripwire (`src/tracer.rs::log_trace_at`) bisected the
+write to **trace 180652** (= `TCardMessage::Clear` entry — but the
+write actually happened in the prior trace event):
+
+```
+trace 180650 0x0004ed10 TCardMessage::TCardMessage(void) (usr) r0=0x0cc82250 ...
+trace 180651 0x00025d1c TAEvent::TAEvent(void)         (usr) r0=0x0cc82250 ...
+trace 180652 0x0004ed84 TCardMessage::Clear(void)      (usr) r0=0x0cc82250 r1=0x6e657774 ...
+*** newt-tripwire fired AT trace 180652 (PA 0x0402a250=0x6e657774 0x0402a254=0x63647376)
+```
+
+`TCardMessage::TCardMessage` at 0x0004ed10 explicitly stores
+"newt"+"cdsv" into its `self`:
+
+```
+4ed3c: ldr r0, [pc, #44]    @ 0x4ed70 = 0x6e657774 ('newt')
+4ed40: str r0, [r4]          ; *(self+0) = 'newt'
+4ed44: ldr r0, [pc, #40]    @ 0x4ed74 = 0x63647376 ('cdsv')
+4ed48: str r0, [r4, #4]      ; *(self+4) = 'cdsv'
+```
+
+with `self = r4 = 0x0cc82250` for this allocation. The two literals
+are the magic class IDs used to identify TCardMessage in untyped
+buffers (the constructor calls them after the TAEvent base ctor and
+before its own `Clear`).
+
+**The kicker — page-table alias:**
+
+```
+*** stage-1 walk for VA 0x0cc82250 (TCardMessage write target):
+  L1[0xcc] = 0x04023481  (coarse, L2 @ PA 0x04023400)
+  L2[0x82] = 0x0402a03e  (small)
+  → PA 0x0402a250
+
+*** stage-1 walk for VA 0x0cc7a250 (pckm sp_usr+8 read site):
+  L1[0xcc] = 0x04023481  (same coarse table)
+  L2[0x7a] = 0x0402a03e  (small) ← same PA
+  → PA 0x0402a250
+```
+
+`L2[0x7a]` and `L2[0x82]` of the same kernel L2 table both map to PA
+0x0402a000. So a write through VA 0x0cc82250 lands at the same
+physical page that backs pckm's user-stack VA 0x0cc7a000. When pckm
+next resumes and `PortReceiveSWI` reads `[sp_usr+8]`, it reads the
+"newt"/"cdsv" magic from the TCardMessage instead of the stack
+pointer that `TUPort::Receive` 0x259d2c pushed there.
+
+This is a *kernel-side* divergence — the kernel's heap/page allocator
+picked PA 0x0402a000 for the new TCardMessage even though that page
+was already mapped at VA 0x0cc7a000 as pckm's stack. Einstein doesn't
+do this, so its L2 entries don't alias.
+
+### Open next steps
+
+1. **Find the diverging allocation.** Walk back from the TCardMessage
+   alloc (`__nw__FUi(184)` at trace 180650) and identify why the
+   kernel's TPageManager / heap chose PA 0x0402a000. Compare against
+   Einstein's allocation order.
+2. **Bisect the earlier divergence.** The two implementations agree
+   on L1/L2 layout for many earlier pages. The first L2 entry that
+   diverges between Einstein and our hypervisor is the clue. Add a
+   diagnostic that dumps both L1 + L2 contents at periodic
+   intervals and diff against Einstein's NewtonProbe.
+3. **Investigate likely peripheral-state-driven divergence.** The
+   `TNewCardAsyncMsg` chain is in the PCMCIA card-insertion path
+   (`TCardSocket::~TCardSocket`, `TCardAlertEvent`, `TCardPart-
+   Handler` were already traced as new-territory functions before
+   the fault). Our PCMCIA driver returns different state than
+   Einstein's, plausibly steering the heap allocator down a path
+   that reuses pckm's stack page.
+
+---
+
+## Earlier — kernel-mode "newt" UnhandledException (QEMU + FVP, 2026-04-26)
 
 After resolving the STKU wedge (see "Resolved — STKU wedge: QEMU
 Bug #1 leak from unaligned `msr spsr_el2`" below), QEMU now reaches

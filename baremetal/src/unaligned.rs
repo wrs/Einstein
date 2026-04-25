@@ -165,7 +165,7 @@ pub fn handle_align_fault(ctx: &mut TrapContext) {
         // (ARM) and ERET to the pre-abt mode. If the PC wasn't
         // 4-aligned we just advance by 4 anyway to avoid an infinite
         // trap loop in the trampoline.
-        set_return(faulting_pc.wrapping_add(4), pre_abt_cpsr);
+        set_return(ctx, faulting_pc.wrapping_add(4), pre_abt_cpsr);
         return;
     }
     let decoded = decoded_maybe.unwrap();
@@ -178,7 +178,7 @@ pub fn handle_align_fault(ctx: &mut TrapContext) {
             "unaligned: WARN cond fails (cond={:#x}, CPSR={:#010x}) at PC={:#x} — skipping",
             decoded.cond, pre_abt_cpsr, faulting_pc
         );
-        set_return(faulting_pc.wrapping_add(4), pre_abt_cpsr);
+        set_return(ctx, faulting_pc.wrapping_add(4), pre_abt_cpsr);
         return;
     }
 
@@ -260,7 +260,7 @@ pub fn handle_align_fault(ctx: &mut TrapContext) {
         write_reg(ctx, decoded.rn, pre_mode, ea_offsetted);
     }
 
-    set_return(faulting_pc.wrapping_add(4), pre_abt_cpsr);
+    set_return(ctx, faulting_pc.wrapping_add(4), pre_abt_cpsr);
 }
 
 /// Map an AArch32 register number (0..14) plus pre-abt mode bits to
@@ -320,16 +320,30 @@ fn ctx_slot_for_reg(reg: u32, pre_mode: u32) -> usize {
     }
 }
 
-fn set_return(next_pc: u32, pre_abt_cpsr: u32) {
-    // SAFETY: AArch64 ELR_EL2 / SPSR_EL2 writes override the HVC-entry
-    // defaults so the ERET at the end of `handle_hvc` returns us to
-    // pre-abt mode at next_pc (past the faulting insn).
-    unsafe {
-        core::arch::asm!("msr elr_el2, {}",  in(reg) next_pc as u64,
-            options(nomem, nostack, preserves_flags));
-        core::arch::asm!("msr spsr_el2, {}", in(reg) pre_abt_cpsr as u64,
-            options(nomem, nostack, preserves_flags));
-    }
+fn set_return(ctx: &mut TrapContext, next_pc: u32, _pre_abt_cpsr: u32) {
+    // Avoid `msr spsr_el2, x` from EL2: per docs/QEMU_BUGS.md Bug #1
+    // that write leaks into AArch32 SPSR_svc (banked_spsr[1]) on QEMU
+    // raspi3b. If the alignment fault fires while the guest is mid-SVC
+    // handler (which happens on ~every UstrlenPrivate call — the ROM's
+    // unaligned LDRs over UTF-16 strings), the leak corrupts SPSR_svc
+    // to the SVC pre-fault CPSR. The eventual `movs pc, lr` at the SVC
+    // handler tail then restores CPSR=SVC instead of CPSR=USR, and the
+    // post-svc `mov pc, lr` at GenericSWI 0x3ae1bc self-loops in SVC
+    // mode (LR_svc=0x3ae1bc). Confirmed against a probe that read
+    // SPSR_EL1 before/after the `msr spsr_el2` and saw the leak land
+    // there exactly as Bug #1 predicts.
+    //
+    // Workaround: ERET into the existing UND_RETURN_STUB while leaving
+    // SPSR_EL2 unchanged from its HVC-entry auto-saved value (= ABT
+    // mode CPSR, since the alignment-DABT trampoline HVCs from ABT).
+    // The stub's `ldr lr, [pc, #0]; movs pc, lr` is mode-agnostic — it
+    // transitions architecturally via whichever banked SPSR is in
+    // scope (here SPSR_abt, untouched by any EL2 code, so it still
+    // holds the pre-fault CPSR set by hardware on DABT entry).
+    //
+    // `_pre_abt_cpsr` equals SPSR_abt by construction, so the stub
+    // doesn't need it — kept on the signature for caller clarity.
+    crate::trap::return_to_guest_from_und(ctx, next_pc as u64, 0);
 }
 
 fn dump_state(ctx: &TrapContext, pre_abt_cpsr: u32) {

@@ -75,6 +75,21 @@ const PATCHES_717006: &[RomPatch] = &[
     RomPatch { offset: 0x0042_0750, value: 0x0D09_5000, name: "Time base (1/4)" },
     RomPatch { offset: 0x0042_0798, value: 0x0D09_5000, name: "Time base (2/4)" },
     RomPatch { offset: 0x004D_CA14, value: 0x0D09_5000, name: "Time base (3/4)" },
+    // GetClock / SetAlarm 32-bit-wrap detection: replace `addls`
+    // (less-or-equal) with `addcc` (strictly-less) so the kernel
+    // doesn't treat *equal* successive tick-register reads as a wrap
+    // event. The original code is correct on real hardware where
+    // CNTPCT-equivalent always strictly advances between two reads,
+    // but our `stage2::TICK_PAGE` mapping only refreshes on hypervisor
+    // heartbeat, so two guest tick reads inside one ~16 ms heartbeat
+    // window observe identical values. The ls/cc swap keeps real
+    // wraps detected (new < old) but ignores the spurious equality.
+    // See INVESTIGATION.md "alarm-loop wedge from spurious wrap
+    // detection". Encoding: cond field [31:28] LS=9 → CC=3; the rest
+    // of the instruction (`add Rn, Rn, #1`) is unchanged.
+    RomPatch { offset: 0x003A_D430, value: 0x3281_1001, name: "GetClock wrap-detect ls→cc" },
+    RomPatch { offset: 0x003A_D46C, value: 0x3282_2001, name: "SetAlarm wrap-detect (1/2) ls→cc" },
+    RomPatch { offset: 0x003A_D49C, value: 0x3282_2001, name: "SetAlarm wrap-detect (2/2) ls→cc" },
 ];
 
 /// HVC immediates that the ROM-patched DebugStr / Debugger trap sites

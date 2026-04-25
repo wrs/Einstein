@@ -314,15 +314,50 @@ const K_HDWR_GPIO_R: u64 = 0x0F18_C000;
 const K_HDWR_GPIO_E: u64 = 0x0F18_C400;
 const K_HDWR_GPIO_C: u64 = 0x0F18_C800;
 
-/// Live tick count, scaled from A53 wall clock to Newton's 3.6864 MHz rate.
+/// Monotonic ratchet for `ticks()`. The Newton kernel's `GetClock`
+/// detects a 32-bit wrap by `cmp current_ticks, gClock.low; addls high,
+/// high, #1` — i.e., it treats `current_ticks <= gClock.low` as a wrap.
+/// If two consecutive `ticks()` reads return the same value (which can
+/// happen when CNTPCT hasn't advanced enough between two close calls,
+/// especially under QEMU TCG where CNTPCT advances much slower than wall
+/// clock), the kernel mis-detects a wrap and bumps `gClock.high` even
+/// though no wrap occurred. That permanently desynchronises gClock.high
+/// from alarm.high (which was queued at the un-bumped value), and the
+/// alarm engine wedges in a tight `TTimerEngine::Alarm` loop because
+/// `CompCompare(now, alarm)` returns -1 forever.
+///
+/// Ratchet ensures every read returns strictly greater than the prior
+/// read: if the raw computation comes out equal-or-less, return
+/// last+1 instead. Wrap-detect in `GetClock` still works correctly
+/// after a real wrap (raw becomes much smaller than last, ratchet
+/// outputs `last+1` which then wraps naturally over many calls).
+static LAST_TICKS: AtomicU32 = AtomicU32::new(0);
+
+/// Live tick count, scaled from A53 wall clock to Newton's 3.6864 MHz
+/// rate. Strict-monotonic via `LAST_TICKS` ratchet.
 pub fn ticks() -> u32 {
     let epoch = TICK_EPOCH.load(Ordering::Acquire);
     let now = read_cntpct();
     let elapsed = now.wrapping_sub(epoch);
     let freq = read_cntfrq();
     // ticks = elapsed * NEWTON_TICK_HZ / freq. Reorder to keep within u64.
-    let ticks = (elapsed as u128 * NEWTON_TICK_HZ as u128 / freq as u128) as u64;
-    ticks as u32
+    let raw = (elapsed as u128 * NEWTON_TICK_HZ as u128 / freq as u128) as u32;
+    loop {
+        let last = LAST_TICKS.load(Ordering::Acquire);
+        // If raw advanced, use it. Otherwise step by 1 — must be strictly
+        // greater so the kernel's wrap-detect doesn't fire spuriously.
+        let next = if raw.wrapping_sub(last) != 0 && raw.wrapping_sub(last) < 0x8000_0000 {
+            raw
+        } else {
+            last.wrapping_add(1)
+        };
+        if LAST_TICKS
+            .compare_exchange(last, next, Ordering::Release, Ordering::Acquire)
+            .is_ok()
+        {
+            return next;
+        }
+    }
 }
 
 // ---------- MMIO dispatch ----------------------------------------------------

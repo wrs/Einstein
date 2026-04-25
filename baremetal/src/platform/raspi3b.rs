@@ -27,9 +27,15 @@ pub const DRAM_1GIB_BLOCK: Option<u64> = None;
 /// Newton ticks are nominally 3.6864 MHz. QEMU raspi3b's CNTPCT_EL0
 /// advances at ~0.8 MHz of wall time, so if we report ticks at the real
 /// rate the kernel's calibrated delay loops stall for tens of seconds.
-/// Scaling up 128× keeps boot-wall-clock under a minute. Matches a
-/// similar fudge in Einstein's TInterruptManager::GetTimer.
-pub const NEWTON_TICK_HZ: u64 = 3_686_400 * 128;
+/// Scaling up keeps boot-wall-clock under a minute. Matches a similar
+/// fudge in Einstein's TInterruptManager::GetTimer.
+///
+/// Note: the multiplier is a tradeoff. Too low and early calibrated delay
+/// loops (e.g. BootOS:0x18F38) stall. Too high and the post-UserBoot
+/// alarm engine can't keep up — `TTimerEngine::Alarm` enters a tight loop
+/// re-arming the same alarm because ticks advance faster than gClock can
+/// be updated by the periodic `RestartTimerOverflowDetect` callback.
+pub const NEWTON_TICK_HZ: u64 = 3_686_400 * 16;
 
 /// Route the EL2 physical timer PPI (CNTHPIRQ) to core 0's IRQ input.
 ///

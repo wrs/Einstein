@@ -330,3 +330,8 @@ re-deriving state from disassembly or tool output:
   finish-the-phase semantics.
 - [`docs/peripherals.md`](docs/peripherals.md) — peripheral
   implementations.
+- [`docs/STRUCTURES.md`](docs/STRUCTURES.md) — Newton kernel data
+  structure layouts (TScheduler, TTask, TObjectTable, kernel ID
+  encoding, observed task census). Always extend this when you
+  decode another kernel struct from the disasm — it's how Phase B
+  debugging keeps cumulative.

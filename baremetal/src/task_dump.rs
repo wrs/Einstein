@@ -37,6 +37,35 @@ const G_WANT_SCHED:    u32 = 0x0c10_0fd4;
 const G_HOLD_SCHED:    u32 = 0x0c10_0fd8;
 const G_CURRENT_GLOB:  u32 = 0x0c10_105c;
 
+/// `gObjectTable` is a TObjectTable instance at this VA. We saw it as
+/// `r0=0x0c10fc34` in the trace for `TObjectTable::Get`.
+///
+/// Layout (from `TObjectTable::Init` + `Get`):
+///   +0x00       static handler / vtable ptr (set in Init)
+///   +0x0C       zeroed
+///   +0x10..+0x10+127*4   hash bucket heads (128 buckets of TKernelObject*)
+///
+/// TKernelObject node layout (from `Get`):
+///   +0x00       id (lookup key, also the task/object ID)
+///   +0x04       next-in-hash-chain pointer
+///   ... rest depends on KernelType
+///
+/// ID encoding (from `NewId`):
+///   bits[3:0]   KernelType — actual values empirically derived from
+///               STKU's task->[0] = 0x12e3 (low nibble 3 ⇒ Task). The
+///               DDK header `KernelTypes.h` from OS600 lists these in a
+///               *different* order (Port, Task, Env, Domain, ...) which
+///               doesn't match the 717006 ROM. Inferred 717006 mapping
+///               (TODO confirm Port / Env / etc.):
+///                 3 = Task           8 = Monitor          9 = Phys
+///                 (others observed in trace: 0x2 0x4 0x5 0x7 0xa 0xb)
+///   bits[31:4]  per-type sequence number (NextGlobalUniqueId)
+/// Hash bucket index = (id >> 4) & 0x7F
+const G_OBJECT_TABLE:  u32 = 0x0c10_fc34;
+const OT_BUCKETS_BASE: u32 = 0x10;
+const OT_NUM_BUCKETS:  u32 = 128;
+const OBJ_TYPE_TASK:   u32 = 3;
+
 const TS_HIGHEST_PRI:  u32 = 0x14;
 const TS_PRI_BITMAP:   u32 = 0x18;
 const TS_QUEUES_BASE:  u32 = 0x1c; // 32 * 8 bytes
@@ -174,6 +203,93 @@ fn read_sp_lr_svc() -> (u32, u32) {
     (sp as u32, lr as u32)
 }
 
+/// Determine task state from the (gCurrentTask, run-queue presence,
+/// wait-queue link presence) signals.
+///
+/// - "RUN"   task is gCurrentTask
+/// - "RDY"   task has run-queue links set (TTaskQItem.next/prev non-zero)
+/// - "WAIT"  task has either of the embedded TDoubleQItem links set
+///           (offsets +0xbc, +0xc8)
+/// - "BLK"   none of the above — task is alive but not in any link we
+///           understand. Most likely waiting on a message-port or
+///           shared-mem queue tracked elsewhere (e.g. waiter list owned
+///           by the port). To distinguish from "freshly-Suspended"
+///           we'd need to identify the per-port waiter-list field —
+///           TODO.
+fn task_state(task_va: u32, current: u32) -> &'static str {
+    if task_va == current {
+        return "RUN";
+    }
+    let qnext = rd(task_va + TT_QITEM).unwrap_or(0);
+    let qprev = rd(task_va + TT_QITEM + 4).unwrap_or(0);
+    let wq1n  = rd(task_va + 0xbc).unwrap_or(0);
+    let wq2n  = rd(task_va + 0xc8).unwrap_or(0);
+    if wq1n != 0 || wq2n != 0 { return "WAIT"; }
+    if qnext != 0 || qprev != 0 { return "RDY"; }
+    "BLK"
+}
+
+/// Walk the object table and dump every TASK entry. Use when we want
+/// to see the population of tasks beyond the run queue.
+fn dump_object_table_tasks(current: u32) {
+    let mut total: u32 = 0;
+    let mut tasks: u32 = 0;
+    let mut by_type: [u32; 16] = [0; 16];
+    for bucket in 0..OT_NUM_BUCKETS {
+        let head_va = G_OBJECT_TABLE + OT_BUCKETS_BASE + bucket * 4;
+        let mut node = match rd(head_va) {
+            Some(v) => v,
+            None => continue,
+        };
+        let mut steps = 0u32;
+        while node != 0 && steps < 128 {
+            total += 1;
+            let id = match rd(node) {
+                Some(v) => v,
+                None => break,
+            };
+            let kind = id & 0xF;
+            by_type[kind as usize] += 1;
+            if kind == OBJ_TYPE_TASK {
+                tasks += 1;
+                let state = task_state(node, current);
+                let prio = rd(node + TT_PRIORITY).unwrap_or(u32::MAX);
+                let globals = rd(node + TT_GLOBALS).unwrap_or(u32::MAX);
+                let qnext = rd(node + TT_QITEM).unwrap_or(0);
+                let qprev = rd(node + TT_QITEM + 4).unwrap_or(0);
+                let wq1n  = rd(node + 0xbc).unwrap_or(0);
+                let wq1p  = rd(node + 0xc0).unwrap_or(0);
+                let wq2n  = rd(node + 0xc8).unwrap_or(0);
+                let wq2p  = rd(node + 0xcc).unwrap_or(0);
+                let name  = find_task_name(globals);
+                let (n0, n1, n2, n3) = match name {
+                    Some((_, v)) => ((v>>24) as u8, (v>>16) as u8, (v>>8) as u8, v as u8),
+                    None         => (b'?', b'?', b'?', b'?'),
+                };
+                kprintln!(
+                    "  [{}] task {:#010x} id={:#x} prio={} name='{}{}{}{}' q={:#010x}/{:#010x} wq1={:#010x}/{:#010x} wq2={:#010x}/{:#010x}",
+                    state, node, id, prio,
+                    n0 as char, n1 as char, n2 as char, n3 as char,
+                    qnext, qprev, wq1n, wq1p, wq2n, wq2p,
+                );
+            }
+            node = match rd(node + 4) {
+                Some(v) => v,
+                None => break,
+            };
+            steps += 1;
+        }
+    }
+    kprintln!(
+        "  object table: {} tasks (of {} kernel objects); types[0..15]={} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}  (3=Task, 8=Mon, 9=Phys are confirmed)",
+        tasks, total,
+        by_type[0], by_type[1], by_type[2], by_type[3],
+        by_type[4], by_type[5], by_type[6], by_type[7],
+        by_type[8], by_type[9], by_type[10], by_type[11],
+        by_type[12], by_type[13], by_type[14], by_type[15],
+    );
+}
+
 /// Top-level dump entry. Called from `trap_irq` periodically.
 pub fn dump() {
     let sched = match rd(G_SCHEDULER_PTR) {
@@ -199,6 +315,11 @@ pub fn dump() {
     if curr != 0 {
         kprintln!("  current:");
         dump_task_one_line(curr);
+        // Print the first word at the task pointer — TKernelObject::id
+        // (per TObjectTable::Add `str r0, [r4]`). Tells us the ID and
+        // therefore the encoded KernelType in bits[3:0].
+        let id_word = rd(curr).unwrap_or(u32::MAX);
+        kprintln!("  curr task->[0] = {:#x}  (low nibble = type, high = seq)", id_word);
         // Read SP_EL1 / ELR_EL1 directly from EL2 — flaky on QEMU but
         // useful when not. If non-zero, dump the top of the SVC stack
         // so we can see the recent call-frame chain.
@@ -218,6 +339,9 @@ pub fn dump() {
             }
         }
     }
+
+    kprintln!("  all tasks (object table walk):");
+    dump_object_table_tasks(curr);
 }
 
 /// Heartbeat-rate dump trigger. Returns true on the firing iterations.
@@ -227,8 +351,10 @@ pub fn periodic() -> bool {
         COUNT = COUNT.wrapping_add(1);
         COUNT
     };
-    // Roughly every 64 heartbeats × 16 ms ≈ 1 s.
-    if n % 64 == 0 {
+    // Roughly every 256 heartbeats × 16 ms ≈ 4 s. The object-table walk
+    // touches up to 128 buckets through the stage-1 walker, so keeping
+    // this slow keeps UART noise under control.
+    if n % 256 == 0 {
         dump();
         true
     } else {

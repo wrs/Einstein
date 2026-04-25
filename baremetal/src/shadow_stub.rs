@@ -708,6 +708,7 @@ fn nzcv_dead_at(start_pc: u32, max_instrs: u32) -> bool {
     nzcv_dead_recursive(start_pc, max_instrs, &mut Visited::new(), &code_read_word)
 }
 
+#[cfg(test)]
 fn nzcv_dead_at_with_reader<R>(start_pc: u32, max_instrs: u32, read_insn: &R) -> bool
 where R: Fn(u32) -> Option<u32> {
     nzcv_dead_recursive(start_pc, max_instrs, &mut Visited::new(), read_insn)
@@ -1212,7 +1213,18 @@ where R: Fn(u32) -> Option<u32> {
                 continue;
             }
             BranchKind::BLink { .. } => {
-                // BL: APCS caller-saved are observably clobbered.
+                // BL site: the callee reads R0..R3 as parameter
+                // registers. We don't know the callee's signature, so
+                // conservatively treat all four as live at the call.
+                // Without this, a register that's only read by the
+                // BL itself (e.g. R1 set up earlier with `mov r1, r3`
+                // and consumed by `bl callee`) appears dead in the
+                // straight-line walk between its definition and the
+                // call — and the stub-scratch picker would happily
+                // overwrite it with CPSR. Newton ROM @ 0x13ca08 is
+                // the canonical case that motivated this fix.
+                const APCS_PARAMS: RegMask = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3);
+                live |= APCS_PARAMS & !written;
                 let bl_clobber = APCS_CALLER_SAVED & !live;
                 written |= bl_clobber;
                 pc = pc.wrapping_add(4);
@@ -2837,25 +2849,57 @@ mod tests {
     }
 
     #[test]
-    fn liveness_bl_clobbers_caller_saved() {
+    fn liveness_bl_param_regs_live() {
         // Stream:
         //   MOV r4, #0   ; r4 dead
-        //   BL +0        ; APCS-clobbers R0..R3, R12, LR
+        //   BL +0        ; reads R0..R3 as params; clobbers R12, LR
         //   BX LR        ; return
-        // After this, R0..R3 and R12 are "written" by the BL → dead at start.
+        // R0..R3 are LIVE because the callee reads them as parameter
+        // registers (we don't know the signature, so all four are
+        // assumed live). R12 and LR are dead — written by BL, never
+        // read in the post-BL fragment.
         let stream = [0xE3A0_4000u32, 0xEB00_0000u32, 0xE12F_FF1Eu32];
         let live = live_at_with_reader(0, 16, &|pc| stream.get((pc / 4) as usize).copied());
-        // R12 written by MOV at slot 0... actually no, MOV writes r4 not r12.
-        // BL clobbers R0..R3, R12, LR. So those are dead at start.
-        for r in [0u16, 1, 2, 3, 12] {
-            // R0 is in APCS_RETURN_LIVE (return value), but it's also
-            // clobbered by BL. The BL clobber happens BEFORE the BX LR,
-            // so R0 is "written" by the BL and the BX LR's read is the
-            // post-BL R0 (not the pre-BL one). So R0 ends up dead at
-            // start.
-            assert_eq!(live & (1u16 << r), 0,
-                "r{} should be dead (BL clobber before any read)", r);
+        for r in [0u16, 1, 2, 3] {
+            assert_ne!(live & (1u16 << r), 0,
+                "r{} should be live (BL parameter reg)", r);
         }
+        for r in [4u16, 12, 14] {
+            assert_eq!(live & (1u16 << r), 0,
+                "r{} should be dead (clobbered before any read)", r);
+        }
+    }
+
+    #[test]
+    fn liveness_bl_param_set_just_before_call() {
+        // The Newton ROM @ 0x13ca08 pattern:
+        //   MOV r1, r3    ; set up param r1 from local r3
+        //   ... (linear straight-line code that doesn't touch r1) ...
+        //   BL callee     ; consumes r1 as a param
+        // r1 must be reported as LIVE at start (the BL consumes the
+        // value `mov r1, r3` placed there). Pre-fix, the walker missed
+        // this and the inline-stub picker would happily clobber r1
+        // with CPSR.
+        let stream = [
+            0xE1A0_1003u32, // MOV r1, r3
+            0xE3A0_5000u32, // MOV r5, #0   (filler — doesn't touch r1)
+            0xE3A0_6000u32, // MOV r6, #0
+            0xEB00_0000u32, // BL +0
+            0xE12F_FF1Eu32, // BX LR
+        ];
+        let live = live_at_with_reader(0, 16, &|pc| stream.get((pc / 4) as usize).copied());
+        // r1 was written by `mov r1, r3` so r1 is dead at start
+        // (the BL's read of r1 is satisfied by the local write).
+        assert_eq!(live & (1u16 << 1), 0,
+            "r1 dead at start — `mov r1, r3` writes it before the BL");
+        // But r3 IS live at start: it was read by `mov r1, r3` and
+        // then the BL's read of r1 (which now == the original r3) is
+        // not what we're tracking. r3 is live because the local
+        // instruction `mov r1, r3` reads it.
+        assert_ne!(live & (1u16 << 3), 0, "r3 live at start (read by `mov r1, r3`)");
+        // r0, r2 are param-live (BL reads them, never written locally).
+        assert_ne!(live & (1u16 << 0), 0, "r0 param-live");
+        assert_ne!(live & (1u16 << 2), 0, "r2 param-live");
     }
 
     #[test]

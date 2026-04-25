@@ -3,7 +3,83 @@
 Live notes. Update as we learn more; remove old updates as we move on to
 new stalls.
 
-## Currently at — boot wedges inside StackManager monitor's page-copy SWI; sound IRQ injection partially unblocks (QEMU, 2026-04-25 evening)
+## Currently at — sound subfn map known; wedge in StackManager page-copy persists (QEMU, 2026-04-25 late)
+
+Captured the actual native-primitive subfn sequence the Newton kernel
+exercises during sound init by adding "first-occurrence" logging in
+`peripherals/sound.rs::handle`:
+
+```
+sound: first subfn 0x1f @PC=0x8013f8 r1=0x400 r2=0x1000 r3=0xc401420
+sound: first subfn 0x5  @PC=0x8011f0 r1=0xcc84140 r2=0xea0 r3=0xcc85030
+sound: first subfn 0x6  @PC=0x801204 r1=0xcc86030 r2=0xea0 r3=0xcc87030
+sound: first subfn 0xa  @PC=0x801254 (PowerOutputOff)
+sound: first subfn 0xc  @PC=0x80127c (PowerInputOff)
+sound: first subfn 0x1e @PC=0x8013e4 (InputIntHandler  — only after our injection fires INT_DMA3)
+sound: first subfn 0x1d @PC=0x8013d0 (OutputIntHandler — only after our injection fires INT_DMA5)
+```
+
+So the kernel's sound init goes:
+1. `NativeSetInterruptMask(input=INT_DMA3=0x400, output=INT_DMA5=0x1000)`
+2. `SetOutputBuffers(0xcc84140, 0xea0, 0xcc85030, 0xea0)` — two 0xea0-byte
+   output buffers in RAM.
+3. `SetInputBuffers(0xcc86030, 0xea0, 0xcc87030, 0xea0)` — likewise input.
+4. `PowerOutputOff` / `PowerInputOff`.
+5. End of sound init — kernel proceeds, never calls subfn 0x07
+   (ScheduleOutputBuffer), 0x09 (PowerOutputOn), or 0x0d (StartOutput).
+   So the sound subsystem is configured but parked.
+
+`GetSoundHardwareInfo` (subfn 0x04) is NOT called during the early-boot
+path — our previous suspicion that the kernel needed the 7-word info
+struct written is false. We still implement Einstein's behaviour
+(write the struct + return 0) so future paths that exercise it
+behave the same as Einstein, but it's not load-bearing for this stall.
+
+The subfn 0x1d / 0x1e firings only happen after our wedge probe
+injects INT_DMA3 + INT_DMA5; the kernel's IRQ path runs the IH chain
+and SendForInterrupt queues a deferred message. **That alone doesn't
+unblock the boot**: heartbeat continues to show PC=0x3ae1bc (= post-
+SVC#5 mov pc,lr in GenericSWI) with int_present=0x40 (TIMER_3 latched
+but unused) and irq_pend=false.
+
+The actual wedge: TStackManager monitor task (id 0x0c113dd8) is
+processing the sound task's `LockStack` collision through
+`FMLockHeapRange / ResolveFault / CopyPageAfterCollisionSWI`. Two
+collision iterations get traced (155559, 155720) — the loop is real
+and per-iteration work is ~270 trace lines — but no further unique
+functions appear past trace ~156725. SwapInGlobals shows
+~10 distinct tasks rotating through the scheduler (so it's not a
+classic deadlock), but the user/svc paths only re-enter
+already-traced code.
+
+Heartbeat reads of `SP_EL1=0 ELR_EL1=0` (= AArch32 R13_svc/R14_svc
+when at EL1 AArch32 SVC) from EL2 are likely unreliable on QEMU
+raspi3b — see `docs/QEMU_BUGS.md`. The existing `handle_diag_lr` path
+uses a guest-side stub to read banked regs into RAM precisely because
+LLVM's AArch64 `MRS sp_svc` / `MRS lr_svc` plumbing on QEMU is
+documented-flaky. Snapshot saves at sync-trap time read non-zero
+values via the same sysregs, suggesting the readback is only
+unreliable from EL2 IRQ-trap context.
+
+Pending-work hypothesis: the StackManager monitor task is **looping
+correctly** but each iteration enters only previously-traced code, so
+the function tracer's "first-occurrence" view shows no progress. The
+real boot may eventually complete the loop. Worth running for 5+ min
+or moving the trace from "first occurrence" to "every-Nth call" to
+confirm forward progress vs. true wedge.
+
+Open next steps:
+1. Use ghidra MCP to read the kernel-mode REx-side `0x1b16b6c b
+   0x1f7540` chain's caller frame (`FMLockHeapRange`) and identify
+   what loop bound it's iterating to — see whether the boot is
+   waiting for many pages to copy or just a few.
+2. Verify SP_svc/LR_svc on FVP at the wedge — if they read sane
+   values there, the QEMU readback was the misdiagnosis source.
+3. Switch the function tracer to "log every Nth call" or wire a
+   per-call counter so we can see whether already-traced functions
+   are being re-entered (real progress) or genuinely stuck.
+
+## Resolved (was) — boot wedges inside StackManager monitor's page-copy SWI; sound IRQ injection partially unblocks (QEMU, 2026-04-25 evening)
 
 The "kernel waiting for sound DMA IRQ" hypothesis below was tested and is
 **partially correct but not the primary blocker**:

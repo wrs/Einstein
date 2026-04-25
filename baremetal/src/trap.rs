@@ -218,10 +218,51 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
         let int_present = vic::int_present_raw();
         let int_ctrl = vic::int_ctrl_raw();
         let irq_pend = vic::irq_pending();
+        // SP_EL1 / ELR_EL1 are AArch64 aliases of AArch32 SP_svc / LR_svc
+        // (same physical registers). Reading them is side-effect-free
+        // and tells us where the SVC-mode call stack is parked when the
+        // guest is wedged in a kernel idle loop.
+        let sp_svc = read_sysreg!("sp_el1") as u32;
+        let lr_svc = read_sysreg!("elr_el1") as u32;
         kprintln!(
-            "timer_irq[{}]: guest ELR={:#x} SPSR={:#x} FAR_EL1={:#x} intid={} VI={} int_present={:#x} int_ctrl={:#x} irq_pend={}",
-            tag, elr, spsr, far, intid, vi, int_present, int_ctrl, irq_pend
+            "timer_irq[{}]: ELR={:#x} SPSR={:#x} SP_svc={:#x} LR_svc={:#x} FAR_EL1={:#x} intid={} VI={} ipres={:#x} ictrl={:#x} pend={}",
+            tag, elr, spsr, sp_svc, lr_svc, far, intid, vi, int_present, int_ctrl, irq_pend
         );
+    }
+
+    // Wedge probe: if the guest's PC parks at the same value across many
+    // consecutive heartbeats AND the int_ctrl mask says sound-DMA IRQs
+    // are enabled (TSoundServer::TheMain has run and registered them),
+    // periodically inject a synthetic sound-DMA-complete IRQ. This
+    // tests the Phase-B hypothesis that the boot wedges after sound
+    // init because the kernel has armed a wait on a sound-DMA IRQ that
+    // we never fire. If the kernel resumes forward progress after
+    // injection, we know the gating factor; we can then move the
+    // injection to a more targeted path (e.g., a real sound-driver
+    // StartOutput emulation).
+    static mut WEDGE_SAME_PC: u64 = 0;
+    static mut WEDGE_LAST_PC: u64 = u64::MAX;
+    static mut WEDGE_INJECT_COUNT: u64 = 0;
+    // SAFETY: single-threaded.
+    unsafe {
+        if elr == WEDGE_LAST_PC {
+            WEDGE_SAME_PC += 1;
+        } else {
+            WEDGE_LAST_PC = elr;
+            WEDGE_SAME_PC = 1;
+        }
+        let int_ctrl = vic::int_ctrl_raw();
+        let sound_armed = (int_ctrl & 0x0000_1400) == 0x0000_1400; // DMA3+DMA5
+        if WEDGE_SAME_PC >= 64 && WEDGE_SAME_PC % 32 == 0 && sound_armed {
+            WEDGE_INJECT_COUNT += 1;
+            if WEDGE_INJECT_COUNT <= 4 {
+                kprintln!(
+                    "wedge-probe: PC={:#x} stuck for {} samples; injecting sound DMA IRQ (#{})",
+                    elr, WEDGE_SAME_PC, WEDGE_INJECT_COUNT
+                );
+            }
+            vic::inject_sound_dma_irq();
+        }
     }
 
     if !spurious {

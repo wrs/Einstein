@@ -576,6 +576,49 @@ void task_dump(TMemory* mem, const char* tag) {
 	std::fflush(stdout);
 }
 
+// Dump the SWIBoot context-save area (task+0x10..+0x54) of `task_va`,
+// plus 16 words of the user stack at saved sp_usr. Used to cross-check
+// our baremetal save area against Einstein's at the same task slot.
+void task_dump_save_area(TMemory* mem, KUInt32 task_va) {
+	const char* names[17] = {
+		"r0 ","r1 ","r2 ","r3 ",
+		"r4 ","r5 ","r6 ","r7 ",
+		"r8 ","r9 ","sl ","fp ",
+		"ip ",
+		"sp_usr","lr_usr","PC ","SPSR",
+	};
+	KUInt32 idword=0; td_read(mem, task_va, idword);
+	KUInt32 globals=0; td_read(mem, task_va + kTTGlobals, globals);
+	KUInt32 nm=0; td_find_task_name(mem, globals, nm);
+	std::fprintf(stdout, "  save-area task=0x%08x id=0x%x name='%c%c%c%c':\n",
+		task_va, idword,
+		(int)((nm>>24)&0xff), (int)((nm>>16)&0xff),
+		(int)((nm>>8)&0xff),  (int)(nm&0xff));
+	for (int i = 0; i < 17; ++i) {
+		KUInt32 off = 0x10 + i*4;
+		KUInt32 v=0; td_read(mem, task_va + off, v);
+		std::fprintf(stdout, "    +0x%02x %-6s = 0x%08x\n", off, names[i], v);
+	}
+	KUInt32 sp_usr=0; td_read(mem, task_va + 0x44, sp_usr);
+	if (sp_usr != 0 && sp_usr != ~0u) {
+		std::fprintf(stdout, "    user stack window @ sp_usr=0x%08x (+/-0x80):\n", sp_usr);
+		for (int i = 0; i < 32; ++i) {
+			int off = (i - 8) * 4;
+			KUInt32 va = sp_usr + (KUInt32)off;
+			KUInt32 v=0; td_read(mem, va, v);
+			const char* mark = (off == 0) ? " <- sp" : "";
+			std::fprintf(stdout, "      [%+4d] 0x%08x = 0x%08x%s\n", off, va, v, mark);
+		}
+		// Stage-1 walk: print PA backing sp_usr so we can compare across
+		// implementations. Einstein has TranslateR(va, pa).
+		KUInt32 pa = 0;
+		bool fault = mem->TranslateR(sp_usr, pa);
+		std::fprintf(stdout, "    sp_usr stage-1 walk: VA 0x%08x -> PA 0x%08x  (fault=%d)\n",
+			sp_usr, pa, fault ? 1 : 0);
+	}
+	std::fflush(stdout);
+}
+
 void usage(const char* argv0) {
 	std::fprintf(stderr,
 		"usage: %s <rom.bin> [rex.bin|-] [wall-seconds]\n"
@@ -644,6 +687,13 @@ int main(int argc, char** argv) {
 			char tag[32];
 			std::snprintf(tag, sizeof(tag), "t=%ds", dump_n * 2 + 2);
 			task_dump(emu.GetMemory(), tag);
+			// Cross-check the cdsv-vs-pckm slot: in our hypervisor this
+			// task struct currently faults with FAR=0x6e657774 ("newt")
+			// on resume because user RAM at sp_usr+8 holds the literal
+			// ASCII fourcc. Dump Einstein's view of the same struct so
+			// we can see (a) whether the saved sp_usr matches and (b)
+			// what's in the user stack at that VA.
+			task_dump_save_area(emu.GetMemory(), 0x0c118dd8u);
 			next_dump += std::chrono::seconds(2);
 			++dump_n;
 		}

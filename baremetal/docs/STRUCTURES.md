@@ -118,6 +118,39 @@ struct TTask /* : TKernelObject */ {           // total = 0x104 (260 B)
     TObjectId  bequeath_id;     // +0xfc   set by SetBequeathId
     void*      bequeath_obj;    // +0x100  set by SetBequeathId
 };
+
+// SWIBoot context-save area (offsets relative to TTask base).
+// Citations: SWIBoot save side at 0x3ad864..0x3ad8dc, restore side
+// at 0x3ad9a4..0x3ad9c4 + final `movs pc, lr` at 0x3ada6c.
+struct TTaskSavedContext {  // sits at &TTask + 0x10, 84 bytes (21 words)
+    ULong r0;        // +0x10   popped pre-restore at 0x3ad9f8 ldm r0,{r0..r12}
+    ULong r1;        // +0x14
+    ULong r2;        // +0x18   stmiane r1!,{r2..r7} writes r2..r7 at +0x18..+0x2c
+    ULong r3;        // +0x1c
+    ULong r4;        // +0x20
+    ULong r5;        // +0x24
+    ULong r6;        // +0x28
+    ULong r7;        // +0x2c
+    // For USR-mode resume (SPSR.mode==0x10): the next 7 words come
+    // from a STM with `^` and so are the user-mode banked R8..R12,
+    // SP_usr, LR_usr (not the active mode's banked regs).
+    ULong r8_usr;    // +0x30
+    ULong r9_usr;    // +0x34
+    ULong sl_usr;    // +0x38
+    ULong fp_usr;    // +0x3c
+    ULong ip_usr;    // +0x40
+    ULong sp_usr;    // +0x44   ← what `^`-banked STM at 0x3ad880 stores
+    ULong lr_usr;    // +0x48
+    // For UND-mode resume (SPSR.mode==0x1B): the kernel skips the
+    // `^`-LDM and instead at 0x3ad9d0..3ad9e8 reads sp_und from +0x44
+    // and lr_und from +0x48, then runs a non-banked LDM r0..r12.
+    ULong saved_pc;  // +0x4c   target of `movs pc, lr` at 0x3ada6c
+    ULong saved_spsr;// +0x50   `msr SPSR_fc, r1` then movs restores CPSR
+};
+// Total TTask size from ctor (at 0x252190) is 0x104 bytes; the save
+// area lives in the gap between fields explicitly written by the ctor.
+// The ctor itself does not zero the save area — it's overwritten on
+// the task's first scheduler-save.
 struct TTaskQItem {             // 40 bytes
     TTask*  next;               // +0x00
     TTask*  prev;               // +0x04   (queue head goes here for tail; verify)
@@ -321,6 +354,42 @@ sits at `(gCurrentGlobals − sizeof) + 0x4c`. Empirically, on
 heuristic backwards-search, fourcc names show up at
 `gCurrentGlobals − 8` for tasks observed so far — implying the
 struct is exactly 0x54 bytes for this build (so name @ 0x54−8=0x4c).
+
+---
+
+## TAEventHandler (ROM `__24TAEventHandler` / `Init` at `0x25628`)
+
+`TAEventHandler::Init(self, class, signal)` writes (citations from
+the disassembly at 0x25628..0x25650):
+
+```c
+struct TAEventHandler {       // size unknown, observed +0x08..+0x0c
+    void*  vtable;            // +0x00
+    // +0x04   unknown
+    ULong  signal;            // +0x08   ← `str r2, [r0, #8]`  (signal arg)
+    ULong  class;             // +0x0c   ← `str r1, [r0, #12]` (class arg)
+    // ... rest unknown
+};
+```
+
+Note the parameter order to `Init`: r1 = class fourcc, r2 = signal
+fourcc. Storage order in the object: signal at +0x08, class at +0x0c
+— **not the same order as the C++ argument list**.
+
+Used by `TAppWorld::AEInstallHandler` (called immediately after Init
+at 0x25648) to register the handler for an (class, signal) pair.
+
+Diagnostic relevance: on the Phase B "newt" DABT, our hypervisor's
+pckm task sees `0x6e657774` ("newt") at `sp_usr+0x08` and
+`0x63647376` ("cdsv") at `sp_usr+0x0c`. That's exactly the layout of
+a `TAEventHandler` with `class='cdsv', signal='newt'` placed at
+`sp_usr`. Cross-check: trace 183155 in our run has
+`Init(handler=0x0c602e2c, class='cdsv', signal='newt')` — same fourcc
+pair, but installed at a *different* handler address. The pckm
+divergence appears to be that our kernel state ends up with this
+fourcc pair sitting on top of pckm's user stack frame, which Einstein
+never produces (in Einstein the stack at `sp_usr+0x08` holds a normal
+stack-pointer pushed by `TUPort::Receive` 0x259d2c).
 
 ---
 

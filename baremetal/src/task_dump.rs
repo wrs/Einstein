@@ -344,6 +344,112 @@ pub fn dump() {
     dump_object_table_tasks(curr);
 }
 
+/// Dump the SWIBoot context-save area of `task_va` — the 21-word
+/// region at +0x10..+0x54 the SVC scheduler reads at 0x3ad9a4..0x3ad9c4
+/// to ERET back into the task. Layout (citations: 0x3ad8cc..0x3ad8dc
+/// for the save side, 0x3ad9a4..0x3ad9c4 + 0x3ada6c for the restore /
+/// movs-pc-lr side):
+///
+///   +0x10 r0  +0x14 r1  +0x18 r2  +0x1c r3
+///   +0x20 r4  +0x24 r5  +0x28 r6  +0x2c r7
+///   +0x30 r8  +0x34 r9  +0x38 sl  +0x3c fp
+///   +0x40 ip
+///   +0x44 sp_usr   +0x48 lr_usr
+///   +0x4c saved-pc (LR_svc at SWI tail; becomes target of `movs pc, lr`)
+///   +0x50 saved-SPSR (CPSR to restore via `msr SPSR_fc` then `movs`)
+pub fn dump_save_area(label: &str, task_va: u32) {
+    let id   = rd(task_va).unwrap_or(u32::MAX);
+    let glob = rd(task_va + TT_GLOBALS).unwrap_or(u32::MAX);
+    let name = find_task_name(glob);
+    let (n0, n1, n2, n3) = match name {
+        Some((_, v)) => ((v>>24) as u8, (v>>16) as u8, (v>>8) as u8, v as u8),
+        None         => (b'?', b'?', b'?', b'?'),
+    };
+    kprintln!(
+        "  save-area [{}] task={:#010x} id={:#x} name='{}{}{}{}':",
+        label, task_va, id, n0 as char, n1 as char, n2 as char, n3 as char,
+    );
+    let names = [
+        "r0 ", "r1 ", "r2 ", "r3 ",
+        "r4 ", "r5 ", "r6 ", "r7 ",
+        "r8 ", "r9 ", "sl ", "fp ",
+        "ip ",
+        "sp_usr", "lr_usr",
+        "PC ", "SPSR",
+    ];
+    for (i, lab) in names.iter().enumerate() {
+        let off = 0x10 + (i as u32) * 4;
+        let va  = task_va + off;
+        let v   = rd(va).unwrap_or(u32::MAX);
+        kprintln!("    +{:#04x} {:6} = {:#010x}", off, lab, v);
+    }
+    // Also dump 64 words spanning sp_usr ± 32. The faulting site is
+    // typically a stack load just past sp_usr; corruption can extend
+    // beyond the immediate window, so widen to see the boundary.
+    let sp_usr = rd(task_va + 0x44).unwrap_or(0);
+    if sp_usr != 0 && sp_usr != u32::MAX {
+        kprintln!("    user stack window @ sp_usr={:#010x} (±0x80):", sp_usr);
+        for i in 0..32i32 {
+            let off = (i - 8) * 4;
+            let va = sp_usr.wrapping_add(off as u32);
+            let v  = rd(va).unwrap_or(u32::MAX);
+            let mark = if off == 0 { " <- sp" } else { "" };
+            kprintln!("      [{:+4}] {:#010x} = {:#010x}{}", off, va, v, mark);
+        }
+        kprintln!("    stage-1 walk for sp_usr:");
+        crate::guest_mem::dump_stage1_walk(sp_usr);
+        // Also walk a few aliasing-suspect VAs: any AEInstallHandler
+        // we registered with class/signal pairs lands signal at +8 and
+        // class at +12 of its TAEventHandler. If our user stack at
+        // sp_usr+8/+12 contains 'newt'/'cdsv', the suspect handler is
+        // at VA 0x0c602e2c (per trace 183155). If those VAs walk to
+        // the same PA as sp_usr → confirmed stage-1 alias.
+        kprintln!("    stage-1 walk for 0x0c602e2c (suspected alias):");
+        crate::guest_mem::dump_stage1_walk(0x0c602e2c);
+    }
+}
+
+/// One-shot diagnostic: dump the SWIBoot save area for every task
+/// in the object table whose fTaskName matches `name_match` (4-char
+/// ASCII; `?` = wildcard byte). Plus the current task. Useful when
+/// chasing per-task corruption: at the moment the "newt" DABT fires
+/// we want to see all tasks named 'cdsv'.
+pub fn dump_save_area_for_named(name_match: &[u8; 4]) {
+    let curr = rd(G_CURRENT_TASK).unwrap_or(0);
+    if curr != 0 {
+        dump_save_area("CURR", curr);
+    }
+    for bucket in 0..OT_NUM_BUCKETS {
+        let head_va = G_OBJECT_TABLE + OT_BUCKETS_BASE + bucket * 4;
+        let mut node = match rd(head_va) {
+            Some(v) => v,
+            None => continue,
+        };
+        let mut steps = 0u32;
+        while node != 0 && steps < 128 {
+            let id = match rd(node) { Some(v) => v, None => break };
+            if (id & 0xF) == OBJ_TYPE_TASK {
+                let glob = rd(node + TT_GLOBALS).unwrap_or(u32::MAX);
+                if let Some((_, v)) = find_task_name(glob) {
+                    let bytes = [(v>>24) as u8, (v>>16) as u8, (v>>8) as u8, v as u8];
+                    let mut hit = true;
+                    for i in 0..4 {
+                        if name_match[i] != b'?' && name_match[i] != bytes[i] {
+                            hit = false;
+                            break;
+                        }
+                    }
+                    if hit && node != curr {
+                        dump_save_area("OBJ ", node);
+                    }
+                }
+            }
+            node = match rd(node + 4) { Some(v) => v, None => break };
+            steps += 1;
+        }
+    }
+}
+
 /// Heartbeat-rate dump trigger. Returns true on the firing iterations.
 pub fn periodic() -> bool {
     static mut COUNT: u64 = 0;

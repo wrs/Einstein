@@ -5,13 +5,21 @@
 //! names so cross-referencing `docs/peripherals.md` and
 //! `Emulator/T*.cpp` stays straightforward.
 
+pub mod battery;
 pub mod dma;
 pub mod flash;
 pub mod flash_driver;
+pub mod host_call;
+pub mod in_translator;
 pub mod native_primitives;
+pub mod network;
+pub mod out_translator;
 pub mod platform;
 pub mod pcmcia;
+pub mod printer;
 pub mod screen;
 pub mod serial;
+pub mod serial_driver;
 pub mod sound;
+pub mod tablet;
 pub mod vic;

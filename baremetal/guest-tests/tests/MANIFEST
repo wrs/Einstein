@@ -21,3 +21,12 @@ test_shadow_stub
 test_spsr_eret
 test_spsr_eret_und
 test_rotate_ldr
+test_battery
+test_tablet
+test_serial_driver
+test_translators
+test_host_call
+test_network
+test_printer
+test_sound
+test_bio_bank

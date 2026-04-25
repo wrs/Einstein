@@ -230,6 +230,11 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
         );
     }
 
+    // Periodic scheduler / run-queue dump. Cheap (64-iteration stride) and
+    // gives forward-progress signal that's independent of the function
+    // tracer (which only sees calls into traced ROM functions).
+    crate::task_dump::periodic();
+
     // Wedge probe: if the guest's PC parks at the same value across many
     // consecutive heartbeats AND the int_ctrl mask says sound-DMA IRQs
     // are enabled (TSoundServer::TheMain has run and registered them),

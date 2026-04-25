@@ -3,7 +3,80 @@
 Live notes. Update as we learn more; remove old updates as we move on to
 new stalls.
 
-## Currently at — sound subfn map known; wedge in StackManager page-copy persists (QEMU, 2026-04-25 late)
+## Currently at — wedge isolated to STKU monitor task body (QEMU, 2026-04-25 night)
+
+Added `src/task_dump.rs`: walks the scheduler at `*0x0c100fd0`,
+gCurrentTask at `*0x0c101000`, the per-priority TTaskQueues at
+`gScheduler+0x1c+prio*8`, and decodes the task fourcc name from
+STaskSwitchedGlobals.fTaskName (heuristic search a few words below
+each task's `globals` pointer at `task+0xa0`).
+
+At the wedge state, the dump consistently reports:
+
+```
+task_dump: gSched=0xc1084b4 curr=0xc113dd8 highest_pri=10 bitmap=0x400
+           last_rem=0x0 want=0 hold=0 curr_glob=0xc11446c
+  current:
+  task 0x0c113dd8 prio=20 name=STKU globals=0x0c11446c q=0/0 stk_bot=0x0c114030
+  prio 10 queue@0xc108520:
+  task 0x0c119c74 prio=10 name=name globals=0x0c320a58 ...   (NameServer task)
+  task 0x0c1180a8 prio=10 name=drvl globals=0x0cc82790 ...   (driver loader)
+```
+
+Key facts the dump establishes:
+
+1. **Scheduler state is healthy**: `gWantSchedule=0`, `gHoldSchedule=0`,
+   highest occupied priority = 10, bitmap=0x400 (only bucket 10 set).
+   `gCurrentTask` = STKU at priority 20 with `q.next=0 q.prev=0` —
+   correctly removed from the run queue while running.
+2. **Newton priority convention** (verified from `TScheduler::Add`'s
+   `cmp r0, r4 / movcc r0, r4` against `highest_pri`): higher number =
+   higher priority. So STKU (prio 20) > drvl/name (prio 10) — the
+   scheduler is right not to preempt with the lower-priority ready
+   tasks.
+3. **Only TWO ready tasks in the system** (drvl, name). Sound server,
+   pkg, the TStackManager user etc. are all blocked on
+   semaphores/ports — they don't appear in any per-priority run
+   queue. (Walking blocked-task lists from semaphore wait queues
+   would need the gObjectTable scan; not yet wired.)
+4. **STKU's wq1/wq2 links are 0** at task+0xbc/0xc8 — STKU isn't
+   waiting on a semaphore-queue or port-queue we know to look at.
+
+So the wedge is **inside the STKU monitor task's execution body**,
+not a scheduler/dispatcher bug. From the snapshot at PC=0x3ae1bc
+LR_svc=0x1f7cc4 the call frame is `TStackManager::ResolveFault →
+CopyPageAfterCollisionSWI → GenericSWI tail` — i.e., the SWI
+returned (heartbeat fires *post*-svc-ret). The next instructions to
+execute would be `add sp, sp, #40` then `b 0x1f7ab0`
+(`Release(semaphore); ldrb [r4,#192]; …`) which loops back into
+ResolveFault. None of that shows in the function tracer — the
+loop body is either doing all of it inside the same already-traced
+functions OR genuinely not executing.
+
+QEMU SP_EL1 / ELR_EL1 readback from EL2 IRQ context returns 0
+(documented QEMU bug — see `docs/QEMU_BUGS.md`). So the dump's
+"SP_EL1=0 ELR_EL1=0" line is not informative on QEMU; FVP is the
+only way to verify SP_svc/LR_svc directly.
+
+Open next steps:
+
+1. **Run on FVP** to (a) confirm the wedge reproduces, (b) read
+   SP_EL1/ELR_EL1 reliably, (c) get a bounded tarmac trace across a
+   single iteration of the supposed STKU loop body — that should
+   reveal whether STKU is genuinely spinning at a single PC or
+   advancing in untraced code.
+2. **Walk gObjectTable** (`*0x0c10fc34`) from the dump to enumerate
+   ALL tasks (not just the run-queue ones) and their state — gives
+   a picture of which tasks are blocked on what semaphore /
+   message port. The run-queue dump only shows ready tasks; blocked
+   tasks live in object-specific waiter lists.
+3. **Mirror dump in NewtonProbe** so we can compare the same
+   scheduler state at the matching boot point in Einstein. If
+   Einstein gets past this with the same task layout, the bug is
+   in our hypervisor; if Einstein wedges similarly, it's a ROM
+   patch or oracle issue.
+
+## Resolved (was) — sound subfn map known; wedge in StackManager page-copy persists (QEMU, 2026-04-25 late)
 
 Captured the actual native-primitive subfn sequence the Newton kernel
 exercises during sound init by adding "first-occurrence" logging in

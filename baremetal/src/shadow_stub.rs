@@ -103,9 +103,23 @@ pub const SBA_MAX_SITES: usize = (SBA_UDF_MAX - SBA_UDF_BASE) as usize + 1;
 // Sits between the tracer pool (0x0090_0000..0x00E0_0000) and the ROM-tail
 // trampoline cluster (0x00FF_FF00..0x00FF_FFF0). Tracer's
 // `in_reserved_range` excludes this window too.
+//
+// Slots are 12 words to accommodate two stub variants in a single
+// fixed-size pool:
+//   - "dead-reg" stub (preferred, when liveness finds 2 dead scratch
+//     candidates or 1 dead candidate + dead NZCV): slots 0, 1, 9, 10
+//     are NOPs; slots 2–8, 11 carry the body.
+//   - "stack" stub (fallback when no dead candidates exist): slots 0/1
+//     PUSH scratch_ea / scratch_fl onto the mode-banked SP, slots 9/10
+//     POP them back.
+//
+// The EA-compute step uses TWO ADDs (or SUBs) to handle 12-bit
+// immediates that don't fit a single ARM modified-immediate (8-bit
+// rotated). Newton ROM byte accesses with offsets > 0xFF (e.g.
+// `ldrb r0, [r0, #0x156]` at 0x26fc0) need this split.
 pub const SBA_STUB_POOL_IPA: u32 = 0x00E0_0000;
 pub const SBA_STUB_POOL_END: u32 = 0x00FF_FF00;
-pub const SBA_STUB_WORDS: usize = 7;
+pub const SBA_STUB_WORDS: usize = 12;
 pub const SBA_STUB_BYTES: u32 = (SBA_STUB_WORDS as u32) * 4;
 pub const SBA_STUB_MAX: usize =
     ((SBA_STUB_POOL_END - SBA_STUB_POOL_IPA) / SBA_STUB_BYTES) as usize;
@@ -462,6 +476,24 @@ mod encode {
         (AL << 28) | 0x010F_0000 | (rd << 12)
     }
 
+    /// NOP A1 encoding (`mov r0, r0` is the canonical form, but ARMv7
+    /// has a dedicated NOP hint at `0xE320_F000`). Use the hint —
+    /// processors recognise it as a true no-op without reading or
+    /// writing R0.
+    pub fn nop() -> u32 {
+        0xE320_F000
+    }
+
+    /// STR Rt, [SP, #-4]!  — push one register (pre-index, U=0, W=1).
+    pub fn push(rt: u32) -> u32 {
+        (AL << 28) | 0x052D_0004 | (rt << 12)
+    }
+
+    /// LDR Rt, [SP], #4    — pop one register (post-index, U=1, W=0).
+    pub fn pop(rt: u32) -> u32 {
+        (AL << 28) | 0x049D_0004 | (rt << 12)
+    }
+
     /// MSR CPSR_f, Rm — write only the flag field (NZCV) from Rm.
     pub fn msr_cpsr_f(rm: u32) -> u32 {
         (AL << 28) | 0x0128_F000 | rm
@@ -602,6 +634,135 @@ fn branch_target(insn: u32, pc: u32) -> u32 {
     // Sign-extend imm24 to 32 bits, shift left 2.
     let signed = ((imm24 as i32) << 8) >> 6; // ((<<8)>>8) sign-extends to 32; <<2 for word
     pc.wrapping_add(8).wrapping_add(signed as u32)
+}
+
+/// NZCV interaction of a single instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NzcvEffect {
+    /// Doesn't read or write the flags.
+    None,
+    /// Reads NZCV (any conditional instruction except AL/NV, plus Bcc).
+    Read,
+    /// Unconditionally writes NZCV (CMP/TST/TEQ/CMN, S=1 DP, MSR cpsr_f).
+    Write,
+}
+
+/// Per-insn NZCV effect derived from the encoding. The walker uses
+/// this to decide whether the inline stub's CMP-clobber is observable
+/// (i.e. whether NZCV is live at orig_pc+4).
+fn analyze_nzcv(insn: u32) -> NzcvEffect {
+    let cond = (insn >> 28) & 0xF;
+    if cond == 0xF { return NzcvEffect::None; }
+    let cond_uses_flags = !matches!(cond, 0xE | 0xF);
+
+    // Bcc: cond 101 L imm24
+    if (insn & 0x0E00_0000) == 0x0A00_0000 {
+        return if cond_uses_flags { NzcvEffect::Read } else { NzcvEffect::None };
+    }
+
+    // DP-immediate / DP-reg / DP-reg-shifted: S bit (bit 20) = write NZCV.
+    // CMP/TST/TEQ/CMN always write (their opcodes 0b1000..1011 imply S).
+    let is_dp_imm = (insn & 0x0E00_0000) == 0x0200_0000;
+    let is_dp_reg_imm = (insn & 0x0E00_0010) == 0x0000_0000;
+    let is_dp_reg_shf = (insn & 0x0E00_0090) == 0x0000_0010;
+    if is_dp_imm || is_dp_reg_imm || is_dp_reg_shf {
+        let opc = (insn >> 21) & 0xF;
+        let s_bit = (insn >> 20) & 1;
+        let cmp_class = matches!(opc, 0b1000 | 0b1001 | 0b1010 | 0b1011);
+        // Conditional CMP / S-set: writes NZCV only when condition passes.
+        // If cond ≠ AL the write is conditional; we treat that as
+        // "may write, may not" → conservatively, the cond evaluation
+        // also reads NZCV. Net: Read.
+        if cmp_class || s_bit == 1 {
+            if cond_uses_flags { return NzcvEffect::Read; }
+            return NzcvEffect::Write;
+        }
+        // Plain DP without S: doesn't touch NZCV. But cond ≠ AL still reads.
+        if cond_uses_flags { return NzcvEffect::Read; }
+        return NzcvEffect::None;
+    }
+
+    // MSR (immediate) cpsr_f / cpsr_fxsc with mask covering F: writes NZCV.
+    // cond 0011 0R10 mask SBO imm12 — mask bit 19 = f.
+    if (insn & 0x0FB0_F000) == 0x0320_F000 {
+        let mask = (insn >> 16) & 0xF;
+        if (mask & 0x8) != 0 { return NzcvEffect::Write; }
+        return NzcvEffect::None;
+    }
+    // MSR (register) — same mask layout.
+    if (insn & 0x0FB0_FFF0) == 0x0120_F000 {
+        let mask = (insn >> 16) & 0xF;
+        if (mask & 0x8) != 0 { return NzcvEffect::Write; }
+        return NzcvEffect::None;
+    }
+
+    // For everything else: any conditional cond reads flags.
+    if cond_uses_flags { NzcvEffect::Read } else { NzcvEffect::None }
+}
+
+/// True iff NZCV is dead at `start_pc` — i.e. some forward path
+/// writes the flags before any read. Used to decide whether the
+/// inline stub needs to save/restore NZCV. Conservative: returns
+/// `false` if any path may read flags before writing.
+fn nzcv_dead_at(start_pc: u32, max_instrs: u32) -> bool {
+    nzcv_dead_recursive(start_pc, max_instrs, &mut Visited::new(), &code_read_word)
+}
+
+fn nzcv_dead_at_with_reader<R>(start_pc: u32, max_instrs: u32, read_insn: &R) -> bool
+where R: Fn(u32) -> Option<u32> {
+    nzcv_dead_recursive(start_pc, max_instrs, &mut Visited::new(), read_insn)
+}
+
+fn nzcv_dead_recursive<R>(
+    start_pc: u32, max_instrs: u32, visited: &mut Visited, read_insn: &R,
+) -> bool
+where R: Fn(u32) -> Option<u32> {
+    if visited.contains(start_pc) {
+        // Cycle: contributes no new reads / writes. Caller's verdict.
+        return true;
+    }
+    if !visited.push(start_pc) {
+        return false; // budget exhausted, conservative
+    }
+    let mut pc = start_pc;
+    for _ in 0..max_instrs {
+        let insn = match read_insn(pc) {
+            Some(w) => w,
+            None => return false,
+        };
+        match analyze_nzcv(insn) {
+            NzcvEffect::Read => return false,
+            NzcvEffect::Write => return true,
+            NzcvEffect::None => {}
+        }
+        let (_, _, kind) = analyze_insn(insn, pc);
+        match kind {
+            BranchKind::Linear | BranchKind::BLink { .. } => {
+                pc = pc.wrapping_add(4);
+            }
+            BranchKind::Direct { target } => {
+                if target == pc { return true; }
+                return nzcv_dead_recursive(target, max_instrs, visited, read_insn);
+            }
+            BranchKind::Cond { target } => {
+                // Cond branch reads NZCV — but `analyze_nzcv(Bcc)` already
+                // reports Read above. We won't reach here if the Bcc had
+                // a flag-reading cond (caught earlier in this iteration).
+                // For an AL-cond branch (just B), follow the target.
+                if target == pc { return true; }
+                let taken = nzcv_dead_recursive(target, max_instrs, visited, read_insn);
+                let fall = nzcv_dead_recursive(pc.wrapping_add(4), max_instrs, visited, read_insn);
+                return taken && fall;
+            }
+            BranchKind::Return => {
+                // Function return: NZCV at the call site isn't part of
+                // APCS preserved state, so we can treat it as dead.
+                return true;
+            }
+            BranchKind::Indirect | BranchKind::Unknown => return false,
+        }
+    }
+    false
 }
 
 /// Decode reads / writes / branch-classification for a single ARM
@@ -854,9 +1015,22 @@ fn analyze_insn(insn: u32, pc: u32) -> (RegMask, RegMask, BranchKind) {
             if w == 1 { write |= 1u16 << rn; }
         }
         if l == 1 && (reglist & (1u16 << 15)) != 0 {
-            // LDM-with-PC: branch. If Rn is SP (POP {…, PC}), this is
-            // an APCS return — caller-observable regs only.
-            if rn == 13 {
+            // LDM-with-PC is an APCS return. Common forms:
+            //   POP {…, PC}              — Rn=SP=13.
+            //   LDMDB fp, {…, PC}        — Rn=FP=11 (frame-pointer
+            //                              variant emitted by ARM
+            //                              compilers; the Newton ROM
+            //                              uses this widely).
+            //   LDMIA Rn, {…, PC}        — any base; tail-call via
+            //                              switch table. Treat as
+            //                              Indirect so we don't
+            //                              over-claim deadness.
+            // For Rn ∈ {SP, FP}, the loaded reglist *is* the caller's
+            // saved-reg set; the caller-observable live regs are
+            // exactly APCS_RETURN_LIVE. For other Rn, fall back to
+            // Indirect (could be a switch jump or a load-from-data
+            // tail-call).
+            if rn == 13 || rn == 11 {
                 return (APCS_RETURN_LIVE | read, 0, BranchKind::Return);
             }
             return (read, 0, BranchKind::Indirect);
@@ -1011,8 +1185,8 @@ where R: Fn(u32) -> Option<u32> {
         return 0;
     }
     if !visited.push(start_pc) {
-        // Visited budget exhausted — conservative.
-        return 0xFFFF;
+        // Visited budget exhausted — ABI-trustful conservative.
+        return APCS_RETURN_LIVE;
     }
 
     let mut live: RegMask = 0;
@@ -1022,7 +1196,7 @@ where R: Fn(u32) -> Option<u32> {
         let insn = match read_insn(pc) {
             Some(w) => w,
             None => {
-                live |= !written & 0xFFFF;
+                live |= APCS_RETURN_LIVE & !written;
                 return live;
             }
         };
@@ -1048,6 +1222,15 @@ where R: Fn(u32) -> Option<u32> {
                 if target == pc {
                     return live;
                 }
+                // If the target is unreadable (outside our backing
+                // store — typically a Newton ROM jump-table entry
+                // pointing into the post-load relocated function
+                // pool at IPA > ROM_SIZE), treat as a tail-call
+                // return: live = APCS_RETURN_LIVE.
+                if read_insn(target).is_none() {
+                    live |= APCS_RETURN_LIVE & !written;
+                    return live;
+                }
                 let tgt_live = live_at_recursive(target, max_instrs, visited, read_insn);
                 live |= tgt_live & !written;
                 return live;
@@ -1058,30 +1241,51 @@ where R: Fn(u32) -> Option<u32> {
                     live |= fall & !written;
                     return live;
                 }
-                let taken = live_at_recursive(target, max_instrs, visited, read_insn);
+                let taken_live = if read_insn(target).is_none() {
+                    APCS_RETURN_LIVE
+                } else {
+                    live_at_recursive(target, max_instrs, visited, read_insn)
+                };
                 let fall = live_at_recursive(pc.wrapping_add(4), max_instrs, visited, read_insn);
-                live |= (taken | fall) & !written;
+                live |= (taken_live | fall) & !written;
                 return live;
             }
             BranchKind::Return => {
                 return live;
             }
             BranchKind::Indirect | BranchKind::Unknown => {
-                live |= !written & 0xFFFF;
+                // ABI-trustful conservative: switch-table dispatches,
+                // function-pointer calls, and unknown instructions
+                // ultimately route to APCS-shaped code (Newton ROM is
+                // APCS-conformant). Mark APCS_RETURN_LIVE — i.e. R0 +
+                // R4..R11 + SP + LR — as live, but trust that R12 +
+                // R1..R3 (caller-saved scratch) are dead per ABI. The
+                // halt-loud install path catches any divergence at
+                // emulation time.
+                live |= APCS_RETURN_LIVE & !written;
                 return live;
             }
         }
     }
-    live |= !written & 0xFFFF;
+    live |= APCS_RETURN_LIVE & !written;
     live
 }
 
 /// Pick (scratch_ea, scratch_flags) — both DEAD at orig_pc+4 — from
-/// {R12, R0..R3, R14} \ {Rt, Rn, Rm}. Returns None if liveness analysis
-/// can't find 2 dead candidates; caller must halt loudly.
-fn pick_scratch_regs(d: &Decoded, orig_pc: u32) -> Option<(u32, u32)> {
+/// {R12, R0..R3, R14} \ {Rt, Rn, Rm}. If only ONE dead GPR is found
+/// AND NZCV is also dead at orig_pc+4 (the next instruction
+/// overwrites flags), return Some((sea, None)) to signal a 1-scratch
+/// stub layout (no NZCV save/restore — the CMP's flag clobber is
+/// observably harmless).
+///
+/// Returns None when neither shape is achievable; caller halts loudly.
+fn pick_scratch_regs(d: &Decoded, orig_pc: u32) -> Option<(u32, Option<u32>)> {
     const CANDIDATES: &[u32] = &[12, 0, 1, 2, 3, 14];
-    let live = live_at(orig_pc.wrapping_add(4), 16);
+    // 32-instruction window: a typical Newton-ROM function body fits
+    // within 32 from the byte-access site. Smaller windows hit the
+    // conservative fallback ("all unwritten regs live") prematurely
+    // and reject sites that genuinely have dead scratch candidates.
+    let live = live_at(orig_pc.wrapping_add(4), 32);
     let operand_mask: RegMask = (1u16 << d.rt) | (1u16 << d.rn) | match d.offset {
         OffsetForm::Reg { rm, .. } => 1u16 << rm,
         _ => 0,
@@ -1094,9 +1298,35 @@ fn pick_scratch_regs(d: &Decoded, orig_pc: u32) -> Option<(u32, u32)> {
         if rmask & live != 0 { continue; }
         picks[n] = r;
         n += 1;
-        if n == 2 { return Some((picks[0], picks[1])); }
+        if n == 2 { return Some((picks[0], Some(picks[1]))); }
+    }
+    if n == 1 && nzcv_dead_at(orig_pc.wrapping_add(4), 32) {
+        return Some((picks[0], None));
     }
     None
+}
+
+/// Operand-exclusion picker for the stack-fallback stub. Picks 2 regs
+/// from `[R12, R0..R3, R14]` that aren't operands of the byte access.
+/// Always succeeds (operand set has at most 3 members; candidate pool
+/// has 6). Stack save/restore preserves their values across the stub
+/// regardless of liveness.
+fn pick_operand_excluded_pair(d: &Decoded) -> (u32, u32) {
+    const CANDIDATES: &[u32] = &[12, 0, 1, 2, 3, 14];
+    let rm = match d.offset {
+        OffsetForm::Reg { rm, .. } => rm,
+        _ => u32::MAX,
+    };
+    let mut picks = [u32::MAX; 2];
+    let mut n = 0;
+    for &r in CANDIDATES {
+        if r == d.rt || r == d.rn || r == rm { continue; }
+        picks[n] = r;
+        n += 1;
+        if n == 2 { break; }
+    }
+    debug_assert!(n == 2, "operand-exclusion picker must always find 2 regs");
+    (picks[0], picks[1])
 }
 
 /// True when the site's operand shape is a simple non-writeback
@@ -1121,71 +1351,172 @@ fn xor_mask(kind: AccessKind) -> u32 {
     }
 }
 
-/// Build the 7-word inline stub for a site whose liveness analysis
-/// found 2 dead scratch registers. No save/restore needed — the stub
-/// freely clobbers scratch_ea (computed EA) and scratch_fl (NZCV
-/// snapshot).
+/// Stub variant — determines whether scratch regs need stack push/pop.
+#[derive(Debug, Clone, Copy)]
+enum StubVariant {
+    /// Both scratch_ea and scratch_flags are LIVENESS-PROVED dead at
+    /// orig_pc+4. No save/restore needed; the stub clobbers them
+    /// freely. `sfl == None` indicates NZCV is also dead, so the
+    /// MRS/MSR pair is omitted (NOPs in slots 2 and 6).
+    DeadReg { sfl: Option<u32> },
+    /// Liveness analysis didn't find 2 dead candidates. Operand-
+    /// exclusion picker chose scratch_ea / scratch_fl (which may be
+    /// genuinely live), and the stub PUSHes them onto the mode-banked
+    /// SP at entry and POPs at exit so the caller's values are
+    /// preserved across the access.
+    ///
+    /// Assumption: SP_<mode> is valid at every byte-access site
+    /// reached after BootOS sets up the per-mode stacks. If a site
+    /// reached BEFORE SetUpStacks ever falls into this variant, the
+    /// PUSH would write into stage-2 RO ROM and stage-2-fault. We've
+    /// only seen this variant fire on past-BootOS sites in the live
+    /// ROM (first hit: 0x225d8 inside TADSPEndpoint::nSnd), where the
+    /// function's own prologue already established a valid SP. If a
+    /// future ROM revision puts a stack-fallback site inside BootOS,
+    /// the resulting stage-2 abort will surface it loudly.
+    Stack { sfl: u32 },
+}
+
+/// Build the 12-word inline stub. Two variants share the slot layout:
 ///
-/// Slot layout (28 bytes):
-///   0:  MRS  scratch_fl, cpsr            ; snapshot NZCV
-///   1:  <ADD|SUB> scratch_ea, Rn, <off>  ; compute EA
-///   2:  CMP  scratch_ea, #XOR_LIMIT      ; clobbers NZCV
-///   3:  EORLO scratch_ea, scratch_ea, #<xor_mask>
-///   4:  MSR  cpsr_f, scratch_fl          ; restore NZCV
-///   5:  <access>[cond] Rt, [scratch_ea]  ; native — may DABT naturally
-///   6:  B    orig_pc + 4
+///   0:  PUSH scratch_ea         (Stack)  | NOP (DeadReg)
+///   1:  PUSH scratch_fl         (Stack)  | NOP (DeadReg)
+///   2:  MRS scratch_fl, cpsr    (when sfl-saving) | NOP
+///   3:  <ADD|SUB> scratch_ea, Rn,    #imm_high
+///   4:  <ADD|SUB> scratch_ea, scratch_ea, #imm_low  (or NOP for reg-offset)
+///   5:  CMP scratch_ea, #XOR_LIMIT
+///   6:  EORLO scratch_ea, scratch_ea, #<xor>
+///   7:  MSR cpsr_f, scratch_fl  (mirror of slot 2) | NOP
+///   8:  <access>[cond] Rt, [scratch_ea]   ; native — may DABT naturally
+///   9:  POP scratch_fl          (Stack)  | NOP (DeadReg)
+///  10:  POP scratch_ea          (Stack)  | NOP (DeadReg)
+///  11:  B orig_pc + 4
 ///
-/// Returns Err with a descriptive reason if the immediate isn't
-/// ARM-imm12-encodable or the back-branch is out of B-imm24 range.
-/// Liveness failure is reported separately by `pick_scratch_regs`
-/// returning None.
+/// Two-step EA compute (slots 3+4) handles 12-bit immediates that
+/// don't fit a single ARM modified-immediate (8-bit-rotated). Newton
+/// ROM has byte accesses with offsets up to 0xFFF (e.g. 0x156 at
+/// 0x26fc0); a single ADD with #0x156 doesn't encode, but
+/// (ADD #0x100; ADD #0x56) does.
 fn encode_inline_stub(
     d: &Decoded,
     orig_pc: u32,
     stub_ipa: u32,
     sea: u32,
-    sfl: u32,
-) -> Result<[u32; 7], &'static str> {
-    // Slot 1: compute EA into `sea`.
-    let slot1 = match d.offset {
+    variant: StubVariant,
+) -> Result<[u32; 12], &'static str> {
+    // Slots 3+4: compute EA into `sea` via two-step ADD/SUB. Stack-
+    // variant + Rn == SP needs a +8 fudge because the two PUSHes
+    // displaced SP by -8 from the value the original `[SP, #imm]`
+    // access expected.
+    let sp_fudge = matches!(variant, StubVariant::Stack { .. }) && d.rn == 13;
+    let nop = encode::nop();
+    let (slot3, slot4) = match d.offset {
         OffsetForm::Imm { imm } => {
-            let enc = encode::arm_imm12(imm).ok_or("imm not encodable")?;
-            if d.u {
-                encode::add_imm(encode::AL, sea, d.rn, enc)
+            let signed_imm: i64 = if d.u { imm as i64 } else { -(imm as i64) };
+            let adjusted: i64 = signed_imm + if sp_fudge { 8 } else { 0 };
+            let abs = if adjusted < 0 { -adjusted } else { adjusted } as u32;
+            if abs > 0xFFF {
+                return Err("imm > 0xFFF (out of 12-bit range)");
+            }
+            let is_add = adjusted >= 0;
+            // Prefer a single ADD/SUB if the immediate is encodable as
+            // a modified-immediate. Otherwise split into (high, low) =
+            // (abs & 0xF00, abs & 0xFF) — both are guaranteed
+            // encodable since 12-bit values decompose into one 4-bit
+            // shifted by 8 and one 8-bit raw.
+            if let Some(enc) = encode::arm_imm12(abs) {
+                let s3 = if is_add {
+                    encode::add_imm(encode::AL, sea, d.rn, enc)
+                } else {
+                    encode::sub_imm(encode::AL, sea, d.rn, enc)
+                };
+                (s3, nop)
             } else {
-                encode::sub_imm(encode::AL, sea, d.rn, enc)
+                let high = abs & !0xFFu32;
+                let low = abs & 0xFFu32;
+                let high_enc = encode::arm_imm12(high)
+                    .ok_or("imm_high not encodable (split)")?;
+                let low_enc = encode::arm_imm12(low)
+                    .ok_or("imm_low not encodable (split)")?;
+                let (s3, s4) = if is_add {
+                    (
+                        encode::add_imm(encode::AL, sea, d.rn, high_enc),
+                        encode::add_imm(encode::AL, sea, sea, low_enc),
+                    )
+                } else {
+                    (
+                        encode::sub_imm(encode::AL, sea, d.rn, high_enc),
+                        encode::sub_imm(encode::AL, sea, sea, low_enc),
+                    )
+                };
+                (s3, s4)
             }
         }
         OffsetForm::Reg { rm, shift_type, shift_amount } => {
-            if d.u {
+            // Slot 3: scratch_ea = Rn ± Rm (with optional shift).
+            let s3 = if d.u {
                 encode::add_reg_shifted(encode::AL, sea, d.rn, rm, shift_type, shift_amount)
             } else {
                 encode::sub_reg_shifted(encode::AL, sea, d.rn, rm, shift_type, shift_amount)
-            }
+            };
+            // Slot 4: only used for stack-variant SP+Rm to apply the
+            // +8 push fudge. For all other reg-offset cases it's NOP.
+            let s4 = if sp_fudge {
+                let enc8 = encode::arm_imm12(8).expect("8 always encodes");
+                encode::add_imm(encode::AL, sea, sea, enc8)
+            } else {
+                nop
+            };
+            (s3, s4)
         }
         OffsetForm::None => return Err("OffsetForm::None not inline-eligible"),
     };
 
     let xor_limit_imm = encode::arm_imm12(XOR_LIMIT).ok_or("XOR_LIMIT not encodable")?;
-    let slot2 = encode::cmp_imm(sea, xor_limit_imm);
+    let slot5 = encode::cmp_imm(sea, xor_limit_imm);
 
     let xor_enc = encode::arm_imm12(xor_mask(d.kind)).ok_or("xor mask not encodable")?;
-    let slot3 = encode::eor_imm_cond(encode::LO, sea, sea, xor_enc);
+    let slot6 = encode::eor_imm_cond(encode::LO, sea, sea, xor_enc);
 
-    let slot5 = encode::access_zero_offset(d.kind, d.cond, d.rt, sea);
+    let slot8 = encode::access_zero_offset(d.kind, d.cond, d.rt, sea);
 
-    let slot6_pc = stub_ipa.wrapping_add(6 * 4);
-    let slot6 = encode::b(slot6_pc, orig_pc.wrapping_add(4))
+    let slot11_pc = stub_ipa.wrapping_add(11 * 4);
+    let slot11 = encode::b(slot11_pc, orig_pc.wrapping_add(4))
         .ok_or("back-branch out of B-imm24 range")?;
 
+    let (slot0, slot1, slot2, slot7, slot9, slot10) = match variant {
+        StubVariant::DeadReg { sfl: Some(sfl) } => (
+            nop,
+            nop,
+            encode::mrs_cpsr(sfl),
+            encode::msr_cpsr_f(sfl),
+            nop,
+            nop,
+        ),
+        StubVariant::DeadReg { sfl: None } => (nop, nop, nop, nop, nop, nop),
+        StubVariant::Stack { sfl } => (
+            encode::push(sea),
+            encode::push(sfl),
+            encode::mrs_cpsr(sfl),
+            encode::msr_cpsr_f(sfl),
+            encode::pop(sfl),
+            encode::pop(sea),
+        ),
+    };
+
     Ok([
-        encode::mrs_cpsr(sfl),       // 0
-        slot1,                       // 1
-        slot2,                       // 2
-        slot3,                       // 3
-        encode::msr_cpsr_f(sfl),     // 4
-        slot5,                       // 5
-        slot6,                       // 6
+        slot0,  // 0  PUSH scratch_ea | NOP
+        slot1,  // 1  PUSH scratch_fl | NOP
+        slot2,  // 2  MRS scratch_fl, cpsr | NOP
+        slot3,  // 3  ADD/SUB scratch_ea, Rn, imm_high
+        slot4,  // 4  ADD/SUB scratch_ea, scratch_ea, imm_low | NOP
+        slot5,  // 5  CMP
+        slot6,  // 6  EORLO
+        slot7,  // 7  MSR cpsr_f, scratch_fl | NOP
+        slot8,  // 8  native access
+        slot9,  // 9  POP scratch_fl | NOP
+        slot10, // 10 POP scratch_ea | NOP
+        slot11, // 11 back-branch
     ])
 }
 
@@ -1194,23 +1525,32 @@ fn encode_inline_stub(
 /// — the ROM is fixed, so an install-time failure means we discovered
 /// a site that needs a code change to handle, not a runtime fallback.
 fn emit_inline_stub(d: &Decoded, orig_pc: u32) {
-    let (sea, sfl) = match pick_scratch_regs(d, orig_pc) {
-        Some(p) => p,
+    let (sea, variant) = match pick_scratch_regs(d, orig_pc) {
+        Some((sea, sfl)) => (sea, StubVariant::DeadReg { sfl }),
         None => {
-            let live = live_at(orig_pc.wrapping_add(4), 16);
-            kprintln!(
-                "shadow_stub: FATAL — liveness can't find 2 dead scratch regs at PC={:#x}",
-                orig_pc
-            );
-            kprintln!(
-                "  insn={:#010x} kind={:?} Rt={} Rn={} live_mask={:#06x}",
-                code_read_word(orig_pc).unwrap_or(0xDEAD_BEEF),
-                d.kind, d.rt, d.rn, live
-            );
-            kprintln!(
-                "  candidates {{R12, R0..R3, R14}} \\ operands all live in next 16 insns"
-            );
-            crate::cpu::halt();
+            // Liveness analysis didn't find 2 dead candidates (or 1 +
+            // dead-NZCV). Fall back to the stack-based stub: the
+            // operand-exclusion picker still gives us 2 free registers
+            // (always — at most 3 operand registers out of a 6-element
+            // candidate pool); the stub PUSHes them onto the mode-
+            // banked SP at entry and POPs at exit. Per-mode banked SP
+            // makes this IRQ-safe (each mode has its own stack).
+            //
+            // ASSUMPTION: SP_<mode> is valid at this site. That holds
+            // for everything past BootOS's SetUpStacks. The first
+            // ROM-side hit was 0x225d8 in TADSPEndpoint::nSnd, well
+            // past BootOS — the function's own prologue had already
+            // pushed its callee-saved frame onto a valid SP. If a
+            // future ROM revision lands a stack-fallback site INSIDE
+            // BootOS (where SP_<mode> is still at its reset value =
+            // some ROM word), the PUSH at slot 0 will write to stage-2
+            // RO ROM and stage-2-fault loudly — this is the same
+            // failure mode the original-plan stack stub had pre-
+            // SetUpStacks, and the install-time halt-loud was supposed
+            // to catch the equivalent dead-reg failure. We accept the
+            // stage-2 abort as the trip-wire if it ever fires.
+            let (sea, sfl) = pick_operand_excluded_pair(d);
+            (sea, StubVariant::Stack { sfl })
         }
     };
 
@@ -1235,7 +1575,7 @@ fn emit_inline_stub(d: &Decoded, orig_pc: u32) {
             crate::cpu::halt();
         }
     };
-    let stub_words = match encode_inline_stub(d, orig_pc, stub_ipa, sea, sfl) {
+    let stub_words = match encode_inline_stub(d, orig_pc, stub_ipa, sea, variant) {
         Ok(ws) => ws,
         Err(reason) => {
             kprintln!(
@@ -2244,36 +2584,99 @@ mod tests {
     }
 
     #[test]
-    fn inline_stub_7_word_layout() {
-        // LDRB r0, [r1, #4]. With scratch picks (R12, sea-or-sfl) vary
-        // depending on liveness, but the structural layout is fixed:
-        //   slot 0: MRS Rd, CPSR  — pattern 0xE10F_0000 | (Rd<<12)
-        //   slot 1: ADD/SUB scratch_ea, Rn, #4
-        //   slot 2: CMP scratch_ea, #XOR_LIMIT
-        //   slot 3: EORLO scratch_ea, scratch_ea, #3
-        //   slot 4: MSR cpsr_f, Rm  — pattern 0xE128_F000 | Rm
-        //   slot 5: LDRB Rt, [scratch_ea]  — re-decodable
-        //   slot 6: B orig_pc+4
+    fn inline_stub_dead_reg_layout() {
+        // LDRB r0, [r1, #4] with sfl=Some(R0): MRS slot 2, MSR slot 7,
+        // NOPs slots 0, 1, 9, 10, back-branch slot 11. Slot 4 is also
+        // NOP since imm=4 fits a single ADD.
         let d = decode(0xE5D1_0004).unwrap();
-        let stub = encode_inline_stub(&d, 0x0004_0000, 0x00E0_0000, 12, 0)
-            .expect("stub");
-        // Slot 0: MRS Rd, CPSR.
-        assert_eq!(stub[0] & 0xFFFF_0FFF, 0xE10F_0000);
-        // Slot 4: MSR cpsr_f, Rm. Lower 4 bits = Rm; upper bits fixed.
-        assert_eq!(stub[4] & 0xFFFF_FFF0, 0xE128_F000);
-        // Slot 5: re-decodes as LDRB with Rt preserved.
-        let decoded_access = decode(stub[5]).expect("access decodes");
-        assert_eq!(decoded_access.kind, AccessKind::Ldrb);
-        assert_eq!(decoded_access.rt, d.rt);
-        if let OffsetForm::Imm { imm } = decoded_access.offset {
-            assert_eq!(imm, 0);
-        } else {
-            panic!("expected zero-imm offset at slot 5");
+        let stub = encode_inline_stub(
+            &d, 0x0004_0000, 0x00E0_0000, 12, StubVariant::DeadReg { sfl: Some(0) },
+        ).expect("stub");
+        let nop = encode::nop();
+        for i in [0usize, 1, 4, 9, 10] {
+            assert_eq!(stub[i], nop, "slot {} should be NOP", i);
         }
-        // Slot 6: back-branch to orig_pc + 4 = 0x0004_0004.
-        let slot6_pc = 0x00E0_0000u32 + 6 * 4;
-        let expected = encode::b(slot6_pc, 0x0004_0004).unwrap();
-        assert_eq!(stub[6], expected);
+        assert_eq!(stub[2] & 0xFFFF_0FFF, 0xE10F_0000);  // MRS
+        assert_eq!(stub[7] & 0xFFFF_FFF0, 0xE128_F000);  // MSR
+        let decoded_access = decode(stub[8]).expect("access decodes");
+        assert_eq!(decoded_access.kind, AccessKind::Ldrb);
+        let slot11_pc = 0x00E0_0000u32 + 11 * 4;
+        let expected = encode::b(slot11_pc, 0x0004_0004).unwrap();
+        assert_eq!(stub[11], expected);
+    }
+
+    #[test]
+    fn inline_stub_dead_reg_nzcv_dead_layout() {
+        // sfl=None (NZCV-dead): MRS/MSR slots also NOP.
+        let d = decode(0xE5D1_0004).unwrap();
+        let stub = encode_inline_stub(
+            &d, 0x0004_0000, 0x00E0_0000, 12, StubVariant::DeadReg { sfl: None },
+        ).expect("stub");
+        let nop = encode::nop();
+        for i in [0usize, 1, 2, 4, 7, 9, 10] {
+            assert_eq!(stub[i], nop, "slot {} should be NOP", i);
+        }
+    }
+
+    #[test]
+    fn inline_stub_stack_layout() {
+        // Stack variant: slots 0/1 PUSH, 9/10 POP.
+        let d = decode(0xE5D1_0004).unwrap();
+        let stub = encode_inline_stub(
+            &d, 0x0004_0000, 0x00E0_0000, 12, StubVariant::Stack { sfl: 0 },
+        ).expect("stub");
+        assert_eq!(stub[0] & 0xFFFF_0FFF, 0xE52D_0004);  // PUSH scratch_ea
+        assert_eq!(stub[1] & 0xFFFF_0FFF, 0xE52D_0004);  // PUSH scratch_fl
+        assert_eq!(stub[9] & 0xFFFF_0FFF, 0xE49D_0004);  // POP scratch_fl
+        assert_eq!(stub[10] & 0xFFFF_0FFF, 0xE49D_0004); // POP scratch_ea
+    }
+
+    #[test]
+    fn inline_stub_imm_split_for_large_offset() {
+        // LDRB r0, [r1, #0x156] — encoding e5d10156. 0x156 doesn't fit
+        // a single ARM modified-immediate, so the EA compute splits
+        // into ADD #0x100 + ADD #0x56.
+        let insn: u32 = 0xE5D1_0156;
+        let d = decode(insn).expect("decode");
+        let stub = encode_inline_stub(
+            &d, 0x0004_0000, 0x00E0_0000, 12, StubVariant::DeadReg { sfl: None },
+        ).expect("stub with split imm");
+        // Slot 3: ADD scratch_ea, Rn(=R1), #0x100.
+        let s3 = stub[3];
+        assert_eq!((s3 >> 28) & 0xF, encode::AL);
+        assert_eq!(s3 & 0x0FE0_0000, 0x0280_0000); // ADD imm
+        assert_eq!((s3 >> 16) & 0xF, 1); // Rn=R1
+        assert_eq!(s3 & 0xFFF, encode::arm_imm12(0x100).unwrap());
+        // Slot 4: ADD scratch_ea, scratch_ea, #0x56.
+        let s4 = stub[4];
+        assert_eq!(s4 & 0x0FE0_0000, 0x0280_0000);
+        assert_eq!(s4 & 0xFFF, encode::arm_imm12(0x56).unwrap());
+    }
+
+    #[test]
+    fn inline_stub_stack_sp_imm_fudges_by_8() {
+        // LDRB r0, [SP, #4] stack variant: +8 fudge → ADD #12 in
+        // slots 3+4. Since 12 fits a single ADD, slot 4 is NOP.
+        let mut w: u32 = 0;
+        w |= 0xE << 28;
+        w |= 0b010 << 25;
+        w |= 1 << 24;
+        w |= 1 << 23;
+        w |= 1 << 22;
+        w |= 1 << 20;
+        w |= 13 << 16;
+        w |= 0 << 12;
+        w |= 4;
+        let d = decode(w).unwrap();
+        let stub = encode_inline_stub(
+            &d, 0x0004_0000, 0x00E0_0000, 12, StubVariant::Stack { sfl: 1 },
+        ).expect("stub");
+        let s3 = stub[3];
+        assert_eq!((s3 >> 16) & 0xF, 13);
+        assert_eq!(s3 & 0x0FE0_0000, 0x0280_0000);
+        assert_eq!(s3 & 0xFFF, encode::arm_imm12(12).unwrap());
+        // Slot 4 is NOP since 12 fits one step.
+        assert_eq!(stub[4], encode::nop());
     }
 
     /// Helper: classify whether a BranchKind ended the basic block.
@@ -2342,13 +2745,14 @@ mod tests {
         let (_, _, kind) = analyze_insn(0xE1A0_F00E, 0);
         assert!(matches!(kind, BranchKind::Return));
         // POP {r0, pc} — LDM SP!, {r0, pc}.
-        // cond 100 P=0 U=1 S=0 W=1 L=1 Rn=13 reglist=0x8001 (r0+pc)
-        // = E8BD_8001
         let (_, _, kind) = analyze_insn(0xE8BD_8001, 0);
         assert!(matches!(kind, BranchKind::Return));
         // LDR PC, [SP], #4 — single-reg pop-return.
-        // cond 010 P=0 U=1 B=0 W=0 L=1 Rn=13 Rt=15 imm=4 = E49D_F004
         let (_, _, kind) = analyze_insn(0xE49D_F004, 0);
+        assert!(matches!(kind, BranchKind::Return));
+        // LDMDB FP, {r4-r11, sp, pc} = e91baff0 — frame-pointer
+        // variant of POP {…, PC}. Newton ROM uses this widely.
+        let (_, _, kind) = analyze_insn(0xE91B_AFF0, 0);
         assert!(matches!(kind, BranchKind::Return));
     }
 

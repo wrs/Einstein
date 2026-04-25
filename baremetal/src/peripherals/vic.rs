@@ -184,8 +184,24 @@ const INT_TIMER_0: u32 = 0x0000_0008;
 const INT_TIMER_1: u32 = 0x0000_0010;
 const INT_TIMER_2: u32 = 0x0000_0020;
 const INT_TIMER_3: u32 = 0x0000_0040;
+const INT_DMA_CH3: u32 = 0x0000_0400;   // sound input
+const INT_DMA_CH5: u32 = 0x0000_1000;   // sound output / tablet rcv
 #[allow(dead_code)]
 const INT_GPIO: u32 = 0x0100_0000;
+
+/// Diagnostic: force-raise the two sound-DMA IRQ bits (DMA channel 3 and
+/// channel 5). Called from a wedge-detector in `trap_irq` to test the
+/// hypothesis that the Phase-B stall after `TSoundServer::TheMain`
+/// stack-collision is the kernel waiting for a sound-DMA-complete IRQ
+/// that we never fire. Einstein's `TNullSoundManager::StartOutput` /
+/// `ScheduleOutputBuffer` raise the same bits via
+/// `mInterruptManager->RaiseInterrupt(mOutputIntMask)`; we emulate it
+/// here without modeling the actual DMA transfer.
+pub fn inject_sound_dma_irq() {
+    // SAFETY: single-threaded.
+    let s = unsafe { &mut *VIC.0.get() };
+    s.int_present |= INT_DMA_CH3 | INT_DMA_CH5;
+}
 
 /// Latch any timer-match bits whose deadline has passed into `int_present`
 /// so the next `update_virq` can assert HCR_EL2.VI. Called from the EL2

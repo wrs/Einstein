@@ -3,7 +3,69 @@
 Live notes. Update as we learn more; remove old updates as we move on to
 new stalls.
 
-## Currently at — kernel idle waiting for non-timer IRQ after stack-collision SWI (QEMU 16×+ratchet+ROM-patch, 2026-04-25)
+## Currently at — boot wedges inside StackManager monitor's page-copy SWI; sound IRQ injection partially unblocks (QEMU, 2026-04-25 evening)
+
+The "kernel waiting for sound DMA IRQ" hypothesis below was tested and is
+**partially correct but not the primary blocker**:
+
+1. Added a wedge probe to `trap_irq` that injects `INT_DMA_CH3 |
+   INT_DMA_CH5` (0x1400) into `vic::int_present` after the heartbeat
+   detects 64+ consecutive samples at the same guest PC and the kernel
+   has armed the sound IRQ enables in `int_ctrl` (mask & 0x1400 ==
+   0x1400). Implementation: `peripherals/vic.rs::inject_sound_dma_irq`,
+   wired into `trap.rs::trap_irq`.
+
+2. **The injection works**: with it enabled the kernel's IRQ path runs
+   `IRQHandler → DispatchIRQInterrupt → PSoundDriver::InputIntHandler →
+   TSoundServer::SoundInputIH → SendForInterrupt`, then the same chain
+   for OutputIntHandler / SoundOutputIH. So the kernel **does** want
+   sound DMA IRQs after registering them in `int_ctrl=0xc401420`.
+
+3. **But the SoundIH runs in IRQ context only** — it doesn't unblock
+   the StackManager monitor task that's wedged in SVC mode mid-page-
+   copy. After the IRQ returns, control resumes at the same idle PC=
+   0x3ae1bc and no new user/svc-mode functions are entered.
+
+4. The actual wedge: `TStackManager::FMLockHeapRange` / `BuildPerms` /
+   `AddPgPAndPerm` for the sound task's stack pages stops making
+   progress around trace 155832 (last `_ExitFIQAtomic`). Sync trap
+   counter keeps growing (cache-flush MCRs, shadow-stub UDFs) but
+   `awk '/^trace / && !seen[$4]++'` shows no new function entries past
+   `PhysSubPageCopy` regardless of how long we run (180+ s).
+
+5. Open question: where in the REx-side `0x1b16b6c
+   CopyPagesAfterStackCollided` (or its callees) are we stuck? The
+   user-mode wrapper is just `ldr r0, [r0]; b 0x1b16b6c`, so the
+   actual loop lives in REx code that the rom.dis tooling doesn't
+   cover. Probably needs ghidra MCP to inspect.
+
+6. Heartbeat reads SP_EL1=0 LR_EL1=0 (which should alias R13_svc /
+   R14_svc) at the wedged state, but the snapshot save reads non-zero
+   values via the same sysregs at sync-trap time (per
+   `INVESTIGATION.md` history: r13(SP_svc)=0x0c1142bc r14(LR_svc)=
+   0x001f7cc4 sampled from snapshot). Either QEMU's
+   AArch32↔AArch64 banked-register plumbing is unreliable for IRQ-
+   trap context (see `docs/QEMU_BUGS.md`), or the kernel does
+   genuinely have SP_svc=LR_svc=0 in some idle path. Worth verifying
+   on FVP before assuming the kernel is at fault.
+
+The sound DMA IRQ injection is left in place as a probe; it doesn't fix
+the wedge but does extend coverage by exercising the sound IH path.
+
+Next steps:
+1. Use ghidra MCP to inspect the REx-side `0x1b16b6c
+   CopyPagesAfterStackCollided` to identify the loop termination
+   condition and what state the kernel is checking that doesn't
+   advance.
+2. Cross-check by running the same boot point on FVP — if SP_svc /
+   LR_svc read coherently there, the QEMU readback is the
+   misdiagnosis source; if they're also 0, the kernel really is
+   parked there with SP_svc=LR_svc=0 (interesting).
+3. Independent path: check whether the wedged kernel-mode task is
+   waiting on a specific kernel-internal semaphore or condition
+   variable that `inject_sound_dma_irq` can't unstick.
+
+## Resolved (was) — kernel idle waiting for non-timer IRQ after stack-collision SWI (QEMU 16×+ratchet+ROM-patch, 2026-04-25)
 
 After both the ratchet fix (hypervisor-side) and the
 addls→addcc ROM patch (kernel-side) below, the timer/alarm

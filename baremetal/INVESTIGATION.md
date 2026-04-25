@@ -3,7 +3,141 @@
 Live notes. Update as we learn more; remove old updates as we move on to
 new stalls.
 
-## Currently at — pckm task at sp_usr=0x0cc7a248 reads TAEventHandler bytes instead of stack frame (QEMU + FVP, 2026-04-27)
+## Currently at — newt-DABT root cause is kernel stack-collision logic, not PCMCIA (QEMU, 2026-04-25 night)
+
+**Update**: PCMCIA chip-detect fix landed (see "Resolved — PCMCIA
+controller chip-detect" below). Boot now advances ~25k more trace
+events / 30 more unique functions through `TCardSocket::Init`,
+`TCardSocketState`, `TATAPartitionInfo`, `TCardATALoader`,
+`TGPIOInterface::RegisterInterrupt`, `TCardServer::AddCardHandler`,
+and 4-slot probe of all four PCMCIA sockets. Despite the deeper
+penetration into the boot the recursive "newt" UnhandledException
+still fires at trace ~244k via `__vfprintf` instead of `TUPort::Receive` —
+the underlying kernel-side L2 alias of VA 0x0cc7a000 / VA 0x0cc82000
+both mapping to PA 0x0402a000 persists.
+
+The page alias is *not* triggered by the chip-detect failure path
+(otherwise fixing it would have prevented the alias). It's set up
+inside `TStackManager::CopyPagesAfterStackCollided` regardless of
+which boot trajectory leads there. So the alias is the kernel's
+intentional stack-recycle behavior; the wedge is that pckm resumes
+on its now-aliased stack while Einstein has pckm BLK at this point
+(see "Einstein-vs-hypervisor task census" below). The divergence
+that determines whether pckm wakes up vs. stays blocked is the next
+thing to chase — likely a missing IRQ delivery or message-port
+state our driver layer isn't keeping in sync with Einstein's.
+
+### Open next steps
+
+1. Confirm Einstein's boot also walks through
+   `TStackManager::CopyPagesAfterStackCollided` for the 0x0cc7a000
+   ↔ 0x0cc82000 pair (probe the L2 entries at trace point ~156100
+   equivalent). If yes, the alias itself is benign and the wedge
+   is purely about pckm scheduling.
+2. Compare gPort waiter queues at the moment of the wedge: which
+   port is pckm blocked on in Einstein, and does our hypervisor
+   ever post a message to that port that wakes it up wrongly?
+3. Resolve the GPIO `0x0F18_DC00` / `0x0F18_E000` reads to ensure
+   we're not silently zero-ing a register the kernel needs to see
+   the previous setting of.
+
+---
+
+## Resolved — PCMCIA controller chip-detect (QEMU, 2026-04-25)
+
+Fresh cold-boot trace identified that the boot reaches `TCardServer::MainConstructor`
+→ `TCardSocket::GetChipInfo` (ROM 0x55714) which writes a magic
+pattern to controller reg_3000 / reg_3800 and reads it back to detect
+the chip. Our `peripherals/pcmcia.rs` returned `0xFFFF_FFFF` for every
+read regardless of writes, failing the pattern check, and steering
+boot into the heavy "no chip" teardown path
+(`TUPhys::Invalidate` → `DeletePhys` → `~TCardSocket` → flood of
+`TCardAlertEvent` / `TCardAlertDialog` / `TCardSystemEventHandler`
+allocations).
+
+### Original symptom analysis (still valid)
+
+1. `TStackManager::CopyPagesAfterStackCollided` at trace 156102
+   remaps VA 0x0cc82000 from PA 0x0401f000 to PA 0x0402a000
+   (`AddPgPAndPerm(0x0cc82000, 0, 0x0402a000, 1)` at trace 156093,
+   then `StoreToPhysAddress(0x04023608, 0x0402a00e, ...)` at trace
+   156097 — the actual L2[0x82] write). PA 0x0402a000 is still
+   mapped at VA 0x0cc7a000 as pckm's user stack (mapped at trace
+   54992, never unmapped) — this is the alias.
+2. The collision arises because the kernel allocates a long chain
+   of `TCardMessage` / `TNewCardAsyncMsg` objects spanning 0x0cc7fxxx
+   .. 0x0cc82xxx (≥160 of them, see traces 179690..180815). The
+   chain runs out of fresh PA/VA space and the kernel resorts to
+   `CopyPagesAfterStackCollided` to recycle a page.
+3. The TCardMessage chain is built by `TCardServer::MainConstructor`
+   → `TCardEventHandler::Init` → ... → `TCardSocket::Init`. After
+   socket init the kernel calls **`TCardSocket::GetChipInfo`** at
+   trace 205540, which fails to detect a chip.
+4. `GetChipInfo` (rom.dis @ 0x55714) does the standard chip-detect
+   ritual: write `0xa5a5` to `base+0x3000`, write `0x5a5a` to
+   `base+0x3800`, read both back, verify the 16-bit values stuck.
+   On chip-detect failure (`r2=0`) the function bails to
+   `Subexception` and the path triggers `TUPhys::Invalidate`
+   (trace 205560) → `DeletePhys` (215486) → `TCardSocket::~TCardSocket`
+   (215550) → a flood of `TCardAlertEvent` / `TCardAlertDialog` /
+   `TCardSystemEventHandler` / `TNewCardAsyncMsg` allocations.
+
+### Why chip-detect fails
+
+`src/peripherals/pcmcia.rs::read` returns `0xFFFF_FFFF` for every
+PCMCIA register read, regardless of prior writes. The kernel writes
+`0xa5a5` to reg_3000, reads back `0xFFFF`, masks to 16 bits, fails
+the `teq r8, ip` check, sets `r2=0`, takes the no-chip path.
+
+Einstein's `Emulator/PCMCIA/TPCMCIAController.cpp` implements proper
+register storage: writes to reg_3000 / reg_3800 are persisted, reads
+return the stored value. So GetChipInfo on Einstein detects the
+chip, and the kernel takes a different (less-allocation-heavy) path
+even with no card actually inserted (no-card is reported via
+reg_1C00's `k1C00_CardIsPresent` bit, not via failed chip-detect).
+
+### Fix (landed)
+
+`src/peripherals/pcmcia.rs` rewritten to model 4 sockets
+(SLOT0..SLOT3 at base 0x3000_0000 / 0x4000_0000 / 0x5000_0000 /
+0x6000_0000), each with a 17-register storage cell mirroring
+Einstein's `TPCMCIAController.cpp`:
+
+- Card-side spaces (attribute/IO/memory at offsets 0..0x0BFF_FFFF
+  inside a slot): reads return 0, writes are dropped (no card).
+- Controller registers at offsets 0x0C00_0000..0x0C00_4400: simple
+  R/W storage (so chip-detect's stuck-write check passes).
+- reg_1C00 reads OR'd with `k1C00_CardIsPresent (0x000C)` to flag
+  "no card inserted".
+- reg_4400 reads as 0xFC (Einstein hardcoded).
+
+In `src/trap.rs::handle_data_abort`, added `try_emulate_isv0_dabt`
+fallback for ISV=0 stage-2 aborts on LDR/STR-immediate (A1) forms.
+Newton uses pre-indexed-with-writeback LDR for PCMCIA controller
+register access (e.g. `DisableSocketInterrupt @ 0x55208`), and the
+syndrome can't carry the destination register for that form. The
+fallback fetches the instruction at ELR, decodes the LDR/STR-imm
+fields, performs the MMIO access, applies writeback to Rn — then
+falls through to `advance_elr(4)`.
+
+Added MMIO read entries at `0x0F18_CC00 / D000 / D800 / DC00 /
+E000` returning 0 — `TGPIOInterface::DisableInterrupt` does
+read-modify-write on these GPIO interrupt-control registers; the
+matching write entries already no-op.
+
+Test: `guest-tests/tests/test_pcmcia.S` rewritten to verify chip-
+detect storage works (write 0xa5a5 to reg_3000, read back), no-card
+flag is reported in reg_1C00, reg_4400 returns 0xFC, slot isolation
+works. All 23 guest tests pass.
+
+Boot trajectory after fix: 219k → 264k trace events / 1266 → 1290
+unique functions. Next stalls listed above under "Currently at".
+
+(Earlier-section content preserved below for reference.)
+
+---
+
+## Earlier — pckm task at sp_usr=0x0cc7a248 reads TAEventHandler bytes instead of stack frame (QEMU + FVP, 2026-04-27)
 
 **Root divergence narrowed**: the recursive "newt" DABT
 (FAR=0x6e657774) is caused by the pckm task (id=0x1753, struct at

@@ -396,9 +396,17 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
     // to the normal `mmio` dispatch with the actual (un-XORed) IPA.
 
     if isv == 0 {
-        // No decodable syndrome — typically LDM/STM or exclusive access.
-        // Log enough to diagnose and halt.
-        let elr = read_sysreg!("elr_el2");
+        // No decodable syndrome — typically LDR/STR with writeback,
+        // LDM/STM, or exclusive access. The Newton kernel uses
+        // pre-indexed-with-writeback LDR (`ldr Rd, [Rn, #imm]!`) for
+        // PCMCIA controller register access (e.g. `DisableSocketInterrupt`
+        // at 0x55208). Try to fetch the instruction and emulate the
+        // simple LDR/STR-immediate forms; fall through to halt on
+        // anything we can't handle so the failure stays loud.
+        if try_emulate_isv0_dabt(ctx, ipa, wnr, elr) {
+            advance_elr(4);
+            return;
+        }
         let spsr = read_sysreg!("spsr_el2");
         let sctlr_el1 = read_sysreg!("sctlr_el1");
         kprintln!(
@@ -462,6 +470,68 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
 
     // Advance past the 32-bit ARM instruction that faulted.
     advance_elr(4);
+}
+
+/// Attempt to emulate an ISV=0 stage-2 data abort. Used when the
+/// faulting instruction is an LDR/STR (immediate, A1) form whose
+/// stage-2 syndrome can't carry the destination register — most
+/// commonly the pre-indexed-with-writeback variant the Newton kernel
+/// uses for PCMCIA-controller register access. Returns true on
+/// successful emulation; the caller advances ELR. Returns false if
+/// the instruction isn't a form we recognise — caller halts loudly.
+///
+/// We only handle the unconditional and a small set of common
+/// conditional encodings; LDM/STM, exclusives, and register-offset
+/// LDR/STR all return false on purpose so they keep halting.
+fn try_emulate_isv0_dabt(ctx: &mut TrapContext, ipa: u64, wnr: bool, elr: u32) -> bool {
+    let insn = match guest_mem::read_word_va(elr) {
+        Some(v) => v,
+        None => return false,
+    };
+    // Decode LDR/STR (immediate, A1): cond 010 P U 0 W L Rn Rt imm12.
+    // We require word access (B=0); halfword/byte forms have
+    // different bit 22 values and we don't support them yet.
+    if (insn & 0x0E40_0000) != 0x0400_0000 {
+        return false;
+    }
+    let cond = (insn >> 28) & 0xF;
+    if cond != 0xE {
+        // Conditional: caller already trapped because the access
+        // happened, so the condition was true. Same emulation works
+        // regardless of which condition was used; allow any cond.
+    }
+    let p = (insn >> 24) & 1 != 0;
+    let u = (insn >> 23) & 1 != 0;
+    let w = (insn >> 21) & 1 != 0;
+    let l = (insn >> 20) & 1 != 0;
+    let rn = ((insn >> 16) & 0xF) as usize;
+    let rt = ((insn >> 12) & 0xF) as usize;
+    let imm12 = insn & 0xFFF;
+    if l != !wnr {
+        // Syndrome WnR disagrees with insn L bit — instruction must
+        // not be the one we think; bail.
+        return false;
+    }
+    if rn == 15 || rt == 15 {
+        // PC-relative or PC-target — too tricky for the simple path.
+        return false;
+    }
+    let writeback = (!p) || w;
+    let signed_off: i32 = if u { imm12 as i32 } else { -(imm12 as i32) };
+    let pre_rn = ctx.x[rn] as u32;
+    let post_rn = pre_rn.wrapping_add(signed_off as u32);
+
+    if l {
+        let value = mmio::read(ipa, 2 /* word */, elr as u64);
+        ctx.x[rt] = value as u64;
+    } else {
+        let value = ctx.x[rt] as u32;
+        mmio::write(ipa, 2 /* word */, value, elr as u64);
+    }
+    if writeback {
+        ctx.x[rn] = post_rn as u64;
+    }
+    true
 }
 
 /// IPA ranges that the stage-2 map intentionally leaves as fault /

@@ -184,6 +184,18 @@ pub fn read(ipa: u64, sas: u8, elr: u64) -> u32 {
         // Einstein returns all-ones = "no cards / switches open".
         0x0F18_D400 => 0xFFFF_FFFF,
 
+        // GPIO interrupt-control / sense registers paired with the
+        // matching writes below. The kernel does read-modify-write on
+        // these (TGPIOInterface::DisableInterrupt at 0x26c468 reads
+        // [r0] then ANDs/ORs and stores back). Returning 0 matches
+        // Einstein's unknown-bank #3 fallback in TMemory.cpp:952-959,
+        // and the paired write entries no-op the result.
+        0x0F18_CC00 => 0,
+        0x0F18_D000 => 0,
+        0x0F18_D800 => 0,
+        0x0F18_DC00 => 0,
+        0x0F18_E000 => 0,
+
         // Power status: 0x0F184C00 read as "all-ok high" per Einstein.
         0x0F18_4C00 => 0xFFFF_FFFF,
 

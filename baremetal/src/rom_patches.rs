@@ -133,9 +133,13 @@ const fn hvc_insn(imm: u32) -> u32 {
 /// excludes them so they're never UDF-patched by the function tracer.
 ///
 /// Each DebugStr / Debugger stub is 2 words:
-///   MOV r7, LR    — capture the banked R14_svc in a non-banked reg
-///                   (QEMU raspi3b doesn't expose banked R13/R14 via
-///                   AArch64 MRS, so we stash LR in r7 before the HVC)
+///   MOV r7, LR    — copy the AArch32 source-mode LR into r7, a non-
+///                   banked GPR. Source mode is SVC for the ROM call
+///                   sites; LR in SVC is R14_svc, which per ARM ARM
+///                   Table D1-79 lives in `ctx.x[18]` from EL2, not
+///                   `ctx.x[14]` (= LR_usr). Stashing into r7 (= R7,
+///                   shared across all non-FIQ modes, ctx.x[7])
+///                   sidesteps that mapping question entirely.
 ///   HVC #imm      — trap to EL2
 const DEBUG_STR_STUB_PC: u32 = 0x00FF_FF30;
 const DEBUGGER_STUB_PC:  u32 = 0x00FF_FF38;

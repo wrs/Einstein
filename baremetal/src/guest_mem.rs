@@ -722,21 +722,33 @@ pub unsafe fn load_newton_rom() {
     //     mcr   p10, 0, lr, c0, c0, 0  ; Rd = 14 (LR) — current-mode banked
     //     ldmia sp!, {pc}
     //
-    // QEMU raspi3b does not propagate the AArch32 current-mode banked
-    // LR into x14 on lower-EL AArch32 → AArch64 EL2 trap entry, so the
-    // MCR fires with ctx.x[14] == 0 instead of the native-call ID the
-    // preceding MOV wrote into LR. That makes every native primitive
-    // decode as (driver=0, subfn=0) — the null-primitive test slot —
-    // and the real flash/platform/etc. handlers are never reached.
+    // The Newton kernel makes these calls in SVC mode, so AArch32 R14
+    // is R14_svc. Per ARM ARM DDI 0487 D1.21.1 Table D1-79 the AArch64
+    // GPR file aliases AArch32 R14_svc as **X18**, not X14 — so an
+    // EL2 trap handler that reads `ctx.x[14]` for the MCR's Rd value
+    // would get LR_usr (whatever the user-mode return address was),
+    // not the native-call ID the preceding MOV wrote into LR_svc.
+    //
+    // The original `handle_fp_simd` decodes the MCR encoding's Rd
+    // field (an AArch32 register number, 0-15) and reads `ctx.x[Rd]`
+    // — which is the AArch64 view of R<Rd>_usr, never the source
+    // mode's banked R14. So Rd=14 in SVC mode would deliver LR_usr,
+    // not LR_svc, and every native primitive would decode as garbage.
     //
     // Fix at load time: rewrite every MCR p10 Rd=LR in the REx to use
-    // Rd=R12 (IP, non-banked and call-clobbered per AAPCS), and rewrite
-    // the matching MOV / ADD / LDR that produced LR's value to target
-    // R12 instead. LR is still pushed/popped by the outer STMDB/LDMIA
-    // so control-flow return is unchanged; R12 was scratch on entry so
-    // no caller is disturbed. The 32-bit MCR encoding only changes
-    // bits [15:12] (Rd); the DP-immediate encodings additionally change
-    // Rn bits [19:16] on the ADD form.
+    // Rd=R12 (IP, non-banked: R12_usr lives in X12, and X12 ≡ AArch32
+    // R12 across all non-FIQ modes per Table D1-79 — also AAPCS call-
+    // clobbered, so no caller is disturbed). The 32-bit MCR encoding
+    // only changes bits [15:12] (Rd); we also rewrite the matching
+    // MOV / ADD / LDR that produced LR's value to target R12 instead
+    // (the DP-immediate encodings additionally change Rn bits [19:16]
+    // on the ADD form). LR is still pushed/popped by the outer
+    // STMDB/LDMIA so control-flow return is unchanged.
+    //
+    // (A more general fix would be to teach `handle_fp_simd` to map
+    // Rd → ctx slot via Table D1-79 using the source mode in
+    // SPSR_EL2; the rewrite path is kept because it gives a smaller
+    // and more localised hot path on every native-primitive call.)
     //
     // See INVESTIGATION.md for the debug trace that exposed this.
     // SAFETY: operates within the REx window we just loaded; bounds
@@ -861,15 +873,20 @@ pub unsafe fn load_newton_rom() {
 ///   +0x58: eafffffe  b .                   ; trap if we ever return
 ///   +0x5C: 0c004f00  .word UND_SAVE_BASE_VA (RAM-mirror VA)
 ///
-/// Why the SVC bounce: `MRS X, LR_svc` and `MRS X, ELR_EL1` from
-/// AArch64 EL2 return 0 under QEMU raspi3b for AArch32 banked state
-/// (same issue that forces LR_und/SPSR_und to be persisted here).
-/// The two `msr cpsr_c` instructions briefly switch the CPU mode so
-/// the trampoline can read R14_svc in-mode and store it; the handler
-/// at EL2 then reads the slot via `read_guest_word_pa`. The assumption
-/// is that the caller was in SVC — true for the Newton 2.x kernel.
-/// For callers in USR/IRQ/ABT the slot holds a stale R14_svc; trace
-/// consumers can tell from the SPSR_und mode field.
+/// Historical note on the SVC bounce: per ARM ARM Table D1-79,
+/// AArch32 R14_svc is the AArch64 X18 register at AArch32→AArch64
+/// exception entry (and `ELR_EL1` is an AArch64-only EL1 register
+/// with no architectural alias to R14_svc). The trampoline could
+/// therefore read LR_svc directly from `ctx.x[18]` at EL2 entry,
+/// without the brief `msr cpsr_c, #0xd3` mode bounce. The bounce is
+/// kept for now because shadow_stub's faulting-mode SP/LR snapshot
+/// also runs from this trampoline path and benefits from in-mode
+/// reads when the faulting mode isn't UND/USR; revisiting after
+/// Phase B for cleanup.
+/// `MRS X, LR_svc` is **NOT** a defined AArch64 sysreg encoding —
+/// MRS (Banked register) is AArch32-only per F7.1.115 — so reads of
+/// `LR_svc` as if it were a sysreg always come back as 0 / undefined
+/// regardless of platform; that was a misdiagnosis.
 ///
 /// Why save R0 and R1 first: the trampoline clobbers R0 (to hold the
 /// save-slot VA for the SPSR/LR stores) and R1 (to carry SPSR_und
@@ -935,11 +952,18 @@ pub const SBA_POST_TRAMP_NEW_PC_OFFSET: usize = SBA_POST_TRAMP_OFFSET + 0x24;
 /// DABT-vector trampoline body. Installed at ROM offset 0x00FF_FFA8
 /// (past the SBA post-emulation trampoline at 0x00FF_FF80, ends
 /// around 0x00FF_FFA8). Saves LR_abt/SP_abt/SPSR_abt natively from
-/// ABT mode, then bounces to SVC to save SP_svc/SPSR_svc/LR_svc
-/// (sidestepping QEMU raspi3b's flaky AArch64-MRS-banked-SP reads),
-/// before HVCing to EL2. The literal at the end of the trampoline is
-/// swapped between pre/post-MMU VAs by
-/// `install_und_vector_swap_{pre,post}_mmu`.
+/// ABT mode, then bounces to SVC to save SP_svc/SPSR_svc/LR_svc.
+///
+/// (Historical note: per Table D1-79, AArch32 R13_svc / R14_svc /
+/// SPSR_svc are reachable from AArch64 EL2 as `ctx.x[19]` / `ctx.x[18]`
+/// / `spsr_el1` respectively, so the SVC bounce is no longer
+/// strictly necessary. The trampoline path is retained because the
+/// alignment-fault fast path's HVC-entry handler reads from
+/// `DABT_SAVE_PA` directly; refactoring that to use ctx.x[] is a
+/// follow-up.)
+///
+/// The literal at the end of the trampoline is swapped between
+/// pre/post-MMU VAs by `install_und_vector_swap_{pre,post}_mmu`.
 ///
 /// Save layout at DABT_SAVE_PA:
 ///   +0x00: LR_abt
@@ -962,10 +986,15 @@ pub const DABT_SAVE_PA: u32 = 0x0400_5FA0;
 ///
 /// Stub layout (15 words = 60 bytes). Saves R0 / R1 to TPIDR scratch
 /// regs and LR_abt / SP_abt / SPSR_abt to a fixed RAM slot *before*
-/// the DFSR check. AArch64 EL2 banked-reg reads (`ctx.x[14]`, `mrs
-/// {}, spsr_abt`) have been unreliable on QEMU raspi3b and at least
-/// some FVP configurations for AArch32 EL1 ABT state, so we persist
-/// via RAM and let the handler read the save area directly.
+/// the DFSR check, because the alignment-fault fast path needs the
+/// pre-abt mode bits and faulting PC available to AArch64 EL2 from
+/// guaranteed-stable storage rather than from `mrs spsr_abt` (which
+/// is fine on FVP but historically unreliable on QEMU raspi3b — see
+/// Bug #1 in docs/QEMU_BUGS.md). LR_abt / SP_abt themselves are
+/// also available in `ctx.x[20]` / `ctx.x[21]` per Table D1-79;
+/// keeping the RAM stash simplifies the trampoline → fast-path
+/// handoff (the trampoline writes them anyway as part of its
+/// ABT-mode-native register save).
 ///
 ///   +0x00: ee0d_0f50  mcr p15,0,r0,c13,c0,2  ; save r0 → TPIDRURW
 ///   +0x04: ee0d_1f70  mcr p15,0,r1,c13,c0,3  ; save r1 → TPIDRRO
@@ -1099,9 +1128,11 @@ unsafe fn patch_und_vector(rom: *mut u32) {
         //
         // Layout: load target PC from a PC-relative literal (which the
         // Rust handler writes before each ERET), then `movs pc, lr`.
-        // Using a literal instead of `ctx.x[14] → R14_und` side-steps a
-        // related QEMU bug: AArch64 ERET to AArch32 UND doesn't reliably
-        // plumb x14 into R14_und.
+        // The literal route avoids relying on AArch64→AArch32 GPR
+        // plumbing for the post-ERET R14: per Table D1-79, X14 maps to
+        // R14_usr regardless of target mode (R14_und lives in X22), so
+        // the obvious "stash return PC in ctx.x[14]" pattern would
+        // overwrite R14_usr instead.
         //   +0x00: e59fe000  ldr lr, [pc, #0]    ; lr = *(stub + 8)
         //   +0x04: e1b0f00e  movs pc, lr         ; CPSR = SPSR_und, PC = lr
         //   +0x08: <target PC literal, updated per ERET>

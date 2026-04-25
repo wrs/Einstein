@@ -393,6 +393,15 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
         0x17 => "abt", 0x1B => "und", 0x1F => "sys", _ => "???",
     };
 
+    // Mode-aware SP / LR. Per ARM ARM Table D1-79 the AArch64 GPR
+    // file aliases AArch32 banked R13/R14 by bank name, not by source
+    // mode — `ctx.x[13]/[14]` are *always* SP_usr/LR_usr regardless
+    // of which mode the function-entry UDF fired in. Use
+    // `banked::sp_for_mode/lr_for_mode` so SVC-entry logs see SP_svc
+    // (= ctx.x[19]) and LR_svc (= ctx.x[18]), etc.
+    let cur_sp = crate::banked::sp_for_mode(ctx, spsr);
+    let cur_lr = crate::banked::lr_for_mode(ctx, spsr);
+
     // putc (0x0034F7E0) is called once per character by the ROM's
     // `_vfprintf` / printf family — most commonly when UnhandledException
     // formats an unhandled-exception message, but any guest printf
@@ -403,7 +412,7 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
     // is shown once per emitted line via the LR captured on first char.
     let fa = fn_addr(idx);
     if fa == 0x0034F7E0 {
-        buffer_putc_char(ctx.x[0] as u32, ctx.x[14] as u32, seq);
+        buffer_putc_char(ctx.x[0] as u32, cur_lr, seq);
         return;
     }
 
@@ -414,7 +423,7 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
         fn_name(idx),
         mode_label,
         ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
-        ctx.x[14] as u32,
+        cur_lr,
     );
 
     // Targeted one-shot-style dumps. Gated on function index to avoid log
@@ -424,15 +433,15 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
             // KSRVTask spawn path — dump guest stack so we see env_id /
             // name / priority stack args passed to TUTask::Init /
             // FMNewStack.
-            dump_guest_stack(ctx.x[13] as u32, 8);
+            dump_guest_stack(cur_sp, 8);
         }
     }
 
     // SVC-mode SP tracking: the Phase-B stall is a stage-1 DABT at
     // DFAR=0x0c001000 with pre-abort mode = SVC. That's the guard
-    // page right below the SVC stack at 0x0c002000. Log SP at each
-    // SVC-mode function entry in the relevant call chain so we can
-    // see exactly where SP_svc crosses the boundary.
+    // page right below the SVC stack at 0x0c002000. Log SP_svc at
+    // each SVC-mode function entry in the relevant call chain so we
+    // can see exactly where SP_svc crosses the boundary.
     if mode == 0x13 {
         match fa {
             0x003AD698  // SWIBoot
@@ -447,8 +456,8 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
             | 0x001DFA70 // SMemCopyToKernelGlue
                 => {
                 kprintln!(
-                    "  @{} SP_svc={:#010x} LR={:#010x}",
-                    fn_name(idx), ctx.x[13] as u32, ctx.x[14] as u32
+                    "  @{} SP_svc={:#010x} LR_svc={:#010x}",
+                    fn_name(idx), cur_sp, cur_lr
                 );
             }
             _ => {}
@@ -463,8 +472,8 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
         static DONE: core::sync::atomic::AtomicBool =
             core::sync::atomic::AtomicBool::new(false);
         if !DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
-            let sp = ctx.x[13] as u32;
-            let lr = ctx.x[14] as u32;
+            let sp = cur_sp;
+            let lr = cur_lr;
             kprintln!(
                 "  @SMemCopyToSharedSWI entry: SP={:#010x} LR={:#010x}",
                 sp, lr

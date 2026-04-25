@@ -63,25 +63,11 @@ pub const ALIGN_TAG: u32 = 0x13;
 /// see the CPU state at the moment of an abort we don't otherwise see
 /// from EL2 (stage-1 aborts handled entirely by the guest), we patch
 /// the relevant guest-mode vector to `HVC #DIAG_TAG`. The handler
-/// dumps registers / banked SPSR / FAR and walks the guest stage-1
-/// table for the faulting VA, then halts. Remove the patch once the
+/// dumps registers / banked SPSR / banked SP/LR via the X-register
+/// mapping (DDI 0487 D1.21.1 Table D1-79), walks the guest stage-1
+/// table for the faulting VA, and halts. Remove the patch once the
 /// root cause is identified.
 pub const DIAG_TAG: u32 = 0x11;
-
-/// Records the PA where `handle_diag`'s stub deposited its banked-reg
-/// dump, so `handle_diag_lr` knows where to read from.
-static LR_SAVE_PA_RECORD: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
-
-/// Second-stage diagnostic HVC used to read AArch32 banked R14 (LR)
-/// from the mode we came from. AArch64 at EL2 does plumb x14 = LR of
-/// the source mode on HVC entry in principle, but QEMU raspi3b leaves
-/// x14 = 0 when the source was taken into ABT via a stage-1 abort.
-/// Workaround: ERET into a small AArch32 stub in guest RAM that does
-/// `mov r0, lr; hvc #DIAG_LR_TAG`. At the second HVC, x0 = LR of the
-/// source mode (= faulting_pc + 8 for a data abort). Installed by
-/// `handle_diag`; see the stub assembly comment in that function.
-pub const DIAG_LR_TAG: u32 = 0x12;
 
 /// Synchronous exception from a lower EL running AArch32.
 #[no_mangle]
@@ -332,9 +318,13 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
     // silently accept — anything outside an MMIO window AND outside
     // the stage-2 RW RAM/flash/FB blocks is obviously unreachable.
     if wnr && is_obviously_unreachable_ipa(ipa) {
-        let spsr = read_sysreg!("spsr_el2");
-        let mode = (spsr as u32) & 0x1F;
+        let spsr = read_sysreg!("spsr_el2") as u32;
+        let mode = spsr & 0x1F;
         let mode_label = aarch32_mode_label(mode);
+        // r13/r14 of the source mode via Table D1-79 (ctx.x[13]/[14]
+        // are SP_usr/LR_usr regardless of source mode).
+        let cur_sp = crate::banked::sp_for_mode(ctx, spsr);
+        let cur_lr = crate::banked::lr_for_mode(ctx, spsr);
         kprintln!(
             "dabt-trip: PC={:#010x} mode={} writing {:#010x} -> IPA={:#x}",
             elr, mode_label, ctx.x[srt] as u32, ipa
@@ -352,8 +342,8 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
             ctx.x[8] as u32, ctx.x[9] as u32, ctx.x[10] as u32, ctx.x[11] as u32
         );
         kprintln!(
-            "           r12={:#010x} sp={:#010x} lr={:#010x}",
-            ctx.x[12] as u32, ctx.x[13] as u32, ctx.x[14] as u32
+            "           r12={:#010x} sp({})={:#010x} lr({})={:#010x}",
+            ctx.x[12] as u32, mode_label, cur_sp, mode_label, cur_lr
         );
     }
 
@@ -450,21 +440,24 @@ fn handle_instruction_abort(ctx: &TrapContext, iss: u32) {
         "  ELR={:#x}  FAR_EL2={:#x}  IPA={:#x}  IFSC={:#x}",
         elr, far, ipa, ifsc
     );
-    let spsr = read_sysreg!("spsr_el2");
+    let spsr = read_sysreg!("spsr_el2") as u32;
     let mode = spsr & 0x1F;
     let mode_name = match mode {
         0x10 => "usr", 0x11 => "fiq", 0x12 => "irq", 0x13 => "svc",
         0x16 => "mon", 0x17 => "abt", 0x1A => "hyp", 0x1B => "und",
         0x1F => "sys", _ => "???",
     };
+    // R14 of the active mode via Table D1-79 (ctx.x[14] is LR_usr
+    // regardless of source mode; LR_und lives in ctx.x[22], etc.).
+    let mode_lr = crate::banked::lr_for_mode(ctx, spsr);
     kprintln!(
-        "  SPSR_EL2={:#x}  mode={}  R14={:#x}  R0={:#x}  R1={:#x}",
-        spsr, mode_name, ctx.x[14] as u32, ctx.x[0] as u32, ctx.x[1] as u32
+        "  SPSR_EL2={:#x}  mode={}  R14({})={:#x}  R0={:#x}  R1={:#x}",
+        spsr, mode_name, mode_name, mode_lr, ctx.x[0] as u32, ctx.x[1] as u32
     );
     if mode == 0x1B {
         kprintln!(
             "  (in UND mode: R14 = faulting_pc + 4 = {:#x}; dig there for the real UND)",
-            (ctx.x[14] as u32).wrapping_sub(4)
+            mode_lr.wrapping_sub(4)
         );
     }
     kprintln!(
@@ -558,15 +551,14 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
             ctx.x[0] = stats.patched as u64;
         }
         0x20 => {
-            // Save snapshot — see src/snapshot.rs. The guest's x0..x14
-            // at HVC entry alias the active AArch32 mode's R0..R14;
-            // ELR_EL2 / SPSR_EL2 give the PC and CPSR to resume at.
-            let gprs: [u64; 15] = [
-                ctx.x[0],  ctx.x[1],  ctx.x[2],  ctx.x[3],
-                ctx.x[4],  ctx.x[5],  ctx.x[6],  ctx.x[7],
-                ctx.x[8],  ctx.x[9],  ctx.x[10], ctx.x[11],
-                ctx.x[12], ctx.x[13], ctx.x[14],
-            ];
+            // Save snapshot — see src/snapshot.rs. ctx.x[0..30] is
+            // the AArch64 GPR view that aliases AArch32 R0..R12 plus
+            // every banked SP/LR per ARM ARM Table D1-79; ELR_EL2 /
+            // SPSR_EL2 give the PC and CPSR to resume at.
+            let mut gprs = [0u64; 31];
+            for i in 0..31 {
+                gprs[i] = ctx.x[i];
+            }
             if let Err(e) = crate::snapshot::save(&gprs) {
                 kprintln!("snapshot: save failed: {}", e);
             }
@@ -585,9 +577,6 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         }
         v if v == DIAG_TAG => {
             handle_diag(ctx);
-        }
-        v if v == DIAG_LR_TAG => {
-            handle_diag_lr(ctx);
         }
         v if v == ALIGN_TAG => {
             crate::unaligned::handle_align_fault(ctx);
@@ -719,13 +708,16 @@ fn handle_und(ctx: &mut TrapContext) {
         let elr = read_sysreg!("elr_el2");
         let spsr = read_sysreg!("spsr_el2");
         let far = read_sysreg!("far_el1");
+        // ctx.x[13] is SP_usr, ctx.x[14] is LR_usr per Table D1-79 —
+        // *not* the source mode's banked SP/LR. The trampoline HVCs
+        // from UND mode, so SP_und/LR_und are in ctx.x[23]/ctx.x[22].
         kprintln!(
             "und: handle_und first entry, ELR_EL2={:#x} SPSR_EL2={:#x} FAR_EL1={:#x}",
             elr, spsr, far
         );
         kprintln!(
-            "und:   x13(=SP_<src>)={:#x}  x14(=LR_<src>)={:#x} — x14-4 is pre-UND PC if AArch32 x14 is plumbed",
-            ctx.x[13] as u32, ctx.x[14] as u32
+            "und:   SP_und=ctx.x[23]={:#x}  LR_und=ctx.x[22]={:#x} — LR_und-4 is the faulting PC",
+            ctx.x[23] as u32, ctx.x[22] as u32
         );
         kprintln!(
             "und:   r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}",
@@ -1081,16 +1073,6 @@ fn log_fpa_ctrl_reg(pc: u32, insn: u32, cond_passed: bool) {
 /// the guest handles it at EL1; patching the vector and running lets
 /// us catch the abort context once before the guest's own handler
 /// clobbers it.
-/// Entry point for callers outside `trap.rs` that want a full banked-
-/// reg dump (e.g. `guest_bp::handle_user_bp_und` at a vector-intercept
-/// BP). Reuses the same stub path as the `HVC #DIAG_TAG` case.
-#[allow(dead_code)]
-pub fn handle_diag_from_bp(ctx: &mut TrapContext) -> ! {
-    handle_diag(ctx);
-    // handle_diag ERETs and never returns, but the function signature
-    // is `fn -> ()` so Rust doesn't know; halt defensively.
-    cpu::halt();
-}
 
 /// Canary handler: the guest hit `PowerOffAndReboot` (ROM PC 0x000E_6BBC).
 /// rom_patches patched the first word to `HVC #POWEROFF_REBOOT_HVC_IMM`,
@@ -1104,9 +1086,10 @@ pub fn handle_diag_from_bp(ctx: &mut TrapContext) -> ! {
 /// will recur indefinitely, so we dump state and halt loudly on the
 /// first hit — no ERET.
 fn handle_poweroff_reboot(ctx: &TrapContext) -> ! {
-    let spsr_el2 = read_sysreg!("spsr_el2");
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
     let elr_el2 = read_sysreg!("elr_el2");
-    let mode = (spsr_el2 & 0x1F) as u32;
+    let mode = spsr_el2 & 0x1F;
+    let caller_lr = crate::banked::lr_for_mode(ctx, spsr_el2);
     kprintln!();
     kprintln!("*** PowerOffAndReboot canary fired — guest is giving up ***");
     kprintln!(
@@ -1126,8 +1109,8 @@ fn handle_poweroff_reboot(ctx: &TrapContext) -> ! {
         ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32
     );
     kprintln!(
-        "  R12={:#010x}  R14(mode)={:#010x}  (caller LR; mode-banked, may be stale)",
-        ctx.x[12] as u32, ctx.x[14] as u32
+        "  R12={:#010x}  R14_{}={:#010x}  (caller LR via Table D1-79)",
+        ctx.x[12] as u32, describe_aarch32_mode(mode), caller_lr
     );
     kprintln!();
     kprintln!("  Flash bank 0 host bytes [0..0x40]:");
@@ -1199,9 +1182,10 @@ fn handle_bootos_canary(ctx: &mut TrapContext) {
     // (the halt message itself will appear in the trace if we emit the
     // stop AFTER the `*** BootOS canary fired ...` line).
     crate::tarmac::emit_stop();
-    let spsr_el2 = read_sysreg!("spsr_el2");
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
     let elr_el2 = read_sysreg!("elr_el2");
-    let mode = (spsr_el2 & 0x1F) as u32;
+    let mode = spsr_el2 & 0x1F;
+    let caller_lr = crate::banked::lr_for_mode(ctx, spsr_el2);
     kprintln!();
     kprintln!("*** BootOS canary fired on entry #{} — software reset detected ***", n);
     kprintln!(
@@ -1217,8 +1201,8 @@ fn handle_bootos_canary(ctx: &mut TrapContext) {
         ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
     );
     kprintln!(
-        "  R12={:#010x}  R14(mode)={:#010x}  (caller LR; mode-banked, may be stale)",
-        ctx.x[12] as u32, ctx.x[14] as u32
+        "  R12={:#010x}  R14_{}={:#010x}  (caller LR via Table D1-79)",
+        ctx.x[12] as u32, describe_aarch32_mode(mode), caller_lr
     );
     kprintln!();
     kprintln!(
@@ -1237,9 +1221,10 @@ fn handle_bootos_canary(ctx: &mut TrapContext) {
 }
 
 fn handle_reboot(ctx: &TrapContext) -> ! {
-    let spsr_el2 = read_sysreg!("spsr_el2");
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
     let elr_el2 = read_sysreg!("elr_el2");
-    let mode = (spsr_el2 & 0x1F) as u32;
+    let mode = spsr_el2 & 0x1F;
+    let caller_lr = crate::banked::lr_for_mode(ctx, spsr_el2);
     kprintln!();
     kprintln!("*** Reboot canary fired — guest kernel is rebooting ***");
     kprintln!(
@@ -1255,8 +1240,8 @@ fn handle_reboot(ctx: &TrapContext) -> ! {
         ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
     );
     kprintln!(
-        "  R12={:#010x}  R14(mode)={:#010x}  (caller LR; mode-banked, may be stale)",
-        ctx.x[12] as u32, ctx.x[14] as u32
+        "  R12={:#010x}  R14_{}={:#010x}  (caller LR via Table D1-79)",
+        ctx.x[12] as u32, describe_aarch32_mode(mode), caller_lr
     );
     kprintln!();
     kprintln!(
@@ -1325,49 +1310,37 @@ fn dump_ram_bytes(va: u32, count: u32) {
     }
 }
 
-fn handle_diag(ctx: &mut TrapContext) {
+fn handle_diag(ctx: &mut TrapContext) -> ! {
     let far = read_sysreg!("far_el1");
     let spsr_el2 = read_sysreg!("spsr_el2");
     let elr_el2 = read_sysreg!("elr_el2");
 
+    // Banked SPSRs are AArch64-named sysregs (FVP and QEMU both honour
+    // them). For SPSR_svc, the architecturally-mapped AArch64 view is
+    // SPSR_EL1 (DDI 0487 D13.2 — SPSR_EL1 bits[31:0] are mapped to
+    // AArch32 SPSR_svc).
+    let spsr_svc = read_sysreg!("spsr_el1");
     let spsr_abt = read_banked_spsr("abt");
     let spsr_und = read_banked_spsr("und");
     let spsr_irq = read_banked_spsr("irq");
     let spsr_fiq = read_banked_spsr("fiq");
 
-    let pre_abort_mode = spsr_el2 & 0x1F;
-    let mode_name = describe_aarch32_mode(pre_abort_mode as u32);
+    // HVC-source mode: whichever AArch32 mode was active when HVC fired
+    // (ABT for the PABT-vector intercept, UND for guest_bp). The
+    // "pre-abort" / "pre-fault" mode is named by the matching banked
+    // SPSR (SPSR_abt for ABT-source, SPSR_und for UND-source).
+    let hvc_src_mode = (spsr_el2 as u32) & 0x1F;
+    let mode_name = describe_aarch32_mode(hvc_src_mode);
 
     kprintln!();
     kprintln!("*** DIAG vector intercept (HVC #DIAG_TAG from mode {}) ***", mode_name);
+    kprintln!("  ELR_EL2   = {:#010x}  (PC of insn after HVC)", elr_el2);
+    kprintln!("  SPSR_EL2  = {:#010x}  (CPSR at HVC entry)", spsr_el2);
+    kprintln!("  FAR_EL1   = {:#010x}  (most-recent EL1 faulting VA)", far);
     kprintln!(
-        "  ELR_EL2   = {:#010x}  (PC of insn after HVC)",
-        elr_el2
+        "  SPSR_svc  = {:#010x}  SPSR_abt = {:#010x}  SPSR_und = {:#010x}  SPSR_irq = {:#010x}  SPSR_fiq = {:#010x}",
+        spsr_svc, spsr_abt, spsr_und, spsr_irq, spsr_fiq
     );
-    kprintln!(
-        "  SPSR_EL2  = {:#010x}  (CPSR at HVC entry)",
-        spsr_el2
-    );
-    kprintln!(
-        "  FAR_EL1   = {:#010x}  (most-recent EL1 faulting VA)",
-        far
-    );
-    kprintln!(
-        "  SPSR_abt  = {:#010x}  SPSR_und = {:#010x}  SPSR_irq = {:#010x}  SPSR_fiq = {:#010x}",
-        spsr_abt, spsr_und, spsr_irq, spsr_fiq
-    );
-    kprintln!("  guest regs at HVC entry (x13/x14 are banked for the current mode):");
-    for chunk in 0..3 {
-        let base = chunk * 5;
-        kprintln!(
-            "    r{:<2}={:#010x} r{:<2}={:#010x} r{:<2}={:#010x} r{:<2}={:#010x} r{:<2}={:#010x}",
-            base, ctx.x[base] as u32,
-            base+1, ctx.x[base+1] as u32,
-            base+2, ctx.x[base+2] as u32,
-            base+3, ctx.x[base+3] as u32,
-            base+4, ctx.x[base+4] as u32,
-        );
-    }
     let esr = read_sysreg!("esr_el2");
     let esr_el1 = read_sysreg!("esr_el1");
     let sctlr = read_sysreg!("sctlr_el1");
@@ -1393,276 +1366,111 @@ fn handle_diag(ctx: &mut TrapContext) {
         "  TTBR0_EL1 = {:#010x}  TTBR1_EL1 = {:#010x}  TCR_EL1 = {:#010x}",
         ttbr0, ttbr1, tcr
     );
-    // Reliable banked state. The DABT trampoline at ROM
-    // DABT_TRAMP_OFFSET stores LR_abt / SP_abt / SPSR_abt (all from
-    // ABT mode) — those are AArch32-native reads and survive QEMU
-    // raspi3b's flaky banked-reg plumbing. SP_svc / SPSR_svc / LR_svc
-    // come from AArch64 banked MRS now that the stub no longer does
-    // the SVC-mode bounce (removed to make room for the alignment-
-    // fault fast path — see guest_mem.rs). Banked MRS works on FVP;
-    // on QEMU raspi3b these reads may be zero, but the DIAG path is
-    // only used for "kernel hit an unexpected DABT" halts and FVP is
-    // the primary Phase-B platform.
-    let lr_abt = guest_mem::read_word_pa(guest_mem::DABT_SAVE_PA).unwrap_or(0);
-    let sp_abt = guest_mem::read_word_pa(guest_mem::DABT_SAVE_PA + 4).unwrap_or(0);
-    let spsr_abt_reliable = guest_mem::read_word_pa(guest_mem::DABT_SAVE_PA + 8).unwrap_or(0);
-    let (sp_svc_reliable, spsr_svc_reliable, lr_svc_reliable) = {
-        let sp: u64; let spsr: u64; let lr: u64;
-        // SP_svc / SPSR_svc / LR_svc are the AArch32 aliases of AArch64's
-        // SP_EL1 / SPSR_EL1 / ELR_EL1 (same physical registers). LLVM's
-        // AArch64 assembler accepts the EL1 forms but rejects the AArch32
-        // banked-mode forms for these three (it does accept SPSR_abt etc.
-        // which are distinct from any EL mapping). Reads have no side
-        // effects.
-        unsafe {
-            core::arch::asm!("mrs {}, sp_el1",   out(reg) sp,
-                options(nomem, nostack, preserves_flags));
-            core::arch::asm!("mrs {}, spsr_el1", out(reg) spsr,
-                options(nomem, nostack, preserves_flags));
-            core::arch::asm!("mrs {}, elr_el1",  out(reg) lr,
-                options(nomem, nostack, preserves_flags));
-        }
-        (sp as u32, spsr as u32, lr as u32)
+
+    // Banked SP/LR via the X-register mapping (DDI 0487 D1.21.1
+    // Table D1-79). Truncated to u32 because Table D1-85 says the
+    // upper 32 bits of x16..x30 on AArch32→AArch64 entry are
+    // CONSTRAINED UNPREDICTABLE.
+    let sp_usr = ctx.x[13] as u32;
+    let lr_usr = ctx.x[14] as u32;
+    let lr_irq = ctx.x[16] as u32;
+    let sp_irq = ctx.x[17] as u32;
+    let lr_svc = ctx.x[18] as u32;
+    let sp_svc = ctx.x[19] as u32;
+    let lr_abt = ctx.x[20] as u32;
+    let sp_abt = ctx.x[21] as u32;
+    let lr_und = ctx.x[22] as u32;
+    let sp_und = ctx.x[23] as u32;
+    kprintln!(
+        "  banked SP/LR (Table D1-79):  USR sp={:#010x} lr={:#010x}",
+        sp_usr, lr_usr
+    );
+    kprintln!(
+        "                               SVC sp={:#010x} lr={:#010x}",
+        sp_svc, lr_svc
+    );
+    kprintln!(
+        "                               ABT sp={:#010x} lr={:#010x}   IRQ sp={:#010x} lr={:#010x}",
+        sp_abt, lr_abt, sp_irq, lr_irq
+    );
+    kprintln!(
+        "                               UND sp={:#010x} lr={:#010x}",
+        sp_und, lr_und
+    );
+    kprintln!("  guest regs r0..r14 (R8..R12 are USR-bank for non-FIQ source modes):");
+    for chunk in 0..3 {
+        let base = chunk * 5;
+        kprintln!(
+            "    r{:<2}={:#010x} r{:<2}={:#010x} r{:<2}={:#010x} r{:<2}={:#010x} r{:<2}={:#010x}",
+            base, ctx.x[base] as u32,
+            base+1, ctx.x[base+1] as u32,
+            base+2, ctx.x[base+2] as u32,
+            base+3, ctx.x[base+3] as u32,
+            base+4, ctx.x[base+4] as u32,
+        );
+    }
+
+    // Pick the source mode's LR/SP. For HVC-from-ABT (the PABT-vector
+    // intercept), the pre-abort mode is named by SPSR_abt and the
+    // banked LR/SP for that mode comes from its X-register slot.
+    // For HVC-from-UND (guest_bp), use SPSR_und.
+    let (spsr_src, lr_src) = match hvc_src_mode {
+        crate::banked::MODE_UND => (spsr_und as u32, lr_und),
+        crate::banked::MODE_ABT => (spsr_abt as u32, lr_abt),
+        _ => (spsr_el2 as u32, ctx.x[14] as u32),
     };
-    let pre_mode = spsr_abt_reliable & 0x1F;
-    let thumb = (spsr_abt_reliable & (1 << 5)) != 0;
-    let faulting_pc = if thumb { (lr_abt.wrapping_sub(4)) & !1 } else { lr_abt.wrapping_sub(8) };
+    let pre_mode = spsr_src & 0x1F;
+    let pre_lr = crate::banked::lr_for_mode(ctx, spsr_src);
+    let pre_sp = crate::banked::sp_for_mode(ctx, spsr_src);
+    let thumb = (spsr_src & (1 << 5)) != 0;
+    // Faulting PC adjustment: ARM DABT = LR-8, ARM PABT = LR-4,
+    // Thumb DABT = LR-4, Thumb PABT = LR-2. The DIAG path only fires
+    // from PABT today (line 801 of guest_mem.rs patches PABT vector),
+    // so use the PABT formula (LR-4 ARM, LR-2 Thumb).
+    let faulting_pc = if thumb { lr_src.wrapping_sub(2) & !1 } else { lr_src.wrapping_sub(4) };
     let insn = guest_mem::read_word_pa(faulting_pc & !3).unwrap_or(0xDEAD_BEEF);
     kprintln!(
-        "  DABT-trampoline saved: LR_abt={:#010x} SP_abt={:#010x} SPSR_abt={:#010x}",
-        lr_abt, sp_abt, spsr_abt_reliable
+        "  HVC source mode = {:#x} ({}); pre-fault mode (from SPSR_<src>) = {:#x} ({}), T={}",
+        hvc_src_mode, mode_name,
+        pre_mode, describe_aarch32_mode(pre_mode), thumb as u32
     );
     kprintln!(
-        "                         SP_svc={:#010x} SPSR_svc={:#010x} LR_svc={:#010x}",
-        sp_svc_reliable, spsr_svc_reliable, lr_svc_reliable
+        "  pre-fault SP={:#010x} LR={:#010x}  -> faulting PC {:#010x}  insn={:#010x}",
+        pre_sp, pre_lr, faulting_pc, insn
     );
+
+    // The DABT trampoline at DABT_TRAMP_OFFSET still records LR_abt /
+    // SP_abt / SPSR_abt to a fixed PA slot for the alignment-fault
+    // fast path. Print those too so any divergence between the
+    // X-register view and the trampoline-stash view is visible at a
+    // glance.
+    let lr_abt_save = guest_mem::read_word_pa(guest_mem::DABT_SAVE_PA).unwrap_or(0);
+    let sp_abt_save = guest_mem::read_word_pa(guest_mem::DABT_SAVE_PA + 4).unwrap_or(0);
+    let spsr_abt_save = guest_mem::read_word_pa(guest_mem::DABT_SAVE_PA + 8).unwrap_or(0);
     kprintln!(
-        "  pre-abort mode = {:#x} ({}), T={}  -> faulting PC {:#010x}  insn={:#010x}",
-        pre_mode, describe_aarch32_mode(spsr_abt_reliable), thumb as u32, faulting_pc, insn
+        "  DABT-trampoline stash (cross-check):  LR_abt={:#010x} SP_abt={:#010x} SPSR_abt={:#010x}",
+        lr_abt_save, sp_abt_save, spsr_abt_save
     );
+
     guest_mem::dump_stage1_walk(far as u32);
     // Also walk a handful of VAs that are relevant to Newton boot —
     // SVC stack, ABT stack target, REx window start, RAM base — so we
     // can tell at a glance whether the kernel's L1 table has the
     // expected mappings in place at the time of the abort.
-    // 0x02Axxxxx added because recent DIAG runs show SP_svc and PC
-    // both landing there; need to see the stage-1 layout. Also
-    // 0x00FFFF00 (our UND trampoline body) to confirm the guest can
-    // actually fetch from there post-MMU.
     for va in [0x04004400u32, 0x0C004C00, 0x01000000, 0x04000000, 0x00800000,
                0x02A00000, 0x02A04000, 0x02A04AA4, 0x00FFFF00,
-               // 0x0008Exxx: where SP_und / LR_und point per the stub
-               // readout. ROM region so identity-mapped through L2, but
-               // we want to confirm there's no surprise.
                0x0008EA8C, 0x0008EB00, 0x0008EB08,
-               // 0x01000xxx: the faulting VA region. L1[0x10] = fault in
-               // Einstein's map; we want to dump L2 subentries only if
-               // somehow a fine/coarse table got installed.
                0x0100018B, 0x01000180, 0x01000190, 0x01000193,
-               // 0x01A00xxx: IRQ vector target (REx jump table). If
-               // L1[0x1A] isn't populated, PABTs from the IRQ path
-               // become a hidden source of chained exceptions.
                0x01A00000, 0x01A00004,
-               // 0x0C100xxx: kernel domain heap / globals per Einstein's
-               // MMU map. L1[0xC1] should be a coarse-into-L2 with small
-               // pages; our post-fix_stage1_xn_bits normalisation may
-               // have stripped domain bits needed for writes.
                0x0C100000, 0x0C100800, 0x0C104000] {
         guest_mem::dump_stage1_walk(va);
     }
 
-    // Before halting, ERET into an AArch32 stub we plant in guest
-    // RAM that dumps banked R13/R14/SPSR of the source mode plus SVC
-    // and UND as well. We write them to a scratch area in RAM and
-    // hvc back; EL2 then reads the saved words directly. This is more
-    // reliable than trying to carry values through ctx.x[0..4] because
-    // QEMU raspi3b's AArch32→AArch64 banked register plumbing is
-    // already known to be flaky (SPSR_abt reads as 0 from AArch64,
-    // x14 doesn't reliably carry LR_<src_mode>).
-    //
-    // Stub at guest IPA 0x04005F00, reached via VA 0x0C004F00 (the
-    // kernel maps 0x0C004000-0x0C004FFF through L1[0xC0] coarse ->
-    // L2[0x04] small page -> PA 0x04005xxx). Saves to IPA 0x04005F80+,
-    // which is inside the same small page so it's writable from the
-    // guest's view.
-    //
-    //   +0x00: e59f0050   ldr r0, [pc, #0x50]  ; r0 = &SAVE_BASE (VA 0x0C004F80)
-    //   +0x04: e1a0100e   mov r1, lr            ; r1 = R14_abt
-    //   +0x08: e5801000   str r1, [r0]          ; save LR_abt at +0x00
-    //   +0x0C: e1a0100d   mov r1, sp            ; r1 = R13_abt
-    //   +0x10: e5801004   str r1, [r0, #4]      ; save SP_abt at +0x04
-    //   +0x14: e14f1000   mrs r1, spsr          ; r1 = SPSR_abt
-    //   +0x18: e5801008   str r1, [r0, #8]      ; save SPSR_abt at +0x08
-    //   +0x1C: e321f0db   msr cpsr_c, #0xdb     ; → UND
-    //   +0x20: e1a0100e   mov r1, lr            ; r1 = R14_und
-    //   +0x24: e580100c   str r1, [r0, #12]     ; save LR_und at +0x0C
-    //   +0x28: e1a0100d   mov r1, sp            ; r1 = R13_und
-    //   +0x2C: e5801010   str r1, [r0, #16]     ; save SP_und at +0x10
-    //   +0x30: e14f1000   mrs r1, spsr          ; r1 = SPSR_und
-    //   +0x34: e5801014   str r1, [r0, #20]     ; save SPSR_und at +0x14
-    //   +0x38: e321f0d3   msr cpsr_c, #0xd3     ; → SVC
-    //   +0x3C: e1a0100e   mov r1, lr            ; r1 = R14_svc
-    //   +0x40: e5801018   str r1, [r0, #24]     ; save LR_svc at +0x18
-    //   +0x44: e1a0100d   mov r1, sp            ; r1 = R13_svc
-    //   +0x48: e580101c   str r1, [r0, #28]     ; save SP_svc at +0x1C
-    //   +0x4C: e321f0d7   msr cpsr_c, #0xd7     ; → ABT
-    //   +0x50: ee151f10   mrc p15,0,r1,c5,c0,0  ; r1 = DFSR
-    //   +0x54: e5801020   str r1, [r0, #0x20]    ; save DFSR at +0x20
-    //   +0x58: ee161f10   mrc p15,0,r1,c6,c0,0   ; r1 = DFAR
-    //   +0x5C: e5801024   str r1, [r0, #0x24]    ; save DFAR at +0x24
-    //   +0x60: e1400172   hvc #0x12             ; DIAG_LR_TAG
-    //   +0x64: eafffffe   b .                   ; trap if returns
-    //   +0x68: 0c004f80   .word SAVE_BASE_VA
-    const LR_STUB_PA: u32 = 0x0400_5F00;
-    const LR_STUB_VA: u32 = 0x0C00_4F00;
-    const LR_SAVE_VA: u32 = 0x0C00_4F80;
-    const LR_SAVE_PA: u32 = 0x0400_5F80;
-    // The stub expects to start in ABT mode (that's the case when
-    // invoked from the DABT-vector HVC intercept at VA 0x10). It can
-    // also be invoked from UND mode via `handle_diag_from_bp` (a
-    // guest-BP hit at a patched vector). Switch to ABT up front so the
-    // first-block reads always capture ABT-mode banked regs regardless
-    // of entry mode. If we're already in ABT the MSR is a no-op.
-    let stub: [u32; 28] = [
-        0xE321_F0D7, // msr cpsr_c, #0xd7  (-> ABT)
-        0xE59F_0060, // ldr r0, [pc, #0x60]  (literal at end)
-        0xE1A0_100E, // mov r1, lr
-        0xE580_1000, // str r1, [r0]
-        0xE1A0_100D, // mov r1, sp
-        0xE580_1004, // str r1, [r0, #4]
-        0xE14F_1000, // mrs r1, spsr
-        0xE580_1008, // str r1, [r0, #8]
-        0xE321_F0DB, // msr cpsr_c, #0xdb  (UND)
-        0xE1A0_100E, // mov r1, lr  (LR_und)
-        0xE580_100C, // str r1, [r0, #0xc]
-        0xE1A0_100D, // mov r1, sp  (SP_und)
-        0xE580_1010, // str r1, [r0, #0x10]
-        0xE14F_1000, // mrs r1, spsr  (SPSR_und)
-        0xE580_1014, // str r1, [r0, #0x14]
-        0xE321_F0D3, // msr cpsr_c, #0xd3  (SVC)
-        0xE1A0_100E, // mov r1, lr  (LR_svc)
-        0xE580_1018, // str r1, [r0, #0x18]
-        0xE1A0_100D, // mov r1, sp  (SP_svc)
-        0xE580_101C, // str r1, [r0, #0x1C]
-        0xE321_F0D7, // msr cpsr_c, #0xd7  (back to ABT)
-        0xEE15_1F10, // mrc p15,0,r1,c5,c0,0 — DFSR
-        0xE580_1020, // str r1, [r0, #0x20]
-        0xEE16_1F10, // mrc p15,0,r1,c6,c0,0 — DFAR
-        0xE580_1024, // str r1, [r0, #0x24]
-        0xE140_0172, // hvc #0x12
-        0xEAFF_FFFE, // b .
-        LR_SAVE_VA,  // literal for first ldr
-    ];
-    for (i, w) in stub.iter().enumerate() {
-        if !guest_mem::write_word_pa(LR_STUB_PA + (i as u32) * 4, *w) {
-            kprintln!("  (stub write at +{} failed; halting)", i * 4);
-            cpu::halt();
-        }
-    }
-    // Record the save-base PA in a module-private location that the
-    // DIAG_LR_TAG handler knows how to find.
-    LR_SAVE_PA_RECORD.store(LR_SAVE_PA, core::sync::atomic::Ordering::Relaxed);
-    kprintln!("  ERET'ing to LR/stack-trace stub at VA {:#x} ...", LR_STUB_VA);
-    // SAFETY: single-use ERET. ELR_EL2 set to the stub VA, SPSR_EL2
-    // kept as-is so the stub runs in the pre-abort mode. Caller is
-    // halted on return from handle_diag_lr.
-    unsafe {
-        core::arch::asm!(
-            "msr elr_el2, {elr}",
-            "isb",
-            "eret",
-            elr = in(reg) LR_STUB_VA as u64,
-            options(noreturn),
-        );
-    }
-}
-
-/// Second-stage diagnostic: the stub installed by `handle_diag` stored
-/// banked R13/R14/SPSR for ABT, UND, and SVC modes to fixed RAM slots
-/// (base recorded in `LR_SAVE_PA_RECORD`). We read them back here and
-/// print a symbolic stack trace. Reading from RAM avoids QEMU's
-/// flaky AArch32→AArch64 banked-register plumbing.
-fn handle_diag_lr(ctx: &mut TrapContext) -> ! {
-    let _ = ctx; // guest x0 was clobbered as stub scratch
-    let base = LR_SAVE_PA_RECORD.load(core::sync::atomic::Ordering::Relaxed);
-    let read = |off: u32| guest_mem::read_word_pa(base + off).unwrap_or(0xdeadbeef);
-    let lr_abt   = read(0x00);
-    let sp_abt   = read(0x04);
-    let spsr_abt = read(0x08);
-    let lr_und   = read(0x0C);
-    let sp_und   = read(0x10);
-    let spsr_und = read(0x14);
-    let lr_svc   = read(0x18);
-    let sp_svc   = read(0x1C);
-    let dfsr     = read(0x20);
-    let dfar     = read(0x24);
-
-    // The "source mode" of the DABT is whichever mode SPSR_abt names.
-    // Reconstruct the faulting PC from LR of that mode, with the
-    // correct adjustment (+8 for DABT/ARM, +4/T for DABT/Thumb).
-    let src_mode = spsr_abt & 0x1F;
-    let (lr_src, sp_src, spsr_src) = match src_mode {
-        0x1B => (lr_und, sp_und, spsr_und),
-        0x13 => (lr_svc, sp_svc, spsr_abt /* SPSR_abt holds pre-abt CPSR */),
-        _    => (lr_abt, sp_abt, spsr_abt),
-    };
-    let thumb = (lr_src & 1) != 0;
-    let faulting_pc = if thumb { lr_src.wrapping_sub(4) & !1 }
-                      else      { lr_src.wrapping_sub(8) };
-
-    kprintln!();
-    kprintln!("*** DIAG stage 2 (LR + stack-trace recovery) ***");
-    kprintln!(
-        "  LR_<src>  = {:#010x}  SPSR_<src> = {:#010x}  (T={})",
-        lr_src, spsr_src, thumb as u32
-    );
-    kprintln!(
-        "  SP_<src>  = {:#010x}  SP_svc  = {:#010x}  LR_svc = {:#010x}",
-        sp_src, sp_svc, lr_svc
-    );
-    let mode_name = describe_aarch32_mode(spsr_src);
-    kprintln!(
-        "  source mode from SPSR = {:#x} ({}); T={}, I={}, F={}",
-        spsr_src & 0x1F, mode_name,
-        (spsr_src >> 5) & 1, (spsr_src >> 7) & 1, (spsr_src >> 6) & 1
-    );
-    kprintln!(
-        "  faulting PC  = {:#010x}  ({})",
-        faulting_pc, if thumb { "Thumb" } else { "ARM" }
-    );
-    kprintln!(
-        "  DFSR      = {:#010x}  (FS[4:0]={:#x}, WnR={}, domain={:#x})",
-        dfsr,
-        ((dfsr >> 10) & 1) << 4 | (dfsr & 0xF),
-        (dfsr >> 11) & 1,
-        (dfsr >> 4) & 0xF
-    );
-    kprintln!("  DFAR      = {:#010x}", dfar);
-    kprintln!("  SP_abt    = {:#010x}  LR_abt = {:#010x}  SPSR_abt = {:#010x}",
-        sp_abt, lr_abt, spsr_abt);
-    kprintln!("  SP_und    = {:#010x}  LR_und = {:#010x}  SPSR_und = {:#010x}",
-        sp_und, lr_und, spsr_und);
-    kprintln!("  src_mode = {:#x}", src_mode);
-
-    // Dump the faulting instruction(s). For Thumb at an aligned addr,
-    // two halfwords. For ARM, one word.
-    if let Some(w) = guest_mem::read_word_pa(faulting_pc) {
-        if thumb {
-            kprintln!(
-                "  insn halfwords @ {:#x} = {:#06x} {:#06x}",
-                faulting_pc, w & 0xFFFF, (w >> 16) & 0xFFFF
-            );
-        } else {
-            kprintln!("  insn word @ {:#x} = {:#010x}", faulting_pc, w);
-        }
-    }
-
-    // Walk the SVC stack symbolically. `lr_svc` is the return
-    // address of whoever is currently executing in SVC — i.e. the BL
-    // that led us here. From SP_svc we scan upward (growing address)
-    // looking for values that plausibly point back into the ROM's
-    // executable range; each such word is a likely saved-LR. This is
-    // a cheap substitute for a full fp-chain walk when fp = 0 (which
+    // Symbolic stack trace from SP_svc. lr_svc is the return address
+    // of whoever is currently executing in SVC — i.e. the BL that led
+    // us here. From SP_svc, scan upward looking for plausible saved
+    // return addresses (point into ROM, aligned, and preceded by a
+    // BL/BLX). Cheap substitute for an fp-chain walk when fp=0 (which
     // BootOS deliberately sets at 0x187d4).
     kprintln!("  symbolic stack trace (SVC):");
     kprintln!(
@@ -1673,11 +1481,6 @@ fn handle_diag_lr(ctx: &mut TrapContext) -> ! {
         "    #1  {:#010x}  ARM    <- LR_svc (caller of faulting fn)",
         lr_svc & !1
     );
-
-    // Scan 64 words up from SP_svc; any word that looks like a return
-    // address (points into ROM, word-aligned modulo Thumb bit, and
-    // the preceding word is a plausible BL / BLX) is printed. The
-    // word-before-BL filter cuts almost all false positives.
     let mut frame = 2usize;
     for i in 0..64u32 {
         let va = sp_svc.wrapping_add(i * 4);
@@ -1687,13 +1490,9 @@ fn handle_diag_lr(ctx: &mut TrapContext) -> ! {
         let w = match guest_mem::read_word_pa(pa) {
             Some(x) => x, None => continue,
         };
-        // Heuristic for "plausible return address": points to ROM
-        // (< 0x0100_0000 after stripping Thumb bit) and aligned.
         let tgt = w & !1;
         if tgt == 0 || tgt >= 0x0100_0000 { continue; }
         if tgt & 3 != 0 { continue; }
-        // Preceding word should look like a BL (`cond_101L_...`) —
-        // which means bits[27:24] = 0b101_ (any BL/B).
         if let Some(prev) = guest_mem::read_word_pa(tgt.wrapping_sub(4)) {
             let is_bl = ((prev >> 24) & 0xF) == 0xB;       // BL (unconditional)
             let is_blx_imm = ((prev >> 25) & 0x7F) == 0x7D; // BLX imm (v5+)
@@ -1901,23 +1700,27 @@ fn resolve_guest_pa(addr: u32) -> Option<u32> {
 /// at PC 0x3ae3ec.
 ///
 /// Workaround (suggested by the verification agent on 2026-04-23):
-/// don't write SPSR_EL2 at all. Instead, stash the desired return PC in
-/// `R14_und` via `ctx.x[14]` and ERET into a `movs pc, lr` stub at
-/// `UND_RETURN_STUB_VA`. SPSR_EL2 stays as the CPU's auto-saved value
-/// from HVC entry (= UND, mode 0x1B), so the ERET lands in UND mode.
-/// The stub then does `movs pc, lr` architecturally — the CPU copies
-/// SPSR_und (still the pre-UND CPSR, preserved since UND entry) into
-/// CPSR, and R14_und into PC. No `msr spsr_el2`, no SPSR_EL1
-/// side-effect.
+/// don't write SPSR_EL2 at all. Instead, ERET into a `ldr lr, [pc,
+/// #0]; movs pc, lr` stub at `UND_RETURN_STUB_VA`. SPSR_EL2 stays as
+/// the CPU's auto-saved value from HVC entry (= UND, mode 0x1B), so
+/// the ERET lands in UND mode. The stub loads the target PC from a
+/// post-LDR literal we write to the ROM backing, then `movs pc, lr`
+/// architecturally — the CPU copies SPSR_und (still the pre-UND
+/// CPSR, preserved since UND entry) into CPSR, and R14_und into PC.
+/// No `msr spsr_el2`, no SPSR_EL1 side-effect.
 pub(crate) fn return_to_guest_from_und(_ctx: &mut TrapContext, elr: u64, _spsr: u64) {
     // Write target PC to the stub's literal slot, then ERET into the
     // stub in UND mode (by leaving SPSR_EL2 alone). The stub does
     // `ldr lr, [pc, #0]; movs pc, lr` — CPU restores CPSR from SPSR_und
     // (preserved since UND entry) and PC from the literal.
     //
-    // Using a literal instead of `ctx.x[14] → R14_und` side-steps a
-    // QEMU raspi3b bug: AArch64 ERET to AArch32 UND doesn't reliably
-    // plumb x14 into R14_und.
+    // Using a literal in the stub (rather than staging the return PC
+    // into LR_und = ctx.x[22] per Table D1-79) is the simpler and
+    // platform-portable choice: `ic ivau` on the literal address is
+    // a single barrier-coupled instruction, whereas the X22 path
+    // would require relying on AArch64-ERET-to-AArch32 to faithfully
+    // route x[22] into R14_und across both QEMU raspi3b and FVP, and
+    // the ROM-backing flush is needed regardless.
     let literal_host =
         guest_mem::rom_host_pa() as usize + guest_mem::UND_RETURN_STUB_LITERAL_OFFSET;
     // SAFETY: bounded write in ROM backing; EL2-owned. Flush via D-cache

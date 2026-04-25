@@ -212,20 +212,30 @@ unsafe fn eret_to_guest(entry_ipa: u64) -> ! {
 /// ERET into a guest restored from a snapshot. Assumes
 /// `snapshot::load` has already re-applied EL1 sysregs (SCTLR, TTBRx,
 /// TCR, DACR, VBAR, CPACR, banked SPSRs).
+///
+/// Per ARM ARM DDI 0487 D1.21.1 Table D1-79, the AArch64 GPR file
+/// X0..X30 aliases AArch32 R0..R12 plus every banked SP/LR by name:
+/// X13/X14 = SP_usr/LR_usr, X18/X19 = LR_svc/SP_svc, X20/X21 =
+/// LR_abt/SP_abt, X22/X23 = LR_und/SP_und, X16/X17 = LR_irq/SP_irq,
+/// X24..X28 = R8_fiq..R12_fiq, X29/X30 = SP_fiq/LR_fiq. So loading
+/// the saved 31-entry GPR view directly into x0..x30 and ERET-ing
+/// makes every banked register land in the right slot for the
+/// AArch32 mode SPSR_EL2 names. No banked sysreg dance needed.
 pub unsafe fn eret_to_restored(state: crate::snapshot::RestoreState) -> ! {
     // Widen u32 GPRs to u64 so we can pair-load with LDP.
-    let mut gprs_u64: [u64; 15] = [0; 15];
-    for i in 0..15 {
+    let mut gprs_u64: [u64; 31] = [0; 31];
+    for i in 0..31 {
         gprs_u64[i] = state.gprs[i] as u64;
     }
     let pc = state.pc as u64;
     let cpsr = state.cpsr as u64;
     let ptr = gprs_u64.as_ptr() as u64;
 
-    // SAFETY: sysreg writes to ELR_EL2 / SPSR_EL2 set the post-ERET
-    // guest PC and CPSR; ERET consumes them. Named registers x24-x26
-    // keep our address scratch pointers out of the x0..x14 range the
-    // LDPs load into, and out of x29 (FP) which Rust reserves.
+    // SAFETY: ELR_EL2 / SPSR_EL2 set the post-ERET guest PC and CPSR;
+    // ERET consumes them. The ldp sequence loads x24..x26 LAST so we
+    // can keep using x26 as the base pointer through the whole
+    // sequence, then overwrite scratch values from the snapshot in
+    // the final two instructions.
     unsafe {
         configure_el2_traps();
 
@@ -233,14 +243,30 @@ pub unsafe fn eret_to_restored(state: crate::snapshot::RestoreState) -> ! {
             "msr elr_el2, x24",
             "msr spsr_el2, x25",
             "isb",
-            "ldp x0, x1,   [x26, #0]",
-            "ldp x2, x3,   [x26, #16]",
-            "ldp x4, x5,   [x26, #32]",
-            "ldp x6, x7,   [x26, #48]",
-            "ldp x8, x9,   [x26, #64]",
-            "ldp x10, x11, [x26, #80]",
-            "ldp x12, x13, [x26, #96]",
-            "ldr x14,      [x26, #112]",
+            // x0..x14 (R0..R12 + SP_usr + LR_usr).
+            "ldp x0, x1,    [x26, #0]",
+            "ldp x2, x3,    [x26, #16]",
+            "ldp x4, x5,    [x26, #32]",
+            "ldp x6, x7,    [x26, #48]",
+            "ldp x8, x9,    [x26, #64]",
+            "ldp x10, x11,  [x26, #80]",
+            "ldp x12, x13,  [x26, #96]",
+            "ldr x14,       [x26, #112]",
+            // x15..x23: SP_hyp + banked LR/SP for IRQ/SVC/ABT/UND.
+            "ldr x15,       [x26, #120]",
+            "ldp x16, x17,  [x26, #128]",
+            "ldp x18, x19,  [x26, #144]",
+            "ldp x20, x21,  [x26, #160]",
+            "ldp x22, x23,  [x26, #176]",
+            // x27..x30 first (FIQ-banked R10..R12, SP_fiq, LR_fiq);
+            // x26 must be the last write so it stays valid as the
+            // base for the previous loads.
+            "ldp x27, x28,  [x26, #216]",
+            "ldp x29, x30,  [x26, #232]",
+            // Finally x24..x26 (FIQ-banked R8/R9 + R10's neighbour);
+            // last instruction overwrites x26 with the saved value.
+            "ldp x24, x25,  [x26, #192]",
+            "ldr x26,       [x26, #208]",
             "eret",
             in("x24") pc,
             in("x25") cpsr,

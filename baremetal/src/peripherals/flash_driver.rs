@@ -114,11 +114,13 @@ fn write(ctx: &mut TrapContext, pc: u32) {
 
     // Einstein's TNativePrimitives reads `flashRange` from `*(r13 + 4)`
     // — the 5th argument the caller pushed before BL'ing into the ROM
-    // vtable trampoline. Doing that read from EL2 is unreliable on
-    // QEMU raspi3b: the AArch32 SVC-mode banked SP is not propagated
-    // into any of the AArch64 SP views (ctx.x[13] / SP_EL0 / SP_EL1
-    // disagree, with SP_EL0 = SP_EL1 = 0 and ctx.x[13] pointing into
-    // an already-popped stack region that reads poison).
+    // vtable trampoline. The kernel makes that call from SVC mode, so
+    // R13 there is R13_svc; per ARM ARM Table D1-79 R13_svc lives in
+    // **X19** (`ctx.x[19]`), NOT X13 (which is SP_usr regardless of
+    // source mode) and NOT SP_EL0/SP_EL1 (which are AArch64-only EL0/
+    // EL1 stack pointers with no architectural alias to AArch32
+    // banked R13). Reading the wrong slot was the historical bug
+    // here.
     //
     // Workaround: every caller of the `TFlashDriver::Write` vtable
     // trampoline at 0x00384790 is a `T{8,16,32}BitFlashRange::DoWrite`
@@ -126,9 +128,12 @@ fn write(ctx: &mut TrapContext, pc: u32) {
     // is the TFlashRange instance — the flashRange pointer. r4 is
     // callee-saved per AAPCS, so it survives the intermediate vtable
     // BL and the NATIVE_PRIM `stmdb sp!, {lr}` and still holds the
-    // flashRange at MCR trap entry. Read it from ctx.x[4]. If a
-    // future caller outside DoWrite invokes TFlashDriver::Write, the
-    // vtable first-word check below will catch the mismatch.
+    // flashRange at MCR trap entry. Read it from ctx.x[4]. (Reading
+    // *(R13_svc + 4) directly is also possible now via ctx.x[19] +
+    // a guest_mem walk; the r4-cache approach is faster and less
+    // tied to the kernel's stack layout.) If a future caller outside
+    // DoWrite invokes TFlashDriver::Write, the vtable first-word
+    // check below will catch the mismatch.
     let flash_range = ctx.x[4] as u32;
     let v_table = match read_guest_word(flash_range) {
         Some(v) => v,

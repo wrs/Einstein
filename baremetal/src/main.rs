@@ -4,6 +4,7 @@
 
 use core::arch::global_asm;
 
+mod banked;
 mod cpu;
 mod guest;
 mod guest_bp;

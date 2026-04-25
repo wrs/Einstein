@@ -21,6 +21,20 @@ pub const DRIVER_ID: u32 = 0x00_0002;
 const ERR_NO_SOUND_HARDWARE: u32 = (-30009i32) as u32;
 
 pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
+    // Diagnostic: log first occurrence of each subfn so we can see what
+    // the kernel exercises during sound init.
+    static mut SEEN: u32 = 0;
+    let bit = 1u32 << (subfn & 0x1F);
+    // SAFETY: single-threaded.
+    let first = unsafe {
+        let v = SEEN; if (v & bit) == 0 { SEEN = v | bit; true } else { false }
+    };
+    if first && subfn <= 0x1F {
+        kprintln!(
+            "sound: first subfn {:#x} @PC={:#x} r1={:#x} r2={:#x} r3={:#x}",
+            subfn, pc, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32
+        );
+    }
     match subfn {
         // SetSoundHardwareInfo: return -30009 to tell the kernel there's
         // no configurable sound hardware. Einstein's default path.
@@ -29,10 +43,29 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         }
 
         // GetSoundHardwareInfo: Einstein writes a 7-word info struct at
-        // [r1] with nominal values (sample rate 0x54600000 etc.) and
-        // returns 0. The struct is advisory; stubbing to r0=0 without
-        // writing it is enough for the kernel to believe we have sound.
+        // [r1] and returns 0. The Newton kernel reads the struct after
+        // the call; returning r0=0 without writing it leaves the struct
+        // holding whatever the heap allocator left there, which may
+        // steer the kernel into an unexpected sample-rate / buffer-size
+        // path during sound subsystem startup.
+        // Einstein source: TNativePrimitives.cpp:1099-1109.
         0x04 => {
+            let info_addr = ctx.x[1] as u32;
+            // Constants from Einstein. The 0x54600000 at +0x0c is a
+            // 32-bit fixed-point sample-rate value the Newton driver
+            // expects.
+            let words: [(u32, u32); 7] = [
+                (0x00, 0x00000001),
+                (0x04, 0x00000001),
+                (0x08, 0x00000001),
+                (0x0c, 0x54600000),
+                (0x10, 0x00000006),
+                (0x14, 0x00000010),
+                (0x18, 0x00000001),
+            ];
+            for (off, val) in words {
+                let _ = crate::guest_mem::write_word_va(info_addr + off, val);
+            }
             ctx.x[0] = 0;
         }
 

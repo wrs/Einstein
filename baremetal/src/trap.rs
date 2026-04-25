@@ -1452,10 +1452,75 @@ fn dump_ram_bytes(va: u32, count: u32) {
     }
 }
 
-fn handle_diag(ctx: &mut TrapContext) -> ! {
+fn handle_diag(ctx: &mut TrapContext) {
     let far = read_sysreg!("far_el1");
     let spsr_el2 = read_sysreg!("spsr_el2");
     let elr_el2 = read_sysreg!("elr_el2");
+
+    // Fast path: DABT-vector trampoline → kernel DataAbortHandler.
+    // For DABTs whose DFSC matches a translation / permission / access-flag
+    // fault, forward to the kernel's DataAbortHandler at VA 0x0039_3114
+    // (the original target of the ROM's VA 0x10 branch before we patched
+    // it with our diagnostic trampoline). Lets the kernel handle routine
+    // faults like stack-collision growth (USR `STMFD sp!, {…}` prologue
+    // crossing into an unmapped page → TStackManager::CopyPagesAfterStack-
+    // Collided) without the hypervisor needing to model on-demand paging.
+    //
+    // Alignment faults (DFSC=0x01) take a separate HVC #ALIGN_TAG path
+    // in the DABT trampoline and never reach here. Source-mode UND (the
+    // guest_bp BP path) and PABT-source (the PABT-vector intercept at
+    // VA 0x0C) fall through to the loud halt below — that's the Phase-B
+    // trip-wire behaviour we need for those classes.
+    //
+    // DFSC values (short-descriptor, ARMv7 DFSR.FS[3:0]):
+    //   0x05 = translation, section (L1 entry fault)
+    //   0x07 = translation, page    (L2 entry fault)
+    //   0x0D = permission, section
+    //   0x0F = permission, page
+    //   0x03 = access flag, section
+    //   0x06 = access flag, page
+    //
+    // R0 and R1 were clobbered by the DABT trampoline (which stashed
+    // them in TPIDRURW / TPIDRRO and then loaded DFSR / SPSR_abt into
+    // them); restore from those scratch slots so the kernel's handler
+    // sees the pre-abort register state. Other regs and banked
+    // LR_abt / SP_abt / SPSR_abt are already in their post-DABT-entry
+    // values (the trampoline reads them but does not modify them).
+    let hvc_src_mode = (spsr_el2 as u32) & 0x1F;
+    if hvc_src_mode == crate::banked::MODE_ABT {
+        let esr_el1 = read_sysreg!("esr_el1");
+        let dfsc = (esr_el1 & 0x3F) as u32;
+        let forwardable = matches!(dfsc, 0x03 | 0x05 | 0x06 | 0x07 | 0x0D | 0x0F);
+        if forwardable {
+            log_dabt_forward(dfsc, far as u32, hvc_src_mode);
+            let saved_r0: u64;
+            let saved_r1: u64;
+            unsafe {
+                core::arch::asm!(
+                    "mrs {}, tpidr_el0",
+                    out(reg) saved_r0,
+                    options(nomem, nostack, preserves_flags),
+                );
+                core::arch::asm!(
+                    "mrs {}, tpidrro_el0",
+                    out(reg) saved_r1,
+                    options(nomem, nostack, preserves_flags),
+                );
+            }
+            ctx.x[0] = saved_r0;
+            ctx.x[1] = saved_r1;
+            const DATA_ABORT_HANDLER_VA: u32 = 0x0039_3114;
+            unsafe {
+                core::arch::asm!(
+                    "msr elr_el2, {elr}",
+                    "isb",
+                    elr = in(reg) DATA_ABORT_HANDLER_VA as u64,
+                    options(nostack, preserves_flags),
+                );
+            }
+            return;
+        }
+    }
 
     // Banked SPSRs are AArch64-named sysregs (FVP and QEMU both honour
     // them). For SPSR_svc, the architecturally-mapped AArch64 view is
@@ -1471,7 +1536,8 @@ fn handle_diag(ctx: &mut TrapContext) -> ! {
     // (ABT for the PABT-vector intercept, UND for guest_bp). The
     // "pre-abort" / "pre-fault" mode is named by the matching banked
     // SPSR (SPSR_abt for ABT-source, SPSR_und for UND-source).
-    let hvc_src_mode = (spsr_el2 as u32) & 0x1F;
+    // (`hvc_src_mode` was already computed above for the fast-path
+    // gate; reused here for the diagnostic dump.)
     let mode_name = describe_aarch32_mode(hvc_src_mode);
 
     kprintln!();
@@ -1894,6 +1960,36 @@ use guest_mem::{read_byte_pa as read_guest_byte_pa,
                 read_word_pa as read_guest_word_pa,
                 write_byte_pa as write_guest_byte_pa,
                 write_word_pa as write_guest_word_pa};
+
+/// Budgeted log for the DABT→kernel forward path. Prints once per unique
+/// (FAR, mode) pair so we see the first sample of each fault site without
+/// flooding on tight-loop faults (e.g. a page-table walk the kernel is
+/// filling in one entry at a time).
+fn log_dabt_forward(dfsc: u32, far: u32, mode: u32) {
+    const SEEN_CAP: usize = 16;
+    static mut SEEN: [(u32, u32); SEEN_CAP] = [(0, 0); SEEN_CAP];
+    static mut SEEN_N: usize = 0;
+    // SAFETY: single-threaded EL2.
+    let first = unsafe {
+        let mut found = false;
+        for i in 0..SEEN_N {
+            if SEEN[i] == (far, mode) { found = true; break; }
+        }
+        if !found && SEEN_N < SEEN_CAP {
+            SEEN[SEEN_N] = (far, mode);
+            SEEN_N += 1;
+            true
+        } else {
+            false
+        }
+    };
+    if first {
+        kprintln!(
+            "dabt: forwarding to kernel DataAbortHandler — DFSC={:#x} FAR={:#010x} mode={:#x}",
+            dfsc, far, mode
+        );
+    }
+}
 
 fn log_und_budgeted(name: &str, pc: u32, payload: Option<u32>) {
     // Dedup SystemBootUND / TapFileCntlUND by PC — only 6 sites in ROM

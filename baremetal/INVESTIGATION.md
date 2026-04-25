@@ -3,7 +3,133 @@
 Live notes. Update as we learn more; remove old updates as we move on to
 new stalls.
 
-## Currently at — wedge isolated to STKU monitor task body (QEMU, 2026-04-25 night)
+## Currently at — STKU wedge persists post banked-reg fix (QEMU, 2026-04-26)
+
+Re-ran the fresh-cold-boot trace after the banked-register handling
+overhaul (commit `mz` 21497bd6 + merge-resolution `xn`). Result confirms
+the prior wedge diagnosis is still real — the banked-reg work did not
+unstick the STKU page-copy SWI on QEMU.
+
+### Pre-flight: restored DABT→kernel forward fast-path
+
+The merge resolution dropped the DABT-forward fast-path from
+`handle_diag` ("keep mz banked-register fixes, drop mn DABT-forward
+fast-path"). On a fresh boot that drop wedges on the **first** non-
+alignment DABT — the SetFreeChain APCS prologue's `STMFD sp!,
+{...,fp,ip,lr,pc}` crossing into an unmapped page below `SP_usr=0x0cc7a010`
+(FAR=0x0cc79ff4, DFSC=0x07, page-translation fault). Newton's own
+`DataAbortHandler` at `0x0039_3114` is the legitimate handler for that
+class of fault; the hypervisor's DIAG halt was a Phase-B trip-wire,
+not the right behaviour for routine on-demand paging.
+
+Restored the fast-path in `trap.rs::handle_diag`:
+
+- Source-mode gate: only forward when HVC source mode is `MODE_ABT`.
+  guest_bp UND-source hits and PABT-vector hits still take the loud
+  halt.
+- DFSC gate: `0x03 | 0x05 | 0x06 | 0x07 | 0x0D | 0x0F` (translation /
+  permission / access-flag for both section + page).
+- R0/R1 restored from TPIDR_EL0 / TPIDRRO_EL0 (the DABT trampoline
+  stashed them there before clobbering with DFSR / SPSR_abt).
+- `ELR_EL2 = 0x0039_3114`, then ERET; SPSR_EL2 stays as captured (mode
+  ABT). LR_abt / SP_abt / SPSR_abt remain hardware-populated.
+- Budgeted `dabt:` log dedups by (FAR, mode), 16 unique-pair cap.
+
+After restore: a 90-s cold boot logs **one** DABT forward
+(`DFSC=0x7 FAR=0x0cc79ff4 mode=0x17` — the SetFreeChain stack-extension)
+and otherwise progresses through the same trajectory as the prior
+investigation: trace ~156k entries, last unique user-mode call
+`PSoundDriver::SoundOutputIH` (sound IRQ injection probe), wedged at
+`PC=0x3ae1bc CPSR=SVC SP_svc=0x0c000400 LR_svc=0x3ae1bc`.
+
+### New observation: LR_svc readback now reliable, and reads PC
+
+The previous heartbeat used `MRS x, sp_el1` / `MRS x, elr_el1` and
+returned `0` from EL2 IRQ context — flagged in `docs/QEMU_BUGS.md`.
+The banked-reg overhaul replaced those with `ctx.x[19]` / `ctx.x[18]`
+per ARM ARM Table D1-79, which gives architecturally-defined values
+on both QEMU and FVP.
+
+The reliable readback shows:
+
+```
+timer_irq[late]: ELR=0x3ae1bc SPSR=0x60000113 SP_svc=0x0c000400
+                 LR_svc=0x3ae1bc FAR_EL1=0x0c116e66
+                 intid=0 VI=0 ipres=0x40 ictrl=0xc401420 pend=false
+```
+
+`LR_svc == ELR == 0x3ae1bc`. That's the address of `mov pc, lr` (note:
+no `s`, not `movs`) at the end of `GenericSWI`:
+
+```
+003ae174 <GenericSWI>:
+  ...
+  3ae1b8: ef000005   svc #5
+  3ae1bc: e1a0f00e   mov pc, lr
+```
+
+Architecturally, when `svc #5` at `0x3ae1b8` fires, hardware sets
+`LR_svc = 0x3ae1bc` and switches to SVC mode. Normal exit through
+`GenericSWIHandler` does an `LDM SP!, {..., PC}^` that restores CPSR
+from `SPSR_svc` (= the saved USR CPSR) and PC from the saved LR. After
+that, `mov pc, lr` at `0x3ae1bc` runs **in USR mode** and falls back
+to the user-mode caller via `LR_usr`.
+
+The wedge state — `PC=0x3ae1bc, mode=SVC, LR_svc=0x3ae1bc,
+SP_svc=0x0c000400` — is the smoking gun for one of:
+
+1. The SWI epilogue used `LDM SP!, {..., PC}` (no `^`) or `MOV PC, LR`
+   (no `s`), so CPSR is not restored and we stay in SVC. `mov pc, lr`
+   at `0x3ae1bc` then jumps to `LR_svc=0x3ae1bc` — **infinite loop in
+   SVC mode**.
+2. A re-entrant `svc` somewhere in the SVC handler clobbered `LR_svc`
+   to `0x3ae1bc`, and the outer return drops us at `0x3ae1bc` in SVC
+   mode where `mov pc, lr` self-loops.
+
+Either way the kernel is sitting in a tight `mov pc, lr` self-jump
+in SVC mode, with sound DMA IRQs preempting the loop on each
+heartbeat (no progress is made).
+
+`SP_svc = 0x0c000400` is the BootOS-set initial SVC stack base —
+matches "SVC stack frame fully unwound", so the handler did get to its
+final pop before the issue.
+
+### Why FVP got past it before, why QEMU doesn't
+
+Per the prior FVP cross-check (180 s wall, run `mn` bad09ce3): on FVP
+the STKU dump appears once (during the page-copy SWI) and then
+`gCurrentTask` advances to `cdsv` (CardServer). On QEMU the wedge is
+permanent. The recent banked-reg work did not change that — confirming
+the wedge is a QEMU TCG behaviour at the AArch32 SVC return path,
+specifically around how `LDM ... {pc}^` restores SPSR_svc to CPSR
+when control re-enters AArch32 from EL2 IRQ-trap context.
+
+`docs/QEMU_BUGS.md` Bug #1 (SPSR_svc clobber via `msr spsr_el2, x`)
+is *not* the cause here: HVC and DABT round-trips are documented to
+use the auto-saved SPSR_EL2 unchanged, and the SVC handler's
+`LDM ... {pc}^` reads `banked_spsr[1]` directly. But the same QEMU
+sub-system (banked SPSR plumbing across the AArch32↔AArch64 boundary)
+is what's faulty.
+
+### Open next steps
+
+1. **Tarmac trace on FVP across one STKU iteration** (the prior plan
+   from `mn` bad09ce3 — still pending). Capture the exact instruction
+   sequence STKU executes after PhysSubPageCopy returns, so we know
+   what the "correct" path looks like and can compare against QEMU.
+   Specifically: does FVP also see `LR_svc = 0x3ae1bc` momentarily
+   and recover, or does the kernel's SVC return path go somewhere
+   different on FVP?
+2. **Inspect `GenericSWIHandler` (0x000d8a64) tail** in ghidra MCP to
+   find the SWI return idiom. If it uses `LDM SP!, {..., PC}^` and
+   the wedge is QEMU's `^` plumbing dropping SPSR_svc on the floor,
+   we have the bug isolated.
+3. **Test on QEMU**: replace the SVC-handler return idiom in ROM
+   patches with a hypervisor-mediated path (HVC → EL2 → re-construct
+   correct CPSR + ELR → ERET). If that fixes the QEMU wedge, the
+   bug is QEMU's `LDM {pc}^` semantics in TCG.
+
+## Resolved (was) — wedge isolated to STKU monitor task body (QEMU, 2026-04-25 night)
 
 Added `src/task_dump.rs`: walks the scheduler at `*0x0c100fd0`,
 gCurrentTask at `*0x0c101000`, the per-priority TTaskQueues at

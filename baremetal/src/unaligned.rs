@@ -23,9 +23,14 @@
 //! Register recovery at HVC entry:
 //!   - R0 original  ← TPIDR_EL0     (stub saved it before clobbering)
 //!   - R1 original  ← TPIDRRO_EL0   (stub saved it before clobbering)
-//!   - R2..R12      ← ctx.x[2..12]  (stub didn't touch them)
-//!   - R14_abt      ← ctx.x[14]     (= faulting_pc + 8 for ARM)
-//!   - SPSR_abt     ← AArch64 `mrs spsr_abt`  (= pre-abt CPSR)
+//!   - R2..R12      ← ctx.x[2..12]  (stub didn't touch them; non-FIQ
+//!                                   modes have R8..R12 ≡ R8_usr..R12_usr
+//!                                   in X8..X12 per Table D1-79)
+//!   - R14_abt      ← ctx.x[20]     (LR_abt per Table D1-79; = faulting_pc + 8 for ARM)
+//!   - SPSR_abt     ← DABT_SAVE_PA + 8 (AArch32-native trampoline stash;
+//!                                      `mrs spsr_abt` reads the same value
+//!                                      on FVP but historically flaky on
+//!                                      QEMU raspi3b)
 //!
 //! Rt / Rn / Rm uses of R13/R14/R15 are rejected for now (halt with
 //! a TODO); the Newton ROM's rotate-LDR sites overwhelmingly use

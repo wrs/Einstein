@@ -323,20 +323,31 @@ pub fn handle_user_bp_und(
         faulting_pc, slot_idx
     );
 
-    // Dump-and-continue path: print ctx.x[0..14] (aliases AArch32 R0..R14
-    // for the mode SPSR_und identifies), plus the saved CPSR. Then restore
-    // the original ROM word and ERET so the breakpointed instruction runs
-    // at native speed. For vector-intercept use cases that need the full
-    // banked-reg dump, call `trap::handle_diag_from_bp(ctx)` instead from
-    // your handler site (it halts, so only useful as a one-shot).
+    // Dump-and-continue path: print ctx.x[0..12] (= R0..R12 for non-
+    // FIQ source modes per Table D1-79) plus the source mode's banked
+    // R13/R14 looked up by mode bits, plus the saved CPSR. Then
+    // restore the original ROM word and ERET so the breakpointed
+    // instruction runs at native speed.
+    //
+    // For HVC #DIAG_TAG-style banked-reg dumps including all modes,
+    // patch the relevant guest vector to HVC #DIAG_TAG instead and
+    // let `handle_diag` halt with the full picture.
     let cpsr = spsr_und as u32;
     kprintln!(
         "  bp detail pc={:#010x} cpsr={:#010x} mode={:#x}",
         faulting_pc, cpsr, cpsr & 0x1F
     );
-    for i in 0..15 {
+    for i in 0..13 {
         kprintln!("    r{:<2} = {:#010x}", i, ctx.x[i] as u32);
     }
+    kprintln!(
+        "    r13 = {:#010x}  (SP of mode {:#x} via Table D1-79)",
+        crate::banked::sp_for_mode(ctx, cpsr), cpsr & 0x1F
+    );
+    kprintln!(
+        "    r14 = {:#010x}  (LR of mode {:#x} via Table D1-79)",
+        crate::banked::lr_for_mode(ctx, cpsr), cpsr & 0x1F
+    );
     kprintln!("    r15 = {:#010x}  (= pc at bp)", faulting_pc);
 
     // If we're at the LDRB-post hook, also dump the word the LDRB was

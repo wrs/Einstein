@@ -99,10 +99,22 @@ listed here for completeness; they pre-date this file.
   helper in `scripts/gdb-init` patches `UDF #0xFFFE` into the ROM
   word and traps to EL2.
 
-- **`MRS <x>, SPSR_<mode>` / `MRS <x>, LR_<mode>` / `MRS <x>, ELR_EL1`
-  from AArch64 EL2 returns 0** for AArch32 banked state. Workaround:
-  guest-side mode bounce stashes the value to a RAM slot before EL2
-  reads it (the UND trampoline pattern).
+- **`MRS <x>, ELR_EL1` / `MRS <x>, SP_EL1` from AArch64 EL2 do NOT
+  return AArch32 R14_svc / R13_svc.** ELR_EL1 and SP_EL1 are
+  AArch64-only special-purpose registers (only present when
+  FEAT_AA64 is implemented); the ARM ARM defines no architectural
+  mapping between them and any AArch32 banked R13/R14. Read R13_svc
+  / R14_svc from `ctx.x[19]` / `ctx.x[18]` per Table D1-79 instead.
+
+  `MRS <x>, SPSR_<mode>` for `<mode>` ∈ {abt, und, irq, fiq} is a
+  defined AArch64 named sysreg and works on FVP and QEMU.
+  `SPSR_svc` is `SPSR_EL1` (architecturally mapped — DDI 0487 D13.2).
+
+  There is **no** AArch64 named-sysreg path to `LR_<mode>` for
+  any mode — `MRS (Banked register)` is A32/T32-only per F7.1.115.
+  Use the X-register slots (Table D1-79). Reading `LR_<mode>` on
+  the assumption that it's AArch64-accessible was a misdiagnosis;
+  the values come from `ctx.x[16..30]` directly.
 
 - **NOT A BUG — `ctx.x[13]` / `ctx.x[14]` at EL2 AArch64 entry from
   AArch32 are `SP_usr` / `LR_usr`, NOT the active mode's banked
@@ -143,11 +155,11 @@ listed here for completeness; they pre-date this file.
   for UND, `ctx.x[16..17]` for IRQ, `ctx.x[24..30]` for FIQ-banked
   R8-R12 + SP + LR. For SPSR_<mode>, the AArch64 named sysregs
   `spsr_abt` / `spsr_und` / `spsr_irq` / `spsr_fiq` work (LLVM's
-  assembler accepts them); SPSR_svc is available as `spsr_el1` when
-  EL1 is AArch32 SVC at entry time. SP_usr can be read via the
-  `sp_el0` alias. There is **no** AArch64-named sysreg for SP/LR in
-  ABT/UND/IRQ/FIQ modes — Table D1-79 is the only access path from
-  AArch64 EL2 (MRS Banked Register is AArch32-only per F7.1.115).
+  assembler accepts them); SPSR_svc is `spsr_el1` (architecturally
+  mapped per DDI 0487 D13.2). There is **no** AArch64-named sysreg
+  for SP/LR in any AArch32 banked mode — Table D1-79 is the only
+  access path from AArch64 EL2 (MRS Banked Register is AArch32-only
+  per F7.1.115).
 
 - **Upper 32 bits of x16..x30 on AArch32→AArch64 exception entry are
   CONSTRAINED UNPREDICTABLE** per ARM ARM D1.21.2 Table D1-85. Always

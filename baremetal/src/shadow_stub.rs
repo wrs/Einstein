@@ -2020,20 +2020,29 @@ fn resolve_addr(addr: u32) -> Option<u32> {
     }
 }
 
-// Banked SP/LR are handled through ctx.x[13] / ctx.x[14] plus the
-// ERET-with-faulting-mode-SPSR exchange. On EL2 entry, ctx.x[13] and
-// ctx.x[14] hold UND-mode's banked SP/LR (the trampoline HVCs from UND).
-// Before emulating the byte access, `handle_sba_udf` overwrites both
-// with the faulting mode's banked values stashed by the trampoline into
-// `UND_SAVE_BANKED_{SP,LR}_IPA`. Register reads / writeback then touch
-// `ctx.x[]` as usual, and `return_to_guest_from_und` with `spsr_und`
-// ERETs into the faulting mode; the AArch64 architecture propagates
-// ctx.x[13] / ctx.x[14] into the target mode's banked SP / LR.
+// Banked SP/LR for the **faulting** AArch32 mode (the mode that
+// executed the SBA-UDF) are handled via the trampoline's pre-HVC
+// stash slots `UND_SAVE_BANKED_{SP,LR}_IPA`, NOT via `ctx.x[]`.
 //
-// This sidesteps the MRS (banked register) encoding problem — QEMU
-// raspi3b doesn't implement the banked-MRS sysreg coordinates we tried
-// (op0=3, op1=4, CRn=4, CRm ∈ {4,5}), and the ERET path works on any
-// ARMv8 implementation.
+// Why the RAM slots: the trampoline runs in UND mode, so per ARM ARM
+// DDI 0487 D1.21.1 Table D1-79 the AArch64 GPR file at HVC entry
+// holds X22 = LR_und, X23 = SP_und — which are NOT the faulting
+// mode's R13/R14. (X13 = SP_usr, X14 = LR_usr, also unrelated.) The
+// trampoline therefore mode-switches to the faulting mode (or SYS
+// when faulting mode = USR), reads R13/R14 in-mode, and persists
+// them to RAM before issuing HVC #UND_TAG. `Regs::snapshot` reads
+// those slots; writeback to R13/R14 routes through the post-
+// emulation trampoline (`dispatch_return`) so the new values land
+// in the target mode's banked R13/R14 natively, since AArch64 ERET
+// to AArch32 places X13/X14 into R13_usr/R14_usr regardless of the
+// SPSR mode field.
+//
+// (R13 and R14 of the faulting mode would also be reachable as
+// X13..X23 per Table D1-79 if the trampoline HVC'd in the faulting
+// mode directly — but the UND trampoline necessarily runs in UND,
+// so the X-register snapshot reflects UND/USR banks, not the
+// faulting mode's. The RAM-slot route is what makes the snapshot
+// faulting-mode-correct.)
 
 fn read_banked_sp_slot() -> u32 {
     crate::guest_mem::read_word_pa(crate::trap::UND_SAVE_BANKED_SP_IPA)

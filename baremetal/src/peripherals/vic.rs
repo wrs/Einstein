@@ -80,11 +80,23 @@ struct VicState {
     // int_present would immediately re-raise because `ticks >= match`
     // stays true.
     match_fired: u32,
+    // RTC alarm-match: stored alarm value (in seconds since 1904 in the
+    // calendar domain) and a single-bit edge-detect latch. Cleared on
+    // alarm register write so a new alarm can fire.
+    alarm_reg: u32,         // 0x0F181400
+    alarm_fired: bool,
     // GPIO-adjacent registers the ROM hits during early probe.
-    gpio_r: u32,            // 0x0F18C000
-    gpio_e: u32,            // 0x0F18C400
+    gpio_r: u32,            // 0x0F18C000 (raised events; HVC-trigger ORs in)
+    gpio_e: u32,            // 0x0F18C400 (per-line interrupt enable)
     #[allow(dead_code)] // written via K_HDWR_GPIO_C path; no reads yet
-    gpio_c: u32,            // 0x0F18C800 (write clears)
+    gpio_c: u32,            // 0x0F18C800 (write-clear)
+    gpio_cc00: u32,         // 0x0F18CC00 (polarity / config — round-trip)
+    gpio_d000: u32,         // 0x0F18D000 (misc — round-trip)
+    gpio_d800: u32,         // 0x0F18D800 (pullup — round-trip)
+    gpio_dc00: u32,         // 0x0F18DC00 (polarity — round-trip)
+    gpio_e000: u32,         // 0x0F18E000 (direction / level latch — round-trip)
+    gpio_e800: u32,         // 0x0F18E800 (IOPower1 — round-trip)
+    gpio_ec00: u32,         // 0x0F18EC00 (IOPower2 — round-trip)
     p0f110000: u32,
     p0f111400: u32,
 }
@@ -102,9 +114,18 @@ static VIC: VicCell = VicCell(UnsafeCell::new(VicState {
     int_ed_3: 0,
     match_reg: [0; 4],
     match_fired: 0,
+    alarm_reg: 0,
+    alarm_fired: false,
     gpio_r: 0,
     gpio_e: 0,
     gpio_c: 0,
+    gpio_cc00: 0,
+    gpio_d000: 0,
+    gpio_d800: 0,
+    gpio_dc00: 0,
+    gpio_e000: 0,
+    gpio_e800: 0,
+    gpio_ec00: 0,
     p0f110000: 0,
     p0f111400: 0,
 }));
@@ -178,7 +199,6 @@ pub fn calendar_seconds() -> u32 {
 }
 
 // Interrupt bit layout in int_present — from TInterruptManager.h.
-#[allow(dead_code)] // referenced once plumbing is wired through to guest IRQ
 const INT_RTC_ALARM: u32 = 0x0000_0004;
 const INT_TIMER_0: u32 = 0x0000_0008;
 const INT_TIMER_1: u32 = 0x0000_0010;
@@ -186,8 +206,22 @@ const INT_TIMER_2: u32 = 0x0000_0020;
 const INT_TIMER_3: u32 = 0x0000_0040;
 const INT_DMA_CH3: u32 = 0x0000_0400;   // sound input
 const INT_DMA_CH5: u32 = 0x0000_1000;   // sound output / tablet rcv
-#[allow(dead_code)]
-const INT_GPIO: u32 = 0x0100_0000;
+pub const INT_GPIO: u32 = 0x0100_0000;
+
+/// Public raiser: OR `mask` into `int_present`. The next `update_virq`
+/// (called at every sync-trap exit and after `timer::on_irq`) reflects
+/// the change into HCR_EL2.VI / VF, so the guest takes a virtual IRQ
+/// on the next ERET if the unmask gates allow it.
+///
+/// Used by external raisers — DMA channel completion (`dma::write`),
+/// GPIO line events (HVC test trigger / future native-event hooks),
+/// RTC alarm match, etc. Timer matches go through the existing
+/// `poll_timer_matches` edge-detect path.
+pub fn raise(mask: u32) {
+    // SAFETY: single-threaded.
+    let s = unsafe { &mut *VIC.0.get() };
+    s.int_present |= mask;
+}
 
 /// Diagnostic: force-raise the two sound-DMA IRQ bits (DMA channel 3 and
 /// channel 5). Called from a wedge-detector in `trap_irq` to test the
@@ -230,6 +264,24 @@ pub fn poll_timer_matches() {
     }
     if raise != 0 {
         s.int_present |= raise;
+    }
+}
+
+/// RTC alarm match: rising-edge fire when `calendar_seconds() >= alarm_reg`
+/// and `alarm_reg != 0`. Call alongside `poll_timer_matches`. Edge-detect
+/// via `alarm_fired` cleared on alarm-register write.
+pub fn poll_alarm() {
+    // SAFETY: single-threaded.
+    let s = unsafe { &mut *VIC.0.get() };
+    if s.alarm_reg == 0 || s.alarm_fired {
+        return;
+    }
+    let now = calendar_seconds();
+    // wrapping_sub < 0x8000_0000 covers both "now == alarm" and "now
+    // moments past alarm" without losing to wraparound.
+    if now.wrapping_sub(s.alarm_reg) < 0x8000_0000 {
+        s.alarm_fired = true;
+        s.int_present |= INT_RTC_ALARM;
     }
 }
 
@@ -329,6 +381,13 @@ const K_HDWR_P0F185000: u64 = 0x0F18_5000;
 const K_HDWR_GPIO_R: u64 = 0x0F18_C000;
 const K_HDWR_GPIO_E: u64 = 0x0F18_C400;
 const K_HDWR_GPIO_C: u64 = 0x0F18_C800;
+const K_HDWR_GPIO_CC00: u64 = 0x0F18_CC00;
+const K_HDWR_GPIO_D000: u64 = 0x0F18_D000;
+const K_HDWR_GPIO_D800: u64 = 0x0F18_D800;
+const K_HDWR_GPIO_DC00: u64 = 0x0F18_DC00;
+const K_HDWR_GPIO_E000: u64 = 0x0F18_E000;
+const K_HDWR_GPIO_E800: u64 = 0x0F18_E800;
+const K_HDWR_GPIO_EC00: u64 = 0x0F18_EC00;
 
 /// Monotonic ratchet for `ticks()`. The Newton kernel's `GetClock`
 /// detects a 32-bit wrap by `cmp current_ticks, gClock.low; addls high,
@@ -404,7 +463,14 @@ pub fn owns(ipa: u64) -> bool {
         | K_HDWR_P0F185000
         | K_HDWR_GPIO_R
         | K_HDWR_GPIO_E
-        | K_HDWR_GPIO_C => true,
+        | K_HDWR_GPIO_C
+        | K_HDWR_GPIO_CC00
+        | K_HDWR_GPIO_D000
+        | K_HDWR_GPIO_D800
+        | K_HDWR_GPIO_DC00
+        | K_HDWR_GPIO_E000
+        | K_HDWR_GPIO_E800
+        | K_HDWR_GPIO_EC00 => true,
         _ => false,
     }
 }
@@ -422,7 +488,7 @@ pub fn read(ipa: u64) -> u32 {
         K_HDWR_HIGH_SPEED_CLCK => 0x0000_0090, // kHighSpeedClockVal per TMemoryConsts
         K_HDWR_P0F111400 => s.p0f111400,
         K_HDWR_CALENDAR_REG => calendar_seconds(),
-        K_HDWR_ALARM_REG => 0,
+        K_HDWR_ALARM_REG => s.alarm_reg,
         K_HDWR_TICKS => ticks(),
         K_HDWR_MATCH_0 => s.match_reg[0],
         K_HDWR_MATCH_1 => s.match_reg[1],
@@ -436,6 +502,19 @@ pub fn read(ipa: u64) -> u32 {
         K_HDWR_INT_ED_3 => s.int_ed_3,
         K_HDWR_GPIO_R => s.gpio_r,
         K_HDWR_GPIO_E => s.gpio_e,
+        // Round-trip storage for the GPIO-adjacent registers the kernel
+        // does read-modify-write on (TGPIOInterface::DisableInterrupt at
+        // ROM 0x26c468 is the canonical example). Returning the last-
+        // written value is what the kernel expects; previously these
+        // were read-as-zero in mmio.rs which silently lost the bits the
+        // kernel had set in the prior write.
+        K_HDWR_GPIO_CC00 => s.gpio_cc00,
+        K_HDWR_GPIO_D000 => s.gpio_d000,
+        K_HDWR_GPIO_D800 => s.gpio_d800,
+        K_HDWR_GPIO_DC00 => s.gpio_dc00,
+        K_HDWR_GPIO_E000 => s.gpio_e000,
+        K_HDWR_GPIO_E800 => s.gpio_e800,
+        K_HDWR_GPIO_EC00 => s.gpio_ec00,
         _ => halt_vic_unreachable("read", ipa, 0),
     }
 }
@@ -474,10 +553,18 @@ pub fn write(ipa: u64, value: u32) {
         // kernel works either way. Accept the write as a no-op; if the
         // guest later depends on the reset, halt here.
         K_HDWR_TICKS => { /* no-op — we derive ticks from CNTPCT */ }
-        // Calendar / alarm regs — stub writes to accept "set calendar"
-        // / "set alarm" without modeling RTC.
+        // Calendar reg writes are still ignored — the host wall clock
+        // is the source of truth; setting the calendar from inside the
+        // guest would silently drift versus calendar_seconds().
         K_HDWR_CALENDAR_REG => { /* no-op — RTC not modeled */ }
-        K_HDWR_ALARM_REG => { /* no-op — RTC alarm not modeled */ }
+        // Alarm: store the value and clear the edge-detect latch so a
+        // new match can fire. `poll_alarm()` (called from timer::on_irq
+        // alongside poll_timer_matches) raises INT_RTC_ALARM when the
+        // calendar crosses this value.
+        K_HDWR_ALARM_REG => {
+            s.alarm_reg = value;
+            s.alarm_fired = false;
+        }
         K_HDWR_MATCH_0 => { s.match_reg[0] = value; s.match_fired &= !0b0001; match_reprogrammed = true; }
         K_HDWR_MATCH_1 => { s.match_reg[1] = value; s.match_fired &= !0b0010; match_reprogrammed = true; }
         K_HDWR_MATCH_2 => { s.match_reg[2] = value; s.match_fired &= !0b0100; match_reprogrammed = true; }
@@ -494,6 +581,13 @@ pub fn write(ipa: u64, value: u32) {
         K_HDWR_P0F185000 => { /* misc, ignore */ }
         K_HDWR_GPIO_E => s.gpio_e = value,
         K_HDWR_GPIO_C => s.int_present &= !value, // many devices clear via this pattern
+        K_HDWR_GPIO_CC00 => s.gpio_cc00 = value,
+        K_HDWR_GPIO_D000 => s.gpio_d000 = value,
+        K_HDWR_GPIO_D800 => s.gpio_d800 = value,
+        K_HDWR_GPIO_DC00 => s.gpio_dc00 = value,
+        K_HDWR_GPIO_E000 => s.gpio_e000 = value,
+        K_HDWR_GPIO_E800 => s.gpio_e800 = value,
+        K_HDWR_GPIO_EC00 => s.gpio_ec00 = value,
         _ => halt_vic_unreachable("write", ipa, value),
     }
     if match_reprogrammed {

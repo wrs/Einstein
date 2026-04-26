@@ -16,7 +16,12 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::kprintln;
+use crate::{kprintln, peripherals::vic};
+
+/// Per-channel completion-IRQ bit in `int_present`. Channel N corresponds
+/// to bit `0x80 << N` (TInterruptManager.h:64-83). Bit 0 (ch 0 = serial 0
+/// rx) starts at `0x80`; bit 7 (ch 7 = modem tx) is `0x4000`.
+const DMA_CH0_BIT: u32 = 0x0000_0080;
 
 /// Bank 1 channel-register window (8 channels × 8 regs × 4 B, stride
 /// 0x2000 per channel, 0x400 per register).
@@ -93,13 +98,34 @@ pub fn write(ipa: u64, value: u32) {
     let s = unsafe { &mut *DMA.0.get() };
     match ipa {
         K_HDWR_ASSIGN => s.assign = value,
-        K_HDWR_ENABLE_STATUS | K_HDWR_DISABLE => {
-            // Einstein's `TDMAManager::WriteEnableRegister` and
-            // `WriteDisableRegister` have the DMA-complete IRQ fire
-            // commented out (`Emulator/TDMAManager.cpp:112,147`). We
-            // match: log the write, don't latch a per-channel bit
-            // into int_present.
-            log_stub("dma enable/disable", ipa, value);
+        K_HDWR_ENABLE_STATUS => {
+            // Einstein's `TDMAManager::WriteEnableRegister` has the
+            // per-channel completion-IRQ raise commented out
+            // (`Emulator/TDMAManager.cpp:112`), but the Newton kernel's
+            // serial / sound / IR drivers expect the IRQ to fire shortly
+            // after they enable a channel — Einstein papers over the
+            // gap by feeding bytes through `TSerialHostPort` which
+            // raises the IRQ on its own schedule.
+            //
+            // We have no host backend, so we synthesise the completion
+            // synchronously: every set bit in `value` raises the
+            // matching `INT_DMA_CH{N}` line. Matches Einstein's
+            // "completes on next pass" timing as observed by the
+            // kernel — the VIRQ delivers on the very next ERET, which
+            // is one instruction past the STR.
+            log_stub("dma enable -> raise channel IRQs", ipa, value);
+            for ch in 0..8u32 {
+                if (value >> ch) & 1 != 0 {
+                    vic::raise(DMA_CH0_BIT << ch);
+                }
+            }
+        }
+        K_HDWR_DISABLE => {
+            // Disable register is "abort pending transfers" in real
+            // hardware; without modeling per-channel state we just
+            // accept the write. Einstein's WriteDisableRegister also
+            // has its IRQ-raise commented out (TDMAManager.cpp:147).
+            log_stub("dma disable", ipa, value);
         }
         // Per-channel writes mirror Einstein: log once, do nothing.
         _ if is_channel_reg(ipa) => log_stub("dma channel write (modeled drop per Einstein)", ipa, value),

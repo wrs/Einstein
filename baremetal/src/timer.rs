@@ -140,6 +140,10 @@ pub fn on_irq() {
     // Re-evaluate the Newton VIC and decide which matches have crossed
     // their threshold.
     vic::poll_timer_matches();
+    // RTC alarm shares the heartbeat: latch INT_RTC_ALARM if the wall-
+    // clock calendar has crossed the alarm value. Edge-detect inside
+    // poll_alarm prevents re-firing.
+    vic::poll_alarm();
     // Refresh the non-trapping tick register so the guest's busy-wait
     // delay loops observe a fresh counter value on their next load.
     // Without this the loops at BootOS:0x19FCC / 0x18F38 would spin

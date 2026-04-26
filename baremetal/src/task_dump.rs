@@ -66,6 +66,7 @@ const OT_NUM_BUCKETS:  u32 = 128;
 const OBJ_TYPE_TASK:   u32 = 3;
 const OBJ_TYPE_PORT:   u32 = 2;
 const OBJ_TYPE_MONITOR:u32 = 0xa;
+const OBJ_TYPE_PHYS:   u32 = 0xb;
 
 /// 4-byte name for each KernelType bucket. Indexed by `id & 0xF`.
 /// Buckets we haven't seen used (0, 1, 12..15) are blank.
@@ -678,6 +679,12 @@ pub fn dump_full() {
     dump();
     dump_all_ports();
     dump_all_monitors();
+    dump_all_phys();
+    // The Phase B "newt-DABT" investigation needs to know which TPhys
+    // descriptors claim PA 0x0402a000 (the page that aliases pckm's
+    // stack). Print them explicitly so the comparison against Einstein
+    // is a simple grep.
+    dump_phys_for_pa(0x0402_a000);
     kprintln!("=== kdump::dump_full end ===");
 }
 
@@ -690,6 +697,131 @@ pub fn dump_all_ports() {
         count += 1;
     });
     kprintln!("=== {} ports total ===", count);
+}
+
+/// Dump one TPhys: id, raw state word, decoded PA, and size for huge
+/// pages. TPhys layout (see `docs/STRUCTURES.md` "Kernel object IDs"
+/// citation for `InitTPhysAndAddToObjectTable` ROM 0x148f28 — type 0xb;
+/// `Init__5TPhys` at ROM 0x18354c sets +0x10 state, +0x14 size):
+///   +0x10 state: bits 31:12 = PA (when small page); bit 9 (0x200) = "huge"
+///                bit 10 (0x400), bit 11 (0x800) = flags set/cleared by
+///                ctor args
+///   +0x14 size:  only valid when bit 9 of state is set (size >= 1MB)
+pub fn dump_phys(phys_va: u32) {
+    let id    = rd(phys_va).unwrap_or(u32::MAX);
+    let state = rd(phys_va + 0x10).unwrap_or(u32::MAX);
+    let sz    = rd(phys_va + 0x14).unwrap_or(u32::MAX);
+    let pa    = state & 0xffff_f000;
+    let huge  = (state & 0x200) != 0;
+    let size_word = if huge { sz } else { 0x1000 };
+    kprintln!(
+        "phys @{:#x} id={:#x}({}) state={:#x} PA={:#x} size={:#x} flags={}{}{}",
+        phys_va, id, KIND_NAMES[(id & 0xF) as usize], state, pa, size_word,
+        if state & 0x800 != 0 { 'V' } else { '-' },
+        if state & 0x400 != 0 { 'E' } else { '-' },
+        if huge                { 'H' } else { '-' },
+    );
+}
+
+/// Walk a TObjectTable at `table_va` and call `f(va, id)` for every
+/// node whose `(id & 0xF) == kind`. Same layout as `gObjectTable`
+/// (128 buckets at +0x10 + bucket*4, hash-chain via +0x04). Lets us
+/// walk the *other* object tables the kernel uses for TPhys
+/// descriptors: `*(0x0c101164)` (primary) and `*(0x0c100fc8)`
+/// (secondary), per `GetPhys` ROM `0x11c168` which falls through both
+/// before giving up.
+fn for_each_in_table<F: FnMut(u32, u32)>(table_va: u32, kind: u32, mut f: F) {
+    const MAX_PER_BUCKET: u32 = 128;
+    if table_va == 0 || table_va == u32::MAX { return; }
+    for bucket in 0..OT_NUM_BUCKETS {
+        let head_va = table_va + OT_BUCKETS_BASE + bucket * 4;
+        let mut node = match rd(head_va) { Some(v) => v, None => continue };
+        let mut steps = 0u32;
+        while node != 0 && steps < MAX_PER_BUCKET {
+            let id = match rd(node) { Some(v) => v, None => break };
+            if (id & 0xF) == kind {
+                f(node, id);
+            }
+            node = match rd(node + 4) { Some(v) => v, None => break };
+            steps += 1;
+        }
+    }
+}
+
+/// Read a pointer-to-TObjectTable from a kernel global VA, dereferencing
+/// once. Returns 0 if unmapped or null.
+fn read_object_table_ptr(globals_va: u32) -> u32 {
+    rd(globals_va).unwrap_or(0)
+}
+
+/// Dump every TPhys in all three known kernel object tables. The
+/// primary `gObjectTable` at 0x0c10fc34 holds user-side TPhys (e.g.
+/// PCMCIA MMIO regions), while RAM-page TPhys are in the additional
+/// tables `*(0x0c101164)` and `*(0x0c100fc8)` (see `GetPhys` at ROM
+/// 0x11c168 — it tries all three before failing).
+pub fn dump_all_phys() {
+    let table_a = read_object_table_ptr(0x0c10_1164);
+    let table_b = read_object_table_ptr(0x0c10_0fc8);
+    kprintln!(
+        "=== all phys (KernelType=11) — gObjectTable=0x{:x} TblA=0x{:x} TblB=0x{:x} ===",
+        G_OBJECT_TABLE, table_a, table_b
+    );
+
+    let mut count_a = 0u32;
+    let mut count_b = 0u32;
+    let mut count_g = 0u32;
+
+    if table_a != 0 && table_a != u32::MAX {
+        kprintln!("--- TblA (*0x0c101164) ---");
+        for_each_in_table(table_a, OBJ_TYPE_PHYS, |va, _id| {
+            dump_phys(va);
+            count_a += 1;
+        });
+    }
+    if table_b != 0 && table_b != u32::MAX && table_b != table_a {
+        kprintln!("--- TblB (*0x0c100fc8) ---");
+        for_each_in_table(table_b, OBJ_TYPE_PHYS, |va, _id| {
+            dump_phys(va);
+            count_b += 1;
+        });
+    }
+    kprintln!("--- gObjectTable ({:#x}) ---", G_OBJECT_TABLE);
+    for_each_object_of_kind(OBJ_TYPE_PHYS, |va, _id| {
+        dump_phys(va);
+        count_g += 1;
+    });
+
+    kprintln!("=== {} phys total (TblA={}, TblB={}, gObjectTable={}) ===",
+        count_a + count_b + count_g, count_a, count_b, count_g);
+}
+
+/// Dump every TPhys whose PA matches `target_pa`, walking all three
+/// kernel object tables. Stronger signal than `dump_all_phys` for the
+/// alias question: if more than one entry prints, the kernel has
+/// multiple TPhys descriptors for the same physical page.
+pub fn dump_phys_for_pa(target_pa: u32) {
+    kprintln!("=== phys with PA={:#x} (across all three tables) ===", target_pa);
+    let mut count = 0u32;
+    let mut report = |va: u32, _id: u32| {
+        let state = rd(va + 0x10).unwrap_or(0);
+        if (state & 0xffff_f000) == target_pa {
+            dump_phys(va);
+            count += 1;
+        }
+    };
+
+    let table_a = read_object_table_ptr(0x0c10_1164);
+    let table_b = read_object_table_ptr(0x0c10_0fc8);
+
+    if table_a != 0 && table_a != u32::MAX {
+        for_each_in_table(table_a, OBJ_TYPE_PHYS, |va, id| report(va, id));
+    }
+    if table_b != 0 && table_b != u32::MAX && table_b != table_a {
+        for_each_in_table(table_b, OBJ_TYPE_PHYS, |va, id| report(va, id));
+    }
+    for_each_object_of_kind(OBJ_TYPE_PHYS, |va, id| report(va, id));
+
+    kprintln!("=== {} TPhys descriptors map PA={:#x} ===", count, target_pa);
 }
 
 /// Heartbeat-rate dump trigger. Returns true on the firing iterations.

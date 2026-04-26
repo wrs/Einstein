@@ -77,6 +77,16 @@ const RAM_PROBE_ABSENT_END:  u64 = 0x0900_0000;
 const NO_REX_PROBE_BASE: u64 = 0x1040_0000;
 const NO_REX_PROBE_END:  u64 = 0x2000_0000;
 
+// Test-only R/W scratch registers above XOR_LIMIT (= 0x1000_0000), used
+// by `guest-tests/tests/test_shadow_stub.S` subtest_11 to verify that
+// shadow-stub byte/halfword accesses bypass the BE-32 XOR for IPAs >=
+// XOR_LIMIT. Real Newton hardware doesn't expose anything in this
+// window; the kernel never touches it during boot. A byte-granular
+// 16-byte storage cell is enough for the test.
+const TEST_SCRATCH_BASE: u64 = 0x1200_0000;
+const TEST_SCRATCH_END:  u64 = 0x1200_0010;
+static mut TEST_SCRATCH: [u8; 16] = [0; 16];
+
 // BIO interface register bank. `TBIOInterface::BIOReadRegister` /
 // `BIOWriteCommand` / etc. at ROM `0x26b878..0x26ba10` compute the
 // target register address as `0x0F05_0000 + (bank_index << 10)`, so
@@ -195,6 +205,14 @@ pub fn read(ipa: u64, sas: u8, elr: u64) -> u32 {
         // RAM-probe "absent bank" window (see const comment above).
         a if (RAM_PROBE_ABSENT_BASE..RAM_PROBE_ABSENT_END).contains(&a) => 0,
 
+        // Test-only scratch window (see TEST_SCRATCH_BASE comment) —
+        // ordered before the NO_REX_PROBE arm because the scratch
+        // sub-window sits inside the same 0x1040_0000..0x2000_0000 IPA
+        // range.
+        a if (TEST_SCRATCH_BASE..TEST_SCRATCH_END).contains(&a) => {
+            test_scratch_read(a, sas)
+        }
+
         // REx / extra-flash "absent" probe window (see const comment).
         a if (NO_REX_PROBE_BASE..NO_REX_PROBE_END).contains(&a) => 0,
 
@@ -202,6 +220,52 @@ pub fn read(ipa: u64, sas: u8, elr: u64) -> u32 {
     };
 
     mask_for_size(value, sas)
+}
+
+/// Byte-granular read from the test scratch window. Byte (sas=0) and
+/// halfword (sas=1) accesses return the raw bytes from `TEST_SCRATCH`;
+/// word reads (sas=2) assemble a u32 from four consecutive bytes.
+fn test_scratch_read(ipa: u64, sas: u8) -> u32 {
+    let off = (ipa - TEST_SCRATCH_BASE) as usize;
+    // SAFETY: single-threaded EL2 access; bounds checked above.
+    unsafe {
+        let p = core::ptr::addr_of!(TEST_SCRATCH) as *const u8;
+        match sas {
+            0 => *p.add(off) as u32,
+            1 => u16::from_le_bytes([*p.add(off), *p.add(off + 1)]) as u32,
+            _ => u32::from_le_bytes([
+                *p.add(off),
+                *p.add(off + 1),
+                *p.add(off + 2),
+                *p.add(off + 3),
+            ]),
+        }
+    }
+}
+
+/// Byte-granular write into the test scratch window. Mirrors the
+/// `test_scratch_read` size dispatch.
+fn test_scratch_write(ipa: u64, sas: u8, value: u32) {
+    let off = (ipa - TEST_SCRATCH_BASE) as usize;
+    // SAFETY: single-threaded EL2 access; bounds checked.
+    unsafe {
+        let p = core::ptr::addr_of_mut!(TEST_SCRATCH) as *mut u8;
+        match sas {
+            0 => *p.add(off) = value as u8,
+            1 => {
+                let bytes = (value as u16).to_le_bytes();
+                *p.add(off) = bytes[0];
+                *p.add(off + 1) = bytes[1];
+            }
+            _ => {
+                let bytes = value.to_le_bytes();
+                *p.add(off) = bytes[0];
+                *p.add(off + 1) = bytes[1];
+                *p.add(off + 2) = bytes[2];
+                *p.add(off + 3) = bytes[3];
+            }
+        }
+    }
 }
 
 pub fn write(ipa: u64, sas: u8, value: u32, elr: u64) {
@@ -250,6 +314,12 @@ pub fn write(ipa: u64, sas: u8, value: u32, elr: u64) {
     // RAM-probe "absent bank" window — dropped writes, deterministic
     // (see const comment above).
     if (RAM_PROBE_ABSENT_BASE..RAM_PROBE_ABSENT_END).contains(&ipa) {
+        return;
+    }
+    // Test-only scratch window — round-trip storage above XOR_LIMIT.
+    // Checked before NO_REX_PROBE because it sits inside that range.
+    if (TEST_SCRATCH_BASE..TEST_SCRATCH_END).contains(&ipa) {
+        test_scratch_write(ipa, sas, value);
         return;
     }
     // Probe-for-absent-REx window — same semantics.

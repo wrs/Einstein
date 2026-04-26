@@ -251,6 +251,18 @@ pub fn pa_to_offset(pa: u32) -> Option<usize> {
     }
 }
 
+/// True when `pa` falls inside flash bank 0 or bank 1.
+/// Used by `trap::handle_data_abort` to recognise stage-2 RO faults
+/// that should be silently dropped (matching `TMemory::WriteP`).
+pub fn is_flash_pa(pa: u64) -> bool {
+    let pa32 = pa as u32;
+    if pa > u32::MAX as u64 {
+        return false;
+    }
+    (pa32 >= BANK0_PA_BASE && pa32 < BANK0_PA_BASE + BANK_SIZE as u32)
+        || (pa32 >= BANK1_PA_BASE && pa32 < BANK1_PA_BASE + BANK_SIZE as u32)
+}
+
 /// Masked 32-bit program into flash, following Einstein's
 /// `TFlash::Write` semantics (`Emulator/TFlash.cpp:192-208`): the
 /// stored word becomes `(existing & ~mask) | word`. Returns false if

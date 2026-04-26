@@ -255,9 +255,21 @@ pub unsafe fn init() {
         );
     }
 
-    // Flash bank 0 (internal store): 4 MiB R/W at guest PA 0x0200_0000.
-    // Backed by the first half of peripherals::flash's static buffer;
-    // persistent across guest reboots within a single hypervisor lifetime.
+    // Flash bank 0/1: 4 MiB read-only at guest PA 0x0200_0000 / 0x1000_0000.
+    // Einstein's `TMemory::WriteP` silently ignores all direct CPU writes
+    // to flash bank addresses (`Emulator/TMemory.cpp:1777` returns
+    // without storing); flash is mutated only via the
+    // `TEinsteinFlashDriver` native primitives (WriteToFlash16/32Bits,
+    // EraseFlash) which call into our `peripherals::flash_driver`,
+    // touching the host backing directly without going through stage-2.
+    //
+    // Mapping the banks RO at stage-2 trips a write-permission fault
+    // for any direct CPU store from the guest (e.g. AMD-style
+    // command-sequence writes the kernel's flash chip code emits).
+    // `trap::handle_data_abort` recognises flash-bank IPAs and silently
+    // drops the write (matching Einstein), so the backing keeps the
+    // values seeded by `flash::init` / programmed by the native
+    // primitives.
     let flash_pa = peripherals::flash::host_pa();
     // SAFETY: helper bounds-checks; flash_pa is 2-MiB aligned.
     unsafe {
@@ -265,15 +277,13 @@ pub unsafe fn init() {
             FLASH_BANK0_IPA_BASE,
             flash_pa,
             FLASH_BANK_IPA_SIZE / TWO_MIB,
-            BLOCK_NORMAL_RW,
+            BLOCK_NORMAL_RO,
         );
-        // Flash bank 1 (kFlashBank2): 4 MiB R/W at guest PA 0x1000_0000.
-        // Backed by the second half of the same static buffer.
         set_l2_blocks(
             FLASH_BANK1_IPA_BASE,
             flash_pa + FLASH_BANK_IPA_SIZE,
             FLASH_BANK_IPA_SIZE / TWO_MIB,
-            BLOCK_NORMAL_RW,
+            BLOCK_NORMAL_RO,
         );
     }
 
@@ -347,12 +357,12 @@ pub unsafe fn init() {
         RAM_IPA_BASE, RAM_IPA_BASE + RAM_IPA_SIZE, guest_mem::ram_host_pa()
     );
     kprintln!(
-        "stage2: flash bank 0 @ IPA {:#x}..{:#x} -> host PA {:#x} (RW, {} MiB)",
+        "stage2: flash bank 0 @ IPA {:#x}..{:#x} -> host PA {:#x} (RO, {} MiB)",
         FLASH_BANK0_IPA_BASE, FLASH_BANK0_IPA_BASE + FLASH_BANK_IPA_SIZE,
         flash_pa, FLASH_BANK_IPA_SIZE / (1024 * 1024)
     );
     kprintln!(
-        "stage2: flash bank 1 @ IPA {:#x}..{:#x} -> host PA {:#x} (RW, {} MiB)",
+        "stage2: flash bank 1 @ IPA {:#x}..{:#x} -> host PA {:#x} (RO, {} MiB)",
         FLASH_BANK1_IPA_BASE, FLASH_BANK1_IPA_BASE + FLASH_BANK_IPA_SIZE,
         flash_pa + FLASH_BANK_IPA_SIZE, FLASH_BANK_IPA_SIZE / (1024 * 1024)
     );

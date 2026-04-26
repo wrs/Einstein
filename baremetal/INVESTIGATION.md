@@ -3,154 +3,127 @@
 Live notes. Update as we learn more; remove old updates as we move on to
 new stalls.
 
-## Currently at — upstream divergence is the flash recovery path; underlying cause for newt-DABT (QEMU, 2026-04-25 late night)
+## Currently at — flash recovery path eliminated; newt-DABT alias still present (QEMU, 2026-04-25 late night)
 
-**Root cause for the newt-DABT chain reaches further upstream than
-previously understood.** The Einstein-vs-hypervisor `awk '/^trace / &&
-!seen[$4]++'` first-occurrence diff over a fresh cold boot showed
-~21 functions our hypervisor enters that Einstein never does:
-`PersistentRecovery`, `BuildMemObjDatabase`, `MemObjManager::CopyObject`,
-`TFlashRange::EraseRange`, `T16BitFlashRange::DoWrite`,
-`T32BitFlashRange::DoWrite`, `TFlashDriver::BeginWrite/StartErase/Write/
-LockBlock/IsEraseComplete/ReportWriteResult`,
-`TReservedBlockAccessor::CompareFlashAndMemRebootIfDifferent / MarkStoreAsValid /
-UpdateBlock0FromBlock1 / CompareAndRebootIfDifferent`,
-`TFlashRange::FlushDataCache/SyncErase/StartErase/IsEraseComplete/EarlyPrepare-
-ForReadingArray/LockBlock`, plus `EarlyIOPowerOn/Off`, `ShortTimerDelay`,
-`LowLevelGetCPUType`, `LowLevelProcSpeed`, `MaybeUnicodeStr`,
-`UnhandledException`, `RebootIfFaultWasInStack`, etc.
+**Status:** Failure B (flash[0..4] DLDS corruption) resolved by mapping
+flash stage-2 RO + dropping direct guest writes. The kernel now takes
+Einstein's success path (`PersistentRecovery` at trace 1713, no
+`UpdateBlock0FromBlock1` / `EraseRange` / `T{16,32}BitFlashRange::DoWrite` /
+`MarkStoreAsValid` / `CompareFlashAndMemRebootIfDifferent` etc. ever
+fires). Trace count drops from ~305 K to ~234 K and the recovery-cycle
+function set is gone from `awk '/^trace / && !seen[$4]++'`.
 
-These are the **flash-store recovery + rewrite cycle**. Einstein cold-
-boots with the kernel taking the success path (operator==(TROMREXChecksums)
-returns true), going straight to `ReadCalibration → InstallPatch →
-PersistentRecovery → BuildMemObjDatabase` at trace 1714. Our hypervisor
-goes through `UpdateBlock0FromBlock1 → SyncErase → DoWrite → MarkStoreAsValid
-→ ReadCalibration → InstallPatch → PersistentRecovery` at trace ~4425
-(originally) or ~54050 (after partial fix). The recovery path makes
-~3000-50000 extra trace events of work, which diverges heap state, which
-eventually feeds the `CopyPagesAfterStackCollided` choosing
-`VA=0x0cc82000` instead of Einstein's `0x0cca3000`, which lands the
-TCardServer's `__nw__FUi(184)` allocator at PA 0x0402a000, which writes
-'newt'/'cdsv' over pckm's `sp_usr+8` save slot.
+The newt-DABT alias still triggers, now earlier (trace 174 655 vs.
+234 292 before): `TCardServer::AddCardHandler → __nw__FUi(184) →
+TCardMessage::TCardMessage at VA 0x0cc82250 → strs 'newt'/'cdsv' over
+pckm's `sp_usr+8` save slot at PA 0x0402a250`. The flash recovery cycle
+was a *concurrent* heap-state perturbation but not the root cause of
+which TStackPage the kernel picks for the alias — that decision is
+upstream.
 
-### Two failure points found in the validation chain (one fixed, one open)
+### What changed in this session
 
-The kernel's `TReservedBlockAccessor::CheckIfRecoveryIsNeeded` runs:
+#### Failure point A (still FIXED): ROM/REx checksum drift after fix_stage1_xn_bits
 
-1. `ValidateCalibrationInformation` → `ValidateCalibrationFields`:
-   - DLDS magic at flash[0x00] and flash[0x50]
-   - OSCD at flash[0x04]
-   - 0x10C at flash[0x08]
-   - **Checksum(flash, 0x54) == flash[0x54] (= 0xD7ECCC66 hardcoded)**
-   - flash[0x58] in {-1, -2, -4, -8, -16}
-2. `ValidatePatchCheckSum` (writes flash[0x5c]/[0x60] to 0 if mismatch)
-3. **`operator==(TROMREXCheckSums)` of kernel-runtime checksums vs
-   flash[0x64..0x8C]**
-4. flash[0x58] state-machine check (cmn r6, #4 → must be 0xFFFFFFFC)
+`trap.rs::reseed_flash_checksums_if_needed()` runs after every
+`fix_stage1_xn_bits` invocation. The kernel's runtime
+`CalculateROMREXCheckSums` matches what's written into
+`flash[0x64..0x8C]`, the `operator==(TROMREXCheckSums)` returns true.
 
-If any check fails → `UpdateBlock0FromBlock1` → `EraseRange` →
-`DoWrite` → `MarkStoreAsValid`.
+#### Failure point B (NOW FIXED): direct guest writes to flash bank IPAs
 
-#### Failure point A (FIXED): ROM/REx checksum drift after fix_stage1_xn_bits
+Einstein's `TMemory::WriteP` at `Emulator/TMemory.cpp:1777` silently
+ignores all direct CPU writes to flash bank addresses
+(`kFlashBank1..End`, `kFlashBank2..End`); flash is mutated only via the
+`TEinsteinFlashDriver` native primitives (`WriteToFlash16/32Bits`,
+`EraseFlash`). Our hypervisor was mapping the banks stage-2 RW, so
+AMD-style command-sequence writes the kernel's flash chip code emits
+landed in the backing and corrupted the seeded DLDS header to
+`0x00FF00FF`.
 
-`flash::seed_rom_rex_checksums` originally ran in `main.rs` *before*
-`shadow_stub::patch_rom_from_bitmap`. Shadow-stub then patched 27,633
-ROM instructions, changing the bytes the kernel computes its runtime
-checksum over. Even after moving the seed to *after* shadow_stub,
-`guest_mem::fix_stage1_xn_bits` (called on first M=0→M=1 SCTLR write
-and first TTBR0=0x04000000 write, per `trap.rs`) walks the kernel's L1,
-finds L2 page tables that live in ROM, and rewrites them in-place to
-ARMv7-form (XN/AP/CB normalisation). Those modifications happen
-*after* hypervisor init.
+**Fix:** Map flash bank 0 (`0x02000000..0x02400000`) and bank 1
+(`0x10000000..0x10400000`) RO at stage-2; intercept stage-2 RO write
+faults to those IPAs in `trap::handle_data_abort` and silently drop
+them (matching Einstein). Flash mutations the kernel actually wants
+to commit go through `peripherals::flash_driver` which writes the
+host backing directly via `flash::program_word` / `flash::erase_block`,
+bypassing stage-2 entirely.
 
-**Fix:** `trap.rs::reseed_flash_checksums_if_needed()` calls
-`flash::seed_rom_rex_checksums` after every `fix_stage1_xn_bits`
-invocation. Diagnostic dumps confirm the kernel's runtime
-`CalculateROMREXCheckSums` result now matches what we wrote into
-flash[0x64..0x8C], and the operator== returns true.
+`drop_flash_write` handles ISV=1 (just advance ELR) and the common
+ISV=0 forms (STR/STRH-immediate with writeback, STR-register) so any
+AMD-style sequence, post-indexed write, etc. is absorbed without
+mutating the backing or losing the writeback to Rn. Unsupported forms
+fall through to the existing loud-halt path so future surprises
+surface.
 
-#### Failure point B (OPEN): flash[0..4] DLDS magic gets corrupted to 0x00FF00FF
+### Boot trajectory after fix
 
-After Failure A is fixed, the kernel still takes the recovery path
-because `ValidateCalibrationFields` returns non-zero (specifically the
-DLDS check at flash[0x00] fails). Diagnostics in the tracer at
-`ValidateCalibrationFields` entry show:
+| metric | original | partial (A) | full (A + B) |
+|---|---|---|---|
+| total trace events (~120s wall) | 261 949 | 304 954 | 234 069 |
+| unique functions | 1290 | 1294 | 1222 |
+| flash recovery cycle | active | active | none |
+| newt-tripwire fires at trace | 194 617 | 234 292 | 174 655 |
+| ultimate wedge | newt UnhandledException | (unchanged) | (unchanged) |
 
-```
-trace-csum: ValidateCalibFields buf @VA 0x34af228:
-  [00ff00ff, 4f534344, 0000010c, 00000000, ...]      <- block 0, FIRST READ
-                                                         offset 0 = 0x00FF00FF, NOT 0x444C4453
-  [444c4453, 4f534344, 0000010c, 00000000, ...]      <- block 1, second read OK
-```
+The newt-tripwire firing earlier is consistent with the heap state no
+longer being delayed by the recovery cycle's allocations. The
+underlying alias bug (`AddPgPAndPerm(VA=0x0cc82000, PA=0x0402a000)`
+with pckm's stack already at PA 0x0402a000 via VA 0x0cc7a000) is
+unchanged.
 
-Hypervisor init dumps confirm `flash[0..16] = 444c4453 4f534344 0000010c
-00000000` after `seed_block(0)` runs. By the time the kernel reads it
-at trace 1614 (BlockMove from VA 0x30000000), `flash[0..4]` reads as
-`0x00FF00FF` (LE bytes 0xFF 0x00 0xFF 0x00 — alternating-halfword pattern).
+### Open next steps
 
-The mutation is invisible to `flash::program_word` (instrumented; not
-called for offset < 0x10). So it's a direct stage-2 write — the guest
-writes through the RW flash bank mapping, bypassing any peripheral
-handler. Need to identify the writer: probably an AMD-style flash
-chip command sequence (write `0xAA` to magic addresses) that lands at
-flash[0..4] because we don't model the flash chip state machine.
+The flash-recovery divergence is the *only* low-hanging upstream
+heap-state difference visible in `awk '/^trace / && !seen[$4]++'` vs.
+Einstein. With it resolved, the next divergence is harder to spot
+from the function-trace alone — the kernel paths look identical but
+the data they're operating on (TPhys IDs, StackInfo VAs) differs.
 
-#### Other partial fix landed
-
-`flash::seed_block` now zeroes 0x10c bytes of the block header before
-writing the specific calibration values, so the unwritten gaps (0x0C..
-0x23, 0x28..0x33, 0x38..0x3B, 0x44..0x4F) are 0 instead of 0xFF —
-matching Einstein's mmap'd flash file behaviour. Without this the
-hardcoded `0xD7ECCC66` checksum at flash[0x54] doesn't match the
-runtime `Checksum(flash, 0x54)` because the gaps differ.
-
-### Boot trajectory after fixes
-
-| metric | original | after fixes |
-|---|---|---|
-| total trace events (~120s wall) | 261,949 | 304,954 |
-| unique functions | 1290 | 1294 (peaks at 1259 at 90s) |
-| newt-tripwire fires at trace | 194,617 | 234,292 |
-| ultimate wedge | newt UnhandledException | (unchanged) |
-
-The boot reaches deeper into the post-PCMCIA-init paths
-(`TUPhys::ChangeVirtualMapping`, `TCardServer::AddCardHandler`,
-`TCardSocket::RegisterSocketInterrupt`, `TGPIOInterface::DisableInterrupt`
-are new unique functions in the post-fix run), but still hits the same
-wedge eventually because Failure B keeps the recovery path active.
-
-### Open next steps for next session
-
-1. **Find the writer to flash[0..4].** Add a stage-2 RO mark for the
-   first 4 KiB of flash bank 0 so any guest write traps. The trapped
-   PC will identify the AMD-style command-sequence emitter. Then either
-   model it (track the chip state machine, return data-array on read)
-   or make those command writes no-ops via a peripheral that owns
-   flash bank 0's command-sequence offsets specifically.
-2. **Cross-reference Einstein's TFlash::Write.** Einstein's flash chip
-   model (`Emulator/TFlash.cpp:192-208`) masks command-sequence writes:
-   `*ptr = swap((swap(*ptr) & ~mask) | word)`. The mask handles the
-   AMD-style "write 0xAA at 0x555 etc." pattern that puts the chip in
-   modes; Einstein effectively ignores them. Our implementation just
-   writes the bytes through, corrupting flash content.
-3. **After fixing Failure B, re-run cold-boot trace.** With both
-   failures resolved, the kernel should take Einstein's success path
-   (operator== → ReadCalibration → InstallPatch → PersistentRecovery
-   at ~trace 1714, no UpdateBlock0FromBlock1). That should align our
-   trace counts with Einstein's, and the downstream
-   `CopyPagesAfterStackCollided` should pick the same TStackPage
-   Einstein picks → no aliasing → no newt-DABT.
+1. **Audit `gPhysAllocator` at trace ~174 k.** Use `dump_all_phys` /
+   `dump_phys_for_pa` (already wired) to print {id → PA} pairs at the
+   moment of the destructive `CopyPagesAfterStackCollided` call. Add
+   the same walker on the Einstein side via
+   `baremetal/probe/probe.cpp` so the dumps are byte-identical when
+   the kernel state is byte-identical. The first divergent {id → PA}
+   pair is the upstream cause.
+2. **Audit StackInfo / StackPage state at the wedge.** Extend
+   `task_dump` to enumerate `TStackInfo`. The StackInfo passed as
+   `r1` (`params[+16]`) to `CopyPagesAfter` carries `vaddr_base` —
+   compare ours (`0x0cc82000`) vs. Einstein's (`0x0cca3000`).
+3. **`RememberMapping` audit.** Hook a count + last-args probe on
+   `RememberMapping` (ROM `0x11c7d8`). The first call where
+   `(va_arg, phys_id_arg)` differs from Einstein's same-numbered call
+   is the upstream divergence.
+4. **`__nw__FUi(184)` audit.** Identify the heap that's serving the
+   TCardAsyncMsg array allocations and compare its size + growth
+   pattern against Einstein.
+5. **Re-run on FVP for cross-check.** QEMU and FVP have agreed on
+   this wedge since 2026-04-26; another FVP run with the new trace
+   counts should confirm the alias picks the same VA / TPhys ID on
+   both platforms (i.e. it's a real cross-platform heap-state
+   divergence, not a QEMU-only artifact).
 
 ### Files changed in this session
 
-- `src/main.rs` — moved `flash::seed_rom_rex_checksums` to after
-  `shadow_stub::patch_rom_from_bitmap` (was before).
-- `src/peripherals/flash.rs` — `seed_block` zeroes 0x10c-byte header
-  region before writing calibration values; `seed_rom_rex_checksums`
-  uses `dprintln!` for status (silenced under quiet feature).
-- `src/trap.rs` — added `reseed_flash_checksums_if_needed()` and call
-  it after every `fix_stage1_xn_bits` invocation (both M=0→M=1 SCTLR
-  and first-TTBR0 sites).
+- `src/stage2.rs` — flash bank 0/1 mapped `BLOCK_NORMAL_RO` instead
+  of RW; comment + log lines updated.
+- `src/trap.rs` — `handle_data_abort` recognises flash-bank writes
+  and silently drops them via new `drop_flash_write` helper
+  (handles ISV=1 + common ISV=0 STR/STRH/STR-register forms,
+  applying any base-register writeback so the guest's CPU state is
+  consistent with a successful store).
+- `src/peripherals/flash.rs` — added `is_flash_pa` helper.
+- `src/mmio.rs` — added `TEST_SCRATCH` (R/W byte-array storage at
+  IPA `0x12000000..0x12000010`) so `test_shadow_stub` can verify
+  the inline-stub no-XOR branch above XOR_LIMIT now that flash
+  bank 1 is RO. Ordered ahead of `NO_REX_PROBE_BASE..END` so the
+  scratch sub-window wins the dispatch arm.
+- `guest-tests/tests/test_flash.S` — rewritten to verify the new
+  drop semantics (writes silently dropped, seeded header preserved,
+  bank independence).
+- `guest-tests/tests/test_shadow_stub.S` — `SCRATCH_HI` now points
+  at `0x12000000` instead of flash bank 1.
 
 ---
 

@@ -184,29 +184,13 @@ pub fn read(ipa: u64, sas: u8, elr: u64) -> u32 {
         // Einstein returns all-ones = "no cards / switches open".
         0x0F18_D400 => 0xFFFF_FFFF,
 
-        // GPIO interrupt-control / sense registers paired with the
-        // matching writes below. The kernel does read-modify-write on
-        // these (TGPIOInterface::DisableInterrupt at 0x26c468 reads
-        // [r0] then ANDs/ORs and stores back). Returning 0 matches
-        // Einstein's unknown-bank #3 fallback in TMemory.cpp:952-959,
-        // and the paired write entries no-op the result.
-        0x0F18_CC00 => 0,
-        0x0F18_D000 => 0,
-        0x0F18_D800 => 0,
-        0x0F18_DC00 => 0,
-        0x0F18_E000 => 0,
-
         // Power status: 0x0F184C00 read as "all-ok high" per Einstein.
+        // (The 0x0F18_CC00..0x0F18_EC00 GPIO / IOPower registers below
+        // 0xE800 used to be inline read-as-zero stubs here; they're
+        // round-tripped in peripherals::vic now so the kernel's
+        // read-modify-write pattern in TGPIOInterface::DisableInterrupt
+        // sees the bits it most recently wrote.)
         0x0F18_4C00 => 0xFFFF_FFFF,
-
-        // IOPower1 / IOPower2. TMemoryConsts.h labels these as W-only
-        // but the kernel's EarlyIOPowerOn does a read-modify-write
-        // (OR 0x30 / 0x10). Return 0 so the OR yields the intended
-        // "power on" bit pattern the kernel writes back. If a later
-        // code path relies on specific preserved bits we'll halt on
-        // the subsequent divergence.
-        0x0F18_E800 => 0,
-        0x0F18_EC00 => 0,
 
         // RAM-probe "absent bank" window (see const comment above).
         a if (RAM_PROBE_ABSENT_BASE..RAM_PROBE_ABSENT_END).contains(&a) => 0,
@@ -327,17 +311,9 @@ pub fn write(ipa: u64, sas: u8, value: u32, elr: u64) {
         0x0F28_4000 => {} // P0F284000        W (0x23)
 
         // --- Power / GPIO miscellany (0x0F18xxxx area outside VIC) ---
-        0x0F18_CC00 => {} // P0F18CC00        W (0x103)
-        0x0F18_D000 => {} // P0F18D000        W (0x0F)
-        0x0F18_D800 => {} // P0F18D800        W (0)
-        0x0F18_DC00 => {} // P0F18DC00        W (0x1EF0, 0xFFFF0FF0)
-        // kHdWr_P0F18E000 isn't in TMemoryConsts.h but sits between
-        // GPIO_CReg (0x0F18C800) and IOPower1 (0x0F18E800). The ROM
-        // writes it from the same setup routine; treat as an extended
-        // power/GPIO register and no-op the write.
-        0x0F18_E000 => {}
-        0x0F18_E800 => {} // IOPower1         W (EarlyIOPowerOn | 0x30)
-        0x0F18_EC00 => {} // IOPower2         W (EarlyIOPowerOn | 0x10)
+        // Note: 0x0F18_CC00..0x0F18_EC00 used to be inline write-no-op
+        // entries here. They're round-tripped in peripherals::vic now
+        // via vic::owns / vic::write, so the inline arms moved out.
 
         a => halt_on_unknown("write", a, sas, value, elr),
     }

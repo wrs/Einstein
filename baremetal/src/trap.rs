@@ -66,6 +66,15 @@ pub const ALIGN_TAG: u32 = 0x13;
 /// `shadow_stub::handle_sba_retry`.
 pub const SBA_RETRY_TAG: u32 = 0x14;
 
+/// Test-only GPIO line-rise trigger. A guest test issues `HVC #GPIO_TRIGGER_TAG`
+/// to inject a virtual GPIO event so the test can verify
+/// `peripherals::vic::INT_GPIO` (bit `0x01_000000`) lights up `int_present`
+/// and gets delivered as a virtual IRQ. Real GPIO sources don't use this
+/// path — they call `vic::raise(INT_GPIO)` directly. This is purely a
+/// test hook so `tests/test_gpio.S` doesn't need to fabricate a real
+/// device event.
+pub const GPIO_TRIGGER_TAG: u32 = 0x06;
+
 
 /// Generic "inspect-then-halt" HVC immediate, used by temporary
 /// vector-intercept patches during Phase B debugging. When we need to
@@ -761,6 +770,11 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         }
         v if v == SBA_RETRY_TAG => {
             crate::shadow_stub::handle_sba_retry(ctx);
+        }
+        v if v == GPIO_TRIGGER_TAG => {
+            // Test-only: raise the GPIO IRQ line. Delivered as a
+            // virtual IRQ on ERET via the shared update_virq path.
+            vic::raise(vic::INT_GPIO);
         }
         #[cfg(feature = "trace")]
         v if v == crate::tracer::TRACE_TAG => {

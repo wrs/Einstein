@@ -30,3 +30,6 @@ test_network
 test_printer
 test_sound
 test_bio_bank
+test_alarm
+test_dma_irq
+test_gpio

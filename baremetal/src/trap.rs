@@ -1777,7 +1777,7 @@ fn handle_diag(ctx: &mut TrapContext) {
         let dfsc = (esr_el1 & 0x3F) as u32;
         let forwardable = matches!(dfsc, 0x03 | 0x05 | 0x06 | 0x07 | 0x0D | 0x0F);
         if forwardable {
-            log_dabt_forward(dfsc, far as u32, hvc_src_mode);
+            log_dabt_forward(dfsc, far as u32, hvc_src_mode, ctx);
             // One-shot diagnostic: when the recursive-abort "newt" DABT
             // fires (FAR=0x6e657774, mode=ABT), dump the SWIBoot save
             // area of every cdsv-named task before forwarding to the
@@ -2266,7 +2266,7 @@ use guest_mem::{read_byte_pa as read_guest_byte_pa,
 /// (FAR, mode) pair so we see the first sample of each fault site without
 /// flooding on tight-loop faults (e.g. a page-table walk the kernel is
 /// filling in one entry at a time).
-fn log_dabt_forward(dfsc: u32, far: u32, mode: u32) {
+fn log_dabt_forward(dfsc: u32, far: u32, mode: u32, ctx: &TrapContext) {
     const SEEN_CAP: usize = 16;
     static mut SEEN: [(u32, u32); SEEN_CAP] = [(0, 0); SEEN_CAP];
     static mut SEEN_N: usize = 0;
@@ -2285,10 +2285,51 @@ fn log_dabt_forward(dfsc: u32, far: u32, mode: u32) {
         }
     };
     if first {
+        // Capture more context: LR_abt (faulting PC + 8) tells us *where*
+        // the kernel was when the abort happened — critical when
+        // mode=ABT (recursive abort) because the FAR alone doesn't
+        // identify the kernel-side instruction that wandered into the
+        // unmapped VA. SPSR_abt names the mode the abort was taken from
+        // (i.e. the mode that was running before this abort). For mode=ABT
+        // (recursive) SPSR_abt also reads ABT — confirming the
+        // double-fault.
+        let lr_abt = ctx.x[20] as u32;
+        let sp_abt = ctx.x[21] as u32;
+        let lr_usr = ctx.x[14] as u32;
+        let sp_usr = ctx.x[13] as u32;
+        let lr_svc = ctx.x[18] as u32;
+        let sp_svc = ctx.x[19] as u32;
+        let spsr_abt = read_banked_spsr("abt") as u32;
+        // For ARM-mode DABT, faulting_pc = LR_abt - 8.
+        let faulting_pc = lr_abt.wrapping_sub(8);
         kprintln!(
             "dabt: forwarding to kernel DataAbortHandler — DFSC={:#x} FAR={:#010x} mode={:#x}",
             dfsc, far, mode
         );
+        kprintln!(
+            "  LR_abt={:#010x} (faulting PC={:#010x}) SP_abt={:#010x} SPSR_abt={:#010x} (pre-abt mode={:#x})",
+            lr_abt, faulting_pc, sp_abt, spsr_abt, spsr_abt & 0x1F
+        );
+        kprintln!(
+            "  USR sp={:#010x} lr={:#010x}   SVC sp={:#010x} lr={:#010x}",
+            sp_usr, lr_usr, sp_svc, lr_svc
+        );
+        kprintln!(
+            "  r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r12={:#010x}",
+            ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32, ctx.x[12] as u32
+        );
+        // Dump the stage-1 walk for the FAR. Crucial for distinguishing
+        // "L1 entry missing" (DFSC=5) from "L2 entry missing"
+        // (DFSC=7) — both would otherwise look the same in a brief log.
+        guest_mem::dump_stage1_walk(far);
+        // For DFSC=5 (section fault), also show the neighbouring L1
+        // entries so we can see whether this section was an isolated
+        // hole vs. a wider gap. Lazy "non-zero fault" descriptors
+        // (e.g. 0x90 — type=00 with bit-7/bit-4 set) are a kernel
+        // bookkeeping shape worth eyeballing across a window.
+        if dfsc == 5 {
+            guest_mem::dump_l1_neighbourhood(far);
+        }
     }
 }
 

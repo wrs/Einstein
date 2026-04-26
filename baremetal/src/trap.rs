@@ -2459,6 +2459,7 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
                 // the live TTBR0 value.
                 if (cp15::read_ttbr0_el1() as u32 & 0xFFFF_C000) == 0x0400_0000 {
                     guest_mem::fix_stage1_xn_bits();
+                    reseed_flash_checksums_if_needed();
                 }
                 // No cache maintenance here: the TTBR0 write handler
                 // below OR's Inner/Outer-WB cacheability bits into
@@ -2559,6 +2560,7 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
             };
             if !already && (raw & 0xFFFF_C000) == 0x0400_0000 {
                 guest_mem::fix_stage1_xn_bits();
+                reseed_flash_checksums_if_needed();
             }
         }
         (0, 3, 0, 0, false) => cp15::write_dacr32(ctx.x[rt]),
@@ -2721,6 +2723,32 @@ fn maybe_dump_l1_once() {
     if n < 10 {
         guest_mem::dump_guest_l1_table();
     }
+}
+
+/// Re-seed the flash ROM/REx checksums after `fix_stage1_xn_bits` has
+/// modified ROM-resident L2 page tables. The original boot-time seed
+/// (in main.rs) computed checksums over the unpatched ROM bytes; once
+/// the kernel writes TTBR0 we walk its L1 table, find L2 tables that
+/// live in ROM, and rewrite them in place to ARMv7-compatible form
+/// (XN/AP/CB normalisation). That mutation invalidates the seeded
+/// checksums — the kernel then sees flash[0x64..0x8C] mismatch its own
+/// runtime CalculateROMREXCheckSums result and takes the heavyweight
+/// `UpdateBlock0FromBlock1 → erase → rewrite` recovery path, which
+/// diverges heap state and feeds the downstream "newt" UnhandledException.
+/// Re-running the seed function recomputes over the post-mutation ROM
+/// and overwrites flash[0x64..0x8C] so the kernel's later comparison
+/// passes. Idempotent: subsequent calls (the kernel re-enables MMU on
+/// every task switch) recompute the same value.
+fn reseed_flash_checksums_if_needed() {
+    // Idempotent: each call recomputes from the current ROM bytes and
+    // writes flash[0x64..0x8C]. Subsequent calls (the kernel re-enables
+    // MMU on every task switch) recompute, and any further L2-table
+    // mutations in ROM get reflected before the kernel reaches the
+    // checksum comparison in TReservedBlockAccessor::CheckIfRecoveryIsNeeded.
+    crate::peripherals::flash::seed_rom_rex_checksums(
+        guest_mem::rom_host_pa() as *const u32,
+        guest_mem::ROM_SIZE,
+    );
 }
 
 fn halt_unknown_cp15(is_read: bool, opc1: u32, crn: u32, crm: u32, opc2: u32, rt: usize, ctx: &TrapContext) -> ! {

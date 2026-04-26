@@ -2,7 +2,222 @@
 
 Live notes. Update as we learn more. REMOVE old updates once resolved.
 
-## Currently at — TCardMessage-alias wedge resolved by per-page stack allocation (QEMU, 2026-04-26 evening)
+## Currently at — wedged inside `TInterpreter::TInterpreter` constructor (Phase B goal reached!) (QEMU, 2026-04-26 afternoon)
+
+**Status:** Boot has reached **`TInterpreter::TInterpreter` at 0x002F40E0** — the
+literal goal of Phase B per `PLAN.md`. The wedge is now *inside* the
+constructor's first call to `TIntrpStack::NewState` after both
+`TRefStructStack` sub-objects have been constructed. So Phase B is
+substantively succeeding — we're now finding bugs in the interpreter's
+backing-stack memory allocation.
+
+### Reboot-canary fire signature (no-trace, repro at trace ~270k)
+
+```
+dabt: forwarding to kernel DataAbortHandler — DFSC=0x7 FAR=0x0ccee800 mode=0x17
+  LR_abt=0x001a4710 (faulting PC=0x001a4708) SP_abt=0x0c004c00 SPSR_abt=0x60000110 (pre-abt mode=0x10)
+  USR sp=0x0cc82664 lr=0x002f41ac   SVC sp=0x0c000400 lr=0x003ae324
+  r0=0x00000007 r1=0x00000110 r2=0x0c606ea8 r3=0x0c105560 r12=0x0cc82678
+dabt: forwarding to kernel DataAbortHandler — DFSC=0x5 FAR=0x0cd07400 mode=0x17
+  LR_abt=0x001a4ba4 (faulting PC=0x001a4b9c) SP_abt=0x0c004c00 SPSR_abt=0x60000110 (pre-abt mode=0x10)
+  USR sp=0x0cc82660 lr=0x0cd07418   SVC sp=0x0c000400 lr=0x001a4708
+  r0=0x00000005 r1=0x80000110 r2=0x0ccee804 r3=0x0ccee800 r12=0x0cd07400
+
+*** Reboot canary fired ***
+  ELR_EL2=0x00ffff58 (= UND-trampoline HVC slot — fired via UND→trampoline→HVC #0x43,
+                        the canary patched at REBOOT_PC = 0x000d9884 from USR mode)
+  SPSR_EL2=0x000001db mode=UND (0x1b)
+  R0=0xffffd8a5  R3=0x7fffffce  R12=0x0cc82544
+  R14_UND=0x000d9888 (= UND-entry-set return address; the architectural caller LR
+                        is in R14_USR which the canary printer needs to be taught
+                        to read for this UND-from-USR path)
+```
+
+R0 = `0xffffd8a5` = `(0xa5 - 0x2800)` is the literal computed at
+`UnhandledException` 0xb02b4-0xb02bc — the "evt.ex.abt.bus, warm
+reboot!" exception code path.
+
+### Root path
+
+USR `lr=0x002f41ac` from the first DABT lands inside
+`__ct__12TInterpreterFv` immediately after `bl NewState__11TIntrpStackFv`
+at PC `0x002f41a8`. Disassembly excerpt:
+
+```
+002f40e0 <__ct__12TInterpreterFv>:
+  ...
+  2f410c: bl __ct__15TRefStructStackFv   ; construct stack #1 at self+8
+  2f4114: bl __ct__15TRefStructStackFv   ; construct stack #2 at self+0x20
+  ...                                     ; AllocateRefHandle x6 + struct init
+  2f41a0: mov r0, r5                     ; r0 = self+8 (TRefStructStack #1)
+  2f41a8: bl NewState__11TIntrpStackFv   ; ← USR lr at 1st DABT lands here (+4)
+  2f41ac: str r0, [r4, #76]
+  2f41b0: ldr r0, [r0]
+  2f41b4: str r6, [r0]
+  2f41b8: mov r0, r4
+  2f41bc: bl SetFastLoopFlag__12TInterpreterFv
+
+001a46f0 <NewState__11TIntrpStackFv>:
+  1a46f0: mov ip, sp
+  1a46f4: push {r4, fp, ip, lr, pc}
+  ...
+  1a4700: ldr r0, [r0]                   ; r0 = self->[0] = stack1_base
+  1a4704: mov r1, #2
+  1a4708: str r1, [r0]                   ; ← FAULT #1: write to 0x0ccee800
+  1a470c: str r1, [r0, #4]
+  ...
+
+001a4b54 <Fill__15TRefStructStackFv>:
+  1a4b54: stmfd sp!, {lr}
+  1a4b58: ldr r1, [r0, #20]              ; r1 = self->[0x14] = stack2_top
+  ...
+  1a4b94: mov r3, r2
+  1a4b98: add r2, r2, #4
+  1a4b9c: str r3, [r1], #4               ; ← FAULT #2: write to 0x0cd07400
+  1a4ba0: cmp r1, lr
+  1a4ba4: bcc 0x1a4b94
+```
+
+`TRefStructStack::TRefStructStack` (and its `TRefStack` base) each call
+`NewStack(0x10000)` (= 64 KB lazy-grow region via `MonitorDispatchSWI`
+sub-fn 1, dispatched to `TStackManager`). For each
+`TRefStructStack` we allocate **two** 64-KB stacks (one in TRefStack
+base ctor, one in the TRefStructStack ctor itself), and the
+TInterpreter has **two** TRefStructStack sub-objects → **4× 64 KB =
+256 KB** of lazy-grow stack memory allocated during construction.
+
+### Hypothesis
+
+The first DABT (DFSC=0x7 FAR=0x0ccee800) is a **page-translation
+fault inside an existing L1 coarse table** — the kernel's lazy-grow
+handler can serve this. The second DABT (DFSC=0x5 FAR=0x0cd07400) is
+a **section-translation fault** — there is no L1 entry for section
+0xCD at all, so the kernel's per-page growth path can't help.
+
+If `NewStack` returns a base inside section 0xCC and the lazy region
+spans into section 0xCD, the kernel needs section 0xCD's L1 entry to
+be pre-allocated (with an empty L2) before the per-page grow path can
+fill in pages. Either:
+
+1. The kernel normally pre-allocates the L1 entry for the entire
+   `NewStack` region but doesn't because of state corrupted upstream.
+2. Our `mask=0xF` per-page subpage-flatten patch
+   (`PATCHES_717006::TStackManager::ResolveFault`) collides with
+   `NewStack`'s allocator — `NewStack` pages might be supposed to
+   share 4 KB pages with other stack subpages, but our mask now grabs
+   the whole page each fault, exhausting the L1 coarse-table reserve
+   sooner than expected.
+3. `NewStack` is supposed to allocate the full 64 KB up-front (and
+   does, on Einstein) but the kernel's `MonitorDispatchSWI` path is
+   miscomputing or short-allocating in our run.
+
+### Stage-1 walk evidence (notrace v3 / v4 with enhanced log)
+
+```
+dabt: forwarding to kernel DataAbortHandler — DFSC=0x7 FAR=0x0ccee800 mode=0x17
+  stage1 walk VA=0x0ccee800:  L1[0xcc] = 0x04025481  (coarse)
+    coarse L2 @ PA 0x4025400, L2[0xee] = 0x00000000  (fault)
+
+dabt: forwarding to kernel DataAbortHandler — DFSC=0x5 FAR=0x0cd07400 mode=0x17
+  stage1 walk VA=0x0cd07400:  L1[0xcd] = 0x00000090  (fault)
+    L1 neighbourhood around section 0xcd:
+      L1[0xc9] = 0x0401c481  (coarse)
+      L1[0xca] = 0x0401c081  (coarse)
+      L1[0xcb] = 0x00000090  (fault)
+      L1[0xcc] = 0x04025481  (coarse)
+      L1[0xcd] = 0x00000090  (fault)  ← here
+      L1[0xce] = 0x00000090  (fault)
+      L1[0xcf] = 0x00000090  (fault)
+      L1[0xd0] = 0x00000090  (fault)
+      L1[0xd1] = 0x00000090  (fault)
+```
+
+`0x90` is the kernel's **lazy/unallocated L1 marker** — type=00 (fault) with
+`bits[8:5]=0x4` (domain field set, picking out a fault-monitor domain via
+`GetDomainAndFaultMonitorFromDomainNumber` at ROM 0x1bd39b4) and bit 4 set.
+The kernel fills "reserved-for-future-allocation" sections with this
+pattern at MMU init and grows them coarse-by-coarse on first fault.
+
+`probe/results-717006-90s.txt` (Einstein eventual-state MMU dump)
+shows section 0xCD fully populated as a coarse table with a sparse
+small-page pattern (e.g. `VA 0x0CD07000..0x0CD08000: small pages`).
+Einstein routinely lazy-grows section 0xCD in this run; our run wedges
+on the first attempt.
+
+### Why the kernel can't grow section 0xCD in our run
+
+`DataAbortHandler` (`0x00393114`) dispatches by `DFSR.FS[3:0]` via a
+jump table at PC `0x39329c`:
+
+```
+DFSC=0/2:  0x3932dc  (alignment-ish / fall-through)
+DFSC=1/3:  0x3932fc  (alignment fault)
+DFSC=4:    0x39339c  (page-fault throw)
+DFSC=5/7:  0x393314  ← page/section translation: domain-monitor dispatch
+DFSC=6:    0x39339c
+```
+
+Both DFSC=5 (section translation) and DFSC=7 (page translation) land at
+`0x393314`, so the kernel *intends* to handle both via the same
+`GetDomainAndFaultMonitorFromDomainNumber` lookup. The kernel pulls the
+domain index from `DFSR.bits[7:4]`. For our `L1[0xCD]=0x90`, the domain
+field is 4 (`bits[8:5]=0b0100`), so the kernel will dispatch to
+"domain 4's fault monitor".
+
+The wedge fires at `Fill__15TRefStructStackFv` PC `0x1a4b9c`
+(`str r3, [r1], #4`) where `r1 = self->[0x14]` = the `Fill` write head
+that has just rolled into section 0xCD. **Either** the fault monitor
+for domain 4 is not handling DFSC=5 the same as DFSC=7 in our run,
+**or** something upstream in the kernel's domain-monitor / TStackManager
+path has been perturbed by our `PATCHES_717006::TStackManager::ResolveFault`
+mask=0xF patch (the same patch that resolved the BootOS-canary wedge).
+
+### Suspect: mask=0xF interacts with NewStack-via-MonitorDispatchSWI
+
+`NewStack` (`0x001f8968`) is a thin SWI wrapper over
+`MonitorDispatchSWI` sub-fn 1, which dispatches into the
+TStackManager monitor. With `mask=0xF` we force `ResolveFault` to take
+all four subpages of every faulting page, which fixed BootOS-canary but
+may now starve the lazy-section-grow path of free pages, leaving lazy
+L1 entries (the 0x90 marker) unconverted to coarse.
+
+### Open next steps
+
+1. **Trace what the kernel's domain-monitor does for DFSC=5 vs DFSC=7.**
+   Disassemble the `GetDomainAndFaultMonitorFromDomainNumber` (`0x1bd39b4`)
+   handler chain and verify that domain 4's monitor for "section grow"
+   path is reachable / non-null in our run. Probably involves dumping
+   the relevant `gKernelGlobals` struct at the moment of the second
+   DABT.
+2. **Try reverting `mask=0xF` and add a different fix for the BootOS
+   canary** — maybe a more surgical patch that doesn't perturb the
+   domain-4 fault-monitor invariants. Side branch / experiment.
+3. **Pre-allocate L1 entries in the hypervisor.** When we see the
+   guest's L1[i]=0x90 marker and a DFSC=5 forward, install a coarse
+   L2 table on the kernel's behalf and rewrite the L1 entry to a
+   real coarse type. Brittle — cuts across the kernel's expected
+   domain-monitor flow — but would unblock investigation.
+4. **Cross-check on FVP.** Validate that the same wedge happens
+   identically on FVP — confirms it's kernel-logic-deterministic, not
+   a QEMU-AArch64 banked-reg artefact.
+
+### Reproduction artifacts
+
+`/tmp/phaseB-2026-04-26-reboot/`:
+- `qemu_trace.log` — 240 s trace+quiet boot (633 k traces; doesn't reach
+  canary because tracer overhead pushes the kernel through the flash log
+  scan loop too slowly — only 1409 unique functions hit, ending with
+  `TCardEventHandler::IdleProc` / `VppIdleOff` / `InternalVppIdleOff`).
+- `qemu_trace.firsts` — `awk '/^trace / && !seen[$4]++'` over above.
+  Useful for "what new code did we reach" diff against prior runs.
+- `qemu_notrace.log` — 120 s quiet-only boot, hits the canary at trace
+  ~270k with the original short canary report.
+- `qemu_notrace_v2.log` — same boot with the enhanced `log_dabt_forward`
+  capture; this is the source of the LR_abt/USR_lr breakdown above.
+
+---
+
+## Earlier — TCardMessage-alias wedge resolved by per-page stack allocation (QEMU, 2026-04-26 evening)
 
 **Status:** the BootOS-canary wedge that's been blocking Phase B for
 weeks is resolved. Boot now progresses 2.4× past the previous stall —

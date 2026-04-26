@@ -548,6 +548,25 @@ pub fn dump_stage1_walk(va: u32) {
     }
 }
 
+/// Dump an 8-entry window of L1 around the section index for `va`.
+/// Useful for diagnosing "section translation fault but the L1 entry
+/// has weird bookkeeping bits set" — we want to see whether the
+/// neighbours are coarse / section / fault, and what the lazy-state
+/// pattern looks like across a kernel-allocated VA range.
+pub fn dump_l1_neighbourhood(va: u32) {
+    let ram = addr_of_mut!(GUEST_RAM) as *const u32;
+    let centre = (va >> 20) as i32;
+    kprintln!("    L1 neighbourhood around section {:#x}:", centre);
+    for di in -4..=4 {
+        let i = centre + di;
+        if i < 0 || i >= 4096 { continue; }
+        // SAFETY: index bounds-checked.
+        let e = unsafe { ram.add(i as usize).read() };
+        let ty = match e & 3 { 0=>"fault", 1=>"coarse", 2=>"section", 3=>"fine", _=>"?" };
+        kprintln!("      L1[{:#x}] = {:#010x}  ({})", i, e, ty);
+    }
+}
+
 /// Dump the first 32 entries of the guest's stage-1 L1 page table, which we
 /// assume lives at the start of guest RAM (TTBR0 = 0x0400_0000 per the
 /// 717006 probe; stage-2 maps that IPA to the host ram backing). Each

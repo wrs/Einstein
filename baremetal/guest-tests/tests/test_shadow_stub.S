@@ -24,7 +24,7 @@
     .arch armv7ve
 
     .equ SCRATCH_BASE,       0x04003000   @ 16-byte scratch, word aligned
-    .equ SCRATCH_HI,         0x10003000   @ flash-bank-1 IPA (≥ XOR_LIMIT)
+    .equ SCRATCH_HI,         0x12000000   @ test-only mmio scratch (≥ XOR_LIMIT)
 
     @ === Vector table ===========================================
     .section .text.vectors, "ax"
@@ -419,6 +419,12 @@ subtest_10_conditional:
     fail_st 10
 
     @ ---- subtest 11: MMIO skip (addr >= XOR_LIMIT) ----------------
+    @ SCRATCH_HI points at the test-only MMIO scratch window above
+    @ XOR_LIMIT (`mmio::TEST_SCRATCH`). Byte/halfword/word accesses
+    @ stage-2-fault and route through `mmio::write` / `mmio::read`,
+    @ which round-trips into a 16-byte storage cell. Verifies the
+    @ shadow-stub inline-stub branch that skips the BE-32 XOR for IPAs
+    @ ≥ XOR_LIMIT.
 subtest_11_mmio_skip:
     load_u32 r4, SCRATCH_HI
     mov     r5, #0

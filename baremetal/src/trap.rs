@@ -8,7 +8,7 @@
 //! return — the vector trailer restores the context and ERETs. Handlers that
 //! don't want to resume never return (they call `cpu::halt`).
 
-use crate::{cpu, guest_mem, kprintln, mmio, peripherals::{native_primitives, vic}, platform, shadow_stub, timer};
+use crate::{cpu, guest_mem, kprintln, mmio, peripherals, peripherals::{native_primitives, vic}, platform, shadow_stub, timer};
 
 macro_rules! read_sysreg {
     ($reg:literal) => {{
@@ -384,6 +384,23 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
         return;
     }
 
+    // Direct CPU writes to flash bank addresses are silently dropped
+    // (matching Einstein's `TMemory::WriteP` at `Emulator/TMemory.cpp:1777`,
+    // which logs and returns without touching the backing). The kernel's
+    // flash chip code emits AMD-style command-sequence stores
+    // (e.g. `0xAA` to magic offsets) that on real hardware are absorbed
+    // by the chip's command latches and never reach the storage cells;
+    // on emulation those stores have to be neutralised so the seeded
+    // calibration header (`flash::seed_block`) survives. Mutations the
+    // kernel actually wants to commit go through `TEinsteinFlashDriver`'s
+    // native primitives → `peripherals::flash_driver` → `flash::program_word`
+    // / `flash::erase_block`, which write the host backing directly and
+    // bypass stage-2 entirely.
+    if wnr && peripherals::flash::is_flash_pa(ipa) && drop_flash_write(ctx, iss, elr) {
+        advance_elr(4);
+        return;
+    }
+
     // Phase B diagnostic: log any access from inside the REx-scanner
     // function range with full register context, to understand what
     // addresses it's probing (for pre-MMU first boot).
@@ -551,6 +568,140 @@ fn is_obviously_unreachable_ipa(ipa: u64) -> bool {
     // Inside ROM (stage-2 RO). Any write is doomed.
     if ipa < 0x0100_0000 { return true; }
     false
+}
+
+/// Drop a guest write to the flash bank IPA window. Stage-2 maps the
+/// banks RO to surface AMD-style command-sequence stores (the kernel's
+/// flash chip code emits `0xAA` / `0x55` / `0x80` to magic offsets);
+/// Einstein's `TMemory::WriteP` ignores them, so we do too.
+///
+/// For ISV=1 syndromes (simple LDR/STR-immediate without writeback):
+/// nothing to update on the guest side, just advance ELR.
+///
+/// For ISV=0 syndromes (writeback or register-offset addressing): we
+/// fetch the instruction at ELR, decode the destination register and
+/// any base-register writeback, and update Rn so the kernel observes
+/// the same post-instruction CPU state it would have if the store had
+/// been silently absorbed by the flash chip's command latch. The store
+/// itself is dropped.
+///
+/// Returns false on instruction shapes we don't recognise (LDM/STM,
+/// load-exclusive, vector loads, …) so the caller halts loudly. Drop
+/// in fresh forms here as the kernel turns out to use them.
+fn drop_flash_write(ctx: &mut TrapContext, iss: u32, elr: u32) -> bool {
+    let isv = (iss >> 24) & 1;
+    if isv != 0 {
+        // Simple LDR/STR-immediate or LDR/STR-byte/halfword without
+        // writeback — no register state changes besides the (dropped)
+        // memory store. Caller advances ELR.
+        return true;
+    }
+
+    // ISV=0: writeback or unusual addressing. Decode the faulting
+    // instruction enough to apply the writeback to Rn (if any).
+    let insn = match guest_mem::read_word_va(elr) {
+        Some(v) => v,
+        None => return false,
+    };
+
+    // STR (immediate, A1): cond 010 P U B W L Rn Rt imm12, L=0.
+    // Word B=0, byte B=1. Writeback when (P=0) || (W=1).
+    if (insn & 0x0E10_0000) == 0x0400_0000 {
+        let p = (insn >> 24) & 1 != 0;
+        let u = (insn >> 23) & 1 != 0;
+        let w = (insn >> 21) & 1 != 0;
+        let rn = ((insn >> 16) & 0xF) as usize;
+        let imm12 = insn & 0xFFF;
+        if rn == 15 {
+            return false;
+        }
+        let writeback = (!p) || w;
+        if writeback {
+            let signed_off: i32 = if u { imm12 as i32 } else { -(imm12 as i32) };
+            let pre_rn = ctx.x[rn] as u32;
+            ctx.x[rn] = pre_rn.wrapping_add(signed_off as u32) as u64;
+        }
+        return true;
+    }
+
+    // STRH (immediate, A1): cond 000 P U 1 W 0 Rn Rt imm4H 1011 imm4L.
+    // imm = (imm4H << 4) | imm4L. Writeback when (P=0) || (W=1).
+    if (insn & 0x0E40_00F0) == 0x0040_00B0 {
+        let p = (insn >> 24) & 1 != 0;
+        let u = (insn >> 23) & 1 != 0;
+        let w = (insn >> 21) & 1 != 0;
+        let rn = ((insn >> 16) & 0xF) as usize;
+        let imm = ((insn >> 4) & 0xF0) | (insn & 0xF);
+        if rn == 15 {
+            return false;
+        }
+        let writeback = (!p) || w;
+        if writeback {
+            let signed_off: i32 = if u { imm as i32 } else { -(imm as i32) };
+            let pre_rn = ctx.x[rn] as u32;
+            ctx.x[rn] = pre_rn.wrapping_add(signed_off as u32) as u64;
+        }
+        return true;
+    }
+
+    // STR (register, A1): cond 011 P U B W L Rn Rt imm5 type Rm, L=0.
+    // Bit 4 must be 0 (else it's a register-shift form we don't decode).
+    if (insn & 0x0E10_0010) == 0x0600_0000 {
+        let p = (insn >> 24) & 1 != 0;
+        let u = (insn >> 23) & 1 != 0;
+        let w = (insn >> 21) & 1 != 0;
+        let rn = ((insn >> 16) & 0xF) as usize;
+        let rm = (insn & 0xF) as usize;
+        let imm5 = (insn >> 7) & 0x1F;
+        let shift_type = (insn >> 5) & 0x3;
+        if rn == 15 || rm == 15 {
+            return false;
+        }
+        let writeback = (!p) || w;
+        if writeback {
+            let rm_val = ctx.x[rm] as u32;
+            let shifted = arm_shift(rm_val, shift_type, imm5);
+            let pre_rn = ctx.x[rn] as u32;
+            let post_rn = if u {
+                pre_rn.wrapping_add(shifted)
+            } else {
+                pre_rn.wrapping_sub(shifted)
+            };
+            ctx.x[rn] = post_rn as u64;
+        }
+        return true;
+    }
+
+    false
+}
+
+/// ARMv7 immediate-shift evaluation for the `imm5/type` field of LDR/STR
+/// register-offset forms. The carry-out is unused here (we only need the
+/// shifted value for address arithmetic).
+fn arm_shift(value: u32, shift_type: u32, imm5: u32) -> u32 {
+    match shift_type {
+        // LSL
+        0 => value.wrapping_shl(imm5),
+        // LSR — imm5==0 means shift by 32, yielding 0
+        1 => if imm5 == 0 { 0 } else { value.wrapping_shr(imm5) },
+        // ASR — imm5==0 means shift by 32 (sign extend)
+        2 => {
+            if imm5 == 0 {
+                ((value as i32) >> 31) as u32
+            } else {
+                ((value as i32).wrapping_shr(imm5)) as u32
+            }
+        }
+        // ROR / RRX — imm5==0 is RRX (one-bit rotate through carry); we
+        // don't have carry here, so approximate with a logical right-1.
+        _ => {
+            if imm5 == 0 {
+                value >> 1
+            } else {
+                value.rotate_right(imm5)
+            }
+        }
+    }
 }
 
 fn aarch32_mode_label(mode: u32) -> &'static str {

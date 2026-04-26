@@ -35,25 +35,27 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
             subfn, pc, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32
         );
     }
+    // Subfn arms below mirror Einstein's `ExecuteSoundDriverNative`
+    // (`Emulator/TNativePrimitives.cpp:1062-1400`) one-for-one. The
+    // Newton kernel picks `case 0x03` first; once it sees
+    // `kError_SoundHardware_NoHardware` it skips most of the rest of
+    // the sound bring-up, so the boot path to `TInterpreter` doesn't
+    // exercise the delegating subfns. Each "STUB" comment is a
+    // deviation from Einstein we accept on that basis — convert them
+    // to real implementations once the kernel actually drives them.
     match subfn {
-        // SetSoundHardwareInfo: return -30009 to tell the kernel there's
-        // no configurable sound hardware. Einstein's default path.
+        // 0x03 SetSoundHardwareInfo — Einstein returns -30009 to tell
+        // the kernel there's no configurable sound hardware. Verbatim.
         0x03 => {
             ctx.x[0] = ERR_NO_SOUND_HARDWARE as u64;
         }
 
-        // GetSoundHardwareInfo: Einstein writes a 7-word info struct at
-        // [r1] and returns 0. The Newton kernel reads the struct after
-        // the call; returning r0=0 without writing it leaves the struct
-        // holding whatever the heap allocator left there, which may
-        // steer the kernel into an unexpected sample-rate / buffer-size
-        // path during sound subsystem startup.
-        // Einstein source: TNativePrimitives.cpp:1099-1109.
+        // 0x04 GetSoundHardwareInfo — Einstein writes a 7-word info
+        // struct at [r1] and returns 0. The 0x54600000 at +0x0c is a
+        // 32-bit fixed-point sample-rate value the Newton driver
+        // expects. Einstein source: TNativePrimitives.cpp:1093-1110.
         0x04 => {
             let info_addr = ctx.x[1] as u32;
-            // Constants from Einstein. The 0x54600000 at +0x0c is a
-            // 32-bit fixed-point sample-rate value the Newton driver
-            // expects.
             let words: [(u32, u32); 7] = [
                 (0x00, 0x00000001),
                 (0x04, 0x00000001),
@@ -75,17 +77,141 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
             ctx.x[0] = 0;
         }
 
-        // The rest of the sound driver — buffer setup, volume, power,
-        // enable/disable — all no-op with r0=0 in Einstein.
-        0x05 | 0x06 | 0x07 | 0x08 | 0x09 | 0x0A | 0x0B | 0x0C
-        | 0x0D | 0x0E | 0x0F
-        | 0x10 | 0x11 | 0x12 | 0x13 | 0x14 | 0x15 | 0x16 | 0x17
-        | 0x18 | 0x19 | 0x1A | 0x1B | 0x1C | 0x1D | 0x1E => {
+        // 0x05 SetOutputBuffers(r1, r2, r3, [sp+4]) — Einstein
+        // (TNativePrimitives.cpp:1112-1132) stores
+        //   mSoundOutputBuffer1Addr = r1
+        //   mSoundOutputBuffer2Addr = r3
+        // for subfn 0x07 to read back. STUB: we drop both addresses;
+        // the matching 0x07 below also no-ops, so nothing reads them.
+        0x05 => {
             ctx.x[0] = 0;
         }
 
-        // NativeSetInterruptMask(r1, r2) — Einstein delegates to
-        // mSoundManager->SetInterruptMask and leaves r0 unchanged.
+        // 0x06 SetInputBuffers — Einstein logs only and returns 0.
+        // (TNativePrimitives.cpp:1134-1149.) Verbatim.
+        0x06 => {
+            ctx.x[0] = 0;
+        }
+
+        // 0x07 ScheduleOutputBuffer(r1=which, r2=amount) — Einstein
+        // (TNativePrimitives.cpp:1151-1172) picks
+        // `mSoundOutputBuffer{1,2}Addr` per `r1` and calls
+        // `mSoundManager->ScheduleOutputBuffer(buffer, amount)`. STUB:
+        // no host sound backend, no scheduled playback; the buffer
+        // address from 0x05 was never stored anyway.
+        0x07 => {
+            ctx.x[0] = 0;
+        }
+
+        // 0x08 ScheduleInputBuffer — Einstein logs only and returns 0.
+        // (TNativePrimitives.cpp:1174-1183.) Verbatim.
+        0x08 => {
+            ctx.x[0] = 0;
+        }
+
+        // 0x09..0x0C PowerOutputOn / PowerOutputOff / PowerInputOn /
+        // PowerInputOff — Einstein logs only and returns 0 for all
+        // four (TNativePrimitives.cpp:1185-1217). Verbatim.
+        0x09 | 0x0A | 0x0B | 0x0C => {
+            ctx.x[0] = 0;
+        }
+
+        // 0x0D StartOutput — Einstein calls
+        // `mSoundManager->StartOutput()` and returns 0
+        // (TNativePrimitives.cpp:1219-1226). STUB: no host sound.
+        0x0D => {
+            ctx.x[0] = 0;
+        }
+
+        // 0x0E StartInput — Einstein logs only and returns 0
+        // (TNativePrimitives.cpp:1228-1234). Verbatim.
+        0x0E => {
+            ctx.x[0] = 0;
+        }
+
+        // 0x0F StopOutput — Einstein calls
+        // `mSoundManager->StopOutput()` and returns 0
+        // (TNativePrimitives.cpp:1236-1243). STUB: no host sound.
+        0x0F => {
+            ctx.x[0] = 0;
+        }
+
+        // 0x10 StopInput — Einstein logs only and returns 0
+        // (TNativePrimitives.cpp:1245-1251). Verbatim.
+        0x10 => {
+            ctx.x[0] = 0;
+        }
+
+        // 0x11 OutputIsEnabled, 0x12 InputIsEnabled — Einstein logs
+        // only and returns 0 (TNativePrimitives.cpp:1253-1267).
+        // Verbatim.
+        0x11 | 0x12 => {
+            ctx.x[0] = 0;
+        }
+
+        // 0x13 OutputIsRunning — Einstein returns
+        // `mSoundManager->OutputIsRunning()` (TNativePrimitives.cpp:
+        // 1269-1275). STUB: no host sound, so nothing is running.
+        0x13 => {
+            ctx.x[0] = 0;
+        }
+
+        // 0x14 InputIsRunning, 0x15 CurrentOutputPtr,
+        // 0x16 CurrentInputPtr — Einstein logs only and returns 0
+        // (TNativePrimitives.cpp:1277-1299). Verbatim.
+        0x14 | 0x15 | 0x16 => {
+            ctx.x[0] = 0;
+        }
+
+        // 0x17 OutputVolume(r1) — Einstein calls
+        // `mSoundManager->OutputVolume(r1)` and returns 0
+        // (TNativePrimitives.cpp:1301-1310). STUB: no host sound;
+        // the requested volume is dropped.
+        0x17 => {
+            ctx.x[0] = 0;
+        }
+
+        // 0x18 OutputVolume getter — Einstein returns
+        // `mSoundManager->OutputVolume()` (TNativePrimitives.cpp:
+        // 1312-1318). STUB: no host sound; we report 0.
+        0x18 => {
+            ctx.x[0] = 0;
+        }
+
+        // 0x19 InputVolume(r1) — Einstein clamps r1 to 0xFF and
+        // stores it in `mInputVolume`, returns 0
+        // (TNativePrimitives.cpp:1320-1336). STUB: dropped; pairs
+        // with 0x1A reading 0 below.
+        0x19 => {
+            ctx.x[0] = 0;
+        }
+
+        // 0x1A InputVolume getter — Einstein returns the cached
+        // `mInputVolume` set by 0x19 (TNativePrimitives.cpp:1338-1344).
+        // STUB: we never stored it, so report 0.
+        0x1A => {
+            ctx.x[0] = 0;
+        }
+
+        // 0x1B EnableExtSoundSource, 0x1C DisableExtSoundSource —
+        // Einstein logs only and returns 0 (TNativePrimitives.cpp:
+        // 1346-1360). Verbatim.
+        0x1B | 0x1C => {
+            ctx.x[0] = 0;
+        }
+
+        // 0x1D OutputIntHandler, 0x1E InputIntHandler — Einstein
+        // logs only and returns 0 (TNativePrimitives.cpp:1362-1376).
+        // Verbatim.
+        0x1D | 0x1E => {
+            ctx.x[0] = 0;
+        }
+
+        // 0x1F NativeSetInterruptMask(r1=in_mask, r2=out_mask) —
+        // Einstein calls `mSoundManager->SetInterruptMask(r1, r2)`
+        // and explicitly leaves r0 unchanged (no `SetRegister(0,…)`
+        // in TNativePrimitives.cpp:1378-1389). STUB: no host sound,
+        // mask dropped; we mirror the "r0 untouched" detail.
         0x1F => {}
 
         _ => {

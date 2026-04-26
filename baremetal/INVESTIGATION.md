@@ -3,43 +3,141 @@
 Live notes. Update as we learn more; remove old updates as we move on to
 new stalls.
 
-## Currently at — newt-DABT root cause is kernel stack-collision logic, not PCMCIA (QEMU, 2026-04-25 night)
+## Currently at — newt-DABT root cause: kernel stack-collision picks the wrong reuse VA (QEMU, 2026-04-25 night, post-NewtonTrace cross-check)
 
-**Update**: PCMCIA chip-detect fix landed (see "Resolved — PCMCIA
-controller chip-detect" below). Boot now advances ~25k more trace
-events / 30 more unique functions through `TCardSocket::Init`,
-`TCardSocketState`, `TATAPartitionInfo`, `TCardATALoader`,
-`TGPIOInterface::RegisterInterrupt`, `TCardServer::AddCardHandler`,
-and 4-slot probe of all four PCMCIA sockets. Despite the deeper
-penetration into the boot the recursive "newt" UnhandledException
-still fires at trace ~244k via `__vfprintf` instead of `TUPort::Receive` —
-the underlying kernel-side L2 alias of VA 0x0cc7a000 / VA 0x0cc82000
-both mapping to PA 0x0402a000 persists.
+**Direct comparison with Einstein NewtonTrace + NewtonProbe nailed
+the divergence.** Both implementations end up with PA 0x0402a000
+mapped at multiple VAs — but in Einstein the *other* VAs are
+addresses no code ever writes to, so the alias is benign. In our
+hypervisor's run the second VA is 0x0cc82000, which the
+`TCardServer::TCardServer` allocation array writes a chain of
+TCardMessages into via `__vc__FPvT1iPFPv_v` (the C++ array
+constructor at ROM 0x34502c). Those writes corrupt pckm's saved
+stack at PA 0x0402a248, which is where pckm resumes on its next
+schedule.
 
-The page alias is *not* triggered by the chip-detect failure path
-(otherwise fixing it would have prevented the alias). It's set up
-inside `TStackManager::CopyPagesAfterStackCollided` regardless of
-which boot trajectory leads there. So the alias is the kernel's
-intentional stack-recycle behavior; the wedge is that pckm resumes
-on its now-aliased stack while Einstein has pckm BLK at this point
-(see "Einstein-vs-hypervisor task census" below). The divergence
-that determines whether pckm wakes up vs. stays blocked is the next
-thing to chase — likely a missing IRQ delivery or message-port
-state our driver layer isn't keeping in sync with Einstein's.
+### Cross-implementation evidence (NewtonProbe / NewtonTrace, 2026-04-25)
+
+Built `NewtonTrace` (`baremetal/probe/trace.cpp`) and ran the same
+ROM 100 s wall under Einstein. Boot reaches **7.6 M trace events /
+3551 unique functions**, deep into `TSCPLoader / TEndpointPipe /
+TFramedAsyncSerTool / TCircleBuf` — no DABT, boot is healthy.
+
+Aggregate page-table activity over the same run:
+
+| metric | Einstein 100 s | hypervisor 100 s |
+|---|---|---|
+| `CopyPagesAfterStackCollided` calls | 100 | 4 |
+| `AddPgPAndPerm` calls (total) | 1083 | (smaller) |
+| `AddPgPAndPerm` with PA = 0x0402a000 | 23 | 7 |
+| `CopyPhysicalPage` with dst PA = 0x0402a000 | 1 | 2 |
+| TCardMessage allocations | 62 | 61 |
+| TCardAsyncMsg allocations | 38 | 48 |
+| `SwapInGlobals` for pckm (0xc118dd8) | 275 | (many) |
+
+Einstein resuses PA 0x0402a000 for many different VAs over the run
+(0x0cc7a000 for pckm initially, then 0x0cca3000 and 0x0ccac000 in
+later remappings). Our hypervisor reuses it for VA 0x0cc7a000,
+0x0cc79000, and **0x0cc82000** — and 0x0cc82xxx is exactly where
+the kernel's TCardServer constructor places its 184-byte
+TCardAsyncMsg array (62 elements spanning 0x0cc7fxxx..0x0cc82xxx,
+allocated via `__vc__FPvT1iPFPv_v` at ROM 0x34502c, called from
+`TCardServer::TCardServer` at lr=0x000529a0 — see trace 180956).
+
+`TCardMessage::TCardMessage` at ROM 0x4ed3c..0x4ed48 stores the
+ASCII fourcc literals `'newt'` (0x6e657774) at `*(self+0)` and
+`'cdsv'` (0x63647376) at `*(self+4)`. For the message instance
+allocated at VA 0x0cc82250, those stores land at PA 0x0402a250 /
+0x0402a254 — exactly pckm's `sp_usr+8 / sp_usr+12` save slots.
+
+### Why the same alias in Einstein doesn't crash
+
+In both runs the running task at the destructive `CopyPhysicalPage`
+is **STKU** (`0x0c113dd8`), and pckm's saved sp_usr is `0x0cc7a248`
+with stage-1 walk → PA 0x0402a248. Pckm task struct, save area,
+and L1/L2 for that VA range are *bit-identical* across
+implementations.
+
+The divergence is **which other VA the kernel maps to PA
+0x0402a000**:
+
+```
+                         our run             Einstein
+init pckm stack          AddPgPAndPerm       AddPgPAndPerm
+  trace ours / Einstein  55088               49142
+  VA / PA                0x0cc7a000 → PA     0x0cc7a000 → PA
+                         0x0402a000           0x0402a000
+
+reuse #1 of PA 0x0402a000:
+  trace                  156706              145256
+  VA                     0x0cc82000          0x0cca3000   <-- different VA
+  caller (RememberMapping r1) same path, same TPhys id 0x176b/0x176b
+
+reuse #2 of PA 0x0402a000:
+  trace                  163684              150438
+  VA                     0x0cc79000          0x0ccac000   <-- different VA
+```
+
+Einstein's reuse VAs (0x0cca3000, 0x0ccac000) are heap addresses no
+code writes to. Our reuse VA (0x0cc82000) is in the user-RAM range
+the TCardAsyncMsg array constructor *will* fill — the allocator's
+`new(184)` chain wrote sequentially up to 0x0cc82520, painting
+'newt'/'cdsv' over PA 0x0402a000+0x250 along the way.
+
+### Why the kernel chooses a different VA
+
+The reuse VA is determined by the `TStackInfo` / `TStackPage` pair
+the kernel passes to `CopyPagesAfterStackCollided`. The `r1` arg
+(`r1 = ldr [params+16]`) is the destination StackPage; its
+`vaddr_base + sub_page << 12` becomes the new VA. So the
+divergence is **which TStackPage the kernel picks as the source
+of the migration**, which depends on which user-task hit a stack
+collision at that moment.
+
+`SwapInGlobals` data shows STKU is running at the moment in both
+runs. But the stack-collision parameters differ — one of the
+upstream `TStackManager::ResolveFault` paths is selecting a
+different `TStackInfo` because heap state diverged earlier in
+boot. The `r2` ID passed to the second `GetPhys` (per
+`CopyPagesAfter` at 0x1f7610) lookup is **0x000013cb** in our run
+vs **0x0000160b** in Einstein — different TPhys descriptors, even
+though both eventually resolve to PA 0x0402a000.
+
+So the chain is:
+
+  our heap state at trace ~156k diverges from Einstein's
+  → kernel picks TStackPage X (with TPhys id 0x13cb) as collision
+    source instead of TStackPage Y (id 0x160b)
+  → CopyPagesAfter remaps VA 0x0cc82000 → PA 0x0402a000
+    instead of VA 0x0cca3000 → PA 0x0402a000
+  → TCardServer's later allocator fills VA 0x0cc82000
+  → corrupts pckm's saved stack at PA 0x0402a250
+  → pckm resumes, reads `newt`/`cdsv` from sp_usr+8/+12,
+    DataAbortHandler fires, recursive abt → "warm reboot!"
 
 ### Open next steps
 
-1. Confirm Einstein's boot also walks through
-   `TStackManager::CopyPagesAfterStackCollided` for the 0x0cc7a000
-   ↔ 0x0cc82000 pair (probe the L2 entries at trace point ~156100
-   equivalent). If yes, the alias itself is benign and the wedge
-   is purely about pckm scheduling.
-2. Compare gPort waiter queues at the moment of the wedge: which
-   port is pckm blocked on in Einstein, and does our hypervisor
-   ever post a message to that port that wakes it up wrongly?
-3. Resolve the GPIO `0x0F18_DC00` / `0x0F18_E000` reads to ensure
-   we're not silently zero-ing a register the kernel needs to see
-   the previous setting of.
+1. Identify what makes our hypervisor pick TPhys id 0x13cb vs
+   Einstein's 0x160b at the collision point. Both are type-0xb
+   ("Phys" = 9, plus another type bit?). Trace `TPageManager` /
+   `TUDomainManager::Get` calls earlier in boot to see which
+   TPhys descriptors get allocated to which VAs — the divergence
+   should propagate from a different `RememberMapping` call ~5–10
+   k traces before the collision.
+2. Add a `phys_dump` walker (mirroring `task_dump` but for type-9
+   gObjectTable entries) to both `baremetal/src/task_dump.rs` and
+   `baremetal/probe/probe.cpp`. Walk it at a matched boot phase
+   on both sides and diff the {id → PA} mapping. The divergent
+   TPhys at the moment the collision is detected is the smoking
+   gun.
+3. Consider an early-boot `RememberMapping` audit: capture a
+   sequence of (caller_pc, va, tphys_id) tuples from each run and
+   diff. The first divergence tells us which kernel function got
+   different inputs.
+4. As an upstream / bisecting check, run `NewtonTrace` with a
+   smaller wall-clock window (10 s) so the trace size is
+   manageable, then compare the early-boot AddPgPAndPerm sequences
+   directly.
 
 ---
 

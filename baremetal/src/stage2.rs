@@ -455,11 +455,33 @@ unsafe fn install_tick_page() {
 pub mod tick_page {
     use super::*;
 
-    /// Write the current `vic::ticks()` value into the tick-register
-    /// offset of `TICK_PAGE`. The caller is expected to run this in an
-    /// EL2 context; DSBs ensure the store is visible to the guest via
-    /// Normal-WB stage-2 coherency before the next ERET.
+    /// Sync-trap path: advance synthetic ticks, poll match crossings,
+    /// and republish the non-trapping tick / calendar registers.
+    /// Called from `trap_sync_lower_aarch32` after every guest sync
+    /// trap. The `tick_advance` here is what makes the tick rate track
+    /// guest progress rather than wall clock — see
+    /// `vic::SYNTH_TICKS`.
+    pub fn update_from_sync_trap() {
+        crate::peripherals::vic::tick_advance();
+        publish();
+    }
+    /// Heartbeat path: do NOT advance ticks ourselves (so the heartbeat
+    /// can detect "no guest progress" by SYNTH_TICKS being unchanged).
+    /// Just poll matches and republish. Forward-progress fast-forward
+    /// is handled in `vic::heartbeat_forward_progress`, called from
+    /// `timer::on_irq` before this.
+    pub fn update_from_heartbeat() {
+        publish();
+    }
+    /// Back-compat shim — older call sites that don't yet distinguish
+    /// path. New code should use `update_from_sync_trap` /
+    /// `update_from_heartbeat` directly.
     pub fn update() {
+        update_from_sync_trap();
+    }
+    fn publish() {
+        crate::peripherals::vic::poll_timer_matches();
+        crate::peripherals::vic::poll_alarm();
         let ticks = crate::peripherals::vic::ticks();
         let calendar = crate::peripherals::vic::calendar_seconds();
         // SAFETY: TICK_PAGE is a statically allocated 4 KiB-aligned

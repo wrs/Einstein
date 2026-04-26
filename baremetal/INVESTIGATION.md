@@ -3,7 +3,161 @@
 Live notes. Update as we learn more; remove old updates as we move on to
 new stalls.
 
-## Currently at — root cause: trace+UDF wall-clock skew, not heap state (QEMU, 2026-04-25 late evening)
+## Currently at — instruction-anchored ticks land; heap allocator now matches Einstein bit-for-bit (QEMU, 2026-04-26)
+
+**Status:** the timing-induced divergence identified in the prior section
+is fully closed. Newton-tick advancement is now decoupled from host
+wall clock and tied to guest sync-trap progress. Heap allocator state
+(`SSafeHeapPage::Alloc` arg sequences) is now byte-identical to
+Einstein's first 1063 calls. Boot trajectory tracks Einstein within
+~600 trace events through the residual `newt-DABT` wedge.
+
+The remaining divergence is **stage-1 page-table state**: even with
+identical heap allocations and identical `TCardMessage` VAs
+(0x0cc7fd70 → 0x0cc800a0 → … in lockstep with Einstein), the kernel's
+`TStackManager`/`TPageManager` decisions about which PA backs which VA
+differ — our run aliases pckm's stack PA into the `0x0cc80xxx` range
+where Einstein doesn't, and the alias-write still corrupts pckm's
+saved frame and triggers the recursive newt DABT.
+
+### What changed
+
+`src/peripherals/vic.rs`, `src/stage2.rs`, `src/timer.rs`:
+
+1. **`vic::SYNTH_TICKS`** — synthetic 32-bit Newton-tick counter,
+   replaces the old wall-clock-anchored `vic::ticks()`. Advanced only
+   by `tick_advance_sync_trap` (Δ_sync = 6 per guest sync trap) and
+   `tick_advance_heartbeat` (Δ_heartbeat = 1024 per CNTHP heartbeat).
+   `LAST_TICKS` ratchet is gone — fetch_add is monotonic by
+   construction.
+2. **`tick_page::update_from_sync_trap`** — sync-trap path. Bumps
+   ticks by Δ_sync, polls VIC matches, republishes the tick / calendar
+   pages.
+3. **`tick_page::update_from_heartbeat`** — heartbeat path. Just
+   republishes; does *not* bump ticks itself, so the no-progress
+   detector below sees a clean signal.
+4. **`vic::heartbeat_tick_update`** — runs from `timer::on_irq`.
+   Bumps ticks by Δ_heartbeat (so non-trapping busy-waits make
+   progress), and *additionally* fast-forwards SYNTH_TICKS past any
+   pending VIC match deadline if no sync trap has fired since the
+   prior heartbeat — i.e., the guest is parked in WFI or a long
+   non-trapping loop. Detection is "SYNTH_TICKS unchanged from the
+   value after last heartbeat update".
+5. **`timer::rearm`** — drops the wall-anchored
+   `newton_ticks_to_cntpct` translation. CNTHP arms a fixed 16 ms
+   heartbeat only; VIC matches are polled at sync-trap granularity
+   instead, which is plenty fine for the kernel's preemption / alarm
+   cadence.
+
+Calendar / RTC stays wall-clock-anchored (read of CNTPCT in
+`vic::calendar_seconds`); the kernel's tick-domain math no longer
+agrees with calendar seconds, but RTC semantics aren't load-bearing
+for boot.
+
+### Calibration (NEWTON_TICK_HZ irrelevant under synthetic clock)
+
+| | Δ_sync | Δ_heartbeat | TaskKillSelf #2 trace | Δ vs Einstein |
+|--|--|--|--|--|
+| wall-anchored (prev) | n/a | n/a | 54 368 | -77 035 |
+| Δ_sync 8, Δ_h 4096 | 8 | 4 096 | 113 043 | -18 360 |
+| Δ_sync 6, Δ_h 4096 | 6 | 4 096 | 113 501 | -17 902 |
+| **Δ_sync 6, Δ_h 1024** | **6** | **1 024** | **130 813** | **-590** |
+
+Δ_sync = 6 derives from Einstein's BIO chip-detect loop (65 polls
+across a 400-tick threshold ≈ 6.15 ticks/poll). Δ_heartbeat = 1024 is
+the smallest value that keeps `BootOS::SafeShortTimerDelay` (an
+11 058-tick non-trapping busy-wait) finishing in ≤ 11 heartbeats
+≈ 176 ms wall.
+
+### Boot trajectory side-by-side (post-fix QEMU vs Einstein 200 k)
+
+| event | ours | Einstein | Δ |
+|---|---|---|---|
+| TaskKillSelf #1 (r2=0x0c111c98) | 38 472 | 39 065 | -593 |
+| TUTask::Start #4 (r0=0x0c310338) | 53 502 | 54 095 | -593 |
+| TUTask::Start #5 (r0=0x0c601320) | 130 416 | 131 006 | -590 |
+| TaskKillSelf #2 (r2=0x0c310274) | 130 813 | 131 403 | -590 |
+| TUTask::Start #6 (r0=0x0c601348) | 134 029 | 134 619 | -590 |
+| TUTask::Start #7 (r0=0x0cc825e0) | 137 594 | 138 184 | -590 |
+| TCardMessage at 0x0cc7fd70 | 170 066 | 170 433 | -367 |
+| TCardMessage at 0x0cc800a0 | 170 321 | 170 663 | -342 |
+
+Identical args, ~600-trace head start that grows to ~340 by trace
+170 k. **`SSafeHeapPage::Alloc`'s first 1063 calls are byte-identical
+in r0/r1/r2** between our run and Einstein's same window. Same heap
+allocation order = same `__nw__FUi` returns = same VAs.
+
+PreEmptiveTimerInterruptHandler now fires **0 times** in our 187 k
+window (Einstein: 1× at trace 228 k). That's a 13× reduction from the
+wall-anchored baseline.
+
+### What's left — stage-1 PA-recycle decision still differs
+
+`TCardMessage` allocations land at the same VAs in both runs, but the
+PA backing those VAs differs:
+
+- Einstein: VAs 0x0cc7fd70 / 0x0cc80xxx / 0x0cc82250 each get fresh
+  PAs from `TPageManager::Get`. Pckm's stack at PA 0x0402a000 stays
+  uniquely mapped at VA 0x0cc7a000.
+- Ours: at least one of the `0x0cc80xxx` VAs gets PA 0x0402a000
+  recycled into it (via `TStackManager::CopyPagesAfterStackCollided`
+  or similar). The TCardMessage write at that VA paints
+  `'newt'`/`'cdsv'` over pckm's saved frame at PA 0x0402a000+0x250 →
+  pckm resumes → recursive DABT → BootOS canary.
+
+Boot now wedges at trace 170 479 (ours) while writing the
+0x0cc80bc8 TCardMessage. Same allocation chain Einstein survives at
+trace 170 466.
+
+### Possible next steps
+
+The remaining bug is **PA-recycle order in `TStackManager`**.
+Heap-allocator drift was the timing-induced piece; this is the
+underlying TPhys / TStackPage selection logic.
+
+1. **`AddPgPAndPerm` audit.** Hook a counter on every
+   `AddPgPAndPerm(VA, PA)` call and dump the (VA, PA) pair to a log.
+   Compare the first call where (VA, PA) differs between our run and
+   Einstein's NewtonTrace. That's the upstream divergence in
+   stage-1 page-table state.
+2. **`TPageManager::Get` / `TPhys` selection.** The kernel's TPhys
+   pool returns recycled PAs in some order. If our `gPhysAllocator`
+   (TPhys table at 0xc1082a0) state differs from Einstein's at the
+   moment of the divergent `AddPgPAndPerm`, that's the cause.
+3. **Hypervisor-side state we touch differently.** The two
+   implementations have different stage-2 page-table layouts; though
+   the kernel doesn't see stage 2 directly, *which* PAs the kernel's
+   TPhys allocator sees as "free" depends on what RAM regions the
+   hypervisor has carved out. Cross-check
+   `gPhysAllocator`'s 39 RAM-page TPhys descriptors against our
+   `stage2::init` PA layout.
+
+### Files changed
+
+- `src/peripherals/vic.rs` — `SYNTH_TICKS`, `tick_advance_sync_trap`,
+  `tick_advance_heartbeat`, `heartbeat_tick_update`,
+  `next_pending_match` retained for the heartbeat fast-forward path.
+- `src/stage2.rs` — `tick_page::update_from_sync_trap` /
+  `update_from_heartbeat` split.
+- `src/timer.rs` — `rearm` simplified to a 16 ms heartbeat;
+  `newton_ticks_to_cntpct` removed; `on_irq` calls
+  `vic::heartbeat_tick_update` then `update_from_heartbeat`.
+
+All 35 guest tests still pass.
+
+### Reproduction artifacts
+
+`/tmp/phaseB-2026-04-25/`:
+
+- `qemu_synth7.log` — current state (Δ_sync = 6, Δ_h = 1024).
+- `qemu_synth7.alloc` — `SSafeHeapPage::Alloc` arg sequence;
+  `diff einstein.alloc qemu_synth7.alloc` is empty for the first
+  1063 calls.
+- Older runs in same dir for regression comparison.
+
+---
+
+## Earlier — root cause: trace+UDF wall-clock skew, not heap state (QEMU, 2026-04-25 late evening)
 
 **New diagnostic data from a fresh QEMU+Einstein NewtonTrace pair plus
 trace-PC and heap-allocation diffs.** The residual newt-DABT divergence

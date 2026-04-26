@@ -72,7 +72,8 @@ If it's another kind of failure:
 | 2026-04-25 | ~108 k | recursive DABT in TStackInfo::Init | flash recovery path eliminated |
 | 2026-04-25 | ~145 k | newt-DABT alias narrows to scheduling order | IRQ-rate + tick-page divergence fixed |
 | 2026-04-26 | ~170 k | BootOS canary entry #2 (R0=0x0cc80c80) — `name`-task stack-overrun corrupts neighbour task on shared PA | **fixed** via 3-instruction ROM patch that forces per-page stack allocation in `TStackManager::ResolveFault` (mask=0xF) |
-| 2026-04-26 (current) | 403 k+ | `Reboot` canary (kernel-driven self-reboot, R0=0xffffd8a5, LR=0x000d9888) — UnhandledException in user-mode flash-driver work | open |
+| 2026-04-26 | 403 k+ | `Reboot` canary (kernel-driven self-reboot, R0=0xffffd8a5, LR=0x000d9888) — UnhandledException in user-mode flash-driver work | superseded by next row |
+| 2026-04-26 (current) | ~270 k notrace | `Reboot` canary inside `TInterpreter::TInterpreter` (Phase B goal **reached**!) — fails on lazy-L1 section grow during `TRefStructStack::Fill` (DFSC=5 at FAR=0x0cd07400, L1[0xCD]=0x90 lazy marker) | open |
 
 See `INVESTIGATION.md` for the full chain of analysis on each.
 

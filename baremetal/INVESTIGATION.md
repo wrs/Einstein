@@ -3,7 +3,108 @@
 Live notes. Update as we learn more; remove old updates as we move on to
 new stalls.
 
-## Currently at — flash recovery path eliminated; newt-DABT alias still present (QEMU, 2026-04-25 late night)
+## Currently at — IRQ-rate + tick-page divergence fixed; newt-DABT alias narrows to scheduling order (QEMU, 2026-04-25 night)
+
+**Status:** Two upstream divergences vs Einstein eliminated. Both
+emerged from comparing per-trace function-set diffs against a fresh
+NewtonTrace baseline.
+
+### Fix 1 — `NEWTON_TICK_HZ` reduced from `× 16` to natural rate
+
+`src/platform/raspi3b.rs::NEWTON_TICK_HZ` was `3_686_400 * 16`. The
+multiplier was originally `× 128` (df05e998) to keep BootOS calibration
+loops fast; reduced to `× 16` (579a2c72) when the alarm engine couldn't
+keep up. Cross-check against Einstein in the first 130k trace events
+showed our boot taking **107 timer IRQs** while Einstein took **0**:
+the ×16 wall-clock-anchored tick rate made every kernel-armed
+`match_reg` cross its deadline in ~1/16 of the wall time the kernel
+intended, firing a flood of `PreEmptiveTimerInterruptHandler` /
+`SetAlarm{,1,Atomic}` / `RestartTimerOverflowDetect` calls that each
+allocated from the safe heap and perturbed subsequent allocations.
+Setting the multiplier to `× 1` (= natural 3.6864 MHz, matching FVP
+and matching what `kFreqGenFreq` constants throughout the kernel
+assume) drops IRQ count to 12 in 130k events. All 35 guest tests
+still pass — the comment's worry about early-boot calibration loops
+turned out to be unfounded once the `tick_page` heartbeat was in
+place.
+
+### Fix 2 — refresh `TICK_PAGE` on every sync-trap exit
+
+`K_HDWR_TICKS` (0x0F181800) is mapped non-trapping via the RAM-backed
+`TICK_PAGE`, and `tick_page::update()` was only called from
+`timer::on_irq` (≈ every 16 ms heartbeat). Tight delay loops like
+`TSerialNumberROM::Init` at 0x1dd8d0 (1-Wire bit-bang protocol with
+a `cmp r0, #20` deadline = 5.4 µs natural) read the cached page —
+which stays constant between heartbeats — so each loop runs ~heartbeat
+wall time regardless of the requested delay. On QEMU TCG with the
+tracer feature each `GetHardwareTime` HVC adds 30+ µs of overhead,
+amplifying the iteration count: we ran **11335 polls** through this
+loop versus Einstein's **2698** (4.2× longer), accumulating ~9k
+extra trace events that propagated downstream as scheduling drift.
+
+Adding `crate::stage2::tick_page::update()` at the bottom of
+`trap_sync_lower_aarch32` (after `update_virq`) makes every guest
+sync-trap refresh the cached tick — exactly when the kernel is
+between bursts of work and likely to re-read ticks. Drops the same
+delay loop to **256 polls** (44× reduction), and brings TStackInfo::Init
+#11 from trace 62439 → 50938 (Einstein 53611) and #12 from 133360 →
+121574 (Einstein 125856). Per-trap cache-maintenance cost is one
+`dc cvac` to a single hot line — negligible on a single-core boot.
+
+### What's left — second TaskKillSelf still ~77k traces too early
+
+Even with both fixes, the per-window function-set diff in
+TStackInfo::Init #11..#12 still shows our run taking the
+recycled-TStackInfo path (TForkWorld::~TForkWorld → TaskKillSelf →
+TStackInfo::~TStackInfo → ScavengeAll → recycle slot 0x0c11aad8)
+while Einstein takes the allocate-new path (TStackPage::TStackPage →
+TPageTracker::Take → TPageManager::Get → fresh slot 0x0c117e18).
+Trace counts:
+
+| event | our run | Einstein | Δ |
+|---|---|---|---|
+| 1st TaskKillSelf (r2=0x0c111c98) | 36669 | 39342 | -2673 |
+| 2nd TaskKillSelf (r2=0x0c310274) | 54822 | 131680 | **-76858** |
+
+Both runs schedule the dying task `0x0c11aa88` exactly **58 times**
+before it kills itself — same task, same amount of work. The drift
+is in **how much time elapses between those 58 schedules**: Einstein
+spreads them across 92k traces, ours across 18k. That's because in
+Einstein's window a 5th `TUTask::Start` call has fired (drvl spawning
+another driver task at trace 131283), and Einstein has scheduled two
+extra task structs (`0x0c112e00` = STKF, `0x0c115c00`) that our run
+hasn't reached yet by the time the dying task gets its 58th schedule.
+
+So the remaining gap is: **why don't STKF / 0x0c115c00 get scheduled
+in our run before the dying task finishes?** Open hypotheses:
+
+1. **Some MMIO source we model differently** is suppressing an event
+   that would unblock STKF. Compare what wakes STKF in Einstein and
+   confirm the same wake-event path runs in ours.
+2. **Drvl is making a request earlier in our run** because of timing,
+   getting a faster response from drvr/drvl/PMGR/etc.
+3. **A periodic IRQ Einstein receives that we don't** — even with
+   IRQ count down to 1 in 130k, perhaps a specific source (sound DMA?
+   GPIO?) fires in Einstein in this window.
+
+### Files changed in this session
+
+- `src/platform/raspi3b.rs` — `NEWTON_TICK_HZ = 3_686_400` (was
+  `* 16`); comment updated.
+- `src/trap.rs::trap_sync_lower_aarch32` — added
+  `tick_page::update()` after `update_virq()` so every sync trap
+  refreshes the cached tick value.
+
+### Files preserved from prior session
+
+`src/stage2.rs` flash bank 0/1 RO mapping, `src/trap.rs::drop_flash_write`,
+`src/peripherals/flash.rs::is_flash_pa`, `src/mmio.rs` TEST_SCRATCH.
+Both flash drop-write fix and IRQ-rate fix are needed for the current
+trajectory.
+
+---
+
+## Earlier — flash recovery path eliminated; newt-DABT alias still present (QEMU, 2026-04-25 late night)
 
 **Status:** Failure B (flash[0..4] DLDS corruption) resolved by mapping
 flash stage-2 RO + dropping direct guest writes. The kernel now takes

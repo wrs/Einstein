@@ -147,6 +147,18 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
     // interrupt keeps re-firing (or an unmasked one never delivers).
     update_virq();
 
+    // Refresh the non-trapping tick page on every sync-trap exit so the
+    // guest's tight delay loops (e.g. TSerialNumberROM::Init at 0x1dd8d0,
+    // bit-bang protocol with cmp-against-#20-tick deadlines) see a fresh
+    // tick value on the next read instead of spinning until the 16 ms
+    // CNTHP heartbeat fires. Without this each delay loop runs ~heartbeat
+    // wall time regardless of the requested delay, which on QEMU TCG (with
+    // tracer overhead amplifying per-trap wall) makes us run ~4x more
+    // delay-loop iterations than Einstein for the same kernel logic — and
+    // the resulting trace-count drift is what causes the heap-allocator
+    // divergence at TStackInfo::Init #12 (see INVESTIGATION.md).
+    crate::stage2::tick_page::update();
+
     // Budget-limited "progress beacon": print PC every 10k traps so we
     // can see if the guest is making forward progress or looping in one
     // place. Doesn't halt — lets boot continue.

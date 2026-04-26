@@ -24,18 +24,23 @@ pub const DEVICE_MMIO_1GIB_BLOCK: Option<u64> = Some(0x4000_0000);
 /// (true for raspi3b — image + RAM live in L1[0]).
 pub const DRAM_1GIB_BLOCK: Option<u64> = None;
 
-/// Newton ticks are nominally 3.6864 MHz. QEMU raspi3b's CNTPCT_EL0
-/// advances at ~0.8 MHz of wall time, so if we report ticks at the real
-/// rate the kernel's calibrated delay loops stall for tens of seconds.
-/// Scaling up keeps boot-wall-clock under a minute. Matches a similar
-/// fudge in Einstein's TInterruptManager::GetTimer.
+/// Newton's hardware tick clock runs at 3.6864 MHz of wall time. We
+/// report the natural rate; CNTPCT_EL0 (running at ~62 MHz on QEMU
+/// raspi3b) is rate-converted in `vic::ticks()`.
 ///
-/// Note: the multiplier is a tradeoff. Too low and early calibrated delay
-/// loops (e.g. BootOS:0x18F38) stall. Too high and the post-UserBoot
-/// alarm engine can't keep up — `TTimerEngine::Alarm` enters a tight loop
-/// re-arming the same alarm because ticks advance faster than gClock can
-/// be updated by the periodic `RestartTimerOverflowDetect` callback.
-pub const NEWTON_TICK_HZ: u64 = 3_686_400 * 16;
+/// Earlier code multiplied this by 16 (and before that 128) to make
+/// early calibrated delay loops finish promptly. With the 16 ms
+/// CNTHP heartbeat in `timer.rs` driving `tick_page::update()`, the
+/// guest sees ticks advance even during tight non-trapping polls
+/// without any rate scaling, so the multiplier is gone. Keeping the
+/// natural rate matches what the kernel computes from `kFreqGenFreq`
+/// and matches Einstein's `TInterruptManager::GetTimeInTicks`, which
+/// avoids a class of divergence where wall-anchored fast ticks make
+/// kernel-armed timer matches fire too early relative to guest
+/// instruction throughput (every spurious alarm IRQ allocates from
+/// the safe heap and perturbs subsequent allocations — see
+/// INVESTIGATION.md).
+pub const NEWTON_TICK_HZ: u64 = 3_686_400;
 
 /// Route the EL2 physical timer PPI (CNTHPIRQ) to core 0's IRQ input.
 ///

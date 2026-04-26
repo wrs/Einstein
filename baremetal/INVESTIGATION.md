@@ -201,6 +201,34 @@ L1 entries (the 0x90 marker) unconverted to coarse.
    identically on FVP — confirms it's kernel-logic-deterministic, not
    a QEMU-AArch64 banked-reg artefact.
 
+### Experiments performed (2026-04-26 PM continuation)
+
+**Experiment A — disable patch (1/3) at `0x001f7a10` (normal-fault path).**
+Hypothesis: patch (1/3) was the one starving the lazy-L1 grow; (2/3)+(3/3)
+on the collision-grow paths were sufficient for the BootOS-canary fix.
+Result: **REJECTED.** Without (1/3), boot wedges earlier with a different
+BootOS-canary signature (R0=0, R2=0x0cc82604, R12=0x0cc8260f, snapshot
+seq=46 vs original ~46 — but earlier in the trace timeline). Patch (1/3)
+is load-bearing for past-stage progress. Reverted.
+
+**Experiment B — normalise the 0x90 lazy-L1 marker to 0 in
+`fix_stage1_xn_bits`.** Hypothesis: maybe the kernel's grow path expects
+canonical fault (0) rather than annotated fault (0x90) and our
+`fix_stage1_xn_bits` is preserving 0x90 unnecessarily. Result:
+**REJECTED.** Boot wedges very early with `task_dump: gScheduler unset`
+and `Reboot canary: R0=0xffffd8a4` (different code than the prior
+0xffffd8a5; -10204 ≠ -10075). The 0x90 markers carry information the
+kernel relies on — bit 4 may be the "lazy-domain-4-region" sentinel and
+zeroing it breaks early scheduler init. Reverted.
+
+**Conclusion of A+B:** the wedge isn't on either of the two simplest
+local levers. The next investigation needs to step inside the kernel's
+DABT-handler dispatch to determine *why* the kernel's grow path doesn't
+fire on the DFSC=5 forward at FAR=0x0cd07400, while the equivalent
+DFSC=7 at FAR=0x0ccee800 (same domain 4) IS handled successfully. A
+hypervisor probe at `0x393894` (throw fast-path) and `0x39339c`
+(success path) would directly reveal which arm the kernel takes.
+
 ### Reproduction artifacts
 
 `/tmp/phaseB-2026-04-26-reboot/`:

@@ -1680,6 +1680,64 @@ fn handle_reboot(ctx: &TrapContext) -> ! {
     kprintln!(
         "   is at the r0 pointer passed to `Throw` a few entries earlier.)"
     );
+
+    // 2026-04-26: dump kernel state to diagnose lazy-L1 wedge inside
+    // TInterpreter::TInterpreter. The interesting fields:
+    //   - L1[0xC0..0xD7]: which sections are coarse vs lazy 0x90 vs 0
+    //   - gKernelGlobals (= *(0x0c100ff8)): pointer used by
+    //     DataAbortHandler at 0x393318 for the monitor lookup
+    //   - That global's task struct's monitor list at +0x74,+0x78,+0x7c
+    //     (read by `0x393324..0x393348` to build the dispatch bitmask)
+    kprintln!();
+    kprintln!("=== one-shot Reboot-canary kernel-state dump ===");
+    {
+        let ram = guest_mem::ram_host_pa() as *const u32;
+        kprintln!("  L1 walk (sections 0xC0..0xD7):");
+        for i in 0xC0..=0xD7 {
+            // SAFETY: i < 4096; L1 lives at start of guest RAM.
+            let e = unsafe { ram.add(i).read() };
+            let kind = match e & 3 {
+                0 => "fault",
+                1 => "coarse",
+                2 => "section",
+                _ => "fine",
+            };
+            kprintln!("    L1[{:#x}] = {:#010x}  ({})", i, e, kind);
+        }
+        // gKernelGlobals at 0x0c100ff8 → walk through stage-1 to find PA.
+        let gkg_va: u32 = 0x0c10_0ff8;
+        if let Some(gkg_pa) = guest_mem::translate_va(gkg_va) {
+            if let Some(gkg) = guest_mem::read_word_pa(gkg_pa) {
+                kprintln!(
+                    "  gKernelGlobals @VA={:#x} PA={:#x} = {:#010x}",
+                    gkg_va, gkg_pa, gkg
+                );
+                if let Some(gkg_pa2) = guest_mem::translate_va(gkg) {
+                    let m74 = guest_mem::read_word_pa(gkg_pa2 + 0x74).unwrap_or(0xDEAD);
+                    let m78 = guest_mem::read_word_pa(gkg_pa2 + 0x78).unwrap_or(0xDEAD);
+                    let m7c = guest_mem::read_word_pa(gkg_pa2 + 0x7c).unwrap_or(0xDEAD);
+                    kprintln!(
+                        "  task @VA={:#x} PA={:#x} ->[0x74]={:#010x} ->[0x78]={:#010x} ->[0x7c]={:#010x}",
+                        gkg, gkg_pa2, m74, m78, m7c
+                    );
+                    // Walk each non-null monitor's bitmask at +0x10
+                    for (off, val) in [(0x74, m74), (0x78, m78), (0x7c, m7c)] {
+                        if val != 0 {
+                            if let Some(pa) = guest_mem::translate_va(val) {
+                                let bm = guest_mem::read_word_pa(pa + 0x10).unwrap_or(0xDEAD);
+                                kprintln!(
+                                    "    monitor[+{:#x}] @VA={:#x} PA={:#x} ->[0x10]={:#010x} (fault-bitmask)",
+                                    off, val, pa, bm
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    kprintln!("=== end Reboot-canary state dump ===");
+
     cpu::halt();
 }
 

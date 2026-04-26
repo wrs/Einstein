@@ -275,6 +275,66 @@ each call `NewStack(0x10000)` (= 64 KB) twice = 256 KB total of
 lazy-grow stack region. Earlier tasks never exceeded 4 KB and so
 never hit the subpage-counter drift. TInterpreter is the canary.
 
+### Kernel-state dump at canary fire (2026-04-26 PM, walter follow-up)
+
+Added a one-shot dump in `handle_reboot` (src/trap.rs). Captures L1 walk
++ the monitor list referenced by DataAbortHandler at 0x393318. Result:
+
+```
+L1 walk (sections 0xC0..0xD7):
+  L1[0xc0] = 0x00001401  (coarse, kernel low-VA scratch)
+  L1[0xc1] = 0x04006841  (coarse)
+  L1[0xc2] = 0x0401cc61  (coarse)
+  L1[0xc3] = 0x04025861  (coarse, kernel-side stack page table)
+  L1[0xc4] = 0x00000070  (fault — different marker, domain=3)
+  L1[0xc5] = 0x00000070  (fault — domain=3)
+  L1[0xc6] = 0x0401c881  (coarse)
+  L1[0xc7] = 0x00000090  (fault — domain=4 lazy)
+  L1[0xc8] = 0x00000090  (fault — domain=4 lazy)
+  L1[0xc9] = 0x0401c481  (coarse, in-use stack region)
+  L1[0xca] = 0x0401c081  (coarse, in-use stack region)
+  L1[0xcb] = 0x00000090  (fault — domain=4 lazy)
+  L1[0xcc] = 0x04025481  (coarse, in-use stack region — stack1!)
+  L1[0xcd..0xd5] = 0x00000090  (all fault — domain=4 lazy)
+  L1[0xd6] = 0x04025ca1  (coarse)
+  L1[0xd7] = 0x000000b0  (fault — domain=5 lazy variant)
+
+gKernelGlobals @VA=0xc100ff8 PA=0x4007ff8 = 0x0c1215f8  (= newt task!)
+task @VA=0xc1215f8 PA=0x40535f8
+  ->[0x74] = 0x0c118ae0  (monitor)
+  ->[0x78] = 0x00000000  (none)
+  ->[0x7c] = 0x00000000  (no list)
+monitor[+0x74] @VA=0xc118ae0 PA=0x4023ae0
+  ->[0x10] = 0x00055555  (fault-handler bitmask)
+```
+
+`gCurrentTask = newt` confirms TInterpreter ctor runs on the `newt`
+task (which makes sense — `newt` is the NewtonScript runner).
+
+The bitmask `0x00055555` analyzed against the kernel's
+`add pc, pc, r0, lsl #2` dispatch at `0x393384`:
+- Shift index for DFSC=5/7: `(DFSR_lo8 >> 3) & 0x1e = 8`
+- `(0x55555 >> 8) & 3 = 1` → dispatch arm 1 → `0x39339c`
+  (= **success path**, calls FaultMonitorEntry).
+
+So **the kernel DOES enter the FaultMonitorEntry chain for our DFSC=5
+fault at FAR=0x0cd07400** — the bitmask routes both DFSC=5 and DFSC=7
+to the same success arm (since `(DFSR_lo8 >> 3) & 0x1e` collapses
+both to 8). The wedge is therefore downstream of FaultMonitorEntry.
+The two most likely failure points are:
+
+1. **ResolveFault's bounds check at `0x1f79b8`/`0x1f79cc`.** It reads
+   `TStackManager->[64]->[68]` (some "tracker" the kernel maintains)
+   and compares against `TStackInfo->[24]` and `TStackInfo->[28]`.
+   If the tracker is outside the bounds of the TStackInfo we picked
+   (e.g., because the kernel found stack1's TStackInfo but the FAR
+   is in stack2's range), ResolveFault errors `-10204`.
+2. **`Remember` → `SWI #12` returning a different error than -10003.**
+   Without -10003 the kernel skips the AllocatePageTable retry loop
+   and propagates whatever error came back. If our hypervisor's SWI
+   path mishandles GenericSWI #12 (or the kernel has internal state
+   that causes the SWI to return an unexpected error), we'd see this.
+
 ### Next experiments motivated by this
 
 1. **Audit ResolveFault's r4->[64]->[68] tracker.** Identify what

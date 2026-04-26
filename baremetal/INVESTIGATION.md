@@ -94,6 +94,94 @@ variant is retained behind regression-test-only wiring); future
 experiments touching the byte-access fallback no longer have to
 worry about stack-page-aliasing side effects.
 
+### Follow-up — physical-allocator + stack-extension trace audit
+
+Pinned the divergence point by tracing every guest physical-allocator
+and stack-extension call. Watchlist (~80 symbols) lives at
+`/tmp/key_events.txt`; filtered events
+(`/tmp/qemu_key_events.log` — 5 216 hits in our 170 K-event boot)
+cover `TPageTracker::{Take,Put}`, `TPhys::*`, `Prim*Mapping`,
+`AddPgP*` / `AddSec*`, `TStackManager::*`, `TStackPage::*`,
+`TUDomainManager::*Map*`, and `TPageManager::*`.
+
+**Take history is LIFO and 1:1 stride 0x1C** — descriptor base
+decreases by one TLittlePhys-record-size each Take. We Take 28
+TLittlePhys descriptors over the 170 K trace; the earliest 26 map
+into VAs that match `einstein.va_pa` byte-for-byte through line 231:
+
+| Take | Trace # | Descriptor base | Mapped VA |
+|------|---------|-----------------|-----------|
+| 1 | 16 715 | `0x0c10fb58` | (kernel internal — no PrimRememberMapping; lr inside `0x001c575c`) |
+| ... | ... | ... | ... |
+| 21 | 106 898 | `0x0c10f928` (PA `0x0402b000`) | `0x0c204000` (C heap) |
+| ... | ... | ... | ... |
+| 26 | 146 300 | `0x0c10f8b0` | `0x0cc87000` |
+| **27** | **147 706** | **`0x0c10f880`** (PA `0x04031000`) | **`0x0ca6b000`** ← **first divergence** |
+| 28 | 165 396 | `0x0c10f864` | `0x0c204000` (alias #2) |
+
+`einstein.va_pa` line 232 records `REMEM 0x0c318000 0x0c10f928` —
+i.e. Einstein's stack-fault path **re-uses an already-Taken
+descriptor** (the PA-`0x0402b000` one, allocated earlier as our
+Take 21 / Einstein's equivalent) and **adds an aliasing kernel-VA
+mapping** for it. Our run instead allocates a fresh descriptor
+(Take 27, descriptor `0x0c10f880`) and maps it to a user-heap VA
+`0x0ca6b000`.
+
+**Key invariant: every PrimRememberMapping through line 231 is
+identical between Einstein and us.** That's 231 events of byte-for-
+byte agreement on TPhys-→-VA bookkeeping. The ONLY divergence is
+the missing fault: between our trace 146 517 (line 231, last match)
+and trace 147 765 (line 232, first divergence) — a window of 1 248
+trace events — Einstein issues 6 extra PrimRememberMappings (the
+`name`-task fault chain `Fault → ResolveFault → AllocNewPage /
+PageMatchFound → RememberMappings`); our run issues zero.
+
+**Stack-event census (170 K trace):**
+
+| Function | Count |
+|----------|-------|
+| `TStackManager::Fault` | 3 (traces 57 696, 169 805, 170 061) |
+| `TStackManager::ResolveFault` | 94 |
+| `TStackManager::FindOrAllocPage` | 32 |
+| `TStackManager::AllocNewPage` | 16 |
+| `TStackPage::Init` | 16 |
+| `TStackManager::SetRestrictedPage` | 284 |
+| `TStackManager::RememberMappings` | 95 |
+| `TStackManager::ForgetMappings` | 2 |
+
+Einstein's run hits `TStackManager::Fault` at trace ~147 500 (the
+`name`-task `MoveFreeBlock` fault); our run never reaches a 4th
+Fault in the entire pre-wedge boot. The two fault-cluster traces
+near the end (169 805 / 170 061) are the recursive DABT chain that
+the canary catches; not the missed `name`-task fault.
+
+**Conclusion of the audit:** the divergence is purely
+control-flow — same byte-identical pre-fault state, same args to
+`MoveFreeBlock`, but our SP-relative access lands on a mapped page
+where Einstein's lands on an unmapped one. The state difference
+isn't in `va_pa` (= TPhys/PrimRememberMapping bookkeeping) and
+isn't in any of the stack-manager calls preceding the divergent
+trace. Candidates for the hidden state:
+
+1. **TStackPage subpage-restriction state** — `SetRestrictedPage`
+   is called 284 times; we don't currently log r0/r1/r3 args
+   ("which subpage of which TStackPage"). A subpage-state diff vs
+   Einstein could expose whether our restricted-page mask differs.
+2. **Kernel-internal SP value of `name` task at the fault moment**
+   — needs a non-trace probe. A guest-BP at `MoveFreeBlock`'s entry
+   inside `name` task could capture the actual SP and compare.
+3. **TUDomainManager FaultMonProc path** — the call site of all 3
+   of our `TStackManager::Fault` is `lr=0x00259230` inside
+   `TUDomainManager::FaultMonProc`. A possible upstream is the
+   page-monitor delivery order; if a faulting message gets routed
+   to a different domain's FaultMonProc on our run, the fault is
+   "swallowed" silently.
+
+Reproduction artifacts: `/tmp/key_events.txt` (watchlist),
+`/tmp/qemu_key_events.log` (filtered trace), `/tmp/take_history.py`
+(LIFO Take→VA mapper), `/tmp/qemu_scratchva.va_pa` (canonical
+va_pa diff against `einstein.va_pa`).
+
 ---
 
 ## Earlier — root cause narrowed: missing stack-fault on `name` task drives PA-recycle into user heap (QEMU, 2026-04-26 PM)

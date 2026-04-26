@@ -152,6 +152,80 @@ Plausible upstream divergences:
    if the same wedge happens identically, that confirms the kernel
    logic alone (no QEMU artefact). If FVP advances past, the
    divergence is QEMU-specific.
+5. **Replace `StubVariant::Stack` with a non-stack-touching scratch
+   variant.** See "shadow-stub Stack-variant experiment" below — the
+   current Stack-variant PUSH/POPs onto the user task's mode-banked
+   SP, which is a strong candidate for the source of the page-mapping
+   divergence. A scratch-page variant (write/read from a fixed
+   stage-2-mapped scratch VA instead of the user stack) would
+   preserve the kernel's view of stack-page liveness.
+
+### Shadow-stub Stack-variant experiment (2026-04-26 PM)
+
+Hypothesis prompted by question: could `StubVariant::Stack` be the
+silent perturbation that prevents our `name` task from triggering the
+MoveFreeBlock fault Einstein triggers?
+
+**Mechanism.** The Stack-variant inline stub (chosen when liveness
+analysis finds < 2 dead candidate registers — see
+`shadow_stub::emit_inline_stub`) emits:
+
+```
+slot 0:  PUSH scratch_ea     ; SP -= 4, write [SP] = scratch_ea
+slot 1:  PUSH scratch_fl     ; SP -= 4, write [SP] = scratch_fl
+slot 2:  MRS scratch_fl, cpsr
+slots 3-7: address compute + access
+slot 9:  POP scratch_fl      ; SP += 4
+slot 10: POP scratch_ea      ; SP += 4
+slot 11: B orig_pc + 4
+```
+
+While SP is restored at exit and the popped values are discarded,
+each Stack-variant PUSH writes to memory below the current SP. If
+that memory lands on a guest page the kernel hasn't yet lazily mapped,
+the PUSH triggers a stage-1 translation fault that our DABT-vector
+trampoline forwards to the kernel's `DataAbortHandler`. The kernel
+maps the page and returns, the PUSH retries successfully, and the
+next time MoveFreeBlock (or any other code) pushes onto that same SP
+range, the page is already mapped — so the kernel-mode stack-fault
+chain Einstein triggers (`TStackManager::Fault → STKF → kernel-side
+TStackPage allocation at VA 0x0c318000 backed by PA 0x0402b000`)
+never fires for us.
+
+**Experiment.** Modified `emit_inline_stub` to return `Err` on the
+liveness-fail branch, with `patch_one_site` falling back to UDF
+emulation for those sites. Result on cold boot:
+
+- Install stats: 1647 sites that previously emitted Stack-variant
+  inline stubs now emit UDF (out of 27799 total byte-access sites).
+  So the Stack-variant *was* 6 % of byte-access sites.
+- Boot wedged **much earlier** — DIAG vector intercept at PC
+  `0x00ffff64` (= the SBA pre-fault stub's `HVC #SBA_RETRY_TAG`),
+  with `LR_svc=0` and `LR_und=0x00045474`, in BootOS's stack-
+  initialisation region. The recursion: a Stack-variant fallback
+  fired in early BootOS (before the kernel's `DataAbortHandler` was
+  fully wired), the SBA-emulator's pre-fault probe LDRB took a DABT,
+  and the unprepared kernel state caused a recursive abort chain.
+
+**What this tells us.**
+
+1. The Stack-variant is heavily used (1647 sites) and is depended on
+   for early BootOS execution. Naive replacement with UDF breaks
+   pre-`SetUpStacks` code paths — the comment in `emit_inline_stub`
+   explicitly noting "first hit: 0x225d8 inside TADSPEndpoint::nSnd"
+   is now stale; the actual install includes earlier sites.
+2. The hypothesis is *plausible but not directly tested* by this
+   experiment. We can't isolate post-`name`-task timing from pre-
+   `SetUpStacks` correctness with a one-knob replacement.
+3. A focused fix would replace `StubVariant::Stack` with a variant
+   that writes scratch_ea / scratch_fl to a fixed hypervisor-allocated
+   stage-2-mapped scratch VA (or to TPIDR_EL0-style scratch in the
+   ROM aperture) instead of the mode-banked SP. That preserves the
+   inline-stub fast path (no UDF round-trip) while removing the
+   stack-touching side effect.
+
+**Source state.** Experiment reverted; `src/shadow_stub.rs` is
+unchanged from parent. Only INVESTIGATION.md updated this commit.
 
 ### Reproduction artifacts
 

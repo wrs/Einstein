@@ -3,7 +3,178 @@
 Live notes. Update as we learn more; remove old updates as we move on to
 new stalls.
 
-## Currently at — instruction-anchored ticks land; heap allocator now matches Einstein bit-for-bit (QEMU, 2026-04-26)
+## Currently at — root cause narrowed: missing stack-fault on `name` task drives PA-recycle into user heap (QEMU, 2026-04-26 PM)
+
+**Status:** the `AddPgPAndPerm` audit pinned the precise divergence point
+and the upstream cause. The wedge is NOT tracer-induced — a fresh
+no-trace cold boot reaches the same recursive DABT and the same BootOS
+canary at the same TCardServer allocation chain.
+
+### The divergence point (trace 147612 Einstein vs 147932 ours)
+
+Both runs make byte-identical AddPgPAndPerm / PrimRememberMapping calls
+through trace 147186 (Einstein) / 146678 (ours) — five `0xcc8x000` →
+`0x0402[ef0]000` pairs that match across both implementations. Then:
+
+| | Einstein | Ours |
+|---|---|---|
+| trace # | 147612 | 147932 |
+| `Remember(env, va, perm, phys_id)` | `(0x1355, 0x0c318000, 0, 0x1b3b)` | `(0x13a5, 0x0ca6b000, 0, 0x1edb)` |
+| Resulting `AddPgPAndPerm(va, _, pa, _)` | `(0x0c318000, _, 0x0402b000, _)` | `(0x0ca6b000, _, 0x04031000, _)` |
+| Caller env | new env 0x1355 (faulting task's domain) | same env 0x13a5 (default) |
+
+Einstein's call is driven by **TStackManager::Fault** — `name` task
+(0x0c119c74) faulted while running `MoveFreeBlock` at trace 147523-147524
+(`DataAbortHandler` mode=ABT, faulting access in domain 3). The fault
+handler unschedules `name`, schedules STKF (0x0c112e00), and STKF
+allocates a new TStackPage at VA `0x0c318000` (a kernel-side address)
+backed by PA `0x0402b000`.
+
+Ours never faults: at the equivalent trace 147028 our `name` task runs
+the same `MoveFreeBlock(r0=0x0c2041e0, r1=0x00000020)` with byte-identical
+args and returns normally. Without a stack fault, STKF never allocates
+the kernel-side page, so PA `0x0402b000` stays in `gPhysAllocator`'s
+free pool.
+
+### The downstream alias chain (PA 0x0402b000)
+
+Tracking every `AddPgPAndPerm` / `RemovePgPAndPerm` / `PrimRememberMapping`
+hit on PA 0x0402b000 (TPhys descriptor 0x0c10f928):
+
+```
+trace ours    Einstein   op       VA           PA
+107143/107638 ADD     0x0c204000   0x0402b000  (initial: in C heap)
+148115        ADD     0x0cc82000   0x0402b000  (alias #1)
+148144        RM      0x0cc82000               (bookkeeping only)
+148201        ADD     0x0cc82000   0x0402b000  (re-add)
+165326        ADD     0x0c204000   0x0402b000  (re-add)
+165641        ADD     0x0c204000   0x04032000  (REMAPPED to different PA)
+165752        ADD     0x0cc82000   0x0402b000  (re-add)
+169509        ADD     0x0cc7f000   0x0402b000  (alias #2 — never RM'd)
+169740        ADD     0x0cc80000   0x0402b000  (alias #3 — TCardMessage region!)
+                ↑ wedge: TCardServer fills VA 0x0cc80xxx with 'newt'/'cdsv'
+                  literals. Writes corrupt the same PA used by
+                  pre-existing alias VAs → recursive DABT → BootOS canary.
+
+# Einstein side (no aliasing in the user heap range):
+                147631 ADD     0x0c318000   0x0402b000  (kernel page, no writes)
+                147660 RM      0x0c318000
+                147717 ADD     0x0c318000   0x0402b000  (re-add)
+```
+
+The kernel deliberately allows multi-VA-to-one-PA aliasing
+(this is by design for stack-page sharing). The bug is which VA the
+kernel chooses: Einstein picks VA `0x0c318000` (kernel internal,
+nothing writes there); ours picks user heap VAs `0x0cc7f/0cc80/0cc82`
+(target of `TCardServer::TCardServer`'s 62-element TCardAsyncMsg
+array constructor at ROM 0x34502c).
+
+### The wedge mechanism
+
+At trace 169981 the array constructor reaches r4=0x0cc80bc8.
+TCardMessage::TCardMessage explicitly stores `'newt'` (0x6e657774) at
+`*(self+0)` and `'cdsv'` (0x63647376) at `*(self+4)`, then `Clear`
+zero-fills `+8..+0xb8`. Those writes hit PA `0x0402b000` + offsets
+`0xbc8..0xc80`, which is also live as VA 0x0c204xxx (the C heap that's
+been there since trace 107143).
+
+Concretely: pckm or another task with a stack frame on the aliased
+range reads what should be a saved LR slot, finds zero (one of the
+zero-fills landed there), and a subsequent `mov pc, lr` jumps to PC=0.
+PC=0 hits the reset vector at VA 0x0 = `b 0x18688 BootOS`. From USR
+mode, HVC at 0x18688 (the canary patch) is undefined, fires UND, the
+trampoline routes to EL2, and the canary detects the second BootOS
+entry as a software reset.
+
+### No-trace confirmation (it's not tracer overhead)
+
+A second cold boot with `--features quiet` (no `trace`) reaches the
+same wedge: `dabt: forwarding to kernel DataAbortHandler — DFSC=0x7
+FAR=0x0cc7fcc8 mode=0x17` then a recursive abort with FAR=0x0cc80001,
+then the same BootOS canary at entry #2 with R0=0x0cc80c80,
+R14_UND=0x0001868c. So the alias is a real bug, not a tracer-induced
+timing artefact. The earlier "wall-clock-skew" theory (closed in the
+previous section by switching to instruction-anchored ticks) was a
+related but distinct issue.
+
+### Why our `name` task doesn't fault (open question)
+
+This is the load-bearing mystery. Both runs:
+
+1. Reach `TNameServer::RegisterForSystemEvent(0x70776f66, 0x1e12)` at
+   identical entry args (ours trace 146910, Einstein 147405).
+2. Walk identical paths through `SysEventTester` ctor → `CList::Search`
+   → `CDynamicArray` ops → `operator new(0x14)` → `malloc` → `NewPtr`
+   → `IsSafeHeap` → `NewBlock` → `MoveFreeBlock(0x0c2041e0, 0x20)`.
+3. Args at every traced step are byte-identical.
+
+Einstein's `MoveFreeBlock` faults; ours returns normally. The
+deterministic kernel logic with identical args **must** depend on
+heap state that has diverged. The alloc-arg sequence file
+(`SafeHeapPage::Alloc(r0, r1, r2)`) was byte-identical for the first
+1063 calls per the prior section, but Einstein's recorded alloc trace
+ends there (200 k trace cap). Beyond 1063, allocations may have
+diverged silently before reaching this code.
+
+Plausible upstream divergences:
+
+1. **Allocation return values** — args matching doesn't mean returned
+   pointers match. If our heap's free chain is in a slightly different
+   order, `NewPtr` returns a different chunk address, downstream code
+   touches different slots.
+2. **Stack-page state** — the *fault* in MoveFreeBlock is about which
+   page the SP touches. If `name` task's stack has a page boundary at
+   slightly different offsets between runs, our SP may stay inside an
+   already-mapped page while Einstein's crosses into an unmapped one.
+3. **Kernel object IDs** — our env 0x13a5 vs Einstein's 0x1355 implies
+   we allocated environments in a different order earlier, leading to
+   different IDs being live for the same logical request.
+
+### Possible next steps
+
+1. **Audit `__nw__FUi` returns past trace 1063.** The current alloc
+   diff stops at Einstein's recording cap. Re-run NewtonProbe with a
+   larger trace cap to extend Einstein's alloc reference past 1063
+   calls, then diff our 1064..1488 to find the first divergent return
+   address. Once that's found, walk back to the upstream perturbation.
+2. **Hypervisor-side state cross-check.** Look at our `gPhysAllocator`
+   layout (39 RAM-page TPhys descriptors). If the order or content of
+   the descriptors differs from Einstein's, `TPhys::Get(0x1edb)` vs
+   `TPhys::Get(0x1b3b)` could resolve to different physical pages —
+   that's what `phys_id` divergence would mean.
+3. **Force the alias to be benign.** Even if we can't make the kernel
+   choose `0x0c318000`, we might detect the multi-VA-aliasing pattern
+   in `AddPgPAndPerm` (stage-2 trap) and either (a) fault if the
+   newly-mapped VA already has live content at the same PA via a
+   different VA, or (b) reject the aliasing add. Risky — kernel-side
+   stack sharing depends on aliasing.
+4. **Cross-check on FVP.** FVP has a different trap-cost profile;
+   if the same wedge happens identically, that confirms the kernel
+   logic alone (no QEMU artefact). If FVP advances past, the
+   divergence is QEMU-specific.
+
+### Reproduction artifacts
+
+`/tmp/phaseB-2026-04-26/`:
+
+- `qemu_fresh.log` — fresh trace+quiet cold boot, 180 s wall, wedges at
+  trace 169986 with BootOS canary entry #2.
+- `qemu_fresh.firsts` — `awk '/^trace / && !seen[$4]++'` over above.
+- `qemu_fresh.va_pa` — VA/PA tuples from AddPgPAndPerm /
+  PrimRememberMapping calls.
+- `qemu_fresh.alloc2` — `SSafeHeapPage::Alloc` arg sequence (1488
+  entries; matches Einstein's 1063 byte-for-byte).
+- `qemu_notrace.log` — fresh quiet-only cold boot, 90 s wall, same
+  wedge without tracer.
+- `einstein.va_pa` — extracted from `/tmp/phaseB-2026-04-25/einstein.head200k`.
+
+`einstein.va_pa` ⊊ our `qemu_fresh.va_pa` for the matched prefix; the
+single line `ADD/REMEM 0x0c318000 …` is in Einstein only and seven
+unique-pair lines are in ours only (all in the user-VA alias range).
+
+---
+
+## Earlier — instruction-anchored ticks land; heap allocator now matches Einstein bit-for-bit (QEMU, 2026-04-26)
 
 **Status:** the timing-induced divergence identified in the prior section
 is fully closed. Newton-tick advancement is now decoupled from host

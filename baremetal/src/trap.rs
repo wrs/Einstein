@@ -2622,6 +2622,7 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
                 // the live TTBR0 value.
                 if (cp15::read_ttbr0_el1() as u32 & 0xFFFF_C000) == 0x0400_0000 {
                     guest_mem::fix_stage1_xn_bits();
+                    guest_mem::install_scratch_pool_l1_section();
                     reseed_flash_checksums_if_needed();
                 }
                 // No cache maintenance here: the TTBR0 write handler
@@ -2723,6 +2724,7 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
             };
             if !already && (raw & 0xFFFF_C000) == 0x0400_0000 {
                 guest_mem::fix_stage1_xn_bits();
+                guest_mem::install_scratch_pool_l1_section();
                 reseed_flash_checksums_if_needed();
             }
         }

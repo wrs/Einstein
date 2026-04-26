@@ -405,6 +405,88 @@ pub fn fix_stage1_xn_bits() {
     }
 }
 
+/// ARMv7 short-descriptor section attributes for the shadow-stub
+/// ScratchVA carve-out installed at the kernel VA
+/// `crate::shadow_stub::SCRATCH_POOL_VA`. The section's PA bits encode
+/// the IPA `SCRATCH_POOL_IPA`, which stage-2 then translates to the
+/// host SCRATCH_POOL backing.
+///
+///   PA[31:20] = SCRATCH_POOL_IPA[31:20]  (stage-1 outputs this IPA)
+///   AP[1:0] = 0b11   (RW from any mode, including USR)
+///   AP[2]   = 0
+///   domain  = 0      (matches kernel domain 0)
+///   TEX     = 0, C/B = 0b11  (Normal cacheable WB)
+///   XN      = 1      (instruction fetches PABT — defensive: scratch
+///                    is data-only)
+///   nG / S / NS = 0  (matches kernel section defaults)
+///   bit[1] = 1, bit[0] = 0  (Section, PXN = 0)
+///
+/// Lower-19 attribute bits are 0x0C1E. Bit-by-bit cross-check against
+/// DDI 0406C B3-19.
+const SCRATCH_POOL_L1_SECTION_ATTRS: u32 = 0x0000_0C1E;
+fn scratch_pool_l1_section() -> u32 {
+    crate::shadow_stub::SCRATCH_POOL_IPA | SCRATCH_POOL_L1_SECTION_ATTRS
+}
+
+/// Install the kernel-side L1 mapping for the shadow-stub ScratchVA
+/// scratch carve-out at VA `crate::shadow_stub::SCRATCH_POOL_IPA`. The
+/// section descriptor identity-maps the VA to itself; stage-2 then
+/// translates that IPA to the host `SCRATCH_POOL` backing.
+///
+/// Idempotent: rewrites the slot to `SCRATCH_POOL_L1_SECTION` even if
+/// `fix_stage1_xn_bits` has just normalised it (clearing XN), so the
+/// XN=1 invariant survives a re-walk.
+///
+/// Halts loud if the kernel has independently populated L1[0x18] with a
+/// non-fault, non-matching entry (would mean a ROM revision actually
+/// uses VA 0x0180_0000 — the plan's assumption breaks and a different
+/// VA must be picked).
+pub fn install_scratch_pool_l1_section() {
+    let ram = addr_of_mut!(GUEST_RAM) as *mut u32;
+    let idx = (crate::shadow_stub::SCRATCH_POOL_VA >> 20) as usize;
+
+    // SAFETY: idx < 4096; GUEST_RAM holds the kernel L1 at TTBR0 = 0x0400_0000.
+    let entry = unsafe { ram.add(idx).read() };
+
+    let installed = scratch_pool_l1_section();
+    // Acceptable pre-states:
+    //   * Any type-0 (fault) entry — bits[1:0] == 0. The 717006 kernel
+    //     leaves stray non-zero bits in unused L1 slots after soft-
+    //     reset (e.g. observed `L1[0x18] = 0x00000010` on the second
+    //     M=0→M=1 transition); the upper bits of a fault descriptor
+    //     are don't-care for translation.
+    //   * `installed` — our previous install survived re-walk
+    //     untouched.
+    //   * Normalised by fix_stage1_xn_bits to (entry & 0xFFF0_01E0) |
+    //     0x0C0E — the walker flipped XN=1 → 0 inside our section.
+    let normalised_after_walker: u32 =
+        (installed & 0xFFF0_01E0) | 0x0000_0C0E;
+    let is_fault_entry = (entry & 3) == 0;
+    let acceptable =
+        is_fault_entry
+        || entry == installed
+        || entry == normalised_after_walker;
+
+    if !acceptable {
+        kprintln!(
+            "shadow_stub scratch: FATAL — kernel L1[{:#x}] = {:#010x}, type bits {:#x}; \
+             not a fault entry and not our installed section. ROM revision uses VA {:#x}? \
+             Pick a different SCRATCH_POOL_VA.",
+            idx, entry, entry & 3, crate::shadow_stub::SCRATCH_POOL_VA,
+        );
+        crate::cpu::halt();
+    }
+
+    if entry != installed {
+        // SAFETY: idx < 4096.
+        unsafe { ram.add(idx).write(installed); }
+        crate::dprintln!(
+            "shadow_stub scratch: installed kernel L1[{:#x}] = {:#010x} (was {:#010x})",
+            idx, installed, entry,
+        );
+    }
+}
+
 /// Manually walk the guest's stage-1 tables for a given VA and print
 /// each level. Useful during Phase B debugging of stage-1 aborts we
 /// don't see from EL2 — the diagnostic HVC handler calls this to show

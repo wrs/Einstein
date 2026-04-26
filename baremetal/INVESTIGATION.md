@@ -3,7 +3,100 @@
 Live notes. Update as we learn more; remove old updates as we move on to
 new stalls.
 
-## Currently at — root cause narrowed: missing stack-fault on `name` task drives PA-recycle into user heap (QEMU, 2026-04-26 PM)
+## Currently at — Stack-variant alias hypothesis EXONERATED via ScratchVA swap (QEMU, 2026-04-26 PM)
+
+**Status:** the focused experiment to swap `StubVariant::Stack` for a
+non-stack-touching `StubVariant::ScratchVA` (per
+`docs/plans/shadow-stub-scratch-va.md`) is complete. The swap landed
+clean: 1,695 ScratchVA-fallback sites install successfully, 35/35
+guest tests pass, and the boot reaches the **same wedge point as the
+baseline**:
+
+- Boot trajectory: BootOS canary entry #2 at trace ~170,369 (baseline:
+  ~169,986; the small delta tracks the per-stub instruction count
+  increase for ScratchVA-eligible sites).
+- Canary signature identical to baseline: `R0=0x0cc80c80`,
+  `R1=0xffffffff`, `R14_UND=0x0001868c`, ELR_EL2=`0x00ffff58`.
+- Preceding tracer entries are byte-identical to the
+  Stack-variant baseline (`TCardMessage::Clear` at PC `0x0004ed84` →
+  `ZeroBytes`/`FillLongs` writing to VA 0x0cc80c00, lr=0x0004ed68).
+
+**Conclusion.** The Stack-variant inline stub's PUSH/POP-onto-mode-banked-SP
+side effect was NOT the silent perturbation masking the kernel-mode
+stack-fault chain Einstein takes. The `name`-task wedge persists
+unchanged with stack-touching removed. Suspect list narrows to:
+
+1. **Heap-allocator divergence past Einstein's recording cap** (trace
+   1,063). Heap state past that point is unmodelled by Einstein but
+   our recording continues; the divergence may live there.
+2. **`gPhysAllocator` ordering / TPhys descriptor selection.** The PA
+   recycle into TCardMessage write region (PA `0x0402b000`) is
+   downstream of physical-page allocator state we haven't yet diffed
+   against Einstein.
+3. **A QEMU-vs-FVP-vs-Einstein behavioural difference** outside the
+   shadow-stub plumbing (e.g., timer cadence, IRQ delivery ordering,
+   device-state side effects).
+
+### ScratchVA implementation summary
+
+- **Stub layout** (`shadow_stub.rs`): bumped from 12 to 16 words. New
+  variant `StubVariant::ScratchVA { sfl, sad, scratch_slot_idx }`
+  saves caller `scratch_addr` to TPIDRURW (slot 0 MCR / slot 13 MRC),
+  loads per-stub scratch slot VA via `LDR scratch_addr, [PC, #+48]`
+  from a literal at slot 15, and STR/LDRs caller `scratch_ea` /
+  `scratch_fl` through that VA at slots 2/3 and 11/12. Slots 4/9 do
+  the standard MRS/MSR NZCV save/restore.
+- **Operand-exclusion picker** extended from 2 regs to 3
+  (`pick_operand_excluded_triple`). Always succeeds: 6 candidates
+  (`R12, R0..R3, R14`) − up to 3 operand registers ≥ 3 spare.
+- **Address layout**: `SCRATCH_POOL_VA = SCRATCH_POOL_IPA = 0x0600_0000`
+  (identity-mapped). Stage-2 refines L2[0x30] to a 64 KiB RW carve-out
+  at IPA `0x0600_0000..0x0601_0000` backed by host
+  `shadow_stub::SCRATCH_POOL`. Kernel L1[0x60] is observed-free in the
+  717006 boot at FATAL-time (gap L1[0x52..0xBF], 110 unallocated slots);
+  `install_scratch_pool_l1_section` writes a section descriptor
+  `0x0600_0C1E` (RW, XN=1, identity PA, normal cacheable) to L1[0x60]
+  on every M=0→M=1 transition.
+- **VA pick rationale.** First attempt (L1[0x18], the `kwmklzru`
+  precedent) failed: the 717006 kernel runtime-allocates a coarse
+  table at L1[0x18] = `0x00018001` on the third M=0→M=1 transition.
+  Same outcome at L1[0x1A] (`0x00016001`). The FATAL halt (re-installer
+  detects the kernel's coarse) confirmed both slots are unsafe. Full
+  L1 census (`/tmp/phaseB-2026-04-26-scratchva/qemu_l1_dump.log`)
+  showed kernel populates L1[0x000..0x2FF] across boot, with
+  observed-free gaps at L1[0x52..0xBF] and L1[0xC2..0xEF].
+- **TPIDRURW IRQ-race risk** (mitigation 1 from the plan): documented
+  and tolerated. Same risk exists in the existing `DeadReg` variant's
+  CPS sysreg use; hasn't surfaced in 35-test guest suite or boot.
+- **Guest test** `subtest_24_scratch_va_preserves_caller` exercises a
+  ScratchVA-fallback site by reading R0..R3, R12, R14 after the
+  access (forcing liveness picker to mark all candidates live).
+  Verifies caller GPRs and NZCV survive the stub round-trip.
+
+### Reproduction artifacts
+
+`/tmp/phaseB-2026-04-26-scratchva/`:
+
+- `qemu_notrace.log` — quiet-only boot (90 s wall). Wedges at the
+  baseline canary point. Install stats: `inline pool 26614/32764,
+  scratch slots 1695/8192`.
+- `qemu_trace.log` — `--features trace,quiet` boot (180 s wall).
+  Final tracer entries identical to baseline through the wedge.
+- `qemu_l1_dump.log` — diagnostic dump from the L1[0x18] / L1[0x1A]
+  failed install attempts; shows kernel L1 census.
+
+### Next steps
+
+The remaining suspects (heap-allocator divergence past Einstein's
+recording cap; TPhys allocator ordering) need independent investigation.
+The ScratchVA variant stays in tree as the live fallback (Stack
+variant is retained behind regression-test-only wiring); future
+experiments touching the byte-access fallback no longer have to
+worry about stack-page-aliasing side effects.
+
+---
+
+## Earlier — root cause narrowed: missing stack-fault on `name` task drives PA-recycle into user heap (QEMU, 2026-04-26 PM)
 
 **Status:** the `AddPgPAndPerm` audit pinned the precise divergence point
 and the upstream cause. The wedge is NOT tracer-induced — a fresh

@@ -174,6 +174,7 @@ test_main:
     bl      subtest_21_ram_reload
     bl      subtest_22_inline_stub_modes
     bl      subtest_23_swi_during_stubs
+    bl      subtest_24_scratch_va_preserves_caller
 
     pop     {r4-r11, lr}
     @ Print PASS banner via unpatched HVC_PUTC.
@@ -1045,6 +1046,118 @@ subtest_23_swi_during_stubs:
     hvc     #2
     pop     {r4, r5, r6, lr}
     fail_st 23
+
+    @ ---- subtest 24: ScratchVA-fallback stub preserves caller state -----
+    @ The shadow-stub install path falls back to the ScratchVA variant
+    @ when liveness analysis can't find 2 dead candidate registers from
+    @ {R0..R3, R12, R14}. The ScratchVA stub uses a hypervisor-side
+    @ scratch slot in IPA 0x0180_0000 (kernel L1[0x18]) plus TPIDRURW to
+    @ save the caller's three scratch registers. This subtest:
+    @
+    @   1. Pre-loads sentinels into R0..R3 and R12 (R14 is the return
+    @      LR, naturally live).
+    @   2. Sets NZCV to a known pattern (N=0, Z=0, C=1, V=0 via CMP).
+    @   3. Saves NZCV pre-access into R6.
+    @   4. Performs LDRB Rt=R5, [Rn=R4]. The post-access instruction
+    @      window reads all candidates (R0..R3, R12, R14) before any of
+    @      them is written, forcing the liveness analyzer to mark all
+    @      candidates live → ScratchVA fallback.
+    @   5. Saves NZCV post-access into R7.
+    @   6. Reads each candidate to verify the ScratchVA stub's save/
+    @      restore round-trip (these reads also satisfy the analyzer's
+    @      forward-walk liveness requirement).
+    @   7. Verifies R0..R3, R12, byte read, and NZCV.
+    @
+    @ Failure subcodes (printed via HVC #2 then halted via fail_st):
+    @   0x240 — R0  not preserved (ScratchVA STR/LDR caller_sea broken)
+    @   0x241 — R1  not preserved
+    @   0x242 — R2  not preserved
+    @   0x243 — R3  not preserved
+    @   0x244 — R12 not preserved (TPIDRURW save-slot or sad register
+    @                              choice broken if R12 was the sad)
+    @   0x245 — byte read returned the wrong value
+    @   0x246 — NZCV clobbered by the stub (MRS/MSR slot 4/9 broken)
+subtest_24_scratch_va_preserves_caller:
+    push    {r4-r11, lr}
+    load_u32 r4, SCRATCH_BASE
+    load_u32 r5, 0xDEADBEEF
+    str     r5, [r4]                @ phys[r4..r4+3] LE = EF BE AD DE,
+                                    @ BE-32 byte at offset 0 = phys[3] = 0xDE.
+
+    @ Sentinels into R0..R3, R12. R14 is the return LR (preserved by ABI).
+    load_u32 r0,  0xC0DE0000
+    load_u32 r1,  0xC0DE0001
+    load_u32 r2,  0xC0DE0002
+    load_u32 r3,  0xC0DE0003
+    load_u32 r12, 0xC0DE000C
+
+    @ Set NZCV to a known pattern. r6 = 1, then CMP r6, #0 → N=0 Z=0 C=1 V=0.
+    mov     r6, #1
+    cmp     r6, #0
+    @ Capture pre-access NZCV into r6.
+    mrs     r6, cpsr
+    and     r6, r6, #0xF0000000
+
+    @ The patched LDRB. Rt=R5, Rn=R4 — neither is a candidate, so the
+    @ operand-exclusion picker has all 6 candidates to choose from.
+    @ The post-access window below reads R0..R3, R12, R14 → liveness
+    @ picker returns None → ScratchVA path.
+    ldrb    r5, [r4]                @ r5 = byte at phys[r4^3] = 0xDE
+
+    @ Capture post-access NZCV before any flag-clobbering instruction.
+    mrs     r7, cpsr
+    and     r7, r7, #0xF0000000
+
+    @ Force-mark every candidate live by reading it before writing.
+    @ CMP reads each candidate (writes only NZCV — a GPR sentinel
+    @ comparison; the saved post-access NZCV is already in r7 and is
+    @ unaffected by these CMPs).
+    cmp     r0, #0                  @ read R0
+    cmp     r1, #0                  @ read R1
+    cmp     r2, #0                  @ read R2
+    cmp     r3, #0                  @ read R3
+    cmp     r12, #0                 @ read R12
+    cmp     lr, #0                  @ read R14
+
+    @ Verify R0..R3, R12 unchanged. r8 used as compare scratch.
+    load_u32 r8, 0xC0DE0000
+    cmp     r0, r8
+    bne     .Lst24_fail_r0
+    load_u32 r8, 0xC0DE0001
+    cmp     r1, r8
+    bne     .Lst24_fail_r1
+    load_u32 r8, 0xC0DE0002
+    cmp     r2, r8
+    bne     .Lst24_fail_r2
+    load_u32 r8, 0xC0DE0003
+    cmp     r3, r8
+    bne     .Lst24_fail_r3
+    load_u32 r8, 0xC0DE000C
+    cmp     r12, r8
+    bne     .Lst24_fail_r12
+
+    @ Verify byte read.
+    cmp     r5, #0xDE
+    bne     .Lst24_fail_byte
+
+    @ Verify NZCV preserved across the access.
+    cmp     r6, r7
+    bne     .Lst24_fail_nzcv
+
+    pop     {r4-r11, lr}
+    bx      lr
+
+.Lst24_fail_r0:    mov r0, #0x240; b .Lst24_fail_done
+.Lst24_fail_r1:    mov r0, #0x241; b .Lst24_fail_done
+.Lst24_fail_r2:    mov r0, #0x242; b .Lst24_fail_done
+.Lst24_fail_r3:    mov r0, #0x243; b .Lst24_fail_done
+.Lst24_fail_r12:   mov r0, #0x244; b .Lst24_fail_done
+.Lst24_fail_byte:  mov r0, #0x245; b .Lst24_fail_done
+.Lst24_fail_nzcv:  mov r0, #0x246
+.Lst24_fail_done:
+    hvc     #2
+    pop     {r4-r11, lr}
+    fail_st 24
 
     .global patch_end
 patch_end:

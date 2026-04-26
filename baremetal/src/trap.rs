@@ -750,6 +750,20 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
                 kprintln!("snapshot: save failed: {}", e);
             }
         }
+        0x21 => {
+            // Full kernel-state dump on demand. Issued from a guest
+            // ROM patch at well-chosen PCs (e.g. just before a
+            // suspected stall, or right after Init__5TTask of a task
+            // we want to trace) to capture scheduler + ports +
+            // monitors in one shot.
+            crate::task_dump::dump_full();
+        }
+        0x22 => {
+            // Dump one kernel object by id. Guest puts the id in r0.
+            let id = ctx.x[0] as u32;
+            kprintln!("=== HVC dump_object_by_id({:#x}) ===", id);
+            crate::task_dump::dump_object_by_id(id);
+        }
         v if v == crate::rom_patches::POWEROFF_REBOOT_HVC_IMM => {
             handle_poweroff_reboot(ctx);
         }
@@ -1610,6 +1624,8 @@ fn handle_diag(ctx: &mut TrapContext) {
                 if !FIRED.swap(true, core::sync::atomic::Ordering::Relaxed) {
                     kprintln!("=== one-shot newt-DABT diagnostic: cdsv save areas ===");
                     crate::task_dump::dump_save_area_for_named(b"cdsv");
+                    kprintln!("=== one-shot newt-DABT diagnostic: full kernel dump ===");
+                    crate::task_dump::dump_full();
                     kprintln!("=== end one-shot newt-DABT diagnostic ===");
                 }
             }

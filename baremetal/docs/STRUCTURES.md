@@ -157,9 +157,11 @@ struct TTaskQItem {             // 40 bytes
     // +0x08..+0x27 unknown
 };
 struct TDoubleQItem {           // 12 bytes
-    void*   next;               // +0x00
-    void*   prev;               // +0x04
-    void*   container;          // +0x08?  (TDoubleQContainer ptr — verify)
+    void*   next;               // +0x00   next entry's TDoubleQItem (or 0)
+    void*   prev;               // +0x04   prev entry's qitem (or container itself
+                                //         when this is the head — Add stores the
+                                //         container ptr there as a sentinel)
+    void*   container;          // +0x08   back-ptr to TDoubleQContainer (set by Add)
 };
 ```
 
@@ -196,21 +198,58 @@ Citations: `TObjectTable::Init` at `0x319df4`; `Get` at `0x319f14`;
 
 ```c
 ID = (sequence << 4) | type;
-type bits[3:0] — empirically derived from 717006:
-   0x3 = Task         (e.g. STKU id=0x12e3, drvl id=0x1803)
-   0x8 = Monitor      (high count in trace queries)
-   0x9 = Phys         (high count in trace queries)
+type bits[3:0] — full mapping for 717006 (kernel side, the value stored in ID):
+   0x2 = TPort
+   0x3 = TTask
+   0x4 = TEnvironment
+   0x5 = TDomain          (TKDomain shares this type; TKDomain : TDomain)
+   0x6 = TSemaphoreList   (DDK calls it SemList)
+   0x7 = TSemaphoreGroup
+   0x8 = TSharedMem
+   0x9 = TSharedMemMsg
+   0xa = TMonitor
+   0xb = TPhys
+   (0x0, 0x1, 0xc..0xf — unused by kernel objects in this build)
 sequence bits[31:4] — global counter from NextGlobalUniqueId()
                       (advances monotonically; resets some flag at 256
                       but the counter keeps going)
 ```
 
-**Warning:** the OS600 DDK `KernelTypes.h` lists the enum as
-`{Port, Task, Env, Domain, SemList, SemGroup, SharedMem, SharedMemMsg,
-Monitor, Phys}` — the order does **not** match 717006 (where Task=3,
-not 1). The actual 717006 mapping for non-confirmed values is still
-unknown — we observe types 0x2, 0x4, 0x5, 0x7, 0xa, 0xb in trace
-without yet attributing them.
+**The kernel KernelTypes enum is the user ObjectTypes enum + 2.** The
+public DDK header `KernelTypes.h` defines `{Port=0, Task=1, Env=2,
+Domain=3, SemList=4, SemGroup=5, SharedMem=6, SharedMemMsg=7, Monitor=8,
+Phys=9}` — those are the values user-mode code passes to
+`MakeObject__8TUObjectF11ObjectTypesP13ObjectMessageUl` (e.g. r1=8
+inside `Init__9TUMonitor` at ROM 0x2594f8). The kernel's
+`MonitorDispatchSWI` translates them to its internal KernelTypes by
+adding 2 before constructing the kernel object and calling
+`RegisterObject__FP13TKernelObject11KernelTypesUl` (the public kernel
+helper that wraps `Add__12TObjectTable`).
+
+**Citations for individual mappings:**
+- `Init__9TUMonitor` ROM 0x2594f0..2594f8: `mov r1, #8; ... bl
+  MakeObject` (user side passes 8, kernel registers as 0xa).
+- `InitObjectManager` ROM 0x1495a0..1495b8: `bl __ct__8TMonitor; ...
+  mov r1, #10; bl RegisterObject` — proves Monitor = kernel type 10.
+- `OsBoot` ROM 0x14817c..148194: `bl __ct__5TTask; ... mov r1, #3; bl
+  RegisterObject` — proves Task = kernel type 3.
+- `InitKernelDomainAndEnvironment` ROM 0xe90e8..e911c: registers
+  TEnvironment with r1=4 (kernel type 4) and TKDomain with r1=5
+  (kernel type 5).
+- `Init__5TTask` ROM 0x252468 + 0x2524b0: registers a TSharedMem at
+  TTask+0xf0 with r1=8 (kernel type 8) and a TSharedMemMsg at
+  TTask+0xf4 with r1=9 (kernel type 9). (Every task ends up owning
+  one of each as embedded fields.)
+- `InitTPhysAndAddToObjectTable` ROM 0x148f28 (path inside an
+  unnamed function, post-`Init__5TPhys`): `mov r1, #11` then `b
+  0x1490ec` falls through to `bl RegisterObject`. Proves Phys =
+  kernel type 11 (0xb).
+
+The remaining types (Port=2, SemList=6, SemGroup=7) are confirmed by
+the +2 pattern but not yet by direct disasm observation of their
+RegisterObject call (`__ct__5TPortFv` is not exported as a separate
+symbol in this ROM; ports are constructed inline through the
+`MonitorDispatchSWI` path and we haven't traced that kernel side).
 
 Hash bucket index = `(id >> 4) & 0x7F` ⇒ 128 buckets.
 
@@ -268,44 +307,51 @@ ports track waiters" below.
 
 ### How ports track waiters
 
-`TPort::Receive` at ROM `0x192330` reveals the port layout. When a
-port has no message ready and the receiver is allowed to block:
+`TPort::Receive` at ROM `0x192330`, `Send` at `0x19211c`, dtor at
+`0x191b40`, and `PortReceiveKernelGlue` at `0x192224` together
+establish the port layout. Type code: **0x2** (KernelType_Port,
+confirmed by `PortResetKernelGlue` ROM `0x1924a0`: `mov r0, #2; bl
+ConvertIdToObj`).
 
 ```c
-struct TPort /* : TKernelObject */ {
+struct TPort /* : TKernelObject */ {           // ~56 bytes
     // +0x00 / +0x04   id, hash-chain next  (TKernelObject base)
-    // +0x08..+0x0F    unknown
-    TDoubleQContainer  pending_messages;   // +0x10  msgs already sent
-                                           //        (length 20 B)
-    TDoubleQContainer  waiting_receivers;  // +0x24  TSharedMemMsg*'s
-                                           //        of blocked receivers
+    // +0x08..+0x0F    unknown — ctor not exported as a separate symbol
+                       //        in this ROM; ports are constructed inline
+                       //        from MonitorDispatchSWI handlers we
+                       //        haven't yet traced kernel-side
+    TDoubleQContainer  pending_messages;   // +0x10  20 B — msgs already sent,
+                                           //        not yet received. Walked
+                                           //        by Receive (0x192378) and
+                                           //        drained by dtor (0x191b58).
+    TDoubleQContainer  waiting_receivers;  // +0x24  20 B — TSharedMemMsg*'s
+                                           //        of blocked receivers.
+                                           //        Walked by Send (0x192170);
+                                           //        drained by dtor (0x191ba8).
 };
 ```
 
-Citations: `TPort::Receive` at `0x192330`:
+Citations: `Send__5TPort` at `0x19211c`:
 ```
-add r0, r6, #16    ; r0 = port + 16 = pending-messages queue
-bl Peek/GetNext on TDoubleQContainer
+add r0, r6, #16    ; r0 = port + 0x10 = pending-messages queue
+bl  Peek__17TDoubleQContainer
 ...
-add r0, r6, #36    ; r0 = port + 36 (=0x24) = receivers/waiters queue
-mov r1, r4         ; r1 = TSharedMemMsg* msg (the receiver token)
-bl Add__17TDoubleQContainerFPv
+add r0, r6, #36    ; r0 = port + 0x24 = receivers queue
+mov r1, r4         ; r1 = msg
+bl  Add__17TDoubleQContainerFPv
 ```
+`Receive__5TPort` at `0x192330` does the symmetric walk: it walks
++0x10 looking for a matching pending msg, and if none is found and
+the caller is willing to block, it adds the receiver-msg to +0x24.
 
-**Crucial:** the link in the waiter queue points to a
-`TSharedMemMsg`, **not** to the `TTask` itself. The msg presumably
-records the requesting task (some field within — TODO map). So
-"who's blocked on what" must be enumerated by walking ports and
-their waiter queues, then chasing each msg back to its owner task.
+**Identifying who is blocked on a port:** walk `port+0x24` (or use
+`walk_dqc` in `src/task_dump.rs`); each entry is a TSharedMemMsg
+whose `+0x70` field is the receiving task's ID. Resolve via
+`gObjectTable[bucket((id>>4)&0x7F)]` to the TTask\*. See the
+TSharedMemMsg layout above for the full field list.
 
-To enumerate blocked tasks comprehensively from the hypervisor:
-1. Walk `gObjectTable` for `type=Port` (TODO: identify Port type bits
-   — it's neither 3, 8, nor 9; observe more types in trace).
-2. For each port, walk `port+0x24`'s TDoubleQContainer.
-3. Each entry is a `TSharedMemMsg` — read the owner-task field
-   (TODO: identify offset).
-
-Same pattern likely for semaphores / shared-mem.
+Same pattern for monitors (TMonitor +0x24 is also a
+TDoubleQContainer — see "TMonitor" below).
 
 ### Observed task IDs and names (this run)
 
@@ -392,6 +438,235 @@ never produces (in Einstein the stack at `sp_usr+0x08` holds a normal
 stack-pointer pushed by `TUPort::Receive` 0x259d2c).
 
 ---
+
+## TMonitor (ROM `__ct__8TMonitorFv` at `0x11fb60`)
+
+The monitor is the kernel's mutual-exclusion + serialised-message
+primitive — every `OBJM`, `PMGR`, `PTBL`, `STK*`, `ROM*` task in the
+boot trace is the helper-task spawned by some monitor's `Init` to run
+its body. Type code: **0xa** (KernelType_Monitor, confirmed by
+`MonitorDispatchKernelGlue` ROM `0x11fc30`: `mov r0, #10; bl
+ConvertIdToObj`).
+
+```c
+struct TMonitor /* : TKernelObject */ {        // 72 bytes
+    // +0x00 / +0x04   id, hash-chain next  (TKernelObject base)
+    // +0x08          ULong owner-or-env id (compared with gCurrentTask+8 in
+                     //        Aquire ROM 0x120278; possibly env id used for
+                     //        access checks)
+    // +0x0c          unknown
+    ULong  depth;             // +0x10  re-acquire depth — incremented by
+                              //        Aquire (ROM 0x120298), decremented by
+                              //        FlushTasksOnMonitor (ROM 0x11fbf0)
+    ULong  state_flags;       // +0x14  bits 0..1 checked at start of Aquire
+                              //        (ROM 0x12024c) — entry guard / aborted?
+    // +0x18          unknown (zeroed in ctor)
+    // +0x1c          unknown (zeroed)
+    // +0x20          unknown (zeroed)
+    TDoubleQContainer waiters;// +0x24  20 B — TDoubleQContainer of blocked
+                              //        TTasks. link_offset = 0xc8, so each
+                              //        entry's qitem is task->wq_link_2 (the
+                              //        second TDoubleQItem embedded in TTask).
+                              //        Constructed with a CheckBeforeAdd
+                              //        callback (ROM 0x11fb8c..fb94 passes
+                              //        a function ptr in r2 and self in r3).
+    // +0x38          ptr (zeroed in ctor)
+    // +0x40          ptr (zeroed)
+    // +0x45          byte (set in Release ROM 0x1202fc — likely a "released"
+                     //        sentinel or "monitor-is-suspended" flag)
+    // +0x46          byte (zeroed)
+};
+```
+
+Citations: ctor at `0x11fb60` (`mov r0, #72`):
+```
+add r0, r4, #36         ; +0x24
+mov r3, r4              ; CheckBeforeAdd ctx = self
+ldr r2, [pc, #48]       ; CheckBeforeAdd fn ptr
+mov r1, #200            ; link_offset = 0xc8 (TTask.wq_link_2)
+bl  __ct__17TDoubleQContainerFPcPFPvT1_vPv
+```
+`Aquire__8TMonitor` at `0x12022c` (waiter add):
+```
+add r0, r4, #36         ; monitor +0x24
+mov r1, r5              ; r5 = gCurrentTask
+bl  Add__17TDoubleQContainerFPv
+```
+`FlushTasksOnMonitor` at `0x11fbc8` (waiter drain → `ScheduleTask`):
+```
+add r0, r0, #36         ; +0x24
+bl  Remove__17TDoubleQContainerFv   ; returns entry = qitem - 0xc8 = TTask*
+ldr r1, [r4, #16]       ; depth
+sub r1, r1, #1
+str r1, [r4, #16]
+bl  ScheduleTask__FP5TTask          ; reschedule the unblocked task
+```
+
+**Diagnostic implication:** unlike a TPort whose waiters are
+TSharedMemMsg tokens, a TMonitor's waiters are TTasks **directly**.
+So enumerating "who is blocked on which monitor" is one walk shorter:
+walk `monitor+0x24`, each entry IS a TTask, read `task+0x00` for the
+id and resolve its name via `STaskSwitchedGlobals`.
+
+## TSharedMemMsg (ROM `__ct__13TSharedMemMsgFv` at `0x1e017c`)
+
+The kernel-side message-passing token. Every cross-task `TUPort::Send`,
+`Receive`, `SendRPC` and similar is mediated by one of these. Each
+TTask owns one as an embedded sub-object at `task+0xf4` (registered
+with KernelType=9 by `Init__5TTask` at ROM `0x2524b0`). Type code:
+**0x9** (KernelType_SharedMemMsg).
+
+```c
+struct TSharedMemMsg /* : TKernelObject */ {       // 168 bytes
+    // +0x00 / +0x04   id, hash-chain next  (TKernelObject base)
+    // +0x08..+0x23    inherited from TSharedMem (28 B);
+    //                 see Init__10TSharedMem ctor — buffer base/limit, env,
+    //                 flags. Detailed offsets TBD.
+    TDoubleQItem  q1;          // +0x30   12 B — qitem used when msg is parked
+                               //         on a TPort or TMonitor waiter/pending
+                               //         queue. Confirmed ctor at 0x1e01a4.
+    // +0x3c             cleared by Init / PortReceiveKernelGlue
+    // +0x40             cleared
+    ULong         state_or_obj;// +0x44   "in-use" sentinel during PortReceive
+                               //         (set to 1 at ROM 0x1922b8); later set
+                               //         to a TKernelObject* by CompleteMsg
+                               //         (ROM 0x1e05e8) when the msg parks on
+                               //         a Port (type 2) or Task (type 3).
+    // +0x48             user ref-con (returned by SMemMsgGetUserRefConKernelGlue
+                               //         ROM 0x1e01f0)
+    // +0x4c             buffer-related (see CompleteReceiver ROM 0x1e0494)
+    ULong         flags;       // +0x50   bit 0x01000000 = msg is a sub-message
+                               //         (CompleteReceiver checks this);
+                               //         bits 0x02000000/0x03000000 control
+                               //         lifecycle (CompleteMsg ROM 0x1e0508)
+    ULong         filter;      // +0x54   recv filter (set by PortReceiveKernelGlue
+                               //         ROM 0x1e0863); compared against sender's
+                               //         flags in Send/Receive's iteration loop
+    // +0x58             ULong  result1   (returned to caller via
+                               //         SMemMsgCheckForDoneKernelGlue ROM 0x1e02d0)
+    // +0x5c             ULong  result2   (same path, ROM 0x1e02e0)
+    // +0x60             ULong  result3
+    // +0x64             ULong  result4
+    // +0x68             ULong  recv_override_id (used at ROM 0x1922f8 when
+                               //         flag bit 0 of incoming `r4` is set)
+    // +0x6c             ULong  parked_on_id    (set at 0x1922fc to either
+                               //         current-task id at +0x70 or override
+                               //         at +0x68; its low 4 bits identify the
+                               //         owner's KernelType — Port=2 / Task=3)
+    ULong         receiver_id; // +0x70   id of the task that issued Receive
+                               //         (= gCurrentTask->id at ROM 0x1922e0)
+    // +0x74             ULong (initialised to 0; reset to msg+0x78 by
+                               //         CompleteReceiver ROM 0x1e04dc)
+    // +0x78             ULong (initialised to 1)
+    ULong         sender_id;   // +0x7c   sender task id (resolved as Type=3
+                               //         in CompleteMsg ROM 0x1e0580 to find
+                               //         the sender's TTask*)
+    TDoubleQItem  q2;          // +0x80   12 B — qitem used when msg is linked
+                               //         from a parent msg's child-completion
+                               //         container at +0x8c (see below).
+                               //         ctor at 0x1e01ac.
+    TDoubleQContainer children;// +0x8c   20 B — child-msgs awaiting completion;
+                               //         link_offset = 128 (= 0x80, i.e. uses
+                               //         each child's q2). ctor at 0x1e01b8.
+};
+```
+
+Citations: ctor at `0x1e017c` allocates 168 bytes:
+```
+mov r0, #168
+bl  __nw__FUi
+add r0, r4, #48     ; +0x30 q1 ctor
+bl  __ct__12TDoubleQItemFv
+add r0, r4, #128    ; +0x80 q2 ctor
+bl  __ct__12TDoubleQItemFv
+add r0, r4, #140    ; +0x8c container ctor
+mov r1, #128        ; link_offset = 0x80 (uses q2 of each child)
+bl  __ct__17TDoubleQContainerFPc
+```
+`PortReceiveKernelGlue` at `0x192224` writes the receiver-task id +0x70:
+```
+ldr r0, [r7]        ; r0 = gCurrentTask
+ldr r0, [r0]        ; r0 = curtask->id
+ldr r1, [sp]        ; r1 = msg
+str r0, [r1, #112]! ; msg->[0x70] = receiver id
+```
+`CompleteMsg` at `0x1e0524` reads sender id from +0x7c:
+```
+ldr r1, [r4, #124]    ; +0x7c = sender id
+mov r0, #3            ; KernelType_Task
+bl  ConvertIdToObj    ; resolve to TTask*
+```
+
+**Diagnostic implication:** to identify "which task is blocked on a
+port", walk the port's waiter queue (`port+0x24` TDoubleQContainer)
+with link_offset = whatever the container reports (typically 0x30 for
+`q1`), then for each entry read `msg+0x70` (receiver id) and look it
+up in `gObjectTable` to find the TTask*. Cross-check against
+`msg+0x6c` whose low nibble must equal 2 (Port) when the msg is
+currently parked on a port.
+
+## TDoubleQContainer (ROM `__ct__17TDoubleQContainerFv` at `0x9c8d0`)
+
+The kernel's primary intrusive doubly-linked-list primitive. Used by
+ports (pending msgs, waiters), monitors (waiters), the timer engine,
+and several other kernel subsystems. **Not a kernel object** — it has
+no ID and isn't registered in `gObjectTable`; it's embedded inside
+other structures as a field.
+
+```c
+struct TDoubleQContainer {       // 20 bytes (mov r0, #20; bl __nw__ in ctor)
+    void*  head;                 // +0x00   first entry's TDoubleQItem (or 0)
+    void*  tail;                 // +0x04   last entry's TDoubleQItem (or 0)
+    ULong  link_offset;          // +0x08   offset within each entry where the
+                                 //         embedded TDoubleQItem sits — Add()
+                                 //         computes &entry.qitem = entry + link_offset
+    void*  check_before_add_fn;  // +0x0c   optional CheckBeforeAdd callback
+                                 //         (set only by ctor variant
+                                 //          __ct__17TDoubleQContainerFPcPFPvT1_vPv)
+    void*  client_data;          // +0x10   opaque ptr passed to the callback
+};
+```
+
+Citations: `Init__17TDoubleQContainerFPc` at `0x9c990` (5-word zero-out,
+stores r1 to +0x08 — the link-offset arg):
+```
+mov r2, #0
+str r2, [r0]        ; +0x00 head = 0
+str r1, [r0, #8]    ; +0x08 link_offset = arg
+str r2, [r0, #4]    ; +0x04 tail  = 0
+str r2, [r0, #12]   ; +0x0c check_before_add_fn = 0
+str r2, [r0, #16]!  ; +0x10 client_data = 0
+```
+
+`Add__17TDoubleQContainerFPv` at `0x9c9b0`:
+```
+ldr r0, [r4, #8]   ; link_offset
+add r5, r0, r1     ; &qitem = link_offset + entry
+str 0, [r5]        ; qitem.next = 0
+ldr r0, [r4]       ; head
+teq r0, #0
+streq r5, [r4]     ; head = &qitem
+streq r4, [r5, #4] ; qitem.prev = container (sentinel for head)
+ldrne r0, [r4, #4] ; tail
+strne r5, [r0]     ; old_tail.next = &qitem
+strne r0, [r5, #4] ; qitem.prev = old_tail
+str r5, [r4, #4]   ; tail = &qitem
+str r4, [r5, #8]!  ; qitem.container = self
+```
+
+**Walking a TDoubleQContainer for diagnostics:**
+1. Read `head` (+0x00). If 0, queue is empty.
+2. Read `link_offset` (+0x08). Each entry pointer is reached by
+   `entry = qitem - link_offset`.
+3. From the head qitem, walk `qitem.next` until 0; the very last
+   `qitem.prev` should be `container` itself (sentinel) but the
+   chain terminates on `next == 0`.
+
+The link-offset varies per use:
+- TPort pending-msgs queue (+0x10): entries are `TSharedMemMsg*`, qitem
+  embedded within the msg (offset TBD in TSharedMemMsg layout).
+- TPort waiters queue (+0x24): entries are `TSharedMemMsg*` as well.
+- TMonitor waiters queue (+0x24): entries TBD.
 
 ## See also
 

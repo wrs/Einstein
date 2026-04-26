@@ -81,32 +81,20 @@ fn program_cval(cval: u64) {
     }
 }
 
-/// Translate a Newton-domain tick value into the CNTPCT_EL0 domain, given
-/// the epoch captured by `vic::init()`.
-fn newton_ticks_to_cntpct(newton_ticks: u32) -> u64 {
-    let epoch_cntpct = vic::timer_epoch();
-    let newton_hz = vic::NEWTON_TICK_HZ as u128;
-    let cnt_hz = read_cntfrq() as u128;
-    // `newton_ticks` is a 32-bit value in the guest's ticks domain; we don't
-    // try to handle wraparound across the full 64-bit range here — the
-    // Newton kernel rearms match_reg often enough that this is fine.
-    let scaled = (newton_ticks as u128 * cnt_hz) / newton_hz;
-    epoch_cntpct.wrapping_add(scaled as u64)
-}
-
-/// Recompute the nearest pending Newton match and reprogram CNTHP_CVAL_EL2.
-/// Called after any write to match_reg[i] or int_ctrl, and from the IRQ
-/// handler after clearing a fired match bit.
+/// Reprogram CNTHP_CVAL_EL2 for the next 16 ms heartbeat. The
+/// heartbeat exists purely to give the EL2 IRQ vector control
+/// periodically — primarily so `tick_page::update` runs even when the
+/// guest is in a non-trapping loop, and so `poll_timer_matches` runs
+/// even when no sync trap has fired recently.
 ///
-/// Also clamps the deadline to a 16 ms fallback heartbeat even if the VIC
-/// match is far in the future. The non-trapping tick page
-/// (`stage2::TICK_PAGE`) only advances when `stage2::tick_page::update()`
-/// runs, and that is driven off the CNTHP IRQ — if CNTHP is only armed
-/// for rare VIC matches the guest's busy-wait delay loops would spin
-/// forever on a stale tick value. 16 ms (~60 Hz) is fast enough that
-/// early calibration loops see at least one tick update per poll cycle,
-/// and slow enough to keep trace volume manageable once the kernel is
-/// past early boot.
+/// We do *not* arm against a specific Newton-tick match deadline.
+/// With instruction-anchored synthetic ticks (see
+/// `vic::SYNTH_TICKS`) there is no fixed wall-time → tick mapping,
+/// so a wall-anchored CNTPCT deadline can't be derived from a Newton
+/// tick value. Instead, every sync trap advances synthetic ticks via
+/// `tick_advance` and runs `poll_timer_matches` — match deliveries
+/// happen at sync-trap granularity, which is plenty fine for the
+/// kernel's preemption / alarm cadence.
 pub fn rearm() {
     let cnt_hz = read_cntfrq();
     // SAFETY: read-only sysreg.
@@ -116,41 +104,28 @@ pub fn rearm() {
             options(nomem, nostack, preserves_flags));
     }
     let heartbeat_cval = now.wrapping_add(cnt_hz / 64); // ~16 ms
-    let cval = match vic::next_pending_match() {
-        Some(t) => {
-            let vic_cval = newton_ticks_to_cntpct(t);
-            // Fire whichever deadline comes first.
-            if vic_cval.wrapping_sub(now) < heartbeat_cval.wrapping_sub(now) {
-                vic_cval
-            } else {
-                heartbeat_cval
-            }
-        }
-        None => heartbeat_cval,
-    };
-    program_cval(cval);
+    program_cval(heartbeat_cval);
 }
 
 /// Called from the EL2 IRQ vector on any physical-IRQ delivery. We only
-/// wire up CNTHP, so any IRQ here is a timer expiry: latch whatever Newton
-/// matches have been crossed, refresh the non-trapping tick page, rearm
-/// for the next deadline, and let trap.rs's shared `update_virq` set
+/// wire up CNTHP, so any IRQ here is a heartbeat expiry: drive forward
+/// progress for any guest parked in WFI on a Newton-match deadline,
+/// refresh the non-trapping tick page, latch crossed matches, and rearm
+/// for the next heartbeat. trap.rs's shared `update_virq` then sets
 /// HCR_EL2.VI for delivery to the guest.
 pub fn on_irq() {
-    // Re-evaluate the Newton VIC and decide which matches have crossed
-    // their threshold.
-    vic::poll_timer_matches();
-    // RTC alarm shares the heartbeat: latch INT_RTC_ALARM if the wall-
-    // clock calendar has crossed the alarm value. Edge-detect inside
-    // poll_alarm prevents re-firing.
-    vic::poll_alarm();
-    // Refresh the non-trapping tick register so the guest's busy-wait
-    // delay loops observe a fresh counter value on their next load.
-    // Without this the loops at BootOS:0x19FCC / 0x18F38 would spin
-    // against a stale tick value until the next IRQ fired for some
-    // other reason.
-    crate::stage2::tick_page::update();
+    // If the guest has made no sync-trap progress since the last
+    // heartbeat, push synthetic ticks past the next pending match so
+    // the deadline fires here instead of waiting for guest progress
+    // that won't come (WFI / long busy-wait). No-op when the guest is
+    // making progress.
+    // Heartbeat path bumps SYNTH_TICKS by Δ_heartbeat (so non-trapping
+    // busy-waits make progress) and fast-forwards past any pending
+    // match deadline if the guest is parked.
+    vic::heartbeat_tick_update();
+    // Republish ticks + poll match crossings.
+    crate::stage2::tick_page::update_from_heartbeat();
     // The match that woke us is now latched in vic::int_present; rearm
-    // for the next pending deadline so we don't re-fire immediately.
+    // for the next 16 ms heartbeat so we don't re-fire immediately.
     rearm();
 }

@@ -389,50 +389,150 @@ const K_HDWR_GPIO_E000: u64 = 0x0F18_E000;
 const K_HDWR_GPIO_E800: u64 = 0x0F18_E800;
 const K_HDWR_GPIO_EC00: u64 = 0x0F18_EC00;
 
-/// Monotonic ratchet for `ticks()`. The Newton kernel's `GetClock`
-/// detects a 32-bit wrap by `cmp current_ticks, gClock.low; addls high,
-/// high, #1` — i.e., it treats `current_ticks <= gClock.low` as a wrap.
-/// If two consecutive `ticks()` reads return the same value (which can
-/// happen when CNTPCT hasn't advanced enough between two close calls,
-/// especially under QEMU TCG where CNTPCT advances much slower than wall
-/// clock), the kernel mis-detects a wrap and bumps `gClock.high` even
-/// though no wrap occurred. That permanently desynchronises gClock.high
-/// from alarm.high (which was queued at the un-bumped value), and the
-/// alarm engine wedges in a tight `TTimerEngine::Alarm` loop because
-/// `CompCompare(now, alarm)` returns -1 forever.
+/// Synthetic Newton-tick counter. Bumped by `tick_advance` from the
+/// hypervisor's tick-page update path — once on every guest sync trap
+/// and once on every CNTHP heartbeat. **Decoupled from wall clock.**
 ///
-/// Ratchet ensures every read returns strictly greater than the prior
-/// read: if the raw computation comes out equal-or-less, return
-/// last+1 instead. Wrap-detect in `GetClock` still works correctly
-/// after a real wrap (raw becomes much smaller than last, ratchet
-/// outputs `last+1` which then wraps naturally over many calls).
-static LAST_TICKS: AtomicU32 = AtomicU32::new(0);
+/// Why not wall-anchored: under QEMU TCG with `--features trace,quiet`
+/// and the shadow-stub UDF emulator we execute ~100× fewer guest
+/// instructions per host wall-second than Einstein's JIT does (each
+/// HVC trampoline alone costs ~30 µs). When the kernel's polling loops
+/// (TBIOInterface::WaitBIOStatus, TDelayTimer::TimedOut callers, etc.)
+/// arm a wall-anchored Newton-tick deadline, our wall-clock-derived
+/// tick value crosses that deadline after far fewer poll iterations
+/// than Einstein's, perturbing the kernel's heap allocator interleave
+/// and steering `__nw__FUi(184)` towards a VA range that aliases
+/// pckm's stack page. See INVESTIGATION.md.
+///
+/// The synthetic clock advances proportional to **guest progress**
+/// (each sync trap ≈ a fixed slice of guest instructions), so
+/// timeout-bounded polling loops iterate about as many times in our
+/// run as in Einstein's, regardless of how slowly the host wall clock
+/// is moving.
+///
+/// Δ per `tick_advance` call is calibrated empirically. Einstein's
+/// `TBIOInterface::WaitBIOStatus` polls `TDelayTimer::TimedOut` 65
+/// times against a 400-tick threshold, i.e. ≈ 6.15 ticks per poll
+/// iteration; rounded up to 8 to allow some slack.
+///
+/// Calendar / RTC: we deliberately do *not* try to keep this clock
+/// synchronised with wall time. `calendar_seconds()` still reads
+/// CNTPCT directly so RTC reads return plausible "seconds since 1904"
+/// values, but the kernel's tick-domain math no longer agrees with
+/// those seconds (a 1-second wall interval will not advance the tick
+/// register by 3,686,400 in this scheme). Real-time-clock semantics
+/// are not load-bearing for the Phase B boot trajectory.
+static SYNTH_TICKS: AtomicU32 = AtomicU32::new(0);
 
-/// Live tick count, scaled from A53 wall clock to Newton's 3.6864 MHz
-/// rate. Strict-monotonic via `LAST_TICKS` ratchet.
+/// How many synthetic ticks each guest sync trap adds. Tuned
+/// against Einstein's per-poll tick consumption in the BIO chip-detect
+/// loop (≈ 6.15 ticks/poll for a 400-tick threshold over 65 polls).
+/// See `SYNTH_TICKS` doc.
+const TICK_ADVANCE_PER_TRAP: u32 = 6;
+
+/// How many synthetic ticks each CNTHP heartbeat adds. The heartbeat
+/// is the only tick source for non-trapping busy-wait loops like
+/// `SafeShortTimerDelay` (BootOS:0x18f08), which read the tick page
+/// in a tight loop without ever leaving guest mode. Without this, a
+/// wait of N ticks would never complete because nothing bumps
+/// SYNTH_TICKS during the loop.
+///
+/// Tuned to make a 11 058-tick `SafeShortTimerDelay` (the first
+/// BootOS calibration call, originally 3 ms wall) complete in ≤ 11
+/// heartbeats ≈ 176 ms wall — i.e., ~50× slower than the kernel's
+/// wall-time intent, which is fine since real-time semantics aren't
+/// load-bearing for boot. Values much smaller make BootOS calibration
+/// crawl; values much larger let preemption-tier deadlines (73 720
+/// ticks for the 20 ms slice) fire on every heartbeat regardless of
+/// guest progress, defeating the instruction-anchored model.
+const TICK_ADVANCE_PER_HEARTBEAT: u32 = 1024;
+
+/// Synthetic-tick reader. Returns the current count without advancing
+/// it; advancement happens via `tick_advance` from the tick-page
+/// update path.
 pub fn ticks() -> u32 {
-    let epoch = TICK_EPOCH.load(Ordering::Acquire);
-    let now = read_cntpct();
-    let elapsed = now.wrapping_sub(epoch);
-    let freq = read_cntfrq();
-    // ticks = elapsed * NEWTON_TICK_HZ / freq. Reorder to keep within u64.
-    let raw = (elapsed as u128 * NEWTON_TICK_HZ as u128 / freq as u128) as u32;
-    loop {
-        let last = LAST_TICKS.load(Ordering::Acquire);
-        // If raw advanced, use it. Otherwise step by 1 — must be strictly
-        // greater so the kernel's wrap-detect doesn't fire spuriously.
-        let next = if raw.wrapping_sub(last) != 0 && raw.wrapping_sub(last) < 0x8000_0000 {
-            raw
+    SYNTH_TICKS.load(Ordering::Acquire)
+}
+
+/// Bump SYNTH_TICKS by the sync-trap delta. Called from
+/// `stage2::tick_page::update_from_sync_trap` (= every guest sync trap
+/// via `trap_sync_lower_aarch32`).
+pub fn tick_advance_sync_trap() -> u32 {
+    let prev = SYNTH_TICKS.fetch_add(TICK_ADVANCE_PER_TRAP, Ordering::AcqRel);
+    prev.wrapping_add(TICK_ADVANCE_PER_TRAP)
+}
+
+/// Bump SYNTH_TICKS by the heartbeat delta. Called from
+/// `timer::on_irq` (every CNTHP heartbeat) so that non-trapping
+/// busy-wait loops still see ticks advance.
+pub fn tick_advance_heartbeat() -> u32 {
+    let prev = SYNTH_TICKS.fetch_add(TICK_ADVANCE_PER_HEARTBEAT, Ordering::AcqRel);
+    prev.wrapping_add(TICK_ADVANCE_PER_HEARTBEAT)
+}
+
+/// Back-compat alias for the sync-trap path. Older callers used
+/// `tick_advance()` for both paths; new code should pick the
+/// matching variant.
+pub fn tick_advance() -> u32 {
+    tick_advance_sync_trap()
+}
+
+/// CNTHP heartbeat tick update: advance synthetic ticks for any guest
+/// parked in WFI / a non-trapping busy-wait, plus jump past any
+/// pending match deadline if the guest is making no sync-trap
+/// progress at all.
+///
+/// Without this hook:
+/// * A guest parked in `SafeShortTimerDelay` (a tight loop reading
+///   `TICK_PAGE` non-trapping) would never see ticks advance, since
+///   sync traps stop firing. The `TICK_ADVANCE_PER_HEARTBEAT` bump
+///   here is the only forward motion that loop sees.
+/// * A guest parked in WFI on a Newton-tick *match* deadline would
+///   wait until the heartbeat-sized advance crossed the match, which
+///   for a 0x12000-tick (= 73 720) preemption deadline is ≈ 18
+///   heartbeats ≈ 288 ms wall. Fine for boot; for short matches the
+///   fast-forward branch below trims it to a single heartbeat.
+///
+/// "No guest progress" is detected by SYNTH_TICKS being unchanged
+/// from the value after the *previous* heartbeat's update: if the
+/// guest had taken any sync trap, `tick_advance_sync_trap` would
+/// have bumped SYNTH_TICKS in between. Don't fast-forward when the
+/// guest is making progress — doing so would let the heartbeat skip
+/// past a polling loop's deadline before the loop iterated as many
+/// times as the kernel intended.
+pub fn heartbeat_tick_update() {
+    static LAST_HEARTBEAT_TICK: AtomicU32 = AtomicU32::new(0);
+    let last = LAST_HEARTBEAT_TICK.load(Ordering::Acquire);
+    let cur = SYNTH_TICKS.load(Ordering::Acquire);
+    let no_guest_progress = cur == last;
+
+    // Apply the heartbeat's own tick advance — needed so non-trapping
+    // busy-wait loops on TICK_PAGE see forward progress at all.
+    let after = tick_advance_heartbeat();
+
+    // If the guest hadn't moved since the last heartbeat AND there's
+    // a pending match deadline, jump past it. This trims wake latency
+    // for WFI-on-match scenarios from "deadline / Δ_heartbeat * 16 ms"
+    // down to one heartbeat.
+    let final_value = if no_guest_progress {
+        if let Some(deadline) = next_pending_match() {
+            let target = if deadline.wrapping_sub(after) < 0x8000_0000 {
+                // Deadline is at or after the just-advanced value.
+                deadline.wrapping_add(1)
+            } else {
+                // Deadline already crossed; nothing to do.
+                after
+            };
+            SYNTH_TICKS.store(target, Ordering::Release);
+            target
         } else {
-            last.wrapping_add(1)
-        };
-        if LAST_TICKS
-            .compare_exchange(last, next, Ordering::Release, Ordering::Acquire)
-            .is_ok()
-        {
-            return next;
+            after
         }
-    }
+    } else {
+        after
+    };
+
+    LAST_HEARTBEAT_TICK.store(final_value, Ordering::Release);
 }
 
 // ---------- MMIO dispatch ----------------------------------------------------

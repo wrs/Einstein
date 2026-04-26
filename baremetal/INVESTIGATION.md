@@ -115,29 +115,104 @@ So the chain is:
   → pckm resumes, reads `newt`/`cdsv` from sp_usr+8/+12,
     DataAbortHandler fires, recursive abt → "warm reboot!"
 
+### Refined model (post `dump_all_phys` walk, 2026-04-25 evening)
+
+Adding `task_dump::dump_all_phys` / `dump_phys_for_pa` (commit
+`963b3389`) walking all three known kernel object tables shows:
+
+- The kernel uses **three** TObjectTable instances, two of which
+  carry TPhys:
+  - `*(0x0c101164)` — `gPhysAllocator` at `0xc1082a0`. Holds **39
+    RAM-page TPhys** descriptors, one per 4 KiB page covering
+    PAs `0x04018000..0x04039000`. `GetPhys` (ROM `0x11c168`) hits
+    this table first when the requested type is 0xb.
+  - `*(0x0c100fc8)` — points at `gObjectTable` (`0xc10fc34`).
+    Holds **8 MMIO-region TPhys** at PAs `0x30000000..0x68000000`
+    (PCMCIA controller bases).
+  - `gObjectTable` itself — same 8 entries (the `*(0x0c100fc8)`
+    pointer dereferences to it).
+- **Exactly one TPhys claims PA 0x0402a000.** It's id `0x176b` at
+  TPhys-VA `0xc10f944`, in `gPhysAllocator`. So the "alias" is
+  *not* "two TPhys, one PA" — it's "one TPhys, two L2 entries".
+- The L2 page-table corruption sequence is therefore:
+
+  ```
+  trace 156706  AddPgPAndPerm(VA=0x0cc82000, PA=0x0402a000)   # write L2[0x82]=0x0402a00e
+  trace 156751  CopyPhysicalPage(0x0402a000, 0x0401f000, 2)    # cnt=0x02 = bitmap → bytes 0x400-0x7FF
+                                                              # of pckm's stack page get
+                                                              # overwritten with whatever is at
+                                                              # PA 0x0401f000 (which had been
+                                                              # VA 0x0cc82xxx's prior backing).
+  ...
+  trace 180958  TCardAsyncMsg::TCardAsyncMsg @ VA 0x0cc7fd70
+                ...62 ctor calls cycling through VAs up to 0x0cc82520
+  trace 180652  TCardMessage::TCardMessage at VA 0x0cc82250
+                writes 'newt' to *(self+0) and 'cdsv' to *(self+4)
+                → those land at PA 0x0402a250 / 0x0402a254 = pckm's sp_usr+8/+12
+  ```
+
+  i.e. the corruption isn't `CopyPhysicalPage`'s 0x400-byte chunk
+  (which doesn't intersect `sp_usr=0x248`); it's the kernel
+  allocator's *direct* writes through the alias VA after the
+  remap — `TCardServer::TCardServer`'s array constructor fills
+  TCardMessages, and the one at VA 0x0cc82250 paints "newt"/"cdsv"
+  on top of pckm's saved stack frame.
+
+### Why Einstein doesn't crash with the same logic
+
+Einstein's `RememberMapping` for the recycled PA 0x0402a000 chooses
+**VA `0x0cca3000`** instead of our `0x0cc82000`. Same kernel TPhys
+(id `0x176b`), same physical destination, but the *new* L2 entry
+sits in a region where no later allocator writes — so PA
+0x0402a000 keeps the (mostly-zero) contents from the post-copy
+state. Pckm wakes up, reads `sp_usr+8` = 0, the
+`cmp r5, #0; strne r1, [r5]` predicate at ROM 0x3ae234..0x3ae238
+sees Z=1, the `strne` is skipped, and pckm proceeds normally.
+
+### What determines the new VA
+
+`TStackManager::CopyPagesAfterStackCollided` (ROM `0x1f7540`) takes
+its destination StackPage from `params[+16]`. In our run the
+destination StackPage's VA range covers 0x0cc82xxx; in Einstein's,
+it covers 0x0cca3xxx. The choice is upstream of `CopyPagesAfter`
+in `TStackManager::ResolveFault` / `FindOrAllocPage`. The
+divergence has to be in *which TStackInfo* gets selected (i.e.
+which task is the collision target), and that depends on the heap
+state established by earlier boot.
+
 ### Open next steps
 
-1. Identify what makes our hypervisor pick TPhys id 0x13cb vs
-   Einstein's 0x160b at the collision point. Both are type-0xb
-   ("Phys" = 9, plus another type bit?). Trace `TPageManager` /
-   `TUDomainManager::Get` calls earlier in boot to see which
-   TPhys descriptors get allocated to which VAs — the divergence
-   should propagate from a different `RememberMapping` call ~5–10
-   k traces before the collision.
-2. Add a `phys_dump` walker (mirroring `task_dump` but for type-9
-   gObjectTable entries) to both `baremetal/src/task_dump.rs` and
-   `baremetal/probe/probe.cpp`. Walk it at a matched boot phase
-   on both sides and diff the {id → PA} mapping. The divergent
-   TPhys at the moment the collision is detected is the smoking
-   gun.
-3. Consider an early-boot `RememberMapping` audit: capture a
-   sequence of (caller_pc, va, tphys_id) tuples from each run and
-   diff. The first divergence tells us which kernel function got
-   different inputs.
-4. As an upstream / bisecting check, run `NewtonTrace` with a
-   smaller wall-clock window (10 s) so the trace size is
-   manageable, then compare the early-boot AddPgPAndPerm sequences
-   directly.
+1. **Audit `gPhysAllocator` at the boot phase corresponding to
+   trace ~156k.** With `dump_all_phys` we can now print the PA
+   map of every RAM page on both sides. If our hypervisor's
+   layout of {id → PA} differs from Einstein's at the same phase,
+   that's the upstream divergence. Add the same walker to
+   `baremetal/probe/probe.cpp` so the dumps are byte-identical
+   when the kernel state is byte-identical.
+
+2. **Audit StackInfo / StackPage state at the wedge.** The new
+   `dump_full` doesn't yet enumerate `TStackInfo`; add one. The
+   key fact is `StackInfo[+16]` (= "VA base") for the destination
+   page in the `CopyPagesAfter` call — if our run's StackInfo
+   has VA-base 0x0cc82000 while Einstein's has 0x0cca3000, the
+   StackInfo pool is the divergent input.
+
+3. **`RememberMapping` audit.** Hook a count + last-args probe
+   on `RememberMapping` (ROM `0x11c7d8`) and emit a periodic
+   summary. The first call where `(va_arg, phys_id_arg)` differs
+   from Einstein's same-numbered call is the upstream divergence.
+
+4. **`__nw__FUi(184)` audit.** The TCardAsyncMsg ctor allocates
+   from a heap whose growth determines which VAs get filled. In
+   our run the array spans 0x0cc7fd70..0x0cc82520 (62 entries, 0xCC
+   stride). In Einstein's run the same array spans different VAs.
+   Identify the heap that's serving these allocs and compare
+   its size + growth pattern.
+
+(Note: prior speculation about TPhys descriptors with duplicate
+PAs is wrong — confirmed via the new walker. Likewise the
+"CopyPhysicalPage corrupted bytes 0x248" story was wrong: the
+copy's 0x02 bitmap covers only bytes 0x400..0x7FF.)
 
 ---
 

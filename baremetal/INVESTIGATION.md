@@ -3,7 +3,178 @@
 Live notes. Update as we learn more; remove old updates as we move on to
 new stalls.
 
-## Currently at — IRQ-rate + tick-page divergence fixed; newt-DABT alias narrows to scheduling order (QEMU, 2026-04-25 night)
+## Currently at — root cause: trace+UDF wall-clock skew, not heap state (QEMU, 2026-04-25 late evening)
+
+**New diagnostic data from a fresh QEMU+Einstein NewtonTrace pair plus
+trace-PC and heap-allocation diffs.** The residual newt-DABT divergence
+is downstream of a fundamental wall-clock-vs-instruction-throughput
+skew — not a heap-allocator quirk we can fix locally.
+
+### Setup
+
+- QEMU run: `cargo run --release --features trace,quiet`, 120 s wall,
+  reaches trace 197 120 / 1224 unique functions before timeout.
+- Einstein NewtonTrace: 180 s wall on
+  `_Data_/Einstein.rex + roms/newton.rom`, reaches **89.6 M traces**.
+- Both runs preserve all current source fixes (NEWTON_TICK_HZ natural,
+  tick_page refresh on sync trap, flash RO, PCMCIA chip-detect, etc.).
+- Both produce byte-identical first 16 779 PCs (line-aligned diff).
+
+### First trace-PC divergence: trace 16 780 (BIO polling loop)
+
+`diff /tmp/phaseB-2026-04-25/qemu.pcs /tmp/phaseB-2026-04-25/einstein.pcs`
+shows the runs are PC-identical for the first 16 779 trace events,
+then **Einstein executes 65 calls to `0x0008ea34
+TDelayTimer::TimedOut(void)` that our run does not**. The caller is
+`TBIOInterface::WaitBIOStatus` at `0x0026ba20`, polling for BIO chip
+status with a 400-tick (≈108 µs wall) timeout.
+
+Einstein iterates 65 times before timing out. Our run iterates **once**
+(the first inline BIO read matches expected because our BIO model
+returns 0 — but Einstein returns 0 too per `TMemory.cpp:952` "unknown
+bank #3" fallback). The difference is:
+
+| | wall budget | guest instructions executed in budget | poll iterations |
+|--|---|---|---|
+| Einstein JIT | 108 µs | ~3M (≈25M instr/s) | 65 |
+| Our QEMU+trace+UDF | 108 µs | ~150 (≈1.5M instr/s) | 1–3 |
+
+Each polling iteration in Einstein reads BIO state, calls TimedOut,
+maybe stays in atomic blocks. Across 200 k traces:
+
+| function | ours (197 k) | einstein (200 k) | Δ |
+|---|---|---|---|
+| `TDelayTimer::TimedOut` | 5 | 207 | **−202** |
+| `TDelayTimer::GetHardwareTime` | 256 | 2 410 | −2154 |
+| `SetAndClearBitsAtomic` | 598 | 948 | −350 |
+| `StartScheduler` | 106 | 371 | −265 |
+| `MakeConforming` | 640 | 0 | +640 (we reach this code earlier) |
+| `LoadFromPhysAddress` | 2 363 | 629 | +1 734 |
+| `Swap` | 6 602 | 4 674 | +1 928 |
+
+**Reading: per-trace, our run skips most polling iterations and
+"races" through to later boot phases.** Einstein spends thousands of
+trace events idling in delay loops; we don't. Net trace counts in the
+window are roughly equal because we offset by doing much more
+page-table work (`MakeConforming`, `Load/StoreToPhysAddress`,
+`FlushDCache`) that Einstein hasn't yet reached.
+
+### First heap-state divergence: SafeHeapPage::Alloc call #534
+
+Tracking `SSafeHeapPage::Alloc` arg `r0` (the page pointer) through
+both runs:
+
+| call # | ours r0 | einstein r0 | Δ trace |
+|---|---|---|---|
+| 530 | `0x0c119000` | `0x0c119000` | identical |
+| 531 | `0x0c118000` | `0x0c118000` | identical |
+| 532 | `0x0c11a000` | `0x0c11a000` | identical |
+| 533 | `0x0c11a000` | `0x0c11a000` | identical |
+| **534** | `0x0c11a000` | **`0x0c119000`** | **first divergence** |
+| 535 | `0x0c11a000` | `0x0c118000` | |
+| 538 | `0x0c11a000` | `0x0c119000` | |
+
+After call 534, Einstein cycles through pages
+(`0x11a, 0x11a, 0x119, 0x118` repeating) while our run keeps allocating
+from `0x0c11a000`. The decision is in `SafeHeapAlloc` at `0x001c5f8c`:
+`r0 = [r4+16]` (heap.first_page). Einstein's first_page rotates;
+ours doesn't.
+
+That happens because the **prior allocs filled `0x0c11a000`'s free
+space differently between runs** — our slow-execution path took fewer
+intermediate allocations from `0x118` / `0x119`, leaving `0x11a` with
+more free room when call 534 runs. From that point on the two heaps
+walk different sequences of free chunks, and `__nw__FUi(184)` for
+`TCardMessage` ends up returning a different VA range
+(`0x0cc82xxx` vs `0x0cca3xxx`), driving the alias bug we still see.
+
+### IRQ-rate confirmation
+
+Even with `NEWTON_TICK_HZ` already at natural rate, our preemptive
+timer fires far more often than Einstein's per trace event:
+
+| | first IRQ trace | total IRQs in 200k traces |
+|---|---|---|
+| Ours | 40 548 | 13 |
+| Einstein | 228 108 | 1 (full 89.6 M run: 30) |
+
+Same root cause: our slow per-wall execution means the kernel-armed
+match register reaches its deadline (20 ms wall = `0x12000` ticks for
+the preemption slice in `PreEmptiveTimerInterruptHandler` at
+`0x001cc480`) after fewer guest instructions executed.
+
+### Negative result — slowing NEWTON_TICK_HZ doesn't fix the alias
+
+Tried `NEWTON_TICK_HZ = 245_760` (15× slower than natural) on the
+hypothesis that polling-loop iteration counts would match Einstein's,
+keeping the heap allocator's interleave aligned. Result: BootOS
+canary fired at trace 164 k — boot crashed earlier than at natural
+rate (which reaches 197 k+). The kernel's `TCardServer::TCardServer`
+allocation chain still hit the alias and corrupted pckm's stack at
+PA 0x0402a000 + 0x250, just at a slightly different VA range. The
+alias is not driven by tick rate alone.
+
+(Reverted; current source has `NEWTON_TICK_HZ = 3_686_400` again.)
+
+### What this means
+
+The "scheduling-order divergence" in the prior section is a *symptom*
+of polling-loop iteration counts not matching Einstein. As long as
+we're wall-clock-anchored and the tracer adds ~30 µs per call (from
+`docs/QEMU_BUGS.md`), our QEMU+TCG+trace+UDF run executes ≈ 1/200th
+the guest-instruction throughput of Einstein-JIT in the same wall
+second, and any tick-deadline-bounded polling loop completes 100× too
+quickly in trace-event terms.
+
+### Possible directions
+
+1. **Anchor tick advancement to instruction-count proxy** rather than
+   wall-clock. E.g., increment `TICK_PAGE` by a fixed Δ per sync-trap
+   plus a residual wall-clock catch-up at heartbeat. Would require
+   careful tuning so calendar/RTC stays sane and so polling loops
+   still terminate; the right Δ has to track Einstein's effective
+   "instructions per Newton tick" ratio (≈ 6.78). The risk is that
+   any Δ chosen is brittle vs. tracer-overhead changes.
+
+2. **Implement BIO-bank canonical reads** matching Einstein's
+   documented values from `TMemoryConsts.h`
+   (`P0F052C00 → 0x0000004E`, `P0F053000 → 0x00007000`, etc.). Right
+   now our model returns 0 for every bank. Some of these defaults
+   carry status bits that the kernel polls; matching them may close
+   the BIO loop without changing tick semantics. **This is the most
+   targeted, lowest-risk experiment to try next.**
+
+3. **Investigate whether the kernel's BIO chip detect path is what
+   ultimately determines `TStackInfo`/`TStackPage` allocation order.**
+   If yes, fixing the BIO model fixes the alias by side effect even
+   though the alias is in StackManager.
+
+4. **Bound delay loops via trace-count instead of tick-deadline.**
+   Highest-effort fix and only viable in `--features trace`; probably
+   not worth pursuing.
+
+### Files changed this session
+
+None. Slow-NEWTON_TICK_HZ experiment was reverted (jj abandon). Source
+state is unchanged from the parent commit `wq 3588f7d5`.
+
+### Reproduction artifacts
+
+`/tmp/phaseB-2026-04-25/`:
+
+- `qemu.log` — 120 s QEMU trace (197 k events).
+- `einstein.trace` — 180 s NewtonTrace (89.6 M events).
+- `einstein.head200k` — first 200 k trace events for fast diff.
+- `qemu.pcs` / `einstein.pcs` — PC-only sequences for line-aligned
+  diff (first divergence at line 16 780).
+- `qemu.alloc` / `einstein.alloc` — `SSafeHeapPage::Alloc` arg
+  sequences (first divergence at call 534).
+- `freq.deltas` — per-function call-count delta, sorted, with names.
+- `joined.named` — per-function first-trace-number side-by-side.
+
+---
+
+## Earlier — IRQ-rate + tick-page divergence fixed; newt-DABT alias narrows to scheduling order (QEMU, 2026-04-25 night)
 
 **Status:** Two upstream divergences vs Einstein eliminated. Both
 emerged from comparing per-trace function-set diffs against a fresh

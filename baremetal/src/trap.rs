@@ -292,10 +292,12 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
         let sound_armed = (int_ctrl & 0x0000_1400) == 0x0000_1400; // DMA3+DMA5
         if WEDGE_SAME_PC >= 64 && WEDGE_SAME_PC % 32 == 0 && sound_armed {
             WEDGE_INJECT_COUNT += 1;
-            if WEDGE_INJECT_COUNT <= 4 {
+            let same_pc = WEDGE_SAME_PC;
+            let inject_count = WEDGE_INJECT_COUNT;
+            if inject_count <= 4 {
                 kprintln!(
                     "wedge-probe: PC={:#x} stuck for {} samples; injecting sound DMA IRQ (#{})",
-                    elr, WEDGE_SAME_PC, WEDGE_INJECT_COUNT
+                    elr, same_pc, inject_count
                 );
             }
             vic::inject_sound_dma_irq();

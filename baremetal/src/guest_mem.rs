@@ -403,6 +403,30 @@ pub fn fix_stage1_xn_bits() {
             sections_patched, l2_tables, patched, fine_to_fault
         );
     }
+
+    // PROBE 2026-04-26: track L1[0xCD] across SCTLR M=0→M=1 transitions.
+    // If the kernel ever converts the lazy 0x90 marker into a real coarse
+    // L2 pointer, we should see the transition here. If the entry stays
+    // at 0x90 throughout boot up to the wedge, the kernel never grows
+    // it — meaning the FaultMonitor / AllocatePageTable chain is not
+    // being invoked for our DFSC=5 fault.
+    static mut LAST_L1_CD: u32 = 0xDEAD_BEEF;
+    static mut TRANSITION_SEQ: u32 = 0;
+    let cur_cd = unsafe { ram.add(0xCD).read() };
+    // SAFETY: single-threaded EL2.
+    let (last, seq) = unsafe {
+        let l = LAST_L1_CD;
+        TRANSITION_SEQ += 1;
+        let s = TRANSITION_SEQ;
+        if l != cur_cd { LAST_L1_CD = cur_cd; }
+        (l, s)
+    };
+    if last != cur_cd {
+        crate::kprintln!(
+            "L1[0xcd] probe: transition #{} {:#010x} -> {:#010x}",
+            seq, last, cur_cd
+        );
+    }
 }
 
 /// ARMv7 short-descriptor section attributes for the shadow-stub

@@ -229,6 +229,67 @@ DFSC=7 at FAR=0x0ccee800 (same domain 4) IS handled successfully. A
 hypervisor probe at `0x393894` (throw fast-path) and `0x39339c`
 (success path) would directly reveal which arm the kernel takes.
 
+**Experiment C — track L1[0xCD] across SCTLR M=0→M=1 transitions.**
+Result: only TWO transitions seen across the entire boot up to wedge:
+
+```
+L1[0xcd] probe: transition #1    0xdeadbeef -> 0x00000000
+L1[0xcd] probe: transition #4121 0x00000000 -> 0x00000090
+```
+
+Reading: the kernel writes L1[0xCD] = 0 (canonical fault) at boot
+init (#1), then later (#4121, presumably after `BuildDomainsAndHeaps`
+or similar domain-init code) writes the lazy marker `0x90`. **The
+kernel never grows L1[0xCD] past `0x90`** in our run, despite the
+DFSC=5 fault at FAR=0x0cd07400. So the kernel's
+`FaultMonitor → ResolveFault → RememberMappings → Remember →
+GenericSWI #12 → AllocatePageTable` chain (which we know exists at
+`0x258e0c`) never fires for our DFSC=5 case. Either the chain is
+short-circuited earlier, or the FaultMonitor never even hands off
+to ResolveFault for stack2's TStackInfo.
+
+### User hypothesis (2026-04-26 PM, walter)
+
+> Perhaps the interpreter is the first thing that actually needs
+> more than 4k of stack? I suspect our previous hack to allocate
+> stacks 4k at a time didn't completely do that — the kernel may
+> still think that when a stack fault happens it only has to add
+> another 1k subpage rather than a whole new 4k page.
+
+This points at a subtle subpage-counter divergence: our `mask=0xF`
+patch makes `FindOrAllocPage` claim all 4 subpages of one 4 KB page
+per fault, but the *kernel's bookkeeping* (counters in TStackInfo,
+TStackPage's per-subpage refcounts at +0x10..+0x14, the
+`SetRestrictedPage` write at `1f7a98`) may still treat it as a
+1 KB grant per fault. After 4 faults the kernel may think "4 KB
+grown" while actually 16 KB of subpage bits are claimed; over many
+faults the kernel's internal address tracker (`r4->[64]->[68]` in
+`ResolveFault`'s bounds check at `1f79a8..1f79c0`) drifts past the
+end of the TStackInfo and ResolveFault returns error `-10204`
+(`0xffffd824`) which propagates up to UnhandledException → Reboot.
+
+**TInterpreter is plausibly the first task needing >4 KB of stack.**
+The kernel boot sequence has 24 task structs (cdsv, pckm, drvr, etc.)
+all using small stacks. TInterpreter's `__ct__15TRefStructStackFv` x 2
+each call `NewStack(0x10000)` (= 64 KB) twice = 256 KB total of
+lazy-grow stack region. Earlier tasks never exceeded 4 KB and so
+never hit the subpage-counter drift. TInterpreter is the canary.
+
+### Next experiments motivated by this
+
+1. **Audit ResolveFault's r4->[64]->[68] tracker.** Identify what
+   that field tracks, dump it before/after each fault. If it advances
+   by 1 KB per fault but should advance by 4 KB, the kernel logic is
+   1-KB-stride and we need to either patch the stride to 4 KB or use
+   a different fix-up.
+2. **Patch `SetSubPageInfo` to bump the page-allocated counter by 4
+   instead of 1.** That's the "kernel thinks 4 KB was added" fix —
+   matches the actual physical allocation under mask=0xF.
+3. **Try `mask=0x1` (only the faulting subpage, the kernel default)
+   plus a separate fix for the BootOS-canary alias.** E.g., a
+   different patch that doesn't share pages between tasks but uses
+   the kernel's natural subpage logic.
+
 ### Reproduction artifacts
 
 `/tmp/phaseB-2026-04-26-reboot/`:

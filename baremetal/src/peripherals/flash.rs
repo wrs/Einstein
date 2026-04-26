@@ -154,7 +154,7 @@ pub fn seed_rom_rex_checksums(rom_le_words: *const u32, rom_len_bytes: usize) {
     // for both block 0 and block 1. Einstein does this via its
     // BE-aware Write helper; we store raw LE u32s (matching what the
     // kernel will read via LE LDR).
-    crate::kprintln!(
+    crate::dprintln!(
         "flash: ROM/REx checksums seeded (base_size={:#x}, nb_rexes={})",
         base_size, nb_rexes
     );
@@ -190,6 +190,22 @@ fn seed_block(base: u32) {
     // u32 values are byte-for-byte what a guest `LDR` at the same IPA
     // sees through Einstein's TFlash::Read (which does the BE->host
     // swap internally).
+    //
+    // Zero the entire 0x10c-byte header region first — Einstein's flash
+    // file (mmap'd, O_CREAT) starts at 0 for unwritten bytes, and the
+    // kernel's `ValidateCalibrationFields` computes a checksum over
+    // bytes 0..0x54 expecting Einstein's hardcoded `0xD7ECCC66`. Real
+    // flash hardware starts erased (0xFF), but the Newton OS calibration
+    // code treats this specific header region as "0 by construction"
+    // because it's seeded in TFlash::TFlash before the kernel ever
+    // boots. Without this zeroing, our 0xFF-initialised default leaves
+    // the unwritten gap bytes (0x0C..0x23 etc.) as 0xFF, which makes
+    // the runtime Checksum mismatch the seeded 0xD7ECCC66 → kernel
+    // takes UpdateBlock0FromBlock1 → erase → rewrite recovery path.
+    unsafe {
+        let host = (addr_of_mut!(GUEST_FLASH) as *mut u8).add(base as usize);
+        core::ptr::write_bytes(host, 0, 0x10c);
+    }
     write_u32(base + 0x00, 0x444C4453); // "DLDS"
     write_u32(base + 0x04, 0x4F534344); // "OSCD"
     write_u32(base + 0x08, 0x0000010C); // block size / offset to block 1

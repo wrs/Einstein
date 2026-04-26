@@ -60,17 +60,6 @@ pub extern "C" fn kmain() -> ! {
     // mut touched only from core 0 during boot.
     peripherals::flash::init();
 
-    // Seed the 10-entry ROM+REx checksum table into both blocks of
-    // flash bank 0. The kernel's `TReservedBlockAccessor` reads these
-    // during early init.
-    #[cfg(not(nh_guest_test))]
-    {
-        peripherals::flash::seed_rom_rex_checksums(
-            guest_mem::rom_host_pa() as *const u32,
-            guest_mem::ROM_SIZE,
-        );
-    }
-
     // SAFETY: stage-2 tables reference the backing store we just populated.
     unsafe {
         stage2::init();
@@ -91,6 +80,24 @@ pub extern "C" fn kmain() -> ! {
     {
         let stats = shadow_stub::patch_rom_from_bitmap();
         shadow_stub::log_stats(&stats);
+    }
+
+    // Seed the 10-entry ROM+REx checksum table into both blocks of
+    // flash bank 0. The kernel's `TReservedBlockAccessor` reads these
+    // during early init and compares against its own runtime computation
+    // over the live ROM bytes. Must happen AFTER all ROM mutations
+    // (rom_patches in load_rom, UND/DABT/PABT vector trampolines, AND
+    // the ~27k shadow_stub UDF rewrites) so the seeded checksums match
+    // what the guest will compute. Order bug fixed 2026-04-25: previously
+    // seeded before shadow_stub, causing checksum mismatch → kernel's
+    // recovery path (UpdateBlock0FromBlock1 → flash erase → rewrite)
+    // diverged heap state and triggered the downstream "newt" UnhandledException.
+    #[cfg(not(nh_guest_test))]
+    {
+        peripherals::flash::seed_rom_rex_checksums(
+            guest_mem::rom_host_pa() as *const u32,
+            guest_mem::ROM_SIZE,
+        );
     }
 
     peripherals::vic::init();

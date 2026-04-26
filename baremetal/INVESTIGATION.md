@@ -3,7 +3,158 @@
 Live notes. Update as we learn more; remove old updates as we move on to
 new stalls.
 
-## Currently at — newt-DABT root cause: kernel stack-collision picks the wrong reuse VA (QEMU, 2026-04-25 night, post-NewtonTrace cross-check)
+## Currently at — upstream divergence is the flash recovery path; underlying cause for newt-DABT (QEMU, 2026-04-25 late night)
+
+**Root cause for the newt-DABT chain reaches further upstream than
+previously understood.** The Einstein-vs-hypervisor `awk '/^trace / &&
+!seen[$4]++'` first-occurrence diff over a fresh cold boot showed
+~21 functions our hypervisor enters that Einstein never does:
+`PersistentRecovery`, `BuildMemObjDatabase`, `MemObjManager::CopyObject`,
+`TFlashRange::EraseRange`, `T16BitFlashRange::DoWrite`,
+`T32BitFlashRange::DoWrite`, `TFlashDriver::BeginWrite/StartErase/Write/
+LockBlock/IsEraseComplete/ReportWriteResult`,
+`TReservedBlockAccessor::CompareFlashAndMemRebootIfDifferent / MarkStoreAsValid /
+UpdateBlock0FromBlock1 / CompareAndRebootIfDifferent`,
+`TFlashRange::FlushDataCache/SyncErase/StartErase/IsEraseComplete/EarlyPrepare-
+ForReadingArray/LockBlock`, plus `EarlyIOPowerOn/Off`, `ShortTimerDelay`,
+`LowLevelGetCPUType`, `LowLevelProcSpeed`, `MaybeUnicodeStr`,
+`UnhandledException`, `RebootIfFaultWasInStack`, etc.
+
+These are the **flash-store recovery + rewrite cycle**. Einstein cold-
+boots with the kernel taking the success path (operator==(TROMREXChecksums)
+returns true), going straight to `ReadCalibration → InstallPatch →
+PersistentRecovery → BuildMemObjDatabase` at trace 1714. Our hypervisor
+goes through `UpdateBlock0FromBlock1 → SyncErase → DoWrite → MarkStoreAsValid
+→ ReadCalibration → InstallPatch → PersistentRecovery` at trace ~4425
+(originally) or ~54050 (after partial fix). The recovery path makes
+~3000-50000 extra trace events of work, which diverges heap state, which
+eventually feeds the `CopyPagesAfterStackCollided` choosing
+`VA=0x0cc82000` instead of Einstein's `0x0cca3000`, which lands the
+TCardServer's `__nw__FUi(184)` allocator at PA 0x0402a000, which writes
+'newt'/'cdsv' over pckm's `sp_usr+8` save slot.
+
+### Two failure points found in the validation chain (one fixed, one open)
+
+The kernel's `TReservedBlockAccessor::CheckIfRecoveryIsNeeded` runs:
+
+1. `ValidateCalibrationInformation` → `ValidateCalibrationFields`:
+   - DLDS magic at flash[0x00] and flash[0x50]
+   - OSCD at flash[0x04]
+   - 0x10C at flash[0x08]
+   - **Checksum(flash, 0x54) == flash[0x54] (= 0xD7ECCC66 hardcoded)**
+   - flash[0x58] in {-1, -2, -4, -8, -16}
+2. `ValidatePatchCheckSum` (writes flash[0x5c]/[0x60] to 0 if mismatch)
+3. **`operator==(TROMREXCheckSums)` of kernel-runtime checksums vs
+   flash[0x64..0x8C]**
+4. flash[0x58] state-machine check (cmn r6, #4 → must be 0xFFFFFFFC)
+
+If any check fails → `UpdateBlock0FromBlock1` → `EraseRange` →
+`DoWrite` → `MarkStoreAsValid`.
+
+#### Failure point A (FIXED): ROM/REx checksum drift after fix_stage1_xn_bits
+
+`flash::seed_rom_rex_checksums` originally ran in `main.rs` *before*
+`shadow_stub::patch_rom_from_bitmap`. Shadow-stub then patched 27,633
+ROM instructions, changing the bytes the kernel computes its runtime
+checksum over. Even after moving the seed to *after* shadow_stub,
+`guest_mem::fix_stage1_xn_bits` (called on first M=0→M=1 SCTLR write
+and first TTBR0=0x04000000 write, per `trap.rs`) walks the kernel's L1,
+finds L2 page tables that live in ROM, and rewrites them in-place to
+ARMv7-form (XN/AP/CB normalisation). Those modifications happen
+*after* hypervisor init.
+
+**Fix:** `trap.rs::reseed_flash_checksums_if_needed()` calls
+`flash::seed_rom_rex_checksums` after every `fix_stage1_xn_bits`
+invocation. Diagnostic dumps confirm the kernel's runtime
+`CalculateROMREXCheckSums` result now matches what we wrote into
+flash[0x64..0x8C], and the operator== returns true.
+
+#### Failure point B (OPEN): flash[0..4] DLDS magic gets corrupted to 0x00FF00FF
+
+After Failure A is fixed, the kernel still takes the recovery path
+because `ValidateCalibrationFields` returns non-zero (specifically the
+DLDS check at flash[0x00] fails). Diagnostics in the tracer at
+`ValidateCalibrationFields` entry show:
+
+```
+trace-csum: ValidateCalibFields buf @VA 0x34af228:
+  [00ff00ff, 4f534344, 0000010c, 00000000, ...]      <- block 0, FIRST READ
+                                                         offset 0 = 0x00FF00FF, NOT 0x444C4453
+  [444c4453, 4f534344, 0000010c, 00000000, ...]      <- block 1, second read OK
+```
+
+Hypervisor init dumps confirm `flash[0..16] = 444c4453 4f534344 0000010c
+00000000` after `seed_block(0)` runs. By the time the kernel reads it
+at trace 1614 (BlockMove from VA 0x30000000), `flash[0..4]` reads as
+`0x00FF00FF` (LE bytes 0xFF 0x00 0xFF 0x00 — alternating-halfword pattern).
+
+The mutation is invisible to `flash::program_word` (instrumented; not
+called for offset < 0x10). So it's a direct stage-2 write — the guest
+writes through the RW flash bank mapping, bypassing any peripheral
+handler. Need to identify the writer: probably an AMD-style flash
+chip command sequence (write `0xAA` to magic addresses) that lands at
+flash[0..4] because we don't model the flash chip state machine.
+
+#### Other partial fix landed
+
+`flash::seed_block` now zeroes 0x10c bytes of the block header before
+writing the specific calibration values, so the unwritten gaps (0x0C..
+0x23, 0x28..0x33, 0x38..0x3B, 0x44..0x4F) are 0 instead of 0xFF —
+matching Einstein's mmap'd flash file behaviour. Without this the
+hardcoded `0xD7ECCC66` checksum at flash[0x54] doesn't match the
+runtime `Checksum(flash, 0x54)` because the gaps differ.
+
+### Boot trajectory after fixes
+
+| metric | original | after fixes |
+|---|---|---|
+| total trace events (~120s wall) | 261,949 | 304,954 |
+| unique functions | 1290 | 1294 (peaks at 1259 at 90s) |
+| newt-tripwire fires at trace | 194,617 | 234,292 |
+| ultimate wedge | newt UnhandledException | (unchanged) |
+
+The boot reaches deeper into the post-PCMCIA-init paths
+(`TUPhys::ChangeVirtualMapping`, `TCardServer::AddCardHandler`,
+`TCardSocket::RegisterSocketInterrupt`, `TGPIOInterface::DisableInterrupt`
+are new unique functions in the post-fix run), but still hits the same
+wedge eventually because Failure B keeps the recovery path active.
+
+### Open next steps for next session
+
+1. **Find the writer to flash[0..4].** Add a stage-2 RO mark for the
+   first 4 KiB of flash bank 0 so any guest write traps. The trapped
+   PC will identify the AMD-style command-sequence emitter. Then either
+   model it (track the chip state machine, return data-array on read)
+   or make those command writes no-ops via a peripheral that owns
+   flash bank 0's command-sequence offsets specifically.
+2. **Cross-reference Einstein's TFlash::Write.** Einstein's flash chip
+   model (`Emulator/TFlash.cpp:192-208`) masks command-sequence writes:
+   `*ptr = swap((swap(*ptr) & ~mask) | word)`. The mask handles the
+   AMD-style "write 0xAA at 0x555 etc." pattern that puts the chip in
+   modes; Einstein effectively ignores them. Our implementation just
+   writes the bytes through, corrupting flash content.
+3. **After fixing Failure B, re-run cold-boot trace.** With both
+   failures resolved, the kernel should take Einstein's success path
+   (operator== → ReadCalibration → InstallPatch → PersistentRecovery
+   at ~trace 1714, no UpdateBlock0FromBlock1). That should align our
+   trace counts with Einstein's, and the downstream
+   `CopyPagesAfterStackCollided` should pick the same TStackPage
+   Einstein picks → no aliasing → no newt-DABT.
+
+### Files changed in this session
+
+- `src/main.rs` — moved `flash::seed_rom_rex_checksums` to after
+  `shadow_stub::patch_rom_from_bitmap` (was before).
+- `src/peripherals/flash.rs` — `seed_block` zeroes 0x10c-byte header
+  region before writing calibration values; `seed_rom_rex_checksums`
+  uses `dprintln!` for status (silenced under quiet feature).
+- `src/trap.rs` — added `reseed_flash_checksums_if_needed()` and call
+  it after every `fix_stage1_xn_bits` invocation (both M=0→M=1 SCTLR
+  and first-TTBR0 sites).
+
+---
+
+## Earlier (preserved) — newt-DABT root cause: kernel stack-collision picks the wrong reuse VA (QEMU, 2026-04-25 night, post-NewtonTrace cross-check)
 
 **Direct comparison with Einstein NewtonTrace + NewtonProbe nailed
 the divergence.** Both implementations end up with PA 0x0402a000

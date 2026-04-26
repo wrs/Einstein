@@ -90,6 +90,51 @@ const PATCHES_717006: &[RomPatch] = &[
     RomPatch { offset: 0x003A_D430, value: 0x3281_1001, name: "GetClock wrap-detect ls→cc" },
     RomPatch { offset: 0x003A_D46C, value: 0x3282_2001, name: "SetAlarm wrap-detect (1/2) ls→cc" },
     RomPatch { offset: 0x003A_D49C, value: 0x3282_2001, name: "SetAlarm wrap-detect (2/2) ls→cc" },
+    // Force per-page stack allocation (no subpage sharing).
+    //
+    // The 717006 kernel uses ARMv4 subpage-AP to put up to four
+    // 1-KiB stacks on a single 4-KiB physical page, with the
+    // "guard" subpages set to AP=00 so a stack overrun faults and
+    // the kernel can grow it. ARMv7 (our hardware) has no
+    // subpage-AP support — `fix_stage1_xn_bits` flattens every
+    // L2 entry to AP=011 (full RW) so accesses don't fault. The
+    // side effect is that overruns silently corrupt the
+    // adjacent task's 1-KiB region living on the same physical
+    // page — that's the chain INVESTIGATION.md "Currently at —
+    // ARMv4 subpage-AP flattened" pins to the BootOS-canary wedge.
+    //
+    // Fix: patch `TStackManager::ResolveFault` to claim **all 4**
+    // subpages (mask=0xF) on every fault-driven page allocation,
+    // instead of just the single subpage that faulted. The kernel
+    // still tracks subpages internally, but each task ends up with
+    // a fresh physical page that nobody else can claim subpages
+    // on, so over-runs corrupt only the task's own slack space.
+    //
+    // Encoded `mov r3, #0xF` (= 0xE3A0_300F) at three
+    // pre-`bl FindOrAllocPage_ReturnUnLockedOnNoPage` sites in
+    // `ResolveFault`:
+    //
+    //   * `0x001f_7a10` — `lsl r3, r0, r8` (single-subpage mask
+    //     in the normal fault path).
+    //   * `0x001f_7bd4` — `ldr r3, [sp, #60]` (mask reload in the
+    //     stack-collision recovery path).
+    //   * `0x001f_7c24` — `orr r3, r1, r0` (mask combine in the
+    //     same recovery path).
+    RomPatch {
+        offset: 0x001F_7A10,
+        value:  0xE3A0_300F,
+        name:   "ResolveFault: claim all 4 subpages (1/3)",
+    },
+    RomPatch {
+        offset: 0x001F_7BD4,
+        value:  0xE3A0_300F,
+        name:   "ResolveFault: claim all 4 subpages (2/3)",
+    },
+    RomPatch {
+        offset: 0x001F_7C24,
+        value:  0xE3A0_300F,
+        name:   "ResolveFault: claim all 4 subpages (3/3)",
+    },
 ];
 
 /// HVC immediates that the ROM-patched DebugStr / Debugger trap sites

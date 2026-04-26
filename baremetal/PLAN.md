@@ -80,7 +80,7 @@ Current layout:
 - `src/peripherals/vic.rs` — interrupt controller + tick clock; `K_HDWR_TICKS` now advances the non-trapping RAM page instead of returning from a trap.
 - `src/mmio.rs` — routes `0x0F1C_0000..0x0F20_0000` to `serial`, plus existing VIC / DMA / PCMCIA / stub dispatch.
 - `src/snapshot.rs` — rolling ring under `/tmp/newton-snapshot-{0..3}.bin`.
-- `src/shadow_stub.rs` — BE-32 byte/halfword-access patcher. Each patched site is replaced in place with `UDF #(0x8000 | idx)`; the UND trampoline at IPA 0x00FFFF00 routes into EL2 where `handle_sba_udf` decodes the original instruction from a 32 K-entry site table and emulates the access in Rust (with the BE-32 XOR for real memory, passthrough for MMIO). Writeback to banked R13 / R14 exits through a post-emulation trampoline at IPA 0x00FFFF80 that writes SP / LR natively in the faulting mode. See IMPLEMENTATION.md §8.5 for the full design; `INVESTIGATION.md` records why the earlier in-guest stub approach couldn't preserve CPSR flags across every mode and MMU state.
+- `src/shadow_stub.rs` — BE-32 byte/halfword-access patcher.
 - `guest-tests/tests/` — 20 tests (test_hello, test_vic, test_flash, test_dma, test_pcmcia, test_cp15_fault_regs, test_finetable_rewrite, test_und_handler, test_cp15_strongarm_clock, test_midr, test_mmio_regs, test_rtc_calendar, test_rom_patches, test_serial, test_native_primitives, test_flash_driver, test_platform_driver, test_screen_blit, test_snapshot, test_shadow_stub).
 - `guest-tests/scripts/run-test.sh` — clears `/tmp/newton-snapshot-*.bin` before each run so a stale snapshot can't cause a test to resume mid-run.
 
@@ -100,56 +100,14 @@ End-of-Phase-A milestone (met):
 cd baremetal && timeout 30 cargo run --release
 ```
 
-Boot reaches deep initialisation code past `0x0E6B94`. No tight loops
-from tick polling; traps are evenly distributed across task-switch
-SCTLR toggles and scattered MMIO touches.
-
-End of Phase B / midterm goal (pending):
-
-```
-cd baremetal && timeout 60 cargo run --release
-```
-
-Trap log shows guest PC sampled at or near `0x002F40E0` — the TInterpreter constructor.
-
-Current Phase B progress (2026-04-23):
-
-- Shadow-byte-access flag-preservation resolved by replacing the
-  in-guest stub with a UDF-trap emulator in EL2 Rust. See
-  `IMPLEMENTATION.md` §8.5 and `INVESTIGATION.md` "Resolved —
-  shadow-stub flag-preservation via UDF-trap".
-- Boot now advances past `MemObjManager::PrimGetEnvDomainName` into
-  `TUSharedMem::CopyToShared` / `SMemCopyToSharedSWI`, DABTs at guest
-  PC 0x003AE3E4 (stage-1 translation fault at VA 0x0C001000 during
-  `LDR R5, [R13, #0xC]`). Next stall to root-cause — see
-  `INVESTIGATION.md` "Currently at".
-- Post-MMU shadow-stub dispatch PABT was resolved earlier by moving
-  pool A into the ROM aperture; the pool is gone entirely under
-  UDF-trap.
-
-Einstein as reference:
-
-```
-cmake --build build --target NewtonProbe
-build/NewtonProbe baremetal/roms/newton.rom _Data_/Einstein.rex 30
-```
-
-Captures CP15 / SWP / mode-transition counts plus the new data-abort
-and prefetch-abort logs. Key cross-reference point: Einstein's first
-`SVC→ABT` transition is the *voluntary* `MSR CPSR_c, #0xd7` at PC
-`0x18C10` (the stack-init helper), not a real abort — and Einstein
-records **zero kernel-mode aborts** in 30 s of boot. Our hypervisor
-matching that count is the cleanest "progress is real" signal.
-
 ## Explicit non-goals for this plan
 
-- Exhaustively implementing every TNativePrimitives encoding upfront — only the encodings the early-boot path can realistically hit get transcribed in Phase A; others are discovered (with a loud halt) during Phase B and transcribed then. The handler itself is real; the table grows as evidence demands.
 - Real screen emulation beyond a framebuffer dump — no compositor, no pen input.
-- Any work past TInterpreter — scheduler, app world, package loading — waits for the next milestone.
+- Package loading — needs a solution for embedded native code
 
-## Still-in-place diagnostic scaffolding
+## Diagnostic scaffolding
 
-These items should come off once Phase B is stable — leave them in
+These items should come off once the system is stable — leave them in
 for now because they're load-bearing for the current debugging loop:
 
 - DABT-vector HVC patch at ROM offset 0x10 (`guest_mem.rs`) → two-stage `handle_diag` / `handle_diag_lr` in `trap.rs`. Catches every stage-1 DABT with full banked-register context.
@@ -158,6 +116,5 @@ for now because they're load-bearing for the current debugging loop:
 - 500-entry trap log budget at the top of `trap_sync_lower_aarch32`; HVC #0x50 (tracer TAG) suppressed to avoid doubling trace output.
 - Bring-up-critical VA walks in `handle_diag`.
 
-Once we're past TInterpreter and confident no silent abort is
-hiding, these can be pulled; the behavioural invariants they
-enforce are already codified in guest tests.
+Once we're confident no silent abort is hiding, these can be pulled; the
+behavioural invariants they enforce are already codified in guest tests.

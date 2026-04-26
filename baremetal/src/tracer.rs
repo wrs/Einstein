@@ -577,6 +577,24 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
                       gcg, r8);
         }
     }
+    // MoveFreeBlock — the heap-block walker that Einstein observes
+    // taking a stack-fault on `name` task at trace ~147 500. Our
+    // equivalent call (same args r0=0x0c2041e0 r1=0x20) returns
+    // normally without a fault, so the divergence is in stack-page
+    // mapping state at the moment of the SP-relative store. Dump
+    // SP_usr / LR_usr, the stage-1 walks for the SP-covering pages,
+    // and the existing stack-frame contents so we can correlate
+    // against Einstein's fault PC. Filter on the specific signature
+    // to avoid logging the 423 other MoveFreeBlock calls.
+    if fa == 0x003121AC && mode == 0x10
+        && ctx.x[0] as u32 == 0x0c204_1e0 && ctx.x[1] as u32 == 0x20
+    {
+        static DONE: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        if !DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            dump_movefreeblock_entry(cur_sp, cur_lr, ctx);
+        }
+    }
     if fa == 0x0011D544 {
         // First RegisterEnvironmentId — this runs right after USR
         // GetEnvDomainName wrapper returns. Dump the fParams buffer
@@ -749,6 +767,78 @@ fn buffer_putc_char(ch: u32, lr: u32, seq: u32) {
             );
             LEN = 0;
         }
+    }
+}
+
+/// One-shot dump at the entry of `MoveFreeBlock(0x0c2041e0, 0x20)` —
+/// the call that faults on Einstein's `name` task and returns normally
+/// on ours. Captures SP_usr / LR_usr, walks stage-1 for several pages
+/// straddling SP (so we can see whether the pages immediately below
+/// SP are mapped or fault), dumps the existing stack frame contents,
+/// and prints the live TTBR0 / SCTLR.
+fn dump_movefreeblock_entry(sp: u32, lr: u32, ctx: &TrapContext) {
+    let ttbr: u64;
+    let sctlr: u64;
+    let dacr: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr,
+            options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mrs {}, sctlr_el1", out(reg) sctlr,
+            options(nomem, nostack, preserves_flags));
+        // DACR32_EL2 mirrors AArch32 DACR.
+        core::arch::asm!("mrs {}, dacr32_el2", out(reg) dacr,
+            options(nomem, nostack, preserves_flags));
+    }
+    kprintln!(
+        "  @MoveFreeBlock[name]: SP={:#010x} LR={:#010x} TTBR0={:#x} SCTLR.M={} DACR={:#010x}",
+        sp, lr, ttbr, sctlr & 1, dacr as u32,
+    );
+    // Decode DACR: 16 × 2-bit fields. 00=fault, 01=client, 11=manager.
+    {
+        let d = dacr as u32;
+        kprintln!(
+            "  DACR domains:  D0={} D1={} D2={} D3={} D4={} D5={} D6={} D7={}",
+            (d >> 0) & 3, (d >> 2) & 3, (d >> 4) & 3, (d >> 6) & 3,
+            (d >> 8) & 3, (d >> 10) & 3, (d >> 12) & 3, (d >> 14) & 3,
+        );
+        kprintln!(
+            "                 D8={} D9={} D10={} D11={} D12={} D13={} D14={} D15={}",
+            (d >> 16) & 3, (d >> 18) & 3, (d >> 20) & 3, (d >> 22) & 3,
+            (d >> 24) & 3, (d >> 26) & 3, (d >> 28) & 3, (d >> 30) & 3,
+        );
+    }
+    kprintln!(
+        "  ctx: r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x}",
+        ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
+        ctx.x[4] as u32, ctx.x[5] as u32, ctx.x[6] as u32, ctx.x[7] as u32,
+    );
+    kprintln!(
+        "  ctx: r8={:#010x} r9={:#010x} r10={:#010x} r11={:#010x} r12={:#010x}",
+        ctx.x[8] as u32, ctx.x[9] as u32, ctx.x[10] as u32, ctx.x[11] as u32,
+        ctx.x[12] as u32,
+    );
+
+    // Stage-1 walks at SP and 8 pages above + below — we want to see
+    // exactly where the mapped→fault boundary is around the current
+    // SP. Newton stack pages grow DOWN, so the fault page (if any)
+    // sits below SP at some 4 KiB offset.
+    let sp_page = sp & !0xFFFu32;
+    kprintln!("  stage-1 walks around SP (page-aligned base {:#010x}):", sp_page);
+    for delta_pages in (-8i32..=8).rev() {
+        let va = sp_page.wrapping_add((delta_pages as u32).wrapping_mul(0x1000));
+        // Print only every 4 KiB; dump_stage1_walk handles its own
+        // formatting and emits multiple lines per call.
+        kprintln!("  [SP{:+}*0x1000] VA={:#010x}", delta_pages, va);
+        guest_mem::dump_stage1_walk(va);
+    }
+
+    // Dump the existing stack frame contents — 64 words above SP
+    // (= existing frame data — already pushed by callers / parent
+    // frames). 32 words below SP show what's about to be touched.
+    kprintln!("  stack contents around SP:");
+    for off in [-32i32, -16, -8, 0, 8, 16, 32, 48].iter().copied() {
+        let addr = sp.wrapping_add((off as u32).wrapping_mul(4));
+        dump_guest_stack(addr, 8);
     }
 }
 

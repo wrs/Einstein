@@ -182,6 +182,109 @@ Reproduction artifacts: `/tmp/key_events.txt` (watchlist),
 (LIFO Take→VA mapper), `/tmp/qemu_scratchva.va_pa` (canonical
 va_pa diff against `einstein.va_pa`).
 
+### Follow-up — root cause: ARMv4 subpage-AP flattened by `fix_stage1_xn_bits`
+
+A one-shot probe at the entry of the specific `name`-task call
+`MoveFreeBlock(0x0c2041e0, 0x20)` (trace 146 848 in our run) dumped
+SP=0x0c320824 and the stage-1 mappings around SP. The decisive
+observation:
+
+- `L1[0xc3]` = `0x04023861` (coarse, domain 3, L2 at PA `0x04023800`)
+- `L2[0x20]` (VA `0x0c320000`) = `0x0401b03e` → PA `0x0401b000`,
+  AP[2:0]=011 (full RW)
+- `L2[0x18]` (VA `0x0c318000`) = `0x0401b03e` → same PA, also AP=011
+  (alias)
+- `DACR` = `0x00000155`, so D3 = `01` (client; AP-bits enforced)
+
+Reading the disassembly of `AddPgPAndPerm` (`0x0015a8f0`) confirmed
+that the kernel actually writes ARMv4-style descriptors with
+**subpage-AP** bits[11:4]:
+
+- VA `0x0c320000` (with `perm_high=0x30`, `perm_low=0x01`): kernel
+  writes `0x0401b30e` — ARMv4 subpages
+  `{ AP0=00, AP1=00, AP2=11, AP3=00 }` (only subpage 2 RW; rest are
+  no-access guards).
+- VA `0x0c318000` (with `perm_high=0x0c`): kernel writes
+  `0x0401b0ce` — subpages `{ 00, 11, 00, 00 }` (only subpage 1 RW).
+
+These ARMv4 entries are the kernel's lazy-allocation guard pattern:
+the LIVE 1 KiB subpage is RW; surrounding subpages are no-access
+guards. On real ARMv4 hardware (Einstein), an SP-relative store
+that drifts into a guard subpage faults, the `DataAbortHandler`
+runs `TStackManager::Fault`, and a fresh stack page is allocated.
+
+ARMv7 (our hardware) has **no subpage-AP support** — bits[11:4] are
+reinterpreted as `(nG, S, AP[2], TEX[2:0], AP[1:0])`. Newton's
+mixed-subpage encoding always reinterprets to AP[2:0] in
+`{000, 100, 111}` (= no-access / Reserved / deprecated), which would
+fault every access. To work around this, `fix_stage1_xn_bits`
+rewrites every small-page L2 entry to `0x...03E` —
+**AP[2:0]=011 (full RW)** — which makes accesses succeed
+unconditionally. This is what ships and works for kernel-mode
+boot, but **silently destroys the kernel's stack-fault chain**:
+
+1. The `name`-task `MoveFreeBlock` prologue pushes registers, SP
+   drifts from 0x0c320824 (subpage 2, live) into 0x0c3207f8 (subpage
+   1, guard).
+2. On Einstein: subpage 1 has AP=00 → fault → kernel allocates
+   fresh PA `0x0402b000` for VA `0x0c318000` → no PA aliasing.
+3. On us: `fix_stage1_xn_bits` flattened the page to AP=011
+   (everyone-RW) → no fault → no fresh allocation → PA `0x0402b000`
+   stays in `gPhysAllocator`'s free pool → later TCardServer
+   allocation aliases it into the user-heap range → BootOS-canary
+   wedge.
+
+### Failed fix attempts (2026-04-26)
+
+Tried two replacement strategies for the ARMv4-→-ARMv7 conversion in
+`fix_stage1_xn_bits`'s small-page handler. Both reverted.
+
+1. **Mixed subpages → AP[2:0]=000 (fault).** Boot wedges very early
+   (~60 traces in) inside `MakePrimaryMMUTable` with PABT chains at
+   ELR=0x186xx. Some early ARMv4 entries that are deliberately
+   AP=00-uniform get marked fault, which breaks BootOS's MMU
+   bring-up.
+2. **Mixed subpages → AP[2:0]=010 (PL1 RW, PL0 RO).** Same early
+   wedge — DABT forwards to kernel at PCs 0x186b4..0x18710 with
+   ESR=0x9381_0047, suggesting a USR-mode write to a kernel-RO page
+   the kernel still expects to be writable.
+
+The conversion needs to distinguish at least three classes of
+ARMv4 subpage-AP entries:
+
+- **Boot-time bring-up entries** (BootOS / MMU primary table): the
+  current flatten-to-AP=011 behaviour is correct.
+- **Stack-guard entries**: should fault on USR write to trigger the
+  lazy-allocation chain.
+- **Code/RO-data**: USR fetches and reads must succeed.
+
+The hint distinguishing them is probably either:
+(a) the calling site (kernel boot vs runtime AddPgPAndPerm); or
+(b) the stage-1 walk context (which task's TTBR0 is live).
+Neither is currently visible inside `fix_stage1_xn_bits`'s passive
+walk.
+
+### Suggested next directions
+
+1. **Trap kernel L2 writes via stage-2 RO-protect**, then convert
+   per-page on the trap (knowing the calling context). Heavy
+   plumbing but precise.
+2. **Selective conversion based on perm bits seen at AddPgPAndPerm
+   call time**: hook the SVC-mode call entry, capture
+   `(VA, PA, perm_high, perm_low)`, and rewrite the resulting L2
+   entry to the ARMv7 equivalent that preserves the kernel's
+   intent. Requires post-AddPgPAndPerm L2-entry rewriting.
+3. **Selective conversion based on subpage pattern**: keep the
+   uniform-subpage cases mapped 1-to-1; for mixed-subpage entries,
+   determine whether the access pattern needs guard semantics by
+   looking at the VA range (kernel-stack VAs `0x0c3xx000` →
+   convert to fault-on-USR-write; everything else → flatten). The
+   717006 ROM's stack VA layout is documented enough that this
+   could be a targeted patch.
+
+The reproduction probe (`tracer.rs::dump_movefreeblock_entry`)
+stays in tree as the diagnostic for any future fix experiment.
+
 ---
 
 ## Earlier — root cause narrowed: missing stack-fault on `name` task drives PA-recycle into user heap (QEMU, 2026-04-26 PM)

@@ -761,9 +761,11 @@ fn buffer_putc_char(ch: u32, lr: u32, seq: u32) {
             || LEN == CAP;
         if should_flush && LEN > 0 {
             let s = core::str::from_utf8(&BUF[..LEN]).unwrap_or("<non-utf8>");
+            let first_seq = FIRST_SEQ;
+            let first_lr = FIRST_LR;
             kprintln!(
                 "putc {:5}..{:5} lr={:#010x}: {}",
-                FIRST_SEQ, seq, FIRST_LR, s
+                first_seq, seq, first_lr, s
             );
             LEN = 0;
         }

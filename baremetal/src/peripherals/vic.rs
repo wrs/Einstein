@@ -33,13 +33,6 @@ static TICK_EPOCH: AtomicU64 = AtomicU64::new(0);
 /// lives in `crate::platform::NEWTON_TICK_HZ`.
 pub use crate::platform::NEWTON_TICK_HZ;
 
-/// CNTPCT_EL0 reading captured at `init()`. Callers doing rate-conversion
-/// between CNTPCT and Newton-tick domains anchor at this point (Newton
-/// ticks = 0 by definition at the same moment).
-pub fn timer_epoch() -> u64 {
-    TICK_EPOCH.load(Ordering::Acquire)
-}
-
 fn read_cntpct() -> u64 {
     let v: u64;
     // SAFETY: read-only sysreg.

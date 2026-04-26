@@ -702,7 +702,13 @@ enum BranchKind {
     /// BL or BL-like — eventually returns. APCS-clobbers
     /// {R0..R3, R12, R14}; analyzer continues at PC+4 with those regs
     /// effectively "written" (i.e. dead from the caller's perspective).
-    BLink { target: u32 },
+    /// `target` is only consumed by `#[cfg(test)]` assertions; the
+    /// runtime walker doesn't follow BL targets (continues at PC+4
+    /// instead).
+    BLink {
+        #[cfg_attr(not(test), allow(dead_code))]
+        target: u32,
+    },
     /// Unconditional branch. Analyzer follows `target` and stops.
     Direct { target: u32 },
     /// Conditional branch (Bcc, no link). Analyzer must consider both

@@ -29,7 +29,7 @@
 //! every read returns the stored value, with two exceptions that
 //! match Einstein:
 //!
-//!   reg_1C00 (status): on read, OR with `k1C00_CardIsPresent (0x000C)`
+//!   reg_1c00 (status): on read, OR with `k1C00_CardIsPresent (0x000C)`
 //!     to report "no card" — the kernel uses this bit instead of a
 //!     failed chip-detect to drive the no-card UI path.
 //!   reg_4400 (chip ID): always reads as 0xFC.
@@ -79,19 +79,19 @@ const K1C00_CARD_IS_PRESENT: u32 = 0x000C;
 struct SlotRegs {
     reg_0000: AtomicU32, // int raised
     reg_0800: AtomicU32,
-    reg_0C00: AtomicU32, // int raised (?)
+    reg_0c00: AtomicU32, // int raised (?)
     reg_1000: AtomicU32,
     reg_1400: AtomicU32,
     reg_1800: AtomicU32,
-    reg_1C00: AtomicU32, // status — read OR'd with k1C00_CardIsPresent
+    reg_1c00: AtomicU32, // status — read OR'd with k1C00_CardIsPresent
     reg_2000: AtomicU32,
     reg_2400: AtomicU32,
     reg_2800: AtomicU32,
-    reg_2C00: AtomicU32,
+    reg_2c00: AtomicU32,
     reg_3000: AtomicU32, // chip-detect target #1
     reg_3400: AtomicU32,
     reg_3800: AtomicU32, // chip-detect target #2
-    reg_3C00: AtomicU32,
+    reg_3c00: AtomicU32,
     reg_4000: AtomicU32,
     int_ctrl: AtomicU32, // kHdWr_IntCtrlReg = 0x0400 — Einstein has it as a separate field
 }
@@ -101,19 +101,19 @@ impl SlotRegs {
         Self {
             reg_0000: AtomicU32::new(0),
             reg_0800: AtomicU32::new(0),
-            reg_0C00: AtomicU32::new(0),
+            reg_0c00: AtomicU32::new(0),
             reg_1000: AtomicU32::new(0),
             reg_1400: AtomicU32::new(0),
             reg_1800: AtomicU32::new(0),
-            reg_1C00: AtomicU32::new(0),
+            reg_1c00: AtomicU32::new(0),
             reg_2000: AtomicU32::new(0),
             reg_2400: AtomicU32::new(0),
             reg_2800: AtomicU32::new(0),
-            reg_2C00: AtomicU32::new(0),
+            reg_2c00: AtomicU32::new(0),
             reg_3000: AtomicU32::new(0),
             reg_3400: AtomicU32::new(0),
             reg_3800: AtomicU32::new(0),
-            reg_3C00: AtomicU32::new(0),
+            reg_3c00: AtomicU32::new(0),
             reg_4000: AtomicU32::new(0),
             int_ctrl: AtomicU32::new(0),
         }
@@ -124,19 +124,19 @@ impl SlotRegs {
             0x0000 => Some(&self.reg_0000),
             0x0400 => Some(&self.int_ctrl),
             0x0800 => Some(&self.reg_0800),
-            0x0C00 => Some(&self.reg_0C00),
+            0x0C00 => Some(&self.reg_0c00),
             0x1000 => Some(&self.reg_1000),
             0x1400 => Some(&self.reg_1400),
             0x1800 => Some(&self.reg_1800),
-            0x1C00 => Some(&self.reg_1C00),
+            0x1C00 => Some(&self.reg_1c00),
             0x2000 => Some(&self.reg_2000),
             0x2400 => Some(&self.reg_2400),
             0x2800 => Some(&self.reg_2800),
-            0x2C00 => Some(&self.reg_2C00),
+            0x2C00 => Some(&self.reg_2c00),
             0x3000 => Some(&self.reg_3000),
             0x3400 => Some(&self.reg_3400),
             0x3800 => Some(&self.reg_3800),
-            0x3C00 => Some(&self.reg_3C00),
+            0x3C00 => Some(&self.reg_3c00),
             0x4000 => Some(&self.reg_4000),
             _ => None,
         }

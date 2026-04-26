@@ -2,14 +2,80 @@
 
 Live notes. Update as we learn more. REMOVE old updates once resolved.
 
-## Currently at — wedged inside `TInterpreter::TInterpreter` constructor (Phase B goal reached!) (QEMU, 2026-04-26 afternoon)
+## In progress — ResolveFault wrapper: 4-iter call-the-allocator-per-subpage (QEMU, 2026-04-26 evening)
 
-**Status:** Boot has reached **`TInterpreter::TInterpreter` at 0x002F40E0** — the
-literal goal of Phase B per `PLAN.md`. The wedge is now *inside* the
-constructor's first call to `TIntrpStack::NewState` after both
-`TRefStructStack` sub-objects have been constructed. So Phase B is
-substantively succeeding — we're now finding bugs in the interpreter's
-backing-stack memory allocation.
+**Status:** Restructured the per-page stack-allocation fix. Removed the three
+`mov r3, #0xF` patches at the `bl FindOrAllocPage` sites and replaced them
+with a thin **wrapper** at `0x00FF_FE00` that re-runs the whole
+`TStackManager::ResolveFault` four times per kernel-side fault — once per
+1-KiB subpage of the faulting 4-KiB page. The wrapper:
+
+1. Reads the original FAR from `this->[+64]->[+68]` and saves it (r8).
+2. Computes the 4-KiB page boundary *relative to* `info->[+20]` — adjacent
+   stack slots in `FMNewStack` sit 33 KiB apart, so `info->base_va` isn't
+   4-KiB-aligned in general.
+3. Loops `r10 = 0..3`, sets FAR to `page_base + r10*1024`, calls the real
+   `ResolveFault`. Treats `r0 == -10203 / -10204` (out of bounds) as
+   "subpage belongs to another stack — skip"; only propagates `r0 == 4`
+   (FindOrAllocPage failure) to the wrapper's caller.
+4. Restores the original FAR and returns 0 on success.
+
+Patches the single `bl ResolveFault` site in `TStackManager::Fault` at
+`0x001F_84E0` to call the wrapper instead. The other call site in
+`FMLockHeapRange` (`0x001F_6B94`) is intentionally left untouched —
+patching both broke early BootOS bring-up.
+
+The wrapper makes the kernel's per-subpage bookkeeping (refcount0[sub_idx],
+RememberMappings perm bits, SetRestrictedPage state) match the physical
+reality that all four subpages of the page are accessible after first
+allocation, since ARMv7's loss of subpage-AP otherwise leaves the kernel's
+view diverged.
+
+Boot now reaches the **same wedge as the original 3-PATCH baseline**:
+- 6 forwarded kernel DABTs handled successfully via the wrapper.
+- 7th forwarded DABT at FAR=`0x0cd07400` (DFSC=5, L1[0xCD]=`0x00000090`
+  lazy) wedges with `Reboot(-10075)`.
+
+So the wrapper structurally replaces the 3-PATCH set with no regression
+and no advancement — it gets us to the same point cleanly.
+
+**Next:** address the L1[0xCD]=0x90 lazy-section wedge (the remaining Phase
+B goal). Options remain those documented earlier in this file:
+hypervisor-side L2 coarse-table pre-allocation for lazy L1 entries, or
+tracing what the kernel's domain-monitor does for DFSC=5 vs DFSC=7.
+
+### TStackInfo layout (correction)
+
+Direct dump from a wrapper-entry probe at FAR=`0x0ccee800` corrected the
+field interpretation. For a `NewStack(0x10000)` allocation in this run:
+
+```
+info[+ 0] = 0x0cd06800   ; (some "top" — unclear)
+info[+ 4] = 0x0ccee800   ; (some "base" — unclear)
+info[+ 8] = 0x0000001a   ; num_pages = 26 (NOT NewStack-size / 4 KiB)
+info[+12] = 0x00003063   ; flags?
+info[+16] = 0x0c122030   ; page_table[]
+info[+20] = 0x0cced000   ; offset basis for (FAR - this) >> 10
+info[+24] = 0x0ccee800   ; LOWER bound (FAR must be >= this)
+info[+28] = 0x0cd06800   ; UPPER bound (FAR must be < this)
+info[+32] = 0x00000000   ; flags
+info[+36] = 0x000013a5   ; domain (env id)
+```
+
+So the bound check is `info[+24] <= FAR < info[+28]`. The "+20 offset
+basis" is *separate* from the "+24 bound base" — adjacent stacks pack
+into 33-KiB slots within a domain page, so `info[+20]` may sit 1-3 KiB
+*below* `info[+24]`. The wrapper has to be aware of this when computing
+which subpages of the page belong to *this* stack.
+
+---
+
+## Earlier — wedged inside `TInterpreter::TInterpreter` constructor (Phase B goal reached!) (QEMU, 2026-04-26 afternoon)
+
+**Status:** Boot reached **`TInterpreter::TInterpreter` at 0x002F40E0** — the
+literal goal of Phase B per `PLAN.md`. Wedge was *inside* the constructor's
+first call to `TIntrpStack::NewState` after both `TRefStructStack` sub-objects
+have been constructed.
 
 ### Reboot-canary fire signature (no-trace, repro at trace ~270k)
 

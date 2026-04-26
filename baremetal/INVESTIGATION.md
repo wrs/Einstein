@@ -1,9 +1,102 @@
 # Phase B boot-stall investigation
 
-Live notes. Update as we learn more; remove old updates as we move on to
-new stalls.
+Live notes. Update as we learn more. REMOVE old updates once resolved.
 
-## Currently at — Stack-variant alias hypothesis EXONERATED via ScratchVA swap (QEMU, 2026-04-26 PM)
+## Currently at — TCardMessage-alias wedge resolved by per-page stack allocation (QEMU, 2026-04-26 evening)
+
+**Status:** the BootOS-canary wedge that's been blocking Phase B for
+weeks is resolved. Boot now progresses 2.4× past the previous stall —
+from trace ~170 k (BootOS canary entry #2 with R0=0x0cc80c80) to trace
+403 k+ (deep into user-mode task setup: TUTaskWorld, TUPort,
+TUSharedMem, TUSemaphoreGroup) and later to a **separate, downstream**
+`Reboot` canary at no-trace runtime.
+
+### Root cause
+
+The 717006 kernel uses **ARMv4 subpage-AP** to pack up to four 1 KiB
+stacks onto a single 4 KiB physical page. Each task's stack lives in
+one of the page's four 256 B-aligned 1-KiB subpages; the other three
+subpages are guard regions (AP=00) so SP-relative writes that drift
+into them fault and the kernel can grow the stack with a fresh page.
+
+ARMv7 (our Cortex-A53 host) **has no subpage-AP support** — bits[11:4]
+of the L2 small-page descriptor are reinterpreted as
+`(nG, S, AP[2], TEX[2:0], AP[1:0])` instead of four 2-bit subpage AP
+fields. The 717006 kernel's encoding ends up as
+`AP[2:0] in {000, 100, 111}` (= no-access / Reserved / deprecated)
+which would fault every access. To work around this,
+`fix_stage1_xn_bits` flattens every L2 entry to AP=011 (full RW) so
+accesses don't fault — necessary for boot to proceed at all.
+
+The side effect is that **stack A's overrun corrupts stack B** when
+the two stacks share a physical page via different VAs to subpages
+of the same PA. In our boot, `name`-task's stack-frame push (in
+`MoveFreeBlock`) walks past its 1-KiB subpage into another task's
+subpage on the same PA, and the corruption propagates downstream
+until the BootOS canary fires.
+
+### Fix: per-page stack allocation
+
+Per @walter's insight: subpage AP is **only used for stacks**, and a
+4-KiB-page-per-stack regime never relies on subpage protection. The
+kernel's stack-page allocator (`TStackManager::ResolveFault`) decides
+per-fault which subpages of a candidate page to claim. By forcing
+`ResolveFault` to claim **all four** subpages on every fault-driven
+allocation (mask = `0xF` instead of `1 << subpage_idx`), each task
+ends up with a fresh 4-KiB page that nobody else can grab subpages
+on. ARMv7's loss of subpage-AP semantics no longer matters: a stack
+overrun stays on the task's own slack space rather than corrupting
+another task's data.
+
+Implemented via three ROM patches in `rom_patches.rs::PATCHES_717006`,
+each replacing the mask-setup instruction immediately before a
+`bl FindOrAllocPage_ReturnUnLockedOnNoPage` call in `ResolveFault`
+(PC 0x001f7978..0x001f7c7c) with `mov r3, #0xF` (= `0xE3A0_300F`):
+
+| Site | Original | Context |
+|------|----------|---------|
+| `0x001f_7a10` | `lsl r3, r0, r8` | normal-fault single-subpage mask |
+| `0x001f_7bd4` | `ldr r3, [sp, #60]` | collision-grow mask reload |
+| `0x001f_7c24` | `orr r3, r1, r0` | collision-grow combined mask |
+
+### Boot-trajectory evidence
+
+| Variant | Wedge | Trace count |
+|---------|-------|-------------|
+| Pre-patch (baseline) | BootOS canary entry #2 (R0=0x0cc80c80, ELR=0x00ffff58) | ~170 k |
+| With ScratchVA only | Same as above (ScratchVA exonerated as a separate hypothesis) | ~170 k |
+| **With mask=0xF patch** | **`Reboot` canary** (kernel-driven self-reboot, separate failure) | **403 k+** |
+
+The new wedge fires `Reboot` (not BootOS canary) with R0=0xffffd8a5,
+LR=0x000d9888 inside user-mode flash-driver work. Different chain;
+not part of the same alias problem.
+
+### Diagnostic / follow-up
+
+`tracer.rs::dump_movefreeblock_entry` — the one-shot probe at the
+specific `name`-task `MoveFreeBlock(0x0c2041e0, 0x20)` call — stays
+in tree as the regression diagnostic. With the patch in place it
+fires identically (SP=0x0c320824, all stage-1 walks unchanged) but
+the subsequent stack push no longer corrupts a neighbor.
+
+Reproduction artifacts:
+- `/tmp/phaseB-2026-04-26-scratchva/qemu_mask_f.log` — trace+quiet
+  boot, 403 k+ traces, no canary.
+- `/tmp/phaseB-2026-04-26-scratchva/qemu_mask_f_notrace.log` —
+  quiet boot, hits `Reboot` canary at the new failure point.
+
+### Next stall
+
+Investigate the `Reboot` canary trigger. R0=0xffffd8a5 is the
+exception code; trace context just before the canary should show the
+`Throw`/`UnhandledException` chain. R12=0x0cc82544 is in the
+TCardServer-allocated region — possibly a related card-driver issue
+that the original wedge was masking, or possibly an entirely separate
+kernel state divergence.
+
+---
+
+## Earlier — Stack-variant alias hypothesis EXONERATED via ScratchVA swap (QEMU, 2026-04-26 PM)
 
 **Status:** the focused experiment to swap `StubVariant::Stack` for a
 non-stack-touching `StubVariant::ScratchVA` (per
@@ -2443,5 +2536,3 @@ Next investigation steps:
   instead of a code/data address.
 - Confirm reproducibility — re-run cold boot without snapshots and
   verify the DABT site / FAR are stable.
-
-

@@ -42,6 +42,7 @@
 //! semantics at the original site would need to be emulated against
 //! the site's own PC, not the handler's.
 
+use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::kprintln;
@@ -119,12 +120,73 @@ pub const SBA_MAX_SITES: usize = (SBA_UDF_MAX - SBA_UDF_BASE) as usize + 1;
 // `ldrb r0, [r0, #0x156]` at 0x26fc0) need this split.
 pub const SBA_STUB_POOL_IPA: u32 = 0x00E0_0000;
 pub const SBA_STUB_POOL_END: u32 = 0x00FF_FF00;
-pub const SBA_STUB_WORDS: usize = 12;
+pub const SBA_STUB_WORDS: usize = 16;
 pub const SBA_STUB_BYTES: u32 = (SBA_STUB_WORDS as u32) * 4;
 pub const SBA_STUB_MAX: usize =
     ((SBA_STUB_POOL_END - SBA_STUB_POOL_IPA) / SBA_STUB_BYTES) as usize;
 
 static NEXT_STUB: AtomicUsize = AtomicUsize::new(0);
+
+// ---- Scratch-VA pool (ScratchVA-variant inline stubs) ------------------
+//
+// ScratchVA-variant inline stubs save the caller's `scratch_ea` and
+// `scratch_fl` registers into a per-stub 8-byte scratch slot at a
+// kernel VA inside a 1 MiB carve-out. Each such stub gets its own
+// dedicated slot (no contention between concurrent stubs in different
+// IRQ contexts).
+//
+// We identity-map VA == IPA so:
+//   * Newton boot (kernel stage-1 on): kernel L1[VA>>20] = section
+//     descriptor identity-mapping VA→IPA. Stage-2 maps IPA →
+//     SCRATCH_POOL.
+//   * Guest-test mode (kernel stage-1 off, runs MMU-off per
+//     `test_runtime.S`): stage-1 is bypassed; the CPU emits VA as
+//     IPA directly. Stage-2 sees IPA == VA and maps to SCRATCH_POOL.
+//
+// Identity mapping keeps the per-stub literal usable from both regimes
+// without two separate stage-2 mappings.
+//
+// IPAs 0x3000_0000..0x5000_0000 are PCMCIA peripheral aperture, so
+// they're off-limits for a RAM-backed scratch carve-out.
+//
+// Empirical L1 census of 717006 boot (see qemu_l1_dump.log /
+// INVESTIGATION.md): the 717006 kernel populates L1[0x000..0x2FF] for
+// kernel-side mappings (contiguous identity sections + a few
+// dynamically-allocated coarse tables, e.g. L1[0x1A] backed by an L2
+// at ROM PA 0x00018000). One large observed-free gap at L1[0x52..0xBF]
+// (110 slots — VA 0x0520_0000..0x0BFF_FFFF). VA = IPA = 0x0600_0000
+// sits in the middle of that gap (L1[0x60]) and is also free in the
+// existing stage-2 layout (between RAM at 0x0440_0000 and the
+// framebuffer at 0x0E00_0000), so its stage-2 L2 slot (L2[0x30]) can
+// be refined to a 64 KiB RW carve-out.
+pub const SCRATCH_POOL_VA: u32 = 0x0600_0000;
+pub const SCRATCH_POOL_IPA: u32 = 0x0600_0000;
+pub const SCRATCH_POOL_SIZE: usize = 64 * 1024; // 16 × 4 KiB pages
+pub const SCRATCH_BYTES_PER_STUB: usize = 8;
+pub const SCRATCH_POOL_STUB_CAP: usize =
+    SCRATCH_POOL_SIZE / SCRATCH_BYTES_PER_STUB;
+
+#[repr(C, align(4096))]
+pub struct ScratchPool(pub [u8; SCRATCH_POOL_SIZE]);
+pub static mut SCRATCH_POOL: ScratchPool = ScratchPool([0; SCRATCH_POOL_SIZE]);
+
+/// Host PA of the scratch pool — used by `stage2::install_scratch_pool`
+/// when populating the L3 page table that backs the carve-out IPA.
+pub fn scratch_pool_host_pa() -> u64 {
+    addr_of_mut!(SCRATCH_POOL) as u64
+}
+
+/// Per-ScratchVA-variant slot allocator. Independent of `NEXT_STUB`
+/// because DeadReg / Stack stubs don't claim a scratch slot.
+static NEXT_SCRATCH_SLOT: AtomicUsize = AtomicUsize::new(0);
+
+/// Compute the kernel VA of the per-stub 8-byte scratch slot for a
+/// given allocator index. The returned VA lies inside
+/// `[SCRATCH_POOL_VA, SCRATCH_POOL_VA + SCRATCH_POOL_SIZE)` and is
+/// 4-byte aligned.
+pub fn scratch_slot_va(slot_idx: usize) -> u32 {
+    SCRATCH_POOL_VA + (slot_idx as u32) * (SCRATCH_BYTES_PER_STUB as u32)
+}
 
 /// Per-site stash of the original instruction word. Indexed by the UDF
 /// `imm16 - SBA_UDF_BASE`. 0 marks "slot unused" — 0 is not a valid
@@ -574,6 +636,37 @@ mod encode {
             super::AccessKind::Ldrsh => (cond << 28) | 0x01D0_00F0 | (rn << 16) | (rt << 12),
             super::AccessKind::Swpb  => unreachable!("SWPB is UDF-fallback, not inline"),
         }
+    }
+
+    /// LDR Rt, [PC, #+disp]  — PC-relative literal load (positive offset
+    /// only). The hardware's pipeline-PC value is the encoding-time PC + 8;
+    /// the caller is responsible for accounting for that. `disp` is in
+    /// bytes, must be ≤ 0xFFF.
+    pub fn ldr_pc_rel_pos(rt: u32, disp: u32) -> u32 {
+        debug_assert!(disp <= 0xFFF);
+        (AL << 28) | 0x059F_0000 | (rt << 12) | (disp & 0xFFF)
+    }
+
+    /// STR Rt, [Rn, #+imm12]  — pre-index, no writeback, positive offset.
+    pub fn str_imm_pos(rt: u32, rn: u32, imm12: u32) -> u32 {
+        debug_assert!(imm12 <= 0xFFF);
+        (AL << 28) | 0x0580_0000 | (rn << 16) | (rt << 12) | (imm12 & 0xFFF)
+    }
+
+    /// LDR Rt, [Rn, #+imm12]  — pre-index, no writeback, positive offset.
+    pub fn ldr_imm_pos(rt: u32, rn: u32, imm12: u32) -> u32 {
+        debug_assert!(imm12 <= 0xFFF);
+        (AL << 28) | 0x0590_0000 | (rn << 16) | (rt << 12) | (imm12 & 0xFFF)
+    }
+
+    /// MCR p15, 0, Rt, c13, c0, 2  — write Rt to TPIDRURW.
+    pub fn mcr_p15_0_c13_c0_2(rt: u32) -> u32 {
+        (AL << 28) | 0x0E0D_0F50 | (rt << 12)
+    }
+
+    /// MRC p15, 0, Rt, c13, c0, 2  — read TPIDRURW into Rt.
+    pub fn mrc_p15_0_c13_c0_2(rt: u32) -> u32 {
+        (AL << 28) | 0x0E1D_0F50 | (rt << 12)
     }
 }
 
@@ -1353,6 +1446,11 @@ fn pick_scratch_regs(d: &Decoded, orig_pc: u32) -> Option<(u32, Option<u32>)> {
 /// Always succeeds (operand set has at most 3 members; candidate pool
 /// has 6). Stack save/restore preserves their values across the stub
 /// regardless of liveness.
+///
+/// Retained for the regression tests at the bottom of the file but
+/// no longer reachable from `emit_inline_stub`'s live fallback path —
+/// `ScratchVA` (and `pick_operand_excluded_triple`) replaces it.
+#[cfg(test)]
 fn pick_operand_excluded_pair(d: &Decoded) -> (u32, u32) {
     const CANDIDATES: &[u32] = &[12, 0, 1, 2, 3, 14];
     let rm = match d.offset {
@@ -1369,6 +1467,30 @@ fn pick_operand_excluded_pair(d: &Decoded) -> (u32, u32) {
     }
     debug_assert!(n == 2, "operand-exclusion picker must always find 2 regs");
     (picks[0], picks[1])
+}
+
+/// Operand-exclusion picker for the ScratchVA-fallback stub. Picks 3
+/// regs from `[R12, R0..R3, R14]` that aren't operands of the byte
+/// access. Always succeeds (operand set has at most 3 members; candidate
+/// pool has 6 → at least 3 left). The stub saves all three caller
+/// values (scratch_ea + scratch_fl into the per-stub 8-byte scratch
+/// slot, scratch_addr into TPIDRURW) and restores them at exit.
+fn pick_operand_excluded_triple(d: &Decoded) -> (u32, u32, u32) {
+    const CANDIDATES: &[u32] = &[12, 0, 1, 2, 3, 14];
+    let rm = match d.offset {
+        OffsetForm::Reg { rm, .. } => rm,
+        _ => u32::MAX,
+    };
+    let mut picks = [u32::MAX; 3];
+    let mut n = 0;
+    for &r in CANDIDATES {
+        if r == d.rt || r == d.rn || r == rm { continue; }
+        picks[n] = r;
+        n += 1;
+        if n == 3 { break; }
+    }
+    debug_assert!(n == 3, "operand-exclusion picker must always find 3 regs");
+    (picks[0], picks[1], picks[2])
 }
 
 /// True when the site's operand shape is a simple non-writeback
@@ -1407,34 +1529,79 @@ enum StubVariant {
     /// SP at entry and POPs at exit so the caller's values are
     /// preserved across the access.
     ///
-    /// Assumption: SP_<mode> is valid at every byte-access site
-    /// reached after BootOS sets up the per-mode stacks. If a site
-    /// reached BEFORE SetUpStacks ever falls into this variant, the
-    /// PUSH would write into stage-2 RO ROM and stage-2-fault. We've
-    /// only seen this variant fire on past-BootOS sites in the live
-    /// ROM (first hit: 0x225d8 inside TADSPEndpoint::nSnd), where the
-    /// function's own prologue already established a valid SP. If a
-    /// future ROM revision puts a stack-fallback site inside BootOS,
-    /// the resulting stage-2 abort will surface it loudly.
+    /// Retained for the regression tests at the bottom of the file but
+    /// no longer reachable from the live `emit_inline_stub` fallback —
+    /// `ScratchVA` replaces it. The fallback used to alias guest stack
+    /// pages that Einstein's run leaves unmapped — that hypothesis was
+    /// tested via the ScratchVA swap (see plan
+    /// `docs/plans/shadow-stub-scratch-va.md`) and exonerated; the
+    /// 717006 wedge still fires at the same canary signature with
+    /// stack-touching removed.
+    #[allow(dead_code)]
     Stack { sfl: u32 },
+    /// Liveness analysis didn't find 2 dead candidates. Operand-
+    /// exclusion picker chose 3 regs (scratch_ea, scratch_fl,
+    /// scratch_addr — none of which is an operand of the byte access).
+    /// The stub stores caller scratch_ea / scratch_fl into a per-stub
+    /// 8-byte slot in `SCRATCH_POOL` (stage-2-mapped via the L1[0x18]
+    /// carve-out at IPA `SCRATCH_POOL_IPA`), and saves caller
+    /// scratch_addr into TPIDRURW (one slot, shared across all
+    /// ScratchVA stubs — see "Why this is IRQ-safe" in the plan).
+    /// The per-stub slot's VA is loaded via `LDR scratch_addr,
+    /// [pc, #disp]` from a literal at slot 15.
+    ///
+    /// `sfl` is always present (NZCV save is required because slot 7's
+    /// CMP unconditionally writes flags). `sad` is the third scratch
+    /// register that holds the per-stub scratch slot VA.
+    ScratchVA { sfl: u32, sad: u32, scratch_slot_idx: usize },
 }
 
-/// Build the 12-word inline stub. Two variants share the slot layout:
+/// Build the 16-word inline stub. Three variants share the slot layout
+/// — slots 14 (back-branch) and 15 (literal) are at fixed positions;
+/// slots 0–13 hold the body.
 ///
-///   0:  PUSH scratch_ea         (Stack)  | NOP (DeadReg)
-///   1:  PUSH scratch_fl         (Stack)  | NOP (DeadReg)
-///   2:  MRS scratch_fl, cpsr    (when sfl-saving) | NOP
-///   3:  <ADD|SUB> scratch_ea, Rn,    #imm_high
-///   4:  <ADD|SUB> scratch_ea, scratch_ea, #imm_low  (or NOP for reg-offset)
-///   5:  CMP scratch_ea, #XOR_LIMIT
-///   6:  EORLO scratch_ea, scratch_ea, #<xor>
-///   7:  MSR cpsr_f, scratch_fl  (mirror of slot 2) | NOP
-///   8:  <access>[cond] Rt, [scratch_ea]   ; native — may DABT naturally
-///   9:  POP scratch_fl          (Stack)  | NOP (DeadReg)
-///  10:  POP scratch_ea          (Stack)  | NOP (DeadReg)
-///  11:  B orig_pc + 4
+/// Common slots (5–10):
+///   5:  <ADD|SUB> scratch_ea, Rn,         #imm_high
+///   6:  <ADD|SUB> scratch_ea, scratch_ea, #imm_low | NOP
+///   7:  CMP scratch_ea, #XOR_LIMIT
+///   8:  EORLO scratch_ea, scratch_ea, #<xor>
+///   9:  MSR cpsr_f, scratch_fl  (mirror of slot 4 — variant-dependent)
+///   10: <access>[cond] Rt, [scratch_ea]   ; native — may DABT naturally
+///   14: B orig_pc + 4
 ///
-/// Two-step EA compute (slots 3+4) handles 12-bit immediates that
+/// DeadReg-variant frame:
+///   0..3:  NOP
+///   4:     MRS scratch_fl, cpsr     (when sfl=Some)  | NOP
+///   9:     MSR cpsr_f, scratch_fl   (when sfl=Some)  | NOP
+///   11..13:NOP
+///   15:    NOP (literal slot unused)
+///
+/// Stack-variant frame (regression-test only; not reachable from
+/// `emit_inline_stub` — see `StubVariant::Stack`):
+///   0:     PUSH scratch_ea  (SP -= 4)
+///   1:     PUSH scratch_fl  (SP -= 4)
+///   2..3:  NOP
+///   4:     MRS scratch_fl, cpsr
+///   9:     MSR cpsr_f, scratch_fl
+///   11:    POP scratch_fl   (SP += 4)
+///   12:    POP scratch_ea   (SP += 4)
+///   13:    NOP
+///   15:    NOP (literal slot unused)
+///
+/// ScratchVA-variant frame (live fallback for sites where liveness
+/// analysis can't find 2 dead candidates):
+///   0:     MCR p15,0,scratch_addr,c13,c0,2  ; TPIDRURW <- caller scratch_addr
+///   1:     LDR scratch_addr, [PC, #+48]     ; load per-stub scratch slot VA
+///   2:     STR scratch_ea, [scratch_addr]   ; save caller scratch_ea
+///   3:     STR scratch_fl, [scratch_addr,#4]; save caller scratch_fl
+///   4:     MRS scratch_fl, cpsr             ; save NZCV
+///   9:     MSR cpsr_f, scratch_fl           ; restore NZCV
+///   11:    LDR scratch_fl, [scratch_addr,#4]; restore caller scratch_fl
+///   12:    LDR scratch_ea, [scratch_addr]   ; restore caller scratch_ea
+///   13:    MRC p15,0,scratch_addr,c13,c0,2  ; restore caller scratch_addr
+///   15:    literal: SCRATCH_POOL_IPA + scratch_slot_idx * 8
+///
+/// Two-step EA compute (slots 5+6) handles 12-bit immediates that
 /// don't fit a single ARM modified-immediate (8-bit-rotated). Newton
 /// ROM has byte accesses with offsets up to 0xFFF (e.g. 0x156 at
 /// 0x26fc0); a single ADD with #0x156 doesn't encode, but
@@ -1445,14 +1612,14 @@ fn encode_inline_stub(
     stub_ipa: u32,
     sea: u32,
     variant: StubVariant,
-) -> Result<[u32; 12], &'static str> {
-    // Slots 3+4: compute EA into `sea` via two-step ADD/SUB. Stack-
+) -> Result<[u32; 16], &'static str> {
+    // Slots 5+6: compute EA into `sea` via two-step ADD/SUB. Stack-
     // variant + Rn == SP needs a +8 fudge because the two PUSHes
     // displaced SP by -8 from the value the original `[SP, #imm]`
     // access expected.
     let sp_fudge = matches!(variant, StubVariant::Stack { .. }) && d.rn == 13;
     let nop = encode::nop();
-    let (slot3, slot4) = match d.offset {
+    let (slot5, slot6) = match d.offset {
         OffsetForm::Imm { imm } => {
             let signed_imm: i64 = if d.u { imm as i64 } else { -(imm as i64) };
             let adjusted: i64 = signed_imm + if sp_fudge { 8 } else { 0 };
@@ -1467,12 +1634,12 @@ fn encode_inline_stub(
             // encodable since 12-bit values decompose into one 4-bit
             // shifted by 8 and one 8-bit raw.
             if let Some(enc) = encode::arm_imm12(abs) {
-                let s3 = if is_add {
+                let s5 = if is_add {
                     encode::add_imm(encode::AL, sea, d.rn, enc)
                 } else {
                     encode::sub_imm(encode::AL, sea, d.rn, enc)
                 };
-                (s3, nop)
+                (s5, nop)
             } else {
                 let high = abs & !0xFFu32;
                 let low = abs & 0xFFu32;
@@ -1480,7 +1647,7 @@ fn encode_inline_stub(
                     .ok_or("imm_high not encodable (split)")?;
                 let low_enc = encode::arm_imm12(low)
                     .ok_or("imm_low not encodable (split)")?;
-                let (s3, s4) = if is_add {
+                let (s5, s6) = if is_add {
                     (
                         encode::add_imm(encode::AL, sea, d.rn, high_enc),
                         encode::add_imm(encode::AL, sea, sea, low_enc),
@@ -1491,74 +1658,104 @@ fn encode_inline_stub(
                         encode::sub_imm(encode::AL, sea, sea, low_enc),
                     )
                 };
-                (s3, s4)
+                (s5, s6)
             }
         }
         OffsetForm::Reg { rm, shift_type, shift_amount } => {
-            // Slot 3: scratch_ea = Rn ± Rm (with optional shift).
-            let s3 = if d.u {
+            // Slot 5: scratch_ea = Rn ± Rm (with optional shift).
+            let s5 = if d.u {
                 encode::add_reg_shifted(encode::AL, sea, d.rn, rm, shift_type, shift_amount)
             } else {
                 encode::sub_reg_shifted(encode::AL, sea, d.rn, rm, shift_type, shift_amount)
             };
-            // Slot 4: only used for stack-variant SP+Rm to apply the
+            // Slot 6: only used for stack-variant SP+Rm to apply the
             // +8 push fudge. For all other reg-offset cases it's NOP.
-            let s4 = if sp_fudge {
+            let s6 = if sp_fudge {
                 let enc8 = encode::arm_imm12(8).expect("8 always encodes");
                 encode::add_imm(encode::AL, sea, sea, enc8)
             } else {
                 nop
             };
-            (s3, s4)
+            (s5, s6)
         }
         OffsetForm::None => return Err("OffsetForm::None not inline-eligible"),
     };
 
     let xor_limit_imm = encode::arm_imm12(XOR_LIMIT).ok_or("XOR_LIMIT not encodable")?;
-    let slot5 = encode::cmp_imm(sea, xor_limit_imm);
+    let slot7 = encode::cmp_imm(sea, xor_limit_imm);
 
     let xor_enc = encode::arm_imm12(xor_mask(d.kind)).ok_or("xor mask not encodable")?;
-    let slot6 = encode::eor_imm_cond(encode::LO, sea, sea, xor_enc);
+    let slot8 = encode::eor_imm_cond(encode::LO, sea, sea, xor_enc);
 
-    let slot8 = encode::access_zero_offset(d.kind, d.cond, d.rt, sea);
+    let slot10 = encode::access_zero_offset(d.kind, d.cond, d.rt, sea);
 
-    let slot11_pc = stub_ipa.wrapping_add(11 * 4);
-    let slot11 = encode::b(slot11_pc, orig_pc.wrapping_add(4))
+    let slot14_pc = stub_ipa.wrapping_add(14 * 4);
+    let slot14 = encode::b(slot14_pc, orig_pc.wrapping_add(4))
         .ok_or("back-branch out of B-imm24 range")?;
 
-    let (slot0, slot1, slot2, slot7, slot9, slot10) = match variant {
-        StubVariant::DeadReg { sfl: Some(sfl) } => (
-            nop,
-            nop,
-            encode::mrs_cpsr(sfl),
-            encode::msr_cpsr_f(sfl),
-            nop,
-            nop,
-        ),
-        StubVariant::DeadReg { sfl: None } => (nop, nop, nop, nop, nop, nop),
-        StubVariant::Stack { sfl } => (
-            encode::push(sea),
-            encode::push(sfl),
-            encode::mrs_cpsr(sfl),
-            encode::msr_cpsr_f(sfl),
-            encode::pop(sfl),
-            encode::pop(sea),
-        ),
+    // Per-variant frame (slots 0..4, 9, 11..13, 15).
+    let mut slot0 = nop;
+    let mut slot1 = nop;
+    let mut slot2 = nop;
+    let mut slot3 = nop;
+    let mut slot4 = nop;
+    let mut slot9 = nop;
+    let mut slot11 = nop;
+    let mut slot12 = nop;
+    let mut slot13 = nop;
+    let mut slot15 = nop;
+
+    match variant {
+        StubVariant::DeadReg { sfl: Some(sfl) } => {
+            slot4 = encode::mrs_cpsr(sfl);
+            slot9 = encode::msr_cpsr_f(sfl);
+        }
+        StubVariant::DeadReg { sfl: None } => {}
+        StubVariant::Stack { sfl } => {
+            slot0 = encode::push(sea);
+            slot1 = encode::push(sfl);
+            slot4 = encode::mrs_cpsr(sfl);
+            slot9 = encode::msr_cpsr_f(sfl);
+            slot11 = encode::pop(sfl);
+            slot12 = encode::pop(sea);
+        }
+        StubVariant::ScratchVA { sfl, sad, scratch_slot_idx } => {
+            // Encoding-time PC at slot 1 = stub_ipa + 4 + 8 = stub_ipa + 12.
+            // Literal lives at slot 15 = stub_ipa + 60. Distance = 48.
+            const LDR_PC_REL_DISP: u32 = 48;
+            slot0 = encode::mcr_p15_0_c13_c0_2(sad);
+            slot1 = encode::ldr_pc_rel_pos(sad, LDR_PC_REL_DISP);
+            slot2 = encode::str_imm_pos(sea, sad, 0);
+            slot3 = encode::str_imm_pos(sfl, sad, 4);
+            slot4 = encode::mrs_cpsr(sfl);
+            slot9 = encode::msr_cpsr_f(sfl);
+            slot11 = encode::ldr_imm_pos(sfl, sad, 4);
+            slot12 = encode::ldr_imm_pos(sea, sad, 0);
+            slot13 = encode::mrc_p15_0_c13_c0_2(sad);
+            if scratch_slot_idx >= SCRATCH_POOL_STUB_CAP {
+                return Err("scratch_slot_idx exceeds pool capacity");
+            }
+            slot15 = scratch_slot_va(scratch_slot_idx);
+        }
     };
 
     Ok([
-        slot0,  // 0  PUSH scratch_ea | NOP
-        slot1,  // 1  PUSH scratch_fl | NOP
-        slot2,  // 2  MRS scratch_fl, cpsr | NOP
-        slot3,  // 3  ADD/SUB scratch_ea, Rn, imm_high
-        slot4,  // 4  ADD/SUB scratch_ea, scratch_ea, imm_low | NOP
-        slot5,  // 5  CMP
-        slot6,  // 6  EORLO
-        slot7,  // 7  MSR cpsr_f, scratch_fl | NOP
-        slot8,  // 8  native access
-        slot9,  // 9  POP scratch_fl | NOP
-        slot10, // 10 POP scratch_ea | NOP
-        slot11, // 11 back-branch
+        slot0,  // 0
+        slot1,  // 1
+        slot2,  // 2
+        slot3,  // 3
+        slot4,  // 4
+        slot5,  // 5  EA-compute high
+        slot6,  // 6  EA-compute low | NOP
+        slot7,  // 7  CMP scratch_ea, XOR_LIMIT
+        slot8,  // 8  EORLO scratch_ea, scratch_ea, #xor
+        slot9,  // 9  MSR cpsr_f, scratch_fl | NOP
+        slot10, // 10 native access
+        slot11, // 11
+        slot12, // 12
+        slot13, // 13
+        slot14, // 14 back-branch
+        slot15, // 15 literal | NOP
     ])
 }
 
@@ -1571,28 +1768,32 @@ fn emit_inline_stub(d: &Decoded, orig_pc: u32) {
         Some((sea, sfl)) => (sea, StubVariant::DeadReg { sfl }),
         None => {
             // Liveness analysis didn't find 2 dead candidates (or 1 +
-            // dead-NZCV). Fall back to the stack-based stub: the
-            // operand-exclusion picker still gives us 2 free registers
+            // dead-NZCV). Fall back to the ScratchVA-based stub: the
+            // operand-exclusion picker gives us 3 free registers
             // (always — at most 3 operand registers out of a 6-element
-            // candidate pool); the stub PUSHes them onto the mode-
-            // banked SP at entry and POPs at exit. Per-mode banked SP
-            // makes this IRQ-safe (each mode has its own stack).
+            // candidate pool). The stub saves caller scratch_ea +
+            // scratch_fl into a per-stub 8-byte slot in `SCRATCH_POOL`
+            // (stage-2-mapped via the L1[0x18] carve-out at IPA
+            // `SCRATCH_POOL_IPA`); caller scratch_addr goes into
+            // TPIDRURW.
             //
-            // ASSUMPTION: SP_<mode> is valid at this site. That holds
-            // for everything past BootOS's SetUpStacks. The first
-            // ROM-side hit was 0x225d8 in TADSPEndpoint::nSnd, well
-            // past BootOS — the function's own prologue had already
-            // pushed its callee-saved frame onto a valid SP. If a
-            // future ROM revision lands a stack-fallback site INSIDE
-            // BootOS (where SP_<mode> is still at its reset value =
-            // some ROM word), the PUSH at slot 0 will write to stage-2
-            // RO ROM and stage-2-fault loudly — this is the same
-            // failure mode the original-plan stack stub had pre-
-            // SetUpStacks, and the install-time halt-loud was supposed
-            // to catch the equivalent dead-reg failure. We accept the
-            // stage-2 abort as the trip-wire if it ever fires.
-            let (sea, sfl) = pick_operand_excluded_pair(d);
-            (sea, StubVariant::Stack { sfl })
+            // The previous fallback (`StubVariant::Stack`) PUSH/POP'd
+            // onto the mode-banked SP, which lazily mapped guest stack
+            // pages and masked a kernel-mode `TStackManager::Fault`
+            // chain Einstein's run takes. ScratchVA touches a hyper-
+            // visor-owned VA so it has no observable side effect on
+            // the guest's stack page accounting. See
+            // `docs/plans/shadow-stub-scratch-va.md` for details.
+            let (sea, sfl, sad) = pick_operand_excluded_triple(d);
+            let scratch_slot_idx = NEXT_SCRATCH_SLOT.fetch_add(1, Ordering::SeqCst);
+            if scratch_slot_idx >= SCRATCH_POOL_STUB_CAP {
+                kprintln!(
+                    "shadow_stub: FATAL — ScratchVA scratch pool exhausted at PC={:#x} ({} slots)",
+                    orig_pc, scratch_slot_idx
+                );
+                crate::cpu::halt();
+            }
+            (sea, StubVariant::ScratchVA { sfl, sad, scratch_slot_idx })
         }
     };
 
@@ -1854,13 +2055,14 @@ pub fn log_stats(stats: &PatchStats) {
         "shadow_stub: scanned {} words, patched {} insns \
          (inline={}, UDF={}; LDRB/STRB={}, LDRH/STRH={}, LDRSB/LDRSH={}, SWPB={}), \
          skipped {} PC-operand, \
-         site table {}/{}, inline pool {}/{}",
+         site table {}/{}, inline pool {}/{}, scratch slots {}/{}",
         stats.words_scanned, stats.patched,
         stats.inline_stubs, stats.udf_fallback,
         stats.ldrb_strb, stats.ldrh_strh, stats.ldrsb_ldrsh, stats.swpb,
         stats.skipped_pc_operand,
         NEXT_SITE.load(Ordering::SeqCst), SBA_MAX_SITES,
         NEXT_STUB.load(Ordering::SeqCst), SBA_STUB_MAX,
+        NEXT_SCRATCH_SLOT.load(Ordering::SeqCst), SCRATCH_POOL_STUB_CAP,
     );
 }
 
@@ -2636,24 +2838,24 @@ mod tests {
 
     #[test]
     fn inline_stub_dead_reg_layout() {
-        // LDRB r0, [r1, #4] with sfl=Some(R0): MRS slot 2, MSR slot 7,
-        // NOPs slots 0, 1, 9, 10, back-branch slot 11. Slot 4 is also
-        // NOP since imm=4 fits a single ADD.
+        // LDRB r0, [r1, #4] with sfl=Some(R0): MRS slot 4, MSR slot 9,
+        // NOPs in all the other variant-frame slots. Slot 6 is NOP
+        // since imm=4 fits a single ADD.
         let d = decode(0xE5D1_0004).unwrap();
         let stub = encode_inline_stub(
             &d, 0x0004_0000, 0x00E0_0000, 12, StubVariant::DeadReg { sfl: Some(0) },
         ).expect("stub");
         let nop = encode::nop();
-        for i in [0usize, 1, 4, 9, 10] {
+        for i in [0usize, 1, 2, 3, 6, 11, 12, 13, 15] {
             assert_eq!(stub[i], nop, "slot {} should be NOP", i);
         }
-        assert_eq!(stub[2] & 0xFFFF_0FFF, 0xE10F_0000);  // MRS
-        assert_eq!(stub[7] & 0xFFFF_FFF0, 0xE128_F000);  // MSR
-        let decoded_access = decode(stub[8]).expect("access decodes");
+        assert_eq!(stub[4] & 0xFFFF_0FFF, 0xE10F_0000);  // MRS
+        assert_eq!(stub[9] & 0xFFFF_FFF0, 0xE128_F000);  // MSR
+        let decoded_access = decode(stub[10]).expect("access decodes");
         assert_eq!(decoded_access.kind, AccessKind::Ldrb);
-        let slot11_pc = 0x00E0_0000u32 + 11 * 4;
-        let expected = encode::b(slot11_pc, 0x0004_0004).unwrap();
-        assert_eq!(stub[11], expected);
+        let slot14_pc = 0x00E0_0000u32 + 14 * 4;
+        let expected = encode::b(slot14_pc, 0x0004_0004).unwrap();
+        assert_eq!(stub[14], expected);
     }
 
     #[test]
@@ -2664,50 +2866,90 @@ mod tests {
             &d, 0x0004_0000, 0x00E0_0000, 12, StubVariant::DeadReg { sfl: None },
         ).expect("stub");
         let nop = encode::nop();
-        for i in [0usize, 1, 2, 4, 7, 9, 10] {
+        for i in [0usize, 1, 2, 3, 4, 6, 9, 11, 12, 13, 15] {
             assert_eq!(stub[i], nop, "slot {} should be NOP", i);
         }
     }
 
     #[test]
     fn inline_stub_stack_layout() {
-        // Stack variant: slots 0/1 PUSH, 9/10 POP.
+        // Stack variant (regression-only): slots 0/1 PUSH, 11/12 POP.
         let d = decode(0xE5D1_0004).unwrap();
         let stub = encode_inline_stub(
             &d, 0x0004_0000, 0x00E0_0000, 12, StubVariant::Stack { sfl: 0 },
         ).expect("stub");
         assert_eq!(stub[0] & 0xFFFF_0FFF, 0xE52D_0004);  // PUSH scratch_ea
         assert_eq!(stub[1] & 0xFFFF_0FFF, 0xE52D_0004);  // PUSH scratch_fl
-        assert_eq!(stub[9] & 0xFFFF_0FFF, 0xE49D_0004);  // POP scratch_fl
-        assert_eq!(stub[10] & 0xFFFF_0FFF, 0xE49D_0004); // POP scratch_ea
+        assert_eq!(stub[11] & 0xFFFF_0FFF, 0xE49D_0004); // POP scratch_fl
+        assert_eq!(stub[12] & 0xFFFF_0FFF, 0xE49D_0004); // POP scratch_ea
+    }
+
+    #[test]
+    fn inline_stub_scratch_va_layout() {
+        // ScratchVA variant: slot 0 = MCR (save sad → TPIDRURW),
+        // slot 1 = LDR sad,[pc,#48], slots 2/3 = STR sea/sfl,[sad,#0/4],
+        // slot 4 = MRS, slot 9 = MSR, slots 11/12 = LDR sfl/sea, slot 13 = MRC,
+        // slot 14 = back-branch, slot 15 = literal scratch VA.
+        let d = decode(0xE5D1_0004).unwrap();
+        let stub = encode_inline_stub(
+            &d, 0x0004_0000, 0x00E0_0000, 12,
+            StubVariant::ScratchVA { sfl: 0, sad: 1, scratch_slot_idx: 7 },
+        ).expect("stub");
+        // slot 0: MCR p15,0,r1,c13,c0,2 = 0xEE0D_1F50
+        assert_eq!(stub[0], 0xEE0D_1F50);
+        // slot 1: LDR r1, [pc, #48] = 0xE59F_1030
+        assert_eq!(stub[1], 0xE59F_1030);
+        // slot 2: STR r12, [r1] = 0xE581_C000
+        assert_eq!(stub[2], 0xE581_C000);
+        // slot 3: STR r0, [r1, #4] = 0xE581_0004
+        assert_eq!(stub[3], 0xE581_0004);
+        // slot 4: MRS r0, cpsr  (mrs_cpsr(0))
+        assert_eq!(stub[4] & 0xFFFF_0FFF, 0xE10F_0000);
+        // slot 9: MSR cpsr_f, r0
+        assert_eq!(stub[9] & 0xFFFF_FFF0, 0xE128_F000);
+        // slot 10: LDRB r0, [r12]
+        let decoded_access = decode(stub[10]).expect("access decodes");
+        assert_eq!(decoded_access.kind, AccessKind::Ldrb);
+        // slot 11: LDR r0, [r1, #4] = 0xE591_0004
+        assert_eq!(stub[11], 0xE591_0004);
+        // slot 12: LDR r12, [r1] = 0xE591_C000
+        assert_eq!(stub[12], 0xE591_C000);
+        // slot 13: MRC p15,0,r1,c13,c0,2 = 0xEE1D_1F50
+        assert_eq!(stub[13], 0xEE1D_1F50);
+        // slot 14: back-branch
+        let slot14_pc = 0x00E0_0000u32 + 14 * 4;
+        let expected_branch = encode::b(slot14_pc, 0x0004_0004).unwrap();
+        assert_eq!(stub[14], expected_branch);
+        // slot 15: literal = SCRATCH_POOL_VA + 7 * 8
+        assert_eq!(stub[15], SCRATCH_POOL_VA + 7 * (SCRATCH_BYTES_PER_STUB as u32));
     }
 
     #[test]
     fn inline_stub_imm_split_for_large_offset() {
         // LDRB r0, [r1, #0x156] — encoding e5d10156. 0x156 doesn't fit
         // a single ARM modified-immediate, so the EA compute splits
-        // into ADD #0x100 + ADD #0x56.
+        // into ADD #0x100 (slot 5) + ADD #0x56 (slot 6).
         let insn: u32 = 0xE5D1_0156;
         let d = decode(insn).expect("decode");
         let stub = encode_inline_stub(
             &d, 0x0004_0000, 0x00E0_0000, 12, StubVariant::DeadReg { sfl: None },
         ).expect("stub with split imm");
-        // Slot 3: ADD scratch_ea, Rn(=R1), #0x100.
-        let s3 = stub[3];
-        assert_eq!((s3 >> 28) & 0xF, encode::AL);
-        assert_eq!(s3 & 0x0FE0_0000, 0x0280_0000); // ADD imm
-        assert_eq!((s3 >> 16) & 0xF, 1); // Rn=R1
-        assert_eq!(s3 & 0xFFF, encode::arm_imm12(0x100).unwrap());
-        // Slot 4: ADD scratch_ea, scratch_ea, #0x56.
-        let s4 = stub[4];
-        assert_eq!(s4 & 0x0FE0_0000, 0x0280_0000);
-        assert_eq!(s4 & 0xFFF, encode::arm_imm12(0x56).unwrap());
+        // Slot 5: ADD scratch_ea, Rn(=R1), #0x100.
+        let s5 = stub[5];
+        assert_eq!((s5 >> 28) & 0xF, encode::AL);
+        assert_eq!(s5 & 0x0FE0_0000, 0x0280_0000); // ADD imm
+        assert_eq!((s5 >> 16) & 0xF, 1); // Rn=R1
+        assert_eq!(s5 & 0xFFF, encode::arm_imm12(0x100).unwrap());
+        // Slot 6: ADD scratch_ea, scratch_ea, #0x56.
+        let s6 = stub[6];
+        assert_eq!(s6 & 0x0FE0_0000, 0x0280_0000);
+        assert_eq!(s6 & 0xFFF, encode::arm_imm12(0x56).unwrap());
     }
 
     #[test]
     fn inline_stub_stack_sp_imm_fudges_by_8() {
         // LDRB r0, [SP, #4] stack variant: +8 fudge → ADD #12 in
-        // slots 3+4. Since 12 fits a single ADD, slot 4 is NOP.
+        // slots 5+6. Since 12 fits a single ADD, slot 6 is NOP.
         let mut w: u32 = 0;
         w |= 0xE << 28;
         w |= 0b010 << 25;
@@ -2722,12 +2964,12 @@ mod tests {
         let stub = encode_inline_stub(
             &d, 0x0004_0000, 0x00E0_0000, 12, StubVariant::Stack { sfl: 1 },
         ).expect("stub");
-        let s3 = stub[3];
-        assert_eq!((s3 >> 16) & 0xF, 13);
-        assert_eq!(s3 & 0x0FE0_0000, 0x0280_0000);
-        assert_eq!(s3 & 0xFFF, encode::arm_imm12(12).unwrap());
-        // Slot 4 is NOP since 12 fits one step.
-        assert_eq!(stub[4], encode::nop());
+        let s5 = stub[5];
+        assert_eq!((s5 >> 16) & 0xF, 13);
+        assert_eq!(s5 & 0x0FE0_0000, 0x0280_0000);
+        assert_eq!(s5 & 0xFFF, encode::arm_imm12(12).unwrap());
+        // Slot 6 is NOP since 12 fits one step.
+        assert_eq!(stub[6], encode::nop());
     }
 
     /// Helper: classify whether a BranchKind ended the basic block.

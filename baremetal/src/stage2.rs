@@ -64,6 +64,16 @@ static mut S2_L2: PageTable = PageTable([0; 512]);
 // in this L3 stay invalid and continue to stage-2-fault into mmio::.
 static mut S2_L3_HW_TICKS: PageTable = PageTable([0; 512]);
 
+// L3 table refining the 2 MiB L2 slot that covers the shadow-stub
+// scratch carve-out at IPA 0x0180_0000..0x01A0_0000 (kernel VA
+// 0x0180_0000 mapped via stage-1 L1[0x18]). The first 16 4 KiB pages
+// are populated by `install_scratch_pool` and back the
+// `shadow_stub::SCRATCH_POOL` host buffer. The remaining 496 entries
+// stay invalid and stage-2-fault if anything outside the populated
+// 64 KiB ever gets accessed (defensive — the ScratchVA stubs only
+// touch their own slot).
+static mut S2_L3_SCRATCH: PageTable = PageTable([0; 512]);
+
 // L3 tables refining the two 2 MiB L2 slots covering guest RAM
 // (IPA 0x0400_0000..0x0440_0000). Each L3 slot is a 4 KiB page; the
 // shadow-stub flips per-page permissions between `RW + XN` (initial,
@@ -315,6 +325,14 @@ pub unsafe fn init() {
     // SAFETY: see the called helper's contract.
     unsafe { install_tick_page(); }
 
+    // Carve out a 64 KiB RW window at IPA 0x0180_0000 to back
+    // shadow-stub ScratchVA-variant inline stubs. Stage-2 maps it to
+    // `shadow_stub::SCRATCH_POOL`; stage-1 (kernel L1[0x18]) is
+    // populated separately by `guest_mem::install_scratch_pool_l1_section`
+    // on the first M=0→M=1 transition.
+    // SAFETY: helper installs L3 entries and points L2[0xC] at the L3.
+    unsafe { install_scratch_pool(); }
+
     // Under the UDF-trap shadow-byte-access path there are no in-guest
     // stub pools. Byte/halfword-access sites are replaced in place with
     // `UDF #imm16` markers; the UND raises into EL2 and the emulator in
@@ -446,6 +464,50 @@ unsafe fn install_tick_page() {
     kprintln!(
         "stage2: tick page (calendar / alarm / ticks) @ IPA {:#x} -> host PA {:#x} (RO, 4 KiB)",
         TICK_PAGE_IPA, tick_pa
+    );
+}
+
+/// Wire the 64 KiB shadow-stub scratch carve-out into stage-2 as RW
+/// normal-cacheable memory backed by `shadow_stub::SCRATCH_POOL`. The
+/// 2 MiB L2 block covering IPA 0x0180_0000..0x01A0_0000 is replaced
+/// with a table descriptor pointing at `S2_L3_SCRATCH`; the first 16
+/// L3 entries (4 KiB each) point at the host pool. Pages 16..512 stay
+/// invalid so any access outside the 64 KiB window stage-2-faults.
+unsafe fn install_scratch_pool() {
+    let l2_index =
+        (crate::shadow_stub::SCRATCH_POOL_IPA as u64 / TWO_MIB) as usize; // 0xC
+    let l3_ptr = addr_of_mut!(S2_L3_SCRATCH) as *mut u64;
+    let pool_pa = crate::shadow_stub::scratch_pool_host_pa();
+    let pool_pages = crate::shadow_stub::SCRATCH_POOL_SIZE / 0x1000; // 16
+
+    // Clear the L3 table (all invalid).
+    for i in 0..512usize {
+        // SAFETY: 0 ≤ i < 512.
+        unsafe { l3_ptr.add(i).write(0); }
+    }
+    // Map the populated pages of the carve-out.
+    let l3_base_ipa = (l2_index as u64) * TWO_MIB;
+    let pool_ipa = crate::shadow_stub::SCRATCH_POOL_IPA as u64;
+    let l3_index_base = ((pool_ipa - l3_base_ipa) / 0x1000) as usize;
+    for i in 0..pool_pages {
+        let entry = (pool_pa + (i as u64) * 0x1000) | PAGE_NORMAL_RW;
+        // SAFETY: l3_index_base + i < 512 by construction (pool fits).
+        unsafe { l3_ptr.add(l3_index_base + i).write(entry); }
+    }
+
+    // Replace the L2 slot with a table descriptor pointing at the L3.
+    let l2_ptr = addr_of_mut!(S2_L2) as *mut u64;
+    let l3_phys = l3_ptr as u64;
+    // SAFETY: l2_index < 512.
+    unsafe { l2_ptr.add(l2_index).write(l3_phys | DESC_VALID | DESC_TABLE); }
+
+    kprintln!(
+        "stage2: shadow-stub scratch pool @ IPA {:#x}..{:#x} -> host PA {:#x} (RW, {} KiB)",
+        crate::shadow_stub::SCRATCH_POOL_IPA,
+        crate::shadow_stub::SCRATCH_POOL_IPA
+            + crate::shadow_stub::SCRATCH_POOL_SIZE as u32,
+        pool_pa,
+        crate::shadow_stub::SCRATCH_POOL_SIZE / 1024,
     );
 }
 

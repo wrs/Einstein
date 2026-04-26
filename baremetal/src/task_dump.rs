@@ -51,20 +51,28 @@ const G_CURRENT_GLOB:  u32 = 0x0c10_105c;
 ///   ... rest depends on KernelType
 ///
 /// ID encoding (from `NewId`):
-///   bits[3:0]   KernelType — actual values empirically derived from
-///               STKU's task->[0] = 0x12e3 (low nibble 3 ⇒ Task). The
-///               DDK header `KernelTypes.h` from OS600 lists these in a
-///               *different* order (Port, Task, Env, Domain, ...) which
-///               doesn't match the 717006 ROM. Inferred 717006 mapping
-///               (TODO confirm Port / Env / etc.):
-///                 3 = Task           8 = Monitor          9 = Phys
-///                 (others observed in trace: 0x2 0x4 0x5 0x7 0xa 0xb)
+///   bits[3:0]   KernelType — full kernel-side mapping for 717006:
+///                 0x2 = Port,  0x3 = Task,    0x4 = Env,    0x5 = Domain,
+///                 0x6 = SemL,  0x7 = SemG,    0x8 = SMem,   0x9 = SMsg,
+///                 0xa = Mon,   0xb = Phys.
+///               Note: this is the user-side ObjectTypes enum (DDK
+///               `KernelTypes.h`) plus 2 — see docs/STRUCTURES.md
+///               "Kernel object IDs" for citations.
 ///   bits[31:4]  per-type sequence number (NextGlobalUniqueId)
 /// Hash bucket index = (id >> 4) & 0x7F
 const G_OBJECT_TABLE:  u32 = 0x0c10_fc34;
 const OT_BUCKETS_BASE: u32 = 0x10;
 const OT_NUM_BUCKETS:  u32 = 128;
 const OBJ_TYPE_TASK:   u32 = 3;
+const OBJ_TYPE_PORT:   u32 = 2;
+const OBJ_TYPE_MONITOR:u32 = 0xa;
+
+/// 4-byte name for each KernelType bucket. Indexed by `id & 0xF`.
+/// Buckets we haven't seen used (0, 1, 12..15) are blank.
+pub const KIND_NAMES: [&str; 16] = [
+    "----", "----", "Port", "Task", "Env ", "Dom ", "SemL", "SemG",
+    "SMem", "SMsg", "Mon ", "Phys", "----", "----", "----", "----",
+];
 
 const TS_HIGHEST_PRI:  u32 = 0x14;
 const TS_PRI_BITMAP:   u32 = 0x18;
@@ -281,12 +289,15 @@ fn dump_object_table_tasks(current: u32) {
         }
     }
     kprintln!(
-        "  object table: {} tasks (of {} kernel objects); types[0..15]={} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}  (3=Task, 8=Mon, 9=Phys are confirmed)",
+        "  object table: {} tasks (of {} kernel objects)",
         tasks, total,
-        by_type[0], by_type[1], by_type[2], by_type[3],
-        by_type[4], by_type[5], by_type[6], by_type[7],
-        by_type[8], by_type[9], by_type[10], by_type[11],
-        by_type[12], by_type[13], by_type[14], by_type[15],
+    );
+    kprintln!(
+        "    Port={} Task={} Env={} Dom={} SemL={} SemG={} SMem={} SMsg={} Mon={} Phys={} (others: t0={} t1={} t12={} t13={} t14={} t15={})",
+        by_type[2], by_type[3], by_type[4], by_type[5],
+        by_type[6], by_type[7], by_type[8], by_type[9],
+        by_type[10], by_type[11],
+        by_type[0], by_type[1], by_type[12], by_type[13], by_type[14], by_type[15],
     );
 }
 
@@ -448,6 +459,237 @@ pub fn dump_save_area_for_named(name_match: &[u8; 4]) {
             steps += 1;
         }
     }
+}
+
+/// Walk a TDoubleQContainer at `qc_va` and call `f(entry_va)` for each
+/// entry, up to `max` iterations. Returns the number of entries
+/// observed, or `None` if the container itself is unreadable.
+///
+/// Layout (see docs/STRUCTURES.md):
+///   +0x00 head        — first entry's TDoubleQItem (or 0)
+///   +0x04 tail        — last entry's qitem
+///   +0x08 link_offset — offset of the qitem within each entry
+///
+/// Each TDoubleQItem is { next, prev, container } with a 4-word stride.
+pub fn walk_dqc<F: FnMut(u32)>(qc_va: u32, max: usize, mut f: F) -> Option<usize> {
+    let head      = rd(qc_va)?;
+    let link_off  = rd(qc_va + 0x08)?;
+    if head == 0 {
+        return Some(0);
+    }
+    let mut count = 0usize;
+    let mut qitem = head;
+    while qitem != 0 && count < max {
+        // entry pointer = qitem - link_offset
+        let entry = qitem.wrapping_sub(link_off);
+        f(entry);
+        count += 1;
+        let next = match rd(qitem) { Some(v) => v, None => break };
+        if next == qitem { break; }
+        qitem = next;
+    }
+    Some(count)
+}
+
+/// Print a one-line summary of a TDoubleQContainer at `qc_va`. Useful
+/// when called against a port's pending or waiter queue.
+pub fn dump_dqc_summary(label: &str, qc_va: u32) {
+    let head      = rd(qc_va).unwrap_or(u32::MAX);
+    let tail      = rd(qc_va + 0x04).unwrap_or(u32::MAX);
+    let link_off  = rd(qc_va + 0x08).unwrap_or(u32::MAX);
+    let cb        = rd(qc_va + 0x0c).unwrap_or(u32::MAX);
+    let client    = rd(qc_va + 0x10).unwrap_or(u32::MAX);
+    let count = walk_dqc(qc_va, 64, |_| {}).unwrap_or(usize::MAX);
+    kprintln!(
+        "  dqc[{}] @{:#x}: head={:#x} tail={:#x} link_off={} cb={:#x} client={:#x} count={}",
+        label, qc_va, head, tail, link_off, cb, client, count
+    );
+}
+
+/// Find the task with id `task_id` in `gObjectTable` and return
+/// (TTask*, name fourcc) if found. Used when chasing a msg back to
+/// its sender or receiver.
+fn find_task_by_id(task_id: u32) -> Option<(u32, [u8; 4])> {
+    if task_id == 0 || task_id == u32::MAX || (task_id & 0xF) != OBJ_TYPE_TASK {
+        return None;
+    }
+    let bucket = (task_id >> 4) & 0x7F;
+    let head_va = G_OBJECT_TABLE + OT_BUCKETS_BASE + bucket * 4;
+    let mut node = rd(head_va)?;
+    let mut steps = 0u32;
+    while node != 0 && steps < 128 {
+        let id = rd(node)?;
+        if id == task_id {
+            let glob = rd(node + TT_GLOBALS).unwrap_or(0);
+            let name = match find_task_name(glob) {
+                Some((_, v)) => [(v>>24) as u8, (v>>16) as u8, (v>>8) as u8, v as u8],
+                None         => *b"????",
+            };
+            return Some((node, name));
+        }
+        node = rd(node + 4)?;
+        steps += 1;
+    }
+    None
+}
+
+/// Print a TSharedMemMsg at `msg_va`. Resolves the receiver and
+/// sender tasks if their IDs are populated. See docs/STRUCTURES.md
+/// "TSharedMemMsg" for the field layout.
+pub fn dump_msg(label: &str, msg_va: u32) {
+    let id          = rd(msg_va).unwrap_or(u32::MAX);
+    let state44     = rd(msg_va + 0x44).unwrap_or(u32::MAX);
+    let flags50     = rd(msg_va + 0x50).unwrap_or(u32::MAX);
+    let filter54    = rd(msg_va + 0x54).unwrap_or(u32::MAX);
+    let parked6c    = rd(msg_va + 0x6c).unwrap_or(u32::MAX);
+    let recv_id     = rd(msg_va + 0x70).unwrap_or(u32::MAX);
+    let sender_id   = rd(msg_va + 0x7c).unwrap_or(u32::MAX);
+    let kind = (id & 0xF) as usize;
+
+    let recv_str = match find_task_by_id(recv_id) {
+        Some((_, n)) => n,
+        None => *b"----",
+    };
+    let send_str = match find_task_by_id(sender_id) {
+        Some((_, n)) => n,
+        None => *b"----",
+    };
+    kprintln!(
+        "  msg[{}] @{:#x} id={:#x}({}) state={:#x} flags={:#x} filter={:#x} parked_on={:#x}({}) recv={:#x}({}{}{}{}) send={:#x}({}{}{}{})",
+        label, msg_va, id, KIND_NAMES[kind], state44, flags50, filter54,
+        parked6c, KIND_NAMES[(parked6c & 0xF) as usize],
+        recv_id, recv_str[0] as char, recv_str[1] as char, recv_str[2] as char, recv_str[3] as char,
+        sender_id, send_str[0] as char, send_str[1] as char, send_str[2] as char, send_str[3] as char,
+    );
+}
+
+/// Dump a TPort: its id, both queue summaries, and resolve each
+/// waiter back to its receiving task. See docs/STRUCTURES.md
+/// "How ports track waiters" for the layout citations.
+pub fn dump_port(port_va: u32) {
+    let id = rd(port_va).unwrap_or(u32::MAX);
+    kprintln!("port @{:#x} id={:#x}({})", port_va, id, KIND_NAMES[(id & 0xF) as usize]);
+    dump_dqc_summary("pending", port_va + 0x10);
+    dump_dqc_summary("waiters", port_va + 0x24);
+
+    // Resolve each waiter to a (msg, receiving-task) pair.
+    let _ = walk_dqc(port_va + 0x24, 32, |msg_va| {
+        dump_msg("waiter", msg_va);
+    });
+}
+
+/// Walk gObjectTable and call `f(obj_va, id)` for each entry whose
+/// `(id & 0xF) == kind`. Stops after `MAX_PER_BUCKET` per bucket as a
+/// safety net against corrupted hash chains.
+fn for_each_object_of_kind<F: FnMut(u32, u32)>(kind: u32, mut f: F) {
+    const MAX_PER_BUCKET: u32 = 128;
+    for bucket in 0..OT_NUM_BUCKETS {
+        let head_va = G_OBJECT_TABLE + OT_BUCKETS_BASE + bucket * 4;
+        let mut node = match rd(head_va) { Some(v) => v, None => continue };
+        let mut steps = 0u32;
+        while node != 0 && steps < MAX_PER_BUCKET {
+            let id = match rd(node) { Some(v) => v, None => break };
+            if (id & 0xF) == kind {
+                f(node, id);
+            }
+            node = match rd(node + 4) { Some(v) => v, None => break };
+            steps += 1;
+        }
+    }
+}
+
+/// Dump a TMonitor: id, depth, state flags, and resolve each blocked
+/// task in its waiter queue (link_offset 0xc8 = TTask.wq_link_2).
+/// See docs/STRUCTURES.md "TMonitor" for the layout citations.
+pub fn dump_monitor(mon_va: u32) {
+    let id     = rd(mon_va).unwrap_or(u32::MAX);
+    let owner8 = rd(mon_va + 0x08).unwrap_or(u32::MAX);
+    let depth  = rd(mon_va + 0x10).unwrap_or(u32::MAX);
+    let state  = rd(mon_va + 0x14).unwrap_or(u32::MAX);
+    kprintln!(
+        "monitor @{:#x} id={:#x}({}) ownerOrEnv={:#x} depth={} state={:#x}",
+        mon_va, id, KIND_NAMES[(id & 0xF) as usize], owner8, depth, state
+    );
+    dump_dqc_summary("waiters", mon_va + 0x24);
+
+    // Each entry is a TTask*; print one line per task.
+    let _ = walk_dqc(mon_va + 0x24, 32, |task_va| {
+        let tid = rd(task_va).unwrap_or(u32::MAX);
+        let glob = rd(task_va + TT_GLOBALS).unwrap_or(0);
+        let (a, b, c, d) = match find_task_name(glob) {
+            Some((_, v)) => ((v>>24) as u8, (v>>16) as u8, (v>>8) as u8, v as u8),
+            None => (b'?', b'?', b'?', b'?'),
+        };
+        kprintln!(
+            "  blocked task @{:#x} id={:#x} name={}{}{}{}",
+            task_va, tid, a as char, b as char, c as char, d as char,
+        );
+    });
+}
+
+/// Dump every TMonitor in `gObjectTable` with its waiter list.
+pub fn dump_all_monitors() {
+    kprintln!("=== all monitors (KernelType=10) ===");
+    let mut count = 0u32;
+    for_each_object_of_kind(OBJ_TYPE_MONITOR, |va, _id| {
+        dump_monitor(va);
+        count += 1;
+    });
+    kprintln!("=== {} monitors total ===", count);
+}
+
+/// Dump a single object by id. Routes to the appropriate per-type
+/// dumper based on the low 4 bits.
+pub fn dump_object_by_id(id: u32) {
+    let kind = (id & 0xF) as usize;
+    let bucket = (id >> 4) & 0x7F;
+    let head_va = G_OBJECT_TABLE + OT_BUCKETS_BASE + bucket * 4;
+    let mut node = match rd(head_va) {
+        Some(v) => v,
+        None => { kprintln!("dump_object_by_id({:#x}): bucket head unreadable", id); return; }
+    };
+    let mut steps = 0u32;
+    while node != 0 && steps < 128 {
+        let nid = match rd(node) { Some(v) => v, None => break };
+        if nid == id {
+            match kind as u32 {
+                OBJ_TYPE_PORT    => dump_port(node),
+                OBJ_TYPE_TASK    => dump_task_one_line(node),
+                OBJ_TYPE_MONITOR => dump_monitor(node),
+                k => kprintln!(
+                    "  obj @{:#x} id={:#x} kind={}({}) — no per-type dumper yet",
+                    node, nid, k, KIND_NAMES[(k & 0xF) as usize]
+                ),
+            }
+            return;
+        }
+        node = match rd(node + 4) { Some(v) => v, None => break };
+        steps += 1;
+    }
+    kprintln!("dump_object_by_id({:#x}): id not found in bucket {}", id, bucket);
+}
+
+/// Full kernel-state dump for diagnostics. Combines the existing
+/// `dump()` (scheduler + run queues + object table summary) with
+/// per-port and per-monitor walks. Intended for one-shot triggers
+/// (HVC, recursive-newt path), not the periodic timer.
+pub fn dump_full() {
+    kprintln!("=== kdump::dump_full ===");
+    dump();
+    dump_all_ports();
+    dump_all_monitors();
+    kprintln!("=== kdump::dump_full end ===");
+}
+
+/// Dump every TPort in `gObjectTable` along with its queue contents.
+pub fn dump_all_ports() {
+    kprintln!("=== all ports (KernelType=2) ===");
+    let mut count = 0u32;
+    for_each_object_of_kind(OBJ_TYPE_PORT, |va, _id| {
+        dump_port(va);
+        count += 1;
+    });
+    kprintln!("=== {} ports total ===", count);
 }
 
 /// Heartbeat-rate dump trigger. Returns true on the firing iterations.

@@ -72,37 +72,83 @@ underlying alias bug (`AddPgPAndPerm(VA=0x0cc82000, PA=0x0402a000)`
 with pckm's stack already at PA 0x0402a000 via VA 0x0cc7a000) is
 unchanged.
 
+### Where the residual divergence lives (TStackInfo::Init #12)
+
+Diffing `TStackInfo::Init` invocations between our run and Einstein
+locates the first heap-allocator divergence precisely:
+
+```
+call # | our run                            | Einstein
+-------|------------------------------------|------------------------------------
+1..11  | r0 (StackInfo*) and args identical | (identical)
+12     | r0=0x0c11aad8 r1=cc93000 r2=cc83400 r3=12 | r0=0x0c117e18 r1=cc93000 r2=cc83400 r3=12
+```
+
+i.e. the kernel calls `TStackInfo::Init` with byte-identical
+`(vaddr_base, max_addr, mode_flags)` arguments but the TStackInfo
+allocation address differs starting at the 12th call. The args going
+in match, so the kernel is doing the same logical work — but the
+allocator (going through `operator new(0x48) → malloc → NewPtr →
+SSafeHeapPage::Alloc`) has reached a different state.
+
+Trace-count drift between TStackInfo::Init #11 and #12: ours runs
+~2873 more trace events than Einstein in that window. Function-set
+diff in the same window (us vs. Einstein):
+
+- **In our run, missing in Einstein:** `DispatchIRQInterrupt`,
+  `IRQHandler`, `IRQCleanUp`, `PreEmptiveTimerInterruptHandler`,
+  `RestartTimerOverflowDetect`, `SetAlarm{,1,Atomic}`,
+  `SMemCopyToSharedSWI`, `LowLevelCopyDoneFromKernelGlue`,
+  `DeleteTask/Port/SharedMemMsg`, `RemovePgPAndPerm`,
+  `PrimForgetMapping`, `ForgetMapping`. These are mostly **timer-IRQ
+  / alarm-loop bookkeeping** plus shared-mem-message teardown — work
+  that Einstein doesn't do here at all.
+- **In Einstein, missing in our run:** `TStackPage::TStackPage`,
+  `TStackPage::Init`, `TStackManager::AllocNewPage`,
+  `TPageTracker::Take`, `TPageManager::Get`,
+  `TPageManager::MonitorProc`, `TUDomainManager::Get`. Einstein takes
+  the **page-not-found** branch out of
+  `FindOrAllocPage_ReturnUnLockedOnNoPage` and allocates a new
+  TStackPage; our run takes the **page-found** branch (because some
+  earlier work left a matching page already cached in our heap).
+
+So the residual divergence has two components:
+1. **Our run takes more timer/alarm IRQs than Einstein** in this
+   window. Even though hypervisor-side ratcheting + ROM-patched
+   `addls→addcc` keeps the alarm engine from wedging, the alarm
+   *frequency* differs — every alarm IRQ runs `RestartTimerOverflow-
+   Detect`, `SetAlarm`, `SetAlarm1`, `SetAlarmAtomic` and may queue
+   work that allocates from the safe heap.
+2. **The heap that backs `TStackInfo` allocation has been touched by
+   different things,** so the next `operator new(0x48)` returns a
+   different chunk. Once the StackInfo addresses diverge, the
+   downstream `RememberMapping(VA=0x0cc82000)` vs Einstein's
+   `RememberMapping(VA=0x0cca3000)` follows mechanically.
+
 ### Open next steps
 
-The flash-recovery divergence is the *only* low-hanging upstream
-heap-state difference visible in `awk '/^trace / && !seen[$4]++'` vs.
-Einstein. With it resolved, the next divergence is harder to spot
-from the function-trace alone — the kernel paths look identical but
-the data they're operating on (TPhys IDs, StackInfo VAs) differs.
-
-1. **Audit `gPhysAllocator` at trace ~174 k.** Use `dump_all_phys` /
-   `dump_phys_for_pa` (already wired) to print {id → PA} pairs at the
-   moment of the destructive `CopyPagesAfterStackCollided` call. Add
-   the same walker on the Einstein side via
-   `baremetal/probe/probe.cpp` so the dumps are byte-identical when
-   the kernel state is byte-identical. The first divergent {id → PA}
-   pair is the upstream cause.
-2. **Audit StackInfo / StackPage state at the wedge.** Extend
-   `task_dump` to enumerate `TStackInfo`. The StackInfo passed as
-   `r1` (`params[+16]`) to `CopyPagesAfter` carries `vaddr_base` —
-   compare ours (`0x0cc82000`) vs. Einstein's (`0x0cca3000`).
-3. **`RememberMapping` audit.** Hook a count + last-args probe on
-   `RememberMapping` (ROM `0x11c7d8`). The first call where
-   `(va_arg, phys_id_arg)` differs from Einstein's same-numbered call
-   is the upstream divergence.
-4. **`__nw__FUi(184)` audit.** Identify the heap that's serving the
-   TCardAsyncMsg array allocations and compare its size + growth
-   pattern against Einstein.
-5. **Re-run on FVP for cross-check.** QEMU and FVP have agreed on
-   this wedge since 2026-04-26; another FVP run with the new trace
-   counts should confirm the alias picks the same VA / TPhys ID on
-   both platforms (i.e. it's a real cross-platform heap-state
-   divergence, not a QEMU-only artifact).
+1. **Compare alarm-IRQ frequency vs Einstein's.** Count
+   `RestartTimerOverflowDetect` invocations in the first 130 k trace
+   events on both sides. If ours fires materially more than
+   Einstein's, the alarm/timer-tick model is off — likely
+   hypervisor-side `vic::ticks` cadence vs Einstein's
+   `TInterruptManager::Tick`. Cross-reference `peripherals/vic.rs`
+   tick-page update cadence and the kernel's `gAlarm` queue depth.
+2. **Audit safe-heap allocations between TStackInfo::Init #11 and
+   #12.** Trace `SSafeHeapPage::Alloc` calls in this window on both
+   sides; the first call whose return address (= allocated chunk
+   start) differs is the upstream perturbation.
+3. **Compare ROM patch sets.** Einstein's `TJITGenericROMPatch` table
+   includes patches that the hypervisor doesn't replicate (the
+   `TJITGenericPatchNativeCall` and `TVirtualizedCallsPatches` entries
+   listed as "not yet ported" in PLAN.md §A.7). Some of those gate
+   timer behaviour (`RealClockSeconds`, `FTimeInSeconds`,
+   `FDateFromSeconds`); even one un-ported patch can change how the
+   kernel queues alarms.
+4. **Re-run on FVP for cross-check.** QEMU and FVP have agreed on
+   the alias wedge since 2026-04-26; another FVP run with the new
+   trace counts should confirm the residual divergence isn't a
+   QEMU-only artifact.
 
 ### Files changed in this session
 

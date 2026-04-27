@@ -2,7 +2,134 @@
 
 Live notes. Update as we learn more. REMOVE old updates once resolved.
 
-## In progress — ResolveFault wrapper: 4-iter call-the-allocator-per-subpage (QEMU, 2026-04-26 evening)
+## In progress — Remember/AllocPT probes: wedge is FILL-into-0xCD from SVC, not lazy-grow failure (QEMU, 2026-04-26 evening +)
+
+**Plan reference:** `docs/plans/l1-cd-lazy-investigation.md` step 1.
+
+Three HVC probes installed by `apply_l1_cd_probes` in `src/rom_patches.rs`:
+
+- HVC #0x46 at `Remember (static)` entry (`0x00258E0C`) — logs args + L1
+  entry when the target VA's L1 is a lazy fault marker (low 2 bits = 00,
+  non-zero) or section is exactly 0xCD. Also handled in handle_und so
+  USR-mode callers (trampolined to UND) work too. Emulates the
+  original `mov ip, sp` so the function prologue continues correctly.
+- HVC #0x47 at `Remember` post-SWI (`0x00258E50`) — logs r0 (= SWI #12
+  return) when the entry probe flagged this call interesting. Emulates
+  `mov r8, #237`.
+- HVC #0x48 at `AllocatePageTable (static)` entry (`0x00259104`) — logs
+  caller LR. Emulates `mov r2, #0`.
+
+Output for the cold-boot run that reaches the Reboot canary:
+
+```
+L1[0xc2]=0x00000070 → SWI ret -10003 → AllocatePageTable → retry succeeds
+L1[0xc6]=0x00000090 → SWI ret 0 (kernel monitor grew lazy implicitly)
+L1[0xc9]=0x00000090 → SWI ret 0
+L1[0xca]=0x00000090 → SWI ret 0
+L1[0xcc]=0x00000090 → SWI ret 0
+L1[0xc3]=0x00000070 → -10003 → AllocatePageTable → retry
+L1[0xd6]=0x000000b0 → -10003 → AllocatePageTable → retry
+... (no Remember call ever targets section 0xCD)
+dabt: forwarding to kernel DataAbortHandler — DFSC=0x7 FAR=0x0ccee800 mode=0x17 (USR)
+dabt: forwarding to kernel DataAbortHandler — DFSC=0x5 FAR=0x0cd07400 mode=0x17 SPSR=0x60000113 (SVC!)
+*** Reboot canary fired ***
+```
+
+### Key takeaway: the wedge is NOT a lazy-L1 grow failure
+
+The kernel CAN grow `L1[i]=0x90` lazy markers — it did so successfully
+for sections 0xC6, 0xC9, 0xCA, 0xCC during this same boot, via the
+static `Remember` SWI #12 path. Notably for the `0x90` (domain=4)
+marker the kernel's monitor handler grows the entry IMPLICITLY on a
+`Remember(va, perm=0, ...)` call: SWI returns 0 immediately and
+AllocatePageTable is NOT invoked. (For the `0x70` and `0xb0` markers
+on other domains the kernel does take the -10003 → AllocatePageTable
+→ retry path.) Both work.
+
+So the framing in the plan ("L1[0xCD] = 0x90, never grown") is correct
+but its cause is upstream: **no Remember call ever targets section
+0xCD** — not because the kernel can't grow it, but because the kernel
+never gets a request to grow it.
+
+### What actually fails
+
+The wedge fires when the kernel's exception handler is itself running
+in **SVC mode** (`SPSR=0x60000113`) at `Fill__15TRefStructStackFv`
+PC `0x001a4b9c` and writes to FAR=`0x0cd07400`. The L1 walk finds
+`L1[0xCD]=0x90` (lazy), the handler can't recursively re-enter
+fault-recovery from inside its own SVC handler, and it Reboots.
+
+The TStackInfo for this stack region (per the wrapper-entry probe at
+FAR=`0x0ccee800` recorded above) has bounds `[0x0ccee800, 0x0cd06800)`.
+The faulting VA `0x0cd07400` is **3 KiB past the kernel-tracked top**:
+
+```
+TStackInfo info[+24] = 0x0ccee800   ; LOWER bound (kernel-granted)
+TStackInfo info[+28] = 0x0cd06800   ; UPPER bound (kernel-granted)
+fill_cursor = 0x0cd07400            ; user-side write attempt
+                                    ;       = top + 0x0c00 (3 KiB over)
+USR lr (in fault dump) = 0x0cd07418 ; user-side fill loop end target
+```
+
+So the user-side `Fill_TRefStructStackFv` cursor advanced past the
+kernel-side `TStackInfo` upper bound. The kernel only saw, and grew,
+sections up to 0xCC; the next fault was already past its bound, so
+TStackManager couldn't pick a TStackInfo for it.
+
+### Why does Fill walk past the kernel bound?
+
+The `TRefStructStack::Fill` loop (disasm at `0x1a4b54`–`0x1a4ba8`)
+mirrors entries from a sibling `TRefStack` into the TRefStructStack
+region. The loop bound is `self->[16] + 4 * (TRefStack pushed bytes /
+4)` — i.e. proportional to pushes on the *other* stack. If the user
+code pushes more on TRefStack than the TRefStructStack region can
+accommodate, Fill walks past the end.
+
+`NewStack(0x10000)` requested 64 KiB but the kernel allocated 96 KiB
+(`info[+28] - info[+24] = 0x18000`). User-side walked to ~99 KiB
+beyond base. So the user's view of the stack and the kernel's view
+disagree by 3 KiB. The actual divergence is somewhere in the
+NewStack-result handshake or in TRefStack/TRefStructStack's accounting.
+
+This is also notable: the fault is in **SVC mode**, and `Fill` is a
+USER-API function with no `bl 0x1a4b54` references in the entire ROM.
+So the kernel must be reaching Fill via either (a) a post-ship patch
+table redirect that we haven't found, or (b) the kernel exception
+handler emulating a user instruction that branches into Fill. Either
+way, the kernel-side context calls a user function that walks past
+its bound.
+
+### Open next steps
+
+1. **Find the SVC-mode caller of Fill.** Examine `SP_svc=0x0c000400`
+   and unwind the SVC stack at the moment of the wedge. Patch the
+   first word of `Fill_TRefStructStackFv` with `HVC` to log who calls
+   it (and from what SVC-LR).
+2. **Trace TRefStack pushes leading to the overflow.** TRefStack ctor
+   stores `self->[0] = self->[4] = HIGH` (top of allocated region).
+   Each push presumably advances `self->[0]`. After enough pushes,
+   `self->[0] - self->[4] > granted_size` → Fill writes past granted
+   region. Find what advances `self->[0]` past granted_size.
+3. **Compare NewStack-output handshake vs Einstein.** Real Newton and
+   Einstein both run this code without wedging, so the granted_size
+   must equal the user-expected size on those platforms. Determine
+   whether our hypervisor's TStackInfo bound differs (96 KiB vs the
+   expected ~256 KiB or whatever the user expects) and trace the
+   divergence to its source.
+4. **Cross-check the per-page wrapper's interaction with NewStack.**
+   The ResolveFault wrapper claims 4 subpages per fault — does that
+   cause TStackInfo's granted-size accounting to be inconsistent with
+   the user-passed size?
+
+### Reproduction artifacts
+
+- `/tmp/phaseB-l1cd-probe/qemu2.log` — quiet boot with the three
+  probes installed. 9 interesting probe events captured before the
+  Reboot canary fires.
+
+---
+
+## Earlier — ResolveFault wrapper: 4-iter call-the-allocator-per-subpage (QEMU, 2026-04-26 evening)
 
 **Status:** Restructured the per-page stack-allocation fix. Removed the three
 `mov r3, #0xF` patches at the `bl FindOrAllocPage` sites and replaced them

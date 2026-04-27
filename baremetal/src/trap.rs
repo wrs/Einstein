@@ -938,6 +938,15 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::BOOTOS_HVC_IMM => {
             handle_bootos_canary(ctx);
         }
+        v if v == crate::rom_patches::REMEMBER_PROBE_HVC_IMM => {
+            handle_remember_entry_probe(ctx);
+        }
+        v if v == crate::rom_patches::REMEMBER_SWIRET_HVC_IMM => {
+            handle_remember_swiret_probe(ctx);
+        }
+        v if v == crate::rom_patches::ALLOC_PT_PROBE_HVC_IMM => {
+            handle_alloc_pt_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1318,6 +1327,30 @@ fn handle_und(ctx: &mut TrapContext) {
             && faulting_pc == crate::rom_patches::BOOTOS_PC =>
         {
             handle_bootos_canary(ctx);
+            return;
+        }
+        // L1[0xCD] investigation probes: the patched HVC instructions
+        // sit inside `Remember` and `AllocatePageTable`, which the
+        // kernel calls from both SVC (kernel-side fault chain) and USR
+        // (user-mode wrappers like the post-ship patch table). HVC
+        // from USR is UNDEFINED, so those calls land here. Pass the
+        // trampoline-saved `spsr_und` (= the original USR-caller CPSR)
+        // directly to the inner probe so its SP/LR lookups land on the
+        // right banked register, then advance ELR via the UND-return
+        // stub since UND entry doesn't auto-advance.
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::REMEMBER_PROBE_HVC_IMM) => {
+            handle_remember_entry_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::REMEMBER_SWIRET_HVC_IMM) => {
+            handle_remember_swiret_probe_with(ctx);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::ALLOC_PT_PROBE_HVC_IMM) => {
+            handle_alloc_pt_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
         // User-driven guest software breakpoint — must be checked
@@ -1739,6 +1772,135 @@ fn handle_reboot(ctx: &TrapContext) -> ! {
     kprintln!("=== end Reboot-canary state dump ===");
 
     cpu::halt();
+}
+
+// ---- L1[0xCD] lazy-grow investigation probes (2026-04-26) -----------------
+//
+// See docs/plans/l1-cd-lazy-investigation.md and
+// `src/rom_patches.rs::apply_l1_cd_probes`. The probes log every call to
+// `TUDomainManager::Remember (static)`, the SWI #12 return inside it,
+// and every call to `TUDomainManager::AllocatePageTable (static)`.
+//
+// Volume control: the entry probe filters by (va >> 20) and only logs
+// when the target VA lives in the lazy-section band 0xC0..0xDF (the
+// domain-4 region the wedge sits in). The post-SWI probe consults a
+// flag set by the entry probe so a Remember call we *did* log gets
+// its return value logged too. AllocatePageTable always logs since
+// it's relatively rare and the caller PC is what we want.
+//
+// Re-entrancy: the kernel serializes Remember through its monitor
+// dispatch, so a single static "current call interesting?" flag is
+// safe under the assumption no callee re-enters Remember. If that
+// assumption breaks, the post-SWI probe will mis-attribute a log
+// line, which is a minor inconvenience compared to losing per-call
+// pairing.
+
+use core::sync::atomic::{AtomicBool, Ordering};
+static REMEMBER_CURRENT_INTERESTING: AtomicBool = AtomicBool::new(false);
+
+/// Pick the CPSR that describes the *original* caller of the probed
+/// function. When the probe HVC fires from a privileged mode it traps
+/// directly to EL2 and SPSR_EL2 already names the caller's mode. When
+/// it fires from USR (forbidden HVC) the UND trampoline runs in UND
+/// mode and re-enters EL2 via its own HVC, so SPSR_EL2 says UND while
+/// the trampoline-saved `spsr_und` slot still carries the original
+/// USR-mode CPSR. A handler reachable from both paths needs the
+/// caller-side CPSR to look up the correct banked SP/LR.
+fn probe_source_cpsr(spsr_el2: u32) -> u32 {
+    if (spsr_el2 & 0x1F) == crate::banked::MODE_UND {
+        // Likely the trampoline path. Read the slot the UND stub wrote
+        // before its HVC. UND_SAVE_SPSR_IPA is the same address used by
+        // handle_und to recover the original CPSR.
+        let saved = read_guest_word_pa(UND_SAVE_SPSR_IPA);
+        return saved.unwrap_or(spsr_el2);
+    }
+    spsr_el2
+}
+
+fn handle_remember_entry_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_remember_entry_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_remember_swiret_probe(ctx: &mut TrapContext) {
+    handle_remember_swiret_probe_with(ctx);
+}
+
+fn handle_alloc_pt_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_alloc_pt_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+/// Inner Remember-entry probe. `source_cpsr` is the CPSR of the
+/// ORIGINAL caller (USR for trampolined probes, SVC for direct ones)
+/// so SP/LR lookups land on the right banked register.
+///
+/// Filter: only log when the target L1 entry is currently a lazy
+/// fault marker (low 2 bits = 00, value != 0). Anything else is the
+/// kernel's normal eager-grow path and would bury the interesting
+/// lazy-grow events under thousands of mundane lines. The SWI-RET
+/// probe consults the same flag so paired entries log together.
+fn handle_remember_entry_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    let env_id = ctx.x[0] as u32;
+    let va     = ctx.x[1] as u32;
+    let perm   = ctx.x[2] as u32;
+    let phys   = ctx.x[3] as u32;
+    let sp     = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let lr     = crate::banked::lr_for_mode(ctx, source_cpsr);
+    let section = (va >> 20) & 0xFFF;
+    let l1_pa = 0x0400_0000u32 + section * 4;
+    let l1 = guest_mem::read_word_pa(l1_pa).unwrap_or(0);
+
+    // Interesting iff:
+    //   - L1 entry is a lazy fault marker (0x70 / 0x90 / 0xb0 etc — low
+    //     2 bits = 00, but non-zero meaning the kernel set domain bits
+    //     on a "lazy" placeholder), OR
+    //   - the target VA lives in section 0xCD (the wedge VA per
+    //     INVESTIGATION.md, which we want to see even if for some
+    //     reason the L1 value differs from what we expect).
+    let l1_lazy = (l1 & 3) == 0 && l1 != 0;
+    let interesting = l1_lazy || section == 0xCD;
+    REMEMBER_CURRENT_INTERESTING.store(interesting, Ordering::Relaxed);
+
+    if interesting {
+        let locked = guest_mem::read_word_va(sp).unwrap_or(0xDEAD_BEEF);
+        kprintln!(
+            "Remember probe ENTER: env={:#x} va={:#010x} perm={:#x} phys={:#010x} locked={:#x} L1[{:#x}]={:#010x} caller_lr={:#010x} src_mode={:#x}",
+            env_id, va, perm, phys, locked, section, l1, lr, source_cpsr & 0x1F
+        );
+    }
+
+    // Emulate the original `mov ip, sp`. ip = r12 (non-banked, ctx.x[12]
+    // for non-FIQ source modes), sp = R13_<source_mode> (banked).
+    ctx.x[12] = sp as u64;
+}
+
+fn handle_remember_swiret_probe_with(ctx: &mut TrapContext) {
+    let r0 = ctx.x[0] as u32;
+    if REMEMBER_CURRENT_INTERESTING.load(Ordering::Relaxed) {
+        // After the SWI returned, re-read the L1 entry so we can see
+        // whether the kernel's monitor handler did the lazy → coarse
+        // grow on this call (which the success-without-AllocatePageTable
+        // pattern in the C0..C9 region suggests it does).
+        kprintln!(
+            "Remember probe SWI-RET: r0={:#010x}  (-10003={:#010x} → retry path; 0=success; other=error)",
+            r0, (-10003i32) as u32
+        );
+    }
+    // Emulate `mov r8, #237`. Together with the next ROM instruction
+    // `sub r8, r8, #10240` this materialises r8 = -10003.
+    ctx.x[8] = 237;
+}
+
+fn handle_alloc_pt_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+    kprintln!(
+        "AllocatePageTable probe ENTER: caller_lr={:#010x} src_mode={:#x}  (interesting_remember={})",
+        lr, source_cpsr & 0x1F,
+        REMEMBER_CURRENT_INTERESTING.load(Ordering::Relaxed)
+    );
+    // Emulate `mov r2, #0`.
+    ctx.x[2] = 0;
 }
 
 fn dump_flash_bytes(ipa: u32, count: u32) {

@@ -212,6 +212,43 @@ const FAULT_BL_RESOLVE_PC: u32 = 0x001F_84E0;
 /// retarget so all `ResolveFault` invocations go through the wrapper.
 const FMLOCK_BL_RESOLVE_PC: u32 = 0x001F_6B94;
 
+// ---- L1[0xCD] lazy-grow investigation probes (2026-04-26) -----------------
+//
+// See docs/plans/l1-cd-lazy-investigation.md. The wedge fires at FAR
+// 0x0cd07400 (DFSC=5, L1[0xCD]=0x90 lazy). The kernel's expected
+// `RememberMappings → Remember → SWI #12 → AllocatePageTable` chain never
+// grows L1[0xCD] past 0x90. These probes patch the relevant function
+// entry points with HVC instructions so we can see (a) whether
+// `Remember` is invoked with a VA in section 0xCD, (b) what SWI #12
+// returns, and (c) whether AllocatePageTable runs.
+
+/// HVC immediate fired by the patched first word of
+/// `TUDomainManager::Remember (static)` at 0x00258E0C. Handler logs
+/// args and the matching L1 entry, then emulates the original
+/// `mov ip, sp` so the function prologue continues correctly.
+pub const REMEMBER_PROBE_HVC_IMM:    u32 = 0x46;
+
+/// HVC immediate fired by the patched word at 0x00258E50 (immediately
+/// after the first `bl GenericSWI` inside Remember). Handler logs r0
+/// (= the SWI #12 return value), then emulates `mov r8, #237` so the
+/// kernel's `r8 = -10003` constant is restored before the `teq` at
+/// 0x00258E58.
+pub const REMEMBER_SWIRET_HVC_IMM:   u32 = 0x47;
+
+/// HVC immediate fired by the patched first word of
+/// `TUDomainManager::AllocatePageTable (static)` at 0x00259104. Handler
+/// logs source-mode LR (= where the call came from), then emulates
+/// `mov r2, #0` so the tail call into MonitorDispatchSWI sees the
+/// expected r2 value.
+pub const ALLOC_PT_PROBE_HVC_IMM:    u32 = 0x48;
+
+const REMEMBER_STATIC_PC:            u32 = 0x0025_8E0C;
+const REMEMBER_STATIC_FIRST_INSN:    u32 = 0xE1A0_C00D; // mov ip, sp
+const REMEMBER_SWIRET_PC:            u32 = 0x0025_8E50;
+const REMEMBER_SWIRET_ORIG_INSN:     u32 = 0xE3A0_80ED; // mov r8, #237
+const ALLOC_PT_STATIC_PC:            u32 = 0x0025_9104;
+const ALLOC_PT_FIRST_INSN:           u32 = 0xE3A0_2000; // mov r2, #0
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -274,9 +311,71 @@ pub unsafe fn apply_717006_patches(rom_ptr: *mut u32) {
         apply_reboot_trap(rom_ptr);
         apply_bootos_trap(rom_ptr);
         apply_resolve_fault_wrapper(rom_ptr);
+        apply_l1_cd_probes(rom_ptr);
     }
 
-    kprintln!("rom_patch: applied {} simple patches + 5 native-call/injection ROM patches + PowerOffAndReboot + Reboot + BootOS + ResolveFault-wrapper", applied);
+    kprintln!("rom_patch: applied {} simple patches + 5 native-call/injection ROM patches + PowerOffAndReboot + Reboot + BootOS + ResolveFault-wrapper + L1[0xCD] probes", applied);
+}
+
+/// Install the three HVC probes for the L1[0xCD] lazy-grow investigation.
+/// See the comment block by `REMEMBER_PROBE_HVC_IMM` above for context.
+unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
+    unsafe {
+        patch_probe(
+            rom_ptr,
+            REMEMBER_STATIC_PC,
+            REMEMBER_STATIC_FIRST_INSN,
+            hvc_insn(REMEMBER_PROBE_HVC_IMM),
+            "Remember static entry",
+            REMEMBER_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            REMEMBER_SWIRET_PC,
+            REMEMBER_SWIRET_ORIG_INSN,
+            hvc_insn(REMEMBER_SWIRET_HVC_IMM),
+            "Remember post-SWI",
+            REMEMBER_SWIRET_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            ALLOC_PT_STATIC_PC,
+            ALLOC_PT_FIRST_INSN,
+            hvc_insn(ALLOC_PT_PROBE_HVC_IMM),
+            "AllocatePageTable static entry",
+            ALLOC_PT_PROBE_HVC_IMM,
+        );
+    }
+}
+
+/// Helper: replace one ROM word with an HVC, panicking loudly if the
+/// previous word doesn't match the recorded original. A mismatch means
+/// the ROM has shifted under us (different ROM image or earlier patch
+/// stomped the same offset) and the probe handler's emulation of the
+/// "original" first instruction would be wrong.
+unsafe fn patch_probe(
+    rom_ptr: *mut u32,
+    pc: u32,
+    expected_orig: u32,
+    new_insn: u32,
+    name: &'static str,
+    imm: u32,
+) {
+    let idx = (pc / 4) as usize;
+    // SAFETY: caller of apply_717006_patches has already bounded rom_ptr.
+    let prev = unsafe { rom_ptr.add(idx).read() };
+    if prev != expected_orig {
+        kprintln!(
+            "rom_patch: ERROR — {} at {:#010x} is {:#010x}, expected {:#010x}; skipping HVC #{:#x} probe",
+            name, pc, prev, expected_orig, imm
+        );
+        return;
+    }
+    unsafe { rom_ptr.add(idx).write(new_insn); }
+    kprintln!(
+        "rom_patch: {:#010x}: {:#010x} -> {:#010x}  ({} probe, HVC #{:#x})",
+        pc, prev, new_insn, name, imm
+    );
 }
 
 /// (Previously we patched every `T28F016_SA_SVDriver` method to emit

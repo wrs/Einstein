@@ -242,12 +242,36 @@ pub const REMEMBER_SWIRET_HVC_IMM:   u32 = 0x47;
 /// expected r2 value.
 pub const ALLOC_PT_PROBE_HVC_IMM:    u32 = 0x48;
 
+/// HVC immediate fired by the patched first word of
+/// `Fill__15TRefStructStackFv` at 0x001A4B54. Handler logs the source-
+/// mode banked R14 (= caller PC) and source mode bits, then emulates
+/// the original `stmfd sp!, {lr}` (push LR onto source-mode stack and
+/// decrement source-mode SP by 4) so the function prologue continues
+/// correctly. Reachable from both handle_hvc (privileged callers) and
+/// handle_und (USR callers — HVC from EL0 is UNDEFINED). See
+/// docs/plans/l1-cd-lazy-investigation.md Step 1.
+pub const FILL_PROBE_HVC_IMM:        u32 = 0x49;
+
+/// HVC immediate fired by the patched word inside `NewStack` at
+/// 0x001F89A8 — the `ldr r1, [sp, #16]` that pulls the LOW output of
+/// the just-returned MonitorDispatchSWI. Handler reads `[sp+16]` (LOW)
+/// and `[sp+20]` (HIGH) from source-mode SP, logs them, and emulates
+/// `ldr r1, [sp, #16]` so r1 := LOW for the following `str r1, [r4]`.
+/// This site fires only on the success path (the preceding `bne 0x1f89b8`
+/// skips the load-store pair on SWI failure), which is exactly the
+/// allocations we want to record. See Step 3 in the plan.
+pub const NEW_STACK_PROBE_HVC_IMM:   u32 = 0x4A;
+
 const REMEMBER_STATIC_PC:            u32 = 0x0025_8E0C;
 const REMEMBER_STATIC_FIRST_INSN:    u32 = 0xE1A0_C00D; // mov ip, sp
 const REMEMBER_SWIRET_PC:            u32 = 0x0025_8E50;
 const REMEMBER_SWIRET_ORIG_INSN:     u32 = 0xE3A0_80ED; // mov r8, #237
 const ALLOC_PT_STATIC_PC:            u32 = 0x0025_9104;
 const ALLOC_PT_FIRST_INSN:           u32 = 0xE3A0_2000; // mov r2, #0
+pub const FILL_STATIC_PC:            u32 = 0x001A_4B54;
+const FILL_FIRST_INSN:               u32 = 0xE92D_4000; // stmfd sp!, {lr}
+pub const NEW_STACK_LOW_LDR_PC:      u32 = 0x001F_89A8;
+const NEW_STACK_LOW_LDR_INSN:        u32 = 0xE59D_1010; // ldr r1, [sp, #16]
 
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
@@ -344,6 +368,22 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(ALLOC_PT_PROBE_HVC_IMM),
             "AllocatePageTable static entry",
             ALLOC_PT_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            FILL_STATIC_PC,
+            FILL_FIRST_INSN,
+            hvc_insn(FILL_PROBE_HVC_IMM),
+            "Fill__15TRefStructStackFv prologue",
+            FILL_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            NEW_STACK_LOW_LDR_PC,
+            NEW_STACK_LOW_LDR_INSN,
+            hvc_insn(NEW_STACK_PROBE_HVC_IMM),
+            "NewStack post-SWI ldr r1, [sp,#16]",
+            NEW_STACK_PROBE_HVC_IMM,
         );
     }
 }

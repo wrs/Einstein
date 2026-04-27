@@ -947,6 +947,12 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::ALLOC_PT_PROBE_HVC_IMM => {
             handle_alloc_pt_probe(ctx);
         }
+        v if v == crate::rom_patches::FILL_PROBE_HVC_IMM => {
+            handle_fill_probe(ctx);
+        }
+        v if v == crate::rom_patches::NEW_STACK_PROBE_HVC_IMM => {
+            handle_new_stack_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1350,6 +1356,16 @@ fn handle_und(ctx: &mut TrapContext) {
         }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::ALLOC_PT_PROBE_HVC_IMM) => {
             handle_alloc_pt_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::FILL_PROBE_HVC_IMM) => {
+            handle_fill_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::NEW_STACK_PROBE_HVC_IMM) => {
+            handle_new_stack_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -1769,6 +1785,72 @@ fn handle_reboot(ctx: &TrapContext) -> ! {
             }
         }
     }
+    kprintln!();
+    kprintln!("=== Step 2: NewStack ring + Fill `this` snapshot ===");
+    {
+        // Dump the most recent NewStack outputs in chronological order.
+        // Ring is small (NEWSTACK_RING_LEN); just print every populated
+        // slot sorted by seq.
+        let mut entries: [(u32, u32, u32, u32, u32, u32); NEWSTACK_RING_LEN] =
+            [(0, 0, 0, 0, 0, 0); NEWSTACK_RING_LEN];
+        for (i, e) in NEWSTACK_RING.iter().enumerate() {
+            entries[i] = (
+                e.seq.load(Ordering::Relaxed),
+                e.caller_lr.load(Ordering::Relaxed),
+                e.env.load(Ordering::Relaxed),
+                e.req.load(Ordering::Relaxed),
+                e.base.load(Ordering::Relaxed),
+                e.top.load(Ordering::Relaxed),
+            );
+        }
+        // Insertion sort by seq (small N).
+        for i in 1..NEWSTACK_RING_LEN {
+            let mut j = i;
+            while j > 0 && entries[j - 1].0 > entries[j].0 {
+                entries.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+        kprintln!("  Recent NewStack outputs (newest last):");
+        for (seq, lr, env, req, base, top) in entries.iter().copied() {
+            if seq == 0 { continue; }
+            let span = top.wrapping_sub(base);
+            kprintln!(
+                "    #{:3}  caller_lr={:#010x} env={:#06x} req={:#07x} base={:#010x} top={:#010x} span={:#07x}",
+                seq, lr, env, req, base, top, span
+            );
+        }
+        let fill_seq = LAST_FILL_SEQ.load(Ordering::Relaxed);
+        let fill_this = LAST_FILL_THIS.load(Ordering::Relaxed);
+        let fill_lr   = LAST_FILL_CALLER_LR.load(Ordering::Relaxed);
+        kprintln!(
+            "  Last Fill probe: seq={} this={:#010x} caller_lr={:#010x}",
+            fill_seq, fill_this, fill_lr
+        );
+        if fill_this != 0 {
+            // TRefStructStack layout (deduced from disasm 0x1a4b54 / 0x1a4a78):
+            //   self->[0]  TRefStack cursor   (advances on push)
+            //   self->[4]  TRefStack base
+            //   self->[8]  TRefStack page-bound  (= base + 0x498)
+            //   self->[12] entries-per-page (300 = 0x12c)
+            //   self->[16] TRefStructStack base
+            //   self->[20] TRefStructStack cursor (advances on Fill)
+            for off in [0u32, 4, 8, 12, 16, 20] {
+                let v = guest_mem::read_word_va(fill_this + off).unwrap_or(0xDEAD_BEEF);
+                kprintln!("    this->[+{:>2}] = {:#010x}", off, v);
+            }
+            let cursor   = guest_mem::read_word_va(fill_this + 0).unwrap_or(0);
+            let rs_base  = guest_mem::read_word_va(fill_this + 4).unwrap_or(0);
+            let rss_base = guest_mem::read_word_va(fill_this + 16).unwrap_or(0);
+            let pushed = cursor.wrapping_sub(rs_base);
+            let fill_bound = rss_base.wrapping_add(pushed);
+            kprintln!(
+                "    derived: TRefStack pushed={:#x}, Fill loop bound = TRefStruct base + pushed = {:#010x}",
+                pushed, fill_bound
+            );
+        }
+    }
+    kprintln!("=== end Step 2 dump ===");
     kprintln!("=== end Reboot-canary state dump ===");
 
     cpu::halt();
@@ -1795,8 +1877,60 @@ fn handle_reboot(ctx: &TrapContext) -> ! {
 // line, which is a minor inconvenience compared to losing per-call
 // pairing.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 static REMEMBER_CURRENT_INTERESTING: AtomicBool = AtomicBool::new(false);
+
+// ---- Step 2: ring of recent NewStack outputs + last Fill `this`. ----
+//
+// Captured by handle_new_stack_probe_with / handle_fill_probe_with so
+// handle_reboot can correlate the wedge against the most recent stack
+// allocations. Ring is a fixed-size circular buffer; older entries get
+// overwritten silently. Ordering::Relaxed is sufficient because the
+// guest is single-core and we only read these from handle_reboot which
+// runs after the wedge is already terminal.
+
+const NEWSTACK_RING_LEN: usize = 8;
+struct NewStackEntry {
+    seq: AtomicU32,        // increments on every populated slot; 0 = empty
+    caller_lr: AtomicU32,
+    env: AtomicU32,
+    req: AtomicU32,
+    base: AtomicU32,
+    top: AtomicU32,
+}
+const NEW_NS_ENTRY: NewStackEntry = NewStackEntry {
+    seq: AtomicU32::new(0),
+    caller_lr: AtomicU32::new(0),
+    env: AtomicU32::new(0),
+    req: AtomicU32::new(0),
+    base: AtomicU32::new(0),
+    top: AtomicU32::new(0),
+};
+static NEWSTACK_RING: [NewStackEntry; NEWSTACK_RING_LEN] =
+    [NEW_NS_ENTRY; NEWSTACK_RING_LEN];
+static NEWSTACK_RING_HEAD: AtomicUsize = AtomicUsize::new(0);
+static NEWSTACK_RING_SEQ:  AtomicU32   = AtomicU32::new(0);
+
+fn newstack_ring_push(caller_lr: u32, env: u32, req: u32, base: u32, top: u32) {
+    let idx = NEWSTACK_RING_HEAD.fetch_add(1, Ordering::Relaxed) % NEWSTACK_RING_LEN;
+    let seq = NEWSTACK_RING_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    let e = &NEWSTACK_RING[idx];
+    e.caller_lr.store(caller_lr, Ordering::Relaxed);
+    e.env.store(env, Ordering::Relaxed);
+    e.req.store(req, Ordering::Relaxed);
+    e.base.store(base, Ordering::Relaxed);
+    e.top.store(top, Ordering::Relaxed);
+    e.seq.store(seq, Ordering::Relaxed);
+}
+
+static LAST_FILL_THIS:      AtomicU32 = AtomicU32::new(0);
+static LAST_FILL_CALLER_LR: AtomicU32 = AtomicU32::new(0);
+static LAST_FILL_SEQ:       AtomicU32 = AtomicU32::new(0);
+fn fill_record(this_ptr: u32, caller_lr: u32) {
+    LAST_FILL_THIS.store(this_ptr, Ordering::Relaxed);
+    LAST_FILL_CALLER_LR.store(caller_lr, Ordering::Relaxed);
+    LAST_FILL_SEQ.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Pick the CPSR that describes the *original* caller of the probed
 /// function. When the probe HVC fires from a privileged mode it traps
@@ -1901,6 +2035,102 @@ fn handle_alloc_pt_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
     );
     // Emulate `mov r2, #0`.
     ctx.x[2] = 0;
+}
+
+fn handle_fill_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_fill_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_new_stack_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_new_stack_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+/// Inner Fill__15TRefStructStackFv prologue probe.
+///
+/// Logs the source-mode caller (R14) and CPSR mode bits, then emulates
+/// the original `stmfd sp!, {lr}` so the function continues correctly:
+/// decrement source-mode SP by 4 and write source-mode LR to the new
+/// top of stack. Re-entered from both handle_hvc (privileged callers)
+/// and handle_und (USR callers).
+///
+/// Plan: docs/plans/l1-cd-lazy-investigation.md Step 1.
+fn handle_fill_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+    let mode = source_cpsr & 0x1F;
+    let r0 = ctx.x[0] as u32;
+    kprintln!(
+        "Fill probe ENTER: this={:#010x} caller_lr={:#010x} src_mode={:#x} ({}) sp={:#010x}",
+        r0, lr, mode, describe_aarch32_mode(mode), sp
+    );
+    fill_record(r0, lr);
+    // Emulate `stmfd sp!, {lr}`: full-descending push of LR onto the
+    // source-mode stack. Decrement source SP by 4, write source LR at
+    // the new top, write the new SP back to the source-mode banked
+    // slot.
+    let new_sp = sp.wrapping_sub(4);
+    if !guest_mem::write_word_va(new_sp, lr) {
+        kprintln!(
+            "*** Fill probe: write of LR={:#010x} to SP={:#010x} failed (unmapped); halting",
+            lr, new_sp
+        );
+        cpu::halt();
+    }
+    let slot = crate::banked::sp_slot_for_mode(source_cpsr);
+    ctx.x[slot] = new_sp as u64;
+}
+
+/// Inner NewStack post-SWI probe.
+///
+/// Patched site (0x001F89A8) is the `ldr r1, [sp, #16]` that pulls the
+/// first SWI-output word into r1 on the success branch. The NewStack
+/// prologue (0x1f897c..0x1f8984) builds a SWI parameter block on the
+/// source stack:
+///
+///   [sp+ 0]  original r0  (env handle / kernel object id)
+///   [sp+ 4]  0  (cleared)
+///   [sp+ 8]  original r1  (= requested size in bytes)
+///   [sp+12]  original r2  (flags / domain perm)
+///   [sp+16]  out_top   — TOP address (upper bound, exclusive)
+///   [sp+20]  out_base  — BASE address (lower bound)
+///
+/// Bookkeeping: the caller stashes `out_base` (read from the on-stack
+/// output pointer that NewStack populated via [sp+20]) into both
+/// `self->[16]` (TRefStructStack base) and `self->[20]` (cursor); the
+/// sibling TRefStack ctor does the same with `self->[0]/[4]`. So the
+/// granted span is `out_top - out_base`, expected to be the rounded-up
+/// requested size.
+///
+/// Handler: read env / size / out_base / out_top from the source-mode
+/// SP, log them, then emulate `ldr r1, [sp, #16]` so r1 := out_top for
+/// the following `str r1, [r4]` (which writes the kernel's first
+/// output into the caller's first ptr argument).
+///
+/// Plan: docs/plans/l1-cd-lazy-investigation.md Step 3.
+fn handle_new_stack_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let mode = source_cpsr & 0x1F;
+    // SP layout at the probe (fp = SP_at_NewStack_entry - 4):
+    //   sp+ 0..23  SWI param block (env / 0 / r1 / r2 / out_top / out_base)
+    //   sp+24..43  pushed {r4, r5, fp, ip, lr_caller, pc}
+    //   sp+40      = [fp-4] = caller's LR (= NewStack's return PC)
+    let env      = guest_mem::read_word_va(sp.wrapping_add(0)).unwrap_or(0xDEAD_BEEF);
+    let req_size = guest_mem::read_word_va(sp.wrapping_add(8)).unwrap_or(0xDEAD_BEEF);
+    let out_top  = guest_mem::read_word_va(sp.wrapping_add(16)).unwrap_or(0xDEAD_BEEF);
+    let out_base = guest_mem::read_word_va(sp.wrapping_add(20)).unwrap_or(0xDEAD_BEEF);
+    let caller_lr = guest_mem::read_word_va(sp.wrapping_add(40)).unwrap_or(0xDEAD_BEEF);
+    let span = out_top.wrapping_sub(out_base);
+    kprintln!(
+        "NewStack probe POST-SWI: env={:#x} req={:#x} base={:#010x} top={:#010x} span={:#x} caller_lr={:#010x} src_mode={:#x} ({})",
+        env, req_size, out_base, out_top, span, caller_lr, mode, describe_aarch32_mode(mode)
+    );
+    newstack_ring_push(caller_lr, env, req_size, out_base, out_top);
+    // Emulate `ldr r1, [sp, #16]`. r1 is non-banked across non-FIQ
+    // modes; in the FIQ case the kernel never calls NewStack from a
+    // FIQ handler so plain ctx.x[1] is correct.
+    ctx.x[1] = out_top as u64;
 }
 
 fn dump_flash_bytes(ipa: u32, count: u32) {

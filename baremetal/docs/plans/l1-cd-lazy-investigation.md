@@ -1,6 +1,54 @@
 # Phase B — Wedge reframed: SVC-mode FILL writes past kernel-tracked stack bound
 
-## Status (2026-04-26 late evening)
+## Status (2026-04-26 late night)
+
+**Steps 1–4 done.** Two probes installed (`HVC #0x49` at Fill prologue,
+`HVC #0x4A` at NewStack post-SWI), `handle_reboot` extended to dump the
+ring of recent NewStack outputs and the live TRefStructStack object,
+and the Einstein cross-check completed. Findings recorded in
+`INVESTIGATION.md` under "Fill+NewStack probes pin wedge to TInterpreter
+ctor's TRefStructStack #2".
+
+The plan's original framing ("user fills past granted bound" / "fix
+the user-vs-kernel stack-extent diff") is **wrong**. The probes show:
+
+- TRefStructStack ctor (`0x1a4a78`) calls NewStack twice (once via the
+  inherited TRefStack ctor, once for itself). Each gets a 96 KiB span.
+- The two allocations end up at `[0x0ccee800, 0x0cd06800)` (TRefStack)
+  and `[0x0cd07400, 0x0cd1f400)` (TRefStructStack). The TRefStructStack
+  region is in section `0xCD` where `L1[0xCD] = 0x90` lazy.
+- NewState pushes 6 entries onto TRefStack. The bound it computes for
+  Fill is `0x0cd07418` — exactly `TRefStruct base + 0x18` (= 6 entries
+  worth). It is NOT past the granted top, it is the *first* write into
+  the TRefStructStack region.
+- Fill's first store at `0x0cd07400` faults because L1[0xCD] is lazy.
+  Real Newton (per Einstein probe) handles this fault by growing
+  L1[0xCD] coarse and allocating the 4-KiB page. Our hypervisor
+  reboots instead.
+
+So the wedge is a **lazy-grow failure on FAR=`0x0cd07400`** after all,
+just not via the `Remember`/`AllocPT` path the original plan checked.
+The recovery for the SECOND fault (in SVC mode at PC `0x1a4b9c`) is
+the broken path. The first fault (USR mode at FAR=`0x0ccee800`) IS
+recovered correctly (L1[0xCC] grows to coarse), but somewhere in the
+recovery the kernel ends up retrying the failed instruction in SVC
+instead of USR — and SVC can't recursively take a stack-fault.
+
+**Step 5 (apply a fix) is blocked** on the next probe round:
+
+- Trace `TStackManager::ResolveFault` entry to confirm whether it's
+  even called for the second fault.
+- Trace `TStackManager::Fault` entry/exit and the kernel's
+  `DataAbortHandler` entry to capture the CPSR transitions across
+  recovery.
+- Find where the recovery from fault #1 transitions USR→SVC (or fails
+  to transition SVC→USR on return). Likely a `movs pc, lr` or
+  `subs pc, lr, #N` somewhere in the kernel handler.
+
+The new probes and the extended reboot dump remain in tree until the
+fix lands.
+
+## Earlier framing (kept for context)
 
 Step 1 of the previous version of this plan landed: three HVC probes in
 `src/rom_patches.rs::apply_l1_cd_probes`, dispatched by handle_hvc and

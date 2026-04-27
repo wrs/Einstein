@@ -1,167 +1,177 @@
-# Phase B — Stack-fault wrapper landed; investigate L1[0xCD] adaptation bug
+# Phase B — Wedge reframed: SVC-mode FILL writes past kernel-tracked stack bound
 
-## Status (2026-04-26 evening)
+## Status (2026-04-26 late evening)
 
-The "always own 4 subpages per fault" goal landed as the **`ResolveFault`
-wrapper** at IPA `0x00FF_FE00`. Mechanism (committed):
+Step 1 of the previous version of this plan landed: three HVC probes in
+`src/rom_patches.rs::apply_l1_cd_probes`, dispatched by handle_hvc and
+handle_und (USR-callers go through the UND trampoline) in `src/trap.rs`.
+Cold-boot artifact at `/tmp/phaseB-l1cd-probe/qemu2.log`. INVESTIGATION.md
+captures the full findings.
 
-- `apply_resolve_fault_wrapper` in `src/rom_patches.rs` writes a 24-word
-  AArch32 stub at `0x00FF_FE00` and patches the `bl ResolveFault` site
-  inside `TStackManager::Fault` (`0x001F_84E0`) to call it.
-- The wrapper saves the original FAR (= `this->[+64]->[+68]`), aligns to
-  the 4-KiB page boundary *relative to* `info->[+20]`, then runs stock
-  `ResolveFault` four times — once per 1-KiB subpage of the page. It
-  treats `r0 == -10203 / -10204` (out-of-bounds subpage — belongs to
-  another stack) as "skip" and only propagates `r0 == 4`
-  (FindOrAllocPage failure) to `Fault`.
-- Three earlier `mov r3, #0xF` mask patches were removed.
-- 35/35 guest tests pass.
+The probe data invalidated the previous framing of this plan. The wedge
+is **not** a lazy-L1-grow failure inside `Remember` / `AllocatePageTable`.
+The kernel's lazy-grow path works correctly in this same boot:
 
-Boot trajectory: identical to the prior 3-PATCH baseline. 6 forwarded
-kernel DABTs handled cleanly via the wrapper; 7th forwarded DABT at
-FAR=`0x0cd07400` (DFSC=5, L1[0xCD]=`0x00000090` lazy) wedges with
-`Reboot(-10075)`. The wrapper structurally replaces the 3-PATCH set with
-no regression, no advancement past the L1-lazy bound.
+- `L1[0xC6]=0x90`, `L1[0xC9]=0x90`, `L1[0xCA]=0x90`, `L1[0xCC]=0x90` were
+  all transitioned from `0x90` lazy → coarse via `Remember(va, perm=0)`.
+  For the `0x90` (domain=4) marker, SWI #12 returned 0 immediately —
+  the kernel's monitor handler grows the entry implicitly, no
+  `AllocatePageTable` round-trip.
+- `L1[0xC2]=0x70`, `L1[0xC3]=0x70`, `L1[0xD6]=0xb0` took the
+  `-10003 → AllocatePageTable → retry` path as expected.
 
-## Next problem (this plan): L1[0xCD] = 0x90 lazy, never grown
+Both paths work. **No `Remember` call ever targets section 0xCD** — not
+because the kernel can't grow it, but because nothing asks the kernel
+to grow it.
 
-### What the wedge is
+## What actually fails
 
-- `Remember` (= `TUDomainManager::Remember` SWI) tries to install an L2
-  entry for a VA in section 0xCD.
-- L1[0xCD] = `0x00000090` is the kernel's "lazy" marker: type=fault,
-  bits[8:5]=0x4 (domain 4), bit-4 set. **No coarse L2 table exists for
-  this section yet.**
-- `FindOrAllocPage`'s cache-miss path doesn't retry on Remember failure:
-  ```
-  bl Remember
-  teq r0, #0
-  beq success
-  mov r0, #0; return 0
-  ```
-- ResolveFault returns 4 → Fault calls `Reboot(-10075)` → canary fires.
+The wedge fires when the kernel's exception handler is itself running
+in **SVC mode** (`SPSR_abt=0x60000113`) at `Fill__15TRefStructStackFv`
+PC `0x001a4b9c` and writes to FAR `0x0cd07400`. The L1 walk finds
+`L1[0xCD]=0x90` (lazy), the kernel can't recursively re-enter
+fault-recovery from inside its own SVC handler, and it Reboots.
 
-So the kernel's stack-grow path **assumes the L2 coarse table is already
-allocated** before the first fault into that section. Something is
-supposed to pre-allocate it. That something isn't running in our boot.
+Per the wrapper-entry probe at FAR=`0x0ccee800`, the active stack's
+`TStackInfo` has bounds `[0x0ccee800, 0x0cd06800)`. The SVC-side fill
+cursor advanced 3 KiB past the upper bound:
 
-### Framing — find what we broke, not what to add
+```
+TStackInfo info[+24] = 0x0ccee800   ; LOWER bound (kernel-granted)
+TStackInfo info[+28] = 0x0cd06800   ; UPPER bound (kernel-granted)
+fill_cursor          = 0x0cd07400   ; SVC write attempt — 3 KiB past top
+USR lr (loop bound)  = 0x0cd07418   ; fill loop end target — 6 words further
+```
 
-The kernel runs unchanged on real Newton hardware and on Einstein's
-ARMv4 emulation. Both grow L1[0xCD] from `0x90` lazy → coarse on demand
-during this same boot phase. So the kernel logic is correct. **We must
-be doing something different from real hardware that prevents the
-lazy-grow path from doing what it always does.**
+`NewStack(0x10000)` requested 64 KiB but `TStackInfo` reports 96 KiB
+(`info[+28] - info[+24] = 0x18000`). The user-side / kernel-side fill
+loop walked further still, to ~99 KiB above base.
 
-Earlier instinct ("add a hypervisor-side L2 pre-allocator for lazy L1
-entries") was the wrong reflex — that's papering over an adaptation
-bug we haven't located. The right next step is to **find the
-divergence between our run and Einstein's** and fix the underlying
-cause.
+## Two open questions
 
-### Candidates for the underlying cause
+1. **Who invokes `Fill_TRefStructStackFv` from SVC mode?** The function
+   sits in user-API space; `grep -n "bl 0x1a4b54"` over the ROM
+   disassembly returns zero hits. So the kernel must be reaching it
+   through the post-ship patch table, an indirect call, or an emulated
+   user instruction during fault recovery. We need to know who.
 
-1. **`shadow_stub` byte/halfword swizzle is wrong somewhere.** The kernel
-   was compiled BE-32; we run on LE and rewrite every LDRB / STRB / LDRH
-   / STRH to swap the address by `^3` (byte) or `^2` (halfword). If
-   `Remember` or any of its callees walks an L1 / L2 descriptor via byte
-   loads, or *manipulates* the lazy-marker via byte writes, and our
-   swizzle is wrong for that specific instruction, the kernel reads or
-   writes the wrong bits and the lazy-grow path silently breaks.
-
-2. **`fix_stage1_xn_bits` only touches L2 entries, not L1.** Confirmed
-   via reading `src/guest_mem.rs`. So this is unlikely to break L1
-   handling — but worth verifying the rewrite doesn't accidentally
-   touch any L1-region word.
-
-3. **`AllocatePageTable`'s ring is exhausted at the moment Remember
-   needs it.** The ring is replenished from `TUPageManager::Get`. If
-   `gPhysAllocator` state has diverged from Einstein's earlier in
-   boot (per INVESTIGATION.md, our PA layout differs subtly), a fresh
-   page might not be available exactly when needed. The fix is upstream
-   — find and remove the divergence's cause.
-
-4. **Earlier divergent control flow.** The kernel marks L1[0xCD] as
-   `0x90` at trap #4121 (per the `L1[0xcd] probe` instrumentation in
-   `src/guest_mem.rs`). Stock kernel may have a *later* init step
-   (between #4121 and the first user fault into section 0xCD) that
-   explicitly allocates the L2 coarse table and installs it. We may be
-   skipping or short-circuiting that step due to an earlier divergence.
+2. **Why does the fill loop bound exceed the kernel's `TStackInfo`
+   upper bound?** The bound is `self->[16] + 4 * (self->[0] -
+   self->[4]) / 4` = `TRefStructStack base + bytes_pushed_on_TRefStack`.
+   So pushes on the sibling `TRefStack` drove the cursor past the end.
+   Either the user code thinks both stacks have a larger size than the
+   kernel granted, or the kernel granted less than the user requested.
 
 ## Plan — investigate, don't add new infrastructure
 
-### Step 1: instrument `Remember` for VAs in section 0xCD
+### Step 1: identify the SVC-mode caller of `Fill__15TRefStructStackFv`
 
-Goal: capture exactly what `TUDomainManager::Remember` does when the
-target VA's L1 entry is `0x90` lazy.
+Patch the first word of `Fill_TRefStructStackFv` (`0x001A_4B54`,
+`stmfd sp!, {lr}` = `0xE92D_4000`) with `HVC #0x49`. Handler logs the
+source-mode banked R14 (= caller's return PC) and the source mode bits.
+Mirror the existing probe pattern in `src/rom_patches.rs`
+(`apply_l1_cd_probes` / `patch_probe`) and `src/trap.rs`
+(`handle_remember_entry_probe_with` etc.). Don't forget the handle_und
+arm for the USR-mode path.
 
-- `Remember` is at `0x1bd9cb0` (per INVESTIGATION.md). Patch its first
-  word with HVC #X via the existing `rom_patches` infrastructure (or
-  use `bp 0x1bd9cb0` + auto-rearm following the pattern from this
-  session's wrapper-debug probes in `src/guest_bp.rs`).
-- The handler should print `(domain, target_va, perm, page_state, locked,
-  L1[target_va >> 20])` on entry and the return code on exit.
-- Repro the wedge: `cargo run --release --features quiet`, look for the
-  Remember invocation whose target_va is in section 0xCD (= 0x0CDxxxxx).
-- Capture: did Remember see the `0x90` marker? What did it return? If
-  it returned `-10003`, who's supposed to retry? If it returned a
-  different error, why?
+To preserve `Fill`'s prologue, emulate the original `stmfd sp!, {lr}`
+in the handler: read source-mode SP, decrement by 4, write source-mode
+LR to the new top, write the new SP back to the source-mode banked
+slot. (Or: install a 3-word wrapper at `0x00FF_FExx` that does
+`HVC #0x49 ; stmfd sp!, {lr} ; B Fill+4` and patch `Fill+0` to
+branch to it. Mirror the ResolveFault wrapper layout.)
 
-### Step 2: cross-check Einstein's behavior at the same site
+Cold-boot, capture the log. Expected output: one or more "Fill called
+from {svc_lr}, mode={svc}" lines pointing at the kernel function that
+walked into Fill. Cross-reference against the ROM disassembly to find
+the call site.
 
-Einstein's `NewtonProbe` records every `Remember` call and its result
-(via `_Data_/symbols.txt` + the existing trace infrastructure described
-in `baremetal/CLAUDE.md` under "ROM fingerprint" and the
-`probe/FINDINGS.md` cross-check). Reproduce the same Remember call in
-Einstein and compare:
+### Step 2: dump TStackInfo and TRefStack/TRefStructStack state at the wedge
 
-- Same `target_va`, same `perm`, same `page_state`?
-- Same return value?
-- If Einstein succeeds and we don't, what's different about the input?
+Extend the existing `handle_reboot` state dump in `src/trap.rs`
+(currently dumps L1 sections + monitor list) with a TStackInfo dump for
+every active TStackInfo whose bounds touch sections 0xCC..0xCF, plus
+the live `TRefStack` / `TRefStructStack` objects whose `self->[0..20]`
+fields point into that range. The data we need:
 
-If inputs are identical and outputs differ, the divergence is in the
-SWI handler (= our adaptation). If inputs differ, the divergence is
-upstream — walk back through the call chain to find where state first
-diverged.
+- For each TStackInfo: `info[+24]` (lower), `info[+28]` (upper),
+  `info[+8]` (num_pages?), `info[+20]` (page_table base).
+- For the TRefStructStack at the wedge: `self->[0]` (TRefStack top),
+  `self->[4]` (TRefStack base), `self->[16]` (TRefStructStack base),
+  `self->[20]` (TRefStructStack cursor).
+- Compute `self->[0] - self->[4]` (bytes pushed) and
+  `self->[20] - self->[16]` (bytes already filled).
+- Compare both against the granted size (96 KiB in the run we have).
 
-### Step 3: fix the actual cause
+The TRefStack/TRefStructStack objects sit on the heap so finding them
+needs either a memory walk or correlation with the disasm
+(TInterpreter at offset...; check the TInterpreter ctor).
 
-Depending on what Step 1+2 turns up:
+### Step 3: reconcile NewStack-output with what the user expected
 
-- **If shadow_stub is wrong** for an instruction Remember (or its
-  callees) executes: fix the swizzle in `src/shadow_stub.rs`. This is
-  the most likely culprit — one missed STRB or LDRH on an L1
-  descriptor would silently corrupt the lazy-grow path.
-- **If a kernel byte/halfword we patched should NOT have been patched**
-  for this code path: narrow the patch.
-- **If `gPhysAllocator` state has diverged**: trace back to where the
-  PA-issuance ordering diverged from Einstein's, fix the upstream
-  cause.
-- **If we're skipping a kernel init step**: figure out why — likely a
-  conditional in some early-init code that takes a different branch in
-  our run, again because of upstream divergence.
+`NewStack(0x10000)` should grant a 64 KiB region; observed
+`info[+28] - info[+24]` is 96 KiB. If NewStack's user-facing return
+gives 64 KiB to the user but the kernel TStackInfo reflects 96 KiB,
+there is no mismatch — Fill should bound at 64 KiB and never reach
+0x0cd07400. If NewStack returns 96 KiB to the user, then the user's
+99 KiB fill is the divergence (3 KiB over-walk).
 
-In every case the fix should reduce the diff between our adaptation and
-real hardware behavior, not add new "the hypervisor knows better"
-logic.
+Patch `NewStack` (`0x001F_8968`) post-SWI return (the `add sp, sp, #4`
+at `0x001F_8948`, original `0xE28D_D004`) with `HVC #0x4A`. Handler
+logs the two output values stored at `[sp+16]` (LOW) and `[sp+20]`
+(HIGH). Capture three or four `NewStack` calls from the
+`TRefStack`/`TRefStructStack` constructors during TInterpreter setup
+and compare `(HIGH - LOW)` against the requested size and against the
+later observed `TStackInfo` bounds.
+
+### Step 4: cross-check against Einstein and real Newton
+
+Once we know whether the divergence is "kernel grants too little" or
+"user fills too much", regenerate the relevant probe trace in Einstein
+(`Emulator/TStackManager.cpp` etc.) and `probe/FINDINGS.md`. The same
+TInterpreter ctor runs on both; whichever side disagrees with us is
+the side to fix.
+
+### Step 5: fix the actual cause
+
+Depends on Step 3+4 results:
+
+- **If Einstein's `NewStack` returns the same range as ours and Fill
+  bounds correctly there**: the divergence is in our hypervisor's
+  view of stack memory. Likely candidate is the `ResolveFault`
+  wrapper's per-page allocation interacting with TStackInfo's
+  `num_pages` / page_table accounting. Trace which part of the
+  4-iter wrapper drifts the kernel's view.
+- **If Einstein returns a different range (e.g. exactly 64 KiB)**:
+  our kernel's NewStack monitor handler is computing the wrong
+  bound. Find why and fix it.
+- **If user-side `TRefStack`/`TRefStructStack` push counters are
+  wrong on our run**: trace which push site overshoots and find the
+  upstream divergence.
+
+The fix should reduce the user-vs-kernel stack-extent diff to zero,
+matching real-hardware behavior. The probes from this plan stay in
+tree until we land the fix; they're cheap when filtered.
 
 ## Critical files
 
-- `src/shadow_stub.rs` — the most suspect adaptation. Verify byte/halfword
-  swizzle covers all relevant instructions in Remember's call chain.
-- `src/guest_mem.rs::fix_stage1_xn_bits` — verify L1 entries are
-  untouched by the rewrite pass.
-- `src/rom_patches.rs::apply_resolve_fault_wrapper` — already landed;
-  this plan doesn't touch it.
-- `src/guest_bp.rs` — extend with a `bp` at Remember's entry/exit for
-  Step 1 instrumentation.
-- `INVESTIGATION.md` — update the "Currently at" section with Step 1
-  and Step 2 findings as they come in.
+- `src/rom_patches.rs::apply_l1_cd_probes` — pattern to mirror for
+  the new `Fill` and `NewStack` probes.
+- `src/trap.rs::handle_remember_entry_probe_with` — pattern for the
+  source-mode-aware handler (works from both privileged HVC and
+  USR-trampoline UND paths).
+- `src/trap.rs::handle_reboot` — extend the one-shot dump with
+  TStackInfo / TRefStack / TRefStructStack state at the wedge.
+- `INVESTIGATION.md` — keep updating the "Currently at" section as
+  Step 1–4 land.
 
 ## Verification
 
-- `guest-tests/scripts/run-all.sh` must remain green throughout (35/35).
-- Cold boot (`rm -f /tmp/newton-snapshot-*.bin` first) and look for the
-  `Reboot canary fired` line at FAR=`0x0cd07400`.
-- The fix is correct when boot advances past that wedge to whatever the
-  next stall is — without inventing new hypervisor abstractions.
+- `guest-tests/scripts/run-all.sh` must remain green throughout
+  (35/35).
+- Cold-boot (`rm -f /tmp/newton-snapshot-*.bin` first) and look for
+  the `Reboot canary fired` line at FAR=`0x0cd07400`. With the new
+  Fill-call probe installed we should also see the SVC-mode caller
+  PC immediately preceding the canary.
+- The fix is correct when boot advances past the wedge to whatever
+  the next stall is, without inventing new hypervisor abstractions.

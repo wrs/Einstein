@@ -2,7 +2,143 @@
 
 Live notes. Update as we learn more. REMOVE old updates once resolved.
 
-## In progress — Fill+NewStack probes pin wedge to TInterpreter ctor's TRefStructStack #2 (QEMU, 2026-04-26 late night)
+## In progress — Fault/ResolveFault probes: kernel never reaches stack-monitor for fault #2 (QEMU, 2026-04-26 night)
+
+**Plan reference:** `docs/plans/l1-cd-lazy-investigation.md` Step 5 prep.
+
+Two new HVC probes installed by `apply_l1_cd_probes`:
+
+- HVC #0x4B at `Fault__13TStackManagerFR15TProcessorState` entry
+  (`0x001F83E4`, original `mov ip, sp` = `0xE1A0C00D`). Logs source-mode
+  CPSR + caller LR + (manager*, processor_state*) + FAR (read from
+  `processor_state[+0x44]`). Emulates the original `mov ip, sp`.
+- HVC #0x4C at `ResolveFault__13TStackManagerFP10TStackInfo` entry
+  (`0x001F7978`, original `mov ip, sp`). Logs source-mode CPSR + caller
+  LR + (manager*, info*) + FAR + info bounds [info+0x18, info+0x1C).
+  Captures both wrapper-driven calls (caller_lr=0x00fffe40 = WRAPPER+0x40)
+  and direct calls (caller_lr=0x001f6b98 from FMLockHeapRange).
+
+Fresh boot artifact at `/tmp/phaseB-l1cd-probe/qemu4.log`. 35/35 guest
+tests still green. The new probes pin three things that were guesses
+before:
+
+### Fault #1 (USR-pre-abt, FAR=0x0ccee800) — fully recovered
+
+```
+dabt: forwarding ... DFSC=0x7 FAR=0x0ccee800 mode=0x17
+  LR_abt=0x001a4710 (faulting PC=0x001a4708) SPSR_abt=0x60000110 (pre-abt USR)
+Fault(stackmgr) probe ENTER: this=0x0c112cb8 procst=0x0c1133a4 far=0x0ccee800
+                             caller_lr=0x00259230 src_mode=0x10 (USR)
+ResolveFault probe ENTER: ... far=0x0ccee000 info_bounds=[0x0ccee800,0x0cd06800)
+ResolveFault probe ENTER: ... far=0x0ccee400 info_bounds=[0x0ccee800,0x0cd06800)
+ResolveFault probe ENTER: ... far=0x0ccee800 info_bounds=[0x0ccee800,0x0cd06800)
+ResolveFault probe ENTER: ... far=0x0cceec00 info_bounds=[0x0ccee800,0x0cd06800)
+Fill probe ENTER: this=0x0c6451c0 caller_lr=0x001a4754 src_mode=0x10 (USR)
+```
+
+- Fault is reached via `FaultMonProc__15TUDomainManager` (caller LR
+  `0x00259230` = inside FaultMonProc just past `mov lr, pc; ldr pc, [r4]`,
+  the vtable dispatch on the manager object).
+- The 4-iter wrapper at `0x00FFFE00` runs all four iterations: subpages
+  0/1 are below info_lo so ResolveFault returns -10203 fast; subpages
+  2/3 land in [info_lo, info_hi) and complete the kernel's per-subpage
+  bookkeeping. After the wrapper returns r0=0, `Fault` returns r5=0,
+  FaultMonProc cleans up and the kernel ERETs back to USR — Fill probe
+  fires next, confirming the recovery returned to USR mode at NewState's
+  call site.
+- `info[+20]` (info base_va) is `0x0ccee000`; `info[+24]` (lower bound)
+  is `0x0ccee800`; `info[+28]` (upper bound) is `0x0cd06800`. The
+  4-KiB-aligned page base for the fault is therefore `0x0ccee000`, which
+  is why iters 0/1 fall below the lower bound — that's the documented
+  "previous-stack-slot" guard inside the 4-iter wrapper, working as
+  designed.
+
+### Fault #2 (FAR=0x0cd07400) — kernel never invokes the stack monitor
+
+```
+dabt: forwarding ... DFSC=0x5 FAR=0x0cd07400 mode=0x17
+  LR_abt=0x001a4ba4 (faulting PC=0x001a4b9c) SPSR_abt=0x60000113 (pre-abt SVC)
+  USR sp=0x0cc82660 lr=0x0cd07418   SVC sp=0x0c000400 lr=0x001a4708
+  r0=0x00000005 r1=0x80000110 r2=0x0ccee804 r3=0x0ccee800 r12=0x0cd07400
+*** Reboot canary fired ***
+  ELR_EL2=0x00ffff58 SPSR=0x000001db (UND, 0x1b)
+  R0=0xffffd8a5 (= -10075)  R14_UND=0x000d9888 (= Reboot+4)
+```
+
+**Neither `Fault(stackmgr)` nor `ResolveFault` fires after the dabt
+forward.** No `Remember` / `AllocatePageTable` probe fires either. So
+the kernel's DataAbortHandler does not route this abort to the stack
+monitor (FaultMonProc → Fault → ResolveFault), nor does it issue a
+`Remember` SWI to grow `L1[0xCD]`. It walks straight to
+`Reboot(-10075)`, reached via UND mode at `LR_UND=0x000d9888`
+(`Reboot+4`) — i.e. the kernel raised an `UnhandledException` whose
+trampoline ended up calling `Reboot` from UND.
+
+The two faults differ in DFSC (#1 = `0x7` page translation; #2 = `0x5`
+section translation) AND in pre-abt mode (#1 = USR; #2 = SVC). Either
+gate could route the kernel into the panic path; the data so far
+doesn't tell them apart.
+
+### The mode-transition mystery
+
+Fill enters at `0x1a4b54` in **USR** (probe captured `src_mode=0x10`
+with the right USR sp/lr). Eight instructions later at `0x1a4b9c` the
+str faults in **SVC**. There is no mode-changing instruction in
+`0x1a4b58..0x1a4b98` — just loads/arith/cmp/bcs. Yet `SPSR_abt=0x60000113`
+unambiguously says SVC at the moment of fault.
+
+Two possibilities, neither yet ruled out:
+
+1. **A USR-pre-abt fault at FAR=0x0cd07400 fired first, was handled
+   silently (no Fault/ResolveFault), and the recovery left the CPU in
+   SVC.** The `log_dabt_forward` dedup is keyed on (FAR, hvc_src_mode);
+   `hvc_src_mode` is always ABT for the trampoline path, so any
+   subsequent dabt at the same FAR is silently suppressed. We could be
+   missing the first fault entirely. Action: lift the dedup (or print
+   the first N occurrences instead of just one).
+
+2. **The recovery for fault #1 never returned to USR — the kernel kept
+   running in SVC and re-entered the same code path that NewState +
+   Fill execute.** SVC `lr=0x001a4708` is fault #1's faulting PC, which
+   is consistent with "kernel still has fault #1's saved-state staged
+   for return-to-USR but is running other code in SVC in the meantime".
+   In this story Fill's probe-time USR sp/lr reflect a stale snapshot
+   from before fault #1, and the Fill body actually runs on top of
+   SVC `sp=0x0c000400` / SVC `lr=0x001a4708`.
+
+To pick between these, the next probe round needs to:
+
+- Disable the `(FAR, mode)` dedup in `log_dabt_forward` for at least
+  the section-`0xCD` range so we see every dabt occurrence in order.
+- Add an HVC at the kernel's monitor-dispatch return path to log when
+  the kernel transitions back to the original mode. Candidate sites:
+  the `subs pc, lr, #N` inside DataAbortHandler that ends the
+  USR-pre-abt path, and the equivalent at the SVC-pre-abt path. (Need
+  to scan DataAbortHandler 0x393114..~0x393950 for those.)
+- A short trace probe at NewState entry/exit (or at the trampoline
+  function `0x1a54a38` that NewState tail-calls) could clarify whether
+  Fill is actually called twice (once USR, once SVC) or just once.
+
+### What's confirmed vs. still hypothesised
+
+| Claim | Status |
+| --- | --- |
+| Wrapper iterates 4 times, two below-bound + two in-range | ✓ confirmed |
+| Fault → ResolveFault both reached for USR-pre-abt fault | ✓ confirmed |
+| Fault and ResolveFault both bypassed for SVC-pre-abt fault | ✓ confirmed |
+| Reboot reason = -10075, called from UND mode | ✓ confirmed |
+| Pre-abt mode is SVC despite Fill probe showing USR entry | ✓ confirmed |
+| Mode flip happens because fault #1 recovery skipped USR-return | ⚠ hypothesis |
+| The Fill probe's stmfd emulation is innocent | ⚠ hypothesis |
+
+### Reproduction artifacts
+
+- `/tmp/phaseB-l1cd-probe/qemu4.log` — quiet boot with all seven probes
+  (`0x46–0x4C`).
+
+---
+
+## Earlier — Fill+NewStack probes pin wedge to TInterpreter ctor's TRefStructStack #2 (QEMU, 2026-04-26 late night)
 
 **Plan reference:** `docs/plans/l1-cd-lazy-investigation.md` Steps 1–3 landed.
 

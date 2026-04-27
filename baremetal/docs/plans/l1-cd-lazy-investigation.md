@@ -1,52 +1,52 @@
-# Phase B — Wedge reframed: SVC-mode FILL writes past kernel-tracked stack bound
+# Phase B — Wedge reframed: kernel skips stack-monitor on the SVC-mode fault
 
-## Status (2026-04-26 late night)
+## Status (2026-04-26 night)
 
-**Steps 1–4 done.** Two probes installed (`HVC #0x49` at Fill prologue,
-`HVC #0x4A` at NewStack post-SWI), `handle_reboot` extended to dump the
-ring of recent NewStack outputs and the live TRefStructStack object,
-and the Einstein cross-check completed. Findings recorded in
-`INVESTIGATION.md` under "Fill+NewStack probes pin wedge to TInterpreter
-ctor's TRefStructStack #2".
+**Steps 1–4 done. Step 5 prep done.** Probes installed:
 
-The plan's original framing ("user fills past granted bound" / "fix
-the user-vs-kernel stack-extent diff") is **wrong**. The probes show:
+- `HVC #0x49` at Fill prologue (USR / direct-callable)
+- `HVC #0x4A` at NewStack post-SWI
+- `HVC #0x4B` at `TStackManager::Fault` prologue
+- `HVC #0x4C` at `TStackManager::ResolveFault` prologue
 
-- TRefStructStack ctor (`0x1a4a78`) calls NewStack twice (once via the
-  inherited TRefStack ctor, once for itself). Each gets a 96 KiB span.
-- The two allocations end up at `[0x0ccee800, 0x0cd06800)` (TRefStack)
-  and `[0x0cd07400, 0x0cd1f400)` (TRefStructStack). The TRefStructStack
-  region is in section `0xCD` where `L1[0xCD] = 0x90` lazy.
-- NewState pushes 6 entries onto TRefStack. The bound it computes for
-  Fill is `0x0cd07418` — exactly `TRefStruct base + 0x18` (= 6 entries
-  worth). It is NOT past the granted top, it is the *first* write into
-  the TRefStructStack region.
-- Fill's first store at `0x0cd07400` faults because L1[0xCD] is lazy.
-  Real Newton (per Einstein probe) handles this fault by growing
-  L1[0xCD] coarse and allocating the 4-KiB page. Our hypervisor
-  reboots instead.
+`handle_reboot` already dumps the NewStack ring and the live
+TRefStructStack object. 35/35 guest tests stay green.
 
-So the wedge is a **lazy-grow failure on FAR=`0x0cd07400`** after all,
-just not via the `Remember`/`AllocPT` path the original plan checked.
-The recovery for the SECOND fault (in SVC mode at PC `0x1a4b9c`) is
-the broken path. The first fault (USR mode at FAR=`0x0ccee800`) IS
-recovered correctly (L1[0xCC] grows to coarse), but somewhere in the
-recovery the kernel ends up retrying the failed instruction in SVC
-instead of USR — and SVC can't recursively take a stack-fault.
+Findings recorded in `INVESTIGATION.md` under "Fault/ResolveFault
+probes: kernel never reaches stack-monitor for fault #2".
 
-**Step 5 (apply a fix) is blocked** on the next probe round:
+The earlier framing ("recovery returns to PC `0x1a4b9c` in SVC instead
+of USR, second fault wedges because SVC can't recursively re-enter
+fault recovery") was partially right — the second fault IS taken from
+SVC mode (`SPSR_abt=0x60000113`) — but **the kernel's response is not
+"recursively re-enter and fail"**. The kernel's DataAbortHandler
+**bypasses the stack monitor entirely** for that fault: neither
+`TStackManager::Fault` nor `TStackManager::ResolveFault` is invoked,
+and no `Remember` / `AllocatePageTable` SWI fires either. The kernel
+walks straight to `Reboot(-10075)` via an `UnhandledException` →
+`Reboot` chain (caller LR_UND = `0x000d9888` = `Reboot+4`).
 
-- Trace `TStackManager::ResolveFault` entry to confirm whether it's
-  even called for the second fault.
-- Trace `TStackManager::Fault` entry/exit and the kernel's
-  `DataAbortHandler` entry to capture the CPSR transitions across
-  recovery.
-- Find where the recovery from fault #1 transitions USR→SVC (or fails
-  to transition SVC→USR on return). Likely a `movs pc, lr` or
-  `subs pc, lr, #N` somewhere in the kernel handler.
+So the wedge is now: **DataAbortHandler fast-classifies SVC-pre-abt
+faults (or DFSC=0x5 vs 0x7) as unrecoverable and panics**, never even
+attempting lazy-grow.
 
-The new probes and the extended reboot dump remain in tree until the
-fix lands.
+The remaining mystery is **how the CPU got into SVC mode at PC
+`0x1a4b9c`** in the first place. The Fill probe captured a regular
+USR-mode entry at `0x1a4b54` (`src_mode=0x10`, USR sp=0x0cc82664),
+and Fill's body has no mode-changing instructions in the eight
+instructions between probe entry and `0x1a4b9c`. Two leading
+hypotheses, see "Step 6" below for the discriminating probe round.
+
+**Step 5 (apply a fix) is blocked** until we know whether the SVC-mode
+state at fault #2 came from:
+
+- (A) a silently-handled earlier USR-mode fault at the same FAR whose
+  recovery left CPSR in SVC — `log_dabt_forward`'s `(FAR, mode)` dedup
+  could be hiding it, or
+- (B) the kernel's recovery from fault #1 never returned to USR at
+  all — Fill in SVC ran on the kernel's SVC stack (`sp=0x0c000400`),
+  and the Fill probe's snapshot reflects a stale USR state from
+  before fault #1.
 
 ## Earlier framing (kept for context)
 
@@ -109,6 +109,76 @@ loop walked further still, to ~99 KiB above base.
    So pushes on the sibling `TRefStack` drove the cursor past the end.
    Either the user code thinks both stacks have a larger size than the
    kernel granted, or the kernel granted less than the user requested.
+
+## Step 6 — discriminate (A) silent-recovery vs (B) recovery-never-returned
+
+This is the next probe round. Both probes are short and read-only;
+neither requires a new abstraction.
+
+### 6a. Lift the dabt-forward dedup, at least for the wedge range
+
+`log_dabt_forward` in `src/trap.rs` keys dedup on `(far, hvc_src_mode)`
+with a 16-entry table. `hvc_src_mode` is always `MODE_ABT` for the
+trampoline path, so any second/third dabt at the same FAR is silently
+suppressed — including a possible USR-pre-abt fault at FAR=`0x0cd07400`
+whose recovery seeded the SVC mode we now observe.
+
+Easiest fix: include `pre_abt_mode = SPSR_abt & 0x1F` in the dedup
+key. That makes USR-pre-abt and SVC-pre-abt at the same FAR distinct
+log lines without flooding on tight-loop kernel-side aborts.
+
+Run, compare new log against `qemu4.log`. If a USR-pre-abt
+`FAR=0x0cd07400` line appears between Fill probe and the existing
+SVC-pre-abt line, hypothesis (A) is confirmed.
+
+### 6b. Probe NewState entry/exit and the trampoline tail-call
+
+NewState (`0x1a46f0`) tail-calls a small trampoline at `0x1a54a38` that
+itself jumps into Fill. If hypothesis (B) is correct, NewState should
+appear once and Fill should appear once, with the wedge inside Fill's
+first iteration. If hypothesis (A) is correct, we may see Fill called
+twice (once USR, once SVC).
+
+Add an `HVC` at `0x1a46f0` first instruction logging mode + caller LR.
+Wire it through the same `apply_l1_cd_probes` / `handle_und` /
+`handle_hvc` machinery as the Fill probe. Reuse the source-mode CPSR
+helper (`probe_source_cpsr`).
+
+### 6c. Identify the DataAbortHandler exit that returns to USR
+
+DataAbortHandler runs from `0x393114`. Its USR-pre-abt path eventually
+issues a `subs pc, lr, #N` (or `movs pc, lr`) to ERET back to the
+faulting USR PC. Find that exit instruction in the disasm
+(`scripts/disasm-out/rom.dis`, lines 972359..~973000). Patch it with
+`HVC #0x4D` so we log every successful USR-return from the handler.
+If we see exactly one USR-return after fault #1, hypothesis (B) is
+confirmed (the kernel did return to USR; mode flip happens later); if
+we see *zero*, hypothesis (B) is the wedge.
+
+## Step 7 — apply the fix
+
+Depends on Step 6 outcome:
+
+- **(A) silent USR-mode fault at FAR=`0x0cd07400`**: the kernel handles
+  one fault path (USR-pre-abt + DFSC=0x5) without invoking the stack
+  monitor. Find the in-DataAbortHandler branch that handles this case
+  and trace what it does. Most likely it sets up a tail-call to
+  something that should grow `L1[0xCD]` but instead leaves CPSR=SVC
+  and returns. Repair locally (probably a missing `subs pc, lr` or a
+  branch to the wrong continuation).
+
+- **(B) recovery from fault #1 didn't return to USR at all**: trace
+  the kernel's path between the Fault wrapper return and the
+  DataAbortHandler exit. The wrapper returning r0=0 means
+  `Fault.r5=0`, FaultMonProc takes the success branch, and somewhere
+  between FaultMonProc's return and DataAbortHandler's exit the mode
+  is supposed to flip back to USR. If our 4-iter wrapper inadvertently
+  affected that path (e.g. by growing the kernel's monitor list in a
+  way the exit code can't unwind), the fix is wrapper-side.
+
+Either way, the fix should reduce the user-vs-kernel stack-extent
+diff to zero and let the boot advance past `0x0cd07400`. Probes from
+Steps 1–5 stay in tree until the fix lands.
 
 ## Plan — investigate, don't add new infrastructure
 

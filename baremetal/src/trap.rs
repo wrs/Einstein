@@ -953,6 +953,12 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::NEW_STACK_PROBE_HVC_IMM => {
             handle_new_stack_probe(ctx);
         }
+        v if v == crate::rom_patches::STACK_MGR_FAULT_PROBE_HVC_IMM => {
+            handle_stack_mgr_fault_probe(ctx);
+        }
+        v if v == crate::rom_patches::RESOLVE_FAULT_PROBE_HVC_IMM => {
+            handle_resolve_fault_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1366,6 +1372,16 @@ fn handle_und(ctx: &mut TrapContext) {
         }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::NEW_STACK_PROBE_HVC_IMM) => {
             handle_new_stack_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::STACK_MGR_FAULT_PROBE_HVC_IMM) => {
+            handle_stack_mgr_fault_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::RESOLVE_FAULT_PROBE_HVC_IMM) => {
+            handle_resolve_fault_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -2131,6 +2147,72 @@ fn handle_new_stack_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
     // modes; in the FIQ case the kernel never calls NewStack from a
     // FIQ handler so plain ctx.x[1] is correct.
     ctx.x[1] = out_top as u64;
+}
+
+fn handle_stack_mgr_fault_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_stack_mgr_fault_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_resolve_fault_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_resolve_fault_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+/// `TStackManager::Fault(TProcessorState&)` prologue probe.
+///
+/// On entry r0 = manager (`this`), r1 = TProcessorState ref. The FAR
+/// the abort path captured lives at `processor_state[+0x44]`. Logs the
+/// (caller, mode, manager*, proc-state*, FAR) tuple, then emulates the
+/// original `mov ip, sp`. Plan: docs/plans/l1-cd-lazy-investigation.md
+/// Step 5 prep — confirms whether the kernel's stack-fault dispatcher
+/// actually reaches `Fault` for both abort #1 (USR) and abort #2 (SVC).
+fn handle_stack_mgr_fault_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+    let mode = source_cpsr & 0x1F;
+    let manager = ctx.x[0] as u32;
+    let proc_state = ctx.x[1] as u32;
+    let far = guest_mem::read_word_va(proc_state.wrapping_add(0x44)).unwrap_or(0xDEAD_BEEF);
+    kprintln!(
+        "Fault(stackmgr) probe ENTER: this={:#010x} procst={:#010x} far={:#010x} caller_lr={:#010x} src_mode={:#x} ({}) sp={:#010x}",
+        manager, proc_state, far, lr, mode, describe_aarch32_mode(mode), sp
+    );
+    // Emulate `mov ip, sp`. ip = r12 (non-banked for non-FIQ source modes).
+    ctx.x[12] = sp as u64;
+}
+
+/// `TStackManager::ResolveFault(TStackInfo*)` prologue probe.
+///
+/// On entry r0 = manager (`this`), r1 = TStackInfo ref. The FAR is
+/// re-derived from `manager[+0x40]` (= TProcessorState*) `[+0x44]`,
+/// matching what the function itself does at PC 0x1f79a8. Logs the
+/// (caller, mode, manager*, info*, FAR) tuple plus the info bounds
+/// `info[+0x18]`/`info[+0x1C]`, then emulates `mov ip, sp`.
+///
+/// Captures both call sites:
+///   - the wrapper at 0x00FF_FE00 (called from Fault @ 0x1f84e0)
+///   - direct call from FMLockHeapRange @ 0x1f6b94
+fn handle_resolve_fault_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+    let mode = source_cpsr & 0x1F;
+    let manager = ctx.x[0] as u32;
+    let info = ctx.x[1] as u32;
+    let proc_state = guest_mem::read_word_va(manager.wrapping_add(0x40)).unwrap_or(0);
+    let far = if proc_state != 0 {
+        guest_mem::read_word_va(proc_state.wrapping_add(0x44)).unwrap_or(0xDEAD_BEEF)
+    } else {
+        0xDEAD_BEEF
+    };
+    let info_lo = guest_mem::read_word_va(info.wrapping_add(0x18)).unwrap_or(0);
+    let info_hi = guest_mem::read_word_va(info.wrapping_add(0x1C)).unwrap_or(0);
+    kprintln!(
+        "ResolveFault probe ENTER: this={:#010x} info={:#010x} far={:#010x} info_bounds=[{:#010x},{:#010x}) caller_lr={:#010x} src_mode={:#x} ({}) sp={:#010x}",
+        manager, info, far, info_lo, info_hi, lr, mode, describe_aarch32_mode(mode), sp
+    );
+    // Emulate `mov ip, sp`.
+    ctx.x[12] = sp as u64;
 }
 
 fn dump_flash_bytes(ipa: u32, count: u32) {

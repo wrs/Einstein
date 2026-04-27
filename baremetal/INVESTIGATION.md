@@ -2,7 +2,104 @@
 
 Live notes. Update as we learn more. REMOVE old updates once resolved.
 
-## In progress — Step 8 (saved-slot vs `mrs spsr_abt` cross-check) + Step 7 reframe (QEMU, 2026-04-27)
+## In progress — Step 7a Einstein cross-check (QEMU + probe data, 2026-04-27)
+
+**Plan reference:** `docs/plans/l1-cd-lazy-investigation.md` Step 7a / Step 7 reframe.
+
+**Layer (α) confirmed.** `probe/results-717006-90s-full.txt` lines 78-98
+show that on a fully-booted Einstein/Newton, section 0xCD is **coarse**:
+each L2 entry inside 0xCD reports as "page fault" (DFSC=7), which only
+happens when L1 is type-1 coarse (`0b01`) pointing at an L2 with all-zero
+descriptors. If L1[0xCD] were `0x90` (translation-section, type-0), the
+walker would emit DFSC=5 (section fault) and the probe would label it
+differently. So real Newton naturally transitions L1[0xCD] from `0x90`
+lazy → coarse before any guest-test-level activity. Our hypervisor leaves
+it `0x90` at the moment of the L1[0xCD] wedge — that's the divergence.
+
+**Where the kernel-side L1=0x90 → coarse transition happens.** The
+existing Remember probe captures the call site: every observed transition
+goes through `Remember(va, perm=0)` from
+`FindOrAllocPage_ReturnUnLockedOnNoPage__13TStackManager` (PCs `0x1f7444`
+and `0x1f74b4`), which is invoked from `TStackManager::ResolveFault`
+(PC `0x1f7978`). For lazy `0x90` sections, `Remember`'s SWI #12 handler
+grows the L1 entry transparently and returns 0; for `0x70` / `0xb0`
+markers it returns -10003 and the caller goes round the
+`AllocatePageTable` path. Both work in this same boot for sections that
+get touched by ResolveFault, e.g. `L1[0xC6/C9/CA/CC]`.
+
+**Where the kernel stops driving the transition for this wedge.** From
+qemu9.log (NewStack ring + ResolveFault probe co-trace):
+
+```
+line 1228  NewStack #17  caller_lr=0x00252390  base=0x0cc7b000  span=0x7800
+line 1229    ResolveFault @ far=0x0cc82400  caller_lr=0x001f6b98 (FMLockHeapRange) — twice
+...
+line 2222  NewStack #18  caller_lr=0x001a4948 (TRefStack ctor)        base=0x0ccee800  span=0x18000
+line 2224  NewStack #19  caller_lr=0x001a4adc (TRefStructStack ctor)  base=0x0cd07400  span=0x18000
+line 2225  NewStack #20  caller_lr=0x001a4948                          base=0x0cd20000  span=0x18000
+                       ← no FMLockHeapRange ResolveFault calls
+line 2243  Fill probe ENTER
+line 2244  dabt: forwarding ... DFSC=0x5 FAR=0x0cd07400  → wedge
+```
+
+Allocator-driven `FMLockHeapRange → ResolveFault` is observed for every
+NewStack #14..#17 (caller `0x00252390`, kernel-side allocator). For
+NewStacks #18..#21 (caller in TRefStack / TRefStructStack ctors at
+`0x001a4948` / `0x001a4adc`), no `caller_lr=0x001f6b98` ResolveFault
+fires. So the C++-side ctors don't drive the kernel's pre-allocation
+loop; they expect the kernel to grow L1 lazily on first touch. Our
+hypervisor's first touch is a section fault (DFSC=5) on the lazy `0x90`,
+which DAH treats as unrecoverable.
+
+**On Einstein the same C++ ctors run, yet L1[0xCD] ends up coarse**, so
+either:
+1. The kernel's NewStack monitor SWI handler (FMNewStack at `0x001F8EAC`)
+   writes L1 entries directly during the allocation, and our hypervisor's
+   view of that path is missing/dropped. Need to disasm FMNewStack and
+   trace whether it touches L1 entries.
+2. Some intermediate kernel bookkeeping in the FMNewStack path interacts
+   with our hypervisor's stage-1 `fix_stage1_xn_bits` flattening or with
+   subpage-AP emulation in ways that quietly corrupt the L1=0x90 → coarse
+   decision.
+3. The TRefStack/TRefStructStack ctor *does* trigger pre-allocation on
+   real Newton via a path we're not observing — for example if our
+   `Remember` probe at `REMEMBER_STATIC_PC = 0x00258E0C` doesn't catch
+   all entry points, the call could be invisible.
+
+### Three fix layers, increasing in scope
+
+- **(α-1) Disasm-and-fix FMNewStack.** Read `0x001F8EAC` /
+  `Init__10TStackInfoFUlN51` (`0x001F6700`) and find what they do for
+  each section in the granted range. Compare against what our
+  hypervisor sees during the SWI #1 handler. If FMNewStack writes L1
+  entries via a path our hypervisor doesn't intercept correctly, that's
+  the bug.
+- **(α-2) Verify on Einstein with a custom NewtonProbe build** that
+  dumps L1[0xCC/0xCD/0xCE] at the moment NewStack returns for the
+  `caller_lr=0x001a4adc` call (TRefStructStack ctor). If Einstein's L1
+  at that exact moment is already coarse, the kernel does drive the
+  transition — and we just need to find what we're dropping. If
+  Einstein's L1 is also `0x90` at that moment and only becomes coarse on
+  some later access, it's a DAH-DFSC=5-handles-`0x90` path we haven't
+  seen yet (and our DAH bytewise matches Einstein, so something we
+  emulate must differ).
+- **(β) Hypervisor-side workaround.** When intercepting the NewStack
+  POST-SWI return, walk the granted range and for each section whose L1
+  entry is `0x90`, write a coarse L1 entry pointing at a fresh empty L2
+  table. Pragmatic and surgical, but papers over a kernel decision and
+  may interact badly with kernel bookkeeping that depends on L1
+  transitions happening through Remember-via-SWI.
+
+Recommendation: (α-2) first — cheaper than (α-1) and dispositive about
+which side owns the responsibility. (β) is a fallback if (α) turns out
+to require disturbing changes elsewhere.
+
+35/35 guest tests still green; jj change `a2401a77` carries the QEMU
+mrs-staleness workaround and saved-slot diagnostics.
+
+---
+
+## Earlier — Step 8 (saved-slot vs `mrs spsr_abt` cross-check) + Step 7 reframe (QEMU, 2026-04-27)
 
 **Plan reference:** `docs/plans/l1-cd-lazy-investigation.md` Step 7 / Step 8.
 

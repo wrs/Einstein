@@ -239,44 +239,57 @@ worked around in tree). The wedge is that NewStack returns a stack
 kernel's DAH for DFSC=5 doesn't grow them — it reboots via
 `RebootIfFaultWasInStack`.
 
-Two candidate fix layers; pick by what Einstein and real Newton do for
-the equivalent `NewStack(0x10000)` call (Step 4 cross-check).
+### Step 7a outcome (2026-04-27) — layer (α) confirmed
 
-**(α) Kernel allocator path: NewStack/Remember should pre-allocate the
-range.** Earlier sections grown in this boot (L1[0xC6/C9/CA/CC]) all
-went through `Remember(va, perm=0)` from the allocator side — that
-matches the success pattern. NewStack #19 (caller_lr=0x001a4adc) and
-NewStack #18 (caller_lr=0x001a4948) both call into the allocator;
-something in #18's path called `Remember` for L1[0xCC] but the
-equivalent path in #19 didn't. Locate the divergence and equalise it.
+`probe/results-717006-90s-full.txt` lines 78-98 show real Newton/Einstein
+has L1[0xCD] **coarse** (the L2 entries inside section 0xCD report as
+"page fault" / DFSC=7, which requires L1 to be type-1 coarse, not the
+type-0 `0x90` lazy marker). So the kernel **does** drive the
+0x90→coarse transition on real Newton, before TInterpreter's Fill ever
+writes to 0x0cd07400. On our hypervisor that transition is missing.
 
-**(β) DAH DFSC=5 path: recognise the `0x90` marker.** A more general
-fix: at PC `0x393314` (the DFSC=5 jump-table arrival), before the
-FaultMonitor OR-chain, check whether the L1 entry at FAR's section is
-the lazy `0x90` marker; if so, call `Remember(FAR, perm=0)` to grow
-it and return-and-retry instead of falling through to
-RebootIfFaultWasInStack. Mirrors the DFSC=7 lazy-grow path that
-already works for L2 entries.
+The qemu9.log NewStack/ResolveFault co-trace pins the difference:
+`FMLockHeapRange → ResolveFault` (caller_lr `0x001f6b98`) drives the
+allocator-side pre-allocation loop for NewStack #14..#17, but is
+**not observed** for NewStack #18..#21 (the
+TRefStack/TRefStructStack ctor calls). On Einstein the same C++ ctors
+run yet L1[0xCD] still becomes coarse, so the transition must happen
+inside the FMNewStack monitor SWI handler itself (`0x001F8EAC`) — and
+our hypervisor is dropping or mis-emulating part of that handler.
 
-(α) is the surgical fix; (β) is the robust safety-net. Either resolves
-the wedge.
+### Three fix layers, increasing in scope
 
-### Step 7a — Einstein cross-check (one shell)
+- **(α-1) Disasm-and-fix FMNewStack.** Read `0x001F8EAC` and the
+  `Init__10TStackInfoFUlN51` it calls (`0x001F6700`); find where it
+  writes L1 entries for the granted range. Compare against what our
+  hypervisor sees during the SWI #1 path (probe
+  `MonitorDispatchSWI` callees, kernel-side L1 writes). If FMNewStack
+  writes L1 via a path our hypervisor mis-handles (e.g. through a CP15
+  TLB op, or via a memory mapping shadowed by stage-2), that's the
+  bug. Fix at the right call site.
 
-Run the equivalent boot under Einstein and capture which layer it owns
-the section-mapping in. Specifically: when Einstein's NewStack returns
-the same `0x0cd07400` base, do its L1 entries already cover sections
-0xCD..D1, or does Einstein also leave them lazy and rely on a different
-DAH path for DFSC=5? `Emulator/TStackManager.cpp` and the surrounding
-kernel-side files are the oracles. The same TInterpreter ctor → Fill →
-first write path runs there.
+- **(α-2) Verify on Einstein with a custom NewtonProbe build** that
+  dumps L1[0xCC/0xCD/0xCE] at the moment NewStack returns for
+  `caller_lr=0x001a4adc` (TRefStructStack ctor). If Einstein's L1 is
+  already coarse there, the kernel really does drive the transition
+  inside the SWI handler — confirms (α-1) is the right layer. If
+  Einstein's L1 is still `0x90` at the SWI return and only becomes
+  coarse on a later access, then real Newton has a DFSC=5-grows-`0x90`
+  path that our DAH handling doesn't replicate (and we'd be looking at
+  layer β plus understanding why Einstein's MMU/DAH interaction
+  differs).
 
-If Einstein has L1[0xCD..D1] = coarse at the moment of the first Fill
-write, layer (α) is the right fix and we need to find what Einstein's
-NewStack does that ours doesn't.
+- **(β) Hypervisor-side workaround.** Intercept NewStack POST-SWI; for
+  each section in the granted range whose L1 is `0x90`, write a coarse
+  L1 entry pointing at a fresh empty L2 page. Pragmatic and surgical,
+  but papers over a kernel decision and may interact badly with kernel
+  bookkeeping that expects L1 transitions to happen through
+  Remember-via-SWI #12.
 
-If Einstein leaves them lazy and DAH-DFSC=5 grows on demand, layer
-(β) is the right fix.
+**Recommendation: (α-2) first** — cheaper than (α-1) and dispositive
+about which side owns the responsibility. (β) is a viable fallback if
+(α-1) turns out to require disturbing changes elsewhere in the
+hypervisor.
 
 ### Old Step 7 framing (kept for context)
 

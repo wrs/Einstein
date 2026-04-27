@@ -42,19 +42,98 @@ quiesces on the same path without ever getting there.
 
 ## Pending follow-ups
 
-### Wake `newt` (next milestone)
+### Active stop: newt self-deadlocks on its own heap semaphore (2026-04-27)
 
-`newt` is RDY (prio 10) but never scheduled. `idle` (prio 0) keeps
-the CPU. The `q=0x00000000/0x0c116ed8` link suggests `newt` is
-waiting on a kernel-side queue / port / semaphore that no one is
-posting to. Trace tail before quiesce shows the kernel cycling
-through `0x3ad6f4` / `0x3adb0c` (idle pause helpers) and
-`0x800a0c` (a REx loop) — find the queue / event the kernel is
-spinning on, and figure out who is supposed to post to it.
+`newt` is queued on `q=0x00000000/0x0c116ed8`. That queue address is
+**TSemaphore + 0x20** (the BlockOnInc queue) of a TSemaphore at
+`0x0c116eb8`. Layout citations:
 
-Once `newt` runs, `TScreenDriver::*` should follow on the
-display-init path, `peripherals/screen.rs::blit` will start firing,
-and `/tmp/newton-fb/` will populate.
+- task[+0x6c] flags = `0x2100000` — bit 0x100000 ("on a TSemaphore wait
+  queue", set by TSemaphore::BlockOnInc / TTaskQueue::Add at ROM
+  0x1d4dc8) | bit 0x02000000 (paged stack).
+- TSemaphore is 40 bytes (ROM 0x1d5114 `mov r0, #40`); BlockOnZero
+  queue at +0x18, BlockOnInc queue at +0x20 (TSemaphore::TSemaphore
+  ROM 0x1d512c / 0x1d5134).
+- The candidate `sema+0x20 = 0x0c116eb8` has `[+0x10] = 0x1ae40` which
+  matches the TSemaphore vtable initialised at ROM 0x1d513c.
+
+The TSemaphore is sema[0] of a TSemaphoreGroup at `0x0c116e94`
+(kernel id `0x13d7`, count=1). Its TUSemaphoreGroup user wrapper is
+at `0x0c116e7c`. The wrapper's `+0x08` (refcon) holds
+`0x0c116e8c` which is `uwrapper + 8` — the malloc'd 4-byte
+lock-state word for a TULockingSemaphore (TULockingSemaphore::Init
+at ROM 0x25a514: `str r0, [r4, #8]; ... bl SetRefCon`). That word
+contains `0x3063` — which is **newt's own task id**.
+
+Newt's saved PC = `0x3ae1fc` (the `svc 0xb` of `SemaphoreOpGlue`),
+`SPSR=0x110` (SVC mode), `lr_usr=0x25a2e0` (= the instruction after
+`bl SemOp` in `TULockingSemaphore::Acquire` at ROM 0x25a298). The user
+stack just below sp_usr has saved LRs:
+
+- `+0x20 = 0x143334` — return into `DisposPtr` after its `bl Acquire`
+  at ROM 0x143330.
+- `+0x60 = 0x354724` — return into `MakeStoreObject`'s exception
+  handler at ROM 0x354718, the `b 0x3544f4` catch loop that calls
+  `TStoreWrapper::Abort` and `NextHandler`.
+- `+0x60 = 0x353af0` — return inside `TStoreWrapper::~TStoreWrapper`.
+
+So the call chain at the wedge is:
+
+1. Newt entered `MakeStoreObject` (ROM 0x354178) and called
+   `LockStore` (which Acquires the heap-store TULockingSemaphore =
+   our id 0x13d7). `Swap` returned 0 (lock free) → newt acquired it.
+   `lock-word` now = `0x3063` (newt's id).
+2. Newt did store work (`StorePermObject`, `TStoreObjectWriter` ctor,
+   etc.).
+3. Something **threw `exBusError`** (Throw at trace 4149074, r0 =
+   `0x000afda0` which is the literal pool pointer to `exBusError`
+   class at ROM 0x3712b8). The bus-error origin is unidentified —
+   most likely an MMIO read or stage-2 fault we should turn into a
+   silent-default rather than a guest-visible bus error.
+4. `setjmp`/`longjmp` cleanup triggered the catch handler at ROM
+   0x3544f4. **It calls `TStoreWrapper::Abort` (0x354b50) but NOT
+   `UnlockStore` — Abort does not release the lock** (verified by
+   reading 0x354b50: it only resets TNodeCache, calls Abort on
+   TStore + the two TStoreHashTables, no UnlockStore).
+5. The catch handler invokes `NextHandler` and chains to the
+   destructor. `~TStoreWrapper` (ROM 0x353ae4) calls
+   `DisposeRefHandle` which eventually reaches `DisposPtr` (ROM
+   0x14320c). DisposPtr calls `Acquire` on the **heap semaphore at
+   ROM 0x143330**.
+6. That `Acquire`'s `Swap` finds `lock-word == 0x3063` (newt's own
+   id, still set by step 1). Swap puts newt's id back and returns
+   `0x3063 ≠ 0`, so Acquire calls `SemOp` → `BlockOnInc`. Newt is
+   queued on its own held lock — self-deadlock.
+
+The `newt`-on-`sema+0x20` linkage is therefore not a "kernel waiting
+for an event" mystery; it's a **lock leak in the C++ exception
+unwind path**: TStoreWrapper's catch arm doesn't unlock the store
+before destroying the wrapper, and the destructor's heap free path
+re-enters the same lock.
+
+Einstein cross-check (NewtonProbe 60 s, `/tmp/probe-60s.log`): at
+t=2 s Einstein already has `Tmux RUN`, `newt(3cf3) RDY`, `scrn RDY`
+(prio 11), `newt(2f13) BLK`; at t=4–60 s `fser RUN` (prio 13),
+plus tasks `cdsv`, `scpl`, `codc`, `scrn`, `newt(2f13)` cycling
+RDY/BLK. Einstein never lands on this deadlock — most likely
+because step 3 (the Bus Error) doesn't fire there. So the right
+fix is to identify the Bus Error origin and make it not throw.
+
+Investigation tools (`src/task_dump.rs`):
+- `dump_semaphore_waits` — for each task with flag 0x100000 set, dump
+  the queue head and probe both `sema+0x18`/`sema+0x20` candidates
+  (whichever has `[+0x10]=0x1ae40` is the real TSemaphore).
+- `find_semaphore_owner` — walks `gObjectTable` for KernelType=7
+  (TSemaphoreGroup), matches by array-base + size.
+- `dump_blocked_pcs` — prints saved PC / sp_usr / lr_usr from each
+  blocked task's SWIBoot save area at task+0x10..+0x54, plus
+  newt's user-stack window.
+
+Next concrete step: re-run with `trace,quiet` (every-call trace) to
+catch the exact memory access that triggers the Bus Error throw.
+Compare against Einstein's run at the same offset; the divergence
+will name the MMIO/DABT we need to silently default. After that,
+the deadlock disappears even without changing the lock semantics.
 
 ### Feed an input (after `newt` wakes)
 

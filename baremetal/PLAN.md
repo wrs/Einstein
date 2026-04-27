@@ -173,33 +173,61 @@ inputs we choose to feed it.
   on QEMU; `--platform fvp` runs the same suite on the FVP. Both
   must stay green. See "Verification" near the end of this file.
 
-## Current stop — none. Steady-state idle reached.
+## Current stop — newt self-deadlocks on the heap-store TULockingSemaphore
 
-A 90 s cold boot now reaches the idle pause loop and stays there with no
-halts: the `idle` task is the running task, `newt` is RDY, beacons cycle
-through `ELR=0x800a0c` / `0x3adb0c` / `0x3ad6f4` (REx + base-ROM idle
-slots), and the snapshot ring rolls cleanly.
+`newt` is permanently queued on a TSemaphore at `0x0c116eb8`'s
+BlockOnInc list (queue at `+0x20 = 0x0c116ed8`). The owning
+TSemaphoreGroup is at `0x0c116e94` (kernel id `0x13d7`). Its
+TULockingSemaphore wrapper is at `0x0c116e7c`; the lock-state word
+at `0x0c116e8c` holds `0x3063` — newt's own task id.
 
-Caveat: "steady-state idle" here is the *kernel's* idle pause loop —
-`idle` task RUN, `newt` task RDY but never actually scheduled. Nothing
-ever calls into `peripherals/screen.rs::blit`, so `/tmp/newton-fb/`
-stays empty. The boot never reaches `TScreenDriver::*` (verified via
-`awk '/^trace / && !seen[$4]++' run.log`); it gets to
-`TPlatformDriver::Init` and the power-subsystem chain, then quiesces
-without ever instantiating the display driver. Getting `newt` onto
-the CPU is the next thing to chase.
+`task_dump`'s saved-PC walker shows newt at PC `0x3ae1fc` (the SVC
+of `SemaphoreOpGlue`), `lr_usr=0x25a2e0` (after `bl SemOp` in
+`TULockingSemaphore::Acquire`), and the user stack carries saved
+LRs `0x143334` (`DisposPtr`'s `bl Acquire` site) and `0x354724`
+(`MakeStoreObject`'s exception catch handler). The sequence is:
 
-Next stops on the roadmap, in roughly the order we expect to hit them:
+1. Newt enters `MakeStoreObject` (ROM 0x354178), acquires the heap
+   store's TULockingSemaphore via `LockStore`. lock-word ← newt id.
+2. Newt does `StorePermObject` work, then **throws `exBusError`**
+   (Throw at trace 4149074 with r0 = literal pool entry pointing to
+   `exBusError` at ROM 0x3712b8). Bus-error origin: unidentified —
+   most likely a guest MMIO read or stage-2 fault we should
+   silently default rather than turn into a guest exception.
+3. The catch handler at ROM 0x3544f4 calls `TStoreWrapper::Abort`
+   (0x354b50). Abort does **not** call `UnlockStore` — verified by
+   reading the body. So the lock stays held by newt.
+4. The destructor `~TStoreWrapper` (0x353ae4) runs through
+   `DisposeRefHandle`, which lands in `DisposPtr` (0x14320c).
+   DisposPtr calls `Acquire` on the heap semaphore at 0x143330.
+5. That `Acquire`'s Swap finds `*lock_state == newt id`, so it
+   calls SemOp → BlockOnInc. Self-deadlock — only newt could
+   release the lock, and newt is now blocked on it.
 
-- **Wake `newt`.** The scheduler picks `idle` (prio=0) and never
-  schedules `newt` (prio=10, RDY) — `newt` is queued on
-  `q=0x00000000/0x0c116ed8` (some functions/wait queue), not on the
-  run queue. Figure out what event the kernel is waiting for to move
-  it. Until `newt` runs, no screen / tablet / network activity.
-- **Feed inputs.** Once `newt` schedules, the PLAN goal of "responds
-  to whatever tablet / serial / network inputs we choose to feed it"
-  is reachable. Tablet is the leading candidate —
-  `peripherals/tablet.rs` already produces stylus events.
+Einstein cross-check (`scripts/fvp` not needed; `build/NewtonProbe`
+60 s shows newt reaching `BLK→RDY` cycles with `Tmux RUN`, `scrn`
+already created, etc.) — Einstein never lands on this deadlock.
+The most plausible reading is that step 2 (the Bus Error) doesn't
+fire on Einstein, so the lock-leak path is never taken there. So
+the right fix is to **find the bus-error origin and make it not
+throw**, not to retro-fit recursive-lock semantics into
+TULockingSemaphore.
+
+Concrete next steps:
+
+1. Re-run with `--features trace,quiet` (every-call trace, not
+   `trace_once`) and capture the data abort or MMIO read that
+   triggers the throw. Cross-check against Einstein at the same
+   trace offset — the divergence will name the handler we need to
+   silently default. (See `docs/peripherals.md` for the existing
+   silent-default arms; Einstein's `TMemory::ReadP` is the oracle
+   for what value to return.)
+2. Implement the silent default. Verify the deadlock disappears
+   and newt makes forward progress. Past this point we expect
+   `TScreenDriver::*` to instantiate (compare against the Einstein
+   t=2 s probe dump).
+3. Then return to "feed inputs": `peripherals/tablet.rs` is the
+   lightest-touch path once `newt` is actually scheduling.
 
 ## Resolved stops (newest first)
 

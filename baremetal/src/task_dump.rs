@@ -270,15 +270,27 @@ fn dump_object_table_tasks(current: u32) {
                 let wq1p  = rd(node + 0xc0).unwrap_or(0);
                 let wq2n  = rd(node + 0xc8).unwrap_or(0);
                 let wq2p  = rd(node + 0xcc).unwrap_or(0);
+                // task[+0x6c] flags (KernelObjectState bits, from
+                // TTaskQueue::Add `flags |= state` at ROM 0x359b08):
+                //   bit 0x4000     — on a TUCTTable bucket queue
+                //   bit 0x20000    — on a TScheduler run queue
+                //   bit 0x100000   — on a TSemaphore wait queue
+                //   bit 0x2000000  — paged stack (TStackManager allocated)
+                // task[+0x90] is the TTaskContainer* (ROM `str r6, [r4, #36]!`
+                // at 0x359b0c after `str r0, [r4, #108]!` at 0x359b08, so the
+                // base is task+0x6c+0x24 = task+0x90 — NOT task+0x24).
+                let flags = rd(node + 0x6c).unwrap_or(u32::MAX);
+                let container = rd(node + 0x90).unwrap_or(u32::MAX);
                 let name  = find_task_name(globals);
                 let (n0, n1, n2, n3) = match name {
                     Some((_, v)) => ((v>>24) as u8, (v>>16) as u8, (v>>8) as u8, v as u8),
                     None         => (b'?', b'?', b'?', b'?'),
                 };
                 kprintln!(
-                    "  [{}] task {:#010x} id={:#x} prio={} name='{}{}{}{}' q={:#010x}/{:#010x} wq1={:#010x}/{:#010x} wq2={:#010x}/{:#010x}",
+                    "  [{}] task {:#010x} id={:#x} prio={} name='{}{}{}{}' flags={:#x} cont={:#x} q={:#010x}/{:#010x} wq1={:#010x}/{:#010x} wq2={:#010x}/{:#010x}",
                     state, node, id, prio,
                     n0 as char, n1 as char, n2 as char, n3 as char,
+                    flags, container,
                     qnext, qprev, wq1n, wq1p, wq2n, wq2p,
                 );
             }
@@ -354,7 +366,228 @@ pub fn dump() {
 
     kprintln!("  all tasks (object table walk):");
     dump_object_table_tasks(curr);
+
+    // For every task whose flags[+0x6c] has bit 0x100000 set (=> on a
+    // TSemaphore wait queue), the queue head address sits in q.prev.
+    // Print a few words around it so we can see whether it's
+    // TSemaphore+0x18 (block-on-zero) or +0x20 (block-on-inc), and what
+    // the surrounding kernel state looks like. Linkage citations:
+    // - flag 0x100000 set/cleared by TSemaphore::Block{OnInc,OnZero} /
+    //   WakeTasksOn{Inc,Zero} via TTaskQueue::Add/Remove with state arg
+    //   = #1048576 (ROM 0x1d4dc8 / 0x1d4de8 / 0x1d4e2c).
+    // - TSemaphore is 40 bytes (ROM 0x1d5114 `mov r0, #40`); two
+    //   TTaskQueues at +0x18 and +0x20 (ROM 0x1d512c / 0x1d5134).
+    dump_semaphore_waits();
+    dump_blocked_pcs();
 }
+
+/// For each task that's not RUN and has q.prev or wq1/wq2 non-zero
+/// (i.e. it's blocked somewhere), print its saved PC + SP_usr from the
+/// SWIBoot save area at task+0x4c / task+0x44. Useful for seeing
+/// "where is newt stuck?" without spamming the per-task save-area
+/// dump.
+fn dump_blocked_pcs() {
+    let curr = rd(G_CURRENT_TASK).unwrap_or(0);
+    let mut printed = false;
+    for bucket in 0..OT_NUM_BUCKETS {
+        let head_va = G_OBJECT_TABLE + OT_BUCKETS_BASE + bucket * 4;
+        let mut node = match rd(head_va) { Some(v) => v, None => continue };
+        let mut steps = 0u32;
+        while node != 0 && steps < 128 {
+            let id = match rd(node) { Some(v) => v, None => break };
+            if (id & 0xF) == OBJ_TYPE_TASK && node != curr {
+                let saved_pc   = rd(node + 0x4c).unwrap_or(u32::MAX);
+                let saved_spsr = rd(node + 0x50).unwrap_or(u32::MAX);
+                let sp_usr     = rd(node + 0x44).unwrap_or(u32::MAX);
+                let lr_usr     = rd(node + 0x48).unwrap_or(u32::MAX);
+                if saved_pc != 0 && saved_pc != u32::MAX {
+                    if !printed {
+                        kprintln!("  blocked-task saved PCs (from SWIBoot save area):");
+                        printed = true;
+                    }
+                    let glob = rd(node + TT_GLOBALS).unwrap_or(0);
+                    let (n0,n1,n2,n3) = match find_task_name(glob) {
+                        Some((_,v)) => ((v>>24) as u8,(v>>16) as u8,(v>>8) as u8,v as u8),
+                        None => (b'?',b'?',b'?',b'?'),
+                    };
+                    kprintln!(
+                        "    task {:#x} ({}{}{}{}) id={:#x} savedPC={:#x} SPSR={:#x} sp_usr={:#x} lr_usr={:#x}",
+                        node, n0 as char, n1 as char, n2 as char, n3 as char,
+                        id, saved_pc, saved_spsr, sp_usr, lr_usr,
+                    );
+                    // Only walk newt's user stack (the deadlocked task) to
+                    // avoid spamming the log. Heuristic: tasks whose name is
+                    // "newt".
+                    if n0 == b'n' && n1 == b'e' && n2 == b'w' && n3 == b't' {
+                        kprintln!("      newt user-stack window (sp_usr +0x00..+0x80):");
+                        for i in 0..32u32 {
+                            let va = sp_usr.wrapping_add(i * 4);
+                            let v = rd(va).unwrap_or(u32::MAX);
+                            kprintln!("        [+{:#04x}] @{:#010x} = {:#010x}", i*4, va, v);
+                        }
+                    }
+                }
+            }
+            node = match rd(node + 4) { Some(v) => v, None => break };
+            steps += 1;
+        }
+    }
+}
+
+/// For each task whose flags[+0x6c].bit(0x100000) is set (= queued on a
+/// TSemaphore), print the bytes around the queue head it points at, plus
+/// a guess at the parent TSemaphore VA. Used to identify which
+/// semaphore is holding the task.
+fn dump_semaphore_waits() {
+    let mut printed = false;
+    for bucket in 0..OT_NUM_BUCKETS {
+        let head_va = G_OBJECT_TABLE + OT_BUCKETS_BASE + bucket * 4;
+        let mut node = match rd(head_va) { Some(v) => v, None => continue };
+        let mut steps = 0u32;
+        while node != 0 && steps < 128 {
+            let id = match rd(node) { Some(v) => v, None => break };
+            if (id & 0xF) == OBJ_TYPE_TASK {
+                let flags = rd(node + 0x6c).unwrap_or(0);
+                let q_prev = rd(node + 0x98).unwrap_or(0);
+                if flags & 0x100000 != 0 && q_prev != 0 {
+                    if !printed {
+                        kprintln!("  semaphore waits (flag 0x100000 set):");
+                        printed = true;
+                    }
+                    let queue_va = q_prev;
+                    let head = rd(queue_va).unwrap_or(u32::MAX);
+                    let tail = rd(queue_va + 4).unwrap_or(u32::MAX);
+                    // Each TSemaphore is 40 bytes. Probe both queue offsets:
+                    // - if queue_va is sema+0x18 (block-on-zero) → sema = queue_va - 0x18
+                    // - if queue_va is sema+0x20 (block-on-inc)  → sema = queue_va - 0x20
+                    let cand_zero = queue_va.wrapping_sub(0x18);
+                    let cand_inc  = queue_va.wrapping_sub(0x20);
+                    let glob = rd(node + TT_GLOBALS).unwrap_or(0);
+                    let (n0, n1, n2, n3) = match find_task_name(glob) {
+                        Some((_, v)) => ((v>>24) as u8, (v>>16) as u8, (v>>8) as u8, v as u8),
+                        None         => (b'?', b'?', b'?', b'?'),
+                    };
+                    kprintln!(
+                        "    task {:#x} ({}{}{}{}) on queue@{:#x} head={:#x} tail={:#x}",
+                        node,
+                        n0 as char, n1 as char, n2 as char, n3 as char,
+                        queue_va, head, tail,
+                    );
+                    // Words around the candidate semaphore base. A real
+                    // TSemaphore has a vtable ptr at +0x10 (first instr
+                    // of __ct__ stores `[r4, #16] = pc-rel const`).
+                    for cand_label in [("sema+0x18 (BlockOnZero)", cand_zero),
+                                       ("sema+0x20 (BlockOnInc) ", cand_inc)] {
+                        let (label, base) = cand_label;
+                        let v00 = rd(base).unwrap_or(u32::MAX);
+                        let v04 = rd(base + 0x04).unwrap_or(u32::MAX);
+                        let v08 = rd(base + 0x08).unwrap_or(u32::MAX);
+                        let v0c = rd(base + 0x0c).unwrap_or(u32::MAX);
+                        let v10 = rd(base + 0x10).unwrap_or(u32::MAX);
+                        let v14 = rd(base + 0x14).unwrap_or(u32::MAX);
+                        let v18 = rd(base + 0x18).unwrap_or(u32::MAX);
+                        let v1c = rd(base + 0x1c).unwrap_or(u32::MAX);
+                        let v20 = rd(base + 0x20).unwrap_or(u32::MAX);
+                        let v24 = rd(base + 0x24).unwrap_or(u32::MAX);
+                        kprintln!(
+                            "      {} @{:#x}: +00={:#x} +04={:#x} +08={:#x} +0c={:#x} +10={:#x} +14={:#x} +18={:#x} +1c={:#x} +20={:#x} +24={:#x}",
+                            label, base, v00, v04, v08, v0c, v10, v14, v18, v1c, v20, v24,
+                        );
+                    }
+                    // Whichever candidate has [+0x10] = 0x1ae40 is the
+                    // real TSemaphore base (TSemaphore::TSemaphore at ROM
+                    // 0x1d513c stores 0x1ae40 to [r4,#16]).
+                    let real_sema = if rd(cand_zero + 0x10) == Some(0x1ae40) {
+                        Some(cand_zero)
+                    } else if rd(cand_inc + 0x10) == Some(0x1ae40) {
+                        Some(cand_inc)
+                    } else { None };
+                    if let Some(sema) = real_sema {
+                        find_semaphore_owner(sema);
+                    }
+                }
+            }
+            node = match rd(node + 4) { Some(v) => v, None => break };
+            steps += 1;
+        }
+    }
+}
+
+/// Search every TSemaphoreGroup in `gObjectTable` for one whose internal
+/// kernel TSemaphoreGroup has +0x10 = `sema_va` (the array base) and
+/// the array contains `sema_va`. The kernel TSemaphoreGroup is the
+/// inner half of TUSemaphoreGroup; for a TULockingSemaphore the array
+/// contains exactly one TSemaphore.
+///
+/// Layout citations:
+/// - TSemaphoreGroup::Init at ROM 0x1d4e5c stores allocated array at
+///   [r4, #16] (= +0x10) and count at [r4, #20] (= +0x14).
+/// - TUSemaphoreGroup wraps the kernel TSemaphoreGroup at offset +0x18
+///   (TULockingSemaphore::Init at ROM 0x25a504 calls TUSemaphoreGroup::Init
+///   on `this`, which passes through to TSemaphoreGroup::Init on
+///   `this+0x18`).
+const OBJ_TYPE_SEMGROUP: u32 = 0x7;
+
+fn find_semaphore_owner(sema_va: u32) {
+    // Each TSemaphore is 40 bytes (0x28). To match a sema in a group's
+    // array, we need (sema_va - array_base) % 40 == 0 AND the index is
+    // < count.
+    let mut found = false;
+    for_each_object_of_kind(OBJ_TYPE_SEMGROUP, |grp_kernel_va, grp_id| {
+        let arr_base = rd(grp_kernel_va + 0x10).unwrap_or(0);
+        let count    = rd(grp_kernel_va + 0x14).unwrap_or(0);
+        if arr_base == 0 || count == 0 { return; }
+        if sema_va < arr_base { return; }
+        let off = sema_va - arr_base;
+        if off % 40 != 0 { return; }
+        let idx = off / 40;
+        if idx >= count { return; }
+        kprintln!(
+            "      owner: TSemaphoreGroup @{:#x} id={:#x} array={:#x} count={} → sema[{}] @{:#x}",
+            grp_kernel_va, grp_id, arr_base, count, idx, sema_va
+        );
+        // The TUSemaphoreGroup user wrapper is at grp_kernel_va - 0x18
+        // (TUSemaphoreGroup::Init passes `this+0x18` to
+        // TSemaphoreGroup::Init at ROM 0x25a270; symmetric layout).
+        // dump that too if it's a sane address.
+        let uwrapper = grp_kernel_va.wrapping_sub(0x18);
+        let urc_id   = rd(uwrapper).unwrap_or(0);
+        let urefcon  = rd(uwrapper + 0x08).unwrap_or(0);
+        // For a TULockingSemaphore, the refcon is set to [this+8] (its
+        // 4-byte malloc'd lock-state word) — see TULockingSemaphore::Init
+        // at ROM 0x25a514. So if `urefcon == uwrapper + 8`, this group
+        // belongs to a TULockingSemaphore and the lock-state word at
+        // urefcon contains the holder's gCurrentTaskId (Acquire's
+        // `ldr r1, [gCurrentTaskId]; bl Swap` at ROM 0x25a2c0).
+        let lock_word = if urefcon != 0 { rd(urefcon).unwrap_or(0) } else { 0 };
+        let is_locking = urefcon == uwrapper + 8;
+        kprintln!(
+            "      candidate TUSemaphoreGroup @{:#x}: id-stash={:#x} refcon-stash={:#x}{} lock-word={:#x}",
+            uwrapper, urc_id, urefcon,
+            if is_locking { " [TULockingSemaphore]" } else { "" },
+            lock_word,
+        );
+        if lock_word != 0 {
+            // Look up the holder by ID in gObjectTable to print its name.
+            if let Some((tva, name)) = find_task_by_id(lock_word) {
+                kprintln!(
+                    "      lock holder: id={:#x} task={:#x} name='{}{}{}{}'",
+                    lock_word, tva,
+                    name[0] as char, name[1] as char, name[2] as char, name[3] as char,
+                );
+            } else {
+                kprintln!(
+                    "      lock holder: id={:#x} (no task with this id)", lock_word
+                );
+            }
+        }
+        found = true;
+    });
+    if !found {
+        kprintln!("      owner: no TSemaphoreGroup contains sema {:#x}", sema_va);
+    }
+}
+
 
 /// Dump the SWIBoot context-save area of `task_va` — the 21-word
 /// region at +0x10..+0x54 the SVC scheduler reads at 0x3ad9a4..0x3ad9c4

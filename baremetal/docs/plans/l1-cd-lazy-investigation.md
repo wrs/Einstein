@@ -1,27 +1,47 @@
-# Phase B — RESOLVED: ARMv7 DFSR.Domain UNK on DFSC=5; hypervisor now overlays L1.domain into DFSR before forwarding to DAH
+# Phase B — RESOLVED: ARMv7 DFSR.Domain UNK on DFSC=5 (γ-fix), and IPA 0x200001a0 = "unknown bank #5" silent-zero
 
-## Status (2026-04-27, RESOLVED)
+## Status (2026-04-27, BOTH WEDGES RESOLVED, PHASE B GOAL REACHED)
 
-**The wedge is fixed.** Boot advances past FAR=0x0CD07400. Layer (γ)
-fix in tree: in `handle_diag`'s dabt-forward path, read the faulting
-VA's L1 entry, extract `bits[8:5]` (domain), and overlay into
-DFSR_EL1.bits[7:4]. Idempotent for valid-domain DFSCs (DFSC=7 already
-has correct domain there); for DFSC=5 it provides what ARMv7 leaves
-UNK per ARM ARM B4.1.51.
+**Both follow-on wedges are fixed; boot reaches `TInterpreter::TInterpreter`.**
 
-The 717006 kernel was written for StrongARM where the equivalent CP15
-status register (`c5,c5,0`) always carried the L1 entry's domain
-regardless of fault status. Our `patch_cp15_encodings` rewrites
-`c5,c5,0` to `c5,c0,0` (= DFSR_EL1) at ROM-load time, but ARMv7 DFSR
-leaves Domain UNK on DFSC=0b00101 — zero on QEMU. Kernel computes
-`domain := 0`, `GetDomainAndFaultMonitorFromDomainNumber(0)` returns
-empty, `FaultMonitorEntry(r0=0)` returns -10015, kernel reboots.
+### γ fix (DFSR.Domain UNK on DFSC=5) — committed earlier today
 
-Boot now reaches a new Phase B trip-wire: unknown MMIO read at IPA
-`0x200001a0` from PC `0x002584A4`. Distinct investigation; this plan
-is closed.
+In `handle_diag`'s dabt-forward path, read the faulting VA's L1 entry,
+extract `bits[8:5]` (domain), and overlay into DFSR_EL1.bits[7:4].
+Idempotent for valid-domain DFSCs; for DFSC=5 it provides what ARMv7
+leaves UNK per ARM ARM B4.1.51. Boot advances past the L1[0xCD]
+wedge (FAR=0x0CD07400 lazy-section grow now succeeds via the kernel's
+existing FaultMonitorEntry → Remember → SWI #12 path).
+
+### Bank-#5 fix (IPA 0x200001a0 silent zero) — this jj change
+
+After γ landed, boot wedged ~10× further on a TInterpreter-side
+`MakeString__FPCc` whose to-Unicode TEncodingMap descriptor's `+16`
+slot pointed at IPA `0x20000110` (the kernel's L1[0x200] = section
+0x20000c0e maps it 1:1, but our stage-2 has nothing there). Einstein's
+`TMemory::ReadP` (`Emulator/TMemory.cpp:1026-1034`) silently returns 0
+for any read in `0x10400000..0x30000000` ("unknown bank #5"). We now
+do the same in `src/mmio.rs::UNKNOWN_BANK5_BASE..END`, matching
+Einstein's behaviour. The deeper "why is the descriptor's +16 wrong?"
+is a NewtonScript-level bug Einstein masks the same way — decoupled
+from this wedge.
+
+### Result
+
+After both fixes, boot advances to `TInterpreter::TInterpreter`
+(`newt` task id=0x3063, [RDY] state) plus the full 27-task driver
+suite — `cdsv`, `cdpr`, `pg&e`, `Tmux`, `OBJM`, `PMGR`, `PTBL`,
+`STKF/STKP/STKU`, `drvr`, `ROMF`, `ROMP`, `alrt`, `sndm`, `name`,
+`pckm`, `cmgr`, `pssm`, `main`. Matches Einstein's NewtonProbe t=2 s
+snapshot. Kernel enters its normal idle pause loop
+(`PauseSystemKernelGlue` → `PauseSystem (TPlatformDriver)`),
+**not** a wedge.
+
+**Phase B's goal of reaching `TInterpreter::TInterpreter` is met.**
 
 35/35 guest tests still green.
+
+See `INVESTIGATION.md` for the full chain.
 
 ## Earlier — Status (2026-04-27)
 

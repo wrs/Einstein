@@ -468,7 +468,7 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
     // was computed. The check mirrors the regions mmio::write would
     // silently accept — anything outside an MMIO window AND outside
     // the stage-2 RW RAM/flash/FB blocks is obviously unreachable.
-    if wnr && is_obviously_unreachable_ipa(ipa) {
+    if is_obviously_unreachable_ipa(ipa) {
         let spsr = read_sysreg!("spsr_el2") as u32;
         let mode = spsr & 0x1F;
         let mode_label = aarch32_mode_label(mode);
@@ -476,9 +476,11 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
         // are SP_usr/LR_usr regardless of source mode).
         let cur_sp = crate::banked::sp_for_mode(ctx, spsr);
         let cur_lr = crate::banked::lr_for_mode(ctx, spsr);
+        let dir = if wnr { "writing" } else { "reading" };
+        let val = if wnr { ctx.x[srt] as u32 } else { 0 };
         kprintln!(
-            "dabt-trip: PC={:#010x} mode={} writing {:#010x} -> IPA={:#x}",
-            elr, mode_label, ctx.x[srt] as u32, ipa
+            "dabt-trip: PC={:#010x} mode={} {} {:#010x} -> IPA={:#x}",
+            elr, mode_label, dir, val, ipa
         );
         kprintln!(
             "           r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}",
@@ -496,6 +498,19 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
             "           r12={:#010x} sp({})={:#010x} lr({})={:#010x}",
             ctx.x[12] as u32, mode_label, cur_sp, mode_label, cur_lr
         );
+        // Walk a few words of the source-mode stack via stage-1 — the
+        // top entry is normally the caller's saved LR after a leaf
+        // function's `stmfd sp!, {lr}` prologue. Also walk the access
+        // base register so the table-pointer dereference is visible
+        // even when the bad value was already overwritten in `ctx`.
+        for off in 0..8u32 {
+            if let Some(w) = guest_mem::read_word_va(cur_sp.wrapping_add(off * 4)) {
+                kprintln!(
+                    "           stack[sp+{:#04x}] @{:#010x} = {:#010x}",
+                    off * 4, cur_sp.wrapping_add(off * 4), w
+                );
+            }
+        }
     }
 
     if wnr {
@@ -581,6 +596,16 @@ fn try_emulate_isv0_dabt(ctx: &mut TrapContext, ipa: u64, wnr: bool, elr: u32) -
 fn is_obviously_unreachable_ipa(ipa: u64) -> bool {
     // Inside ROM (stage-2 RO). Any write is doomed.
     if ipa < 0x0100_0000 { return true; }
+    // "Unknown bank #5" gap (between flash bank 2 end at 0x10400000
+    // and PCMCIA0Base at 0x30000000). Einstein's TMemory silently
+    // returns 0 here; we now do the same in mmio.rs but the kernel
+    // still gets here only via uninitialised-pointer paths (e.g.
+    // the TEncodingMap.+16 = 0x20000110 from the MakeString fault
+    // we resolved on 2026-04-27). Surfacing the register context
+    // for the first such access per boot is cheap and decisive.
+    // Skip the NO_REX_PROBE sub-window (0x10400000..0x20000000) —
+    // that's a known ROM-driven scan that legitimately reads zeros.
+    if (0x2000_0000..0x3000_0000).contains(&ipa) { return true; }
     false
 }
 

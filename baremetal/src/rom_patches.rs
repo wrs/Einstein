@@ -202,7 +202,9 @@ const FDATE_STUB_PC:     u32 = 0x00FF_FF60;
 const RESOLVE_FAULT_WRAPPER_PC: u32 = 0x00FF_FE00;
 
 /// Entry point of `TStackManager::ResolveFault` that the wrapper invokes.
+/// Also re-exported as `RESOLVE_FAULT_ENTRY_PC` for the lazy-L1 probe.
 const RESOLVE_FAULT_PC: u32 = 0x001F_7978;
+pub const RESOLVE_FAULT_ENTRY_PC: u32 = RESOLVE_FAULT_PC;
 
 /// PC of the `bl ResolveFault` call inside `TStackManager::Fault` —
 /// the site we re-target to the wrapper.
@@ -262,6 +264,24 @@ pub const FILL_PROBE_HVC_IMM:        u32 = 0x49;
 /// allocations we want to record. See Step 3 in the plan.
 pub const NEW_STACK_PROBE_HVC_IMM:   u32 = 0x4A;
 
+/// HVC immediate fired by the patched first word of
+/// `Fault__13TStackManagerFR15TProcessorState` at 0x001F83E4. Handler
+/// logs source-mode CPSR + caller LR, the (manager*, processor_state*)
+/// pair, and the FAR read from `processor_state->[+0x44]`, then emulates
+/// the original `mov ip, sp`. See plan Step 5 prep — confirms whether
+/// the kernel's stack-fault dispatcher is reached for the second
+/// (FAR=0x0cd07400) abort.
+pub const STACK_MGR_FAULT_PROBE_HVC_IMM: u32 = 0x4B;
+
+/// HVC immediate fired by the patched first word of
+/// `ResolveFault__13TStackManagerFP10TStackInfo` at 0x001F7978. Handler
+/// logs source-mode CPSR + caller LR, the (manager*, info*) pair, and
+/// the FAR read from `manager->[+0x40]->[+0x44]`, then emulates the
+/// original `mov ip, sp`. Captures both wrapper-reached calls (from
+/// 0x1f84e0 → wrapper @0xfffe00 → BL here) and direct calls (from
+/// FMLockHeapRange at 0x1f6b94). See plan Step 5 prep.
+pub const RESOLVE_FAULT_PROBE_HVC_IMM:   u32 = 0x4C;
+
 const REMEMBER_STATIC_PC:            u32 = 0x0025_8E0C;
 const REMEMBER_STATIC_FIRST_INSN:    u32 = 0xE1A0_C00D; // mov ip, sp
 const REMEMBER_SWIRET_PC:            u32 = 0x0025_8E50;
@@ -272,6 +292,9 @@ pub const FILL_STATIC_PC:            u32 = 0x001A_4B54;
 const FILL_FIRST_INSN:               u32 = 0xE92D_4000; // stmfd sp!, {lr}
 pub const NEW_STACK_LOW_LDR_PC:      u32 = 0x001F_89A8;
 const NEW_STACK_LOW_LDR_INSN:        u32 = 0xE59D_1010; // ldr r1, [sp, #16]
+pub const STACK_MGR_FAULT_PC:        u32 = 0x001F_83E4;
+const STACK_MGR_FAULT_FIRST_INSN:    u32 = 0xE1A0_C00D; // mov ip, sp
+const RESOLVE_FAULT_FIRST_INSN:      u32 = 0xE1A0_C00D; // mov ip, sp
 
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
@@ -384,6 +407,22 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(NEW_STACK_PROBE_HVC_IMM),
             "NewStack post-SWI ldr r1, [sp,#16]",
             NEW_STACK_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            STACK_MGR_FAULT_PC,
+            STACK_MGR_FAULT_FIRST_INSN,
+            hvc_insn(STACK_MGR_FAULT_PROBE_HVC_IMM),
+            "TStackManager::Fault prologue",
+            STACK_MGR_FAULT_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            RESOLVE_FAULT_ENTRY_PC,
+            RESOLVE_FAULT_FIRST_INSN,
+            hvc_insn(RESOLVE_FAULT_PROBE_HVC_IMM),
+            "TStackManager::ResolveFault prologue",
+            RESOLVE_FAULT_PROBE_HVC_IMM,
         );
     }
 }

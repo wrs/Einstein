@@ -393,6 +393,26 @@ pub const DAH_FME_ENTRY_HVC_IMM:      u32 = 0x51;
 pub const FME_STATIC_PC:              u32 = 0x0011_FC60;
 const FME_STATIC_FIRST_INSN:          u32 = 0xE1A0_C00D;
 
+/// `ldr r1, [pc, #1588]` at DAH PC `0x00393318`, the load that
+/// initialises `r1` with `gKernelGlobals` (= `0x0C100FF8`) before the
+/// OR-chain at `0x393320..0x393344` builds the fault bitmask passed to
+/// `FaultMonitorEntry`. Original encoding `0xE59F_1634`. We replace it
+/// with `HVC #DAH_OR_CHAIN_HVC_IMM`; the handler reads
+/// `*gKernelGlobals` (= curr_task), then `curr_task->[+0x74/+0x78/+0x7c]`
+/// (TUDomainManager pointers) and each monitor's `[+0x10]` (the OR'd
+/// value), logs them, and emulates the original load by writing the
+/// literal `0x0C100FF8` into `ctx.x[1]`. Natural ERET resumes at
+/// `0x39331c` (the kernel's `ldr r1, [r1]`) so the kernel proceeds
+/// normally with `r1 = 0x0C100FF8`.
+///
+/// Diagnostic for the γ probe: distinguishes (E-1) curr_task changed
+/// between fault #2 entry and Reboot from (E-2) same task but
+/// monitor[+0x74] mutated. See INVESTIGATION.md "γ probe outcome".
+pub const DAH_OR_CHAIN_HVC_IMM:       u32 = 0x52;
+pub const DAH_OR_CHAIN_PC:            u32 = 0x0039_3318;
+const DAH_OR_CHAIN_INSN:              u32 = 0xE59F_1634;
+pub const G_KERNEL_GLOBALS_VA:        u32 = 0x0C10_0FF8;
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -578,6 +598,18 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(DAH_FME_ENTRY_HVC_IMM),
             "FaultMonitorEntry static entry (mov ip, sp)",
             DAH_FME_ENTRY_HVC_IMM,
+        );
+        // Layer-γ probe: DAH OR-chain entry at 0x00393318 (`ldr r1,
+        // [pc, #1588]` loading gKernelGlobals VA). Captures curr_task
+        // and its monitor list to distinguish (E-1) curr_task changed
+        // from (E-2) same task with mutated monitor list.
+        patch_probe(
+            rom_ptr,
+            DAH_OR_CHAIN_PC,
+            DAH_OR_CHAIN_INSN,
+            hvc_insn(DAH_OR_CHAIN_HVC_IMM),
+            "DAH OR-chain entry (ldr r1, gKernelGlobals)",
+            DAH_OR_CHAIN_HVC_IMM,
         );
     }
 }

@@ -1,6 +1,45 @@
-# Phase B — Wedge reframed: kernel skips stack-monitor on the SVC-mode fault
+# Phase B — Wedge reframed: NewStack #19 leaves TRefStructStack range as L1=0x90 lazy markers, DAH reboots on first touch
 
-## Status (2026-04-26 night-2)
+## Status (2026-04-27)
+
+**Step 8 done (without FVP). Step 7 ready to start in the right layer.**
+
+Key findings, captured in `INVESTIGATION.md`:
+
+- **Hypothesis (C) confirmed**: QEMU raspi3b's `mrs spsr_abt` from EL2
+  is stale for fault #2 at `FAR=0x0cd07400`. Direct evidence in
+  `qemu6.log` line 2202 — `mrs spsr_abt` returns 0x60000113 (SVC) but
+  the trampoline-saved slot at `DABT_SAVE_PA + 8` (written via AArch32
+  `mrs r1, spsr`) holds 0x80000110 (USR). FVP cross-check skipped:
+  the cache-accurate FVP boot didn't reach the wedge in 600s of wall
+  time, and the in-run saved-slot vs `mrs` divergence is dispositive on
+  its own.
+- **Hypothesis (D) refuted**: the saved slot is a consistent USR across
+  fault entry and DAH exit, so no async exception fired during DAH.
+- **The wedge is not SPSR-staleness-gated**: even with the kernel's
+  `mrs r1, SPSR` at PC 0x393144 patched to substitute the saved-slot
+  value (HVC #0x4F → `handle_dah_mrs_spsr_patch`), fault #2 still
+  reaches the throw exit at PC 0x393944. The route changes (USR-
+  recovery → FaultMonitorEntry → RebootIfFaultWasInStack →
+  `b 0x3932dc` → throw) but the outcome is the same: kernel reboots.
+- **Real cause**: NewStack #19 allocates `TRefStructStack` at
+  `base=0x0cd07400` (sections 0xCD..0xD1) but leaves L1[0xCD..D1] = 0x90
+  lazy markers. The first write at `0x0cd07400` triggers a DFSC=5
+  section-translation fault. DAH's DFSC=5 path doesn't recognise the
+  `0x90` marker, FaultMonitorEntry returns "no owner",
+  RebootIfFaultWasInStack reboots. Earlier-grown lazy sections in this
+  boot (L1[0xC6/C9/CA/CC]) were transitioned 0x90→coarse via
+  `Remember(va, perm=0)` from the kernel's allocator path; nothing
+  drives the same call for sections 0xCD..D1.
+
+**Step 7 (apply the fix) is no longer blocked.** Two candidate layers
+to repair, see "Step 7 reframe" below.
+
+In tree: kernel-side `mrs r1, SPSR` HVC patch + saved-slot vs `mrs`
+divergence diagnostic (defensive QEMU-staleness workaround; FVP no-op).
+35/35 guest tests still green.
+
+## Earlier — Status (2026-04-26 night-2)
 
 **Step 6 done.** All three sub-probes installed and one cold-boot
 artifact captured:
@@ -191,7 +230,55 @@ If we see exactly one USR-return after fault #1, hypothesis (B) is
 confirmed (the kernel did return to USR; mode flip happens later); if
 we see *zero*, hypothesis (B) is the wedge.
 
-## Step 7 — apply the fix
+## Step 7 reframe — fix NewStack #19's L1 mapping for the TRefStructStack range
+
+The Step-8 cross-check moved the wedge: it is **not** at the
+SPSR_abt-staleness layer (that was a real but secondary QEMU bug, now
+worked around in tree). The wedge is that NewStack returns a stack
+`base=0x0cd07400` whose L1 entries are still `0x90` (lazy) and the
+kernel's DAH for DFSC=5 doesn't grow them — it reboots via
+`RebootIfFaultWasInStack`.
+
+Two candidate fix layers; pick by what Einstein and real Newton do for
+the equivalent `NewStack(0x10000)` call (Step 4 cross-check).
+
+**(α) Kernel allocator path: NewStack/Remember should pre-allocate the
+range.** Earlier sections grown in this boot (L1[0xC6/C9/CA/CC]) all
+went through `Remember(va, perm=0)` from the allocator side — that
+matches the success pattern. NewStack #19 (caller_lr=0x001a4adc) and
+NewStack #18 (caller_lr=0x001a4948) both call into the allocator;
+something in #18's path called `Remember` for L1[0xCC] but the
+equivalent path in #19 didn't. Locate the divergence and equalise it.
+
+**(β) DAH DFSC=5 path: recognise the `0x90` marker.** A more general
+fix: at PC `0x393314` (the DFSC=5 jump-table arrival), before the
+FaultMonitor OR-chain, check whether the L1 entry at FAR's section is
+the lazy `0x90` marker; if so, call `Remember(FAR, perm=0)` to grow
+it and return-and-retry instead of falling through to
+RebootIfFaultWasInStack. Mirrors the DFSC=7 lazy-grow path that
+already works for L2 entries.
+
+(α) is the surgical fix; (β) is the robust safety-net. Either resolves
+the wedge.
+
+### Step 7a — Einstein cross-check (one shell)
+
+Run the equivalent boot under Einstein and capture which layer it owns
+the section-mapping in. Specifically: when Einstein's NewStack returns
+the same `0x0cd07400` base, do its L1 entries already cover sections
+0xCD..D1, or does Einstein also leave them lazy and rely on a different
+DAH path for DFSC=5? `Emulator/TStackManager.cpp` and the surrounding
+kernel-side files are the oracles. The same TInterpreter ctor → Fill →
+first write path runs there.
+
+If Einstein has L1[0xCD..D1] = coarse at the moment of the first Fill
+write, layer (α) is the right fix and we need to find what Einstein's
+NewStack does that ours doesn't.
+
+If Einstein leaves them lazy and DAH-DFSC=5 grows on demand, layer
+(β) is the right fix.
+
+### Old Step 7 framing (kept for context)
 
 Depends on Step 6 outcome:
 

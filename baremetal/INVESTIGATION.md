@@ -2,7 +2,143 @@
 
 Live notes. Update as we learn more. REMOVE old updates once resolved.
 
-## In progress — Step 6 probes: DAH-exit + NewState + mode-aware dabt dedup (QEMU, 2026-04-26 night-2)
+## In progress — Step 8 (saved-slot vs `mrs spsr_abt` cross-check) + Step 7 reframe (QEMU, 2026-04-27)
+
+**Plan reference:** `docs/plans/l1-cd-lazy-investigation.md` Step 7 / Step 8.
+
+Step 8 was originally framed as "run the boot under FVP to discriminate
+QEMU `mrs spsr_abt` staleness (C) from an asynchronous mode flip (D)".
+A first FVP attempt (`/tmp/phaseB-l1cd-probe/fvp1.log`, `--timeout=120`)
+timed out in early cache-flush loops at PC=0x18b38; a longer attempt
+(`fvp2.log`, `--timeout=600`) made it to 60+ wall-seconds but still hadn't
+left the early `StoreToPhysAddress` / cache-clean region (FVP runs the
+generic timer + cache model accurately, so even a 600s budget didn't
+reach the L1[0xCD] wedge that QEMU TCG hits in <100s).
+
+Rather than wait it out, we discriminated (C) vs (D) without FVP by adding
+an in-run cross-check: the dabt-trampoline already saves SPSR_abt to
+`DABT_SAVE_PA + 8` via *AArch32* `mrs r1, spsr` (which is reliable on
+QEMU). The probe handlers at the dabt-forward path and the DAH-exit
+path now read both `read_banked_spsr("abt")` (= EL2 `mrs spsr_abt`)
+*and* `read_word_pa(DABT_SAVE_PA + 8)`, and tag any divergence with
+`-- mrs DIVERGES FROM SAVED SLOT --`. See `qemu6.log` line 2202 for the
+smoking gun:
+
+```
+SPSR_abt=0x60000113 (pre-abt mode=0x13)  [mrs] -- mrs DIVERGES FROM SAVED SLOT --
+saved-slot SPSR_abt=0x80000110 (pre-abt mode=0x10 = USR)
+```
+
+Same read, two milliseconds apart, in the same trap handler — EL2
+`mrs spsr_abt` returned **0x60000113 (pre-abt SVC)** while the
+trampoline-saved slot held **0x80000110 (pre-abt USR)**. **Hypothesis
+(C) confirmed: QEMU raspi3b's documented `mrs spsr_abt`-from-EL2
+staleness fires for fault #2 at FAR=0x0cd07400.** Hypothesis (D)
+(asynchronous mode flip) is refuted: the saved slot is consistent USR
+across both reads, so no async exception ran. The "SVC-mode wedge"
+framing in earlier `qemu5.log` analysis was an artefact of the stale
+`mrs` read.
+
+### Follow-on: kernel-side `mrs r1, SPSR` is **also** stale, but the wedge is not gated on it
+
+The kernel's DAH at PC `0x393144` does `mrs r1, SPSR`; if that read also
+returns the stale value (0x13 SVC), the kernel takes the throw branch at
+PC `0x393158` (`bne 0x393898` after `cmp r1, #16/0/27`).
+
+We tried two mitigations against the QEMU staleness:
+
+1. **EL2 `msr spsr_abt, <saved-slot>` before ERETing to DAH** (qemu7.log).
+   Did *not* clear the wedge — the kernel's later AArch32 `mrs r1,
+   SPSR` still saw the stale value and routed to the throw exit at
+   `0x393944`. So QEMU's bug affects both EL2 reads *and* writes — an
+   `msr spsr_abt` from EL2 doesn't propagate to the AArch32 ABT-mode
+   `mrs`.
+
+2. **Patch the kernel's `mrs r1, SPSR` directly with `HVC #0x4F`**
+   (qemu9.log). Handler reads `DABT_SAVE_PA + 8` (architecturally
+   correct) and writes it into `ctx.x[1]`. Verified it fires for every
+   DAH entry, with `r1_in` showing the kernel's pre-mrs r1 (= cursor
+   `0x0cd07400` for fault #2) and the saved-slot mode bits = USR. **The
+   wedge persists**: fault #2 still ends at the throw exit at
+   `0x393944`. So the kernel's `mrs` *was* stale, but the wedge is not
+   gated on it.
+
+### Where the wedge actually fires (DFSC=5 path leads back to throw)
+
+With the kernel-side mrs patch in place, fault #2 takes the
+USR-recovery branch at `0x393160 → 0x39318c`, walks through the
+fault-classification jump table at `0x393294`, and for DFSC=5 lands at
+`0x393314` (the OR-chain that builds the FaultMonitor bitmask) →
+`0x393368` → `mrc p15,0,r1,c5,c5,{0}` → second jump table at
+`0x393384` → either `0x3932dc` (throw setup) or `0x39339c`. From
+`0x39339c` the kernel calls `FaultMonitorEntry__FUl` at `0x393980`; on
+non-zero return the kernel calls `RebootIfFaultWasInStack` at
+`0x393a14` and falls through to `b 0x3932dc`, which sets up the
+`movs pc, lr` to `Throw` at `0x393944`.
+
+So with the QEMU-mrs workaround, fault #2 reaches the *real* gating
+logic: **`FaultMonitorEntry` returns non-zero for `FAR=0x0cd07400`,
+`RebootIfFaultWasInStack` decides the fault VA is in a tracked stack
+region, and the kernel reboots intentionally**. This is the same
+outcome the original `qemu5.log` analysis attributed to
+"DAH bypasses the stack monitor entirely" — but the bypass framing
+was wrong; DAH *does* invoke FaultMonitorEntry, the monitor just
+returns "I don't own this address" and the kernel treats the fault as
+unrecoverable stack overflow.
+
+### Ground truth on the L1[0xCD] mapping
+
+`handle_reboot` dump at the wedge:
+- L1[0xCB] = 0x90 (lazy)  ← unallocated
+- L1[0xCC] = `0x04023481` (coarse)  ← grown for fault #1
+- **L1[0xCD] = 0x90 (lazy)**  ← never grown, fault #2 fires here
+- L1[0xCE..D1] = 0x90 (all lazy)
+
+NewStack ring shows two relevant calls during TInterpreter setup:
+- `# 18  caller_lr=0x001a4948 req=0x10c00 base=0x0ccee800 top=0x0cd06800` — the active `TRefStack` allocation (96 KiB straddling sections 0xCC..0xCD).
+- `# 19  caller_lr=0x001a4adc req=0x10c00 base=0x0cd07400 top=0x0cd1f400` — the sibling `TRefStructStack` allocation (96 KiB across sections 0xCD..0xD1).
+
+The `TRefStructStack` object snapshot:
+- `this->[+16]=0x0cd07400` (base, = NewStack #19's output low)
+- `this->[+20]=0x0cd07400` (cursor)
+- Fill loop bound = `this->[+16] + 4*pushed_words = 0x0cd07418`.
+
+So the fault at `FAR=0x0cd07400` is a *first* write to the freshly-
+allocated TRefStructStack. NewStack #19 returned `base=0x0cd07400`,
+but the kernel left L1[0xCD..D1] as 0x90 lazy markers and did **not**
+arrange for them to be grown on first touch. DFSC=5 (section
+translation fault) routes through DAH to the
+`RebootIfFaultWasInStack` path, which reboots.
+
+**Step 7 reframe.** The wedge is **not** SPSR_abt-staleness-gated. The
+fix has to be at one of two layers:
+1. **NewStack should pre-allocate L1 entries** (call `Remember(va,
+   perm=0)` for each section in the granted range, the same way the
+   kernel grew L1[0xCC..0xC9] earlier in this boot when those were
+   touched as part of an `Allocate` flow).
+2. **DAH's DFSC=5 path should recognise the `0x90` lazy marker** and
+   call `Remember(va, perm=0)` itself before bailing to
+   `RebootIfFaultWasInStack`.
+
+Either path makes L1[0xCD] = coarse and lets the fault retry succeed.
+Cross-check needed against Einstein's `Emulator/TStackManager.cpp` /
+`Emulator/TVirtualMemory.cpp`: real Newton's behaviour for an
+identical `NewStack(0x10000)` call should tell us which layer owns
+the section-mapping responsibility.
+
+### Reproduction artifacts
+
+- `/tmp/phaseB-l1cd-probe/fvp1.log` — first FVP attempt, --timeout=120, didn't reach the wedge.
+- `/tmp/phaseB-l1cd-probe/fvp2.log` — second FVP attempt, --timeout=600, still didn't reach the wedge.
+- `/tmp/phaseB-l1cd-probe/qemu6.log` — first cold boot with the saved-slot vs mrs cross-check; smoking gun divergence at line 2202.
+- `/tmp/phaseB-l1cd-probe/qemu7.log` — added EL2 `msr spsr_abt` at dabt-forward; wedge persists (later reverted).
+- `/tmp/phaseB-l1cd-probe/qemu9.log` — kernel-side `mrs r1, SPSR` patch at PC 0x393144 with always-log; confirms QEMU mrs is genuinely stale on fault #2 *and* that the wedge survives the workaround.
+
+35/35 guest tests still green with the kernel-side mrs patch in tree.
+
+---
+
+## Earlier — Step 6 probes: DAH-exit + NewState + mode-aware dabt dedup (QEMU, 2026-04-26 night-2)
 
 **Plan reference:** `docs/plans/l1-cd-lazy-investigation.md` Step 6 (a/b/c).
 

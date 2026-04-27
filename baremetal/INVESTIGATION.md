@@ -12,32 +12,59 @@ last stop — `Swap(NULL, 1)` at ROM `0x3ae204` — was resolved by
 mirroring Einstein's `TMemory::WriteP` silent-drop for the ROM
 aperture; see the resolved-stops table in `PLAN.md`.
 
+## What "steady-state idle" actually means here
+
+It's the **kernel's** idle pause loop, not the user-facing idle:
+
+- `idle` task RUN at prio 0
+- `newt` task RDY at prio 10, queued on `q=0x00000000/0x0c116ed8`
+  (some functions/wait queue, not the run queue)
+- everything else BLK
+- timer IRQ + beacon trap cycle through PCs `0x800a0c` /
+  `0x3adb0c` / `0x3ad6f4`
+
+`peripherals/screen.rs::blit` never fires, so `/tmp/newton-fb/`
+stays empty. Cross-checked against the existing pre-fix
+`trace_once` log at `/tmp/run-trace-once.log` (1477 unique first-
+calls, 4147578 total trace events, ending at the SWP-NULL stop):
+
+```sh
+awk '/^trace / && !seen[$4]++' /tmp/run-trace-once.log \
+  | grep -iE "Screen|Blit|Display|TPlatform|TBits"
+```
+
+returns `TPlatformDriver::Init`, `PowerOffSubsystem`,
+`PowerOnSubsystem`, `RegisterPowerSwitchInterrupt`,
+`EnableSysPowerInterrupt`, `ResetZAPStoreCheck` — but no
+`TScreenDriver::*`, `TMainDisplay*`, or `TBlit*`. The display driver
+was never instantiated before the wedge, and post-fix the kernel
+quiesces on the same path without ever getting there.
+
 ## Pending follow-ups
 
-### Snapshot-resume divergence (background)
+### Wake `newt` (next milestone)
 
-Cold boot is fine, but resuming from a saved slot drops the kernel's
-stage-1 mapping for VAs in `0x0c000000+` (kernel globals like
-`gWantDeferred = 0x0c100e58`). The first post-resume access then
-halts with `unknown MMIO read` at `IPA = 0x0c100xxx` — the IPA we
-report is the VA itself because the stage-1 walk didn't remap. Likely
-cause: `src/snapshot.rs` doesn't capture enough of the EL1 sysreg
-state (TTBR / ASID / TLB) to reconstitute the kernel's high-half map.
+`newt` is RDY (prio 10) but never scheduled. `idle` (prio 0) keeps
+the CPU. The `q=0x00000000/0x0c116ed8` link suggests `newt` is
+waiting on a kernel-side queue / port / semaphore that no one is
+posting to. Trace tail before quiesce shows the kernel cycling
+through `0x3ad6f4` / `0x3adb0c` (idle pause helpers) and
+`0x800a0c` (a REx loop) — find the queue / event the kernel is
+spinning on, and figure out who is supposed to post to it.
 
-Not a Phase B "stop" — the running boot doesn't depend on it — but
-the workflow does (rewinding via slot copies). When this becomes
-load-bearing, regenerate the snapshot save/load list against the
-current EL1-from-EL2 access surface.
+Once `newt` runs, `TScreenDriver::*` should follow on the
+display-init path, `peripherals/screen.rs::blit` will start firing,
+and `/tmp/newton-fb/` will populate.
 
-### Feed an input (next milestone)
+### Feed an input (after `newt` wakes)
 
 PLAN's stated goal is "drive forward until the boot quiesces in a
 steady-state idle that **responds to** whatever tablet / serial /
-network inputs we choose to feed it." Idle is reached; the response
-half is unclaimed. Tablet is the lightest-touch entry point —
-`peripherals/tablet.rs` already produces stylus-down/up events, and
-the kernel's `pckm` task is BLK on the tablet port. Wiring a synthetic
-tap should wake `newt` and exercise the dispatch path.
+network inputs we choose to feed it." Tablet is the lightest-touch
+entry point — `peripherals/tablet.rs` already produces stylus-down
+/ up events, and the kernel's `pckm` task is BLK on the tablet
+port. Wiring a synthetic tap should exercise the dispatch path
+once the scheduler is letting `newt` run.
 
 ## Resolved stop log (this session)
 

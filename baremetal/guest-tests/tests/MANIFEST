@@ -33,3 +33,4 @@ test_bio_bank
 test_alarm
 test_dma_irq
 test_gpio
+test_swp_rom_aperture

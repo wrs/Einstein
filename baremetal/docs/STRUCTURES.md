@@ -97,16 +97,32 @@ struct TTask /* : TKernelObject */ {           // total = 0x104 (260 B)
                                 //         (low nibble = type=3 for tasks)
     TKernelObject* next;        // +0x04   next-in-hash-chain in TObjectTable
     // ... (unknown +0x08..+0x6b)
-    ULong      flags;           // +0x6c   bit 0x02000000 = paged stack
-                                //         (FreeStack tests this)
-    // ...
-    ULong      stack_pages;     // +0x88   freed via FreePagedMem(pages-1)
-    void*      stack_base;      // +0x8c   freed via free() if not paged
+    ULong      flags;           // +0x6c   KernelObjectState bits — see
+                                //         TTaskQueue table below.
+                                //         bit 0x4000     = on a TUCTTable
+                                //         bit 0x20000    = on a TScheduler
+                                //                          run queue
+                                //         bit 0x100000   = on a TSemaphore
+                                //                          wait queue
+                                //         bit 0x02000000 = paged stack
     // ...
     Priority   priority;        // +0x80   used as run-queue bucket index
-    TTaskQItem run_queue_link;  // +0x94   embedded — 40 B
-                                //         +0x00 next_task_ptr
-                                //         +0x04 prev_task_ptr (probably)
+    ULong      stack_pages;     // +0x88   freed via FreePagedMem(pages-1)
+    void*      stack_base;      // +0x8c   freed via free() if not paged
+    TTaskContainer* container;  // +0x90   ptr to the queue container we're
+                                //         currently in (TScheduler / TSema /
+                                //         TUCTTable). Written by
+                                //         TTaskQueue::Add (`str r6, [r4, #36]!`
+                                //         after `str r0, [r4, #108]!` ⇒
+                                //         base=task+0x6c+0x24=task+0x90 —
+                                //         NOT task+0x24).
+    TTask*     q_next;          // +0x94   TTaskQueue.next link
+    TTask*     q_prev_or_queue; // +0x98   TTaskQueue.prev — points to either
+                                //         the previous task in the queue OR
+                                //         to the queue head (when this is
+                                //         the queue's only/first element)
+    // +0x9c          ULong  per-queue payload (TUCTTable stores held-id here:
+                                //         `str r4, [r5, #156]` at ROM 0x256330)
     void*      globals;         // +0xa0   per-task switched-globals ptr
                                 //         (STaskSwitchedGlobals lives below)
     // +0xa4..+0xa8 zeroed in ctor
@@ -667,6 +683,208 @@ The link-offset varies per use:
   embedded within the msg (offset TBD in TSharedMemMsg layout).
 - TPort waiters queue (+0x24): entries are `TSharedMemMsg*` as well.
 - TMonitor waiters queue (+0x24): entries TBD.
+
+## TTaskQueue (ROM `__ct__10TTaskQueueFv` at `0x359a74`)
+
+Two-pointer head/tail queue used by both the scheduler (per-priority
+run buckets at `gScheduler + 0x1c + prio*8`) and TSemaphore (the
+BlockOnZero / BlockOnInc wait queues at `sema+0x18` / `sema+0x20`).
+Tasks are linked by `task[+0x94]` (next) and `task[+0x98]` (prev or
+queue-back-pointer when head/tail).
+
+```c
+struct TTaskQueue {     // 8 bytes (mov r0, #8 in ctor)
+    TTask*  head;       // +0x00  first task in queue (or 0 if empty)
+    TTask*  tail;       // +0x04  last task in queue
+};
+```
+
+Add/Remove citations:
+
+`Add__10TTaskQueueFP5TTask17KernelObjectStateP14TTaskContainer` at
+ROM `0x359aac`:
+
+```
+str r0, [r1, #148]    ; task[+0x94] (next) = 0   ; CITES +0x94 next
+ldr r0, [r5]          ; queue.head
+teq r0, #0
+streq r4, [r5]        ; if empty, queue.head = task
+streq r5, [r4, #152]  ; task[+0x98] = queue
+ldrne r0, [r5, #4]    ; queue.tail
+strne r4, [r0, #148]  ; old_tail.next = task     ; CITES +0x94
+strne r0, [r4, #152]  ; task[+0x98] = old_tail   ; CITES +0x98 prev
+str r4, [r5, #4]!     ; queue.tail = task
+ldr r0, [r4, #108]    ; flags[+0x6c]
+orr r0, r0, r7        ; |= state
+str r0, [r4, #108]!   ; r4 ← task+0x6c
+str r6, [r4, #36]!    ; task[+0x6c+0x24] = task[+0x90] = container
+                       ; CITES +0x90 container (NOT +0x24)
+```
+
+**KernelObjectState bits passed as `r2` to `Add__10TTaskQueue`:**
+
+| bit          | symbol             | added by                                   |
+|--------------|--------------------|--------------------------------------------|
+| `0x4000`     | (TUCT)             | `TUCTTable::Add` (ROM 0x256300, r2=0x4000) |
+| `0x20000`    | (run queue)        | `TScheduler::Add` (ROM 0x1cc564, r2=0x20000) |
+| `0x100000`   | (TSemaphore wait)  | `TSemaphore::BlockOnInc/BlockOnZero` (ROM 0x1d4d98 / 0x1d5264, r2=0x100000) |
+
+These bits are stored in `task[+0x6c]` (flags). Reading
+`task[+0x6c]` tells you which queue mechanism currently owns the
+task. Cleared on the matching Remove path (`bic` in
+`Remove__10TTaskQueue` ROM 0x359b48 / `RemoveFromQueue` 0x359bcc).
+
+## TSemaphore (ROM `__ct__10TSemaphoreFv` at `0x1d5100`)
+
+The kernel's binary-or-counted-semaphore primitive. **Not a kernel
+object** (no ID, not in `gObjectTable`); allocated as a 40-byte
+internal struct, typically as the contents of a TSemaphoreGroup's
+sema array.
+
+```c
+struct TSemaphore {           // 40 bytes (mov r0, #40 at ROM 0x1d5114)
+    // +0x00 / +0x04   unused (zeroed via __nw_v)
+    // +0x08           unknown (zeroed)
+    // +0x0c           unknown (zeroed)
+    void*       vtable;       // +0x10  set to 0x0001ae40 by __ct__
+                               //        (the real vtable; 0x0001dbc4 is
+                               //        the early "init in progress" stub
+                               //        written first then overwritten)
+    Long        count;        // +0x14  current count value (signed; <0
+                               //        means waiters present in BlockOnInc)
+    TTaskQueue  block_zero;   // +0x18  8 B — tasks waiting for count==0
+    TTaskQueue  block_inc;    // +0x20  8 B — tasks waiting for count to inc
+};                             // total 0x28
+```
+
+Critical methods:
+
+- `BlockOnInc__10TSemaphoreFP5TTask8SemFlags` ROM `0x1d4d98`:
+  ```
+  tst r2, #1              ; SemFlags & 1 = "non-blocking" → return early
+  bl  UnScheduleTask      ; remove caller from run queue
+  add r0, r5, #32         ; r0 = sema + 0x20 = block_inc queue
+  mov r3, r5              ; container = sema
+  mov r2, #0x100000       ; state bit
+  b   Add__10TTaskQueue
+  ```
+- `WakeTasksOnInc__10TSemaphoreFv` ROM `0x1d4e18` walks `sema+0x20`,
+  calling `Remove__10TTaskQueue(state=0x100000)` and
+  `ScheduleTask` for each waiter, then `WantSchedule`.
+- `Remove__10TSemaphoreFP5TTask` ROM `0x1d5230` calls
+  `RemoveFromQueue` for whichever of the two queues the task is on.
+
+## TSemaphoreGroup (ROM `Init__15TSemaphoreGroupFUl` at `0x1d4e5c`)
+
+Kernel-side wrapper around an array of TSemaphores. Registered in
+`gObjectTable` as KernelType=7 ("SemG"). The TUSemaphoreGroup user
+wrapper adds a +0x00..+0x18 prefix; the kernel half lives at
+TUSemaphoreGroup+0x18 (verified by TUSemaphoreGroup::Init at ROM
+0x25a270 calling MakeObject which fills `this[0]` with the kernel id,
+plus TULockingSemaphore::Init at 0x25a504 calling
+TUSemaphoreGroup::Init on `this`).
+
+```c
+struct TSemaphoreGroup /* : TKernelObject */ {     // ~24 bytes
+    // +0x00 / +0x04   id, hash-chain next (TKernelObject base)
+    // +0x08           unknown (zeroed)
+    // +0x0c           unknown (zeroed)
+    TSemaphore*  sema_array;       // +0x10  malloc'd via __nw_v of
+                                   //        sizeof(TSemaphore)*count;
+                                   //        each slot ctor'd by __ct__
+                                   //        (ROM 0x1d4e84 / 0x1d4e88).
+    ULong        count;            // +0x14  number of semaphores
+                                   //        (ROM 0x1d4e9c stores r5)
+};
+```
+
+**Diagnostic implication:** to map a TSemaphore back to its owning
+group, walk every TSemaphoreGroup in `gObjectTable` and check
+whether the sema's address falls within `[arr_base, arr_base +
+40*count)` and is 40-byte aligned from `arr_base`. See
+`task_dump::find_semaphore_owner` for the reference walker.
+
+## TUSemaphoreGroup / TULockingSemaphore (user-mode wrappers)
+
+```c
+struct TUSemaphoreGroup {           // user-side wrapper
+    TObjectId    sem_group_id;      // +0x00  kernel id, set by
+                                    //        MakeObject(ObjectTypes=5)
+                                    //        at ROM 0x25a290.
+    // +0x04            unknown
+    void*        refcon;            // +0x08  opaque, set by SetRefCon
+                                    //        (TUSemaphoreGroup +0x08 in
+                                    //        TULockingSemaphore::Init).
+    // +0x0c..+0x17     unknown
+    // (TSemaphoreGroup kernel half lives at +0x18 in TULockingSemaphore;
+    //  TUSemaphoreGroup standalone is just the +0x00..+0x14 prefix.)
+};
+
+struct TULockingSemaphore : TUSemaphoreGroup {     // 40+ bytes
+    // inherits sem_group_id at +0x00, refcon at +0x08
+    ULong*       lock_state;        // +0x08 alias — `refcon` is
+                                    //        SET to lock_state by ctor.
+                                    //        Points to a 4-byte malloc'd
+                                    //        word (ROM 0x25a4dc malloc(4)).
+                                    //        Lock value: 0=free, otherwise
+                                    //        the holder's gCurrentTaskId.
+    // +0x18..       embedded TSemaphoreGroup (see above)
+};
+```
+
+`Acquire__18TULockingSemaphoreF8SemFlags` ROM `0x25a298`:
+
+```
+mov r4, r0                   ; r4 = this
+ldr r0, [r4, #8]             ; r0 = lock_state ptr
+ldr r1, [r9]                 ; r1 = gCurrentTaskId (= *0x0c101054)
+bl  Swap                     ; *r0 ↔ r1 ; r0 ← old(*r0) (atomic)
+teq r0, #0
+beq acquired                 ; if old == 0, lock was free
+mov r0, r4
+mov r1, r8                   ; r1 = gAcquireOps (0x0c104f14)
+mov r2, r5                   ; r2 = SemFlags arg
+bl  SemOp__16TUSemaphoreGroupFP17TUSemaphoreOpList8SemFlags
+                             ; → SVC 0xb (SemaphoreOpGlue ROM 0x3ae1fc)
+                             ; → kernel-side TSemaphoreGroup::SemOp
+                             ; → BlockOnInc on sema[0]
+beq retry                    ; loop back to outer Swap on wakeup
+```
+
+**Note:** TULockingSemaphore is **not** recursive. A second `Acquire`
+by the same task that already holds the lock will see
+`*lock_state == gCurrentTaskId` (non-zero), Swap puts the same id
+back, and Acquire blocks on `BlockOnInc` of a count that no one
+will increment (since the holder is itself the blocked task). This
+is a self-deadlock — any caller of `Acquire` must guarantee a
+matching `Release` on **all** exit paths, including the C++
+exception unwind chain. (See `INVESTIGATION.md` for a worked
+example: `MakeStoreObject`'s catch handler calls
+`TStoreWrapper::Abort` but **not** `UnlockStore`, so a Throw inside
+the locked region leaves the heap-store TULockingSemaphore held by
+the throwing task.)
+
+`Release__18TULockingSemaphoreFv` ROM `0x25a31c`:
+
+```
+ldr r0, [r0, #8]             ; lock_state ptr
+mov r1, #0
+bl  Swap                     ; old = swap(*lock_state, 0)
+ldr r1, [&gCurrentTaskId]
+teq r0, r1
+moveq r0, #0
+ldmdbeq fp, ... (return)     ; if old == self, simple release done
+mov r0, r4                   ; else need to wake waiters via SemOp inc
+mov r1, &gReleaseOps         ; (0x0c104f0c)
+mov r2, #1
+b   SemOp                    ; → BlockOnInc complement (count++)
+```
+
+`gAcquireOps` (TUSemaphoreOpList @ 0x0c104f14) and `gReleaseOps`
+(@ 0x0c104f0c) are statically initialised in
+`TULockingSemaphore::StaticInit` (ROM 0x25a480, called via
+`TUSemaphoreOpList::Init`). Acquire is `subtract 1` (block on
+count<0); Release is `add 1` (wake on count≥0).
 
 ## See also
 

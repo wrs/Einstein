@@ -66,33 +66,65 @@ either:
    `Remember` probe at `REMEMBER_STATIC_PC = 0x00258E0C` doesn't catch
    all entry points, the call could be invisible.
 
-### Three fix layers, increasing in scope
+### α-2 outcome (2026-04-27) — Einstein recovers the same DFSC=5 abort
 
-- **(α-1) Disasm-and-fix FMNewStack.** Read `0x001F8EAC` /
-  `Init__10TStackInfoFUlN51` (`0x001F6700`) and find what they do for
-  each section in the granted range. Compare against what our
-  hypervisor sees during the SWI #1 handler. If FMNewStack writes L1
-  entries via a path our hypervisor doesn't intercept correctly, that's
-  the bug.
-- **(α-2) Verify on Einstein with a custom NewtonProbe build** that
-  dumps L1[0xCC/0xCD/0xCE] at the moment NewStack returns for the
-  `caller_lr=0x001a4adc` call (TRefStructStack ctor). If Einstein's L1
-  at that exact moment is already coarse, the kernel does drive the
-  transition — and we just need to find what we're dropping. If
-  Einstein's L1 is also `0x90` at that moment and only becomes coarse on
-  some later access, it's a DAH-DFSC=5-handles-`0x90` path we haven't
-  seen yet (and our DAH bytewise matches Einstein, so something we
-  emulate must differ).
-- **(β) Hypervisor-side workaround.** When intercepting the NewStack
-  POST-SWI return, walk the granted range and for each section whose L1
-  entry is `0x90`, write a coarse L1 entry pointing at a fresh empty L2
-  table. Pragmatic and surgical, but papers over a kernel decision and
-  may interact badly with kernel bookkeeping that depends on L1
-  transitions happening through Remember-via-SWI.
+NewtonProbe with the matching ROM (saved as
+`/tmp/phaseB-l1cd-probe/einstein-30s-v2.log`) records 115 data aborts
+in 30 wall seconds. Abort **#16** is **PC=0x001A4B9C FAR=0x0CD07400
+FSR=0x00000045 mode=USR** — identical PC, FAR, DFSC=5, domain=4, and
+pre-abt mode to our hypervisor's fault #2. Einstein's kernel recovers
+and the boot continues; aborts #17–#63 land at later PCs/FARs (further
+into Fill, into other Fill-callers at PC `0x002DDF2C`, etc.).
 
-Recommendation: (α-2) first — cheaper than (α-1) and dispositive about
-which side owns the responsibility. (β) is a fallback if (α) turns out
-to require disturbing changes elsewhere.
+Implications:
+
+- **(α-1) refuted.** Real Newton's NewStack monitor handler does **not**
+  pre-allocate L1[0xCD]; the lazy `0x90` marker stays in place until
+  the first user-mode write triggers a DFSC=5 abort. There is no
+  section-mapping responsibility owned by FMNewStack to fix.
+- **(β) is the wrong shape too.** Real Newton's DAH-DFSC=5 path *does*
+  recover from L1=`0x90` lazy on its own; the kernel's existing logic
+  works. Synthesising a coarse L1 entry from the hypervisor would
+  paper over whatever we're actually breaking, not fix it.
+- **(γ) The wedge is in our hypervisor's DAH dispatch chain or the
+  kernel state it sees.** Our DAH reaches `FaultMonitorEntry__FUl` at
+  PC `0x001AF7BF4` (via the DFSC=5 jump table at `0x393314 →
+  0x39339c`), but `FaultMonitorEntry` returns non-zero, and the kernel
+  falls through to `RebootIfFaultWasInStack` at `0x393a14` which
+  reboots. On Einstein, `FaultMonitorEntry` returns 0 (takes the
+  success branch at `0x393988 beq 0x393a30`) for the same fault. Our
+  existing Fault(stackmgr) probe at `TStackManager::Fault` PC
+  `0x001F83E4` doesn't fire for fault #2 — consistent with
+  `FaultMonitorEntry` failing before dispatching into TStackManager.
+
+### Step 7 reframed — instrument FaultMonitorEntry, find diverging state
+
+Concrete next probes:
+
+- **HVC at FaultMonitorEntry entry** (PC `0x001AF7BF4`). Log `r0`
+  (input fault mask), the current-task pointer, and the relevant
+  TUDomainManager entries pointed to by `curr_task[+0x74/+0x78/+0x7c]`.
+- **HVC at FaultMonitorEntry return**. Log `r0` (the success/failure
+  result returned to DAH).
+
+Diff the entry/exit values against an Einstein NewtonProbe build that
+captures the same on its abort #16 of fault FAR=0x0cd07400. The diff
+narrows the search:
+
+- If the input fault mask `r0` in `FaultMonitorEntry` differs between
+  Einstein and us at fault #2 entry, DAH built the wrong fault bitmask
+  — the OR-chain reads bad values from TUDomainManager (so *those*
+  entries are corrupt).
+- If the input mask is the same but the return value differs,
+  `FaultMonitorEntry`'s internal state (the global monitor list, or
+  the per-domain bitmask resolution) is corrupt or different.
+- If everything matches but the kernel still falls through, the
+  divergence is downstream in the DAH path (RebootIfFaultWasInStack
+  decision, or some intervening read of CP15 state our hypervisor
+  emulates differently).
+
+35/35 guest tests still green; jj change `809444f0` records the prior
+Step 7a investigation update.
 
 35/35 guest tests still green; jj change `a2401a77` carries the QEMU
 mrs-staleness workaround and saved-slot diagnostics.

@@ -31,6 +31,16 @@ platform-fvp-base = []
 # and mutates the ROM in ways that invalidate existing snapshots.
 trace = []
 
+# First-touch variant of `trace`: each function logs its entry line
+# once per session. The trampolines still fire on every call (so the
+# targeted debug instrumentation in `tracer::log_trace_at` — putc
+# buffering, newt-tripwire poll, mode-13 SP_svc tracking, etc. — keeps
+# working), but the main `trace SEQ PC NAME (mode) r0..r3 lr=...` line
+# is gated on a per-function fired-bitmap. Use when you want to see
+# *which* functions execute without the loop-spam from re-entries.
+# Implies `trace`.
+trace_once = ["trace"]
+
 # Silence recurring diagnostic logs that dominate the console during
 # phase-B development (stage-1 XN re-walks on every MMU toggle, etc.).
 # Off by default; enable with `--features quiet` alongside `trace` to

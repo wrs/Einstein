@@ -170,6 +170,8 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
         dst_top, dst_left, dst_bottom, dst_right,
         copied);
 
+    crate::fb_dump::mark_dirty();
+
     ctx.x[0] = 0;
 }
 

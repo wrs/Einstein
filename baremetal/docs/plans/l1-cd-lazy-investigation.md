@@ -1,6 +1,29 @@
-# Phase B — Wedge reframed: NewStack #19 leaves TRefStructStack range as L1=0x90 lazy markers, DAH reboots on first touch
+# Phase B — RESOLVED: ARMv7 DFSR.Domain UNK on DFSC=5; hypervisor now overlays L1.domain into DFSR before forwarding to DAH
 
-## Status (2026-04-27)
+## Status (2026-04-27, RESOLVED)
+
+**The wedge is fixed.** Boot advances past FAR=0x0CD07400. Layer (γ)
+fix in tree: in `handle_diag`'s dabt-forward path, read the faulting
+VA's L1 entry, extract `bits[8:5]` (domain), and overlay into
+DFSR_EL1.bits[7:4]. Idempotent for valid-domain DFSCs (DFSC=7 already
+has correct domain there); for DFSC=5 it provides what ARMv7 leaves
+UNK per ARM ARM B4.1.51.
+
+The 717006 kernel was written for StrongARM where the equivalent CP15
+status register (`c5,c5,0`) always carried the L1 entry's domain
+regardless of fault status. Our `patch_cp15_encodings` rewrites
+`c5,c5,0` to `c5,c0,0` (= DFSR_EL1) at ROM-load time, but ARMv7 DFSR
+leaves Domain UNK on DFSC=0b00101 — zero on QEMU. Kernel computes
+`domain := 0`, `GetDomainAndFaultMonitorFromDomainNumber(0)` returns
+empty, `FaultMonitorEntry(r0=0)` returns -10015, kernel reboots.
+
+Boot now reaches a new Phase B trip-wire: unknown MMIO read at IPA
+`0x200001a0` from PC `0x002584A4`. Distinct investigation; this plan
+is closed.
+
+35/35 guest tests still green.
+
+## Earlier — Status (2026-04-27)
 
 **Step 8 done (without FVP). Step 7 ready to start in the right layer.**
 

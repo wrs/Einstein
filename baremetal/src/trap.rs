@@ -974,6 +974,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::DAH_FME_ENTRY_HVC_IMM => {
             handle_fme_entry_probe(ctx);
         }
+        v if v == crate::rom_patches::DAH_OR_CHAIN_HVC_IMM => {
+            handle_dah_or_chain_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -2450,27 +2453,84 @@ fn handle_dah_fme_ret_probe(_ctx: &mut TrapContext) {
 }
 
 /// Handler for the patched `mov ip, sp` at FaultMonitorEntry static
-/// entry PC `0x0011FC60`. Logs r0 (input fault mask), the FAR (so we
-/// can correlate against the dabt-forward log), and emulates the
-/// original `mov ip, sp` (writes ctx.x[12] = current SP for the source
-/// AArch32 mode).
+/// entry PC `0x0011FC60`. Logs r0 (input fault mask), the FAR, and
+/// emulates the original `mov ip, sp` (writes ctx.x[12] = current SP
+/// for the source AArch32 mode). Also reads `curr_task[+0x64]` (which
+/// was set just before this call to scratch[4] from
+/// GetDomainAndFaultMonitorFromDomainNumber) to test whether the
+/// return value difference is in scratch[0] only or both scratch[0]
+/// and scratch[4].
 fn handle_fme_entry_probe(ctx: &mut TrapContext) {
     let r0 = ctx.x[0] as u32;
     let far = read_sysreg!("far_el1") as u32;
     let spsr_el2 = read_sysreg!("spsr_el2") as u32;
     let src_mode = spsr_el2 & 0x1F;
     let sp_src = crate::banked::sp_for_mode(ctx, spsr_el2);
+    let curr_task = guest_mem::read_word_va(
+        crate::rom_patches::G_KERNEL_GLOBALS_VA,
+    ).unwrap_or(0);
+    let task_64 = if curr_task != 0 {
+        guest_mem::read_word_va(curr_task.wrapping_add(0x64)).unwrap_or(0)
+    } else { 0 };
+    let task_70 = if curr_task != 0 {
+        guest_mem::read_word_va(curr_task.wrapping_add(0x70)).unwrap_or(0)
+    } else { 0 };
+    let task_58 = if curr_task != 0 {
+        guest_mem::read_word_va(curr_task.wrapping_add(0x58)).unwrap_or(0)
+    } else { 0 };
     static FIRED: core::sync::atomic::AtomicU32 =
         core::sync::atomic::AtomicU32::new(0);
     let n = FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if n < 24 {
         kprintln!(
-            "FME-entry[{}]: r0(mask)={:#010x} far={:#010x} src_mode={:#x} sp={:#010x}",
-            n, r0, far, src_mode, sp_src,
+            "FME-entry[{}]: r0(mask)={:#010x} far={:#010x} src_mode={:#x} sp={:#010x} task[+0x70]={:#010x} task[+0x64]={:#010x} task[+0x58]={:#010x}",
+            n, r0, far, src_mode, sp_src, task_70, task_64, task_58,
         );
     }
     // Emulate `mov ip, sp`: ctx.x[12] = banked SP for source mode.
     ctx.x[12] = (ctx.x[12] & 0xFFFF_FFFF_0000_0000) | (sp_src as u64);
+}
+
+/// Handler for the patched `ldr r1, [pc, #1588]` at DAH PC `0x393318`
+/// (just before the OR-chain that builds the fault mask). Logs the
+/// curr_task pointer + its `[+0x74/+0x78/+0x7c]` TUDomainManager chain
+/// + each monitor's `[+0x10]`, then emulates the original ldr by
+/// writing the literal `0x0C100FF8` (gKernelGlobals VA) into
+/// `ctx.x[1]`. ERET resumes at `0x39331c` (kernel's `ldr r1, [r1]`).
+fn handle_dah_or_chain_probe(ctx: &mut TrapContext) {
+    let far = read_sysreg!("far_el1") as u32;
+    let g_kernel_globals_va = crate::rom_patches::G_KERNEL_GLOBALS_VA;
+    let curr_task = guest_mem::read_word_va(g_kernel_globals_va).unwrap_or(0);
+    let m74 = if curr_task != 0 {
+        guest_mem::read_word_va(curr_task.wrapping_add(0x74)).unwrap_or(0)
+    } else { 0 };
+    let m78 = if curr_task != 0 {
+        guest_mem::read_word_va(curr_task.wrapping_add(0x78)).unwrap_or(0)
+    } else { 0 };
+    let m7c = if curr_task != 0 {
+        guest_mem::read_word_va(curr_task.wrapping_add(0x7c)).unwrap_or(0)
+    } else { 0 };
+    let m74_10 = if m74 != 0 {
+        guest_mem::read_word_va(m74.wrapping_add(0x10)).unwrap_or(0)
+    } else { 0 };
+    let m78_10 = if m78 != 0 {
+        guest_mem::read_word_va(m78.wrapping_add(0x10)).unwrap_or(0)
+    } else { 0 };
+    let m7c_10 = if m7c != 0 {
+        guest_mem::read_word_va(m7c.wrapping_add(0x10)).unwrap_or(0)
+    } else { 0 };
+    static FIRED: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+    let n = FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if n < 24 {
+        kprintln!(
+            "DAH-OR[{}]: far={:#010x} curr_task={:#010x} m74={:#010x}->{:#010x} m78={:#010x}->{:#010x} m7c={:#010x}->{:#010x}",
+            n, far, curr_task, m74, m74_10, m78, m78_10, m7c, m7c_10,
+        );
+    }
+    // Emulate `ldr r1, [pc, #1588]`: r1 = literal at (pc + 8 + 1588) =
+    // 0x393954 = 0x0C100FF8. Write low 32 bits of ctx.x[1].
+    ctx.x[1] = (ctx.x[1] & 0xFFFF_FFFF_0000_0000) | (g_kernel_globals_va as u64);
 }
 
 fn dump_flash_bytes(ipa: u32, count: u32) {
@@ -2567,6 +2627,49 @@ fn handle_diag(ctx: &mut TrapContext) {
         let dfsc = (esr_el1 & 0x3F) as u32;
         let forwardable = matches!(dfsc, 0x03 | 0x05 | 0x06 | 0x07 | 0x0D | 0x0F);
         if forwardable {
+            // ARMv7 leaves DFSR.Domain UNK for DFSC=5 (translation,
+            // section) — see ARMv7 ARM B4.1.51. The 717006 kernel was
+            // written for StrongARM, where the equivalent register
+            // (CP15 c5,c5,0) always carried the L1 entry's domain
+            // regardless of fault status. Our hypervisor rewrites
+            // the kernel's `mrc c5,c5,0` to `mrc c5,c0,0` (= DFSR_EL1)
+            // at ROM-load time (see guest_mem::patch_cp15_encodings),
+            // so the kernel's later DAH read picks up whatever ARMv7
+            // hardware put in DFSR.Domain — which is 0 for DFSC=5.
+            // The kernel then computes domain := 0 and asks
+            // `GetDomainAndFaultMonitorFromDomainNumber(0)`, which has
+            // no monitor → returns scratch[0]=0 →
+            // `FaultMonitorEntry(r0=0)` → -10015 → reboot.
+            // Empirical wedge: qemu13.log fault #2 shows
+            // task[+0x58]=0x05 (DFSR=0x05, domain=0) where every other
+            // recovered abort had task[+0x58]=0x47 (DFSR=0x47,
+            // domain=4).
+            //
+            // Fix: synthesise the StrongARM-style domain field by
+            // reading the L1 entry for the FAR's section and writing
+            // its bits[8:5] into DFSR_EL1.bits[7:4]. Idempotent for
+            // valid-domain DFSCs (the bits already match).
+            if dfsc == 0x05 || dfsc == 0x07 || dfsc == 0x0D || dfsc == 0x0F {
+                let l1_pa = 0x0400_0000u32 + ((far as u32) >> 20) * 4;
+                let l1 = guest_mem::read_word_pa(l1_pa).unwrap_or(0);
+                let l1_domain = (l1 >> 5) & 0xF;
+                let mut dfsr_el1: u64;
+                // SAFETY: sysreg read of DFSR_EL1 (= ESR_EL1's AArch32
+                // alias for data aborts when EL1 is AArch32). On
+                // Cortex-A53 in our config, DFSR_EL1 == ESR_EL1 for
+                // AArch32 EL1 abort entries, so update both via
+                // ESR_EL1.
+                unsafe {
+                    core::arch::asm!("mrs {}, esr_el1", out(reg) dfsr_el1,
+                        options(nomem, nostack, preserves_flags));
+                }
+                dfsr_el1 = (dfsr_el1 & !(0xF << 4)) | ((l1_domain as u64) << 4);
+                unsafe {
+                    core::arch::asm!("msr esr_el1, {}", in(reg) dfsr_el1,
+                        options(nostack, preserves_flags));
+                    core::arch::asm!("isb", options(nostack, preserves_flags));
+                }
+            }
             log_dabt_forward(dfsc, far as u32, hvc_src_mode, ctx);
             // One-shot diagnostic: when the recursive-abort "newt" DABT
             // fires (FAR=0x6e657774, mode=ABT), dump the SWIBoot save

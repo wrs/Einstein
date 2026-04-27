@@ -4,22 +4,76 @@ Live notes for the next iteration. Replace this file's body when the
 current stop is fixed and a new one takes over — git history is the
 archive of past investigations.
 
-## Stop: NULL-pointer write at REx 0x95c444 (2026-04-27)
+## No active stop. Steady-state idle reached (2026-04-27).
+
+A 90 s cold boot with `cargo run --release` (default features, no
+`trace*`) reaches the idle pause loop and stays there cleanly. The
+last stop — `Swap(NULL, 1)` at ROM `0x3ae204` — was resolved by
+mirroring Einstein's `TMemory::WriteP` silent-drop for the ROM
+aperture; see the resolved-stops table in `PLAN.md`.
+
+## Pending follow-ups
+
+### Snapshot-resume divergence (background)
+
+Cold boot is fine, but resuming from a saved slot drops the kernel's
+stage-1 mapping for VAs in `0x0c000000+` (kernel globals like
+`gWantDeferred = 0x0c100e58`). The first post-resume access then
+halts with `unknown MMIO read` at `IPA = 0x0c100xxx` — the IPA we
+report is the VA itself because the stage-1 walk didn't remap. Likely
+cause: `src/snapshot.rs` doesn't capture enough of the EL1 sysreg
+state (TTBR / ASID / TLB) to reconstitute the kernel's high-half map.
+
+Not a Phase B "stop" — the running boot doesn't depend on it — but
+the workflow does (rewinding via slot copies). When this becomes
+load-bearing, regenerate the snapshot save/load list against the
+current EL1-from-EL2 access surface.
+
+### Feed an input (next milestone)
+
+PLAN's stated goal is "drive forward until the boot quiesces in a
+steady-state idle that **responds to** whatever tablet / serial /
+network inputs we choose to feed it." Idle is reached; the response
+half is unclaimed. Tablet is the lightest-touch entry point —
+`peripherals/tablet.rs` already produces stylus-down/up events, and
+the kernel's `pckm` task is BLK on the tablet port. Wiring a synthetic
+tap should wake `newt` and exercise the dispatch path.
+
+## Resolved stop log (this session)
+
+### `Swap(NULL, 1)` ⇒ stage-2 perm fault on ROM-aperture write (2026-04-27)
+
+Symptom — cold boot halted with:
 
 ```
 *** data abort ISV=0 at ELR=0x95c444 SPSR=0x20000110
     IPA=0 FAR=0 iss=0x4e
-    SCTLR_EL1 (guest) M-bit = 1 (stage-1 ON)
 ```
 
-`iss=0x4e` ⇒ `WnR=1`, `DFSC=0x0e` (stage-2 permission fault, level 2).
-`FnV` clear → `FAR=0` is valid; the guest dereferenced VA=0. Stage-1
-identity-maps VA 0 → IPA 0 via `L1[0]` coarse @ PA 0x400; stage-2 has
-IPA 0..0x1000000 RO (the ROM aperture) — hence the permission fault on
-the write.
+`iss=0x4e` ⇒ `WnR=1`, `DFSC=0xe` (stage-2 permission fault, level 2),
+guest VA = 0.
 
-`ELR=0x95c444` is in **Einstein.rex** (REx base 0x00800000,
-REx-offset 0x15c444). Trace tail (`trace_once,quiet`):
+The misleading initial read of the trace tail was that PC `0x95c444`
+looked like an Einstein.rex offset (REx base `0x00800000`,
+offset `0x15c444`). REx is only 0x46c50 bytes, so that offset is well
+past the loaded image. The actual answer:
+
+`0x95c444` lives inside the **tracer trampoline pool**
+(`0x00900000..0x00E00000`, `src/tracer.rs`). The pool is a flat array
+of 5-word slots; `0x95c444 - 0x900000 = 0x5c444 = 18 896 × 20 + 4`,
+so the PC is at `slot[1]` (offset +4) of slot index 18 896. Slot
+index 18 896 of `scripts/classify-out/code-symbols.txt` resolves to
+function **`Swap`** at ROM `0x003ae204`, whose body is one instruction:
+
+```
+003ae204 <Swap>:
+  3ae204:  e1000091   swp r0, r1, [r0]
+```
+
+`Swap` is the kernel's atomic-exchange primitive. It's reached via
+`Acquire(TULockingSemaphore*, SemFlags)` (ROM `0x1bce754` →
+`0x55b1c`'s `TCardSocket::VccOff` etc.). The trace tail before the
+abort:
 
 ```
 trace 4147559 0x00050d18 VccOff(int)              (usr) ...
@@ -27,62 +81,55 @@ trace 4147560 0x00050d28 VccOff(int, unsigned long) (usr) ...
 *** data abort ISV=0 at ELR=0x95c444 ...
 ```
 
-`VccOff` is a PCMCIA `TCardSocket` method, so the failing write
-originates somewhere in the REx-resident PCMCIA driver path — most
-likely Einstein REx code that populates / probes a `TCardSocket`
-field assumed non-NULL but left blank in our setup.
+— bare-function `VccOff__Fi`/`VccOff__FiUl` (NOT
+`TCardSocket::VccOff`). Inside `VccOff__FiUl` (ROM `0x50d28` —
+disassembled in `scripts/disasm-out/rom.dis`) is a chain that
+indexes `gPowerSemaphore[arg0]` (`g 0x0c105f54`) and passes it to
+`Acquire`. On the failing path that table entry is NULL, so
+`Acquire(NULL)` reaches `Swap` with `r0 = 0`. The SWP then tries to
+write to VA = 0; stage-1 identity-maps to IPA = 0; stage-2 has the
+ROM aperture mapped RO, so we take a stage-2 perm fault.
 
-## Why we halt
+Einstein oracle — `Emulator/TMemory.cpp:1755-1766`:
 
-`try_emulate_isv0_dabt` (`src/trap.rs:542`) only emulates word
-`LDR/STR` immediate (B=0, P/U/W/L decoded; Rn≠15, Rt≠15). The faulting
-instruction at `0x95c444` doesn't match — it's likely a byte/halfword
-store, an LDM/STM, or a pre/post-indexed-with-writeback variant — so
-the emulator returns `false` and we drop into the loud-halt path at
-`src/trap.rs:462`.
+```cpp
+TMemory::WriteP(PAddr inAddress, KUInt32 inWord) {
+    if (inAddress < TMemoryConsts::kRAMStart) {
+        if (inAddress < TMemoryConsts::kHighROMEnd) {
+            if (mLog) mLog->FLogLine(
+                "Ignored write word access to ROM at P0x%.8X (%.8X)",
+                ...);
+            // FALL THROUGH — no fault, no write.
+        }
+        ...
+    }
+}
+```
 
-## Things we don't know yet
+Writes to anywhere `< kHighROMEnd` (0x01000000) are silently dropped.
+For SWP the read-side still runs (`TJITGeneric_SingleDataSwap_template.h`
+calls `Read` then `Write`), so `r0` ends up with `ROM[0]` (the reset
+vector word `0xea0061a0`) and the kernel's spin-loop sees a non-zero
+value.
 
-- **The instruction at `0x95c444`.** `scripts/disasm-out/rom.dis` only
-  covers base ROM (≤ `0x71fc4c`); REx is missing. Cheapest path:
-  `objdump -b binary -m armv5t -D --adjust-vma=0x800000` over the
-  embedded `_Data_/Einstein.rex`.
-- **Which register was 0.** The current halt path doesn't dump the
-  AArch32 register file for ISV=0 aborts that fall through to halt.
-  Either widen the abort-time dump or set a `bp 0x95c444` breakpoint
-  via `scripts/gdb-init` and inspect `ctx.x[]` from gdb.
-- **Whether Einstein's TCardSocket model populates state we leave
-  blank.** The Newton's PCMCIA driver code in REx is shared with
-  Einstein, so whatever non-NULL state the code expects has to come
-  from somewhere. Check `Emulator/Newt/Driver/*` and
-  `Emulator/Network/*` for TCardSocket initialisation paths.
+Fix — `src/trap.rs::try_absorb_rom_write` (called from the ISV=0 arm
+of `handle_data_abort`):
 
-## Suggested order of attack
+- Bail unless the IPA is in the ROM aperture (`< 0x01000000`).
+- Read the faulting instruction at ELR (via stage-1 if up, else PA-
+  direct so the path works for the early-boot / guest-test case).
+- For SWP/SWPB (`(insn & 0x0FB0_0FF0) == 0x0100_0090`): set Rd to
+  `ROM[ipa]` (word or byte), drop the store, advance ELR.
+- Anything else falls through to the loud halt — the absorber is
+  intentionally narrow so the next novel write to ROM stays loud.
 
-1. **Find the instruction.** Disassemble REx at offset `0x15c444` and
-   the surrounding ~32 bytes. Identify what's being written and via
-   which base register.
-2. **Identify the NULL.** Either widen the ISV=0 halt-path dump to
-   print `r0..r12 + sp_<mode> + lr_<mode>` (mirror the
-   `is_obviously_unreachable_ipa` dump in `trap.rs:472`) or use `bp`.
-   Trace the NULL back to the field it came from.
-3. **Cross-check Einstein.** Run the same offset under
-   `build/NewtonProbe` (or step Einstein) and confirm whether the
-   same call writes to a non-NULL pointer. If yes — Einstein populates
-   something we don't; replicate. If no — the failure is structural
-   in this code path and we deliver the abort to the guest's DABT
-   vector instead of halting (the kernel's `UnhandledException` then
-   runs and we see what the guest does about it).
-4. **Apply the fix in the right layer.** Hypervisor handler /
-   peripheral state / abort delivery — see PLAN.md "Workflow per
-   stop" for the decision tree.
+Verification:
 
-## Related context that's still live
-
-- `src/peripherals/pcmcia.rs` halts loudly on every PCMCIA-class MMIO
-  surface it doesn't recognise, by design. That's a deliberate
-  trip-wire from Phase A — extend rather than silence.
-- The `unknown bank #5` mmio arm (`src/mmio.rs`,
-  `0x20000000..0x30000000` silent-zero) covers reads / writes
-  *inside* PCMCIA bank 5; the current fault is a write to IPA=0 (ROM
-  aperture), not bank 5, so that arm doesn't apply.
+- 90 s cold boot reaches steady-state idle (no halts; `idle` task
+  RUN, `newt` task RDY, beacons cycle through ELR=`0x800a0c` /
+  `0x3adb0c` / `0x3ad6f4`).
+- All 36 guest tests pass (`baremetal/guest-tests/scripts/run-all.sh`).
+- New regression test `guest-tests/tests/test_swp_rom_aperture.S`
+  exercises word SWP, the kernel's exact `swp r0, r1, [r0]` alias
+  pattern (encoded as `.word 0xe1000091` because gas rejects
+  `Rn==Rd`), byte SWPB, and a non-zero ROM-aperture address.

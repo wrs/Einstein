@@ -169,63 +169,36 @@ inputs we choose to feed it.
 
 ### Test suites
 
-- `baremetal/guest-tests/scripts/run-all.sh` runs the 35 guest tests
+- `baremetal/guest-tests/scripts/run-all.sh` runs the 36 guest tests
   on QEMU; `--platform fvp` runs the same suite on the FVP. Both
   must stay green. See "Verification" near the end of this file.
 
-## Current stop — NULL-pointer write at REx 0x95c444 (2026-04-27)
+## Current stop — none. Steady-state idle reached.
 
-```
-*** data abort ISV=0 at ELR=0x95c444 SPSR=0x20000110
-    IPA=0 FAR=0 iss=0x4e
-    SCTLR_EL1 (guest) M-bit = 1 (stage-1 ON)
-```
+A 90 s cold boot now reaches the idle pause loop and stays there with no
+halts: the `idle` task is the running task, `newt` is RDY, beacons cycle
+through `ELR=0x800a0c` / `0x3adb0c` / `0x3ad6f4` (REx + base-ROM idle
+slots), and the snapshot ring rolls cleanly.
 
-Decoded: `iss=0x4e` ⇒ `WnR=1` (write), `DFSC=0x0e` (stage-2 permission
-fault, level 2). `FnV` clear so `FAR=0` is valid → guest accessed
-VA = 0. Stage-1 maps VA 0 → IPA 0 (kernel `L1[0]` is the small-page
-coarse table at PA 0x400, identity-mapping the first 1 MiB); stage-2
-has IPA 0..0x1000000 mapped read-only as the ROM aperture, hence the
-permission fault on the write.
+Next stops on the roadmap, in roughly the order we expect to hit them:
 
-`ELR=0x95c444` lands in **Einstein.rex** (REx base 0x00800000, REx
-offset 0x15c444). The trace tail just before the abort:
-
-```
-trace 4147559 0x00050d18 VccOff(int)              (usr) ...
-trace 4147560 0x00050d28 VccOff(int, unsigned long) (usr) ...
-*** data abort ISV=0 at ELR=0x95c444 ...
-```
-
-`VccOff` is a PCMCIA `TCardSocket` method, so the failing write
-originates somewhere in the REx-resident PCMCIA driver path. The
-faulting instruction wasn't a plain word `LDR`/`STR` immediate, so
-`try_emulate_isv0_dabt` (`src/trap.rs:542`) declined to handle it and
-dropped to the loud halt at `src/trap.rs:462`.
-
-Next steps:
-
-- Disassemble REx around `0x95c444` to identify the instruction shape
-  (likely byte/halfword store, LDM/STM, or pre/post-indexed with
-  writeback) and whatever pointer chain produced VA=0. The disasm
-  toolchain currently only covers base ROM (up to `0x71fc4c`); extend
-  it to cover REx, or use `objdump` directly on the REx region we
-  embed.
-- Cross-check against Einstein: does `TCardSocket::VccOff` legitimately
-  hit a NULL state field on this code path in Einstein, or does
-  Einstein's PCMCIA model populate something we leave blank? Most
-  likely the latter — we currently halt loudly on every PCMCIA-class
-  surface in `src/peripherals/pcmcia.rs`.
-- Decide whether to (a) extend `try_emulate_isv0_dabt` to cover the
-  faulting instruction shape and let `mmio::write` drop it like a
-  legitimate MMIO write, (b) populate the PCMCIA state the driver
-  expects to be non-NULL, or (c) deliver the abort to the guest's
-  DABT vector and let the kernel's `UnhandledException` path run.
+- **Feed inputs.** PLAN's "responds to whatever tablet / serial /
+  network inputs we choose to feed it" goal is the next milestone.
+  Tablet is the leading candidate — `peripherals/tablet.rs` already
+  produces stylus events. Wire something that actually delivers an
+  event into the live boot and watch what happens when `newt` wakes.
+- **Snapshot resume divergence.** Resuming from a saved slot currently
+  drops the kernel's `0x0c000000+` stage-1 remap of kernel globals (e.g.
+  `gWantDeferred`@`0x0c100e58`), so the first post-resume access halts
+  with `IPA=0x0c100xxx` "outside known windows". Cold boot is fine; the
+  bug is in what the snapshot captures (or fails to capture) of the
+  guest's TTBR / ASID / TLB state.
 
 ## Resolved stops (newest first)
 
 | Date | Wedge | Resolution |
 |------|-------|------------|
+| 2026-04-27 | NULL-pointer SWP via `Swap(0,1)` at ROM `0x3ae204` (kernel `Acquire(NULL)` glue inside `VccOff__FiUl`) — stage-2 perm fault on write to ROM aperture, ISV=0 | trap.rs `try_absorb_rom_write`: mirror Einstein `TMemory::WriteP` (TMemory.cpp:1755-1766), drop the store; for SWP/SWPB also run the load piece into Rd. Boot reached steady-state idle. Test: `guest-tests/tests/test_swp_rom_aperture.S`. |
 | 2026-04-27 | TEncodingMap.+16 = 0x20000110 (out-of-stage-2 IPA) at `ConvertToUnicodeFunc_Contiguous8` | mmio.rs: `0x20000000..0x30000000` "unknown bank #5" silent-zero matching Einstein's `TMemory::ReadP` (TMemory.cpp:1026-1034). Boot advanced 10× → reaches TInterpreter. |
 | 2026-04-27 | `Reboot` canary inside `TInterpreter::TInterpreter` — DFSC=5 at FAR=0x0cd07400 on lazy-L1 section grow during `TRefStructStack::Fill` (L1[0xCD]=0x90 lazy marker) | γ-fix in `handle_diag`: read L1.domain from the faulting VA's L1 entry and write it into DFSR_EL1.bits[7:4] before forwarding to DAH (ARMv7 leaves Domain UNK on DFSC=5; kernel was reading 0). |
 | 2026-04-26 | BootOS canary entry #2 (R0=0x0cc80c80) — `name`-task stack-overrun corrupts neighbour task on shared PA | 3-instruction ROM patch in `TStackManager::ResolveFault` (mask=0xF) forces per-page stack allocation. |
@@ -251,7 +224,8 @@ See `INVESTIGATION.md` for the full chain of analysis on each.
   `handle_fp_simd` → CP10/11; two-stage `handle_diag` /
   `handle_diag_lr` DABT-intercept stub; `handle_data_abort` with
   kernel-DABT forwarding for lazy stack growth; `try_emulate_isv0_dabt`
-  for ISV=0 word LDR/STR.
+  for ISV=0 word LDR/STR; `try_absorb_rom_write` mirroring Einstein's
+  silent-drop of writes to the ROM aperture (SWP/SWPB load piece runs).
 - `src/guest.rs` — HCR_EL2 (TVM, TIDCP, TSW, IMO, FMO, AMO);
   CPTR_EL2.TFP for CP10/11; DC bit toggling across stage-1 on/off.
 - `src/stage2.rs` — stage-2 L1/L2/L3. 2 MiB blocks for ROM/RAM/flash/FB;
@@ -283,7 +257,7 @@ See `INVESTIGATION.md` for the full chain of analysis on each.
 - `src/tarmac.rs` — Tarmac-like instruction-trace markers.
 - `src/unaligned.rs` — `handle_align_fault` emulator for SCTLR.A=1
   unaligned LDR/STR aborts.
-- `guest-tests/tests/` — 35 tests; `guest-tests/scripts/run-test.sh`
+- `guest-tests/tests/` — 36 tests; `guest-tests/scripts/run-test.sh`
   clears snapshots before each run.
 
 ## Verification
@@ -294,7 +268,7 @@ Each commit:
 baremetal/guest-tests/scripts/run-all.sh
 ```
 
-All 35 tests pass at the current commit.
+All 36 tests pass at the current commit.
 
 ## Non-goals
 

@@ -448,6 +448,17 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
             advance_elr(4);
             return;
         }
+        // Mirror Einstein's `TMemory::WriteP` (Emulator/TMemory.cpp:1755-
+        // 1766): writes to anywhere `< kHighROMEnd` (0x01000000) are
+        // silently dropped, no fault raised. The Newton kernel's PCMCIA
+        // path ends up calling `Swap(0, 1)` (atomic SWP via `Acquire`'s
+        // semaphore-acquire helper) when `gPowerSemaphore[idx]` is NULL,
+        // so the SWP loads ROM[0] and the kernel spins on a non-zero
+        // value — matching that behaviour keeps the boot walking.
+        if wnr && try_absorb_rom_write(ctx, ipa, elr) {
+            advance_elr(4);
+            return;
+        }
         let spsr = read_sysreg!("spsr_el2");
         let sctlr_el1 = read_sysreg!("sctlr_el1");
         kprintln!(
@@ -588,6 +599,63 @@ fn try_emulate_isv0_dabt(ctx: &mut TrapContext, ipa: u64, wnr: bool, elr: u32) -
         ctx.x[rn] = post_rn as u64;
     }
     true
+}
+
+/// Mirror Einstein's `TMemory::WriteP` (Emulator/TMemory.cpp:1755-1766)
+/// for stage-2 permission faults that target the ROM aperture
+/// (`IPA < kHighROMEnd = 0x01000000`). Einstein logs and drops every
+/// such write without raising a fault; we map ROM RO at stage-2 so the
+/// same writes surface as ISV=0 stage-2 perm faults (no decodable
+/// syndrome — SWP, LDM/STM with a base in ROM, etc.).
+///
+/// For atomic `SWP/SWPB` we still have to run the load piece — the
+/// Newton kernel's lock-acquire glue calls `Swap(addr, val)` with
+/// `addr = gPowerSemaphore[idx]`, which is NULL on a fresh PCMCIA path,
+/// and spins on the loaded value. The load returns `ROM[ipa]` (here
+/// `ROM[0]` = the reset vector), the store is dropped.
+///
+/// Returns `true` if the instruction shape was recognised and the write
+/// has been absorbed; the caller advances ELR. Returns `false` for
+/// anything we don't recognise so the loud halt path stays the trip-
+/// wire for novel cases (pre/post-indexed STR with writeback, LDM/STM,
+/// inline-stub byte/halfword stores, …).
+fn try_absorb_rom_write(ctx: &mut TrapContext, ipa: u64, elr: u32) -> bool {
+    if ipa >= 0x0100_0000 {
+        return false;
+    }
+    // Stage-1 off (pre-MMU and the guest-test runtime) makes
+    // `read_word_va` return None — fall back to a PA-direct read,
+    // matching the architectural rule that VA == IPA == PA when the
+    // MMU is disabled.
+    let insn = match guest_mem::read_word_va(elr).or_else(|| guest_mem::read_word_pa(elr)) {
+        Some(v) => v,
+        None => return false,
+    };
+    // SWP / SWPB (A1):  cond 00010 B 00 Rn Rd SBZ 1001 Rm
+    // Mask leaves cond, B (bit 22), Rn, Rd, Rm free; fixes everything
+    // else. Rd holds the loaded data on completion; Rm holds the value
+    // to write (which we drop). Rn holds the address.
+    if (insn & 0x0FB0_0FF0) == 0x0100_0090 {
+        let b = ((insn >> 22) & 1) != 0;
+        let rn = ((insn >> 16) & 0xF) as usize;
+        let rd = ((insn >> 12) & 0xF) as usize;
+        if rn == 15 || rd == 15 {
+            return false;
+        }
+        let pa = ipa as u32;
+        let value = if b {
+            guest_mem::read_byte_pa(pa).unwrap_or(0) as u32
+        } else {
+            // Plain SWP zero-extends bits[31:0] of the loaded word into
+            // Rd; `read_word_pa` already returns a u32 in the guest's
+            // little-endian view (matches the BE→LE byteswap done at
+            // ROM load time).
+            guest_mem::read_word_pa(pa).unwrap_or(0)
+        };
+        ctx.x[rd] = value as u64;
+        return true;
+    }
+    false
 }
 
 /// IPA ranges that the stage-2 map intentionally leaves as fault /

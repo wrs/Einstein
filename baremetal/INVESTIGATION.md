@@ -2,7 +2,210 @@
 
 Live notes. Update as we learn more. REMOVE old updates once resolved.
 
-## In progress — Remember/AllocPT probes: wedge is FILL-into-0xCD from SVC, not lazy-grow failure (QEMU, 2026-04-26 evening +)
+## In progress — Fill+NewStack probes pin wedge to TInterpreter ctor's TRefStructStack #2 (QEMU, 2026-04-26 late night)
+
+**Plan reference:** `docs/plans/l1-cd-lazy-investigation.md` Steps 1–3 landed.
+
+Two new probes installed by `apply_l1_cd_probes` in `src/rom_patches.rs`:
+
+- HVC #0x49 at `Fill__15TRefStructStackFv` entry (`0x001A4B54`, original
+  `stmfd sp!, {lr}` = `0xE92D4000`) — logs `this`, source-mode caller
+  LR, source mode bits. Reachable from both handle_hvc and handle_und.
+  Emulates the original `stmfd sp!, {lr}` (push LR onto source-mode
+  stack, advance source-mode SP) so Fill continues correctly.
+- HVC #0x4A at `NewStack` post-SWI (`0x001F89A8`, original
+  `ldr r1, [sp, #16]` = `0xE59D1010`) — fires only on the success branch
+  (the preceding `bne 0x1f89b8` skips it on SWI failure). Reads the SWI
+  param block from source-mode SP — `[sp+0]=env, [sp+8]=req_size,
+  [sp+16]=out_top, [sp+20]=out_base` — and logs them along with the
+  real caller PC pulled from `[fp-4]` (the bl-saved LR; `lr_for_mode`
+  alone returns NewStack's own clobbered LR after `bl MonitorDispatchSWI`).
+  Emulates `ldr r1, [sp, #16]` so r1 := out_top for the next `str r1, [r4]`.
+
+Step 2 also extends `handle_reboot` with a ring buffer of recent
+NewStack outputs and the most recent Fill `this` pointer, then dumps
+the live `TRefStructStack` object's first six words at the wedge so we
+can pin `(TRefStack cursor, base; TRefStructStack base, cursor)` exactly.
+
+### What the new probes show
+
+```
+NewStack ring (last 8, IDs are seq):
+  # 14  caller_lr=0x00252390  env=0x1355  req=0x08400  base=0x0c321800  top=0x0c329000  span=0x07800
+  # 15  caller_lr=0x00252390  env=0x13a5  req=0x08400  base=0x0ccde000  top=0x0cce5800  span=0x07800
+  # 16  caller_lr=0x00252390  env=0x13a5  req=0x08400  base=0x0cce6400  top=0x0ccedc00  span=0x07800
+  # 17  caller_lr=0x00252390  env=0x13a5  req=0x08400  base=0x0cc7b000  top=0x0cc82800  span=0x07800
+  # 18  caller_lr=0x001a4948  env=0x13a5  req=0x10c00  base=0x0ccee800  top=0x0cd06800  span=0x18000  ← TRefStack
+  # 19  caller_lr=0x001a4adc  env=0x13a5  req=0x10c00  base=0x0cd07400  top=0x0cd1f400  span=0x18000  ← TRefStructStack (the wedge stack)
+  # 20  caller_lr=0x001a4948  env=0x13a5  req=0x10c00  base=0x0cd20000  top=0x0cd38000  span=0x18000
+  # 21  caller_lr=0x001a4adc  env=0x13a5  req=0x10c00  base=0x0cd38c00  top=0x0cd50c00  span=0x18000
+
+Fill probe ENTER: this=0x0c6451c0 caller_lr=0x001a4754 src_mode=0x10 (USR) sp=0x0cc82664
+TRefStructStack object @ 0x0c6451c0:
+  this->[+ 0] = 0x0ccee818   ; TRefStack cursor (= base + 0x18 = 6 entries pushed)
+  this->[+ 4] = 0x0ccee800   ; TRefStack base
+  this->[+ 8] = 0x0cceec98   ; TRefStack page-bound (= base + 0x498)
+  this->[+12] = 0x0000012c   ; entries-per-page constant (300)
+  this->[+16] = 0x0cd07400   ; TRefStructStack base
+  this->[+20] = 0x0cd07400   ; TRefStructStack cursor (initial = base)
+derived: TRefStack pushed = 0x18, Fill loop bound = TRefStruct base + pushed = 0x0cd07418
+```
+
+### Mechanism, no remaining ambiguity
+
+The **TRefStructStack ctor** at `0x1a4a78` calls `NewStack(env, 0x10000)`
+**twice**: once via the inherited TRefStack ctor at `0x1a48e4` (returning
+to `0x1a4948`), once for itself (returning to `0x1a4adc`). Each time
+the kernel grants a 96 KiB span (`req=0x10c00 → span=0x18000`) — the
+small earlier stacks were 30 KiB each, but the four right before the
+wedge are all 96 KiB.
+
+`__ct__15TRefStructStackFv` stashes the second `NewStack` BASE in both
+`self->[16]` and `self->[20]`, identical to how TRefStack ctor stores
+the first NewStack BASE in `self->[0]/[4]`. So one TRefStructStack object
+spans **two disjoint allocations**: TRefStack at `[0x0ccee800, 0x0cd06800)`
+and TRefStructStack at `[0x0cd07400, 0x0cd1f400)`. The 3 KiB gap in
+between is the kernel's standard inter-stack guard.
+
+`NewState__11TIntrpStackFv` (entry `0x1a46f0`) writes 6 words to
+TRefStack starting at `self->[0]` (= `0x0ccee800`) — those 6 stores
+are the first writes to the new TRefStack region, and the kernel's
+ResolveFault wrapper handles the resulting fault on FAR=`0x0ccee800`,
+growing `L1[0xCC]` from `0x90` lazy → coarse. The 6 stores complete
+and the cursor advances by `0x18` to `0x0ccee818`.
+
+NewState then conditionally tail-calls Fill (via `bllt 0x1a54a38` at
+`0x1a4750` — that intermediate function tail-jumps into Fill so the
+Fill-side `caller_lr=0x1a4754` matches NewState's return point). The
+Fill loop bound, computed as `self->[16] + (self->[0] - self->[4])` =
+`0x0cd07400 + 0x18` = `0x0cd07418`, is fine. The first store at
+`0x1a4b9c` (`str r3, [r1], #4`, with r1 = TRefStructStack cursor =
+`0x0cd07400`) writes to TRefStructStack base. Section `0xCD` is still
+`L1[0xCD]=0x90` lazy — the second NewStack call set L1[0xCD..0xD0] to
+lazy markers but nothing has touched any of those pages yet, so
+ResolveFault never ran for them. Data abort.
+
+The kernel's data abort handler runs in SVC mode (the second fault in
+the trace shows `SPSR_abt=0x60000113` → pre-mode = SVC). The handler
+itself is at PC `0x1a4b9c` — i.e. the recovery from the first fault
+left the CPU executing Fill in SVC, not USR. From SVC the kernel can't
+recursively re-enter the data-abort handler for FAR=`0x0cd07400`, and
+it Reboots.
+
+### Why `req=0x10c00` but `span=0x18000`?
+
+Both ctors literally do `mov r1, #0x10000` (64 KiB request) before
+`bl NewStack`, so the **kernel modifies `[sp+8]` mid-SWI**. The probe
+reads it after the SWI returns. Inferred: `[sp+8]` post-SWI is the
+adjusted size with kernel-side per-stack housekeeping included; the
+`span = top - base` is the actual usable range. For the small stacks
+the relationship is `req = span + 0xC00` (0xC00 = 3 KiB inter-stack
+guard), so `req` = slot pitch. For the 96-KiB stacks the kernel grants
+much more than the small-slot pattern would predict. We don't yet know
+why the same code path requesting 64 KiB sometimes lands in 30-KiB
+slot pitch (`req=0x8400`) and sometimes in 96-KiB span (`req=0x10c00`,
+`span=0x18000`). Likely a per-task or per-domain config.
+
+### Einstein/HW cross-check (Step 4)
+
+`baremetal/probe/results-717006-90s-full.txt` (real Newton in Einstein
+emulator, 90 s wall-clock boot) shows for the same VA range:
+
+```
+VA 0x0CCEF000 to 0x0CD07000 (96 kB): page fault     ; same coarse L2 → unallocated tail of TRefStack
+VA 0x0CD07000 to 0x0CD08000 ( 4 kB): small pages    ; TRefStructStack base — first page allocated
+VA 0x0CD08000 to 0x0CD20000 (96 kB): page fault     ; rest of TRefStructStack lazy
+VA 0x0CD20000 to 0x0CD21000 ( 4 kB): small pages    ; next TRefStack base
+VA 0x0CD21000 to 0x0CD38000 (92 kB): page fault
+VA 0x0CD38000 to 0x0CD39000 ( 4 kB): small pages    ; next TRefStructStack base
+...
+```
+
+The `page fault` lines are L2-fault entries inside a coarse L1 table —
+that is, **L1[0xCD] is already coarse on real HW**, with `small pages`
+allocated for the very first 4-KiB page of every NewStack region (the
+base page) and the rest left lazy. So the kernel's intended pattern is:
+
+1. NewStack reserves the region by setting `L1[i] = 0x90` for sections
+   that are still fault-class.
+2. On the first write to any page in that region, the data abort
+   handler grows `L1[i]` from `0x90` lazy → coarse and allocates the
+   touched 4-KiB page (`small pages`).
+3. Subsequent writes to *other* pages in the same section take L2-level
+   page faults; the same handler chain allocates them on demand.
+
+So Fill writing to `0x0cd07400` is a normal lazy grow on real HW. Our
+hypervisor reboots instead. The kernel-side handler reaches Reboot
+without ever invoking the `Remember` SWI for section 0xCD — confirmed
+by the absence of any `Remember probe ENTER` line for VA in section
+`0xCD` in `/tmp/phaseB-l1cd-probe/qemu3.log`.
+
+### Where the recovery goes wrong
+
+The two-fault transcript:
+
+```
+dabt #1: DFSC=0x7 FAR=0x0ccee800 SPSR_abt=0x60000110 (pre-mode=USR)
+   stage1 walk: L1[0xcc]=0x04023481 (coarse), L2[0xee]=0  (page fault)
+   handled → returns to USR, NewState completes 6 pushes, calls Fill
+
+dabt #2: DFSC=0x5 FAR=0x0cd07400 SPSR_abt=0x60000113 (pre-mode=SVC!)
+   stage1 walk: L1[0xcd]=0x00000090 (lazy)
+   PC at fault = 0x1a4b9c (Fill body)
+   USR sp=0x0cc82660 USR lr=0x0cd07418 (= Fill loop bound)
+   handler reaches Reboot
+```
+
+The pre-mode for fault #2 is **SVC**, not USR — even though Fill was
+called from USR (per our HVC #0x49 probe) and PC `0x1a4b9c` is plain
+user-API code. So between the recovery from fault #1 and fault #2 the
+CPU transitioned USR→SVC while still at PC `0x1a4b9c`. Newton's data
+abort handler is entered in ABT mode and, for stack-fault recovery,
+trampolines into SVC to run `TStackManager::Fault` → `ResolveFault`
+(the patched call site at `0x001f84e0` that we re-target to our
+ResolveFault wrapper). The wedge sequence appears to be:
+
+  fault #1 (USR) → ABT vector → DataAbortHandler dispatches to
+  TStackManager::Fault → SVC mode → our ResolveFault wrapper grows
+  L1[0xCC] → returns to TStackManager::Fault → which **re-tries the
+  failed instruction in SVC mode** (instead of returning to USR via
+  ERET) → the failed instruction is now Fill's first store at
+  `0x0cd07400` → fault #2 (SVC pre-mode) → DataAbortHandler can't
+  re-enter SVC recovery from inside SVC → Reboot.
+
+The "re-tries in SVC mode" step is hypothesised, not observed. To
+confirm, the next session should:
+
+- Trace the kernel's data abort handler entry/exit (HVC at
+  `0x00393114` and at the handler's return path) so we can see the
+  CPSR transitions across the recovery.
+- Capture which sysreg instruction transitions USR→SVC at PC
+  `0x1a4b9c` — likely a `movs pc, lr` or `subs pc, lr, #N` in the
+  handler that doesn't restore the original SPSR correctly.
+- If the kernel does mean to retry in SVC, then the wedge isn't
+  about mode at all and the real bug is that ResolveFault for
+  FAR=`0x0cd07400` should handle it but doesn't. Add a probe at
+  `TStackManager::ResolveFault` entry to log every call and see
+  whether the second-fault path even reaches it.
+
+### What still needs to land
+
+1. **Plan Step 4 (cross-check)** — done, captured above.
+2. **Plan Step 5 (fix)** — blocked on understanding the USR→SVC mode
+   transition between fault #1 and fault #2. Don't apply a guess fix;
+   add the probes above first.
+
+### Reproduction artifacts
+
+- `/tmp/phaseB-l1cd-probe/qemu3.log` — quiet boot with all five probes
+  installed (`0x46–0x4A`). 21 NewStack outputs captured before the
+  wedge; the four 96-KiB stacks (`#18`–`#21`) are the TInterpreter
+  TRefStructStack-pair allocations. The Reboot-canary state dump
+  includes the live TRefStructStack-object snapshot quoted above.
+
+---
+
+## Earlier — Remember/AllocPT probes: wedge is FILL-into-0xCD from SVC, not lazy-grow failure (QEMU, 2026-04-26 evening)
 
 **Plan reference:** `docs/plans/l1-cd-lazy-investigation.md` step 1.
 

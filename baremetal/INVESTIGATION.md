@@ -129,6 +129,78 @@ Step 7a investigation update.
 35/35 guest tests still green; jj change `a2401a77` carries the QEMU
 mrs-staleness workaround and saved-slot diagnostics.
 
+### γ probe outcome (2026-04-27, qemu10.log + qemu11.log)
+
+Patched `cmp r0, #0` at DAH PC `0x393984` (HVC #0x50) and the static
+FaultMonitorEntry first insn at PC `0x0011FC60` (HVC #0x51,
+emulating `mov ip, sp`). Re-ran on QEMU; both probes fire for every
+DAH dispatch, so the post-ship slot at `0x01AF7BF4` redirects through
+the static entry — no REx-side override active for FaultMonitorEntry.
+qemu11.log captures:
+
+```
+FME-entry[0..5]: r0(mask)=0x0000121a  far=0x0cc79ff4..0x0ccee800  → ret=0x00000000  (recovery, 6 successful aborts)
+FME-entry[6]:    r0(mask)=0x00000000  far=0x0cd07400              → ret=0xffffd8e1  (-10015, reboot)
+```
+
+**The fault bitmask flips from `0x121a` to `0x00000000` at fault #2.**
+Each of the 6 prior successful aborts hands `FaultMonitorEntry` a
+non-zero mask. The wedge fault hands it zero, and `FaultMonitorEntry`
+returns -10015 because there's no monitor entry encoded in the empty
+mask.
+
+The mask is built by DAH's OR-chain at `0x393320..0x393344`:
+
+```
+ldr  r1, [pc, #1588]   ; r1 = literal at 0x393954 = 0x0c100ff8 (gKernelGlobals)
+ldr  r1, [r1]          ; r1 = *gKernelGlobals = curr_task ptr
+mov  r0, #0
+ldr  r2, [r1, #116]    ; r2 = curr_task->[+0x74]  (TUDomainManager #1)
+cmp  r2, #0  / ldrne r2, [r2, #16] / orrne r0, r0, r2
+ldr  r2, [r1, #120]    ; r2 = curr_task->[+0x78]
+... same OR ...
+ldr  r1, [r1, #124]    ; r1 = curr_task->[+0x7c]
+... linked-list chain following [+0x74][+0x78][+0x7c]/[+0x74] ...
+```
+
+Mask = `monitor#1->[+0x10] | monitor#2->[+0x10] | ...`. The
+`handle_reboot` state dump at the wedge shows curr_task at Reboot:
+
+```
+gKernelGlobals @VA=0xc100ff8 = 0x0c1212cc
+task @VA=0xc1212cc ->[0x74]=0x0c118ae0 ->[0x78]=0x00000000 ->[0x7c]=0x00000000
+monitor[+0x74] @VA=0xc118ae0 ->[0x10]=0x00055555  (fault-bitmask)
+```
+
+So the curr_task at Reboot has 0x55555 in monitor[+0x74][+0x10] — but
+the FME-entry probe captured **mask=0** at fault #2 entry. Two
+candidates:
+
+- (E-1) `gKernelGlobals[0]` (= curr_task ptr) changed between fault #2
+  entry and the Reboot dump (different task), and the active task at
+  fault #2 has empty monitor list.
+- (E-2) Same curr_task throughout, but `monitor[+0x74]` was different
+  (e.g. NULL or a different pointer) at fault #2 and got assigned later.
+
+### Next probe set
+
+Add to the OR-chain entry (just before mask construction) a single
+HVC that captures:
+
+- `gKernelGlobals[0]` (curr_task ptr at fault #2 entry)
+- `curr_task->[+0x74]` (first TUDomainManager pointer)
+- `curr_task->[+0x78]`
+- `curr_task->[+0x7c]`
+- For each non-NULL: `monitor->[+0x10]` (the OR'd value)
+
+Compare against an Einstein NewtonProbe build that captures the same
+state at its abort #16. The diff identifies whether (E-1) or (E-2)
+holds, and which task or monitor was clobbered. Strong suspect for
+the mutation: our 4-iter ResolveFault wrapper at `0x00FFFE00` (called
+during fault #1's recovery) — see qemu9.log lines 2239-2242 — may have
+side-effected the curr_task's monitor list or the gKernelGlobals
+pointer.
+
 ---
 
 ## Earlier — Step 8 (saved-slot vs `mrs spsr_abt` cross-check) + Step 7 reframe (QEMU, 2026-04-27)

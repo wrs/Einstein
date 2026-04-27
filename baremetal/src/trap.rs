@@ -968,6 +968,12 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::DAH_MRS_SPSR_HVC_IMM => {
             handle_dah_mrs_spsr_patch(ctx);
         }
+        v if v == crate::rom_patches::DAH_FME_RET_HVC_IMM => {
+            handle_dah_fme_ret_probe(ctx);
+        }
+        v if v == crate::rom_patches::DAH_FME_ENTRY_HVC_IMM => {
+            handle_fme_entry_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -2392,6 +2398,79 @@ fn handle_dah_mrs_spsr_patch(ctx: &mut TrapContext) {
             } else { "" },
         );
     }
+}
+
+/// Handler for the patched `cmp r0, #0` at DAH PC `0x393984`,
+/// immediately after `bl FaultMonitorEntry`. Logs `r0` (FaultMonitorEntry's
+/// return value) plus the FAR (so we can correlate against the
+/// dabt-forward log), then emulates the original `cmp r0, #0` by
+/// updating SPSR_EL2's NZCV bits so the kernel's subsequent `beq
+/// 0x393a30` at `0x393988` branches as if the cmp had run.
+///
+/// Useful for the layer-γ investigation: Einstein's abort #16 at
+/// FAR=0x0CD07400 recovers (FaultMonitorEntry returns 0); ours doesn't
+/// (returns non-zero). This probe pins the divergent return value
+/// directly.
+fn handle_dah_fme_ret_probe(_ctx: &mut TrapContext) {
+    // r0 is in ctx.x[0] for AArch32 from EL2's view.
+    let r0 = _ctx.x[0] as u32;
+    let far = read_sysreg!("far_el1") as u32;
+    static FIRED: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+    let n = FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if n < 24 {
+        kprintln!(
+            "DAH-FME-ret[{}]: r0={:#010x} far={:#010x}{}",
+            n, r0, far,
+            if r0 == 0 { "  (success → recovery)" } else { "  (failure → reboot)" },
+        );
+    }
+    // Emulate `cmp r0, #0`:
+    //   N = (r0 >> 31) & 1
+    //   Z = (r0 == 0)
+    //   C = 1  (cmp Rn, #0 = subs scratch, Rn, #0; no borrow → C=1)
+    //   V = 0  (cmp with 0 cannot overflow)
+    let n_bit = ((r0 >> 31) & 1) as u64;
+    let z_bit = if r0 == 0 { 1u64 } else { 0u64 };
+    let c_bit = 1u64;
+    let v_bit = 0u64;
+    let new_nzcv = (n_bit << 31) | (z_bit << 30) | (c_bit << 29) | (v_bit << 28);
+    let mut spsr_el2: u64;
+    // SAFETY: sysreg read/write, no side effects.
+    unsafe {
+        core::arch::asm!("mrs {}, spsr_el2", out(reg) spsr_el2,
+            options(nomem, nostack, preserves_flags));
+    }
+    spsr_el2 = (spsr_el2 & !(0xF << 28)) | new_nzcv;
+    unsafe {
+        core::arch::asm!("msr spsr_el2, {}", in(reg) spsr_el2,
+            options(nostack, preserves_flags));
+        core::arch::asm!("isb", options(nostack, preserves_flags));
+    }
+}
+
+/// Handler for the patched `mov ip, sp` at FaultMonitorEntry static
+/// entry PC `0x0011FC60`. Logs r0 (input fault mask), the FAR (so we
+/// can correlate against the dabt-forward log), and emulates the
+/// original `mov ip, sp` (writes ctx.x[12] = current SP for the source
+/// AArch32 mode).
+fn handle_fme_entry_probe(ctx: &mut TrapContext) {
+    let r0 = ctx.x[0] as u32;
+    let far = read_sysreg!("far_el1") as u32;
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    let src_mode = spsr_el2 & 0x1F;
+    let sp_src = crate::banked::sp_for_mode(ctx, spsr_el2);
+    static FIRED: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+    let n = FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if n < 24 {
+        kprintln!(
+            "FME-entry[{}]: r0(mask)={:#010x} far={:#010x} src_mode={:#x} sp={:#010x}",
+            n, r0, far, src_mode, sp_src,
+        );
+    }
+    // Emulate `mov ip, sp`: ctx.x[12] = banked SP for source mode.
+    ctx.x[12] = (ctx.x[12] & 0xFFFF_FFFF_0000_0000) | (sp_src as u64);
 }
 
 fn dump_flash_bytes(ipa: u32, count: u32) {

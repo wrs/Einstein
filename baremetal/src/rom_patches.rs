@@ -360,6 +360,39 @@ const MOVS_PC_LR_INSN:               u32 = 0xE1B0_F00E;
 pub const DAH_MRS_SPSR_PC:           u32 = 0x0039_3144;
 const DAH_MRS_SPSR_INSN:             u32 = 0xE14F_1000;
 
+/// `cmp r0, #0` immediately after `bl FaultMonitorEntry` at PC
+/// `0x00393984` (DAH's post-monitor-call branch decision). The
+/// preceding `bl` jumps through the post-ship patch table at
+/// `0x01af7bf4` to whatever current FaultMonitorEntry the kernel has
+/// installed. After the call, r0 = 0 means "monitor handled the fault,
+/// take the recovery path"; non-zero means "monitor declined, fall
+/// through toward RebootIfFaultWasInStack".
+///
+/// On Einstein, the abort #16 at FAR=0x0CD07400 (mode=USR, DFSC=5)
+/// recovers — i.e. FaultMonitorEntry returns 0 there. Our hypervisor
+/// reaches the throw exit on the same fault, which only happens if
+/// FaultMonitorEntry returns non-zero. Patch this `cmp` with an HVC so
+/// EL2 can log the return value and emulate the `cmp r0, #0` flag
+/// update, leaving the `beq 0x393a30` at `0x393988` to branch as the
+/// kernel intended.
+pub const DAH_FME_RET_HVC_IMM:        u32 = 0x50;
+pub const DAH_FME_RET_PC:             u32 = 0x0039_3984;
+const DAH_FME_RET_INSN:               u32 = 0xE3500000;
+
+/// Static FaultMonitorEntry entry at PC `0x0011FC60`. The post-ship
+/// patch table at `0x01AF7BF4` is the symbol target the kernel actually
+/// calls; if its slot redirects through the static entry (no REx
+/// override active), this probe fires and gives us the input fault
+/// mask plus the implementation flow. Original first insn:
+/// `mov ip, sp = 0xE1A0_C00D`. Replace with `HVC #DAH_FME_ENTRY_HVC_IMM`;
+/// the handler emulates `mov ip, sp` (writes ctx.x[12] = ctx.x[13]),
+/// logs r0 (= input fault mask), and returns. If the probe doesn't
+/// fire, the post-ship slot is redirected to a different (REx-side)
+/// implementation we don't have disasm for.
+pub const DAH_FME_ENTRY_HVC_IMM:      u32 = 0x51;
+pub const FME_STATIC_PC:              u32 = 0x0011_FC60;
+const FME_STATIC_FIRST_INSN:          u32 = 0xE1A0_C00D;
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -523,6 +556,28 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(DAH_MRS_SPSR_HVC_IMM),
             "DataAbortHandler mrs r1, SPSR (QEMU spsr_abt staleness fix)",
             DAH_MRS_SPSR_HVC_IMM,
+        );
+        // Layer-γ probe: `cmp r0, #0` after `bl FaultMonitorEntry` at
+        // 0x00393984. Captures FaultMonitorEntry's return value so we
+        // can compare against Einstein's recovery path.
+        patch_probe(
+            rom_ptr,
+            DAH_FME_RET_PC,
+            DAH_FME_RET_INSN,
+            hvc_insn(DAH_FME_RET_HVC_IMM),
+            "DAH FaultMonitorEntry return cmp r0, #0",
+            DAH_FME_RET_HVC_IMM,
+        );
+        // Layer-γ probe: static FaultMonitorEntry entry at 0x0011FC60.
+        // Captures input fault mask in r0 if the post-ship slot
+        // redirects through the static entry.
+        patch_probe(
+            rom_ptr,
+            FME_STATIC_PC,
+            FME_STATIC_FIRST_INSN,
+            hvc_insn(DAH_FME_ENTRY_HVC_IMM),
+            "FaultMonitorEntry static entry (mov ip, sp)",
+            DAH_FME_ENTRY_HVC_IMM,
         );
     }
 }

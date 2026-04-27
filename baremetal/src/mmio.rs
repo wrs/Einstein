@@ -77,6 +77,23 @@ const RAM_PROBE_ABSENT_END:  u64 = 0x0900_0000;
 const NO_REX_PROBE_BASE: u64 = 0x1040_0000;
 const NO_REX_PROBE_END:  u64 = 0x2000_0000;
 
+// "Unknown bank #5" silent-zero window — the gap between Newton MP2x00's
+// kFlashBank2End (0x1040_0000) and kPCMCIA0Base (0x3000_0000). Einstein's
+// `TMemory::ReadP` (Emulator/TMemory.cpp:1026-1034) returns 0 silently
+// for any read in this range and absorbs writes. The 717006 kernel hits
+// this on a TInterpreter-side `MakeString__FPCc` whose to-Unicode
+// translator descriptor's `+16` slot (the per-encoding lookup table
+// base) is 0x2000_0110 — a bogus pointer the kernel computed from
+// uninitialised / partially-installed encoding state. Einstein tolerates
+// it via this silent-zero path (the convert function reads 0 → emits
+// U+0000 → boot continues with garbled string output instead of a hard
+// fault). Match that behaviour here so the trip-wire isn't load-bearing
+// past the modelled-MMIO window. The deeper "why is the descriptor
+// wrong" question is decoupled from this wedge: it's a NewtonScript-
+// level bug Einstein masks the same way.
+const UNKNOWN_BANK5_BASE: u64 = 0x2000_0000;
+const UNKNOWN_BANK5_END:  u64 = 0x3000_0000;
+
 // Test-only R/W scratch registers above XOR_LIMIT (= 0x1000_0000), used
 // by `guest-tests/tests/test_shadow_stub.S` subtest_11 to verify that
 // shadow-stub byte/halfword accesses bypass the BE-32 XOR for IPAs >=
@@ -216,6 +233,9 @@ pub fn read(ipa: u64, sas: u8, elr: u64) -> u32 {
         // REx / extra-flash "absent" probe window (see const comment).
         a if (NO_REX_PROBE_BASE..NO_REX_PROBE_END).contains(&a) => 0,
 
+        // "Unknown bank #5" silent-zero window (see const comment).
+        a if (UNKNOWN_BANK5_BASE..UNKNOWN_BANK5_END).contains(&a) => 0,
+
         a => halt_on_unknown("read", a, sas, 0, elr),
     };
 
@@ -324,6 +344,10 @@ pub fn write(ipa: u64, sas: u8, value: u32, elr: u64) {
     }
     // Probe-for-absent-REx window — same semantics.
     if (NO_REX_PROBE_BASE..NO_REX_PROBE_END).contains(&ipa) {
+        return;
+    }
+    // "Unknown bank #5" silent-drop (see UNKNOWN_BANK5_BASE comment).
+    if (UNKNOWN_BANK5_BASE..UNKNOWN_BANK5_END).contains(&ipa) {
         return;
     }
     // Platform "write-only" control registers. Each is a Newton ASIC

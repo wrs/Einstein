@@ -73,7 +73,9 @@ If it's another kind of failure:
 | 2026-04-25 | ~145 k | newt-DABT alias narrows to scheduling order | IRQ-rate + tick-page divergence fixed |
 | 2026-04-26 | ~170 k | BootOS canary entry #2 (R0=0x0cc80c80) — `name`-task stack-overrun corrupts neighbour task on shared PA | **fixed** via 3-instruction ROM patch that forces per-page stack allocation in `TStackManager::ResolveFault` (mask=0xF) |
 | 2026-04-26 | 403 k+ | `Reboot` canary (kernel-driven self-reboot, R0=0xffffd8a5, LR=0x000d9888) — UnhandledException in user-mode flash-driver work | superseded by next row |
-| 2026-04-26 (current) | ~270 k notrace | `Reboot` canary inside `TInterpreter::TInterpreter` (Phase B goal **reached**!) — fails on lazy-L1 section grow during `TRefStructStack::Fill` (DFSC=5 at FAR=0x0cd07400, L1[0xCD]=0x90 lazy marker) | open |
+| 2026-04-26 | ~270 k notrace | `Reboot` canary inside `TInterpreter::TInterpreter` (Phase B goal **reached**!) — fails on lazy-L1 section grow during `TRefStructStack::Fill` (DFSC=5 at FAR=0x0cd07400, L1[0xCD]=0x90 lazy marker) | **fixed** via DFSR.Domain overlay (γ-fix): handle_diag now reads L1.domain from the faulting VA's L1 entry and writes it into DFSR_EL1.bits[7:4] before forwarding to DAH (ARMv7 leaves Domain UNK on DFSC=5; kernel was reading 0). |
+| 2026-04-27 | ~2.1 M notrace | `ConvertToUnicodeFunc_Contiguous8` reading bogus TEncodingMap.+16 = 0x20000110 (out-of-stage-2 IPA) | **fixed** by adding "unknown bank #5" silent-zero arm to `mmio.rs` for IPA 0x20000000..0x30000000, matching Einstein's `TMemory::ReadP` (TMemory.cpp:1026-1034). |
+| 2026-04-27 (current) | ~24 M notrace | Boot reaches `TInterpreter::TInterpreter` and full driver suite. `newt` task alive, system in normal idle pause loop. | **Phase B goal met.** |
 
 See `INVESTIGATION.md` for the full chain of analysis on each.
 

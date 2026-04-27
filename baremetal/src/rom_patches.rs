@@ -282,6 +282,23 @@ pub const STACK_MGR_FAULT_PROBE_HVC_IMM: u32 = 0x4B;
 /// FMLockHeapRange at 0x1f6b94). See plan Step 5 prep.
 pub const RESOLVE_FAULT_PROBE_HVC_IMM:   u32 = 0x4C;
 
+/// HVC immediate fired by the patched first word of
+/// `NewState__11TIntrpStackFv` at 0x001A46F0. Handler logs source-mode
+/// CPSR + caller LR, then emulates the original `mov ip, sp`.
+/// Discriminates hypothesis (A) silent-recovery vs (B) recovery-never-
+/// returned for fault #2: if NewState fires once before the wedge,
+/// recovery from fault #1 returned to USR; if it fires twice (USR + SVC)
+/// we have a second recovery-handled-silently path. See plan Step 6b.
+pub const NEW_STATE_PROBE_HVC_IMM:       u32 = 0x4D;
+
+/// HVC immediate fired by the patched DataAbortHandler USR-return exit
+/// (a `subs pc, lr, #N` or `movs pc, lr` inside the handler at
+/// 0x00393114..). Handler logs source-mode CPSR + caller LR + the
+/// would-be return PC (`lr` minus the same `#N`). Tells us whether
+/// DataAbortHandler is exiting to USR after fault #1's recovery vs.
+/// not exiting at all (hypothesis B). See plan Step 6c.
+pub const DAH_USR_RETURN_PROBE_HVC_IMM:  u32 = 0x4E;
+
 const REMEMBER_STATIC_PC:            u32 = 0x0025_8E0C;
 const REMEMBER_STATIC_FIRST_INSN:    u32 = 0xE1A0_C00D; // mov ip, sp
 const REMEMBER_SWIRET_PC:            u32 = 0x0025_8E50;
@@ -295,6 +312,28 @@ const NEW_STACK_LOW_LDR_INSN:        u32 = 0xE59D_1010; // ldr r1, [sp, #16]
 pub const STACK_MGR_FAULT_PC:        u32 = 0x001F_83E4;
 const STACK_MGR_FAULT_FIRST_INSN:    u32 = 0xE1A0_C00D; // mov ip, sp
 const RESOLVE_FAULT_FIRST_INSN:      u32 = 0xE1A0_C00D; // mov ip, sp
+pub const NEW_STATE_PC:              u32 = 0x001A_46F0;
+const NEW_STATE_FIRST_INSN:          u32 = 0xE1A0_C00D; // mov ip, sp
+
+/// Two `movs pc, lr` exits inside `DataAbortHandler` (0x00393114).
+/// Both use the same encoding (`0xE1B0_F00E`), and both perform an
+/// SPSR_abt → CPSR copy + PC := LR, exiting ABT mode. They differ in
+/// what LR points to:
+///   - 0x00393B80 — kernel-monitor success exit. Reached after
+///     FaultMonitorEntry returned 0 and Scheduler picked a task; LR
+///     was reloaded from the scheduled task's saved-LR slot, so this
+///     is the actual "return to USR task" path.
+///   - 0x00393944 — fast-throw exit. Reached when FaultMonitorEntry
+///     returned non-0 (or when SPSR check at 0x39314c rejected the
+///     pre-abt mode); LR was set to the literal at 0x393974
+///     (= 0x01BE319C, `Throw`), so this exit tail-calls Throw with
+///     pre-abt CPSR.
+/// Both are mode-flip exits; instrumenting both lets us tell whether
+/// the kernel went success-or-throw on each abort. The handler reads
+/// ELR_EL2 to distinguish call sites.
+pub const DAH_USR_RETURN_PC:         u32 = 0x0039_3B80;
+pub const DAH_THROW_EXIT_PC:         u32 = 0x0039_3944;
+const MOVS_PC_LR_INSN:               u32 = 0xE1B0_F00E;
 
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
@@ -423,6 +462,31 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(RESOLVE_FAULT_PROBE_HVC_IMM),
             "TStackManager::ResolveFault prologue",
             RESOLVE_FAULT_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            NEW_STATE_PC,
+            NEW_STATE_FIRST_INSN,
+            hvc_insn(NEW_STATE_PROBE_HVC_IMM),
+            "NewState__11TIntrpStackFv prologue",
+            NEW_STATE_PROBE_HVC_IMM,
+        );
+        // DataAbortHandler exit probes — same encoding at two PCs.
+        patch_probe(
+            rom_ptr,
+            DAH_USR_RETURN_PC,
+            MOVS_PC_LR_INSN,
+            hvc_insn(DAH_USR_RETURN_PROBE_HVC_IMM),
+            "DataAbortHandler success exit (movs pc, lr)",
+            DAH_USR_RETURN_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            DAH_THROW_EXIT_PC,
+            MOVS_PC_LR_INSN,
+            hvc_insn(DAH_USR_RETURN_PROBE_HVC_IMM),
+            "DataAbortHandler throw exit (movs pc, lr)",
+            DAH_USR_RETURN_PROBE_HVC_IMM,
         );
     }
 }

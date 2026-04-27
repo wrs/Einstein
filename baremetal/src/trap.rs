@@ -959,6 +959,12 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::RESOLVE_FAULT_PROBE_HVC_IMM => {
             handle_resolve_fault_probe(ctx);
         }
+        v if v == crate::rom_patches::NEW_STATE_PROBE_HVC_IMM => {
+            handle_new_state_probe(ctx);
+        }
+        v if v == crate::rom_patches::DAH_USR_RETURN_PROBE_HVC_IMM => {
+            handle_dah_usr_return_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1382,6 +1388,22 @@ fn handle_und(ctx: &mut TrapContext) {
         }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::RESOLVE_FAULT_PROBE_HVC_IMM) => {
             handle_resolve_fault_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::NEW_STATE_PROBE_HVC_IMM) => {
+            handle_new_state_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::DAH_USR_RETURN_PROBE_HVC_IMM) => {
+            // The DAH USR-return probe lives inside DataAbortHandler,
+            // which only ever runs from ABT mode — not from USR. So the
+            // UND-trampoline path is unreachable in practice, but we
+            // still wire it up symmetrically with the other probes for
+            // safety. The handler does its own ELR_EL2 fixup so we
+            // simply route through the inner helper.
+            handle_dah_usr_return_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -2215,6 +2237,105 @@ fn handle_resolve_fault_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
     ctx.x[12] = sp as u64;
 }
 
+fn handle_new_state_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_new_state_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+/// `NewState__11TIntrpStackFv` prologue probe.
+///
+/// Logs source-mode CPSR + caller LR. NewState is the user-API entry
+/// that allocates a new stack frame on the TIntrpStack and dispatches
+/// (via the trampoline at 0x1a54a38) into Fill__15TRefStructStackFv.
+/// We need this site to discriminate hypothesis (A) silent USR-mode
+/// fault recovery vs (B) recovery-never-returned: if NewState fires
+/// twice (USR + SVC) before the wedge, an earlier fault was handled
+/// without re-entering Fault/ResolveFault; if it fires only once
+/// (USR) and the wedge is in SVC, the kernel is running Fill body
+/// code in SVC without re-entering NewState.
+///
+/// The first instruction is `mov ip, sp`, same as Fault/ResolveFault.
+fn handle_new_state_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+    let mode = source_cpsr & 0x1F;
+    let r0 = ctx.x[0] as u32;
+    kprintln!(
+        "NewState probe ENTER: this={:#010x} caller_lr={:#010x} src_mode={:#x} ({}) sp={:#010x}",
+        r0, lr, mode, describe_aarch32_mode(mode), sp
+    );
+    // Emulate `mov ip, sp`.
+    ctx.x[12] = sp as u64;
+}
+
+fn handle_dah_usr_return_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_dah_usr_return_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+/// DataAbortHandler `movs pc, lr` exit probe.
+///
+/// The same encoding (`0xE1B0_F00E`) sits at two distinct call sites
+/// inside DataAbortHandler:
+///   - 0x00393B80 — kernel-monitor success exit. LR was just reloaded
+///     from the scheduled task's saved-LR slot, so the natural `movs
+///     pc, lr` semantics resume that task in USR mode at its saved PC.
+///   - 0x00393944 — fast-throw exit. LR was set to a literal pointer
+///     to `Throw` (= 0x01BE319C), so the `movs pc, lr` tail-calls Throw
+///     with the pre-abt CPSR (typically USR for a faulted user task,
+///     SVC if the kernel itself was in SVC when the abort fired).
+///
+/// We log which site is firing (by reading ELR_EL2 — the post-HVC PC
+/// is patched_pc + 4) plus the saved registers, then emulate the
+/// original `movs pc, lr` by setting ELR_EL2 := lr_abt and
+/// SPSR_EL2 := SPSR_abt, so the natural ERET out of EL2 lands in the
+/// pre-abt mode at the LR target.
+///
+/// Discriminates plan-Step-6c hypotheses: if we see ≥1 success-exit
+/// (0x393B80) after fault #1 and before fault #2's SVC-pre-abt UDF,
+/// recovery DID return to USR and the SVC-mode wedge can't be
+/// "kernel never returned to USR after fault #1" (hypothesis B). A
+/// throw-exit (0x393944) before fault #2 instead signals an earlier
+/// silently-handled fault (hypothesis A).
+fn handle_dah_usr_return_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    let mode = source_cpsr & 0x1F;
+    let sp_abt = ctx.x[21] as u32;
+    let lr_abt = ctx.x[20] as u32;
+    let spsr_abt = read_banked_spsr("abt") as u32;
+    let pre_abt_mode = spsr_abt & 0x1F;
+    let elr = read_sysreg!("elr_el2") as u32;
+    // ELR_EL2 = patched_pc + 4 because HVC entry from AArch32 stores the
+    // PC of the instruction *after* the HVC (DDI 0487 G1.11.1).
+    let site_pc = elr.wrapping_sub(4);
+    let site = match site_pc {
+        crate::rom_patches::DAH_USR_RETURN_PC => "success",
+        crate::rom_patches::DAH_THROW_EXIT_PC => "throw",
+        _ => "?",
+    };
+    kprintln!(
+        "DAH-exit probe ({} @ {:#010x}): src_mode={:#x} ({}) lr_abt={:#010x} sp_abt={:#010x} spsr_abt={:#010x} (pre-abt mode={:#x} = {})",
+        site, site_pc, mode, describe_aarch32_mode(mode),
+        lr_abt, sp_abt, spsr_abt, pre_abt_mode, describe_aarch32_mode(pre_abt_mode)
+    );
+    // Emulate `movs pc, lr`:
+    //   - PC ← lr_abt
+    //   - CPSR ← SPSR_abt  (mode flip back to pre-abt mode)
+    // SPSR_EL2 low 32 bits map directly to AArch32 SPSR for AArch32
+    // exception return (DDI 0487 D13.6 — SPSR_EL2 layout). The mode
+    // bits already have M[4]=1 (set on AArch32 abort entry) so the
+    // architecture honours the AArch32 return mode encoded in M[4:0].
+    unsafe {
+        core::arch::asm!(
+            "msr elr_el2, {pc}",
+            "msr spsr_el2, {sp}",
+            "isb",
+            pc = in(reg) lr_abt as u64,
+            sp = in(reg) spsr_abt as u64,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 fn dump_flash_bytes(ipa: u32, count: u32) {
     let base = crate::peripherals::flash::host_pa() as *const u8;
     let flash_off = ipa.wrapping_sub(crate::peripherals::flash::BANK0_PA_BASE) as usize;
@@ -2795,21 +2916,29 @@ use guest_mem::{read_byte_pa as read_guest_byte_pa,
                 write_word_pa as write_guest_word_pa};
 
 /// Budgeted log for the DABT→kernel forward path. Prints once per unique
-/// (FAR, mode) pair so we see the first sample of each fault site without
-/// flooding on tight-loop faults (e.g. a page-table walk the kernel is
-/// filling in one entry at a time).
+/// (FAR, hvc_src_mode, pre_abt_mode) tuple so we see each distinct fault
+/// site without flooding on tight-loop faults (e.g. a page-table walk
+/// the kernel is filling in one entry at a time).
+///
+/// Including `pre_abt_mode` (`SPSR_abt & 0x1F`) in the dedup key
+/// distinguishes a USR-pre-abt fault from an SVC-pre-abt fault at the
+/// same FAR — needed for the L1[0xCD] investigation, where we suspect
+/// a silently-handled USR-pre-abt fault precedes the visible SVC-pre-abt
+/// one. See `docs/plans/l1-cd-lazy-investigation.md` Step 6a.
 fn log_dabt_forward(dfsc: u32, far: u32, mode: u32, ctx: &TrapContext) {
+    let spsr_abt = read_banked_spsr("abt") as u32;
+    let pre_abt_mode = spsr_abt & 0x1F;
     const SEEN_CAP: usize = 16;
-    static mut SEEN: [(u32, u32); SEEN_CAP] = [(0, 0); SEEN_CAP];
+    static mut SEEN: [(u32, u32, u32); SEEN_CAP] = [(0, 0, 0); SEEN_CAP];
     static mut SEEN_N: usize = 0;
     // SAFETY: single-threaded EL2.
     let first = unsafe {
         let mut found = false;
         for i in 0..SEEN_N {
-            if SEEN[i] == (far, mode) { found = true; break; }
+            if SEEN[i] == (far, mode, pre_abt_mode) { found = true; break; }
         }
         if !found && SEEN_N < SEEN_CAP {
-            SEEN[SEEN_N] = (far, mode);
+            SEEN[SEEN_N] = (far, mode, pre_abt_mode);
             SEEN_N += 1;
             true
         } else {
@@ -2831,7 +2960,6 @@ fn log_dabt_forward(dfsc: u32, far: u32, mode: u32, ctx: &TrapContext) {
         let sp_usr = ctx.x[13] as u32;
         let lr_svc = ctx.x[18] as u32;
         let sp_svc = ctx.x[19] as u32;
-        let spsr_abt = read_banked_spsr("abt") as u32;
         // For ARM-mode DABT, faulting_pc = LR_abt - 8.
         let faulting_pc = lr_abt.wrapping_sub(8);
         kprintln!(

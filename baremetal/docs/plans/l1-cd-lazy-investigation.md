@@ -1,5 +1,41 @@
 # Phase B — Wedge reframed: kernel skips stack-monitor on the SVC-mode fault
 
+## Status (2026-04-26 night-2)
+
+**Step 6 done.** All three sub-probes installed and one cold-boot
+artifact captured:
+
+- `HVC #0x4D` at NewState entry (USR / direct-callable)
+- `HVC #0x4E` at the two `movs pc, lr` exits in DataAbortHandler
+  (0x00393B80 success and 0x00393944 throw)
+- `log_dabt_forward` dedup key now includes `pre_abt_mode = SPSR_abt
+  & 0x1F`
+
+`/tmp/phaseB-l1cd-probe/qemu5.log` confirms:
+
+- The kernel's stack-monitor dispatch is **not** synchronous inside
+  DAH — DAH success-exits to USR at LR_abt=0x01a00024 (a post-ship
+  patch-table entry), then USR-mode user code calls
+  `FaultMonProc → Fault → ResolveFault`. Old framing was wrong.
+- Fault #1 takes the success exit at 0x393B80 (pre-abt USR). DAH
+  *does* return to USR. **Hypothesis (B) ruled out.**
+- Fault #2 takes the throw exit at 0x393944 (`lr := 0x01BE319C =
+  Throw`). The mode-aware dedup did *not* surface a preceding USR-
+  pre-abt fault at FAR=0x0cd07400. **Hypothesis (A) is unsupported by
+  evidence.**
+- New mystery: between Fill's USR-mode prologue at 0x1a4b54
+  (probe captures USR + sp=0x0cc82664) and the str fault at 0x1a4b9c,
+  SPSR_abt reads SVC. No mode-changing instruction in 0x1a4b58..
+  0x1a4b98. Two surviving sub-hypotheses:
+  - **(C) QEMU AArch64↔AArch32 SPSR_abt flakiness.**
+  - **(D) An asynchronous exception flipped the mode mid-Fill.**
+
+INVESTIGATION.md ("Step 6 probes") has the full timeline and decoded
+log lines.
+
+**Step 7 (apply a fix)** is now blocked on resolving (C) vs. (D).
+The most decisive next move is an FVP cross-check (Step 8 below).
+
 ## Status (2026-04-26 night)
 
 **Steps 1–4 done. Step 5 prep done.** Probes installed:
@@ -271,6 +307,33 @@ The fix should reduce the user-vs-kernel stack-extent diff to zero,
 matching real-hardware behavior. The probes from this plan stay in
 tree until we land the fix; they're cheap when filtered.
 
+## Step 8 — FVP cross-check (proposed next)
+
+After Step 6 surfaced the USR/SVC mode-flip mystery, the most
+decisive next move is running the same boot under FVP, which has
+an architecturally accurate banked-register model. Concrete plan:
+
+1. Build with the FVP feature set:
+   ```
+   rm -f /tmp/newton-snapshot-*.bin
+   cargo build --release --no-default-features \
+     --features "platform-fvp-base quiet"
+   scripts/fvp --timeout=120 \
+     target/aarch64-unknown-none-softfloat/release/newton-hypervisor
+   ```
+2. Compare the new `dabt: forwarding ... pre-abt mode=...` and
+   `DAH-exit probe` lines around FAR=0x0cd07400 against qemu5.log.
+3. If FVP also reports `pre-abt mode=SVC` at fault #2 entry **and**
+   `pre-abt mode=USR` at the throw exit, then the kernel really is
+   writing SPSR_abt somewhere between DAH entry and the throw-exit
+   probe. Find the write site by inserting a `mrs` of SPSR_abt at
+   intermediate PCs along the throw path (cheap: a few extra HVC
+   probes inside the 0x393898..0x393944 region).
+4. If FVP reports a *consistent* pre-abt mode for fault #2 (USR
+   throughout, or SVC throughout), then sub-hypothesis (C) holds for
+   QEMU — the QEMU result was an SPSR_abt staleness artifact.
+   Continue investigation on FVP only for Step 7.
+
 ## Critical files
 
 - `src/rom_patches.rs::apply_l1_cd_probes` — pattern to mirror for
@@ -280,8 +343,10 @@ tree until we land the fix; they're cheap when filtered.
   USR-trampoline UND paths).
 - `src/trap.rs::handle_reboot` — extend the one-shot dump with
   TStackInfo / TRefStack / TRefStructStack state at the wedge.
-- `INVESTIGATION.md` — keep updating the "Currently at" section as
-  Step 1–4 land.
+- `src/trap.rs::handle_dah_usr_return_probe_with` — Step 6c handler
+  that emulates `movs pc, lr` while logging.
+- `INVESTIGATION.md` — "Step 6 probes" entry has the latest log
+  decoding.
 
 ## Verification
 

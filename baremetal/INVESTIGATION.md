@@ -2,7 +2,185 @@
 
 Live notes. Update as we learn more. REMOVE old updates once resolved.
 
-## In progress — Fault/ResolveFault probes: kernel never reaches stack-monitor for fault #2 (QEMU, 2026-04-26 night)
+## In progress — Step 6 probes: DAH-exit + NewState + mode-aware dabt dedup (QEMU, 2026-04-26 night-2)
+
+**Plan reference:** `docs/plans/l1-cd-lazy-investigation.md` Step 6 (a/b/c).
+
+Three new mechanisms installed:
+
+1. **6a — mode-aware `log_dabt_forward` dedup.** Key now includes
+   `pre_abt_mode = SPSR_abt & 0x1F`, so a USR-pre-abt and SVC-pre-abt
+   fault at the same FAR show as distinct lines. Goal: surface any
+   silently-handled USR-pre-abt fault at FAR=0x0cd07400 preceding the
+   visible SVC-pre-abt one.
+2. **6b — `NewState__11TIntrpStackFv` prologue probe (HVC #0x4D)** at
+   PC 0x001A46F0. Logs source-mode CPSR + caller LR. Distinguishes
+   "Fill is being called from a Fresh NewState in USR" vs. "Fill is
+   being run on a stale stack from inside an interrupted handler".
+3. **6c — DataAbortHandler `movs pc, lr` exit probe (HVC #0x4E)** at
+   *both* 0x00393B80 (success exit, post-Scheduler) and 0x00393944
+   (throw exit, tail-call into `Throw` at 0x01BE319C). Probe handler
+   reads ELR_EL2 to identify the call site, logs the LR/SPSR_abt
+   tuple, then emulates `movs pc, lr` by setting `ELR_EL2 := lr_abt`
+   and `SPSR_EL2 := SPSR_abt` so the natural ERET out of EL2 mirrors
+   the kernel's intended mode-flip + branch.
+
+`/tmp/phaseB-l1cd-probe/qemu5.log` is the cold-boot artifact. 35/35
+guest tests still green.
+
+### Major model correction (vs. the previous framing)
+
+The old story was "FaultMonitorEntry calls FaultMonProc → Fault →
+ResolveFault from inside DAH; DAH exits to USR after the kernel-side
+recovery is done". That's wrong.
+
+New empirical pattern, repeated across at least five distinct USR-
+pre-abt faults in this boot:
+
+```
+1. dabt: forwarding ... DFSC=0x7 FAR=0x... mode=0x17 (pre-abt USR)
+2. DAH-exit probe (success @ 0x00393b80): src_mode=0x17 (ABT)
+                                          lr_abt=0x01a00024
+                                          spsr_abt=...0x10 (pre-abt USR)
+3. Fault(stackmgr) probe ENTER: ... src_mode=0x10 (USR)
+                                caller_lr=0x00259230 (= FaultMonProc)
+4. ResolveFault probe ENTER × 4: ... src_mode=0x10 (USR)
+                                 caller_lr=0x00fffe40 (= our wrapper)
+```
+
+The DAH success-exit fires **before** the Fault probe — every time.
+That means the kernel's DAH does **not** synchronously call the
+stack monitor. It exits to USR mode at LR_abt = `0x01a00024` (a
+post-ship patch-table entry), and only *then* — running in USR mode
+— does the kernel walk into FaultMonProc → Fault → ResolveFault
+to do the actual page-table fix-up. Our 4-iter wrapper at
+`0x00FFFE00` is reached from this USR-mode user code, not from
+inside DAH.
+
+This explains why all the existing Fault/ResolveFault probes show
+`src_mode=0x10 (USR)`: they really are called from USR mode.
+
+### Fault #2 (FAR=0x0cd07400) — DAH takes the *throw* exit
+
+```
+Fill probe ENTER: this=0x0c6451c0 caller_lr=0x001a4754 src_mode=0x10 (USR)
+dabt: forwarding ... DFSC=0x5 FAR=0x0cd07400 mode=0x17
+  LR_abt=0x001a4ba4 (faulting PC=0x001a4b9c) SPSR_abt=0x60000113 (pre-abt SVC)
+  USR sp=0x0cc82660 lr=0x0cd07418  SVC sp=0x0c000400 lr=0x001a4708
+  L1[0xcd] = 0x00000090 (fault)
+DAH-exit probe (throw @ 0x00393944): lr_abt=0x01be319c
+                                     spsr_abt=0x80000110 (pre-abt USR)
+*** Reboot canary fired ***
+  R14_UND=0x000d9888 (= Reboot+4)
+```
+
+Two things were confirmed:
+
+- Fault #2's DAH exit is the **throw path** at `0x00393944`
+  (`movs pc, lr` with `lr := 0x01be319c = Throw`). This is consistent
+  with no Fault/ResolveFault probe firing between fault #2 entry and
+  the Reboot canary — the kernel never invokes the stack monitor for
+  this abort. It tail-calls `Throw` → `UnhandledException` → `Reboot`.
+
+- The pre-abt mode at the throw exit is reported as **USR**
+  (`spsr_abt=0x80000110`), even though `dabt: forwarding` 14 lines
+  earlier reported pre-abt **SVC** (`spsr_abt=0x60000113`). The two
+  reads use the same `read_banked_spsr("abt")` helper. Either:
+  (i) the kernel writes SPSR_abt somewhere between DAH entry and the
+  throw exit (no obvious site in the disasm 0x393114..0x393944), or
+  (ii) the AArch64 view of SPSR_abt is stale by the time the probe
+  fires (the documented QEMU raspi3b banked-reg flakiness; see
+  `docs/QEMU_BUGS.md`). FVP would be a useful cross-check.
+
+### Hypothesis (B) ruled out
+
+> Recovery from fault #1 never returned to USR.
+
+This is **wrong**. The DAH success-exit for fault #1 fires with
+pre-abt USR (line 2182 in qemu5.log) and `lr_abt=0x01a00024` which
+is a USR-mode patch-table entry. The kernel does return to USR.
+Hypothesis (B) is dead.
+
+### Hypothesis (A) — partially refuted
+
+> A silently-handled earlier USR-pre-abt fault at FAR=0x0cd07400
+> left CPSR in SVC.
+
+The mode-aware dedup did **not** surface any USR-pre-abt fault at
+FAR=0x0cd07400. Only the SVC-pre-abt one is logged. So if (A) holds,
+the silent fault must be at a *different* FAR whose recovery somehow
+left CPSR in SVC for the next access at 0x0cd07400 — there is no
+direct evidence of one.
+
+### The remaining mystery — USR→SVC mode flip inside Fill body
+
+Fill enters at `0x1a4b54` in USR (`src_mode=0x10`, `sp=0x0cc82664`).
+The body 0x1a4b58..0x1a4b98 is straight-line ARM with no `cps`,
+`msr CPSR_*`, `bx pc`, or other mode-changing instruction:
+
+```
+1a4b54: stmfd sp!, {lr}    ; (probe-emulated)
+1a4b58: ldr r1, [r0, #20]  ; r1 = TRefStruct cursor = 0x0cd07400
+1a4b5c..1a4b88: arith chain  ; no faulting access (data is in r0/r1/r2/r3)
+1a4b8c: cmp r1, lr          ; cursor vs loop bound
+1a4b90: bcs 0x1a4ba8        ; not taken (cursor < bound)
+1a4b94: mov r3, r2
+1a4b98: add r2, r2, #4
+1a4b9c: str r3, [r1], #4   ; FAULT — write to L1[0xCD]=0x90 lazy region
+```
+
+So if the Fill probe's USR-source identification is correct, the
+str at 0x1a4b9c should fault from USR mode. The architecture-level
+banked SP/LR view supports that:
+
+- `USR sp=0x0cc82660` matches the probe-emulated `stmfd` push
+  (0x0cc82664 - 4 = 0x0cc82660).
+- `USR lr=0x0cd07418` matches Fill's bound-computation result at
+  0x1a4b78 (`add lr, r3, lr, lsl #2`).
+
+But `SPSR_abt=0x60000113 (SVC)` says the abort was taken from SVC.
+
+Two surviving sub-hypotheses:
+
+- **(C) QEMU AArch64↔AArch32 SPSR_abt flakiness** — `mrs spsr_abt`
+  at EL2 doesn't always reflect the just-saved CPSR. We've seen this
+  pattern enough times that an FVP cross-check is high-value.
+  `docs/QEMU_BUGS.md` already documents related x[13]/x[14]
+  misdiagnoses; this could be the SPSR sibling.
+
+- **(D) An exception fired between Fill prologue and 0x1a4b9c that
+  switched to SVC and never returned.** Candidates: alignment fault,
+  external abort, async-exception. None expected, but the architecture
+  permits asynchronous SError. Would need a probe at the SError /
+  alignment-fault entry to rule out.
+
+### Reproduction artifacts
+
+- `/tmp/phaseB-l1cd-probe/qemu5.log` — quiet boot with all nine probes
+  (`0x46–0x4E`).
+
+### Next steps
+
+1. **Cross-check on FVP.** If sub-hypothesis (C) is correct, FVP's
+   accurate banked-reg model should show consistent SPSR_abt (= SVC
+   at every read after the abort) or USR (if the abort really was
+   USR). Either resolves the ambiguity.
+2. **Probe the kernel's USR-mode fault dispatch path.** We now know
+   Fault → ResolveFault are invoked from USR via the patch-table
+   entry at `0x01a00024`. Trace what happens between DAH-exit and
+   Fault probe ENTER for fault #1 — that's where the kernel's user-
+   side stack-recovery state lives, and where the cause of the
+   wedge most likely sits.
+3. **Investigate why fault #2's DAH path takes the throw exit.** The
+   SVC-pre-abt branch at 0x393158 (`bne 0x393898`) routes to a region
+   that the disassembler labels `<UNDEFINED>`. The kernel's behaviour
+   there is implementation-defined — we should figure out exactly
+   what executes between 0x393898 and 0x3938c4 (the lr-load that sets
+   up the Throw tail-call).
+
+---
+
+## Earlier — Fault/ResolveFault probes: kernel never reaches stack-monitor for fault #2 (QEMU, 2026-04-26 night)
 
 **Plan reference:** `docs/plans/l1-cd-lazy-investigation.md` Step 5 prep.
 

@@ -180,19 +180,26 @@ halts: the `idle` task is the running task, `newt` is RDY, beacons cycle
 through `ELR=0x800a0c` / `0x3adb0c` / `0x3ad6f4` (REx + base-ROM idle
 slots), and the snapshot ring rolls cleanly.
 
+Caveat: "steady-state idle" here is the *kernel's* idle pause loop —
+`idle` task RUN, `newt` task RDY but never actually scheduled. Nothing
+ever calls into `peripherals/screen.rs::blit`, so `/tmp/newton-fb/`
+stays empty. The boot never reaches `TScreenDriver::*` (verified via
+`awk '/^trace / && !seen[$4]++' run.log`); it gets to
+`TPlatformDriver::Init` and the power-subsystem chain, then quiesces
+without ever instantiating the display driver. Getting `newt` onto
+the CPU is the next thing to chase.
+
 Next stops on the roadmap, in roughly the order we expect to hit them:
 
-- **Feed inputs.** PLAN's "responds to whatever tablet / serial /
-  network inputs we choose to feed it" goal is the next milestone.
-  Tablet is the leading candidate — `peripherals/tablet.rs` already
-  produces stylus events. Wire something that actually delivers an
-  event into the live boot and watch what happens when `newt` wakes.
-- **Snapshot resume divergence.** Resuming from a saved slot currently
-  drops the kernel's `0x0c000000+` stage-1 remap of kernel globals (e.g.
-  `gWantDeferred`@`0x0c100e58`), so the first post-resume access halts
-  with `IPA=0x0c100xxx` "outside known windows". Cold boot is fine; the
-  bug is in what the snapshot captures (or fails to capture) of the
-  guest's TTBR / ASID / TLB state.
+- **Wake `newt`.** The scheduler picks `idle` (prio=0) and never
+  schedules `newt` (prio=10, RDY) — `newt` is queued on
+  `q=0x00000000/0x0c116ed8` (some functions/wait queue), not on the
+  run queue. Figure out what event the kernel is waiting for to move
+  it. Until `newt` runs, no screen / tablet / network activity.
+- **Feed inputs.** Once `newt` schedules, the PLAN goal of "responds
+  to whatever tablet / serial / network inputs we choose to feed it"
+  is reachable. Tablet is the leading candidate —
+  `peripherals/tablet.rs` already produces stylus events.
 
 ## Resolved stops (newest first)
 

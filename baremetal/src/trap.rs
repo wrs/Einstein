@@ -314,6 +314,7 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     // into the ring even when the guest is wedged. See
     // src/snapshot.rs.
     crate::snapshot::maybe_autosave(ctx);
+    crate::fb_dump::maybe_dump();
 
     // EOI last so the GIC is ready to deliver the next interrupt.
     // No-op on BCM2836.
@@ -3607,9 +3608,11 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
                 // (stack / scratch) corrupted by the walker. Gate on
                 // the live TTBR0 value.
                 if (cp15::read_ttbr0_el1() as u32 & 0xFFFF_C000) == 0x0400_0000 {
-                    guest_mem::fix_stage1_xn_bits();
+                    let rom_dirty = guest_mem::fix_stage1_xn_bits();
                     guest_mem::install_scratch_pool_l1_section();
-                    reseed_flash_checksums_if_needed();
+                    if rom_dirty {
+                        reseed_flash_checksums_if_needed();
+                    }
                 }
                 // No cache maintenance here: the TTBR0 write handler
                 // below OR's Inner/Outer-WB cacheability bits into
@@ -3709,9 +3712,11 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
                 v
             };
             if !already && (raw & 0xFFFF_C000) == 0x0400_0000 {
-                guest_mem::fix_stage1_xn_bits();
+                let rom_dirty = guest_mem::fix_stage1_xn_bits();
                 guest_mem::install_scratch_pool_l1_section();
-                reseed_flash_checksums_if_needed();
+                if rom_dirty {
+                    reseed_flash_checksums_if_needed();
+                }
             }
         }
         (0, 3, 0, 0, false) => cp15::write_dacr32(ctx.x[rt]),

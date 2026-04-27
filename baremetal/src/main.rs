@@ -7,6 +7,7 @@ use core::arch::global_asm;
 
 mod banked;
 mod cpu;
+mod fb_dump;
 mod guest;
 mod guest_bp;
 mod guest_mem;

@@ -1,124 +1,294 @@
-# Plan — Reach the TInterpreter constructor
+# Plan — Drive Newton OS to interactive use
 
 ## Status
 
-**Phase A is done. Phase B is mid-flight.**
+**Phase A done.** Every CPU instruction and MMIO region in the early-boot
+path has a real handler; "unknown sub-case" responses are loud trip-wires.
 
-## Approach (two phases)
+**Phase B done.** Boot reaches `TInterpreter::TInterpreter` and the full
+driver suite. The `newt` task is alive and the system enters its idle
+pause loop. The per-stall chronology that got us here is in
+`INVESTIGATION.md` and the git log; the table at the bottom of this
+file is the condensed view.
 
-### Phase A — build every known-required piece as a real handler ✅ DONE
+**Now: keep fixing stops until the system works.** No more phases — each
+remaining wedge is its own commit and (where the surface is testable in
+isolation) its own `guest-tests/tests/test_<name>.S`. There is no fixed
+end-state milestone; we drive forward until the boot quiesces in a
+steady-state idle that responds to whatever tablet / serial / network
+inputs we choose to feed it.
 
-By the end of Phase A, every piece of hardware / CPU behaviour required by the 717006 ROM's early-boot path must have a *real* implementation — no per-opcode patches, no stubs. "Real" here means: when the guest executes a SWP, takes an UND exception, does an MCR to CP10, or touches a serial-chip register, our hypervisor routes that access to a proper EL2 handler (or a properly-modelled MMIO device) that does the correct thing. Unknown sub-cases return a loud error, not a silent stub value.
+## Workflow per stop
 
-Each item lands as its own commit + its own `guest-tests/tests/test_<name>.S`. If a test fails we fix it against the test, not the ROM. The ROM is not touched in Phase A.
+1. Capture the trace tail (`--features trace_once,quiet` for one-shot
+   first-touch, `trace,quiet` when a tight loop is the symptom).
+   `INVESTIGATION.md` is the running log; update it as facts accrue.
+2. Identify PC, mode, and faulting access. Cross-reference against
+   `scripts/disasm-out/rom.dis`, `_Data_/symbols.txt`,
+   `_Data_/demangled_symbols.txt`, and Einstein's source under
+   `Emulator/`. PCs ≥ 0x00800000 land in `Einstein.rex`; symbols there
+   are not in our tables — read the rex bytes via the ROM disasm
+   pipeline or step through Einstein.
+3. Run the same offset under Einstein
+   (`build/NewtonProbe baremetal/roms/newton.rom _Data_/Einstein.rex
+   30`) so we have a known-good oracle.
+4. Decide where the fix belongs:
+   - **Hypervisor handler gap** — implement / extend the relevant
+     handler in `src/peripherals/*.rs`, `src/trap.rs`, etc.
+   - **Einstein behavioural quirk we need to mirror** — port the
+     specific arm of Einstein logic into our matching path (the
+     `unknown bank #5` silent-zero in `src/mmio.rs` is the canonical
+     example).
+   - **ROM patch** — add to `src/rom_patches.rs` only when there is no
+     other layer that can host the fix. We're past the era where ROM
+     patches are routine; prefer hypervisor- or peripheral-side
+     interventions.
+   - **Deliver to the guest** — some aborts (NULL derefs, alignment,
+     external aborts) are intended to be observed by the guest's own
+     DABT vector. If the kernel has a recovery path, route the abort
+     to it instead of halting.
+5. Add a `guest-tests/tests/test_<name>.S` if the surface is testable
+   without booting the ROM. Otherwise, the cross-Einstein comparison
+   plus the live trace is the regression evidence.
+6. Re-run, go to next stall.
 
-1. **Fine-table (0b11) L1 descriptor rewrite.** ✅ Done. `HIGHLEVEL.md` §5.4 + `probe/FINDINGS.md`. The 717006 kernel installs three L1 fine-table descriptors (VA `0x78000000` / `0x90000000` / `0xAC000000`) that ARMv7 doesn't walk. Extend `guest_mem::fix_stage1_xn_bits` to rewrite type `0b11` → `0b00` (fault) in the guest's L1, so touching those VAs raises a proper stage-1 translation fault that our abort handler can see rather than looping in undefined walker behaviour. Guest test: synthesise an L1 with a fine descriptor, run the fix, verify the entry was rewritten and a subsequent stage-1 walk for that VA takes a translation fault. Test: `test_finetable_rewrite`.
+## Tools available
 
-2. **Undefined-instruction handler at EL2 (SWP + Einstein UND opcodes).** ✅ Done. Test: `test_und_handler`. ARMv7 AArch32 has no HCR_EL2 bit that traps UND directly to EL2, so we install a trampoline at the guest's UND vector (VA `0x00000004`; ROM offset 0x04 patched to a branch to a helper at ROM offset 0x00FFFF00) that HVCs to EL2. In `trap.rs`, `handle_und` reads the faulting instruction from guest memory, decodes it, and dispatches:
-   - `SWP/SWPB` (any encoding) → emulate atomically via EL2 load-store on the translated PA.
-   - `0xE6000010` (`SystemBootUND`) → NOP semantic; ELR += 8 (opcode + payload word).
-   - `0xE6000510` (`DebuggerUND`) → read the null-terminated ASCII message that follows the opcode, log it (deduped by PC), advance ELR past the aligned message tail.
-   - `0xE6000810` (`TapFileCntlUND`) → ELR += 8; read payload word, log (deduped by PC).
-   - `MCR p15, 0, Rt, c15, c1, 2` (StrongARM clock-control, ARMv4-only, UND on A53) → no-op.
-   - `MCR p15, 0, Rt, c7, c7, 0` (ARMv4 "invalidate unified cache", UND on A53) → emulate as `IC IALLUIS; DSB ISH`.
-   - Anything else → log opcode + PC + banked context dump and **halt loudly**.
+### Hosts to run under
 
-   **Trampoline redesign (Phase B discovery)**: the original push-based trampoline depended on SP_und being initialised, which BootOS doesn't do until `SetUpStacks` at 0x11EFD4 — after the first UND fires at 0x18924. Rewritten to a 4-instruction stack-free form that writes LR / SPSR to a RAM slot via a PC-relative literal pointer. Save slot also moved from `0x04000400` (overlaps the guest L1 table at TTBR0 base!) to `0x04005F00` in the RAM-mirror window.
+- **QEMU raspi3b** (default; `cargo run --release`) — fast, BCM2835
+  VIC, AArch32↔AArch64 banking quirks documented in
+  `docs/QEMU_BUGS.md`. The day-to-day driver. Wrapper:
+  `scripts/run-qemu.sh`.
+- **ARM FVP `FVP_Base_RevC-2xAEMvA`** —
+  `scripts/fvp <elf>`. Accurate reference: GICv3, generic timer +
+  cache model exact. Slow wall-clock, but required when QEMU's
+  banking weirdness is suspect or when only Tarmac will do. Add
+  `--gdb` for an Iris debug server on host port 7100. Build with
+  `--no-default-features --features platform-fvp-base`.
 
-3. **CP15 StrongARM clock-control quirk.** ✅ Done. Test: `test_cp15_strongarm_clock`. `MCR p15, 0, Rn, c15, c1, 2` handled in `handle_und` (not `handle_cp15_trap` — it UNDs at EL1 before TIDCP can trap it). Same "no-op, ELR += 4, budgeted log" pattern.
+### Trace and observation
 
-4. **`peripherals/serial.rs` — four TSerialChip implementations.** ✅ Done. Test: `test_serial`. `peripherals::serial` owns `0x0F1C_0000..0x0F20_0000`. Status register returns "TX FIFO empty + RX empty" so polling loops terminate; TX writes are consumed and logged; RX returns no-data.
+- **Function-level tracer** — `--features trace` patches every entry
+  in `scripts/classify-out/code-symbols.txt` with an HVC trampoline
+  and logs `seq PC name (mode) r0..r3 lr` on each call. Use
+  `--features trace_once` for first-touch (each function logs once
+  per session, ~2800× quieter on a long boot). `--features quiet`
+  silences the recurring diagnostic chatter (`fix_stage1_xn_bits`,
+  XN re-walks, etc.) and is almost always desirable alongside trace.
+  Trace mutates ROM, so traced runs cold-boot (snapshots saved with
+  trace off are rejected on load and vice versa).
+  Post-hoc first-call filter on a full `trace` log:
 
-5. **`peripherals/native_primitives.rs` — CP10/11 EL2 handler.** ✅ Done. Test: `test_native_primitives`. `CPTR_EL2.TFP` enabled in `guest.rs::configure_el2_traps`. `handle_fp_simd` decodes the MCR, calls `native_primitives::execute`, which matches against an encoding table. Unknown encodings halt with full context.
+  ```sh
+  awk '/^trace / && !seen[$4]++' run.log
+  ```
 
-6. **`peripherals/screen.rs` — Blit/screen primitive handler.** ✅ Done. Test: `test_screen_blit`. Registered as the screen-class dispatch target in `native_primitives`. Real blit copies into `GUEST_FB` via stage-1 + stage-2 translation.
+  Same effect as `trace_once` but lets you keep the every-call log
+  around and re-derive the first-call view (or any other dedup key
+  — `$3` for PC-uniqueness, which separates overloaded methods that
+  share a `$4` token).
+- **Tarmac windowing on FVP** — `scripts/fvp --tarmac-window=<file>
+  <elf>`. The plugin starts with tracing OFF; `src/tarmac.rs` emits
+  `<<TRM_START>>` / `<<TRM_STOP>>` on the UART and the FVP's
+  `bp.pl011_uart0.toggle_mti` flips the TarmacTrace on/off. Use to
+  capture an instruction-accurate slice around a stall instead of a
+  10+ GiB full-boot trace. `--tarmac=<file>` (no window) traces the
+  whole run.
+- **`scripts/trace-diff.sh`** — runs Einstein (`NewtonTrace`) and the
+  hypervisor with function-entry tracing on, diffs the two logs.
+  First diverging trace line is usually the right place to start.
+- **`build/NewtonProbe`** — Einstein-as-oracle. `build/NewtonProbe
+  baremetal/roms/newton.rom _Data_/Einstein.rex 30` runs the same ROM
+  under Einstein, captures every CP15 access, SWP, mode transition,
+  data abort `{PC, FAR, FSR, mode}`, and prefetch abort
+  `{PC, IFSR, mode}`. Diff vs. our trap log to localise divergence.
+  Findings cached in `probe/FINDINGS.md`.
+- **Function tracer trampoline pool** is at IPA `0x00900000..
+  0x00E00000`; tracer-side debug probes (putc buffering,
+  newt-tripwire poll, mode-13 SP_svc tracking) live in
+  `tracer::log_trace_at` and fire per-call even in `trace_once`
+  mode.
 
-7. **Einstein's ROM patches (word-write set).** ✅ Done (retroactively). `src/rom_patches.rs::apply_717006_patches` applies every `TJITGenericPatch` entry from `Einstein/Emulator/JIT/Generic/TJITGenericROMPatch.cpp` that targets the 717006 ROM: `gDebugger = 1`, `gNewtConfig = 0x8202`, "ignore setting time", "BeaconDetect no-op", "avoid screen calibration", time-base (4 words). These are known preconditions Einstein relies on — several disable code paths that would otherwise spin on hardware we don't model, and at least one (`gDebugger`) selects the driver-enabled boot path. Missing from Phase A by oversight — the omission forced us to debug Einstein-specific symptoms in Phase B that had nothing to do with our hypervisor.
+### State capture
 
-   Not yet ported (deferred, out of early-boot critical path):
-   - `TJITGenericPatchNativeCall` entries (`DebugStr`, `Debugger`,
-     `RealClockSeconds`, `FTimeInSeconds`, `FDateFromSeconds`). These
-     write a `SWI #0x8xxxxx` marker that only Einstein's JIT intercepts;
-     on real hardware the SWI would take the ROM's own SWI path. To
-     port them we'd replace the `SWI` marker with our tracer-style
-     UDF + EL2 Rust handler.
-   - `TVirtualizedCallsPatches` entries (`__rt_sdiv`, `__rt_udiv`,
-     `symcmp`). 5-word sequence with a bit-31 marker caught by
-     Einstein's `TNativePrimitives::ExecuteNative`. Safe no-op on a
-     native A53 — the ROM's own software-division routines run fine,
-     the virtualized version is only a JIT speed-up.
+- **Snapshot ring** — 4 slots at `/tmp/newton-snapshot-{0..3}.bin`,
+  autosaved every 2 s of wall-clock from `trap_irq`. `cargo run
+  --release` resumes from the newest valid slot if the ROM
+  fingerprint matches; cold-boot by `rm /tmp/newton-snapshot-*.bin`.
+  Guest-triggered save: `HVC #0x20`. Captures GUEST_RAM + GUEST_FB +
+  flash + EL1 sysregs + AArch64 GPRs (which alias every AArch32
+  banked SP/LR per ARM ARM Table D1-79).
+- **Framebuffer PNG dumps** — `/tmp/newton-fb/NNNNN.png`, written 1 s
+  after the most recent `screen::blit`. 320×480 1-bpp grayscale,
+  inverted so PNG viewers reproduce the panel. See `src/fb_dump.rs`.
 
-Phase A end state: every CPU instruction and every MMIO region touched by the early-boot path has a real handler behind it, and every known-required ROM patch Einstein applies is in place. "Unknown sub-case" responses are intentional, loud, and act as trip-wires for Phase B.
+### Debugging in flight
 
-### Phase B — boot the 717006 ROM and debug failures one at a time
+- **gdb on QEMU** — `DEBUG=1 cargo run --release` (term 1) +
+  `aarch64-elf-gdb -x scripts/gdb-init <elf>` (term 2). EL2
+  hypervisor BPs / source-line / `stepi` / `bt` work. Guest AArch32
+  BPs go through helpers in `scripts/gdb-init`:
+  - `bg <addr>` — conditional stop at `trap_sync_lower_aarch32` when
+    `$ELR_EL2 == <addr>`. Catches naturally-trapping guest insns
+    only (data/insn abort, SVC/HVC, CP15) — not UND, because the UND
+    trampoline HVCs into EL2.
+  - `bp <addr>` — patches the ROM word with `UDF #0xFFFE` so any
+    ROM-range PC stops in `handle_user_bp_und` with `faulting_pc`
+    set. Snapshot autosaves are gated while a `bp` is live.
+  - Convenience: `tt N`, `guest-state`, `bp-clear`, `bp-list`.
+- **DABT-vector DIAG HVC** at ROM offset `0x10` — every stage-1 DABT
+  passes through `handle_diag` with full banked-register context
+  before being forwarded to the kernel's DAH. Same for PABT at
+  `0x0C`. These are diagnostic scaffolding (see the section near the
+  end of this file), not load-bearing for guest correctness.
+- **Software-reset canaries** — BootOS / PowerOffAndReboot / Reboot
+  canaries in `rom_patches.rs` fire `HVC #0x42`/`0x43`/`0x44` on the
+  first call so the path is loud rather than silently re-entered.
 
-Run the Newton ROM under the hypervisor and drive toward TInterpreter. For each stall:
+### Reference and disassembly
 
-If it's clearly a loud failure for an unimplemented Einstein driver, implement that driver.
+- **`scripts/disasm-out/rom.dis`** — full symbol-annotated ROM
+  disassembly. Currently covers base ROM (≤ `0x71fc4c`) only; REx
+  is not yet pipelined through. See `docs/DISASM.md`.
+- **`docs/NEWTON_INTERNALS.md`** — APCS calling convention,
+  two-level object dispatch, ROM jump-table at `0x01A00000..
+  0x01C20000`, DDK header locations.
+- **`docs/QEMU_BUGS.md`** — raspi3b AArch64↔AArch32 quirks,
+  especially around banked registers at exception entry. Read
+  before suspecting hypervisor code at that boundary.
+- **`docs/STRUCTURES.md`** — Newton kernel data-structure layouts
+  decoded from the disasm.
+- **`docs/WORKFLOW.md`** — process notes (Einstein-driver review by
+  sub-agent; test-per-feature; finish-the-phase semantics).
+- **`docs/peripherals.md`** — peripheral implementations.
+- **`probe/FINDINGS.md`** — golden record of what a fully-booted
+  Newton actually does. Regenerate with `cmake --build build
+  --target NewtonProbe` and `build/NewtonProbe baremetal/roms/
+  newton.rom - 90`.
 
-If it's another kind of failure:
+### Test suites
 
-1. Identify the exact PC where the guest is stuck (heartbeat sampler is already in `trap.rs::trap_irq`; DIAG HVC at VA 0x10 catches any DABT with full context; the function-level tracer dumps every named-symbol call).
-2. Disassemble the ROM at that PC and consult `_Data_/symbols.txt` to name the function.
-3. Run the same offset under Einstein (`build/NewtonProbe baremetal/roms/newton.rom _Data_/Einstein.rex 30`) and compare — the probe now also records every guest data abort with `{PC, FAR, FSR, mode}`, and every prefetch abort with `{PC, IFSR, mode}`, plus the existing CP15 / SWP / mode-transition counts. Diff vs. our hypervisor trap log isolates the divergence.
-4. Reproduce the gap with a focused guest test if feasible, or directly cross-reference against Einstein / `_Data_/symbols.txt` to identify the cause.
-5. Fix the hypervisor.
-6. Re-run ROM, go to next stall.
+- `baremetal/guest-tests/scripts/run-all.sh` runs the 35 guest tests
+  on QEMU; `--platform fvp` runs the same suite on the FVP. Both
+  must stay green. See "Verification" near the end of this file.
 
-#### Phase B progress milestones
+## Current stop — NULL-pointer write at REx 0x95c444 (2026-04-27)
 
-| Date | Trace | Wedge | Resolution |
-|------|-------|-------|------------|
-| 2026-04-25 | ~108 k | recursive DABT in TStackInfo::Init | flash recovery path eliminated |
-| 2026-04-25 | ~145 k | newt-DABT alias narrows to scheduling order | IRQ-rate + tick-page divergence fixed |
-| 2026-04-26 | ~170 k | BootOS canary entry #2 (R0=0x0cc80c80) — `name`-task stack-overrun corrupts neighbour task on shared PA | **fixed** via 3-instruction ROM patch that forces per-page stack allocation in `TStackManager::ResolveFault` (mask=0xF) |
-| 2026-04-26 | 403 k+ | `Reboot` canary (kernel-driven self-reboot, R0=0xffffd8a5, LR=0x000d9888) — UnhandledException in user-mode flash-driver work | superseded by next row |
-| 2026-04-26 | ~270 k notrace | `Reboot` canary inside `TInterpreter::TInterpreter` (Phase B goal **reached**!) — fails on lazy-L1 section grow during `TRefStructStack::Fill` (DFSC=5 at FAR=0x0cd07400, L1[0xCD]=0x90 lazy marker) | **fixed** via DFSR.Domain overlay (γ-fix): handle_diag now reads L1.domain from the faulting VA's L1 entry and writes it into DFSR_EL1.bits[7:4] before forwarding to DAH (ARMv7 leaves Domain UNK on DFSC=5; kernel was reading 0). |
-| 2026-04-27 | ~2.1 M notrace | `ConvertToUnicodeFunc_Contiguous8` reading bogus TEncodingMap.+16 = 0x20000110 (out-of-stage-2 IPA) | **fixed** by adding "unknown bank #5" silent-zero arm to `mmio.rs` for IPA 0x20000000..0x30000000, matching Einstein's `TMemory::ReadP` (TMemory.cpp:1026-1034). |
-| 2026-04-27 (current) | ~24 M notrace | Boot reaches `TInterpreter::TInterpreter` and full driver suite. `newt` task alive, system in normal idle pause loop. | **Phase B goal met.** |
+```
+*** data abort ISV=0 at ELR=0x95c444 SPSR=0x20000110
+    IPA=0 FAR=0 iss=0x4e
+    SCTLR_EL1 (guest) M-bit = 1 (stage-1 ON)
+```
+
+Decoded: `iss=0x4e` ⇒ `WnR=1` (write), `DFSC=0x0e` (stage-2 permission
+fault, level 2). `FnV` clear so `FAR=0` is valid → guest accessed
+VA = 0. Stage-1 maps VA 0 → IPA 0 (kernel `L1[0]` is the small-page
+coarse table at PA 0x400, identity-mapping the first 1 MiB); stage-2
+has IPA 0..0x1000000 mapped read-only as the ROM aperture, hence the
+permission fault on the write.
+
+`ELR=0x95c444` lands in **Einstein.rex** (REx base 0x00800000, REx
+offset 0x15c444). The trace tail just before the abort:
+
+```
+trace 4147559 0x00050d18 VccOff(int)              (usr) ...
+trace 4147560 0x00050d28 VccOff(int, unsigned long) (usr) ...
+*** data abort ISV=0 at ELR=0x95c444 ...
+```
+
+`VccOff` is a PCMCIA `TCardSocket` method, so the failing write
+originates somewhere in the REx-resident PCMCIA driver path. The
+faulting instruction wasn't a plain word `LDR`/`STR` immediate, so
+`try_emulate_isv0_dabt` (`src/trap.rs:542`) declined to handle it and
+dropped to the loud halt at `src/trap.rs:462`.
+
+Next steps:
+
+- Disassemble REx around `0x95c444` to identify the instruction shape
+  (likely byte/halfword store, LDM/STM, or pre/post-indexed with
+  writeback) and whatever pointer chain produced VA=0. The disasm
+  toolchain currently only covers base ROM (up to `0x71fc4c`); extend
+  it to cover REx, or use `objdump` directly on the REx region we
+  embed.
+- Cross-check against Einstein: does `TCardSocket::VccOff` legitimately
+  hit a NULL state field on this code path in Einstein, or does
+  Einstein's PCMCIA model populate something we leave blank? Most
+  likely the latter — we currently halt loudly on every PCMCIA-class
+  surface in `src/peripherals/pcmcia.rs`.
+- Decide whether to (a) extend `try_emulate_isv0_dabt` to cover the
+  faulting instruction shape and let `mmio::write` drop it like a
+  legitimate MMIO write, (b) populate the PCMCIA state the driver
+  expects to be non-NULL, or (c) deliver the abort to the guest's
+  DABT vector and let the kernel's `UnhandledException` path run.
+
+## Resolved stops (newest first)
+
+| Date | Wedge | Resolution |
+|------|-------|------------|
+| 2026-04-27 | TEncodingMap.+16 = 0x20000110 (out-of-stage-2 IPA) at `ConvertToUnicodeFunc_Contiguous8` | mmio.rs: `0x20000000..0x30000000` "unknown bank #5" silent-zero matching Einstein's `TMemory::ReadP` (TMemory.cpp:1026-1034). Boot advanced 10× → reaches TInterpreter. |
+| 2026-04-27 | `Reboot` canary inside `TInterpreter::TInterpreter` — DFSC=5 at FAR=0x0cd07400 on lazy-L1 section grow during `TRefStructStack::Fill` (L1[0xCD]=0x90 lazy marker) | γ-fix in `handle_diag`: read L1.domain from the faulting VA's L1 entry and write it into DFSR_EL1.bits[7:4] before forwarding to DAH (ARMv7 leaves Domain UNK on DFSC=5; kernel was reading 0). |
+| 2026-04-26 | BootOS canary entry #2 (R0=0x0cc80c80) — `name`-task stack-overrun corrupts neighbour task on shared PA | 3-instruction ROM patch in `TStackManager::ResolveFault` (mask=0xF) forces per-page stack allocation. |
+| 2026-04-25 | `newt`-DABT alias narrows to scheduling order | IRQ-rate + tick-page divergence fixed. |
+| 2026-04-25 | Recursive DABT in `TStackInfo::Init` | Flash recovery path eliminated. |
 
 See `INVESTIGATION.md` for the full chain of analysis on each.
 
 ## Critical files
 
-Current layout:
-
-- `src/guest_mem.rs` — ROM load, byteswap, `fix_stage1_xn_bits` (L1 + coarse-L2 normalise; re-runs on M=0→M=1 SCTLR edges; **note: flattens ARMv4 subpage-AP to AP=011 — see INVESTIGATION.md "TCardMessage-alias wedge resolved"**), UND-vector trampoline at ROM offset 0x00FFFF00, DABT-vector DIAG HVC patch at ROM offset 0x10, `dump_stage1_walk` helper, scratch-VA L1 section installer at L1[0x60].
-- `src/trap.rs` — CP15 shim (TVM trap on writes to virtual-memory regs), HVC dispatch (UND_TAG / DIAG_TAG / DIAG_LR_TAG / SBA / tracer / canary tags), `handle_und` (SWP, SystemBoot/Debugger/TapFileCntl UND, `MCR c15,1,2` StrongARM clock, `MCR c7,c7,0` deprecated cache-invalidate), `handle_fp_simd` → CP10/11 dispatch, `handle_diag` / `handle_diag_lr` two-stage DABT-intercept stub, `handle_data_abort` with kernel-DABT forwarding for lazy stack growth.
-- `src/guest.rs` — HCR_EL2 setup (TVM, TIDCP, TSW, IMO, FMO, AMO), CPTR_EL2.TFP for CP10/11, DC bit toggling for stage-1-off vs stage-1-on regimes.
-- `src/stage2.rs` — stage-2 L1/L2/L3 tables. 2 MiB block layout for ROM/RAM/flash/FB, refined to 4 KiB L3 pages for the `0x0F000000..0x0F200000` MMIO window (non-trapping `TickPage` at IPA `0x0F181000`) and for the 64 KiB shadow-stub scratch carve-out at IPA `0x0600_0000`. `tick_page::update()` pumped from sync-trap exits and from heartbeat IRQs.
-- `src/timer.rs` — CNTHP driver; instruction-anchored synthetic ticks (no wall-clock skew between trace/no-trace runs).
-- `src/banked.rs` — AArch32 banked-register access from EL2 (SP_<mode>, LR_<mode>) per ARM ARM Table D1-79.
-- `src/peripherals/serial.rs` — four TSerialChip models.
-- `src/peripherals/serial_driver.rs` — TInternalSerialDriver native-primitive wrapper.
-- `src/peripherals/native_primitives.rs` — CP10/11 handler with encoding table.
-- `src/peripherals/screen.rs` — blit into `GUEST_FB`.
-- `src/peripherals/platform.rs` — TPlatformDriver (battery / power / wake-up).
-- `src/peripherals/battery.rs` — battery state.
-- `src/peripherals/tablet.rs` — TTabletDriver / pen input stubs.
-- `src/peripherals/sound.rs` — TSoundDriver.
-- `src/peripherals/network.rs` — TNetworkDriver.
-- `src/peripherals/printer.rs` — TPrinterDriver.
-- `src/peripherals/host_call.rs` — Newton's HostCall ABI (file/network requests routed through Einstein-style hooks).
-- `src/peripherals/in_translator.rs`, `out_translator.rs` — translator native-primitive plumbing.
-- `src/peripherals/flash.rs`, `flash_driver.rs` — Newton flash filesystem + TFlash driver.
-- `src/peripherals/vic.rs` — interrupt controller + tick clock; `K_HDWR_TICKS` advances a non-trapping RAM page driven by sync-trap progress + heartbeat.
-- `src/peripherals/dma.rs`, `pcmcia.rs` — DMA + PCMCIA.
-- `src/mmio.rs` — routes `0x0F1C_0000..0x0F20_0000` to `serial`, plus VIC / DMA / PCMCIA / stub dispatch and `0x3000_0000..0x5000_0000` to `pcmcia`.
-- `src/rom_patches.rs` — Einstein word-write patches; debugger HVC injections (DebugStr / Debugger / RealClockSeconds / FTimeInSeconds / FDateFromSeconds); GetClock / SetAlarm wrap-detect ls→cc fixes; `PowerOffAndReboot`, `Reboot`, `BootOS` software-reset canaries; **`TStackManager::ResolveFault` per-page-stack-allocation patches (mask=0xF, three sites in 0x001f7a10..0x001f7c24) that fix the BootOS-canary wedge**.
-- `src/shadow_stub.rs` — BE-32 byte/halfword-access patcher with three stub variants: `DeadReg` (preferred — no save/restore), `Stack` (regression-test-only), `ScratchVA` (live fallback — saves caller scratch into a 64 KiB hypervisor carve-out at VA/IPA `0x0600_0000`, plus TPIDRURW for the third register). 16-word stub layout. Pool capacity 32 764 stubs; scratch-slot capacity 8 192 (1 695 used in live ROM).
+- `src/guest_mem.rs` — ROM load + byteswap; `fix_stage1_xn_bits` (L1 +
+  coarse-L2 normalise; flattens ARMv4 subpage-AP to AP=011; skips the
+  shadow-stub scratch L1 slot so it doesn't fight the installer; now
+  returns `bool` indicating whether ROM bytes mutated this call so
+  flash-checksum reseeds skip when nothing changed); UND-vector
+  trampoline at ROM offset `0x00FFFF00`; DABT-vector DIAG HVC patch at
+  ROM offset `0x10`; `dump_stage1_walk`; scratch-VA L1 section
+  installer at `L1[0x60]`.
+- `src/trap.rs` — CP15 shim (TVM trap on writes to VM regs); HVC
+  dispatch (UND_TAG / DIAG_TAG / DIAG_LR_TAG / SBA / tracer / canary
+  tags); `handle_und` (SWP, SystemBoot/Debugger/TapFileCntl UND, MCR
+  c15,1,2 StrongARM clock, MCR c7,c7,0 deprecated cache-invalidate);
+  `handle_fp_simd` → CP10/11; two-stage `handle_diag` /
+  `handle_diag_lr` DABT-intercept stub; `handle_data_abort` with
+  kernel-DABT forwarding for lazy stack growth; `try_emulate_isv0_dabt`
+  for ISV=0 word LDR/STR.
+- `src/guest.rs` — HCR_EL2 (TVM, TIDCP, TSW, IMO, FMO, AMO);
+  CPTR_EL2.TFP for CP10/11; DC bit toggling across stage-1 on/off.
+- `src/stage2.rs` — stage-2 L1/L2/L3. 2 MiB blocks for ROM/RAM/flash/FB;
+  4 KiB L3 pages for the MMIO window `0x0F000000..0x0F200000` and the
+  64 KiB shadow-stub scratch carve-out at IPA `0x0600_0000`.
+- `src/timer.rs` — CNTHP driver; instruction-anchored synthetic ticks.
+- `src/banked.rs` — AArch32 banked-register access from EL2 per
+  ARM ARM Table D1-79.
+- `src/peripherals/{serial,serial_driver,native_primitives,screen,
+  platform,battery,tablet,sound,network,printer,host_call,
+  in_translator,out_translator,flash,flash_driver,vic,dma,pcmcia}.rs`
+  — Newton driver / native-primitive surface.
+- `src/mmio.rs` — routes the MMIO window plus the `0x20000000..
+  0x30000000` "unknown bank #5" silent-zero arm and PCMCIA banks.
+- `src/rom_patches.rs` — Einstein word-write patches; debugger HVC
+  injections; GetClock / SetAlarm wrap-detect ls→cc fixes;
+  PowerOffAndReboot / Reboot / BootOS canaries; `TStackManager::
+  ResolveFault` per-page-stack-allocation patches.
+- `src/shadow_stub.rs` — BE-32 byte/halfword-access patcher (DeadReg /
+  Stack / ScratchVA stub variants; 16-word stub layout).
 - `src/snapshot.rs` — rolling ring under `/tmp/newton-snapshot-{0..3}.bin`.
-- `src/tracer.rs` — function-level tracer (HVC trampolines on every `code-symbols.txt` entry); per-function one-shot probes (e.g. `dump_movefreeblock_entry` for the `name`-task SP / stack-page diagnostic).
-- `src/guest_bp.rs` — guest breakpoint / `bp <addr>` infrastructure for the gdb workflow.
-- `src/task_dump.rs` — TScheduler / TTask data-structure dumps from EL2.
-- `src/tarmac.rs` — Tarmac-like instruction-trace markers (`<<TRM_START>>` / `<<TRM_STOP>>`).
-- `src/unaligned.rs` — `handle_align_fault` emulator for SCTLR.A=1-induced unaligned LDR/STR aborts.
-- `guest-tests/tests/` — 35 tests covering CPU / MMIO / driver paths (test_hello, test_vic, test_flash, test_dma, test_pcmcia, test_cp15_fault_regs, test_finetable_rewrite, test_und_handler, test_cp15_strongarm_clock, test_midr, test_mmio_regs, test_rtc_calendar, test_rom_patches, test_serial, test_native_primitives, test_flash_driver, test_platform_driver, test_screen_blit, test_snapshot, test_shadow_stub, test_spsr_eret, test_spsr_eret_und, test_rotate_ldr, test_battery, test_tablet, test_serial_driver, test_translators, test_host_call, test_network, test_printer, test_sound, test_bio_bank, test_alarm, test_dma_irq, test_gpio).
-- `guest-tests/scripts/run-test.sh` — clears `/tmp/newton-snapshot-*.bin` before each run so a stale snapshot can't cause a test to resume mid-run.
+- `src/tracer.rs` — function-level tracer (HVC trampolines on every
+  `code-symbols.txt` entry); `trace_once` feature gates the per-call
+  trace line behind a fired-bitmap so each function logs at most once.
+- `src/fb_dump.rs` — 1 s after each `screen::blit`, dumps GUEST_FB to
+  `/tmp/newton-fb/NNNNN.png` via Arm semihosting.
+- `src/guest_bp.rs` — `bp <addr>` infrastructure for the gdb workflow.
+- `src/task_dump.rs` — `TScheduler` / `TTask` dumps from EL2.
+- `src/tarmac.rs` — Tarmac-like instruction-trace markers.
+- `src/unaligned.rs` — `handle_align_fault` emulator for SCTLR.A=1
+  unaligned LDR/STR aborts.
+- `guest-tests/tests/` — 35 tests; `guest-tests/scripts/run-test.sh`
+  clears snapshots before each run.
 
 ## Verification
 
-Each Phase A / Phase B commit:
+Each commit:
 
 ```
 baremetal/guest-tests/scripts/run-all.sh
@@ -126,23 +296,26 @@ baremetal/guest-tests/scripts/run-all.sh
 
 All 35 tests pass at the current commit.
 
-## Explicit non-goals for this plan
+## Non-goals
 
-- Real screen emulation beyond a framebuffer dump — no compositor, no pen input.
-- Package loading — needs a solution for embedded native code
+- Real screen emulation beyond the framebuffer dump — no compositor,
+  no pen input.
+- Package loading — needs a solution for embedded native code.
 
 ## Diagnostic scaffolding
 
-These items should come off once the system is stable — leave them in
-for now because they're load-bearing for the current debugging loop:
+These are load-bearing for the current stop-fixing loop and stay until
+the boot is steady-state-quiet:
 
-- DABT-vector HVC patch at ROM offset 0x10 (`guest_mem.rs::patch_dabt_vector`) → two-stage `handle_diag` / `handle_diag_lr` in `trap.rs`. Catches every stage-1 DABT with full banked-register context.
-- PABT-vector HVC patch at ROM offset 0x0C — same DIAG path; tripwire for prefetch aborts.
-- `handle_diag_from_bp` hook in `guest_bp.rs::handle_user_bp_und` — lets a `bp <addr>` hit hand off to the banked-reg dump stub.
-- 500-entry trap log budget at the top of `trap_sync_lower_aarch32`; HVC #0x50 (tracer TAG) suppressed to avoid doubling trace output.
-- Bring-up-critical VA walks in `handle_diag`.
-- `tracer.rs::dump_movefreeblock_entry` one-shot probe at the `name`-task `MoveFreeBlock(0x0c2041e0, 0x20)` call — the regression diagnostic for the per-page-stack-allocation fix; stays in tree until the Phase-B chain is fully resolved.
-- BootOS / PowerOffAndReboot / Reboot canaries in `rom_patches.rs` — fire `HVC #0x42`/`0x43`/`0x44` on the first call rather than letting the kernel quietly re-enter and obscure the cause.
+- DABT-vector HVC patch at ROM offset `0x10` →
+  `handle_diag` / `handle_diag_lr` in `trap.rs`. Catches every stage-1
+  DABT with full banked-register context.
+- PABT-vector HVC patch at ROM offset `0x0C` — same DIAG path.
+- `handle_diag_from_bp` hook in `guest_bp.rs::handle_user_bp_und`.
+- 500-entry trap log budget at the top of `trap_sync_lower_aarch32`;
+  HVC `#0x50` (tracer TAG) suppressed to avoid doubling trace output.
+- Bring-up VA walks in `handle_diag`.
+- BootOS / PowerOffAndReboot / Reboot canaries in `rom_patches.rs`.
 
-Once we're confident no silent abort is hiding, these can be pulled; the
-behavioural invariants they enforce are already codified in guest tests.
+Once the boot quiesces these can be pulled; the behavioural invariants
+they enforce are codified in guest tests.

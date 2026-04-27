@@ -42,9 +42,13 @@
 //! can't be safely rewritten (unsupported PC-relative form), that function
 //! is skipped and counted; no silent data corruption.
 //!
-//! No first-touch disabling: every call fires the HVC. The trampoline
-//! never removes itself, so a second invocation of the same function
-//! produces a second trace line.
+//! Two log modes:
+//!   - default (`--features trace`): every call produces a trace line.
+//!   - first-touch (`--features trace_once`): each function's main
+//!     trace line is emitted once per session, gated on `FIRED_BITMAP`
+//!     in `log_trace_at`. The trampoline itself still fires on every
+//!     call so targeted debug side-effects (putc buffering, newt-
+//!     tripwire poll, mode-13 SP_svc tracking) keep working.
 //!
 //! Changes the snapshot ROM fingerprint (many ROM words move), so runs
 //! with `trace` enabled always cold-boot in practice.
@@ -79,6 +83,36 @@ const SLOT_SIZE: u32 = (SLOT_WORDS as u32) * 4;
 
 /// Sequence counter for the trace log. Bumped on every HVC fire.
 static mut TRACE_SEQ: u32 = 0;
+
+/// Per-function "already logged" bitmap, used by the `trace_once`
+/// feature to gate the main trace line. One bit per slot index;
+/// `fetch_or` makes the test+set race-free even if a future change
+/// makes EL2 multi-entrant.
+#[cfg(feature = "trace_once")]
+const FIRED_BITMAP_WORDS: usize = (FN_COUNT + 31) / 32;
+#[cfg(feature = "trace_once")]
+static FIRED_BITMAP: [core::sync::atomic::AtomicU32; FIRED_BITMAP_WORDS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; FIRED_BITMAP_WORDS];
+
+/// Test-and-set the fired bit for slot `idx`. Returns `true` if this
+/// function has already logged its main trace line in this session.
+/// Always returns `false` when the `trace_once` feature is off, so the
+/// caller's `if !already_fired(idx)` reduces to an unconditional log.
+#[inline]
+fn already_fired(_idx: usize) -> bool {
+    #[cfg(feature = "trace_once")]
+    {
+        let word = _idx / 32;
+        let bit = 1u32 << (_idx & 31);
+        let prev = FIRED_BITMAP[word]
+            .fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
+        return (prev & bit) != 0;
+    }
+    #[cfg(not(feature = "trace_once"))]
+    {
+        false
+    }
+}
 
 /// True once `init()` has installed the trampolines. Prevents double-install
 /// if called from multiple boot paths (e.g. cold boot vs. snapshot resume).
@@ -427,15 +461,17 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
         return;
     }
 
-    kprintln!(
-        "trace {:5} {:#010x} {} ({}) r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} lr={:#010x}",
-        seq,
-        fn_addr(idx),
-        fn_name(idx),
-        mode_label,
-        ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
-        cur_lr,
-    );
+    if !already_fired(idx) {
+        kprintln!(
+            "trace {:5} {:#010x} {} ({}) r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} lr={:#010x}",
+            seq,
+            fn_addr(idx),
+            fn_name(idx),
+            mode_label,
+            ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
+            cur_lr,
+        );
+    }
 
     // newt-tripwire (per-trace-event poll): catches the first trace
     // event after PA 0x0402a250 (= pckm's user stack at sp_usr+8) is

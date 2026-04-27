@@ -299,7 +299,12 @@ pub fn write_byte_pa(pa: u32, value: u8) -> bool {
 /// We walk the tables once, when the guest first writes TTBR0 (CP15
 /// c2 c0 0). Tables in ROM are modified via our backing store — guests
 /// see ROM as stage-2 read-only, but from EL2 we own the bytes.
-pub fn fix_stage1_xn_bits() {
+///
+/// Returns `true` iff this call actually wrote bytes into the ROM
+/// backing store (an L2 entry inside ROM was rewritten). The flash
+/// ROM/REx checksums only need re-seeding when ROM has changed, so
+/// callers gate `reseed_flash_checksums_if_needed` on the return.
+pub fn fix_stage1_xn_bits() -> bool {
     let ram = addr_of_mut!(GUEST_RAM) as *mut u32;
     let rom = addr_of_mut!(GUEST_ROM) as *mut u32;
 
@@ -307,9 +312,22 @@ pub fn fix_stage1_xn_bits() {
     let mut patched = 0usize;
     let mut sections_patched = 0usize;
     let mut fine_to_fault = 0usize;
+    let mut rom_writes = 0usize;
+
+    let scratch_l1_idx = (crate::shadow_stub::SCRATCH_POOL_VA >> 20) as usize;
 
     // L1 sits at the start of guest RAM (TTBR0 = 0x0400_0000 per probe).
     for i in 0..4096 {
+        // Skip the shadow-stub scratch L1 slot — it's owned by
+        // `install_scratch_pool_l1_section`, which installs a section
+        // with XN=1. The section-normalisation block below would clear
+        // XN every M-toggle, forcing the installer to re-set it on
+        // each task switch. Leave the slot alone; the installer
+        // handles it.
+        if i == scratch_l1_idx {
+            continue;
+        }
+
         // SAFETY: L1 is 16 KiB = 4096 × 4 bytes, at RAM[0..16384].
         let entry = unsafe { ram.add(i).read() };
         let typ = entry & 3;
@@ -365,6 +383,7 @@ pub fn fix_stage1_xn_bits() {
         } else {
             continue;
         };
+        let is_rom = region_start == 0;
         let l2_idx_start = (l2_pa - region_start) / 4;
         if l2_idx_start + 256 > region_size / 4 {
             continue;
@@ -390,6 +409,9 @@ pub fn fix_stage1_xn_bits() {
             if new != e {
                 unsafe { ptr.write(new); }
                 patched += 1;
+                if is_rom {
+                    rom_writes += 1;
+                }
             }
         }
     }
@@ -427,6 +449,8 @@ pub fn fix_stage1_xn_bits() {
             seq, last, cur_cd
         );
     }
+
+    rom_writes > 0
 }
 
 /// ARMv7 short-descriptor section attributes for the shadow-stub

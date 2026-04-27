@@ -298,6 +298,24 @@ pub const NEW_STATE_PROBE_HVC_IMM:       u32 = 0x4D;
 /// DataAbortHandler is exiting to USR after fault #1's recovery vs.
 /// not exiting at all (hypothesis B). See plan Step 6c.
 pub const DAH_USR_RETURN_PROBE_HVC_IMM:  u32 = 0x4E;
+/// QEMU raspi3b workaround: replace the `mrs r1, SPSR` at the head of
+/// `DataAbortHandler` (PC 0x00393144) with an HVC. Empirically (see
+/// qemu7.log lines 2237/2252 and the `[mrs] -- mrs DIVERGES FROM SAVED
+/// SLOT --` marker in the dabt-forward log) `mrs spsr_abt` from EL2
+/// returns a stale value relative to the trampoline-saved SPSR_abt.
+/// Writing `msr spsr_abt, <saved>` from EL2 before ERETing to DAH did
+/// **not** propagate to the kernel's later AArch32 ABT-mode `mrs r1,
+/// SPSR` — the kernel still saw the stale value and branched to the
+/// throw exit at 0x393158, rebooting on the L1[0xCD]=0x90 fault that
+/// the recovery path would otherwise have grown lazily. The handler
+/// for this HVC reads the trampoline-saved SPSR_abt at
+/// `DABT_SAVE_PA + 8` and writes it into `ctx.x[1]`, so the kernel's
+/// next instruction (`and r1, r1, #31`) sees the architecturally-
+/// correct mode bits regardless of QEMU's staleness. On FVP the
+/// trampoline-saved value matches what `mrs r1, SPSR` would have
+/// returned, so this patch is functionally a no-op there. Mirrors
+/// docs/QEMU_BUGS.md Bug #1's banked-LR workaround.
+pub const DAH_MRS_SPSR_HVC_IMM:          u32 = 0x4F;
 
 const REMEMBER_STATIC_PC:            u32 = 0x0025_8E0C;
 const REMEMBER_STATIC_FIRST_INSN:    u32 = 0xE1A0_C00D; // mov ip, sp
@@ -334,6 +352,13 @@ const NEW_STATE_FIRST_INSN:          u32 = 0xE1A0_C00D; // mov ip, sp
 pub const DAH_USR_RETURN_PC:         u32 = 0x0039_3B80;
 pub const DAH_THROW_EXIT_PC:         u32 = 0x0039_3944;
 const MOVS_PC_LR_INSN:               u32 = 0xE1B0_F00E;
+/// `mrs r1, SPSR` at DAH entry (4th instruction past the function
+/// label, after the DACR setup). Original encoding `0xE14F_1000`. We
+/// replace it with `HVC #DAH_MRS_SPSR_HVC_IMM` so the EL2 handler can
+/// supply the architecturally-correct SPSR_abt from the trampoline-
+/// saved slot, working around QEMU raspi3b's stale `mrs spsr_abt`.
+pub const DAH_MRS_SPSR_PC:           u32 = 0x0039_3144;
+const DAH_MRS_SPSR_INSN:             u32 = 0xE14F_1000;
 
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
@@ -487,6 +512,17 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(DAH_USR_RETURN_PROBE_HVC_IMM),
             "DataAbortHandler throw exit (movs pc, lr)",
             DAH_USR_RETURN_PROBE_HVC_IMM,
+        );
+        // QEMU raspi3b workaround: patch the kernel's `mrs r1, SPSR`
+        // at DAH entry (0x393144) so EL2 can substitute the
+        // trampoline-saved SPSR_abt for the stale `mrs spsr_abt`.
+        patch_probe(
+            rom_ptr,
+            DAH_MRS_SPSR_PC,
+            DAH_MRS_SPSR_INSN,
+            hvc_insn(DAH_MRS_SPSR_HVC_IMM),
+            "DataAbortHandler mrs r1, SPSR (QEMU spsr_abt staleness fix)",
+            DAH_MRS_SPSR_HVC_IMM,
         );
     }
 }

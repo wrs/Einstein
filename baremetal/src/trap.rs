@@ -965,6 +965,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::DAH_USR_RETURN_PROBE_HVC_IMM => {
             handle_dah_usr_return_probe(ctx);
         }
+        v if v == crate::rom_patches::DAH_MRS_SPSR_HVC_IMM => {
+            handle_dah_mrs_spsr_patch(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -2303,6 +2306,16 @@ fn handle_dah_usr_return_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
     let lr_abt = ctx.x[20] as u32;
     let spsr_abt = read_banked_spsr("abt") as u32;
     let pre_abt_mode = spsr_abt & 0x1F;
+    // Cross-check `mrs spsr_abt` against the trampoline-saved SPSR_abt
+    // at `DABT_SAVE_PA + 8` (written by the AArch32 DABT vector
+    // trampoline on entry to ABT mode, before any kernel code runs).
+    // QEMU raspi3b returns stale SPSR_abt for `mrs` reads from EL2
+    // (docs/QEMU_BUGS.md Bug #1); the saved-slot is unaffected. A
+    // divergence here pins the fault-#2 mode-flip mystery on (C) QEMU
+    // mrs staleness rather than (D) an asynchronous mode change inside
+    // DAH. See plan Step 8 / 6c.
+    let spsr_abt_save = guest_mem::read_word_pa(guest_mem::DABT_SAVE_PA + 8).unwrap_or(0);
+    let pre_abt_mode_save = spsr_abt_save & 0x1F;
     let elr = read_sysreg!("elr_el2") as u32;
     // ELR_EL2 = patched_pc + 4 because HVC entry from AArch32 stores the
     // PC of the instruction *after* the HVC (DDI 0487 G1.11.1).
@@ -2316,6 +2329,11 @@ fn handle_dah_usr_return_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
         "DAH-exit probe ({} @ {:#010x}): src_mode={:#x} ({}) lr_abt={:#010x} sp_abt={:#010x} spsr_abt={:#010x} (pre-abt mode={:#x} = {})",
         site, site_pc, mode, describe_aarch32_mode(mode),
         lr_abt, sp_abt, spsr_abt, pre_abt_mode, describe_aarch32_mode(pre_abt_mode)
+    );
+    kprintln!(
+        "DAH-exit probe ({} @ {:#010x}): saved-slot SPSR_abt={:#010x} (pre-abt mode={:#x} = {}){}",
+        site, site_pc, spsr_abt_save, pre_abt_mode_save, describe_aarch32_mode(pre_abt_mode_save),
+        if pre_abt_mode_save != pre_abt_mode { "  *** MRS DIVERGES FROM SAVED SLOT ***" } else { "" },
     );
     // Emulate `movs pc, lr`:
     //   - PC ← lr_abt
@@ -2332,6 +2350,46 @@ fn handle_dah_usr_return_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
             pc = in(reg) lr_abt as u64,
             sp = in(reg) spsr_abt as u64,
             options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Handler for the patched `mrs r1, SPSR` at DAH PC 0x393144. Substitutes
+/// the trampoline-saved SPSR_abt (architecturally correct on every
+/// platform) for the kernel's `mrs r1, SPSR` result, working around
+/// QEMU raspi3b's stale `mrs spsr_abt`. See plan Step 7 / qemu7.log
+/// analysis: with the EL2 `msr spsr_abt` write alone the kernel's
+/// AArch32 ABT-mode `mrs r1, SPSR` still returned the stale value and
+/// branched to the throw exit at 0x393158 on the L1[0xCD]=0x90 fault.
+/// Patching the kernel's `mrs` directly bypasses that staleness so DAH
+/// takes the recovery path; on FVP the saved-slot equals what `mrs r1,
+/// SPSR` would have returned, so this is functionally a no-op there.
+fn handle_dah_mrs_spsr_patch(ctx: &mut TrapContext) {
+    let spsr_abt_save = guest_mem::read_word_pa(
+        guest_mem::DABT_SAVE_PA + 8,
+    ).unwrap_or(0);
+    let r1_in = ctx.x[1] as u32;
+    // Cross-check: also read `mrs spsr_abt` from EL2. If it disagrees
+    // with the saved slot, that's the documented QEMU staleness. We
+    // always use the saved-slot value (architecturally correct on
+    // every platform).
+    let mrs_view = read_banked_spsr("abt") as u32;
+    // Replace r1 with the trampoline-saved SPSR_abt. Natural ERET
+    // resumes at the post-HVC PC (= 0x393148, the kernel's
+    // `and r1, r1, #31`).
+    ctx.x[1] = (ctx.x[1] & 0xFFFF_FFFF_0000_0000)
+        | (spsr_abt_save as u64);
+    static FIRED: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+    let n = FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if n < 16 {
+        kprintln!(
+            "DAH-mrs-patch[{}]: r1_in={:#010x} mrs={:#010x} saved-slot={:#010x} (pre-abt mode={:#x} = {}){}",
+            n, r1_in, mrs_view, spsr_abt_save, spsr_abt_save & 0x1F,
+            describe_aarch32_mode(spsr_abt_save & 0x1F),
+            if (mrs_view & 0x1F) != (spsr_abt_save & 0x1F) {
+                "  *** MRS DIVERGES ***"
+            } else { "" },
         );
     }
 }
@@ -2928,17 +2986,28 @@ use guest_mem::{read_byte_pa as read_guest_byte_pa,
 fn log_dabt_forward(dfsc: u32, far: u32, mode: u32, ctx: &TrapContext) {
     let spsr_abt = read_banked_spsr("abt") as u32;
     let pre_abt_mode = spsr_abt & 0x1F;
+    // Cross-check `mrs spsr_abt` against the trampoline-saved SPSR_abt
+    // (docs/QEMU_BUGS.md Bug #1: QEMU raspi3b returns stale spsr_abt
+    // for `mrs` from EL2). The trampoline writes the slot before any
+    // kernel code runs, so the slot is the architecturally-correct
+    // pre-abt CPSR.
+    let spsr_abt_save = guest_mem::read_word_pa(guest_mem::DABT_SAVE_PA + 8).unwrap_or(0);
+    let pre_abt_mode_save = spsr_abt_save & 0x1F;
     const SEEN_CAP: usize = 16;
     static mut SEEN: [(u32, u32, u32); SEEN_CAP] = [(0, 0, 0); SEEN_CAP];
     static mut SEEN_N: usize = 0;
+    // Dedup on the saved-slot mode (architecturally correct) so a single
+    // physical fault doesn't double-print just because `mrs spsr_abt`
+    // reads a different (stale) value than the saved slot.
+    let dedup_mode = pre_abt_mode_save;
     // SAFETY: single-threaded EL2.
     let first = unsafe {
         let mut found = false;
         for i in 0..SEEN_N {
-            if SEEN[i] == (far, mode, pre_abt_mode) { found = true; break; }
+            if SEEN[i] == (far, mode, dedup_mode) { found = true; break; }
         }
         if !found && SEEN_N < SEEN_CAP {
-            SEEN[SEEN_N] = (far, mode, pre_abt_mode);
+            SEEN[SEEN_N] = (far, mode, dedup_mode);
             SEEN_N += 1;
             true
         } else {
@@ -2967,8 +3036,15 @@ fn log_dabt_forward(dfsc: u32, far: u32, mode: u32, ctx: &TrapContext) {
             dfsc, far, mode
         );
         kprintln!(
-            "  LR_abt={:#010x} (faulting PC={:#010x}) SP_abt={:#010x} SPSR_abt={:#010x} (pre-abt mode={:#x})",
-            lr_abt, faulting_pc, sp_abt, spsr_abt, spsr_abt & 0x1F
+            "  LR_abt={:#010x} (faulting PC={:#010x}) SP_abt={:#010x} SPSR_abt={:#010x} (pre-abt mode={:#x}){}",
+            lr_abt, faulting_pc, sp_abt, spsr_abt, spsr_abt & 0x1F,
+            if pre_abt_mode_save != pre_abt_mode {
+                "  [mrs] -- mrs DIVERGES FROM SAVED SLOT --"
+            } else { "" },
+        );
+        kprintln!(
+            "  saved-slot SPSR_abt={:#010x} (pre-abt mode={:#x} = {})",
+            spsr_abt_save, pre_abt_mode_save, describe_aarch32_mode(pre_abt_mode_save),
         );
         kprintln!(
             "  USR sp={:#010x} lr={:#010x}   SVC sp={:#010x} lr={:#010x}",

@@ -121,75 +121,80 @@ both VAs end up RW pointing to the same PA after we flatten to AP=011.
 
 ### Investigation progress
 
-Three probes installed; the third caught the aliases.
+Four probes installed; the third+fourth narrowed Group-2 to
+deliberate stack-guard sharing.
 
 1. **`TUDomainManager::Get` page-allocator** (HVC #0x53 on `0x00258EFC`).
-   28 Get calls in baseline boot, all from `caller_lr=0x001F87C0`
-   (AllocNewPage), all count=2, all distinct PageIds. **0
-   duplicates.** Get is NOT recycling PAs at the bookkeeping level.
+   28 Get calls; 0 duplicates. Get is NOT recycling PAs.
 
-2. **`Remember (static)`** at `0x00258E0C` (added per-PA → first-VA
-   tracker to `handle_remember_entry_probe_with`). 7 ENTER lines,
-   **0 `Remember ALIAS:` lines** — but the underlying alias detector
-   was mis-decoded (treated r3 as a PA when r3 is the TPhys-pointer
-   passed unchanged to `GenericSWI`). Even with correct decoding it
-   would still miss the kernel-internal paths.
+2. **`Remember (static)`** at `0x00258E0C` (HVC #0x46, augmented
+   per-PA tracker). 0 `Remember ALIAS:` lines, but the alias detector
+   mis-decoded the args (treated r3 as a PA when r3 is the TPhys-
+   pointer passed through to `GenericSWI`). Still wouldn't have
+   caught the kernel-internal paths.
 
-3. **`PrimRememberMapping` at `0x00163480`** — HVC #0x54. **Catches
-   all 12 Group-2 aliases.** The signature was originally documented
-   as `(env, va, &TPhys, perm)` but per disasm is actually
-   `(va=r0, mask=r1, &TPhys=r2, perm=r3)`; the first-iteration probe
-   miscoded this, registering false positives on incremental-subpage
-   widening (mask=0x3 → 0xf → 0x3f → 0xff for the same VA). Fixed.
+3. **`PrimRememberMapping` at `0x00163480`** (HVC #0x54). Caught
+   all 12 Group-2 aliases. Signature is
+   `(va=r0, mask=r1, &TPhys=r2, perm=r3)`; mask in r1 is the
+   incremental-subpage activation mask (same va called repeatedly
+   with widening 0x3 → 0xff). Probe walks RememberMapping's APCS
+   frame to capture the upstream caller LR. Distribution across
+   13 unique aliased PAs:
+   - `0x000d8e3c` (GenericSWIHandler / SWI #12 dispatch): 13 (all)
+   - `0x001f775c` (CopyPagesAfterStackCollided 2nd RM call): 9
+   - `0x001f76bc` (CopyPagesAfterStackCollided 1st RM call): 2
 
-   The probe also walks RememberMapping's APCS frame (`fp - 4`) to
-   capture the upstream caller of `RememberMapping__FUlN31Uc` (the
-   call site that issued the BL into RememberMapping itself). The
-   distribution across 13 unique aliased PAs:
+4. **`PrimForgetMapping` at `0x00163514`** (HVC #0x55). Hoisted the
+   per-PA → first-VA tracker into module-level statics so both
+   probes manipulate the same arrays. A matched forget clears the
+   slot; mismatched ones log `FORGET MISMATCH:`. Cold-boot deltas:
 
-   - `0x000d8e3c` (GenericSWIHandler, SWI #12 dispatch): 13 PAs (all)
-   - `0x001f775c` (CopyPagesAfterStackCollided #2): 9 PAs
-   - `0x001f76bc` (CopyPagesAfterStackCollided #1): 2 PAs
+   | metric              | iter 1 (Remember) | iter 2 (+Forget) |
+   |---------------------|------------------:|-----------------:|
+   | `Prim ALIAS:` lines |               106 |               55 |
+   | unique aliased PAs  |                13 |               12 |
+   | `FORGET MISMATCH:`  |               n/a |                8 |
 
-   Group-1 aliases (PA=0x04004000-0x04006000, kernel-globals
-   self-mapping) do NOT pass through Prim — they're created by
-   direct kernel L2 writes during TTBR0 setup.
+   The 12 surviving PAs are **real aliases**: kernel installed PA
+   at VA1, then at VA2, with no intervening forget. **All 12 come
+   through `0x000d8e3c` (GenericSWIHandler, SWI #12)** — i.e.
+   user-mode `Remember (static)` calls. The aliased VAs land on
+   the 32-KiB stack-stride pattern (e.g. PA=0x04028000 mapped at
+   0xc310000, 0xc318000, 0xc320000), confirming **Group-2 stack-
+   guard sharing**: the kernel deliberately makes the LAST page of
+   stack N the FIRST page of stack N+1 (ARMv4 subpage AP gave each
+   stack its own half; ARMv7 collapses to AP=011 → real alias).
 
-### Next iteration — narrow Group-2 + stage-2 trap for Group-1
+   Group-1 aliases (PA=0x04004000-0x04006000) still don't pass
+   through Prim — they remain direct kernel L2 writes during TTBR0
+   setup.
 
-**Group-2 (Prim catches these — narrow further):**
+### Next iteration — identify user-mode SWI #12 caller, then patch
 
-a. Probe `ForgetMapping` (called from `CopyPagesAfterStackCollided`
-   immediately before `RememberMapping`) at `0x001f75f4` to confirm
-   whether the OLD VA→PA mapping is actually cleared from L2 before
-   the NEW mapping installs. If ForgetMapping leaves stale entries,
-   that's the bug; if not, the alias originates from a SWI #12 path
-   that doesn't pair with a ForgetMapping.
+**Step 1 — recover user-mode caller PC at SWI boundary.**
+At `handle_prim_remember_probe_with` entry the source mode is SVC
+(SWI dispatch). The Newton SWI vector pushes USR R0..R15 onto SP_svc
+before branching to GenericSWIHandler. Read the saved-PC slot in
+that frame to get the instruction-after-`swi #12`. Group aliases
+by user-mode caller; the most-frequent caller is the patch target
+(likely `FMNewStack` based on prior 36-KiB attempt).
 
-b. For the GenericSWIHandler/SWI #12 path, walk the SWIBoot save
-   area at the kernel-side dispatch entry to recover the user-mode
-   caller PC (above the SWI boundary). The likely callers are
-   `FMNewStack`, `LockHeapRange`, `UnlockHeapRange` — already
-   touched by existing per-allocator patches, so we may need to
-   ratchet those (e.g. extend the 4-KiB chunk-size patch to a
-   per-allocator exclusivity guarantee).
+**Step 2 — design FMNewStack non-sharing patch.**
+Two patterns to consider, given the previous 36-KiB attempt's slot-
+size collision with the heap domain page-table:
 
-c. Cross-check Newton's `TUPageManager::Get` PageId encoding —
-   `count=2` from the page-allocator means two physical pages per
-   PageId. If only ONE is owned by the callee and the other ends
-   up unclaimed, a later allocation may re-claim that PA from
-   elsewhere → alias.
+a. Pad allocation, keep stride: allocate 36 KiB physical (9 × 4 KiB)
+   per stack but keep the 32-KiB VA stride — last 4 KiB unmapped
+   between stacks.
+b. Force stack VA stride = 36 KiB: adjust per-task stack base so
+   adjacent stacks don't share a 4 KiB boundary.
 
-**Group-1 (stage-2 trap):**
-
-The 3 kernel-globals self-mapping aliases at PA=0x04004000-0x04006000
-are written by direct kernel store instructions during TTBR0 setup,
-bypassing the entire Remember/Prim layer. Plan: install a stage-2 RO
-trap on those PAs, decode each AArch32 store fault, log
-`(PC, L2-entry-index, value)`, then commit the write so the kernel
-proceeds. Once the (PC, entry, value) triples are captured, decide
-between (a) Einstein-port behaviour, (b) ROM patch that splits the
-self-map, or (c) hypervisor-synthesised second mapping.
+**Step 3 — Group-1 stage-2 RO trap.**
+Install a stage-2 RO trap on PA=0x04004000..0x04007000. Decode
+each AArch32 store fault, log `(PC, L2-entry-index, value)`, then
+commit the write. Once the (PC, entry, value) triples are captured,
+decide between (a) Einstein-port behaviour, (b) ROM patch that
+splits the self-map, or (c) hypervisor-synthesised second mapping.
 
 Until aliases are zero, the alrt-task DABT and any other later wedge
 stays **deliberately not investigated**.

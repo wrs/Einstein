@@ -564,6 +564,20 @@ pub const PRIM_REMEMBER_PROBE_HVC_IMM: u32 = 0x54;
 pub const PRIM_REMEMBER_PC:            u32 = 0x0016_3480;
 const PRIM_REMEMBER_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
 
+/// `PrimForgetMapping(va, &TPhys)` probe at ROM `0x00163514`. The
+/// counterpart to `PrimRememberMapping`: removes the (VA, PA)
+/// mapping at the L2 layer. Pairing this with the Remember probe
+/// lets us discriminate "real" aliases (PA installed at VA' before
+/// the prior install at VA was forgotten) from "expected" PA reuse
+/// (PA properly forgotten between installs). Function signature is
+/// `PrimForgetMapping(va=r0, &TPhys=r1)`. Original first word is
+/// `mov ip, sp`. The handler clears the per-PA → first-VA tracker
+/// slot iff the cleared VA matches the previously-recorded one;
+/// mismatch logs `FORGET MISMATCH:` for diagnosis.
+pub const PRIM_FORGET_PROBE_HVC_IMM:   u32 = 0x55;
+pub const PRIM_FORGET_PC:              u32 = 0x0016_3514;
+const PRIM_FORGET_FIRST_INSN:          u32 = 0xE1A0_C00D; // mov ip, sp
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -786,6 +800,19 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(PRIM_REMEMBER_PROBE_HVC_IMM),
             "PrimRememberMapping prologue",
             PRIM_REMEMBER_PROBE_HVC_IMM,
+        );
+        // PrimForgetMapping prologue probe at 0x00163514. Companion to
+        // the Remember probe — clears the per-PA → first-VA tracker
+        // slot when the kernel forgets a mapping, so subsequent
+        // re-installs at a different VA only register as aliases when
+        // they LACK a preceding forget.
+        patch_probe(
+            rom_ptr,
+            PRIM_FORGET_PC,
+            PRIM_FORGET_FIRST_INSN,
+            hvc_insn(PRIM_FORGET_PROBE_HVC_IMM),
+            "PrimForgetMapping prologue",
+            PRIM_FORGET_PROBE_HVC_IMM,
         );
     }
 }

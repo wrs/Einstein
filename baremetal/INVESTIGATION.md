@@ -42,6 +42,64 @@ quiesces on the same path without ever getting there.
 
 ## Pending follow-ups
 
+### Heap-watch sentinel narrows the corruption window (2026-04-27, late+)
+
+A new module `src/heap_watch.rs` samples `heap[0x0ca6b010]` from
+both `trap_sync_lower_aarch32` and `trap_irq` on every guest trap,
+maintains a 32-slot ring buffer of recent ELRs, and dumps the ring
+on every value transition. Cold boot
+(`/tmp/run-watch.log`) shows the four expected transitions:
+
+| # | source | from        | to          | elr      | prev-elr |
+|---|--------|-------------|-------------|----------|----------|
+| 0 | sync   | 0x00000000  | 0x0ca6b000  | 0xffff58 | 0xffff58 |
+| 1 | sync   | 0x0ca6b000  | 0x00000000  | 0x392c00 | 0x18d0c  |
+| 2 | sync   | 0x00000000  | 0x0ca6b000  | 0x392c00 | 0x18d0c  |
+| 3 | sync   | 0x0ca6b000  | **0x002dd804** | 0xffffd8 | 0xffff58 |
+
+Transition #0 is NewHeap initialising the heap struct (we observe it
+during a UND-trampoline IRQ). #1/#2 are short-lived zero blanks
+during NewHeap init's field-store sequence. **#3 is the corruption.**
+
+The transition-#3 ring buffer dump (newest at index 31):
+
+```
+ring[24..28]: 0x800194 / 0x3b32c / 0x3b33c / 0x3b340 / 0x8001a4   (REx ↔ kernel cycle)
+ring[29]:     0xffff58   (UND-trampoline body offset +0x58)
+ring[30]:     0xffff58   (same)
+ring[31]:     0xffffd8   (DABT-trampoline offset +0x30 — the wedge)
+```
+
+So the corrupting store fires somewhere between the trap at ELR
+0xffff58 (UND trampoline guard) and the trap at ELR 0xffffd8
+(DABT trampoline path). The "kernel ↔ REx" cycle just before is:
+
+- 0x3b32c..0x3b340 = body of `SetBankControlRegister__20TBankControlRegisterFUlT1`
+  (`ldr r3, [r0]; bic; lsl; orr; str r1, [r0]; ldr r0, [r0]`) — three
+  stage-2 traps on the MMIO at IPA 0x0F241000 (one bank past the
+  modelled MMIO window 0x0F000000..0x0F200000).
+- 0x800194 / 0x8001a4 = REx code calling `SetBankControlRegister`
+  in a tight loop (caller LR after each `bl 0x3b324`).
+
+Open questions for the next iteration:
+
+1. Why does the guest ever hit PC=0xffff58? That is the
+   `eaff_fffe (b .)` guard at `UND_TRAMP_OFFSET + 0x58` (= base+22),
+   the trampoline word right after `HVC #UND_TAG` at +0x54. If
+   `handle_und` correctly ERETs to `(original-UND-PC) + 4` we should
+   never resume the trampoline body. Two consecutive `0xffff58`
+   captures in the ring make this look like a real ERET-target bug
+   in some UND emulation path, not just IRQ-during-loop noise.
+2. Is the 0xffff58 observation an IRQ (asynchronous, guest stuck in
+   `b .`) or a sync trap (something at offset +0x58 that traps —
+   shouldn't happen)? The current ring buffer doesn't preserve the
+   source label per entry. Add source tracking next.
+3. Cross-check Einstein at the equivalent boot offset
+   (`build/NewtonProbe baremetal/roms/newton.rom _Data_/Einstein.rex
+   30`) — does Einstein's run hit the same MMIO loop at the same
+   point in time? If yes, the kernel ↔ REx cycle is normal and the
+   bug is downstream; if no, the divergence pinpoints the trigger.
+
 ### `0x0ca6b010` is the legitimate RelocHeap; its header is the corruption (2026-04-27, late)
 
 NewHeap-entry / SetCurrentHeap-entry / TRefStack-NewStack-exit probes

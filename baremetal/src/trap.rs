@@ -94,6 +94,13 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
     let ec = ((esr >> 26) & 0x3f) as u32;
     let iss = (esr & 0x01ff_ffff) as u32;
 
+    // Forensic sentinel for the RelocHeap-header corruption stop:
+    // sample heap[0x0ca6b010] on every guest sync trap and log the
+    // value transition with the current ELR_EL2. Bisects the corruption
+    // writer to a function range. See `INVESTIGATION.md` and
+    // `src/heap_watch.rs`.
+    crate::heap_watch::sample(read_sysreg!("elr_el2"), "sync");
+
     // DIAG: log the first N sync traps' EC + ELR + ESR, no dedup, so
     // we can see the guest PC timeline in the window leading up to a
     // stall. Remove once Phase B stall is past.
@@ -183,6 +190,11 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
 /// and update HCR_EL2.VI so the guest takes a virtual IRQ on ERET.
 #[no_mangle]
 pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
+    // Forensic sentinel for the RelocHeap-header corruption stop —
+    // sample heap[0x0ca6b010] every IRQ. Pairs with the per-sync-trap
+    // sample at trap_sync_lower_aarch32. See `src/heap_watch.rs`.
+    crate::heap_watch::sample(read_sysreg!("elr_el2"), "irq");
+
     // Acknowledge the interrupt on the host CPU-interface (GICv3 on
     // FVP, no-op on BCM2836) before doing any work. On GICv3 the
     // returned INTID identifies which source fired; a spurious ACK

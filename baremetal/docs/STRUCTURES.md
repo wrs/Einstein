@@ -1167,9 +1167,48 @@ ULong Init__10TStackPage(TStackPage* this, void* mgr, ULong page_id) {
 }
 ```
 
-`TUDomainManager::Get` lives at the jump-table entry `0x001BD2974`;
-its real body is in REx-resident kernel text (we haven't
-disassembled the body yet). On return, `*&this == new_PA`.
+`TUDomainManager::Get`'s body is at base ROM `0x00258EC0`
+(NOT in REx — the `0x01BD2974` reference is the post-ship
+patch-table thunk; see `docs/DISASM.md` "Jump-table aliasing").
+On return, `*&this == new_PA`.
+
+The body is a thin SWI shim:
+
+```c
+ULong Get(TUDomainManager* this, ULong& out_pa, int count) {
+    ULong msgbuf[3] = {
+        /*[0]=*/ *(ULong*)0x0c101054,    // gPagePoolHandle
+        /*[1]=*/ (ULong)count,           // = 2 in NewStack path
+        /*[2]=*/ (ULong)(this + 24),     // domain field pointer
+    };
+    if (MonitorDispatchSWI(/*r0=*/ *(void**)0x0c104eec,
+                           /*r1=*/ 5,            // msg = "Get a page"
+                           /*r2=*/ msgbuf) == 0) {
+        out_pa = msgbuf[0];               // return value in-place
+        return 0;
+    }
+    return error_code;
+}
+```
+
+`MonitorDispatchSWI` is `svc #0x1B`. The kernel SWI handler
+routes msg #5 to `PageMonProc__15TUDomainManagerFlPv` at
+`0x0025925C`, which is a vtable trampoline:
+
+```
+PageMonProc(monitor_obj, msg, args_buf):
+  if msg == 0x7FFFFFFF:               // init message
+      jump *(*monitor_obj + 8)        // = vtable[2] handler
+  else:                                // normal page request
+      jump *(*monitor_obj + 4)        // = vtable[1] handler
+```
+
+So the actual "give me a page" code is `vtable[1]` of the
+monitor object pointed to by `*0x0c104eec`. This vtable lives
+in kernel data and isn't statically disassembled. To inspect:
+runtime probe — read `*0x0c104eec` at boot, walk `[+0]` to
+vtable, dereference `[+4]` for the handler PC, then grep
+`rom.dis` for that PC.
 
 ### Where aliasing actually originates
 

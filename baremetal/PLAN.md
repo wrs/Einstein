@@ -180,6 +180,115 @@ NOTE: Fix all compiler warnings before committing, to keep context clean.
   on QEMU; `--platform fvp` runs the same suite on the FVP. Both
   must stay green. See "Verification" near the end of this file.
 
+## Pivoted goal — eliminate ALL RAM PA aliases before resuming alrt debug
+
+User directive (2026-04-28): if any RAM physical page is mapped by
+two distinct VAs, things will break randomly under our flat AP=011.
+Don't continue debugging the alrt-task wedge until aliasing is
+zero. The verification scaffold from the previous iteration was
+extended to **enumerate every aliased PA one-shot** and a trace
++ verify-mmu correlation captures the kernel context for each
+alias's first appearance.
+
+### Inventory at the wedge — 15 aliases in three groups
+
+```
+PA=0x04004000  VA=0x0c000000 (L1[0xc0],L2[0x0]) ↔ VA=0x0c002000 (L1[0xc0],L2[0x2])
+PA=0x04005000  VA=0x0c003000 (L1[0xc0],L2[0x3]) ↔ VA=0x0c004000 (L1[0xc0],L2[0x4])
+PA=0x04006000  VA=0x0c007000 (L1[0xc0],L2[0x7]) ↔ VA=0x0c008000 (L1[0xc0],L2[0x8])
+PA=0x04028000  VA=0x0c310000 (last page of stack #10) ↔ VA=0x0c318000 (last page of stack #11)
+PA=0x0402c000  VA=0x0cc7a000 ↔ VA=0x0cc82000  (8 KiB apart)
+PA=0x0402e000  VA=0x0cc9b000 ↔ VA=0x0cca3000  (8 KiB apart)
+PA=0x0402f000  VA=0x0c318000 (kernel stack)   ↔ VA=0x0cc7a000 (user heap)
+PA=0x04033000  VA=0x0cc82000 ↔ VA=0x0ccad000
+PA=0x04034000  VA=0x0cc7f000 ↔ VA=0x0cc82000
+PA=0x04035000  VA=0x0c603000 ↔ VA=0x0ccc4000
+PA=0x0403a000  VA=0x0ccc4000 ↔ VA=0x0ccca000
+PA=0x0403b000  VA=0x0ccc4000 ↔ VA=0x0cccb000
+PA=0x0403c000  VA=0x0ccc4000 ↔ VA=0x0cccc000
+PA=0x0403d000  VA=0x0ccc4000 ↔ VA=0x0ccc9000
+PA=0x04043000  VA=0x0ccc4000 ↔ VA=0x0ccdd000
+```
+
+**Group 1 — kernel-globals self-mapping** (PAs 0x04004-0x04006).
+Created at TTBR0 setup time (`MCR p15,0,c2,c0,0 val=0x04000000`).
+The kernel maps its OWN L1+L2 backing pages into VA 0x0c000000+
+for self-modification, with two views (offsets 0,2 / 3,4 / 7,8).
+Both VAs are kernel-only by intent. **Benign — leave alone.**
+
+**Group 2 — stack-guard sharing** (every other PA).
+Trace correlation: every alias appears immediately after a NewStack
+allocation or stack-fault ResolveFault. The kernel places stack
+slots at **33-KiB intervals** (`STACK_SLOT_SIZE = 0x8400` in
+`FMNewStack` at ROM `0x001F8EAC`):
+- `0x1f8edc: mov r7, #0x8400`
+- `0x1f8f18: mov r0, #0x8400` then `add r0, r0, r0, lsl #5` (×33)
+  then `sub r0, r9, r0, lsl #10` (× 1024) — modulo by 0x8400
+- `0x1f8f48`, `0x1f8f5c`, `0x1f8fa0`: similar div-by-0x8400 sites
+
+33 KiB (=8 pages + 1 KiB) means adjacent stack slots straddle a
+4-KiB boundary. Each stack body (30 KiB = `0x7800`) leaves a
+3-KiB margin at the top, which the kernel relies on subpage AP
+to share with the next stack's bottom guard. ARMv7 has no
+subpage AP → both VAs (= last page of stack N + boundary page
+of stack N+1) end up RW pointing to the same PA. **This is the
+aliasing source.**
+
+### Patch design (next iteration)
+
+Change stack-slot spacing from 33 KiB to a 4-KiB-aligned size so
+no slot straddles a 4-KiB boundary. Two candidates:
+
+- **36 KiB (`0x9000`, 9 pages)** — gives 30 KiB body + 6 KiB
+  guard/padding. Plenty of room. Encodable: `mov rN, #0x9000`
+  is `0xE3A0_NC09` (imm8=0x09, rot_imm=12 → ROR(0x09,24)=0x9000).
+- **32 KiB (`0x8000`, 8 pages)** — exactly fits 30 KiB body
+  + 2 KiB guard but BREAKS the 3-KiB guard the kernel expects;
+  may regress.
+
+Recommend 36 KiB. Required FMNewStack patches:
+
+| Offset    | Original                         | New                               | Notes |
+|-----------|----------------------------------|-----------------------------------|-------|
+| `0x1F8EDC` | `mov r7, #0x8400` (E3A07B21)    | `mov r7, #0x9000` (E3A07C09)     | initial r7 |
+| `0x1F8F18` | `mov r0, #0x8400` (E3A00B21)    | `mov r0, #0x9000` (E3A00C09)     | div-by-stack-slot |
+| `0x1F8F20` | `add r0, r0, r0, lsl #5` (×33) (E0800280) | `add r0, r0, r0, lsl #3` (×9) (E0800180) | for 36 KiB |
+| `0x1F8F24` | `sub r0, r9, r0, lsl #10` (×1024) (E0490500) | `sub r0, r9, r0, lsl #12` (×4096) (E0490600) | scale to 36 KiB |
+| `0x1F8F38` | `cmp r0, #0x8400` (E3500B21)    | `cmp r0, #0x9000` (E3500C09)     | bounds check |
+| `0x1F8F48` | `mov r0, #0x8400` (E3A00B21)    | `mov r0, #0x9000` (E3A00C09)     | second div |
+| `0x1F8F5C` | `mov r0, #0x8400` (E3A00B21)    | `mov r0, #0x9000` (E3A00C09)     | third div |
+| `0x1F8F90` | `cmp r0, #0x8400` (E3500B21)    | `cmp r0, #0x9000` (E3500C09)     | bounds check |
+| `0x1F8FA0` | `mov r0, #0x8400` (E3A00B21)    | `mov r0, #0x9000` (E3A00C09)     | fourth div |
+
+That's **9 patches in PATCHES_717006**. The `add/sub` pair at
+`0x1F8F20`/`0x1F8F24` is the only place the multiplier-vs-shift
+arithmetic changes; everywhere else just swaps the constant.
+
+Risk: the `add r0, r0, #0xC00` (3-KiB guard offset) at `0x1F8EF0`
+and `0x1F8F30` may need to grow to `0x1000` (4-KiB guard) or
+stay as-is. Need to read FMNewStack's caller (`FMNewHeapArea` at
+`0x001F68F8`) to see whether the 0xC00 is the inter-slot guard
+size or something else. Do that first before applying.
+
+After patching, every kernel call that consumes "stack slot
+size" by reading the kernel's runtime constant (instead of the
+literal 0x8400) needs auditing. `apply_resolve_fault_wrapper` in
+`src/rom_patches.rs` already aligns to 4-KiB *within the stack
+range* (`info->base_va + page_offset`), so the wrapper itself
+is safe.
+
+### Verification scaffold (already in place)
+
+`fix_stage1_xn_bits` in `src/guest_mem.rs` now:
+- Counts and ratchet-logs subpage-AP heterogeneity per L2 entry.
+- Detects every PA→VA alias and prints `(PA, VA1[L1,L2], VA2[L1,L2])`
+  one-shot per aliased PA via a static 1024-bit bitmap.
+- Stays quiet once everything is clean (zero violations → no log).
+
+Expected after the FMNewStack patch: only Group 1 (3 kernel-
+globals self-aliases) survives. If Group 2 still appears, more
+aliasing sources need investigation.
+
 ## MMU verification scaffold (2026-04-28)
 
 `fix_stage1_xn_bits` (called on every `SCTLR.M` toggle) now also runs

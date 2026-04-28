@@ -126,6 +126,46 @@ RUNNING in the first place.** Next iteration should diff our
 scheduler / port / message-delivery state vs. Einstein's around the
 alrt task entry.
 
+## Goal pivot: eliminate ALL RAM PA aliases first (2026-04-28)
+
+User: "If there are still mixed-mapping RAM pages, there's no point
+in continuing because things will be randomly broken by corruption.
+Change the goal to fixing the 4k allocations once and for all."
+
+Extended the verification (now logs every aliased PA one-shot with
+both VAs and L1/L2 indices) and ran with the function tracer to
+correlate alias appearance with kernel context.
+
+**Findings — 15 aliased pages in three groups:**
+
+Group 1 (3 aliases): kernel-globals self-mapping at PA 0x04004-
+0x04006. Created at TTBR0 setup (`MCR p15,0,c2,c0,0`). Both VAs
+are kernel-only by intent. Benign.
+
+Group 2 (12 aliases): stack guard-page sharing. Every alias
+appears immediately after a `NewStack POST-SWI` event or a
+`ResolveFault` for a stack page. Pattern:
+- `PA=0x04028000  VA=0x0c310000 ↔ VA=0x0c318000`
+  = last page of stack #10 (top=0x0c310400) shares PA with last
+  page of stack #11 (top=0x0c318800).
+
+Diagnosis: `FMNewStack` (ROM `0x001F8EAC`) places stacks at
+`STACK_SLOT_SIZE = 0x8400` (= 33 KiB) intervals. 33 KiB is 8 pages
++ 1 KiB → adjacent slots straddle a 4-KiB boundary. Each stack
+body (30 KiB = 0x7800) leaves 3 KiB for guard, which the kernel
+expects subpage AP to share with the neighbour. ARMv7's flat AP
+breaks the partition.
+
+PLAN.md "Pivoted goal" lays out the full FMNewStack patch — 9
+ROM word writes (8 constant swaps `0x8400 → 0x9000` and one
+shift change for the multiplier `add r0, r0, lsl #5 → lsl #3`).
+Implementation deferred to next iteration to allow careful audit
+of `FMNewStack`'s caller (`FMNewHeapArea` at `0x001F68F8`) for
+side-effects on the 3-KiB guard constant `0xC00`.
+
+Reverted the alrt-receive probe scaffolding from the earlier
+commit since it's out of scope until aliasing is zero.
+
 ## Wedge-time task census added to Reboot canary (2026-04-28)
 
 Hooked `task_dump::dump()` into the Reboot canary handler in

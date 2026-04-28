@@ -175,66 +175,68 @@ NOTE: Fix all compiler warnings before committing, to keep context clean.
   on QEMU; `--platform fvp` runs the same suite on the FVP. Both
   must stay green. See "Verification" near the end of this file.
 
-## Current stop — NULL-deref write at IPA=0x3 from PC=0x00f76368 (downstream of SearchFreeList no-fit)
+## Current stop — wild jump into SBA inline-stub pool downstream of the no-fit recovery
 
-The previous SearchFreeList wedge (RelocHeap header corruption,
-captured in `INVESTIGATION.md` — kept for reference) is now
-side-stepped: `guest_bp::handle_user_bp_und` for ROM `0x00313308`
-detects a wild freelist node (`r0` doesn't translate) and ELRs
-straight to the function's "no-fit" exit at `0x00313360` with
-`r0 = 0`. The kernel's `__nw__FUi` then takes its usual
-out-of-memory path. Boot progresses an additional ~2400 trace
-lines past the old wedge.
-
-The new halt:
+The previous SearchFreeList wedge is side-stepped (see resolved
+stops). Boot progresses ~2400 trace lines further and halts on:
 
 ```
 dabt-trip: PC=0x00f76368 mode=usr writing 0x00000082 -> IPA=0x3
-           r0=0x82 r1=0x60000110 r2=0x002dfa20 r3=0x001a48f0
-           r4=0x0ca6b12c r5=0x7c r6=0x0 r7=0x6c r8=0x70
-           r12=0x3 sp(usr)=0x0cc81f3c lr(usr)=0x00311e1c
 *** unknown MMIO write halted ***
-  IPA = 0x00000000  B  value=0x00000082  @ELR=0xf76368
 ```
 
-Notes:
+PC `0x00f76368` is **inside `shadow_stub`'s inline-stub pool**
+(`SBA_STUB_POOL_IPA = 0x00E00000` .. `SBA_STUB_POOL_END = 0x00FFFFf00`,
+in `src/shadow_stub.rs`). The bytes there are written by
+`shadow_stub::patch_rom_from_bitmap` at boot — not by the ROM
+image. Confirmed via paired `kmain` dumps: the slot reads zero
+post-`load_rom` and `0xe5cc0000` post-`patch_rom_from_bitmap`.
 
-- IPA=0x3 is unmapped — looks like a NULL-deref of a
-  `(NULL + 3)` byte address. r12=0x3 in the dump.
-- ELR `0x00f76368` sits in the ROM gap past REx tail (~0x847000)
-  and past the function-tracer pool (0x00E00000) — i.e. addresses
-  the disassembly doesn't cover. Likely an indirect dispatch
-  through a function pointer that resolved to 0x00f76368 via the
-  bogus heap header (we still see `r4=0x0ca6b12c` = heap+0x11c
-  on the user stack, and `r2=0x002dfa20`/`r3=0x001a48f0` — both
-  ROM PCs that were in the corrupted header).
-- `lr_usr=0x00311e1c` is the return address into `__nw__FUi`'s
-  caller. The stack still carries the bad heap pointer at top
-  (`stack[sp]=0x0ca6b010`), so the caller is still operating on
-  the corrupted RelocHeap.
+Decoded stub body around PC:
+
+```
++0x00 (0xf76368): e5cc0000  strb r0, [r12, #0]     ← faulting (r12=3)
++0x04           : e320f000  nop
+-0x04           : e128f001  msr cpsr_c, r1
+```
+
+The stub assumes a specific calling convention (`r12` = effective
+target, `r0` = byte to store, etc.) that's set up only by the
+SBA-trap path that branches into it. Our wild jump arrives with
+`r12 = 0x3` — a byte from the corrupted heap leaking through —
+and the `strb r0, [r12]` writes to IPA 3 → unmapped → halt.
+
+So this halt is **downstream blast radius** from the original
+RelocHeap header corruption: the kernel dispatches through a
+vtable / function pointer that's been clobbered to a value inside
+the SBA stub pool (the corrupted heap header contains many
+ROM-PC-like values; one of them lands a valid-looking branch
+target inside our pool). Caller chain on the user stack still
+carries the bad heap (`stack[sp]=0x0ca6b010`,
+`lr_usr=0x00311e1c`).
 
 Concrete next steps:
 
-1. Decode what's at PC `0x00f76368`. Strategies:
-   - Read the four ROM words at `0x00f76368` and surrounding via
-     `guest_mem::read_word_pa` or a one-shot kprintln in
-     `kmain` — these aren't in the rom.dis but they exist in the
-     16 MiB ROM image, so they're readable.
-   - The PC sits inside the gap between REx tail and the
-     function-tracer pool. That gap is normally zeros, so a
-     non-zero ELR there means the gap has been written to —
-     either by ROM patching or by a tracer trampoline we don't
-     remember installing. Check.
-2. If the dispatch is from a corrupted vtable / function-pointer
-   table on the bad heap, the right intervention is upstream:
-   make `__nw__FUi`'s no-fit recovery path (the new arm we just
-   added) ALSO clear the bad heap from `gCurrentHeap` so future
-   allocations don't read it. Look at how `SetCurrentHeap` is
-   called in the recovery path.
-3. Cross-check against Einstein with the same SearchFreeList
-   intercept (Einstein doesn't need it — the corruption doesn't
-   happen there — but observing what state Einstein is in at the
-   equivalent boot offset gives us a target).
+1. **Halt earlier — at the wild branch, not at the stub crash.**
+   Add a guard at the top of `handle_data_abort` (or in a thin
+   wrapper) that detects `(elr in shadow_stub stub pool) &&
+   (lr_usr or stack frame doesn't match SBA-call expectations)`
+   and halts with the caller PC and stack trace, so we see who
+   issued the wild branch.
+2. **Trace `lr_usr=0x00311e1c` back.** That's inside
+   `__nw__FUi`'s no-fit recovery (between SearchFreeList return
+   and the next allocator call). Disassemble the surrounding
+   ROM and identify which function pointer or vtable lookup
+   resolves to a stub-pool address.
+3. **Upstream fix:** extend the SearchFreeList no-fit arm to
+   also clear `gCurrentHeap`'s reference to the bad heap (write
+   zero or `gFallbackHeap` to `currentTask->globals[-16]`).
+   Subsequent allocator calls would then go to a sane heap and
+   the corrupted-vtable dispatch wouldn't happen at all.
+4. **Cross-check Einstein** — what does Einstein do here? It
+   probably doesn't reach this state, since its heap stays
+   valid. But understanding the no-fit recovery path's expected
+   behaviour helps choose between (1) and (3).
 
 ## Earlier stop — RelocHeap header corruption in newt's MakeStoreObject path
 

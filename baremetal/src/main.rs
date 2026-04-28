@@ -11,6 +11,7 @@ mod fb_dump;
 mod guest;
 mod guest_bp;
 mod guest_mem;
+mod heap_watch;
 mod mmio;
 mod mmu;
 mod panic;

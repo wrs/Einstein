@@ -212,19 +212,27 @@ but always log on the wedge-relevant arg matches):
 
 Concrete next steps:
 
-1. Localise the **first write** that corrupts heap[+0..+0x14]. Either
-   add a stage-2 write-watch carving the heap header into a 4 KiB RO
-   stage-2 page (4-KiB L3 entry in `src/stage2.rs`), trapping every
-   guest store and logging the writing PC, **or** install a guest BP
-   at the candidate writers (`__ct__9TRefStackFv` push, the catch-arm
-   stack-frame builder in `MakeStoreObject` at 0x3544f4, `__nw__FUi`
-   freelist updates) and watch r4/r1 to see who points at 0x0ca6b010.
-2. Cross-check Einstein at the equivalent boot offset (NewtonProbe
+1. Pin down why the guest ever resumes at PC=0xffff58 (=
+   `UND_TRAMP_OFFSET + 0x58`, the `b .` guard one word past the
+   `HVC #UND_TAG` at +0x54). The heap-watch ring buffer for
+   transition #3 captures `0xffff58` twice in a row immediately
+   before the wedge (`0xffffd8`, the DABT-trampoline path). Either
+   it's an IRQ caught with the guest stuck in the trampoline guard
+   (ERET-target bug in a `handle_und` arm — which is itself a
+   wedge), or it's a sync trap at `+0x58` that we shouldn't see.
+   Make `heap_watch::sample` carry source-label per ring slot so
+   we can tell IRQ from sync at each entry.
+2. Add a stage-2 RO carve-out at IPA `0x0ca6b000` (4 KiB L3 page
+   inside the encompassing 2 MiB RAM block; mirrors the existing
+   shadow-stub scratch carve-out at `0x06000000`). On the resulting
+   stage-2 perm fault, log the writing PC + IPA + value before
+   forwarding the write so the heap stays unmodified for diagnosis.
+3. Cross-check Einstein at the equivalent boot offset (NewtonProbe
    60 s) — dump Einstein's RelocHeap header at the same point and
    diff. If Einstein's heap stays valid, the bug is hypervisor-side
    (stage-2 mapping / aliasing); if Einstein corrupts it the same
    way, it's a ROM data-flow bug we need to mirror or patch around.
-3. Once the writer is identified, decide whether the fix is a
+4. Once the writer is identified, decide whether the fix is a
    handler gap (stage-2 fault on a write that should have trapped
    cleanly) or a behavioural mirror (kernel does something Einstein
    doesn't because of an earlier divergence we need to match).
@@ -391,6 +399,13 @@ the boot is steady-state-quiet:
   re-occupy the slot, so the marker UDF stays armed for the whole
   boot without per-hit ROM churn. Remove once the RelocHeap header
   corruption writer is identified.
+- `heap_watch::sample` (`src/heap_watch.rs`) called from
+  `trap_sync_lower_aarch32` and `trap_irq` entry — samples
+  `heap[0x0ca6b010]` every trap, maintains a 32-slot ring buffer
+  of recent ELRs, and on every value transition logs the change
+  plus the ring buffer to the kernel console. Used to bracket the
+  RelocHeap-header corruption writer to a tight trap-stream window.
+  Remove with the rest of this stop's scaffolding.
 
 Once the boot quiesces these can be pulled; the behavioural invariants
 they enforce are codified in guest tests.

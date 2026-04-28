@@ -4,6 +4,60 @@ Live notes for the next iteration. Replace this file's body when the
 current stop is fixed and a new one takes over — git history is the
 archive of past investigations.
 
+## Heap sanity checker added; halts cleanly at first sign of corruption (2026-04-27, late late)
+
+`heap_watch::check_heap_sanity` validates two invariants the kernel
+never legitimately mutates:
+
+- `heap[+0x00]` = `heap - 16` (block-management prefix sits 16
+  bytes before the header).
+- `heap[+0x08]` = `0x736b_6961` ("skia" magic literal from ROM
+  `0x00310f34`, set by NewHeap at `0x00310e80`).
+
+Other fields (`heap[+0x0C]`, `heap[+0x10]`) start as self-pointers
+but the kernel re-uses them for "next heap" / "free-list owner"
+links during normal heap-chain management — checking them caused
+false positives.
+
+Wired into `heap_watch::sample` after the transition logic. Skipped
+when ELR is inside known heap-allocator PC ranges (`0x140000..
+0x148000`, `0x310000..0x320000`) so partial updates don't trip
+the check. On first trip-wire, dumps the heap header + ring buffer
+of recent trap ELRs and halts.
+
+Result on cold boot: sanity check fires at the same ELR=0xffffd8
+as `heap-watch[3]` (DABT-trampoline DIAG return), with heap[+0x00]
+=`0x002dd804`. This is functionally equivalent to the earlier
+heap-watch[3] detection but cheaper and clearer — boot halts on
+first corruption rather than running on to the SBA-stub wedge,
+and the diagnostic dump shows the corrupted header + ring buffer
+in one place.
+
+Useful new context from the ring buffer: the two ELRs immediately
+before the wedge are `0x00e4f168` (in `shadow_stub`'s SBA inline-
+stub pool — analogous to the 0xf76368 wedge from iteration 6) and
+`0xffffd8` itself (recurring DABT-trampoline returns). So the
+allocator is repeatedly dispatching through corrupted vtables
+into shadow_stub stubs in a tight loop, with each iteration
+mutating more of the heap header. The sanity check freezes the
+process at the first observable corruption.
+
+For the next iteration, the strategic move is one of:
+
+1. Hook the entry path into the SBA inline-stub pool — when
+   `handle_data_abort` sees a fault at IPA in
+   `SBA_STUB_POOL_IPA..SBA_STUB_POOL_END` AND the previous-fault
+   record shows a different originating PC than the stub's
+   intended caller, halt with the wild-branch source PC.
+2. Pre-empt the cascade by detecting a corrupted vtable load —
+   probe the well-known dispatch sites after `__nw__FUi`'s no-fit
+   recovery and validate the loaded function pointer before the
+   `bl`/`blx`.
+3. Step back: accept that the corruption is downstream of a
+   Newton-OS state divergence we don't yet model; cross-check
+   Einstein's `__nw__FUi` recovery path to identify what state
+   we're missing.
+
 ## Active stop: wild jump into SBA inline-stub pool — 2026-04-27 (updated)
 
 `PC=0x00f76368` is **inside `shadow_stub`'s SBA inline-stub pool**

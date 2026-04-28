@@ -486,11 +486,42 @@ pub fn handle_user_bp_und(
                 // (most are valid; only wild-r0 cases redirect).
                 static WILD_HITS: AtomicU32 = AtomicU32::new(0);
                 let n = WILD_HITS.fetch_add(1, Ordering::Relaxed);
+                // Cascade-stopper: also clear `currentTask->globals[-16]`
+                // (= gCurrentHeap source) so the next GetCurrentHeap
+                // call falls back to gFallbackHeap. Otherwise the bad
+                // heap stays installed and downstream allocator paths
+                // dispatch through its corrupted vtable into shadow_stub
+                // SBA inline-stub pool — see the previous wedge at
+                // PC=0x00f76368.
+                //
+                // gCurrentTask pointer lives at VA 0x0c10105c per the
+                // GetCurrentHeap disasm at ROM 0x00142da0.
+                const G_CURRENT_TASK_VA: u32 = 0x0c10_105c;
+                let cleared = if let Some(task_ptr) =
+                    crate::guest_mem::read_word_va(G_CURRENT_TASK_VA)
+                {
+                    let heap_slot = task_ptr.wrapping_sub(16);
+                    let prev = crate::guest_mem::read_word_va(heap_slot)
+                        .unwrap_or(0);
+                    let ok = crate::guest_mem::write_word_va(heap_slot, 0);
+                    Some((task_ptr, heap_slot, prev, ok))
+                } else { None };
+
                 if n < 16 {
                     kprintln!(
                         "SearchFreeList wild r0={:#010x} → no-fit return (hit #{})",
                         r0, n,
                     );
+                    if let Some((task, slot, prev, ok)) = cleared {
+                        kprintln!(
+                            "  cleared gCurrentHeap: task={:#010x} slot={:#010x} prev={:#010x} write_ok={}",
+                            task, slot, prev, ok,
+                        );
+                    } else {
+                        kprintln!(
+                            "  could not read gCurrentTask ptr at {:#010x}", G_CURRENT_TASK_VA,
+                        );
+                    }
                 }
                 ctx.x[0] = 0;
                 lock();

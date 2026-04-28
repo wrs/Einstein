@@ -42,6 +42,59 @@ quiesces on the same path without ever getting there.
 
 ## Pending follow-ups
 
+### Defensive RO-state poll confirms the post-rebind page is RO yet still mutated (2026-04-27, night)
+
+Added `heap_watch::sample` defensive RO-state check at the top of
+every trap entry: read the L3 entry for the armed PA, log if its
+S2_AP bits aren't `0b01` (RO). Logged 64 events.
+
+**All 64 events are pre-rebind (armed PA = 0x0401f000). Zero are
+post-rebind (armed PA = 0x04032000).**
+
+What it means:
+
+- Pre-rebind: the page IS in RW state at most trap entries (the
+  existing `handle_data_abort` line 406 path keeps flipping it
+  RW+XN after every perm fault; our re-arm flips it RO again on
+  the next trap). Captured 64 such RW snapshots — consistent with
+  the 256 perm-faults logged previously.
+- Post-rebind: the page is in RO state at every trap entry — the
+  re-arm path is working. Yet `heap[+0]` reads change value
+  (transitions #2 → #3). The writes must be landing at the host
+  PA backing of `IPA=0x04032010`, but stage-2 RO is not faulting
+  on them.
+
+This rules out "page silently flipped RW by some other code path"
+and pins the disagreement to QEMU's stage-2 AP enforcement on
+the post-rebind codepath. Hypotheses:
+
+- QEMU caches stage-2 translations per-VA in a way that doesn't
+  fully invalidate even after `tlbi vmalls12e1is`.
+- QEMU bypasses stage-2 enforcement for some specific access
+  pattern (e.g. STM, SWP, or strided multi-word writes that the
+  kernel uses inside the heap-allocator inner loop).
+- The kernel writes through a different VA whose stage-1 IPA is
+  also `0x04032xxx` but where some context (mode? domain?)
+  causes QEMU to short-circuit the stage-2 walk.
+
+Trace mode (`--features trace,quiet`) introduces ~3500× per-call
+overhead and times out 240s into boot — the wedge isn't reached
+in trace mode. So we can't bisect the writer through trace.
+
+Next iteration should commit to ONE of:
+1. Run on FVP for architectural ground truth. If FVP shows perm
+   faults on the post-rebind PA, document the QEMU bug class
+   in `docs/QEMU_BUGS.md` and proceed there.
+2. Switch the carve-out from RO-page to invalid-page (clear
+   `DESC_VALID`). All accesses (read AND write) fault, including
+   the suspected non-faulting writes — but reads need EL2
+   emulation to hand back the host-PA value. Larger code change
+   but side-steps any AP-enforcement bug.
+3. Move past this stop entirely: accept that we can't pinpoint
+   the corrupting writer in QEMU, look at whether the wedge is
+   silenceable downstream (e.g. force `SearchFreeList` to retry
+   when its r0 is wild), and continue the boot.
+
 ### Stage-1 RW theory ruled out; post-rebind silence is QEMU stage-2 enforcement (2026-04-27, late evening II)
 
 Added stage-1 walk + L3 readback at every heap_watch transition, plus

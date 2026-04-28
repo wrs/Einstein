@@ -312,6 +312,30 @@ fn maybe_rearm() {
 /// faulting address. Cheap enough to call from every trap entry; the
 /// guest_mem walk is a few stage-1 page-table reads.
 pub fn sample(elr_el2: u64, source: Source) {
+    // Defensive RO-state poll: if some other code path has flipped
+    // the carved page to RW without our knowledge (e.g. shadow_stub
+    // claiming the page as a code page after a fetch trap on it),
+    // log it loudly. AP=0b01 is encoded in bits[7:6] = 0x40 of the
+    // L3 entry. Anything other than that on the armed page is
+    // suspect.
+    {
+        let armed = CARVED_PA.load(Ordering::Relaxed);
+        if armed != 0 {
+            if let Some(l3) = crate::stage2::ram_page_l3_entry(armed) {
+                if (l3 & (3 << 6)) != (1 << 6) {
+                    static REPORTED: AtomicU32 = AtomicU32::new(0);
+                    let n = REPORTED.fetch_add(1, Ordering::Relaxed);
+                    if n < 64 {
+                        kprintln!(
+                            "heap-watch: !!! armed PA {:#010x} is NOT RO at sample (L3={:#018x}) src={}",
+                            armed, l3, source.label(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // Re-arm the stage-2 carve-out (if any) one trap after a perm
     // fault flipped its page to RW. Doing it here means the guest
     // retried the faulting store under RW, the store landed, and now

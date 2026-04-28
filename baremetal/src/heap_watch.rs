@@ -52,22 +52,42 @@ const LIMIT: u32 = 32;
 /// buffer so the developer can see the trap stream that led up to
 /// the corruption — much narrower than the global 500-entry trap log
 /// budget that's already exhausted by mid-boot.
+///
+/// Each slot packs the source kind into bit 63 (1 = irq, 0 = sync) so
+/// the dump can disambiguate IRQ-during-loop noise from a sync trap
+/// inside the trampoline body. ELRs in our config never use bit 63,
+/// so there's no aliasing risk.
 const RING_SIZE: usize = 32;
+const RING_SRC_IRQ_BIT: u64 = 1u64 << 63;
 static RING: [AtomicU64; RING_SIZE] = [const { AtomicU64::new(0) }; RING_SIZE];
 static RING_HEAD: AtomicUsize = AtomicUsize::new(0);
+
+/// Source-kind tag matching the encoding bit packed into ring slots.
+#[derive(Copy, Clone)]
+pub enum Source {
+    Sync,
+    Irq,
+}
+
+impl Source {
+    fn label(self) -> &'static str {
+        match self { Source::Sync => "sync", Source::Irq => "irq" }
+    }
+    fn bit(self) -> u64 {
+        match self { Source::Sync => 0, Source::Irq => RING_SRC_IRQ_BIT }
+    }
+}
 
 /// Sample heap[+0]. If it changed since the last sample, log the
 /// transition with the supplied source label and the EL2-saved
 /// faulting address. Cheap enough to call from every trap entry; the
 /// guest_mem walk is a few stage-1 page-table reads.
-///
-/// `source` is a short ASCII label like `"sync"`, `"irq"`,
-/// `"bp"` — used only for the kprintln, not for any logic.
-pub fn sample(elr_el2: u64, source: &str) {
-    // Always record this ELR in the ring buffer, even when the value
-    // hasn't changed — the ring is what we dump on transition.
+pub fn sample(elr_el2: u64, source: Source) {
+    // Always record this ELR + source-bit in the ring buffer, even
+    // when the value hasn't changed.
+    let slot = (elr_el2 & !RING_SRC_IRQ_BIT) | source.bit();
     let head = RING_HEAD.fetch_add(1, Ordering::Relaxed);
-    RING[head % RING_SIZE].store(elr_el2, Ordering::Relaxed);
+    RING[head % RING_SIZE].store(slot, Ordering::Relaxed);
 
     let value = match guest_mem::read_word_va(WATCH_VA) {
         Some(v) => v,
@@ -85,7 +105,7 @@ pub fn sample(elr_el2: u64, source: &str) {
         let prev_elr = PREV_ELR.load(Ordering::Relaxed);
         kprintln!(
             "heap-watch[{}] {}: heap[{:#010x}] {:#010x} -> {:#010x}  (elr={:#x}, prev-trap-elr={:#x})",
-            n, source, WATCH_VA, prev, value, elr_el2, prev_elr,
+            n, source.label(), WATCH_VA, prev, value, elr_el2, prev_elr,
         );
         // Dump the ring buffer in chronological order so the operator
         // can see the trap stream that led to this transition. The
@@ -94,9 +114,11 @@ pub fn sample(elr_el2: u64, source: &str) {
         let next_head = head.wrapping_add(1);
         for i in 0..RING_SIZE {
             let idx = next_head.wrapping_add(i) % RING_SIZE;
-            let elr = RING[idx].load(Ordering::Relaxed);
-            if elr != 0 {
-                kprintln!("    ring[{:>2}]: elr={:#x}", i, elr);
+            let raw = RING[idx].load(Ordering::Relaxed);
+            if raw != 0 {
+                let src = if (raw & RING_SRC_IRQ_BIT) != 0 { "irq " } else { "sync" };
+                let e = raw & !RING_SRC_IRQ_BIT;
+                kprintln!("    ring[{:>2}] {}: elr={:#x}", i, src, e);
             }
         }
     }

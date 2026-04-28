@@ -213,54 +213,54 @@ them.
 
 ## Concrete next steps
 
-**Wrapper-revert diagnostic (PLAN step 1) ran this iteration.**
-Outcome: boot fails at the already-resolved BootOS canary
-entry #2 (R0=0x0cc80c80, name-task stack overrun) much earlier
-without the wrapper. The wrapper IS still needed to get past
-the original ARMv7 subpage-AP corruption. So:
+**Findings to date (2026-04-28):**
+- Wrapper IS needed (revert diagnostic: boot dies at earlier
+  resolved BootOS canary without it).
+- Aliasing IS at stage-1 (kernel page tables map both VAs to
+  same PA, not a stage-2 issue).
+- **Three VAs map to PA 0x04032000**: heap, newt's stack,
+  pssm's stack. Kernel page-pool re-issued the same PA at
+  least twice for different stack-grow events.
 
-- **Wrapper is necessary** — can't simply remove it.
-- **Wrapper is the most plausible aliasing trigger** —
-  heap-aliasing wedge only manifests when the wrapper has
-  enabled enough boot progress.
+Refined hypothesis: the wrapper's interaction with the
+kernel's page-pool (`TUPageManager::Get` / `FindOrAllocPage`
+/ `AllocNewPage`) breaks the free-list bookkeeping such that
+already-allocated pages get re-issued. Einstein's stock
+boot uses the same ROM but doesn't hit the bug — its 60 s
+NewtonProbe heap dump shows the heap stays valid throughout.
 
-Refined hypothesis: the wrapper either (a) mismanages the
-kernel allocator's free-list itself, or (b) enables enough
-sustained allocation pressure that a separate kernel-side
-allocator divergence (which Einstein doesn't hit on the same
-ROM) surfaces.
-
-1. **Audit FindOrAllocPage return values across the wrapper.**
-   Add an HVC probe at the call site `FindOrAllocPage` returns
-   to the wrapper; log every returned PA. Watch for PA
-   0x04032000 (the heap PA) being returned for a stack-grow
-   event. If yes, the kernel's free-list issued the heap PA
-   to the wrapper — that's the bug.
-2. **Walk the page tables for duplicates at sanity-halt.**
-   Already a known-good probe pattern: walk the kernel's L1
-   (rooted at 0x04000000, 16 KiB), enumerate every L2 small
-   page entry, and list every VA that resolves to PA
-   0x04032000. Multiple VAs naming the same PA confirm the
-   alias set; the L2 entries' positions tell us which kernel
-   structures share the page.
-3. **Cross-check Einstein's L2 tables.** Add a stage-1 walk
-   to NewtonProbe at the equivalent boot offset, dumping the
-   L2 entries for VA 0x0ca6b000 and a typical user-stack VA.
-   If Einstein's two L2 entries name *different* PAs at the
-   same boot offset, that confirms the kernel wouldn't
-   normally alias these VAs — the divergence has to come
-   from our side, narrowing the bug to "what state our
-   wrapper's iterations leave that Einstein's stock
-   ResolveFault doesn't".
-4. **Audit the wrapper's bookkeeping invariants.** The
-   wrapper assumes that after iter 0 allocates, iters 1-3
-   take the existing-page branch and just call
-   `SetSubPageInfo`. But what if iter N (N>0) goes back to
-   the FindOrAllocPage path because the kernel's slot
-   bookkeeping was reset between iters (e.g., by an
-   intervening fault, IRQ, or our own re-entry)? Adding
-   a one-shot probe at FindOrAllocPage entry that logs
-   wrapper-iter# + FAR + return-PA would surface this.
+1. **Probe FindOrAllocPage (or AllocNewPage) return values.**
+   Most direct test. Add an HVC patch at FindOrAllocPage's
+   exit point (or at TUPageManager::Get's exit) to log every
+   returned PA. Tag with caller-LR so we know which path
+   asked. If PA 0x04032000 appears >1 time, we've localised
+   the bug to the kernel's free-list; the wrapper is the
+   trigger but the bug is in how the wrapper exercises the
+   allocator's bookkeeping. Symbol/PC lookup: search for
+   `__nw__FUi` / `AllocNewPage` / `TUPageManager` in
+   `_Data_/symbols.txt` and `_Data_/demangled_symbols.txt`.
+2. **Cross-check Einstein.** Extend NewtonProbe with a
+   "scan kernel L1/L2 for duplicate PA entries" pass at
+   t=30 s and t=60 s. If Einstein's tables show no
+   duplicate PA mappings under sustained allocation
+   pressure, that confirms the divergence is on our side.
+3. **Audit the wrapper's per-iter bookkeeping.** The
+   wrapper assumes iter 0 allocates and iters 1-3 reuse via
+   `SetSubPageInfo`. Verify by tracing each iter's
+   `FindOrAllocPage` call path — does iter N (N>0) ever
+   actually re-allocate? If a fault/IRQ during iter N's
+   `SetSubPageInfo` resets the slot bookkeeping, iter N+1
+   could think slot empty → AllocNewPage → fresh page →
+   leaked page. The wrapper's `cmp r0,#4 / beq done` only
+   guards against `r0==4` (FindOrAllocPage failure code);
+   doesn't bail on success-but-different-page.
+4. **Even bigger picture.** With three VAs sharing the same
+   PA, ANY write to one corrupts the other two. The heap
+   corruption is just the first observable symptom. Once
+   we trace the duplicate-issue, the fix likely belongs at
+   the wrapper level (don't trigger the double-issue) or
+   at a hypervisor stage-2 enforcement level (notice the
+   page-pool re-issue and reject it before it lands).
 
 Diagnostic scaffolding (heap-watch sentinel, stage-2 RO
 carve-out, sanity-halt with banked-SP + ring-SP capture,

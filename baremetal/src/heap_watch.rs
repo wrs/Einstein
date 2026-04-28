@@ -231,6 +231,89 @@ fn log_stage1_walk(va: u32) {
     }
 }
 
+/// Walk the entire kernel stage-1 (TTBR0=PA 0x0400_0000) and log
+/// every VA whose mapping resolves to `target_pa`. Lets the
+/// sanity-halt path enumerate the full alias set, so we know which
+/// kernel structures share the heap's backing page.
+///
+/// Walks all 4096 L1 entries; for each coarse entry, walks all 256
+/// L2 entries. Reports VA + L1 idx + L2 idx + L2 entry value for
+/// every match. `cap` bounds the report so a wildly broken page
+/// table (e.g., zeroed) doesn't flood the log.
+pub fn enumerate_va_aliases(target_pa: u32, cap: u32) {
+    kprintln!(
+        "    --- alias enumeration: every VA mapping to PA {:#010x} ---",
+        target_pa,
+    );
+    let target_page = target_pa & 0xFFFF_F000;
+    let mut found: u32 = 0;
+    for l1_idx in 0..4096u32 {
+        let l1_pa = 0x0400_0000u32 + l1_idx * 4;
+        let l1 = match guest_mem::read_word_pa(l1_pa) {
+            Some(v) => v,
+            None => continue,
+        };
+        let l1_kind = l1 & 3;
+        match l1_kind {
+            // Section: 1 MiB at l1[31:20] | low 20 zeros.
+            2 => {
+                let section_pa = l1 & 0xFFF0_0000;
+                if section_pa == (target_page & 0xFFF0_0000) {
+                    let va = l1_idx << 20;
+                    kprintln!(
+                        "      ALIAS: VA={:#010x} L1[{:#x}]={:#010x} (section, PA={:#010x})",
+                        va, l1_idx, l1, section_pa,
+                    );
+                    found += 1;
+                    if found >= cap {
+                        kprintln!("      (cap {} hit; stopping)", cap);
+                        return;
+                    }
+                }
+            }
+            // Coarse: walk L2.
+            1 => {
+                let l2_base = l1 & 0xFFFF_FC00;
+                for l2_idx in 0..256u32 {
+                    let l2_pa = l2_base + l2_idx * 4;
+                    let l2 = match guest_mem::read_word_pa(l2_pa) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let l2_kind = l2 & 3;
+                    let pa_field = match l2_kind {
+                        // Large page (64 KiB): bits[31:16].
+                        1 => l2 & 0xFFFF_0000,
+                        // Small page (4 KiB): bits[31:12].
+                        2 | 3 => l2 & 0xFFFF_F000,
+                        _ => continue,
+                    };
+                    if pa_field == target_page {
+                        let va = (l1_idx << 20) | (l2_idx << 12);
+                        let kind_str = match l2_kind {
+                            1 => "large",
+                            2 | 3 => "small",
+                            _ => "fault",
+                        };
+                        kprintln!(
+                            "      ALIAS: VA={:#010x} L1[{:#x}]={:#010x} L2[{:#x}]={:#010x} ({}, PA={:#010x})",
+                            va, l1_idx, l1, l2_idx, l2, kind_str, pa_field,
+                        );
+                        found += 1;
+                        if found >= cap {
+                            kprintln!("      (cap {} hit; stopping)", cap);
+                            return;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    kprintln!("    --- alias enumeration done: {} VAs map to PA {:#010x} ---",
+        found, target_pa);
+}
+
 /// Translate VA 0x0ca6b000 to its current guest PA via the kernel's
 /// stage-1 tables, then install a stage-2 RO carve-out on the
 /// containing 4 KiB page. Idempotent on subsequent calls — we only
@@ -613,6 +696,13 @@ pub fn sample(elr_el2: u64, source: Source, ctx: &TrapContext, spsr_el2: u64) {
         if sp_usr != 0 {
             kprintln!("    (also walking SP_usr={:#010x} of the current task)", sp_usr);
             log_stage1_walk(sp_usr);
+        }
+        // Full enumeration: walk the kernel L1/L2 tables and list
+        // every VA that maps to the corrupted heap PA. Tells us
+        // exactly which kernel structures share PA 0x04032000.
+        let armed_pa = CARVED_PA.load(Ordering::Relaxed);
+        if armed_pa != 0 {
+            enumerate_va_aliases(armed_pa, 64);
         }
         // Dump the trap-stream ring buffer (newest at index 31) so
         // the operator can bisect the corrupting writer to between

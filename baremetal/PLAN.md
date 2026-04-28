@@ -217,50 +217,53 @@ them.
 - Wrapper IS needed (revert diagnostic: boot dies at earlier
   resolved BootOS canary without it).
 - Aliasing IS at stage-1 (kernel page tables map both VAs to
-  same PA, not a stage-2 issue).
-- **Three VAs map to PA 0x04032000**: heap, newt's stack,
-  pssm's stack. Kernel page-pool re-issued the same PA at
-  least twice for different stack-grow events.
+  same PA).
+- THREE VAs initially map to PA 0x04032000 at sanity-halt
+  (heap + newt's stack + pssm's stack).
+- **NEW (this iteration):** alias-onset detector caught a
+  similar event at PA 0x0401f000 (the heap PA *before* its
+  rebind). Triggered through `FMLockHeapRange`'s stock-path
+  call to `ResolveFault` — explicitly NOT routed through
+  our wrapper. The page-pool double-issue happens via stock
+  kernel code, not via the wrapper.
+- `fix_stage1_xn_bits` is exonerated: it preserves the PA
+  field; only normalises AP/CB/XN.
 
-Refined hypothesis: the wrapper's interaction with the
-kernel's page-pool (`TUPageManager::Get` / `FindOrAllocPage`
-/ `AllocNewPage`) breaks the free-list bookkeeping such that
-already-allocated pages get re-issued. Einstein's stock
-boot uses the same ROM but doesn't hit the bug — its 60 s
-NewtonProbe heap dump shows the heap stays valid throughout.
+Refined hypothesis: the kernel's page-pool free-list
+bookkeeping is corrupt by the time FMLockHeapRange asks for
+a page. Why it's corrupt is the open question. The wrapper
+might be partially involved (its earlier 4× iters do touch
+the bookkeeping), but the *trigger* of the visible alias
+event is the stock kernel path.
 
-1. **Probe FindOrAllocPage (or AllocNewPage) return values.**
-   Most direct test. Add an HVC patch at FindOrAllocPage's
-   exit point (or at TUPageManager::Get's exit) to log every
-   returned PA. Tag with caller-LR so we know which path
-   asked. If PA 0x04032000 appears >1 time, we've localised
-   the bug to the kernel's free-list; the wrapper is the
-   trigger but the bug is in how the wrapper exercises the
-   allocator's bookkeeping. Symbol/PC lookup: search for
-   `__nw__FUi` / `AllocNewPage` / `TUPageManager` in
-   `_Data_/symbols.txt` and `_Data_/demangled_symbols.txt`.
-2. **Cross-check Einstein.** Extend NewtonProbe with a
-   "scan kernel L1/L2 for duplicate PA entries" pass at
-   t=30 s and t=60 s. If Einstein's tables show no
-   duplicate PA mappings under sustained allocation
-   pressure, that confirms the divergence is on our side.
-3. **Audit the wrapper's per-iter bookkeeping.** The
-   wrapper assumes iter 0 allocates and iters 1-3 reuse via
-   `SetSubPageInfo`. Verify by tracing each iter's
-   `FindOrAllocPage` call path — does iter N (N>0) ever
-   actually re-allocate? If a fault/IRQ during iter N's
-   `SetSubPageInfo` resets the slot bookkeeping, iter N+1
-   could think slot empty → AllocNewPage → fresh page →
-   leaked page. The wrapper's `cmp r0,#4 / beq done` only
-   guards against `r0==4` (FindOrAllocPage failure code);
-   doesn't bail on success-but-different-page.
-4. **Even bigger picture.** With three VAs sharing the same
-   PA, ANY write to one corrupts the other two. The heap
-   corruption is just the first observable symptom. Once
-   we trace the duplicate-issue, the fix likely belongs at
-   the wrapper level (don't trigger the double-issue) or
-   at a hypervisor stage-2 enforcement level (notice the
-   page-pool re-issue and reject it before it lands).
+1. **Cross-check Einstein.** Extend NewtonProbe with the
+   `count_va_aliases` / `enumerate_va_aliases` walk at the
+   equivalent boot offset (e.g. t=10 s). If Einstein's
+   tables show zero duplicates while ours show 2-3, the
+   divergence has to come from us — and we now know it's
+   not the wrapper exclusively, so a broader hypervisor
+   surface is implicated.
+2. **Audit shadow_stub for stores into the page-pool's
+   free-list area.** shadow_stub patches byte/halfword
+   store instructions to use word stores with byte-
+   swizzling. If the kernel's page-pool free-list has
+   bookkeeping written via STRB and shadow_stub mis-emulates
+   one of those stores, the free-list becomes wrong. Find
+   the address range of the kernel's page-pool metadata,
+   check whether shadow_stub touches any insn that targets
+   it.
+3. **Probe FMLockHeapRange's call path.** Add an HVC at the
+   start of FMLockHeapRange and at the BL-ResolveFault site.
+   Log every (FAR, returned-PA) tuple. If PA 0x0401f000
+   appears as a "returned" PA when the FAR is in newt's
+   stack range, that's the page-pool double-issue we want
+   to fix.
+4. **Audit the wrapper's per-iter bookkeeping.** Even
+   though the visible alias event came through the stock
+   path, the wrapper might have been the upstream trigger
+   that left the free-list inconsistent. Add per-iter
+   logging and watch for an iter that takes the
+   FindOrAllocPage path unexpectedly.
 
 Diagnostic scaffolding (heap-watch sentinel, stage-2 RO
 carve-out, sanity-halt with banked-SP + ring-SP capture,

@@ -4,6 +4,77 @@ Live notes for the next iteration. Replace this file's body when the
 current stop is fixed and a new one takes over — git history is the
 archive of past investigations.
 
+## Onset detector: aliasing happens via FMLockHeapRange stock path, NOT via our wrapper (2026-04-28)
+
+This iteration adds `count_va_aliases(target_pa)` (cheap version
+of `enumerate_va_aliases` that only counts) plus a periodic
+detector in `heap_watch::sample`: every 64 traps, scan the
+kernel page tables for the count of VAs mapping to the carved-out
+heap PA. Fire loudly when the count strictly increases past a
+known prior count.
+
+The detector also resets its prior-count when the carve-out
+follows a VA→PA rebind, so post-rebind aliases aren't masked
+by the higher pre-rebind count.
+
+Two onset events captured:
+
+**(1)** Initial scan: PA 0x0401f000 has 2 VAs already.
+```
+ALIAS: VA=0x0c600000 L1[0xc6]=0x0401c881 L2[0x0]=0x0401f03e
+ALIAS: VA=0x0ca6b000 L1[0xca]=0x0401c081 L2[0x6b]=0x0401f03e
+```
+This is **heap #1 (NewHeap base 0x0c600c00, 3.5 MiB) and heap #3
+(NewHeap base 0x0ca6b000, 2 MiB) sharing PA 0x0401f000 from very
+early in boot.** Both heaps' first-page L2 entries point to the
+same physical page. The overlap is at PA offsets 0xc00..0xfff
+(last 1 KiB of the 4 KiB page) — that's where heap #1's data
+starts (offset 0xc00 within page) and where heap #3's first-page
+data ends. Stays present from the moment the carve-out arms.
+
+**(2)** Refined detector caught the 2→3 transition:
+```
+*** alias ONSET: PA 0x0401f000 now mapped by 3 VAs (was 2) ***
+ALIAS: VA=0x0c600000 ...
+ALIAS: VA=0x0ca6b000 ...
+ALIAS: VA=0x0cc82000 L1[0xcc]=0x04023481 L2[0x82]=0x0401f03e ← NEW
+```
+- Trap source: SVC mode, ELR=0x18cd0 (CP15 op).
+- Pre-trap context: `ResolveFault probe ENTER: this=0x0c112cb8
+  info=0x0c1181b0 far=0x0cc82400 caller_lr=0x001f6b98`
+- caller_lr=0x001f6b98 = the return after the `bl ResolveFault`
+  at FMLockHeapRange's `0x001f6b94` (= `FMLOCK_BL_RESOLVE_PC`
+  in `rom_patches.rs`).
+
+The wrapper's source comment explicitly says `FMLockHeapRange
+BL not patched`. So **this aliasing happens through the stock
+kernel path**, not via our 4-iteration wrapper.
+
+Our `fix_stage1_xn_bits` is exonerated: it preserves the PA
+field (mask `0xFFFF_F000`), only normalising AP/CB/XN low
+bits. The fact that all three L2 entries have identical low
+bits `0x03E` confirms our function processed them, but the PA
+came from the kernel itself.
+
+So the bug is in the kernel's page-pool: it double-issues PA
+0x0401f000 to FMLockHeapRange's stack-locking request when
+that PA is already in use by two heap regions. The kernel's
+free-list bookkeeping is corrupt by this point.
+
+Why the kernel's free-list goes corrupt is now the question.
+Candidates:
+- Real ROM bug, but Einstein doesn't hit it on the same ROM —
+  so something we do differently triggers it.
+- shadow_stub mis-emulating a kernel store that updates the
+  page-pool's free-list bookkeeping.
+- An earlier kernel-side fault/IRQ causing the page-pool's
+  metadata to be left in an inconsistent state.
+
+Next-step probe: extend NewtonProbe with the same
+`count_va_aliases`/`enumerate_va_aliases` walk at the
+equivalent boot offset. If Einstein shows zero duplicates at
+the same point, that confirms the divergence is on our side.
+
 ## Full alias enumeration: PA 0x04032000 mapped to THREE distinct VAs across two tasks + heap (2026-04-28)
 
 This iteration adds `enumerate_va_aliases(target_pa, cap)` in

@@ -216,31 +216,50 @@ would cascade FROM the underlying VA-aliasing bug.
 
 ## Concrete next steps
 
-1. **Confirm aliasing.** Extend `heap_watch::sample` (or add a
-   one-shot at sanity-halt) to walk stage-1 for the user-stack
-   VA `0x0cc82018` and the heap VA `0x0ca6b018` and print both
-   IPAs. If they match, aliasing is confirmed. If they don't
-   match but the bytes still appear in both, the aliasing is
-   stage-2 (two IPAs sharing a host PA), which would point at
-   our `stage2.rs` mapping logic.
-2. **Find the duplicate.** Walk the kernel's L1/L2 tables
-   exhaustively, scanning every VA that resolves to PA
-   0x04032000 (the current heap PA). If multiple VAs name the
-   same PA, the duplicate VA list pinpoints what's wrong. The
-   walker can be wired into `heap_watch.rs` near
-   `arm_carve_out_at_heap_va`, called once when the carve-out
-   first arms.
-3. **Trace upstream.** Once we know which VAs alias, identify
-   WHEN the duplicate mapping was installed. The kernel's page
-   allocator picks pages from a free list; if our hypervisor
-   tells the kernel a page is free that we've already handed
-   out, the allocator will re-issue it. Likely culprits:
-   - Our ROM-load region overlapping a region the kernel
-     reclaims.
-   - A handed-out tracer-trampoline page or shadow-stub page
-     ending up in the kernel's free list.
-   - An unused-RAM detection that ours and Einstein's models
-     differ on.
+**Prime suspect: the `apply_resolve_fault_wrapper` ROM patch in
+`src/rom_patches.rs:894`.** This wrapper makes the kernel run
+`TStackManager::ResolveFault` **four times per kernel-side fault**
+to compensate for ARMv7's missing subpage-AP support, calling
+`FindOrAllocPage` repeatedly and exercising bookkeeping paths
+the kernel didn't expect to execute that often. If even one of
+those iterations causes the kernel's free-list to re-issue a
+page already allocated to the heap, we get exactly the aliasing
+observed. Investigation order:
+
+1. **Audit the wrapper's interaction with the page allocator.**
+   Does it cause `FindOrAllocPage` (or the page-pool free-list)
+   to re-issue a heap page? The wrapper's per-iter FAR is
+   `info->base_va + page_offset + sub_idx*1024` — bounded to
+   the stack region — but the FOUR `ResolveFault` invocations
+   all call into the kernel allocator, and that allocator may
+   not tolerate four "first-allocation" attempts on adjacent
+   subpages without losing track of allocated pages.
+   Specifically check: does iter 0 reserve a page that iters
+   1-3 then re-reserve under different subpage indices,
+   leaking refcount? Or do iters 1-3 actually `FindOrAllocPage`
+   fresh pages too?
+2. **Confirm aliasing directly.** Add a one-shot probe at
+   sanity-halt: walk stage-1 for the user-stack VA
+   `0x0cc82018` and the heap VA `0x0ca6b018`, print both IPAs.
+   If they match, aliasing is confirmed at stage-1. If they
+   don't match but the bytes still appear in both, the
+   aliasing is stage-2 (two IPAs sharing a host PA), which
+   would point at our `stage2.rs` mapping logic — much less
+   likely.
+3. **Walk the page tables for duplicates.** Walk the kernel's
+   L1/L2 exhaustively and list every VA that resolves to PA
+   0x04032000. If multiple VAs name the same PA, the duplicate
+   list pinpoints which kernel structures share the page.
+4. **Try disabling the wrapper.** The wrapper only matters
+   under sustained allocation pressure (TInterpreter ctor's
+   256 KiB of lazy stacks). Temporarily revert
+   `apply_resolve_fault_wrapper` and the
+   `GetMatchingPage→0` patch and rerun. If the heap stays
+   intact (boot wedges elsewhere on the original subpage-AP
+   issue), that confirms the wrapper as the culprit; if the
+   heap still corrupts, look elsewhere. This is a
+   *diagnostic* test, not a fix — we still need a real
+   solution for the subpage-AP issue.
 
 Diagnostic scaffolding (heap-watch sentinel, stage-2 RO
 carve-out, sanity-halt with banked-SP + ring-SP capture,

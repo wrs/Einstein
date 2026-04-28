@@ -619,6 +619,94 @@ void task_dump_save_area(TMemory* mem, KUInt32 task_va) {
 	std::fflush(stdout);
 }
 
+// Walk Einstein's stage-1 page tables (rooted at TTBR0) and report
+// every PA that's mapped by 2+ distinct VAs. Cross-check for our
+// hypervisor's heap-aliasing bug — see baremetal/INVESTIGATION.md
+// "alias-onset detector" finding. If Einstein shows 0 duplicates
+// at the equivalent boot offset, the divergence is on our side.
+//
+// Walks all 4096 L1 entries; for each coarse, walks 256 L2 entries.
+// Builds a PA -> [VAs] map and prints any PA with multiple mappings.
+void duplicate_pa_scan(TMemory* mem) {
+	KUInt32 ttbr = mem->GetTranslationTableBase() & 0xFFFF'C000u;
+	std::map<KUInt32, std::vector<KUInt32>> pa_to_vas;
+	for (KUInt32 l1_idx = 0; l1_idx < 4096; ++l1_idx) {
+		Boolean fault = false;
+		KUInt32 l1 = mem->ReadP(ttbr + l1_idx * 4, fault);
+		if (fault) continue;
+		KUInt32 typ = l1 & 3;
+		if (typ == 2) {
+			// Section: 1 MiB at l1[31:20].
+			KUInt32 pa = l1 & 0xFFF00000u;
+			KUInt32 va = l1_idx << 20;
+			pa_to_vas[pa].push_back(va);
+		} else if (typ == 1) {
+			// Coarse: walk 256 L2 entries.
+			KUInt32 l2_base = l1 & 0xFFFFFC00u;
+			for (KUInt32 l2_idx = 0; l2_idx < 256; ++l2_idx) {
+				Boolean f2 = false;
+				KUInt32 l2 = mem->ReadP(l2_base + l2_idx * 4, f2);
+				if (f2) continue;
+				KUInt32 t2 = l2 & 3;
+				KUInt32 pa = 0;
+				if (t2 == 1) {
+					// Large page (64 KiB).
+					pa = l2 & 0xFFFF0000u;
+				} else if (t2 == 2 || t2 == 3) {
+					// Small page (4 KiB).
+					pa = l2 & 0xFFFFF000u;
+				} else {
+					continue;
+				}
+				KUInt32 va = (l1_idx << 20) | (l2_idx << 12);
+				pa_to_vas[pa].push_back(va);
+			}
+		}
+	}
+	// Counts split between ROM (PA < 0x01000000), RAM
+	// (0x04000000 <= PA < 0x04400000), and "other" (the rest).
+	// The kernel's post-ship patch table at VA 0x01a00000..0x01c20000
+	// aliases ROM PAs ~33 times by design (see docs/NEWTON_INTERNALS.md);
+	// those aren't bugs. Our heap-aliasing wedge is in RAM.
+	int total_pas = 0;
+	int rom_dup_pas = 0, rom_dup_vas = 0;
+	int ram_dup_pas = 0, ram_dup_vas = 0;
+	for (const auto& [pa, vas] : pa_to_vas) {
+		++total_pas;
+		if (vas.size() <= 1) continue;
+		if (pa < 0x01000000u) {
+			++rom_dup_pas;
+			rom_dup_vas += vas.size();
+		} else if (pa >= 0x04000000u && pa < 0x04400000u) {
+			++ram_dup_pas;
+			ram_dup_vas += vas.size();
+		}
+	}
+	std::fprintf(stdout,
+		"dup-pa-scan: TTBR=0x%08x  total_unique_PAs=%d  ROM_dup_PAs=%d (alias VAs=%d)  RAM_dup_PAs=%d (alias VAs=%d)\n",
+		ttbr, total_pas, rom_dup_pas, rom_dup_vas, ram_dup_pas, ram_dup_vas);
+	if (ram_dup_pas == 0) {
+		std::fprintf(stdout, "  (no RAM duplicate PA mappings — only ROM jump-table aliases)\n");
+		std::fflush(stdout);
+		return;
+	}
+	std::fprintf(stdout, "  RAM duplicates:\n");
+	int rows_printed = 0;
+	for (const auto& [pa, vas] : pa_to_vas) {
+		if (vas.size() <= 1) continue;
+		if (pa < 0x04000000u || pa >= 0x04400000u) continue; // RAM only
+		std::fprintf(stdout, "    PA=0x%08x mapped by %zu VAs:", pa, vas.size());
+		for (KUInt32 va : vas) std::fprintf(stdout, " 0x%08x", va);
+		std::fprintf(stdout, "\n");
+		++rows_printed;
+		if (rows_printed >= 32) {
+			std::fprintf(stdout, "    ...(stopped after 32 RAM entries)\n");
+			break;
+		}
+	}
+	std::fflush(stdout);
+}
+
 // Dump 128 bytes of a heap header at `heap_va` (which equals base+16
 // for a Newton heap; the caller passes 0x0ca6b010 for the legitimate
 // RelocHeap created by NewHeap call #3, base=0x0ca6b000). Cross-check
@@ -740,6 +828,11 @@ int main(int argc, char** argv) {
 			// On baremetal this header gets corrupted partway through
 			// boot — see baremetal/INVESTIGATION.md current stop.
 			heap_header_dump(emu.GetMemory(), 0x0ca6b010u);
+			// Duplicate-PA scan: enumerate every PA mapped by 2+ VAs.
+			// On baremetal we see PA 0x0401f000 shared between heap #1,
+			// heap #3, and newt's stack region. If Einstein shows 0
+			// duplicates, divergence is on our side.
+			duplicate_pa_scan(emu.GetMemory());
 			next_dump += std::chrono::seconds(2);
 			++dump_n;
 		}

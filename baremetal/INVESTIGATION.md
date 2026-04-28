@@ -4,6 +4,85 @@ Live notes for the next iteration. Replace this file's body when the
 current stop is fixed and a new one takes over — git history is the
 archive of past investigations.
 
+## Einstein cross-check: aliasing is normal kernel behaviour; the bug is WHICH PA backs heap #3 (2026-04-28)
+
+Added `duplicate_pa_scan()` to `baremetal/probe/probe.cpp`,
+called every 2 s alongside the periodic `task_dump`. Walks
+Einstein's TTBR0-rooted L1/L2 (4096 + 256-each), counts
+duplicate PA mappings, splits ROM (PA<0x01000000) vs. RAM
+(0x04000000≤PA<0x04400000), and lists the RAM duplicates.
+
+Run result on 717006 ROM, 30 s wall-clock, multiple t=2 s,
+4 s, 6 s, ... dumps:
+
+```
+dup-pa-scan: TTBR=0x04000000  total_unique_PAs=927
+    ROM_dup_PAs=42 (alias VAs=1104)
+    RAM_dup_PAs=19 (alias VAs=49)
+  RAM duplicates (subset):
+    PA=0x0401f000 mapped by 2 VAs: 0x0c600000 0x0ccab000
+    PA=0x04035000 mapped by 2 VAs: 0x0c328000 0x0cc82000
+    PA=0x0403f000 mapped by 3 VAs: 0x0ccdd000 0x0cce4000 0x0cd07000
+    PA=0x0402a000 mapped by 3 VAs: 0x0cc7a000 0x0cca3000 0x0ccac000
+    ...
+```
+
+Findings:
+
+1. **The 1104 ROM-region aliases are by design.** Einstein has
+   42 ROM PAs each mapped by ~33 VAs across the kernel's
+   post-ship patch table at VA 0x01a00000..0x01c20000 (per
+   `docs/NEWTON_INTERNALS.md`). These aren't a bug.
+
+2. **The 19 RAM aliases are also by design.** The kernel
+   intentionally co-locates distinct kernel objects on shared
+   physical pages, using ARMv4 subpage-AP to enforce
+   per-subpage permissions. With ARMv7 (no subpage-AP), our
+   `fix_stage1_xn_bits` flattens AP=011 (full RW), losing the
+   protection.
+
+3. **Crucially, Einstein's heap #3 (VA 0x0ca6b000) is NOT in
+   any RAM duplicate set.** Einstein puts heap #3 at PA
+   0x040a6000, sole occupant. Our hypervisor puts heap #3 at
+   PA 0x04032000, shared with TWO stacks (newt at 0x0cc82000
+   and pssm at 0x0cce4000).
+
+4. **Einstein's newt stack VA 0x0cc82000 IS shared, but with
+   0x0c328000** (some Tmux-area kernel struct), not with a
+   heap. So newt-stack writes overlap a region the subpage-AP
+   would have protected; on real hardware that's fine, on
+   ARMv7 it would corrupt. Yet Einstein boots cleanly — which
+   means either Einstein's stage-2 model is more permissive
+   for the stack-shared case, OR the colliding region
+   (0x0c328000) happens not to receive damaging writes.
+
+The bug isn't "we have aliasing", it's "the kernel's
+page-pool state diverges between Einstein and us before
+NewHeap call #3". Some allocation state we cause (or fail to
+cause) leads to heap #3 landing on a different PA than
+Einstein's, and that PA happens to be shared with a stack
+region that overlaps the heap struct fields.
+
+So the divergence question is now: **what kernel-state
+operation between boot and NewHeap call #3 produces a
+different page-pool state in our hypervisor?** The page-pool
+allocator's free-list is shaped by every preceding
+`Alloc`/`Release`. Anything we do differently (cache ops
+emulation, banked-register quirks, an extra/missing fault,
+shadow-stub byte-store side effects, flash-driver behaviour
+divergences) could cascade into different allocations.
+
+Concrete next-step probe: log every page-pool operation
+(`AllocNewPage` / `TUPageManager::Get` / `TUPageManager::
+Release` exit) and compare the sequence of (op, PA) tuples
+between Einstein and us up to NewHeap #3. The first
+divergence is the trigger.
+
+Alternative: extend the wrapper's protection (or add a
+parallel mechanism) to ensure heap pages are never shared
+with stack pages. Practical short-term fix; doesn't address
+the underlying state divergence but stops the corruption.
+
 ## Onset detector: aliasing happens via FMLockHeapRange stock path, NOT via our wrapper (2026-04-28)
 
 This iteration adds `count_va_aliases(target_pa)` (cheap version

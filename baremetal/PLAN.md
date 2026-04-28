@@ -213,57 +213,69 @@ them.
 
 ## Concrete next steps
 
-**Findings to date (2026-04-28):**
-- Wrapper IS needed (revert diagnostic: boot dies at earlier
-  resolved BootOS canary without it).
-- Aliasing IS at stage-1 (kernel page tables map both VAs to
-  same PA).
-- THREE VAs initially map to PA 0x04032000 at sanity-halt
-  (heap + newt's stack + pssm's stack).
-- **NEW (this iteration):** alias-onset detector caught a
-  similar event at PA 0x0401f000 (the heap PA *before* its
-  rebind). Triggered through `FMLockHeapRange`'s stock-path
-  call to `ResolveFault` — explicitly NOT routed through
-  our wrapper. The page-pool double-issue happens via stock
-  kernel code, not via the wrapper.
-- `fix_stage1_xn_bits` is exonerated: it preserves the PA
-  field; only normalises AP/CB/XN.
+**Major reframe (2026-04-28):** the Einstein cross-check via
+`duplicate_pa_scan()` showed that **Einstein has 17-19 RAM
+duplicate PAs** with 44-49 alias VAs at the equivalent boot
+offset. Aliasing is intentional kernel behaviour — the kernel
+co-locates distinct kernel objects on shared 4 KiB physical
+pages and uses ARMv4 subpage-AP to enforce per-1 KiB-subpage
+permissions. With ARMv7 (no subpage-AP), our `fix_stage1_xn_bits`
+flattens AP=011 (full RW) so writes to one subpage spill into
+another's.
 
-Refined hypothesis: the kernel's page-pool free-list
-bookkeeping is corrupt by the time FMLockHeapRange asks for
-a page. Why it's corrupt is the open question. The wrapper
-might be partially involved (its earlier 4× iters do touch
-the bookkeeping), but the *trigger* of the visible alias
-event is the stock kernel path.
+**The 1 KiB subpage allocation isn't just for stacks — it's
+also for heaps.** Earlier we assumed only stacks. The
+`apply_resolve_fault_wrapper` at `src/rom_patches.rs:894`
+forces every stack to its own physical page (via 4× ResolveFault
+iter, claiming all 4 subpages for the stack). That isolates
+stacks from each other and from any other kernel object on the
+same page. **Heaps are not currently protected this way.**
 
-1. **Cross-check Einstein.** Extend NewtonProbe with the
-   `count_va_aliases` / `enumerate_va_aliases` walk at the
-   equivalent boot offset (e.g. t=10 s). If Einstein's
-   tables show zero duplicates while ours show 2-3, the
-   divergence has to come from us — and we now know it's
-   not the wrapper exclusively, so a broader hypervisor
-   surface is implicated.
-2. **Audit shadow_stub for stores into the page-pool's
-   free-list area.** shadow_stub patches byte/halfword
-   store instructions to use word stores with byte-
-   swizzling. If the kernel's page-pool free-list has
-   bookkeeping written via STRB and shadow_stub mis-emulates
-   one of those stores, the free-list becomes wrong. Find
-   the address range of the kernel's page-pool metadata,
-   check whether shadow_stub touches any insn that targets
-   it.
-3. **Probe FMLockHeapRange's call path.** Add an HVC at the
-   start of FMLockHeapRange and at the BL-ResolveFault site.
-   Log every (FAR, returned-PA) tuple. If PA 0x0401f000
-   appears as a "returned" PA when the FAR is in newt's
-   stack range, that's the page-pool double-issue we want
-   to fix.
-4. **Audit the wrapper's per-iter bookkeeping.** Even
-   though the visible alias event came through the stock
-   path, the wrapper might have been the upstream trigger
-   that left the free-list inconsistent. Add per-iter
-   logging and watch for an iter that takes the
-   FindOrAllocPage path unexpectedly.
+Einstein puts heap #3 alone on PA 0x040a6000. Our hypervisor
+puts heap #3 on PA 0x04032000 alongside two stacks (newt and
+pssm). The difference comes from the kernel's page-pool state
+diverging between us and Einstein before NewHeap #3 runs.
+Einstein avoids corruption by subpage-AP; we corrupt because
+our flat AP lets the stack writes spill into the heap's
+subpage.
+
+So the strategy is to **extend the wrapper-style protection to
+heap allocations**: ensure each heap page is allocated as the
+sole occupant of its 4 KiB physical page, just like we do for
+stacks.
+
+1. **Find the heap-allocation page-pool path.** NewHeap calls
+   into `__nw__FUi` (operator new) or directly into the
+   page-allocator. Identify the heap-side `FindOrAllocPage`
+   equivalent. Likely candidates: `FMLockHeapRange`, the
+   `__nw__FUi` path, or a heap-specific TUPageManager call
+   site. Symbol search:
+   - `FMLockHeapRange` at 0x001f6b94 region (already known
+     from the wrapper's BL-not-patched comment).
+   - `__nw__FUi` at 0x001bce738.
+   - `TUPageManager::Get` at 0x00162af4 (we saw this from a
+     prior symbol lookup).
+2. **Mirror the wrapper for heaps.** Build the analog of
+   `apply_resolve_fault_wrapper` for whichever function ends
+   up being the heap-side analog of `TStackManager::Fault`.
+   The wrapper's job: force fresh-page allocation per heap
+   subpage, claim all 4 subpages of the page for the heap.
+3. **Watch for second-order effects.** The stack wrapper's
+   interaction with the kernel's page-pool was already a
+   source of subtle behaviour shifts. Adding a heap wrapper
+   should be paired with the existing alias-onset detector
+   so we catch any new corruption immediately.
+4. **Diagnostic alternative.** If a wrapper-style fix is too
+   invasive to design quickly, a stage-2-side fix could
+   detect heap pages and refuse to alias them at stage-1.
+   Larger lift but more robust.
+
+The aliasing IS the kernel's intent; our hypervisor's job is
+to either preserve subpage-AP semantics (impossible on
+ARMv7) or arrange the kernel's allocations such that no
+shared page contains two regions whose subpage offsets
+would overlap. The wrapper takes the second approach for
+stacks; the next step is to take it for heaps too.
 
 Diagnostic scaffolding (heap-watch sentinel, stage-2 RO
 carve-out, sanity-halt with banked-SP + ring-SP capture,

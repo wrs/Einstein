@@ -218,31 +218,53 @@ deliberate stack-guard sharing.
    the prior "PA recycling" diagnosis) is plausible but a
    substantial undertaking.
 
-### Next iteration — Group-1 stage-2 RO trap (independent track)
+7. **Group-1 stage-2 RO trap probe** — implemented `g1_capture`
+   module marking PA=0x04004000, 0x04005000, 0x04006000 RO+XN
+   at boot, captures every guest write with (PC, offset, value).
+   IRQ-only rearm (sync-trap rearm caused an infinite STMIA-retry
+   loop). Cold-boot run: 186 captures across 25 writer PCs,
+   exit=1 reboot canary, 15 verify-mmu aliases unchanged, 36/36
+   guest tests pass.
 
-Pivot to Group-1 (PA=0x04004000, 0x04005000, 0x04006000), a
-fundamentally different class — these are direct kernel L2
-writes during TTBR0 setup that bypass the entire Remember/Prim
-layer. The track is independent of Group-2 progress and yields
-3 aliases of progress when complete.
+   **Captures don't reveal alias-creating writes.** The 3 armed
+   PAs are *target* pages of the duplicate L2 entries — what
+   gets mapped at two VAs — not the L2 PT pages where the
+   duplicate L2 descriptors live. Per the prior task-census
+   `L1[0xc0]=0x00001401`, the L2 PT for L1[0xc0] sits at
+   PA=`0x00001400` in **ROM**; the duplicate descriptors at
+   L2[0x0] / L2[0x2] / etc. are pre-baked at ROM build time and
+   never dynamically written. Group-1 aliases are static ROM
+   artifacts, not runtime kernel decisions.
 
-Steps:
+   Hypervisor self-noise observed: 56 captures at PC=0x00FFFF08
+   (UND_TRAMP) writing PA=0x04005000+0xf0c, plus 5 at
+   PC=0x00FFFFB4 (DABT_TRAMP) writing +0xfa0 — these are our
+   own UND/DABT scratch-slot writes (UND_SAVE_R0_IPA=0x04005F0C,
+   DABT_SAVE_PA=0x04005FA0) trapping at stage-2.
 
-1. Stage-2 RO mapping on PA=0x04004000..0x04007000 (3 pages).
-   Mark them stage-2-RO; stage-1 stays RW so the guest sees a
-   normal write but it traps to EL2.
-2. EL2 fault handler: decode the AArch32 store insn (reuse the
-   `unaligned::handle_align_fault` decoder), log
-   `(PC, target offset, value)` for every store, then commit
-   the write through the kernel-globals mirror so the guest
-   proceeds.
-3. Cold-boot. Capture the (PC, offset, value) triples that
-   produce the 3 verify-mmu Group-1 aliases.
-4. Decide fix layer: (a) Einstein-port behaviour for those PCs,
-   (b) ROM patch redirecting the self-map writes to a non-
-   shared backing, (c) hypervisor-synthesised second mapping
-   (write distinct PA values into the L2 entries so the guest
-   never aliases at the underlying L1).
+### Next iteration — confirm ROM-baked L2 PT, then choose fix layer
+
+Step 1: Add a one-shot dump at end of `stage2::init()` (or at
+first verify-mmu fire) reading PA=0x00001400..0x00001500. Log
+the first 64 L2 entries. Confirm L2[0x0] and L2[0x2] both
+contain PA=0x04004000-derived descriptors; repeat for L2[0x3]/
+L2[0x4] and L2[0x7]/L2[0x8].
+
+Step 2: Choose fix layer:
+- (a) ROM-byte patches in `apply_717006_patches` overwriting the
+  duplicate L2 entries (cleanest if duplicate access isn't
+  actually used).
+- (b) Stage-2 PA splitting at the duplicate VA: detect the
+  duplicate at MMU-enable time, allocate a hypervisor backing,
+  copy contents, modify the *guest's* L2 entry at the alias VA
+  to point at the new PA. Both VAs remain RW; they no longer
+  alias.
+- (c) Investigate first: stage-2 trap on the duplicate VAs
+  (not target PAs) to enumerate read/write patterns. If both
+  VAs are used for distinct data, neither (a) nor (b) works.
+
+Recommend the order (c) → (a)|(b) once access patterns are
+characterised.
 
 Group-2's 12 aliases remain parked until Group-1 is zero.
 Group-2 will then be revisited with **Option C: stage-2 PA

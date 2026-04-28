@@ -341,36 +341,116 @@ recycling"); the new aliases the 36-KiB attempt produced may
 have a different cause that's now diagnosable via the Prim
 alias tracker.
 
-## Next iteration — Group-1 stage-2 RO trap (independent track)
+## Group-1 stage-2 RO trap probe — pages are write targets, not L2 PTs
 
-The 3 Group-1 aliases (PA=0x04004000, 0x04005000, 0x04006000) are
-a fundamentally different class of problem from Group-2 — they
-come from direct kernel L2 writes during TTBR0 setup, bypassing
-the entire Remember/Prim layer. Switching to this track:
+Implemented a `g1_capture` module (`src/g1_capture.rs`) that:
 
-1. Install a stage-2 RO mapping on PA=0x04004000..0x04007000
-   (3 pages). Make those PAs read-write through stage-1 (the
-   guest sees normal RW) but stage-2-RO so writes trap to EL2.
-2. EL2 fault handler: decode the AArch32 store insn (existing
-   `unaligned::handle_align_fault` infrastructure has the
-   relevant decoder), log `(PC, target offset, value)`, then
-   commit the write through the kernel-globals mirror so the
-   guest proceeds.
-3. Cold-boot. Capture every store to those 3 pages during boot.
-   Sort the (PC, offset, value) triples to identify the kernel's
-   TTBR0 self-map setup function.
-4. Decide fix layer: (a) Einstein-port behaviour (do whatever
-   Einstein does for these specific writes), (b) ROM patch that
-   redirects the self-map writes to a non-shared backing, (c)
-   hypervisor-synthesised second mapping (write the L2 entries
-   to point at a duplicate hypervisor-allocated PA so the guest
-   sees the same L1/L2 byte values without underlying alias).
+- Marks PA=0x04004000, 0x04005000, 0x04006000 stage-2 RO+XN at
+  end of `stage2::init()` (before guest ERET).
+- Hooks `handle_data_abort` so any RW permission-fault on those
+  pages logs `(elr, ipa, value, srt)` before the existing
+  auto-flip-to-RW path lets the store complete.
+- Re-arms RO+XN on every IRQ entry (timer-driven, ~16 ms cadence)
+  so subsequent writes also fault. **Critical:** rearming on
+  *sync* trap entry caused an infinite ResolveFault-style loop
+  because STMIA (and other multi-register stores) span page
+  boundaries and re-fault on each retry; IRQ-only rearm lets
+  the in-flight STM complete unhindered.
 
-Group-2 stays parked at 12 aliases until Group-1 is solved.
-Once Group-1 is zero, revisit Group-2 with stage-2 PA splitting
-(Option C) — the hypervisor-level approach that was previously
-considered "overkill" but may now be the cleanest route given
-the Group-2 root cause is deliberate kernel design.
+Cold-boot result: 186 captures across the 3 PAs, 25 distinct
+writer PCs, exit=1 reboot canary as before, 15 verify-mmu
+aliases unchanged, all 36 guest tests pass.
+
+### Captures don't reveal the alias-creating writes
+
+Distribution by PA / offset:
+
+```
+PA=0x04004000  64 captures across 15 distinct offsets, range 0x0..0x3ec
+PA=0x04005000  64 captures across  5 distinct offsets, range 0x0..0xfa0
+PA=0x04006000  58 captures across  9 distinct offsets, range 0x0..0x868
+```
+
+`PA=0x04005000`'s captures at offsets `0xf0c` (56× from
+PC=0x00FFFF08) and `0xfa0` (5× from PC=0x00FFFFB4) are
+**hypervisor self-noise** — those PCs are inside our own
+UND/DABT trampolines (UND_TRAMP at 0x00FFFF00, DABT_TRAMP at
+0x00FFFFA8). UND_SAVE_R0_IPA is `0x04005F0C` and DABT_SAVE is
+at `0x04005FA0`; both fall in the 0x04005000 page, so our own
+EL2-controlled trampoline writes trip the stage-2 RO trap.
+That's expected and harmless — they're EL1-AArch32 stores from
+the guest-installed trampoline.
+
+The remaining captures (`~125`) are heterogeneous. Some values
+look like ARMv7 section descriptors (e.g. `0x04007f0e` written
+to PA=0x04006000 by PC=0x00018d10), suggesting that page hosts
+*part of* the kernel's L1 PT. Other values are small integers
+(1..0x26) written to PA=0x04004000 by PC=0x001dd934 — looks like
+counter-loop population of an array, NOT an L1/L2 PT entry.
+
+### What we missed: writes to PA=0x00001400 (ROM-resident L2 PT)
+
+The prior task-census output recorded `L1[0xc0] = 0x00001401`,
+a coarse PT descriptor pointing at L2 PT base PA `0x00001400`
+(decoded: bits[31:10]=0x05 → base = 0x05 << 10). PA `0x1400`
+lives in ROM. The duplicate L2 entries that establish the
+Group-1 aliases (e.g. L1[0xc0],L2[0x0] → PA=0x04004000 AND
+L1[0xc0],L2[0x2] → PA=0x04004000) live at PA `0x1400 + idx*4`
+in ROM — pre-baked at ROM build time, never dynamically
+written.
+
+So the g1_capture probe sees writes to the *target* PAs of the
+aliases (the kernel-globals data pages) but **not** to the L2
+PT entries that *create* the aliases. The aliases are static
+ROM artifacts — a deliberate Apple-build-time design that
+exposes kernel-globals data pages at two VAs each (likely an
+ARMv4 subpage-AP-era permission-overlay pattern: kernel-RW at
+one VA, kernel-RO-shared at another).
+
+## Next iteration — confirm ROM-baked L2 PT, design fix
+
+### Step 1: confirm by direct inspection
+
+Add a one-shot dump at end of `stage2::init()` (or at first
+verify-mmu fire): read PA=0x00001400..0x00001500 and log the
+first 64 L2 entries. Confirm L2[0x0] and L2[0x2] both contain
+PA=0x04004000-derived descriptors. Repeat for the other two
+alias families.
+
+### Step 2: choose fix layer
+
+Given the aliases are ROM-baked:
+
+a. **ROM patch.** Add ROM-byte patches to `apply_717006_patches`
+   that overwrite the duplicate L2 entries with either invalid
+   (= unmap one of the two VAs) or distinct-PA descriptors.
+   Risk: the duplicate is intentional — kernel-globals access
+   at the alias VA may have legitimate uses we'd break.
+
+b. **Stage-2 PA splitting at the duplicate VA.** Detect the
+   duplicate at MMU-enable time, hypervisor-allocate a fresh
+   backing PA, copy the kernel-globals contents into it, and
+   modify the *guest's* L2 entry at the alias VA to point at
+   the new PA. The guest still sees two writable mappings, but
+   they no longer alias the same physical page. Each subsequent
+   kernel write to either VA stays local; reads from the alias
+   VA may go stale, but if the kernel only ever *writes* through
+   one VA and never reads from the other (the typical permission-
+   overlay pattern), this is invisible.
+
+c. **Investigate first.** Before patching, characterise what
+   the kernel actually does with the alias VAs. Add a stage-2
+   trap on the duplicate VAs (not the target PAs) and log every
+   read and write to enumerate access patterns. If both VAs are
+   actively used for distinct data, neither (a) nor (b) works
+   and we need a different model.
+
+Recommend (c) → (a) or (b) based on the access pattern.
+
+### Group-2 still parked
+
+Once Group-1 is resolved, revisit Group-2 with stage-2 PA
+splitting (Option C from prior plan).
 
 ### Step Group-1 stage-2 RO trap (still needed)
 

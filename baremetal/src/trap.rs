@@ -1211,6 +1211,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::PRIM_REMEMBER_PROBE_HVC_IMM => {
             handle_prim_remember_probe(ctx);
         }
+        v if v == crate::rom_patches::PRIM_FORGET_PROBE_HVC_IMM => {
+            handle_prim_forget_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1664,6 +1667,13 @@ fn handle_und(ctx: &mut TrapContext) {
             // spsr_und as the source CPSR so SP/LR lookups land on
             // the right banked register.
             handle_prim_remember_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::PRIM_FORGET_PROBE_HVC_IMM) => {
+            // PrimForgetMapping prologue probe at 0x00163514. Same
+            // dispatch shape as the Remember probe.
+            handle_prim_forget_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -2975,6 +2985,26 @@ fn handle_page_get_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
     }
 }
 
+/// Per-PA → first-VA tracker shared by the Prim Remember/Forget
+/// probes. `PRIM_FIRST_VA_FOR_PA[idx] == 0` means "no current
+/// mapping recorded"; non-zero is the VA the kernel last installed
+/// at this PA. `PrimRememberMapping` populates the slot; a matching
+/// `PrimForgetMapping` clears it. A Remember call seeing a non-zero
+/// `prev_va != va` is an alias *without* a preceding forget — the
+/// real-bug condition we want to surface.
+const PRIM_TRACKER_RAM_BASE: u32   = 0x0400_0000;
+const PRIM_TRACKER_RAM_PAGES: usize = 0x0040_0000 / 0x1000; // 1024
+static PRIM_FIRST_VA_FOR_PA: [AtomicU32; PRIM_TRACKER_RAM_PAGES] = {
+    const ZERO: AtomicU32 = AtomicU32::new(0);
+    [ZERO; PRIM_TRACKER_RAM_PAGES]
+};
+static PRIM_FIRST_LR_FOR_PA: [AtomicU32; PRIM_TRACKER_RAM_PAGES] = {
+    const ZERO: AtomicU32 = AtomicU32::new(0);
+    [ZERO; PRIM_TRACKER_RAM_PAGES]
+};
+static PRIM_ALIAS_LOG_BUDGET: AtomicU32 = AtomicU32::new(64);
+static PRIM_FORGET_MISMATCH_BUDGET: AtomicU32 = AtomicU32::new(64);
+
 /// `PrimRememberMapping` prologue probe (PRIM_REMEMBER_PROBE_HVC_IMM = 0x54).
 ///
 /// Patches the first word at ROM `0x00163480` (the standard
@@ -3027,32 +3057,27 @@ fn handle_prim_remember_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
         .unwrap_or(0xDEAD_BEEF);
     let phys = phys_word & !0xFFF;
 
-    const RAM_BASE: u32 = 0x0400_0000;
-    const RAM_PAGES: usize = 0x0040_0000 / 0x1000; // 1024
-    static FIRST_VA_FOR_PA: [AtomicU32; RAM_PAGES] = {
-        const ZERO: AtomicU32 = AtomicU32::new(0);
-        [ZERO; RAM_PAGES]
-    };
-    static FIRST_LR_FOR_PA: [AtomicU32; RAM_PAGES] = {
-        const ZERO: AtomicU32 = AtomicU32::new(0);
-        [ZERO; RAM_PAGES]
-    };
-    static PRIM_ALIAS_LOG_BUDGET: AtomicU32 = AtomicU32::new(64);
     static CALL_COUNT: AtomicU32 = AtomicU32::new(0);
     let n = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
 
-    if phys >= RAM_BASE && (phys - RAM_BASE) < (RAM_PAGES as u32 * 0x1000) {
-        let page_idx = ((phys - RAM_BASE) >> 12) as usize;
+    if phys >= PRIM_TRACKER_RAM_BASE
+        && (phys - PRIM_TRACKER_RAM_BASE) < (PRIM_TRACKER_RAM_PAGES as u32 * 0x1000)
+    {
+        let page_idx = ((phys - PRIM_TRACKER_RAM_BASE) >> 12) as usize;
         // CAS-style update: only overwrite the slot if the VA differs.
         // The kernel's incremental-subpage pattern calls Prim with the
         // SAME va several times to widen the mask; we want first-VA
         // semantics, not last-VA, so a same-VA call must not displace
-        // the original LR.
-        let prev_va = FIRST_VA_FOR_PA[page_idx].load(Ordering::Relaxed);
-        let prev_lr = FIRST_LR_FOR_PA[page_idx].load(Ordering::Relaxed);
+        // the original LR. PrimForgetMapping clears this slot to 0
+        // when the kernel forgets a mapping, so a `prev_va != 0 &&
+        // prev_va != va` here means the kernel installed PA at va'
+        // and then at va WITHOUT a preceding forget — the real-bug
+        // condition.
+        let prev_va = PRIM_FIRST_VA_FOR_PA[page_idx].load(Ordering::Relaxed);
+        let prev_lr = PRIM_FIRST_LR_FOR_PA[page_idx].load(Ordering::Relaxed);
         if prev_va == 0 {
-            FIRST_VA_FOR_PA[page_idx].store(va, Ordering::Relaxed);
-            FIRST_LR_FOR_PA[page_idx].store(
+            PRIM_FIRST_VA_FOR_PA[page_idx].store(va, Ordering::Relaxed);
+            PRIM_FIRST_LR_FOR_PA[page_idx].store(
                 if upstream_lr == 0 { 0xFFFF_FFFE } else { upstream_lr },
                 Ordering::Relaxed,
             );
@@ -3076,6 +3101,72 @@ fn handle_prim_remember_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
     }
 
     // Emulate `mov ip, sp` (ip = r12 non-banked; sp = R13_<source_mode>).
+    ctx.x[12] = sp as u64;
+}
+
+/// `PrimForgetMapping` prologue probe (PRIM_FORGET_PROBE_HVC_IMM = 0x55).
+///
+/// Patches the first word at ROM `0x00163514` (`mov ip, sp`) with
+/// `HVC #0x55`. Companion to the Remember probe: when the kernel
+/// forgets a (VA, PA) mapping, this handler clears the per-PA →
+/// first-VA tracker slot. With both probes installed, `Prim ALIAS:`
+/// fires only when the kernel installs the SAME PA at two different
+/// VAs WITHOUT a preceding forget — the real-bug aliasing condition.
+///
+/// Function signature: `PrimForgetMapping(va=r0, &TPhys=r1)`. PA is
+/// recovered as `*(r1+16) & ~0xFFF` (same encoding as Remember). If
+/// the tracker slot's recorded VA doesn't match the forgotten VA,
+/// log `FORGET MISMATCH:` so we know the kernel is forgetting at a
+/// VA other than the one we recorded — also a useful signal.
+fn handle_prim_forget_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_prim_forget_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_prim_forget_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    let va     = ctx.x[0] as u32;
+    let tphys  = ctx.x[1] as u32;
+    let sp     = crate::banked::sp_for_mode(ctx, source_cpsr);
+
+    let phys_word = guest_mem::read_word_va(tphys.wrapping_add(16))
+        .unwrap_or(0xDEAD_BEEF);
+    let phys = phys_word & !0xFFF;
+
+    static FORGET_CALL_COUNT: AtomicU32 = AtomicU32::new(0);
+    let n = FORGET_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    if phys >= PRIM_TRACKER_RAM_BASE
+        && (phys - PRIM_TRACKER_RAM_BASE) < (PRIM_TRACKER_RAM_PAGES as u32 * 0x1000)
+    {
+        let page_idx = ((phys - PRIM_TRACKER_RAM_BASE) >> 12) as usize;
+        let prev_va = PRIM_FIRST_VA_FOR_PA[page_idx].load(Ordering::Relaxed);
+        if prev_va == va {
+            // Matched forget — clear the slot.
+            PRIM_FIRST_VA_FOR_PA[page_idx].store(0, Ordering::Relaxed);
+            PRIM_FIRST_LR_FOR_PA[page_idx].store(0, Ordering::Relaxed);
+        } else if prev_va != 0 {
+            let budget = PRIM_FORGET_MISMATCH_BUDGET
+                .fetch_sub(1, Ordering::Relaxed);
+            if budget > 0 {
+                kprintln!(
+                    "Prim FORGET MISMATCH: PA={:#010x}  forgot VA={:#010x}  but tracker had VA={:#010x}",
+                    phys, va, prev_va,
+                );
+            }
+        }
+        // prev_va == 0: PA wasn't tracked (probably forgotten before
+        // any remember we observed, or PA outside our tracker range);
+        // silently no-op so we don't drown in noise.
+    }
+
+    if n < 16 {
+        crate::dprintln!(
+            "Prim FORGET probe ENTER: #{} va={:#010x} phys={:#010x} src_mode={:#x} sp={:#010x}",
+            n, va, phys, source_cpsr & 0x1F, sp,
+        );
+    }
+
+    // Emulate `mov ip, sp`.
     ctx.x[12] = sp as u64;
 }
 

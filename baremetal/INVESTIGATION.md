@@ -144,50 +144,132 @@ even if it had seen the right calls, its alias-key was a TPhys*
 pointer rather than a real PA — a different (and rarely-coinciding)
 condition.
 
-## Next iteration — narrow Group-2 root cause + Group-1 stage-2 trap
+## `PrimForgetMapping` probe — 12 of 13 prior aliases survive forget pairing
 
-### Group-2 (Prim catches these)
+Patched `0x00163514` (`mov ip, sp`) with `HVC #PRIM_FORGET_PROBE_HVC_IMM
+(0x55)`. Hoisted the per-PA → first-VA tracker out of
+`handle_prim_remember_probe_with` into module-level statics
+(`PRIM_FIRST_VA_FOR_PA` / `PRIM_FIRST_LR_FOR_PA`) so both probes
+manipulate the same arrays. `PrimForgetMapping(va=r0, &TPhys=r1)`:
+PA recovered as `*(r1+16) & ~0xFFF`. On a forget call, if the
+tracker's recorded VA matches the forgotten VA, the slot clears;
+mismatches log `Prim FORGET MISMATCH:`.
 
-Two paths to investigate:
+### Result
 
-1. **`CopyPagesAfterStackCollided` (`0x001F7540`).** This function
-   handles stack-stack collision recovery: copy old PA → new PA,
-   `ForgetMapping(old_VA, ..., old_PA)`, `RememberMapping(?, new_VA?, mask, new_PA, perm)`.
-   In principle the alias should clear after `ForgetMapping`, but
-   the probe shows the same PA appearing at multiple VAs *across*
-   collision events — suggesting the PA in step "new_PA" sometimes
-   is a PA that's STILL mapped under another stack's VA.
-   - Plan: add a probe at the `bl ForgetMapping` (`0x001f75f0`) to
-     log `(old_VA, old_PA)` and verify whether ForgetMapping
-     actually clears the L2 entry.
-   - Cross-check `TUPageManager::Get` page-allocation: the prior
-     page-get probe showed unique `PageId`s but Newton's PageId
-     may map to N>1 physical pages (count=2 was observed); the
-     same `PageId` returned to two consumers could mean two PAs
-     each, but if only ONE is owned-by-callee and the OTHER ends
-     up unclaimed, a later allocation could re-claim it.
-2. **`GenericSWIHandler` (SWI #12 dispatch at `0x000D8E38`).**
-   This is the user-mode-driven path. Likely callers: heap/stack
-   allocation routines like `FMNewStack`, `LockHeapRange`,
-   `UnlockHeapRange`. To narrow further, walk the SWIBoot save
-   area at HVC time to recover the user-mode caller PC (above
-   the SWI boundary).
+| metric | iter 1 (Remember only) | iter 2 (+ Forget) |
+|--------|-----------------------:|------------------:|
+| `Prim ALIAS:` lines    | 106 | 55 |
+| unique aliased PAs     |  13 | 12 |
+| `FORGET MISMATCH:` lines | n/a |  8 |
+| verify-mmu aliases     |  15 | 15 |
 
-### Group-1 (Prim does NOT catch these — direct L2 writes)
+The drop from 106 → 55 ALIAS lines and 13 → 12 unique PAs proves
+the tracker correctly clears matched forgets — most of the prior
+"aliases" were artifacts of normal forget+re-install sequences.
+The remaining 12 are **real aliases**: same PA installed at two
+distinct VAs WITHOUT an intervening forget. **All 12 come through
+upstream `0x000d8e3c` (GenericSWIHandler, SWI #12 dispatch)** —
+the kernel-side handler for user-mode `Remember (static)` calls.
 
-The 3 Group-1 aliases (PA=0x04004000, 0x04005000, 0x04006000)
-correspond to the kernel's L1 PT page (PA 0x04004000 backs L1
-sections via the TTBR0 self-map) and the first two L2 PT pages.
-These are written by direct kernel store instructions during
+`CopyPagesAfterStackCollided` upstream LRs (`0x001f76bc`,
+`0x001f775c`) only appear as accomplices on a few PAs — those PAs
+are dual-installed via SWI #12 *and* through stack-collision
+recovery. The collision path is not creating fresh aliases on
+its own.
+
+### FORGET MISMATCH cases corroborate
+
+```
+PA=0x04028000  forgot VA=0x0c318000  but tracker had VA=0x0c602000
+PA=0x04028000  forgot VA=0x0c320000  but tracker had VA=0x0c602000
+PA=0x0402c000  forgot VA=0x0cc82000  but tracker had VA=0x0ccab000
+PA=0x04034000  forgot VA=0x0cc7f000  but tracker had VA=0x0cc82000
+PA=0x04034000  forgot VA=0x0cc80000  but tracker had VA=0x0cc82000
+PA=0x04034000  forgot VA=0x0cc81000  but tracker had VA=0x0cc82000
+PA=0x0403d000  forgot VA=0x0ccc9000  but tracker had VA=0x0ccc4000
+PA=0x0402e000  forgot VA=0x0c320000  but tracker had VA=0x0cc9b000
+```
+
+These show the kernel forgetting a (VA, PA) pair where our tracker
+held a *later* VA — i.e. the kernel called Remember(VA1, PA),
+Remember(VA2, PA) (alias logged), then later Forget(VA1, PA). So
+the kernel is aware that PA was mapped at multiple VAs and
+forgets each VA's mapping individually — but during the period
+between Remember(VA2, PA) and Forget(VA1, PA), the alias is live.
+
+### Why this matches the "stack-guard sharing" hypothesis
+
+The aliased VAs land on stack-grid offsets (32 KiB stride):
+
+| PA           | Aliased VAs |
+|--------------|---|
+| 0x04028000 | 0x0c310000, 0x0c318000, 0x0c320000, 0x0c602000 |
+| 0x0402c000 | 0x0cc7a000, 0x0cc82000, 0x0ccab000 |
+| 0x0402e000 | 0x0cc9b000, 0x0cca3000, 0x0c320000 |
+
+VAs `0xc310000 / 0xc318000 / 0xc320000` differ by 0x8000 (32 KiB —
+the Newton stack-stride). The same physical page is the *last
+page of stack N* AND the *first page of stack N+1*. ARMv4's
+subpage AP let those two stacks own the page's halves
+independently; on ARMv7 we collapse to AP=011, so the two stacks
+share the entire 4 KiB page → write-from-one corrupts the other.
+
+This is the documented **Group-2 stack-guard sharing** pattern:
+the kernel is intentionally sharing boundary pages, not by
+mistake. The fix is at the allocator (FMNewStack) layer — make
+each stack allocate non-overlapping 4 KiB pages.
+
+## Next iteration — narrow user-mode SWI #12 caller, draft FMNewStack patch
+
+### Step 1: walk SWIBoot save area for user-mode PC
+
+The Prim probe records `upstream_lr=0x000d8e3c` for all real
+aliases — this is *inside* GenericSWIHandler. The user-mode caller
+PC (the `swi #12` issuing instruction's PC) is preserved by the
+SWI entry vector in the per-task SWIBoot save area before
+GenericSWIHandler runs. Walking that area at probe time gives the
+user-mode function name (likely `FMNewStack`, `LockHeapRange`, or
+`Remember (static)` direct invocations).
+
+Approach:
+- At `handle_prim_remember_probe_with` entry, source-mode is SVC
+  (user→SWI dispatch). `sp_for_mode(ctx, SVC)` already gives us
+  the SVC stack pointer.
+- The Newton kernel's SWI vector pushes USR R0..R15 onto SP_svc
+  before branching to GenericSWIHandler. The exact layout is
+  documented in `docs/STRUCTURES.md` ("SWI dispatch") or
+  `Emulator/`'s SWI handling. Read off saved-PC (= the
+  instruction-after-`swi #12`).
+- Group aliases by user-mode caller. The most-frequent caller is
+  the primary patch target.
+
+### Step 2: design FMNewStack patch
+
+Once the user-mode caller is identified, draft a per-stack
+exclusivity patch. Two patterns to consider, given the previous
+36-KiB attempt's slot-size collision with the heap domain:
+
+a. **Pad allocation, don't change slot stride.** Allocate 36 KiB
+   physical (9 × 4 KiB) but keep the 32-KiB stride in VA — the
+   trailing 4 KiB is unmapped between stacks.
+b. **Force stack VA stride = 36 KiB.** Adjust the per-task stack
+   base computation so adjacent stacks don't share a 4 KiB
+   boundary; reverts to 32-KiB stride only if the slot-size
+   constraint can be addressed elsewhere.
+
+### Step 3: Group-1 stage-2 RO trap (still needed)
+
+The 3 Group-1 aliases (PA=0x04004000, 0x04005000, 0x04006000) come
+from the kernel's L1 PT page (TTBR0 self-map) and the first two
+L2 PT pages — written by direct kernel store instructions during
 TTBR0 setup, bypassing the entire Remember/Prim layer.
 
-Plan: install a stage-2 RO trap on PA=0x04004000..0x04007000.
-Each `S2 RO` fault decodes the AArch32 store insn, logs `(PC,
-L2-entry-index, value)`, then performs the write through the
-kernel-globals mirror so the kernel proceeds. Once we see the
-exact (PC, entry, value) triples that produce the alias, we can
-either (a) port Einstein's matching behaviour, (b) install a ROM
-patch that splits the self-map onto two distinct PAs, or (c)
-synthesize the second mapping at hypervisor level so the kernel
-sees the same byte values it expected without aliasing in the
-underlying L2 entries.
+Install a stage-2 RO trap on PA=0x04004000..0x04007000. Each `S2
+RO` fault decodes the AArch32 store insn, logs `(PC, L2-entry-
+index, value)`, then performs the write through the kernel-
+globals mirror so the kernel proceeds. Once we see the exact
+(PC, entry, value) triples that produce the alias, decide between
+(a) Einstein-port behaviour, (b) ROM patch that splits the
+self-map onto two distinct PAs, or (c) hypervisor-synthesised
+second mapping.

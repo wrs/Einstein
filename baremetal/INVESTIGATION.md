@@ -4,6 +4,64 @@ Live notes for the next iteration. Replace this file's body when the
 current stop is fixed and a new one takes over — git history is the
 archive of past investigations.
 
+## Heap-aliasing wedge RESOLVED — force VM-heap chunk_size=4 KiB via NewHeap + NewVMHeap patches (2026-04-28)
+
+The user's surgical fix: bypass the kernel's 1 KiB subpage-AP
+fault-catching mechanism by forcing every VM heap to allocate
+and extend in whole 4 KiB pages. Each heap then exclusively
+owns its physical pages — no subpage sharing with stacks or
+other heaps.
+
+The mechanism:
+
+1. **`NewVMHeap` (0x00142338)** chooses `r5 = 1024` (default) or
+   `r5 = 4096` based on bit 30 (`0x40000000`) of inFlags. With
+   bit 30 set, it ALSO rounds the heap-area size up to 4 KiB.
+   The flag has other side-effects (ip address-space behaviour,
+   slack +4 KiB at NewHeapArea) so blindly setting it isn't
+   the cleanest solution.
+
+2. **`NewHeap` (0x00310E24)** stores its 3rd arg (`chunk_size`,
+   = NewVMHeap's r5) at `heap[+0x38]`.
+
+3. **`ExtendVMHeap` (0x0031091C)** reads `heap[+0x38]` and rounds
+   the requested growth up to that chunk size. Called by the
+   block allocator (`NewBlock` at 0x311DB8 and `SetBlockSize`
+   at 0x31266C) when the heap's free space runs low.
+
+4. **Heap extension calls `LockHeapRange` (0x001F8AB4)** which
+   issues SafeUserRequestEntry req-id 7 → `FMLockHeapRange`
+   (0x001F6B24). FMLockHeapRange iterates 1 KiB subpages of the
+   requested range, calling `ResolveFault` per subpage. With
+   chunk_size=4 KiB at the heap level, each LockHeapRange call
+   covers a full 4 KiB-aligned range, producing 4 ResolveFault
+   calls that all land on the same physical page slot.
+
+The two-patch surgery (in `PATCHES_717006`):
+
+- **0x00310E38**: `mov r6, r2` (`0xE1A0_6002`) → `mov r6, #4096`
+  (`0xE3A0_6A01`). Forces `NewHeap`'s recorded chunk_size to
+  4 KiB regardless of caller. ExtendVMHeap then grows in 4 KiB
+  increments.
+- **0x001423A0**: `beq 0x001423C0` (`0x0A00_0006`) → `nop`
+  (`0xE1A0_0000`). Forces NewVMHeap's 4-KiB-init path so the
+  initial LockHeapRange covers a 4 KiB range.
+
+Result on cold boot:
+
+- Every NewHeap call shows `r2=0x00001000` (= 4096).
+- Heap #3 (NewHeap #3, base=0x0ca6b000, size=2 MiB) maps to PA
+  0x04022000 — different from prior 0x04032000, because the
+  kernel's page-pool state diverges with 4 KiB chunks.
+- **No `alias ONSET`** detected.
+- **No `heap-watch sanity FAIL`**.
+- Boot progresses ~5900 trace lines further past the prior
+  heap-aliasing wedge; reaches a NEW Reboot canary at
+  FAR=0xe336000c (alrt task DABT into unmapped address).
+
+The new stop is unrelated to the heap-aliasing bug. It's the
+next thing to investigate.
+
 ## Survey: kernel L2-write paths that intend subpage-AP fault-catching (2026-04-28)
 
 This iteration surveyed `_Data_/symbols.txt` and the disasm

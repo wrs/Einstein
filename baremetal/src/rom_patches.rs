@@ -90,6 +90,46 @@ const PATCHES_717006: &[RomPatch] = &[
     RomPatch { offset: 0x003A_D430, value: 0x3281_1001, name: "GetClock wrap-detect ls→cc" },
     RomPatch { offset: 0x003A_D46C, value: 0x3282_2001, name: "SetAlarm wrap-detect (1/2) ls→cc" },
     RomPatch { offset: 0x003A_D49C, value: 0x3282_2001, name: "SetAlarm wrap-detect (2/2) ls→cc" },
+    // Force every VM heap to allocate / extend in 4-KiB chunks
+    // instead of 1-KiB subpages. The kernel's design partitions
+    // shared 4-KiB physical pages into 1-KiB subpages with per-
+    // subpage AP, enforced by ARMv4's subpage-AP. ARMv7 has no
+    // subpage-AP — `fix_stage1_xn_bits` flattens to AP=011, so a
+    // stack write to "its" subpage spills into the heap's adjacent
+    // subpage on the same physical page. See
+    // `INVESTIGATION.md` "Subpage-AP decoded" for the full picture.
+    //
+    // Surgical fix: make heap[+0x38] (= chunk_size, written by
+    // NewHeap from its 3rd arg) always 4096. Then `ExtendVMHeap`
+    // grows heaps in whole 4-KiB pages — each heap page is
+    // exclusively owned, never shared with another VA.
+    //
+    // (1) `NewHeap` 0x00310E38 originally `mov r6, r2`
+    //     (`0xE1A0_6002`) reads chunk_size from r2 into r6. Replace
+    //     with `mov r6, #4096` (`0xE3A0_6A01`) so the heap struct
+    //     always records 4 KiB regardless of caller's intent. Per
+    //     ARM ARM A8.8.103: MOV (immediate) encoding A1: cond=1110
+    //     (e), op=1110_0011_1010 (3a), SBZ=0000, Rd=0110 (6),
+    //     immediate12 = 0xa01 (= imm8=0x01, rot=0xa → ROR(0x01, 20)
+    //     = 0x1000 = 4096).
+    RomPatch { offset: 0x0031_0E38, value: 0xE3A0_6A01, name: "NewHeap: force chunk_size=4096" },
+    // (2) `NewVMHeap` 0x001423A0 originally `beq 0x001423C0`
+    //     (`0x0A00_0006`) skips the 4-KiB-init path when the
+    //     `kFlagAllocateInPages` (bit 30) flag is clear. Replace
+    //     with `nop` (= `mov r0, r0`, `0xE1A0_0000`) so the
+    //     function always falls through to the 4-KiB rounding +
+    //     `r5 = 4096`. Initial chunk size for LockHeapRange ends
+    //     up 4 KiB; ExtendVMHeap reads heap[+0x38]=4096 (set by
+    //     patch #1) so subsequent extensions are also 4 KiB.
+    //
+    //     The flag's other side-effect — `addne r1, r1, #4096` at
+    //     0x142368 adding slack to the heap-area size — is left
+    //     untouched. Most heap allocations are already 4-KiB
+    //     aligned; the only exception we've observed is heap #6
+    //     (50 KiB), which would round up to 52 KiB. NewHeapArea's
+    //     internal alignment likely accommodates this; if not,
+    //     we'll need a third patch making the addne unconditional.
+    RomPatch { offset: 0x0014_23A0, value: 0xE1A0_0000, name: "NewVMHeap: force 4 KiB init path (nop branch)" },
     // Force exclusive per-stack page allocation by short-circuiting
     // `TStackManager::GetMatchingPage` to always return 0 (= "no
     // shareable page found"). This forces every `FindOrAllocPage` call
@@ -988,7 +1028,11 @@ unsafe fn apply_resolve_fault_wrapper(rom_ptr: *mut u32) {
 
         // (FMLockHeapRange BL not patched — covers early bring-up paths
         // that allocate single physical pages eagerly, where
-        // multi-iter would over-claim and break boot.)
+        // multi-iter would over-claim and break boot. We tried wrapping
+        // it 2026-04-28; the wrapper's "swallow -10203" behaviour
+        // masks legitimate out-of-bounds errors from FMLockHeapRange's
+        // range-iteration, causing the kernel to retry forever.
+        // See INVESTIGATION.md for that diagnostic run.)
         let _ = FMLOCK_BL_RESOLVE_PC;
 
     }

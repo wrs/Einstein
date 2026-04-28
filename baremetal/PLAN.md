@@ -180,7 +180,55 @@ NOTE: Fix all compiler warnings before committing, to keep context clean.
   on QEMU; `--platform fvp` runs the same suite on the FVP. Both
   must stay green. See "Verification" near the end of this file.
 
-## Current stop — Stage-1 aliasing confirmed: kernel maps heap VA and user-stack VA to same PA
+## Current stop — alrt-task DABT at FAR=0xe336000c → Reboot canary
+
+The heap-aliasing wedge is resolved (see "Resolved stops"
+table). With each VM heap now exclusively owning whole 4 KiB
+pages, the boot progresses ~5900 trace lines further. The new
+terminus is a Reboot canary fired by the kernel's exception
+unwinder:
+
+```
+DAH-OR[5]: far=0xe336000c curr_task=0x0c115db4 (= alrt task)
+DAH-exit probe (throw @ 0x00393944): src_mode=0x17 (ABT)
+  lr_abt=0x01be319c sp_abt=0x0c004c00
+*** Reboot canary fired — guest kernel is rebooting ***
+  R0 = 0xffffd8a5  R3 = 0x7fffffce
+  R14_UND=0x000d9888  (caller LR via Table D1-79)
+```
+
+The faulting address `0xe336000c` is wildly out of any RAM /
+ROM region (RAM = 0x04000000..0x04400000; ROM ≤ 0x01000000).
+The kernel's DAH can't recover and propagates a throw, leading
+to UnhandledException → Reboot.
+
+L1 walk of section 0xE33: every entry in 0xE2F..0xE37 reads
+`0x00000150` = an L1 fault descriptor. So nothing's mapped
+near the faulting VA.
+
+Likely candidates:
+- alrt task's stack or globals contain a corrupted pointer
+  that someone dereferences.
+- An MMIO-style read against an unmapped VA the kernel
+  expects to handle gracefully (ours flags it as fatal).
+- Cascade fallout from the 4 KiB-chunk patches: maybe the
+  kernel's heap allocator is now confused about heap layout
+  in a way that produces wild pointers.
+
+Concrete next steps:
+
+1. **Cross-check Einstein** at the equivalent boot offset.
+   Does Einstein reach the alrt task and, if so, what does
+   it access at this point? NewtonProbe with our existing
+   instrumentation will show.
+2. **Identify alrt's call chain at the wedge.** lr_abt=
+   0x01be319c (jump-table entry) returns to which kernel
+   function? Walk back from that ROM PC.
+3. **Inspect the data near 0xe336000c.** R12=0x0cca34ac at
+   the canary — that's an alrt-region pointer. Likely the
+   loaded value is somewhere alrt's stack or globals.
+
+## Earlier stop — Stage-1 aliasing confirmed: kernel maps heap VA and user-stack VA to same PA
 
 **Aliasing CONFIRMED at stage-1.** This iteration's stage-1
 walk probe proves both VAs translate to PA 0x04032000:
@@ -501,6 +549,7 @@ Concrete next steps:
 
 | Date | Wedge | Resolution |
 |------|-------|------------|
+| 2026-04-28 | RelocHeap (heap #3) header corruption: stack-grow assigns newt's user stack to PA shared with heap #3, ARMv7's flat AP=011 (post-`fix_stage1_xn_bits`) lets stack writes spill into the heap struct subpage | Two-patch surgery forces every VM heap to allocate / extend in 4-KiB chunks instead of 1-KiB subpages: `0x310E38: mov r6, r2 → mov r6, #4096` (NewHeap chunk_size) + `0x1423A0: beq → nop` (NewVMHeap 4 KiB-init path). Each heap exclusively owns whole pages; no subpage sharing with stacks. Boot progresses ~5900 trace lines past the wedge to a NEW stop (Reboot canary, alrt task). |
 | 2026-04-27 | NULL-pointer SWP via `Swap(0,1)` at ROM `0x3ae204` (kernel `Acquire(NULL)` glue inside `VccOff__FiUl`) — stage-2 perm fault on write to ROM aperture, ISV=0 | trap.rs `try_absorb_rom_write`: mirror Einstein `TMemory::WriteP` (TMemory.cpp:1755-1766), drop the store; for SWP/SWPB also run the load piece into Rd. Boot reached steady-state idle. Test: `guest-tests/tests/test_swp_rom_aperture.S`. |
 | 2026-04-27 | TEncodingMap.+16 = 0x20000110 (out-of-stage-2 IPA) at `ConvertToUnicodeFunc_Contiguous8` | mmio.rs: `0x20000000..0x30000000` "unknown bank #5" silent-zero matching Einstein's `TMemory::ReadP` (TMemory.cpp:1026-1034). Boot advanced 10× → reaches TInterpreter. |
 | 2026-04-27 | `Reboot` canary inside `TInterpreter::TInterpreter` — DFSC=5 at FAR=0x0cd07400 on lazy-L1 section grow during `TRefStructStack::Fill` (L1[0xCD]=0x90 lazy marker) | γ-fix in `handle_diag`: read L1.domain from the faulting VA's L1 entry and write it into DFSR_EL1.bits[7:4] before forwarding to DAH (ARMv7 leaves Domain UNK on DFSC=5; kernel was reading 0). |

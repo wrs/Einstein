@@ -42,6 +42,42 @@ quiesces on the same path without ever getting there.
 
 ## Pending follow-ups
 
+### Source-tagged ring buffer: 0xffff58 captures are HVC returns, not IRQ noise (2026-04-27, evening)
+
+`heap_watch::Source` (sync vs. irq) is now packed into bit 63 of each
+ring slot, with the dump labelling each ELR by source kind. Re-run
+shows **all** ring entries — including the four `0xffff58` captures
+in transition #3's prelude — are `sync`, not `irq`. So the previous
+"IRQ-during-`b .`-loop" reading was wrong.
+
+Re-resolved: ELR_EL2 on an HVC trap from AArch32 holds the
+**preferred return address** (= HVC PC + 4), not the HVC's own
+address. Working through the trampoline offsets:
+
+- UND trampoline: `HVC #UND_TAG` at IPA 0xffff54 → ELR_EL2 = 0xffff58
+  on entry. The ring's `sync` 0xffff58 captures are the standard
+  post-HVC sample point of every UND-class emulation.
+- DABT trampoline: `HVC #DIAG_TAG` at IPA 0xffffd4 → ELR_EL2 = 0xffffd8
+  on entry. The wedge's `sync` 0xffffd8 entry is `handle_diag` doing
+  the kernel-DABT forward (consistent with the `dabt: forwarding…`
+  log immediately below).
+- DABT trampoline: `HVC #ALIGN_TAG` at IPA 0xffffd8 → ELR = 0xffffdc
+  on entry. We do NOT see ELR=0xffffdc, so the ALIGN path isn't
+  involved here.
+
+So the trap stream just before transition #3 is: REx ↔ kernel cycle
+through the (legitimate) `SetBankControlRegister` MMIO loop, then
+two UND-class instructions emulated via the trampoline, then a
+USR DABT at PC=0x001a4938 (`stmfd sp!, {r3}` — TRefStack ctor's
+push) forwarded to the kernel for stack-grow recovery. The
+corrupting store happens somewhere in that emulated guest run; pure
+guest code, no hypervisor handler involvement.
+
+The trap-only sampling can't narrow further. Next step is a
+stage-2 RO carve-out at IPA 0x0ca6b000 so any write to the heap
+header takes a stage-2 perm fault with the writing PC in ELR_EL2
+and the IPA in HPFAR_EL2 — the precise tool we need.
+
 ### Heap-watch sentinel narrows the corruption window (2026-04-27, late+)
 
 A new module `src/heap_watch.rs` samples `heap[0x0ca6b010]` from

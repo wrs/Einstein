@@ -52,6 +52,8 @@ inputs we choose to feed it.
    plus the live trace is the regression evidence.
 6. Re-run, go to next stall.
 
+NOTE: Fix all compiler warnings before committing, to keep context clean.
+
 ## Tools available
 
 ### Hosts to run under
@@ -212,30 +214,32 @@ but always log on the wedge-relevant arg matches):
 
 Concrete next steps:
 
-1. Pin down why the guest ever resumes at PC=0xffff58 (=
-   `UND_TRAMP_OFFSET + 0x58`, the `b .` guard one word past the
-   `HVC #UND_TAG` at +0x54). The heap-watch ring buffer for
-   transition #3 captures `0xffff58` twice in a row immediately
-   before the wedge (`0xffffd8`, the DABT-trampoline path). Either
-   it's an IRQ caught with the guest stuck in the trampoline guard
-   (ERET-target bug in a `handle_und` arm — which is itself a
-   wedge), or it's a sync trap at `+0x58` that we shouldn't see.
-   Make `heap_watch::sample` carry source-label per ring slot so
-   we can tell IRQ from sync at each entry.
-2. Add a stage-2 RO carve-out at IPA `0x0ca6b000` (4 KiB L3 page
-   inside the encompassing 2 MiB RAM block; mirrors the existing
-   shadow-stub scratch carve-out at `0x06000000`). On the resulting
-   stage-2 perm fault, log the writing PC + IPA + value before
-   forwarding the write so the heap stays unmodified for diagnosis.
-3. Cross-check Einstein at the equivalent boot offset (NewtonProbe
+1. **Stage-2 RO carve-out at IPA 0x0ca6b000.** Convert the 2 MiB
+   stage-2 L1 block at IPA 0x0c800000..0x0ca00000 (or the right
+   block covering 0x0ca6b000) to a table descriptor; install an L2
+   with mostly RW pages backed by their natural PAs, except the
+   single 4 KiB page covering 0x0ca6b000 which is RO. Mirror the
+   existing shadow-stub scratch carve-out pattern at IPA
+   0x06000000 in `src/stage2.rs`. Catch the resulting stage-2 perm
+   fault in `handle_data_abort`, log `(ELR_EL2, HPFAR_EL2,
+   FAR_EL2, decoded value)`, and either drop the write
+   (diagnostic mode — heap stays valid, boot continues) or halt
+   on first hit. Either gives us the writing PC for free.
+2. Cross-check Einstein at the equivalent boot offset (NewtonProbe
    60 s) — dump Einstein's RelocHeap header at the same point and
    diff. If Einstein's heap stays valid, the bug is hypervisor-side
    (stage-2 mapping / aliasing); if Einstein corrupts it the same
    way, it's a ROM data-flow bug we need to mirror or patch around.
-4. Once the writer is identified, decide whether the fix is a
+3. Once the writer is identified, decide whether the fix is a
    handler gap (stage-2 fault on a write that should have trapped
    cleanly) or a behavioural mirror (kernel does something Einstein
    doesn't because of an earlier divergence we need to match).
+
+The trap-stream sampling is exhausted: heap_watch (now with
+source-tagged ring entries) shows that the corruption window is
+between ordinary UND-trampoline emulations and a kernel-forwarded
+DABT, with nothing in EL2 touching the heap; the writer is a
+plain guest store we can only catch with a stage-2 trap.
 
 ## Earlier stop — newt self-deadlocks on the heap-store TULockingSemaphore
 

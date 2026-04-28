@@ -149,6 +149,14 @@ const PATCHES_717006: &[RomPatch] = &[
     // `docs/STRUCTURES.md` "1-KiB allocator audit" for the full
     // catalogue of 1-KiB sites.
     RomPatch { offset: 0x0014_28B8, value: 0xE3A0_4A01, name: "ZapHeap: force chunk/lock size = 4096" },
+    // (FMNewStack 33→36 KiB patch reverted 2026-04-28 — see PLAN.md
+    // "Patch attempt 1" + STRUCTURES.md "End-to-end page allocation".
+    // Patch was internally consistent for slot-size/placement (NewStack
+    // POST-SWI confirms 4-KiB-aligned 36-KiB slots, no stack-stack
+    // guard sharing). But TUDomainManager::Get still recycles PAs
+    // across different TStackInfo* consumers — the actual root cause
+    // of the remaining aliases. Investigation continues at TUDomainManager
+    // level.)
     // Force exclusive per-stack page allocation by short-circuiting
     // `TStackManager::GetMatchingPage` to always return 0 (= "no
     // shareable page found"). This forces every `FindOrAllocPage` call

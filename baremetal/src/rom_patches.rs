@@ -564,6 +564,40 @@ pub const PRIM_REMEMBER_PROBE_HVC_IMM: u32 = 0x54;
 pub const PRIM_REMEMBER_PC:            u32 = 0x0016_3480;
 const PRIM_REMEMBER_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
 
+/// `TTask::Init`'s `bl NewStack` site at ROM `0x0025238c`. The probe
+/// in the previous iteration showed this BL is the user-mode caller
+/// upstream of 11 of 12 Group-2 aliased PAs. The aliasing comes from
+/// adjacent stacks deliberately sharing 4-KiB boundary pages
+/// (ARMv4 subpage-AP design); under our flat AP=011 the boundary
+/// becomes a real PA alias.
+///
+/// **Per-stack 4 KiB padding (Option A in PLAN.md):** redirect the
+/// BL to a wrapper at `NEW_STACK_PAD_WRAPPER_PC` which adds 0x1000
+/// to `r1` (size argument) before tail-calling the real `NewStack`
+/// at `NEW_STACK_PC`. The 4 KiB pad gives every stack one extra
+/// page beyond its requested size; the kernel's per-domain
+/// "next stack VA" pointer decrements by the new (larger) size on
+/// each allocation, so adjacent stacks no longer share boundary
+/// pages. The encoding `add r1, r1, #4180` (84 + 4096) doesn't fit
+/// in a single ARM imm12, so the wrapper is the cleanest place to
+/// inject the +4 KiB.
+const NEW_STACK_PAD_BL_PC:        u32 = 0x0025_238C;
+/// The BL at `NEW_STACK_PAD_BL_PC` originally targets the post-ship
+/// patch-table thunk for NewStack at `0x001BD7BA4` (visible in the
+/// disasm as a `<NewStack>` label inside the 0x01A00000..0x01C20000
+/// patch-table region). The wrapper preserves that target via
+/// tail-call so any future REx-side override of NewStack still
+/// applies. The static body is at `0x001F8968` (also labelled
+/// `<NewStack>` — the user-mode SWI shim) but going through the
+/// thunk is the architecturally correct path.
+const NEW_STACK_THUNK_PC:         u32 = 0x001B_D7BA4;
+const NEW_STACK_PAD_WRAPPER_PC:   u32 = 0x00FF_FE80;
+/// Original first-word at the BL site — used to assert the patch
+/// applies to the expected ROM. `bl 0x001bd7ba4` from PC 0x25238c
+/// has offset bytes `(0x1bd7ba4 - 0x252394) = 0x1985810`, off in
+/// words = `0x6_6160`, encoded as `0xEB66_1604`.
+const NEW_STACK_PAD_BL_ORIG_INSN: u32 = 0xEB66_1604;
+
 /// `PrimForgetMapping(va, &TPhys)` probe at ROM `0x00163514`. The
 /// counterpart to `PrimRememberMapping`: removes the (VA, PA)
 /// mapping at the L2 layer. Pairing this with the Remember probe
@@ -640,6 +674,16 @@ pub unsafe fn apply_717006_patches(rom_ptr: *mut u32) {
         apply_reboot_trap(rom_ptr);
         apply_bootos_trap(rom_ptr);
         apply_resolve_fault_wrapper(rom_ptr);
+        // `apply_new_stack_pad_wrapper` is NOT installed — the
+        // call-site +4 KiB pad changes the size *requested* of
+        // NewStack but not the kernel's stack-pool slot stride. The
+        // result is that fewer-but-larger stacks fit per pool and
+        // the kernel's per-task pool index runs past the upper
+        // bound on the (N+1)-th stack, producing an infinite
+        // ResolveFault-loop at `FAR == info_bounds.end + 3`. See
+        // INVESTIGATION.md "Option A pad attempt — wedges on
+        // info_bounds overflow" for the full diagnostic.
+        let _ = apply_new_stack_pad_wrapper;
         // `apply_lock_heap_range_wrapper` stays in the source for
         // reference but is NOT installed. The 4-KiB-rounding wrapper at
         // LockHeapRange/UnlockHeapRange entry corrupts adjacent
@@ -1198,6 +1242,58 @@ unsafe fn apply_resolve_fault_wrapper(rom_ptr: *mut u32) {
         // See INVESTIGATION.md for that diagnostic run.)
         let _ = FMLOCK_BL_RESOLVE_PC;
 
+    }
+}
+
+/// Install the per-stack 4 KiB padding wrapper (Option A in PLAN.md).
+/// `TTask::Init`'s `bl NewStack` at `0x0025238c` is the upstream
+/// caller for 11 of 12 Group-2 verify-mmu aliases. Each adjacent
+/// stack pair shares a 4 KiB boundary page (ARMv4 subpage-AP-era
+/// design); ARMv7 has no subpage AP, so under our flat AP=011 the
+/// boundary is a real PA alias. Adding 4 KiB to every stack
+/// allocation request bumps the kernel's per-domain "next stack
+/// VA" pointer by an extra page on each call, eliminating the
+/// shared-boundary pattern.
+///
+/// Wrapper layout at `NEW_STACK_PAD_WRAPPER_PC` (2 words = 8 B):
+///   +0x00  add r1, r1, #4096   — pad the size argument
+///   +0x04  b   <NewStack thunk> — tail-call into the kernel function
+///
+/// The original BL site's link register (set by the caller's BL
+/// to the wrapper) is preserved unchanged across the tail-call
+/// `b`, so when NewStack eventually returns, control flows back
+/// to TTask::Init's post-BL site (0x00252390) as if the call had
+/// gone directly.
+unsafe fn apply_new_stack_pad_wrapper(rom_ptr: *mut u32) {
+    // ARM `add r1, r1, #4096` (= 0xE2811A01) — imm12 with rot=0xA,
+    // imm8=0x01 → ROR(0x01, 20) = 0x1000.
+    let add_r1_4k = 0xE281_1A01u32;
+    let b_target  = arm_b(NEW_STACK_PAD_WRAPPER_PC + 4, NEW_STACK_THUNK_PC);
+    let stub: [u32; 2] = [add_r1_4k, b_target];
+    unsafe {
+        for (i, w) in stub.iter().copied().enumerate() {
+            let offset = NEW_STACK_PAD_WRAPPER_PC + (i as u32) * 4;
+            let idx = (offset / 4) as usize;
+            rom_ptr.add(idx).write(w);
+        }
+
+        // Patch TTask::Init's BL to point at the wrapper instead of
+        // directly at the post-ship NewStack thunk.
+        let idx = (NEW_STACK_PAD_BL_PC / 4) as usize;
+        let prev = rom_ptr.add(idx).read();
+        if prev != NEW_STACK_PAD_BL_ORIG_INSN {
+            kprintln!(
+                "rom_patch: ERROR — TTask::Init bl NewStack site at {:#010x} is {:#010x}, expected {:#010x}; skipping per-stack pad wrapper",
+                NEW_STACK_PAD_BL_PC, prev, NEW_STACK_PAD_BL_ORIG_INSN,
+            );
+            return;
+        }
+        let new_bl = arm_bl(NEW_STACK_PAD_BL_PC, NEW_STACK_PAD_WRAPPER_PC);
+        rom_ptr.add(idx).write(new_bl);
+        kprintln!(
+            "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (TTask::Init bl NewStack → +4 KiB pad wrapper @{:#x})",
+            NEW_STACK_PAD_BL_PC, prev, new_bl, NEW_STACK_PAD_WRAPPER_PC,
+        );
     }
 }
 

@@ -290,40 +290,87 @@ inside `TUDomainManager::Get`'s post-`bl MonitorDispatchSWI`
 PC. `Get` is the user-mode page-allocator shim; LockHeapRange's
 fault-resolve path goes through it via SWI dispatch.
 
-## Next iteration — design FMNewStack non-sharing patch
+## Option A pad attempt — wedges on info_bounds overflow (2026-04-28)
 
-The aliases are not a kernel bug — they're a *deliberate* ARMv4
-subpage-AP-era design that doesn't translate to ARMv7. Three
-patch directions, in increasing scope:
+Implemented Option A (call-site +4 KiB padding) as a 2-word
+wrapper at `0x00FFFE80`:
 
-### Option A: per-stack 4-KiB boundary padding (preferred)
+```
+add r1, r1, #4096       ; bump stack-size request by 4 KiB
+b   <NewStack thunk>    ; tail-call into the post-ship patch table
+```
 
-Make every stack allocation grab one extra 4-KiB page beyond its
-33-KiB needed size, but keep VA stride at 32 KiB (stacks remain
-densely packed in VA space). The extra page sits "between"
-adjacent stack VAs as guaranteed-unmapped padding so no boundary
-PA is ever shared. Touch points:
-- `NewStack` at `0x001BD7BA4`. Increase the size argument or
-  intercept the SWI to round up to 36 KiB.
-- The previous 33→36-KiB attempt failed because the size
-  constant is shared with the heap domain page-table size.
-  Audit how the size flows to verify whether the 36-KiB padding
-  can be applied at the BL-NewStack site only (i.e. patching
-  `r1` at 0x25238c) without affecting the heap domain.
+Patched `TTask::Init`'s `bl NewStack` at `0x0025238C` to redirect
+through the wrapper. Patch installed cleanly.
 
-### Option B: stack VA stride widening
+**Result: regression — boot wedges in an infinite ResolveFault
+loop instead of reaching the Reboot canary.** Trace tail repeats:
 
-Push adjacent stacks 36 KiB apart in VA so their pages never
-overlap. Affects `NewStack`'s VA-pick algorithm; harder than
-Option A because the VA stride is implicit in many places.
+```
+Fault(stackmgr) ENTER  far=0x0c647003 caller_lr=0x00259230 src_mode=USR
+ResolveFault    ENTER  far=0x0c647000 info_bounds=[0x0c601000,0x0c647000)
+ResolveFault    ENTER  far=0x0c647400 info_bounds=[0x0c601000,0x0c647000)
+ResolveFault    ENTER  far=0x0c647800 info_bounds=[0x0c601000,0x0c647000)
+ResolveFault    ENTER  far=0x0c647c00 info_bounds=[0x0c601000,0x0c647000)
+DAH-exit (success @ 0x00393b80)  ← kernel claims to handle the fault
+[loop repeats forever, FAR never advances]
+```
 
-### Option C: stage-2 PA splitting
+`FAR=0xc647003` is exactly 3 bytes past `info_bounds`'s exclusive
+upper bound of `0xc647000`. The 4 KiB pad changed the *size
+requested* of NewStack but NOT the kernel's stack-pool slot
+stride. The kernel still places adjacent stacks at 33 KiB stride,
+so each padded stack consumes its 33 KiB slot plus 4 KiB of the
+next slot. The pool's per-task allocation index runs past the
+upper bound on the (N+1)-th stack, producing a USR-mode access
+3 bytes past info_bounds; ResolveFault returns "success" via the
+ResolveFaultWrapper path but the underlying VA is still
+unmapped, so the abort re-fires immediately.
 
-At the hypervisor level, when the guest's L2 maps two different
-VAs to the same PA, transparently allocate a duplicate stage-2
-backing page and re-route one of the VAs through that. Avoids
-ROM patching entirely; complexity is in the COW-style write
-shadowing. Probably overkill for this case.
+Patch reverted (the wrapper code is left in `apply_new_stack_pad_wrapper`
+but not installed). Baseline restored: 15 verify-mmu aliases, 55
+`Prim ALIAS:` lines, all 36 guest tests pass.
+
+**Insight:** The targeted call-site pad cannot work in isolation —
+it must be paired with stride widening (Option B). The previous
+20-patch 36-KiB attempt did both and successfully eliminated
+stack-stack guard sharing, but introduced new stack-vs-heap
+aliases. Our current Get probe confirms `TUDomainManager::Get`
+returns unique PageIds per call (not the prior diagnosis of "PA
+recycling"); the new aliases the 36-KiB attempt produced may
+have a different cause that's now diagnosable via the Prim
+alias tracker.
+
+## Next iteration — Group-1 stage-2 RO trap (independent track)
+
+The 3 Group-1 aliases (PA=0x04004000, 0x04005000, 0x04006000) are
+a fundamentally different class of problem from Group-2 — they
+come from direct kernel L2 writes during TTBR0 setup, bypassing
+the entire Remember/Prim layer. Switching to this track:
+
+1. Install a stage-2 RO mapping on PA=0x04004000..0x04007000
+   (3 pages). Make those PAs read-write through stage-1 (the
+   guest sees normal RW) but stage-2-RO so writes trap to EL2.
+2. EL2 fault handler: decode the AArch32 store insn (existing
+   `unaligned::handle_align_fault` infrastructure has the
+   relevant decoder), log `(PC, target offset, value)`, then
+   commit the write through the kernel-globals mirror so the
+   guest proceeds.
+3. Cold-boot. Capture every store to those 3 pages during boot.
+   Sort the (PC, offset, value) triples to identify the kernel's
+   TTBR0 self-map setup function.
+4. Decide fix layer: (a) Einstein-port behaviour (do whatever
+   Einstein does for these specific writes), (b) ROM patch that
+   redirects the self-map writes to a non-shared backing, (c)
+   hypervisor-synthesised second mapping (write the L2 entries
+   to point at a duplicate hypervisor-allocated PA so the guest
+   sees the same L1/L2 byte values without underlying alias).
+
+Group-2 stays parked at 12 aliases until Group-1 is solved.
+Once Group-1 is zero, revisit Group-2 with stage-2 PA splitting
+(Option C) — the hypervisor-level approach that was previously
+considered "overkill" but may now be the cleanest route given
+the Group-2 root cause is deliberate kernel design.
 
 ### Step Group-1 stage-2 RO trap (still needed)
 

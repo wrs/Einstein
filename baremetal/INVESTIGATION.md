@@ -4,6 +4,55 @@ Live notes for the next iteration. Replace this file's body when the
 current stop is fixed and a new one takes over — git history is the
 archive of past investigations.
 
+## gFallbackHeap substitution gets boot past SetBlockSize, lands on CompactHeap→LockedBlock translation fault (2026-04-28)
+
+Wired option 1 from the previous PLAN.md: in the SetCurrentHeap probe
+arm at ROM `0x00142df0`, when `r0 == 0x0ca6b010`, read `gFallbackHeap`
+from VA `0x0c101080` and substitute it into `ctx.x[0]` before the
+function runs. The kernel's bracketing pattern (NewHeap, NewHandle,
+CompactHeap, HUnlock save→use→restore) sees fallback in / fallback
+out, so it doesn't get confused.
+
+Result on cold boot:
+- Two `SetCurrentHeap: substituted r0=0x0ca6b010 -> gFallbackHeap=
+  0x0c111000` events fire (the NewHeap save/restore bracketing).
+- Boot progresses past the old SetBlockSize wedge and through five
+  successful kernel-DABT recoveries (`DAH-OR[0..4]` for FARs
+  `0x0cc79ff4`, `0x0cc7fcc8`, `0x0cc80001`, `0x0cc81000`, `0x0ccc9ffc`).
+- Halts at a new `DIAG vector intercept` (HVC #DIAG_TAG from mode
+  ABT) with:
+  - `pre-fault PC` in shadow_stub's stub pool (slot starting at
+    `0xf76940`, fault at `0xf76968` = slot 10 = the access slot).
+  - `FAR=0x0c22cba3`, stage-1 walk: L1[0xc2]=0x0401cc61 (coarse),
+    L2[0x2c]=0 (fault).
+  - `USR lr=0x0031326c` = return into `CompactHeap` after
+    `bl LockedBlock` at `0x00313268`.
+  - `r4=r9=0x0c111000` = gFallbackHeap (substitution working).
+  - `ESR_EL1=0x37` — non-standard DFSC, so handle_diag took the
+    "not-forwardable" loud-halt path rather than passing it to the
+    kernel's DAH.
+
+So substitution is good enough to keep the boot walking but the
+resulting kernel state diverges from a real Newton boot path —
+the kernel reaches CompactHeap on the fallback heap, calls
+LockedBlock, and that ends up doing a shadow_stub-emulated
+byte/halfword access on a VA whose page isn't mapped. That's a
+different class of fault than the DAH-handled "lazy-grow" DABTs.
+
+Two lanes for the next iteration:
+
+1. **Decode the new wedge.** The dabt-trip-style stub-orig-PC
+   decoder doesn't run on the DIAG_TAG path (different log
+   format). Add the same decode in handle_diag's loud-halt arm
+   so the new wedge tells us which ROM PC it emulates.
+2. **Reconsider the substitution.** Possibly the kernel
+   genuinely needs the RelocHeap-specific behaviour (the heap
+   has different attribute fields than fallback) and substituting
+   `gFallbackHeap` lands us in code paths that expect
+   relocatability semantics fallback doesn't provide. Cross-check
+   Einstein's RelocHeap usage at this boot offset to see what
+   the heap is actually used for.
+
 ## SBA-stub wedge decodes to `SetBlockSize`'s `strb r0, [r9]` (2026-04-27, deep night)
 
 Added a stub-orig-PC decoder in `handle_data_abort`'s `dabt-trip`

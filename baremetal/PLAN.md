@@ -306,19 +306,52 @@ it when Einstein doesn't. So the wedge is a **scheduling-divergence
 symptom**, not an "alrt task got a junk CList entry that we need to
 defend against" bug.
 
-1. Identify why our alrt task is RUNNING. Check
-   the alrt port / event flow: when alrt is created, it should
-   block on a semaphore / message wait. Compare our port state for
-   alrt's wait-on-message vs. Einstein's. Probe candidates:
-   `Acquire`, `BlockOnInc`, `Receive__6TUPort` calls in the alrt
-   task before the wedge.
-2. **If no fix appears at the schedule layer**, fall back to
+**Wedge-time task census added to Reboot canary** (Step 3, this
+iteration) — the dump now shows exactly who's running/ready/blocked.
+Comparison against Einstein at idle (NewtonProbe steady state):
+
+| State | Einstein at idle | Us at wedge |
+|-------|------------------|-------------|
+| RUN   | newt             | alrt        |
+| RDY   | scrn, pckm       | cdsv, drvl  |
+| BLK   | everyone else (incl. alrt) | everyone else |
+
+Our wedge fires earlier in the boot (cdsv = card services, drvl =
+driver loader, both RDY but blocked on monitor work) than the
+Einstein snapshot (newt = newton-app already booted past
+TInterpreter). So the comparison is not strictly apples-to-apples,
+but the structural finding stands: our scheduler activates alrt
+while Einstein keeps it parked. alrt's `savedPC=0x3AE230` is
+`PortReceiveSWI` and `lr_usr=0x259D48` is `Receive__6TUPort`, so
+alrt was parked in a Receive call. To run CheckButton it must have
+received a message — that message is the wedge trigger.
+
+1. **Identify the message that wakes alrt.** Add a probe at
+   `Receive__6TUPort` for `port_id == alrt.port_id` (or filter by
+   destination task), logging the SENDER and message body. The
+   first non-zero return from alrt's Receive is the trigger.
+2. **Walk alrt's port-wait state.** alrt is parked in Receive so it
+   should be on the port's wait queue (which lives in the PORT
+   struct, not the TTask). Find the alrt port by walking the
+   object table for kernel objects with name 'alrt' or the port
+   whose receiver is the alrt task — see
+   `task_dump.rs::dump_port` (already exists). Confirm alrt is
+   the port's only receiver and that no message is queued at
+   probe time.
+3. **Auxiliary: dump the CList state at wedge time**
+   (`task_alrt → ehandler → list@140 → entries`). Even if we
+   fix the schedule divergence, knowing whether the CList itself
+   was corrupted (vs. just being legitimately non-empty with valid
+   TAlertDialog pointers) tells us whether the wedge is a
+   message-cascade bug or a separate corruption. The TAlertEventHandler*
+   is recoverable from the alrt task stack frame at wedge time —
+   walk up two stack frames from CheckButton's prologue to
+   IdleProc and read the saved r4.
+4. **If no fix appears at the schedule layer**, fall back to
    "hardening" CheckAlertDone / IdleProc to skip junk CList
-   entries gracefully (validate `this` before deref).
-3. Auxiliary: dump the CList state at wedge time
-   (`task_alrt → ehandler → list@140 → entries`) — confirms which
-   slot holds the junk and whether other slots have valid pointers.
-   Useful even if we fix the schedule divergence first.
+   entries gracefully (validate `this` before deref). This is a
+   workaround, not a fix; only do it if we exhaust the message-
+   trigger investigation.
 
 Detailed text below describes the original wedge first-look:
 

@@ -2129,6 +2129,18 @@ fn handle_reboot(ctx: &TrapContext) -> ! {
         }
     }
     kprintln!("=== end Step 2 dump ===");
+
+    // Step 3 (2026-04-28): full task census via task_dump::dump.
+    // For the alrt-task wedge investigation, we need to see WHICH tasks
+    // are RUN/RDY/BLK at wedge time and compare with Einstein
+    // (NewtonProbe shows alrt as BLK; on us it's running CheckButton
+    // with junk this — meaning we somehow scheduled it). The
+    // census print covers run-queue traversal, all-objects walk, and
+    // semaphore-wait state — enough to spot the divergence.
+    kprintln!();
+    kprintln!("=== Step 3: full task census ===");
+    crate::task_dump::dump();
+    kprintln!("=== end Step 3 dump ===");
     kprintln!("=== end Reboot-canary state dump ===");
 
     cpu::halt();

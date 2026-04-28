@@ -126,6 +126,38 @@ RUNNING in the first place.** Next iteration should diff our
 scheduler / port / message-delivery state vs. Einstein's around the
 alrt task entry.
 
+## FMNewStack 33→36 KiB patch attempt — REVERTED (2026-04-28)
+
+User: "Don't give up on the patch unless it's actually impossible."
+Designed and applied 20 coordinated ROM patches changing the
+stack-slot constant from 0x8400 (33 KiB) to 0x9000 (36 KiB) across
+4 functions: `Init__11THeapDomainFP13TStackManagerUlT2`,
+`GetStackInfo__11THeapDomainFUlPP10TStackInfo`, `FMNewStack`,
+`FMFree`. Encodings round-tripped through `arm-none-eabi-as` —
+caught a hand-computed imm12 mistake (0xC09 → 0xA09 for #0x9000)
+before applying.
+
+Boot regressed from "alrt-task wedge" to "infinite ResolveFault loop
+on heap region 0x0c601000..0x0c981000" (3.5 MiB sound heap). Alias
+count went up from 12 to 84.
+
+Root cause: the 33-KiB constant is the page-table granularity for
+`THeapDomain`, which tracks **both stacks AND heaps** in the same
+domain via the same `page_table[N]` array. Changing it desyncs the
+slot-index lookup from where the kernel had already populated L2
+entries for heap pages → mass aliasing.
+
+The 33-KiB stack-slot ABI is part of the larger heap-domain page-
+table ABI; it can't be changed in isolation.
+
+Reverted all 20 patches; baseline restored (15 aliases, alrt
+wedge fires as before).
+
+Added a `WORKFLOW.md` section enforcing assembler round-trip for
+ARM encodings (per user instruction "don't rely on intuition for
+ARM instructions, always double check with the actual
+assembler/disassembler").
+
 ## Goal pivot: eliminate ALL RAM PA aliases first (2026-04-28)
 
 User: "If there are still mixed-mapping RAM pages, there's no point

@@ -197,41 +197,60 @@ deliberate stack-guard sharing.
    shared boundary; ARMv7 has no subpage AP, AP=011 makes both
    stacks' VAs alias the same PA.
 
-### Next iteration — implement Option A (per-stack 4-KiB padding)
+6. **Option A (call-site +4 KiB pad) attempt** — implemented as a
+   2-word wrapper at `0x00FFFE80` (`add r1, r1, #4096; b NewStack
+   thunk`); BL at `0x0025238C` redirected through it. **Result:
+   boot wedges in an infinite ResolveFault loop at
+   FAR=0xc647003** (3 bytes past `info_bounds.end=0xc647000`).
+   The pad bumped the size requested of NewStack but did NOT
+   change the kernel's stack-pool slot stride; padded stacks
+   overflow into the (N+1)-th slot, exhausting the pool one
+   stack early. ResolveFault returns "success" via the existing
+   wrapper but the underlying VA is unmapped → abort re-fires
+   forever. Patch reverted; wrapper code retained as
+   `apply_new_stack_pad_wrapper` (not installed) for future use.
+   Baseline restored.
 
-Most-targeted fix: round up the size argument at the
-BL-NewStack site (`0x0025238c`) so each stack allocation grabs
-one extra 4-KiB page beyond the requested size. VA stride stays
-32 KiB; the extra page sits as guaranteed-unmapped padding
-between adjacent stacks → no shared boundary PA.
+   **Insight:** The call-site pad cannot work alone — pad and
+   stride must move together (= the prior 20-patch 36-KiB
+   attempt). Resurrecting that attempt with our current Get
+   probe (which proved Get returns unique PageIds, contradicting
+   the prior "PA recycling" diagnosis) is plausible but a
+   substantial undertaking.
+
+### Next iteration — Group-1 stage-2 RO trap (independent track)
+
+Pivot to Group-1 (PA=0x04004000, 0x04005000, 0x04006000), a
+fundamentally different class — these are direct kernel L2
+writes during TTBR0 setup that bypass the entire Remember/Prim
+layer. The track is independent of Group-2 progress and yields
+3 aliases of progress when complete.
 
 Steps:
 
-1. Read `NewStack__FUlT1` at `0x001BD7BA4`. Decode args and how
-   the size flows. Verify whether patching `r1` at the
-   call-site (`0x00252384..0x00252388` adds `r1 = stack_size +
-   84`) to also `add r1, #4096` is sufficient, or whether the
-   size constant feeds elsewhere.
-2. Cross-check: the prior 36-KiB attempt that was reverted —
-   what specifically broke? See git log around
-   `26146947 trace-bisect FMNewStack 36-KiB patch` for the
-   failure mode.
-3. Apply the patch. Cold-boot. Expect `Prim ALIAS:` lines from
-   the `TTask::Init` paths to drop to 0.
-4. Re-run guest tests.
+1. Stage-2 RO mapping on PA=0x04004000..0x04007000 (3 pages).
+   Mark them stage-2-RO; stage-1 stays RW so the guest sees a
+   normal write but it traps to EL2.
+2. EL2 fault handler: decode the AArch32 store insn (reuse the
+   `unaligned::handle_align_fault` decoder), log
+   `(PC, target offset, value)` for every store, then commit
+   the write through the kernel-globals mirror so the guest
+   proceeds.
+3. Cold-boot. Capture the (PC, offset, value) triples that
+   produce the 3 verify-mmu Group-1 aliases.
+4. Decide fix layer: (a) Einstein-port behaviour for those PCs,
+   (b) ROM patch redirecting the self-map writes to a non-
+   shared backing, (c) hypervisor-synthesised second mapping
+   (write distinct PA values into the L2 entries so the guest
+   never aliases at the underlying L1).
 
-Tail-distribution callers (heap creation, driver init, REx-
-resident shims) will likely still alias. Iterate on each in
-priority order once `TTask::Init` is clean.
-
-### Step Group-1 stage-2 RO trap (independent track)
-
-Group-1 aliases (PA=0x04004000-0x04006000, kernel-globals
-self-mapping) bypass the entire Remember/Prim layer — direct
-kernel L2 writes during TTBR0 setup. Plan: stage-2 RO trap on
-PA=0x04004000..0x04007000, decode each AArch32 store fault,
-log `(PC, L2-entry-index, value)`, commit the write. Decide
-fix layer once the triples are captured.
+Group-2's 12 aliases remain parked until Group-1 is zero.
+Group-2 will then be revisited with **Option C: stage-2 PA
+splitting** — the hypervisor-level approach. When the guest's
+L2 maps two VAs to the same PA, transparently allocate a
+duplicate stage-2 backing page and re-route one of the VAs.
+This avoids fighting the kernel's deliberate boundary-sharing
+design entirely; complexity is in COW-style write shadowing.
 
 Until aliases are zero, the alrt-task DABT and any other later wedge
 stays **deliberately not investigated**.

@@ -255,6 +255,39 @@ when a PA gets installed at a second VA → that's where the
 kernel-side aliasing mechanism lives, and it's the layer to
 fix (or compensate for via shadow pages).
 
+### Update (2026-04-28 ctd) — `Remember (static)` is also NOT the source
+
+Augmented the existing `handle_remember_entry_probe_with`
+(patched on `Remember (static)` at `0x00258E0C`) with an
+unconditional per-PA → first-VA aliasing tracker. Every call
+records `(phys, va, lr)`; on a duplicate PA at a different VA
+it logs `Remember ALIAS:` with both VA/LR pairs.
+
+**Cold-boot result:** 7 calls to `Remember (static)` matched
+the existing L1-lazy-grow filter (so 7 ENTER lines), and
+**zero `Remember ALIAS:` lines** were logged across the entire
+boot up to the Reboot canary. Meanwhile the 12 verify-mmu
+aliases all still appeared. Conclusion: the L2 writes that
+create those aliases do NOT pass through `Remember (static)`.
+
+Two non-overlapping kernel paths bypass it:
+
+- **Direct L2 writes by cold-boot kernel setup.** The 3
+  kernel-globals self-mapping aliases (PA=0x04004-0x04006)
+  are produced when the kernel builds its own page tables
+  during TTBR0 setup. No Remember-shim involvement.
+- **`PrimRememberMapping` family** at `0x00163480` /
+  `0x00163708` / `0x00163920`. These are the lower-level
+  L2-write primitives, reached via different kernel paths
+  than the user-shim Remember (static). The 9 stack-guard
+  aliases probably go through here.
+
+Next iteration: probe `PrimRememberMapping` at `0x00163480`.
+Args are `(env=r0, va=r1, &TPhys=r2, perm=r3)`; PA is
+extracted as `*(r2+16) >> 12 << 12`. Same per-PA → first-VA
+aliasing tracker. If that doesn't catch the 9 stack-guard
+aliases, escalate to a stage-2 trap on the L2 backing pages.
+
 ## FMNewStack 33→36 KiB patch attempt — REVERTED (2026-04-28)
 
 User: "Don't give up on the patch unless it's actually impossible."

@@ -234,48 +234,160 @@ subpage AP → both VAs (= last page of stack N + boundary page
 of stack N+1) end up RW pointing to the same PA. **This is the
 aliasing source.**
 
-### Patch design (next iteration)
+### Patch attempt 1 — REVERTED. 33 KiB is the *domain* page-table granularity, not just stack-slot size
 
-Change stack-slot spacing from 33 KiB to a 4-KiB-aligned size so
-no slot straddles a 4-KiB boundary. Two candidates:
+Applied 20 ROM patches to change FMNewStack + Init__11THeapDomain
++ GetStackInfo__11THeapDomain + FMFree from 33 → 36 KiB. Encodings
+verified with `arm-none-eabi-as` round-trip (initial hand-computed
+imm12 was wrong; assembler caught it — `mov r?, #0x9000 = 0xE3A?_?A09`,
+not `0xC09`. **Lesson: always round-trip ARM encodings through the
+assembler.**)
 
-- **36 KiB (`0x9000`, 9 pages)** — gives 30 KiB body + 6 KiB
-  guard/padding. Plenty of room. Encodable: `mov rN, #0x9000`
-  is `0xE3A0_NC09` (imm8=0x09, rot_imm=12 → ROR(0x09,24)=0x9000).
-- **32 KiB (`0x8000`, 8 pages)** — exactly fits 30 KiB body
-  + 2 KiB guard but BREAKS the 3-KiB guard the kernel expects;
-  may regress.
+Result: boot regressed from "alrt-task wedge at NewStack #14" to
+"infinite ResolveFault loop on heap region 0x0c601000..0x0c981000"
+(span 3.5 MiB — the sound heap). **Alias count went UP from 12 to
+84** because the kernel's heap-region page-table was now sized too
+small / too coarsely.
 
-Recommend 36 KiB. Required FMNewStack patches:
+Root cause: `THeapDomain::page_table[N]` (allocated in
+`Init__11THeapDomainFP13TStackManagerUlT2`) tracks `domain_size /
+slot_size` entries. **The kernel uses the same page-table
+granularity for stacks AND heaps in the same domain.** Heaps span
+hundreds of KiB and rely on the page-table being densely indexed
+at the slot-size granularity. Changing slot-size from 33 → 36 KiB
+changed:
+- The number of slots in a 3.5 MiB heap region from
+  `0x380000/0x8400 = 110` to `0x380000/0x9000 = 99` (10% fewer).
+- The placement of every heap allocation within the domain
+  (placement formula uses `slot_idx * slot_size`).
 
-| Offset    | Original                         | New                               | Notes |
-|-----------|----------------------------------|-----------------------------------|-------|
-| `0x1F8EDC` | `mov r7, #0x8400` (E3A07B21)    | `mov r7, #0x9000` (E3A07C09)     | initial r7 |
-| `0x1F8F18` | `mov r0, #0x8400` (E3A00B21)    | `mov r0, #0x9000` (E3A00C09)     | div-by-stack-slot |
-| `0x1F8F20` | `add r0, r0, r0, lsl #5` (×33) (E0800280) | `add r0, r0, r0, lsl #3` (×9) (E0800180) | for 36 KiB |
-| `0x1F8F24` | `sub r0, r9, r0, lsl #10` (×1024) (E0490500) | `sub r0, r9, r0, lsl #12` (×4096) (E0490600) | scale to 36 KiB |
-| `0x1F8F38` | `cmp r0, #0x8400` (E3500B21)    | `cmp r0, #0x9000` (E3500C09)     | bounds check |
-| `0x1F8F48` | `mov r0, #0x8400` (E3A00B21)    | `mov r0, #0x9000` (E3A00C09)     | second div |
-| `0x1F8F5C` | `mov r0, #0x8400` (E3A00B21)    | `mov r0, #0x9000` (E3A00C09)     | third div |
-| `0x1F8F90` | `cmp r0, #0x8400` (E3500B21)    | `cmp r0, #0x9000` (E3500C09)     | bounds check |
-| `0x1F8FA0` | `mov r0, #0x8400` (E3A00B21)    | `mov r0, #0x9000` (E3A00C09)     | fourth div |
+ResolveFault probes for `info_bounds=[0x0c601000,0x0c981000)`
+suggest the kernel was treating the *sound heap* as if it were a
+TStackInfo with the new slot size. The page_table indices no
+longer matched the L2 entries the kernel had already populated
+for heap pages → mass aliasing as different VAs got mapped to the
+same PA via the now-misaligned page_table.
 
-That's **9 patches in PATCHES_717006**. The `add/sub` pair at
-`0x1F8F20`/`0x1F8F24` is the only place the multiplier-vs-shift
-arithmetic changes; everywhere else just swaps the constant.
+**Conclusion: changing `STACK_SLOT_SIZE` is not feasible. The
+constant is shared infrastructure across the entire allocator —
+not just stacks. Any patch touching it would need to coordinate
+with the heap allocation layer too, which is too much surface.**
 
-Risk: the `add r0, r0, #0xC00` (3-KiB guard offset) at `0x1F8EF0`
-and `0x1F8F30` may need to grow to `0x1000` (4-KiB guard) or
-stay as-is. Need to read FMNewStack's caller (`FMNewHeapArea` at
-`0x001F68F8`) to see whether the 0xC00 is the inter-slot guard
-size or something else. Do that first before applying.
+### Next options to investigate (next iteration)
 
-After patching, every kernel call that consumes "stack slot
-size" by reading the kernel's runtime constant (instead of the
-literal 0x8400) needs auditing. `apply_resolve_fault_wrapper` in
-`src/rom_patches.rs` already aligns to 4-KiB *within the stack
-range* (`info->base_va + page_offset`), so the wrapper itself
-is safe.
+1. **Patch FMNewStack's *placement only*** — allocate stacks at
+   4-KiB-aligned offsets within the existing 33-KiB grid by
+   leaving the slot SIZE constants alone but changing the body
+   START offset from 3 KiB to 4 KiB. The slot still occupies 33
+   KiB but uses subpage layout: 4 KiB guard + 28 KiB body + 1 KiB
+   pad. Body fits in 7 pages instead of 8 — doesn't fit our 30 KiB
+   body span.
+2. **Wrap FMNewStack at the *return* point** — let the kernel
+   compute its 33-KiB-spaced slot, but our wrapper substitutes a
+   4-KiB-aligned base address (round up by up to 3 KiB). The
+   kernel's TStackInfo and page_table believe one base; the
+   ACTUAL backing pages live at a different (4-KiB-aligned) base.
+   Risk: the kernel's lookup `(va - base) / slot_size` would then
+   compute the wrong slot for the actual VAs.
+3. **Change the apply_resolve_fault_wrapper's behavior** — when
+   a stack fault hits a page that's already owned by ANOTHER
+   stack's L2 entry, force the wrapper to allocate a *fresh*
+   page anyway (claim all 4 subpages for the new owner) and
+   rewrite the L2 entry. The other stack's L2 entry stays
+   pointing at the original page — but our verify-mmu would
+   still see the alias.
+4. **Stage-2 page shadowing (proposed previously)** — the only
+   path that doesn't fight the kernel's design. Cost: 256 KiB
+   shadow pool + careful filter to exclude kernel-globals
+   self-mapping.
+
+The user requested "keep the kernel as natural as possible" — so
+options 1-3 are preferred over 4. But none of them have a clear
+path forward without more investigation.
+
+### Original design (kept for reference)
+
+The 0x8400 (= 33 KiB) constant is used by 4 kernel functions that
+share the slot-size ABI: `Init__11THeapDomainFP13TStackManagerUlT2`
+(slot count + page-table allocation), `GetStackInfo__11THeapDomainFUlPP10TStackInfo`
+(VA→slot lookup), `FMNewStack` (allocation), `FMFree` (deallocation).
+
+Audit confirmed the `0x271xxx` references are **error-code
+generation**, not slot-size — they use `mvn r0, #226 ; sub r0, r0,
+#0x8400` to produce a specific negative error code. Don't touch
+those.
+
+All the slot-arithmetic occurrences must change in lockstep:
+
+**Group 1 — constant `0x8400 → 0x9000` (10 sites). Encodings
+verified with `arm-none-eabi-as -mcpu=cortex-a8` round-tripped
+through `arm-none-eabi-objdump -d`:**
+
+| PC | Original | New |
+|----|---------:|----:|
+| `0x1F8D74` | `mov r0, #0x8400` (E3A00B21) | `mov r0, #0x9000` (E3A00A09) |
+| `0x1F8E1C` | `mov r0, #0x8400` (E3A00B21) | `mov r0, #0x9000` (E3A00A09) |
+| `0x1F8EDC` | `mov r7, #0x8400` (E3A07B21) | `mov r7, #0x9000` (E3A07A09) |
+| `0x1F8F18` | `mov r0, #0x8400` (E3A00B21) | `mov r0, #0x9000` (E3A00A09) |
+| `0x1F8F38` | `cmp r0, #0x8400` (E3500B21) | `cmp r0, #0x9000` (E3500A09) |
+| `0x1F8F48` | `mov r0, #0x8400` (E3A00B21) | `mov r0, #0x9000` (E3A00A09) |
+| `0x1F8F5C` | `mov r0, #0x8400` (E3A00B21) | `mov r0, #0x9000` (E3A00A09) |
+| `0x1F8F90` | `cmp r0, #0x8400` (E3500B21) | `cmp r0, #0x9000` (E3500A09) |
+| `0x1F8FA0` | `mov r0, #0x8400` (E3A00B21) | `mov r0, #0x9000` (E3A00A09) |
+| `0x1F918C` | `mov r0, #0x8400` (E3A00B21) | `mov r0, #0x9000` (E3A00A09) |
+
+(I had originally hand-computed `0xC09`; the assembler round-trip
+showed it should be `0xA09`. ARM imm12 for 0x9000 is imm8=0x09,
+rot_imm=10 → ROR(0x09, 20) = 0x9000. **Always verify with the
+assembler — don't rely on hand-computed encodings.**)
+
+**Group 2 — multiplier ×33 → ×9 (3 sites; uses `r + r<<5 = r*33`
+becomes `r + r<<3 = r*9`):**
+
+| PC | Original | New |
+|----|---------:|----:|
+| `0x1F8F20` | `add r0, r0, r0, lsl #5` (E0800280) | `add r0, r0, r0, lsl #3` (E0800180) |
+| `0x1F9024` | `add r1, sl, sl, lsl #5` (E08A128A) | `add r1, sl, sl, lsl #3` (E08A118A) |
+| `0x1F9030` | `add r0, r7, r7, lsl #5` (E0870287) | `add r0, r7, r7, lsl #3` (E0870187) |
+
+**Group 3 — shift ×1024 → ×4096 (3 sites; combines with the ×9 to
+yield ×9·4096 = 0x9000 total scale, matching the new slot size):**
+
+| PC | Original | New |
+|----|---------:|----:|
+| `0x1F8F24` | `sub r0, r9, r0, lsl #10` (E0490500) | `sub r0, r9, r0, lsl #12` (E0490600) |
+| `0x1F902C` | `add r9, r0, r1, lsl #10` (E0809501) | `add r9, r0, r1, lsl #12` (E0809601) |
+| `0x1F9034` | `sub r0, r9, r0, lsl #10` (E0490500) | `sub r0, r9, r0, lsl #12` (E0490600) |
+
+**Group 4 — guard offset 3 KiB → 4 KiB (4 sites):**
+
+| PC | Original | New |
+|----|---------:|----:|
+| `0x1F8EF0` | `sub r1, r0, #3072` (E2401B03) | `sub r1, r0, #4096` (E2401A01) |
+| `0x1F8F30` | `add r0, r0, #3072` (E2800B03) | `add r0, r0, #4096` (E2800A01) |
+| `0x1F8F88` | `add r0, r0, #3072` (E2800B03) | `add r0, r0, #4096` (E2800A01) |
+| `0x1F9038` | `add r2, r0, #3072` (E2802B03) | `add r2, r0, #4096` (E2802A01) |
+
+**Total: 20 RomPatch entries.**
+
+New slot layout (36 KiB = 9 pages):
+- offset 0..4 KiB: guard (1 full page, AP=011 after our flatten;
+  `apply_resolve_fault_wrapper` claims this as a unique page per
+  stack so no aliasing)
+- offset 4..34 KiB: body (30 KiB usable, unchanged)
+- offset 34..36 KiB: padding (2 KiB) — unused
+
+Memory cost: ~25 stacks × 3 KiB extra = ~75 KiB. RAM is 4 MiB,
+so fine.
+
+All encodings round-tripped through `arm-none-eabi-as` →
+`arm-none-eabi-objdump -d` (see verification log in commit message).
+**Lesson learned this iteration: hand-computing ARM imm12 rotations
+is error-prone. Use the assembler.**
+
+After patching, expected verify-mmu output: 0 stack-page aliases.
+The 3 kernel-globals self-map aliases (Group 1 in the inventory)
+remain — those are intentional kernel-only mappings.
 
 ### Verification scaffold (already in place)
 

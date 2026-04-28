@@ -303,6 +303,8 @@ the tracer's coverage in lock-step with shadow_stub's definition of
   function still runs correctly; it just isn't traced.
 - Every call fires an HVC. On a long boot the trace volume can
   saturate the mini-UART; lean on `quiet` and/or grep.
+- *Don't* rely on your ability to handle exact ARM instruction encodings, always
+  double check with the actual assembler/disassembler.
 
 ## Reference docs
 

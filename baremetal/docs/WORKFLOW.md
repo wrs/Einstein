@@ -1,5 +1,42 @@
 # Working-style notes for Phase B
 
+## Always round-trip ARM encodings through the assembler
+
+When designing a ROM patch that replaces existing AArch32
+instructions (especially data-processing immediates with non-trivial
+constants), **never trust hand-computed encodings** — round-trip
+through `arm-none-eabi-as` then `arm-none-eabi-objdump -d`:
+
+```sh
+cat > /tmp/check.s << 'EOF'
+.arm
+.syntax unified
+
+mov r0, #0x9000
+sub r1, r0, #4096
+add r0, r0, r0, lsl #3
+@ ...etc
+EOF
+arm-none-eabi-as -mcpu=cortex-a8 -o /tmp/check.o /tmp/check.s
+arm-none-eabi-objdump -d /tmp/check.o
+```
+
+This catches imm12 rotation mistakes — for example, `mov r?, #0x9000`
+is `0xE3A?_?A09` (imm8=0x09, rot_imm=10 → ROR(0x09, 20)). Hand
+computation easily produces `0xC09` (rot_imm=12 → ROR(0x09, 24) =
+0x0900, not 0x9000) which assembles to a different value, silently.
+Also catches shift-amount typos and Rd/Rn/Rm field swaps.
+
+The assembler must be available — `/Applications/ArmGNUToolchain/`
+on macOS, or `apt install gcc-arm-none-eabi` on Linux.
+
+**Why:** the 2026-04-28 FMNewStack patch attempt installed
+`mov r?, #0x9000` as `0xE3A?_?C09` (hand-computed, wrong) on first
+draft. The hypervisor would have applied wrong values silently — the
+pre-patch sanity check (`patch_probe`) only verifies the *original*
+word matches expected, not that the *new* word decodes correctly.
+Assembler round-trip caught it before commit.
+
 ## Verify Einstein-driver ports with a review sub-agent
 
 When landing any Rust port claimed to mirror Einstein (typical comment:

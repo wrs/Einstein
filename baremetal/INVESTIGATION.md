@@ -4,6 +4,57 @@ Live notes for the next iteration. Replace this file's body when the
 current stop is fixed and a new one takes over — git history is the
 archive of past investigations.
 
+## Wrapper-revert diagnostic: wrapper IS needed AND IS likely the aliasing trigger (2026-04-28)
+
+This iteration ran PLAN.md step 1: temporarily commented out
+the `apply_resolve_fault_wrapper(rom_ptr)` call in
+`rom_patches.rs:477`, cold-booted, captured
+`/tmp/run-no-wrapper.log`.
+
+Result: boot terminates **much earlier** (2261 lines of log vs.
+5918 with the wrapper). It dies at the **already-resolved**
+BootOS canary entry #2 wedge:
+
+```
+*** BootOS canary fired on entry #2 — software reset detected ***
+  ELR_EL2  = 0x00ffff58  (= BootOS entry PC)
+  R0 = 0x0cc80c80  R1 = 0xffffffff
+```
+
+R0=0x0cc80c80 matches exactly the resolved-stops table entry:
+> 2026-04-26 | BootOS canary entry #2 (R0=0x0cc80c80) — `name`-task
+> stack-overrun corrupts neighbour task on shared PA |
+> 3-instruction ROM patch in `TStackManager::ResolveFault`
+> (mask=0xF) forces per-page stack allocation.
+
+So the wrapper IS still required to get past the original
+ARMv7 subpage-AP corruption. Without it, "name" task's stack
+overruns into a neighbour task's data on a shared 4-KiB page
+and the kernel software-resets.
+
+Conclusion:
+
+- **The wrapper is necessary** to get past the earlier stop.
+- **The wrapper enables enough boot progress** that we then
+  hit the heap-aliasing wedge much later (transition #3 at
+  trap 5840 vs. the BootOS canary firing within the first
+  few hundred trap entries without it).
+- **The wrapper is the most plausible trigger** of the
+  aliasing because the heap-aliasing wedge is downstream of
+  the wrapper-driven path. Whether the wrapper itself
+  mismanages the kernel allocator's free-list, or whether
+  it just exposes a separate kernel allocator divergence
+  that's only triggered by sustained allocation pressure,
+  needs further investigation.
+
+The right next step is to **audit the wrapper without
+disabling it** — specifically, log every `FindOrAllocPage`
+call's result and watch for the same PA being returned
+twice across different stack-grow events. If PA 0x04032000
+appears twice (once for the heap region, once later for
+the user stack), the kernel's free-list has the bug and
+the wrapper exposes it.
+
 ## Aliasing CONFIRMED at stage-1: kernel maps VA 0x0ca6b000 and VA 0x0cc82000 to the same PA (2026-04-28)
 
 This iteration added a one-shot probe at the heap-watch

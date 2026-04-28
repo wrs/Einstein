@@ -79,6 +79,46 @@ impl Source {
 }
 
 // ----------------------------------------------------------------------
+// Heap-header sanity check.
+//
+// `NewHeap` at ROM 0x00310e24 initialises a Newton heap header with
+// these load-bearing invariants (offsets relative to the header VA):
+//
+//   heap[+0x00]  = heap - 16        (base of the heap's block area)
+//   heap[+0x08]  = 0x736b6961       ("skia" little-endian magic, from
+//                                    the ROM literal at 0x00310f34)
+//   heap[+0x0C]  = heap             (self-pointer, set at 0x00310ec4)
+//   heap[+0x10]  = heap             (self-pointer, set at 0x00310ed0)
+//   heap[+0x40]  = 0x40             (constant 64, set at 0x00310f10)
+//
+// All five hold on a freshly-initialised heap. The wedge corruption
+// (heap[+0]=0x002dd804, heap[+0x10]=0, etc.) breaks four of them on
+// first observation, so a multi-field check catches it as reliably
+// as a single-field watch and gives a clean "halt on first sign of
+// corruption" tripwire.
+
+/// Result of one sanity probe. Returns None when all invariants hold.
+///
+/// Only the two invariants the kernel never legitimately mutates are
+/// checked. `heap[+0xC]` and `heap[+0x10]` are also self-pointers at
+/// init but the kernel re-uses them as "next heap" / "free-list
+/// owner" links during normal operation, so they false-positive
+/// against working code.
+pub fn check_heap_sanity(heap_va: u32) -> Option<(&'static str, u32, u32)> {
+    let read = |off: u32| guest_mem::read_word_va(heap_va.wrapping_add(off));
+    let base = read(0)?;
+    let want_base = heap_va.wrapping_sub(16);
+    if base != want_base {
+        return Some(("heap[+0x00] != heap-16 (base)", base, want_base));
+    }
+    let magic = read(8)?;
+    if magic != 0x736b_6961 {
+        return Some(("heap[+0x08] != 'skia' magic", magic, 0x736b_6961));
+    }
+    None
+}
+
+// ----------------------------------------------------------------------
 // Stage-2 RO carve-out at the RelocHeap header's PA.
 //
 // Once we know the PA backing VA 0x0ca6b000 (one stage-1 walk at the
@@ -311,6 +351,28 @@ fn maybe_rearm() {
 /// transition with the supplied source label and the EL2-saved
 /// faulting address. Cheap enough to call from every trap entry; the
 /// guest_mem walk is a few stage-1 page-table reads.
+/// PC ranges where the kernel legitimately mutates a heap header
+/// transiently (NewHeap init, allocator inner loops, semaphore-glue
+/// at SetCurrentHeap). The sanity check skips when ELR is inside one
+/// of these so we don't false-positive during a partial update.
+///
+/// This is intentionally narrow — only the actual allocator code
+/// ranges, not trap trampolines or stub pools (which are valid
+/// observation points for "the kernel just left heap code, before
+/// we re-enter it").
+fn elr_inside_heap_code(elr: u32) -> bool {
+    // NewHeap body, SetCurrentHeap, NewHandle/HLock/HUnlock, etc.
+    if (0x0014_0000..0x0014_8000).contains(&elr) { return true; }
+    // CompactHeap / SearchFreeList / JumpBlock / NewBlock / freelist ops.
+    if (0x0031_0000..0x0032_0000).contains(&elr) { return true; }
+    false
+}
+
+/// True iff a sanity-check failure has already been reported.
+/// Latches so we halt cleanly on the first trip-wire and don't
+/// flood the log if the same heap is read multiple times.
+static SANITY_FIRED: AtomicU32 = AtomicU32::new(0);
+
 pub fn sample(elr_el2: u64, source: Source) {
     // Defensive RO-state poll: if some other code path has flipped
     // the carved page to RW without our knowledge (e.g. shadow_stub
@@ -397,4 +459,71 @@ pub fn sample(elr_el2: u64, source: Source) {
     }
     PREV.store(value, Ordering::Relaxed);
     PREV_ELR.store(elr_el2, Ordering::Relaxed);
+
+    // Multi-field heap-header sanity check. Skipped when ELR is
+    // inside a heap-allocator function (the fields can be transiently
+    // out-of-spec while NewHeap / NewHandle / SetCurrentHeap / etc.
+    // update them). Skipped before NewHeap runs (PREV still 0). Halts
+    // on the first trip-wire so the operator can see WHICH trap
+    // observed the corruption — much tighter than waiting for
+    // SearchFreeList to wedge.
+    if SANITY_FIRED.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    if elr_inside_heap_code(elr_el2 as u32) {
+        return;
+    }
+    if PREV.load(Ordering::Relaxed) == 0 {
+        return; // pre-NewHeap; the heap doesn't exist yet
+    }
+    if let Some((reason, got, want)) = check_heap_sanity(WATCH_VA) {
+        SANITY_FIRED.store(1, Ordering::Relaxed);
+        kprintln!(
+            "*** heap-watch sanity FAIL: {} (got={:#010x} want={:#010x})",
+            reason, got, want,
+        );
+        kprintln!(
+            "    at trap source={} elr={:#x} heap-VA={:#010x}",
+            source.label(), elr_el2, WATCH_VA,
+        );
+        let armed = CARVED_PA.load(Ordering::Relaxed);
+        let pa_now = guest_mem::translate_va(WATCH_VA).unwrap_or(0);
+        kprintln!(
+            "    pa_now={:#010x} armed={:#010x}", pa_now, armed,
+        );
+        // Dump the first 0x40 bytes of the heap header for context.
+        for off in (0..0x40u32).step_by(16) {
+            let mut row = [0u32; 4];
+            for i in 0..4u32 {
+                row[i as usize] = guest_mem::read_word_va(
+                    WATCH_VA.wrapping_add(off + i * 4)
+                ).unwrap_or(0xDEADBEEF);
+            }
+            kprintln!(
+                "      heap[+{:#04x}]  {:#010x} {:#010x} {:#010x} {:#010x}",
+                off, row[0], row[1], row[2], row[3],
+            );
+        }
+        // Dump the trap-stream ring buffer (newest at index 31) so
+        // the operator can bisect the corrupting writer to between
+        // two adjacent ring entries. The ring is updated at the top
+        // of every sample call, so it includes this trap.
+        let head = RING_HEAD.load(Ordering::Relaxed);
+        let next_head = head.wrapping_add(1);
+        for i in 0..RING_SIZE {
+            let idx = next_head.wrapping_add(i) % RING_SIZE;
+            let raw = RING[idx].load(Ordering::Relaxed);
+            if raw != 0 {
+                let src = if (raw & RING_SRC_IRQ_BIT) != 0 { "irq " } else { "sync" };
+                let e = raw & !RING_SRC_IRQ_BIT;
+                kprintln!("      ring[{:>2}] {}: elr={:#x}", i, src, e);
+            }
+        }
+        // Halt loudly so the operator catches the first sign of
+        // corruption with the trap stream still in the ring buffer.
+        kprintln!(
+            "    *** halting at first heap-corruption observation ***"
+        );
+        crate::cpu::halt();
+    }
 }

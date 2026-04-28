@@ -215,28 +215,36 @@ target inside our pool). Caller chain on the user stack still
 carries the bad heap (`stack[sp]=0x0ca6b010`,
 `lr_usr=0x00311e1c`).
 
+Update — the gCurrentHeap-clear from this iteration's #3 attempt
+DID write back (`prev=0x0ca6b010, write_ok=true`) but the boot
+still wedges identically. Reason: the caller (`__nw__FUi`'s
+recovery path) saved the bad heap pointer to its own stack
+frame BEFORE calling SearchFreeList; clearing `task[-16]` after
+the fact doesn't unwind those copies. So the cascade has to be
+broken at a different layer.
+
 Concrete next steps:
 
-1. **Halt earlier — at the wild branch, not at the stub crash.**
-   Add a guard at the top of `handle_data_abort` (or in a thin
-   wrapper) that detects `(elr in shadow_stub stub pool) &&
-   (lr_usr or stack frame doesn't match SBA-call expectations)`
-   and halts with the caller PC and stack trace, so we see who
-   issued the wild branch.
+1. **Hook the entry into the SBA inline-stub pool.** When
+   `handle_data_abort` sees a fault with ELR in
+   `SBA_STUB_POOL_IPA..SBA_STUB_POOL_END` and the calling
+   convention isn't satisfied (e.g. `r12` doesn't translate to
+   a valid IPA), halt with the source PC of the dispatch.
+   That gives us the wild-branch site.
 2. **Trace `lr_usr=0x00311e1c` back.** That's inside
-   `__nw__FUi`'s no-fit recovery (between SearchFreeList return
-   and the next allocator call). Disassemble the surrounding
-   ROM and identify which function pointer or vtable lookup
-   resolves to a stub-pool address.
-3. **Upstream fix:** extend the SearchFreeList no-fit arm to
-   also clear `gCurrentHeap`'s reference to the bad heap (write
-   zero or `gFallbackHeap` to `currentTask->globals[-16]`).
-   Subsequent allocator calls would then go to a sane heap and
-   the corrupted-vtable dispatch wouldn't happen at all.
-4. **Cross-check Einstein** — what does Einstein do here? It
-   probably doesn't reach this state, since its heap stays
-   valid. But understanding the no-fit recovery path's expected
-   behaviour helps choose between (1) and (3).
+   `__nw__FUi`'s no-fit recovery. Disassemble surrounding ROM
+   to find the vtable or function-pointer load that yielded
+   a stub-pool address.
+3. **Cross-check Einstein** — what does Einstein do at the
+   equivalent boot offset? Einstein's heap stays valid so it
+   doesn't reach this state, but understanding the
+   no-fit-recovery dispatch helps choose where to intercept.
+4. **Or step back further** — block the bad-heap creation /
+   adoption upstream by validating heap pointers as they're
+   passed to SetCurrentHeap (already probed; not yet rejecting).
+   If we reject `r0=0x0ca6b010` at SetCurrentHeap entry and
+   substitute a known-good heap, the whole cascade never
+   starts.
 
 ## Earlier stop — RelocHeap header corruption in newt's MakeStoreObject path
 
@@ -490,6 +498,13 @@ the boot is steady-state-quiet:
   unconditional all-class DABT log for the armed PA, used to
   distinguish "no fault fires" from "fault fires but our arm
   doesn't match". Remove together with the heap_watch sentinel.
+- `heap_watch::check_heap_sanity` — multi-field heap-header
+  invariant probe (heap[+0]=base, heap[+8]='skia' magic). Wired
+  into `sample()` after the transition log; halts on the first
+  trip-wire with a full header dump + ring-buffer trap stream.
+  Gated on ELR being outside known heap-allocator PC ranges
+  (`0x140000..0x148000`, `0x310000..0x320000`) so partial
+  allocator updates don't false-positive.
 
 Once the boot quiesces these can be pulled; the behavioural invariants
 they enforce are codified in guest tests.

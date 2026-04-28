@@ -519,13 +519,11 @@ pub fn sample(elr_el2: u64, source: Source) {
                 kprintln!("      ring[{:>2}] {}: elr={:#x}", i, src, e);
             }
         }
-        // Log-only mode for this iteration: don't halt, so the boot
-        // continues into the SBA-stub-pool wedge where the dabt-trip
-        // handler can decode the stub's slot-14 back-branch and tell
-        // us which ROM PC the stub emulates. Re-enable the halt once
-        // the cascade source is identified.
+        // Halt loudly so the operator catches the first sign of
+        // corruption with the trap stream still in the ring buffer.
         kprintln!(
-            "    (sanity FAIL latched; continuing boot to expose downstream wedge)"
+            "    *** halting at first heap-corruption observation ***"
         );
+        crate::cpu::halt();
     }
 }

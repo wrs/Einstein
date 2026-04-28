@@ -18,6 +18,11 @@ end-state milestone; we drive forward until the boot quiesces in a
 steady-state idle that responds to whatever tablet / serial / network
 inputs we choose to feed it.
 
+**IMPORTANT:** The goal is to run the *original ROM code* successfully.
+Don't introduce patches or workarounds just to get the run to progress
+farther. Diagnose and fix the actual problem. *No workarounds, no deferrals,
+no shortcuts.*
+
 ## Workflow per stop
 
 1. Capture the trace tail (`--features trace_once,quiet` for one-shot
@@ -175,52 +180,67 @@ NOTE: Fix all compiler warnings before committing, to keep context clean.
   on QEMU; `--platform fvp` runs the same suite on the FVP. Both
   must stay green. See "Verification" near the end of this file.
 
-## Current stop — CompactHeap→LockedBlock translation fault on gFallbackHeap (downstream of bad-heap substitution)
+## Current stop — RelocHeap header corruption at PA 0x04032000+ (root-cause investigation)
 
-Iteration 10 wired option 1 from the previous plan: substitute
-`gFallbackHeap` for `r0=0x0ca6b010` in the SetCurrentHeap probe.
-The kernel's bracketing save/restore sees fallback in / fallback
-out and stays consistent. Boot progressed past the old
-SetBlockSize wedge, handled 5 lazy-grow DABTs cleanly, then
-halted on a `DIAG vector intercept` at:
+Reverted iterations 6's SearchFreeList no-fit redirect and 10's
+gFallbackHeap substitution. Both were symptom workarounds that
+let the boot walk past the wedge but masked the real divergence
+from how Einstein (and real Newton hardware) execute the same
+ROM. The kernel SHOULD be able to use the legitimate RelocHeap
+(NewHeap call #3, base=0x0ca6b000, size=2 MiB) — it was created
+correctly by `NewHeap` and registered with `SetCurrentHeap`.
+Something WE'RE doing causes its header to be overwritten with
+ROM PCs and stack values.
 
-- pre-fault PC inside shadow_stub stub pool (slot @ `0xf76940`,
-  access at slot 10 = `0xf76968`).
-- FAR=`0x0c22cba3`, stage-1 L2[0x2c]=0 (translation fault).
-- USR lr=`0x0031326c` = return into CompactHeap after
-  `bl LockedBlock` at `0x00313268`.
-- r4=r9=gFallbackHeap (`0x0c111000`) — substitution working.
-- ESR_EL1=`0x37` — DFSC not in handle_diag's forwardable set, so
-  it took the loud-halt path.
+Diagnostic ground truth from prior iterations:
 
-This is a NEW class of failure — the kernel is now operating on
-gFallbackHeap and reaching CompactHeap → LockedBlock, which
-hits an unmapped VA. The substitution let us walk past the
-old wedge but landed us in code paths with different
-expectations.
+- Heap header is correctly initialised post-`NewHeap` (transition
+  #0 sees `heap[+0x10]=0x0ca6b000`, the expected base).
+- VA `0x0ca6b000` is rebound stage-1 from PA `0x0401f000` to
+  `0x04032000` partway through boot — this is the kernel's
+  normal page-management, but worth confirming Einstein does
+  the same.
+- Sanity check (heap[+0]=heap-16, heap[+8]='skia' magic) holds
+  through transition #2 and fails at transition #3 (heap[+0]
+  becomes a ROM PC `0x002dd804`).
+- FVP and QEMU produce the byte-identical corruption — not a
+  QEMU stage-2 enforcement bug. Both show prev-trap-elr =
+  `0x2dd7bc` (FVP) or `0xe4f168` (QEMU) immediately before the
+  wedge is observed.
+- Stage-2 carve-out captures hundreds of legitimate writes to
+  the heap, but the corrupting write rides the RW window opened
+  by `handle_data_abort`'s auto-flip after each perm fault and
+  is not individually trapped.
 
-Concrete next steps:
+The right next step (from the PLAN.md guidance) is **cross-check
+Einstein at the equivalent boot offset**:
 
-1. **Decode the new wedge's stub.** The dabt-trip-style stub
-   orig-pc decoder doesn't run on the DIAG_TAG halt path
-   (different log format). Mirror the same decode in
-   handle_diag's loud-halt arm so the new wedge dump shows
-   which ROM PC its stub emulates.
-2. **Check whether DFSC=0x37 should be forwardable.** ARMv7
-   short-descriptor FS field is 4 bits at [3:0] + bit 10.
-   ESR_EL1=0x37 might be a synthetic DFSC the trampoline
-   generates but handle_diag's allowed-set
-   (0x03/0x05/0x06/0x07/0x0D/0x0F) misses. If so, extend the
-   set so the kernel takes its own DAH path.
-3. **Cross-check Einstein** — what's the kernel doing in
-   CompactHeap → LockedBlock at this boot offset? Einstein
-   doesn't reach this state; understanding the expected flow
-   helps localise where our fallback-heap substitution
-   diverges from the real path.
-4. **Reconsider the substitution.** Possibly the kernel needs
-   RelocHeap-specific behaviour (the heap has different
-   attribute fields than fallback). If so, the right approach
-   is fixing the corruption upstream, not substituting.
+1. **Run NewtonProbe with the same ROM/REx and dump the heap
+   header bytes at the equivalent stage of boot.** Build:
+   ```
+   cmake --build build --target NewtonProbe
+   build/NewtonProbe baremetal/roms/newton.rom _Data_/Einstein.rex 60
+   ```
+   Add a probe to NewtonProbe (or grep its existing log) that
+   captures heap[0x0ca6b010..+0x40] and the value of
+   `currentTask->globals[-16]` at the moment Einstein runs the
+   equivalent of our heap-watch transition #2 → #3 window.
+2. **If Einstein's heap stays valid**, the bug is hypervisor-
+   side. Likely candidates:
+   - A stage-2 mapping issue (we already verified L3 entry, but
+     could be a TLB or per-VA stage-1-stage-2 interaction).
+   - A CP15 / cache-op handler that's misbehaving and corrupting
+     RAM bytes through a side channel (e.g. dirty-cache flush
+     with wrong target).
+   - shadow_stub's BE-32 byte-access patcher mis-emulating an
+     instruction that targets the heap.
+3. **If Einstein corrupts it the same way**, the kernel has its
+   own recovery path (per the ROM source) that we need to mirror
+   instead of papering over. Find it by looking at what
+   Einstein does post-corruption and matching that behaviour.
+
+The current heap-watch / sanity-check / SBA-stub-decoder
+scaffolding is cheap and stays armed for the cross-check work.
 
 ## Earlier stop — wild jump into SBA inline-stub pool downstream of the no-fit recovery
 
@@ -427,8 +447,6 @@ Concrete next steps:
 
 | Date | Wedge | Resolution |
 |------|-------|------------|
-| 2026-04-28 | RelocHeap-corruption cascade through NewBlock → SetBlockSize (wedge at `strb r0, [r9]` ROM 0x00312a18 via SBA stub at PC=0x00f76368) | `guest_bp` SetCurrentHeap probe at ROM `0x00142df0` substitutes `gFallbackHeap` (= *0x0c101080) for `r0=0x0ca6b010`. The kernel's bracketed save/restore sees fallback in / fallback out, the bad heap never gets installed in `task[-16]`, and NewBlock walks the good heap. Boot progresses past the cascade. New downstream stop at CompactHeap → LockedBlock translation fault — different class of failure, queued for next iteration. |
-| 2026-04-27 | SearchFreeList bus-error throw on wild freelist node (RelocHeap header corruption — full chronology in `INVESTIGATION.md`) | `guest_bp` arm at ROM `0x00313308` detects untranslatable r0 and ELRs to `0x00313360` (the function's no-fit exit) with r0=0. `__nw__FUi` takes its existing out-of-memory recovery path. Boot progressed past the wedge to a downstream NULL-deref at PC=0x00f76368. |
 | 2026-04-27 | NULL-pointer SWP via `Swap(0,1)` at ROM `0x3ae204` (kernel `Acquire(NULL)` glue inside `VccOff__FiUl`) — stage-2 perm fault on write to ROM aperture, ISV=0 | trap.rs `try_absorb_rom_write`: mirror Einstein `TMemory::WriteP` (TMemory.cpp:1755-1766), drop the store; for SWP/SWPB also run the load piece into Rd. Boot reached steady-state idle. Test: `guest-tests/tests/test_swp_rom_aperture.S`. |
 | 2026-04-27 | TEncodingMap.+16 = 0x20000110 (out-of-stage-2 IPA) at `ConvertToUnicodeFunc_Contiguous8` | mmio.rs: `0x20000000..0x30000000` "unknown bank #5" silent-zero matching Einstein's `TMemory::ReadP` (TMemory.cpp:1026-1034). Boot advanced 10× → reaches TInterpreter. |
 | 2026-04-27 | `Reboot` canary inside `TInterpreter::TInterpreter` — DFSC=5 at FAR=0x0cd07400 on lazy-L1 section grow during `TRefStructStack::Fill` (L1[0xCD]=0x90 lazy marker) | γ-fix in `handle_diag`: read L1.domain from the faulting VA's L1 entry and write it into DFSR_EL1.bits[7:4] before forwarding to DAH (ARMv7 leaves Domain UNK on DFSC=5; kernel was reading 0). |

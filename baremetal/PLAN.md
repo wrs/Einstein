@@ -169,32 +169,69 @@ deliberate stack-guard sharing.
    through Prim — they remain direct kernel L2 writes during TTBR0
    setup.
 
-### Next iteration — identify user-mode SWI #12 caller, then patch
+### Investigation progress (continued)
 
-**Step 1 — recover user-mode caller PC at SWI boundary.**
-At `handle_prim_remember_probe_with` entry the source mode is SVC
-(SWI dispatch). The Newton SWI vector pushes USR R0..R15 onto SP_svc
-before branching to GenericSWIHandler. Read the saved-PC slot in
-that frame to get the instruction-after-`swi #12`. Group aliases
-by user-mode caller; the most-frequent caller is the patch target
-(likely `FMNewStack` based on prior 36-KiB attempt).
+5. **SWI save-area walk** for user-mode caller identification.
+   New helper `read_swi_caller()` reads `(saved_pc, lr_usr,
+   user_caller)` from `curr_task + {0x4c, 0x48, 0x3c-walk}`.
+   Prim ALIAS lines now log all three. Result across 12 aliased
+   PAs:
 
-**Step 2 — design FMNewStack non-sharing patch.**
-Two patterns to consider, given the previous 36-KiB attempt's slot-
-size collision with the heap domain page-table:
+   | user_caller | function | aliased PAs |
+   |---|---|---:|
+   | `0x002523bc` / `0x002523d4` | **`TTask::Init`** post-LockHeapRange BL sites | **11** |
+   | `0x00124280` | `TMuxStoreMonitor::Init` | 2 |
+   | `0x003109e4` | `ExtendVMHeap` | 2 |
+   | `0x0c1118c8` | RAM (REx-resident shim) | 2 |
+   | + 7 more, 1 PA each | `NewVMHeap` / `LockStack` / `NewDirectBlock` / `TheMain::TLoader` / `TCardAsyncMsg` / 1 RAM | 7 |
 
-a. Pad allocation, keep stride: allocate 36 KiB physical (9 × 4 KiB)
-   per stack but keep the 32-KiB VA stride — last 4 KiB unmapped
-   between stacks.
-b. Force stack VA stride = 36 KiB: adjust per-task stack base so
-   adjacent stacks don't share a 4 KiB boundary.
+   `user_lr=0x00258efc` (inside `TUDomainManager::Get`) for ALL
+   aliases — the SWI is dispatched through Get's
+   `bl MonitorDispatchSWI` site as part of LockHeapRange's
+   per-page resolve-fault path.
 
-**Step 3 — Group-1 stage-2 RO trap.**
-Install a stage-2 RO trap on PA=0x04004000..0x04007000. Decode
-each AArch32 store fault, log `(PC, L2-entry-index, value)`, then
-commit the write. Once the (PC, entry, value) triples are captured,
-decide between (a) Einstein-port behaviour, (b) ROM patch that
-splits the self-map, or (c) hypervisor-synthesised second mapping.
+   Root cause confirmed: stack allocations via `TTask::Init →
+   NewStack → LockHeapRange` deliberately share 4 KiB boundary
+   pages between adjacent stacks (33-KiB usable on a 32-KiB VA
+   stride). ARMv4 subpage AP let each stack own 1 KiB of the
+   shared boundary; ARMv7 has no subpage AP, AP=011 makes both
+   stacks' VAs alias the same PA.
+
+### Next iteration — implement Option A (per-stack 4-KiB padding)
+
+Most-targeted fix: round up the size argument at the
+BL-NewStack site (`0x0025238c`) so each stack allocation grabs
+one extra 4-KiB page beyond the requested size. VA stride stays
+32 KiB; the extra page sits as guaranteed-unmapped padding
+between adjacent stacks → no shared boundary PA.
+
+Steps:
+
+1. Read `NewStack__FUlT1` at `0x001BD7BA4`. Decode args and how
+   the size flows. Verify whether patching `r1` at the
+   call-site (`0x00252384..0x00252388` adds `r1 = stack_size +
+   84`) to also `add r1, #4096` is sufficient, or whether the
+   size constant feeds elsewhere.
+2. Cross-check: the prior 36-KiB attempt that was reverted —
+   what specifically broke? See git log around
+   `26146947 trace-bisect FMNewStack 36-KiB patch` for the
+   failure mode.
+3. Apply the patch. Cold-boot. Expect `Prim ALIAS:` lines from
+   the `TTask::Init` paths to drop to 0.
+4. Re-run guest tests.
+
+Tail-distribution callers (heap creation, driver init, REx-
+resident shims) will likely still alias. Iterate on each in
+priority order once `TTask::Init` is clean.
+
+### Step Group-1 stage-2 RO trap (independent track)
+
+Group-1 aliases (PA=0x04004000-0x04006000, kernel-globals
+self-mapping) bypass the entire Remember/Prim layer — direct
+kernel L2 writes during TTBR0 setup. Plan: stage-2 RO trap on
+PA=0x04004000..0x04007000, decode each AArch32 store fault,
+log `(PC, L2-entry-index, value)`, commit the write. Decide
+fix layer once the triples are captured.
 
 Until aliases are zero, the alrt-task DABT and any other later wedge
 stays **deliberately not investigated**.

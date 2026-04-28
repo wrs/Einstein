@@ -1191,24 +1191,39 @@ ULong Get(TUDomainManager* this, ULong& out_pa, int count) {
 }
 ```
 
-`MonitorDispatchSWI` is `svc #0x1B`. The kernel SWI handler
-routes msg #5 to `PageMonProc__15TUDomainManagerFlPv` at
-`0x0025925C`, which is a vtable trampoline:
+`MonitorDispatchSWI` is `svc #0x1B`. `*0x0c104eec` is a
+**kernel monitor handle** (an integer ID, not a pointer);
+`StaticInit__15TUDomainManager` copies it in via
+`CopyObject__9TUMonitor`, which writes the handle directly to
+`this[0]`. The kernel SWI handler at `svc #0x1B` looks up the
+proc registered for that handle and calls it.
+
+`PageMonProc__15TUDomainManagerFlPv` at `0x0025925C` is **NOT**
+the allocator-side handler. It's the LOCAL `TUDomainManager`'s
+own monitor-procedure stub, run when this domain is itself
+called *as* a fault monitor:
 
 ```
-PageMonProc(monitor_obj, msg, args_buf):
+PageMonProc(this, msg, args_buf):
   if msg == 0x7FFFFFFF:               // init message
-      jump *(*monitor_obj + 8)        // = vtable[2] handler
-  else:                                // normal page request
-      jump *(*monitor_obj + 4)        // = vtable[1] handler
+      jump *(*this + 8)               // = vtable[2] handler
+  else:                                // normal call
+      jump *(*this + 4)               // = vtable[1] handler
 ```
 
-So the actual "give me a page" code is `vtable[1]` of the
-monitor object pointed to by `*0x0c104eec`. This vtable lives
-in kernel data and isn't statically disassembled. To inspect:
-runtime probe — read `*0x0c104eec` at boot, walk `[+0]` to
-vtable, dereference `[+4]` for the handler PC, then grep
-`rom.dis` for that PC.
+The page-allocator handler that produces a fresh PA on the OTHER
+side of the SWI is registered into the global page-monitor at
+runtime by `RegisterPageMonitor__15TUDomainManagerSFv` (at
+`0x00259094`) via `MonitorDispatchSWI(*0x0c104eec, msg=3, ...)`.
+The actual allocator proc lives in kernel-mode code reached via
+that registration; it is not directly visible in `rom.dis` (kernel
+runtime registration, not a static constant).
+
+To inspect it, add a hypervisor-side `svc #0x1B` trap that
+filters on `r0 == *0x0c104eec && r1 == 5` and logs the (caller,
+args_in, returned_PA) tuple per call. See PLAN.md "Static
+analysis dead end — proceed via runtime probe" for the full
+plan.
 
 ### Where aliasing actually originates
 

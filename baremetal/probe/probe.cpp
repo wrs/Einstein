@@ -619,6 +619,47 @@ void task_dump_save_area(TMemory* mem, KUInt32 task_va) {
 	std::fflush(stdout);
 }
 
+// Dump 128 bytes of a heap header at `heap_va` (which equals base+16
+// for a Newton heap; the caller passes 0x0ca6b010 for the legitimate
+// RelocHeap created by NewHeap call #3, base=0x0ca6b000). Cross-check
+// for baremetal/INVESTIGATION.md's "current stop": our hypervisor sees
+// heap[+0]=0x002dd804 + further header corruption; this lets us see
+// what Einstein has at the same VA at the equivalent boot offset.
+//
+// Reads via ReadAligned (i.e. through the kernel's stage-1 view —
+// same VA the kernel itself would dereference). On a Newton heap the
+// invariants are heap[+0]=heap-16, heap[+8]=0x736b6961 ('skia' magic,
+// little-endian).
+void heap_header_dump(TMemory* mem, KUInt32 heap_va) {
+	KUInt32 magic_at_8 = 0;
+	td_read(mem, heap_va + 8, magic_at_8);
+	std::fprintf(stdout,
+		"heap-dump @ VA=0x%08x  magic[+8]=0x%08x  %s\n",
+		heap_va, magic_at_8,
+		magic_at_8 == 0x736b6961u ? "(skia magic OK)" :
+		magic_at_8 == 0u          ? "(zero - heap not yet created)" :
+		                            "(*** unexpected magic ***)");
+	for (int off = 0x00; off < 0x80; off += 16) {
+		KUInt32 w[4] = {0,0,0,0};
+		td_read(mem, heap_va + off + 0,  w[0]);
+		td_read(mem, heap_va + off + 4,  w[1]);
+		td_read(mem, heap_va + off + 8,  w[2]);
+		td_read(mem, heap_va + off + 12, w[3]);
+		std::fprintf(stdout,
+			"  heap[+0x%02x]  0x%08x 0x%08x 0x%08x 0x%08x\n",
+			off, w[0], w[1], w[2], w[3]);
+	}
+	// Also resolve VA -> PA so we can see whether Einstein's heap
+	// hops backing pages the way ours does (PA 0x0401f000 ->
+	// 0x04032000 across boot).
+	KUInt32 pa = 0;
+	bool fault = mem->TranslateR(heap_va, pa);
+	std::fprintf(stdout,
+		"  heap-dump VA->PA: VA 0x%08x -> PA 0x%08x  (fault=%d)\n",
+		heap_va, pa, fault ? 1 : 0);
+	std::fflush(stdout);
+}
+
 void usage(const char* argv0) {
 	std::fprintf(stderr,
 		"usage: %s <rom.bin> [rex.bin|-] [wall-seconds]\n"
@@ -694,6 +735,11 @@ int main(int argc, char** argv) {
 			// we can see (a) whether the saved sp_usr matches and (b)
 			// what's in the user stack at that VA.
 			task_dump_save_area(emu.GetMemory(), 0x0c118dd8u);
+			// Cross-check the RelocHeap header at the legitimate
+			// VA=0x0ca6b010 (NewHeap #3, base=0x0ca6b000, size=2 MiB).
+			// On baremetal this header gets corrupted partway through
+			// boot — see baremetal/INVESTIGATION.md current stop.
+			heap_header_dump(emu.GetMemory(), 0x0ca6b010u);
 			next_dump += std::chrono::seconds(2);
 			++dump_n;
 		}

@@ -57,6 +57,16 @@ use crate::guest_mem;
 use crate::kprintln;
 use crate::trap::{self, TrapContext};
 
+/// Per-PC log budgets for the `MakeStoreObject` probes. Each probe is a
+/// re-armed marker UDF (no ROM mutation per hit), so we can keep them
+/// installed cheaply for the whole boot. We still cap the kprintln
+/// volume at the early hits — by the time newt diverges from Einstein,
+/// the first ~30 calls per probe are enough to localise the issue.
+static NEWSTACK_EXIT_HITS: AtomicU32 = AtomicU32::new(0);
+static SETCURHEAP_HITS:    AtomicU32 = AtomicU32::new(0);
+static NEWHEAP_HITS:       AtomicU32 = AtomicU32::new(0);
+const PROBE_LOG_LIMIT: u32 = 32;
+
 /// Max number of live breakpoints at once.
 pub const TABLE_SIZE: usize = 16;
 
@@ -323,6 +333,109 @@ pub fn handle_user_bp_und(
             return false;
         }
     };
+
+    // `NewHeap` entry probe at ROM 0x00310e24
+    // (`mov ip, sp` — 0xe1a0c00d). r0 holds the new heap's RAM base
+    // (the function returns r7 = r0 + 16 to the caller). If we ever
+    // see r0 = 0x0ca6b000, that's the moment the bogus RelocHeap got
+    // created in a real allocation pass.
+    if faulting_pc == 0x0031_0e24 {
+        let cpsr = spsr_und as u32;
+        let r0 = ctx.x[0] as u32;
+        let n = NEWHEAP_HITS.fetch_add(1, Ordering::Relaxed);
+        if n < PROBE_LOG_LIMIT || r0 == 0x0ca6_b000 {
+            let lr_idx = crate::banked::lr_slot_for_mode(cpsr);
+            kprintln!(
+                "probe: NewHeap#{} mode={:#x} r0(base)={:#010x} r1(size)={:#010x} r2={:#010x} lr={:#010x}",
+                n, cpsr & 0x1F,
+                r0, ctx.x[1] as u32, ctx.x[2] as u32,
+                ctx.x[lr_idx] as u32,
+            );
+        }
+        // Original insn = `mov ip, sp` (= ARM r12 := r13). ip is X12 in
+        // banked context; sp is the source-mode SP per Table D1-79.
+        let sp = crate::banked::sp_for_mode(ctx, cpsr);
+        ctx.x[12] = sp as u64;
+        lock();
+        // SAFETY: re-occupy slot.
+        unsafe {
+            let table = &mut *core::ptr::addr_of_mut!(TABLE);
+            table[slot_idx] = Slot { ipa: faulting_pc, orig: s.orig };
+        }
+        unlock();
+        trap::return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+        return true;
+    }
+
+    // `__ct__9TRefStackFv` post-NewStack probe at ROM 0x001a4948
+    // (`add sp, sp, #4`). Logs the NewStack return register r0 and the
+    // mode SP / LR to localise where the bogus heap pointer enters
+    // newt's globals. Emulates the original instruction so the marker
+    // UDF stays armed for every subsequent invocation.
+    if faulting_pc == 0x001a_4948 {
+        let cpsr = spsr_und as u32;
+        let n = NEWSTACK_EXIT_HITS.fetch_add(1, Ordering::Relaxed);
+        if n < PROBE_LOG_LIMIT {
+            let sp_idx = crate::banked::sp_slot_for_mode(cpsr);
+            let lr_idx = crate::banked::lr_slot_for_mode(cpsr);
+            kprintln!(
+                "probe: TRefStack-NewStack-exit#{} mode={:#x} r0={:#010x} r4={:#010x} sp={:#010x} lr={:#010x}",
+                n, cpsr & 0x1F,
+                ctx.x[0] as u32, ctx.x[4] as u32,
+                ctx.x[sp_idx] as u32, ctx.x[lr_idx] as u32,
+            );
+        }
+        // Emulate `add sp, sp, #4` against the source mode's SP.
+        let sp_idx = crate::banked::sp_slot_for_mode(cpsr);
+        ctx.x[sp_idx] = (ctx.x[sp_idx] as u32).wrapping_add(4) as u64;
+        lock();
+        // SAFETY: LOCK gives exclusive access; re-occupy the slot the
+        // dispatcher freed at the top of this fn.
+        unsafe {
+            let table = &mut *core::ptr::addr_of_mut!(TABLE);
+            table[slot_idx] = Slot { ipa: faulting_pc, orig: s.orig };
+        }
+        unlock();
+        trap::return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+        return true;
+    }
+
+    // `SetCurrentHeap` entry probe at ROM 0x00142df0
+    // (`ldr r1, [pc, #40]`). r0 holds the heap pointer being installed
+    // into the current task's globals[-16]. The wedge happens because
+    // GetCurrentHeap returns 0x0ca6b010 — which is NOT a real heap. If
+    // SetCurrentHeap is ever called with that pointer, it's the source.
+    if faulting_pc == 0x0014_2df0 {
+        let cpsr = spsr_und as u32;
+        let r0 = ctx.x[0] as u32;
+        let n = SETCURHEAP_HITS.fetch_add(1, Ordering::Relaxed);
+        // Always log when r0 matches the wedge's bogus heap, regardless
+        // of the cap — the whole point of this probe is to find that
+        // exact moment.
+        if n < PROBE_LOG_LIMIT || r0 == 0x0ca6_b010 {
+            let lr_idx = crate::banked::lr_slot_for_mode(cpsr);
+            kprintln!(
+                "probe: SetCurrentHeap#{} mode={:#x} r0(heap)={:#010x} lr={:#010x}",
+                n, cpsr & 0x1F,
+                r0, ctx.x[lr_idx] as u32,
+            );
+        }
+        // Emulate `ldr r1, [pc, #40]` — PC at execution = pc+8, so the
+        // word loaded is at faulting_pc + 8 + 40. The ROM literal at
+        // 0x142e20 is `0x0c10102c` (a g-pointer constant).
+        let lit_addr = faulting_pc.wrapping_add(48);
+        let lit = guest_mem::read_word_va(lit_addr).unwrap_or(0);
+        ctx.x[1] = lit as u64;
+        lock();
+        // SAFETY: same as above — re-occupy the slot.
+        unsafe {
+            let table = &mut *core::ptr::addr_of_mut!(TABLE);
+            table[slot_idx] = Slot { ipa: faulting_pc, orig: s.orig };
+        }
+        unlock();
+        trap::return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+        return true;
+    }
 
     // SearchFreeList `ldr r3, [r0]` (ROM 0x00313308) fast path. Emulate
     // the load in EL2 instead of restoring the ROM word — that way the

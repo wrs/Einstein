@@ -128,6 +128,18 @@ pub extern "C" fn kmain() -> ! {
     // heap header + freelist chain and halts.
     let rc = guest_bp::install_guest_bp(0x0031_3308);
     kprintln!("guest_bp: SearchFreeList tripwire install rc={}", rc);
+    // Upstream probes for the "bogus current heap" investigation.
+    // 0x001a4948 = `__ct__9TRefStackFv` instr right after `bl NewStack`
+    // (logs r0 = stack base or 0 on failure). 0x00142df0 = SetCurrentHeap
+    // entry (logs r0 = the heap pointer being installed into the current
+    // task's globals[-16]). Both stay armed via slot re-occupation in
+    // handle_user_bp_und so every call is logged (capped at 32 lines).
+    let rc = guest_bp::install_guest_bp(0x001a_4948);
+    kprintln!("guest_bp: TRefStack-NewStack-exit probe install rc={}", rc);
+    let rc = guest_bp::install_guest_bp(0x0014_2df0);
+    kprintln!("guest_bp: SetCurrentHeap probe install rc={}", rc);
+    let rc = guest_bp::install_guest_bp(0x0031_0e24);
+    kprintln!("guest_bp: NewHeap entry probe install rc={}", rc);
     kprintln!();
     kprintln!("Entering Newton ROM...");
 

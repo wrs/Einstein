@@ -42,7 +42,103 @@ quiesces on the same path without ever getting there.
 
 ## Pending follow-ups
 
-### Bus-error origin pinned to PC=0x00313308, FAR=0xe52d006c (2026-04-27, evening)
+### `0x0ca6b010` is the legitimate RelocHeap; its header is the corruption (2026-04-27, late)
+
+NewHeap-entry / SetCurrentHeap-entry / TRefStack-NewStack-exit probes
+(`src/guest_bp.rs::handle_user_bp_und`, installed from `kmain`)
+disambiguate where the bogus heap pointer enters the system. Cold boot
+log `/tmp/run-probe.log`:
+
+**NewHeap is called 7 times.** Bases and sizes:
+
+| #  | base       | size       | caller-lr  |
+|----|------------|------------|------------|
+| 0  | 0x0c200c00 | 1 MiB      | 0x001423f8 |
+| 1  | 0x0c600c00 | 3.5 MiB    | 0x001423f8 |
+| 2  | 0x0c984000 | 896 KiB    | 0x001423f8 |
+| 3  | **0x0ca6b000** | **2 MiB** | 0x001423f8 |
+| 4  | 0x0d601000 | 1.003 MiB  | 0x001423f8 |
+| 5  | 0x0d601000 | 1.027 MiB  | 0x00142908 |
+| 6  | 0x0ccac800 | 50 KiB     | 0x001423f8 |
+
+Heap #3's header lives at `0x0ca6b010` (= base + 16). Immediately
+after creation, NewHeap calls `SetCurrentHeap(0x0ca6b010)` from
+`lr=0x00310e60` (the entry switch inside NewHeap). So `0x0ca6b010`
+is **the legitimate RelocHeap pointer**, not a wild value.
+
+**SetCurrentHeap is called many times with `r0=0x0ca6b010`.** Caller
+LRs (and the function each LR sits in):
+
+- 0x00141c40 — inside `NewHandle`'s heap-switch sequence
+- 0x001415d4 — `NewHandle` immediately after `bl SetHeap`
+- 0x0031325c, 0x003132cc — `CompactHeap` save/restore around its body
+- 0x00141ef0 — inside `HUnlock`
+
+So the kernel actively switches to RelocHeap during normal handle
+allocation and compaction. The wedge isn't "bogus pointer in
+globals[-16]" — it's that the heap's content has been corrupted.
+
+**TRefStack-NewStack-exit fires 3 times before the wedge**, each time
+with `r0=0` (= success per `TRefStackFv` ctor's `teq r0,#0; beq` at
+0x1a4950). So NewStack is functioning correctly — the SVC-return path
+is intact and stack growth is happening.
+
+**The corrupted heap header at 0x0ca6b010 (128 bytes):**
+
+```
++0x00  0x002dd804 0x001a48f0 0x0c645f0c 0x0cc825d8
++0x10  0x00000000 0x0cc825e0 0x0cc82510 0x0cc82038
++0x20  0x002dfa20 0x002dd7c4 0x0c6437b4 0x0cd51800
++0x30  0x0cd51800 0x0cd51c98 0x0000012c 0x00000001
++0x40  0x00000040 0x0c9842b4 0x002dfa20 0x00000000
++0x50  0x00000000 0x00000000 0x00000000 0x00000000
++0x60  0x00000000 0x0c116e7c 0x00000000 0x00000000
++0x70  0x00000000 0x00000000 0x00000000 0x00000000
+```
+
+`+0x40 = 0x40` matches NewHeap-init's `r0 = #64; str r0, [r7, #64]`.
+`+0x64 = 0x0c116e7c` is the heap-store TULockingSemaphore wrapper.
+`+0x44 = 0x0c9842b4` is a pointer into NewHeap #2's region. So the
+heap was correctly initialised at one point.
+
+The corruption is concentrated in `+0x00..+0x14` (looks like saved
+ROM PCs / stack pointers) and `+0x48`/`+0x60` (freelist position
+clobbered to a ROM PC = `0x002dfa20`). SearchFreeList walks the
+freelist starting at `heap[+72] = 0x002dfa20` and dereferences
+`*0x002dfa24 = 0xe52d006c` (= encoding of `str r0, [sp, #-108]!`),
+which is what causes FAR=0xe52d006c.
+
+Newt's actual user stack is at 0x0cc82xxx (sp_usr=0x0cc81f04 at the
+fault). The RelocHeap is at 0x0ca6b000..0x0cc6b000 (2 MiB). They
+do **not** overlap — the corruption isn't direct stack/heap aliasing.
+
+Diagnostic scaffolding installed (all stay armed via re-occupy-slot
+in `handle_user_bp_und`; capped at 32 lines per probe but
+unconditionally log on the wedge-relevant matches `r0=0x0ca6b010` for
+SetCurrentHeap and `r0=0x0ca6b000` for NewHeap):
+
+- `0x00313308` SearchFreeList wild-r0 dump (halt)
+- `0x001a4948` TRefStack post-NewStack r0/r4/sp/lr
+- `0x00142df0` SetCurrentHeap entry r0/lr
+- `0x00310e24` NewHeap entry r0(base)/r1(size)/lr
+
+Concrete next steps:
+
+1. Identify the WRITE that lands `0x002dd804` at heap[+0]. Add a stage-2
+   write-watch on `0x0ca6b010..0x0ca6b020` (or a guest-side gdb
+   data-breakpoint via QEMU's WP) that fires on the first store.
+   Cross-check the writing PC against a function that thinks it's
+   pushing a stack frame.
+2. Walk the heap once at NewHeap-exit (extra probe) and again at the
+   first SearchFreeList hit on RelocHeap to bracket when the
+   corruption appears in time.
+3. Run Einstein at the same boot offset and dump the equivalent heap
+   region for comparison. If Einstein's RelocHeap survives, the bug
+   is hypervisor-side (stage-2 mapping / aliasing); if Einstein
+   corrupts it the same way, it's a ROM-level data-flow bug we need
+   to mirror or work around.
+
+### Earlier: Bus-error origin pinned to PC=0x00313308, FAR=0xe52d006c (2026-04-27, evening)
 
 Cold-boot-with-quiet log (`/tmp/run-quiet.log`) plus a hypervisor-side bp
 at SearchFreeList's `ldr r3, [r0]` (ROM 0x00313308; install in `kmain`,

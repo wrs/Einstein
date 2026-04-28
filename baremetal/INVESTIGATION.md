@@ -126,6 +126,38 @@ RUNNING in the first place.** Next iteration should diff our
 scheduler / port / message-delivery state vs. Einstein's around the
 alrt task entry.
 
+## Wedge-time task census added to Reboot canary (2026-04-28)
+
+Hooked `task_dump::dump()` into the Reboot canary handler in
+`src/trap.rs` so every wedge prints the full task census, run
+queue, and blocked-task savedPC table. Comparison at wedge:
+
+```
+[RUN] alrt  id=0x1d43 prio=10  flags=0x2000000  q=0/0 wq1=0/0 wq2=0/0
+[RDY] cdsv  id=0x2113 prio=10  (in prio-10 queue)
+[RDY] drvl  id=0x1823 prio=10  (in prio-10 queue)
+[BLK] {OBJM, idle, PMGR, PTBL, STKF, STKP, STKU, cdpr, mntr,
+       pg&e, ROMF, ROMP, sndm, Tmux, mntr (2nd), name, pckm, cmgr,
+       ????}
+```
+
+22 tasks total (vs Einstein's 27 at steady-state idle). All
+prio-10 user tasks (cdsv, drvl) are RDY behind alrt; this is the
+runqueue contention. The bitmap is `0x400` (bit 10 set), so the
+scheduler picks the prio-10 queue → alrt gets dequeued first
+(ahead of cdsv/drvl due to insertion order). Once alrt is
+selected, its savedPC = `0x3AE230 (PortReceiveSWI)` resumes; the
+SWI returns from the kernel, and the userland code path
+(`Receive__6TUPort` jump-table → caller's event-loop frame →
+TAlertEventHandler::IdleProc → CheckAlertDone → CheckButton) takes
+over. Crash on `ldr r0, [r0, #12]` with the junk this.
+
+**The actionable signal:** alrt was parked in Receive, then
+received a message that woke it. We need to identify that message
+(sender + content). Without that, "alrt is RUN on us, BLK on
+Einstein" is just a divergence symptom; the trigger is the message
+itself. Next iteration: probe `Receive__6TUPort` filtered by alrt.
+
 ## Faulting site decoded — `CheckButton__12TAlertDialogFv` reading `this->[+12]` with this=0xE3360000 (2026-04-28)
 
 This iteration's deeper diagnosis (without code changes) localised

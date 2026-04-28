@@ -184,9 +184,15 @@ NOTE: Fix all compiler warnings before committing, to keep context clean.
 
 The heap-aliasing wedge is resolved (see "Resolved stops"
 table). With each VM heap now exclusively owning whole 4 KiB
-pages, the boot progresses ~5900 trace lines further. The new
-terminus is a Reboot canary fired by the kernel's exception
-unwinder:
+pages, the boot progresses ~5900 trace lines further. **A
+follow-up sweep (2026-04-28) audited every other 1-KiB
+allocator in the ROM** — see `docs/STRUCTURES.md`
+"## TStackManager" — and patched the only remaining one
+(`ZapHeap` at `0x001428B8`). All 29 LockHeapRange callers,
+TStackInfo / TStackPage layouts, and FMLockHeapRange / ResolveFault
+internals are now documented. The wedge below persists, so it has
+a different root cause than 1-KiB-chunking. The new terminus is a
+Reboot canary fired by the kernel's exception unwinder:
 
 ```
 DAH-OR[5]: far=0xe336000c curr_task=0x0c115db4 (= alrt task)
@@ -549,6 +555,7 @@ Concrete next steps:
 
 | Date | Wedge | Resolution |
 |------|-------|------------|
+| 2026-04-28 | 1-KiB allocator audit (preventative; not a wedge) | Final 1-KiB site closed: `ZapHeap` at `0x001428B8` (`moveq r4, #1024 → mov r4, #4096`). Full catalogue of FMLockHeapRange ABI, TStackInfo / TStackPage layouts, and the 29 LockHeapRange callers documented in `docs/STRUCTURES.md` "## TStackManager". Boot reaches the same alrt-task wedge — the wedge has a different root cause than subpage-AP. |
 | 2026-04-28 | RelocHeap (heap #3) header corruption: stack-grow assigns newt's user stack to PA shared with heap #3, ARMv7's flat AP=011 (post-`fix_stage1_xn_bits`) lets stack writes spill into the heap struct subpage | Two-patch surgery forces every VM heap to allocate / extend in 4-KiB chunks instead of 1-KiB subpages: `0x310E38: mov r6, r2 → mov r6, #4096` (NewHeap chunk_size) + `0x1423A0: beq → nop` (NewVMHeap 4 KiB-init path). Each heap exclusively owns whole pages; no subpage sharing with stacks. Boot progresses ~5900 trace lines past the wedge to a NEW stop (Reboot canary, alrt task). |
 | 2026-04-27 | NULL-pointer SWP via `Swap(0,1)` at ROM `0x3ae204` (kernel `Acquire(NULL)` glue inside `VccOff__FiUl`) — stage-2 perm fault on write to ROM aperture, ISV=0 | trap.rs `try_absorb_rom_write`: mirror Einstein `TMemory::WriteP` (TMemory.cpp:1755-1766), drop the store; for SWP/SWPB also run the load piece into Rd. Boot reached steady-state idle. Test: `guest-tests/tests/test_swp_rom_aperture.S`. |
 | 2026-04-27 | TEncodingMap.+16 = 0x20000110 (out-of-stage-2 IPA) at `ConvertToUnicodeFunc_Contiguous8` | mmio.rs: `0x20000000..0x30000000` "unknown bank #5" silent-zero matching Einstein's `TMemory::ReadP` (TMemory.cpp:1026-1034). Boot advanced 10× → reaches TInterpreter. |

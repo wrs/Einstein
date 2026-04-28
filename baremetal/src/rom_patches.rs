@@ -130,6 +130,25 @@ const PATCHES_717006: &[RomPatch] = &[
     //     internal alignment likely accommodates this; if not,
     //     we'll need a third patch making the addne unconditional.
     RomPatch { offset: 0x0014_23A0, value: 0xE1A0_0000, name: "NewVMHeap: force 4 KiB init path (nop branch)" },
+    // ZapHeap (0x00142844) builds a heap on top of a heap-area produced
+    // by GetHeapAreaInfo. When the caller passes a flag byte of 0
+    // (the common case), `0x001428B8 moveq r4, #1024` (`0x03A04B01`)
+    // sets r4 = 1 KiB, which then drives both the initial
+    // SetHeapLimits / LockHeapRange / UnlockHeapRange round-trip
+    // (locking only a 1-KiB sliver at the heap base) and the
+    // chunk_size argument to the subsequent NewHeap. The NewHeap
+    // chunk_size gets force-overridden to 4096 by the patch above,
+    // but the initial 1-KiB lock leaves only one of the page's four
+    // 1-KiB subpages claimed under ARMv7's flat AP=011 — the other
+    // three subpages are nominally unowned and could leak ownership
+    // to other allocators. Mirror the existing NewHeap encoding
+    // (`mov r6, #4096` = `0xE3A0_6A01`) but for r4: `mov r4, #4096`
+    // = `0xE3A0_4A01`. The companion `movne r4, #4096` at
+    // `0x001428BC` becomes a no-op (still sets r4 = 4096 when the
+    // flag arm is taken — same value our patch produces). See
+    // `docs/STRUCTURES.md` "1-KiB allocator audit" for the full
+    // catalogue of 1-KiB sites.
+    RomPatch { offset: 0x0014_28B8, value: 0xE3A0_4A01, name: "ZapHeap: force chunk/lock size = 4096" },
     // Force exclusive per-stack page allocation by short-circuiting
     // `TStackManager::GetMatchingPage` to always return 0 (= "no
     // shareable page found"). This forces every `FindOrAllocPage` call
@@ -253,6 +272,43 @@ const FAULT_BL_RESOLVE_PC: u32 = 0x001F_84E0;
 /// PC of the `bl ResolveFault` call inside `FMLockHeapRange`. Same
 /// retarget so all `ResolveFault` invocations go through the wrapper.
 const FMLOCK_BL_RESOLVE_PC: u32 = 0x001F_6B94;
+
+/// `LockHeapRange` (caller-side glue at 0x001F_8AB4) and
+/// `UnlockHeapRange` (0x001F_8B88) — the two ABI entry points whose
+/// `(base, limit, lock_id?)` parms are forwarded to FMLockHeapRange /
+/// FMUnlockHeapRange via SafeUserRequestEntry req-ids 6 and 7.
+///
+/// We patch each function's first instruction (`mov ip, sp`) with a
+/// `b WRAPPER`. The wrapper aligns r0 (base) DOWN to a 4-KiB boundary
+/// and r1 (limit) UP to a 4-KiB boundary, then re-enters the real
+/// function at +4 (skipping the patched-out `mov ip, sp` after
+/// replicating it locally).
+///
+/// Why: the kernel's design partitions a 4-KiB physical page into
+/// four 1-KiB subpages, each VA-owned by a different heap/stack/driver
+/// object via ARMv4 subpage-AP. ARMv7 has no subpage-AP — once we
+/// flatten to AP=011 (full RW), any user write hits all four subpages.
+/// FMLockHeapRange's per-1-KiB-subpage `ResolveFault` iteration
+/// happily allocates subpage 1 of an existing page to a different
+/// owner than subpage 0; that's the bug. Forcing every caller's range
+/// to a 4-KiB boundary makes FMLockHeapRange iterate exactly four
+/// times per page, claiming all four subpages for ONE owner. The
+/// `page_table[page_index]` slot then names a page exclusively owned
+/// by that caller; subsequent callers asking for adjacent VA pages
+/// can't accidentally land on the same physical page.
+///
+/// This SUBSUMES the per-call-site fix (29 distinct LockHeapRange
+/// callers) and matches the existing NewHeap/NewVMHeap chunk_size=4096
+/// patches at the heap-allocation layer.
+const LOCK_HEAP_RANGE_PC: u32 = 0x001F_8AB4;
+const UNLOCK_HEAP_RANGE_PC: u32 = 0x001F_8B88;
+const LOCK_HEAP_RANGE_WRAPPER_PC: u32 = 0x00FF_FD80;
+const UNLOCK_HEAP_RANGE_WRAPPER_PC: u32 = 0x00FF_FDB0;
+
+/// The original first word of LockHeapRange / UnlockHeapRange — the
+/// standard `mov ip, sp` AArch32 prologue. Asserted at install time so
+/// any future ROM build that shifts the function entries fails loudly.
+const LOCK_UNLOCK_ORIG_FIRST_INSN: u32 = 0xE1A0_C00D;
 
 // ---- L1[0xCD] lazy-grow investigation probes (2026-04-26) -----------------
 //
@@ -515,6 +571,17 @@ pub unsafe fn apply_717006_patches(rom_ptr: *mut u32) {
         apply_reboot_trap(rom_ptr);
         apply_bootos_trap(rom_ptr);
         apply_resolve_fault_wrapper(rom_ptr);
+        // `apply_lock_heap_range_wrapper` stays in the source for
+        // reference but is NOT installed. The 4-KiB-rounding wrapper at
+        // LockHeapRange/UnlockHeapRange entry corrupts adjacent
+        // allocations because FMLockHeapRange's `parms[+8] != 0`
+        // flag-set loop writes `[TStackPage+subpage]+44 = 1` for the
+        // widened range, pinning subpages owned by OTHER stack_infos
+        // (Pattern A driver inits use lock_id=1; see
+        // `docs/STRUCTURES.md` "TStackManager"). The right fix is
+        // per-allocator (see ZapHeap patch in PATCHES_717006); the
+        // wrapper itself is the wrong layer.
+        let _ = apply_lock_heap_range_wrapper;
         apply_l1_cd_probes(rom_ptr);
     }
 
@@ -1035,6 +1102,83 @@ unsafe fn apply_resolve_fault_wrapper(rom_ptr: *mut u32) {
         // See INVESTIGATION.md for that diagnostic run.)
         let _ = FMLOCK_BL_RESOLVE_PC;
 
+    }
+}
+
+/// Install the LockHeapRange / UnlockHeapRange entry-point wrappers
+/// that round (base, limit) to 4-KiB boundaries before the original
+/// function body runs. See the constant doc-comments at
+/// `LOCK_HEAP_RANGE_PC` for the full rationale.
+///
+/// Wrapper layout (9 words = 36 bytes per stub):
+///   +0x00  mov  ip, sp                ; replicate patched-out 1st insn
+///   +0x04  lsr  r0, r0, #12           ; r0 = base & ~0xFFF (align down)
+///   +0x08  lsl  r0, r0, #12
+///   +0x0c  sub  r1, r1, #1            ; r1 = end_inclusive (orig limit-1)
+///   +0x10  orr  r1, r1, #0xC00        ; |= bits 10-11 (subpage 3 marker)
+///   +0x14  orr  r1, r1, #0x3F0        ; |= bits 4-9
+///   +0x18  orr  r1, r1, #0x0F         ; |= bits 0-3
+///   ;      r1 is now (end_inclusive | 0xFFF) — last byte of the 4-KiB
+///   ;      page that contains the caller's original end.
+///   +0x1c  add  r1, r1, #1            ; restore "limit" form (one past end)
+///   +0x20  b    <function entry>+4    ; rejoin at second instruction
+///
+/// The 0xFFF mask is split into 0xC00 + 0x3F0 + 0x0F because ARMv7's
+/// 8-bit-rotated immediate encoding can't represent 0xFFF in a single
+/// op. The three pieces are individually encodable:
+///   - 0xC00: imm8=0x0C, rot_imm=12 → ROR(0x0C, 24) = 0xC00
+///   - 0x3F0: imm8=0x3F, rot_imm=14 → ROR(0x3F, 28) = 0x3F0
+///   - 0x0F:  imm8=0x0F, rot_imm=0  → 0x0F
+///
+/// **Why both LockHeapRange AND UnlockHeapRange are patched.** The
+/// kernel's lock/unlock invariant requires the unlock range to match
+/// the lock range exactly. If we widen the lock to 4 KiB but leave
+/// the unlock at 1-KiB granularity, the extra subpages stay locked
+/// indefinitely. Symmetric patching keeps the kernel's per-subpage
+/// refcounts balanced.
+unsafe fn apply_lock_heap_range_wrapper(rom_ptr: *mut u32) {
+    let stub_template: [u32; 9] = [
+        0xE1A0_C00D,                                                    // +0x00 mov ip, sp
+        0xE1A0_0620,                                                    // +0x04 lsr r0, r0, #12
+        0xE1A0_0600,                                                    // +0x08 lsl r0, r0, #12
+        0xE241_1001,                                                    // +0x0c sub r1, r1, #1
+        0xE381_1C0C,                                                    // +0x10 orr r1, r1, #0xC00
+        0xE381_1E3F,                                                    // +0x14 orr r1, r1, #0x3F0
+        0xE381_100F,                                                    // +0x18 orr r1, r1, #0x0F
+        0xE281_1001,                                                    // +0x1c add r1, r1, #1
+        0,                                                              // +0x20 b function+4 (filled in)
+    ];
+
+    for (wrapper_pc, fn_pc, name) in [
+        (LOCK_HEAP_RANGE_WRAPPER_PC,   LOCK_HEAP_RANGE_PC,   "LockHeapRange"),
+        (UNLOCK_HEAP_RANGE_WRAPPER_PC, UNLOCK_HEAP_RANGE_PC, "UnlockHeapRange"),
+    ] {
+        let mut stub = stub_template;
+        stub[8] = arm_b(wrapper_pc + 0x20, fn_pc + 4);
+
+        unsafe {
+            for (i, w) in stub.iter().copied().enumerate() {
+                let idx = ((wrapper_pc + (i as u32) * 4) / 4) as usize;
+                rom_ptr.add(idx).write(w);
+            }
+
+            let fn_idx = (fn_pc / 4) as usize;
+            let prev = rom_ptr.add(fn_idx).read();
+            if prev != LOCK_UNLOCK_ORIG_FIRST_INSN {
+                kprintln!(
+                    "rom_patch: ERROR — {} first word is {:#010x}, expected {:#010x}; \
+                     skipping 4-KiB wrapper",
+                    name, prev, LOCK_UNLOCK_ORIG_FIRST_INSN,
+                );
+                continue;
+            }
+            let branch = arm_b(fn_pc, wrapper_pc);
+            rom_ptr.add(fn_idx).write(branch);
+            kprintln!(
+                "rom_patch: {:#010x}: {:#010x} -> {:#010x}  ({} → 4-KiB wrapper @{:#x})",
+                fn_pc, prev, branch, name, wrapper_pc,
+            );
+        }
     }
 }
 

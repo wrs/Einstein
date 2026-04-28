@@ -886,6 +886,242 @@ b   SemOp                    ; → BlockOnInc complement (count++)
 `TUSemaphoreOpList::Init`). Acquire is `subtract 1` (block on
 count<0); Release is `add 1` (wake on count≥0).
 
+## TStackManager — heap / stack page allocator
+
+**Why this matters for Phase B.** The 717006 kernel was built for
+ARMv4 and uses ARMv4 *subpage-AP* (per-1-KiB AP encoding within a 4-KiB
+page) to put up to four 1-KiB-owned objects on a single physical page,
+relying on hardware to fault on cross-subpage user writes. ARMv7 has no
+subpage-AP — once `fix_stage1_xn_bits` flattens every L2 entry to
+AP=011, all four subpages become RW for the same user mode and any
+cross-subpage write silently corrupts the neighbour. Forcing every
+allocator to chunk in whole 4-KiB pages restores isolation. This
+section catalogues the lock/unlock ABI, the kernel structures it
+mutates, and every allocator we've audited for 1-KiB chunking.
+
+### Locking ABI — `LockHeapRange` / `UnlockHeapRange`
+
+```c
+// Caller-side glue (jump-table-aliased at 0x01BD6B54 / 0x01BDDEA0)
+ULong LockHeapRange(void* base, void* limit, UByte lock_id);   // 0x001F8AB4
+ULong UnlockHeapRange(void* base, void* limit);                // 0x001F8B88
+```
+
+Both pack the args into a parms struct on the stack and hand off via
+`MonitorDispatchSWI` to a privileged TStackManager method:
+
+| caller | req-id | callee | parms shape |
+|--------|--------|--------|-------------|
+| `LockHeapRange`   | 6 | `FMLockHeapRange__13TStackManager` (`0x001F6B24`) | `{base, end_inclusive=limit-1, lock_id_byte}` (12 B) |
+| `UnlockHeapRange` | 7 | `FMUnlockHeapRange__13TStackManager` (`0x001F6C24`) | `{base, end_inclusive=limit-1}` (8 B) |
+
+Citations: `LockHeapRange` body `1f8ac0..1f8acc` (str r0; sub r0,r1,#1;
+str r0,[sp,#4]; strb r2,[sp,#8]); `UnlockHeapRange` body `1f8b94..1f8b9c`
+(same minus the strb).
+
+### TStackInfo (per-stack / per-heap allocator descriptor)
+
+The `r5` argument to FMLockHeapRange's loop and the `r5` argument to
+ResolveFault are both `TStackInfo*`. Decoded fields:
+
+```c
+struct TStackInfo {                  // total size unknown
+    // +0x00..+0x0f  unknown
+    TStackPage**  page_table;        // +0x10  array of TStackPage*, indexed by
+                                     //        page_idx = (FAR - base_va) / 4 KiB
+    ULong         base_va;           // +0x14  base VA of the stack/heap region
+    ULong         lower_bound;       // +0x18  inclusive lower-bound VA
+    ULong         upper_bound;       // +0x1c  exclusive upper-bound VA
+    // +0x20..+0x23  unknown
+    void*         domain_ptr;        // +0x24  THeapDomain* (used by RememberMappings)
+    // ...
+};
+```
+
+Citations:
+- `+0x10`: ResolveFault `1f79fc: ldr r0, [r5, #16]` then
+  `1f7a00: ldr r6, [r0, r7, lsl #2]` — load page_table base, then index
+  by `page_idx*4`.
+- `+0x14`: ResolveFault `1f79d8: ldr r1, [r5, #20]` then
+  `1f79dc: sub r0, r0, r1` — subtract base_va from FAR to get offset.
+- `+0x18`: ResolveFault `1f79c4: ldr r2, [r5, #24]` — lower-bound check.
+  Returns -10203 (`r0=37; subcc r0, r0, #10240`) if FAR < lower.
+- `+0x1c`: ResolveFault `1f79b0: ldr r2, [r5, #28]` — upper-bound check.
+  Returns -10204 if FAR ≥ upper.
+- `+0x24`: RememberMappings `1f8588: ldr r0, [r4, #36]!` (with r4 =
+  TStackInfo*) — Remember/Forget calls receive this as their domain.
+
+### TStackPage (per-physical-page bookkeeping)
+
+A `TStackPage*` lives in `TStackInfo->page_table[page_idx]` and tracks
+the four 1-KiB subpages of one 4-KiB physical page.
+
+```c
+struct TStackPage {                  // total size unknown (≥48 B)
+    // +0x00..+0x0f  unknown (page state / phys backing)
+    TStackInfo*   subpage_owner[4];  // +0x10  stride 4   (16 B)
+    UShort        subpage_info[4];   // +0x20  stride 2   (8 B)  — high byte = page_idx
+    UByte         subpage_lockcount[4]; // +0x28 stride 1 (4 B)  — refcount
+    UByte         subpage_flag[4];   // +0x2c  stride 1   (4 B)  — "don't page out"
+    // ...
+};
+```
+
+Citations:
+- `+0x10` (subpage_owner): `SetSubPageInfo` `1f85f8: add lr, r3, ip,
+  lsl #2; str r1, [lr, #16]!` (r3=page, ip=subpage_idx, r1=info).
+  ResolveFault `1f7a3c..40: add r0, r6, r8, lsl #2; ldr r9, [r0, #16]!`
+  reads back into r9.
+- `+0x20` (subpage_info): SetSubPageInfo `1f8600: add r1, r3, ip, lsl
+  #1` then `strb` at `+33` and `+32`. ResolveFault `1f7a48: ldr r2,
+  [r0, #32]; lsr r2, r2, #16` extracts the high half = page_idx.
+- `+0x28` (subpage_lockcount): UnlockSubPagesBetween `1f7100: ldrb
+  sl, [r6, #40]; sub sl, sl, #1; strb sl, [r6, #40]` — decrement
+  on unlock; ResolveFault `1f7ac4..d0: ldrb r1, [r0, #40]; add r1,
+  r1, #1; strb r1, [r0, #40]` increments on resume.
+- `+0x2c` (subpage_flag): FMLockHeapRange flag-set `1f6c04: strb r1,
+  [r0, #44]` writes 1; UnlockSubPagesBetween `1f7110: streq r0, [r6,
+  #44]` clears to 0 once lockcount hits 0. Semantic: subpage is pinned
+  in memory while non-zero.
+
+### FMLockHeapRange iteration (ROM `0x001F6B24`)
+
+```
+1f6b58..6c  lsr/lsl #10 — align r9=base, r8=end_inclusive DOWN to 1 KiB
+1f6b88..c8  main loop:                       ; per-1-KiB step over [r9, r8]
+              ResolveFault(this, info)        ; FAR set via [info[+64]][+68]
+              on first-iter failure → return
+              on later failure → UnlockSubPagesBetween(prefix); return
+              advance r6 += 1024
+1f6bcc..14  if (parms[+8] /* lock_id */ != 0):
+              for (subpage in [r9, r8] step 1024)
+                offset = subpage - info->base_va
+                page_idx = (offset >> 10) >> 2
+                page = info->page_table[page_idx]
+                page[+44 + (subpage_idx & 3)] = 1   ; pin subpage
+```
+
+The main loop allocates / claims subpages via ResolveFault; the
+flag-set loop pins them against paging. Both consume the same
+1-KiB-aligned (r9, r8) range — which is why widening at the
+LockHeapRange entry point is unsafe (the flag loop would pin subpages
+owned by other allocations).
+
+### ResolveFault page-sharing logic (ROM `0x001F7978`)
+
+```
+read FAR from this->[+64]->[+68]
+range-check vs info->[+1c] (upper) and info->[+18] (lower)
+offset       = FAR - info->[+14]
+page_idx     = (offset >> 10) >> 2
+subpage_idx  = (offset >> 10) & 3
+page         = info->[+10][page_idx]
+if (page == NULL):
+    page = FindOrAllocPage_ReturnUnLockedOnNoPage(this, info, page_idx, mask=1<<subpage_idx)
+    info->[+10][page_idx] = page
+else:
+    if (page->subpage_owner[subpage_idx] == info
+        && high(page->subpage_info[subpage_idx]) == page_idx):
+        // fast path
+    else if (page->subpage_owner[subpage_idx] == NULL):
+        SetSubPageInfo(this, info, page_idx, page, subpage_idx)
+    else:
+        CountMatches / collision-handling (subpage owned by *other* stack)
+SetRestrictedPage; RememberMappings; release semaphore
+if (this->[+0xC0] != 0): page[+40 + subpage_idx]++   ; lockcount on resume
+```
+
+Two existing ROM patches close the cross-stack sharing path: 
+`apply_resolve_fault_wrapper` runs ResolveFault 4× per stack fault
+(one per subpage), and `GetMatchingPage→0` short-circuits the
+page-sharing search inside `FindOrAllocPage` so every fresh allocation
+returns a brand-new page. Together these guarantee that any page
+backing a stack-fault is owned by ONE stack across all 4 subpages.
+
+### LockHeapRange call-site catalog
+
+29 distinct `bl/b 0x01BD6B54` sites in the ROM. Grouped by intent:
+
+**Pattern A — Lock my object's data area** (15 callers).
+Driver / kernel objects calling `LockHeapRange(this, this+sizeof, lock_id)`
+to pin their own footprint against paging:
+
+| ROM PC | Owner | size (B) | lock_id |
+|--------|-------|---------:|---------|
+| `0x021B88` | `Init__4TADCFv` | 372 | 0 |
+| `0x0388E0` | `New__15TAsyncDebugLinkFv` | 32 | 1 |
+| `0x058018` | `Allocate__10TCircleBufFUliUcT3` | 40 | derived |
+| `0x058F48` | `Init__20PCirrusBatteryDriverFv` | 156 | 0 |
+| `0x05B1E4` | `Init__16TResistiveTabletFRC4Rect` | 180 | 0 |
+| `0x0B1DEC` | `Init__9TFIQTimerFv` | 96 | 1 |
+| `0x0DB20C` | `New__17TGeoPortDebugLinkFv` | 72 | 1 |
+| `0x0E8D38` | `Init__9TIRQTimerFv` | 216 | 0 |
+| `0x0EB70C` | `Init__10TICHandlerFUl` | 60 | 0 |
+| `0x1D5D6C` | `Init__16TSerialChip16450FP11TCardSocketP12TCardHandlerPUc` | 92 | 1 |
+| `0x1D63C0` | `Init__19PTheSerChipRegistryFv` | 92 | 1 |
+| `0x1D69C0` | `InitByOption__18TSerialChipVoyagerFP7TOption` | 160 | 0 |
+| `0x1D95EC` | `Init__16TSerialDMAEngineFP21TDMAChannelDiscriptorPvUc` | 64 | 1 |
+| `0x26C5F4` | `New__20TVoyagerMiscIntfImplFv` | 36 | 0 |
+| `0x26CEB4` | `Init__16TVoyagerPlatformFv` | 260 | 0 |
+
+These objects live ON HEAP MEMORY (allocated via operator new). With
+the existing NewHeap chunk_size=4096 patch, each heap exclusively owns
+its 4-KiB pages, so multiple driver objects on one page are all
+"owned" by the same heap → no subpage-AP boundary crossing. **Not
+1-KiB allocators.**
+
+**Pattern B — Lock a stack range** (5 callers):
+
+| ROM PC | Owner | size | lock_id |
+|--------|-------|------|---------|
+| `0x12427C` | `Init__16TMuxStoreMonitorFP6TStore` | 2 KiB straddling SP | 0 |
+| `0x1B940C` | `TaskConstructor__8TSerToolFv` | virtual-call return | 1 |
+| `0x2523B8` | `Init__5TTaskFPFPvUlT2_vUlPvN32P12TEnvironment` (full stack) | stack span | 0 |
+| `0x2523D0` | same TTask::Init (first 48 B of stack) | 48 | 0 |
+| `0x1F8B30` | `LockStack` (wrapper) | from kernel globals | 0 |
+
+The stack allocator (TStackManager via the NewStack SWI →
+FMNewStack) is what determines stack page granularity, not these lock
+callers. The existing `apply_resolve_fault_wrapper` already handles
+stack-fault pages at 4-KiB.
+
+**Pattern C — Lock a heap range** (5 callers):
+
+| ROM PC | Owner | size | notes |
+|--------|-------|------|-------|
+| `0x1423D4` | `NewVMHeap` | r5 | r5=4096 after our existing patch |
+| `0x3109E0` | `ExtendVMHeap` | round_up(req, heap[+0x38]) | heap[+0x38]=4096 after our patch |
+| `0x1C5E7C` | `GrowByOnePage__15SWiredHeapDescrFv` | 4096 | always 4 KiB |
+| `0x143068` | `LockPtr` | `GetPtrSize()` | caller-determined |
+| **`0x1428DC`** | **`ZapHeap`** | r4 (1024 OR 4096) | **PATCHED — see audit below** |
+
+**Pattern D — Lock a domain region** (2 callers): `BuildDomainsAndHeaps`
+at `0xE9400` and `0xE9688`. Domain Base/Size are 1 MiB-aligned (ROM
+enforces via `lsls #12` at `0xe9264`); 4-KiB-aligned by construction.
+
+**Pattern E — Lock malloc'd buffer + object** (2 callers):
+`Init__17THistoryCollectorFUiPcT2iT4` at `0x2DC57C` (locks the malloc'd
+buffer of variable size) and `0x2DC598` (locks the 108-byte object).
+
+### 1-KiB allocator audit
+
+Every code path in the ROM that `mov`s a literal 1-KiB to a register
+used in a heap/stack allocation, with status:
+
+| ROM PC | Owner | What | Status |
+|--------|-------|------|--------|
+| `0x142398` | `NewVMHeap` | `mov r5, #1024` default chunk size | **handled** by `0x1423A0 beq→nop` patch (forces 4-KiB arm) |
+| `0x142828` | `NewHeapAt` | `mov r2, #1024` chunk_size for NewHeap call | **handled** indirectly — NewHeap chunk_size patch overrides r2 to 4096 |
+| `0x1428B8` | `ZapHeap` | `moveq r4, #1024` (chunk + lock size when caller flag=0) | **PATCHED THIS ITERATION** — force `mov r4, #4096` |
+| `0x1F6E78` / `0x1F6E7C` | `Init__13TStackManagerFv` | `mov r3,#1024; mov r2,#1024` passed to TUDomainManager::Init | NOT an allocation — domain-manager configuration thresholds |
+| `0x1F6BA8`, `0x1F6BC0`, `0x1F6C08` | `FMLockHeapRange` | `add/sub r6/r9, #1024` per-subpage step | per-subpage iteration internals; not a 1-KiB allocation request |
+| `0x1F6A7C`, `0x1F6AA8`, `0x1F6FD0`, `0x1F7030`, `0x1F72F4`, `0x1F7D6C`, `0x1F7E4C`, `0x1F7E84` | `FMSetHeapLimits` / `FMGetSystemReleaseable` / `FreeSubPagesBetween` / `ReleasePagesInOneStack` | per-subpage iteration internals | same — not allocation requests |
+
+Allocators audited and confirmed NOT to use 1-KiB chunking:
+`SSafeHeapPage`, `SWiredHeapPage`, `NewBlock`, `SetBlockSize`, `malloc`,
+`NewPtr`, `NewWiredPtr`, `AllocNewPage`, `TUPageManager::Get`. All
+allocate at 4-byte (object) or 4-KiB (page) granularity.
+
 ## See also
 
 - `INVESTIGATION.md` — live wedge debugging notes

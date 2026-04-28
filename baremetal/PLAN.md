@@ -467,6 +467,51 @@ So the next iteration's actual investigation target is:
    the new probe data), or (b) add a hypervisor-side shadow-
    page mechanism so stage-2 isolates the apparent aliases.
 
+### Step 1 done — `Remember (static)` is NOT the aliasing source
+
+Augmented the existing `handle_remember_entry_probe_with`
+(patched on `Remember (static)` at `0x00258E0C`) with an
+unconditional per-PA → first-VA aliasing tracker. Every
+`Remember (static)` call records `(phys, va, lr)`; if the
+same PA is later seen at a different VA, the tracker logs
+`Remember ALIAS:` with both VA/LR pairs.
+
+**Cold-boot result:** 7 calls to `Remember (static)` got
+captured (matching the existing L1-lazy-grow filter), and
+**ZERO `Remember ALIAS:` lines were logged**. Meanwhile the
+12 verify-mmu RAM aliases ALL still appeared. So the L2
+writes that produce those aliases do NOT pass through the
+`Remember (static)` shim at the user-mode side.
+
+Two non-overlapping kernel paths can produce L2 writes that
+bypass `Remember (static)`:
+
+- **Direct L2 writes by cold-boot kernel setup.** The 3
+  kernel-globals self-mapping aliases (PA=0x04004-0x04006)
+  are written by the kernel's TTBR0 setup code as it builds
+  its own page tables. No Remember-shim involvement.
+- **`PrimRememberMapping` family** (`0x00163480` /
+  `PrimRememberPhysMapping` `0x00163708` /
+  `PrimRememberPermMapping` `0x00163920`). These are the
+  lower-level write primitives reachable via different
+  kernel paths than the `Remember (static)` user-shim. The
+  9 stack-guard-sharing aliases probably go through here.
+
+### Next iteration — probe the Prim* primitives
+
+1. Patch the first word of `PrimRememberMapping` at
+   `0x00163480` (`mov ip, sp` = `0xE1A0_C00D`) with HVC
+   immediate. Args are `(env=r0, va=r1, &TPhys=r2, perm=r3)`;
+   PA is read via `*(r2+16) >>= 12; <<= 12`.
+2. Run the same per-PA → first-VA aliasing tracker on it.
+3. Repeat for `PrimRememberPhysMapping` if the first probe
+   doesn't catch it. Check `PrimRememberPermMapping` last —
+   these set perms, may not change PA bindings.
+4. If neither catches the stack-guard aliases, the writes
+   are direct stores from the kernel's monitor proc and we
+   need a stage-2 trap (mark the L2 table page RO, decode
+   each fault).
+
 Until aliases are zero, the alrt-task DABT and any other
 later wedge stays **deliberately not investigated**.
 

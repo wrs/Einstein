@@ -2312,6 +2312,43 @@ fn handle_remember_entry_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
         );
     }
 
+    // Aliasing detector: track per-RAM-PA the first VA we saw being
+    // installed via Remember(). When a subsequent call asks for the
+    // same PA at a different VA, log it — that's the kernel-side
+    // aliasing source we're trying to identify. Logs unconditional;
+    // bounded by REMEMBER_ALIAS_LOG_BUDGET.
+    const RAM_BASE: u32 = 0x0400_0000;
+    const RAM_PAGES: usize = 0x0040_0000 / 0x1000; // 1024
+    if phys >= RAM_BASE && (phys - RAM_BASE) < (RAM_PAGES as u32 * 0x1000) {
+        let page_idx = ((phys - RAM_BASE) >> 12) as usize;
+        static FIRST_VA_FOR_PA: [core::sync::atomic::AtomicU32; RAM_PAGES] = {
+            const ZERO: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            [ZERO; RAM_PAGES]
+        };
+        static FIRST_LR_FOR_PA: [core::sync::atomic::AtomicU32; RAM_PAGES] = {
+            const ZERO: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            [ZERO; RAM_PAGES]
+        };
+        static REMEMBER_ALIAS_LOG_BUDGET: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(64);
+        let prev_va = FIRST_VA_FOR_PA[page_idx]
+            .swap(va, Ordering::Relaxed);
+        let prev_lr = FIRST_LR_FOR_PA[page_idx]
+            .swap(if lr == 0 { 0xFFFF_FFFE } else { lr }, Ordering::Relaxed);
+        if prev_va != 0 && prev_va != va {
+            let budget = REMEMBER_ALIAS_LOG_BUDGET
+                .fetch_sub(1, Ordering::Relaxed);
+            if budget > 0 {
+                kprintln!(
+                    "Remember ALIAS: PA={:#010x}  VA1={:#010x} (lr={:#010x})  VA2={:#010x} (lr={:#010x})  perm={:#x} env={:#x}",
+                    phys, prev_va, prev_lr, va, lr, perm, env_id,
+                );
+            }
+        }
+    }
+
     // Emulate the original `mov ip, sp`. ip = r12 (non-banked, ctx.x[12]
     // for non-FIQ source modes), sp = R13_<source_mode> (banked).
     ctx.x[12] = sp as u64;

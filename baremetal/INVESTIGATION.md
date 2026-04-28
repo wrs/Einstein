@@ -42,6 +42,55 @@ quiesces on the same path without ever getting there.
 
 ## Pending follow-ups
 
+### FVP cross-check: same wedge, same corruption, no QEMU bug. Real cause: writes during the RW window. (2026-04-27, very late)
+
+Built `--no-default-features --features platform-fvp-base quiet`,
+ran under FVP for 240 s. The boot progresses (slower wall-clock,
+same logical behaviour) and reaches the same SearchFreeList wild-r0
+halt with **byte-for-byte identical** corruption in the heap header
+(0x002dd804 / 0x001a48f0 / 0x0c645f0c / ...). So the bug is not
+platform-specific and not a QEMU stage-2 enforcement issue.
+
+Two real findings from FVP:
+
+1. **prev-trap-elr=0x2dd7bc** on FVP for transition #3 (vs. QEMU's
+   0xe4f168). PC 0x2dd7bc is `push {r4, r5, r6, r7, fp, ip, lr, pc}`
+   in `__ct__18TStoreObjectWriter`. So the trap immediately
+   preceding the wedge-value observation is TStoreObjectWriter's
+   prologue push. The push doesn't itself land at the heap (saved-r4
+   would be the caller's r4 = `inWrapper`, not 0x002dd804) but it's
+   the very last guest activity before the corruption is observed.
+2. The earlier "post-rebind perm faults missing" was a counter-cap
+   artefact, not a bug. Resetting the dabt-on-carve cap on every
+   rebind reveals **256 post-rebind perm faults** correctly logged
+   on PA=0x04032xxx in QEMU. None of them target heap[+0x10..+0x18]
+   (the corrupted bytes) and none carry value 0x002dd804.
+
+Why the wedge writes escape the trap log: after each perm fault,
+`handle_data_abort` line 406 flips the page to RW so the guest's
+retry succeeds. Until the next trap fires (and `heap_watch::sample`
+re-arms RO), the entire 4 KiB page is RW. The kernel writes many
+words in that window — including any subsequent writes to
+heap[+0x10..+0x18] — silently. We only capture the *first* write
+of each RO→RW cycle. The wedge write to heap[+0x10] sits inside
+one of these RW windows.
+
+To capture every write would require either:
+
+- A stage-2 invalid-entry trap (no auto-flip; reads need EL2
+  emulation to return the host-PA value).
+- An ARM-store decoder that emulates each write in EL2 and keeps
+  the page RO (extending `try_emulate_isv0_dabt` to handle ALL
+  STR/STM/STRB forms — significant implementation effort).
+- Single-step support via `MDCR_EL2.SS` so the auto-flip RW lasts
+  exactly one instruction.
+
+For a stop-fixing context, the better lane is PLAN.md option 2 —
+make `SearchFreeList` fail gracefully on a wild freelist node so
+the kernel takes its existing out-of-memory path and the boot
+keeps walking. The corruption itself is a Newton-OS allocator
+divergence we can investigate further once we're past this stall.
+
 ### Defensive RO-state poll confirms the post-rebind page is RO yet still mutated (2026-04-27, night)
 
 Added `heap_watch::sample` defensive RO-state check at the top of

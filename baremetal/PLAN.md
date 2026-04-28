@@ -214,31 +214,34 @@ but always log on the wedge-relevant arg matches):
 
 Concrete next steps:
 
-1. **Run on FVP with the carve-out in place.** The QEMU stage-2
-   enforcement bug is now confirmed by the defensive RO-state poll
-   (post-rebind: 0 RW samples; pre-rebind: 64 RW samples — the
-   page demonstrably stays RO yet writes land at the host backing).
-   FVP is architecturally accurate; it should fault and let us
-   capture writers. Build with `--no-default-features --features
-   "platform-fvp-base"`, run via `scripts/fvp`, look for the same
-   `heap-watch perm-fault` log lines on the post-rebind PA.
-2. **Or step around the wedge entirely.** The corruption is a
-   Newton-OS internal allocator inconsistency we can't pinpoint
-   in QEMU; consider hooking `SearchFreeList` (ROM 0x003132d8)
-   to silently fail (return NULL = "no fit") when its current-
-   heap pointer dereference would fault. Equivalent to telling
-   the allocator "this size is unsatisfiable on this heap" —
-   the kernel typically retries against a different heap or
-   throws a benign out-of-memory exception.
-3. Cross-check Einstein at the equivalent boot offset (NewtonProbe
+1. **Hook `SearchFreeList` to fail gracefully.** Both QEMU and
+   FVP reach the same wedge with identical corruption — this is
+   a Newton-OS allocator divergence, not a hypervisor bug. The
+   carve-out captures most writers but not the actual corrupting
+   write (which lands during the RW window between fault-and-
+   next-trap; see INVESTIGATION.md). Rather than chase the writer
+   with an ARM-store decoder or stage-2 invalid-entry mode (both
+   significant implementation cost), patch `SearchFreeList` (ROM
+   `0x003132d8`) to short-circuit on a wild freelist node:
+   detect that `*r0` would translate-fail (or matches the
+   `0xe5xx_xxxx` instruction-encoding signature of a ROM PC
+   misread as a freelist-next pointer) and return `r0 = 0`
+   (no fit). The kernel's caller is `__nw__FUi`, which on
+   "no fit" tries the next heap or throws `exMemFull` — both
+   benign compared to the bus-error throw we currently get.
+2. Cross-check Einstein at the equivalent boot offset (NewtonProbe
    60 s) — dump Einstein's RelocHeap header at the same point and
-   diff. If Einstein's heap stays valid, the bug is hypervisor-side
-   (stage-2 mapping / aliasing); if Einstein corrupts it the same
-   way, it's a ROM data-flow bug we need to mirror or patch around.
-4. Once the writer is identified, decide whether the fix is a
-   handler gap (stage-2 fault on a write that should have trapped
-   cleanly) or a behavioural mirror (kernel does something Einstein
-   doesn't because of an earlier divergence we need to match).
+   diff. If Einstein's heap stays valid, the bug is in our
+   reproduction of one of the upstream allocator side-effects;
+   if Einstein corrupts it the same way, the ROM internally
+   recovers from this, and so should we (option 1 mirrors that
+   recovery).
+3. Once the wedge no longer halts, observe what new state the
+   boot reaches and pick the next stop.
+
+The carve-out + dabt-on-carve scaffolding should stay armed — it
+gives us a continuous log of write activity on the heap header
+that's useful for any follow-up investigation.
 
 ## Earlier stop — newt self-deadlocks on the heap-store TULockingSemaphore
 

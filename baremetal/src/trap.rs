@@ -399,16 +399,39 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
     // RO carve-out doesn't seem to trap. Remove with the rest of the
     // heap-watch scaffolding. Always emit; the trap log budget is
     // separate and we want every hit on this narrow window.
+    //
+    // Pre-rebind hits saturate any global cap quickly, so reset the
+    // cap whenever the armed PA changes — gives each rebind window
+    // its own log budget.
     {
         let armed = crate::heap_watch::carved_pa();
         if armed != 0 && (ipa as u32) & !0xFFF == armed {
             static HITS: core::sync::atomic::AtomicU32 =
                 core::sync::atomic::AtomicU32::new(0);
+            static LAST_ARMED: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            if LAST_ARMED.load(core::sync::atomic::Ordering::Relaxed) != armed {
+                HITS.store(0, core::sync::atomic::Ordering::Relaxed);
+                LAST_ARMED.store(armed, core::sync::atomic::Ordering::Relaxed);
+            }
             let n = HITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if n < 512 {
+            // Always log writes to the corrupted-header window
+            // (offsets +0x10..+0x28 from heap base, = page offsets
+            // +0x10..+0x28). Filter the rest below the cap.
+            let off = (ipa as u32) & 0xFFF;
+            let in_corrupt_window = (0x10..0x28).contains(&off);
+            let value = if isv != 0 { ctx.x[srt] as u32 } else { 0 };
+            let is_wedge = (isv != 0) && matches!(
+                value,
+                0x002d_d804 | 0x001a_48f0 | 0x002d_fa20 | 0x002d_d7c4
+            );
+            if n < 256 || in_corrupt_window || is_wedge {
                 kprintln!(
-                    "heap-watch dabt-on-carve[{}]: ipa={:#010x} elr={:#010x} ifsc={:#x} wnr={} isv={} (carved_pa={:#010x})",
-                    n, ipa, elr, ifsc, wnr as u32, isv, armed,
+                    "heap-watch dabt-on-carve[{}]: ipa={:#010x} elr={:#010x} ifsc={:#x} wnr={} isv={} value={:#010x} srt={} (carved_pa={:#010x}){}",
+                    n, ipa, elr, ifsc, wnr as u32, isv, value, srt, armed,
+                    if is_wedge { "  *** WEDGE-VALUE ***" }
+                    else if in_corrupt_window { "  [header window]" }
+                    else { "" },
                 );
             }
         }

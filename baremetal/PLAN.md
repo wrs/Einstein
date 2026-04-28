@@ -180,6 +180,49 @@ NOTE: Fix all compiler warnings before committing, to keep context clean.
   on QEMU; `--platform fvp` runs the same suite on the FVP. Both
   must stay green. See "Verification" near the end of this file.
 
+## MMU verification scaffold (2026-04-28)
+
+`fix_stage1_xn_bits` (called on every `SCTLR.M` toggle) now also runs
+two cross-checks before flattening L2 entries:
+
+- **Subpage-AP heterogeneity** — for each ARMv4 small/large-page L2
+  entry, decode the four 2-bit subpage AP fields at bits [11:10],
+  [9:8], [7:6], [5:4] and count entries where they don't all agree.
+- **RAM PA aliasing** — for each small-page L2 entry mapping a RAM
+  PA (`0x04000000..+RAM_SIZE`), record `(page_idx → first VA seen)`
+  in a 1024-entry stack array; report any PA reached by two distinct
+  VAs.
+
+Output is ratchet-only (highest-watermark crossings) so a typical
+boot emits ~10 lines. Recent baseline:
+
+```
+verify-mmu: subpage-AP-mixed=8 RAM-aliased-pages=5
+  first alias: PA=0x04004000 mapped by VA1=0x0c000000 and VA2=0x0c002000
+verify-mmu: subpage-AP-mixed=264 RAM-aliased-pages=5
+verify-mmu: subpage-AP-mixed=1178 RAM-aliased-pages=12
+```
+
+Findings:
+- Subpage-AP-mixed grows monotonically (8 → 1178 over boot). The
+  kernel still **writes** mixed-AP L2 entries everywhere — our
+  patches don't stop that. But every entry gets immediately flattened
+  to AP=011 by the same walk, so the kernel's intent is harmless: it
+  thinks subpage AP is enforcing isolation, the hardware has no idea.
+  The number is informational, not actionable.
+- RAM-aliased-pages grows 5 → 12 over the boot. The very first alias
+  (PA=0x04004000 ↔ VA 0x0c000000 / 0x0c002000) is in the
+  kernel-globals region — likely an L2-table backing page that the
+  kernel deliberately self-maps via two VAs. The +7 over the boot
+  matches per-task L1 / L2 sharing for kernel-global sections.
+  These are kernel-internal; no user-mode allocation aliasing was
+  detected after the heap-aliasing fix and ZapHeap patch.
+
+Implementation: `src/guest_mem.rs::fix_stage1_xn_bits`, decode bits +
+1024-entry `va_for_pa` array + ratcheting `static mut HIGH_*`. Cost:
+one extra read per L2 entry walked (~10–50 L2 tables per call) plus
+the array zero-init. Negligible.
+
 ## Current stop — alrt-task DABT at FAR=0xe336000c → Reboot canary (CheckButton with junk `this`)
 
 The heap-aliasing wedge is resolved (see "Resolved stops"
@@ -255,18 +298,27 @@ Rn=6, imm=0). Possible sources:
   allocation
 
 **Concrete next steps for the next iteration:**
-1. Dump the CList state at the moment of the wedge — extend the
-   Reboot-canary kernel-state dump to walk
-   `task_alrt → ehandler → list@140 → entries`. This pins the
-   exact slot and what its neighbours look like.
-2. Cross-check Einstein at the equivalent boot offset — does the
-   alrt task even reach `IdleProc → CheckAlertDone` cleanly?
-   `build/NewtonProbe baremetal/roms/newton.rom _Data_/Einstein.rex 60`.
-3. Watch for the writer: install a sentinel on
-   `TAlertEventHandler::list[+0..+8]` (or wherever the CList
-   header lives) so we catch the write that introduces the junk
-   pointer. Mirrors the heap-watch carve-out approach from the
-   prior wedge.
+
+NEW PRIORITY (from Einstein cross-check): the alrt task is
+**BLK** throughout the 60-s NewtonProbe window — never reaches
+`IdleProc → CheckAlertDone → CheckButton`. Our hypervisor schedules
+it when Einstein doesn't. So the wedge is a **scheduling-divergence
+symptom**, not an "alrt task got a junk CList entry that we need to
+defend against" bug.
+
+1. Identify why our alrt task is RUNNING. Check
+   the alrt port / event flow: when alrt is created, it should
+   block on a semaphore / message wait. Compare our port state for
+   alrt's wait-on-message vs. Einstein's. Probe candidates:
+   `Acquire`, `BlockOnInc`, `Receive__6TUPort` calls in the alrt
+   task before the wedge.
+2. **If no fix appears at the schedule layer**, fall back to
+   "hardening" CheckAlertDone / IdleProc to skip junk CList
+   entries gracefully (validate `this` before deref).
+3. Auxiliary: dump the CList state at wedge time
+   (`task_alrt → ehandler → list@140 → entries`) — confirms which
+   slot holds the junk and whether other slots have valid pointers.
+   Useful even if we fix the schedule divergence first.
 
 Detailed text below describes the original wedge first-look:
 

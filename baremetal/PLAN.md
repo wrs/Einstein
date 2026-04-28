@@ -180,86 +180,79 @@ NOTE: Fix all compiler warnings before committing, to keep context clean.
   on QEMU; `--platform fvp` runs the same suite on the FVP. Both
   must stay green. See "Verification" near the end of this file.
 
-## Current stop — RelocHeap header corruption is VA aliasing — heap shares backing PA with user stack
+## Current stop — Stage-1 aliasing confirmed: kernel maps heap VA and user-stack VA to same PA
 
-**Strong new finding (this iteration):** the corrupted bytes
-decode EXACTLY as two ARM `push {regs}` instructions executed
-by guest code:
+**Aliasing CONFIRMED at stage-1.** This iteration's stage-1
+walk probe proves both VAs translate to PA 0x04032000:
 
-- `__ct__9TRefStackFv` push (PC=0x1a48e8) writes lr=0x002dd804
-  + pc+8=0x001a48f0 → heap[+0x00..+0x04]
-- `__ct__18TStoreObjectWriter` push (PC=0x2dd7bc) writes
-  lr=0x002dfa20 + pc+8=0x002dd7c4 → heap[+0x20..+0x24]
-- The ip value at heap[+0x1c] is **0x0cc82038** = sp_old in the
-  USER STACK range, NOT in the heap range.
+```
+VA 0x0ca6b010 → L1[0xca] coarse → L2[0x6b]=0x0403203e → PA 0x04032000
+VA 0x0cc82018 → L1[0xcc] coarse → L2[0x82]=0x0403203e → PA 0x04032000
+```
 
-Both bytes appearing at heap addresses means **VA 0x0cc82018
-and VA 0x0ca6b018 share backing memory** in our hypervisor.
-Einstein puts them on different PAs (heap on PA 0x040a6010 vs.
-user stack elsewhere) — see prior iteration's NewtonProbe
-heap-dump cross-check.
+The L2 entries are byte-identical (0x0403203e). This is NOT a
+stage-2 issue — both VAs reach the same IPA via stage-1. Two
+distinct L2 tables (in different L1 slots, at different L2
+PAs) both name the same backing physical page.
 
-The hypervisor-side bug is therefore in stage-1 / stage-2 page
-mapping such that two distinct kernel VAs end up at the same
-backing PA. Hypothesis #1 (banked-SP aliases heap header) is
-**refuted** by this iteration's banked-SP capture probe — none
-of the source-mode SPs at the sanity-halt is within ±0x100 of
-heap base. The aliasing is at the page-table layer, not the
-SP-points-into-heap layer.
+The `apply_resolve_fault_wrapper` ROM patch in
+`src/rom_patches.rs:894` is the prime suspect. It makes the
+kernel run `TStackManager::ResolveFault` **four times per
+stack fault**, with the `GetMatchingPage→0` companion patch
+forcing every subpage to allocate a fresh physical page. The
+heavy allocator churn this produces is the most credible
+cause for the kernel's page-pool re-issuing PA 0x04032000
+(originally allocated to the RelocHeap) under stack-grow
+pressure later in boot.
 
-## Earlier hypothesis-space (mostly RESOLVED by this iteration)
-
-Hypothesis #1 (banked-SP-aliases-heap) refuted. Hypotheses
-#2 (shadow_stub mis-emulation) and #3 (CP15 cache-op corruption)
-remain possible but the aliasing finding subsumes them — both
-would cascade FROM the underlying VA-aliasing bug.
+**Hypothesis #1 (banked-SP-aliases-heap)** was refuted in the
+prior iteration. **Stage-2 bugs** (e.g., set_ram_page_ro_x
+corrupting unrelated entries) are now also ruled out by this
+iteration — both VAs reach the same IPA *before* stage-2 sees
+them.
 
 ## Concrete next steps
 
-**Prime suspect: the `apply_resolve_fault_wrapper` ROM patch in
-`src/rom_patches.rs:894`.** This wrapper makes the kernel run
-`TStackManager::ResolveFault` **four times per kernel-side fault**
-to compensate for ARMv7's missing subpage-AP support, calling
-`FindOrAllocPage` repeatedly and exercising bookkeeping paths
-the kernel didn't expect to execute that often. If even one of
-those iterations causes the kernel's free-list to re-issue a
-page already allocated to the heap, we get exactly the aliasing
-observed. Investigation order:
-
-1. **Audit the wrapper's interaction with the page allocator.**
-   Does it cause `FindOrAllocPage` (or the page-pool free-list)
-   to re-issue a heap page? The wrapper's per-iter FAR is
-   `info->base_va + page_offset + sub_idx*1024` — bounded to
-   the stack region — but the FOUR `ResolveFault` invocations
-   all call into the kernel allocator, and that allocator may
-   not tolerate four "first-allocation" attempts on adjacent
-   subpages without losing track of allocated pages.
-   Specifically check: does iter 0 reserve a page that iters
-   1-3 then re-reserve under different subpage indices,
-   leaking refcount? Or do iters 1-3 actually `FindOrAllocPage`
-   fresh pages too?
-2. **Confirm aliasing directly.** Add a one-shot probe at
-   sanity-halt: walk stage-1 for the user-stack VA
-   `0x0cc82018` and the heap VA `0x0ca6b018`, print both IPAs.
-   If they match, aliasing is confirmed at stage-1. If they
-   don't match but the bytes still appear in both, the
-   aliasing is stage-2 (two IPAs sharing a host PA), which
-   would point at our `stage2.rs` mapping logic — much less
-   likely.
-3. **Walk the page tables for duplicates.** Walk the kernel's
-   L1/L2 exhaustively and list every VA that resolves to PA
-   0x04032000. If multiple VAs name the same PA, the duplicate
-   list pinpoints which kernel structures share the page.
-4. **Try disabling the wrapper.** The wrapper only matters
-   under sustained allocation pressure (TInterpreter ctor's
-   256 KiB of lazy stacks). Temporarily revert
-   `apply_resolve_fault_wrapper` and the
-   `GetMatchingPage→0` patch and rerun. If the heap stays
-   intact (boot wedges elsewhere on the original subpage-AP
-   issue), that confirms the wrapper as the culprit; if the
-   heap still corrupts, look elsewhere. This is a
-   *diagnostic* test, not a fix — we still need a real
-   solution for the subpage-AP issue.
+1. **Diagnostic-only revert test.** Revert
+   `apply_resolve_fault_wrapper` install + the
+   `GetMatchingPage→0` patch (revert just those two,
+   keep everything else), cold-boot, watch the heap-watch
+   sanity-halt. Three possible outcomes:
+   - **Heap stays intact** (boot wedges elsewhere on the
+     original ARMv7 subpage-AP issue): confirms the wrapper
+     or its companion patch is the cause. Next move: fix the
+     wrapper (don't iterate 4×; or iterate 4× but keep
+     bookkeeping consistent so the page-pool doesn't get
+     confused).
+   - **Heap still corrupts at the same point**: rules out
+     the wrapper; the bug is somewhere else. Look at
+     `fix_stage1_xn_bits` next — does it ever touch the PA
+     field of an L2 entry?
+   - **Boot fails earlier in some other way**: useful data;
+     means the patches do gate against an earlier bug we
+     haven't characterised since they were added.
+2. **Audit the wrapper without reverting.** Read
+   `apply_resolve_fault_wrapper` in detail; trace what
+   `FindOrAllocPage` returns for each of the 4 iters; check
+   whether the kernel's page-table-slot bookkeeping is left
+   consistent across iters. The wrapper IS supposed to
+   produce 1 page per fault (iter 0 allocates, iters 1-3
+   reuse via slot-already-filled), so any double-allocation
+   would be a real bug in the wrapper's logic. Pair this
+   with PLAN.md option 3 (find every VA mapping to PA
+   0x04032000 in the kernel's tables — easy walker since
+   the kernel L1 sits at PA 0x04000000 and is 16 KiB).
+3. **Audit `fix_stage1_xn_bits`** in `src/guest_mem.rs` for
+   any path that could set the PA field of an L2 entry.
+   It's documented as flattening AP bits; if it accidentally
+   writes PA bits, that's another candidate.
+4. **Cross-check Einstein's L2 tables.** Add a stage-1 walk
+   to NewtonProbe at the equivalent boot offset, dumping
+   the L2 entries for VA 0x0ca6b000 and a typical
+   user-stack VA. If Einstein's two L2 entries name
+   *different* PAs, that confirms the kernel wouldn't
+   normally alias these VAs — the divergence has to come
+   from us.
 
 Diagnostic scaffolding (heap-watch sentinel, stage-2 RO
 carve-out, sanity-halt with banked-SP + ring-SP capture,

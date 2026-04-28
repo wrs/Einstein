@@ -588,6 +588,32 @@ pub fn sample(elr_el2: u64, source: Source, ctx: &TrapContext, spsr_el2: u64) {
                 curr_task_globals, heap_ptr,
             );
         }
+        // Aliasing probe (PLAN.md "Confirm aliasing"): walk stage-1
+        // for the heap VA and for the user-stack VA whose push hit
+        // the heap header. The previous iteration's decode showed
+        // the corrupting push had sp=0x0cc82038 → corresponds to VA
+        // 0x0cc82018..0x0cc82038. If those VAs translate to the
+        // same IPA as the heap VA, aliasing is at stage-1 (kernel /
+        // wrapper-driven page reuse). If they translate to different
+        // IPAs but the same PA shows up in stage-2, aliasing is on
+        // our side (stage-2 mapping bug).
+        kprintln!("    --- aliasing probe: stage-1 walks for heap and user-stack VAs ---");
+        log_stage1_walk(WATCH_VA);
+        // Also walk the four user-stack VAs that the corrupting push
+        // touched. sp_old at the push moment was 0x0cc82038, so the
+        // 8-reg push wrote 0x0cc82018..0x0cc82038. Walk a couple of
+        // them to see if any aliases the heap PA. The exact-aligned
+        // word VAs are 0x0cc82018, 0x0cc82020, 0x0cc82028, 0x0cc82030.
+        for &alias_va in &[0x0cc8_2018u32, 0x0cc8_2020, 0x0cc8_2028, 0x0cc8_2030] {
+            log_stage1_walk(alias_va);
+        }
+        // Also walk the current task's actual sp_usr — it might
+        // identify a third VA we haven't considered.
+        let sp_usr = ctx.x[13] as u32;
+        if sp_usr != 0 {
+            kprintln!("    (also walking SP_usr={:#010x} of the current task)", sp_usr);
+            log_stage1_walk(sp_usr);
+        }
         // Dump the trap-stream ring buffer (newest at index 31) so
         // the operator can bisect the corrupting writer to between
         // two adjacent ring entries. Ring slots now include the

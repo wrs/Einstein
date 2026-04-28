@@ -177,6 +177,42 @@ points at the analysis). Next iteration: disassemble
 `TUDomainManager::Get`'s real body (probably REx-side; jump-table
 thunk at 0x001BD2974 redirects to the actual function).
 
+### Update (2026-04-28 ctd) — Get's body found at 0x00258EC0; it's a SWI shim
+
+The "REx-side" expectation was wrong. `0x01BD2974` is the
+post-ship patch-table thunk (NEWTON_INTERNALS.md "ROM patch
+table") — it just `B`'s to base-ROM `0x00258EC0`, which we
+already disassembled. From now on, when chasing `0x01Bxxxxx`
+targets, look up BOTH addresses in `_Data_/demangled_symbols.txt`
+and read the ≤ 0x00800000 one — the other is just an
+indirection. Captured in `docs/DISASM.md` "Jump-table aliasing".
+
+The body at `0x00258EC0` is a 17-instruction SWI shim that
+packages `(*0x0c101054, count, this+24)` into a 3-word arg
+buffer and hands it off via `MonitorDispatchSWI` (svc #0x1B).
+The kernel SWI handler routes msg #5 to PageMonProc at
+`0x0025925C`, which then jumps to `vtable[1]` of the monitor
+object pointed to by `*0x0c104eec`. **That vtable handler is
+where the actual page-allocator lives**, and it's NOT visible
+in `rom.dis` — kernel data, not text. Pseudocode now in
+`docs/STRUCTURES.md` "End-to-end page allocation".
+
+So further static disassembly is a dead end. To inspect the
+allocator's free-list / recycle behaviour we'd need either:
+
+- A hypervisor-side `svc #0x1B` trap that logs every (msg=5,
+  args_buf) call and decodes the in-place return.
+- A runtime walk: read `*0x0c104eec` at boot, follow `[+0]` to
+  vtable, dereference `[+4]` for the handler PC, grep `rom.dis`.
+
+**Pivot.** The 36-KiB FMNewStack patch was a side-quest. The
+remaining wedge is the alrt-task DABT (CheckButton with junk
+this=0xE3360000), and the user already pivoted that to
+"scheduling divergence — alrt should be BLK like Einstein,
+not RUN" (see PLAN.md "Current stop"). Page-allocator
+forensics parked. Next iteration: alrt port-message trigger
+investigation.
+
 ## FMNewStack 33→36 KiB patch attempt — REVERTED (2026-04-28)
 
 User: "Don't give up on the patch unless it's actually impossible."

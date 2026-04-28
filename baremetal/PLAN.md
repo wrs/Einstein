@@ -346,27 +346,71 @@ The page allocator (`TUDomainManager::Get`) doesn't know about
 the stack-pool's allocation state, OR our slot resize causes its
 free-list to count differently than the consumers do.
 
-### Next iteration — read TUDomainManager::Get's body
+### TUDomainManager::Get — body found, but it's a SWI shim (2026-04-28)
 
-The function lives at jump-table `0x001BD2974` which redirects to
-the real implementation. Likely in REx (RAM-resident kernel
-patches). Two ways to find it:
+Initial PLAN said "likely in REx". **Wrong.** The 0x01BD2974
+address is a REx **jump-table thunk** (the post-ship patch
+mechanism described in `docs/NEWTON_INTERNALS.md` "ROM patch
+table"); it just `B`'s to the real ROM body at base ROM
+`0x00258EC0`.
 
-1. Disassemble the jump-table thunk to see where it branches.
-2. Search `_Data_/Einstein.rex` for the function — it'll be inside
-   the byteswapped REx bytes.
+Memo to self / future sessions: when chasing a `bl 0x01Bxxxxx`
+target, ALWAYS check `_Data_/demangled_symbols.txt` for both
+the body address (≤ 0x00800000) AND the thunk address
+(0x01Axxxxx-0x01Cxxxxx). The body is what to read; the thunk
+is just an indirection. Now documented in `docs/DISASM.md`
+"Jump-table aliasing — DON'T mistake the thunk for the body".
 
-Once we find the body, look for:
-- A free-list of recycled PAs (a list head + per-page link).
-- Any per-domain page-budget bookkeeping that depends on the
-  slot-size constant (perhaps `pages_per_slot = slot_size / 4096`
-  is hardcoded somewhere).
-- Whether `Get` checks "is this PA already in use" before
-  returning it.
+The body at `0x00258EC0`:
 
-The end-to-end mechanism is now documented in
-`docs/STRUCTURES.md` "## End-to-end page allocation" — read that
-first.
+```
+Get(this, &out_pa, count) {
+  msgbuf[0] = *0x0c101054     // gPagePoolHandle (kernel obj)
+  msgbuf[1] = count           // 2 in our trace
+  msgbuf[2] = this + 24       // TUDomainManager's domain field
+  if (MonitorDispatchSWI(*0x0c104eec, msg=5, &msgbuf) == 0)
+    *out_pa = msgbuf[0]       // returned page id (in-place)
+}
+```
+
+`MonitorDispatchSWI` is `svc #0x1B`. The kernel SWI handler
+routes msg #5 to `TUDomainManager::PageMonProc` at `0x0025925C`,
+which is itself a vtable trampoline:
+
+```
+PageMonProc(monitor_obj, msg, args_buf) {
+  if (msg == 0x7FFFFFFF) jump (vtable[2]+8)   // init
+  else                   jump (vtable[1]+4)   // page handler
+}
+```
+
+So the actual page-allocation logic is at `vtable[1]` of the
+monitor object pointed to by `*0x0c104eec`. **That vtable lives
+in kernel data, not in the rom.dis we have.** To inspect it we
+need either:
+- a hypervisor-side SWI #0x1B trap that logs every (msg=5,
+  args_buf) call + decodes the in-place return,
+- or a runtime walk: read `*0x0c104eec` at boot, follow `[+0]`
+  to vtable, read `vtable[+4]` to get the handler PC, and grep
+  `rom.dis` for that PC.
+
+Both are tractable but neither is half-an-iteration small.
+
+### PIVOT — the alrt-task wedge isn't gated on this investigation
+
+The 36-KiB FMNewStack patch attempt was the side-quest that
+pulled us into TUDomainManager::Get. That patch is **reverted**.
+The remaining wedge is the alrt-task DABT (CheckButton with
+junk `this=0xE3360000`), and the user already pivoted that to
+**"scheduling divergence — alrt should be BLK like Einstein,
+not RUN"** (see "Current stop" section above).
+
+So the next iteration's actual priority is the
+**alrt port-message trigger investigation** — find what message
+wakes alrt, vs Einstein where alrt stays parked in Receive.
+Steps detailed in "Current stop" #1-#4. Page-allocator forensics
+parked until/unless the scheduling fix exposes a remaining
+aliasing problem.
 
 ### Original bisect strategy (kept for reference)
 

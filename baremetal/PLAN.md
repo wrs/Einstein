@@ -384,33 +384,58 @@ PageMonProc(monitor_obj, msg, args_buf) {
 }
 ```
 
-So the actual page-allocation logic is at `vtable[1]` of the
-monitor object pointed to by `*0x0c104eec`. **That vtable lives
-in kernel data, not in the rom.dis we have.** To inspect it we
-need either:
-- a hypervisor-side SWI #0x1B trap that logs every (msg=5,
-  args_buf) call + decodes the in-place return,
-- or a runtime walk: read `*0x0c104eec` at boot, follow `[+0]`
-  to vtable, read `vtable[+4]` to get the handler PC, and grep
-  `rom.dis` for that PC.
+**Correction (2026-04-28).** Initial reading said the value at
+`*0x0c104eec` was a "monitor object pointer" with a vtable.
+That's wrong. Re-reading `StaticInit__15TUDomainManager` shows
+`*0x0c104eec` is just a **kernel monitor handle** (an integer
+ID), copied in by `CopyObject__9TUMonitor` at static-init.
+`MonitorDispatchSWI` (svc #0x1B) takes that handle as r0, the
+msg as r1, and the kernel SWI handler dispatches based on the
+handle to whatever proc was registered for that monitor.
 
-Both are tractable but neither is half-an-iteration small.
+So the actual page-allocation handler proc is **registered at
+runtime**, not visible via static disassembly of the constant
+table. The `RegisterPageMonitor__15TUDomainManagerSFv` (at
+`0x00259094`) is what the kernel runs to install the proc; it
+SWIs msg #3 with sp[0] = `*0x0c104eec` = the page-mon-id, and
+the kernel's SWI handler binds that id to the proc.
 
-### PIVOT — the alrt-task wedge isn't gated on this investigation
+`PageMonProc` at `0x0025925C` is the LOCAL stub TUDomainManager
+runs when IT is itself called as a fault monitor — not the
+allocator-side proc.
 
-The 36-KiB FMNewStack patch attempt was the side-quest that
-pulled us into TUDomainManager::Get. That patch is **reverted**.
-The remaining wedge is the alrt-task DABT (CheckButton with
-junk `this=0xE3360000`), and the user already pivoted that to
-**"scheduling divergence — alrt should be BLK like Einstein,
-not RUN"** (see "Current stop" section above).
+### Static analysis dead end — proceed via runtime probe
 
-So the next iteration's actual priority is the
-**alrt port-message trigger investigation** — find what message
-wakes alrt, vs Einstein where alrt stays parked in Receive.
-Steps detailed in "Current stop" #1-#4. Page-allocator forensics
-parked until/unless the scheduling fix exposes a remaining
-aliasing problem.
+To inspect the allocator's recycle behaviour we need a
+hypervisor-side **`svc #0x1B` trap** that:
+
+1. Filters guest svcs to msg=5 with r0 == `*(GUEST_RAM_BASE +
+   0x0c104eec - GUEST_RAM_VA_BASE)` (= the page-mon-id at
+   runtime).
+2. Logs the args buffer at entry: `(*0x0c101054, count, this+24)`.
+3. Logs the args buffer at exit: `(returned_PA, ?, ?)`.
+4. Maintains a `seen_PA → first_caller_PC` map and prints the
+   decisive pair when a duplicate is detected.
+
+That gives us a precise alloc log. Combined with the existing
+verify-mmu detector, we can name the offending caller chain.
+
+### Aliasing remains the priority
+
+Per user directive (2026-04-28): no other debugging until
+aliasing is zero. The 36-KiB FMNewStack patch is reverted but
+the underlying aliasing question is open. Concretely the next
+iteration should:
+
+1. Add the `svc #0x1B` probe (above). Cold-boot, capture log.
+2. Re-apply the 36-KiB FMNewStack patch set on top of the probe
+   and capture a second log; diff shows the alloc difference.
+3. Identify the desync (likely a slot-size-dependent constant
+   inside the kernel allocator that we missed in the audit).
+4. Patch that constant; confirm zero aliases.
+
+Until that loop closes, the alrt-task DABT and any other later
+wedge is **deliberately not investigated**.
 
 ### Original bisect strategy (kept for reference)
 

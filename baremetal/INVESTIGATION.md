@@ -190,28 +190,35 @@ indirection. Captured in `docs/DISASM.md` "Jump-table aliasing".
 The body at `0x00258EC0` is a 17-instruction SWI shim that
 packages `(*0x0c101054, count, this+24)` into a 3-word arg
 buffer and hands it off via `MonitorDispatchSWI` (svc #0x1B).
-The kernel SWI handler routes msg #5 to PageMonProc at
-`0x0025925C`, which then jumps to `vtable[1]` of the monitor
-object pointed to by `*0x0c104eec`. **That vtable handler is
-where the actual page-allocator lives**, and it's NOT visible
-in `rom.dis` — kernel data, not text. Pseudocode now in
-`docs/STRUCTURES.md` "End-to-end page allocation".
+`*0x0c104eec` is a **kernel monitor handle (integer)** — copied
+in by `CopyObject__9TUMonitor` at `StaticInit` time — not a
+vtable pointer. The kernel SWI handler binds the handle to the
+allocator proc at `RegisterPageMonitor` time via msg #3.
 
-So further static disassembly is a dead end. To inspect the
-allocator's free-list / recycle behaviour we'd need either:
+The local `PageMonProc` at `0x0025925C` IS a vtable trampoline
+(jumping to `vtable[1]+4`), but it's the LOCAL `TUDomainManager`
+object's own monitor-proc stub — used when this domain is
+called as a fault monitor — not the allocator-side handler.
 
-- A hypervisor-side `svc #0x1B` trap that logs every (msg=5,
-  args_buf) call and decodes the in-place return.
-- A runtime walk: read `*0x0c104eec` at boot, follow `[+0]` to
-  vtable, dereference `[+4]` for the handler PC, grep `rom.dis`.
+So further static disassembly of the allocator path is a dead
+end: the allocator proc is registered at runtime, keyed by the
+kernel monitor handle, and the registration target isn't a
+constant in `rom.dis`. To observe it we need a runtime probe —
+specifically, a hypervisor `svc #0x1B` trap filtered on `r0 ==
+*0x0c104eec && r1 == 5`, logging the args buffer at entry and
+exit (the returned PA is written in-place to args_buf[0]).
 
-**Pivot.** The 36-KiB FMNewStack patch was a side-quest. The
-remaining wedge is the alrt-task DABT (CheckButton with junk
-this=0xE3360000), and the user already pivoted that to
-"scheduling divergence — alrt should be BLK like Einstein,
-not RUN" (see PLAN.md "Current stop"). Page-allocator
-forensics parked. Next iteration: alrt port-message trigger
-investigation.
+**Course correction (2026-04-28).** Earlier text in this file
+and PLAN.md had pivoted to "alrt-task DABT scheduling
+divergence". User has corrected: **aliasing remains the
+priority until aliases are zero**. Reverted the pivot.
+
+Next iteration: build the `svc #0x1B` hypervisor probe
+described above, capture an alloc log, identify the kernel-side
+desync that the 36-KiB FMNewStack patch triggered (the patch
+itself is internally consistent at the FMNewStack layer; the
+break is somewhere downstream in the page-allocator monitor
+proc).
 
 ## FMNewStack 33→36 KiB patch attempt — REVERTED (2026-04-28)
 

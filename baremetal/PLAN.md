@@ -214,17 +214,19 @@ but always log on the wedge-relevant arg matches):
 
 Concrete next steps:
 
-1. **Stage-2 RO carve-out at IPA 0x0ca6b000.** Convert the 2 MiB
-   stage-2 L1 block at IPA 0x0c800000..0x0ca00000 (or the right
-   block covering 0x0ca6b000) to a table descriptor; install an L2
-   with mostly RW pages backed by their natural PAs, except the
-   single 4 KiB page covering 0x0ca6b000 which is RO. Mirror the
-   existing shadow-stub scratch carve-out pattern at IPA
-   0x06000000 in `src/stage2.rs`. Catch the resulting stage-2 perm
-   fault in `handle_data_abort`, log `(ELR_EL2, HPFAR_EL2,
-   FAR_EL2, decoded value)`, and either drop the write
-   (diagnostic mode — heap stays valid, boot continues) or halt
-   on first hit. Either gives us the writing PC for free.
+1. **Diagnose why post-rebind RO-carve-out doesn't trap.** The
+   stage-2 carve-out works pre-rebind (256 writers logged) and the
+   post-rebind L3 entry reads back RO + valid + host-PA-correct,
+   but no perm faults fire on the new PA (`0x04032000`) between
+   transitions #2 and #3. Most likely: the kernel's stage-1 has
+   the heap VA at user-mode RO, so writes via that VA stage-1
+   DABT into the kernel's own DAH (forwarded by our `0x10`
+   trampoline) before stage-2 sees them. Verify by reading the
+   L1[0xCA] / L2 entry for VA `0x0ca6b000` from
+   `heap_watch::sample` and logging on the post-rebind read.
+   If confirmed, switch to a different observation strategy
+   (e.g. `handle_diag` already sees every kernel-forwarded DABT —
+   add a hook there for FAR matching the heap header).
 2. Cross-check Einstein at the equivalent boot offset (NewtonProbe
    60 s) — dump Einstein's RelocHeap header at the same point and
    diff. If Einstein's heap stays valid, the bug is hypervisor-side
@@ -234,12 +236,6 @@ Concrete next steps:
    handler gap (stage-2 fault on a write that should have trapped
    cleanly) or a behavioural mirror (kernel does something Einstein
    doesn't because of an earlier divergence we need to match).
-
-The trap-stream sampling is exhausted: heap_watch (now with
-source-tagged ring entries) shows that the corruption window is
-between ordinary UND-trampoline emulations and a kernel-forwarded
-DABT, with nothing in EL2 touching the heap; the writer is a
-plain guest store we can only catch with a stage-2 trap.
 
 ## Earlier stop — newt self-deadlocks on the heap-store TULockingSemaphore
 
@@ -410,6 +406,13 @@ the boot is steady-state-quiet:
   plus the ring buffer to the kernel console. Used to bracket the
   RelocHeap-header corruption writer to a tight trap-stream window.
   Remove with the rest of this stop's scaffolding.
+- `heap_watch::arm_carve_out_at_heap_va` + the carve-out branch
+  in `handle_data_abort` — installs a stage-2 RO carve-out on
+  the 4 KiB page backing `VA=0x0ca6b000`, follows the VA across
+  stage-1 rebinds, and logs every guest-side perm fault on the
+  page (writer ELR + IPA + decoded value when ISV=1).
+  `stage2::ram_page_l3_entry` is the readback helper for
+  verification. Remove together with the heap_watch sentinel.
 
 Once the boot quiesces these can be pulled; the behavioural invariants
 they enforce are codified in guest tests.

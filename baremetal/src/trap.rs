@@ -405,6 +405,21 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
     let is_permission = (ifsc & 0b111100) == 0b001100;
     if wnr && is_permission && (ram_base..ram_end).contains(&ipa) {
         let page = (ipa as u32) & !0xFFF;
+
+        // Heap-watch carve-out: log writer info before the auto-flip,
+        // and arm a re-RO at the next trap so the next write also
+        // faults. See `src/heap_watch.rs`.
+        if crate::heap_watch::is_carved_out_ipa(page) {
+            let value = if isv != 0 {
+                Some(ctx.x[srt] as u32)
+            } else {
+                None
+            };
+            crate::heap_watch::note_perm_fault_on_carve_out(
+                elr, ipa as u32, value, isv != 0, srt as u32,
+            );
+        }
+
         // SAFETY: helper performs its own TLB maintenance.
         unsafe { crate::stage2::set_ram_page_rw_xn(page); }
         // Don't advance ELR — the CPU retries the write.

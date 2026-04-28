@@ -234,10 +234,16 @@ unsafe fn install_locked(ipa: u32) -> i32 {
     }
 
     table[slot_idx] = Slot { ipa, orig };
-    kprintln!(
-        "guest_bp: installed at {:#010x} (slot {}, orig={:#010x})",
-        ipa, slot_idx, orig
-    );
+    // Suppress the per-install kprintln for the SearchFreeList re-arm
+    // path — handle_user_bp_und re-installs on every benign walk and
+    // would otherwise saturate the log. Genuine bp installations from
+    // gdb/main land here only once and stay loud.
+    if ipa != 0x0031_3308 {
+        kprintln!(
+            "guest_bp: installed at {:#010x} (slot {}, orig={:#010x})",
+            ipa, slot_idx, orig
+        );
+    }
     slot_idx as i32
 }
 
@@ -318,6 +324,40 @@ pub fn handle_user_bp_und(
         }
     };
 
+    // SearchFreeList `ldr r3, [r0]` (ROM 0x00313308) fast path. Emulate
+    // the load in EL2 instead of restoring the ROM word — that way the
+    // marker UDF stays in place and every subsequent walk re-enters this
+    // arm without us paying for restore-word + install_guest_bp ROM
+    // churn. Re-occupy the slot manually since the dispatcher above
+    // released it.
+    if faulting_pc == 0x0031_3308 {
+        let r0 = ctx.x[0] as u32;
+        match crate::guest_mem::read_word_va(r0) {
+            Some(value) => {
+                ctx.x[3] = value as u64;
+                lock();
+                // SAFETY: LOCK gives exclusive access; we're putting back
+                // the slot we just freed at the top of the dispatcher.
+                unsafe {
+                    let table = &mut *core::ptr::addr_of_mut!(TABLE);
+                    table[slot_idx] = Slot { ipa: faulting_pc, orig: s.orig };
+                }
+                unlock();
+                trap::return_to_guest_from_und(
+                    ctx, (faulting_pc + 4) as u64, spsr_und,
+                );
+                return true;
+            }
+            None => {
+                kprintln!(
+                    "*** SearchFreeList wild r0={:#010x} (stage-1 translate failed) ***",
+                    r0
+                );
+                // Fall through to the full dump path below.
+            }
+        }
+    }
+
     kprintln!(
         "guest_bp: HIT at {:#010x} (slot {}) — restored, one-shot consumed",
         faulting_pc, slot_idx
@@ -397,6 +437,62 @@ pub fn handle_user_bp_und(
     if faulting_pc == 0x0011_D844 {
         kprintln!("    (halting after USR LDRB-post dump — diagnostic scaffolding)");
         crate::cpu::halt();
+    }
+
+    // SearchFreeList `ldr r3, [r0]` (ROM 0x00313308) — only reached
+    // here when the early dispatcher above failed to translate r0 (i.e.
+    // it would fault). Dump heap context + freelist chain and halt.
+    if faulting_pc == 0x0031_3308 {
+        let r0 = ctx.x[0] as u32;
+        let r1 = ctx.x[1] as u32;
+        {
+            kprintln!(
+                "    *** SearchFreeList wild r0 ptr — heap={:#010x} corrupt-next={:#010x} ***",
+                r1, r0,
+            );
+            // Walk heap @ r1: dump the first 128 bytes of the heap header
+            // so we can see [+28]=size, [+32]=start, [+72]=saved freelist
+            // position, [+92]=flags.
+            kprintln!("      heap[{:#010x}] header (128 bytes):", r1);
+            for off in (0..128u32).step_by(16) {
+                let mut row = [0u32; 4];
+                for i in 0..4u32 {
+                    row[i as usize] = crate::guest_mem::read_word_va(r1.wrapping_add(off + i * 4))
+                        .unwrap_or(0xDEADBEEF);
+                }
+                kprintln!(
+                    "        +{:#04x}  {:#010x} {:#010x} {:#010x} {:#010x}",
+                    off, row[0], row[1], row[2], row[3]
+                );
+            }
+            // Walk freelist starting at heap[+72]: ptr to first node, then
+            // node->next chain (offset +4 from each node) until we either
+            // wrap to heap[+32] (start) or hit the corrupt next.
+            let mut p = crate::guest_mem::read_word_va(r1.wrapping_add(72)).unwrap_or(0);
+            let start = crate::guest_mem::read_word_va(r1.wrapping_add(32)).unwrap_or(0);
+            kprintln!(
+                "      freelist walk: heap[+72]={:#010x} heap[+32]={:#010x}",
+                p, start
+            );
+            for step in 0..32u32 {
+                let size = crate::guest_mem::read_word_va(p).unwrap_or(0xDEADBEEF);
+                let next = crate::guest_mem::read_word_va(p.wrapping_add(4)).unwrap_or(0xDEADBEEF);
+                kprintln!(
+                    "        node[{:>2}] @{:#010x} size={:#010x} next={:#010x}",
+                    step, p, size, next
+                );
+                if next == r0 {
+                    kprintln!("        ↑ this node holds the corrupt next ptr");
+                    break;
+                }
+                if next == 0 || next == start {
+                    break;
+                }
+                p = next;
+            }
+            kprintln!("    (halting after SearchFreeList wild-r0 dump — diagnostic scaffolding)");
+            crate::cpu::halt();
+        }
     }
 
     restore_word(faulting_pc, s.orig);

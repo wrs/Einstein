@@ -173,7 +173,50 @@ inputs we choose to feed it.
   on QEMU; `--platform fvp` runs the same suite on the FVP. Both
   must stay green. See "Verification" near the end of this file.
 
-## Current stop — newt self-deadlocks on the heap-store TULockingSemaphore
+## Current stop — bogus heap pointer in newt's MakeStoreObject path
+
+The bus-error throw inside `CardFaultMonProc` (0x4e528) is triggered
+upstream by a DABT at `SearchFreeList` PC=0x00313308 with
+FAR=0xe52d006c. The "heap" pointer that `GetCurrentHeap` returns at
+that point (0x0ca6b010) is **not a real heap** — its 128-byte header
+contains saved return addresses and stack pointers from
+`__ct__18TStoreObjectWriter` / `__ct__9TRefStackFv` (e.g. heap[+0] =
+0x002dd804, heap[+72] = 0x002dfa20 — both ROM PCs inside
+`MakeStoreObject`). The freelist walker treats those ROM bytes as
+node descriptors and dereferences `0xe52d006c` (literally the
+encoding of `str r0, [sp, #-108]!`).
+
+Einstein's probe shows 22 page-grow DABTs at PC=0x002DDF2C / FAR=
+0x0CDDDC00 right after the last common stack-grow (FAR=0x0cc81ff8).
+We take **none** of those. If our stage-1 already covers that
+range (stale from a prior recovery, or different lazy-grow accounting
+than Einstein), the writes near the new `__ct__18TStoreObjectWriter`
+buffer land but later reads pick up unrelated bytes, fitting the
+"freelist points at instructions" symptom.
+
+Diagnostic scaffolding (still installed):
+
+- `kmain` calls `guest_bp::install_guest_bp(0x0031_3308)`.
+- `handle_user_bp_und` for that PC: emulate `ldr r3, [r0]` if the
+  guest VA translates; on translate-fail, dump the bogus "heap"
+  header + freelist chain and halt. The marker UDF stays in ROM so
+  every iteration re-traps cheaply (no restore/install ROM churn).
+
+Concrete next steps:
+
+1. With the bp still loaded, also BP at the kernel's stack-grow
+   recovery exit (right after `bl NewStack` in `__ct__9TRefStackFv`,
+   PC=0x001a4948) and at `SetCurrentHeap` (0x142df0). Confirm whether
+   our run skips the 22 page-grows Einstein takes (stage-2 already
+   maps the pages?) or whether `SetCurrentHeap` is wrongly invoked.
+2. Walk newt's stage-1 L1 around `0x0CDD0000..0x0CDF0000` before
+   divergence and compare to a healthy sibling task's coverage.
+3. If the divergence is "stage-1 has stale mappings", figure out
+   which prior recovery left them and undo the persistence. If it's
+   "we miss page-grows because the kernel chose a different VA",
+   match Einstein's NewStack accounting.
+
+## Earlier stop — newt self-deadlocks on the heap-store TULockingSemaphore
 
 `newt` is permanently queued on a TSemaphore at `0x0c116eb8`'s
 BlockOnInc list (queue at `+0x20 = 0x0c116ed8`). The owning
@@ -325,6 +368,10 @@ the boot is steady-state-quiet:
   HVC `#0x50` (tracer TAG) suppressed to avoid doubling trace output.
 - Bring-up VA walks in `handle_diag`.
 - BootOS / PowerOffAndReboot / Reboot canaries in `rom_patches.rs`.
+- `guest_bp` install at ROM 0x00313308 from `kmain` (SearchFreeList
+  bus-error tripwire) plus the 0x0031_3308 arm in `handle_user_bp_und`
+  that emulates the LDR + halts on translate failure. Remove once the
+  upstream `GetCurrentHeap` divergence is fixed.
 
 Once the boot quiesces these can be pulled; the behavioural invariants
 they enforce are codified in guest tests.

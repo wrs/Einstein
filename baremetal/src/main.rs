@@ -121,6 +121,13 @@ pub extern "C" fn kmain() -> ! {
     // two key points on the PrimGetEnvDomainName path — post-both-STRBs
     // in the kernel, and post-LDRB in USR — so we can compare byte flag
     // state with Einstein at the same cycle.
+    //
+    // Diagnostic scaffolding: bp at SearchFreeList's `ldr r3, [r0]`
+    // (ROM 0x00313308) so handle_user_bp_und can intercept the wild-r0
+    // bus-error case. Benign in-RAM walks re-arm silently; wild-r0 dumps
+    // heap header + freelist chain and halts.
+    let rc = guest_bp::install_guest_bp(0x0031_3308);
+    kprintln!("guest_bp: SearchFreeList tripwire install rc={}", rc);
     kprintln!();
     kprintln!("Entering Newton ROM...");
 

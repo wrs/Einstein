@@ -42,7 +42,76 @@ quiesces on the same path without ever getting there.
 
 ## Pending follow-ups
 
-### Active stop: newt self-deadlocks on its own heap semaphore (2026-04-27)
+### Bus-error origin pinned to PC=0x00313308, FAR=0xe52d006c (2026-04-27, evening)
+
+Cold-boot-with-quiet log (`/tmp/run-quiet.log`) plus a hypervisor-side bp
+at SearchFreeList's `ldr r3, [r0]` (ROM 0x00313308; install in `kmain`,
+emulation+halt-on-wild-r0 in `handle_user_bp_und`) gives a single dump
+when the bus-error chain fires:
+
+- DAH-OR[8] FAR=0xe52d006c, current task = newt.
+- Faulting PC 0x00313308 in `SearchFreeList` (ROM 0x003132d8).
+- ctx at the fault: r0=0xe52d006c, r1=0x0ca6b010, r4=0x7c (request
+  size), r9=0x0ca6b12c (= r1+0x11c), lr_usr=0x003132ec (back in the
+  same fn), fp=0x0cc81f14, sp_usr=0x0cc81f04.
+
+The "heap" at r1=0x0ca6b010 is NOT a real heap. Its 128-byte header has
+ROM PCs at +0x00, +0x04, +0x20, +0x24 instead of vtable / size / start /
+freelist position:
+
+```
++0x00 0x002dd804  ; instruction inside __ct__18TStoreObjectWriter,
+                  ; right after `bl __ct__9TRefStackFv` at 0x2dd800
++0x04 0x001a48f0  ; first body instruction of __ct__9TRefStackFv
++0x08 0x0c645f0c  ; RAM+0x14 0x0cc825e0  ; stack pointer
++0x18 0x0cc82510  ; stack pointer
++0x1c 0x0cc82038  ; stack pointer (read as heap[+28]="size limit")+0x20 0x002dfa20  ; instruction `mov r0, #0` at MakeStoreObject; read
+                  ; as heap[+32]="freelist start sentinel"+0x24 0x002dd7c4  ; instruction inside __ct__18TStoreObjectWriter
++0x28 0x0c6437b4  ; RAM
++0x2c 0x0cd51800  ; the new TRefStack stack base from the latest
+                  ; NewStack POST-SWI in this trace+0x30 0x0cd51800  ; same+0x38 0x0000012c  ; 300 = TRefStack::ctor's `mov r0, #0x12c`
++0x48 0x002dfa20  ; heap[+72]="saved freelist position" — same ROM PC
+                  ; as +0x20
+```
+
+freelist walk reads node[0]@0x002dfa20 = `{size=0xe3a00000 (= mov r0,#0
+insn), next=0xe52d006c (= str r0,[sp,#-108]! insn)}` — i.e. the walker
+is interpreting MakeStoreObject's body as a freelist node.
+
+So `GetCurrentHeap` (which reads `*(*0x0c10105c - 16)` = current task's
+`globals[-16]`) returns a pointer to something that is **not a heap** —
+likely a TStoreObjectWriter / TRefStack / CatchHeader struct that has
+saved return addresses where heap header fields belong. Walking it as
+a heap reads ROM bytes that look like instruction encodings (0xe52d006c
+= `str r0, [sp, #-108]!` — the function-prologue stack push), and the
+next-pointer dereference faults with FAR=0xe52d006c.
+
+Einstein doesn't hit this fault (probe log: 38 unique data-abort
+tuples, all FAR ≤ 0x0CDDDC00, none with FAR=0xe5xxxxxx). So between
+DAH-OR[7] (FAR=0x0cc81ff8 — the last common stack-grow we both take)
+and the divergence, our hypervisor either:
+- writes the wrong value into newt's `globals[-16]` (our `SetCurrentHeap`
+  source), or
+- reads `globals[-16]` from the wrong memory backing (stage-2 bug, or
+  task-globals lookup pointing at the wrong page), or
+- skips a normal heap-init step that Einstein performs (page-grow
+  DABTs at PC=0x002DDF2C / FAR=0x0CDDDC00 that Einstein takes 22 times
+  but we don't take at all — those are exactly inside the 0x002dxxxx
+  `MakeStoreObject` / `TStoreObjectWriter` neighbourhood whose code
+  bytes leak into our walker).
+
+Diagnostic scaffolding stays loaded for now (kmain installs the bp,
+handle_user_bp_und emulates the LDR + halts on wild r0). The next
+concrete step is to identify why we miss the 22 `0x002DDF2C / FAR=
+0x0CDDDC00` page-grow faults Einstein takes — those faults come from
+`str r1, [r2], #4` inside what looks like TStoreObjectWriter::Prescan
+(ROM 0x002dde20 region), populating a stack-allocated buffer. If our
+stage-1 page table already has those pages mapped (so no DABT fires),
+the writes land but read-back later returns ROM bytes from a stale
+mapping — exactly the symptom we see. Inspect newt's L1/L2 entries
+covering 0x0c... in the stack-grow window before the divergence.
+
+### Earlier: newt self-deadlocks on its own heap semaphore (2026-04-27, am)
 
 `newt` is queued on `q=0x00000000/0x0c116ed8`. That queue address is
 **TSemaphore + 0x20** (the BlockOnInc queue) of a TSemaphore at

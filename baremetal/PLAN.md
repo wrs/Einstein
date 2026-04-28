@@ -404,38 +404,71 @@ the kernel's SWI handler binds that id to the proc.
 runs when IT is itself called as a fault monitor — not the
 allocator-side proc.
 
-### Static analysis dead end — proceed via runtime probe
+### Runtime probe done — TUDomainManager::Get does NOT recycle PageIds
 
-To inspect the allocator's recycle behaviour we need a
-hypervisor-side **`svc #0x1B` trap** that:
+Implemented as `handle_page_get_probe` in `src/trap.rs`, ROM
+patch `PAGE_GET_PROBE` in `src/rom_patches.rs`. Patches the
+`teq r0, #0` at `0x00258EFC` (immediately after
+`bl MonitorDispatchSWI` in Get) with `HVC #0x53`. Runs from
+both SVC-direct and USR→UND-trampoline paths; emulates the
+original `teq` flag effect by writing N/Z back to either
+SPSR_EL2 or `UND_SAVE_SPSR_IPA` depending on the entry path.
+Caller LR is recovered by walking Get's APCS frame at fp[-4]
+(R14 itself is clobbered by the BL into MonitorDispatchSWI by
+the time the probe fires).
 
-1. Filters guest svcs to msg=5 with r0 == `*(GUEST_RAM_BASE +
-   0x0c104eec - GUEST_RAM_VA_BASE)` (= the page-mon-id at
-   runtime).
-2. Logs the args buffer at entry: `(*0x0c101054, count, this+24)`.
-3. Logs the args buffer at exit: `(returned_PA, ?, ?)`.
-4. Maintains a `seen_PA → first_caller_PC` map and prints the
-   decisive pair when a duplicate is detected.
+**Result of cold-boot up to the existing Reboot canary
+(2026-04-28):**
 
-That gives us a precise alloc log. Combined with the existing
-verify-mmu detector, we can name the offending caller chain.
+- 28 successful Get calls, all with `caller_lr=0x001F87C0`
+  (= AllocNewPage's bl-Init return) and `count=2`.
+- All returned a **distinct** Newton page id (range
+  `0x136B..0x2A5B`, low 4 bits = `0xB` consistently — the
+  PageId encoding tags low-flags).
+- **ZERO duplicate-PageId returns detected.**
 
-### Aliasing remains the priority
+Conclusion: **Get is not the source of the 12 baseline RAM
+aliases observed by verify-mmu.** The hypothesis from the
+prior iteration's trace bisection — "TUDomainManager::Get
+recycles PAs across consumers" — is refuted, at least in the
+no-patch baseline.
 
-Per user directive (2026-04-28): no other debugging until
-aliasing is zero. The 36-KiB FMNewStack patch is reverted but
-the underlying aliasing question is open. Concretely the next
-iteration should:
+### Where the aliasing actually originates — pivot to RememberPhysMap
 
-1. Add the `svc #0x1B` probe (above). Cold-boot, capture log.
-2. Re-apply the 36-KiB FMNewStack patch set on top of the probe
-   and capture a second log; diff shows the alloc difference.
-3. Identify the desync (likely a slot-size-dependent constant
-   inside the kernel allocator that we missed in the audit).
-4. Patch that constant; confirm zero aliases.
+The 12 baseline aliases (per the inventory at the top of this
+file) are mostly stack-guard sharing: adjacent stacks at
+33-KiB intervals straddle a 4-KiB page, and the kernel relied
+on subpage-AP to give each stack its own sub-slot of the
+shared page. Our flat AP=011 collapses this to one PA-with-two-
+VAs. The kernel must be calling `RememberPhysMap` (or
+`RememberPermMap`) with the same PA but two different VAs —
+not because Get is recycling, but because the kernel
+*intentionally* creates the alias to implement subpage-AP
+intent. Examples in the inventory:
 
-Until that loop closes, the alrt-task DABT and any other later
-wedge is **deliberately not investigated**.
+- `PA=0x04028000 ↔ VA 0x0c310000 / 0x0c318000` (last page of
+  stack #10, last page of stack #11) — 33-KiB stride, shared
+  4-KiB boundary page.
+
+So the next iteration's actual investigation target is:
+
+1. **Probe the `RememberPhysMap` family** (entries at
+   `0x00259284`, `0x00259304`, `0x002589f0`, `0x00258a58`)
+   with a second HVC patch on the SWI shim, logging
+   `(env_id, va, pa, perm)` tuples per call. Detect when a
+   PA gets written to a second VA.
+2. Cross-reference the resulting map against verify-mmu's
+   alias enumeration to confirm 1:1 correspondence.
+3. With the kernel-side aliasing source decoded, design an
+   intervention: either (a) patch the kernel's stack-pool
+   allocator so it doesn't share the boundary page (the
+   FMNewStack 36-KiB patch was the right idea but had a
+   different unrelated regression — re-investigate why with
+   the new probe data), or (b) add a hypervisor-side shadow-
+   page mechanism so stage-2 isolates the apparent aliases.
+
+Until aliases are zero, the alrt-task DABT and any other
+later wedge stays **deliberately not investigated**.
 
 ### Original bisect strategy (kept for reference)
 

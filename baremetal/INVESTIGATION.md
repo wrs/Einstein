@@ -220,6 +220,41 @@ itself is internally consistent at the FMNewStack layer; the
 break is somewhere downstream in the page-allocator monitor
 proc).
 
+### Update (2026-04-28 ctd) — page-allocator probe says Get does NOT recycle
+
+Built the probe as a ROM patch on `0x00258EFC` (the `teq r0, #0`
+after `bl MonitorDispatchSWI` inside Get) → `HVC #0x53`. Handler
+in `trap.rs::handle_page_get_probe`. Reaches via either SVC-direct
+or USR→UND-trampoline path; emulates the `teq` flag effect by
+writing N/Z to the appropriate SPSR slot. Caller LR is recovered
+by walking Get's APCS frame at `fp[-4]` since R14 itself is
+clobbered by the BL.
+
+**Cold-boot result (no FMNewStack patch, baseline state):**
+
+- 28 successful Get calls before the existing Reboot-canary
+  wedge.
+- All callers: `0x001F87C0` (= AllocNewPage's bl-Init return PC).
+- All `count = 2` and same `domain_field = 0x0c112cd0`.
+- Returned page IDs: 28 distinct values in
+  `0x136B..0x2A5B`, all ending in `0xB` (low-bit flags).
+- **0 duplicate-PageId returns detected.**
+
+So the prior iteration's "Get is recycling PAs" hypothesis is
+**refuted at the baseline.** The 12 verify-mmu aliases observed
+during this same boot (3 kernel-globals self-mapping +
+9 stack-guard-sharing) are NOT created by Get returning the
+same PA twice. They must come from the `RememberPhysMap` /
+`RememberPermMap` layer where the kernel deliberately writes
+two L2 entries pointing at the same PA (subpage-AP intent
+that ARMv7 strict-AP collapses to plain aliasing).
+
+Next iteration target: probe the `RememberPhysMap` family
+(0x00259284 / 0x00259304 / 0x002589F0 / 0x00258A58). Detect
+when a PA gets installed at a second VA → that's where the
+kernel-side aliasing mechanism lives, and it's the layer to
+fix (or compensate for via shadow pages).
+
 ## FMNewStack 33→36 KiB patch attempt — REVERTED (2026-04-28)
 
 User: "Don't give up on the patch unless it's actually impossible."

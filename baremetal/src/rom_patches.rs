@@ -149,6 +149,19 @@ const PATCHES_717006: &[RomPatch] = &[
     // `docs/STRUCTURES.md` "1-KiB allocator audit" for the full
     // catalogue of 1-KiB sites.
     RomPatch { offset: 0x0014_28B8, value: 0xE3A0_4A01, name: "ZapHeap: force chunk/lock size = 4096" },
+    // Page-allocator probe — patches the `teq r0, #0` at 0x00258EFC
+    // (immediately after `bl MonitorDispatchSWI` in TUDomainManager::Get)
+    // with HVC #PAGE_GET_PROBE_HVC_IMM. Handler in trap.rs::handle_page_get_probe
+    // logs (returned_PA, count, domain_field, caller_lr) and detects
+    // duplicate-PA returns, then emulates the original `teq` by
+    // setting SPSR_EL2 N/Z bits so the following ldreq/streq behave
+    // correctly. Diagnostic; remove once aliasing root cause is
+    // identified and fixed.
+    RomPatch {
+        offset: PAGE_GET_PROBE_PC,
+        value: hvc_insn(PAGE_GET_PROBE_HVC_IMM),
+        name: "TUDomainManager::Get post-SWI page-allocator probe",
+    },
     // (FMNewStack 33→36 KiB patch reverted 2026-04-28 — see PLAN.md
     // "Patch attempt 1" + STRUCTURES.md "End-to-end page allocation".
     // Patch was internally consistent for slot-size/placement (NewStack
@@ -516,6 +529,25 @@ pub const DAH_OR_CHAIN_HVC_IMM:       u32 = 0x52;
 pub const DAH_OR_CHAIN_PC:            u32 = 0x0039_3318;
 const DAH_OR_CHAIN_INSN:              u32 = 0xE59F_1634;
 pub const G_KERNEL_GLOBALS_VA:        u32 = 0x0C10_0FF8;
+
+/// `TUDomainManager::Get` post-SWI probe — instrument the kernel's
+/// page allocator to log every (caller_lr, returned_PA, count,
+/// domain_field) tuple and detect duplicate-PA returns. The patched
+/// instruction is the `teq r0, #0` at `0x00258EFC`, immediately after
+/// the `bl 0x3ae320 <MonitorDispatchSWI>` at `0x00258EF8`. The probe
+/// runs in source mode (typically SVC since Get is called from
+/// FMNewStack/AllocNewPage on the SWI fault path); after logging it
+/// emulates the original `teq r0, #0` by setting SPSR_EL2 N/Z so the
+/// following `ldreq r1, [sp]; streq r1, [r4]` continue correctly.
+///
+/// See PLAN.md "Static analysis dead end — proceed via runtime
+/// probe" for the motivation and STRUCTURES.md "End-to-end page
+/// allocation" for the args-buffer layout.
+pub const PAGE_GET_PROBE_HVC_IMM:     u32 = 0x53;
+pub const PAGE_GET_PROBE_PC:          u32 = 0x0025_8EFC;
+// The original instruction at PAGE_GET_PROBE_PC is `teq r0, #0`
+// (= 0xE3300000); the HVC handler emulates it by setting SPSR_EL2
+// N/Z bits before ERET, so we don't need to re-execute the literal.
 
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix

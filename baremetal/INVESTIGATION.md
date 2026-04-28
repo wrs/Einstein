@@ -4,6 +4,77 @@ Live notes for the next iteration. Replace this file's body when the
 current stop is fixed and a new one takes over — git history is the
 archive of past investigations.
 
+## Subpage-AP decoded: kernel partitions shared 4 KiB pages into per-VA subpage owners (2026-04-28)
+
+Extended `duplicate_pa_scan` in NewtonProbe to print the full
+L2 entry value for each aliased page's mapping, plus a decoded
+ARMv4 subpage-AP[3..0] field per VA.
+
+Result for several Einstein RAM-aliased pages:
+
+```
+PA=0x04035000 mapped by 2 VAs:
+  VA=0x0c328000 L2=0x04035f0e  AP[3..0]=[R/W, R/W, NA, NA]
+  VA=0x0cc82000 L2=0x040350fe  AP[3..0]=[NA, NA, R/W, R/W]
+
+PA=0x0403f000 mapped by 3 VAs:
+  VA=0x0ccdd000 L2=0x0403f03e  AP[3..0]=[NA, NA, NA, R/W]
+  VA=0x0cce4000 L2=0x0403ff0e  AP[3..0]=[R/W, R/W, NA, NA]
+  VA=0x0cd07000 L2=0x0403f0ce  AP[3..0]=[NA, NA, R/W, NA]
+
+PA=0x0401f000 mapped by 2 VAs:
+  VA=0x0c600000 L2=0x0401fc0e  AP[3..0]=[R/W, NA, NA, NA]
+  VA=0x0ccab000 L2=0x0401f3fe  AP[3..0]=[NA, R/W, R/W, R/W]
+
+PA=0x0402a000 mapped by 3 VAs:
+  VA=0x0cc7a000 L2=0x0402a03e  AP[3..0]=[NA, NA, NA, R/W]
+  VA=0x0cca3000 L2=0x0402a0ce  AP[3..0]=[NA, NA, R/W, NA]
+  VA=0x0ccac000 L2=0x0402af0e  AP[3..0]=[R/W, R/W, NA, NA]
+```
+
+Pattern: each shared 4 KiB page is partitioned into 1 KiB
+subpages with each VA owning a non-overlapping subset. The
+non-owned subpages are marked AP=00 (NA) — meaning "user
+access faults". ARMv4 enforces this per-subpage; ARMv7 has no
+subpage-AP at all — only one whole-page AP[2:0] per L2 entry.
+
+When `fix_stage1_xn_bits` runs, it flattens every entry to
+ARMv7 small-page form with AP=011 (full RW). The per-subpage
+NA bits are lost. **This is the architectural divergence** —
+ARMv7 simply can't represent the kernel's subpage-AP intent.
+
+Implications for the heap-aliasing wedge:
+- Heap #3 in our hypervisor lands on PA 0x04032000 alongside
+  newt's stack and pssm's stack.
+- On real ARMv4 hardware, the kernel would set heap #3's L2
+  entry with AP=[R/W, R/W, R/W, R/W] (all subpages owned by
+  heap #3). Stacks' L2 entries would name a different PA.
+  Or: if the kernel ever DOES put heap and stacks on the same
+  page (which Einstein's evidence shows is normal for
+  stack-with-stack pairings), it would set per-subpage AP so
+  user-mode writes from a stack land only in the stack's
+  subpages.
+- On ARMv7, our flattened AP=011 lets user-mode writes hit
+  ALL subpages of the page. A stack write spills into heap
+  #3's subpages → heap struct corruption.
+
+The user's framing is precise: kernel objects that EXPECT to
+catch user-mode write faults (the NA-subpage owners) must not
+share a page with objects that DON'T (the R/W-subpage
+owners). On ARMv4 this is enforced architecturally. On ARMv7
+we have to enforce it by allocation: any fault-expecting
+object gets its own physical page.
+
+Stacks already get this protection via
+`apply_resolve_fault_wrapper`. Heaps don't. Hence the bug.
+
+Note: the user's heaps-vs-objects distinction matters. Many
+kernel objects are "just data" with all subpages R/W —
+they're fine sharing pages with each other. The risk is only
+for objects whose kernel intent includes "fault on user write
+to this subpage." The wrapper for those objects must ensure
+they never share a page with R/W-owning objects.
+
 ## Einstein cross-check: aliasing is normal kernel behaviour; the bug is WHICH PA backs heap #3 (2026-04-28)
 
 Added `duplicate_pa_scan()` to `baremetal/probe/probe.cpp`,

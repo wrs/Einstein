@@ -213,69 +213,64 @@ them.
 
 ## Concrete next steps
 
-**Major reframe (2026-04-28):** the Einstein cross-check via
-`duplicate_pa_scan()` showed that **Einstein has 17-19 RAM
-duplicate PAs** with 44-49 alias VAs at the equivalent boot
-offset. Aliasing is intentional kernel behaviour — the kernel
-co-locates distinct kernel objects on shared 4 KiB physical
-pages and uses ARMv4 subpage-AP to enforce per-1 KiB-subpage
-permissions. With ARMv7 (no subpage-AP), our `fix_stage1_xn_bits`
-flattens AP=011 (full RW) so writes to one subpage spill into
-another's.
+**Refined framing (2026-04-28):** ARMv4's per-subpage AP lets
+the kernel partition each shared 4 KiB page into 1 KiB
+subpages, with each subpage owned by a different VA. The
+non-owning VAs see those subpages as `AP=00` (NA) — user
+writes FAULT. ARMv7 has no subpage-AP, so `fix_stage1_xn_bits`
+flattens every L2 entry to AP=011 (full RW). Per-subpage
+write-fault enforcement is gone.
 
-**The 1 KiB subpage allocation isn't just for stacks — it's
-also for heaps.** Earlier we assumed only stacks. The
-`apply_resolve_fault_wrapper` at `src/rom_patches.rs:894`
-forces every stack to its own physical page (via 4× ResolveFault
-iter, claiming all 4 subpages for the stack). That isolates
-stacks from each other and from any other kernel object on the
-same page. **Heaps are not currently protected this way.**
+**The kernel design that breaks**: shared pages with
+mixed-intent subpages (some "fault on user write", some
+"user RW"). On real hardware, ARMv4 enforces. On us, all
+subpages are RW so writes intended to fault land silently.
 
-Einstein puts heap #3 alone on PA 0x040a6000. Our hypervisor
-puts heap #3 on PA 0x04032000 alongside two stacks (newt and
-pssm). The difference comes from the kernel's page-pool state
-diverging between us and Einstein before NewHeap #3 runs.
-Einstein avoids corruption by subpage-AP; we corrupt because
-our flat AP lets the stack writes spill into the heap's
-subpage.
+So the task is: **identify every kernel object whose
+allocation expects subpage-AP fault-on-user-write semantics,
+and ensure it gets its own dedicated physical page**.
+The user's distinction matters: most kernel objects don't
+need fault-catching (they're just data, fine on shared
+pages). Only objects that EXPECT to catch user-mode write
+faults (lazy-grow stacks, certain heap structures, etc.)
+need the wrapper-style protection.
 
-So the strategy is to **extend the wrapper-style protection to
-heap allocations**: ensure each heap page is allocated as the
-sole occupant of its 4 KiB physical page, just like we do for
-stacks.
+Concrete next steps:
 
-1. **Find the heap-allocation page-pool path.** NewHeap calls
-   into `__nw__FUi` (operator new) or directly into the
-   page-allocator. Identify the heap-side `FindOrAllocPage`
-   equivalent. Likely candidates: `FMLockHeapRange`, the
-   `__nw__FUi` path, or a heap-specific TUPageManager call
-   site. Symbol search:
-   - `FMLockHeapRange` at 0x001f6b94 region (already known
-     from the wrapper's BL-not-patched comment).
-   - `__nw__FUi` at 0x001bce738.
-   - `TUPageManager::Get` at 0x00162af4 (we saw this from a
-     prior symbol lookup).
-2. **Mirror the wrapper for heaps.** Build the analog of
-   `apply_resolve_fault_wrapper` for whichever function ends
-   up being the heap-side analog of `TStackManager::Fault`.
-   The wrapper's job: force fresh-page allocation per heap
-   subpage, claim all 4 subpages of the page for the heap.
-3. **Watch for second-order effects.** The stack wrapper's
-   interaction with the kernel's page-pool was already a
-   source of subtle behaviour shifts. Adding a heap wrapper
-   should be paired with the existing alias-onset detector
-   so we catch any new corruption immediately.
-4. **Diagnostic alternative.** If a wrapper-style fix is too
-   invasive to design quickly, a stage-2-side fix could
-   detect heap pages and refuse to alias them at stage-1.
-   Larger lift but more robust.
-
-The aliasing IS the kernel's intent; our hypervisor's job is
-to either preserve subpage-AP semantics (impossible on
-ARMv7) or arrange the kernel's allocations such that no
-shared page contains two regions whose subpage offsets
-would overlap. The wrapper takes the second approach for
-stacks; the next step is to take it for heaps too.
+1. **Survey which kernel allocation paths use subpage-AP
+   fault-catching.** Search the ROM (or `_Data_/symbols.txt`)
+   for write paths into L2-entry construction. Specifically:
+   - `TStackManager::ResolveFault` and surrounding (already
+     wrapped for fault-catching expectations).
+   - `FMLockHeapRange` (= heap-side stage-1 mapping path).
+     Does it set per-subpage AP, or always all-R/W?
+   - `TUMonitor` / `TUPageManager` interactions when memory
+     is mapped into kernel structures.
+   - Heap creation: does the kernel's `NewHeap` chain
+     intentionally request subpage-AP-protected pages, or
+     does the heap allocator just rely on fresh whole pages?
+2. **For each path that intends fault-catching, force
+   fresh-page allocation.** Build a `apply_resolve_fault_
+   wrapper`-style stub for the heap-side path. Goal: when
+   the kernel asks to map a page that would otherwise share
+   a physical page with a fault-expecting object, redirect
+   to a fresh page where AP=011 universally (no
+   fault-catching needed) or AP=001 universally (whole-page
+   fault-catching).
+3. **Use the duplicate-PA scan + alias-onset detector as
+   regression catchers.** They're already wired; rerun after
+   each fix to confirm no new aliasing of a fault-expecting
+   page.
+4. **Cross-check Einstein's specific allocation order.** The
+   Einstein dump shows heap #3 alone on PA 0x040a6000,
+   never aliased. Our heap #3 lands on PA 0x04032000
+   shared with two stacks. If our hypervisor diverges
+   from Einstein's allocation order, instrumenting the
+   page-pool's `Get`/`Release` calls would identify the
+   first divergence point. That might suggest a simpler
+   fix than wrapping the heap path — fix whatever causes
+   the divergence and the kernel will allocate the same
+   way Einstein does.
 
 Diagnostic scaffolding (heap-watch sentinel, stage-2 RO
 carve-out, sanity-halt with banked-SP + ring-SP capture,

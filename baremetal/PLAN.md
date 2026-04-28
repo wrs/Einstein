@@ -213,46 +213,54 @@ them.
 
 ## Concrete next steps
 
-1. **Diagnostic-only revert test.** Revert
-   `apply_resolve_fault_wrapper` install + the
-   `GetMatchingPage→0` patch (revert just those two,
-   keep everything else), cold-boot, watch the heap-watch
-   sanity-halt. Three possible outcomes:
-   - **Heap stays intact** (boot wedges elsewhere on the
-     original ARMv7 subpage-AP issue): confirms the wrapper
-     or its companion patch is the cause. Next move: fix the
-     wrapper (don't iterate 4×; or iterate 4× but keep
-     bookkeeping consistent so the page-pool doesn't get
-     confused).
-   - **Heap still corrupts at the same point**: rules out
-     the wrapper; the bug is somewhere else. Look at
-     `fix_stage1_xn_bits` next — does it ever touch the PA
-     field of an L2 entry?
-   - **Boot fails earlier in some other way**: useful data;
-     means the patches do gate against an earlier bug we
-     haven't characterised since they were added.
-2. **Audit the wrapper without reverting.** Read
-   `apply_resolve_fault_wrapper` in detail; trace what
-   `FindOrAllocPage` returns for each of the 4 iters; check
-   whether the kernel's page-table-slot bookkeeping is left
-   consistent across iters. The wrapper IS supposed to
-   produce 1 page per fault (iter 0 allocates, iters 1-3
-   reuse via slot-already-filled), so any double-allocation
-   would be a real bug in the wrapper's logic. Pair this
-   with PLAN.md option 3 (find every VA mapping to PA
-   0x04032000 in the kernel's tables — easy walker since
-   the kernel L1 sits at PA 0x04000000 and is 16 KiB).
-3. **Audit `fix_stage1_xn_bits`** in `src/guest_mem.rs` for
-   any path that could set the PA field of an L2 entry.
-   It's documented as flattening AP bits; if it accidentally
-   writes PA bits, that's another candidate.
-4. **Cross-check Einstein's L2 tables.** Add a stage-1 walk
-   to NewtonProbe at the equivalent boot offset, dumping
-   the L2 entries for VA 0x0ca6b000 and a typical
-   user-stack VA. If Einstein's two L2 entries name
-   *different* PAs, that confirms the kernel wouldn't
+**Wrapper-revert diagnostic (PLAN step 1) ran this iteration.**
+Outcome: boot fails at the already-resolved BootOS canary
+entry #2 (R0=0x0cc80c80, name-task stack overrun) much earlier
+without the wrapper. The wrapper IS still needed to get past
+the original ARMv7 subpage-AP corruption. So:
+
+- **Wrapper is necessary** — can't simply remove it.
+- **Wrapper is the most plausible aliasing trigger** —
+  heap-aliasing wedge only manifests when the wrapper has
+  enabled enough boot progress.
+
+Refined hypothesis: the wrapper either (a) mismanages the
+kernel allocator's free-list itself, or (b) enables enough
+sustained allocation pressure that a separate kernel-side
+allocator divergence (which Einstein doesn't hit on the same
+ROM) surfaces.
+
+1. **Audit FindOrAllocPage return values across the wrapper.**
+   Add an HVC probe at the call site `FindOrAllocPage` returns
+   to the wrapper; log every returned PA. Watch for PA
+   0x04032000 (the heap PA) being returned for a stack-grow
+   event. If yes, the kernel's free-list issued the heap PA
+   to the wrapper — that's the bug.
+2. **Walk the page tables for duplicates at sanity-halt.**
+   Already a known-good probe pattern: walk the kernel's L1
+   (rooted at 0x04000000, 16 KiB), enumerate every L2 small
+   page entry, and list every VA that resolves to PA
+   0x04032000. Multiple VAs naming the same PA confirm the
+   alias set; the L2 entries' positions tell us which kernel
+   structures share the page.
+3. **Cross-check Einstein's L2 tables.** Add a stage-1 walk
+   to NewtonProbe at the equivalent boot offset, dumping the
+   L2 entries for VA 0x0ca6b000 and a typical user-stack VA.
+   If Einstein's two L2 entries name *different* PAs at the
+   same boot offset, that confirms the kernel wouldn't
    normally alias these VAs — the divergence has to come
-   from us.
+   from our side, narrowing the bug to "what state our
+   wrapper's iterations leave that Einstein's stock
+   ResolveFault doesn't".
+4. **Audit the wrapper's bookkeeping invariants.** The
+   wrapper assumes that after iter 0 allocates, iters 1-3
+   take the existing-page branch and just call
+   `SetSubPageInfo`. But what if iter N (N>0) goes back to
+   the FindOrAllocPage path because the kernel's slot
+   bookkeeping was reset between iters (e.g., by an
+   intervening fault, IRQ, or our own re-entry)? Adding
+   a one-shot probe at FindOrAllocPage entry that logs
+   wrapper-iter# + FAR + return-PA would surface this.
 
 Diagnostic scaffolding (heap-watch sentinel, stage-2 RO
 carve-out, sanity-halt with banked-SP + ring-SP capture,

@@ -4,6 +4,58 @@ Live notes for the next iteration. Replace this file's body when the
 current stop is fixed and a new one takes over — git history is the
 archive of past investigations.
 
+## Aliasing CONFIRMED at stage-1: kernel maps VA 0x0ca6b000 and VA 0x0cc82000 to the same PA (2026-04-28)
+
+This iteration added a one-shot probe at the heap-watch
+sanity-halt path that walks stage-1 for both the heap VA
+0x0ca6b010 and the user-stack VA range 0x0cc82018..0x0cc82030.
+Cold-boot result is unambiguous:
+
+```
+stage-1 walk VA=0x0ca6b010: L1[0xca]=0x0401c081 (coarse, domain=4);
+    L2[0x6b]=0x0403203e (small page, AP=[011], XN=0, PA=0x04032000)
+stage-1 walk VA=0x0cc82018: L1[0xcc]=0x04023481 (coarse, domain=4);
+    L2[0x82]=0x0403203e (small page, AP=[011], XN=0, PA=0x04032000)
+stage-1 walk VA=0x0cc82020: ... L2[0x82]=0x0403203e ... PA=0x04032000
+stage-1 walk VA=0x0cc82028: ... L2[0x82]=0x0403203e ... PA=0x04032000
+stage-1 walk VA=0x0cc82030: ... L2[0x82]=0x0403203e ... PA=0x04032000
+```
+
+The L2 entries are **byte-identical (0x0403203e)** for both VAs:
+- VA 0x0ca6b000 → L1[0xca] coarse table at 0x0401c000 → L2[0x6b]=0x0403203e
+- VA 0x0cc82000 → L1[0xcc] coarse table at 0x04023400 → L2[0x82]=0x0403203e
+
+Two L2 tables in different physical locations have entries that
+both name PA 0x04032000. This is **kernel-level stage-1
+aliasing**, not a stage-2 bug.
+
+Note: VA 0x0cc81ffc walks to L2[0x81]=0 (fault page). So the
+user-stack VA 0x0cc82xxx is the one that grew into VA-0x0cc82000
+via DABT recovery; before that growth, the page wasn't mapped.
+That places the timing of the bad mapping inside a stack-grow
+operation — exactly where the `apply_resolve_fault_wrapper` runs.
+
+What this rules in / out:
+- **Stage-2 mapping bug** (e.g., set_ram_page_ro_x corrupting
+  unrelated stage-2 entries) — **ruled out**. The aliasing
+  happens before stage-2 even sees the access; both VAs end
+  up at the same IPA via stage-1.
+- **Our `fix_stage1_xn_bits` mutating L2 entries** — possible
+  but would need to be writing PA 0x04032000 into both L2
+  slots, which is unlikely for a function that only flattens
+  AP bits. Worth verifying it doesn't touch the PA field.
+- **Kernel page-allocator re-issuing PA 0x04032000** — most
+  plausible. The page would have been allocated for the
+  RelocHeap by NewHeap call #3 (~0x310e60 timeframe), then
+  later the `apply_resolve_fault_wrapper`-driven stack grow
+  asked for a fresh page and got the same one back.
+
+The aliasing happens in the user-stack growth path, so the
+wrapper or its `GetMatchingPage→0` companion patch is now the
+clear prime suspect. PLAN.md "Concrete next steps" still has
+the wrapper-revert diagnostic test as step 4; promote that to
+step 1.
+
 ## Banked-SP capture rules out hypothesis #1; corruption decodes as guest pushes via aliased VA (2026-04-28)
 
 This iteration extended `heap_watch::sample` to take `&TrapContext`

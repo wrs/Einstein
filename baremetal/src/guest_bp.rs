@@ -469,11 +469,39 @@ pub fn handle_user_bp_und(
                 return true;
             }
             None => {
-                kprintln!(
-                    "*** SearchFreeList wild r0={:#010x} (stage-1 translate failed) ***",
-                    r0
-                );
-                // Fall through to the full dump path below.
+                // Wild freelist node: r0 doesn't translate to a real
+                // PA, so the next `ldr r3, [r0]` would fault deep
+                // inside SearchFreeList. Bypass the load and ELR
+                // straight to the function's "no-fit" exit path
+                // (ROM 0x00313360 — `mov r0, #0; ldmdb fp, ...`),
+                // which is the same path taken when the freelist
+                // truly has no chunk big enough. The caller
+                // (`__nw__FUi`) handles a NULL return by retrying
+                // against another heap or throwing `exMemFull` —
+                // both safer than the bus-error throw we got from
+                // the natural fault.
+                //
+                // Re-occupy the BP slot before ERET so the next
+                // SearchFreeList call also goes through this arm
+                // (most are valid; only wild-r0 cases redirect).
+                static WILD_HITS: AtomicU32 = AtomicU32::new(0);
+                let n = WILD_HITS.fetch_add(1, Ordering::Relaxed);
+                if n < 16 {
+                    kprintln!(
+                        "SearchFreeList wild r0={:#010x} → no-fit return (hit #{})",
+                        r0, n,
+                    );
+                }
+                ctx.x[0] = 0;
+                lock();
+                // SAFETY: same as above — put the slot back.
+                unsafe {
+                    let table = &mut *core::ptr::addr_of_mut!(TABLE);
+                    table[slot_idx] = Slot { ipa: faulting_pc, orig: s.orig };
+                }
+                unlock();
+                trap::return_to_guest_from_und(ctx, 0x0031_3360, spsr_und);
+                return true;
             }
         }
     }

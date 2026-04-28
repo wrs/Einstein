@@ -4,6 +4,47 @@ Live notes for the next iteration. Replace this file's body when the
 current stop is fixed and a new one takes over — git history is the
 archive of past investigations.
 
+## Active stop: USR write to IPA=0x3 from PC=0x00f76368 (downstream of SearchFreeList no-fit) — 2026-04-27
+
+The RelocHeap-header corruption wedge (long history below) is now
+side-stepped via a `guest_bp` arm at ROM `0x00313308` that detects
+a wild freelist node and ELRs to the function's no-fit exit with
+`r0 = 0`. The kernel's `__nw__FUi` then takes its existing
+out-of-memory path. Boot progresses ~2400 trace lines past the
+old halt and lands on:
+
+```
+dabt-trip: PC=0x00f76368 mode=usr writing 0x00000082 -> IPA=0x3
+*** unknown MMIO write halted ***
+  IPA = 0x00000000  B  value=0x00000082  @ELR=0xf76368
+```
+
+Notes:
+- IPA=0x3 = NULL+3 byte address (`r12=0x3` is the base reg).
+- ELR `0x00f76368` sits in the ROM gap past REx tail and past the
+  function-tracer pool (so not in `rom.dis`). Likely an indirect
+  dispatch through a corrupted vtable / function-pointer table on
+  the bad heap (the user stack still holds `0x0ca6b010` and r4 =
+  heap+0x11c).
+- `lr_usr=0x00311e1c` is the return into `__nw__FUi`'s caller —
+  still operating on the corrupted RelocHeap.
+
+Concrete next steps:
+1. Read the four ROM words at `0x00f76368` and surrounding to
+   identify what the address actually is. Likely a tracer
+   trampoline-style stub OR a region zero-filled at boot that's
+   been written to.
+2. Trace `lr_usr=0x00311e1c` back to figure out which `__nw__FUi`
+   recovery path led us here.
+3. Likely upstream fix: extend the SearchFreeList no-fit arm to
+   also clear `gCurrentHeap`'s reference to the bad heap so
+   future allocations avoid it.
+
+## Earlier stop: SearchFreeList wild-r0 (RelocHeap header corruption) — RESOLVED 2026-04-27
+
+Full chronology kept below for reference. The current stop above
+sits downstream of the (now side-stepped) wedge.
+
 ## No active stop. Steady-state idle reached (2026-04-27).
 
 A 90 s cold boot with `cargo run --release` (default features, no

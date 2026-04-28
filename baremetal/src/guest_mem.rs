@@ -332,12 +332,12 @@ pub fn fix_stage1_xn_bits() -> bool {
     // 0 means the slot is free (no real VA maps to address 0 via stage-1).
     let mut subpage_ap_mixed = 0usize;
     let mut alias_count = 0usize;
-    let mut alias_first_pa: u32 = 0;
-    let mut alias_first_va_a: u32 = 0;
-    let mut alias_first_va_b: u32 = 0;
     let ram_pages = RAM_SIZE / 4096;
     let mut va_for_pa = [0u32; 1024];
     debug_assert!(ram_pages <= va_for_pa.len(), "ram_pages exceeds verification table");
+    // Bitmap of PAs we've already logged as aliased (one-shot per PA across
+    // all walks). 1024 bits = 16 u64 words.
+    static mut LOGGED_ALIAS_BITMAP: [u64; 16] = [0; 16];
 
     let scratch_l1_idx = (crate::shadow_stub::SCRATCH_POOL_VA >> 20) as usize;
 
@@ -466,12 +466,23 @@ pub fn fix_stage1_xn_bits() -> bool {
                     if prev_va == 0 {
                         va_for_pa[page_idx] = va;
                     } else if prev_va != va {
-                        if alias_count == 0 {
-                            alias_first_pa = pa;
-                            alias_first_va_a = prev_va;
-                            alias_first_va_b = va;
-                        }
                         alias_count += 1;
+                        // One-shot per aliased PA: log full (PA, VA1, VA2)
+                        // the first time we see THIS PA aliased. Subsequent
+                        // walks where the same PA is aliased are silent.
+                        let bit = page_idx;
+                        let word = bit / 64;
+                        let mask = 1u64 << (bit % 64);
+                        let already = unsafe { LOGGED_ALIAS_BITMAP[word] & mask != 0 };
+                        if !already {
+                            unsafe { LOGGED_ALIAS_BITMAP[word] |= mask; }
+                            crate::kprintln!(
+                                "verify-mmu alias: PA={:#010x} VA1={:#010x} (L1[{:#x}],L2[{:#x}]) VA2={:#010x} (L1[{:#x}],L2[{:#x}])",
+                                pa,
+                                prev_va, prev_va >> 20, (prev_va >> 12) & 0xFF,
+                                va, va >> 20, (va >> 12) & 0xFF,
+                            );
+                        }
                     }
                 }
             }
@@ -527,13 +538,8 @@ pub fn fix_stage1_xn_bits() -> bool {
             "verify-mmu: subpage-AP-mixed={} RAM-aliased-pages={}",
             subpage_ap_mixed, alias_count,
         );
-        if alias_details_log {
-            crate::kprintln!(
-                "  first alias: PA={:#010x} mapped by VA1={:#010x} and VA2={:#010x}",
-                alias_first_pa, alias_first_va_a, alias_first_va_b,
-            );
-        }
     }
+    let _ = alias_details_log;
 
     // Only log when we actually rewrote something, to avoid flooding
     // the serial when the kernel re-enables stage-1 on every task

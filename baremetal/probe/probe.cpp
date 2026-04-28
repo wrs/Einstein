@@ -690,17 +690,54 @@ void duplicate_pa_scan(TMemory* mem) {
 		std::fflush(stdout);
 		return;
 	}
-	std::fprintf(stdout, "  RAM duplicates:\n");
+	std::fprintf(stdout, "  RAM duplicates (L2 entry value + ARMv4 subpage AP[3:0]):\n");
 	int rows_printed = 0;
 	for (const auto& [pa, vas] : pa_to_vas) {
 		if (vas.size() <= 1) continue;
 		if (pa < 0x04000000u || pa >= 0x04400000u) continue; // RAM only
-		std::fprintf(stdout, "    PA=0x%08x mapped by %zu VAs:", pa, vas.size());
-		for (KUInt32 va : vas) std::fprintf(stdout, " 0x%08x", va);
-		std::fprintf(stdout, "\n");
+		std::fprintf(stdout, "    PA=0x%08x mapped by %zu VAs:\n", pa, vas.size());
+		for (KUInt32 va : vas) {
+			// Re-read the L2 entry for this VA so we can dump its raw
+			// bits and decode the per-subpage AP fields.
+			KUInt32 l1_idx = va >> 20;
+			Boolean f1 = false;
+			KUInt32 l1 = mem->ReadP(ttbr + l1_idx * 4, f1);
+			KUInt32 l2_val = 0;
+			KUInt32 l2_addr = 0;
+			if (!f1 && (l1 & 3) == 1) {
+				KUInt32 l2_base = l1 & 0xFFFFFC00u;
+				KUInt32 l2_idx = (va >> 12) & 0xFF;
+				l2_addr = l2_base + l2_idx * 4;
+				Boolean f2 = false;
+				l2_val = mem->ReadP(l2_addr, f2);
+				if (f2) l2_val = 0xDEADBEEF;
+			}
+			// ARMv4 small-page L2: bits[31:12]=PA, bits[11:10]=AP3,
+			//   bits[9:8]=AP2, bits[7:6]=AP1, bits[5:4]=AP0,
+			//   bits[3:2]=CB, bits[1:0]=10.
+			// AP value: 00 = no access, 01 = privileged R/W (user
+			// FAULT on access), 10 = priv R/W + user RO, 11 = full R/W.
+			KUInt32 ap0 = (l2_val >> 4) & 3;
+			KUInt32 ap1 = (l2_val >> 6) & 3;
+			KUInt32 ap2 = (l2_val >> 8) & 3;
+			KUInt32 ap3 = (l2_val >> 10) & 3;
+			auto ap_label = [](KUInt32 ap) {
+				switch (ap) {
+					case 0: return "00=NA";
+					case 1: return "01=PR/W";
+					case 2: return "10=PR/W+UR";
+					case 3: return "11=R/W";
+					default: return "??";
+				}
+			};
+			std::fprintf(stdout,
+				"      VA=0x%08x L2@0x%08x=0x%08x  AP[3..0]=[%s,%s,%s,%s]\n",
+				va, l2_addr, l2_val,
+				ap_label(ap3), ap_label(ap2), ap_label(ap1), ap_label(ap0));
+		}
 		++rows_printed;
-		if (rows_printed >= 32) {
-			std::fprintf(stdout, "    ...(stopped after 32 RAM entries)\n");
+		if (rows_printed >= 16) {
+			std::fprintf(stdout, "    ...(stopped after 16 RAM entries)\n");
 			break;
 		}
 	}

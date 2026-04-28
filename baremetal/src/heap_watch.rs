@@ -101,6 +101,84 @@ static REARM_PENDING: AtomicBool = AtomicBool::new(false);
 static PERM_FAULT_HITS: AtomicU32 = AtomicU32::new(0);
 const PERM_FAULT_LOG_LIMIT: u32 = 256;
 
+/// Walk the guest stage-1 (rooted at the architectural TTBR0 = guest
+/// PA 0x0400_0000) for `va` and log the L1 / optional L2 entries
+/// decoded into "section vs coarse" + AP[2:0] + Domain. Exists so the
+/// post-rebind silence on the heap carve-out can be diagnosed:
+/// stage-1 RO at user mode would route writes through stage-1 DABT
+/// before stage-2 sees them, bypassing the carve-out.
+///
+/// Short-descriptor format (ARMv7-A B3.5.1):
+/// - L1 section bits[1:0]=10. Domain = bits[8:5]. AP[2,1,0] in
+///   bits[15,11:10]; AP[2]=APX, AP[1:0]=AP. nG = bit 17.
+/// - L1 coarse bits[1:0]=01. Domain = bits[8:5]. PA = bits[31:10].
+/// - L2 small page bits[1:0]=10. AP[2,1,0] in bits[9,5:4].
+/// - L2 large page bits[1:0]=01. AP[2,1,0] in bits[9,5:4].
+fn log_stage1_walk(va: u32) {
+    let l1_idx = (va >> 20) as usize;
+    let l1_pa = 0x0400_0000u32 + (l1_idx as u32) * 4;
+    let l1 = match guest_mem::read_word_pa(l1_pa) {
+        Some(v) => v,
+        None => {
+            kprintln!("    stage-1 walk VA={:#010x}: L1 read at PA={:#x} failed", va, l1_pa);
+            return;
+        }
+    };
+    let l1_kind = l1 & 3;
+    match l1_kind {
+        2 => {
+            let domain = (l1 >> 5) & 0xF;
+            let ap2 = (l1 >> 15) & 1;
+            let ap10 = (l1 >> 10) & 0x3;
+            let ng = (l1 >> 17) & 1;
+            kprintln!(
+                "    stage-1 walk VA={:#010x}: L1[{:#x}]={:#010x} (section, domain={}, AP=[{}{:02b}], nG={}, PA={:#010x})",
+                va, l1_idx, l1, domain, ap2, ap10, ng, l1 & 0xFFF0_0000,
+            );
+        }
+        1 => {
+            let domain = (l1 >> 5) & 0xF;
+            let l2_pa_base = l1 & 0xFFFF_FC00;
+            let l2_idx = (va >> 12) & 0xFF;
+            let l2_addr = l2_pa_base + l2_idx * 4;
+            let l2 = match guest_mem::read_word_pa(l2_addr) {
+                Some(v) => v,
+                None => {
+                    kprintln!(
+                        "    stage-1 walk VA={:#010x}: L1[{:#x}]={:#010x} (coarse, domain={}, L2 PA={:#x}, L2 read failed)",
+                        va, l1_idx, l1, domain, l2_addr,
+                    );
+                    return;
+                }
+            };
+            let l2_kind = l2 & 3;
+            let ap2 = (l2 >> 9) & 1;
+            let ap10 = (l2 >> 4) & 0x3;
+            let xn = (l2 >> 0) & 1;
+            let kind_str = match l2_kind {
+                1 => "large",
+                2 | 3 => "small",
+                _ => "fault",
+            };
+            let pa_field = match l2_kind {
+                1 => l2 & 0xFFFF_0000,
+                2 | 3 => l2 & 0xFFFF_F000,
+                _ => 0,
+            };
+            kprintln!(
+                "    stage-1 walk VA={:#010x}: L1[{:#x}]={:#010x} (coarse, domain={}); L2[{:#x}]={:#010x} ({} page, AP=[{}{:02b}], XN={}, PA={:#010x})",
+                va, l1_idx, l1, domain, l2_idx, l2, kind_str, ap2, ap10, xn, pa_field,
+            );
+        }
+        _ => {
+            kprintln!(
+                "    stage-1 walk VA={:#010x}: L1[{:#x}]={:#010x} (kind={}, fault)",
+                va, l1_idx, l1, l1_kind,
+            );
+        }
+    }
+}
+
 /// Translate VA 0x0ca6b000 to its current guest PA via the kernel's
 /// stage-1 tables, then install a stage-2 RO carve-out on the
 /// containing 4 KiB page. Idempotent on subsequent calls — we only
@@ -126,6 +204,13 @@ pub fn arm_carve_out_at_heap_va(va: u32) -> Option<u32> {
 pub fn is_carved_out_ipa(ipa: u32) -> bool {
     let armed = CARVED_PA.load(Ordering::Relaxed);
     armed != 0 && (ipa & !0xFFF) == armed
+}
+
+/// 4 KiB-aligned PA currently armed RO, or 0 if none. Used by the
+/// trap handler's debug arm to log all DABTs on the watched page,
+/// regardless of fault class.
+pub fn carved_pa() -> u32 {
+    CARVED_PA.load(Ordering::Relaxed)
 }
 
 /// Log a stage-2 perm fault on the carve-out and request the page be
@@ -193,6 +278,19 @@ fn maybe_rearm() {
         unsafe {
             crate::stage2::set_ram_page_rw_xn(armed);
             crate::stage2::set_ram_page_ro_x(pa_now);
+            // Defensive: nuke every TLB entry, both stages, EL1+EL2.
+            // The per-IPA tlbi inside set_ram_page_ro_x ought to be
+            // sufficient, but the post-rebind silence persists, so
+            // hammer the whole thing to rule out a cached stale RW
+            // entry. This costs us a TLB miss flurry; acceptable for
+            // diagnostic.
+            core::arch::asm!(
+                "dsb ish",
+                "tlbi vmalls12e1is",
+                "dsb ish",
+                "isb",
+                options(nostack, preserves_flags),
+            );
         }
         CARVED_PA.store(pa_now, Ordering::Release);
         let l3 = crate::stage2::ram_page_l3_entry(pa_now).unwrap_or(0xDEADBEEF_DEADBEEF);
@@ -249,11 +347,15 @@ pub fn sample(elr_el2: u64, source: Source) {
         } else {
             "(*** PA REMAPPED — carve-out now stale ***)"
         };
+        let l3 = if armed_pa != 0 {
+            crate::stage2::ram_page_l3_entry(armed_pa).unwrap_or(0xDEAD_BEEF_DEAD_BEEF)
+        } else { 0 };
         kprintln!(
-            "heap-watch[{}] {}: heap[{:#010x}] {:#010x} -> {:#010x}  (elr={:#x}, prev-trap-elr={:#x}, pa_now={:#010x}, armed={:#010x} {})",
+            "heap-watch[{}] {}: heap[{:#010x}] {:#010x} -> {:#010x}  (elr={:#x}, prev-trap-elr={:#x}, pa_now={:#010x}, armed={:#010x} {} L3={:#018x})",
             n, source.label(), WATCH_VA, prev, value, elr_el2, prev_elr,
-            pa_now, armed_pa, pa_match,
+            pa_now, armed_pa, pa_match, l3,
         );
+        log_stage1_walk(WATCH_VA);
         // Dump the ring buffer in chronological order so the operator
         // can see the trap stream that led to this transition. The
         // newest entry is at `head` (just stored above); the oldest is

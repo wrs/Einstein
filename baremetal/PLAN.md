@@ -214,25 +214,25 @@ but always log on the wedge-relevant arg matches):
 
 Concrete next steps:
 
-1. **Diagnose why post-rebind RO-carve-out doesn't trap.** The
-   stage-2 carve-out works pre-rebind (256 writers logged) and the
-   post-rebind L3 entry reads back RO + valid + host-PA-correct,
-   but no perm faults fire on the new PA (`0x04032000`) between
-   transitions #2 and #3. Most likely: the kernel's stage-1 has
-   the heap VA at user-mode RO, so writes via that VA stage-1
-   DABT into the kernel's own DAH (forwarded by our `0x10`
-   trampoline) before stage-2 sees them. Verify by reading the
-   L1[0xCA] / L2 entry for VA `0x0ca6b000` from
-   `heap_watch::sample` and logging on the post-rebind read.
-   If confirmed, switch to a different observation strategy
-   (e.g. `handle_diag` already sees every kernel-forwarded DABT —
-   add a hook there for FAR matching the heap header).
-2. Cross-check Einstein at the equivalent boot offset (NewtonProbe
+1. **Switch to INVALID-entry trap.** Stage-2 RO doesn't fault on
+   the post-rebind heap PA in QEMU — confirmed via per-trap L3
+   readback (always RO) plus unconditional dabt-on-carve trace
+   (zero hits on the armed PA after rebind), and stage-1 grants
+   user-mode RW (`AP=[011]`). The next observation strategy is
+   to set the L3 entry to invalid (`!DESC_VALID`) so reads AND
+   writes fault. Reads need EL2 emulation (return the value from
+   host PA); writes get the writer-PC log we're after.
+2. **Verify on FVP.** Run with the carve-out in place under
+   `scripts/fvp` (architecturally-accurate). If FVP shows the
+   missing perm faults, this is a QEMU bug class — worth an
+   entry in `docs/QEMU_BUGS.md` — and we move forward with FVP
+   data.
+3. Cross-check Einstein at the equivalent boot offset (NewtonProbe
    60 s) — dump Einstein's RelocHeap header at the same point and
    diff. If Einstein's heap stays valid, the bug is hypervisor-side
    (stage-2 mapping / aliasing); if Einstein corrupts it the same
    way, it's a ROM data-flow bug we need to mirror or patch around.
-3. Once the writer is identified, decide whether the fix is a
+4. Once the writer is identified, decide whether the fix is a
    handler gap (stage-2 fault on a write that should have trapped
    cleanly) or a behavioural mirror (kernel does something Einstein
    doesn't because of an earlier divergence we need to match).
@@ -412,7 +412,13 @@ the boot is steady-state-quiet:
   stage-1 rebinds, and logs every guest-side perm fault on the
   page (writer ELR + IPA + decoded value when ISV=1).
   `stage2::ram_page_l3_entry` is the readback helper for
-  verification. Remove together with the heap_watch sentinel.
+  verification. `heap_watch::log_stage1_walk` decodes the
+  kernel's L1/L2 entries for VA 0x0ca6b010 to disambiguate
+  stage-1-RO vs stage-1-RW writes. The "dabt-on-carve" trace
+  in `handle_data_abort` (top of the function) is an
+  unconditional all-class DABT log for the armed PA, used to
+  distinguish "no fault fires" from "fault fires but our arm
+  doesn't match". Remove together with the heap_watch sentinel.
 
 Once the boot quiesces these can be pulled; the behavioural invariants
 they enforce are codified in guest tests.

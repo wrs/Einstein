@@ -214,19 +214,22 @@ but always log on the wedge-relevant arg matches):
 
 Concrete next steps:
 
-1. **Switch to INVALID-entry trap.** Stage-2 RO doesn't fault on
-   the post-rebind heap PA in QEMU — confirmed via per-trap L3
-   readback (always RO) plus unconditional dabt-on-carve trace
-   (zero hits on the armed PA after rebind), and stage-1 grants
-   user-mode RW (`AP=[011]`). The next observation strategy is
-   to set the L3 entry to invalid (`!DESC_VALID`) so reads AND
-   writes fault. Reads need EL2 emulation (return the value from
-   host PA); writes get the writer-PC log we're after.
-2. **Verify on FVP.** Run with the carve-out in place under
-   `scripts/fvp` (architecturally-accurate). If FVP shows the
-   missing perm faults, this is a QEMU bug class — worth an
-   entry in `docs/QEMU_BUGS.md` — and we move forward with FVP
-   data.
+1. **Run on FVP with the carve-out in place.** The QEMU stage-2
+   enforcement bug is now confirmed by the defensive RO-state poll
+   (post-rebind: 0 RW samples; pre-rebind: 64 RW samples — the
+   page demonstrably stays RO yet writes land at the host backing).
+   FVP is architecturally accurate; it should fault and let us
+   capture writers. Build with `--no-default-features --features
+   "platform-fvp-base"`, run via `scripts/fvp`, look for the same
+   `heap-watch perm-fault` log lines on the post-rebind PA.
+2. **Or step around the wedge entirely.** The corruption is a
+   Newton-OS internal allocator inconsistency we can't pinpoint
+   in QEMU; consider hooking `SearchFreeList` (ROM 0x003132d8)
+   to silently fail (return NULL = "no fit") when its current-
+   heap pointer dereference would fault. Equivalent to telling
+   the allocator "this size is unsatisfiable on this heap" —
+   the kernel typically retries against a different heap or
+   throws a benign out-of-memory exception.
 3. Cross-check Einstein at the equivalent boot offset (NewtonProbe
    60 s) — dump Einstein's RelocHeap header at the same point and
    diff. If Einstein's heap stays valid, the bug is hypervisor-side

@@ -175,7 +175,54 @@ NOTE: Fix all compiler warnings before committing, to keep context clean.
   on QEMU; `--platform fvp` runs the same suite on the FVP. Both
   must stay green. See "Verification" near the end of this file.
 
-## Current stop — wild jump into SBA inline-stub pool downstream of the no-fit recovery
+## Current stop — CompactHeap→LockedBlock translation fault on gFallbackHeap (downstream of bad-heap substitution)
+
+Iteration 10 wired option 1 from the previous plan: substitute
+`gFallbackHeap` for `r0=0x0ca6b010` in the SetCurrentHeap probe.
+The kernel's bracketing save/restore sees fallback in / fallback
+out and stays consistent. Boot progressed past the old
+SetBlockSize wedge, handled 5 lazy-grow DABTs cleanly, then
+halted on a `DIAG vector intercept` at:
+
+- pre-fault PC inside shadow_stub stub pool (slot @ `0xf76940`,
+  access at slot 10 = `0xf76968`).
+- FAR=`0x0c22cba3`, stage-1 L2[0x2c]=0 (translation fault).
+- USR lr=`0x0031326c` = return into CompactHeap after
+  `bl LockedBlock` at `0x00313268`.
+- r4=r9=gFallbackHeap (`0x0c111000`) — substitution working.
+- ESR_EL1=`0x37` — DFSC not in handle_diag's forwardable set, so
+  it took the loud-halt path.
+
+This is a NEW class of failure — the kernel is now operating on
+gFallbackHeap and reaching CompactHeap → LockedBlock, which
+hits an unmapped VA. The substitution let us walk past the
+old wedge but landed us in code paths with different
+expectations.
+
+Concrete next steps:
+
+1. **Decode the new wedge's stub.** The dabt-trip-style stub
+   orig-pc decoder doesn't run on the DIAG_TAG halt path
+   (different log format). Mirror the same decode in
+   handle_diag's loud-halt arm so the new wedge dump shows
+   which ROM PC its stub emulates.
+2. **Check whether DFSC=0x37 should be forwardable.** ARMv7
+   short-descriptor FS field is 4 bits at [3:0] + bit 10.
+   ESR_EL1=0x37 might be a synthetic DFSC the trampoline
+   generates but handle_diag's allowed-set
+   (0x03/0x05/0x06/0x07/0x0D/0x0F) misses. If so, extend the
+   set so the kernel takes its own DAH path.
+3. **Cross-check Einstein** — what's the kernel doing in
+   CompactHeap → LockedBlock at this boot offset? Einstein
+   doesn't reach this state; understanding the expected flow
+   helps localise where our fallback-heap substitution
+   diverges from the real path.
+4. **Reconsider the substitution.** Possibly the kernel needs
+   RelocHeap-specific behaviour (the heap has different
+   attribute fields than fallback). If so, the right approach
+   is fixing the corruption upstream, not substituting.
+
+## Earlier stop — wild jump into SBA inline-stub pool downstream of the no-fit recovery
 
 The previous SearchFreeList wedge is side-stepped (see resolved
 stops). Boot progresses ~2400 trace lines further and halts on:
@@ -380,6 +427,7 @@ Concrete next steps:
 
 | Date | Wedge | Resolution |
 |------|-------|------------|
+| 2026-04-28 | RelocHeap-corruption cascade through NewBlock → SetBlockSize (wedge at `strb r0, [r9]` ROM 0x00312a18 via SBA stub at PC=0x00f76368) | `guest_bp` SetCurrentHeap probe at ROM `0x00142df0` substitutes `gFallbackHeap` (= *0x0c101080) for `r0=0x0ca6b010`. The kernel's bracketed save/restore sees fallback in / fallback out, the bad heap never gets installed in `task[-16]`, and NewBlock walks the good heap. Boot progresses past the cascade. New downstream stop at CompactHeap → LockedBlock translation fault — different class of failure, queued for next iteration. |
 | 2026-04-27 | SearchFreeList bus-error throw on wild freelist node (RelocHeap header corruption — full chronology in `INVESTIGATION.md`) | `guest_bp` arm at ROM `0x00313308` detects untranslatable r0 and ELRs to `0x00313360` (the function's no-fit exit) with r0=0. `__nw__FUi` takes its existing out-of-memory recovery path. Boot progressed past the wedge to a downstream NULL-deref at PC=0x00f76368. |
 | 2026-04-27 | NULL-pointer SWP via `Swap(0,1)` at ROM `0x3ae204` (kernel `Acquire(NULL)` glue inside `VccOff__FiUl`) — stage-2 perm fault on write to ROM aperture, ISV=0 | trap.rs `try_absorb_rom_write`: mirror Einstein `TMemory::WriteP` (TMemory.cpp:1755-1766), drop the store; for SWP/SWPB also run the load piece into Rd. Boot reached steady-state idle. Test: `guest-tests/tests/test_swp_rom_aperture.S`. |
 | 2026-04-27 | TEncodingMap.+16 = 0x20000110 (out-of-stage-2 IPA) at `ConvertToUnicodeFunc_Contiguous8` | mmio.rs: `0x20000000..0x30000000` "unknown bank #5" silent-zero matching Einstein's `TMemory::ReadP` (TMemory.cpp:1026-1034). Boot advanced 10× → reaches TInterpreter. |

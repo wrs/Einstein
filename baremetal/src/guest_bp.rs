@@ -426,6 +426,40 @@ pub fn handle_user_bp_und(
         // already armed.
         if r0 == 0x0ca6_b010 {
             let _ = crate::heap_watch::arm_carve_out_at_heap_va(0x0ca6_b000);
+            // Cascade-stopper: substitute gFallbackHeap so the
+            // kernel operates on a sane heap rather than installing
+            // the corrupted RelocHeap in `task[-16]`. The fallback
+            // pointer lives at VA 0x0c101080 per GetCurrentHeap's
+            // disasm at ROM 0x00142da0.
+            //
+            // gFallbackHeap is what GetCurrentHeap already returns
+            // when `task[-16]` is null, so swapping in this value
+            // matches a path the kernel already exercises. Reads /
+            // writes against this heap go to actual valid heap
+            // memory, sidestepping NewBlock's "freelist position
+            // = 0x002dfa20 (a ROM PC)" cascade that lands at
+            // SetBlockSize's `strb r0, [r9]` with r9 garbage.
+            //
+            // We DON'T want to fully suppress SetCurrentHeap (e.g.
+            // by ELR-to-early-exit) because the kernel's
+            // bracketing pattern (NewHeap, NewHandle, CompactHeap,
+            // HUnlock) saves and restores `gCurrentHeap`; if we
+            // skip the save, the restore puts us on the wrong heap.
+            // Substituting r0 keeps the bracketing intact — every
+            // call sees fallback in / fallback out.
+            if let Some(fallback) = crate::guest_mem::read_word_va(0x0c10_1080) {
+                if fallback != 0 && fallback != 0x0ca6_b010 {
+                    static SUBSTITUTED: AtomicU32 = AtomicU32::new(0);
+                    let m = SUBSTITUTED.fetch_add(1, Ordering::Relaxed);
+                    if m < 4 {
+                        kprintln!(
+                            "  SetCurrentHeap: substituted r0=0x0ca6b010 -> gFallbackHeap={:#010x} (hit #{})",
+                            fallback, m,
+                        );
+                    }
+                    ctx.x[0] = fallback as u64;
+                }
+            }
         }
         // Emulate `ldr r1, [pc, #40]` — PC at execution = pc+8, so the
         // word loaded is at faulting_pc + 8 + 40. The ROM literal at

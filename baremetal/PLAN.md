@@ -234,6 +234,41 @@ subpage AP → both VAs (= last page of stack N + boundary page
 of stack N+1) end up RW pointing to the same PA. **This is the
 aliasing source.**
 
+### Goal restatement (user 2026-04-28)
+
+Fix the kernel so it doesn't *need* subpage AP at all — change
+allocation granularity from 1 KiB to 4 KiB. Subpage AP today does
+two distinct jobs and BOTH must work:
+
+- **Job 1: Cross-VA isolation.** Page partitioned into 4 subpages,
+  each owned by a different stack/heap. Defunct under our flat
+  AP=011 — different VAs that the kernel intended to isolate via
+  per-subpage AP can write to each other's data.
+- **Job 2: Stack-overflow detection.** Body subpage RW + guard
+  subpages NA so SP overflow faults. Defunct under our flat AP=011
+  — overflow silently corrupts.
+
+Shadow pages would fix Job 1 only. The kernel still wouldn't get
+the overflow faults it needs for Job 2. Per user: "Of course there
+will be overflow, why would there be overflow kernel code if there
+was no overflow."
+
+The right answer is to make the kernel use 4-KiB granularity
+naturally — extensive changes to a LIMITED part of the kernel
+(the allocator), but staying close to the original mechanism. With
+4-KiB-aligned allocations:
+
+- Each stack's body and guard occupy whole pages (no shared 4-KiB
+  pages, no Job 1 problem).
+- Guard becomes a full unmapped page; overflow faults at the L2
+  level (not the subpage level), restoring Job 2.
+- Subpage AP becomes irrelevant; flat AP=011 is correct.
+
+User: "What I meant by natural is keeping the mechanisms as close
+as possible to the original (but no closer)." — i.e., resize the
+kernel's slot constants but don't introduce alien mechanisms like
+shadow pages or fault emulation.
+
 ### Patch attempt 1 — REVERTED. 33 KiB is the *domain* page-table granularity, not just stack-slot size
 
 Applied 20 ROM patches to change FMNewStack + Init__11THeapDomain
@@ -273,37 +308,79 @@ constant is shared infrastructure across the entire allocator —
 not just stacks. Any patch touching it would need to coordinate
 with the heap allocation layer too, which is too much surface.**
 
-### Next options to investigate (next iteration)
+### Next iteration — bisect what's missing from the patch set
 
-1. **Patch FMNewStack's *placement only*** — allocate stacks at
-   4-KiB-aligned offsets within the existing 33-KiB grid by
-   leaving the slot SIZE constants alone but changing the body
-   START offset from 3 KiB to 4 KiB. The slot still occupies 33
-   KiB but uses subpage layout: 4 KiB guard + 28 KiB body + 1 KiB
-   pad. Body fits in 7 pages instead of 8 — doesn't fit our 30 KiB
-   body span.
-2. **Wrap FMNewStack at the *return* point** — let the kernel
-   compute its 33-KiB-spaced slot, but our wrapper substitutes a
-   4-KiB-aligned base address (round up by up to 3 KiB). The
-   kernel's TStackInfo and page_table believe one base; the
-   ACTUAL backing pages live at a different (4-KiB-aligned) base.
-   Risk: the kernel's lookup `(va - base) / slot_size` would then
-   compute the wrong slot for the actual VAs.
-3. **Change the apply_resolve_fault_wrapper's behavior** — when
-   a stack fault hits a page that's already owned by ANOTHER
-   stack's L2 entry, force the wrapper to allocate a *fresh*
-   page anyway (claim all 4 subpages for the new owner) and
-   rewrite the L2 entry. The other stack's L2 entry stays
-   pointing at the original page — but our verify-mmu would
-   still see the alias.
-4. **Stage-2 page shadowing (proposed previously)** — the only
-   path that doesn't fight the kernel's design. Cost: 256 KiB
-   shadow pool + careful filter to exclude kernel-globals
-   self-mapping.
+The 20-patch set was internally consistent (verify-mmu sees no
+inconsistency between FMNewStack placement and GetStackInfo
+lookup, both using 36 KiB). But the boot wedged on the heap
+region. So either:
 
-The user requested "keep the kernel as natural as possible" — so
-options 1-3 are preferred over 4. But none of them have a clear
-path forward without more investigation.
+a) Some other kernel code reads / writes slot-size-dependent
+   layout that I haven't patched (likely candidates below).
+b) A 36-KiB slot doesn't divide the existing domain sizes
+   cleanly, leaving the kernel's allocator in a state it can't
+   recover from.
+
+**Bisection strategy**: re-apply the 20 patches one *group* at a
+time, each as its own commit, and observe at what point the boot
+breaks. Groups (in declared dependency order):
+
+1. Group 1 only (constant 0x8400 → 0x9000 in 10 places). This
+   alone is INCONSISTENT (placement formula still uses ×33 ×1024)
+   so will break, but the failure mode tells us how the kernel
+   reacts to the size change in isolation.
+2. Group 2 only (multiplier ×33 → ×9 in 3 places). Also
+   inconsistent on its own.
+3. Group 3 only (shift ×1024 → ×4096 in 3 places). Same.
+4. Group 4 only (guard 3 KiB → 4 KiB in 4 places). Same.
+5. Groups 1+2+3 together (slot size + placement, no guard
+   change). Body offset still 3 KiB inside a 36-KiB slot. Should
+   place stacks at 36-KiB intervals with body starting 3 KiB in.
+6. All 4 groups (the failed attempt). Re-confirm same failure.
+
+Then 7. Add additional patches as we identify what's missing:
+- `Init__11THeapDomain` page_table allocation size (`r0 *= 4`
+  at 0x1F8D80 — should change to multiply by something else if
+  we're actually doing per-page tracking instead of per-slot?
+  Need to check what page_table[i] holds and whether its
+  granularity-coupled sizing depends on slot vs page).
+- The body-span constant (0x7800 = 30 KiB) — used elsewhere?
+- Init__10TStackInfo (called from FMNewStack at 0x1F9098) —
+  what does it do with the address arithmetic?
+
+### Other suspects to audit before re-attempting
+
+- **`Init__10TStackInfoFUlN51`** at `0x001AFBDB8` (in REx jump
+  table). Called from FMNewStack with computed args. Might use
+  slot_size internally for its own bookkeeping. Read its body.
+- **`__ct__10TStackInfoFv`** at `0x001AEF7B8`. Probably just
+  zero-initialises; check.
+- **The 0x271xxx error-code sites** were dismissed as
+  error-code arithmetic. Re-verify by reading 5–10 of them — if
+  any actually compute slot sizing (e.g. `0xFFFFFFFF - slot_idx
+  * 0x8400`) they'd need patching.
+- **REx-side functions** at `0x01Axxxxx`. `NewStack` (0x01BD7BA4),
+  `NewHeapArea` (0x01BD7B98), `LockStack`, etc. Check if any
+  are *patched* in the REx (RAM-resident bytes overriding the
+  ROM thunk default) and if those patches use slot constants.
+
+### Other patch ideas IF the bisect fails
+
+5. **Wrap FMNewStack to return 4-KiB-aligned base** — let kernel
+   keep its 33-KiB allocator internally, but the actual backing
+   pages live at a 4-KiB-aligned offset. Risk: lookup formula
+   `slot_idx = (va - base) / 33 KiB` gives wrong slot for the
+   actual page VAs. Probably doesn't work without ALSO
+   intercepting GetStackInfo.
+6. **Apply Group 4 (guard offset) only**, leaving slot size at
+   33 KiB. Body becomes 4-KiB-aligned within slot. Body span
+   shrinks to 28 KiB or stays 30 KiB and overlaps next slot's
+   guard. Either way, doesn't eliminate cross-slot sharing of
+   the boundary 4-KiB page.
+
+Start with the bisection. The failure mode for "Group 1 only"
+will tell us what the kernel does when the constant is wrong on
+ONE side of a producer/consumer pair.
 
 ### Original design (kept for reference)
 

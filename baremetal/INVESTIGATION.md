@@ -78,6 +78,62 @@ hypothesis. The wedge must have a different cause (corrupted alrt
 task state, missing handler, or downstream of a still-unidentified
 divergence with Einstein).
 
+## Faulting site decoded — `CheckButton__12TAlertDialogFv` reading `this->[+12]` with this=0xE3360000 (2026-04-28)
+
+This iteration's deeper diagnosis (without code changes) localised
+the fault precisely:
+
+1. **PC `0x0002EABC`**: `ldr r0, [r0, #12]` inside
+   `CheckButton__12TAlertDialogFv` (entry at `0x0002EAA4`).
+   `r0` came from the function's first instruction `mov r4, r0`
+   (preserves `this` in r4); the LDR re-reads `this->[+12]`. With
+   `r0 = 0xe3360000` and offset 12 → FAR = 0xe336000c.
+
+2. **`this = 0xe3360000`** is not a heap pointer. It's a value
+   that decodes as ARM `teq r6, #0` (cond=AL, op=TEQ-imm, Rn=6,
+   imm=0) — i.e., raw instruction bytes that ended up where a
+   TAlertDialog object pointer should be.
+
+3. **Caller chain (USR-mode):** USR `lr=0x0002E8D8` returns into
+   `CheckAlertDone__12TAlertDialogFPUl` (`0x0002E8C0`), which
+   itself was called from
+   `IdleProc__18TAlertEventHandlerFP10TUMsgTokenPUlP7TAEvent`
+   (`0x000309EC`) at one of two BL sites (0x30A3C / 0x30A64).
+   IdleProc reads `r0 = TAlertEventHandler->[+20]; r0 += 140; bl
+   At__5CListFl(r0, 0)` — i.e., it asks `CList::At(0)` for the
+   first TAlertDialog in the alert handler's list. The wedge
+   means CList::At(0) returned the junk `0xe3360000`.
+
+4. **Why DAH can't recover:** L1[0xE33] = `0x00000150` (fault
+   descriptor — nothing mapped near 0xE336xxxx). FME's recovery
+   path returns `r0 != 0` → DAH falls into the throw path
+   (saved-LR_abt = `0x01BE319C` = `Throw` jump-table entry) which
+   propagates UnhandledException → Reboot.
+
+5. **Hypothesis.** Something corrupted a CList entry (or the CList
+   header pointer) with what looks like ROM instruction bytes.
+   Candidates: a packed record misread as a function-pointer
+   array, a NewBlock/NewPtr returning an address inside a live
+   allocation, a shadow-stub write that landed in the wrong VA.
+
+**Next iteration's concrete probe targets:**
+
+- **Dump alrt-task CList at the wedge.** Extend the
+  Reboot-canary kernel-state dump in `task_dump.rs` (or a sibling)
+  to walk `task_alrt → ehandler → list@+140 → entries[]`.
+  Print at least 4 entries' raw words. Pinpoint which slot holds
+  the junk and what neighbours look like.
+- **NewtonProbe cross-check.** Run
+  `build/NewtonProbe baremetal/roms/newton.rom
+  _Data_/Einstein.rex 60` and look for IdleProc /
+  CheckAlertDone / TAlertDialog activity. If Einstein doesn't
+  hit this code path at this point, our boot is reaching it
+  via some divergence (likely an alert that fires on real hardware
+  but not on Einstein).
+- **Sentinel on the CList region.** Once we know the CList
+  storage VA, install a stage-2 RO carve-out (mirror the
+  heap-watch infrastructure) that logs every writer.
+
 ## Heap-aliasing wedge RESOLVED — force VM-heap chunk_size=4 KiB via NewHeap + NewVMHeap patches (2026-04-28)
 
 The user's surgical fix: bypass the kernel's 1 KiB subpage-AP

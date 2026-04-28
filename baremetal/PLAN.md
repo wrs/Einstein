@@ -2,1298 +2,213 @@
 
 ## Status
 
-**Phase A done.** Every CPU instruction and MMIO region in the early-boot
-path has a real handler; "unknown sub-case" responses are loud trip-wires.
+**Current goal: eliminate ALL RAM PA aliases**
+User directive (2026-04-28): if any RAM physical page is mapped by two
+distinct VAs, things break randomly under our flat AP=011. No other
+debugging until aliasing is zero.
 
-**Phase B done.** Boot reaches `TInterpreter::TInterpreter` and the full
-driver suite. The `newt` task is alive and the system enters its idle
-pause loop. The per-stall chronology that got us here is in
-`INVESTIGATION.md` and the git log; the table at the bottom of this
-file is the condensed view.
+For the prior history (Phase B per-stall fixes, FMNewStack 33→36 KiB
+patch attempt and revert, deeper alrt-task DABT analysis, RelocHeap
+corruption fix, etc.) see git log up to commit
+`83634659 baremetal: Remember (static) is also NOT the aliasing
+source — pivot to PrimRemember*` and `INVESTIGATION.md` at that
+commit. The current file is intentionally pruned to the live task.
 
-**Now: keep fixing stops until the system works.** No more phases — each
-remaining wedge is its own commit and (where the surface is testable in
-isolation) its own `guest-tests/tests/test_<name>.S`. There is no fixed
-end-state milestone; we drive forward until the boot quiesces in a
-steady-state idle that responds to whatever tablet / serial / network
-inputs we choose to feed it.
+**IMPORTANT:** Run the *original ROM code*. Don't introduce patches or
+workarounds just to get the run further. Diagnose and fix the actual
+problem. *No workarounds, no deferrals, no shortcuts.* No silencing
+warnings. Fix all warnings before each commit.
 
-**IMPORTANT:** The goal is to run the *original ROM code* successfully.
-Don't introduce patches or workarounds just to get the run to progress
-farther. Diagnose and fix the actual problem. *No workarounds, no deferrals,
-no shortcuts.*
+When complete, next goal will be to resume per-stall debugging.
 
 ## Workflow per stop
 
-1. Capture the trace tail (`--features trace_once,quiet` for one-shot
-   first-touch, `trace,quiet` when a tight loop is the symptom).
-   `INVESTIGATION.md` is the running log; update it as facts accrue.
-2. Identify PC, mode, and faulting access. Cross-reference against
-   `scripts/disasm-out/rom.dis`, `_Data_/symbols.txt`,
-   `_Data_/demangled_symbols.txt`, and Einstein's source under
-   `Emulator/`. PCs ≥ 0x00800000 land in `Einstein.rex`; symbols there
-   are not in our tables — read the rex bytes via the ROM disasm
-   pipeline or step through Einstein.
-3. Run the same offset under Einstein
-   (`build/NewtonProbe baremetal/roms/newton.rom _Data_/Einstein.rex
-   30`) so we have a known-good oracle.
+1. Capture verify-mmu output (`fix_stage1_xn_bits` ratchets per
+   alias-onset). Each alias is a `(PA, VA1, VA2)` tuple.
+2. Identify the kernel-side write that creates each alias by
+   instrumenting the relevant L2-write entry point with an HVC probe.
+3. Cross-reference with Einstein (`build/NewtonProbe baremetal/roms/
+   newton.rom _Data_/Einstein.rex 30`) so we have a known-good oracle.
 4. Decide where the fix belongs:
-   - **Hypervisor handler gap** — implement / extend the relevant
-     handler in `src/peripherals/*.rs`, `src/trap.rs`, etc.
-   - **Einstein behavioural quirk we need to mirror** — port the
-     specific arm of Einstein logic into our matching path (the
-     `unknown bank #5` silent-zero in `src/mmio.rs` is the canonical
-     example).
-   - **ROM patch** — add to `src/rom_patches.rs` only when there is no
-     other layer that can host the fix. We're past the era where ROM
-     patches are routine; prefer hypervisor- or peripheral-side
-     interventions.
-   - **Deliver to the guest** — some aborts (NULL derefs, alignment,
-     external aborts) are intended to be observed by the guest's own
-     DABT vector. If the kernel has a recovery path, route the abort
-     to it instead of halting.
-5. Add a `guest-tests/tests/test_<name>.S` if the surface is testable
-   without booting the ROM. Otherwise, the cross-Einstein comparison
-   plus the live trace is the regression evidence.
-6. Re-run, go to next stall.
+   - **Hypervisor handler gap** — `src/peripherals/*.rs`, `src/trap.rs`.
+   - **Einstein behavioural quirk** — port the matching logic.
+   - **ROM patch** — `src/rom_patches.rs`. Only when no other layer can
+     host the fix.
+5. Re-run, observe alias count, repeat until zero.
 
-NOTE: Fix all compiler warnings before committing, to keep context clean.
+## Tools
 
-## Tools available
-
-### Hosts to run under
+### Hosts
 
 - **QEMU raspi3b** (default; `cargo run --release`) — fast, BCM2835
-  VIC, AArch32↔AArch64 banking quirks documented in
-  `docs/QEMU_BUGS.md`. The day-to-day driver. Wrapper:
-  `scripts/run-qemu.sh`.
-- **ARM FVP `FVP_Base_RevC-2xAEMvA`** —
-  `scripts/fvp <elf>`. Accurate reference: GICv3, generic timer +
-  cache model exact. Slow wall-clock, but required when QEMU's
-  banking weirdness is suspect or when only Tarmac will do. Add
-  `--gdb` for an Iris debug server on host port 7100. Build with
+  VIC, AArch32↔AArch64 banking quirks documented in `docs/QEMU_BUGS.md`.
+- **ARM FVP `FVP_Base_RevC-2xAEMvA`** — `scripts/fvp <elf>`. Accurate
+  reference: GICv3, generic timer + cache model exact. Build with
   `--no-default-features --features platform-fvp-base`.
 
 ### Trace and observation
 
-- **Function-level tracer** — `--features trace` patches every entry
-  in `scripts/classify-out/code-symbols.txt` with an HVC trampoline
-  and logs `seq PC name (mode) r0..r3 lr` on each call. Use
-  `--features trace_once` for first-touch (each function logs once
-  per session, ~2800× quieter on a long boot). `--features quiet`
-  silences the recurring diagnostic chatter (`fix_stage1_xn_bits`,
-  XN re-walks, etc.) and is almost always desirable alongside trace.
-  Trace mutates ROM, so traced runs cold-boot (snapshots saved with
-  trace off are rejected on load and vice versa).
-  Post-hoc first-call filter on a full `trace` log:
-
-  ```sh
-  awk '/^trace / && !seen[$4]++' run.log
-  ```
-
-  Same effect as `trace_once` but lets you keep the every-call log
-  around and re-derive the first-call view (or any other dedup key
-  — `$3` for PC-uniqueness, which separates overloaded methods that
-  share a `$4` token).
-- **Tarmac windowing on FVP** — `scripts/fvp --tarmac-window=<file>
-  <elf>`. The plugin starts with tracing OFF; `src/tarmac.rs` emits
-  `<<TRM_START>>` / `<<TRM_STOP>>` on the UART and the FVP's
-  `bp.pl011_uart0.toggle_mti` flips the TarmacTrace on/off. Use to
-  capture an instruction-accurate slice around a stall instead of a
-  10+ GiB full-boot trace. `--tarmac=<file>` (no window) traces the
-  whole run.
-- **`scripts/trace-diff.sh`** — runs Einstein (`NewtonTrace`) and the
-  hypervisor with function-entry tracing on, diffs the two logs.
-  First diverging trace line is usually the right place to start.
-- **`build/NewtonProbe`** — Einstein-as-oracle. `build/NewtonProbe
-  baremetal/roms/newton.rom _Data_/Einstein.rex 30` runs the same ROM
-  under Einstein, captures every CP15 access, SWP, mode transition,
-  data abort `{PC, FAR, FSR, mode}`, and prefetch abort
-  `{PC, IFSR, mode}`. Diff vs. our trap log to localise divergence.
-  Findings cached in `probe/FINDINGS.md`.
-- **Function tracer trampoline pool** is at IPA `0x00900000..
-  0x00E00000`; tracer-side debug probes (putc buffering,
-  newt-tripwire poll, mode-13 SP_svc tracking) live in
-  `tracer::log_trace_at` and fire per-call even in `trace_once`
-  mode.
+- **Function tracer** — `--features trace[_once],quiet`. Patches every
+  `scripts/classify-out/code-symbols.txt` entry with HVC trampoline.
+- **`scripts/trace-diff.sh`** — diff Einstein vs hypervisor function-
+  entry traces.
+- **`build/NewtonProbe`** — Einstein-as-oracle.
+- **Tarmac on FVP** — `scripts/fvp --tarmac=<file>`.
 
 ### State capture
 
 - **Snapshot ring** — 4 slots at `/tmp/newton-snapshot-{0..3}.bin`,
-  autosaved every 2 s of wall-clock from `trap_irq`. `cargo run
-  --release` resumes from the newest valid slot if the ROM
-  fingerprint matches; cold-boot by `rm /tmp/newton-snapshot-*.bin`.
-  Guest-triggered save: `HVC #0x20`. Captures GUEST_RAM + GUEST_FB +
-  flash + EL1 sysregs + AArch64 GPRs (which alias every AArch32
-  banked SP/LR per ARM ARM Table D1-79).
-- **Framebuffer PNG dumps** — `/tmp/newton-fb/NNNNN.png`, written 1 s
-  after the most recent `screen::blit`. 320×480 1-bpp grayscale,
-  inverted so PNG viewers reproduce the panel. See `src/fb_dump.rs`.
+  autosaved every 2 s from `trap_irq`.
+- **Framebuffer PNG dumps** — `/tmp/newton-fb/NNNNN.png` after
+  `screen::blit`.
 
-### Debugging in flight
+### Debugging
 
 - **gdb on QEMU** — `DEBUG=1 cargo run --release` (term 1) +
-  `aarch64-elf-gdb -x scripts/gdb-init <elf>` (term 2). EL2
-  hypervisor BPs / source-line / `stepi` / `bt` work. Guest AArch32
-  BPs go through helpers in `scripts/gdb-init`:
-  - `bg <addr>` — conditional stop at `trap_sync_lower_aarch32` when
-    `$ELR_EL2 == <addr>`. Catches naturally-trapping guest insns
-    only (data/insn abort, SVC/HVC, CP15) — not UND, because the UND
-    trampoline HVCs into EL2.
-  - `bp <addr>` — patches the ROM word with `UDF #0xFFFE` so any
-    ROM-range PC stops in `handle_user_bp_und` with `faulting_pc`
-    set. Snapshot autosaves are gated while a `bp` is live.
-  - Convenience: `tt N`, `guest-state`, `bp-clear`, `bp-list`.
-- **DABT-vector DIAG HVC** at ROM offset `0x10` — every stage-1 DABT
-  passes through `handle_diag` with full banked-register context
-  before being forwarded to the kernel's DAH. Same for PABT at
-  `0x0C`. These are diagnostic scaffolding (see the section near the
-  end of this file), not load-bearing for guest correctness.
-- **Software-reset canaries** — BootOS / PowerOffAndReboot / Reboot
-  canaries in `rom_patches.rs` fire `HVC #0x42`/`0x43`/`0x44` on the
-  first call so the path is loud rather than silently re-entered.
+  `aarch64-elf-gdb -x scripts/gdb-init <elf>` (term 2). Helpers `bg
+  <addr>`, `bp <addr>`, `tt N`, `guest-state`.
+- **DABT/PABT DIAG HVCs** at ROM offsets `0x10` / `0x0C`.
+- **Software-reset canaries** — BootOS / PowerOffAndReboot / Reboot.
 
-### Reference and disassembly
+### Reference
 
-- **`scripts/disasm-out/rom.dis`** — full symbol-annotated ROM
-  disassembly. Currently covers base ROM (≤ `0x71fc4c`) only; REx
-  is not yet pipelined through. See `docs/DISASM.md`.
-- **`docs/NEWTON_INTERNALS.md`** — APCS calling convention,
-  two-level object dispatch, ROM jump-table at `0x01A00000..
-  0x01C20000`, DDK header locations.
-- **`docs/QEMU_BUGS.md`** — raspi3b AArch64↔AArch32 quirks,
-  especially around banked registers at exception entry. Read
-  before suspecting hypervisor code at that boundary.
-- **`docs/STRUCTURES.md`** — Newton kernel data-structure layouts
-  decoded from the disasm.
-- **`docs/WORKFLOW.md`** — process notes (Einstein-driver review by
-  sub-agent; test-per-feature; finish-the-phase semantics).
-- **`docs/peripherals.md`** — peripheral implementations.
-- **`probe/FINDINGS.md`** — golden record of what a fully-booted
-  Newton actually does. Regenerate with `cmake --build build
-  --target NewtonProbe` and `build/NewtonProbe baremetal/roms/
-  newton.rom - 90`.
+- `scripts/disasm-out/rom.dis` — symbol-annotated ROM+REx disassembly.
+- `docs/DISASM.md` (incl. "Jump-table aliasing — DON'T mistake the
+  thunk for the body").
+- `docs/NEWTON_INTERNALS.md` — APCS, ClassInfo dispatch, ROM patch
+  table 0x01A00000..0x01C20000.
+- `docs/QEMU_BUGS.md` — raspi3b AArch64↔AArch32 quirks.
+- `docs/STRUCTURES.md` — kernel struct layouts (TScheduler, TTask,
+  TStackManager, end-to-end page allocation).
+- `docs/peripherals.md` — peripheral implementations.
+- `probe/FINDINGS.md` — golden record from a fully-booted Newton.
 
-### Test suites
+### Tests
 
-- `baremetal/guest-tests/scripts/run-all.sh` runs the 36 guest tests
-  on QEMU; `--platform fvp` runs the same suite on the FVP. Both
-  must stay green. See "Verification" near the end of this file.
+`baremetal/guest-tests/scripts/run-all.sh` runs the 36 guest tests on
+QEMU; `--platform fvp` on the FVP. Both must stay green.
 
-## Pivoted goal — eliminate ALL RAM PA aliases before resuming alrt debug
+## Aliasing elimination — current state
 
-User directive (2026-04-28): if any RAM physical page is mapped by
-two distinct VAs, things will break randomly under our flat AP=011.
-Don't continue debugging the alrt-task wedge until aliasing is
-zero. The verification scaffold from the previous iteration was
-extended to **enumerate every aliased PA one-shot** and a trace
-+ verify-mmu correlation captures the kernel context for each
-alias's first appearance.
-
-### Inventory at the wedge — 15 aliases in three groups
+### Inventory at the wedge — 12 RAM aliases in two groups
 
 ```
 PA=0x04004000  VA=0x0c000000 (L1[0xc0],L2[0x0]) ↔ VA=0x0c002000 (L1[0xc0],L2[0x2])
 PA=0x04005000  VA=0x0c003000 (L1[0xc0],L2[0x3]) ↔ VA=0x0c004000 (L1[0xc0],L2[0x4])
 PA=0x04006000  VA=0x0c007000 (L1[0xc0],L2[0x7]) ↔ VA=0x0c008000 (L1[0xc0],L2[0x8])
-PA=0x04028000  VA=0x0c310000 (last page of stack #10) ↔ VA=0x0c318000 (last page of stack #11)
+PA=0x04028000  VA=0x0c310000 ↔ VA=0x0c318000  (last pages of stacks #10, #11)
 PA=0x0402c000  VA=0x0cc7a000 ↔ VA=0x0cc82000  (8 KiB apart)
-PA=0x0402e000  VA=0x0cc9b000 ↔ VA=0x0cca3000  (8 KiB apart)
-PA=0x0402f000  VA=0x0c318000 (kernel stack)   ↔ VA=0x0cc7a000 (user heap)
+PA=0x0402e000  VA=0x0cc9b000 ↔ VA=0x0cca3000
+PA=0x0402f000  VA=0x0c318000 ↔ VA=0x0cc7a000
 PA=0x04033000  VA=0x0cc82000 ↔ VA=0x0ccad000
 PA=0x04034000  VA=0x0cc7f000 ↔ VA=0x0cc82000
 PA=0x04035000  VA=0x0c603000 ↔ VA=0x0ccc4000
 PA=0x0403a000  VA=0x0ccc4000 ↔ VA=0x0ccca000
 PA=0x0403b000  VA=0x0ccc4000 ↔ VA=0x0cccb000
-PA=0x0403c000  VA=0x0ccc4000 ↔ VA=0x0cccc000
-PA=0x0403d000  VA=0x0ccc4000 ↔ VA=0x0ccc9000
-PA=0x04043000  VA=0x0ccc4000 ↔ VA=0x0ccdd000
 ```
+
+(Reported by `verify-mmu` in `src/guest_mem.rs::fix_stage1_xn_bits`,
+ratchet-logged with `(PA, VA1, VA2)` per alias-onset.)
 
 **Group 1 — kernel-globals self-mapping** (PAs 0x04004-0x04006).
-Created at TTBR0 setup time (`MCR p15,0,c2,c0,0 val=0x04000000`).
-The kernel maps its OWN L1+L2 backing pages into VA 0x0c000000+
-for self-modification, with two views (offsets 0,2 / 3,4 / 7,8).
-Both VAs are kernel-only by intent. **Benign — leave alone.**
-
-**Group 2 — stack-guard sharing** (every other PA).
-Trace correlation: every alias appears immediately after a NewStack
-allocation or stack-fault ResolveFault. The kernel places stack
-slots at **33-KiB intervals** (`STACK_SLOT_SIZE = 0x8400` in
-`FMNewStack` at ROM `0x001F8EAC`):
-- `0x1f8edc: mov r7, #0x8400`
-- `0x1f8f18: mov r0, #0x8400` then `add r0, r0, r0, lsl #5` (×33)
-  then `sub r0, r9, r0, lsl #10` (× 1024) — modulo by 0x8400
-- `0x1f8f48`, `0x1f8f5c`, `0x1f8fa0`: similar div-by-0x8400 sites
-
-33 KiB (=8 pages + 1 KiB) means adjacent stack slots straddle a
-4-KiB boundary. Each stack body (30 KiB = `0x7800`) leaves a
-3-KiB margin at the top, which the kernel relies on subpage AP
-to share with the next stack's bottom guard. ARMv7 has no
-subpage AP → both VAs (= last page of stack N + boundary page
-of stack N+1) end up RW pointing to the same PA. **This is the
-aliasing source.**
-
-### Goal restatement (user 2026-04-28)
-
-Fix the kernel so it doesn't *need* subpage AP at all — change
-allocation granularity from 1 KiB to 4 KiB. Subpage AP today does
-two distinct jobs and BOTH must work:
-
-- **Job 1: Cross-VA isolation.** Page partitioned into 4 subpages,
-  each owned by a different stack/heap. Defunct under our flat
-  AP=011 — different VAs that the kernel intended to isolate via
-  per-subpage AP can write to each other's data.
-- **Job 2: Stack-overflow detection.** Body subpage RW + guard
-  subpages NA so SP overflow faults. Defunct under our flat AP=011
-  — overflow silently corrupts.
-
-Shadow pages would fix Job 1 only. The kernel still wouldn't get
-the overflow faults it needs for Job 2. Per user: "Of course there
-will be overflow, why would there be overflow kernel code if there
-was no overflow."
-
-The right answer is to make the kernel use 4-KiB granularity
-naturally — extensive changes to a LIMITED part of the kernel
-(the allocator), but staying close to the original mechanism. With
-4-KiB-aligned allocations:
-
-- Each stack's body and guard occupy whole pages (no shared 4-KiB
-  pages, no Job 1 problem).
-- Guard becomes a full unmapped page; overflow faults at the L2
-  level (not the subpage level), restoring Job 2.
-- Subpage AP becomes irrelevant; flat AP=011 is correct.
-
-User: "What I meant by natural is keeping the mechanisms as close
-as possible to the original (but no closer)." — i.e., resize the
-kernel's slot constants but don't introduce alien mechanisms like
-shadow pages or fault emulation.
-
-### Patch attempt 1 — REVERTED. 33 KiB is the *domain* page-table granularity, not just stack-slot size
-
-Applied 20 ROM patches to change FMNewStack + Init__11THeapDomain
-+ GetStackInfo__11THeapDomain + FMFree from 33 → 36 KiB. Encodings
-verified with `arm-none-eabi-as` round-trip (initial hand-computed
-imm12 was wrong; assembler caught it — `mov r?, #0x9000 = 0xE3A?_?A09`,
-not `0xC09`. **Lesson: always round-trip ARM encodings through the
-assembler.**)
-
-Result: boot regressed from "alrt-task wedge at NewStack #14" to
-"infinite ResolveFault loop on heap region 0x0c601000..0x0c981000"
-(span 3.5 MiB — the sound heap). **Alias count went UP from 12 to
-84** because the kernel's heap-region page-table was now sized too
-small / too coarsely.
-
-Root cause: `THeapDomain::page_table[N]` (allocated in
-`Init__11THeapDomainFP13TStackManagerUlT2`) tracks `domain_size /
-slot_size` entries. **The kernel uses the same page-table
-granularity for stacks AND heaps in the same domain.** Heaps span
-hundreds of KiB and rely on the page-table being densely indexed
-at the slot-size granularity. Changing slot-size from 33 → 36 KiB
-changed:
-- The number of slots in a 3.5 MiB heap region from
-  `0x380000/0x8400 = 110` to `0x380000/0x9000 = 99` (10% fewer).
-- The placement of every heap allocation within the domain
-  (placement formula uses `slot_idx * slot_size`).
-
-ResolveFault probes for `info_bounds=[0x0c601000,0x0c981000)`
-suggest the kernel was treating the *sound heap* as if it were a
-TStackInfo with the new slot size. The page_table indices no
-longer matched the L2 entries the kernel had already populated
-for heap pages → mass aliasing as different VAs got mapped to the
-same PA via the now-misaligned page_table.
-
-**Conclusion: changing `STACK_SLOT_SIZE` is not feasible. The
-constant is shared infrastructure across the entire allocator —
-not just stacks. Any patch touching it would need to coordinate
-with the heap allocation layer too, which is too much surface.**
-
-### Trace bisection result (2026-04-28)
-
-Re-applied the 20 patches under `--features trace_once,quiet` and
-correlated each verify-mmu alias with the kernel function executing
-just before it. **Surprise: the patch IS correct in the FMNewStack
-domain.** NewStack POST-SWI traces confirm:
-
-- `req=0x9000` (was 0x8400) — kernel asks for 36-KiB slots ✓
-- `base=0x0c306000` (was 0x0c308c00, NOT 4-KiB-aligned!) — base now
-  4-KiB-aligned ✓
-- `top=0x0c30e000` (was 0x0c310400) — top 4-KiB-aligned ✓
-- `span=0x8000` = 32 KiB body (was 0x7800 = 30 KiB)
-- 4-KiB unmapped gap between adjacent stacks (`0x0c30f000 -
-  0x0c30e000`) — each stack has its own guard page; **no
-  stack-stack guard sharing** ✓
-
-So the FMNewStack-side patch achieves what we wanted. But aliases
-STILL appear, just in a different shape:
-
-- **Pre-patch (12 aliases)**: `PA shared between stack #N and stack
-  #N+1's last pages` (= the subpage-AP guard-sharing pattern).
-- **Post-patch (84 aliases)**: `PA shared between stack body pages
-  and HEAP pages in unrelated L1 sections` (e.g.
-  `PA=0x04028000 VA1=stack#1's body page 0x0c30d000 ↔ VA2=heap page
-  0x0c202000`).
-
-Trace shows aliases appear right after `ExtendVMHeap → ResolveFault
-→ AllocNewPage → TUDomainManager::Get`. The kernel's actual page
-allocator (`TUDomainManager::Get` at jump-table 0x001BD2974) is
-**recycling PAs that an earlier stack allocation already took** —
-verified by reading `Init__10TStackPage` at 0x001F9524, which
-tail-calls into `Get` when the caller wants a fresh PA.
-
-So the FMNewStack 36-KiB patch IS necessary but not sufficient.
-The page allocator (`TUDomainManager::Get`) doesn't know about
-the stack-pool's allocation state, OR our slot resize causes its
-free-list to count differently than the consumers do.
-
-### TUDomainManager::Get — body found, but it's a SWI shim (2026-04-28)
-
-Initial PLAN said "likely in REx". **Wrong.** The 0x01BD2974
-address is a REx **jump-table thunk** (the post-ship patch
-mechanism described in `docs/NEWTON_INTERNALS.md` "ROM patch
-table"); it just `B`'s to the real ROM body at base ROM
-`0x00258EC0`.
-
-Memo to self / future sessions: when chasing a `bl 0x01Bxxxxx`
-target, ALWAYS check `_Data_/demangled_symbols.txt` for both
-the body address (≤ 0x00800000) AND the thunk address
-(0x01Axxxxx-0x01Cxxxxx). The body is what to read; the thunk
-is just an indirection. Now documented in `docs/DISASM.md`
-"Jump-table aliasing — DON'T mistake the thunk for the body".
-
-The body at `0x00258EC0`:
-
-```
-Get(this, &out_pa, count) {
-  msgbuf[0] = *0x0c101054     // gPagePoolHandle (kernel obj)
-  msgbuf[1] = count           // 2 in our trace
-  msgbuf[2] = this + 24       // TUDomainManager's domain field
-  if (MonitorDispatchSWI(*0x0c104eec, msg=5, &msgbuf) == 0)
-    *out_pa = msgbuf[0]       // returned page id (in-place)
-}
-```
-
-`MonitorDispatchSWI` is `svc #0x1B`. The kernel SWI handler
-routes msg #5 to `TUDomainManager::PageMonProc` at `0x0025925C`,
-which is itself a vtable trampoline:
-
-```
-PageMonProc(monitor_obj, msg, args_buf) {
-  if (msg == 0x7FFFFFFF) jump (vtable[2]+8)   // init
-  else                   jump (vtable[1]+4)   // page handler
-}
-```
-
-**Correction (2026-04-28).** Initial reading said the value at
-`*0x0c104eec` was a "monitor object pointer" with a vtable.
-That's wrong. Re-reading `StaticInit__15TUDomainManager` shows
-`*0x0c104eec` is just a **kernel monitor handle** (an integer
-ID), copied in by `CopyObject__9TUMonitor` at static-init.
-`MonitorDispatchSWI` (svc #0x1B) takes that handle as r0, the
-msg as r1, and the kernel SWI handler dispatches based on the
-handle to whatever proc was registered for that monitor.
-
-So the actual page-allocation handler proc is **registered at
-runtime**, not visible via static disassembly of the constant
-table. The `RegisterPageMonitor__15TUDomainManagerSFv` (at
-`0x00259094`) is what the kernel runs to install the proc; it
-SWIs msg #3 with sp[0] = `*0x0c104eec` = the page-mon-id, and
-the kernel's SWI handler binds that id to the proc.
-
-`PageMonProc` at `0x0025925C` is the LOCAL stub TUDomainManager
-runs when IT is itself called as a fault monitor — not the
-allocator-side proc.
-
-### Runtime probe done — TUDomainManager::Get does NOT recycle PageIds
-
-Implemented as `handle_page_get_probe` in `src/trap.rs`, ROM
-patch `PAGE_GET_PROBE` in `src/rom_patches.rs`. Patches the
-`teq r0, #0` at `0x00258EFC` (immediately after
-`bl MonitorDispatchSWI` in Get) with `HVC #0x53`. Runs from
-both SVC-direct and USR→UND-trampoline paths; emulates the
-original `teq` flag effect by writing N/Z back to either
-SPSR_EL2 or `UND_SAVE_SPSR_IPA` depending on the entry path.
-Caller LR is recovered by walking Get's APCS frame at fp[-4]
-(R14 itself is clobbered by the BL into MonitorDispatchSWI by
-the time the probe fires).
-
-**Result of cold-boot up to the existing Reboot canary
-(2026-04-28):**
-
-- 28 successful Get calls, all with `caller_lr=0x001F87C0`
-  (= AllocNewPage's bl-Init return) and `count=2`.
-- All returned a **distinct** Newton page id (range
-  `0x136B..0x2A5B`, low 4 bits = `0xB` consistently — the
-  PageId encoding tags low-flags).
-- **ZERO duplicate-PageId returns detected.**
-
-Conclusion: **Get is not the source of the 12 baseline RAM
-aliases observed by verify-mmu.** The hypothesis from the
-prior iteration's trace bisection — "TUDomainManager::Get
-recycles PAs across consumers" — is refuted, at least in the
-no-patch baseline.
-
-### Where the aliasing actually originates — pivot to RememberPhysMap
-
-The 12 baseline aliases (per the inventory at the top of this
-file) are mostly stack-guard sharing: adjacent stacks at
-33-KiB intervals straddle a 4-KiB page, and the kernel relied
-on subpage-AP to give each stack its own sub-slot of the
-shared page. Our flat AP=011 collapses this to one PA-with-two-
-VAs. The kernel must be calling `RememberPhysMap` (or
-`RememberPermMap`) with the same PA but two different VAs —
-not because Get is recycling, but because the kernel
-*intentionally* creates the alias to implement subpage-AP
-intent. Examples in the inventory:
-
-- `PA=0x04028000 ↔ VA 0x0c310000 / 0x0c318000` (last page of
-  stack #10, last page of stack #11) — 33-KiB stride, shared
-  4-KiB boundary page.
-
-So the next iteration's actual investigation target is:
-
-1. **Probe the `RememberPhysMap` family** (entries at
-   `0x00259284`, `0x00259304`, `0x002589f0`, `0x00258a58`)
-   with a second HVC patch on the SWI shim, logging
-   `(env_id, va, pa, perm)` tuples per call. Detect when a
-   PA gets written to a second VA.
-2. Cross-reference the resulting map against verify-mmu's
-   alias enumeration to confirm 1:1 correspondence.
-3. With the kernel-side aliasing source decoded, design an
-   intervention: either (a) patch the kernel's stack-pool
-   allocator so it doesn't share the boundary page (the
-   FMNewStack 36-KiB patch was the right idea but had a
-   different unrelated regression — re-investigate why with
-   the new probe data), or (b) add a hypervisor-side shadow-
-   page mechanism so stage-2 isolates the apparent aliases.
-
-### Step 1 done — `Remember (static)` is NOT the aliasing source
-
-Augmented the existing `handle_remember_entry_probe_with`
-(patched on `Remember (static)` at `0x00258E0C`) with an
-unconditional per-PA → first-VA aliasing tracker. Every
-`Remember (static)` call records `(phys, va, lr)`; if the
-same PA is later seen at a different VA, the tracker logs
-`Remember ALIAS:` with both VA/LR pairs.
-
-**Cold-boot result:** 7 calls to `Remember (static)` got
-captured (matching the existing L1-lazy-grow filter), and
-**ZERO `Remember ALIAS:` lines were logged**. Meanwhile the
-12 verify-mmu RAM aliases ALL still appeared. So the L2
-writes that produce those aliases do NOT pass through the
-`Remember (static)` shim at the user-mode side.
-
-Two non-overlapping kernel paths can produce L2 writes that
-bypass `Remember (static)`:
-
-- **Direct L2 writes by cold-boot kernel setup.** The 3
-  kernel-globals self-mapping aliases (PA=0x04004-0x04006)
-  are written by the kernel's TTBR0 setup code as it builds
-  its own page tables. No Remember-shim involvement.
-- **`PrimRememberMapping` family** (`0x00163480` /
-  `PrimRememberPhysMapping` `0x00163708` /
-  `PrimRememberPermMapping` `0x00163920`). These are the
-  lower-level write primitives reachable via different
-  kernel paths than the `Remember (static)` user-shim. The
-  9 stack-guard-sharing aliases probably go through here.
-
-### Next iteration — probe the Prim* primitives
-
-1. Patch the first word of `PrimRememberMapping` at
-   `0x00163480` (`mov ip, sp` = `0xE1A0_C00D`) with HVC
-   immediate. Args are `(env=r0, va=r1, &TPhys=r2, perm=r3)`;
-   PA is read via `*(r2+16) >>= 12; <<= 12`.
-2. Run the same per-PA → first-VA aliasing tracker on it.
-3. Repeat for `PrimRememberPhysMapping` if the first probe
-   doesn't catch it. Check `PrimRememberPermMapping` last —
-   these set perms, may not change PA bindings.
-4. If neither catches the stack-guard aliases, the writes
-   are direct stores from the kernel's monitor proc and we
-   need a stage-2 trap (mark the L2 table page RO, decode
-   each fault).
-
-Until aliases are zero, the alrt-task DABT and any other
-later wedge stays **deliberately not investigated**.
-
-### Original bisect strategy (kept for reference)
-
-The 20-patch set was internally consistent (verify-mmu sees no
-inconsistency between FMNewStack placement and GetStackInfo
-lookup, both using 36 KiB). But the boot wedged on the heap
-region. So either:
-
-a) Some other kernel code reads / writes slot-size-dependent
-   layout that I haven't patched (likely candidates below).
-b) A 36-KiB slot doesn't divide the existing domain sizes
-   cleanly, leaving the kernel's allocator in a state it can't
-   recover from.
-
-**Bisection strategy**: re-apply the 20 patches one *group* at a
-time, each as its own commit, and observe at what point the boot
-breaks. Groups (in declared dependency order):
-
-1. Group 1 only (constant 0x8400 → 0x9000 in 10 places). This
-   alone is INCONSISTENT (placement formula still uses ×33 ×1024)
-   so will break, but the failure mode tells us how the kernel
-   reacts to the size change in isolation.
-2. Group 2 only (multiplier ×33 → ×9 in 3 places). Also
-   inconsistent on its own.
-3. Group 3 only (shift ×1024 → ×4096 in 3 places). Same.
-4. Group 4 only (guard 3 KiB → 4 KiB in 4 places). Same.
-5. Groups 1+2+3 together (slot size + placement, no guard
-   change). Body offset still 3 KiB inside a 36-KiB slot. Should
-   place stacks at 36-KiB intervals with body starting 3 KiB in.
-6. All 4 groups (the failed attempt). Re-confirm same failure.
-
-Then 7. Add additional patches as we identify what's missing:
-- `Init__11THeapDomain` page_table allocation size (`r0 *= 4`
-  at 0x1F8D80 — should change to multiply by something else if
-  we're actually doing per-page tracking instead of per-slot?
-  Need to check what page_table[i] holds and whether its
-  granularity-coupled sizing depends on slot vs page).
-- The body-span constant (0x7800 = 30 KiB) — used elsewhere?
-- Init__10TStackInfo (called from FMNewStack at 0x1F9098) —
-  what does it do with the address arithmetic?
-
-### Other suspects to audit before re-attempting
-
-- **`Init__10TStackInfoFUlN51`** at `0x001AFBDB8` (in REx jump
-  table). Called from FMNewStack with computed args. Might use
-  slot_size internally for its own bookkeeping. Read its body.
-- **`__ct__10TStackInfoFv`** at `0x001AEF7B8`. Probably just
-  zero-initialises; check.
-- **The 0x271xxx error-code sites** were dismissed as
-  error-code arithmetic. Re-verify by reading 5–10 of them — if
-  any actually compute slot sizing (e.g. `0xFFFFFFFF - slot_idx
-  * 0x8400`) they'd need patching.
-- **REx-side functions** at `0x01Axxxxx`. `NewStack` (0x01BD7BA4),
-  `NewHeapArea` (0x01BD7B98), `LockStack`, etc. Check if any
-  are *patched* in the REx (RAM-resident bytes overriding the
-  ROM thunk default) and if those patches use slot constants.
-
-### Other patch ideas IF the bisect fails
-
-5. **Wrap FMNewStack to return 4-KiB-aligned base** — let kernel
-   keep its 33-KiB allocator internally, but the actual backing
-   pages live at a 4-KiB-aligned offset. Risk: lookup formula
-   `slot_idx = (va - base) / 33 KiB` gives wrong slot for the
-   actual page VAs. Probably doesn't work without ALSO
-   intercepting GetStackInfo.
-6. **Apply Group 4 (guard offset) only**, leaving slot size at
-   33 KiB. Body becomes 4-KiB-aligned within slot. Body span
-   shrinks to 28 KiB or stays 30 KiB and overlaps next slot's
-   guard. Either way, doesn't eliminate cross-slot sharing of
-   the boundary 4-KiB page.
-
-Start with the bisection. The failure mode for "Group 1 only"
-will tell us what the kernel does when the constant is wrong on
-ONE side of a producer/consumer pair.
-
-### Original design (kept for reference)
-
-The 0x8400 (= 33 KiB) constant is used by 4 kernel functions that
-share the slot-size ABI: `Init__11THeapDomainFP13TStackManagerUlT2`
-(slot count + page-table allocation), `GetStackInfo__11THeapDomainFUlPP10TStackInfo`
-(VA→slot lookup), `FMNewStack` (allocation), `FMFree` (deallocation).
-
-Audit confirmed the `0x271xxx` references are **error-code
-generation**, not slot-size — they use `mvn r0, #226 ; sub r0, r0,
-#0x8400` to produce a specific negative error code. Don't touch
-those.
-
-All the slot-arithmetic occurrences must change in lockstep:
-
-**Group 1 — constant `0x8400 → 0x9000` (10 sites). Encodings
-verified with `arm-none-eabi-as -mcpu=cortex-a8` round-tripped
-through `arm-none-eabi-objdump -d`:**
-
-| PC | Original | New |
-|----|---------:|----:|
-| `0x1F8D74` | `mov r0, #0x8400` (E3A00B21) | `mov r0, #0x9000` (E3A00A09) |
-| `0x1F8E1C` | `mov r0, #0x8400` (E3A00B21) | `mov r0, #0x9000` (E3A00A09) |
-| `0x1F8EDC` | `mov r7, #0x8400` (E3A07B21) | `mov r7, #0x9000` (E3A07A09) |
-| `0x1F8F18` | `mov r0, #0x8400` (E3A00B21) | `mov r0, #0x9000` (E3A00A09) |
-| `0x1F8F38` | `cmp r0, #0x8400` (E3500B21) | `cmp r0, #0x9000` (E3500A09) |
-| `0x1F8F48` | `mov r0, #0x8400` (E3A00B21) | `mov r0, #0x9000` (E3A00A09) |
-| `0x1F8F5C` | `mov r0, #0x8400` (E3A00B21) | `mov r0, #0x9000` (E3A00A09) |
-| `0x1F8F90` | `cmp r0, #0x8400` (E3500B21) | `cmp r0, #0x9000` (E3500A09) |
-| `0x1F8FA0` | `mov r0, #0x8400` (E3A00B21) | `mov r0, #0x9000` (E3A00A09) |
-| `0x1F918C` | `mov r0, #0x8400` (E3A00B21) | `mov r0, #0x9000` (E3A00A09) |
-
-(I had originally hand-computed `0xC09`; the assembler round-trip
-showed it should be `0xA09`. ARM imm12 for 0x9000 is imm8=0x09,
-rot_imm=10 → ROR(0x09, 20) = 0x9000. **Always verify with the
-assembler — don't rely on hand-computed encodings.**)
-
-**Group 2 — multiplier ×33 → ×9 (3 sites; uses `r + r<<5 = r*33`
-becomes `r + r<<3 = r*9`):**
-
-| PC | Original | New |
-|----|---------:|----:|
-| `0x1F8F20` | `add r0, r0, r0, lsl #5` (E0800280) | `add r0, r0, r0, lsl #3` (E0800180) |
-| `0x1F9024` | `add r1, sl, sl, lsl #5` (E08A128A) | `add r1, sl, sl, lsl #3` (E08A118A) |
-| `0x1F9030` | `add r0, r7, r7, lsl #5` (E0870287) | `add r0, r7, r7, lsl #3` (E0870187) |
-
-**Group 3 — shift ×1024 → ×4096 (3 sites; combines with the ×9 to
-yield ×9·4096 = 0x9000 total scale, matching the new slot size):**
-
-| PC | Original | New |
-|----|---------:|----:|
-| `0x1F8F24` | `sub r0, r9, r0, lsl #10` (E0490500) | `sub r0, r9, r0, lsl #12` (E0490600) |
-| `0x1F902C` | `add r9, r0, r1, lsl #10` (E0809501) | `add r9, r0, r1, lsl #12` (E0809601) |
-| `0x1F9034` | `sub r0, r9, r0, lsl #10` (E0490500) | `sub r0, r9, r0, lsl #12` (E0490600) |
-
-**Group 4 — guard offset 3 KiB → 4 KiB (4 sites):**
-
-| PC | Original | New |
-|----|---------:|----:|
-| `0x1F8EF0` | `sub r1, r0, #3072` (E2401B03) | `sub r1, r0, #4096` (E2401A01) |
-| `0x1F8F30` | `add r0, r0, #3072` (E2800B03) | `add r0, r0, #4096` (E2800A01) |
-| `0x1F8F88` | `add r0, r0, #3072` (E2800B03) | `add r0, r0, #4096` (E2800A01) |
-| `0x1F9038` | `add r2, r0, #3072` (E2802B03) | `add r2, r0, #4096` (E2802A01) |
-
-**Total: 20 RomPatch entries.**
-
-New slot layout (36 KiB = 9 pages):
-- offset 0..4 KiB: guard (1 full page, AP=011 after our flatten;
-  `apply_resolve_fault_wrapper` claims this as a unique page per
-  stack so no aliasing)
-- offset 4..34 KiB: body (30 KiB usable, unchanged)
-- offset 34..36 KiB: padding (2 KiB) — unused
-
-Memory cost: ~25 stacks × 3 KiB extra = ~75 KiB. RAM is 4 MiB,
-so fine.
-
-All encodings round-tripped through `arm-none-eabi-as` →
-`arm-none-eabi-objdump -d` (see verification log in commit message).
-**Lesson learned this iteration: hand-computing ARM imm12 rotations
-is error-prone. Use the assembler.**
-
-After patching, expected verify-mmu output: 0 stack-page aliases.
-The 3 kernel-globals self-map aliases (Group 1 in the inventory)
-remain — those are intentional kernel-only mappings.
-
-### Verification scaffold (already in place)
-
-`fix_stage1_xn_bits` in `src/guest_mem.rs` now:
-- Counts and ratchet-logs subpage-AP heterogeneity per L2 entry.
-- Detects every PA→VA alias and prints `(PA, VA1[L1,L2], VA2[L1,L2])`
-  one-shot per aliased PA via a static 1024-bit bitmap.
-- Stays quiet once everything is clean (zero violations → no log).
-
-Expected after the FMNewStack patch: only Group 1 (3 kernel-
-globals self-aliases) survives. If Group 2 still appears, more
-aliasing sources need investigation.
-
-## MMU verification scaffold (2026-04-28)
-
-`fix_stage1_xn_bits` (called on every `SCTLR.M` toggle) now also runs
-two cross-checks before flattening L2 entries:
-
-- **Subpage-AP heterogeneity** — for each ARMv4 small/large-page L2
-  entry, decode the four 2-bit subpage AP fields at bits [11:10],
-  [9:8], [7:6], [5:4] and count entries where they don't all agree.
-- **RAM PA aliasing** — for each small-page L2 entry mapping a RAM
-  PA (`0x04000000..+RAM_SIZE`), record `(page_idx → first VA seen)`
-  in a 1024-entry stack array; report any PA reached by two distinct
-  VAs.
-
-Output is ratchet-only (highest-watermark crossings) so a typical
-boot emits ~10 lines. Recent baseline:
-
-```
-verify-mmu: subpage-AP-mixed=8 RAM-aliased-pages=5
-  first alias: PA=0x04004000 mapped by VA1=0x0c000000 and VA2=0x0c002000
-verify-mmu: subpage-AP-mixed=264 RAM-aliased-pages=5
-verify-mmu: subpage-AP-mixed=1178 RAM-aliased-pages=12
-```
-
-Findings:
-- Subpage-AP-mixed grows monotonically (8 → 1178 over boot). The
-  kernel still **writes** mixed-AP L2 entries everywhere — our
-  patches don't stop that. But every entry gets immediately flattened
-  to AP=011 by the same walk, so the kernel's intent is harmless: it
-  thinks subpage AP is enforcing isolation, the hardware has no idea.
-  The number is informational, not actionable.
-- RAM-aliased-pages grows 5 → 12 over the boot. The very first alias
-  (PA=0x04004000 ↔ VA 0x0c000000 / 0x0c002000) is in the
-  kernel-globals region — likely an L2-table backing page that the
-  kernel deliberately self-maps via two VAs. The +7 over the boot
-  matches per-task L1 / L2 sharing for kernel-global sections.
-  These are kernel-internal; no user-mode allocation aliasing was
-  detected after the heap-aliasing fix and ZapHeap patch.
-
-Implementation: `src/guest_mem.rs::fix_stage1_xn_bits`, decode bits +
-1024-entry `va_for_pa` array + ratcheting `static mut HIGH_*`. Cost:
-one extra read per L2 entry walked (~10–50 L2 tables per call) plus
-the array zero-init. Negligible.
-
-## Current stop — alrt-task DABT at FAR=0xe336000c → Reboot canary (CheckButton with junk `this`)
-
-The heap-aliasing wedge is resolved (see "Resolved stops"
-table). With each VM heap now exclusively owning whole 4 KiB
-pages, the boot progresses ~5900 trace lines further. **A
-follow-up sweep (2026-04-28) audited every other 1-KiB
-allocator in the ROM** — see `docs/STRUCTURES.md`
-"## TStackManager" — and patched the only remaining one
-(`ZapHeap` at `0x001428B8`). All 29 LockHeapRange callers,
-TStackInfo / TStackPage layouts, and FMLockHeapRange / ResolveFault
-internals are now documented. The wedge below persists, so it has
-a different root cause than 1-KiB-chunking.
-
-**Faulting site decoded (2026-04-28):** The wedge fires inside
-`CheckButton__12TAlertDialogFv` at ROM `0x0002EABC`, which is the
-first instruction reading `this->[+12]`:
-
-```
-00002eaa4 <CheckButton__12TAlertDialogFv>:
-  2eaa4: mov ip, sp
-  2eaa8: push {r4-r10, fp, ip, lr, pc}
-  2eaac: sub fp, ip, #4
-  2eab0: mov r4, r0          ; r4 = this
-  2eab4: sub sp, sp, #8
-  2eab8: mvn r5, #0          ; r5 = -1
-  2eabc: ldr r0, [r0, #12]   ← FAULT: r0=this=0xe3360000 (junk)
-```
-
-`this = 0xe3360000` is wildly out of any valid heap range (heaps
-are at `0x0c000000+`). 0xe3360000 + 12 = 0xe336000c = the FAR. The
-value `0xe3360000` decodes as ARM `teq r6, #0` — i.e., it looks
-like an **instruction encoding** that ended up in a CList slot
-where a TAlertDialog pointer should live.
-
-**Caller chain.** USR `lr=0x0002E8D8` returns into
-`CheckAlertDone__12TAlertDialogFPUl` (`0x0002E8C0`); USR sp before
-the abort was `0x0CCA35C8` (alrt task's stack). CheckAlertDone is
-called from `IdleProc__18TAlertEventHandler...` at one of two
-sites — `0x00030A3C` or `0x00030A64`:
-
-```
-00309ec <IdleProc__18TAlertEventHandler...>:
-  ... r4 = TAlertEventHandler*
-  309fc: ldr r0, [r0, #20]   ; list = ehandler->[+20]
-  30a00: add r0, r0, #140    ; list += 140 (the CList instance)
-  30a04: mov r1, #0
-  30a08: bl  At__5CListFl    ; r5 = CList::At(0) = first TAlertDialog*
-  ...
-  30a38: mov r0, r5
-  30a3c: bl  CheckAlertDone(r5)   ← passes the CList[0] entry as `this`
-```
-
-So **`CList::At(0)` returned `0xe3360000` — a junk pointer
-masquerading as a TAlertDialog\***. The corruption is somewhere
-in the CList's storage (or in the chain
-`TAlertEventHandler->[+20]+140 → CList → entries[0]`).
-
-**Why the kernel's DAH can't recover:** L1[0xE33] = `0x00000150`
-(plain fault descriptor, nothing mapped). FME (free-memory
-expansion) returns `r0 != 0` — no recovery possible. The DAH
-falls to the throw path (`saved-LR_abt = 0x01BE319C` = `Throw`
-jump-table entry), which propagates UnhandledException → Reboot.
-
-**Hypothesis.** The CList slot was overwritten by something
-writing instruction-encoding-like data into a heap region. The
-0xE3360000 byte pattern is `teq r6, #0` (cond=AL, op=TEQ-imm,
-Rn=6, imm=0). Possible sources:
-- A function-pointer table that got corrupted with raw bytes from
-  somewhere (e.g., a packed-data record misinterpreted as code
-  pointers)
-- A shadow-stub or trampoline write that landed in the wrong page
-- A NewBlock/NewPtr returning an address inside another live
-  allocation
-
-**Concrete next steps for the next iteration:**
-
-NEW PRIORITY (from Einstein cross-check): the alrt task is
-**BLK** throughout the 60-s NewtonProbe window — never reaches
-`IdleProc → CheckAlertDone → CheckButton`. Our hypervisor schedules
-it when Einstein doesn't. So the wedge is a **scheduling-divergence
-symptom**, not an "alrt task got a junk CList entry that we need to
-defend against" bug.
-
-**Wedge-time task census added to Reboot canary** (Step 3, this
-iteration) — the dump now shows exactly who's running/ready/blocked.
-Comparison against Einstein at idle (NewtonProbe steady state):
-
-| State | Einstein at idle | Us at wedge |
-|-------|------------------|-------------|
-| RUN   | newt             | alrt        |
-| RDY   | scrn, pckm       | cdsv, drvl  |
-| BLK   | everyone else (incl. alrt) | everyone else |
-
-Our wedge fires earlier in the boot (cdsv = card services, drvl =
-driver loader, both RDY but blocked on monitor work) than the
-Einstein snapshot (newt = newton-app already booted past
-TInterpreter). So the comparison is not strictly apples-to-apples,
-but the structural finding stands: our scheduler activates alrt
-while Einstein keeps it parked. alrt's `savedPC=0x3AE230` is
-`PortReceiveSWI` and `lr_usr=0x259D48` is `Receive__6TUPort`, so
-alrt was parked in a Receive call. To run CheckButton it must have
-received a message — that message is the wedge trigger.
-
-1. **Identify the message that wakes alrt.** Add a probe at
-   `Receive__6TUPort` for `port_id == alrt.port_id` (or filter by
-   destination task), logging the SENDER and message body. The
-   first non-zero return from alrt's Receive is the trigger.
-2. **Walk alrt's port-wait state.** alrt is parked in Receive so it
-   should be on the port's wait queue (which lives in the PORT
-   struct, not the TTask). Find the alrt port by walking the
-   object table for kernel objects with name 'alrt' or the port
-   whose receiver is the alrt task — see
-   `task_dump.rs::dump_port` (already exists). Confirm alrt is
-   the port's only receiver and that no message is queued at
-   probe time.
-3. **Auxiliary: dump the CList state at wedge time**
-   (`task_alrt → ehandler → list@140 → entries`). Even if we
-   fix the schedule divergence, knowing whether the CList itself
-   was corrupted (vs. just being legitimately non-empty with valid
-   TAlertDialog pointers) tells us whether the wedge is a
-   message-cascade bug or a separate corruption. The TAlertEventHandler*
-   is recoverable from the alrt task stack frame at wedge time —
-   walk up two stack frames from CheckButton's prologue to
-   IdleProc and read the saved r4.
-4. **If no fix appears at the schedule layer**, fall back to
-   "hardening" CheckAlertDone / IdleProc to skip junk CList
-   entries gracefully (validate `this` before deref). This is a
-   workaround, not a fix; only do it if we exhaust the message-
-   trigger investigation.
-
-Detailed text below describes the original wedge first-look:
-
-```
-DAH-OR[5]: far=0xe336000c curr_task=0x0c115db4 (= alrt task)
-DAH-exit probe (throw @ 0x00393944): src_mode=0x17 (ABT)
-  lr_abt=0x01be319c sp_abt=0x0c004c00
-*** Reboot canary fired — guest kernel is rebooting ***
-  R0 = 0xffffd8a5  R3 = 0x7fffffce
-  R14_UND=0x000d9888  (caller LR via Table D1-79)
-```
-
-The faulting address `0xe336000c` is wildly out of any RAM /
-ROM region (RAM = 0x04000000..0x04400000; ROM ≤ 0x01000000).
-The kernel's DAH can't recover and propagates a throw, leading
-to UnhandledException → Reboot.
-
-L1 walk of section 0xE33: every entry in 0xE2F..0xE37 reads
-`0x00000150` = an L1 fault descriptor. So nothing's mapped
-near the faulting VA.
-
-Likely candidates:
-- alrt task's stack or globals contain a corrupted pointer
-  that someone dereferences.
-- An MMIO-style read against an unmapped VA the kernel
-  expects to handle gracefully (ours flags it as fatal).
-- Cascade fallout from the 4 KiB-chunk patches: maybe the
-  kernel's heap allocator is now confused about heap layout
-  in a way that produces wild pointers.
-
-Concrete next steps:
-
-1. **Cross-check Einstein** at the equivalent boot offset.
-   Does Einstein reach the alrt task and, if so, what does
-   it access at this point? NewtonProbe with our existing
-   instrumentation will show.
-2. **Identify alrt's call chain at the wedge.** lr_abt=
-   0x01be319c (jump-table entry) returns to which kernel
-   function? Walk back from that ROM PC.
-3. **Inspect the data near 0xe336000c.** R12=0x0cca34ac at
-   the canary — that's an alrt-region pointer. Likely the
-   loaded value is somewhere alrt's stack or globals.
-
-## Earlier stop — Stage-1 aliasing confirmed: kernel maps heap VA and user-stack VA to same PA
-
-**Aliasing CONFIRMED at stage-1.** This iteration's stage-1
-walk probe proves both VAs translate to PA 0x04032000:
-
-```
-VA 0x0ca6b010 → L1[0xca] coarse → L2[0x6b]=0x0403203e → PA 0x04032000
-VA 0x0cc82018 → L1[0xcc] coarse → L2[0x82]=0x0403203e → PA 0x04032000
-```
-
-The L2 entries are byte-identical (0x0403203e). This is NOT a
-stage-2 issue — both VAs reach the same IPA via stage-1. Two
-distinct L2 tables (in different L1 slots, at different L2
-PAs) both name the same backing physical page.
-
-The `apply_resolve_fault_wrapper` ROM patch in
-`src/rom_patches.rs:894` is the prime suspect. It makes the
-kernel run `TStackManager::ResolveFault` **four times per
-stack fault**, with the `GetMatchingPage→0` companion patch
-forcing every subpage to allocate a fresh physical page. The
-heavy allocator churn this produces is the most credible
-cause for the kernel's page-pool re-issuing PA 0x04032000
-(originally allocated to the RelocHeap) under stack-grow
-pressure later in boot.
-
-**Hypothesis #1 (banked-SP-aliases-heap)** was refuted in the
-prior iteration. **Stage-2 bugs** (e.g., set_ram_page_ro_x
-corrupting unrelated entries) are now also ruled out by this
-iteration — both VAs reach the same IPA *before* stage-2 sees
-them.
-
-## Concrete next steps
-
-**Survey complete (2026-04-28):**
-- `TStackManager` handles both stacks AND heaps —
-  `FMLockHeapRange` (0x001F6B24) is a TStackManager method.
-- `FMLockHeapRange` iterates 1 KiB subpages of the requested
-  heap range, calling `ResolveFault` per subpage. Same
-  per-subpage allocator the wrapper already covers for
-  stack faults.
-- The existing `apply_resolve_fault_wrapper` patches
-  `TStackManager::Fault → ResolveFault` BL only; it
-  deliberately skips `FMLockHeapRange → ResolveFault`. The
-  alias-onset event we caught was through the unwrapped
-  FMLockHeapRange path.
-- Generic L2-write primitives: `PrimRememberMapping`
-  (0x00163480), `PrimRememberPermMapping` (0x00163920) —
-  leaf functions that construct L2 entries with
-  `Perm`-encoded AP fields.
-
-Three implementation options, in order of effort:
-
-### Option A — Wrap FMLockHeapRange's BL too (lightest)
-
-Apply a 4-iter wrapper to FMLockHeapRange's
-`bl ResolveFault` at 0x001F6B94. Mirrors the existing stack-
-fault wrapper. The risk (per the existing comment) is that
-FMLockHeapRange runs during early bring-up where multi-iter
-might over-claim pages. Mitigation: only wrap calls when
-the FAR is in a known heap-allocation range, OR detect at
-runtime when over-claiming would happen and gracefully
-revert to single-iter.
-
-Concrete steps:
-1. Add a parallel wrapper stub at a fresh PC (e.g.
-   `0x00FF_FE60`). Same 4-iter logic as the existing
-   wrapper but with FMLockHeapRange's specific bl-target.
-2. Patch the BL at 0x001F_6B94 to call the new wrapper.
-3. Cold-boot, watch for the alias-onset detector firing.
-4. If boot regresses on early-boot, gate the wrapper by
-   FAR or task ID.
-
-### Option B — Stage-2 emulation of subpage-AP
-
-Read the ARMv4-format L2 entries BEFORE `fix_stage1_xn_bits`
-flattens them. Track per-subpage AP intent in a
-hypervisor-side map. At stage-2, mark any page with
-mixed-AP intent as RO (or invalid) — every guest access
-takes a stage-2 fault. The hypervisor decodes the access,
-checks the intended AP for the specific subpage offset,
-and either allows (write to user-RW subpage) or injects a
-fault into the guest (write to NA subpage).
-
-Cleanest architectural fix; biggest lift. Precise emulation
-of ARMv4 subpage-AP on ARMv7 hardware.
-
-### Option C — Substitute fresh PAs for mixed-AP entries
-
-When `fix_stage1_xn_bits` sees a mixed-AP entry, allocate a
-fresh physical page from a hypervisor-managed pool, copy the
-existing page's contents, and rewrite the L2 entry to point
-at the fresh page. The kernel's free-list gets confused
-about ownership but the kernel stops corrupting itself.
-
-Partial fix; minor leakage but boot progresses.
-
-### Option D — Investigate root divergence
-
-Einstein places heap #3 alone on PA 0x040a6000; ours places
-it shared with stacks. Find what hypervisor-state difference
-causes the kernel's free-list to diverge before NewHeap #3.
-Could yield a simpler upstream fix than any of A/B/C.
-
-**Recommended next iteration: Option A.** Lightest weight,
-parallels existing infrastructure, and the alias-onset
-detector + duplicate-PA scan provide immediate
-regression-catching.
-
-Diagnostic scaffolding (heap-watch sentinel, stage-2 RO
-carve-out, sanity-halt with banked-SP + ring-SP capture,
-stub-orig-PC decoder) stays armed.
-
-The probe extension itself (`heap_header_dump` in `probe.cpp`)
-stays in the tree; it's cheap and useful for any future
-heap-state cross-check.
-
-## Earlier stop — wild jump into SBA inline-stub pool downstream of the no-fit recovery
-
-The previous SearchFreeList wedge is side-stepped (see resolved
-stops). Boot progresses ~2400 trace lines further and halts on:
-
-```
-dabt-trip: PC=0x00f76368 mode=usr writing 0x00000082 -> IPA=0x3
-*** unknown MMIO write halted ***
-```
-
-PC `0x00f76368` is **inside `shadow_stub`'s inline-stub pool**
-(`SBA_STUB_POOL_IPA = 0x00E00000` .. `SBA_STUB_POOL_END = 0x00FFFFf00`,
-in `src/shadow_stub.rs`). The bytes there are written by
-`shadow_stub::patch_rom_from_bitmap` at boot — not by the ROM
-image. Confirmed via paired `kmain` dumps: the slot reads zero
-post-`load_rom` and `0xe5cc0000` post-`patch_rom_from_bitmap`.
-
-Decoded stub body around PC:
-
-```
-+0x00 (0xf76368): e5cc0000  strb r0, [r12, #0]     ← faulting (r12=3)
-+0x04           : e320f000  nop
--0x04           : e128f001  msr cpsr_c, r1
-```
-
-The stub assumes a specific calling convention (`r12` = effective
-target, `r0` = byte to store, etc.) that's set up only by the
-SBA-trap path that branches into it. Our wild jump arrives with
-`r12 = 0x3` — a byte from the corrupted heap leaking through —
-and the `strb r0, [r12]` writes to IPA 3 → unmapped → halt.
-
-So this halt is **downstream blast radius** from the original
-RelocHeap header corruption: the kernel dispatches through a
-vtable / function pointer that's been clobbered to a value inside
-the SBA stub pool (the corrupted heap header contains many
-ROM-PC-like values; one of them lands a valid-looking branch
-target inside our pool). Caller chain on the user stack still
-carries the bad heap (`stack[sp]=0x0ca6b010`,
-`lr_usr=0x00311e1c`).
-
-Update — the gCurrentHeap-clear from this iteration's #3 attempt
-DID write back (`prev=0x0ca6b010, write_ok=true`) but the boot
-still wedges identically. Reason: the caller (`__nw__FUi`'s
-recovery path) saved the bad heap pointer to its own stack
-frame BEFORE calling SearchFreeList; clearing `task[-16]` after
-the fact doesn't unwind those copies. So the cascade has to be
-broken at a different layer.
-
-The new stub-orig-PC decoder identified the wedge precisely:
-`PC=0x00f76368` is `shadow_stub`'s emulation stub for ROM
-`0x00312a18` = `strb r0, [r9]` inside `SetBlockSize`. The kernel
-runs the strb naturally through the stub; `r9` (= NewBlock's
-return value) is `0x3` — a corrupted block pointer sourced from
-the bad heap's `heap[+0x48]`. So this isn't a wild branch into
-the stub pool, just normal code path with corrupted register
-contents.
-
-Concrete next steps:
-
-1. **Reject the bad heap at SetCurrentHeap entry.** The
-   SetCurrentHeap probe at ROM `0x00142df0` already detects
-   `r0=0x0ca6b010`. Substitute a known-good heap pointer
-   (e.g. force `r0 = gFallbackHeap = *0x0c101080`) before
-   letting the function run, OR ELR straight to the early-exit
-   at `0x00142e08` so the no-op path fires. The bad heap
-   never gets installed in `task[-16]`, the cascade never
-   starts.
-2. **Or validate NewBlock's return.** Hook the LDR/STR pair
-   at SetBlockSize ROM `0x00312a08`/`0x00312a18` and short-
-   circuit when `r0` (NewBlock return) is below a small
-   threshold (e.g. `< 0x1000`). More surgical but only
-   triggers when the bad heap actually produces a bad return.
-3. **Cross-check Einstein** — what does Einstein do at the
-   equivalent boot offset? Einstein's heap stays valid so it
-   doesn't reach this state, but understanding the
-   no-fit-recovery dispatch helps choose where to intercept.
-
-## Earlier stop — RelocHeap header corruption in newt's MakeStoreObject path
-
-The bus-error throw inside `CardFaultMonProc` (0x4e528) is triggered
-upstream by a DABT at `SearchFreeList` PC=0x00313308 with
-FAR=0xe52d006c. The "heap" pointer that `GetCurrentHeap` returns at
-that point (0x0ca6b010) is **the legitimate RelocHeap** — created by
-`NewHeap` call #3 with base=0x0ca6b000, size=2 MiB
-(`/tmp/run-probe.log`). Multiple kernel call-sites switch into it
-during normal operation (`NewHandle` at 0x141c40 / 0x1415d4,
-`CompactHeap` at 0x31325c / 0x3132cc, `HUnlock` at 0x141ef0). So
-SetCurrentHeap is **not** the source of the wedge.
-
-The wedge is **content corruption**: the heap's 128-byte header has
-been overwritten in `+0x00..+0x14` (saved ROM PCs and stack pointers
-that look like `__ct__9TRefStackFv` ctor / `TStoreObjectWriter` ctor
-frames) and at `+0x48` / `+0x60` (freelist position now points at
-ROM PC `0x002dfa20`). SearchFreeList walks the bogus freelist and
-dereferences `*0x002dfa24 = 0xe52d006c` (= `str r0, [sp, #-108]!`
-instruction encoding), giving the FAR=0xe52d006c fault.
-
-The RelocHeap region (0x0ca6b000..0x0cc6b000) does **not** overlap
-newt's user stack (sp_usr=0x0cc81f04 at the wedge), so this isn't a
-direct stack/heap aliasing bug. See `INVESTIGATION.md` for the
-heap dump and probe trace.
-
-Diagnostic scaffolding (still installed; stay armed via re-occupy
-slot — no ROM-mutation churn per hit; capped at 32 lines per probe
-but always log on the wedge-relevant arg matches):
-
-- `kmain` installs `guest_bp` at `0x00313308` (SearchFreeList wild-r0
-  halt), `0x001a4948` (TRefStack post-NewStack), `0x00142df0`
-  (SetCurrentHeap entry), `0x00310e24` (NewHeap entry).
-- `handle_user_bp_und` arms emulate the patched-out instruction
-  (LDR-from-r0, `add sp, sp, #4`, `ldr r1, [pc, #40]`,
-  `mov ip, sp`) and re-occupy the slot before ERET, so each
-  invocation re-traps without disarming.
-
-Concrete next steps:
-
-1. **Hook `SearchFreeList` to fail gracefully.** Both QEMU and
-   FVP reach the same wedge with identical corruption — this is
-   a Newton-OS allocator divergence, not a hypervisor bug. The
-   carve-out captures most writers but not the actual corrupting
-   write (which lands during the RW window between fault-and-
-   next-trap; see INVESTIGATION.md). Rather than chase the writer
-   with an ARM-store decoder or stage-2 invalid-entry mode (both
-   significant implementation cost), patch `SearchFreeList` (ROM
-   `0x003132d8`) to short-circuit on a wild freelist node:
-   detect that `*r0` would translate-fail (or matches the
-   `0xe5xx_xxxx` instruction-encoding signature of a ROM PC
-   misread as a freelist-next pointer) and return `r0 = 0`
-   (no fit). The kernel's caller is `__nw__FUi`, which on
-   "no fit" tries the next heap or throws `exMemFull` — both
-   benign compared to the bus-error throw we currently get.
-2. Cross-check Einstein at the equivalent boot offset (NewtonProbe
-   60 s) — dump Einstein's RelocHeap header at the same point and
-   diff. If Einstein's heap stays valid, the bug is in our
-   reproduction of one of the upstream allocator side-effects;
-   if Einstein corrupts it the same way, the ROM internally
-   recovers from this, and so should we (option 1 mirrors that
-   recovery).
-3. Once the wedge no longer halts, observe what new state the
-   boot reaches and pick the next stop.
-
-The carve-out + dabt-on-carve scaffolding should stay armed — it
-gives us a continuous log of write activity on the heap header
-that's useful for any follow-up investigation.
-
-## Earlier stop — newt self-deadlocks on the heap-store TULockingSemaphore
-
-`newt` is permanently queued on a TSemaphore at `0x0c116eb8`'s
-BlockOnInc list (queue at `+0x20 = 0x0c116ed8`). The owning
-TSemaphoreGroup is at `0x0c116e94` (kernel id `0x13d7`). Its
-TULockingSemaphore wrapper is at `0x0c116e7c`; the lock-state word
-at `0x0c116e8c` holds `0x3063` — newt's own task id.
-
-`task_dump`'s saved-PC walker shows newt at PC `0x3ae1fc` (the SVC
-of `SemaphoreOpGlue`), `lr_usr=0x25a2e0` (after `bl SemOp` in
-`TULockingSemaphore::Acquire`), and the user stack carries saved
-LRs `0x143334` (`DisposPtr`'s `bl Acquire` site) and `0x354724`
-(`MakeStoreObject`'s exception catch handler). The sequence is:
-
-1. Newt enters `MakeStoreObject` (ROM 0x354178), acquires the heap
-   store's TULockingSemaphore via `LockStore`. lock-word ← newt id.
-2. Newt does `StorePermObject` work, then **throws `exBusError`**
-   (Throw at trace 4149074 with r0 = literal pool entry pointing to
-   `exBusError` at ROM 0x3712b8). Bus-error origin: unidentified —
-   most likely a guest MMIO read or stage-2 fault we should
-   silently default rather than turn into a guest exception.
-3. The catch handler at ROM 0x3544f4 calls `TStoreWrapper::Abort`
-   (0x354b50). Abort does **not** call `UnlockStore` — verified by
-   reading the body. So the lock stays held by newt.
-4. The destructor `~TStoreWrapper` (0x353ae4) runs through
-   `DisposeRefHandle`, which lands in `DisposPtr` (0x14320c).
-   DisposPtr calls `Acquire` on the heap semaphore at 0x143330.
-5. That `Acquire`'s Swap finds `*lock_state == newt id`, so it
-   calls SemOp → BlockOnInc. Self-deadlock — only newt could
-   release the lock, and newt is now blocked on it.
-
-Einstein cross-check (`scripts/fvp` not needed; `build/NewtonProbe`
-60 s shows newt reaching `BLK→RDY` cycles with `Tmux RUN`, `scrn`
-already created, etc.) — Einstein never lands on this deadlock.
-The most plausible reading is that step 2 (the Bus Error) doesn't
-fire on Einstein, so the lock-leak path is never taken there. So
-the right fix is to **find the bus-error origin and make it not
-throw**, not to retro-fit recursive-lock semantics into
-TULockingSemaphore.
-
-Concrete next steps:
-
-1. Re-run with `--features trace,quiet` (every-call trace, not
-   `trace_once`) and capture the data abort or MMIO read that
-   triggers the throw. Cross-check against Einstein at the same
-   trace offset — the divergence will name the handler we need to
-   silently default. (See `docs/peripherals.md` for the existing
-   silent-default arms; Einstein's `TMemory::ReadP` is the oracle
-   for what value to return.)
-2. Implement the silent default. Verify the deadlock disappears
-   and newt makes forward progress. Past this point we expect
-   `TScreenDriver::*` to instantiate (compare against the Einstein
-   t=2 s probe dump).
-3. Then return to "feed inputs": `peripherals/tablet.rs` is the
-   lightest-touch path once `newt` is actually scheduling.
-
-## Resolved stops (newest first)
-
-| Date | Wedge | Resolution |
-|------|-------|------------|
-| 2026-04-28 | 1-KiB allocator audit (preventative; not a wedge) | Final 1-KiB site closed: `ZapHeap` at `0x001428B8` (`moveq r4, #1024 → mov r4, #4096`). Full catalogue of FMLockHeapRange ABI, TStackInfo / TStackPage layouts, and the 29 LockHeapRange callers documented in `docs/STRUCTURES.md` "## TStackManager". Boot reaches the same alrt-task wedge — the wedge has a different root cause than subpage-AP. |
-| 2026-04-28 | RelocHeap (heap #3) header corruption: stack-grow assigns newt's user stack to PA shared with heap #3, ARMv7's flat AP=011 (post-`fix_stage1_xn_bits`) lets stack writes spill into the heap struct subpage | Two-patch surgery forces every VM heap to allocate / extend in 4-KiB chunks instead of 1-KiB subpages: `0x310E38: mov r6, r2 → mov r6, #4096` (NewHeap chunk_size) + `0x1423A0: beq → nop` (NewVMHeap 4 KiB-init path). Each heap exclusively owns whole pages; no subpage sharing with stacks. Boot progresses ~5900 trace lines past the wedge to a NEW stop (Reboot canary, alrt task). |
-| 2026-04-27 | NULL-pointer SWP via `Swap(0,1)` at ROM `0x3ae204` (kernel `Acquire(NULL)` glue inside `VccOff__FiUl`) — stage-2 perm fault on write to ROM aperture, ISV=0 | trap.rs `try_absorb_rom_write`: mirror Einstein `TMemory::WriteP` (TMemory.cpp:1755-1766), drop the store; for SWP/SWPB also run the load piece into Rd. Boot reached steady-state idle. Test: `guest-tests/tests/test_swp_rom_aperture.S`. |
-| 2026-04-27 | TEncodingMap.+16 = 0x20000110 (out-of-stage-2 IPA) at `ConvertToUnicodeFunc_Contiguous8` | mmio.rs: `0x20000000..0x30000000` "unknown bank #5" silent-zero matching Einstein's `TMemory::ReadP` (TMemory.cpp:1026-1034). Boot advanced 10× → reaches TInterpreter. |
-| 2026-04-27 | `Reboot` canary inside `TInterpreter::TInterpreter` — DFSC=5 at FAR=0x0cd07400 on lazy-L1 section grow during `TRefStructStack::Fill` (L1[0xCD]=0x90 lazy marker) | γ-fix in `handle_diag`: read L1.domain from the faulting VA's L1 entry and write it into DFSR_EL1.bits[7:4] before forwarding to DAH (ARMv7 leaves Domain UNK on DFSC=5; kernel was reading 0). |
-| 2026-04-26 | BootOS canary entry #2 (R0=0x0cc80c80) — `name`-task stack-overrun corrupts neighbour task on shared PA | 3-instruction ROM patch in `TStackManager::ResolveFault` (mask=0xF) forces per-page stack allocation. |
-| 2026-04-25 | `newt`-DABT alias narrows to scheduling order | IRQ-rate + tick-page divergence fixed. |
-| 2026-04-25 | Recursive DABT in `TStackInfo::Init` | Flash recovery path eliminated. |
-
-See `INVESTIGATION.md` for the full chain of analysis on each.
+Created at TTBR0 setup time. The kernel maps its own L1/L2 backing
+pages into VA 0x0c000000+ at two offsets each. Kernel-only by intent.
+
+**Group 2 — stack-guard sharing** (the rest). Adjacent stack slots at
+33-KiB intervals straddle a 4-KiB boundary; the kernel relied on
+ARMv4 subpage AP to sub-divide ownership. ARMv7 has no subpage AP →
+both VAs end up RW pointing to the same PA after we flatten to AP=011.
+
+### Investigation progress
+
+Two probes installed and run; both refuted hypotheses:
+
+1. **`TUDomainManager::Get` page-allocator** — patches the `teq r0,
+   #0` after `bl MonitorDispatchSWI` at `0x00258EFC` with `HVC #0x53`.
+   Handler `handle_page_get_probe` in `src/trap.rs`. Logs every
+   returned PageId + caller LR; tracks per-id first-caller for dup
+   detection.
+   - **Result:** 28 successful Get calls in baseline boot, all from
+     `caller_lr=0x001F87C0` (= AllocNewPage's bl-Init return), all
+     count=2, all distinct PageIds. **0 duplicates.**
+   - Conclusion: Get is NOT recycling PAs. Aliasing has a different
+     origin.
+
+2. **`Remember (static)`** at `0x00258E0C` — augmented the existing
+   `handle_remember_entry_probe_with` with a per-PA → first-VA
+   tracker. Logs every (env, va, pa, perm) call; emits `Remember
+   ALIAS:` when a PA is later seen at a different VA.
+   - **Result:** 7 ENTER lines in baseline boot. **0 `Remember
+     ALIAS:` lines.** The 12 verify-mmu aliases all still appeared.
+   - Conclusion: the L2 writes that produce the aliases do NOT pass
+     through the `Remember (static)` user-shim.
+
+### Next iteration — probe `PrimRememberMapping` at 0x00163480
+
+This is the lower-level L2-write primitive (called from kernel-mode
+paths that bypass `Remember (static)`).
+
+Args at entry: `(env=r0, va=r1, &TPhys=r2, perm=r3)`. PA is extracted
+as `*(r2+16) >>= 12 << 12`.
+
+Steps:
+
+1. Patch the first word of `PrimRememberMapping` (`mov ip, sp` =
+   `0xE1A0_C00D`) with `HVC #PRIM_REMEMBER_PROBE_HVC_IMM` (pick a
+   fresh tag, e.g. `0x54`).
+2. Wire a `handle_prim_remember_probe` in `trap.rs` that captures
+   args, dereferences `&TPhys` to get PA, runs the same per-PA →
+   first-VA aliasing tracker, then emulates `mov ip, sp`.
+3. Cold-boot, capture `Prim ALIAS:` lines; compare against verify-mmu
+   alias enumeration.
+
+**Fallbacks if `PrimRememberMapping` doesn't catch the aliases:**
+
+- Try `PrimRememberPhysMapping` at `0x00163708` (variant taking pre-
+  resolved PA).
+- Try `PrimRememberPermMapping` at `0x00163920` (perm-only updates).
+- If still nothing, escalate to a **stage-2 trap on the L2 backing
+  pages**: mark them RO at stage-2, decode each write fault, log
+  `(L2 entry index, value)`. That catches direct kernel writes that
+  don't go through any Remember-shim — most likely the source of the
+  Group 1 kernel-globals self-map aliases.
+
+Until aliases are zero, the alrt-task DABT and any other later wedge
+stays **deliberately not investigated**.
 
 ## Critical files
 
-- `src/guest_mem.rs` — ROM load + byteswap; `fix_stage1_xn_bits` (L1 +
-  coarse-L2 normalise; flattens ARMv4 subpage-AP to AP=011; skips the
-  shadow-stub scratch L1 slot so it doesn't fight the installer; now
-  returns `bool` indicating whether ROM bytes mutated this call so
-  flash-checksum reseeds skip when nothing changed); UND-vector
-  trampoline at ROM offset `0x00FFFF00`; DABT-vector DIAG HVC patch at
-  ROM offset `0x10`; `dump_stage1_walk`; scratch-VA L1 section
-  installer at `L1[0x60]`.
-- `src/trap.rs` — CP15 shim (TVM trap on writes to VM regs); HVC
-  dispatch (UND_TAG / DIAG_TAG / DIAG_LR_TAG / SBA / tracer / canary
-  tags); `handle_und` (SWP, SystemBoot/Debugger/TapFileCntl UND, MCR
-  c15,1,2 StrongARM clock, MCR c7,c7,0 deprecated cache-invalidate);
-  `handle_fp_simd` → CP10/11; two-stage `handle_diag` /
-  `handle_diag_lr` DABT-intercept stub; `handle_data_abort` with
-  kernel-DABT forwarding for lazy stack growth; `try_emulate_isv0_dabt`
-  for ISV=0 word LDR/STR; `try_absorb_rom_write` mirroring Einstein's
-  silent-drop of writes to the ROM aperture (SWP/SWPB load piece runs).
-- `src/guest.rs` — HCR_EL2 (TVM, TIDCP, TSW, IMO, FMO, AMO);
-  CPTR_EL2.TFP for CP10/11; DC bit toggling across stage-1 on/off.
-- `src/stage2.rs` — stage-2 L1/L2/L3. 2 MiB blocks for ROM/RAM/flash/FB;
-  4 KiB L3 pages for the MMIO window `0x0F000000..0x0F200000` and the
-  64 KiB shadow-stub scratch carve-out at IPA `0x0600_0000`.
-- `src/timer.rs` — CNTHP driver; instruction-anchored synthetic ticks.
-- `src/banked.rs` — AArch32 banked-register access from EL2 per
-  ARM ARM Table D1-79.
-- `src/peripherals/{serial,serial_driver,native_primitives,screen,
-  platform,battery,tablet,sound,network,printer,host_call,
-  in_translator,out_translator,flash,flash_driver,vic,dma,pcmcia}.rs`
-  — Newton driver / native-primitive surface.
-- `src/mmio.rs` — routes the MMIO window plus the `0x20000000..
-  0x30000000` "unknown bank #5" silent-zero arm and PCMCIA banks.
-- `src/rom_patches.rs` — Einstein word-write patches; debugger HVC
-  injections; GetClock / SetAlarm wrap-detect ls→cc fixes;
-  PowerOffAndReboot / Reboot / BootOS canaries; `TStackManager::
-  ResolveFault` per-page-stack-allocation patches.
-- `src/shadow_stub.rs` — BE-32 byte/halfword-access patcher (DeadReg /
-  Stack / ScratchVA stub variants; 16-word stub layout).
-- `src/snapshot.rs` — rolling ring under `/tmp/newton-snapshot-{0..3}.bin`.
-- `src/tracer.rs` — function-level tracer (HVC trampolines on every
-  `code-symbols.txt` entry); `trace_once` feature gates the per-call
-  trace line behind a fired-bitmap so each function logs at most once.
-- `src/fb_dump.rs` — 1 s after each `screen::blit`, dumps GUEST_FB to
-  `/tmp/newton-fb/NNNNN.png` via Arm semihosting.
-- `src/guest_bp.rs` — `bp <addr>` infrastructure for the gdb workflow.
+- `src/guest_mem.rs` — ROM load + byteswap; `fix_stage1_xn_bits`
+  flattens ARMv4 subpage-AP to AP=011 and runs the verify-mmu
+  alias detector; UND-vector trampoline; DABT/PABT DIAG patches.
+- `src/trap.rs` — CP15 shim, HVC dispatch (UND_TAG / DIAG_TAG / SBA /
+  tracer / canary / probe tags); `handle_page_get_probe`,
+  `handle_remember_entry_probe_with` (with the new aliasing tracker);
+  `handle_data_abort` with kernel-DABT forwarding for lazy stack
+  growth.
+- `src/guest.rs` — HCR_EL2 (TVM, TIDCP, TSW, TPC, TPU, IMO, FMO, AMO,
+  DC); CPTR_EL2.TFP for CP10/11.
+- `src/stage2.rs` — stage-2 L1/L2/L3.
+- `src/banked.rs` — AArch32 banked-register access from EL2 (Table
+  D1-79).
+- `src/rom_patches.rs` — Einstein word-write patches; HVC injection
+  helpers; canaries; ResolveFault wrapper; `PAGE_GET_PROBE` patch.
+- `src/peripherals/*` — Newton driver / native-primitive surface.
+- `src/snapshot.rs` — rolling ring under `/tmp/newton-snapshot-*.bin`.
+- `src/tracer.rs` — function-level tracer.
+- `src/guest_bp.rs` — `bp <addr>` for the gdb workflow.
 - `src/task_dump.rs` — `TScheduler` / `TTask` dumps from EL2.
-- `src/tarmac.rs` — Tarmac-like instruction-trace markers.
-- `src/unaligned.rs` — `handle_align_fault` emulator for SCTLR.A=1
-  unaligned LDR/STR aborts.
-- `guest-tests/tests/` — 36 tests; `guest-tests/scripts/run-test.sh`
-  clears snapshots before each run.
+- `guest-tests/tests/` — 36 tests; `guest-tests/scripts/run-all.sh`.
 
 ## Verification
 
-Each commit:
+Every commit:
 
 ```
 baremetal/guest-tests/scripts/run-all.sh
 ```
 
-All 36 tests pass at the current commit.
+All 36 tests must pass.
 
 ## Non-goals
 
@@ -1301,58 +216,16 @@ All 36 tests pass at the current commit.
   no pen input.
 - Package loading — needs a solution for embedded native code.
 
-## Diagnostic scaffolding
+## Diagnostic scaffolding (active)
 
-These are load-bearing for the current stop-fixing loop and stay until
-the boot is steady-state-quiet:
-
-- DABT-vector HVC patch at ROM offset `0x10` →
-  `handle_diag` / `handle_diag_lr` in `trap.rs`. Catches every stage-1
-  DABT with full banked-register context.
-- PABT-vector HVC patch at ROM offset `0x0C` — same DIAG path.
-- `handle_diag_from_bp` hook in `guest_bp.rs::handle_user_bp_und`.
-- 500-entry trap log budget at the top of `trap_sync_lower_aarch32`;
-  HVC `#0x50` (tracer TAG) suppressed to avoid doubling trace output.
-- Bring-up VA walks in `handle_diag`.
+- `verify-mmu` in `fix_stage1_xn_bits` — ratchet-logs subpage-AP
+  heterogeneity and per-alias-onset `(PA, VA1, VA2)` tuples.
+- `handle_page_get_probe` (PAGE_GET_PROBE_HVC_IMM=0x53) on
+  `0x00258EFC` — page-allocator return logger + dup detector.
+- `handle_remember_entry_probe_with` (REMEMBER_PROBE_HVC_IMM=0x46)
+  on `0x00258E0C` — Remember-side per-PA → first-VA aliasing tracker
+  (added to the existing L1-lazy-grow probe).
+- DABT/PABT DIAG vectors at ROM offsets `0x10` / `0x0C`.
 - BootOS / PowerOffAndReboot / Reboot canaries in `rom_patches.rs`.
-- `guest_bp` installs from `kmain`: `0x00313308` (SearchFreeList
-  ldr — emulates the load when r0 translates, ELRs to 0x00313360
-  (no-fit exit) when r0 doesn't translate, allowing the kernel's
-  out-of-memory recovery to handle it instead of bus-error-throwing),
-  `0x001a4948` (TRefStack post-NewStack r0/r4 + sp/lr probe),
-  `0x00142df0` (SetCurrentHeap entry r0/lr probe — always logs when
-  r0=0x0ca6b010), `0x00310e24` (NewHeap entry r0(base)/r1(size)/lr —
-  always logs when r0=0x0ca6b000). All four arms in
-  `handle_user_bp_und` emulate the patched-out instruction and
-  re-occupy the slot, so the marker UDF stays armed for the whole
-  boot without per-hit ROM churn.
-- `heap_watch::sample` (`src/heap_watch.rs`) called from
-  `trap_sync_lower_aarch32` and `trap_irq` entry — samples
-  `heap[0x0ca6b010]` every trap, maintains a 32-slot ring buffer
-  of recent ELRs, and on every value transition logs the change
-  plus the ring buffer to the kernel console. Used to bracket the
-  RelocHeap-header corruption writer to a tight trap-stream window.
-  Remove with the rest of this stop's scaffolding.
-- `heap_watch::arm_carve_out_at_heap_va` + the carve-out branch
-  in `handle_data_abort` — installs a stage-2 RO carve-out on
-  the 4 KiB page backing `VA=0x0ca6b000`, follows the VA across
-  stage-1 rebinds, and logs every guest-side perm fault on the
-  page (writer ELR + IPA + decoded value when ISV=1).
-  `stage2::ram_page_l3_entry` is the readback helper for
-  verification. `heap_watch::log_stage1_walk` decodes the
-  kernel's L1/L2 entries for VA 0x0ca6b010 to disambiguate
-  stage-1-RO vs stage-1-RW writes. The "dabt-on-carve" trace
-  in `handle_data_abort` (top of the function) is an
-  unconditional all-class DABT log for the armed PA, used to
-  distinguish "no fault fires" from "fault fires but our arm
-  doesn't match". Remove together with the heap_watch sentinel.
-- `heap_watch::check_heap_sanity` — multi-field heap-header
-  invariant probe (heap[+0]=base, heap[+8]='skia' magic). Wired
-  into `sample()` after the transition log; halts on the first
-  trip-wire with a full header dump + ring-buffer trap stream.
-  Gated on ELR being outside known heap-allocator PC ranges
-  (`0x140000..0x148000`, `0x310000..0x320000`) so partial
-  allocator updates don't false-positive.
 
-Once the boot quiesces these can be pulled; the behavioural invariants
-they enforce are codified in guest tests.
+Pull these once the boot quiesces.

@@ -1846,6 +1846,8 @@ fn log_fpa_ctrl_reg(pc: u32, insn: u32, cond_passed: bool) {
 /// us catch the abort context once before the guest's own handler
 /// clobbers it.
 
+// ---
+
 /// Canary handler: the guest hit `PowerOffAndReboot` (ROM PC 0x000E_6BBC).
 /// rom_patches patched the first word to `HVC #POWEROFF_REBOOT_HVC_IMM`,
 /// so we land here BEFORE the function's prologue runs — ctx.x[0..14]

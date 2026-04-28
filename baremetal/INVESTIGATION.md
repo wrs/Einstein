@@ -42,6 +42,56 @@ quiesces on the same path without ever getting there.
 
 ## Pending follow-ups
 
+### Stage-1 RW theory ruled out; post-rebind silence is QEMU stage-2 enforcement (2026-04-27, late evening II)
+
+Added stage-1 walk + L3 readback at every heap_watch transition, plus
+unconditional dabt-on-carve trace at handle_data_abort entry. New data:
+
+- Stage-1 entries at every transition (including #3, the corruption):
+  - `L1[0xCA] = 0x0401c081` (coarse, domain=4)
+  - `L2[0x6B] = 0x0403203e` (small page, **AP=[011]**, XN=0, PA=0x04032000)
+
+  AP=[011] is "Privileged R/W, User R/W" (ARMv7-A short-descriptor B3.7.1).
+  Stage-1 grants writes from user mode, so the stage-1-RO theory is
+  **ruled out**.
+
+- L3 entry at every transition reads back as `0x000000000183277f`:
+  bits[1:0]=11 (valid+page), bits[7:6]=01 (S2_AP=RO), PA=0x01832000.
+  RO **is** set in the L3 table at the time of the corruption read.
+
+- Unconditional dabt-on-carve trace (every DABT whose IPA falls on the
+  armed page, regardless of class) shows **zero** hits on PA=0x04032xxx
+  across the entire boot. All 64 captured hits are pre-rebind on the
+  old PA=0x0401fxxx.
+
+- Hammered TLB after rebind with `tlbi vmalls12e1is` (full stage-1+
+  stage-2 EL1 flush). No change.
+
+So the L3 entry says RO, the kernel writes RW-eligible bytes via a
+stage-1-RW VA, and yet stage-2 doesn't fault. Most plausible
+explanation: QEMU's stage-2 permission enforcement is missing for
+AArch32-source writes after a TLBI on this codepath. Worth
+verifying on FVP, where the architectural model is exact.
+
+Even if the QEMU bug stands, the corruption itself is a Newton-OS
+concern, not a hypervisor concern (Einstein boots through this
+window cleanly). Better-aimed next steps:
+
+1. **Ditch the RO carve-out for an INVALID-entry trap.** Setting
+   the L3 entry to invalid (`!DESC_VALID`) makes both reads AND
+   writes fault — at least we'd see one access pattern. Reads
+   would need to be emulated (return the value from host PA);
+   writes get the writer-PC log we're after. More setup, but
+   side-steps the suspected QEMU bug class.
+2. **Run on FVP with the carve-out in place.** If FVP shows the
+   missing perm faults, this is firmly a QEMU bug (worth a
+   `docs/QEMU_BUGS.md` entry) and we move on with the FVP data.
+3. **Polling at finer granularity.** `heap_watch::sample` already
+   fires every trap; the trap stream between transition #2 and
+   #3 averages ~0.5 traps/instruction, but the corruption window
+   sits inside a single trap-to-trap gap. Unsatisfying without
+   instrumentation, but could narrow with a Tarmac slice on FVP.
+
 ### Stage-2 RO carve-out works pre-rebind, mysteriously silent post-rebind (2026-04-27, late evening)
 
 `src/heap_watch.rs` now installs a stage-2 RO carve-out on the

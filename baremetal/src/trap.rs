@@ -394,6 +394,26 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
 
     let elr = read_sysreg!("elr_el2") as u32;
 
+    // Heap-watch debug: log every DABT on the carved-out heap page,
+    // regardless of fault class, so we can see WHY the post-rebind
+    // RO carve-out doesn't seem to trap. Remove with the rest of the
+    // heap-watch scaffolding. Always emit; the trap log budget is
+    // separate and we want every hit on this narrow window.
+    {
+        let armed = crate::heap_watch::carved_pa();
+        if armed != 0 && (ipa as u32) & !0xFFF == armed {
+            static HITS: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let n = HITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n < 512 {
+                kprintln!(
+                    "heap-watch dabt-on-carve[{}]: ipa={:#010x} elr={:#010x} ifsc={:#x} wnr={} isv={} (carved_pa={:#010x})",
+                    n, ipa, elr, ifsc, wnr as u32, isv, armed,
+                );
+            }
+        }
+    }
+
     // Stage-2 RO-permission fault on a RAM code page. Newton's
     // demand-pager is overwriting a page the hypervisor previously
     // froze RO+X after shadow-stub patching; flip the page back to

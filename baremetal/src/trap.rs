@@ -1208,6 +1208,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::PAGE_GET_PROBE_HVC_IMM => {
             handle_page_get_probe(ctx);
         }
+        v if v == crate::rom_patches::PRIM_REMEMBER_PROBE_HVC_IMM => {
+            handle_prim_remember_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1651,6 +1654,16 @@ fn handle_und(ctx: &mut TrapContext) {
             handle_page_get_probe_with(ctx, spsr_und as u32);
             let updated = compute_teq_z_n(spsr_und as u32, ctx.x[0] as u32);
             let _ = write_guest_word_pa(UND_SAVE_SPSR_IPA, updated);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::PRIM_REMEMBER_PROBE_HVC_IMM) => {
+            // PrimRememberMapping prologue probe at 0x00163480.
+            // Reached via UND-trampoline when the call originates in
+            // USR mode (HVC from EL0 is UNDEFINED in AArch32). Pass
+            // spsr_und as the source CPSR so SP/LR lookups land on
+            // the right banked register.
+            handle_prim_remember_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -2960,6 +2973,110 @@ fn handle_page_get_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
             r0, caller_lr, count_arg, domain_field,
         );
     }
+}
+
+/// `PrimRememberMapping` prologue probe (PRIM_REMEMBER_PROBE_HVC_IMM = 0x54).
+///
+/// Patches the first word at ROM `0x00163480` (the standard
+/// `mov ip, sp` AArch32 prologue) with `HVC #0x54`. The lower-level
+/// L2-write primitive that the kernel reaches from paths bypassing
+/// `Remember (static)` (which the prior probe iteration showed does
+/// NOT see the 12 verify-mmu aliases). Function signature is
+/// `PrimRememberMapping(va=r0, mask=r1, &TPhys=r2, perm=r3)`; the
+/// PA is recovered as `*(r2+16) & ~0xFFF`. The mask in r1 is the
+/// kernel's incremental subpage activation mask — same (va, &TPhys)
+/// is called repeatedly with widening masks (0x3 → 0xf → 0x3f →
+/// 0xff) as the page is staged in. Aliasing tracker keys on `va`
+/// (r0) only — different masks for the SAME va are not aliases.
+/// After logging we emulate the original `mov ip, sp`
+/// (ctx.x[12] = source-mode SP) so the function prologue continues
+/// correctly.
+///
+/// Source mode varies: most calls come from kernel SVC contexts but
+/// USR-shim wrappers can also reach here. `probe_source_cpsr` /
+/// `spsr_und` resolve either path.
+fn handle_prim_remember_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_prim_remember_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_prim_remember_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    let va     = ctx.x[0] as u32;
+    let mask   = ctx.x[1] as u32;
+    let tphys  = ctx.x[2] as u32;
+    let perm   = ctx.x[3] as u32;
+    let sp     = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let lr     = crate::banked::lr_for_mode(ctx, source_cpsr);
+
+    // Walk RememberMapping's APCS frame to find ITS caller (= the
+    // upstream kernel function that set this aliasing in motion). At
+    // the moment of the Prim probe, Prim's prologue hasn't run, so
+    // r11/fp still belong to RememberMapping (which DID run its
+    // prologue). RememberMapping's `sub fp, ip, #4` makes fp point at
+    // its saved-PC slot; saved-LR (= RememberMapping's caller) is at
+    // fp - 4 in memory.
+    let r_fp = ctx.x[11] as u32;
+    let upstream_lr = guest_mem::read_word_va(r_fp.wrapping_sub(4))
+        .unwrap_or(0xDEAD_DEAD);
+
+    // PA recovery: the kernel does `ldr r0, [r2, #16]!; lsr r0,
+    // r0, #12; lsl r7, r0, #12` — i.e. PA = *(r2+16) & ~0xFFF.
+    // The low 12 bits encode per-page attributes (e.g. bit 9 =
+    // cacheability), which `PrimRememberMapping` extracts separately.
+    let phys_word = guest_mem::read_word_va(tphys.wrapping_add(16))
+        .unwrap_or(0xDEAD_BEEF);
+    let phys = phys_word & !0xFFF;
+
+    const RAM_BASE: u32 = 0x0400_0000;
+    const RAM_PAGES: usize = 0x0040_0000 / 0x1000; // 1024
+    static FIRST_VA_FOR_PA: [AtomicU32; RAM_PAGES] = {
+        const ZERO: AtomicU32 = AtomicU32::new(0);
+        [ZERO; RAM_PAGES]
+    };
+    static FIRST_LR_FOR_PA: [AtomicU32; RAM_PAGES] = {
+        const ZERO: AtomicU32 = AtomicU32::new(0);
+        [ZERO; RAM_PAGES]
+    };
+    static PRIM_ALIAS_LOG_BUDGET: AtomicU32 = AtomicU32::new(64);
+    static CALL_COUNT: AtomicU32 = AtomicU32::new(0);
+    let n = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    if phys >= RAM_BASE && (phys - RAM_BASE) < (RAM_PAGES as u32 * 0x1000) {
+        let page_idx = ((phys - RAM_BASE) >> 12) as usize;
+        // CAS-style update: only overwrite the slot if the VA differs.
+        // The kernel's incremental-subpage pattern calls Prim with the
+        // SAME va several times to widen the mask; we want first-VA
+        // semantics, not last-VA, so a same-VA call must not displace
+        // the original LR.
+        let prev_va = FIRST_VA_FOR_PA[page_idx].load(Ordering::Relaxed);
+        let prev_lr = FIRST_LR_FOR_PA[page_idx].load(Ordering::Relaxed);
+        if prev_va == 0 {
+            FIRST_VA_FOR_PA[page_idx].store(va, Ordering::Relaxed);
+            FIRST_LR_FOR_PA[page_idx].store(
+                if upstream_lr == 0 { 0xFFFF_FFFE } else { upstream_lr },
+                Ordering::Relaxed,
+            );
+        } else if prev_va != va {
+            let budget = PRIM_ALIAS_LOG_BUDGET
+                .fetch_sub(1, Ordering::Relaxed);
+            if budget > 0 {
+                kprintln!(
+                    "Prim ALIAS: PA={:#010x}  VA1={:#010x} (upstream_lr={:#010x})  VA2={:#010x} (upstream_lr={:#010x})  mask={:#x} perm={:#x}",
+                    phys, prev_va, prev_lr, va, upstream_lr, mask, perm,
+                );
+            }
+        }
+    }
+
+    if n < 16 {
+        crate::dprintln!(
+            "Prim probe ENTER: #{} va={:#010x} mask={:#x} phys={:#010x} perm={:#x} caller_lr={:#010x} upstream_lr={:#010x} src_mode={:#x} sp={:#010x}",
+            n, va, mask, phys, perm, lr, upstream_lr, source_cpsr & 0x1F, sp,
+        );
+    }
+
+    // Emulate `mov ip, sp` (ip = r12 non-banked; sp = R13_<source_mode>).
+    ctx.x[12] = sp as u64;
 }
 
 fn dump_flash_bytes(ipa: u32, count: u32) {

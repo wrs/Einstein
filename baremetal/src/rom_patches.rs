@@ -549,6 +549,21 @@ pub const PAGE_GET_PROBE_PC:          u32 = 0x0025_8EFC;
 // (= 0xE3300000); the HVC handler emulates it by setting SPSR_EL2
 // N/Z bits before ERET, so we don't need to re-execute the literal.
 
+/// `PrimRememberMapping(env, va, &TPhys, perm)` probe at ROM
+/// `0x00163480`. This is the lower-level L2-write primitive reached
+/// from kernel-internal paths that bypass `Remember (static)` — the
+/// suspected source of the 9 Group-2 stack-guard aliases per
+/// PLAN.md "Aliasing elimination". Original first insn is the
+/// standard `mov ip, sp` AArch32 prologue. Replace with HVC; the
+/// handler dereferences `&TPhys` to recover the page-aligned PA
+/// (= `*(r2+16) >> 12 << 12`), runs the per-PA → first-VA aliasing
+/// tracker, then emulates `mov ip, sp` (ctx.x[12] = source-mode
+/// banked SP) so the function prologue continues correctly. See
+/// PLAN.md "Next iteration — probe `PrimRememberMapping`".
+pub const PRIM_REMEMBER_PROBE_HVC_IMM: u32 = 0x54;
+pub const PRIM_REMEMBER_PC:            u32 = 0x0016_3480;
+const PRIM_REMEMBER_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -757,6 +772,20 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(DAH_OR_CHAIN_HVC_IMM),
             "DAH OR-chain entry (ldr r1, gKernelGlobals)",
             DAH_OR_CHAIN_HVC_IMM,
+        );
+        // PrimRememberMapping prologue probe at 0x00163480. The
+        // lower-level L2-write primitive that the kernel calls from
+        // paths bypassing `Remember (static)`; suspected source of
+        // the Group-2 stack-guard aliases. Handler captures
+        // (env, va, PA, perm) and runs the per-PA → first-VA
+        // aliasing tracker, then emulates the original `mov ip, sp`.
+        patch_probe(
+            rom_ptr,
+            PRIM_REMEMBER_PC,
+            PRIM_REMEMBER_FIRST_INSN,
+            hvc_insn(PRIM_REMEMBER_PROBE_HVC_IMM),
+            "PrimRememberMapping prologue",
+            PRIM_REMEMBER_PROBE_HVC_IMM,
         );
     }
 }

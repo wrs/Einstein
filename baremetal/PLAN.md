@@ -121,57 +121,75 @@ both VAs end up RW pointing to the same PA after we flatten to AP=011.
 
 ### Investigation progress
 
-Two probes installed and run; both refuted hypotheses:
+Three probes installed; the third caught the aliases.
 
-1. **`TUDomainManager::Get` page-allocator** — patches the `teq r0,
-   #0` after `bl MonitorDispatchSWI` at `0x00258EFC` with `HVC #0x53`.
-   Handler `handle_page_get_probe` in `src/trap.rs`. Logs every
-   returned PageId + caller LR; tracks per-id first-caller for dup
-   detection.
-   - **Result:** 28 successful Get calls in baseline boot, all from
-     `caller_lr=0x001F87C0` (= AllocNewPage's bl-Init return), all
-     count=2, all distinct PageIds. **0 duplicates.**
-   - Conclusion: Get is NOT recycling PAs. Aliasing has a different
-     origin.
+1. **`TUDomainManager::Get` page-allocator** (HVC #0x53 on `0x00258EFC`).
+   28 Get calls in baseline boot, all from `caller_lr=0x001F87C0`
+   (AllocNewPage), all count=2, all distinct PageIds. **0
+   duplicates.** Get is NOT recycling PAs at the bookkeeping level.
 
-2. **`Remember (static)`** at `0x00258E0C` — augmented the existing
-   `handle_remember_entry_probe_with` with a per-PA → first-VA
-   tracker. Logs every (env, va, pa, perm) call; emits `Remember
-   ALIAS:` when a PA is later seen at a different VA.
-   - **Result:** 7 ENTER lines in baseline boot. **0 `Remember
-     ALIAS:` lines.** The 12 verify-mmu aliases all still appeared.
-   - Conclusion: the L2 writes that produce the aliases do NOT pass
-     through the `Remember (static)` user-shim.
+2. **`Remember (static)`** at `0x00258E0C` (added per-PA → first-VA
+   tracker to `handle_remember_entry_probe_with`). 7 ENTER lines,
+   **0 `Remember ALIAS:` lines** — but the underlying alias detector
+   was mis-decoded (treated r3 as a PA when r3 is the TPhys-pointer
+   passed unchanged to `GenericSWI`). Even with correct decoding it
+   would still miss the kernel-internal paths.
 
-### Next iteration — probe `PrimRememberMapping` at 0x00163480
+3. **`PrimRememberMapping` at `0x00163480`** — HVC #0x54. **Catches
+   all 12 Group-2 aliases.** The signature was originally documented
+   as `(env, va, &TPhys, perm)` but per disasm is actually
+   `(va=r0, mask=r1, &TPhys=r2, perm=r3)`; the first-iteration probe
+   miscoded this, registering false positives on incremental-subpage
+   widening (mask=0x3 → 0xf → 0x3f → 0xff for the same VA). Fixed.
 
-This is the lower-level L2-write primitive (called from kernel-mode
-paths that bypass `Remember (static)`).
+   The probe also walks RememberMapping's APCS frame (`fp - 4`) to
+   capture the upstream caller of `RememberMapping__FUlN31Uc` (the
+   call site that issued the BL into RememberMapping itself). The
+   distribution across 13 unique aliased PAs:
 
-Args at entry: `(env=r0, va=r1, &TPhys=r2, perm=r3)`. PA is extracted
-as `*(r2+16) >>= 12 << 12`.
+   - `0x000d8e3c` (GenericSWIHandler, SWI #12 dispatch): 13 PAs (all)
+   - `0x001f775c` (CopyPagesAfterStackCollided #2): 9 PAs
+   - `0x001f76bc` (CopyPagesAfterStackCollided #1): 2 PAs
 
-Steps:
+   Group-1 aliases (PA=0x04004000-0x04006000, kernel-globals
+   self-mapping) do NOT pass through Prim — they're created by
+   direct kernel L2 writes during TTBR0 setup.
 
-1. Patch the first word of `PrimRememberMapping` (`mov ip, sp` =
-   `0xE1A0_C00D`) with `HVC #PRIM_REMEMBER_PROBE_HVC_IMM` (pick a
-   fresh tag, e.g. `0x54`).
-2. Wire a `handle_prim_remember_probe` in `trap.rs` that captures
-   args, dereferences `&TPhys` to get PA, runs the same per-PA →
-   first-VA aliasing tracker, then emulates `mov ip, sp`.
-3. Cold-boot, capture `Prim ALIAS:` lines; compare against verify-mmu
-   alias enumeration.
+### Next iteration — narrow Group-2 + stage-2 trap for Group-1
 
-**Fallbacks if `PrimRememberMapping` doesn't catch the aliases:**
+**Group-2 (Prim catches these — narrow further):**
 
-- Try `PrimRememberPhysMapping` at `0x00163708` (variant taking pre-
-  resolved PA).
-- Try `PrimRememberPermMapping` at `0x00163920` (perm-only updates).
-- If still nothing, escalate to a **stage-2 trap on the L2 backing
-  pages**: mark them RO at stage-2, decode each write fault, log
-  `(L2 entry index, value)`. That catches direct kernel writes that
-  don't go through any Remember-shim — most likely the source of the
-  Group 1 kernel-globals self-map aliases.
+a. Probe `ForgetMapping` (called from `CopyPagesAfterStackCollided`
+   immediately before `RememberMapping`) at `0x001f75f4` to confirm
+   whether the OLD VA→PA mapping is actually cleared from L2 before
+   the NEW mapping installs. If ForgetMapping leaves stale entries,
+   that's the bug; if not, the alias originates from a SWI #12 path
+   that doesn't pair with a ForgetMapping.
+
+b. For the GenericSWIHandler/SWI #12 path, walk the SWIBoot save
+   area at the kernel-side dispatch entry to recover the user-mode
+   caller PC (above the SWI boundary). The likely callers are
+   `FMNewStack`, `LockHeapRange`, `UnlockHeapRange` — already
+   touched by existing per-allocator patches, so we may need to
+   ratchet those (e.g. extend the 4-KiB chunk-size patch to a
+   per-allocator exclusivity guarantee).
+
+c. Cross-check Newton's `TUPageManager::Get` PageId encoding —
+   `count=2` from the page-allocator means two physical pages per
+   PageId. If only ONE is owned by the callee and the other ends
+   up unclaimed, a later allocation may re-claim that PA from
+   elsewhere → alias.
+
+**Group-1 (stage-2 trap):**
+
+The 3 kernel-globals self-mapping aliases at PA=0x04004000-0x04006000
+are written by direct kernel store instructions during TTBR0 setup,
+bypassing the entire Remember/Prim layer. Plan: install a stage-2 RO
+trap on those PAs, decode each AArch32 store fault, log
+`(PC, L2-entry-index, value)`, then commit the write so the kernel
+proceeds. Once the (PC, entry, value) triples are captured, decide
+between (a) Einstein-port behaviour, (b) ROM patch that splits the
+self-map, or (c) hypervisor-synthesised second mapping.
 
 Until aliases are zero, the alrt-task DABT and any other later wedge
 stays **deliberately not investigated**.

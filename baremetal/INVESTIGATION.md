@@ -4,7 +4,51 @@ Live notes for the next iteration. Replace this file's body when the
 current stop is fixed and a new one takes over — git history is the
 archive of past investigations.
 
-## Active stop: USR write to IPA=0x3 from PC=0x00f76368 (downstream of SearchFreeList no-fit) — 2026-04-27
+## Active stop: wild jump into SBA inline-stub pool — 2026-04-27 (updated)
+
+`PC=0x00f76368` is **inside `shadow_stub`'s SBA inline-stub pool**
+(`0x00E00000..0x00FFFF00`), confirmed via paired `kmain` dumps: the
+ROM word reads zero post-`load_rom` and `0xe5cc0000` post-
+`patch_rom_from_bitmap`. The bytes form the body of one
+shadow_stub inline emulation stub:
+
+```
++0x00 (0xf76368): e5cc0000  strb r0, [r12, #0]     ← faulting (r12=3)
++0x04           : e320f000  nop
+-0x04           : e128f001  msr cpsr_c, r1
+```
+
+The stub assumes a specific calling convention. Our wild jump
+arrives with `r12=0x3` (a stray byte from the corrupted heap), so
+the `strb r0, [r12]` writes to IPA 3 → unmapped → halt.
+
+So this is **downstream blast radius** from the original RelocHeap
+corruption: the kernel does an indirect call through a clobbered
+function pointer that resolves into the stub pool. The user stack
+still carries the bad heap (`stack[sp]=0x0ca6b010`), so the call
+chain is operating on the corrupted RelocHeap.
+
+The fix lane is now clearer:
+
+- `__nw__FUi`'s no-fit recovery (after our SearchFreeList
+  intercept returns r0=0) still has the bad heap in
+  `currentTask->globals[-16]`. Subsequent allocator calls keep
+  reading from it — eventually one returns a corrupted function
+  pointer, and we end up here.
+- Extending the SearchFreeList no-fit arm to also clear
+  `gCurrentHeap` (set `task[-16]` to 0 or to `gFallbackHeap`)
+  would short-circuit the cascade.
+
+Diagnostic scaffolding installed during this iteration:
+- `main.rs` post-`load_rom` and post-`patch_rom_from_bitmap` dumps
+  at `0x00f76368` to identify which patcher writes there (one-shot,
+  cheap, leave armed).
+- `dabt-trip` log in `handle_data_abort` now also dumps four
+  instruction words (`pc-0x4`, `pc`, `pc+0x4`, `pc+0x8`) via
+  both VA and PA — handy for any future wedge whose PC sits past
+  the disassembly's coverage.
+
+## Earlier active stop: USR write to IPA=0x3 from PC=0x00f76368 — 2026-04-27
 
 The RelocHeap-header corruption wedge (long history below) is now
 side-stepped via a `guest_bp` arm at ROM `0x00313308` that detects

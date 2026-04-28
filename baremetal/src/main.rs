@@ -57,6 +57,19 @@ pub extern "C" fn kmain() -> ! {
     // SAFETY: load ROM bytes into guest backing store before stage-2 maps it.
     unsafe { guest_mem::load_rom(); }
 
+    // Diagnostic: post-load_rom dump of bytes at 0x00f76368, where
+    // the new wedge fires. If this is non-zero, either ROM_BE has
+    // bytes there or something patched it during load_rom; if zero,
+    // some later code path writes to ROM beyond REx end.
+    for off in [-0x10i32, -0x4, 0, 0x4, 0x8] {
+        let addr = 0x00f7_6368u32.wrapping_add(off as u32);
+        let w = guest_mem::read_word_pa(addr).unwrap_or(0xDEADBEEF);
+        kprintln!(
+            "post-load ROM dump: @{:#010x} = {:#010x}",
+            addr, w,
+        );
+    }
+
     // Seed the Newton flash filesystem header before stage-2 exposes
     // the backing to the guest. Safe because the backing is a static
     // mut touched only from core 0 during boot.
@@ -82,6 +95,17 @@ pub extern "C" fn kmain() -> ! {
     {
         let stats = shadow_stub::patch_rom_from_bitmap();
         shadow_stub::log_stats(&stats);
+    }
+    // Diagnostic: post-shadow-stub-patch dump at 0x00f76368, the new
+    // wedge PC. Pairs with the post-load_rom dump above to find which
+    // patcher is writing here.
+    for off in [-0x10i32, -0x4, 0, 0x4, 0x8] {
+        let addr = 0x00f7_6368u32.wrapping_add(off as u32);
+        let w = guest_mem::read_word_pa(addr).unwrap_or(0xDEADBEEF);
+        kprintln!(
+            "post-shadow-stub ROM dump: @{:#010x} = {:#010x}",
+            addr, w,
+        );
     }
 
     // Seed the 10-entry ROM+REx checksum table into both blocks of

@@ -580,6 +580,20 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
             "           r12={:#010x} sp({})={:#010x} lr({})={:#010x}",
             ctx.x[12] as u32, mode_label, cur_sp, mode_label, cur_lr
         );
+        // Dump the instruction word at the faulting PC + 1 word of
+        // surrounding context, both via stage-1 (so we honour the
+        // kernel's view) and direct PA (in case stage-1 is off).
+        // Helps when the PC is past the disassembly's coverage —
+        // e.g. the post-SearchFreeList halt at 0xf76368.
+        for off in [-4i32, 0, 4, 8] {
+            let addr = elr.wrapping_add(off as u32);
+            let via_va = guest_mem::read_word_va(addr).unwrap_or(0xDEADBEEF);
+            let via_pa = guest_mem::read_word_pa(addr).unwrap_or(0xDEADBEEF);
+            kprintln!(
+                "           insn[pc{:+#3x}] @{:#010x} = via-va:{:#010x}  via-pa:{:#010x}",
+                off, addr, via_va, via_pa,
+            );
+        }
         // Walk a few words of the source-mode stack via stage-1 — the
         // top entry is normally the caller's saved LR after a leaf
         // function's `stmfd sp!, {lr}` prologue. Also walk the access

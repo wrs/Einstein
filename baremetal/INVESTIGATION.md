@@ -93,6 +93,18 @@ side-effect of an early allocation we do or fail to do) leaves
 the kernel believing the same physical page is free twice, we
 get this aliasing.
 
+**Prime suspect identified by user pointer: our
+`apply_resolve_fault_wrapper` in `src/rom_patches.rs:894`.**
+The wrapper makes the kernel run `TStackManager::ResolveFault`
+**four times per stack fault** to work around ARMv7's missing
+subpage-AP support. Each iteration calls into `FindOrAllocPage`
+and the kernel's page-pool free-list. If a misbehaving iter
+causes the kernel to re-issue a page that's already mapped
+elsewhere (e.g., a heap page), we get the exact aliasing we
+see. The PLAN.md "Current stop" lists the audit steps for the
+wrapper and a diagnostic-only revert test as the cleanest way
+to confirm.
+
 Concrete next-step probe: at sanity-halt time, walk stage-1 for
 the user stack VA 0x0cc82018 and the heap VA 0x0ca6b018 and
 print both IPAs. If they match, aliasing is confirmed; we then

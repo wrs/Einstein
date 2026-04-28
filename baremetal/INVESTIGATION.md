@@ -4,6 +4,74 @@ Live notes for the next iteration. Replace this file's body when the
 current stop is fixed and a new one takes over — git history is the
 archive of past investigations.
 
+## SBA-stub wedge decodes to `SetBlockSize`'s `strb r0, [r9]` (2026-04-27, deep night)
+
+Added a stub-orig-PC decoder in `handle_data_abort`'s `dabt-trip`
+log: when the faulting ELR is in `shadow_stub`'s SBA inline-stub
+pool (`SBA_STUB_POOL_IPA..SBA_STUB_POOL_END`), the dump now reads
+slot 14 of the containing 16-word stub (= the back-branch
+`B orig_pc + 4`) and decodes the imm24 to recover the original
+ROM PC the stub emulates.
+
+For the cold-boot wedge at PC=`0x00f76368`:
+
+```
+sba-stub: slot 23949 (base 0x00f76340) emulates ROM PC 0x00312a18
+                     (back-branch 0x00f76378 -> 0x00312a1c)
+```
+
+ROM PC `0x00312a18` is **inside `SetBlockSize`** (at `0x0031266c`).
+The instruction is `strb r0, [r9]` (`0xe5c90000`):
+
+```
+312a04: bl 0x1b78c60 <NewBlock>      ; r0 = block ptr
+312a08: mov r9, r0                   ; r9 = NewBlock return
+312a0c: ldr r4, [sp, #8]
+312a10: ldrb r0, [r4]
+312a14: bic r0, r0, #4
+312a18: strb r0, [r9]                ← wedge (now b 0xf76340 stub)
+```
+
+So the wedge isn't a wild branch — the kernel is in `SetBlockSize`
+naturally, executing the strb via shadow_stub's emulation stub.
+The fault is because `r9` (NewBlock's return value) is a small
+constant (`0x3` per the trap dump's `r12=0x3`, which the stub
+mirrors from `r9`) rather than a valid block pointer.
+
+The corruption flow is therefore deeper than just "wild branch
+into stub pool":
+
+1. Bad RelocHeap stays installed (cascade not stopped at
+   SearchFreeList no-fit — task[-16] clear didn't unwind the
+   caller's stack copies of the bad heap).
+2. NewBlock is called against the bad heap and returns a
+   corrupted block pointer (sourced from `heap[+0x48]` = freelist
+   position, which on the bad heap holds garbage).
+3. SetBlockSize uses the corrupted return value as `r9` and
+   does `strb r0, [r9]` → fault.
+
+Strategic implication: the right intervention point is upstream of
+NewBlock, not at the SBA-stub wedge. Two candidates:
+
+a. **Reject the bad heap at SetCurrentHeap entry.** The
+   SetCurrentHeap probe at ROM `0x00142df0` already detects
+   `r0=0x0ca6b010`. Substitute a known-good heap (e.g. set
+   `r0 = gFallbackHeap` before letting the function run) so the
+   bad heap never gets installed in `task[-16]`.
+b. **Validate NewBlock's return.** Hook NewBlock's return path
+   (after `ldmdb fp, …, pc`) to validate the returned block
+   pointer is in a valid heap range before SetBlockSize uses it.
+
+(a) is upstream and prevents the entire cascade. (b) is downstream
+but more surgical — only triggers when the bad heap actually
+produces a bad return.
+
+Diagnostic scaffolding from this iteration (kept armed):
+- `handle_data_abort` dabt-trip dump now decodes any SBA-stub-pool
+  wedge to its original ROM PC.
+- `heap_watch::sample` sanity halt downgraded to log-only so the
+  boot continues into the SBA wedge for diagnosis.
+
 ## Heap sanity checker added; halts cleanly at first sign of corruption (2026-04-27, late late)
 
 `heap_watch::check_heap_sanity` validates two invariants the kernel

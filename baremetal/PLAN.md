@@ -223,28 +223,34 @@ frame BEFORE calling SearchFreeList; clearing `task[-16]` after
 the fact doesn't unwind those copies. So the cascade has to be
 broken at a different layer.
 
+The new stub-orig-PC decoder identified the wedge precisely:
+`PC=0x00f76368` is `shadow_stub`'s emulation stub for ROM
+`0x00312a18` = `strb r0, [r9]` inside `SetBlockSize`. The kernel
+runs the strb naturally through the stub; `r9` (= NewBlock's
+return value) is `0x3` — a corrupted block pointer sourced from
+the bad heap's `heap[+0x48]`. So this isn't a wild branch into
+the stub pool, just normal code path with corrupted register
+contents.
+
 Concrete next steps:
 
-1. **Hook the entry into the SBA inline-stub pool.** When
-   `handle_data_abort` sees a fault with ELR in
-   `SBA_STUB_POOL_IPA..SBA_STUB_POOL_END` and the calling
-   convention isn't satisfied (e.g. `r12` doesn't translate to
-   a valid IPA), halt with the source PC of the dispatch.
-   That gives us the wild-branch site.
-2. **Trace `lr_usr=0x00311e1c` back.** That's inside
-   `__nw__FUi`'s no-fit recovery. Disassemble surrounding ROM
-   to find the vtable or function-pointer load that yielded
-   a stub-pool address.
+1. **Reject the bad heap at SetCurrentHeap entry.** The
+   SetCurrentHeap probe at ROM `0x00142df0` already detects
+   `r0=0x0ca6b010`. Substitute a known-good heap pointer
+   (e.g. force `r0 = gFallbackHeap = *0x0c101080`) before
+   letting the function run, OR ELR straight to the early-exit
+   at `0x00142e08` so the no-op path fires. The bad heap
+   never gets installed in `task[-16]`, the cascade never
+   starts.
+2. **Or validate NewBlock's return.** Hook the LDR/STR pair
+   at SetBlockSize ROM `0x00312a08`/`0x00312a18` and short-
+   circuit when `r0` (NewBlock return) is below a small
+   threshold (e.g. `< 0x1000`). More surgical but only
+   triggers when the bad heap actually produces a bad return.
 3. **Cross-check Einstein** — what does Einstein do at the
    equivalent boot offset? Einstein's heap stays valid so it
    doesn't reach this state, but understanding the
    no-fit-recovery dispatch helps choose where to intercept.
-4. **Or step back further** — block the bad-heap creation /
-   adoption upstream by validating heap pointers as they're
-   passed to SetCurrentHeap (already probed; not yet rejecting).
-   If we reject `r0=0x0ca6b010` at SetCurrentHeap entry and
-   substitute a known-good heap, the whole cascade never
-   starts.
 
 ## Earlier stop — RelocHeap header corruption in newt's MakeStoreObject path
 

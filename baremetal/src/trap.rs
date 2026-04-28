@@ -594,6 +594,45 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
                 off, addr, via_va, via_pa,
             );
         }
+        // If the faulting PC sits inside shadow_stub's SBA inline-stub
+        // pool, decode slot 14 of the containing stub — that's a
+        // `B orig_pc + 4` and gives us the original ROM PC the stub
+        // emulates. Helps localise wild branches into the pool to a
+        // specific ROM instruction.
+        if (crate::shadow_stub::SBA_STUB_POOL_IPA
+            ..crate::shadow_stub::SBA_STUB_POOL_END)
+            .contains(&elr)
+        {
+            let off = elr.wrapping_sub(crate::shadow_stub::SBA_STUB_POOL_IPA);
+            let slot_idx = off / crate::shadow_stub::SBA_STUB_BYTES;
+            let slot_base = crate::shadow_stub::SBA_STUB_POOL_IPA
+                + slot_idx * crate::shadow_stub::SBA_STUB_BYTES;
+            let back_branch_pa = slot_base.wrapping_add(14 * 4);
+            if let Some(insn) = guest_mem::read_word_pa(back_branch_pa) {
+                // ARM A1 B encoding: cond=1110 1010 imm24
+                if (insn & 0x0F00_0000) == 0x0A00_0000 {
+                    let imm24 = insn & 0x00FF_FFFF;
+                    let signed = if imm24 & 0x0080_0000 != 0 {
+                        imm24 | 0xFF00_0000
+                    } else {
+                        imm24
+                    };
+                    let target = back_branch_pa
+                        .wrapping_add(8)
+                        .wrapping_add((signed as i32 as u32) << 2);
+                    let orig_pc = target.wrapping_sub(4);
+                    kprintln!(
+                        "           sba-stub: slot {} (base {:#010x}) emulates ROM PC {:#010x} (back-branch {:#010x} -> {:#010x})",
+                        slot_idx, slot_base, orig_pc, back_branch_pa, target,
+                    );
+                } else {
+                    kprintln!(
+                        "           sba-stub: slot {} (base {:#010x}) — back-branch slot {:#010x} = {:#010x} (not a B insn)",
+                        slot_idx, slot_base, back_branch_pa, insn,
+                    );
+                }
+            }
+        }
         // Walk a few words of the source-mode stack via stage-1 — the
         // top entry is normally the caller's saved LR after a leaf
         // function's `stmfd sp!, {lr}` prologue. Also walk the access

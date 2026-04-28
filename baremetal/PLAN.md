@@ -180,7 +180,7 @@ NOTE: Fix all compiler warnings before committing, to keep context clean.
   on QEMU; `--platform fvp` runs the same suite on the FVP. Both
   must stay green. See "Verification" near the end of this file.
 
-## Current stop — alrt-task DABT at FAR=0xe336000c → Reboot canary
+## Current stop — alrt-task DABT at FAR=0xe336000c → Reboot canary (CheckButton with junk `this`)
 
 The heap-aliasing wedge is resolved (see "Resolved stops"
 table). With each VM heap now exclusively owning whole 4 KiB
@@ -191,8 +191,84 @@ allocator in the ROM** — see `docs/STRUCTURES.md`
 (`ZapHeap` at `0x001428B8`). All 29 LockHeapRange callers,
 TStackInfo / TStackPage layouts, and FMLockHeapRange / ResolveFault
 internals are now documented. The wedge below persists, so it has
-a different root cause than 1-KiB-chunking. The new terminus is a
-Reboot canary fired by the kernel's exception unwinder:
+a different root cause than 1-KiB-chunking.
+
+**Faulting site decoded (2026-04-28):** The wedge fires inside
+`CheckButton__12TAlertDialogFv` at ROM `0x0002EABC`, which is the
+first instruction reading `this->[+12]`:
+
+```
+00002eaa4 <CheckButton__12TAlertDialogFv>:
+  2eaa4: mov ip, sp
+  2eaa8: push {r4-r10, fp, ip, lr, pc}
+  2eaac: sub fp, ip, #4
+  2eab0: mov r4, r0          ; r4 = this
+  2eab4: sub sp, sp, #8
+  2eab8: mvn r5, #0          ; r5 = -1
+  2eabc: ldr r0, [r0, #12]   ← FAULT: r0=this=0xe3360000 (junk)
+```
+
+`this = 0xe3360000` is wildly out of any valid heap range (heaps
+are at `0x0c000000+`). 0xe3360000 + 12 = 0xe336000c = the FAR. The
+value `0xe3360000` decodes as ARM `teq r6, #0` — i.e., it looks
+like an **instruction encoding** that ended up in a CList slot
+where a TAlertDialog pointer should live.
+
+**Caller chain.** USR `lr=0x0002E8D8` returns into
+`CheckAlertDone__12TAlertDialogFPUl` (`0x0002E8C0`); USR sp before
+the abort was `0x0CCA35C8` (alrt task's stack). CheckAlertDone is
+called from `IdleProc__18TAlertEventHandler...` at one of two
+sites — `0x00030A3C` or `0x00030A64`:
+
+```
+00309ec <IdleProc__18TAlertEventHandler...>:
+  ... r4 = TAlertEventHandler*
+  309fc: ldr r0, [r0, #20]   ; list = ehandler->[+20]
+  30a00: add r0, r0, #140    ; list += 140 (the CList instance)
+  30a04: mov r1, #0
+  30a08: bl  At__5CListFl    ; r5 = CList::At(0) = first TAlertDialog*
+  ...
+  30a38: mov r0, r5
+  30a3c: bl  CheckAlertDone(r5)   ← passes the CList[0] entry as `this`
+```
+
+So **`CList::At(0)` returned `0xe3360000` — a junk pointer
+masquerading as a TAlertDialog\***. The corruption is somewhere
+in the CList's storage (or in the chain
+`TAlertEventHandler->[+20]+140 → CList → entries[0]`).
+
+**Why the kernel's DAH can't recover:** L1[0xE33] = `0x00000150`
+(plain fault descriptor, nothing mapped). FME (free-memory
+expansion) returns `r0 != 0` — no recovery possible. The DAH
+falls to the throw path (`saved-LR_abt = 0x01BE319C` = `Throw`
+jump-table entry), which propagates UnhandledException → Reboot.
+
+**Hypothesis.** The CList slot was overwritten by something
+writing instruction-encoding-like data into a heap region. The
+0xE3360000 byte pattern is `teq r6, #0` (cond=AL, op=TEQ-imm,
+Rn=6, imm=0). Possible sources:
+- A function-pointer table that got corrupted with raw bytes from
+  somewhere (e.g., a packed-data record misinterpreted as code
+  pointers)
+- A shadow-stub or trampoline write that landed in the wrong page
+- A NewBlock/NewPtr returning an address inside another live
+  allocation
+
+**Concrete next steps for the next iteration:**
+1. Dump the CList state at the moment of the wedge — extend the
+   Reboot-canary kernel-state dump to walk
+   `task_alrt → ehandler → list@140 → entries`. This pins the
+   exact slot and what its neighbours look like.
+2. Cross-check Einstein at the equivalent boot offset — does the
+   alrt task even reach `IdleProc → CheckAlertDone` cleanly?
+   `build/NewtonProbe baremetal/roms/newton.rom _Data_/Einstein.rex 60`.
+3. Watch for the writer: install a sentinel on
+   `TAlertEventHandler::list[+0..+8]` (or wherever the CList
+   header lives) so we catch the write that introduces the junk
+   pointer. Mirrors the heap-watch carve-out approach from the
+   prior wedge.
+
+Detailed text below describes the original wedge first-look:
 
 ```
 DAH-OR[5]: far=0xe336000c curr_task=0x0c115db4 (= alrt task)

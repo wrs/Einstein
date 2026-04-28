@@ -308,7 +308,67 @@ constant is shared infrastructure across the entire allocator —
 not just stacks. Any patch touching it would need to coordinate
 with the heap allocation layer too, which is too much surface.**
 
-### Next iteration — bisect what's missing from the patch set
+### Trace bisection result (2026-04-28)
+
+Re-applied the 20 patches under `--features trace_once,quiet` and
+correlated each verify-mmu alias with the kernel function executing
+just before it. **Surprise: the patch IS correct in the FMNewStack
+domain.** NewStack POST-SWI traces confirm:
+
+- `req=0x9000` (was 0x8400) — kernel asks for 36-KiB slots ✓
+- `base=0x0c306000` (was 0x0c308c00, NOT 4-KiB-aligned!) — base now
+  4-KiB-aligned ✓
+- `top=0x0c30e000` (was 0x0c310400) — top 4-KiB-aligned ✓
+- `span=0x8000` = 32 KiB body (was 0x7800 = 30 KiB)
+- 4-KiB unmapped gap between adjacent stacks (`0x0c30f000 -
+  0x0c30e000`) — each stack has its own guard page; **no
+  stack-stack guard sharing** ✓
+
+So the FMNewStack-side patch achieves what we wanted. But aliases
+STILL appear, just in a different shape:
+
+- **Pre-patch (12 aliases)**: `PA shared between stack #N and stack
+  #N+1's last pages` (= the subpage-AP guard-sharing pattern).
+- **Post-patch (84 aliases)**: `PA shared between stack body pages
+  and HEAP pages in unrelated L1 sections` (e.g.
+  `PA=0x04028000 VA1=stack#1's body page 0x0c30d000 ↔ VA2=heap page
+  0x0c202000`).
+
+Trace shows aliases appear right after `ExtendVMHeap → ResolveFault
+→ AllocNewPage → TUDomainManager::Get`. The kernel's actual page
+allocator (`TUDomainManager::Get` at jump-table 0x001BD2974) is
+**recycling PAs that an earlier stack allocation already took** —
+verified by reading `Init__10TStackPage` at 0x001F9524, which
+tail-calls into `Get` when the caller wants a fresh PA.
+
+So the FMNewStack 36-KiB patch IS necessary but not sufficient.
+The page allocator (`TUDomainManager::Get`) doesn't know about
+the stack-pool's allocation state, OR our slot resize causes its
+free-list to count differently than the consumers do.
+
+### Next iteration — read TUDomainManager::Get's body
+
+The function lives at jump-table `0x001BD2974` which redirects to
+the real implementation. Likely in REx (RAM-resident kernel
+patches). Two ways to find it:
+
+1. Disassemble the jump-table thunk to see where it branches.
+2. Search `_Data_/Einstein.rex` for the function — it'll be inside
+   the byteswapped REx bytes.
+
+Once we find the body, look for:
+- A free-list of recycled PAs (a list head + per-page link).
+- Any per-domain page-budget bookkeeping that depends on the
+  slot-size constant (perhaps `pages_per_slot = slot_size / 4096`
+  is hardcoded somewhere).
+- Whether `Get` checks "is this PA already in use" before
+  returning it.
+
+The end-to-end mechanism is now documented in
+`docs/STRUCTURES.md` "## End-to-end page allocation" — read that
+first.
+
+### Original bisect strategy (kept for reference)
 
 The 20-patch set was internally consistent (verify-mmu sees no
 inconsistency between FMNewStack placement and GetStackInfo

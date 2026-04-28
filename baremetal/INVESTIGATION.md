@@ -126,6 +126,57 @@ RUNNING in the first place.** Next iteration should diff our
 scheduler / port / message-delivery state vs. Einstein's around the
 alrt task entry.
 
+## Trace-bisect of FMNewStack 33→36 KiB patch points at TUDomainManager::Get (2026-04-28)
+
+User: "Wasn't the trace mechanism useful for clues?" — yes, it was.
+Re-applied the 20-patch FMNewStack 33→36 KiB set under
+`--features trace_once,quiet` and dumped 12 lines of trace context
+before each verify-mmu alias.
+
+**Surprise findings:**
+
+1. The patch IS correct in the FMNewStack domain. NewStack POST-SWI
+   confirms 4-KiB-aligned 36-KiB slots with 32-KiB body and 4-KiB
+   guard gap between adjacent slots — no stack-stack guard sharing.
+   Pre-patch alias #4 (PA 0x04028000 shared between stack #10 and
+   stack #11's last pages) is GONE.
+
+2. New aliases appear in a different shape: stack body pages share
+   PAs with heap pages in unrelated L1 sections. Example:
+   `PA=0x04028000 VA1=0x0c30d000 (stack #1 body page) ↔ VA2=0x0c202000
+   (heap page in L1[0xC2])`.
+
+3. Trace immediately preceding each new alias shows
+   `ExtendVMHeap → SearchFreeList → ResolveFault → AllocNewPage`.
+   `AllocNewPage` is at ROM `0x001F8788`; it constructs a TStackPage
+   and calls `Init__10TStackPage`. `Init__10TStackPage` (`0x001F9524`)
+   tail-calls into `TUDomainManager::Get(mgr, &this, 2)` at
+   jump-table `0x001BD2974` to obtain a fresh PA.
+
+4. The patch made FMNewStack consume 4-KiB-aligned ranges, but
+   **`TUDomainManager::Get` is recycling PAs across different
+   TStackInfo* consumers anyway** — handing the same PA to a stack
+   allocation, then later to a heap allocation.
+
+So the 36-KiB patch is necessary but not sufficient. The actual
+root cause of the remaining aliasing is in `TUDomainManager::Get`,
+not in the slot-size constants.
+
+`TROMDomainManager1K::Reset` was a red herring — the trace placed
+it adjacent to alias creation but it doesn't use the 0x8400
+constant (verified by exhaustive grep).
+
+End-to-end mechanism documented in `docs/STRUCTURES.md`
+"## End-to-end page allocation" with pseudocode and ROM-PC
+citations (per user: "don't underthink the patch, read the
+disassembly and generate pseudocode to really understand the
+end-to-end mechanism").
+
+Patches REVERTED for now (one stub comment in PATCHES_717006
+points at the analysis). Next iteration: disassemble
+`TUDomainManager::Get`'s real body (probably REx-side; jump-table
+thunk at 0x001BD2974 redirects to the actual function).
+
 ## FMNewStack 33→36 KiB patch attempt — REVERTED (2026-04-28)
 
 User: "Don't give up on the patch unless it's actually impossible."

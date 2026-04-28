@@ -1122,6 +1122,98 @@ Allocators audited and confirmed NOT to use 1-KiB chunking:
 `NewPtr`, `NewWiredPtr`, `AllocNewPage`, `TUPageManager::Get`. All
 allocate at 4-byte (object) or 4-KiB (page) granularity.
 
+## End-to-end page allocation — `AllocNewPage` → `TUDomainManager::Get`
+
+This decodes the call chain that produces a fresh `TStackPage*`
+when `ResolveFault` discovers `page_table[page_idx] == NULL`.
+Useful for understanding **where the kernel's "free physical
+page" pool lives** — the place that, if it returns the same PA
+twice, produces our verify-mmu aliases.
+
+### Pseudocode (decoded from ROM)
+
+```c
+// TStackManager::AllocNewPage  — 0x001F8788
+TStackPage* AllocNewPage(TStackManager* this, ULong domain_id) {
+    TStackPage* p = __ct__10TStackPageFv(/*r0=*/0);   // calloc'd ctor
+    if (!p) return NULL;
+    if (Init__10TStackPage(p, this, domain_id) != 0) {
+        // Init failed → destruct and return NULL.
+        __dt__10TStackPageFv(p, /*r1=*/1);
+        return NULL;
+    }
+    return p;
+}
+
+// Init__10TStackPageFP15TUDomainManagerUl  — 0x001F9524
+//   r0 = TStackPage* (this)
+//   r1 = TUDomainManager* (or TStackManager*?  argument named "P15TUDomainManager")
+//   r2 = page_id (when caller already has a PA, e.g. for boot setup);
+//        when r2 == 0, request a FRESH page from the domain manager.
+ULong Init__10TStackPage(TStackPage* this, void* mgr, ULong page_id) {
+    if (page_id != 0) {
+        // Pre-existing PA: just record it and clear the "fresh-allocation"
+        // flag at this[+0x30] bit 0x04000000.
+        this[+0]   = page_id;
+        this[+0x30] &= ~0x04000000;
+        return 0;
+    } else {
+        // Set the "fresh-allocation" flag so cleanup knows to free the page.
+        this[+0x30] |= 0x04000000;
+        // Tail-call into the domain manager's free-page allocator.
+        // Args: (mgr, &this, 2)  — 2 means "give me a page".
+        return TUDomainManager::Get(mgr, &this, /*r2=*/2);
+    }
+}
+```
+
+`TUDomainManager::Get` lives at the jump-table entry `0x001BD2974`;
+its real body is in REx-resident kernel text (we haven't
+disassembled the body yet). On return, `*&this == new_PA`.
+
+### Where aliasing actually originates
+
+After the existing patches (`apply_resolve_fault_wrapper` claims
+all 4 subpages atomically; `GetMatchingPage→0` short-circuits the
+page-sharing search), every call to ResolveFault that hits
+`page_table[idx] == NULL` flows: `FindOrAllocPage` →
+`AllocNewPage` → `Init__10TStackPage(mgr, /*page_id=*/0)` →
+`TUDomainManager::Get(mgr, &out, 2)`.
+
+If `TUDomainManager::Get` ever returns the same PA twice across
+different `TStackInfo*` consumers, the result is an alias: two
+different L2 entries (in different page_table arrays) both
+naming the same PA.
+
+**Observed in the FMNewStack 33→36 KiB patch attempt
+(2026-04-28):** with the patch, fresh stack allocations
+naturally consume 4-KiB-aligned 9-page slots (no stack-stack
+guard sharing — verified from NewStack POST-SWI traces). But
+the kernel's later heap activity (`ExtendVMHeap` faulting on a
+new heap page → ResolveFault → AllocNewPage → Get) **gets the
+same PA back that an earlier stack allocation had received**.
+The trace correlation shows the alias appears immediately
+after `ExtendVMHeap` for an 8-KiB heap, with `info_bounds=
+[0x0c201000, 0x0c203000)`.
+
+The only way one PA gets handed out twice is if
+`TUDomainManager::Get` either:
+
+a) Has a free-list that recycles pages (and our patch causes a
+   page to enter that free-list when the kernel believes its
+   slot was vacated).
+b) Has internal bookkeeping that desyncs from our slot resize
+   — for example, a slot-count or per-slot-page-budget value
+   that we didn't audit.
+c) Is implemented in REx (RAM-resident patch) where our base-
+   ROM patches don't apply.
+
+**To investigate next:** disassemble TUDomainManager::Get's
+real body (probably REx-side; check `_Data_/Einstein.rex` byte
+range for the function's actual address). Look for any
+slot-size constant or page-counting logic that we might be
+desyncing with.
+
 ## See also
 
 - `INVESTIGATION.md` — live wedge debugging notes

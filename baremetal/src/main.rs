@@ -8,6 +8,7 @@ use core::arch::global_asm;
 mod banked;
 mod cpu;
 mod fb_dump;
+mod g1_capture;
 mod guest;
 mod guest_bp;
 mod guest_mem;
@@ -79,6 +80,11 @@ pub extern "C" fn kmain() -> ! {
     unsafe {
         stage2::init();
         stage2::enable();
+        // Group-1 self-map capture: mark the 3 kernel-globals self-mapping
+        // PAs RO+XN at stage-2 so any guest write to them traps to EL2.
+        // Must run before the guest gets ERET'd in so we catch TTBR0
+        // setup writes from the very first guest instruction.
+        g1_capture::arm();
     }
 
     // Pre-patch every ROM site the classify-rom bitmap marked as an

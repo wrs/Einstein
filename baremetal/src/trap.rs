@@ -107,6 +107,13 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
         read_sysreg!("spsr_el2"),
     );
 
+    // (Group-1 capture re-arm intentionally NOT here — see
+    // `trap_irq` for the rationale. Sync traps include the
+    // data-abort our own capture handler triggered, so re-arming
+    // here would race with STMIA-style multi-register stores that
+    // span a page boundary: each STMIA retry re-faults on the still-
+    // RO page and the loop never makes progress.)
+
     // DIAG: log the first N sync traps' EC + ELR + ESR, no dedup, so
     // we can see the guest PC timeline in the window leading up to a
     // stall. Remove once Phase B stall is past.
@@ -205,6 +212,19 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
         ctx,
         read_sysreg!("spsr_el2"),
     );
+
+    // Group-1 capture re-arm: any G1 page that took a permission-fault
+    // since the last IRQ has been auto-flipped to RW (so the store
+    // could complete). Re-impose RO+XN now so the *next* G1 write
+    // after this IRQ also faults and gets logged. Re-arming on IRQ
+    // (not sync trap) avoids racing with multi-register stores —
+    // STMIA-style instructions can span a page boundary, and each
+    // retry takes a sync trap; re-arming between retries would
+    // perpetually re-fault the same store. Timer IRQs fire on a
+    // ~16 ms cadence which is long enough for in-flight multi-stores
+    // to complete and short enough to capture distinct writer PCs
+    // through the boot.
+    crate::g1_capture::maybe_rearm();
 
     // Acknowledge the interrupt on the host CPU-interface (GICv3 on
     // FVP, no-op on BCM2836) before doing any work. On GICv3 the
@@ -459,6 +479,15 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
     let is_permission = (ifsc & 0b111100) == 0b001100;
     if wnr && is_permission && (ram_base..ram_end).contains(&ipa) {
         let page = (ipa as u32) & !0xFFF;
+
+        // Group-1 kernel-globals self-map capture: log the writer
+        // before the auto-flip lets the store complete. The
+        // re-arm-on-next-trap hook (`g1_capture::maybe_rearm`) will
+        // restore RO+XN so subsequent writes also fault.
+        if crate::g1_capture::is_armed_pa(page) {
+            let value = if isv != 0 { Some(ctx.x[srt] as u32) } else { None };
+            crate::g1_capture::note_perm_fault(elr, ipa as u32, value, srt as u32);
+        }
 
         // Heap-watch carve-out: log writer info before the auto-flip,
         // and arm a re-RO at the next trap so the next write also

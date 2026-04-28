@@ -270,40 +270,72 @@ deliberate stack-guard sharing.
    installed per-task page tables) — populated at runtime by
    the TTask::Init → LockHeapRange → RememberMapping chain.
 
-### Next iteration — Option α: drop one VA, observe what breaks
+9. **Option α probe** — added PATCHES_717006 entries zeroing
+   L2[0x2]/0x4/0x8 of the ROM L2 PT at PA=0x00001400. Cold-boot:
+   verify-mmu aliases 15 → 2, but boot wedged in an infinite
+   ResolveFault loop at FAR=0xc004fa0. The 2 surviving aliases
+   exposed a *third* descriptor per PA we hadn't seen on the
+   first walk:
 
-Try the cheapest fix first: ROM-patch the duplicate L2 entries
-to invalid (zero). Removes the second VA mapping; subpages
-1-3 of each Group-1 PA lose their priv-RW grant. If the kernel
-doesn't actually use the alternate-VA priv-RW access, we win
-3 aliases and Group-1 is solved. If it does, the failure mode
-(immediate fault at a known PC) tells us exactly which subpage
-matters.
+   ```
+   L2[0x0] (PA=0x04004000) ↔ L2[0x5] (PA=0x04004000)
+   L2[0x3] (PA=0x04005000) ↔ L2[0x6] (PA=0x04005000)
+   ```
 
-Steps:
+   Decoding L2[0x5]=0x0400440e and L2[0x6]=0x04005c0e: each
+   grants priv-RW to **subpage 3** of its PA. So each Group-1
+   PA has 3 distinct L2 descriptors, each granting priv-RW to
+   a different subpage. The "duplicates" aren't redundant —
+   they're per-subpage RW grants split across multiple VA
+   windows.
 
-1. Add a function `apply_l1c0_l2pt_dedup` to `rom_patches.rs` that
-   writes 0 to the ROM L2 PT at PA=0x00001400 + {8, 0x10, 0x20}
-   (= L2[0x2], L2[0x4], L2[0x8]). The ROM backing is owned by
-   EL2 even though stage-2 maps ROM RO to the guest; we write
-   directly into the host-side backing.
-2. Call from `apply_717006_patches` after the existing ROM
-   patches. Verify the patch with a re-read assertion.
-3. Cold-boot. Expect:
-   - verify-mmu Group-1 alias count: 3 → 0
-   - boot reaches at least the prior reboot canary
-   - if not, capture the FAR + ELR of the new fault — that's the
-     subpage user.
-4. Run guest tests.
+   **What was using FAR=0xc004fa0?** Disasm grep proves no
+   kernel code references the entire L1[0xc0] self-map VA
+   range (0x0c000000..0x0c008fff has 0 literal hits) or our
+   trampoline scratch VAs (0x0c004f00/0x0c004fa0). The only
+   code using those VAs is OUR HYPERVISOR's DABT/UND/SBA
+   trampolines (`install_und_vector_swap_post_mmu()` writes
+   0x0c00_4f00 / 0x0c00_4fa0 into trampoline literals). The
+   wedge was our DABT trampoline trying to `str lr, [r0]` at
+   r0=0x0c004fa0 with L2[0x4] zeroed → unmapped → re-DABT.
 
-If Option α breaks boot, pivot to Option β (stage-2 PA splitting
-with shadow-on-write) for Group-1 — INVESTIGATION.md has the
-design sketch.
+   Patches reverted. Baseline restored: 15 verify-mmu aliases,
+   exit=1 reboot canary, 36/36 guest tests pass.
 
-Group-2's 12 aliases remain parked until Group-1 is zero;
-Group-2 will then be addressed via stage-2 PA splitting (Option C
-from prior plan) — same approach as Option β but applied to the
-RAM-resident L2 PT entries.
+   The L1[0xc0] kernel-globals self-map is **functionally inert**
+   in the running kernel — vestigial design intent the team
+   wired up but the running code doesn't exercise. The PA-target
+   pages (PA=0x04004000-0x04006000) DO receive writes from many
+   kernel PCs (g1_capture probe found 25 distinct writers), but
+   those accesses must go through some OTHER VA window not yet
+   enumerated.
+
+### Next iteration — Option β-light: relocate hypervisor scratch, then redo dedup
+
+Cheapest path to zero Group-1 aliases:
+
+1. Move the hypervisor's UND/DABT/SBA trampoline scratch slots
+   out of PA=0x04005XXX (= subpage 3 of L2[0x4-0x6]'s mapping).
+   Candidate target: extend the existing shadow-stub scratch
+   carve-out at IPA `0x01800000` (mapped via `L1[0x18]`, owned
+   by the hypervisor). Update `install_und_vector_swap_post_mmu()`
+   and the relevant scratch-slot constants
+   (`UND_SAVE_LR_IPA`, `DABT_SAVE_PA`, etc.).
+2. Re-attempt the ROM-patch dedup, this time covering ALL
+   known duplicates (L2[0x2], 0x4, 0x5, 0x6, 0x8, plus the
+   third descriptor for PA=0x04006000 once identified by
+   running the dedup probe with progressively more entries
+   zeroed).
+3. Cold-boot. Expect Group-1 aliases 3 → 0 with no wedge,
+   since no kernel code uses these VAs.
+4. If it still wedges, the wedge names a VA the kernel does
+   use (via base-register indirection rather than literal) —
+   investigate from there.
+
+Group-2's 12 aliases (RAM-resident L2 PTs, runtime-installed
+by the kernel's RememberMapping chain) remain parked until
+Group-1 is zero; Group-2 will then be addressed via stage-2
+PA splitting (Option C from prior plan).
 
 Group-2's 12 aliases remain parked until Group-1 is zero.
 Group-2 will then be revisited with **Option C: stage-2 PA

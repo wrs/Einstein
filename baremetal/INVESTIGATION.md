@@ -4,6 +4,83 @@ Live notes for the next iteration. Replace this file's body when the
 current stop is fixed and a new one takes over — git history is the
 archive of past investigations.
 
+## Survey: kernel L2-write paths that intend subpage-AP fault-catching (2026-04-28)
+
+This iteration surveyed `_Data_/symbols.txt` and the disasm
+to identify the kernel paths that construct mixed-subpage-AP
+L2 entries.
+
+**Discovery 1: `TStackManager` handles BOTH stacks and heaps.**
+`FMLockHeapRange` (0x001F6B24) is a TStackManager method. The
+class manages all subpage-AP-aware allocation, regardless of
+whether the caller's intent is stack-shaped or heap-shaped.
+
+`FMLockHeapRange`'s body:
+```
+1f6b88: bl ResolveFault          ; per-subpage allocation
+1f6b98: movs sl, r0
+1f6b9c: beq next                  ; success → next subpage
+1f6ba0: cmp r6, r9                ; failed at first subpage?
+1f6ba8: sub r3, r6, #1024
+1f6bac..1f6bbc: bl UnlockSubPagesBetween + branch
+1f6bc0: add r6, r6, #1024         ; advance 1 KiB
+1f6bc4: cmp r6, r8
+1f6bc8: bls 1f6b88                ; loop
+```
+
+So FMLockHeapRange iterates 1 KiB subpages over the requested
+heap range, calling `ResolveFault` per subpage.
+
+**Discovery 2: Our existing wrapper skips FMLockHeapRange.**
+`apply_resolve_fault_wrapper` patches the
+`TStackManager::Fault → ResolveFault` BL but explicitly NOT
+`FMLockHeapRange → ResolveFault` (comment in
+`rom_patches.rs:989`: "covers early bring-up paths that
+allocate single physical pages eagerly, where multi-iter
+would over-claim and break boot"). The alias-onset detector
+caught the actual alias forming through FMLockHeapRange's
+unmodified path.
+
+**Discovery 3: Generic Remember/Forget infrastructure.** All
+L2-entry writes that intend subpage-AP go through
+`PrimRememberMapping` (0x00163480) / `PrimRememberPermMapping`
+(0x00163920) / `PrimRememberPhysMapping` (0x00163708). These
+are the leaf primitives that actually construct the L2 word
+with `Perm`-encoded AP fields.
+
+**Discovery 4: SafeHeapPage / WiredHeapPage are unrelated.**
+`SSafeHeapPage` (0x001C57B4) and `SWiredHeapPage` (0x001C5C2C)
+are small-block allocators that carve up ONE 4 KiB page for
+multiple small objects. Different abstraction from per-VA
+subpage-AP partitioning.
+
+**Approaches to fix the heap-aliasing wedge:**
+
+A. **Wrap FMLockHeapRange's BL with the 4-iter wrapper too.**
+   Risk: the existing wrapper comment warns this breaks early
+   boot. But maybe we can write a DIFFERENT wrapper specifically
+   for the heap-lock case.
+B. **Emulate per-subpage AP at stage-2 level.** Read original
+   ARMv4-format L2 entries before flattening; track per-subpage
+   intent in a hypervisor-side structure; inject faults on
+   access to "fault-catching" subpages. Architectural fix;
+   biggest lift but cleanest.
+C. **Allocate fresh pages for any L2 write with mixed AP.**
+   When `fix_stage1_xn_bits` (or a stage-2 trap on L2-table
+   writes) sees a mixed-AP entry, substitute a fresh PA from
+   a hypervisor-managed pool. Partial fix; kernel free-list
+   may get confused but shouldn't break.
+D. **Find why our kernel state diverges from Einstein's.**
+   Einstein's allocator places heap #3 alone on its page;
+   ours places it shared. Some prior allocation history
+   differs. Long investigation to identify the divergence
+   trigger; could yield a simpler upstream fix.
+
+Per-iteration plan: try (A) first since it parallels the
+existing wrapper. If wrapping FMLockHeapRange causes early-
+boot issues (per the warning comment), fall back to (C) or
+(B).
+
 ## Subpage-AP decoded: kernel partitions shared 4 KiB pages into per-VA subpage owners (2026-04-28)
 
 Extended `duplicate_pa_scan` in NewtonProbe to print the full

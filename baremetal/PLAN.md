@@ -213,64 +213,80 @@ them.
 
 ## Concrete next steps
 
-**Refined framing (2026-04-28):** ARMv4's per-subpage AP lets
-the kernel partition each shared 4 KiB page into 1 KiB
-subpages, with each subpage owned by a different VA. The
-non-owning VAs see those subpages as `AP=00` (NA) — user
-writes FAULT. ARMv7 has no subpage-AP, so `fix_stage1_xn_bits`
-flattens every L2 entry to AP=011 (full RW). Per-subpage
-write-fault enforcement is gone.
+**Survey complete (2026-04-28):**
+- `TStackManager` handles both stacks AND heaps —
+  `FMLockHeapRange` (0x001F6B24) is a TStackManager method.
+- `FMLockHeapRange` iterates 1 KiB subpages of the requested
+  heap range, calling `ResolveFault` per subpage. Same
+  per-subpage allocator the wrapper already covers for
+  stack faults.
+- The existing `apply_resolve_fault_wrapper` patches
+  `TStackManager::Fault → ResolveFault` BL only; it
+  deliberately skips `FMLockHeapRange → ResolveFault`. The
+  alias-onset event we caught was through the unwrapped
+  FMLockHeapRange path.
+- Generic L2-write primitives: `PrimRememberMapping`
+  (0x00163480), `PrimRememberPermMapping` (0x00163920) —
+  leaf functions that construct L2 entries with
+  `Perm`-encoded AP fields.
 
-**The kernel design that breaks**: shared pages with
-mixed-intent subpages (some "fault on user write", some
-"user RW"). On real hardware, ARMv4 enforces. On us, all
-subpages are RW so writes intended to fault land silently.
+Three implementation options, in order of effort:
 
-So the task is: **identify every kernel object whose
-allocation expects subpage-AP fault-on-user-write semantics,
-and ensure it gets its own dedicated physical page**.
-The user's distinction matters: most kernel objects don't
-need fault-catching (they're just data, fine on shared
-pages). Only objects that EXPECT to catch user-mode write
-faults (lazy-grow stacks, certain heap structures, etc.)
-need the wrapper-style protection.
+### Option A — Wrap FMLockHeapRange's BL too (lightest)
 
-Concrete next steps:
+Apply a 4-iter wrapper to FMLockHeapRange's
+`bl ResolveFault` at 0x001F6B94. Mirrors the existing stack-
+fault wrapper. The risk (per the existing comment) is that
+FMLockHeapRange runs during early bring-up where multi-iter
+might over-claim pages. Mitigation: only wrap calls when
+the FAR is in a known heap-allocation range, OR detect at
+runtime when over-claiming would happen and gracefully
+revert to single-iter.
 
-1. **Survey which kernel allocation paths use subpage-AP
-   fault-catching.** Search the ROM (or `_Data_/symbols.txt`)
-   for write paths into L2-entry construction. Specifically:
-   - `TStackManager::ResolveFault` and surrounding (already
-     wrapped for fault-catching expectations).
-   - `FMLockHeapRange` (= heap-side stage-1 mapping path).
-     Does it set per-subpage AP, or always all-R/W?
-   - `TUMonitor` / `TUPageManager` interactions when memory
-     is mapped into kernel structures.
-   - Heap creation: does the kernel's `NewHeap` chain
-     intentionally request subpage-AP-protected pages, or
-     does the heap allocator just rely on fresh whole pages?
-2. **For each path that intends fault-catching, force
-   fresh-page allocation.** Build a `apply_resolve_fault_
-   wrapper`-style stub for the heap-side path. Goal: when
-   the kernel asks to map a page that would otherwise share
-   a physical page with a fault-expecting object, redirect
-   to a fresh page where AP=011 universally (no
-   fault-catching needed) or AP=001 universally (whole-page
-   fault-catching).
-3. **Use the duplicate-PA scan + alias-onset detector as
-   regression catchers.** They're already wired; rerun after
-   each fix to confirm no new aliasing of a fault-expecting
-   page.
-4. **Cross-check Einstein's specific allocation order.** The
-   Einstein dump shows heap #3 alone on PA 0x040a6000,
-   never aliased. Our heap #3 lands on PA 0x04032000
-   shared with two stacks. If our hypervisor diverges
-   from Einstein's allocation order, instrumenting the
-   page-pool's `Get`/`Release` calls would identify the
-   first divergence point. That might suggest a simpler
-   fix than wrapping the heap path — fix whatever causes
-   the divergence and the kernel will allocate the same
-   way Einstein does.
+Concrete steps:
+1. Add a parallel wrapper stub at a fresh PC (e.g.
+   `0x00FF_FE60`). Same 4-iter logic as the existing
+   wrapper but with FMLockHeapRange's specific bl-target.
+2. Patch the BL at 0x001F_6B94 to call the new wrapper.
+3. Cold-boot, watch for the alias-onset detector firing.
+4. If boot regresses on early-boot, gate the wrapper by
+   FAR or task ID.
+
+### Option B — Stage-2 emulation of subpage-AP
+
+Read the ARMv4-format L2 entries BEFORE `fix_stage1_xn_bits`
+flattens them. Track per-subpage AP intent in a
+hypervisor-side map. At stage-2, mark any page with
+mixed-AP intent as RO (or invalid) — every guest access
+takes a stage-2 fault. The hypervisor decodes the access,
+checks the intended AP for the specific subpage offset,
+and either allows (write to user-RW subpage) or injects a
+fault into the guest (write to NA subpage).
+
+Cleanest architectural fix; biggest lift. Precise emulation
+of ARMv4 subpage-AP on ARMv7 hardware.
+
+### Option C — Substitute fresh PAs for mixed-AP entries
+
+When `fix_stage1_xn_bits` sees a mixed-AP entry, allocate a
+fresh physical page from a hypervisor-managed pool, copy the
+existing page's contents, and rewrite the L2 entry to point
+at the fresh page. The kernel's free-list gets confused
+about ownership but the kernel stops corrupting itself.
+
+Partial fix; minor leakage but boot progresses.
+
+### Option D — Investigate root divergence
+
+Einstein places heap #3 alone on PA 0x040a6000; ours places
+it shared with stacks. Find what hypervisor-state difference
+causes the kernel's free-list to diverge before NewHeap #3.
+Could yield a simpler upstream fix than any of A/B/C.
+
+**Recommended next iteration: Option A.** Lightest weight,
+parallels existing infrastructure, and the alias-onset
+detector + duplicate-PA scan provide immediate
+regression-catching.
 
 Diagnostic scaffolding (heap-watch sentinel, stage-2 RO
 carve-out, sanity-halt with banked-SP + ring-SP capture,

@@ -23,6 +23,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 
 use crate::guest_mem;
 use crate::kprintln;
+use crate::trap::TrapContext;
 
 /// IPA of newt's RelocHeap header (NewHeap #3 returns r5+16 where
 /// r5=0x0ca6b000). The full header is 128 bytes; we only sample the
@@ -61,6 +62,17 @@ const RING_SIZE: usize = 32;
 const RING_SRC_IRQ_BIT: u64 = 1u64 << 63;
 static RING: [AtomicU64; RING_SIZE] = [const { AtomicU64::new(0) }; RING_SIZE];
 static RING_HEAD: AtomicUsize = AtomicUsize::new(0);
+
+/// Parallel ring of source-mode SPs at trap entry, indexed in lockstep
+/// with `RING`. Lets the sanity-halt dump answer "did any recent trap
+/// have a banked SP that aliased the heap header?" — directly tests
+/// hypothesis #1 in PLAN.md (the corruption pattern matches an
+/// exception-frame push, so a SP pointing into the heap would be the
+/// smoking gun).
+static RING_SP: [AtomicU32; RING_SIZE] = [const { AtomicU32::new(0) }; RING_SIZE];
+/// Parallel ring of source-mode encoded as low 5 bits of SPSR_EL2 at
+/// trap entry. Lets the dump label which mode's SP is in `RING_SP[i]`.
+static RING_MODE: [AtomicU32; RING_SIZE] = [const { AtomicU32::new(0) }; RING_SIZE];
 
 /// Source-kind tag matching the encoding bit packed into ring slots.
 #[derive(Copy, Clone)]
@@ -373,7 +385,7 @@ fn elr_inside_heap_code(elr: u32) -> bool {
 /// flood the log if the same heap is read multiple times.
 static SANITY_FIRED: AtomicU32 = AtomicU32::new(0);
 
-pub fn sample(elr_el2: u64, source: Source) {
+pub fn sample(elr_el2: u64, source: Source, ctx: &TrapContext, spsr_el2: u64) {
     // Defensive RO-state poll: if some other code path has flipped
     // the carved page to RW without our knowledge (e.g. shadow_stub
     // claiming the page as a code page after a fetch trap on it),
@@ -405,10 +417,17 @@ pub fn sample(elr_el2: u64, source: Source) {
     maybe_rearm();
 
     // Always record this ELR + source-bit in the ring buffer, even
-    // when the value hasn't changed.
+    // when the value hasn't changed. Parallel rings track the
+    // source-mode SP and mode bits so the sanity-halt dump can
+    // disambiguate which banked SP applied at each trap.
     let slot = (elr_el2 & !RING_SRC_IRQ_BIT) | source.bit();
+    let cpsr = spsr_el2 as u32;
+    let sp_at_trap = crate::banked::sp_for_mode(ctx, cpsr);
     let head = RING_HEAD.fetch_add(1, Ordering::Relaxed);
-    RING[head % RING_SIZE].store(slot, Ordering::Relaxed);
+    let idx = head % RING_SIZE;
+    RING[idx].store(slot, Ordering::Relaxed);
+    RING_SP[idx].store(sp_at_trap, Ordering::Relaxed);
+    RING_MODE[idx].store(cpsr & 0x1F, Ordering::Relaxed);
 
     let value = match guest_mem::read_word_va(WATCH_VA) {
         Some(v) => v,
@@ -504,10 +523,77 @@ pub fn sample(elr_el2: u64, source: Source) {
                 off, row[0], row[1], row[2], row[3],
             );
         }
+        // Banked-register snapshot at the moment of the sanity-fail
+        // trap. PLAN.md hypothesis #1 is that an exception-frame push
+        // (stmdb sp!, {…}) lands on memory that aliases the heap
+        // header — i.e. some banked SP is within ~0x80 of the heap
+        // base 0x0ca6b000. Print every mode's SP+LR so the operator
+        // can spot the alias directly.
+        let cpsr = spsr_el2 as u32;
+        kprintln!(
+            "    spsr_el2={:#x} (mode={:#x})  source-mode SP_<mode>={:#010x} LR_<mode>={:#010x}",
+            spsr_el2, cpsr & 0x1F,
+            crate::banked::sp_for_mode(ctx, cpsr),
+            crate::banked::lr_for_mode(ctx, cpsr),
+        );
+        kprintln!(
+            "    SP_usr={:#010x} LR_usr={:#010x}  SP_svc={:#010x} LR_svc={:#010x}",
+            ctx.x[13] as u32, ctx.x[14] as u32,
+            ctx.x[19] as u32, ctx.x[18] as u32,
+        );
+        kprintln!(
+            "    SP_abt={:#010x} LR_abt={:#010x}  SP_und={:#010x} LR_und={:#010x}",
+            ctx.x[21] as u32, ctx.x[20] as u32,
+            ctx.x[23] as u32, ctx.x[22] as u32,
+        );
+        kprintln!(
+            "    SP_irq={:#010x} LR_irq={:#010x}  SP_fiq={:#010x} LR_fiq={:#010x}",
+            ctx.x[17] as u32, ctx.x[16] as u32,
+            ctx.x[29] as u32, ctx.x[30] as u32,
+        );
+        // Heap-alias check across ALL banked SPs. Any SP in
+        // 0x0ca6b000-0x80 .. 0x0ca6b000+0x80 is the smoking gun —
+        // a push through that SP would clobber the header.
+        const HEAP_BASE: u32 = 0x0ca6_b000;
+        const ALIAS_RANGE: u32 = 0x100;
+        let banked_sps = [
+            ("SP_usr", ctx.x[13] as u32),
+            ("SP_svc", ctx.x[19] as u32),
+            ("SP_abt", ctx.x[21] as u32),
+            ("SP_und", ctx.x[23] as u32),
+            ("SP_irq", ctx.x[17] as u32),
+            ("SP_fiq", ctx.x[29] as u32),
+        ];
+        for (name, sp) in banked_sps.iter() {
+            let delta = (*sp).wrapping_sub(HEAP_BASE);
+            let in_range = delta < ALIAS_RANGE
+                || (HEAP_BASE.wrapping_sub(*sp) < ALIAS_RANGE);
+            if in_range {
+                kprintln!(
+                    "    *** {} ({:#010x}) ALIASES heap base {:#010x} (delta={:+}) ***",
+                    name, sp, HEAP_BASE, delta as i32,
+                );
+            }
+        }
+        // Resolve currentTask via gCurrentTask (VA 0x0c10105c) →
+        // taskGlobals (the first word) → task[-16] = the heap pointer
+        // that GetCurrentHeap returns. Helps confirm whether the
+        // legitimate RelocHeap is still installed at the moment of
+        // corruption.
+        if let Some(curr_task_globals) = guest_mem::read_word_va(0x0c10_105c) {
+            let heap_slot_va = curr_task_globals.wrapping_sub(16);
+            let heap_ptr = guest_mem::read_word_va(heap_slot_va).unwrap_or(0);
+            kprintln!(
+                "    gCurrentTaskGlobals={:#010x}  task[-16](=heap)={:#010x}",
+                curr_task_globals, heap_ptr,
+            );
+        }
         // Dump the trap-stream ring buffer (newest at index 31) so
         // the operator can bisect the corrupting writer to between
-        // two adjacent ring entries. The ring is updated at the top
-        // of every sample call, so it includes this trap.
+        // two adjacent ring entries. Ring slots now include the
+        // source-mode SP, so a push corrupting the heap shows up as
+        // SP < heap+0x80 in the ring entry directly preceding the
+        // observation.
         let head = RING_HEAD.load(Ordering::Relaxed);
         let next_head = head.wrapping_add(1);
         for i in 0..RING_SIZE {
@@ -516,7 +602,15 @@ pub fn sample(elr_el2: u64, source: Source) {
             if raw != 0 {
                 let src = if (raw & RING_SRC_IRQ_BIT) != 0 { "irq " } else { "sync" };
                 let e = raw & !RING_SRC_IRQ_BIT;
-                kprintln!("      ring[{:>2}] {}: elr={:#x}", i, src, e);
+                let sp = RING_SP[idx].load(Ordering::Relaxed);
+                let mode = RING_MODE[idx].load(Ordering::Relaxed);
+                let alias = sp.wrapping_sub(HEAP_BASE) < ALIAS_RANGE
+                    || HEAP_BASE.wrapping_sub(sp) < ALIAS_RANGE;
+                kprintln!(
+                    "      ring[{:>2}] {}: mode={:#04x} elr={:#x} sp={:#010x}{}",
+                    i, src, mode, e, sp,
+                    if alias { "  *** ALIASES HEAP ***" } else { "" },
+                );
             }
         }
         // Halt loudly so the operator catches the first sign of

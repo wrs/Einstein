@@ -180,83 +180,71 @@ NOTE: Fix all compiler warnings before committing, to keep context clean.
   on QEMU; `--platform fvp` runs the same suite on the FVP. Both
   must stay green. See "Verification" near the end of this file.
 
-## Current stop — RelocHeap header corruption (hypervisor-side bug; cross-check confirmed)
+## Current stop — RelocHeap header corruption is VA aliasing — heap shares backing PA with user stack
 
-Reverted iterations 6's SearchFreeList no-fit redirect and 10's
-gFallbackHeap substitution. Both were symptom workarounds that
-masked the real divergence. The kernel SHOULD be able to use the
-legitimate RelocHeap (NewHeap call #3, base=0x0ca6b000, size=2 MiB);
-something on our side is overwriting its header with what looks
-like saved exception-frame bytes (ROM PCs + stack pointers).
+**Strong new finding (this iteration):** the corrupted bytes
+decode EXACTLY as two ARM `push {regs}` instructions executed
+by guest code:
 
-**NewtonProbe cross-check (this iteration):** added
-`heap_header_dump` to `baremetal/probe/probe.cpp`, dumping
-`heap[0x0ca6b010..+0x80]` every 2 s alongside the existing
-periodic `task_dump`. Ran `build/NewtonProbe
-baremetal/roms/newton.rom _Data_/Einstein.rex 60`; captured 30+
-heap-dump samples spanning t=2 s through t=32 s.
+- `__ct__9TRefStackFv` push (PC=0x1a48e8) writes lr=0x002dd804
+  + pc+8=0x001a48f0 → heap[+0x00..+0x04]
+- `__ct__18TStoreObjectWriter` push (PC=0x2dd7bc) writes
+  lr=0x002dfa20 + pc+8=0x002dd7c4 → heap[+0x20..+0x24]
+- The ip value at heap[+0x1c] is **0x0cc82038** = sp_old in the
+  USER STACK range, NOT in the heap range.
 
-Result: **Einstein's RelocHeap header is stable and valid for the
-entire 60 s window.** All invariants hold (`heap[+0]=base`,
-`heap[+8]='skia'`, `heap[+0x40]=64`, `heap[+0x18]=size=2 MiB`,
-`heap[+0x64]=TULockingSemaphore wrapper`). VA→PA stays at
-`0x040a6010` for the entire run — Einstein never rebinds, ours
-hops `0x0401f000 → 0x04032000`.
+Both bytes appearing at heap addresses means **VA 0x0cc82018
+and VA 0x0ca6b018 share backing memory** in our hypervisor.
+Einstein puts them on different PAs (heap on PA 0x040a6010 vs.
+user stack elsewhere) — see prior iteration's NewtonProbe
+heap-dump cross-check.
 
-So **the bug is on our side.** See `INVESTIGATION.md` for the
-side-by-side byte diff. The corrupted offsets `+0x00..+0x14`
-match an ARM exception frame (saved `{r4..r7,fp,ip,lr,pc}` plus
-saved-SP) — the kernel SOMETHING saves an exception frame onto
-the heap header.
+The hypervisor-side bug is therefore in stage-1 / stage-2 page
+mapping such that two distinct kernel VAs end up at the same
+backing PA. Hypothesis #1 (banked-SP aliases heap header) is
+**refuted** by this iteration's banked-SP capture probe — none
+of the source-mode SPs at the sanity-halt is within ±0x100 of
+heap base. The aliasing is at the page-table layer, not the
+SP-points-into-heap layer.
 
-Hypothesis space, in rough order of testability:
+## Earlier hypothesis-space (mostly RESOLVED by this iteration)
 
-1. **Banked-register / mode-confusion: an exception entry saves
-   to a region that overlaps the heap header.** The most
-   plausible candidate. Worth probing first: capture
-   `currentTask->globals[-16]`, `task` itself, and the per-mode
-   banked SPs at the moment of the first sanity-check failure.
-   If any saved-SP value lands inside `0x0ca6b000..0x0ca6b080`,
-   the next exception entry would clobber the header.
-2. **shadow_stub byte-access patcher mis-emulating a store.**
-   The previous-iteration log shows the wedge stub at
-   `0x00f76368` emulates `strb r0, [r9]` from `SetBlockSize`.
-   Check whether any of the *legitimate* shadow_stub rewrites
-   on the path between heap-watch transition #2 and #3 target
-   a register that holds the heap base.
-3. **CP15 / cache-op corruption via a wrong-target write.**
-   List every CP15 handler invoked between transitions #2 and
-   #3; cross-check against Einstein's CP15 trace from the probe
-   log to see if we run any operation Einstein doesn't.
-4. **Stage-2 perm-fault auto-flip RW window dropping the trap.**
-   Already heavily investigated; FVP confirms it's not
-   QEMU-specific. The window is real but doesn't tell us what
-   *writes* into the window — exhaustive single-stepping is
-   the only way through this lane.
+Hypothesis #1 (banked-SP-aliases-heap) refuted. Hypotheses
+#2 (shadow_stub mis-emulation) and #3 (CP15 cache-op corruption)
+remain possible but the aliasing finding subsumes them — both
+would cascade FROM the underlying VA-aliasing bug.
 
-Concrete next steps:
+## Concrete next steps
 
-a. **QEMU GDB-stub watchpoint on the heap header.** Run
-   `DEBUG=1 cargo run --release` (term 1), `aarch64-elf-gdb -x
-   scripts/gdb-init` (term 2), then `watch *0x04032010`. QEMU
-   instruments memory accesses at the TCG level; a watchpoint
-   on the post-translation IPA fires across EL boundaries on
-   guest stores. This is the lightest path to a writer-PC
-   capture. The IPA is `0x04032010` post-rebind; for the
-   pre-rebind window use `0x0401f010`. (FVP equivalent uses
-   the Iris debug server on host port 7100 with `--gdb`.)
-b. Add an exception-frame capture probe: at every trap entry,
-   if `task[-16]` points within `±0x80` of either heap base
-   (`0x0ca6b000` or any other live heap), log task-id, mode,
-   banked SPs, `task` VA. Answers hypothesis #1 directly,
-   without depending on QEMU watchpoint behaviour.
-c. Cross-reference shadow_stub's emulation log between
-   transitions #2 and #3 against the corrupted byte values.
-   If `r9` in the SetBlockSize stub equals the heap base at
-   any point, hypothesis #2 is localised.
+1. **Confirm aliasing.** Extend `heap_watch::sample` (or add a
+   one-shot at sanity-halt) to walk stage-1 for the user-stack
+   VA `0x0cc82018` and the heap VA `0x0ca6b018` and print both
+   IPAs. If they match, aliasing is confirmed. If they don't
+   match but the bytes still appear in both, the aliasing is
+   stage-2 (two IPAs sharing a host PA), which would point at
+   our `stage2.rs` mapping logic.
+2. **Find the duplicate.** Walk the kernel's L1/L2 tables
+   exhaustively, scanning every VA that resolves to PA
+   0x04032000 (the current heap PA). If multiple VAs name the
+   same PA, the duplicate VA list pinpoints what's wrong. The
+   walker can be wired into `heap_watch.rs` near
+   `arm_carve_out_at_heap_va`, called once when the carve-out
+   first arms.
+3. **Trace upstream.** Once we know which VAs alias, identify
+   WHEN the duplicate mapping was installed. The kernel's page
+   allocator picks pages from a free list; if our hypervisor
+   tells the kernel a page is free that we've already handed
+   out, the allocator will re-issue it. Likely culprits:
+   - Our ROM-load region overlapping a region the kernel
+     reclaims.
+   - A handed-out tracer-trampoline page or shadow-stub page
+     ending up in the kernel's free list.
+   - An unused-RAM detection that ours and Einstein's models
+     differ on.
 
 Diagnostic scaffolding (heap-watch sentinel, stage-2 RO
-carve-out, sanity-halt, stub-orig-PC decoder) stays armed.
+carve-out, sanity-halt with banked-SP + ring-SP capture,
+stub-orig-PC decoder) stays armed.
 
 The probe extension itself (`heap_header_dump` in `probe.cpp`)
 stays in the tree; it's cheap and useful for any future

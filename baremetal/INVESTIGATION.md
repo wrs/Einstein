@@ -4,6 +4,106 @@ Live notes for the next iteration. Replace this file's body when the
 current stop is fixed and a new one takes over — git history is the
 archive of past investigations.
 
+## Banked-SP capture rules out hypothesis #1; corruption decodes as guest pushes via aliased VA (2026-04-28)
+
+This iteration extended `heap_watch::sample` to take `&TrapContext`
+and `spsr_el2` so the sanity-halt path can dump every banked SP
+of the source-mode AND a parallel ring of `(elr, sp, mode)` per
+trap. Cold-boot run captured the halt; full SP context is in
+`/tmp/run-bp-probe.log`.
+
+**Hypothesis #1 (banked SP aliases heap header) is refuted.**
+At halt:
+- spsr_el2=0x20000197 (mode=ABT), source SP_abt=0x0c004c00
+- SP_usr=0x0cc81ffc  SP_svc=0x0c000400
+- SP_abt=0x0c004c00  SP_und=0x0c006000
+- SP_irq=0x0c002c00  SP_fiq=0x0c003400
+
+None of these are within ±0x100 of heap base 0x0ca6b000. Across
+the full 32-slot ring the SPs trail through the user stack range
+0x0cc82200..0x0cc82380 and the und-mode 0x0c006000 — never the
+heap. So no exception-frame push hit the heap header directly via
+the source-mode SP.
+
+**But the corrupted bytes decode EXACTLY as two ARM `push` instructions
+executed by guest code.** The header dump:
+
+```
+heap[+0x00]  0x002dd804 0x001a48f0 0x0c645f0c 0x0cc825d8
+heap[+0x10]  0x00000000 0x0cc825e0 0x0cc82510 0x0cc82038
+heap[+0x20]  0x002dfa20 0x002dd7c4 0x0c6437b4 0x00000400
+```
+
+Cross-referencing the disassembly:
+
+ROM `0x002dd7bc <__ct__18TStoreObjectWriter>`:
+```
+2dd7b8: mov  ip, sp
+2dd7bc: push {r4, r5, r6, r7, fp, ip, lr, pc}    ; 8 regs = 32 bytes
+2dd7c0: sub  fp, ip, #4
+```
+
+ROM `0x001a48e4 <__ct__9TRefStackFv>`:
+```
+1a48e4: mov  ip, sp
+1a48e8: push {r4, fp, ip, lr, pc}                 ; 5 regs = 20 bytes
+```
+
+Calling chain: `MakeStoreObject` (PC≈0x2dfa1c calls
+`__ct__18TStoreObjectWriter`) → ctor body (PC≈0x2dd800 calls
+`__ct__9TRefStackFv`).
+
+`__ct__9TRefStackFv` push, with sp_new = 0x0ca6b004, writes:
+| addr        | value          | from               |
+|-------------|----------------|--------------------|
+| heap[+0x00] | 0x002dd804     | lr (return into TStoreObjectWriter ctor) |
+| heap[+0x04] | 0x001a48f0     | pc + 8 (architectural pc of the push)    |
+
+Both match. (For `pc+8`: the push at 0x1a48e8 stores arch-pc =
+0x1a48e8 + 8 = 0x1a48f0.)
+
+`__ct__18TStoreObjectWriter` push, with sp_new = 0x0ca6b018:
+| addr        | predicted        | actual         | match |
+|-------------|------------------|----------------|-------|
+| heap[+0x20] | lr=0x002dfa20    | 0x002dfa20     | ✓     |
+| heap[+0x24] | pc+8=0x002dd7c4  | 0x002dd7c4     | ✓     |
+| heap[+0x1c] | ip=sp_old        | 0x0cc82038     | (!)   |
+
+The ip value 0x0cc82038 is `mov ip, sp` at PC=0x002dd7b8 — i.e.,
+the value of SP **before** the push. **0x0cc82038 is in the user
+stack range, NOT in the heap range.** The push was actually
+executed with sp_old=0x0cc82038, sp_new=0x0cc82018. So the bytes
+hit the user stack.
+
+**…and the same bytes appear at heap addresses.** That means
+VA 0x0cc82018..0x0cc82038 and VA 0x0ca6b008..0x0ca6b028 share
+backing memory. Two distinct VAs translate to the same backing
+PA in our hypervisor.
+
+Why Einstein avoids this: its kernel page-management picks
+different PAs for the two VAs (PA 0x040a6010 for the heap; the
+user stack is on a different PA). Our kernel's stage-1 walk
+ends up co-locating them.
+
+This is a **stage-1 aliasing bug** at the kernel level, but the
+trigger is on our side — the kernel's page-allocator picks pages
+for the heap and user stack based on which physical pages it
+considers free. If our hypervisor's stage-2 layout (or some
+side-effect of an early allocation we do or fail to do) leaves
+the kernel believing the same physical page is free twice, we
+get this aliasing.
+
+Concrete next-step probe: at sanity-halt time, walk stage-1 for
+the user stack VA 0x0cc82018 and the heap VA 0x0ca6b018 and
+print both IPAs. If they match, aliasing is confirmed; we then
+trace WHY the kernel's page allocator put them on the same PA.
+
+Alternative angle: enumerate every VA that translates to PA
+0x04032000 by scanning the kernel's L1/L2 tables. If multiple,
+the duplicates name the aliased VAs.
+
+Diagnostic scaffolding kept intact.
+
 ## NewtonProbe cross-check: Einstein keeps RelocHeap valid throughout boot (2026-04-28)
 
 Wired the cross-check from the previous iteration's PLAN.md: added

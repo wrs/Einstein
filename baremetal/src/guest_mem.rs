@@ -482,6 +482,35 @@ pub fn fix_stage1_xn_bits() -> bool {
                                 prev_va, prev_va >> 20, (prev_va >> 12) & 0xFF,
                                 va, va >> 20, (va >> 12) & 0xFF,
                             );
+                            // Dump the L1[i] descriptor and the two L2
+                            // entries (at L2[prev_va_idx], L2[va_idx]) so
+                            // the next iteration can see whether the
+                            // alias is ROM-baked vs RAM-resident. `entry`
+                            // is the L1 descriptor from this walk's
+                            // outer loop; the L2 reads go through
+                            // `read_word_pa` which honours both ROM and
+                            // RAM backings.
+                            let l2_pt_base = entry & 0xFFFF_FC00;
+                            let prev_idx = ((prev_va >> 12) & 0xFF) as u32;
+                            let va_idx   = ((va      >> 12) & 0xFF) as u32;
+                            let prev_l2_pa = l2_pt_base + prev_idx * 4;
+                            let va_l2_pa   = l2_pt_base + va_idx   * 4;
+                            let prev_l2 = read_word_pa(prev_l2_pa).unwrap_or(0xDEAD_BEEF);
+                            let va_l2   = read_word_pa(va_l2_pa  ).unwrap_or(0xDEAD_BEEF);
+                            let l2_loc = if (l2_pt_base as usize) < ROM_SIZE {
+                                "ROM"
+                            } else if (RAM_BASE_USIZE..RAM_BASE_USIZE + RAM_SIZE)
+                                .contains(&(l2_pt_base as usize)) {
+                                "RAM"
+                            } else {
+                                "?"
+                            };
+                            crate::kprintln!(
+                                "verify-mmu alias L1[{:#x}]={:#010x} → L2_PT@PA={:#010x} ({})  L2[{:#x}]={:#010x} (PA={:#010x})  L2[{:#x}]={:#010x} (PA={:#010x})",
+                                i, entry, l2_pt_base, l2_loc,
+                                prev_idx, prev_l2, prev_l2 & 0xFFFF_F000,
+                                va_idx,   va_l2,   va_l2   & 0xFFFF_F000,
+                            );
                         }
                     }
                 }

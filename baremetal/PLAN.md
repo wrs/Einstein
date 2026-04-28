@@ -242,29 +242,68 @@ deliberate stack-guard sharing.
    own UND/DABT scratch-slot writes (UND_SAVE_R0_IPA=0x04005F0C,
    DABT_SAVE_PA=0x04005FA0) trapping at stage-2.
 
-### Next iteration — confirm ROM-baked L2 PT, then choose fix layer
+8. **ROM-baked L2 PT confirmed.** Added a one-shot dump in
+   verify-mmu's first-alias-per-PA log path that reads the L1
+   entry's L2 PT and logs `(L2[prev_idx], L2[va_idx], L2_PT_PA,
+   ROM/RAM)`. Cold-boot result:
 
-Step 1: Add a one-shot dump at end of `stage2::init()` (or at
-first verify-mmu fire) reading PA=0x00001400..0x00001500. Log
-the first 64 L2 entries. Confirm L2[0x0] and L2[0x2] both
-contain PA=0x04004000-derived descriptors; repeat for L2[0x3]/
-L2[0x4] and L2[0x7]/L2[0x8].
+   ```
+   L1[0xc0]=0x00001411 → L2_PT@PA=0x00001400 (ROM)
+     L2[0x0]=0x0400403e (PA=0x04004000)  L2[0x2]=0x0400414e (PA=0x04004000)
+     L2[0x3]=0x0400503e (PA=0x04005000)  L2[0x4]=0x0400514e (PA=0x04005000)
+     L2[0x7]=0x0400603e (PA=0x04006000)  L2[0x8]=0x0400604e (PA=0x04006000)
+   ```
 
-Step 2: Choose fix layer:
-- (a) ROM-byte patches in `apply_717006_patches` overwriting the
-  duplicate L2 entries (cleanest if duplicate access isn't
-  actually used).
-- (b) Stage-2 PA splitting at the duplicate VA: detect the
-  duplicate at MMU-enable time, allocate a hypervisor backing,
-  copy contents, modify the *guest's* L2 entry at the alias VA
-  to point at the new PA. Both VAs remain RW; they no longer
-  alias.
-- (c) Investigate first: stage-2 trap on the duplicate VAs
-  (not target PAs) to enumerate read/write patterns. If both
-  VAs are used for distinct data, neither (a) nor (b) works.
+   The duplicate descriptor pairs share PA but have **different
+   subpage-AP bits**. They aren't redundant; they're permission
+   overlays that under ARMv4 gave each subpage exactly one VA
+   with privileged-RW access. Decoding the L2[0x0]/L2[0x2] pair:
+   - 0x0400403e: AP=(11,00,00,00) — subpage 0 RW; rest sys
+   - 0x0400414e: AP=(00,01,01,00) — subpages 1-2 priv-RW
 
-Recommend the order (c) → (a)|(b) once access patterns are
-characterised.
+   Our `fix_stage1_xn_bits` flattens both to AP=11 → both VAs
+   become full RW → real PA alias under ARMv7. This is the
+   *deliberate* ARMv4-era design colliding with our normalization.
+
+   Group-2 dumps confirm the same subpage-AP pattern but with
+   RAM-resident L2 PTs at PA=0x04025400/0x04025800 (kernel-
+   installed per-task page tables) — populated at runtime by
+   the TTask::Init → LockHeapRange → RememberMapping chain.
+
+### Next iteration — Option α: drop one VA, observe what breaks
+
+Try the cheapest fix first: ROM-patch the duplicate L2 entries
+to invalid (zero). Removes the second VA mapping; subpages
+1-3 of each Group-1 PA lose their priv-RW grant. If the kernel
+doesn't actually use the alternate-VA priv-RW access, we win
+3 aliases and Group-1 is solved. If it does, the failure mode
+(immediate fault at a known PC) tells us exactly which subpage
+matters.
+
+Steps:
+
+1. Add a function `apply_l1c0_l2pt_dedup` to `rom_patches.rs` that
+   writes 0 to the ROM L2 PT at PA=0x00001400 + {8, 0x10, 0x20}
+   (= L2[0x2], L2[0x4], L2[0x8]). The ROM backing is owned by
+   EL2 even though stage-2 maps ROM RO to the guest; we write
+   directly into the host-side backing.
+2. Call from `apply_717006_patches` after the existing ROM
+   patches. Verify the patch with a re-read assertion.
+3. Cold-boot. Expect:
+   - verify-mmu Group-1 alias count: 3 → 0
+   - boot reaches at least the prior reboot canary
+   - if not, capture the FAR + ELR of the new fault — that's the
+     subpage user.
+4. Run guest tests.
+
+If Option α breaks boot, pivot to Option β (stage-2 PA splitting
+with shadow-on-write) for Group-1 — INVESTIGATION.md has the
+design sketch.
+
+Group-2's 12 aliases remain parked until Group-1 is zero;
+Group-2 will then be addressed via stage-2 PA splitting (Option C
+from prior plan) — same approach as Option β but applied to the
+RAM-resident L2 PT entries.
 
 Group-2's 12 aliases remain parked until Group-1 is zero.
 Group-2 will then be revisited with **Option C: stage-2 PA

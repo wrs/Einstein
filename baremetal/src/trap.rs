@@ -1205,6 +1205,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::DAH_OR_CHAIN_HVC_IMM => {
             handle_dah_or_chain_probe(ctx);
         }
+        v if v == crate::rom_patches::PAGE_GET_PROBE_HVC_IMM => {
+            handle_page_get_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1633,6 +1636,21 @@ fn handle_und(ctx: &mut TrapContext) {
         }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::NEW_STATE_PROBE_HVC_IMM) => {
             handle_new_state_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::PAGE_GET_PROBE_HVC_IMM) => {
+            // TUDomainManager::Get post-SWI probe at ROM 0x00258EFC
+            // (the `teq r0, #0` after `bl MonitorDispatchSWI`).
+            // Reached via the UND-trampoline path because Get is
+            // most-often called from a USR task during fault
+            // resolution, where AArch32 HVC is undefined. Update the
+            // saved SPSR_und N/Z bits in-place so the trampoline tail
+            // restores them correctly when ERETing back to the
+            // following `ldreq r1, [sp]; streq r1, [r4]`.
+            handle_page_get_probe_with(ctx, spsr_und as u32);
+            let updated = compute_teq_z_n(spsr_und as u32, ctx.x[0] as u32);
+            let _ = write_guest_word_pa(UND_SAVE_SPSR_IPA, updated);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -2771,6 +2789,138 @@ fn handle_dah_or_chain_probe(ctx: &mut TrapContext) {
     // Emulate `ldr r1, [pc, #1588]`: r1 = literal at (pc + 8 + 1588) =
     // 0x393954 = 0x0C100FF8. Write low 32 bits of ctx.x[1].
     ctx.x[1] = (ctx.x[1] & 0xFFFF_FFFF_0000_0000) | (g_kernel_globals_va as u64);
+}
+
+/// `TUDomainManager::Get` post-SWI probe (PAGE_GET_PROBE_HVC_IMM = 0x53).
+///
+/// Patches the `teq r0, #0` at ROM `0x00258EFC` with `HVC #0x53` so we
+/// observe every kernel page-allocator return. Logs the (caller_lr,
+/// returned_PA, count, domain_field) tuple and detects duplicate-PA
+/// returns across calls — the suspected source of stack-vs-heap
+/// aliasing under the FMNewStack 36-KiB patch attempt. Then emulates
+/// the original `teq r0, #0` by setting SPSR_EL2 N/Z so the following
+/// `ldreq r1, [sp]; streq r1, [r4]` continue correctly.
+///
+/// Args buffer layout (3 words on source-mode SP, populated by the
+/// Get prologue at 0x258EE4):
+///   sp+0  IN: *0x0c101054 (gPagePoolHandle)   OUT: returned PA
+///   sp+4  IN: count   (= 2 in NewStack path)
+///   sp+8  IN: this+24 (domain field)
+///
+/// Source mode: typically USR (most kernel calls into Get come from
+/// user tasks during stack/heap fault resolution); occasionally SVC.
+/// `banked::sp_for_mode` resolves `sp` to the correct AArch32 banked
+/// register from EL2 view.
+fn handle_page_get_probe(ctx: &mut TrapContext) {
+    // HVC at USR is undefined and traps via the UND trampoline; from
+    // SVC it traps directly to EL2. probe_source_cpsr resolves either.
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    let source_cpsr = probe_source_cpsr(spsr_el2);
+    handle_page_get_probe_with(ctx, source_cpsr);
+    // Update the SPSR that ERET will restore so the original
+    // `teq r0, #0` flag effect is preserved for the following
+    // `ldreq r1, [sp]; streq r1, [r4]`.
+    apply_page_get_teq_flags(spsr_el2, ctx.x[0] as u32);
+}
+
+/// Apply `teq r0, #0` flag effects (Z = r0==0, N = bit 31 of r0; C, V
+/// unchanged) to whichever SPSR storage will end up in CPSR after
+/// ERET. From SVC the resume flows through SPSR_EL2; from USR (UND
+/// trampoline path) the resume flows through SPSR_und stored at
+/// UND_SAVE_SPSR_IPA — write back there.
+fn apply_page_get_teq_flags(spsr_el2: u32, r0: u32) {
+    let mode_at_trap = spsr_el2 & 0x1F;
+    if mode_at_trap == crate::banked::MODE_UND {
+        // Trampoline path: source CPSR lives in the UND-save slot.
+        let saved = read_guest_word_pa(UND_SAVE_SPSR_IPA).unwrap_or(spsr_el2);
+        let updated = compute_teq_z_n(saved, r0);
+        let _ = write_guest_word_pa(UND_SAVE_SPSR_IPA, updated);
+    } else {
+        // Direct EL2 entry: ERET reloads SPSR_EL2 into CPSR.
+        let updated = compute_teq_z_n(spsr_el2, r0);
+        unsafe {
+            core::arch::asm!(
+                "msr spsr_el2, {0:x}",
+                in(reg) updated as u64,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+}
+
+fn compute_teq_z_n(cpsr: u32, r0: u32) -> u32 {
+    let mut s = cpsr;
+    s &= !(0b11u32 << 30);
+    if r0 == 0 { s |= 1 << 30; }
+    if (r0 & 0x8000_0000) != 0 { s |= 1 << 31; }
+    s
+}
+
+fn handle_page_get_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    let r0 = ctx.x[0] as u32;
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let mode = source_cpsr & 0x1F;
+
+    // Walk Get's APCS frame to recover the original caller's LR. Get
+    // saved {r4, fp, ip, lr, pc} via push at entry then `sub fp, ip,
+    // #4`; the LR slot is at fp - 4. fp = R11 (non-banked) lives in
+    // ctx.x[11]. By the time this HVC fires (PC=0x258EFC, mid-function),
+    // R14 has been clobbered by `bl MonitorDispatchSWI`, so reading
+    // ctx.x[14] gives 0x258EFC (= the BL return address), not the
+    // caller of Get.
+    let fp = ctx.x[11] as u32;
+    let caller_lr = guest_mem::read_word_va(fp.wrapping_sub(4))
+        .unwrap_or(0xDEAD_DEAD);
+
+    let returned_id  = guest_mem::read_word_va(sp).unwrap_or(0xDEAD_BEEF);
+    let count_arg    = guest_mem::read_word_va(sp.wrapping_add(4)).unwrap_or(0xDEAD_BEEF);
+    let domain_field = guest_mem::read_word_va(sp.wrapping_add(8)).unwrap_or(0xDEAD_BEEF);
+
+    static SEEN_FIRST_LR: [core::sync::atomic::AtomicU32; 0x10000] = {
+        const ZERO: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        [ZERO; 0x10000]
+    };
+    static CALL_COUNT: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+    static DUP_LOG_BUDGET: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(64);
+
+    let n = CALL_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+    if r0 == 0 {
+        // The kernel returns a "page id" (Newton TUPageManager handle),
+        // NOT a RAM PA. The encoding is opaque from this layer; check
+        // for any return-value duplication directly. Page ids are
+        // observed in the [0x100, 0x10000) range during boot — fits
+        // a 64 K-entry table cheaply.
+        let key = (returned_id & 0xFFFF) as usize;
+        let prev = SEEN_FIRST_LR[key].swap(
+            if caller_lr == 0 { 0xFFFF_FFFE } else { caller_lr },
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        if prev != 0 && prev != caller_lr {
+            let budget = DUP_LOG_BUDGET
+                .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+            if budget > 0 {
+                kprintln!(
+                    "page-get DUP: id={:#x} now_lr={:#010x} prev_lr={:#010x} call#{} count={} domain_field={:#010x}",
+                    returned_id, caller_lr, prev, n, count_arg, domain_field,
+                );
+            }
+        }
+        if n < 64 {
+            crate::dprintln!(
+                "page-get: #{} id={:#010x} count={} domain_field={:#010x} caller_lr={:#010x} sp={:#010x} fp={:#010x} mode={:#x}",
+                n, returned_id, count_arg, domain_field, caller_lr, sp, fp, mode,
+            );
+        }
+    } else if n < 64 {
+        crate::dprintln!(
+            "page-get ERR: r0={:#x} caller_lr={:#010x} count={} domain_field={:#010x}",
+            r0, caller_lr, count_arg, domain_field,
+        );
+    }
 }
 
 fn dump_flash_bytes(ipa: u32, count: u32) {

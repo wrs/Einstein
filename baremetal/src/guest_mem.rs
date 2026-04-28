@@ -314,6 +314,31 @@ pub fn fix_stage1_xn_bits() -> bool {
     let mut fine_to_fault = 0usize;
     let mut rom_writes = 0usize;
 
+    // Verification scaffolding (2026-04-28): on every XN-fix walk, sanity-check
+    //   (a) no L2 small/large-page entry has a heterogeneous ARMv4 subpage-AP
+    //       encoding (all four 1-KiB subpages must share the same AP[1:0]),
+    //       i.e. the kernel is no longer relying on subpage AP for isolation
+    //       after our 1-KiB-allocator patches; and
+    //   (b) no RAM physical page is mapped by more than one VA.
+    // Both are silent when clean; print a *summary* line on the first call
+    // that surfaces violations and the running totals on each subsequent
+    // call where the count changes — so a stable boot stays quiet.
+    //
+    // Subpage-AP heterogeneity check uses the ORIGINAL ARMv4 entry (read
+    // before normalisation). Aliasing check uses the original PA bits.
+    //
+    // RAM has 1024 4-KiB pages (RAM_SIZE / 4 KiB = 4 MiB / 4 KiB). Use a
+    // local 1024-entry stack array as a `pa_page_idx → first VA seen` map;
+    // 0 means the slot is free (no real VA maps to address 0 via stage-1).
+    let mut subpage_ap_mixed = 0usize;
+    let mut alias_count = 0usize;
+    let mut alias_first_pa: u32 = 0;
+    let mut alias_first_va_a: u32 = 0;
+    let mut alias_first_va_b: u32 = 0;
+    let ram_pages = RAM_SIZE / 4096;
+    let mut va_for_pa = [0u32; 1024];
+    debug_assert!(ram_pages <= va_for_pa.len(), "ram_pages exceeds verification table");
+
     let scratch_l1_idx = (crate::shadow_stub::SCRATCH_POOL_VA >> 20) as usize;
 
     // L1 sits at the start of guest RAM (TTBR0 = 0x0400_0000 per probe).
@@ -406,6 +431,51 @@ pub fn fix_stage1_xn_bits() -> bool {
                 2 | 3 => (e & 0xFFFF_F000) | 0x0000_003E, // small page, XN=0
                 _ => unreachable!(),
             };
+
+            // ---- Verification (a): subpage-AP heterogeneity ----
+            // ARMv4 small/large-page L2 layout encodes four per-1-KiB-subpage
+            // AP[1:0] fields at bits [11:10] (sub3), [9:8] (sub2), [7:6]
+            // (sub1), [5:4] (sub0). All four must match — heterogeneity
+            // means the kernel is partitioning a 4-KiB page into per-subpage
+            // owners, which our flatten-to-AP=011 step destroys. After the
+            // 1-KiB-allocator patches we expect ZERO heterogeneous entries.
+            // We check before we rewrite (`new` strips these bits).
+            if typ == 2 || typ == 3 || typ == 1 {
+                let sub0 = (e >> 4) & 0b11;
+                let sub1 = (e >> 6) & 0b11;
+                let sub2 = (e >> 8) & 0b11;
+                let sub3 = (e >> 10) & 0b11;
+                if !(sub0 == sub1 && sub1 == sub2 && sub2 == sub3) {
+                    subpage_ap_mixed += 1;
+                }
+            }
+
+            // ---- Verification (b): PA→VA aliasing ----
+            // For every small-page entry that maps a RAM PA, record the
+            // VA. If we see two distinct VAs for the same PA, log it. We
+            // check small-page entries only (typ == 2 || typ == 3); large
+            // pages span 16 entries with the same PA so they'd false-alias
+            // against themselves and require a different walker — out of
+            // scope for now (the 717006 ROM hardly uses large pages).
+            if typ == 2 || typ == 3 {
+                let pa = e & 0xFFFF_F000;
+                if (RAM_BASE_USIZE..RAM_BASE_USIZE + RAM_SIZE).contains(&(pa as usize)) {
+                    let page_idx = ((pa as usize) - RAM_BASE_USIZE) / 4096;
+                    let va = ((i << 20) | (j << 12)) as u32;
+                    let prev_va = va_for_pa[page_idx];
+                    if prev_va == 0 {
+                        va_for_pa[page_idx] = va;
+                    } else if prev_va != va {
+                        if alias_count == 0 {
+                            alias_first_pa = pa;
+                            alias_first_va_a = prev_va;
+                            alias_first_va_b = va;
+                        }
+                        alias_count += 1;
+                    }
+                }
+            }
+
             if new != e {
                 unsafe { ptr.write(new); }
                 patched += 1;
@@ -413,6 +483,55 @@ pub fn fix_stage1_xn_bits() -> bool {
                     rom_writes += 1;
                 }
             }
+        }
+    }
+
+    // Logging policy: this function fires on every M-toggle (very hot).
+    // Noisy logs drown the boot trace. RATCHET upward only — print when
+    // either count exceeds the highest value ever seen, never on dips.
+    // For subpage_ap_mixed (which grows continuously as the kernel
+    // installs more L2 tables) gate on power-of-2 watermark crossings
+    // to limit log volume to ~12 lines for a full boot. For
+    // alias_count (rarer events) print every new high. The "first
+    // alias" details are static across walks so we print them once
+    // alongside the first non-zero alias_count.
+    // Single-threaded EL2 → static mut is fine.
+    static mut HIGH_SUBPAGE_MIXED_BUCKET: usize = 0;
+    static mut HIGH_ALIAS_COUNT: usize = 0;
+    static mut FIRST_ALIAS_LOGGED: bool = false;
+    let bucket = if subpage_ap_mixed == 0 { 0 } else { subpage_ap_mixed.next_power_of_two() / 2 };
+    let (subpage_log, alias_log, alias_details_log) = unsafe {
+        let prev_bucket = HIGH_SUBPAGE_MIXED_BUCKET;
+        let prev_alias = HIGH_ALIAS_COUNT;
+        let prev_alias_details = FIRST_ALIAS_LOGGED;
+        let mut log_subpage = false;
+        let mut log_alias = false;
+        let mut log_details = false;
+        if bucket > prev_bucket {
+            HIGH_SUBPAGE_MIXED_BUCKET = bucket;
+            log_subpage = true;
+        }
+        if alias_count > prev_alias {
+            HIGH_ALIAS_COUNT = alias_count;
+            log_alias = true;
+            if !prev_alias_details && alias_count != 0 {
+                FIRST_ALIAS_LOGGED = true;
+                log_details = true;
+            }
+        }
+        (log_subpage, log_alias, log_details)
+    };
+
+    if subpage_log || alias_log {
+        crate::kprintln!(
+            "verify-mmu: subpage-AP-mixed={} RAM-aliased-pages={}",
+            subpage_ap_mixed, alias_count,
+        );
+        if alias_details_log {
+            crate::kprintln!(
+                "  first alias: PA={:#010x} mapped by VA1={:#010x} and VA2={:#010x}",
+                alias_first_pa, alias_first_va_a, alias_first_va_b,
+            );
         }
     }
 

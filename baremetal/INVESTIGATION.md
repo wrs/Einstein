@@ -78,6 +78,54 @@ hypothesis. The wedge must have a different cause (corrupted alrt
 task state, missing handler, or downstream of a still-unidentified
 divergence with Einstein).
 
+## MMU verification scaffold + first cross-check + Einstein cross-check (2026-04-28)
+
+This iteration added two cross-checks to `fix_stage1_xn_bits` per
+the user's directive ("verify at each MMU flush / XN fix that there
+are no subpage allocations and no RAM PA has > 1 VA"):
+
+**Findings — subpage-AP-mixed.** The kernel writes ~1178 mixed-AP
+L2 entries by the time we wedge. Our `fix_stage1_xn_bits` flattens
+every one of them to AP=011 immediately, so they're harmless: the
+kernel believes subpage AP is enforcing isolation but the hardware
+has no clue. The count is informational — it's not an "allocator
+we forgot to patch", it's how the kernel's allocator is *designed*
+to work and we transparently neutralise it.
+
+**Findings — RAM-aliased-pages.** 5 baseline aliases at boot start,
++7 more over ~30 s of activity (final count 12). First one always
+PA=0x04004000 ↔ VA 0x0c000000 / 0x0c002000 — kernel-globals area,
+looks like an L2-table backing page deliberately self-mapped via
+two VAs. None of the aliases land in the user-heap VA range
+(0x0cca... / 0x0cce... where the wedge fires), confirming the
+ZapHeap and NewHeap patches eliminated the user-allocation aliasing
+that drove the RelocHeap header corruption.
+
+Implementation: `src/guest_mem.rs::fix_stage1_xn_bits`. The full
+output formatter (ratchet-only, 11 lines per boot) is documented
+in PLAN.md "## MMU verification scaffold".
+
+**Einstein cross-check.** `build/NewtonProbe newton.rom Einstein.rex
+60` shows the `alrt` task is **BLK** (blocked) for the entire 60-second
+window; never reaches `IdleProc → CheckAlertDone → CheckButton`.
+Snapshot:
+```
+[BLK] task 0x0c115db4 id=0x1d33 prio=10 name='alrt' globals=0x0cca3738 q=0/0 wq1=0/0 wq2=0/0
+```
+Our hypervisor's alrt task is in IdleProc when the wedge fires —
+i.e., we **scheduled** it when Einstein doesn't. Possibilities:
+- We deliver an extra event/message that wakes the alrt port.
+- We never set up the blocking semaphore properly so alrt's Acquire
+  call returns immediately.
+- Our scheduler picks alrt from RDY when Einstein keeps it BLK.
+
+This explains the wedge: our alrt task IS running CheckButton, hits
+a junk CList entry, and faults. **The fix probably isn't to make
+CheckButton tolerant of junk; it's to figure out why alrt is
+RUNNING in the first place.** Next iteration should diff our
+scheduler / port / message-delivery state vs. Einstein's around the
+alrt task entry.
+
 ## Faulting site decoded — `CheckButton__12TAlertDialogFv` reading `this->[+12]` with this=0xE3360000 (2026-04-28)
 
 This iteration's deeper diagnosis (without code changes) localised

@@ -42,6 +42,69 @@ quiesces on the same path without ever getting there.
 
 ## Pending follow-ups
 
+### Stage-2 RO carve-out works pre-rebind, mysteriously silent post-rebind (2026-04-27, late evening)
+
+`src/heap_watch.rs` now installs a stage-2 RO carve-out on the
+4 KiB page backing `VA=0x0ca6b000` the first time SetCurrentHeap
+is called with `r0=0x0ca6b010`. On every guest write to the page,
+`handle_data_abort` checks `is_carved_out_ipa`, logs the writer's
+ELR + IPA + value (when ISV=1), and arms a re-RO at the next trap
+so subsequent writes also fault.
+
+**Major finding: VA → PA rebind.** At boot, VA `0x0ca6b000` maps
+to PA `0x0401f000`. Soon after NewHeap finishes init, the kernel
+rebinds the same VA to PA `0x04032000` (different host backing).
+A fixed-PA carve-out goes stale across the rebind; `maybe_rearm`
+walks stage-1 every trap and re-arms on the new PA when the
+rebind is detected.
+
+**Pre-rebind sample (256 perm-faults captured, log-cap):**
+The kernel writes the heap page from many sites — `0x003108d0`,
+`0x00310c18`, `0x00311dec`, `0x003ae1d0`, `0x00259610`, `0x000cb5c8`,
+`0x0013d180`, `0x0015e0ec`, `0x0015e228`, `0x003ae204`, `0x003940b4`,
+`0x0025ba98`, `0x003ae238`, `0x003ae410`, `0x00149328`, `0x00382714`,
+`0x001f8ab8`, `0x001f8b8c`, `0x003826f0`, `0x00310a30`, `0x00130644`,
+`0x00259c3c`, `0x00259bbc`, `0x003ae3ac`, `0x003ae3bc`, `0x00143210`,
+`0x000cb248`, `0x0038612c`, `0x000e6e68`, `0x00318eec`, `0x000e51b0`,
+plus REx PCs `0x00f0ee28`, `0x00f10ee8`, `0x00f75ca8`. All are
+allocator-internal — `__nw__FUi`, `NewBlock`, `Acquire`/`SemOp`,
+`SetHeapInfo`, etc. — touching the block-data tail of the heap
+page (offsets 0x500..0xfff), not the corrupted header window
+(offsets 0x10..0x28).
+
+**Post-rebind: zero perm faults captured on the new PA.** L3
+entry readback right after the rebind confirms `0x0183277f` —
+RW=0b01 (RO), AF=1, valid + page descriptor, host PA `0x01832000`.
+Yet between transitions #2 and #3 (heap[+0] going `0x0ca6b000 →
+0x002dd804`), no `handle_data_abort` perm-fault path fires for
+PA `0x04032xxx`. The heap_watch transition itself observes the
+new value with `pa_now = armed = 0x04032000`, so the read goes
+through the same PA — ruling out another silent rebind.
+
+Open question for the next iteration: why does the new PA's RO
+mapping fail to trap writes? Hypotheses:
+
+- **Stage-1 RO upstream:** the kernel's stage-1 maps `0x0ca6b000`
+  RO at user mode, sending writes through stage-1 DABT (handled
+  by the kernel's own DAH via the `0x10` trampoline) before
+  stage-2 ever sees the access. Verify by reading the L1/L2
+  entry for VA `0x0ca6b000` from `heap_watch::sample`.
+- **Different VA aliasing:** the corrupting write goes through a
+  different VA (e.g., `0x0c000000+` segment paged-mapped) whose
+  IPA differs from `0x04032000`. A second alias would then need
+  a parallel carve-out — but this would still need to land in
+  the 4 MiB stage-2 RAM aperture, which the perm-fault path
+  catches.
+- **Stage-2 cache or AP-mismatch issue:** the descriptor reads
+  back as RO but the hardware TLB is keyed differently. Adding a
+  blanket `tlbi vmalls12e1` after `set_ram_page_ro_x` would
+  rule it out.
+
+The pre-rebind data already demonstrates the carve-out is sound;
+the new investigation thread is "why does the rebind defeat it",
+which is itself revealing about how Newton's stage-1 management
+interacts with hypervisor-side stage-2.
+
 ### Source-tagged ring buffer: 0xffff58 captures are HVC returns, not IRQ noise (2026-04-27, evening)
 
 `heap_watch::Source` (sync vs. irq) is now packed into bit 63 of each

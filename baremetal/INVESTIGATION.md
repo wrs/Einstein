@@ -220,45 +220,112 @@ the kernel is intentionally sharing boundary pages, not by
 mistake. The fix is at the allocator (FMNewStack) layer — make
 each stack allocate non-overlapping 4 KiB pages.
 
-## Next iteration — narrow user-mode SWI #12 caller, draft FMNewStack patch
+## SWI save-area walk — user-mode aliasing source is `TTask::Init`
 
-### Step 1: walk SWIBoot save area for user-mode PC
+`docs/STRUCTURES.md` "TTaskSavedContext" documents the SWIBoot
+save layout at `&TTask + 0x10`:
 
-The Prim probe records `upstream_lr=0x000d8e3c` for all real
-aliases — this is *inside* GenericSWIHandler. The user-mode caller
-PC (the `swi #12` issuing instruction's PC) is preserved by the
-SWI entry vector in the per-task SWIBoot save area before
-GenericSWIHandler runs. Walking that area at probe time gives the
-user-mode function name (likely `FMNewStack`, `LockHeapRange`, or
-`Remember (static)` direct invocations).
+- `TTask + 0x4c` = saved_pc (LR_svc, the post-SVC return PC)
+- `TTask + 0x48` = lr_usr (USR caller-of-active-function LR)
+- `TTask + 0x3c` = fp_usr (active USR fp at SWI time)
 
-Approach:
-- At `handle_prim_remember_probe_with` entry, source-mode is SVC
-  (user→SWI dispatch). `sp_for_mode(ctx, SVC)` already gives us
-  the SVC stack pointer.
-- The Newton kernel's SWI vector pushes USR R0..R15 onto SP_svc
-  before branching to GenericSWIHandler. The exact layout is
-  documented in `docs/STRUCTURES.md` ("SWI dispatch") or
-  `Emulator/`'s SWI handling. Read off saved-PC (= the
-  instruction-after-`swi #12`).
-- Group aliases by user-mode caller. The most-frequent caller is
-  the primary patch target.
+`curr_task = *(0x0c100ff8)` (gKernelGlobals). New helper
+`read_swi_caller()` in `src/trap.rs` reads all three. The Prim
+Remember probe now logs `(user_pc, user_lr, user_caller)` on
+every Prim ALIAS line, where `user_caller = *(fp_usr - 4)` —
+the saved-LR slot of the active USR function's APCS frame, i.e.
+who BL'd into the function that issued the SWI.
 
-### Step 2: design FMNewStack patch
+### Result — `TTask::Init` dominates
 
-Once the user-mode caller is identified, draft a per-stack
-exclusivity patch. Two patterns to consider, given the previous
-36-KiB attempt's slot-size collision with the heap domain:
+Cold-boot run, 55 `Prim ALIAS:` lines across 12 PAs. user_caller
+distribution:
 
-a. **Pad allocation, don't change slot stride.** Allocate 36 KiB
-   physical (9 × 4 KiB) but keep the 32-KiB stride in VA — the
-   trailing 4 KiB is unmapped between stacks.
-b. **Force stack VA stride = 36 KiB.** Adjust the per-task stack
-   base computation so adjacent stacks don't share a 4 KiB
-   boundary; reverts to 32-KiB stride only if the slot-size
-   constraint can be addressed elsewhere.
+| user_caller | function | aliased PAs | count |
+|---|---|---:|---:|
+| `0x002523bc` | `TTask::Init` post-`bl LockHeapRange` (1st) | 6 | 22 |
+| `0x002523d4` | `TTask::Init` post-`bl LockHeapRange` (2nd) | 5 | 9 |
+| `0x00124280` | `TMuxStoreMonitor::Init` | 2 | 4 |
+| `0x003109e4` | `ExtendVMHeap` | 2 | 4 |
+| `0x0c1118c8` | (RAM, REx-resident) | 2 | 4 |
+| `0x00114078` | `TheMain::TLoader` (boot) | 1 | 2 |
+| `0x001423d8` | `NewVMHeap` | 1 | 2 |
+| `0x001f8b34` | `LockStack` | 1 | 1 |
+| `0x00311f04` | `NewDirectBlock` | 1 | 2 |
+| `0x0004b0fc` | `TCardAsyncMsg` ctor | 1 | 4 |
+| `0x0c119d4c` | (RAM, REx-resident) | 1 | 2 |
 
-### Step 3: Group-1 stage-2 RO trap (still needed)
+`TTask::Init` is responsible for **11 of 12** aliased PAs. The
+two BL sites at `0x002523b8` and `0x002523d0` are the per-task
+`LockHeapRange` calls that pin the just-allocated stack into
+resident memory:
+
+```
+0x25238c: bl NewStack             ; allocate stack VA range
+0x2523b4: str r0, [r4, #248]      ; task[+0xf8] = stack_base - 0x54
+0x2523b8: bl LockHeapRange        ; lock entire stack range → user_caller=0x2523bc
+0x2523c4: ldr r0, [r4, #248]      ; r0 = stack_base - 0x54
+0x2523c8: add r1, r0, #48         ; r1 = stack_base - 0x24
+0x2523d0: bl LockHeapRange        ; lock 48-byte header range → user_caller=0x2523d4
+```
+
+LockHeapRange triggers per-page resolve-fault handlers that call
+`RememberMapping` for each page in the range. Because Newton
+stacks have a 32-KiB VA stride and a 33-KiB usable size,
+**adjacent stacks share a 4 KiB boundary page** — the last page
+of stack N is the first page of stack N+1 in VA space. Under
+ARMv4 subpage AP each stack owned a 1-KiB subpage of the
+shared 4-KiB physical page; ARMv7 has no subpage AP, our
+`fix_stage1_xn_bits` flattens to AP=011, so the boundary page
+becomes a true PA alias.
+
+The tail of the distribution (1-2 PAs each) covers the same
+class of problem in other allocator paths: heap creation
+(`NewVMHeap`, `ExtendVMHeap`, `NewDirectBlock`), driver init
+(`TMuxStoreMonitor::Init`, `TCardAsyncMsg`), boot loader
+(`TheMain::TLoader`), and the `LockStack` user-mode shim.
+
+`user_lr=0x00258efc` is consistent across all aliases — that's
+inside `TUDomainManager::Get`'s post-`bl MonitorDispatchSWI`
+PC. `Get` is the user-mode page-allocator shim; LockHeapRange's
+fault-resolve path goes through it via SWI dispatch.
+
+## Next iteration — design FMNewStack non-sharing patch
+
+The aliases are not a kernel bug — they're a *deliberate* ARMv4
+subpage-AP-era design that doesn't translate to ARMv7. Three
+patch directions, in increasing scope:
+
+### Option A: per-stack 4-KiB boundary padding (preferred)
+
+Make every stack allocation grab one extra 4-KiB page beyond its
+33-KiB needed size, but keep VA stride at 32 KiB (stacks remain
+densely packed in VA space). The extra page sits "between"
+adjacent stack VAs as guaranteed-unmapped padding so no boundary
+PA is ever shared. Touch points:
+- `NewStack` at `0x001BD7BA4`. Increase the size argument or
+  intercept the SWI to round up to 36 KiB.
+- The previous 33→36-KiB attempt failed because the size
+  constant is shared with the heap domain page-table size.
+  Audit how the size flows to verify whether the 36-KiB padding
+  can be applied at the BL-NewStack site only (i.e. patching
+  `r1` at 0x25238c) without affecting the heap domain.
+
+### Option B: stack VA stride widening
+
+Push adjacent stacks 36 KiB apart in VA so their pages never
+overlap. Affects `NewStack`'s VA-pick algorithm; harder than
+Option A because the VA stride is implicit in many places.
+
+### Option C: stage-2 PA splitting
+
+At the hypervisor level, when the guest's L2 maps two different
+VAs to the same PA, transparently allocate a duplicate stage-2
+backing page and re-route one of the VAs through that. Avoids
+ROM patching entirely; complexity is in the COW-style write
+shadowing. Probably overkill for this case.
+
+### Step Group-1 stage-2 RO trap (still needed)
 
 The 3 Group-1 aliases (PA=0x04004000, 0x04005000, 0x04006000) come
 from the kernel's L1 PT page (TTBR0 self-map) and the first two

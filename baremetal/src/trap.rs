@@ -2985,6 +2985,35 @@ fn handle_page_get_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
     }
 }
 
+/// Recover user-mode call-chain anchors from the SWI save area for
+/// the currently-running task. SWIBoot at `0x3ad864..0x3ad8dc`
+/// saves (per `docs/STRUCTURES.md` "TTaskSavedContext"):
+///   - LR_svc → `curr_task + 0x4c` (saved_pc; SWI's "return PC")
+///   - FP_usr → `curr_task + 0x3c` (active USR fp at SWI time)
+///   - LR_usr → `curr_task + 0x48` (USR caller-of-thunk LR)
+/// `curr_task = *(gKernelGlobals)` at VA `0x0c100ff8`.
+///
+/// Returns `(saved_pc, lr_usr, caller_of_active_lr)`. The third
+/// field is `*(fp_usr - 4)` — the saved-LR slot of the active USR
+/// function's APCS frame, i.e. who BL'd into the function that
+/// issued the SWI. Each field is `None` if any required dereference
+/// fails (e.g. SWI was from SVC, the USR stack page isn't mapped,
+/// or the chain is otherwise unsound).
+fn read_swi_caller() -> (Option<u32>, Option<u32>, Option<u32>) {
+    let gkg = match guest_mem::read_word_va(crate::rom_patches::G_KERNEL_GLOBALS_VA) {
+        Some(v) => v,
+        None => return (None, None, None),
+    };
+    let saved_pc = guest_mem::read_word_va(gkg.wrapping_add(0x4c));
+    let lr_usr   = guest_mem::read_word_va(gkg.wrapping_add(0x48));
+    let fp_usr   = guest_mem::read_word_va(gkg.wrapping_add(0x3c));
+    let caller_of_active = match fp_usr {
+        Some(fp) if fp != 0 => guest_mem::read_word_va(fp.wrapping_sub(4)),
+        _ => None,
+    };
+    (saved_pc, lr_usr, caller_of_active)
+}
+
 /// Per-PA → first-VA tracker shared by the Prim Remember/Forget
 /// probes. `PRIM_FIRST_VA_FOR_PA[idx] == 0` means "no current
 /// mapping recorded"; non-zero is the VA the kernel last installed
@@ -3049,6 +3078,20 @@ fn handle_prim_remember_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
     let upstream_lr = guest_mem::read_word_va(r_fp.wrapping_sub(4))
         .unwrap_or(0xDEAD_DEAD);
 
+    // For SWI-dispatched calls (upstream_lr inside GenericSWIHandler),
+    // the actual user-mode caller is preserved in the per-task
+    // SWIBoot save area. saved_pc = LR_svc = post-SVC return PC
+    // (often the trampoline at 0x01a00024 or MonitorDispatchSWI's
+    // `mov pc, lr` at 0x003ae324). lr_usr = the USR caller of the
+    // SWI-issuing helper. caller_of_active = saved-LR slot in the
+    // active USR function's APCS frame, i.e. who BL'd into the
+    // function that issued the SWI — this is the layer above
+    // TUDomainManager::Get / similar memory-management shims.
+    let (user_pc_opt, user_lr_opt, caller_of_active_opt) = read_swi_caller();
+    let user_pc      = user_pc_opt.unwrap_or(0);
+    let user_lr      = user_lr_opt.unwrap_or(0);
+    let user_caller  = caller_of_active_opt.unwrap_or(0);
+
     // PA recovery: the kernel does `ldr r0, [r2, #16]!; lsr r0,
     // r0, #12; lsl r7, r0, #12` — i.e. PA = *(r2+16) & ~0xFFF.
     // The low 12 bits encode per-page attributes (e.g. bit 9 =
@@ -3086,8 +3129,8 @@ fn handle_prim_remember_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
                 .fetch_sub(1, Ordering::Relaxed);
             if budget > 0 {
                 kprintln!(
-                    "Prim ALIAS: PA={:#010x}  VA1={:#010x} (upstream_lr={:#010x})  VA2={:#010x} (upstream_lr={:#010x})  mask={:#x} perm={:#x}",
-                    phys, prev_va, prev_lr, va, upstream_lr, mask, perm,
+                    "Prim ALIAS: PA={:#010x}  VA1={:#010x} (upstream_lr={:#010x})  VA2={:#010x} (upstream_lr={:#010x} user_pc={:#010x} user_lr={:#010x} user_caller={:#010x})  mask={:#x} perm={:#x}",
+                    phys, prev_va, prev_lr, va, upstream_lr, user_pc, user_lr, user_caller, mask, perm,
                 );
             }
         }

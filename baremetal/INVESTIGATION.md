@@ -4,6 +4,54 @@ Live notes for the next iteration. Replace this file's body when the
 current stop is fixed and a new one takes over — git history is the
 archive of past investigations.
 
+## Full alias enumeration: PA 0x04032000 mapped to THREE distinct VAs across two tasks + heap (2026-04-28)
+
+This iteration adds `enumerate_va_aliases(target_pa, cap)` in
+`src/heap_watch.rs`. At sanity-halt it walks all 4096 L1
+entries; for each coarse, walks all 256 L2 entries; reports
+every VA whose mapping resolves to `target_pa`.
+
+Cold-boot result with carve-out armed at PA 0x04032000:
+
+```
+--- alias enumeration: every VA mapping to PA 0x04032000 ---
+  ALIAS: VA=0x0ca6b000 L1[0xca]=0x0401c081 L2[0x6b]=0x0403203e (small)
+  ALIAS: VA=0x0cc82000 L1[0xcc]=0x04023481 L2[0x82]=0x0403203e (small)
+  ALIAS: VA=0x0cce4000 L1[0xcc]=0x04023481 L2[0xe4]=0x0403203e (small)
+--- alias enumeration done: 3 VAs map to PA 0x04032000 ---
+```
+
+Identification:
+- VA=0x0ca6b000 → heap region (NewHeap call #3 base, allocated
+  at boot for the legitimate RelocHeap)
+- VA=0x0cc82000 → newt's user-stack region (newt globals near
+  0x0cc8276c per the probe log)
+- VA=0x0cce4000 → **pssm task's globals/stack region**. The
+  Einstein probe log shows `task 0x0c12043c id=0x2d83 prio=10
+  name='pssm' globals=0x0cce4ce8` — the alias VA is exactly
+  inside pssm's globals page.
+
+So the kernel's page-pool re-issued PA 0x04032000 **at least
+twice** for stack-grow events on different tasks (newt and
+pssm), after originally allocating it to the heap.
+
+This is a textbook page-pool double-issue — and combined with
+the prior wrapper-revert diagnostic finding, points cleanly
+at the wrapper's interaction with `FindOrAllocPage` /
+`TUPageManager::Get`. Note: VAs 0x0cc82000 and 0x0cce4000
+are both in L1[0xcc]'s coarse table, so they share the same
+L2 table at PA 0x04023400 — that's a single L2 page with two
+entries pointing at the same destination PA. The kernel
+deliberately wrote the same PA into both slots; it's not an
+L2-table corruption.
+
+Next concrete probe: instrument the kernel's page allocator
+at its return point to capture every PA returned across the
+boot. If PA 0x04032000 appears more than once, we've localised
+the bug to the kernel's free-list bookkeeping (driven by
+something our wrapper does that Einstein's stock path
+doesn't).
+
 ## Wrapper-revert diagnostic: wrapper IS needed AND IS likely the aliasing trigger (2026-04-28)
 
 This iteration ran PLAN.md step 1: temporarily commented out

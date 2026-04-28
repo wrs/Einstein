@@ -175,7 +175,68 @@ NOTE: Fix all compiler warnings before committing, to keep context clean.
   on QEMU; `--platform fvp` runs the same suite on the FVP. Both
   must stay green. See "Verification" near the end of this file.
 
-## Current stop — RelocHeap header corruption in newt's MakeStoreObject path
+## Current stop — NULL-deref write at IPA=0x3 from PC=0x00f76368 (downstream of SearchFreeList no-fit)
+
+The previous SearchFreeList wedge (RelocHeap header corruption,
+captured in `INVESTIGATION.md` — kept for reference) is now
+side-stepped: `guest_bp::handle_user_bp_und` for ROM `0x00313308`
+detects a wild freelist node (`r0` doesn't translate) and ELRs
+straight to the function's "no-fit" exit at `0x00313360` with
+`r0 = 0`. The kernel's `__nw__FUi` then takes its usual
+out-of-memory path. Boot progresses an additional ~2400 trace
+lines past the old wedge.
+
+The new halt:
+
+```
+dabt-trip: PC=0x00f76368 mode=usr writing 0x00000082 -> IPA=0x3
+           r0=0x82 r1=0x60000110 r2=0x002dfa20 r3=0x001a48f0
+           r4=0x0ca6b12c r5=0x7c r6=0x0 r7=0x6c r8=0x70
+           r12=0x3 sp(usr)=0x0cc81f3c lr(usr)=0x00311e1c
+*** unknown MMIO write halted ***
+  IPA = 0x00000000  B  value=0x00000082  @ELR=0xf76368
+```
+
+Notes:
+
+- IPA=0x3 is unmapped — looks like a NULL-deref of a
+  `(NULL + 3)` byte address. r12=0x3 in the dump.
+- ELR `0x00f76368` sits in the ROM gap past REx tail (~0x847000)
+  and past the function-tracer pool (0x00E00000) — i.e. addresses
+  the disassembly doesn't cover. Likely an indirect dispatch
+  through a function pointer that resolved to 0x00f76368 via the
+  bogus heap header (we still see `r4=0x0ca6b12c` = heap+0x11c
+  on the user stack, and `r2=0x002dfa20`/`r3=0x001a48f0` — both
+  ROM PCs that were in the corrupted header).
+- `lr_usr=0x00311e1c` is the return address into `__nw__FUi`'s
+  caller. The stack still carries the bad heap pointer at top
+  (`stack[sp]=0x0ca6b010`), so the caller is still operating on
+  the corrupted RelocHeap.
+
+Concrete next steps:
+
+1. Decode what's at PC `0x00f76368`. Strategies:
+   - Read the four ROM words at `0x00f76368` and surrounding via
+     `guest_mem::read_word_pa` or a one-shot kprintln in
+     `kmain` — these aren't in the rom.dis but they exist in the
+     16 MiB ROM image, so they're readable.
+   - The PC sits inside the gap between REx tail and the
+     function-tracer pool. That gap is normally zeros, so a
+     non-zero ELR there means the gap has been written to —
+     either by ROM patching or by a tracer trampoline we don't
+     remember installing. Check.
+2. If the dispatch is from a corrupted vtable / function-pointer
+   table on the bad heap, the right intervention is upstream:
+   make `__nw__FUi`'s no-fit recovery path (the new arm we just
+   added) ALSO clear the bad heap from `gCurrentHeap` so future
+   allocations don't read it. Look at how `SetCurrentHeap` is
+   called in the recovery path.
+3. Cross-check against Einstein with the same SearchFreeList
+   intercept (Einstein doesn't need it — the corruption doesn't
+   happen there — but observing what state Einstein is in at the
+   equivalent boot offset gives us a target).
+
+## Earlier stop — RelocHeap header corruption in newt's MakeStoreObject path
 
 The bus-error throw inside `CardFaultMonProc` (0x4e528) is triggered
 upstream by a DABT at `SearchFreeList` PC=0x00313308 with
@@ -303,6 +364,7 @@ Concrete next steps:
 
 | Date | Wedge | Resolution |
 |------|-------|------------|
+| 2026-04-27 | SearchFreeList bus-error throw on wild freelist node (RelocHeap header corruption — full chronology in `INVESTIGATION.md`) | `guest_bp` arm at ROM `0x00313308` detects untranslatable r0 and ELRs to `0x00313360` (the function's no-fit exit) with r0=0. `__nw__FUi` takes its existing out-of-memory recovery path. Boot progressed past the wedge to a downstream NULL-deref at PC=0x00f76368. |
 | 2026-04-27 | NULL-pointer SWP via `Swap(0,1)` at ROM `0x3ae204` (kernel `Acquire(NULL)` glue inside `VccOff__FiUl`) — stage-2 perm fault on write to ROM aperture, ISV=0 | trap.rs `try_absorb_rom_write`: mirror Einstein `TMemory::WriteP` (TMemory.cpp:1755-1766), drop the store; for SWP/SWPB also run the load piece into Rd. Boot reached steady-state idle. Test: `guest-tests/tests/test_swp_rom_aperture.S`. |
 | 2026-04-27 | TEncodingMap.+16 = 0x20000110 (out-of-stage-2 IPA) at `ConvertToUnicodeFunc_Contiguous8` | mmio.rs: `0x20000000..0x30000000` "unknown bank #5" silent-zero matching Einstein's `TMemory::ReadP` (TMemory.cpp:1026-1034). Boot advanced 10× → reaches TInterpreter. |
 | 2026-04-27 | `Reboot` canary inside `TInterpreter::TInterpreter` — DFSC=5 at FAR=0x0cd07400 on lazy-L1 section grow during `TRefStructStack::Fill` (L1[0xCD]=0x90 lazy marker) | γ-fix in `handle_diag`: read L1.domain from the faulting VA's L1 entry and write it into DFSR_EL1.bits[7:4] before forwarding to DAH (ARMv7 leaves Domain UNK on DFSC=5; kernel was reading 0). |
@@ -396,15 +458,16 @@ the boot is steady-state-quiet:
 - Bring-up VA walks in `handle_diag`.
 - BootOS / PowerOffAndReboot / Reboot canaries in `rom_patches.rs`.
 - `guest_bp` installs from `kmain`: `0x00313308` (SearchFreeList
-  bus-error tripwire — halts on wild r0 with heap+freelist dump),
+  ldr — emulates the load when r0 translates, ELRs to 0x00313360
+  (no-fit exit) when r0 doesn't translate, allowing the kernel's
+  out-of-memory recovery to handle it instead of bus-error-throwing),
   `0x001a4948` (TRefStack post-NewStack r0/r4 + sp/lr probe),
   `0x00142df0` (SetCurrentHeap entry r0/lr probe — always logs when
   r0=0x0ca6b010), `0x00310e24` (NewHeap entry r0(base)/r1(size)/lr —
   always logs when r0=0x0ca6b000). All four arms in
   `handle_user_bp_und` emulate the patched-out instruction and
   re-occupy the slot, so the marker UDF stays armed for the whole
-  boot without per-hit ROM churn. Remove once the RelocHeap header
-  corruption writer is identified.
+  boot without per-hit ROM churn.
 - `heap_watch::sample` (`src/heap_watch.rs`) called from
   `trap_sync_lower_aarch32` and `trap_irq` entry — samples
   `heap[0x0ca6b010]` every trap, maintains a 32-slot ring buffer

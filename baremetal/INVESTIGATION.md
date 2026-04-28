@@ -4,23 +4,110 @@ Live notes for the next iteration. Replace this file's body when the
 current stop is fixed and a new one takes over — git history is the
 archive of past investigations.
 
+## NewtonProbe cross-check: Einstein keeps RelocHeap valid throughout boot (2026-04-28)
+
+Wired the cross-check from the previous iteration's PLAN.md: added
+`heap_header_dump` to `baremetal/probe/probe.cpp`, dumping
+`heap[0x0ca6b010..+0x80]` every 2 s alongside the existing
+`task_dump`. Built with `cmake --build build --target NewtonProbe`,
+ran `build/NewtonProbe baremetal/roms/newton.rom _Data_/Einstein.rex
+60` and captured `/tmp/probe-heap-dump.log`.
+
+Result: Einstein's RelocHeap header is **stable and valid for the
+entire 60 s window**. Identical bytes captured at t=2 s, 4 s, ..,
+30 s+ (one ephemeral difference at t=2 s — heap[+0x1c]=0x124 vs.
+0x90 thereafter — consistent with normal allocator activity, not
+corruption). The invariants hold:
+
+```
+heap[+0x00]  0x0ca6b000 0x0ca6cc00 0x736b6961 0x0c600c10
+heap[+0x10]  0x0ca6b010 0x00000000 0x00000000 0x00000090
+heap[+0x20]  0x0ca6cb60 0x0ca6cb60 0x00200000 0x00001c00
+heap[+0x30]  0x00003000 0x00001c00 0x00000400 0x00000001
+heap[+0x40]  0x00000040 0x0c984314 0x0ca6cb60 0x00000000
+heap[+0x50]  0x00000000 0x00000000 0x00000000 0x00000000
+heap[+0x60]  0x00000000 0x0c116e7c 0xfffffdec 0xfffffde8
+heap[+0x70]  0x00000000 0x00000000 0x00000000 0x00000000
+```
+
+- `heap[+0x00]` = 0x0ca6b000 = heap-16 (base) — invariant ✓
+- `heap[+0x08]` = 0x736b6961 = 'skia' magic — invariant ✓
+- `heap[+0x10]` = 0x0ca6b010 — self-pointer, also valid
+- `heap[+0x18]` = 0x00200000 = 2 MiB (heap size) — matches NewHeap #3 args ✓
+- `heap[+0x40]` = 0x40 = 64 (constant from NewHeap init) — invariant ✓
+- `heap[+0x44]` = 0x0c984314 — pointer into NewHeap #2's region ✓
+- `heap[+0x64]` = 0x0c116e7c — TULockingSemaphore wrapper ✓
+- VA→PA: VA 0x0ca6b010 → PA 0x040a6010, **never rebound** across
+  ~30 dumps (in our hypervisor the same VA hops PA 0x0401f000 →
+  0x04032000 partway through boot — that's already a divergence).
+
+**Direct comparison against our wedge-time corrupted dump** (from
+the SearchFreeList wild-r0 halt, recorded earlier in this file):
+
+| offset | Einstein     | Hypervisor    | divergence |
+|--------|--------------|---------------|------------|
+| +0x00  | 0x0ca6b000   | 0x002dd804    | ROM PC into TStoreObjectWriter |
+| +0x04  | 0x0ca6cc00   | 0x001a48f0    | ROM PC into TRefStack ctor |
+| +0x08  | 0x736b6961   | 0x0c645f0c    | 'skia' magic clobbered |
+| +0x0c  | 0x0c600c10   | 0x0cc825d8    | stack-pointer-shaped value |
+| +0x10  | 0x0ca6b010   | 0x00000000    | self-pointer cleared |
+| +0x14  | 0x00000000   | 0x0cc825e0    | stack ptr |
+| +0x18  | (2 MiB size) | 0x0cc82510    | stack ptr |
+| +0x1c  | 0x00001c00   | 0x0cc82038    | stack ptr |
+| +0x20  | 0x0ca6cb60   | 0x002dfa20    | ROM PC into MakeStoreObject |
+| +0x24  | 0x0ca6cb60   | 0x002dd7c4    | ROM PC into TStoreObjectWriter |
+| +0x44  | 0x0c984314   | 0x0c9842b4    | similar pointer, different value |
+| +0x64  | 0x0c116e7c   | 0x0c116e7c    | match (TULockingSemaphore wrapper) |
+
+**The bug is hypervisor-side.** The kernel correctly creates and
+maintains the RelocHeap on Einstein; our hypervisor is overwriting
+its header bytes with what looks like a saved exception frame
+(saved-LRs + stack pointers). The corrupted +0x00..+0x14 region
+matches the layout of an ARM stack frame `{r4, r5, r6, r7, fp, ip,
+lr, pc}` from an exception unwind — exactly the pattern visible
+in the corrupted bytes (ROM PCs at +0x00/+0x04/+0x20/+0x24, stack
+ptrs at +0x0c/+0x10/+0x14/+0x18).
+
+Hypothesis space (per PLAN.md option 2 candidates):
+
+1. **Stage-2 mapping issue** — already extensively investigated.
+   The carve-out shows pre-rebind perm faults work but
+   post-rebind silence. We know writes are landing through a path
+   that misses our perm-fault trap.
+2. **CP15 / cache-op handler corrupting RAM through a side
+   channel** — possible if a `dccmvac` / `dccsw` is operating
+   on the wrong target. Worth listing every CP15 handler that
+   touches RAM during the trap window.
+3. **shadow_stub byte-access patcher mis-emulating** — the wedge
+   PC `0x00f76368` is inside the SBA inline-stub pool, and we
+   know shadow_stub rewrites byte/halfword accesses ROM-side. If
+   one of those rewrites targets `[r4, #imm]` where r4 happens
+   to be the heap base on the failing call, the rewrite would
+   corrupt the header.
+4. **Banked-register / mode confusion** — when an exception fires
+   during heap-allocator code, we save banked regs to a region
+   that overlaps the heap header. If task[-16] points into the
+   heap header range, our banked-reg save path would clobber
+   it. Worth checking what `task[-16]` is at the moment of the
+   first heap-watch[3] transition.
+
+The most directly testable hypothesis is #4: cross-check whether
+the corrupted bytes look like banked regs we save during exception
+entry. heap[+0x00..+0x14] containing ROM PCs + stack pointers
+matches that hypothesis well — it IS what an SVC/IRQ frame would
+write to a stack region. If task[-16] for the running task aliases
+the heap base, every exception entry corrupts the header.
+
+Diagnostic scaffolding kept intact (heap-watch sentinel, stage-2
+RO carve-out, sanity check w/ halt re-enabled, stub-orig-PC
+decoder).
+
 ## Reverted iteration-6/10 symptom workarounds; refocus on root cause (2026-04-28)
 
 Iterations 6 (SearchFreeList wild-r0 → no-fit ELR redirect) and
 10 (gFallbackHeap substitution at SetCurrentHeap entry) were
 symptom workarounds that let the boot walk past wedges without
-fixing the underlying corruption. Both reverted in this commit.
-The kernel SHOULD be able to use the legitimate RelocHeap; the
-fact that it can't on our hypervisor (but does on Einstein, per
-prior iterations' implication) means there's a real divergence
-to find. The next iteration's primary task is the NewtonProbe
-cross-check called out in PLAN.md option 1 of the previous
-iteration's "next steps" — comparing Einstein's RelocHeap
-state at the equivalent boot offset to ours, byte-by-byte.
-
-Diagnostic scaffolding kept intact (heap-watch sentinel, stage-2
-RO carve-out, sanity check w/ halt re-enabled, stub-orig-PC
-decoder) — these are root-cause tools, not workarounds.
+fixing the underlying corruption. Both reverted.
 
 ## (Earlier) gFallbackHeap substitution gets boot past SetBlockSize, lands on CompactHeap→LockedBlock translation fault (2026-04-28)
 

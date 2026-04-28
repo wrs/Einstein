@@ -180,67 +180,87 @@ NOTE: Fix all compiler warnings before committing, to keep context clean.
   on QEMU; `--platform fvp` runs the same suite on the FVP. Both
   must stay green. See "Verification" near the end of this file.
 
-## Current stop — RelocHeap header corruption at PA 0x04032000+ (root-cause investigation)
+## Current stop — RelocHeap header corruption (hypervisor-side bug; cross-check confirmed)
 
 Reverted iterations 6's SearchFreeList no-fit redirect and 10's
 gFallbackHeap substitution. Both were symptom workarounds that
-let the boot walk past the wedge but masked the real divergence
-from how Einstein (and real Newton hardware) execute the same
-ROM. The kernel SHOULD be able to use the legitimate RelocHeap
-(NewHeap call #3, base=0x0ca6b000, size=2 MiB) — it was created
-correctly by `NewHeap` and registered with `SetCurrentHeap`.
-Something WE'RE doing causes its header to be overwritten with
-ROM PCs and stack values.
+masked the real divergence. The kernel SHOULD be able to use the
+legitimate RelocHeap (NewHeap call #3, base=0x0ca6b000, size=2 MiB);
+something on our side is overwriting its header with what looks
+like saved exception-frame bytes (ROM PCs + stack pointers).
 
-Diagnostic ground truth from prior iterations:
+**NewtonProbe cross-check (this iteration):** added
+`heap_header_dump` to `baremetal/probe/probe.cpp`, dumping
+`heap[0x0ca6b010..+0x80]` every 2 s alongside the existing
+periodic `task_dump`. Ran `build/NewtonProbe
+baremetal/roms/newton.rom _Data_/Einstein.rex 60`; captured 30+
+heap-dump samples spanning t=2 s through t=32 s.
 
-- Heap header is correctly initialised post-`NewHeap` (transition
-  #0 sees `heap[+0x10]=0x0ca6b000`, the expected base).
-- VA `0x0ca6b000` is rebound stage-1 from PA `0x0401f000` to
-  `0x04032000` partway through boot — this is the kernel's
-  normal page-management, but worth confirming Einstein does
-  the same.
-- Sanity check (heap[+0]=heap-16, heap[+8]='skia' magic) holds
-  through transition #2 and fails at transition #3 (heap[+0]
-  becomes a ROM PC `0x002dd804`).
-- FVP and QEMU produce the byte-identical corruption — not a
-  QEMU stage-2 enforcement bug. Both show prev-trap-elr =
-  `0x2dd7bc` (FVP) or `0xe4f168` (QEMU) immediately before the
-  wedge is observed.
-- Stage-2 carve-out captures hundreds of legitimate writes to
-  the heap, but the corrupting write rides the RW window opened
-  by `handle_data_abort`'s auto-flip after each perm fault and
-  is not individually trapped.
+Result: **Einstein's RelocHeap header is stable and valid for the
+entire 60 s window.** All invariants hold (`heap[+0]=base`,
+`heap[+8]='skia'`, `heap[+0x40]=64`, `heap[+0x18]=size=2 MiB`,
+`heap[+0x64]=TULockingSemaphore wrapper`). VA→PA stays at
+`0x040a6010` for the entire run — Einstein never rebinds, ours
+hops `0x0401f000 → 0x04032000`.
 
-The right next step (from the PLAN.md guidance) is **cross-check
-Einstein at the equivalent boot offset**:
+So **the bug is on our side.** See `INVESTIGATION.md` for the
+side-by-side byte diff. The corrupted offsets `+0x00..+0x14`
+match an ARM exception frame (saved `{r4..r7,fp,ip,lr,pc}` plus
+saved-SP) — the kernel SOMETHING saves an exception frame onto
+the heap header.
 
-1. **Run NewtonProbe with the same ROM/REx and dump the heap
-   header bytes at the equivalent stage of boot.** Build:
-   ```
-   cmake --build build --target NewtonProbe
-   build/NewtonProbe baremetal/roms/newton.rom _Data_/Einstein.rex 60
-   ```
-   Add a probe to NewtonProbe (or grep its existing log) that
-   captures heap[0x0ca6b010..+0x40] and the value of
-   `currentTask->globals[-16]` at the moment Einstein runs the
-   equivalent of our heap-watch transition #2 → #3 window.
-2. **If Einstein's heap stays valid**, the bug is hypervisor-
-   side. Likely candidates:
-   - A stage-2 mapping issue (we already verified L3 entry, but
-     could be a TLB or per-VA stage-1-stage-2 interaction).
-   - A CP15 / cache-op handler that's misbehaving and corrupting
-     RAM bytes through a side channel (e.g. dirty-cache flush
-     with wrong target).
-   - shadow_stub's BE-32 byte-access patcher mis-emulating an
-     instruction that targets the heap.
-3. **If Einstein corrupts it the same way**, the kernel has its
-   own recovery path (per the ROM source) that we need to mirror
-   instead of papering over. Find it by looking at what
-   Einstein does post-corruption and matching that behaviour.
+Hypothesis space, in rough order of testability:
 
-The current heap-watch / sanity-check / SBA-stub-decoder
-scaffolding is cheap and stays armed for the cross-check work.
+1. **Banked-register / mode-confusion: an exception entry saves
+   to a region that overlaps the heap header.** The most
+   plausible candidate. Worth probing first: capture
+   `currentTask->globals[-16]`, `task` itself, and the per-mode
+   banked SPs at the moment of the first sanity-check failure.
+   If any saved-SP value lands inside `0x0ca6b000..0x0ca6b080`,
+   the next exception entry would clobber the header.
+2. **shadow_stub byte-access patcher mis-emulating a store.**
+   The previous-iteration log shows the wedge stub at
+   `0x00f76368` emulates `strb r0, [r9]` from `SetBlockSize`.
+   Check whether any of the *legitimate* shadow_stub rewrites
+   on the path between heap-watch transition #2 and #3 target
+   a register that holds the heap base.
+3. **CP15 / cache-op corruption via a wrong-target write.**
+   List every CP15 handler invoked between transitions #2 and
+   #3; cross-check against Einstein's CP15 trace from the probe
+   log to see if we run any operation Einstein doesn't.
+4. **Stage-2 perm-fault auto-flip RW window dropping the trap.**
+   Already heavily investigated; FVP confirms it's not
+   QEMU-specific. The window is real but doesn't tell us what
+   *writes* into the window — exhaustive single-stepping is
+   the only way through this lane.
+
+Concrete next steps:
+
+a. **QEMU GDB-stub watchpoint on the heap header.** Run
+   `DEBUG=1 cargo run --release` (term 1), `aarch64-elf-gdb -x
+   scripts/gdb-init` (term 2), then `watch *0x04032010`. QEMU
+   instruments memory accesses at the TCG level; a watchpoint
+   on the post-translation IPA fires across EL boundaries on
+   guest stores. This is the lightest path to a writer-PC
+   capture. The IPA is `0x04032010` post-rebind; for the
+   pre-rebind window use `0x0401f010`. (FVP equivalent uses
+   the Iris debug server on host port 7100 with `--gdb`.)
+b. Add an exception-frame capture probe: at every trap entry,
+   if `task[-16]` points within `±0x80` of either heap base
+   (`0x0ca6b000` or any other live heap), log task-id, mode,
+   banked SPs, `task` VA. Answers hypothesis #1 directly,
+   without depending on QEMU watchpoint behaviour.
+c. Cross-reference shadow_stub's emulation log between
+   transitions #2 and #3 against the corrupted byte values.
+   If `r9` in the SetBlockSize stub equals the heap base at
+   any point, hypothesis #2 is localised.
+
+Diagnostic scaffolding (heap-watch sentinel, stage-2 RO
+carve-out, sanity-halt, stub-orig-PC decoder) stays armed.
+
+The probe extension itself (`heap_header_dump` in `probe.cpp`)
+stays in the tree; it's cheap and useful for any future
+heap-state cross-check.
 
 ## Earlier stop — wild jump into SBA inline-stub pool downstream of the no-fit recovery
 

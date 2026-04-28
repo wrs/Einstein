@@ -407,45 +407,131 @@ exposes kernel-globals data pages at two VAs each (likely an
 ARMv4 subpage-AP-era permission-overlay pattern: kernel-RW at
 one VA, kernel-RO-shared at another).
 
-## Next iteration — confirm ROM-baked L2 PT, design fix
+## ROM-baked L2 PT confirmed — and the duplicates are subpage-AP overlays
 
-### Step 1: confirm by direct inspection
+Added a one-shot dump path inside `verify-mmu`: when the alias
+detector first records PA P, it also reads the L1 entry's
+underlying L2 PT and logs `L2[prev_idx]` and `L2[va_idx]`
+(both descriptors), plus the L2 PT's location (ROM vs RAM).
 
-Add a one-shot dump at end of `stage2::init()` (or at first
-verify-mmu fire): read PA=0x00001400..0x00001500 and log the
-first 64 L2 entries. Confirm L2[0x0] and L2[0x2] both contain
-PA=0x04004000-derived descriptors. Repeat for the other two
-alias families.
+Cold-boot result confirms the hypothesis for **all 3 Group-1
+aliases**:
 
-### Step 2: choose fix layer
+```
+verify-mmu alias L1[0xc0]=0x00001411 → L2_PT@PA=0x00001400 (ROM)
+  L2[0x0]=0x0400403e (PA=0x04004000)  L2[0x2]=0x0400414e (PA=0x04004000)
+  L2[0x3]=0x0400503e (PA=0x04005000)  L2[0x4]=0x0400514e (PA=0x04005000)
+  L2[0x7]=0x0400603e (PA=0x04006000)  L2[0x8]=0x0400604e (PA=0x04006000)
+```
 
-Given the aliases are ROM-baked:
+L1[0xc0] = `0x00001411` (coarse PT, base = `0x05 << 10 =
+0x00001400`, in **ROM**). The L2 entry pairs at indices
+`(0x0,0x2)`, `(0x3,0x4)`, `(0x7,0x8)` are pre-baked at ROM
+build time and confirmed identical-PA-different-flags.
 
-a. **ROM patch.** Add ROM-byte patches to `apply_717006_patches`
-   that overwrite the duplicate L2 entries with either invalid
-   (= unmap one of the two VAs) or distinct-PA descriptors.
-   Risk: the duplicate is intentional — kernel-globals access
-   at the alias VA may have legitimate uses we'd break.
+### The duplicates are *subpage-AP permission overlays*
 
-b. **Stage-2 PA splitting at the duplicate VA.** Detect the
-   duplicate at MMU-enable time, hypervisor-allocate a fresh
-   backing PA, copy the kernel-globals contents into it, and
-   modify the *guest's* L2 entry at the alias VA to point at
-   the new PA. The guest still sees two writable mappings, but
-   they no longer alias the same physical page. Each subsequent
-   kernel write to either VA stays local; reads from the alias
-   VA may go stale, but if the kernel only ever *writes* through
-   one VA and never reads from the other (the typical permission-
-   overlay pattern), this is invisible.
+The two descriptors of each pair share the high 20 bits (PA)
+but differ in bits [11:0]. Decoding ARMv4 subpage AP encoding
+(bits [5:4] = AP[0] for subpage 0, [7:6] = AP[1], [9:8] = AP[2],
+[11:10] = AP[3]) for the L2[0x0]/L2[0x2] pair (PA=0x04004000):
 
-c. **Investigate first.** Before patching, characterise what
-   the kernel actually does with the alias VAs. Add a stage-2
-   trap on the duplicate VAs (not the target PAs) and log every
-   read and write to enumerate access patterns. If both VAs are
-   actively used for distinct data, neither (a) nor (b) works
-   and we need a different model.
+| descriptor | AP[0] | AP[1] | AP[2] | AP[3] |
+|------------|-------|-------|-------|-------|
+| 0x0400403e | 11    | 00    | 00    | 00    |  (RW   sys  sys  sys)
+| 0x0400414e | 00    | 01    | 01    | 00    |  (sys  pRW  pRW  sys)
 
-Recommend (c) → (a) or (b) based on the access pattern.
+Each subpage of PA=0x04004000 has exactly **one** VA with
+privileged-RW access:
+- subpage 0 (offset 0..1KiB)   → VA=0xc000000 (priv-RW)
+- subpage 1 (offset 1..2 KiB)  → VA=0xc002000 (priv-RW user-RO)
+- subpage 2 (offset 2..3 KiB)  → VA=0xc002000 (priv-RW user-RO)
+- subpage 3 (offset 3..4 KiB)  → neither (sys/priv-RO from both)
+
+This is the ARMv4 subpage-AP-era permission-overlay pattern: one
+physical page exposes different RW views through two VAs. Our
+`fix_stage1_xn_bits` flattens both to AP=11 → both VAs become
+full RW → real PA alias under ARMv7's no-subpage-AP rule.
+
+### Group-2 confirmation (RAM-resident, runtime)
+
+For comparison, the dump also fires for Group-2 aliases:
+```
+verify-mmu alias L1[0xcc]=0x04025481 → L2_PT@PA=0x04025400 (RAM)
+  L2[0x82]=0x0403303e (PA=0x04033000)  L2[0xad]=0x0403300e (PA=0x04033000)
+```
+Group-2 L2 PTs are in **RAM** at PA=0x04025400/0x04025800 — the
+kernel-installed per-task page tables. These match the prior
+diagnosis (TTask::Init → LockHeapRange → RememberMapping → PrimRememberMapping
+chain populates these L2 entries at runtime). For Group-2 aliases
+the L2 entries also have differing AP bits (e.g. 0x0403303e vs
+0x0403300e) confirming the same subpage-AP design pattern.
+
+## Next iteration — design choices given the subpage-AP overlay
+
+The duplicates are NOT spurious; the kernel deliberately
+relies on per-subpage access asymmetry. Three ordered options:
+
+### Option α — drop one VA, hope the kernel doesn't notice
+
+ROM-patch L2[0x2] (and 0x4, 0x8) to invalid (zero). The
+single-VA mapping loses the partial-RW semantics: subpages
+1-3 of PA=0x04004000 lose their priv-RW access (since AP[1..3]
+in L2[0x0] are all 00). Any kernel write through VA=0xc002000
+that depended on the AP=01 priv-RW grant would fault.
+
+Risk: high. The kernel may be relying on writes through
+VA=0xc002000 to subpages 1-2; killing the mapping would
+deadlock or fault-loop early.
+
+### Option β — stage-2 PA splitting
+
+For each Group-1 alias, hypervisor:
+1. Allocate a fresh PA (call it P') from a hypervisor-managed
+   pool (extra RAM or unused stage-2 region).
+2. At MMU-enable time, walk the guest stage-1 once, find the
+   duplicate L2 entry (e.g. L2[0x2]), and **rewrite it** in the
+   ROM backing to point at P' instead of P. The kernel sees
+   both VAs as RW-mappable (same as before our normalization).
+3. Copy initial contents PA → P' so reads return the same bytes.
+4. To preserve cross-VA write coherence, install stage-2 traps
+   on both PAs and shadow writes to the other.
+
+Complexity: high. Step 4 is essentially software cache
+coherence and may need care to avoid infinite trap loops.
+
+### Option γ — preserve subpage-AP semantics natively
+
+Don't flatten to AP=11 in `fix_stage1_xn_bits`; instead, walk
+each L2 descriptor and use stage-2 to enforce the per-subpage
+permission. Stage-2 has 4-KiB granularity, so we'd need to
+synthesise per-1-KiB sub-page mappings — but ARMv7 stage-2
+also has only 4-KiB granularity. So this is impossible without
+breaking up the page into 4× separate 4-KiB mappings, which is
+a major restructuring.
+
+### Recommendation
+
+Try **Option α** first as a probe: ROM-patch L2[0x2] to 0 and
+observe what breaks. If the kernel boots past the patch point
+without using subpage-1/2 of the affected pages (i.e. the
+permission overlay is unused at runtime), we win cheaply. If
+not, the failure mode tells us what data lives in those
+subpages and informs Option β's design.
+
+Implementation skeleton:
+1. Add a `g1_invalidate_duplicate_l2_entries` function that
+   modifies the ROM L2 PT bytes at PA=0x00001400+{0x8, 0x10,
+   0x20} (= L2[0x2]/L2[0x4]/L2[0x8]) to 0.
+2. Call it from `apply_717006_patches` after the existing
+   ROM patches.
+3. Cold-boot. Expect verify-mmu Group-1 count to drop from 3
+   → 0. Expect either (a) clean boot through to the prior
+   reboot canary, or (b) an early stall that names the
+   subpage-1/2 user (immediately diagnosable from the FAR).
+
+Group-2 will then be the only remaining aliasing. Plan there
+remains stage-2 PA splitting (Option C from prior plan).
 
 ### Group-2 still parked
 

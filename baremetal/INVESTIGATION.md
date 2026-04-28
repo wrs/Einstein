@@ -4,7 +4,25 @@ Live notes for the next iteration. Replace this file's body when the
 current stop is fixed and a new one takes over — git history is the
 archive of past investigations.
 
-## gFallbackHeap substitution gets boot past SetBlockSize, lands on CompactHeap→LockedBlock translation fault (2026-04-28)
+## Reverted iteration-6/10 symptom workarounds; refocus on root cause (2026-04-28)
+
+Iterations 6 (SearchFreeList wild-r0 → no-fit ELR redirect) and
+10 (gFallbackHeap substitution at SetCurrentHeap entry) were
+symptom workarounds that let the boot walk past wedges without
+fixing the underlying corruption. Both reverted in this commit.
+The kernel SHOULD be able to use the legitimate RelocHeap; the
+fact that it can't on our hypervisor (but does on Einstein, per
+prior iterations' implication) means there's a real divergence
+to find. The next iteration's primary task is the NewtonProbe
+cross-check called out in PLAN.md option 1 of the previous
+iteration's "next steps" — comparing Einstein's RelocHeap
+state at the equivalent boot offset to ours, byte-by-byte.
+
+Diagnostic scaffolding kept intact (heap-watch sentinel, stage-2
+RO carve-out, sanity check w/ halt re-enabled, stub-orig-PC
+decoder) — these are root-cause tools, not workarounds.
+
+## (Earlier) gFallbackHeap substitution gets boot past SetBlockSize, lands on CompactHeap→LockedBlock translation fault (2026-04-28)
 
 Wired option 1 from the previous PLAN.md: in the SetCurrentHeap probe
 arm at ROM `0x00142df0`, when `r0 == 0x0ca6b010`, read `gFallbackHeap`

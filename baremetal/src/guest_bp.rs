@@ -426,40 +426,6 @@ pub fn handle_user_bp_und(
         // already armed.
         if r0 == 0x0ca6_b010 {
             let _ = crate::heap_watch::arm_carve_out_at_heap_va(0x0ca6_b000);
-            // Cascade-stopper: substitute gFallbackHeap so the
-            // kernel operates on a sane heap rather than installing
-            // the corrupted RelocHeap in `task[-16]`. The fallback
-            // pointer lives at VA 0x0c101080 per GetCurrentHeap's
-            // disasm at ROM 0x00142da0.
-            //
-            // gFallbackHeap is what GetCurrentHeap already returns
-            // when `task[-16]` is null, so swapping in this value
-            // matches a path the kernel already exercises. Reads /
-            // writes against this heap go to actual valid heap
-            // memory, sidestepping NewBlock's "freelist position
-            // = 0x002dfa20 (a ROM PC)" cascade that lands at
-            // SetBlockSize's `strb r0, [r9]` with r9 garbage.
-            //
-            // We DON'T want to fully suppress SetCurrentHeap (e.g.
-            // by ELR-to-early-exit) because the kernel's
-            // bracketing pattern (NewHeap, NewHandle, CompactHeap,
-            // HUnlock) saves and restores `gCurrentHeap`; if we
-            // skip the save, the restore puts us on the wrong heap.
-            // Substituting r0 keeps the bracketing intact — every
-            // call sees fallback in / fallback out.
-            if let Some(fallback) = crate::guest_mem::read_word_va(0x0c10_1080) {
-                if fallback != 0 && fallback != 0x0ca6_b010 {
-                    static SUBSTITUTED: AtomicU32 = AtomicU32::new(0);
-                    let m = SUBSTITUTED.fetch_add(1, Ordering::Relaxed);
-                    if m < 4 {
-                        kprintln!(
-                            "  SetCurrentHeap: substituted r0=0x0ca6b010 -> gFallbackHeap={:#010x} (hit #{})",
-                            fallback, m,
-                        );
-                    }
-                    ctx.x[0] = fallback as u64;
-                }
-            }
         }
         // Emulate `ldr r1, [pc, #40]` — PC at execution = pc+8, so the
         // word loaded is at faulting_pc + 8 + 40. The ROM literal at
@@ -503,70 +469,11 @@ pub fn handle_user_bp_und(
                 return true;
             }
             None => {
-                // Wild freelist node: r0 doesn't translate to a real
-                // PA, so the next `ldr r3, [r0]` would fault deep
-                // inside SearchFreeList. Bypass the load and ELR
-                // straight to the function's "no-fit" exit path
-                // (ROM 0x00313360 — `mov r0, #0; ldmdb fp, ...`),
-                // which is the same path taken when the freelist
-                // truly has no chunk big enough. The caller
-                // (`__nw__FUi`) handles a NULL return by retrying
-                // against another heap or throwing `exMemFull` —
-                // both safer than the bus-error throw we got from
-                // the natural fault.
-                //
-                // Re-occupy the BP slot before ERET so the next
-                // SearchFreeList call also goes through this arm
-                // (most are valid; only wild-r0 cases redirect).
-                static WILD_HITS: AtomicU32 = AtomicU32::new(0);
-                let n = WILD_HITS.fetch_add(1, Ordering::Relaxed);
-                // Cascade-stopper: also clear `currentTask->globals[-16]`
-                // (= gCurrentHeap source) so the next GetCurrentHeap
-                // call falls back to gFallbackHeap. Otherwise the bad
-                // heap stays installed and downstream allocator paths
-                // dispatch through its corrupted vtable into shadow_stub
-                // SBA inline-stub pool — see the previous wedge at
-                // PC=0x00f76368.
-                //
-                // gCurrentTask pointer lives at VA 0x0c10105c per the
-                // GetCurrentHeap disasm at ROM 0x00142da0.
-                const G_CURRENT_TASK_VA: u32 = 0x0c10_105c;
-                let cleared = if let Some(task_ptr) =
-                    crate::guest_mem::read_word_va(G_CURRENT_TASK_VA)
-                {
-                    let heap_slot = task_ptr.wrapping_sub(16);
-                    let prev = crate::guest_mem::read_word_va(heap_slot)
-                        .unwrap_or(0);
-                    let ok = crate::guest_mem::write_word_va(heap_slot, 0);
-                    Some((task_ptr, heap_slot, prev, ok))
-                } else { None };
-
-                if n < 16 {
-                    kprintln!(
-                        "SearchFreeList wild r0={:#010x} → no-fit return (hit #{})",
-                        r0, n,
-                    );
-                    if let Some((task, slot, prev, ok)) = cleared {
-                        kprintln!(
-                            "  cleared gCurrentHeap: task={:#010x} slot={:#010x} prev={:#010x} write_ok={}",
-                            task, slot, prev, ok,
-                        );
-                    } else {
-                        kprintln!(
-                            "  could not read gCurrentTask ptr at {:#010x}", G_CURRENT_TASK_VA,
-                        );
-                    }
-                }
-                ctx.x[0] = 0;
-                lock();
-                // SAFETY: same as above — put the slot back.
-                unsafe {
-                    let table = &mut *core::ptr::addr_of_mut!(TABLE);
-                    table[slot_idx] = Slot { ipa: faulting_pc, orig: s.orig };
-                }
-                unlock();
-                trap::return_to_guest_from_und(ctx, 0x0031_3360, spsr_und);
-                return true;
+                kprintln!(
+                    "*** SearchFreeList wild r0={:#010x} (stage-1 translate failed) ***",
+                    r0
+                );
+                // Fall through to the dump-and-halt path below.
             }
         }
     }

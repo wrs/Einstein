@@ -4,6 +4,80 @@ Live notes for the next iteration. Replace this file's body when the
 current stop is fixed and a new one takes over — git history is the
 archive of past investigations.
 
+## 1-KiB allocator audit complete; ZapHeap patched but boot still wedges at alrt-task DABT (2026-04-28)
+
+**Goal of this iteration:** the user directed a sweep through every
+ROM site that allocates in 1-KiB pages, since the 717006 kernel
+relies on ARMv4 subpage-AP for cross-subpage isolation and ARMv7
+gives us no equivalent. Find them all, change them to 4 KiB.
+
+**Method:**
+1. Enumerated all 29 `LockHeapRange` call sites (9 grouped patterns A–E
+   in `docs/STRUCTURES.md`).
+2. Decoded TStackInfo and TStackPage layouts with ROM-PC citations
+   (also in STRUCTURES.md).
+3. Audited every kernel allocator (`SSafeHeapPage`, `SWiredHeapPage`,
+   `NewBlock`, `SetBlockSize`, `malloc`, `NewPtr`, `NewWiredPtr`,
+   `AllocNewPage`, `TUPageManager::Get`, `NewStack`, `NewHeapAt`,
+   `NewVMHeap`, `ExtendVMHeap`, `ZapHeap`) for explicit 1-KiB
+   chunking.
+
+**Findings:**
+- `NewVMHeap` default arm (1 KiB) is already neutralised by the prior
+  iteration's `0x1423A0 beq→nop` patch.
+- `NewHeapAt` passes `r2 = 1024` to NewHeap; intercepted by the prior
+  `NewHeap chunk_size=4096` patch.
+- `Init__13TStackManagerFv` passes 1024 to `TUDomainManager::Init` —
+  configuration thresholds, not allocations.
+- All inner-loop `#1024` uses inside `FMLockHeapRange`,
+  `FMSetHeapLimits`, `FreeSubPagesBetween`, etc. are per-subpage
+  iteration logic, not allocation requests.
+- All non-VM allocators (`SafeHeapPage`/`WiredHeapPage`/`NewBlock`/
+  `malloc`/`NewPtr`/`NewWiredPtr`) carve at 4-byte or whole-4-KiB
+  granularity — no 1-KiB-chunk paths.
+
+**The single remaining 1-KiB allocator: `ZapHeap` at `0x001428B8`.**
+The `moveq r4, #1024` arm fires when the caller's flag byte is 0
+and drives both the initial SetHeapLimits/LockHeapRange/UnlockHeapRange
+round-trip AND the chunk_size argument to NewHeap. The NewHeap
+chunk_size is overridden by our prior patch to 4096, but the initial
+1-KiB lock leaves only one of the page's four 1-KiB subpages claimed.
+**Patched this iteration:** `0x001428B8: 0x03A04B01 → 0xE3A04A01`
+(`moveq r4, #1024` → unconditional `mov r4, #4096`).
+
+**Result:** 36/36 guest tests pass; cold boot reaches the SAME
+alrt-task DABT wedge (NewHeap=7, NewStack=14, Reboot canary,
+FAR=0xe336000c). ZapHeap was not the root cause of this wedge but
+the patch is correct per the user's directive — every 1-KiB-chunking
+ROM site now uses 4 KiB.
+
+**Wrapper-attempt failure (kept for reference).** I prototyped a
+LockHeapRange-entry wrapper that aligns r0 (base) DOWN and r1
+(limit) UP to 4 KiB. Boot regressed to `gPlatformDriver->[+4]`
+overwritten with `0xea3fffbd` at PC `0x387ebc` (PauseSystem
+two-level vtable dispatch) — only NewHeap=5, NewStack=1 reached.
+Root cause: FMLockHeapRange's `parms[+8] != 0` flag-set loop also
+consumes the (r9, r8) range; widening it makes the loop write
+`[TStackPage+subpage]+44 = 1` for subpages owned by other
+stack_infos that happen to live in the extended range. For the
+~7 Pattern-A driver inits with `lock_id = 1`, this corrupts adjacent
+allocations' bookkeeping. The wrapper code stays in
+`apply_lock_heap_range_wrapper` (invocation pinned with `let _ =`)
+for archeology; do not re-enable.
+
+**Documentation.** All findings (29-caller catalogue, TStackInfo /
+TStackPage layouts with citations, FMLockHeapRange iteration
+mechanics, ResolveFault page-sharing logic, 1-KiB allocator audit)
+are now in `docs/STRUCTURES.md` under the new `## TStackManager`
+section.
+
+**Next iteration:** the alrt-task DABT at FAR=0xe336000c is still
+the wedge to investigate. Earlier notes on it are below; the new
+context is that we've now exhausted the "more 1-KiB allocators"
+hypothesis. The wedge must have a different cause (corrupted alrt
+task state, missing handler, or downstream of a still-unidentified
+divergence with Einstein).
+
 ## Heap-aliasing wedge RESOLVED — force VM-heap chunk_size=4 KiB via NewHeap + NewVMHeap patches (2026-04-28)
 
 The user's surgical fix: bypass the kernel's 1 KiB subpage-AP

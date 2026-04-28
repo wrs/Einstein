@@ -467,71 +467,127 @@ chain populates these L2 entries at runtime). For Group-2 aliases
 the L2 entries also have differing AP bits (e.g. 0x0403303e vs
 0x0403300e) confirming the same subpage-AP design pattern.
 
-## Next iteration — design choices given the subpage-AP overlay
+## Option α probe — wedges immediately, but the wedge is informative
 
-The duplicates are NOT spurious; the kernel deliberately
-relies on per-subpage access asymmetry. Three ordered options:
+Implemented Option α as PATCHES_717006 entries zeroing L2[0x2],
+L2[0x4], L2[0x8] in the ROM L2 PT at PA=0x00001400.
 
-### Option α — drop one VA, hope the kernel doesn't notice
+Cold-boot result: verify-mmu reported aliases dropped from 15 → 2,
+but boot wedged at FAR=0xc004fa0 in an infinite ResolveFault loop.
+The TWO surviving aliases revealed previously-undetected duplicates:
 
-ROM-patch L2[0x2] (and 0x4, 0x8) to invalid (zero). The
-single-VA mapping loses the partial-RW semantics: subpages
-1-3 of PA=0x04004000 lose their priv-RW access (since AP[1..3]
-in L2[0x0] are all 00). Any kernel write through VA=0xc002000
-that depended on the AP=01 priv-RW grant would fault.
+```
+L1[0xc0]=0x00001411 → L2_PT@PA=0x00001400 (ROM)
+  L2[0x0]=0x0400403e (PA=0x04004000)  L2[0x5]=0x0400440e (PA=0x04004000)
+  L2[0x3]=0x0400503e (PA=0x04005000)  L2[0x6]=0x04005c0e (PA=0x04005000)
+```
 
-Risk: high. The kernel may be relying on writes through
-VA=0xc002000 to subpages 1-2; killing the mapping would
-deadlock or fault-loop early.
+Decoding the *third* descriptor of each pair:
+- L2[0x5] = 0x0400440e: AP=(00,00,00,01) — subpage 3 priv-RW
+- L2[0x6] = 0x04005c0e: AP=(00,00,00,11) — subpage 3 RW
 
-### Option β — stage-2 PA splitting
+So each Group-1 PA actually has **three** L2 descriptors, each
+granting priv-RW to a *different* subpage:
+- PA=0x04004000: L2[0x0] (sp 0), L2[0x2] (sp 1+2), L2[0x5] (sp 3)
+- PA=0x04005000: L2[0x3] (sp 0), L2[0x4] (sp 1+2), L2[0x6] (sp 3)
+- PA=0x04006000: L2[0x7] (sp ?), L2[0x8] (sp ?), and probably one more
 
-For each Group-1 alias, hypervisor:
-1. Allocate a fresh PA (call it P') from a hypervisor-managed
-   pool (extra RAM or unused stage-2 region).
-2. At MMU-enable time, walk the guest stage-1 once, find the
-   duplicate L2 entry (e.g. L2[0x2]), and **rewrite it** in the
-   ROM backing to point at P' instead of P. The kernel sees
-   both VAs as RW-mappable (same as before our normalization).
-3. Copy initial contents PA → P' so reads return the same bytes.
-4. To preserve cross-VA write coherence, install stage-2 traps
-   on both PAs and shadow writes to the other.
+The duplicates are NOT redundant — they cover distinct subpages.
+Zeroing L2[0x4] unmapped subpage 3 of PA=0x04005000 from VA=0xc004XXX,
+and *something* in the system was reading/writing through that VA.
 
-Complexity: high. Step 4 is essentially software cache
-coherence and may need care to avoid infinite trap loops.
+## What was using VA=0xc004fa0?
 
-### Option γ — preserve subpage-AP semantics natively
+User asked: "what code is accessing that memory?". Answer (verified):
 
-Don't flatten to AP=11 in `fix_stage1_xn_bits`; instead, walk
-each L2 descriptor and use stage-2 to enforce the per-subpage
-permission. Stage-2 has 4-KiB granularity, so we'd need to
-synthesise per-1-KiB sub-page mappings — but ARMv7 stage-2
-also has only 4-KiB granularity. So this is impossible without
-breaking up the page into 4× separate 4-KiB mappings, which is
-a major restructuring.
+**Direct literal references in the kernel disasm to the relevant
+addresses are all ZERO:**
 
-### Recommendation
+```
+0x0c000000..0x0c008fff (entire L1[0xc0] self-map VA range): 0 hits
+0x0c004f00 (UND/SBA scratch base post-MMU):                  0 hits in code
+0x0c004fa0 (DABT scratch post-MMU):                          0 hits
+0x0c006fa0 (RW alias of PA=0x04005FA0 via L2[0x6]):          0 hits
+0x04005f00 (UND/SBA scratch base pre-MMU):                   0 hits
+0x04005fa0 (DABT scratch pre-MMU):                           0 hits
+```
 
-Try **Option α** first as a probe: ROM-patch L2[0x2] to 0 and
-observe what breaks. If the kernel boots past the patch point
-without using subpage-1/2 of the affected pages (i.e. the
-permission overlay is unused at runtime), we win cheaply. If
-not, the failure mode tells us what data lives in those
-subpages and informs Option β's design.
+(A few `stceq 15, ...` matches landed in REx data regions but
+those are constants in literal pools, not instructions.)
 
-Implementation skeleton:
-1. Add a `g1_invalidate_duplicate_l2_entries` function that
-   modifies the ROM L2 PT bytes at PA=0x00001400+{0x8, 0x10,
-   0x20} (= L2[0x2]/L2[0x4]/L2[0x8]) to 0.
-2. Call it from `apply_717006_patches` after the existing
-   ROM patches.
-3. Cold-boot. Expect verify-mmu Group-1 count to drop from 3
-   → 0. Expect either (a) clean boot through to the prior
-   reboot canary, or (b) an early stall that names the
-   subpage-1/2 user (immediately diagnosable from the FAR).
+**The only code that uses these VAs is OUR HYPERVISOR's
+trampolines:**
+- `install_und_vector_swap_post_mmu()` writes `0x0C00_4F00` into
+  the UND trampoline literal (offset +0x5C of UND_TRAMP).
+- Same function writes `0x0C00_4F00` into the SBA-post-emulation
+  trampoline literal.
+- And `0x0C00_4FA0` into the DABT trampoline literal.
 
-Group-2 will then be the only remaining aliasing. Plan there
-remains stage-2 PA splitting (Option C from prior plan).
+So the kernel-globals self-map at L1[0xc0] **is functionally
+inert** in the running kernel — no kernel code reads or writes
+through those VAs as literals. The PA targets
+(PA=0x04004000-0x04006000) DO receive writes from many kernel
+PCs (per the prior g1_capture probe — 25 distinct writers), but
+those accesses MUST go through some OTHER VA window we haven't
+enumerated (likely a different L1 section's L2 PT pointing at
+the same PAs). The L1[0xc0] mappings appear to be a vestigial
+ARMv4 design-intent that the kernel team wired up but the
+running code never exercises.
+
+### Why the wedge then?
+
+The wedge at FAR=0xc004fa0 is OUR hypervisor's DABT trampoline
+trying to `str lr, [r0]` where `r0 = 0x0c004fa0`. With L2[0x4]
+zeroed, that VA is unmapped → DABT → trampoline tries again at
+the same VA → infinite loop. We broke ourselves, not the kernel.
+
+### What the captures missed
+
+The g1_capture probe armed PA=0x04004000-0x04006000 directly,
+but the kernel writers of PA=0x04004000 (e.g. PC=0x001dd934
+writing 1..0x26) reach those PAs via stage-1 translation through
+non-L1[0xc0] L2 PTs we haven't located. To find them we'd need
+to walk the entire guest L2 PT space at runtime and look for
+every entry mapping any of the 3 PAs.
+
+## Next iteration — Option β-light: relocate hypervisor scratch
+
+The cheapest fix is to MOVE the hypervisor's UND/DABT/SBA
+trampoline scratch slots out of the L1[0xc0] self-map region,
+then re-attempt L2 dedup. With the trampolines using a
+different VA, zeroing L2[0x2]/0x4/0x5/0x6/0x8 should eliminate
+the Group-1 aliases without affecting boot.
+
+Steps:
+
+1. Pick a non-conflicting scratch location. Constraints:
+   - Mapped by the kernel post-MMU (so the trampolines work
+     after stage-1 enable).
+   - In a region the kernel doesn't access at runtime (so we
+     don't clobber kernel data).
+   - Reachable from all guest exception modes.
+
+   Candidate: existing shadow-stub scratch at IPA
+   `0x01800000-0x01A00000` (mapped via `L1[0x18]`, owned by the
+   hypervisor). Or pick a fresh page in unused RAM after the
+   L1 PT.
+
+2. Update `install_und_vector_swap_post_mmu()` and the scratch-
+   slot constants (UND_SAVE_LR_IPA, DABT_SAVE_PA, etc.) to
+   point at the new location. Apply matching pre-MMU values.
+
+3. Re-attempt the ROM-patch dedup of all duplicate L2 entries
+   in PA=0x00001400's L2 PT (L2[0x2], 0x4, 0x5, 0x6, 0x8, and
+   any third descriptor for PA=0x04006000 we haven't found yet).
+
+4. Cold-boot. Expect Group-1 aliases 3 → 0 with no wedge.
+
+If even after relocating our trampolines and zeroing the
+duplicates, kernel code somewhere accesses these VAs through
+non-literal indirection, the wedge will fire elsewhere — and
+that's still informative.
+
+Group-2 (12 aliases, RAM-resident L2 PTs) remains parked.
 
 ### Group-2 still parked
 

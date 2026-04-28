@@ -67,6 +67,20 @@ struct RomPatch {
 const PATCHES_717006: &[RomPatch] = &[
     RomPatch { offset: 0x0000_13F4, value: 0x0000_0001, name: "gDebugger patch" },
     RomPatch { offset: 0x0000_13FC, value: 0x0000_8202, name: "gNewtConfig patch" },
+    // (Option α attempt 2026-04-28: zeroing L2[0x2]/0x4/0x8 of the
+    // ROM L2 PT at PA=0x00001400 — the "second descriptor" of each
+    // Group-1 alias pair — wedges boot in an infinite ResolveFault
+    // loop at FAR=0xc004fa0 (= subpage 3 of PA=0x04005000 via the
+    // VA window L2[0x4] used to provide). The duplicates aren't
+    // redundant: each L2 descriptor grants priv-RW to a DIFFERENT
+    // subpage of the same PA, so removing one unmaps that subpage.
+    // Empirically there are MORE duplicates than the first walk
+    // shows (a third descriptor L2[0x5] for PA=0x04004000 grants
+    // pRW to subpage 3, L2[0x6] does the same for PA=0x04005000).
+    // Option α is fundamentally broken as a "drop the second VA"
+    // approach. Pivot is Option β = stage-2 PA splitting per
+    // descriptor with coherence shadowing. See INVESTIGATION.md
+    // "Option α attempt — wedges on subpage-3 unmap".)
     RomPatch { offset: 0x0008_A20C, value: 0xE1A0_F00E, name: "Ignore setting time" },
     RomPatch { offset: 0x000D_B0D8, value: 0xE3A0_0000, name: "BeaconDetect (1/2)" },
     RomPatch { offset: 0x000D_B0DC, value: 0xE1A0_F00E, name: "BeaconDetect (2/2)" },

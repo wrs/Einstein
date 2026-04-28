@@ -150,6 +150,10 @@ pub fn check_heap_sanity(heap_va: u32) -> Option<(&'static str, u32, u32)> {
 /// 4 KiB-aligned PA (= IPA in stage-2) currently armed RO. 0 = none.
 static CARVED_PA: AtomicU32 = AtomicU32::new(0);
 static REARM_PENDING: AtomicBool = AtomicBool::new(false);
+/// Set by `maybe_rearm` on a VA→PA rebind so the alias-onset
+/// detector (in `sample`) can reset its `prev` counter and fire
+/// fresh on the post-rebind PA's 1→2 alias transition.
+static REBIND_RESET_PENDING: AtomicBool = AtomicBool::new(false);
 static PERM_FAULT_HITS: AtomicU32 = AtomicU32::new(0);
 const PERM_FAULT_LOG_LIMIT: u32 = 256;
 
@@ -229,6 +233,51 @@ fn log_stage1_walk(va: u32) {
             );
         }
     }
+}
+
+/// Count VAs that map to `target_pa` without logging.
+/// Cheap version of `enumerate_va_aliases` for periodic alias-onset
+/// detection from the trap path.
+pub fn count_va_aliases(target_pa: u32) -> u32 {
+    let target_page = target_pa & 0xFFFF_F000;
+    let mut found: u32 = 0;
+    for l1_idx in 0..4096u32 {
+        let l1_pa = 0x0400_0000u32 + l1_idx * 4;
+        let l1 = match guest_mem::read_word_pa(l1_pa) {
+            Some(v) => v,
+            None => continue,
+        };
+        let l1_kind = l1 & 3;
+        match l1_kind {
+            2 => {
+                let section_pa = l1 & 0xFFF0_0000;
+                if section_pa == (target_page & 0xFFF0_0000) {
+                    found += 1;
+                }
+            }
+            1 => {
+                let l2_base = l1 & 0xFFFF_FC00;
+                for l2_idx in 0..256u32 {
+                    let l2_pa = l2_base + l2_idx * 4;
+                    let l2 = match guest_mem::read_word_pa(l2_pa) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let l2_kind = l2 & 3;
+                    let pa_field = match l2_kind {
+                        1 => l2 & 0xFFFF_0000,
+                        2 | 3 => l2 & 0xFFFF_F000,
+                        _ => continue,
+                    };
+                    if pa_field == target_page {
+                        found += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    found
 }
 
 /// Walk the entire kernel stage-1 (TTBR0=PA 0x0400_0000) and log
@@ -428,6 +477,10 @@ fn maybe_rearm() {
             );
         }
         CARVED_PA.store(pa_now, Ordering::Release);
+        // Signal the alias-onset detector to reset its prev count so
+        // it can fire on the post-rebind 1→2 transition independently
+        // of any pre-rebind alias state.
+        REBIND_RESET_PENDING.store(true, Ordering::Release);
         let l3 = crate::stage2::ram_page_l3_entry(pa_now).unwrap_or(0xDEADBEEF_DEADBEEF);
         kprintln!(
             "heap-watch: VA {:#010x} rebound — old PA={:#010x} → new PA={:#010x} (L3={:#018x})",
@@ -498,6 +551,69 @@ pub fn sample(elr_el2: u64, source: Source, ctx: &TrapContext, spsr_el2: u64) {
     // retried the faulting store under RW, the store landed, and now
     // the next store will trigger another fault → another log line.
     maybe_rearm();
+
+    // Alias-onset detector: every Nth trap, scan the kernel page
+    // tables and count how many VAs map to the carved-out heap PA.
+    // When the count first transitions from 1 to >1, we've caught
+    // the kernel re-issuing the page — halt with the trap-stream
+    // ring buffer to localise the responsible kernel call.
+    {
+        const SCAN_EVERY: u32 = 64;
+        static SCAN_COUNTER: AtomicU32 = AtomicU32::new(0);
+        static PREV_ALIAS_COUNT: AtomicU32 = AtomicU32::new(0);
+        static ONSET_REPORTED: AtomicU32 = AtomicU32::new(0);
+        let armed = CARVED_PA.load(Ordering::Relaxed);
+        if armed != 0 && ONSET_REPORTED.load(Ordering::Relaxed) == 0 {
+            // Consume rebind reset: forget the prev count from the
+            // old PA so the detector arms fresh on the new PA.
+            if REBIND_RESET_PENDING.swap(false, Ordering::AcqRel) {
+                PREV_ALIAS_COUNT.store(0, Ordering::Relaxed);
+            }
+            let n = SCAN_COUNTER.fetch_add(1, Ordering::Relaxed);
+            if n % SCAN_EVERY == 0 {
+                let count = count_va_aliases(armed);
+                let prev = PREV_ALIAS_COUNT.load(Ordering::Relaxed);
+                // Fire only on a strict increase from a known prior
+                // count (prev>0). The first scan establishes baseline
+                // without firing — that way the persistent
+                // pre-existing alias of PA 0x0401f000 (heaps #1 and
+                // #3 sharing a page from boot) doesn't trigger; only
+                // a NEW alias appearing later does.
+                if prev > 0 && count > prev {
+                    ONSET_REPORTED.store(1, Ordering::Relaxed);
+                    kprintln!(
+                        "*** alias ONSET: PA {:#010x} now mapped by {} VAs (was {}) ***",
+                        armed, count, prev,
+                    );
+                    kprintln!(
+                        "    at trap source={} elr={:#x}", source.label(), elr_el2,
+                    );
+                    enumerate_va_aliases(armed, 64);
+                    // Dump the trap-stream ring buffer so the operator
+                    // can see what just ran.
+                    let head = RING_HEAD.load(Ordering::Relaxed);
+                    let next_head = head.wrapping_add(1);
+                    for i in 0..RING_SIZE {
+                        let idx = next_head.wrapping_add(i) % RING_SIZE;
+                        let raw = RING[idx].load(Ordering::Relaxed);
+                        if raw != 0 {
+                            let src = if (raw & RING_SRC_IRQ_BIT) != 0 { "irq " } else { "sync" };
+                            let e = raw & !RING_SRC_IRQ_BIT;
+                            let sp = RING_SP[idx].load(Ordering::Relaxed);
+                            let mode = RING_MODE[idx].load(Ordering::Relaxed);
+                            kprintln!(
+                                "      ring[{:>2}] {}: mode={:#04x} elr={:#x} sp={:#010x}",
+                                i, src, mode, e, sp,
+                            );
+                        }
+                    }
+                    kprintln!("    *** halting at alias-onset detection ***");
+                    crate::cpu::halt();
+                }
+                PREV_ALIAS_COUNT.store(count, Ordering::Relaxed);
+            }
+        }
+    }
 
     // Always record this ELR + source-bit in the ring buffer, even
     // when the value hasn't changed. Parallel rings track the

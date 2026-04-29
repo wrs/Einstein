@@ -785,3 +785,74 @@ globals mirror so the kernel proceeds. Once we see the exact
 (a) Einstein-port behaviour, (b) ROM patch that splits the
 self-map onto two distinct PAs, or (c) hypervisor-synthesised
 second mapping.
+
+## PA=0x04034000 timeline probe — 2 simultaneous-live mappings, 3 transient
+
+Added `PRIM_FOCUS_PA=0x04034000` constant in `src/trap.rs`. Both the
+Remember and Forget probe handlers now log every call for this PA
+unconditionally, sharing a global sequence counter (`PRIM_FOCUS_SEQ`)
+so the Remember/Forget interleave shows true chronological order.
+
+### Cold-boot capture (17 events, PRIM_FOCUS_LOG_BUDGET=64)
+
+| seq | op | VA | mask | upstream | user_caller |
+|-----|----|----|------|----------|-------------|
+| #000 | REM | 0x0cc82000 | 0x0 | GenericSWIHandler | 0x0c1181b0 (REx-resident) |
+| #001 | REM | 0x0cc82000 | 0xc | CopyPagesAfterStackCollided#1 | 0x0c1181b0 |
+| #002 | REM | 0x0cc7f000 | 0x0 | GenericSWIHandler | TheMain::TLoader |
+| #003 | REM | 0x0cc7f000 | 0x3 | GenericSWIHandler | TheMain::TLoader |
+| #004 | **FGT** | **0x0cc7f000** | | | |
+| #005 | REM | 0x0cc82000 | 0xc | CopyPagesAfterStackCollided#2 | 0x0c1181b0 |
+| #006 | REM | 0x0cc80000 | 0x0 | GenericSWIHandler | TCardAsyncMsg ctor |
+| #007 | REM | 0x0cc80000 | 0x3 | GenericSWIHandler | TCardAsyncMsg ctor |
+| #008 | **FGT** | **0x0cc80000** | | | |
+| #009 | REM | 0x0cc82000 | 0xc | CopyPagesAfterStackCollided#2 | 0x0c1181b0 |
+| #010 | REM | 0x0cc81000 | 0x0 | GenericSWIHandler | TCardAsyncMsg ctor |
+| #011 | REM | 0x0cc81000 | 0x3 | GenericSWIHandler | TCardAsyncMsg ctor |
+| #012 | **FGT** | **0x0cc81000** | | | |
+| #013 | REM | 0x0cc82000 | 0xc | CopyPagesAfterStackCollided#2 | 0x0c1181b0 |
+| #014 | REM | 0x0c310000 | 0x0 | GenericSWIHandler | TTask::Init#1 (`0x002523bc`) |
+| #015 | REM | 0x0c310000 | 0x3 | GenericSWIHandler | TTask::Init#1 |
+| #016 | REM | 0x0c310000 | 0x3 | GenericSWIHandler | TTask::Init#2 (`0x002523d4`) |
+
+### Diagnosis
+
+Three transient secondaries (`0xcc7f`, `0xcc80`, `0xcc81`) ARE
+forgotten before the next reuse — those are not the bug.
+
+But VA=`0xcc82000` (REx driver, #000) is **never forgotten**, and
+VA=`0x0c310000` (TTask::Init stack base, #014) is also **never
+forgotten**. End-of-boot live state: PA=0x04034000 mapped at TWO
+distinct VAs simultaneously, neither paired with a Forget, both
+reachable from kernel code through full-RW under our flat AP=11.
+
+Verify-mmu's recorded pair `(0xcc7f000, 0xcc82000)` is a *transient*
+state captured at seq #003 (between REM va=0xcc7f000 mask=0x3 and
+FGT at #004). The actual end-of-boot persistent conflict is
+`(0xcc82000, 0x0c310000)`.
+
+### Why this is a real bug
+
+- ARMv7 has no subpage AP — once any subpage of a page is RW from
+  one VA, the entire page is RW from every VA mapping that PA.
+- The 4-KiB allocator patch set (NewHeap/NewVMHeap/ZapHeap) exists
+  to force the kernel to allocate a fresh 4-KiB PA per consumer so
+  PA-aliasing never happens at all.
+- The patch set evidently does NOT cover whatever allocator path
+  the REx-resident code at `user_caller=0x0c1181b0` uses to obtain
+  PA=0x04034000. That same PA is then re-handed to TTask::Init's
+  stack-allocation path later, producing two simultaneous-live RW
+  mappings of the same physical page.
+
+### Next investigation step
+
+Disassemble `_Data_/Einstein.rex` symbols around `0x0c1181b0` to
+identify the REx function that issued REM #000 and what allocator
+chain it uses. The user_caller field is the saved-LR slot of the
+active USR function's APCS frame at the SWI #12 entry — i.e. who
+BL'd into the SWI-issuing helper. So `0x0c1181b0` is the BL+4 of
+the function-of-interest.
+
+Cross-check Einstein with NewtonProbe on the same ROM+REx pair to
+see whether Einstein also produces two simultaneous live mappings
+of PA=0x04034000.

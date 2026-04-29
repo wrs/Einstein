@@ -142,6 +142,74 @@ the corruption within ~16 ms granularity but not pin the exact
 PC. Decide which to pursue based on whether we want chronology
 (periodic snapshot) or the writer's PC (instruction emulation).
 
+### Iteration 3: per-IRQ snapshot reveals corruption is stale heap data
+
+Implemented option B (per-IRQ snapshot diff) in
+`src/alrt_capture.rs`. 8-word snapshot of offsets 0x7c0..0x800
+is sampled at every `maybe_rearm` call; word-level diffs vs
+prior snapshot are logged.
+
+Cold-boot timeline (6 diffs):
+
+| diff | what changes | observation |
+|------|-----|-----|
+| #0 | All 8 words: 0 → `0x6db6db6d` pattern | Kernel free-memory poison fill |
+| #1 | All 8 words: poison → 0 | Page zero-cleared (allocation step) |
+| #2 | +0x7c0=0x0c6016b8, +0x7c8=4, +0x7cc=4, +0x7dc=0x1db9 | Some sentinel/header init |
+| #3 | **The corruption appears as a single batch:** | |
+|    | +0x7c0: 0x0c6016b8 → 0x0c20463c | RAM ptr |
+|    | +0x7c4: 0 → **0x00000020** | bogus "count" = 32 |
+|    | +0x7c8: 4 → **0x00000001** | bogus "esize" = 1 |
+|    | +0x7cc: 4 → 0x0c320804 | RAM ptr |
+|    | +0x7d0: 0 → 0x0c3207dc | RAM ptr |
+|    | +0x7d4: 0 → **0x003121fc** | ROM PC after `bl SetFreeChain` |
+|    | +0x7d8: 0 → **0x00310858** | ROM PC = SetFreeChain prologue |
+|    | +0x7dc: 0x1db9 → 0x0c201010 | RAM ptr |
+| #4 | +0x7c0: 0x0c20463c → 0x0c204884 | Heap-link rotation |
+| #5 | +0x7c0: 0x0c204884 → 0x0c2049a0 | Heap-link rotation |
+
+### Translate_va check disproves the third-VA-alias hypothesis
+
+I extended IdleProc to translate VA=0x0c3207dc (which would be
+SP if these were direct-push frame imprints). Result:
+VA=0x0c3207dc → PA=**0x0402f7dc**, NOT 0x0402e7dc. The values
+are NOT from a stage-1-aliased push to the alrt page.
+
+### Revised diagnosis: heap-allocator stale data, not direct alias
+
+The Newton kernel's heap allocator uses raw bytes inside free
+blocks for freelist linkage (`SetFreeChain`/`MoveFreeBlock`).
+When a free block is recycled, the linkage bytes remain visible
+until overwritten by the new owner.
+
+Diff #3's pattern fits: a recently-freed block at PA=0x0402e7c0
+held linkage data from when the heap allocator's freelist
+manipulation routines (`MoveFreeBlock`, `SetFreeChain`) had run
+through it. That block was then handed to the alrt task's
+TAlertEventHandler allocation. The kernel never zero-init'd the
+CList header at +0x1c..+0x3c, so the alrt task sees the stale
+freelist bytes when IdleProc reads CList::At(0).
+
+The ROM PCs (0x003121fc / 0x00310858) being heap-allocator
+internals is consistent with the freelist storing return
+addresses or pointers as part of its internal accounting.
+
+### Next iteration — narrow the heap-allocator path
+
+1. Hook a probe at the heap allocator's block-handout entry
+   points (`NewBlock`, `NewPtr`, equivalent) logging every
+   allocation that lands near PA=0x0402e000. The expected
+   sequence: a free block at PA=0x0402e7a8 with stale linkage
+   bytes is reused for the alrt TAlertEventHandler without
+   zero-init.
+2. Cross-check Einstein with `NewtonProbe` to see whether the
+   ARMv4 kernel's allocator zero-inits this region or whether
+   subpage-AP somehow keeps the freelist bytes from leaking
+   into client code.
+3. Decide fix layer once the leaking allocator path is
+   identified — likely a ROM patch inserting zero-init on the
+   TAlertEventHandler constructor or the CList constructor.
+
 User directive (2026-04-28): "look at every alias and decide it's
 benign before moving on. This is how we find bugs in our 4k page
 allocation patch set."

@@ -54,6 +54,71 @@ static REARM_PENDING: AtomicBool = AtomicBool::new(false);
 static TOTAL_TRAPS: AtomicU32 = AtomicU32::new(0);
 static OUT_OF_WINDOW: AtomicU32 = AtomicU32::new(0);
 
+/// Per-IRQ snapshot of the CList window (offsets 0x7c0..0x800 = 8
+/// words). Captured at every `maybe_rearm` call. When the snapshot
+/// differs from the prior one, log the diff. Bisects boot phase
+/// the corruption fires in (within ~16 ms granularity per the IRQ
+/// cadence) without needing instruction-level emulation. Doesn't
+/// pin the exact writer PC, but narrows the search window
+/// dramatically vs. the boot-wide RAM=0..corrupted observation.
+const SNAPSHOT_WORDS: usize = 8; // 0x7c0..0x800 = 32 bytes = 8 words
+const SNAPSHOT_BASE_OFFSET: u32 = 0x7c0;
+static SNAPSHOT: [AtomicU32; SNAPSHOT_WORDS] = [
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+];
+/// Counter for diff events so logs interleave coherently with other
+/// per-IRQ traces.
+static SNAPSHOT_SEQ: AtomicU32 = AtomicU32::new(0);
+/// Total diffs logged (capped budget so a stuck-RW window doesn't
+/// flood the trace if the kernel keeps overwriting).
+static SNAPSHOT_LOG_BUDGET: AtomicU32 = AtomicU32::new(64);
+
+/// Compare current PA bytes vs the saved snapshot; log any change
+/// per-word. Called at every IRQ rearm of an armed page.
+fn check_snapshot_diff() {
+    let armed = TARGET_PA.load(Ordering::Relaxed);
+    if armed == 0 {
+        return;
+    }
+    let mut changed = false;
+    let mut new_words = [0u32; SNAPSHOT_WORDS];
+    for i in 0..SNAPSHOT_WORDS {
+        let pa = armed + SNAPSHOT_BASE_OFFSET + (i as u32) * 4;
+        let v = crate::guest_mem::read_word_pa(pa).unwrap_or(0xDEAD_BEEF);
+        new_words[i] = v;
+        let prev = SNAPSHOT[i].load(Ordering::Relaxed);
+        if prev != v {
+            changed = true;
+        }
+    }
+    if !changed {
+        return;
+    }
+    let seq = SNAPSHOT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let budget = SNAPSHOT_LOG_BUDGET.fetch_sub(1, Ordering::Relaxed);
+    if budget == 0 {
+        SNAPSHOT_LOG_BUDGET.store(0, Ordering::Relaxed);
+        // Still update SNAPSHOT below so next diff is incremental
+        // even after budget exhaustion (avoids spamming "everything
+        // changed" once we resume).
+    } else if budget > 0 {
+        kprintln!("alrt-capture SNAPSHOT diff #{} at PA={:#010x}+{:#x}:",
+            seq, armed, SNAPSHOT_BASE_OFFSET);
+        for i in 0..SNAPSHOT_WORDS {
+            let prev = SNAPSHOT[i].load(Ordering::Relaxed);
+            let cur = new_words[i];
+            if prev != cur {
+                kprintln!("    +{:#x}: {:#010x} -> {:#010x}",
+                    SNAPSHOT_BASE_OFFSET + (i as u32) * 4, prev, cur);
+            }
+        }
+    }
+    for i in 0..SNAPSHOT_WORDS {
+        SNAPSHOT[i].store(new_words[i], Ordering::Relaxed);
+    }
+}
+
 /// Print the diagnostic counters. Called by the Reboot canary.
 pub fn dump_counters() {
     kprintln!(
@@ -106,17 +171,20 @@ pub unsafe fn arm_at_boot() {
         "alrt-capture: BOOT armed RO+XN on PA={:#010x} L3 before={:#x} after={:#x}",
         KNOWN_TARGET_PA, before.unwrap_or(0), after.unwrap_or(0),
     );
-    // Dump initial RAM contents at the CList-header window. If these
-    // bytes already match the corrupted state observed at IdleProc
-    // (count=32, esize=1, ebase=0x003121fc) at this point, the
-    // "corruption" is actually our hypervisor's RAM-init pattern —
-    // we'd be looking for a hypervisor-side bug, not a guest one.
+    // Dump initial RAM contents at the CList-header window AND
+    // seed SNAPSHOT so the first per-IRQ diff fires on the first
+    // change. If these bytes already match the corrupted state
+    // observed at IdleProc (count=32, esize=1, ebase=0x003121fc),
+    // the "corruption" is actually our hypervisor's RAM-init
+    // pattern — we'd be looking for a hypervisor-side bug.
     kprintln!("alrt-capture: RAM at PA={:#010x}+0x7c0..0x800 at boot:",
         KNOWN_TARGET_PA);
-    for i in 0..16u32 {
-        let pa = KNOWN_TARGET_PA + 0x7c0 + i * 4;
+    for i in 0..SNAPSHOT_WORDS {
+        let pa = KNOWN_TARGET_PA + SNAPSHOT_BASE_OFFSET + (i as u32) * 4;
         let v = crate::guest_mem::read_word_pa(pa).unwrap_or(0xDEAD_BEEF);
-        kprintln!("    +{:#x}: {:#010x}", 0x7c0 + i*4, v);
+        kprintln!("    +{:#x}: {:#010x}",
+            SNAPSHOT_BASE_OFFSET + (i as u32) * 4, v);
+        SNAPSHOT[i].store(v, Ordering::Relaxed);
     }
 }
 
@@ -205,11 +273,21 @@ pub fn note_perm_fault(elr: u32, ipa: u32, value: Option<u32>, srt: u32, src_cps
 
 /// Re-arm if a prior trap captured a write. Called from trap entry
 /// (mirrors the pattern used by `g1_capture::maybe_rearm`).
+///
+/// Also runs the per-IRQ snapshot diff regardless of whether a
+/// rearm is pending — we want a tick on every IRQ even if no
+/// stage-2 fault landed, so we don't miss corruption that fires
+/// in a window between IRQs.
 pub fn maybe_rearm() {
     let armed = TARGET_PA.load(Ordering::Relaxed);
     if armed == 0 {
         return;
     }
+    // Always check for content drift, then optionally rearm. Reading
+    // the page bytes at IRQ time happens through EL2's stage-1 (the
+    // PA-helper bypasses stage-2), so a stage-2 RO state on the
+    // guest doesn't block our read.
+    check_snapshot_diff();
     if REARM_PENDING.swap(false, Ordering::Acquire) {
         // SAFETY: helper performs its own TLB maintenance.
         unsafe { crate::stage2::set_ram_page_ro_xn(armed); }

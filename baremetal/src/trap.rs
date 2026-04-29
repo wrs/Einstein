@@ -3508,14 +3508,16 @@ fn handle_idleproc_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
             .unwrap_or(0xDEAD_DEA3);
         let ebase = guest_mem::read_word_va(clist.wrapping_add(0x10))
             .unwrap_or(0xDEAD_DEA4);
-        // Resolve VA→PA for the CList header so we know which PA to
-        // arm. The boot-time arm uses the historical PA=0x0402e000;
-        // if the kernel maps VA=0x0cca3000 to a different PA in
-        // this run, the arm misses entirely.
+        // Resolve VA→PA for the CList header AND for the suspect
+        // third aliasing VA (0x0c320000 — discovered via per-IRQ
+        // snapshot in iter 3 by reverse-engineering the corrupting
+        // SetFreeChain APCS push at sp=0x0c3207dc). If both translate
+        // to the same PA, the alias is confirmed.
         let clist_pa = guest_mem::translate_va(clist).unwrap_or(0xDEAD_DEA8);
+        let alias_pa = guest_mem::translate_va(0x0c32_07dc).unwrap_or(0xDEAD_DEA9);
         kprintln!(
-            "IdleProc #{:03} ENTER this={:#010x} inner={:#010x} clist={:#010x} (PA={:#010x}) count={} esize={} ebase={:#010x} src_mode={:#x} sp={:#010x}",
-            n, this, inner, clist, clist_pa, count, esize, ebase, source_cpsr & 0x1F, sp,
+            "IdleProc #{:03} ENTER this={:#010x} inner={:#010x} clist={:#010x} (PA={:#010x}) alias_test_VA=0x0c3207dc->PA={:#010x} count={} esize={} ebase={:#010x} src_mode={:#x} sp={:#010x}",
+            n, this, inner, clist, clist_pa, alias_pa, count, esize, ebase, source_cpsr & 0x1F, sp,
         );
 
         // Always dump the first 4 entries as 32-bit words — CList::At

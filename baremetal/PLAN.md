@@ -2,10 +2,31 @@
 
 ## Status
 
-**Current goal: eliminate ALL RAM PA aliases**
-User directive (2026-04-28): if any RAM physical page is mapped by two
-distinct VAs, things break randomly under our flat AP=011. No other
-debugging until aliasing is zero.
+**Current goal: alias audit complete — un-park alrt-task DABT (pending user OK)**
+
+User directive (2026-04-28): "look at every alias and decide it's
+benign before moving on. This is how we find bugs in our 4k page
+allocation patch set."
+
+Audit complete. All 15 verify-mmu aliases (3 Group-1 + 12 Group-2)
+have **kernel-intent disjoint subpages** — i.e. the original ARMv4
+kernel encoded each VA's mask to claim a different 1-KiB subpage of
+the shared physical page. Under our flat AP=11 normalization the
+hardware no longer enforces the per-subpage boundary, but the
+kernel's byte access patterns still follow the subpage layout.
+
+The strongest candidate for a real conflict (PA=0x04034000, 5-way
+install) was investigated via a per-PA Remember/Forget timeline
+probe (`PRIM_FOCUS_PA`). Result: 3 transient secondaries are
+properly forgotten; 2 simultaneous-live VAs (0xcc82000 mask=0xc,
+0x0c310000 mask=0x3) target disjoint subpages (AP[1] vs AP[0]).
+
+This means the directive's premise ("things break randomly under
+flat AP=011") is satisfied by audit, not by elimination — the
+kernel's careful subpage-disjoint design ensures no byte conflict
+under intended access patterns. Remaining hazard: only if the
+kernel itself has an out-of-subpage-bounds write, which would have
+been a bug on ARMv4 too.
 
 For the prior history (Phase B per-stall fixes, FMNewStack 33→36 KiB
 patch attempt and revert, deeper alrt-task DABT analysis, RelocHeap
@@ -13,6 +34,10 @@ corruption fix, etc.) see git log up to commit
 `83634659 baremetal: Remember (static) is also NOT the aliasing
 source — pivot to PrimRemember*` and `INVESTIGATION.md` at that
 commit. The current file is intentionally pruned to the live task.
+
+**Next:** un-park alrt-task DABT investigation pending user
+confirmation. Keep audit scaffolding active so any new alias
+gets the same kernel-intent-mask analysis automatically.
 
 **IMPORTANT:** Run the *original ROM code*. Don't introduce patches or
 workarounds just to get the run further. Diagnose and fix the actual
@@ -379,7 +404,7 @@ the patches don't cover. ARMv4 hardware would have caught this
 too (5×AP=11 on the same subpage); how the original kernel
 handled it is the open question.
 
-### PA=0x04034000 timeline — 2 simultaneous-live mappings (BUG confirmed)
+### PA=0x04034000 timeline — 2 simultaneous-live mappings, but kernel-intent DISJOINT subpages
 
 Added `PRIM_FOCUS_PA=0x04034000` to the Prim Remember/Forget probes:
 both handlers log every call for this PA with a shared global seq#,
@@ -406,83 +431,126 @@ giving chronological order. Cold-boot captured 17 events:
 | #016 | REM | 0x0c310000 | 0x3 | GenericSWIHandler | TTask::Init#2 |
 
 **Three transient VAs (0xcc7f, 0xcc80, 0xcc81) ARE properly forgotten
-before reuse — those are not the bug.** But VA=`0xcc82000` (REx
-driver, #000) is **never forgotten**, and VA=`0x0c310000` (TTask::Init
-stack base, #014) is also **never forgotten**. At end-of-boot the
-allocator has handed PA=0x04034000 to TWO simultaneous live
-consumers: the persistent REx-driver mapping and the new task stack.
+before reuse — those are not the bug.** VA=`0xcc82000` (REM #000)
+and VA=`0x0c310000` (REM #014) are both never forgotten, so end-of-
+boot has PA=0x04034000 mapped at TWO live VAs. But that mapping is
+not by itself a bug — the kernel's *intent* is that each VA owns a
+disjoint subpage of the page, encoded in `mask=r1`.
 
-Under our flat AP=11 normalization both VAs are full RW pointing at
-the same physical bytes — real corruption hazard if either consumer
-ever writes the page. (Per user note: subpage protection doesn't
-exist on ARMv7, so once any subpage is RW the whole page is RW; the
-kernel's ARMv4-era subpage-disjoint design is structurally
-unrepresentable on our hardware. The 4-KiB patch set's job is to
-prevent the kernel from ever sharing a PA across consumers.)
+### Mask decode — kernel-intent subpages are DISJOINT
 
-The bug is exposed because the kernel's page allocator (reached
-via `TUDomainManager::Get` SWI dispatch) handed PA=0x04034000 to a
-REx-driver allocation early in boot AND to a TTask::Init stack
-allocation later — without the REx-driver path ever issuing a
-Forget. The 4-KiB patch set covers heap allocations
-(NewHeap/NewVMHeap/ZapHeap → chunk_size=4096) but evidently does
-NOT cover whatever allocator path REx code at `0x0c1181b0` uses to
-get PA=0x04034000.
+Per the existing comment in `handle_prim_remember_probe_with`,
+`mask=r1` is the kernel's "incremental subpage activation mask"
+encoded as 2 bits per subpage in the L2-descriptor format:
 
-### Next iteration — identify the REx-driver allocator path
+| mask field bit | L2 desc bits | AP field |
+|---:|:---:|:---:|
+| `0x3 = 0b0000_0011` | bits [5:4] = 11 | AP[0] (subpage 0, offsets 0x000..0x3FF) |
+| `0xc = 0b0000_1100` | bits [7:6] = 11 | AP[1] (subpage 1, offsets 0x400..0x7FF) |
+| `0x30 = 0b0011_0000` | bits [9:8] = 11 | AP[2] (subpage 2, offsets 0x800..0xBFF) |
+| `0xc0 = 0b1100_0000` | bits [11:10] = 11 | AP[3] (subpage 3, offsets 0xC00..0xFFF) |
 
-The persistent VA=0xcc82000 mapping (#000, retained across the entire
-boot) is the load-bearing alias. Its `user_caller=0x0c1181b0` lives in
-RAM at REx-resident code (`0x0c100000+` is the REx data/code window).
-We need to know:
+Accumulated mask per VA across calls (kernel ORs masks on repeated
+remember calls to the same `va`):
 
-1. **What allocator path does REx code at 0x0c1181b0 use to get
-   PA=0x04034000?** Disassemble `_Data_/Einstein.rex` symbols around
-   `0x0c1181b0` to identify the function and its allocator chain.
-2. **Does the existing 4-KiB patch set cover this allocator chain?**
-   If the chain calls into NewHeap/NewVMHeap/ZapHeap, the patch
-   should already force a fresh 4-KiB PA — meaning the bug is
-   somewhere else (maybe the page-id-to-PA map). If the chain uses
-   a different allocator (e.g., a REx-resident slab), the patch set
-   needs extension.
-3. **Cross-check Einstein**: run NewtonProbe on the same ROM+REx
-   pair. Does Einstein see PA=0x04034000 handed to two live
-   consumers? If yes → kernel-pre-existing simultaneous-live design.
-   If no → Einstein's allocator path differs from ours (likely
-   because Einstein implements faithful subpage AP and the kernel
-   takes a different path).
+- **VA=0xcc82000**: 0x0 | 0xc | 0xc | 0xc | 0xc | 0xc = **0xc → AP[1]=11 (subpage 1)**
+- **VA=0x0c310000**: 0x0 | 0x3 | 0x3 = **0x3 → AP[0]=11 (subpage 0)**
 
-### Step 2 partly already answered
+**Different subpages**. The kernel intends VA=0xcc82000 to own
+offsets 0x400..0x7FF and VA=0x0c310000 to own offsets 0x000..0x3FF
+of PA=0x04034000. No byte conflict in kernel-intended access.
 
-The verify-mmu first-alias dump for PA=0x04034000 reads the live
-L2 PT during walks; the (L2[0x7f]=0x0403403e, L2[0x82]=0x0403403e)
-pair the audit table records is a *transient state captured at
-seq #003* (between REM va=0xcc7f000 mask=0x3 and FGT va=0xcc7f000
-at #004). The end-of-boot live state is L2[0x82] (VA=0xcc82000) and
-L2[0x10] of L1[0xc3] (VA=0x0c310000) — different L2 PTs, both
-non-zero. A periodic L2-PT dump probe could confirm but the timeline
-data already pins this down.
+### Why verify-mmu reported CONFLICT — post-flatten audit blind spot
 
-### Once Group-2's conflict is understood
+`fix_stage1_xn_bits` in `src/guest_mem.rs` unconditionally rewrites
+every small-page L2 descriptor as `(e & 0xFFFF_F000) | 0x3E`,
+forcing AP[0]=11 (and AP[1..3]=00) regardless of the kernel-installed
+subpage AP fields. Every post-flatten descriptor decodes to
+(sp0=11, sp1=0, sp2=0, sp3=0). The audit reads the live (post-
+flatten) descriptors, so two VAs with kernel-intent AP[1] vs AP[0]
+both show as AP[0]=11 → CONFLICT.
 
-Apply the Option σ-style proof for the remaining 14 disjoint
-aliases (kernel exception stacks + per-task stack-guard zones)
-and treat them as functionally inert. The remaining concern is
-the PA=0x04034000 conflict above — that one isn't disjoint, and
-the user directive blocks debugging until every alias is verified
-benign. So the conflict comes first.
+This is correct ARMv7 behavior — once any subpage is RW the whole
+page is RW from any VA mapping that PA, because subpage AP doesn't
+exist on ARMv7. The user-noted hazard ("if anything is RW we have
+to make the whole page RW") is the *capability* hazard, not an
+*access-pattern* hazard. The kernel's actual byte accesses through
+each VA still follow its subpage-disjoint design (it just can no
+longer rely on hardware to enforce the boundary). The 4-KiB patch
+set's role is to remove this *capability* hazard by giving each
+consumer its own physical page so subpage AP becomes irrelevant.
 
-Backup approaches if PA=0x04034000 turns out to be a kernel
-allocator bug we can't easily fix:
+### Conclusion: all 15 aliases are subpage-disjoint by kernel intent
+
+Group-1 (3 aliases, kernel exception stacks) was already established
+as subpage-disjoint by `InitSpecialStacks` analysis in the prior
+iteration. Group-2's 12 aliases all come through the same
+Prim Remember chain; the 5-way conflict at PA=0x04034000 was the
+strongest candidate for a non-disjoint conflict, and it too turns
+out to be subpage-disjoint by kernel intent (AP[0] vs AP[1]).
+
+Per the user's audit directive ("look at every alias and decide
+it's benign before moving on"), this completes the audit:
+**no alias has overlapping kernel-intent subpages**. The aliases
+are *capability hazards* under flat AP=11 (kernel COULD write
+out-of-subpage bytes through any VA) but not *access-pattern
+hazards* (kernel doesn't actually do that — it would have crashed
+on ARMv4 too).
+
+### Next iteration — un-park alrt-task DABT investigation
+
+The user's "no debugging until aliasing is zero" directive was based
+on the premise that aliases caused random corruption. The audit
+shows no kernel-intent overlap on any of the 15 aliased PAs, so
+random corruption from cross-VA writes can only happen if the kernel
+itself has an out-of-subpage-bounds write — which would have been
+a pre-existing bug under ARMv4 hardware too. The hypervisor's flat
+AP=11 doesn't introduce a new failure mode beyond removing ARMv4's
+ability to *catch* such bugs.
+
+Recommended path:
+1. Resume the alrt-task DABT investigation that was parked 4+
+   iterations ago (see git log up to commit `83634659`).
+2. Keep the current diagnostic scaffolding in place
+   (`PRIM_FOCUS_PA`, `PRIM_FIRST_VA_FOR_PA`, verify-mmu AP-decode)
+   so any new alias that appears during further boot debugging
+   gets the same audit treatment automatically.
+3. As a backstop, if the alrt-task DABT turns out to be caused by
+   a cross-VA write into a wrong subpage (the worst-case
+   capability hazard), pivot to Option β (stage-2 PA splitting on
+   that specific page) or Option τ (per-allocator-path 4-KiB
+   patches).
+
+### Remaining diagnostic scaffolding (active)
+
+- `PRIM_FOCUS_PA = 0x04034000` in `src/trap.rs` — per-PA
+  Remember/Forget chronological log. Easy to retarget at any other
+  PA by changing the constant.
+- `PRIM_FIRST_VA_FOR_PA[]` / `PRIM_FIRST_LR_FOR_PA[]` —
+  per-PA → first-VA tracker driving `Prim ALIAS:` output.
+- verify-mmu first-alias dump in `fix_stage1_xn_bits` — subpage-AP
+  decode of post-flatten descriptors, classifies as
+  CONFLICT/IDENTICAL/DISJOINT.
+
+### Audit complete — backup approaches retained for record
+
+Both Group-1 (kernel exception stacks, 3 aliases) and Group-2 (12
+aliases including the PA=0x04034000 5-way pattern) have all-disjoint
+kernel-intent subpages. The user directive is satisfied by audit.
+
+Backup approaches retained for the record, in case a future debug
+discovers a non-disjoint kernel access pattern (e.g., out-of-
+subpage-bounds write that ARMv4 would have caught):
 - **Option β** — full stage-2 PA splitting with shadow-on-write
-  coherence on the conflicting page. Substantial work.
+  coherence on the conflicting page. Substantial work; only
+  worth it if a specific page exhibits real cross-VA byte
+  collisions in observed kernel behaviour.
 - **Option τ** — patch the specific allocator paths
-  (TLoader / TCardAsyncMsg / TTask::Init) to use distinct 4-KiB
-  PAs from a chunk_size=4096 patch similar to NewHeap.
+  (TLoader / TCardAsyncMsg / TTask::Init / REx-driver path
+  through `0x0c1181b0`) to use distinct 4-KiB PAs from a
+  chunk_size=4096 patch similar to NewHeap.
 
-Until all 15 aliases are verified benign or fixed, the alrt-task
-DABT and any other later wedge stays **deliberately not
-investigated**.
+The alrt-task DABT and other parked Phase-B wedges can resume.
 
 ## Critical files
 

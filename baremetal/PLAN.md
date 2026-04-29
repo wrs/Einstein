@@ -222,6 +222,105 @@ TAlertEventHandler region.
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
 
+### Iteration 12 (next-loop iter 8): 36-KiB stack patch lands — alrt-task DABT fixed, exposes pool-sizing wedge
+
+Re-applied the 17 FMNewStack patches plus 3 divisor sites from
+iter 11's catalogue:
+
+- `Init__11THeapDomain` at `0x001F_8D74` — divisor for slot count.
+- `GetStackInfo__11THeapDomain` at `0x001F_8E1C` — divisor for slot index.
+- `FMFree__13TStackManager` at `0x001F_918C` — divisor for slot index.
+
+All three are simple `mov r0, #33792` → `mov r0, #36864`.
+
+### What worked — alrt-task DABT eliminated
+
+```
+NewStack POST-SWI: env=0x1355 req=0x9000 base=0x0c306000 top=0x0c30e000 span=0x8000
+NewStack POST-SWI: env=0x1355 req=0x9000 base=0x0c30f000 top=0x0c317000 span=0x8000
+NewStack POST-SWI: env=0x1355 req=0x9000 base=0x0c318000 top=0x0c320000 span=0x8000
+NewStack POST-SWI: env=0x13a5 req=0x9000 base=0x0cc67000 top=0x0cc6f000 span=0x8000
+NewStack POST-SWI: env=0x13a5 req=0x9000 base=0x0cc70000 top=0x0cc78000 span=0x8000
+...
+IdleProc #000 ENTER this=0x0cc92fa8 inner=0x0cc92f38 clist=0x0cc92fc4 (PA=0x0403ffc4)
+  count=0 esize=4 ebase=0x00000000 src_mode=0x10 sp=0x0cc92e38
+```
+
+- `req=0x9000` (= 36 KiB) per task ✓
+- Each slot 4-KiB-aligned, 32 KiB usable + 4 KiB guard ✓
+- IdleProc enters with **`count=0 esize=4 ebase=0`** — the CList is
+  CORRECTLY initialized!
+- pa-emul `CORRUPTION` count = **0** ✓
+
+The alrt-task DABT investigation that motivated iters 1-11 is
+SOLVED by this patch. With each task in its own 36-KiB slot
+(4-KiB-aligned), there's no boundary 4-KiB page shared with an
+adjacent task; SetFreeChain/MoveFreeBlock pushes stay inside the
+current task's slot, never landing on alrt's data.
+
+### What broke next — pool sized for 8 × 33 KiB, only 7 fit at 36 KiB
+
+Boot now wedges in an infinite ResolveFault loop:
+
+```
+Fault(stackmgr) probe ENTER: this=0x0c112cb8 procst=0x0c1133a4 \
+  far=0x0c647003 caller_lr=0x00259230 src_mode=0x10 (USR)
+ResolveFault probe ENTER: ... far=0x0c647000 \
+  info_bounds=[0x0c601000,0x0c647000) ...
+ResolveFault probe ENTER: ... far=0x0c647400 ...
+ResolveFault probe ENTER: ... far=0x0c647800 ...
+ResolveFault probe ENTER: ... far=0x0c647c00 ...
+```
+
+`info_bounds=[0xc601000, 0xc647000)` — a 280 KiB stack pool
+(= 8 × 33 KiB + 16 KiB overhead). With 36-KiB slots we fit 7
+plus a partial 8th that overflows pool end at `0xc647000`. The
+8th task's stack maps to slot index 7 starting at `0xc640000`
+which extends to `0xc649000` — past pool end. Its first access
+(`FAR=0xc647003`) falls into ResolveFault, which can't resolve
+out-of-pool addresses, so the fault loops.
+
+This is the same failure mode as iter-6's "Option A pad attempt"
+(2026-04-23). The diagnosis there: "the call-site pad cannot
+work alone — pad and stride must move together". We now have
+the stride (FMNewStack 36-KiB patch), but not the pool size.
+
+### Next iteration — find and patch the pool-size site
+
+The pool size is allocated somewhere upstream of FMNewStack,
+likely in `TStackManager::Init` or the domain-creation path that
+hands a backing store to `Init__11THeapDomain`. The pool-byte
+size at iter 12 is `0x46000` (280 KiB) for the 0xc601000 domain.
+With 8 × 36 KiB slots we'd want at minimum `0x48000` (288 KiB),
+plus whatever overhead (slot_info array, alignment) the kernel
+adds.
+
+Search candidates:
+- Constants near `Init__11THeapDomain` — the function takes
+  a `(start, size_in_megabytes)` pair (`r2 << 20`, `r3 << 20`).
+  The pool size in this domain might come from a config table.
+- Look for `pool_size_in_bytes = N * 33792` patterns, or
+  `pool_size = N * 0x21` pre-shift. With the divisor patched
+  to `#36864`, slot count is computed correctly; the question
+  is whether the pool itself is sized as a multiple of slot_size.
+- The `Get` page-allocator (probed at `0x00258EFC`) may also
+  be relevant if the pool is page-aligned and sized in pages.
+
+A simpler band-aid: clamp `Init__11THeapDomain`'s slot count
+to `(pool_size - overhead) / 36864` and accept the lost slot.
+That gives us 7 stacks instead of 8 in this domain. May or may
+not be enough for boot.
+
+### Backup plan if the pool-size patch is hard
+
+Reverting just the 36-KiB stride change loses the alrt-task
+DABT fix — the iter-12 patch is the first time we've cleanly
+gotten past that stall. If the pool-size investigation takes
+multiple iterations, consider keeping the 36-KiB patch as
+"forward progress" while we work on the pool sizing — the
+ResolveFault loop is more diagnosable than the alrt-task DABT
+because we know exactly what's wrong (overflow past pool end).
+
 ### Iteration 11 (next-loop iter 7): 36-KiB FMNewStack patch attempted, reverted — slot arithmetic in 33 KiB lives in many functions
 
 Implemented the 17 FMNewStack patches sketched in iter 10:

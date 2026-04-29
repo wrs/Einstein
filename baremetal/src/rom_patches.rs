@@ -677,6 +677,23 @@ pub const NW_RETURN_PROBE_HVC_IMM: u32 = 0x58;
 pub const NW_RETURN_PROBE_PC:      u32 = 0x0031_8F1C;
 const NW_RETURN_ORIG_INSN:         u32 = 0xE1A0_0004; // mov r0, r4
 
+/// `__dl__FPv` (operator delete) probe at ROM `0x00318F28`. The
+/// original word is a single `b free` (target `0x01BD2958` in REx).
+/// The handler reads `r0` (= block to free), clears the matching
+/// NW_TABLE entry, then redirects ELR_EL2 to the free entry so the
+/// guest tail-calls into the actual free implementation.
+///
+/// Pairs with the `__nw__` entry/return probes to give a live-allocation
+/// tracker that distinguishes legitimate recycle (alloc → free → alloc
+/// at same address) from the kernel-allocator overlap bug we suspect.
+pub const DL_PROBE_HVC_IMM:        u32 = 0x59;
+pub const DL_PROBE_PC:             u32 = 0x0031_8F28;
+const DL_ORIG_INSN:                u32 = 0xEA62_E68A; // b 0x01bd2958 <free>
+/// Branch target of `__dl__`'s `b free`. Used by the HVC handler to
+/// set ELR_EL2 so execution continues into free after we record the
+/// deallocation.
+pub const DL_FREE_TARGET_PC:       u32 = 0x01BD_2958;
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -959,6 +976,20 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(NW_RETURN_PROBE_HVC_IMM),
             "__nw__FUi return",
             NW_RETURN_PROBE_HVC_IMM,
+        );
+        // __dl__FPv (operator delete) probe — captures every free
+        // and clears the matching NW_TABLE slot so we can tell
+        // legitimate recycle from real overlap. Handler also
+        // redirects ELR_EL2 to the free entry (DL_FREE_TARGET_PC)
+        // since the original instruction was a `b free` that we've
+        // overwritten with our HVC.
+        patch_probe(
+            rom_ptr,
+            DL_PROBE_PC,
+            DL_ORIG_INSN,
+            hvc_insn(DL_PROBE_HVC_IMM),
+            "__dl__FPv tail-call to free",
+            DL_PROBE_HVC_IMM,
         );
     }
 }

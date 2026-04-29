@@ -1357,25 +1357,28 @@ Citations:
 - `WriteRun @ 0x00256F94..0x00256FFC` iterates the byte buffer at
   `[this+0xa1+r5]` for `r5 = 0..count-1`.
 
-**Phase B iter 19 wedge.** A 420-byte instance was placed at
-USER pointer `0xc646c0c..0xc646db0` (NewBlock returned block
-header at `0xc646bfc`; NewDirectBlock added the 16-byte header
-offset). `New` IS called for this compressor (probe confirms
-`this=0x0c646c0c, caller_lr=0x0005c68c`), so count = 0 right
-after construction. WriteChunk's entry probe also confirms
-`count=0x0`. By the time WriteRun is invoked (from inside
-WriteChunk), count has flipped to `0x20000111` — a CPSR-shaped
-value (NZCV=0010, mode=0x11=FIQ) plus 1.
+**Phase B iter 20 wedge.** A 420-byte instance at USER pointer
+`0xc646c0c..0xc646db0`. `New` zeros count, WriteChunk enters
+with count=0. The count-load probe at ROM `0x00257074`
+(`ldr r0, [r4, #156]`) shows iter 0 starting with count=0
+(takes PATH D, sets count=1) and iter 1 starting with count=1
+(takes PATH B, increments to 2 via `str r1, [r4, #156]`). But
+the immediate re-read at `0x25709c` reads `0x20000111` instead
+of `2`, triggering the WriteRun flush via PATH B.
 
-WriteChunk's own logic cannot produce that value in the
-9-iteration loop (`length=18 → length>>1=9`). The corruption
-is therefore EXTERNAL to WriteChunk. Working hypotheses
-(iter-20 work):
-- A stage-1 alias mapping VA `0xc646xxx` to a PA shared with
-  another VA whose write produces 0x20000110.
-- The callback at `*(this+0x10)` modifies count when invoked
-  during the buffer-A flush path (PC `0x00257128`).
-- An interrupt handler save-area aliases the compressor's PA.
+The corruption window is the 4 instructions between str (count=2)
+and re-read (count=0x20000111):
+```
+257090: str  r1, [r4, #156]   ; count = 2
+257094: add  r0, r0, r4
+257098: strb r6, [r0, #161]   ; byte to buffer_b[1] (offset +0xa2)
+25709c: ldr  r0, [r4, #156]   ; reads 0x20000111 (!)
+```
+
+The strb at `+0xa2` cannot directly corrupt count at `+0x9c`.
+Strong-evidence theory: stage-1 alias — the compressor's page
+shares a physical page with another active VA whose write
+during this window lands on count.
 
 The fault MECHANISM at FAR=`0xc647003`:
 1. WriteChunk reads count from `+0x9c` = `0x20000110`

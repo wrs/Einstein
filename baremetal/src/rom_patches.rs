@@ -834,6 +834,17 @@ pub const COMP_RESET_PROBE_HVC_IMM:       u32 = 0x61;
 pub const COMP_RESET_PROBE_PC:            u32 = 0x0025_6ED8;
 const COMP_RESET_FIRST_INSN:              u32 = 0xE3A0_1000; // mov r1, #0
 
+/// `WriteChunk` count-load probe — patches the
+/// `ldr r0, [r4, #156]` at ROM `0x00257074`. The probe fires
+/// once per loop iteration (right before the count check).
+/// Handler logs `(this=r4, count_value)` and emulates the load.
+/// Iter 19 saw count flip 0 → 0x20000110 between WriteChunk
+/// entry and WriteRun entry; this probe pinpoints the iteration
+/// where the jump happens.
+pub const WC_LOAD_PROBE_HVC_IMM:          u32 = 0x62;
+pub const WC_LOAD_PROBE_PC:               u32 = 0x0025_7074;
+const WC_LOAD_FIRST_INSN:                 u32 = 0xE594_009C; // ldr r0, [r4, #156]
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -1213,6 +1224,16 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(COMP_RESET_PROBE_HVC_IMM),
             "TUnicodeCompressor::Reset entry",
             COMP_RESET_PROBE_HVC_IMM,
+        );
+        // WriteChunk count-load probe — fires once per
+        // loop iteration so we can see when count gets corrupted.
+        patch_probe(
+            rom_ptr,
+            WC_LOAD_PROBE_PC,
+            WC_LOAD_FIRST_INSN,
+            hvc_insn(WC_LOAD_PROBE_HVC_IMM),
+            "WriteChunk count-load",
+            WC_LOAD_PROBE_HVC_IMM,
         );
     }
 }

@@ -8,15 +8,15 @@ available). After iter-12's 36-KiB stack patch landed, the
 alrt-task DABT (cross-subpage stack overflow corrupting the alrt
 task's CList) is GONE. Phase B has moved on to the next stall.
 
-**Current goal: count corruption originates OUTSIDE WriteChunk —
-Iter 19 added probes for WriteChunk / New / Reset. New IS called
-for the wedging compressor, count IS zero on WriteChunk entry.
-But by the time WriteRun is called from inside WriteChunk, count
-has flipped to `0x20000111`. WriteChunk's own logic cannot
-produce that value (max 9 increments per call). The writer is
-external — likely an interrupt save area, an aliased VA, or a
-stage-1 mismapping. Next: install a stage-2 RO trap on the PA
-backing the compressor's +0x9c offset to capture every write.**
+**Current goal: count flips within iter 1's PATH B — Iter 20
+WriteChunk count-load probe (HVC #0x62 at 0x00257074) shows:
+`WC-load #0 count=0`, `WC-load #1 count=1`, then WriteRun fires
+with count=0x20000111. The corruption happens IN ITERATION 1,
+between str (count=2) and the immediate re-read at 0x25709c
+(count=0x20000111) — a 4-instruction window. Strong evidence of
+a stage-1 alias / cache coherency issue. Next: dump stage-1 walk
+for the compressor's VA to find which PA backs it and identify
+the alias hazard.**
 
 ### IdleProc probe — corruption pattern identified
 
@@ -229,6 +229,90 @@ TAlertEventHandler region.
   allocator's freelist threading code (the ROM PCs we see are
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
+
+### Iteration 20 (next-loop iter 16): WriteChunk count-load probe — count flips between str and re-read in iter 1 PATH B
+
+Iter 19 narrowed the corruption to "between WriteChunk entry and
+WriteRun entry". This iteration installs `HVC #0x62` patching
+the count-load `ldr r0, [r4, #156]` at ROM `0x00257074` (the
+first instruction of every WriteChunk loop iteration). Handler
+emulates the load and logs `(this, count, r5_total, r7_index)`.
+
+#### Cold-boot result — corruption hits during iter 1 PATH B
+
+```
+WriteChunk #0 ENTER: this=0x0c646c0c ... count=0x0
+WC-load #0: this=0x0c646c0c count=0x0(0)            r5=9 r7=0
+WC-load #1: this=0x0c646c0c count=0x1(1)            r5=9 r7=1
+WriteRun #0 ENTER: this=0x0c646c0c ... count=0x20000111
+```
+
+- `WC-load #0`: iter 0 starts with count=0. PATH C/D path is
+  taken (count <= 0); PATH D sets count=1.
+- `WC-load #1`: iter 1 starts with count=1. PATH B is then
+  taken (byte_a0 == sl assumed): r1 = count+1 = 2; str count =
+  2 at `0x257090`.
+- After str, the iteration continues:
+  - `0x257094: add r0, r0, r4`   (compute buffer write addr)
+  - `0x257098: strb r6, [r0, #161]`  (single byte to buffer_b[1])
+  - `0x25709c: ldr r0, [r4, #156]`  (RE-READ count)
+  - `0x2570a0: cmp r0, #255`
+  - `0x2570a4: bcc skip` — taken if count < 255
+  - `0x2570ac: bl WriteRun` — fires only if count >= 255
+- **WriteRun fires** with `count=0x20000111`, meaning the re-read
+  at `0x25709c` returned `0x20000111` instead of `2`.
+
+#### The 4-instruction window
+
+Between str at `0x257090` (writes 2) and ldr at `0x25709c` (reads
+`0x20000111`), only:
+- `add r0, r0, r4` (no memory access)
+- `strb r6, [r0, #161]` (writes ONE byte to buffer_b[1] at
+  `compressor + 0xa2 = 0x0c646cae`)
+
+The strb writes a different byte (offset +0xa2, count is at +0x9c
+— 6 bytes apart). It cannot directly corrupt count.
+
+#### Strong-evidence working theory: stage-1 PA alias
+
+The compressor's count field at VA `0x0c646ca8` is backed by some
+PA. If that PA is shared with another active VA (via a kernel
+PrimRememberMapping alias), writes through the OTHER VA would
+appear at our compressor's count.
+
+The Group-2 alias inventory shows `PA=0x0402e000` is shared
+between VA `0x0cc6e000` (a stack region) and VA `0x0c606000`
+(this same heap, but lower offset). If the heap allocator
+re-used PA `0x0402e000` to back VA `0x0c646000` (the compressor's
+page), then writes via VA `0x0cc6e000` (or `0x0cca3000` from the
+older alrt alias) would corrupt the compressor.
+
+Specifically: VA `0x0cca3000` was the alrt task's globals page,
+mapping to PA `0x0402e000`. The procst at VA `0x0c1133a4`
+contained `procst[+0x40] = saved_cpsr = 0x20000110` (iter 15
+finding). If procst is also aliased to PA `0x0402e000` via some
+chain, writes to procst+0x40 would land on the compressor's
+count field.
+
+#### Next iteration plan
+
+1. **Dump stage-1 walk** for VA `0x0c646000` (the compressor's
+   page) at WriteChunk entry. Confirms the PA backing it and
+   reveals any alias.
+2. **If aliased to `0x0402e000`**: extend `alrt_capture` /
+   `pa_emulate.rs` to watch the count's PA window and capture
+   the cross-VA writer.
+3. **Cross-check**: is VA `0x0c646000` mapped via Prim Remember,
+   or via a direct kernel L2 write? Look for the corresponding
+   `Prim probe ENTER` line in the boot log.
+
+#### Status
+
+- 36/36 guest tests pass.
+- All prior iter probes stay active.
+- Iter-20 deliverable: WC-load probe pinpoints the corruption to
+  iter 1 PATH B's str/re-read 4-instruction window. Strong-
+  evidence theory: stage-1 alias.
 
 ### Iteration 19 (next-loop iter 15): WriteChunk + New + Reset probes — count is zero at WriteChunk entry, refuting the "uninitialized" theory
 

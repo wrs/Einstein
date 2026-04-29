@@ -809,20 +809,6 @@ fn analyze_nzcv(insn: u32) -> NzcvEffect {
     if cond_uses_flags { NzcvEffect::Read } else { NzcvEffect::None }
 }
 
-/// True iff NZCV is dead at `start_pc` — i.e. some forward path
-/// writes the flags before any read. Used to decide whether the
-/// inline stub needs to save/restore NZCV. Conservative: returns
-/// `false` if any path may read flags before writing.
-fn nzcv_dead_at(start_pc: u32, max_instrs: u32) -> bool {
-    nzcv_dead_recursive(start_pc, max_instrs, &mut Visited::new(), &code_read_word)
-}
-
-#[cfg(test)]
-fn nzcv_dead_at_with_reader<R>(start_pc: u32, max_instrs: u32, read_insn: &R) -> bool
-where R: Fn(u32) -> Option<u32> {
-    nzcv_dead_recursive(start_pc, max_instrs, &mut Visited::new(), read_insn)
-}
-
 fn nzcv_dead_recursive<R>(
     start_pc: u32, max_instrs: u32, visited: &mut Visited, read_insn: &R,
 ) -> bool
@@ -1283,10 +1269,6 @@ impl Visited {
     }
 }
 
-fn live_at(start_pc: u32, max_instrs: u32) -> RegMask {
-    live_at_with_reader(start_pc, max_instrs, &code_read_word)
-}
-
 /// Liveness analysis with an injectable instruction reader. Production
 /// callers use `code_read_word`; tests pass an in-memory closure.
 fn live_at_with_reader<R>(start_pc: u32, max_instrs: u32, read_insn: &R) -> RegMask
@@ -1421,12 +1403,19 @@ where R: Fn(u32) -> Option<u32> {
 ///
 /// Returns None when neither shape is achievable; caller halts loudly.
 fn pick_scratch_regs(d: &Decoded, orig_pc: u32) -> Option<(u32, Option<u32>)> {
+    pick_scratch_regs_with_reader(d, orig_pc, &code_read_word)
+}
+
+fn pick_scratch_regs_with_reader<R>(
+    d: &Decoded, orig_pc: u32, read_insn: &R,
+) -> Option<(u32, Option<u32>)>
+where R: Fn(u32) -> Option<u32> {
     const CANDIDATES: &[u32] = &[12, 0, 1, 2, 3, 14];
     // 32-instruction window: a typical Newton-ROM function body fits
     // within 32 from the byte-access site. Smaller windows hit the
     // conservative fallback ("all unwritten regs live") prematurely
     // and reject sites that genuinely have dead scratch candidates.
-    let live = live_at(orig_pc.wrapping_add(4), 32);
+    let live = live_at_with_reader(orig_pc.wrapping_add(4), 32, read_insn);
     let operand_mask: RegMask = (1u16 << d.rt) | (1u16 << d.rn) | match d.offset {
         OffsetForm::Reg { rm, .. } => 1u16 << rm,
         _ => 0,
@@ -1441,7 +1430,11 @@ fn pick_scratch_regs(d: &Decoded, orig_pc: u32) -> Option<(u32, Option<u32>)> {
         n += 1;
         if n == 2 { return Some((picks[0], Some(picks[1]))); }
     }
-    if n == 1 && nzcv_dead_at(orig_pc.wrapping_add(4), 32) {
+    if n == 1
+        && nzcv_dead_recursive(
+            orig_pc.wrapping_add(4), 32, &mut Visited::new(), read_insn,
+        )
+    {
         return Some((picks[0], None));
     }
     None
@@ -3256,6 +3249,71 @@ mod tests {
         // r0 dead on fall-through (written before return), live on taken
         // path (taken path's BX LR reads return-value-live r0). Union: live.
         assert_ne!(live & (1u16 << 0), 0, "r0 live (taken path needs it)");
+    }
+
+    #[test]
+    fn pick_scratch_at_rom_0x257080_does_not_pick_r0() {
+        // ROM 0x00257080: ldrb r1, [r4, #160] — the LDRB iter-25
+        // suspected of clobbering r0 via the shadow-stub. The
+        // surrounding basic block (from rom.dis) is:
+        //   0x257080: ldrb r1, [r4, #160]      <- the access
+        //   0x257084: teq  r1, sl
+        //   0x257088: bne  0x2570c0            <- cond, target writes r0 first
+        //   0x25708c: add  r1, r0, #1          <- READS r0 on fall-through
+        //   0x257090: str  r1, [r4, #156]
+        //   0x257094: add  r0, r0, r4          <- READS r0
+        //   0x257098: strb r6, [r0, #161]      <- READS r0
+        //   0x25709c: ldr  r0, [r4, #156]      <- writes r0
+        //   ... then bl WriteRun, returns
+        //   0x2570c0: mov  r0, r4              <- BNE target writes r0
+        //   0x2570c4: bl   WriteRun
+        // Fall-through path reads r0 → r0 LIVE at 0x257084. Picker must
+        // pick R12 + R2 (both dead by APCS_RETURN_LIVE) and leave R0
+        // alone. If this test fails, the shadow-stub IS clobbering r0.
+        //
+        // Stream is laid out so PC=0 corresponds to ROM 0x257080.
+        // BNE imm24=10: target = pc+8+(10<<2) = 8+8+40 = 0x38 → stream[14].
+        let stream = [
+            0xE5D4_10A0u32, // [0]  pc=0x00 LDRB r1, [r4, #160]
+            0xE131_000Au32, // [1]  pc=0x04 TEQ  r1, sl
+            0x1A00_000Au32, // [2]  pc=0x08 BNE  +10 (target = 0x38)
+            0xE280_1001u32, // [3]  pc=0x0c ADD  r1, r0, #1
+            0xE584_109Cu32, // [4]  pc=0x10 STR  r1, [r4, #156]
+            0xE080_0004u32, // [5]  pc=0x14 ADD  r0, r0, r4
+            0xE5C0_60A1u32, // [6]  pc=0x18 STRB r6, [r0, #161]
+            0xE594_009Cu32, // [7]  pc=0x1c LDR  r0, [r4, #156]
+            0xE12F_FF1Eu32, // [8]  pc=0x20 BX   LR    (terminate fall-through)
+            0xE12F_FF1Eu32, // [9]  pc=0x24 (unused)
+            0xE12F_FF1Eu32, // [10] pc=0x28 (unused)
+            0xE12F_FF1Eu32, // [11] pc=0x2c (unused)
+            0xE12F_FF1Eu32, // [12] pc=0x30 (unused)
+            0xE12F_FF1Eu32, // [13] pc=0x34 (unused)
+            0xE1A0_0004u32, // [14] pc=0x38 MOV  r0, r4   (BNE target)
+            0xE12F_FF1Eu32, // [15] pc=0x3c BX   LR
+        ];
+        let read = |pc: u32| stream.get((pc / 4) as usize).copied();
+        let d = decode(stream[0]).expect("decode LDRB");
+        assert_eq!(d.kind, AccessKind::Ldrb);
+        assert_eq!(d.rt, 1);
+        assert_eq!(d.rn, 4);
+
+        let live = live_at_with_reader(4, 32, &read);
+        assert_ne!(live & (1u16 << 0), 0,
+            "r0 must be live at 0x257084 — fall-through reads it via `add r1, r0, #1`; live={:#x}", live);
+
+        let picks = pick_scratch_regs_with_reader(&d, 0, &read)
+            .expect("picker should find 2 dead regs");
+        let (sea, sfl) = picks;
+        assert_ne!(sea, 0, "scratch_ea must not be r0; got {}", sea);
+        if let Some(s) = sfl {
+            assert_ne!(s, 0, "scratch_flags must not be r0; got {}", s);
+        }
+        // The deterministic answer (CANDIDATES order [12,0,1,2,3,14],
+        // operand_mask=R1|R4, live includes R0 and APCS_RETURN_LIVE):
+        // first pick R12 (dead), skip R0 (live), skip R1 (operand),
+        // pick R2 (dead). Lock that in so future regressions surface.
+        assert_eq!(sea, 12, "scratch_ea expected R12; got {}", sea);
+        assert_eq!(sfl, Some(2), "scratch_flags expected R2; got {:?}", sfl);
     }
 
     #[test]

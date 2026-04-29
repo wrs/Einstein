@@ -861,6 +861,22 @@ pub const WC_LOAD_PROBE_HVC_IMM:          u32 = 0x62;
 pub const WC_LOAD_PROBE_PC:               u32 = 0x0025_7074;
 const WC_LOAD_FIRST_INSN:                 u32 = 0xE594_009C; // ldr r0, [r4, #156]
 
+/// `WriteChunk` count-store probe — patches the
+/// `str r1, [r4, #156]` at ROM `0x00257090` (PATH B's count++).
+/// Handler logs `(this=r4, r1_value, count_in_memory_before)`
+/// and emulates the store.
+pub const WC_STORE_PROBE_HVC_IMM:         u32 = 0x63;
+pub const WC_STORE_PROBE_PC:              u32 = 0x0025_7090;
+const WC_STORE_FIRST_INSN:                u32 = 0xE584_109C; // str r1, [r4, #156]
+
+/// `WriteChunk` count-reload probe — patches the
+/// `ldr r0, [r4, #156]` at ROM `0x0025709C` (re-read just
+/// before the cmp #255 / bl WriteRun decision). Handler logs
+/// `(this=r4, count_in_memory)` and emulates the load.
+pub const WC_RELOAD_PROBE_HVC_IMM:        u32 = 0x64;
+pub const WC_RELOAD_PROBE_PC:             u32 = 0x0025_709C;
+const WC_RELOAD_FIRST_INSN:               u32 = 0xE594_009C; // ldr r0, [r4, #156]
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -1241,8 +1257,8 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             "TUnicodeCompressor::Reset entry",
             COMP_RESET_PROBE_HVC_IMM,
         );
-        // WriteChunk count-load probe — fires once per
-        // loop iteration so we can see when count gets corrupted.
+        // WriteChunk count-load probe — re-enabled iter 24 after
+        // confirming the wedge fires identically without it.
         patch_probe(
             rom_ptr,
             WC_LOAD_PROBE_PC,
@@ -1250,6 +1266,25 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(WC_LOAD_PROBE_HVC_IMM),
             "WriteChunk count-load",
             WC_LOAD_PROBE_HVC_IMM,
+        );
+        // Iter 24: probe the count store and the immediate
+        // re-read so we can see whether the store wrote the
+        // expected value and what the re-read sees.
+        patch_probe(
+            rom_ptr,
+            WC_STORE_PROBE_PC,
+            WC_STORE_FIRST_INSN,
+            hvc_insn(WC_STORE_PROBE_HVC_IMM),
+            "WriteChunk count-store",
+            WC_STORE_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            WC_RELOAD_PROBE_PC,
+            WC_RELOAD_FIRST_INSN,
+            hvc_insn(WC_RELOAD_PROBE_HVC_IMM),
+            "WriteChunk count-reload",
+            WC_RELOAD_PROBE_HVC_IMM,
         );
     }
 }

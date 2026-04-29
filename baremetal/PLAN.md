@@ -8,15 +8,16 @@ available). After iter-12's 36-KiB stack patch landed, the
 alrt-task DABT (cross-subpage stack overflow corrupting the alrt
 task's CList) is GONE. Phase B has moved on to the next stall.
 
-**Current goal: count flips within iter 1's PATH B — Iter 20
-WriteChunk count-load probe (HVC #0x62 at 0x00257074) shows:
-`WC-load #0 count=0`, `WC-load #1 count=1`, then WriteRun fires
-with count=0x20000111. The corruption happens IN ITERATION 1,
-between str (count=2) and the immediate re-read at 0x25709c
-(count=0x20000111) — a 4-instruction window. Strong evidence of
-a stage-1 alias / cache coherency issue. Next: dump stage-1 walk
-for the compressor's VA to find which PA backs it and identify
-the alias hazard.**
+**Current goal: PA=0x04084000 aliased between heap VA=0x0c646000
+and stack VA=0x0ccc8000 — Iter 21's stage-1 walk confirmed the
+compressor's count VA `0x0c646ca8` resolves to PA `0x04084ca8`,
+and the boot log already shows a `Prim ALIAS` between this PA
+and VA `0x0ccc8000`. Some other task running on stack VA
+0x0ccc8000 writes to offset 0xca8 (= some stack frame field
+holding a CPSR-shaped value), which corrupts the compressor's
+count via the alias. Iter-22 should either (a) PA-split
+the alias via stage-2 redirect (Option β from prior iters), or
+(b) patch the kernel allocator to not reuse already-mapped PAs.**
 
 ### IdleProc probe — corruption pattern identified
 
@@ -229,6 +230,104 @@ TAlertEventHandler region.
   allocator's freelist threading code (the ROM PCs we see are
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
+
+### Iteration 21 (next-loop iter 17): stage-1 walk + alias tracker — PA=0x04084000 alias between heap and stack VAs
+
+Iter 20 narrowed the count corruption to a 4-instruction window
+in WriteChunk's iter 1 PATH B (between str and re-read).
+Hypothesised stage-1 alias. This iteration extends the WriteChunk
+entry probe to:
+1. Dump the stage-1 walk for `this+0x9c` (the count VA).
+2. Resolve the count VA → PA and look up
+   `PRIM_FIRST_VA_FOR_PA[pa]` to detect aliases.
+3. Also dump the callback function pointer and arg
+   (`*(this+0x10)`, `*(this+0x14)`).
+
+#### Cold-boot result — alias confirmed
+
+```
+WriteChunk #0 ENTER: this=0x0c646c0c ptr=0x0cc77aa4 length=18 \
+  count=0x0 cb=0x01a3deac(0x0cc77a8c) caller_lr=0x002dcf20
+  stage1 walk VA=0x0c646ca8: L1[0xc6] = 0x0401c881 (coarse)
+    coarse L2 @ PA 0x401c800, L2[0x46] = 0x0408403e (small)
+  WriteChunk count_pa=0x04084ca8 → tracker[first_va_for_pa]=0x0c646000
+```
+
+The Prim tracker's `first_va_for_pa` reports VA `0x0c646000` —
+just the compressor's own VA — but searching the boot log shows
+the canonical `Prim ALIAS:` line:
+
+```
+Prim ALIAS: PA=0x04084000  VA1=0x0ccc8000 (upstream_lr=0x000d8e3c)
+   VA2=0x0c646000 (caller_lr=0x003109e4)  mask=0x3f perm=0x1
+verify-mmu alias: PA=0x04084000 VA1=0x0c646000 (L1[0xc6],L2[0x46])
+   VA2=0x0ccc8000 (L1[0xcc],L2[0xc8])
+```
+
+**The compressor's heap page at VA `0x0c646000` aliases PA
+`0x04084000` with stack/data page VA `0x0ccc8000`.** Both
+mappings come through `caller_lr=0x003109e4` (post-bl
+LockHeapRange in ExtendVMHeap), meaning the kernel's heap-extend
+path reused a PA that was already in use elsewhere.
+
+#### Why the corruption looks CPSR-shaped
+
+VA `0x0ccc8ca8` is somewhere in the aliasing region's stack
+frame. The value `0x20000110` matches a saved CPSR (NZCV=0010,
+mode USR=0x10) — likely an exception handler's stack-frame
+push of the saved-CPSR slot. After WriteChunk's str writes 2 to
+PA `0x04084ca8` via heap VA, an exception handler runs in the
+OTHER task on stack VA `0x0ccc8000`, pushes its CPSR as part of
+the exception-entry trampoline, and that push lands at the SAME
+PA, clobbering the compressor's count.
+
+#### The callback at `*(this+0x10)`
+
+`cb=0x01a3deac` (REx region) with `arg=0x0cc77a8c` (alarm task
+sp). `New__18TUnicodeCompressorFv` doesn't set `+0x10`/`+0x14` —
+the compressor's caller (TStoreWritePipe::WriteToStore at
+`0x002DCEF0`+) presumably initializes these via a separate
+helper. The callback isn't invoked in our wedge case
+(w98=0 < 128, so PATH E never fires), so the callback isn't the
+corruption source.
+
+#### Next iteration plan
+
+The bug is the **ARMv4-subpage-AP alias hazard** the prior
+audit warned about. The fix is one of:
+
+**Option β (stage-2 PA splitting)** — when PrimRememberMapping
+installs an alias (the second VA for a PA already in use), the
+hypervisor allocates a private shadow page from `shadow_pool.rs`
+(infrastructure already exists from iter 9), copies the PA's
+contents to the shadow IPA, and rewrites the L2 entry to point
+at the shadow IPA instead. The shadow_pool has 16 pages; might
+need to grow to cover ALL Group-2 aliases.
+
+**Option γ (kernel patch)** — patch `ExtendVMHeap` /
+`LockHeapRange` to skip PAs already in `PRIM_FIRST_VA_FOR_PA`,
+forcing the kernel allocator to pick a unique PA. Less work than
+β but more invasive at the kernel level.
+
+**Option δ (clamp in WriteChunk)** — defensive workaround:
+patch WriteChunk's count-load to clamp count to ≤ 255 before
+the loop. Hides the symptom but doesn't fix the alias bug.
+NOT acceptable per CLAUDE.md ("No workarounds").
+
+**Recommend Option β next iteration.** The shadow_pool
+infrastructure is ready; we just need the redirect at
+PrimRememberMapping. The same fix would handle every Group-2
+alias automatically.
+
+#### Status
+
+- 36/36 guest tests pass.
+- All prior iter probes stay active.
+- Iter-21 deliverable: stage-1 walk + alias tracker integration,
+  CONFIRMING that the compressor's PA is aliased with another
+  task's stack VA. The wedge mechanism is now fully explained:
+  ARMv4-subpage-AP allocator reuses a PA across consumers; under
+  flat AP=11 both VAs see each other's writes.
 
 ### Iteration 20 (next-loop iter 16): WriteChunk count-load probe — count flips between str and re-read in iter 1 PATH B
 

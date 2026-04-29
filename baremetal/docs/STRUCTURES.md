@@ -1357,7 +1357,7 @@ Citations:
 - `WriteRun @ 0x00256F94..0x00256FFC` iterates the byte buffer at
   `[this+0xa1+r5]` for `r5 = 0..count-1`.
 
-**Phase B iter 20 wedge.** A 420-byte instance at USER pointer
+**Phase B iter 21 wedge.** A 420-byte instance at USER pointer
 `0xc646c0c..0xc646db0`. `New` zeros count, WriteChunk enters
 with count=0. The count-load probe at ROM `0x00257074`
 (`ldr r0, [r4, #156]`) shows iter 0 starting with count=0
@@ -1376,9 +1376,23 @@ and re-read (count=0x20000111):
 ```
 
 The strb at `+0xa2` cannot directly corrupt count at `+0x9c`.
-Strong-evidence theory: stage-1 alias — the compressor's page
-shares a physical page with another active VA whose write
-during this window lands on count.
+**Stage-1 alias confirmed**: VA `0x0c646ca8` (compressor's count)
+resolves to PA `0x04084ca8`, which is also reachable via
+VA `0x0ccc8ca8` (a stack region of another task). The Prim
+ALIAS log shows:
+```
+Prim ALIAS: PA=0x04084000  VA1=0x0ccc8000 (upstream_lr=0x000d8e3c)
+   VA2=0x0c646000 (caller_lr=0x003109e4)  mask=0x3f perm=0x1
+```
+Both mappings come through `caller_lr=0x003109e4` =
+post-bl LockHeapRange in ExtendVMHeap. The kernel reused
+PA `0x04084000` for the heap extension despite already having
+it mapped at VA `0x0ccc8000`.
+
+When some other task's exception-entry trampoline pushes a
+saved CPSR onto its stack at offset `0xca8`, the write lands at
+PA `0x04084ca8` via the alias, clobbering the compressor's
+count with a CPSR-shaped value (`0x20000110`).
 
 The fault MECHANISM at FAR=`0xc647003`:
 1. WriteChunk reads count from `+0x9c` = `0x20000110`

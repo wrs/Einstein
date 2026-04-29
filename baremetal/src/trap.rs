@@ -4182,11 +4182,41 @@ fn handle_write_chunk_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
     let caller_lr = crate::banked::lr_for_mode(ctx, source_cpsr);
     let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
     let mode = source_cpsr & 0x1F;
+    // Also capture the callback function pointer (+0x10) and the
+    // argument (+0x14). New zeroes +0x98/+0x9c/+0xa0 but NOT
+    // +0x10/+0x14 — so if these are non-null they were set by
+    // an earlier setter (probably WriteToStore's pipe init).
+    let cb_func = guest_mem::read_word_va(this.wrapping_add(0x10)).unwrap_or(0xDEAD_BEEF);
+    let cb_arg = guest_mem::read_word_va(this.wrapping_add(0x14)).unwrap_or(0xDEAD_BEEF);
 
     kprintln!(
-        "WriteChunk #{} ENTER: this={:#010x} ptr={:#010x} length={}(0x{:x}) count={:#x} caller_lr={:#010x} src_mode={:#x} sp={:#010x}",
-        seq, this, ptr, length, length, count, caller_lr, mode, sp,
+        "WriteChunk #{} ENTER: this={:#010x} ptr={:#010x} length={}(0x{:x}) count={:#x} cb={:#010x}({:#010x}) caller_lr={:#010x} src_mode={:#x} sp={:#010x}",
+        seq, this, ptr, length, length, count, cb_func, cb_arg, caller_lr, mode, sp,
     );
+
+    // Iter 21: dump the stage-1 walk for the compressor's count
+    // VA and look up the PA in the per-PA → first-VA alias
+    // tracker. If the same PA is currently mapped at another VA,
+    // we have the alias-hazard suspect.
+    let count_va = this.wrapping_add(0x9c);
+    guest_mem::dump_stage1_walk(count_va);
+    if let Some(pa) = guest_mem::translate_va(count_va) {
+        let pa_idx = pa
+            .wrapping_sub(PRIM_TRACKER_RAM_BASE)
+            .wrapping_shr(12) as usize;
+        if pa_idx < PRIM_TRACKER_RAM_PAGES {
+            let other_va = PRIM_FIRST_VA_FOR_PA[pa_idx].load(Ordering::Relaxed);
+            kprintln!(
+                "  WriteChunk count_pa={:#010x} → tracker[first_va_for_pa]={:#010x}",
+                pa, other_va
+            );
+        } else {
+            kprintln!(
+                "  WriteChunk count_pa={:#010x} (out of tracker range)",
+                pa
+            );
+        }
+    }
 
     // Emulate `mov ip, sp`.
     ctx.x[12] = sp as u64;

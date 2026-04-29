@@ -222,6 +222,110 @@ TAlertEventHandler region.
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
 
+### Iteration 14 (next-loop iter 10): LockHeapRange probe + ResolveFault wrapper bug fix + Init divisor revert
+
+Three discoveries this iteration, all from extending the diagnostic
+chain.
+
+#### 1. LockHeapRange entry probe — pinpoints `ExtendVMHeap`
+
+Added `LOCK_HEAP_RANGE_PROBE_HVC_IMM=0x5A` patching the `mov ip, sp`
+prologue at `0x001F_8AB4` (the `LockHeapRange` user-shim entry).
+Handler logs `(base, limit, lock_id, caller_lr)` per call.
+
+The wedge sequence is unambiguous:
+
+```
+LockHeapRange #75: base=0xc608000 limit=0xc646000 lock_id=0  caller_lr=0x003109e4
+LockHeapRange #76: base=0xc646000 limit=0xc647000 lock_id=0  caller_lr=0x003109e4
+... infinite ResolveFault loop on FAR=0xc647003 ...
+```
+
+`caller_lr=0x003109e4` is the instruction after `bl LockHeapRange`
+inside `ExtendVMHeap` at ROM `0x0031_091C`. So the heap-extend
+path is the trigger, exactly as iter-13 hypothesized.
+
+#### 2. `Init__11THeapDomain` divisor patch was over-aggressive — reverted
+
+`Init__11THeapDomain` is the constructor for THeapDomain, which is
+used for BOTH stack pools AND data heaps. Patching its divisor at
+`0x001F_8D74` to 36 KiB correctly sizes the slot_info array for
+stack pools but UNDER-sizes bookkeeping for data heaps (108 entries
+→ 99). With under-sized heap bookkeeping, ExtendVMHeap can't grow
+beyond what the smaller array can index.
+
+Reverted that patch. `GetStackInfo` and `FMFree` divisors stay
+patched — those functions are stack-only, and need the matching
+36 KiB stride for correct slot index computation.
+
+After the revert, `info_bounds` advance correctly during the
+boot — bounds extend to `0xc647000` matching `LockHeapRange #76`'s
+limit. The wedge moved one page later: now FAR=`0xc647003` with
+bounds=`[0xc601000, 0xc647000)`, an out-of-bounds access just past
+the heap's new top.
+
+#### 3. ResolveFault wrapper was MASKING errors as success — fixed
+
+The wrapper at `apply_resolve_fault_wrapper` was designed for the
+33-KiB-stack layout where each 4 KiB physical page is shared between
+adjacent stacks via subpage AP. It iterated 4 sub-pages per fault
+and ignored `-10203` ("subpage belongs to another stack — skip")
+return codes from `ResolveFault`, falling through to `mov r0, #0`
+on loop completion.
+
+With 36-KiB stacks, no 4-KiB page is shared, so `-10203` should
+never fire. When it DOES (because of the heap-extend off-by-one),
+the wrapper's "ignore -10203, return 0" semantics MASK the real
+failure: the kernel re-faults forever on an unmapped page.
+
+Fixed the wrapper's check from `cmp r0, #4 / beq done` to
+`cmp r0, #0 / bne done` — propagate ANY non-zero return. Encoding:
+
+| offset within wrapper | was | now |
+|---|---|---|
+| `+0x40` | `0xE350_0004` (cmp r0, #4) | `0xE350_0000` (cmp r0, #0) |
+| `+0x44` | `0x0A00_0003` (beq done) | `0x1A00_0003` (bne done) |
+
+After the fix, the kernel correctly receives the failure return
+code, calls SetHeapLimits to roll back, and reaches its
+out-of-memory failure path → triggers `Reboot` canary.
+
+### Boot state at end of iter 14
+
+```
+CORRUPTION count: 0                       (alrt-DABT FIXED, iter 12)
+LockHeapRange total: 77                   (heap-extend chain complete)
+IdleProc #000 ENTER: count=0 esize=4      (clean CList, iter 12)
+last LockHeapRange: #76 base=0xc646000 limit=0xc647000  (extends 4 KiB)
+wedge: kernel reboots after FAR=0xc647003 unresolvable fault
+```
+
+The kernel is reaching MUCH later boot stages: `IdleProc` runs
+clean, 77 heap operations succeed (up from 5 in iter 12). The
+final stall is now a NEW class of bug: an unaligned 4-byte STR
+spanning the heap top boundary. The `+3` offset of FAR=`0xc647003`
+suggests a 4-byte access starting at `0xc646FFF` (last mapped byte)
+with 3 bytes spilling into unmapped territory.
+
+### Next iteration — find the unaligned-STR site
+
+The fault PC isn't captured by the existing probes. Strategies:
+
+1. **Augment the Fault(stackmgr) probe** to read `procst[+0x40]`
+   (saved ELR_EL1 / PC) and log it with FAR. Identifies the
+   exact kernel/user PC at the moment of fault.
+2. **Stage-2 RO trap on the heap's last page** — capture the
+   STR instruction and decode its target. `pa_emulate.rs` is
+   already wired for this; just need to retarget it to the
+   heap page.
+3. **Cross-check Einstein** — does Einstein's heap allocator
+   tolerate the `heap_top - 1` 4-byte access pattern? If so the
+   bug is hypervisor-specific.
+
+The 36-KiB stack patch + GetStackInfo/FMFree divisor patches
++ corrected ResolveFault wrapper stay active — they're proven
+forward progress. 36/36 guest tests pass.
+
 ### Iteration 13 (next-loop iter 9): pool-wedge analysis — it's a HEAP-extend mismatch, not a stack-pool sizing issue
 
 Drilled into the iter-12 wedge timeline. Tracking

@@ -8,9 +8,12 @@ available). After iter-12's 36-KiB stack patch landed, the
 alrt-task DABT (cross-subpage stack overflow corrupting the alrt
 task's CList) is GONE. Phase B has moved on to the next stall.
 
-**Current goal: heap-extend off-by-one — `TUnicodeCompressor`
-allocation straddles the heap boundary, only 4 KiB of the required
-8 KiB get LockHeapRange'd. See Iter 15 below for the pinpoint.**
+**Current goal: NewBlock allocator off-by-one — a 420-byte
+`TUnicodeCompressor` block ends up at `0xc646f60`, spanning the
+heap top at `0xc647000`. Iter 16 ruled out ExtendVMHeap as the
+culprit (its rounding is correct for the 784-byte request that
+was made). Next probe the NewBlock allocator's freelist placement
+to find why the 420-byte block lands so close to the heap top.**
 
 ### IdleProc probe — corruption pattern identified
 
@@ -223,6 +226,114 @@ TAlertEventHandler region.
   allocator's freelist threading code (the ROM PCs we see are
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
+
+### Iteration 16 (next-loop iter 12): ExtendVMHeap probe — rules out the heap-extend rounding as the bug
+
+Iter 15 hypothesized that `ExtendVMHeap` was undersizing the heap
+extension, leaving the freshly-allocated 420-byte compressor object
+spilling past the new heap top. This iteration adds an
+`ExtendVMHeap` entry probe (`HVC #0x5B` patching `mov ip, sp` at
+ROM `0x0031091C`) that logs `(this, requested, chunk_size,
+rounded, current_top, proposed_top, reserved_end, caller_lr)` per
+call.
+
+#### Cold-boot result — extend rounding is consistent
+
+11 ExtendVMHeap calls fire before the wedge. The relevant ones:
+
+```
+ExtendVMHeap #9:  this=0xc601010 requested=0x3d0a4 chunk=0x1000 \
+  rounded=0x3e000 top=0x07000 -> 0x45000 reserved_end=0x380000 \
+  caller_lr=0x00311e1c
+LockHeapRange #75: base=0xc608000 limit=0xc646000  (0x3e000 = 248 KiB)
+
+ExtendVMHeap #10: this=0xc601010 requested=0x310 chunk=0x1000 \
+  rounded=0x1000 top=0x45000 -> 0x46000 reserved_end=0x380000 \
+  caller_lr=0x00311e1c
+LockHeapRange #76: base=0xc646000 limit=0xc647000  (0x1000 = 4 KiB)
+```
+
+`requested=0x310` (= 784 bytes) for the call right before the
+wedge. The kernel rounds `roundup(784, 4096) = 4096`, extends by
+one chunk, and locks the 4 KiB range. **No rounding bug** — the
+caller asked for 784 bytes, the kernel delivered 4096 bytes of
+fresh heap.
+
+#### What the request size means
+
+`caller_lr=0x00311e1c` is the post-`bl ExtendVMHeap` instruction
+inside `NewBlock` at ROM `0x00311DB8`. Decoding NewBlock:
+
+```
+311dc4: mov  r5, r0                ; r5 = requested_size
+311dc8: bl   GetCurrentHeap        ; r4 = current_heap
+311dd0: add  r0, r5, #16           ; r5 += 16 (block header)
+311dd4..311ddc: align r5 to 4-byte
+311de4: ldr  r0, [r4, #0x20]       ; saved last-block scan position
+311dec: str  r0, [r4, #0x48]       ; for retry-after-extend
+311df4..311e0c: SearchFreeList(r5) ; find free block ≥ r5 bytes
+311e10..311e1c: bl   ExtendVMHeap(r4, r5)   ; if not found
+311e28..311ee0: split block, mark used, return
+```
+
+So the `r1=0x310` (784) request to ExtendVMHeap is the
+**total-needed-bytes for the failing search** — i.e. the block
+*including* the 16-byte header for an allocation of size
+`0x310 - 0x10 = 0x300` (768) bytes (or with extra alignment-fudge,
+slightly less). **This is NOT the 420-byte compressor allocation.**
+
+A 420-byte allocation would round to `420 + 16 = 436` (still
+under the available 4096 fresh bytes), so it doesn't trigger
+ExtendVMHeap at all — it's served from the freelist.
+
+#### Where does the compressor end up?
+
+The 420-byte compressor object lands at `0xc646f60` based on the
+fault arithmetic (`r0 + 0xa1 = 0xc647003` at `ldrb r0, [r0, #161]`,
+with r5≥0). The freshly-extended 4 KiB chunk is `[0xc646000,
+0xc647000)`. NewBlock's `MoveFreeBlock`-based split takes from the
+**front** of the free block, so a 420-byte allocation against a
+fresh `[0xc646000, 0xc647000)` free block would land at
+`0xc646000`, **not** `0xc646f60`. The compressor ending up at
+`0xc646f60` means the allocator picked a **different** free block,
+or split from a position 0xf60 bytes into a free block that
+extends past the heap top.
+
+#### Next iteration — NewBlock entry+exit probe
+
+Add an `HVC #0x5C` probe at `NewBlock`'s prologue (`mov ip, sp` at
+ROM `0x00311DB8`) and a paired probe at the success-return
+`ldmdb fp, {..., pc}` at ROM `0x00311EDC` so we can log every
+`(requested_size, returned_block_addr, caller_lr)` triple. The
+allocation that returns `0xc646f60..0xc647104` for a 420-byte
+request is the smoking gun. With its caller_lr we can identify the
+ROM site that does this allocation.
+
+Bonus: the freelist might be holding STALE addresses past the
+heap top that NewBlock's SearchFreeList trusts. If so, the bug is
+upstream of NewBlock — possibly a `__dl__`/free path that's
+adding back-already-extended pages or a `MoveFreeBlock` corruption
+similar to the iter-12 alrt-DABT but in a different region.
+
+The diagnostic output to expect:
+
+```
+NewBlock #N: req=0x1a4(420)+0x10=0x1b4 returns=0x0c646f60 caller_lr=0x...
+```
+
+If `returns=0x0c646f60`, the freelist contained a free block at
+`0xc646f60` ≥ 0x1b4 bytes BEFORE the call. That block extends to
+`>= 0xc647114`, past the current heap top of `0xc647000` — proving
+the freelist got corrupted/stale.
+
+#### Status
+
+- 36/36 guest tests pass.
+- Iter-12 36-KiB stack patches stay active.
+- Iter-14 ResolveFault wrapper fix stays active.
+- Iter-15 Fault(stackmgr) probe + SBA-stub origin lookup stay active.
+- Iter-16 deliverable: ExtendVMHeap probe, rules out ExtendVMHeap
+  rounding as the iter-15 wedge cause.
 
 ### Iteration 15 (next-loop iter 11): Fault(stackmgr) procst dump + SBA-stub origin reveal — wedge is `TUnicodeCompressor::WriteRun`
 

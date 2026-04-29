@@ -757,6 +757,23 @@ pub const LOCK_HEAP_RANGE_PROBE_HVC_IMM: u32 = 0x5A;
 pub const LOCK_HEAP_RANGE_PROBE_PC:      u32 = 0x001F_8AB4;
 const LOCK_HEAP_RANGE_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
 
+/// `ExtendVMHeap` entry probe — patches the standard `mov ip, sp`
+/// prologue at ROM `0x0031_091C` with HVC. The handler logs
+/// `(r0=heap, r1=requested_size, current_top=heap[+0x2c],
+/// chunk_size=heap[+0x38], reserved_end=heap[+0x28], caller_lr)`
+/// so we can see whether the allocator's requested-extend size
+/// covers the full block being placed near the heap top.
+///
+/// Iter 15 wedge analysis: `LockHeapRange #76` extended only one
+/// 4-KiB chunk (base=0xc646000 limit=0xc647000) but the placed
+/// 420-byte `TUnicodeCompressor` object spilled past the new top
+/// at offset +0xa1 onwards. Either `ExtendVMHeap` is being called
+/// with a too-small `r1` or its rounding/chunk-size logic isn't
+/// covering the full allocation footprint.
+pub const EXTEND_VM_HEAP_PROBE_HVC_IMM:  u32 = 0x5B;
+pub const EXTEND_VM_HEAP_PROBE_PC:       u32 = 0x0031_091C;
+const EXTEND_VM_HEAP_FIRST_INSN:         u32 = 0xE1A0_C00D; // mov ip, sp
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -1065,6 +1082,18 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(LOCK_HEAP_RANGE_PROBE_HVC_IMM),
             "LockHeapRange entry",
             LOCK_HEAP_RANGE_PROBE_HVC_IMM,
+        );
+        // ExtendVMHeap entry probe — captures (heap, requested_size,
+        // current_top, chunk_size, reserved_end, caller_lr) per call.
+        // Diagnoses the iter-15 wedge where the allocator places a
+        // 420-byte block past the freshly-extended heap top.
+        patch_probe(
+            rom_ptr,
+            EXTEND_VM_HEAP_PROBE_PC,
+            EXTEND_VM_HEAP_FIRST_INSN,
+            hvc_insn(EXTEND_VM_HEAP_PROBE_HVC_IMM),
+            "ExtendVMHeap entry",
+            EXTEND_VM_HEAP_PROBE_HVC_IMM,
         );
     }
 }

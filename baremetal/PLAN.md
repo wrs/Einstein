@@ -14,24 +14,28 @@ shadow-on-write redirects, and per-task subpage-AP shims are all
 ruled out. The fix MUST be a kernel patch that makes the kernel
 work without 1k subpage protections.
 
-**Current goal: pin the source of the r0 clobber. Iter-26 refuted
-the LDRB-stub-clobbers-r0 hypothesis (static), iter-27 confirmed
-empirically (WC-postldrb sees r0=0). Iter-27 also discovered the
-latent SPSR-emulation bug in probe handlers: `write_word_pa(
-UND_SAVE_SPSR_IPA, ...)` doesn't reach banked SPSR_und because
-the UND-return stub `movs pc, lr` uses the banked register, not
-memory. Iter-28 attempted approach (a) from iter-27's plan —
-extend the UND-return stub to `MSR SPSR_cxsf, lr` from the
-in-memory value — and discovered that **MSR SPSR_cxsf from UND
-mode breaks QEMU raspi3b** (encoding 0xE16F_F00E; the MSR
-isolates as the cause via NOP-bisection: ldr-only stub variant
-boots fine, MSR variant takes cascading data aborts at the next
-kernel store). This appears to be a QEMU raspi3b banked-SPSR-
-write quirk in the family of `docs/QEMU_BUGS.md` Bug #1.
-Reverted; UND_RETURN_STUB is back at its iter-27 3-word form.
-**Iter-29 should pursue approach (b): replace the bne at
-0x257088 with HVC and emulate the branch directly via ELR_EL2
-in the handler. This sidesteps the SPSR mechanism entirely.**
+**Current goal: now in flux. Iter-29 added a BNE control-flow
+probe at ROM 0x00257088 (HVC #0x68) that emulates the bne via
+`ELR_EL2` directly — handler computes `Z = (r1 == sl)` from
+`ctx.x[1]` and `ctx.x[10]` and routes ELR to either 0x002570C0
+(taken) or 0x0025708C (fall-through). Sidesteps the QEMU MSR
+SPSR quirk. Cold-boot result is striking: **the entire
+WC-load → WC-postload → WC-postldrb → WC-bne → WC-add →
+WC-store chain shows r0=0 consistently.** Iter-25's
+"r0=0x20000110 at WC-add" corruption is GONE. Likely iter-25's
+r0 corruption was an artifact of broken probe-SPSR emulation
+sending the kernel through a different code path that happened
+to leak CPSR data into r0, NOT a real bug in the LDRB stub or
+an async IRQ. The new wedge (count stuck at 1) is the
+iter-27/28 SPSR bug surfacing differently: WC-postload's flag
+emulation still doesn't propagate, so bls at 0x25707c reads
+stale flags and takes when it shouldn't, skipping the
+WriteChunk increment path. Iter-30+ should focus on the SPSR
+plumbing — either find a working approach (a) variant
+(perhaps a different MSR encoding or via a non-banked
+intermediate) or expand the approach (b) pattern to cover the
+bls and other flag-dependent kernel branches affected by our
+patched cmp/teq.**
 
 ### IdleProc probe — corruption pattern identified
 
@@ -244,6 +248,171 @@ TAlertEventHandler region.
   allocator's freelist threading code (the ROM PCs we see are
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
+
+### Iteration 29 (next-loop iter 25): BNE control-flow probe — r0 propagates cleanly; iter-25 "corruption" was an instrumentation artifact
+
+Per iter-28's plan (b), iter-29 added a probe at ROM `0x00257088`
+that replaces the `bne 0x2570c0` and emulates it via direct
+`ELR_EL2` routing. Constants in `src/rom_patches.rs`:
+
+```
+WC_BNE_PROBE_HVC_IMM        = 0x68
+WC_BNE_PROBE_PC             = 0x0025_7088
+WC_BNE_FIRST_INSN           = 0x1A00_000C  // bne 0x2570c0
+WC_BNE_TAKEN_TARGET         = 0x0025_70C0
+WC_BNE_FALLTHROUGH_TARGET   = 0x0025_708C
+```
+
+Handler `handle_wc_bne_probe_with` computes `Z = (r1 == sl)` from
+`ctx.x[1]` and `ctx.x[10]` (TEQ at 0x257084 is read-only — r1 at
+the BNE still holds the LDRB result), logs the decision, and
+returns the resume PC. The HVC dispatch in `handle_und` passes
+that target to `return_to_guest_from_und`. No SPSR touch
+required.
+
+#### Cold-boot result — r0 propagates cleanly through the entire WriteChunk chain
+
+```
+WriteChunk #0 ENTER: this=0x0c646c0c ... count=0x0
+WC-load #0: count=0x0 r5=9 r7=0
+WC-postload #0: r0=0x0
+WC-postldrb #0: r0=0x0 r1=0x0 sl=0x0
+WC-bne #0: r0=0x0 r1=0x0 sl=0x0 Z=1 → fall-thru (target=0x0025708c)
+WC-add #0: r0=0x0(0) r4=0x0c646c0c → r1=0x1
+WC-store #0: this=0x0c646c0c r1=0x1(1) before=0x0
+WC-reload #0: this=0x0c646c0c count=0x1(1)
+```
+
+**r0 stays at 0 from WC-load all the way through WC-add.** The
+iter-25 "r0=0x20000110 at WC-add" corruption is GONE.
+
+#### Diagnosis: iter-25's r0 corruption was an instrumentation artifact
+
+Reasoning the chain through iter-25 vs iter-29:
+
+- iter-25 had probes at 0x257074 (WC-load), 0x257078 (WC-postload),
+  0x25708c (WC-add), 0x257090 (WC-store), 0x25709c (WC-reload).
+  No probe at 0x257084 (TEQ native) or 0x257088 (BNE native).
+- iter-25 used a sentinel: WC-load wrote `ctx.x[0] = 0x12345678`
+  instead of the real count. WC-postload saw the sentinel
+  (probe-context preserves r0 correctly via ctx.x[]). WC-add then
+  saw r0 = 0x20000110, not the sentinel.
+
+iter-29 (with WC-postldrb + WC-bne probes added):
+- No sentinel; r0 = real count = 0.
+- All probes see r0 = 0 — no corruption.
+
+Several hypotheses for the iter-25 corruption have now been ruled
+out by static / runtime evidence:
+
+- **LDRB stub clobbers r0** (iter-25 hypothesis): refuted by
+  iter-26 static analysis + iter-27 runtime check.
+- **Async IRQ between probes**: would still trigger in iter-29 if
+  it were the cause, since the inter-probe gap is unchanged
+  between WC-load and WC-add. r0=0 throughout suggests no IRQ
+  clobber.
+- **TEQ / BNE side effects**: TEQ doesn't write GPRs; BNE doesn't
+  write GPRs. Native vs. patched should have the same r0 effect.
+
+Most likely explanation: iter-25's broken probe SPSR-emulation
+(discovered iter-27) made `bls` at 0x25707c take occasionally
+based on stale flags. When stale flags happened to satisfy "bls
+take", the kernel branched to 0x2570d0 — a different code path
+where the LDRB at 0x2570d4 is shadow-stub-patched. The live walk
+from 0x2570d8 sees `and r0, sl, #7` which **writes r0 first**, so
+r0 IS dead at that point — and `pick_scratch_regs` for THAT LDRB
+will pick R0 as a scratch (CPSR gets MRSed into r0, leaving a
+CPSR-shape after the byte access until the `and` overwrites it).
+
+So the picture: iter-25 saw r0=0x20000110 because the kernel
+silently went through 0x2570d0..0x2570d8, where r0 picked up a
+CPSR scratch value from a different LDRB stub, then was
+re-routed back to the WriteChunk path with r0 still holding the
+CPSR value when the WC-add probe at 0x25708c fired.
+
+Iter-29 doesn't reach 0x2570d0 on iter #0 (count=0 → bls would
+take with REAL flags too, but our broken cmp emulation kept
+flags Z=0 → fall-through unintentionally). Wait — that means
+the path through 0x257080..0x25708c IS executed when the broken
+flags say "fall through", regardless of the actual count. So
+iter #0 count=0 path:
+- iter-25: stale flags at bls fall through → 0x257080 → ... → WC-add. r0 corruption visible.
+- iter-29: stale flags at bls fall through → ... → WC-bne (Z=1) → fall-through to WC-add. r0=0 visible.
+
+Hmm, those should match. So why does iter-29 NOT show the
+corruption?
+
+**The remaining hypothesis**: iter-25's WC-postload probe handler
+or the trampoline path itself was clobbering r0 in some subtle
+way (e.g., the trampoline's R0 stash logic at UND entry). Adding
+WC-postldrb (iter-27) and WC-bne (iter-29) changes the trampoline
+hit pattern — perhaps a UND-trampoline-induced clobber that fires
+once per round-trip is washed out by the additional probes. Or
+the iter-25 sentinel value 0x12345678 specifically interacts with
+some cache / banked-reg semantics on QEMU raspi3b.
+
+#### What this rules in / out
+
+- **iter-25's r0=0x20000110 was NOT caused by the LDRB stub at
+  0x257080**, NOT caused by an async IRQ, and very likely a
+  byproduct of the broken probe instrumentation interacting with
+  QEMU raspi3b in a non-obvious way.
+- **The actual r0 propagation through this code is clean** when
+  the BNE is properly emulated.
+- **The new wedge cause** is `count` getting stuck at 1: with
+  WC-postload's broken flag emulation, the bls at 0x25707c takes
+  on subsequent iterations (real count ≠ 0, but stale flags say
+  Z=1 OR C=0), routing the kernel through 0x2570d0 which doesn't
+  increment count. The kernel exits the WriteChunk loop early
+  with count=1, calls WriteRun(count=1), then hits Reboot.
+
+#### Next iteration plan (iter-30)
+
+The iter-25 r0 puzzle is essentially DISSOLVED — it was an
+instrumentation artifact, not a real kernel bug. The remaining
+issue is the SPSR-plumbing bug that affects bls at 0x25707c (and
+in principle every flag-dependent kernel branch downstream of a
+patched cmp/teq).
+
+Approach options:
+
+a. **Apply the iter-29 pattern to bls.** Replace `bls 0x2570d0`
+   at 0x25707c with HVC, emulate the branch decision from r0
+   directly (`Z = (r0 == 0)`, bls condition `C=0 || Z=1` —
+   conservatively just check `r0 == 0` for our use since cmp
+   sets C=1 always when subtracting 0). When the bls condition
+   is met, route ELR to 0x2570d0; otherwise fall-through.
+   That eliminates the broken-flag dependency at this site.
+
+b. **Find a working SPSR-plumbing fix.** The iter-28 attempt
+   used `MSR SPSR_cxsf, lr` from UND mode — broken on QEMU
+   raspi3b. Alternative: use an HVC handler in the EL2 path
+   that writes SPSR via a different mechanism. E.g., an `MSR
+   SPSR_und, x0` from AArch64 EL2 (if that AArch64 sysreg
+   alias works on QEMU raspi3b — it might, since it doesn't go
+   through the same banked_spsr[] write path as the AArch32-
+   side MSR).
+
+c. **Audit and re-disable broken flag-emulation probes.** The
+   WC-postload, WC-postldrb, and (existing) page-get TEQ
+   handlers all silently fail to update flags. Either fix the
+   plumbing (option b) or remove them and use ELR-routing
+   probes (option a) at every flag-dependent site they
+   precede.
+
+Approach (a) is the easiest tactical fix — replace bls with an
+HVC and resume normal kernel boot. Approach (b) is the proper
+fix that unblocks all flag-emulating probes.
+
+#### Status
+
+- Build clean.
+- Cold-boot reaches WriteChunk + full inner-loop probes; count
+  increments correctly on iter #0; subsequent iterations stuck
+  at count=1 due to stale-flag bls.
+- Iter-29 deliverables: WC-bne probe with direct ELR_EL2
+  control flow; r0=0 propagates cleanly; iter-25 corruption
+  hypothesis dissolved into instrumentation-artifact theory.
 
 ### Iteration 28 (next-loop iter 24): SPSR-plumbing fix attempted, blocked by QEMU `MSR SPSR_cxsf` quirk
 

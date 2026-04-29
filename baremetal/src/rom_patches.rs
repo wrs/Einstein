@@ -909,10 +909,31 @@ const WC_POSTLOAD_FIRST_INSN:             u32 = 0xE350_0000; // cmp r0, #0
 ///
 /// Emulates teq r1, sl by setting Z = (r1 == sl), N = MSB(r1 ^ sl)
 /// in saved SPSR. C, V unchanged (TEQ leaves them untouched per
-/// ARM ARM A8.8.236).
+/// ARM ARM A8.8.236). Caveat (iter-27): the SPSR write to
+/// UND_SAVE_SPSR_IPA does NOT reach banked SPSR_und (the UND-return
+/// stub uses the banked register, not memory). Iter-28 attempted
+/// to fix the plumbing via MSR SPSR_cxsf in the stub but
+/// QEMU raspi3b mishandles that instruction. The flag-emulation
+/// here is therefore advisory; the WC-bne probe (iter-29) emulates
+/// the bne control-flow decision directly via ELR_EL2 instead.
 pub const WC_POSTLDRB_PROBE_HVC_IMM:      u32 = 0x67;
 pub const WC_POSTLDRB_PROBE_PC:           u32 = 0x0025_7084;
 const WC_POSTLDRB_FIRST_INSN:             u32 = 0xE131_000A; // teq r1, sl
+
+/// `WriteChunk` BNE probe — patches the `bne 0x2570c0` at ROM
+/// `0x00257088`. Logs r0 right at the conditional branch, between
+/// WC-postldrb (0x257084) and WC-add (0x25708c). Bypasses SPSR by
+/// computing Z = (r1 == sl) directly from `ctx.x[1]` and `ctx.x[10]`
+/// (TEQ at 0x257084 is read-only, so r1 still holds the LDRB
+/// result). The handler routes ELR_EL2 to the BNE target
+/// (0x002570C0) when Z=0, or to the fall-through (0x0025708C) when
+/// Z=1, sidestepping the QEMU raspi3b MSR SPSR quirk discovered in
+/// iter-28.
+pub const WC_BNE_PROBE_HVC_IMM:           u32 = 0x68;
+pub const WC_BNE_PROBE_PC:                u32 = 0x0025_7088;
+const WC_BNE_FIRST_INSN:                  u32 = 0x1A00_000C; // bne 0x2570c0
+pub const WC_BNE_TAKEN_TARGET:            u32 = 0x0025_70C0;
+pub const WC_BNE_FALLTHROUGH_TARGET:      u32 = 0x0025_708C;
 
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
@@ -1346,6 +1367,14 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(WC_POSTLDRB_PROBE_HVC_IMM),
             "WriteChunk post-LDRB teq",
             WC_POSTLDRB_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            WC_BNE_PROBE_PC,
+            WC_BNE_FIRST_INSN,
+            hvc_insn(WC_BNE_PROBE_HVC_IMM),
+            "WriteChunk bne (control-flow emulator)",
+            WC_BNE_PROBE_HVC_IMM,
         );
     }
 }

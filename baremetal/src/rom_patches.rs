@@ -877,6 +877,24 @@ pub const WC_RELOAD_PROBE_HVC_IMM:        u32 = 0x64;
 pub const WC_RELOAD_PROBE_PC:             u32 = 0x0025_709C;
 const WC_RELOAD_FIRST_INSN:               u32 = 0xE594_009C; // ldr r0, [r4, #156]
 
+/// `WriteChunk` count-add probe — patches the
+/// `add r1, r0, #1` at ROM `0x0025708C` (PATH B's increment).
+/// Logs r0 right before the add fires and emulates the add by
+/// setting r1 = r0 + 1. Pins whether r0 is correct after the
+/// WC-load probe's ERET.
+pub const WC_ADD_PROBE_HVC_IMM:           u32 = 0x65;
+pub const WC_ADD_PROBE_PC:                u32 = 0x0025_708C;
+const WC_ADD_FIRST_INSN:                  u32 = 0xE280_1001; // add r1, r0, #1
+
+/// `WriteChunk` post-WC-load probe — patches the
+/// `cmp r0, #0` at ROM `0x00257078`, the FIRST instruction
+/// after the count-load. Logs r0 right after the WC-load
+/// probe's ERET to verify the probe's r0 update propagates.
+/// Emulates cmp by updating NZ flags via SPSR.
+pub const WC_POSTLOAD_PROBE_HVC_IMM:      u32 = 0x66;
+pub const WC_POSTLOAD_PROBE_PC:           u32 = 0x0025_7078;
+const WC_POSTLOAD_FIRST_INSN:             u32 = 0xE350_0000; // cmp r0, #0
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -1285,6 +1303,22 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(WC_RELOAD_PROBE_HVC_IMM),
             "WriteChunk count-reload",
             WC_RELOAD_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            WC_ADD_PROBE_PC,
+            WC_ADD_FIRST_INSN,
+            hvc_insn(WC_ADD_PROBE_HVC_IMM),
+            "WriteChunk count-add",
+            WC_ADD_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            WC_POSTLOAD_PROBE_PC,
+            WC_POSTLOAD_FIRST_INSN,
+            hvc_insn(WC_POSTLOAD_PROBE_HVC_IMM),
+            "WriteChunk post-load cmp",
+            WC_POSTLOAD_PROBE_HVC_IMM,
         );
     }
 }

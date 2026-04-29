@@ -1290,6 +1290,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::LOCK_HEAP_RANGE_PROBE_HVC_IMM => {
             handle_lock_heap_range_probe(ctx);
         }
+        v if v == crate::rom_patches::EXTEND_VM_HEAP_PROBE_HVC_IMM => {
+            handle_extend_vm_heap_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1805,6 +1808,11 @@ fn handle_und(ctx: &mut TrapContext) {
         }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::LOCK_HEAP_RANGE_PROBE_HVC_IMM) => {
             handle_lock_heap_range_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::EXTEND_VM_HEAP_PROBE_HVC_IMM) => {
+            handle_extend_vm_heap_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -3895,6 +3903,60 @@ fn handle_lock_heap_range_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
         "LockHeapRange #{}: base={:#010x} limit={:#010x} lock_id={:#04x} \
 caller_lr={:#010x} src_mode={:#x} sp={:#010x}",
         seq, base, limit, lock_id, caller_lr, source_cpsr & 0x1F, sp,
+    );
+
+    // Emulate `mov ip, sp`.
+    ctx.x[12] = sp as u64;
+}
+
+fn handle_extend_vm_heap_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_extend_vm_heap_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+/// `ExtendVMHeap(r0=heap, r1=requested_size_bytes)` entry probe.
+///
+/// Reads heap struct fields the function itself uses:
+/// - `heap[+0x28]` reserved end (max growable VA)
+/// - `heap[+0x2c]` current top (next free VA)
+/// - `heap[+0x38]` chunk_size used to round up requested_size
+/// - `heap[+0x04]` heap base + cumulative offset (used by SetHeapLimits)
+/// - `heap[+0x00]` heap base (start VA)
+///
+/// Logs the requested-size + rounded-extend that ExtendVMHeap will
+/// pass to LockHeapRange. Pinpoints whether the bug is in the
+/// caller's request size or in chunk-size rounding.
+fn handle_extend_vm_heap_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let this = ctx.x[0] as u32;
+    let requested = ctx.x[1] as u32;
+    let caller_lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let mode = source_cpsr & 0x1F;
+
+    let base = guest_mem::read_word_va(this).unwrap_or(0xDEAD_BEEF);
+    let extra = guest_mem::read_word_va(this.wrapping_add(0x04)).unwrap_or(0xDEAD_BEEF);
+    let reserved_end = guest_mem::read_word_va(this.wrapping_add(0x28)).unwrap_or(0xDEAD_BEEF);
+    let current_top = guest_mem::read_word_va(this.wrapping_add(0x2c)).unwrap_or(0xDEAD_BEEF);
+    let chunk_size = guest_mem::read_word_va(this.wrapping_add(0x38)).unwrap_or(0xDEAD_BEEF);
+
+    // Replicate the kernel's rounding (PC 0x310968..0x310974):
+    //   r5 = (r0 + chunk_size - 1) & ~(chunk_size - 1)
+    let rounded = if chunk_size != 0 && chunk_size != 0xDEAD_BEEF {
+        (requested.wrapping_add(chunk_size).wrapping_sub(1)) & !(chunk_size.wrapping_sub(1))
+    } else {
+        0
+    };
+    let proposed_top = current_top.wrapping_add(rounded);
+
+    kprintln!(
+        "ExtendVMHeap #{}: this={:#010x} requested={:#x} chunk={:#x} rounded={:#x} \
+top={:#010x} -> {:#010x} reserved_end={:#010x} base={:#010x}+{:#x} caller_lr={:#010x} \
+src_mode={:#x} sp={:#010x}",
+        seq, this, requested, chunk_size, rounded, current_top, proposed_top,
+        reserved_end, base, extra, caller_lr, mode, sp,
     );
 
     // Emulate `mov ip, sp`.

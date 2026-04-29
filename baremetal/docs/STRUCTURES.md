@@ -1357,14 +1357,23 @@ Citations:
 - `WriteRun @ 0x00256F94..0x00256FFC` iterates the byte buffer at
   `[this+0xa1+r5]` for `r5 = 0..count-1`.
 
-**Phase B iter 15 wedge.** A 420-byte instance was placed at
-`0xc646f60` near the heap top (`0xc647000`). The `+0xa1` buffer
-spans the page boundary; the `ldrb r0, [r0, #161]` at `0x00256FA8`
-on iteration r5=2 reads `0xc647003`, one byte past mapped memory →
-DFSC=7 page-translation fault → unresolvable in the
-`LockHeapRange/ResolveFault` retry loop because the heap was only
-extended by 4 KiB (`#76: base=0xc646000 limit=0xc647000`) instead
-of the 8 KiB required to cover the 420-byte object.
+**Phase B iter 17 wedge.** A 420-byte instance was placed at
+`0xc646bfc..0xc646da0` (NewBlock #656) — fully within the heap
+top of `0xc647000`, NOT spanning it as iter 15 had hypothesised.
+The wedge at FAR=`0xc647003` corresponds to the `WriteRun` loop
+reaching iteration `r5=870`, which requires `count >= 871` at
+ROM `0x256FF8`'s `bhi` check. Since `WriteChunk` caps count at
+255 and `New`/`Reset` zero it, count > 870 means the compressor
+was used WITHOUT calling New/Reset — count holds heap-garbage
+from `NewBlock`'s freelist memory.
+
+The `+0xa1` buffer access then reads bytes
+`compressor + 0xa1 + r5` for r5=0..870. Byte 870 lands at
+`0xc646bfc + 0xa1 + 870 = 0xc647003` — past the heap top.
+
+The fault MECHANISM: the loop overruns the compressor object
+(420 bytes) by hundreds of bytes, walking through whatever
+follows in the heap, and eventually hits unmapped memory.
 
 ## See also
 

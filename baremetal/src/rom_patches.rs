@@ -774,6 +774,30 @@ pub const EXTEND_VM_HEAP_PROBE_HVC_IMM:  u32 = 0x5B;
 pub const EXTEND_VM_HEAP_PROBE_PC:       u32 = 0x0031_091C;
 const EXTEND_VM_HEAP_FIRST_INSN:         u32 = 0xE1A0_C00D; // mov ip, sp
 
+/// `NewBlock` entry probe — patches the standard `mov ip, sp`
+/// prologue at ROM `0x0031_1DB8` with HVC. The handler captures
+/// `(r0=requested_size, sp, caller_lr)` and stores it in a
+/// per-sp ring so the exit probe can pair the call.
+///
+/// Iter 16 ruled out ExtendVMHeap as the heap-extend cause; the
+/// 420-byte compressor block at `0xc646f60` (spilling past the
+/// heap top of `0xc647000`) must come from NewBlock's freelist
+/// placement. This probe + the matching exit probe log every
+/// `(size, returned_block, caller_lr)` triple to find which
+/// allocation lands there.
+pub const NEW_BLOCK_ENTRY_PROBE_HVC_IMM: u32 = 0x5C;
+pub const NEW_BLOCK_ENTRY_PROBE_PC:      u32 = 0x0031_1DB8;
+const NEW_BLOCK_ENTRY_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
+
+/// `NewBlock` success-return probe — patches the `mov r0, r6` at
+/// ROM `0x0031_1ED8` (one instruction before the LDMDB return).
+/// The handler logs `(returned_block=r6, size=from-pending,
+/// caller_lr=from-pending)` and emulates `mov r0, r6` so the
+/// LDMDB at 0x311EDC fires normally and returns the value.
+pub const NEW_BLOCK_RETURN_PROBE_HVC_IMM: u32 = 0x5D;
+pub const NEW_BLOCK_RETURN_PROBE_PC:      u32 = 0x0031_1ED8;
+const NEW_BLOCK_RETURN_FIRST_INSN:        u32 = 0xE1A0_0006; // mov r0, r6
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -1094,6 +1118,25 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(EXTEND_VM_HEAP_PROBE_HVC_IMM),
             "ExtendVMHeap entry",
             EXTEND_VM_HEAP_PROBE_HVC_IMM,
+        );
+        // NewBlock entry+return probes — capture every block
+        // allocation's (size, returned_addr, caller_lr) triple to
+        // find the one placing a 420-byte block at 0xc646f60.
+        patch_probe(
+            rom_ptr,
+            NEW_BLOCK_ENTRY_PROBE_PC,
+            NEW_BLOCK_ENTRY_FIRST_INSN,
+            hvc_insn(NEW_BLOCK_ENTRY_PROBE_HVC_IMM),
+            "NewBlock entry",
+            NEW_BLOCK_ENTRY_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            NEW_BLOCK_RETURN_PROBE_PC,
+            NEW_BLOCK_RETURN_FIRST_INSN,
+            hvc_insn(NEW_BLOCK_RETURN_PROBE_HVC_IMM),
+            "NewBlock success-return",
+            NEW_BLOCK_RETURN_PROBE_HVC_IMM,
         );
     }
 }

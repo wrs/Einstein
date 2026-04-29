@@ -310,32 +310,72 @@ deliberate stack-guard sharing.
    those accesses must go through some OTHER VA window not yet
    enumerated.
 
-### Next iteration — Option β-light: relocate hypervisor scratch, then redo dedup
+10. **Trampoline relocation succeeded; dedup retried; wedge revealed
+    the actual layout.** Moved `HYP_TRAMP_SCRATCH_BASE` from
+    `0x04005F00` to `0x0600_F000` (last 4 KiB of SCRATCH_POOL).
+    Same value works pre + post-MMU — no swap needed. Refactored
+    `read/write_*_pa` helpers through `host_addr_for(pa, size, for_write)`
+    so SCRATCH_POOL accesses succeed from EL2. 36/36 guest tests
+    pass; baseline preserved (15 verify-mmu aliases unchanged).
 
-Cheapest path to zero Group-1 aliases:
+    With trampolines moved, re-attempted ROM-patching of L2[0x2,4,5,6,8]
+    in the L2 PT at PA=0x00001400. Cold-boot: aliases dropped 15→0,
+    but boot wedged at FAR=`0xc004bf8` in `InitSpecialStacks`.
+    Patches reverted.
 
-1. Move the hypervisor's UND/DABT/SBA trampoline scratch slots
-   out of PA=0x04005XXX (= subpage 3 of L2[0x4-0x6]'s mapping).
-   Candidate target: extend the existing shadow-stub scratch
-   carve-out at IPA `0x01800000` (mapped via `L1[0x18]`, owned
-   by the hypervisor). Update `install_und_vector_swap_post_mmu()`
-   and the relevant scratch-slot constants
-   (`UND_SAVE_LR_IPA`, `DABT_SAVE_PA`, etc.).
-2. Re-attempt the ROM-patch dedup, this time covering ALL
-   known duplicates (L2[0x2], 0x4, 0x5, 0x6, 0x8, plus the
-   third descriptor for PA=0x04006000 once identified by
-   running the dedup probe with progressively more entries
-   zeroed).
-3. Cold-boot. Expect Group-1 aliases 3 → 0 with no wedge,
-   since no kernel code uses these VAs.
-4. If it still wedges, the wedge names a VA the kernel does
-   use (via base-register indirection rather than literal) —
-   investigate from there.
+    **The L1[0xc0] self-map is the kernel's exception-stack layout.**
+    Decoded `InitSpecialStacks` at ROM `0x0011efb4`:
+    - SetFIQStack(0x0c003400) → subpage 0 of PA=0x04005000 via L2[0x3]
+    - SetAbortStack(0x0c004c00) → subpages 1+2 via L2[0x4]
+    - SetUndefStack(0x0c006000) → subpage 3 via L2[0x6]
+    - SetIRQStack(0x0c002c00) → subpage 3 of PA=0x04004000 via L2[0x2]
+    - SetUserStack(0x0c007400) → L2[0x7]
 
-Group-2's 12 aliases (RAM-resident L2 PTs, runtime-installed
-by the kernel's RememberMapping chain) remain parked until
-Group-1 is zero; Group-2 will then be addressed via stage-2
-PA splitting (Option C from prior plan).
+    The kernel packs 4 exception stacks into shared 4-KiB physical
+    pages, each at its own 1-KiB subpage. ARMv4 subpage AP gave each
+    stack an exclusive priv-RW VA window; Einstein faithfully
+    emulates this (`Emulator/TMMU.cpp:304-306, 325-326`). Our flat
+    AP=11 collapses the per-subpage AP, but the kernel's *usage
+    pattern* still puts each stack at its own disjoint 1-KiB offset.
+    Stacks share the page in stage-1 but never write overlapping
+    bytes — assuming none overflows its 1-KiB allocation (which
+    would also be a bug under ARMv4).
+
+    **Group-1 aliases are functionally inert** — verify-mmu reports
+    them but no actual byte conflict can occur. The same likely
+    holds for Group-2 (kernel allocator gives each task stack a
+    consistent 33-KiB layout; boundary 4-KiB pages split into
+    per-stack zones).
+
+    Disasm-grep finding zero literal references to alias VAs was
+    misleading: kernel computes them via `mov + orr` indirection.
+
+    The original directive ("things break randomly") rests on the
+    assumption that aliases cause corruption; the kernel's careful
+    subpage-disjoint design prevents this.
+
+### Next iteration — Option σ: accept aliases as benign + un-park alrt-task DABT
+
+The aliases are reportable verify-mmu observations but not real
+corruption sources. Recommend:
+
+1. Document Group-1 / Group-2 aliases as benign (kernel's
+   subpage-disjoint exception-stack and stack-guard layouts).
+2. As a safety net, add stage-2 RO traps on the *off-stack
+   subpages* of each shared physical page — an actual overflow
+   into a wrong subpage would fault to EL2 and we'd see it.
+3. Un-park the alrt-task DABT investigation deferred 4+ iterations
+   ago. The original "no debugging until aliases are zero"
+   directive was based on the corruption hypothesis we now have
+   evidence against.
+
+Backup options if Option σ proves insufficient:
+- **Option β** — full stage-2 PA splitting with shadow-on-write
+  coherence. Substantial work; only worth it if we observe actual
+  byte conflict.
+- **Option τ** — patch `InitSpecialStacks` to use distinct 4-KiB
+  PAs per exception stack. Doable but needs an audit for kernel
+  paths that rely on the shared layout.
 
 Group-2's 12 aliases remain parked until Group-1 is zero.
 Group-2 will then be revisited with **Option C: stage-2 PA

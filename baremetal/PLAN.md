@@ -222,6 +222,111 @@ TAlertEventHandler region.
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
 
+### Iteration 11 (next-loop iter 7): 36-KiB FMNewStack patch attempted, reverted — slot arithmetic in 33 KiB lives in many functions
+
+Implemented the 17 FMNewStack patches sketched in iter 10:
+
+```
+0x001F_8EDC  mov r7, #36864   (was #33792)
+0x001F_8EF0  sub r1, r0, #4096 (was #3072)
+0x001F_8F18  mov r0, #36864
+0x001F_8F20  add r0, r0, r0, lsl #3   (×9)   was lsl #5 (×33)
+0x001F_8F24  sub r0, r9, r0, lsl #12  (×4096) was lsl #10 (×1024)
+0x001F_8F30  add r0, r0, #4096
+0x001F_8F38  cmp r0, #36864
+0x001F_8F48  mov r0, #36864
+0x001F_8F5C  mov r0, #36864
+0x001F_8F88  add r0, r0, #4096
+0x001F_8F90  cmp r0, #36864
+0x001F_8FA0  mov r0, #36864
+0x001F_9024  add r1, sl, sl, lsl #3
+0x001F_902C  add r9, r0, r1, lsl #12
+0x001F_9030  add r0, r7, r7, lsl #3
+0x001F_9034  sub r0, r9, r0, lsl #12
+0x001F_9038  add r2, r0, #4096
+```
+
+(Initially had a typo at `0x001F_8F60` instead of `0x001F_8F5C`,
+which clobbered the `bl __rt_udiv` after the third divisor — fixed
+once detected via the rom_patch dump.)
+
+### What worked
+
+NewStack POST-SWI confirms FMNewStack alone produces the right
+36-KiB layout:
+
+```
+NewStack probe POST-SWI: env=0x1355 req=0x9000 base=0x0c306000 \
+  top=0x0c30e000 span=0x8000 caller_lr=0x00252390 src_mode=0x10 (USR)
+```
+
+- `req=0x9000` (= 36 KiB) ✓
+- `base=0x0c306000` (4-KiB aligned ✓)
+- `top=0x0c30e000` (4-KiB aligned ✓)
+- `span=0x8000` (= 32 KiB usable ✓)
+
+So FMNewStack itself is internally consistent.
+
+### What broke — boot wedge in PauseSystem
+
+```
+unaligned: cannot read aligned 0xea3fffc4 (EA=0xea3fffc5) at PC=0x387ebc
+  pre-abt CPSR = 0x400001d3  mode=0x13
+  r0..r7:   0xea3fffbd 0x0c400000 0x0c100fc8 ...
+```
+
+`PC=0x387ebc` is `PauseSystem::TPlatformDriver`'s `ldr ip, [r0, #8]`
+— a vtable load. `r0=0xea3fffbd` is junk; `r0+8 = 0xea3fffc5`
+unaligned-faults. The corruption happens before alarm-task creation,
+so the alrt-task DABT we were trying to fix isn't even reached.
+
+### Why — `#33792` is encoded in many ROM functions, not just FMNewStack
+
+`grep -nE '#33792' rom.dis` shows ~50 occurrences. The FMNewStack
+patch only covers ~13 of them. The rest are in:
+
+| function | offset | what it does |
+|---|---|---|
+| `Init__11THeapDomain` | `0x001F_8D74` | `mov r0, #33792` divisor — computes slot count from pool size |
+| `GetStackInfo` | `0x001F_8E1C` | `mov r0, #33792` divisor — maps a VA back to its slot index |
+| FMNewStack continuation | `0x001F_918C` | `mov r0, #33792` — additional divisor in the success-tail |
+| BootOS / system-stack init | `0x0001_8F8C`, `0x0001_8FA4`, `0x0001_90EC` | `add r0, r0, #33792` — points into a hardcoded `0xC008400` system-stack location |
+| Stack-walker / unwind | `0x0027_1Exx`, `0x0027_22xx`, etc. | conditional `sub r0, r0, #33792` — stack-bounds check in fault decode |
+| Misc | `0x0038_D008`, `0x0038_D404`, etc. | `add ... #33792` |
+
+Without patching the divisor sites, `Init__11THeapDomain` thinks
+the pool has `pool_size / 33` slots when actually it has fewer
+36-KiB slots. The slot-info array is sized wrong; later code reads
+past it into junk → vtable corruption → wedge.
+
+### Reverted; document for the next iteration
+
+The FMNewStack patches have been reverted. The detailed catalogue
+of additional sites is ready to consume; the next iteration needs
+to:
+
+1. Patch the **divisor sites** in `Init__11THeapDomain` (`0x001F_8D74`),
+   `GetStackInfo` (`0x001F_8E1C`), and FMNewStack continuation
+   (`0x001F_918C`). All three are simple `mov r0, #33792` →
+   `mov r0, #36864`.
+2. Audit the **`add r0, r0, #33792`** sites at `0x0001_8F8C`, etc.
+   These compute `0xC000000 + 33792 = 0xC008400` for the system
+   stack location. Either patch them to `+ 36864` (= `0xC009000`)
+   or leave them — depends on whether the system stack uses
+   FMNewStack-allocated memory or its own region.
+3. Audit the **conditional `sub` sites** at `0x0027_1Exx`. These
+   look like stack-bounds checks. Encoding for `subne r0, r0,
+   #33792` (`0x12400B21`) → `subne r0, r0, #36864` (`0x12400A09`)
+   etc. — same imm12 swap as the unconditional cases.
+4. Test guest-tests + boot. If the IdleProc DABT goes away (no
+   pa-emul CORRUPTION lines), commit; otherwise document the
+   next failure mode.
+
+The 36-KiB patch in PATCHES_717006 is reverted but the comment
+block lists all 17 instructions for re-introduction; the
+companion divisor + bounds patches are added in the next
+iteration.
+
 ### Iteration 10 (next-loop iter 6): patch audit — guard pages aren't working because we kept the 33-KiB layout
 
 **User question (2026-04-29):** "Sounds like the stack manage guard

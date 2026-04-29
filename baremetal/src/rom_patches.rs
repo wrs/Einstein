@@ -175,14 +175,28 @@ const PATCHES_717006: &[RomPatch] = &[
         value: hvc_insn(PAGE_GET_PROBE_HVC_IMM),
         name: "TUDomainManager::Get post-SWI page-allocator probe",
     },
-    // (FMNewStack 33→36 KiB patch reverted 2026-04-28 — see PLAN.md
-    // "Patch attempt 1" + STRUCTURES.md "End-to-end page allocation".
-    // Patch was internally consistent for slot-size/placement (NewStack
-    // POST-SWI confirms 4-KiB-aligned 36-KiB slots, no stack-stack
-    // guard sharing). But TUDomainManager::Get still recycles PAs
-    // across different TStackInfo* consumers — the actual root cause
-    // of the remaining aliases. Investigation continues at TUDomainManager
-    // level.)
+    // (FMNewStack 33→36 KiB + 3→4 KiB guard re-attempt 2026-04-29 —
+    // reverted. NewStack POST-SWI confirms the 17-instruction patch
+    // produces 4-KiB-aligned 36-KiB slots (req=0x9000, base=0xc306000,
+    // top=0xc30e000, span=0x8000). But boot wedges in PauseSystem
+    // around alarm-task vtable load (junk r0=0xea3fffbd) because
+    // OTHER ROM functions also encode 33 KiB:
+    //   * Init__11THeapDomain at 0x001F_8D74 (slot count divisor)
+    //   * GetStackInfo at 0x001F_8E1C (slot index divisor)
+    //   * FMNewStack continuation at 0x001F_918C
+    //   * BootOS / system-stack init at 0x0001_8F8C, 0x0001_8FA4,
+    //     0x0001_90EC (`add r0, r0, #33792` patterns)
+    //   * 0x0027_1Exx, 0x0027_22xx — many `sub r0, r0, #33792`
+    //     conditional sites in another routine (probably the
+    //     stack-walker or fault-decode that maps task PC to slot)
+    //
+    // Without a coordinated patch across all of these the kernel's
+    // slot-arithmetic mismatches reality and downstream pointer
+    // chases hit junk. Patching them all is doable but each site
+    // needs individual decode (some are conditional sub/add, not
+    // simple mov immediates). Defer to a follow-up iteration that
+    // works through the full catalogue. PLAN.md captures the current
+    // state of analysis.)
     // Force exclusive per-stack page allocation by short-circuiting
     // `TStackManager::GetMatchingPage` to always return 0 (= "no
     // shareable page found"). This forces every `FindOrAllocPage` call

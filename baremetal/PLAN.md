@@ -8,15 +8,15 @@ available). After iter-12's 36-KiB stack patch landed, the
 alrt-task DABT (cross-subpage stack overflow corrupting the alrt
 task's CList) is GONE. Phase B has moved on to the next stall.
 
-**Current goal: heap memory not zero-filled — Iter 18 WriteRun
-probe shows the compressor at `0xc646c0c` (= NewBlock 0xc646bfc + 16
-header) entering WriteRun with `count=0x20000111`, a SPSR-shaped
-value strongly indicating the heap RAM was previously used as a
-TProcessorState save area. The compressor's caller skips
-`New__18TUnicodeCompressor` (which would zero the count). Next:
-identify the caller (probe WriteChunk entry / the construction
-path) and either (a) patch the caller, (b) defensively clamp
-count in WriteRun, or (c) zero-fill on NewBlock return.**
+**Current goal: count corruption originates OUTSIDE WriteChunk —
+Iter 19 added probes for WriteChunk / New / Reset. New IS called
+for the wedging compressor, count IS zero on WriteChunk entry.
+But by the time WriteRun is called from inside WriteChunk, count
+has flipped to `0x20000111`. WriteChunk's own logic cannot
+produce that value (max 9 increments per call). The writer is
+external — likely an interrupt save area, an aliased VA, or a
+stage-1 mismapping. Next: install a stage-2 RO trap on the PA
+backing the compressor's +0x9c offset to capture every write.**
 
 ### IdleProc probe — corruption pattern identified
 
@@ -229,6 +229,95 @@ TAlertEventHandler region.
   allocator's freelist threading code (the ROM PCs we see are
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
+
+### Iteration 19 (next-loop iter 15): WriteChunk + New + Reset probes — count is zero at WriteChunk entry, refuting the "uninitialized" theory
+
+Iter 18 hypothesised that the compressor was used WITHOUT calling
+New/Reset, leaving count holding stale heap garbage. This
+iteration adds probes at:
+- `WriteChunk__18TUnicodeCompressorFPvl` entry (`HVC #0x5F` at
+  ROM `0x0025700C`).
+- `New__18TUnicodeCompressorFv` first insn (`HVC #0x60` at ROM
+  `0x00256C7C`, `mov r1, #0`).
+- `Reset__18TUnicodeCompressorFv` first insn (`HVC #0x61` at ROM
+  `0x00256ED8`, `mov r1, #0`).
+
+#### Cold-boot result — New IS called, count IS zero at WriteChunk
+
+```
+TUnicodeCompressor::New #0 this=0x0c646c0c caller_lr=0x0005c68c src_mode=0x10
+WriteChunk #0 ENTER: this=0x0c646c0c ptr=0x0cc77aa4 length=18(0x12) count=0x0 ...
+WriteRun #0 ENTER: this=0x0c646c0c ... count=0x20000111(536871185) ...
+```
+
+- **`New` was called** with `this=0x0c646c0c` — the compressor
+  was constructed via the proper `TClassInfo::Construct` chain
+  (caller_lr=`0x0005c68c` → ROM `0x5C688`'s `add pc, r4, #36`,
+  the TClassInfo vtable[1] dispatch).
+- **`Reset` was NOT called** — but `New` already zeroes count, so
+  Reset isn't needed.
+- **`count=0x0` at WriteChunk entry** — this disproves iter-18's
+  "uninitialized garbage" theory. count was correctly zero when
+  WriteChunk started.
+
+#### The puzzle — count flips between WriteChunk and WriteRun
+
+WriteChunk's body iterates `length>>1 = 9` wide chars. Per-iter
+writes to count: PATH B `count = count+1`, PATH D `count = 1`.
+After 9 iterations count is at most 9 — far below 255 (the cap
+that triggers PATH B's `bl WriteRun` at ROM `0x002570AC`). Yet
+WriteRun's `caller_lr=0x002570B0` confirms PATH B was reached,
+and `count=0x20000111` was the value loaded by `ldr r0, [r4,
+#156]` at `0x00257074`.
+
+**Hypotheses (in priority order):**
+
+1. **Interrupt handler save-area aliases the compressor's PA.**
+   The CPSR-shaped `0x20000110` matches procst[+0x40]'s
+   saved-CPSR pattern. If a kernel scratch VA aliases PA
+   `0x0402eca8` (the compressor's `count` PA), an exception
+   handler's save during WriteChunk would write through that
+   alias, corrupting count. Group-2 alias inventory shows
+   `PA=0x0402e000` is aliased between VA `0xcc9b000` (mntr
+   stack) and VA `0xcca3000` (alrt globals). **Possibility:
+   VA 0xc646000 also hits PA 0x0402e000?** Need to verify with
+   a stage-1 walk for VA `0xc646000`.
+
+2. **The callback at `*(this+0x10)` modifies count.** WriteChunk
+   line `0x00257128: ldr pc, [r4, #16]` calls a function
+   pointer. If the callback's logic writes to `*(this+0x9c)`,
+   it could set count to 0x20000110. The callback is set
+   somewhere; need to dump `this+0x10` to find which function.
+
+3. **The 9-iteration limit assumption is wrong.** Maybe path E
+   (buffer-A flush) somehow loops back without consuming an
+   input byte, allowing count to be incremented many more
+   times. Need to trace WriteChunk's actual iteration count.
+
+#### Next iteration plan
+
+a. **Stage-2 RO trap on PA backing compressor +0x9c.** Modeled
+   on `alrt_capture` / `pa_emulate.rs`. Captures every write
+   to the count word with `(PC, value, src_mode)`. Definitive
+   answer to "who writes count".
+
+b. **Stage-1 walk for VA `0xc646000`** at ExtendVMHeap #10
+   completion to confirm/refute the alias hypothesis. Probably
+   maps to a fresh PA (since LockHeapRange just allocated it),
+   but if it hits PA `0x0402e000` we'd see the alias.
+
+c. **Probe `*(this+0x10)`** — the callback function pointer.
+   Dump it from `New` or `WriteChunk` entry to identify the
+   callback. (Could extend the existing WriteChunk probe to
+   also dump `this+0x10`.)
+
+#### Status
+
+- 36/36 guest tests pass.
+- All prior iter probes stay active.
+- Iter-19 deliverable: WriteChunk + New + Reset probes, refuting
+  the "no proper init" theory and pinning the corruption to a
+  WRITE during WriteChunk's body.
 
 ### Iteration 18 (next-loop iter 14): WriteRun entry probe — confirms count is uninitialized heap garbage (= SPSR-shaped value)
 

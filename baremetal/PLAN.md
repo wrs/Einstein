@@ -14,17 +14,19 @@ shadow-on-write redirects, and per-task subpage-AP shims are all
 ruled out. The fix MUST be a kernel patch that makes the kernel
 work without 1k subpage protections.
 
-**Current goal: PA=0x04084000 aliased between heap VA=0x0c646000
-and stack VA=0x0ccc8000 — Iter 21's stage-1 walk confirmed the
-compressor's count VA `0x0c646ca8` resolves to PA `0x04084ca8`,
-and the boot log already shows a `Prim ALIAS` between this PA
-and VA `0x0ccc8000`. Some other task running on stack VA
-0x0ccc8000 writes to offset 0xca8, which corrupts the compressor's
-count via the alias. Iter-22 must patch the kernel allocator
-chain so two distinct kernel consumers do NOT share the same PA.
-Need to identify where `PA=0x04084000` got mapped twice — likely
-the stack/heap allocator's pool-sharing constant we missed, or a
-freelist that recycles a PA across distinct domains.**
+**Current goal: heap and stack share the SAME physical pool.
+Iter 22 re-enabled per-call `TUDomainManager::Get` logging.
+Every observed Get call (≥100 calls in the wedge boot) comes
+through `AllocNewPage__13TStackManager` at ROM `0x001F8788`
+(caller_lr=`0x001f87c0`, post-bl `Init__10TStackPage`). count=2
+per call (= 8 KiB chunks for stack pages). The heap allocator's
+later mapping of PA `0x04084000` at VA `0x0c646000` overlays a
+PHYSICAL page already claimed by a stack — the kernel uses ONE
+physical pool for both stacks and heaps and intentionally shares
+boundary pages via subpage-AP. Iter-23 must trace the heap-extend
+side of the chain (FMLockHeapRange → ResolveFault → AddPgPAndPerm)
+to find where the kernel decides to reuse a stack-pool page for
+the heap's last page, and patch that decision.**
 
 ### IdleProc probe — corruption pattern identified
 
@@ -237,6 +239,82 @@ TAlertEventHandler region.
   allocator's freelist threading code (the ROM PCs we see are
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
+
+### Iteration 22 (next-loop iter 18): re-enable Get logging — every Get is a stack-pool allocation; heap-extend reuses stack pages
+
+Iter 21 confirmed PA `0x04084000` is aliased between heap VA
+`0x0c646000` and stack VA `0x0ccc8000`. Iter 22 re-enables the
+existing `TUDomainManager::Get` post-SWI probe (HVC #0x53 at ROM
+`0x00258EFC`) by switching its `dprintln!` to `kprintln!` and
+raising the budget from 64 to 1024.
+
+#### Cold-boot result — Get is exclusively a stack-pool path
+
+```
+page-get: #0   id=0x0000136b count=2 caller_lr=0x001f87c0 ...
+page-get: #1   id=0x000013cb count=2 caller_lr=0x001f87c0 ...
+...
+page-get: #98  id=0x0000356b count=2 caller_lr=0x001f87c0 ...
+Prim ALIAS: PA=0x04084000  VA1=0x0ccc8000  VA2=0x0c646000  ...
+page-get: #99  id=0x000035bb count=2 caller_lr=0x001f87c0 ...
+```
+
+All 100+ Get calls have `caller_lr=0x001f87c0`. That's the
+post-`bl Init__10TStackPage` site inside
+`AllocNewPage__13TStackManagerFUl` at ROM `0x001F8788`:
+
+```
+1f87b0: mov r2, r4                    ; size class
+1f87b4: mov r1, r5                    ; manager
+1f87b8: mov r0, r6                    ; TStackPage*
+1f87bc: bl  Init__10TStackPageFP15TUDomainManagerUl
+1f87c0: teq r0, #0                    ; ← caller_lr lands here
+```
+
+`count=2` means each Get returns 2 contiguous physical pages
+(8 KiB) for one TStackPage. Get returns unique PageIDs (no
+duplicates) — confirming iter-3's audit.
+
+#### Where do heap PAs come from?
+
+The heap-extend path (ExtendVMHeap → LockHeapRange → FMLockHeapRange
+→ ResolveFault → AddPgPAndPerm) doesn't call Get. It must be
+re-using PAs allocated earlier by `AllocNewPage`. The heap's last
+4-KiB page at VA `0x0c646000` overlays PA `0x04084000` — same PA
+that holds subpage 3 of stack VA `0x0ccc8000`.
+
+Under ARMv4 subpage-AP this is intentional: each consumer claims
+its own 1-KiB subpage of a shared 4-KiB physical page. Under our
+flat AP=11 the sharing collapses and both VAs see each other's
+writes — exactly the wedge.
+
+#### Next iteration plan
+
+1. Probe `FMLockHeapRange` at ROM `0x001F6B24` to log
+   `(parms, base, limit, lock_id)` — different from the existing
+   user-shim probe at 0x001F8AB4 (which logs the user-mode call).
+   FMLockHeapRange is the privileged kernel side that actually
+   resolves PAs.
+2. Probe `ResolveFault` at ROM `0x001F7978` — already wired but
+   filtered. Capture the per-page PA assignment to see which
+   stack-pool pages get reused for heap.
+3. Trace AddPgPAndPerm callers — that's the ROM site that writes
+   the L2 entry installing PA at VA. Identifying its source of
+   the PA value (TPhys struct, a TStackPage, or fresh allocation)
+   reveals the kernel patch point.
+
+The fix-target: patch the routine that decides "reuse stack-pool
+page X for the heap's last page" so the heap instead allocates
+its OWN page. This may require enlarging the physical pool or
+adjusting the heap/stack pool-divider.
+
+#### Status
+
+- 36/36 guest tests pass.
+- All prior iter probes stay active.
+- Iter-22 deliverable: enabled per-call Get logging, confirming
+  Get is exclusively used by AllocNewPage / TStackPage and that
+  the heap-extend path overlays existing stack-pool pages.
 
 ### Iteration 21 (next-loop iter 17): stage-1 walk + alias tracker — PA=0x04084000 alias between heap and stack VAs
 

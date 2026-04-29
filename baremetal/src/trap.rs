@@ -3196,14 +3196,17 @@ fn handle_page_get_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
                 );
             }
         }
-        if n < 64 {
-            crate::dprintln!(
+        // Iter 22: Verbose logging via kprintln so the trace is
+        // visible in the release / quiet build. Raise the budget
+        // to 1024 to cover all Get calls during the wedge boot.
+        if n < 1024 {
+            kprintln!(
                 "page-get: #{} id={:#010x} count={} domain_field={:#010x} caller_lr={:#010x} sp={:#010x} fp={:#010x} mode={:#x}",
                 n, returned_id, count_arg, domain_field, caller_lr, sp, fp, mode,
             );
         }
-    } else if n < 64 {
-        crate::dprintln!(
+    } else if n < 1024 {
+        kprintln!(
             "page-get ERR: r0={:#x} caller_lr={:#010x} count={} domain_field={:#010x}",
             r0, caller_lr, count_arg, domain_field,
         );

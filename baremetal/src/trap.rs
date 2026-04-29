@@ -1293,6 +1293,12 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::EXTEND_VM_HEAP_PROBE_HVC_IMM => {
             handle_extend_vm_heap_probe(ctx);
         }
+        v if v == crate::rom_patches::NEW_BLOCK_ENTRY_PROBE_HVC_IMM => {
+            handle_new_block_entry_probe(ctx);
+        }
+        v if v == crate::rom_patches::NEW_BLOCK_RETURN_PROBE_HVC_IMM => {
+            handle_new_block_return_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1813,6 +1819,16 @@ fn handle_und(ctx: &mut TrapContext) {
         }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::EXTEND_VM_HEAP_PROBE_HVC_IMM) => {
             handle_extend_vm_heap_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::NEW_BLOCK_ENTRY_PROBE_HVC_IMM) => {
+            handle_new_block_entry_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::NEW_BLOCK_RETURN_PROBE_HVC_IMM) => {
+            handle_new_block_return_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -3961,6 +3977,105 @@ src_mode={:#x} sp={:#010x}",
 
     // Emulate `mov ip, sp`.
     ctx.x[12] = sp as u64;
+}
+
+/// Per-call ring for NewBlock entry/exit pairing. Keyed by SP at
+/// entry (which equals SP at exit because LDMDB restores it). The
+/// kernel's NewBlock isn't called recursively, but it can be
+/// preempted while sleeping inside SearchFreeList → ExtendVMHeap;
+/// the per-SP ring keeps interleaved calls disambiguated.
+const NB_RING_SLOTS: usize = 16;
+static mut NB_RING_SP: [u32; NB_RING_SLOTS] = [0; NB_RING_SLOTS];
+static mut NB_RING_SIZE: [u32; NB_RING_SLOTS] = [0; NB_RING_SLOTS];
+static mut NB_RING_LR: [u32; NB_RING_SLOTS] = [0; NB_RING_SLOTS];
+
+fn handle_new_block_entry_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_new_block_entry_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_new_block_entry_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let requested = ctx.x[0] as u32;
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let caller_lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+    let mode = source_cpsr & 0x1F;
+
+    // Stash (sp, size, caller_lr) so the success-return probe can
+    // pair the call with its returned block address.
+    // SAFETY: single-threaded.
+    unsafe {
+        // Find a free slot; otherwise overwrite slot 0.
+        let mut slot = 0;
+        for i in 0..NB_RING_SLOTS {
+            if NB_RING_SP[i] == 0 {
+                slot = i;
+                break;
+            }
+        }
+        NB_RING_SP[slot] = sp;
+        NB_RING_SIZE[slot] = requested;
+        NB_RING_LR[slot] = caller_lr;
+    }
+
+    kprintln!(
+        "NewBlock #{} ENTER: req={:#x}({}) caller_lr={:#010x} src_mode={:#x} sp={:#010x}",
+        seq, requested, requested, caller_lr, mode, sp,
+    );
+
+    // Emulate `mov ip, sp`.
+    ctx.x[12] = sp as u64;
+}
+
+fn handle_new_block_return_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_new_block_return_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+/// `mov r0, r6` at ROM 0x00311ED8 — one insn before NewBlock's
+/// success-return LDMDB. r6 holds the allocated block pointer.
+fn handle_new_block_return_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    let returned = ctx.x[6] as u32;
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let mode = source_cpsr & 0x1F;
+    // NewBlock's prologue at 0x311DBC pushed 9 words (r4..r8, fp,
+    // ip, lr, pc) onto the source-mode stack — so at the exit
+    // probe (before the LDMDB at 0x311EDC), sp is 9*4 = 36 bytes
+    // BELOW where it was at entry. Reverse the offset to recover
+    // the entry-time sp used as the pairing key.
+    let entry_sp = sp.wrapping_add(9 * 4);
+
+    // Find the matching pending entry by entry-time SP.
+    // SAFETY: single-threaded.
+    let (size, caller_lr) = unsafe {
+        let mut found_size = 0u32;
+        let mut found_lr = 0u32;
+        for i in 0..NB_RING_SLOTS {
+            if NB_RING_SP[i] == entry_sp {
+                found_size = NB_RING_SIZE[i];
+                found_lr = NB_RING_LR[i];
+                NB_RING_SP[i] = 0;
+                NB_RING_SIZE[i] = 0;
+                NB_RING_LR[i] = 0;
+                break;
+            }
+        }
+        (found_size, found_lr)
+    };
+
+    let end = returned.wrapping_add(size);
+    kprintln!(
+        "NewBlock RET: returned={:#010x}..{:#010x} size={:#x}({}) caller_lr={:#010x} src_mode={:#x} sp={:#010x}",
+        returned, end, size, size, caller_lr, mode, sp,
+    );
+
+    // Emulate `mov r0, r6`. The natural ELR advance to 0x00311EDC
+    // then runs the LDMDB which loads the user-callable r0 from the
+    // pushed save area; setting ctx.x[0] = r6 here is symmetric so
+    // a recovery snapshot mid-handler also sees the right value.
+    ctx.x[0] = ctx.x[6];
 }
 
 fn handle_dl_probe(ctx: &mut TrapContext) {

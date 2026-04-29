@@ -8,12 +8,14 @@ available). After iter-12's 36-KiB stack patch landed, the
 alrt-task DABT (cross-subpage stack overflow corrupting the alrt
 task's CList) is GONE. Phase B has moved on to the next stall.
 
-**Current goal: NewBlock allocator off-by-one — a 420-byte
-`TUnicodeCompressor` block ends up at `0xc646f60`, spanning the
-heap top at `0xc647000`. Iter 16 ruled out ExtendVMHeap as the
-culprit (its rounding is correct for the 784-byte request that
-was made). Next probe the NewBlock allocator's freelist placement
-to find why the 420-byte block lands so close to the heap top.**
+**Current goal: TUnicodeCompressor count-field corruption — Iter 17
+NewBlock probe confirmed the 420-byte compressor lives at
+`0xc646bfc..0xc646da0`, FULLY WITHIN the heap (no boundary spill).
+The wedge at FAR=0xc647003 is therefore the WriteRun loop reading
+buffer B with `count > 870` — far above the 255 cap WriteChunk
+enforces. Next: probe WriteRun entry to log `count` and identify
+how it got set so high (uninitialized post-NewBlock, not Reset, or
+a non-WriteChunk code path setting it).**
 
 ### IdleProc probe — corruption pattern identified
 
@@ -226,6 +228,107 @@ TAlertEventHandler region.
   allocator's freelist threading code (the ROM PCs we see are
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
+
+### Iteration 17 (next-loop iter 13): NewBlock probe — locates compressor at `0xc646bfc`, RULES OUT heap-boundary spill
+
+Iter 16 hypothesized that the 420-byte `TUnicodeCompressor` block
+lived at `0xc646f60` (with its `+0xa1` buffer spilling past the
+heap top of `0xc647000`). This iteration adds NewBlock entry +
+success-return probes (`HVC #0x5C/#0x5D`) at ROM `0x00311DB8` and
+`0x00311ED8` to log every `(req_size, returned_block, caller_lr)`
+triple. The pairing keys on entry-time SP, recovered at exit by
+adding back the prologue-push offset (9 words = 36 bytes).
+
+#### Cold-boot result — compressor at `0xc646bfc..0xc646da0`
+
+656 NewBlock calls fire before the wedge. The relevant one:
+
+```
+NewBlock #656 ENTER: req=0x1a4(420) caller_lr=0x00311f04 sp=0x0cc7771c
+NewBlock RET: returned=0x0c646bfc..0x0c646da0 size=0x1a4(420) \
+  caller_lr=0x00311f04 src_mode=0x10 sp=0x0cc776f8
+```
+
+`req=0x1a4` (= 420 = `Sizeof__18TUnicodeCompressorSFv`).
+Returned `0x0c646bfc..0x0c646da0` — **fully within the heap**
+(top is `0x0c647000`). `caller_lr=0x00311f04` is the
+post-`bl NewBlockLow` site inside `NewDirectBlock` at ROM
+`0x00311EE4`.
+
+#### What the wedge actually is — `count` corrupted, not heap spill
+
+If the compressor is at `0xc646bfc..0xc646da0`, then for the
+`ldrb r0, [r0, #161]` at ROM `0x00256FA8` to fault at FAR
+`0x0c647003`:
+
+```
+r4 + r5 + 0xa1 = 0xc647003
+r4              = 0xc646bfc                ; compressor base
+r5              = 0xc647003 - 0xc646bfc - 0xa1 = 0x366 = 870
+```
+
+So r5 reaches **870** in the WriteRun loop before faulting. The
+loop bound check is `cmp count, r5; bhi loop` (PC `0x256ff8`),
+meaning `count >= 871` at fault time. But:
+
+- `WriteChunk__18TUnicodeCompressorFPvl` (`0x0025700C`) caps
+  count at 255 — increments via `str count+1, [r4, #156]`, then
+  `cmp count, #255 / bcc skip` flushes through `WriteRun` once
+  count reaches 255.
+- `New__18TUnicodeCompressorFv` at `0x00256C7C` zeros count
+  (`str r1, [r0, #156]` with `r1 = 0`).
+- `Reset__18TUnicodeCompressorFv` at `0x00256ED8` also zeros
+  count.
+
+So count must legitimately be 0..255 if the compressor is used
+correctly. Reaching 871 means **the compressor was used without
+proper New/Reset**, leaving count holding stale heap garbage.
+
+**Hypothesis (next-iter target):** the kernel allocates the
+compressor via `NewDirectBlock` and uses it directly without
+calling `New__18TUnicodeCompressor` or `Reset__18TUnicodeCompressor`.
+Either:
+1. The C++ object construction path uses raw `NewDirectBlock`
+   then expects the caller's first method (e.g., WriteChunk) to
+   tolerate uninitialized fields. WriteChunk DOES check
+   `count <= 0` for the read loop's exit condition, but it does
+   NOT zero count first.
+2. There's a separate path that sets count to a non-zero value
+   without WriteChunk's cap (e.g., Flush, vector-set, or a
+   manual store from the caller).
+
+#### Next iteration plan
+
+Add a `WriteRun` entry probe (`HVC #0x5E`) at ROM `0x00256EEC`
+patching the `mov ip, sp` prologue. Handler logs `(this,
+this->count, this->byte_a0, this->buffer_a_first_8_bytes,
+caller_lr)` so we can:
+
+- Confirm count is large at WriteRun entry (>871).
+- See whether the same compressor is reused multiple times across
+  calls (caller_lr correlation).
+- Check if buffer_a contents look like compressor data or
+  uninitialized poison.
+
+Once count's source is pinned, the fix is either:
+- Patch the kernel caller to call New or Reset before WriteChunk.
+- Patch `WriteChunk` / `WriteRun` to clamp count to a sane value
+  defensively.
+- (Or, even simpler: patch `NewDirectBlock` / `NewBlock` to
+  zero-fill returned blocks. ARMv4 + original kernel may have
+  relied on fresh-page zeroing that our 4-KiB chunk allocator
+  doesn't replicate after kernel-level RAM reuse.)
+
+#### Status
+
+- 36/36 guest tests pass.
+- Iter-12 36-KiB stack patches stay active.
+- Iter-14 ResolveFault wrapper fix stays active.
+- Iter-15 Fault(stackmgr) probe + SBA-stub origin lookup stay active.
+- Iter-16 ExtendVMHeap probe stays active.
+- Iter-17 NewBlock entry+return probes stay active. Pinpointed
+  the compressor's actual heap location and identified the wedge
+  as a `count` corruption, not a heap-boundary spill.
 
 ### Iteration 16 (next-loop iter 12): ExtendVMHeap probe — rules out the heap-extend rounding as the bug
 

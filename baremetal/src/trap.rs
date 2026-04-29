@@ -1311,6 +1311,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::COMP_RESET_PROBE_HVC_IMM => {
             handle_comp_reset_probe(ctx);
         }
+        v if v == crate::rom_patches::WC_LOAD_PROBE_HVC_IMM => {
+            handle_wc_load_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1861,6 +1864,11 @@ fn handle_und(ctx: &mut TrapContext) {
         }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::COMP_RESET_PROBE_HVC_IMM) => {
             handle_comp_reset_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::WC_LOAD_PROBE_HVC_IMM) => {
+            handle_wc_load_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -4230,6 +4238,40 @@ fn handle_comp_reset_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
 
     // Emulate `mov r1, #0`.
     ctx.x[1] = 0;
+}
+
+fn handle_wc_load_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_wc_load_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+/// `WriteChunk` count-load probe — `ldr r0, [r4, #156]` at ROM
+/// `0x00257074`. Fires once per WriteChunk loop iteration.
+/// Logs `(this=r4, count_value, r5_loop_total, r7_loop_index)`
+/// and emulates the load.
+///
+/// Volume control: log every iteration up to 32, then sample.
+fn handle_wc_load_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let this = ctx.x[4] as u32;
+    let r5 = ctx.x[5] as u32; // = length>>1 (loop total)
+    let r7 = ctx.x[7] as u32; // = loop index
+    let count = guest_mem::read_word_va(this.wrapping_add(0x9c)).unwrap_or(0xDEAD_BEEF);
+    let mode = source_cpsr & 0x1F;
+
+    // Log first 32 calls fully, then every 64th to keep volume
+    // bounded while preserving structure.
+    if seq < 32 || (seq & 0x3F) == 0 {
+        kprintln!(
+            "WC-load #{}: this={:#010x} count={:#x}({}) r5={} r7={} src_mode={:#x}",
+            seq, this, count, count, r5, r7, mode,
+        );
+    }
+
+    // Emulate `ldr r0, [r4, #156]`.
+    ctx.x[0] = count as u64;
 }
 
 fn handle_dl_probe(ctx: &mut TrapContext) {

@@ -1357,23 +1357,27 @@ Citations:
 - `WriteRun @ 0x00256F94..0x00256FFC` iterates the byte buffer at
   `[this+0xa1+r5]` for `r5 = 0..count-1`.
 
-**Phase B iter 17 wedge.** A 420-byte instance was placed at
-`0xc646bfc..0xc646da0` (NewBlock #656) — fully within the heap
-top of `0xc647000`, NOT spanning it as iter 15 had hypothesised.
-The wedge at FAR=`0xc647003` corresponds to the `WriteRun` loop
-reaching iteration `r5=870`, which requires `count >= 871` at
-ROM `0x256FF8`'s `bhi` check. Since `WriteChunk` caps count at
-255 and `New`/`Reset` zero it, count > 870 means the compressor
-was used WITHOUT calling New/Reset — count holds heap-garbage
-from `NewBlock`'s freelist memory.
+**Phase B iter 18 wedge.** A 420-byte instance was placed at
+USER pointer `0xc646c0c..0xc646db0` (NewBlock returned block
+header at `0xc646bfc`; NewDirectBlock added the 16-byte header
+offset). The compressor's count field at `+0x9c = 0xc646ca8`
+held `0x20000111` on WriteRun entry — a CPSR-shaped value
+(NZCV=0010, mode=0x11=FIQ) plus 1, indicating the heap RAM was
+previously occupied by a `TProcessorState` save-area whose
+`saved_cpsr` field landed at exactly this offset. The kernel's
+free path doesn't poison-fill, and the compressor's caller
+skips `New__18TUnicodeCompressor` (which would zero the count).
 
-The `+0xa1` buffer access then reads bytes
-`compressor + 0xa1 + r5` for r5=0..870. Byte 870 lands at
-`0xc646bfc + 0xa1 + 870 = 0xc647003` — past the heap top.
-
-The fault MECHANISM: the loop overruns the compressor object
-(420 bytes) by hundreds of bytes, walking through whatever
-follows in the heap, and eventually hits unmapped memory.
+The fault MECHANISM at FAR=`0xc647003`:
+1. WriteChunk reads count from `+0x9c` = `0x20000110`
+   (uninitialized heap garbage).
+2. WriteChunk increments count to `0x20000111`.
+3. WriteChunk's `cmp count, #255 / bcc skip` falls through
+   because `0x20000111 > 255` → flush via WriteRun.
+4. WriteRun's loop reads `byte[this + 0xa1 + r5]` for
+   r5 = 0..count-1. count is huge, so the loop walks through
+   memory until r5 = 854 reaches the heap-top boundary at
+   `0xc647003` and faults.
 
 ## See also
 

@@ -8,14 +8,15 @@ available). After iter-12's 36-KiB stack patch landed, the
 alrt-task DABT (cross-subpage stack overflow corrupting the alrt
 task's CList) is GONE. Phase B has moved on to the next stall.
 
-**Current goal: TUnicodeCompressor count-field corruption — Iter 17
-NewBlock probe confirmed the 420-byte compressor lives at
-`0xc646bfc..0xc646da0`, FULLY WITHIN the heap (no boundary spill).
-The wedge at FAR=0xc647003 is therefore the WriteRun loop reading
-buffer B with `count > 870` — far above the 255 cap WriteChunk
-enforces. Next: probe WriteRun entry to log `count` and identify
-how it got set so high (uninitialized post-NewBlock, not Reset, or
-a non-WriteChunk code path setting it).**
+**Current goal: heap memory not zero-filled — Iter 18 WriteRun
+probe shows the compressor at `0xc646c0c` (= NewBlock 0xc646bfc + 16
+header) entering WriteRun with `count=0x20000111`, a SPSR-shaped
+value strongly indicating the heap RAM was previously used as a
+TProcessorState save area. The compressor's caller skips
+`New__18TUnicodeCompressor` (which would zero the count). Next:
+identify the caller (probe WriteChunk entry / the construction
+path) and either (a) patch the caller, (b) defensively clamp
+count in WriteRun, or (c) zero-fill on NewBlock return.**
 
 ### IdleProc probe — corruption pattern identified
 
@@ -228,6 +229,112 @@ TAlertEventHandler region.
   allocator's freelist threading code (the ROM PCs we see are
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
+
+### Iteration 18 (next-loop iter 14): WriteRun entry probe — confirms count is uninitialized heap garbage (= SPSR-shaped value)
+
+Iter 17 hypothesised that WriteRun was being called with
+`count > 870` because the compressor's count field was never zeroed.
+This iteration installs a `WriteRun` entry probe (`HVC #0x5E`)
+patching the `mov ip, sp` prologue at ROM `0x00256EEC`. Handler
+logs `(this, count, byte_a0, buffer_b first 8 bytes, caller_lr)`.
+
+#### Cold-boot result — count is `0x20000111` on WriteRun entry
+
+```
+WriteRun #0 ENTER: this=0x0c646c0c w98=0x00000000 count=0x20000111(536871185) \
+  byte_a0=0x00 buf[a0..a8]=0000000000000000 caller_lr=0x002570b0 \
+  src_mode=0x10 sp=0x0cc77728
+```
+
+**Three confirmations:**
+
+1. **`this=0x0c646c0c`, NOT `0x0c646bfc`** — NewBlock returned the
+   16-byte block header at `0x0c646bfc`; NewDirectBlock at ROM
+   `0x00311EE4` adds 16 (`add r0, r4, #16`) to skip the header,
+   giving a user pointer of `0x0c646c0c`. The 420-byte compressor
+   sits at `0x0c646c0c..0x0c646db0`.
+
+2. **`count=0x20000111`** — that's a CPSR-shaped value:
+   - bits [31:28] = `0010` → NZCV (Carry set)
+   - bits [4:0] = `0x11` → mode = FIQ (`0x11`)
+   - This matches the iter-15 `procst[+0x40]` saved-CPSR observation
+     (`0x20000110`) almost exactly. The heap RAM at this offset was
+     previously holding a `TProcessorState` save-area's `saved_cpsr`
+     field, then was freed without zero-filling, then re-allocated
+     to the compressor.
+
+3. **WriteChunk increments count once before flush** — the value
+   `0x20000111` is `0x20000110 + 1`. WriteChunk's path-B
+   (count++ → cmp 255 → flush) ran exactly once, incrementing the
+   junk `0x20000110` to `0x20000111`, then triggered WriteRun
+   because `0x20000111 > 255`. The "byte at +0xa0..+0xa7 are all
+   zero" indicates the byte sentinel was clean (probably zeroed by
+   a partial Reset or by zero-fill of the LOWER region of the
+   compressor).
+
+#### Recompute the fault arithmetic
+
+```
+this        = 0x0c646c0c   (WriteRun's r4)
+fault FAR   = 0x0c647003   (the ldrb at 0x00256FA8: r0+0xa1)
+r5 at fault = FAR - this - 0xa1 = 0x356 = 854
+count       = 0x20000111   (which is >> 854, so loop iterates
+                            until r5 hits the unmapped page)
+```
+
+Loop runs r5 = 0..854 reading `byte[this+0xa1+r5]`. At r5 = 854
+the read targets `0x0c647003`, past the heap top → DFSC=7 fault.
+
+#### Why was the heap RAM holding `0x20000110`?
+
+This memory at `0x0402exxx` (heap-mapped via VA `0x0c646xxx`)
+was likely previously used as exception-handler scratch or as the
+backing store for a `TProcessorState` struct. The kernel's free
+path doesn't poison-fill on every release — and our `__nw__`/free
+tracking never tracks small subdomain blocks anyway.
+
+The compressor's caller doesn't call `New__18TUnicodeCompressor`
+(`0x00256C7C`) which would zero `+0x98 +0x9c +0xa0`. The caller
+relies on `Reset__18TUnicodeCompressor` (`0x00256ED8`) being
+called at the right time, OR it's outright buggy.
+
+#### Next iteration plan
+
+1. **Probe WriteChunk entry** at ROM `0x0025700C` to log
+   `(this, count_at_entry, caller_lr)` — the caller of WriteChunk
+   is the kernel function that owns / mis-uses the compressor.
+2. **Probe TUnicodeCompressor::Reset** at `0x00256ED8` and
+   `New__18TUnicodeCompressor` at `0x00256C7C` to see if either is
+   ever called for `this=0x0c646c0c`. If not, the compressor was
+   used without proper initialization.
+3. **Cross-check Einstein** — run NewtonProbe to see whether the
+   ARMv4 emulator hits the same site without faulting, and if so,
+   what its compressor's count value is at WriteRun entry.
+
+#### Possible fixes
+
+a. **Patch the caller to call Reset before WriteChunk** — most
+   correct, but requires identifying the caller first.
+
+b. **Defensive clamp in WriteRun** — patch the function to clamp
+   count to `min(count, 255)` at entry. Safe (matches WriteChunk's
+   own cap) but masks the underlying bug.
+
+c. **Zero-fill on NewDirectBlock return** — patch
+   `NewDirectBlock` to memset the returned block to 0 before
+   returning. Affects every direct-block allocation in the
+   kernel; could mask other latent bugs but also could expose new
+   ones. Most invasive.
+
+d. **Patch `New__18TUnicodeCompressor`** to be auto-called by the
+   construction path. Need to find that path first.
+
+#### Status
+
+- 36/36 guest tests pass.
+- All prior iter probes stay active.
+- Iter-18 deliverable: WriteRun entry probe, confirmation that
+  count is uninitialized SPSR-shaped heap garbage.
 
 ### Iteration 17 (next-loop iter 13): NewBlock probe — locates compressor at `0xc646bfc`, RULES OUT heap-boundary spill
 

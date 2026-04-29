@@ -14,20 +14,20 @@ shadow-on-write redirects, and per-task subpage-AP shims are all
 ruled out. The fix MUST be a kernel patch that makes the kernel
 work without 1k subpage protections.
 
-**Current goal: GetMatchingPage stub committed but wedge persists
-with same `count=0x20000111`. Iter-23 installed the
-`GetMatchingPage = always-return-0` stub at ROM `0x001F86B4`
-(documented as commentary since iter 10 but never landed). The
-stub forces every `FindOrAllocPage_ReturnUnLockedOnNoPage` call
-into the cache-miss branch → fresh PA from `AllocNewPage`. Cold
-boot result: ALL Group-2 PA aliases are gone (0 left in
-verify-mmu output, down from 12). The compressor's count VA
-`0x0c646ca8` now backs PA `0x04096ca8` (was `0x04084ca8` —
-shared with stack). But WriteRun still enters with
-`count=0x20000111` and the wedge fires at FAR=`0x0c647003`. The
-corruption is therefore NOT a stage-1 PA alias. Iter-24 must
-instrument the str at `0x00257090` and ldr at `0x0025709c` to
-identify the actual count-writer.**
+**Current goal: count-store probe shows the str at `0x00257090`
+writes `r1=0x20000111` directly. Iter-24 added probes at the str
+(`0x257090`) and re-read (`0x2570 9c`). Result: WC-store fires
+with `r1=0x20000111` even though WC-load just before it returned
+`count=1`. The bug is in the user-mode register state: the `add
+r1, r0, #1` at ROM `0x0025708C` produced 0x20000111 (= 0x20000110
++ 1), meaning r0 was 0x20000110 at the add instruction, NOT 1 as
+my WC-load probe set it. Strong suspicion: a cache-coherency
+mismatch where my hypervisor probe reads via stage-2 host PA
+(bypassing the kernel's data cache), but the kernel's USR-mode
+ARM instructions read via stage-1 + cache and see a different
+value. Iter-25 must verify by either flushing caches in the
+probe handler or comparing the probe's emulated load with what
+the kernel actually loaded.**
 
 ### IdleProc probe — corruption pattern identified
 
@@ -240,6 +240,87 @@ TAlertEventHandler region.
   allocator's freelist threading code (the ROM PCs we see are
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
+
+### Iteration 24 (next-loop iter 20): count-store probe — str writes `r1=0x20000111` directly
+
+Iter 23's GetMatchingPage stub eliminated Group-2 PA aliases but
+the wedge persisted. Iter 24 narrows the corruption further:
+1. First, disabled the WC-load probe and re-ran. Wedge fires
+   identically with same `count=0x20000111`. This rules out the
+   probe as the cause.
+2. Then re-enabled WC-load and added two new probes:
+   - WC-store at ROM `0x00257090` (`str r1, [r4, #156]`) — logs r1.
+   - WC-reload at ROM `0x0025709C` (`ldr r0, [r4, #156]`) — logs
+     the value read from memory.
+3. Cold-boot result:
+
+```
+WriteChunk #0 ENTER: this=0x0c646c0c count=0x0
+WC-load #0: count=0x0(0) r5=9 r7=0
+WC-load #1: count=0x1(1) r5=9 r7=1
+WC-store #0: this=0x0c646c0c r1=0x20000111(536871185) before=0x1
+WC-reload #0: this=0x0c646c0c count=0x20000111(536871185)
+WriteRun #0 ENTER: count=0x20000111
+```
+
+Iter 1's PATH B sequence:
+- `0x257074: ldr r0, [r4, #156]` — WC-load probe says count=1, sets `ctx.x[0]=1`.
+- `0x257078..257088: cmp/bls/ldrb/teq/bne` — none touch r0.
+- `0x25708c: add r1, r0, #1` — should produce r1=2.
+- `0x257090: str r1, [r4, #156]` — WC-store probe says **r1=0x20000111**.
+
+The add at `0x25708c` produced 0x20000111, which means r0 was
+**0x20000110** at the add — NOT the 1 my WC-load probe stored
+in ctx.x[0].
+
+#### Hypothesis: cache-coherency mismatch
+
+The hypervisor's `guest_mem::read_word_va` walks the page tables
+and reads via stage-2 host PA. This BYPASSES the guest's data
+cache. The kernel's USR-mode `str r0, [r4, #156]` (in iter 0
+PATH D) writes count=1 via stage-1 + cache. If the cache hasn't
+written back yet, the PA still has the old value (0x20000110
+from earlier use).
+
+So:
+- WC-load probe reads PA (= 0x20000110), but my emulator reports
+  count=1 because the kernel's prior write to count=1 (via cache)
+  is what we expect. **But our log shows count=1 — so the read
+  returned 1, not 0x20000110.**
+- The kernel's actual ldr at `0x257074` reads via cache. If cache
+  has 1 (from iter 0's write), ldr returns 1. r0=1.
+- But add produces 0x20000111, meaning r0 was 0x20000110 at the
+  add — NOT 1.
+
+This is contradictory. Possibilities:
+- ERET from EL2 to UND mode, then UND→USR via `movs pc, lr` —
+  the r0 register isn't actually getting my `ctx.x[0]=1` value.
+  Some path overrides it.
+- An interrupt fires in the 4 instructions between `ldr` and
+  `add`, and the IRQ handler doesn't preserve r0 correctly.
+- The guest's cache and my probe see DIFFERENT data — the probe
+  reports `count=1` from PA, but the kernel's ARM ldr reads
+  `count=0x20000110` from cache.
+
+#### Next iteration plan
+
+Definitive test: instrument the path so we can see r0 value
+right after the WC-load probe's ERET, BEFORE the add fires.
+Replace 0x25708c (`add r1, r0, #1`) with HVC. Handler logs r0.
+This pinpoints whether r0 is correct after the WC-load
+probe (= 1) or wrong (= 0x20000110).
+
+If r0 is wrong AFTER the probe → the probe's ERET path doesn't
+deliver ctx.x[0] to USR's r0.
+
+If r0 is correct → the add somehow produces wrong r1.
+
+#### Status
+
+- 36/36 guest tests pass.
+- Iter-24 deliverables: WC-store + WC-reload probes; verified
+  the wedge isn't probe-induced; pinned the corruption to
+  r0=0x20000110 at the add at `0x25708c`.
 
 ### Iteration 23 (next-loop iter 19): GetMatchingPage stub — eliminates Group-2 aliases but wedge persists
 

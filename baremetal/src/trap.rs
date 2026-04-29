@@ -1264,6 +1264,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::NW_RETURN_PROBE_HVC_IMM => {
             handle_nw_return_probe(ctx);
         }
+        v if v == crate::rom_patches::DL_PROBE_HVC_IMM => {
+            handle_dl_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1763,6 +1766,18 @@ fn handle_und(ctx: &mut TrapContext) {
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::NW_RETURN_PROBE_HVC_IMM) => {
             handle_nw_return_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::DL_PROBE_HVC_IMM) => {
+            // __dl__FPv prologue probe — original instruction was
+            // `b free`. Record the free, then return to the free
+            // entry rather than the next-instruction PC.
+            handle_dl_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(
+                ctx,
+                crate::rom_patches::DL_FREE_TARGET_PC as u64,
+                spsr_und,
+            );
             return;
         }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::DAH_USR_RETURN_PROBE_HVC_IMM) => {
@@ -3726,6 +3741,8 @@ fn handle_nw_return_probe_with(ctx: &mut TrapContext, _source_cpsr: u32) {
             let e_size = NW_TABLE[idx].size.load(Ordering::Relaxed);
             let e_lr   = NW_TABLE[idx].caller_lr.load(Ordering::Relaxed);
             let e_seq  = NW_TABLE[idx].seq.load(Ordering::Relaxed);
+            let frees_m = NW_FREE_MATCHED.load(Ordering::Relaxed);
+            let frees_u = NW_FREE_UNMATCHED.load(Ordering::Relaxed);
             kprintln!();
             kprintln!("*** nw OVERLAP DETECTED ***");
             kprintln!(
@@ -3738,7 +3755,8 @@ fn handle_nw_return_probe_with(ctx: &mut TrapContext, _source_cpsr: u32) {
                 e_seq, e_addr, e_size, e_lr, e_addr, e_hi,
             );
             kprintln!(
-                "  Both blocks are LIVE per the tracker (no Free/__dl__ recorded between them)."
+                "  Both blocks LIVE per tracker (frees so far: matched={} unmatched={})",
+                frees_m, frees_u,
             );
             kprintln!();
         }
@@ -3763,8 +3781,82 @@ fn handle_nw_return_probe_with(ctx: &mut TrapContext, _source_cpsr: u32) {
         );
     }
 
+    // Periodic running summary: every 256 allocations log
+    // (alloc_count, frees_matched, frees_unmatched, live_count) so we
+    // can watch the live set evolve over the boot.
+    if seq > 0 && (seq & 0xFF) == 0 {
+        let frees_m = NW_FREE_MATCHED.load(Ordering::Relaxed);
+        let frees_u = NW_FREE_UNMATCHED.load(Ordering::Relaxed);
+        let next = NW_NEXT_SLOT.load(Ordering::Relaxed) as usize;
+        let scan = next.min(NW_TABLE_SLOTS);
+        let mut live = 0u32;
+        for i in 0..scan {
+            if NW_TABLE[i].addr.load(Ordering::Relaxed) != 0 {
+                live += 1;
+            }
+        }
+        kprintln!(
+            "nw summary @seq={}: live={} frees(matched={} unmatched={})",
+            seq, live, frees_m, frees_u,
+        );
+    }
+
     // Emulate `mov r0, r4`.
     ctx.x[0] = ctx.x[4];
+}
+
+/// Per-free counters for the live-allocation tracker. `MATCHED` means
+/// we found and cleared a NW_TABLE slot for the freed address;
+/// `UNMATCHED` means the address wasn't in our table (allocation
+/// happened before the probe was armed, or via a non-`__nw__` path
+/// the probe doesn't see).
+static NW_FREE_MATCHED:   AtomicU32 = AtomicU32::new(0);
+static NW_FREE_UNMATCHED: AtomicU32 = AtomicU32::new(0);
+
+fn handle_dl_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_dl_probe_with(ctx, probe_source_cpsr(spsr_el2));
+    // Original instruction was `b free`. Override the architected
+    // ELR_EL2 = (HVC PC)+4 so ERET resumes at free's entry rather
+    // than __nw_v__'s prologue.
+    unsafe {
+        core::arch::asm!(
+            "msr elr_el2, {}",
+            in(reg) crate::rom_patches::DL_FREE_TARGET_PC as u64,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+fn handle_dl_probe_with(_ctx: &mut TrapContext, _source_cpsr: u32) {
+    let addr = _ctx.x[0] as u32;
+
+    // free(NULL) is a no-op in C/C++. The real `free` handles this
+    // too; just record-and-skip on our side.
+    if addr == 0 {
+        return;
+    }
+
+    // Search NW_TABLE backwards (newest first) for a live slot with
+    // matching address. Clear it. We don't compact the table — slot
+    // indices stay stable so the seq/caller_lr arrays don't need
+    // reshuffling.
+    let next_slot = NW_NEXT_SLOT.load(Ordering::Relaxed);
+    let scan_limit = (next_slot as usize).min(NW_TABLE_SLOTS);
+    let mut found = false;
+    for i in (0..scan_limit).rev() {
+        if NW_TABLE[i].addr.load(Ordering::Relaxed) == addr {
+            NW_TABLE[i].addr.store(0, Ordering::Relaxed);
+            found = true;
+            break;
+        }
+    }
+
+    if found {
+        NW_FREE_MATCHED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        NW_FREE_UNMATCHED.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 fn dump_flash_bytes(ipa: u32, count: u32) {

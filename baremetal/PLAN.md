@@ -2,12 +2,13 @@
 
 ## Status
 
+**Larger context:** We've tried to patch the kernel so it no longer
+needs 1k subpage protections in the MMU (ARMv4 feature no longer
+available). There are still corruptions happening, so we haven't
+accomplished that yet.
+
 **Current goal: alrt-task DABT — CList header corruption confirmed,
 identify the writer.**
-
-The alias audit (prior loop) proved all 15 verify-mmu aliases are
-kernel-intent subpage-disjoint. Resumed alrt-task DABT
-investigation per the deferred plan.
 
 ### IdleProc probe — corruption pattern identified
 
@@ -221,17 +222,114 @@ TAlertEventHandler region.
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
 
-### Next iteration
+### Iteration 6 (next-loop iter 2): __dl__/free tracking refutes the heap-overlap diagnosis
 
-1. **Add `__dl__`/free tracking** to the live-allocation tracker.
-   Eliminates the "same-address recycle" false positives, leaving
-   only the genuine partial-overlap and same-address-no-free cases.
-2. **Probe `NewBlock`/`NewPtr`** in addition to `__nw__` — these
-   allocator entry points may catch what `__nw__` misses (e.g.,
-   if InitAlertManager-equivalent uses a different allocator path).
-3. **Trace the FIRST partial-overlap** (#118/#120) back via
-   `caller_lr` to identify the kernel call sequence. The
-   immediate fix layer is wherever that bug lives.
+Added `DL_PROBE_HVC_IMM=0x59` at ROM `0x00318F28` (`__dl__FPv`,
+the C++ `operator delete` thunk that tail-calls `free`). The
+original word is a single `b 0x01bd2958 <free>`; the probe
+overwrites it with `HVC #0x59`. The handler reads `r0` (the block
+to free), scans `NW_TABLE` newest-first for a slot with matching
+`addr`, clears `addr` to 0, then sets `ELR_EL2` to
+`DL_FREE_TARGET_PC=0x01BD2958` so ERET continues into the actual
+`free` implementation in REx — the kernel's free path is preserved.
+
+The overlap detector already skipped slots with `addr == 0`, so
+clearing them on free turns the tracker into a true live-allocation
+view. Added two counters (`NW_FREE_MATCHED`, `NW_FREE_UNMATCHED`)
+plus a periodic `nw summary` log every 256 allocations.
+
+`__dl_v__FPvUiPFPvi_v` (vector delete) tail-calls `__dl__` after
+running destructors, so probing `__dl__` alone covers
+`delete[]` too.
+
+### Cold-boot result — heap allocator is NOT producing overlapping live blocks
+
+```
+nw summary @seq=256: live=222 frees(matched=35 unmatched=2)
+nw summary @seq=512: live=291 frees(matched=222 unmatched=58)
+nw summary @seq=768: live=497 frees(matched=272 unmatched=70)
+OVERLAP DETECTED count: 0
+```
+
+Zero overlaps, all the way to the wedge. **The 293 "overlaps" from
+iter 5 were ALL same-address-recycle false positives** — the
+allocator was correctly freeing and re-issuing blocks; we just
+didn't track frees and so every legitimate recycle looked like a
+collision.
+
+The earlier "smoking gun" partial-overlap case (#118/#120) was a
+misread:
+- #118: `__nw_v__` (vector new) called `__nw__` for `0x2c` bytes.
+  Returned `addr=0x0c1178c8`. This is the underlying
+  `count*size+4`-byte block that backs the vector.
+- #120: `THeapDomain::Init` called `__nw__` for `0x3e0` bytes.
+  Returned `addr=0x0c1178cc`.
+
+Between #118 and #120, the kernel ran `__dl_v__(0x0c1178cc, ...)`
+(or a direct free of 0x0c1178c8) — the matching free was just
+invisible to iter 5. With free tracking, the recycled-and-shifted
+allocation is benign coalesce-and-resplit by the allocator.
+
+### Implications — back to the alias-overlap diagnosis
+
+The user's hypothesis ("heap manager assigning overlapping
+physical pages") is **disproved** by the boot-long zero-overlap
+result. The alrt CList corruption at `PA=0x0402e7c4` does NOT come
+from two `__nw__` callers being given the same address.
+
+That puts the corruption back where the iter-3 per-IRQ snapshot
+analysis pointed: a write to a VA that aliases `PA=0x0402e000`
+through a stage-1 mapping that the prior alias audit classified
+as "kernel-intent disjoint". Specifically, in this boot:
+- `VA=0x0cca3000` (alrt globals) mask=`0xc` → AP[1]=11 (subpage 1,
+  offsets `0x400..0x7FF`) — owns `PA=0x0402e000+0x7c4`.
+- `VA=0x0cc9b000` (mntr stack) — first-mapped, PRIM tracker-pinned.
+- `VA=0x0c320000` (name task) mask=`0x30` → AP[2]=11 (subpage 2).
+- `VA=0x0c328000` (Tmux task) mask=`0xf0` → AP[2..3]=11.
+
+By kernel intent, only the alrt task should write subpage 1
+(offsets `0x400..0x7FF`). The corruption pattern (ROM PCs
+`0x003121fc`/`0x00310858` from `MoveFreeBlock`/`SetFreeChain`)
+looks like saved-LR bytes from a heap-allocator call frame — not
+the alrt task's own data.
+
+**Working hypothesis:** one of the OTHER tasks aliasing
+`PA=0x0402e000` runs `MoveFreeBlock`/`SetFreeChain` with `sp`
+landing at offset `0x7c4` of its own VA window. Under ARMv4
+subpage AP that write would have been blocked (its mask doesn't
+include subpage 1). Under our flat AP=11 it goes through to
+`PA=0x0402e000+0x7c4`, overwriting the alrt CList. Iter 3's
+audit conclusion ("capability hazard, not access-pattern hazard")
+is the wrong call: under flat AP=11 the kernel actually IS doing
+the unintended write that subpage AP would have caught.
+
+### Next iteration — capture the writer's PC, finally
+
+Both prior approaches (snapshot diff, stage-2 RO trap with
+auto-flip) saw the corruption but could not pin the PC. Two
+remaining paths:
+
+1. **Instruction-level emulation at the stage-2 trap**, the long-
+   deferred Option A from iter 2. Keep `PA=0x0402e000` RO
+   continuously; in `handle_data_abort`, decode the AArch32 store
+   at `ELR_EL2`, apply the write via `write_word_pa`, advance
+   `ELR_EL2`, leave the page RO. Captures every write with exact
+   PC. Reuses `src/unaligned.rs`'s decode helpers; STM needs
+   per-register iteration.
+
+2. **Constrain via per-task stack subpage trap.** If only one
+   task is the corrupting writer, identifying it narrows the
+   call site without full instruction emulation. A cheaper probe:
+   on every `Prim Remember` for `PA=0x0402e000`, log the per-VA
+   mask history; correlate with the wedge to see which task's
+   accumulated mask doesn't include subpage 1 yet whose VA
+   covers offset `0x7c4`.
+
+Option 1 is the architecturally correct fix and reuses
+infrastructure that's been wanted across multiple iterations.
+Option 2 is one-iteration cheap but only narrows by one variable.
+
+Recommend Option 1 next.
 
 ### Iteration 4 (deferred / superseded by next-loop iter 1 above): ROM-decode of CList ctor
 

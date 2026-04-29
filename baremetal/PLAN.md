@@ -222,6 +222,79 @@ TAlertEventHandler region.
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
 
+### Iteration 9 (next-loop iter 5): shadow-pool infrastructure for Option β
+
+Lay the groundwork for the alias-redirect fix recommended by iter 8.
+The fix needs hypervisor-managed RAM that can back redirected guest
+mappings: when the kernel installs a second VA for an already-mapped
+PA, the hypervisor allocates one of these pages, copies the original
+PA's contents, and rewrites the new VA's L2 entry to point at the
+shadow IPA. Both VAs then have their own physical pages, eliminating
+the cross-subpage write hazard.
+
+This iteration is **infrastructure only** — the policy that uses the
+pool (the Prim Remember hook) lands next iteration. Splitting it
+keeps each commit testable in isolation.
+
+### What landed
+
+- **`src/shadow_pool.rs`** — 64 KiB region (16 4 KiB pages) at
+  `IPA=0x0601_0000`. Backed by `static SHADOW_POOL: [u8; 64 KiB]`
+  in hypervisor RAM. Provides `allocate()` (monotonic slot
+  handout) and `host_pa()` (used by `host_addr_for`).
+- **`src/stage2.rs::install_scratch_pool`** extended to map
+  the shadow pool's 16 L3 entries alongside the existing
+  scratch pool — both share the 2 MiB block at IPA `0x0600_0000`,
+  so we reuse `S2_L3_SCRATCH` rather than adding another L3 table.
+- **`src/guest_mem.rs::host_addr_for`** extended so PA helpers
+  (`read_word_pa`, `write_word_pa`, etc.) can address shadow IPAs
+  the same way they address scratch / RAM / framebuffer.
+- **Smoke test** in `kmain` after stage-2 enable: allocate one
+  shadow page, write `0xCAFEF00D`, read it back, log OK/FAIL.
+
+Cold-boot output:
+
+```
+stage2: shadow-stub scratch pool @ IPA 0x6000000..0x6010000 -> host PA 0x1617000 (RW, 64 KiB)
+stage2: alias-redirect shadow pool @ IPA 0x6010000..0x6020000 -> host PA 0x1607000 (RW, 64 KiB)
+shadow_pool smoke test: ipa=0x06010000 write=true readback=Some(3405705229) -> OK
+```
+
+The smoke test confirms the round trip works: a write at IPA
+`0x06010000` lands in our static `SHADOW_POOL` and is readable
+through `read_word_pa`. Subsequent iterations can rely on this
+plumbing.
+
+### Next iteration — wire the redirect at PrimRememberMapping
+
+With infrastructure in place the redirect itself is small:
+
+1. In `handle_prim_remember_probe_with`, detect the alias install
+   (PA already in `PRIM_FIRST_VA_FOR_PA` for a different VA, AND
+   the new VA's intent mask doesn't subsume the existing one's —
+   meaning the new VA expects to own a different subpage and
+   therefore wants a private page under our flat AP=11).
+2. Call `shadow_pool::allocate()`. Copy the current PA contents
+   (via `read_word_pa` × 1024) to the shadow IPA.
+3. Modify TPhys[+0x10] in place: replace the high 20 bits (page
+   IPA) with the shadow IPA's high 20 bits, leaving the low 12
+   flag bits untouched. The kernel reads TPhys[+0x10] inside
+   PrimRememberMapping (`ldr r0, [r2, #16]!` at `0x163498`) and
+   passes it to AddPgPAndPerm — so by the time the L2 entry gets
+   written, it points at the shadow IPA.
+4. PrimForgetMapping reads the same TPhys[+0x10] (still the shadow
+   IPA after our modification) and removes the right entry —
+   symmetric, no separate hypervisor-side bookkeeping needed.
+
+The regression test: after the redirect lands, pa-emul's
+`writer-PC frequency` table should show **zero** counts for
+`MoveFreeBlock` and `SetFreeChain` writing through `VA=0x0c320000`,
+and the IdleProc DABT at `FAR=0xe336000c` should be gone (the
+alrt task's CList stays uncorrupted).
+
+The pa-emul scaffolding stays armed across iterations — it's the
+mechanical regression test for the redirect.
+
 ### Iteration 8 (next-loop iter 4): subpage-violation classifier and writer attribution
 
 Iter 7 pinned the corrupting writer to `SetFreeChain` at PC=0x00310850

@@ -153,6 +153,13 @@ fn host_addr_for(pa: usize, size: usize, for_write: bool) -> Option<usize> {
     if (scratch_base..scratch_end).contains(&pa) && pa + size <= scratch_end {
         return Some(crate::shadow_stub::scratch_pool_host_pa() as usize + (pa - scratch_base));
     }
+    // Hypervisor shadow pool. Used by the alias-redirect path to
+    // back VA-redirected shadow pages (see `src/shadow_pool.rs`).
+    let shadow_base = crate::shadow_pool::SHADOW_POOL_IPA as usize;
+    let shadow_end = shadow_base + crate::shadow_pool::SHADOW_POOL_SIZE;
+    if (shadow_base..shadow_end).contains(&pa) && pa + size <= shadow_end {
+        return Some(crate::shadow_pool::host_pa() as usize + (pa - shadow_base));
+    }
     None
 }
 

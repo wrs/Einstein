@@ -21,6 +21,7 @@ mod panic;
 mod peripherals;
 mod platform;
 mod rom_patches;
+mod shadow_pool;
 mod shadow_stub;
 mod snapshot;
 mod stage2;
@@ -82,6 +83,10 @@ pub extern "C" fn kmain() -> ! {
     unsafe {
         stage2::init();
         stage2::enable();
+        // Shadow-pool smoke test: verify the stage-2 mapping + host
+        // backing for the alias-redirect shadow pool are wired up
+        // before any policy code uses the pool. One-line diagnostic.
+        shadow_pool::smoke_test();
         // Group-1 self-map capture: mark the 3 kernel-globals self-mapping
         // PAs RO+XN at stage-2 so any guest write to them traps to EL2.
         // Must run before the guest gets ERET'd in so we catch TTBR0

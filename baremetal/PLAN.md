@@ -4,11 +4,13 @@
 
 **Larger context:** We've tried to patch the kernel so it no longer
 needs 1k subpage protections in the MMU (ARMv4 feature no longer
-available). There are still corruptions happening, so we haven't
-accomplished that yet.
+available). After iter-12's 36-KiB stack patch landed, the
+alrt-task DABT (cross-subpage stack overflow corrupting the alrt
+task's CList) is GONE. Phase B has moved on to the next stall.
 
-**Current goal: alrt-task DABT — CList header corruption confirmed,
-identify the writer.**
+**Current goal: heap-extend off-by-one — `TUnicodeCompressor`
+allocation straddles the heap boundary, only 4 KiB of the required
+8 KiB get LockHeapRange'd. See Iter 15 below for the pinpoint.**
 
 ### IdleProc probe — corruption pattern identified
 
@@ -221,6 +223,131 @@ TAlertEventHandler region.
   allocator's freelist threading code (the ROM PCs we see are
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
+
+### Iteration 15 (next-loop iter 11): Fault(stackmgr) procst dump + SBA-stub origin reveal — wedge is `TUnicodeCompressor::WriteRun`
+
+Iter 14 left the wedge "inside the kernel reboot path triggered by an
+unresolvable fault at `FAR=0xc647003` after LockHeapRange #76". This
+iteration adds two diagnostics that pin the *exact* user-mode
+instruction that takes the fault.
+
+#### 1. Augmented `Fault(stackmgr)` probe — confirms procst layout
+
+Extended `handle_stack_mgr_fault_probe_with` in `src/trap.rs` to dump
+`procst[+0x40..+0x60]` plus the instruction word at the
+hypothesized saved-PC offset. The PLAN's earlier guess
+("`procst[+0x40]` = saved ELR_EL1 / PC") turned out to be wrong:
+
+```
+Fault(stackmgr) probe ENTER: this=0x0c112cb8 procst=0x0c1133a4 \
+  pc=0x20000110 far=0x0c647003 status=0x02800000 saved_sp=0x0cc77700 \
+  caller_lr=0x00259230 src_mode=0x10 (USR) sp=0x0c1133a4
+Fault(stackmgr) procst[+0x40..+0x60]: 20000110 0c647003 00000047 \
+  00000004 0cc77700 000013a5 000030f3 02800000
+```
+
+Decoded layout (now in `docs/STRUCTURES.md` "TProcessorState"):
+
+| offset | field | observed |
+|---|---|---|
+| +0x40 | saved CPSR | `0x20000110` (NZCV = 0010, mode=USR) |
+| +0x44 | FAR | `0x0c647003` |
+| +0x48 | DFSR | `0x47` (write, page L2-translation fault) |
+| +0x4c | (unknown small constant) | `0x00000004` |
+| +0x50 | saved SP_usr | `0x0cc77700` |
+| +0x54 | env id | `0x000013a5` |
+| +0x58 | task id | `0x000030f3` |
+| +0x5c | status word | `0x02800000` (bit 25 = data abort) |
+
+The saved PC is NOT in this 32-byte window. It probably lives in
+`procst[+0x00..+0x40]` alongside the user-mode register file (open;
+to confirm next iteration). For now the actual user PC is recovered
+from `lr_abt - 8` in the `dabt: forwarding` path.
+
+#### 2. SBA-stub origin lookup on the dabt-forwarding path
+
+When `lr_abt - 8` lands in the SBA inline-stub pool
+(`0x00E0_0000..0x00FF_FF00`), the new lookup decodes slot 14's
+back-branch (which is always a `B orig_pc + 4`) to recover the
+original ROM PC the stub emulates. This pattern was already present
+on the dabt-trip diag path; iter 15 replicates it on the dabt
+forwarding path so the kernel-DAH wedge is also localised.
+
+#### Cold-boot output — wedge is `TUnicodeCompressor::WriteRun` byte-loop
+
+```
+dabt: forwarding to kernel DataAbortHandler — DFSC=0x7 FAR=0x0c647003 mode=0x17
+  LR_abt=0x00f0f8b0 (faulting PC=0x00f0f8a8) SP_abt=0x0c004c00 SPSR_abt=0x80000110 (pre-abt mode=0x10)
+  sba-stub: slot 17378 (base 0x00f0f880) emulates ROM PC 0x00256fa8 (back-branch 0x00f0f8b8 -> 0x00256fac)
+```
+
+ROM PC `0x00256fa8` is inside `WriteRun__18TUnicodeCompressorFv`
+(begins `0x00256EEC`):
+
+```
+00256f94: e3a05000  mov  r5, #0
+00256f98: e594009c  ldr  r0, [r4, #156]      ; r0 = this->count (this = r4)
+00256f9c: e3500000  cmp  r0, #0
+00256fa0: 9a000016  bls  0x257000             ; exit if count <= 0
+00256fa4: e0840005  add  r0, r4, r5
+00256fa8: e5d000a1  ldrb r0, [r0, #161]       ; ← FAULT: read byte at this+0xa1+r5
+```
+
+The compressor object (`Sizeof__18TUnicodeCompressorSFv = 420`) was
+allocated at `r4 = 0x0c646f60`. Iteration `r5 = 2` accesses
+`0x0c646f60 + 2 + 0xa1 = 0x0c647003` — one byte past the heap top
+that LockHeapRange #76 had just extended to.
+
+#### Diagnosis: heap-extend chain undersized for the 420-byte allocation
+
+The 420-byte `TUnicodeCompressor` straddles the boundary at
+`0x0c647000`:
+- bytes 0..159 sit in `[0xc646f60, 0xc647000)` — within the heap
+- bytes 160..419 sit in `[0xc647000, 0xc647104)` — past the heap top
+
+LockHeapRange #76 only locked 4 KiB (`base=0xc646000 limit=0xc647000`)
+when 8 KiB (`base=0xc646000 limit=0xc648000`) was needed. The
+allocator made *space* for the 420-byte block in the freelist
+bookkeeping but didn't `LockHeapRange` enough physical pages to
+cover the back half. When user-mode `WriteRun` tries to read the
+buffer, the kernel re-faults forever (now correctly returning
+failure after the iter-14 wrapper fix), eventually hitting the
+out-of-memory Reboot path.
+
+#### Next iteration — pin the allocator that under-extends
+
+The kernel allocator path is:
+1. `__nw__(420)` → block-allocator → finds/creates a free 420-byte
+   region near the heap top.
+2. The region spans the heap boundary; allocator should call
+   `ExtendVMHeap` with enough size to cover the WHOLE block, then
+   `LockHeapRange(base, base+full_size)`.
+3. Instead, `ExtendVMHeap` (caller_lr=`0x003109e4`) extends only
+   one 4 KiB chunk via the existing patched `chunk_size=4096`. The
+   block extends past the chunk; the second `LockHeapRange` for the
+   following chunk never fires.
+
+Probe candidates:
+- Hook `ExtendVMHeap` entry (ROM `0x0031091C`) to log `(requested,
+  current_top, granted)`. Verify whether the call asked for
+  `>= 420 - (page_remaining_in_current)` or only the next 4 KiB.
+- Hook `__nw__` return / new-block placement path to confirm the
+  block start address vs. heap top at the moment of issue.
+
+The simplest fix path may be to widen `ExtendVMHeap`'s
+`chunk_size = 4096` patch so it grows by `roundup(requested,
+8 KiB)` instead of one page at a time. Alternatively patch the
+allocator so it doesn't place blocks straddling the freshly-locked
+boundary.
+
+#### Status
+
+- 36/36 guest tests pass.
+- Iter-12 36-KiB stack patches stay active.
+- Iter-14 ResolveFault wrapper fix stays active (correctly
+  propagates failure now).
+- Iter-15 deliverable: `Fault(stackmgr)` probe procst-dump
+  augmentation + SBA-stub origin lookup on dabt-forwarding.
 
 ### Iteration 14 (next-loop iter 10): LockHeapRange probe + ResolveFault wrapper bug fix + Init divisor revert
 

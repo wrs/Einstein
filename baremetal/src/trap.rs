@@ -3091,6 +3091,122 @@ const PRIM_FOCUS_PA: u32 = 0x0403_4000;
 static PRIM_FOCUS_SEQ: AtomicU32 = AtomicU32::new(0);
 static PRIM_FOCUS_LOG_BUDGET: AtomicU32 = AtomicU32::new(64);
 
+/// Per-(PA, VA) kernel-intent mask tracker.
+///
+/// The verify-mmu post-flatten audit reads each L2 descriptor *after*
+/// `fix_stage1_xn_bits` rewrites it as `(e & 0xFFFF_F000) | 0x3E`,
+/// which forces AP[0]=11 regardless of the kernel-installed subpage
+/// AP. So the audit can't tell whether two VAs aliasing the same PA
+/// were *kernel-intended* to share a subpage (real conflict) or to
+/// own different subpages (kernel-intent disjoint). The kernel's
+/// intent is encoded in the `mask=r1` argument to
+/// `PrimRememberMapping`, which uses the L2 descriptor's 2-bits-per-
+/// subpage AP layout: bits[1:0]=AP[0], bits[3:2]=AP[1], etc., set to
+/// `11` for "subpage RW".
+///
+/// This table records, per (PA, VA) pair, the accumulated mask
+/// across all PrimRememberMapping calls. The kernel ORs masks across
+/// repeated calls (the "incremental subpage activation" pattern), so
+/// we OR too. PrimForgetMapping clears the slot. The verify-mmu
+/// alias dump in `guest_mem.rs::fix_stage1_xn_bits` calls
+/// `kernel_intent_mask_for(pa, va)` to recover the kernel-intent AP
+/// state and reclassify the alias as kernel-intent DISJOINT vs
+/// CONFLICT, separate from the post-flatten audit.
+///
+/// Sized for ~30 active alias VAs + ~64 transient + headroom. Linear
+/// search; insertion finds first empty (mask==0) slot. Slow at O(N)
+/// but Prim call rate is low and N is small.
+const KIM_SLOTS: usize = 256;
+struct KimEntry {
+    pa: AtomicU32,
+    va: AtomicU32,
+    mask: AtomicU32,
+}
+static KERNEL_INTENT_MASK: [KimEntry; KIM_SLOTS] = {
+    const Z: KimEntry = KimEntry {
+        pa: AtomicU32::new(0),
+        va: AtomicU32::new(0),
+        mask: AtomicU32::new(0),
+    };
+    [Z; KIM_SLOTS]
+};
+
+/// OR `mask` into the slot for `(pa, va)`. If no slot exists, claim
+/// the first empty slot. Single-threaded EL2 so plain Relaxed ops.
+fn kim_remember(pa: u32, va: u32, mask: u32) {
+    if pa == 0 {
+        return;
+    }
+    // First pass: find existing (pa, va) slot.
+    for slot in &KERNEL_INTENT_MASK {
+        let s_pa = slot.pa.load(Ordering::Relaxed);
+        let s_va = slot.va.load(Ordering::Relaxed);
+        if s_pa == pa && s_va == va {
+            let prev = slot.mask.load(Ordering::Relaxed);
+            slot.mask.store(prev | mask, Ordering::Relaxed);
+            return;
+        }
+    }
+    // Second pass: claim first empty slot (mask==0 means "free").
+    for slot in &KERNEL_INTENT_MASK {
+        if slot.mask.load(Ordering::Relaxed) == 0
+            && slot.pa.load(Ordering::Relaxed) == 0
+        {
+            slot.pa.store(pa, Ordering::Relaxed);
+            slot.va.store(va, Ordering::Relaxed);
+            // Store mask last so a concurrent reader sees a complete
+            // entry (defensive; we're single-threaded, but cheap).
+            // Use mask|1 sentinel-or pattern? No — kernel can call
+            // with mask=0 (initial empty install, observed at REM
+            // #000 / #002 / #006 / #010 / #014 in the focus log).
+            // Since mask==0 is also "empty slot" the lookup table
+            // can lose track of a mask=0 install. That's acceptable
+            // here: the audit only cares about mask!=0 (= some
+            // kernel subpage-RW intent). A mask=0 install with no
+            // follow-up widening means the kernel never asserted any
+            // RW grant; under flat AP=11 the page becomes RW anyway,
+            // but kernel intent says "no AP=11 grant" so the
+            // disjointness check still works (any-bit-overlap = 0).
+            slot.mask.store(mask, Ordering::Relaxed);
+            return;
+        }
+    }
+    // Table full. The verify-mmu code logs a one-time warning if it
+    // encounters this. Don't kprintln here on the hot path.
+}
+
+/// Clear the slot for `(pa, va)`. No-op if no slot exists.
+fn kim_forget(pa: u32, va: u32) {
+    if pa == 0 {
+        return;
+    }
+    for slot in &KERNEL_INTENT_MASK {
+        let s_pa = slot.pa.load(Ordering::Relaxed);
+        let s_va = slot.va.load(Ordering::Relaxed);
+        if s_pa == pa && s_va == va {
+            slot.pa.store(0, Ordering::Relaxed);
+            slot.va.store(0, Ordering::Relaxed);
+            slot.mask.store(0, Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
+/// Lookup the accumulated kernel-intent mask for `(pa, va)`. Returns
+/// `Some(mask)` if a slot exists, `None` if no PrimRememberMapping
+/// call has been observed for this pair (or all observations were
+/// followed by a Forget that cleared the slot).
+pub fn kernel_intent_mask_for(pa: u32, va: u32) -> Option<u32> {
+    for slot in &KERNEL_INTENT_MASK {
+        let s_pa = slot.pa.load(Ordering::Relaxed);
+        let s_va = slot.va.load(Ordering::Relaxed);
+        if s_pa == pa && s_va == va {
+            return Some(slot.mask.load(Ordering::Relaxed));
+        }
+    }
+    None
+}
+
 /// `PrimRememberMapping` prologue probe (PRIM_REMEMBER_PROBE_HVC_IMM = 0x54).
 ///
 /// Patches the first word at ROM `0x00163480` (the standard
@@ -3159,6 +3275,12 @@ fn handle_prim_remember_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
 
     static CALL_COUNT: AtomicU32 = AtomicU32::new(0);
     let n = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    // Kernel-intent mask tracker — OR mask into the (PA, VA) slot.
+    // Used by verify-mmu's first-alias dump to reclassify each alias
+    // as kernel-intent DISJOINT vs CONFLICT, separate from the
+    // post-flatten audit which can't see the kernel's subpage intent.
+    kim_remember(phys, va, mask);
 
     // Per-PA focus timeline: log every Remember call for PRIM_FOCUS_PA
     // unconditionally, with a shared seq# (interleaves with Forget) so
@@ -3249,6 +3371,9 @@ fn handle_prim_forget_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
 
     static FORGET_CALL_COUNT: AtomicU32 = AtomicU32::new(0);
     let n = FORGET_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    // Kernel-intent mask tracker — clear the (PA, VA) slot.
+    kim_forget(phys, va);
 
     // Per-PA focus timeline (Forget side, shared seq with Remember).
     if PRIM_FOCUS_PA != 0 && phys == PRIM_FOCUS_PA {

@@ -538,6 +538,55 @@ pub fn fix_stage1_xn_bits() -> bool {
                                 va_aps[0],   va_aps[1],   va_aps[2],   va_aps[3],
                                 conflict_mask,
                             );
+
+                            // Kernel-intent (pre-flatten) classification.
+                            // Look up the accumulated PrimRememberMapping
+                            // mask for each VA. Each mask bit-pair encodes
+                            // an AP field: bits[1:0]=AP[0], [3:2]=AP[1],
+                            // [5:4]=AP[2], [7:6]=AP[3]. Treat each AP-pair
+                            // as "kernel intends subpage-RW iff field==11".
+                            // Two VAs are kernel-intent disjoint iff their
+                            // sets of "==11" subpages don't overlap.
+                            //
+                            // Misses (None) come from two cases:
+                            //  (a) Group-1 — Direct kernel L2 writes during
+                            //      TTBR0 setup never traverse Prim. We log
+                            //      "INTENT: kernel-direct (Group-1)" and
+                            //      defer to InitSpecialStacks analysis.
+                            //  (b) Group-2 transient — VA was forgotten
+                            //      before this audit walk fired. The
+                            //      tracker slot is empty; the alias is
+                            //      live in stage-1 only because the L2
+                            //      descriptor hasn't been zeroed yet by
+                            //      the kernel's batch flush. Either way,
+                            //      no current kernel-RW intent.
+                            fn intent_subpage_ap_set(mask: u32) -> u8 {
+                                // Returns a 4-bit set: bit i = "AP[i]==11".
+                                let mut s = 0u8;
+                                if mask         & 0b11 == 0b11 { s |= 1; }
+                                if (mask >> 2)  & 0b11 == 0b11 { s |= 1 << 1; }
+                                if (mask >> 4)  & 0b11 == 0b11 { s |= 1 << 2; }
+                                if (mask >> 6)  & 0b11 == 0b11 { s |= 1 << 3; }
+                                s
+                            }
+                            let prev_intent = crate::trap::kernel_intent_mask_for(pa, prev_va);
+                            let va_intent   = crate::trap::kernel_intent_mask_for(pa, va);
+                            let intent_class = match (prev_intent, va_intent) {
+                                (Some(m1), Some(m2)) => {
+                                    let s1 = intent_subpage_ap_set(m1);
+                                    let s2 = intent_subpage_ap_set(m2);
+                                    if s1 & s2 != 0 {
+                                        "CONFLICT"
+                                    } else {
+                                        "DISJOINT"
+                                    }
+                                }
+                                _ => "kernel-direct-or-forgotten",
+                            };
+                            crate::kprintln!(
+                                "verify-mmu alias INTENT: {} prev_va_mask={:?} va_mask={:?}",
+                                intent_class, prev_intent, va_intent,
+                            );
                         }
                     }
                 }

@@ -1,0 +1,18 @@
+# rust-analyzer project config.
+#
+# main.rs uses `#![cfg_attr(not(test), no_std)]` so the crate is no_std on
+# aarch64-unknown-none-softfloat (the build/run target) but std on the host
+# triple (used by `cargo test --target x86_64-unknown-linux-gnu` for the
+# unit tests in src/shadow_stub.rs).
+#
+# rust-analyzer defaults to `cfg.set_test = true` and `cargo.all_targets =
+# true`, which forces cfg(test) on while checking against the bare-metal
+# target — producing hundreds of bogus "can't find crate for `std`" errors.
+# Turning both off makes rust-analyzer match the actual baremetal build.
+# Unit tests in shadow_stub.rs lose IDE diagnostics but still compile and
+# run via `cargo test --target x86_64-unknown-linux-gnu`.
+[cargo]
+allTargets = false
+
+[cfg]
+setTest = false

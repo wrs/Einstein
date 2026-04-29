@@ -14,22 +14,23 @@ shadow-on-write redirects, and per-task subpage-AP shims are all
 ruled out. The fix MUST be a kernel patch that makes the kernel
 work without 1k subpage protections.
 
-**Current goal: shadow-stub LDRB clobbers r0 via scratch-register
-spill. Iter-25 used a sentinel test: WC-load probe sets
-`ctx.x[0]=0x12345678` (verified at handler exit AND at
-trap_sync_lower_aarch32 return). WC-postload probe at
-`0x00257078` sees `r0=0x12345678` — propagation works. But
-WC-add probe at `0x0025708C` sees `r0=0x20000110` — the
-sentinel was clobbered between `0x257078` and `0x25708c`.
-Only ARM instructions in between are cmp/bls/ldrb/teq/bne, none
-of which legitimately modify r0. The `ldrb r1, [r4, #160]` at
-`0x00257080` has been patched by the shadow-stub system (every
-LDRB/STRB gets a B → stub-slot replacement). Strong suspicion:
-the stub's scratch-register selection picks r0 (treating it as
-"dead" after the original ldrb), spills/restores r0 around the
-emulated byte access, but the spill/restore path leaves r0
-holding a CPSR-shaped scratch value. Iter-26 must inspect the
-generated stub at `0x00257080` to confirm whether it touches r0.**
+**Current goal: pin the source of the r0 clobber between WC-postload
+(0x257078, sees sentinel `0x12345678`) and WC-add (0x25708c, sees
+`0x20000110`). Iter-26 ran static analysis on the shadow-stub
+generator and **refuted** the iter-25 hypothesis that the LDRB-
+patched stub at `0x00257080` clobbers r0. `pick_scratch_regs`
+deterministically picks (R12, R2) for that site, never R0 (locked
+in by new unit test `pick_scratch_at_rom_0x257080_does_not_pick_r0`
+in `src/shadow_stub.rs`). R0 is correctly identified as live (via
+the fall-through `add r1, r0, #1` at 0x25708c). So the stub's
+DeadReg variant uses R12 as scratch_ea and R2 as scratch_flags;
+R0 is untouched. The clobber comes from somewhere else — the only
+remaining suspect on the path is an asynchronous IRQ firing
+between 0x257078 and 0x25708c, with the EL2 trap_irq save/restore
+or autosave path leaking a CPSR-shaped value into ctx.x[0]. Iter-27
+must instrument the IRQ path or insert a per-instruction probe
+sequence to localize the clobber to the exact instruction
+boundary.**
 
 ### IdleProc probe — corruption pattern identified
 
@@ -242,6 +243,138 @@ TAlertEventHandler region.
   allocator's freelist threading code (the ROM PCs we see are
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
+
+### Iteration 26 (next-loop iter 22): static analysis refutes shadow-stub-clobbers-r0 hypothesis
+
+Iter-25 hypothesised that the shadow-stub generated for the LDRB
+at `0x00257080` picks R0 as scratch_ea or scratch_flags and leaves
+a CPSR-shaped value in r0 across the byte access. Rather than
+booting and dumping bytes, iter-26 statically reasons about
+`pick_scratch_regs` (deterministic given the surrounding code) and
+locks the result in a unit test.
+
+#### Liveness at orig_pc+4 = 0x00257084
+
+Surrounding block from `rom.dis`:
+
+```
+0x257080: ldrb r1, [r4, #160]    <- the access (rt=r1, rn=r4)
+0x257084: teq  r1, sl            <- reads r1, sl; no GPR write
+0x257088: bne  0x2570c0          <- cond branch
+0x25708c: add  r1, r0, #1        <- READS r0   (fall-through)
+0x257090: str  r1, [r4, #156]
+0x257094: add  r0, r0, r4        <- READS r0
+0x257098: strb r6, [r0, #161]    <- READS r0
+0x25709c: ldr  r0, [r4, #156]    <- writes r0
+... bl WriteRun, return path
+0x2570c0: mov  r0, r4            <- BNE target writes r0 (dead before)
+0x2570c4: bl   WriteRun
+```
+
+`live_at(0x257084, 32)`:
+- Fall-through: `add r1, r0, #1` reads r0 before any write → r0
+  LIVE on this path.
+- Taken (0x2570c0): `mov r0, r4` writes r0 before any read → r0
+  DEAD on this path.
+- BNE union: r0 LIVE.
+
+`pick_scratch_regs(d, 0x00257080)` then iterates CANDIDATES =
+[R12, R0, R1, R2, R3, R14] with operand_mask = R1|R4 (rt=1, rn=4):
+- R12: not in operand, not in live → PICK as scratch_ea.
+- R0: not in operand, **R0 IS in live** → SKIP.
+- R1: in operand → SKIP.
+- R2: not in operand, not in live → PICK as scratch_flags. Done.
+
+Returns `Some((12, Some(2)))`. Variant `DeadReg { sfl: Some(2) }`.
+Stub uses R12 as EA scratch and R2 to spill CPSR via MRS/MSR.
+**R0 is never touched.**
+
+#### Lock-in: unit test
+
+Added `pick_scratch_at_rom_0x257080_does_not_pick_r0` to
+`src/shadow_stub.rs::tests`. Synthesizes the basic-block
+instruction stream and asserts the picker returns `(12, Some(2))`,
+explicitly rejecting r0. Refactor: extracted
+`pick_scratch_regs_with_reader` so the picker is reachable from
+tests with an injected instruction stream (mirrors the existing
+`live_at_with_reader` / `nzcv_dead_recursive` pattern). Removed the
+no-suffix `live_at` and `nzcv_dead_at` wrappers — `pick_scratch_regs`
+now goes through `_with_reader` directly with `code_read_word`.
+
+All 30 shadow_stub tests pass.
+
+#### What this rules out
+
+- The shadow-stub LDRB patch at `0x00257080` does NOT touch r0.
+- The stub's spill/restore path can't be the source of the
+  CPSR-shaped 0x20000110 in r0 at WC-add.
+
+#### Where the clobber must come from
+
+Path from WC-postload (0x257078) to WC-add (0x25708c):
+1. `bls 0x2570d0` — flags are stale (cmp at 0x257078 was replaced
+   by the WC-postload HVC); didn't take (otherwise WC-add wouldn't
+   fire).
+2. `ldrb r1, [r4, #160]` → shadow-stub. R0 untouched (proved this
+   iter).
+3. `teq r1, sl` — reads r1, sl; no GPR write.
+4. `bne 0x2570c0` — didn't take (otherwise WC-add wouldn't fire).
+5. WC-add probe at 0x25708c fires.
+
+None of the architected effects of these instructions write r0.
+Remaining suspects, ordered by plausibility:
+
+a. **Asynchronous IRQ between 0x257078 and 0x25708c.** Newton arms
+   CNTHP fairly tight; an IRQ during this 4-insn window enters
+   `trap_irq` at EL2. If trap_irq writes ctx.x[0] (e.g. through
+   the autosave path: snapshot save reads regs into a buffer; if
+   the save path stomps ctx.x[0] with CPSR/SPSR before restore,
+   that explains the value).
+
+b. **The WC-postload probe handler itself isn't ERETing with
+   ctx.x[0] preserved as expected.** The iter-25 diagnostic
+   `trap_sync_lower_aarch32 RETURN: ctx.x[0]=0x12345678` proves
+   ctx.x[0] is correct *at that print*, but maybe banked-register
+   handling in vectors.s flips a different copy at the actual
+   ERET (per QEMU_BUGS.md, AArch32↔AArch64 banking is fragile on
+   raspi3b).
+
+c. **A different patched site we missed.** `bls`, `bne`, `teq` —
+   none are LDRB/STRB so the shadow-stub system shouldn't have
+   touched them. But the function tracer (under `--features trace`)
+   would have. Verify the count-store run is built without
+   `trace`.
+
+d. **The stub's slot 4 MRS/slot 9 MSR pair runs but the captured
+   CPSR-shape leaks via a live-but-unconsidered path.** Possible
+   if `analyze_insn` for some opcode in the window has a bug that
+   makes the walker think r0 is dead when it isn't — but the
+   liveness test we just added directly contradicts this.
+
+#### Next iteration plan (iter-27)
+
+Highest-value experiment: insert a per-instruction probe at
+`0x257080`, `0x257084`, and `0x257088` logging `r0`. We already
+have probes at 0x257078 and 0x25708c bracketing the window; this
+shrinks the window to single instructions. If r0 is still
+sentinel at 0x257080 and 0x257084 but corrupt at 0x257088 →
+something in the BNE / TEQ pair did it (likely an IRQ or
+mis-decoded patch). If r0 corrupts at 0x257080 → re-examine the
+stub at runtime (the static analysis is wrong somewhere — most
+likely an analyze_insn bug for an instruction in the live walk).
+
+If the per-insn probes don't pin it (because the IRQ fires
+between probes), instrument `trap_irq` to log ctx.x[0] before any
+modification when ELR_EL2 ∈ [0x00257078, 0x00257090].
+
+#### Status
+
+- 30/30 shadow_stub unit tests pass (29 prior + 1 new).
+- 36/36 guest tests still pass.
+- Iter-26 deliverable: static refutation of iter-25's stub-clobber
+  hypothesis; unit test locking the picker's R0-exclusion at
+  0x00257080. Refocus on async IRQ / banked-register paths for
+  iter-27.
 
 ### Iteration 25 (next-loop iter 21): post-load probe pins corruption to shadow-stub-patched LDRB at 0x00257080
 

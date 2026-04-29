@@ -1287,6 +1287,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::DL_PROBE_HVC_IMM => {
             handle_dl_probe(ctx);
         }
+        v if v == crate::rom_patches::LOCK_HEAP_RANGE_PROBE_HVC_IMM => {
+            handle_lock_heap_range_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1798,6 +1801,11 @@ fn handle_und(ctx: &mut TrapContext) {
                 crate::rom_patches::DL_FREE_TARGET_PC as u64,
                 spsr_und,
             );
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::LOCK_HEAP_RANGE_PROBE_HVC_IMM) => {
+            handle_lock_heap_range_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::DAH_USR_RETURN_PROBE_HVC_IMM) => {
@@ -3832,6 +3840,38 @@ fn handle_nw_return_probe_with(ctx: &mut TrapContext, _source_cpsr: u32) {
 /// the probe doesn't see).
 static NW_FREE_MATCHED:   AtomicU32 = AtomicU32::new(0);
 static NW_FREE_UNMATCHED: AtomicU32 = AtomicU32::new(0);
+
+fn handle_lock_heap_range_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_lock_heap_range_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_lock_heap_range_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    // LockHeapRange(r0=base, r1=limit, r2=lock_id_byte). Caller LR
+    // is the source-mode LR at entry (function hasn't pushed yet).
+    // Source mode is typically USR (0x10) — kernel/REx callers go
+    // through this user-shim → MonitorDispatchSWI → FMLockHeapRange.
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let base = ctx.x[0] as u32;
+    let limit = ctx.x[1] as u32;
+    let lock_id = ctx.x[2] as u32 & 0xFF;
+    let caller_lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+
+    // Log every call. Volume should be modest — most allocations
+    // don't go through LockHeapRange (it's the explicit per-range
+    // path used by, e.g., NewVMHeap and stack-region init).
+    kprintln!(
+        "LockHeapRange #{}: base={:#010x} limit={:#010x} lock_id={:#04x} \
+caller_lr={:#010x} src_mode={:#x} sp={:#010x}",
+        seq, base, limit, lock_id, caller_lr, source_cpsr & 0x1F, sp,
+    );
+
+    // Emulate `mov ip, sp`.
+    ctx.x[12] = sp as u64;
+}
 
 fn handle_dl_probe(ctx: &mut TrapContext) {
     let spsr_el2 = read_sysreg!("spsr_el2") as u32;

@@ -215,8 +215,22 @@ const PATCHES_717006: &[RomPatch] = &[
     RomPatch { offset: 0x001F_9034, value: 0xE049_0600, name: "FMNewStack: sub r0, r9, r0, lsl #12 (×4096, end-of-slot)" },
     RomPatch { offset: 0x001F_9038, value: 0xE280_2A01, name: "FMNewStack: add r2, r0, #4096 (base = slot+guard)" },
 
-    // Heap-domain divisor patches (3 patches):
-    RomPatch { offset: 0x001F_8D74, value: 0xE3A0_0A09, name: "Init__11THeapDomain: mov r0, #36864 (slot count divisor)" },
+    // Heap-domain divisor patches.
+    //
+    // Init__11THeapDomain (0x001F_8D74) was patched alongside
+    // FMNewStack but reverted: that function constructs THeapDomain
+    // for BOTH stack pools and regular data heaps. Patching the
+    // divisor to 36 KiB correctly sizes the slot_info array for
+    // stack pools but UNDER-sizes the bookkeeping for data heaps,
+    // breaking ExtendVMHeap when the heap grows past what the
+    // patched-down array can index. The unpatched 33 KiB divisor
+    // OVER-sizes the array for stack pools (108 slots vs 99 actually
+    // used) — wasted memory but functionally safe; FMNewStack only
+    // ever computes indices in the 0..99 range.
+    //
+    // GetStackInfo and FMFree are stack-only paths, so the 36-KiB
+    // divisor stays — correct slot index computation requires the
+    // matching slot stride.
     RomPatch { offset: 0x001F_8E1C, value: 0xE3A0_0A09, name: "GetStackInfo: mov r0, #36864 (slot index divisor)" },
     RomPatch { offset: 0x001F_918C, value: 0xE3A0_0A09, name: "FMFree: mov r0, #36864 (slot index divisor)" },
     // Force exclusive per-stack page allocation by short-circuiting
@@ -730,6 +744,19 @@ const DL_ORIG_INSN:                u32 = 0xEA62_E68A; // b 0x01bd2958 <free>
 /// deallocation.
 pub const DL_FREE_TARGET_PC:       u32 = 0x01BD_2958;
 
+/// `LockHeapRange` user-shim entry probe — patches the standard
+/// `mov ip, sp` prologue at ROM `0x001F_8AB4` with HVC. The handler
+/// logs `(r0=base, r1=limit, r2=lock_id_byte, caller_lr)` so we can
+/// see exactly what range every kernel/REx caller asks the
+/// `FMLockHeapRange` SWI to lock. The boot wedge after the iter-12
+/// 36-KiB stack patch is an infinite ResolveFault loop where
+/// `limit` is one 4-KiB page past the heap's current top — this
+/// probe is the first step in identifying which caller computes
+/// the bad `limit`.
+pub const LOCK_HEAP_RANGE_PROBE_HVC_IMM: u32 = 0x5A;
+pub const LOCK_HEAP_RANGE_PROBE_PC:      u32 = 0x001F_8AB4;
+const LOCK_HEAP_RANGE_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -1026,6 +1053,18 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(DL_PROBE_HVC_IMM),
             "__dl__FPv tail-call to free",
             DL_PROBE_HVC_IMM,
+        );
+        // LockHeapRange shim entry probe — captures (base, limit,
+        // lock_id, caller_lr) on every user-mode LockHeapRange call.
+        // Diagnoses the iter-13 ResolveFault loop where limit is
+        // one page past heap top.
+        patch_probe(
+            rom_ptr,
+            LOCK_HEAP_RANGE_PROBE_PC,
+            LOCK_HEAP_RANGE_FIRST_INSN,
+            hvc_insn(LOCK_HEAP_RANGE_PROBE_HVC_IMM),
+            "LockHeapRange entry",
+            LOCK_HEAP_RANGE_PROBE_HVC_IMM,
         );
     }
 }
@@ -1376,8 +1415,8 @@ unsafe fn apply_resolve_fault_wrapper(rom_ptr: *mut u32) {
         0xE1A0_0004,                            // +0x34 mov r0, r4
         0xE1A0_1005,                            // +0x38 mov r1, r5
         arm_bl(bl_pc, RESOLVE_FAULT_PC),        // +0x3c bl ResolveFault
-        0xE350_0004,                            // +0x40 cmp r0, #4
-        0x0A00_0003,                            // +0x44 beq done (skip 3 insns to +0x58)
+        0xE350_0000,                            // +0x40 cmp r0, #0
+        0x1A00_0003,                            // +0x44 bne done — propagate ANY error (was beq on r0==4 only)
         0xE28A_A001,                            // +0x48 add r10, r10, #1
         0xE35A_0004,                            // +0x4c cmp r10, #4
         0xBAFF_FFF5,                            // +0x50 blt iter (offset -11 words from PC+8)

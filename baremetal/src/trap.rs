@@ -1320,6 +1320,12 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::WC_RELOAD_PROBE_HVC_IMM => {
             handle_wc_reload_probe(ctx);
         }
+        v if v == crate::rom_patches::WC_ADD_PROBE_HVC_IMM => {
+            handle_wc_add_probe(ctx);
+        }
+        v if v == crate::rom_patches::WC_POSTLOAD_PROBE_HVC_IMM => {
+            handle_wc_postload_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1885,6 +1891,16 @@ fn handle_und(ctx: &mut TrapContext) {
         }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::WC_RELOAD_PROBE_HVC_IMM) => {
             handle_wc_reload_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::WC_ADD_PROBE_HVC_IMM) => {
+            handle_wc_add_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::WC_POSTLOAD_PROBE_HVC_IMM) => {
+            handle_wc_postload_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -4321,6 +4337,60 @@ fn handle_wc_load_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
 
     // Emulate `ldr r0, [r4, #156]`.
     ctx.x[0] = count as u64;
+}
+
+fn handle_wc_add_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_wc_add_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+/// `WriteChunk` count-add probe — `add r1, r0, #1` at ROM
+/// `0x0025708C`. Logs r0 right before the add fires. Emulates
+/// the add by setting r1 = r0 + 1.
+fn handle_wc_add_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let r0 = ctx.x[0] as u32;
+    let r4 = ctx.x[4] as u32;
+    let mode = source_cpsr & 0x1F;
+
+    if seq < 32 {
+        kprintln!(
+            "WC-add #{}: r0={:#x}({}) r4={:#010x} → r1={:#x} src_mode={:#x}",
+            seq, r0, r0, r4, r0.wrapping_add(1), mode,
+        );
+    }
+
+    // Emulate `add r1, r0, #1`.
+    ctx.x[1] = r0.wrapping_add(1) as u64;
+}
+
+fn handle_wc_postload_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_wc_postload_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+/// `WriteChunk` post-WC-load probe — `cmp r0, #0` at ROM
+/// `0x00257078`. Logs r0 RIGHT AFTER the WC-load probe's ERET.
+/// Emulates cmp by updating NZ flags in SPSR.
+fn handle_wc_postload_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let r0 = ctx.x[0] as u32;
+    let mode = source_cpsr & 0x1F;
+
+    if seq < 32 {
+        kprintln!(
+            "WC-postload #{}: r0={:#x} src_mode={:#x}",
+            seq, r0, mode,
+        );
+    }
+
+    // Emulate `cmp r0, #0` by updating NZ flags in saved SPSR.
+    let updated = compute_teq_z_n(source_cpsr, r0);
+    let _ = guest_mem::write_word_pa(UND_SAVE_SPSR_IPA, updated);
 }
 
 fn handle_wc_store_probe(ctx: &mut TrapContext) {

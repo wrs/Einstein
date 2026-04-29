@@ -14,20 +14,22 @@ shadow-on-write redirects, and per-task subpage-AP shims are all
 ruled out. The fix MUST be a kernel patch that makes the kernel
 work without 1k subpage protections.
 
-**Current goal: count-store probe shows the str at `0x00257090`
-writes `r1=0x20000111` directly. Iter-24 added probes at the str
-(`0x257090`) and re-read (`0x2570 9c`). Result: WC-store fires
-with `r1=0x20000111` even though WC-load just before it returned
-`count=1`. The bug is in the user-mode register state: the `add
-r1, r0, #1` at ROM `0x0025708C` produced 0x20000111 (= 0x20000110
-+ 1), meaning r0 was 0x20000110 at the add instruction, NOT 1 as
-my WC-load probe set it. Strong suspicion: a cache-coherency
-mismatch where my hypervisor probe reads via stage-2 host PA
-(bypassing the kernel's data cache), but the kernel's USR-mode
-ARM instructions read via stage-1 + cache and see a different
-value. Iter-25 must verify by either flushing caches in the
-probe handler or comparing the probe's emulated load with what
-the kernel actually loaded.**
+**Current goal: shadow-stub LDRB clobbers r0 via scratch-register
+spill. Iter-25 used a sentinel test: WC-load probe sets
+`ctx.x[0]=0x12345678` (verified at handler exit AND at
+trap_sync_lower_aarch32 return). WC-postload probe at
+`0x00257078` sees `r0=0x12345678` — propagation works. But
+WC-add probe at `0x0025708C` sees `r0=0x20000110` — the
+sentinel was clobbered between `0x257078` and `0x25708c`.
+Only ARM instructions in between are cmp/bls/ldrb/teq/bne, none
+of which legitimately modify r0. The `ldrb r1, [r4, #160]` at
+`0x00257080` has been patched by the shadow-stub system (every
+LDRB/STRB gets a B → stub-slot replacement). Strong suspicion:
+the stub's scratch-register selection picks r0 (treating it as
+"dead" after the original ldrb), spills/restores r0 around the
+emulated byte access, but the spill/restore path leaves r0
+holding a CPSR-shaped scratch value. Iter-26 must inspect the
+generated stub at `0x00257080` to confirm whether it touches r0.**
 
 ### IdleProc probe — corruption pattern identified
 
@@ -240,6 +242,76 @@ TAlertEventHandler region.
   allocator's freelist threading code (the ROM PCs we see are
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
+
+### Iteration 25 (next-loop iter 21): post-load probe pins corruption to shadow-stub-patched LDRB at 0x00257080
+
+Iter 24 narrowed corruption to "between str at 0x257090 and ldr
+at 0x25709c" — wrong. Iter 25 widens the trace by adding two
+probes around the SUSPICIOUS region:
+- `WC-add` at `0x25708C` (already there from iter 24): logs r0
+  right before the increment.
+- `WC-postload` at `0x257078`: logs r0 right after WC-load's
+  ERET.
+
+Sentinel test: temporarily replaced `ctx.x[0] = count` with
+`ctx.x[0] = 0x12345678` in the WC-load probe. Also added a
+diagnostic kprintln in trap_sync_lower_aarch32 right before
+eret to verify ctx.x[0] is preserved up to the eret.
+
+Cold-boot result:
+
+```
+WC-load #0: count=0x0(0) r5=9 r7=0
+WC-load post-update: ctx.x[0]=0x12345678, save_slot=0x12345678
+trap_sync_lower_aarch32 RETURN: ctx.x[0]=0x12345678 ELR_EL2=0xffffe4
+WC-postload #0: r0=0x12345678 src_mode=0x10
+WC-add #0: r0=0x20000110(536871184) → r1=0x20000111
+WC-store #0: r1=0x20000111 before=0x0
+WriteRun #0 ENTER: count=0x20000111
+*** Reboot canary fired ***
+```
+
+**Crucial finding**: r0 propagation WORKS up through 0x257078
+(WC-postload sees the sentinel), but is CLOBBERED before
+0x25708c. Only ARM instructions in between are:
+- `0x25707c: bls 0x2570d0`
+- `0x257080: ldrb r1, [r4, #160]`
+- `0x257084: teq r1, sl`
+- `0x257088: bne 0x2570c0`
+
+None of cmp/bls/teq/bne legitimately modify r0. The `ldrb` at
+`0x00257080` is special: the shadow-stub system patches EVERY
+LDRB/STRB at boot (`shadow_stub: scanned 27799 words, patched
+27799 insns`). So the kernel reaches `0x00257080` and BRANCHES
+to a generated stub in the SBA pool (`0x00E0_0000..0x00FF_FF00`).
+
+The stub emulates the byte access using scratch registers. If
+the stub's scratch-register selection (`pick_scratch_regs` in
+`src/shadow_stub.rs`) treats r0 as "dead at orig_pc+4" — based
+on the original ARM body without considering the EL2 ERET
+delivers r0 from EL2's ctx — it might use r0 as the EA register
+and clobber it.
+
+The clobber value `0x20000110` is CPSR-shaped (NZCV=0010, mode=
+USR=0x10), suggesting the stub places SPSR or a CPSR-derived
+value into r0.
+
+#### Next iteration plan
+
+1. Dump the actual stub bytes at the slot for orig_pc=`0x257080`.
+   `pick_scratch_regs` should be deterministic given the
+   classifier output, so we can inspect the stub layout directly.
+2. If r0 is used as scratch_ea or scratch_flags, check whether
+   the stub's spill-restore preserves r0 across the byte access.
+3. Likely fix: blacklist r0 from scratch-register pick at
+   `0x257080` (or globally for kernel ROM), forcing the stub to
+   spill a different register.
+
+#### Status
+
+- 36/36 guest tests pass (with sentinel removed at end of iter).
+- Iter-25 deliverable: WC-postload + sentinel test, pinning the
+  r0 corruption to the shadow-stub-patched LDRB at `0x00257080`.
 
 ### Iteration 24 (next-loop iter 20): count-store probe — str writes `r1=0x20000111` directly
 

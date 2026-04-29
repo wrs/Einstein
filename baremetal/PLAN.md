@@ -222,6 +222,101 @@ TAlertEventHandler region.
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
 
+### Iteration 13 (next-loop iter 9): pool-wedge analysis — it's a HEAP-extend mismatch, not a stack-pool sizing issue
+
+Drilled into the iter-12 wedge timeline. Tracking
+`info=0x0c115784` (the TStackInfo whose bounds the failing
+FMLockHeapRange checks against) across the boot shows its
+`[base, top)` range GROWING over time:
+
+| boot-line | bounds | size |
+|---|---|---|
+| early | `[0xc601000, 0xc981000)` | 3.5 MiB |
+| then | `[0xc601000, 0xc603000)` |   8 KiB |
+| then | `[0xc601000, 0xc604000)` |  12 KiB |
+| then | `[0xc601000, 0xc605000)` |  16 KiB |
+| ... grows in 4-KiB steps ... | | |
+| at wedge | `[0xc601000, 0xc646000)` | 276 KiB |
+
+This is a **HEAP** that extends in 4-KiB chunks (= our patched
+`NewHeap` / `NewVMHeap` / `ZapHeap` chunk_size). NOT a stack pool.
+The 3.5-MiB initial bounds is the heap's max reservation; the
+actual extent at any time is the lower number.
+
+### What the wedge actually is
+
+`FMLockHeapRange` is called with `parms->[+0]=base=0xc601000`
+and `parms->[+4]=limit=0xc647000` (= 280 KiB). It iterates
+`r6 = base..limit` in 1-KiB steps, calling `ResolveFault` on
+each chunk. When `r6` enters `[0xc646000, 0xc647000)` — past
+the heap's current top of `0xc646000` — `ResolveFault` can't
+resolve the page (it's outside the heap's reserved range),
+returns 4, the wrapper retries the next subpage, all four fail,
+the function returns 4 to FMLockHeapRange which treats it as
+"page not yet present, will retry"; `r6` advances another 1 KiB,
+re-faults, etc. Infinite loop.
+
+So **`limit` is one 4-KiB page past `top`**. Caller of
+`LockHeapRange` is asking to lock a range that extends one page
+beyond the heap's current end.
+
+### Why does limit > top?
+
+This is most likely a `NewHeapArea` / `ExtendVMHeap` path where:
+
+1. Kernel asks `NewHeapArea` to grow heap by `N` bytes.
+2. Heap grows by `M` bytes where `M < N` (due to chunk rounding,
+   pool exhaustion, or off-by-one in our patches).
+3. Kernel calls `LockHeapRange(base, base+N)` — but heap only
+   extends to `base+M`.
+4. `FMLockHeapRange` iterates past `top=base+M`, faults, loops.
+
+Our active heap-side patches are:
+
+- `NewHeap chunk_size=4096` (was 1024) — at `0x0031_0E38`.
+- `NewVMHeap` 4-KiB init path — at `0x0014_23A0`.
+- `ZapHeap chunk/lock = 4096` (was 1024) — at `0x0014_28B8`.
+
+Plus the `apply_resolve_fault_wrapper` (4-iter per page).
+
+These were applied BEFORE iter 12 and boot worked through them
+until the alrt-DABT wedge. The 36-KiB stack patches land on top
+without affecting heap growth directly. But possibly:
+
+- The stack-info bookkeeping array (sized via
+  `Init__11THeapDomain`'s `(pool_size / 36864)`) is now smaller,
+  and a downstream caller computes
+  `lock_limit = info_array[N].top + something` where the
+  array is shorter than expected — accessing past the array reads
+  junk for `top`.
+- Or: the 36 KiB allocation per stack means the stack pool ITSELF
+  grew via heap-style extension; the heap claims it's grown by
+  36 KiB but `NewHeapArea` only delivered 33 KiB or 32 KiB.
+
+### Investigation strategy for the next iteration
+
+1. **Probe `LockHeapRange` parms** — log `(base, limit, lock_id)`
+   on entry so we see exactly what range the caller asks to lock.
+2. **Probe the heap-extend path** — log `NewHeapArea` /
+   `ExtendVMHeap` `(requested_size, granted_size, new_top)` so we
+   see the over-/under-allocation.
+3. **Cross-check Einstein** — run `NewtonProbe` to see what
+   `LockHeapRange` parms look like with the original 33-KiB
+   layout. If Einstein passes the same `limit > top + 4 KiB`
+   pattern, our patches haven't broken anything new — the off-by-
+   one already exists in the original kernel and we're triggering
+   it through a different path.
+
+### Iteration outcome — analysis only, no code change
+
+The iter-13 deliverable is the analysis above. The wedge needs
+further probing to identify the exact site that miscomputes
+`lock_limit` or `granted_size`. The 36-KiB stack patches from
+iter 12 stay active — they remain the right architectural fix
+and have already eliminated the alrt-task DABT.
+
+36/36 guest tests still pass with the iter-12 patches active.
+
 ### Iteration 12 (next-loop iter 8): 36-KiB stack patch lands — alrt-task DABT fixed, exposes pool-sizing wedge
 
 Re-applied the 17 FMNewStack patches plus 3 divisor sites from

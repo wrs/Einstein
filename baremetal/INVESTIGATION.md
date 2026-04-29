@@ -1437,6 +1437,111 @@ B is implementable in a similar-sized iteration to this one;
 A is more involved but reusable for any future page-write
 attribution problem.
 
+## Iteration 5 — __nw__ probe confirms heap-allocator chaos (user-suggested hypothesis)
+
+User asked (2026-04-28): "Is this not just random chaos caused by
+the heap manager assigning overlapping physical pages? Have we
+done anything to demonstrate that this is not the case?"
+
+We hadn't. The prior alias audit only validated stage-1 VA→PA
+disjointness. The block allocator (the layer slicing 4-KiB pages
+into smaller chunks for `NewBlock`/`__nw__`) was unchecked.
+
+### Probe design
+
+Paired entry/return hooks on `__nw__FUi` (operator new) at ROM
+`0x00318ee8` (entry, instruction `mov ip, sp`) and `0x00318f1c`
+(return-site, instruction `mov r0, r4`). New HVC immediates 0x57
+and 0x58.
+
+`handle_nw_entry_probe_with` captures `(size = r0, caller_lr)`
+and pushes to a small per-CPU pending stack (depth=8 for nested
+calls). `handle_nw_return_probe_with` reads `r4` (= the address
+about to be returned), pops the matching entry, logs the
+(seq, addr, size, caller_lr) tuple, and checks for overlap with
+all entries in a 1024-slot append-only `NW_TABLE`. On overlap
+detection the handler prints a multi-line diagnostic showing
+both the new and prior allocation's caller chain.
+
+No `free`/`__dl__` tracking yet — the table is append-only, so
+"same-address re-allocation after free" produces a false-positive
+overlap. Partial-overlap cases (different start addresses,
+intersecting ranges) are unambiguous and can't be explained by
+recycling.
+
+### Cold-boot result
+
+939+ allocations during boot. **293 overlap warnings.** That
+warning rate alone is overwhelming evidence the allocator is in
+chaos.
+
+Sample partial-overlap (UNAMBIGUOUS bug — addresses differ):
+```
+*** nw OVERLAP DETECTED ***
+  new alloc #120: addr=0x0c1178cc size=0x3e0 caller_lr=0x001f8d88
+                  (range [0x0c1178cc, 0x0c117cac))
+  prior alloc #118: addr=0x0c1178c8 size=0x2c  caller_lr=0x00318f58
+                  (range [0x0c1178c8, 0x0c1178f4))
+  Overlap: [0x0c1178cc, 0x0c1178f4) — 0x28 bytes shared
+```
+
+#118 and #120 start 4 bytes apart. No free-then-realloc story can
+explain "give out a block at X, then later give out a slightly
+shifted block at X+4 with both still live". Two distinct
+allocations that physically overlap.
+
+Same-start overlap (could be recycle, but suspicious):
+```
+*** nw OVERLAP DETECTED ***
+  new alloc #185: addr=0x0c11aa60 size=0x24 caller_lr=0x001f6730
+  prior alloc #162: addr=0x0c11aa60 size=0x24 caller_lr=0x00149030
+```
+
+### How this changes our thinking about the alrt CList corruption
+
+Iter 4 said diff #3 is "an active overwrite of the just-constructed
+CList by some unidentified writer." If the heap allocator gave
+both the alrt task's TAlertManager (via InitAlertManager →
+__nw__(200)) AND some other consumer's allocation overlapping
+ranges, then:
+
+- The alrt task's TAlertEventHandler ctor + CList ctor properly
+  initialize their region (diff #2).
+- Then the OTHER consumer's code (the one whose allocation
+  overlaps ours) writes its own data into what it thinks is its
+  own block — but it actually lands in our CList header (diff #3).
+- The other consumer's data has heap-allocator-internal-looking
+  values because that consumer is running heap-related code
+  (likely the heap allocator's own bookkeeping).
+
+This matches the diff #3 byte pattern (count=0x20, esize=1, ROM
+PCs for MoveFreeBlock/SetFreeChain) — the values are the OTHER
+consumer's struct fields, not corruption of our CList.
+
+### Caveats — direct alrt allocation not in this run's log
+
+The 939 allocations captured don't include any size=0xc8
+(TAlertManager) or any address near VA=0x0cca3000. Either:
+- The alrt task creation runs via a different allocator path
+  (e.g., `NewBlock` or `NewPtr`, not `__nw__`).
+- The boot wedges before InitAlertManager fires (but we DO see
+  the alrt task in the Reboot canary).
+- InitAlertManager runs and our probe captures it, but the
+  per-call log budget (32 detailed entries) elided it.
+
+Next iteration should:
+1. Add `__dl__`/free tracking to filter same-address recycles.
+2. Probe `NewBlock`/`NewPtr` in addition to `__nw__`.
+3. Lift the per-call detailed-log budget so we can find the
+   alrt allocation directly.
+4. Once the corrupting overlap is pinpointed, decide fix layer:
+   - ROM patch on the buggy allocator path
+   - Allocator wrapper enforcing strict block boundaries
+   - Different stage-2 mapping that prevents the overlap
+
+The user's hypothesis (heap chaos) is now confirmed; the next
+iterations refine it into a specific bug to fix.
+
 The corruption pattern (heap allocator APCS frame imprint) is
 consistent with: while the alrt task's USR-mode code held a
 TAlertEventHandler at that stack offset, a kernel-mode SVC call

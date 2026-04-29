@@ -652,6 +652,31 @@ pub const IDLEPROC_PROBE_HVC_IMM:      u32 = 0x56;
 pub const IDLEPROC_PROBE_PC:           u32 = 0x0003_09EC;
 const IDLEPROC_FIRST_INSN:             u32 = 0xE1A0_C00D; // mov ip, sp
 
+/// `__nw__FUi` (operator new) probe — paired ENTRY / RETURN hooks
+/// at ROM `0x00318ee8` and `0x00318f1c` so we can correlate
+/// `(size_requested, returned_addr, caller_LR)` per allocation and
+/// detect overlapping live blocks.
+///
+/// The user's hypothesis (2026-04-28) is that the corruption at the
+/// alrt task's TAlertEventHandler CList header is heap allocator
+/// chaos — two distinct `__nw__` calls overlap in physical address
+/// because the allocator's free-list / block bookkeeping is broken
+/// under our flat AP=11. The probe tests this directly: log every
+/// (size, addr) pair, watch for overlaps.
+///
+/// Entry insn at 0x318ee8 is the standard `mov ip, sp`. Return-site
+/// insn at 0x318f1c is `mov r0, r4` (loading the allocated address
+/// from the saved register before the function returns). Both get
+/// patched with HVCs; the handlers preserve the original effect
+/// (ctx.x[12]=sp at entry; ctx.x[0]=ctx.x[4] at return).
+pub const NW_ENTRY_PROBE_HVC_IMM:  u32 = 0x57;
+pub const NW_ENTRY_PROBE_PC:       u32 = 0x0031_8EE8;
+const NW_ENTRY_FIRST_INSN:         u32 = 0xE1A0_C00D; // mov ip, sp
+
+pub const NW_RETURN_PROBE_HVC_IMM: u32 = 0x58;
+pub const NW_RETURN_PROBE_PC:      u32 = 0x0031_8F1C;
+const NW_RETURN_ORIG_INSN:         u32 = 0xE1A0_0004; // mov r0, r4
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -911,6 +936,29 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(IDLEPROC_PROBE_HVC_IMM),
             "IdleProc__18TAlertEventHandler prologue",
             IDLEPROC_PROBE_HVC_IMM,
+        );
+        // __nw__ entry/return probe pair. Entry captures
+        // (size, caller_LR); return captures the allocated address
+        // and pairs them via a per-CPU pending-call slot. Together
+        // they let the handler log every operator-new allocation
+        // with full (size, addr, caller_LR) and detect overlaps
+        // between live blocks (the user-suspected mode for the alrt
+        // CList corruption).
+        patch_probe(
+            rom_ptr,
+            NW_ENTRY_PROBE_PC,
+            NW_ENTRY_FIRST_INSN,
+            hvc_insn(NW_ENTRY_PROBE_HVC_IMM),
+            "__nw__FUi entry",
+            NW_ENTRY_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            NW_RETURN_PROBE_PC,
+            NW_RETURN_ORIG_INSN,
+            hvc_insn(NW_RETURN_PROBE_HVC_IMM),
+            "__nw__FUi return",
+            NW_RETURN_PROBE_HVC_IMM,
         );
     }
 }

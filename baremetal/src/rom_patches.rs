@@ -233,6 +233,22 @@ const PATCHES_717006: &[RomPatch] = &[
     // matching slot stride.
     RomPatch { offset: 0x001F_8E1C, value: 0xE3A0_0A09, name: "GetStackInfo: mov r0, #36864 (slot index divisor)" },
     RomPatch { offset: 0x001F_918C, value: 0xE3A0_0A09, name: "FMFree: mov r0, #36864 (slot index divisor)" },
+    // GetMatchingPage = always-return-0 stub (iter 23). Forces every
+    // FindOrAllocPage_ReturnUnLockedOnNoPage call into the cache-miss
+    // branch → AllocNewPage → fresh PA from TUPageManager::Get. Without
+    // this stub, the kernel's TStackManager reuses an existing
+    // TStackPage's PA across distinct VAs (heap/stack/scratch) by relying
+    // on ARMv4 subpage-AP — exactly the alias the iter-21 stage-1 walk
+    // pinned for PA=0x04084000 (heap VA 0x0c646000 ↔ stack VA 0x0ccc8000).
+    // Under flat AP=11 the alias collapses and the compressor's count
+    // gets clobbered by another task's exception-frame push.
+    //
+    // Stub layout (replaces the original prologue at 0x001F_86B4):
+    //   0x001F_86B4: mov r0, #0   (was: mov ip, sp = 0xE1A0_C00D)
+    //   0x001F_86B8: bx lr         (was: push {r4-r10, fp, ip, lr, pc}
+    //                                    = 0xE92D_DFF0)
+    RomPatch { offset: 0x001F_86B4, value: 0xE3A0_0000, name: "GetMatchingPage: mov r0, #0 (return 0 — no shareable page)" },
+    RomPatch { offset: 0x001F_86B8, value: 0xE12F_FF1E, name: "GetMatchingPage: bx lr (skip prologue+body)" },
     // Force exclusive per-stack page allocation by short-circuiting
     // `TStackManager::GetMatchingPage` to always return 0 (= "no
     // shareable page found"). This forces every `FindOrAllocPage` call

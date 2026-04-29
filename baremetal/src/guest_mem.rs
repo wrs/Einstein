@@ -1563,9 +1563,25 @@ unsafe fn patch_und_vector(rom: *mut u32) {
         // R14_usr regardless of target mode (R14_und lives in X22), so
         // the obvious "stash return PC in ctx.x[14]" pattern would
         // overwrite R14_usr instead.
+        //
         //   +0x00: e59fe000  ldr lr, [pc, #0]    ; lr = *(stub + 8)
         //   +0x04: e1b0f00e  movs pc, lr         ; CPSR = SPSR_und, PC = lr
         //   +0x08: <target PC literal, updated per ERET>
+        //
+        // Iter-28 attempted to extend this stub to also reload banked
+        // SPSR_und from UND_SAVE_SPSR_IPA via `MSR SPSR_cxsf, lr` (so
+        // flag-emulating probes' SPSR updates would propagate). The
+        // attempt failed: with the MSR in place QEMU raspi3b broke the
+        // boot with cascading data aborts at the next kernel store
+        // (0x186b4). Loads + movs without the MSR are stable; only
+        // the MSR triggers the regression. Suspected QEMU raspi3b
+        // banked-SPSR-write quirk (consistent with docs/QEMU_BUGS.md
+        // Bug #1's family of `banked_spsr[]` indexing issues; possibly
+        // distinct because Bug #1 is about EL2 → AArch32 propagation,
+        // whereas this is AArch32-internal MSR SPSR from UND mode).
+        // Reverted to the 3-word stub. Approach (b) — emulate the bne
+        // at 0x257088 directly via ELR_EL2 in an HVC handler — is the
+        // path forward; it sidesteps SPSR entirely.
         let stub = UND_RETURN_STUB_OFFSET / 4;
         rom.add(stub + 0).write(0xE59F_E000); // ldr lr, [pc, #0]
         rom.add(stub + 1).write(0xE1B0_F00E); // movs pc, lr

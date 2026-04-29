@@ -14,30 +14,24 @@ shadow-on-write redirects, and per-task subpage-AP shims are all
 ruled out. The fix MUST be a kernel patch that makes the kernel
 work without 1k subpage protections.
 
-**Current goal: pin the source of the r0 clobber. Iter-26 statically
-refuted the iter-25 "LDRB stub clobbers r0" hypothesis;
-`pick_scratch_regs` for the LDRB at `0x00257080` deterministically
-picks (R12, R2), never R0 (locked in by unit test). Iter-27 added
-a probe at `0x00257084` (between the LDRB-stub return and the BNE)
-and confirmed empirically: **WC-postldrb sees r0=0** — exactly the
-value WC-load delivered, so the LDRB stub is innocent at runtime
-too. But iter-27 also surfaced a **latent bug in the existing
-probe infrastructure**: probe handlers for cmp/teq/etc. update
-flags by writing `UND_SAVE_SPSR_IPA` in memory, but the UND-return
-stub uses banked `SPSR_und` (the hardware register, saved by the
-CPU at UND entry, not reloaded from memory). So all the
-"emulate cmp/teq via SPSR" updates have been silently no-ops for
-the iter-25/26 probes too — those probes happened to work because
-the stale flags (from before the patched instruction) coincidentally
-satisfied the kernel's expected branch directions. Iter-27 broke
-that luck: with the WC-postldrb probe replacing the native `teq r1,
-sl`, the BNE at 0x257088 reads flags-from-before-the-patched-cmp
-(stale, Z=0) and takes — control reaches WriteRun via the BNE-
-taken path instead of the WC-add fall-through. **Iter-28 must fix
-the trampoline so probe handler flag-updates actually reach banked
-SPSR_und, or use a different probe mechanism (e.g. emulating the
-branch directly in the handler) before iter-25's actual r0 puzzle
-can be re-investigated.**
+**Current goal: pin the source of the r0 clobber. Iter-26 refuted
+the LDRB-stub-clobbers-r0 hypothesis (static), iter-27 confirmed
+empirically (WC-postldrb sees r0=0). Iter-27 also discovered the
+latent SPSR-emulation bug in probe handlers: `write_word_pa(
+UND_SAVE_SPSR_IPA, ...)` doesn't reach banked SPSR_und because
+the UND-return stub `movs pc, lr` uses the banked register, not
+memory. Iter-28 attempted approach (a) from iter-27's plan —
+extend the UND-return stub to `MSR SPSR_cxsf, lr` from the
+in-memory value — and discovered that **MSR SPSR_cxsf from UND
+mode breaks QEMU raspi3b** (encoding 0xE16F_F00E; the MSR
+isolates as the cause via NOP-bisection: ldr-only stub variant
+boots fine, MSR variant takes cascading data aborts at the next
+kernel store). This appears to be a QEMU raspi3b banked-SPSR-
+write quirk in the family of `docs/QEMU_BUGS.md` Bug #1.
+Reverted; UND_RETURN_STUB is back at its iter-27 3-word form.
+**Iter-29 should pursue approach (b): replace the bne at
+0x257088 with HVC and emulate the branch directly via ELR_EL2
+in the handler. This sidesteps the SPSR mechanism entirely.**
 
 ### IdleProc probe — corruption pattern identified
 
@@ -250,6 +244,143 @@ TAlertEventHandler region.
   allocator's freelist threading code (the ROM PCs we see are
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
+
+### Iteration 28 (next-loop iter 24): SPSR-plumbing fix attempted, blocked by QEMU `MSR SPSR_cxsf` quirk
+
+Per iter-27's plan (a), iter-28 attempted to extend the
+`UND_RETURN_STUB` (in `src/guest_mem.rs::patch_und_vector`) so it
+reloads banked `SPSR_und` from `UND_SAVE_SPSR_IPA` before
+`movs pc, lr`. Target layout (7 words = 28 bytes, fitting exactly
+between `UND_RETURN_STUB_OFFSET = 0x00FF_FFE4` and ROM_END):
+
+```
++0x00: e59fe00c  ldr lr, [pc, #0xc]    ; lr = SPSR_IPA literal
++0x04: e59ee000  ldr lr, [lr]          ; lr = saved SPSR
++0x08: e16ff00e  msr SPSR_cxsf, lr     ; banked SPSR_und ← lr (UND mode)
++0x0c: e59fe004  ldr lr, [pc, #4]      ; lr = ELR literal
++0x10: e1b0f00e  movs pc, lr           ; CPSR = SPSR_und, PC = lr
++0x14: <UND_SAVE_SPSR_IPA literal = 0x0600_F004>
++0x18: <ELR literal>
+```
+
+LR is the sole scratch (rewritten three times) so we don't need
+to round-trip R12 through TPIDRURW. Required `UND_RETURN_STUB_LITERAL_OFFSET`
+to move from +0x08 to +0x18.
+
+#### Cold-boot result — boot regression at the first kernel store
+
+```
+Dropping to EL1 AArch32 at guest IPA 0x00000000 (ROM reset vector)
+trap: EC=0x12 (HVC from AArch32) ELR=0x1868c ESR=0x4a000044
+BootOS canary: first boot — emulated mov r0,#0xb0 ...
+trap: EC=0x12 (HVC from AArch32) ELR=0xffff58 ESR=0x4a000010
+und: handle_und first entry, ELR_EL2=0xffff58 SPSR_EL2=0x1db FAR_EL1=0x0
+und: MCR p15,0,Rt,c15,c1,2 (StrongARM clock) @PC=0x186a8 — no-op
+trap: EC=0x24 (Data abort from lower EL) ELR=0x186b4 ESR=0x93810047
+trap: EC=0x24 (Data abort from lower EL) ELR=0x186c0 ESR=0x93810047
+... [cascading DABTs at sequential PCs through the kernel]
+```
+
+The very first UND-trampoline round-trip (the StrongARM-clock MCR
+no-op) returns to 0x186ac, then the next kernel store at 0x186b4
+(`str r1, [r0]`) takes a DABT, and the kernel cascades into
+broken state. Pre-iter-28 baseline (3-word UND_RETURN_STUB) the
+exact same MCR-no-op round-trip works fine.
+
+#### Bisection localizes the regression to the MSR
+
+I replaced individual instructions in the new stub with NOPs:
+
+- All three new instructions NOP'd (loads + MSR): boot reaches
+  WriteChunk same as iter-27 baseline. ✓
+- Loads enabled, MSR replaced with NOP: still boots fine. ✓
+- Loads enabled + MSR enabled (the actual fix): boot dies at
+  0x186b4 with cascading DABTs. ✗
+
+So the load sequence is fine; the MSR specifically is the cause.
+
+#### Diagnosis: suspected QEMU raspi3b banked-SPSR-write quirk
+
+Encoding `MSR SPSR_cxsf, lr = 0xE16F_F00E`:
+- bits 31:28 cond = 1110 (AL)
+- bits 27:23 = 00010 (data-processing misc)
+- bit 22 R = 1 (SPSR)
+- bits 21:20 = 10
+- bits 19:16 mask = 1111 (cxsf)
+- bits 15:12 SBO = 1111
+- bits 11:4 = 0
+- bits 3:0 Rm = 1110 (LR)
+
+Encoding matches ARM ARM A8.8.110 verbatim. From UND mode, MSR
+SPSR_cxsf, Rm targets the current mode's banked SPSR
+(SPSR_und). On real hardware this would be a no-op (the value we
+write to memory in the trampoline is what we re-MSR). But the
+boot regression strongly implies QEMU raspi3b mishandles the
+write — clobbering some other piece of state and propagating
+chaos into subsequent kernel execution.
+
+This is consistent with `docs/QEMU_BUGS.md` Bug #1 (and the
+DataAbortHandler `mrs r1, SPSR` workaround at
+`rom_patches.rs::DAH_MRS_SPSR_HVC_IMM`): QEMU raspi3b's banked
+SPSR plumbing is unreliable. We've already wired around the
+**reading** side via the DAH MRS-replacement HVC; the **writing**
+side appears to have its own quirk.
+
+#### Cleanup
+
+Reverted `src/guest_mem.rs::patch_und_vector` to the iter-27
+3-word stub. Boot is back to iter-27 baseline. The negative
+finding is documented in the patch_und_vector comment and in
+this PLAN entry so iter-29 doesn't waste a cycle re-attempting
+the same approach.
+
+#### What this rules in / out
+
+- The SPSR-plumbing fix (approach a from iter-27) is blocked on
+  QEMU raspi3b at the `MSR SPSR_cxsf, lr` instruction.
+- Approach (b) — replace the bne with HVC, emulate via ELR_EL2 —
+  remains untested and is the path forward.
+- The MSR may work on FVP (which has more accurate banked-reg
+  semantics per docs/QEMU_BUGS.md), but the project must keep
+  both QEMU raspi3b AND FVP green per CLAUDE.md, so a
+  QEMU-broken fix is unacceptable.
+
+#### Next iteration plan (iter-29)
+
+Approach (b): replace `bne 0x2570c0` at ROM `0x00257088` with
+HVC #0x68 (next available probe imm). Handler reads source SPSR's
+Z bit and either:
+- Z=1 (BNE not taken): let ERET resume at 0x25708c — natural
+  fall-through.
+- Z=0 (BNE taken): override `ELR_EL2` to point at 0x2570c0 before
+  ERET so guest resumes at the BNE target.
+
+The handler doesn't need to write SPSR; it just decides PC.
+Sidesteps the QEMU MSR quirk entirely. The handler also logs r0
+at this point (the most useful new datapoint — r0 right at the
+BNE, between WC-postldrb and WC-add).
+
+Then re-enable the iter-25 sentinel (`ctx.x[0] = 0x12345678` in
+WC-load) and re-run. Expected outcome:
+- WC-postload r0 = 0x12345678 ✓
+- WC-postldrb r0 = 0x12345678 (matches iter-27)
+- WC-bne r0 = 0x12345678 OR 0x20000110 (the diagnostic)
+- WC-add r0 = 0x20000110 (per iter-25)
+
+If WC-bne sees 0x20000110 → corruption is between WC-postldrb
+(0x257084) and WC-bne (0x257088), i.e. either teq-emulation or
+something async firing in that one-insn gap (very narrow!).
+If WC-bne sees 0x12345678 → corruption is at WC-add itself or in
+the bne emulation (regression in our new code), which we can
+investigate separately.
+
+#### Status
+
+- Build clean, 30/30 shadow_stub tests pass.
+- Boot reaches WriteChunk + WC-postldrb (iter-27 baseline).
+- Iter-28 deliverable: documented negative result on the SPSR-
+  plumbing fix; preserved iter-27 baseline; iter-29 plan
+  pivots to approach (b).
 
 ### Iteration 27 (next-loop iter 23): WC-postldrb probe confirms LDRB stub innocent; uncovers latent SPSR-emulation bug
 

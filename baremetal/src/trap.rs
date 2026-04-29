@@ -3082,6 +3082,15 @@ static PRIM_FIRST_LR_FOR_PA: [AtomicU32; PRIM_TRACKER_RAM_PAGES] = {
 static PRIM_ALIAS_LOG_BUDGET: AtomicU32 = AtomicU32::new(64);
 static PRIM_FORGET_MISMATCH_BUDGET: AtomicU32 = AtomicU32::new(64);
 
+/// Per-PA timeline focus: when a Remember or Forget call's PA matches
+/// `PRIM_FOCUS_PA`, log it unconditionally with a shared global
+/// sequence counter so Remember/Forget interleave in chronological
+/// order. The 5-way conflict at PA=0x04034000 (per the iter-1 audit)
+/// is the active target. Set to 0 to disable.
+const PRIM_FOCUS_PA: u32 = 0x0403_4000;
+static PRIM_FOCUS_SEQ: AtomicU32 = AtomicU32::new(0);
+static PRIM_FOCUS_LOG_BUDGET: AtomicU32 = AtomicU32::new(64);
+
 /// `PrimRememberMapping` prologue probe (PRIM_REMEMBER_PROBE_HVC_IMM = 0x54).
 ///
 /// Patches the first word at ROM `0x00163480` (the standard
@@ -3150,6 +3159,21 @@ fn handle_prim_remember_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
 
     static CALL_COUNT: AtomicU32 = AtomicU32::new(0);
     let n = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    // Per-PA focus timeline: log every Remember call for PRIM_FOCUS_PA
+    // unconditionally, with a shared seq# (interleaves with Forget) so
+    // we can read off the temporal order. Tracker logic below stays
+    // first-VA based; this is purely additive observation.
+    if PRIM_FOCUS_PA != 0 && phys == PRIM_FOCUS_PA {
+        let seq = PRIM_FOCUS_SEQ.fetch_add(1, Ordering::Relaxed);
+        let budget = PRIM_FOCUS_LOG_BUDGET.fetch_sub(1, Ordering::Relaxed);
+        if budget > 0 {
+            kprintln!(
+                "Prim FOCUS REM #{:03} PA={:#010x} va={:#010x} mask={:#x} perm={:#x} upstream_lr={:#010x} user_pc={:#010x} user_caller={:#010x}",
+                seq, phys, va, mask, perm, upstream_lr, user_pc, user_caller,
+            );
+        }
+    }
 
     if phys >= PRIM_TRACKER_RAM_BASE
         && (phys - PRIM_TRACKER_RAM_BASE) < (PRIM_TRACKER_RAM_PAGES as u32 * 0x1000)
@@ -3225,6 +3249,18 @@ fn handle_prim_forget_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
 
     static FORGET_CALL_COUNT: AtomicU32 = AtomicU32::new(0);
     let n = FORGET_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    // Per-PA focus timeline (Forget side, shared seq with Remember).
+    if PRIM_FOCUS_PA != 0 && phys == PRIM_FOCUS_PA {
+        let seq = PRIM_FOCUS_SEQ.fetch_add(1, Ordering::Relaxed);
+        let budget = PRIM_FOCUS_LOG_BUDGET.fetch_sub(1, Ordering::Relaxed);
+        if budget > 0 {
+            kprintln!(
+                "Prim FOCUS FGT #{:03} PA={:#010x} va={:#010x} src_mode={:#x}",
+                seq, phys, va, source_cpsr & 0x1F,
+            );
+        }
+    }
 
     if phys >= PRIM_TRACKER_RAM_BASE
         && (phys - PRIM_TRACKER_RAM_BASE) < (PRIM_TRACKER_RAM_PAGES as u32 * 0x1000)

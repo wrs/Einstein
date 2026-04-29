@@ -379,33 +379,89 @@ the patches don't cover. ARMv4 hardware would have caught this
 too (5×AP=11 on the same subpage); how the original kernel
 handled it is the open question.
 
-### Next iteration — narrow the PA=0x04034000 conflict
+### PA=0x04034000 timeline — 2 simultaneous-live mappings (BUG confirmed)
 
-1. Walk Prim probe call sequence for PA=0x04034000 to determine
-   the temporal order: were the 5 installs simultaneously live,
-   or did each preceding install get forgotten before the next?
-   The PrimForgetMapping probe data answers this.
-2. Read the L2 PT directly at PA=0x04025400+0x7f*4..+0x82*4
-   to see the FINAL state. If only one descriptor remains
-   non-zero, the others were forgotten and there's no
-   simultaneous live conflict.
-3. Cross-check against Einstein: under faithful subpage-AP
-   emulation, what does Einstein do when 5 calls install the
-   same PA at different VAs with overlapping subpage masks?
-4. Decide:
-   - If Einstein also has the simultaneous live mapping → it's
-     pre-existing kernel design relying on serialization.
-   - If Einstein doesn't (forgets prior installs) → our
-     PrimForgetMapping path is missing forgets that the
-     kernel's ARMv4 path would have done.
+Added `PRIM_FOCUS_PA=0x04034000` to the Prim Remember/Forget probes:
+both handlers log every call for this PA with a shared global seq#,
+giving chronological order. Cold-boot captured 17 events:
 
-If the conflict is truly simultaneous-live (no prior forget),
-the 4-KiB patch set may be missing a per-allocator-path patch
-similar to the existing NewHeap/NewVMHeap/ZapHeap chunk_size=4096
-patches but applied to a different size class.
+| seq | op | VA | mask | upstream | user_caller |
+|-----|----|----|------|----------|-------------|
+| #000 | REM | 0x0cc82000 | 0x0 | GenericSWIHandler | 0x0c1181b0 (REx driver) |
+| #001 | REM | 0x0cc82000 | 0xc | CopyPagesAfterStackCollided#1 | 0x0c1181b0 |
+| #002 | REM | 0x0cc7f000 | 0x0 | GenericSWIHandler | TheMain::TLoader |
+| #003 | REM | 0x0cc7f000 | 0x3 | GenericSWIHandler | TheMain::TLoader |
+| #004 | **FGT** | **0x0cc7f000** | | | |
+| #005 | REM | 0x0cc82000 | 0xc | CopyPagesAfterStackCollided#2 | 0x0c1181b0 |
+| #006 | REM | 0x0cc80000 | 0x0 | GenericSWIHandler | TCardAsyncMsg ctor |
+| #007 | REM | 0x0cc80000 | 0x3 | GenericSWIHandler | TCardAsyncMsg ctor |
+| #008 | **FGT** | **0x0cc80000** | | | |
+| #009 | REM | 0x0cc82000 | 0xc | CopyPagesAfterStackCollided#2 | 0x0c1181b0 |
+| #010 | REM | 0x0cc81000 | 0x0 | GenericSWIHandler | TCardAsyncMsg ctor |
+| #011 | REM | 0x0cc81000 | 0x3 | GenericSWIHandler | TCardAsyncMsg ctor |
+| #012 | **FGT** | **0x0cc81000** | | | |
+| #013 | REM | 0x0cc82000 | 0xc | CopyPagesAfterStackCollided#2 | 0x0c1181b0 |
+| #014 | REM | 0x0c310000 | 0x0 | GenericSWIHandler | TTask::Init#1 |
+| #015 | REM | 0x0c310000 | 0x3 | GenericSWIHandler | TTask::Init#1 |
+| #016 | REM | 0x0c310000 | 0x3 | GenericSWIHandler | TTask::Init#2 |
 
-Until this conflict is resolved, the alrt-task DABT
-investigation stays parked.
+**Three transient VAs (0xcc7f, 0xcc80, 0xcc81) ARE properly forgotten
+before reuse — those are not the bug.** But VA=`0xcc82000` (REx
+driver, #000) is **never forgotten**, and VA=`0x0c310000` (TTask::Init
+stack base, #014) is also **never forgotten**. At end-of-boot the
+allocator has handed PA=0x04034000 to TWO simultaneous live
+consumers: the persistent REx-driver mapping and the new task stack.
+
+Under our flat AP=11 normalization both VAs are full RW pointing at
+the same physical bytes — real corruption hazard if either consumer
+ever writes the page. (Per user note: subpage protection doesn't
+exist on ARMv7, so once any subpage is RW the whole page is RW; the
+kernel's ARMv4-era subpage-disjoint design is structurally
+unrepresentable on our hardware. The 4-KiB patch set's job is to
+prevent the kernel from ever sharing a PA across consumers.)
+
+The bug is exposed because the kernel's page allocator (reached
+via `TUDomainManager::Get` SWI dispatch) handed PA=0x04034000 to a
+REx-driver allocation early in boot AND to a TTask::Init stack
+allocation later — without the REx-driver path ever issuing a
+Forget. The 4-KiB patch set covers heap allocations
+(NewHeap/NewVMHeap/ZapHeap → chunk_size=4096) but evidently does
+NOT cover whatever allocator path REx code at `0x0c1181b0` uses to
+get PA=0x04034000.
+
+### Next iteration — identify the REx-driver allocator path
+
+The persistent VA=0xcc82000 mapping (#000, retained across the entire
+boot) is the load-bearing alias. Its `user_caller=0x0c1181b0` lives in
+RAM at REx-resident code (`0x0c100000+` is the REx data/code window).
+We need to know:
+
+1. **What allocator path does REx code at 0x0c1181b0 use to get
+   PA=0x04034000?** Disassemble `_Data_/Einstein.rex` symbols around
+   `0x0c1181b0` to identify the function and its allocator chain.
+2. **Does the existing 4-KiB patch set cover this allocator chain?**
+   If the chain calls into NewHeap/NewVMHeap/ZapHeap, the patch
+   should already force a fresh 4-KiB PA — meaning the bug is
+   somewhere else (maybe the page-id-to-PA map). If the chain uses
+   a different allocator (e.g., a REx-resident slab), the patch set
+   needs extension.
+3. **Cross-check Einstein**: run NewtonProbe on the same ROM+REx
+   pair. Does Einstein see PA=0x04034000 handed to two live
+   consumers? If yes → kernel-pre-existing simultaneous-live design.
+   If no → Einstein's allocator path differs from ours (likely
+   because Einstein implements faithful subpage AP and the kernel
+   takes a different path).
+
+### Step 2 partly already answered
+
+The verify-mmu first-alias dump for PA=0x04034000 reads the live
+L2 PT during walks; the (L2[0x7f]=0x0403403e, L2[0x82]=0x0403403e)
+pair the audit table records is a *transient state captured at
+seq #003* (between REM va=0xcc7f000 mask=0x3 and FGT va=0xcc7f000
+at #004). The end-of-boot live state is L2[0x82] (VA=0xcc82000) and
+L2[0x10] of L1[0xc3] (VA=0x0c310000) — different L2 PTs, both
+non-zero. A periodic L2-PT dump probe could confirm but the timeline
+data already pins this down.
 
 ### Once Group-2's conflict is understood
 

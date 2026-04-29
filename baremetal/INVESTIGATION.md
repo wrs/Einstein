@@ -975,3 +975,135 @@ the Prim probe entirely.
 The audit infrastructure stays in place so any new alias
 introduced by future debugging picks up the same mechanical
 classification automatically.
+
+## alrt-task DABT — IdleProc probe identifies CList header corruption (2026-04-28)
+
+Resumed after the alias audit completed. The user-confirmed
+fault was decoded in commit `0ed81e20` as a CheckButton dereference
+of a junk pointer (0xE3360000), pulled from the alrt task's
+TAlertEventHandler CList by IdleProc.
+
+### IdleProc probe (`IDLEPROC_PROBE_HVC_IMM=0x56`)
+
+Patched ROM `0x000309EC` (IdleProc's `mov ip, sp` prologue) with
+`HVC #0x56`. Handler `handle_idleproc_probe_with` in `src/trap.rs`
+dumps:
+- `this`, `inner = *(this+0x14)`, `clist = inner+0x8c`
+- CList header fields: count, esize, ebase
+- First 4 entries (read as 32-bit words regardless of esize)
+- Raw 32-byte snapshot of `this` (vtable, signature, fields)
+- Raw 32-byte snapshot of the CList header
+
+Reached via UND-trampoline since IdleProc runs from USR mode.
+
+### Cold-boot capture (single IdleProc call before wedge)
+
+```
+IdleProc #000 ENTER this=0x0cca37a8 inner=0x0cca3738
+                clist=0x0cca37c4 count=32 esize=1
+                ebase=0x003121fc src_mode=0x10 sp=0x0cca3638
+  entry[0] @VA=0x003121fc = 0xe3360000  ← JUNK (FAR=0xe336000c source)
+  entry[1] @VA=0x00312200 = 0x15a74048
+  entry[2] @VA=0x00312204 = 0xe91baff0
+  entry[3] @VA=0x00312208 = 0xe3300000
+  raw this[0..32]:
+    +0x00: 0x0001eac0     ← vtable (ROM, valid)
+    +0x04: 0x00000000
+    +0x08: 0x6e657774     ← ASCII "newt"
+    +0x0c: 0x616c7274     ← ASCII "alrt"
+    +0x10: 0x0c6019c0
+    +0x14: 0x0cca3738     ← inner ptr (= alrt globals base)
+    +0x18: 0x0c2049a0
+    +0x1c: 0x00000020
+  raw clist[0..32]:
+    +0x00: 0x00000020     ← count = 32
+    +0x04: 0x00000001     ← esize = 1 (bogus; should be 4)
+    +0x08: 0x0c320804
+    +0x0c: 0x0c3207dc
+    +0x10: 0x003121fc     ← ebase = ROM PC
+    +0x14: 0x00310858     ← ROM PC
+    +0x18: 0x0c201010
+    +0x1c: 0x00000020
+```
+
+### TAlertEventHandler is intact; the CList header is what's corrupted
+
+The vtable pointer at this+0 (0x1eac0) is in ROM (valid).
+The "newt"+"alrt" ASCII at this+8/+0xc is the standard Newton
+class signature. The inner pointer at this+0x14 (0x0cca3738) is
+the alrt task globals base (matches the Reboot canary's
+`globals=0x0cca3738`). So the TAlertEventHandler is a real,
+properly-constructed object.
+
+The corruption is in the CList header at VA=0x0cca37c4
+(= inner+0x8c = this+0x1c). Field-by-field:
+- `count = 32`  (plausible-looking magnitude but unverified)
+- `esize = 1`  (bogus — for `void*` entries it must be 4)
+- `ebase = 0x003121fc` (ROM PC, definitely wrong)
+
+The two ROM PCs at clist+0x10 and clist+0x14 are inside the kernel
+heap allocator:
+- `0x003121fc` is **right after `bl SetFreeChain`** in
+  `MoveFreeBlock` (ROM symbol `0x003121AC <MoveFreeBlock>:`)
+- `0x00310858` is the **first instruction of `SetFreeChain`** after
+  its prologue (ROM symbol `0x0031084C <SetFreeChain>:`)
+
+These look like saved-LR / saved-PC values from an APCS stack
+frame. The CList header storage was used as a STACK at some point
+during a `MoveFreeBlock → bl SetFreeChain` call, leaving the
+allocator's APCS frame imprint behind.
+
+CList::At(0) reads `*(ebase + 0*esize)` and returns it as a 32-bit
+word: `*(0x003121fc) = 0xE3360000` (the instruction byte
+encoding of `teq r6, #0` at that ROM address). Caller treats that
+as a TAlertDialog pointer, dereferences `[+12]`, and faults at
+FAR=0xe336000c. Wedge confirmed root-cause: corrupted CList header.
+
+### Next iteration — stage-2 RO trap on PA backing 0x0cca37c4
+
+Install a stage-2 RO carve-out on the page containing
+VA=0x0cca37c4 (4-KiB aligned). On every kernel write, log
+`(PC, offset, value, src_mode)` then auto-flip to RW so the store
+completes (same pattern as the existing g1_capture probe in
+`src/g1_capture.rs`).
+
+Expected captures:
+1. The legitimate writes that initialize the CList header
+   (count=0, esize=4, ebase=null or valid-heap-pointer).
+2. The corrupting writes that overwrite the header with the
+   APCS frame (heap allocator stack-frame imprint).
+
+The PCs of (2) tell us which kernel routine is escaping its
+allocation boundary into the alrt task's TAlertEventHandler
+inner struct.
+
+### Working hypothesis
+
+The alrt task's stack lives at VA=0x0cc9c000..0x0cca4000 (per the
+Reboot canary's `stk_bot=0x0cc9c000`). The TAlertEventHandler
+instance at `this=0x0cca37a8` and inner at `0x0cca3738` are
+within that stack range (`0x0cca3738` < `0x0cca37a8` <
+`0x0cca37c4` < ~0x0cca4000). So the TAlertEventHandler **is on
+the alrt task's stack**.
+
+The corruption pattern (heap allocator APCS frame imprint) is
+consistent with: while the alrt task's USR-mode code held a
+TAlertEventHandler at that stack offset, a kernel-mode SVC call
+into the heap allocator (`MoveFreeBlock → bl SetFreeChain`) ran
+on the SAME task's SVC stack region, and the SVC stack overlapped
+the USR stack at offset 0x0cca37c4. Heap allocator's frame
+overwrite the USR-mode CList header.
+
+This is a **per-task USR-vs-SVC stack-region overlap** — the
+kernel's task structure should give SVC mode a separate stack
+from USR. The overlap may be due to our hypervisor's flat AP=11
+allowing kernel-mode writes through what should be USR-stack-
+disjoint AP, OR a real kernel bug that ARMv4 caught via subpage
+AP and our flat AP=11 silently allows.
+
+This connects back to the alias audit: while the audit confirmed
+no current Group-2 alias has overlapping kernel-intent subpages,
+this corruption suggests a subpage-AP boundary the kernel
+*relies on* for USR-vs-SVC stack disjointness is no longer
+enforced under our flat AP=11. The "things break randomly under
+flat AP=011" premise from the original directive may apply here.

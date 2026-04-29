@@ -1243,6 +1243,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::PRIM_FORGET_PROBE_HVC_IMM => {
             handle_prim_forget_probe(ctx);
         }
+        v if v == crate::rom_patches::IDLEPROC_PROBE_HVC_IMM => {
+            handle_idleproc_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1722,6 +1725,15 @@ fn handle_und(ctx: &mut TrapContext) {
             // PrimForgetMapping prologue probe at 0x00163514. Same
             // dispatch shape as the Remember probe.
             handle_prim_forget_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::IDLEPROC_PROBE_HVC_IMM) => {
+            // IdleProc__18TAlertEventHandler prologue probe at
+            // 0x000309EC. Reached via UND-trampoline since IdleProc
+            // runs from USR mode. Pass spsr_und so SP/LR lookups land
+            // on the right banked register.
+            handle_idleproc_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -3419,6 +3431,106 @@ fn handle_prim_forget_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
     }
 
     // Emulate `mov ip, sp`.
+    ctx.x[12] = sp as u64;
+}
+
+/// `IdleProc__18TAlertEventHandler` prologue probe
+/// (`IDLEPROC_PROBE_HVC_IMM = 0x56`).
+///
+/// Patches the first word at ROM `0x000309EC` (the standard
+/// `mov ip, sp` AArch32 prologue) with `HVC #0x56`. On entry:
+/// `r0 = this` (TAlertEventHandler*). The function reads
+/// `inner = *(this + 0x14)` (= ehandler->[+20]), then
+/// `clist = inner + 0x8c` (= +140); calls
+/// `r5 = CList::At(clist, 0)`; iterates dialogs.
+///
+/// CDynamicArray (CList base) layout (from
+/// `SafeElementPtrAt__13CDynamicArrayFl` at ROM 0xa175c):
+///   `[+0x00]` = element count
+///   `[+0x04]` = element size in bytes
+///   `[+0x10]` = entries-array base pointer
+/// `CList::At(this, idx)` (ROM `0x11341c`) calls
+/// SafeElementPtrAt then dereferences (`ldr r0, [r0]`), so each
+/// entry stored is a pointer (e.g. TAlertDialog*).
+///
+/// We log the (this, inner, clist, count, elem_size, entries_base,
+/// entries[0..min(count,4)]) tuple per call. Combined with the
+/// timestamp interleave against other probes, we should see when
+/// `entries[0]` first becomes a junk value (= 0xE3360000) and
+/// pinpoint the writer.
+///
+/// Source mode varies: IdleProc is invoked from USR mode via the
+/// alrt task's event-loop; HVC from EL0 AArch32 is undefined and
+/// reaches the dispatcher through the UND-trampoline path. We
+/// mirror the Prim probes' source-CPSR resolution.
+fn handle_idleproc_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_idleproc_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_idleproc_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    let this = ctx.x[0] as u32;
+    let sp   = crate::banked::sp_for_mode(ctx, source_cpsr);
+
+    static CALL_COUNT: AtomicU32 = AtomicU32::new(0);
+    static LOG_BUDGET: AtomicU32 = AtomicU32::new(64);
+    let n = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+    let budget = LOG_BUDGET.fetch_sub(1, Ordering::Relaxed);
+
+    if budget > 0 {
+        let inner = guest_mem::read_word_va(this.wrapping_add(0x14))
+            .unwrap_or(0xDEAD_DEA1);
+        let clist = inner.wrapping_add(0x8c);
+        let count = guest_mem::read_word_va(clist)
+            .unwrap_or(0xDEAD_DEA2);
+        let esize = guest_mem::read_word_va(clist.wrapping_add(4))
+            .unwrap_or(0xDEAD_DEA3);
+        let ebase = guest_mem::read_word_va(clist.wrapping_add(0x10))
+            .unwrap_or(0xDEAD_DEA4);
+        kprintln!(
+            "IdleProc #{:03} ENTER this={:#010x} inner={:#010x} clist={:#010x} count={} esize={} ebase={:#010x} src_mode={:#x} sp={:#010x}",
+            n, this, inner, clist, count, esize, ebase, source_cpsr & 0x1F, sp,
+        );
+
+        // Always dump the first 4 entries as 32-bit words — CList::At
+        // always returns a 32-bit `*entries_base` regardless of esize
+        // (per ROM 0x11342c `ldrne r0, [r0]`). So this is what the
+        // alrt task actually sees at IdleProc's BL At call.
+        if ebase != 0 && ebase != 0xDEAD_DEA4 {
+            for i in 0..4u32 {
+                let slot_va = ebase.wrapping_add(i * 4);
+                let slot_val = guest_mem::read_word_va(slot_va)
+                    .unwrap_or(0xDEAD_DEA5);
+                kprintln!(
+                    "  entry[{}] @VA={:#010x} = {:#010x}{}",
+                    i, slot_va, slot_val,
+                    if slot_val == 0xE336_0000 {
+                        "  <-- JUNK (the FAR=0xe336000c source)"
+                    } else { "" },
+                );
+            }
+        }
+
+        // Dump 8 words of `this` and 8 words of `clist` as raw memory
+        // so we can tell whether the object/CList header is sensible
+        // C++ layout or has been corrupted. A real TAlertEventHandler
+        // should have a vtable pointer at +0; a real CList should
+        // have count <= 1024, esize ∈ {1, 2, 4}, and ebase in heap.
+        kprintln!("  raw this[0..32]:");
+        for j in 0..8u32 {
+            let v = guest_mem::read_word_va(this.wrapping_add(j * 4))
+                .unwrap_or(0xDEAD_DEA6);
+            kprintln!("    +{:#04x}: {:#010x}", j*4, v);
+        }
+        kprintln!("  raw clist[0..32]:");
+        for j in 0..8u32 {
+            let v = guest_mem::read_word_va(clist.wrapping_add(j * 4))
+                .unwrap_or(0xDEAD_DEA7);
+            kprintln!("    +{:#04x}: {:#010x}", j*4, v);
+        }
+    }
+
+    // Emulate `mov ip, sp` (ip = r12 non-banked; sp = R13_<source_mode>).
     ctx.x[12] = sp as u64;
 }
 

@@ -2,8 +2,80 @@
 
 ## Status
 
-**Current goal: alias audit complete (mechanically confirmed) —
-un-park alrt-task DABT (pending user OK)**
+**Current goal: alrt-task DABT — CList header corruption confirmed,
+identify the writer.**
+
+The alias audit (prior loop) proved all 15 verify-mmu aliases are
+kernel-intent subpage-disjoint. Resumed alrt-task DABT
+investigation per the deferred plan.
+
+### IdleProc probe — corruption pattern identified
+
+Added an HVC probe at IdleProc__18TAlertEventHandler entry
+(0x000309EC, IDLEPROC_PROBE_HVC_IMM=0x56). Cold-boot fires once
+before the wedge with this output:
+
+```
+IdleProc #000 ENTER this=0x0cca37a8 inner=0x0cca3738
+                clist=0x0cca37c4 count=32 esize=1
+                ebase=0x003121fc src_mode=0x10 sp=0x0cca3638
+  entry[0] @VA=0x003121fc = 0xe3360000  <-- JUNK (the FAR=0xe336000c source)
+  entry[1] @VA=0x00312200 = 0x15a74048
+  entry[2] @VA=0x00312204 = 0xe91baff0
+  entry[3] @VA=0x00312208 = 0xe3300000
+  raw this[0..32]:
+    +0x00: 0x0001eac0     ← vtable pointer (ROM)
+    +0x04: 0x00000000
+    +0x08: 0x6e657774     ← ASCII "newt"
+    +0x0c: 0x616c7274     ← ASCII "alrt"
+    +0x10: 0x0c6019c0
+    +0x14: 0x0cca3738     ← inner ptr (also = alrt task globals)
+    +0x18: 0x0c2049a0
+    +0x1c: 0x00000020
+  raw clist[0..32]:
+    +0x00: 0x00000020     ← "count" = 32
+    +0x04: 0x00000001     ← "esize" = 1   (bogus; should be 4)
+    +0x08: 0x0c320804
+    +0x0c: 0x0c3207dc
+    +0x10: 0x003121fc     ← "ebase" = ROM PC inside MoveFreeBlock
+    +0x14: 0x00310858     ← ROM PC inside SetFreeChain
+    +0x18: 0x0c201010
+    +0x1c: 0x00000020
+```
+
+**Diagnosis:** `this=0x0cca37a8` IS a valid TAlertEventHandler:
+vtable pointer at +0, ASCII signature "newt"+"alrt" at +8/+0xc, real
+inner-struct pointer at +0x14. The TAlertEventHandler object itself
+is intact.
+
+**The corruption is in the CList header storage at VA=0x0cca37c4.**
+The values look like an APCS stack frame from a recent
+`MoveFreeBlock → bl SetFreeChain` call, which left two return-style
+addresses (0x003121fc = post-`bl SetFreeChain`, 0x00310858 = inside
+SetFreeChain) at the offsets where IdleProc expects entries_base
+and a follow-on field. With ebase=0x003121fc, CList::At(0) reads
+*(0x003121fc) = 0xE3360000 (= ARM `teq r6, #0` instruction bytes
+at that ROM address) — exactly the junk pointer the wedge dies on.
+
+The corruption is therefore **not random** — it's the kernel's
+heap allocator stack-frame leaking into a separately-allocated
+TAlertEventHandler's CList field. Likely cause: the alrt task's
+stack overflow into the inner struct, OR a heap-allocator write to
+a wrong VA (e.g., a use-after-free that later reuses the freed
+TAlertEventHandler memory as a stack frame).
+
+### Next iteration — catch the writer with a stage-2 RO trap
+
+Install a stage-2 RO carve-out on the PA backing VA=0x0cca37c4
+(specifically, the 4-KiB page containing the CList header).
+Capture every (PC, value, src_mode) writing to that PA. We expect
+to see:
+- The legitimate kernel write that initializes the CList (count=0,
+  ebase=valid-heap-or-0).
+- The corrupting write that overwrites it with stack-frame bytes.
+
+The corrupting writer's PC will tell us which kernel routine is
+escaping its allocation.
 
 User directive (2026-04-28): "look at every alias and decide it's
 benign before moving on. This is how we find bugs in our 4k page

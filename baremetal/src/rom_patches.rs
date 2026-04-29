@@ -625,6 +625,33 @@ pub const PRIM_FORGET_PROBE_HVC_IMM:   u32 = 0x55;
 pub const PRIM_FORGET_PC:              u32 = 0x0016_3514;
 const PRIM_FORGET_FIRST_INSN:          u32 = 0xE1A0_C00D; // mov ip, sp
 
+/// `IdleProc__18TAlertEventHandlerFP10TUMsgTokenPUlP7TAEvent` probe
+/// at ROM `0x000309EC`. This is the alert-handler idle-poll function
+/// where the alrt-task DABT decoded by commit 0ed81e20 originates:
+/// IdleProc reads `r0 = this->[+20]; r0 += 0x8c; r5 = CList::At(r0,
+/// 0)` and gets a junk dialog pointer (`0xE3360000` = ARM `teq r6,
+/// #0` instruction-encoded bytes that ended up in the CList entries
+/// array). The downstream `bl CheckAlertDone` (0x30A3C / 0x30A64)
+/// then `bl CheckButton`, and `ldr r0, [r0, #12]` at PC 0x0002EABC
+/// faults with FAR=0xe336000c.
+///
+/// Probe fires at IdleProc's first instruction (the standard
+/// `mov ip, sp` AArch32 prologue). Handler reads:
+///   - `this = ctx.x[0]` (TAlertEventHandler*)
+///   - `inner = *(this + 0x14)`
+///   - CList header at `inner + 0x8c`: count [+0], elem_size [+4],
+///     entries_base [+0x10]
+///   - first few entries (= the dialog pointers)
+/// then emulates `mov ip, sp` so the function continues.
+///
+/// The point: capture CList contents on every IdleProc call so we
+/// see when the junk pointer first appears. Combined with the
+/// timeline ordering against other probes, that pinpoints the
+/// corrupting writer.
+pub const IDLEPROC_PROBE_HVC_IMM:      u32 = 0x56;
+pub const IDLEPROC_PROBE_PC:           u32 = 0x0003_09EC;
+const IDLEPROC_FIRST_INSN:             u32 = 0xE1A0_C00D; // mov ip, sp
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -870,6 +897,20 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(PRIM_FORGET_PROBE_HVC_IMM),
             "PrimForgetMapping prologue",
             PRIM_FORGET_PROBE_HVC_IMM,
+        );
+        // IdleProc__18TAlertEventHandler probe at 0x000309EC. Captures
+        // the alrt-task's TAlertEventHandler CList state on every
+        // idle-poll call so we can see when the corrupting junk
+        // pointer (= 0xE3360000, decoded as ARM teq r6, #0 bytes)
+        // first appears in CList entries[0..N]. Per the alrt-task
+        // DABT decoding in commit 0ed81e20.
+        patch_probe(
+            rom_ptr,
+            IDLEPROC_PROBE_PC,
+            IDLEPROC_FIRST_INSN,
+            hvc_insn(IDLEPROC_PROBE_HVC_IMM),
+            "IdleProc__18TAlertEventHandler prologue",
+            IDLEPROC_PROBE_HVC_IMM,
         );
     }
 }

@@ -98,29 +98,41 @@ const FB_BASE_USIZE: usize = FB_IPA_BASE as usize;
 
 /// Read a 32-bit word from a guest physical address by resolving the
 /// backing store directly. Returns None if `pa` is outside the ROM /
-/// RAM / framebuffer regions we own. Pre-MMU (VA == IPA == PA) this
-/// is exactly a guest load; post-MMU callers need to translate VA
-/// to PA first (e.g. via `AT S12E1R`).
+/// RAM / framebuffer / scratch-pool regions we own. Pre-MMU
+/// (VA == IPA == PA) this is exactly a guest load; post-MMU callers
+/// need to translate VA to PA first (e.g. via `AT S12E1R`).
 pub fn read_word_pa(pa: u32) -> Option<u32> {
-    let pa = pa as usize;
-    if pa + 4 <= ROM_SIZE {
-        let host = (rom_host_pa() as usize) + pa;
-        // SAFETY: bounds-checked against ROM backing.
-        return Some(unsafe { core::ptr::read_volatile(host as *const u32) });
+    let h = host_addr_for(pa as usize, 4, /*for_write=*/ false)?;
+    // SAFETY: host_addr_for bounds-checks against the chosen backing.
+    Some(unsafe { core::ptr::read_volatile(h as *const u32) })
+}
+
+/// Map a guest IPA + size to the host backing pointer. Centralises the
+/// region table used by the typed PA helpers so regions added here
+/// (e.g. the shadow-stub `SCRATCH_POOL`) are visible to all callers
+/// in one shot. `for_write=true` excludes ROM (read-only at the
+/// hypervisor backing layer).
+fn host_addr_for(pa: usize, size: usize, for_write: bool) -> Option<usize> {
+    if !for_write && pa + size <= ROM_SIZE {
+        return Some(rom_host_pa() as usize + pa);
     }
     if (RAM_BASE_USIZE..RAM_BASE_USIZE + RAM_SIZE).contains(&pa)
-        && pa + 4 <= RAM_BASE_USIZE + RAM_SIZE
+        && pa + size <= RAM_BASE_USIZE + RAM_SIZE
     {
-        let host = (ram_host_pa() as usize) + (pa - RAM_BASE_USIZE);
-        // SAFETY: bounds-checked.
-        return Some(unsafe { core::ptr::read_volatile(host as *const u32) });
+        return Some(ram_host_pa() as usize + (pa - RAM_BASE_USIZE));
     }
     if (FB_BASE_USIZE..FB_BASE_USIZE + FB_SIZE).contains(&pa)
-        && pa + 4 <= FB_BASE_USIZE + FB_SIZE
+        && pa + size <= FB_BASE_USIZE + FB_SIZE
     {
-        let host = (fb_host_pa() as usize) + (pa - FB_BASE_USIZE);
-        // SAFETY: bounds-checked.
-        return Some(unsafe { core::ptr::read_volatile(host as *const u32) });
+        return Some(fb_host_pa() as usize + (pa - FB_BASE_USIZE));
+    }
+    // Shadow-stub scratch pool. Covers the hypervisor-managed RW IPA
+    // window at `SCRATCH_POOL_IPA..+SCRATCH_POOL_SIZE`. Behaves like
+    // RAM at this layer — full RW from EL2 via the host backing.
+    let scratch_base = crate::shadow_stub::SCRATCH_POOL_IPA as usize;
+    let scratch_end = scratch_base + crate::shadow_stub::SCRATCH_POOL_SIZE;
+    if (scratch_base..scratch_end).contains(&pa) && pa + size <= scratch_end {
+        return Some(crate::shadow_stub::scratch_pool_host_pa() as usize + (pa - scratch_base));
     }
     None
 }
@@ -129,88 +141,43 @@ pub fn read_word_pa(pa: u32) -> Option<u32> {
 /// caller's responsibility; misaligned reads silently split across the
 /// host pointer the way the CPU would cross bytes.
 pub fn read_halfword_pa(pa: u32) -> Option<u16> {
-    let pa = pa as usize;
-    if pa + 2 <= ROM_SIZE {
-        let host = (rom_host_pa() as usize) + pa;
-        // SAFETY: bounds-checked.
-        return Some(unsafe { core::ptr::read_volatile(host as *const u16) });
-    }
-    if (RAM_BASE_USIZE..RAM_BASE_USIZE + RAM_SIZE).contains(&pa)
-        && pa + 2 <= RAM_BASE_USIZE + RAM_SIZE
-    {
-        let host = (ram_host_pa() as usize) + (pa - RAM_BASE_USIZE);
-        // SAFETY: bounds-checked.
-        return Some(unsafe { core::ptr::read_volatile(host as *const u16) });
-    }
-    if (FB_BASE_USIZE..FB_BASE_USIZE + FB_SIZE).contains(&pa)
-        && pa + 2 <= FB_BASE_USIZE + FB_SIZE
-    {
-        let host = (fb_host_pa() as usize) + (pa - FB_BASE_USIZE);
-        // SAFETY: bounds-checked.
-        return Some(unsafe { core::ptr::read_volatile(host as *const u16) });
-    }
-    None
+    let h = host_addr_for(pa as usize, 2, /*for_write=*/ false)?;
+    // SAFETY: host_addr_for bounds-checked.
+    Some(unsafe { core::ptr::read_volatile(h as *const u16) })
 }
 
 /// Write one halfword to a guest PA. Returns true on success; writes
 /// to ROM / unmapped regions are refused.
 pub fn write_halfword_pa(pa: u32, value: u16) -> bool {
-    let pa = pa as usize;
-    if (RAM_BASE_USIZE..RAM_BASE_USIZE + RAM_SIZE).contains(&pa)
-        && pa + 2 <= RAM_BASE_USIZE + RAM_SIZE
-    {
-        let host = (ram_host_pa() as usize) + (pa - RAM_BASE_USIZE);
-        unsafe { core::ptr::write_volatile(host as *mut u16, value); }
-        return true;
+    match host_addr_for(pa as usize, 2, /*for_write=*/ true) {
+        Some(h) => {
+            // SAFETY: host_addr_for bounds-checked, ROM excluded.
+            unsafe { core::ptr::write_volatile(h as *mut u16, value); }
+            true
+        }
+        None => false,
     }
-    if (FB_BASE_USIZE..FB_BASE_USIZE + FB_SIZE).contains(&pa)
-        && pa + 2 <= FB_BASE_USIZE + FB_SIZE
-    {
-        let host = (fb_host_pa() as usize) + (pa - FB_BASE_USIZE);
-        unsafe { core::ptr::write_volatile(host as *mut u16, value); }
-        return true;
-    }
-    false
 }
 
 /// Read one byte from a guest PA.
 pub fn read_byte_pa(pa: u32) -> Option<u8> {
-    let pa = pa as usize;
-    if pa < ROM_SIZE {
-        let host = (rom_host_pa() as usize) + pa;
-        return Some(unsafe { core::ptr::read_volatile(host as *const u8) });
-    }
-    if (RAM_BASE_USIZE..RAM_BASE_USIZE + RAM_SIZE).contains(&pa) {
-        let host = (ram_host_pa() as usize) + (pa - RAM_BASE_USIZE);
-        return Some(unsafe { core::ptr::read_volatile(host as *const u8) });
-    }
-    if (FB_BASE_USIZE..FB_BASE_USIZE + FB_SIZE).contains(&pa) {
-        let host = (fb_host_pa() as usize) + (pa - FB_BASE_USIZE);
-        return Some(unsafe { core::ptr::read_volatile(host as *const u8) });
-    }
-    None
+    let h = host_addr_for(pa as usize, 1, /*for_write=*/ false)?;
+    // SAFETY: host_addr_for bounds-checked.
+    Some(unsafe { core::ptr::read_volatile(h as *const u8) })
 }
 
 /// Write a 32-bit word to a guest PA. Returns true on success. Writes
 /// to ROM (or unmapped regions) are refused — callers should halt on
 /// a false return if the write was supposed to succeed.
 pub fn write_word_pa(pa: u32, value: u32) -> bool {
-    let pa = pa as usize;
-    if (RAM_BASE_USIZE..RAM_BASE_USIZE + RAM_SIZE).contains(&pa)
-        && pa + 4 <= RAM_BASE_USIZE + RAM_SIZE
-    {
-        let host = (ram_host_pa() as usize) + (pa - RAM_BASE_USIZE);
-        unsafe { core::ptr::write_volatile(host as *mut u32, value); }
-        return true;
+    match host_addr_for(pa as usize, 4, /*for_write=*/ true) {
+        Some(h) => {
+            // SAFETY: host_addr_for bounds-checked, ROM excluded.
+            unsafe { core::ptr::write_volatile(h as *mut u32, value); }
+            true
+        }
+        None => false,
     }
-    if (FB_BASE_USIZE..FB_BASE_USIZE + FB_SIZE).contains(&pa)
-        && pa + 4 <= FB_BASE_USIZE + FB_SIZE
-    {
-        let host = (fb_host_pa() as usize) + (pa - FB_BASE_USIZE);
-        unsafe { core::ptr::write_volatile(host as *mut u32, value); }
-        return true;
-    }
-    false
 }
 
 /// Write a 32-bit word to a guest VA by walking the live stage-1
@@ -272,18 +239,14 @@ pub fn translate_va(va: u32) -> Option<u32> {
 
 /// Write one byte to a guest PA. See `write_word_pa` for semantics.
 pub fn write_byte_pa(pa: u32, value: u8) -> bool {
-    let pa = pa as usize;
-    if (RAM_BASE_USIZE..RAM_BASE_USIZE + RAM_SIZE).contains(&pa) {
-        let host = (ram_host_pa() as usize) + (pa - RAM_BASE_USIZE);
-        unsafe { core::ptr::write_volatile(host as *mut u8, value); }
-        return true;
+    match host_addr_for(pa as usize, 1, /*for_write=*/ true) {
+        Some(h) => {
+            // SAFETY: host_addr_for bounds-checked, ROM excluded.
+            unsafe { core::ptr::write_volatile(h as *mut u8, value); }
+            true
+        }
+        None => false,
     }
-    if (FB_BASE_USIZE..FB_BASE_USIZE + FB_SIZE).contains(&pa) {
-        let host = (fb_host_pa() as usize) + (pa - FB_BASE_USIZE);
-        unsafe { core::ptr::write_volatile(host as *mut u8, value); }
-        return true;
-    }
-    false
 }
 
 /// Walk the guest's stage-1 L1 table at TTBR=0x0400_0000 and, for every
@@ -1276,7 +1239,11 @@ pub const SBA_POST_TRAMP_NEW_PC_OFFSET: usize = SBA_POST_TRAMP_OFFSET + 0x24;
 ///   +0x10: SPSR_svc
 ///   +0x14: LR_svc
 pub const DABT_TRAMP_OFFSET: usize = 0x00FF_FFA8;
-pub const DABT_SAVE_PA: u32 = 0x0400_5FA0;
+/// 2026-04-28: relocated from PA=0x04005FA0 to IPA=0x0600_F0A0
+/// (last 4 KiB of the SCRATCH_POOL). See `trap::HYP_TRAMP_SCRATCH_BASE`
+/// for the rationale. The same value works pre-MMU and post-MMU,
+/// so no swap is required.
+pub const DABT_SAVE_PA: u32 = crate::trap::HYP_TRAMP_SCRATCH_BASE + 0xA0;
 
 /// Install the DABT-vector intercept stub at `DABT_TRAMP_OFFSET` and
 /// patch VA 0x10 to branch to it. Serves two roles:
@@ -1347,7 +1314,7 @@ pub unsafe fn patch_dabt_vector(rom_ptr: *mut u32) {
         rom_ptr.add(db + 11).write(0xE140_0171);         // hvc #0x11 (DIAG_TAG)
         rom_ptr.add(db + 12).write(0xE140_0173);         // hvc #0x13 (ALIGN_TAG)
         rom_ptr.add(db + 13).write(0xEAFF_FFFE);         // b . (guard)
-        rom_ptr.add(db + 14).write(0x0400_5FA0);         // literal (pre-MMU IPA)
+        rom_ptr.add(db + 14).write(DABT_SAVE_PA);        // literal: SCRATCH_POOL IPA (works pre + post-MMU, see DABT_SAVE_PA comment)
     }
 }
 
@@ -1435,7 +1402,7 @@ unsafe fn patch_und_vector(rom: *mut u32) {
         rom.add(base + 20).write(0xE321_F0DB);      // msr cpsr_c, #0xdb (UND)
         rom.add(base + 21).write(0xE140_0170);      // hvc #0x10
         rom.add(base + 22).write(0xEAFF_FFFE);      // b . (trap)
-        rom.add(base + 23).write(0x0400_5F00);      // literal: RAM IPA (pre-MMU)
+        rom.add(base + 23).write(crate::trap::HYP_TRAMP_SCRATCH_BASE); // literal: SCRATCH_POOL IPA (works pre + post-MMU, see trap.rs HYP_TRAMP_SCRATCH_BASE comment)
 
         // SBA pre-fault stub. When the shadow-stub byte-access emulator
         // encounters a faulting EA on an unmapped guest page, it stashes
@@ -1494,7 +1461,7 @@ unsafe fn patch_und_vector(rom: *mut u32) {
         rom.add(pt + 5).write(0xE59F_F008);          // ldr pc, [pc, #0x08]
         rom.add(pt + 6).write(0xEAFF_FFFE);          // b . (guard)
         rom.add(pt + 7).write(0xEAFF_FFFE);          // b . (guard)
-        rom.add(pt + 8).write(0x0400_5F00);          // slot base (pre-MMU)
+        rom.add(pt + 8).write(crate::trap::HYP_TRAMP_SCRATCH_BASE); // slot base (SCRATCH_POOL IPA, works pre + post-MMU)
         rom.add(pt + 9).write(0xDEAD_C0DE);          // NEW_PC placeholder
     }
 }
@@ -1591,32 +1558,41 @@ pub unsafe fn install_und_vector_swap_post_mmu() {
     // Caller must hold exclusive access to the ROM backing. Swaps the
     // UND trampoline, the SBA post-emulation trampoline, and the DABT
     // diagnostic trampoline.
+    //
+    // 2026-04-28: with HYP_TRAMP_SCRATCH_BASE relocated into the
+    // SCRATCH_POOL IPA window, the same value works both pre-MMU
+    // (stage-1 off → IPA → stage-2 → host SCRATCH_POOL) and post-MMU
+    // (kernel L1[0x60] → IPA → stage-2). The swap therefore writes
+    // the same literal as the pre-MMU install path; kept as a callable
+    // no-op to preserve the install/uninstall contract for future
+    // changes that might re-introduce a swap.
     unsafe {
         let rom = rom_host_pa() as *mut u32;
         let base = UND_TRAMP_OFFSET / 4;
-        rom.add(base + 23).write(0x0C00_4F00);
+        rom.add(base + 23).write(crate::trap::HYP_TRAMP_SCRATCH_BASE);
         let pt = SBA_POST_TRAMP_OFFSET / 4;
-        rom.add(pt + 8).write(0x0C00_4F00);
+        rom.add(pt + 8).write(crate::trap::HYP_TRAMP_SCRATCH_BASE);
         let db = DABT_TRAMP_OFFSET / 4;
-        rom.add(db + 14).write(0x0C00_4FA0);
+        rom.add(db + 14).write(DABT_SAVE_PA);
     }
 }
 
-/// Revert the trampoline's save-slot literal back to the pre-MMU RAM
-/// IPA (0x0400_5F00). Called when the guest turns its stage-1 MMU
-/// off — typically the SWIBoot→ROMBoot soft-reset path. Without this,
-/// a UND taken before the next MMU re-enable would store to an
-/// unmapped IPA via the stale kernel-VA literal.
+/// Revert the trampoline's save-slot literal back to the pre-MMU value.
+/// Called when the guest turns its stage-1 MMU off — typically the
+/// SWIBoot→ROMBoot soft-reset path. Without this, a UND taken before
+/// the next MMU re-enable would store to an unmapped IPA via the stale
+/// kernel-VA literal. (Now a no-op given HYP_TRAMP_SCRATCH_BASE works
+/// pre + post-MMU; retained for symmetry with the post-MMU swap.)
 pub unsafe fn install_und_vector_swap_pre_mmu() {
     // SAFETY: same as the post-MMU swap above.
     unsafe {
         let rom = rom_host_pa() as *mut u32;
         let base = UND_TRAMP_OFFSET / 4;
-        rom.add(base + 23).write(0x0400_5F00);
+        rom.add(base + 23).write(crate::trap::HYP_TRAMP_SCRATCH_BASE);
         let pt = SBA_POST_TRAMP_OFFSET / 4;
-        rom.add(pt + 8).write(0x0400_5F00);
+        rom.add(pt + 8).write(crate::trap::HYP_TRAMP_SCRATCH_BASE);
         let db = DABT_TRAMP_OFFSET / 4;
-        rom.add(db + 14).write(0x0400_5FA0);
+        rom.add(db + 14).write(DABT_SAVE_PA);
     }
 }
 

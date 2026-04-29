@@ -1317,32 +1317,51 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
 /// eventually, the ROM's patch_und_vector):
 ///   0x04000400  — saved LR_und (faulting_pc + 4)
 ///   0x04000404  — saved SPSR_und (pre-UND CPSR)
-// Old (buggy) slots at 0x0400_0400 — those live inside the kernel's L1
-// table (TTBR0 points at PA 0x0400_0000, and 0x0400_0400 is L1[0x100]).
-// Writing there both (a) fails post-MMU because the guest's L1[0x40]
-// maps VA 0x0400_0400 to PA 0x0000_0400 (ROM, RO under stage-2) and
-// (b) would corrupt the guest's own L1 if it ever did succeed. New
-// slots live in the RAM-mirror window the DIAG stub also uses.
-pub const UND_SAVE_LR_IPA: u32 = 0x0400_5F00;
-pub const UND_SAVE_SPSR_IPA: u32 = 0x0400_5F04;
+// 2026-04-28: relocated trampoline scratch from PA=0x04005F00 (the
+// kernel-globals self-mapped region at L1[0xc0]) to the last 4 KiB of
+// the hypervisor scratch pool at IPA=0x0600_F000. The previous PA was
+// reachable post-MMU only through the kernel's pre-baked L2[0x4]
+// descriptor — a deliberate ARMv4 subpage-AP permission-overlay
+// mapping the kernel-globals page at PA=0x04005000 at multiple kernel
+// VAs. That created a verify-mmu Group-1 alias under our flat AP=011.
+// The new IPA lives in the hypervisor-managed `SCRATCH_POOL` region
+// (mapped via the L1[0x60] section we install at MMU-enable time),
+// so the same value works pre-MMU (stage-1 off → stage-2 maps IPA →
+// host SCRATCH_POOL) and post-MMU (kernel L1[0x60] → IPA → stage-2).
+// No swap pre/post-MMU needed.
+//
+// Older (buggy) slots at 0x0400_0400 — those lived inside the kernel's
+// L1 table; writing there fails post-MMU and would corrupt the guest's
+// own L1 if it succeeded.
+//
+// Layout (offsets from `HYP_TRAMP_SCRATCH_BASE`):
+//   +0x00 LR_und       +0x10 R1
+//   +0x04 SPSR_und     +0x14 R2
+//   +0x08 LR_svc       +0x18 banked SP
+//   +0x0C R0           +0x1C banked LR
+//   +0xA0..+0xB7  DABT trampoline save (lr_abt, sp_abt, spsr_abt,
+//                                       sp_svc, spsr_svc, lr_svc)
+pub const HYP_TRAMP_SCRATCH_BASE: u32 = 0x0600_F000;
+pub const UND_SAVE_LR_IPA: u32 = HYP_TRAMP_SCRATCH_BASE + 0x00;
+pub const UND_SAVE_SPSR_IPA: u32 = HYP_TRAMP_SCRATCH_BASE + 0x04;
 /// LR_svc captured by the trampoline's brief SVC-mode bounce. Only
 /// meaningful when SPSR_und's mode field says the caller was SVC
 /// (which is the case for all Newton 2.x kernel-internal calls).
 #[allow(dead_code)]
-pub const UND_SAVE_LR_SVC_IPA: u32 = 0x0400_5F08;
+pub const UND_SAVE_LR_SVC_IPA: u32 = HYP_TRAMP_SCRATCH_BASE + 0x08;
 
 /// Pre-UND R0 and R1. The trampoline persists them here before
 /// clobbering R0 (to hold the save-slot VA) and R1 (to read SPSR /
 /// LR_svc). `handle_und` restores `ctx.x[0]` and `ctx.x[1]` from
 /// these slots at entry so the traced guest sees its arguments
 /// intact across the UND round-trip.
-pub const UND_SAVE_R0_IPA: u32 = 0x0400_5F0C;
-pub const UND_SAVE_R1_IPA: u32 = 0x0400_5F10;
+pub const UND_SAVE_R0_IPA: u32 = HYP_TRAMP_SCRATCH_BASE + 0x0C;
+pub const UND_SAVE_R1_IPA: u32 = HYP_TRAMP_SCRATCH_BASE + 0x10;
 
 /// R2 stash — the trampoline briefly clobbers R2 while executing the
 /// mode-switch dance that reads the faulting mode's banked SP/LR.
 #[allow(dead_code)]
-pub const UND_SAVE_R2_IPA: u32 = 0x0400_5F14;
+pub const UND_SAVE_R2_IPA: u32 = HYP_TRAMP_SCRATCH_BASE + 0x14;
 
 /// Banked SP (R13) and LR (R14) of the faulting mode. Populated by the
 /// trampoline after switching to the faulting mode (or SYS when the
@@ -1352,8 +1371,8 @@ pub const UND_SAVE_R2_IPA: u32 = 0x0400_5F14;
 /// (see `guest_mem::patch_und_vector`) also reads these slots on the
 /// way out to write the updated values into the faulting mode's banked
 /// SP / LR, for sites that writeback Rn ∈ {13, 14}.
-pub const UND_SAVE_BANKED_SP_IPA: u32 = 0x0400_5F18;
-pub const UND_SAVE_BANKED_LR_IPA: u32 = 0x0400_5F1C;
+pub const UND_SAVE_BANKED_SP_IPA: u32 = HYP_TRAMP_SCRATCH_BASE + 0x18;
+pub const UND_SAVE_BANKED_LR_IPA: u32 = HYP_TRAMP_SCRATCH_BASE + 0x1C;
 
 fn handle_und(ctx: &mut TrapContext) {
     // Restore pre-UND R0, R1, R12 from the stash slots the trampoline

@@ -1302,6 +1302,15 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::WRITE_RUN_PROBE_HVC_IMM => {
             handle_write_run_probe(ctx);
         }
+        v if v == crate::rom_patches::WRITE_CHUNK_PROBE_HVC_IMM => {
+            handle_write_chunk_probe(ctx);
+        }
+        v if v == crate::rom_patches::COMP_NEW_PROBE_HVC_IMM => {
+            handle_comp_new_probe(ctx);
+        }
+        v if v == crate::rom_patches::COMP_RESET_PROBE_HVC_IMM => {
+            handle_comp_reset_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1837,6 +1846,21 @@ fn handle_und(ctx: &mut TrapContext) {
         }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::WRITE_RUN_PROBE_HVC_IMM) => {
             handle_write_run_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::WRITE_CHUNK_PROBE_HVC_IMM) => {
+            handle_write_chunk_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::COMP_NEW_PROBE_HVC_IMM) => {
+            handle_comp_new_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::COMP_RESET_PROBE_HVC_IMM) => {
+            handle_comp_reset_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -4130,6 +4154,82 @@ fn handle_write_run_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
 
     // Emulate `mov ip, sp`.
     ctx.x[12] = sp as u64;
+}
+
+fn handle_write_chunk_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_write_chunk_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+/// `WriteChunk__18TUnicodeCompressorFPvl(this, ptr, length)`
+/// entry probe. Emulates `mov ip, sp`.
+fn handle_write_chunk_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let this = ctx.x[0] as u32;
+    let ptr = ctx.x[1] as u32;
+    let length = ctx.x[2] as u32;
+    let count = guest_mem::read_word_va(this.wrapping_add(0x9c)).unwrap_or(0xDEAD_BEEF);
+    let caller_lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let mode = source_cpsr & 0x1F;
+
+    kprintln!(
+        "WriteChunk #{} ENTER: this={:#010x} ptr={:#010x} length={}(0x{:x}) count={:#x} caller_lr={:#010x} src_mode={:#x} sp={:#010x}",
+        seq, this, ptr, length, length, count, caller_lr, mode, sp,
+    );
+
+    // Emulate `mov ip, sp`.
+    ctx.x[12] = sp as u64;
+}
+
+fn handle_comp_new_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_comp_new_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+/// `New__18TUnicodeCompressorFv` first-insn probe. Original insn
+/// is `mov r1, #0` — emulated by setting ctx.x[1] = 0.
+fn handle_comp_new_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let this = ctx.x[0] as u32;
+    let caller_lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+    let mode = source_cpsr & 0x1F;
+
+    kprintln!(
+        "TUnicodeCompressor::New #{} this={:#010x} caller_lr={:#010x} src_mode={:#x}",
+        seq, this, caller_lr, mode,
+    );
+
+    // Emulate `mov r1, #0`.
+    ctx.x[1] = 0;
+}
+
+fn handle_comp_reset_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_comp_reset_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+/// `Reset__18TUnicodeCompressorFv` first-insn probe. Original
+/// insn is `mov r1, #0` — emulated by setting ctx.x[1] = 0.
+fn handle_comp_reset_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let this = ctx.x[0] as u32;
+    let caller_lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+    let mode = source_cpsr & 0x1F;
+
+    kprintln!(
+        "TUnicodeCompressor::Reset #{} this={:#010x} caller_lr={:#010x} src_mode={:#x}",
+        seq, this, caller_lr, mode,
+    );
+
+    // Emulate `mov r1, #0`.
+    ctx.x[1] = 0;
 }
 
 fn handle_dl_probe(ctx: &mut TrapContext) {

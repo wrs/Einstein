@@ -1357,16 +1357,25 @@ Citations:
 - `WriteRun @ 0x00256F94..0x00256FFC` iterates the byte buffer at
   `[this+0xa1+r5]` for `r5 = 0..count-1`.
 
-**Phase B iter 18 wedge.** A 420-byte instance was placed at
+**Phase B iter 19 wedge.** A 420-byte instance was placed at
 USER pointer `0xc646c0c..0xc646db0` (NewBlock returned block
 header at `0xc646bfc`; NewDirectBlock added the 16-byte header
-offset). The compressor's count field at `+0x9c = 0xc646ca8`
-held `0x20000111` on WriteRun entry — a CPSR-shaped value
-(NZCV=0010, mode=0x11=FIQ) plus 1, indicating the heap RAM was
-previously occupied by a `TProcessorState` save-area whose
-`saved_cpsr` field landed at exactly this offset. The kernel's
-free path doesn't poison-fill, and the compressor's caller
-skips `New__18TUnicodeCompressor` (which would zero the count).
+offset). `New` IS called for this compressor (probe confirms
+`this=0x0c646c0c, caller_lr=0x0005c68c`), so count = 0 right
+after construction. WriteChunk's entry probe also confirms
+`count=0x0`. By the time WriteRun is invoked (from inside
+WriteChunk), count has flipped to `0x20000111` — a CPSR-shaped
+value (NZCV=0010, mode=0x11=FIQ) plus 1.
+
+WriteChunk's own logic cannot produce that value in the
+9-iteration loop (`length=18 → length>>1=9`). The corruption
+is therefore EXTERNAL to WriteChunk. Working hypotheses
+(iter-20 work):
+- A stage-1 alias mapping VA `0xc646xxx` to a PA shared with
+  another VA whose write produces 0x20000110.
+- The callback at `*(this+0x10)` modifies count when invoked
+  during the buffer-A flush path (PC `0x00257128`).
+- An interrupt handler save-area aliases the compressor's PA.
 
 The fault MECHANISM at FAR=`0xc647003`:
 1. WriteChunk reads count from `+0x9c` = `0x20000110`

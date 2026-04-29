@@ -809,6 +809,31 @@ pub const WRITE_RUN_PROBE_HVC_IMM:        u32 = 0x5E;
 pub const WRITE_RUN_PROBE_PC:             u32 = 0x0025_6EEC;
 const WRITE_RUN_FIRST_INSN:               u32 = 0xE1A0_C00D; // mov ip, sp
 
+/// `WriteChunk__18TUnicodeCompressorFPvl` entry probe — patches
+/// `mov ip, sp` at ROM `0x0025700C`. Handler logs `(this, ptr,
+/// length, this->count, caller_lr)` so we can identify the kernel
+/// site that calls WriteChunk on a compressor whose count holds
+/// stale heap garbage.
+pub const WRITE_CHUNK_PROBE_HVC_IMM:      u32 = 0x5F;
+pub const WRITE_CHUNK_PROBE_PC:           u32 = 0x0025_700C;
+const WRITE_CHUNK_FIRST_INSN:             u32 = 0xE1A0_C00D; // mov ip, sp
+
+/// `New__18TUnicodeCompressorFv` probe — patches the function's
+/// FIRST instruction at ROM `0x00256C7C` (a leaf function that
+/// doesn't push). The original first insn is `mov r1, #0`. The
+/// handler logs `(this=r0, caller_lr)` so we can confirm whether
+/// New is ever invoked for the wedging compressor.
+pub const COMP_NEW_PROBE_HVC_IMM:         u32 = 0x60;
+pub const COMP_NEW_PROBE_PC:              u32 = 0x0025_6C7C;
+const COMP_NEW_FIRST_INSN:                u32 = 0xE3A0_1000; // mov r1, #0
+
+/// `Reset__18TUnicodeCompressorFv` probe — patches the function's
+/// FIRST instruction at ROM `0x00256ED8`. Original is
+/// `mov r1, #0`; handler logs `(this=r0, caller_lr)`.
+pub const COMP_RESET_PROBE_HVC_IMM:       u32 = 0x61;
+pub const COMP_RESET_PROBE_PC:            u32 = 0x0025_6ED8;
+const COMP_RESET_FIRST_INSN:              u32 = 0xE3A0_1000; // mov r1, #0
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -1159,6 +1184,35 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(WRITE_RUN_PROBE_HVC_IMM),
             "WriteRun entry",
             WRITE_RUN_PROBE_HVC_IMM,
+        );
+        // WriteChunk entry probe — captures the kernel caller
+        // that mis-uses the compressor (count holds heap junk).
+        patch_probe(
+            rom_ptr,
+            WRITE_CHUNK_PROBE_PC,
+            WRITE_CHUNK_FIRST_INSN,
+            hvc_insn(WRITE_CHUNK_PROBE_HVC_IMM),
+            "WriteChunk entry",
+            WRITE_CHUNK_PROBE_HVC_IMM,
+        );
+        // New__18TUnicodeCompressor / Reset__18TUnicodeCompressor
+        // probes — confirms whether either is invoked for the
+        // wedging compressor instance (we expect "no").
+        patch_probe(
+            rom_ptr,
+            COMP_NEW_PROBE_PC,
+            COMP_NEW_FIRST_INSN,
+            hvc_insn(COMP_NEW_PROBE_HVC_IMM),
+            "TUnicodeCompressor::New entry",
+            COMP_NEW_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            COMP_RESET_PROBE_PC,
+            COMP_RESET_FIRST_INSN,
+            hvc_insn(COMP_RESET_PROBE_HVC_IMM),
+            "TUnicodeCompressor::Reset entry",
+            COMP_RESET_PROBE_HVC_IMM,
         );
     }
 }

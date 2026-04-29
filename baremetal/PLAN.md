@@ -142,7 +142,113 @@ the corruption within ~16 ms granularity but not pin the exact
 PC. Decide which to pursue based on whether we want chronology
 (periodic snapshot) or the writer's PC (instruction emulation).
 
-### Iteration 3: per-IRQ snapshot reveals corruption is stale heap data
+### Iteration 4: ROM-decode of CList ctor disproves "stale heap data" — corruption is active overwrite
+
+Iter 3 hypothesized "stale heap freelist data left after `MoveFreeBlock
+→ SetFreeChain`, never zero-init'd by the constructor." Iter 4
+disasm cross-check shows that's wrong:
+
+`__ct__5CListFv` at ROM `0x113238` calls
+`__ct__13CDynamicArrayFlT1(this, 4, 4)` at `0xa16ac` which
+unconditionally writes:
+```
+[this+0x00] = 0     (count)
+[this+0x04] = 4     (elem_size)
+[this+0x08] = 4     (max_capacity)
+[this+0x0c] = 0
+[this+0x10] = 0     (entries_base)
+[this+0x14] = 0
+```
+
+Re-reading iter 3's diff #2:
+```
++0x7c4 (count):       0 -> 0
++0x7c8 (elem_size):   0 -> 4   ← matches ctor
++0x7cc (max_cap):     0 -> 4   ← matches ctor
++0x7d0:               0 -> 0
++0x7d4 (entries_base):0 -> 0   ← matches ctor (NULL)
++0x7d8:               0 -> 0
+```
+
+Diff #2 IS the legitimate CList constructor finishing. The CList
+is correctly initialized (count=0, elem_size=4, max_cap=4,
+entries_base=NULL).
+
+Diff #3 then **actively overwrites** the just-constructed CList:
+```
++0x7c4 (count):       0 -> 0x00000020   (32 — bogus)
++0x7c8 (elem_size):   4 -> 0x00000001   (1 — bogus)
++0x7cc (max_cap):     4 -> 0x0c320804   (RAM ptr)
++0x7d0:               0 -> 0x0c3207dc   (RAM ptr)
++0x7d4 (entries_base):0 -> 0x003121fc   (ROM PC, into MoveFreeBlock)
++0x7d8:               0 -> 0x00310858   (ROM PC, SetFreeChain)
++0x7dc (TUAsyncMessage start): 0x1db9 -> 0x0c201010
+```
+
+This isn't stale data being read — it's an active WRITE of 24+
+bytes of foreign data into `TAlertManager+0x8c`, AFTER the CList
+constructor properly initialized it.
+
+### TAlertManager layout decoded from `InitAlertManager` ROM `0x000307D4`
+
+```
+TAlertManager (200 bytes from `__nw__(200)` at 0x307e4):
+  +0x00:  TAppWorld (vtable=0x0001c880, set at 0x30824)
+  +0x70:  TAEventHandler embedded sub-object
+            +0x70+0x00: vtable = 0x0001eac0 (TAlertEventHandler vtable,
+                        set at 0x30804 overwriting TAEventHandler ctor's vtable)
+            +0x70+0x14: pointer back to TAlertManager base (= "this->[+0x14]"
+                        in IdleProc, used to navigate from TAlertEventHandler
+                        sub-object to TAlertManager outer)
+  +0x8c:  CList (24 bytes — the dialog list IdleProc reads)
+  +0xa4:  TUAsyncMessage
+  +0xb4:  TAEvent
+  +...:   trailing fields up to 0xC8 (200) bytes
+```
+
+This explains our observations from iters 1-3:
+- `this=0x0cca37a8` is TAlertManager+0x70 (TAlertEventHandler embedded sub-object)
+- `this->[+0x14] = 0x0cca3738` is the back-pointer to TAlertManager base
+- `inner+0x8c = 0x0cca37c4` is the CList at TAlertManager+0x8c
+
+So our offset arithmetic is correct. The CList IS where we think it
+is, and it IS getting properly constructed (per diff #2). The
+corruption (diff #3) happens AFTER successful construction.
+
+### What causes the active overwrite?
+
+Two candidates:
+1. **A memcpy or struct copy** that runs after CList ctor. The
+   24-byte size matches a CList-sized memcpy from a 24-byte
+   source. The source content (count=0x20, elem_size=1,
+   pointers including ROM PCs) doesn't match any standard
+   well-formed object — it looks like raw kernel-internal
+   bookkeeping.
+2. **A field-by-field assignment** in some downstream init
+   step that mistakes our CList region for a different field.
+   The values look heterogeneous enough (mix of small ints,
+   RAM ptrs, ROM PCs) to be field assignments rather than a
+   single memcpy.
+
+### Next iteration — capture the corrupting write directly
+
+The per-IRQ snapshot pinned the corruption to a single ~16 ms
+boot window between diffs #2 and #3. Two ways to escape that
+limit and capture the actual writer's PC:
+
+**A. Instruction-level emulation** (deferred from iter 2 still
+the right architectural fix). Keep PA=0x0402e000 RO continuously;
+on each trap decode the AArch32 store at ELR_EL2, apply the
+write via PA helpers, advance ELR. Captures every write with
+exact PC.
+
+**B. Periodic in-handler snapshots**. Add a snapshot-diff call
+at every Prim Remember / Forget / IdleProc entry (in addition
+to maybe_rearm). Tightens the window from ~16 ms to whatever
+event triggers most frequently between diffs #2 and #3.
+
+A is the right fix for general future debugging; B is the
+faster way to narrow this specific case.
 
 Implemented option B (per-IRQ snapshot diff) in
 `src/alrt_capture.rs`. 8-word snapshot of offsets 0x7c0..0x800

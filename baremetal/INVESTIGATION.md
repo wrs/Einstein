@@ -1291,6 +1291,152 @@ keep the freelist words sequestered.
 Per-IRQ snapshot infrastructure is in place and reusable for
 similar bisects on other corrupted regions; budget=64 captures.
 
+## Iteration 4 — TAlertManager layout decoded; iter-3's "stale data" diagnosis is wrong
+
+Cross-checking the actual ROM constructors disproves iter 3's
+"stale heap data" hypothesis.
+
+### CList constructor unconditionally zero-inits
+
+`__ct__5CListFv` at ROM `0x113238` is the CList constructor:
+
+```
+00113238 <__ct__5CListFv>:
+  113238: mov ip, sp
+  113244: movs r4, r0           ; r4 = this
+  113248: bne 0x11325c          ; if non-NULL, in-place init
+  11324c: mov r0, #24
+  113250: bl 0x1bce738 <__nw__> ; else allocate 24 bytes
+  113254: ...
+  11325c: mov r0, r4
+  113260: mov r2, #4
+  113264: mov r1, #4
+  113268: bl 0x1be31d4 <__ct__13CDynamicArrayFlT1>  ; init the array
+  11326c: mov r0, r4
+```
+
+So `__ct__5CListFv(this, 4, 4)` calls
+`__ct__13CDynamicArrayFlT1(this, 4, 4)`. That function at ROM
+`0xa16ac` writes:
+
+```
+[this+0x00] = 0   (count)
+[this+0x04] = 4   (elem_size)
+[this+0x08] = 4   (max_capacity)
+[this+0x0c] = 0
+[this+0x10] = 0   (entries_base, NULL — array starts empty)
+[this+0x14] = 0
+```
+
+So a freshly-constructed CList has count=0, elem_size=4,
+max_cap=4, entries_base=NULL.
+
+### Re-reading iter 3 diffs
+
+Diff #2:
+```
++0x7c4 (count):       0 -> 0    (already zero)
++0x7c8 (elem_size):   0 -> 4    ← matches ctor write
++0x7cc (max_cap):     0 -> 4    ← matches ctor write
++0x7d0:               0 -> 0    (already zero)
++0x7d4 (entries_base):0 -> 0    ← matches ctor (NULL)
++0x7d8:               0 -> 0    (already zero)
++0x7dc:               0 -> 0x1db9   (next struct: TUAsyncMessage init)
+```
+
+**Diff #2 is the LEGITIMATE CList constructor finishing.** The
+CList is correctly initialized.
+
+Diff #3:
+```
++0x7c4 (count):       0 -> 0x00000020   (32 — bogus, overwrites valid 0)
++0x7c8 (elem_size):   4 -> 0x00000001   (1 — bogus, overwrites valid 4)
++0x7cc (max_cap):     4 -> 0x0c320804
++0x7d0:               0 -> 0x0c3207dc
++0x7d4 (entries_base):0 -> 0x003121fc   (ROM PC = post-`bl SetFreeChain`)
++0x7d8:               0 -> 0x00310858   (ROM PC = SetFreeChain prologue +8)
++0x7dc (TUAsyncMessage): 0x1db9 -> 0x0c201010
+```
+
+**Diff #3 ACTIVELY OVERWRITES the just-constructed CList** plus
+the start of the next struct (TUAsyncMessage). All 7 words from
++0x7c4 to +0x7dc are written to non-zero foreign values.
+
+### TAlertManager layout (decoded from `InitAlertManager` ROM `0x307D4`)
+
+```
+TAlertManager (200 bytes, allocated at ROM 0x307e4 via `__nw__(200)`):
+  +0x00..+0x6F:  TAppWorld (vtable=0x0001c880 set at 0x30824)
+  +0x70..+0x83:  TAEventHandler embedded sub-object
+                   (TAEventHandler ctor zero-inits 5 words at offsets +0..+16
+                    via `__ct__14TAEventHandlerFv` at ROM 0x25574;
+                    InitAlertManager then overwrites [+0x70+0] with the
+                    TAlertEventHandler vtable 0x0001eac0 at ROM 0x30804)
+  +0x84..+0x8B:  TAlertEventHandler-specific fields (one of which is the
+                   "back-pointer to TAlertManager" at [+0x70+0x14] = +0x84)
+  +0x8C..+0xA3:  CList (24 bytes — the dialog list IdleProc reads)
+                   constructed by __ct__5CListFv called at ROM 0x3080c
+  +0xA4..+0xB3:  TUAsyncMessage (constructed at ROM 0x30814)
+  +0xB4..+0xC7:  TAEvent (constructed at ROM 0x3081c)
+```
+
+Observations match exactly:
+- `this=0x0cca37a8` corresponds to TAlertManager+0x70 (the
+  TAlertEventHandler sub-object)
+- `this->[+0x14]=0x0cca3738` is the back-pointer to
+  TAlertManager base = 0x0cca37a8 - 0x70 = 0x0cca3738 ✓
+- `inner+0x8c=0x0cca37c4` is the CList at TAlertManager+0x8c ✓
+- The CList IS where we think it is, IS getting properly
+  constructed, AND IS getting actively overwritten afterwards.
+
+### Why "stale heap data reuse" was wrong
+
+Iter 3 reasoned: "the kernel uses raw bytes inside free blocks
+for freelist linkage; when a freed block is recycled without
+zero-init, the leftover bytes remain visible." That mechanism
+DOES exist in the heap, but the CList ctor explicitly
+zero-inits its 24 bytes — there's no opportunity for stale
+data to remain visible if the ctor runs to completion.
+
+The CList ctor DOES run (we see its writes in diff #2). So the
+stale-data path is closed. The corruption must be an active
+write from later code.
+
+### What's the active write?
+
+Two candidates:
+1. **A memcpy or struct copy** of 24+ bytes that lands on
+   TAlertManager+0x8c. The 24-byte size matches CList-sized.
+   The source content (count=0x20, elem_size=1, plus heap
+   pointers and ROM PCs that look like heap-allocator
+   internals) doesn't match any well-formed C++ object — it
+   could be raw kernel-internal bookkeeping (a TStackInfo,
+   a TFreeBlock descriptor, etc.).
+2. **A field-by-field assignment** in some downstream init.
+   The values look heterogeneous (mix of small ints, RAM
+   ptrs, ROM PCs) — could be assignments mistargeting our
+   CList region.
+
+### Next iteration
+
+The per-IRQ snapshot narrowed the corruption to one ~16 ms
+window between diffs #2 and #3. To capture the actual
+writer's PC we need either:
+
+- **A. Instruction-level emulation** (the right architectural
+  fix; deferred from iter 2). Keep PA=0x0402e000 RO
+  continuously, decode each trapping AArch32 store, apply via
+  PA helpers, advance ELR.
+- **B. Periodic in-handler snapshots**. Add a snapshot diff at
+  every Prim Remember / Forget / IdleProc / heap-allocator
+  probe entry, in addition to the per-IRQ tick. Tightens the
+  detection window dramatically without needing the full
+  AArch32 store decoder.
+
+B is implementable in a similar-sized iteration to this one;
+A is more involved but reusable for any future page-write
+attribution problem.
+
 The corruption pattern (heap allocator APCS frame imprint) is
 consistent with: while the alrt task's USR-mode code held a
 TAlertEventHandler at that stack offset, a kernel-mode SVC call

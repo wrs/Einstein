@@ -895,6 +895,25 @@ pub const WC_POSTLOAD_PROBE_HVC_IMM:      u32 = 0x66;
 pub const WC_POSTLOAD_PROBE_PC:           u32 = 0x0025_7078;
 const WC_POSTLOAD_FIRST_INSN:             u32 = 0xE350_0000; // cmp r0, #0
 
+/// `WriteChunk` post-LDRB probe — patches the
+/// `teq r1, sl` at ROM `0x00257084`, immediately after the
+/// shadow-stub-patched `ldrb r1, [r4, #160]` at 0x00257080.
+/// Logs r0 right after the LDRB stub returns. Iter-26 statically
+/// proved `pick_scratch_regs` for the LDRB picks (R12, R2) — never
+/// R0; this probe's job is to confirm at runtime. If r0 here is
+/// the sentinel set by the WC-postload probe (`0x12345678` under
+/// the iter-25 sentinel test, or the real count value otherwise),
+/// the LDRB stub is innocent and the WC-add corruption arises
+/// later (TEQ flag effect on bne path, or async IRQ between this
+/// probe and WC-add).
+///
+/// Emulates teq r1, sl by setting Z = (r1 == sl), N = MSB(r1 ^ sl)
+/// in saved SPSR. C, V unchanged (TEQ leaves them untouched per
+/// ARM ARM A8.8.236).
+pub const WC_POSTLDRB_PROBE_HVC_IMM:      u32 = 0x67;
+pub const WC_POSTLDRB_PROBE_PC:           u32 = 0x0025_7084;
+const WC_POSTLDRB_FIRST_INSN:             u32 = 0xE131_000A; // teq r1, sl
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -1319,6 +1338,14 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(WC_POSTLOAD_PROBE_HVC_IMM),
             "WriteChunk post-load cmp",
             WC_POSTLOAD_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            WC_POSTLDRB_PROBE_PC,
+            WC_POSTLDRB_FIRST_INSN,
+            hvc_insn(WC_POSTLDRB_PROBE_HVC_IMM),
+            "WriteChunk post-LDRB teq",
+            WC_POSTLDRB_PROBE_HVC_IMM,
         );
     }
 }

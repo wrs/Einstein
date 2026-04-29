@@ -1326,6 +1326,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::WC_POSTLOAD_PROBE_HVC_IMM => {
             handle_wc_postload_probe(ctx);
         }
+        v if v == crate::rom_patches::WC_POSTLDRB_PROBE_HVC_IMM => {
+            handle_wc_postldrb_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1901,6 +1904,11 @@ fn handle_und(ctx: &mut TrapContext) {
         }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::WC_POSTLOAD_PROBE_HVC_IMM) => {
             handle_wc_postload_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::WC_POSTLDRB_PROBE_HVC_IMM) => {
+            handle_wc_postldrb_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -4390,6 +4398,40 @@ fn handle_wc_postload_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
 
     // Emulate `cmp r0, #0` by updating NZ flags in saved SPSR.
     let updated = compute_teq_z_n(source_cpsr, r0);
+    let _ = guest_mem::write_word_pa(UND_SAVE_SPSR_IPA, updated);
+}
+
+fn handle_wc_postldrb_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_wc_postldrb_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+/// `WriteChunk` post-LDRB probe — `teq r1, sl` at ROM
+/// `0x00257084`. Logs r0 right after the shadow-stub-patched LDRB
+/// at 0x00257080 returns. Iter-26 statically proved the LDRB stub
+/// picks (R12, R2) as scratch regs and never touches R0; this
+/// probe confirms at runtime by sampling r0 at the next
+/// instruction. Emulates `teq r1, sl` by setting Z = (r1 == sl),
+/// N = MSB(r1 ^ sl) in the saved SPSR (UND-trampoline path); C, V
+/// unchanged per ARM ARM A8.8.236.
+fn handle_wc_postldrb_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let r0 = ctx.x[0] as u32;
+    let r1 = ctx.x[1] as u32;
+    let sl = ctx.x[10] as u32;
+    let mode = source_cpsr & 0x1F;
+
+    if seq < 32 {
+        kprintln!(
+            "WC-postldrb #{}: r0={:#x} r1={:#x} sl={:#x} src_mode={:#x}",
+            seq, r0, r1, sl, mode,
+        );
+    }
+
+    // Emulate `teq r1, sl` (XOR-based flags, C/V unchanged).
+    let updated = compute_teq_z_n(source_cpsr, r1 ^ sl);
     let _ = guest_mem::write_word_pa(UND_SAVE_SPSR_IPA, updated);
 }
 

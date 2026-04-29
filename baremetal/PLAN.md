@@ -14,23 +14,30 @@ shadow-on-write redirects, and per-task subpage-AP shims are all
 ruled out. The fix MUST be a kernel patch that makes the kernel
 work without 1k subpage protections.
 
-**Current goal: pin the source of the r0 clobber between WC-postload
-(0x257078, sees sentinel `0x12345678`) and WC-add (0x25708c, sees
-`0x20000110`). Iter-26 ran static analysis on the shadow-stub
-generator and **refuted** the iter-25 hypothesis that the LDRB-
-patched stub at `0x00257080` clobbers r0. `pick_scratch_regs`
-deterministically picks (R12, R2) for that site, never R0 (locked
-in by new unit test `pick_scratch_at_rom_0x257080_does_not_pick_r0`
-in `src/shadow_stub.rs`). R0 is correctly identified as live (via
-the fall-through `add r1, r0, #1` at 0x25708c). So the stub's
-DeadReg variant uses R12 as scratch_ea and R2 as scratch_flags;
-R0 is untouched. The clobber comes from somewhere else — the only
-remaining suspect on the path is an asynchronous IRQ firing
-between 0x257078 and 0x25708c, with the EL2 trap_irq save/restore
-or autosave path leaking a CPSR-shaped value into ctx.x[0]. Iter-27
-must instrument the IRQ path or insert a per-instruction probe
-sequence to localize the clobber to the exact instruction
-boundary.**
+**Current goal: pin the source of the r0 clobber. Iter-26 statically
+refuted the iter-25 "LDRB stub clobbers r0" hypothesis;
+`pick_scratch_regs` for the LDRB at `0x00257080` deterministically
+picks (R12, R2), never R0 (locked in by unit test). Iter-27 added
+a probe at `0x00257084` (between the LDRB-stub return and the BNE)
+and confirmed empirically: **WC-postldrb sees r0=0** — exactly the
+value WC-load delivered, so the LDRB stub is innocent at runtime
+too. But iter-27 also surfaced a **latent bug in the existing
+probe infrastructure**: probe handlers for cmp/teq/etc. update
+flags by writing `UND_SAVE_SPSR_IPA` in memory, but the UND-return
+stub uses banked `SPSR_und` (the hardware register, saved by the
+CPU at UND entry, not reloaded from memory). So all the
+"emulate cmp/teq via SPSR" updates have been silently no-ops for
+the iter-25/26 probes too — those probes happened to work because
+the stale flags (from before the patched instruction) coincidentally
+satisfied the kernel's expected branch directions. Iter-27 broke
+that luck: with the WC-postldrb probe replacing the native `teq r1,
+sl`, the BNE at 0x257088 reads flags-from-before-the-patched-cmp
+(stale, Z=0) and takes — control reaches WriteRun via the BNE-
+taken path instead of the WC-add fall-through. **Iter-28 must fix
+the trampoline so probe handler flag-updates actually reach banked
+SPSR_und, or use a different probe mechanism (e.g. emulating the
+branch directly in the handler) before iter-25's actual r0 puzzle
+can be re-investigated.**
 
 ### IdleProc probe — corruption pattern identified
 
@@ -243,6 +250,166 @@ TAlertEventHandler region.
   allocator's freelist threading code (the ROM PCs we see are
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
+
+### Iteration 27 (next-loop iter 23): WC-postldrb probe confirms LDRB stub innocent; uncovers latent SPSR-emulation bug
+
+Per iter-26's plan, iter-27 added a probe at ROM `0x00257084`
+(replacing the native `teq r1, sl`), positioned between the
+LDRB-stub return and the BNE. Probe constants and dispatch in
+`src/rom_patches.rs` and `src/trap.rs`:
+
+- `WC_POSTLDRB_PROBE_HVC_IMM = 0x67`
+- `WC_POSTLDRB_PROBE_PC      = 0x0025_7084`
+- Original word: `0xE131_000A` (`teq r1, sl`)
+
+Handler logs `(r0, r1, sl, src_mode)` and emulates `teq r1, sl`
+flag effect by writing the updated SPSR to `UND_SAVE_SPSR_IPA`.
+
+#### Cold-boot result — LDRB stub innocent at runtime
+
+```
+WC-load #0:     this=0x0c646c0c count=0x0(0) r5=9 r7=0 src_mode=0x10
+WC-postload #0: r0=0x0 src_mode=0x10
+WC-postldrb #0: r0=0x0 r1=0x0 sl=0x0 src_mode=0x10
+WriteRun #0 ENTER: this=0x0c646c0c w98=0x0 count=0x0(0) ...
+```
+
+`r0=0` at the WC-postldrb probe — **exactly what WC-load
+delivered.** The shadow-stub's MRS/LDRB/MSR sequence at
+`0x00257080` did not modify r0. iter-26 static analysis confirmed
+empirically.
+
+#### Latent bug uncovered: probe SPSR-emulation is a no-op
+
+Note the absence of `WC-add #0` in the cold-boot output. The
+expected WriteChunk path for `count=0` would be: bls TAKES (since
+`cmp r0, #0` with r0=0 sets Z=1) → branches to `0x2570d0`,
+skipping the LDRB entirely. But WC-postldrb DID fire — meaning
+bls fell through. So `cmp r0, #0`'s flag update from the
+WC-postload probe handler did not actually affect bls's reading
+of CPSR.
+
+Tracing the data path:
+
+1. `handle_wc_postload_probe_with` calls
+   `compute_teq_z_n(source_cpsr, r0)` and writes the result to
+   `UND_SAVE_SPSR_IPA` via `guest_mem::write_word_pa`.
+2. `return_to_guest_from_und` ERETs to the UND-return stub
+   (`UND_RETURN_STUB_VA`):
+
+```
++0x00: e59fe000  ldr lr, [pc, #0]   ; lr = literal (= ELR_EL2)
++0x04: e1b0f00e  movs pc, lr        ; CPSR = SPSR_und (banked!), PC = lr
+```
+
+3. `movs pc, lr` in UND mode copies **banked `SPSR_und`** (the
+   hardware register, saved by the CPU at UND entry) into CPSR.
+   It does NOT consult `UND_SAVE_SPSR_IPA`.
+
+The trampoline saves `SPSR_und` to memory at entry but never
+reloads it from memory before the return. So **every probe that
+writes `UND_SAVE_SPSR_IPA` to "emulate" a flag-setting instruction
+has been a silent no-op.** The kernel runs with stale CPSR (the
+flags from *before* the patched instruction) and the patched
+flow happens to work only when the stale flags coincidentally
+satisfy the kernel's expected branch.
+
+WC-postload (cmp), WC-postldrb (teq), and the page-get TEQ
+emulator (`apply_page_get_teq_flags`'s UND-mode branch) all share
+this defect. The two probes that emulate non-flag-setting
+instructions (WC-load, WC-add, WC-store, WC-reload) are
+unaffected — they only update GPRs through `ctx.x[]`, and that
+path works because the EL2 trap context is restored to
+guest registers at ERET.
+
+#### Why iter-25's WC-add #0 fired but iter-27's didn't
+
+Both runs reach the LDRB at `0x00257080` only because bls falls
+through. With WC-postload's flag emulation broken, bls's flag
+read is whatever the kernel had before the patched cmp — and that
+happens to NOT trigger bls (Z=0 ∧ C=1). Lucky.
+
+After the LDRB stub returns at `0x00257084`:
+- iter-25: native `teq r1, sl` runs, sets Z=1 (r1 == sl observed
+  per iter-27's WC-postldrb log). BNE doesn't take, fall through
+  to WC-add. ✓
+- iter-27: my WC-postldrb probe **replaces** the teq with HVC.
+  Flag update via UND_SAVE_SPSR_IPA is a no-op. BNE reads stale
+  flags (the same stale flags that existed at bls entry — Z=0).
+  BNE TAKES → branches to `0x2570c0` → `mov r0, r4; bl WriteRun`.
+  WC-add never fires.
+
+So iter-27's probe broke the bne control flow as a side effect of
+the latent SPSR bug. The information we DID get (r0=0 at
+0x257084) is still valid — that comes from `ctx.x[0]`, which the
+trap context preserves correctly across the trampoline.
+
+#### What this rules in / out
+
+- The shadow-stub LDRB at `0x00257080` does not modify r0
+  (confirmed iter-26 statically + iter-27 empirically).
+- The iter-25 r0=0x20000110 puzzle remains: with sentinel,
+  WC-postload r0=0x12345678, WC-add r0=0x20000110, but no
+  intermediate probe at 0x257084. The clobber happened somewhere
+  in the 0x257078..0x25708c window. iter-27's probe broke the
+  flow before we could interrogate it cleanly.
+- Existing probe infrastructure has a latent flag-emulation bug
+  affecting cmp/teq/teq-like emulations. Probes that only update
+  GPRs (load/store/add) work fine.
+
+#### Next iteration plan (iter-28)
+
+Two viable approaches, in order of preference:
+
+a. **Fix the SPSR plumbing** so flag updates reach banked
+   `SPSR_und`. The minimal change: extend the UND-return stub to
+   load the saved SPSR from memory and `MSR SPSR_und, <reg>`
+   before `movs pc, lr`. Layout becomes:
+
+   ```
+   +0x00: ldr  r12, [pc, #0x10]      ; r12 = scratch base (SCRATCH_POOL IPA)
+   +0x04: ldr  r12, [r12, #0x04]     ; r12 = saved SPSR_und (potentially updated)
+   +0x08: msr  SPSR_und, r12         ; restore banked SPSR_und from memory
+   +0x0c: ldr  lr,  [pc, #0]         ; lr = literal (= ELR_EL2)
+   +0x10: movs pc,  lr               ; CPSR = SPSR_und (now reflecting handler updates)
+   +0x14: <ELR_EL2 literal>
+   +0x18: <SCRATCH_POOL IPA literal>
+   ```
+
+   Caveat: writing `SPSR_und` from UND mode requires CPSR.M==UND,
+   which the trampoline already is at this point. `MSR SPSR_und, ...`
+   from the same mode targets that mode's banked SPSR. Verify
+   AArch32-EL1 access semantics on QEMU raspi3b (the target most
+   likely to misbehave per docs/QEMU_BUGS.md) and on FVP.
+
+   Once fixed, re-run iter-27's probe + run with iter-25's
+   sentinel test. The expected outcome at 0x25708c (WC-add) tells
+   us where r0 was clobbered.
+
+b. **Probe at the BNE target instead.** Instead of replacing
+   `teq r1, sl` (flag-setting), replace the bne at `0x00257088`
+   with HVC and emulate the branch directly in the handler. The
+   handler reads source SPSR's Z bit and either (a) advances ELR
+   to `0x2570c0` (branch taken) or (b) lets ERET resume at
+   `0x25708c` (fall through). This sidesteps the SPSR bug because
+   the handler controls control flow without needing to update
+   guest CPSR.
+
+Approach (a) is preferable — it fixes the latent bug and unblocks
+all flag-emulating probes for future iterations. Approach (b) is
+a tactical workaround if (a) turns out to be tricky on either
+host platform.
+
+#### Status
+
+- 30/30 shadow_stub unit tests pass.
+- New probe (`WC_POSTLDRB_PROBE`) installed and operational.
+- Cold-boot: r0=0 at 0x257084 confirms LDRB stub innocent.
+- Discovered: probe SPSR-emulation has been a silent no-op for
+  cmp/teq probes since at least iter-25.
+- Iter-28 must fix the SPSR plumbing (approach a) or implement a
+  control-flow-controlling BNE probe (approach b) before the
+  iter-25 r0 puzzle can resume.
 
 ### Iteration 26 (next-loop iter 22): static analysis refutes shadow-stub-clobbers-r0 hypothesis
 

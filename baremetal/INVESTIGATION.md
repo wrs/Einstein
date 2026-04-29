@@ -1175,6 +1175,122 @@ phase the corruption falls in.
 A is the right architectural fix; B is cheaper to ship if we
 want to bisect the boot phase first.
 
+## Iteration 3 — per-IRQ snapshot diff: corruption is stale heap data
+
+Implemented option B in `src/alrt_capture.rs`: an 8-word snapshot
+of offsets 0x7c0..0x800 sampled at every `maybe_rearm` call.
+Word-level diffs vs the prior snapshot are logged. The snapshot
+is seeded from initial RAM contents in `arm_at_boot`.
+
+### Cold-boot result — 6 diffs, the 3rd is the "corruption"
+
+```
+alrt-capture: RAM at PA=0x0402e000+0x7c0..0x800 at boot:  ALL ZERO
+
+#0 — kernel free-memory poison fill:
+    +0x7c0: 0 -> 0x6db6db6d
+    +0x7c4: 0 -> 0xb6db6db6
+    +0x7c8: 0 -> 0xdb6db6db
+    +0x7cc: 0 -> 0x6db6db6d
+    +0x7d0: 0 -> 0xb6db6db6
+    +0x7d4: 0 -> 0xdb6db6db
+    +0x7d8: 0 -> 0x6db6db6d
+    +0x7dc: 0 -> 0xb6db6db6
+
+#1 — page zeroed (allocation prep):
+    poison -> 0 across all 8 words
+
+#2 — partial init of some adjacent header:
+    +0x7c0: 0 -> 0x0c6016b8
+    +0x7c8: 0 -> 4
+    +0x7cc: 0 -> 4
+    +0x7dc: 0 -> 0x1db9
+
+#3 — THE CORRUPTION (appears in a single tick):
+    +0x7c0: 0x0c6016b8 -> 0x0c20463c
+    +0x7c4: 0          -> 0x00000020   (bogus "count" = 32)
+    +0x7c8: 4          -> 0x00000001   (bogus "esize" = 1)
+    +0x7cc: 4          -> 0x0c320804
+    +0x7d0: 0          -> 0x0c3207dc
+    +0x7d4: 0          -> 0x003121fc   (ROM PC after `bl SetFreeChain`)
+    +0x7d8: 0          -> 0x00310858   (ROM PC = SetFreeChain prologue)
+    +0x7dc: 0x1db9     -> 0x0c201010
+
+#4, #5 — heap-link rotations on +0x7c0 only (legitimate heap activity).
+```
+
+### Translate_va check disproves the stage-1-alias hypothesis
+
+I added a translate_va of VA=0x0c3207dc to the IdleProc probe (the
+"saved-ip" value, which would be SP at SetFreeChain entry if the
+diff #3 bytes came from a direct push at that VA). Result:
+
+```
+IdleProc #000 ... clist=0x0cca37c4 (PA=0x0402e7c4)
+                  alias_test_VA=0x0c3207dc -> PA=0x0402f7dc
+```
+
+VA=0x0c3207dc maps to PA=**0x0402f7dc**, NOT 0x0402e7dc. So the
+APCS-frame-shaped values are NOT from a stage-1-aliased push to
+the alrt CList page. The earlier hypothesis (a third VA aliasing
+PA=0x0402e000) was wrong.
+
+### Revised diagnosis: heap-allocator stale-data reuse
+
+The Newton kernel uses raw bytes inside free blocks for freelist
+linkage. `MoveFreeBlock` and `SetFreeChain` manipulate these
+bytes when blocks are joined/split/threaded through the freelist.
+A freed block carries leftover linkage and (depending on the
+allocator's internals) ROM PCs that look like back-pointers or
+debug breadcrumbs.
+
+The pattern in diff #3 fits: a free block at PA=0x0402e7c0
+contained leftover SetFreeChain/MoveFreeBlock linkage. When the
+alrt task's TAlertEventHandler was allocated and its CList
+header storage placed at `inner+0x8c = +0x1c = PA+0x7c4`, the
+leftover bytes were not zero-cleared. IdleProc then reads
+`count = *(0x7c4) = 0x20` etc.
+
+This is consistent with:
+- The earlier `MoveFreeBlock → bl SetFreeChain` analysis: the
+  ROM PCs are heap-allocator-internal, not from random kernel
+  code.
+- The kernel-intent mask audit: PA=0x0402e000 was classified
+  DISJOINT (subpage-disjoint), but DISJOINT only protects
+  against TWO-VA-aliased access. It doesn't protect against a
+  single VA reading stale heap data left behind by the
+  allocator's own freelist manipulation.
+
+The "things break randomly under flat AP=011" premise of the
+original directive is partly relevant (heap allocator's freelist
+writes go through one VA, client constructor through another;
+under subpage AP they'd be confined; under flat AP=11 the bytes
+are visible to the client) — but the deeper cause is the
+allocator's lack of zero-init on block reuse, which would have
+been a latent bug under ARMv4 too if subpage AP didn't somehow
+keep the freelist words sequestered.
+
+### Next iteration — narrow the heap-allocator path
+
+1. **Probe `NewBlock` / `NewPtr` / equivalent allocator entry
+   points** with a per-allocation logger. Filter to allocations
+   in the range PA=0x0402e000..0x0402f000 to surface the one
+   that gives the alrt task its TAlertEventHandler storage.
+2. **Cross-check Einstein with `NewtonProbe`** on the same
+   ROM+REx pair. If Einstein's faithful subpage-AP emulation
+   keeps the freelist bytes from leaking, the corruption is
+   exclusive to our flat-AP=11 environment. If Einstein also
+   leaks them, this is a pre-existing kernel bug we're now
+   exposing.
+3. **Decide fix layer** based on (1) and (2):
+   - Pre-existing bug → ROM patch zero-init at the
+     TAlertEventHandler constructor or CList::Init.
+   - flat-AP-only bug → a more surgical alias fix (Option β
+     stage-2 PA splitting or per-allocator-path 4-KiB pad).
+
+Per-IRQ snapshot infrastructure is in place and reusable for
+similar bisects on other corrupted regions; budget=64 captures.
+
 The corruption pattern (heap allocator APCS frame imprint) is
 consistent with: while the alrt task's USR-mode code held a
 TAlertEventHandler at that stack offset, a kernel-mode SVC call

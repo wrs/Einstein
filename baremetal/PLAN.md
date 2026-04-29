@@ -354,39 +354,79 @@ deliberate stack-guard sharing.
     assumption that aliases cause corruption; the kernel's careful
     subpage-disjoint design prevents this.
 
-### Next iteration — Option σ: accept aliases as benign + un-park alrt-task DABT
+### Per-alias subpage-AP audit (per user directive 2026-04-28)
 
-The aliases are reportable verify-mmu observations but not real
-corruption sources. Recommend:
+Extended verify-mmu's first-alias dump with subpage-AP decode and
+classified each pair. **14 of 15 aliases are DISJOINT** (one VA
+grants priv-RW to its dedicated subpage; the other has no RW
+grants — a pure read-only mirror). **One alias is a real
+CONFLICT**:
 
-1. Document Group-1 / Group-2 aliases as benign (kernel's
-   subpage-disjoint exception-stack and stack-guard layouts).
-2. As a safety net, add stage-2 RO traps on the *off-stack
-   subpages* of each shared physical page — an actual overflow
-   into a wrong subpage would fault to EL2 and we'd see it.
-3. Un-park the alrt-task DABT investigation deferred 4+ iterations
-   ago. The original "no debugging until aliases are zero"
-   directive was based on the corruption hypothesis we now have
-   evidence against.
+```
+PA=0x04034000  L2[0x7f]=0x0403403e  L2[0x82]=0x0403403e  IDENTICAL
+  AP-decode: both grant priv-RW to subpage 0 (offsets 0..1023)
+```
 
-Backup options if Option σ proves insufficient:
+Prim probe data confirms 5 distinct VAs map to PA=0x04034000
+all with `mask=0x3` (subpage 0 RW), from 3 different allocator
+paths (TLoader, TCardAsyncMsg ctor, TTask::Init ×2). The kernel
+allocator is recycling PA=0x04034000 across distinct consumers
+without subpage isolation.
+
+This is a real bug — exactly what the user directive predicted:
+the 4-KiB patch set audit reveals a kernel allocator behavior
+the patches don't cover. ARMv4 hardware would have caught this
+too (5×AP=11 on the same subpage); how the original kernel
+handled it is the open question.
+
+### Next iteration — narrow the PA=0x04034000 conflict
+
+1. Walk Prim probe call sequence for PA=0x04034000 to determine
+   the temporal order: were the 5 installs simultaneously live,
+   or did each preceding install get forgotten before the next?
+   The PrimForgetMapping probe data answers this.
+2. Read the L2 PT directly at PA=0x04025400+0x7f*4..+0x82*4
+   to see the FINAL state. If only one descriptor remains
+   non-zero, the others were forgotten and there's no
+   simultaneous live conflict.
+3. Cross-check against Einstein: under faithful subpage-AP
+   emulation, what does Einstein do when 5 calls install the
+   same PA at different VAs with overlapping subpage masks?
+4. Decide:
+   - If Einstein also has the simultaneous live mapping → it's
+     pre-existing kernel design relying on serialization.
+   - If Einstein doesn't (forgets prior installs) → our
+     PrimForgetMapping path is missing forgets that the
+     kernel's ARMv4 path would have done.
+
+If the conflict is truly simultaneous-live (no prior forget),
+the 4-KiB patch set may be missing a per-allocator-path patch
+similar to the existing NewHeap/NewVMHeap/ZapHeap chunk_size=4096
+patches but applied to a different size class.
+
+Until this conflict is resolved, the alrt-task DABT
+investigation stays parked.
+
+### Once Group-2's conflict is understood
+
+Apply the Option σ-style proof for the remaining 14 disjoint
+aliases (kernel exception stacks + per-task stack-guard zones)
+and treat them as functionally inert. The remaining concern is
+the PA=0x04034000 conflict above — that one isn't disjoint, and
+the user directive blocks debugging until every alias is verified
+benign. So the conflict comes first.
+
+Backup approaches if PA=0x04034000 turns out to be a kernel
+allocator bug we can't easily fix:
 - **Option β** — full stage-2 PA splitting with shadow-on-write
-  coherence. Substantial work; only worth it if we observe actual
-  byte conflict.
-- **Option τ** — patch `InitSpecialStacks` to use distinct 4-KiB
-  PAs per exception stack. Doable but needs an audit for kernel
-  paths that rely on the shared layout.
+  coherence on the conflicting page. Substantial work.
+- **Option τ** — patch the specific allocator paths
+  (TLoader / TCardAsyncMsg / TTask::Init) to use distinct 4-KiB
+  PAs from a chunk_size=4096 patch similar to NewHeap.
 
-Group-2's 12 aliases remain parked until Group-1 is zero.
-Group-2 will then be revisited with **Option C: stage-2 PA
-splitting** — the hypervisor-level approach. When the guest's
-L2 maps two VAs to the same PA, transparently allocate a
-duplicate stage-2 backing page and re-route one of the VAs.
-This avoids fighting the kernel's deliberate boundary-sharing
-design entirely; complexity is in COW-style write shadowing.
-
-Until aliases are zero, the alrt-task DABT and any other later wedge
-stays **deliberately not investigated**.
+Until all 15 aliases are verified benign or fixed, the alrt-task
+DABT and any other later wedge stays **deliberately not
+investigated**.
 
 ## Critical files
 

@@ -107,6 +107,25 @@ pub fn read_word_pa(pa: u32) -> Option<u32> {
     Some(unsafe { core::ptr::read_volatile(h as *const u32) })
 }
 
+/// Decode the 4 per-subpage AP fields from an ARMv4 small-page L2
+/// descriptor (typ=2). Returns `[AP[0], AP[1], AP[2], AP[3]]` where
+/// AP[i] covers subpage i (1 KiB at offset i*0x400 within the page).
+/// Encoding (per the 717006 ROM disasm):
+///   bits [5:4]   = AP[0]
+///   bits [7:6]   = AP[1]
+///   bits [9:8]   = AP[2]
+///   bits [11:10] = AP[3]
+/// Each 2-bit field: 0b00 sys (priv-RO with SCTLR.SR=1), 0b01 priv-RW
+/// user-RO, 0b10 priv-RW user-RO-deprecated, 0b11 full RW.
+fn decode_subpage_ap(desc: u32) -> [u8; 4] {
+    [
+        ((desc >> 4)  & 0x3) as u8,
+        ((desc >> 6)  & 0x3) as u8,
+        ((desc >> 8)  & 0x3) as u8,
+        ((desc >> 10) & 0x3) as u8,
+    ]
+}
+
 /// Map a guest IPA + size to the host backing pointer. Centralises the
 /// region table used by the typed PA helpers so regions added here
 /// (e.g. the shadow-stub `SCRATCH_POOL`) are visible to all callers
@@ -473,6 +492,51 @@ pub fn fix_stage1_xn_bits() -> bool {
                                 i, entry, l2_pt_base, l2_loc,
                                 prev_idx, prev_l2, prev_l2 & 0xFFFF_F000,
                                 va_idx,   va_l2,   va_l2   & 0xFFFF_F000,
+                            );
+                            // Subpage-AP decode + conflict classification.
+                            // ARMv4 small-page (typ=2) AP layout:
+                            //   bits [11:10] = AP[3] (subpage 3, offsets 0xC00..0xFFF)
+                            //   bits [9:8]   = AP[2] (subpage 2, offsets 0x800..0xBFF)
+                            //   bits [7:6]   = AP[1] (subpage 1, offsets 0x400..0x7FF)
+                            //   bits [5:4]   = AP[0] (subpage 0, offsets 0x000..0x3FF)
+                            // Value 0b11 = priv-RW + user-RW (full RW grant).
+                            // Anything else (00 sys, 01 priv-RW user-RO, 10
+                            // priv-RW user-RW-deprecated) we treat as
+                            // "non-RW" for the disjointness check — only
+                            // an AP=11 subpage is one the kernel might
+                            // actively write through this VA. If both
+                            // descriptors grant AP=11 to the SAME subpage,
+                            // both VAs can write the same bytes → real
+                            // alias-corruption hazard. Otherwise the
+                            // alias is "subpage-disjoint benign".
+                            let prev_aps = decode_subpage_ap(prev_l2);
+                            let va_aps   = decode_subpage_ap(va_l2);
+                            let conflict_mask =
+                                (prev_aps[0] == 0b11 && va_aps[0] == 0b11) as u8
+                              | (((prev_aps[1] == 0b11 && va_aps[1] == 0b11) as u8) << 1)
+                              | (((prev_aps[2] == 0b11 && va_aps[2] == 0b11) as u8) << 2)
+                              | (((prev_aps[3] == 0b11 && va_aps[3] == 0b11) as u8) << 3);
+                            let class = if conflict_mask != 0 {
+                                "CONFLICT"
+                            } else if prev_l2 == va_l2 {
+                                // Identical descriptors at two VAs — same
+                                // AP grants, so any RW subpage is RW from
+                                // both VAs. Flag explicitly because the
+                                // bit-mask check above only fires on
+                                // AP=11 overlap; identical descs that
+                                // share AP=01 / 10 / 00 grants on the
+                                // same subpage are still byte-overlapping
+                                // RW from kernel perspective.
+                                "IDENTICAL"
+                            } else {
+                                "DISJOINT"
+                            };
+                            crate::kprintln!(
+                                "verify-mmu alias AP-decode: {} prev=[sp0={:02b} sp1={:02b} sp2={:02b} sp3={:02b}] va=[sp0={:02b} sp1={:02b} sp2={:02b} sp3={:02b}] conflict_mask={:#x}",
+                                class,
+                                prev_aps[0], prev_aps[1], prev_aps[2], prev_aps[3],
+                                va_aps[0],   va_aps[1],   va_aps[2],   va_aps[3],
+                                conflict_mask,
                             );
                         }
                     }

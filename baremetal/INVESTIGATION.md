@@ -550,7 +550,110 @@ non-L1[0xc0] L2 PTs we haven't located. To find them we'd need
 to walk the entire guest L2 PT space at runtime and look for
 every entry mapping any of the 3 PAs.
 
-## Trampoline relocated; Option α retried; revealed exception-stack layout
+## Per-alias subpage-AP audit — 14 disjoint, 1 real CONFLICT (BUG)
+
+User directive: "look at every alias and decide it's benign before
+moving on. This is how we find bugs in our 4k page allocation patch
+set."
+
+Extended `verify-mmu`'s first-alias dump with subpage-AP decode of
+both L2 descriptors. For each pair, classify as:
+- **DISJOINT** — the two descriptors grant priv-RW (AP=11) to
+  different subpages (or one grants RW and the other has no AP=11
+  grants at all). Stacks/data sharing the page disjointly.
+- **CONFLICT** — both descriptors grant AP=11 to the same subpage.
+  Two consumers can write the same bytes → real corruption.
+- **IDENTICAL** — both descriptors are bit-identical. (subset of
+  CONFLICT; both grant the exact same subpage RW.)
+
+Cold-boot result on the 15 verify-mmu aliases:
+
+| # | PA           | VA1 / VA2 (L1[N],L2[M]) | Class    | AP-decode |
+|---|--------------|-------------------------|----------|-----------|
+| 1 | 0x04004000 | 0xc000000 / 0xc002000 | DISJOINT | (11,0,0,0) / (0,1,1,0) |
+| 2 | 0x04005000 | 0xc003000 / 0xc004000 | DISJOINT | (11,0,0,0) / (0,1,1,0) |
+| 3 | 0x04006000 | 0xc007000 / 0xc008000 | DISJOINT | (11,0,0,0) / (0,1,0,0) |
+| 4 | 0x04028000 | 0xc310000 / 0xc318000 | DISJOINT | (11,0,0,0) / (0,0,0,0) |
+| 5 | 0x0402c000 | 0xcc7a000 / 0xcc82000 | DISJOINT | (11,0,0,0) / (0,0,0,0) |
+| 6 | 0x0402e000 | 0xcc9b000 / 0xcca3000 | DISJOINT | (11,0,0,0) / (0,0,0,0) |
+| 7 | 0x0402f000 | 0xc318000 / 0xcc7a000 | DISJOINT | (0,0,0,0) / (0,0,0,0) |
+| 8 | 0x04033000 | 0xcc82000 / 0xccad000 | DISJOINT | (11,0,0,0) / (0,0,0,0) |
+| 9 | **0x04034000** | **0xcc7f000 / 0xcc82000** | **CONFLICT** | **(11,0,0,0) / (11,0,0,0) IDENTICAL** |
+| 10 | 0x04035000 | 0xc603000 / 0xccc4000 | DISJOINT | (0,0,0,0) / (11,0,0,0) |
+| 11 | 0x0403a000 | 0xccc4000 / 0xccca000 | DISJOINT | (11,0,0,0) / (0,0,0,0) |
+| 12 | 0x0403b000 | 0xccc4000 / 0xcccb000 | DISJOINT | (11,0,0,0) / (0,0,0,0) |
+| 13 | 0x0403c000 | 0xccc4000 / 0xcccc000 | DISJOINT | (11,0,0,0) / (0,0,0,0) |
+| 14 | 0x0403d000 | 0xccc4000 / 0xccc9000 | DISJOINT | (11,0,0,0) / (0,0,0,0) |
+| 15 | 0x04043000 | 0xccc4000 / 0xccdd000 | DISJOINT | (11,0,0,0) / (0,0,0,0) |
+
+### CONFLICT at PA=0x04034000 — 5-way collision across allocator paths
+
+Prim probe data confirms the conflict isn't normalization noise.
+PA=0x04034000 was installed at FIVE distinct VAs, all with
+`mask=0x3` (subpage 0 RW), from THREE different allocator paths:
+
+```
+PrimRememberMapping(va=0x0cc82000, mask=0x3, PA=0x04034000)  user_caller=0x002523bc (TTask::Init)
+PrimRememberMapping(va=0x0cc7f000, mask=0x3, PA=0x04034000)  user_caller=0x00114078 (TheMain::TLoader)
+PrimRememberMapping(va=0x0cc80000, mask=0x3, PA=0x04034000)  user_caller=0x0004b0fc (TCardAsyncMsg ctor)
+PrimRememberMapping(va=0x0cc81000, mask=0x3, PA=0x04034000)  user_caller=0x0004b0fc (TCardAsyncMsg ctor)
+PrimRememberMapping(va=0x0c310000, mask=0x3, PA=0x04034000)  user_caller=0x002523d4 (TTask::Init)
+```
+
+Five distinct consumers from three call paths (TLoader,
+TCardAsyncMsg, TTask::Init) all receive PA=0x04034000 with
+mask=0x3 (subpage 0 RW). Each thinks it owns subpage 0 (offsets
+0..1023) of its own page; in reality all five share the same
+physical bytes.
+
+verify-mmu only reports the first-detected pair; the Prim probe
+data is the complete picture. ARMv4 with subpage AP would
+ALSO have flagged this (multiple AP=11 grants on the same
+subpage). The conflict is not a hypervisor artifact.
+
+### Why this matters — 4-KiB patch-set audit hits a real issue
+
+The existing PATCHES_717006 4-KiB-rounding patches force HEAP
+allocations to use 4 KiB chunks (NewHeap, NewVMHeap, ZapHeap).
+But the page-allocator layer (TUPageManager::Get) is unpatched.
+The five conflicting installs all came through Get's SWI #1B
+chain (per `user_pc=0x003ae404` post-`bl MonitorDispatchSWI` in
+TUDomainManager::Get).
+
+The prior page-get probe found 28 Get calls with no PageId
+duplicates. That was the early-boot allocator window only.
+Later in boot, Get evidently recycles PAs across distinct
+PageIds — handing PA=0x04034000 to FIVE different consumers
+across the boot lifecycle.
+
+Three possibilities:
+
+1. **Pre-existing kernel-design conflict** — the kernel always
+   had this race; ARMv4 ALSO would have aliased these, but the
+   kernel relies on serialization (the conflicting consumers
+   never run simultaneously). Verify-mmu sees the static L2
+   state but no actual corruption ever fires.
+2. **Bug exposed by our 4-KiB patch set** — the patches force a
+   different allocator path than ARMv4 would have used; in the
+   ARMv4 path the kernel would have used subpage AP to give each
+   consumer a distinct subpage of PA=0x04034000, but with our
+   forced 4-KiB chunks the consumers all end up claiming the
+   same subpage 0.
+3. **Bug pre-existing in kernel allocator that we now expose** —
+   the PA reuse without proper subpage isolation was always
+   wrong, but ARMv4 hardware caught it via subpage-AP RW
+   conflicts that the kernel's exception handler silently
+   absorbed (or it triggered a fault we don't have data for).
+
+Hypothesis 2 is the most actionable. Looking at the consumers:
+- TLoader, TCardAsyncMsg ctor — driver init paths
+- TTask::Init (LockHeapRange ×2) — task stack init
+
+These are MULTIPLE distinct allocator entry points, not all on
+the per-task stack path. TLoader and TCardAsyncMsg suggest
+heap/data allocations through different size classes.
+
+## Next iteration — narrow the PA=0x04034000 conflict
 
 Relocated `HYP_TRAMP_SCRATCH_BASE` from `0x04005F00` (kernel-globals
 self-map page) to `0x0600_F000` (last 4 KiB of the shadow-stub

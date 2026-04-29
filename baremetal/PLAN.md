@@ -77,6 +77,71 @@ to see:
 The corrupting writer's PC will tell us which kernel routine is
 escaping its allocation.
 
+### Iteration 2: stage-2 RO trap installed (PA=0x0402e000); auto-flip limit identified
+
+Added `src/alrt_capture.rs` modeled after `g1_capture.rs`. Boot-time
+arm via `arm_at_boot()` from `kmain` with `KNOWN_TARGET_PA=0x0402e000`
+(the stable PA backing VA=0x0cca3000 per the prior alias table).
+Dynamic re-arm via `maybe_arm_for_va` hooked into the Prim Remember
+probe as a sanity check. Cold-boot results:
+
+```
+alrt-capture: BOOT armed RO+XN on PA=0x0402e000 L3 before=0x4000000182e7ff after=0x4000000182e77f
+alrt-capture: RAM at PA=0x0402e000+0x7c0..0x800 at boot:  ALL ZERO
+alrt-capture summary: armed_pa=0x0402e000 traps=10 out_of_window=10 budget_remaining=4096
+IdleProc #000 ENTER ... clist=0x0cca37c4 (PA=0x0402e7c4) count=32 esize=1 ebase=0x003121fc ...
+```
+
+**Boot RAM is zero.** **PA at IdleProc time confirmed = 0x0402e000.**
+**10 stage-2 permission faults captured, ALL outside the
+0x7c0..0x800 CList window.** Yet the CList header IS corrupted
+when IdleProc fires.
+
+### The auto-flip-to-RW pattern is the limiting factor
+
+`handle_data_abort` in `src/trap.rs` does, on every RAM permission
+fault: (1) call `g1_capture::note_perm_fault` /
+`alrt_capture::note_perm_fault` for logging, (2) call
+`set_ram_page_rw_xn(page)` to flip the page to RW, (3) return
+*without advancing ELR* so the guest retries the store. The
+`maybe_rearm()` hook on next trap re-imposes RO+XN, but that only
+fires on IRQ entry (per the `g1_capture` comment, sync-trap rearm
+caused infinite STM retry loops because multi-register stores
+straddle pages and re-fault each retry).
+
+Result: after the first fault on the page in each ~16 ms IRQ
+window, the page is RW for the rest of that window — every
+subsequent write passes through unobserved. Our 10 captures are
+just the first faults of 10 IRQ windows. The corrupting write to
+offset 0x7c4 happened in some window between traps, while the
+page was transiently RW.
+
+### Next iteration — instruction-level emulation
+
+To capture EVERY write to PA=0x0402e000 we need a different
+architecture: when the trap fires, decode the AArch32 store
+instruction at ELR_EL2, apply the write via the PA helpers
+(read_word_pa / write_word_pa), advance ELR past the instruction,
+and **leave the page RO**. This avoids the STM retry loop because
+the in-flight store is consumed at trap time rather than retried
+natively.
+
+The `src/unaligned.rs` infrastructure already has AArch32 store
+decoding for unaligned-fault recovery; we can reuse its
+`decode_*_store` helpers. The store types we need to handle on
+this page: STR-imm, STR-imm-pre/post-indexed, STM, byte/half
+variants. STM would need per-register iteration so the trap
+captures every word of the multi-store individually.
+
+This is a larger change than fits in a one-iteration commit, so
+this iteration ships the boot-time arm + diagnostic counters as
+infrastructure; the next iteration adds instruction-level
+emulation. Alternative simpler probe: snapshot the CList-window
+bytes at each IRQ rearm and log when they change — would catch
+the corruption within ~16 ms granularity but not pin the exact
+PC. Decide which to pursue based on whether we want chronology
+(periodic snapshot) or the writer's PC (instruction emulation).
+
 User directive (2026-04-28): "look at every alias and decide it's
 benign before moving on. This is how we find bugs in our 4k page
 allocation patch set."

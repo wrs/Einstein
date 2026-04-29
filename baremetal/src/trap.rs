@@ -225,6 +225,7 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     // to complete and short enough to capture distinct writer PCs
     // through the boot.
     crate::g1_capture::maybe_rearm();
+    crate::alrt_capture::maybe_rearm();
 
     // Acknowledge the interrupt on the host CPU-interface (GICv3 on
     // FVP, no-op on BCM2836) before doing any work. On GICv3 the
@@ -487,6 +488,17 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
         if crate::g1_capture::is_armed_pa(page) {
             let value = if isv != 0 { Some(ctx.x[srt] as u32) } else { None };
             crate::g1_capture::note_perm_fault(elr, ipa as u32, value, srt as u32);
+        }
+
+        // alrt-task CList header capture: same shape as g1, dynamically
+        // armed when Prim Remember installs VA=0x0cca3000 (see
+        // `src/alrt_capture.rs`).
+        if crate::alrt_capture::is_armed_pa(page) {
+            let value = if isv != 0 { Some(ctx.x[srt] as u32) } else { None };
+            let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+            crate::alrt_capture::note_perm_fault(
+                elr, ipa as u32, value, srt as u32, spsr_el2,
+            );
         }
 
         // Heap-watch carve-out: log writer info before the auto-flip,
@@ -2119,6 +2131,8 @@ fn handle_reboot(ctx: &TrapContext) -> ! {
     //   - That global's task struct's monitor list at +0x74,+0x78,+0x7c
     //     (read by `0x393324..0x393348` to build the dispatch bitmask)
     kprintln!();
+    crate::alrt_capture::dump_counters();
+    kprintln!();
     kprintln!("=== one-shot Reboot-canary kernel-state dump ===");
     {
         let ram = guest_mem::ram_host_pa() as *const u32;
@@ -3294,6 +3308,13 @@ fn handle_prim_remember_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
     // post-flatten audit which can't see the kernel's subpage intent.
     kim_remember(phys, va, mask);
 
+    // alrt-task CList header capture — arm a stage-2 RO trap on the
+    // PA backing VA=0x0cca3000 the first time we see it installed,
+    // so the corrupting writer that turns the CList header into an
+    // APCS frame imprint is caught with `(PC, value)`. No-op for any
+    // other VA. See `src/alrt_capture.rs`.
+    crate::alrt_capture::maybe_arm_for_va(va, phys);
+
     // Per-PA focus timeline: log every Remember call for PRIM_FOCUS_PA
     // unconditionally, with a shared seq# (interleaves with Forget) so
     // we can read off the temporal order. Tracker logic below stays
@@ -3487,9 +3508,14 @@ fn handle_idleproc_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
             .unwrap_or(0xDEAD_DEA3);
         let ebase = guest_mem::read_word_va(clist.wrapping_add(0x10))
             .unwrap_or(0xDEAD_DEA4);
+        // Resolve VA→PA for the CList header so we know which PA to
+        // arm. The boot-time arm uses the historical PA=0x0402e000;
+        // if the kernel maps VA=0x0cca3000 to a different PA in
+        // this run, the arm misses entirely.
+        let clist_pa = guest_mem::translate_va(clist).unwrap_or(0xDEAD_DEA8);
         kprintln!(
-            "IdleProc #{:03} ENTER this={:#010x} inner={:#010x} clist={:#010x} count={} esize={} ebase={:#010x} src_mode={:#x} sp={:#010x}",
-            n, this, inner, clist, count, esize, ebase, source_cpsr & 0x1F, sp,
+            "IdleProc #{:03} ENTER this={:#010x} inner={:#010x} clist={:#010x} (PA={:#010x}) count={} esize={} ebase={:#010x} src_mode={:#x} sp={:#010x}",
+            n, this, inner, clist, clist_pa, count, esize, ebase, source_cpsr & 0x1F, sp,
         );
 
         // Always dump the first 4 entries as 32-bit words — CList::At

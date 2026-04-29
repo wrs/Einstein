@@ -1329,6 +1329,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::WC_POSTLDRB_PROBE_HVC_IMM => {
             handle_wc_postldrb_probe(ctx);
         }
+        v if v == crate::rom_patches::WC_BNE_PROBE_HVC_IMM => {
+            handle_wc_bne_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1910,6 +1913,11 @@ fn handle_und(ctx: &mut TrapContext) {
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::WC_POSTLDRB_PROBE_HVC_IMM) => {
             handle_wc_postldrb_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::WC_BNE_PROBE_HVC_IMM) => {
+            let target = handle_wc_bne_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, target as u64, spsr_und);
             return;
         }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::DAH_USR_RETURN_PROBE_HVC_IMM) => {
@@ -4430,9 +4438,57 @@ fn handle_wc_postldrb_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
         );
     }
 
-    // Emulate `teq r1, sl` (XOR-based flags, C/V unchanged).
+    // Emulate `teq r1, sl` (XOR-based flags, C/V unchanged). Iter-27
+    // discovered this write doesn't reach banked SPSR_und, but it's
+    // kept as documentation; the WC-bne probe (next handler) doesn't
+    // depend on it — it computes Z directly from r1 and sl.
     let updated = compute_teq_z_n(source_cpsr, r1 ^ sl);
     let _ = guest_mem::write_word_pa(UND_SAVE_SPSR_IPA, updated);
+}
+
+fn handle_wc_bne_probe(ctx: &mut TrapContext) -> u32 {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_wc_bne_probe_with(ctx, probe_source_cpsr(spsr_el2))
+}
+
+/// `WriteChunk` BNE probe — `bne 0x2570c0` at ROM `0x00257088`.
+/// Logs r0 right at the conditional branch, between WC-postldrb
+/// (0x257084) and WC-add (0x25708c). Emulates the BNE control-flow
+/// decision directly via ELR_EL2 to sidestep the QEMU raspi3b MSR
+/// SPSR quirk discovered in iter-28.
+///
+/// Z = (r1 == sl), computed from `ctx.x[1]` and `ctx.x[10]`. The TEQ
+/// at 0x257084 is read-only (writes flags only, no GPR), so r1 at
+/// the BNE still holds the LDRB result from 0x257080. Returns the
+/// PC the guest should resume at: target if Z=0 (BNE taken), or
+/// fall-through if Z=1 (BNE not taken).
+fn handle_wc_bne_probe_with(ctx: &mut TrapContext, source_cpsr: u32) -> u32 {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let r0 = ctx.x[0] as u32;
+    let r1 = ctx.x[1] as u32;
+    let sl = ctx.x[10] as u32;
+    let mode = source_cpsr & 0x1F;
+
+    let z = r1 == sl;
+    let taken = !z;
+    let target = if taken {
+        crate::rom_patches::WC_BNE_TAKEN_TARGET
+    } else {
+        crate::rom_patches::WC_BNE_FALLTHROUGH_TARGET
+    };
+
+    if seq < 32 {
+        kprintln!(
+            "WC-bne #{}: r0={:#x} r1={:#x} sl={:#x} Z={} → {} (target={:#010x}) src_mode={:#x}",
+            seq, r0, r1, sl, z as u32,
+            if taken { "TAKEN" } else { "fall-thru" },
+            target, mode,
+        );
+    }
+
+    target
 }
 
 fn handle_wc_store_probe(ctx: &mut TrapContext) {

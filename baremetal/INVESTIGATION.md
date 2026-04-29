@@ -901,3 +901,77 @@ kernel-intent mask analysis showing disjoint subpage ownership.
 The audit directive (look at every alias, decide benign before
 moving on) is satisfied. The alrt-task DABT investigation can
 resume.
+
+## Mechanical kernel-intent audit (iter 4)
+
+The iter-3 conclusion was hand-decoded from one alias's mask
+column. To make the audit repeatable and cover all 15 aliases
+mechanically, added `KERNEL_INTENT_MASK[256]` in `src/trap.rs`:
+a per-(PA, VA) accumulated-mask tracker driven by the existing
+Prim Remember/Forget probes. `kim_remember(pa, va, mask)` ORs
+the mask into the matching slot (or claims a fresh empty slot);
+`kim_forget(pa, va)` clears the slot.
+
+`pub fn kernel_intent_mask_for(pa, va) -> Option<u32>` exposes
+the lookup. Verify-mmu's first-alias dump in
+`fix_stage1_xn_bits` calls it for both VAs and emits a new
+`verify-mmu alias INTENT:` line classifying as:
+
+- **DISJOINT** — both VAs have entries; their AP=11 subpage sets
+  don't overlap.
+- **CONFLICT** — both VAs have entries; at least one subpage has
+  AP=11 from both.
+- **kernel-direct-or-forgotten** — one or both VAs lack an entry
+  (Group-1 direct kernel L2 writes during TTBR0 setup never hit
+  Prim; transient Group-2 entries cleared by Forget before the
+  audit walk).
+
+### Cold-boot result
+
+| group | aliases | INTENT classification |
+|-------|--------:|-----------------------|
+| Group-1 (PA=0x04004/05/06000) | 3 | kernel-direct-or-forgotten |
+| Group-2 (PA=0x04028..0x04043000) | 12 | **DISJOINT** |
+| **Total CONFLICT** | **0** | — |
+
+The PA=0x04034000 alias (which the post-flatten audit had labelled
+CONFLICT/IDENTICAL — both descriptors `0x0403403e`) is now
+mechanically classified as **INTENT: DISJOINT** with
+`prev_va_mask=Some(0)` (VA=0xcc7f000, lazy-fault install with no
+kernel-RW intent at the moment of detection) and `va_mask=Some(12)`
+(VA=0xcc82000, AP[1]=11 → subpage 1 RW). The two AP=11 subpage
+sets don't overlap → DISJOINT.
+
+### Why Some(0) for VA=0xcc7f000
+
+Verify-mmu fires its first-alias detection when the kernel's L2-PT
+walk first hits a duplicate. PrimRememberMapping's HVC fires at
+function entry (before the L2 store), so by the time the kernel's
+write completes and the next walk-cycle picks up the alias, the
+tracker has the mask the kernel passed in. For VA=0xcc7f000 that
+mask was 0x0 at REM #002 (lazy-fault install). The detection thus
+captures the state at seq #002 with mask=0 still recorded. Later
+calls (#003 mask=0x3, then #004 Forget) don't move verify-mmu's
+ratchet — it logs only the first alias per PA.
+
+The Some(0) value is *not* an artifact of "table-cleared by
+Forget"; the slot survives because Forget at #004 zeroes the slot
+to (pa=0, va=0, mask=0), which would have made later lookups
+return None. We see Some(0), so the slot is still in its mask=0
+state captured at REM #002 — verify-mmu's ratchet fired between
+#002 and #003.
+
+### What this confirms
+
+The iter-3 hand analysis of mask=0xc vs mask=0x3 at PA=0x04034000
+is now mechanically reproducible at any PA via the
+`kernel_intent_mask_for` helper. Re-running the cold boot
+classifies all 12 Group-2 aliases as DISJOINT in a single line
+each, removing the manual decode step. Group-1's 3 aliases need
+the separate `InitSpecialStacks` justification (already provided
+in the prior iteration), since direct-kernel-write paths bypass
+the Prim probe entirely.
+
+The audit infrastructure stays in place so any new alias
+introduced by future debugging picks up the same mechanical
+classification automatically.

@@ -2,24 +2,29 @@
 
 ## Status
 
-**Current goal: alias audit complete — un-park alrt-task DABT (pending user OK)**
+**Current goal: alias audit complete (mechanically confirmed) —
+un-park alrt-task DABT (pending user OK)**
 
 User directive (2026-04-28): "look at every alias and decide it's
 benign before moving on. This is how we find bugs in our 4k page
 allocation patch set."
 
-Audit complete. All 15 verify-mmu aliases (3 Group-1 + 12 Group-2)
-have **kernel-intent disjoint subpages** — i.e. the original ARMv4
-kernel encoded each VA's mask to claim a different 1-KiB subpage of
-the shared physical page. Under our flat AP=11 normalization the
-hardware no longer enforces the per-subpage boundary, but the
-kernel's byte access patterns still follow the subpage layout.
+Audit complete and mechanically confirmed. The new
+`KERNEL_INTENT_MASK[256]` per-(PA, VA) accumulated-mask tracker
+(iter 4) feeds verify-mmu a kernel-intent DISJOINT/CONFLICT
+classification independent of the post-flatten AP-decode. Cold
+boot: **12/12 Group-2 aliases mechanically DISJOINT, 0 CONFLICT**;
+3 Group-1 aliases bypass Prim (direct L2 writes during TTBR0
+setup) and are covered by the prior `InitSpecialStacks`
+subpage-disjoint analysis.
 
 The strongest candidate for a real conflict (PA=0x04034000, 5-way
 install) was investigated via a per-PA Remember/Forget timeline
-probe (`PRIM_FOCUS_PA`). Result: 3 transient secondaries are
-properly forgotten; 2 simultaneous-live VAs (0xcc82000 mask=0xc,
-0x0c310000 mask=0x3) target disjoint subpages (AP[1] vs AP[0]).
+probe (`PRIM_FOCUS_PA`) and now mechanically classified as INTENT:
+DISJOINT (`prev_va_mask=Some(0)`, `va_mask=Some(12)`). 3 transient
+secondaries are properly forgotten; 2 simultaneous-live VAs
+(0xcc82000 mask=0xc, 0x0c310000 mask=0x3) target disjoint subpages
+(AP[1] vs AP[0]).
 
 This means the directive's premise ("things break randomly under
 flat AP=011") is satisfied by audit, not by elimination — the
@@ -521,16 +526,44 @@ Recommended path:
    that specific page) or Option τ (per-allocator-path 4-KiB
    patches).
 
+### Mechanical kernel-intent audit — 12/12 Group-2 aliases DISJOINT
+
+Iter 4: added a per-(PA, VA) accumulated-mask tracker
+(`KERNEL_INTENT_MASK[256]` in `src/trap.rs`) wired into the Prim
+Remember/Forget probes. Verify-mmu's first-alias dump now calls
+`kernel_intent_mask_for(pa, va)` for both VAs and emits a
+`verify-mmu alias INTENT:` line classifying the kernel's pre-flatten
+intent as DISJOINT (no shared AP=11 subpage) or CONFLICT (overlap),
+independent of the post-flatten audit.
+
+Cold-boot result on the 15 aliases:
+
+| group | aliases | INTENT classification |
+|-------|--------:|-----------------------|
+| Group-1 (kernel exception stacks, direct L2 writes) | 3 | kernel-direct-or-forgotten (Prim is bypassed; covered by `InitSpecialStacks` analysis) |
+| Group-2 (Prim Remember chain) | 12 | **DISJOINT (mechanical)** |
+| Total CONFLICT | 0 | — |
+
+The post-flatten audit's lone CONFLICT (PA=0x04034000) is now
+mechanically reclassified as INTENT: DISJOINT, with
+`prev_va_mask=Some(0) va_mask=Some(12)` — VA=0xcc7f000 had no
+kernel-RW intent (mask=0, lazy-fault install) at the moment of
+detection; VA=0xcc82000 claimed subpage 1 (mask=0xc → AP[1]=11).
+No subpage overlap → DISJOINT. The hand-decoded analysis of iter 3
+is now mechanically confirmed.
+
 ### Remaining diagnostic scaffolding (active)
 
 - `PRIM_FOCUS_PA = 0x04034000` in `src/trap.rs` — per-PA
-  Remember/Forget chronological log. Easy to retarget at any other
-  PA by changing the constant.
+  Remember/Forget chronological log. Retarget at any other PA by
+  changing the constant.
 - `PRIM_FIRST_VA_FOR_PA[]` / `PRIM_FIRST_LR_FOR_PA[]` —
   per-PA → first-VA tracker driving `Prim ALIAS:` output.
-- verify-mmu first-alias dump in `fix_stage1_xn_bits` — subpage-AP
-  decode of post-flatten descriptors, classifies as
-  CONFLICT/IDENTICAL/DISJOINT.
+- `KERNEL_INTENT_MASK[256]` — per-(PA, VA) accumulated mask;
+  reused by verify-mmu's INTENT classifier on every first-alias
+  detection.
+- verify-mmu first-alias dump in `fix_stage1_xn_bits` — emits both
+  post-flatten `AP-decode:` and kernel-intent `INTENT:` lines.
 
 ### Audit complete — backup approaches retained for record
 

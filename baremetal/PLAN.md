@@ -14,19 +14,20 @@ shadow-on-write redirects, and per-task subpage-AP shims are all
 ruled out. The fix MUST be a kernel patch that makes the kernel
 work without 1k subpage protections.
 
-**Current goal: heap and stack share the SAME physical pool.
-Iter 22 re-enabled per-call `TUDomainManager::Get` logging.
-Every observed Get call (≥100 calls in the wedge boot) comes
-through `AllocNewPage__13TStackManager` at ROM `0x001F8788`
-(caller_lr=`0x001f87c0`, post-bl `Init__10TStackPage`). count=2
-per call (= 8 KiB chunks for stack pages). The heap allocator's
-later mapping of PA `0x04084000` at VA `0x0c646000` overlays a
-PHYSICAL page already claimed by a stack — the kernel uses ONE
-physical pool for both stacks and heaps and intentionally shares
-boundary pages via subpage-AP. Iter-23 must trace the heap-extend
-side of the chain (FMLockHeapRange → ResolveFault → AddPgPAndPerm)
-to find where the kernel decides to reuse a stack-pool page for
-the heap's last page, and patch that decision.**
+**Current goal: GetMatchingPage stub committed but wedge persists
+with same `count=0x20000111`. Iter-23 installed the
+`GetMatchingPage = always-return-0` stub at ROM `0x001F86B4`
+(documented as commentary since iter 10 but never landed). The
+stub forces every `FindOrAllocPage_ReturnUnLockedOnNoPage` call
+into the cache-miss branch → fresh PA from `AllocNewPage`. Cold
+boot result: ALL Group-2 PA aliases are gone (0 left in
+verify-mmu output, down from 12). The compressor's count VA
+`0x0c646ca8` now backs PA `0x04096ca8` (was `0x04084ca8` —
+shared with stack). But WriteRun still enters with
+`count=0x20000111` and the wedge fires at FAR=`0x0c647003`. The
+corruption is therefore NOT a stage-1 PA alias. Iter-24 must
+instrument the str at `0x00257090` and ldr at `0x0025709c` to
+identify the actual count-writer.**
 
 ### IdleProc probe — corruption pattern identified
 
@@ -239,6 +240,97 @@ TAlertEventHandler region.
   allocator's freelist threading code (the ROM PCs we see are
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
+
+### Iteration 23 (next-loop iter 19): GetMatchingPage stub — eliminates Group-2 aliases but wedge persists
+
+The iter-22 trace showed that `Get` is exclusively called by
+`AllocNewPage` (stack pool). The heap-side path
+`ExtendVMHeap → LockHeapRange → ResolveFault → FindOrAllocPage`
+calls `GetMatchingPage` first to find an EXISTING TStackPage
+that matches the requested address. If found, that page's PA
+is reused at the heap VA — creating the alias. Only on a
+cache miss does FindOrAllocPage fall through to AllocNewPage.
+
+The GetMatchingPage stub was documented as commentary in
+`rom_patches.rs` lines 236-270 but never committed to
+`PATCHES_717006`. Iter 23 commits it.
+
+Stub layout (replaces prologue at `0x001F_86B4`):
+- `0x001F_86B4: mov r0, #0`  (was `mov ip, sp` = `0xE1A0_C00D`)
+- `0x001F_86B8: bx lr`        (was `push {r4..pc}` = `0xE92D_DFF0`)
+
+Cold-boot result with stub installed:
+
+```
+rom_patch: 0x001f86b4: 0xe1a0c00d -> 0xe3a00000  (GetMatchingPage: mov r0, #0)
+rom_patch: 0x001f86b8: 0xe92ddff0 -> 0xe12fff1e  (GetMatchingPage: bx lr)
+verify-mmu alias: PA=0x04004000 ...  (Group-1, 3 of 3, ROM-baked)
+verify-mmu alias: PA=0x04005000 ...
+verify-mmu alias: PA=0x04006000 ...
+(NO Group-2 aliases — 0 of 12)
+
+stage1 walk VA=0x0c646ca8: ...
+  WriteChunk count_pa=0x04096ca8 → tracker[first_va_for_pa]=0x0c646000
+
+WriteChunk #0 ENTER: count=0x0
+WC-load #0: count=0x0 r5=9 r7=0
+WC-load #1: count=0x1 r5=9 r7=1
+WriteRun #0 ENTER: count=0x20000111(536871185)
+*** Reboot canary fired ***
+```
+
+The compressor's PA changed from `0x04084ca8` (aliased) to
+`0x04096ca8` (unique). All Prim/verify-mmu Group-2 aliases are
+GONE. The kernel's per-page allocation now gives every consumer
+a private 4-KiB physical page.
+
+But the count-corruption WEDGE PERSISTS. count flips from `1`
+(at WC-load #1) to `0x20000111` (at WriteRun entry) inside the
+4-instruction window between str (`0x257090`) and ldr
+(`0x25709c`). Same pattern as iter 20.
+
+#### What this rules out
+
+- Stage-1 PA alias as the corruption source. The compressor's PA
+  is uniquely owned. No other VA shares it.
+- Reuse of stack-pool pages for heap. With GetMatchingPage
+  stubbed, every consumer gets a private page.
+
+#### What it leaves on the table
+
+- The **str at `0x257090`** itself may be writing the wrong value.
+  Need to probe r1 at the moment of store.
+- The **ldr at `0x25709c`** may be reading from somewhere else
+  due to register/load issues.
+- An **interrupt during the 4-insn window** that saves CPSR
+  somewhere, where the kernel exception entry happens to land on
+  PA `0x04096ca8` via a path I haven't traced.
+- The **WC-load probe handler** itself might be doing something
+  wrong (incorrect emulation of `ldr r0, [r4, #156]`). My
+  emulation reads the count via `guest_mem::read_word_va` and
+  sets `ctx.x[0] = count as u64`. Possibly the cast or the
+  memory read is buggy in a way that the second-iteration count
+  is wrong.
+
+#### Next iteration plan
+
+1. **Probe str at `0x257090`** — patch with HVC, log
+   `(this, r1, count_in_memory_before, count_in_memory_after)`.
+   Confirms whether the str writes the expected value (2) or
+   something else.
+2. **Probe ldr at `0x25709c`** — patch with HVC, emulate the
+   load, log the value read. Confirms what ldr sees.
+3. **Disable/remove the WC-load probe** for one run as a
+   sanity check — does the wedge still happen without it?
+   Rules out probe-induced corruption.
+
+#### Status
+
+- 36/36 guest tests pass.
+- Iter-23 deliverable: `GetMatchingPage = always-return-0`
+  stub committed in PATCHES_717006. Eliminates Group-2 PA
+  aliases. Wedge persists, so Group-2 aliasing was NOT the
+  cause; the actual cause is in WriteChunk's body somehow.
 
 ### Iteration 22 (next-loop iter 18): re-enable Get logging — every Get is a stack-pool allocation; heap-extend reuses stack pages
 

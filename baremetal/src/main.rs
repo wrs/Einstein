@@ -5,6 +5,7 @@
 #[cfg(not(test))]
 use core::arch::global_asm;
 
+mod alrt_capture;
 mod banked;
 mod cpu;
 mod fb_dump;
@@ -85,6 +86,12 @@ pub extern "C" fn kmain() -> ! {
         // Must run before the guest gets ERET'd in so we catch TTBR0
         // setup writes from the very first guest instruction.
         g1_capture::arm();
+        // alrt-task CList header capture: same idea but on the page
+        // backing VA=0x0cca3000 (PA=0x0402e000 per prior alias-table).
+        // Boot-time arm so we catch every write — the dynamic
+        // (Prim Remember-driven) arm in the previous probe iteration
+        // fired too late and missed the corrupting writer.
+        alrt_capture::arm_at_boot();
     }
 
     // Pre-patch every ROM site the classify-rom bitmap marked as an

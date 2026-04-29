@@ -1086,6 +1086,95 @@ within that stack range (`0x0cca3738` < `0x0cca37a8` <
 `0x0cca37c4` < ~0x0cca4000). So the TAlertEventHandler **is on
 the alrt task's stack**.
 
+## alrt CList capture probe (iter 2) — boot-time arm catches faults but auto-flip masks the writer
+
+Added `src/alrt_capture.rs` (modeled on `src/g1_capture.rs`) and
+boot-time arm via `arm_at_boot()` invoked from `kmain` between
+`stage2::enable()` and the first guest ERET, with
+`KNOWN_TARGET_PA = 0x0402e000` per the prior alias-table. Hooks:
+
+- `handle_data_abort` calls `alrt_capture::note_perm_fault` after
+  the existing `g1_capture` and `heap_watch` checks.
+- `trap_irq` calls `alrt_capture::maybe_rearm` after `g1_capture`'s.
+- `handle_prim_remember_probe_with` calls
+  `alrt_capture::maybe_arm_for_va` as a re-confirmation that the
+  kernel actually maps TARGET_VA → KNOWN_TARGET_PA (logs a
+  WARNING if it doesn't).
+- `handle_reboot` calls `alrt_capture::dump_counters` so the
+  Reboot canary tells us how many traps fired and whether any
+  hit the CList window.
+
+### Cold-boot result
+
+```
+alrt-capture: BOOT armed RO+XN on PA=0x0402e000
+                L3 before=0x4000000182e7ff after=0x4000000182e77f
+                (only bit 7 cleared = AP RW→RO; XN bit was already set)
+
+alrt-capture: RAM at PA=0x0402e000+0x7c0..0x800 at boot:  ALL ZERO
+
+[ ... boot proceeds, trapping 10 RW faults on this page, all at
+  offsets outside 0x7c0..0x800 ... ]
+
+IdleProc #000 ENTER this=0x0cca37a8 inner=0x0cca3738
+  clist=0x0cca37c4 (PA=0x0402e7c4) count=32 esize=1
+  ebase=0x003121fc
+
+alrt-capture summary: armed_pa=0x0402e000 traps=10
+                       out_of_window=10 budget_remaining=4096
+```
+
+Three confirmed facts:
+1. Initial RAM at the CList window is all-zero.
+2. The PA at IdleProc time matches our armed PA (0x0402e000).
+3. Stage-2 traps fire (10×), but every captured offset is OUTSIDE
+   0x7c0..0x800. Yet at IdleProc the CList header is corrupted.
+
+### Diagnosis: auto-flip-to-RW mask
+
+The data-abort handler at `src/trap.rs:495` runs the auto-flip
+unconditionally on RAM permission faults: it logs the writer
+through `note_perm_fault`, flips the L3 entry to RW (so the
+in-flight store completes natively), and returns without
+advancing ELR. The `maybe_rearm` hook restores RO+XN at the
+next IRQ entry (~16 ms cadence per the existing `g1_capture`
+comment).
+
+Sync-trap rearm was tried in `g1_capture` and caused infinite
+STM retry loops (multi-register stores spanning page boundaries
+re-fault each retry). So between consecutive IRQ rearms, the
+page is transiently RW after the first fault — every subsequent
+write to the page in that window passes through unobserved.
+
+Our 10 captures are the first faults of 10 IRQ windows, all
+hitting offsets that the kernel writes early in each window
+(0x6e4, 0x8f8, 0x628). The corruption at offset 0x7c4 happens
+later in the same windows, when the page is RW.
+
+This explains why dynamic-arm (iter 1, 9 captures) and boot-arm
+(iter 2, 10 captures) yielded similar non-CList-window results:
+both are limited by the same auto-flip pattern.
+
+### Next iteration: instruction-level emulation OR per-IRQ snapshot
+
+Two architectures to escape the limit:
+
+**A. Instruction-level emulation.** On trap, decode the AArch32
+store at ELR_EL2 (reuse `src/unaligned.rs` decode helpers),
+apply the write via `guest_mem::write_word_pa` (or byte/half
+variants), advance ELR past the instruction, and leave the page
+RO. STM has to step register-by-register so each member-write
+gets logged individually. Captures every write with exact PC.
+
+**B. Per-IRQ byte snapshot.** Read `0x0402e7c0..0x0402e7e0` at
+each `maybe_rearm` call; log when the bytes change vs prior
+snapshot. Catches the corruption within ~16 ms but doesn't pin
+the exact PC; useful as a triage tool to narrow which boot
+phase the corruption falls in.
+
+A is the right architectural fix; B is cheaper to ship if we
+want to bisect the boot phase first.
+
 The corruption pattern (heap allocator APCS frame imprint) is
 consistent with: while the alrt task's USR-mode code held a
 TAlertEventHandler at that stack offset, a kernel-mode SVC call

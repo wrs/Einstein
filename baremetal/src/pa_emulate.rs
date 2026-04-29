@@ -67,6 +67,45 @@ fn log_if_in_window(elr: u32, va: u32, value: u32, mode: u32, label: &str) {
     if off < lo || off >= hi {
         return;
     }
+    note_pc(elr);
+
+    // Subpage-violation check: the kernel-intent mask for the VA
+    // making this write should grant AP for the subpage containing
+    // `off`. If it doesn't, the write is corrupting bytes that
+    // belong to another VA's task per ARMv4 subpage AP — exactly
+    // the bug the audit missed. Promote those to a "CORRUPTION"
+    // log line regardless of the per-PC suppression so they always
+    // surface.
+    let armed_pa = armed;
+    let va_page = va & !0xFFF;
+    let intended_mask = crate::trap::kernel_intent_mask_for(armed_pa, va_page);
+    let owns_subpage = match intended_mask {
+        Some(mask) => subpage_owned(mask, off),
+        None => true, // No intent recorded — don't flag.
+    };
+
+    if !owns_subpage {
+        let prev = CORRUPTION_LOG_BUDGET.fetch_sub(1, Ordering::Relaxed);
+        if prev > 0 {
+            kprintln!(
+                "pa-emul CORRUPTION: PC={:#010x} VA={:#010x} (page={:#010x} mask={:#x}) writes PA={:#010x}+{:#x} \
+value={:#010x} mode={:#x} [{}] — subpage AP[{}] not in kernel-intent mask, this is the cross-subpage write \
+ARMv4 subpage AP would have caught",
+                elr, va, va_page,
+                intended_mask.unwrap_or(0),
+                armed_pa, off, value, mode, label,
+                subpage_index(off),
+            );
+        } else {
+            CORRUPTION_LOG_BUDGET.store(0, Ordering::Relaxed);
+        }
+        // Always advance per-PC budget below so per-write logging
+        // continues for non-corruption writers.
+    }
+
+    if pc_suppressed(elr) {
+        return;
+    }
     let prev = WATCH_BUDGET.fetch_sub(1, Ordering::Relaxed);
     if prev == 0 {
         WATCH_BUDGET.store(0, Ordering::Relaxed);
@@ -79,6 +118,128 @@ fn log_if_in_window(elr: u32, va: u32, value: u32, mode: u32, label: &str) {
         );
     }
 }
+
+/// Return `true` iff bit `subpage_index(off)` of `mask` is set in
+/// any of its two AP-bit slots. The kernel encodes
+/// AP[N]=11 as `mask |= 0x3 << (N*2)`, so subpage N is "owned"
+/// iff `mask & (0x3 << (N*2)) != 0`.
+fn subpage_owned(mask: u32, off: u32) -> bool {
+    let sp = subpage_index(off);
+    (mask & (0x3 << (sp * 2))) != 0
+}
+
+fn subpage_index(off: u32) -> u32 {
+    (off & 0xFFF) >> 10
+}
+
+/// PCs that are part of cold-boot RAM-init fills (poison + zero) —
+/// these legitimately scribble the page before any task allocation.
+/// Suppress per-write logging for them (counters still increment).
+const PC_SUPPRESS: &[u32] = &[
+    0x00018ddc, // kernel zero-fill loop
+    0x00019a84, 0x00019ac0, 0x00019af0, // kernel poison-fill loops
+];
+
+fn pc_suppressed(pc: u32) -> bool {
+    PC_SUPPRESS.iter().any(|&p| p == pc)
+}
+
+/// PC-frequency table for end-of-boot summary. Fixed-size to fit
+/// no_std; spillover counts go into a sentinel bucket.
+const PC_TABLE_SLOTS: usize = 32;
+struct PcSlot {
+    pc: AtomicU32,
+    count: AtomicU32,
+}
+static PC_TABLE: [PcSlot; PC_TABLE_SLOTS] = {
+    const Z: PcSlot = PcSlot {
+        pc: AtomicU32::new(0),
+        count: AtomicU32::new(0),
+    };
+    [Z; PC_TABLE_SLOTS]
+};
+static PC_OVERFLOW: AtomicU32 = AtomicU32::new(0);
+
+fn note_pc(pc: u32) {
+    for slot in &PC_TABLE {
+        let cur = slot.pc.load(Ordering::Relaxed);
+        if cur == pc {
+            slot.count.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if cur == 0 {
+            // Try to claim the slot. Race window is small but real;
+            // use compare_exchange.
+            if slot.pc.compare_exchange(0, pc, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                slot.count.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            // Lost the race — re-scan from the start to either find
+            // our PC's claimed slot or another empty one.
+            return note_pc_scan_after_race(pc);
+        }
+    }
+    PC_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+}
+
+fn note_pc_scan_after_race(pc: u32) {
+    for slot in &PC_TABLE {
+        if slot.pc.load(Ordering::Relaxed) == pc {
+            slot.count.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+    PC_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Dump the PC frequency table, sorted by count descending. Called
+/// from the alrt_capture summary at the Reboot canary.
+pub fn dump_pc_table() {
+    // Snapshot first to a small local array (no heap, no alloc).
+    let mut snap: [(u32, u32); PC_TABLE_SLOTS] = [(0u32, 0u32); PC_TABLE_SLOTS];
+    let mut n = 0usize;
+    for slot in &PC_TABLE {
+        let pc = slot.pc.load(Ordering::Relaxed);
+        let count = slot.count.load(Ordering::Relaxed);
+        if pc != 0 {
+            snap[n] = (pc, count);
+            n += 1;
+        }
+    }
+    // Insertion-sort by count descending (n is small).
+    for i in 1..n {
+        let key = snap[i];
+        let mut j = i;
+        while j > 0 && snap[j - 1].1 < key.1 {
+            snap[j] = snap[j - 1];
+            j -= 1;
+        }
+        snap[j] = key;
+    }
+    kprintln!("pa-emul writer-PC frequency (top hits in watch window):");
+    for &(pc, count) in &snap[..n] {
+        let label = pc_label(pc);
+        kprintln!("    PC={:#010x}  count={:6}  {}", pc, count, label);
+    }
+    let overflow = PC_OVERFLOW.load(Ordering::Relaxed);
+    if overflow != 0 {
+        kprintln!("    (table overflow: {} writes from {} additional PCs)",
+            overflow, "untracked");
+    }
+}
+
+fn pc_label(pc: u32) -> &'static str {
+    match pc {
+        0x00018ddc => "kernel zero-fill loop (boot-init)",
+        0x00019a84 | 0x00019ac0 | 0x00019af0 => "kernel poison-fill loop (boot-init)",
+        0x00310850 => "SetFreeChain prologue push",
+        0x003121b0 => "MoveFreeBlock prologue push",
+        0x003940b4 => "LowLevelCopyEngineLong memcpy",
+        _ => "?",
+    }
+}
+
+static CORRUPTION_LOG_BUDGET: AtomicU32 = AtomicU32::new(64);
 
 fn resolve_pa(va: u32) -> Option<u32> {
     let sctlr: u64;

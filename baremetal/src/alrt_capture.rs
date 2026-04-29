@@ -134,6 +134,7 @@ pub fn dump_counters() {
         crate::pa_emulate::UNRECOGNIZED.load(Ordering::Relaxed),
         crate::pa_emulate::SKIPPED.load(Ordering::Relaxed),
     );
+    crate::pa_emulate::dump_pc_table();
 }
 
 /// Per-page log budget. The page lives in the kernel's task-globals /

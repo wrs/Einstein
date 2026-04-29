@@ -222,6 +222,136 @@ TAlertEventHandler region.
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
 
+### Iteration 8 (next-loop iter 4): subpage-violation classifier and writer attribution
+
+Iter 7 pinned the corrupting writer to `SetFreeChain` at PC=0x00310850
+but didn't classify which writes are bugs (kernel-intent violation)
+vs. legitimate (kernel writing its own subpage). With the dense
+pa-emul output it was hard to tell at a glance which writes were the
+problem.
+
+This iteration adds two diagnostic layers in `src/pa_emulate.rs`:
+
+1. **Subpage-violation classifier** (`pa-emul CORRUPTION:` log).
+   For every emulated store landing in the watch window, look up
+   `kernel_intent_mask_for(pa, va_page)` and check whether the
+   accumulated mask grants AP for the subpage containing the offset.
+   If not, emit a CORRUPTION line — this is the cross-subpage write
+   ARMv4 subpage AP would have caught.
+
+2. **Writer-PC frequency table** dumped from the Reboot canary.
+   32-slot table aggregating every emulated write hitting the watch
+   window, with human-readable labels for the known PCs.
+
+### Cold-boot result — every corrupting writer comes from VA=0x0c320000
+
+```
+pa-emul writer-PC frequency (top hits in watch window):
+    PC=0x003121b0  count=    38  MoveFreeBlock prologue push
+    PC=0x00310850  count=    35  SetFreeChain prologue push
+    PC=0x00019a84  count=    16  kernel poison-fill loop (boot-init)
+    PC=0x00019ac0  count=    16  kernel poison-fill loop (boot-init)
+    PC=0x00019af0  count=    16  kernel poison-fill loop (boot-init)
+    PC=0x00018ddc  count=    16  kernel zero-fill loop (boot-init)
+    PC=0x003940b4  count=    16  LowLevelCopyEngineLong memcpy
+    PC=0x00030b84  count=     1  ?      ← TAlertManager::MainConstructor (legitimate)
+    PC=0x00259610  count=     1  ?
+    PC=0x00f10e28  count=     1  ?
+```
+
+The CORRUPTION lines fire ONLY for the two heap-allocator prologues:
+
+```
+pa-emul CORRUPTION: PC=0x003121b0 VA=0x0c3207f8 (page=0x0c320000 mask=0x30)
+  writes PA=0x0402e000+0x7f8 value=0x0c201010 mode=0x10 [STM-r4]
+  — subpage AP[1] not in kernel-intent mask
+pa-emul CORRUPTION: PC=0x00310850 VA=0x0c3207e0 (page=0x0c320000 mask=0x30)
+  writes PA=0x0402e000+0x7e0 value=0x00000020 mode=0x10 [STM-r5]
+  — subpage AP[1] not in kernel-intent mask
+```
+
+Both come from `VA=0x0c320000` (kernel-intent mask=`0x30` →
+AP[2]=11, owns subpage 2 only) writing into subpage 1 (offsets
+`0x400..0x7FF`) — alrt task's territory.
+
+### What the data tells us about scope and fix path
+
+- Only ONE VA (`0x0c320000`) hosts the corrupting writers. That's
+  one task's stack region; the other aliases are subpage-disjoint
+  in practice (no CORRUPTION lines for VA=`0x0c328000`,
+  `0xcc9b000`, etc., even though they share `PA=0x0402e000`).
+- Only TWO routines (`MoveFreeBlock`, `SetFreeChain`) generate
+  the cross-subpage writes. Both are heap-allocator internals
+  with multi-register prologues that drop sp from low addresses
+  in subpage 2 across the boundary into subpage 1.
+- `LowLevelCopyEngineLong` and `TAlertManager::MainConstructor`
+  hit the watch window too but only via VAs whose mask DOES
+  include AP[1] (alrt's `VA=0x0cca3000`, mask=`0xc`). Those are
+  legitimate writes by the page's intended owner.
+
+So the bug surface is narrow: when the task whose stack maps to
+`PA=0x0402e000` via `VA=0x0c320000` runs SetFreeChain or
+MoveFreeBlock with sp already low in its boundary page, the push
+crosses out of its subpage. Under ARMv4 hardware, the kernel
+would have caught the resulting permission fault and either grown
+the stack or panicked. Under our flat AP=11, the push silently
+overwrites alrt's CList header.
+
+### Fix path — recommend Option τ (kernel patch for non-shared boundary pages)
+
+Three options remain on the table:
+
+1. **Option β (PA splitting via L2-entry redirect)**: when the kernel
+   installs the second VA's L2 entry for an already-mapped PA,
+   rewrite the IPA to a hypervisor-allocated shadow page. Removes
+   the alias entirely. Cost: ~13 4-KiB shadow pages of RAM, plus
+   the L2-entry-rewrite hook. Architecturally clean; preserves the
+   kernel's existing layout and code.
+
+2. **Option τ (kernel ROM patch for 36-KiB stack stride)**: bump the
+   per-task stack region from 33 KiB to 36 KiB (9 unique 4-KiB
+   pages) so the boundary page is no longer shared. Requires
+   patching FMNewStack at ROM `0x001f8eac` — the slot stride is
+   encoded as `r1 = sl + sl<<5` (sl*33) and the size constant
+   `0x8400` (33 KiB) appears at multiple sites. The earlier
+   call-site +4 KiB pad failed because pool stride wasn't bumped
+   together; a coordinated patch should work.
+
+3. **Option α (per-task subpage-AP shim)**: emulate ARMv4 subpage
+   AP at stage-2 by splitting each aliased page into 4 stage-2
+   sub-mappings. Stage-2 has 4-KiB granularity natively, so this
+   would require trapping every access on aliased pages and
+   filtering by VA — much higher overhead.
+
+**Recommend Option β next.** β is more general (covers any future
+alias bug), is the smallest-surface change (one hook in the Prim
+Remember probe + a shadow-page allocator), and preserves the
+kernel ROM unmodified. Option τ would be elegant if it works, but
+the 36-KiB stride change has many call sites the earlier attempt
+exposed.
+
+### Implementation sketch for Option β (next iteration)
+
+1. Reserve a hypervisor RAM pool at IPA `0x07000000+` (16 4-KiB
+   pages — enough for all 12 Group-2 aliases plus headroom).
+2. Stage-2 maps the pool identity (host_addr_for already covers
+   it via the existing scratch pool / fb_dump area).
+3. In `handle_prim_remember_probe`, when the install would create
+   an alias (PA already in `PRIM_FIRST_VA_FOR_PA`), allocate the
+   next pool slot and pre-empt the kernel:
+   - Patch the L2-write site at PrimRememberMapping (the inner
+     `bl AddPgPAndPerm` at `0x163504` passes IPA in r2; rewrite
+     to shadow IPA).
+   - Or, simpler: hook AT the AddPgPAndPerm prologue and modify r2.
+   - Or, simplest: scan the kernel's L2 page table after Prim
+     return and rewrite the entry.
+4. Verify with a re-run that pa-emul CORRUPTION count drops to 0
+   and the IdleProc DABT no longer fires.
+
+This is the regression test: with PA splitting in place, the
+pa-emul output should show ZERO CORRUPTION lines and the boot
+should advance past the alrt-task DABT to the next stall.
+
 ### Iteration 7 (next-loop iter 3): pa-emulate catches the corrupting writer — SetFreeChain @0x00310850
 
 Implemented Option A from iter 6: `src/pa_emulate.rs` decodes and

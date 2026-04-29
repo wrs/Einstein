@@ -2649,22 +2649,50 @@ fn handle_resolve_fault_probe(ctx: &mut TrapContext) {
 /// `TStackManager::Fault(TProcessorState&)` prologue probe.
 ///
 /// On entry r0 = manager (`this`), r1 = TProcessorState ref. The FAR
-/// the abort path captured lives at `processor_state[+0x44]`. Logs the
-/// (caller, mode, manager*, proc-state*, FAR) tuple, then emulates the
-/// original `mov ip, sp`. Plan: docs/plans/l1-cd-lazy-investigation.md
-/// Step 5 prep — confirms whether the kernel's stack-fault dispatcher
-/// actually reaches `Fault` for both abort #1 (USR) and abort #2 (SVC).
+/// the abort path captured lives at `processor_state[+0x44]`. The
+/// faulting instruction's saved PC sits at `procst[+0x40]`. Logs the
+/// (caller, mode, manager*, proc-state*, saved_pc, FAR, status) tuple
+/// plus a procst hex window, then emulates the original `mov ip, sp`.
+///
+/// Plan iter-14 wedge: the heap-extend path takes a stage-1 fault at
+/// `FAR=0xc647003` (one byte past the freshly-extended heap top) that
+/// no ResolveFault iteration can resolve. Without the saved PC we
+/// cannot identify the kernel/user instruction performing the
+/// unaligned 4-byte write spanning the boundary. This dump pins it.
 fn handle_stack_mgr_fault_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
     let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
     let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
     let mode = source_cpsr & 0x1F;
     let manager = ctx.x[0] as u32;
     let proc_state = ctx.x[1] as u32;
+    let saved_pc = guest_mem::read_word_va(proc_state.wrapping_add(0x40)).unwrap_or(0xDEAD_BEEF);
     let far = guest_mem::read_word_va(proc_state.wrapping_add(0x44)).unwrap_or(0xDEAD_BEEF);
+    let status = guest_mem::read_word_va(proc_state.wrapping_add(0x5c)).unwrap_or(0xDEAD_BEEF);
+    let saved_sp = guest_mem::read_word_va(proc_state.wrapping_add(0x60)).unwrap_or(0xDEAD_BEEF);
     kprintln!(
-        "Fault(stackmgr) probe ENTER: this={:#010x} procst={:#010x} far={:#010x} caller_lr={:#010x} src_mode={:#x} ({}) sp={:#010x}",
-        manager, proc_state, far, lr, mode, describe_aarch32_mode(mode), sp
+        "Fault(stackmgr) probe ENTER: this={:#010x} procst={:#010x} pc={:#010x} far={:#010x} status={:#010x} saved_sp={:#010x} caller_lr={:#010x} src_mode={:#x} ({}) sp={:#010x}",
+        manager, proc_state, saved_pc, far, status, saved_sp, lr, mode, describe_aarch32_mode(mode), sp
     );
+    // Hex-dump procst[+0x40..+0x60] so future iterations can refine
+    // the offset map. 8 words = 32 bytes.
+    let mut words = [0u32; 8];
+    for i in 0..8 {
+        words[i] = guest_mem::read_word_va(proc_state.wrapping_add(0x40 + (i as u32) * 4))
+            .unwrap_or(0xDEAD_BEEF);
+    }
+    kprintln!(
+        "Fault(stackmgr) procst[+0x40..+0x60]: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+        words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]
+    );
+    // If the saved PC looks like a guest instruction, fetch and log it
+    // so we can identify the failing AArch32 store directly.
+    if saved_pc != 0xDEAD_BEEF && saved_pc != 0 && (saved_pc & 0x3) == 0 {
+        let insn = guest_mem::read_word_va(saved_pc).unwrap_or(0xDEAD_BEEF);
+        kprintln!(
+            "Fault(stackmgr) faulting insn: pc={:#010x} insn={:#010x}",
+            saved_pc, insn
+        );
+    }
     // Emulate `mov ip, sp`. ip = r12 (non-banked for non-FIQ source modes).
     ctx.x[12] = sp as u64;
 }
@@ -4622,6 +4650,40 @@ fn log_dabt_forward(dfsc: u32, far: u32, mode: u32, ctx: &TrapContext) {
             "  r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r12={:#010x}",
             ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32, ctx.x[12] as u32
         );
+        // If the faulting USR PC is in the SBA stub pool, decode slot
+        // 14's back-branch to recover the original ROM PC the stub
+        // emulates. Same trick as the dabt-trip handler above; lets us
+        // identify the kernel/user instruction that took the
+        // unresolvable fault even when it's a hot SBA-instrumented
+        // store.
+        if (crate::shadow_stub::SBA_STUB_POOL_IPA
+            ..crate::shadow_stub::SBA_STUB_POOL_END)
+            .contains(&faulting_pc)
+        {
+            let off = faulting_pc.wrapping_sub(crate::shadow_stub::SBA_STUB_POOL_IPA);
+            let slot_idx = off / crate::shadow_stub::SBA_STUB_BYTES;
+            let slot_base = crate::shadow_stub::SBA_STUB_POOL_IPA
+                + slot_idx * crate::shadow_stub::SBA_STUB_BYTES;
+            let back_branch_pa = slot_base.wrapping_add(14 * 4);
+            if let Some(insn) = guest_mem::read_word_pa(back_branch_pa) {
+                if (insn & 0x0F00_0000) == 0x0A00_0000 {
+                    let imm24 = insn & 0x00FF_FFFF;
+                    let signed = if imm24 & 0x0080_0000 != 0 {
+                        imm24 | 0xFF00_0000
+                    } else {
+                        imm24
+                    };
+                    let target = back_branch_pa
+                        .wrapping_add(8)
+                        .wrapping_add((signed as i32 as u32) << 2);
+                    let orig_pc = target.wrapping_sub(4);
+                    kprintln!(
+                        "  sba-stub: slot {} (base {:#010x}) emulates ROM PC {:#010x} (back-branch {:#010x} -> {:#010x})",
+                        slot_idx, slot_base, orig_pc, back_branch_pa, target,
+                    );
+                }
+            }
+        }
         // Dump the stage-1 walk for the FAR. Crucial for distinguishing
         // "L1 entry missing" (DFSC=5) from "L2 entry missing"
         // (DFSC=7) — both would otherwise look the same in a brief log.

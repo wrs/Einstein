@@ -1268,6 +1268,104 @@ range for the function's actual address). Look for any
 slot-size constant or page-counting logic that we might be
 desyncing with.
 
+## TProcessorState (DABT-time saved-context struct)
+
+Built by `DataAbortHandler` (ROM `0x00393114`) and `PrefetchAbort-
+Handler`. Total length is 100 bytes (`0x64`) — confirmed by
+`GetFaultState__FP15TProcessorState` at ROM `0x0011fe3c` calling
+`SMemCopyFromSharedSWI` with `r2 = 100`. Passed by reference into
+`TStackManager::Fault(TProcessorState&)` (ROM `0x001F83E4`) and the
+peer `TROMDomainManager1K::Fault` (ROM `0x001AEEDC`).
+
+### Confirmed fields (Phase B iter 15, hypervisor `Fault(stackmgr)` probe)
+
+```c
+struct TProcessorState {            // 100 bytes total (0x64)
+    // 0x00..0x3F: presumed user-banked register file (16 words).
+    //              Not yet observed at probe time — fault path saves
+    //              registers before invoking Fault, so the slots
+    //              are populated by the time the dispatcher runs.
+    //              (Open: confirm whether r15/PC is at +0x3C.)
+    u32         saved_cpsr;         // +0x40   pre-abort CPSR (NZCV..mode bits)
+    u32         far;                // +0x44   FAR_EL1 captured at abort
+    u32         dfsr;               // +0x48   DFSR (e.g. 0x47 = write,
+                                    //         status=0b00111 → page L2 fault)
+    u32         _4c;                // +0x4c   small constant (observed = 4)
+    u32         saved_sp_usr;       // +0x50   user-mode SP at fault time
+    u32         env_id;             // +0x54   gCurrentTaskEnv (e.g. 0x13a5)
+    u32         _58;                // +0x58   task-id-ish (observed 0x30f3 / 0x1843)
+    u32         status;             // +0x5c   abort-source flags;
+                                    //         bit 25 (0x2000000) tested by
+                                    //         Fault @ 0x1F8420 to discriminate
+                                    //         instruction- vs data-abort
+};
+```
+
+Citations:
+- `Fault @ 0x1F8418`: `str r5, [r4, #0x40]` saves the procst pointer
+  in the manager (manager+0x40, NOT procst+0x40).
+- `Fault @ 0x1F841C`: `ldr r1, [r5, #0x5c]` reads procst→status.
+- `Fault @ 0x1F8438`: `ldr r1, [r0, #0x58]!` (then implicit
+  pre-update `[r0, #0x50]` via writeback chain).
+- `Fault @ 0x1F846C`: `ldr r1, [r0, #0x44]!` reads procst→FAR (this
+  is the canonical FAR access used downstream by `GetStackInfo`).
+
+### Probe output reference
+
+A live capture from `handle_stack_mgr_fault_probe_with` looks like:
+
+```
+Fault(stackmgr) probe ENTER: this=0x0c112cb8 procst=0x0c1133a4 \
+  pc=0x20000110 far=0x0c647003 status=0x02800000 \
+  saved_sp=0x0cc77700 caller_lr=0x00259230 src_mode=0x10 (USR) sp=0x0c1133a4
+Fault(stackmgr) procst[+0x40..+0x60]: 20000110 0c647003 00000047 \
+  00000004 0cc77700 000013a5 000030f3 02800000
+```
+
+`pc=0x20000110` here is the *saved CPSR*, not a PC — `0x20000110`
+decodes to N=0 Z=0 C=1 V=0, mode=0x10 (USR). To recover the actual
+faulting USR PC from EL2, use `lr_abt - 8` (or, when the fault came
+through the SBA stub pool, decode slot 14 of the containing stub for
+the original ROM PC; see `src/trap.rs::handle_data_abort` forwarding
+path).
+
+## TUnicodeCompressor (ROM `Sizeof` at `0x00256C74`)
+
+Total size **420 bytes** (`mov r0, #420` at `0x00256C74`). Used by
+the kernel's Unicode-string compression path (`WriteRun` at
+`0x00256EEC`, `WriteChunk` at `0x0025700C`, `Flush` at
+`0x0025719C`).
+
+```c
+struct TUnicodeCompressor {         // 420 bytes (0x1A4)
+    u32         _vtable;            // +0x00
+    // ...
+    u8          buffer_a[?];        // +0x18  byte-buffer accessed via r6=this+24
+    // ...
+    u32         count;              // +0x9c  loop bound (validated by WriteRun)
+    u8          flag_a0;            // +0xa0  byte (zeroed by Reset)
+    u8          buffer_b[?];        // +0xa1  byte-buffer accessed via this+0xa1+r5
+    // ...
+    u8          end_marker;         // +0x121 byte set/cleared by Reset
+};
+```
+
+Citations:
+- `Sizeof = 420` at `0x00256C74`.
+- `Reset` at `0x00256ED8` zeroes `+0x98 (4-byte)` and `+0xa0 (byte)`,
+  then `str r1, [r0, #156]!` zeroes `+0x9c` (count).
+- `WriteRun @ 0x00256F94..0x00256FFC` iterates the byte buffer at
+  `[this+0xa1+r5]` for `r5 = 0..count-1`.
+
+**Phase B iter 15 wedge.** A 420-byte instance was placed at
+`0xc646f60` near the heap top (`0xc647000`). The `+0xa1` buffer
+spans the page boundary; the `ldrb r0, [r0, #161]` at `0x00256FA8`
+on iteration r5=2 reads `0xc647003`, one byte past mapped memory →
+DFSC=7 page-translation fault → unresolvable in the
+`LockHeapRange/ResolveFault` retry loop because the heap was only
+extended by 4 KiB (`#76: base=0xc646000 limit=0xc647000`) instead
+of the 8 KiB required to cover the 420-byte object.
+
 ## See also
 
 - `INVESTIGATION.md` — live wedge debugging notes

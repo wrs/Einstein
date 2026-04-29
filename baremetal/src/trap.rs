@@ -492,13 +492,33 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
 
         // alrt-task CList header capture: same shape as g1, dynamically
         // armed when Prim Remember installs VA=0x0cca3000 (see
-        // `src/alrt_capture.rs`).
+        // `src/alrt_capture.rs`). Try instruction-level emulation
+        // first so the page can stay RO across consecutive writes;
+        // falls through to the auto-flip path on unrecognized
+        // instruction forms.
         if crate::alrt_capture::is_armed_pa(page) {
             let value = if isv != 0 { Some(ctx.x[srt] as u32) } else { None };
             let spsr_el2 = read_sysreg!("spsr_el2") as u32;
             crate::alrt_capture::note_perm_fault(
                 elr, ipa as u32, value, srt as u32, spsr_el2,
             );
+            let result = crate::pa_emulate::try_emulate_store(
+                ctx, elr, spsr_el2, ipa as u32,
+            );
+            crate::pa_emulate::note(result);
+            if matches!(
+                result,
+                crate::pa_emulate::EmulationResult::Emulated
+                    | crate::pa_emulate::EmulationResult::Skipped,
+            ) {
+                // ELR already advanced and the store applied. Leave
+                // the page RO so the next write also faults; we keep
+                // capturing every store until the corruption is
+                // pinned to a specific (PC, value) pair.
+                return;
+            }
+            // Fell through with Unrecognized — fall back to the
+            // auto-flip behavior below so boot can continue.
         }
 
         // Heap-watch carve-out: log writer info before the auto-flip,

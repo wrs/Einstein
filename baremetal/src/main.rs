@@ -16,6 +16,7 @@ mod guest_mem;
 mod heap_watch;
 mod mmio;
 mod mmu;
+mod pa_emulate;
 mod panic;
 mod peripherals;
 mod platform;

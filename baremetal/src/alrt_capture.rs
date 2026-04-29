@@ -128,6 +128,12 @@ pub fn dump_counters() {
         OUT_OF_WINDOW.load(Ordering::Relaxed),
         BUDGET.load(Ordering::Relaxed),
     );
+    kprintln!(
+        "pa-emul summary: emulated={} unrecognized={} skipped={}",
+        crate::pa_emulate::EMULATED.load(Ordering::Relaxed),
+        crate::pa_emulate::UNRECOGNIZED.load(Ordering::Relaxed),
+        crate::pa_emulate::SKIPPED.load(Ordering::Relaxed),
+    );
 }
 
 /// Per-page log budget. The page lives in the kernel's task-globals /
@@ -170,6 +176,16 @@ pub unsafe fn arm_at_boot() {
     kprintln!(
         "alrt-capture: BOOT armed RO+XN on PA={:#010x} L3 before={:#x} after={:#x}",
         KNOWN_TARGET_PA, before.unwrap_or(0), after.unwrap_or(0),
+    );
+    // Tell the pa_emulate side which window to log in-handler. With
+    // emulation in place, the page stays RO across consecutive writes,
+    // so we can log every store landing in the CList header range
+    // [0x7c0, 0x800).
+    crate::pa_emulate::arm_watch_window(
+        KNOWN_TARGET_PA,
+        CLIST_OFFSET_LO,
+        CLIST_OFFSET_HI,
+        4096,
     );
     // Dump initial RAM contents at the CList-header window AND
     // seed SNAPSHOT so the first per-IRQ diff fires on the first

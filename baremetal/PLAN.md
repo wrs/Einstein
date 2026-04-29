@@ -222,6 +222,128 @@ TAlertEventHandler region.
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
 
+### Iteration 7 (next-loop iter 3): pa-emulate catches the corrupting writer — SetFreeChain @0x00310850
+
+Implemented Option A from iter 6: `src/pa_emulate.rs` decodes and
+emulates AArch32 stores at the stage-2 RO trap, bypassing the
+auto-flip-to-RW pattern that limited prior probes to one capture
+per ~16 ms IRQ window. Coverage: STR/STRB/STRH (immediate, A1) +
+STM/STMDB/STMIB/STMDA (A1 with optional writeback). Unrecognized
+forms fall back to the prior auto-flip path so boot can continue.
+
+Wired into `handle_data_abort` for `alrt_capture::is_armed_pa`
+hits. With the page held RO continuously, the trap fires on
+**every** store to `PA=0x0402e000`. A separate watch window
+`[0x7c0, 0x800)` filters per-store kprintln so the log stays
+readable.
+
+### Cold-boot result — corruption traced to a single (PC, value)
+
+```
+alrt-capture summary: armed_pa=0x0402e000 traps=4825 out_of_window=4779 budget_remaining=4050
+pa-emul summary: emulated=4824 unrecognized=1 skipped=0
+```
+
+530× the visibility of the prior probe (9 traps → 4825). The
+in-window log captured the corruption directly:
+
+```
+pa-emul[STM-r5]: PC=0x00310850 VA=0x0c3207c4 PA=0x0402e000+0x7c4 value=0x00000020 mode=0x10
+pa-emul[STM-lr]: PC=0x00310850 VA=0x0c3207d4 PA=0x0402e000+0x7d4 value=0x003121fc mode=0x10
+pa-emul[STM-pc]: PC=0x00310850 VA=0x0c3207d8 PA=0x0402e000+0x7d8 value=0x00310858 mode=0x10
+```
+
+The values are an **exact match** for the corrupted CList header
+seen at IdleProc entry (count=`0x20`, ebase=`0x003121fc`,
++0x7d8=`0x00310858`).
+
+`PC=0x00310850` is the prologue of `SetFreeChain`:
+
+```
+0031084c <SetFreeChain>:
+  31084c:  e1a0c00d  mov   ip, sp
+  310850:  e92dd870  push  {r4, r5, r6, fp, ip, lr, pc}   ← THE CORRUPTING STM
+  310854:  e24cb004  sub   fp, ip, #4
+```
+
+The push lands at `VA=0x0c3207c4..0x0c3207f4`. That VA stage-1
+maps to **`PA=0x0402e7c4..0x0402e7f4`** — the same physical bytes
+the alrt task accesses through `VA=0x0cca37c4` for its CList
+header. `src_mode=0x10` (USR) means a user-mode task running
+ROM code; `sp_usr` near `0x0c3207f4` matches the `name` task
+(census shows `sp_usr=0xc3208d0`).
+
+### Why the prior alias audit was wrong
+
+The iter-3 audit concluded "no kernel-intent overlap on any of
+the 15 aliased PAs" and treated all aliases as **capability
+hazards** (not access-pattern hazards). Specifically:
+- `VA=0x0c320000` mask=`0x30` → AP[2]=11 → owns subpage 2
+  (offsets `0x800..0xBFF`).
+- `VA=0x0cca3000` mask=`0xc` → AP[1]=11 → owns subpage 1
+  (offsets `0x400..0x7FF`).
+
+Audit's claim: the kernel only writes its OWN subpage; the
+ARMv4-vs-ARMv7 difference is invisible because no actual byte
+collision occurs.
+
+But `SetFreeChain`'s prologue absolutely DOES drop sp into the
+adjacent subpage. With `sp` at `0x0c3207f4` (already in subpage 1
+of `VA=0x0c320000`'s page — below the `0x800` boundary), the
+`push {r4,r5,r6,fp,ip,lr,pc}` writes 28 bytes from `0x0c3207d8`
+to `0x0c3207f0`. **Every one of those 7 words is in subpage 1,
+which the kernel intent says belongs to `VA=0x0cca3000` (the
+alrt task), not to `VA=0x0c320000` (the name task).**
+
+Under ARMv4 hardware subpage AP, this push would have raised a
+permission fault on the first store. The original kernel must
+have had a fault handler that grew the stack or split it
+differently. Under our flat AP=11, the push silently succeeds
+and overwrites alrt's CList header.
+
+The audit's "no access-pattern hazard" conclusion is refuted by
+direct observation. **The capability hazard IS the bug** — the
+kernel's actual access pattern crosses subpage boundaries; ARMv4
+caught it; ARMv7 with our flat AP doesn't.
+
+### Next iteration — pick a fix layer
+
+The diagnosis is now solid. Three viable fixes:
+
+1. **Option β (PA splitting)**: clone `PA=0x0402e000` per-VA so
+   each task gets its own physical page. Eliminates the alias
+   entirely; SetFreeChain's push at `0x0c3207f4` no longer
+   touches alrt's bytes. Hypervisor-side; doesn't require kernel
+   patches. Stage-2 has 4-KiB granularity which matches the
+   problem; the cost is ~13 extra 4-KiB pages of RAM (one per
+   aliased PA) and shadow-on-write coherence for any
+   legitimately-shared bytes (none expected — the alias is
+   already in the audit's "kernel intends disjoint subpages"
+   class).
+
+2. **Option τ (stack-region ROM patch)**: re-attempt the 36-KiB
+   per-task stack patch from earlier iterations, this time with
+   the matching pool-stride bump so padded stacks fit. The
+   smoking gun (`SetFreeChain` is just a normal heap routine
+   running in any task's context) suggests the right fix is
+   stack regions that don't share boundary pages, period — not
+   special handling of one routine.
+
+3. **Per-task subpage-AP shim at stage-2**: split each aliased
+   page into 4 stage-2 sub-mappings, each granted RW only to the
+   VAs whose kernel-intent mask includes that subpage. Most
+   ARMv4-faithful but most complex; requires per-task IPA
+   contexts and stage-2 reconfiguration on context switch.
+
+Recommend **Option β** next. The code already separates "what
+PA backs each VA" from "what bytes live there"; PA-splitting
+is the smallest patch that demonstrably eliminates the bug
+class.
+
+Keep the pa-emulate scaffolding active across iterations — once
+β is in place the alrt page should see ZERO emulated stores
+landing in the watch window, which is the regression test.
+
 ### Iteration 6 (next-loop iter 2): __dl__/free tracking refutes the heap-overlap diagnosis
 
 Added `DL_PROBE_HVC_IMM=0x59` at ROM `0x00318F28` (`__dl__FPv`,

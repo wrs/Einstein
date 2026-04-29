@@ -14,28 +14,27 @@ shadow-on-write redirects, and per-task subpage-AP shims are all
 ruled out. The fix MUST be a kernel patch that makes the kernel
 work without 1k subpage protections.
 
-**Current goal: now in flux. Iter-29 added a BNE control-flow
-probe at ROM 0x00257088 (HVC #0x68) that emulates the bne via
-`ELR_EL2` directly — handler computes `Z = (r1 == sl)` from
-`ctx.x[1]` and `ctx.x[10]` and routes ELR to either 0x002570C0
-(taken) or 0x0025708C (fall-through). Sidesteps the QEMU MSR
-SPSR quirk. Cold-boot result is striking: **the entire
-WC-load → WC-postload → WC-postldrb → WC-bne → WC-add →
-WC-store chain shows r0=0 consistently.** Iter-25's
-"r0=0x20000110 at WC-add" corruption is GONE. Likely iter-25's
-r0 corruption was an artifact of broken probe-SPSR emulation
-sending the kernel through a different code path that happened
-to leak CPSR data into r0, NOT a real bug in the LDRB stub or
-an async IRQ. The new wedge (count stuck at 1) is the
-iter-27/28 SPSR bug surfacing differently: WC-postload's flag
-emulation still doesn't propagate, so bls at 0x25707c reads
-stale flags and takes when it shouldn't, skipping the
-WriteChunk increment path. Iter-30+ should focus on the SPSR
-plumbing — either find a working approach (a) variant
-(perhaps a different MSR encoding or via a non-banked
-intermediate) or expand the approach (b) pattern to cover the
-bls and other flag-dependent kernel branches affected by our
-patched cmp/teq.**
+**Current goal: validated by iter-30 — the 4-KiB-page phase-B
+hypothesis HOLDS for the heap allocator and stack allocator at
+the invariant level. After 30 iterations of microscope-mode
+fault chasing, iter-30 stepped back to test the actual
+hypothesis: with kernel patches that move all allocations to
+4 KiB granularity, do the heap blocks remain non-overlapping
+and do the stacks remain bounded by guard pages? The answer
+across an entire boot to the existing Reboot canary wedge:
+**yes**. No heap-overlap halt fired (1024-slot live allocation
+table, dl-probe-tracked frees, halt-on-first-overlap tripwire
+armed). No NewStack guard-page violation fired across all 24
+tasks created during boot (every stack at base ≥ 0xC306000
+with span 0x8000 was preceded by a 4-KiB unmapped guard page).
+No NewStack alignment violation fired. The remaining Reboot
+canary wedge is a different bug (most likely a kernel self-
+test fail downstream of the dissolved iter-25 r0 puzzle).
+Iter-31+ should pursue the remaining instrumentation gaps
+(ResolveFault RETURN probe with subpage_owner walk + cross-task
+stack scan, Prim Remember/Forget consistency tracking, page-
+grain alignment audit on ExtendVMHeap/AllocNewPage) and then
+investigate the kernel self-test that fires the canary.**
 
 ### IdleProc probe — corruption pattern identified
 
@@ -248,6 +247,126 @@ TAlertEventHandler region.
   allocator's freelist threading code (the ROM PCs we see are
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
+
+### Iteration 30 (next-loop iter 26): high-level heap/stack invariant pass — 4 KiB hypothesis HOLDS
+
+User course-correction: stop chasing individual r0 / count
+clobbers under a microscope; instead instrument the actual
+phase-B hypothesis directly. With kernel patches that move all
+allocations to 4 KiB granularity, do heap blocks remain
+non-overlapping and stacks remain bounded by guard pages? Test
+that at the assertion level: halt on first violation.
+
+#### What landed
+
+1. **`halt_invariant(label, local_dump)` helper** in `src/trap.rs`.
+   Uniform `*** invariant violation: ... ***` header, runs the
+   per-assertion local-context dump, then `task_dump::dump()`,
+   then `cpu::halt()`. Used by all new tripwires.
+
+2. **__nw__ heap-overlap halt** in `handle_nw_return_probe_with`.
+   Existing probe already maintained NW_TABLE (live allocations)
+   and detected overlaps but only logged. The dl-probe at
+   `0x00318F28` already keeps the table accurate (clears entries
+   on free). Iter-30 flips the existing log-on-overlap to
+   halt-on-overlap with classification (same-address →
+   "use-after-free or missed __dl__"; different-start partial
+   overlap → "4-KiB chunking violated").
+
+3. **NewStack guard-page + alignment invariants** in
+   `handle_new_stack_probe_with`:
+   - Halt if `out_base`, `out_top`, or `span` aren't 4-KiB-
+     aligned/multiple. Pre-flatten the kernel could return 1-KiB-
+     aligned ranges and rely on subpage AP overlay; post-flatten
+     it must operate at full-page granularity.
+   - Halt if `guest_mem::translate_va(out_base - 0x1000)` returns
+     `Some(_)`. Stacks grow down; the page below must be
+     fault-on-access so a stack overflow takes a clean DABT into
+     `TStackManager::Fault`.
+
+#### Cold-boot result — invariants HOLD
+
+```
+nw alloc #0..#31 (heap allocations, no overlap halt)
+NewStack POST-SWI: env=0x1355 base=0x0c306000 top=0x0c30e000 span=0x8000 ...
+NewStack POST-SWI: env=0x1355 base=0x0c30f000 top=0x0c317000 span=0x8000 ...
+NewStack POST-SWI: env=0x1355 base=0x0c318000 top=0x0c320000 span=0x8000 ...
+... [continues for 24 tasks total] ...
+*** Reboot canary fired *** (existing iter-23 wedge — different cause)
+```
+
+Every stack: base ≡ 0 mod 0x1000, top ≡ 0 mod 0x1000,
+span = 0x8000 (32 KiB), and the page at `base - 0x1000` is
+unmapped (guard page intact). Note the kernel allocates
+adjacent stacks 0x9000 apart (8 task pages + 1 guard page) —
+so it IS reserving a guard page per stack. The 4-KiB hypothesis
+holds at this level.
+
+For heap: 32+ allocations all distinct address ranges, no
+overlap halt fired, dl probe matched frees correctly.
+
+#### What this means
+
+The Phase B "stack/heap 4 KiB problem" — i.e. that losing 1 KiB
+subpage AP overlay would cause the kernel's heap and stack
+allocators to produce overlapping or guard-less ranges — is
+**not happening at the high-level invariants we just locked
+down**. Combined with iter-26/27/29's findings (LDRB stub
+doesn't clobber r0; iter-25's r0=0x20000110 was an
+instrumentation artifact of broken probe-SPSR emulation), the
+remaining Reboot canary wedge is a different bug.
+
+#### What this rules out / in
+
+- **RULED OUT:** Heap allocator handing out two distinct live
+  blocks that overlap.
+- **RULED OUT:** NewStack returning misaligned ranges or stacks
+  without guard pages.
+- **STILL UNCHECKED:** ResolveFault (lazy stack growth)
+  returning pages that alias another task's stack via PA
+  collision; Prim Remember/Forget pair consistency;
+  ExtendVMHeap / AllocNewPage page-grain alignment.
+
+#### Next iteration plan (iter-31)
+
+Close the remaining gaps from iter-30's plan file
+(`/Users/walter/.claude/plans/now-in-plan-mode-gentle-wigderson.md`):
+
+1. **ResolveFault RETURN probe.** Add HVC at the
+   post-RememberMappings return site inside
+   `TStackManager::ResolveFault` (the function entered at the
+   existing entry probe, ROM `0x001F7978`). Find the right
+   return site via rom.dis. Walk `TStackPage::subpage_owner[0..4]`
+   for the resolved page; halt if any owner ≠ faulting task's
+   manager and ≠ NULL. Cross-task scan: walk all `TTask`s in
+   `TScheduler` task list, pull their `TStackInfo*`, and assert
+   the resolved PA isn't in any other task's stack range. Halt
+   on collision with colliding task id + name + bounds.
+
+2. **Prim Remember/Forget consistency.** Extend
+   `handle_prim_remember_probe` / `handle_prim_forget_probe` to
+   maintain a live (PA, VA) set. Halt on Forget for an
+   unrecorded pair. Boot-completion audit (at SchedulerStart or
+   BootOS canary) dumps remaining live pairs.
+
+3. **Page-grain alignment audits** on ExtendVMHeap (needs new
+   return-side probe — entry-only currently) and AllocNewPage
+   (needs full new entry/return probe pair).
+
+After (1)-(3) close cleanly, investigate the remaining Reboot
+canary cause directly via `task_dump::dump()` output (24 tasks
+already at the canary, so the kernel reached SchedulerStart and
+the canary fires from a downstream self-test).
+
+#### Status
+
+- Build clean, 30/30 shadow_stub tests pass.
+- 24 tasks created with all stack invariants intact.
+- 32+ heap allocations with all overlap invariants intact.
+- Iter-30 deliverables: halt_invariant helper, __nw__ overlap
+  halt, NewStack guard-page + alignment halt, PLAN.md
+  high-level finding (4-KiB hypothesis holds for heap/stack
+  invariants).
 
 ### Iteration 29 (next-loop iter 25): BNE control-flow probe — r0 propagates cleanly; iter-25 "corruption" was an instrumentation artifact
 

@@ -2742,6 +2742,47 @@ fn handle_new_stack_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
         env, req_size, out_base, out_top, span, caller_lr, mode, describe_aarch32_mode(mode)
     );
     newstack_ring_push(caller_lr, env, req_size, out_base, out_top);
+
+    // Iter-30: page-grain alignment + guard-page invariants.
+    //
+    // 1. NewStack must return a 4-KiB-aligned base/top with
+    //    4-KiB-multiple span. Pre-flatten the kernel could return 1-KiB
+    //    aligned ranges and rely on subpage AP overlay; post-flatten it
+    //    must operate at full-page granularity.
+    // 2. The page directly below `out_base` must be unmapped (stage-1
+    //    fault-on-access) so a stack overflow takes a clean DABT into
+    //    the kernel's StackMgr fault handler instead of silently
+    //    corrupting whatever allocation lives in the next page.
+    //
+    // Skip the checks if the kernel reported an obviously-bogus alloc
+    // (req_size==0, out_base==0xDEADBEEF, etc.) — those are read-fail
+    // signals from our SP probe, not real allocator output.
+    if out_base != 0xDEAD_BEEF && out_base != 0 && out_top != 0xDEAD_BEEF {
+        if (out_base & 0xFFF) != 0 || (out_top & 0xFFF) != 0 || (span & 0xFFF) != 0 {
+            halt_invariant("NewStack returned non-4KiB-aligned range", || {
+                kprintln!(
+                    "  base={:#010x} top={:#010x} span={:#x} (need all aligned to 0x1000)",
+                    out_base, out_top, span,
+                );
+                kprintln!("  caller_lr={:#010x} env={:#x} req={:#x}", caller_lr, env, req_size);
+            });
+        }
+        let guard_va = out_base.wrapping_sub(0x1000);
+        if let Some(pa) = guest_mem::translate_va(guard_va) {
+            halt_invariant("NewStack guard page is mapped (overflow won't fault)", || {
+                kprintln!(
+                    "  task stack [base={:#010x}, top={:#010x}); guard would be at VA={:#010x}",
+                    out_base, out_top, guard_va,
+                );
+                kprintln!(
+                    "  but VA={:#010x} is mapped → PA={:#010x} (an overflow corrupts that page silently)",
+                    guard_va, pa,
+                );
+                kprintln!("  caller_lr={:#010x} env={:#x} req={:#x}", caller_lr, env, req_size);
+            });
+        }
+    }
+
     // Emulate `ldr r1, [sp, #16]`. r1 is non-banked across non-FIQ
     // modes; in the FIQ case the kernel never calls NewStack from a
     // FIQ handler so plain ctx.x[1] is correct.
@@ -3772,6 +3813,30 @@ fn handle_idleproc_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
 /// freed-and-reallocated blocks (same address re-issued later), but
 /// the user-suspected failure mode is exactly that two distinct live
 /// allocations overlap, so we'll surface that case clearly.
+/// Common halt path for invariant-violation tripwires (iter-30+
+/// instrumentation pass). Emits a uniform header, runs the per-
+/// assertion local-context dump, runs `task_dump::dump()` for
+/// scheduler/task state, then halts. Use for any check that should
+/// stop the boot at the first 4-KiB-hypothesis violation rather
+/// than chase the symptom downstream.
+#[inline(never)]
+fn halt_invariant(label: &str, local_dump: impl FnOnce()) -> ! {
+    let elr = read_sysreg!("elr_el2");
+    let spsr = read_sysreg!("spsr_el2") as u32;
+    kprintln!();
+    kprintln!("*** invariant violation: {} ***", label);
+    kprintln!(
+        "  ELR_EL2={:#x} SPSR_EL2={:#x} src_mode={:#x}",
+        elr, spsr, spsr & 0x1F,
+    );
+    local_dump();
+    kprintln!();
+    kprintln!("--- task_dump ---");
+    crate::task_dump::dump();
+    kprintln!("--- end task_dump ---");
+    cpu::halt();
+}
+
 const NW_TABLE_SLOTS: usize = 1024;
 struct NwEntry {
     addr: AtomicU32,
@@ -3906,31 +3971,42 @@ fn handle_nw_return_probe_with(ctx: &mut TrapContext, _source_cpsr: u32) {
     }
 
     if let Some(idx) = overlap_idx {
-        let budget = NW_OVERLAP_LOG_BUDGET.fetch_sub(1, Ordering::Relaxed);
-        if budget > 0 {
-            let e_addr = NW_TABLE[idx].addr.load(Ordering::Relaxed);
-            let e_size = NW_TABLE[idx].size.load(Ordering::Relaxed);
-            let e_lr   = NW_TABLE[idx].caller_lr.load(Ordering::Relaxed);
-            let e_seq  = NW_TABLE[idx].seq.load(Ordering::Relaxed);
+        let e_addr = NW_TABLE[idx].addr.load(Ordering::Relaxed);
+        let e_size = NW_TABLE[idx].size.load(Ordering::Relaxed);
+        let e_lr   = NW_TABLE[idx].caller_lr.load(Ordering::Relaxed);
+        let e_seq  = NW_TABLE[idx].seq.load(Ordering::Relaxed);
+        let e_hi = e_addr.saturating_add(e_size);
+        // Iter-30: halt on the first heap-overlap. The dl probe at
+        // 0x00318F28 keeps NW_TABLE accurate (cleared on free), so any
+        // overlap found against a live entry is unambiguously a real
+        // bug — either two distinct live allocations overlap (the
+        // 4-KiB allocator-chunking hypothesis is broken), or a same-
+        // address allocation arrived without a prior matching free
+        // (use-after-free pattern).
+        halt_invariant("nw heap overlap (live blocks)", || {
             let frees_m = NW_FREE_MATCHED.load(Ordering::Relaxed);
             let frees_u = NW_FREE_UNMATCHED.load(Ordering::Relaxed);
-            kprintln!();
-            kprintln!("*** nw OVERLAP DETECTED ***");
             kprintln!(
                 "  new alloc #{}: addr={:#010x} size={:#x} caller_lr={:#010x} (range [{:#010x}, {:#010x}))",
                 seq, addr, size, caller_lr, new_lo, new_hi,
             );
-            let e_hi = e_addr.saturating_add(e_size);
             kprintln!(
                 "  prior alloc #{}: addr={:#010x} size={:#x} caller_lr={:#010x} (range [{:#010x}, {:#010x}))",
                 e_seq, e_addr, e_size, e_lr, e_addr, e_hi,
             );
             kprintln!(
-                "  Both blocks LIVE per tracker (frees so far: matched={} unmatched={})",
+                "  classification: {}",
+                if new_lo == e_addr {
+                    "same-address (use-after-free or missed __dl__)"
+                } else {
+                    "partial overlap (4-KiB chunking violated)"
+                }
+            );
+            kprintln!(
+                "  frees so far: matched={} unmatched={}",
                 frees_m, frees_u,
             );
-            kprintln!();
-        }
+        });
     }
 
     // Record the new allocation. Slot allocation is monotonic; if we

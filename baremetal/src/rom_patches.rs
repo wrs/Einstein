@@ -798,6 +798,17 @@ pub const NEW_BLOCK_RETURN_PROBE_HVC_IMM: u32 = 0x5D;
 pub const NEW_BLOCK_RETURN_PROBE_PC:      u32 = 0x0031_1ED8;
 const NEW_BLOCK_RETURN_FIRST_INSN:        u32 = 0xE1A0_0006; // mov r0, r6
 
+/// `WriteRun__18TUnicodeCompressorFv` entry probe — patches the
+/// standard `mov ip, sp` prologue at ROM `0x00256EEC` with HVC.
+/// Handler logs `(this, this->count [+0x9c], this->byte_a0
+/// [+0xa0], this->w98 [+0x98], buffer_b first 4 bytes [+0xa1],
+/// caller_lr)`. Pinpoints whether `count` is corrupted at the
+/// moment WriteRun is invoked (iter 17 hypothesis: count > 870
+/// means uninitialized post-NewBlock).
+pub const WRITE_RUN_PROBE_HVC_IMM:        u32 = 0x5E;
+pub const WRITE_RUN_PROBE_PC:             u32 = 0x0025_6EEC;
+const WRITE_RUN_FIRST_INSN:               u32 = 0xE1A0_C00D; // mov ip, sp
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -1137,6 +1148,17 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(NEW_BLOCK_RETURN_PROBE_HVC_IMM),
             "NewBlock success-return",
             NEW_BLOCK_RETURN_PROBE_HVC_IMM,
+        );
+        // WriteRun entry probe — captures (this, count, buffer_b
+        // first 4 bytes, caller_lr) per call. Identifies which
+        // compressor instance is wedging WriteRun with count >871.
+        patch_probe(
+            rom_ptr,
+            WRITE_RUN_PROBE_PC,
+            WRITE_RUN_FIRST_INSN,
+            hvc_insn(WRITE_RUN_PROBE_HVC_IMM),
+            "WriteRun entry",
+            WRITE_RUN_PROBE_HVC_IMM,
         );
     }
 }

@@ -1299,6 +1299,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::NEW_BLOCK_RETURN_PROBE_HVC_IMM => {
             handle_new_block_return_probe(ctx);
         }
+        v if v == crate::rom_patches::WRITE_RUN_PROBE_HVC_IMM => {
+            handle_write_run_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1829,6 +1832,11 @@ fn handle_und(ctx: &mut TrapContext) {
         }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::NEW_BLOCK_RETURN_PROBE_HVC_IMM) => {
             handle_new_block_return_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::WRITE_RUN_PROBE_HVC_IMM) => {
+            handle_write_run_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -4076,6 +4084,52 @@ fn handle_new_block_return_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
     // pushed save area; setting ctx.x[0] = r6 here is symmetric so
     // a recovery snapshot mid-handler also sees the right value.
     ctx.x[0] = ctx.x[6];
+}
+
+fn handle_write_run_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_write_run_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+/// `WriteRun__18TUnicodeCompressorFv` entry probe.
+///
+/// On entry r0 = `this` (compressor). Logs:
+/// - this->w98 (count word at +0x98 — coalesce-buffer write index)
+/// - this->count (+0x9c) — the loop bound that wedges if > 255
+/// - this->byte_a0 (+0xa0) — the last-byte sentinel
+/// - first 4 bytes of buffer_b (+0xa1)
+/// - caller LR
+fn handle_write_run_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let this = ctx.x[0] as u32;
+    let caller_lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let mode = source_cpsr & 0x1F;
+
+    let w98 = guest_mem::read_word_va(this.wrapping_add(0x98)).unwrap_or(0xDEAD_BEEF);
+    let count = guest_mem::read_word_va(this.wrapping_add(0x9c)).unwrap_or(0xDEAD_BEEF);
+    // Read +0xa0 as a byte (the strb byte field). Read 4 bytes
+    // starting at +0xa0 then mask the low byte; safe because we
+    // only need the relative shape, and the read itself is
+    // word-aligned.
+    let a0_word = guest_mem::read_word_va(this.wrapping_add(0xa0)).unwrap_or(0xDEAD_BEEF);
+    let byte_a0 = a0_word & 0xFF;
+    // Buffer B starts at +0xa1 (byte-aligned). Read 4 bytes from
+    // (this+0xa0) covering [+0xa0..+0xa3], shift to expose
+    // [+0xa1..+0xa3]. Read another word at +0xa4 to cover
+    // [+0xa4..+0xa7] for an 8-byte view of buffer B.
+    let buf_lo = guest_mem::read_word_va(this.wrapping_add(0xa0)).unwrap_or(0);
+    let buf_hi = guest_mem::read_word_va(this.wrapping_add(0xa4)).unwrap_or(0);
+
+    kprintln!(
+        "WriteRun #{} ENTER: this={:#010x} w98={:#010x} count={:#x}({}) byte_a0={:#04x} buf[a0..a8]={:08x}{:08x} caller_lr={:#010x} src_mode={:#x} sp={:#010x}",
+        seq, this, w98, count, count, byte_a0, buf_lo, buf_hi, caller_lr, mode, sp,
+    );
+
+    // Emulate `mov ip, sp`.
+    ctx.x[12] = sp as u64;
 }
 
 fn handle_dl_probe(ctx: &mut TrapContext) {

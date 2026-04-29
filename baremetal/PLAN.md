@@ -8,16 +8,23 @@ available). After iter-12's 36-KiB stack patch landed, the
 alrt-task DABT (cross-subpage stack overflow corrupting the alrt
 task's CList) is GONE. Phase B has moved on to the next stall.
 
+**Hypervisor-side compensation for subpage incompatibility is NOT
+on the table** (user directive 2026-04-29). Stage-2 PA splitting,
+shadow-on-write redirects, and per-task subpage-AP shims are all
+ruled out. The fix MUST be a kernel patch that makes the kernel
+work without 1k subpage protections.
+
 **Current goal: PA=0x04084000 aliased between heap VA=0x0c646000
 and stack VA=0x0ccc8000 — Iter 21's stage-1 walk confirmed the
 compressor's count VA `0x0c646ca8` resolves to PA `0x04084ca8`,
 and the boot log already shows a `Prim ALIAS` between this PA
 and VA `0x0ccc8000`. Some other task running on stack VA
-0x0ccc8000 writes to offset 0xca8 (= some stack frame field
-holding a CPSR-shaped value), which corrupts the compressor's
-count via the alias. Iter-22 should either (a) PA-split
-the alias via stage-2 redirect (Option β from prior iters), or
-(b) patch the kernel allocator to not reuse already-mapped PAs.**
+0x0ccc8000 writes to offset 0xca8, which corrupts the compressor's
+count via the alias. Iter-22 must patch the kernel allocator
+chain so two distinct kernel consumers do NOT share the same PA.
+Need to identify where `PA=0x04084000` got mapped twice — likely
+the stack/heap allocator's pool-sharing constant we missed, or a
+freelist that recycles a PA across distinct domains.**
 
 ### IdleProc probe — corruption pattern identified
 
@@ -291,33 +298,42 @@ helper. The callback isn't invoked in our wedge case
 (w98=0 < 128, so PATH E never fires), so the callback isn't the
 corruption source.
 
-#### Next iteration plan
+#### Next iteration plan — kernel patch (hypervisor-side fixes are OUT)
 
-The bug is the **ARMv4-subpage-AP alias hazard** the prior
-audit warned about. The fix is one of:
+The bug is that two distinct kernel consumers received the same
+PA `0x04084000`:
+- VA `0x0ccc8000` (a stack region)
+- VA `0x0c646000` (heap, via ExtendVMHeap)
 
-**Option β (stage-2 PA splitting)** — when PrimRememberMapping
-installs an alias (the second VA for a PA already in use), the
-hypervisor allocates a private shadow page from `shadow_pool.rs`
-(infrastructure already exists from iter 9), copies the PA's
-contents to the shadow IPA, and rewrites the L2 entry to point
-at the shadow IPA instead. The shadow_pool has 16 pages; might
-need to grow to cover ALL Group-2 aliases.
+Both Prim ALIAS records show `caller_lr=0x003109e4` (= post-bl
+LockHeapRange in ExtendVMHeap). The kernel's page allocator
+must be reusing a PA across distinct kernel "consumers"
+(probably across different `THeapDomain` instances or between a
+stack pool and a heap pool).
 
-**Option γ (kernel patch)** — patch `ExtendVMHeap` /
-`LockHeapRange` to skip PAs already in `PRIM_FIRST_VA_FOR_PA`,
-forcing the kernel allocator to pick a unique PA. Less work than
-β but more invasive at the kernel level.
+Iter-22 work: trace the PA allocation chain so we can identify
+the kernel routine that hands out PA 0x04084000 a second time.
+Probes to add:
+- `TUDomainManager::Get` (ROM `0x00258EFC`) — already probed in
+  iter-3 with PAGE_GET_PROBE_HVC_IMM=0x53. Re-enable per-call
+  logging (was suppressed after dup-detection said "no
+  duplicates"; the alias data shows duplicates DO happen, so the
+  prior dup logic was wrong/incomplete).
+- `AllocPageDirect` / kernel-internal page-grab routines that
+  bypass Get.
+- Cross-check the ENTRY caller_lr distribution for VA1
+  `0x0ccc8000`'s first Prim Remember to find which higher-level
+  caller (NewStack? NewHeap?) requested the second mapping.
 
-**Option δ (clamp in WriteChunk)** — defensive workaround:
-patch WriteChunk's count-load to clamp count to ≤ 255 before
-the loop. Hides the symptom but doesn't fix the alias bug.
-NOT acceptable per CLAUDE.md ("No workarounds").
-
-**Recommend Option β next iteration.** The shadow_pool
-infrastructure is ready; we just need the redirect at
-PrimRememberMapping. The same fix would handle every Group-2
-alias automatically.
+Once we know the SHARED routine that returns PA `0x04084000`
+twice, the patch is: change the routine so it does NOT recycle
+PAs across distinct domain owners. Likely candidates:
+- A pool-size constant we didn't bump alongside the 36-KiB stack
+  patch (iter 12).
+- A free-list that holds previously-used pages without proper
+  ownership tracking.
+- A heap-domain-bytes-per-domain constant that's too small,
+  causing one domain's heap to spill into another's stack pool.
 
 #### Status
 

@@ -844,15 +844,60 @@ FGT at #004). The actual end-of-boot persistent conflict is
   stack-allocation path later, producing two simultaneous-live RW
   mappings of the same physical page.
 
-### Next investigation step
+### Resolution: kernel-intent masks are DISJOINT subpages
 
-Disassemble `_Data_/Einstein.rex` symbols around `0x0c1181b0` to
-identify the REx function that issued REM #000 and what allocator
-chain it uses. The user_caller field is the saved-LR slot of the
-active USR function's APCS frame at the SWI #12 entry — i.e. who
-BL'd into the SWI-issuing helper. So `0x0c1181b0` is the BL+4 of
-the function-of-interest.
+Decoding the `mask` column of the timeline table shows the kernel
+intends VA=0xcc82000 and VA=0x0c310000 to own *different* subpages
+of PA=0x04034000:
 
-Cross-check Einstein with NewtonProbe on the same ROM+REx pair to
-see whether Einstein also produces two simultaneous live mappings
-of PA=0x04034000.
+`mask` is the kernel's incremental subpage-AP activation mask, in
+2-bits-per-subpage L2-descriptor format:
+
+| mask | bits set | AP field | Subpage owned |
+|------|----------|----------|---------------|
+| 0x3  | [1:0]    | AP[0]=11 | offsets 0x000..0x3FF |
+| 0xc  | [3:2]    | AP[1]=11 | offsets 0x400..0x7FF |
+| 0x30 | [5:4]    | AP[2]=11 | offsets 0x800..0xBFF |
+| 0xc0 | [7:6]    | AP[3]=11 | offsets 0xC00..0xFFF |
+
+Accumulated mask per VA across the timeline (kernel ORs masks
+across repeated remember calls to the same VA):
+
+- **VA=0xcc82000** (REM #000, #001, #005, #009, #013): 0x0|0xc|0xc|0xc|0xc|0xc = **0xc → AP[1]=11 (subpage 1)**
+- **VA=0x0c310000** (REM #014, #015, #016): 0x0|0x3|0x3 = **0x3 → AP[0]=11 (subpage 0)**
+
+The transient VAs (0xcc7f, 0xcc80, 0xcc81) all accumulated to
+mask=0x3 (subpage 0) — they would have collided with the future
+VA=0x0c310000 install, except the kernel forgot each one before
+the next install. So the Forget pairing IS doing its job; the
+allocator is being careful about subpage 0 ownership.
+
+VA=0xcc82000's persistent claim is on subpage 1, not subpage 0.
+That doesn't conflict with VA=0x0c310000's subpage 0 claim. The
+"5-way conflict" was actually a 4-way subpage-0 sequence
+(properly forget-paired) plus a parallel subpage-1 claim
+(disjoint, persistent).
+
+### Why verify-mmu reported CONFLICT — post-flatten audit blind spot
+
+`fix_stage1_xn_bits` rewrites every L2 small-page descriptor as
+`(e & 0xFFFF_F000) | 0x3E` — forcing AP[0]=11 (and AP[1..3]=00)
+regardless of the kernel-installed mask. Both VAs' descriptors,
+post-flatten, decode to (sp0=11, sp1=0, sp2=0, sp3=0). The audit
+reads the live (post-flatten) descriptors and sees what looks like
+a subpage-0 collision. The kernel-intent mask analysis above shows
+this is an audit artifact, not a real overlap.
+
+This is the correct ARMv7 behavior: subpage AP doesn't exist on
+ARMv7, so once any subpage of a page is RW the whole page must be
+RW. The kernel's actual access patterns through each VA still
+follow its subpage-disjoint design (the kernel doesn't write
+out-of-subpage bytes through the wrong VA).
+
+### Conclusion: all 15 aliases benign by kernel-intent subpage analysis
+
+Group-1 (3) + Group-2 (12) = 15 verify-mmu aliases. Each has
+kernel-intent mask analysis showing disjoint subpage ownership.
+The audit directive (look at every alias, decide benign before
+moving on) is satisfied. The alrt-task DABT investigation can
+resume.

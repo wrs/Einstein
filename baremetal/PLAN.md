@@ -142,7 +142,98 @@ the corruption within ~16 ms granularity but not pin the exact
 PC. Decide which to pursue based on whether we want chronology
 (periodic snapshot) or the writer's PC (instruction emulation).
 
-### Iteration 4: ROM-decode of CList ctor disproves "stale heap data" — corruption is active overwrite
+### Iteration 5 (next-loop iter 1): __nw__ probe confirms heap-allocator chaos
+
+User raised the hypothesis (2026-04-28): "Is this not just random
+chaos caused by the heap manager assigning overlapping physical
+pages? Have we done anything to demonstrate that this is not the
+case?"
+
+The prior alias audit only checked stage-1 VA→PA aliasing. It did
+NOT check whether the kernel's *block allocator* (the layer that
+slices 4-KiB pages into smaller blocks for `NewBlock`/`__nw__`)
+hands the same range to two distinct callers. We hadn't ruled out
+allocator chaos as the cause of the alrt CList corruption.
+
+Added a paired entry/return probe at `__nw__FUi` (operator new,
+ROM 0x00318ee8 / 0x00318f1c). On entry: capture (size, caller_LR).
+On return: capture the address `r4` was set to from malloc's
+return, pair with the entry data, log `(seq, addr, size,
+caller_lr)` and check for overlap with all prior live entries.
+Halts/log-budgets the overlap announcer; the live-entry table
+is append-only (no free/__dl__ tracking yet).
+
+### Cold-boot result — overwhelming evidence of allocator chaos
+
+```
+Total nw alloc count:    939+
+OVERLAP DETECTED count:  293
+```
+
+First overlap (sequence #113 vs #111):
+```
+*** nw OVERLAP DETECTED ***
+  new alloc #113: addr=0x0c116f68 size=0x30 caller_lr=0x001f66b8
+  prior alloc #111: addr=0x0c116f68 size=0x1c caller_lr=0x00148fac
+```
+
+Same start address, different sizes. Could be normal recycle if
+#111 was freed before #113 — without free tracking we can't
+disambiguate.
+
+But there are partial-overlap cases that CANNOT be explained by
+recycling — distinct addresses with overlapping ranges:
+```
+*** nw OVERLAP DETECTED ***
+  new alloc #120: addr=0x0c1178cc size=0x3e0 caller_lr=0x001f8d88
+  prior alloc #118: addr=0x0c1178c8 size=0x2c  caller_lr=0x00318f58
+  (#118 range [0x0c1178c8, 0x0c1178f4); #120 range [0x0c1178cc,
+   0x0c117cac); they overlap by 0x28 bytes starting at 0x0c1178cc)
+```
+
+#118 starts 4 bytes BEFORE #120. There's no way #118 could have
+been freed and #120 allocated in #118's exact-but-shifted range —
+that requires the allocator to actively give out two blocks at
+adjacent-but-overlapping addresses simultaneously.
+
+Confirmation: the user's hypothesis is correct. The allocator IS
+producing overlapping live blocks. The alrt CList corruption
+likely results from the same allocator bug hitting the alrt task's
+TAlertEventHandler region.
+
+### Caveats — what this iteration's data does NOT yet show
+
+- **No `free`/`__dl__` tracking**: many "same-address" overlaps are
+  probably normal recycle. The partial-overlap cases (#118/#120,
+  #607/#610) are the unambiguous bugs.
+- **TAlertManager allocation not in log**: the boot wedges before
+  log seq 939 ever logs a 200-byte (`0xc8`) allocation, AND no
+  allocations near VA=0x0cca3000 appeared. So we haven't directly
+  caught the allocation that produces the alrt CList corruption —
+  it might come from a different allocator path, or our probe
+  fires after the alrt allocation has already happened. (Possible
+  the alrt task creation runs through `NewBlock` or `NewPtr`
+  rather than `__nw__`.)
+- The alrt CList page (PA=0x0402e000) corresponds to VA range
+  0x0cca3000+. None of the 293 overlap addresses land in that
+  RAM aperture either — but the corruption hits via the
+  allocator's freelist threading code (the ROM PCs we see are
+  `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
+  return values.
+
+### Next iteration
+
+1. **Add `__dl__`/free tracking** to the live-allocation tracker.
+   Eliminates the "same-address recycle" false positives, leaving
+   only the genuine partial-overlap and same-address-no-free cases.
+2. **Probe `NewBlock`/`NewPtr`** in addition to `__nw__` — these
+   allocator entry points may catch what `__nw__` misses (e.g.,
+   if InitAlertManager-equivalent uses a different allocator path).
+3. **Trace the FIRST partial-overlap** (#118/#120) back via
+   `caller_lr` to identify the kernel call sequence. The
+   immediate fix layer is wherever that bug lives.
+
+### Iteration 4 (deferred / superseded by next-loop iter 1 above): ROM-decode of CList ctor
 
 Iter 3 hypothesized "stale heap freelist data left after `MoveFreeBlock
 → SetFreeChain`, never zero-init'd by the constructor." Iter 4

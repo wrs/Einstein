@@ -1258,6 +1258,12 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::IDLEPROC_PROBE_HVC_IMM => {
             handle_idleproc_probe(ctx);
         }
+        v if v == crate::rom_patches::NW_ENTRY_PROBE_HVC_IMM => {
+            handle_nw_entry_probe(ctx);
+        }
+        v if v == crate::rom_patches::NW_RETURN_PROBE_HVC_IMM => {
+            handle_nw_return_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1746,6 +1752,16 @@ fn handle_und(ctx: &mut TrapContext) {
             // runs from USR mode. Pass spsr_und so SP/LR lookups land
             // on the right banked register.
             handle_idleproc_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::NW_ENTRY_PROBE_HVC_IMM) => {
+            handle_nw_entry_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::NW_RETURN_PROBE_HVC_IMM) => {
+            handle_nw_return_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -3560,6 +3576,195 @@ fn handle_idleproc_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
 
     // Emulate `mov ip, sp` (ip = r12 non-banked; sp = R13_<source_mode>).
     ctx.x[12] = sp as u64;
+}
+
+/// Live-allocation tracker for the `__nw__` (operator new) entry/return
+/// probe pair. Each slot records `(addr, size, caller_lr, seq)` for
+/// one block returned by `__nw__`. We don't model `free`/`__dl__` yet
+/// — slots are append-only — so the overlap detector treats every
+/// recorded entry as live. That'll false-positive on legitimately
+/// freed-and-reallocated blocks (same address re-issued later), but
+/// the user-suspected failure mode is exactly that two distinct live
+/// allocations overlap, so we'll surface that case clearly.
+const NW_TABLE_SLOTS: usize = 1024;
+struct NwEntry {
+    addr: AtomicU32,
+    size: AtomicU32,
+    caller_lr: AtomicU32,
+    seq: AtomicU32,
+}
+static NW_TABLE: [NwEntry; NW_TABLE_SLOTS] = {
+    const Z: NwEntry = NwEntry {
+        addr: AtomicU32::new(0),
+        size: AtomicU32::new(0),
+        caller_lr: AtomicU32::new(0),
+        seq: AtomicU32::new(0),
+    };
+    [Z; NW_TABLE_SLOTS]
+};
+static NW_NEXT_SLOT: AtomicU32 = AtomicU32::new(0);
+static NW_GLOBAL_SEQ: AtomicU32 = AtomicU32::new(0);
+
+/// Pending entry-side state, popped at the matching return. Treat as
+/// a small stack (newest first) to handle nested __nw__ calls.
+const NW_PENDING_DEPTH: usize = 8;
+static NW_PENDING_SIZE: [AtomicU32; NW_PENDING_DEPTH] = [
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+];
+static NW_PENDING_LR: [AtomicU32; NW_PENDING_DEPTH] = [
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+];
+static NW_PENDING_DEPTH_CUR: AtomicU32 = AtomicU32::new(0);
+
+/// Log budget — also gates the halt-on-overlap behaviour.
+static NW_OVERLAP_LOG_BUDGET: AtomicU32 = AtomicU32::new(8);
+
+fn handle_nw_entry_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_nw_entry_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_nw_entry_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    // At entry: r0 = size, lr = caller's return PC (since the function
+    // hasn't pushed its frame yet), sp = caller's sp.
+    let size = ctx.x[0] as u32;
+    let caller_lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+
+    // Push pending. Single-threaded EL2; depth bookkeeping needs no
+    // CAS but we use AtomicU32 to keep it as a regular static.
+    let depth = NW_PENDING_DEPTH_CUR.load(Ordering::Relaxed);
+    if (depth as usize) < NW_PENDING_DEPTH {
+        NW_PENDING_SIZE[depth as usize].store(size, Ordering::Relaxed);
+        NW_PENDING_LR[depth as usize].store(caller_lr, Ordering::Relaxed);
+        NW_PENDING_DEPTH_CUR.store(depth + 1, Ordering::Relaxed);
+    } else {
+        kprintln!(
+            "nw probe: PENDING STACK OVERFLOW size={:#x} caller_lr={:#010x} (deep nesting?)",
+            size, caller_lr,
+        );
+    }
+
+    // First few entries: log the entry side too so the trace shows
+    // both ends paired by sequence # (return-side increments seq).
+    if NW_GLOBAL_SEQ.load(Ordering::Relaxed) < 32 {
+        crate::dprintln!(
+            "nw ENTRY size={:#x} caller_lr={:#010x} sp={:#010x} src_mode={:#x}",
+            size, caller_lr, sp, source_cpsr & 0x1F,
+        );
+    }
+
+    // Emulate `mov ip, sp`.
+    ctx.x[12] = sp as u64;
+}
+
+fn handle_nw_return_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_nw_return_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_nw_return_probe_with(ctx: &mut TrapContext, _source_cpsr: u32) {
+    // The patched instruction is `mov r0, r4`. r4 holds the allocated
+    // address. Pop the pending entry. Pair size+caller_lr with addr.
+    let addr = ctx.x[4] as u32;
+
+    // Pop pending.
+    let depth_pre = NW_PENDING_DEPTH_CUR.load(Ordering::Relaxed);
+    if depth_pre == 0 {
+        // Unmatched return — log once.
+        if NW_OVERLAP_LOG_BUDGET.load(Ordering::Relaxed) > 0 {
+            kprintln!("nw probe: UNMATCHED RETURN addr={:#010x}", addr);
+        }
+        // Still emulate `mov r0, r4` so the function returns correctly.
+        ctx.x[0] = ctx.x[4];
+        return;
+    }
+    let depth = depth_pre - 1;
+    let size = NW_PENDING_SIZE[depth as usize].load(Ordering::Relaxed);
+    let caller_lr = NW_PENDING_LR[depth as usize].load(Ordering::Relaxed);
+    NW_PENDING_DEPTH_CUR.store(depth, Ordering::Relaxed);
+
+    let seq = NW_GLOBAL_SEQ.fetch_add(1, Ordering::Relaxed);
+
+    // Skip null returns (allocation failure) — they're not overlaps.
+    if addr == 0 {
+        crate::dprintln!(
+            "nw alloc #{} FAILED size={:#x} caller_lr={:#010x}",
+            seq, size, caller_lr,
+        );
+        ctx.x[0] = ctx.x[4];
+        return;
+    }
+
+    // Overlap check: scan all prior entries.
+    let new_lo = addr;
+    let new_hi = addr.saturating_add(size);
+    let mut overlap_idx = None;
+    let next_slot = NW_NEXT_SLOT.load(Ordering::Relaxed);
+    let scan_limit = (next_slot as usize).min(NW_TABLE_SLOTS);
+    for i in 0..scan_limit {
+        let e_addr = NW_TABLE[i].addr.load(Ordering::Relaxed);
+        let e_size = NW_TABLE[i].size.load(Ordering::Relaxed);
+        if e_addr == 0 {
+            continue;
+        }
+        let e_lo = e_addr;
+        let e_hi = e_addr.saturating_add(e_size);
+        // Half-open ranges overlap iff new_lo < e_hi && e_lo < new_hi.
+        if new_lo < e_hi && e_lo < new_hi {
+            overlap_idx = Some(i);
+            break;
+        }
+    }
+
+    if let Some(idx) = overlap_idx {
+        let budget = NW_OVERLAP_LOG_BUDGET.fetch_sub(1, Ordering::Relaxed);
+        if budget > 0 {
+            let e_addr = NW_TABLE[idx].addr.load(Ordering::Relaxed);
+            let e_size = NW_TABLE[idx].size.load(Ordering::Relaxed);
+            let e_lr   = NW_TABLE[idx].caller_lr.load(Ordering::Relaxed);
+            let e_seq  = NW_TABLE[idx].seq.load(Ordering::Relaxed);
+            kprintln!();
+            kprintln!("*** nw OVERLAP DETECTED ***");
+            kprintln!(
+                "  new alloc #{}: addr={:#010x} size={:#x} caller_lr={:#010x} (range [{:#010x}, {:#010x}))",
+                seq, addr, size, caller_lr, new_lo, new_hi,
+            );
+            let e_hi = e_addr.saturating_add(e_size);
+            kprintln!(
+                "  prior alloc #{}: addr={:#010x} size={:#x} caller_lr={:#010x} (range [{:#010x}, {:#010x}))",
+                e_seq, e_addr, e_size, e_lr, e_addr, e_hi,
+            );
+            kprintln!(
+                "  Both blocks are LIVE per the tracker (no Free/__dl__ recorded between them)."
+            );
+            kprintln!();
+        }
+    }
+
+    // Record the new allocation. Slot allocation is monotonic; if we
+    // exhaust the table we silently drop further entries (the wedge
+    // typically fires within the first few hundred allocations).
+    if (next_slot as usize) < NW_TABLE_SLOTS {
+        NW_TABLE[next_slot as usize].addr.store(addr, Ordering::Relaxed);
+        NW_TABLE[next_slot as usize].size.store(size, Ordering::Relaxed);
+        NW_TABLE[next_slot as usize].caller_lr.store(caller_lr, Ordering::Relaxed);
+        NW_TABLE[next_slot as usize].seq.store(seq, Ordering::Relaxed);
+        NW_NEXT_SLOT.store(next_slot + 1, Ordering::Relaxed);
+    }
+
+    // Per-call log: keep first 32 + every overlap.
+    if seq < 32 {
+        kprintln!(
+            "nw alloc #{} addr={:#010x} size={:#x} caller_lr={:#010x}",
+            seq, addr, size, caller_lr,
+        );
+    }
+
+    // Emulate `mov r0, r4`.
+    ctx.x[0] = ctx.x[4];
 }
 
 fn dump_flash_bytes(ipa: u32, count: u32) {

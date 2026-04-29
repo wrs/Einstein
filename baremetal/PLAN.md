@@ -222,6 +222,162 @@ TAlertEventHandler region.
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
 
+### Iteration 10 (next-loop iter 6): patch audit — guard pages aren't working because we kept the 33-KiB layout
+
+**User question (2026-04-29):** "Sounds like the stack manage guard
+pages aren't working. Did we perhaps patch it to change from 33k
+allocation (one 1k subpage of guard) to 32k (no guard), instead of
+36k with a full 4k guard?"
+
+This is exactly the right framing. The audit:
+
+### What current patches actually do
+
+`PATCHES_717006` has these heap-allocation patches active:
+
+| offset | patch | effect |
+|---|---|---|
+| 0x0031_0E38 | `NewHeap` chunk_size = 4096 | heaps grow in whole 4 KiB pages |
+| 0x0014_23A0 | `NewVMHeap` 4-KiB init path | LockHeapRange initial size = 4 KiB |
+| 0x0014_28B8 | `ZapHeap` chunk/lock size = 4096 | initial lock covers whole page |
+
+Plus `apply_resolve_fault_wrapper` (installed): iterates ResolveFault
+4× per page so the first allocation owns all 4 subpages of the
+4-KiB physical page.
+
+### What we did NOT patch
+
+- `FMNewStack`'s 33-KiB stride is unchanged. The size constant
+  `0x8400` (= 33 KiB) still appears at multiple sites in
+  `0x001F_8EDC..0x001F_9034`, plus the slot-encoding `add r1, sl,
+  sl, lsl #5` (= sl × 33) at `0x001F_9024`. A 33→36 KiB attempt
+  was made and reverted earlier (Phase B logs).
+- The "GetMatchingPage = always 0" stub at lines 186–220 of
+  `src/rom_patches.rs` is **commentary only** — it is not in the
+  `PATCHES_717006` array. Without it, `TStackManager` still
+  matches existing pages from its cache, sharing 4-KiB physical
+  pages between adjacent stacks via the boundary subpage.
+
+### So why does the guard not catch SetFreeChain's overflow?
+
+Under ARMv4 hardware:
+- Each task's slot is 33 KiB. Of that, 32 KiB are unique pages
+  and 1 KiB is one subpage of the boundary page (shared via
+  subpage AP with the next task).
+- The other three subpages of the boundary page belong to the
+  adjacent task(s) and are AP=00 (sys-only) from this task's
+  perspective — **subpage AP IS the guard mechanism**.
+- A push that crosses out of the owned subpage permission-faults
+  on hardware; the kernel's DataAbortHandler either grows the
+  stack (via lazy resolve) or signals overflow.
+
+Under our flat AP=11 stage-2 mapping:
+- `fix_stage1_xn_bits` strips the per-subpage AP bits from every
+  small-page L2 descriptor. Each VA gets full RW to the entire
+  4-KiB page.
+- The "guard" subpages are no longer guards — they're just
+  regular bytes that happen to be the next task's data. The push
+  succeeds silently, corrupting the alias victim.
+
+We can't recover ARMv4 subpage AP at stage-2: stage-2 has 4-KiB
+granularity, so we can't make individual subpages of a 4-KiB page
+unmapped while leaving others RW. Either the whole page is
+mapped or none of it is.
+
+### The correct architectural fix — 36 KiB allocation with a full 4-KiB guard page
+
+Reshape the per-task slot from `33 KiB = 32 KiB usable + 1 KiB
+subpage guard` to **`36 KiB = 32 KiB usable + 4 KiB full-page
+guard`**:
+
+```
+old slot (33 KiB):                     new slot (36 KiB):
++----------------+ <- top              +----------------+ <- top
+|                |                     |                |
+|   32 KiB       |                     |   32 KiB       |
+|   usable stack |                     |   usable stack |
+|                |                     |                |
++----------------+                     +----------------+ <- base
+| 1 KiB subpage  |  (boundary page,    | 4 KiB GUARD    |  (own page,
+|   guard via    |   shared with       |   stage-2 RO   |   stage-2
+|   subpage AP)  |   adjacent task)    |   or unmapped) |   unmapped)
++----------------+                     +----------------+
+```
+
+Each slot now has its own dedicated 4-KiB guard page, separately
+mapped. The hypervisor sets that page **stage-2 unmapped** (or
+RO with W^X — kernel writes fault to EL2). On a stack overflow,
+sp drops into the guard, the write fires a stage-2 permission
+fault, and we either forward to the kernel's DataAbortHandler
+(if the kernel is supposed to handle stack overflow) or halt
+loudly with full context.
+
+### Patch sites — FMNewStack at 0x001F_8EAC
+
+The 33-KiB stride is encoded in five places. To bump to 36 KiB:
+
+| offset | original | new | meaning |
+|---|---|---|---|
+| 0x1F_8EDC | `mov r7, #33792` | `mov r7, #36864` | per-slot size = 36 KiB |
+| 0x1F_8F18 | `mov r0, #33792` | `mov r0, #36864` | divisor in computation |
+| 0x1F_8F38 | `cmp r0, #33792` | `cmp r0, #36864` | bounds check |
+| 0x1F_8F48 | `mov r0, #33792` | `mov r0, #36864` | divisor again |
+| 0x1F_8F60 | `mov r0, #33792` | `mov r0, #36864` | divisor again |
+| 0x1F_8FA0 | `mov r0, #33792` | `mov r0, #36864` | divisor again |
+| 0x1F_9024 | `add r1, sl, sl, lsl #5` (sl×33) | `add r1, sl, lsl #2` then `add r1, r1, sl, lsl #5` (sl×36) | slot stride = sl × 36 |
+| 0x1F_9034 | `sub r0, r9, r0, lsl #10` (×1024) | unchanged | scale stays the same |
+
+ARM immediate encoding for 36 KiB: 36864 = 0x9000 = 0x9 × 0x1000.
+ARM `mov` immediate-12: rot=0xa, imm8=0x09 → ROR(0x09, 20) = 0x9000.
+Encoding: `0xE3A0_0A09` for `mov r0, #36864`,
+`0xE3A0_7A09` for `mov r7, #36864`,
+`0xE350_0A09` for `cmp r0, #36864`.
+
+The `sl × 36` rewrite is two instructions but the original is one
+— so we'd need a different patch shape (e.g., a small ROM-trampoline
+that does the multiplication and branches back). That's the
+mechanical complication that defeated the prior 36-KiB attempt;
+the simpler path may be to encode `sl × 36` as `(sl + sl<<3) << 2`
+which is also two instructions.
+
+### Stage-2 guard wiring
+
+For each new 36-KiB slot, the bottom 4 KiB is a guard page. The
+hypervisor needs to know which physical pages back the guards.
+Two options:
+
+1. **Patch the kernel's stack-pool initialization** so the guard
+   pages are allocated from a separate hypervisor-known pool, and
+   stage-2 holds them unmapped. Cleanest but more invasive.
+2. **Detect at PrimRememberMapping**: when the kernel installs the
+   FIRST 4-KiB page of a new task's slot (the bottom = guard),
+   note it and flip it to stage-2 unmapped. Doesn't require ROM
+   patches beyond what's already there. Reuse the
+   `g1_capture::set_ram_page_ro_xn` pattern — but unmap entirely
+   (write a 0 descriptor) instead of RO+XN, since any access
+   should fault.
+
+Option 2 is the one that pairs naturally with the FMNewStack-stride
+patch.
+
+### Next iteration plan
+
+1. Implement the FMNewStack stride bump (33 → 36 KiB) at all sites.
+   Find the encoding for the `sl × 36` and ensure the divisors all
+   match.
+2. Modify the `apply_resolve_fault_wrapper` if needed — its
+   loop-over-4-subpages pattern is tied to the 33-KiB layout's
+   subpage handling.
+3. Add a stage-2 guard-page installer hooked into PrimRememberMapping
+   that detects "this is a slot's first page" and unmaps it at
+   stage-2.
+4. Verify pa-emul CORRUPTION drops to 0 and IdleProc DABT no longer
+   fires.
+
+The shadow-pool infrastructure from iter 9 stays available — it's
+useful for any remaining alias cases where 36-KiB stacks alone
+aren't enough.
+
 ### Iteration 9 (next-loop iter 5): shadow-pool infrastructure for Option β
 
 Lay the groundwork for the alias-redirect fix recommended by iter 8.

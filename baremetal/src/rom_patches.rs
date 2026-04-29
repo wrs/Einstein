@@ -175,28 +175,50 @@ const PATCHES_717006: &[RomPatch] = &[
         value: hvc_insn(PAGE_GET_PROBE_HVC_IMM),
         name: "TUDomainManager::Get post-SWI page-allocator probe",
     },
-    // (FMNewStack 33→36 KiB + 3→4 KiB guard re-attempt 2026-04-29 —
-    // reverted. NewStack POST-SWI confirms the 17-instruction patch
-    // produces 4-KiB-aligned 36-KiB slots (req=0x9000, base=0xc306000,
-    // top=0xc30e000, span=0x8000). But boot wedges in PauseSystem
-    // around alarm-task vtable load (junk r0=0xea3fffbd) because
-    // OTHER ROM functions also encode 33 KiB:
-    //   * Init__11THeapDomain at 0x001F_8D74 (slot count divisor)
-    //   * GetStackInfo at 0x001F_8E1C (slot index divisor)
-    //   * FMNewStack continuation at 0x001F_918C
-    //   * BootOS / system-stack init at 0x0001_8F8C, 0x0001_8FA4,
-    //     0x0001_90EC (`add r0, r0, #33792` patterns)
-    //   * 0x0027_1Exx, 0x0027_22xx — many `sub r0, r0, #33792`
-    //     conditional sites in another routine (probably the
-    //     stack-walker or fault-decode that maps task PC to slot)
+    // FMNewStack + heap-domain 33→36 KiB + 3→4 KiB guard. Coordinated
+    // re-attempt covering the 17 sites in FMNewStack itself (size
+    // constants, guard offsets, slot-stride encodings) plus the 3
+    // divisor sites in surrounding heap-domain functions:
+    //   * `Init__11THeapDomain` at 0x001F_8D74 — divides pool size
+    //     by 33 KiB to compute slot count for the slot_info array.
+    //   * `GetStackInfo__11THeapDomain` at 0x001F_8E1C — divides VA
+    //     offset by 33 KiB to map VA → slot index.
+    //   * `FMFree__13TStackManager` at 0x001F_918C — same divisor
+    //     in the slot-index path.
     //
-    // Without a coordinated patch across all of these the kernel's
-    // slot-arithmetic mismatches reality and downstream pointer
-    // chases hit junk. Patching them all is doable but each site
-    // needs individual decode (some are conditional sub/add, not
-    // simple mov immediates). Defer to a follow-up iteration that
-    // works through the full catalogue. PLAN.md captures the current
-    // state of analysis.)
+    // ARM immediate encoding: #36864 = imm12 0xA09 (rot=0xA, imm8=9
+    // → ROR(9,20) = 0x9000); #4096 = imm12 0xA01 (rot=0xA, imm8=1
+    // → ROR(1,20) = 0x1000).
+    //
+    // Sites in CheckHeap / VetHeap (0x0027_1Exx) and SaveCPUStateAndStop
+    // (0x0001_8F8C, 0x0001_8FA4, 0x0001_90EC) are NOT patched —
+    // CheckHeap may not run in our boot path, and the SaveCPUState
+    // sites use 0xC008400 as a fixed kernel-globals offset unrelated
+    // to per-task stack stride.
+
+    // FMNewStack (17 patches):
+    RomPatch { offset: 0x001F_8EDC, value: 0xE3A0_7A09, name: "FMNewStack: mov r7, #36864 (was 33792)" },
+    RomPatch { offset: 0x001F_8EF0, value: 0xE240_1A01, name: "FMNewStack: sub r1, r0, #4096 (was 3072)" },
+    RomPatch { offset: 0x001F_8F18, value: 0xE3A0_0A09, name: "FMNewStack: mov r0, #36864 (divisor)" },
+    RomPatch { offset: 0x001F_8F20, value: 0xE080_0180, name: "FMNewStack: add r0, r0, r0, lsl #3 (×9)" },
+    RomPatch { offset: 0x001F_8F24, value: 0xE049_0600, name: "FMNewStack: sub r0, r9, r0, lsl #12 (×4096)" },
+    RomPatch { offset: 0x001F_8F30, value: 0xE280_0A01, name: "FMNewStack: add r0, r0, #4096 (guard)" },
+    RomPatch { offset: 0x001F_8F38, value: 0xE350_0A09, name: "FMNewStack: cmp r0, #36864" },
+    RomPatch { offset: 0x001F_8F48, value: 0xE3A0_0A09, name: "FMNewStack: mov r0, #36864 (divisor)" },
+    RomPatch { offset: 0x001F_8F5C, value: 0xE3A0_0A09, name: "FMNewStack: mov r0, #36864 (divisor)" },
+    RomPatch { offset: 0x001F_8F88, value: 0xE280_0A01, name: "FMNewStack: add r0, r0, #4096 (guard, alt)" },
+    RomPatch { offset: 0x001F_8F90, value: 0xE350_0A09, name: "FMNewStack: cmp r0, #36864 (alt)" },
+    RomPatch { offset: 0x001F_8FA0, value: 0xE3A0_0A09, name: "FMNewStack: mov r0, #36864 (alt-path divisor)" },
+    RomPatch { offset: 0x001F_9024, value: 0xE08A_118A, name: "FMNewStack: add r1, sl, sl, lsl #3 (×9)" },
+    RomPatch { offset: 0x001F_902C, value: 0xE080_9601, name: "FMNewStack: add r9, r0, r1, lsl #12 (×4096)" },
+    RomPatch { offset: 0x001F_9030, value: 0xE087_0187, name: "FMNewStack: add r0, r7, r7, lsl #3 (×9)" },
+    RomPatch { offset: 0x001F_9034, value: 0xE049_0600, name: "FMNewStack: sub r0, r9, r0, lsl #12 (×4096, end-of-slot)" },
+    RomPatch { offset: 0x001F_9038, value: 0xE280_2A01, name: "FMNewStack: add r2, r0, #4096 (base = slot+guard)" },
+
+    // Heap-domain divisor patches (3 patches):
+    RomPatch { offset: 0x001F_8D74, value: 0xE3A0_0A09, name: "Init__11THeapDomain: mov r0, #36864 (slot count divisor)" },
+    RomPatch { offset: 0x001F_8E1C, value: 0xE3A0_0A09, name: "GetStackInfo: mov r0, #36864 (slot index divisor)" },
+    RomPatch { offset: 0x001F_918C, value: 0xE3A0_0A09, name: "FMFree: mov r0, #36864 (slot index divisor)" },
     // Force exclusive per-stack page allocation by short-circuiting
     // `TStackManager::GetMatchingPage` to always return 0 (= "no
     // shareable page found"). This forces every `FindOrAllocPage` call

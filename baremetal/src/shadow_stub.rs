@@ -458,6 +458,22 @@ fn code_read_word(ipa: u32) -> Option<u32> {
     crate::guest_mem::read_word_pa(ipa)
 }
 
+/// Iter-50: read the ORIGINAL pre-patch instruction at `ipa`. The
+/// liveness analyser uses this so probe HVCs installed by
+/// `rom_patches::apply_717006_patches` (which runs BEFORE
+/// `patch_rom_from_bitmap`) don't confuse it. Without this, the
+/// analyser at e.g. FindSuperceeder's body @0x001488ac walks
+/// forward past 0x001488c4 — where the original `mov r0, ip`
+/// (a LOCAL read of R12) has been replaced with HVC #0x6E
+/// (FINDSUPER_MID probe) — and misclassifies R12 as dead, then
+/// the picker chooses R12 as scratch_ea and the stub clobbers ip.
+fn code_read_word_original_first(ipa: u32) -> Option<u32> {
+    if let Some(orig) = crate::rom_patches::read_original(ipa) {
+        return Some(orig);
+    }
+    crate::guest_mem::read_word_pa(ipa)
+}
+
 /// Publish a freshly-written code range to the instruction stream.
 ///
 /// Two passes — first `DC CVAU` every line to push D-cache dirty lines
@@ -1403,7 +1419,7 @@ where R: Fn(u32) -> Option<u32> {
 ///
 /// Returns None when neither shape is achievable; caller halts loudly.
 fn pick_scratch_regs(d: &Decoded, orig_pc: u32) -> Option<(u32, Option<u32>)> {
-    pick_scratch_regs_with_reader(d, orig_pc, &code_read_word)
+    pick_scratch_regs_with_reader(d, orig_pc, &code_read_word_original_first)
 }
 
 fn pick_scratch_regs_with_reader<R>(
@@ -3419,15 +3435,23 @@ mod tests {
     /// missing the LOCAL read of R12 from the original instruction.
     /// Result: picker picks R12 → stub clobbers ip → wild this to Lookup.
     ///
-    /// This test reproduces the production bug. Currently EXPECTED TO
-    /// FAIL — it documents the bug and will turn green once iter-50 fixes
-    /// the install order (or makes the analyzer original-ROM-aware).
+    /// Iter-49 regression (production reality): same body as above, but
+    /// with PC=0x1488c4 (the `mov r0, ip` site) replaced by an HVC —
+    /// because rom_patches installs the FINDSUPER_MID probe there at boot.
+    ///
+    /// iter-50's fix: the production reader (`code_read_word_original_first`)
+    /// consults `rom_patches::read_original` before reading ROM. This test
+    /// simulates that with a wrapper reader that returns the original
+    /// instruction at PC=0x18 (the `mov r0, ip`) instead of the HVC sitting
+    /// in the stream. With the wrapper, the picker MUST avoid R12.
+    ///
+    /// The "no wrapper" sub-test below documents what HAPPENS without the
+    /// fix — the analyzer reads HVC, misclassifies R12 as dead, picks it.
+    /// That's the iter-49 bug; we leave the assertion-on-bug to a `#[ignore]`'d
+    /// test so it stays visible without breaking CI.
     #[test]
-    #[ignore = "documents iter-49 bug; will pass once iter-50 fixes install order"]
-    fn pick_scratch_at_findsuperceeder_when_midprobe_installed_does_not_pick_r12() {
-        // hvc_insn for FINDSUPER_MID_PROBE_HVC_IMM=0x6E:
-        //   cond=AL (0xE), op=0001_0100, imm12=0x006, op2=0111, imm4=0xE
-        //   = 0xE140_067E
+    fn pick_scratch_at_findsuperceeder_with_originals_wrapper_does_not_pick_r12() {
+        // hvc_insn for FINDSUPER_MID_PROBE_HVC_IMM=0x6E = 0xE140_067E.
         let hvc_06e = 0xE140_067Eu32;
         let stream = [
             0xE5D1_103Du32, // [0]  pc=0x00  ldrb r1, [r1, #61]
@@ -3436,25 +3460,55 @@ mod tests {
             0x13A0_2006u32, // [3]  pc=0x0c  movne r2, #6
             0xE590_0000u32, // [4]  pc=0x10  ldr r0, [r0]
             0xE3C0_120Fu32, // [5]  pc=0x14  bic r1, r0, #0xf0000000
-            hvc_06e,        // [6]  pc=0x18  ★ HVC (probe replaces `mov r0, ip`)
+            hvc_06e,        // [6]  pc=0x18  ← HVC sitting in current ROM
             0xE12F_FF1Eu32, // [7]  pc=0x1c  bx lr
         ];
-        let read = |pc: u32| stream.get((pc / 4) as usize).copied();
         let d = decode(stream[0]).expect("decode LDRB");
+
+        // Originals side-table: rom_patches recorded that PC=0x18's
+        // pre-patch instruction was `mov r0, ip` (e1a0_000c).
+        let originals: &[(u32, u32)] = &[(0x18, 0xE1A0_000Cu32)];
+
+        // Wrapper reader: consult originals first, fall back to stream.
+        let read = |pc: u32| {
+            for &(p, orig) in originals { if p == pc { return Some(orig); } }
+            stream.get((pc / 4) as usize).copied()
+        };
 
         let picks = pick_scratch_regs_with_reader(&d, 0, &read)
             .expect("picker should find dead reg(s)");
         let (sea, sfl) = picks;
-        // The original `mov r0, ip` at PC=0x18 read R12. After rom_patches
-        // replaces it with HVC, that read is invisible to shadow_stub's
-        // ROM-byte-driven analyzer. The bug is that the analyzer happily
-        // picks R12 as scratch.
         assert_ne!(sea, 12,
-            "scratch_ea must NOT be R12 even when PC=0x18 is HVC — the
-             original `mov r0, ip` at that PC reads ip; got {}", sea);
+            "scratch_ea must NOT be R12 — original `mov r0, ip` at PC=0x18 \
+             reads R12; with originals wrapper the analyzer must see it; got {}",
+            sea);
         if let Some(s) = sfl {
             assert_ne!(s, 12, "scratch_flags must NOT be R12; got {}", s);
         }
+    }
+
+    /// Documents the iter-49 bug: WITHOUT iter-50's originals-wrapper,
+    /// the analyzer reads HVC at PC=0x18, treats it as BLink (caller-
+    /// saved clobber), misses the R12 read, and the picker chooses R12.
+    /// Kept as a regression so any future regression in
+    /// `code_read_word_original_first` (e.g. table not populated, lookup
+    /// returning None) re-surfaces immediately.
+    #[test]
+    fn pick_scratch_at_findsuperceeder_without_originals_picks_r12() {
+        let hvc_06e = 0xE140_067Eu32;
+        let stream = [
+            0xE5D1_103Du32, 0xE331_0000u32, 0x03A0_200Du32, 0x13A0_2006u32,
+            0xE590_0000u32, 0xE3C0_120Fu32, hvc_06e, 0xE12F_FF1Eu32,
+        ];
+        let read = |pc: u32| stream.get((pc / 4) as usize).copied();
+        let d = decode(stream[0]).expect("decode LDRB");
+        let (sea, _sfl) = pick_scratch_regs_with_reader(&d, 0, &read)
+            .expect("picker should find dead reg(s)");
+        // The bug: without the originals wrapper, the picker chooses R12.
+        // If this assertion fires (with sea != 12), something changed in
+        // the analyzer that ALSO catches this case — re-evaluate whether
+        // the iter-50 originals-shim is still needed.
+        assert_eq!(sea, 12, "iter-49 bug repro: picker chooses R12; got {}", sea);
     }
 
     /// Iter-41 regression: a function uses LR (R14) as a save register

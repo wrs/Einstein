@@ -1643,10 +1643,74 @@ unsafe fn patch_probe(
         return;
     }
     unsafe { rom_ptr.add(idx).write(new_insn); }
+    record_original(pc, prev);
     kprintln!(
         "rom_patch: {:#010x}: {:#010x} -> {:#010x}  ({} probe, HVC #{:#x})",
         pc, prev, new_insn, name, imm
     );
+}
+
+/// Iter-50: side-table of `(pc, original_instruction)` pairs for ROM
+/// PCs that `patch_probe` has overwritten with an HVC. shadow_stub's
+/// liveness analyser consults this table via `read_original` so it
+/// sees the pre-patch instruction stream — necessary because
+/// `apply_717006_patches` runs BEFORE `shadow_stub::patch_rom_from_bitmap`,
+/// and without this table the analyser misclassifies probe-HVCs
+/// (e.g. picks R12 as scratch_ea at FindSuperceeder body's
+/// 0x001488ac because the original `mov r0, ip` at 0x001488c4 has
+/// been replaced with HVC #0x6E for the FINDSUPER_MID probe).
+///
+/// Capacity = 64: well above the ~20 probes installed today, with
+/// headroom for future per-stall probes. Single-threaded boot use,
+/// so a plain `static mut` with index counter is safe.
+const ORIG_CAP: usize = 64;
+static mut ORIG_PCS:    [u32; ORIG_CAP] = [0; ORIG_CAP];
+static mut ORIG_INSNS:  [u32; ORIG_CAP] = [0; ORIG_CAP];
+static mut ORIG_N:      usize = 0;
+
+fn record_original(pc: u32, orig: u32) {
+    // SAFETY: single-threaded boot path; `apply_717006_patches`
+    // runs once on core 0 before the guest is ERET'd in. Use raw
+    // pointers so we don't trip the rust_2024_compatibility lint
+    // about shared/mutable references to a static mut.
+    unsafe {
+        let n_ptr = core::ptr::addr_of_mut!(ORIG_N);
+        let n = n_ptr.read();
+        if n >= ORIG_CAP {
+            kprintln!(
+                "rom_patch: WARN — ORIG_PCS table full ({} entries) — \
+                 shadow_stub may misanalyse PC={:#010x}",
+                n, pc
+            );
+            return;
+        }
+        let pcs = core::ptr::addr_of_mut!(ORIG_PCS) as *mut u32;
+        let insns = core::ptr::addr_of_mut!(ORIG_INSNS) as *mut u32;
+        pcs.add(n).write(pc);
+        insns.add(n).write(orig);
+        n_ptr.write(n + 1);
+    }
+}
+
+/// Look up the original (pre-patch) instruction at `pc`. Returns
+/// `Some(orig)` if `patch_probe` previously rewrote that PC, else
+/// `None` — callers fall back to reading current ROM bytes.
+pub fn read_original(pc: u32) -> Option<u32> {
+    // SAFETY: single-threaded after boot; ORIG_N is monotonic-up
+    // and the slots below it are immutable post-patch. Read via raw
+    // pointers to satisfy the rust_2024_compatibility static-mut-ref
+    // lint without taking shared references to a static mut.
+    unsafe {
+        let n = core::ptr::addr_of!(ORIG_N).read();
+        let pcs = core::ptr::addr_of!(ORIG_PCS) as *const u32;
+        let insns = core::ptr::addr_of!(ORIG_INSNS) as *const u32;
+        for i in 0..n {
+            if pcs.add(i).read() == pc {
+                return Some(insns.add(i).read());
+            }
+        }
+    }
+    None
 }
 
 /// (Previously we patched every `T28F016_SA_SVDriver` method to emit

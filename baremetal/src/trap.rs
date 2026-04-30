@@ -2430,15 +2430,81 @@ fn handle_cardfault_throw_probe(ctx: &TrapContext) -> ! {
             let off = i * 4;
             let va = true_source_sp.wrapping_add(off);
             let label = match off {
+                0x2c => " ← saved fp (r11) at fault time",
+                0x34 => " ← saved sp (r13_usr)",
+                0x38 => " ← saved lr (r14_usr) — caller of TObjRef::Set",
+                0x3c => " ← saved pc (r15) — faulting instruction",
+                0x40 => " ← saved CPSR",
                 0x44 => " ← FAR",
                 0x48 => " ← DFSR/access (bit 0 = ?)",
-                0x58 => " ← offending PC",
                 _    => "",
             };
             match guest_mem::read_word_va(va) {
                 Some(w) => kprintln!("    sp+{:#04x} @{:#010x} = {:#010x}{}", off, va, w, label),
                 None    => kprintln!("    sp+{:#04x} @{:#010x} = (unmapped){}", off, va, label),
             }
+        }
+
+        // Iter-37: walk Tmux's APCS frame chain. The TProcessorState
+        // saved (sp, fp, lr, pc) at offsets 0x34, 0x2c, 0x38, 0x3c
+        // give us the active frame at fault time; from there we walk
+        // up using the FP-chain APCS convention:
+        //   fp[0]  = saved pc (= function entry pc + 8 by APCS)
+        //   fp[-1] = saved lr = caller's resume PC
+        //   fp[-2] = saved ip = caller's sp on entry
+        //   fp[-3] = saved fp = caller's fp
+        // We walk up to MAX_FRAMES frames; each step reads the
+        // saved-fp word to advance.
+        let saved_sp_usr = guest_mem::read_word_va(true_source_sp.wrapping_add(0x34)).unwrap_or(0);
+        let saved_fp = guest_mem::read_word_va(true_source_sp.wrapping_add(0x2c)).unwrap_or(0);
+        let saved_lr = guest_mem::read_word_va(true_source_sp.wrapping_add(0x38)).unwrap_or(0);
+        let saved_pc = guest_mem::read_word_va(true_source_sp.wrapping_add(0x3c)).unwrap_or(0);
+
+        kprintln!();
+        kprintln!(
+            "  Faulting task user stack at SP_USR={:#010x} (32 words):",
+            saved_sp_usr,
+        );
+        for i in 0..32u32 {
+            let off = i * 4;
+            let va = saved_sp_usr.wrapping_add(off);
+            match guest_mem::read_word_va(va) {
+                Some(w) => kprintln!("    sp+{:#04x} @{:#010x} = {:#010x}", off, va, w),
+                None    => kprintln!("    sp+{:#04x} @{:#010x} = (unmapped)", off, va),
+            }
+        }
+
+        kprintln!();
+        kprintln!("  APCS frame chain (faulting task):");
+        kprintln!(
+            "    [0] pc={:#010x} lr_to_caller={:#010x} fp={:#010x}",
+            saved_pc, saved_lr, saved_fp,
+        );
+        let mut fp = saved_fp;
+        for i in 1..8u32 {
+            // APCS: fp[-1] = saved lr (caller's resume PC),
+            //       fp[-3] = saved fp (caller's fp).
+            let lr_va = fp.wrapping_sub(4);
+            let fp_va = fp.wrapping_sub(12);
+            let pc_at_frame = guest_mem::read_word_va(fp).unwrap_or(0); // function entry+8
+            let caller_lr = match guest_mem::read_word_va(lr_va) {
+                Some(w) => w,
+                None    => break,
+            };
+            let caller_fp = match guest_mem::read_word_va(fp_va) {
+                Some(w) => w,
+                None    => break,
+            };
+            kprintln!(
+                "    [{}] fn_entry+8={:#010x} caller_lr={:#010x} caller_fp={:#010x}",
+                i, pc_at_frame, caller_lr, caller_fp,
+            );
+            // Stop if the chain has gone off the rails (unmapped or
+            // looping). 0 / non-RAM / repeating fp = end.
+            if caller_fp == 0 || caller_fp == fp || caller_fp < 0x0c000000 || caller_fp >= 0x10000000 {
+                break;
+            }
+            fp = caller_fp;
         }
     });
 }

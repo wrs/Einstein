@@ -266,6 +266,98 @@ TAlertEventHandler region.
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
 
+### Iteration 35 (next-loop iter 31): UnhandledException halt-on-entry — wedge originates in CardFaultMonProc
+
+User pointed out we should obviously halt directly at
+UnhandledException rather than at the downstream Reboot canary.
+Iter-35 wires the trip:
+
+- New HVC #0x69 at ROM `0x000B_0220` (UnhandledException entry)
+- New HVC #0x6A at ROM `0x000B_031C` (UnhandledNonUserModeException entry)
+- New `handle_unhandled_exception(ctx, non_user)` halt-on-entry
+  handler in `src/trap.rs`. Reads exception name from r0 as a
+  C-string (BE-byte-order within LE words, per Newton 2.x BE32
+  conventions in iter-30 docs) and prints it directly. Dumps r0..r3,
+  TRUE source mode/SP/LR via `UND_SAVE_SPSR_IPA`, and the first 8
+  words at r1 (exception data).
+
+#### Cold-boot result
+
+```
+*** invariant violation: kernel reached UnhandledException ***
+  variant: UnhandledException
+  r0=0x000afdd8  r1=0  r2=0  r3=0x00002163
+  exception name (r0) @ VA=0x000afdd8: "evt.ex.abt.perm"
+  TRUE source mode=USR  caller_lr=0x0004e664  sp=0x0c30df14
+
+current task: 'cdfm' (id=0x20c3)
+```
+
+The caller LR `0x0004e664` is right after `bl Throw` at
+`0x0004e660`, which lives inside
+`CardFaultMonProc__12TCardDomainsFlPv` at ROM `0x0004e498`.
+
+So the wedge is fully characterized:
+
+1. The `cdfm` task takes a **data-abort permission fault** in
+   card-domain memory.
+2. The kernel's `CardFaultMonProc` (registered as the fault
+   monitor for `TCardDomains`) examines the fault, decides
+   it can't recover, and `Throw`s `"evt.ex.abt.perm"`.
+3. No handler claims that exception → `UnhandledException`.
+4. `UnhandledException` decides "warm reboot" → `Reboot` →
+   ROMBoot loop.
+
+`r3=0x00002163` is task id of `cdsv` (the card-services task)
+— possibly the env/domain of the DABT.
+
+#### What this means for phase B
+
+`evt.ex.abt.perm` is the kernel's name for the kind of fault
+that 1 KiB subpage AP overlay was specifically designed to
+control. With AP-flatten, the kernel's monitor decides the
+fault is unhandleable. The fix path is one of:
+
+a. **Stage-2 splitting at the offending VA** — if we know the
+   FAR is in a Group-1 alias, install per-subpage stage-2
+   mappings that recreate the kernel-intent AP shape.
+b. **Patch `CardFaultMonProc`** to recognize the post-flatten
+   AP and treat it as a non-fault (e.g. ignore subpage AP
+   mismatches). Risky — could mask real faults.
+c. **Patch the kernel allocator** that handed the cdfm task
+   memory in a layout that doesn't match its expected
+   subpage AP plan. Most invasive but most "correct".
+
+#### Next iteration plan (iter-36)
+
+1. **Halt at Throw or at the ABT decision point.** Add a probe
+   inside `CardFaultMonProc` (~0x0004e660 — at the `bl Throw`)
+   so we capture the full state immediately before Throw is
+   called: monitor's argument (the TException-like structure
+   it just decided was unhandleable), the FAR/DFSR captured
+   in the fault frame, the offending USR-mode PC.
+
+2. **Or halt earlier still: at `DataAbortHandler` permission-
+   fault classification.** The existing DAH probes log the
+   DABT entry; iter-36 can extend with a halt when the
+   classified DFSR is permission (status=0xD or similar) AND
+   the monitor returns unhandleable.
+
+3. Once we have `(FAR, DFSR, USR_PC, faulting insn)`, decode
+   the access type (load/store/byte/word) and pick the fix
+   strategy from a/b/c above.
+
+#### Status
+
+- Build clean.
+- UnhandledException halt-on-entry tripwire fires cleanly with
+  exception name dumped as ASCII.
+- Caller pinned to `CardFaultMonProc` → bl Throw → "evt.ex.abt.perm".
+- 30/30 shadow_stub tests pass.
+- Iter-35 deliverables: removed dependency on the Reboot canary
+  and stack-string decode trick; PLAN.md plan for iter-36
+  scoped to capture the underlying FAR/DFSR/USR_PC.
+
 ### Iteration 34 (next-loop iter 30): TRUE caller decoded — wedge is "evt.ex.abt.perm" UnhandledException
 
 Iter-33 enhanced the canary handler with SP_und + R0 + R3

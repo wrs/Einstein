@@ -935,6 +935,25 @@ const WC_BNE_FIRST_INSN:                  u32 = 0x1A00_000C; // bne 0x2570c0
 pub const WC_BNE_TAKEN_TARGET:            u32 = 0x0025_70C0;
 pub const WC_BNE_FALLTHROUGH_TARGET:      u32 = 0x0025_708C;
 
+/// `UnhandledException(char* name, void* data, void(*handler)(void*))`
+/// at ROM `0x000B_0220`. The first arg `r0` is a pointer to the
+/// exception name as an ASCII string (e.g. "evt.ex.abt.perm" for a
+/// permission DABT). Patching the entry with HVC and dumping the
+/// name string directly is the right wedge tripwire — far cleaner
+/// than chasing the downstream Reboot canary and decoding the
+/// stack-passed string.
+pub const UNHANDLED_EXCEPTION_HVC_IMM:    u32 = 0x69;
+pub const UNHANDLED_EXCEPTION_PC:         u32 = 0x000B_0220;
+const UNHANDLED_EXCEPTION_FIRST_INSN:     u32 = 0xE1A0_C00D; // mov ip, sp
+
+/// `UnhandledNonUserModeException(char*, void*, void(*)(void*))` at
+/// ROM `0x000B_031C`. Same signature as `UnhandledException` but
+/// invoked from non-USR contexts (UND/SVC/ABT). Mirrors the
+/// previous probe so we catch both paths at entry.
+pub const UNHANDLED_NUM_EXCEPTION_HVC_IMM: u32 = 0x6A;
+pub const UNHANDLED_NUM_EXCEPTION_PC:      u32 = 0x000B_031C;
+const UNHANDLED_NUM_EXCEPTION_FIRST_INSN:  u32 = 0xE1A0_C00D; // mov ip, sp
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -1375,6 +1394,22 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(WC_BNE_PROBE_HVC_IMM),
             "WriteChunk bne (control-flow emulator)",
             WC_BNE_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            UNHANDLED_EXCEPTION_PC,
+            UNHANDLED_EXCEPTION_FIRST_INSN,
+            hvc_insn(UNHANDLED_EXCEPTION_HVC_IMM),
+            "UnhandledException entry (halt-on-entry tripwire)",
+            UNHANDLED_EXCEPTION_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            UNHANDLED_NUM_EXCEPTION_PC,
+            UNHANDLED_NUM_EXCEPTION_FIRST_INSN,
+            hvc_insn(UNHANDLED_NUM_EXCEPTION_HVC_IMM),
+            "UnhandledNonUserModeException entry (halt-on-entry tripwire)",
+            UNHANDLED_NUM_EXCEPTION_HVC_IMM,
         );
     }
 }

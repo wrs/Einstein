@@ -17,18 +17,23 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-47):** The Phase-B bus-abort (`evt.ex.abt.bus`,
-FAR=0xea0061c4) is `c0cd8: ldr r2, [r0, #36]` inside `PhysBlock`,
-called with r0=NULL via the chain
-TFlashStore::Lookup → IsVirgin → LogEntryOffset (wrapper@c0cac) →
-PhysBlock(NULL). The NULL originates in Lookup at `c74cc: ldr r0,
-[TFlashStore->[+44], index, lsl #2]`. iter-47 must probe Lookup`s
-table-base load (c74c8) to bisect:
-  (a) wild base (= 0x20000000) → trace who wrote the wrong base, OR
-  (b) sane base, NULL entry → Lookup iterating past valid extent.
-Cold-boot dabt-trip captured r4[+44]=0x20000000 r1=0x27 at PC=c74cc,
-which favours (a). 64 prior PhysBlock calls had sane r0 (0x0c605950
-or 0x0c605970).
+**Current goal (iter-48):** Lookup's TFlashBlock-pointer table at
+`TFlashStore->[+44]` contains wild entries. iter-47 added a probe at
+c74c8 (`ldr r0, [r4, #44]`) and observed the base = `0x0c605848` is
+ALWAYS sane in 8+ logged calls (r4 = `0x0c604c04` = the sole boot-
+time TFlashStore). So iter-46 hypothesis (a) "wild base" REJECTED;
+hypothesis (b) "sane base, wild/NULL entry" CONFIRMED. The boot now
+progresses past the iter-46 wedge and hits an unaligned-load fault
+at `0xc0c9c: ldr r1, [r0, #8]` (LogEntryOffset entry) with r0 =
+`0x0a000005` — yet another wild TFlashBlock\* pulled from the table.
+
+iter-48 must probe the natural table-indexed load at c74cc (`ldr
+r0, [r0, r1, lsl #2]`) — capture (base, index, returned). Halt
+when `table[index]` is outside RAM (0x0c000000..0x10000000) and
+ROM (0..0x800000). Dump table neighbourhood at the bad index +
+walk the caller chain. Then decide: are we iterating PAST the
+valid extent (r1 too large), or are specific table entries being
+overwritten between init and use?
 
 ### Iteration 46: bus-abort is PhysBlock(NULL) via Lookup→IsVirgin→LogEntryOffset
 
@@ -91,127 +96,59 @@ LogEntryOffset → PhysBlock(NULL).
    call #65+ suggests iter-past-end rather than gradual
    corruption — favors hypothesis #3.
 
-### Iteration 45 (next-loop iter 5): wrapper@c0cac fp always sane — fault is in the tail-called TFlashPhysBlock::LogEntryOffset, not in the wrapper
+### Iteration 47: Lookup's `[r4+44]` table base is consistently sane — wild values are TABLE ENTRIES, not the base
 
-Iter-44 hypothesized fp corruption at the wrapper's ldmdb.
-Iter-45 patches the wrapper's first instruction (`mov ip, sp`
-at 0x000c_0cac, which is INSIDE `LogEntryOffset__11TFlashBlockFv`)
-to capture incoming fp and walk the caller chain when wild.
+Patched `c74c8: ldr r0, [r4, #44]` with HVC. Handler reads
+`[r4+44]`, halts if outside RAM (0x0c000000..0x10000000) or ROM
+(0..0x800000), else emulates and continues.
 
-#### Cold-boot output
+Cold-boot result: 8+ logged Lookup-base events all show
+`r4=0x0c604c04` (sole boot-time TFlashStore, lives in RAM), and
+`[r4+44] = 0x0c605848` (in RAM, sane) for every call. **No halt
+fired.** Hypothesis (a) "wild base = 0x20000000" REJECTED. The
+prior iter-46 `dabt-trip: PC=0xc74cc r0=0x20000000` line was a
+recoverable kernel DABT on an unrelated path — not the wedge call.
 
-All 8+ logged wrapper@c0cac calls have SANE incoming fp:
-
-```
-wrapper@c0cac #0: fp=0x0c328f14 caller_lr=0x000c0818 sp=0x0c328f08
-wrapper@c0cac #1: fp=0x0c328f14 caller_lr=0x000c0818 sp=0x0c328f08
-wrapper@c0cac #2: fp=0x0c328e88 caller_lr=0x000c0818 sp=0x0c328e7c
-wrapper@c0cac #3: fp=0x0c328e88 caller_lr=0x000c0818 sp=0x0c328e7c
-wrapper@c0cac #4: fp=0x0c328f14 caller_lr=0x000c0818 sp=0x0c328f08
-wrapper@c0cac #5: fp=0x0c328f14 caller_lr=0x000c0818 sp=0x0c328f08
-wrapper@c0cac #6: fp=0x0c328ea0 caller_lr=0x000c0818 sp=0x0c328e94
-wrapper@c0cac #7: fp=0x0cc77d28 caller_lr=0x000c0818 sp=0x0cc77d1c
-```
-
-All fp values are in valid Tmux stack range. Hypothesis #2
-(fp inherited wild) is REJECTED.
-
-#### The actual fault site
-
-`c0cac` is INSIDE `LogEntryOffset__11TFlashBlockFv` (entry at
-0xc0c9c). The function:
+The boot now progresses past iter-46's PhysBlock(NULL) wedge:
+the iter-44 PhysBlock probe halts on `*[r0]` wild ONLY when r1
+!= -1 (the early-return gate). Some path through Lookup now
+returns `table[index] = 0x0a000005` (not NULL, not in PhysBlock-
+probe halt class), and that wild pointer reaches
+`LogEntryOffset__11TFlashBlockFv` at c0c9c → `ldr r1, [r0, #8]`
+faults UNALIGNED (0x0a00000d & 3 != 0). End-of-boot output:
 
 ```
-000c0c9c <LogEntryOffset__11TFlashBlockFv>:
-   c0c9c: ldr r1, [r0, #8]       ; early return check
-   c0ca0: cmn r1, #1
-   c0ca4: moveq r0, #0
-   c0ca8: moveq pc, lr            ; return r0=0 if [r0+8]==-1
-   c0cac: mov ip, sp              ← our probe
-   c0cb0: push {fp, ip, lr, pc}
-   c0cb4: sub fp, ip, #4
-   c0cb8: bl PhysBlock             ; lr = 0xc0cbc
-   c0cbc: ldmdb fp, {fp, sp, lr}
-   c0cc0: b 0x1afef68 <LogEntryOffset__15TFlashPhysBlockFv>
-                                   ← tail-call to a DIFFERENT class's
-                                     getter — same name, different class
+unaligned: cannot read aligned 0x0a00000c (EA=0x0a00000d) at PC=0xc0c9c
+  r0..r7: 0x0a000005 0x00000027 0x0000000d 0xe59d0000
+          0x0c604c42 0x0000000d 0x0c328e90 0x00000027
 ```
 
-The tail-call target is `LogEntryOffset__15TFlashPhysBlockFv`
-at 0x000c2418. Looking at it:
+So `Lookup.table[index] = 0x0a000005` for some index. Either
+the index is past the valid extent (table holds garbage past N),
+or specific entries got overwritten after init.
 
-```
-000c2418 <LogEntryOffset__15TFlashPhysBlockFv>:
-   c2418: ldr r0, [r0, #12]      ← THE FAULTING INSTRUCTION
-   c241c: mov pc, lr               ; return
-```
+#### Next iteration plan (iter-48)
 
-A single-instruction getter that reads field at offset 12
-from the TFlashPhysBlock pointer (= the value PhysBlock
-returned). If PhysBlock returned a wild pointer, this ldr
-faults.
+1. **Probe at c74cc** (`ldr r0, [r0, r1, lsl #2]`). Capture
+   `(base, index, table[index])`. Emulate the load. Halt when
+   the loaded value is outside RAM/ROM. Dump 16 words around
+   `base + index*4` to see whether neighbouring entries are
+   sane (→ specific corruption) or wild (→ iterating past end).
 
-Since `b 0x1afef68` is a plain branch (not bl), lr is
-preserved as 0xc0cbc through the tail-call. Hence Throw's
-caller_lr = 0xc0cbc matches even though the actual faulting
-PC is at c2418 (inside a function entered via tail-call).
+2. **If iter-past-end**: Lookup's calling convention probably
+   has a max-index check upstream. Check what `r7` (the search
+   key) and `[r4+96]` (the shift) are doing — `r1 = r7 >> shift`
+   should bound the index. Trace whether a too-large r7 is
+   reaching Lookup.
 
-#### What PhysBlock returns
+3. **If specific-entry corruption**: install a stage-2 RO trap
+   on the affected table page (PA backing 0x0c605848) once the
+   bad index is known. Capture every writer.
 
-Reviewing PhysBlock's body:
-
-```
-000c0cc4 <PhysBlock>:
-   c0cc4: ldr r1, [r0, #8]      ; r1 = this->[8] (offset)
-   c0cc8: cmn r1, #1
-   c0ccc: moveq r0, #0
-   c0cd0: moveq pc, lr           ; if [r0+8]==-1, return 0
-   c0cd4: ldr r0, [r0]           ; r0 = *this (a TFlashStore*)
-   c0cd8: ldr r2, [r0, #36]      ; r2 = store->[36] (table base)
-   c0cdc: ldr r0, [r0, #88]      ; r0 = store->[88] (shift)
-   c0ce0: lsr r0, r1, r0         ; r0 = r1 >> shift (index)
-   c0ce4: add r0, r0, r0, lsl #1 ; r0 = index * 3
-   c0ce8: add r0, r2, r0, lsl #3 ; r0 = table + index * 24 (TFlashPhysBlock pointer)
-   c0cec: mov pc, lr             ; return
-```
-
-PhysBlock returns `table_base + (offset >> shift) * 24`,
-indexing into a TFlashPhysBlock array. If `index` overshoots
-the array bounds OR `table_base` is corrupted, the returned
-pointer is wild.
-
-In the wedge call, PhysBlock might have returned a value
-like 0xea0061b8 (TFlashPhysBlock pointer + 12 = 0xea0061c4
-= the FAR we observed).
-
-#### Next iteration plan (iter-46)
-
-1. **Probe at LogEntryOffset__15TFlashPhysBlockFv entry**
-   (PC=0x000c2418) to capture r0. Patch the `ldr r0, [r0, #12]`
-   with HVC; if r0 is wild, halt with the caller chain
-   walked. Otherwise emulate the load.
-
-2. **If r0 entering this getter is wild**: the bug is in
-   how PhysBlock computes the table index. Look at PhysBlock's
-   inputs (its own r0 = TFlashBlock* and the [r0+8] offset
-   field). If offset is too large or the table base
-   (TFlashStore->[36]) points to wild memory, the returned
-   pointer is wild.
-
-3. **Cross-reference with the prior PhysBlock probe**: extend
-   it to also log r0 at PhysBlock EXIT (the returned value)
-   so we can pair-match `(input r0, returned r0)`.
-
-#### Status
-
-- Build clean.
-- 65+ wrapper@c0cac calls observed with sane fp.
-- Bus-abort precisely localized: `ldr r0, [r0, #12]` at PC=
-  0x000c2418 inside `LogEntryOffset__15TFlashPhysBlockFv`,
-  with r0 = wild TFlashPhysBlock* returned by PhysBlock.
-- iter-45 deliverable: rejected the iter-44 fp-corruption
-  hypothesis; pinned the actual faulting instruction; identified
-  the data-flow source (PhysBlock's return value).
+4. **Cross-reference Einstein**: `build/NewtonProbe` should
+   show what a fully-booted Newton's TFlashStore->[+44] table
+   looks like. If our boot's table differs only in a few
+   entries, that's the corruption fingerprint.
 
 ## Workflow per stop
 

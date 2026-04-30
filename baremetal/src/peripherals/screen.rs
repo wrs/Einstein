@@ -133,24 +133,42 @@ fn get_screen_info(ctx: &mut TrapContext, pc: u32) {
 ///   r3 = dst SRect pointer    (same layout)
 ///   [SP + 4] = mode (blit mode, ignored here)
 ///
-/// PixelMap layout (struct NewtonPixmap in TNativePrimitives.cpp:68):
-///   +0x00  addy      — bitmap data pointer (guest VA)
-///   +0x04  rowBytes  — bytes per source row
-///   +0x08  bounds    — SRect {top, left, bottom, right}
+/// PixelMap layout (struct NewtonPixmap in TNativePrimitives.cpp:68;
+/// confirmed against TScreenManager::Blit @ Screen/TScreenManager.cpp):
+///   +0x00  addy           — bitmap data pointer (guest VA)
+///   +0x04  rowBytes_pkd   — packed; actual rowBytes = (word >> 16)
+///   +0x08  pixmapTopLeft  — pixmap's coordinate-space origin
+///                            (top in high 16, left in low 16);
+///                            src rect is given in this same space
+///                            and must be biased back to byte offsets
+///                            inside `addy`
 ///   +0x10  flags
 ///   +0x14  table
 ///
 /// We copy the row band [src.top, src.bottom) of the pixmap into
-/// GUEST_FB laid out identically for the destination rect. For 1-bpp
-/// Newton panels, rowBytes already encodes the pixel-to-byte packing,
-/// so a byte-wise copy is correct.
+/// GUEST_FB. For 1-bpp Newton panels, rowBytes already encodes the
+/// pixel-to-byte packing, so a byte-wise copy is correct (we don't
+/// model bit-aligned masking like Einstein's `Blit_0` because the
+/// Newton ROM aligns its src rects to byte boundaries on a 320-px
+/// 1-bpp panel — `srcLeft` always lands on a multiple of 8).
 fn blit(ctx: &mut TrapContext, pc: u32) {
     let pixmap_va = ctx.x[1] as u32;
     let src_rect_va = ctx.x[2] as u32;
     let dst_rect_va = ctx.x[3] as u32;
 
     let addy = read_word_or_halt(pixmap_va, "pixmap.addy", pc);
-    let row_bytes = read_word_or_halt(pixmap_va + 4, "pixmap.rowBytes", pc);
+    // rowBytes is in the HIGH 16 bits of the word at +0x04 (per
+    // TScreenManager::Blit `srcRowBytes >> 16`). Iter-53 wedge:
+    // reading the full word gave row_bytes = 0x00280000 — a 2.5 MB
+    // stride that walked addy+(src_top*row_bytes) into unmapped
+    // memory at 0xc64d000 within a few rows.
+    let row_bytes_pkd = read_word_or_halt(pixmap_va + 4, "pixmap.rowBytes_pkd", pc);
+    let row_bytes = row_bytes_pkd >> 16;
+    // pixmap origin: src/dst rects are in this coord space; subtract
+    // to get byte offsets relative to `addy`.
+    let pixmap_top_left = read_word_or_halt(pixmap_va + 8, "pixmap.topLeft", pc);
+    let pixmap_top = (pixmap_top_left >> 16) as u16;
+    let pixmap_left = (pixmap_top_left & 0xFFFF) as u16;
 
     let (src_top, src_left, src_bottom, src_right) =
         read_rect(src_rect_va, "srcRect", pc);
@@ -165,19 +183,58 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
         cpu::halt();
     }
 
+    // Bias src rect into pixmap-relative coordinates. Halt loud on
+    // an out-of-bounds source — that's a kernel-data inconsistency
+    // we want to see, not silently zero-blit.
+    if src_top < pixmap_top || src_left < pixmap_left {
+        kprintln!(
+            "*** screen.blit: src ({},{}) outside pixmap origin ({},{}) @PC={:#x}",
+            src_top, src_left, pixmap_top, pixmap_left, pc
+        );
+        cpu::halt();
+    }
+    let pixmap_src_top = src_top - pixmap_top;
+    let pixmap_src_left = src_left - pixmap_left;
+
     let height = (src_bottom - src_top) as u32;
 
-    // The destination rect tells us where in the FB the band lands.
-    // We treat the FB as a linear bitmap whose row stride matches the
-    // source pixmap — same packing, same byte-per-pixel — so the
-    // copy is a straight (src -> fb) memmove per row.
-    let fb_stride = row_bytes;
-    let dst_row0_offset = (dst_top as u32) * fb_stride;
+    // Up-front parameter dump so a partial blit halt downstream can
+    // be correlated with the pixmap geometry that drove it.
+    log_blit_enter(pc, pixmap_va, addy, row_bytes,
+        pixmap_top, pixmap_left,
+        src_top, src_left, src_bottom, src_right,
+        dst_top, dst_left, dst_bottom, dst_right);
+
+    // 1-bpp packing: each byte holds 8 pixels. Src starts at
+    // addy + (pixmap_src_top * rowBytes) + (pixmap_src_left / 8).
+    // Newton aligns srcLeft to 8-pixel boundaries on the 320-px
+    // panel; if a future caller breaks that, halt loudly so we can
+    // port Einstein's bit-mask path.
+    if (pixmap_src_left & 0x7) != 0 {
+        kprintln!(
+            "*** screen.blit: src_left {} not 8-pixel aligned (would need bit-mask blit) @PC={:#x}",
+            src_left, pc
+        );
+        cpu::halt();
+    }
+    let src_col0_byte = (pixmap_src_left / 8) as u32;
+    let src_width_pixels = (src_right - src_left) as u32;
+    if src_width_pixels & 0x7 != 0 {
+        kprintln!(
+            "*** screen.blit: src width {} px not multiple of 8 @PC={:#x}",
+            src_width_pixels, pc
+        );
+        cpu::halt();
+    }
+    let src_width_bytes = src_width_pixels / 8;
+
+    let fb_row_bytes = (SCREEN_WIDTH * SCREEN_BPP) / 8;
 
     let mut copied = 0u32;
     for row in 0..height {
-        for col in 0..row_bytes {
-            let src_va = addy + (src_top as u32 + row) * row_bytes + col;
+        let src_row = addy + (pixmap_src_top as u32 + row) * row_bytes + src_col0_byte;
+        for col in 0..src_width_bytes {
+            let src_va = src_row + col;
             // src_va is a guest VA when stage-1 is on (post-MMU
             // Newton boot); when stage-1 is off (guest-test runtime),
             // VA is treated as PA via the identity. translate_va
@@ -194,9 +251,16 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
                     cpu::halt();
                 }
             };
-            let fb_off = dst_row0_offset + row * fb_stride + col;
+            // Newton 1-bpp pixmaps are stored INVERTED (1 = white,
+            // 0 = black) relative to the host framebuffer convention
+            // we use; Einstein's Blit_0 flips with `~chunk` for
+            // srcCopy mode. Mirror that here so the FB dumps look
+            // right.
+            let fb_byte = !byte;
+            let fb_off = (dst_top as u32 + row) * fb_row_bytes
+                + ((dst_left as u32) / 8) + col;
             let fb_ipa = guest_mem::FB_IPA_BASE.wrapping_add(fb_off);
-            if !guest_mem::write_byte_pa(fb_ipa, byte) {
+            if !guest_mem::write_byte_pa(fb_ipa, fb_byte) {
                 kprintln!(
                     "*** screen.blit: FB IPA {:#x} outside framebuffer",
                     fb_ipa
@@ -259,6 +323,26 @@ fn log_blit(pc: u32, addy: u32, row_bytes: u32, height: u32,
             "screen.blit @PC={:#x} addy={:#x} rowBytes={} h={} src=({},{},{},{}) dst=({},{},{},{}) copied={}",
             pc, addy, row_bytes, height,
             st, sl, sb, sr, dt, dl, db, dr, copied
+        );
+    }
+}
+
+fn log_blit_enter(pc: u32, pixmap_va: u32, addy: u32, row_bytes: u32,
+    pmt: u16, pml: u16,
+    st: u16, sl: u16, sb: u16, sr: u16,
+    dt: u16, dl: u16, db: u16, dr: u16,
+) {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static BUDGET: AtomicUsize = AtomicUsize::new(0);
+    const MAX: usize = 8;
+    let n = BUDGET.fetch_add(1, Ordering::Relaxed);
+    if n < MAX {
+        kprintln!(
+            "screen.blit ENTER @PC={:#x} pixmap={:#x} addy={:#x} rowBytes={} pmTL=({},{}) src=({},{},{},{}) dst=({},{},{},{})",
+            pc, pixmap_va, addy,
+            row_bytes,
+            pmt, pml,
+            st, sl, sb, sr, dt, dl, db, dr,
         );
     }
 }

@@ -17,45 +17,105 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-53):** iter-52 fixed the FindSuperceeder
-wild-r3 wedge: shadow_stub's liveness analyser was treating
-unreachable Direct/Cond branch targets as `APCS_RETURN_LIVE` only,
-but every Newton ROM jumptable thunk is reached via such a branch
-and is a tail-call passing args in R0..R3. Adding `APCS_PARAMS`
-to the live mask at unreachable targets fixes the `b 0x1afef70`
-(jumptable thunk for `Lookup`) entry in FindSuperceeder. Picker
-at 0x001488ac now falls back to `ScratchVA` (R12/R0/R2) instead
-of clobbering R3.
+**Current goal (iter-54):** iter-53 fixed the screen.blit wedge:
+the rowBytes field at pixmap+4 is packed in the high 16 bits
+(per Einstein's `TScreenManager::Blit` reading
+`srcRowBytes >> 16`), and the source rect is in the pixmap's
+own coordinate space (must be biased back through pixmap+8
+`pixmapTopLeft`). Our previous code read the full 32-bit word as
+rowBytes, so rowBytes=2621440 (=0x280000) walked the bitmap
+pointer off the end of mapped RAM after a few rows. With the
+fix, rowBytes=40 (0x28) and the blit completes for the
+320×480 screen.
 
-The same iter also added `0x08 GetFeature` and `0x09 SetFeature`
-handlers to `peripherals/screen.rs` (filling in stubs from
-Einstein's `TNativePrimitives.cpp:1662`) and converted
-`get_screen_info` / `blit` reads to use stage-1 translate-or-
-identity (so MMU-on Newton boot works while MMU-off guest tests
-still pass).
+The blit also now inverts each byte (Newton 1-bpp convention vs
+host FB) and lays rows out at SCREEN_WIDTH/8 = 40-byte stride
+(the fixed FB stride, not the source rowBytes — the previous
+code matched src and dst strides which only happened to work
+when both were tiny test buffers). `test_screen_blit.S` was
+updated to match these semantics.
 
-Boot now progresses to NewBlock #758+ allocations and hits
-a NEW wedge in `screen.blit`:
+Boot now progresses to NewBlock #769 and hits a NEW wedge:
+the kernel's user-mode code branched to a wild PC = 0xe7f842f0
+(an undefined-instruction encoding pattern, not a real ROM
+address). The DIAG vector intercept dump shows:
 
 ```
-*** screen.blit: src VA 0xc64d000 → PA 0xc64d000 outside
-    mapped regions
+*** DIAG vector intercept (HVC #DIAG_TAG from mode ABT) ***
+  ELR_EL2   = 0x00000010  (PC of insn after HVC)
+  faulting PC 0xe7f842f0 insn=0xdeadbeef
+  pre-fault SP=0x0cc7787c LR=0x0035c498
+  r0=0x0cc77c40 r1=0xfffffffe r12=0x0cc778bb
 ```
 
-The kernel's pixmap at addy=0xc64cb64..0xc64cba4 has its bitmap
-data spanning into 0xc64d000+ which the kernel hasn't yet
-stage-1-mapped to RAM. Likely a lazy-mapping page that the kernel
-faults in on first access; our blit walks the bitmap eagerly
-without triggering the kernel's fault path.
+Pre-fault mode was USR; LR_usr = 0x0035c498. The wild PC
+likely came from a corrupted function pointer or an LDM-with-PC
+that loaded garbage from a spilled stack slot.
 
-iter-53 should:
-1. Decide if the blit src walk should let the kernel do the
-   stage-1 fault (e.g., have the hypervisor pre-touch the page
-   via a synthetic DABT to a kernel ResolveFault handler), or
-   2. Just check the mapping and return early when the bitmap
-      isn't fully mapped (the kernel will retry).
-3. Or: examine whether our addy/rowBytes/src_top math is wrong
-   and we're walking past the actual valid bitmap region.
+iter-54 should:
+1. Backtrace from LR_usr=0x0035c498 to identify the call site
+   that branched to the wild PC.
+2. Inspect the user-stack contents at SP_usr=0x0cc7787c to find
+   the spilled register (likely R12 or PC) that held 0xe7f842f0.
+3. Decide if this is yet another shadow_stub mis-pick, a stack-
+   corruption upstream, or a kernel-data-structure issue.
+
+### Iteration 53: screen.blit pixmap interpretation aligned with Einstein's TScreenManager
+
+iter-52's fix unblocked the boot to NewBlock #758, where the
+Tmux task issued a Blit native primitive. The hypervisor's
+blit halted with `screen.blit: src VA 0xc64d000 outside mapped
+regions` — a few rows into the copy, the bitmap walker had
+walked `addy + N * rowBytes` clear off the end of RAM.
+
+#### Mechanism
+
+Einstein's `TScreenManager::Blit` (Screen/TScreenManager.cpp)
+reads pixmap+0x04 with `srcRowBytes = word >> 16` — rowBytes
+is in the HIGH 16 bits of the packed word. The Newton ROM
+stored 0x00280000 there; the high half is 0x0028 = 40
+(the 1-bpp byte count for a 320-pixel-wide row). Our code
+took the whole 32-bit word, getting rowBytes = 2621440 (= 2.5
+MiB stride per row). The first row started at addy=0xc646d00
+and the second row tried to read at 0xc646d00 + 2621440 =
+0xc8c6d00 — well past the heap top.
+
+Einstein also reads pixmap+0x08 as `pixmapTopLeft` (top in high
+16, left in low 16) and biases the src rect into pixmap-relative
+coordinates (`srcLeft -= pixmapLeft`, `srcTop -= pixmapTop`).
+Our code skipped this step. For the boot blit the topLeft is
+(0,0) so the bias was a no-op, but kernel UI code that uses
+sub-pixmap rects (Newton's compositor does) would have crashed
+the same way.
+
+#### Fix
+
+`peripherals/screen.rs::blit` now:
+1. Reads `rowBytes = word_at_pixmap+4 >> 16`.
+2. Reads `pixmap_top_left` at +0x08, biases src rect to
+   pixmap-relative.
+3. Halts loud on src_left or src_width not 8-pixel aligned (we
+   don't model Einstein's bit-mask blit — Newton's 320-px panel
+   stays byte-aligned in practice; the halt makes a future
+   non-aligned caller surface immediately rather than corrupting
+   the FB).
+4. Inverts each byte before writing FB (Newton 1-bpp `1 = pen-
+   pressed` vs host FB `1 = white`).
+5. Lays out rows in FB at `SCREEN_WIDTH / 8 = 40` bytes stride,
+   not the source rowBytes (which only matched by accident in
+   the small test pixmap).
+
+`test_screen_blit.S` was updated to match: rowBytes is now
+packed (`(4 << 16)`), expected FB bytes are inverted, and row 1
+is read at FB[+40] not FB[+4].
+
+#### Verification
+
+- All 36 guest tests pass (test_screen_blit re-greens with the
+  updated expectations).
+- Cold boot: blit completes 19200 bytes copied for the
+  320×480 screen and proceeds to NewBlock #769. New wedge is a
+  wild PC=0xe7f842f0 in USR mode (iter-54).
 
 ### Iteration 52: FindSuperceeder wild-r3 root-caused — Direct-branch unreachable targets need APCS_PARAMS
 
@@ -143,116 +203,6 @@ allocations) and hit:
 The next wedge — `screen.blit: src VA 0xc64d000 outside mapped
 regions` — is iter-53 territory.
 
-### Iteration 51: WriteRun bus-abort root-caused — visited-set leak in liveness analyser
-
-iter-50's wedge (Throw `evt.ex.abt.bus` from
-`TStackManager::Fault @0x001f8534`) traced to a corrupted
-`TUnicodeCompressor::count` field (this[+0x9c]=0x20000111 instead
-of expected 0..0xff). WriteRun then iterated that runaway count
-and walked off the end of the heap region at byte VA=0x0c647003,
-triggering a stack-grow fault that ResolveFault refused (FAR was
-1 byte past the registered upper bound).
-
-#### Mechanism
-
-Working backwards from the corruption:
-
-1. `WriteChunk @0x00257080` is `ldrb r1, [r4, #160]` — read the
-   compressor's flag byte. shadow_stub patches this to `B stub`.
-2. The stub's pre/post `MRS R0, CPSR` / `MSR cpsr_f, R0` pair
-   uses R0 as `scratch_fl` (where the picker stored "save NZCV
-   here") because the picker's liveness analyser misclassified
-   R0 as dead.
-3. The `MRS R0, CPSR` overwrote R0 with 0x20000110 (the saved
-   condition flags + USR mode bits).
-4. The next ROM instruction `add r1, r0, #1 @0x0025708c` then
-   computed r1 = 0x20000110 + 1 = 0x20000111 and stored it as
-   the new `count`.
-5. WriteRun later loaded that wild count and looped 0x353
-   iterations, eventually reading byte at this+0x3F4 = 0x0c647000
-   which is past the stack/heap upper bound → bus abort →
-   throw → unhandled.
-
-#### Root cause: visited-set conflated cycle-break with memoization
-
-`live_at_recursive` used a single `Visited` flat list that served
-two purposes incompatibly:
-
-- **Cycle break**: revisit-on-current-call-stack returns 0 (no
-  new reads from this back-edge). Correct.
-- **Memoization**: revisit-of-fully-walked-block returns 0 (the
-  first walk already counted the reads). **WRONG** — the caller
-  applies `live |= sub & !written` with the CALLER'S local
-  `written`. If the original walk visited the block deep inside
-  a sub-tree where the caller's `written` masked out R0, that
-  R0-read DIDN'T propagate up to the OUTER caller's frame. When
-  the outer caller's direct path then tried to walk the same
-  block, the visited check returned 0 instead of recomputing
-  with the outer's empty `written`.
-
-Concrete failure for `0x00257080`:
-
-```
-outer (0x257084)
-├── teq r1, sl (R1, R10 read)
-└── BNE 0x2570c0 → recurse:
-    ├── taken: 0x2570c0 (mov r0, r4 → written |= R0)
-    │         → bl WriteRun (R0 caller-saved → written |= R0)
-    │         → ... deep walk eventually back-edges to 0x25705c
-    │         → 0x25705c walks → ldrb r1, [r4, #160] @ 0x257080
-    │           → BNE 0x2570c0 (visited!) →
-    │           → fall=0x25708c FIRST visited HERE, deep,
-    │             where written includes R0 → R0 read masked
-    │             out before bubbling up
-    │ This frame returns its live (no R0).
-    └── fall: 0x25708c (visited!) → returns 0 ← BUG
-   
-outer's live |= (taken_no_R0 | 0) & !0 = no R0
-```
-
-The OUTER's direct fall path has empty `written`, so a fresh
-walk would have correctly reported R0 live. The visited cache
-robbed it of that walk.
-
-#### Fix
-
-`Visited` now carries per-block analysis state (`InProgress` →
-`Finished(live_in)`). `live_at_recursive` returns:
-
-- `0` when revisiting a block currently being walked (cycle break).
-- The cached `live_in` when revisiting a block already fully
-  analysed (proper memoization — `live_in(B)` is independent of
-  the caller's local `written` because the caller applies its
-  mask AFTER receiving the result).
-
-`nzcv_dead_recursive` got the same treatment (encodes its bool
-result as 0/1 in the same `Visited::live` array; values never
-collide with the `LIVE_IN_PROGRESS = u16::MAX` sentinel).
-
-#### Verification
-
-- `shadow_stub pick @0x00257080` now reports
-  `DeadReg sea=R12 sfl=None` (single-scratch with NZCV-dead);
-  R0 no longer chosen.
-- All 36 shadow_stub unit tests pass, including 2 new iter-51
-  regression tests:
-  - `liveness_shared_block_does_not_drop_reads_iter_51` — the
-    shared-block-via-two-paths pattern that exposed the bug.
-  - `liveness_tight_cycle_terminates_iter_51` — confirms the
-    in-progress sentinel still breaks tight self-loops.
-- All 36 guest tests pass.
-- Cold boot no longer Throws `evt.ex.abt.bus`. Boot reaches
-  Tmux task and a different wedge (the iter-52 starting point).
-
-#### Why this didn't surface earlier
-
-The existing `pick_scratch_at_rom_0x257080_does_not_pick_r0`
-test correctly exercised the simplified pattern but didn't
-include the deep BL/back-edge structure that triggers the
-visited-leak. The test uses a 16-instruction stream where
-the BNE target is a self-contained block; the ROM has the
-back-edge to 0x25705c that walks BACK into 0x25708c via a
-different path. iter-51 added the missing pattern.
 
 ## Workflow per stop
 

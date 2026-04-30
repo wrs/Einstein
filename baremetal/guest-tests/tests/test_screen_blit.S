@@ -5,8 +5,11 @@
 @
 @ Setup (all in guest RAM):
 @   pixmap @ 0x04020000 = {
-@     addy = 0x04021000,   // pointer to bitmap data
-@     rowBytes = 4,
+@     addy = 0x04021000,                     // pointer to bitmap data
+@     rowBytes_packed = (4 << 16) = 0x40000, // actual rowBytes is the
+@                                            // HIGH 16 bits per
+@                                            // TScreenManager::Blit
+@                                            // (`srcRowBytes >> 16`).
 @     bounds = {0, 0, 2, 32}  // 2 rows x 32 pixels (1 bpp)
 @     flags = 0,
 @     table = 0,
@@ -29,8 +32,12 @@
 @   0xEE005A10: MCR p10, 0, r5, c0, c0, 0
 @ so the native code lives in r5 and r1/r2/r3 keep their blit meaning.
 @
-@ After the call, read FB @ 0x0E000000..0x0E000008 and verify it
-@ matches the planted bytes.
+@ After the call, read FB. The hypervisor's blit:
+@   - inverts each source byte (Newton 1-bpp convention vs host FB),
+@   - lays rows out in FB at stride SCREEN_WIDTH/8 = 40 bytes/row
+@     (NOT the source rowBytes).
+@ So row 0 (4 src bytes) lands at FB[0..4], row 1 lands at FB[40..44],
+@ and each byte is the bitwise NOT of the planted source byte.
 
 #include "common/test_runtime.S"
 
@@ -50,8 +57,10 @@ test_main:
     ldr     r0, =PIXMAP_DATA_VA
     str     r0, [r6, #0x00]          @ addy
 
+    @ rowBytes = 4, packed in HIGH 16 bits (Newton/Einstein layout).
     mov     r0, #4
-    str     r0, [r6, #0x04]          @ rowBytes
+    lsl     r0, r0, #16
+    str     r0, [r6, #0x04]          @ rowBytes_packed = (4<<16)
 
     @ bounds = {top=0, left=0, bottom=2, right=32}.
     @ Word 0 = (top<<16) | left = 0
@@ -105,14 +114,18 @@ test_main:
     hvc     #5                       @ mark 1: blit returned success
 
     @ ---- Verify FB bytes ----
+    @ Source row 0 = DE AD BE EF (LE word 0xEFBEADDE).
+    @ After `~byte` inversion: 21 52 41 10 (LE word 0x10415221).
     ldr     r6, =FB_VA
     ldr     r0, [r6, #0]
-    ldr     r1, =0xEFBEADDE
+    ldr     r1, =0x10415221
     cmp     r0, r1
     bne     .Lfail_fb0
 
-    ldr     r0, [r6, #4]
-    ldr     r1, =0xBEBAFECA
+    @ Source row 1 = CA FE BA BE (LE word 0xBEBAFECA), inverted = 35 01 45 41.
+    @ FB stride is SCREEN_WIDTH/8 = 40 bytes, so row 1 lives at +40, not +4.
+    ldr     r0, [r6, #40]
+    ldr     r1, =0x41450135
     cmp     r0, r1
     bne     .Lfail_fb1
 

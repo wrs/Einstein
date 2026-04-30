@@ -14,7 +14,16 @@ shadow-on-write redirects, and per-task subpage-AP shims are all
 ruled out. The fix MUST be a kernel patch that makes the kernel
 work without 1k subpage protections.
 
-**Current goal (revised iter-41): ROOT CAUSE FOUND. shadow_stub's
+**Current goal (revised iter-42): WEDGE RESOLVED. The R14
+exclusion in `pick_scratch_regs` (iter-42) eliminates the
+shadow_stub LR-corruption that caused 41 iterations of
+"evt.ex.abt.perm" investigation. The next stall is
+`evt.ex.abt.bus` rethrown by UnlockStore→NextHandler at
+0x000c87f0. Iter-43 must pin the underlying bus-abort site
+(FAR/DFSR/USR_PC) and decide whether the fault is in our
+peripheral model, MMU mapping, or kernel logic.
+
+**(Iter-41 ROOT-CAUSE framing preserved.) shadow_stub's
 DeadReg stub at 0x00E97FC0 picks R14 (LR) as scratch_fl despite
 LR being live across the tail-call from FindSuperceeder to
 Lookup. The MRS at slot 4 stores CPSR (= 0x80000110, with N flag
@@ -340,6 +349,131 @@ TAlertEventHandler region.
   allocator's freelist threading code (the ROM PCs we see are
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
+
+### Iteration 42 (next-loop iter 2): shadow_stub R14 fix lands — wild-r3 wedge resolved; new stall is "evt.ex.abt.bus" via UnlockStore→NextHandler
+
+Iter-41 identified the root cause: shadow_stub's `pick_scratch_regs`
+picked R14 (LR) as scratch_fl for the byte-access stub at
+PC=0x001488ac. The conservative fix was to remove R14 from the
+DeadReg-variant CANDIDATES pool.
+
+#### Implementation
+
+`src/shadow_stub.rs:1413` — change:
+```rust
+const CANDIDATES: &[u32] = &[12, 0, 1, 2, 3, 14];
+```
+to:
+```rust
+const CANDIDATES: &[u32] = &[12, 0, 1, 2, 3];
+```
+
+with a long comment explaining why R14 must NEVER be a DeadReg-
+variant scratch (rationale from iter-41).
+
+The ScratchVA-fallback variant (`pick_operand_excluded_triple`)
+is left unchanged because it explicitly saves and restores all
+picked registers via TPIDRURW + the per-stub scratch slot —
+R14 there is safe.
+
+#### Verification — guest tests
+
+`guest-tests/scripts/run-all.sh`: **36 passed, 0 failed.** All
+shadow_stub unit + regression tests still green.
+
+#### Verification — Phase B cold boot
+
+The wild-r3 wedge is RESOLVED:
+
+```
+FindSuper-mid #0 @1488c4: r3=0x0c328e90 r0=0xf0000027 r1=0x00000027
+                          r2=0x0000000d ip=0x0c604c42
+                          lr=0x000c96cc  ← SANE (was 0x80000110)
+                          sp=0x0c328e18 mode=0x10
+
+Lookup ENTRY (from c96cc tail-call): seq=#19
+    r3=0x0c328e90  ← SANE (was 0x80000110)
+    r0=0x0c604c42 r1=0x00000027
+```
+
+LR_USR is no longer corrupted by the shadow_stub stub. The
+TFlashStore::Lookup call now receives a valid stack-address
+OUT-param pointer; TObjRef::Set's `str r1, [r0, #8]` succeeds;
+CardFaultMonProc never fires; the kernel does not Throw
+"evt.ex.abt.perm".
+
+#### The new stall — evt.ex.abt.bus (bus abort)
+
+The boot now reaches a DIFFERENT UnhandledException:
+
+```
+*** invariant violation: kernel reached UnhandledException —
+    exception had no handler ***
+  variant: UnhandledException
+  r0=0x000afda0  r1=0xea0061c4  r2=0x00000000  r3=0x000afd9e
+  exception name (r0) @ VA=0x000afda0: "evt.ex.abt.bus"
+  TRUE source mode=USR (0x10)  caller_lr=0x000c87f4  sp=0x0c328eec
+```
+
+`caller_lr=0x000c87f4` lands inside `UnlockStore__11TFlashStoreFv`
+right after:
+
+```
+   c87f0:	eb6c6657 	bl	0x1be2154 <NextHandler>
+   c87f4:	e1a0000d 	mov	r0, sp
+```
+
+`NextHandler` is the kernel's exception-rethrow mechanism: a
+setjmp-style handler in UnlockStore caught a bus-abort exception
+during the flash-store unlock sequence, did some cleanup
+(VppOff at c87e0; flash store fields at +0x80/+0x7c zeroed),
+then rethrew via `bl NextHandler`. No outer handler claims it
+→ UnhandledException → halt.
+
+Bus-abort (`evt.ex.abt.bus`) suggests a memory access to a
+device or unmapped region — different from the iter-36 wedge's
+translation-fault ("evt.ex.abt.perm" is generic "unhandled
+abort"; the kernel uses different exception names for different
+fault classes when the abort source is identifiable). Likely
+candidates:
+- Flash MMIO that's not yet wired up in our peripheral model.
+- A memory-mapped controller that returns a bus error.
+- A page-fault path that escalates to bus instead of permission.
+
+#### Next iteration plan (iter-43)
+
+1. **Pin the underlying bus-abort site.** Repeat the iter-36
+   pattern: add an HVC probe at the `bl Throw` site that
+   emits "evt.ex.abt.bus" (or at the DataAbortHandler bus-
+   classification path). Capture FAR/DFSR/USR_PC of the
+   bus-abort.
+
+2. **Decode FAR**: if it's a flash MMIO address, the fix is
+   in the peripheral model. If it's an unmapped RAM address,
+   investigate the kernel's memory-mapping flow.
+
+3. **Cross-check with shadow_stub coverage.** Now that R14
+   is no longer a scratch candidate, some sites that used
+   to use ScratchVA-variant might switch back to DeadReg
+   (with R12 + a different reg). Confirm no regressions
+   from the iter-42 patch.
+
+4. **Long-term:** investigate the actual liveness-analysis
+   bug — `live_at_with_reader` should have detected R14 as
+   live for the 0x001488ac case but didn't. The conservative
+   fix sidesteps it but doesn't address the underlying logic
+   gap. Track this as a `docs/` followup item.
+
+#### Status
+
+- Build clean.
+- Wild-r3 wedge from iter-36..iter-41 RESOLVED. 41-iteration
+  microscope-mode investigation pays off.
+- shadow_stub coverage holds: 36/36 guest tests pass.
+- New stall identified: `evt.ex.abt.bus` rethrown by
+  UnlockStore→NextHandler. Iter-43 scope.
+- Iter-42 deliverable: applied the conservative R14-exclusion
+  fix; verified Phase B progress; documented next stall.
 
 ### Iteration 41 (next-loop iter 1 of new ralph loop): ROOT CAUSE — shadow_stub picks R14 (LR) as scratch_fl despite LR being live across tail-call
 

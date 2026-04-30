@@ -76,10 +76,17 @@ test_main:
     str     r0, [r6, #0x14]          @ table
 
     @ ---- Plant bitmap bytes (8 bytes, 2 rows * 4 bytes) ----
+    @ The screen.blit handler reads source pixmap bytes in BE-32
+    @ word-invariant order (read_byte_pa(pa ^ 3)) — the same
+    @ convention shadow_stub uses for guest LDRB. To feed it the
+    @ logical byte stream "DE AD BE EF / CA FE BA BE", plant the
+    @ STR'd word as the BE-byte-stream encoded as an integer:
+    @   STR 0xDEADBEEF → host LE bytes EF BE AD DE
+    @                  → BE-view bytes DE AD BE EF (handler reads).
     ldr     r6, =PIXMAP_DATA_VA
-    ldr     r0, =0xEFBEADDE          @ LE word = DE AD BE EF
+    ldr     r0, =0xDEADBEEF          @ BE-view bytes DE AD BE EF
     str     r0, [r6, #0]
-    ldr     r0, =0xBEBAFECA          @ LE word = CA FE BA BE
+    ldr     r0, =0xCAFEBABE          @ BE-view bytes CA FE BA BE
     str     r0, [r6, #4]
 
     @ ---- Build src + dst rects (same shape, top-left dst) ----

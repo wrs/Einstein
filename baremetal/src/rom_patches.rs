@@ -1023,6 +1023,17 @@ pub const THROW_ENTRY_PROBE_HVC_IMM:     u32 = 0x6F;
 pub const THROW_ENTRY_PROBE_PC:          u32 = 0x000B_00C8;
 const THROW_ENTRY_FIRST_INSN:            u32 = 0xE1A0_C00D; // mov ip, sp
 
+/// `PhysBlock__11TFlashBlockFv` first insn at ROM `0x000c_0cc4`.
+/// Iter-43 pinned the `evt.ex.abt.bus` original throw to the
+/// `bl PhysBlock` site at 0xc0cb8 (caller_lr=0xc0cbc). The fault
+/// is suspected on PhysBlock's first instruction `ldr r1, [r0, #8]`
+/// when r0 (TFlashBlock* this) is wild. iter-44 patches the ldr
+/// with HVC; the handler captures r0 and dumps caller context, then
+/// either emulates the load (if r0 looks sane) or halts.
+pub const PHYSBLOCK_ENTRY_PROBE_HVC_IMM: u32 = 0x70;
+pub const PHYSBLOCK_ENTRY_PROBE_PC:      u32 = 0x000C_0CC4;
+const PHYSBLOCK_ENTRY_FIRST_INSN:        u32 = 0xE590_1008; // ldr r1, [r0, #8]
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -1519,6 +1530,14 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(THROW_ENTRY_PROBE_HVC_IMM),
             "Throw entry (log every kernel exception throw)",
             THROW_ENTRY_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            PHYSBLOCK_ENTRY_PROBE_PC,
+            PHYSBLOCK_ENTRY_FIRST_INSN,
+            hvc_insn(PHYSBLOCK_ENTRY_PROBE_HVC_IMM),
+            "PhysBlock entry (capture r0 = TFlashBlock* this; halt if wild)",
+            PHYSBLOCK_ENTRY_PROBE_HVC_IMM,
         );
     }
 }

@@ -6172,6 +6172,18 @@ fn handle_diag(ctx: &mut TrapContext) {
     if hvc_src_mode == crate::banked::MODE_ABT {
         let esr_el1 = read_sysreg!("esr_el1");
         let dfsc = (esr_el1 & 0x3F) as u32;
+        // Iter-54: DFSC=0x01 is alignment fault. The DABT trampoline's
+        // legacy `mrc p15,0,Rt,c5,c0,0` ought to route alignment faults
+        // to ALIGN_TAG via the BEQ — but in practice we've seen at least
+        // one site (the LDR-with-imm-offset rotate idiom in DrText at
+        // 0x0035c554) where the trampoline still falls through to
+        // DIAG_TAG. Cross-check ESR_EL1 here and dispatch to the
+        // alignment emulator unconditionally, instead of dumping and
+        // halting on a fault the hypervisor already knows how to handle.
+        if dfsc == 0x01 {
+            crate::unaligned::handle_align_fault(ctx);
+            return;
+        }
         let forwardable = matches!(dfsc, 0x03 | 0x05 | 0x06 | 0x07 | 0x0D | 0x0F);
         if forwardable {
             // ARMv7 leaves DFSR.Domain UNK for DFSC=5 (translation,

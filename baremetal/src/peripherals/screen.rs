@@ -207,6 +207,14 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
 
     // 1-bpp packing: each byte holds 8 pixels. Src starts at
     // addy + (pixmap_src_top * rowBytes) + (pixmap_src_left / 8).
+    //
+    // BE-32 word-invariant byte access: the Newton kernel writes
+    // pixmap data as BE-32, so logical byte N at PA `p` lives at
+    // host PA `p ^ 3` (within each 4-byte word). Mirror the convention
+    // shadow_stub uses for in-guest LDRB (see `shadow_stub::XOR_LIMIT`
+    // and `shadow_stub::dispatch_byte_read`). The FB itself is
+    // hypervisor-managed linear-LE — host byte N is pixel byte N in
+    // display order — so FB writes don't XOR.
     let src_width_pixels = (src_right - src_left) as u32;
     let fb_row_bytes = (SCREEN_WIDTH * SCREEN_BPP) / 8;
 
@@ -227,7 +235,9 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
                 let abs_src_pix = pixmap_src_left as u32 + col_pix;
                 let src_va = addy + src_row_pa_off + abs_src_pix / 8;
                 let src_pa = guest_mem::translate_va(src_va).unwrap_or(src_va);
-                let byte = match guest_mem::read_byte_pa(src_pa) {
+                // BE-32 byte lane: read at `src_pa ^ 3` to land on
+                // the kernel's logical byte (see top-of-blit comment).
+                let byte = match guest_mem::read_byte_pa(src_pa ^ 3) {
                     Some(b) => b,
                     None => {
                         kprintln!(
@@ -237,9 +247,10 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
                         cpu::halt();
                     }
                 };
-                // Newton 1-bpp BE bit ordering: pixel 0 is bit 7
-                // (MSB) of byte 0. Extract this column's bit, then
-                // INVERT (Newton's 1=pen-pressed → host FB 1=white).
+                // Newton 1-bpp bit ordering within the (now logical)
+                // byte: pixel 0 is bit 7 (MSB). Extract this column's
+                // bit, then INVERT (Newton's 1=pen-pressed → host FB
+                // 1=white).
                 let src_bit = (byte >> (7 - (abs_src_pix & 7))) & 1;
                 let fb_bit = src_bit ^ 1;
 
@@ -288,7 +299,9 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
             // returns None in the MMU-off case; fall back to identity
             // so guest-tests' MMU-off paths still work.
             let src_pa = guest_mem::translate_va(src_va).unwrap_or(src_va);
-            let byte = match guest_mem::read_byte_pa(src_pa) {
+            // BE-32 byte lane: read at `src_pa ^ 3` to land on the
+            // kernel's logical byte (see top-of-blit comment).
+            let byte = match guest_mem::read_byte_pa(src_pa ^ 3) {
                 Some(b) => b,
                 None => {
                     kprintln!(

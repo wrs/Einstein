@@ -17,37 +17,77 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-56):** iter-55 added a per-pixel
-non-byte-aligned blit path to `peripherals/screen.rs`, so
-Newton's UI code can now blit sub-byte glyph regions
-(src_left=115 ≡ 3 mod 8 etc.). Boot reaches **interactive
-operation**: 2 blits land for the 320×480 splash + a 90×118
-glyph region, framebuffer dump `/tmp/newton-fb/00000.png` is
-written, and the kernel is then in steady state doing 3.4M
-hypervisor traps/sec — no halt, no `***` line, no wedge.
+**Current goal (iter-57):** iter-56 fixed FB rendering — the
+splash screen now renders the Newton lightbulb logo and the
+"Newton" text correctly (was previously scrambled because the
+blit handler read source bytes in raw LE host order instead of
+BE-32 byte-lane order). Boot still reaches steady-state with
+no `***` halt; remaining iter-55 sub-goals stand:
 
-99% of the steady-state traps are at `ELR=0xffffe4`
-(UND_RETURN_STUB_OFFSET) with `SPSR=0x40000197` (ABT mode, IRQ
-masked). This is the alignment-fault handler return path
-firing repeatedly as Newton's ROM walks unaligned half-word
-loads in its UI rendering loop. Functional, but expensive.
-
-iter-56 should:
-1. **Decide whether to look at the FB.** A user-facing capture
-   (PNG dump, or live framebuffer-mirror) can confirm the splash
-   screen has rendered correctly. The first blit copy was a
-   320×480 inverted byte copy — comparing against a reference
-   Newton boot screen confirms our blit math.
-2. **Reduce the alignment-fault rate**, OR confirm the boot
+1. **Reduce the alignment-fault rate**, OR confirm the boot
    reaches a true idle / event-pending wait-state on its own
-   (e.g., touchscreen interrupt). Our hypervisor's per-fault
-   trap-and-emulate adds overhead on top of QEMU TCG; a
+   (e.g., touchscreen interrupt). 99% of steady-state traps are
+   at `ELR=0xffffe4` (UND_RETURN_STUB_OFFSET) with
+   `SPSR=0x40000197` (ABT mode, IRQ masked) — the alignment-
+   fault return path firing repeatedly as Newton's ROM walks
+   unaligned half-word loads in its UI rendering loop. A
    rotate-LDR fast-path inside the hypervisor (or a kernel
    patch that uses ARMv7-aware LDRH instead of the ARMv4
    unaligned LDR idiom) could drop the rate by ~10-100×.
-3. **Add tablet/pen input.** The boot is in steady state; the
+2. **Add tablet/pen input.** The boot is in steady state; the
    next milestone is observable user interaction, which needs
    the pen-input path wired up (`peripherals/tablet.rs`).
+
+### Iteration 56: framebuffer renders correctly — BE-32 byte-lane fix
+
+iter-55's PNG dump showed the Newton splash with the lightbulb
+logo fragmented and the "Newton" caption scrambled to nonsense.
+The bytes were word-reversed within each 4-byte chunk: every
+group of 32 pixels had its 4 bytes shuffled from order [0,1,2,3]
+to [3,2,1,0].
+
+#### Root cause
+
+The Newton ROM is **BE-32 word-invariant**: aligned word reads
+match LE, but byte reads land on a different byte lane —
+`BE-32 LDRB at addr A == phys[A ^ 3]` (per `shadow_stub.rs:1-9`).
+The Newton kernel writes pixmap data as BE-32, so logical byte 0
+of each 4-byte word lives at host PA offset 3, byte 1 at offset
+2, etc. `peripherals/screen.rs::blit` was reading via
+`read_byte_pa(src_pa)`, which returns the raw LE host byte —
+i.e. word-reversed bytes. `shadow_stub::dispatch_byte_read`
+already encodes the correct convention as `^ 3` for backed
+memory below `XOR_LIMIT`; the blit simply wasn't following it.
+
+#### Fix
+
+`peripherals/screen.rs` — both fast and slow paths now read
+source pixmap bytes via `read_byte_pa(src_pa ^ 3)`. FB writes
+stay linear-LE (host byte N = pixel byte N in display order),
+matching `fb_dump.rs`'s straight-line PNG read.
+
+`guest-tests/tests/test_screen_blit.S` — planted source words
+updated from `0xEFBEADDE / 0xBEBAFECA` (LE-host byte stream) to
+`0xDEADBEEF / 0xCAFEBABE` (BE-view byte stream) so the test
+mirrors the kernel's actual BE-32 STR pattern. Expected FB
+bytes after `~byte` inversion are unchanged.
+
+#### Verification
+
+- All 36 guest tests pass (`test_screen_blit` materially
+  affected; passes with new word values).
+- Cold boot produces `/tmp/newton-fb/00000.png` showing the
+  Newton lightbulb logo + "Newton" caption rendered correctly.
+- Boot still reaches steady-state — no `***` halt, no
+  regression in the iter-55 trap counts.
+
+#### Out of scope (deferred)
+
+- Updating `fb_dump.rs` / FB storage to BE-32 view. Only
+  matters if the guest reads its own FB back; not observed in
+  cold boot.
+- Einstein-style word-mask `Blit_0` for the slow path. Per-
+  pixel RMW is fast enough for cold-boot UI rates.
 
 ### Iteration 55: non-byte-aligned blit lands; boot reaches steady-state
 
@@ -93,52 +133,6 @@ After this fix, the cold boot:
 This is the first iteration since Phase B started where the
 boot doesn't end on a halt — it ends on a *timeout*, with the
 kernel still running.
-
-### Iteration 54: alignment-fault redirect from DIAG-tag (DFSC=0x1 safety net)
-
-iter-53's "wild PC=0xe7f842f0" wedge turned out not to be a wild
-PC at all. The DIAG-vector dump's "faulting PC = 0xe7f842f0
-insn=0xdeadbeef" line was reading the high 32 bits of a 64-bit
-FAR_EL1 whose lower 32 bits held the actual VA (0x0c64be6e).
-The high half was leftover bytes from an earlier exception. The
-correct faulting info comes from the DABT trampoline's stash:
-`LR_abt=0x0035c55c` → aborting PC = 0x0035c554, which is
-`ldr r0, [r0, #0x3e]` inside `DrText__FlN21`.
-
-This is the ARMv4 rotate-on-unaligned LDR idiom: read a 16-bit
-half-word at a non-aligned offset by loading the surrounding
-word and rotating. ARMv7 with SCTLR.A=1 (which we force on)
-turns it into an alignment fault. Our hypervisor has an
-emulator for it (`unaligned::handle_align_fault`) reached via
-the DABT trampoline's BEQ to ALIGN_TAG.
-
-#### Mechanism
-
-The DABT trampoline checks DFSR.FS[3:0] via legacy
-`mrc p15,0,Rt,c5,c0,0`. If FS == 1, BEQ to `HVC #ALIGN_TAG`;
-else fall-through to `HVC #DIAG_TAG`. For this specific site
-(and cause unknown — we have ~40 successful ALIGN_TAG dispatches
-earlier in the run), the BEQ fell through to DIAG_TAG even though
-ESR_EL1 reports DFSC=0x01.
-
-#### Fix
-
-`handle_diag` now cross-checks ESR_EL1.DFSC: if src_mode == ABT
-and DFSC == 0x01 (alignment), it calls
-`unaligned::handle_align_fault(ctx)` directly instead of falling
-through to the diagnostic dump. This is a defence-in-depth net
-that catches the case where the trampoline's legacy-DFSR check
-disagrees with the AArch64 ESR_EL1 view.
-
-#### Verification
-
-- All 36 guest tests pass.
-- Cold boot: zero `*** DIAG vector intercept` lines (was 1
-  before). 40 alignment faults emulated successfully (vs. 39
-  before, plus 1 now via the DIAG → ALIGN redirect).
-- Boot progresses past the iter-53 wedge and reaches a new
-  limitation in screen.blit (non-8-pixel-aligned src_left,
-  iter-55).
 
 ## Workflow per stop
 

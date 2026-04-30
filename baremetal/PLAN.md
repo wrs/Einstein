@@ -14,8 +14,25 @@ shadow-on-write redirects, and per-task subpage-AP shims are all
 ruled out. The fix MUST be a kernel patch that makes the kernel
 work without 1k subpage protections.
 
-**Current goal (revised iter-36): the wedge is NOT a permission
-fault — it's a TRANSLATION fault from a wild "this" pointer.
+**Current goal (revised iter-37): the wedge is a translation
+fault on a wild this-pointer (0x80000110) inside
+`Set__7TObjRefFUlT1`. Iter-37's FP-chain walker pins the call
+chain to ?→UnlockStore→TFlashStore::DoCommit→FindSuperceeder→
+TFlashStore::Lookup→TObjRef::Set, BUT also surfaces an anomaly:
+the saved r6 in Lookup (= the OUT-param &TObjRef pointer Set
+faulted on) doesn't match what DoCommit's `add r1, sp, #120`
+should produce given the FP chain's reported DoCommit fp. The
+mismatch suggests either the FP chain mixes stale frames with
+the live one, or a non-obvious code path is corrupting the
+OUT-param value. Iter-38 should add a probe at Lookup entry
+(or FindSuperceeder entry) with a ring buffer of (seq, r0..r3,
+lr, sp) per call, halting on the first call with a bit-31-set
+r3 — that pins the precise caller and call site of the wild
+value. Original revision below is preserved for context.
+
+**(Iter-36 framing — partial; see iter-37 for refinement.) The
+wedge is NOT a permission fault — it's a TRANSLATION fault
+from a wild "this" pointer.
 Iter-36 captured the kernel-side `TProcessorState` fault frame
 right before `bl Throw` at `0x0004_E660` and decoded the
 underlying DABT:
@@ -272,6 +289,160 @@ TAlertEventHandler region.
   allocator's freelist threading code (the ROM PCs we see are
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
+
+### Iteration 37 (next-loop iter 33): FP-chain walk pins call-stack to UnlockStore→DoCommit→FindSuperceeder→Lookup; OUT-param mismatch detected
+
+Iter-36 captured the TProcessorState fault frame but didn't
+identify Tmux's call stack. Iter-37 extends
+`handle_cardfault_throw_probe` to walk Tmux's APCS FP chain
+from the saved fp in the fault frame, dumping up to 8 frames
+plus 32 words of Tmux's user stack starting at saved sp_usr.
+
+#### Cold-boot output (call chain only)
+
+```
+Faulting task user stack at SP_USR=0x0c328dd4 (32 words):
+  sp+0x00 = 0x0c604c04  (Set's saved r4 = TFlashStore* this)
+  sp+0x08 = 0x0c328e14  (Set's saved fp = Lookup's fp)
+  sp+0x10 = 0x000c74b8  (Set's saved lr)
+  sp+0x14 = 0x00148324  (Set's saved pc, prologue+8)
+  sp+0x18 = 0x0c604c04  (Lookup's saved r4)
+  sp+0x20 = 0x00000001  (Lookup's saved r6 — caller's r6 BEFORE Lookup
+                         overwrites it with r3)
+  sp+0x34 = 0x0c328ee8  (Lookup's saved fp = DoCommit's fp)
+  sp+0x38 = 0x0c328e18  (Lookup's saved ip = DoCommit's sp at bl Lookup)
+  sp+0x3c = 0x000c96cc  (Lookup's saved lr)
+  sp+0x40 = 0x000c7488  (Lookup's saved pc)
+  ...
+
+APCS frame chain (faulting task):
+  [0] pc=0x00148328 lr_to_caller=0x000c74b8 fp=0x0c328de8
+  [1] fn_entry+8=0x00148324 caller_lr=0x000c74b8 caller_fp=0x0c328e14
+  [2] fn_entry+8=0x000c7488 caller_lr=0x000c96cc caller_fp=0x0c328ee8
+  [3] fn_entry+8=0x000c94fc caller_lr=0x000c87bc caller_fp=0x0c328f70
+  [4] fn_entry+8=0x000c875c caller_lr=0x00387060 caller_fp=0x0cc77d94
+  [5] fn_entry+8=0x001237d8 caller_lr=0x00354b18 caller_fp=0x0cc77dac
+  [6] fn_entry+8=0x00354b00 caller_lr=0x003544e4 caller_fp=0x0cc77e7c
+  [7] fn_entry+8=0x00354184 caller_lr=0x00354c4c caller_fp=0x0cc77ea0
+```
+
+#### Decoded call chain
+
+| Frame | fn_entry+8     | Function                                   |
+|-------|----------------|--------------------------------------------|
+| [1]   | 0x00148324     | `Set__7TObjRefFUlT1` (TObjRef::Set)        |
+| [2]   | 0x000c7488     | `Lookup__11TFlashStoreFUliR7TObjRef` (TFlashStore::Lookup) |
+| [3]   | 0x000c94fc     | `DoCommit__11TFlashStoreFUc`               |
+| [4]   | 0x000c875c     | `UnlockStore__11TFlashStoreFv`             |
+| [5]   | 0x001237d8     | (caller of UnlockStore — TODO grep)        |
+| [6]   | 0x00354b00     | (TODO)                                     |
+| [7]   | 0x00354184     | (TODO)                                     |
+
+**Tail-called layer:** `FindSuperceeder__7TObjRefFR7TObjRef` at
+0x001488a0 sits between DoCommit and Lookup but doesn't
+appear in the FP chain because it has no APCS prologue —
+it's a leaf-ish wrapper that ends with `b 0x1afef70 <Lookup>`
+(branch, not bl), so Lookup's saved-lr is DoCommit's resume PC
+(0xc96cc) directly.
+
+#### The OUT-param mismatch — unresolved anomaly
+
+The Set fault frame has saved r0/r4/r6 all = 0x80000110. r6 is
+callee-saved by Lookup, set from r3 at c7494, and preserved
+across the intermediate `bl Lookup__22TFlashStoreLookupCacheFUli`
+(c749c). At c74ac the path is `mov r0, r6; bl Set`. So:
+
+- **Lookup's r6 at the bl Set = r3 entering Lookup = 0x80000110.**
+- FindSuperceeder is a pure passthrough: `mov r3, r1` at 0x1488a0,
+  then no further r3 writes. So r3 entering Lookup = r1 entering
+  FindSuperceeder.
+- r1 entering FindSuperceeder = caller's r1 = DoCommit's r1 at the
+  bl FindSuperceeder (c96c8).
+
+DoCommit at c96c0..c96c8 explicitly does:
+```
+c96c0: add r1, sp, #120
+c96c4: add r0, sp, #148
+c96c8: bl FindSuperceeder
+```
+
+DoCommit's prologue layout: `push {r4..r8, fp, ip, lr, pc}` (36
+bytes) + `sub sp, sp, #176` (c9504). No further sp/push between
+c9504 and c96c8. So sp at c96c8 = old_sp - 212.
+
+The FP chain says:
+- DoCommit's fp = 0x0c328ee8 (so DoCommit's old_sp = 0x0c328eec)
+- Therefore DoCommit's sp at c96c8 = 0x0c328e18
+- Therefore r1 = 0x0c328e90 (a stack address)
+
+This is also confirmed by Lookup's saved-ip on Tmux's stack
+(at 0x0c328e0c) = 0x0c328e18, which is exactly DoCommit's sp
+at the bl chain entry into Lookup.
+
+**But Lookup's saved r6 = 0x80000110, NOT 0x0c328e90.**
+
+This is impossible without:
+1. Some intermediate operation in DoCommit modifying r1 between
+   c96c0 and c96c8 (the disassembly shows nothing).
+2. Some intermediate operation in FindSuperceeder modifying r3
+   after `mov r3, r1` (the disassembly shows nothing).
+3. Tmux's stack containing stale frame data from a prior
+   completed call, with a NEW DoCommit→Lookup call having a
+   different SP layout that the FP-chain walker is missing.
+4. Stack corruption stomping on the saved r6 slot in
+   GetFaultState's TProcessorState frame after capture.
+
+Hypothesis (3) is interesting: if the FP-chain walker reads
+stale frames AND a fresh Lookup call was made via a different
+caller path with r3=0x80000110, the FP chain would mis-attribute.
+But the FP-chain walker uses live `fp` from the fault context;
+fp = 0x0c328de8 is from the active Set frame and walks up through
+fp values that are ON THE LIVE STACK.
+
+The most likely real explanation: **the FP chain at frames [3]+
+isn't actually the path that produced this Lookup call.** Tmux
+has a complicated message-routing dispatch where IPC or task-
+switching plumbing might restore an old SP/FP, leaving stale
+frame bytes that look like a chain but don't reflect current
+flow. Frame [2] (Lookup itself) is current and trustworthy; the
+frames above it may be from a previous, unrelated DoCommit.
+
+#### Next iteration plan (iter-38)
+
+1. **Add a probe at TFlashStore::Lookup entry** (0x000c747c).
+   Capture r0..r3, sp, lr, and walk fp 4 levels. This pins
+   exactly which caller passed the wild &TObjRef and lets us
+   distinguish the FP-chain interpretation issues.
+
+2. **Or add a probe at FindSuperceeder entry** (0x001488a0)
+   since DoCommit→FindSuperceeder is the suspect path. r0..r1 at
+   FindSuperceeder entry will tell us whether the wild value
+   came from DoCommit or whether FindSuperceeder is actually
+   not on the path at all.
+
+3. Iter-38 should print `(seq, r0, r1, r2, r3, lr, sp)` per
+   call as a ring buffer (last 16 calls), then halt when an
+   r3 with bit-31 set is seen. That gives us the call chain
+   leading to the wild OUT param without halting on every
+   benign call.
+
+4. Once the wild-value source is identified, decide whether
+   it's a kernel-allocator issue (4 KiB-allocator change
+   leaving a field uninitialized that the old subpage-AP
+   mechanism would have caught), an IPC dispatch issue (Tmux
+   getting a wrong message body), or something else.
+
+#### Status
+
+- Build clean.
+- FP-chain walker added; captures up to 8 frames + 32 words of
+  user stack.
+- Call chain pinned: ?→UnlockStore→DoCommit→FindSuperceeder→
+  Lookup→Set.
+- 30/30 shadow_stub tests pass.
+- The OUT-param mismatch remains an open question for iter-38.
+- Iter-37 deliverable: explicit call-chain identification for
+  the wedge, and a precise diagnostic question to answer next.
 
 ### Iteration 36 (next-loop iter 32): CardFaultMonProc Throw probe pins fault to TObjRef::Set with wild "this"=0x80000110
 

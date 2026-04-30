@@ -2283,6 +2283,49 @@ fn handle_reboot(ctx: &TrapContext) -> ! {
         "  R12={:#010x}  R14_{}={:#010x}  (caller LR via Table D1-79)",
         ctx.x[12] as u32, describe_aarch32_mode(mode), caller_lr
     );
+
+    // Iter-33: when called from UND mode (the typical
+    // UnhandledException → Reboot path), walk SP_und (= ctx.x[23]
+    // per Table D1-79) for ~16 words. APCS frames keep saved-LR
+    // at fp-4 / fp-8; we don't decode them structurally here, just
+    // dump the raw words so symbol resolution against rom.dis can
+    // find the user-mode caller chain.
+    if mode == 0x1B {
+        let sp_und = ctx.x[23] as u32;
+        kprintln!();
+        kprintln!("  SP_und stack (16 words from ctx.x[23]={:#010x}):", sp_und);
+        for i in 0..16 {
+            let va = sp_und.wrapping_add(i * 4);
+            match guest_mem::read_word_va(va) {
+                Some(w) => kprintln!("    [{:+3}] @{:#010x} = {:#010x}", (i * 4) as i32, va, w),
+                None    => kprintln!("    [{:+3}] @{:#010x} = (unmapped)", (i * 4) as i32, va),
+            }
+        }
+        // R0 typically points at a TException / TThrow descriptor
+        // (per the existing handler comment). Dump 8 words at
+        // *R0 if the address translates.
+        let r0 = ctx.x[0] as u32;
+        kprintln!();
+        kprintln!("  Exception-descriptor candidate at R0={:#010x}:", r0);
+        for i in 0..8 {
+            let va = r0.wrapping_add(i * 4);
+            match guest_mem::read_word_va(va) {
+                Some(w) => kprintln!("    [{:+3}] @{:#010x} = {:#010x}", (i * 4) as i32, va, w),
+                None    => kprintln!("    [{:+3}] @{:#010x} = (unmapped)", (i * 4) as i32, va),
+            }
+        }
+        // R3 is often the kErr_* code passed to Throw (signed int32).
+        // Print both unsigned and signed interpretations so we can
+        // match against kErr_- constants (typically -10000..-50000)
+        // or positive object-table indices.
+        let r3 = ctx.x[3] as u32;
+        kprintln!();
+        kprintln!(
+            "  R3 decoded as error code: {:#010x} ({}, signed={})",
+            r3, r3, r3 as i32
+        );
+    }
+
     kprintln!();
     kprintln!(
         "  (Preceding tracer entries show the caller chain. A typical trigger"

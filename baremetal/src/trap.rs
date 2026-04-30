@@ -1347,6 +1347,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::FINDSUPER_ENTRY_PROBE_HVC_IMM => {
             handle_findsuper_entry_probe(ctx);
         }
+        v if v == crate::rom_patches::FINDSUPER_MID_PROBE_HVC_IMM => {
+            handle_findsuper_mid_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1954,6 +1957,11 @@ fn handle_und(ctx: &mut TrapContext) {
         }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::FINDSUPER_ENTRY_PROBE_HVC_IMM) => {
             handle_findsuper_entry_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::FINDSUPER_MID_PROBE_HVC_IMM) => {
+            handle_findsuper_mid_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -2768,6 +2776,43 @@ fn handle_findsuper_entry_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
             seq, ctx.x[3] as u32, r1,
         );
     }
+}
+
+/// Iter-40: probe at FindSuperceeder body PC=0x001488c4 (`mov r0, ip`).
+/// Captures r3 here to bisect whether shadow_stub's stub at 1488ac
+/// corrupted r3 (then iter-41 fixes the stub) or whether some later
+/// step corrupts it.
+fn handle_findsuper_mid_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_findsuper_mid_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_findsuper_mid_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let r0 = ctx.x[0] as u32;
+    let r1 = ctx.x[1] as u32;
+    let r2 = ctx.x[2] as u32;
+    let r3 = ctx.x[3] as u32;
+    let ip = ctx.x[12] as u32;
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let mode = source_cpsr & 0x1F;
+
+    // Log every call's r3 — there will only be 1-2 per cold boot.
+    kprintln!(
+        "FindSuper-mid #{} @1488c4: r3={:#010x} r0={:#010x} r1={:#010x} r2={:#010x} ip={:#010x} lr={:#010x} sp={:#010x} mode={:#x}",
+        seq, r3, r0, r1, r2, ip, lr, sp, mode,
+    );
+
+    if (r3 & 0x8000_0000) != 0 {
+        kprintln!(
+            "  ★ WILD r3 already at 1488c4 — corruption is BEFORE this PC (shadow_stub stub at 1488ac is the prime suspect)"
+        );
+    }
+
+    // Emulate `mov r0, ip`.
+    ctx.x[0] = ip as u64;
 }
 
 fn handle_reboot(ctx: &TrapContext) -> ! {

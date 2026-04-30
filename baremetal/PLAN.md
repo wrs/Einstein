@@ -14,7 +14,16 @@ shadow-on-write redirects, and per-task subpage-AP shims are all
 ruled out. The fix MUST be a kernel patch that makes the kernel
 work without 1k subpage protections.
 
-**Current goal (revised iter-39): the shadow_stub byte-access
+**Current goal (revised iter-40): shadow_stub's byte-access stub
+at 0x00E97FC0 is confirmed to corrupt LR_USR (mid-probe at
+1488c4 captures lr=0x80000110 immediately after the stub).
+The wild value 0x80000110 then mysteriously transfers into r3
+between 1488c4 and Lookup entry, while LR_USR is restored to
+the original 0xc96cc — an r3↔lr swap of unknown origin. iter-41
+must inspect the stub itself (dump bytes at 0x00E97FC0) and
+trace exactly how its emulation pattern triggers the swap.
+
+**(Iter-39 framing preserved.) The shadow_stub byte-access
 emulator at 0x001488ac (patched `ldrb r1, [r1, #61]` → `b 0x00E97FC0`)
 is the prime suspect for r3 corruption. FindSuperceeder enters with
 r1=0x0c328e90 (sane); after `mov r3, r1`, r3=0x0c328e90; but Lookup
@@ -316,6 +325,137 @@ TAlertEventHandler region.
   allocator's freelist threading code (the ROM PCs we see are
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
+
+### Iteration 40 (next-loop iter 36): mid-FindSuperceeder probe pins shadow_stub stub as LR corrupter; r3 corruption happens AFTER mid
+
+Iter-39 confirmed shadow_stub patched 1488ac. Iter-40 added a
+probe at 0x001488c4 (the `mov r0, ip` instruction, between the
+shadow_stub patch and the b-chain to Lookup) to capture r3
+mid-body.
+
+#### Implementation
+
+- New `FINDSUPER_MID_PROBE_HVC_IMM = 0x6E` constant.
+- Patch ROM 0x001488c4 (`mov r0, ip` = 0xE1A0_000C) with HVC.
+- `handle_findsuper_mid_probe` captures (r0..r3, ip, lr, sp,
+  mode) per call. Emulates `mov r0, ip` (`ctx.x[0] = ip`).
+
+#### Cold-boot output (THE ACTUAL FINDING)
+
+```
+FindSuperceeder #0: r0=0x0c328eac r1=0x0c328e90 r3_in=0x00000000
+                    lr=0x000c96cc sp=0x0c328e18 mode=0x10
+FindSuperceeder #0 POST-emul: ctx.x[3]=0x0c328e90
+
+FindSuper-mid #0 @1488c4:
+    r3=0x0c328e90    ← STILL SANE at 1488c4!
+    r0=0xf0000027    ← from prior `ldr r0, [r0]` at 1488bc
+    r1=0x00000027    ← key (after bic at 1488c0)
+    r2=0x0000000d    ← 13 (kind discriminator)
+    ip=0x0c604c42    ← store ptr base + adjusted offset
+    lr=0x80000110    ← ★ WILD! LR_USR has been clobbered
+    sp=0x0c328e18    ← unchanged
+    mode=0x10        ← USR
+```
+
+#### The corruption pattern revealed
+
+Comparing across the three observation points in the path
+DoCommit→FindSuperceeder→Lookup:
+
+|             | At FS entry | At 1488c4 (mid) | At Lookup entry |
+|-------------|-------------|-----------------|-----------------|
+| r3 (USR)    | 0x00000000  | 0x0c328e90      | 0x80000110      |
+| LR (USR)    | 0x000c96cc  | 0x80000110      | 0x000c96cc      |
+| r1 (USR)    | 0x0c328e90  | 0x00000027      | 0x00000027      |
+
+**Two corruptions visible:**
+
+1. **Between FS-entry and 1488c4 (mid):** LR_USR changed from
+   0xc96cc → 0x80000110. ONLY one execution path between these
+   points: the shadow_stub stub at 1488ac (forward-`b` to
+   stub at 0x00E97FC0). **The stub corrupts LR_USR.**
+
+2. **Between 1488c4 (mid) and Lookup entry:** r3 changed from
+   0x0c328e90 → 0x80000110, AND lr changed from 0x80000110
+   → 0xc96cc. They EFFECTIVELY SWAPPED. The path between
+   these points is just three branches:
+   - 1488c8: `b 0x01afef70` (unpatched per iter-39 dump)
+   - 0x01afef70: `b 0x000c747c` (unpatched)
+   - 0x000c747c: HVC #0x6C (our Lookup probe)
+
+   None of these branches modifies r3 or lr. So the swap
+   must be happening inside the EL2 trap path of one of
+   the HVCs — likely the Lookup probe HVC at 0xc747c, OR
+   our mid probe at 0x1488c4 itself.
+
+#### The likely root cause
+
+**The mid probe handler (or a deeper layer) is doing something
+that swaps r3 ↔ lr somehow.** This pattern is too perfect to
+be random. Possibilities:
+
+1. The UND trampoline path AT THE SECOND HVC (Lookup probe)
+   is reading R3 from a wrong slot — e.g., from a save slot
+   that holds LR.
+
+2. Our mid probe handler at 0x1488c4 doesn't restore some
+   register correctly. After the mid probe handler runs and
+   ERETs back to the guest, R3_USR might end up with whatever
+   LR_USR was, and LR_USR might end up with the original
+   pre-stub LR value (from a save slot somewhere).
+
+3. **Most likely**: shadow_stub's stub uses `bl` to call into
+   an emulation helper. `bl` overwrites LR with the return
+   address INSIDE the stub. The stub doesn't restore LR
+   before branching back to 1488b0. So LR_USR has the stub's
+   internal "return-to-stub" PC = something in the stub pool
+   (which lives at 0x80000000+ somewhere?).
+
+   Then somewhere between 1488c4 and Lookup, the wild LR
+   value gets COPIED into r3 by some cleanup path, AND the
+   original LR (0xc96cc) is restored from a save slot.
+
+#### Next iteration plan (iter-41)
+
+1. **Inspect the shadow_stub stub at 0x00E97FC0**: dump its
+   bytes (16+ words) and decode. Look for `bl` instructions
+   that overwrite LR without preservation. Look for any path
+   that might set R3.
+
+2. **Check shadow_stub's scratch-pool layout** in
+   `src/shadow_stub.rs` — specifically whether stubs live at
+   VA 0x8000_0000 or use that as a save slot. The wild value
+   0x80000110 might be a shadow_stub bookkeeping address.
+
+3. **Add an HVC probe at the start of the shadow_stub stub**
+   (PC=0x00E97FC0) and at its end (just before the `b 1488b0`
+   return) to capture the register state on entry and exit.
+   That'll directly show what the stub does to LR / R3.
+
+4. **Once the stub bug is identified**, fix it:
+   - If the stub uses a forbidden `bl`, rewrite to `b`.
+   - If the stub uses a save slot improperly, fix the save/
+     restore sequence.
+   - If the stub's emulation calls into Rust via HVC and the
+     Rust code doesn't preserve some reg, add the preservation.
+
+#### Status
+
+- Build clean.
+- Probe HVC #0x6E at 0x001488c4 fires; captures r3=sane,
+  lr=wild AT MID — pinning shadow_stub's stub at 1488ac as
+  the LR corrupter.
+- The r3↔lr swap between mid and Lookup entry remains a
+  mystery for iter-41 (most likely a deeper handler-path bug,
+  or an artifact of the stub's `bl`-to-emulation pattern).
+- 30/30 shadow_stub tests pass — the existing tests don't
+  exercise this combination of caller-saved reg state across
+  a non-faulting byte-access emulation.
+- Iter-40 deliverable: localized one corruption to
+  shadow_stub's stub (LR), with a clear iter-41 path to
+  the second corruption (r3 gain) inside the stub or the
+  HVC handler chain.
 
 ### Iteration 39 (next-loop iter 35): bisection — FindSuperceeder entry r1=sane, but Lookup sees r3 wild; shadow_stub stub at 0x001488ac is the prime suspect
 

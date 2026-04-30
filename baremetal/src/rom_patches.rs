@@ -1000,6 +1000,19 @@ pub const FINDSUPER_ENTRY_PROBE_HVC_IMM: u32 = 0x6D;
 pub const FINDSUPER_ENTRY_PROBE_PC:      u32 = 0x0014_88A0;
 const FINDSUPER_ENTRY_FIRST_INSN:        u32 = 0xE1A0_3001; // mov r3, r1
 
+/// Mid-FindSuperceeder probe at ROM `0x0014_88C4` (`mov r0, ip` =
+/// 0xE1A0_000C). Iter-40 bisects shadow_stub-stub-corruption vs
+/// post-stub-chain corruption: if r3 is sane (0x0c328e90) at this
+/// PC, the corruption happens in the b 0x01afef70 → b 0x000c747c
+/// chain (only 2 instructions, both unconditional branches with
+/// no register writes — extremely suspicious). If r3 is already
+/// wild here, the corruption happened earlier in the body (either
+/// in the shadow_stub stub at 1488ac, or in the natural ldrb /
+/// teq / mov / ldr / bic / mov sequence at 1488a4..1488c0).
+pub const FINDSUPER_MID_PROBE_HVC_IMM:   u32 = 0x6E;
+pub const FINDSUPER_MID_PROBE_PC:        u32 = 0x0014_88C4;
+const FINDSUPER_MID_FIRST_INSN:          u32 = 0xE1A0_000C; // mov r0, ip
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -1480,6 +1493,14 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(FINDSUPER_ENTRY_PROBE_HVC_IMM),
             "FindSuperceeder entry (ring + halt-on-wild-r1)",
             FINDSUPER_ENTRY_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            FINDSUPER_MID_PROBE_PC,
+            FINDSUPER_MID_FIRST_INSN,
+            hvc_insn(FINDSUPER_MID_PROBE_HVC_IMM),
+            "FindSuperceeder mid-body @1488c4 (capture r3 post-stub)",
+            FINDSUPER_MID_PROBE_HVC_IMM,
         );
     }
 }

@@ -14,7 +14,16 @@ shadow-on-write redirects, and per-task subpage-AP shims are all
 ruled out. The fix MUST be a kernel patch that makes the kernel
 work without 1k subpage protections.
 
-**Current goal (revised iter-42): WEDGE RESOLVED. The R14
+**Current goal (revised iter-43): The bus-abort throw site is
+narrowed to PhysBlock's call boundary (caller_lr=0xc0cbc, right
+after `bl PhysBlock` at 0xc0cb8). The fault is either inside
+PhysBlock (wild r0 dereference at `ldr r1, [r0, #8]`) or at
+the wrapper's `ldmdb` epilogue (corrupt fp). FAR = 0xea0061c4
+(per Throw's r1). iter-44 must add a probe at PhysBlock entry
+to read r0 and bisect: if r0 wild, trace caller chain; if r0
+sane, the fault is in ldmdb.
+
+**(Iter-42 framing preserved.) WEDGE RESOLVED. The R14
 exclusion in `pick_scratch_regs` (iter-42) eliminates the
 shadow_stub LR-corruption that caused 41 iterations of
 "evt.ex.abt.perm" investigation. The next stall is
@@ -349,6 +358,106 @@ TAlertEventHandler region.
   allocator's freelist threading code (the ROM PCs we see are
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
+
+### Iteration 43 (next-loop iter 3): Throw entry probe pins original bus-abort to PhysBlock area; wild r0 / fp suspected
+
+Iter-42 surfaced the new stall: `evt.ex.abt.bus` rethrown by
+UnlockStore→NextHandler. To find the ORIGINAL throw site
+without probing 20+ candidate `bl Throw` instructions, iter-43
+patches Throw's entry instruction directly and logs every
+kernel exception.
+
+#### Implementation
+
+- New `THROW_ENTRY_PROBE_HVC_IMM = 0x6F` constant.
+- Patch ROM 0x000B_00C8 (`Throw` first insn = `mov ip, sp` =
+  0xE1A0_C00D) with HVC.
+- `handle_throw_entry_probe` reads the C-string at r0 (= the
+  exception name) and logs `(name, r0..r2, caller_lr, sp,
+  mode)`.
+
+#### Cold-boot output
+
+```
+Throw #0: name="evt.ex.abt.bus" (r0=0x000afda0)
+          r1=0xea0061c4 r2=0x00000000
+          caller_lr=0x000c0cbc sp=0x0c328dcc mode=0x10  ← original
+
+Throw #1: name="evt.ex.abt.bus" (r0=0x000afda0)
+          r1=0xea0061c4 r2=0x00000000
+          caller_lr=0x000c87f4 sp=0x0c328eec mode=0x10  ← rethrow
+
+*** invariant violation: kernel reached UnhandledException ***
+```
+
+So the chain is:
+- Throw #0: original bus-abort fired with caller_lr=0xc0cbc.
+- Throw #1: UnlockStore catches it, rethrows via NextHandler
+  → caller_lr=0xc87f4 (matching iter-42's UnhandledException
+  caller_lr).
+- UnhandledException: no handler claims the rethrow → halt.
+
+#### Decoded Throw #0 caller
+
+`caller_lr=0xc0cbc` is right after `bl PhysBlock` at 0xc0cb8.
+Disassembly of the surrounding tiny wrapper:
+
+```
+   c0cac:	mov ip, sp
+   c0cb0:	push {fp, ip, lr, pc}
+   c0cb4:	sub fp, ip, #4
+   c0cb8:	bl 0x1b010a8 <PhysBlock__11TFlashBlockFv>  ← lr=0xc0cbc
+   c0cbc:	ldmdb fp, {fp, sp, lr}                    ← restore frame
+   c0cc0:	b 0x1afef68 <LogEntryOffset__15TFlashPhysBlockFv>
+                                                       ← tail-call
+```
+
+Two candidate fault sites:
+1. **PhysBlock's first insn** (`ldr r1, [r0, #8]` at 0xc0cc4)
+   if r0 (the TFlashBlock* this) is wild. PhysBlock is a
+   leaf — doesn't modify lr — so a fault inside PhysBlock
+   leaves LR_USR=0xc0cbc, matching the probe.
+2. **The ldmdb at 0xc0cbc** if fp is corrupted. ldmdb reads
+   from `[fp-12], [fp-8], [fp-4]` and would also fault with
+   LR_USR=0xc0cbc.
+
+`r1=0xea0061c4` in the Throw frame is likely the FAR of the
+bus abort (Throw's r1 = exception-data pointer; the kernel's
+DABT-classifier path stuffs FAR into the exception data).
+0xea0061c4 has bit-31 set, looks like an ARM `b` instruction
+encoding (0xea = b opcode), but with no obvious source — it's
+unmapped per iter-42's exception-data dump.
+
+If the fault is from PhysBlock's `ldr [r0, #8]` with r0=
+0xea0061bc, then `[r0+8]=0xea0061c4=FAR`.
+
+#### Next iteration plan (iter-44)
+
+1. **Add probe at `PhysBlock__11TFlashBlockFv` entry**
+   (0x000c0cc4) to capture r0. If r0 = 0xea0061bc, the
+   fault is on PhysBlock's first ldr; iter-45 traces back
+   PhysBlock's caller to find who passed the wild this-pointer.
+2. **If r0 entering PhysBlock is sane**, the fault must be
+   at the ldmdb at 0xc0cbc (fp corrupted). Capture fp at
+   the wrapper's exit.
+3. **Identify the wrapper at 0xc0cac**: it has no symbol in
+   the disassembly. Search for callers (any `bl 0x...` with
+   target = 0xc0cac via a thunk). The wrapper's name + caller
+   will localize the bug to a specific code path.
+4. **Cross-check with task context**: current task is Tmux,
+   in USR mode, sp=0x0c328eec at UnhandledException. iter-37's
+   FP-chain technique can be applied at the Throw probe to
+   walk the throw caller's stack.
+
+#### Status
+
+- Build clean.
+- 36/36 guest tests still pass (the new probe only adds an
+  HVC at Throw's first insn).
+- Iter-43 deliverable: original-throw-site identified —
+  bus-abort during PhysBlock call (or the wrapper's frame
+  unwind). 0xea0061c4 is the FAR; iter-44 narrows to
+  exact faulting insn.
 
 ### Iteration 42 (next-loop iter 2): shadow_stub R14 fix lands — wild-r3 wedge resolved; new stall is "evt.ex.abt.bus" via UnlockStore→NextHandler
 

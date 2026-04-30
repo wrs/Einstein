@@ -1013,6 +1013,16 @@ pub const FINDSUPER_MID_PROBE_HVC_IMM:   u32 = 0x6E;
 pub const FINDSUPER_MID_PROBE_PC:        u32 = 0x0014_88C4;
 const FINDSUPER_MID_FIRST_INSN:          u32 = 0xE1A0_000C; // mov r0, ip
 
+/// `Throw` entry at ROM `0x000B_00C8`. The kernel exception-throw
+/// primitive — every Throw goes through this. r0 = exception name
+/// pointer, r1 = data, r2 = handler. LR at entry = caller's resume
+/// PC, which uniquely identifies the throw site. iter-43 logs every
+/// Throw call (with name string, args, caller LR) so the bus-abort
+/// throw site is identified without probing 20+ candidate sites.
+pub const THROW_ENTRY_PROBE_HVC_IMM:     u32 = 0x6F;
+pub const THROW_ENTRY_PROBE_PC:          u32 = 0x000B_00C8;
+const THROW_ENTRY_FIRST_INSN:            u32 = 0xE1A0_C00D; // mov ip, sp
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -1501,6 +1511,14 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(FINDSUPER_MID_PROBE_HVC_IMM),
             "FindSuperceeder mid-body @1488c4 (capture r3 post-stub)",
             FINDSUPER_MID_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            THROW_ENTRY_PROBE_PC,
+            THROW_ENTRY_FIRST_INSN,
+            hvc_insn(THROW_ENTRY_PROBE_HVC_IMM),
+            "Throw entry (log every kernel exception throw)",
+            THROW_ENTRY_PROBE_HVC_IMM,
         );
     }
 }

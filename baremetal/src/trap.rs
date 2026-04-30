@@ -1338,6 +1338,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::UNHANDLED_NUM_EXCEPTION_HVC_IMM => {
             handle_unhandled_exception(ctx, true);
         }
+        v if v == crate::rom_patches::CARDFAULT_THROW_PROBE_HVC_IMM => {
+            handle_cardfault_throw_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1934,6 +1937,10 @@ fn handle_und(ctx: &mut TrapContext) {
             handle_unhandled_exception(ctx, true);
             // Never returns: handle_unhandled_exception halts.
         }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::CARDFAULT_THROW_PROBE_HVC_IMM) => {
+            handle_cardfault_throw_probe(ctx);
+            // Never returns: handle_cardfault_throw_probe halts.
+        }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::DAH_USR_RETURN_PROBE_HVC_IMM) => {
             // The DAH USR-return probe lives inside DataAbortHandler,
             // which only ever runs from ABT mode — not from USR. So the
@@ -2354,6 +2361,83 @@ fn handle_unhandled_exception(ctx: &TrapContext, non_user: bool) -> ! {
             match guest_mem::read_word_va(va) {
                 Some(w) => kprintln!("    [{:+3}] @{:#010x} = {:#010x}", (i * 4) as i32, va, w),
                 None    => kprintln!("    [{:+3}] @{:#010x} = (unmapped)", (i * 4) as i32, va),
+            }
+        }
+    });
+}
+
+/// Halt-on-entry tripwire for the second `bl Throw` site inside
+/// `CardFaultMonProc__12TCardDomainsFlPv` (ROM 0x0004_E660). Iter-35
+/// pinned this site as the source of the `evt.ex.abt.perm`
+/// `UnhandledException`. Iter-36 captures the kernel-side fault
+/// frame BEFORE Throw runs: `GetFaultState__FP15TProcessorState`
+/// at 0x0004_E4FC populated a 25-word `TProcessorState` on the
+/// stack via `sub sp, sp, #100; mov r0, sp; bl GetFaultState`.
+/// Per the surrounding disassembly:
+///   sp+0x44 = FAR (used as the address compared against domain
+///             ranges in the r4 alias loop at 0x4e55c..0x4e5ac)
+///   sp+0x48 = DFSR/access bits (`tst r1, #1` at 0x4e50c — bit 0
+///             discriminates the kErr=234 early return)
+///   sp+0x58 = the offending USR-mode PC (loaded into r0 at 0x4e510
+///             for ROM-PC matching)
+/// r0 is `*(0x003712C4)` — pointer to the exception-name C-string
+/// ("evt.ex.abt.perm").
+fn handle_cardfault_throw_probe(ctx: &TrapContext) -> ! {
+    let r0 = ctx.x[0] as u32;
+    let r1 = ctx.x[1] as u32;
+    let r2 = ctx.x[2] as u32;
+    let r3 = ctx.x[3] as u32;
+    let r4 = ctx.x[4] as u32;
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    let trap_mode = spsr_el2 & 0x1F;
+    let trampoline_saved_spsr = guest_mem::read_word_pa(UND_SAVE_SPSR_IPA).unwrap_or(0);
+    let true_source_spsr = if trap_mode == crate::banked::MODE_UND {
+        trampoline_saved_spsr
+    } else {
+        spsr_el2
+    };
+    let true_source_mode = true_source_spsr & 0x1F;
+    let true_source_sp = crate::banked::sp_for_mode(ctx, true_source_spsr);
+    let true_source_lr = crate::banked::lr_for_mode(ctx, true_source_spsr);
+
+    halt_invariant("CardFaultMonProc reached bl Throw — kernel decided fault unhandleable", || {
+        kprintln!(
+            "  trap_mode={} ({:#x})  true_source_mode={} ({:#x})",
+            describe_aarch32_mode(trap_mode), trap_mode,
+            describe_aarch32_mode(true_source_mode), true_source_mode,
+        );
+        kprintln!(
+            "  trampoline_saved_spsr={:#010x} (only valid if trap_mode=UND)",
+            trampoline_saved_spsr,
+        );
+        kprintln!(
+            "  TRUE source SP_{}={:#010x}  LR_{}={:#010x}",
+            describe_aarch32_mode(true_source_mode), true_source_sp,
+            describe_aarch32_mode(true_source_mode), true_source_lr,
+        );
+        kprintln!(
+            "  r0={:#010x}  r1={:#010x}  r2={:#010x}  r3={:#010x}  r4={:#010x}",
+            r0, r1, r2, r3, r4,
+        );
+        print_exception_name("exception name (r0)", r0);
+
+        // Dump the 25-word TProcessorState fault frame at SP. The
+        // disassembly tells us the structure layout, but we print
+        // every word to be safe.
+        kprintln!();
+        kprintln!("  TProcessorState fault frame at SP (25 words = 0x64 bytes):");
+        for i in 0..25u32 {
+            let off = i * 4;
+            let va = true_source_sp.wrapping_add(off);
+            let label = match off {
+                0x44 => " ← FAR",
+                0x48 => " ← DFSR/access (bit 0 = ?)",
+                0x58 => " ← offending PC",
+                _    => "",
+            };
+            match guest_mem::read_word_va(va) {
+                Some(w) => kprintln!("    sp+{:#04x} @{:#010x} = {:#010x}{}", off, va, w, label),
+                None    => kprintln!("    sp+{:#04x} @{:#010x} = (unmapped){}", off, va, label),
             }
         }
     });

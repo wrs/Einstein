@@ -14,23 +14,30 @@ shadow-on-write redirects, and per-task subpage-AP shims are all
 ruled out. The fix MUST be a kernel patch that makes the kernel
 work without 1k subpage protections.
 
-**Current goal: pin the permission DABT that's tripping
-UnhandledException. Iter-34 cracked the wedge open: the stack at
-the canary's TRUE source SP_USR (decoded by reading
-UND_SAVE_SPSR_IPA to recover the trampoline-hidden source mode)
-contains the ASCII string "Unhandled exception evt.ex.abt.perm,
-warm reboot!". The kernel hit a permission DABT it couldn't
-recover from and called UnhandledException → Reboot. This
-directly implicates the iter-3 AP-flatten step: with 1 KiB
-subpage AP overlay removed, the kernel sees AP=011 (RW/RW)
-grants where it expected per-subpage no-access. Iter-35+ should
-chase the actual fault: capture the FAR/ELR/insn of the
-permission DABT that triggered UnhandledException, decode the
-faulting access, and decide whether to (a) restore subpage
-isolation via stage-2 splitting at the offending VA, (b) patch
-the kernel allocator at the alloc site that produced the
-overlapping mapping, or (c) re-instate kernel-intent classifier
-output as a runtime gating layer.**
+**Current goal (revised iter-36): the wedge is NOT a permission
+fault — it's a TRANSLATION fault from a wild "this" pointer.
+Iter-36 captured the kernel-side `TProcessorState` fault frame
+right before `bl Throw` at `0x0004_E660` and decoded the
+underlying DABT:
+
+- FAR = 0x80000118 (unmapped — L1[0x800] = 0x110 fault)
+- DFSR = 0x85 → status=0b00101 = "translation fault, section"
+- Faulting task = Tmux (id=0x2e83), USR mode
+- Faulting PC = 0x00148328 in `Set__7TObjRefFUlT1`,
+  instruction `str r1, [r0, #8]`
+- Therefore r0 (= TObjRef "this") = 0x80000110 — a wild kernel-
+  space VA the cdfm fault monitor can't recover.
+
+The "evt.ex.abt.perm" name is misleading: it's the kernel's
+GENERIC unhandled-DABT exception name, not specifically a
+permission fault. (The kernel's `evt.ex.abt.perm` exception
+class covers all data-abort-derived "abort permission"
+conditions including a translation fault on an unmapped
+address.) iter-3 AP-flatten subpage protections are NOT
+implicated; the bug is a corrupted/uninitialized TObjRef
+"this" pointer in Tmux. Iter-37+ should trace back the call
+chain to find why Tmux invokes TObjRef::Set with this=0x80000110,
+likely an uninitialized field reads or a use-after-free.**
 
 (Earlier formulation:) Iter-30 — the 4-KiB-page phase-B
 hypothesis HOLDS for the heap allocator and stack allocator at
@@ -266,7 +273,198 @@ TAlertEventHandler region.
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
 
-### Iteration 35 (next-loop iter 31): UnhandledException halt-on-entry — wedge originates in CardFaultMonProc
+### Iteration 36 (next-loop iter 32): CardFaultMonProc Throw probe pins fault to TObjRef::Set with wild "this"=0x80000110
+
+Iter-35 halted at `UnhandledException` and decoded the exception
+name `"evt.ex.abt.perm"` with caller_lr=0x0004_E664 (right after
+the second `bl Throw` site inside
+`CardFaultMonProc__12TCardDomainsFlPv`). Iter-36 walks one frame
+upstream: a halt-on-entry probe at the `bl Throw` itself
+(`0x0004_E660`) captures the kernel's `TProcessorState` fault
+frame BEFORE Throw runs. `GetFaultState__FP15TProcessorState` at
+`0x0004_E4FC` populates a 25-word struct on the stack via
+`sub sp, sp, #100; mov r0, sp; bl GetFaultState`, so the frame
+fields are still live at the `bl Throw` site.
+
+#### Implementation
+
+- New `CARDFAULT_THROW_PROBE_HVC_IMM = 0x6B` constant in
+  `src/rom_patches.rs`. Original first insn at 0x0004_E660 is
+  `0xEB6E_52CD` (bl 0x1be319c <Throw>); patch replaces it with
+  `hvc #0x6B`.
+- New `handle_cardfault_throw_probe(ctx)` halt-on-entry handler
+  in `src/trap.rs`. Uses the iter-34 SPSR-trampoline pattern to
+  decode true source mode/SP (the probe arrives via the UND
+  trampoline because CardFaultMonProc runs in USR mode of the
+  cdfm task; HVC from USR is treated as UND on ARMv7-A).
+  Dumps r0..r4, the exception name string at r0, and all 25
+  words of the TProcessorState fault frame at SP_USR with
+  inline labels for FAR/DFSR/PC.
+- Wired into both HVC dispatch paths: direct (handle_hvc) and
+  UND-arrived-as-HVC (handle_und).
+
+#### Cold-boot output (annotated)
+
+```
+*** invariant violation: CardFaultMonProc reached bl Throw —
+    kernel decided fault unhandleable ***
+  ELR_EL2=0xffff58 SPSR_EL2=0x1db src_mode=0x1b
+  trap_mode=UND (0x1b)  true_source_mode=USR (0x10)
+  trampoline_saved_spsr=0x00000110 (only valid if trap_mode=UND)
+  TRUE source SP_USR=0x0c30df14  LR_USR=0x0c101188
+  r0=0x000afdd8  r1=0  r2=0  r3=0x00002163  r4=0x00000002
+  exception name (r0) @ VA=0x000afdd8: "evt.ex.abt.perm"
+
+  TProcessorState fault frame at SP (25 words = 0x64 bytes):
+    sp+0x00 = 0x80000110  ← saved r0 (TObjRef "this") at fault time
+    sp+0x10 = 0x80000110
+    sp+0x18 = 0x80000110
+    sp+0x3c = 0x00148328  ← saved PC (== Tmux savedPC)
+    sp+0x40 = 0x00000110  ← saved CPSR (mode=USR)
+    sp+0x44 = 0x80000118  ← FAR
+    sp+0x48 = 0x00000085  ← DFSR
+    sp+0x4c = 0x00000004  ← (likely access size)
+    sp+0x50 = 0x0c328dd4  ← Tmux SP_USR (matches task_dump)
+    sp+0x54 = 0x000014a5  ← (some kernel object id)
+    sp+0x58 = 0x00002e83  ← Tmux task id (NOT a PC! — my earlier
+                             label was wrong)
+```
+
+current task: cdfm (id=0x20c3) — fault MONITOR task, dispatched
+by FME to handle the fault.
+
+#### Decoded fault
+
+PC=0x00148328 is in `Set__7TObjRefFUlT1` (TObjRef::Set):
+
+```
+148318 <Set__7TObjRefFUlT1>:
+  148318: e1a0c00d  mov ip, sp
+  14831c: e92dd830  push {r4, r5, fp, ip, lr, pc}
+  148320: e24cb004  sub fp, ip, #4
+  148324: e1a04000  mov r4, r0
+  148328: e5801008  str r1, [r0, #8]    ← FAULTING INSN
+  14832c: e1a00002  mov r0, r2
+  148330: e3710001  cmn r1, #1
+  ...
+```
+
+The faulting instruction is `str r1, [r0, #8]` — a WRITE of r1
+to the address `r0 + 8`. With FAR=0x80000118, r0 = 0x80000110.
+This is the `this` pointer of the TObjRef object — the "self"
+parameter of `TObjRef::Set(unsigned long, unsigned long)`.
+
+DFSR=0x85 decodes to:
+- status[3:0] = 0b0101, status[4]=bit10=0 → status=0b00101 =
+  "Translation fault, section" (NOT permission)
+- bit 7 = 1 (auxiliary, varies by impl)
+- bit 11 (WnR) = 0 — but the instruction is a STORE, so this
+  reads anomalously. Possibly the DFSR captured here is the
+  read-side recorded by the kernel's GetFaultState normalization,
+  or our DFSR-bit-position assumption is off. The store-fault
+  pattern (FAR=base+offset matches r0+8) is unambiguous from
+  the disassembly even if the WnR flag reads inconsistently.
+
+L1[0x800] = 0x00000110 — this is a "fault" descriptor (low
+bits 00 = translation fault) with domain field = 0x8. The VA
+0x80000110 is genuinely unmapped at stage 1.
+
+#### Why the "permission fault" name is misleading
+
+`evt.ex.abt.perm` is the kernel's GENERIC unhandled-DABT
+exception class, not specifically a permission fault. Newton's
+exception taxonomy uses `abt.perm` to mean "abort, escalated
+to permanent" — i.e., the fault couldn't be transiently
+resolved and must be reported to the task. Both translation
+faults and AP-violation faults end up routed here when no
+fault monitor recovers them.
+
+This means the iter-3 AP-flatten step is NOT implicated by
+this wedge. The fault is a wild this-pointer in Tmux, not a
+subpage-AP mismatch.
+
+#### Earlier-fault-chain context (log scrollback)
+
+Just before the wedge, the kernel DAH log shows:
+
+```
+dabt: forwarding to kernel DataAbortHandler — DFSC=0x5
+    FAR=0x80000118 mode=0x17
+  ...
+DAH-OR[5]: far=0x80000118 curr_task=0x0c12241c m74=0x0c118b38->0x00003045
+DAH-FME-ret[5]: r0=0x00000000 far=0x80000118  (success → recovery)
+DAH-exit probe (success @ 0x00393b80): src_mode=0x17 (ABT)
+```
+
+So the DAH dispatched the fault to FME (Fault Monitor Engine);
+FME found CardFaultMonProc as the registered monitor and
+returned r0=0 (handler-found success). The kernel then woke
+the cdfm task; cdfm runs CardFaultMonProc, which iterates the
+card-domain alias list, finds NO domain owns 0x80000118, and
+calls `Throw("evt.ex.abt.perm")`. No throwing handler claims
+it → UnhandledException → Reboot.
+
+The dispatch chain itself is working correctly. The bug is
+upstream in Tmux, where it invokes TObjRef::Set with a wild
+this=0x80000110.
+
+#### Hypotheses for Tmux's wild this-pointer
+
+1. **Uninitialized TObjRef field**: A struct allocation in Tmux
+   that's not initialized before TObjRef::Set is called on it.
+   The +8 / +12 fields would be set inside Set, but if the
+   "this" base is junk, those writes go to garbage VAs.
+2. **Stale TObjRef from freed message**: Tmux routes IPC
+   messages between tasks; a freed message's TObjRef field
+   could survive into a re-routed delivery.
+3. **Pointer truncation/sign-extension**: 0x80000110 could be
+   a sign-extended low-half value, or an i32 with bit-31 set
+   from arithmetic that overflowed.
+
+#### Status
+
+- Build clean.
+- Probe HVC #0x6B fires correctly via UND-trampoline path from
+  USR-mode cdfm task.
+- 25-word fault frame decoded; FAR=0x80000118 confirmed; PC
+  pinned to TObjRef::Set; this-pointer is 0x80000110.
+- `evt.ex.abt.perm` correctly identified as a generic-unhandled-
+  DABT label, NOT specifically a subpage-AP fault. iter-3 AP-
+  flatten is exonerated for this wedge.
+- 30/30 shadow_stub tests pass (probe is patched after main
+  rom_patches and doesn't disturb shadow_stub coverage).
+
+#### Next iteration plan (iter-37)
+
+1. **Find the caller of TObjRef::Set at PC=0x148328**. Look at
+   the saved LR_USR=0x0c101188 (likely a stack-stored caller
+   PC) and Tmux's saved task_dump entry: `task 0xc12241c (Tmux)
+   id=0x2e83 savedPC=0x148328 SPSR=0x110 sp_usr=0xc328dd4
+   lr_usr=0xc74b8`. lr_usr=0x000c74b8 is the immediate caller
+   of Set. Look up 0x000c74b8 in rom.dis to find the calling
+   function and the source of r0 (the TObjRef this-pointer).
+
+2. **Walk Tmux's user stack at 0x0c328dd4** to recover the call
+   chain. The probe already dumped sp+0x50 = 0x0c328dd4 (Tmux
+   SP_USR). Add a follow-up dump of [SP_USR..SP_USR+0x80] to
+   see Tmux's APCS frame chain. The "fp"-walking convention
+   should let us walk back several frames.
+
+3. **Identify what allocates the TObjRef** that has this=0x80000110.
+   Likely a dispatch through Tmux's message-routing path.
+   Cross-reference with `STRUCTURES.md` and the Newton
+   internals docs for TObjRef layout.
+
+4. Once the caller is identified, decide:
+   a. Initialize the field properly (kernel patch).
+   b. If it's a bug in the message-routing protocol (e.g.,
+      a free/use ordering issue), re-architect the path.
+   c. If it's an artifact of one of our earlier patches
+      (e.g., 4 KiB allocator changes leaving a field
+      uninitialized that the old subpage-AP mechanism would
+      have caught), revisit the patch.
+
+
 
 User pointed out we should obviously halt directly at
 UnhandledException rather than at the downstream Reboot canary.

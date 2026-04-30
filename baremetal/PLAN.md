@@ -17,48 +17,94 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-54):** iter-53 fixed the screen.blit wedge:
-the rowBytes field at pixmap+4 is packed in the high 16 bits
-(per Einstein's `TScreenManager::Blit` reading
-`srcRowBytes >> 16`), and the source rect is in the pixmap's
-own coordinate space (must be biased back through pixmap+8
-`pixmapTopLeft`). Our previous code read the full 32-bit word as
-rowBytes, so rowBytes=2621440 (=0x280000) walked the bitmap
-pointer off the end of mapped RAM after a few rows. With the
-fix, rowBytes=40 (0x28) and the blit completes for the
-320×480 screen.
+**Current goal (iter-55):** iter-54 root-caused the iter-53
+"wild PC=0xe7f842f0" wedge: it wasn't a wild PC at all — the
+DIAG-vector intercept's "faulting PC" decoder was misled by a
+stale 64-bit FAR_EL1 value whose high half had previously been
+some other instruction word. The actual fault was an **alignment
+fault** on `ldr r0, [r0, #0x3e]` at PC=0x0035c554 inside
+`DrText__FlN21` — Newton ROM uses the ARMv4 rotate-on-unaligned
+LDR idiom that becomes an alignment fault under ARMv7's
+SCTLR.A=1 (which we force on for exactly that reason).
 
-The blit also now inverts each byte (Newton 1-bpp convention vs
-host FB) and lays rows out at SCREEN_WIDTH/8 = 40-byte stride
-(the fixed FB stride, not the source rowBytes — the previous
-code matched src and dst strides which only happened to work
-when both were tiny test buffers). `test_screen_blit.S` was
-updated to match these semantics.
+The DABT trampoline's BEQ that's supposed to route alignment
+faults to `HVC #ALIGN_TAG` instead fell through to
+`HVC #DIAG_TAG` for this site (cause unclear: legacy DFSR via
+`mrc c5,c0,0` may report differently from ESR_EL1 on this
+specific site). iter-54 added a defence-in-depth check in
+`handle_diag`: when src_mode is ABT and ESR_EL1.DFSC == 0x01,
+dispatch to `unaligned::handle_align_fault` directly instead of
+dumping and halting.
 
-Boot now progresses to NewBlock #769 and hits a NEW wedge:
-the kernel's user-mode code branched to a wild PC = 0xe7f842f0
-(an undefined-instruction encoding pattern, not a real ROM
-address). The DIAG vector intercept dump shows:
+Boot progresses past the alignment-fault wedge and hits a NEW
+limitation in our screen.blit:
 
 ```
-*** DIAG vector intercept (HVC #DIAG_TAG from mode ABT) ***
-  ELR_EL2   = 0x00000010  (PC of insn after HVC)
-  faulting PC 0xe7f842f0 insn=0xdeadbeef
-  pre-fault SP=0x0cc7787c LR=0x0035c498
-  r0=0x0cc77c40 r1=0xfffffffe r12=0x0cc778bb
+screen.blit ENTER ... pixmap=0xc107d8c addy=0xc646d00
+  rowBytes=40 pmTL=(0,0) src=(111,115,229,205) dst=(111,115,229,205)
+*** screen.blit: src_left 115 not 8-pixel aligned (would need
+    bit-mask blit) @PC=0x801bd4
 ```
 
-Pre-fault mode was USR; LR_usr = 0x0035c498. The wild PC
-likely came from a corrupted function pointer or an LDM-with-PC
-that loaded garbage from a spilled stack slot.
+Newton's UI code is now blitting a non-byte-aligned region
+(src_left=115 ≡ 3 mod 8). Our hypervisor's blit halts loud on
+non-byte-aligned src because we never ported Einstein's
+bit-mask path (`Blit_0` in `Screen/TScreenManager.cpp`).
 
-iter-54 should:
-1. Backtrace from LR_usr=0x0035c498 to identify the call site
-   that branched to the wild PC.
-2. Inspect the user-stack contents at SP_usr=0x0cc7787c to find
-   the spilled register (likely R12 or PC) that held 0xe7f842f0.
-3. Decide if this is yet another shadow_stub mis-pick, a stack-
-   corruption upstream, or a kernel-data-structure issue.
+iter-55 should port the Einstein bit-mask blit logic. The
+required pieces:
+- `additionalLeftPixels = srcLeft & 0x7` and a `leftMask` that
+  preserves the dst's pre-existing left-edge pixels.
+- Same for the right edge (`additionalRightPixels`).
+- Per-row 32-bit-word loop reading source big-endian and
+  inverting per blit mode (0 = srcCopy, 1 = darken).
+- `UpdateScreenRect` no-op (we mark FB dirty already).
+
+### Iteration 54: alignment-fault redirect from DIAG-tag (DFSC=0x1 safety net)
+
+iter-53's "wild PC=0xe7f842f0" wedge turned out not to be a wild
+PC at all. The DIAG-vector dump's "faulting PC = 0xe7f842f0
+insn=0xdeadbeef" line was reading the high 32 bits of a 64-bit
+FAR_EL1 whose lower 32 bits held the actual VA (0x0c64be6e).
+The high half was leftover bytes from an earlier exception. The
+correct faulting info comes from the DABT trampoline's stash:
+`LR_abt=0x0035c55c` → aborting PC = 0x0035c554, which is
+`ldr r0, [r0, #0x3e]` inside `DrText__FlN21`.
+
+This is the ARMv4 rotate-on-unaligned LDR idiom: read a 16-bit
+half-word at a non-aligned offset by loading the surrounding
+word and rotating. ARMv7 with SCTLR.A=1 (which we force on)
+turns it into an alignment fault. Our hypervisor has an
+emulator for it (`unaligned::handle_align_fault`) reached via
+the DABT trampoline's BEQ to ALIGN_TAG.
+
+#### Mechanism
+
+The DABT trampoline checks DFSR.FS[3:0] via legacy
+`mrc p15,0,Rt,c5,c0,0`. If FS == 1, BEQ to `HVC #ALIGN_TAG`;
+else fall-through to `HVC #DIAG_TAG`. For this specific site
+(and cause unknown — we have ~40 successful ALIGN_TAG dispatches
+earlier in the run), the BEQ fell through to DIAG_TAG even though
+ESR_EL1 reports DFSC=0x01.
+
+#### Fix
+
+`handle_diag` now cross-checks ESR_EL1.DFSC: if src_mode == ABT
+and DFSC == 0x01 (alignment), it calls
+`unaligned::handle_align_fault(ctx)` directly instead of falling
+through to the diagnostic dump. This is a defence-in-depth net
+that catches the case where the trampoline's legacy-DFSR check
+disagrees with the AArch64 ESR_EL1 view.
+
+#### Verification
+
+- All 36 guest tests pass.
+- Cold boot: zero `*** DIAG vector intercept` lines (was 1
+  before). 40 alignment faults emulated successfully (vs. 39
+  before, plus 1 now via the DIAG → ALIGN redirect).
+- Boot progresses past the iter-53 wedge and reaches a new
+  limitation in screen.blit (non-8-pixel-aligned src_left,
+  iter-55).
 
 ### Iteration 53: screen.blit pixmap interpretation aligned with Einstein's TScreenManager
 
@@ -116,92 +162,6 @@ is read at FB[+40] not FB[+4].
 - Cold boot: blit completes 19200 bytes copied for the
   320×480 screen and proceeds to NewBlock #769. New wedge is a
   wild PC=0xe7f842f0 in USR mode (iter-54).
-
-### Iteration 52: FindSuperceeder wild-r3 root-caused — Direct-branch unreachable targets need APCS_PARAMS
-
-iter-51's fix exposed a new wedge: `TFlashStore::Lookup called
-with wild OUT-param r3=0x80000110` from caller PC 0x000c96cc
-(right after `bl FindSuperceeder`). The wild value 0x80000110
-is the saved CPSR (USR mode + N flag) — same shape as
-iter-49's R12 clobber, the unmistakable signature of an
-`MRS scratch_fl, CPSR` write hitting a register that's actually
-live.
-
-#### Mechanism
-
-`FindSuperceeder @0x001488a0` body:
-```
-1488a0: mov r3, r1            ; r3 = OUT-param (saved here)
-1488a4: ldr r1, [r0, #16]     ; r1 = TFlashStore* (this for Lookup)
-1488a8: mov ip, r1            ; ip = TFlashStore*
-1488ac: ldrb r1, [r1, #61]    ; ← shadow_stub-patched LDRB
-        ...
-1488c8: b 0x1afef70 <Lookup-jumptable-thunk>
-```
-
-The picker for the LDRB at `0x001488ac` walks forward through
-the body and at `1488c8: b 0x1afef70` follows the Direct branch.
-0x1afef70 lies in the post-ROM jumptable region (above
-ROM_IPA_BASE+ROM_IPA_SIZE = 0x01000000), so `read_insn(target)`
-returns `None`. The walker then OR'd `APCS_RETURN_LIVE` into
-live and returned — but **omitted `APCS_PARAMS` (R0..R3)**.
-
-Tail-calls in APCS pass arguments in R0..R3, so any jumptable-
-routed `b <fn>` should mark R0..R3 live at the call site.
-Without it, the picker classified R3 as dead, picked it as
-`scratch_fl`, and the stub's `MRS R3, CPSR` clobbered the
-OUT-param pointer with 0x80000110.
-
-#### Fix
-
-Hoist `APCS_PARAMS` to a module-level const, and OR it into the
-live mask whenever a Direct or Cond branch's target is
-unreachable:
-
-```rust
-// BranchKind::Direct
-if read_insn(target).is_none() {
-    live |= (APCS_RETURN_LIVE | APCS_PARAMS) & !written;
-    return live;
-}
-```
-
-This hardens the picker against every jumptable-routed tail-call
-in Newton ROM, not just FindSuperceeder. Every Newton ROM
-function that ends in a `b <jumptable_slot>` is now treated as
-parameter-passing.
-
-#### Verification
-
-- `shadow_stub pick @0x001488ac` now reports
-  `ScratchVA sea=R12 sfl=R0 sad=R2` (3 caller-saved regs
-  spilled to per-stub slot; no R3 touch).
-- All 36 shadow_stub unit tests pass.
-- All 36 guest tests pass.
-- Cold boot no longer trips the Lookup-wild-r3 invariant.
-
-#### Side fixes (downstream wedges this iteration unblocked)
-
-The boot then ran ~80% further (Tmux task active, NewBlock #758
-allocations) and hit:
-
-1. `screen.GetScreenInfo: cannot write 0xcc77e70 @PC=0x801b84`
-   — `peripherals/screen.rs::get_screen_info` was using
-   `write_word_pa` on a guest VA. Fixed: translate VA → PA via
-   `guest_mem::translate_va`, with identity fall-back when
-   stage-1 is off (guest-test runtime).
-
-2. `screen: unknown subfn 0x8 @PC=0x801be8 r1=0x4` — REx code
-   queries `TMainDisplayDriver::GetFeature(feature_id)`. Added
-   the `0x08 GetFeature` and `0x09 SetFeature` handlers per
-   `Emulator/TNativePrimitives.cpp:1662`. Returns Einstein-style
-   defaults for an un-configured ScreenManager.
-
-3. `screen.blit` `read_byte_pa` was using PA on a VA — fixed
-   the same way (translate-or-identity).
-
-The next wedge — `screen.blit: src VA 0xc64d000 outside mapped
-regions` — is iter-53 territory.
 
 
 ## Workflow per stop

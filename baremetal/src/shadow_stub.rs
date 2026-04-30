@@ -829,13 +829,27 @@ fn nzcv_dead_recursive<R>(
     start_pc: u32, max_instrs: u32, visited: &mut Visited, read_insn: &R,
 ) -> bool
 where R: Fn(u32) -> Option<u32> {
-    if visited.contains(start_pc) {
-        // Cycle: contributes no new reads / writes. Caller's verdict.
-        return true;
+    if let Some((_idx, cached)) = visited.find(start_pc) {
+        if cached == LIVE_IN_PROGRESS {
+            // Cycle: contributes no new reads. Conservative-true.
+            return true;
+        }
+        // Already-finished: encoded as 0 = false, 1 = true.
+        return cached != 0;
     }
-    if !visited.push(start_pc) {
-        return false; // budget exhausted, conservative
-    }
+    let idx = match visited.start(start_pc) {
+        Some(i) => i,
+        None => return false, // budget exhausted, conservative
+    };
+    let result = nzcv_dead_walk(start_pc, max_instrs, visited, read_insn);
+    visited.finish(idx, if result { 1 } else { 0 });
+    result
+}
+
+fn nzcv_dead_walk<R>(
+    start_pc: u32, max_instrs: u32, visited: &mut Visited, read_insn: &R,
+) -> bool
+where R: Fn(u32) -> Option<u32> {
     let mut pc = start_pc;
     for _ in 0..max_instrs {
         let insn = match read_insn(pc) {
@@ -1265,23 +1279,65 @@ const APCS_RETURN_LIVE: RegMask =
 
 const LIVE_AT_MAX_VISITED: usize = 64;
 
+/// Per-block analysis state. Each `start_pc` we begin walking gets a
+/// slot. Slots transition `InProgress` → `Finished(live_in)` once the
+/// walk completes; this distinction lets us treat cycles (back-edges
+/// to a still-in-progress ancestor) differently from re-entries to a
+/// block that's already been fully analysed.
+///
+/// Iter-51 fix: previously we tracked only "visited" with a return-0
+/// short-circuit on revisit. That conflated cycle-break with
+/// memoization, and was unsafe when a block was reachable through two
+/// paths whose local `written` masks differed: the deep visit's caller
+/// could mask out reads (e.g. R0 written before fall-back-merge), then
+/// when the OUTER caller's direct path tried to walk the same block,
+/// the contains-check returned 0 and the OUTER caller never re-saw
+/// those reads. Concrete failure: WriteChunk LDRB stub @0x00257080
+/// dropped R0's read at 0x0025708c → picker chose R0 as scratch_fl →
+/// `MRS R0, CPSR` clobbered R0 with the saved CPSR (0x20000110), which
+/// then leaked into `add r1, r0, #1` and corrupted `count` to a wild
+/// value, eventually failing as `evt.ex.abt.bus` deep in WriteRun.
 struct Visited {
     pcs: [u32; LIVE_AT_MAX_VISITED],
+    /// `live[i]` is the cached live_in mask for `pcs[i]` after its
+    /// walk completes. `u16::MAX` is the sentinel "still in progress"
+    /// (a real live mask never sets all 16 bits — bit 15 is PC and
+    /// is never live before the actual return).
+    live: [RegMask; LIVE_AT_MAX_VISITED],
     n: usize,
 }
 
+const LIVE_IN_PROGRESS: RegMask = u16::MAX;
+
 impl Visited {
     fn new() -> Self {
-        Self { pcs: [0; LIVE_AT_MAX_VISITED], n: 0 }
+        Self { pcs: [0; LIVE_AT_MAX_VISITED], live: [0; LIVE_AT_MAX_VISITED], n: 0 }
     }
-    fn contains(&self, pc: u32) -> bool {
-        self.pcs[..self.n].iter().any(|&p| p == pc)
+    /// Look up `pc`. Returns `(idx, live)` where `live == LIVE_IN_PROGRESS`
+    /// means we're inside the walk for `pc` (back-edge → cycle), and any
+    /// other value is the cached live_in.
+    fn find(&self, pc: u32) -> Option<(usize, RegMask)> {
+        for i in 0..self.n {
+            if self.pcs[i] == pc {
+                return Some((i, self.live[i]));
+            }
+        }
+        None
     }
-    fn push(&mut self, pc: u32) -> bool {
-        if self.n >= LIVE_AT_MAX_VISITED { return false; }
-        self.pcs[self.n] = pc;
+    /// Reserve a slot for `pc` with `LIVE_IN_PROGRESS` until the walk
+    /// finishes. Returns `Some(idx)` on success, `None` if capacity is
+    /// exhausted (caller falls back to ABI-trustful conservative).
+    fn start(&mut self, pc: u32) -> Option<usize> {
+        if self.n >= LIVE_AT_MAX_VISITED { return None; }
+        let idx = self.n;
+        self.pcs[idx] = pc;
+        self.live[idx] = LIVE_IN_PROGRESS;
         self.n += 1;
-        true
+        Some(idx)
+    }
+    /// Mark slot `idx` as fully analysed with `live` as its live_in.
+    fn finish(&mut self, idx: usize, live: RegMask) {
+        self.live[idx] = live;
     }
 }
 
@@ -1297,16 +1353,38 @@ fn live_at_recursive<R>(
     start_pc: u32, max_instrs: u32, visited: &mut Visited, read_insn: &R,
 ) -> RegMask
 where R: Fn(u32) -> Option<u32> {
-    // Cycle detection: revisiting a block we've already analyzed adds
-    // no new reads — the original visit already captured them.
-    if visited.contains(start_pc) {
-        return 0;
+    if let Some((_idx, cached)) = visited.find(start_pc) {
+        if cached == LIVE_IN_PROGRESS {
+            // Cycle: back-edge to a block on the current call chain.
+            // Returning 0 under-approximates the live_in for the cycle
+            // case, but that's acceptable — proper iterative dataflow
+            // would require fixed-point iteration; this single-pass
+            // approximation has been adequate for Newton ROM bodies in
+            // every other site we've validated.
+            return 0;
+        }
+        // Already-finished block: return the memoized live_in. This
+        // is the iter-51 fix — without it, the second walker to reach
+        // a block from a different code path would receive 0 and the
+        // picker would mistake reachable reads for "dead" registers.
+        return cached;
     }
-    if !visited.push(start_pc) {
-        // Visited budget exhausted — ABI-trustful conservative.
-        return APCS_RETURN_LIVE;
-    }
+    let idx = match visited.start(start_pc) {
+        Some(i) => i,
+        None => {
+            // Visited budget exhausted — ABI-trustful conservative.
+            return APCS_RETURN_LIVE;
+        }
+    };
+    let live = live_at_walk(start_pc, max_instrs, visited, read_insn);
+    visited.finish(idx, live);
+    live
+}
 
+fn live_at_walk<R>(
+    start_pc: u32, max_instrs: u32, visited: &mut Visited, read_insn: &R,
+) -> RegMask
+where R: Fn(u32) -> Option<u32> {
     let mut live: RegMask = 0;
     let mut written: RegMask = 0;
     let mut pc = start_pc;
@@ -1799,6 +1877,7 @@ fn emit_inline_stub(d: &Decoded, orig_pc: u32) {
     // Compile-time-cheap (just an array compare); narrow output.
     const TRACE_PICK_SITES: &[u32] = &[
         0x0014_88AC, // FindSuperceeder body — iter-49 R12-misclassification
+        0x0025_7080, // WriteChunk LDRB — iter-51 R0-misclassification (visited-set leak)
     ];
     let trace_pick = TRACE_PICK_SITES.contains(&orig_pc);
 
@@ -3367,6 +3446,58 @@ mod tests {
         // pick R2 (dead). Lock that in so future regressions surface.
         assert_eq!(sea, 12, "scratch_ea expected R12; got {}", sea);
         assert_eq!(sfl, Some(2), "scratch_flags expected R2; got {:?}", sfl);
+    }
+
+    /// Iter-51 regression: live_at_recursive's visited-set was both a
+    /// cycle break AND a 0-return memoization, so the FALL arm of a
+    /// Cond branch was short-circuited to 0 whenever the TAKEN arm's
+    /// deep recursion had pre-visited the fall target via a different
+    /// path. Reads on the fall path were silently lost. The fix:
+    /// proper per-block memoization with an in-progress sentinel for
+    /// real cycle detection. This test constructs the exact pattern.
+    ///
+    /// Pattern:
+    ///   pc=0x00: BNE +N (target picks the taken arm)
+    ///   pc=0x04: ADD r0, r0, #1   ← reads R0 (the fall path)
+    ///   pc=0x08: BX LR            ← fall path return
+    ///   pc=0x0c (taken): MOV r0, r5
+    ///   pc=0x10: B 0x04           ← back-edge into fall-block
+    ///
+    /// Without the iter-51 fix, the taken arm walks 0x0c, 0x10, then
+    /// recurses on 0x04 (pushes 0x04). When the outer caller then
+    /// recurses on its own fall=0x04, the visited-contains check
+    /// returns 0, and R0's read at 0x04 is dropped. With the fix,
+    /// 0x04's first walk caches `live_in(0x04) = {R0}`; the outer's
+    /// fall recursion gets the cached value, and R0 is correctly
+    /// reported live.
+    #[test]
+    fn liveness_shared_block_does_not_drop_reads_iter_51() {
+        let stream = [
+            0x1A00_0001u32, // [0]  pc=0x00 BNE +1 (target = pc+8+1*4 = 0x0c)
+            0xE280_0001u32, // [1]  pc=0x04 ADD r0, r0, #1   ← reads R0
+            0xE12F_FF1Eu32, // [2]  pc=0x08 BX LR
+            0xE1A0_0005u32, // [3]  pc=0x0c MOV r0, r5
+            0xEAFF_FFFCu32, // [4]  pc=0x10 B  0x04 (back-edge → 0x04)
+        ];
+        let read = |pc: u32| stream.get((pc / 4) as usize).copied();
+        let live = live_at_with_reader(0, 32, &read);
+        assert_ne!(
+            live & (1u16 << 0), 0,
+            "R0 must be live at 0x00 — fall path 0x04 reads R0 via `add r0, r0, #1`; live={:#x}",
+            live
+        );
+    }
+
+    /// Iter-51 supporting test: confirms the in-progress sentinel
+    /// breaks the back-edge cycle without exhausting the visited
+    /// budget. A trivial self-loop (`b .`) must terminate.
+    #[test]
+    fn liveness_tight_cycle_terminates_iter_51() {
+        // Single instruction that branches to itself.
+        let stream = [0xEAFF_FFFEu32]; // pc=0x00 B 0x00
+        let read = |pc: u32| stream.get((pc / 4) as usize).copied();
+        // Should NOT panic / overflow / hang.
+        let _live = live_at_with_reader(0, 32, &read);
     }
 
     /// Iter-49 regression: FindSuperceeder body at ROM 0x001488ac.

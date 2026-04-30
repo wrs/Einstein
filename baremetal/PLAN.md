@@ -248,6 +248,81 @@ TAlertEventHandler region.
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
 
+### Iteration 32 (next-loop iter 28): canary-source investigation — Reboot from UND mode
+
+Iter-30/31 verified the heap and stack invariants and tightened
+the Prim layer. With those in place the wedge is consistently the
+existing Reboot canary, with mode-context revealing where it
+comes from.
+
+#### Canary handler output, untraced run
+
+```
+*** Reboot canary fired — guest kernel is rebooting ***
+  ELR_EL2  = 0x00ffff58  (= Reboot entry PC)
+  SPSR_EL2 = 0x000001db  mode=UND (0x1b)
+  R0 = 0xffffd8a5  R1 = 0  R2 = 0  R3 = 0x7fffffcd
+  R12 = 0x0cc77cc8  R14_UND = 0x000d9888
+```
+
+Mode=UND when Reboot runs — that's the Throw/UnhandledException
+exit path. The kernel's UnhandledException handler eventually
+tail-calls Reboot. R3=0x7FFFFFCD looks like a NewtonOS error code
+(packed kErr- form). R0=0xFFFFD8A5 likely an exception
+descriptor pointer.
+
+#### Trace-mode run reveals timing dependence
+
+`cargo run --release --features trace,quiet` produced 175k+
+trace entries over 60 s and never hit the Reboot canary. The
+last entries show the kernel spinning in `TFlash::Read` /
+`SFlashLogEntry::IsValid` — flash log replay during early boot.
+Trace mode adds ~10× per-call overhead via the HVC trampoline,
+so the kernel doesn't reach whatever post-init self-test fires
+the canary in the untraced run. This rules out tracing as a
+direct path to the caller.
+
+#### What we have / want
+
+- We have: Reboot fires from UND mode, R3 = error code
+  0x7FFFFFCD, exception descriptor at 0xFFFFD8A5.
+- We want: the user-mode call chain that issued Throw, plus
+  the actual error symbol the kernel resolved.
+
+#### Next iteration plan (iter-33)
+
+Extend the existing Reboot canary handler in `src/trap.rs` to:
+
+1. Walk the SP_und stack (8–16 words) and decode any APCS frames
+   it finds. The UND-mode code path that ends in Reboot is
+   `UnhandledException → Throw → ...`; the saved fp / lr chain
+   should resolve back to the user-mode caller that issued the
+   exception.
+2. Resolve the error code in R3 against the kernel's exception
+   string table. The kernel keeps `(kErr_*, "name")` pairs in
+   ROM; finding R3=0x7FFFFFCD's symbol turns "some self-test
+   failed" into "the kernel rejected something specific".
+3. Read `[R0]` (= the exception descriptor) and dump the first
+   16–32 bytes; if it's a TException or TThrow object the layout
+   is documented in NewtonOS internals.
+
+If steps 1–3 don't pin the source, fall back to setting an
+HVC tripwire at the kernel's `Throw` entry (find the symbol PC
+via classify-out) so we catch the exception at the moment it's
+raised, not at the moment Reboot fires.
+
+#### Status
+
+- Build clean.
+- Untraced cold-boot reaches Reboot canary (mode=UND).
+- Traced cold-boot doesn't reach canary in 60 s — timing-
+  dependent, can't use trace alone to find the caller.
+- Iter-32 deliverables: characterized canary mode (UND →
+  Throw path), documented R3 error code 0x7FFFFFCD as the
+  resolution target for iter-33; PLAN.md plan for iter-33
+  (extend canary handler with SP_und walk + error-code
+  resolution).
+
 ### Iteration 31 (next-loop iter 27): Prim aliasing/forget halts — defensive
 
 Iter-30 verified the high-level heap and stack invariants hold.

@@ -14,7 +14,22 @@ shadow-on-write redirects, and per-task subpage-AP shims are all
 ruled out. The fix MUST be a kernel patch that makes the kernel
 work without 1k subpage protections.
 
-**Current goal (revised iter-40): shadow_stub's byte-access stub
+**Current goal (revised iter-41): ROOT CAUSE FOUND. shadow_stub's
+DeadReg stub at 0x00E97FC0 picks R14 (LR) as scratch_fl despite
+LR being live across the tail-call from FindSuperceeder to
+Lookup. The MRS at slot 4 stores CPSR (= 0x80000110, with N flag
+set + USR mode + I-bit) into LR; the MSR at slot 9 restores
+NZCV from LR (read of the now-CPSR-valued LR ≠ original LR).
+LR retains the CPSR value, propagating into Tmux's call into
+Lookup as the OUT-param pointer. iter-42 must apply the
+conservative fix: remove R14 from `pick_scratch_regs`
+CANDIDATES (line 1413 of `src/shadow_stub.rs`). After the fix,
+re-run shadow_stub_tests AND the Phase B cold boot to confirm
+the wedge is resolved. Investigate the liveness-analysis bug
+(R14 not being detected as live across tail-calls) as a
+follow-up — the conservative fix sidesteps it.
+
+**(Iter-40 framing preserved.) shadow_stub's byte-access stub
 at 0x00E97FC0 is confirmed to corrupt LR_USR (mid-probe at
 1488c4 captures lr=0x80000110 immediately after the stub).
 The wild value 0x80000110 then mysteriously transfers into r3
@@ -325,6 +340,149 @@ TAlertEventHandler region.
   allocator's freelist threading code (the ROM PCs we see are
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
+
+### Iteration 41 (next-loop iter 1 of new ralph loop): ROOT CAUSE — shadow_stub picks R14 (LR) as scratch_fl despite LR being live across tail-call
+
+Iter-40 pinned the LR corruption to shadow_stub's stub at
+0x00E97FC0. Iter-41 dumps the actual stub bytes and decodes
+them.
+
+#### Stub bytes at 0x00E97FC0 (DeadReg variant)
+
+```
+slot[ 0]: 0xe320f000  NOP
+slot[ 1]: 0xe320f000  NOP
+slot[ 2]: 0xe320f000  NOP
+slot[ 3]: 0xe320f000  NOP
+slot[ 4]: 0xe10fe000  MRS R14, CPSR    ★ uses LR as scratch_fl!
+slot[ 5]: 0xe281c03d  ADD R12, R1, #61 ★ uses IP as scratch_ea
+slot[ 6]: 0xe320f000  NOP
+slot[ 7]: 0xe35c0201  CMP R12, #0x10000000  (XOR_LIMIT)
+slot[ 8]: 0x322cc003  EORLO R12, R12, #3  (BE32→LE32 byte XOR)
+slot[ 9]: 0xe128f00e  MSR CPSR_f, R14  (restore NZCV from LR)
+slot[10]: 0xe5dc1000  LDRB R1, [R12]  (the actual byte access)
+slot[11..13]: NOPs
+slot[14]: 0xeacac22c  B 0x001488b0  (back-branch to next insn)
+slot[15]: 0xe320f000  NOP (unused literal slot in DeadReg variant)
+```
+
+Trampoline scratch slots at HYP_TRAMP_SCRATCH_BASE confirm
+the captured banked LR slot:
+
+```
+scratch+0x1c = 0x80000110  (banked LR_USR at mid-probe time)
+```
+
+The wild value 0x80000110 = `0x80000000 | 0x110`:
+- `0x110` = USR mode (0x10) + I-bit (0x80) — exactly Tmux's
+  CPSR at the moment of the MRS.
+- `0x80000000` = N flag set (from some earlier comparison
+  result, e.g. the EORLO at slot 8 setting flags? actually
+  EORLO doesn't set flags; the N flag must come from earlier
+  in Tmux's flow).
+
+So 0x80000110 is genuinely Tmux's CPSR captured by
+`MRS LR, CPSR` at slot 4. The stub never restores LR after
+the MSR at slot 9 — LR keeps the CPSR value.
+
+#### The bug in shadow_stub's liveness analysis
+
+`pick_scratch_regs_with_reader` at `src/shadow_stub.rs:1405`
+uses `CANDIDATES: &[u32] = &[12, 0, 1, 2, 3, 14]` and picks
+two registers that aren't operands and aren't live. The
+liveness analyzer at `live_at_with_reader` walks forward
+from `orig_pc + 4` (= 0x001488b0).
+
+The walker SHOULD detect R14 as live because:
+1. From 0x001488b0, linear walk through 1488b0..1488c8 (7
+   insns) doesn't read or write R14.
+2. At 0x001488c8: `b 0x01afef70` (Direct branch). The walker
+   tries `read_insn(0x01afef70)`.
+3. 0x01afef70 is in the post-ship-patch table region
+   (0x01a00000..0x01c20000), past ROM_SIZE (0x01000000).
+   `code_read_word` returns None.
+4. Per `BranchKind::Direct` handling:
+   ```rust
+   if read_insn(target).is_none() {
+       live |= APCS_RETURN_LIVE & !written;
+       return live;
+   }
+   ```
+   `APCS_RETURN_LIVE` = `{R0, R4..R11, SP (R13), LR (R14)}`.
+   So R14 SHOULD be added to `live`.
+5. The picker would then reject R14 (because it's live) and
+   try the next candidate.
+
+But the actual stub at 0x00E97FC0 picks R14, meaning the
+walker didn't add R14 to live. **Something is wrong with the
+liveness logic for this site.**
+
+Possibilities:
+1. **`code_read_word` actually reads 0x01afef70 successfully**
+   somehow (e.g., the read fallback to RAM backing returns
+   data). Then the walker recurses into 0x01afef70 and
+   continues. If the recursion hits visited-budget exhaustion
+   or another path, R14 might be missed.
+2. **The walker's recursion into 0x01afef70 (or downstream
+   into 0x000c747c → push) doesn't propagate R14 as live**
+   correctly. There may be a bug in how reads at the recursed
+   target merge back into the parent's live set.
+3. **The conservative path's `& !written` mask is too eager**.
+   Looking at the code:
+   `live |= APCS_RETURN_LIVE & !written;`
+   If `written` somehow includes R14, the OR-in misses it.
+   But `written` for our trace shouldn't include R14 (no
+   instruction in 1488b0..1488c4 writes R14).
+
+#### The conservative fix (iter-42)
+
+Remove R14 from the dead-reg CANDIDATES pool entirely. R14 is
+the link register; using it as a scratch in an in-line stub
+is fundamentally fragile because:
+- Tail-calls (`b <function>`) propagate R14 as the callee's
+  caller PC. Liveness analyzers may not follow tail-calls
+  across function boundaries (especially through the
+  post-ship-patch table where targets are unreadable).
+- BX LR is the standard return; if anything between the stub
+  and the return executes a BX LR, the wild LR is jumped to.
+
+Patch: `CANDIDATES: &[u32] = &[12, 0, 1, 2, 3]` (drop 14).
+Stack-fallback variant's `pick_operand_excluded_pair` should
+also drop 14 if applicable.
+
+#### Why this matters for Phase B
+
+This is a long-standing latent bug in shadow_stub. It might
+be the root cause of MULTIPLE Phase B stalls — anywhere
+shadow_stub picks LR as scratch_fl AND the patched site is
+followed by a tail-call (or any LR-consuming flow), the
+function's LR is corrupted. The Phase B wedge caught this
+specific instance because Tmux's tail-call into Lookup
+propagated a CPSR value (= `0x80000110`) as the OUT-param
+ptr of TFlashStore::Lookup, eventually faulting in
+TObjRef::Set with this=0x80000110.
+
+Iter-42 should:
+1. Apply the conservative fix (remove R14 from candidates).
+2. Re-run shadow_stub_tests and the Phase B boot to confirm
+   the wedge is fixed.
+3. Investigate the actual liveness-analysis bug as a
+   follow-up — even with R14 removed from candidates, the
+   walker should be correctly identifying liveness across
+   tail-calls / unreadable targets.
+
+#### Status
+
+- Build clean.
+- Stub bytes decoded; root cause identified: shadow_stub
+  picks LR as scratch_fl at 0x001488ac despite LR being
+  semantically live across the tail-call.
+- The wild 0x80000110 = CPSR captured by `MRS LR, CPSR`
+  at stub slot 4.
+- Iter-41 deliverable: stub-byte decode + root-cause
+  identification + iter-42 conservative-fix plan.
+- 30/30 shadow_stub tests pass — they don't exercise the
+  tail-call-through-unreadable-target path.
 
 ### Iteration 40 (next-loop iter 36): mid-FindSuperceeder probe pins shadow_stub stub as LR corrupter; r3 corruption happens AFTER mid
 

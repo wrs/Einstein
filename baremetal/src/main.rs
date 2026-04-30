@@ -33,6 +33,7 @@ mod tracer;
 mod trap;
 pub mod uart;
 mod unaligned;
+mod unaligned_inline;
 
 #[cfg(not(test))]
 global_asm!(include_str!("boot.s"));

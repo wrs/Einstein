@@ -260,6 +260,12 @@ pub fn handle_align_fault(ctx: &mut TrapContext) {
         write_reg(ctx, decoded.rn, pre_mode, ea_offsetted);
     }
 
+    // Lazy-install an in-ROM inline stub at this PC so the next
+    // execution doesn't take the EL2 round-trip. Best-effort: any
+    // failure path (STR, writeback, no dead scratches, RAM PC, pool
+    // full) just leaves this PC paying the EL2 trap on every fire.
+    crate::unaligned_inline::try_install_at(faulting_pc);
+
     set_return(ctx, faulting_pc.wrapping_add(4), pre_abt_cpsr);
 }
 
@@ -363,23 +369,23 @@ fn dump_state(ctx: &TrapContext, pre_abt_cpsr: u32) {
     );
 }
 
-struct Decoded {
-    load: bool,   // true = LDR, false = STR
-    cond: u32,
-    rn: u32,
-    rt: u32,
-    offset: OffsetForm,
-    p: bool,      // pre-index
-    u: bool,      // add
-    w: bool,      // writeback
+pub(crate) struct Decoded {
+    pub load: bool,   // true = LDR, false = STR
+    pub cond: u32,
+    pub rn: u32,
+    pub rt: u32,
+    pub offset: OffsetForm,
+    pub p: bool,      // pre-index
+    pub u: bool,      // add
+    pub w: bool,      // writeback
 }
 
-enum OffsetForm {
+pub(crate) enum OffsetForm {
     Imm(u32),
     Reg { rm: u32, shift_type: u32, shift_amount: u32 },
 }
 
-fn decode(insn: u32) -> Option<Decoded> {
+pub(crate) fn decode(insn: u32) -> Option<Decoded> {
     let cond = (insn >> 28) & 0xF;
     if cond == 0xF {
         return None;

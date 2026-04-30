@@ -239,7 +239,7 @@ pub struct PatchStats {
 
 /// Decoded access kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AccessKind {
+pub(crate) enum AccessKind {
     /// LDRB (load unsigned byte) — B=1, L=1 in data-proc-imm/reg form.
     Ldrb,
     /// STRB (store byte) — B=1, L=0.
@@ -531,7 +531,7 @@ pub fn icache_sync_range(host_va: u64, length: usize) {
 // Encoder helpers (inline-stub emission)
 // =======================================================================
 
-mod encode {
+pub(crate) mod encode {
     pub const AL: u32 = 0xE;
     pub const LO: u32 = 0x3;
 
@@ -2218,6 +2218,100 @@ pub fn log_stats(stats: &PatchStats) {
         NEXT_STUB.load(Ordering::SeqCst), SBA_STUB_MAX,
         NEXT_SCRATCH_SLOT.load(Ordering::SeqCst), SCRATCH_POOL_STUB_CAP,
     );
+}
+
+// =======================================================================
+// Public surface for sister modules (e.g. unaligned_inline) that reuse
+// the SBA stub-pool machinery for non-byte-access cases.
+// =======================================================================
+
+/// Compute the live-register set (R0..R14 as bits 0..14 of a u16) at
+/// `start_pc`. Reads ROM via the original-first reader so probe HVCs
+/// installed earlier in boot don't confuse the analyser.
+pub fn live_regs_at(start_pc: u32, max_instrs: u32) -> u16 {
+    live_at_with_reader(start_pc, max_instrs, &code_read_word_original_first)
+}
+
+/// Allocate the next free slot in the inline-stub pool. Returns
+/// `(slot_idx, stub_ipa)`. None if the pool is exhausted.
+pub fn alloc_stub_slot() -> Option<(usize, u32)> {
+    let slot_ix = NEXT_STUB.fetch_add(1, Ordering::SeqCst);
+    if slot_ix >= SBA_STUB_MAX {
+        return None;
+    }
+    let stub_ipa = SBA_STUB_POOL_IPA + (slot_ix as u32) * SBA_STUB_BYTES;
+    Some((slot_ix, stub_ipa))
+}
+
+/// Install an inline stub at a previously-allocated slot.
+///
+/// `words.len()` must be ≤ `SBA_STUB_WORDS`; trailing slots are filled
+/// with NOPs. Writes the stub words first, then patches `orig_pc` with
+/// `B stub_ipa`, then icache-flushes both ranges. The two icache flushes
+/// are required: the stub region needs to be visible to icache fetches
+/// when the new B branches into it, and the orig_pc word's old contents
+/// must be evicted so the next fetch sees the B.
+///
+/// Returns Err if the B from `orig_pc` to `stub_ipa` is out of imm24
+/// range, or if either write fails. Never halts — caller decides
+/// whether to fall back.
+pub fn install_inline_at(
+    orig_pc: u32, stub_ipa: u32, words: &[u32],
+) -> Result<(), &'static str> {
+    if words.len() > SBA_STUB_WORDS {
+        return Err("install_inline_at: words exceeds SBA_STUB_WORDS");
+    }
+    let br = match encode::b(orig_pc, stub_ipa) {
+        Some(w) => w,
+        None => return Err("install_inline_at: B out of imm24 range"),
+    };
+
+    // Write the full slot — supplied words first, NOPs for the rest.
+    let nop = encode::nop();
+    for i in 0..SBA_STUB_WORDS {
+        let w = words.get(i).copied().unwrap_or(nop);
+        let ipa = stub_ipa.wrapping_add((i as u32) * 4);
+        code_write_word(ipa, w)?;
+    }
+
+    // Then redirect the original site to the stub.
+    code_write_word(orig_pc, br)?;
+
+    // Flush both regions to the point of unification so the guest's
+    // next fetch sees the freshly-written stub and B.
+    let stub_host = match orig_pc_to_host(stub_ipa) {
+        Some(h) => h,
+        None => return Err("install_inline_at: stub_ipa not in ROM/RAM backing"),
+    };
+    icache_sync_range(stub_host, SBA_STUB_WORDS * 4);
+    let orig_host = match orig_pc_to_host(orig_pc) {
+        Some(h) => h,
+        None => return Err("install_inline_at: orig_pc not in ROM/RAM backing"),
+    };
+    icache_sync_range(orig_host, 4);
+    Ok(())
+}
+
+fn orig_pc_to_host(ipa: u32) -> Option<u64> {
+    if (ipa as usize) + 4 <= crate::guest_mem::ROM_SIZE {
+        return Some(crate::guest_mem::rom_host_pa() + ipa as u64);
+    }
+    let ram_base = crate::guest_mem::RAM_IPA_BASE as usize;
+    if (ipa as usize) >= ram_base
+        && (ipa as usize) + 4 <= ram_base + crate::guest_mem::RAM_SIZE
+    {
+        return Some(
+            crate::guest_mem::ram_host_pa() + (ipa as u64 - ram_base as u64),
+        );
+    }
+    None
+}
+
+/// Read the original (pre-patch) instruction at `ipa`, falling back to
+/// the live ROM/RAM word if no original is recorded. Exposed for sister
+/// modules that need to read instructions in patch-aware contexts.
+pub fn read_insn_original_first(ipa: u32) -> Option<u32> {
+    code_read_word_original_first(ipa)
 }
 
 /// Outcome of a single-PC probe-list validation check.

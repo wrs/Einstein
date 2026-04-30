@@ -17,122 +17,100 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-57):** iter-56 fixed FB rendering — the
-splash screen now renders the Newton lightbulb logo and the
-"Newton" text correctly (was previously scrambled because the
-blit handler read source bytes in raw LE host order instead of
-BE-32 byte-lane order). Boot still reaches steady-state with
-no `***` halt; remaining iter-55 sub-goals stand:
+**Current goal (iter-58):** iter-57 cut the steady-state trap
+rate by ~37× via lazy in-ROM inline stubs for the rotate-LDR
+idiom (see below). Boot still reaches steady-state, FB renders
+correctly. The dominant trap is no longer the alignment-fault
+return; the residue is split between SVC dispatches, cold
+alignment-fault PCs we haven't installed yet, and other
+peripheral activity. Next steps:
 
-1. **Reduce the alignment-fault rate**, OR confirm the boot
-   reaches a true idle / event-pending wait-state on its own
-   (e.g., touchscreen interrupt). 99% of steady-state traps are
-   at `ELR=0xffffe4` (UND_RETURN_STUB_OFFSET) with
-   `SPSR=0x40000197` (ABT mode, IRQ masked) — the alignment-
-   fault return path firing repeatedly as Newton's ROM walks
-   unaligned half-word loads in its UI rendering loop. A
-   rotate-LDR fast-path inside the hypervisor (or a kernel
-   patch that uses ARMv7-aware LDRH instead of the ARMv4
-   unaligned LDR idiom) could drop the rate by ~10-100×.
-2. **Add tablet/pen input.** The boot is in steady state; the
-   next milestone is observable user interaction, which needs
-   the pen-input path wired up (`peripherals/tablet.rs`).
+1. **Wire up tablet/pen input.** With the trap budget freed up,
+   the next milestone is observable user interaction
+   (`peripherals/tablet.rs` already has scaffolding; needs the
+   pen-down/move/up event sequence + IRQ raise).
+2. **Optional: extend the inline-stub coverage.** A few percent
+   of alignment faults still trap to EL2 because they fall in
+   one of the rejection paths (writeback/post-index, no-dead-
+   scratch, REX or RAM PC). Most of the win is captured; only
+   pursue if the residue blocks something.
 
-### Iteration 56: framebuffer renders correctly — BE-32 byte-lane fix
+### Iteration 57: lazy in-ROM inline stub for rotate-LDR — 37× trap-rate cut
 
-iter-55's PNG dump showed the Newton splash with the lightbulb
-logo fragmented and the "Newton" caption scrambled to nonsense.
-The bytes were word-reversed within each 4-byte chunk: every
-group of 32 pixels had its 4 bytes shuffled from order [0,1,2,3]
-to [3,2,1,0].
-
-#### Root cause
-
-The Newton ROM is **BE-32 word-invariant**: aligned word reads
-match LE, but byte reads land on a different byte lane —
-`BE-32 LDRB at addr A == phys[A ^ 3]` (per `shadow_stub.rs:1-9`).
-The Newton kernel writes pixmap data as BE-32, so logical byte 0
-of each 4-byte word lives at host PA offset 3, byte 1 at offset
-2, etc. `peripherals/screen.rs::blit` was reading via
-`read_byte_pa(src_pa)`, which returns the raw LE host byte —
-i.e. word-reversed bytes. `shadow_stub::dispatch_byte_read`
-already encodes the correct convention as `^ 3` for backed
-memory below `XOR_LIMIT`; the blit simply wasn't following it.
+iter-56 left the boot in steady-state at ~3.4M hypervisor
+traps/sec, dominated 99% by alignment-fault returns at
+`ELR=0xffffe4`. Each fault is a full DABT → AArch32
+trampoline → HVC → EL2 emulator → ERET round-trip for an SA-
+1100 rotate-LDR instruction (`LDR Rt, [Rn]` with unaligned
+EA, `result = word_at(Rn & ~3) ROR ((Rn & 3) * 8)`). The ROM
+has ~1300 such sites; in steady-state UI rendering a small
+hot subset accounts for the bulk of the rate.
 
 #### Fix
 
-`peripherals/screen.rs` — both fast and slow paths now read
-source pixmap bytes via `read_byte_pa(src_pa ^ 3)`. FB writes
-stay linear-LE (host byte N = pixel byte N in display order),
-matching `fb_dump.rs`'s straight-line PNG read.
+New `src/unaligned_inline.rs` lazy-installs an in-ROM inline
+stub at each faulting PC the first time we see it, reusing the
+shadow_stub mechanism (SBA stub pool at IPA
+`0x00E00000..0x00FF_FF00`, B-instruction reach, liveness-aware
+scratch picker, icache-flush-both-ranges install). After
+install, subsequent executions of that PC run the rotate
+natively in AArch32 with no trap:
 
-`guest-tests/tests/test_screen_blit.S` — planted source words
-updated from `0xEFBEADDE / 0xBEBAFECA` (LE-host byte stream) to
-`0xDEADBEEF / 0xCAFEBABE` (BE-view byte stream) so the test
-mirrors the kernel's actual BE-32 STR pattern. Expected FB
-bytes after `~byte` inversion are unchanged.
+```
+slot 0/1: ADD/SUB sea, Rn, <off>      ; (or 2-step ADD if imm > 0xFF)
+slot 2:   AND     ssh, sea, #3
+slot 3:   BIC     sea, sea, #3
+slot 4:   LDR{c}  Rt, [sea]
+slot 5:   LSL     ssh, ssh, #3
+slot 6:   MOV{c}  Rt, Rt, ROR ssh
+slot 7:   B       orig_pc + 4
+```
+
+Aligned EAs see `ssh = 0` → ROR-by-0 = identity, so a single
+body handles aligned and unaligned cases. Non-S forms throughout
+preserve NZCV. Conditional LDR/MOV match the original cond, so
+a cond-fail leaves Rt untouched (matches original LDR's
+architectural behaviour).
+
+Eligibility (anything not eligible falls through to the existing
+EL2 emulator; partial coverage already wins):
+- LDR only (STR-unaligned is implementation-defined; rare).
+- Pre-index, no writeback (P=1, W=0).
+- No PC operand for Rt, Rn, or Rm.
+- Faulting PC < 0x00900000 (Newton ROM/REX, not tracer pool
+  or SBA stub pool).
+- Liveness analysis finds 2 dead scratches in {R0..R3, R12}
+  not in the operand mask.
+
+`shadow_stub` exposes a small public API (`live_regs_at`,
+`alloc_stub_slot`, `install_inline_at`,
+`read_insn_original_first`) that the new module reuses.
 
 #### Verification
 
-- All 36 guest tests pass (`test_screen_blit` materially
-  affected; passes with new word values).
-- Cold boot produces `/tmp/newton-fb/00000.png` showing the
-  Newton lightbulb logo + "Newton" caption rendered correctly.
-- Boot still reaches steady-state — no `***` halt, no
-  regression in the iter-55 trap counts.
+- All 36 guest tests pass on QEMU.
+- Cold boot reaches steady-state with no `***` halt; FB dump
+  generates correctly (logo + "Newton" caption).
+- Trap rate dropped from ~3.4M/sec (iter-56) to ~91K/sec
+  average over a 25-second cold boot (~37× reduction). Beacon
+  ELR distribution shifted from 99% `0xffffe4` (alignment) to
+  ~10% `0xffffe4` plus a spread across SVC dispatches and
+  other handlers — i.e. alignment faults are no longer the
+  dominant trap source.
+- 56 unique PCs installed in 25 s; install rate slows as the
+  hot UI-loop set is covered.
 
 #### Out of scope (deferred)
 
-- Updating `fb_dump.rs` / FB storage to BE-32 view. Only
-  matters if the guest reads its own FB back; not observed in
-  cold boot.
-- Einstein-style word-mask `Blit_0` for the slow path. Per-
-  pixel RMW is fast enough for cold-boot UI rates.
-
-### Iteration 55: non-byte-aligned blit lands; boot reaches steady-state
-
-iter-54's wedge was a hypervisor halt on Newton's UI calling
-`Blit` with `src_left=115` (3 mod 8 — non-byte-aligned). Our
-blit handler refused that input because the byte-aligned fast
-path can only copy whole bytes of source bits.
-
-#### Fix
-
-`peripherals/screen.rs::blit` now branches on
-`(pixmap_src_left | src_width_pixels) & 0x7`:
-
-- **Byte-aligned fast path** (unchanged): byte-by-byte copy with
-  per-byte inversion at FB stride 40.
-- **Non-byte-aligned slow path** (new): per-pixel loop reading
-  the source bit at `(byte >> (7 - sx & 7)) & 1`, inverting,
-  read-modify-writing the matching dst byte's bit. Slow vs the
-  word-mask logic Einstein uses in `Blit_0` (Screen/
-  TScreenManager.cpp), but correct and adequate for the
-  cold-boot UI rendering rate.
-
-#### Observed boot state
-
-After this fix, the cold boot:
-1. Completes 19200-byte byte-aligned blit (320×480 splash).
-2. Completes 10620-pixel non-aligned blit (90×118 glyph region
-   at src=(111,115,229,205) — the iter-55 wedge case).
-3. Writes `/tmp/newton-fb/00000.png` framebuffer snapshot.
-4. Enters steady-state operation. The 90-second timeout kills
-   the run with the kernel still spinning — no halt, no `***`
-   wedge, no UnhandledException. 3.4M hypervisor traps/sec
-   (99% are alignment-fault returns at `ELR=0xffffe4`), which
-   means Newton is actively doing UI work.
-
-#### Verification
-
-- All 36 guest tests pass.
-- 0 `***` halt lines in cold-boot log.
-- 2 successful blits land in the FB.
-- FB dump `/tmp/newton-fb/00000.png` is generated.
-
-This is the first iteration since Phase B started where the
-boot doesn't end on a halt — it ends on a *timeout*, with the
-kernel still running.
+- Inline coverage of LDR with writeback / post-index. Mostly
+  unused by the rotate-LDR idiom; would expand the encoder.
+- ScratchVA fallback for sites where liveness can't find 2
+  dead scratches. Lazy install means partial coverage still
+  wins; revisit only if a hot site has no dead scratches.
+- RAM-resident faulting PCs (REX or copied code). The B from
+  the SBA stub pool can't reach them; would need a parallel
+  pool or an HVC-based UDF site (slower, but cheaper than the
+  current EL2 emulator round-trip).
 
 ## Workflow per stop
 

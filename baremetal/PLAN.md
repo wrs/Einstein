@@ -17,23 +17,98 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-58):** iter-57 cut the steady-state trap
-rate by ~37× via lazy in-ROM inline stubs for the rotate-LDR
-idiom (see below). Boot still reaches steady-state, FB renders
-correctly. The dominant trap is no longer the alignment-fault
-return; the residue is split between SVC dispatches, cold
-alignment-fault PCs we haven't installed yet, and other
-peripheral activity. Next steps:
+**Current goal (iter-59):** iter-58 untrapped CP15 cache-by-VA
+maintenance ops (see below). Cold-boot trap rate went from ~91 K/s
+(post-iter-57) to ~430 K/s–1.3 M/s wall-clock — i.e. forward
+progress per second of wall time is now 5–15× higher. Boot still
+gets stuck in DiagBootStub-area work though: 160 M traps in 120 s
+of wall time, 98% beacon-sampled at `ELR=0xffffe4` (alignment-
+fault returns via the rotate-LDR EL2 emulator). Only 2 screen
+blits (splash + sub-region) on the FB. The kernel hasn't reached
+the multitasking phase that NewtonProbe shows for Einstein at
+60 s wall (`pg&e`/`drvr`/`newt`/`Tmux`/`alrt`/`scrn` all alive).
 
-1. **Wire up tablet/pen input.** With the trap budget freed up,
-   the next milestone is observable user interaction
-   (`peripherals/tablet.rs` already has scaffolding; needs the
-   pen-down/move/up event sequence + IRQ raise).
-2. **Optional: extend the inline-stub coverage.** A few percent
-   of alignment faults still trap to EL2 because they fall in
-   one of the rejection paths (writeback/post-index, no-dead-
-   scratch, REX or RAM PC). Most of the win is captured; only
-   pursue if the residue blocks something.
+Next steps:
+
+1. **Identify where the byte-access work is concentrated.** With
+   alignment-fault returns at 98% of beacons after iter-58, a
+   PC histogram on the SBA UDF dispatch (or on the alignment-
+   fault EL2 emulator) would show whether it's a few hot kernel
+   functions (string hash, soup walking) or a wide spread.
+2. **If concentrated:** add inline-stub coverage for the
+   currently-rejected sites (writeback, no-dead-scratch
+   fallback via ScratchVA, RAM-resident PCs via UDF retry).
+3. **If wide:** consider untrapping more aggressively — e.g.
+   relax `SCTLR_EL1.A=1` so legitimate aligned word LDRs don't
+   fault and only the rotate-LDR pattern traps via a different
+   mechanism. (Risk: changes guest semantics.)
+4. **Wire up tablet/pen input** once the boot quiesces into a
+   true idle wait state — observable user interaction is the
+   real Phase B endpoint.
+
+### Iteration 58: untrap CP15 cache-by-VA — 5–15× progress speedup
+
+iter-57 cut the alignment-fault trap rate; the next-dominant
+beacon source was 75% inside `CleanRangeInDCSWIGlue`'s 5-instruction
+cache-line loop:
+
+```
+mcr p15,c7,c10,{1}   ; DCCMVAC — clean line by VA
+mcr p15,c7,c10,{4}   ; DSB
+mcr p15,c7,c6, {1}   ; DCIMVAC — invalidate line by VA
+add r2, r2, #32
+teq r2, r1
+bne .loop
+```
+
+Three CP15 traps per 32-byte line, called after every flash
+write via `FlushDataCache__11TFlashRangeCFUlT1`. Each trap is a
+full EL2 entry/exit even though we no-op the op — the trap
+cost dominated wall-clock time in the flash-store init phase.
+
+#### Fix
+
+`src/guest.rs` clears `HCR_EL2.TPC` and `HCR_EL2.TPU`
+(previously both set). The MCRs run natively at EL1 with no
+trap. Cortex-A53 in AArch32 treats DC-by-VA / IC-by-VA on an
+unmapped VA as a no-op (matching the SA-1100 semantics
+Newton's `CleanPageInDcache` relies on for unmapped VAs before
+L2-entry population), so the `AddPgPAndPermWithPageTable`
+caller works without the EL2 detour.
+
+This mirrors Einstein's `TARMProcessor::SystemCoprocRegisterTransfer`
+case 7 (`TARMProcessor.cpp:253`), which is a silent no-op for
+all non-WFI cache-maintenance MCRs.
+
+`scripts/run-qemu.sh` switches `-serial stdio` →
+`-serial mon:stdio` so `Ctrl-A x` quits QEMU cleanly (the prior
+form forwarded Ctrl-C / Ctrl-\ as characters to the guest).
+
+#### Verification
+
+- All 36 guest tests pass on QEMU.
+- Cold boot reaches steady-state with no `***` halt; FB still
+  renders splash + sub-region correctly. `fb_dump` fires within
+  the 25-second window post-iter-58 (it didn't reliably fire
+  pre-iter-58 within the same window).
+- Trap rate ~91 K/s (iter-57) → ~430 K/s–1.3 M/s (iter-58).
+  Beacon-sampled cache-MCR PCs (`0x18b30`/`0x18b34`/`0x18b38`)
+  drop from 75% to 0% — the kernel-side cache loops finish
+  natively without trapping.
+- 160 M traps in 120 s of wall (vs ~96 M in 17 min pre-iter-58)
+  — boot still in DiagBootStub-region work but progresses
+  ~10× faster.
+
+#### Out of scope (deferred)
+
+- FVP fallback. The original comment warned that FVP Base RevC
+  raises a translation fault for cache-by-VA on unmapped VAs.
+  If FVP regresses, add a translation-fault filter in
+  `handle_data_abort` that no-ops the fault when ELR points at
+  a c7 cache-maintenance MCR. (Not observed in this iteration
+  because all testing was QEMU.)
+- TSW (set/way cache maintenance). Newton's kernel doesn't use
+  set/way ops in the hot path; leave it trapped.
 
 ### Iteration 57: lazy in-ROM inline stub for rotate-LDR — 37× trap-rate cut
 

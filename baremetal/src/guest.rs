@@ -41,22 +41,26 @@ unsafe fn configure_el2_traps() {
         hcr |= 1u64 << 20;    // TIDCP: trap implementation-defined CP15
         hcr |= 1u64 << 26;    // TVM:   trap guest writes to virtual-memory CP15 regs
         hcr |= 1u64 << 22;    // TSW:   trap set/way cache maintenance
-        hcr |= 1u64 << 23;    // TPC:   trap EL1 DC maintenance by VA to PoC
-                              //        (DC CVAC / CIVAC / IVAC). The Newton
-                              //        kernel's AddPgPAndPermWithPageTable
-                              //        calls CleanPageInDcache on a VA before
-                              //        populating that VA's L2 entry, relying
-                              //        on SA-1100 semantics where DC-by-MVA
-                              //        on an unmapped VA is a no-op. ARMv8-A
-                              //        (FVP Base RevC) raises a translation
-                              //        fault instead; trapping to EL2 lets
-                              //        our CP15 c7 handler NOP it, matching
-                              //        SA-1100 and QEMU TCG behaviour.
-        hcr |= 1u64 << 24;    // TPU:   trap EL1 DC/IC maintenance by VA to PoU
-                              //        (DC CVAU / IC IVAU). Same rationale
-                              //        as TPC; CleanPageInDcache also issues
-                              //        these on unmapped VAs. Emulated as a
-                              //        no-op by the c7/c8 CP15 handler.
+        // TPC / TPU stay clear (iter-58). Newton's flash-store init
+        // hot path drives `CleanRangeInDCSWIGlue` (0x18ae8) and
+        // `FlushDataCache__11TFlashRangeCFUlT1`, which iterate 32-byte
+        // cache lines emitting three CP15 c7 ops per line
+        // (DCCMVAC / DSB / DCIMVAC). Trapping them to EL2 turned a
+        // millisecond-scale loop into the dominant trap source (75% of
+        // beacon samples) and stalled cold boot inside DiagBootStub.
+        // Einstein's `TARMProcessor::SystemCoprocRegisterTransfer`
+        // case 7 is a silent no-op (TARMProcessor.cpp:253); on
+        // Cortex-A53 in AArch32, DC-by-VA / IC-by-VA on an unmapped
+        // VA is implementation-defined and treated as a no-op (per
+        // the Cortex-A53 TRM, matching the SA-1100 semantics the
+        // Newton kernel relies on for `CleanPageInDcache`-on-unmapped-
+        // VA before L2-entry population). So we let those ops run
+        // natively at EL1.
+        //
+        // (FVP Base RevC may behave differently — keep this in mind
+        // if the FVP path regresses; we'd add a stage-1 translation-
+        // fault filter that no-ops the fault when ELR points at a
+        // c7 cache-maintenance MCR.)
         hcr |= 1u64 << 12;    // DC:    force Normal-WB cacheable while
                               //        guest stage-1 MMU is off. Without
                               //        this the guest's reset-time

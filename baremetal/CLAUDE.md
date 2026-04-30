@@ -218,6 +218,17 @@ saw in a log), skip the install: `bg <addr>` and `c` is enough.
   isolation. A Phase B regression in handler code should show
   up as a failing test; run `guest-tests/scripts/run-all.sh`
   before committing.
+- **Skip the guest-tests run** when an iteration's only changes
+  are a Phase-B probe (a new HVC immediate at a Newton-ROM PC
+  in `src/rom_patches.rs` + a dispatch arm + handler in
+  `src/trap.rs` that emulates the original instruction). The
+  guest tests run isolated test ELFs that don't include the
+  Newton ROM, so probe-only changes can't regress them.
+  Walter has called this out as wasted time. Run them when
+  changes touch `src/shadow_stub.rs`, `src/unaligned.rs`,
+  `src/peripherals/*`, `src/banked.rs`, `src/stage2.rs`,
+  `src/guest.rs`, generic SBA/UND/DABT/IRQ paths in
+  `src/trap.rs`, or `guest-tests/` itself.
 
 ## Function-level execution trace
 

@@ -1362,6 +1362,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::LOGOFFSET_PHYS_PROBE_HVC_IMM => {
             handle_logoffset_phys_entry_probe(ctx);
         }
+        v if v == crate::rom_patches::LOOKUP_TABLE_BASE_PROBE_HVC_IMM => {
+            handle_lookup_table_base_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1994,6 +1997,11 @@ fn handle_und(ctx: &mut TrapContext) {
         }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::LOGOFFSET_PHYS_PROBE_HVC_IMM) => {
             handle_logoffset_phys_entry_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::LOOKUP_TABLE_BASE_PROBE_HVC_IMM) => {
+            handle_lookup_table_base_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -3238,6 +3246,117 @@ fn handle_logoffset_phys_entry_probe_with(ctx: &mut TrapContext, source_cpsr: u3
         0xDEADBEEF
     });
     ctx.x[0] = val as u64;
+}
+
+/// Iter-47: probe at `TFlashStore::Lookup` (PC=0x000c_74c8,
+/// `ldr r0, [r4, #44]`) — captures the loaded TFlashBlock-pointer
+/// table base. Iter-46 pinned the wedge as PhysBlock(NULL) caused
+/// by Lookup at c74cc loading `table[index]` = NULL when the
+/// table base (= `[r4+44]`) was 0x20000000 (wild). The probe
+/// halts when the loaded base is outside both RAM
+/// (0x0c000000..0x10000000) and ROM (0..0x800000); otherwise
+/// emulates the load and continues.
+fn handle_lookup_table_base_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_lookup_table_base_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_lookup_table_base_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let r4 = ctx.x[4] as u32;
+    let r7 = ctx.x[7] as u32;
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let fp = ctx.x[11] as u32;
+    let mode = source_cpsr & 0x1F;
+
+    // Read [r4+44] = the table base.
+    let base_va = r4.wrapping_add(44);
+    let base = guest_mem::read_word_va(base_va).unwrap_or_else(|| {
+        kprintln!(
+            "  ★ Lookup#{} base load from {:#010x} returned None — would have faulted",
+            seq, base_va,
+        );
+        0xDEADBEEF
+    });
+
+    // "Sane" iff in RAM (0x0c000000..0x10000000 covers heap/stack)
+    // or ROM (0x00000000..0x00800000). Anything else (= 0x20000000,
+    // 0xea000000, etc.) is wild.
+    let in_ram = (0x0c00_0000..0x1000_0000).contains(&base);
+    let in_rom = base < 0x0080_0000;
+    let base_sane = in_ram || in_rom;
+
+    if !base_sane {
+        halt_invariant("TFlashStore::Lookup loaded WILD table base from [r4+44]", || {
+            kprintln!(
+                "  TFlashStore* r4={:#010x}  [r4+44] (table base) = {:#010x}  WILD",
+                r4, base,
+            );
+            kprintln!(
+                "  r7 (Lookup arg) = {:#010x}  caller_lr={:#010x}  sp={:#010x}  fp={:#010x}",
+                r7, lr, sp, fp,
+            );
+            kprintln!(
+                "  src_mode={} ({:#x})  seq=#{}",
+                describe_aarch32_mode(mode), mode, seq,
+            );
+            kprintln!();
+            kprintln!("  TFlashStore dump @{:#010x} (32 words):", r4);
+            for i in 0..32u32 {
+                let off = i * 4;
+                let va = r4.wrapping_add(off);
+                match guest_mem::read_word_va(va) {
+                    Some(w) => kprintln!("    [r4+{:#04x}] @{:#010x} = {:#010x}", off, va, w),
+                    None    => kprintln!("    [r4+{:#04x}] @{:#010x} = (unmapped)", off, va),
+                }
+            }
+            kprintln!();
+            kprintln!("  Caller-mode stack window from sp={:#010x} (32 words):", sp);
+            for i in 0..32u32 {
+                let off = i * 4;
+                let va = sp.wrapping_add(off);
+                match guest_mem::read_word_va(va) {
+                    Some(w) => kprintln!("    sp+{:#04x} @{:#010x} = {:#010x}", off, va, w),
+                    None    => kprintln!("    sp+{:#04x} @{:#010x} = (unmapped)", off, va),
+                }
+            }
+            kprintln!();
+            kprintln!("  APCS FP chain from incoming fp={:#010x}:", fp);
+            let mut walk_fp = fp;
+            for i in 0..8u32 {
+                let lr_va = walk_fp.wrapping_sub(4);
+                let fp_va = walk_fp.wrapping_sub(12);
+                let pc_at = guest_mem::read_word_va(walk_fp).unwrap_or(0xDEADBEEF);
+                let caller_lr = match guest_mem::read_word_va(lr_va) {
+                    Some(w) => w,
+                    None => { kprintln!("    [{}] fp={:#010x}  (lr unread)", i, walk_fp); break; }
+                };
+                let caller_fp = match guest_mem::read_word_va(fp_va) {
+                    Some(w) => w,
+                    None => { kprintln!("    [{}] fp={:#010x}  caller_lr={:#010x}  (caller_fp unread)", i, walk_fp, caller_lr); break; }
+                };
+                kprintln!(
+                    "    [{}] fp={:#010x}  pc_at_fp={:#010x}  caller_lr={:#010x}  caller_fp={:#010x}",
+                    i, walk_fp, pc_at, caller_lr, caller_fp,
+                );
+                if caller_fp == 0 || caller_fp == walk_fp { break; }
+                walk_fp = caller_fp;
+            }
+        });
+    }
+
+    if seq < 8 || seq % 64 == 0 {
+        kprintln!(
+            "Lookup-base #{}: r4={:#010x} [r4+44]={:#010x} r7={:#010x} caller_lr={:#010x} sp={:#010x}",
+            seq, r4, base, r7, lr, sp,
+        );
+    }
+
+    // Emulate `ldr r0, [r4, #44]`.
+    ctx.x[0] = base as u64;
 }
 
 fn handle_reboot(ctx: &TrapContext) -> ! {

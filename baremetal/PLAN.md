@@ -17,39 +17,114 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-61):** iter-60 root-caused the iter-59
-`evt.ex.abt.bus` throw at FAR=0x0cd2d000 to a missing DFSR.Domain
-synthesis: iter-59's fast trampoline bypassed `handle_diag`, so
-DFSC=0x05 (translation, section) — for which ARMv7 leaves
-DFSR.Domain UNK — reached the kernel's DAH with Domain=0. The
-kernel's `GetDomainAndFaultMonitorFromDomainNumber(0)` returned no
-monitor, FaultMonitorEntry returned -10015, and DAH threw
-`evt.ex.abt.bus`. iter-60 excluded DFSC=5 from the fast path so
-those faults fall through to the slow EL2 path which still
-synthesises DFSR.Domain from L1[FAR>>20][8:5] before forwarding.
-Result: boot recovers from the throw, reaches 26 tasks alive
-(`inkr`, `scrn` join the iter-59 list), and `evt.ex.fr.store`
-NewtonScript-level throws are now non-fatal (handled by Newton's
-own runtime — no `UnhandledException` halt within 30 s).
+**Current goal (iter-62):** iter-61 confirmed the residual
+`evt.ex.fr.store` throws are benign. r1 ∈ {0xffffd698, 0xffffd692}
+decode (per `ghidra/DDKIncludes/OS600/OSErrors.h`) as -10600
+(`kSError_ObjectOverRun`) and -10606 (`kSError_ObjectNotFound`) —
+soup-probe misses caught by Newton's NewtonScript runtime, not
+fatal. With a 90 s SIGKILL'd cold boot the system reaches a
+**quiescent idle at the Newton splash**: the lightbulb logo +
+"Newton" caption render correctly (`/tmp/newton-fb/00000.png`,
+19 748 B, two `screen.blit` calls — one full 480x320, one 118-row
+sub-region covering the logo). Task census: `newt`=RUN,
+`scrn`=RDY on `TSemaphoreGroup` at `0xc125cec` (id=0x3707, sema[1]
+of a 3-sema group; not a `TULockingSemaphore` — `refcon-stash=0`,
+`lock-word=0`, so this is an event-signal group, not a held
+mutex), `inkr`=BLK, all other 24 tasks BLK. 26 tasks total. We
+are well past `DiagBootStub` and `OsBoot` — the late user-mode
+system tasks (`cdfm`/`cdsv`/`drvr`/`alrt`/`sndm`/`mntr`/`Tmux`/
+`pg&e`/`pckm`/`cmgr`/`ROMP`/`ROMF`) are all instantiated and
+parked.
+
+What we **don't** yet know: what `scrn` is waiting on. We have
+no evidence pinning it to a specific producer (tablet, alarm,
+redraw queue, NewtonScript callback, etc.) — that's the
+investigation iter-62 has to start with, without prejudgement.
+The next-step list below is deliberately neutral on the producer
+identity.
+
+Cross-reference with Einstein at the same wall-clock point is
+also outstanding. `build/NewtonProbe` fails to load our 8 MiB ROM
+("code 3" from `TROMImage::GetErrorCode`); the captured
+`probe/results-717006-90s*.txt` files are MMU-state dumps and
+don't include task-census or scheduler state. We need an Einstein-
+driven oracle that prints the task list + run-queue at 90 s wall
+to compare against our hypervisor's state.
 
 Next steps:
 
-1. **Trace the residual `evt.ex.fr.store` throws.** Throw r1
-   alternates 0xffffd692 (-10094) / 0xffffd698 (-10088), called
-   from `0x00351e50` / `0x00353730` / `0x002df4f0` /
-   `0x002eff24`. These look like soup / package-store error
-   codes. Boot hasn't reached a quiescent idle yet; understand
-   whether these are expected (catch-and-continue) or block
-   reaching the idle wait state.
-2. **Wire up tablet/pen input** once boot quiesces into a true
-   idle. The 26-task census includes `scrn` (RDY waiting on a
-   semaphore group at `0xc125d58`) and `inkr` (recogniser),
-   which suggests the framework is ready for input.
-3. **Optional perf:** add a ScratchVA fallback for the rotate-
-   LDR `no_dead_scratches` rejection (98% of inline-stub
-   misses) — keeps the alignment-fault trap rate down. Lower
-   priority than (1) since the boot now progresses past the
-   prior wedge.
+1. **Identify what signals `TSemaphoreGroup` id=0x3707.** Walk
+   the disasm for every `SemOp(release)` against a sema in
+   `[arr_base=0xc125d10, arr_base+120)` — that's the 3-sema
+   array of this group. Each release call site tells us
+   *something* about who wakes `scrn`. Don't pre-commit to a
+   guess about which producer is the relevant one.
+2. **Cross-check against Einstein.** Either fix `NewtonProbe`'s
+   ROM loader (the "code 3" path) or write a small companion
+   that runs `TEmulator` for 90 s and dumps `gObjectTable` +
+   the run-queue head, mirroring our `task_dump`. The point is
+   to learn whether Einstein at the same wall-clock is in the
+   same state we are, or has progressed further — that
+   constrains the hypothesis space for what's missing.
+3. **Optional perf (deferred):** ScratchVA fallback for the
+   rotate-LDR `no_dead_scratches` rejection (98 % of inline-
+   stub misses). Trap rate at the splash idle is ~400 K/s,
+   dominated by `ELR=0xffffe4` (rotate-LDR returns) — fine for
+   development; tackle only if it interferes with whatever the
+   producer investigation needs.
+
+### Iteration 61: residual `evt.ex.fr.store` triaged — boot reaches splash idle
+
+iter-60 cleared the fatal `evt.ex.abt.bus` throw but left an open
+question: was the residual `evt.ex.fr.store` (5 throws fired
+during the 30 s test window, with r1 ∈ {-10094, -10088}) a soft
+exception or a slow-walk to UnhandledException? iter-61 ran a
+90 s `timeout -k 2` cold boot to settle it.
+
+#### Findings
+
+- **Both r1 values are benign store errors.** Per
+  `ghidra/DDKIncludes/OS600/OSErrors.h`:
+  - `kStoreError_Base = ERRBASE_OS - 600 = -10600`
+  - `0xffffd698` = -10600 = `kSError_ObjectOverRun`
+  - `0xffffd692` = -10606 = `kSError_ObjectNotFound`
+  Both are "soup probe miss" outcomes that the NewtonScript
+  runtime catches; they're the kernel's normal way of reporting
+  "this stored object doesn't exist" or "read past end of object"
+  back to the interpreter. Caller-LRs:
+  - `0x00351e50` — `StoreCreateSoup`
+  - `0x00353730` — `Get__15TStoreHashTableFlPcPl`
+  - `0x002df4f0` — `LoadPermObject__FP13TStoreWrapperUlPP13CDynamicArray`
+  - `0x002eff24` — `DoCall__FRC6RefVarl`
+  - `0x002f1eac` — `Run__12TInterpreterFv`
+  All consistent with NewtonScript-level soup access.
+
+- **Boot reaches a quiescent idle at the Newton splash.** Two
+  `screen.blit` calls (full 480x320 frame + a 118-row sub-region
+  covering the lightbulb logo) and one `fb_dump`
+  (`/tmp/newton-fb/00000.png`, 19 748 B) render correctly. After
+  that the scheduler stays at `highest_pri=0 bitmap=0`,
+  `newt`=RUN, `scrn`=RDY on `TSemaphoreGroup` at `0xc125cec`
+  (id=0x3707, sema[1] of 3; not a `TULockingSemaphore` — the
+  user-wrapper's `refcon-stash=0` and `lock-word=0`, so this is
+  an event-signal group, not a held mutex). 26 tasks in the
+  object table, matching iter-60. We are well past `DiagBootStub`
+  (pre-multitasking ROM/RAM init at `0x1955c`) and past the
+  `TFlashStore::Init` flash-cache-flush phase that iter-58
+  unblocked — the named user-mode system tasks (`cdfm`/`cdsv`/
+  `drvr`/`alrt`/`sndm`/`mntr`/`Tmux`/`pg&e`/`pckm`/`cmgr`/`ROMP`/
+  `ROMF`) are all instantiated and parked.
+
+- **No further halts in 90 s of wall-clock.** Trap rate
+  ~400 K/s, dominated by alignment-fault returns at `ELR=0xffffe4`
+  (the rotate-LDR EL2 emulator) — `newt` is in some idle loop
+  with unaligned word LDRs.
+
+#### Deliverables
+
+No code changes. PLAN.md updated to set iter-62's goal (tablet/
+pen input) and record the splash-idle as the Phase-B endpoint
+reached.
 
 ### Iteration 60: DFSC=5 fast-forward exclusion — bus-abort throw resolved
 
@@ -223,69 +298,10 @@ counters, called from `trap_irq` every ~2 s of wall time
   drop the lr/sp save in the slow `DABT_TRAMP` and make even
   the slow path leaner.
 
-### Iteration 58: untrap CP15 cache-by-VA — 5–15× progress speedup
+<!-- iter-58 (untrap CP15 cache-by-VA, 5-15x speedup) pruned per the
+     auto-prune maintenance note. See `git log --grep="iter-58"` for
+     the full retrospective. -->
 
-iter-57 cut the alignment-fault trap rate; the next-dominant
-beacon source was 75% inside `CleanRangeInDCSWIGlue`'s 5-instruction
-cache-line loop:
-
-```
-mcr p15,c7,c10,{1}   ; DCCMVAC — clean line by VA
-mcr p15,c7,c10,{4}   ; DSB
-mcr p15,c7,c6, {1}   ; DCIMVAC — invalidate line by VA
-add r2, r2, #32
-teq r2, r1
-bne .loop
-```
-
-Three CP15 traps per 32-byte line, called after every flash
-write via `FlushDataCache__11TFlashRangeCFUlT1`. Each trap is a
-full EL2 entry/exit even though we no-op the op — the trap
-cost dominated wall-clock time in the flash-store init phase.
-
-#### Fix
-
-`src/guest.rs` clears `HCR_EL2.TPC` and `HCR_EL2.TPU`
-(previously both set). The MCRs run natively at EL1 with no
-trap. Cortex-A53 in AArch32 treats DC-by-VA / IC-by-VA on an
-unmapped VA as a no-op (matching the SA-1100 semantics
-Newton's `CleanPageInDcache` relies on for unmapped VAs before
-L2-entry population), so the `AddPgPAndPermWithPageTable`
-caller works without the EL2 detour.
-
-This mirrors Einstein's `TARMProcessor::SystemCoprocRegisterTransfer`
-case 7 (`TARMProcessor.cpp:253`), which is a silent no-op for
-all non-WFI cache-maintenance MCRs.
-
-`scripts/run-qemu.sh` switches `-serial stdio` →
-`-serial mon:stdio` so `Ctrl-A x` quits QEMU cleanly (the prior
-form forwarded Ctrl-C / Ctrl-\ as characters to the guest).
-
-#### Verification
-
-- All 36 guest tests pass on QEMU.
-- Cold boot reaches steady-state with no `***` halt; FB still
-  renders splash + sub-region correctly. `fb_dump` fires within
-  the 25-second window post-iter-58 (it didn't reliably fire
-  pre-iter-58 within the same window).
-- Trap rate ~91 K/s (iter-57) → ~430 K/s–1.3 M/s (iter-58).
-  Beacon-sampled cache-MCR PCs (`0x18b30`/`0x18b34`/`0x18b38`)
-  drop from 75% to 0% — the kernel-side cache loops finish
-  natively without trapping.
-- 160 M traps in 120 s of wall (vs ~96 M in 17 min pre-iter-58)
-  — boot still in DiagBootStub-region work but progresses
-  ~10× faster.
-
-#### Out of scope (deferred)
-
-- FVP fallback. The original comment warned that FVP Base RevC
-  raises a translation fault for cache-by-VA on unmapped VAs.
-  If FVP regresses, add a translation-fault filter in
-  `handle_data_abort` that no-ops the fault when ELR points at
-  a c7 cache-maintenance MCR. (Not observed in this iteration
-  because all testing was QEMU.)
-- TSW (set/way cache maintenance). Newton's kernel doesn't use
-  set/way ops in the hot path; leave it trapped.
 
 <!-- Older iteration retrospectives (iter-57 and earlier) live in
      `git log` per the auto-prune maintenance note. -->

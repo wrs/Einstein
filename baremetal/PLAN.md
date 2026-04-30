@@ -248,6 +248,55 @@ TAlertEventHandler region.
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
 
+### Iteration 31 (next-loop iter 27): Prim aliasing/forget halts — defensive
+
+Iter-30 verified the high-level heap and stack invariants hold.
+This iteration tightens the Prim Remember/Forget tracker (which
+already detects PA-aliasing and forget-mismatch events but only
+logged) into halt-shaped assertions, in case a regression reopens
+Group-2 PA aliasing or introduces an unmatched Forget.
+
+Two changes to `src/trap.rs`:
+
+1. `handle_prim_remember_probe_with`: when a second VA appears for
+   the same PA without a prior Forget for the first VA, halt with
+   `(PA, VA1, VA1's upstream_lr, VA2, VA2's upstream_lr / user_pc /
+   user_lr / user_caller, mask, perm)`. The iter-23 GetMatchingPage
+   stub eliminated all 12 Group-2 PA aliases observed pre-iter-23;
+   any new alias is a real regression.
+
+2. `handle_prim_forget_probe_with`: when the kernel forgets a
+   (PA, VA') pair but our tracker had a different VA for the same
+   PA, halt with `(PA, forgot_VA, tracker_VA)`. Either Prim
+   ordering is wrong or our tracker is desynced — both worth
+   surfacing immediately.
+
+Removed two now-unused budget statics (`PRIM_ALIAS_LOG_BUDGET`,
+`PRIM_FORGET_MISMATCH_BUDGET`).
+
+Cold-boot: same as iter-30, both halts silent through the boot
+to the existing Reboot canary. So pre-canary, neither aliasing
+nor forget-mismatch fires — the wedge is downstream of the Prim
+layer.
+
+Iter-32+ should investigate the canary directly: the existing
+canary handler already runs `task_dump::dump_full()` and shows
+24 tasks at SchedulerStart, so the kernel is reaching the
+post-init self-test. Read the saved-PC map (e.g. `task 0xc1233f8
+(main) savedPC=0x3ae220 SPSR=0x40000110`) and trace what
+`0x003AE220` does — that's likely the kernel's Idle / scheduler
+loop, and one of the tasks is the one calling Reboot.
+
+#### Status
+
+- Build clean.
+- Boot reaches Reboot canary (iter-30 baseline preserved).
+- 30/30 shadow_stub tests pass.
+- Iter-31 deliverables: Prim aliasing halt, Prim forget-mismatch
+  halt, PLAN.md plan for iter-32 (read the saved-PC map at canary
+  time to find the calling task, then chase the actual self-test
+  fail).
+
 ### Iteration 30 (next-loop iter 26): high-level heap/stack invariant pass — 4 KiB hypothesis HOLDS
 
 User course-correction: stop chasing individual r0 / count

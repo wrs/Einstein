@@ -3348,8 +3348,6 @@ static PRIM_FIRST_LR_FOR_PA: [AtomicU32; PRIM_TRACKER_RAM_PAGES] = {
     const ZERO: AtomicU32 = AtomicU32::new(0);
     [ZERO; PRIM_TRACKER_RAM_PAGES]
 };
-static PRIM_ALIAS_LOG_BUDGET: AtomicU32 = AtomicU32::new(64);
-static PRIM_FORGET_MISMATCH_BUDGET: AtomicU32 = AtomicU32::new(64);
 
 /// Per-PA timeline focus: when a Remember or Forget call's PA matches
 /// `PRIM_FOCUS_PA`, log it unconditionally with a shared global
@@ -3595,14 +3593,31 @@ fn handle_prim_remember_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
                 Ordering::Relaxed,
             );
         } else if prev_va != va {
-            let budget = PRIM_ALIAS_LOG_BUDGET
-                .fetch_sub(1, Ordering::Relaxed);
-            if budget > 0 {
+            // Iter-31: halt on Prim aliasing. Iter-23's GetMatchingPage
+            // stub eliminated all 12 Group-2 PA aliases; if a Prim
+            // ALIAS event fires post-iter-23, the kernel is establishing
+            // a second VA → same-PA mapping without a Forget for the
+            // prior VA — i.e. a regression of the Group-2 alias root
+            // cause, or a new alias path we haven't characterized.
+            // Either way, halt cleanly so the wedge is the real signal.
+            halt_invariant("Prim ALIAS: PA mapped to two VAs without Forget", || {
                 kprintln!(
-                    "Prim ALIAS: PA={:#010x}  VA1={:#010x} (upstream_lr={:#010x})  VA2={:#010x} (upstream_lr={:#010x} user_pc={:#010x} user_lr={:#010x} user_caller={:#010x})  mask={:#x} perm={:#x}",
-                    phys, prev_va, prev_lr, va, upstream_lr, user_pc, user_lr, user_caller, mask, perm,
+                    "  PA={:#010x}",
+                    phys,
                 );
-            }
+                kprintln!(
+                    "  VA1={:#010x} (upstream_lr={:#010x})",
+                    prev_va, prev_lr,
+                );
+                kprintln!(
+                    "  VA2={:#010x} (upstream_lr={:#010x} user_pc={:#010x} user_lr={:#010x} user_caller={:#010x})",
+                    va, upstream_lr, user_pc, user_lr, user_caller,
+                );
+                kprintln!(
+                    "  mask={:#x} perm={:#x}",
+                    mask, perm,
+                );
+            });
         }
     }
 
@@ -3673,14 +3688,17 @@ fn handle_prim_forget_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
             PRIM_FIRST_VA_FOR_PA[page_idx].store(0, Ordering::Relaxed);
             PRIM_FIRST_LR_FOR_PA[page_idx].store(0, Ordering::Relaxed);
         } else if prev_va != 0 {
-            let budget = PRIM_FORGET_MISMATCH_BUDGET
-                .fetch_sub(1, Ordering::Relaxed);
-            if budget > 0 {
+            // Iter-31: halt on Prim Forget mismatch. The kernel is
+            // forgetting a (PA, VA) pair we never observed it remember;
+            // either Prim ordering is wrong, or our tracker is out of
+            // sync (which would itself indicate a probe bug). Halt to
+            // get the call site rather than lose it in the noise.
+            halt_invariant("Prim FORGET MISMATCH: forgot VA tracker didn't have", || {
                 kprintln!(
-                    "Prim FORGET MISMATCH: PA={:#010x}  forgot VA={:#010x}  but tracker had VA={:#010x}",
+                    "  PA={:#010x}  forgot VA={:#010x}  but tracker had VA={:#010x}",
                     phys, va, prev_va,
                 );
-            }
+            });
         }
         // prev_va == 0: PA wasn't tracked (probably forgotten before
         // any remember we observed, or PA outside our tracker range);

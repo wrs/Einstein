@@ -17,7 +17,57 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-62):** iter-61 confirmed the residual
+**Current goal (iter-63):** iter-62 added a per-task APCS stack-
+chain walker to `task_dump`, with PC-name lookup via the symbol
+table (now built unconditionally, not gated on `trace`). For every
+blocked task the dump now prints the full call stack with
+`function+offset`-style names, jump-table slots resolved by reading
+the underlying `b imm24`. Concrete findings at splash idle:
+
+- `scrn` is `ScreenUpdateTask+0x48` parked at `SemaphoreOpGlue`.
+  It waits via `SemOp(grp[+24], grp[+48])` and signals done via
+  `SemOp(grp[+24], grp[+52])`. The screen-state global is at
+  VA `0x0c101a4c`. Several functions in `0x1cc..0x1cd` reference
+  that global and call `SemOp` on the same group — `StopDrawing`
+  is a strong producer candidate (it does `SemOp(grp[+24],
+  grp[+56])` at `0x1cd390`, then directly calls
+  `UpdateHardwareScreen` itself).
+- `idle` is `SleepTask` → `OsBoot+0x190` → `ROMBoot+0x26c`.
+  Standard kernel idle.
+- 12 tasks (`inkr`/`cdsv`/`cdpr`/`drvr`/`pg&e`/`alrt`/`sndm`/
+  `name`/`pssm`/`pckm`/`cmgr`) are all parked at
+  `TUPort::Receive` inside their `TAppWorld::AEventLoop` —
+  standard event-loop wait. The kernel-parked LR for every
+  task's `TUTaskWorld::TaskEntry` resolves to
+  `TaskKillSelf [JT]`, confirming the "if TaskEntry ever returns,
+  kill the task" pattern.
+- 8 tasks (`OBJM`/`cdfm`/`PMGR`/`STKP`/`STKU`/`ROMF`/`ROMP`/
+  `mntr`/`Tmux`) have savedPC at `MonitorEntryGlue [JT]` — they
+  are inside kernel-monitor SVCs (page allocator, heap manager,
+  etc.) that haven't returned yet.
+
+Next steps:
+
+1. **Find the producer for `scrn`'s SemOp.** Decode the OpList
+   layout in `InitScreenTask` (entries at `[r6+36/40/44/56]`)
+   to identify which OpList corresponds to "wake-scrn". Then
+   the producer is whoever calls `SemOp(grp[+24], that-OpList)`.
+   `BlitToScreens` and `QDStopDrawing` are also candidates
+   alongside `StopDrawing`.
+2. **Verify whether `StopDrawing` is gated on something we
+   haven't satisfied.** `StopDrawing` has its own
+   `UpdateHardwareScreen` call at `0x1cd3b8` — if it routinely
+   does the work synchronously, scrn might just be a backstop
+   that's *expected* to mostly idle. In that case "what wakes
+   scrn" is the wrong question, and the right next-step is
+   "what would normally trigger another `StopDrawing` /
+   `BlitToScreens` post-splash".
+3. **Cross-check against Einstein** — still outstanding from
+   iter-61. `NewtonProbe`'s ROM loader fails ("code 3"); a
+   small companion that runs `TEmulator` for 90 s and dumps
+   `gObjectTable` + run-queue would be the cleanest oracle.
+
+**Background (carried over from iter-61):** the residual
 `evt.ex.fr.store` throws are benign. r1 ∈ {0xffffd698, 0xffffd692}
 decode (per `ghidra/DDKIncludes/OS600/OSErrors.h`) as -10600
 (`kSError_ObjectOverRun`) and -10606 (`kSError_ObjectNotFound`) —
@@ -72,6 +122,76 @@ Next steps:
    dominated by `ELR=0xffffe4` (rotate-LDR returns) — fine for
    development; tackle only if it interferes with whatever the
    producer investigation needs.
+
+### Iteration 62: per-task APCS stack tracer
+
+Adds a frame-chain walker to `task_dump` so every blocked task's
+saved registers and call stack are printed alongside the existing
+`savedPC`/`SPSR`/`sp_usr`/`lr_usr` line. Reads each task's
+`fp_usr` from `TTaskSavedContext.fp_usr` (`TTask + 0x3c`), then
+walks APCS frames (`*fp = saved pc`, `*(fp-4) = saved lr`,
+`*(fp-12) = prev fp`) up to a 12-deep cap with self-loop and
+unmapped-VA guards.
+
+Symbol-name lookup (`fn_name+0xN`) was extracted from `tracer.rs`
+into a new always-available `src/symbols.rs`; `build.rs` now
+emits `fn_addrs.bin` / `fn_name_offs.bin` / `fn_names.bin`
+unconditionally (was gated on the `trace` feature). The walker's
+formatter is honest about uncertainty:
+
+- Jump-table slots (`0x01A0_0000..0x01C2_0000`) are decoded by
+  reading the `b imm24` at the slot, computing the target, and
+  resolving *that* in the symbol table — printed as
+  `name+0xN [JT]`. Without this every JT slot would render as
+  the spuriously-nearest ROM symbol with a giant offset.
+- Kernel-VA addresses (`>= 0x0C00_0000`) print as `<data 0x…>`.
+- Unsymbolised ROM gaps (offset > 0x1000 from the matched
+  entry) print `name+0x?` to flag the wide miss.
+
+Output is now name-first, with raw values trailing in `[…]` for
+the case-by-case verification path. Example:
+```
+    task 0xc125484 (scrn) id=0x37b3 SPSR=0x40000110
+      PC=SemaphoreOpGlue+0x0 <- LR=ScreenUpdateTask+0x48
+      [pc=0x3ae1fc lr=0x1cd164 sp=0xcd34f78 fp=0xcd34fa8]
+        #1  ScreenUpdateTask+0xc  <-  TaskKillSelf+0x0 [JT]
+            [pc=0x1cd128 lr=0x1bdde84 fp=0xcd34fa8]
+```
+
+#### Findings (recorded in the Status block above)
+
+The 26-task census split cleanly into three patterns:
+- 12 tasks parked at `TUPort::Receive` inside
+  `TAppWorld::AEventLoop` (standard event-loop wait).
+- 8 tasks at `MonitorEntryGlue [JT]` (kernel-monitor SVCs).
+- `idle`/`main`/`scrn`/`drvr`/`STKU` each in something more
+  specific.
+- Every task's bottom frame `lr` resolves to `TaskKillSelf [JT]`,
+  the kernel-parked "if TaskEntry returns, kill the task" thunk.
+  This is the *only* place a JT address legitimately appears in
+  a stack trace; mid-stack JT-as-LR doesn't happen because the
+  JT body is `b real_target` (preserves caller's LR).
+
+#### Verification
+
+- All 36 guest tests pass on QEMU.
+- 35 s SIGKILL'd cold boot reaches the same splash-idle state as
+  iter-61 (no regression). New stack-trace output is printed at
+  every periodic task dump (~every 2 s).
+- DIAG_TAG remains effectively zero in the steady-state window
+  (iter-59/60 fast trampoline still intact).
+
+#### Out of scope (deferred)
+
+- Demangled-name truncation. Some C++ demangled names
+  (`TUPort::Receive(unsigned long *, void *, …)`) overflow the
+  fixed 96-byte format buffer and clip mid-parameter. Cosmetic;
+  fix when it bites.
+- Stack trace for the currently-RUNNING task (`newt`). Saved
+  context isn't valid (the kernel writes `0x55555` as a sentinel
+  while the task is on-CPU). Could fall back to the live
+  ELR_EL2 / FAR_EL1 captured by the most recent trap, but only
+  when the dump is invoked synchronously from a trap path.
 
 ### Iteration 61: residual `evt.ex.fr.store` triaged — boot reaches splash idle
 

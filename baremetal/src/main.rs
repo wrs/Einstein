@@ -25,6 +25,7 @@ mod shadow_pool;
 mod shadow_stub;
 mod snapshot;
 mod stage2;
+mod symbols;
 mod tarmac;
 mod task_dump;
 mod timer;

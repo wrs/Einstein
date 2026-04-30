@@ -382,6 +382,152 @@ pub fn dump() {
 }
 
 /// For each task that's not RUN and has q.prev or wq1/wq2 non-zero
+/// Decode a jump-table slot at `pc` (must be in
+/// `0x01A0_0000..0x01C2_0000`). The JT is full of `b imm24`
+/// unconditional branches put there by post-ship ROM patches; the
+/// nearest-prior code symbol in the symbol table is misleading
+/// (it's the function before the JT region in ROM order, not the
+/// real target). Read the slot, decode the branch, return the real
+/// target. `None` if the slot isn't an unconditional `b` or the
+/// fetch faults.
+fn jt_target(pc: u32) -> Option<u32> {
+    let word = rd(pc)?;
+    // Unconditional `b imm24`: bits[31:28]=0xE (AL), bits[27:24]=0xA.
+    if (word & 0xFF00_0000) != 0xEA00_0000 { return None; }
+    let imm24 = word & 0x00FF_FFFF;
+    let signed = ((imm24 << 8) as i32) >> 8;          // sign-extend 24→32
+    let target = pc.wrapping_add(8).wrapping_add((signed as u32).wrapping_shl(2));
+    Some(target)
+}
+
+/// Render `pc` as a human-readable function reference. Tries:
+///
+/// - JT slot (`0x01A0_0000..0x01C2_0000`): decode the embedded
+///   `b imm24` and resolve to the real target's symbol.
+///   `name+0xN [JT]`.
+/// - ROM (`0..0x90_0000`): symbol-table lookup. `name+0xN`. Wide
+///   misses (>0x1000 from the entry) print `+0x?` so the offset
+///   uncertainty is visible.
+/// - Kernel-VA data (`>= 0x0C00_0000`): `<data 0x…>` — stack/heap
+///   pointers that fell into a saved register file from a caller.
+/// - Other VAs (`0x009..0x0B…`): `<noncode 0x…>`.
+/// - Below the first ROM symbol: `?`.
+fn fmt_pc_name(pc: u32) -> ([u8; 96], usize) {
+    let mut buf = [0u8; 96];
+    let mut n = 0usize;
+    fn push(b: u8, buf: &mut [u8; 96], n: &mut usize) {
+        if *n < buf.len() { buf[*n] = b; *n += 1; }
+    }
+    fn push_str(s: &str, buf: &mut [u8; 96], n: &mut usize) {
+        for &b in s.as_bytes() { push(b, buf, n); }
+    }
+    fn push_hex(val: u32, buf: &mut [u8; 96], n: &mut usize) {
+        let mut started = false;
+        for shift in (0..8u32).rev() {
+            let nib = ((val >> (shift * 4)) & 0xF) as u8;
+            if nib != 0 || started || shift == 0 {
+                started = true;
+                let c = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+                push(c, buf, n);
+            }
+        }
+    }
+    fn render_rom_pc(pc: u32, buf: &mut [u8; 96], n: &mut usize) {
+        match crate::symbols::fn_name_for_pc(pc) {
+            Some((entry, name)) => {
+                let off = pc.wrapping_sub(entry);
+                for &b in name.as_bytes() { push(b, buf, n); }
+                if off > 0x1000 { push_str("+0x?", buf, n); }
+                else {
+                    push(b'+', buf, n);
+                    push(b'0', buf, n);
+                    push(b'x', buf, n);
+                    push_hex(off, buf, n);
+                }
+            }
+            None => { push(b'?', buf, n); }
+        }
+    }
+
+    if (0x01A0_0000..0x01C2_0000).contains(&pc) {
+        if let Some(target) = jt_target(pc) {
+            // Recurse-by-hand: render the resolved target as if it
+            // were a normal ROM PC, then tag with `[JT]`.
+            if target < 0x0090_0000 {
+                render_rom_pc(target, &mut buf, &mut n);
+                push_str(" [JT]", &mut buf, &mut n);
+            } else {
+                push_str("JT->0x", &mut buf, &mut n);
+                push_hex(target, &mut buf, &mut n);
+            }
+        } else {
+            push_str("JT@0x", &mut buf, &mut n);
+            push_hex(pc, &mut buf, &mut n);
+        }
+        return (buf, n);
+    }
+    if pc >= 0x0C00_0000 {
+        push_str("<data 0x", &mut buf, &mut n);
+        push_hex(pc, &mut buf, &mut n);
+        push(b'>', &mut buf, &mut n);
+        return (buf, n);
+    }
+    if pc >= 0x0090_0000 {
+        push_str("<noncode 0x", &mut buf, &mut n);
+        push_hex(pc, &mut buf, &mut n);
+        push(b'>', &mut buf, &mut n);
+        return (buf, n);
+    }
+    render_rom_pc(pc, &mut buf, &mut n);
+    (buf, n)
+}
+
+/// Walk an APCS frame chain from `start_fp` and print up to
+/// `depth_cap` frames. Each line shows `fp`, the saved PC at that
+/// frame (≈ where the function was when its child got called), and
+/// the saved LR (≈ the caller's return address — the function this
+/// frame returns into). Symbol names are best-effort via
+/// `tracer::fn_name_for_pc`.
+///
+/// APCS prologue (per `docs/NEWTON_INTERNALS.md`):
+/// ```
+///   mov   ip, sp
+///   stmfd sp!, {fp, ip, lr, pc}        ; pushes in reg-number order
+///   sub   fp, ip, #4
+/// ```
+/// After entry, `fp` points at the saved-pc slot, so the per-frame
+/// layout is:
+///   `*fp        = saved pc (this fn)`
+///   `*(fp - 4)  = saved lr (caller's pc)`
+///   `*(fp - 8)  = saved ip (caller's sp at entry)`
+///   `*(fp - 12) = saved fp (caller's fp)`
+///
+/// Walk: `prev_fp = *(fp - 12)`. Stop at NULL / unaligned / bogus
+/// VA / self-loop / depth cap.
+fn walk_apcs_frames(start_fp: u32, depth_cap: usize) {
+    let mut fp = start_fp;
+    let mut prev_fp = 0u32;
+    let mut depth = 0usize;
+    while depth < depth_cap {
+        if fp == 0 || fp == u32::MAX || (fp & 3) != 0 { break; }
+        if fp == prev_fp { break; }
+        let frame_pc = match rd(fp) { Some(v) => v, None => break };
+        let frame_lr = match rd(fp.wrapping_sub(4)) { Some(v) => v, None => break };
+        let new_fp   = match rd(fp.wrapping_sub(12)) { Some(v) => v, None => break };
+        let (pc_buf, pc_n) = fmt_pc_name(frame_pc);
+        let (lr_buf, lr_n) = fmt_pc_name(frame_lr);
+        let pc_name = core::str::from_utf8(&pc_buf[..pc_n]).unwrap_or("?");
+        let lr_name = core::str::from_utf8(&lr_buf[..lr_n]).unwrap_or("?");
+        kprintln!(
+            "        #{:<2} {}  <-  {}  [pc={:#x} lr={:#x} fp={:#x}]",
+            depth + 1, pc_name, lr_name, frame_pc, frame_lr, fp,
+        );
+        prev_fp = fp;
+        fp = new_fp;
+        depth += 1;
+    }
+}
+
 /// (i.e. it's blocked somewhere), print its saved PC + SP_usr from the
 /// SWIBoot save area at task+0x4c / task+0x44. Useful for seeing
 /// "where is newt stuck?" without spamming the per-task save-area
@@ -410,14 +556,24 @@ fn dump_blocked_pcs() {
                         Some((_,v)) => ((v>>24) as u8,(v>>16) as u8,(v>>8) as u8,v as u8),
                         None => (b'?',b'?',b'?',b'?'),
                     };
+                    let fp_usr = rd(node + 0x3c).unwrap_or(u32::MAX);
+                    let (pc_buf, pc_n) = fmt_pc_name(saved_pc);
+                    let (lr_buf, lr_n) = fmt_pc_name(lr_usr);
+                    let pc_name = core::str::from_utf8(&pc_buf[..pc_n]).unwrap_or("?");
+                    let lr_name = core::str::from_utf8(&lr_buf[..lr_n]).unwrap_or("?");
                     kprintln!(
-                        "    task {:#x} ({}{}{}{}) id={:#x} savedPC={:#x} SPSR={:#x} sp_usr={:#x} lr_usr={:#x}",
+                        "    task {:#x} ({}{}{}{}) id={:#x} SPSR={:#x}  PC={} <- LR={}  [pc={:#x} lr={:#x} sp={:#x} fp={:#x}]",
                         node, n0 as char, n1 as char, n2 as char, n3 as char,
-                        id, saved_pc, saved_spsr, sp_usr, lr_usr,
+                        id, saved_spsr, pc_name, lr_name,
+                        saved_pc, lr_usr, sp_usr, fp_usr,
                     );
-                    // Only walk newt's user stack (the deadlocked task) to
-                    // avoid spamming the log. Heuristic: tasks whose name is
-                    // "newt".
+                    // Walk the APCS frame chain starting at fp_usr.
+                    // 12 frames is plenty for everything we've seen so
+                    // far; cap stops a corrupt chain from spamming the
+                    // log.
+                    if fp_usr != 0 && fp_usr != u32::MAX && (fp_usr & 3) == 0 {
+                        walk_apcs_frames(fp_usr, 12);
+                    }
                     if n0 == b'n' && n1 == b'e' && n2 == b'w' && n3 == b't' {
                         kprintln!("      newt user-stack window (sp_usr +0x00..+0x80):");
                         for i in 0..32u32 {

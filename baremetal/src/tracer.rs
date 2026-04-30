@@ -58,11 +58,10 @@ use crate::guest_mem;
 use crate::kprintln;
 use crate::trap::TrapContext;
 
-const FN_ADDRS_RAW: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fn_addrs.bin"));
-const FN_NAME_OFFS_RAW: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fn_name_offs.bin"));
-const NAME_POOL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fn_names.bin"));
-
-const FN_COUNT: usize = FN_ADDRS_RAW.len() / 4;
+// Symbol-table backing storage lives in `crate::symbols` (always
+// available). Re-export the raw helpers here so the rest of this
+// file's code reads as it did before the extract.
+use crate::symbols::{FN_COUNT, fn_addr, fn_name, fn_name_off};
 
 /// HVC immediate used by trampoline slot[0]. Routed from `trap::handle_hvc`
 /// to `handle_trace_hvc`. 0x50 chosen to not collide with existing
@@ -118,22 +117,6 @@ fn already_fired(_idx: usize) -> bool {
 /// if called from multiple boot paths (e.g. cold boot vs. snapshot resume).
 static mut INITIALISED: bool = false;
 
-fn read_u32_le(slice: &[u8], i: usize) -> u32 {
-    let o = i * 4;
-    u32::from_le_bytes([slice[o], slice[o + 1], slice[o + 2], slice[o + 3]])
-}
-
-fn fn_addr(i: usize) -> u32 { read_u32_le(FN_ADDRS_RAW, i) }
-fn fn_name_off(i: usize) -> usize { read_u32_le(FN_NAME_OFFS_RAW, i) as usize }
-
-fn fn_name(i: usize) -> &'static str {
-    let start = fn_name_off(i);
-    let mut end = start;
-    while end < NAME_POOL.len() && NAME_POOL[end] != 0 {
-        end += 1;
-    }
-    core::str::from_utf8(&NAME_POOL[start..end]).unwrap_or("<non-utf8>")
-}
 
 /// ROM ranges we must not overwrite with a `B trampoline`:
 ///   - VA 0x00..0x20: ARM vector table. The reset vector at 0x00 runs

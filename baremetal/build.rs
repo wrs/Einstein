@@ -43,9 +43,11 @@ fn main() {
         println!("cargo:rerun-if-changed={}", abs.display());
     }
 
-    if env::var("CARGO_FEATURE_TRACE").is_ok() {
-        build_trace_tables();
-    }
+    // Build the symbol tables unconditionally. `trace` consumes them
+    // for its trampoline pool; `task_dump` consumes them (always) for
+    // PC → name lookup in stack traces. Cost is just a few hundred KB
+    // of `include_bytes!` data in the image.
+    build_trace_tables();
 
     // Stage the classify bitmap for include_bytes! in shadow_stub.
     // In guest-test mode the bitmap is embedded but never consulted —
@@ -161,7 +163,7 @@ fn build_trace_tables() {
     }
 
     println!(
-        "cargo:warning=nh-baremetal: trace feature — {} function entries, {} bytes of names",
+        "cargo:warning=nh-baremetal: symbol table — {} function entries, {} bytes of names",
         entries.len(),
         pool_off
     );

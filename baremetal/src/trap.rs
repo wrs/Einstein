@@ -2805,6 +2805,48 @@ fn handle_findsuper_mid_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
         seq, r3, r0, r1, r2, ip, lr, sp, mode,
     );
 
+    // Iter-41: dump the shadow_stub stub bytes at 0x00E97FC0 (the
+    // stub for ldrb r1, [r1, #61] at PC=0x001488ac) and probe the
+    // wild VA 0x80000110 to see what's there.
+    if seq == 0 {
+        kprintln!("  Iter-41 stub bytes at 0x00E97FC0 (16 words):");
+        for i in 0..16u32 {
+            let va = 0x00E97FC0u32.wrapping_add(i * 4);
+            match guest_mem::read_word_va(va) {
+                Some(w) => kprintln!("    stub[{:2}] @{:#010x} = {:#010x}", i, va, w),
+                None    => kprintln!("    stub[{:2}] @{:#010x} = (unmapped)", i, va),
+            }
+        }
+        kprintln!("  Iter-41 wild-VA bytes at 0x80000110 (4 words):");
+        for i in 0..4u32 {
+            let va = 0x80000110u32.wrapping_add(i * 4);
+            match guest_mem::read_word_va(va) {
+                Some(w) => kprintln!("    wild[{:2}] @{:#010x} = {:#010x}", i, va, w),
+                None    => kprintln!("    wild[{:2}] @{:#010x} = (unmapped)", i, va),
+            }
+        }
+        // Also dump where the LR_USR=0x80000110 value might live
+        // — read the trampoline's UND-save slots to see if any of
+        // them holds the wild value.
+        kprintln!("  UND trampoline save slots:");
+        let scratch = crate::trap::HYP_TRAMP_SCRATCH_BASE;
+        for &(off, label) in &[
+            (0x00u32, "LR_und"),
+            (0x04, "SPSR_und"),
+            (0x08, "LR_svc"),
+            (0x0C, "R0"),
+            (0x10, "R1"),
+            (0x14, "R2"),
+            (0x18, "banked SP"),
+            (0x1C, "banked LR"),
+        ] {
+            match guest_mem::read_word_pa(scratch + off) {
+                Some(w) => kprintln!("    {}+{:#04x} = {:#010x}  ({})", "scratch", off, w, label),
+                None    => kprintln!("    {}+{:#04x} = (unmapped)  ({})", "scratch", off, label),
+            }
+        }
+    }
+
     if (r3 & 0x8000_0000) != 0 {
         kprintln!(
             "  ★ WILD r3 already at 1488c4 — corruption is BEFORE this PC (shadow_stub stub at 1488ac is the prime suspect)"

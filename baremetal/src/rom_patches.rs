@@ -986,6 +986,20 @@ pub const LOOKUP_ENTRY_PROBE_HVC_IMM:    u32 = 0x6C;
 pub const LOOKUP_ENTRY_PROBE_PC:         u32 = 0x000C_747C;
 const LOOKUP_ENTRY_FIRST_INSN:           u32 = 0xE1A0_C00D; // mov ip, sp
 
+/// `FindSuperceeder__7TObjRefFR7TObjRef` entry at ROM `0x0014_88A0`.
+/// Iter-38 confirmed Lookup is reached with r3=0x80000110 from the
+/// DoCommit-c96c8 path via FindSuperceeder's tail call. Iter-39
+/// bisects: this probe fires BEFORE FindSuperceeder runs, capturing
+/// (r0, r1, r2, r3, lr, sp). If r1 here is already 0x80000110, the
+/// bug is in DoCommit (its `add r1, sp, #120` somehow yields a
+/// kernel-space VA). If r1 is sane (= sp+120 stack address), then
+/// something between FindSuperceeder entry and Lookup entry is
+/// overwriting r3 — even though the disassembly says only `mov
+/// r3, r1` writes r3.
+pub const FINDSUPER_ENTRY_PROBE_HVC_IMM: u32 = 0x6D;
+pub const FINDSUPER_ENTRY_PROBE_PC:      u32 = 0x0014_88A0;
+const FINDSUPER_ENTRY_FIRST_INSN:        u32 = 0xE1A0_3001; // mov r3, r1
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -1458,6 +1472,14 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(LOOKUP_ENTRY_PROBE_HVC_IMM),
             "TFlashStore::Lookup entry (ring + halt-on-wild-r3)",
             LOOKUP_ENTRY_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            FINDSUPER_ENTRY_PROBE_PC,
+            FINDSUPER_ENTRY_FIRST_INSN,
+            hvc_insn(FINDSUPER_ENTRY_PROBE_HVC_IMM),
+            "FindSuperceeder entry (ring + halt-on-wild-r1)",
+            FINDSUPER_ENTRY_PROBE_HVC_IMM,
         );
     }
 }

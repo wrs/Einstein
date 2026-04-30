@@ -973,6 +973,19 @@ pub const CARDFAULT_THROW_PROBE_HVC_IMM:  u32 = 0x6B;
 pub const CARDFAULT_THROW_PROBE_PC:       u32 = 0x0004_E660;
 const CARDFAULT_THROW_FIRST_INSN:         u32 = 0xEB6E_52CD; // bl 0x1be319c <Throw>
 
+/// `Lookup__11TFlashStoreFUliR7TObjRef` entry at ROM `0x000C_747C`
+/// (TFlashStore::Lookup). Iter-37 pinned the wedge call chain to
+/// `?→UnlockStore→DoCommit→FindSuperceeder→Lookup→Set`, with the
+/// faulting `r0` for Set's `str r1, [r0, #8]` coming from Lookup's
+/// `mov r0, r6` at 0x000C_74AC, where r6 was loaded from r3 at
+/// 0x000C_7494. Iter-38 captures (r0..r3, lr, sp) per call to
+/// pinpoint the caller passing a wild &TObjRef OUT-param. The
+/// handler keeps a 64-slot ring buffer and halts on the first
+/// call with bit-31 of r3 set (= 0x80000110 family).
+pub const LOOKUP_ENTRY_PROBE_HVC_IMM:    u32 = 0x6C;
+pub const LOOKUP_ENTRY_PROBE_PC:         u32 = 0x000C_747C;
+const LOOKUP_ENTRY_FIRST_INSN:           u32 = 0xE1A0_C00D; // mov ip, sp
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -1437,6 +1450,14 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(CARDFAULT_THROW_PROBE_HVC_IMM),
             "CardFaultMonProc bl Throw (pre-Throw fault-frame capture)",
             CARDFAULT_THROW_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            LOOKUP_ENTRY_PROBE_PC,
+            LOOKUP_ENTRY_FIRST_INSN,
+            hvc_insn(LOOKUP_ENTRY_PROBE_HVC_IMM),
+            "TFlashStore::Lookup entry (ring + halt-on-wild-r3)",
+            LOOKUP_ENTRY_PROBE_HVC_IMM,
         );
     }
 }

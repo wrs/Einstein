@@ -1368,15 +1368,18 @@ pub const DABT_TRAMP_OFFSET: usize = 0x00FF_FFA8;
 ///
 ///   DFSC == 0x07 (translation, page)     → branch DAH @ 0x00393114
 ///   DFSC == 0x0F (permission, page)      → branch DAH @ 0x00393114
-///   DFSC == 0x05 (translation, section)  → branch DAH @ 0x00393114
 ///   DFSC == 0x0D (permission, section)   → branch DAH @ 0x00393114
 ///   DFSC == 0x06 (access flag, page)     → branch DAH @ 0x00393114
 ///   DFSC == 0x03 (access flag, section)  → branch DAH @ 0x00393114
 ///   anything else                        → fall through to DABT_TRAMP_OFFSET
-///                                          (slow EL2 path: alignment,
-///                                          domain faults, external
-///                                          aborts, recursive aborts —
-///                                          all rare or halt-worthy)
+///                                          (slow EL2 path: DFSC=0x05
+///                                          translation-section needs
+///                                          DFSR.Domain synthesis from
+///                                          L1[FAR>>20][8:5] — see
+///                                          install_dabt_fast_trampoline
+///                                          docs; alignment, domain,
+///                                          external, recursive aborts
+///                                          all also fall through)
 ///
 /// VA 0x10 branches here instead of directly at DABT_TRAMP_OFFSET so
 /// the fast path doesn't pay the DABT_TRAMP's lr/sp/spsr saves either.
@@ -1485,8 +1488,8 @@ pub unsafe fn patch_dabt_vector(rom_ptr: *mut u32) {
 ///   ft+5:  beq FAST_FWD              ; → ft+17
 ///   ft+6:  cmp r0, #15               ; permission, page
 ///   ft+7:  beq FAST_FWD
-///   ft+8:  cmp r0, #5                ; translation, section
-///   ft+9:  beq FAST_FWD
+///   ft+8:  nop                       ; (was: cmp r0, #5 — see iter-60 below)
+///   ft+9:  nop                       ; (was: beq FAST_FWD — see iter-60 below)
 ///   ft+10: cmp r0, #13               ; permission, section
 ///   ft+11: beq FAST_FWD
 ///   ft+12: cmp r0, #6                ; access flag, page
@@ -1509,6 +1512,18 @@ pub unsafe fn patch_dabt_vector(rom_ptr: *mut u32) {
 /// ~30 s of wall (DFSCs 0x07/0x0F dominating, all forwarded to kernel
 /// DAH). Bypassing the EL2 round-trip for those cases is a direct
 /// win — same kernel-side execution, no hypervisor overhead.
+///
+/// iter-60: DFSC=0x05 (translation, section) is *deliberately
+/// excluded* from the fast path (slots ft+8/ft+9 left as NOPs). For
+/// section-level translation faults ARMv7 leaves DFSR.Domain UNK
+/// (= 0); the kernel's `GetDomainAndFaultMonitorFromDomainNumber(0)`
+/// then returns no monitor and DAH throws `evt.ex.abt.bus`. Pre-iter-
+/// 59 the EL2 `handle_diag` synthesised DFSR.Domain from L1[FAR>>20]
+/// [8:5] before forwarding to DAH; iter-59 bypassed handle_diag. The
+/// minimal fix is to let DFSC=5 fall through to the slow EL2 path,
+/// which still does the synthesis. Section-level faults fire only on
+/// first touch of a 1 MiB section (~tens of times per boot for
+/// freshly-allocated stacks), so the slow-path cost is negligible.
 ///
 /// SAFETY: writes 21 words in the reserved range
 /// `DABT_FAST_TRAMP_OFFSET .. + 21*4`. Caller owns the ROM backing.
@@ -1541,8 +1556,12 @@ pub unsafe fn install_dabt_fast_trampoline(rom_ptr: *mut u32) {
         rom_ptr.add(ft +  5).write(beq(5, 18));   // beq FAST_FWD
         rom_ptr.add(ft +  6).write(0xE350_000F);  // cmp r0, #15
         rom_ptr.add(ft +  7).write(beq(7, 18));   // beq FAST_FWD
-        rom_ptr.add(ft +  8).write(0xE350_0005);  // cmp r0, #5
-        rom_ptr.add(ft +  9).write(beq(9, 18));   // beq FAST_FWD
+        // iter-60: DFSC=0x05 deliberately excluded — see file-level
+        // comment for rationale. Two NOPs preserve the slot layout so
+        // the existing beq targets / `b SLOW_DABT_TRAMP` offset stay
+        // correct without recomputing.
+        rom_ptr.add(ft +  8).write(0xE320_F000);  // nop
+        rom_ptr.add(ft +  9).write(0xE320_F000);  // nop
         rom_ptr.add(ft + 10).write(0xE350_000D);  // cmp r0, #13
         rom_ptr.add(ft + 11).write(beq(11, 18));  // beq FAST_FWD
         rom_ptr.add(ft + 12).write(0xE350_0006);  // cmp r0, #6

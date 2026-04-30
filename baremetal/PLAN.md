@@ -17,54 +17,132 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-60):** iter-59 added a per-imm HVC histogram
-diagnostic, which revealed that ~99% of traps were `HVC #DIAG_TAG`
-(20.8 M in 30 s) — kernel DABTs forwarded to `DataAbortHandler`.
-A new AArch32 fast-forward DABT trampoline at
-`DABT_FAST_TRAMP_OFFSET = 0x008F_FF00` now dispatches by DFSC
-without an EL2 round trip for the common kernel-handled cases
-(translation/permission/access-flag faults at section + page).
-Result: cold boot reaches the multitasking phase, with `newt`,
-`OBJM`, `cdfm`, `cdsv`, `PMGR`, `PTBL`, `STKF`, `idle`, `main`
-all alive in the task list. New failure mode: kernel-thrown
-exceptions `evt.ex.abt.bus` (FAR=0x0cd2d000, kernel heap range)
-and `evt.ex.fr.store` reach `UnhandledException` because no
-handler catches them.
+**Current goal (iter-61):** iter-60 root-caused the iter-59
+`evt.ex.abt.bus` throw at FAR=0x0cd2d000 to a missing DFSR.Domain
+synthesis: iter-59's fast trampoline bypassed `handle_diag`, so
+DFSC=0x05 (translation, section) — for which ARMv7 leaves
+DFSR.Domain UNK — reached the kernel's DAH with Domain=0. The
+kernel's `GetDomainAndFaultMonitorFromDomainNumber(0)` returned no
+monitor, FaultMonitorEntry returned -10015, and DAH threw
+`evt.ex.abt.bus`. iter-60 excluded DFSC=5 from the fast path so
+those faults fall through to the slow EL2 path which still
+synthesises DFSR.Domain from L1[FAR>>20][8:5] before forwarding.
+Result: boot recovers from the throw, reaches 26 tasks alive
+(`inkr`, `scrn` join the iter-59 list), and `evt.ex.fr.store`
+NewtonScript-level throws are now non-fatal (handled by Newton's
+own runtime — no `UnhandledException` halt within 30 s).
 
 Next steps:
 
-1. **Diagnose the bus-abort throws.** FAR=0x0cd2d000 falls in the
-   kernel-VA heap range; `caller_lr=0x002ddefc` is post-
-   `DisposeRefHandle`. Could be: (a) genuine guest bug uncovered
-   by faster boot, (b) our fast-forward not setting up DAH state
-   correctly for some DFSC, (c) stage-2 mapping gap revealed at
-   later boot phase. Walk the throw chain back from
-   `BusFaultMonitor` / `evt.ex.abt.bus` registration.
-2. **Improve rotate-LDR liveness coverage.** 98% of remaining
-   alignment-fault traps (3865/3883) are rejected as
-   `no_dead_scratches`. Adding a ScratchVA fallback would cover
-   them with a per-stub TPIDR-saved scratch, similar to the
-   shadow_stub byte-access path.
-3. **Wire up tablet/pen input** once the `evt.ex.fr.store` is
-   resolved and the boot can quiesce into a true idle.
+1. **Trace the residual `evt.ex.fr.store` throws.** Throw r1
+   alternates 0xffffd692 (-10094) / 0xffffd698 (-10088), called
+   from `0x00351e50` / `0x00353730` / `0x002df4f0` /
+   `0x002eff24`. These look like soup / package-store error
+   codes. Boot hasn't reached a quiescent idle yet; understand
+   whether these are expected (catch-and-continue) or block
+   reaching the idle wait state.
+2. **Wire up tablet/pen input** once boot quiesces into a true
+   idle. The 26-task census includes `scrn` (RDY waiting on a
+   semaphore group at `0xc125d58`) and `inkr` (recogniser),
+   which suggests the framework is ready for input.
+3. **Optional perf:** add a ScratchVA fallback for the rotate-
+   LDR `no_dead_scratches` rejection (98% of inline-stub
+   misses) — keeps the alignment-fault trap rate down. Lower
+   priority than (1) since the boot now progresses past the
+   prior wedge.
 
-Next steps:
+### Iteration 60: DFSC=5 fast-forward exclusion — bus-abort throw resolved
 
-1. **Identify where the byte-access work is concentrated.** With
-   alignment-fault returns at 98% of beacons after iter-58, a
-   PC histogram on the SBA UDF dispatch (or on the alignment-
-   fault EL2 emulator) would show whether it's a few hot kernel
-   functions (string hash, soup walking) or a wide spread.
-2. **If concentrated:** add inline-stub coverage for the
-   currently-rejected sites (writeback, no-dead-scratch
-   fallback via ScratchVA, RAM-resident PCs via UDF retry).
-3. **If wide:** consider untrapping more aggressively — e.g.
-   relax `SCTLR_EL1.A=1` so legitimate aligned word LDRs don't
-   fault and only the rotate-LDR pattern traps via a different
-   mechanism. (Risk: changes guest semantics.)
-4. **Wire up tablet/pen input** once the boot quiesces into a
-   true idle wait state — observable user interaction is the
-   real Phase B endpoint.
+iter-59's fast trampoline bypassed `handle_diag` for every
+forwardable DFSC. That broke section-level translation faults
+(DFSC=0x05): ARMv7 leaves DFSR.Domain UNK for those, the kernel's
+DAH then computes Domain=0, `GetDomainAndFaultMonitorFromDomainNumber(0)`
+returns no monitor, `FaultMonitorEntry` returns -10015, and DAH
+throws `evt.ex.abt.bus`. iter-58's slow path synthesised
+DFSR.Domain from L1[FAR>>20][8:5] before forwarding (handle_diag,
+trap.rs:6295), which got the right Domain=4 and let DAH recover.
+
+#### Diagnosis
+
+Cold-boot probe captures (lines 6518–6697 of the iter-60 cold-boot
+log) showed:
+
+```
+NewStack POST-SWI: env=0x13a5 req=0x11000 base=0x0cd2d000 ...
+dabt: forwarding to kernel DataAbortHandler — DFSC=0x5 FAR=0x0cd2d000 mode=0x17
+FME-entry[4]: r0(mask)=0x0000121a far=0x0cd2d000 ... task[+0x58]=0x00000045
+```
+
+Compare against the iter-59 log at the same FAR: `task[+0x58]=
+0x00000005` (Domain=0, FS=5). The `0x45` vs `0x05` difference is
+exactly the synthesised Domain=4 vs hardware-UNK Domain=0. Mask
+went from 0 (no monitor matched) to 0x121a (matched stack/heap
+domain), and `FaultMonitorEntry` returned 0 (success → recovery)
+instead of -10015 (failure → throw).
+
+Empirically, L1[0xcd] for our run is `0x04025081` with bits[8:5]
+= 0b0100 = 4 (heap-domain encoding). Even though that L1 entry's
+type bits show "section descriptor" (= no fault), the section
+itself faults at first access because the stage-2 mapping
+isn't backed yet — DFSC=5 fires, but the L1 entry already has
+the domain bits the kernel needs. Synthesis is therefore correct
+and matches the StrongARM behaviour the kernel was written for.
+
+#### Fix
+
+Two NOPs in place of the DFSC=5 dispatch slots in
+`install_dabt_fast_trampoline` (`src/guest_mem.rs`):
+
+```rust
+// iter-60: DFSC=0x05 deliberately excluded — see file-level
+// comment for rationale. Two NOPs preserve the slot layout so
+// the existing beq targets / `b SLOW_DABT_TRAMP` offset stay
+// correct without recomputing.
+rom_ptr.add(ft +  8).write(0xE320_F000);  // nop
+rom_ptr.add(ft +  9).write(0xE320_F000);  // nop
+```
+
+DFSC=5 now falls through to the slow path → DABT_TRAMP → HVC
+#DIAG_TAG → handle_diag → synthesise → forward. Other DFSCs
+(0x07, 0x0F, 0x0D, 0x06, 0x03) keep the iter-59 fast bypass.
+NOP encoding `0xE320_F000` verified with `arm-none-eabi-objdump`.
+
+#### Verification
+
+- All 36 guest tests pass on QEMU.
+- 30 s cold boot (no snapshot, fresh):
+  - DIAG_TAG (slow-path DABT) ≈ 0 in the per-2-s histograms — fast
+    path still working for the common DFSCs. (The earlier 5-min
+    measurement of 249 M DIAG_TAGs was a `timeout 30` that didn't
+    actually kill QEMU because `timeout` defaults to SIGTERM which
+    QEMU's semihosting ignores; the 5-min run kept emitting traps
+    after the kernel got into a post-throw reboot loop. Use
+    `timeout -k 2 30 …` (or `-s KILL`) for QEMU runs.)
+  - One `dabt: forwarding DFSC=0x5 FAR=0x0cd2d000` slow-path entry,
+    followed by the DFSC=7 page-level faults at the same VA — the
+    expected first-touch sequence per new section.
+  - 26 tasks alive (was 24 in iter-59): `OBJM`, `idle`, `main`,
+    `cdfm`, `newt`, `cdsv`, `PMGR`, `PTBL`, `STKF`, `STKP`,
+    `STKU`, `cdpr`, `drvr`, `ROMF`, `pg&e`, `alrt`, `ROMP`,
+    `sndm`, `mntr`, `Tmux`, `name`, `pssm`, `pckm`, `cmgr`,
+    plus the new `inkr` (recogniser, 0x3853) and `scrn`
+    (screen, RDY blocked on TSemaphoreGroup at 0xc125d58).
+- New residual: `evt.ex.fr.store` NewtonScript throws fire at
+  ROM PCs `0x00353730` / `0x002df4f0` / `0x00351e50` /
+  `0x002eff24` / `0x002f1eac` with r1 ∈ {0xffffd692, 0xffffd698}.
+  Caught and continued — no `UnhandledException` halt in the
+  30 s window. Tracked as iter-61.
+
+#### Out of scope (deferred)
+
+- Inline DFSR.Domain synthesis in the AArch32 fast trampoline.
+  Doable (≈10 extra insns: read FAR, walk L1, splice into DFSR
+  via `mcr p15,0,r0,c5,c0,0`) but DFSC=5 fires only on first
+  touch of a 1 MiB section — ~tens of times per boot. Slow-path
+  cost is negligible.
+- Hardening the timeout pattern in iter scripts. Adopted ad-hoc
+  in iter-60: use `timeout -k 2 N` so QEMU under semihosting
+  actually dies on deadline.
 
 ### Iteration 59: AArch32 fast-forward DABT trampoline — boot reaches scheduler
 
@@ -209,82 +287,8 @@ form forwarded Ctrl-C / Ctrl-\ as characters to the guest).
 - TSW (set/way cache maintenance). Newton's kernel doesn't use
   set/way ops in the hot path; leave it trapped.
 
-### Iteration 57: lazy in-ROM inline stub for rotate-LDR — 37× trap-rate cut
-
-iter-56 left the boot in steady-state at ~3.4M hypervisor
-traps/sec, dominated 99% by alignment-fault returns at
-`ELR=0xffffe4`. Each fault is a full DABT → AArch32
-trampoline → HVC → EL2 emulator → ERET round-trip for an SA-
-1100 rotate-LDR instruction (`LDR Rt, [Rn]` with unaligned
-EA, `result = word_at(Rn & ~3) ROR ((Rn & 3) * 8)`). The ROM
-has ~1300 such sites; in steady-state UI rendering a small
-hot subset accounts for the bulk of the rate.
-
-#### Fix
-
-New `src/unaligned_inline.rs` lazy-installs an in-ROM inline
-stub at each faulting PC the first time we see it, reusing the
-shadow_stub mechanism (SBA stub pool at IPA
-`0x00E00000..0x00FF_FF00`, B-instruction reach, liveness-aware
-scratch picker, icache-flush-both-ranges install). After
-install, subsequent executions of that PC run the rotate
-natively in AArch32 with no trap:
-
-```
-slot 0/1: ADD/SUB sea, Rn, <off>      ; (or 2-step ADD if imm > 0xFF)
-slot 2:   AND     ssh, sea, #3
-slot 3:   BIC     sea, sea, #3
-slot 4:   LDR{c}  Rt, [sea]
-slot 5:   LSL     ssh, ssh, #3
-slot 6:   MOV{c}  Rt, Rt, ROR ssh
-slot 7:   B       orig_pc + 4
-```
-
-Aligned EAs see `ssh = 0` → ROR-by-0 = identity, so a single
-body handles aligned and unaligned cases. Non-S forms throughout
-preserve NZCV. Conditional LDR/MOV match the original cond, so
-a cond-fail leaves Rt untouched (matches original LDR's
-architectural behaviour).
-
-Eligibility (anything not eligible falls through to the existing
-EL2 emulator; partial coverage already wins):
-- LDR only (STR-unaligned is implementation-defined; rare).
-- Pre-index, no writeback (P=1, W=0).
-- No PC operand for Rt, Rn, or Rm.
-- Faulting PC < 0x00900000 (Newton ROM/REX, not tracer pool
-  or SBA stub pool).
-- Liveness analysis finds 2 dead scratches in {R0..R3, R12}
-  not in the operand mask.
-
-`shadow_stub` exposes a small public API (`live_regs_at`,
-`alloc_stub_slot`, `install_inline_at`,
-`read_insn_original_first`) that the new module reuses.
-
-#### Verification
-
-- All 36 guest tests pass on QEMU.
-- Cold boot reaches steady-state with no `***` halt; FB dump
-  generates correctly (logo + "Newton" caption).
-- Trap rate dropped from ~3.4M/sec (iter-56) to ~91K/sec
-  average over a 25-second cold boot (~37× reduction). Beacon
-  ELR distribution shifted from 99% `0xffffe4` (alignment) to
-  ~10% `0xffffe4` plus a spread across SVC dispatches and
-  other handlers — i.e. alignment faults are no longer the
-  dominant trap source.
-- 56 unique PCs installed in 25 s; install rate slows as the
-  hot UI-loop set is covered.
-
-#### Out of scope (deferred)
-
-- Inline coverage of LDR with writeback / post-index. Mostly
-  unused by the rotate-LDR idiom; would expand the encoder.
-- ScratchVA fallback for sites where liveness can't find 2
-  dead scratches. Lazy install means partial coverage still
-  wins; revisit only if a hot site has no dead scratches.
-- RAM-resident faulting PCs (REX or copied code). The B from
-  the SBA stub pool can't reach them; would need a parallel
-  pool or an HVC-based UDF site (slower, but cheaper than the
-  current EL2 emulator round-trip).
+<!-- Older iteration retrospectives (iter-57 and earlier) live in
+     `git log` per the auto-prune maintenance note. -->
 
 ## Workflow per stop
 

@@ -165,3 +165,34 @@ listed here for completeness; they pre-date this file.
   CONSTRAINED UNPREDICTABLE** per ARM ARM D1.21.2 Table D1-85. Always
   w-view (`ctx.x[N] as u32`) when reading banked values. Don't rely
   on the upper halves being zero-extended.
+
+## Tooling pitfall — `timeout` doesn't kill QEMU under semihosting
+
+Plain `timeout N cargo run --release` does **not** stop QEMU at the
+deadline. `timeout`'s default signal is SIGTERM, and
+`qemu-system-aarch64` running with our semihosting + `-no-reboot`
+configuration ignores it (the busy semihosting loop never reaches
+the signal-poll site). The `cargo run` wrapper exits, the QEMU
+child is reparented, and the run keeps emitting traps for as long
+as you let it — which can produce wildly misleading trap-rate
+measurements if you assume the wall-clock window equals your
+intended timeout.
+
+Use `timeout -k 2 N` (or `timeout -s KILL N`) for any QEMU run
+that needs to die on a deadline:
+
+```bash
+# Cold-boot capture, definitely-stops-after-30 s:
+rm -f /tmp/newton-snapshot-{0..3}.bin
+timeout -k 2 30 cargo run --release > /tmp/cold.log 2>&1
+```
+
+Discovered iter-60 (2026-04-30): a `timeout 30` measurement of
+"249 M DIAG_TAGs over 30 s" was actually a 5+ minute run because
+QEMU never received SIGKILL. The same fix applied with `-k 2`
+gave the correct ≈0 DIAG_TAGs over 30 s.
+
+The Ctrl-C symptom in interactive runs has the same root cause —
+`scripts/run-qemu.sh` was updated in iter-58 from `-serial stdio`
+to `-serial mon:stdio` so Ctrl-A x quits cleanly; Ctrl-C still
+won't reliably kill semihosting QEMU.

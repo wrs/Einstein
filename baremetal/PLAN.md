@@ -14,7 +14,21 @@ shadow-on-write redirects, and per-task subpage-AP shims are all
 ruled out. The fix MUST be a kernel patch that makes the kernel
 work without 1k subpage protections.
 
-**Current goal (revised iter-37): the wedge is a translation
+**Current goal (revised iter-38): wedge mechanism confirmed —
+Lookup's r3 is genuinely 0x80000110 entering from DoCommit's
+c96c8 path. Iter-38's entry-side ring probe captured 19 normal
+Lookup calls before the wedge call (#19, lr=0xc96cc) with
+r3=0x80000110 / sp=0x0c328e18. The disassembly path (`add r1,
+sp, #120` → `mov r3, r1`) cannot produce 0x80000110 from
+sp=0x0c328e18. Iter-39 must bisect: probe at FindSuperceeder
+entry (0x001488a0) to determine whether the wild value is
+already in r1 entering FindSuperceeder (→ DoCommit's c96c0
+register state is corrupted) or appears later (→ unknown ROM-
+runtime modification of r3 in FindSuperceeder's body). The
+following iter-37 framing remains correct as far as it goes;
+the iter-38 finding sharpens the next debugging step.
+
+**(Iter-37 framing preserved.) The wedge is a translation
 fault on a wild this-pointer (0x80000110) inside
 `Set__7TObjRefFUlT1`. Iter-37's FP-chain walker pins the call
 chain to ?→UnlockStore→TFlashStore::DoCommit→FindSuperceeder→
@@ -289,6 +303,147 @@ TAlertEventHandler region.
   allocator's freelist threading code (the ROM PCs we see are
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
+
+### Iteration 38 (next-loop iter 34): Lookup-entry ring probe confirms wild r3=0x80000110 — sp consistent, OUT-param mystery deepens
+
+Iter-37 surfaced an OUT-param mismatch: Lookup's saved r6 in
+the fault frame was 0x80000110, but DoCommit's `add r1, sp,
+#120` at c96c0 should produce 0x0c328e90 given the FP-chain's
+reported DoCommit fp. Iter-38 added an entry-side ring-buffer
+probe at TFlashStore::Lookup (PC=0x000C_747C) to capture every
+caller's (r0..r3, lr, sp) and halt on the first call with
+bit-31 set in r3.
+
+#### Implementation
+
+- New `LOOKUP_ENTRY_PROBE_HVC_IMM = 0x6C` constant.
+- Patch first insn (`mov ip, sp` / 0xE1A0_C00D) at 0x000C_747C
+  with HVC.
+- New `handle_lookup_entry_probe(ctx)` in `src/trap.rs`:
+  - 64-slot ring buffer of `(seq, r0..r3, lr, sp, mode)`.
+  - Periodic logging only on seq < 8 / seq % 64 to avoid UART
+    flood.
+  - On any call with `r3 & 0x8000_0000` set: dump the entire
+    ring (chronological), mark the wedge entry, and halt via
+    halt_invariant.
+  - Emulates the patched `mov ip, sp` (`ctx.x[12] = sp`).
+- Wired into both HVC dispatch paths (direct + UND-trampoline);
+  Lookup is called from USR-mode kernel-as-task contexts so
+  the UND trampoline path is the live one.
+
+#### Cold-boot output (annotated)
+
+19 calls fired before the wedge:
+
+```
+[#  0] r0=0x0c604c04 r1=0x17 r3=0x0cc77d80 lr=0x000c9204
+[#  1] r0=0x0c604c04 r1=0x27 r3=0x0cc77d58 lr=0x000c5e74
+[#  2] r0=0x0c604c04 r1=0x27 r3=0x0cc77c84 lr=0x000c5e74
+[#  3] r0=0x0c604c04 r1=0x32 r3=0x0cc77ba8 lr=0x000c7284
+[#  4] r0=0x0c604c04 r1=0x33 r3=0x0cc77ba8 lr=0x000c7284
+[#  5] r0=0x0c604c04 r1=0x32 r3=0x0c328ea8 lr=0x000ca7a8  ← Tmux-stack
+[#  6] r0=0x0c604c04 r1=0x34 r3=0x0c328ea8 lr=0x000ca7a8
+[#  7] r0=0x0c604c04 r1=0x33 r3=0x0c328ea8 lr=0x000ca7a8
+[#  8] r0=0x0c604c04 r1=0x35 r3=0x0c328ea8 lr=0x000ca7a8
+[#  9] r0=0x0c604c04 r1=0x27 r3=0x0c328ec4 lr=0x000ca7a8
+[# 10] r0=0x0c604c04 r1=0x17 r3=0x0c328eb8 lr=0x000c947c   ← MarkCommitPoint
+[# 11..18] r0=0x0c604c04 r1=0x31..0x37 r2=0xffffffff r3=0x0c328eac lr=0x000c20a0
+                                                          ← TFlashIterator::Next
+[# 19] r0=0x0c604c04 r1=0x27 r2=0x0d r3=0x80000110 lr=0x000c96cc  ← WEDGE
+       caller_lr=0x000c96cc  sp=0x0c328e18  src_mode=USR
+```
+
+#### What this confirms
+
+1. **The wedge call comes via DoCommit at c96c8 → FindSuperceeder
+   tail-call → Lookup**, exactly as iter-37's FP-chain claimed.
+   lr=0xc96cc is unique to that bl-site.
+2. **sp=0x0c328e18 entering Lookup is correct** — matches the
+   FP-chain's reported DoCommit-sp-at-bl-FindSuperceeder.
+3. **r1=0x27, r2=0x0d are consistent** with FindSuperceeder's
+   work: r1 = `[sp+148] & 0x0fffffff` = (this->[76] low 28 bits),
+   r2 = 13 (taken because [store+61] == 0).
+4. **r3=0x80000110 violates the disassembly.** Per the ROM:
+   - DoCommit at c96c0: `add r1, sp, #120` (no other r1 write
+     between c96c0 and c96c8)
+   - FindSuperceeder at 1488a0: `mov r3, r1` (no other r3 write)
+   - Therefore r3 entering Lookup = sp + 120
+   - Computed: sp+120 = 0x0c328e18 + 120 = 0x0c328e90
+   - Observed: 0x80000110
+
+The disassembly path can't produce 0x80000110 from sp=0x0c328e18.
+
+#### Hypotheses for the impossible value
+
+1. **A SECOND `add r1, sp, #120` writes r1 with a different sp**
+   (e.g., a callee mutates sp temporarily and a deferred path
+   re-runs the add). Disassembly shows no such pattern.
+2. **`add r1, sp, #120` is being mis-decoded by my analysis,
+   and the actual instruction loads from somewhere else**.
+   Encoding 0xE28D1078 verified as ADD imm; this is solid.
+3. **A pre-emption / IRQ between c96c0 and c96c8** that re-enters
+   DoCommit on a different stack. Unlikely — DoCommit is short.
+4. **Stack corruption that flows through r1 specifically.**
+   Maybe a callee (like TFlashIterator::Next) corrupts the
+   return state in such a way that DoCommit's sp/r1 register
+   restoration pulls 0x80000110.
+5. **A UND trampoline / HVC handler bug** that mis-saves r3
+   under specific conditions. Unlikely — the trampoline only
+   touches r0/r1/r2/r12, never r3 (verified in
+   `patch_und_vector`).
+6. **A DIFFERENT entry point to Lookup** that happens to produce
+   the matching lr by some weird control flow (e.g., a `b
+   FindSuperceeder` from elsewhere). Disassembly grep of
+   `bl FindSuperceeder` shows ONLY 3 sites (c61f4 / c6508 /
+   c96c8), all `bl`, and only c96c8 produces lr=0xc96cc.
+
+The most informative next step is to bisect: probe FindSuperceeder
+entry (0x001488a0) and see whether r1 there is already
+0x80000110 (→ DoCommit is the source) or whether it's
+0x0c328e90 (→ FindSuperceeder modifies r3 in a way the
+disassembly doesn't show, i.e. there's hidden runtime
+modification).
+
+#### Next iteration plan (iter-39)
+
+1. **Add HVC probe at `FindSuperceeder` entry (0x001488a0).**
+   Original first insn `mov r3, r1` (0xE1A0_3001). Capture
+   (r0, r1, r2, r3, lr, sp) per call, ring buffer, halt on
+   r1 with bit-31 set.
+
+2. If r1 entering FindSuperceeder is already 0x80000110, the
+   bug is in DoCommit at c96c0..c96c8 — add a second probe at
+   `add r1, sp, #120` (0x000C_96C0) to capture sp directly.
+
+3. If r1 entering FindSuperceeder is a stack address but the
+   subsequent Lookup-entry probe reports r3=0x80000110, the
+   bug must be in FindSuperceeder's body — examine each
+   instruction, verify ROM bytes haven't been patched, and
+   consider whether bit-31 of some constant is set in a way
+   that gets propagated.
+
+4. Alternatively, capture the FULL 32-word window of Tmux's
+   stack at sp..sp+0x80 in the Lookup-entry probe so we can
+   see what's at [sp+120] (DoCommit's local at offset 120).
+   This isn't strictly needed (the `add` doesn't read from
+   that location) but might reveal a corruption pattern.
+
+#### Status
+
+- Build clean.
+- Probe HVC #0x6C fires reliably; halt-on-wild-r3 path verified.
+- Wedge call's identity confirmed: 19 prior Lookup calls had
+  perfectly normal stack-address r3 values; only the c96cc
+  call has the wild value.
+- The OUT-param mismatch is REAL (not an artifact of the
+  iter-37 FP-chain walker mixing stale frames). The mystery
+  shifts to "where in the c96c0..c96c8 → 1488a0..1488a4 path
+  does the wild r3 originate?"
+- 30/30 shadow_stub tests pass (the new probe doesn't disturb
+  shadow_stub coverage).
+- Iter-38 deliverable: precise call-site ID + ring buffer
+  context for the wedge, narrowed iter-39 to a binary-search
+  probe at FindSuperceeder entry.
 
 ### Iteration 37 (next-loop iter 33): FP-chain walk pins call-stack to UnlockStore→DoCommit→FindSuperceeder→Lookup; OUT-param mismatch detected
 

@@ -1341,6 +1341,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::CARDFAULT_THROW_PROBE_HVC_IMM => {
             handle_cardfault_throw_probe(ctx);
         }
+        v if v == crate::rom_patches::LOOKUP_ENTRY_PROBE_HVC_IMM => {
+            handle_lookup_entry_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1941,6 +1944,11 @@ fn handle_und(ctx: &mut TrapContext) {
             handle_cardfault_throw_probe(ctx);
             // Never returns: handle_cardfault_throw_probe halts.
         }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::LOOKUP_ENTRY_PROBE_HVC_IMM) => {
+            handle_lookup_entry_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::DAH_USR_RETURN_PROBE_HVC_IMM) => {
             // The DAH USR-return probe lives inside DataAbortHandler,
             // which only ever runs from ABT mode — not from USR. So the
@@ -2507,6 +2515,98 @@ fn handle_cardfault_throw_probe(ctx: &TrapContext) -> ! {
             fp = caller_fp;
         }
     });
+}
+
+/// Iter-38: ring-buffer probe at `Lookup__11TFlashStoreFUliR7TObjRef`
+/// entry (ROM 0x000C_747C). Captures (seq, r0..r3, lr, sp) per call
+/// to identify the caller passing a wild &TObjRef OUT-param. Halts
+/// on the first call where r3 has bit 31 set (= 0x80000110-family
+/// kernel-space VA), dumping the ring buffer for context.
+const LOOKUP_RING_SLOTS: usize = 64;
+#[derive(Clone, Copy)]
+struct LookupRingEntry {
+    seq: u32,
+    r0: u32,
+    r1: u32,
+    r2: u32,
+    r3: u32,
+    lr: u32,
+    sp: u32,
+    mode: u32,
+}
+static mut LOOKUP_RING: [LookupRingEntry; LOOKUP_RING_SLOTS] = [LookupRingEntry {
+    seq: 0, r0: 0, r1: 0, r2: 0, r3: 0, lr: 0, sp: 0, mode: 0,
+}; LOOKUP_RING_SLOTS];
+static LOOKUP_SEQ: AtomicU32 = AtomicU32::new(0);
+
+fn handle_lookup_entry_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_lookup_entry_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_lookup_entry_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    let seq = LOOKUP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let r0 = ctx.x[0] as u32;
+    let r1 = ctx.x[1] as u32;
+    let r2 = ctx.x[2] as u32;
+    let r3 = ctx.x[3] as u32;
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+    let mode = source_cpsr & 0x1F;
+
+    let entry = LookupRingEntry { seq, r0, r1, r2, r3, lr, sp, mode };
+    // SAFETY: single-threaded EL2 trap path.
+    unsafe {
+        LOOKUP_RING[(seq as usize) % LOOKUP_RING_SLOTS] = entry;
+    }
+
+    // Heuristic: a stack/heap address in Newton 2.x lives in
+    // 0x0C00_0000..0x0E00_0000 (RAM aperture). Anything with bit 31
+    // set is unmapped kernel-space and definitely wild.
+    let r3_wild = (r3 & 0x8000_0000) != 0;
+
+    if r3_wild {
+        halt_invariant("TFlashStore::Lookup called with wild &TObjRef OUT param (bit-31 r3)", || {
+            kprintln!(
+                "  WILD CALL: seq=#{} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}",
+                seq, r0, r1, r2, r3,
+            );
+            kprintln!(
+                "  caller_lr={:#010x}  sp={:#010x}  src_mode={} ({:#x})",
+                lr, sp, describe_aarch32_mode(mode), mode,
+            );
+            kprintln!();
+            kprintln!("  Lookup ring buffer (last {} calls, oldest first):", LOOKUP_RING_SLOTS);
+            // Print in chronological order (seq ascending). Entries
+            // with seq=0 and zero fields are unused slots if seq < SLOTS.
+            // SAFETY: single-threaded.
+            unsafe {
+                let total = (seq + 1) as usize;
+                let count = total.min(LOOKUP_RING_SLOTS);
+                let start = if total <= LOOKUP_RING_SLOTS { 0 } else { total - LOOKUP_RING_SLOTS };
+                for i in 0..count {
+                    let s = start + i;
+                    let e = LOOKUP_RING[s % LOOKUP_RING_SLOTS];
+                    let mark = if e.seq == seq { " ← WEDGE" } else { "" };
+                    kprintln!(
+                        "    [#{:3}] r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} lr={:#010x} sp={:#010x} mode={:#x}{}",
+                        e.seq, e.r0, e.r1, e.r2, e.r3, e.lr, e.sp, e.mode, mark,
+                    );
+                }
+            }
+        });
+    }
+
+    // Periodic logging only (avoid flooding the UART).
+    if seq < 8 || seq % 64 == 0 {
+        kprintln!(
+            "Lookup #{}: r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} lr={:#010x} sp={:#010x} mode={:#x}",
+            seq, r0, r1, r2, r3, lr, sp, mode,
+        );
+    }
+
+    // Emulate `mov ip, sp`.
+    ctx.x[12] = sp as u64;
 }
 
 fn handle_reboot(ctx: &TrapContext) -> ! {

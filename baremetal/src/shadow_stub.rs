@@ -1778,8 +1778,24 @@ fn encode_inline_stub(
 /// — the ROM is fixed, so an install-time failure means we discovered
 /// a site that needs a code change to handle, not a runtime fallback.
 fn emit_inline_stub(d: &Decoded, orig_pc: u32) {
+    // Iter-49 diagnostic: log scratch picks at sites known to have been
+    // mis-picked in production. Add more PCs here as bugs surface.
+    // Compile-time-cheap (just an array compare); narrow output.
+    const TRACE_PICK_SITES: &[u32] = &[
+        0x0014_88AC, // FindSuperceeder body — iter-49 R12-misclassification
+    ];
+    let trace_pick = TRACE_PICK_SITES.contains(&orig_pc);
+
     let (sea, variant) = match pick_scratch_regs(d, orig_pc) {
-        Some((sea, sfl)) => (sea, StubVariant::DeadReg { sfl }),
+        Some((sea, sfl)) => {
+            if trace_pick {
+                kprintln!(
+                    "shadow_stub pick @{:#010x}: DeadReg sea=R{} sfl={:?}",
+                    orig_pc, sea, sfl,
+                );
+            }
+            (sea, StubVariant::DeadReg { sfl })
+        }
         None => {
             // Liveness analysis didn't find 2 dead candidates (or 1 +
             // dead-NZCV). Fall back to the ScratchVA-based stub: the
@@ -1799,6 +1815,12 @@ fn emit_inline_stub(d: &Decoded, orig_pc: u32) {
             // the guest's stack page accounting. See
             // `docs/plans/shadow-stub-scratch-va.md` for details.
             let (sea, sfl, sad) = pick_operand_excluded_triple(d);
+            if trace_pick {
+                kprintln!(
+                    "shadow_stub pick @{:#010x}: ScratchVA sea=R{} sfl=R{} sad=R{}",
+                    orig_pc, sea, sfl, sad,
+                );
+            }
             let scratch_slot_idx = NEXT_SCRATCH_SLOT.fetch_add(1, Ordering::SeqCst);
             if scratch_slot_idx >= SCRATCH_POOL_STUB_CAP {
                 kprintln!(
@@ -3329,6 +3351,137 @@ mod tests {
         // pick R2 (dead). Lock that in so future regressions surface.
         assert_eq!(sea, 12, "scratch_ea expected R12; got {}", sea);
         assert_eq!(sfl, Some(2), "scratch_flags expected R2; got {:?}", sfl);
+    }
+
+    /// Iter-49 regression: FindSuperceeder body at ROM 0x001488ac.
+    /// Body uses IP (R12) as a save register across the byte-access stub:
+    ///
+    ///   0x1488a8: mov ip, r1            ; save TFlashStore* in ip
+    ///   0x1488ac: ldrb r1, [r1, #61]    ← byte access (patched to UDF)
+    ///   0x1488b0: teq r1, #0
+    ///   0x1488b4: moveq r2, #13
+    ///   0x1488b8: movne r2, #6
+    ///   0x1488bc: ldr r0, [r0]
+    ///   0x1488c0: bic r1, r0, #0xf0000000
+    ///   0x1488c4: mov r0, ip            ← READ of R12!
+    ///   0x1488c8: b Lookup_thunk
+    ///
+    /// The picker MUST detect R12 as live at PC=0x1488b0 (= orig_pc+4),
+    /// because the local read at 0x1488c4 consumes the value of ip set
+    /// at 0x1488a8 (before the byte access).
+    ///
+    /// In production, this case fires a real wedge: the picker chose R12
+    /// as scratch_ea, the stub's `ADD R12, R1, #61` clobbered ip with
+    /// `TFlashStore* + 0x3d` (XOR'd to 0x3e), and the subsequent
+    /// `mov r0, ip` at 0x1488c4 fed Lookup a wild this-pointer.
+    ///
+    /// Stream layout: PC=0 corresponds to the byte-access site (= 0x1488ac).
+    #[test]
+    fn pick_scratch_at_findsuperceeder_does_not_pick_r12() {
+        // Body sequence in pristine ROM (no rom_patches HVCs).
+        let stream = [
+            0xE5D1_103Du32, // [0]  pc=0x00  ldrb r1, [r1, #61]    ← byte access
+            0xE331_0000u32, // [1]  pc=0x04  teq r1, #0
+            0x03A0_200Du32, // [2]  pc=0x08  moveq r2, #13
+            0x13A0_2006u32, // [3]  pc=0x0c  movne r2, #6
+            0xE590_0000u32, // [4]  pc=0x10  ldr r0, [r0]
+            0xE3C0_120Fu32, // [5]  pc=0x14  bic r1, r0, #0xf0000000
+            0xE1A0_000Cu32, // [6]  pc=0x18  mov r0, ip   ← READS R12
+            0xE12F_FF1Eu32, // [7]  pc=0x1c  bx lr (stand-in for tail-call)
+        ];
+        let read = |pc: u32| stream.get((pc / 4) as usize).copied();
+        let d = decode(stream[0]).expect("decode LDRB");
+        assert_eq!(d.kind, AccessKind::Ldrb);
+        assert_eq!(d.rt, 1);
+        assert_eq!(d.rn, 1);
+
+        let live = live_at_with_reader(4, 32, &read);
+        assert_ne!(live & (1u16 << 12), 0,
+            "R12 must be live at orig_pc+4 — `mov r0, ip` at PC=0x18 reads it; live={:#x}", live);
+
+        let picks = pick_scratch_regs_with_reader(&d, 0, &read)
+            .expect("picker should find dead reg(s)");
+        let (sea, sfl) = picks;
+        assert_ne!(sea, 12, "scratch_ea must NOT be R12 — body reads ip; got {}", sea);
+        if let Some(s) = sfl {
+            assert_ne!(s, 12, "scratch_flags must NOT be R12; got {}", s);
+        }
+    }
+
+    /// Iter-49 regression (production reality): same body as above, but
+    /// with PC=0x1488c4 (the `mov r0, ip` site) replaced by an HVC —
+    /// because rom_patches installs the FINDSUPER_MID probe there at boot.
+    ///
+    /// In the production install order (rom_patches BEFORE shadow_stub),
+    /// shadow_stub's analyzer reads ROM and sees HVC at PC=0x1488c4
+    /// instead of `mov r0, ip`. HVC is treated as BLink (function call):
+    /// the analyzer marks R0..R3 + R12 + R14 as caller-saved-clobbered,
+    /// missing the LOCAL read of R12 from the original instruction.
+    /// Result: picker picks R12 → stub clobbers ip → wild this to Lookup.
+    ///
+    /// This test reproduces the production bug. Currently EXPECTED TO
+    /// FAIL — it documents the bug and will turn green once iter-50 fixes
+    /// the install order (or makes the analyzer original-ROM-aware).
+    #[test]
+    #[ignore = "documents iter-49 bug; will pass once iter-50 fixes install order"]
+    fn pick_scratch_at_findsuperceeder_when_midprobe_installed_does_not_pick_r12() {
+        // hvc_insn for FINDSUPER_MID_PROBE_HVC_IMM=0x6E:
+        //   cond=AL (0xE), op=0001_0100, imm12=0x006, op2=0111, imm4=0xE
+        //   = 0xE140_067E
+        let hvc_06e = 0xE140_067Eu32;
+        let stream = [
+            0xE5D1_103Du32, // [0]  pc=0x00  ldrb r1, [r1, #61]
+            0xE331_0000u32, // [1]  pc=0x04  teq r1, #0
+            0x03A0_200Du32, // [2]  pc=0x08  moveq r2, #13
+            0x13A0_2006u32, // [3]  pc=0x0c  movne r2, #6
+            0xE590_0000u32, // [4]  pc=0x10  ldr r0, [r0]
+            0xE3C0_120Fu32, // [5]  pc=0x14  bic r1, r0, #0xf0000000
+            hvc_06e,        // [6]  pc=0x18  ★ HVC (probe replaces `mov r0, ip`)
+            0xE12F_FF1Eu32, // [7]  pc=0x1c  bx lr
+        ];
+        let read = |pc: u32| stream.get((pc / 4) as usize).copied();
+        let d = decode(stream[0]).expect("decode LDRB");
+
+        let picks = pick_scratch_regs_with_reader(&d, 0, &read)
+            .expect("picker should find dead reg(s)");
+        let (sea, sfl) = picks;
+        // The original `mov r0, ip` at PC=0x18 read R12. After rom_patches
+        // replaces it with HVC, that read is invisible to shadow_stub's
+        // ROM-byte-driven analyzer. The bug is that the analyzer happily
+        // picks R12 as scratch.
+        assert_ne!(sea, 12,
+            "scratch_ea must NOT be R12 even when PC=0x18 is HVC — the
+             original `mov r0, ip` at that PC reads ip; got {}", sea);
+        if let Some(s) = sfl {
+            assert_ne!(s, 12, "scratch_flags must NOT be R12; got {}", s);
+        }
+    }
+
+    /// Iter-41 regression: a function uses LR (R14) as a save register
+    /// across a byte-access stub. The byte access at PC=0 is followed
+    /// by a use of LR, then a tail-call. The picker MUST detect R14 as
+    /// live (because the local `mov r0, lr` reads it before the tail-call,
+    /// AND APCS LR is observably live at function return).
+    #[test]
+    fn pick_scratch_with_local_lr_read_does_not_pick_r14() {
+        // Synthetic but representative: byte access, then read R14 to a
+        // scratch reg, then return (BX LR consumes LR).
+        let stream = [
+            0xE5D1_103Du32, // [0]  pc=0x00  ldrb r1, [r1, #61]
+            0xE331_0000u32, // [1]  pc=0x04  teq r1, #0
+            0xE1A0_400Eu32, // [2]  pc=0x08  mov r4, lr     ← READS R14
+            0xE12F_FF1Eu32, // [3]  pc=0x0c  bx lr
+        ];
+        let read = |pc: u32| stream.get((pc / 4) as usize).copied();
+        let d = decode(stream[0]).expect("decode LDRB");
+
+        let live = live_at_with_reader(4, 32, &read);
+        assert_ne!(live & (1u16 << 14), 0,
+            "R14 must be live at orig_pc+4 — `mov r4, lr` at PC=0x08 reads it; live={:#x}", live);
+
+        // Sanity: with the iter-42 R14-exclusion fix in CANDIDATES, R14
+        // is never picked anyway. This test verifies the analyzer
+        // correctness independently of the band-aid candidate exclusion.
     }
 
     #[test]

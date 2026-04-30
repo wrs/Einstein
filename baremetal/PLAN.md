@@ -17,85 +17,67 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-49):** Lookup is called with **wild this**
-(r4 = 0x0c604c42 = TFlashStore* + 0x3e, NOT 0x0c604c04). iter-48's
-table-indexed probe at c74cc halted with `base=0x00100000 index=0x27
-entry=0x0a000005` — the "base" (= [r4+44] = [0x0c604c6e]) is just
-random bytes from a stack/heap region that happen to land in ROM
-range (so iter-47's base check missed it). The real bug is upstream:
-**Lookup's `this` argument is wild**.
-
-The call path: UnlockStore → DoCommit → FindSuperceeder (TAIL-CALL)
-→ Lookup. FindSuperceeder body at 0x001488ac..0x001488c8 ends with
-`ldr r0, [r0]; bic r1, r0, #0xf0000000; ...; b Lookup_thunk`. So
-Lookup's `this` = `*[input_TObjRef]` from FindSuperceeder. The
-input TObjRef is `DoCommit.sp+148` (a stack-local TObjRef in
-DoCommit's frame). On the wedge call, `*[sp+148]` = 0x0c604c42 —
-garbage, not a real TFlashStore* (note the iter-37/38 narrative
-already saw r0=0x0c604c42 entering Lookup; we just hadn't yet
-identified that it's coming from a poorly-initialised TObjRef
-local).
-
-iter-49 must probe FindSuperceeder thunk entry (0x01af8c14) or
-FindSuperceeder body entry (0x001488a0) to capture incoming r0
-(the TObjRef ptr) AND dump 8 words at that pointer (the full
-TObjRef contents). Halt when TObjRef[+0] is outside RAM/ROM (=
-wild). Walk the caller chain to identify where in DoCommit the
-TObjRef was supposed to be populated.
-
-### Iteration 47: Lookup's `[r4+44]` table base is consistently sane — wild values are TABLE ENTRIES, not the base
-
-Patched `c74c8: ldr r0, [r4, #44]` with HVC. Handler reads
-`[r4+44]`, halts if outside RAM (0x0c000000..0x10000000) or ROM
-(0..0x800000), else emulates and continues.
-
-Cold-boot result: 8+ logged Lookup-base events all show
-`r4=0x0c604c04` (sole boot-time TFlashStore, lives in RAM), and
-`[r4+44] = 0x0c605848` (in RAM, sane) for every call. **No halt
-fired.** Hypothesis (a) "wild base = 0x20000000" REJECTED. The
-prior iter-46 `dabt-trip: PC=0xc74cc r0=0x20000000` line was a
-recoverable kernel DABT on an unrelated path — not the wedge call.
-
-The boot now progresses past iter-46's PhysBlock(NULL) wedge:
-the iter-44 PhysBlock probe halts on `*[r0]` wild ONLY when r1
-!= -1 (the early-return gate). Some path through Lookup now
-returns `table[index] = 0x0a000005` (not NULL, not in PhysBlock-
-probe halt class), and that wild pointer reaches
-`LogEntryOffset__11TFlashBlockFv` at c0c9c → `ldr r1, [r0, #8]`
-faults UNALIGNED (0x0a00000d & 3 != 0). End-of-boot output:
+**Current goal (iter-50):** **The bug is in shadow_stub's liveness
+analyser, NOT in DoCommit.** iter-49 traced the wild Lookup `this`
+back through the FindSuperceeder body's tail-call sequence:
 
 ```
-unaligned: cannot read aligned 0x0a00000c (EA=0x0a00000d) at PC=0xc0c9c
-  r0..r7: 0x0a000005 0x00000027 0x0000000d 0xe59d0000
-          0x0c604c42 0x0000000d 0x0c328e90 0x00000027
+   001488a8: mov ip, r1            ; ip = TFlashStore* (parent, from TObjRef[+16])
+   001488ac: ldrb r1, [r1, #61]    ← byte access (shadow_stub UDF)
+   001488b0..1488c0: teq, moveq, ldr r0, [r0], bic r1, ...
+   001488c4: mov r0, ip            ← READS R12, but rom_patches replaced this PC
+                                     with HVC #0x6E (FINDSUPER_MID probe) at boot
+   001488c8: b Lookup_thunk        ; tail-call
 ```
 
-So `Lookup.table[index] = 0x0a000005` for some index. Either
-the index is past the valid extent (table holds garbage past N),
-or specific entries got overwritten after init.
+**Root cause (chain):**
 
-#### Next iteration plan (iter-48)
+1. At hypervisor boot, `apply_717006_patches` (in `load_rom`) installs
+   the FINDSUPER_MID probe HVC at PC=0x001488c4, replacing the original
+   `mov r0, ip`.
+2. THEN `shadow_stub::patch_rom_from_bitmap` runs and sees the
+   byte-access at 0x001488ac.
+3. Its liveness analyser walks ROM from PC=0x001488b0 forward. At
+   PC=0x001488c4 it reads HVC #0x6E (treated as `BLink` →
+   APCS-clobber-R0..R3+R12+R14) instead of the original `mov r0, ip`
+   (which would mark R12 LIVE).
+4. The picker concludes R12 is dead and picks it as scratch_ea.
+5. Stub's `ADD R12, R1, #61` clobbers ip with `TFlashStore* + 0x3d`
+   (XOR'd with 3 → +0x3e per BE32→LE32 fixup).
+6. Body's `mov r0, ip` (post-HVC, run after probe handler emulates
+   the original) reads the clobbered ip → Lookup gets wild this.
 
-1. **Probe at c74cc** (`ldr r0, [r0, r1, lsl #2]`). Capture
-   `(base, index, table[index])`. Emulate the load. Halt when
-   the loaded value is outside RAM/ROM. Dump 16 words around
-   `base + index*4` to see whether neighbouring entries are
-   sane (→ specific corruption) or wild (→ iterating past end).
+The same class of bug as iter-41 (R14 chosen as scratch_fl despite
+being live across a tail-call). iter-42 worked around iter-41 by
+removing R14 from the candidate pool. The CORRECT fix addresses
+both (and any future similar case): make the analyser see the
+original ROM bytes, not the post-probe-patch ROM.
 
-2. **If iter-past-end**: Lookup's calling convention probably
-   has a max-index check upstream. Check what `r7` (the search
-   key) and `[r4+96]` (the shift) are doing — `r1 = r7 >> shift`
-   should bound the index. Trace whether a too-large r7 is
-   reaching Lookup.
+iter-49 deliverables (committed):
+- Production tracing logs the pick: `shadow_stub pick @0x001488ac:
+  DeadReg sea=R12 sfl=None` — confirms the bug live.
+- Two new regression unit tests in `src/shadow_stub.rs`:
+  - `pick_scratch_at_findsuperceeder_does_not_pick_r12` — passes on
+    pristine ROM (analyser correct given the right input).
+  - `pick_scratch_at_findsuperceeder_when_midprobe_installed_does_not_pick_r12`
+    — `#[ignore]`'d, fails on HVC-corrupted ROM (documents the bug).
+- One unit test for the iter-41 R14 case
+  (`pick_scratch_with_local_lr_read_does_not_pick_r14`) — passes,
+  documents the correctness invariant.
 
-3. **If specific-entry corruption**: install a stage-2 RO trap
-   on the affected table page (PA backing 0x0c605848) once the
-   bad index is known. Capture every writer.
+iter-50 must pick a fix:
+1. **Reorder install** — call `shadow_stub::patch_rom_from_bitmap`
+   BEFORE `apply_717006_patches`. Simplest, but requires verifying
+   no shadow_stub site PC overlaps a rom_patches probe PC (a quick
+   audit of both lists).
+2. **Original-ROM-aware analyser** — pass shadow_stub a "shadowed
+   read function" that returns the pre-patch instruction at any
+   PC in the rom_patches list. Slightly more code but localised
+   to the analyser.
 
-4. **Cross-reference Einstein**: `build/NewtonProbe` should
-   show what a fully-booted Newton's TFlashStore->[+44] table
-   looks like. If our boot's table differs only in a few
-   entries, that's the corruption fingerprint.
+Option 1 is preferred unless the audit surfaces an overlap. Once
+fixed, un-`#[ignore]` the second regression test and confirm it
+turns green.
 
 ### Iteration 48: r4 (Lookup's `this`) is itself wild — the bug is upstream of Lookup
 
@@ -171,6 +153,64 @@ that r0 was independently wild.)
    =0x0c604c42` for the SAME wedge call (caller_lr=c96cc).
    The value is recurring — strongly suggests a deterministic
    init bug, not random corruption.
+
+### Iteration 49: shadow_stub liveness analyser reads probe-corrupted ROM — picks R12 wrongly
+
+iter-48 hypothesised "DoCommit doesn't initialise sp+148"; the
+hypothesis is WRONG. iter-49 added a `*[r0]` wildness check in the
+FindSuperceeder ENTRY probe (false positive — TObjRef[+0] is an
+object ID like `0xf0000027`, not a pointer; the actual parent
+TFlashStore* lives at TObjRef[+16]) and through that diagnostic
+trace identified the actual mechanism.
+
+The FindSuperceeder body uses ip (R12) as a save register across
+the byte-access stub at 0x001488ac. The picker chose R12 as
+scratch_ea because the liveness analyser was looking at the
+**already-patched** ROM (rom_patches replaced the LOCAL
+`mov r0, ip` at 0x001488c4 with HVC #0x6E for the FINDSUPER_MID
+probe). HVC is treated as `BLink` → caller-saved clobber → R12
+"dead" → picked. Stub clobbers ip → wild this to Lookup.
+
+This is the same root cause as iter-41 (R14 picked as scratch_fl).
+iter-42 worked around iter-41 by excluding R14 from the candidate
+pool — a band-aid that doesn't address the analyser's read-the-
+post-patch-ROM problem.
+
+#### Iter-49 deliverables
+
+- Tracing in `emit_inline_stub` for known-buggy sites — confirms
+  in production cold boot:
+  ```
+  shadow_stub pick @0x001488ac: DeadReg sea=R12 sfl=None
+  ```
+- Three regression unit tests in `src/shadow_stub.rs::tests`:
+  - `pick_scratch_at_findsuperceeder_does_not_pick_r12` — passes
+    when the analyser sees pristine ROM bytes; demonstrates the
+    analyser is correct given the right input.
+  - `pick_scratch_at_findsuperceeder_when_midprobe_installed_does_not_pick_r12`
+    — `#[ignore]`'d; fails on HVC-corrupted ROM. Will turn green
+    when iter-50 lands.
+  - `pick_scratch_with_local_lr_read_does_not_pick_r14` — passes;
+    locks in the iter-41 invariant.
+
+#### Next iteration plan (iter-50)
+
+Pick one of:
+
+1. **Reorder install** — move `shadow_stub::patch_rom_from_bitmap()`
+   BEFORE the `apply_717006_patches` call inside `load_rom`. Audit
+   that no shadow_stub byte-access PC overlaps a rom_patches probe
+   PC (the lists are small; a static assertion at install time is
+   easy).
+
+2. **Original-ROM shadow** — keep a side-table of `(PC, original
+   instruction)` pairs maintained by `apply_717006_patches`, and
+   give shadow_stub's analyser a reader function that consults it
+   first. Local change to the analyser; no ordering constraint.
+
+After the fix lands, un-`#[ignore]` the regression test and verify
+it turns green. Re-run the cold boot — iter-48's wedge (Lookup
+called with wild this) should be gone.
 
 ## Workflow per stop
 

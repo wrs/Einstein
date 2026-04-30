@@ -47,6 +47,15 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         0x07 => {
             blit(ctx, pc);
         }
+        0x08 => {
+            get_feature(ctx);
+        }
+        0x09 => {
+            // SetFeature: contrast/backlight/orientation. We don't
+            // have a display backend that distinguishes these, so just
+            // accept the write (return 0).
+            ctx.x[0] = 0;
+        }
         _ => {
             kprintln!(
                 "*** screen: unknown subfn {:#x} @PC={:#x} r1={:#x} r2={:#x} r3={:#x}",
@@ -55,6 +64,26 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
             cpu::halt();
         }
     }
+}
+
+/// `TMainDisplayDriver::GetFeature(feature_id)` — Einstein's table at
+/// `Emulator/TNativePrimitives.cpp:1662`. We don't model contrast /
+/// backlight / orientation runtime knobs, so we return the same
+/// constants Einstein returns for a default un-configured ScreenManager:
+/// contrast/backlight/orientation default to 0, "display present" = 1,
+/// feature 5 = 0xA, anything else = 0xFFFFFFFF.
+fn get_feature(ctx: &mut TrapContext) {
+    let feature = ctx.x[1] as u32;
+    let value: u32 = match feature {
+        0 => 0,           // contrast (default off)
+        1 => 1,           // display present
+        2 => 0,           // backlight (default off)
+        3 => 0,
+        4 => 0,           // orientation (default upright)
+        5 => 0xA,
+        _ => 0xFFFF_FFFF, // unknown feature
+    };
+    ctx.x[0] = value as u64;
 }
 
 /// Geometry advertised to the guest on GetScreenInfo. The values
@@ -77,11 +106,18 @@ fn get_screen_info(ctx: &mut TrapContext, pc: u32) {
         (0x14, 0x0000_0020), // unknown
         (0x18, 0x0000_0020), // unknown
     ];
+    // r1 is a user VA — Tmux task @PC=0x801b84 (REx-side) calls
+    // GetScreenInfo with a stack VA like 0x0cc77e70 that the guest
+    // kernel has stage-1-mapped to an IPA in 0x040x_xxxx. Translate
+    // through the live stage-1 walk; fall back to identity when the
+    // MMU is off (guest-test runtime path).
     for (off, val) in fields {
-        if !guest_mem::write_word_pa(info_addr + off, val) {
+        let va = info_addr + off;
+        let pa = guest_mem::translate_va(va).unwrap_or(va);
+        if !guest_mem::write_word_pa(pa, val) {
             kprintln!(
-                "*** screen.GetScreenInfo: cannot write {:#x} @PC={:#x}",
-                info_addr + off, pc
+                "*** screen.GetScreenInfo: cannot write VA {:#x} (PA {:#x}) @PC={:#x}",
+                va, pa, pc
             );
             cpu::halt();
         }
@@ -142,12 +178,18 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
     for row in 0..height {
         for col in 0..row_bytes {
             let src_va = addy + (src_top as u32 + row) * row_bytes + col;
-            let byte = match guest_mem::read_byte_pa(src_va) {
+            // src_va is a guest VA when stage-1 is on (post-MMU
+            // Newton boot); when stage-1 is off (guest-test runtime),
+            // VA is treated as PA via the identity. translate_va
+            // returns None in the MMU-off case; fall back to identity
+            // so guest-tests' MMU-off paths still work.
+            let src_pa = guest_mem::translate_va(src_va).unwrap_or(src_va);
+            let byte = match guest_mem::read_byte_pa(src_pa) {
                 Some(b) => b,
                 None => {
                     kprintln!(
-                        "*** screen.blit: src VA {:#x} outside mapped regions",
-                        src_va
+                        "*** screen.blit: src VA {:#x} → PA {:#x} outside mapped regions",
+                        src_va, src_pa
                     );
                     cpu::halt();
                 }
@@ -176,12 +218,15 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
 }
 
 fn read_word_or_halt(va: u32, what: &str, pc: u32) -> u32 {
-    match guest_mem::read_word_pa(va) {
+    // VA-aware in MMU-on mode (Newton boot); identity in MMU-off mode
+    // (guest tests) — `translate_va` returns None when SCTLR.M=0.
+    let pa = guest_mem::translate_va(va).unwrap_or(va);
+    match guest_mem::read_word_pa(pa) {
         Some(v) => v,
         None => {
             kprintln!(
-                "*** screen.blit: cannot read {} at VA {:#x} @PC={:#x}",
-                what, va, pc
+                "*** screen.blit: cannot read {} at VA {:#x} (PA {:#x}) @PC={:#x}",
+                what, va, pa, pc
             );
             cpu::halt();
         }

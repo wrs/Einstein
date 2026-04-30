@@ -17,33 +17,131 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-52):** iter-51 root-caused the
-`evt.ex.abt.bus` wedge in `TStackManager::Fault`: shadow_stub's
-liveness analyser had a memoization bug that caused R0 to be
-mis-classified dead at WriteChunk's LDRB stub @0x00257080. The fix
-landed; boot progresses past WriteRun and hits a NEW wedge in
-`FindSuperceeder` → `Lookup` with wild OUT-param r3=0x80000110:
+**Current goal (iter-53):** iter-52 fixed the FindSuperceeder
+wild-r3 wedge: shadow_stub's liveness analyser was treating
+unreachable Direct/Cond branch targets as `APCS_RETURN_LIVE` only,
+but every Newton ROM jumptable thunk is reached via such a branch
+and is a tail-call passing args in R0..R3. Adding `APCS_PARAMS`
+to the live mask at unreachable targets fixes the `b 0x1afef70`
+(jumptable thunk for `Lookup`) entry in FindSuperceeder. Picker
+at 0x001488ac now falls back to `ScratchVA` (R12/R0/R2) instead
+of clobbering R3.
+
+The same iter also added `0x08 GetFeature` and `0x09 SetFeature`
+handlers to `peripherals/screen.rs` (filling in stubs from
+Einstein's `TNativePrimitives.cpp:1662`) and converted
+`get_screen_info` / `blit` reads to use stage-1 translate-or-
+identity (so MMU-on Newton boot works while MMU-off guest tests
+still pass).
+
+Boot now progresses to NewBlock #758+ allocations and hits
+a NEW wedge in `screen.blit`:
 
 ```
-*** invariant violation: TFlashStore::Lookup called with wild
-    &TObjRef OUT param (bit-31 r3) ***
-WILD CALL: seq=#19 r0=0x0c604c04 r1=0x00000027 r2=0x0000000d
-           r3=0x80000110 caller_lr=0x000c96cc
+*** screen.blit: src VA 0xc64d000 → PA 0xc64d000 outside
+    mapped regions
 ```
 
-caller_lr=0x000c96cc is right after `bl FindSuperceeder` at
-0x000c96c8. The wild value 0x80000110 is a CPSR (USR mode + N
-flag), the same shape as the iter-49 `MRS scratch_fl, CPSR`
-clobber pattern but at a different stub site. Likely another
-shadow_stub mis-pick where the picker chose R3 (the OUT-param
-register) as scratch_fl.
+The kernel's pixmap at addy=0xc64cb64..0xc64cba4 has its bitmap
+data spanning into 0xc64d000+ which the kernel hasn't yet
+stage-1-mapped to RAM. Likely a lazy-mapping page that the kernel
+faults in on first access; our blit walks the bitmap eagerly
+without triggering the kernel's fault path.
 
-iter-52 should:
-1. Identify which shadow_stub site clobbers R3 between Lookup
-   call #18 (sane r3=0x0c328eac) and #19 (wild r3=0x80000110).
-2. Decide whether the bug is another picker miss (the iter-51 fix
-   is general but doesn't cover every site automatically) or a
-   site-specific liveness-analysis edge case.
+iter-53 should:
+1. Decide if the blit src walk should let the kernel do the
+   stage-1 fault (e.g., have the hypervisor pre-touch the page
+   via a synthetic DABT to a kernel ResolveFault handler), or
+   2. Just check the mapping and return early when the bitmap
+      isn't fully mapped (the kernel will retry).
+3. Or: examine whether our addy/rowBytes/src_top math is wrong
+   and we're walking past the actual valid bitmap region.
+
+### Iteration 52: FindSuperceeder wild-r3 root-caused — Direct-branch unreachable targets need APCS_PARAMS
+
+iter-51's fix exposed a new wedge: `TFlashStore::Lookup called
+with wild OUT-param r3=0x80000110` from caller PC 0x000c96cc
+(right after `bl FindSuperceeder`). The wild value 0x80000110
+is the saved CPSR (USR mode + N flag) — same shape as
+iter-49's R12 clobber, the unmistakable signature of an
+`MRS scratch_fl, CPSR` write hitting a register that's actually
+live.
+
+#### Mechanism
+
+`FindSuperceeder @0x001488a0` body:
+```
+1488a0: mov r3, r1            ; r3 = OUT-param (saved here)
+1488a4: ldr r1, [r0, #16]     ; r1 = TFlashStore* (this for Lookup)
+1488a8: mov ip, r1            ; ip = TFlashStore*
+1488ac: ldrb r1, [r1, #61]    ; ← shadow_stub-patched LDRB
+        ...
+1488c8: b 0x1afef70 <Lookup-jumptable-thunk>
+```
+
+The picker for the LDRB at `0x001488ac` walks forward through
+the body and at `1488c8: b 0x1afef70` follows the Direct branch.
+0x1afef70 lies in the post-ROM jumptable region (above
+ROM_IPA_BASE+ROM_IPA_SIZE = 0x01000000), so `read_insn(target)`
+returns `None`. The walker then OR'd `APCS_RETURN_LIVE` into
+live and returned — but **omitted `APCS_PARAMS` (R0..R3)**.
+
+Tail-calls in APCS pass arguments in R0..R3, so any jumptable-
+routed `b <fn>` should mark R0..R3 live at the call site.
+Without it, the picker classified R3 as dead, picked it as
+`scratch_fl`, and the stub's `MRS R3, CPSR` clobbered the
+OUT-param pointer with 0x80000110.
+
+#### Fix
+
+Hoist `APCS_PARAMS` to a module-level const, and OR it into the
+live mask whenever a Direct or Cond branch's target is
+unreachable:
+
+```rust
+// BranchKind::Direct
+if read_insn(target).is_none() {
+    live |= (APCS_RETURN_LIVE | APCS_PARAMS) & !written;
+    return live;
+}
+```
+
+This hardens the picker against every jumptable-routed tail-call
+in Newton ROM, not just FindSuperceeder. Every Newton ROM
+function that ends in a `b <jumptable_slot>` is now treated as
+parameter-passing.
+
+#### Verification
+
+- `shadow_stub pick @0x001488ac` now reports
+  `ScratchVA sea=R12 sfl=R0 sad=R2` (3 caller-saved regs
+  spilled to per-stub slot; no R3 touch).
+- All 36 shadow_stub unit tests pass.
+- All 36 guest tests pass.
+- Cold boot no longer trips the Lookup-wild-r3 invariant.
+
+#### Side fixes (downstream wedges this iteration unblocked)
+
+The boot then ran ~80% further (Tmux task active, NewBlock #758
+allocations) and hit:
+
+1. `screen.GetScreenInfo: cannot write 0xcc77e70 @PC=0x801b84`
+   — `peripherals/screen.rs::get_screen_info` was using
+   `write_word_pa` on a guest VA. Fixed: translate VA → PA via
+   `guest_mem::translate_va`, with identity fall-back when
+   stage-1 is off (guest-test runtime).
+
+2. `screen: unknown subfn 0x8 @PC=0x801be8 r1=0x4` — REx code
+   queries `TMainDisplayDriver::GetFeature(feature_id)`. Added
+   the `0x08 GetFeature` and `0x09 SetFeature` handlers per
+   `Emulator/TNativePrimitives.cpp:1662`. Returns Einstein-style
+   defaults for an un-configured ScreenManager.
+
+3. `screen.blit` `read_byte_pa` was using PA on a VA — fixed
+   the same way (translate-or-identity).
+
+The next wedge — `screen.blit: src VA 0xc64d000 outside mapped
+regions` — is iter-53 territory.
 
 ### Iteration 51: WriteRun bus-abort root-caused — visited-set leak in liveness analyser
 

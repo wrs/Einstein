@@ -248,6 +248,110 @@ TAlertEventHandler region.
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
 
+### Iteration 33 (next-loop iter 29): enhanced canary dump pins Reboot caller to GenericSWIHandler
+
+Iter-32 collected (ELR, SPSR, R0..R3, R14_und) at canary time
+but couldn't identify the calling function. Iter-33 extends the
+canary handler in `src/trap.rs::handle_reboot` to dump:
+
+1. SP_und stack (16 words from `ctx.x[23]`).
+2. The R0-pointed exception-descriptor candidate (8 words).
+3. R3 decoded as both unsigned and signed int32.
+
+#### Cold-boot output, iter-33
+
+```
+*** Reboot canary fired ***
+  ELR_EL2  = 0x00ffff58  (= Reboot entry PC)
+  SPSR_EL2 = 0x000001db  mode=UND
+  R0 = 0xffffd8a5  R1 = 0  R2 = 0  R3 = 0x7fffffcd
+  R12 = 0x0cc77cc8  R14_UND = 0x000d9888
+
+  SP_und stack (16 words from ctx.x[23]=0x0c006000):
+    [+0..+60] = 0x6db6db6d / 0xb6db6db6 / 0xdb6db6db (POISON)
+
+  Exception-descriptor candidate at R0=0xffffd8a5:
+    all 8 entries: (unmapped)
+
+  R3 decoded as error code: 0x7fffffcd (2147483597, signed=2147483597)
+```
+
+**Key findings:**
+
+1. SP_und is **fully poisoned** (0x6db6db6d sliding-hex pattern,
+   the kernel's "uninitialized" marker). The UND-mode handler
+   never pushed a frame before reaching Reboot — i.e. Reboot
+   was reached via a `bl` or `b` from UND mode without any prior
+   APCS prologue.
+
+2. R0=0xffffd8a5 doesn't translate (no stage-1 mapping). It's
+   not an exception-descriptor pointer; it looks like a kErr_-
+   shaped error code in disguise (0xFFFFD8A5 ~= -10075 signed,
+   in the kErr_* range -10000..-50000).
+
+3. R3=0x7fffffcd (positive, near INT_MAX) is most likely
+   uninitialized — Reboot's signature is `(long, unsigned long,
+   unsigned char)` so R3 isn't even an argument.
+
+#### Caller pinned via rom.dis
+
+`grep "bl 0x1bef798"` on the disassembly finds 9 `bl Reboot`
+sites:
+
+```
+0xb02bc, 0xb0394, 0xd8fd4, 0xd9980, 0xe6c00, 0xe9b98,
+0x113f54, 0x113f68, 0x13be54
+```
+
+The caller at `0x000d8fd4` is inside **`GenericSWIHandler`**
+(starts at `0x000d8a64`). The local context just before
+`bl Reboot`:
+
+```
+d8f94: bl Get__12TObjectTableFUl    ; lookup an object
+d8fa0: movs r1, r0                  ; r0=0 → object not found
+d8fa4: moveq r7, #229
+d8fa8: subeq r7, r7, #10240         ; r7 = -10011 = 0xFFFFD8E5
+d8fac: beq 0xd9228                  ; → return r7 as error
+...
+d8fd0: mov r0, r4
+d8fd4: bl Reboot                    ; called when handler decides to reboot
+```
+
+So the kernel's SWI handler is executing one of its early-boot
+self-tests, the test fails, and it tail-calls Reboot. Mode is
+UND because GenericSWIHandler runs from UND? Unlikely —
+GenericSWIHandler is an SVC-mode handler. Need to verify which
+of the 9 caller sites is actually firing.
+
+#### Next iteration plan (iter-34)
+
+**Per-callsite Reboot tagging.** Patch each of the 9 `bl Reboot`
+sites with a UNIQUE HVC (instead of letting them all reach the
+canary at Reboot's prologue). Each HVC handler logs the caller
+PC and emulates the bl. The canary dispatch then identifies
+*which* of the 9 sites is the actual trigger — in one boot.
+
+Implementation: in `src/rom_patches.rs`, add 9 `REBOOT_CALLER_*`
+constants (HVC #0x6A..0x72), patch each `bl Reboot` site with
+its tagged HVC, and in the dispatcher log the call site +
+arguments before halting (or chaining to the existing canary).
+
+Once the actual caller is identified, the failure-mode
+investigation moves to whatever check that specific caller is
+running — likely an object-table lookup, parameter-validation,
+or environment-domain check that's failing because of Phase B
+state.
+
+#### Status
+
+- Build clean.
+- Canary output upgraded with SP_und walk + R0 descriptor +
+  R3 decode.
+- Caller narrowed to one of 9 `bl Reboot` sites; iter-34 will
+  pin the specific one.
+- 30/30 shadow_stub tests pass.
+
 ### Iteration 32 (next-loop iter 28): canary-source investigation — Reboot from UND mode
 
 Iter-30/31 verified the heap and stack invariants and tightened

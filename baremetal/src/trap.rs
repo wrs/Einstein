@@ -1332,6 +1332,12 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::WC_BNE_PROBE_HVC_IMM => {
             handle_wc_bne_probe(ctx);
         }
+        v if v == crate::rom_patches::UNHANDLED_EXCEPTION_HVC_IMM => {
+            handle_unhandled_exception(ctx, false);
+        }
+        v if v == crate::rom_patches::UNHANDLED_NUM_EXCEPTION_HVC_IMM => {
+            handle_unhandled_exception(ctx, true);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1920,6 +1926,14 @@ fn handle_und(ctx: &mut TrapContext) {
             return_to_guest_from_und(ctx, target as u64, spsr_und);
             return;
         }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::UNHANDLED_EXCEPTION_HVC_IMM) => {
+            handle_unhandled_exception(ctx, false);
+            // Never returns: handle_unhandled_exception halts.
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::UNHANDLED_NUM_EXCEPTION_HVC_IMM) => {
+            handle_unhandled_exception(ctx, true);
+            // Never returns: handle_unhandled_exception halts.
+        }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::DAH_USR_RETURN_PROBE_HVC_IMM) => {
             // The DAH USR-return probe lives inside DataAbortHandler,
             // which only ever runs from ABT mode — not from USR. So the
@@ -2258,6 +2272,91 @@ fn handle_bootos_canary(ctx: &mut TrapContext) {
         "  the reset vector at VA 0."
     );
     cpu::halt();
+}
+
+/// Read up to `max` bytes of an ASCII C-string from guest VA, stopping
+/// at NUL or unmapped page. Used for exception-name dumps.
+fn read_cstr_at(va: u32, max: usize) -> ([u8; 128], usize) {
+    let mut buf = [0u8; 128];
+    let cap = max.min(128);
+    let mut len = 0;
+    let mut i = 0usize;
+    while i < cap {
+        // Read a 32-bit word at the next word-aligned position so we
+        // can extract the relevant bytes — stage-1 translate is
+        // word-granular in our helpers.
+        let word_va = (va.wrapping_add(i as u32)) & !0x3;
+        let off = ((va.wrapping_add(i as u32)) & 0x3) as usize;
+        let w = match guest_mem::read_word_va(word_va) {
+            Some(w) => w,
+            None    => break,
+        };
+        // Newton 2.x stores strings in BE-byte-order even in our LE-
+        // word view (BE32 kernel built against SA-1100; iter-30 docs).
+        // Within a word, byte k of the string is `(w >> ((3-k)*8))`.
+        for j in off..4 {
+            if i >= cap { break; }
+            let shift = (3 - j) * 8;
+            let b = ((w >> shift) & 0xFF) as u8;
+            if b == 0 { return (buf, len); }
+            buf[i] = b;
+            len = i + 1;
+            i += 1;
+        }
+    }
+    (buf, len)
+}
+
+fn print_exception_name(label: &str, name_va: u32) {
+    let (buf, len) = read_cstr_at(name_va, 128);
+    let s = core::str::from_utf8(&buf[..len]).unwrap_or("<non-utf8>");
+    if len == 0 {
+        kprintln!("  {} @ VA={:#010x}: <unmapped or empty>", label, name_va);
+    } else {
+        kprintln!("  {} @ VA={:#010x}: \"{}\"", label, name_va, s);
+    }
+}
+
+/// Halt-on-entry tripwire for `UnhandledException(char*, void*,
+/// void(*)(void*))` (and the NonUserMode variant). The kernel calls
+/// these when it can't dispatch an exception to any installed handler;
+/// the caller passes the exception NAME as a C-string in r0. Catching
+/// here is far cleaner than letting Reboot fire and decoding the
+/// stack-passed string from a downstream caller.
+///
+/// `non_user` distinguishes the two variants (false ⇒ regular USR
+/// path, true ⇒ kernel/UND path). Halts via `halt_invariant`.
+fn handle_unhandled_exception(ctx: &TrapContext, non_user: bool) -> ! {
+    let r0 = ctx.x[0] as u32;
+    let r1 = ctx.x[1] as u32;
+    let r2 = ctx.x[2] as u32;
+    let r3 = ctx.x[3] as u32;
+    let trampoline_saved_spsr = guest_mem::read_word_pa(UND_SAVE_SPSR_IPA).unwrap_or(0);
+    let true_source_mode = trampoline_saved_spsr & 0x1F;
+    let true_caller_lr = crate::banked::lr_for_mode(ctx, trampoline_saved_spsr);
+    let true_source_sp = crate::banked::sp_for_mode(ctx, trampoline_saved_spsr);
+    let label = if non_user { "UnhandledNonUserModeException" } else { "UnhandledException" };
+    halt_invariant("kernel reached UnhandledException — exception had no handler", || {
+        kprintln!("  variant: {}", label);
+        kprintln!(
+            "  r0={:#010x}  r1={:#010x}  r2={:#010x}  r3={:#010x}",
+            r0, r1, r2, r3,
+        );
+        print_exception_name("exception name (r0)", r0);
+        kprintln!(
+            "  TRUE source mode={} ({:#x})  caller_lr={:#010x}  sp={:#010x}",
+            describe_aarch32_mode(true_source_mode),
+            true_source_mode, true_caller_lr, true_source_sp,
+        );
+        kprintln!("  exception data (r1) — first 8 words:");
+        for i in 0..8 {
+            let va = r1.wrapping_add(i * 4);
+            match guest_mem::read_word_va(va) {
+                Some(w) => kprintln!("    [{:+3}] @{:#010x} = {:#010x}", (i * 4) as i32, va, w),
+                None    => kprintln!("    [{:+3}] @{:#010x} = (unmapped)", (i * 4) as i32, va),
+            }
+        }
+    });
 }
 
 fn handle_reboot(ctx: &TrapContext) -> ! {

@@ -1410,7 +1410,22 @@ fn pick_scratch_regs_with_reader<R>(
     d: &Decoded, orig_pc: u32, read_insn: &R,
 ) -> Option<(u32, Option<u32>)>
 where R: Fn(u32) -> Option<u32> {
-    const CANDIDATES: &[u32] = &[12, 0, 1, 2, 3, 14];
+    // R14 (LR) was previously in this list, but iter-41 caught a
+    // case where the liveness analyzer failed to detect LR as live
+    // across a tail-call (`b <fn>` where the target is in the
+    // post-ship-patch table at VA > ROM_SIZE — the analyzer's
+    // unreadable-target fallback should OR APCS_RETURN_LIVE in but
+    // for some sites does not). The result was: shadow_stub picked
+    // R14 as scratch_fl, the stub's `MRS R14, CPSR` clobbered LR
+    // with the captured CPSR value (= 0x80000110 in the wedge case),
+    // and the wild LR propagated as Tmux's caller PC into Lookup,
+    // becoming the OUT-param pointer to TObjRef::Set, which faulted
+    // on the wild this-pointer. R14 is the link register; using it
+    // as a scratch in an in-line stub is fundamentally fragile (any
+    // BX LR or tail-call between the stub and the function exit
+    // jumps to the wild value). Restricting CANDIDATES to caller-
+    // saved scratch GPRs is the safe choice.
+    const CANDIDATES: &[u32] = &[12, 0, 1, 2, 3];
     // 32-instruction window: a typical Newton-ROM function body fits
     // within 32 from the byte-access site. Smaller windows hit the
     // conservative fallback ("all unwritten regs live") prematurely

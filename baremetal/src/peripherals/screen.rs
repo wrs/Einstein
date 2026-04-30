@@ -207,28 +207,75 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
 
     // 1-bpp packing: each byte holds 8 pixels. Src starts at
     // addy + (pixmap_src_top * rowBytes) + (pixmap_src_left / 8).
-    // Newton aligns srcLeft to 8-pixel boundaries on the 320-px
-    // panel; if a future caller breaks that, halt loudly so we can
-    // port Einstein's bit-mask path.
-    if (pixmap_src_left & 0x7) != 0 {
-        kprintln!(
-            "*** screen.blit: src_left {} not 8-pixel aligned (would need bit-mask blit) @PC={:#x}",
-            src_left, pc
-        );
-        cpu::halt();
-    }
-    let src_col0_byte = (pixmap_src_left / 8) as u32;
     let src_width_pixels = (src_right - src_left) as u32;
-    if src_width_pixels & 0x7 != 0 {
-        kprintln!(
-            "*** screen.blit: src width {} px not multiple of 8 @PC={:#x}",
-            src_width_pixels, pc
-        );
-        cpu::halt();
-    }
-    let src_width_bytes = src_width_pixels / 8;
-
     let fb_row_bytes = (SCREEN_WIDTH * SCREEN_BPP) / 8;
+
+    let byte_aligned =
+        (pixmap_src_left & 0x7) == 0 && (src_width_pixels & 0x7) == 0;
+
+    if !byte_aligned {
+        // Non-byte-aligned blit (Newton UI passes sub-byte rects for
+        // text glyphs and small graphics). Per-pixel read/inverted-
+        // write: read source bit, write into the dst byte's matching
+        // bit position. Slow vs Einstein's word-mask Blit_0, but we
+        // run this only on cold-boot UI rendering — correctness is
+        // the priority here, not throughput.
+        let mut copied = 0u32;
+        for row in 0..height {
+            let src_row_pa_off = (pixmap_src_top as u32 + row) * row_bytes;
+            for col_pix in 0..src_width_pixels {
+                let abs_src_pix = pixmap_src_left as u32 + col_pix;
+                let src_va = addy + src_row_pa_off + abs_src_pix / 8;
+                let src_pa = guest_mem::translate_va(src_va).unwrap_or(src_va);
+                let byte = match guest_mem::read_byte_pa(src_pa) {
+                    Some(b) => b,
+                    None => {
+                        kprintln!(
+                            "*** screen.blit: src VA {:#x} → PA {:#x} outside mapped regions",
+                            src_va, src_pa
+                        );
+                        cpu::halt();
+                    }
+                };
+                // Newton 1-bpp BE bit ordering: pixel 0 is bit 7
+                // (MSB) of byte 0. Extract this column's bit, then
+                // INVERT (Newton's 1=pen-pressed → host FB 1=white).
+                let src_bit = (byte >> (7 - (abs_src_pix & 7))) & 1;
+                let fb_bit = src_bit ^ 1;
+
+                let dst_pix = dst_left as u32 + col_pix;
+                let fb_off = (dst_top as u32 + row) * fb_row_bytes + dst_pix / 8;
+                let fb_ipa = guest_mem::FB_IPA_BASE.wrapping_add(fb_off);
+                let mut fb_byte = guest_mem::read_byte_pa(fb_ipa).unwrap_or(0);
+                let bit_pos = 7 - (dst_pix & 7) as u8;
+                let bit_mask = 1u8 << bit_pos;
+                if fb_bit != 0 {
+                    fb_byte |= bit_mask;
+                } else {
+                    fb_byte &= !bit_mask;
+                }
+                if !guest_mem::write_byte_pa(fb_ipa, fb_byte) {
+                    kprintln!(
+                        "*** screen.blit: FB IPA {:#x} outside framebuffer",
+                        fb_ipa
+                    );
+                    cpu::halt();
+                }
+                copied += 1;
+            }
+        }
+        log_blit(pc, addy, row_bytes, height,
+            src_top, src_left, src_bottom, src_right,
+            dst_top, dst_left, dst_bottom, dst_right,
+            copied);
+        crate::fb_dump::mark_dirty();
+        ctx.x[0] = 0;
+        return;
+    }
+
+    // Byte-aligned fast path.
+    let src_col0_byte = (pixmap_src_left / 8) as u32;
+    let src_width_bytes = src_width_pixels / 8;
 
     let mut copied = 0u32;
     for row in 0..height {

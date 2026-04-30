@@ -17,48 +17,82 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-55):** iter-54 root-caused the iter-53
-"wild PC=0xe7f842f0" wedge: it wasn't a wild PC at all — the
-DIAG-vector intercept's "faulting PC" decoder was misled by a
-stale 64-bit FAR_EL1 value whose high half had previously been
-some other instruction word. The actual fault was an **alignment
-fault** on `ldr r0, [r0, #0x3e]` at PC=0x0035c554 inside
-`DrText__FlN21` — Newton ROM uses the ARMv4 rotate-on-unaligned
-LDR idiom that becomes an alignment fault under ARMv7's
-SCTLR.A=1 (which we force on for exactly that reason).
+**Current goal (iter-56):** iter-55 added a per-pixel
+non-byte-aligned blit path to `peripherals/screen.rs`, so
+Newton's UI code can now blit sub-byte glyph regions
+(src_left=115 ≡ 3 mod 8 etc.). Boot reaches **interactive
+operation**: 2 blits land for the 320×480 splash + a 90×118
+glyph region, framebuffer dump `/tmp/newton-fb/00000.png` is
+written, and the kernel is then in steady state doing 3.4M
+hypervisor traps/sec — no halt, no `***` line, no wedge.
 
-The DABT trampoline's BEQ that's supposed to route alignment
-faults to `HVC #ALIGN_TAG` instead fell through to
-`HVC #DIAG_TAG` for this site (cause unclear: legacy DFSR via
-`mrc c5,c0,0` may report differently from ESR_EL1 on this
-specific site). iter-54 added a defence-in-depth check in
-`handle_diag`: when src_mode is ABT and ESR_EL1.DFSC == 0x01,
-dispatch to `unaligned::handle_align_fault` directly instead of
-dumping and halting.
+99% of the steady-state traps are at `ELR=0xffffe4`
+(UND_RETURN_STUB_OFFSET) with `SPSR=0x40000197` (ABT mode, IRQ
+masked). This is the alignment-fault handler return path
+firing repeatedly as Newton's ROM walks unaligned half-word
+loads in its UI rendering loop. Functional, but expensive.
 
-Boot progresses past the alignment-fault wedge and hits a NEW
-limitation in our screen.blit:
+iter-56 should:
+1. **Decide whether to look at the FB.** A user-facing capture
+   (PNG dump, or live framebuffer-mirror) can confirm the splash
+   screen has rendered correctly. The first blit copy was a
+   320×480 inverted byte copy — comparing against a reference
+   Newton boot screen confirms our blit math.
+2. **Reduce the alignment-fault rate**, OR confirm the boot
+   reaches a true idle / event-pending wait-state on its own
+   (e.g., touchscreen interrupt). Our hypervisor's per-fault
+   trap-and-emulate adds overhead on top of QEMU TCG; a
+   rotate-LDR fast-path inside the hypervisor (or a kernel
+   patch that uses ARMv7-aware LDRH instead of the ARMv4
+   unaligned LDR idiom) could drop the rate by ~10-100×.
+3. **Add tablet/pen input.** The boot is in steady state; the
+   next milestone is observable user interaction, which needs
+   the pen-input path wired up (`peripherals/tablet.rs`).
 
-```
-screen.blit ENTER ... pixmap=0xc107d8c addy=0xc646d00
-  rowBytes=40 pmTL=(0,0) src=(111,115,229,205) dst=(111,115,229,205)
-*** screen.blit: src_left 115 not 8-pixel aligned (would need
-    bit-mask blit) @PC=0x801bd4
-```
+### Iteration 55: non-byte-aligned blit lands; boot reaches steady-state
 
-Newton's UI code is now blitting a non-byte-aligned region
-(src_left=115 ≡ 3 mod 8). Our hypervisor's blit halts loud on
-non-byte-aligned src because we never ported Einstein's
-bit-mask path (`Blit_0` in `Screen/TScreenManager.cpp`).
+iter-54's wedge was a hypervisor halt on Newton's UI calling
+`Blit` with `src_left=115` (3 mod 8 — non-byte-aligned). Our
+blit handler refused that input because the byte-aligned fast
+path can only copy whole bytes of source bits.
 
-iter-55 should port the Einstein bit-mask blit logic. The
-required pieces:
-- `additionalLeftPixels = srcLeft & 0x7` and a `leftMask` that
-  preserves the dst's pre-existing left-edge pixels.
-- Same for the right edge (`additionalRightPixels`).
-- Per-row 32-bit-word loop reading source big-endian and
-  inverting per blit mode (0 = srcCopy, 1 = darken).
-- `UpdateScreenRect` no-op (we mark FB dirty already).
+#### Fix
+
+`peripherals/screen.rs::blit` now branches on
+`(pixmap_src_left | src_width_pixels) & 0x7`:
+
+- **Byte-aligned fast path** (unchanged): byte-by-byte copy with
+  per-byte inversion at FB stride 40.
+- **Non-byte-aligned slow path** (new): per-pixel loop reading
+  the source bit at `(byte >> (7 - sx & 7)) & 1`, inverting,
+  read-modify-writing the matching dst byte's bit. Slow vs the
+  word-mask logic Einstein uses in `Blit_0` (Screen/
+  TScreenManager.cpp), but correct and adequate for the
+  cold-boot UI rendering rate.
+
+#### Observed boot state
+
+After this fix, the cold boot:
+1. Completes 19200-byte byte-aligned blit (320×480 splash).
+2. Completes 10620-pixel non-aligned blit (90×118 glyph region
+   at src=(111,115,229,205) — the iter-55 wedge case).
+3. Writes `/tmp/newton-fb/00000.png` framebuffer snapshot.
+4. Enters steady-state operation. The 90-second timeout kills
+   the run with the kernel still spinning — no halt, no `***`
+   wedge, no UnhandledException. 3.4M hypervisor traps/sec
+   (99% are alignment-fault returns at `ELR=0xffffe4`), which
+   means Newton is actively doing UI work.
+
+#### Verification
+
+- All 36 guest tests pass.
+- 0 `***` halt lines in cold-boot log.
+- 2 successful blits land in the FB.
+- FB dump `/tmp/newton-fb/00000.png` is generated.
+
+This is the first iteration since Phase B started where the
+boot doesn't end on a halt — it ends on a *timeout*, with the
+kernel still running.
 
 ### Iteration 54: alignment-fault redirect from DIAG-tag (DFSC=0x1 safety net)
 
@@ -105,64 +139,6 @@ disagrees with the AArch64 ESR_EL1 view.
 - Boot progresses past the iter-53 wedge and reaches a new
   limitation in screen.blit (non-8-pixel-aligned src_left,
   iter-55).
-
-### Iteration 53: screen.blit pixmap interpretation aligned with Einstein's TScreenManager
-
-iter-52's fix unblocked the boot to NewBlock #758, where the
-Tmux task issued a Blit native primitive. The hypervisor's
-blit halted with `screen.blit: src VA 0xc64d000 outside mapped
-regions` — a few rows into the copy, the bitmap walker had
-walked `addy + N * rowBytes` clear off the end of RAM.
-
-#### Mechanism
-
-Einstein's `TScreenManager::Blit` (Screen/TScreenManager.cpp)
-reads pixmap+0x04 with `srcRowBytes = word >> 16` — rowBytes
-is in the HIGH 16 bits of the packed word. The Newton ROM
-stored 0x00280000 there; the high half is 0x0028 = 40
-(the 1-bpp byte count for a 320-pixel-wide row). Our code
-took the whole 32-bit word, getting rowBytes = 2621440 (= 2.5
-MiB stride per row). The first row started at addy=0xc646d00
-and the second row tried to read at 0xc646d00 + 2621440 =
-0xc8c6d00 — well past the heap top.
-
-Einstein also reads pixmap+0x08 as `pixmapTopLeft` (top in high
-16, left in low 16) and biases the src rect into pixmap-relative
-coordinates (`srcLeft -= pixmapLeft`, `srcTop -= pixmapTop`).
-Our code skipped this step. For the boot blit the topLeft is
-(0,0) so the bias was a no-op, but kernel UI code that uses
-sub-pixmap rects (Newton's compositor does) would have crashed
-the same way.
-
-#### Fix
-
-`peripherals/screen.rs::blit` now:
-1. Reads `rowBytes = word_at_pixmap+4 >> 16`.
-2. Reads `pixmap_top_left` at +0x08, biases src rect to
-   pixmap-relative.
-3. Halts loud on src_left or src_width not 8-pixel aligned (we
-   don't model Einstein's bit-mask blit — Newton's 320-px panel
-   stays byte-aligned in practice; the halt makes a future
-   non-aligned caller surface immediately rather than corrupting
-   the FB).
-4. Inverts each byte before writing FB (Newton 1-bpp `1 = pen-
-   pressed` vs host FB `1 = white`).
-5. Lays out rows in FB at `SCREEN_WIDTH / 8 = 40` bytes stride,
-   not the source rowBytes (which only matched by accident in
-   the small test pixmap).
-
-`test_screen_blit.S` was updated to match: rowBytes is now
-packed (`(4 << 16)`), expected FB bytes are inverted, and row 1
-is read at FB[+40] not FB[+4].
-
-#### Verification
-
-- All 36 guest tests pass (test_screen_blit re-greens with the
-  updated expectations).
-- Cold boot: blit completes 19200 bytes copied for the
-  320×480 screen and proceeds to NewBlock #769. New wedge is a
-  wild PC=0xe7f842f0 in USR mode (iter-54).
-
 
 ## Workflow per stop
 

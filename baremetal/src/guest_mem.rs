@@ -1359,6 +1359,35 @@ pub const SBA_POST_TRAMP_NEW_PC_OFFSET: usize = SBA_POST_TRAMP_OFFSET + 0x24;
 ///   +0x10: SPSR_svc
 ///   +0x14: LR_svc
 pub const DABT_TRAMP_OFFSET: usize = 0x00FF_FFA8;
+
+/// iter-59: AArch32-side fast-forward DABT trampoline. Installed in
+/// the head of the SBA stub pool (which has plenty of free space).
+///
+/// Routes by DFSC straight from AArch32 ABT mode without an EL2 round
+/// trip in the common kernel-handled cases:
+///
+///   DFSC == 0x07 (translation, page)     → branch DAH @ 0x00393114
+///   DFSC == 0x0F (permission, page)      → branch DAH @ 0x00393114
+///   DFSC == 0x05 (translation, section)  → branch DAH @ 0x00393114
+///   DFSC == 0x0D (permission, section)   → branch DAH @ 0x00393114
+///   DFSC == 0x06 (access flag, page)     → branch DAH @ 0x00393114
+///   DFSC == 0x03 (access flag, section)  → branch DAH @ 0x00393114
+///   anything else                        → fall through to DABT_TRAMP_OFFSET
+///                                          (slow EL2 path: alignment,
+///                                          domain faults, external
+///                                          aborts, recursive aborts —
+///                                          all rare or halt-worthy)
+///
+/// VA 0x10 branches here instead of directly at DABT_TRAMP_OFFSET so
+/// the fast path doesn't pay the DABT_TRAMP's lr/sp/spsr saves either.
+/// The slow-fall-through invokes the existing DABT_TRAMP_OFFSET (which
+/// does the saves and HVCs into EL2 for the rare cases).
+///
+/// Located in the unused tail between Einstein.rex (ends ~0x847000)
+/// and the tracer trampoline pool (starts at 0x900000). 64 words
+/// reserved; the trampoline body uses ~16.
+pub const DABT_FAST_TRAMP_OFFSET: usize = 0x008F_FF00;
+pub const DABT_FAST_TRAMP_DAH_TARGET: u32 = 0x0039_3114;
 /// 2026-04-28: relocated from PA=0x04005FA0 to IPA=0x0600_F0A0
 /// (last 4 KiB of the SCRATCH_POOL). See `trap::HYP_TRAMP_SCRATCH_BASE`
 /// for the rationale. The same value works pre-MMU and post-MMU,
@@ -1415,9 +1444,14 @@ pub const DABT_SAVE_PA: u32 = crate::trap::HYP_TRAMP_SCRATCH_BASE + 0xA0;
 /// reserved region; caller must own the ROM backing.
 pub unsafe fn patch_dabt_vector(rom_ptr: *mut u32) {
     unsafe {
-        let imm24 = ((DABT_TRAMP_OFFSET as u32).wrapping_sub(0x10 + 8) / 4) & 0x00FF_FFFF;
+        // VA 0x10 → branch to the iter-59 fast trampoline (which
+        // dispatches by DFSC; common cases jump straight to kernel
+        // DAH; uncommon cases fall through to the slow DABT_TRAMP).
+        let imm24 = ((DABT_FAST_TRAMP_OFFSET as u32).wrapping_sub(0x10 + 8) / 4) & 0x00FF_FFFF;
         let branch_insn = 0xEA00_0000 | imm24;
-        rom_ptr.add(4).write(branch_insn);              // 0x10: b DABT_TRAMP_OFFSET
+        rom_ptr.add(4).write(branch_insn);              // 0x10: b DABT_FAST_TRAMP_OFFSET
+
+        install_dabt_fast_trampoline(rom_ptr);
 
         let db = DABT_TRAMP_OFFSET / 4;
         rom_ptr.add(db +  0).write(0xEE0D_0F50);         // mcr p15,0,r0,c13,c0,2
@@ -1435,6 +1469,99 @@ pub unsafe fn patch_dabt_vector(rom_ptr: *mut u32) {
         rom_ptr.add(db + 12).write(0xE140_0173);         // hvc #0x13 (ALIGN_TAG)
         rom_ptr.add(db + 13).write(0xEAFF_FFFE);         // b . (guard)
         rom_ptr.add(db + 14).write(DABT_SAVE_PA);        // literal: SCRATCH_POOL IPA (works pre + post-MMU, see DABT_SAVE_PA comment)
+    }
+}
+
+/// Install the iter-59 fast-forward DABT trampoline at
+/// `DABT_FAST_TRAMP_OFFSET` (in the unused tail between Einstein.rex
+/// and the tracer pool). VA 0x10's branch (set by `patch_dabt_vector`)
+/// targets here. Layout:
+///
+///   ft+0:  mcr p15,0,r0,c13,c0,2     ; TPIDRURW = R0 (save)
+///   ft+1:  mcr p15,0,r1,c13,c0,3     ; TPIDRRO = R1 (save)
+///   ft+2:  mrc p15,0,r0,c5,c0,0      ; R0 = DFSR
+///   ft+3:  and r0, r0, #0xF          ; R0 = DFSC[3:0]
+///   ft+4:  cmp r0, #7                ; translation, page (most common)
+///   ft+5:  beq FAST_FWD              ; → ft+17
+///   ft+6:  cmp r0, #15               ; permission, page
+///   ft+7:  beq FAST_FWD
+///   ft+8:  cmp r0, #5                ; translation, section
+///   ft+9:  beq FAST_FWD
+///   ft+10: cmp r0, #13               ; permission, section
+///   ft+11: beq FAST_FWD
+///   ft+12: cmp r0, #6                ; access flag, page
+///   ft+13: beq FAST_FWD
+///   ft+14: cmp r0, #3                ; access flag, section
+///   ft+15: beq FAST_FWD
+///   ft+16: mrc p15,0,r0,c13,c0,2     ; restore R0 (was clobbered with DFSC)
+///   ft+17: b SLOW_DABT_TRAMP         ; → DABT_TRAMP_OFFSET (slow EL2 path)
+///   ; FAST_FWD:
+///   ft+18: mrc p15,0,r0,c13,c0,2     ; restore R0 from TPIDRURW
+///   ft+19: mrc p15,0,r1,c13,c0,3     ; restore R1 from TPIDRRO
+///   ft+20: ldr pc, [pc, #-4]         ; pc+8-4 = ft+20+4 → literal at ft+21
+///   ft+21: literal: 0x00393114       ; kernel DataAbortHandler VA
+///
+/// 21 words × 4 = 84 bytes; reserved region is 256 bytes so plenty of
+/// slack.
+///
+/// Cost reduction: at iter-58 the DABT trampoline took an EL2 round-
+/// trip on every fault. iter-59 measured 20.8 M HVC #DIAG_TAG hits in
+/// ~30 s of wall (DFSCs 0x07/0x0F dominating, all forwarded to kernel
+/// DAH). Bypassing the EL2 round-trip for those cases is a direct
+/// win — same kernel-side execution, no hypervisor overhead.
+///
+/// SAFETY: writes 21 words in the reserved range
+/// `DABT_FAST_TRAMP_OFFSET .. + 21*4`. Caller owns the ROM backing.
+pub unsafe fn install_dabt_fast_trampoline(rom_ptr: *mut u32) {
+    unsafe {
+        let ft = DABT_FAST_TRAMP_OFFSET / 4;
+
+        // Helper: encode `beq imm24` from offset_within_trampoline `from`
+        // to slot `to`. ARMv7 imm24 is in WORDS, signed; PC-relative target
+        // = (PC + 8) + (imm24 << 2). PC at slot N is `OFFSET + N*4`, so
+        // imm24 = (to - from - 2).
+        let beq = |from: usize, to: usize| -> u32 {
+            let imm24 = ((to as i32) - (from as i32) - 2) as u32 & 0x00FF_FFFF;
+            0x0A00_0000 | imm24
+        };
+        // Helper: encode `b imm24` to a far target (DABT_TRAMP_OFFSET).
+        let b_far = |from_byte_offset: u32, to_byte_offset: u32| -> u32 {
+            let pc_plus_8 = from_byte_offset.wrapping_add(8);
+            let off_bytes = (to_byte_offset as i32) - (pc_plus_8 as i32);
+            let imm24 = ((off_bytes >> 2) as u32) & 0x00FF_FFFF;
+            0xEA00_0000 | imm24
+        };
+
+        // Slot writes:
+        rom_ptr.add(ft +  0).write(0xEE0D_0F50);  // mcr p15,0,r0,c13,c0,2
+        rom_ptr.add(ft +  1).write(0xEE0D_1F70);  // mcr p15,0,r1,c13,c0,3
+        rom_ptr.add(ft +  2).write(0xEE15_0F10);  // mrc p15,0,r0,c5,c0,0
+        rom_ptr.add(ft +  3).write(0xE200_000F);  // and r0, r0, #0xF
+        rom_ptr.add(ft +  4).write(0xE350_0007);  // cmp r0, #7
+        rom_ptr.add(ft +  5).write(beq(5, 18));   // beq FAST_FWD
+        rom_ptr.add(ft +  6).write(0xE350_000F);  // cmp r0, #15
+        rom_ptr.add(ft +  7).write(beq(7, 18));   // beq FAST_FWD
+        rom_ptr.add(ft +  8).write(0xE350_0005);  // cmp r0, #5
+        rom_ptr.add(ft +  9).write(beq(9, 18));   // beq FAST_FWD
+        rom_ptr.add(ft + 10).write(0xE350_000D);  // cmp r0, #13
+        rom_ptr.add(ft + 11).write(beq(11, 18));  // beq FAST_FWD
+        rom_ptr.add(ft + 12).write(0xE350_0006);  // cmp r0, #6
+        rom_ptr.add(ft + 13).write(beq(13, 18));  // beq FAST_FWD
+        rom_ptr.add(ft + 14).write(0xE350_0003);  // cmp r0, #3
+        rom_ptr.add(ft + 15).write(beq(15, 18));  // beq FAST_FWD
+        // Slow-path fall-through: R0 was clobbered with DFSC; restore
+        // it from TPIDRURW so the slow DABT_TRAMP's own `mcr` re-saves
+        // the original value. R1 wasn't clobbered after its save.
+        rom_ptr.add(ft + 16).write(0xEE1D_0F50);  // mrc p15,0,r0,c13,c0,2 (restore R0)
+        rom_ptr.add(ft + 17).write(b_far(
+            (DABT_FAST_TRAMP_OFFSET as u32).wrapping_add(17 * 4),
+            DABT_TRAMP_OFFSET as u32,
+        ));                                        // b SLOW_DABT_TRAMP
+        // FAST_FWD:
+        rom_ptr.add(ft + 18).write(0xEE1D_0F50);  // mrc p15,0,r0,c13,c0,2 (restore R0)
+        rom_ptr.add(ft + 19).write(0xEE1D_1F70);  // mrc p15,0,r1,c13,c0,3 (restore R1)
+        rom_ptr.add(ft + 20).write(0xE51F_F004);  // ldr pc, [pc, #-4]
+        rom_ptr.add(ft + 21).write(DABT_FAST_TRAMP_DAH_TARGET);
     }
 }
 

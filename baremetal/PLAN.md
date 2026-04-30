@@ -17,16 +17,36 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-59):** iter-58 untrapped CP15 cache-by-VA
-maintenance ops (see below). Cold-boot trap rate went from ~91 K/s
-(post-iter-57) to ~430 K/s–1.3 M/s wall-clock — i.e. forward
-progress per second of wall time is now 5–15× higher. Boot still
-gets stuck in DiagBootStub-area work though: 160 M traps in 120 s
-of wall time, 98% beacon-sampled at `ELR=0xffffe4` (alignment-
-fault returns via the rotate-LDR EL2 emulator). Only 2 screen
-blits (splash + sub-region) on the FB. The kernel hasn't reached
-the multitasking phase that NewtonProbe shows for Einstein at
-60 s wall (`pg&e`/`drvr`/`newt`/`Tmux`/`alrt`/`scrn` all alive).
+**Current goal (iter-60):** iter-59 added a per-imm HVC histogram
+diagnostic, which revealed that ~99% of traps were `HVC #DIAG_TAG`
+(20.8 M in 30 s) — kernel DABTs forwarded to `DataAbortHandler`.
+A new AArch32 fast-forward DABT trampoline at
+`DABT_FAST_TRAMP_OFFSET = 0x008F_FF00` now dispatches by DFSC
+without an EL2 round trip for the common kernel-handled cases
+(translation/permission/access-flag faults at section + page).
+Result: cold boot reaches the multitasking phase, with `newt`,
+`OBJM`, `cdfm`, `cdsv`, `PMGR`, `PTBL`, `STKF`, `idle`, `main`
+all alive in the task list. New failure mode: kernel-thrown
+exceptions `evt.ex.abt.bus` (FAR=0x0cd2d000, kernel heap range)
+and `evt.ex.fr.store` reach `UnhandledException` because no
+handler catches them.
+
+Next steps:
+
+1. **Diagnose the bus-abort throws.** FAR=0x0cd2d000 falls in the
+   kernel-VA heap range; `caller_lr=0x002ddefc` is post-
+   `DisposeRefHandle`. Could be: (a) genuine guest bug uncovered
+   by faster boot, (b) our fast-forward not setting up DAH state
+   correctly for some DFSC, (c) stage-2 mapping gap revealed at
+   later boot phase. Walk the throw chain back from
+   `BusFaultMonitor` / `evt.ex.abt.bus` registration.
+2. **Improve rotate-LDR liveness coverage.** 98% of remaining
+   alignment-fault traps (3865/3883) are rejected as
+   `no_dead_scratches`. Adding a ScratchVA fallback would cover
+   them with a per-stub TPIDR-saved scratch, similar to the
+   shadow_stub byte-access path.
+3. **Wire up tablet/pen input** once the `evt.ex.fr.store` is
+   resolved and the boot can quiesce into a true idle.
 
 Next steps:
 
@@ -45,6 +65,85 @@ Next steps:
 4. **Wire up tablet/pen input** once the boot quiesces into a
    true idle wait state — observable user interaction is the
    real Phase B endpoint.
+
+### Iteration 59: AArch32 fast-forward DABT trampoline — boot reaches scheduler
+
+iter-58's HVC-tag histogram diagnostic (added this iteration as
+`trap.rs::dump_hvc_tag_stats`, called every ~2 s from `trap_irq`)
+revealed that ~99% of HVCs were `HVC #DIAG_TAG` (0x11) — kernel
+DABT-vector traps. Each was a full EL2 entry/exit even though
+`handle_diag` just rewrote ELR to forward the fault to the kernel's
+own `DataAbortHandler` at `0x00393114`. The kernel's
+`AddPgPAndPermWithPageTable` (and many other paths) take routine
+translation / permission faults during normal operation; round-
+tripping every one through EL2 was the dominant remaining cost.
+
+#### Fix
+
+New AArch32-side fast-forward trampoline at
+`DABT_FAST_TRAMP_OFFSET = 0x008F_FF00` (in the unused tail
+between Einstein.rex and the tracer trampoline pool). VA 0x10
+now branches here first; the trampoline reads DFSR, masks to
+DFSC[3:0], and dispatches in 4–10 inline instructions:
+
+```
+ft+0:   mcr p15,0,r0,c13,c0,2     ; TPIDRURW = R0 (save)
+ft+1:   mcr p15,0,r1,c13,c0,3     ; TPIDRRO = R1 (save)
+ft+2:   mrc p15,0,r0,c5,c0,0      ; R0 = DFSR
+ft+3:   and r0, r0, #0xF          ; DFSC[3:0]
+ft+4:   cmp r0, #7    \           ; six dispatched values:
+ft+5:   beq FAST_FWD  |             0x07 (translation, page)
+ft+6:   cmp r0, #15   |             0x0F (permission, page)
+ft+7:   beq FAST_FWD  |             0x05 (translation, section)
+ft+8:   cmp r0, #5    |             0x0D (permission, section)
+ft+9:   beq FAST_FWD  |             0x06 (access flag, page)
+ft+10:  cmp r0, #13   |             0x03 (access flag, section)
+ft+11:  beq FAST_FWD  |
+…       …             |
+ft+16:  mrc p15,0,r0,c13,c0,2     ; restore R0 (was clobbered with DFSC)
+ft+17:  b SLOW_DABT_TRAMP         ; uncommon DFSCs → DABT_TRAMP_OFFSET
+ft+18:  mrc p15,0,r0,c13,c0,2     ; FAST_FWD: restore R0
+ft+19:  mrc p15,0,r1,c13,c0,3     ;           restore R1
+ft+20:  ldr pc, [pc, #-4]         ;           jump to DAH
+ft+21:  literal: 0x00393114
+```
+
+For forwardable DFSCs the entire round-trip is ~6 instructions
+of inline AArch32 with no EL2 entry. Other DFSCs (alignment,
+external aborts, etc.) fall through to the existing
+`DABT_TRAMP_OFFSET` slow path.
+
+`trap.rs` gains `dump_hvc_tag_stats` + per-imm histogram
+counters, called from `trap_irq` every ~2 s of wall time
+(independent of the snapshot autosave gating).
+
+#### Verification
+
+- All 36 guest tests pass on QEMU.
+- HVC histogram: `DIAG_TAG=20.8M → 0` between iter-58 and
+  iter-59. `UND_TAG` (byte-access UDF) and `ALIGN_TAG`
+  (rotate-LDR) are now the dominant non-zero entries; the
+  former at ~146 K, the latter at ~3.9 K, both small.
+- Cold boot reaches the multitasking phase. Task dump shows
+  `OBJM`, `idle`, `main`, `cdfm`, `newt` (RUN), `cdsv`, `PMGR`,
+  `PTBL`, `STKF` and others all alive — the same scheduler
+  state Einstein reaches at 60 s wall (per NewtonProbe).
+- New failure: `evt.ex.abt.bus` and `evt.ex.fr.store` thrown
+  by kernel code reach `UnhandledException`. Tracked as the
+  iter-60 starting point.
+
+#### Out of scope (deferred)
+
+- Stub the rotate-LDR `no_dead_scratches` rejection rate (98%)
+  via a ScratchVA fallback like shadow_stub uses for byte
+  accesses. Would cover sites where liveness can't find 2 dead
+  candidates by saving them to a per-stub 8-byte slot in the
+  scratch pool.
+- Refactor `unaligned.rs` and `handle_diag` to read banked
+  LR_abt / SP_abt from `ctx.x[20]` / `ctx.x[21]` instead of
+  the trampoline's `DABT_SAVE_PA` slot, which would let us
+  drop the lr/sp save in the slow `DABT_TRAMP` and make even
+  the slow path leaner.
 
 ### Iteration 58: untrap CP15 cache-by-VA — 5–15× progress speedup
 

@@ -75,6 +75,62 @@ pub const SBA_RETRY_TAG: u32 = 0x14;
 /// device event.
 pub const GPIO_TRIGGER_TAG: u32 = 0x06;
 
+/// iter-59 diagnostic counters: per-immediate HVC histogram (256
+/// slots covering imm[0..256]). Pulled from `trap_irq` every ~2 s of
+/// wall time so we can see which paths dominate the residual trap
+/// rate.
+static HVC_IMM_HIST: [core::sync::atomic::AtomicU64; 256] = {
+    const INIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    [INIT; 256]
+};
+/// Counter for HVCs with imm ≥ 256 (probe HVCs we don't expect to
+/// dominate but want visibility on).
+static HVC_HIGH_HIST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn hvc_count(imm: u32) {
+    use core::sync::atomic::Ordering;
+    if imm < 256 {
+        HVC_IMM_HIST[imm as usize].fetch_add(1, Ordering::Relaxed);
+    } else {
+        HVC_HIGH_HIST.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn dump_hvc_tag_stats() {
+    use core::sync::atomic::Ordering;
+    // Sort top 8 by hit count, dump as "imm=NN n=COUNT" tuples.
+    let mut totals = [0u64; 256];
+    for (i, c) in HVC_IMM_HIST.iter().enumerate() {
+        totals[i] = c.load(Ordering::Relaxed);
+    }
+    let mut indices: [usize; 256] = [0; 256];
+    for i in 0..256 { indices[i] = i; }
+    // Selection sort top 8 (n=256 is small enough).
+    for k in 0..8 {
+        let mut best = k;
+        for j in (k + 1)..256 {
+            if totals[indices[j]] > totals[indices[best]] {
+                best = j;
+            }
+        }
+        indices.swap(k, best);
+    }
+    let high = HVC_HIGH_HIST.load(Ordering::Relaxed);
+    kprintln!(
+        "hvc-imm-hist: top imm[0]=0x{:02x}n={} imm[1]=0x{:02x}n={} imm[2]=0x{:02x}n={} imm[3]=0x{:02x}n={} imm[4]=0x{:02x}n={} imm[5]=0x{:02x}n={} imm[6]=0x{:02x}n={} imm[7]=0x{:02x}n={} (high={})",
+        indices[0], totals[indices[0]],
+        indices[1], totals[indices[1]],
+        indices[2], totals[indices[2]],
+        indices[3], totals[indices[3]],
+        indices[4], totals[indices[4]],
+        indices[5], totals[indices[5]],
+        indices[6], totals[indices[6]],
+        indices[7], totals[indices[7]],
+        high
+    );
+    crate::unaligned_inline::log_stats();
+}
+
 
 /// Generic "inspect-then-halt" HVC immediate, used by temporary
 /// vector-intercept patches during Phase B debugging. When we need to
@@ -359,6 +415,32 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     // src/snapshot.rs.
     crate::snapshot::maybe_autosave(ctx);
     crate::fb_dump::maybe_dump();
+
+    // iter-59 diagnostic: every ~2 s of wall, print HVC-tag counters
+    // so we can see whether the residual trap rate is byte-access
+    // (UND_TAG) or alignment-fault (ALIGN_TAG) dominated. Independent
+    // of snapshot autosave (which is gated when guest_bp is live).
+    {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_DUMP_TICKS: AtomicU64 = AtomicU64::new(0);
+        let now: u64;
+        let freq: u64;
+        // SAFETY: sysreg reads, side-effect free.
+        unsafe {
+            core::arch::asm!("mrs {}, cntpct_el0", out(reg) now,
+                options(nomem, nostack, preserves_flags));
+            core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq,
+                options(nomem, nostack, preserves_flags));
+        }
+        let interval = freq.wrapping_mul(2);  // 2 seconds
+        let next = NEXT_DUMP_TICKS.load(Ordering::Relaxed);
+        if next == 0 {
+            NEXT_DUMP_TICKS.store(now.wrapping_add(interval), Ordering::Relaxed);
+        } else if now >= next {
+            dump_hvc_tag_stats();
+            NEXT_DUMP_TICKS.store(now.wrapping_add(interval), Ordering::Relaxed);
+        }
+    }
 
     // EOI last so the GIC is ready to deliver the next interrupt.
     // No-op on BCM2836.
@@ -1117,6 +1199,8 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
     // Guest-test protocol — see baremetal/guest-tests/README.md.
     let imm = iss & 0xFFFF;
     let r0 = ctx.x[0] as u32;
+    // iter-59 diagnostic: per-imm HVC histogram. See dump_hvc_tag_stats.
+    hvc_count(imm);
     match imm {
         0x01 => {
             // Print one ASCII byte from r0.

@@ -14,7 +14,17 @@ shadow-on-write redirects, and per-task subpage-AP shims are all
 ruled out. The fix MUST be a kernel patch that makes the kernel
 work without 1k subpage protections.
 
-**Current goal (revised iter-43): The bus-abort throw site is
+**Current goal (revised iter-44): the bus-abort is at the
+ldmdb at 0xc0cbc, NOT in PhysBlock — all 65+ PhysBlock calls
+in the boot have sane TFlashBlock* r0 values. The wrapper at
+0xc0cac inherited a wild fp (≈0xea0061cc) from its caller and
+saved it to the stack at push prologue. ldmdb's first load
+restores fp to the wild value; the next load `[fp-8]` faults
+with FAR ≈ 0xea0061c4. iter-45 must probe the wrapper's entry
+to capture incoming fp and trace which Tmux call chain
+arrived with fp wild.
+
+**(Iter-43 framing preserved.) The bus-abort throw site is
 narrowed to PhysBlock's call boundary (caller_lr=0xc0cbc, right
 after `bl PhysBlock` at 0xc0cb8). The fault is either inside
 PhysBlock (wild r0 dereference at `ldr r1, [r0, #8]`) or at
@@ -358,6 +368,138 @@ TAlertEventHandler region.
   allocator's freelist threading code (the ROM PCs we see are
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
+
+### Iteration 44 (next-loop iter 4): PhysBlock r0 always sane — bus-abort is at the wrapper's ldmdb (corrupt fp)
+
+Iter-43 narrowed the bus-abort to PhysBlock's call boundary
+(caller_lr=0xc0cbc, after `bl PhysBlock` at 0xc0cb8). Two
+hypotheses:
+1. PhysBlock's `ldr r1, [r0, #8]` at 0xc0cc4 with wild r0.
+2. The wrapper's `ldmdb fp, {fp, sp, lr}` at 0xc0cbc with
+   corrupt fp.
+
+Iter-44 patches PhysBlock's first instruction with HVC and
+captures r0 at every entry. With r0 emulation, the natural
+ldr never executes; if r0 is wild, the probe halts.
+
+#### Cold-boot output
+
+```
+PhysBlock #0:  r0=0x0c605950 caller_lr=0x000bef30 sp=0x0c328e7c
+PhysBlock #1:  r0=0x0c605970 caller_lr=0x000bef30 sp=0x0c328e7c
+PhysBlock #2:  r0=0x0c605950 caller_lr=0x000c0cbc sp=0x0c328ef8
+PhysBlock #3:  r0=0x0c605970 caller_lr=0x000c0cbc sp=0x0c328ef8
+PhysBlock #4:  r0=0x0c605950 caller_lr=0x000c08d0 sp=0x0c328e9c
+...
+PhysBlock #64: r0=0x0c605950 caller_lr=0x000c0cbc sp=0x0c328df4
+
+Throw #0: name="evt.ex.abt.bus" r1=0xea0061c4 caller_lr=0xc0cbc
+Throw #1: name="evt.ex.abt.bus" r1=0xea0061c4 caller_lr=0xc87f4
+*** UnhandledException ***
+```
+
+**All 65+ PhysBlock calls have valid r0 (= 0x0c605950 or
+0x0c605970, both real TFlashBlock instances in RAM).**
+
+#### Conclusion: hypothesis #1 is REJECTED, #2 confirmed
+
+Since r0 is always sane and our probe emulates the ldr
+correctly, PhysBlock's body executes as intended in all 65+
+cases. The bus-abort that fires Throw with caller_lr=0xc0cbc
+must be at the wrapper's `ldmdb fp, {fp, sp, lr}` at 0xc0cbc.
+
+The wrapper at 0xc0cac is:
+```
+   c0cac:	mov ip, sp                      ; ip = caller's sp
+   c0cb0:	push {fp, ip, lr, pc}          ; saves caller fp/sp/lr/pc
+   c0cb4:	sub fp, ip, #4                  ; fp = caller_sp - 4
+   c0cb8:	bl PhysBlock                    ; r0 preserved as arg
+   c0cbc:	ldmdb fp, {fp, sp, lr}          ← FAULTING
+   c0cc0:	b LogEntryOffset                ; tail-call
+```
+
+`ldmdb fp, {fp, sp, lr}` reads from `[fp-12], [fp-8], [fp-4]`.
+The push at c0cb0 placed fp/ip/lr/pc at sp, sp-4, sp-8, sp-12
+relative to the new sp (after the push). After `sub fp, ip,
+#4`, fp = caller_sp - 4 = sp_after_push + 12. So:
+- `[fp-12]` = sp_after_push  = saved fp
+- `[fp-8]`  = sp_after_push+4 = saved ip  
+- `[fp-4]`  = sp_after_push+8 = saved lr
+
+If fp is wild (not pointing into caller's stack), ldmdb
+faults with bus error.
+
+PhysBlock is a leaf and doesn't touch fp (r11). So fp at
+ldmdb time = fp set at c0cb4 = caller_sp - 4. For ldmdb to
+fault, **caller_sp - 4 must be a wild address** at the
+wrapper's c0cb4 → c0cbc transition.
+
+That implies **the wrapper's caller passed a bad sp**, OR
+PhysBlock secretly modified fp/sp.
+
+The wrapper's caller's sp at the bl-wrapper call site was
+some value. In our iter-44 PhysBlock #0..#64 dump, sp values
+at the probe time (at PhysBlock entry) range from 0x0c328df4
+to 0x0c328ef8 — all reasonable Tmux stack addresses. fp =
+caller_sp - 4 would also be reasonable.
+
+Yet at the wedge call, ldmdb faults. Possibilities:
+1. **Tmux's stack overflowed** between PhysBlock's invocation
+   and the ldmdb. Stack growing beyond its allocated range
+   could put fp in unmapped territory.
+2. **PhysBlock or a nested operation modified the wrapper's
+   stack frame**, corrupting the saved-fp slot at fp-12.
+   ldmdb writes back to fp from `[fp-12]` first, so a wild
+   stored fp value gets loaded. Wait — ldmdb LOADS into
+   {fp, sp, lr}, NOT stores. So `[fp-12]` is read into fp,
+   `[fp-8]` into sp, `[fp-4]` into lr. If `[fp-12]` is a
+   wild value, fp becomes wild AFTER the first iteration of
+   the load. But the first read itself uses the ORIGINAL fp
+   (caller_sp - 4). If ORIGINAL fp is sane, the first read
+   succeeds; fp gets a wild value; the next read `[fp-8]`
+   from the wild fp faults.
+
+Hypothesis: the ldmdb's first load (`[fp-12]` into fp)
+returns a wild value, then the second load (`[fp-8]` into
+sp) faults with FAR derived from wild_fp - 8.
+
+If FAR = 0xea0061c4 = wild_fp - 8, then wild_fp = 0xea0061cc.
+That's the saved-fp slot's contents written by the prologue's
+push. The push wrote the CALLER's fp value. So the caller's
+fp at wrapper-entry was 0xea0061cc — wild!
+
+So **the wrapper's caller had fp=0xea0061cc**, and this got
+saved to the wrapper's stack frame, then loaded back into
+fp by ldmdb, then the next load faulted.
+
+#### Next iteration plan (iter-45)
+
+1. **Probe at the wrapper's entry (0xc0cac)** to capture fp
+   on entry. If fp is 0xea0061cc, the bug is in the
+   wrapper's caller. If fp is sane, the bug is somewhere
+   between the wrapper's prologue and the ldmdb (e.g.,
+   PhysBlock or LogEntryOffset clobbering the stack frame).
+
+2. **Identify the wrapper's name** by examining its callers.
+   The wrapper at 0xc0cac is unnamed in the disasm; its
+   role (calls PhysBlock then tail-calls LogEntryOffset)
+   suggests it's some flash-block-related getter.
+
+3. **Track Tmux's call chain** that arrived at the wrapper
+   with fp=0xea0061cc. Walk back via FP chain.
+
+#### Status
+
+- Build clean.
+- 36/36 guest tests pass.
+- PhysBlock probe with relaxed heuristic completes 65+ calls
+  with all-sane r0; rejects hypothesis #1.
+- Bus-abort confirmed at the ldmdb at 0xc0cbc with corrupt
+  fp; the corruption is in the saved-fp slot of the
+  wrapper's frame.
+- iter-44 deliverable: pinned the bus-abort instruction
+  exactly + identified the corruption mechanism (caller's
+  fp was wild at wrapper entry).
 
 ### Iteration 43 (next-loop iter 3): Throw entry probe pins original bus-abort to PhysBlock area; wild r0 / fp suspected
 

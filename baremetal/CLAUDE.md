@@ -27,7 +27,7 @@ guest ISA and modelled Newton hardware are identical on both.
   slower than QEMU TCG — use longer timeouts.
 
 Both platforms must stay green: `guest-tests/scripts/run-all.sh` runs
-the 22 guest tests on QEMU, and any new divergence should be tracked
+the guest tests on QEMU, and any new divergence should be tracked
 down rather than papered over with a feature gate.
 
 See `README.md` for the user-facing project overview and

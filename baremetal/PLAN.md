@@ -14,7 +14,20 @@ shadow-on-write redirects, and per-task subpage-AP shims are all
 ruled out. The fix MUST be a kernel patch that makes the kernel
 work without 1k subpage protections.
 
-**Current goal (revised iter-38): wedge mechanism confirmed —
+**Current goal (revised iter-39): the shadow_stub byte-access
+emulator at 0x001488ac (patched `ldrb r1, [r1, #61]` → `b 0x00E97FC0`)
+is the prime suspect for r3 corruption. FindSuperceeder enters with
+r1=0x0c328e90 (sane); after `mov r3, r1`, r3=0x0c328e90; but Lookup
+sees r3=0x80000110 by the time control reaches its first instruction.
+The pattern 0x80000110 = (0x80000000 | 0x110) where 0x110 is
+SPSR_und's stored value (USR + I-bit) hints that the
+shadow_stub stub or its SBA pre-fault retry path is leaking the
+saved CPSR into r3 during DABT recovery. iter-40 must probe at
+0x001488c4 (after the byte-access emulation, before the chain
+to Lookup) to confirm where r3 becomes wild, then inspect/fix
+the shadow_stub stub's caller-save preservation.
+
+**(Iter-38 framing preserved.) Wedge mechanism confirmed —
 Lookup's r3 is genuinely 0x80000110 entering from DoCommit's
 c96c8 path. Iter-38's entry-side ring probe captured 19 normal
 Lookup calls before the wedge call (#19, lr=0xc96cc) with
@@ -303,6 +316,133 @@ TAlertEventHandler region.
   allocator's freelist threading code (the ROM PCs we see are
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
+
+### Iteration 39 (next-loop iter 35): bisection — FindSuperceeder entry r1=sane, but Lookup sees r3 wild; shadow_stub stub at 0x001488ac is the prime suspect
+
+Iter-38's contradiction: Lookup's r3=0x80000110 vs DoCommit's
+expected `add r1, sp, #120` = 0x0c328e90. Iter-39 added an
+entry-side probe at FindSuperceeder (HVC #0x6D at 0x001488A0)
+to bisect.
+
+#### Implementation
+
+- New `FINDSUPER_ENTRY_PROBE_HVC_IMM = 0x6D` constant.
+- Patch FindSuperceeder's first insn (`mov r3, r1` =
+  0xE1A0_3001) at 0x001488A0 with HVC.
+- `handle_findsuper_entry_probe` captures (r0..r3, lr, sp)
+  in a 32-slot ring; emulates `mov r3, r1` (`ctx.x[3] = r1`).
+- Diagnostic post-write print verifies the ctx modification
+  takes effect.
+- Cross-correlation print in the Lookup probe captures the
+  paired call (lr=0xc96cc) AND dumps the bytes at the relevant
+  thunks and FindSuperceeder body.
+
+#### Cold-boot output (the smoking-gun comparison)
+
+```
+FindSuperceeder #0: r0=0x0c328eac r1=0x0c328e90 r3_in=0x00000000
+                    lr=0x000c96cc sp=0x0c328e18 mode=0x10
+FindSuperceeder #0 POST-emul: ctx.x[3]=0x0c328e90
+                              (should == r1=0x0c328e90)  ← ✓ propagated
+Lookup ENTRY (from c96cc tail-call): seq=#19
+    r3=0x80000110  ← STILL WILD
+    r0=0x0c604c04 r1=0x00000027
+
+  Reading guest memory at suspect locations:
+    [thunk]   @VA=0x01af8c14 = 0xea993f21      ← b 0x001488a0  ✓ (default)
+    [thunk]   @VA=0x01af8c18 = 0xea973d79
+    [body]    @VA=0x001488a0 = 0xe140067d      ← our HVC #0x6D probe
+    [body]    @VA=0x001488a4 = 0xe5901010      ← ldr r1, [r0, #16] ✓
+    [body]    @VA=0x001488a8 = 0xe1a0c001      ← mov ip, r1 ✓
+    [body]    @VA=0x001488ac = 0xea353dc3      ← b 0x00E97FC0  ★ SHADOW_STUB PATCH
+    [body]    @VA=0x001488b0 = 0xe3310000      ← teq r1, #0 ✓
+    [body]    @VA=0x001488b4 = 0x03a0200d      ← moveq r2, #13 ✓
+    [body]    @VA=0x001488b8 = 0x13a02006      ← movne r2, #6 ✓
+    [body]    @VA=0x001488bc = 0xe5900000      ← ldr r0, [r0] ✓
+    [body]    @VA=0x001488c0 = 0xe3c0120f      ← bic r1, r0, #f0000000 ✓
+    [body]    @VA=0x001488c4 = 0xe1a0000c      ← mov r0, ip ✓
+    [body]    @VA=0x001488c8 = 0xea66d9a8      ← b 0x01afef70 ✓
+    [body]    @VA=0x001488cc = 0xe1a0c00d      ← (next fn's mov ip, sp)
+    [LUthunk] @VA=0x01afef70 = 0xea972141      ← b 0x000c747c  ✓ (default)
+```
+
+#### Findings
+
+1. **r1 entering FindSuperceeder = 0x0c328e90** (sane stack
+   address; matches DoCommit's `add r1, sp, #120`).
+2. **Our `mov r3, r1` emulation propagates correctly**:
+   POST-emul print confirms `ctx.x[3] = 0x0c328e90`. The
+   AArch64→AArch32 ERET path (vectors.s `restore_context_and_eret`
+   → UND-return stub `movs pc, lr`) preserves X3 → R3_usr.
+3. **The thunk at 0x01af8c14 is unpatched**: bytes match the
+   default `b 0x001488a0` redirect. Same for the Lookup thunk
+   at 0x01afef70.
+4. **★ The instruction at 0x001488ac has been patched by
+   shadow_stub** to `b 0x00E97FC0`. The original was
+   `ldrb r1, [r1, #61]` = `0xE5D1_103D` (a byte access into
+   `[store + 61]` to read a flag byte). Shadow_stub redirects
+   byte-access sites to inline emulation stubs.
+5. The instructions BEFORE 1488ac (1488a4..1488a8) and AFTER
+   (1488b0..1488c8) are intact per disassembly.
+
+#### Hypothesis
+
+The shadow_stub inline emulation stub at 0x00E97FC0 (or its
+DABT-fault recovery path) is **clobbering r3** during the
+byte-access emulation for `ldrb r1, [r1, #61]`. Per APCS r3
+is caller-saved (volatile), so the kernel's DABT handler is
+not strictly required to preserve r3 across a fault — but
+shadow_stub's emulator is operating SYNCHRONOUSLY with the
+caller's register state, so any clobber is a stub bug.
+
+The wild value 0x80000110 looks like:
+- `0x80000000` (sign-bit set) `+ 0x110`
+- `0x110` is exactly the value of CPSR for USR mode +
+  IRQ-disabled (= `mode=USR | I-bit`). One of the trampoline
+  / DABT-handler save areas might leak the saved CPSR into r3.
+
+#### Next iteration plan (iter-40)
+
+1. **Capture r3 at 1488c4** (`mov r0, ip` = 0xE1A0_000C).
+   Replace with HVC; emulate via `ctx.x[0] = ctx.x[12]`.
+   This pins whether r3 was already wild AFTER shadow_stub's
+   stub returns vs. before the b 0x01afef70 chain.
+
+2. **Inspect the shadow_stub inline stub at 0x00E97FC0**
+   to see whether it touches r3. Look for any path that
+   stores the saved CPSR into r3 (matching 0x80000110 =
+   0x80000000 | 0x110).
+
+3. **Cross-check the SBA pre-fault stub** at
+   `SBA_PREFAULT_STUB_OFFSET` (which the inline stub jumps
+   to on EA-page fault for kernel-side fixup retry). The
+   `ldrb r0, [r0]; hvc #0x14; b .` sequence handles UND
+   re-entry; the kernel's DABT handler runs in between and
+   may not preserve r3.
+
+4. **If shadow_stub IS the culprit**, fix the stub's
+   register preservation: the emulator must save r3 (and any
+   other caller-save reg it transiently uses) before emulating,
+   restore on return. Per APCS the kernel's DABT handler
+   is allowed to clobber r0..r3, but shadow_stub treats
+   itself as an in-line emulator and so MUST preserve all
+   GPRs of the original instruction's surrounding context.
+
+#### Status
+
+- Build clean.
+- Probe HVC #0x6D at FindSuperceeder entry fires, captures
+  r1=0x0c328e90 (sane).
+- ctx.x[3] modification verified to propagate.
+- Anomaly localized to FindSuperceeder body's 1488a4..1488c8
+  range; shadow_stub's `b` redirect at 1488ac is the prime
+  suspect.
+- 30/30 shadow_stub tests pass — the existing test coverage
+  doesn't exercise this specific failure mode (DABT-recovery
+  with caller's r3 preservation).
+- Iter-39 deliverable: bisected the OUT-param corruption to
+  inside FindSuperceeder body, identified shadow_stub as the
+  likely vehicle for the 0x80000110 value.
 
 ### Iteration 38 (next-loop iter 34): Lookup-entry ring probe confirms wild r3=0x80000110 — sp consistent, OUT-param mystery deepens
 

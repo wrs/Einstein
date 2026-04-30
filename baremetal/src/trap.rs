@@ -1344,6 +1344,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::LOOKUP_ENTRY_PROBE_HVC_IMM => {
             handle_lookup_entry_probe(ctx);
         }
+        v if v == crate::rom_patches::FINDSUPER_ENTRY_PROBE_HVC_IMM => {
+            handle_findsuper_entry_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1949,6 +1952,11 @@ fn handle_und(ctx: &mut TrapContext) {
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::FINDSUPER_ENTRY_PROBE_HVC_IMM) => {
+            handle_findsuper_entry_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::DAH_USR_RETURN_PROBE_HVC_IMM) => {
             // The DAH USR-return probe lives inside DataAbortHandler,
             // which only ever runs from ABT mode — not from USR. So the
@@ -2550,6 +2558,42 @@ fn handle_lookup_entry_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
     let r1 = ctx.x[1] as u32;
     let r2 = ctx.x[2] as u32;
     let r3 = ctx.x[3] as u32;
+    // Diagnostic: log when called from FindSuperceeder's tail-call site
+    // (lr=0xc96cc) so we can compare with the FindSuperceeder probe's
+    // POST-emul r3 value. Also dump the thunk and FindSuperceeder body
+    // bytes to verify nothing has been runtime-patched.
+    let lr_check = crate::banked::lr_for_mode(ctx, source_cpsr);
+    if lr_check == 0x000c96cc {
+        kprintln!(
+            "Lookup ENTRY (from c96cc tail-call): seq=#{} r3={:#010x} r0={:#010x} r1={:#010x}",
+            seq, r3, r0, r1,
+        );
+        kprintln!("  Reading guest memory at suspect locations:");
+        // FindSuperceeder thunk at 0x01af8c14 — should be `b 0x001488a0`
+        for off in 0..2u32 {
+            let va = 0x01af8c14u32.wrapping_add(off * 4);
+            match guest_mem::read_word_va(va) {
+                Some(w) => kprintln!("    [thunk]  @VA={:#010x} = {:#010x}", va, w),
+                None    => kprintln!("    [thunk]  @VA={:#010x} = (unmapped)", va),
+            }
+        }
+        // FindSuperceeder body at 0x001488a0..0x001488cc
+        for off in 0..12u32 {
+            let va = 0x001488a0u32.wrapping_add(off * 4);
+            match guest_mem::read_word_va(va) {
+                Some(w) => kprintln!("    [body]   @VA={:#010x} = {:#010x}", va, w),
+                None    => kprintln!("    [body]   @VA={:#010x} = (unmapped)", va),
+            }
+        }
+        // Lookup thunk at 0x01afef70 — should be `b 0x000c747c`
+        for off in 0..2u32 {
+            let va = 0x01afef70u32.wrapping_add(off * 4);
+            match guest_mem::read_word_va(va) {
+                Some(w) => kprintln!("    [LUthunk]@VA={:#010x} = {:#010x}", va, w),
+                None    => kprintln!("    [LUthunk]@VA={:#010x} = (unmapped)", va),
+            }
+        }
+    }
     let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
     let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
     let mode = source_cpsr & 0x1F;
@@ -2607,6 +2651,123 @@ fn handle_lookup_entry_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
 
     // Emulate `mov ip, sp`.
     ctx.x[12] = sp as u64;
+}
+
+/// Iter-39: ring-buffer probe at `FindSuperceeder` entry
+/// (ROM 0x0014_88A0). Bisects the iter-38 OUT-param mismatch: if
+/// r1 entering FindSuperceeder is already 0x80000110-family
+/// (bit-31 set), the wild value originated in DoCommit's r1 setup
+/// at c96c0; if r1 is a normal stack address but Lookup's r3
+/// later sees the wild value, FindSuperceeder's body is somehow
+/// modifying r3.
+const FINDSUPER_RING_SLOTS: usize = 32;
+#[derive(Clone, Copy)]
+struct FindSuperRingEntry {
+    seq: u32,
+    r0: u32,
+    r1: u32,
+    r2: u32,
+    r3: u32,
+    lr: u32,
+    sp: u32,
+    mode: u32,
+}
+static mut FINDSUPER_RING: [FindSuperRingEntry; FINDSUPER_RING_SLOTS] = [FindSuperRingEntry {
+    seq: 0, r0: 0, r1: 0, r2: 0, r3: 0, lr: 0, sp: 0, mode: 0,
+}; FINDSUPER_RING_SLOTS];
+static FINDSUPER_SEQ: AtomicU32 = AtomicU32::new(0);
+
+fn handle_findsuper_entry_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_findsuper_entry_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_findsuper_entry_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    let seq = FINDSUPER_SEQ.fetch_add(1, Ordering::Relaxed);
+    let r0 = ctx.x[0] as u32;
+    let r1 = ctx.x[1] as u32;
+    let r2 = ctx.x[2] as u32;
+    let r3 = ctx.x[3] as u32;
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+    let mode = source_cpsr & 0x1F;
+
+    let entry = FindSuperRingEntry { seq, r0, r1, r2, r3, lr, sp, mode };
+    // SAFETY: single-threaded EL2 trap path.
+    unsafe {
+        FINDSUPER_RING[(seq as usize) % FINDSUPER_RING_SLOTS] = entry;
+    }
+
+    let r1_wild = (r1 & 0x8000_0000) != 0;
+
+    if r1_wild {
+        halt_invariant("FindSuperceeder called with wild &TObjRef OUT param (bit-31 r1)", || {
+            kprintln!(
+                "  WILD CALL: seq=#{} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}",
+                seq, r0, r1, r2, r3,
+            );
+            kprintln!(
+                "  caller_lr={:#010x}  sp={:#010x}  src_mode={} ({:#x})",
+                lr, sp, describe_aarch32_mode(mode), mode,
+            );
+            kprintln!();
+            kprintln!("  FindSuperceeder ring (last {} calls, oldest first):", FINDSUPER_RING_SLOTS);
+            // SAFETY: single-threaded.
+            unsafe {
+                let total = (seq + 1) as usize;
+                let count = total.min(FINDSUPER_RING_SLOTS);
+                let start = if total <= FINDSUPER_RING_SLOTS { 0 } else { total - FINDSUPER_RING_SLOTS };
+                for i in 0..count {
+                    let s = start + i;
+                    let e = FINDSUPER_RING[s % FINDSUPER_RING_SLOTS];
+                    let mark = if e.seq == seq { " ← WEDGE" } else { "" };
+                    kprintln!(
+                        "    [#{:3}] r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} lr={:#010x} sp={:#010x} mode={:#x}{}",
+                        e.seq, e.r0, e.r1, e.r2, e.r3, e.lr, e.sp, e.mode, mark,
+                    );
+                }
+            }
+
+            // Tmux's user stack window around DoCommit's locals.
+            // We expect [sp+120] (= sp+0x78) and [sp+148] (= sp+0x94)
+            // to hold the TObjRef OUT params. Dump 64 words from sp.
+            kprintln!();
+            kprintln!("  caller-mode (DoCommit) stack window from sp={:#010x} (64 words):", sp);
+            for i in 0..64u32 {
+                let off = i * 4;
+                let va = sp.wrapping_add(off);
+                let label = match off {
+                    0x78 => "  ← DoCommit's [sp+120] (= 2nd TObjRef OUT)",
+                    0x94 => "  ← DoCommit's [sp+148] (= 1st TObjRef self)",
+                    0xa4 => "  ← DoCommit's [sp+164] (= TFlashStore* this)",
+                    _    => "",
+                };
+                match guest_mem::read_word_va(va) {
+                    Some(w) => kprintln!("    sp+{:#04x} @{:#010x} = {:#010x}{}", off, va, w, label),
+                    None    => kprintln!("    sp+{:#04x} @{:#010x} = (unmapped){}", off, va, label),
+                }
+            }
+        });
+    }
+
+    // Periodic logging for non-wedge calls.
+    if seq < 8 || seq % 64 == 0 {
+        kprintln!(
+            "FindSuperceeder #{}: r0={:#010x} r1={:#010x} r3_in={:#010x} lr={:#010x} sp={:#010x} mode={:#x}",
+            seq, r0, r1, r3, lr, sp, mode,
+        );
+    }
+
+    // Emulate `mov r3, r1`.
+    ctx.x[3] = r1 as u64;
+
+    // Diagnostic: verify the ctx write took effect.
+    if seq < 8 {
+        kprintln!(
+            "FindSuperceeder #{} POST-emul: ctx.x[3]={:#010x} (should == r1={:#010x})",
+            seq, ctx.x[3] as u32, r1,
+        );
+    }
 }
 
 fn handle_reboot(ctx: &TrapContext) -> ! {

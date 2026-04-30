@@ -2284,12 +2284,48 @@ fn handle_reboot(ctx: &TrapContext) -> ! {
         ctx.x[12] as u32, describe_aarch32_mode(mode), caller_lr
     );
 
-    // Iter-33: when called from UND mode (the typical
-    // UnhandledException → Reboot path), walk SP_und (= ctx.x[23]
-    // per Table D1-79) for ~16 words. APCS frames keep saved-LR
-    // at fp-4 / fp-8; we don't decode them structurally here, just
-    // dump the raw words so symbol resolution against rom.dis can
-    // find the user-mode caller chain.
+    // Iter-34: SPSR_EL2 mode=UND is the TRAMPOLINE'S mode (HVC
+    // was issued from the UND-mode trampoline at 0xFFFF54), not
+    // the original caller's. The trampoline saves the source CPSR
+    // to UND_SAVE_SPSR_IPA. Read it to recover the actual caller
+    // mode and banked LR.
+    let trampoline_saved_spsr = guest_mem::read_word_pa(UND_SAVE_SPSR_IPA).unwrap_or(0);
+    let true_source_mode = (trampoline_saved_spsr & 0x1F) as u32;
+    let true_caller_lr = crate::banked::lr_for_mode(ctx, trampoline_saved_spsr);
+    kprintln!();
+    kprintln!(
+        "  TRUE source CPSR={:#010x} mode={} ({:#x})  TRUE caller LR={:#010x}",
+        trampoline_saved_spsr,
+        describe_aarch32_mode(true_source_mode),
+        true_source_mode,
+        true_caller_lr,
+    );
+    kprintln!(
+        "  (LR_und=0x{:08x} above is the trampoline's bookkeeping, not the caller.)",
+        ctx.x[22] as u32,
+    );
+
+    // The original-mode SP gives the call stack. For USR/SVC etc.
+    // ctx.x[13] is the active SP slot per Table D1-79.
+    let true_source_sp = crate::banked::sp_for_mode(ctx, trampoline_saved_spsr);
+    kprintln!(
+        "  TRUE source SP_{}={:#010x}",
+        describe_aarch32_mode(true_source_mode),
+        true_source_sp,
+    );
+    kprintln!();
+    kprintln!("  TRUE source-mode stack (16 words from {:#010x}):", true_source_sp);
+    for i in 0..16 {
+        let va = true_source_sp.wrapping_add(i * 4);
+        match guest_mem::read_word_va(va) {
+            Some(w) => kprintln!("    [{:+3}] @{:#010x} = {:#010x}", (i * 4) as i32, va, w),
+            None    => kprintln!("    [{:+3}] @{:#010x} = (unmapped)", (i * 4) as i32, va),
+        }
+    }
+
+    // Keep the SP_und dump (under the original `if mode == 0x1B`)
+    // for backward compatibility — useful when the trampoline path
+    // happens to push something there.
     if mode == 0x1B {
         let sp_und = ctx.x[23] as u32;
         kprintln!();

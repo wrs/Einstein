@@ -14,7 +14,25 @@ shadow-on-write redirects, and per-task subpage-AP shims are all
 ruled out. The fix MUST be a kernel patch that makes the kernel
 work without 1k subpage protections.
 
-**Current goal: validated by iter-30 — the 4-KiB-page phase-B
+**Current goal: pin the permission DABT that's tripping
+UnhandledException. Iter-34 cracked the wedge open: the stack at
+the canary's TRUE source SP_USR (decoded by reading
+UND_SAVE_SPSR_IPA to recover the trampoline-hidden source mode)
+contains the ASCII string "Unhandled exception evt.ex.abt.perm,
+warm reboot!". The kernel hit a permission DABT it couldn't
+recover from and called UnhandledException → Reboot. This
+directly implicates the iter-3 AP-flatten step: with 1 KiB
+subpage AP overlay removed, the kernel sees AP=011 (RW/RW)
+grants where it expected per-subpage no-access. Iter-35+ should
+chase the actual fault: capture the FAR/ELR/insn of the
+permission DABT that triggered UnhandledException, decode the
+faulting access, and decide whether to (a) restore subpage
+isolation via stage-2 splitting at the offending VA, (b) patch
+the kernel allocator at the alloc site that produced the
+overlapping mapping, or (c) re-instate kernel-intent classifier
+output as a runtime gating layer.**
+
+(Earlier formulation:) Iter-30 — the 4-KiB-page phase-B
 hypothesis HOLDS for the heap allocator and stack allocator at
 the invariant level. After 30 iterations of microscope-mode
 fault chasing, iter-30 stepped back to test the actual
@@ -247,6 +265,113 @@ TAlertEventHandler region.
   allocator's freelist threading code (the ROM PCs we see are
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
+
+### Iteration 34 (next-loop iter 30): TRUE caller decoded — wedge is "evt.ex.abt.perm" UnhandledException
+
+Iter-33 enhanced the canary handler with SP_und + R0 + R3
+dumps but mis-identified the source mode as UND. The mode bits
+in SPSR_EL2 reflect the TRAMPOLINE'S mode (the UND trampoline
+issues HVC #UND_TAG from UND mode), not the original caller's
+mode. Iter-34 fixes this by reading the trampoline-saved CPSR
+from `UND_SAVE_SPSR_IPA` and using THAT to look up the true
+banked LR / SP / mode.
+
+#### Cold-boot output, iter-34
+
+```
+*** Reboot canary fired ***
+  ELR_EL2  = 0x00ffff58  SPSR_EL2 = 0x000001db  mode=UND (trampoline)
+  R14_UND = 0x000d9888  (trampoline bookkeeping, not caller)
+
+  TRUE source CPSR = 0x60000110  mode=USR (0x10)
+  TRUE caller LR   = 0x000b02c0  (= 0xb02bc + 4, caller is the function at 0xb0220)
+  TRUE source SP_usr = 0x0cc77cc8
+
+  TRUE source-mode stack (16 words from 0x0cc77cc8):
+    [+0]  = 0x556e6861  ("Unha")
+    [+4]  = 0x6e646c65  ("ndle")
+    [+8]  = 0x64206578  ("d ex")
+    [+12] = 0x63657074  ("cept")
+    [+16] = 0x696f6e20  ("ion ")
+    [+20] = 0x6576742e  ("evt.")
+    [+24] = 0x65782e61  ("ex.a")
+    [+28] = 0x62742e70  ("bt.p")
+    [+32] = 0x65726d2c  ("erm,")
+    [+36] = 0x20776172  (" war")
+    [+40] = 0x6d207265  ("m re")
+    [+44] = 0x626f6f74  ("boot")
+    [+48] = 0x21001318  ("!\0..")
+```
+
+**Decoded ASCII: `"Unhandled exception evt.ex.abt.perm, warm reboot!"`**
+
+`evt.ex.abt.perm` is NewtonOS's exception identifier for
+**data-abort permission fault** (event → exception → abort →
+permission). The kernel hit a permission DABT the recovery
+path couldn't handle, so it routed to UnhandledException which
+chose "warm reboot" as the action. The caller LR `0x000b02c0`
+is right after `bl Reboot at 0xb02bc`, which is inside
+`UnhandledException__FPcPvPFPv_v` at ROM 0x000b0220.
+
+#### Why this matters
+
+The wedge is now directly implicated in the iter-3 AP-flatten
+step. The phase-B hypothesis was: with 1 KiB subpage AP overlay
+removed and replaced with flat AP=011 (RW/RW), the kernel
+won't notice the difference because its allocators have been
+patched to operate at 4 KiB granularity. Iter-30 verified the
+ALLOCATOR-side invariants hold. But the KERNEL'S RUNTIME ACCESS
+PATTERNS apparently still depend on per-subpage AP differences:
+some 1-KiB region used to be no-access for the current task, but
+post-flatten the whole 4-KiB page is RW. The kernel either:
+
+a. Hits a permission DABT because we patched the AP "less
+   restrictively" than it expected, and the kernel's recovery
+   logic interprets that AP shape as "this shouldn't be writable
+   at all".
+b. Or, more likely, hits a permission DABT because the AP shape
+   is now uniform-RW and the kernel's monitor/ACL-check finds
+   a violation it can't reconcile.
+
+#### Next iteration plan (iter-35)
+
+1. **Capture the underlying permission DABT.** Add an HVC tripwire
+   at the kernel's DABT-entry path (the existing
+   `DAH_MRS_SPSR_HVC_IMM` probe at 0x00393144 already runs once
+   per DABT) that captures `(FAR, DFSR, ELR, AP-of-faulting-page)`
+   into a ring buffer. When the canary fires, dump the last few
+   ring entries — the most recent permission-DABT entry IS the
+   one that escalated to UnhandledException.
+
+2. **Decode the AP shape at the faulting VA.** Walk stage-1 to
+   recover the L2 entry for the FAR VA. Read its 4 1-KiB AP
+   subfields (bits [11:10], [9:8], [7:6], [5:4]) and the page-
+   level AP (bits [5:4]). Print all five so we can see which
+   subpage's access permissions the kernel was checking.
+
+3. **Cross-reference with `kernel_intent_mask_for(pa, va)`.** The
+   Prim Remember tracker already records the kernel-intent mask
+   for each (PA, VA). If the faulting VA has tracker output, we
+   can see whether the AP-flatten step removed a no-access
+   subpage that the kernel still expects.
+
+If the FAR is in a Group-1 alias range (PAs 0x04004000 /
+0x04005000 / 0x04006000 — the kernel exception-stack pages),
+the fix path is stage-2 splitting (reinstate per-subpage AP via
+shadow PA aliasing). If it's in heap or stack range, the fix is
+likely a kernel-allocator patch.
+
+#### Status
+
+- Build clean.
+- True caller ID'd: `UnhandledException__FPcPvPFPv_v` at
+  ROM 0x000b0220, called from a permission DABT path.
+- Exception name: `"evt.ex.abt.perm"` — data-abort permission
+  fault.
+- 30/30 shadow_stub tests pass.
+- Iter-34 deliverable: trampoline-hidden caller decoded, wedge
+  identified as permission-DABT escalation, iter-35 plan
+  scoped to capture the underlying fault.
 
 ### Iteration 33 (next-loop iter 29): enhanced canary dump pins Reboot caller to GenericSWIHandler
 

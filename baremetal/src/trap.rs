@@ -4116,13 +4116,33 @@ fn handle_stack_mgr_fault_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
     let mode = source_cpsr & 0x1F;
     let manager = ctx.x[0] as u32;
     let proc_state = ctx.x[1] as u32;
-    let saved_pc = guest_mem::read_word_va(proc_state.wrapping_add(0x40)).unwrap_or(0xDEAD_BEEF);
+    // procst layout (per docs/STRUCTURES.md): +0x00..+0x3F is the
+    // 16-word saved register file (r0..r15), +0x40 saved CPSR, +0x44
+    // FAR, +0x48 DFSR, +0x50 saved_sp_usr, +0x5c status. The faulting
+    // instruction's PC is the saved r15 at +0x3C.
+    let saved_cpsr = guest_mem::read_word_va(proc_state.wrapping_add(0x40)).unwrap_or(0xDEAD_BEEF);
+    let saved_pc = guest_mem::read_word_va(proc_state.wrapping_add(0x3c)).unwrap_or(0xDEAD_BEEF);
     let far = guest_mem::read_word_va(proc_state.wrapping_add(0x44)).unwrap_or(0xDEAD_BEEF);
+    let dfsr = guest_mem::read_word_va(proc_state.wrapping_add(0x48)).unwrap_or(0xDEAD_BEEF);
+    let saved_sp_usr = guest_mem::read_word_va(proc_state.wrapping_add(0x50)).unwrap_or(0xDEAD_BEEF);
     let status = guest_mem::read_word_va(proc_state.wrapping_add(0x5c)).unwrap_or(0xDEAD_BEEF);
-    let saved_sp = guest_mem::read_word_va(proc_state.wrapping_add(0x60)).unwrap_or(0xDEAD_BEEF);
     kprintln!(
-        "Fault(stackmgr) probe ENTER: this={:#010x} procst={:#010x} pc={:#010x} far={:#010x} status={:#010x} saved_sp={:#010x} caller_lr={:#010x} src_mode={:#x} ({}) sp={:#010x}",
-        manager, proc_state, saved_pc, far, status, saved_sp, lr, mode, describe_aarch32_mode(mode), sp
+        "Fault(stackmgr) probe ENTER: this={:#010x} procst={:#010x} saved_pc={:#010x} saved_cpsr={:#010x} far={:#010x} dfsr={:#010x} status={:#010x} saved_sp_usr={:#010x} caller_lr={:#010x} src_mode={:#x} ({}) sp={:#010x}",
+        manager, proc_state, saved_pc, saved_cpsr, far, dfsr, status, saved_sp_usr, lr, mode, describe_aarch32_mode(mode), sp
+    );
+    // Dump full saved register file (r0..r15 at +0x00..+0x3C).
+    let mut regs = [0u32; 16];
+    for i in 0..16 {
+        regs[i] = guest_mem::read_word_va(proc_state.wrapping_add((i as u32) * 4))
+            .unwrap_or(0xDEAD_BEEF);
+    }
+    kprintln!(
+        "Fault(stackmgr) regs r0..r7:   {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+        regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7]
+    );
+    kprintln!(
+        "Fault(stackmgr) regs r8..r15:  {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+        regs[8], regs[9], regs[10], regs[11], regs[12], regs[13], regs[14], regs[15]
     );
     // Hex-dump procst[+0x40..+0x60] so future iterations can refine
     // the offset map. 8 words = 32 bytes.
@@ -4135,14 +4155,91 @@ fn handle_stack_mgr_fault_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
         "Fault(stackmgr) procst[+0x40..+0x60]: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
         words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]
     );
-    // If the saved PC looks like a guest instruction, fetch and log it
-    // so we can identify the failing AArch32 store directly.
-    if saved_pc != 0xDEAD_BEEF && saved_pc != 0 && (saved_pc & 0x3) == 0 {
-        let insn = guest_mem::read_word_va(saved_pc).unwrap_or(0xDEAD_BEEF);
+    // Decode the faulting instruction at saved_pc so we can identify
+    // the failing AArch32 load/store directly. The DataAbort entry
+    // saves r15 = pc+8 (per ARM convention), so the instruction is at
+    // saved_pc - 8.
+    if saved_pc != 0xDEAD_BEEF && (saved_pc & 0x3) == 0 && saved_pc >= 8 {
+        let insn_pc = saved_pc.wrapping_sub(8);
+        let insn = guest_mem::read_word_va(insn_pc).unwrap_or(0xDEAD_BEEF);
         kprintln!(
             "Fault(stackmgr) faulting insn: pc={:#010x} insn={:#010x}",
-            saved_pc, insn
+            insn_pc, insn
         );
+        // If the fault is inside a shadow_stub inline-stub slot, decode
+        // the slot's back-branch (slot 14) to recover the original ROM
+        // PC the stub was emitted for. Without this we can't tell which
+        // user-code byte access ultimately faulted.
+        if (crate::shadow_stub::SBA_STUB_POOL_IPA
+            ..crate::shadow_stub::SBA_STUB_POOL_END)
+            .contains(&insn_pc)
+        {
+            let stub_base = insn_pc & !(crate::shadow_stub::SBA_STUB_BYTES - 1);
+            let slot = (insn_pc - stub_base) / 4;
+            let bb_pc = stub_base + 14 * 4;
+            let bb = guest_mem::read_word_va(bb_pc).unwrap_or(0);
+            // Decode `B imm24` → target. ARM B encoding:
+            // (cond<<28)|0x0A000000|imm24, target = (bb_pc+8) + sext(imm24)*4
+            // The shadow_stub back-branch points at orig_pc + 4, so
+            // orig_pc = target - 4.
+            let imm24 = bb & 0x00FF_FFFF;
+            let signed = ((imm24 as i32) << 8) >> 8;
+            let target = bb_pc.wrapping_add(8).wrapping_add((signed * 4) as u32);
+            let orig_pc = target.wrapping_sub(4);
+            // Dump the full stub (16 words) so we can hand-verify the
+            // EA-compute and access encoding.
+            let mut stub = [0u32; 16];
+            for i in 0..16 {
+                stub[i] = guest_mem::read_word_va(stub_base + (i as u32) * 4)
+                    .unwrap_or(0xDEAD_BEEF);
+            }
+            kprintln!(
+                "Fault(stackmgr) shadow_stub @{:#010x} slot={} → orig_pc={:#010x}",
+                stub_base, slot, orig_pc
+            );
+            kprintln!(
+                "  stub[0..7]:  {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+                stub[0], stub[1], stub[2], stub[3],
+                stub[4], stub[5], stub[6], stub[7]
+            );
+            kprintln!(
+                "  stub[8..15]: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+                stub[8], stub[9], stub[10], stub[11],
+                stub[12], stub[13], stub[14], stub[15]
+            );
+            // Disassemble the original ROM instruction so the operator
+            // can immediately see which byte access faulted.
+            let orig_insn = guest_mem::read_word_va(orig_pc).unwrap_or(0xDEAD_BEEF);
+            kprintln!(
+                "  orig_pc={:#010x} orig_insn={:#010x}",
+                orig_pc, orig_insn
+            );
+            // If the orig_pc is inside WriteRun (TUnicodeCompressor)
+            // dump the object's header so we can see whether `count`
+            // (this[+0x9c]) and `flag` (this[+0xa0]) are sane.
+            // WriteRun spans 0x00256eec..0x00257008.
+            if (0x00256eec..0x00257008).contains(&orig_pc) {
+                let this_ptr = regs[4];
+                let mut hdr = [0u32; 32];
+                for i in 0..32 {
+                    hdr[i] = guest_mem::read_word_va(this_ptr.wrapping_add((i as u32) * 4))
+                        .unwrap_or(0xDEAD_BEEF);
+                }
+                kprintln!("  TUnicodeCompressor @{:#010x}:", this_ptr);
+                kprintln!(
+                    "    +0x00..0x1c (vtbl..hdr): {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+                    hdr[0], hdr[1], hdr[2], hdr[3], hdr[4], hdr[5], hdr[6], hdr[7]
+                );
+                kprintln!(
+                    "    +0x80..0x9c       : {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+                    hdr[32 / 4], hdr[36 / 4], hdr[40 / 4], hdr[44 / 4],
+                    hdr[48 / 4], hdr[52 / 4], hdr[56 / 4], hdr[60 / 4]
+                );
+                let count = guest_mem::read_word_va(this_ptr.wrapping_add(0x9c)).unwrap_or(0);
+                let flag = guest_mem::read_word_va(this_ptr.wrapping_add(0xa0)).unwrap_or(0) & 0xff;
+                kprintln!("    count(+0x9c)={:#x}  flag(+0xa0)={:#x}", count, flag);
+            }
+        }
     }
     // Emulate `mov ip, sp`. ip = r12 (non-banked for non-FIQ source modes).
     ctx.x[12] = sp as u64;

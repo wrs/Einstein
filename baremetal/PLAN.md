@@ -17,143 +17,144 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-51):** iter-50 fixed the iter-49 liveness-analyser
-corruption bug (option 2 from iter-49's plan: original-ROM shadow).
-Cold-boot confirms `shadow_stub pick @0x001488ac: DeadReg sea=R2
-sfl=Some(3)` — picks R2+R3 instead of R12 — and the iter-48 wedge
-("Lookup loaded WILD entry") is gone. Boot now progresses past the
-flash-block lookup and hits a NEW stall in
-`Fault__13TStackManagerFR15TProcessorState`:
+**Current goal (iter-52):** iter-51 root-caused the
+`evt.ex.abt.bus` wedge in `TStackManager::Fault`: shadow_stub's
+liveness analyser had a memoization bug that caused R0 to be
+mis-classified dead at WriteChunk's LDRB stub @0x00257080. The fix
+landed; boot progresses past WriteRun and hits a NEW wedge in
+`FindSuperceeder` → `Lookup` with wild OUT-param r3=0x80000110:
 
 ```
-Throw #0: name="evt.ex.abt.bus" r0=0x000afda0 r1=0x0cc77700 r2=0
-          caller_lr=0x001f8538  sp=0x0c113388  mode=0x10
-*** invariant violation: kernel reached UnhandledException ***
+*** invariant violation: TFlashStore::Lookup called with wild
+    &TObjRef OUT param (bit-31 r3) ***
+WILD CALL: seq=#19 r0=0x0c604c04 r1=0x00000027 r2=0x0000000d
+           r3=0x80000110 caller_lr=0x000c96cc
 ```
 
-caller_lr=0x001f8538 is right after `bl Throw` at 0x001f8534, inside
-TStackManager::Fault. r1=0x0cc77700 looks like a valid RAM VA, NOT
-the iter-48-class wild bit-31-set value.
+caller_lr=0x000c96cc is right after `bl FindSuperceeder` at
+0x000c96c8. The wild value 0x80000110 is a CPSR (USR mode + N
+flag), the same shape as the iter-49 `MRS scratch_fl, CPSR`
+clobber pattern but at a different stub site. Likely another
+shadow_stub mis-pick where the picker chose R3 (the OUT-param
+register) as scratch_fl.
 
-iter-51 must pin the underlying bus-abort site behind this Throw.
-Likely a stack-page lazy-fault path that's hitting an MMIO region
-or unmapped IPA. The standard recipe: probe DataAbortHandler's
-forwarding decision, capture FAR/DFSR/USR_PC, decode whether the
-fault is in the peripheral model, MMU mapping, or kernel logic.
+iter-52 should:
+1. Identify which shadow_stub site clobbers R3 between Lookup
+   call #18 (sane r3=0x0c328eac) and #19 (wild r3=0x80000110).
+2. Decide whether the bug is another picker miss (the iter-51 fix
+   is general but doesn't cover every site automatically) or a
+   site-specific liveness-analysis edge case.
 
-### Iteration 49: shadow_stub liveness analyser reads probe-corrupted ROM — picks R12 wrongly
+### Iteration 51: WriteRun bus-abort root-caused — visited-set leak in liveness analyser
 
-iter-48 hypothesised "DoCommit doesn't initialise sp+148"; the
-hypothesis is WRONG. iter-49 added a `*[r0]` wildness check in the
-FindSuperceeder ENTRY probe (false positive — TObjRef[+0] is an
-object ID like `0xf0000027`, not a pointer; the actual parent
-TFlashStore* lives at TObjRef[+16]) and through that diagnostic
-trace identified the actual mechanism.
+iter-50's wedge (Throw `evt.ex.abt.bus` from
+`TStackManager::Fault @0x001f8534`) traced to a corrupted
+`TUnicodeCompressor::count` field (this[+0x9c]=0x20000111 instead
+of expected 0..0xff). WriteRun then iterated that runaway count
+and walked off the end of the heap region at byte VA=0x0c647003,
+triggering a stack-grow fault that ResolveFault refused (FAR was
+1 byte past the registered upper bound).
 
-The FindSuperceeder body uses ip (R12) as a save register across
-the byte-access stub at 0x001488ac. The picker chose R12 as
-scratch_ea because the liveness analyser was looking at the
-**already-patched** ROM (rom_patches replaced the LOCAL
-`mov r0, ip` at 0x001488c4 with HVC #0x6E for the FINDSUPER_MID
-probe). HVC is treated as `BLink` → caller-saved clobber → R12
-"dead" → picked. Stub clobbers ip → wild this to Lookup.
+#### Mechanism
 
-This is the same root cause as iter-41 (R14 picked as scratch_fl).
-iter-42 worked around iter-41 by excluding R14 from the candidate
-pool — a band-aid that doesn't address the analyser's read-the-
-post-patch-ROM problem.
+Working backwards from the corruption:
 
-#### Iter-49 deliverables
+1. `WriteChunk @0x00257080` is `ldrb r1, [r4, #160]` — read the
+   compressor's flag byte. shadow_stub patches this to `B stub`.
+2. The stub's pre/post `MRS R0, CPSR` / `MSR cpsr_f, R0` pair
+   uses R0 as `scratch_fl` (where the picker stored "save NZCV
+   here") because the picker's liveness analyser misclassified
+   R0 as dead.
+3. The `MRS R0, CPSR` overwrote R0 with 0x20000110 (the saved
+   condition flags + USR mode bits).
+4. The next ROM instruction `add r1, r0, #1 @0x0025708c` then
+   computed r1 = 0x20000110 + 1 = 0x20000111 and stored it as
+   the new `count`.
+5. WriteRun later loaded that wild count and looped 0x353
+   iterations, eventually reading byte at this+0x3F4 = 0x0c647000
+   which is past the stack/heap upper bound → bus abort →
+   throw → unhandled.
 
-- Tracing in `emit_inline_stub` for known-buggy sites — confirms
-  in production cold boot:
-  ```
-  shadow_stub pick @0x001488ac: DeadReg sea=R12 sfl=None
-  ```
-- Three regression unit tests in `src/shadow_stub.rs::tests`:
-  - `pick_scratch_at_findsuperceeder_does_not_pick_r12` — passes
-    when the analyser sees pristine ROM bytes; demonstrates the
-    analyser is correct given the right input.
-  - `pick_scratch_at_findsuperceeder_when_midprobe_installed_does_not_pick_r12`
-    — `#[ignore]`'d; fails on HVC-corrupted ROM. Will turn green
-    when iter-50 lands.
-  - `pick_scratch_with_local_lr_read_does_not_pick_r14` — passes;
-    locks in the iter-41 invariant.
+#### Root cause: visited-set conflated cycle-break with memoization
 
-#### Next iteration plan (iter-50)
+`live_at_recursive` used a single `Visited` flat list that served
+two purposes incompatibly:
 
-Pick one of:
+- **Cycle break**: revisit-on-current-call-stack returns 0 (no
+  new reads from this back-edge). Correct.
+- **Memoization**: revisit-of-fully-walked-block returns 0 (the
+  first walk already counted the reads). **WRONG** — the caller
+  applies `live |= sub & !written` with the CALLER'S local
+  `written`. If the original walk visited the block deep inside
+  a sub-tree where the caller's `written` masked out R0, that
+  R0-read DIDN'T propagate up to the OUTER caller's frame. When
+  the outer caller's direct path then tried to walk the same
+  block, the visited check returned 0 instead of recomputing
+  with the outer's empty `written`.
 
-1. **Reorder install** — move `shadow_stub::patch_rom_from_bitmap()`
-   BEFORE the `apply_717006_patches` call inside `load_rom`. Audit
-   that no shadow_stub byte-access PC overlaps a rom_patches probe
-   PC (the lists are small; a static assertion at install time is
-   easy).
-
-2. **Original-ROM shadow** — keep a side-table of `(PC, original
-   instruction)` pairs maintained by `apply_717006_patches`, and
-   give shadow_stub's analyser a reader function that consults it
-   first. Local change to the analyser; no ordering constraint.
-
-After the fix lands, un-`#[ignore]` the regression test and verify
-it turns green. Re-run the cold boot — iter-48's wedge (Lookup
-called with wild this) should be gone.
-
-### Iteration 50: original-ROM shadow lands; iter-49 wedge resolved
-
-Implemented option 2 from the iter-49 plan: an
-`ORIG_PCS / ORIG_INSNS` side-table in `src/rom_patches.rs` populated
-by `patch_probe` at install time, exposed via
-`pub fn read_original(pc) -> Option<u32>`. shadow_stub's analyser
-now uses a wrapper reader (`code_read_word_original_first`) that
-consults `read_original` before falling back to `read_word_pa`.
-
-**Result on cold boot:**
+Concrete failure for `0x00257080`:
 
 ```
-shadow_stub pick @0x001488ac: DeadReg sea=R2 sfl=Some(3)   ← was R12!
-Lookup-base #0..#N: r4=0x0c604c04 [r4+44]=0x0c605848  (consistently sane)
-Lookup-idx  #0..#N: base=0x0c605848 idx=0x0 entry=0x0c605950  (sane)
+outer (0x257084)
+├── teq r1, sl (R1, R10 read)
+└── BNE 0x2570c0 → recurse:
+    ├── taken: 0x2570c0 (mov r0, r4 → written |= R0)
+    │         → bl WriteRun (R0 caller-saved → written |= R0)
+    │         → ... deep walk eventually back-edges to 0x25705c
+    │         → 0x25705c walks → ldrb r1, [r4, #160] @ 0x257080
+    │           → BNE 0x2570c0 (visited!) →
+    │           → fall=0x25708c FIRST visited HERE, deep,
+    │             where written includes R0 → R0 read masked
+    │             out before bubbling up
+    │ This frame returns its live (no R0).
+    └── fall: 0x25708c (visited!) → returns 0 ← BUG
+   
+outer's live |= (taken_no_R0 | 0) & !0 = no R0
 ```
 
-iter-48's wedge (Lookup called with wild this) is gone. The boot
-now progresses past the flash-block lookup chain and hits a NEW
-stall in `TStackManager::Fault` (a kernel stack-fault throw at
-PC=0x001f8534) — that's iter-51 territory.
+The OUTER's direct fall path has empty `written`, so a fresh
+walk would have correctly reported R0 live. The visited cache
+robbed it of that walk.
 
-#### Tests
+#### Fix
 
-The previously-`#[ignore]`'d iter-49 regression test was rewritten
-into two:
+`Visited` now carries per-block analysis state (`InProgress` →
+`Finished(live_in)`). `live_at_recursive` returns:
 
-- `pick_scratch_at_findsuperceeder_with_originals_wrapper_does_not_pick_r12`
-  — passes; demonstrates the analyser picks R2/R3 correctly when the
-  reader simulates the originals-shim.
-- `pick_scratch_at_findsuperceeder_without_originals_picks_r12` —
-  passes; locks in the BUG behaviour as a regression so a future
-  change to the analyser that "happens to fix" this case (without
-  the originals shim) makes the test fail loudly.
+- `0` when revisiting a block currently being walked (cycle break).
+- The cached `live_in` when revisiting a block already fully
+  analysed (proper memoization — `live_in(B)` is independent of
+  the caller's local `written` because the caller applies its
+  mask AFTER receiving the result).
 
-All 6 `pick_scratch_*` tests in `shadow_stub::tests` pass.
+`nzcv_dead_recursive` got the same treatment (encodes its bool
+result as 0/1 in the same `Visited::live` array; values never
+collide with the `LIVE_IN_PROGRESS = u16::MAX` sentinel).
 
-#### Why option 2 over option 1
+#### Verification
 
-Option 1 (reorder install) was viable but option 2 has zero
-ordering constraint and works regardless of how many future
-probes are added. The side-table is bounded (`ORIG_CAP=64`) and
-populated at boot only. Production reader `code_read_word` is
-unchanged — only `pick_scratch_regs`'s reader path now consults
-the side-table.
+- `shadow_stub pick @0x00257080` now reports
+  `DeadReg sea=R12 sfl=None` (single-scratch with NZCV-dead);
+  R0 no longer chosen.
+- All 36 shadow_stub unit tests pass, including 2 new iter-51
+  regression tests:
+  - `liveness_shared_block_does_not_drop_reads_iter_51` — the
+    shared-block-via-two-paths pattern that exposed the bug.
+  - `liveness_tight_cycle_terminates_iter_51` — confirms the
+    in-progress sentinel still breaks tight self-loops.
+- All 36 guest tests pass.
+- Cold boot no longer Throws `evt.ex.abt.bus`. Boot reaches
+  Tmux task and a different wedge (the iter-52 starting point).
 
-#### Iter-42 R14 band-aid status
+#### Why this didn't surface earlier
 
-Still in place. The iter-50 fix is the proper layer for
-correctness; the R14 candidate-pool exclusion remains as defence
-in depth (iter-41's mechanism was the same as iter-49's, so the
-analyser fix should make the R14 exclusion unnecessary). Could be
-reverted once we confirm shadow_stub picks correctly in all known
-cases without the exclusion. Tracked but deferred — not on the
-critical path.
+The existing `pick_scratch_at_rom_0x257080_does_not_pick_r0`
+test correctly exercised the simplified pattern but didn't
+include the deep BL/back-edge structure that triggers the
+visited-leak. The test uses a 16-instruction stream where
+the BNE target is a self-contained block; the ROM has the
+back-edge to 0x25705c that walks BACK into 0x25708c via a
+different path. iter-51 added the missing pattern.
 
 ## Workflow per stop
 

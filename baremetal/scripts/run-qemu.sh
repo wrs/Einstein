@@ -54,7 +54,7 @@ fi
 exec qemu-system-aarch64 \
     -M raspi3b \
     -kernel "$img" \
-    -serial stdio \
+    -serial mon:stdio \
     -display none \
     -no-reboot \
     -semihosting-config enable=on,target=native \

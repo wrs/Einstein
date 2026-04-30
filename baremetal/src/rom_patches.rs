@@ -1034,6 +1034,15 @@ pub const PHYSBLOCK_ENTRY_PROBE_HVC_IMM: u32 = 0x70;
 pub const PHYSBLOCK_ENTRY_PROBE_PC:      u32 = 0x000C_0CC4;
 const PHYSBLOCK_ENTRY_FIRST_INSN:        u32 = 0xE590_1008; // ldr r1, [r0, #8]
 
+/// Wrapper at ROM `0x000c_0cac` — the unnamed function whose
+/// `bl PhysBlock; ldmdb fp, ...; b LogEntryOffset` faults at the
+/// ldmdb (iter-44). Probe its first insn (mov ip, sp) to capture
+/// incoming fp / sp / lr / r0..r3 on every call. Halt when fp is
+/// wild (bit-31 set).
+pub const C0CAC_ENTRY_PROBE_HVC_IMM:     u32 = 0x71;
+pub const C0CAC_ENTRY_PROBE_PC:          u32 = 0x000C_0CAC;
+const C0CAC_ENTRY_FIRST_INSN:            u32 = 0xE1A0_C00D; // mov ip, sp
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -1538,6 +1547,14 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(PHYSBLOCK_ENTRY_PROBE_HVC_IMM),
             "PhysBlock entry (capture r0 = TFlashBlock* this; halt if wild)",
             PHYSBLOCK_ENTRY_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            C0CAC_ENTRY_PROBE_PC,
+            C0CAC_ENTRY_FIRST_INSN,
+            hvc_insn(C0CAC_ENTRY_PROBE_HVC_IMM),
+            "wrapper @c0cac entry (capture incoming fp; halt if wild)",
+            C0CAC_ENTRY_PROBE_HVC_IMM,
         );
     }
 }

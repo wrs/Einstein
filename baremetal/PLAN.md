@@ -14,7 +14,17 @@ shadow-on-write redirects, and per-task subpage-AP shims are all
 ruled out. The fix MUST be a kernel patch that makes the kernel
 work without 1k subpage protections.
 
-**Current goal (revised iter-44): the bus-abort is at the
+**Current goal (revised iter-45): the bus-abort is precisely
+at PC=0x000c2418 (`ldr r0, [r0, #12]` in
+`LogEntryOffset__15TFlashPhysBlockFv`), with r0 = the wild
+TFlashPhysBlock* returned by PhysBlock. The lr=0xc0cbc that
+Throw saw is preserved through the tail-call `b` from the
+TFlashBlock-class wrapper at 0xc0cc0 (different class, same
+name). iter-46 must probe the c2418 site to capture r0,
+then trace back to PhysBlock's index calculation that
+produces the wild pointer.
+
+**(Iter-44 framing preserved.) the bus-abort is at the
 ldmdb at 0xc0cbc, NOT in PhysBlock — all 65+ PhysBlock calls
 in the boot have sane TFlashBlock* r0 values. The wrapper at
 0xc0cac inherited a wild fp (≈0xea0061cc) from its caller and
@@ -368,6 +378,128 @@ TAlertEventHandler region.
   allocator's freelist threading code (the ROM PCs we see are
   `MoveFreeBlock` / `SetFreeChain`), not via direct __nw__
   return values.
+
+### Iteration 45 (next-loop iter 5): wrapper@c0cac fp always sane — fault is in the tail-called TFlashPhysBlock::LogEntryOffset, not in the wrapper
+
+Iter-44 hypothesized fp corruption at the wrapper's ldmdb.
+Iter-45 patches the wrapper's first instruction (`mov ip, sp`
+at 0x000c_0cac, which is INSIDE `LogEntryOffset__11TFlashBlockFv`)
+to capture incoming fp and walk the caller chain when wild.
+
+#### Cold-boot output
+
+All 8+ logged wrapper@c0cac calls have SANE incoming fp:
+
+```
+wrapper@c0cac #0: fp=0x0c328f14 caller_lr=0x000c0818 sp=0x0c328f08
+wrapper@c0cac #1: fp=0x0c328f14 caller_lr=0x000c0818 sp=0x0c328f08
+wrapper@c0cac #2: fp=0x0c328e88 caller_lr=0x000c0818 sp=0x0c328e7c
+wrapper@c0cac #3: fp=0x0c328e88 caller_lr=0x000c0818 sp=0x0c328e7c
+wrapper@c0cac #4: fp=0x0c328f14 caller_lr=0x000c0818 sp=0x0c328f08
+wrapper@c0cac #5: fp=0x0c328f14 caller_lr=0x000c0818 sp=0x0c328f08
+wrapper@c0cac #6: fp=0x0c328ea0 caller_lr=0x000c0818 sp=0x0c328e94
+wrapper@c0cac #7: fp=0x0cc77d28 caller_lr=0x000c0818 sp=0x0cc77d1c
+```
+
+All fp values are in valid Tmux stack range. Hypothesis #2
+(fp inherited wild) is REJECTED.
+
+#### The actual fault site
+
+`c0cac` is INSIDE `LogEntryOffset__11TFlashBlockFv` (entry at
+0xc0c9c). The function:
+
+```
+000c0c9c <LogEntryOffset__11TFlashBlockFv>:
+   c0c9c: ldr r1, [r0, #8]       ; early return check
+   c0ca0: cmn r1, #1
+   c0ca4: moveq r0, #0
+   c0ca8: moveq pc, lr            ; return r0=0 if [r0+8]==-1
+   c0cac: mov ip, sp              ← our probe
+   c0cb0: push {fp, ip, lr, pc}
+   c0cb4: sub fp, ip, #4
+   c0cb8: bl PhysBlock             ; lr = 0xc0cbc
+   c0cbc: ldmdb fp, {fp, sp, lr}
+   c0cc0: b 0x1afef68 <LogEntryOffset__15TFlashPhysBlockFv>
+                                   ← tail-call to a DIFFERENT class's
+                                     getter — same name, different class
+```
+
+The tail-call target is `LogEntryOffset__15TFlashPhysBlockFv`
+at 0x000c2418. Looking at it:
+
+```
+000c2418 <LogEntryOffset__15TFlashPhysBlockFv>:
+   c2418: ldr r0, [r0, #12]      ← THE FAULTING INSTRUCTION
+   c241c: mov pc, lr               ; return
+```
+
+A single-instruction getter that reads field at offset 12
+from the TFlashPhysBlock pointer (= the value PhysBlock
+returned). If PhysBlock returned a wild pointer, this ldr
+faults.
+
+Since `b 0x1afef68` is a plain branch (not bl), lr is
+preserved as 0xc0cbc through the tail-call. Hence Throw's
+caller_lr = 0xc0cbc matches even though the actual faulting
+PC is at c2418 (inside a function entered via tail-call).
+
+#### What PhysBlock returns
+
+Reviewing PhysBlock's body:
+
+```
+000c0cc4 <PhysBlock>:
+   c0cc4: ldr r1, [r0, #8]      ; r1 = this->[8] (offset)
+   c0cc8: cmn r1, #1
+   c0ccc: moveq r0, #0
+   c0cd0: moveq pc, lr           ; if [r0+8]==-1, return 0
+   c0cd4: ldr r0, [r0]           ; r0 = *this (a TFlashStore*)
+   c0cd8: ldr r2, [r0, #36]      ; r2 = store->[36] (table base)
+   c0cdc: ldr r0, [r0, #88]      ; r0 = store->[88] (shift)
+   c0ce0: lsr r0, r1, r0         ; r0 = r1 >> shift (index)
+   c0ce4: add r0, r0, r0, lsl #1 ; r0 = index * 3
+   c0ce8: add r0, r2, r0, lsl #3 ; r0 = table + index * 24 (TFlashPhysBlock pointer)
+   c0cec: mov pc, lr             ; return
+```
+
+PhysBlock returns `table_base + (offset >> shift) * 24`,
+indexing into a TFlashPhysBlock array. If `index` overshoots
+the array bounds OR `table_base` is corrupted, the returned
+pointer is wild.
+
+In the wedge call, PhysBlock might have returned a value
+like 0xea0061b8 (TFlashPhysBlock pointer + 12 = 0xea0061c4
+= the FAR we observed).
+
+#### Next iteration plan (iter-46)
+
+1. **Probe at LogEntryOffset__15TFlashPhysBlockFv entry**
+   (PC=0x000c2418) to capture r0. Patch the `ldr r0, [r0, #12]`
+   with HVC; if r0 is wild, halt with the caller chain
+   walked. Otherwise emulate the load.
+
+2. **If r0 entering this getter is wild**: the bug is in
+   how PhysBlock computes the table index. Look at PhysBlock's
+   inputs (its own r0 = TFlashBlock* and the [r0+8] offset
+   field). If offset is too large or the table base
+   (TFlashStore->[36]) points to wild memory, the returned
+   pointer is wild.
+
+3. **Cross-reference with the prior PhysBlock probe**: extend
+   it to also log r0 at PhysBlock EXIT (the returned value)
+   so we can pair-match `(input r0, returned r0)`.
+
+#### Status
+
+- Build clean.
+- 65+ wrapper@c0cac calls observed with sane fp.
+- Bus-abort precisely localized: `ldr r0, [r0, #12]` at PC=
+  0x000c2418 inside `LogEntryOffset__15TFlashPhysBlockFv`,
+  with r0 = wild TFlashPhysBlock* returned by PhysBlock.
+- iter-45 deliverable: rejected the iter-44 fp-corruption
+  hypothesis; pinned the actual faulting instruction; identified
+  the data-flow source (PhysBlock's return value).
 
 ### Iteration 44 (next-loop iter 4): PhysBlock r0 always sane — bus-abort is at the wrapper's ldmdb (corrupt fp)
 

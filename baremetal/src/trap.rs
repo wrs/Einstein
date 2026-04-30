@@ -1356,6 +1356,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::PHYSBLOCK_ENTRY_PROBE_HVC_IMM => {
             handle_physblock_entry_probe(ctx);
         }
+        v if v == crate::rom_patches::C0CAC_ENTRY_PROBE_HVC_IMM => {
+            handle_c0cac_entry_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1978,6 +1981,11 @@ fn handle_und(ctx: &mut TrapContext) {
         }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::PHYSBLOCK_ENTRY_PROBE_HVC_IMM) => {
             handle_physblock_entry_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::C0CAC_ENTRY_PROBE_HVC_IMM) => {
+            handle_c0cac_entry_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -2969,6 +2977,85 @@ fn handle_physblock_entry_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
         0xDEADBEEF
     });
     ctx.x[1] = val as u64;
+}
+
+/// Iter-45: probe at the wrapper at 0x000c_0cac (whose ldmdb at
+/// 0xc0cbc faults with corrupt fp). Captures incoming fp/sp/lr +
+/// r0..r3. If fp is wild (bit-31 set), halts and walks the
+/// caller's APCS frame chain to identify Tmux's call path.
+fn handle_c0cac_entry_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_c0cac_entry_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_c0cac_entry_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let r0 = ctx.x[0] as u32;
+    let r1 = ctx.x[1] as u32;
+    let r2 = ctx.x[2] as u32;
+    let r3 = ctx.x[3] as u32;
+    let fp = ctx.x[11] as u32;
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+    let mode = source_cpsr & 0x1F;
+
+    let fp_wild = (fp & 0x8000_0000) != 0;
+
+    if fp_wild {
+        halt_invariant("wrapper @c0cac called with wild fp", || {
+            kprintln!(
+                "  WILD CALL #{} fp={:#010x}  caller_lr={:#010x}  sp={:#010x}",
+                seq, fp, lr, sp,
+            );
+            kprintln!(
+                "  r0={:#010x}  r1={:#010x}  r2={:#010x}  r3={:#010x}",
+                r0, r1, r2, r3,
+            );
+            kprintln!();
+            kprintln!("  Caller's stack (32 words from sp={:#010x}):", sp);
+            for i in 0..32u32 {
+                let off = i * 4;
+                let va = sp.wrapping_add(off);
+                match guest_mem::read_word_va(va) {
+                    Some(w) => kprintln!("    sp+{:#04x} @{:#010x} = {:#010x}", off, va, w),
+                    None    => kprintln!("    sp+{:#04x} @{:#010x} = (unmapped)", off, va),
+                }
+            }
+            // Walk the FP chain even though fp is wild; we may get
+            // one frame back if the caller's saved fp is reachable.
+            kprintln!();
+            kprintln!("  APCS FP chain attempt (starting from incoming fp):");
+            let mut walk_fp = fp;
+            for i in 0..6u32 {
+                let lr_va = walk_fp.wrapping_sub(4);
+                let fp_va = walk_fp.wrapping_sub(12);
+                let pc_at = guest_mem::read_word_va(walk_fp).unwrap_or(0xDEADBEEF);
+                let caller_lr = match guest_mem::read_word_va(lr_va) {
+                    Some(w) => w, None => { kprintln!("    [{}] fp={:#010x}  (lr unread)", i, walk_fp); break; }
+                };
+                let caller_fp = match guest_mem::read_word_va(fp_va) {
+                    Some(w) => w, None => { kprintln!("    [{}] fp={:#010x}  caller_lr={:#010x}  (caller_fp unread)", i, walk_fp, caller_lr); break; }
+                };
+                kprintln!(
+                    "    [{}] fp={:#010x}  pc_at_fp={:#010x}  caller_lr={:#010x}  caller_fp={:#010x}",
+                    i, walk_fp, pc_at, caller_lr, caller_fp,
+                );
+                if caller_fp == 0 || caller_fp == walk_fp { break; }
+                walk_fp = caller_fp;
+            }
+        });
+    }
+
+    if seq < 8 || seq % 64 == 0 {
+        kprintln!(
+            "wrapper@c0cac #{}: fp={:#010x} caller_lr={:#010x} sp={:#010x} mode={:#x}",
+            seq, fp, lr, sp, mode,
+        );
+    }
+
+    // Emulate `mov ip, sp`.
+    ctx.x[12] = sp as u64;
 }
 
 fn handle_reboot(ctx: &TrapContext) -> ! {

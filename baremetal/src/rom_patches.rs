@@ -1043,6 +1043,18 @@ pub const C0CAC_ENTRY_PROBE_HVC_IMM:     u32 = 0x71;
 pub const C0CAC_ENTRY_PROBE_PC:          u32 = 0x000C_0CAC;
 const C0CAC_ENTRY_FIRST_INSN:            u32 = 0xE1A0_C00D; // mov ip, sp
 
+/// `LogEntryOffset__15TFlashPhysBlockFv` first insn at ROM
+/// `0x000c_2418` — the tail-call target from the wrapper at
+/// 0xc0cac. Iter-45 pinned the bus-abort to this site: the
+/// single-instruction getter `ldr r0, [r0, #12]` faults because
+/// r0 (the TFlashPhysBlock* returned by PhysBlock) is wild.
+/// iter-46 patches the ldr with HVC; the handler captures r0
+/// and either halts (with caller chain) when wild, or emulates
+/// the load.
+pub const LOGOFFSET_PHYS_PROBE_HVC_IMM:  u32 = 0x72;
+pub const LOGOFFSET_PHYS_PROBE_PC:       u32 = 0x000C_2418;
+const LOGOFFSET_PHYS_FIRST_INSN:         u32 = 0xE590_000C; // ldr r0, [r0, #12]
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -1555,6 +1567,14 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(C0CAC_ENTRY_PROBE_HVC_IMM),
             "wrapper @c0cac entry (capture incoming fp; halt if wild)",
             C0CAC_ENTRY_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            LOGOFFSET_PHYS_PROBE_PC,
+            LOGOFFSET_PHYS_FIRST_INSN,
+            hvc_insn(LOGOFFSET_PHYS_PROBE_HVC_IMM),
+            "LogEntryOffset__15TFlashPhysBlockFv entry (capture r0 = TFlashPhysBlock*; halt if wild)",
+            LOGOFFSET_PHYS_PROBE_HVC_IMM,
         );
     }
 }

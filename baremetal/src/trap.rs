@@ -1359,6 +1359,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::C0CAC_ENTRY_PROBE_HVC_IMM => {
             handle_c0cac_entry_probe(ctx);
         }
+        v if v == crate::rom_patches::LOGOFFSET_PHYS_PROBE_HVC_IMM => {
+            handle_logoffset_phys_entry_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1986,6 +1989,11 @@ fn handle_und(ctx: &mut TrapContext) {
         }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::C0CAC_ENTRY_PROBE_HVC_IMM) => {
             handle_c0cac_entry_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::LOGOFFSET_PHYS_PROBE_HVC_IMM) => {
+            handle_logoffset_phys_entry_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -2961,22 +2969,101 @@ fn handle_physblock_entry_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
         });
     }
 
-    // r0 is plausible. Log periodically and emulate `ldr r1, [r0, #8]`.
-    if seq < 8 || seq % 64 == 0 {
-        kprintln!(
-            "PhysBlock #{}: r0={:#010x} caller_lr={:#010x} sp={:#010x} mode={:#x}",
-            seq, r0, lr, sp, mode,
-        );
-    }
-    let load_va = r0.wrapping_add(8);
-    let val = guest_mem::read_word_va(load_va).unwrap_or_else(|| {
+    // Iter-46 extension: PhysBlock continues past `cmn r1, #1; moveq pc,
+    // lr` and runs `ldr r0, [r0]` at c0cd4 (loading the parent TFlashStore*),
+    // then `ldr r2, [r0, #36]` at c0cd8 — and iter-46 cold-boot pinned the
+    // bus-abort to c0cd8, faulting on `r0 + 36 = 0xea0061c4` ⇒ r0 (= the
+    // store pointer loaded at c0cd4) = 0xea0061a0 = wild. Read the parent
+    // TFlashStore* now and halt if it's wild — we capture which TFlashBlock
+    // has the corrupted [+0] field plus the caller chain. Skip when r1 ==
+    // -1 (the early-return path) since the store pointer is never derefd.
+    let store_ptr_va = r0; // [r0+0]
+    let store_ptr = guest_mem::read_word_va(store_ptr_va).unwrap_or(0xDEAD_BEEF);
+    let r1 = guest_mem::read_word_va(r0.wrapping_add(8)).unwrap_or_else(|| {
         kprintln!(
             "  ★ PhysBlock #{} load from {:#010x} returned None — would have faulted",
-            seq, load_va,
+            seq, r0.wrapping_add(8),
         );
         0xDEADBEEF
     });
-    ctx.x[1] = val as u64;
+    let store_wild = (store_ptr & 0x8000_0000) != 0;
+    let early_return = r1 == 0xFFFF_FFFF;
+
+    if store_wild && !early_return {
+        halt_invariant("PhysBlock TFlashBlock has wild parent TFlashStore* at [+0]", || {
+            kprintln!(
+                "  TFlashBlock* r0={:#010x}  *[r0+0] (parent store) = {:#010x}  WILD",
+                r0, store_ptr,
+            );
+            kprintln!(
+                "  [r0+8] (offset)  = {:#010x}",
+                r1,
+            );
+            kprintln!(
+                "  caller_lr={:#010x}  sp={:#010x}  src_mode={} ({:#x})",
+                lr, sp, describe_aarch32_mode(mode), mode,
+            );
+            kprintln!(
+                "  next ldr at c0cd8 would compute FAR = store_ptr + 36 = {:#010x}",
+                store_ptr.wrapping_add(36),
+            );
+            kprintln!();
+            kprintln!("  TFlashBlock dump @{:#010x} (16 words):", r0);
+            for i in 0..16u32 {
+                let off = i * 4;
+                let va = r0.wrapping_add(off);
+                match guest_mem::read_word_va(va) {
+                    Some(w) => kprintln!("    [r0+{:#04x}] @{:#010x} = {:#010x}", off, va, w),
+                    None    => kprintln!("    [r0+{:#04x}] @{:#010x} = (unmapped)", off, va),
+                }
+            }
+            kprintln!();
+            kprintln!("  Caller-mode stack window from sp={:#010x} (32 words):", sp);
+            for i in 0..32u32 {
+                let off = i * 4;
+                let va = sp.wrapping_add(off);
+                match guest_mem::read_word_va(va) {
+                    Some(w) => kprintln!("    sp+{:#04x} @{:#010x} = {:#010x}", off, va, w),
+                    None    => kprintln!("    sp+{:#04x} @{:#010x} = (unmapped)", off, va),
+                }
+            }
+            // Walk APCS FP chain — caller frame should give the wrapper
+            // and its caller's call site.
+            let fp = ctx.x[11] as u32;
+            kprintln!();
+            kprintln!("  APCS FP chain from incoming fp={:#010x}:", fp);
+            let mut walk_fp = fp;
+            for i in 0..8u32 {
+                let lr_va = walk_fp.wrapping_sub(4);
+                let fp_va = walk_fp.wrapping_sub(12);
+                let pc_at = guest_mem::read_word_va(walk_fp).unwrap_or(0xDEADBEEF);
+                let caller_lr = match guest_mem::read_word_va(lr_va) {
+                    Some(w) => w,
+                    None => { kprintln!("    [{}] fp={:#010x}  (lr unread)", i, walk_fp); break; }
+                };
+                let caller_fp = match guest_mem::read_word_va(fp_va) {
+                    Some(w) => w,
+                    None => { kprintln!("    [{}] fp={:#010x}  caller_lr={:#010x}  (caller_fp unread)", i, walk_fp, caller_lr); break; }
+                };
+                kprintln!(
+                    "    [{}] fp={:#010x}  pc_at_fp={:#010x}  caller_lr={:#010x}  caller_fp={:#010x}",
+                    i, walk_fp, pc_at, caller_lr, caller_fp,
+                );
+                if caller_fp == 0 || caller_fp == walk_fp { break; }
+                walk_fp = caller_fp;
+            }
+        });
+    }
+
+    // r0 (and *r0) are plausible. Log periodically and emulate `ldr r1,
+    // [r0, #8]`.
+    if seq < 8 || seq % 64 == 0 {
+        kprintln!(
+            "PhysBlock #{}: r0={:#010x} *r0={:#010x} caller_lr={:#010x} sp={:#010x} mode={:#x}",
+            seq, r0, store_ptr, lr, sp, mode,
+        );
+    }
+    ctx.x[1] = r1 as u64;
 }
 
 /// Iter-45: probe at the wrapper at 0x000c_0cac (whose ldmdb at
@@ -3056,6 +3143,101 @@ fn handle_c0cac_entry_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
 
     // Emulate `mov ip, sp`.
     ctx.x[12] = sp as u64;
+}
+
+/// Iter-46: probe at `LogEntryOffset__15TFlashPhysBlockFv` (PC=
+/// 0x000c_2418) — the tail-call target from the wrapper at
+/// 0xc0cac. The original first instruction is `ldr r0, [r0, #12]`
+/// (a single-instruction getter); r0 entering this function is
+/// the TFlashPhysBlock* returned by PhysBlock. iter-45 narrowed
+/// the bus-abort to this site: when r0 is wild, the ldr faults
+/// with FAR = r0 + 12 = 0xea0061c4 (so r0 = 0xea0061b8).
+///
+/// On a wild r0, halt with the caller chain walked. Otherwise
+/// emulate the load by reading [r0+12] from guest memory and
+/// writing it back into r0; the next insn `mov pc, lr` returns.
+fn handle_logoffset_phys_entry_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_logoffset_phys_entry_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_logoffset_phys_entry_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let r0 = ctx.x[0] as u32;
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let fp = ctx.x[11] as u32;
+    let mode = source_cpsr & 0x1F;
+
+    let r0_wild = (r0 & 0x8000_0000) != 0;
+
+    if r0_wild {
+        halt_invariant("LogEntryOffset__15TFlashPhysBlockFv called with wild this (TFlashPhysBlock*)", || {
+            kprintln!(
+                "  WILD r0={:#010x}  caller_lr={:#010x}  sp={:#010x}  fp={:#010x}  src_mode={} ({:#x})",
+                r0, lr, sp, fp, describe_aarch32_mode(mode), mode,
+            );
+            kprintln!(
+                "  expected [r0+12] @{:#010x} would be the faulting load (FAR)",
+                r0.wrapping_add(12),
+            );
+            kprintln!();
+            kprintln!("  Caller-mode stack window from sp={:#010x} (32 words):", sp);
+            for i in 0..32u32 {
+                let off = i * 4;
+                let va = sp.wrapping_add(off);
+                match guest_mem::read_word_va(va) {
+                    Some(w) => kprintln!("    sp+{:#04x} @{:#010x} = {:#010x}", off, va, w),
+                    None    => kprintln!("    sp+{:#04x} @{:#010x} = (unmapped)", off, va),
+                }
+            }
+            // Walk the APCS FP chain from the (sane) caller's fp.
+            // The wrapper at 0xc0cac tail-called us, and PhysBlock
+            // (a leaf) was bl'd just before. fp at this probe is
+            // the wrapper's fp — pointing into Tmux's stack.
+            kprintln!();
+            kprintln!("  APCS FP chain from incoming fp={:#010x}:", fp);
+            let mut walk_fp = fp;
+            for i in 0..8u32 {
+                let lr_va = walk_fp.wrapping_sub(4);
+                let fp_va = walk_fp.wrapping_sub(12);
+                let pc_at = guest_mem::read_word_va(walk_fp).unwrap_or(0xDEADBEEF);
+                let caller_lr = match guest_mem::read_word_va(lr_va) {
+                    Some(w) => w,
+                    None => { kprintln!("    [{}] fp={:#010x}  (lr unread)", i, walk_fp); break; }
+                };
+                let caller_fp = match guest_mem::read_word_va(fp_va) {
+                    Some(w) => w,
+                    None => { kprintln!("    [{}] fp={:#010x}  caller_lr={:#010x}  (caller_fp unread)", i, walk_fp, caller_lr); break; }
+                };
+                kprintln!(
+                    "    [{}] fp={:#010x}  pc_at_fp={:#010x}  caller_lr={:#010x}  caller_fp={:#010x}",
+                    i, walk_fp, pc_at, caller_lr, caller_fp,
+                );
+                if caller_fp == 0 || caller_fp == walk_fp { break; }
+                walk_fp = caller_fp;
+            }
+        });
+    }
+
+    if seq < 8 || seq % 64 == 0 {
+        kprintln!(
+            "LogEntryOffset@c2418 #{}: r0={:#010x} caller_lr={:#010x} sp={:#010x} mode={:#x}",
+            seq, r0, lr, sp, mode,
+        );
+    }
+
+    // r0 is plausible — emulate `ldr r0, [r0, #12]`.
+    let load_va = r0.wrapping_add(12);
+    let val = guest_mem::read_word_va(load_va).unwrap_or_else(|| {
+        kprintln!(
+            "  ★ LogEntryOffset@c2418 #{} load from {:#010x} returned None — would have faulted",
+            seq, load_va,
+        );
+        0xDEADBEEF
+    });
+    ctx.x[0] = val as u64;
 }
 
 fn handle_reboot(ctx: &TrapContext) -> ! {

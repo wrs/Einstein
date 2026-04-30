@@ -954,6 +954,25 @@ pub const UNHANDLED_NUM_EXCEPTION_HVC_IMM: u32 = 0x6A;
 pub const UNHANDLED_NUM_EXCEPTION_PC:      u32 = 0x000B_031C;
 const UNHANDLED_NUM_EXCEPTION_FIRST_INSN:  u32 = 0xE1A0_C00D; // mov ip, sp
 
+/// CardFaultMonProc `bl Throw` at ROM `0x0004_E660`. This is the
+/// second of two `bl Throw` sites inside
+/// `CardFaultMonProc__12TCardDomainsFlPv` (the other is at
+/// `0x0004_E528`); iter-35 pinned the firing site to
+/// `0x0004_E660` via `caller_lr=0x0004_E664`. Catching here gives
+/// us the kernel-side fault frame BEFORE Throw unwinds anything
+/// — `sp..sp+0x64` holds the 25-word `TProcessorState` populated
+/// by `GetFaultState__FP15TProcessorState` at `0x0004_E4FC`. Per
+/// the surrounding disassembly: `sp+0x44` = FAR, `sp+0x48` =
+/// DFSR/access bits (bit 0 tested as the "USR vs kernel access"
+/// distinction), `sp+0x58` = the offending USR-mode PC. r0 is
+/// loaded from `[0x003712C4]` and re-loaded as `*(0x003712C4)` —
+/// the pointer to the exception-name C-string ("evt.ex.abt.perm").
+/// r4 indicates the path taken (0 = main "no matching domain",
+/// 5 = NotifyTaskBlocked already invoked).
+pub const CARDFAULT_THROW_PROBE_HVC_IMM:  u32 = 0x6B;
+pub const CARDFAULT_THROW_PROBE_PC:       u32 = 0x0004_E660;
+const CARDFAULT_THROW_FIRST_INSN:         u32 = 0xEB6E_52CD; // bl 0x1be319c <Throw>
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -1410,6 +1429,14 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(UNHANDLED_NUM_EXCEPTION_HVC_IMM),
             "UnhandledNonUserModeException entry (halt-on-entry tripwire)",
             UNHANDLED_NUM_EXCEPTION_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            CARDFAULT_THROW_PROBE_PC,
+            CARDFAULT_THROW_FIRST_INSN,
+            hvc_insn(CARDFAULT_THROW_PROBE_HVC_IMM),
+            "CardFaultMonProc bl Throw (pre-Throw fault-frame capture)",
+            CARDFAULT_THROW_PROBE_HVC_IMM,
         );
     }
 }

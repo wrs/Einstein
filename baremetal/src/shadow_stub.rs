@@ -1267,6 +1267,14 @@ fn analyze_insn(insn: u32, pc: u32) -> (RegMask, RegMask, BranchKind) {
 const APCS_CALLER_SAVED: RegMask =
     (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 12) | (1 << 14);
 
+/// APCS parameter registers — read by any callee, so any kind of call
+/// (BL, BX, B-tail-call) makes these live at the call site. The walker
+/// adds these to live both at BL/BLink boundaries and at unreachable-
+/// target Direct/Cond branches (assumed to be tail-calls, since the
+/// only readable Direct targets we've seen in Newton ROM are intra-
+/// function branches; jumptable thunks live above the ROM aperture).
+const APCS_PARAMS: RegMask = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3);
+
 /// Registers the caller observably depends on at function return: R0
 /// (return value), R4–R11 (callee-preserved), R13 (SP), R14 (LR).
 /// R1–R3 and R12 are caller-saved; the caller doesn't expect any
@@ -1418,7 +1426,6 @@ where R: Fn(u32) -> Option<u32> {
                 // call — and the stub-scratch picker would happily
                 // overwrite it with CPSR. Newton ROM @ 0x13ca08 is
                 // the canonical case that motivated this fix.
-                const APCS_PARAMS: RegMask = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3);
                 live |= APCS_PARAMS & !written;
                 let bl_clobber = APCS_CALLER_SAVED & !live;
                 written |= bl_clobber;
@@ -1432,10 +1439,22 @@ where R: Fn(u32) -> Option<u32> {
                 // If the target is unreadable (outside our backing
                 // store — typically a Newton ROM jump-table entry
                 // pointing into the post-load relocated function
-                // pool at IPA > ROM_SIZE), treat as a tail-call
-                // return: live = APCS_RETURN_LIVE.
+                // pool at IPA > ROM_SIZE), treat as a TAIL-CALL: the
+                // callee will read R0..R3 as parameters AND the
+                // caller-observable result registers (APCS_RETURN_LIVE)
+                // are also live across the tail. Iter-52 fix: the
+                // previous version omitted APCS_PARAMS, which let the
+                // picker classify R0..R3 as dead at any tail-call site
+                // whose target lived in the post-ROM jumptable region
+                // — concretely, FindSuperceeder body @0x001488ac tail-
+                // calls Lookup via `b 0x1afef70` (jumptable thunk),
+                // and the picker chose R3 as scratch_fl, so the stub's
+                // `MRS R3, CPSR` clobbered the OUT-param pointer with
+                // a CPSR value (0x80000110) before the tail-call to
+                // Lookup. Tail-calls passing parameters in R0..R3 are
+                // pervasive in Newton ROM (every jumptable thunk).
                 if read_insn(target).is_none() {
-                    live |= APCS_RETURN_LIVE & !written;
+                    live |= (APCS_RETURN_LIVE | APCS_PARAMS) & !written;
                     return live;
                 }
                 let tgt_live = live_at_recursive(target, max_instrs, visited, read_insn);
@@ -1448,8 +1467,12 @@ where R: Fn(u32) -> Option<u32> {
                     live |= fall & !written;
                     return live;
                 }
+                // Same iter-52 reasoning as Direct: a Cond branch to an
+                // unreachable target is a conditional tail-call (e.g.
+                // a jumptable-routed `bne <fn>`). Mark the param regs
+                // live alongside APCS_RETURN_LIVE.
                 let taken_live = if read_insn(target).is_none() {
-                    APCS_RETURN_LIVE
+                    APCS_RETURN_LIVE | APCS_PARAMS
                 } else {
                     live_at_recursive(target, max_instrs, visited, read_insn)
                 };

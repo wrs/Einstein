@@ -502,6 +502,119 @@ fn fmt_pc_name(pc: u32) -> ([u8; 96], usize) {
 ///   `*(fp - 8)  = saved ip (caller's sp at entry)`
 ///   `*(fp - 12) = saved fp (caller's fp)`
 ///
+/// SemaphoreOpGlue is the user-mode SVC trampoline at ROM 0x3ae1fc.
+/// Body is just `svc #0x0b; mov pc, lr`. When a task blocks inside
+/// kernel SemOp, its saved PC lands in this 8-byte range.
+const SEMAPHORE_OP_GLUE_LO: u32 = 0x003a_e1fc;
+const SEMAPHORE_OP_GLUE_HI: u32 = 0x003a_e204;
+
+/// Look up any kernel object in `gObjectTable` by its kernel ID.
+/// Returns the kernel object's VA (i.e. the bucket-chain node ptr) on
+/// hit, `None` otherwise. Same hash layout as `find_task_by_id`:
+/// bucket = `(id >> 4) & 0x7F`, chain via +0x04.
+fn find_object_by_id(obj_id: u32) -> Option<u32> {
+    if obj_id == 0 || obj_id == u32::MAX { return None; }
+    let bucket = (obj_id >> 4) & 0x7F;
+    let head_va = G_OBJECT_TABLE + OT_BUCKETS_BASE + bucket * 4;
+    let mut node = rd(head_va)?;
+    let mut steps = 0u32;
+    while node != 0 && steps < 128 {
+        let id = rd(node)?;
+        if id == obj_id { return Some(node); }
+        node = rd(node + 4)?;
+        steps += 1;
+    }
+    None
+}
+
+/// Decode and print a TSemaphoreOpList. The user-side wrapper holds a
+/// kernel object ID (not a VA); the user-side `SemOp` thunk derefs the
+/// wrapper to extract the ID, then SemaphoreOpGlue passes the ID into
+/// the kernel SVC. So when a task blocks at SemaphoreOpGlue, its
+/// task[+0x10]/[+0x14] hold the **group ID** and **OpList ID**, not VAs.
+/// We resolve them through `gObjectTable`.
+///
+/// Kernel-side TSemaphoreOpList layout (per
+/// `Init__16TSemaphoreOpListFUlPUl` ROM 0x1d5078 + the load pattern in
+/// `SemOp__15TSemaphoreGroup` ROM 0x1d4f54..0x1d4f74):
+///
+///   +0x10  ULong*  ops array (heap, count*4 bytes)
+///   +0x14  ULong   count
+///
+/// Each op-word:
+///   bits[31:16]  sema_index (unsigned)
+///   bits[15:0]   delta      (signed 16-bit)
+///
+/// Semantics (from the dispatch in SemOp__15TSemaphoreGroup):
+///   delta == 0  wait sema[i].count == 0 (BlockOnZero if non-zero)
+///   delta  > 0  increment sema[i].count by delta (always succeeds;
+///               WakeTasksOnInc on the second pass)
+///   delta  < 0  decrement; if sema[i].count + delta < 0, BlockOnInc
+///
+/// Live-sema cross-check: read sema[i].count from
+/// (group[+0x10] + i*40)+0x14 and flag the op that would block now.
+/// The displayed sema state may be stale by the time the dump runs (the
+/// kernel may have already woken the task), but at quiescent idle it's
+/// reliable enough to identify which producer needs to fire.
+fn dump_oplist(group_id: u32, oplist_id: u32, indent: &str) {
+    let oplist_va = match find_object_by_id(oplist_id) {
+        Some(v) => v,
+        None => {
+            kprintln!(
+                "{}OpList: id={:#x} (type={}) — not found in gObjectTable",
+                indent, oplist_id, KIND_NAMES[(oplist_id & 0xF) as usize]
+            );
+            return;
+        }
+    };
+    let group_va = find_object_by_id(group_id).unwrap_or(0);
+    let valid_va = |v: u32| v != 0 && v != u32::MAX && (v & 3) == 0;
+    let ops_ptr = rd(oplist_va + 0x10).unwrap_or(0);
+    let count   = rd(oplist_va + 0x14).unwrap_or(0);
+    if count == 0 || count > 16 || !valid_va(ops_ptr) {
+        kprintln!(
+            "{}OpList @{:#x} (id={:#x}): ops_ptr={:#x} count={} (header looks wrong)",
+            indent, oplist_va, oplist_id, ops_ptr, count
+        );
+        return;
+    }
+    let grp_arr   = if valid_va(group_va) { rd(group_va + 0x10).unwrap_or(0) } else { 0 };
+    let grp_count = if valid_va(group_va) { rd(group_va + 0x14).unwrap_or(0) } else { 0 };
+    kprintln!(
+        "{}SemOp: group @{:#x} (id={:#x}) arr={:#x} n={}; OpList @{:#x} (id={:#x}) ops@{:#x} count={}",
+        indent, group_va, group_id, grp_arr, grp_count,
+        oplist_va, oplist_id, ops_ptr, count
+    );
+    for i in 0..count {
+        let op = match rd(ops_ptr + i * 4) { Some(v) => v, None => break };
+        let sema_idx = op >> 16;
+        let delta    = ((op as i32) << 16) >> 16; // sign-extend low 16 bits
+        let in_range = grp_arr != 0 && sema_idx < grp_count;
+        let sema_va  = if in_range { grp_arr + sema_idx * 40 } else { 0 };
+        let sema_cnt = if sema_va != 0 {
+            rd(sema_va + 0x14).unwrap_or(u32::MAX)
+        } else { u32::MAX };
+        let action = if delta == 0 { "wait_zero" }
+                     else if delta > 0 { "inc      " }
+                     else { "dec      " };
+        // Flag the op that would block at the currently observed sema
+        // count. For delta<0 we treat sema_cnt as a signed int32 (it can
+        // legitimately be 0xffffffff briefly during release sequences,
+        // though in practice the kernel keeps it nonneg).
+        let blocks_now = match delta {
+            0 => sema_cnt != 0 && sema_cnt != u32::MAX,
+            d if d > 0 => false,
+            d => sema_va != 0 && sema_cnt != u32::MAX
+                 && (sema_cnt as i32).wrapping_add(d) < 0,
+        };
+        let mark = if blocks_now { " <-- BLOCKS" } else { "" };
+        kprintln!(
+            "{}  op[{}]: sema[{}] {} delta={:+} (op={:#010x}) sema@{:#x} count={}{}",
+            indent, i, sema_idx, action, delta, op, sema_va, sema_cnt as i32, mark
+        );
+    }
+}
+
 /// Walk: `prev_fp = *(fp - 12)`. Stop at NULL / unaligned / bogus
 /// VA / self-loop / depth cap.
 fn walk_apcs_frames(start_fp: u32, depth_cap: usize) {
@@ -567,6 +680,15 @@ fn dump_blocked_pcs() {
                         id, saved_spsr, pc_name, lr_name,
                         saved_pc, lr_usr, sp_usr, fp_usr,
                     );
+                    // If parked in SemaphoreOpGlue, decode the OpList:
+                    // saved r0 = TSemaphoreGroup* (kernel), saved r1 =
+                    // TSemaphoreOpList* (kernel), both live in the
+                    // SWIBoot save area (task+0x10 and task+0x14).
+                    if (SEMAPHORE_OP_GLUE_LO..SEMAPHORE_OP_GLUE_HI).contains(&saved_pc) {
+                        let r0 = rd(node + 0x10).unwrap_or(0);
+                        let r1 = rd(node + 0x14).unwrap_or(0);
+                        dump_oplist(r0, r1, "      ");
+                    }
                     // Walk the APCS frame chain starting at fp_usr.
                     // 12 frames is plenty for everything we've seen so
                     // far; cap stops a corrupt chain from spamming the

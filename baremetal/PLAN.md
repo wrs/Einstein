@@ -17,84 +17,31 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-48):** Lookup's TFlashBlock-pointer table at
-`TFlashStore->[+44]` contains wild entries. iter-47 added a probe at
-c74c8 (`ldr r0, [r4, #44]`) and observed the base = `0x0c605848` is
-ALWAYS sane in 8+ logged calls (r4 = `0x0c604c04` = the sole boot-
-time TFlashStore). So iter-46 hypothesis (a) "wild base" REJECTED;
-hypothesis (b) "sane base, wild/NULL entry" CONFIRMED. The boot now
-progresses past the iter-46 wedge and hits an unaligned-load fault
-at `0xc0c9c: ldr r1, [r0, #8]` (LogEntryOffset entry) with r0 =
-`0x0a000005` — yet another wild TFlashBlock\* pulled from the table.
+**Current goal (iter-49):** Lookup is called with **wild this**
+(r4 = 0x0c604c42 = TFlashStore* + 0x3e, NOT 0x0c604c04). iter-48's
+table-indexed probe at c74cc halted with `base=0x00100000 index=0x27
+entry=0x0a000005` — the "base" (= [r4+44] = [0x0c604c6e]) is just
+random bytes from a stack/heap region that happen to land in ROM
+range (so iter-47's base check missed it). The real bug is upstream:
+**Lookup's `this` argument is wild**.
 
-iter-48 must probe the natural table-indexed load at c74cc (`ldr
-r0, [r0, r1, lsl #2]`) — capture (base, index, returned). Halt
-when `table[index]` is outside RAM (0x0c000000..0x10000000) and
-ROM (0..0x800000). Dump table neighbourhood at the bad index +
-walk the caller chain. Then decide: are we iterating PAST the
-valid extent (r1 too large), or are specific table entries being
-overwritten between init and use?
+The call path: UnlockStore → DoCommit → FindSuperceeder (TAIL-CALL)
+→ Lookup. FindSuperceeder body at 0x001488ac..0x001488c8 ends with
+`ldr r0, [r0]; bic r1, r0, #0xf0000000; ...; b Lookup_thunk`. So
+Lookup's `this` = `*[input_TObjRef]` from FindSuperceeder. The
+input TObjRef is `DoCommit.sp+148` (a stack-local TObjRef in
+DoCommit's frame). On the wedge call, `*[sp+148]` = 0x0c604c42 —
+garbage, not a real TFlashStore* (note the iter-37/38 narrative
+already saw r0=0x0c604c42 entering Lookup; we just hadn't yet
+identified that it's coming from a poorly-initialised TObjRef
+local).
 
-### Iteration 46: bus-abort is PhysBlock(NULL) via Lookup→IsVirgin→LogEntryOffset
-
-Added c2418 probe (the iter-45 plan) — confirmed the c2418 site
-is NOT where the fault lives (8 sane firings, none on wedge).
-Re-decoded the kernel DABT trace: faulting PC = 0x000c0cd8
-(`ldr r2, [r0, #36]` inside PhysBlock). iter-44's PhysBlock probe
-only halted on bit-31-set r0 — extended it to also halt when
-`*[r0+0]` is wild (gated on r1 != -1 so the early-return path is
-unaffected). Result on cold boot: r0 = NULL — PhysBlock called
-with NULL `this`. `*[NULL]` reads VA 0 = the reset vector instr
-0xea0061a0; `[0xea0061a0+36] = 0xea0061c4` = unmapped → bus abort
-(matches the FAR we've been chasing since iter-43).
-
-APCS FP chain (decoded from c0808 = IsVirgin, c747c = Lookup):
-PhysBlock(NULL) ← `LogEntryOffset__11TFlashBlockFv`(NULL,
-wrapper@c0cac) ← `IsVirgin__11TFlashBlockFv`(NULL, c0808) ←
-`TFlashStore::Lookup` (c747c, bl IsVirgin at c74d4).
-
-Lookup body around c74c0..c74d4:
-
-```
-   c74c0: ldr r1, [r4, #96]        ; r4 = TFlashStore* this
-   c74c4: lsr r1, r7, r1
-   c74c8: ldr r0, [r4, #44]        ; r0 = this->[+44] (block-table base)
-   c74cc: ldr r0, [r0, r1, lsl #2] ; r0 = table[index]
-   c74d0: mov r9, r0
-   c74d4: bl IsVirgin               ; r0 = NULL on wedge
-```
-
-The pre-wedge `dabt-trip` line in the cold-boot output captured
-r0=0x20000000 r1=0x00000027 at PC=c74cc — i.e., on the wedge
-call, table base = `[r4+44]` = 0x20000000 (wild, outside
-RAM/ROM ranges). The IPA 0x2000009c is unmapped, so the load
-returned 0 (NULL), which then propagated into IsVirgin →
-LogEntryOffset → PhysBlock(NULL).
-
-#### Next iteration plan (iter-47)
-
-1. **Probe at c74c8 (`ldr r0, [r4, #44]`)** — capture r4 (the
-   TFlashStore*) and the loaded table base. Halt if base has
-   bit-31 set or is outside RAM (0x0c000000..0x10000000) /
-   ROM (0..0x800000). This bisects "wild base" vs "sane base
-   but indexed entry is NULL".
-
-2. **If the table base is wild** (= 0x20000000): trace who
-   wrote it. Likely candidates: a stage-2 alias to a different
-   PA (cf. iter-21 PA=0x04084000 alias finding), or a
-   write-during-init bug in TFlashStore setup. Add a stage-2
-   RO trap on TFlashStore+44 once the TFlashStore instance is
-   identified.
-
-3. **If the base is sane but `table[r1]` is NULL**: the bug is
-   that Lookup iterates past the valid block-table extent.
-   Check r1 against TFlashStore's table-size field (probably
-   adjacent to [+44]).
-
-4. **Sanity**: 64 prior PhysBlock calls had sane r0 values
-   (0x0c605950, 0x0c605970). The transition to r0=NULL on
-   call #65+ suggests iter-past-end rather than gradual
-   corruption — favors hypothesis #3.
+iter-49 must probe FindSuperceeder thunk entry (0x01af8c14) or
+FindSuperceeder body entry (0x001488a0) to capture incoming r0
+(the TObjRef ptr) AND dump 8 words at that pointer (the full
+TObjRef contents). Halt when TObjRef[+0] is outside RAM/ROM (=
+wild). Walk the caller chain to identify where in DoCommit the
+TObjRef was supposed to be populated.
 
 ### Iteration 47: Lookup's `[r4+44]` table base is consistently sane — wild values are TABLE ENTRIES, not the base
 
@@ -149,6 +96,81 @@ or specific entries got overwritten after init.
    show what a fully-booted Newton's TFlashStore->[+44] table
    looks like. If our boot's table differs only in a few
    entries, that's the corruption fingerprint.
+
+### Iteration 48: r4 (Lookup's `this`) is itself wild — the bug is upstream of Lookup
+
+Patched `c74cc: ldr r0, [r0, r1, lsl #2]` with HVC. Halt when
+`table[index]` is outside RAM/ROM. Cold boot: 12 logged Lookup-idx
+events with sane entries, then halt:
+
+```
+TFlashStore::Lookup loaded WILD entry from table[index]
+  base=0x00100000  index=0x27 (39)  entry_va=0x0010009c  entry=0x0a000005
+  TFlashStore* r4=0x0c604c42  r7 (search key)=0x00000027
+  caller_lr=0x000c4c4c  sp=0x0c328dec  fp=0x0c328e14
+```
+
+**r4 = 0x0c604c42**, not the sane 0x0c604c04 we saw in iter-47's 8
+logged calls. r4 = TFlashStore + 0x3e — clearly wild (also non-
+4-aligned). iter-47's c74c8 probe accepted base=0x00100000 as
+"sane" (it's < 0x800000 = ROM range), so the upstream wildness
+slipped through. The "table" at base 0x00100000 is literally ROM
+code bytes (table[0x21] = `e1a08000 = mov r8, r0`, etc.) —
+treating ROM instructions as 4-byte TFlashBlock pointers. The
+entry at index 0x27 is `0a000005` (= `beq 0x18` instruction
+encoding), which has bits set outside RAM/ROM ranges → halt.
+
+#### Decoded call chain (from FP walk + disasm)
+
+```
+[0] fp=0x0c328e14  pc_at_fp=0x000c7488  caller_lr=0x000c96cc  ; Lookup
+[1] fp=0x0c328ee8  pc_at_fp=0x000c94fc  caller_lr=0x000c87bc  ; DoCommit
+[2] fp=0x0c328f70  pc_at_fp=0x000c875c  caller_lr=0x00387060  ; UnlockStore
+[3]+ ...
+```
+
+UnlockStore (c8750) → DoCommit (c94f0) → at c96c8 `bl
+FindSuperceeder` with r0=sp+148, r1=sp+120. FindSuperceeder body
+at 0x001488a0..0x001488c8 ends with:
+
+```
+   001488bc: e5900000  ldr r0, [r0]                  ; r0 = *[input TObjRef]
+   001488c0: e3c0120f  bic r1, r0, #0xf0000000       ; r1 = lower 28 bits
+   001488c4: e140067e  UDF (SBA-emulated load)
+   001488c8: ea66d9a8  b   0x01afef70 → Lookup       ; tail-call
+```
+
+So **Lookup's r0 = `*[DoCommit.sp+148]` = TObjRef[+0]**. On the
+wedge call, that's 0x0c604c42 (garbage). The TObjRef at
+sp+148 is a stack-local in DoCommit; it's not properly
+initialised before being passed to FindSuperceeder.
+
+(Iter-37/38 already observed `Lookup r0=0x0c604c42` entering
+the wedge, but at the time we were chasing the r3=0x80000110
+shadow_stub corruption — iter-42 fixed that — and missed
+that r0 was independently wild.)
+
+#### Next iteration plan (iter-49)
+
+1. **Probe at FindSuperceeder thunk or body entry** (0x01af8c14
+   or 0x001488a0). Capture incoming r0 (= the TObjRef pointer
+   passed by DoCommit) AND dump 8 words at that pointer (the
+   TObjRef contents). Halt when TObjRef[+0] is outside RAM/ROM.
+
+2. **If TObjRef[+0] is consistently wild from the first call**:
+   the bug is in DoCommit's setup — the TObjRef at sp+148 is
+   NEVER properly initialised, OR it's initialised by a path
+   that's broken. Check what writes sp+148 in DoCommit upstream
+   of c96c0.
+
+3. **If TObjRef[+0] is sane initially and goes wild later**:
+   stack overflow from a callee or aliasing. Check whether
+   sp+148's PA aliases another active VA.
+
+4. **Cross-reference iter-37/38**: those captured `Lookup r0
+   =0x0c604c42` for the SAME wedge call (caller_lr=c96cc).
+   The value is recurring — strongly suggests a deterministic
+   init bug, not random corruption.
 
 ## Workflow per stop
 

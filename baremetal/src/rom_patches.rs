@@ -1067,6 +1067,18 @@ pub const LOOKUP_TABLE_BASE_PROBE_HVC_IMM: u32 = 0x73;
 pub const LOOKUP_TABLE_BASE_PROBE_PC:      u32 = 0x000C_74C8;
 const LOOKUP_TABLE_BASE_FIRST_INSN:        u32 = 0xE594_002C; // ldr r0, [r4, #44]
 
+/// `TFlashStore::Lookup` table-indexed load at ROM `0x000c_74cc`:
+/// `ldr r0, [r0, r1, lsl #2]` — r0 is the table base (loaded by
+/// c74c8, which iter-47 confirmed is consistently sane =
+/// 0x0c605848); r1 is the index. iter-47 confirmed the boot wedges
+/// downstream because some `table[index]` entry is wild
+/// (e.g. 0x0a000005). iter-48 patches this load to capture
+/// `(base, index, table[index])`, halts on wild result, and
+/// otherwise emulates the load.
+pub const LOOKUP_TABLE_IDX_PROBE_HVC_IMM:  u32 = 0x74;
+pub const LOOKUP_TABLE_IDX_PROBE_PC:       u32 = 0x000C_74CC;
+const LOOKUP_TABLE_IDX_FIRST_INSN:         u32 = 0xE790_0101; // ldr r0, [r0, r1, lsl #2]
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -1595,6 +1607,14 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(LOOKUP_TABLE_BASE_PROBE_HVC_IMM),
             "TFlashStore::Lookup table-base load (capture r4 + [r4+44]; halt if base wild)",
             LOOKUP_TABLE_BASE_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            LOOKUP_TABLE_IDX_PROBE_PC,
+            LOOKUP_TABLE_IDX_FIRST_INSN,
+            hvc_insn(LOOKUP_TABLE_IDX_PROBE_HVC_IMM),
+            "TFlashStore::Lookup table-indexed load (capture base+idx+entry; halt if entry wild)",
+            LOOKUP_TABLE_IDX_PROBE_HVC_IMM,
         );
     }
 }

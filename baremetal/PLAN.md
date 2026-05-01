@@ -17,33 +17,33 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-64):** iter-63 closed out the "what wakes
-`scrn`?" question and pivoted the investigation to "what is
-`newt` doing post-splash?". `scrn` is wired up correctly and
-idle by design — the right next step is to find which call in
-`TNotebook::InitToolbox` newt is currently inside. Concrete
-findings recorded below; next steps:
+**Current goal (iter-65):** iter-64 used the existing function
+tracer (`--features trace_once,quiet` — first-touch only, low
+overhead) to locate where newt actually is post-splash. **It is
+inside RunInitScripts → DoBlock running NewtonScript, doing text
+drawing and polling flash erases.** Concrete findings below; next
+steps:
 
-1. **Probe each `TNotebook::InitToolbox` step.** The function
-   at `0x146b28` makes a fixed sequence of ~13 calls (parent
-   init → virtual hook → script-globals → inker → orientation
-   → DrawSplashScreen → FPlaySoundIrregardless → print/font/
-   intl → recognition → RunInitScripts → InitDarkStar → tail).
-   Plant one HVC per call site to determine which call doesn't
-   return; the high-rotate-LDR-trap signature (~400 K/s at
-   `ELR=0xffffe4`) plus newt=RUN suggests we're inside something
-   that iterates heavily — most likely `RunInitScripts`'s
-   NewtonScript interpreter loop, but could also be
-   `FPlaySoundIrregardless` waiting on the sound server.
+1. **Identify which NewtonScript boot block is running.** The
+   `DoBlock(refHandle, *0x00680388)` call inside `RunInitScripts`
+   at ROM 0x1f1b18 picks up a NewtonScript frame from the symbol
+   table at `0x00680388`. Read that NS object out of the ROM
+   to identify the boot block, then trace what it does. The new
+   `IsInternalFlashEraseActive` and `CheckEraseCompletion`
+   first-touches at the trace tail strongly suggest the block
+   is provisioning the PSS store (formatting blocks via erase).
 2. **Cross-check against Einstein** — still outstanding from
-   iter-61/62. The clean oracle would be a small companion to
-   `NewtonProbe` that calls into `TEmulator` for 60 s and dumps
-   `gObjectTable` + run-queue head, mirroring our `task_dump`.
+   iter-61/62/63. The clean oracle would be a small companion
+   to `NewtonProbe` that calls into `TEmulator` for the same
+   wall-clock window and dumps `gObjectTable` + run-queue head,
+   mirroring our `task_dump`. Tells us whether Einstein at the
+   same point is still in this NS block or has progressed
+   further.
 3. **Optional perf (deferred):** ScratchVA fallback for the
    rotate-LDR `no_dead_scratches` rejection (98 % of inline-
    stub misses). Trap rate at splash idle is ~400 K/s, dominated
-   by `ELR=0xffffe4`. Fine for development unless it bottlenecks
-   diagnostics.
+   by `ELR=0xffffe4`. Fine for development unless it
+   bottlenecks diagnostics.
 
 **Background (unchanged from iter-61):** boot reaches a quiescent
 idle at the Newton splash. The framebuffer renders correctly
@@ -52,104 +52,91 @@ idle at the Newton splash. The framebuffer renders correctly
 all 24 others BLK. The residual `evt.ex.fr.store` throws are
 benign soup-probe misses caught by NewtonScript.
 
-### Iteration 63: SemOp OpList decoder; scrn wake-path mapped; InitToolbox decoded
+### Iteration 64: function tracer locates newt — past splash, inside RunInitScripts/DoBlock
 
-Adds a kernel-ID-aware OpList decoder to `task_dump` so any task
-parked at `SemaphoreOpGlue` (saved PC in `0x3ae1fc..0x3ae204`)
-auto-dumps the semaphore ops it's blocked on, with live sema
-counts and a `<-- BLOCKS` flag on the offending op. Also walks
-the disasm of the screen subsystem and `TNotebook::InitToolbox`
-to pin down the wake-path and the post-splash startup sequence.
+No code changes. Used the existing `--features trace_once,quiet`
+build (first-touch only, ~3% overhead vs full `trace`) to discover
+where newt has actually been post-splash. The "must be in
+TNotebook::InitToolbox somewhere" guess from iter-63 was right
+about the function but wrong about the step.
 
-Mechanism:
+#### Method
 
-- New `find_object_by_id` walks `gObjectTable`'s hash chain to
-  resolve a kernel object ID to a kernel-side VA. The user-side
-  `SemOp` wrapper at `0x25a464` derefs the user-handle to extract
-  the kernel ID (not a VA) before tail-branching into
-  `SemaphoreOpGlue`'s `svc #0xb`, so the saved `r0`/`r1` in the
-  task's SWIBoot save area at `+0x10`/`+0x14` are kernel IDs.
-- New `dump_oplist(group_id, oplist_id)` resolves both IDs via
-  the gObjectTable walk, then decodes the kernel-side
-  `TSemaphoreOpList` (count at +0x14, ops array at +0x10) and
-  prints each op as `sema[i] {wait_zero|inc|dec} delta=...`. The
-  encoding is `(sema_idx << 16) | (signed-16-bit delta)`, derived
-  from the kernel `SemOp` dispatch at ROM `0x1d4f64..0x1d4f74`.
-- Live cross-check: read sema[i].count from
-  `(group[+0x10] + i*40)+0x14` and flag the op that would block
-  *now*. At quiescent idle this is reliable.
+`trace_once` patches every code-symbol entry with a HVC trampoline
+that fires once per function (per-fn `INITIALISED` bitmap in
+`tracer.rs`). Cold boot for 90 s captured first-entries from
+trace 1 to ~4.25M; the system reached steady state with the
+expected `ELR=0xffffe4 SPSR=0x40000197` rotate-LDR trap signature
+at ~33M traps total.
 
-Findings (concrete):
+#### Findings
 
-- **scrn's blocking op identified.** At splash idle the dump
-  prints (verbatim from cold boot):
-  ```
-  SemOp: group @0xc125cec (id=0x3707) arr=0xc125d10 n=3
-         OpList @0xc125ec0 (id=0x3786) ops@0xc125edc count=4
-    op[0]: sema[0] wait_zero delta=+0  (op=0x00000000) sema@0xc125d10 count=0
-    op[1]: sema[0] inc       delta=+1  (op=0x00000001) sema@0xc125d10 count=0
-    op[2]: sema[1] dec       delta=-1  (op=0x0001ffff) sema@0xc125d38 count=0 <-- BLOCKS
-    op[3]: sema[2] wait_zero delta=+0  (op=0x00020000) sema@0xc125d60 count=0
-  ```
-  This OpList is `gScreen[+48]` per `InitScreenTask`. scrn is
-  blocked at `dec sema[1]` because no producer has incremented
-  sema[1].
-- **The only `inc sema[1]` OpList is at `gScreen[+44]`**, used
-  by exactly one producer: `QDStopDrawing` at `0x1ccf0c`. That
-  routine fires the wake whenever its dirty rect is non-empty.
-  `QDStopDrawing`'s 10 callers are all primitive QD operations:
-  `DrawLine`, `DrawArc`, `RgnBlt`, `DrTextChunk`, `InkerLine`,
-  `GrayShrink`, `StretchBits`. So scrn only fires when one of
-  these primitives runs **without an enclosing `StartDrawing`/
-  `StopDrawing` pair** — i.e. ad-hoc primitive drawing, not the
-  normal app-driven path.
-- **`StopDrawing` is NOT gated externally.** It uses
-  `OpList[+56]=(2:-1, 2:0, 2:1)` as a non-blocking barrier on
-  sema[2]: the first thread to acquire the barrier does
-  `UpdateHardwareScreen` synchronously itself; the rest fall
-  through. So scrn idle at splash is *expected* — drawing went
-  through the sync path, and there's no further QD primitive
-  drawing to fire scrn's wake. This kills the "scrn is stuck on
-  something we haven't satisfied" hypothesis.
-- **`TNotebook::InitToolbox` (0x146b28) decoded.** This is the
-  master post-OS-init driver that newt runs to bring the app
-  framework up. Sequence:
-    1. `TApplication::InitToolbox` (parent init)
-    2. virtual `this->vtable[+44]` (platform-specific hook)
-    3. `InitScriptGlobals`
-    4. `this->InitInker`
-    5. `GetPreference` + `SetOrientation`
-    6. **`this->DrawSplashScreen`** (renders the lightbulb)
-    7. **`FPlaySoundIrregardless(0x00680210)`** (startup sound;
-       blocks on sound server — `Schedule`/`Start` SVC paths
-       can throw)
-    8. `InitPrintDrivers` / `InitFontLoader` /
-       `InitInternationalUtils`
-    9. **`TRecognitionManager::Init`** at `0x1ab4a60`
-    10. **`RunInitScripts`** at `0x1aa0074` — sets up a
-        `setjmp`/`AddExceptionHandler`, then calls
-        `DoBlock(refHandle, *0x00680388)` to run a NewtonScript
-        block. This is the "run all the boot scripts" call.
-    11. `InitDarkStar`
-    12. tail `DisposeRefHandle`.
-  The splash is rendered (step 6 ran to completion), so newt
-  has reached at least step 7. The high rotate-LDR trap rate
-  with newt=RUN is most consistent with newt being inside step
-  10's NewtonScript interpreter, but FPlaySoundIrregardless
-  blocking on the sound server is also plausible.
+Newt's progression through user-mode boot, by trace number:
 
-Verification:
+```
+   16514  TAppWorld::TheMain                  (boot main)
+   18066  TLoader::TheMain                    (TLoader at 0x11401c)
+   71308  TSoundServer::TheMain               (separate task)
+  100494  TCardProcessor::TheMain             (separate task)
+ 4113325  TPSSManager::TheMain                (separate task; lasts 4M+ ticks)
+ 4171906  TNotebook::InitToolbox              (newt enters InitToolbox)
+ 4171907  TApplication::InitToolbox           (parent — step 1)
+ 4172358  DoBlock                             (RunInitScripts NewtonScript)
+ 4240890  TNotebook::DrawSplashScreen         (step 6 — splash logo)
+ 4241030  UpdateHardwareScreen
+ 4241034  BlitToScreens                       (the actual blit)
+   ...
+ 4244865  InitTextWalker
+ 4244866  ResetTextWalker                     (NS drawing text)
+ 4245205  IsInternalFlashEraseActive          (NS provisioning flash)
+ 4245206  TNewInternalFlash::CheckEraseCompletion
+ 4245210  TNewInternalFlash::InternalCheckEraseCompletion
+```
 
-- All 36 guest tests pass on QEMU.
-- 50 s SIGKILL'd cold boot reaches the same splash-idle state.
-  New OpList decode line is printed for `scrn` at every periodic
-  task dump.
+After trace 4245210 no new functions enter for the rest of the
+~33M-trap run. So newt is in a tight loop calling only previously-
+seen functions, dominated by `IsInternalFlashEraseActive` polls,
+text drawing, and the rotate-LDR alignment-fault path.
 
-Out of scope (deferred):
+What this tells us:
+- **Newt got past splash.** The "what wakes scrn" line of inquiry
+  was a dead end — scrn is quiet by design (only QD-primitive
+  drawing without an enclosing StartDrawing/StopDrawing wakes it).
+- **Newt is inside `DoBlock` in `RunInitScripts`** (step 10 of
+  TNotebook::InitToolbox), executing a NewtonScript boot block
+  loaded from `*0x00680388`. The NS block is actively drawing
+  text and waiting on flash erases — almost certainly
+  provisioning the PSS store on first boot (filling in the
+  Formatted-but-empty data area whose layout iter-58/63 showed
+  the kernel scanning).
+- **Trace overhead matters.** Full `--features trace,quiet`
+  slows boot enough that in 60 s of wall time the system
+  hadn't even cleared `InitPSSManager`'s flash log scan. Every
+  Newton function call becomes an EL2 round-trip; `trace_once`
+  amortises it to one round-trip per function.
 
-- The actual instrumentation of `TNotebook::InitToolbox` call
-  sites — that's iter-64.
-- Cross-check against Einstein — still outstanding.
+#### Verification
+
+- All 36 guest tests pass on QEMU (no code changes; ran the
+  suite to confirm baseline still green).
+- Two cold-boot runs:
+  - `trace_once,quiet` 90 s — log captured the boot waypoints
+    above; FB at `/tmp/newton-fb/00000.png` matches iter-61.
+  - `trace,quiet` 60 s — too slow to clear flash scan; abandoned.
+
+#### Out of scope (deferred to iter-65)
+
+- Decoding the NewtonScript block at `*0x00680388`. This is
+  what iter-65 should do — extract the boot-block frame and
+  identify which NS function is running.
+- ScratchVA fallback for rotate-LDR `no_dead_scratches`. 4634
+  rejections out of 4923 attempts (94 %) is a perf bottleneck
+  that would shrink the trap rate by an order of magnitude.
+
+<!-- iter-63 (SemOp OpList decoder + scrn wake mapping +
+     InitToolbox decode) pruned per the auto-prune maintenance
+     note. See `git log --grep="iter-63"` for the full
+     retrospective. -->
 
 <!-- iter-62 (per-task APCS stack tracer) pruned per the auto-prune
      maintenance note. See `git log --grep="iter-62"` for the full

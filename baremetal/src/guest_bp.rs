@@ -123,7 +123,33 @@ static GUEST_BP_FORCE_KEEP: (
     extern "C" fn(u32) -> i32,
     extern "C" fn(u32) -> i32,
     extern "C" fn(),
-) = (install_guest_bp, remove_guest_bp, list_guest_bps);
+    extern "C" fn(u32),
+) = (install_guest_bp, remove_guest_bp, list_guest_bps, bp_hit_anchor);
+
+/// Stable, gdb-friendly stop point for user-installed guest BPs. Called
+/// from `handle_user_bp_und` immediately after the slot lookup confirms
+/// a real BP hit (i.e. matched a slot in TABLE), and *before* any
+/// special-case PC dispatch. `faulting_pc` is the first AAPCS64 arg, so
+/// it lives in `w0`/`x0` at the call boundary — gdb evaluates a
+/// `condition <bp> faulting_pc == <addr>` filter cheaply and reliably.
+///
+/// The body is intentionally empty + `#[inline(never)]` so the symbol
+/// has a real entry the gdb stub can latch onto. Cost is one B+RET on
+/// every BP hit (probe BPs included), which is dwarfed by the existing
+/// trampoline / save-area / kprintln paths.
+///
+/// Used by the gdb-init `bp` command to set a stable conditional
+/// breakpoint, replacing the prior line-number-anchored
+/// `tbreak src/guest_bp.rs:481` which drifted as the source moved.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn bp_hit_anchor(_faulting_pc: u32) {
+    // SAFETY: empty body — the call/return is the entire purpose.
+    // `core::hint::black_box` defends the call against future LTO
+    // attempts to flatten this into a tail-merge or otherwise erase
+    // the symbol's entry instruction.
+    core::hint::black_box(_faulting_pc);
+}
 
 /// Install a one-shot guest breakpoint at ROM IPA `ipa`.
 ///
@@ -333,6 +359,11 @@ pub fn handle_user_bp_und(
             return false;
         }
     };
+
+    // Stable gdb stop point. Fires for every legitimate BP hit,
+    // before any special-case PC dispatch. The gdb-init `bp` command
+    // sets a conditional breakpoint here filtered on `faulting_pc`.
+    bp_hit_anchor(faulting_pc);
 
     // `NewHeap` entry probe at ROM 0x00310e24
     // (`mov ip, sp` — 0xe1a0c00d). r0 holds the new heap's RAM base

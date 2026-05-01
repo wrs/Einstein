@@ -1381,13 +1381,16 @@ pub fn periodic(ctx: &crate::trap::TrapContext) -> bool {
 /// at `ctx.x[11]` because of how the AArch32 register file maps to the
 /// AArch64 GPR file under EL2.
 ///
-/// Callable from gdb after `up`'ing into a frame where `ctx` is in
-/// scope, e.g. `trap_sync_lower_aarch32` or `trap_irq`:
+/// `#[no_mangle] extern "C"` so gdb's `call` works without the Rust
+/// language hook trying to resolve the function name as a tuple-struct
+/// constructor. Callable from gdb after `up`'ing into a frame where
+/// `ctx` is in scope, e.g. `trap_sync_lower_aarch32` or `trap_irq`:
 /// ```
-/// (gdb) call newton_hypervisor::task_dump::dump_current_chain(ctx)
+/// (gdb) call dump_current_chain(ctx)
 /// ```
 /// Or from any in-tree caller that has a `&TrapContext` handy.
-pub fn dump_current_chain(ctx: &crate::trap::TrapContext) {
+#[no_mangle]
+pub extern "C" fn dump_current_chain(ctx: &crate::trap::TrapContext) {
     let elr: u64;
     let spsr: u64;
     // SAFETY: reading sysregs has no side effects.

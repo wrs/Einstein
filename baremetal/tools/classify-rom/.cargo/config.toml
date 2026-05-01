@@ -1,9 +1,13 @@
 # Override the no_std cross target that baremetal/.cargo/config.toml imposes.
 # classify-rom is a host-side binary. The parent sets build.target to the
 # baremetal cross triple; we have to replace it with a string (cargo can't
-# merge string-in-parent with array-in-child). Hardcoding the host triple is
-# brittle across platforms but fine for the macOS dev environment this project
-# already targets. Linux contributors: edit to e.g. "x86_64-unknown-linux-gnu"
-# or "aarch64-unknown-linux-gnu".
+# merge string-in-parent with array-in-child).
+#
+# The canonical entry point is scripts/regen-classify.sh, which detects the
+# host triple via `rustc -vV` and passes `--target $host` to cargo, which
+# overrides this setting. The hardcoded value below is only consulted when
+# someone runs `cargo build` directly in this directory; it's set to the
+# project's primary dev target (Apple Silicon) and is harmless on other
+# hosts because the script overrides it.
 [build]
 target = "aarch64-apple-darwin"

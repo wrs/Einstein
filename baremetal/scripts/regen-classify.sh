@@ -35,17 +35,21 @@ for f in "$rom" "$rex" "$symbols"; do
     fi
 done
 
-(cd "$tool_dir" && cargo build --release)
-
-# The classify-rom crate pins its host target to aarch64-apple-darwin via
-# its own .cargo/config.toml. Look there first, then fall back to the
-# generic release dir in case a contributor edits that config.
-bin="$tool_dir/target/aarch64-apple-darwin/release/classify-rom"
-if [[ ! -x "$bin" ]]; then
-    bin="$tool_dir/target/release/classify-rom"
+# Detect the host triple from the active rustc so the build works on Intel
+# Macs, Apple Silicon Macs, and Linux without anyone editing the crate's
+# .cargo/config.toml. Passing --target on the command line overrides the
+# build.target hardcoded in tools/classify-rom/.cargo/config.toml.
+host="$(cd "$tool_dir" && rustc -vV | sed -n 's/^host: //p')"
+if [[ -z "$host" ]]; then
+    echo "regen-classify.sh: could not determine host triple from rustc -vV" >&2
+    exit 1
 fi
+
+(cd "$tool_dir" && cargo build --release --target "$host")
+
+bin="$tool_dir/target/$host/release/classify-rom"
 if [[ ! -x "$bin" ]]; then
-    echo "regen-classify.sh: classify-rom binary not found under $tool_dir/target" >&2
+    echo "regen-classify.sh: classify-rom binary not found at $bin" >&2
     exit 1
 fi
 

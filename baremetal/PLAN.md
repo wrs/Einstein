@@ -17,62 +17,87 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-69):** iter-68 instrumented the SBA UDF
-emulator with a per-mode + per-faulting_pc histogram (reverted
-before commit). The result is a third hypothesis falsification:
-**the wedge is not driven by SBA UDF emulation at all.** SBA UDFs
-fired exactly 131 K times during early boot — one histogram
-dump, dominated by SVC mode (sites 0x001a7ca8 / 0x001a7cac at
-~50 % each) — then went silent for the rest of a 22 M+ beacon
-run.
+**Current goal (iter-70):** **iter-69 found the wedge root cause.**
+Walter's original "shadow_stub is broken" hunch was correct.
+classify-rom's `BYTE_ACCESS_STATIC_BITMAP` falsely classifies a
+function-pointer literal-pool entry inside InitTextWalker as a
+sub-word access instruction; shadow_stub patches it; the corrupted
+value gets read as data, used as a function pointer, and the
+indirect call branches to high-VA garbage.
 
-The ABT-mode bucket is ZERO. iter-67's "DataAbortHandler stuck
-running emulated byte accesses" mechanism is also wrong. The
-wedge is happening **without any SBA UDF traffic at all**.
+Concrete chain:
 
-**Updated mechanism (most plausible):** The CPU is spinning
-natively in a tight loop at PC ≈ `0xFFFFE4`, the
-`UND_RETURN_STUB`. Two-instruction body:
+1. `InitTextWalker` (ROM 0x35c41c..0x35c49c) ends with a literal
+   pool. The last word at **0x35c49c** is the function-pointer
+   constant **0x01b494f4** (a JT thunk address; the disasm shows
+   "<UNDEFINED> instruction: 0x01b494f4" — that's a literal, not
+   code).
+2. classify-rom marks 0x35c49c as a sub-word access instruction
+   (false positive). NEXT_SITE allocation gave it slot **0x420**.
+3. shadow_stub patches 0x35c49c to `enc_udf(0x8000 | 0x420)` =
+   **0xe7f842f0**. SBA_ORIG_INSN[0x420] = 0x01b494f4 (the original
+   pointer value, decoded as if it were a byte access, which it
+   isn't); SBA_ORIG_PC[0x420] = 0x35c49c.
+4. At runtime, `InitTextWalker` does
+   `ldr r0, [pc, #52] @ 0x35c49c` (instruction at 0x35c460) — it
+   reads the literal *as a 32-bit word*, getting 0xe7f842f0
+   instead of 0x01b494f4.
+5. `str r0, [r4, #8]` saves the corrupt value as the TextWalker's
+   "scanner" function pointer.
+6. Later: `ldr pc, [r4, #8]` (at 0x35c494, paired with `mov lr,
+   pc` at 0x35c490) — PC := 0xe7f842f0.
+7. Guest fetches at high VA 0xe7f842f0 → AArch32 PABT (no stage-1
+   mapping). Kernel handler runs. The retry path keeps re-fetching
+   the same bad PC → permanent loop.
+
+The key periodic dump that revealed it (one out of dozens that
+caught newt in USR mode rather than ABT):
 
 ```
-0xFFFFE4: ldr lr, [pc, #0]    ; lr = *(0xFFFFEC)
-0xFFFFE8: movs pc, lr         ; PC = lr, CPSR = SPSR_<mode>
-0xFFFFEC: <literal>           ; written by EL2 before each ERET
+current task 0xc12391c (newt) id=0x3113 mode=0x10
+  [pc=0xe7f842f0 lr=0x35c498 sp=0xcc7787c fp=0xcc77894]
 ```
 
-If the literal at `0xFFFFEC` was last written to `0xFFFFE4`
-(or any PC that immediately re-enters the stub), the stub
-loops at 2 cycles/iteration with no traps. Timer IRQs fire ~16
-ms apart (or the kernel re-asserts the timer aggressively),
-catching the guest at PC=0xFFFFE4 every time. That matches the
-~100 K-1 M trap/s "beacon" rate without the ETx2 SBA UDF
-volume that iter-67 expected.
+`LR_usr = 0x35c498` is the return address from the indirect call
+pair `mov lr, pc; ldr pc, [r4, #8]` at 0x35c490–0x35c494. PC is the
+loaded value.
 
-**Open questions for iter-69:**
+**Why iter-66/67/68 hypotheses all missed this:**
 
-1. **Read the literal at `0xFFFFEC`.** If it's `0xFFFFE4`,
-   that's the wedge — a self-referential UND_RETURN_STUB. If
-   it's some other PC, follow the chain from there.
-2. **What writes the literal?** `trap::return_to_guest_from_und`
-   in `src/trap.rs` writes the literal slot before each ERET
-   to UND_RETURN_STUB. If the SBA emulator is fed
-   `faulting_pc = 0xFFFFE0` (or any address that yields
-   `target = 0xFFFFE4` after `+4`), the stub becomes
-   self-referential.
-3. **What earlier event poisons the literal?** A USR fault
-   inside the trampoline region (`0xFFFFXX`) would do it.
-   Could also come from a kernel-side `bx LR` where LR holds
-   a stale UND_RETURN_STUB target.
+- iter-66 looked at slot 0x424 (LDRB at 0x35d110). Coincidence:
+  slot 0x420 — *adjacent* slot, different PC — was the actual
+  culprit, and 0x424 just happens to be in the same neighbour
+  cluster of slots from the same DrTextChunk family.
+- iter-67/68 looked for the wedge inside the abort handler. The
+  abort handler IS running, but it's reacting to USR's bad
+  branch, not generating the wedge itself.
+- iter-69's "literal poisoning of UND_RETURN_STUB" probe didn't
+  fire because the literal was being set to legitimate USR PCs
+  outside the trampoline region — the wedge is *upstream* of the
+  return-stub literal write.
 
-**iter-69 plan:**
+**iter-70 plan: fix classify-rom (or add a shadow_stub guard).**
 
-- One-shot kprintln in `trap::return_to_guest_from_und`
-  recording the first time the literal is written with
-  `target ∈ 0xFFFFE0..0xFFFFF0` (= self-referential into the
-  trampoline region). Logs `(faulting_pc, target, source mode,
-  caller LR)`.
-- If that fires, `bp` the captured `faulting_pc` to inspect
-  USR-side state at the moment the bad target was computed.
+Two fix paths, in order of preference:
+
+1. **Detect literal pools in classify-rom.** Newton's compiler
+   emits literal pools right after function bodies (after `ldmdb
+   fp, {…pc}` epilogues). Words between the epilogue and the
+   next function symbol are constants, not instructions. Update
+   `tools/classify-rom` to suppress sub-word-access marks for
+   any address that's:
+   - within `[function_end, next_function_start)`, AND
+   - the target of a `ldr Rd, [pc, #imm]` from inside the
+     enclosing function.
+2. **Runtime guard in shadow_stub.** Before patching, scan the
+   surrounding 32 instructions for an `ldr Rd, [pc, #imm]`
+   whose computed literal address equals the patch site. If
+   found, skip the patch. Cheaper and isolates the fix to the
+   hypervisor side.
+
+Once the fix lands, the boot should advance past
+`InitTextWalker → DrTextChunk` and reach the actual
+post-splash NewtonScript boot block iter-64 was trying to identify.
 
 **Background (unchanged from iter-61):** boot reaches a quiescent
 idle at the Newton splash. The framebuffer renders correctly
@@ -80,6 +105,111 @@ idle at the Newton splash. The framebuffer renders correctly
 `newt`=RUN, `scrn`=RDY blocked on its event-signal sema-group,
 all 24 others BLK. The residual `evt.ex.fr.store` throws are
 benign soup-probe misses caught by NewtonScript.
+
+### Iteration 69: ROOT CAUSE — classify-rom + shadow_stub corrupt a function-pointer literal
+
+#### Method
+
+iter-69 added a one-shot probe in `trap::return_to_guest_from_und`
+to log the first time the UND_RETURN_STUB literal at 0xFFFFEC
+was set to a value inside the trampoline region (testing the
+iter-68 self-loop hypothesis). **The probe never fired** —
+falsifying iter-68 too.
+
+The breakthrough came from a different direction: cross-checking
+periodic dumps that caught newt outside the wedge state. One
+single dump captured newt in **USR mode** (mode=0x10) instead of
+the usual ABT-mode wedge:
+
+```
+current task 0xc12391c (newt) id=0x3113 mode=0x10
+  [pc=0xe7f842f0 lr=0x35c498 sp=0xcc7787c fp=0xcc77894]
+```
+
+`PC = 0xe7f842f0` and `LR_usr = 0x35c498`. This is the moment of
+the *first* PABT, before the kernel handler is even reached.
+
+#### Identifying the call site
+
+`LR = 0x35c498` is the return address from a function call ending
+just before that. Disasm of `InitTextWalker` (0x35c41c..0x35c49c):
+
+```
+  35c460:  e59f0034   ldr r0, [pc, #52]   @ literal at 0x35c49c
+  35c464:  e1a01005   mov r1, r5
+  35c468:  e5840008   str r0, [r4, #8]    @ TextWalker.scanner = r0
+  …
+  35c490:  e1a0e00f   mov lr, pc          @ LR = 0x35c498
+  35c494:  e594f008   ldr pc, [r4, #8]    @ PC = TextWalker.scanner
+  35c498:  e91ba830   ldmdb fp, {…, pc}   @ epilogue (return target)
+  35c49c:  01b494f4                       @ literal: function pointer
+```
+
+So `*0x35c49c` is a function-pointer literal originally
+`0x01b494f4` (a JT-thunk address in 0x01A00000..0x01C20000). The
+disassembler misleadingly labels it "<UNDEFINED> instruction" —
+it's a literal, not code.
+
+#### Identifying the corruption
+
+`enc_udf(0x8000 | 0x420) = 0xe7f842f0` — the SBA UDF marker for
+slot 0x420. Cross-check via the slot table dump from iter-66:
+
+```
+SBA_ORIG_PC[0x420..0x428]: 0x35c49c, 0x35d078, 0x35d0ac, 0x35d0bc,
+                            0x35d110, 0x35d144, 0x35d148, 0x35d1ac
+```
+
+**Slot 0x420 = orig_pc 0x35c49c.** That's the literal-pool entry.
+shadow_stub::patch_rom_from_bitmap walked
+BYTE_ACCESS_STATIC_BITMAP, the bit for word offset 0x35c49c was
+set, so emit_udf_site overwrote `*0x35c49c` (originally the
+function pointer 0x01b494f4) with the UDF marker `0xe7f842f0`.
+
+#### Result
+
+When `InitTextWalker` runs, the `ldr r0, [pc, #52]` reads the
+patched literal — getting `0xe7f842f0` instead of `0x01b494f4`.
+That value is stored as the TextWalker's scanner function
+pointer and called via `ldr pc, [r4, #8]`. Branching to high VA
+0xe7f842f0 traps to AArch32 PABT; the kernel's recovery path
+loops on the unmapped fetch.
+
+The persistence of the wedge across multiple periodic dumps is
+because the kernel handler retries the same bad branch on every
+recovery, and the `mode=ABT` snapshot captures the handler
+mid-emulation rather than USR mode mid-call.
+
+#### Why all prior hypotheses missed it
+
+- **iter-66**: Looked at slot 0x424 (LDRB at 0x35d110). Wrong slot
+  by an off-by-4 — the actual culprit is slot 0x420 in the same
+  cluster. The 0x424-vs-0x420 confusion came from misreading
+  `LR_abt = 0xe7f842f4` as the SBA marker (it IS slot 0x424's
+  marker, but that's coincidental; LR_abt reflects later state
+  inside the abort handler, not the original bad PC).
+- **iter-67/68**: Looked inside the kernel abort handler. The
+  handler IS running, but it's reacting to the bad branch, not
+  generating it.
+- **iter-69 (literal-poison probe)**: Never fired — the wedge is
+  upstream of the UND_RETURN_STUB. Negative result was useful.
+
+#### iter-70 plan: fix the bitmap classification
+
+Two paths, in order of preference:
+
+1. **Fix `tools/classify-rom`.** Newton's compiler emits literal
+   pools right after function bodies (after `ldmdb fp, {…pc}`
+   epilogues). Words between the epilogue and the next function
+   symbol are constants, not instructions. Suppress sub-word-
+   access marks for any address that is BOTH in such a tail
+   range AND the target of an in-function `ldr Rd, [pc, #imm]`.
+2. **Runtime guard in `shadow_stub::patch_one_site`.** Before
+   patching, scan a small window of preceding instructions for
+   any `ldr Rd, [pc, #imm]` whose computed literal address
+   equals the patch site. If found, skip the patch — it's a
+   data word, not code. Cheaper and isolates the fix to the
+   hypervisor side.
 
 ### Iteration 68: DataAbortHandler-internal hypothesis falsified; SBA UDFs are silent in the wedge
 
@@ -139,56 +269,13 @@ iter-69 starts with a one-shot probe in
 literal is set to a self-referential value
 (`target ∈ 0xFFFFE0..0xFFFFF0`).
 
-### Iteration 67: PABT-recovery hypothesis falsified; wedge is in DataAbortHandler
-
-#### Method
-
-Two probes added (both reverted before commit):
-
-- `install_guest_bp(0x0039_3b84)` in `kmain`: patches the first
-  instruction of `PrefetchAbortHandler` with the marker UDF. The
-  default dump-and-continue tail in `handle_user_bp_und` would
-  log r0..r12 + banked LR/SP for every kernel-side PABT entry.
-- Unsuppressed-repeat counter in `log_dabt_forward`
-  (`src/trap.rs` ~6822): logs the first 16 repeat hits per
-  (FAR, mode, dedup_mode) tuple plus every 64th up to 1024,
-  bypassing the existing dedup so the wedge's dominant fault
-  isn't silenced.
-
-Cold-boot, no debugger.
-
-#### Result
-
-Boot reached the wedge state (`ELR=0xffffe4 SPSR=0x40000197
-mode=ABT`) at ~3M beacons. Kept running to 4.6M+ beacons.
-
-- **PrefetchAbortHandler bp: 0 hits.** No "guest_bp: HIT at
-  0x00393b84" line appeared. The kernel's PABT path doesn't
-  reach 0x393b84 in the wedge state. So the wedge isn't
-  driven by repeated PABTs.
-- **DABT-forward repeat counter: 0 events.** The single
-  pre-existing forward (`DFSC=0x5 FAR=0x0cd2d000 mode=0x17`)
-  is the only `handle_diag` ABT-source dispatch in the entire
-  run — no further aborts go through DIAG.
-
-#### Implication
-
-iter-66's "PABT recovery loop on permanently-unmapped VA"
-hypothesis is **falsified**. The trap-rate signature at
-`ELR=0xffffe4` (UND_RETURN_STUB) is pure SBA UDF emulation
-inside the kernel's `DataAbortHandler` — invoked once for the
-recursive DABT at FAR=0x0cd2d000 (mode=0x17), and stuck
-running *inside its own body* without making forward progress
-on a tight loop of byte accesses.
-
-The wedge is therefore *upstream* of any USR-mode "indirect
-call to high VA" bug. The kernel's DataAbortHandler entered with
-corrupt state from the original DABT and is now grinding through
-emulated byte accesses that never converge to a return.
-
-`LR_abt = 0xe7f842f4` in periodic dumps is just a register value
-left over from inside the handler's body; not a hardware abort
-artifact.
+<!-- iter-67 (PABT-recovery hypothesis falsified — bp at
+     PrefetchAbortHandler 0x393b84 fired 0 times, dabt-forward
+     repeat counter logged 0 events) pruned per auto-prune. See
+     `git log --grep="iter-67"`. Both falsified hypotheses
+     (iter-66 LDRB-loop, iter-67 PABT-recovery) are superseded
+     by iter-69's actual root cause: shadow_stub corrupted a
+     literal-pool function pointer at 0x35c49c. -->
 
 <!-- iter-66 (slot 0x424 LDRB hypothesis falsified — the LDRB at
      0x35d110 is never executed during the wedge despite the UDF

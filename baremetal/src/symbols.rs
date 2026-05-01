@@ -2,8 +2,8 @@
 //! feature gate around `mod tracer`).
 //!
 //! `build.rs` reads `scripts/classify-out/code-symbols.txt` (the
-//! curated code-only symbol list) and emits three files into
-//! `OUT_DIR`:
+//! curated code-only address list) and `../_Data_/symbols.txt` (the
+//! mangled-name source) and emits three files into `OUT_DIR`:
 //!
 //!   - `fn_addrs.bin`     — packed u32 LE, sorted by entry address.
 //!   - `fn_name_offs.bin` — packed u32 LE, parallel to fn_addrs;

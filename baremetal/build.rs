@@ -4,11 +4,17 @@
 //   guest test image (if $NH_GUEST_TEST is set to a .bin file). Sets the
 //   `nh_guest_test` cfg so `guest_mem.rs` takes the test-mode branch.
 // - When the `trace` cargo feature is on, parses
-//   ../_Data_/demangled_symbols.txt and emits three compact binary blobs
-//   into OUT_DIR for src/tracer.rs to `include_bytes!`:
+//   scripts/classify-out/code-symbols.txt for the vetted code-only address
+//   list and ../_Data_/symbols.txt for the matching mangled names, then
+//   emits three compact binary blobs into OUT_DIR for src/tracer.rs and
+//   src/task_dump.rs to `include_bytes!`:
 //     fn_addrs.bin       — packed u32 LE, sorted ROM-range function entry PAs
 //     fn_name_offs.bin   — parallel u32 LE offsets into fn_names.bin
-//     fn_names.bin       — NUL-separated demangled names (name pool)
+//     fn_names.bin       — NUL-separated mangled names (name pool). Mangled
+//                          rather than demangled because demangled C++ names
+//                          can be 100+ chars (full arg type list); the
+//                          mangled form is typically <40 chars and prints
+//                          legibly in stack traces.
 
 use std::env;
 use std::fs;
@@ -112,9 +118,37 @@ fn build_trace_tables() {
     let text = fs::read_to_string(&sym_path)
         .unwrap_or_else(|e| panic!("trace: read {:?}: {e}", sym_path));
 
-    // Strict tab-separated parse: `<hex addr>\t<name>`. Classify-symbols.py
-    // has already applied the address/name filters; we only defend against
-    // blatantly wrong entries (unaligned, out of ROM range).
+    // Mangled-name source. classify-symbols.py reads demangled_symbols.txt
+    // (because the classifier rules match on demangled patterns), so
+    // code-symbols.txt carries demangled names. We override with the
+    // mangled equivalent at the same address — falling back to the
+    // demangled string only if the addr isn't in symbols.txt (rare; mostly
+    // applies to a handful of tool-emitted entries that aren't part of
+    // the original symbol table).
+    let mangled_path = Path::new(&manifest).join("../_Data_/symbols.txt");
+    let mut mangled_map: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    if mangled_path.is_file() {
+        println!("cargo:rerun-if-changed={}", mangled_path.display());
+        let mtext = fs::read_to_string(&mangled_path)
+            .unwrap_or_else(|e| panic!("trace: read {:?}: {e}", mangled_path));
+        for line in mtext.lines() {
+            let mut it = line.splitn(3, '\t');
+            let addr_s = match it.next() { Some(s) => s.trim(), None => continue };
+            let name = match it.next() { Some(s) => s.trim(), None => continue };
+            if name.is_empty() { continue; }
+            let hex = match addr_s.strip_prefix("0x").or_else(|| addr_s.strip_prefix("0X")) {
+                Some(h) => h, None => continue,
+            };
+            if let Ok(addr) = u32::from_str_radix(hex, 16) {
+                mangled_map.entry(addr).or_insert_with(|| name.to_string());
+            }
+        }
+    }
+
+    // Strict tab-separated parse of code-symbols.txt: `<hex addr>\t<name>`.
+    // Classify-symbols.py has already applied the address/name filters;
+    // we only defend against blatantly wrong entries (unaligned, out of
+    // ROM range).
     let mut entries: Vec<(u32, String)> = Vec::new();
     let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
@@ -137,7 +171,8 @@ fn build_trace_tables() {
         if addr >= 0x0100_0000 { continue; }
 
         if seen.insert(addr) {
-            entries.push((addr, name.to_string()));
+            let final_name = mangled_map.get(&addr).cloned().unwrap_or_else(|| name.to_string());
+            entries.push((addr, final_name));
         }
     }
 

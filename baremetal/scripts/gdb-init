@@ -83,11 +83,34 @@ define bp
     # Stop in the UND handler itself. The UND trampoline bounces
     # through HVC before entering EL2, so `$ELR_EL2` at trap_sync
     # entry is the trampoline PC, not the guest PC — `bg` works for
-    # other sync-trap classes but not UND. `handle_user_bp_und` is
-    # only called when our marker UDF matched in the BP table, so any
-    # hit corresponds to a user guest-BP. We break unconditionally and
-    # leave filtering to the user (inspect `faulting_pc` on stop).
-    break newton_hypervisor::guest_bp::handle_user_bp_und
+    # other sync-trap classes but not UND.
+    #
+    # Anchor the stop at the `kprintln!("guest_bp: HIT …")` call in
+    # the default dump-and-restore tail of handle_user_bp_und (line
+    # 481 of src/guest_bp.rs — update if the source moves). Two
+    # reasons not to break at the function entry:
+    #   (a) `lock()` inlines an atomic CAS at the top of the fn; the
+    #       inlined frame drops DWARF for `ctx`/`faulting_pc`, so
+    #       those args are only visible after `up 3`.
+    #   (b) Stopping unconditionally trips for *any* guest_bp hit —
+    #       including the always-armed probe BPs at 0x310e24,
+    #       0x1a4948, 0x142df0, 0x313308. Filtering on faulting_pc
+    #       would fail at frame 0 there too because of (a).
+    # Anchoring at the HIT-log line instead lands at frame 0 of
+    # handle_user_bp_und with `ctx` and `faulting_pc` live, and the
+    # `if faulting_pc == $arg0` filter Just Works.
+    #
+    # Caveat: the four probe PCs above return earlier in the function
+    # and never reach the HIT line, so this breakpoint will not fire
+    # for them. That's deliberate — they're persistent instrumentation
+    # that emits its own kprintln logs and is not meant to halt gdb.
+    # If you ever need to stop at one of them, set a manual tbreak on
+    # a line inside that PC's `if` arm.
+    #
+    # `tbreak` (one-shot) matches the underlying guest_bp's one-shot
+    # semantic — fires once and auto-deletes, so repeated `bp`
+    # invocations don't accumulate stale gdb breakpoints.
+    tbreak src/guest_bp.rs:481 if faulting_pc == $arg0
   end
 end
 document bp

@@ -482,12 +482,12 @@ fn fmt_pc_name(pc: u32) -> ([u8; 96], usize) {
     (buf, n)
 }
 
-/// Walk an APCS frame chain from `start_fp` and print up to
-/// `depth_cap` frames. Each line shows `fp`, the saved PC at that
-/// frame (≈ where the function was when its child got called), and
-/// the saved LR (≈ the caller's return address — the function this
-/// frame returns into). Symbol names are best-effort via
-/// `tracer::fn_name_for_pc`.
+/// Walk an APCS frame chain from `start_fp`, calling `emit(frame_lr, fp)`
+/// once per frame up to `depth_cap`. The saved LR at each frame is the
+/// return address into *this* frame's caller — i.e. the address where
+/// the next function up the chain will resume. We emit only that and
+/// not the saved PC (which is the prologue-stored PC, always near
+/// entry, hence redundant for a one-line-per-function chain print).
 ///
 /// APCS prologue (per `docs/NEWTON_INTERNALS.md`):
 /// ```
@@ -616,29 +616,30 @@ fn dump_oplist(group_id: u32, oplist_id: u32, indent: &str) {
 }
 
 /// Walk: `prev_fp = *(fp - 12)`. Stop at NULL / unaligned / bogus
-/// VA / self-loop / depth cap.
-fn walk_apcs_frames(start_fp: u32, depth_cap: usize) {
+/// VA / self-loop / depth cap. Emits `(frame_lr, fp)` per frame so the
+/// caller can render a one-line-per-function chain.
+fn walk_apcs_frames(start_fp: u32, depth_cap: usize, mut emit: impl FnMut(u32, u32)) {
     let mut fp = start_fp;
     let mut prev_fp = 0u32;
     let mut depth = 0usize;
     while depth < depth_cap {
         if fp == 0 || fp == u32::MAX || (fp & 3) != 0 { break; }
         if fp == prev_fp { break; }
-        let frame_pc = match rd(fp) { Some(v) => v, None => break };
         let frame_lr = match rd(fp.wrapping_sub(4)) { Some(v) => v, None => break };
         let new_fp   = match rd(fp.wrapping_sub(12)) { Some(v) => v, None => break };
-        let (pc_buf, pc_n) = fmt_pc_name(frame_pc);
-        let (lr_buf, lr_n) = fmt_pc_name(frame_lr);
-        let pc_name = core::str::from_utf8(&pc_buf[..pc_n]).unwrap_or("?");
-        let lr_name = core::str::from_utf8(&lr_buf[..lr_n]).unwrap_or("?");
-        kprintln!(
-            "        #{:<2} {}  <-  {}  [pc={:#x} lr={:#x} fp={:#x}]",
-            depth + 1, pc_name, lr_name, frame_pc, frame_lr, fp,
-        );
+        emit(frame_lr, fp);
         prev_fp = fp;
         fp = new_fp;
         depth += 1;
     }
+}
+
+/// Print one chain frame: `        #N  <name+offset>`. Used by
+/// `dump_blocked_pcs` to render a stack trace as one function per line.
+fn print_chain_frame(depth: usize, pc: u32) {
+    let (buf, n) = fmt_pc_name(pc);
+    let name = core::str::from_utf8(&buf[..n]).unwrap_or("?");
+    kprintln!("        #{:<2} {}", depth, name);
 }
 
 /// (i.e. it's blocked somewhere), print its saved PC + SP_usr from the
@@ -670,16 +671,36 @@ fn dump_blocked_pcs() {
                         None => (b'?',b'?',b'?',b'?'),
                     };
                     let fp_usr = rd(node + 0x3c).unwrap_or(u32::MAX);
-                    let (pc_buf, pc_n) = fmt_pc_name(saved_pc);
-                    let (lr_buf, lr_n) = fmt_pc_name(lr_usr);
-                    let pc_name = core::str::from_utf8(&pc_buf[..pc_n]).unwrap_or("?");
-                    let lr_name = core::str::from_utf8(&lr_buf[..lr_n]).unwrap_or("?");
                     kprintln!(
-                        "    task {:#x} ({}{}{}{}) id={:#x} SPSR={:#x}  PC={} <- LR={}  [pc={:#x} lr={:#x} sp={:#x} fp={:#x}]",
+                        "    task {:#x} ({}{}{}{}) id={:#x} SPSR={:#x}  [pc={:#x} lr={:#x} sp={:#x} fp={:#x}]",
                         node, n0 as char, n1 as char, n2 as char, n3 as char,
-                        id, saved_spsr, pc_name, lr_name,
+                        id, saved_spsr,
                         saved_pc, lr_usr, sp_usr, fp_usr,
                     );
+                    // Call chain, one function per line:
+                    //   #0 = currently-suspended PC (saved_pc reg)
+                    //   #1 = where the leaf will return — saved LR reg.
+                    //        For a SWI-stub leaf (e.g. PortReceiveSWI) the
+                    //        leaf has no APCS frame, so this is the
+                    //        leaf-caller's resume address.
+                    //   #N (N≥2) = the saved LR at each successive APCS
+                    //        frame, walked from fp_usr. Each frame's
+                    //        saved LR identifies the next function up the
+                    //        chain at its active call site (mid-function
+                    //        offset, more useful than the prologue-stored
+                    //        saved PC). 12-frame cap guards against a
+                    //        corrupt chain spamming the log.
+                    print_chain_frame(0, saved_pc);
+                    if lr_usr != 0 && lr_usr != u32::MAX {
+                        print_chain_frame(1, lr_usr);
+                    }
+                    if fp_usr != 0 && fp_usr != u32::MAX && (fp_usr & 3) == 0 {
+                        let mut depth = 2usize;
+                        walk_apcs_frames(fp_usr, 12, |frame_lr, _fp| {
+                            print_chain_frame(depth, frame_lr);
+                            depth += 1;
+                        });
+                    }
                     // If parked in SemaphoreOpGlue, decode the OpList:
                     // saved r0 = TSemaphoreGroup* (kernel), saved r1 =
                     // TSemaphoreOpList* (kernel), both live in the
@@ -688,13 +709,6 @@ fn dump_blocked_pcs() {
                         let r0 = rd(node + 0x10).unwrap_or(0);
                         let r1 = rd(node + 0x14).unwrap_or(0);
                         dump_oplist(r0, r1, "      ");
-                    }
-                    // Walk the APCS frame chain starting at fp_usr.
-                    // 12 frames is plenty for everything we've seen so
-                    // far; cap stops a corrupt chain from spamming the
-                    // log.
-                    if fp_usr != 0 && fp_usr != u32::MAX && (fp_usr & 3) == 0 {
-                        walk_apcs_frames(fp_usr, 12);
                     }
                     if n0 == b'n' && n1 == b'e' && n2 == b'w' && n3 == b't' {
                         kprintln!("      newt user-stack window (sp_usr +0x00..+0x80):");

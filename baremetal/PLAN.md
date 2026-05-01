@@ -17,94 +17,119 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-70):** **iter-69 found the wedge root cause.**
-Walter's original "shadow_stub is broken" hunch was correct.
-classify-rom's `BYTE_ACCESS_STATIC_BITMAP` falsely classifies a
-function-pointer literal-pool entry inside InitTextWalker as a
-sub-word access instruction; shadow_stub patches it; the corrupted
-value gets read as data, used as a function pointer, and the
-indirect call branches to high-VA garbage.
-
-Concrete chain:
-
-1. `InitTextWalker` (ROM 0x35c41c..0x35c49c) ends with a literal
-   pool. The last word at **0x35c49c** is the function-pointer
-   constant **0x01b494f4** (a JT thunk address; the disasm shows
-   "<UNDEFINED> instruction: 0x01b494f4" — that's a literal, not
-   code).
-2. classify-rom marks 0x35c49c as a sub-word access instruction
-   (false positive). NEXT_SITE allocation gave it slot **0x420**.
-3. shadow_stub patches 0x35c49c to `enc_udf(0x8000 | 0x420)` =
-   **0xe7f842f0**. SBA_ORIG_INSN[0x420] = 0x01b494f4 (the original
-   pointer value, decoded as if it were a byte access, which it
-   isn't); SBA_ORIG_PC[0x420] = 0x35c49c.
-4. At runtime, `InitTextWalker` does
-   `ldr r0, [pc, #52] @ 0x35c49c` (instruction at 0x35c460) — it
-   reads the literal *as a 32-bit word*, getting 0xe7f842f0
-   instead of 0x01b494f4.
-5. `str r0, [r4, #8]` saves the corrupt value as the TextWalker's
-   "scanner" function pointer.
-6. Later: `ldr pc, [r4, #8]` (at 0x35c494, paired with `mov lr,
-   pc` at 0x35c490) — PC := 0xe7f842f0.
-7. Guest fetches at high VA 0xe7f842f0 → AArch32 PABT (no stage-1
-   mapping). Kernel handler runs. The retry path keeps re-fetching
-   the same bad PC → permanent loop.
-
-The key periodic dump that revealed it (one out of dozens that
-caught newt in USR mode rather than ABT):
+**Current goal (iter-71):** boot now wedges on an unrecognised
+AArch32 coprocessor instruction:
 
 ```
-current task 0xc12391c (newt) id=0x3113 mode=0x10
-  [pc=0xe7f842f0 lr=0x35c498 sp=0xcc7787c fp=0xcc77894]
+*** unrecognised UND: insn=0xed2dc203 at PC=0xd2780 SPSR_und=0x60000110
+    (extend handle_und in trap.rs to handle this opcode)
 ```
 
-`LR_usr = 0x35c498` is the return address from the indirect call
-pair `mov lr, pc; ldr pc, [r4, #8]` at 0x35c490–0x35c494. PC is the
-loaded value.
+`0xed2dc203` decodes as `STC2 p2, c12, [sp, #-12]!` (or similar
+coprocessor 2 store) — VFP/floating-point register save state
+emitted as part of the kernel's FPU context-switch path that the
+ROM 717006 expects to be handled by an FPU emulator. Newton ROM's
+`FP_UndefHandlers_*` (now reachable, see iter-70) intercepts FPU
+instructions; this opcode either falls through that handler or is
+emitted by code outside the FPU emulation entry point.
 
-**Why iter-66/67/68 hypotheses all missed this:**
+iter-71 plan: identify the call chain landing at PC=0xd2780,
+determine which FPU/coprocessor opcode family the ROM uses for
+context save/restore, and either widen the trap.rs UND classifier
+to forward the matching opcodes into the ROM's FP handler, or
+implement a hypervisor-side stub if the ROM doesn't have one.
 
-- iter-66 looked at slot 0x424 (LDRB at 0x35d110). Coincidence:
-  slot 0x420 — *adjacent* slot, different PC — was the actual
-  culprit, and 0x424 just happens to be in the same neighbour
-  cluster of slots from the same DrTextChunk family.
-- iter-67/68 looked for the wedge inside the abort handler. The
-  abort handler IS running, but it's reacting to USR's bad
-  branch, not generating the wedge itself.
-- iter-69's "literal poisoning of UND_RETURN_STUB" probe didn't
-  fire because the literal was being set to legitimate USR PCs
-  outside the trampoline region — the wedge is *upstream* of the
-  return-stub literal write.
+**iter-70 result:** classify-rom walker bugs fixed; the iter-69
+wedge at `InitTextWalker → 0x35c49c` is gone. Boot progresses far
+past the splash — NewBlock #793 allocations, `ExtendVMHeap`
+firing, sound driver initialising at `PC=0x8011dc` — before
+hitting the new VFP-stub stall.
 
-**iter-70 plan: fix classify-rom (or add a shadow_stub guard).**
+**Background (unchanged from iter-61):** boot used to reach a
+quiescent idle at the Newton splash with `newt`=RUN wedged in
+`InitTextWalker`. Now boot pushes well into kernel-driver init
+before stalling on the FP coprocessor opcode above.
 
-Two fix paths, in order of preference:
+### Iteration 70: classify-rom walker fixes — wedge cleared
 
-1. **Detect literal pools in classify-rom.** Newton's compiler
-   emits literal pools right after function bodies (after `ldmdb
-   fp, {…pc}` epilogues). Words between the epilogue and the
-   next function symbol are constants, not instructions. Update
-   `tools/classify-rom` to suppress sub-word-access marks for
-   any address that's:
-   - within `[function_end, next_function_start)`, AND
-   - the target of a `ldr Rd, [pc, #imm]` from inside the
-     enclosing function.
-2. **Runtime guard in shadow_stub.** Before patching, scan the
-   surrounding 32 instructions for an `ldr Rd, [pc, #imm]`
-   whose computed literal address equals the patch site. If
-   found, skip the patch. Cheaper and isolates the fix to the
-   hypervisor side.
+#### Method
 
-Once the fix lands, the boot should advance past
-`InitTextWalker → DrTextChunk` and reach the actual
-post-splash NewtonScript boot block iter-64 was trying to identify.
+Two fix paths from iter-69's plan: (1) fix `tools/classify-rom`
+or (2) runtime guard in `shadow_stub::patch_one_site`. Walter's
+note "the classifier bitmap needs to be perfect, so let's at
+least fix all known bugs" extended the scope to the full set of
+walker reachability gaps revealed by the oracle ⊆ static
+invariant check.
 
-**Background (unchanged from iter-61):** boot reaches a quiescent
-idle at the Newton splash. The framebuffer renders correctly
-(`/tmp/newton-fb/00000.png`). All 26 expected tasks alive;
-`newt`=RUN, `scrn`=RDY blocked on its event-signal sema-group,
-all 24 others BLK. The residual `evt.ex.fr.store` throws are
-benign soup-probe misses caught by NewtonScript.
+Four walker fixes in `tools/classify-rom/src/main.rs`:
+
+1. **Manual-BL `in_table` bug (root cause for iter-69).** When the
+   walker saw `mov lr, pc; ldr pc, [...]` (Newton's manual-BL
+   idiom), `step()` correctly returned `Continue` but the
+   `in_table` update flagged the LDR-PC as a jump-table dispatch.
+   The next instruction — typically the function's own `ldmdb fp,
+   {…pc}` epilogue — was then misinterpreted as a "default-case
+   return" inside an imaginary table, so the walker walked past
+   the epilogue and into the literal pool. Words there that
+   happened to decode as byte-access shapes (e.g. `0x01b494f4`
+   ≅ LDRSH) got marked, then patched with UDF stubs, then read
+   *as data* by the LDR-pc-rel that originally loaded the
+   constant. Fix: gate `in_table = true` on `!prev_sets_lr`.
+
+2. **PC-relative jump-table dispatch.** `add pc, pc, Rn[, shift]`
+   patterns (FPU undef-handler dispatchers and similar) had
+   `step()` returning `Stop` because no fall-through target was
+   computable; the walker never enumerated the B-AL run that
+   followed. Fix: `is_pc_rel_pc_dispatch` + explicit
+   `enumerate_pc_rel_jump_table` that pushes each `B target` to
+   the worklist starting at `pc + 8`.
+
+3. **Function-pointer literal harvest.** Functions reached only
+   through indirect calls where a function pointer is loaded by
+   `LDR Rt, [pc, #±imm]` and *passed by reference* (not stored
+   into `[r0, #0]`, so `collect_vtable_roots` misses) — e.g. the
+   constructor-pointer arg to `__vc__FPvT1iPFPv_v` — were
+   unreachable. Fix: `collect_fnptr_literal_roots` scans every
+   reached PC-rel LDR, reads the literal, and seeds it as a
+   worklist root if the target word is prologue-shaped.
+
+4. **Consecutive-B-AL dispatch table harvest.** REX `FDRV` /
+   `pkgl` class-info structures embed N≥3 adjacent unconditional
+   `B`s as method dispatch stubs (e.g. PA 0x800460..0x800530,
+   17 entries). The walker can't reach them through any
+   recognised symbol; `rex_header_roots`'s function-pointer
+   filter rejects them because their value (`0xEAxxxxxx`) lies
+   outside ROM. Fix: `collect_b_run_roots` scans the full ROM+REX
+   for runs of ≥3 consecutive B-AL words and seeds each entry's
+   branch target. Threshold of 3 keeps accidental top-byte-0xEA
+   data words from generating false positives.
+
+#### Result
+
+- `byte-access-static.bitmap` popcount: 27799 → 27818 (+19 net;
+  +35 added by reaching new code, –35 removed by the literal-pool
+  fix — coincidental wash; popcount is not a useful signal for
+  this fix).
+- 0x35c49c bit cleared — iter-69's corruption site is no longer
+  in the bitmap.
+- All 12 oracle ⊆ static invariant violations resolved (oracle
+  popcount = static popcount intersection = 2155, missing = 0).
+- 36/36 guest tests pass.
+- Cold boot: wedge at 0x35c49c is **gone**. Boot advances through
+  many `NewBlock` allocations, `ExtendVMHeap` firings, and the
+  sound driver's first subfn dispatch (PC=0x8011dc — REX code
+  reachable via fix 4). New stall is `unrecognised UND
+  insn=0xed2dc203 at PC=0xd2780` — a VFP coprocessor opcode the
+  hypervisor's UND classifier doesn't know about.
+
+#### Walker stats (post-fix)
+
+```
+words walked (with revisits):  851531  (was 829504 pre-fix)
+fnptr literal roots added:        389
+B-run dispatch roots added:       470
+total indirect roots added:       859
+```
 
 ### Iteration 69: ROOT CAUSE — classify-rom + shadow_stub corrupt a function-pointer literal
 
@@ -211,63 +236,11 @@ Two paths, in order of preference:
    data word, not code. Cheaper and isolates the fix to the
    hypervisor side.
 
-### Iteration 68: DataAbortHandler-internal hypothesis falsified; SBA UDFs are silent in the wedge
-
-#### Method
-
-Instrumented `shadow_stub::emulate_sba_site` with a histogram
-(reverted before commit):
-
-- Per-mode counter (`MODE_COUNT[0..32]`) over the SPSR_und
-  source-mode bits.
-- Per-mode top-N (8 slots) faulting_pc histogram for USR / SVC
-  / ABT — first-fit on empty slots, evict-smallest otherwise.
-- Dump every 2^17 (≈131 K) hits — roughly one per periodic
-  heartbeat at the wedge's trap rate.
-
-Cold boot, no debugger, ran past the wedge.
-
-#### Result
-
-**Exactly one histogram dump fired** (at total = 131 072 hits).
-After that, total never reached the next 131 K threshold despite
-22 M+ trap beacons accumulating at `ELR=0xffffe4`.
-
-```
-=== iter-68 SBA mode/pc histogram (total=131072) ===
-  by-mode usr=0 svc=131073 fiq=0 irq=0 abt=0 und=0 sys=0
-  top 4 pcs (mode SVC):
-    pc=0x001a7ca8 count=65489
-    pc=0x001a7cac count=65488
-    pc=0x000bd6a0 count=48
-    pc=0x000bd6a4 count=48
-=== iter-68 end ===
-```
-
-All 131 K SBA UDFs were SVC-mode boot-time activity; ABT-mode
-count is **zero**.
-
-#### Implication
-
-iter-67's "DataAbortHandler stuck running emulated byte
-accesses" hypothesis is **falsified**. SBA UDFs are silent in
-the wedge state. The kernel's DataAbortHandler is *not* doing
-emulated byte access work — there's no SBA traffic to drive.
-
-Combined with iter-67's findings (no DIAG-path aborts, no
-PrefetchAbortHandler hits), the wedge is taking some path that
-*doesn't* generate any EL2 traps until the next timer IRQ.
-
-The most plausible mechanism is a tight 2-instruction loop at
-the `UND_RETURN_STUB` itself (`ldr lr, [pc, #0]; movs pc, lr`),
-where the literal at `0xFFFFEC` last got written to a value
-that re-enters the stub on every iteration. Native-speed loop,
-no traps, just timer IRQs catching the guest there.
-
-iter-69 starts with a one-shot probe in
-`trap::return_to_guest_from_und` that logs the first time the
-literal is set to a self-referential value
-(`target ∈ 0xFFFFE0..0xFFFFF0`).
+<!-- iter-68 (DataAbortHandler-internal hypothesis falsified — SBA
+     UDFs silent in the wedge) pruned per auto-prune. iter-69
+     superseded its self-loop hypothesis with the literal-pool
+     corruption finding; iter-70 then fixed the underlying
+     classify-rom bug. See `git log --grep="iter-68"`. -->
 
 <!-- iter-67 (PABT-recovery hypothesis falsified — bp at
      PrefetchAbortHandler 0x393b84 fired 0 times, dabt-forward

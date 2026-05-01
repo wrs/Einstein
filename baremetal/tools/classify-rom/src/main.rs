@@ -440,6 +440,61 @@ fn sets_lr_to_return_here(w: u32) -> bool {
     false
 }
 
+/// Enumerate the unconditional-`B` table that immediately follows a
+/// PC-relative dispatch (`<dpop> PC, PC, Rn[, shift]`). Pushes each
+/// branch target onto `worklist`. Bounded by:
+///   - `MAX_ENTRIES = 256` (defensive cap; FPU handler tables are
+///     ~32 entries),
+///   - first non-B-AL word (the table ends),
+///   - end of ROM aperture.
+///
+/// The dispatch's PC reads as `pc_of_dispatch + 8` per ARM convention,
+/// so table entry 0 lives exactly there — no padding to skip.
+fn enumerate_pc_rel_jump_table(
+    words: &[u32],
+    pc_of_dispatch: u32,
+    worklist: &mut Vec<u32>,
+) -> usize {
+    const MAX_ENTRIES: usize = 256;
+    let mut tbl = pc_of_dispatch.wrapping_add(8);
+    let mut count = 0usize;
+    for _ in 0..MAX_ENTRIES {
+        if (tbl as usize) + 4 > ROM_SIZE_BYTES { break; }
+        if tbl & 3 != 0 { break; }
+        let w = words[(tbl >> 2) as usize];
+        // Unconditional `B` (cond=AL, link=0): top byte = 0xEA.
+        if (w >> 24) != 0xEA { break; }
+        let imm24 = w & 0xFFFFFF;
+        let simm = sign_extend(imm24, 24) << 2;
+        let target = tbl.wrapping_add(8).wrapping_add(simm as u32);
+        worklist.push(target);
+        count += 1;
+        tbl = tbl.wrapping_add(4);
+    }
+    count
+}
+
+/// Returns true if `w` is a PC-relative jump-table dispatch:
+/// `<dp_op> PC, PC, Rn[, shift]` (Rd = Rn = 15, register operand).
+/// Newton's compiler emits these (e.g. `ADD PC, PC, R9, LSR #25` or
+/// `EORLS PC, PC, R0, LSL #2`) for n-way switch dispatches; the n
+/// table entries are unconditional `B`s starting at `pc + 8`.
+fn is_pc_rel_pc_dispatch(w: u32) -> bool {
+    // DP family (bits[27:26]=00).
+    if (w >> 26) & 0b11 != 0b00 { return false; }
+    // Register operand (bit 25 = 0).
+    if (w >> 25) & 1 != 0 { return false; }
+    let rd = (w >> 12) & 0xF;
+    let rn = (w >> 16) & 0xF;
+    if rd != 15 || rn != 15 { return false; }
+    let opcode = (w >> 21) & 0xF;
+    let s_bit = (w >> 20) & 1;
+    // Reject TST/TEQ/CMP/CMN (opcodes 8..=B with S=0) — those are
+    // compare-only forms that don't write Rd.
+    if matches!(opcode, 0x8..=0xB) && s_bit == 0 { return false; }
+    true
+}
+
 /// Returns true if `w` (when executed unconditionally) writes to PC. Used
 /// to detect jump-table dispatch: after such an instruction, a run of
 /// unconditional `B` entries is a jump table, not terminal jumps.
@@ -583,6 +638,8 @@ struct WalkStats {
     rex_header_roots: usize,
     vtable_roots: usize,
     vtables_found: usize,
+    fnptr_literal_roots: usize,
+    b_run_roots: usize,
 }
 
 /// Walk from roots, closing over indirect-targets by scanning unreached
@@ -632,15 +689,39 @@ fn walk(
                 reach.set_word(cur);
                 stats.words_walked += 1;
                 let step_result = step(w, cur, prev_w, in_table);
+
+                // PC-relative jump-table dispatch (`<dpop> PC, PC, Rn[, shift]`):
+                // the n table entries are unconditional `B`s starting at PC+8.
+                // step() returns Stop on this insn (since it doesn't know the
+                // target), so we have to enumerate the B-AL run here before
+                // breaking. Without this, the walker misses every case body
+                // reachable only through the dispatch.
+                if is_pc_rel_pc_dispatch(w) {
+                    enumerate_pc_rel_jump_table(words, cur, &mut worklist);
+                }
+
                 // Update table state for the next iteration: entering a
                 // table when the current insn writes PC (dispatch), staying
                 // in a table while we keep seeing unconditional `B` entries,
                 // leaving once any other word appears.
+                //
+                // Exception: a PC-write preceded by `mov lr, pc` (or
+                // `add lr, pc, #0`) is Newton's manual-BL idiom — the PC
+                // load is a function call, not a dispatch. Don't enter
+                // in-table mode after it, otherwise the walker
+                // misinterprets the call's epilogue (LDM-with-PC at the
+                // function's true end) as a "default-case return"
+                // between dispatch and table entries, walks past the
+                // epilogue, and falls into the literal pool. That's how
+                // a function-pointer literal at `function_end + 0` ends
+                // up classified as a byte-access instruction
+                // (iter-69: 0x35c49c → 0x01b494f4 corruption).
                 let cond = (w >> 28) & 0xF;
                 let is_b_al = ((w >> 25) & 0b111) == 0b101
                     && cond == 0xE
                     && ((w >> 24) & 1) == 0;
-                in_table = if is_pc_write(w) {
+                let prev_sets_lr = sets_lr_to_return_here(prev_w);
+                in_table = if is_pc_write(w) && !prev_sets_lr {
                     true
                 } else if in_table && is_b_al {
                     true
@@ -688,6 +769,26 @@ fn walk(
         // P=1/U=1/W=0, imm12=0.
         let mut new_roots = 0usize;
         new_roots += collect_vtable_roots(
+            words, &reach, data_ranges, &mut worklist, &mut stats,
+        );
+        // Function-pointer literal harvest: any reached `LDR Rt, [pc, #±imm]`
+        // whose loaded literal value points at a prologue-shaped instruction
+        // is a function pointer being passed by reference (e.g. as a
+        // constructor-pointer argument to `__vc__FPvT1iPFPv_v`, which
+        // invokes it indirectly for each array element). Without this,
+        // functions reached only through such patterns are unreachable
+        // to the walker.
+        new_roots += collect_fnptr_literal_roots(
+            words, &reach, data_ranges, &mut worklist, &mut stats,
+        );
+        // Consecutive-B-AL dispatch-table harvest: a run of N≥3 adjacent
+        // unconditional `B` instructions is almost certainly a method
+        // dispatch table (REX FDRV / pkgl class-info, jump-tables that
+        // weren't reached by the PC-rel dispatch walker, etc.). Seed
+        // each branch target as a worklist root. Threshold of 3 keeps
+        // accidental top-byte-0xEA data words from generating false
+        // positives — three in a row is a strong signal.
+        new_roots += collect_b_run_roots(
             words, &reach, data_ranges, &mut worklist, &mut stats,
         );
 
@@ -786,6 +887,110 @@ fn collect_vtable_roots(
             stats.vtable_roots += entries_added;
         }
     }
+    added
+}
+
+/// Scan the entire ROM+REX aperture for runs of N≥3 adjacent
+/// unconditional `B` instructions (top byte 0xEA). Each such run is a
+/// dispatch table (REX FDRV class-method stubs, jump-tables that the
+/// PC-rel walker missed, compiler-emitted switch tables that aren't
+/// preceded by a recognizable PC-write). Seed every entry's branch
+/// target as a worklist root.
+///
+/// Threshold of 3: a single 0xEA-shaped data word happens often
+/// (especially in REX strings/integers); 3 in a row is rare enough to
+/// be a strong signal. Newton's actual dispatch tables run 3..32+
+/// entries.
+///
+/// Bounded by the first non-B-AL word (run terminates).
+fn collect_b_run_roots(
+    words: &[u32],
+    reach: &Bitmap,
+    data_ranges: &[(u32, u32)],
+    worklist: &mut Vec<u32>,
+    stats: &mut WalkStats,
+) -> usize {
+    const MIN_RUN: usize = 3;
+    let mut added = 0usize;
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut i = 0usize;
+    while i + MIN_RUN <= ROM_WORD_COUNT {
+        // Find the next B-AL word.
+        if (words[i] >> 24) != 0xEA {
+            i += 1;
+            continue;
+        }
+        // Measure the run length.
+        let mut j = i;
+        while j < ROM_WORD_COUNT && (words[j] >> 24) == 0xEA { j += 1; }
+        let run_len = j - i;
+        if run_len >= MIN_RUN {
+            for k in i..j {
+                let entry_pa = (k as u32) * 4;
+                if in_any_range(entry_pa, data_ranges) { continue; }
+                let imm24 = words[k] & 0xFFFFFF;
+                let simm = sign_extend(imm24, 24) << 2;
+                let target = entry_pa.wrapping_add(8).wrapping_add(simm as u32);
+                if (target as usize) >= ROM_SIZE_BYTES { continue; }
+                if target & 3 != 0 { continue; }
+                if in_any_range(target, data_ranges) { continue; }
+                if reach.get_word(target) { continue; }
+                if !seen.insert(target) { continue; }
+                worklist.push(target);
+                added += 1;
+            }
+        }
+        i = j.max(i + 1);
+    }
+    stats.b_run_roots += added;
+    added
+}
+
+/// Scan reached code for `LDR Rt, [pc, #±imm12]` instructions and read
+/// each literal. If the literal value points at a prologue-shaped target,
+/// seed it as a worklist root. This catches function pointers passed as
+/// arguments (e.g. constructor-pointer args to `__vc__FPvT1iPFPv_v`,
+/// destructor-pointer args, comparator function pointers, etc.) — call
+/// sites where the LDR isn't followed by an STR, so `collect_vtable_roots`
+/// doesn't fire.
+fn collect_fnptr_literal_roots(
+    words: &[u32],
+    reach: &Bitmap,
+    data_ranges: &[(u32, u32)],
+    worklist: &mut Vec<u32>,
+    stats: &mut WalkStats,
+) -> usize {
+    let mut added = 0usize;
+    let mut seen: HashSet<u32> = HashSet::new();
+    for addr_idx in 0..ROM_WORD_COUNT {
+        let addr = (addr_idx as u32) * 4;
+        if !reach.get_word(addr) { continue; }
+        let w = words[addr_idx];
+        // LDR Rt, [pc, #±imm12], cond=AL: 0xE59Fxxxx (U=1) or 0xE51Fxxxx (U=0).
+        let imm_sign: i32 = match w >> 16 {
+            0xE59F => 1,
+            0xE51F => -1,
+            _ => continue,
+        };
+        let imm12 = (w & 0xFFF) as i32;
+        let lit_pc = (addr as i64) + 8 + (imm_sign as i64 * imm12 as i64);
+        if lit_pc < 0 || (lit_pc as usize) + 4 > ROM_SIZE_BYTES { continue; }
+        if (lit_pc as u32) & 3 != 0 { continue; }
+        let val = words[(lit_pc as usize) >> 2];
+        if val == 0 { continue; }
+        if val & 3 != 0 { continue; }
+        if (val as usize) >= ROM_SIZE_BYTES { continue; }
+        if in_any_range(val, data_ranges) { continue; }
+        let tgt_idx = (val >> 2) as usize;
+        let tgt_word = words[tgt_idx];
+        if (tgt_word >> 28) == 0xF { continue; }
+        if !is_known_function_start(tgt_word) { continue; }
+        if reach.get_word(val) { continue; }
+        if !seen.insert(val) { continue; }
+        worklist.push(val);
+        added += 1;
+    }
+    stats.fnptr_literal_roots += added;
     added
 }
 
@@ -912,6 +1117,8 @@ fn run(args: Args) -> Result<(), String> {
     writeln!(f, "    vtable passes:             {}", stats.indirect_passes).ok();
     writeln!(f, "    vtables found:             {}", stats.vtables_found).ok();
     writeln!(f, "    vtable method roots added: {}", stats.vtable_roots).ok();
+    writeln!(f, "    fnptr literal roots added: {}", stats.fnptr_literal_roots).ok();
+    writeln!(f, "    B-run dispatch roots added: {}", stats.b_run_roots).ok();
     writeln!(f, "    total indirect roots added: {}", stats.indirect_roots_added).ok();
     writeln!(f, "    reachable-code popcount: {}", reach.popcount()).ok();
     writeln!(f, "  byte-access-static.bitmap popcount = {}", ba_static.popcount()).ok();

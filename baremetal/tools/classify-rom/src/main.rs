@@ -440,34 +440,69 @@ fn sets_lr_to_return_here(w: u32) -> bool {
     false
 }
 
-/// Enumerate the unconditional-`B` table that immediately follows a
-/// PC-relative dispatch (`<dpop> PC, PC, Rn[, shift]`). Pushes each
-/// branch target onto `worklist`. Bounded by:
-///   - `MAX_ENTRIES = 256` (defensive cap; FPU handler tables are
-///     ~32 entries),
-///   - first non-B-AL word (the table ends),
-///   - end of ROM aperture.
+/// Enumerate the one-instruction-per-entry table that immediately
+/// follows a PC-relative dispatch (`<dpop> PC, PC, Rn[, shift]`).
+/// Pushes each entry's PA as a worklist root, plus B/BL targets.
+/// Bounded by:
+///   - if `prev_w` is `CMP Rn, #imm`, exactly `imm + 1` entries (the
+///     `addls pc, pc, Rn, lsl #2` idiom dispatches indices 0..=imm),
+///   - otherwise the first entry that doesn't decode as a valid
+///     one-instruction handler (B / BL / Bcond / MOV PC / LDR PC /
+///     LDM-with-PC / BX),
+///   - `MAX_ENTRIES = 256` defensive cap.
 ///
 /// The dispatch's PC reads as `pc_of_dispatch + 8` per ARM convention,
-/// so table entry 0 lives exactly there — no padding to skip.
+/// so table entry 0 lives exactly there — no padding to skip. Each
+/// entry is a single-instruction terminal control-flow op; mixed
+/// `B handler / mov pc, lr / b default_handler` is normal in Newton
+/// (e.g. CallAirusANoLock at 0x2d590).
 fn enumerate_pc_rel_jump_table(
     words: &[u32],
     pc_of_dispatch: u32,
+    prev_w: u32,
     worklist: &mut Vec<u32>,
 ) -> usize {
     const MAX_ENTRIES: usize = 256;
+    // If the preceding insn is `CMP Rn, #imm` (cond=AL, opcode CMP=0xA,
+    // S=1, imm form), the dispatch handles indices 0..=imm so the table
+    // has imm+1 entries. CMP encoding: 0xE35Riiii where R is Rn.
+    let bounded_size: Option<usize> = {
+        let cond = (prev_w >> 28) & 0xF;
+        let opcode = (prev_w >> 21) & 0xF;
+        let s_bit = (prev_w >> 20) & 1;
+        let bit25 = (prev_w >> 25) & 1;
+        if cond == 0xE && opcode == 0xA && s_bit == 1 && bit25 == 1 {
+            // Decode imm12 modified-immediate.
+            let rot = ((prev_w >> 8) & 0xF) * 2;
+            let val8 = prev_w & 0xFF;
+            let imm = val8.rotate_right(rot);
+            Some((imm as usize) + 1)
+        } else {
+            None
+        }
+    };
+    let limit = bounded_size.unwrap_or(MAX_ENTRIES).min(MAX_ENTRIES);
     let mut tbl = pc_of_dispatch.wrapping_add(8);
     let mut count = 0usize;
-    for _ in 0..MAX_ENTRIES {
+    for _ in 0..limit {
         if (tbl as usize) + 4 > ROM_SIZE_BYTES { break; }
         if tbl & 3 != 0 { break; }
         let w = words[(tbl >> 2) as usize];
-        // Unconditional `B` (cond=AL, link=0): top byte = 0xEA.
-        if (w >> 24) != 0xEA { break; }
-        let imm24 = w & 0xFFFFFF;
-        let simm = sign_extend(imm24, 24) << 2;
-        let target = tbl.wrapping_add(8).wrapping_add(simm as u32);
-        worklist.push(target);
+        // Each table entry is a one-instruction terminal handler.
+        // If it's a branch (B/BL/Bcc), seed the target as a root.
+        // Otherwise it must be a PC-write (MOV PC / LDR PC / etc.).
+        let is_branch = ((w >> 25) & 0b111) == 0b101 && ((w >> 28) & 0xF) != 0xF;
+        if is_branch {
+            let imm24 = w & 0xFFFFFF;
+            let simm = sign_extend(imm24, 24) << 2;
+            let target = tbl.wrapping_add(8).wrapping_add(simm as u32);
+            worklist.push(target);
+        } else if !is_pc_write(w) {
+            // Not a recognized one-instruction handler — table ended.
+            break;
+        }
+        // Mark the entry word itself as code.
+        worklist.push(tbl);
         count += 1;
         tbl = tbl.wrapping_add(4);
     }
@@ -640,6 +675,8 @@ struct WalkStats {
     vtables_found: usize,
     fnptr_literal_roots: usize,
     b_run_roots: usize,
+    pc_rel_addr_roots: usize,
+    branch_to_reached_roots: usize,
 }
 
 /// Walk from roots, closing over indirect-targets by scanning unreached
@@ -697,7 +734,7 @@ fn walk(
                 // breaking. Without this, the walker misses every case body
                 // reachable only through the dispatch.
                 if is_pc_rel_pc_dispatch(w) {
-                    enumerate_pc_rel_jump_table(words, cur, &mut worklist);
+                    enumerate_pc_rel_jump_table(words, cur, prev_w, &mut worklist);
                 }
 
                 // Update table state for the next iteration: entering a
@@ -789,6 +826,28 @@ fn walk(
         // accidental top-byte-0xEA data words from generating false
         // positives — three in a row is a strong signal.
         new_roots += collect_b_run_roots(
+            words, &reach, data_ranges, &mut worklist, &mut stats,
+        );
+        // PC-relative address-of harvest: any reached `ADD Rd, PC, #imm`
+        // or `SUB Rd, PC, #imm` (Rd != PC) computes a candidate base
+        // address. The most common use is establishing a base register
+        // for a runtime-dispatched jump table (e.g. BPNetEvaluate's
+        // `add sl, pc, #232; ...; add pc, sl, r9, lsl #4`) — without
+        // seeding, the dispatch's case bodies are unreachable. Newton
+        // also uses this idiom for compiler-emitted PC-relative
+        // string/data pointers, but those typically point into curated
+        // data ranges (which terminate the walker harmlessly).
+        new_roots += collect_pc_relative_addr_roots(
+            words, &reach, data_ranges, &mut worklist, &mut stats,
+        );
+        // Branch-to-reached harvest: any unreached word that decodes
+        // as B / BL / Bcc with target reach=true is itself code (per
+        // the no-code/data-sharing premise). Compiler-emitted
+        // forward branches inside loop bodies and conditional
+        // returns from speculative dispatch entries fall in this
+        // class. Iterates with the worklist so newly reached blocks
+        // can pull in their predecessors.
+        new_roots += collect_branch_to_reached_roots(
             words, &reach, data_ranges, &mut worklist, &mut stats,
         );
 
@@ -890,6 +949,106 @@ fn collect_vtable_roots(
     added
 }
 
+/// Scan unreached words for B / BL / Bcc whose target is reach=true.
+/// Such a word is itself code (under the no-code/data-sharing
+/// premise): a data word that *happened* to decode as a branch with
+/// a valid in-bounds reach=true target would be a coincidence the
+/// no-sharing premise rules out.
+///
+/// This catches forward branches at the head of loop bodies that
+/// the walker entered via Step::Jump (so it never walked the
+/// pre-jump fall-through), and conditional returns inside dispatch
+/// case bodies whose entry was unreachable until other passes seeded
+/// the table base.
+fn collect_branch_to_reached_roots(
+    words: &[u32],
+    reach: &Bitmap,
+    data_ranges: &[(u32, u32)],
+    worklist: &mut Vec<u32>,
+    stats: &mut WalkStats,
+) -> usize {
+    let mut added = 0usize;
+    let mut seen: HashSet<u32> = HashSet::new();
+    for addr_idx in 0..ROM_WORD_COUNT {
+        let addr = (addr_idx as u32) * 4;
+        if reach.get_word(addr) { continue; }
+        if in_any_range(addr, data_ranges) { continue; }
+        let w = words[addr_idx];
+        let cond = (w >> 28) & 0xF;
+        if cond == 0xF { continue; }
+        let kind = (w >> 25) & 7;
+        if kind != 0b101 { continue; }
+        let imm24 = w & 0xFFFFFF;
+        let simm = sign_extend(imm24, 24) << 2;
+        let target = addr.wrapping_add(8).wrapping_add(simm as u32);
+        if (target as usize) >= ROM_SIZE_BYTES { continue; }
+        if target & 3 != 0 { continue; }
+        if !reach.get_word(target) { continue; }
+        if !seen.insert(addr) { continue; }
+        worklist.push(addr);
+        added += 1;
+    }
+    stats.branch_to_reached_roots += added;
+    added
+}
+
+/// Scan reached code for `ADD Rd, PC, #imm12` / `SUB Rd, PC, #imm12`
+/// (cond=AL, register form, Rd != PC, Rn=PC) and seed `pc + 8 ± imm12`
+/// as a worklist root. Newton uses this to compute table-base
+/// addresses for runtime-dispatched jump tables — e.g.
+/// `add sl, pc, #232` followed later by `add pc, sl, r9, lsl #4`. The
+/// table base isn't a B target, isn't in a vtable, and isn't preceded
+/// by an LDR-pc-rel literal, so none of the existing harvesters catch
+/// it. Without this, every case body of every SL-based dispatch is
+/// unreachable.
+fn collect_pc_relative_addr_roots(
+    words: &[u32],
+    reach: &Bitmap,
+    data_ranges: &[(u32, u32)],
+    worklist: &mut Vec<u32>,
+    stats: &mut WalkStats,
+) -> usize {
+    let mut added = 0usize;
+    let mut seen: HashSet<u32> = HashSet::new();
+    for addr_idx in 0..ROM_WORD_COUNT {
+        let addr = (addr_idx as u32) * 4;
+        if !reach.get_word(addr) { continue; }
+        let w = words[addr_idx];
+        // ADD/SUB cond=AL imm: 0xE28FRddd (ADD) / 0xE24FRddd (SUB).
+        // Mask the cond, S-bit-and-opcode-bits, Rn=15 to detect.
+        // ADD imm: 0xE28F_xxxx (cond=E, op=ADD=0100, S=0, Rn=15).
+        // SUB imm: 0xE24F_xxxx (cond=E, op=SUB=0010, S=0, Rn=15).
+        let kind = w >> 16;
+        let imm_sign: i32 = match kind {
+            0xE28F => 1,
+            0xE24F => -1,
+            _ => continue,
+        };
+        let rd = (w >> 12) & 0xF;
+        if rd == 15 { continue; } // ADD PC, PC, ... handled by jump-table dispatcher
+        // Decode imm12 modified-immediate (8-bit value rotated by 2*rot).
+        let rot = ((w >> 8) & 0xF) * 2;
+        let val8 = w & 0xFF;
+        let imm = val8.rotate_right(rot);
+        let target = (addr.wrapping_add(8) as i64)
+            .wrapping_add(imm_sign as i64 * imm as i64) as u32;
+        if (target as usize) >= ROM_SIZE_BYTES { continue; }
+        if target & 3 != 0 { continue; }
+        if in_any_range(target, data_ranges) { continue; }
+        // Skip if the target word looks like NV-cond (0xF top nibble) —
+        // strongly suggests data, not code. Plain code starts with cond
+        // 0..=E.
+        let tw = words[(target >> 2) as usize];
+        if (tw >> 28) == 0xF { continue; }
+        if reach.get_word(target) { continue; }
+        if !seen.insert(target) { continue; }
+        worklist.push(target);
+        added += 1;
+    }
+    stats.pc_rel_addr_roots += added;
+    added
+}
+
 /// Scan the entire ROM+REX aperture for runs of N≥3 adjacent
 /// unconditional `B` instructions (top byte 0xEA). Each such run is a
 /// dispatch table (REX FDRV class-method stubs, jump-tables that the
@@ -928,16 +1087,16 @@ fn collect_b_run_roots(
             for k in i..j {
                 let entry_pa = (k as u32) * 4;
                 if in_any_range(entry_pa, data_ranges) { continue; }
-                let imm24 = words[k] & 0xFFFFFF;
-                let simm = sign_extend(imm24, 24) << 2;
-                let target = entry_pa.wrapping_add(8).wrapping_add(simm as u32);
-                if (target as usize) >= ROM_SIZE_BYTES { continue; }
-                if target & 3 != 0 { continue; }
-                if in_any_range(target, data_ranges) { continue; }
-                if reach.get_word(target) { continue; }
-                if !seen.insert(target) { continue; }
-                worklist.push(target);
-                added += 1;
+                // Seed the entry PA itself as a worklist root. Walker
+                // marks it reach=true, then Step::Jump processes the
+                // target, so every table entry word is recognised as
+                // code (not data) — important for dispatch tables
+                // where individual entries aren't referenced from any
+                // vtable or BL.
+                if !reach.get_word(entry_pa) && seen.insert(entry_pa) {
+                    worklist.push(entry_pa);
+                    added += 1;
+                }
             }
         }
         i = j.max(i + 1);
@@ -1087,6 +1246,7 @@ fn run(args: Args) -> Result<(), String> {
         .map_err(|e| format!("mkdir {}: {}", out_dir.display(), e))?;
 
     write_bitmap(&out_dir.join("byte-access-static.bitmap"), &ba_static)?;
+    write_bitmap(&out_dir.join("reach.bitmap"), &reach)?;
 
     // Invariant check vs the oracle bitmap, if it exists.
     let oracle_path = out_dir.join("byte-access.bitmap");
@@ -1119,6 +1279,8 @@ fn run(args: Args) -> Result<(), String> {
     writeln!(f, "    vtable method roots added: {}", stats.vtable_roots).ok();
     writeln!(f, "    fnptr literal roots added: {}", stats.fnptr_literal_roots).ok();
     writeln!(f, "    B-run dispatch roots added: {}", stats.b_run_roots).ok();
+    writeln!(f, "    PC-rel addr roots added:    {}", stats.pc_rel_addr_roots).ok();
+    writeln!(f, "    branch-to-reached roots:    {}", stats.branch_to_reached_roots).ok();
     writeln!(f, "    total indirect roots added: {}", stats.indirect_roots_added).ok();
     writeln!(f, "    reachable-code popcount: {}", reach.popcount()).ok();
     writeln!(f, "  byte-access-static.bitmap popcount = {}", ba_static.popcount()).ok();

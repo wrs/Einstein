@@ -676,7 +676,6 @@ struct WalkStats {
     fnptr_literal_roots: usize,
     b_run_roots: usize,
     pc_rel_addr_roots: usize,
-    branch_to_reached_roots: usize,
 }
 
 /// Walk from roots, closing over indirect-targets by scanning unreached
@@ -687,6 +686,7 @@ fn walk(
     words: &[u32],
     initial_roots: &[u32],
     data_ranges: &[(u32, u32)],
+    fn_ranges: &[(u32, u32)],
 ) -> (Bitmap, WalkStats) {
     let mut stats = WalkStats::default();
     let mut reach = Bitmap::new();
@@ -697,6 +697,15 @@ fn walk(
         .collect();
     stats.initial_roots = worklist.len();
 
+    // Addresses reached via an explicit B / BL / Bcc target from
+    // already-walked code. Such targets override data_ranges: a
+    // direct in-ROM branch is a stronger code signal than the data-
+    // symbol extent classify-symbols.py assigns. Without this,
+    // legitimate code that lives in the gap between a data symbol
+    // and the next code symbol (e.g. inline helpers at 0x18450 that
+    // DiagHook at 0x184D0 calls into) stays unreachable.
+    let mut branch_overrides: HashSet<u32> = HashSet::new();
+
     let mut pass = 0u32;
     loop {
         pass += 1;
@@ -704,20 +713,23 @@ fn walk(
             let mut cur = pc;
             let mut prev_w: u32 = 0;
             let mut in_table = false;
+            // When the worklist entry came from an explicit branch
+            // target (B / BL / Bcc from already-walked code), bypass
+            // data_ranges for the FIRST walked word. Subsequent
+            // fall-through still checks data_ranges — otherwise a
+            // single random "B" encoding inside a data table cascades
+            // through the whole table, marking ASCII / pointer data
+            // as reachable code (and potentially corrupting it via
+            // shadow_stub patches at byte-access-shape words).
+            let mut bypass_dr_once = branch_overrides.remove(&pc);
             loop {
                 if (cur as usize) >= ROM_SIZE_BYTES || cur & 3 != 0 { break; }
                 if reach.get_word(cur) { break; }
-                // Curated data ranges from classify-symbols.py terminate
-                // the walker. These are contiguous extents of data
-                // symbols (vtables, string tables, literal pools
-                // between functions, ...) that real code never steps
-                // through; if we fall into one we've mis-identified a
-                // function boundary, and continuing would mark data
-                // as reachable code.
-                if in_any_range(cur, data_ranges) {
+                if !bypass_dr_once && in_any_range(cur, data_ranges) {
                     stats.data_range_stops += 1;
                     break;
                 }
+                bypass_dr_once = false;
                 let w = words[(cur >> 2) as usize];
                 if (w >> 28) == 0xF {
                     stats.nv_cond_skips += 1;
@@ -768,6 +780,7 @@ fn walk(
                 match step_result {
                     Step::Continue { branch: Some(t) } => {
                         worklist.push(t);
+                        branch_overrides.insert(t);
                         prev_w = w;
                         cur = cur.wrapping_add(4);
                     }
@@ -838,17 +851,7 @@ fn walk(
         // string/data pointers, but those typically point into curated
         // data ranges (which terminate the walker harmlessly).
         new_roots += collect_pc_relative_addr_roots(
-            words, &reach, data_ranges, &mut worklist, &mut stats,
-        );
-        // Branch-to-reached harvest: any unreached word that decodes
-        // as B / BL / Bcc with target reach=true is itself code (per
-        // the no-code/data-sharing premise). Compiler-emitted
-        // forward branches inside loop bodies and conditional
-        // returns from speculative dispatch entries fall in this
-        // class. Iterates with the worklist so newly reached blocks
-        // can pull in their predecessors.
-        new_roots += collect_branch_to_reached_roots(
-            words, &reach, data_ranges, &mut worklist, &mut stats,
+            words, &reach, data_ranges, fn_ranges, &mut worklist, &mut stats,
         );
 
         stats.indirect_passes = pass;
@@ -949,49 +952,6 @@ fn collect_vtable_roots(
     added
 }
 
-/// Scan unreached words for B / BL / Bcc whose target is reach=true.
-/// Such a word is itself code (under the no-code/data-sharing
-/// premise): a data word that *happened* to decode as a branch with
-/// a valid in-bounds reach=true target would be a coincidence the
-/// no-sharing premise rules out.
-///
-/// This catches forward branches at the head of loop bodies that
-/// the walker entered via Step::Jump (so it never walked the
-/// pre-jump fall-through), and conditional returns inside dispatch
-/// case bodies whose entry was unreachable until other passes seeded
-/// the table base.
-fn collect_branch_to_reached_roots(
-    words: &[u32],
-    reach: &Bitmap,
-    data_ranges: &[(u32, u32)],
-    worklist: &mut Vec<u32>,
-    stats: &mut WalkStats,
-) -> usize {
-    let mut added = 0usize;
-    let mut seen: HashSet<u32> = HashSet::new();
-    for addr_idx in 0..ROM_WORD_COUNT {
-        let addr = (addr_idx as u32) * 4;
-        if reach.get_word(addr) { continue; }
-        if in_any_range(addr, data_ranges) { continue; }
-        let w = words[addr_idx];
-        let cond = (w >> 28) & 0xF;
-        if cond == 0xF { continue; }
-        let kind = (w >> 25) & 7;
-        if kind != 0b101 { continue; }
-        let imm24 = w & 0xFFFFFF;
-        let simm = sign_extend(imm24, 24) << 2;
-        let target = addr.wrapping_add(8).wrapping_add(simm as u32);
-        if (target as usize) >= ROM_SIZE_BYTES { continue; }
-        if target & 3 != 0 { continue; }
-        if !reach.get_word(target) { continue; }
-        if !seen.insert(addr) { continue; }
-        worklist.push(addr);
-        added += 1;
-    }
-    stats.branch_to_reached_roots += added;
-    added
-}
-
 /// Scan reached code for `ADD Rd, PC, #imm12` / `SUB Rd, PC, #imm12`
 /// (cond=AL, register form, Rd != PC, Rn=PC) and seed `pc + 8 ± imm12`
 /// as a worklist root. Newton uses this to compute table-base
@@ -1005,6 +965,7 @@ fn collect_pc_relative_addr_roots(
     words: &[u32],
     reach: &Bitmap,
     data_ranges: &[(u32, u32)],
+    fn_ranges: &[(u32, u32)],
     worklist: &mut Vec<u32>,
     stats: &mut WalkStats,
 ) -> usize {
@@ -1015,9 +976,6 @@ fn collect_pc_relative_addr_roots(
         if !reach.get_word(addr) { continue; }
         let w = words[addr_idx];
         // ADD/SUB cond=AL imm: 0xE28FRddd (ADD) / 0xE24FRddd (SUB).
-        // Mask the cond, S-bit-and-opcode-bits, Rn=15 to detect.
-        // ADD imm: 0xE28F_xxxx (cond=E, op=ADD=0100, S=0, Rn=15).
-        // SUB imm: 0xE24F_xxxx (cond=E, op=SUB=0010, S=0, Rn=15).
         let kind = w >> 16;
         let imm_sign: i32 = match kind {
             0xE28F => 1,
@@ -1025,8 +983,7 @@ fn collect_pc_relative_addr_roots(
             _ => continue,
         };
         let rd = (w >> 12) & 0xF;
-        if rd == 15 { continue; } // ADD PC, PC, ... handled by jump-table dispatcher
-        // Decode imm12 modified-immediate (8-bit value rotated by 2*rot).
+        if rd == 15 { continue; }
         let rot = ((w >> 8) & 0xF) * 2;
         let val8 = w & 0xFF;
         let imm = val8.rotate_right(rot);
@@ -1035,9 +992,20 @@ fn collect_pc_relative_addr_roots(
         if (target as usize) >= ROM_SIZE_BYTES { continue; }
         if target & 3 != 0 { continue; }
         if in_any_range(target, data_ranges) { continue; }
-        // Skip if the target word looks like NV-cond (0xF top nibble) —
-        // strongly suggests data, not code. Plain code starts with cond
-        // 0..=E.
+        // Sound gate: only seed if Rd is later used as the base
+        // register of a runtime PC-write dispatch (`<dpop>cond pc,
+        // Rd, Rn, lsl #imm`) somewhere inside the same containing
+        // function. That distinguishes a code-table-base setup
+        // (BPNetEvaluate's `add sl, pc, #232` later feeding `add
+        // pc, sl, r9, lsl #4`) from a string-or-data pointer
+        // setup (REPStackTrace's `add r1, pc, #0xa4` which feeds a
+        // BL Print(...) — the pc-rel result there is an ASCII
+        // string, not a dispatch base).
+        let fn_range = match find_fn_range(fn_ranges, addr) {
+            Some(r) => r,
+            None => continue,
+        };
+        if !is_used_as_dispatch_base(words, fn_range, rd, addr) { continue; }
         let tw = words[(target >> 2) as usize];
         if (tw >> 28) == 0xF { continue; }
         if reach.get_word(target) { continue; }
@@ -1047,6 +1015,50 @@ fn collect_pc_relative_addr_roots(
     }
     stats.pc_rel_addr_roots += added;
     added
+}
+
+/// Find the (start, end) range of the function containing `addr`,
+/// using the sorted `fn_ranges` list. Returns `None` if `addr` is
+/// outside any known function.
+fn find_fn_range(fn_ranges: &[(u32, u32)], addr: u32) -> Option<(u32, u32)> {
+    let idx = fn_ranges.partition_point(|&(s, _)| s <= addr);
+    if idx == 0 { return None; }
+    let (s, e) = fn_ranges[idx - 1];
+    if s <= addr && addr < e { Some((s, e)) } else { None }
+}
+
+/// Returns true if any word in `[fn_range.0, fn_range.1)` decodes as a
+/// PC-write dispatch (`<dpop>cond pc, Rd_target, ...`) using `rd_target`
+/// as the base register. Skips `add Rd, PC, ...` itself by requiring
+/// Rn = `rd_target` (the dispatch reads from rd_target — only meaningful
+/// if rd_target was set earlier).
+fn is_used_as_dispatch_base(
+    words: &[u32],
+    fn_range: (u32, u32),
+    rd_target: u32,
+    skip_addr: u32,
+) -> bool {
+    let (s, e) = fn_range;
+    let start_idx = (s >> 2) as usize;
+    let end_idx = ((e >> 2) as usize).min(ROM_WORD_COUNT);
+    for i in start_idx..end_idx {
+        let pa = (i as u32) * 4;
+        if pa == skip_addr { continue; }
+        let w = words[i];
+        // DP family with Rd=15, Rn=rd_target, register operand,
+        // any cond (LS/CC/AL etc).
+        if (w >> 26) & 0b11 != 0b00 { continue; }
+        if (w >> 25) & 1 != 0 { continue; }
+        let rd = (w >> 12) & 0xF;
+        let rn = (w >> 16) & 0xF;
+        if rd != 15 { continue; }
+        if rn != rd_target { continue; }
+        let opcode = (w >> 21) & 0xF;
+        let s_bit = (w >> 20) & 1;
+        if matches!(opcode, 0x8..=0xB) && s_bit == 0 { continue; }
+        return true;
+    }
+    false
 }
 
 /// Scan the entire ROM+REX aperture for runs of N≥3 adjacent
@@ -1222,7 +1234,22 @@ fn run(args: Args) -> Result<(), String> {
         None => Vec::new(),
     };
 
-    let (reach, mut stats) = walk(&words, &symbols, &data_ranges);
+    // Function ranges from code-symbols.txt: half-open spans
+    // (sym_n, sym_{n+1}) for use by collect_pc_relative_addr_roots
+    // to scope its dispatch-base check. The last entry stretches
+    // to the ROM aperture end.
+    let mut fn_addrs = load_symbol_roots(&args.symbols)?;
+    fn_addrs.sort_unstable();
+    fn_addrs.dedup();
+    let mut fn_ranges: Vec<(u32, u32)> = fn_addrs
+        .windows(2)
+        .map(|w| (w[0], w[1]))
+        .collect();
+    if let Some(&last) = fn_addrs.last() {
+        fn_ranges.push((last, ROM_SIZE_BYTES as u32));
+    }
+
+    let (reach, mut stats) = walk(&words, &symbols, &data_ranges, &fn_ranges);
     stats.rex_header_roots = rex_header_root_count;
     // Dedup sometimes removes some of the REx entries (they may
     // overlap vectors/symbols); report the actual count after merge.
@@ -1280,7 +1307,6 @@ fn run(args: Args) -> Result<(), String> {
     writeln!(f, "    fnptr literal roots added: {}", stats.fnptr_literal_roots).ok();
     writeln!(f, "    B-run dispatch roots added: {}", stats.b_run_roots).ok();
     writeln!(f, "    PC-rel addr roots added:    {}", stats.pc_rel_addr_roots).ok();
-    writeln!(f, "    branch-to-reached roots:    {}", stats.branch_to_reached_roots).ok();
     writeln!(f, "    total indirect roots added: {}", stats.indirect_roots_added).ok();
     writeln!(f, "    reachable-code popcount: {}", reach.popcount()).ok();
     writeln!(f, "  byte-access-static.bitmap popcount = {}", ba_static.popcount()).ok();

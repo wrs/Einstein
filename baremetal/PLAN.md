@@ -17,49 +17,60 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-67):** iter-66 falsified the
-"`0x35d110` LDRB is looping" hypothesis with a one-line probe in
-`shadow_stub::emulate_sba_site`: the SBA UDF for slot 0x424 is
-**never executed** during the wedge (zero probe hits despite
-millions of beacons at `ELR=0xffffe4 SPSR=0x40000197`). So the
-0xe7f842f4 value seen as `LR_abt` is *unrelated to the LDRB at
-0x35d110 ever firing* — it's purely the byte pattern of the
-patched UDF marker, coinciding because slot allocation happens to
-land that index there.
+**Current goal (iter-68):** iter-67 narrowed the wedge mechanism
+further with two probes (both reverted before commit): a `bp` at
+PrefetchAbortHandler entry (0x393b84) and an unsuppressed-repeat
+counter in `log_dabt_forward`. Findings below; **the wedge is not
+PABT-recovery looping — it's the kernel's `DataAbortHandler`
+(invoked once by a recursive DABT at FAR=0x0cd2d000, mode=0x17)
+running emulated byte accesses indefinitely without making
+forward progress**.
 
-**Corrected mechanism:** The wedge is a kernel-side abort retry
-loop. PABT handler entry sets `LR_abt = abort'd_PC + 4`. The
-handler's recovery path (`subs pc, lr, #4` or equivalent) restarts
-the abort'd instruction at `LR_abt - 4 = 0xe7f842f0`. Fetching at
-`0xe7f842f0` is permanently unmapped (high VA, no stage-1 entry),
-so PABT fires again, hardware re-sets `LR_abt = 0xe7f842f4`, retry,
-loop. The ~100K-1M trap/s at `ELR=0xffffe4` is the SBA-UDF traffic
-inside the *abort handler's own* byte accesses, not progress.
+iter-66's correction is itself partially wrong: there's no
+permanent PABT loop. The actual mechanism is:
 
-**Open question:** how did USR mode end up branching to
-`0xe7f842f0` in the first place? Either:
-- Indirect call (`bx Rn` / `mov pc, Rn` / `ldr pc, [...]`) where
-  the target value was loaded from a corrupted ROM word — most
-  plausibly because `shadow_stub::patch_rom_from_bitmap`
-  rewrote a code-and-data overlap region.
-- Computed pointer arithmetic that landed in high VA space.
+1. USR took a DABT, kernel `DataAbortHandler` ran in ABT mode.
+2. While in ABT mode, a *recursive* DABT fired at
+   FAR=0x0cd2d000 (DFSC=0x05 = translation fault, section).
+3. EL2's `handle_diag` forwarded that to `DataAbortHandler` at
+   0x393114 (the standard DABT-fast-path forward).
+4. Since then: zero further DIAG-path aborts (the iter-67
+   REPEAT counter logged 0 events across 4.6M+ beacons). All
+   the `ELR=0xffffe4 SPSR=0x40000197` (mode=ABT) traps are SBA
+   UDF emulations, not abort recursions.
 
-**iter-67 next steps:**
+So the kernel's `DataAbortHandler` is in a tight loop *inside
+its own body* — running through emulated byte accesses without
+returning. Most plausible: a string scan / list walk / pointer
+chase against corrupt state from the original DABT.
 
-1. **Capture the first PABT.** Install a one-shot HVC at the
-   AArch32 PABT vector (ROM offset `0x0C`) that logs IFAR, IFSR,
-   LR_abt, SPSR_abt before forwarding to the kernel's
-   `PrefetchAbortHandler` (`0x01A0_0010`). Template:
-   `guest_mem::patch_dabt_vector` already does the same thing
-   for DABT. Confirms IFAR value and *original* (pre-loop) USR
-   PC and registers.
-2. **Once IFAR is confirmed**, install a `bp` at the USR PC just
-   before the bad branch and use `ctt $x0` to dump the chain
-   plus `info registers` to see what r0..r12 contained at the
-   moment of the indirect call.
-3. **Bisect the corrupt source.** If the bad target came from a
-   load, find the source word; check `BYTE_ACCESS_STATIC_BITMAP`
-   for whether `shadow_stub` patched a code/data overlap.
+**Probe results that ruled things out:**
+
+- `bp 0x00393b84` (PrefetchAbortHandler entry) installed via
+  `install_guest_bp` in `kmain` — **never fired** during 4.6M+
+  wedge beacons. The kernel's PABT path doesn't reach 0x393b84.
+  So the ELR=0xffffe4 wedge isn't PABT-driven.
+- `log_dabt_forward` repeat-counter (logging up to 16 repeats
+  per tuple plus every 64th up to 1024) — also fired 0 times.
+  Confirms the DIAG-path is quiescent after the initial
+  recursive-DABT forward.
+
+**iter-68 next steps:**
+
+1. **Identify what `DataAbortHandler` is doing.** A `bp` at
+   `0x00393114` (DataAbortHandler entry) will fire on the
+   first invocation; the dump-and-continue tail logs r0..r12 +
+   banked LR/SP. From there, bisect forward to find the loop.
+2. **Or instrument the SBA UDF emulator** to count emulations
+   per source mode and per faulting_pc. If most ABT-mode SBA
+   UDFs cluster at one PC range, that's the loop body.
+3. **Cross-check FAR=0x0cd2d000.** That VA is in the kernel's
+   global-data window (0x0c100000+). What kernel structure lives
+   at 0x0cd2d000? probe/FINDINGS.md or the L1 page-table walker
+   should resolve it. If the structure is corrupt at boot
+   (e.g. stack collision, uninitialised pointer), the wedge is
+   in the kernel's stage-1 mapping setup, not in shadow_stub at
+   all.
 
 **Background (unchanged from iter-61):** boot reaches a quiescent
 idle at the Newton splash. The framebuffer renders correctly
@@ -67,6 +78,57 @@ idle at the Newton splash. The framebuffer renders correctly
 `newt`=RUN, `scrn`=RDY blocked on its event-signal sema-group,
 all 24 others BLK. The residual `evt.ex.fr.store` throws are
 benign soup-probe misses caught by NewtonScript.
+
+### Iteration 67: PABT-recovery hypothesis falsified; wedge is in DataAbortHandler
+
+#### Method
+
+Two probes added (both reverted before commit):
+
+- `install_guest_bp(0x0039_3b84)` in `kmain`: patches the first
+  instruction of `PrefetchAbortHandler` with the marker UDF. The
+  default dump-and-continue tail in `handle_user_bp_und` would
+  log r0..r12 + banked LR/SP for every kernel-side PABT entry.
+- Unsuppressed-repeat counter in `log_dabt_forward`
+  (`src/trap.rs` ~6822): logs the first 16 repeat hits per
+  (FAR, mode, dedup_mode) tuple plus every 64th up to 1024,
+  bypassing the existing dedup so the wedge's dominant fault
+  isn't silenced.
+
+Cold-boot, no debugger.
+
+#### Result
+
+Boot reached the wedge state (`ELR=0xffffe4 SPSR=0x40000197
+mode=ABT`) at ~3M beacons. Kept running to 4.6M+ beacons.
+
+- **PrefetchAbortHandler bp: 0 hits.** No "guest_bp: HIT at
+  0x00393b84" line appeared. The kernel's PABT path doesn't
+  reach 0x393b84 in the wedge state. So the wedge isn't
+  driven by repeated PABTs.
+- **DABT-forward repeat counter: 0 events.** The single
+  pre-existing forward (`DFSC=0x5 FAR=0x0cd2d000 mode=0x17`)
+  is the only `handle_diag` ABT-source dispatch in the entire
+  run — no further aborts go through DIAG.
+
+#### Implication
+
+iter-66's "PABT recovery loop on permanently-unmapped VA"
+hypothesis is **falsified**. The trap-rate signature at
+`ELR=0xffffe4` (UND_RETURN_STUB) is pure SBA UDF emulation
+inside the kernel's `DataAbortHandler` — invoked once for the
+recursive DABT at FAR=0x0cd2d000 (mode=0x17), and stuck
+running *inside its own body* without making forward progress
+on a tight loop of byte accesses.
+
+The wedge is therefore *upstream* of any USR-mode "indirect
+call to high VA" bug. The kernel's DataAbortHandler entered with
+corrupt state from the original DABT and is now grinding through
+emulated byte accesses that never converge to a return.
+
+`LR_abt = 0xe7f842f4` in periodic dumps is just a register value
+left over from inside the handler's body; not a hardware abort
+artifact.
 
 ### Iteration 66: slot 0x424 LDRB hypothesis falsified
 
@@ -106,100 +168,15 @@ function pointer") is **falsified**.
   is *inside the abort handler's retry loop*, not in the USR
   scanner code DrTextChunk represents.
 
-### Iteration 65: per-task call-chain tools + splash wedge characterized
-
-#### Tooling shipped
-
-- `task_dump::dump_current_chain(ctx)` — current-task chain from
-  live banked regs (ELR_EL2 leaf, SP/LR/r11 from `ctx` per Table
-  D1-79). `#[no_mangle] #[inline(never)]` + `#[used]` pin so gdb
-  `call` resolves the symbol post-LTO.
-- `task_dump::dump_chain_at(ctx, pc)` — explicit-PC variant for
-  guest-BP stops, where ELR_EL2 holds the UND-trampoline PC, not
-  the BP'd guest PC.
-- `guest_bp::bp_hit_anchor(faulting_pc, ctx)` — empty
-  `#[inline(never)]` `extern "C"` shim called from
-  `handle_user_bp_und` after the slot lookup. Lets the gdb-init
-  `bp <addr>` command set a stable conditional `tbreak
-  bp_hit_anchor if ($x0 & 0xffffffff) == <addr>` (vs. the prior
-  line-number anchor that drifted into a kprintln macro).
-  Carries `ctx` so it's visible at the bp-stop frame after one
-  `up`, allowing `ctt`-from-bp to work without walking past
-  `<optimized out>` frames.
-- gdb-init `ctt [pc]` and `bp <addr>` commands. Output goes to
-  the hypervisor serial console, not gdb.
-- Mangled C++ names in the symbol pool (build.rs reads
-  `_Data_/symbols.txt` and overrides demangled names from
-  `code-symbols.txt`). 18925 entries × ~32 bytes/name = 609 KB.
-- One-fn-per-line stack rendering (drops the redundant `PC <-
-  LR` per row that previously printed each function twice with
-  different offsets).
-- Periodic heartbeat dump (`trap_irq` → `task_dump::periodic`)
-  now also dumps the current-task chain.
-
-#### Key finding: the splash wedge
-
-Cold-boot run, no snapshot, no trace. Periodic dumps land an
-identical chain every ~4 s (= state stable across multiple
-samples, definitively wedged):
-
-```
-current task 0xc12391c (newt) id=0x3113 mode=0x17
-   [pc=0xffffe4 lr=0xe7f842f4 sp=0xc004c00 fp=0xcc77894]
-        #0  <noncode 0xffffe4>                  ← UND_RETURN_STUB
-        #1  <data 0xe7f842f4>                   ← UDF instruction word
-        #2  MeasureGlyphWidths__Fl+0x224
-        #3  UpdateLayoutState__FlN31+0x88
-        #4  DrText__FlN21+0x54
-        #5  DoTextOnce_...+0x110
-        #6  DrawTextOnce_...+0x4c
-        #7  DrawSplashScreen__9TNotebookFv+0x368
-        #8  InitToolbox__9TNotebookFv+0x90
-        #9..#13  ... TaskEntry → TaskKillSelf
-```
-
-Cross-checks:
-
-- `SBA_ORIG_PC[0x424] = 0x35d110` (inside
-  `DrTextChunk__FP10DrTextInfolPUsPl`).
-- `SBA_ORIG_INSN[0x424] = 0xe4d61001` = `LDRB r1, [r6], #1`.
-- Site is solidly inside the function body (preceded by `b
-  0x35d57c`, followed by another `LDRB r2, [r6]` for halfword
-  assembly).
-- `enc_udf(0x8000 | 0x424) = 0xe7f842f4` exactly.
-
-The same `0xe7f842f4` value appears as the saved `LR_abt`. The
-timer-IRQ early-trap dump shows `LR_svc=0xe7f842f0` (= UDF word -
-4) at the same wedge state — meaning *two* banked LRs are
-contaminated by the patched-ROM-word value.
-
-#### What this means
-
-Some path inside `MeasureGlyphWidths` or its callees reads the
-ROM word at `0x35d110` *as data* (not by executing the LDRB),
-gets the patched UDF marker `0xe7f842f4`, and uses it as a code
-address. The fetch at high VA `0xe7f842f4` traps to AArch32 PABT;
-the kernel's PrefetchAbortHandler runs in ABT mode and can't
-recover (the address is genuinely unmapped at stage-1). The
-abort handler's own LDRB/LDRH sites trip SBA UDFs constantly,
-producing the ~100K-1M trap/s rate at `ELR=0xffffe4` — that is
-NOT forward progress, it's the abort handler grinding through
-its own emulated byte accesses without ever exiting.
-
-#### Verification
-
-Two cold-boot runs, chain identical at +4s/+8s/+12s/+16s. SP, FP,
-LR all unchanged. Beacon trap counter rises 100K-1M per beacon —
-high churn, zero progress.
-
-#### Open question for iter-66
-
-Where is the LDR that reads `0x35d110` as data? Static grep over
-`rom.dis` finds no literal pool reference. Most likely runtime-
-computed: a glyph-cache pointer table, a "drawer-fn-per-glyph"
-dispatch, or unrolled bitmap copy that mistakes a code page for
-a font row. iter-66 starts with the PABT-vector probe to confirm
-IFAR, then walks the load chain back from there.
+<!-- iter-65 (per-task call-chain tools + splash wedge
+     characterised) pruned per the auto-prune maintenance note —
+     iter-66 + iter-67 both refer to its `LR_abt = 0xe7f842f4`
+     finding and the `MeasureGlyphWidths → DrTextChunk` chain it
+     surfaced via `dump_current_chain` / `ctt`. Both hypotheses
+     drawn from iter-65 (the LDRB-loop and the PABT-recovery
+     loop) are now superseded by iter-67's "DataAbortHandler
+     stuck inside its own body" mechanism. See
+     `git log --grep="iter-65"` for the full retrospective. -->
 
 <!-- iter-64 (function tracer locates newt past splash, inside
      RunInitScripts/DoBlock) pruned per the auto-prune

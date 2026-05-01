@@ -165,10 +165,27 @@ document tt
 tt N -- log the first N sync traps' guest PC + ESR, then stop.
 end
 
+# `ctt` — current task trace. From any stop where a `&TrapContext` is
+# in scope (trap_sync_lower_aarch32, trap_irq, handle_user_bp_und,
+# handle_data_abort, …), call into the hypervisor to print the
+# currently-running task's call chain from live banked registers.
+# ELR_EL2 is read inside the hypervisor so the value is fresh; SP/LR/FP
+# come from the trap context per Table D1-79.
+define ctt
+  call newton_hypervisor::task_dump::dump_current_chain(ctx)
+end
+document ctt
+ctt -- print the currently-running task's call chain (one fn per line).
+Requires `ctx` to be visible in the current frame; if not, `up` until
+you reach a trap-handler frame that took a `&mut TrapContext` argument.
+Output goes to the hypervisor serial console (kprintln), not gdb.
+end
+
 printf "gdb connected. Handy commands:\n"
 printf "  break kmain              # EL2 hypervisor entry\n"
 printf "  break trap_sync_lower_aarch32\n"
 printf "  guest-state              # dump guest PC/ESR/FAR/CPSR at an EL2 sync-trap stop\n"
+printf "  ctt                      # print current task's call chain (needs `ctx` in scope)\n"
 printf "  bg  0x<addr>             # break when guest *sync-traps* at that PC\n"
 printf "  bp  0x<addr>             # install guest sw BP at ROM addr + arm bg (one-shot)\n"
 printf "  bp-clear 0x<addr>        # remove a bp-installed BP\n"

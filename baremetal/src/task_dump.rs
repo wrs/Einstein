@@ -1350,7 +1350,12 @@ pub fn dump_phys_for_pa(target_pa: u32) {
 }
 
 /// Heartbeat-rate dump trigger. Returns true on the firing iterations.
-pub fn periodic() -> bool {
+/// Pass the trap context from the caller so the current-task chain can
+/// be rendered from live banked registers (the SWIBoot save area at
+/// task+0x4c is stale for the running task — it only gets written when
+/// the task transitions through SWI/IRQ in EL1, and our trap_irq goes
+/// straight to EL2 instead).
+pub fn periodic(ctx: &crate::trap::TrapContext) -> bool {
     static mut COUNT: u64 = 0;
     let n = unsafe {
         COUNT = COUNT.wrapping_add(1);
@@ -1361,8 +1366,68 @@ pub fn periodic() -> bool {
     // this slow keeps UART noise under control.
     if n % 256 == 0 {
         dump();
+        dump_current_chain(ctx);
         true
     } else {
         false
+    }
+}
+
+/// Render the currently-running task's call chain from live banked
+/// registers. ELR_EL2 is the guest PC at the moment the EL2 handler
+/// was entered; the source-mode SP/LR/r11 come from `ctx` per Table
+/// D1-79 (via `banked::sp_for_mode` / `banked::lr_for_mode`); r11 is
+/// non-banked except for FIQ, where the FIQ-banked slot already lives
+/// at `ctx.x[11]` because of how the AArch32 register file maps to the
+/// AArch64 GPR file under EL2.
+///
+/// Callable from gdb after `up`'ing into a frame where `ctx` is in
+/// scope, e.g. `trap_sync_lower_aarch32` or `trap_irq`:
+/// ```
+/// (gdb) call newton_hypervisor::task_dump::dump_current_chain(ctx)
+/// ```
+/// Or from any in-tree caller that has a `&TrapContext` handy.
+pub fn dump_current_chain(ctx: &crate::trap::TrapContext) {
+    let elr: u64;
+    let spsr: u64;
+    // SAFETY: reading sysregs has no side effects.
+    unsafe {
+        core::arch::asm!(
+            "mrs {}, elr_el2",
+            "mrs {}, spsr_el2",
+            out(reg) elr,
+            out(reg) spsr,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    let elr = elr as u32;
+    let spsr = spsr as u32;
+    let mode = spsr & 0x1F;
+    let sp = crate::banked::sp_for_mode(ctx, spsr);
+    let lr = crate::banked::lr_for_mode(ctx, spsr);
+    let fp = ctx.x[11] as u32;
+
+    let curr = rd(G_CURRENT_TASK).unwrap_or(0);
+    let id = rd(curr).unwrap_or(0);
+    let glob = rd(curr + TT_GLOBALS).unwrap_or(0);
+    let (n0, n1, n2, n3) = match find_task_name(glob) {
+        Some((_, v)) => ((v >> 24) as u8, (v >> 16) as u8, (v >> 8) as u8, v as u8),
+        None         => (b'?', b'?', b'?', b'?'),
+    };
+    kprintln!(
+        "  current task {:#x} ({}{}{}{}) id={:#x} mode={:#x}  [pc={:#x} lr={:#x} sp={:#x} fp={:#x}]",
+        curr, n0 as char, n1 as char, n2 as char, n3 as char,
+        id, mode, elr, lr, sp, fp,
+    );
+    print_chain_frame(0, elr);
+    if lr != 0 && lr != u32::MAX {
+        print_chain_frame(1, lr);
+    }
+    if fp != 0 && fp != u32::MAX && (fp & 3) == 0 {
+        let mut depth = 2usize;
+        walk_apcs_frames(fp, 12, |frame_lr, _fp| {
+            print_chain_frame(depth, frame_lr);
+            depth += 1;
+        });
     }
 }

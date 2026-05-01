@@ -342,8 +342,10 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
 
     // Periodic scheduler / run-queue dump. Cheap (64-iteration stride) and
     // gives forward-progress signal that's independent of the function
-    // tracer (which only sees calls into traced ROM functions).
-    crate::task_dump::periodic();
+    // tracer (which only sees calls into traced ROM functions). Pass ctx
+    // so the dump can render the current task's chain from live banked
+    // regs (its SWIBoot save area is stale for the running task).
+    crate::task_dump::periodic(ctx);
 
     // One-shot tripwire: poll PA 0x0402a250 every heartbeat and log the
     // first time it transitions to 0x6e657774 ("newt"). Lets us bound

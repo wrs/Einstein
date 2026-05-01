@@ -1383,45 +1383,80 @@ pub fn periodic(ctx: &crate::trap::TrapContext) -> bool {
 ///
 /// `#[no_mangle] extern "C"` so gdb's `call` works without the Rust
 /// language hook trying to resolve the function name as a tuple-struct
-/// constructor. Callable from gdb after `up`'ing into a frame where
-/// `ctx` is in scope, e.g. `trap_sync_lower_aarch32` or `trap_irq`:
-/// ```
-/// (gdb) call dump_current_chain(ctx)
-/// ```
-/// Or from any in-tree caller that has a `&TrapContext` handy.
+/// constructor. `#[inline(never)]` + the `#[used]` pin below keep LTO
+/// from flattening the function into `periodic()` (the only in-tree
+/// caller), which would erase the gdb-visible symbol.
+///
+/// Reads ELR_EL2 to identify the leaf PC. That's correct for
+/// most trap-handler frames (data abort, IRQ, generic HVC), but
+/// *wrong* at a guest-BP stop: there ELR_EL2 holds the UND-trampoline
+/// PC inside ROM offset 0x00FFFF00+, not the BP'd guest PC. For BP
+/// stops use `dump_chain_at(ctx, faulting_pc)` instead — that's what
+/// the gdb-init `ctt <pc>` form does when the user passes `faulting_pc`.
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn dump_current_chain(ctx: &crate::trap::TrapContext) {
     let elr: u64;
-    let spsr: u64;
     // SAFETY: reading sysregs has no side effects.
     unsafe {
         core::arch::asm!(
             "mrs {}, elr_el2",
-            "mrs {}, spsr_el2",
             out(reg) elr,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    dump_chain_at(ctx, elr as u32);
+}
+
+/// Render the currently-running task's call chain using `pc` as the
+/// leaf address. Use this at guest-BP stops where ELR_EL2 points at the
+/// UND trampoline; pass `faulting_pc` instead so depth 0 shows the
+/// actual BP'd PC. SP/LR/FP still come from `ctx` per the source mode
+/// in SPSR_EL2.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn dump_chain_at(ctx: &crate::trap::TrapContext, pc: u32) {
+    let spsr: u64;
+    // SAFETY: reading sysregs has no side effects.
+    unsafe {
+        core::arch::asm!(
+            "mrs {}, spsr_el2",
             out(reg) spsr,
             options(nomem, nostack, preserves_flags),
         );
     }
-    let elr = elr as u32;
+    let elr = pc;
     let spsr = spsr as u32;
     let mode = spsr & 0x1F;
     let sp = crate::banked::sp_for_mode(ctx, spsr);
     let lr = crate::banked::lr_for_mode(ctx, spsr);
     let fp = ctx.x[11] as u32;
 
+    // gCurrentTask isn't populated until the kernel scheduler is up
+    // (well after BootOS / InitCGlobals). Reads of `*curr` early in
+    // boot return whatever happens to be at PA 0, which decodes as
+    // garbage. Treat curr==0 (and any read failure) as "no task yet"
+    // and skip the task-identity header — the chain itself is the
+    // useful part either way.
     let curr = rd(G_CURRENT_TASK).unwrap_or(0);
-    let id = rd(curr).unwrap_or(0);
-    let glob = rd(curr + TT_GLOBALS).unwrap_or(0);
-    let (n0, n1, n2, n3) = match find_task_name(glob) {
-        Some((_, v)) => ((v >> 24) as u8, (v >> 16) as u8, (v >> 8) as u8, v as u8),
-        None         => (b'?', b'?', b'?', b'?'),
-    };
-    kprintln!(
-        "  current task {:#x} ({}{}{}{}) id={:#x} mode={:#x}  [pc={:#x} lr={:#x} sp={:#x} fp={:#x}]",
-        curr, n0 as char, n1 as char, n2 as char, n3 as char,
-        id, mode, elr, lr, sp, fp,
-    );
+    if curr == 0 {
+        kprintln!(
+            "  current task <none — scheduler not yet up>  mode={:#x}  [pc={:#x} lr={:#x} sp={:#x} fp={:#x}]",
+            mode, elr, lr, sp, fp,
+        );
+    } else {
+        let id = rd(curr).unwrap_or(0);
+        let glob = rd(curr + TT_GLOBALS).unwrap_or(0);
+        let (n0, n1, n2, n3) = match find_task_name(glob) {
+            Some((_, v)) => ((v >> 24) as u8, (v >> 16) as u8, (v >> 8) as u8, v as u8),
+            None         => (b'?', b'?', b'?', b'?'),
+        };
+        kprintln!(
+            "  current task {:#x} ({}{}{}{}) id={:#x} mode={:#x}  [pc={:#x} lr={:#x} sp={:#x} fp={:#x}]",
+            curr, n0 as char, n1 as char, n2 as char, n3 as char,
+            id, mode, elr, lr, sp, fp,
+        );
+    }
     print_chain_frame(0, elr);
     if lr != 0 && lr != u32::MAX {
         print_chain_frame(1, lr);
@@ -1434,3 +1469,14 @@ pub extern "C" fn dump_current_chain(ctx: &crate::trap::TrapContext) {
         });
     }
 }
+
+/// `#[used]` pin so LTO can't strip these symbols. gdb's `call`
+/// machinery needs an actual entry to land on, and the only in-tree
+/// caller of `dump_current_chain` is `periodic()` (which would inline
+/// it away under LTO without this guard). `dump_chain_at` has no
+/// in-tree caller at all.
+#[used]
+static DUMP_CHAIN_FORCE_KEEP: (
+    extern "C" fn(&crate::trap::TrapContext),
+    extern "C" fn(&crate::trap::TrapContext, u32),
+) = (dump_current_chain, dump_chain_at);

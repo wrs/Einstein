@@ -175,17 +175,40 @@ end
 # `handle_user_bp_und` (or any trap-handler frame that took a
 # `&mut TrapContext`), then run `ctt`.
 #
-# No type cast on the call — gdb's Rust language hook rejects `(void)`
-# and friends, and Rust's unit return prints harmlessly anyway.
+# `dump_current_chain` is `#[no_mangle] extern "C"` and present in the
+# symbol table, but gdb's Rust language hook refuses to look it up
+# from Rust source contexts ("No symbol in current context") because
+# the function isn't declared in Rust scope at the stop frame.
+# Switching the language to C for the duration of the call lets gdb
+# resolve the unmangled name and synthesise a `void(void*)` signature
+# from the symbol table; we restore `auto` immediately after so the
+# rest of the session keeps Rust pretty-printing.
 define ctt
-  call dump_current_chain(ctx)
+  set language c
+  if $argc == 0
+    call dump_current_chain(ctx)
+  else
+    call dump_chain_at(ctx, $arg0)
+  end
+  set language auto
 end
 document ctt
-ctt -- print the currently-running task's call chain (one fn per line).
-Requires `ctx` to be visible in the current frame; from `bp_hit_anchor`
-or other helper-fn stops, `up` until you reach a frame that took a
-`&mut TrapContext` argument. Output goes to the hypervisor serial
-console (kprintln), not gdb.
+ctt [PC] -- print the currently-running task's call chain (one fn
+per line) to the hypervisor serial console (not gdb).
+
+  ctt              uses ELR_EL2 as the leaf PC. Right for most
+                   trap-handler stops (data abort, IRQ, …).
+  ctt faulting_pc  uses an explicit PC. Use this at a guest-BP stop
+                   (`up` to bp_hit_anchor first so `faulting_pc` is
+                   in scope), where ELR_EL2 points at the UND
+                   trampoline rather than the BP'd guest PC.
+                   `ctt $x0` works equivalently at the bp_hit_anchor
+                   entry, since faulting_pc is the first AAPCS64 arg.
+
+Requires `ctx` to be visible in the current frame. From a stop
+inside `core::hint::black_box` (frame 0), `up` once to reach
+`bp_hit_anchor` (frame 1) — `ctx` is now passed there as the second
+arg, so it stays in DWARF.
 end
 
 printf "gdb connected. Handy commands:\n"

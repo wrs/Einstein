@@ -143,12 +143,12 @@ static GUEST_BP_FORCE_KEEP: (
 /// `tbreak src/guest_bp.rs:481` which drifted as the source moved.
 #[no_mangle]
 #[inline(never)]
-pub extern "C" fn bp_hit_anchor(_faulting_pc: u32) {
+pub extern "C" fn bp_hit_anchor(faulting_pc: u32) {
     // SAFETY: empty body — the call/return is the entire purpose.
     // `core::hint::black_box` defends the call against future LTO
     // attempts to flatten this into a tail-merge or otherwise erase
     // the symbol's entry instruction.
-    core::hint::black_box(_faulting_pc);
+    core::hint::black_box(faulting_pc);
 }
 
 /// Install a one-shot guest breakpoint at ROM IPA `ipa`.

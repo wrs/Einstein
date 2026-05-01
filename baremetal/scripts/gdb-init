@@ -99,7 +99,12 @@ define bp
     # `tbreak` (one-shot) matches the underlying guest_bp's one-shot
     # semantic — fires once and auto-deletes, so repeated `bp`
     # invocations don't accumulate stale gdb breakpoints.
-    tbreak bp_hit_anchor if _faulting_pc == $arg0
+    # Filter on $x0 (the AAPCS64 register that holds the first arg at
+    # function entry) rather than the Rust parameter name. The named
+    # symbol can show as "optimized out" in DWARF at the immediate
+    # entry of an `#[inline(never)]` shim that just forwards to
+    # black_box, but $x0 is always live there.
+    tbreak bp_hit_anchor if (unsigned)$x0 == $arg0
   end
 end
 document bp

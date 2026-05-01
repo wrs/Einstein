@@ -17,40 +17,49 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-66):** iter-65 shipped per-task call-chain
-tools (`ctt` / `dump_current_chain` / `dump_chain_at` /
-`bp_hit_anchor`) and used the live periodic dump to redirect the
-wedge investigation. The "tight loop calling only previously-seen
-functions" iter-64 saw is **not forward progress in DoBlock — it's
-a wedge inside `DrawSplashScreen → MeasureGlyphWidths →
-DrTextChunk@0x35d110`**. Mode = ABT, PC = UND_RETURN_STUB,
-LR_abt = `0xe7f842f4` literally equals the SBA UDF instruction
-word for slot 0x424 (which patched the LDRB at 0x35d110). That
-value got into a code register somewhere; the resulting fetch at
-high VA `0xe7f842f4` PABTs, the kernel handler can't recover, and
-the chain of SBA UDFs in the abort handler itself produces the
-~100K-1M trap/s rate at `ELR=0xffffe4`. Concrete iter-65 findings
-below; next steps:
+**Current goal (iter-67):** iter-66 falsified the
+"`0x35d110` LDRB is looping" hypothesis with a one-line probe in
+`shadow_stub::emulate_sba_site`: the SBA UDF for slot 0x424 is
+**never executed** during the wedge (zero probe hits despite
+millions of beacons at `ELR=0xffffe4 SPSR=0x40000197`). So the
+0xe7f842f4 value seen as `LR_abt` is *unrelated to the LDRB at
+0x35d110 ever firing* — it's purely the byte pattern of the
+patched UDF marker, coinciding because slot allocation happens to
+land that index there.
 
-1. **Confirm the PABT trigger.** Install a one-shot HVC at the
-   AArch32 PABT vector (ROM offset `0x0C`) or at the kernel
-   `PrefetchAbortHandler` entry (`0x01A0_0010`) that logs IFAR,
-   IFSR, LR_abt, SPSR_abt for the first hit. Hypothesis: IFAR =
-   `0xe7f842f4` (or near it). The existing DABT-vector intercept
-   in `guest_mem::patch_dabt_vector` is the template.
-2. **Trace the LDR-as-data site.** A grep over `rom.dis` for any
-   literal pool / computed reference to `0x35d100..0x35d130`
-   yields nothing direct, so the bad pointer is computed at
-   runtime (table-index pointer arithmetic, vtable lookup,
-   glyph-cache key). Once the PABT IFAR is confirmed, set a
-   guest BP a few instructions before the wedge fires and walk
-   the load chain back.
-3. **Decide where the fix lives.** Either (a) the classify-rom
-   bitmap incorrectly marked a code/data overlap region as
-   sub-word-access code; (b) shadow_stub needs an overlap-detect
-   guard before patching; or (c) the LDR site itself is doing
-   something un-Newtony that we should special-case. iter-64's
-   "newt is in DoBlock" plan is parked until this is resolved.
+**Corrected mechanism:** The wedge is a kernel-side abort retry
+loop. PABT handler entry sets `LR_abt = abort'd_PC + 4`. The
+handler's recovery path (`subs pc, lr, #4` or equivalent) restarts
+the abort'd instruction at `LR_abt - 4 = 0xe7f842f0`. Fetching at
+`0xe7f842f0` is permanently unmapped (high VA, no stage-1 entry),
+so PABT fires again, hardware re-sets `LR_abt = 0xe7f842f4`, retry,
+loop. The ~100K-1M trap/s at `ELR=0xffffe4` is the SBA-UDF traffic
+inside the *abort handler's own* byte accesses, not progress.
+
+**Open question:** how did USR mode end up branching to
+`0xe7f842f0` in the first place? Either:
+- Indirect call (`bx Rn` / `mov pc, Rn` / `ldr pc, [...]`) where
+  the target value was loaded from a corrupted ROM word — most
+  plausibly because `shadow_stub::patch_rom_from_bitmap`
+  rewrote a code-and-data overlap region.
+- Computed pointer arithmetic that landed in high VA space.
+
+**iter-67 next steps:**
+
+1. **Capture the first PABT.** Install a one-shot HVC at the
+   AArch32 PABT vector (ROM offset `0x0C`) that logs IFAR, IFSR,
+   LR_abt, SPSR_abt before forwarding to the kernel's
+   `PrefetchAbortHandler` (`0x01A0_0010`). Template:
+   `guest_mem::patch_dabt_vector` already does the same thing
+   for DABT. Confirms IFAR value and *original* (pre-loop) USR
+   PC and registers.
+2. **Once IFAR is confirmed**, install a `bp` at the USR PC just
+   before the bad branch and use `ctt $x0` to dump the chain
+   plus `info registers` to see what r0..r12 contained at the
+   moment of the indirect call.
+3. **Bisect the corrupt source.** If the bad target came from a
+   load, find the source word; check `BYTE_ACCESS_STATIC_BITMAP`
+   for whether `shadow_stub` patched a code/data overlap.
 
 **Background (unchanged from iter-61):** boot reaches a quiescent
 idle at the Newton splash. The framebuffer renders correctly
@@ -58,6 +67,44 @@ idle at the Newton splash. The framebuffer renders correctly
 `newt`=RUN, `scrn`=RDY blocked on its event-signal sema-group,
 all 24 others BLK. The residual `evt.ex.fr.store` throws are
 benign soup-probe misses caught by NewtonScript.
+
+### Iteration 66: slot 0x424 LDRB hypothesis falsified
+
+#### Method
+
+Added a one-line probe in `shadow_stub::emulate_sba_site` that
+logs every SBA UDF firing at slot index `0x424`, including a flag
+for "EA inside DrTextChunk" (the false-positive case the iter-65
+hypothesis would have produced). Cold-boot run, no debugger.
+
+#### Result
+
+Beacons advanced to ~3M traps at `ELR=0xffffe4 SPSR=0x40000197`,
+periodic dumps showed the same wedge state as iter-65 (`current
+task 0xc12391c (newt) … pc=0xffffe4 lr=0xe7f842f4 mode=0x17`), and
+**zero probe hits** logged. The LDRB at `0x35d110` is not being
+executed during the wedge.
+
+#### Implication
+
+The match between `LR_abt = 0xe7f842f4` and the slot-0x424 UDF
+encoding is coincidental — slot allocation order happened to give
+slot `0x424` to the LDRB at that address, and the UDF byte pattern
+`enc_udf(0x8000 | 0x424) = 0xe7f842f4` matches an unrelated
+unmapped VA the kernel is retrying. The probe was reverted before
+commit (one-line removal); the negative result is the deliverable.
+
+iter-65's hypothesis ("DrTextChunk LDRB scanner reads its own
+patched code as data and uses the resulting UDF marker as a
+function pointer") is **falsified**.
+
+#### Verification
+
+- Probe was active for >3M traps, never fired.
+- chain dump shows DrawSplashScreen → MeasureGlyphWidths → ...
+  exactly as in iter-65, but with mode=ABT confirming the wedge
+  is *inside the abort handler's retry loop*, not in the USR
+  scanner code DrTextChunk represents.
 
 ### Iteration 65: per-task call-chain tools + splash wedge characterized
 

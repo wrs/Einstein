@@ -17,33 +17,40 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-65):** iter-64 used the existing function
-tracer (`--features trace_once,quiet` — first-touch only, low
-overhead) to locate where newt actually is post-splash. **It is
-inside RunInitScripts → DoBlock running NewtonScript, doing text
-drawing and polling flash erases.** Concrete findings below; next
-steps:
+**Current goal (iter-66):** iter-65 shipped per-task call-chain
+tools (`ctt` / `dump_current_chain` / `dump_chain_at` /
+`bp_hit_anchor`) and used the live periodic dump to redirect the
+wedge investigation. The "tight loop calling only previously-seen
+functions" iter-64 saw is **not forward progress in DoBlock — it's
+a wedge inside `DrawSplashScreen → MeasureGlyphWidths →
+DrTextChunk@0x35d110`**. Mode = ABT, PC = UND_RETURN_STUB,
+LR_abt = `0xe7f842f4` literally equals the SBA UDF instruction
+word for slot 0x424 (which patched the LDRB at 0x35d110). That
+value got into a code register somewhere; the resulting fetch at
+high VA `0xe7f842f4` PABTs, the kernel handler can't recover, and
+the chain of SBA UDFs in the abort handler itself produces the
+~100K-1M trap/s rate at `ELR=0xffffe4`. Concrete iter-65 findings
+below; next steps:
 
-1. **Identify which NewtonScript boot block is running.** The
-   `DoBlock(refHandle, *0x00680388)` call inside `RunInitScripts`
-   at ROM 0x1f1b18 picks up a NewtonScript frame from the symbol
-   table at `0x00680388`. Read that NS object out of the ROM
-   to identify the boot block, then trace what it does. The new
-   `IsInternalFlashEraseActive` and `CheckEraseCompletion`
-   first-touches at the trace tail strongly suggest the block
-   is provisioning the PSS store (formatting blocks via erase).
-2. **Cross-check against Einstein** — still outstanding from
-   iter-61/62/63. The clean oracle would be a small companion
-   to `NewtonProbe` that calls into `TEmulator` for the same
-   wall-clock window and dumps `gObjectTable` + run-queue head,
-   mirroring our `task_dump`. Tells us whether Einstein at the
-   same point is still in this NS block or has progressed
-   further.
-3. **Optional perf (deferred):** ScratchVA fallback for the
-   rotate-LDR `no_dead_scratches` rejection (98 % of inline-
-   stub misses). Trap rate at splash idle is ~400 K/s, dominated
-   by `ELR=0xffffe4`. Fine for development unless it
-   bottlenecks diagnostics.
+1. **Confirm the PABT trigger.** Install a one-shot HVC at the
+   AArch32 PABT vector (ROM offset `0x0C`) or at the kernel
+   `PrefetchAbortHandler` entry (`0x01A0_0010`) that logs IFAR,
+   IFSR, LR_abt, SPSR_abt for the first hit. Hypothesis: IFAR =
+   `0xe7f842f4` (or near it). The existing DABT-vector intercept
+   in `guest_mem::patch_dabt_vector` is the template.
+2. **Trace the LDR-as-data site.** A grep over `rom.dis` for any
+   literal pool / computed reference to `0x35d100..0x35d130`
+   yields nothing direct, so the bad pointer is computed at
+   runtime (table-index pointer arithmetic, vtable lookup,
+   glyph-cache key). Once the PABT IFAR is confirmed, set a
+   guest BP a few instructions before the wedge fires and walk
+   the load chain back.
+3. **Decide where the fix lives.** Either (a) the classify-rom
+   bitmap incorrectly marked a code/data overlap region as
+   sub-word-access code; (b) shadow_stub needs an overlap-detect
+   guard before patching; or (c) the LDR site itself is doing
+   something un-Newtony that we should special-case. iter-64's
+   "newt is in DoBlock" plan is parked until this is resolved.
 
 **Background (unchanged from iter-61):** boot reaches a quiescent
 idle at the Newton splash. The framebuffer renders correctly
@@ -52,86 +59,109 @@ idle at the Newton splash. The framebuffer renders correctly
 all 24 others BLK. The residual `evt.ex.fr.store` throws are
 benign soup-probe misses caught by NewtonScript.
 
-### Iteration 64: function tracer locates newt — past splash, inside RunInitScripts/DoBlock
+### Iteration 65: per-task call-chain tools + splash wedge characterized
 
-No code changes. Used the existing `--features trace_once,quiet`
-build (first-touch only, ~3% overhead vs full `trace`) to discover
-where newt has actually been post-splash. The "must be in
-TNotebook::InitToolbox somewhere" guess from iter-63 was right
-about the function but wrong about the step.
+#### Tooling shipped
 
-#### Method
+- `task_dump::dump_current_chain(ctx)` — current-task chain from
+  live banked regs (ELR_EL2 leaf, SP/LR/r11 from `ctx` per Table
+  D1-79). `#[no_mangle] #[inline(never)]` + `#[used]` pin so gdb
+  `call` resolves the symbol post-LTO.
+- `task_dump::dump_chain_at(ctx, pc)` — explicit-PC variant for
+  guest-BP stops, where ELR_EL2 holds the UND-trampoline PC, not
+  the BP'd guest PC.
+- `guest_bp::bp_hit_anchor(faulting_pc, ctx)` — empty
+  `#[inline(never)]` `extern "C"` shim called from
+  `handle_user_bp_und` after the slot lookup. Lets the gdb-init
+  `bp <addr>` command set a stable conditional `tbreak
+  bp_hit_anchor if ($x0 & 0xffffffff) == <addr>` (vs. the prior
+  line-number anchor that drifted into a kprintln macro).
+  Carries `ctx` so it's visible at the bp-stop frame after one
+  `up`, allowing `ctt`-from-bp to work without walking past
+  `<optimized out>` frames.
+- gdb-init `ctt [pc]` and `bp <addr>` commands. Output goes to
+  the hypervisor serial console, not gdb.
+- Mangled C++ names in the symbol pool (build.rs reads
+  `_Data_/symbols.txt` and overrides demangled names from
+  `code-symbols.txt`). 18925 entries × ~32 bytes/name = 609 KB.
+- One-fn-per-line stack rendering (drops the redundant `PC <-
+  LR` per row that previously printed each function twice with
+  different offsets).
+- Periodic heartbeat dump (`trap_irq` → `task_dump::periodic`)
+  now also dumps the current-task chain.
 
-`trace_once` patches every code-symbol entry with a HVC trampoline
-that fires once per function (per-fn `INITIALISED` bitmap in
-`tracer.rs`). Cold boot for 90 s captured first-entries from
-trace 1 to ~4.25M; the system reached steady state with the
-expected `ELR=0xffffe4 SPSR=0x40000197` rotate-LDR trap signature
-at ~33M traps total.
+#### Key finding: the splash wedge
 
-#### Findings
-
-Newt's progression through user-mode boot, by trace number:
+Cold-boot run, no snapshot, no trace. Periodic dumps land an
+identical chain every ~4 s (= state stable across multiple
+samples, definitively wedged):
 
 ```
-   16514  TAppWorld::TheMain                  (boot main)
-   18066  TLoader::TheMain                    (TLoader at 0x11401c)
-   71308  TSoundServer::TheMain               (separate task)
-  100494  TCardProcessor::TheMain             (separate task)
- 4113325  TPSSManager::TheMain                (separate task; lasts 4M+ ticks)
- 4171906  TNotebook::InitToolbox              (newt enters InitToolbox)
- 4171907  TApplication::InitToolbox           (parent — step 1)
- 4172358  DoBlock                             (RunInitScripts NewtonScript)
- 4240890  TNotebook::DrawSplashScreen         (step 6 — splash logo)
- 4241030  UpdateHardwareScreen
- 4241034  BlitToScreens                       (the actual blit)
-   ...
- 4244865  InitTextWalker
- 4244866  ResetTextWalker                     (NS drawing text)
- 4245205  IsInternalFlashEraseActive          (NS provisioning flash)
- 4245206  TNewInternalFlash::CheckEraseCompletion
- 4245210  TNewInternalFlash::InternalCheckEraseCompletion
+current task 0xc12391c (newt) id=0x3113 mode=0x17
+   [pc=0xffffe4 lr=0xe7f842f4 sp=0xc004c00 fp=0xcc77894]
+        #0  <noncode 0xffffe4>                  ← UND_RETURN_STUB
+        #1  <data 0xe7f842f4>                   ← UDF instruction word
+        #2  MeasureGlyphWidths__Fl+0x224
+        #3  UpdateLayoutState__FlN31+0x88
+        #4  DrText__FlN21+0x54
+        #5  DoTextOnce_...+0x110
+        #6  DrawTextOnce_...+0x4c
+        #7  DrawSplashScreen__9TNotebookFv+0x368
+        #8  InitToolbox__9TNotebookFv+0x90
+        #9..#13  ... TaskEntry → TaskKillSelf
 ```
 
-After trace 4245210 no new functions enter for the rest of the
-~33M-trap run. So newt is in a tight loop calling only previously-
-seen functions, dominated by `IsInternalFlashEraseActive` polls,
-text drawing, and the rotate-LDR alignment-fault path.
+Cross-checks:
 
-What this tells us:
-- **Newt got past splash.** The "what wakes scrn" line of inquiry
-  was a dead end — scrn is quiet by design (only QD-primitive
-  drawing without an enclosing StartDrawing/StopDrawing wakes it).
-- **Newt is inside `DoBlock` in `RunInitScripts`** (step 10 of
-  TNotebook::InitToolbox), executing a NewtonScript boot block
-  loaded from `*0x00680388`. The NS block is actively drawing
-  text and waiting on flash erases — almost certainly
-  provisioning the PSS store on first boot (filling in the
-  Formatted-but-empty data area whose layout iter-58/63 showed
-  the kernel scanning).
-- **Trace overhead matters.** Full `--features trace,quiet`
-  slows boot enough that in 60 s of wall time the system
-  hadn't even cleared `InitPSSManager`'s flash log scan. Every
-  Newton function call becomes an EL2 round-trip; `trace_once`
-  amortises it to one round-trip per function.
+- `SBA_ORIG_PC[0x424] = 0x35d110` (inside
+  `DrTextChunk__FP10DrTextInfolPUsPl`).
+- `SBA_ORIG_INSN[0x424] = 0xe4d61001` = `LDRB r1, [r6], #1`.
+- Site is solidly inside the function body (preceded by `b
+  0x35d57c`, followed by another `LDRB r2, [r6]` for halfword
+  assembly).
+- `enc_udf(0x8000 | 0x424) = 0xe7f842f4` exactly.
+
+The same `0xe7f842f4` value appears as the saved `LR_abt`. The
+timer-IRQ early-trap dump shows `LR_svc=0xe7f842f0` (= UDF word -
+4) at the same wedge state — meaning *two* banked LRs are
+contaminated by the patched-ROM-word value.
+
+#### What this means
+
+Some path inside `MeasureGlyphWidths` or its callees reads the
+ROM word at `0x35d110` *as data* (not by executing the LDRB),
+gets the patched UDF marker `0xe7f842f4`, and uses it as a code
+address. The fetch at high VA `0xe7f842f4` traps to AArch32 PABT;
+the kernel's PrefetchAbortHandler runs in ABT mode and can't
+recover (the address is genuinely unmapped at stage-1). The
+abort handler's own LDRB/LDRH sites trip SBA UDFs constantly,
+producing the ~100K-1M trap/s rate at `ELR=0xffffe4` — that is
+NOT forward progress, it's the abort handler grinding through
+its own emulated byte accesses without ever exiting.
 
 #### Verification
 
-- All 36 guest tests pass on QEMU (no code changes; ran the
-  suite to confirm baseline still green).
-- Two cold-boot runs:
-  - `trace_once,quiet` 90 s — log captured the boot waypoints
-    above; FB at `/tmp/newton-fb/00000.png` matches iter-61.
-  - `trace,quiet` 60 s — too slow to clear flash scan; abandoned.
+Two cold-boot runs, chain identical at +4s/+8s/+12s/+16s. SP, FP,
+LR all unchanged. Beacon trap counter rises 100K-1M per beacon —
+high churn, zero progress.
 
-#### Out of scope (deferred to iter-65)
+#### Open question for iter-66
 
-- Decoding the NewtonScript block at `*0x00680388`. This is
-  what iter-65 should do — extract the boot-block frame and
-  identify which NS function is running.
-- ScratchVA fallback for rotate-LDR `no_dead_scratches`. 4634
-  rejections out of 4923 attempts (94 %) is a perf bottleneck
-  that would shrink the trap rate by an order of magnitude.
+Where is the LDR that reads `0x35d110` as data? Static grep over
+`rom.dis` finds no literal pool reference. Most likely runtime-
+computed: a glyph-cache pointer table, a "drawer-fn-per-glyph"
+dispatch, or unrolled bitmap copy that mistakes a code page for
+a font row. iter-66 starts with the PABT-vector probe to confirm
+IFAR, then walks the load chain back from there.
+
+<!-- iter-64 (function tracer locates newt past splash, inside
+     RunInitScripts/DoBlock) pruned per the auto-prune
+     maintenance note. See `git log --grep="iter-64"`. The iter-64
+     conclusion that "newt is in DoBlock running NewtonScript" was
+     based on first-touch traces; iter-65's live periodic dump
+     supersedes it — newt is wedged in DrawSplashScreen, well
+     before the post-splash NS block ever runs. -->
+
 
 <!-- iter-63 (SemOp OpList decoder + scrn wake mapping +
      InitToolbox decode) pruned per the auto-prune maintenance

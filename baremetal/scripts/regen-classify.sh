@@ -51,18 +51,11 @@ fi
 
 mkdir -p "$classify_out"
 
-data_ranges="$here/classify-out/data-ranges.txt"
-extra=()
-if [[ -f "$data_ranges" ]]; then
-    extra+=(--data-ranges "$data_ranges")
-fi
-
 "$bin" \
     --rom "$rom" \
     --rex "$rex" \
     --symbols "$symbols" \
-    --out "$classify_out" \
-    "${extra[@]}"
+    --out "$classify_out"
 
 # Surface the hash directory so callers can see what got regenerated.
 newest="$(ls -td "$classify_out"/*/ 2>/dev/null | head -n1 || true)"

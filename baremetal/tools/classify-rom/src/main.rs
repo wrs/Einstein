@@ -32,7 +32,6 @@ struct Args {
     rex: PathBuf,
     symbols: PathBuf,
     out_root: PathBuf,
-    data_ranges: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -40,7 +39,6 @@ fn parse_args() -> Result<Args, String> {
     let mut rex: Option<PathBuf> = None;
     let mut symbols: Option<PathBuf> = None;
     let mut out_root: Option<PathBuf> = None;
-    let mut data_ranges: Option<PathBuf> = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -53,9 +51,8 @@ fn parse_args() -> Result<Args, String> {
             "--rex" => rex = Some(take(&mut it, "--rex")?),
             "--symbols" => symbols = Some(take(&mut it, "--symbols")?),
             "--out" => out_root = Some(take(&mut it, "--out")?),
-            "--data-ranges" => data_ranges = Some(take(&mut it, "--data-ranges")?),
             "-h" | "--help" => {
-                eprintln!("classify-rom --rom <path> --rex <path> --symbols <path> --out <dir> [--data-ranges <path>]");
+                eprintln!("classify-rom --rom <path> --rex <path> --symbols <path> --out <dir>");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown arg: {other}")),
@@ -67,49 +64,7 @@ fn parse_args() -> Result<Args, String> {
         rex: rex.ok_or("--rex required")?,
         symbols: symbols.ok_or("--symbols required")?,
         out_root: out_root.ok_or("--out required")?,
-        data_ranges,
     })
-}
-
-/// Parse the half-open `0xSTART 0xEND` pairs produced by
-/// `baremetal/scripts/classify-symbols.py`. Blank/comment lines are
-/// ignored. Returns ranges sorted by start address — the walker does
-/// a linear scan against them (a few hundred entries, so no need for
-/// a tree).
-fn load_data_ranges(path: &Path) -> Result<Vec<(u32, u32)>, String> {
-    let text = fs::read_to_string(path)
-        .map_err(|e| format!("read {}: {}", path.display(), e))?;
-    let mut out: Vec<(u32, u32)> = Vec::new();
-    for (lineno, raw) in text.lines().enumerate() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') { continue; }
-        let mut parts = line.split_whitespace();
-        let a = parts.next().ok_or_else(||
-            format!("{}:{}: missing start", path.display(), lineno + 1))?;
-        let b = parts.next().ok_or_else(||
-            format!("{}:{}: missing end", path.display(), lineno + 1))?;
-        let parse_addr = |s: &str| -> Result<u32, String> {
-            let hex = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))
-                .unwrap_or(s);
-            u32::from_str_radix(hex, 16)
-                .map_err(|e| format!("{}:{}: {}: {}", path.display(), lineno + 1, s, e))
-        };
-        let start = parse_addr(a)?;
-        let end = parse_addr(b)?;
-        if end <= start { continue; }
-        out.push((start, end));
-    }
-    out.sort_unstable();
-    Ok(out)
-}
-
-/// Half-open address-in-range test against a sorted `ranges` slice.
-fn in_any_range(addr: u32, ranges: &[(u32, u32)]) -> bool {
-    // Binary search by start. Then check the adjacent entry.
-    let idx = ranges.partition_point(|&(s, _)| s <= addr);
-    if idx == 0 { return false; }
-    let (s, e) = ranges[idx - 1];
-    s <= addr && addr < e
 }
 
 fn fnv1a_32(bytes: &[u8], seed: u32) -> u32 {
@@ -297,13 +252,18 @@ fn rex_header_roots(words: &[u32]) -> Vec<u32> {
                 let end = ((data_end as usize) >> 2).min(ROM_WORD_COUNT);
                 for w in start..end {
                     let p = words[w];
-                    if p & 3 != 0 { continue; }
-                    if (p as usize) >= ROM_SIZE_BYTES { continue; }
-                    let tgt_idx = (p >> 2) as usize;
+                    if p == 0 { continue; }
+                    // FDRV class-info method pointers may be direct
+                    // ROM PAs or patch-table VAs.
+                    let final_tgt = match resolve_target_to_rom(words, p) {
+                        Some(t) => t,
+                        None => continue,
+                    };
+                    let tgt_idx = (final_tgt >> 2) as usize;
                     let tgt = words[tgt_idx];
                     if (tgt >> 28) == 0xF { continue; }
                     if !is_known_function_start(tgt) { continue; }
-                    out.push(p);
+                    out.push(final_tgt);
                 }
             }
             // 'pkgl' — embedded package list. Package internal layout
@@ -316,22 +276,21 @@ fn rex_header_roots(words: &[u32]) -> Vec<u32> {
     out
 }
 
-/// Function-prologue allowlist from baremetal/src/tracer.rs:96-125.
-/// Used for indirect-target recovery: values that point to a prologue-shaped
-/// word are treated as function pointers.
+/// True iff `w` looks like the first instruction of a function entry —
+/// any AL-cond word (top nibble 0xE) decoding as a known ARM
+/// instruction class. Used by indirect-target recovery (function-
+/// pointer literals, vtable method slots, dispatch-table entries) to
+/// distinguish real code addresses from data constants. Conditional
+/// (cond != AL) first instructions exist (tail-called leaves) but
+/// data-constant false positives dominate that case, so cond=AL is
+/// the conservative cutoff. Mirrors `classify-symbols.py` —
+/// `is_known_function_start` accepts top3 ∈ {000..101, 111}.
+/// 110 (coproc LDC/STC) is rare as a first insn and excluded.
 fn is_known_function_start(w: u32) -> bool {
-    if (w & 0xF000_0000) != 0xE000_0000 { return false; }
-    if (w & 0x0FFF_0000) == 0x092D_0000 && (w & 0xFFFF) != 0 { return true; }
-    if (w & 0x0FFF_F000) == 0x024D_D000 { return true; }
-    if (w & 0x0FFF_F000) == 0x028D_C000 { return true; }
-    if w == 0xE52D_E004 { return true; }
-    if w == 0xE1A0_C00D { return true; }
-    if (w & 0x0FFF_0000) == 0x03A0_0000 { return true; }
-    if (w & 0x0FFF_0000) == 0x03E0_0000 { return true; }
-    if (w & 0x0FFF_0FF0) == 0x01A0_0000 { return true; }
-    if (w & 0x0FFF_F000) == 0x059F_0000 { return true; }
-    if (w & 0x0FE0_0F10) == 0x0E00_0F10 { return true; }
-    if (w & 0x0F00_0000) == 0x0A00_0000 { return true; }
+    if (w >> 28) & 0xF != 0xE { return false; }
+    let top3 = (w >> 25) & 0b111;
+    if top3 <= 0b101 { return true; }
+    if top3 == 0b111 { return true; }
     false
 }
 
@@ -426,18 +385,87 @@ fn sign_extend(v: u32, bits: u32) -> i32 {
     ((v << shift) as i32) >> shift
 }
 
-/// Returns true if `w` sets LR to the address immediately after it
-/// (Newton's hand-rolled manual-BL idiom: a following PC-write is a call,
-/// not a terminal jump, because the callee returns via LR).
-fn sets_lr_to_return_here(w: u32) -> bool {
-    // MOV LR, PC → LR = PC+8-of-this-insn = (this_pc + 8). The following
-    // insn at (this_pc + 4) executes; a PC-write at (this_pc + 4) is a
-    // call whose return address is (this_pc + 8) = (call_pc + 4). Fall
-    // through from the PC-write is live.
-    if w == 0xE1A0_E00F { return true; }
-    // ADD LR, PC, #0 — equivalent effect to MOV LR, PC on ARM (imm12 = 0).
-    if w == 0xE28F_E000 { return true; }
-    false
+/// If `w` is a manual-BL LR setup (`MOV LR, PC` or `ADD LR, PC, #imm`),
+/// return `Some(imm)` where `imm` is the offset that the following
+/// PC-write will return to: walker should treat the eventual jump as
+/// a call returning at `lr_set_pc + 8 + imm`. `None` for any other
+/// instruction.
+///
+/// MOV LR, PC: LR = PC+8 of this insn → imm = 0.
+/// ADD LR, PC, #imm12 (cond=AL, opcode ADD, S=0, Rn=15, Rd=14):
+///     LR = PC+8 + imm12. Used in protocol-call thunks where the
+///     compiler interleaves intermediate insns between the LR setup
+///     and the indirect jump (e.g. `add lr, pc, #4; ldr ip, [r0, #8];
+///     add pc, ip, #12`); the imm offset accounts for the
+///     intermediate insns so LR still lands at jump_pc + 4.
+fn lr_setup_imm(w: u32) -> Option<u32> {
+    if w == 0xE1A0_E00F { return Some(0); }       // MOV LR, PC
+    if w == 0xE28F_E000 { return Some(0); }       // ADD LR, PC, #0
+    // ADD LR, PC, #imm: cond=AL(E) 001 opcode=ADD(0100) S=0 Rn=15 Rd=14.
+    // Mask: 0xFFFF_F000 = E28F_E000; check imm12 in the low 12 bits.
+    if (w & 0xFFFF_F000) == 0xE28F_E000 {
+        let rot = ((w >> 8) & 0xF) * 2;
+        let val8 = w & 0xFF;
+        let imm = val8.rotate_right(rot);
+        return Some(imm);
+    }
+    None
+}
+
+/// Translate a ROM patch-table VA (0x01A00000..0x01C20880) to the
+/// underlying ROM PA. Per `docs/NEWTON_INTERNALS.md`:
+///
+///   17 buckets of 0x20000 bytes at 0x01A00000 + B*0x20000, B ∈ 0..16.
+///   Each bucket's 32 VA 4 KB pages all alias the same 4 KB phys
+///   page at `0x2000 + B*0x1000`. Within a slot, only 0x80 valid
+///   bytes live at offset P*0x80 (where P = 0..31 is the slot
+///   index = which 4 KB VA page within the bucket).
+///
+/// For static analysis we only need the VA→phys mapping: the
+/// kernel's stage-1 maps every VA in the bucket's 0x20000-byte
+/// range to the same 4 KB phys page at the bucket's phys base, with
+/// `va_offset_in_page == phys_offset_in_page`.
+fn jt_va_to_phys(va: u32) -> Option<u32> {
+    if va < 0x01A0_0000 || va >= 0x01C2_0880 { return None; }
+    let off = va - 0x01A0_0000;
+    let bucket = off / 0x2_0000;
+    if bucket > 16 { return None; }
+    let off_in_page = off & 0xFFF;
+    Some(0x2000 + bucket * 0x1000 + off_in_page)
+}
+
+/// If `target` is a VA in the ROM patch-table range, decode the B/BL
+/// thunk living at the corresponding phys slot and return the final
+/// ROM-PA target. Otherwise `None`. Returns the target unchanged when
+/// the slot's word isn't a B/BL — patch-table slots can be patched at
+/// boot to non-B forms, but the static (unpatched) image is always a
+/// B-AL thunk to the real ROM function.
+fn resolve_jt_va(words: &[u32], target: u32) -> Option<u32> {
+    let phys = jt_va_to_phys(target)?;
+    if (phys as usize) + 4 > ROM_SIZE_BYTES { return None; }
+    if phys & 3 != 0 { return None; }
+    let w = words[(phys >> 2) as usize];
+    // B/BL at the slot's runtime VA: target = va + 8 + sext(imm24)<<2.
+    let cond = (w >> 28) & 0xF;
+    let kind = (w >> 25) & 0b111;
+    if cond == 0xF || kind != 0b101 { return None; }
+    let imm24 = w & 0x00FF_FFFF;
+    let simm = sign_extend(imm24, 24) << 2;
+    let final_tgt = target.wrapping_add(8).wrapping_add(simm as u32);
+    if (final_tgt as usize) >= ROM_SIZE_BYTES { return None; }
+    if final_tgt & 3 != 0 { return None; }
+    Some(final_tgt)
+}
+
+/// Normalise a branch / function-pointer target to its in-ROM PA.
+/// Returns `Some(pa)` if `target` is already a ROM PA, or if it's a
+/// ROM-patch-table VA that resolves through `resolve_jt_va`.
+/// Returns `None` for arbitrary out-of-ROM addresses (high VAs not in
+/// the patch table, raw addresses past the ROM aperture, etc.).
+fn resolve_target_to_rom(words: &[u32], target: u32) -> Option<u32> {
+    if target & 3 != 0 { return None; }
+    if (target as usize) < ROM_SIZE_BYTES { return Some(target); }
+    resolve_jt_va(words, target)
 }
 
 /// Enumerate the one-instruction-per-entry table that immediately
@@ -488,20 +516,29 @@ fn enumerate_pc_rel_jump_table(
         if (tbl as usize) + 4 > ROM_SIZE_BYTES { break; }
         if tbl & 3 != 0 { break; }
         let w = words[(tbl >> 2) as usize];
-        // Each table entry is a one-instruction terminal handler.
-        // If it's a branch (B/BL/Bcc), seed the target as a root.
-        // Otherwise it must be a PC-write (MOV PC / LDR PC / etc.).
+        // Each 4-byte slot is one of:
+        //   1. Branch (B/BL/Bcc): single-insn handler; seed target.
+        //   2. Other PC-write (MOV PC, LR / LDR PC / etc.):
+        //      single-insn early-return / register jump.
+        //   3. Non-terminal: a switch with fallthrough — the slot
+        //      is the first instruction of a multi-insn handler
+        //      that falls through into its own continuation. Only
+        //      legal when the table is bounded (e.g. `cmp r3, #7`
+        //      pinning size at 8); seeding `tbl` as a worklist
+        //      root lets the walker walk the body until natural
+        //      Stop. Without bounded_size we don't know where the
+        //      table ends, so fall back to the legacy "stop at
+        //      first non-terminal" rule to avoid walking off into
+        //      adjacent code.
         let is_branch = ((w >> 25) & 0b111) == 0b101 && ((w >> 28) & 0xF) != 0xF;
         if is_branch {
             let imm24 = w & 0xFFFFFF;
             let simm = sign_extend(imm24, 24) << 2;
             let target = tbl.wrapping_add(8).wrapping_add(simm as u32);
             worklist.push(target);
-        } else if !is_pc_write(w) {
-            // Not a recognized one-instruction handler — table ended.
+        } else if !is_pc_write(w) && bounded_size.is_none() {
             break;
         }
-        // Mark the entry word itself as code.
         worklist.push(tbl);
         count += 1;
         tbl = tbl.wrapping_add(4);
@@ -562,15 +599,18 @@ fn is_pc_write(w: u32) -> bool {
 
 /// Decode one ARM word for the walker's control-flow purposes. Data-flow
 /// classification (byte/halfword access) is a separate check via
-/// `is_byte_access`. `prev_w` is the preceding word (used to recognise
-/// Newton's manual-BL idiom). `in_table` says the walker is currently
+/// `is_byte_access`. `manual_bl` says the walker has tracked a recent
+/// `mov lr, pc` / `add lr, pc, #imm` whose target equals `pc + 4` —
+/// any PC-write at `pc` is therefore a call returning at `pc + 4`,
+/// not a terminal jump. `in_table` says the walker is currently
 /// traversing a jump-table fall-through — the caller sets this after a
 /// PC-writing instruction; while true, unconditional `B` is interpreted
 /// as a table entry (push target, keep walking) rather than a terminal
 /// jump.
-fn step(w: u32, pc: u32, prev_w: u32, in_table: bool) -> Step {
+fn step(w: u32, _pc: u32, manual_bl: bool, in_table: bool) -> Step {
     let cond = (w >> 28) & 0xF;
-    let prev_sets_lr = sets_lr_to_return_here(prev_w);
+    let prev_sets_lr = manual_bl;
+    let pc = _pc;
 
     // B / BL / Bcc.
     if (w >> 25) & 0b111 == 0b101 {
@@ -685,7 +725,6 @@ struct WalkStats {
 fn walk(
     words: &[u32],
     initial_roots: &[u32],
-    data_ranges: &[(u32, u32)],
     fn_ranges: &[(u32, u32)],
 ) -> (Bitmap, WalkStats) {
     let mut stats = WalkStats::default();
@@ -693,18 +732,8 @@ fn walk(
     let mut worklist: Vec<u32> = initial_roots
         .iter()
         .copied()
-        .filter(|a| !in_any_range(*a, data_ranges))
         .collect();
     stats.initial_roots = worklist.len();
-
-    // Addresses reached via an explicit B / BL / Bcc target from
-    // already-walked code. Such targets override data_ranges: a
-    // direct in-ROM branch is a stronger code signal than the data-
-    // symbol extent classify-symbols.py assigns. Without this,
-    // legitimate code that lives in the gap between a data symbol
-    // and the next code symbol (e.g. inline helpers at 0x18450 that
-    // DiagHook at 0x184D0 calls into) stays unreachable.
-    let mut branch_overrides: HashSet<u32> = HashSet::new();
 
     let mut pass = 0u32;
     loop {
@@ -713,23 +742,15 @@ fn walk(
             let mut cur = pc;
             let mut prev_w: u32 = 0;
             let mut in_table = false;
-            // When the worklist entry came from an explicit branch
-            // target (B / BL / Bcc from already-walked code), bypass
-            // data_ranges for the FIRST walked word. Subsequent
-            // fall-through still checks data_ranges — otherwise a
-            // single random "B" encoding inside a data table cascades
-            // through the whole table, marking ASCII / pointer data
-            // as reachable code (and potentially corrupting it via
-            // shadow_stub patches at byte-access-shape words).
-            let mut bypass_dr_once = branch_overrides.remove(&pc);
+            // LR-target tracker for multi-insn manual-BL idioms.
+            // When `lr_target == Some(cur + 4)` at a PC-writing
+            // instruction, the call returns at cur+4 — even when
+            // the LR setup happened several insns earlier. Cleared
+            // when a non-PC, non-call instruction overwrites LR.
+            let mut lr_target: Option<u32> = None;
             loop {
                 if (cur as usize) >= ROM_SIZE_BYTES || cur & 3 != 0 { break; }
                 if reach.get_word(cur) { break; }
-                if !bypass_dr_once && in_any_range(cur, data_ranges) {
-                    stats.data_range_stops += 1;
-                    break;
-                }
-                bypass_dr_once = false;
                 let w = words[(cur >> 2) as usize];
                 if (w >> 28) == 0xF {
                     stats.nv_cond_skips += 1;
@@ -737,7 +758,24 @@ fn walk(
                 }
                 reach.set_word(cur);
                 stats.words_walked += 1;
-                let step_result = step(w, cur, prev_w, in_table);
+                // Refresh LR-target tracker. `mov lr, pc` /
+                // `add lr, pc, #imm` set LR to a static address
+                // we can compute against the current PC. Other
+                // instructions that write LR (Rd=14) invalidate
+                // the tracker.
+                if let Some(imm) = lr_setup_imm(w) {
+                    lr_target = Some(cur.wrapping_add(8).wrapping_add(imm));
+                } else {
+                    let writes_lr = ((w >> 28) & 0xF) == 0xE
+                        && (w >> 12) & 0xF == 14
+                        // DP / LDR with Rd = LR.
+                        && ((w >> 26) & 0b11 == 0b00 || (w >> 26) & 0b11 == 0b01);
+                    if writes_lr {
+                        lr_target = None;
+                    }
+                }
+                let manual_bl = lr_target == Some(cur.wrapping_add(4));
+                let step_result = step(w, cur, manual_bl, in_table);
 
                 // PC-relative jump-table dispatch (`<dpop> PC, PC, Rn[, shift]`):
                 // the n table entries are unconditional `B`s starting at PC+8.
@@ -769,8 +807,7 @@ fn walk(
                 let is_b_al = ((w >> 25) & 0b111) == 0b101
                     && cond == 0xE
                     && ((w >> 24) & 1) == 0;
-                let prev_sets_lr = sets_lr_to_return_here(prev_w);
-                in_table = if is_pc_write(w) && !prev_sets_lr {
+                in_table = if is_pc_write(w) && !manual_bl {
                     true
                 } else if in_table && is_b_al {
                     true
@@ -779,8 +816,15 @@ fn walk(
                 };
                 match step_result {
                     Step::Continue { branch: Some(t) } => {
+                        // Resolve ROM-patch-table VAs to their final
+                        // ROM-PA targets. The patch-table thunks live
+                        // at ROM PA 0x2000..0x1285C and are aliased
+                        // into VA 0x01A00000..0x01C20880 by the
+                        // kernel's stage-1 mapping. Each thunk slot
+                        // is a `B real_rom_function` decoded against
+                        // the runtime VA.
+                        let t = resolve_jt_va(words, t).unwrap_or(t);
                         worklist.push(t);
-                        branch_overrides.insert(t);
                         prev_w = w;
                         cur = cur.wrapping_add(4);
                     }
@@ -789,6 +833,7 @@ fn walk(
                         cur = cur.wrapping_add(4);
                     }
                     Step::Jump(t) => {
+                        let t = resolve_jt_va(words, t).unwrap_or(t);
                         prev_w = 0;
                         in_table = false;
                         cur = t;
@@ -819,39 +864,16 @@ fn walk(
         // P=1/U=1/W=0, imm12=0.
         let mut new_roots = 0usize;
         new_roots += collect_vtable_roots(
-            words, &reach, data_ranges, &mut worklist, &mut stats,
+            words, &reach, &mut worklist, &mut stats,
         );
-        // Function-pointer literal harvest: any reached `LDR Rt, [pc, #±imm]`
-        // whose loaded literal value points at a prologue-shaped instruction
-        // is a function pointer being passed by reference (e.g. as a
-        // constructor-pointer argument to `__vc__FPvT1iPFPv_v`, which
-        // invokes it indirectly for each array element). Without this,
-        // functions reached only through such patterns are unreachable
-        // to the walker.
         new_roots += collect_fnptr_literal_roots(
-            words, &reach, data_ranges, &mut worklist, &mut stats,
+            words, &reach, &mut worklist, &mut stats,
         );
-        // Consecutive-B-AL dispatch-table harvest: a run of N≥3 adjacent
-        // unconditional `B` instructions is almost certainly a method
-        // dispatch table (REX FDRV / pkgl class-info, jump-tables that
-        // weren't reached by the PC-rel dispatch walker, etc.). Seed
-        // each branch target as a worklist root. Threshold of 3 keeps
-        // accidental top-byte-0xEA data words from generating false
-        // positives — three in a row is a strong signal.
         new_roots += collect_b_run_roots(
-            words, &reach, data_ranges, &mut worklist, &mut stats,
+            words, &reach, &mut worklist, &mut stats,
         );
-        // PC-relative address-of harvest: any reached `ADD Rd, PC, #imm`
-        // or `SUB Rd, PC, #imm` (Rd != PC) computes a candidate base
-        // address. The most common use is establishing a base register
-        // for a runtime-dispatched jump table (e.g. BPNetEvaluate's
-        // `add sl, pc, #232; ...; add pc, sl, r9, lsl #4`) — without
-        // seeding, the dispatch's case bodies are unreachable. Newton
-        // also uses this idiom for compiler-emitted PC-relative
-        // string/data pointers, but those typically point into curated
-        // data ranges (which terminate the walker harmlessly).
         new_roots += collect_pc_relative_addr_roots(
-            words, &reach, data_ranges, fn_ranges, &mut worklist, &mut stats,
+            words, &reach, fn_ranges, &mut worklist, &mut stats,
         );
 
         stats.indirect_passes = pass;
@@ -869,7 +891,6 @@ fn walk(
 fn collect_vtable_roots(
     words: &[u32],
     reach: &Bitmap,
-    data_ranges: &[(u32, u32)],
     worklist: &mut Vec<u32>,
     stats: &mut WalkStats,
 ) -> usize {
@@ -916,14 +937,12 @@ fn collect_vtable_roots(
         let vtable_addr = words[(lit_pc as usize) >> 2];
         if (vtable_addr as usize) >= ROM_SIZE_BYTES { continue; }
         if vtable_addr & 3 != 0 { continue; }
-        if in_any_range(vtable_addr, data_ranges) { continue; }
         if !seen.insert(vtable_addr) { continue; }
 
-        // Enumerate consecutive method pointers at vtable_addr. Stop
-        // at the first word that doesn't point at a prologue-shaped
-        // target, or that points into a known data range. Also bound
-        // the scan so a runaway (pointer-shape noise) can't walk the
-        // whole ROM.
+        // Enumerate consecutive method pointers at vtable_addr.
+        // Stop at the first word that doesn't point at a prologue-
+        // shaped target. Also bound the scan so a runaway (pointer-
+        // shape noise) can't walk the whole ROM.
         const MAX_VTABLE_ENTRIES: usize = 256;
         let mut entries_added = 0usize;
         for j in 0..MAX_VTABLE_ENTRIES {
@@ -931,9 +950,15 @@ fn collect_vtable_roots(
             if (vptr_addr as usize) + 4 > ROM_SIZE_BYTES { break; }
             let p = words[(vptr_addr as usize) >> 2];
             if p == 0 { break; }
-            if p & 3 != 0 { break; }
-            if (p as usize) >= ROM_SIZE_BYTES { break; }
-            if in_any_range(p, data_ranges) { break; }
+            // Resolve patch-table VAs to their underlying ROM PA.
+            // Vtables in Newton overwhelmingly point at JT thunks
+            // (so methods are patchable post-ship); a vtable scan
+            // that requires direct ROM-PA targets misses every
+            // method.
+            let p = match resolve_target_to_rom(words, p) {
+                Some(pa) => pa,
+                None => break,
+            };
             let tgt_idx = (p >> 2) as usize;
             let tgt_word = words[tgt_idx];
             if (tgt_word >> 28) == 0xF { break; }
@@ -964,7 +989,6 @@ fn collect_vtable_roots(
 fn collect_pc_relative_addr_roots(
     words: &[u32],
     reach: &Bitmap,
-    data_ranges: &[(u32, u32)],
     fn_ranges: &[(u32, u32)],
     worklist: &mut Vec<u32>,
     stats: &mut WalkStats,
@@ -991,7 +1015,6 @@ fn collect_pc_relative_addr_roots(
             .wrapping_add(imm_sign as i64 * imm as i64) as u32;
         if (target as usize) >= ROM_SIZE_BYTES { continue; }
         if target & 3 != 0 { continue; }
-        if in_any_range(target, data_ranges) { continue; }
         // Sound gate: only seed if Rd is later used as the base
         // register of a runtime PC-write dispatch (`<dpop>cond pc,
         // Rd, Rn, lsl #imm`) somewhere inside the same containing
@@ -1077,38 +1100,80 @@ fn is_used_as_dispatch_base(
 fn collect_b_run_roots(
     words: &[u32],
     reach: &Bitmap,
-    data_ranges: &[(u32, u32)],
     worklist: &mut Vec<u32>,
     stats: &mut WalkStats,
 ) -> usize {
-    const MIN_RUN: usize = 3;
+    const MIN_B: usize = 3;
     let mut added = 0usize;
     let mut seen: HashSet<u32> = HashSet::new();
     let mut i = 0usize;
-    while i + MIN_RUN <= ROM_WORD_COUNT {
-        // Find the next B-AL word.
+    while i + MIN_B <= ROM_WORD_COUNT {
+        // Skip until we find a B-AL.
         if (words[i] >> 24) != 0xEA {
             i += 1;
             continue;
         }
-        // Measure the run length.
+        // Permissive run: words that are either B-AL or zero
+        // (placeholder/unused slot). Newton's REX FDRV ClassInfo
+        // vtables look like
+        //
+        //   B method0
+        //   0   ; placeholder for cleanup
+        //   0   ; placeholder for finalize
+        //   B method1
+        //   B method2
+        //   0   ; ...
+        //
+        // — interleaved B-AL and zero slots. A run that requires
+        // strictly-consecutive B-AL would miss every isolated method
+        // entry. Group B-AL runs with internal zero gaps as one
+        // table; demand ≥MIN_B real B-AL entries (zeros don't count)
+        // for the run to qualify.
         let mut j = i;
-        while j < ROM_WORD_COUNT && (words[j] >> 24) == 0xEA { j += 1; }
-        let run_len = j - i;
-        if run_len >= MIN_RUN {
-            for k in i..j {
-                let entry_pa = (k as u32) * 4;
-                if in_any_range(entry_pa, data_ranges) { continue; }
-                // Seed the entry PA itself as a worklist root. Walker
-                // marks it reach=true, then Step::Jump processes the
-                // target, so every table entry word is recognised as
-                // code (not data) — important for dispatch tables
-                // where individual entries aren't referenced from any
-                // vtable or BL.
-                if !reach.get_word(entry_pa) && seen.insert(entry_pa) {
-                    worklist.push(entry_pa);
-                    added += 1;
-                }
+        while j < ROM_WORD_COUNT {
+            let w = words[j];
+            if (w >> 24) == 0xEA || w == 0 {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        // Trim trailing zeros so the run ends on a B-AL.
+        while j > i && words[j - 1] == 0 { j -= 1; }
+        let b_count = (i..j).filter(|&k| (words[k] >> 24) == 0xEA).count();
+        if b_count < MIN_B { i = j.max(i + 1); continue; }
+        // Validate: real dispatch tables target prologue-shaped code.
+        // Reject runs whose targets land on non-code words (e.g.
+        // gROMPublicJumpTable, whose entries point at unresolved
+        // patch slots that hold zero-padded pointer values until
+        // boot-time fixup). Require ≥75% of B-AL entries to have
+        // function-start-shaped targets (after JT-resolution).
+        // Zero placeholder slots don't participate in the count.
+        let mut good = 0usize;
+        for k in i..j {
+            if (words[k] >> 24) != 0xEA { continue; }
+            let entry_pa = (k as u32) * 4;
+            let imm24 = words[k] & 0xFFFFFF;
+            let simm = sign_extend(imm24, 24) << 2;
+            let target = entry_pa.wrapping_add(8).wrapping_add(simm as u32);
+            let final_tgt = match resolve_target_to_rom(words, target) {
+                Some(t) => t,
+                None => continue,
+            };
+            let tgt_word = words[(final_tgt >> 2) as usize];
+            if is_known_function_start(tgt_word) { good += 1; }
+        }
+        if good * 4 < b_count * 3 { i = j.max(i + 1); continue; }
+        for k in i..j {
+            // Skip zero placeholder slots — they're data; only the
+            // B-AL entries are method bodies the walker should walk.
+            if (words[k] >> 24) != 0xEA { continue; }
+            let entry_pa = (k as u32) * 4;
+            // Seed the entry PA as a worklist root. Walker marks it
+            // reach=true, then Step::Jump processes the target.
+            if !reach.get_word(entry_pa) && seen.insert(entry_pa) {
+                worklist.push(entry_pa);
+                added += 1;
             }
         }
         i = j.max(i + 1);
@@ -1127,7 +1192,6 @@ fn collect_b_run_roots(
 fn collect_fnptr_literal_roots(
     words: &[u32],
     reach: &Bitmap,
-    data_ranges: &[(u32, u32)],
     worklist: &mut Vec<u32>,
     stats: &mut WalkStats,
 ) -> usize {
@@ -1149,16 +1213,19 @@ fn collect_fnptr_literal_roots(
         if (lit_pc as u32) & 3 != 0 { continue; }
         let val = words[(lit_pc as usize) >> 2];
         if val == 0 { continue; }
-        if val & 3 != 0 { continue; }
-        if (val as usize) >= ROM_SIZE_BYTES { continue; }
-        if in_any_range(val, data_ranges) { continue; }
-        let tgt_idx = (val >> 2) as usize;
+        // Function-pointer literal: may be a direct ROM PA or a
+        // patch-table VA. Resolve before validating shape.
+        let final_tgt = match resolve_target_to_rom(words, val) {
+            Some(t) => t,
+            None => continue,
+        };
+        let tgt_idx = (final_tgt >> 2) as usize;
         let tgt_word = words[tgt_idx];
         if (tgt_word >> 28) == 0xF { continue; }
         if !is_known_function_start(tgt_word) { continue; }
-        if reach.get_word(val) { continue; }
-        if !seen.insert(val) { continue; }
-        worklist.push(val);
+        if reach.get_word(final_tgt) { continue; }
+        if !seen.insert(final_tgt) { continue; }
+        worklist.push(final_tgt);
         added += 1;
     }
     stats.fnptr_literal_roots += added;
@@ -1229,11 +1296,6 @@ fn run(args: Args) -> Result<(), String> {
     symbols.sort_unstable();
     symbols.dedup();
 
-    let data_ranges = match &args.data_ranges {
-        Some(p) => load_data_ranges(p)?,
-        None => Vec::new(),
-    };
-
     // Function ranges from code-symbols.txt: half-open spans
     // (sym_n, sym_{n+1}) for use by collect_pc_relative_addr_roots
     // to scope its dispatch-base check. The last entry stretches
@@ -1249,7 +1311,7 @@ fn run(args: Args) -> Result<(), String> {
         fn_ranges.push((last, ROM_SIZE_BYTES as u32));
     }
 
-    let (reach, mut stats) = walk(&words, &symbols, &data_ranges, &fn_ranges);
+    let (reach, mut stats) = walk(&words, &symbols, &fn_ranges);
     stats.rex_header_roots = rex_header_root_count;
     // Dedup sometimes removes some of the REx entries (they may
     // overlap vectors/symbols); report the actual count after merge.

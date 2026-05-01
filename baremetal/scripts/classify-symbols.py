@@ -66,43 +66,6 @@ def load_rom_words() -> list[int | None]:
 # strict here; add back conditional-entry support if a real
 # example turns up), and top3=0b110/0b111 (coprocessor / SWI) —
 # specific coproc encodings (MRC/MCR p15) are handled below.
-def _trim_to_first_al_run(start: int, end: int, words: list,
-                          run_len: int = 4) -> int:
-    """Scan [start, end) for the first run of `run_len` consecutive
-    DISTINCT cond=AL instruction words (top nibble 0xE). If found,
-    return the run's start address (so the data range ends there).
-    Otherwise return `end` unchanged.
-
-    Heuristic for splitting a data range that has accidentally
-    swallowed inline code: ASCII strings have random top nibbles,
-    pointer tables have top byte 0x00, zero padding is 0x00. Real
-    ARM code is overwhelmingly cond=AL with diverse opcodes within
-    a basic block, so a sustained run of distinct 0xExxxxxxx words
-    is a reliable code-start signal. The "distinct" requirement
-    rejects heap pages that happen to contain repeated identical
-    AL-shaped values (e.g. 7×0xe3800000 inside the NewtonScript
-    object heap)."""
-    if start >= end:
-        return end
-    si = start >> 2
-    ei = end >> 2
-    streak: list[int] = []
-    streak_start = None
-    for i in range(si, ei):
-        w = words[i] if i < len(words) else None
-        is_al = w is not None and (w >> 28) & 0xF == 0xE
-        if is_al:
-            if not streak:
-                streak_start = i << 2
-            streak.append(w)
-            if len(set(streak)) >= run_len:
-                return streak_start
-        else:
-            streak = []
-            streak_start = None
-    return end
-
-
 def is_known_function_start(w: int | None) -> bool:
     if w is None:
         return False
@@ -422,72 +385,6 @@ def main() -> int:
             for addr, name, _ in buckets["code"]:
                 f.write(f"0x{addr:08X}\t{name}\n")
 
-        # Emit data-symbol extents as (start, end) ranges. Walker
-        # inside classify-rom uses these as termination boundaries
-        # so it doesn't fall through from a real function into the
-        # adjacent data label's bytes.
-        #
-        # Extent derivation: merge every data symbol with its
-        # successor (sorted by address). An explicit DATA_RANGES
-        # entry overrides the auto-extent (both ends). The last
-        # data symbol in the file is clamped to the next address
-        # that appears in `code` (which is by definition the
-        # boundary after which the walker is free to run again).
-        data_ranges_path = OUT_DIR / "data-ranges.txt"
-        data_addrs = sorted(a for a, _, _ in buckets["data"])
-        code_addrs = sorted(a for a, _, _ in buckets["code"])
-        next_code_idx = 0
-        spans: list[tuple[int, int]] = []
-        for i, a in enumerate(data_addrs):
-            if i + 1 < len(data_addrs):
-                end = data_addrs[i + 1]
-            else:
-                # Final data symbol: clamp at the next code address.
-                end = ROM_APERTURE
-                for c in code_addrs:
-                    if c > a:
-                        end = c
-                        break
-            # Clamp by the next code symbol strictly inside [a, end).
-            while (next_code_idx < len(code_addrs)
-                   and code_addrs[next_code_idx] <= a):
-                next_code_idx += 1
-            if next_code_idx < len(code_addrs):
-                c = code_addrs[next_code_idx]
-                if a < c < end:
-                    end = c
-            # Trim auto-extended ranges at the first run of N consecutive
-            # AL-cond instruction words. A data symbol's actual extent
-            # is rarely the full distance to the next code symbol —
-            # compilers often emit small inline helpers in the gap
-            # (e.g. unnamed routines at 0x18450..0x184CC sandwiched
-            # between gInitialCPUMode at 0x1841C and DiagHook at
-            # 0x184D0). Without trimming, those helpers stay
-            # unreachable to the walker. ASCII strings, pointer tables,
-            # and zero padding all have random / non-AL top nibbles, so
-            # 4 consecutive `0xExxxxxxx` words is a strong code signal.
-            end = _trim_to_first_al_run(a, end, words, run_len=4)
-            spans.append((a, end))
-        # Merge the hand-maintained DATA_RANGES entries (things like
-        # "every word between function X and symbol Y is data" that
-        # aren't represented by a standalone symbol) into the same
-        # sorted span list before merging — classify-rom consumes
-        # only data-ranges.txt, so those spans need to appear here
-        # or the walker won't see them.
-        spans.extend(DATA_RANGES)
-        spans.sort()
-        # Merge adjacent / overlapping spans so the file stays tight.
-        merged: list[tuple[int, int]] = []
-        for a, b in spans:
-            if merged and a <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], b))
-            else:
-                merged.append((a, b))
-        with data_ranges_path.open("w") as f:
-            f.write("# Data-only address ranges produced by classify-symbols.py.\n")
-            f.write("# Format: 0xSTART 0xEND (half-open), one pair per line.\n")
-            for a, b in merged:
-                f.write(f"0x{a:08X} 0x{b:08X}\n")
 
     total = sum(len(v) for v in buckets.values())
     print(f"total symbols scanned: {total}")

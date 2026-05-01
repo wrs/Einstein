@@ -165,20 +165,27 @@ document tt
 tt N -- log the first N sync traps' guest PC + ESR, then stop.
 end
 
-# `ctt` — current task trace. From any stop where a `&TrapContext` is
-# in scope (trap_sync_lower_aarch32, trap_irq, handle_user_bp_und,
-# handle_data_abort, …), call into the hypervisor to print the
+# `ctt` — current task trace. Calls into the hypervisor to print the
 # currently-running task's call chain from live banked registers.
 # ELR_EL2 is read inside the hypervisor so the value is fresh; SP/LR/FP
-# come from the trap context per Table D1-79.
+# come from the trap context (passed in via `ctx`) per Table D1-79.
+#
+# Requires `ctx` to be visible in the current frame. If you're stopped
+# at `bp_hit_anchor`, that fn doesn't take ctx — `up` until you reach
+# `handle_user_bp_und` (or any trap-handler frame that took a
+# `&mut TrapContext`), then run `ctt`.
+#
+# No type cast on the call — gdb's Rust language hook rejects `(void)`
+# and friends, and Rust's unit return prints harmlessly anyway.
 define ctt
-  call (void) dump_current_chain(ctx)
+  call dump_current_chain(ctx)
 end
 document ctt
 ctt -- print the currently-running task's call chain (one fn per line).
-Requires `ctx` to be visible in the current frame; if not, `up` until
-you reach a trap-handler frame that took a `&mut TrapContext` argument.
-Output goes to the hypervisor serial console (kprintln), not gdb.
+Requires `ctx` to be visible in the current frame; from `bp_hit_anchor`
+or other helper-fn stops, `up` until you reach a frame that took a
+`&mut TrapContext` argument. Output goes to the hypervisor serial
+console (kprintln), not gdb.
 end
 
 printf "gdb connected. Handy commands:\n"

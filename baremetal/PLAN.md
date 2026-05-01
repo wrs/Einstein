@@ -17,60 +17,62 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-68):** iter-67 narrowed the wedge mechanism
-further with two probes (both reverted before commit): a `bp` at
-PrefetchAbortHandler entry (0x393b84) and an unsuppressed-repeat
-counter in `log_dabt_forward`. Findings below; **the wedge is not
-PABT-recovery looping — it's the kernel's `DataAbortHandler`
-(invoked once by a recursive DABT at FAR=0x0cd2d000, mode=0x17)
-running emulated byte accesses indefinitely without making
-forward progress**.
+**Current goal (iter-69):** iter-68 instrumented the SBA UDF
+emulator with a per-mode + per-faulting_pc histogram (reverted
+before commit). The result is a third hypothesis falsification:
+**the wedge is not driven by SBA UDF emulation at all.** SBA UDFs
+fired exactly 131 K times during early boot — one histogram
+dump, dominated by SVC mode (sites 0x001a7ca8 / 0x001a7cac at
+~50 % each) — then went silent for the rest of a 22 M+ beacon
+run.
 
-iter-66's correction is itself partially wrong: there's no
-permanent PABT loop. The actual mechanism is:
+The ABT-mode bucket is ZERO. iter-67's "DataAbortHandler stuck
+running emulated byte accesses" mechanism is also wrong. The
+wedge is happening **without any SBA UDF traffic at all**.
 
-1. USR took a DABT, kernel `DataAbortHandler` ran in ABT mode.
-2. While in ABT mode, a *recursive* DABT fired at
-   FAR=0x0cd2d000 (DFSC=0x05 = translation fault, section).
-3. EL2's `handle_diag` forwarded that to `DataAbortHandler` at
-   0x393114 (the standard DABT-fast-path forward).
-4. Since then: zero further DIAG-path aborts (the iter-67
-   REPEAT counter logged 0 events across 4.6M+ beacons). All
-   the `ELR=0xffffe4 SPSR=0x40000197` (mode=ABT) traps are SBA
-   UDF emulations, not abort recursions.
+**Updated mechanism (most plausible):** The CPU is spinning
+natively in a tight loop at PC ≈ `0xFFFFE4`, the
+`UND_RETURN_STUB`. Two-instruction body:
 
-So the kernel's `DataAbortHandler` is in a tight loop *inside
-its own body* — running through emulated byte accesses without
-returning. Most plausible: a string scan / list walk / pointer
-chase against corrupt state from the original DABT.
+```
+0xFFFFE4: ldr lr, [pc, #0]    ; lr = *(0xFFFFEC)
+0xFFFFE8: movs pc, lr         ; PC = lr, CPSR = SPSR_<mode>
+0xFFFFEC: <literal>           ; written by EL2 before each ERET
+```
 
-**Probe results that ruled things out:**
+If the literal at `0xFFFFEC` was last written to `0xFFFFE4`
+(or any PC that immediately re-enters the stub), the stub
+loops at 2 cycles/iteration with no traps. Timer IRQs fire ~16
+ms apart (or the kernel re-asserts the timer aggressively),
+catching the guest at PC=0xFFFFE4 every time. That matches the
+~100 K-1 M trap/s "beacon" rate without the ETx2 SBA UDF
+volume that iter-67 expected.
 
-- `bp 0x00393b84` (PrefetchAbortHandler entry) installed via
-  `install_guest_bp` in `kmain` — **never fired** during 4.6M+
-  wedge beacons. The kernel's PABT path doesn't reach 0x393b84.
-  So the ELR=0xffffe4 wedge isn't PABT-driven.
-- `log_dabt_forward` repeat-counter (logging up to 16 repeats
-  per tuple plus every 64th up to 1024) — also fired 0 times.
-  Confirms the DIAG-path is quiescent after the initial
-  recursive-DABT forward.
+**Open questions for iter-69:**
 
-**iter-68 next steps:**
+1. **Read the literal at `0xFFFFEC`.** If it's `0xFFFFE4`,
+   that's the wedge — a self-referential UND_RETURN_STUB. If
+   it's some other PC, follow the chain from there.
+2. **What writes the literal?** `trap::return_to_guest_from_und`
+   in `src/trap.rs` writes the literal slot before each ERET
+   to UND_RETURN_STUB. If the SBA emulator is fed
+   `faulting_pc = 0xFFFFE0` (or any address that yields
+   `target = 0xFFFFE4` after `+4`), the stub becomes
+   self-referential.
+3. **What earlier event poisons the literal?** A USR fault
+   inside the trampoline region (`0xFFFFXX`) would do it.
+   Could also come from a kernel-side `bx LR` where LR holds
+   a stale UND_RETURN_STUB target.
 
-1. **Identify what `DataAbortHandler` is doing.** A `bp` at
-   `0x00393114` (DataAbortHandler entry) will fire on the
-   first invocation; the dump-and-continue tail logs r0..r12 +
-   banked LR/SP. From there, bisect forward to find the loop.
-2. **Or instrument the SBA UDF emulator** to count emulations
-   per source mode and per faulting_pc. If most ABT-mode SBA
-   UDFs cluster at one PC range, that's the loop body.
-3. **Cross-check FAR=0x0cd2d000.** That VA is in the kernel's
-   global-data window (0x0c100000+). What kernel structure lives
-   at 0x0cd2d000? probe/FINDINGS.md or the L1 page-table walker
-   should resolve it. If the structure is corrupt at boot
-   (e.g. stack collision, uninitialised pointer), the wedge is
-   in the kernel's stage-1 mapping setup, not in shadow_stub at
-   all.
+**iter-69 plan:**
+
+- One-shot kprintln in `trap::return_to_guest_from_und`
+  recording the first time the literal is written with
+  `target ∈ 0xFFFFE0..0xFFFFF0` (= self-referential into the
+  trampoline region). Logs `(faulting_pc, target, source mode,
+  caller LR)`.
+- If that fires, `bp` the captured `faulting_pc` to inspect
+  USR-side state at the moment the bad target was computed.
 
 **Background (unchanged from iter-61):** boot reaches a quiescent
 idle at the Newton splash. The framebuffer renders correctly
@@ -78,6 +80,64 @@ idle at the Newton splash. The framebuffer renders correctly
 `newt`=RUN, `scrn`=RDY blocked on its event-signal sema-group,
 all 24 others BLK. The residual `evt.ex.fr.store` throws are
 benign soup-probe misses caught by NewtonScript.
+
+### Iteration 68: DataAbortHandler-internal hypothesis falsified; SBA UDFs are silent in the wedge
+
+#### Method
+
+Instrumented `shadow_stub::emulate_sba_site` with a histogram
+(reverted before commit):
+
+- Per-mode counter (`MODE_COUNT[0..32]`) over the SPSR_und
+  source-mode bits.
+- Per-mode top-N (8 slots) faulting_pc histogram for USR / SVC
+  / ABT — first-fit on empty slots, evict-smallest otherwise.
+- Dump every 2^17 (≈131 K) hits — roughly one per periodic
+  heartbeat at the wedge's trap rate.
+
+Cold boot, no debugger, ran past the wedge.
+
+#### Result
+
+**Exactly one histogram dump fired** (at total = 131 072 hits).
+After that, total never reached the next 131 K threshold despite
+22 M+ trap beacons accumulating at `ELR=0xffffe4`.
+
+```
+=== iter-68 SBA mode/pc histogram (total=131072) ===
+  by-mode usr=0 svc=131073 fiq=0 irq=0 abt=0 und=0 sys=0
+  top 4 pcs (mode SVC):
+    pc=0x001a7ca8 count=65489
+    pc=0x001a7cac count=65488
+    pc=0x000bd6a0 count=48
+    pc=0x000bd6a4 count=48
+=== iter-68 end ===
+```
+
+All 131 K SBA UDFs were SVC-mode boot-time activity; ABT-mode
+count is **zero**.
+
+#### Implication
+
+iter-67's "DataAbortHandler stuck running emulated byte
+accesses" hypothesis is **falsified**. SBA UDFs are silent in
+the wedge state. The kernel's DataAbortHandler is *not* doing
+emulated byte access work — there's no SBA traffic to drive.
+
+Combined with iter-67's findings (no DIAG-path aborts, no
+PrefetchAbortHandler hits), the wedge is taking some path that
+*doesn't* generate any EL2 traps until the next timer IRQ.
+
+The most plausible mechanism is a tight 2-instruction loop at
+the `UND_RETURN_STUB` itself (`ldr lr, [pc, #0]; movs pc, lr`),
+where the literal at `0xFFFFEC` last got written to a value
+that re-enters the stub on every iteration. Native-speed loop,
+no traps, just timer IRQs catching the guest there.
+
+iter-69 starts with a one-shot probe in
+`trap::return_to_guest_from_und` that logs the first time the
+literal is set to a self-referential value
+(`target ∈ 0xFFFFE0..0xFFFFF0`).
 
 ### Iteration 67: PABT-recovery hypothesis falsified; wedge is in DataAbortHandler
 
@@ -130,43 +190,11 @@ emulated byte accesses that never converge to a return.
 left over from inside the handler's body; not a hardware abort
 artifact.
 
-### Iteration 66: slot 0x424 LDRB hypothesis falsified
-
-#### Method
-
-Added a one-line probe in `shadow_stub::emulate_sba_site` that
-logs every SBA UDF firing at slot index `0x424`, including a flag
-for "EA inside DrTextChunk" (the false-positive case the iter-65
-hypothesis would have produced). Cold-boot run, no debugger.
-
-#### Result
-
-Beacons advanced to ~3M traps at `ELR=0xffffe4 SPSR=0x40000197`,
-periodic dumps showed the same wedge state as iter-65 (`current
-task 0xc12391c (newt) … pc=0xffffe4 lr=0xe7f842f4 mode=0x17`), and
-**zero probe hits** logged. The LDRB at `0x35d110` is not being
-executed during the wedge.
-
-#### Implication
-
-The match between `LR_abt = 0xe7f842f4` and the slot-0x424 UDF
-encoding is coincidental — slot allocation order happened to give
-slot `0x424` to the LDRB at that address, and the UDF byte pattern
-`enc_udf(0x8000 | 0x424) = 0xe7f842f4` matches an unrelated
-unmapped VA the kernel is retrying. The probe was reverted before
-commit (one-line removal); the negative result is the deliverable.
-
-iter-65's hypothesis ("DrTextChunk LDRB scanner reads its own
-patched code as data and uses the resulting UDF marker as a
-function pointer") is **falsified**.
-
-#### Verification
-
-- Probe was active for >3M traps, never fired.
-- chain dump shows DrawSplashScreen → MeasureGlyphWidths → ...
-  exactly as in iter-65, but with mode=ABT confirming the wedge
-  is *inside the abort handler's retry loop*, not in the USR
-  scanner code DrTextChunk represents.
+<!-- iter-66 (slot 0x424 LDRB hypothesis falsified — the LDRB at
+     0x35d110 is never executed during the wedge despite the UDF
+     marker `enc_udf(0x8000|0x424) = 0xe7f842f4` matching the
+     wedge's `LR_abt`. Coincidence, not causation.) pruned per
+     auto-prune. See `git log --grep="iter-66"`. -->
 
 <!-- iter-65 (per-task call-chain tools + splash wedge
      characterised) pruned per the auto-prune maintenance note —

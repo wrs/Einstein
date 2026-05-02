@@ -1445,6 +1445,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::THROW_EX_INTRP_PROBE_HVC_IMM => {
             handle_throw_ex_intrp_probe(ctx);
         }
+        v if v == crate::rom_patches::DOSEND_ENTRY_PROBE_HVC_IMM => {
+            handle_dosend_entry_probe(ctx);
+        }
         v if v == crate::rom_patches::PHYSBLOCK_ENTRY_PROBE_HVC_IMM => {
             handle_physblock_entry_probe(ctx);
         }
@@ -2087,6 +2090,11 @@ fn handle_und(ctx: &mut TrapContext) {
         }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::THROW_EX_INTRP_PROBE_HVC_IMM) => {
             handle_throw_ex_intrp_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::DOSEND_ENTRY_PROBE_HVC_IMM) => {
+            handle_dosend_entry_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -3150,6 +3158,54 @@ fn handle_throw_entry_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
     ctx.x[12] = sp as u64;
 }
 
+fn handle_dosend_entry_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_dosend_entry_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+/// Probe at `DoSend__FRC6RefVarN21l` entry (ROM 0x002F_059C).
+/// Args: r0=receiver RefVar, r1=methodName RefVar, r2=args RefVar,
+/// r3=argc. Captures the first N invocations + always logs the
+/// last N before the type-mismatch throw fires (the throw at
+/// 0x2f05fc is reached on every call where `**r1==2`, which is
+/// guaranteed only once given UnhandledException halts the boot).
+///
+/// Logging the FULL DoSend stream would be ~hundreds of MB on a
+/// boot that walks NS — instead, ring-buffer the most recent 16
+/// entries and dump them when the throw probe fires elsewhere.
+/// Until then keep this handler lightweight.
+fn handle_dosend_entry_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let r0 = ctx.x[0] as u32;  // receiver RefVar*
+    let r1 = ctx.x[1] as u32;  // methodName RefVar*
+    let r2 = ctx.x[2] as u32;  // args RefVar*
+    let r3 = ctx.x[3] as u32;  // argc
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+    let mode = source_cpsr & 0x1F;
+
+    // Resolve the underlying NS Refs (one indirection past each RefVar).
+    let recv_ref = guest_mem::read_word_va(r0).unwrap_or(0xDEADBEEF);
+    let method_ref = guest_mem::read_word_va(r1).unwrap_or(0xDEADBEEF);
+    let args_ref = guest_mem::read_word_va(r2).unwrap_or(0xDEADBEEF);
+
+    crate::dosend_ring::record(seq, recv_ref, method_ref, args_ref, r3, lr);
+
+    // Throttle the live log: print the first 8 firings (early
+    // boot context) and every 64th after that. The ring buffer
+    // is the authoritative record.
+    if seq < 8 || seq % 64 == 0 {
+        kprintln!(
+            "DoSend #{}: recv={:#010x} meth={:#010x} args={:#010x} argc={} caller_lr={:#010x} sp={:#010x} mode={:#x}",
+            seq, recv_ref, method_ref, args_ref, r3, lr, sp, mode,
+        );
+    }
+
+    // Emulate `mov ip, sp`.
+    ctx.x[12] = sp as u64;
+}
+
 fn handle_throw_ex_intrp_probe(ctx: &mut TrapContext) {
     let spsr_el2 = read_sysreg!("spsr_el2") as u32;
     handle_throw_ex_intrp_probe_with(ctx, probe_source_cpsr(spsr_el2));
@@ -3175,6 +3231,16 @@ fn handle_throw_ex_intrp_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
         "ThrowExInterpreterWithSymbol #{}: sym={} (r0={:#010x}) r1={:#010x} *r1={:#010x} caller_lr={:#010x} sp={:#010x} mode={:#x}",
         seq, r0 as i32, r0, r1, ref_value, lr, sp, mode,
     );
+
+    // Dump the most-recent DoSend invocations so iter-76 can
+    // identify the upstream NS-runtime caller that's about to
+    // throw a type-mismatch exception. The ring is populated by
+    // `handle_dosend_entry_probe` on every DoSend; we read it
+    // here on the first throw and stay quiet on subsequent ones
+    // because UnhandledException halts the boot anyway.
+    if seq == 0 {
+        crate::dosend_ring::dump("ThrowExInterpreterWithSymbol fired");
+    }
 
     // Emulate `mov ip, sp`.
     ctx.x[12] = sp as u64;

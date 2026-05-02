@@ -17,42 +17,140 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-76):** iter-75's probe at
-`ThrowExInterpreterWithSymbol` entry (HVC #0x76 at 0x2f5810)
-pinned the throw to `DoSend__FRC6RefVarN21l` at 0x2f05fc:
+**Current goal (iter-77):** iter-76 added a DoSend entry probe
+(HVC #0x77 at 0x2f059c) plus a 16-entry ring buffer
+(`src/dosend_ring.rs`) of recent invocations dumped on the first
+ThrowExInterpreterWithSymbol fire. Cold boot showed exactly **one**
+DoSend call before the throw:
 
 ```
-2f05e8: ldr r0, [r5]   ; r0 = *r5    (r5 = methodName RefVar)
-2f05ec: ldr r0, [r0]   ; r0 = first word of object at *r5
-2f05f0: teq r0, #2     ; type tag == 2?
-2f05f4: moveq r1, r4   ; if so, r1 = args RefVar
-2f05f8: ldreq r0, [pc, #168]  ; sym code = 0xffff4157
-2f05fc: bleq ThrowExInterpreterWithSymbol  ← throw fires here
+DoSend #0: recv=0x0cd09020 meth=0x0c643c9c args=0x006840b4
+           argc=1 caller_lr=0x002f0eac
 ```
 
-Probe captured `r0=0xffff4157` (sym), `r1=0x006840b8`,
-`*r1=0x006840b4` — a pointer Ref to ROM 0x006840b0
-(`RSSYMpunctuationcursiveoption`, a NS symbol). So a `Send`
-operation is being attempted with the *symbol* as the offending
-value (probably the receiver itself, dereferenced and finding
-header-word 2 = some "not-a-frame" tag).
+`caller_lr=0x002f0eac` is just past the
+`bl DoSend` inside `DoMessage__FRC6RefVarN21` (0x002f0e40 —
+`DoMessage(RefVar const&, RefVar const&, RefVar const&)`).
+DoMessage's flow:
 
-caller_lr = 0x2f0600 — that's *inside* DoSend (just past the
-BL). Need next iteration's stack walk to find the *upstream*
-caller of DoSend (one of: 0x2f02b8 / 0x2f0850 / 0x2f09b0 / and
-the TInterpreter inline send paths). Add a probe at DoSend
-entry (0x2f059c) capturing r0..r3 + caller LR; that pins which
-NS-runtime wrapper is sending a method to a symbol receiver.
+```
+2f0e40: <prologue> r5=recv r4=methodName r6=argsArray
+2f0e60: bl IsSymbol(*methodName)   ; passes
+2f0e84: bl FindImplementor(recv, methodName)
+2f0e88: bl AllocateRefHandle       ; wraps result, sp = &RefHandle
+2f0e94: bl PushArgArray(argsArray) ; pushes args, returns argc in r0
+2f0ea8: bl DoSend(recv, sp, methodName, argc)
+```
 
-**Background:** iter-70 cleared the splash wedge; iter-71/72
-fought a classifier regression; iter-73 forwarded FPA UNDs to
-the kernel's FPE emulator at 0x38d8dc; iter-74 pinned the
-unhandled-throw chain to ThrowRefException; iter-75 walked one
-frame up to the DoSend `**r5 == 2` site. Boot reaches NS runtime:
-27 kernel objects, all standard tasks (TSoundServer, TNotebook,
-TNameServer, …), `newt` running NS code, several
-`evt.ex.fr.store` exceptions caught successfully, then
-`type.ref.frame` escapes all handlers.
+Inside DoSend at 0x2f05fc the throw fires because
+`**arg1 == 2` — i.e. the FindImplementor result's first word is
+2. Captured `*arg1 = 0x0c643c9c` (heap address), so the heap
+object at IPA 0x0c643c9c has header word = 2 (NS object type 2,
+which is *not* a frame). The receiver is a heap frame at
+0x0cd09020, and the methodName is the ROM symbol
+`RSSYMpunctuationcursiveoption` (0x006840b4).
+
+So FindImplementor walked the receiver's protochain looking for
+the `punctuationCursiveOption` slot and returned a non-frame
+heap object instead of an implementor frame. Two possibilities:
+(a) the protochain walk found the slot but its value isn't a
+frame (NS code expecting a method-on-frame but the slot holds
+a different type); (b) the protochain walk returned an internal
+sentinel that the caller mishandled.
+
+Next: probe FindImplementor entry+exit (or AllocateRefHandle
+post-FindImplementor) to capture the actual lookup result; dump
+the heap object at 0x0c643c9c (header + 16 words) to identify
+its NS type. If the object is genuinely not-a-frame and
+expected, the bug is in DoMessage's caller (the NS opcode that
+sourced this message). If it's a wild value, walk further back
+to find the corruption point.
+
+**Background:** iter-70 cleared the splash wedge;
+iter-71/72 fought a classifier regression; iter-73 forwarded FPA
+UNDs to the kernel's FPE emulator at 0x38d8dc; iter-74 pinned
+the throw chain to ThrowRefException; iter-75 walked up to the
+DoSend `**r5 == 2` site; iter-76 walked up to DoMessage. Boot
+reaches NS runtime, 27 kernel objects + `newt` running NS code,
+several `evt.ex.fr.store` exceptions caught, then `type.ref.frame`
+escapes all handlers exactly once and trips UnhandledException.
+
+### Iteration 76: walk back from DoSend to DoMessage
+
+#### Method
+
+iter-75's probe placed the throw inside DoSend but `caller_lr`
+pointed into DoSend itself (just past the conditional bleq).
+DoSend has 16+ call sites in 717006, so a static cross-ref
+isn't enough — need a runtime probe.
+
+Add a probe at DoSend entry (HVC #0x77 at 0x002F_059C) that
+captures r0..r3 (receiver / impl / methodName / argc), resolves
+each RefVar with one indirection (so we see the actual NS Refs),
+and source-mode banked LR. Also added a 16-entry ring buffer
+in `src/dosend_ring.rs` populated on every DoSend call; the
+ThrowExInterpreterWithSymbol probe (iter-75) dumps the ring on
+the first fire so we get the call sequence even when many
+DoSends precede the bad one.
+
+DoSend fires ~hundreds of times per NS-running boot, so the
+inline log throttles to every 64th call (plus the first 8).
+The ring is the authoritative record.
+
+#### Result
+
+Single-shot cold boot fired exactly **one** DoSend before
+the type-mismatch throw:
+
+```
+DoSend #0: recv=0x0cd09020 meth=0x0c643c9c args=0x006840b4
+           argc=1 caller_lr=0x002f0eac
+```
+
+(In the existing log this is the *first* DoSend — earlier
+boot work apparently hadn't dispatched any messages, which
+is consistent with TNotebook::InitToolbox having only just
+finished and the NS interpreter just entering its first
+message-send.)
+
+`caller_lr=0x002f0eac` lands inside
+`DoMessage__FRC6RefVarN21` (0x002f0e40), specifically just
+past the `bl DoSend` at 0x2f0ea8. DoMessage's flow:
+
+```
+prologue: r5 = recv, r4 = methodName, r6 = argsArray
+2f0e60: bl IsSymbol(*methodName)           ; passes — methodName IS a symbol
+2f0e84: bl FindImplementor(recv, methodName)
+2f0e88: bl AllocateRefHandle               ; wraps result, sp = &RefHandle
+2f0e94: bl PushArgArray(argsArray)         ; pushes args, returns argc
+2f0ea8: bl DoSend(recv, sp, methodName, argc)
+```
+
+So DoMessage receives `(recv, methodName=punctuationCursiveOption,
+argsArray)`, looks up the method in the receiver's protochain via
+FindImplementor, wraps the result in a RefHandle, and calls DoSend
+with that wrapper as arg1. DoSend reads `**arg1` (= the
+implementor's first word) and finds 2 → throws "type.ref.frame".
+
+The captured `meth=0x0c643c9c` field is actually the
+FindImplementor-result Ref (passed as DoSend's arg1, mislabeled
+"meth" in the probe). The heap object at IPA 0x0c643c9c has
+its first word = 2, so it's not a frame.
+
+The methodName (DoSend's arg2, captured as `args=0x006840b4`) is
+the ROM symbol `RSSYMpunctuationcursiveoption` at 0x006840b0.
+The receiver is `recv=0x0cd09020` (a heap frame). FindImplementor
+returned a non-frame for the `punctuationCursiveOption` slot —
+either the slot's value genuinely isn't a frame (so the NS code
+calling `recv:punctuationCursiveOption(arg)` is wrong about the
+type), or it's a wild value from corruption.
+
+iter-77 will probe FindImplementor + dump the heap object at
+0x0c643c9c to identify its actual NS type and decide which
+branch we're in.
+
+36/36 guest tests skipped per the maintenance note (probe-only
+addition: new HVC immediate + dispatch arms + log-only handler).
 
 ### Iteration 75: walk back from ThrowRefException to the DoSend type check
 
@@ -113,56 +211,12 @@ TInterpreter send paths) that's passing a symbol receiver.
 36/36 guest tests skipped per the maintenance note (probe-only
 addition: new HVC immediate + dispatch arms + log-only handler).
 
-### Iteration 74: pin the type.ref.frame throw site
-
-#### Method
-
-Re-reading iter-73's "new stall" section showed it was wrong:
-the apparent abort loop at PC=0x19a84 / 0x19ac0 inside
-`DiagBootStub` is just normal demand-paging during a memory-fill
-loop (each `stmia r0!,{r2,r3,r4}` iteration faults on a fresh
-page, the RAM-perm-fault arm in `handle_data_abort` flips
-RO→RW+XN, the STM completes, ELR advances, loop continues).
-The trap log budget runs out at 500 lines and the boot keeps
-walking silently; the actual stall is much further in.
-
-Looking at the tail of `/tmp/iter73-boot.log`:
-
-```
-Throw #0..#4: name="evt.ex.fr.store" (caught somewhere)
-ThrowRefException #0: name="evt.ex.fr.intrp;type.ref.frame"
-                       *r1=0x0c643ca4  caller_lr=0x002f5878
-Throw #5..#7: name="evt.ex.fr.intrp;type.ref.frame"  (rethrown)
-*** invariant violation: kernel reached UnhandledException ***
-```
-
-Existing `Throw` probe (0x000B_00C8) only sees the throw inside
-`ThrowRefException`'s own `bl Throw` site at 0x2f57f8 — it can't
-walk back through the constructor's frame to identify which NS
-runtime function asked for the throw. Added a new probe at
-`ThrowRefException__FPcRC6RefVar` entry (0x2f5730), HVC #0x75,
-that captures r0 (name C-string), r1 (RefVar const&), and the
-banked LR (= return PC into the caller) at entry — plus
-dereferences `*r1` so we can see the offending Ref value.
-
-#### Result
-
-- Probe added (`THROW_REF_EXCEPTION_PROBE_HVC_IMM`,
-  `THROW_REF_EXCEPTION_PROBE_PC = 0x002F_5730`); single-shot
-  cold boot fires it once before the wedge.
-- `ThrowRefException #0: name="evt.ex.fr.intrp;type.ref.frame"
-  (r0=0x000afed8) r1=0x0cc77b50 *r1=0x0c643ca4
-  caller_lr=0x002f5878 sp=0x0cc77b4c mode=0x10`.
-- Caller PC 0x002f5878 = first insn after `bl ThrowRefException`
-  inside `ThrowExInterpreterWithSymbol__FlRC6RefVar` at 0x002f5810.
-  Disasm confirms: `2f586c..2f5874` is
-  `ldr r0,[pc,#24]; ldr r0,[r0]; bl ThrowRefException`.
-- Offending ref `*r1 = 0x0c643ca4`: low 2 bits = 00 ⇒ pointer
-  ref (`PtrRef`); the object lives in RAM at IPA 0x0c643ca4.
-  The interpreter expected a frame; the heap object isn't one.
-- 36/36 guest tests skipped per the maintenance note (probe-
-  only addition: new HVC immediate + dispatch + log-only handler,
-  no SBA/UND/DABT-path changes).
+<!-- iter-74 (added a ThrowRefException entry probe — HVC #0x75 at
+     0x2f5730 — to walk one frame up from the existing Throw
+     probe. Captured caller_lr=0x002f5878 = inside the wrapper
+     ThrowExInterpreterWithSymbol; offending Ref *r1=0x0c643ca4
+     [a heap pointer ref]. iter-75 walked another frame up.)
+     pruned per auto-prune. See `git log --grep="iter-74"`. -->
 
 <!-- iter-73 (forward FPA UND to the guest's kernel FPE emulator
      at ROM 0x38d8dc. Added `is_fpa_insn` (cp1/cp2 LDC/STC/CDP/

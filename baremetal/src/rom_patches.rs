@@ -1045,6 +1045,20 @@ pub const THROW_EX_INTRP_PROBE_HVC_IMM: u32 = 0x76;
 pub const THROW_EX_INTRP_PROBE_PC:      u32 = 0x002F_5810;
 const THROW_EX_INTRP_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
 
+/// `DoSend__FRC6RefVarN21l` entry at ROM `0x002F_059C` — the NS
+/// runtime's send-message dispatch. Args:
+///   r0 = receiver RefVar      r1 = methodName RefVar
+///   r2 = args RefVar          r3 = argc (long)
+/// At 0x2f05fc DoSend tests `**r1 == 2` and throws
+/// `evt.ex.fr.intrp;type.ref.frame` with `r4=args` as the
+/// offending value (iter-75). iter-76 captures r0..r3 + the
+/// resolved Ref values + caller LR so we can identify the
+/// upstream NS-runtime wrapper passing a non-frame method name
+/// (or non-frame receiver) into DoSend.
+pub const DOSEND_ENTRY_PROBE_HVC_IMM:   u32 = 0x77;
+pub const DOSEND_ENTRY_PROBE_PC:        u32 = 0x002F_059C;
+const DOSEND_ENTRY_FIRST_INSN:          u32 = 0xE1A0_C00D; // mov ip, sp
+
 /// `PhysBlock__11TFlashBlockFv` first insn at ROM `0x000c_0cc4`.
 /// Iter-43 pinned the `evt.ex.abt.bus` original throw to the
 /// `bl PhysBlock` site at 0xc0cb8 (caller_lr=0xc0cbc). The fault
@@ -1613,6 +1627,14 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(THROW_EX_INTRP_PROBE_HVC_IMM),
             "ThrowExInterpreterWithSymbol entry (sym code + caller PC)",
             THROW_EX_INTRP_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            DOSEND_ENTRY_PROBE_PC,
+            DOSEND_ENTRY_FIRST_INSN,
+            hvc_insn(DOSEND_ENTRY_PROBE_HVC_IMM),
+            "DoSend entry (capture recv/method/args + caller PC)",
+            DOSEND_ENTRY_PROBE_HVC_IMM,
         );
         patch_probe(
             rom_ptr,

@@ -8,6 +8,7 @@ use core::arch::global_asm;
 mod alrt_capture;
 mod banked;
 mod cpu;
+mod dosend_ring;
 mod fb_dump;
 mod g1_capture;
 mod guest;

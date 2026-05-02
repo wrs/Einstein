@@ -1,0 +1,4 @@
+# Override the no_std cross target inherited from baremetal/.cargo/config.toml.
+# romdump is a host-side binary; see tools/classify-rom for the same pattern.
+[build]
+target = "aarch64-apple-darwin"

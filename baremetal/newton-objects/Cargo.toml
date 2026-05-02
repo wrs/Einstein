@@ -1,0 +1,17 @@
+[package]
+name = "newton-objects"
+version = "0.0.1"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "Parser for the NewtonScript object encoding (Refs, binary/array/frame objects, symbols)."
+
+# Standalone workspace so neither the hypervisor's toolchain pin nor the
+# romdump CLI's host build flags leak between consumers.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1

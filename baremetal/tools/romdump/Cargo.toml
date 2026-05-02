@@ -1,0 +1,20 @@
+[package]
+name = "romdump"
+version = "0.0.1"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "CLI dump of a NewtonScript object graph rooted at a file offset."
+
+# Standalone — see tools/classify-rom for the rationale.
+[workspace]
+
+[[bin]]
+name = "romdump"
+path = "src/main.rs"
+
+[dependencies]
+newton-objects = { path = "../../newton-objects" }
+
+[profile.release]
+lto = true
+codegen-units = 1

@@ -1,0 +1,7 @@
+[toolchain]
+channel = "1.94.1"
+profile = "minimal"
+# Host-buildable library — no cross target required when invoked directly
+# from this directory. The hypervisor's cross compilation still works because
+# its own toolchain pin (with the aarch64-unknown-none-softfloat target) takes
+# effect when cargo runs from the baremetal/ root.

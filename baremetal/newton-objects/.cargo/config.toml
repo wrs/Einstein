@@ -1,0 +1,7 @@
+# Override the no_std cross target inherited from baremetal/.cargo/config.toml.
+# This crate is no_std-compatible, but `cargo test` / `cargo build` run from
+# inside this directory should target the host so the library can be unit-tested
+# without semihosting. The hypervisor still picks up the cross target normally
+# when it builds newton-objects transitively from baremetal/.
+[build]
+target = "aarch64-apple-darwin"

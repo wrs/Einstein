@@ -1034,6 +1034,17 @@ pub const THROW_REF_EXCEPTION_PROBE_HVC_IMM: u32 = 0x75;
 pub const THROW_REF_EXCEPTION_PROBE_PC:      u32 = 0x002F_5730;
 const THROW_REF_EXCEPTION_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
 
+/// `ThrowExInterpreterWithSymbol__FlRC6RefVar` entry at ROM
+/// `0x002F_5810` — the wrapper above ThrowRefException that takes
+/// a symbol code (r0, 0..N) and a RefVar (r1) and constructs the
+/// `evt.ex.fr.intrp;<symname>` exception frame. Iter-75 captures
+/// the symbol code + caller LR to identify which NS interpreter
+/// site (FastCall / FastSend / FindVar / SlowRun / etc.) requested
+/// the throw — there are 12 distinct callers in 717006 ROM.
+pub const THROW_EX_INTRP_PROBE_HVC_IMM: u32 = 0x76;
+pub const THROW_EX_INTRP_PROBE_PC:      u32 = 0x002F_5810;
+const THROW_EX_INTRP_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
+
 /// `PhysBlock__11TFlashBlockFv` first insn at ROM `0x000c_0cc4`.
 /// Iter-43 pinned the `evt.ex.abt.bus` original throw to the
 /// `bl PhysBlock` site at 0xc0cb8 (caller_lr=0xc0cbc). The fault
@@ -1594,6 +1605,14 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(THROW_REF_EXCEPTION_PROBE_HVC_IMM),
             "ThrowRefException entry (capture NS interpreter caller PC)",
             THROW_REF_EXCEPTION_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            THROW_EX_INTRP_PROBE_PC,
+            THROW_EX_INTRP_FIRST_INSN,
+            hvc_insn(THROW_EX_INTRP_PROBE_HVC_IMM),
+            "ThrowExInterpreterWithSymbol entry (sym code + caller PC)",
+            THROW_EX_INTRP_PROBE_HVC_IMM,
         );
         patch_probe(
             rom_ptr,

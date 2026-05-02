@@ -17,32 +17,101 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-75):** the actual stall iter-73 unblocked is
-the kernel's `UnhandledException` tripwire firing on
-`evt.ex.fr.intrp;type.ref.frame` thrown by the NewtonScript
-interpreter. iter-74 added a `ThrowRefException` entry probe
-(HVC #0x75 at 0x2f5730) that pinned the throw site one frame up:
-`ThrowExInterpreterWithSymbol__FlRC6RefVar` (0x2f5810), called
-from inside the interpreter with `*r1 = 0x0c643ca4` — a pointer
-ref (low 2 bits = 00) to a non-frame heap object. The interpreter
-expected a frame and got something else. Next: walk the SP_usr
-stack at the throw moment back to the FastOpXxx site that
-fetched the bad ref, identify the slot/protochain lookup that
-returned a non-frame, and decide whether (a) it's an upstream
-data corruption we caused or (b) genuine NS code expecting a
-frame slot that's missing.
+**Current goal (iter-76):** iter-75's probe at
+`ThrowExInterpreterWithSymbol` entry (HVC #0x76 at 0x2f5810)
+pinned the throw to `DoSend__FRC6RefVarN21l` at 0x2f05fc:
 
-**Background (unchanged from iter-61):** boot used to reach a
-quiescent idle at the Newton splash with `newt` wedged in
-`InitTextWalker`. iter-70 cleared the splash wedge; iter-71's
-classifier added idiom recognizers but introduced a new wedge
-iter-72 root-caused and fixed; iter-73 forwarded FPA UNDs to the
-kernel's FPE emulator at 0x38d8dc, unblocking the TFrameSoundChannel
-codec path. Boot now reaches NewtonScript runtime: TSoundServer /
-TPSSManager / TNotebook / TNameServer / 27 kernel objects up,
-`newt` running NS code, several `evt.ex.fr.store` exceptions
-caught successfully, then `evt.ex.fr.intrp;type.ref.frame`
-escapes all handlers and trips UnhandledException.
+```
+2f05e8: ldr r0, [r5]   ; r0 = *r5    (r5 = methodName RefVar)
+2f05ec: ldr r0, [r0]   ; r0 = first word of object at *r5
+2f05f0: teq r0, #2     ; type tag == 2?
+2f05f4: moveq r1, r4   ; if so, r1 = args RefVar
+2f05f8: ldreq r0, [pc, #168]  ; sym code = 0xffff4157
+2f05fc: bleq ThrowExInterpreterWithSymbol  ← throw fires here
+```
+
+Probe captured `r0=0xffff4157` (sym), `r1=0x006840b8`,
+`*r1=0x006840b4` — a pointer Ref to ROM 0x006840b0
+(`RSSYMpunctuationcursiveoption`, a NS symbol). So a `Send`
+operation is being attempted with the *symbol* as the offending
+value (probably the receiver itself, dereferenced and finding
+header-word 2 = some "not-a-frame" tag).
+
+caller_lr = 0x2f0600 — that's *inside* DoSend (just past the
+BL). Need next iteration's stack walk to find the *upstream*
+caller of DoSend (one of: 0x2f02b8 / 0x2f0850 / 0x2f09b0 / and
+the TInterpreter inline send paths). Add a probe at DoSend
+entry (0x2f059c) capturing r0..r3 + caller LR; that pins which
+NS-runtime wrapper is sending a method to a symbol receiver.
+
+**Background:** iter-70 cleared the splash wedge; iter-71/72
+fought a classifier regression; iter-73 forwarded FPA UNDs to
+the kernel's FPE emulator at 0x38d8dc; iter-74 pinned the
+unhandled-throw chain to ThrowRefException; iter-75 walked one
+frame up to the DoSend `**r5 == 2` site. Boot reaches NS runtime:
+27 kernel objects, all standard tasks (TSoundServer, TNotebook,
+TNameServer, …), `newt` running NS code, several
+`evt.ex.fr.store` exceptions caught successfully, then
+`type.ref.frame` escapes all handlers.
+
+### Iteration 75: walk back from ThrowRefException to the DoSend type check
+
+#### Method
+
+iter-74's probe captured `caller_lr=0x002f5878` (just past the
+`bl ThrowRefException` inside `ThrowExInterpreterWithSymbol`).
+But that's a wrapper above ThrowRefException — the *real* NS
+runtime caller is one frame further back. Cross-ref disasm shows
+12 distinct call sites for ThrowExInterpreterWithSymbol in 717006:
+
+```
+2b6170: FGetVar             2ed760: FastResend
+2d2d64: FindVar              2edbec: FastFindVar
+2d2ddc: SetFindVar           2f2ff8/2f31ec: SlowRun
+2ed58c: FastCall             2f5874: ThrowRefException (the wrapper)
+2ed614: FastSend             2f645c/2f64fc/2f6538: SetupSend / SetupResend
+```
+
+Add a probe at `ThrowExInterpreterWithSymbol` entry (HVC #0x76
+at 0x2f5810) to capture `r0` (the symbol code, a `long`),
+`r1`/`*r1` (the offending RefVar), and source-mode banked LR
+(= return PC into the caller).
+
+#### Result
+
+Single-shot cold boot fired:
+
+```
+ThrowExInterpreterWithSymbol #0: sym=-48809 (r0=0xffff4157)
+  r1=0x006840b8 *r1=0x006840b4 caller_lr=0x002f0600
+```
+
+`caller_lr=0x002f0600` is inside `DoSend__FRC6RefVarN21l`
+(0x2f059c..0x2f068c), specifically just past the throw site
+at 0x2f05fc:
+
+```
+DoSend prologue saves: r7=arg0 (recv), r5=arg1 (methodName),
+                       r4=arg2 (args), r6=arg3 (argc).
+2f05e8: ldr r0, [r5] ; *r5 = methodName Ref
+2f05ec: ldr r0, [r0] ; first word of object pointed to
+2f05f0: teq r0, #2   ; type tag == 2 ?
+2f05fc: bleq ThrowExInterpreterWithSymbol(sym, r4)
+```
+
+Offending Ref `0x006840b4`: low 2 bits = 00 (pointer ref); the
+target is ROM `006840b0 <RSSYMpunctuationcursiveoption>` — a
+NS symbol literal embedded in the ROM. The interpreter expected
+something else (frame? array?) and rejected the symbol's
+header-word value of 2.
+
+iter-76 will probe DoSend entry (0x2f059c) to capture
+r0..r3 + caller LR and identify the upstream NS-runtime
+wrapper (Send / Perform / NSSendProtoWithArgArray / inline
+TInterpreter send paths) that's passing a symbol receiver.
+
+36/36 guest tests skipped per the maintenance note (probe-only
+addition: new HVC immediate + dispatch arms + log-only handler).
 
 ### Iteration 74: pin the type.ref.frame throw site
 
@@ -95,78 +164,15 @@ dereferences `*r1` so we can see the offending Ref value.
   only addition: new HVC immediate + dispatch + log-only handler,
   no SBA/UND/DABT-path changes).
 
-### Iteration 73: forward FPA UND to the guest's kernel FPE emulator
-
-#### Method
-
-iter-72 cleared the iter-71 abort wedge, exposing the iter-70
-stall: `*** unrecognised UND: insn=0xed2dc203 at PC=0xd2780
-SPSR_und=0x60000110`. `0xed2dc203` is the FPA `SFM f4, 1, [sp,
-#-12]!` opcode (Store FPA Multiple) — the compiler-emitted prologue
-of `Convert__18TFrameSoundChannelFRC6RefVarP10SoundBlock`.
-`scripts/disasm-out/rom.dis` shows ~80 SFM/LFM call sites in the
-ROM, so per-opcode in-EL2 NOPs would be a maintenance liability.
-
-Newton's UND vector at PA=0x4 originally branches `b 0x1a031f4`
-(`FP_UndefHandlers_Start_JT` in the post-ship JT region) which
-thunks to `FP_UndefHandlers_Start` at ROM 0x38d8dc — a complete
-FPA emulator covering LDF/STF/LFM/SFM, the CDP arithmetic family
-(MUFD/ADFD/SUFD/CMF/CMFE/MVF/…), MCR/MRC (FIX/FLT), and the
-control/status register accesses. The whole family already has
-an in-ROM home; we just need to route there.
-
-`patch_und_vector` (in `guest_mem.rs`) preempts the original
-branch with our HVC trampoline, so unhandled FPA opcodes wedge
-in `handle_und` instead of reaching the kernel FPE. The fix:
-when the faulting insn is FPA-class (cp1/cp2 LDC/STC/CDP/MCR/MRC,
-cond ≠ 0xF) and not the existing in-EL2 RFS/WFS/RFC/WFC ctrl-reg
-arm, ERET into 0x38d8dc directly — staying in UND mode (SPSR_EL2
-unchanged, since the trampoline ended in `msr cpsr_c, #0xdb`).
-
-The trampoline already preserves everything the FPE emulator
-expects on entry: orig R0..R12 (R0/R1/R12 reloaded from stash
-slots / TPIDR_EL0 at `handle_und` entry; R2 reloaded by the
-trampoline itself before HVC; R3..R11 untouched), SP_und (never
-written), hardware-saved LR_und = `faulting_pc + 4`, and SPSR_und
-= pre-UND CPSR. The FPE emulator's first instruction reads
-`LR - 4` to recover the faulting PC, so the trampoline's
-LR_und write is consumed correctly.
-
-The FPE emulator forces I=1, F=1 on entry and restores both from
-SPSR_und on `ldm sp!, {pc}^`, so the trampoline's pre-HVC
-`msr cpsr_c, #0xdb` (which forces F=1 even when the original
-mode had F=0) is invisible to the guest after FPE return —
-SPSR_und holds the original F bit. Existing in-EL2 ctrl-reg
-NOP path is left intact; it runs first and never reaches the
-forward arm.
-
-#### Result
-
-- `und: forwarding FPA insn 0xed2dc203 @PC=0xd2780 → kernel FPE
-  @0x38d8dc` (SFM at `Convert__18TFrameSoundChannelFRC6RefVarP10SoundBlock`)
-- Two more forwards in the same function:
-  `0xed9fc108 @PC=0xd2a40` (LDF) and `0xed1bc20c @PC=0xd2cfc`
-  (LFM). All three resolve cleanly through the kernel FPE.
-- 36/36 guest tests pass.
-- Cold boot: progresses well past iter-70/iter-72's stall point.
-  The early `und: handle_und first entry` log fires (StrongARM
-  CP15 c15 c1 op2=2 NOP), then SystemBootUND, TapFileCntl,
-  multiple sound-driver subfunctions (subfn 0x1f, 5, 6, 0xa,
-  0xc, 4, 0x13, 0x17, 9, 7, 0x11, 0xd) — TSoundServer comes up.
-  The full TScheduler / task table is set up: TNewtWorld /
-  TPSSManager / TPCKM / TCommManager / TNameServer / TSoundServer
-  / TAlertEventHandler / TScreenDriver / TAppWorld(s) all
-  populated. `TNotebook::InitToolbox` runs before the new stall.
-- New stall: kernel `UnhandledException` tripwire fires on
-  `evt.ex.fr.intrp;type.ref.frame` thrown by the NewtonScript
-  interpreter (chain: `ThrowRefException` → `Throw` ×3 levels of
-  rethrow through `Run` → `DoCall`). iter-74 territory.
-  (The earlier-suspected "stage-2 perm fault loop at PC=0x19a84"
-  was a misread: that's normal demand-paging on `DiagBootStub`'s
-  memory-fill loop — each STMIA iteration faults the next page,
-  the RAM-perm-fault arm flips it RW+XN, and boot walks on. The
-  trap log budget ran out at 500 lines and hid the actual wedge
-  ~600 lines later.)
+<!-- iter-73 (forward FPA UND to the guest's kernel FPE emulator
+     at ROM 0x38d8dc. Added `is_fpa_insn` (cp1/cp2 LDC/STC/CDP/
+     MCR/MRC, cond ≠ 0xF) and `forward_und_to_guest_fpe` in
+     `src/trap.rs` that ERETs to 0x38d8dc with SPSR_EL2 unchanged
+     so we stay in UND mode. Cleared the iter-70 SFM wedge at
+     0xd2780 and let boot walk through TFrameSoundChannel codec,
+     TSoundServer init, full kernel-task census, into NS runtime.
+     Subsequently revealed the iter-74 type.ref.frame throw stall.)
+     pruned per auto-prune. See `git log --grep="iter-73"`. -->
 
 <!-- iter-72 (classify-rom — fn-range clamp on unbounded PC-rel
      switch in `enumerate_pc_rel_jump_table`; cleared the

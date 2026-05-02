@@ -140,12 +140,20 @@ pub fn log_ref(label: &str, ref_value: u32) {
 
 /// One-shot summary of the heap bounds, suitable for an iter-78
 /// boot-log line. Logs nothing if the heap isn't constructed yet.
+///
+/// Doubles as a one-shot trigger for iter-79's "force kernel
+/// diagnostics on" sequence. By the time the heap exists, both
+/// `InitObjects__Fv` and `InitInterpreter__Fv` have run, so the
+/// kernel globals we want to flip are live.
 pub fn log_heap_bounds_once() {
     static LOGGED: AtomicU32 = AtomicU32::new(0);
-    if LOGGED.swap(1, Ordering::Relaxed) != 0 {
+    if LOGGED.load(Ordering::Relaxed) != 0 {
         return;
     }
     if let Some((lo, hi)) = heap_bounds() {
+        // Set the latch BEFORE logging so an IRQ-side caller and a
+        // probe-side caller racing on the same tick don't double-log.
+        LOGGED.store(1, Ordering::Relaxed);
         crate::kprintln!(
             "heap_check: TObjectHeap @{:#010x} → [{:#010x}, {:#010x}) ({} KiB)",
             read_word(G_OBJECT_HEAP).unwrap_or(0),
@@ -153,7 +161,87 @@ pub fn log_heap_bounds_once() {
             hi,
             (hi - lo) / 1024,
         );
+        force_kernel_diag_on();
     }
+    // If `heap_bounds()` returned None (heap not yet up), leave the
+    // latch clear so a later poll can succeed.
+}
+
+// ----- iter-79: force-enable kernel diagnostic flags -----------------
+//
+// Two Newton-side flags gate most of the kernel's diagnostic
+// output:
+//
+// 1. `gWantSerialDebugging` — a packed u32 at IPA `0x0c1017c4`
+//    (the +16 field of the global at `0x0c1017b4`, set by
+//    `SetgWantSerialDebugging__FUl` @ `0x199e68`). Encoding:
+//    high byte must be `0x48` to validate, low 24 bits are
+//    sub-flag bits queried via `IsSerialDebuggingAndFlag`
+//    (`0x199e80`). On a stock boot this stays 0 because nothing
+//    sends the Hammer handshake. We force it to `0x48FFFFFF`
+//    so every IsSerialDebugging-gated branch (~30 sites in
+//    717006) takes the "yes, log it" path.
+//
+// 2. `gInterpreter[124]` — the byte at offset `+0x7C` in the
+//    `TInterpreter` singleton. `gInterpreter` is reachable as
+//    `*0x0c105458` (cf. DoSend's literal at `0x2f06a4`). When
+//    non-zero, every `DoSend / DoMessage / DoFastApply` calls
+//    `TraceSend / TraceCall / TraceApply` which funnel into
+//    `TraceMethod` → `Print(POutTranslator*, fmt, ...)`. With our
+//    Print thunk hook in place that surfaces every NS-level
+//    call into the EL2 UART.
+//
+// `force_kernel_diag_on` is invoked once (from
+// `log_heap_bounds_once`, which fires after `InitInterpreter__Fv`
+// has already run). Both writes are word-sized into kernel-data
+// RAM that's mapped writable; failure to translate is logged
+// and silently dropped.
+
+const G_WANT_SERIAL_DEBUGGING: u32 = 0x0c10_17c4;
+const G_INTERPRETER_PTR:       u32 = 0x0c10_5458;
+const TINTERPRETER_TRACE_OFF:  u32 = 124;
+
+fn write_word(va: u32, value: u32) -> bool {
+    if guest_mem::write_word_va(va, value) {
+        return true;
+    }
+    guest_mem::write_word_pa(va, value)
+}
+
+fn force_kernel_diag_on() {
+    let mut summary = [0u8; 96];
+    let mut n = 0usize;
+
+    // (1) gWantSerialDebugging — 0x48 sentinel + all sub-flags on.
+    if write_word(G_WANT_SERIAL_DEBUGGING, 0x48FF_FFFF) {
+        summary[n..n + 13].copy_from_slice(b"WantSerial=on");
+        n += 13;
+    } else {
+        summary[n..n + 14].copy_from_slice(b"WantSerial=ERR");
+        n += 14;
+    }
+
+    // (2) TInterpreter trace flag.
+    summary[n] = b' ';
+    n += 1;
+    match read_word(G_INTERPRETER_PTR) {
+        Some(p) if p != 0 => {
+            if write_word(p.wrapping_add(TINTERPRETER_TRACE_OFF), 1) {
+                summary[n..n + 11].copy_from_slice(b"TInterp=on ");
+                n += 11;
+            } else {
+                summary[n..n + 12].copy_from_slice(b"TInterp=ERR ");
+                n += 12;
+            }
+        }
+        _ => {
+            summary[n..n + 17].copy_from_slice(b"TInterp=not-init ");
+            n += 17;
+        }
+    }
+
+    let s = core::str::from_utf8(&summary[..n]).unwrap_or("<utf8>");
+    crate::kprintln!("force_diag: {}", s);
 }
 
 // ----- newton-objects integration ---------------------------------------

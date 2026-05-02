@@ -1059,6 +1059,76 @@ pub const DOSEND_ENTRY_PROBE_HVC_IMM:   u32 = 0x77;
 pub const DOSEND_ENTRY_PROBE_PC:        u32 = 0x002F_059C;
 const DOSEND_ENTRY_FIRST_INSN:          u32 = 0xE1A0_C00D; // mov ip, sp
 
+/// `Print__14POutTranslatorFPCce` thunk at ROM `0x0038_9EB8` —
+/// the kernel's chokepoint for all REP / debug printf output.
+/// 150+ call sites in 717006 (REPprintf, REPStackTrace,
+/// REPExceptionNotify, the printf jump-table entry at
+/// `0x01bf1880`, and many ad-hoc kernel diag-prints).
+///
+/// Called as `Print(POutTranslator* this, const char* fmt, ...)`
+/// with standard ARM EABI varargs (r0=this, r1=fmt, r2=arg0,
+/// r3=arg1, then stack). The thunk dispatches through the
+/// vtable to the currently-installed translator (Null on a stock
+/// boot with no debug link, so output is normally invisible);
+/// we hook BEFORE the dispatch so the format strings reach our
+/// UART regardless of which translator is plugged in. iter-79.
+///
+/// First insn is `ldr r0, [r0, #4]` (multiple-inheritance-style
+/// `this`-adjustment via the POutTranslator's inner pointer);
+/// the handler emulates that load before proceeding so the rest
+/// of the thunk works as the kernel expects.
+pub const PRINT_PROBE_HVC_IMM:          u32 = 0x78;
+pub const PRINT_PROBE_PC:               u32 = 0x0038_9EB8;
+const PRINT_PROBE_FIRST_INSN:           u32 = 0xE590_0004; // ldr r0, [r0, #4]
+
+/// `REPStackTrace__FPv` entry at ROM `0x002D_35BC`. Called by the
+/// NS-interpreter exception path (REPExceptionNotify and the
+/// generic Throw chain) to dump the current NewtonScript call
+/// stack via Print. iter-79 hooks just the entry to log "called"
+/// — the body's Print calls already get captured by the Print
+/// hook above.
+pub const REP_STACK_TRACE_PROBE_HVC_IMM: u32 = 0x79;
+pub const REP_STACK_TRACE_PROBE_PC:      u32 = 0x002D_35BC;
+const REP_STACK_TRACE_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
+
+/// `REPExceptionNotify__FP9Exception` entry at ROM `0x002F_5A58`.
+/// Called when an exception bubbles up to a notify-style handler;
+/// internally calls Print to format the exception name and
+/// payload. iter-79 hooks the entry to log "called: ex=…"
+/// — Print's format strings then surface the exception details.
+pub const REP_EX_NOTIFY_PROBE_HVC_IMM:   u32 = 0x7a;
+pub const REP_EX_NOTIFY_PROBE_PC:        u32 = 0x002F_5A58;
+const REP_EX_NOTIFY_FIRST_INSN:          u32 = 0xE1A0_C00D; // mov ip, sp
+
+/// Sister thunks for the `POutTranslator` virtual interface — same
+/// shape as the Print thunk (first insn `ldr r0, [r0, #4]`,
+/// followed by vtable lookup + jump). Hooking the abstract
+/// thunks captures every output path the kernel uses regardless
+/// of which concrete translator (Null / Hammer / Serial / NTK)
+/// is plugged into the global `gREPout` slot. iter-79.
+///
+/// `Putc` (single-char output), `Flush` (flush buffered bytes),
+/// `StackTrace` (NS-frame dump), and `ExceptionNotify`
+/// (exception-frame dump) are the four other output channels we
+/// care about. (We deliberately skip `Idle`, `ConsumeFrame`,
+/// `Prompt`, `EnterBreakLoop`, `ExitBreakLoop` — they're
+/// control signals, not byte streams.)
+pub const PUTC_PROBE_HVC_IMM:            u32 = 0x7B;
+pub const PUTC_PROBE_PC:                 u32 = 0x0038_9EC4;
+const PUTC_PROBE_FIRST_INSN:             u32 = 0xE590_0004;
+
+pub const FLUSH_PROBE_HVC_IMM:           u32 = 0x7C;
+pub const FLUSH_PROBE_PC:                u32 = 0x0038_9EA0;
+const FLUSH_PROBE_FIRST_INSN:            u32 = 0xE590_0004;
+
+pub const STACK_TRACE_PROBE_HVC_IMM:     u32 = 0x7D;
+pub const STACK_TRACE_PROBE_PC:          u32 = 0x0038_9EE8;
+const STACK_TRACE_PROBE_FIRST_INSN:      u32 = 0xE590_0004;
+
+pub const EX_NOTIFY_PROBE_HVC_IMM:       u32 = 0x7E;
+pub const EX_NOTIFY_PROBE_PC:            u32 = 0x0038_9EF4;
+const EX_NOTIFY_PROBE_FIRST_INSN:        u32 = 0xE590_0004;
+
 /// `PhysBlock__11TFlashBlockFv` first insn at ROM `0x000c_0cc4`.
 /// Iter-43 pinned the `evt.ex.abt.bus` original throw to the
 /// `bl PhysBlock` site at 0xc0cb8 (caller_lr=0xc0cbc). The fault
@@ -1635,6 +1705,62 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(DOSEND_ENTRY_PROBE_HVC_IMM),
             "DoSend entry (capture recv/method/args + caller PC)",
             DOSEND_ENTRY_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            PRINT_PROBE_PC,
+            PRINT_PROBE_FIRST_INSN,
+            hvc_insn(PRINT_PROBE_HVC_IMM),
+            "Print thunk (capture kernel REP printf output)",
+            PRINT_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            REP_STACK_TRACE_PROBE_PC,
+            REP_STACK_TRACE_FIRST_INSN,
+            hvc_insn(REP_STACK_TRACE_PROBE_HVC_IMM),
+            "REPStackTrace entry (NS interpreter stack-dump marker)",
+            REP_STACK_TRACE_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            REP_EX_NOTIFY_PROBE_PC,
+            REP_EX_NOTIFY_FIRST_INSN,
+            hvc_insn(REP_EX_NOTIFY_PROBE_HVC_IMM),
+            "REPExceptionNotify entry (capture Exception*)",
+            REP_EX_NOTIFY_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            PUTC_PROBE_PC,
+            PUTC_PROBE_FIRST_INSN,
+            hvc_insn(PUTC_PROBE_HVC_IMM),
+            "Putc thunk (single-char REP output)",
+            PUTC_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            FLUSH_PROBE_PC,
+            FLUSH_PROBE_FIRST_INSN,
+            hvc_insn(FLUSH_PROBE_HVC_IMM),
+            "Flush thunk (flush buffered REP output)",
+            FLUSH_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            STACK_TRACE_PROBE_PC,
+            STACK_TRACE_PROBE_FIRST_INSN,
+            hvc_insn(STACK_TRACE_PROBE_HVC_IMM),
+            "StackTrace thunk (NS-frame dump)",
+            STACK_TRACE_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            EX_NOTIFY_PROBE_PC,
+            EX_NOTIFY_PROBE_FIRST_INSN,
+            hvc_insn(EX_NOTIFY_PROBE_HVC_IMM),
+            "ExceptionNotify thunk (exception-frame dump)",
+            EX_NOTIFY_PROBE_HVC_IMM,
         );
         patch_probe(
             rom_ptr,

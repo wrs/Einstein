@@ -22,6 +22,7 @@ mod pa_emulate;
 mod panic;
 mod peripherals;
 mod platform;
+mod rep_print;
 mod rom_patches;
 mod shadow_pool;
 mod shadow_stub;

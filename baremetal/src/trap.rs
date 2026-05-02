@@ -347,6 +347,13 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     // regs (its SWIBoot save area is stale for the running task).
     crate::task_dump::periodic(ctx);
 
+    // iter-79: periodically check whether the runtime heap has come
+    // up; on the first successful check, fire the force-enable
+    // sequence (sets gWantSerialDebugging + gInterpreter trace
+    // flag). Cheap idempotent — atomic guard inside the helper
+    // ensures it only does real work once.
+    crate::heap_check::log_heap_bounds_once();
+
     // One-shot tripwire: poll PA 0x0402a250 every heartbeat and log the
     // first time it transitions to 0x6e657774 ("newt"). Lets us bound
     // the trace event range during which the corruption was written
@@ -1448,6 +1455,27 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::DOSEND_ENTRY_PROBE_HVC_IMM => {
             handle_dosend_entry_probe(ctx);
         }
+        v if v == crate::rom_patches::PRINT_PROBE_HVC_IMM => {
+            handle_print_probe(ctx);
+        }
+        v if v == crate::rom_patches::REP_STACK_TRACE_PROBE_HVC_IMM => {
+            handle_rep_stack_trace_probe(ctx);
+        }
+        v if v == crate::rom_patches::REP_EX_NOTIFY_PROBE_HVC_IMM => {
+            handle_rep_ex_notify_probe(ctx);
+        }
+        v if v == crate::rom_patches::PUTC_PROBE_HVC_IMM => {
+            handle_thunk_probe(ctx, ThunkKind::Putc);
+        }
+        v if v == crate::rom_patches::FLUSH_PROBE_HVC_IMM => {
+            handle_thunk_probe(ctx, ThunkKind::Flush);
+        }
+        v if v == crate::rom_patches::STACK_TRACE_PROBE_HVC_IMM => {
+            handle_thunk_probe(ctx, ThunkKind::StackTrace);
+        }
+        v if v == crate::rom_patches::EX_NOTIFY_PROBE_HVC_IMM => {
+            handle_thunk_probe(ctx, ThunkKind::ExceptionNotify);
+        }
         v if v == crate::rom_patches::PHYSBLOCK_ENTRY_PROBE_HVC_IMM => {
             handle_physblock_entry_probe(ctx);
         }
@@ -2095,6 +2123,41 @@ fn handle_und(ctx: &mut TrapContext) {
         }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::DOSEND_ENTRY_PROBE_HVC_IMM) => {
             handle_dosend_entry_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::PRINT_PROBE_HVC_IMM) => {
+            handle_print_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::REP_STACK_TRACE_PROBE_HVC_IMM) => {
+            handle_rep_stack_trace_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::REP_EX_NOTIFY_PROBE_HVC_IMM) => {
+            handle_rep_ex_notify_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::PUTC_PROBE_HVC_IMM) => {
+            handle_thunk_probe(ctx, ThunkKind::Putc);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::FLUSH_PROBE_HVC_IMM) => {
+            handle_thunk_probe(ctx, ThunkKind::Flush);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::STACK_TRACE_PROBE_HVC_IMM) => {
+            handle_thunk_probe(ctx, ThunkKind::StackTrace);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::EX_NOTIFY_PROBE_HVC_IMM) => {
+            handle_thunk_probe(ctx, ThunkKind::ExceptionNotify);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -3270,6 +3333,148 @@ fn handle_throw_ex_intrp_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
         crate::dosend_ring::dump("ThrowExInterpreterWithSymbol fired");
     }
 
+    // Emulate `mov ip, sp`.
+    ctx.x[12] = sp as u64;
+}
+
+/// iter-79: probe at `Print__14POutTranslatorFPCce` entry
+/// (ROM 0x389eb8). The thunk's first insn is
+/// `ldr r0, [r0, #4]`; we emulate it after capturing args.
+///
+/// Args follow standard ARM EABI varargs:
+///   r0 = POutTranslator* this   (consumed by the thunk)
+///   r1 = format string (const char*)
+///   r2 = arg0   r3 = arg1   [sp+0..]+ = arg2..
+///
+/// The renderer's `VaArgs` pulls args from r2/r3 then walks
+/// the source-mode stack. For REPprintf-style callers (which
+/// pack args into a struct and pass a pointer-to-pointer in r2),
+/// this would render the first integer arg as a wild pointer —
+/// but iter-78 confirmed REPprintf has zero callers in 717006,
+/// so the standard convention applies everywhere.
+fn handle_print_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_print_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_print_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    let r0 = ctx.x[0] as u32;
+    let r1 = ctx.x[1] as u32;
+    let r2 = ctx.x[2] as u32;
+    let r3 = ctx.x[3] as u32;
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+
+    crate::rep_print::render_and_log(
+        "REP> ",
+        r1,
+        crate::rep_print::VaArgs::new(r2, r3, sp),
+    );
+
+    // Emulate `ldr r0, [r0, #4]` so the rest of the thunk
+    // (`ldr ip, [r0, #8]; add pc, ip, #36`) sees the same r0
+    // it would have without the patch.
+    let new_r0 = guest_mem::read_word_va(r0.wrapping_add(4))
+        .or_else(|| guest_mem::read_word_pa(r0.wrapping_add(4)))
+        .unwrap_or(0xDEAD_BEEF);
+    ctx.x[0] = new_r0 as u64;
+}
+
+/// iter-79: probe at `REPStackTrace__FPv` entry (ROM 0x2d35bc).
+/// Just logs the entry + caller_lr; the body's Print calls
+/// surface through the Print probe above.
+fn handle_rep_stack_trace_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_rep_stack_trace_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_rep_stack_trace_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let r0 = ctx.x[0] as u32;
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+    kprintln!(
+        "REPStackTrace #{}: arg=({:#010x}) caller_lr={:#010x} sp={:#010x}",
+        seq, r0, lr, sp,
+    );
+    // Emulate `mov ip, sp`.
+    ctx.x[12] = sp as u64;
+}
+
+/// iter-79: probe at `REPExceptionNotify__FP9Exception` entry
+/// (ROM 0x2f5a58). Args: r0 = Exception*. The body chases
+/// `*r0` (exception name C-string) and Subexception-tests
+/// against well-known root strings before formatting via Print.
+fn handle_rep_ex_notify_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_rep_ex_notify_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+/// iter-79: which `POutTranslator` vtable thunk fired.
+#[derive(Clone, Copy)]
+enum ThunkKind {
+    Putc,
+    Flush,
+    StackTrace,
+    ExceptionNotify,
+}
+
+/// Unified handler for the abstract POutTranslator thunks
+/// (Putc / Flush / StackTrace / ExceptionNotify). All four
+/// share the same first-insn shape (`ldr r0, [r0, #4]`) and
+/// the same vtable-dispatch tail; only the captured-arg
+/// formatting differs.
+fn handle_thunk_probe(ctx: &mut TrapContext, kind: ThunkKind) {
+    let r0 = ctx.x[0] as u32;
+    let r1 = ctx.x[1] as u32;
+    match kind {
+        ThunkKind::Putc => {
+            let c = (r1 & 0xFF) as u8;
+            let printable = if c.is_ascii() && (c >= 0x20 || c == b'\n' || c == b'\r' || c == b'\t') {
+                c
+            } else {
+                b'?'
+            };
+            kprintln!("REP> putc {:#04x} ({})", c, printable as char);
+        }
+        ThunkKind::Flush => {
+            kprintln!("REP> flush (translator={:#010x})", r0);
+        }
+        ThunkKind::StackTrace => {
+            kprintln!("REP> StackTrace(translator={:#010x}, arg={:#010x})", r0, r1);
+        }
+        ThunkKind::ExceptionNotify => {
+            // r1 = Exception*; *r1 = name C-string ptr.
+            let name_ptr = guest_mem::read_word_va(r1).unwrap_or(0);
+            let (buf, len) = read_cstr_at(name_ptr, 80);
+            let name = core::str::from_utf8(&buf[..len]).unwrap_or("<non-utf8>");
+            kprintln!(
+                "REP> ExceptionNotify(translator={:#010x}, ex={:#010x}) name={:?}",
+                r0, r1, name,
+            );
+        }
+    }
+    // Emulate the original `ldr r0, [r0, #4]` so the rest of
+    // the thunk (vtable lookup + jump) sees the same r0.
+    let new_r0 = guest_mem::read_word_va(r0.wrapping_add(4))
+        .or_else(|| guest_mem::read_word_pa(r0.wrapping_add(4)))
+        .unwrap_or(0xDEAD_BEEF);
+    ctx.x[0] = new_r0 as u64;
+}
+
+fn handle_rep_ex_notify_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let r0 = ctx.x[0] as u32;
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+    let name_ptr = guest_mem::read_word_va(r0).unwrap_or(0);
+    let (buf, len) = read_cstr_at(name_ptr, 80);
+    let name = core::str::from_utf8(&buf[..len]).unwrap_or("<non-utf8>");
+    kprintln!(
+        "REPExceptionNotify #{}: ex={:#010x} name={:?} caller_lr={:#010x} sp={:#010x}",
+        seq, r0, name, lr, sp,
+    );
     // Emulate `mov ip, sp`.
     ctx.x[12] = sp as u64;
 }

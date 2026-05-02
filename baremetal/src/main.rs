@@ -14,6 +14,7 @@ mod g1_capture;
 mod guest;
 mod guest_bp;
 mod guest_mem;
+mod heap_check;
 mod heap_watch;
 mod mmio;
 mod mmu;

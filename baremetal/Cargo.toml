@@ -52,6 +52,9 @@ quiet = []
 # Off by default; the helper is wired up but not yet invoked.
 validate_with_probe = []
 
+[dependencies]
+newton-objects = { path = "newton-objects" }
+
 [profile.dev]
 panic = "abort"
 opt-level = 1

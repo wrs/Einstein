@@ -136,6 +136,20 @@ impl fmt::Display for ParseError {
     }
 }
 
+// ----------------------------------------------------------------- Endian
+
+/// Byte order of the on-buffer encoding.
+///
+/// Newton package parts use big-endian (the default — preserves the
+/// original behavior). The runtime heap on a little-endian CPU
+/// (e.g. Cortex-A53 running an unmodified Newton ROM) uses
+/// little-endian.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Endian {
+    Big,
+    Little,
+}
+
 // ------------------------------------------------------------------- Heap
 
 /// A read-only view of a packed object region.
@@ -151,15 +165,19 @@ impl fmt::Display for ParseError {
 /// [`Heap::with_load_addr`] when the buffer represents a region that
 /// was originally loaded at a non-zero address (e.g. a Newton heap dump
 /// whose pointer Refs encode `loadaddr + file_offset`).
+///
+/// Default endianness is big-endian (Newton package format). Use
+/// [`Heap::with_endian`] to parse a runtime little-endian heap.
 #[derive(Clone, Copy, Debug)]
 pub struct Heap<'a> {
     bytes: &'a [u8],
     load_addr: u32,
+    endian: Endian,
 }
 
 impl<'a> Heap<'a> {
     pub const fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, load_addr: 0 }
+        Self { bytes, load_addr: 0, endian: Endian::Big }
     }
 
     /// Construct a heap whose offsets are interpreted as `load_addr + X`,
@@ -167,7 +185,13 @@ impl<'a> Heap<'a> {
     /// `load_addr + X` resolves to the object whose 8-byte header begins
     /// at `bytes[X..]`.
     pub const fn with_load_addr(bytes: &'a [u8], load_addr: u32) -> Self {
-        Self { bytes, load_addr }
+        Self { bytes, load_addr, endian: Endian::Big }
+    }
+
+    /// Override the byte order for word reads. Builder-style; combine
+    /// with [`Heap::new`] / [`Heap::with_load_addr`].
+    pub const fn with_endian(self, endian: Endian) -> Self {
+        Self { bytes: self.bytes, load_addr: self.load_addr, endian }
     }
 
     pub fn bytes(&self) -> &'a [u8] {
@@ -176,6 +200,10 @@ impl<'a> Heap<'a> {
 
     pub fn load_addr(&self) -> u32 {
         self.load_addr
+    }
+
+    pub fn endian(&self) -> Endian {
+        self.endian
     }
 
     /// Translate a load-address-space offset to a file index, or `None`
@@ -259,7 +287,7 @@ impl<'a> Iterator for ObjectIter<'a> {
     }
 }
 
-fn read_be_u32(heap: Heap<'_>, abs: u32) -> Result<u32, ParseError> {
+fn read_word_u32(heap: Heap<'_>, abs: u32) -> Result<u32, ParseError> {
     let off = heap
         .file_off(abs)
         .ok_or(ParseError::OutOfBounds { offset: abs, len: 4 })? as usize;
@@ -268,7 +296,11 @@ fn read_be_u32(heap: Heap<'_>, abs: u32) -> Result<u32, ParseError> {
         .bytes
         .get(off..end)
         .ok_or(ParseError::OutOfBounds { offset: abs, len: 4 })?;
-    Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+    let bytes = [s[0], s[1], s[2], s[3]];
+    Ok(match heap.endian {
+        Endian::Big => u32::from_be_bytes(bytes),
+        Endian::Little => u32::from_le_bytes(bytes),
+    })
 }
 
 // --------------------------------------------------------------- Header
@@ -290,13 +322,13 @@ struct Header {
 
 impl Header {
     fn parse(heap: Heap<'_>, offset: u32) -> Result<Self, ParseError> {
-        let w0 = read_be_u32(heap, offset)?;
+        let w0 = read_word_u32(heap, offset)?;
         // word 1 is documented as zero, except the locator-array's
         // alignment-flag bit. We tolerate any value here.
-        let _w1 = read_be_u32(heap, offset.wrapping_add(4))?;
+        let _w1 = read_word_u32(heap, offset.wrapping_add(4))?;
         let size = w0 >> 8;
         let flags = (w0 & 0xFF) as u8;
-        // read_be_u32 succeeded so file_off(offset) is in-bounds.
+        // read_word_u32 succeeded so file_off(offset) is in-bounds.
         let file_off = offset.wrapping_sub(heap.load_addr) as usize;
         if size < 8 || file_off.saturating_add(size as usize) > heap.bytes.len() {
             return Err(ParseError::BadHeader { offset, size, flags });
@@ -399,7 +431,7 @@ impl<'a> ObjBase<'a> {
     }
 
     fn read_ref(&self, off: u32) -> Result<Ref, ParseError> {
-        read_be_u32(self.heap, off).map(Ref)
+        read_word_u32(self.heap, off).map(Ref)
     }
 }
 
@@ -457,14 +489,16 @@ impl<'a> Binary<'a> {
     }
 
     /// Returns the Unicode characters of a `'string` object. The data
-    /// is null-terminated UCS-2 big-endian; the terminator is stripped.
+    /// is null-terminated UCS-2 in the heap's endianness; the
+    /// terminator is stripped.
     pub fn as_string_chars(&self) -> impl Iterator<Item = u16> + 'a {
         let data = self.data();
-        StringChars { data, i: 0 }
+        StringChars { data, i: 0, endian: self.0.heap.endian }
     }
 
     /// IEEE-754 double-precision float for a `'real` object.
-    /// The first 8 bytes of `data` are interpreted big-endian.
+    /// The first 8 bytes of `data` are interpreted in the heap's
+    /// endianness.
     pub fn as_real(&self) -> Option<f64> {
         let d = self.data();
         if d.len() < 8 {
@@ -472,13 +506,17 @@ impl<'a> Binary<'a> {
         }
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&d[..8]);
-        Some(f64::from_be_bytes(buf))
+        Some(match self.0.heap.endian {
+            Endian::Big => f64::from_be_bytes(buf),
+            Endian::Little => f64::from_le_bytes(buf),
+        })
     }
 }
 
 pub struct StringChars<'a> {
     data: &'a [u8],
     i: usize,
+    endian: Endian,
 }
 
 impl<'a> Iterator for StringChars<'a> {
@@ -487,7 +525,11 @@ impl<'a> Iterator for StringChars<'a> {
         if self.i + 2 > self.data.len() {
             return None;
         }
-        let c = u16::from_be_bytes([self.data[self.i], self.data[self.i + 1]]);
+        let bytes = [self.data[self.i], self.data[self.i + 1]];
+        let c = match self.endian {
+            Endian::Big => u16::from_be_bytes(bytes),
+            Endian::Little => u16::from_le_bytes(bytes),
+        };
         self.i += 2;
         if c == 0 {
             None
@@ -514,7 +556,11 @@ impl<'a> Symbol<'a> {
         if d.len() < 4 {
             return 0;
         }
-        u32::from_be_bytes([d[0], d[1], d[2], d[3]])
+        let bytes = [d[0], d[1], d[2], d[3]];
+        match self.0.heap().endian() {
+            Endian::Big => u32::from_be_bytes(bytes),
+            Endian::Little => u32::from_le_bytes(bytes),
+        }
     }
 
     /// Symbol name as raw bytes, with the null terminator stripped.

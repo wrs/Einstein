@@ -1405,6 +1405,152 @@ The fault MECHANISM at FAR=`0xc647003`:
    memory until r5 = 854 reaches the heap-top boundary at
    `0xc647003` and faults.
 
+## NewtonScript Ref tag scheme
+
+A 32-bit value passed through the NS interpreter. The low 2 bits are
+the tag; the remaining 30 bits depend on the tag.
+
+```text
+  low 2 bits  meaning            decode
+  00          integer            value = (Ref as i32) >> 2
+  01          real pointer       address = Ref - 1   (heap or ROM frame)
+  10          immediate          NIL = 0x02
+                                 TRUE = 0x1A   (i.e. character code 1)
+                                 char if (Ref & 0xF) == 0xA, codepoint = Ref >> 4
+                                 other specials: kFunctionTag, etc.
+  11          magic pointer      ROM-table index = Ref >> 2
+                                 (Newton 2.x splits as `(table:16, index:14, tag:2)`)
+```
+
+Citations from the kernel (717006):
+
+- `IsInt__FRC6RefVar` @ `0x31c6c4` — masks low 2 bits, returns true on `00`.
+- `IsRealPtr__FRC6RefVar` @ `0x31c77c` — true on `01`.
+- `IsChar__FRC6RefVar` @ `0x31c6e0` — `(Ref & 0xF) == 0xA`.
+- `IsMagicPtr__FRC6RefVar` @ `0x31c75c` — true on `11`.
+- `IsPtr__FRC6RefVar` @ `0x31c70c` — `(Ref & 1) != 0` (real OR magic).
+- `MakeBoolean__Fi` @ `0x31c6b4` — false → `0x02`, true → `0x1A`.
+- `MakeInt__Fl` @ `0x31c694` — `lsl r0, r0, #2`.
+
+> **Common mistake.** The 30-bit-integer-with-pointer-tag layout
+> (00=int, 01=ptr) is the opposite of the 30-bit-pointer-with-int-tag
+> layout (00=ptr, 01=int) used by some other dynamic runtimes.
+> Newton uses the *first* form: pointers have the low bit set, so the
+> hardware can't accidentally dereference them as object headers.
+
+### `RefVar const&` ABI
+
+`RefVar` is the GC-tracked stack-resident handle that NS interpreter
+code passes around. The class has a single `Ref*` field (a slot
+pointer into the GC root array), so `sizeof(RefVar) == 4`. A
+`RefVar const&` parameter is lowered to `RefVar*` at the asm level —
+**two indirections** are needed to reach the Ref:
+
+```asm
+ldr r0, [r0]   ; r0 = *RefVar*  → slot pointer (Ref*)
+ldr r0, [r0]   ; r0 = **RefVar* → tagged Ref
+```
+
+Probes that read just `*r0` see slot pointers (typically
+4-byte-aligned RAM addresses, low 2 bits `00`), which on cursory
+inspection look like integer Refs. iter-77 fell into exactly this
+trap and reported a slot pointer as the receiver. Always do the
+double-deref.
+
+---
+
+## TObjectHeap (NS runtime heap)
+
+The NewtonScript runtime allocates packed objects (binary, array,
+frame) inside a single `TObjectHeap`. Constructed by `InitObjects__Fv`
+(`0x31c608`) with the C++ ctor at `__ct__11TObjectHeapFlT1`
+(`0x31cafc`). The bounds check `InHeap__11TObjectHeapFl`
+(`0x31bddc`) is `lo <= addr < hi`.
+
+```c
+struct TObjectHeap {            // total >= 0x24
+    void*   vtable;             // +0x00
+    void*   storage;            // +0x04   raw block from NewPtr(size + 4)
+    void*   lo;                 // +0x08   lo bound (storage + 3 & ~3, inclusive)
+    void*   hi;                 // +0x0c   hi bound (lo + size, exclusive)
+    // ...
+    ObjHeader* free_list_head;  // +0x14   first free block (set in ctor)
+    // ...
+    ULong   gc_threshold;       // +0x20   `8 + 2048` = 0x808 by default
+};
+```
+
+Citations:
+
+- ctor @ `0x31cafc` — `str r1, [r4, #8]` (lo) and `str r0, [r4, #12]` (hi)
+  set the bounds; `str r0, [r4, #20]` saves the free-block pointer.
+- `InHeap` @ `0x31bddc` — reads `[r4, #8]` then `[r4, #12]`, compares
+  against the address (after stripping the 01 ptr tag → addr - 1).
+
+### Global accessor
+
+The constructed `TObjectHeap*` is stored in a global at IPA
+`0x0c105548` (literal at `0x31c684`, written by
+`InitObjects__Fv`'s `str r0, [r4]`). Reading `*0x0c105548` after
+`InitObjects__Fv` has run gives a live pointer; before, it's zero
+(useful as an "is the NS runtime up?" sentinel). Used by the
+hypervisor's `src/heap_check.rs` to classify Refs at probe time.
+
+Observed extent on a 717006 cold boot stalled at
+`evt.ex.fr.intrp;type.ref.frame`:
+
+```
+heap_check: TObjectHeap @0x0c607288 → [0x0c6072cc, 0x0c64435c) (244 KiB)
+```
+
+So the heap occupies a single contiguous block right after the
+TObjectHeap struct itself in low-RAM (close to the `gObjectTable`
+region at `0x0c10fc34`).
+
+---
+
+## NS object headers (heap layout)
+
+Inside the heap, objects are laid out with this 8-byte header:
+
+```c
+struct ObjHeader {
+    ULong   word0;   // (size << 8) | flags
+    ULong   word1;   // zero (or alignment-flag bit for locator arrays)
+};
+```
+
+Flags (low byte of word 0):
+
+```text
+  bit 0  KOBJ_SLOTTED   slotted object (array or frame). If clear: binary.
+  bit 1  KOBJ_FRAME     frame (only meaningful when KOBJ_SLOTTED is set;
+                        clear-with-SLOTTED-set → array)
+  bit 6  HEADER_BASE    always 1 (0x40); every other unused bit is 0.
+```
+
+After the 8-byte header:
+
+- **Binary**: 4-byte class Ref, then `size - 12` raw data bytes.
+- **Array**: 4-byte class Ref, then `(size - 12) / 4` slot Refs.
+- **Frame**: 4-byte map Ref (an array; slot 0 is the supermap chain
+  terminator, slots 1..N are symbol Refs naming the frame's local
+  slots), then `(size - 12) / 4` value Refs.
+
+The on-disk package format and the in-memory runtime use the same
+layout, so the `newton-objects` parser handles both. The runtime
+encoding is little-endian on Cortex-A53; package-format is
+big-endian. `src/heap_check.rs::dump_object` reads runtime bytes
+into a stack buffer via `to_be_bytes` so the parser sees the
+original byte order, then parses with `Endian::Big`.
+
+Citation: `__ct__11TObjectHeapFlT1` (`0x31cafc`) constructs the
+initial free block whose first word is `(size << 8) | flags` with
+flags `0x80000 | 0x800 | …` for the free-list bits. Header bit
+positions cross-checked against `newton-objects/src/lib.rs::flags`.
+
+---
+
 ## See also
 
 - `INVESTIGATION.md` — live wedge debugging notes

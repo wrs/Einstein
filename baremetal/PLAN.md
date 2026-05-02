@@ -17,199 +17,152 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-78):** iter-77 dumped both heap objects
-referenced by the failing DoSend. The receiver (0x0cd09020) and
-the FindImplementor result (0x0c643c9c) **both** have header
-word = `0x00000002`. The implementor's contents look like a
-hashmap-style entry table:
+**Current goal (iter-79):** iter-78 fixed the iter-76/77 RefVar
+indirection bug, added a runtime-heap-bounds classifier
+(`src/heap_check.rs`), and wired the `newton-objects` parser
+into the dosend ring + throw probes (with little-endian support
+in the library). The corrected probe output identifies the
+actual problem in one line:
 
 ```
-recv (0x0cd09020):
-  [+0]  = 0x00000002      ← header (objClass=2 = "binary")
-  [+4]  = 0x0c6093b5      ← Ref (low 2 bits = 01 = integer)
-  [+8]  = 0x0c6093b5      ← same
-  [+c]  = 0x00628175      ← integer Ref
-  [+10] = 0x0c60937d      ← integer Ref
-  [+14] = 0x006282ad      ← integer Ref
-  [+18] = 0x00000000
-
-meth (FindImplementor result, 0x0c643c9c):
-  [+0]  = 0x00000002      ← header
-  [+4]  = 0x00000008      ← could be slot count / size
-  [+8]  = 0x000000a8      ← byte offset?
-  [+c]  = 0xfffffffc      ← -4
-  [+10] = 0x000000ac      ← byte offset (a8+4)
-  [+14] = 0xfffffffc      ← -4
-  [+18] = 0x000000b0      ← byte offset (ac+4)
-  [+1c] = 0xfffffffc      ← -4
+DoSend #0: recv=0x00000002 impl=0x00000002 meth=0x003b673d argc=1 caller_lr=0x002f0eac
+heap_check: TObjectHeap @0x0c607288 → [0x0c6072cc, 0x0c64435c) (244 KiB)
+  recv: ref=0x00000002 → NIL
+  impl: ref=0x00000002 → NIL
+  meth: ref=0x003b673d → real-ptr ROM @0x003b673c
+    symbol 'Query (hash=0xebfb0b66) @0x003b673c size=22
 ```
 
-The implementor's structure (8-byte pairs of `(offset_in_4s,
--4)`) doesn't look like a regular frame — it looks like an
-internal hash/dispatch table. The header `0x00000002` matches
-both the receiver and the implementor; in Apple's NS object
-header the low byte is the object class, where `kIndirectBinary`
-or `kPackBinary` would be 2.
+So:
+- The boot is calling **`NIL:Query()` with one arg**. Not the
+  bogus `punctuationCursiveOption` from iter-77 — that name
+  came from misreading the slot-pointer at 0x006840b4 as a Ref.
+- The runtime object heap occupies 244 KiB at
+  `[0x0c6072cc, 0x0c64435c)`; the throw value at 0x0c6093e0
+  *is* in-heap (a 12-byte binary with class Ref(0x0c609420)).
+- The ThrowRefException error code `errCode=-48809 (0xffff4157)`
+  matches DoSend's literal at 0x2f06a8 — i.e. the throw came
+  from DoSend's own `**arg1 == 2` check at 0x2f05fc, which
+  fires when **the implementor (FindImplementor result) is NIL**.
+  FindImplementor returns NIL when `:Query` isn't found on the
+  receiver — and the receiver is itself NIL.
 
-Hypothesis (to confirm): the boot is calling
-`punctuationCursiveOption` on something that is itself a binary
-object (perhaps a font/string-table object) rather than a
-frame; OR our heap-dump is reading an address that's offset
-from the actual object header.
-
-Next: cross-check the Ref-encoding convention. NS pointer Refs
-point AT the header (low 2 bits = 0), so `[ref]` IS the header
-word. Confirm via a second probe that captures `IsBinary(*recv)`
-and `IsBinary(*impl)` directly (the kernel's IsBinary at
-0x1bf398c) — if those return true, our reads agree with the
-kernel. If FALSE, we're misreading the Ref encoding (e.g.
-encoding has a -4 offset). Either way the next step is to
-identify the upstream NS opcode that constructed this DoSend
-and walk back to find why the receiver was a binary instead of
-a frame.
+Next (iter-79): walk up from DoMessage (caller `0x002f0eac`)
+to identify what NS opcode invoked `something:Query(arg)` with
+NIL as `something`. DoMessage's caller chain is the next probe
+target. Likely an opcode-26-style send-message or a bytecode
+issuing a `:Query` from a pulldown / picker view that hadn't
+finished initialising. Use the same probe pattern (HVC at
+DoMessage entry; ring-buffer of recv/methodName + caller_lr)
+plus a stack walk past DoMessage's APCS frame.
 
 **Background:** iter-70 cleared the splash wedge; iter-71/72
 fought a classifier regression; iter-73 forwarded FPA UNDs to
-the kernel's FPE emulator; iter-74 pinned the throw chain to
-ThrowRefException; iter-75 walked up to DoSend; iter-76 walked
-up to DoMessage; iter-77 dumped the heap objects at the DoSend
-boundary. Boot reaches NS runtime, 27 kernel objects + `newt`
-running NS code, several `evt.ex.fr.store` exceptions caught,
-then `type.ref.frame` escapes all handlers exactly once and
-trips UnhandledException.
+the kernel's FPE emulator; iter-74/75 walked the throw chain to
+ThrowRefException → ThrowExInterpreterWithSymbol → DoSend;
+iter-76 walked up to DoMessage; iter-77 mis-decoded RefVars and
+mistook slot pointers for Refs; iter-78 fixed the decoding,
+parsed the heap-resident throw value, identified the actual
+methodName as `'Query` with a NIL receiver. Boot reaches NS
+runtime, 27 kernel objects + `newt` running NS code, several
+`evt.ex.fr.store` exceptions caught, then `type.ref.frame`
+escapes all handlers exactly once and trips UnhandledException.
 
-### Iteration 77: dump the implementor and receiver heap objects
-
-#### Method
-
-iter-76 pinned the throw to a single DoSend call from DoMessage
-with `meth=0x0c643c9c` (the FindImplementor result that DoSend
-rejects with `**arg1 == 2`). To classify the heap object's NS
-type, extend the dosend_ring dump in `src/dosend_ring.rs` to also
-walk each captured Ref's first 8 words via stage-1 reads. Skip
-non-pointer refs (low 2 bits ≠ 00) and out-of-range addresses;
-otherwise print `[+0..+1c]` of the pointed-to memory.
-
-#### Result
-
-Single-shot cold boot dumped:
-
-```
-recv (0x0cd09020):
-  [+0]=0x00000002 [+4]=0x0c6093b5 [+8]=0x0c6093b5 [+c]=0x00628175
-  [+10]=0x0c60937d [+14]=0x006282ad [+18]=0 [+1c]=0
-
-meth/impl (0x0c643c9c):
-  [+0]=0x00000002 [+4]=0x00000008 [+8]=0x000000a8 [+c]=0xfffffffc
-  [+10]=0x000000ac [+14]=0xfffffffc [+18]=0x000000b0 [+1c]=0xfffffffc
-
-args/methodName (0x006840b4 — ROM symbol RSSYMpunctuationcursiveoption):
-  [+0]=0x003b673d  ← integer Ref (low 2 bits = 01)
-  [+4]=0x006840b4  ← back-pointer (matches the ROM symbol-table layout)
-  ...
-```
-
-Both the receiver and the implementor have header word 2 — i.e.
-both look like NS-class-2 objects (binary). The implementor's
-content is an array of `(offset_in_4s, -4)` pairs starting at
-+0x4 — looks like a hashmap-style entry table.
-
-The Ref-encoding convention check is unsettled: NS pointer Refs
-should point AT the header, so reading `[ref]` IS the header.
-But two unrelated heap objects both having header == 2 is
-suspicious. Either:
-- both are *genuinely* binary objects and the upstream NS code
-  is wrong about the receiver type (likely a real Apple bug
-  surfaces because we triggered an unexpected code path);
-- our heap dump is reading 4 bytes past the actual header (the
-  NS Ref convention has a -4 offset on this build);
-- the heap is corrupted and the header bytes were overwritten.
-
-iter-78 will cross-check by calling/probing IsBinary on the
-captured Refs from EL2, and by dumping the bytes at
-`ref - 4` to see if there's a different header structure
-preceding the captured address.
-
-36/36 guest tests skipped per the maintenance note (probe-only
-addition: heap-dump helper in dosend_ring; no SBA/UND/DABT-path
-changes).
-
-### Iteration 76: walk back from DoSend to DoMessage
+### Iteration 78: heap-bounds classifier + Ref-decoding fix + structured object dump
 
 #### Method
 
-iter-75's probe placed the throw inside DoSend but `caller_lr`
-pointed into DoSend itself (just past the conditional bleq).
-DoSend has 16+ call sites in 717006, so a static cross-ref
-isn't enough — need a runtime probe.
+Three coupled fixes to make the iter-76/77 probe data
+trustworthy:
 
-Add a probe at DoSend entry (HVC #0x77 at 0x002F_059C) that
-captures r0..r3 (receiver / impl / methodName / argc), resolves
-each RefVar with one indirection (so we see the actual NS Refs),
-and source-mode banked LR. Also added a 16-entry ring buffer
-in `src/dosend_ring.rs` populated on every DoSend call; the
-ThrowExInterpreterWithSymbol probe (iter-75) dumps the ring on
-the first fire so we get the call sequence even when many
-DoSends precede the bad one.
+1. **RefArg double-indirection.** A `RefVar const&` at the
+   asm level is `RefVar*`; a `RefVar` itself holds a `Ref*`
+   slot pointer; the actual tagged Ref needs **two**
+   indirections (cf. `IsInt__FRC6RefVar` @ 0x31c6c4 — two
+   chained `ldr r0,[r0]`). iter-76/77 stopped at one. The
+   Newton tag scheme (verified against `IsRealPtr` @
+   0x31c77c, `IsMagicPtr` @ 0x31c75c) is `00=int 01=real-ptr
+   10=imm 11=magic-ptr`, *not* `00=ptr` — so refs ending in
+   00 are integers, not pointers. Both bugs combined to make
+   iter-77 print slot-pointer addresses as if they were
+   object headers.
 
-DoSend fires ~hundreds of times per NS-running boot, so the
-inline log throttles to every 64th call (plus the first 8).
-The ring is the authoritative record.
+2. **Heap-bounds classifier (`src/heap_check.rs`).**
+   Decompiled `InHeap__11TObjectHeapFl` @ 0x31bddc to find
+   the bounds layout: `[this+8] = lo` (inclusive) and
+   `[this+12] = hi` (exclusive); `lo <= addr < hi` is the
+   in-heap test. The global `TObjectHeap*` is at IPA
+   `0x0c105548` (literal at 0x31c684, populated by
+   `InitObjects__Fv` @ 0x31c608 from the
+   `__ct__11TObjectHeapFlT1` result). Caches the bounds on
+   first read; classifies real-pointer Refs as `in-heap` /
+   `ROM` (addr < 0x01000000) / `OUT-OF-HEAP`.
+
+3. **Structured object dump via `newton-objects`.** Extended
+   the (BE-only) `newton-objects` library with an `Endian`
+   enum + `Heap::with_endian` builder. Wired into
+   `heap_check::dump_object`: copies up to 256 bytes from
+   guest memory into a stack buffer (each runtime u32 written
+   via `to_be_bytes` so byte-level data preserves the
+   original on-disk order — counteracts the `load_rom`
+   per-word byteswap), then parses with `Endian::Big`. Yields
+   `symbol 'Query (hash=…) size=22`-style lines for ROM-
+   resident method symbols, `frame map=… len=…`-style for
+   heap-resident frames.
 
 #### Result
 
-Single-shot cold boot fired exactly **one** DoSend before
-the type-mismatch throw:
+Single-shot cold boot now produces an unambiguous diagnosis:
 
 ```
-DoSend #0: recv=0x0cd09020 meth=0x0c643c9c args=0x006840b4
-           argc=1 caller_lr=0x002f0eac
+DoSend #0: recv=0x00000002 impl=0x00000002 meth=0x003b673d argc=1 caller_lr=0x002f0eac
+ThrowExInterpreterWithSymbol #0: errCode=-48809 (r0=0xffff4157) ...
+heap_check: TObjectHeap @0x0c607288 → [0x0c6072cc, 0x0c64435c) (244 KiB)
+  symbol: ref=0x003b673d → real-ptr ROM @0x003b673c
+    symbol 'Query (hash=0xebfb0b66) @0x003b673c size=22
+dosend_ring (...): last 1 invocations:
+  #0: recv=0x00000002 impl=0x00000002 meth=0x003b673d argc=1 caller_lr=0x002f0eac
+    recv: ref=0x00000002 → NIL
+    impl: ref=0x00000002 → NIL
+    meth: ref=0x003b673d → real-ptr ROM @0x003b673c
+      symbol 'Query (hash=0xebfb0b66) @0x003b673c size=22
+ThrowRefException #0: name="evt.ex.fr.intrp;type.ref.frame" ... **r1=0x0c6093e1
+  value: ref=0x0c6093e1 → real-ptr in-heap @0x0c6093e0
+    binary class=Ref::Pointer(0x0c609420) @0x0c6093e0 size=12 (data 0 B)
 ```
 
-(In the existing log this is the *first* DoSend — earlier
-boot work apparently hadn't dispatched any messages, which
-is consistent with TNotebook::InitToolbox having only just
-finished and the NS interpreter just entering its first
-message-send.)
+Conclusions:
 
-`caller_lr=0x002f0eac` lands inside
-`DoMessage__FRC6RefVarN21` (0x002f0e40), specifically just
-past the `bl DoSend` at 0x2f0ea8. DoMessage's flow:
+- The throw is `NIL:Query()`. iter-77's
+  `RSSYMpunctuationcursiveoption` was wrong (decoded a
+  slot-pointer address as a Ref).
+- DoSend's check at 0x2f05fc (`**arg1 == 2`) fires because
+  FindImplementor returned NIL — natural for a NIL receiver.
+  The chain is `<???> → DoMessage(NIL, 'Query, args) → DoSend
+  → throw`; iter-79 walks past DoMessage to find the NS
+  caller that supplied NIL.
+- The thrown exception value is a 12-byte heap-resident
+  binary at 0x0c6093e0 (presumably the frame holding the
+  error info; class points at another heap object at
+  0x0c609420).
+- Heap is healthy (244 KiB at `[0x0c6072cc, 0x0c64435c)`).
+  No corruption hypothesis needed.
 
-```
-prologue: r5 = recv, r4 = methodName, r6 = argsArray
-2f0e60: bl IsSymbol(*methodName)           ; passes — methodName IS a symbol
-2f0e84: bl FindImplementor(recv, methodName)
-2f0e88: bl AllocateRefHandle               ; wraps result, sp = &RefHandle
-2f0e94: bl PushArgArray(argsArray)         ; pushes args, returns argc
-2f0ea8: bl DoSend(recv, sp, methodName, argc)
-```
+36/36 guest tests skipped per the maintenance note
+(probe-only: heap_check + newton-objects integration; no
+SBA/UND/DABT-path changes).
 
-So DoMessage receives `(recv, methodName=punctuationCursiveOption,
-argsArray)`, looks up the method in the receiver's protochain via
-FindImplementor, wraps the result in a RefHandle, and calls DoSend
-with that wrapper as arg1. DoSend reads `**arg1` (= the
-implementor's first word) and finds 2 → throws "type.ref.frame".
+<!-- iter-77 (dumped heap objects at the DoSend boundary; both
+     showed header word 2 — but that was an artifact of the
+     RefArg single-indirection bug, which iter-78 fixed. The
+     actual story is recv = NIL, not "binary class 2".) pruned
+     per auto-prune. See `git log --grep="iter-77"`. -->
 
-The captured `meth=0x0c643c9c` field is actually the
-FindImplementor-result Ref (passed as DoSend's arg1, mislabeled
-"meth" in the probe). The heap object at IPA 0x0c643c9c has
-its first word = 2, so it's not a frame.
-
-The methodName (DoSend's arg2, captured as `args=0x006840b4`) is
-the ROM symbol `RSSYMpunctuationcursiveoption` at 0x006840b0.
-The receiver is `recv=0x0cd09020` (a heap frame). FindImplementor
-returned a non-frame for the `punctuationCursiveOption` slot —
-either the slot's value genuinely isn't a frame (so the NS code
-calling `recv:punctuationCursiveOption(arg)` is wrong about the
-type), or it's a wild value from corruption.
-
-iter-77 will probe FindImplementor + dump the heap object at
-0x0c643c9c to identify its actual NS type and decide which
-branch we're in.
-
-36/36 guest tests skipped per the maintenance note (probe-only
-addition: new HVC immediate + dispatch arms + log-only handler).
+<!-- iter-76 (DoSend entry probe + 16-entry ring buffer; pinned
+     caller_lr=0x002f0eac inside DoMessage; mis-decoded RefVars
+     so the captured addresses were slot pointers, not Refs.
+     iter-78 fixed the decoding.) pruned per auto-prune. See
+     `git log --grep="iter-76"`. -->
 
 <!-- iter-75 (added a ThrowExInterpreterWithSymbol entry probe —
      HVC #0x76 at 0x2f5810 — to walk past the ThrowRefException

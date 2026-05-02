@@ -8,6 +8,17 @@
 //! to hundreds of sends per second). Instead we keep the latest
 //! `CAP` entries and dump them when `evt.ex.fr.intrp;type.ref.frame`
 //! fires — that gives the call sequence leading to the bad send.
+//!
+//! iter-78: store the actual tagged Refs (the probe now does the
+//! correct double-indirection of `RefVar const&`) and dump each via
+//! `heap_check::log_ref` so the operator can immediately tell
+//! "this Ref is NIL", "this Ref points into the runtime heap", or
+//! "this Ref points at a ROM frame".
+//!
+//! Field naming follows DoSend's actual signature
+//! `DoSend(receiver, implementor, methodName, argc)` — iter-76's
+//! "args" slot was actually the methodName; iter-77's "meth" slot
+//! was actually the implementor (the FindImplementor result).
 
 use crate::kprintln;
 
@@ -17,8 +28,8 @@ const CAP: usize = 16;
 struct Entry {
     seq: u32,
     recv: u32,
+    impl_: u32,
     method: u32,
-    args: u32,
     argc: u32,
     caller_lr: u32,
 }
@@ -26,8 +37,8 @@ struct Entry {
 const EMPTY: Entry = Entry {
     seq: 0,
     recv: 0,
+    impl_: 0,
     method: 0,
-    args: 0,
     argc: 0,
     caller_lr: 0,
 };
@@ -36,10 +47,10 @@ static mut RING: [Entry; CAP] = [EMPTY; CAP];
 static mut WRITE_POS: usize = 0;
 static mut FILLED: usize = 0;
 
-pub fn record(seq: u32, recv: u32, method: u32, args: u32, argc: u32, caller_lr: u32) {
+pub fn record(seq: u32, recv: u32, impl_: u32, method: u32, argc: u32, caller_lr: u32) {
     // SAFETY: single-threaded EL2.
     unsafe {
-        RING[WRITE_POS] = Entry { seq, recv, method, args, argc, caller_lr };
+        RING[WRITE_POS] = Entry { seq, recv, impl_, method, argc, caller_lr };
         WRITE_POS = (WRITE_POS + 1) % CAP;
         if FILLED < CAP {
             FILLED += 1;
@@ -51,10 +62,11 @@ pub fn record(seq: u32, recv: u32, method: u32, args: u32, argc: u32, caller_lr:
 /// Called from the type-mismatch throw probe so the operator sees
 /// the call sequence that led to the bad send.
 ///
-/// For each entry, also dumps the receiver and implementor heap
-/// objects' first few words via stage-1-translated reads — that's
-/// where the type-mismatch evidence lives (the implementor's
-/// header word == 2 is exactly the trip-wire DoSend hits).
+/// For each entry, classifies each captured Ref via
+/// `heap_check::log_ref` (tag-decoded; for real-pointer Refs,
+/// reports heap-membership). When a Ref points into the runtime
+/// object heap, also dumps the first 8 words at the underlying
+/// address — that's where `objHeader / class / size` live.
 pub fn dump(label: &str) {
     // SAFETY: single-threaded EL2.
     let (filled, write_pos) = unsafe { (FILLED, WRITE_POS) };
@@ -63,40 +75,28 @@ pub fn dump(label: &str) {
         return;
     }
     kprintln!("dosend_ring ({}): last {} invocations (oldest first):", label, filled);
+    crate::heap_check::log_heap_bounds_once();
     let start = if filled < CAP { 0 } else { write_pos };
     for i in 0..filled {
         let idx = (start + i) % CAP;
         // SAFETY: single-threaded EL2.
         let e = unsafe { RING[idx] };
         kprintln!(
-            "  #{}: recv={:#010x} meth={:#010x} args={:#010x} argc={} caller_lr={:#010x}",
-            e.seq, e.recv, e.method, e.args, e.argc, e.caller_lr,
+            "  #{}: recv={:#010x} impl={:#010x} meth={:#010x} argc={} caller_lr={:#010x}",
+            e.seq, e.recv, e.impl_, e.method, e.argc, e.caller_lr,
         );
-        dump_heap_obj("    recv", e.recv);
-        dump_heap_obj("    meth (FindImplementor result)", e.method);
-        dump_heap_obj("    args (methodName symbol)", e.args);
+        classify_and_dump("    recv", e.recv);
+        classify_and_dump("    impl", e.impl_);
+        classify_and_dump("    meth", e.method);
     }
 }
 
-/// Dump the first 8 words of a heap object at the given Ref-tagged
-/// address. Skips the dump for non-pointer refs (low 2 bits != 00)
-/// and for addresses outside the readable RAM/ROM regions.
-fn dump_heap_obj(label: &str, ref_value: u32) {
-    if (ref_value & 0x3) != 0 {
-        kprintln!("{}: ref={:#010x} (immediate, not a pointer)", label, ref_value);
-        return;
-    }
-    if ref_value == 0 {
-        kprintln!("{}: ref=NULL", label);
-        return;
-    }
-    let addr = ref_value & !0x3;
-    kprintln!("{}: ref={:#010x} → header+words at {:#010x}:", label, ref_value, addr);
-    for off in 0..8u32 {
-        let p = addr.wrapping_add(off * 4);
-        let v = crate::guest_mem::read_word_va(p)
-            .or_else(|| crate::guest_mem::read_word_pa(p))
-            .unwrap_or(0xDEADBEEF);
-        kprintln!("      [{:+#04x}] @{:#010x} = {:#010x}", off * 4, p, v);
-    }
+/// Print a tag-classification for `ref_value`, and if it's a real
+/// pointer (heap or ROM), dump the structured object via
+/// `newton-objects`. ROM-resident pointers (e.g. a method-name
+/// symbol) are dumped just like heap-resident ones because Newton
+/// stores both as the same packed-object layout.
+fn classify_and_dump(label: &str, ref_value: u32) {
+    crate::heap_check::log_ref(label, ref_value);
+    crate::heap_check::dump_object("      ", ref_value);
 }

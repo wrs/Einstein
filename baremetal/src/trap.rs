@@ -3178,32 +3178,51 @@ fn handle_dosend_entry_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
     static SEQ: AtomicU32 = AtomicU32::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let r0 = ctx.x[0] as u32;  // receiver RefVar*
-    let r1 = ctx.x[1] as u32;  // methodName RefVar*
-    let r2 = ctx.x[2] as u32;  // args RefVar*
+    let r1 = ctx.x[1] as u32;  // implementor RefVar*
+    let r2 = ctx.x[2] as u32;  // methodName RefVar*
     let r3 = ctx.x[3] as u32;  // argc
     let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
     let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
     let mode = source_cpsr & 0x1F;
 
-    // Resolve the underlying NS Refs (one indirection past each RefVar).
-    let recv_ref = guest_mem::read_word_va(r0).unwrap_or(0xDEADBEEF);
-    let method_ref = guest_mem::read_word_va(r1).unwrap_or(0xDEADBEEF);
-    let args_ref = guest_mem::read_word_va(r2).unwrap_or(0xDEADBEEF);
+    // Resolve the underlying NS Refs. `RefVar const&` lowers to a
+    // pointer to a `RefVar`, which itself holds a `Ref*` slot
+    // pointer (see `IsInt__FRC6RefVar` @ 0x31c6c4: two `ldr r0,
+    // [r0]` chained). So **r{0,1,2} is the actual tagged Ref;
+    // iter-77 stopped at *r{0,1,2} and printed slot pointers as if
+    // they were Refs.
+    let recv_ref = read_ref_double(r0);
+    let impl_ref = read_ref_double(r1);
+    let method_ref = read_ref_double(r2);
 
-    crate::dosend_ring::record(seq, recv_ref, method_ref, args_ref, r3, lr);
+    crate::dosend_ring::record(seq, recv_ref, impl_ref, method_ref, r3, lr);
 
     // Throttle the live log: print the first 8 firings (early
     // boot context) and every 64th after that. The ring buffer
     // is the authoritative record.
     if seq < 8 || seq % 64 == 0 {
         kprintln!(
-            "DoSend #{}: recv={:#010x} meth={:#010x} args={:#010x} argc={} caller_lr={:#010x} sp={:#010x} mode={:#x}",
-            seq, recv_ref, method_ref, args_ref, r3, lr, sp, mode,
+            "DoSend #{}: recv={:#010x} impl={:#010x} meth={:#010x} argc={} caller_lr={:#010x} sp={:#010x} mode={:#x}",
+            seq, recv_ref, impl_ref, method_ref, r3, lr, sp, mode,
         );
     }
 
     // Emulate `mov ip, sp`.
     ctx.x[12] = sp as u64;
+}
+
+/// Resolve a `RefVar const&` (passed in a register as the address of
+/// a `RefVar`) to the underlying tagged Ref. Two indirections — first
+/// dereferences the `RefVar*` to get the slot pointer, second loads
+/// the Ref out of the slot. Returns `0xDEADBEEF` on a translation
+/// failure at either step (i.e. caller can still proceed but the
+/// printed value is obviously bogus).
+fn read_ref_double(refvar_ptr: u32) -> u32 {
+    let slot = match guest_mem::read_word_va(refvar_ptr) {
+        Some(s) => s,
+        None => return 0xDEADBEEF,
+    };
+    guest_mem::read_word_va(slot).unwrap_or(0xDEADBEEF)
 }
 
 fn handle_throw_ex_intrp_probe(ctx: &mut TrapContext) {
@@ -3212,8 +3231,13 @@ fn handle_throw_ex_intrp_probe(ctx: &mut TrapContext) {
 }
 
 /// Probe at `ThrowExInterpreterWithSymbol__FlRC6RefVar` entry
-/// (ROM 0x2f5810). r0 = symbol code (long, 0..N — index into the
-/// kernel's interpreter-exception name table), r1 = RefVar const&.
+/// (ROM 0x2f5810).
+///
+/// Signature: `(int errorCode, RefArg symbol)` — r0 is an integer
+/// error code (one of the kernel's interpreter-exception enum
+/// values, *not* a Ref), r1 is `RefVar const&` (i.e. address of
+/// a `RefVar` whose slot points at the offending Ref).
+///
 /// Captures the caller LR so we can identify which NS interpreter
 /// site (FastCall/FastSend/FindVar/SlowRun/SetupSend/...) requested
 /// the throw — there are 12 such call sites in the 717006 ROM.
@@ -3225,12 +3249,16 @@ fn handle_throw_ex_intrp_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
     let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
     let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
     let mode = source_cpsr & 0x1F;
-    let ref_value = guest_mem::read_word_va(r1).unwrap_or(0xDEADBEEF);
+    // r1 is `RefVar const&` — two indirections to reach the Ref.
+    let ref_value = read_ref_double(r1);
 
     kprintln!(
-        "ThrowExInterpreterWithSymbol #{}: sym={} (r0={:#010x}) r1={:#010x} *r1={:#010x} caller_lr={:#010x} sp={:#010x} mode={:#x}",
+        "ThrowExInterpreterWithSymbol #{}: errCode={} (r0={:#010x}) r1={:#010x} **r1={:#010x} caller_lr={:#010x} sp={:#010x} mode={:#x}",
         seq, r0 as i32, r0, r1, ref_value, lr, sp, mode,
     );
+    crate::heap_check::log_heap_bounds_once();
+    crate::heap_check::log_ref("  symbol", ref_value);
+    crate::heap_check::dump_object("    ", ref_value);
 
     // Dump the most-recent DoSend invocations so iter-76 can
     // identify the upstream NS-runtime caller that's about to
@@ -3269,15 +3297,18 @@ fn handle_throw_ref_exception_probe_with(ctx: &mut TrapContext, source_cpsr: u32
     let (buf, len) = read_cstr_at(r0, 64);
     let name = core::str::from_utf8(&buf[..len]).unwrap_or("<non-utf8>");
 
-    // r1 is `RefVar const&` — a pointer to a single Ref slot. Read the
-    // tagged ref so we can see *what* the offending value is (immediate
-    // int, pointer-to-something, magic constant, …).
-    let ref_value = guest_mem::read_word_va(r1).unwrap_or(0xDEADBEEF);
+    // r1 is `RefVar const&` — i.e. a pointer to a `RefVar` whose
+    // slot pointer (one further dereference) points at the actual
+    // tagged Ref. Two indirections.
+    let ref_value = read_ref_double(r1);
 
     kprintln!(
-        "ThrowRefException #{}: name={:?} (r0={:#010x}) r1={:#010x} *r1={:#010x} caller_lr={:#010x} sp={:#010x} mode={:#x}",
+        "ThrowRefException #{}: name={:?} (r0={:#010x}) r1={:#010x} **r1={:#010x} caller_lr={:#010x} sp={:#010x} mode={:#x}",
         seq, name, r0, r1, ref_value, lr, sp, mode,
     );
+    crate::heap_check::log_heap_bounds_once();
+    crate::heap_check::log_ref("  value", ref_value);
+    crate::heap_check::dump_object("    ", ref_value);
 
     // Emulate `mov ip, sp`.
     ctx.x[12] = sp as u64;

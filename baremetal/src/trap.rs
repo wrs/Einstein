@@ -1439,6 +1439,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::THROW_ENTRY_PROBE_HVC_IMM => {
             handle_throw_entry_probe(ctx);
         }
+        v if v == crate::rom_patches::THROW_REF_EXCEPTION_PROBE_HVC_IMM => {
+            handle_throw_ref_exception_probe(ctx);
+        }
         v if v == crate::rom_patches::PHYSBLOCK_ENTRY_PROBE_HVC_IMM => {
             handle_physblock_entry_probe(ctx);
         }
@@ -2071,6 +2074,11 @@ fn handle_und(ctx: &mut TrapContext) {
         }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::THROW_ENTRY_PROBE_HVC_IMM) => {
             handle_throw_entry_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::THROW_REF_EXCEPTION_PROBE_HVC_IMM) => {
+            handle_throw_ref_exception_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -3128,6 +3136,43 @@ fn handle_throw_entry_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
     kprintln!(
         "Throw #{}: name={:?} (r0={:#010x}) r1={:#010x} r2={:#010x} caller_lr={:#010x} sp={:#010x} mode={:#x}",
         seq, name, r0, r1, r2, lr, sp, mode,
+    );
+
+    // Emulate `mov ip, sp`.
+    ctx.x[12] = sp as u64;
+}
+
+fn handle_throw_ref_exception_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_throw_ref_exception_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+/// Probe at `ThrowRefException(char* name, RefVar const& value)` entry
+/// (ROM 0x2f5730). Captures the caller LR — i.e. the NewtonScript-
+/// runtime PC that constructed the type-mismatch throw — which the
+/// generic `Throw` probe can't see (it only fires from inside
+/// ThrowRefException's own `bl Throw` at 0x2f57f8). Pairs the name
+/// string and the RefVar pointer with the caller-PC bisect.
+fn handle_throw_ref_exception_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let r0 = ctx.x[0] as u32;
+    let r1 = ctx.x[1] as u32;
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+    let mode = source_cpsr & 0x1F;
+
+    let (buf, len) = read_cstr_at(r0, 64);
+    let name = core::str::from_utf8(&buf[..len]).unwrap_or("<non-utf8>");
+
+    // r1 is `RefVar const&` — a pointer to a single Ref slot. Read the
+    // tagged ref so we can see *what* the offending value is (immediate
+    // int, pointer-to-something, magic constant, …).
+    let ref_value = guest_mem::read_word_va(r1).unwrap_or(0xDEADBEEF);
+
+    kprintln!(
+        "ThrowRefException #{}: name={:?} (r0={:#010x}) r1={:#010x} *r1={:#010x} caller_lr={:#010x} sp={:#010x} mode={:#x}",
+        seq, name, r0, r1, ref_value, lr, sp, mode,
     );
 
     // Emulate `mov ip, sp`.

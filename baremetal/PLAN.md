@@ -17,27 +17,83 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-74):** boot now stops in a stage-2 permission-
-fault loop at guest PC=0x19a84 / 0x19ac0 (`stmia r0!, {r2,r3,r4}` /
-`stmia r0!, {r2,r3,r4,r5}` inside `DiagBootStub` at 0x1955c).
-ESR=0x9200004f ⇒ EC=0x24 (DABT from lower EL) WnR=1, DFSC=0x0F
-(permission fault, level 3). Repeats forever — the kernel's
-DataAbortHandler isn't clearing the fault, suggesting r0 points at
-a guest VA the kernel believes is writable but stage-2 has marked
-RO (most likely the ROM aperture or a kernel-globals page). Next:
-capture FAR_EL2 + the running task / guest-mode CPSR to identify
-the destination PA, then decide whether stage-2 needs to grow a
-new mapping or the kernel patch list needs to redirect the write.
+**Current goal (iter-75):** the actual stall iter-73 unblocked is
+the kernel's `UnhandledException` tripwire firing on
+`evt.ex.fr.intrp;type.ref.frame` thrown by the NewtonScript
+interpreter. iter-74 added a `ThrowRefException` entry probe
+(HVC #0x75 at 0x2f5730) that pinned the throw site one frame up:
+`ThrowExInterpreterWithSymbol__FlRC6RefVar` (0x2f5810), called
+from inside the interpreter with `*r1 = 0x0c643ca4` — a pointer
+ref (low 2 bits = 00) to a non-frame heap object. The interpreter
+expected a frame and got something else. Next: walk the SP_usr
+stack at the throw moment back to the FastOpXxx site that
+fetched the bad ref, identify the slot/protochain lookup that
+returned a non-frame, and decide whether (a) it's an upstream
+data corruption we caused or (b) genuine NS code expecting a
+frame slot that's missing.
 
 **Background (unchanged from iter-61):** boot used to reach a
-quiescent idle at the Newton splash with `newt`=RUN wedged in
+quiescent idle at the Newton splash with `newt` wedged in
 `InitTextWalker`. iter-70 cleared the splash wedge; iter-71's
 classifier added idiom recognizers but introduced a new wedge
-that iter-72 root-caused and fixed; iter-73 then forwarded FPA
-UNDs to the kernel's FPE emulator at 0x38d8dc, unblocking the
-TFrameSoundChannel codec path. Boot now drives most of the ROM
-init / sound subsystem before hitting the DiagBootStub stage-2
-perm fault.
+iter-72 root-caused and fixed; iter-73 forwarded FPA UNDs to the
+kernel's FPE emulator at 0x38d8dc, unblocking the TFrameSoundChannel
+codec path. Boot now reaches NewtonScript runtime: TSoundServer /
+TPSSManager / TNotebook / TNameServer / 27 kernel objects up,
+`newt` running NS code, several `evt.ex.fr.store` exceptions
+caught successfully, then `evt.ex.fr.intrp;type.ref.frame`
+escapes all handlers and trips UnhandledException.
+
+### Iteration 74: pin the type.ref.frame throw site
+
+#### Method
+
+Re-reading iter-73's "new stall" section showed it was wrong:
+the apparent abort loop at PC=0x19a84 / 0x19ac0 inside
+`DiagBootStub` is just normal demand-paging during a memory-fill
+loop (each `stmia r0!,{r2,r3,r4}` iteration faults on a fresh
+page, the RAM-perm-fault arm in `handle_data_abort` flips
+RO→RW+XN, the STM completes, ELR advances, loop continues).
+The trap log budget runs out at 500 lines and the boot keeps
+walking silently; the actual stall is much further in.
+
+Looking at the tail of `/tmp/iter73-boot.log`:
+
+```
+Throw #0..#4: name="evt.ex.fr.store" (caught somewhere)
+ThrowRefException #0: name="evt.ex.fr.intrp;type.ref.frame"
+                       *r1=0x0c643ca4  caller_lr=0x002f5878
+Throw #5..#7: name="evt.ex.fr.intrp;type.ref.frame"  (rethrown)
+*** invariant violation: kernel reached UnhandledException ***
+```
+
+Existing `Throw` probe (0x000B_00C8) only sees the throw inside
+`ThrowRefException`'s own `bl Throw` site at 0x2f57f8 — it can't
+walk back through the constructor's frame to identify which NS
+runtime function asked for the throw. Added a new probe at
+`ThrowRefException__FPcRC6RefVar` entry (0x2f5730), HVC #0x75,
+that captures r0 (name C-string), r1 (RefVar const&), and the
+banked LR (= return PC into the caller) at entry — plus
+dereferences `*r1` so we can see the offending Ref value.
+
+#### Result
+
+- Probe added (`THROW_REF_EXCEPTION_PROBE_HVC_IMM`,
+  `THROW_REF_EXCEPTION_PROBE_PC = 0x002F_5730`); single-shot
+  cold boot fires it once before the wedge.
+- `ThrowRefException #0: name="evt.ex.fr.intrp;type.ref.frame"
+  (r0=0x000afed8) r1=0x0cc77b50 *r1=0x0c643ca4
+  caller_lr=0x002f5878 sp=0x0cc77b4c mode=0x10`.
+- Caller PC 0x002f5878 = first insn after `bl ThrowRefException`
+  inside `ThrowExInterpreterWithSymbol__FlRC6RefVar` at 0x002f5810.
+  Disasm confirms: `2f586c..2f5874` is
+  `ldr r0,[pc,#24]; ldr r0,[r0]; bl ThrowRefException`.
+- Offending ref `*r1 = 0x0c643ca4`: low 2 bits = 00 ⇒ pointer
+  ref (`PtrRef`); the object lives in RAM at IPA 0x0c643ca4.
+  The interpreter expected a frame; the heap object isn't one.
+- 36/36 guest tests skipped per the maintenance note (probe-
+  only addition: new HVC immediate + dispatch + log-only handler,
+  no SBA/UND/DABT-path changes).
 
 ### Iteration 73: forward FPA UND to the guest's kernel FPE emulator
 
@@ -101,64 +157,24 @@ forward arm.
   TPSSManager / TPCKM / TCommManager / TNameServer / TSoundServer
   / TAlertEventHandler / TScreenDriver / TAppWorld(s) all
   populated. `TNotebook::InitToolbox` runs before the new stall.
-- New stall: stage-2 permission-fault loop at guest PC=0x19a84
-  / 0x19ac0 inside `DiagBootStub` (memory-fill loops,
-  `stmia r0!, {r2,r3,r4}` / `stmia r0!, {r2,r3,r4,r5}`). ESR
-  ISS bit[6] WnR=1, DFSC=0x0F = level-3 permission fault.
-  Iter-74 territory — no FAR_EL2 captured yet.
+- New stall: kernel `UnhandledException` tripwire fires on
+  `evt.ex.fr.intrp;type.ref.frame` thrown by the NewtonScript
+  interpreter (chain: `ThrowRefException` → `Throw` ×3 levels of
+  rethrow through `Run` → `DoCall`). iter-74 territory.
+  (The earlier-suspected "stage-2 perm fault loop at PC=0x19a84"
+  was a misread: that's normal demand-paging on `DiagBootStub`'s
+  memory-fill loop — each STMIA iteration faults the next page,
+  the RAM-perm-fault arm flips it RW+XN, and boot walks on. The
+  trap log budget ran out at 500 lines and hid the actual wedge
+  ~600 lines later.)
 
-### Iteration 72: classify-rom — fn-range clamp on unbounded PC-rel switch
-
-#### Method
-
-Cold-boot wedged at `ELR=0xffffe4 SPSR=0x80000197` (ABT mode),
-~18 M HVC #DIAG_TAG firings/run. `FAR_EL1` upper half (=IFAR)
-held `0xe7f848f4` — an SBA UDF-marker encoding (slot 0x484), not
-an address. Lower half (DFAR) `0x0c10fc2e`. `LR_abt =
-0xe7f848f8` = UDF marker for slot 0x488. Suggested an iter-69-
-class regression: a literal-pool / function-pointer slot was
-being patched as code.
-
-Diagnostic: dumped `SBA_ORIG_PC[0x484..=0x488]`. Slot 0x484/0x485
-were real STRBs at 0x3ad370/0x3ad374 (legitimate). Slots
-0x486/0x487/0x488 were at 0x3ad580/0x3ad584/0x3ad58c, with
-`orig_insn` values `0x003adbb4 / 0x003adedc / 0x003adcb0` — i.e.
-*ROM addresses*, not instructions. Cross-reference against
-`rom.dis` showed 0x3ad568..0x3ad5f4 is the SWIBoot handler-pointer
-table (35 entries, plus a few preceding-tail words). The
-classifier was walking those data words as code.
-
-Trace: in `tools/classify-rom/src/main.rs`,
-`enumerate_pc_rel_jump_table` (iter-71) seeds 64 worklist roots
-when no CMP bound is present. The dispatch in `DynArrayLeaf` at
-0x3ad4e4 (`add pc, pc, r1, lsl #2`) is unbounded; only ~14 case-
-body slots are real, so seeding 64 starting at 0x3ad4ec swept past
-the function's `mov pc, lr` at 0x3ad520 and into the data table at
-0x3ad568+. Three table entries decoded as byte-access shapes
-(LDRH / LDRSB), so `shadow_stub` patched them with UDF markers,
-corrupting the SWIBoot dispatch.
-
-Fix in `enumerate_pc_rel_jump_table`: thread `fn_ranges` through
-and clamp seeded slots to the containing function's end via
-`find_fn_range`. The cond-code emulator at 0x3add80 (the case
-iter-71 was added for) is inside SWIBoot (0x3ad698..0x3ae158);
-its 64-slot table at 0x3add88..0x3ade88 stays inside the fn
-range and continues to be enumerated correctly.
-
-#### Result
-
-- `byte-access-static.bitmap` popcount: 27913 → 27906 (-7,
-  removing the false-positive bits at 0x3ad580/0x3ad584/
-  0x3ad58c/0x3ad590/0x3ad5b4/0x3ad5bc/0x3ad5e8 inside the
-  SWIBoot pointer table).
-- `reach.bitmap` popcount: 2654975 → 2654939 (-36 words: the
-  data-table region 0x3ad568..0x3ad5f4 plus a few adjacent slots
-  inside DynArrayLeaf that were over-seeded).
-- Oracle ⊆ static invariant: 0 missing.
-- 36/36 guest tests pass.
-- Cold boot: wedge at PC=0xffffe4 is **gone**. Boot reaches the
-  iter-70 stall point (`unrecognised UND insn=0xed2dc203 at
-  PC=0xd2780` — VFP coprocessor opcode).
+<!-- iter-72 (classify-rom — fn-range clamp on unbounded PC-rel
+     switch in `enumerate_pc_rel_jump_table`; cleared the
+     0xffffe4 / SBA-UDF-marker-as-FAR wedge by stopping
+     iter-71's 64-slot enumeration from sweeping past
+     DynArrayLeaf's `mov pc, lr` into the SWIBoot pointer
+     table at 0x3ad568+. Bitmap deltas + walker clamp diff.)
+     pruned per auto-prune. See `git log --grep="iter-72"`. -->
 
 <!-- iter-71 (classify-rom — five idiom recognizers: TClassInfo
      trampoline walker, SVC fall-through, multi-insn case bodies

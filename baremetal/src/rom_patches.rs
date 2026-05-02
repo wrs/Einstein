@@ -1023,6 +1023,17 @@ pub const THROW_ENTRY_PROBE_HVC_IMM:     u32 = 0x6F;
 pub const THROW_ENTRY_PROBE_PC:          u32 = 0x000B_00C8;
 const THROW_ENTRY_FIRST_INSN:            u32 = 0xE1A0_C00D; // mov ip, sp
 
+/// `ThrowRefException__FPcRC6RefVar` entry at ROM `0x002F_5730` —
+/// the NewtonScript-runtime helper that constructs a frame-typed
+/// exception (e.g. `type.ref.frame`) and forwards to `Throw`. Iter-74
+/// captures the entry LR (= caller PC inside the NS interpreter)
+/// because the existing `THROW_ENTRY_PROBE` only sees the
+/// ThrowRefException-internal `bl Throw`, not the NS interpreter
+/// site that requested the throw.
+pub const THROW_REF_EXCEPTION_PROBE_HVC_IMM: u32 = 0x75;
+pub const THROW_REF_EXCEPTION_PROBE_PC:      u32 = 0x002F_5730;
+const THROW_REF_EXCEPTION_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
+
 /// `PhysBlock__11TFlashBlockFv` first insn at ROM `0x000c_0cc4`.
 /// Iter-43 pinned the `evt.ex.abt.bus` original throw to the
 /// `bl PhysBlock` site at 0xc0cb8 (caller_lr=0xc0cbc). The fault
@@ -1575,6 +1586,14 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(THROW_ENTRY_PROBE_HVC_IMM),
             "Throw entry (log every kernel exception throw)",
             THROW_ENTRY_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            THROW_REF_EXCEPTION_PROBE_PC,
+            THROW_REF_EXCEPTION_FIRST_INSN,
+            hvc_insn(THROW_REF_EXCEPTION_PROBE_HVC_IMM),
+            "ThrowRefException entry (capture NS interpreter caller PC)",
+            THROW_REF_EXCEPTION_PROBE_HVC_IMM,
         );
         patch_probe(
             rom_ptr,

@@ -488,9 +488,16 @@ fn enumerate_pc_rel_jump_table(
     words: &[u32],
     pc_of_dispatch: u32,
     prev_w: u32,
+    fn_ranges: &[(u32, u32)],
     worklist: &mut Vec<u32>,
 ) -> usize {
     const MAX_ENTRIES: usize = 256;
+    // Without a CMP bound, cap iteration at MAX_UNBOUNDED slots so
+    // runaway walks can't pull adjacent data into the reach set.
+    // 64 × 4 = 256 bytes covers the multi-insn switches observed in
+    // the Newton ROM (e.g. 16 × 16-byte case bodies for the cond-
+    // code emulator at 0x3add80).
+    const MAX_UNBOUNDED: usize = 64;
     // If the preceding insn is `CMP Rn, #imm` (cond=AL, opcode CMP=0xA,
     // S=1, imm form), the dispatch handles indices 0..=imm so the table
     // has imm+1 entries. CMP encoding: 0xE35Riiii where R is Rn.
@@ -509,12 +516,29 @@ fn enumerate_pc_rel_jump_table(
             None
         }
     };
-    let limit = bounded_size.unwrap_or(MAX_ENTRIES).min(MAX_ENTRIES);
+    let limit = bounded_size
+        .unwrap_or(MAX_UNBOUNDED)
+        .min(MAX_ENTRIES);
+    // Iter-72 fix: clamp seeding to the containing function's range.
+    // For DynArrayLeaf (0x3ad4e4..0x3ad524), the dispatch at 0x3ad4e4
+    // is followed by 14 case-body insns ending in `mov pc, lr`; data
+    // starts at 0x3ad568. Without a CMP bound and without a function-
+    // boundary clamp, the unbounded 64-slot seeding walked into the
+    // SWIBoot handler-pointer table at 0x3ad568..0x3ad5f4, classifying
+    // those data words as code and producing UDF-marker corruption at
+    // 0x003ad580/0x003ad584/0x003ad58c (slots 0x486/0x487/0x488 in the
+    // SBA site table). The cond-code emulator at 0x3add80 still works
+    // because its containing function (SWIBoot, 0x3ad698..0x3ae158) is
+    // large enough to fully contain its 64-slot table.
+    let fn_end = find_fn_range(fn_ranges, pc_of_dispatch).map(|(_, e)| e);
     let mut tbl = pc_of_dispatch.wrapping_add(8);
     let mut count = 0usize;
     for _ in 0..limit {
         if (tbl as usize) + 4 > ROM_SIZE_BYTES { break; }
         if tbl & 3 != 0 { break; }
+        if let Some(end) = fn_end {
+            if tbl >= end { break; }
+        }
         let w = words[(tbl >> 2) as usize];
         // Each 4-byte slot is one of:
         //   1. Branch (B/BL/Bcc): single-insn handler; seed target.
@@ -522,22 +546,15 @@ fn enumerate_pc_rel_jump_table(
         //      single-insn early-return / register jump.
         //   3. Non-terminal: a switch with fallthrough — the slot
         //      is the first instruction of a multi-insn handler
-        //      that falls through into its own continuation. Only
-        //      legal when the table is bounded (e.g. `cmp r3, #7`
-        //      pinning size at 8); seeding `tbl` as a worklist
-        //      root lets the walker walk the body until natural
-        //      Stop. Without bounded_size we don't know where the
-        //      table ends, so fall back to the legacy "stop at
-        //      first non-terminal" rule to avoid walking off into
-        //      adjacent code.
+        //      that falls through into its own continuation. Seed
+        //      `tbl` as a worklist root and let the walker walk
+        //      the body until its natural epilogue.
         let is_branch = ((w >> 25) & 0b111) == 0b101 && ((w >> 28) & 0xF) != 0xF;
         if is_branch {
             let imm24 = w & 0xFFFFFF;
             let simm = sign_extend(imm24, 24) << 2;
             let target = tbl.wrapping_add(8).wrapping_add(simm as u32);
             worklist.push(target);
-        } else if !is_pc_write(w) && bounded_size.is_none() {
-            break;
         }
         worklist.push(tbl);
         count += 1;
@@ -689,9 +706,13 @@ fn step(w: u32, _pc: u32, manual_bl: bool, in_table: bool) -> Step {
         }
     }
 
-    // SWI (unconditional).
+    // SWI/SVC: kernel call that returns to PC+4. Walker must fall
+    // through — Newton's SWI-wrapper functions (e.g. SMemMsg…SWI at
+    // 0x3ae458) do bookkeeping after the SWI before their own `mov
+    // pc, lr` epilogue. Stopping at the SWI strands everything past
+    // it, including the actual return.
     if cond == 0xE && (w >> 24) & 0xF == 0xF {
-        return Step::Stop;
+        return Step::Continue { branch: None };
     }
 
     // UDF (A1 encoding family).
@@ -716,6 +737,8 @@ struct WalkStats {
     fnptr_literal_roots: usize,
     b_run_roots: usize,
     pc_rel_addr_roots: usize,
+    classinfo_roots: usize,
+    indexed_dispatch_roots: usize,
 }
 
 /// Walk from roots, closing over indirect-targets by scanning unreached
@@ -784,7 +807,9 @@ fn walk(
                 // breaking. Without this, the walker misses every case body
                 // reachable only through the dispatch.
                 if is_pc_rel_pc_dispatch(w) {
-                    enumerate_pc_rel_jump_table(words, cur, prev_w, &mut worklist);
+                    enumerate_pc_rel_jump_table(
+                        words, cur, prev_w, fn_ranges, &mut worklist,
+                    );
                 }
 
                 // Update table state for the next iteration: entering a
@@ -873,6 +898,12 @@ fn walk(
             words, &reach, &mut worklist, &mut stats,
         );
         new_roots += collect_pc_relative_addr_roots(
+            words, &reach, fn_ranges, &mut worklist, &mut stats,
+        );
+        new_roots += collect_classinfo_roots(
+            words, &reach, &mut worklist, &mut stats,
+        );
+        new_roots += collect_indexed_dispatch_roots(
             words, &reach, fn_ranges, &mut worklist, &mut stats,
         );
 
@@ -1015,22 +1046,33 @@ fn collect_pc_relative_addr_roots(
             .wrapping_add(imm_sign as i64 * imm as i64) as u32;
         if (target as usize) >= ROM_SIZE_BYTES { continue; }
         if target & 3 != 0 { continue; }
-        // Sound gate: only seed if Rd is later used as the base
-        // register of a runtime PC-write dispatch (`<dpop>cond pc,
-        // Rd, Rn, lsl #imm`) somewhere inside the same containing
-        // function. That distinguishes a code-table-base setup
-        // (BPNetEvaluate's `add sl, pc, #232` later feeding `add
-        // pc, sl, r9, lsl #4`) from a string-or-data pointer
-        // setup (REPStackTrace's `add r1, pc, #0xa4` which feeds a
-        // BL Print(...) — the pc-rel result there is an ASCII
-        // string, not a dispatch base).
+        // Two ways for the PC-rel computed address to be code:
+        //
+        //   (a) Dispatch-base setup: Rd is later used as the base
+        //       register of a runtime PC-write dispatch
+        //       (`<dpop>cond pc, Rd, Rn, lsl #imm`) inside the
+        //       same function — e.g. BPNetEvaluate's `add sl, pc,
+        //       #232` later feeding `add pc, sl, r9, lsl #4`.
+        //   (b) Function-pointer construction: the target word
+        //       itself is a function prologue. Newton emits this
+        //       when handing a small in-line handler off as an
+        //       argument — e.g. FPE init at 0x39264c does
+        //       `sub r1, pc, #0x2c` to point r1 at a 2-insn stub
+        //       (`mvn r0, #0; movs pc, lr`) that's never B-called
+        //       and has no 32-bit pointer reference anywhere.
+        //
+        // ASCII-string targets (REPStackTrace's `add r1, pc, #0xa4`)
+        // can't pass (b)'s prologue gate because ASCII top nibbles
+        // are 0x2..0x7, not 0xE.
+        let tw = words[(target >> 2) as usize];
+        if (tw >> 28) == 0xF { continue; }
+        let target_is_code = is_known_function_start(tw);
         let fn_range = match find_fn_range(fn_ranges, addr) {
             Some(r) => r,
             None => continue,
         };
-        if !is_used_as_dispatch_base(words, fn_range, rd, addr) { continue; }
-        let tw = words[(target >> 2) as usize];
-        if (tw >> 28) == 0xF { continue; }
+        let is_dispatch_base = is_used_as_dispatch_base(words, fn_range, rd, addr);
+        if !target_is_code && !is_dispatch_base { continue; }
         if reach.get_word(target) { continue; }
         if !seen.insert(target) { continue; }
         worklist.push(target);
@@ -1179,6 +1221,262 @@ fn collect_b_run_roots(
         i = j.max(i + 1);
     }
     stats.b_run_roots += added;
+    added
+}
+
+/// Recognize TClassInfo trampoline functions and walk the inline
+/// 60-byte struct that precedes them.
+///
+/// Newton's class metadata layout (TClassInfo, 15 longs = 60 bytes)
+/// terminates in a 4-instruction tail-stub:
+///
+///   sub  r0, pc, #68     ; r0 = struct_base = pc + 8 - 68
+///   mov  pc, lr          ; trampoline returns the struct's base PA
+///   mov  r0, #imm        ; alt entry: bail-out function returning <imm>
+///   mov  pc, lr          ;            (typically nil, i.e. imm == 0)
+///
+/// The 60 bytes preceding the trampoline are the struct itself, with
+/// these "Branch" fields holding inline `B method` slots:
+/// fSizeofBranch, fAllocBranch, fFreeBranch, fDefaultNewBranch,
+/// fDefaultDeleteBranch, fSelectorBranch, fReserved2. Each slot is
+/// either a real `B` to a method body, the inline `mov pc, lr` empty
+/// stub, or zero.
+///
+/// `collect_b_run_roots` catches dense runs of these (≥3 consecutive
+/// B-AL words), but isolated branches — most importantly the
+/// `B alt_entry` slot at +0x38 that points at the bail-out function —
+/// fall below that threshold and remain unreached. Recognising the
+/// trampoline pattern lets us seed the entire struct precisely.
+///
+/// The pattern is highly specific (4 exact instructions in sequence),
+/// so this scans the full ROM+REX rather than gating on already-
+/// reached code; a TClassInfo whose trampoline isn't a known symbol
+/// (3 such cases observed) is still discovered.
+fn collect_classinfo_roots(
+    words: &[u32],
+    reach: &Bitmap,
+    worklist: &mut Vec<u32>,
+    stats: &mut WalkStats,
+) -> usize {
+    const TRAMP_SUB_R0_PC_68: u32 = 0xE24F_0044;
+    const MOV_PC_LR: u32 = 0xE1A0_F00E;
+    const STRUCT_BYTES: u32 = 60;
+
+    let mut added = 0usize;
+    let mut seen: HashSet<u32> = HashSet::new();
+    let last = ROM_WORD_COUNT.saturating_sub(4);
+    let struct_words = (STRUCT_BYTES / 4) as usize;
+
+    for fn_idx in struct_words..last {
+        if words[fn_idx] != TRAMP_SUB_R0_PC_68 { continue; }
+        if words[fn_idx + 1] != MOV_PC_LR { continue; }
+        // Alt entry: `mov r0, #imm` (any 12-bit rotated imm).
+        let w_alt = words[fn_idx + 2];
+        if (w_alt & 0xFFFF_F000) != 0xE3A0_0000 { continue; }
+        if words[fn_idx + 3] != MOV_PC_LR { continue; }
+
+        let fn_pa = (fn_idx as u32) * 4;
+
+        // Seed the trampoline function itself — covers TClassInfo
+        // entries that aren't named in code-symbols.txt.
+        if !reach.get_word(fn_pa) && seen.insert(fn_pa) {
+            worklist.push(fn_pa);
+            added += 1;
+        }
+
+        // Scan the 60-byte struct for B-AL slots. Each one is a
+        // method-dispatch branch; seeding it lets the walker
+        // Step::Jump to the target. The B->alt_entry slot at +0x38
+        // naturally pulls in `fn + 8` this way.
+        let sb_idx = fn_idx - struct_words;
+        for k_off in 0..struct_words {
+            let w = words[sb_idx + k_off];
+            if (w >> 24) != 0xEA { continue; }
+            let pa = (sb_idx as u32 + k_off as u32) * 4;
+            if !reach.get_word(pa) && seen.insert(pa) {
+                worklist.push(pa);
+                added += 1;
+            }
+        }
+    }
+
+    stats.classinfo_roots += added;
+    added
+}
+
+/// Recognize the bounded indexed-dispatch idiom Newton uses for
+/// kernel SWI handlers (and similar opcode tables):
+///
+///   cmp  Rm, #N                ; bounds check
+///   b<cc> out_of_range         ; branch past the dispatch on overflow
+///   ldr  Rd, [pc, #±imm12]     ; Rd = literal-pool word = table base PA
+///   ldr  pc, [Rd, Rm, lsl #2]  ; pc = table[Rm]
+///
+/// Example: SWIBoot at 0x3ad698 dispatches `cmp r1, #35; bge out;
+/// ldr r0, [pc, #-488]; ldr pc, [r0, r1, lsl #2]` — the table at
+/// 0x3ad56c..0x3ad5f4 holds 35 SWI handler PAs. The handlers are
+/// reachable only through this idiom (not via B-AL runs, vtables,
+/// or LDR-pc-rel literal pools), so the walker has to follow it
+/// explicitly.
+///
+/// Walker action:
+///   1. At each LDR pc, [Rn, Rm, lsl #2] in reached code, look
+///      backwards (within the containing function) for an
+///      LDR Rn, [pc, #±imm] that loads the table base, and a
+///      `cmp Rm, #imm` plus its conditional branch that bounds
+///      the index range.
+///   2. Decode the table base from the literal pool, map the
+///      conditional-branch type to an entry count (BGE/BHS/BCS:
+///      count = imm; BGT/BHI: count = imm + 1).
+///   3. For each in-range entry, validate the target is a
+///      prologue-shaped function and seed it.
+fn collect_indexed_dispatch_roots(
+    words: &[u32],
+    reach: &Bitmap,
+    fn_ranges: &[(u32, u32)],
+    worklist: &mut Vec<u32>,
+    stats: &mut WalkStats,
+) -> usize {
+    let mut added = 0usize;
+    let mut seen: HashSet<u32> = HashSet::new();
+    for addr_idx in 0..ROM_WORD_COUNT {
+        let addr = (addr_idx as u32) * 4;
+        if !reach.get_word(addr) { continue; }
+        let w = words[addr_idx];
+        // LDR pc, [Rn, Rm, lsl #2], cond=AL, P=1 U=1 B=0 W=0 L=1.
+        // Encoding: cond | 011 | P U B W L | Rn | Rt | shift_imm | type | 0 | Rm.
+        // Required bit fields (top byte): 0xE7 (cond=AL, 011 P=1).
+        if (w >> 28) != 0xE { continue; }
+        if (w >> 25) & 0b111 != 0b011 { continue; }
+        if (w >> 24) & 1 != 1 { continue; }    // P=1 (pre-indexed)
+        if (w >> 23) & 1 != 1 { continue; }    // U=1 (positive offset)
+        if (w >> 22) & 1 != 0 { continue; }    // B=0 (word access)
+        if (w >> 21) & 1 != 0 { continue; }    // W=0
+        if (w >> 20) & 1 != 1 { continue; }    // L=1 (load)
+        if (w >> 12) & 0xF != 0xF { continue; } // Rt = pc
+        if (w >> 4) & 1 != 0 { continue; }     // immediate-shift form
+        if (w >> 5) & 0b11 != 0b00 { continue; } // LSL
+        if (w >> 7) & 0b11111 != 2 { continue; } // shift_imm = 2 (4-byte stride)
+        let rn = (w >> 16) & 0xF;
+        let rm = w & 0xF;
+        if rn == 15 || rm == 15 { continue; }
+
+        let fn_range = match find_fn_range(fn_ranges, addr) {
+            Some(r) => r,
+            None => continue,
+        };
+        let start_idx = (fn_range.0 >> 2) as usize;
+
+        // Walk back up to 16 instructions, finding:
+        //   - LDR Rn, [pc, #±imm12] that loaded the table base.
+        //   - CMP Rm, #imm that bounded the index.
+        //   - The conditional branch immediately following the CMP
+        //     (its cond field tells us count = imm or imm+1).
+        let mut table_base: Option<u32> = None;
+        let mut cmp_imm: Option<u32> = None;
+        let mut bound_cond: Option<u32> = None;
+        for back in 1..=16u32 {
+            let pa = match addr.checked_sub(back * 4) { Some(p) => p, None => break };
+            if ((pa >> 2) as usize) < start_idx { break; }
+            let pw = words[(pa >> 2) as usize];
+
+            if table_base.is_none() {
+                let top = pw >> 16;
+                let imm_sign: i32 = match top {
+                    0xE59F => 1,
+                    0xE51F => -1,
+                    _ => 0,
+                };
+                if imm_sign != 0 && (pw >> 12) & 0xF == rn {
+                    let imm12 = (pw & 0xFFF) as i32;
+                    let lit_pc = (pa as i64) + 8 + (imm_sign as i64 * imm12 as i64);
+                    if lit_pc >= 0
+                        && (lit_pc as usize) + 4 <= ROM_SIZE_BYTES
+                        && (lit_pc as u32) & 3 == 0
+                    {
+                        let v = words[(lit_pc as usize) >> 2];
+                        if (v as usize) < ROM_SIZE_BYTES && v & 3 == 0 {
+                            table_base = Some(v);
+                        }
+                    }
+                }
+            }
+
+            if cmp_imm.is_none() {
+                // CMP Rm, #imm: cond=AL, opcode=0xA, S=1, I=1, Rn=rm.
+                let cond = (pw >> 28) & 0xF;
+                let opcode = (pw >> 21) & 0xF;
+                let s_bit = (pw >> 20) & 1;
+                let bit25 = (pw >> 25) & 1;
+                let rn_cmp = (pw >> 16) & 0xF;
+                if cond == 0xE && opcode == 0xA && s_bit == 1 && bit25 == 1 && rn_cmp == rm {
+                    let rot = ((pw >> 8) & 0xF) * 2;
+                    let val8 = pw & 0xFF;
+                    cmp_imm = Some(val8.rotate_right(rot));
+                    // The conditional branch immediately after the
+                    // CMP carries the polarity. Search forward 1..4
+                    // insns from the CMP for a B<cond> with the
+                    // expected cc.
+                    for fwd in 1..=4u32 {
+                        let bpa = pa.wrapping_add(fwd * 4);
+                        if bpa >= addr { break; }
+                        let bw = words[(bpa >> 2) as usize];
+                        if (bw >> 25) & 0b111 == 0b101 && (bw >> 24) & 1 == 0 {
+                            // Unconditional B (cond=AL) is the
+                            // out-of-range branch only if cc came
+                            // earlier; skip it here.
+                            let bcond = (bw >> 28) & 0xF;
+                            if bcond != 0xE && bcond != 0xF {
+                                bound_cond = Some(bcond);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if table_base.is_some() && cmp_imm.is_some() { break; }
+        }
+
+        let (tbl, imm, cc) = match (table_base, cmp_imm, bound_cond) {
+            (Some(t), Some(i), Some(c)) => (t, i, c),
+            _ => continue,
+        };
+
+        // Map condition to entry count. b<cc> branches OUT of the
+        // dispatch; the cc tells us when "out" applies.
+        //   GE (0xA), HS=CS (0x2): out when Rm ≥ N → count = N
+        //   GT (0xC), HI    (0x8): out when Rm > N → count = N + 1
+        // Other ccs (LT/LS/LO/MI/EQ/NE/...) indicate a non-bound
+        // pattern; skip.
+        let count = match cc {
+            0xA | 0x2 => imm as usize,
+            0xC | 0x8 => imm as usize + 1,
+            _ => continue,
+        };
+        const MAX_TABLE: usize = 1024;
+        let count = count.min(MAX_TABLE);
+
+        for i in 0..count {
+            let entry_pa = tbl.wrapping_add((i as u32) * 4);
+            if (entry_pa as usize) + 4 > ROM_SIZE_BYTES { break; }
+            let entry_val = words[(entry_pa >> 2) as usize];
+            let final_tgt = match resolve_target_to_rom(words, entry_val) {
+                Some(t) => t,
+                None => continue,
+            };
+            let tgt_idx = (final_tgt >> 2) as usize;
+            let tgt_word = words[tgt_idx];
+            if (tgt_word >> 28) == 0xF { continue; }
+            if !is_known_function_start(tgt_word) { continue; }
+            if !reach.get_word(final_tgt) && seen.insert(final_tgt) {
+                worklist.push(final_tgt);
+                added += 1;
+            }
+        }
+    }
+
+    stats.indexed_dispatch_roots += added;
     added
 }
 
@@ -1369,6 +1667,8 @@ fn run(args: Args) -> Result<(), String> {
     writeln!(f, "    fnptr literal roots added: {}", stats.fnptr_literal_roots).ok();
     writeln!(f, "    B-run dispatch roots added: {}", stats.b_run_roots).ok();
     writeln!(f, "    PC-rel addr roots added:    {}", stats.pc_rel_addr_roots).ok();
+    writeln!(f, "    TClassInfo struct roots:    {}", stats.classinfo_roots).ok();
+    writeln!(f, "    indexed-dispatch roots:     {}", stats.indexed_dispatch_roots).ok();
     writeln!(f, "    total indirect roots added: {}", stats.indirect_roots_added).ok();
     writeln!(f, "    reachable-code popcount: {}", reach.popcount()).ok();
     writeln!(f, "  byte-access-static.bitmap popcount = {}", ba_static.popcount()).ok();

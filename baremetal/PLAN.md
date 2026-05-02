@@ -17,224 +17,203 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-71):** boot now wedges on an unrecognised
-AArch32 coprocessor instruction:
-
-```
-*** unrecognised UND: insn=0xed2dc203 at PC=0xd2780 SPSR_und=0x60000110
-    (extend handle_und in trap.rs to handle this opcode)
-```
-
-`0xed2dc203` decodes as `STC2 p2, c12, [sp, #-12]!` (or similar
-coprocessor 2 store) — VFP/floating-point register save state
-emitted as part of the kernel's FPU context-switch path that the
-ROM 717006 expects to be handled by an FPU emulator. Newton ROM's
-`FP_UndefHandlers_*` (now reachable, see iter-70) intercepts FPU
-instructions; this opcode either falls through that handler or is
-emitted by code outside the FPU emulation entry point.
-
-iter-71 plan: identify the call chain landing at PC=0xd2780,
-determine which FPU/coprocessor opcode family the ROM uses for
-context save/restore, and either widen the trap.rs UND classifier
-to forward the matching opcodes into the ROM's FP handler, or
-implement a hypervisor-side stub if the ROM doesn't have one.
-
-**iter-70 result:** classify-rom walker bugs fixed; the iter-69
-wedge at `InitTextWalker → 0x35c49c` is gone. Boot progresses far
-past the splash — NewBlock #793 allocations, `ExtendVMHeap`
-firing, sound driver initialising at `PC=0x8011dc` — before
-hitting the new VFP-stub stall.
+**Current goal (iter-73):** boot now stops with `unrecognised
+UND insn=0xed2dc203 at PC=0xd2780 SPSR_und=0x60000110` — a VFP
+coprocessor opcode the UND classifier doesn't decode. Same stall
+iter-70 reached before iter-71's classifier regression buried it
+under the abort loop. Next: extend `handle_und` (or the
+unaligned-fault classifier) to recognise the VFP encoding family
+and either emulate, NOP, or HVC-forward as appropriate.
 
 **Background (unchanged from iter-61):** boot used to reach a
 quiescent idle at the Newton splash with `newt`=RUN wedged in
-`InitTextWalker`. Now boot pushes well into kernel-driver init
-before stalling on the FP coprocessor opcode above.
+`InitTextWalker`. After iter-70 the splash wedge was cleared;
+iter-71's classifier added more code-discovery idioms but
+inadvertently regressed boot to an InitKernelDomainAndEnvironment-
+era abort loop (iter-72 root-caused and fixed). Boot now reaches
+the iter-70 stall point.
 
-### Iteration 70: classify-rom walker fixes — wedge cleared
+### Iteration 72: classify-rom — fn-range clamp on unbounded PC-rel switch
 
 #### Method
 
-Two fix paths from iter-69's plan: (1) fix `tools/classify-rom`
-or (2) runtime guard in `shadow_stub::patch_one_site`. Walter's
-note "the classifier bitmap needs to be perfect, so let's at
-least fix all known bugs" extended the scope to the full set of
-walker reachability gaps revealed by the oracle ⊆ static
-invariant check.
+Cold-boot wedged at `ELR=0xffffe4 SPSR=0x80000197` (ABT mode),
+~18 M HVC #DIAG_TAG firings/run. `FAR_EL1` upper half (=IFAR)
+held `0xe7f848f4` — an SBA UDF-marker encoding (slot 0x484), not
+an address. Lower half (DFAR) `0x0c10fc2e`. `LR_abt =
+0xe7f848f8` = UDF marker for slot 0x488. Suggested an iter-69-
+class regression: a literal-pool / function-pointer slot was
+being patched as code.
 
-Four walker fixes in `tools/classify-rom/src/main.rs`:
+Diagnostic: dumped `SBA_ORIG_PC[0x484..=0x488]`. Slot 0x484/0x485
+were real STRBs at 0x3ad370/0x3ad374 (legitimate). Slots
+0x486/0x487/0x488 were at 0x3ad580/0x3ad584/0x3ad58c, with
+`orig_insn` values `0x003adbb4 / 0x003adedc / 0x003adcb0` — i.e.
+*ROM addresses*, not instructions. Cross-reference against
+`rom.dis` showed 0x3ad568..0x3ad5f4 is the SWIBoot handler-pointer
+table (35 entries, plus a few preceding-tail words). The
+classifier was walking those data words as code.
 
-1. **Manual-BL `in_table` bug (root cause for iter-69).** When the
-   walker saw `mov lr, pc; ldr pc, [...]` (Newton's manual-BL
-   idiom), `step()` correctly returned `Continue` but the
-   `in_table` update flagged the LDR-PC as a jump-table dispatch.
-   The next instruction — typically the function's own `ldmdb fp,
-   {…pc}` epilogue — was then misinterpreted as a "default-case
-   return" inside an imaginary table, so the walker walked past
-   the epilogue and into the literal pool. Words there that
-   happened to decode as byte-access shapes (e.g. `0x01b494f4`
-   ≅ LDRSH) got marked, then patched with UDF stubs, then read
-   *as data* by the LDR-pc-rel that originally loaded the
-   constant. Fix: gate `in_table = true` on `!prev_sets_lr`.
+Trace: in `tools/classify-rom/src/main.rs`,
+`enumerate_pc_rel_jump_table` (iter-71) seeds 64 worklist roots
+when no CMP bound is present. The dispatch in `DynArrayLeaf` at
+0x3ad4e4 (`add pc, pc, r1, lsl #2`) is unbounded; only ~14 case-
+body slots are real, so seeding 64 starting at 0x3ad4ec swept past
+the function's `mov pc, lr` at 0x3ad520 and into the data table at
+0x3ad568+. Three table entries decoded as byte-access shapes
+(LDRH / LDRSB), so `shadow_stub` patched them with UDF markers,
+corrupting the SWIBoot dispatch.
 
-2. **PC-relative jump-table dispatch.** `add pc, pc, Rn[, shift]`
-   patterns (FPU undef-handler dispatchers and similar) had
-   `step()` returning `Stop` because no fall-through target was
-   computable; the walker never enumerated the B-AL run that
-   followed. Fix: `is_pc_rel_pc_dispatch` + explicit
-   `enumerate_pc_rel_jump_table` that pushes each `B target` to
-   the worklist starting at `pc + 8`.
-
-3. **Function-pointer literal harvest.** Functions reached only
-   through indirect calls where a function pointer is loaded by
-   `LDR Rt, [pc, #±imm]` and *passed by reference* (not stored
-   into `[r0, #0]`, so `collect_vtable_roots` misses) — e.g. the
-   constructor-pointer arg to `__vc__FPvT1iPFPv_v` — were
-   unreachable. Fix: `collect_fnptr_literal_roots` scans every
-   reached PC-rel LDR, reads the literal, and seeds it as a
-   worklist root if the target word is prologue-shaped.
-
-4. **Consecutive-B-AL dispatch table harvest.** REX `FDRV` /
-   `pkgl` class-info structures embed N≥3 adjacent unconditional
-   `B`s as method dispatch stubs (e.g. PA 0x800460..0x800530,
-   17 entries). The walker can't reach them through any
-   recognised symbol; `rex_header_roots`'s function-pointer
-   filter rejects them because their value (`0xEAxxxxxx`) lies
-   outside ROM. Fix: `collect_b_run_roots` scans the full ROM+REX
-   for runs of ≥3 consecutive B-AL words and seeds each entry's
-   branch target. Threshold of 3 keeps accidental top-byte-0xEA
-   data words from generating false positives.
+Fix in `enumerate_pc_rel_jump_table`: thread `fn_ranges` through
+and clamp seeded slots to the containing function's end via
+`find_fn_range`. The cond-code emulator at 0x3add80 (the case
+iter-71 was added for) is inside SWIBoot (0x3ad698..0x3ae158);
+its 64-slot table at 0x3add88..0x3ade88 stays inside the fn
+range and continues to be enumerated correctly.
 
 #### Result
 
-- `byte-access-static.bitmap` popcount: 27799 → 27818 (+19 net;
-  +35 added by reaching new code, –35 removed by the literal-pool
-  fix — coincidental wash; popcount is not a useful signal for
-  this fix).
-- 0x35c49c bit cleared — iter-69's corruption site is no longer
-  in the bitmap.
-- All 12 oracle ⊆ static invariant violations resolved (oracle
-  popcount = static popcount intersection = 2155, missing = 0).
+- `byte-access-static.bitmap` popcount: 27913 → 27906 (-7,
+  removing the false-positive bits at 0x3ad580/0x3ad584/
+  0x3ad58c/0x3ad590/0x3ad5b4/0x3ad5bc/0x3ad5e8 inside the
+  SWIBoot pointer table).
+- `reach.bitmap` popcount: 2654975 → 2654939 (-36 words: the
+  data-table region 0x3ad568..0x3ad5f4 plus a few adjacent slots
+  inside DynArrayLeaf that were over-seeded).
+- Oracle ⊆ static invariant: 0 missing.
 - 36/36 guest tests pass.
-- Cold boot: wedge at 0x35c49c is **gone**. Boot advances through
-  many `NewBlock` allocations, `ExtendVMHeap` firings, and the
-  sound driver's first subfn dispatch (PC=0x8011dc — REX code
-  reachable via fix 4). New stall is `unrecognised UND
-  insn=0xed2dc203 at PC=0xd2780` — a VFP coprocessor opcode the
-  hypervisor's UND classifier doesn't know about.
+- Cold boot: wedge at PC=0xffffe4 is **gone**. Boot reaches the
+  iter-70 stall point (`unrecognised UND insn=0xed2dc203 at
+  PC=0xd2780` — VFP coprocessor opcode).
+
+### Iteration 71: classify-rom — five idiom recognizers
+
+#### Method
+
+Iteration over the unreached-words dump of `classify/<hash>/
+reach.bitmap`. Each chunk traced back to a specific compiler-
+emitted idiom the walker didn't follow. Five fixes in
+`tools/classify-rom/src/main.rs`, each pinned to the idiom — no
+content-shape heuristics. (A "scan for runs of code-pointer-shaped
+values" attempt earlier in iter-71 contaminated the bitmap with
++22311 false-positive byte-access bits and was reverted in favour
+of the SWIBoot recognizer below.)
+
+1. **TClassInfo trampoline + struct walker.** Newton's class
+   metadata terminates in a 4-instruction tail-stub:
+
+   ```
+   sub  r0, pc, #68      ; return struct base
+   mov  pc, lr
+   mov  r0, #imm         ; alt entry: bail-out returning <imm>
+   mov  pc, lr
+   ```
+
+   The 60 bytes preceding the trampoline are the TClassInfo
+   struct (15 longs: `fReserved1..fReserved2`). The struct's
+   "Branch" fields are inline `B method` slots;
+   `collect_b_run_roots` already catches dense ≥3-in-a-row runs,
+   but the lone `fSelectorBranch` slot at +0x38 (a B into the
+   trampoline's alt entry at `fn + 8`) falls below that threshold
+   and was unreached for all 116 TClassInfo trampolines.
+   `collect_classinfo_roots` recognises the trampoline pattern
+   and seeds every B-AL slot in the inline struct.
+
+2. **SVC fall-through.** `step()` treated `SVC #imm` (cond=AL)
+   as `Step::Stop`, stranding everything past it. SWIs return to
+   PC+4; Newton's SWI-wrapper functions (e.g.
+   `SMemMsgCheckForDoneSWI` at 0x3ae458) do bookkeeping after
+   the SWI before their own `mov pc, lr` epilogue. Now Continue.
+
+3. **Multi-instruction case bodies in unbounded PC-rel
+   switches.** `enumerate_pc_rel_jump_table` previously broke at
+   the first non-terminal slot when no preceding `cmp Rn, #imm`
+   bounded the table. Newton's cond-code emulator at 0x3add80
+   dispatches `add pc, pc, r1, lsr #24` into a 16 × 16-byte case
+   body table without a CMP — every case body is `nop; tst r0,
+   #flag; bcc; b common`. Cap unbounded enumeration at
+   MAX_UNBOUNDED = 64 slots and seed each as a worklist root;
+   multi-insn bodies walk to their natural epilogues.
+
+4. **SWIBoot-style indexed dispatch.** Newton's kernel SWI
+   handler dispatch at SWIBoot+0xb4 (0x3ad74c):
+
+   ```
+   cmp r1, #35
+   bge out_of_range
+   ldr r0, [pc, #-488]      ; r0 = table_base
+   ldr pc, [r0, r1, lsl #2]
+   ```
+
+   The 35-handler table at 0x3ad56c..0x3ad5f4 is referenced only
+   through this idiom — no B-AL run, no vtable install, no
+   LDR-pc-rel literal, no static 32-bit pointer to any handler.
+   `collect_indexed_dispatch_roots` scans reached code for
+   `ldr pc, [Rn, Rm, lsl #2]`, walks back ≤16 insns within the
+   containing function for the LDR-Rn pc-rel that loaded the
+   base and the CMP-Rm that bounded the index, and maps the
+   conditional-branch type to an entry count (BGE/BHS/BCS → N;
+   BGT/BHI → N+1).
+
+5. **PC-rel function-pointer construction.**
+   `collect_pc_relative_addr_roots` previously gated solely on
+   `is_used_as_dispatch_base` — only seeded if Rd was later the
+   base of a runtime PC-write dispatch. That gate was added to
+   keep ASCII-string `add r1, pc, #imm` setups from contaminating
+   adjacent text. New parallel gate: also seed when the target
+   word itself is a function prologue. Catches cases like FPE
+   init at 0x39264c — `sub r1, pc, #0x2c` to point r1 at a
+   2-insn stub (`mvn r0, #0; movs pc, lr`) handed off as a
+   callback. ASCII top nibbles are 0x2-0x7, never 0xE, so
+   `is_known_function_start` rules string-pointer setups out
+   structurally — no heuristic threshold required.
+
+#### Result
+
+- `byte-access-static.bitmap` popcount: 27897 → 27913 (+16: +9
+  byte-class bits past SVCs, +7 halfword/signed bits in
+  newly-walked switch bodies).
+- `reach.bitmap` popcount: 2,653,975 → 2,654,975 (+~1000).
+- Oracle ⊆ static invariant: 0 missing.
+- 116/116 TClassInfo trampolines fully reached (fn_start, alt
+  entry, every B-AL struct slot).
+- 35/35 SWIBoot handler targets reached; SMemMsg…SWI-style
+  wrappers walk to their epilogues; cond-emulator switch at
+  0x3add80 reaches all 16 case bodies.
+- Remaining unreached chunks (e.g. 0x39276c FPE save/restore
+  handlers) have *no* static reference anywhere in reached code
+  — they are runtime-installed via memory writes, which static
+  analysis fundamentally can't follow. Correct behaviour, not
+  a classifier gap.
+- 36/36 guest tests pass.
 
 #### Walker stats (post-fix)
 
 ```
-words walked (with revisits):  851531  (was 829504 pre-fix)
-fnptr literal roots added:        389
-B-run dispatch roots added:       470
-total indirect roots added:       859
+fnptr literal roots added:      395
+B-run dispatch roots added:    9379
+PC-rel addr roots added:        222
+TClassInfo struct roots:        460
+indexed-dispatch roots:          34
+total indirect roots added:   10487
+reachable-code popcount:    2654975
 ```
 
-### Iteration 69: ROOT CAUSE — classify-rom + shadow_stub corrupt a function-pointer literal
+<!-- iter-70 (classify-rom walker fixes that cleared the iter-69
+     literal-pool corruption; bitmap deltas / four walker fixes
+     in tools/classify-rom/src/main.rs) pruned per auto-prune.
+     See `git log --grep="iter-70"`. iter-71 superseded its
+     surface (added more idiom recognizers); iter-72 superseded
+     iter-71's regression. -->
 
-#### Method
-
-iter-69 added a one-shot probe in `trap::return_to_guest_from_und`
-to log the first time the UND_RETURN_STUB literal at 0xFFFFEC
-was set to a value inside the trampoline region (testing the
-iter-68 self-loop hypothesis). **The probe never fired** —
-falsifying iter-68 too.
-
-The breakthrough came from a different direction: cross-checking
-periodic dumps that caught newt outside the wedge state. One
-single dump captured newt in **USR mode** (mode=0x10) instead of
-the usual ABT-mode wedge:
-
-```
-current task 0xc12391c (newt) id=0x3113 mode=0x10
-  [pc=0xe7f842f0 lr=0x35c498 sp=0xcc7787c fp=0xcc77894]
-```
-
-`PC = 0xe7f842f0` and `LR_usr = 0x35c498`. This is the moment of
-the *first* PABT, before the kernel handler is even reached.
-
-#### Identifying the call site
-
-`LR = 0x35c498` is the return address from a function call ending
-just before that. Disasm of `InitTextWalker` (0x35c41c..0x35c49c):
-
-```
-  35c460:  e59f0034   ldr r0, [pc, #52]   @ literal at 0x35c49c
-  35c464:  e1a01005   mov r1, r5
-  35c468:  e5840008   str r0, [r4, #8]    @ TextWalker.scanner = r0
-  …
-  35c490:  e1a0e00f   mov lr, pc          @ LR = 0x35c498
-  35c494:  e594f008   ldr pc, [r4, #8]    @ PC = TextWalker.scanner
-  35c498:  e91ba830   ldmdb fp, {…, pc}   @ epilogue (return target)
-  35c49c:  01b494f4                       @ literal: function pointer
-```
-
-So `*0x35c49c` is a function-pointer literal originally
-`0x01b494f4` (a JT-thunk address in 0x01A00000..0x01C20000). The
-disassembler misleadingly labels it "<UNDEFINED> instruction" —
-it's a literal, not code.
-
-#### Identifying the corruption
-
-`enc_udf(0x8000 | 0x420) = 0xe7f842f0` — the SBA UDF marker for
-slot 0x420. Cross-check via the slot table dump from iter-66:
-
-```
-SBA_ORIG_PC[0x420..0x428]: 0x35c49c, 0x35d078, 0x35d0ac, 0x35d0bc,
-                            0x35d110, 0x35d144, 0x35d148, 0x35d1ac
-```
-
-**Slot 0x420 = orig_pc 0x35c49c.** That's the literal-pool entry.
-shadow_stub::patch_rom_from_bitmap walked
-BYTE_ACCESS_STATIC_BITMAP, the bit for word offset 0x35c49c was
-set, so emit_udf_site overwrote `*0x35c49c` (originally the
-function pointer 0x01b494f4) with the UDF marker `0xe7f842f0`.
-
-#### Result
-
-When `InitTextWalker` runs, the `ldr r0, [pc, #52]` reads the
-patched literal — getting `0xe7f842f0` instead of `0x01b494f4`.
-That value is stored as the TextWalker's scanner function
-pointer and called via `ldr pc, [r4, #8]`. Branching to high VA
-0xe7f842f0 traps to AArch32 PABT; the kernel's recovery path
-loops on the unmapped fetch.
-
-The persistence of the wedge across multiple periodic dumps is
-because the kernel handler retries the same bad branch on every
-recovery, and the `mode=ABT` snapshot captures the handler
-mid-emulation rather than USR mode mid-call.
-
-#### Why all prior hypotheses missed it
-
-- **iter-66**: Looked at slot 0x424 (LDRB at 0x35d110). Wrong slot
-  by an off-by-4 — the actual culprit is slot 0x420 in the same
-  cluster. The 0x424-vs-0x420 confusion came from misreading
-  `LR_abt = 0xe7f842f4` as the SBA marker (it IS slot 0x424's
-  marker, but that's coincidental; LR_abt reflects later state
-  inside the abort handler, not the original bad PC).
-- **iter-67/68**: Looked inside the kernel abort handler. The
-  handler IS running, but it's reacting to the bad branch, not
-  generating it.
-- **iter-69 (literal-poison probe)**: Never fired — the wedge is
-  upstream of the UND_RETURN_STUB. Negative result was useful.
-
-#### iter-70 plan: fix the bitmap classification
-
-Two paths, in order of preference:
-
-1. **Fix `tools/classify-rom`.** Newton's compiler emits literal
-   pools right after function bodies (after `ldmdb fp, {…pc}`
-   epilogues). Words between the epilogue and the next function
-   symbol are constants, not instructions. Suppress sub-word-
-   access marks for any address that is BOTH in such a tail
-   range AND the target of an in-function `ldr Rd, [pc, #imm]`.
-2. **Runtime guard in `shadow_stub::patch_one_site`.** Before
-   patching, scan a small window of preceding instructions for
-   any `ldr Rd, [pc, #imm]` whose computed literal address
-   equals the patch site. If found, skip the patch — it's a
-   data word, not code. Cheaper and isolates the fix to the
-   hypervisor side.
+<!-- iter-69 (ROOT CAUSE: classify-rom + shadow_stub corrupted the
+     literal-pool function pointer at 0x35c49c, slot 0x420
+     overwriting `0x01b494f4` with SBA UDF marker `0xe7f842f0`.
+     Discovered via a USR-mode periodic-dump capture showing
+     `pc=0xe7f842f0 lr=0x35c498` — first-PABT moment of
+     `InitTextWalker`. iter-70 fixed the underlying classify-rom
+     walker bug.) pruned per auto-prune. See
+     `git log --grep="iter-69"`. -->
 
 <!-- iter-68 (DataAbortHandler-internal hypothesis falsified — SBA
      UDFs silent in the wedge) pruned per auto-prune. iter-69

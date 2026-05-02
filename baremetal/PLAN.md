@@ -17,21 +17,95 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-73):** boot now stops with `unrecognised
-UND insn=0xed2dc203 at PC=0xd2780 SPSR_und=0x60000110` — a VFP
-coprocessor opcode the UND classifier doesn't decode. Same stall
-iter-70 reached before iter-71's classifier regression buried it
-under the abort loop. Next: extend `handle_und` (or the
-unaligned-fault classifier) to recognise the VFP encoding family
-and either emulate, NOP, or HVC-forward as appropriate.
+**Current goal (iter-74):** boot now stops in a stage-2 permission-
+fault loop at guest PC=0x19a84 / 0x19ac0 (`stmia r0!, {r2,r3,r4}` /
+`stmia r0!, {r2,r3,r4,r5}` inside `DiagBootStub` at 0x1955c).
+ESR=0x9200004f ⇒ EC=0x24 (DABT from lower EL) WnR=1, DFSC=0x0F
+(permission fault, level 3). Repeats forever — the kernel's
+DataAbortHandler isn't clearing the fault, suggesting r0 points at
+a guest VA the kernel believes is writable but stage-2 has marked
+RO (most likely the ROM aperture or a kernel-globals page). Next:
+capture FAR_EL2 + the running task / guest-mode CPSR to identify
+the destination PA, then decide whether stage-2 needs to grow a
+new mapping or the kernel patch list needs to redirect the write.
 
 **Background (unchanged from iter-61):** boot used to reach a
 quiescent idle at the Newton splash with `newt`=RUN wedged in
-`InitTextWalker`. After iter-70 the splash wedge was cleared;
-iter-71's classifier added more code-discovery idioms but
-inadvertently regressed boot to an InitKernelDomainAndEnvironment-
-era abort loop (iter-72 root-caused and fixed). Boot now reaches
-the iter-70 stall point.
+`InitTextWalker`. iter-70 cleared the splash wedge; iter-71's
+classifier added idiom recognizers but introduced a new wedge
+that iter-72 root-caused and fixed; iter-73 then forwarded FPA
+UNDs to the kernel's FPE emulator at 0x38d8dc, unblocking the
+TFrameSoundChannel codec path. Boot now drives most of the ROM
+init / sound subsystem before hitting the DiagBootStub stage-2
+perm fault.
+
+### Iteration 73: forward FPA UND to the guest's kernel FPE emulator
+
+#### Method
+
+iter-72 cleared the iter-71 abort wedge, exposing the iter-70
+stall: `*** unrecognised UND: insn=0xed2dc203 at PC=0xd2780
+SPSR_und=0x60000110`. `0xed2dc203` is the FPA `SFM f4, 1, [sp,
+#-12]!` opcode (Store FPA Multiple) — the compiler-emitted prologue
+of `Convert__18TFrameSoundChannelFRC6RefVarP10SoundBlock`.
+`scripts/disasm-out/rom.dis` shows ~80 SFM/LFM call sites in the
+ROM, so per-opcode in-EL2 NOPs would be a maintenance liability.
+
+Newton's UND vector at PA=0x4 originally branches `b 0x1a031f4`
+(`FP_UndefHandlers_Start_JT` in the post-ship JT region) which
+thunks to `FP_UndefHandlers_Start` at ROM 0x38d8dc — a complete
+FPA emulator covering LDF/STF/LFM/SFM, the CDP arithmetic family
+(MUFD/ADFD/SUFD/CMF/CMFE/MVF/…), MCR/MRC (FIX/FLT), and the
+control/status register accesses. The whole family already has
+an in-ROM home; we just need to route there.
+
+`patch_und_vector` (in `guest_mem.rs`) preempts the original
+branch with our HVC trampoline, so unhandled FPA opcodes wedge
+in `handle_und` instead of reaching the kernel FPE. The fix:
+when the faulting insn is FPA-class (cp1/cp2 LDC/STC/CDP/MCR/MRC,
+cond ≠ 0xF) and not the existing in-EL2 RFS/WFS/RFC/WFC ctrl-reg
+arm, ERET into 0x38d8dc directly — staying in UND mode (SPSR_EL2
+unchanged, since the trampoline ended in `msr cpsr_c, #0xdb`).
+
+The trampoline already preserves everything the FPE emulator
+expects on entry: orig R0..R12 (R0/R1/R12 reloaded from stash
+slots / TPIDR_EL0 at `handle_und` entry; R2 reloaded by the
+trampoline itself before HVC; R3..R11 untouched), SP_und (never
+written), hardware-saved LR_und = `faulting_pc + 4`, and SPSR_und
+= pre-UND CPSR. The FPE emulator's first instruction reads
+`LR - 4` to recover the faulting PC, so the trampoline's
+LR_und write is consumed correctly.
+
+The FPE emulator forces I=1, F=1 on entry and restores both from
+SPSR_und on `ldm sp!, {pc}^`, so the trampoline's pre-HVC
+`msr cpsr_c, #0xdb` (which forces F=1 even when the original
+mode had F=0) is invisible to the guest after FPE return —
+SPSR_und holds the original F bit. Existing in-EL2 ctrl-reg
+NOP path is left intact; it runs first and never reaches the
+forward arm.
+
+#### Result
+
+- `und: forwarding FPA insn 0xed2dc203 @PC=0xd2780 → kernel FPE
+  @0x38d8dc` (SFM at `Convert__18TFrameSoundChannelFRC6RefVarP10SoundBlock`)
+- Two more forwards in the same function:
+  `0xed9fc108 @PC=0xd2a40` (LDF) and `0xed1bc20c @PC=0xd2cfc`
+  (LFM). All three resolve cleanly through the kernel FPE.
+- 36/36 guest tests pass.
+- Cold boot: progresses well past iter-70/iter-72's stall point.
+  The early `und: handle_und first entry` log fires (StrongARM
+  CP15 c15 c1 op2=2 NOP), then SystemBootUND, TapFileCntl,
+  multiple sound-driver subfunctions (subfn 0x1f, 5, 6, 0xa,
+  0xc, 4, 0x13, 0x17, 9, 7, 0x11, 0xd) — TSoundServer comes up.
+  The full TScheduler / task table is set up: TNewtWorld /
+  TPSSManager / TPCKM / TCommManager / TNameServer / TSoundServer
+  / TAlertEventHandler / TScreenDriver / TAppWorld(s) all
+  populated. `TNotebook::InitToolbox` runs before the new stall.
+- New stall: stage-2 permission-fault loop at guest PC=0x19a84
+  / 0x19ac0 inside `DiagBootStub` (memory-fill loops,
+  `stmia r0!, {r2,r3,r4}` / `stmia r0!, {r2,r3,r4,r5}`). ESR
+  ISS bit[6] WnR=1, DFSC=0x0F = level-3 permission fault.
+  Iter-74 territory — no FAR_EL2 captured yet.
 
 ### Iteration 72: classify-rom — fn-range clamp on unbounded PC-rel switch
 
@@ -86,118 +160,14 @@ range and continues to be enumerated correctly.
   iter-70 stall point (`unrecognised UND insn=0xed2dc203 at
   PC=0xd2780` — VFP coprocessor opcode).
 
-### Iteration 71: classify-rom — five idiom recognizers
-
-#### Method
-
-Iteration over the unreached-words dump of `classify/<hash>/
-reach.bitmap`. Each chunk traced back to a specific compiler-
-emitted idiom the walker didn't follow. Five fixes in
-`tools/classify-rom/src/main.rs`, each pinned to the idiom — no
-content-shape heuristics. (A "scan for runs of code-pointer-shaped
-values" attempt earlier in iter-71 contaminated the bitmap with
-+22311 false-positive byte-access bits and was reverted in favour
-of the SWIBoot recognizer below.)
-
-1. **TClassInfo trampoline + struct walker.** Newton's class
-   metadata terminates in a 4-instruction tail-stub:
-
-   ```
-   sub  r0, pc, #68      ; return struct base
-   mov  pc, lr
-   mov  r0, #imm         ; alt entry: bail-out returning <imm>
-   mov  pc, lr
-   ```
-
-   The 60 bytes preceding the trampoline are the TClassInfo
-   struct (15 longs: `fReserved1..fReserved2`). The struct's
-   "Branch" fields are inline `B method` slots;
-   `collect_b_run_roots` already catches dense ≥3-in-a-row runs,
-   but the lone `fSelectorBranch` slot at +0x38 (a B into the
-   trampoline's alt entry at `fn + 8`) falls below that threshold
-   and was unreached for all 116 TClassInfo trampolines.
-   `collect_classinfo_roots` recognises the trampoline pattern
-   and seeds every B-AL slot in the inline struct.
-
-2. **SVC fall-through.** `step()` treated `SVC #imm` (cond=AL)
-   as `Step::Stop`, stranding everything past it. SWIs return to
-   PC+4; Newton's SWI-wrapper functions (e.g.
-   `SMemMsgCheckForDoneSWI` at 0x3ae458) do bookkeeping after
-   the SWI before their own `mov pc, lr` epilogue. Now Continue.
-
-3. **Multi-instruction case bodies in unbounded PC-rel
-   switches.** `enumerate_pc_rel_jump_table` previously broke at
-   the first non-terminal slot when no preceding `cmp Rn, #imm`
-   bounded the table. Newton's cond-code emulator at 0x3add80
-   dispatches `add pc, pc, r1, lsr #24` into a 16 × 16-byte case
-   body table without a CMP — every case body is `nop; tst r0,
-   #flag; bcc; b common`. Cap unbounded enumeration at
-   MAX_UNBOUNDED = 64 slots and seed each as a worklist root;
-   multi-insn bodies walk to their natural epilogues.
-
-4. **SWIBoot-style indexed dispatch.** Newton's kernel SWI
-   handler dispatch at SWIBoot+0xb4 (0x3ad74c):
-
-   ```
-   cmp r1, #35
-   bge out_of_range
-   ldr r0, [pc, #-488]      ; r0 = table_base
-   ldr pc, [r0, r1, lsl #2]
-   ```
-
-   The 35-handler table at 0x3ad56c..0x3ad5f4 is referenced only
-   through this idiom — no B-AL run, no vtable install, no
-   LDR-pc-rel literal, no static 32-bit pointer to any handler.
-   `collect_indexed_dispatch_roots` scans reached code for
-   `ldr pc, [Rn, Rm, lsl #2]`, walks back ≤16 insns within the
-   containing function for the LDR-Rn pc-rel that loaded the
-   base and the CMP-Rm that bounded the index, and maps the
-   conditional-branch type to an entry count (BGE/BHS/BCS → N;
-   BGT/BHI → N+1).
-
-5. **PC-rel function-pointer construction.**
-   `collect_pc_relative_addr_roots` previously gated solely on
-   `is_used_as_dispatch_base` — only seeded if Rd was later the
-   base of a runtime PC-write dispatch. That gate was added to
-   keep ASCII-string `add r1, pc, #imm` setups from contaminating
-   adjacent text. New parallel gate: also seed when the target
-   word itself is a function prologue. Catches cases like FPE
-   init at 0x39264c — `sub r1, pc, #0x2c` to point r1 at a
-   2-insn stub (`mvn r0, #0; movs pc, lr`) handed off as a
-   callback. ASCII top nibbles are 0x2-0x7, never 0xE, so
-   `is_known_function_start` rules string-pointer setups out
-   structurally — no heuristic threshold required.
-
-#### Result
-
-- `byte-access-static.bitmap` popcount: 27897 → 27913 (+16: +9
-  byte-class bits past SVCs, +7 halfword/signed bits in
-  newly-walked switch bodies).
-- `reach.bitmap` popcount: 2,653,975 → 2,654,975 (+~1000).
-- Oracle ⊆ static invariant: 0 missing.
-- 116/116 TClassInfo trampolines fully reached (fn_start, alt
-  entry, every B-AL struct slot).
-- 35/35 SWIBoot handler targets reached; SMemMsg…SWI-style
-  wrappers walk to their epilogues; cond-emulator switch at
-  0x3add80 reaches all 16 case bodies.
-- Remaining unreached chunks (e.g. 0x39276c FPE save/restore
-  handlers) have *no* static reference anywhere in reached code
-  — they are runtime-installed via memory writes, which static
-  analysis fundamentally can't follow. Correct behaviour, not
-  a classifier gap.
-- 36/36 guest tests pass.
-
-#### Walker stats (post-fix)
-
-```
-fnptr literal roots added:      395
-B-run dispatch roots added:    9379
-PC-rel addr roots added:        222
-TClassInfo struct roots:        460
-indexed-dispatch roots:          34
-total indirect roots added:   10487
-reachable-code popcount:    2654975
-```
+<!-- iter-71 (classify-rom — five idiom recognizers: TClassInfo
+     trampoline walker, SVC fall-through, multi-insn case bodies
+     in unbounded PC-rel switches, SWIBoot-style indexed
+     dispatch, PC-rel function-pointer construction. Bitmap
+     deltas + walker stats.) pruned per auto-prune. See
+     `git log --grep="iter-71"`. iter-72 superseded its
+     regression (the unbounded-switch fix swept past
+     `DynArrayLeaf`'s fn end into the SWIBoot pointer table). -->
 
 <!-- iter-70 (classify-rom walker fixes that cleared the iter-69
      literal-pool corruption; bitmap deltas / four walker fixes

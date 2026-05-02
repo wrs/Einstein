@@ -230,7 +230,6 @@ pub struct PatchStats {
     pub patched: usize,
     pub inline_stubs: usize,
     pub udf_fallback: usize,
-    pub skipped_pc_operand: usize,
     pub ldrb_strb: usize,
     pub ldrh_strh: usize,
     pub ldrsb_ldrsh: usize,
@@ -2042,28 +2041,22 @@ fn patch_one_site(pc: u32, force_udf: bool, stats: &mut PatchStats) {
         None => return,
     };
 
-    // Reject PC as any operand. Most of these hits are not even real
-    // code: classify-rom's prologue-sweep is generous enough to scoop
-    // in data words (string tables, dispatch tables) that happen to
-    // decode as byte-access-shape with Rn=PC. Emulating PC-relative
-    // against the original site is unnecessary work to support a
-    // pattern the real ROM doesn't use.
-    if decoded.rn == 15
-        || decoded.rt == 15
-        || (matches!(decoded.kind, AccessKind::Swpb) && decoded.rt2 == 15)
-    {
-        stats.skipped_pc_operand += 1;
-        crate::dprintln!(
-            "shadow_stub: skipping insn {:#010x} at PC {:#x} - PC operand",
-            insn, pc
+    // PC as any operand: with the classify-rom walker now recognising
+    // the `0xE6000510` panic-with-string trap and gating its dispatch-
+    // base seeding on reached words, the bitmap doesn't contain any
+    // real-code byte/halfword accesses with Rn/Rt/Rm=PC, and Newton
+    // doesn't use that pattern in practice. Halt rather than silently
+    // skip: a future ROM/REX change that regresses the walker should
+    // surface here, not produce undetected gaps in stub coverage.
+    let pc_in_offset = matches!(decoded.offset, OffsetForm::Reg { rm: 15, .. });
+    let pc_in_swpb_rt2 = matches!(decoded.kind, AccessKind::Swpb) && decoded.rt2 == 15;
+    if decoded.rn == 15 || decoded.rt == 15 || pc_in_offset || pc_in_swpb_rt2 {
+        kprintln!(
+            "shadow_stub: PC-operand byte access at {:#x} (insn {:#010x}) — \
+             classify-rom should have excluded this; regenerate the bitmap",
+            pc, insn,
         );
-        return;
-    }
-    if let OffsetForm::Reg { rm, .. } = decoded.offset {
-        if rm == 15 {
-            stats.skipped_pc_operand += 1;
-            return;
-        }
+        crate::cpu::halt();
     }
 
     let use_inline = !force_udf && is_inline_eligible(&decoded);
@@ -2208,12 +2201,10 @@ pub fn log_stats(stats: &PatchStats) {
     kprintln!(
         "shadow_stub: scanned {} words, patched {} insns \
          (inline={}, UDF={}; LDRB/STRB={}, LDRH/STRH={}, LDRSB/LDRSH={}, SWPB={}), \
-         skipped {} PC-operand, \
          site table {}/{}, inline pool {}/{}, scratch slots {}/{}",
         stats.words_scanned, stats.patched,
         stats.inline_stubs, stats.udf_fallback,
         stats.ldrb_strb, stats.ldrh_strh, stats.ldrsb_ldrsh, stats.swpb,
-        stats.skipped_pc_operand,
         NEXT_SITE.load(Ordering::SeqCst), SBA_MAX_SITES,
         NEXT_STUB.load(Ordering::SeqCst), SBA_STUB_MAX,
         NEXT_SCRATCH_SLOT.load(Ordering::SeqCst), SCRATCH_POOL_STUB_CAP,

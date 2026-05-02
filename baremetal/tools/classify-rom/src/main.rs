@@ -720,6 +720,17 @@ fn step(w: u32, _pc: u32, manual_bl: bool, in_table: bool) -> Step {
         return Step::Stop;
     }
 
+    // Newton "panic with inline message" pseudo-op. The trap doesn't
+    // return; the bytes after it are an ASCII null-terminated message
+    // padded to 4-byte alignment, NOT instructions. Without recognising
+    // it the walker falls through into the message and marks string
+    // words as code (string chars happen to decode as LDRB/STRB shape
+    // with Rn=PC, then leak into the byte-access bitmap and force
+    // shadow_stub to skip them at install time).
+    if w == 0xE600_0510 {
+        return Step::Stop;
+    }
+
     Step::Continue { branch: None }
 }
 
@@ -1071,7 +1082,7 @@ fn collect_pc_relative_addr_roots(
             Some(r) => r,
             None => continue,
         };
-        let is_dispatch_base = is_used_as_dispatch_base(words, fn_range, rd, addr);
+        let is_dispatch_base = is_used_as_dispatch_base(words, reach, fn_range, rd, addr);
         if !target_is_code && !is_dispatch_base { continue; }
         if reach.get_word(target) { continue; }
         if !seen.insert(target) { continue; }
@@ -1097,8 +1108,15 @@ fn find_fn_range(fn_ranges: &[(u32, u32)], addr: u32) -> Option<(u32, u32)> {
 /// as the base register. Skips `add Rd, PC, ...` itself by requiring
 /// Rn = `rd_target` (the dispatch reads from rd_target — only meaningful
 /// if rd_target was set earlier).
+///
+/// MOV (opcode 0xD) and MVN (opcode 0xF) are excluded: they don't read
+/// the Rn field, so its value is encoded as 0 by convention. Treating
+/// `mov pc, lr` (every function epilogue) as a dispatch from R0 would
+/// match every `add r0, pc, #imm` whose function ends with `mov pc, lr`,
+/// pulling string-pointer arguments into the reach set.
 fn is_used_as_dispatch_base(
     words: &[u32],
+    reach: &Bitmap,
     fn_range: (u32, u32),
     rd_target: u32,
     skip_addr: u32,
@@ -1109,11 +1127,26 @@ fn is_used_as_dispatch_base(
     for i in start_idx..end_idx {
         let pa = (i as u32) * 4;
         if pa == skip_addr { continue; }
+        // The hypothesis being tested is that rd_target was loaded
+        // here for a dispatch later in the function. By the time the
+        // indirect pass runs, the dispatch instruction itself must
+        // already be in reached code (walker would have followed
+        // there from the function entry). Skipping unreached words
+        // prevents data inside the synthetic last-fn-range bucket
+        // from masquerading as a dispatch.
+        if !reach.get_word(pa) { continue; }
         let w = words[i];
         // DP family with Rd=15, Rn=rd_target, register operand,
         // any cond (LS/CC/AL etc).
         if (w >> 26) & 0b11 != 0b00 { continue; }
         if (w >> 25) & 1 != 0 { continue; }
+        // bits[27:25]=000 with bit 4 = 1 splits into:
+        //   bit 7 = 0 → DP register-specified shift (real DP)
+        //   bit 7 = 1 → multiply / extra LD-ST / sync primitive
+        // The latter aren't DP at all but happen to share Rd/Rn field
+        // positions, so without this filter random data words match
+        // the dispatch-base check (~670 false hits in REX alone).
+        if (w >> 4) & 1 != 0 && (w >> 7) & 1 != 0 { continue; }
         let rd = (w >> 12) & 0xF;
         let rn = (w >> 16) & 0xF;
         if rd != 15 { continue; }
@@ -1121,6 +1154,7 @@ fn is_used_as_dispatch_base(
         let opcode = (w >> 21) & 0xF;
         let s_bit = (w >> 20) & 1;
         if matches!(opcode, 0x8..=0xB) && s_bit == 0 { continue; }
+        if matches!(opcode, 0xD | 0xF) { continue; }
         return true;
     }
     false

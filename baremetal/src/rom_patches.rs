@@ -1224,6 +1224,29 @@ pub const LOOKUP_TABLE_IDX_PROBE_HVC_IMM:  u32 = 0x74;
 pub const LOOKUP_TABLE_IDX_PROBE_PC:       u32 = 0x000C_74CC;
 const LOOKUP_TABLE_IDX_FIRST_INSN:         u32 = 0xE790_0101; // ldr r0, [r0, r1, lsl #2]
 
+/// FPE-entry probe at `FP_UndefHandlers_Start + 0x3C` = `0x0038_D918`.
+/// Original first insn is `mov ip, sp` (`0xE1A0_C00D`); replace with
+/// `HVC #FPE_ENTRY_PROBE_HVC_IMM`. The handler:
+///
+///   1. Counts FPE entries (per-call counter).
+///   2. On entry #2 (= forward #2 = mvfs in SetSystemVolume that wedges
+///      the FPE on the IP-corruption trap), calls
+///      `crate::tarmac::emit_start()` to open the TarmacTrace window.
+///      The matching `emit_stop()` fires from the unrecognised-UND
+///      halt path in `handle_und`.
+///   3. Emulates the original `mov ip, sp` by setting
+///      `ctx.x[12] = ctx.x[23]` (= sp_und, since the FPE always runs
+///      in UND mode after iter-84's bypass delivers UND naturally).
+///
+/// The trace bracketed by entry #2's start and the halt's stop
+/// captures every instruction + register write inside the FPE call
+/// that wedges — small enough to grep for the moment R12 transitions
+/// from `0x0c005fc0` (post-`mov ip, sp`) to `0x003900c8` (at the
+/// trap), pinning the IP-clobber site.
+pub const FPE_ENTRY_PROBE_HVC_IMM: u32 = 0x80;
+pub const FPE_ENTRY_PROBE_PC:      u32 = 0x0038_D918;
+const FPE_ENTRY_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -1848,6 +1871,14 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(LOOKUP_TABLE_IDX_PROBE_HVC_IMM),
             "TFlashStore::Lookup table-indexed load (capture base+idx+entry; halt if entry wild)",
             LOOKUP_TABLE_IDX_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            FPE_ENTRY_PROBE_PC,
+            FPE_ENTRY_FIRST_INSN,
+            hvc_insn(FPE_ENTRY_PROBE_HVC_IMM),
+            "FP_UndefHandlers_Start mov ip, sp (count + open tarmac window on entry #2)",
+            FPE_ENTRY_PROBE_HVC_IMM,
         );
     }
 }

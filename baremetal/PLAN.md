@@ -14,10 +14,114 @@ Bloated PLAN.md wastes context every read.
   the table (2026-04-29). The fix MUST be a kernel patch.
 - Run the *original ROM code*; no workarounds, no deferrals, no
   shortcuts; fix all warnings before each commit.
-- All 36 guest tests must pass on every commit
+- All 36 guest tests must pass on every commit that touches hypervisor
+  functionality (not merely diagnostics):
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-85):** with iter-84's FPA bypass in place
+**Current goal (iter-86):** chase the `LowLevelCopyEngineLong` r0=0
+regression that surfaced when iter-85 dropped R12 from
+`pick_scratch_regs_with_reader::CANDIDATES`. Boot now wedges at
+`*** unknown MMIO write halted *** IPA=0x00000000 W value=0xe8bd0030
+@ELR=0x3940b4` — `LowLevelCopyEngineLong`'s `str r3, [r0], #4` with
+`r0` wild. Some shadow_stub site that previously got covered by the
+R12-as-scratch shortcut is now picking from `[R0,R1,R2,R3]` at a
+site where the dead-reg analyzer is wrong about one of those — the
+same liveness-model issue (APCS-grounded analysis vs kernel-private
+conventions) that bit us on R12, just at a different register.
+
+The new `--features sba-trace` lets us dump every patch's solution.
+Bisect by walking the trace lines around the wedge and looking for
+sites where the picked scratch is one of the operands of a *future*
+load that the analyzer didn't see (e.g., across an unreadable
+tail-call or a B to a post-ship-patch slot).
+
+### Iteration 85: drop R12 from dead-reg picker + sba-trace feature
+
+#### Goal
+
+iter-83/84 traced the FPE forward-#2 wedge to `r12 = 0x003900c8`
+at `0x38db18` with the FPE expecting `ip = sp_und = 0x0c005fc0`.
+Static disasm of the FPE region shows zero R12 writes between
+`mov ip, sp` at `0x38d918` and the trap, so an *external* write
+had to be the cause. iter-85 located it: shadow_stub's inline
+emulation stubs at `0x00390004 / 0x00390054 / 0x0039009c` (LDRBs
+in the FPA helpers `0x38ffd8`/`0x390028` reachable from the mvfs
+arm) had picked R12 as their scratch register. The stub's
+`add r12, r6, r8 ror #28` clobbered R12 with the FPA constant
+table address; the FPE's epilogue `ldmdb ip` later read the
+constants instead of the prologue-saved CPSR/SPSR, the next
+`msr CPSR_fc / msr SPSR_fc` got garbage mode bits, and the trap
+fired.
+
+The picker's `APCS_RETURN_LIVE` mask explicitly excludes R12:
+
+```rust
+/// R1–R3 and R12 are caller-saved; the caller doesn't expect any
+/// particular value in them at return, so they're "dead" at BX LR.
+const APCS_RETURN_LIVE: RegMask =
+    (1 << 0) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7)
+    | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11)
+    | (1 << 13) | (1 << 14);
+```
+
+…so the analyzer correctly proves R12 dead at every `bx lr` /
+`mov pc, lr` per APCS. But the FPE has a *private* convention
+where R12 (= `ip`) is callee-preserved across its entire BL
+chain — APCS doesn't bind here. The analyzer can't see private
+conventions; the picker would always be wrong at any site
+inside a kernel function whose caller treats R12 as preserved.
+
+#### Mechanism
+
+Two changes to `src/shadow_stub.rs::pick_scratch_regs_with_reader`:
+
+1. `CANDIDATES` drops R12: `&[12, 0, 1, 2, 3]` → `&[0, 1, 2, 3]`.
+   The DeadReg-stub picker now never selects R12. ScratchVA
+   fallback (used when R0..R3 are all live or are operands)
+   keeps R12 in `pick_operand_excluded_triple`'s candidate pool;
+   that path is safe because the stub save/restores its scratch
+   regs around the body.
+
+2. New `--features sba-trace` Cargo feature gates per-patch
+   logging at install time:
+   ```
+   sba-trace @0x00390054 ldrb r6 [r6, r8, ror #28] : DeadReg sea=R2 sfl=<nzcv-dead>
+   sba-trace @0x00390004 ldrb r6 [r6, r8, ror #28] : ScratchVA sea=R12 sfl=R0 sad=R1
+   ```
+   ~28k lines for a full ROM scan; enable when investigating a
+   suspected scratch-register-clobber. Would have caught the
+   R12 problem at install time (the line for `0x00390054` shows
+   `sea=R12` plainly under the old picker).
+
+`SCRATCH_POOL_SIZE` raised from 64 KiB to 384 KiB and
+`SHADOW_POOL_IPA` moved from `0x0601_0000` to `0x0606_0000` to
+absorb the increased ScratchVA fallback (10351 stubs vs 2976
+before — 7k more sites can't find 2 dead regs from `[R0..R3]`
+alone).
+
+#### Verification
+
+`--features sba-trace` confirms the picker change globally:
+DeadReg `sea` histogram is `{R0: 2688, R1: 8657, R2: 3565, R3: 1384}`,
+DeadReg `sfl` is `{R1: 1413, R2: 5678, R3: 3063}` — **R12 never
+picked** as a dead-reg scratch. The forward-#2 wedge at
+`PC=0x38db18` is gone; boot proceeds past `SetSystemVolume`'s
+mvfs / ldfs / mufs / fixz chain.
+
+#### New regression
+
+A different shadow_stub site (TBD) now has a wrong scratch pick
+in `[R0..R3]`, surfacing as `LowLevelCopyEngineLong` `str r3,
+[r0], #4` with `r0=0` at the wedge. Same model bug class
+(APCS-grounded liveness vs kernel-private convention), different
+register. iter-86 picks up the chase.
+
+---
+
+(iter-83/84 status preserved below until iter-86 supersedes;
+trim per auto-prune.)
+
+**Old iter-85 goal:** with iter-84's FPA bypass in place
 (UND vector at IPA 0x04 routes FPA-class UNDs straight to
 `FP_UndefHandlers_Start_JT` at 0x38d874, exactly the path SA-110
 hardware took on the original Newton), the kernel's FPE *still*

@@ -166,7 +166,14 @@ static NEXT_STUB: AtomicUsize = AtomicUsize::new(0);
 // be refined to a 64 KiB RW carve-out.
 pub const SCRATCH_POOL_VA: u32 = 0x0600_0000;
 pub const SCRATCH_POOL_IPA: u32 = 0x0600_0000;
-pub const SCRATCH_POOL_SIZE: usize = 64 * 1024; // 16 × 4 KiB pages
+// iter-85 raised this from 64 KiB to 384 KiB. Dropping R12 from the
+// dead-reg picker (`pick_scratch_regs_with_reader::CANDIDATES`) forces
+// more sites to fall through to the ScratchVA fallback — the 717006
+// scan now needs ~17k slots vs ~6k before. 384 KiB / 8 B per stub =
+// 49152 slots, comfortable headroom. Stays within the 1 MiB
+// kernel-side L1 section at VA 0x06000000 (SHADOW_POOL_IPA at
+// 0x0606_0000 directly follows).
+pub const SCRATCH_POOL_SIZE: usize = 384 * 1024; // 96 × 4 KiB pages
 pub const SCRATCH_BYTES_PER_STUB: usize = 8;
 pub const SCRATCH_POOL_STUB_CAP: usize =
     SCRATCH_POOL_SIZE / SCRATCH_BYTES_PER_STUB;
@@ -1546,7 +1553,44 @@ where R: Fn(u32) -> Option<u32> {
     // BX LR or tail-call between the stub and the function exit
     // jumps to the wild value). Restricting CANDIDATES to caller-
     // saved scratch GPRs is the safe choice.
-    const CANDIDATES: &[u32] = &[12, 0, 1, 2, 3];
+    //
+    // R12 (IP) was also in this list, but iter-85 caught it
+    // clobbering the kernel FPE's `ip = mov sp` invariant: the FPE
+    // helpers at 0x38f04c / 0x38ffd8 / 0x390028 (reachable from
+    // forward #2's mvfs path) contain LDRB instructions, and the
+    // dead-reg analyzer's `APCS_RETURN_LIVE` mask treats R12 as
+    // dead at every `bx lr` / `mov pc, lr` (since APCS marks R12
+    // caller-saved). At those LDRBs the analyzer sees R12 as dead
+    // and picks it as scratch_ea — but the FPE caller depends on
+    // R12 being preserved across every BL down to the epilogue's
+    // `ldmdb ip`. The inline stub's `add r12, rN, ...` then
+    // overwrote R12 with the FPA-constant-table address, the FPE
+    // epilogue read garbage CPSR/SPSR via the corrupted ip, and
+    // the next `msr SPSR_fc` traps as UND with reserved-mode bits.
+    // Dropping R12 from the candidate pool — even though the
+    // analyzer "proves" it dead — is the right call: kernel
+    // private conventions exist (and we can't enumerate them all
+    // ahead of time), and there are 4 other safe candidates
+    // (R0..R3) plus the ScratchVA fallback. APCS-grounded
+    // liveness is sound for almost all sites but unsound where
+    // the kernel locally diverges from APCS, and R12 is exactly
+    // such a divergence point.
+    // Drop R12 entirely. Previously [12, 0, 1, 2, 3]; iter-85 caught
+    // the kernel FPE's helper chain at 0x38f04c / 0x38ffd8 / 0x390028
+    // (reachable from forward #2's mvfs path) wedging because the
+    // analyzer's `APCS_RETURN_LIVE` mask treats R12 as caller-saved at
+    // every `bx lr` / `mov pc, lr` (per APCS), so the picker classified
+    // R12 as dead at 0x00390004 / 0x00390054 / 0x0039009c and chose it
+    // as scratch_ea / scratch_fl. The inline stub's `add r12, …` and
+    // `mrs r12, cpsr` clobbered R12 — and the FPE caller depended on
+    // R12 being preserved across every BL down to the epilogue's
+    // `ldmdb ip`, a private "callee-saved R12" convention that
+    // diverges from APCS. The picker can't see kernel-private
+    // conventions; refusing R12 entirely is the safe choice. The
+    // ScratchVA fallback (which save/restores) still picks R12 — the
+    // stub's save+restore makes that path safe regardless of caller
+    // convention.
+    const CANDIDATES: &[u32] = &[0, 1, 2, 3];
     // 32-instruction window: a typical Newton-ROM function body fits
     // within 32 from the byte-access site. Smaller windows hit the
     // conservative fallback ("all unwritten regs live") prematurely
@@ -1566,7 +1610,19 @@ where R: Fn(u32) -> Option<u32> {
         n += 1;
         if n == 2 { return Some((picks[0], Some(picks[1]))); }
     }
+    // The `sfl = None` (= "NZCV dead, skip save/restore") variant is
+    // only sound when the patched access is unconditional. The stub's
+    // slot 7 `cmp sea, XOR_LIMIT` clobbers NZCV before slot 10's
+    // conditional LDR/STR runs; if the original access was conditional
+    // (LDRBEQ / LDRBNE / etc.), slot 10 would read the stub's clobbered
+    // flags instead of the caller's flags and execute the wrong way.
+    // iter-85 caught this in `test_shadow_stub` subtest 10: with R12
+    // dropped from `CANDIDATES` the picker fell through to the 1-dead +
+    // NZCV-dead path at the LDRBEQ site (0x460), the stub's CMP forced
+    // Z=0 before the conditional load, the LDRBEQ skipped, and r6
+    // stayed as its 0xEE sentinel.
     if n == 1
+        && d.cond == encode::AL
         && nzcv_dead_recursive(
             orig_pc.wrapping_add(4), 32, &mut Visited::new(), read_insn,
         )
@@ -1898,22 +1954,100 @@ fn encode_inline_stub(
 /// `B stub_slot`. Halts at install time on any encoding or pool failure
 /// — the ROM is fixed, so an install-time failure means we discovered
 /// a site that needs a code change to handle, not a runtime fallback.
+/// Render an `AccessKind` as the assembler mnemonic, for sba-trace logs.
+fn describe_kind(k: AccessKind) -> &'static str {
+    match k {
+        AccessKind::Ldrb => "ldrb",
+        AccessKind::Strb => "strb",
+        AccessKind::Ldrh => "ldrh",
+        AccessKind::Strh => "strh",
+        AccessKind::Ldrsb => "ldrsb",
+        AccessKind::Ldrsh => "ldrsh",
+        AccessKind::Swpb => "swpb",
+    }
+}
+
+/// Render the data-register operand "rN" or "rN/rM" (SWPB).
+fn describe_rt(d: &Decoded) -> RtFormat {
+    RtFormat { rt: d.rt, rt2: d.rt2, swpb: matches!(d.kind, AccessKind::Swpb) }
+}
+
+struct RtFormat { rt: u32, rt2: u32, swpb: bool }
+impl core::fmt::Display for RtFormat {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.swpb {
+            write!(f, "r{}/r{}", self.rt, self.rt2)
+        } else {
+            write!(f, "r{}", self.rt)
+        }
+    }
+}
+
+/// Render `[rN]` / `[rN, ±#imm]` / `[rN, ±rM, shift #amt]`.
+fn describe_rn_offset(d: &Decoded) -> RnOffsetFormat {
+    RnOffsetFormat { rn: d.rn, u: d.u, off: d.offset }
+}
+
+struct RnOffsetFormat { rn: u32, u: bool, off: OffsetForm }
+impl core::fmt::Display for RnOffsetFormat {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let sign = if self.u { "" } else { "-" };
+        match self.off {
+            OffsetForm::None => write!(f, "[r{}]", self.rn),
+            OffsetForm::Imm { imm: 0 } => write!(f, "[r{}]", self.rn),
+            OffsetForm::Imm { imm } => write!(f, "[r{}, #{}{:#x}]", self.rn, sign, imm),
+            OffsetForm::Reg { rm, shift_type, shift_amount } => {
+                let st = match shift_type {
+                    0 => "lsl", 1 => "lsr", 2 => "asr", 3 => "ror", _ => "?",
+                };
+                if shift_amount == 0 && shift_type == 0 {
+                    write!(f, "[r{}, {}r{}]", self.rn, sign, rm)
+                } else {
+                    write!(f, "[r{}, {}r{}, {} #{}]", self.rn, sign, rm, st, shift_amount)
+                }
+            }
+        }
+    }
+}
+
+fn describe_sfl_opt(sfl: Option<u32>) -> SflOptFormat { SflOptFormat(sfl) }
+struct SflOptFormat(Option<u32>);
+impl core::fmt::Display for SflOptFormat {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(r) => write!(f, "R{}", r),
+            None => write!(f, "<nzcv-dead>"),
+        }
+    }
+}
+
 fn emit_inline_stub(d: &Decoded, orig_pc: u32) {
     // Iter-49 diagnostic: log scratch picks at sites known to have been
     // mis-picked in production. Add more PCs here as bugs surface.
     // Compile-time-cheap (just an array compare); narrow output.
+    //
+    // For the broader case ("show me every patch's picked scratch regs"),
+    // build with `--features sba-trace`. iter-85 added that feature
+    // after the FPE-helper R12-as-scratch bug at 0x390004/0x390054/
+    // 0x39009c (forward #2's IP-corruption wedge) would have been
+    // visible at a glance from the trace.
     const TRACE_PICK_SITES: &[u32] = &[
         0x0014_88AC, // FindSuperceeder body — iter-49 R12-misclassification
         0x0025_7080, // WriteChunk LDRB — iter-51 R0-misclassification (visited-set leak)
     ];
-    let trace_pick = TRACE_PICK_SITES.contains(&orig_pc);
+    let trace_pick = TRACE_PICK_SITES.contains(&orig_pc) || cfg!(feature = "sba-trace");
 
     let (sea, variant) = match pick_scratch_regs(d, orig_pc) {
         Some((sea, sfl)) => {
             if trace_pick {
                 kprintln!(
-                    "shadow_stub pick @{:#010x}: DeadReg sea=R{} sfl={:?}",
-                    orig_pc, sea, sfl,
+                    "sba-trace @{:#010x} {} {} {} : DeadReg sea=R{} sfl={}",
+                    orig_pc,
+                    describe_kind(d.kind),
+                    describe_rt(d),
+                    describe_rn_offset(d),
+                    sea,
+                    describe_sfl_opt(sfl),
                 );
             }
             (sea, StubVariant::DeadReg { sfl })
@@ -1939,8 +2073,12 @@ fn emit_inline_stub(d: &Decoded, orig_pc: u32) {
             let (sea, sfl, sad) = pick_operand_excluded_triple(d);
             if trace_pick {
                 kprintln!(
-                    "shadow_stub pick @{:#010x}: ScratchVA sea=R{} sfl=R{} sad=R{}",
-                    orig_pc, sea, sfl, sad,
+                    "sba-trace @{:#010x} {} {} {} : ScratchVA sea=R{} sfl=R{} sad=R{}",
+                    orig_pc,
+                    describe_kind(d.kind),
+                    describe_rt(d),
+                    describe_rn_offset(d),
+                    sea, sfl, sad,
                 );
             }
             let scratch_slot_idx = NEXT_SCRATCH_SLOT.fetch_add(1, Ordering::SeqCst);
@@ -2073,6 +2211,16 @@ fn patch_one_site(pc: u32, force_udf: bool, stats: &mut PatchStats) {
         emit_inline_stub(&decoded, pc);
         stats.inline_stubs += 1;
     } else {
+        if cfg!(feature = "sba-trace") {
+            kprintln!(
+                "sba-trace @{:#010x} {} {} {} : UDF (force_udf={})",
+                pc,
+                describe_kind(decoded.kind),
+                describe_rt(&decoded),
+                describe_rn_offset(&decoded),
+                force_udf,
+            );
+        }
         emit_udf_site(pc, insn);
         stats.udf_fallback += 1;
     }

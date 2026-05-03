@@ -1494,6 +1494,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::LOOKUP_TABLE_IDX_PROBE_HVC_IMM => {
             handle_lookup_table_idx_probe(ctx);
         }
+        v if v == crate::rom_patches::FPE_ENTRY_PROBE_HVC_IMM => {
+            handle_fpe_entry_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -2263,6 +2266,12 @@ fn handle_und(ctx: &mut TrapContext) {
             cpu::halt();
         }
         _ => {
+            // Stop the tarmac window before any further EL2 work runs
+            // (the diagnostic kprintln!'s below would otherwise appear
+            // in the trace and bloat it). The window was opened by the
+            // FPE-entry probe at 0x38d918 on the third FPE entry —
+            // exactly the call that wedges on the IP-corruption trap.
+            crate::tarmac::emit_stop();
             kprintln!(
                 "*** unrecognised UND: insn={:#010x} at PC={:#x} SPSR_und={:#x}",
                 insn, faulting_pc, spsr_und
@@ -4147,6 +4156,31 @@ fn handle_lookup_table_idx_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
 
     // Emulate `ldr r0, [r0, r1, lsl #2]`.
     ctx.x[0] = entry as u64;
+}
+
+/// FPE-entry probe: patched at `0x0038_D918` over `mov ip, sp`. Counts
+/// FPE entries; on the call that's expected to wedge on the
+/// IP-corruption trap (entry index 2 = forward #2 = mvfs in
+/// SetSystemVolume), opens the TarmacTrace window via
+/// `crate::tarmac::emit_start()`. The matching `emit_stop()` fires from
+/// the unrecognised-UND halt path. The trace bracketed by these two
+/// markers contains every retired instruction inside the FPE call —
+/// grep for the moment R12 is written with `0x003900c8` to pin the
+/// IP-clobber site.
+///
+/// Then emulates the original `mov ip, sp` by setting
+/// `ctx.x[12] = ctx.x[23]` (= sp_und, since the FPE always runs in
+/// UND mode after iter-84's bypass routes UND naturally to FPE_JT).
+fn handle_fpe_entry_probe(ctx: &mut TrapContext) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static FIRED: AtomicU32 = AtomicU32::new(0);
+    let n = FIRED.fetch_add(1, Ordering::Relaxed);
+    let sp_und = ctx.x[23] as u32;
+    if n < 8 {
+        kprintln!("FPE-entry[{}]: sp_und={:#010x}", n, sp_und);
+    }
+    // Emulate `mov ip, sp` (= ctx.x[23] in UND-source mode).
+    ctx.x[12] = (ctx.x[12] & 0xFFFF_FFFF_0000_0000) | (sp_und as u64);
 }
 
 fn handle_reboot(ctx: &TrapContext) -> ! {
@@ -7823,7 +7857,14 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
                     value, readback, (readback >> 1) & 1, readback & 1,
                     (readback >> 13) & 1,
                 );
-                crate::tarmac::emit_start();
+                // iter-85: tarmac window now opens from the FPE-entry
+                // probe at 0x38d918 on entry #2 (= forward #2 = mvfs in
+                // SetSystemVolume that wedges the FPE on IP corruption).
+                // The SCTLR-A=1 trigger from the iter-78 alignment-fault
+                // investigation is left disabled so it doesn't preempt
+                // the FPE window. Re-enable when the active investigation
+                // changes.
+                let _ = ();  // tarmac::emit_start() suppressed for iter-85
             }
             log_sctlr_write(value);
             if was_off && now_on {

@@ -51,11 +51,12 @@ pub fn handle_align_fault(ctx: &mut TrapContext) {
     static N: AtomicU32 = AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
     const LOG_FIRST: u32 = 40;
-    // Stop the tarmac-window capture on the first alignment fault so
-    // the trace isn't dominated by the hypervisor's post-fault handler.
-    if n == 1 {
-        crate::tarmac::emit_stop();
-    }
+    // iter-85: tarmac window is now bracketed by the FPE-entry probe
+    // (open) and the unrecognised-UND halt (close). The first-alignment-
+    // fault stop trigger from the iter-78 investigation would close
+    // the window way before the FPE call we want to trace, so it's
+    // disabled. Re-enable when the active investigation changes.
+    let _ = n; // tarmac::emit_stop() suppressed for iter-85
 
     // Recover pre-abt R0 / R1 from TPIDR scratch regs.
     let orig_r0: u64;

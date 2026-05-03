@@ -52,6 +52,16 @@ quiet = []
 # Off by default; the helper is wired up but not yet invoked.
 validate_with_probe = []
 
+# Per-patch tracing for shadow_stub. When enabled, every byte/halfword
+# access patched by `patch_code_range` emits one line at install time
+# describing the source instruction (PC, kind, Rt, Rn, offset shape) and
+# the chosen patch (DeadReg with picked scratch regs, ScratchVA with the
+# 3 picks, or UDF fallback). Off by default — the 717006 ROM has ~28k
+# patches, so the log gets large; turn on when investigating a suspected
+# scratch-register-clobber bug. iter-85 added this after the FPE-helper
+# R12-as-scratch bug would have been visible at a glance with this on.
+sba-trace = []
+
 [dependencies]
 newton-objects = { path = "newton-objects" }
 

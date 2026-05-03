@@ -72,6 +72,7 @@ pub fn emit_stop() {
 /// when the interesting window is triggered by a specific EL2 event
 /// rather than a trap count (e.g., "SCTLR.A=1 just became live and I
 /// want to trace from here").
+#[allow(dead_code)]
 pub fn emit_start() {
     // SAFETY: single-threaded EL2.
     if unsafe { STARTED } {

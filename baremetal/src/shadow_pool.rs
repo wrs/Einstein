@@ -31,7 +31,10 @@ use crate::kprintln;
 /// IPA where the shadow pool starts. Chosen so it sits in the same
 /// 2 MiB L2 block as `shadow_stub::SCRATCH_POOL` (which covers
 /// IPA 0x0600_0000..0x0620_0000), letting us reuse `S2_L3_SCRATCH`.
-pub const SHADOW_POOL_IPA: u32 = 0x0601_0000;
+/// Sits directly after `SCRATCH_POOL` (which iter-85 enlarged to
+/// 384 KiB to absorb the increased ScratchVA fallback rate from
+/// dropping R12 as a dead-reg-picker candidate).
+pub const SHADOW_POOL_IPA: u32 = 0x0606_0000;
 /// 16 4 KiB pages = 64 KiB. Enough to cover the 12 known Group-2
 /// aliases plus headroom.
 pub const SHADOW_POOL_SIZE: usize = 16 * 4096;

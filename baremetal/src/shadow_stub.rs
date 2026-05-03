@@ -188,9 +188,27 @@ pub fn scratch_pool_host_pa() -> u64 {
     addr_of_mut!(SCRATCH_POOL) as u64
 }
 
+/// First slot index available to ScratchVA stubs. Slots `0..RESERVED_SCRATCH_SLOTS`
+/// are reserved for the AArch32 UND / DABT trampoline's banked-register
+/// save area (`trap::HYP_TRAMP_SCRATCH_BASE` and `guest_mem::DABT_SAVE_PA`),
+/// which lives at `SCRATCH_POOL_IPA + 0` — hypervisor traps that fire after
+/// shadow_stub install would otherwise overwrite stub literals at the same
+/// offset and corrupt SBA emulation.
+///
+/// Sized to comfortably cover the trampoline's footprint:
+///   - UND saves (LR_und, SPSR_und, LR_svc, R0..R2, SP_banked, LR_banked)
+///     at offsets 0x00..0x1C (32 B = 4 slots).
+///   - DABT saves (LR_abt, SP_abt, SPSR_abt) at offsets 0xA0..0xAC
+///     (12 B = 2 slots, slot indices 20..21).
+/// 32 reserved slots = 256 B leaves slack for any future state we add to
+/// the trampoline area.
+pub const RESERVED_SCRATCH_SLOTS: usize = 32;
+
 /// Per-ScratchVA-variant slot allocator. Independent of `NEXT_STUB`
-/// because DeadReg / Stack stubs don't claim a scratch slot.
-static NEXT_SCRATCH_SLOT: AtomicUsize = AtomicUsize::new(0);
+/// because DeadReg / Stack stubs don't claim a scratch slot. Starts past
+/// `RESERVED_SCRATCH_SLOTS` so the hypervisor trampoline's banked-reg
+/// save area never collides with a stub's literal slot.
+static NEXT_SCRATCH_SLOT: AtomicUsize = AtomicUsize::new(RESERVED_SCRATCH_SLOTS);
 
 /// Compute the kernel VA of the per-stub 8-byte scratch slot for a
 /// given allocator index. The returned VA lies inside

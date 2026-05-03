@@ -1595,7 +1595,14 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
 //   +0x0C R0           +0x1C banked LR
 //   +0xA0..+0xB7  DABT trampoline save (lr_abt, sp_abt, spsr_abt,
 //                                       sp_svc, spsr_svc, lr_svc)
-pub const HYP_TRAMP_SCRATCH_BASE: u32 = 0x0600_F000;
+//
+// 2026-05-03: relocated from 0x0600_F000 (slot 7680 inside SCRATCH_POOL)
+// to 0x0600_0000 (slot 0). The old location overlapped shadow_stub's
+// per-stub literal area once iter-85 grew SCRATCH_POOL to 384 KiB —
+// shadow_stub's NEXT_SCRATCH_SLOT now starts past RESERVED_SCRATCH_SLOTS
+// (32 slots = 256 B), keeping the trampoline's footprint (offsets
+// 0x00..0xAC) reserved and never claimed by a stub.
+pub const HYP_TRAMP_SCRATCH_BASE: u32 = crate::shadow_stub::SCRATCH_POOL_IPA;
 pub const UND_SAVE_LR_IPA: u32 = HYP_TRAMP_SCRATCH_BASE + 0x00;
 pub const UND_SAVE_SPSR_IPA: u32 = HYP_TRAMP_SCRATCH_BASE + 0x04;
 /// LR_svc captured by the trampoline's brief SVC-mode bounce. Only

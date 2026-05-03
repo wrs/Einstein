@@ -44,7 +44,67 @@
 //! See `Einstein/Emulator/JIT/Generic/TJITGenericROMPatch.cpp` for the
 //! full annotated list and the Einstein-side rationale for each.
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use crate::kprintln;
+
+// ============================================================================
+// Patch-stub arena
+// ============================================================================
+//
+// Each kernel-side native-primitive patch (DebugStr, Debugger,
+// FTimeInSeconds, FDateFromSeconds, ResolveFault wrapper, …) needs a
+// few words of guest-visible ROM space to hold its replacement-stub
+// body, and the kernel-patched BL/B site needs to know that stub's PC
+// to encode the redirect. Picking those PCs by hand is exactly how the
+// iter-87 wedge happened: FTIME_STUB_PC = 0x00FF_FF40 silently overlapped
+// the UND trampoline `patch_und_vector` writes at 0x00FF_FF00..0x00FF_FF60,
+// the trampoline ran second, the stub was clobbered, and the kernel's
+// patched `b 0x00FF_FF40` at 0x89B80 fell into trampoline code mid-
+// instruction-stream. Even after that fix the audit found a second
+// latent collision (NEW_STACK_PAD_WRAPPER at 0x00FF_FE80 vs FTIME/FDATE
+// at 0x00FF_FE70/0x00FF_FE84).
+//
+// The arena removes the manual address management entirely. Each
+// `apply_*` function calls `alloc_patch_stub(n)` at install time and
+// gets back the next free PC; allocations never overlap and arena
+// overflow halts loudly. Callers that need to address into their own
+// stub (e.g. RESOLVE_FAULT_WRAPPER's bl-site offset) pass that PC
+// around as a local instead of consulting a global constant.
+//
+// The arena lives in the gap between the unused
+// LOCK_HEAP_RANGE_WRAPPER region (`0x00FF_FD80`) and the FPA bypass
+// stub at `0x00FF_FEC0` that `patch_und_vector` owns. 320 bytes total.
+// Currently-installed patches need 152 B; the LOCK/UNLOCK/NEW_STACK_PAD
+// wrappers (NOT installed) would add another 80 B, comfortably within
+// the budget.
+const PATCH_STUB_ARENA_BASE: u32 = 0x00FF_FD80;
+const PATCH_STUB_ARENA_END:  u32 = 0x00FF_FEC0;
+
+static PATCH_STUB_ARENA_CURSOR: AtomicU32 = AtomicU32::new(PATCH_STUB_ARENA_BASE);
+
+/// Allocate `n_words` (4 bytes each) inside the patch-stub arena and
+/// return the start PC. Halts loudly on overflow so any future stub
+/// that pushes past `PATCH_STUB_ARENA_END` fails at install time
+/// rather than silently corrupting an adjacent stub.
+fn alloc_patch_stub(n_words: usize, name: &'static str) -> u32 {
+    let bytes = (n_words * 4) as u32;
+    let pc = PATCH_STUB_ARENA_CURSOR.fetch_add(bytes, Ordering::SeqCst);
+    let new_end = pc + bytes;
+    if new_end > PATCH_STUB_ARENA_END {
+        kprintln!(
+            "*** patch-stub arena overflow: {} wants {}B at {:#x}; \
+             arena end is {:#x}",
+            name, bytes, pc, PATCH_STUB_ARENA_END,
+        );
+        crate::cpu::halt();
+    }
+    kprintln!(
+        "rom_patch: arena alloc {}B for {} -> {:#010x} (cursor now {:#x})",
+        bytes, name, pc, new_end,
+    );
+    pc
+}
 
 /// A single word-write patch against the main ROM (IPA 0..0x00800000).
 #[derive(Copy, Clone)]
@@ -376,30 +436,6 @@ const fn hvc_insn(imm: u32) -> u32 {
 ///                   shared across all non-FIQ modes, ctx.x[7])
 ///                   sidesteps that mapping question entirely.
 ///   HVC #imm      — trap to EL2
-// Kernel-side native-primitive stubs. These all live in the gap
-// between RESOLVE_FAULT_WRAPPER (ends at 0x00FF_FE5C) and the FPA
-// bypass stub at 0x00FF_FEC0. The previous addresses (0x00FF_FF30+)
-// overlapped the UND trampoline that `patch_und_vector` installs at
-// 0x00FF_FF00..0x00FF_FF5C; since `patch_und_vector` runs *after*
-// `apply_717006_patches`, the trampoline silently clobbered each
-// stub. The kernel's patched BL/B sites still pointed at the stub
-// addresses, so any call into FTimeInSeconds/FDate/DebugStr/Debugger
-// branched into the middle of the trampoline body — which, in USR
-// mode, eventually executed the trampoline's `hvc #UND_TAG` and
-// wedged with `*** unrecognised UND insn=0xe1400170 at PC=0xffff54`
-// (iter-87). Sizes: DEBUG_STR / DEBUGGER 2 words each (8 B);
-// FTIME / FDATE 5 words each (20 B). 56 bytes total fits in the
-// 96-byte free window.
-const DEBUG_STR_STUB_PC: u32 = 0x00FF_FE60;
-const DEBUGGER_STUB_PC:  u32 = 0x00FF_FE68;
-const FTIME_STUB_PC:     u32 = 0x00FF_FE70;
-const FDATE_STUB_PC:     u32 = 0x00FF_FE84;
-
-/// PC of the ResolveFault wrapper (see `apply_resolve_fault_wrapper`).
-/// Sits below the existing 0x00FF_FFxx stubs in the post-UND-trampoline
-/// reserved region. 20 words = 80 bytes; safe to grow downward as needed.
-const RESOLVE_FAULT_WRAPPER_PC: u32 = 0x00FF_FE00;
-
 /// Entry point of `TStackManager::ResolveFault` that the wrapper invokes.
 /// Also re-exported as `RESOLVE_FAULT_ENTRY_PC` for the lazy-L1 probe.
 const RESOLVE_FAULT_PC: u32 = 0x001F_7978;
@@ -442,8 +478,6 @@ const FMLOCK_BL_RESOLVE_PC: u32 = 0x001F_6B94;
 /// patches at the heap-allocation layer.
 const LOCK_HEAP_RANGE_PC: u32 = 0x001F_8AB4;
 const UNLOCK_HEAP_RANGE_PC: u32 = 0x001F_8B88;
-const LOCK_HEAP_RANGE_WRAPPER_PC: u32 = 0x00FF_FD80;
-const UNLOCK_HEAP_RANGE_WRAPPER_PC: u32 = 0x00FF_FDB0;
 
 /// The original first word of LockHeapRange / UnlockHeapRange — the
 /// standard `mov ip, sp` AArch32 prologue. Asserted at install time so
@@ -710,7 +744,6 @@ const NEW_STACK_PAD_BL_PC:        u32 = 0x0025_238C;
 /// `<NewStack>` — the user-mode SWI shim) but going through the
 /// thunk is the architecturally correct path.
 const NEW_STACK_THUNK_PC:         u32 = 0x001B_D7BA4;
-const NEW_STACK_PAD_WRAPPER_PC:   u32 = 0x00FF_FE80;
 /// Original first-word at the BL site — used to assert the patch
 /// applies to the expected ROM. `bl 0x001bd7ba4` from PC 0x25238c
 /// has offset bytes `(0x1bd7ba4 - 0x252394) = 0x1985810`, off in
@@ -2014,28 +2047,30 @@ pub fn read_original(pc: u32) -> Option<u32> {
 /// adjacent entries in the Newton UND-dispatch table, each reachable
 /// as an independent BL target, so neither can occupy two words.
 unsafe fn apply_debug_patches(rom_ptr: *mut u32) {
+    let debug_str_stub_pc = alloc_patch_stub(2, "DebugStr stub");
+    let debugger_stub_pc  = alloc_patch_stub(2, "Debugger stub");
     // MOV r7, lr = E1A0_700E ; HVC #imm
     let debugstr_stub: [u32; 2] = [0xE1A0_700E, hvc_insn(DEBUG_STR_HVC_IMM)];
     let debugger_stub: [u32; 2] = [0xE1A0_700E, hvc_insn(DEBUGGER_HVC_IMM)];
     unsafe {
-        write_stub_words(rom_ptr, DEBUG_STR_STUB_PC, &debugstr_stub);
-        write_stub_words(rom_ptr, DEBUGGER_STUB_PC,  &debugger_stub);
+        write_stub_words(rom_ptr, debug_str_stub_pc, &debugstr_stub);
+        write_stub_words(rom_ptr, debugger_stub_pc,  &debugger_stub);
 
         let word = (0x0038_CE6C / 4) as usize;
         let prev = rom_ptr.add(word).read();
-        let insn = arm_b(0x0038_CE6C, DEBUG_STR_STUB_PC);
+        let insn = arm_b(0x0038_CE6C, debug_str_stub_pc);
         rom_ptr.add(word).write(insn);
         kprintln!(
             "rom_patch: 0x0038ce6c: {:#010x} -> {:#010x}  (DebugStr → B {:#x}, HVC #{:#x})",
-            prev, insn, DEBUG_STR_STUB_PC, DEBUG_STR_HVC_IMM,
+            prev, insn, debug_str_stub_pc, DEBUG_STR_HVC_IMM,
         );
         let word = (0x0038_CE70 / 4) as usize;
         let prev = rom_ptr.add(word).read();
-        let insn = arm_b(0x0038_CE70, DEBUGGER_STUB_PC);
+        let insn = arm_b(0x0038_CE70, debugger_stub_pc);
         rom_ptr.add(word).write(insn);
         kprintln!(
             "rom_patch: 0x0038ce70: {:#010x} -> {:#010x}  (Debugger → B {:#x}, HVC #{:#x})",
-            prev, insn, DEBUGGER_STUB_PC, DEBUGGER_HVC_IMM,
+            prev, insn, debugger_stub_pc, DEBUGGER_HVC_IMM,
         );
     }
 }
@@ -2086,13 +2121,14 @@ unsafe fn apply_real_clock_seconds_patch(rom_ptr: *mut u32) {
 unsafe fn apply_ftime_in_seconds_patch(rom_ptr: *mut u32) {
     const PATCH_PC: u32 = 0x0008_9B80;
     const RETURN_PC: u32 = 0x0008_9B84; // original LDMDB epilogue
-    // Stub body at FTIME_STUB_PC (5 words):
+    let ftime_stub_pc = alloc_patch_stub(5, "FTimeInSeconds stub");
+    // Stub body (5 words):
     //   +0x00 LDR r12, [pc, #8]           ; load delta from +0x10
     //   +0x04 SUB r0, r0, r12             ; r0 = r0 - delta
     //   +0x08 MOV r0, r0, LSL #4          ; callback << 2 + original << 2
     //   +0x0C B <RETURN_PC>               ; resume at the epilogue
     //   +0x10 .word safeIntervalDeltaSeconds
-    let stub_b = arm_b(FTIME_STUB_PC + 0x0C, RETURN_PC);
+    let stub_b = arm_b(ftime_stub_pc + 0x0C, RETURN_PC);
     let stub: [u32; 5] = [
         0xE59F_C008,        // LDR r12, [pc, #8]
         0xE040_000C,        // SUB r0, r0, r12
@@ -2100,9 +2136,9 @@ unsafe fn apply_ftime_in_seconds_patch(rom_ptr: *mut u32) {
         stub_b,             // B RETURN_PC
         SAFE_INTERVAL_DELTA_SECONDS,
     ];
-    let patch_insn = arm_b(PATCH_PC, FTIME_STUB_PC);
+    let patch_insn = arm_b(PATCH_PC, ftime_stub_pc);
     unsafe {
-        write_stub_and_patch(rom_ptr, FTIME_STUB_PC, &stub, PATCH_PC, patch_insn, "FTimeInSeconds");
+        write_stub_and_patch(rom_ptr, ftime_stub_pc, &stub, PATCH_PC, patch_insn, "FTimeInSeconds");
     }
 }
 
@@ -2114,7 +2150,8 @@ unsafe fn apply_ftime_in_seconds_patch(rom_ptr: *mut u32) {
 unsafe fn apply_fdate_from_seconds_patch(rom_ptr: *mut u32) {
     const PATCH_PC: u32 = 0x0008_A8A8;
     const RETURN_PC: u32 = 0x0008_A8AC; // next instruction after the patched MOV
-    let stub_b = arm_b(FDATE_STUB_PC + 0x0C, RETURN_PC);
+    let fdate_stub_pc = alloc_patch_stub(5, "FDateFromSeconds stub");
+    let stub_b = arm_b(fdate_stub_pc + 0x0C, RETURN_PC);
     let stub: [u32; 5] = [
         0xE59F_C008,        // LDR r12, [pc, #8]
         0xE081_100C,        // ADD r1, r1, r12
@@ -2122,9 +2159,9 @@ unsafe fn apply_fdate_from_seconds_patch(rom_ptr: *mut u32) {
         stub_b,             // B RETURN_PC
         SAFE_INTERVAL_DELTA_SECONDS,
     ];
-    let patch_insn = arm_b(PATCH_PC, FDATE_STUB_PC);
+    let patch_insn = arm_b(PATCH_PC, fdate_stub_pc);
     unsafe {
-        write_stub_and_patch(rom_ptr, FDATE_STUB_PC, &stub, PATCH_PC, patch_insn, "FDateFromSeconds");
+        write_stub_and_patch(rom_ptr, fdate_stub_pc, &stub, PATCH_PC, patch_insn, "FDateFromSeconds");
     }
 }
 
@@ -2289,7 +2326,8 @@ unsafe fn apply_resolve_fault_wrapper(rom_ptr: *mut u32) {
     // not the page boundary computed from info[20]) generate -10203.
     // We treat those as "subpage belongs to another stack — skip" and
     // only propagate r0==4 (FindOrAllocPage failure) to the caller.
-    let bl_pc = RESOLVE_FAULT_WRAPPER_PC + 0x3C;
+    let resolve_fault_wrapper_pc = alloc_patch_stub(24, "ResolveFault wrapper");
+    let bl_pc = resolve_fault_wrapper_pc + 0x3C;
     let stub: [u32; 24] = [
         0xE92D_47F0,                            // +0x00 push {r4-r10, lr}
         0xE1A0_4000,                            // +0x04 mov r4, r0
@@ -2318,7 +2356,7 @@ unsafe fn apply_resolve_fault_wrapper(rom_ptr: *mut u32) {
     ];
     unsafe {
         for (i, w) in stub.iter().copied().enumerate() {
-            let offset = RESOLVE_FAULT_WRAPPER_PC + (i as u32) * 4;
+            let offset = resolve_fault_wrapper_pc + (i as u32) * 4;
             let idx = (offset / 4) as usize;
             rom_ptr.add(idx).write(w);
         }
@@ -2326,11 +2364,11 @@ unsafe fn apply_resolve_fault_wrapper(rom_ptr: *mut u32) {
         // Patch the `bl ResolveFault` site inside `Fault` (0x001f84e0).
         let idx = (FAULT_BL_RESOLVE_PC / 4) as usize;
         let prev = rom_ptr.add(idx).read();
-        let insn = arm_bl(FAULT_BL_RESOLVE_PC, RESOLVE_FAULT_WRAPPER_PC);
+        let insn = arm_bl(FAULT_BL_RESOLVE_PC, resolve_fault_wrapper_pc);
         rom_ptr.add(idx).write(insn);
         kprintln!(
             "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (Fault → ResolveFaultWrapper @{:#x})",
-            FAULT_BL_RESOLVE_PC, prev, insn, RESOLVE_FAULT_WRAPPER_PC,
+            FAULT_BL_RESOLVE_PC, prev, insn, resolve_fault_wrapper_pc,
         );
 
         // (FMLockHeapRange BL not patched — covers early bring-up paths
@@ -2365,14 +2403,15 @@ unsafe fn apply_resolve_fault_wrapper(rom_ptr: *mut u32) {
 /// to TTask::Init's post-BL site (0x00252390) as if the call had
 /// gone directly.
 unsafe fn apply_new_stack_pad_wrapper(rom_ptr: *mut u32) {
+    let wrapper_pc = alloc_patch_stub(2, "NewStack pad wrapper");
     // ARM `add r1, r1, #4096` (= 0xE2811A01) — imm12 with rot=0xA,
     // imm8=0x01 → ROR(0x01, 20) = 0x1000.
     let add_r1_4k = 0xE281_1A01u32;
-    let b_target  = arm_b(NEW_STACK_PAD_WRAPPER_PC + 4, NEW_STACK_THUNK_PC);
+    let b_target  = arm_b(wrapper_pc + 4, NEW_STACK_THUNK_PC);
     let stub: [u32; 2] = [add_r1_4k, b_target];
     unsafe {
         for (i, w) in stub.iter().copied().enumerate() {
-            let offset = NEW_STACK_PAD_WRAPPER_PC + (i as u32) * 4;
+            let offset = wrapper_pc + (i as u32) * 4;
             let idx = (offset / 4) as usize;
             rom_ptr.add(idx).write(w);
         }
@@ -2388,11 +2427,11 @@ unsafe fn apply_new_stack_pad_wrapper(rom_ptr: *mut u32) {
             );
             return;
         }
-        let new_bl = arm_bl(NEW_STACK_PAD_BL_PC, NEW_STACK_PAD_WRAPPER_PC);
+        let new_bl = arm_bl(NEW_STACK_PAD_BL_PC, wrapper_pc);
         rom_ptr.add(idx).write(new_bl);
         kprintln!(
             "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (TTask::Init bl NewStack → +4 KiB pad wrapper @{:#x})",
-            NEW_STACK_PAD_BL_PC, prev, new_bl, NEW_STACK_PAD_WRAPPER_PC,
+            NEW_STACK_PAD_BL_PC, prev, new_bl, wrapper_pc,
         );
     }
 }
@@ -2442,8 +2481,8 @@ unsafe fn apply_lock_heap_range_wrapper(rom_ptr: *mut u32) {
     ];
 
     for (wrapper_pc, fn_pc, name) in [
-        (LOCK_HEAP_RANGE_WRAPPER_PC,   LOCK_HEAP_RANGE_PC,   "LockHeapRange"),
-        (UNLOCK_HEAP_RANGE_WRAPPER_PC, UNLOCK_HEAP_RANGE_PC, "UnlockHeapRange"),
+        (alloc_patch_stub(9, "LockHeapRange wrapper"),   LOCK_HEAP_RANGE_PC,   "LockHeapRange"),
+        (alloc_patch_stub(9, "UnlockHeapRange wrapper"), UNLOCK_HEAP_RANGE_PC, "UnlockHeapRange"),
     ] {
         let mut stub = stub_template;
         stub[8] = arm_b(wrapper_pc + 0x20, fn_pc + 4);

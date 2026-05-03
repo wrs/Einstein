@@ -38,6 +38,70 @@ Investigation will need to follow the bus-abort path —
 satisfy, so the ResolveFault/Remember chain is the natural starting
 point.
 
+### Iteration 87 follow-up: arena allocator for stubs + audit fixes
+
+Audit of all fixed-address allocations after iter-87 found two latent
+overlaps the manual-constant scheme couldn't have caught:
+
+1. **`NEW_STACK_PAD_WRAPPER_PC` (`0x00FF_FE80`, NOT installed) overlapped
+   FTIME_STUB (`0x00FF_FE70..0x00FF_FE84`) and FDATE_STUB
+   (`0x00FF_FE84..0x00FF_FE98`).** Iter-87's relocation chose addresses
+   inside the `0xFE60..0xFEC0` gap without accounting for the unused
+   wrapper slot.
+
+2. **`HYP_TRAMP_SCRATCH_BASE = 0x0600_F000` (slot 7680 of SCRATCH_POOL)
+   overlapped `shadow_stub`'s ScratchVA-stub literal area.** Pre-iter-85
+   `SCRATCH_POOL_SIZE = 64 KiB` placed HYP_TRAMP_SCRATCH at the *end*
+   of the pool — out of `NEXT_SCRATCH_SLOT`'s reach. Iter-85 grew the
+   pool to 384 KiB and bumped ScratchVA stubs from 2976 to 10351;
+   slots 7680–7701 are now allocated, so every UND/DABT trap silently
+   overwrote the literals of any stub at those slot indices.
+
+#### Fix 1: patch-stub arena (`src/rom_patches.rs`)
+
+All kernel-side native-primitive stub addresses are now allocated at
+install time from a single arena spanning `0x00FF_FD80..0x00FF_FEC0`
+(320 B). Each `apply_*` function calls
+`alloc_patch_stub(n_words, name)` and gets back the next free PC.
+Overflow halts loudly; the boot log prints every allocation so the
+layout is visible. Per-stub constants (`DEBUG_STR_STUB_PC`,
+`DEBUGGER_STUB_PC`, `FTIME_STUB_PC`, `FDATE_STUB_PC`,
+`RESOLVE_FAULT_WRAPPER_PC`, `LOCK_HEAP_RANGE_WRAPPER_PC`,
+`UNLOCK_HEAP_RANGE_WRAPPER_PC`, `NEW_STACK_PAD_WRAPPER_PC`) are
+deleted; functions that need to address into their own stub pass
+`wrapper_pc` as a local.
+
+Boot-time allocation order under the current configuration:
+- DebugStr / Debugger stubs (8 B each) → `0x00FF_FD80`, `0x00FF_FD88`
+- FTimeInSeconds / FDateFromSeconds stubs (20 B each) → `0x00FF_FD90`, `0x00FF_FDA4`
+- ResolveFault wrapper (96 B) → `0x00FF_FDB8`
+
+Total 152 B; cursor lands at `0x00FF_FE18` with 168 B slack before
+the FPA bypass stub at `0x00FF_FEC0`.
+
+#### Fix 2: reserve first 32 slots of SCRATCH_POOL for hypervisor scratch
+
+`shadow_stub::NEXT_SCRATCH_SLOT` initial value bumped from 0 to
+`RESERVED_SCRATCH_SLOTS = 32` (256 B). `HYP_TRAMP_SCRATCH_BASE`
+relocated from `0x0600_F000` to `SCRATCH_POOL_IPA` (`0x0600_0000`).
+The trampoline's footprint (UND saves at `+0x00..0x1C`, DABT saves
+at `+0xA0..0xAC`) fits comfortably inside the 256 B reservation.
+
+#### Audit summary (clean after fixes)
+
+- **Trampoline tail (`0x00FF_FD80..0x0100_0000`):** RESOLVE_FAULT
+  wrapper, kernel-patch stubs, FPA bypass, UND tramp, SBA pre/post,
+  DABT tramp, UND return stub — all back-to-back, no overlaps.
+- **Stage-2 IPA layout:** ROM (`0x0..0x1000000`), RAM
+  (`0x4M..0x5M`), SCRATCH_POOL with 32-slot hypervisor reservation
+  (`0x6000000..0x6060000`), SHADOW_POOL (`0x6060000..0x6070000`),
+  framebuffer (`0xE000000+`), MMIO (`0xF000000+`), GIC
+  (`0x2F000000+`) — non-overlapping with healthy gaps.
+- **HVC immediates:** all unique.
+
+36/36 guest tests pass; cold boot reaches the same iter-88 wedge
+(`evt.ex.abt.bus`).
+
 ### Iteration 87: relocate kernel-patch stubs out of the UND trampoline window
 
 #### Symptom

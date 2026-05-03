@@ -61,15 +61,20 @@ include!(concat!(env!("OUT_DIR"), "/rom_rex_hash.rs"));
 static BYTE_ACCESS_STATIC_BITMAP: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/byte-access-static.bitmap"));
 
-/// Addresses < XOR_LIMIT are treated as real memory (XOR applied);
-/// addresses >= XOR_LIMIT are treated as MMIO and passed through.
-/// Chosen to cover everything in the Newton IPA map below flash bank 1.
+/// Historical "below this is real memory, above is MMIO" cutoff.
+/// Kept around for documentation but no longer used by the dispatch
+/// logic — see the `dispatch_*` functions, which now try the XOR'd
+/// address against backed memory first regardless of `ea`'s range.
 ///
-/// The XOR is correct for both memory and the Newton's tick-page MMIO
-/// at 0x0F18_1000 (stage-2-mapped RAM, BE-32 view). Trap-for-dispatch
-/// MMIO addresses below XOR_LIMIT don't exist in the current peripheral
-/// map; if any appear, the XOR'd address will stage-2-fault and
-/// `mmio::read`/`write` will halt loudly on the unrecognised IPA.
+/// The original heuristic broke once we observed the Newton kernel
+/// reading flash bank 0 data through the PCMCIA aperture VAs
+/// (`0x30000000+`), which sit above this cutoff. Stage-1 maps those
+/// VAs back to flash PAs, so the access *is* against backed memory
+/// and the BE→LE byte swizzle (XOR-3 / XOR-2) must apply, even
+/// though the EA itself is in what the heuristic called the "MMIO
+/// range". `dispatch_byte_read` and friends now apply the swizzle
+/// whenever `(ea ^ XOR)` resolves to a backed PA, falling through
+/// to MMIO dispatch only when the XOR'd address has no backing.
 pub const XOR_LIMIT: u32 = 0x1000_0000;
 
 /// Low end of the UDF immediate band reserved for shadow-byte-access
@@ -2603,25 +2608,17 @@ fn backed_halfword_write(pa: u32, val: u16) -> bool {
     false
 }
 
-/// Dispatch a byte load: try backed memory (with XOR) first; fall back
-/// to MMIO for IPAs outside our backing stores, or unconditionally for
-/// `ea >= XOR_LIMIT`.
+/// Dispatch a byte load. Try the BE-on-LE swizzled address first
+/// (`ea ^ 3`); if it resolves to backed memory (RAM, ROM, FB, flash)
+/// we return that byte regardless of where `ea` itself sits in the IPA
+/// map. This covers the case where stage-1 page tables alias a backed
+/// region into a high VA (e.g. the kernel reads flash bank 0 through
+/// the PCMCIA aperture at `0x30000000+`). Only fall through to MMIO
+/// dispatch when the XOR'd address has no backing.
 fn dispatch_byte_read(ea: u32, faulting_pc: u32) -> u8 {
-    if ea < XOR_LIMIT {
-        let addr = ea ^ 3;
-        if let Some(pa) = resolve_addr(addr) {
-            if let Some(v) = backed_byte_read(pa) {
-                return v;
-            }
-        }
-    } else {
-        // MMIO-range read: no XOR, try backed stores first (flash bank 1
-        // lives at IPA 0x10000000, which is >= XOR_LIMIT but is real
-        // memory), then fall through to mmio dispatch.
-        if let Some(pa) = resolve_addr(ea) {
-            if let Some(v) = backed_byte_read(pa) {
-                return v;
-            }
+    if let Some(pa) = resolve_addr(ea ^ 3) {
+        if let Some(v) = backed_byte_read(pa) {
+            return v;
         }
     }
     let pa = resolve_addr(ea).unwrap_or_else(|| {
@@ -2637,18 +2634,9 @@ fn dispatch_byte_read(ea: u32, faulting_pc: u32) -> u8 {
 }
 
 fn dispatch_byte_write(ea: u32, val: u8, faulting_pc: u32) {
-    if ea < XOR_LIMIT {
-        let addr = ea ^ 3;
-        if let Some(pa) = resolve_addr(addr) {
-            if backed_byte_write(pa, val) {
-                return;
-            }
-        }
-    } else {
-        if let Some(pa) = resolve_addr(ea) {
-            if backed_byte_write(pa, val) {
-                return;
-            }
+    if let Some(pa) = resolve_addr(ea ^ 3) {
+        if backed_byte_write(pa, val) {
+            return;
         }
     }
     let pa = resolve_addr(ea).unwrap_or_else(|| {
@@ -2662,18 +2650,9 @@ fn dispatch_byte_write(ea: u32, val: u8, faulting_pc: u32) {
 }
 
 fn dispatch_halfword_read(ea: u32, faulting_pc: u32) -> u16 {
-    if ea < XOR_LIMIT {
-        let addr = ea ^ 2;
-        if let Some(pa) = resolve_addr(addr) {
-            if let Some(v) = backed_halfword_read(pa) {
-                return v;
-            }
-        }
-    } else {
-        if let Some(pa) = resolve_addr(ea) {
-            if let Some(v) = backed_halfword_read(pa) {
-                return v;
-            }
+    if let Some(pa) = resolve_addr(ea ^ 2) {
+        if let Some(v) = backed_halfword_read(pa) {
+            return v;
         }
     }
     let pa = resolve_addr(ea).unwrap_or_else(|| {
@@ -2687,18 +2666,9 @@ fn dispatch_halfword_read(ea: u32, faulting_pc: u32) -> u16 {
 }
 
 fn dispatch_halfword_write(ea: u32, val: u16, faulting_pc: u32) {
-    if ea < XOR_LIMIT {
-        let addr = ea ^ 2;
-        if let Some(pa) = resolve_addr(addr) {
-            if backed_halfword_write(pa, val) {
-                return;
-            }
-        }
-    } else {
-        if let Some(pa) = resolve_addr(ea) {
-            if backed_halfword_write(pa, val) {
-                return;
-            }
+    if let Some(pa) = resolve_addr(ea ^ 2) {
+        if backed_halfword_write(pa, val) {
+            return;
         }
     }
     let pa = resolve_addr(ea).unwrap_or_else(|| {

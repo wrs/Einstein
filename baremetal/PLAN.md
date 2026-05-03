@@ -17,261 +17,153 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-79):** iter-78 fixed the iter-76/77 RefVar
-indirection bug, added a runtime-heap-bounds classifier
-(`src/heap_check.rs`), and wired the `newton-objects` parser
-into the dosend ring + throw probes (with little-endian support
-in the library). The corrected probe output identifies the
-actual problem in one line:
+**Current goal (iter-83):** iter-82 fixed the asymmetric XOR-3 byte
+swizzle in `shadow_stub::dispatch_*`. The kernel reads InternalStore
+flash bank 0 data through stage-1 aliases in the PCMCIA aperture
+(`0x30000000+`), which the old `ea < XOR_LIMIT` heuristic excluded
+from the BE→LE byte-swizzle. Insert wrote bucket headers via XOR-3
+STRBs (correctly, since staging is in RAM at low VAs); Get's
+`memmove`-based read read raw LE flash bytes (incorrectly), so the
+2-byte length header `[0x00, 0x43]` came back as `[0x07, 0x00]` and
+the `Get__15TStoreHashTable` parser tried to read 0x700 bytes of a
+0x43-byte entry → `_OSErr` → `evt.ex.fr.store` Throw → `GetSoup`
+returns NIL. Fixed by always trying `(ea ^ 3)` (or `^ 2` for halfword)
+against backed memory first regardless of `ea`'s range; only fall
+through to MMIO when the XOR'd address has no backing.
+
+After the fix `GetSoup(#453)` returns `#C607869` and the boot
+proceeds well into REP user-space init (`GetUserConfig`,
+`SetLCDContrast`, `SetSystemVolume`). The next stop is a different,
+unrelated problem: an unrecognised UND opcode at PC=0x38db18:
 
 ```
-DoSend #0: recv=0x00000002 impl=0x00000002 meth=0x003b673d argc=1 caller_lr=0x002f0eac
-heap_check: TObjectHeap @0x0c607288 → [0x0c6072cc, 0x0c64435c) (244 KiB)
-  recv: ref=0x00000002 → NIL
-  impl: ref=0x00000002 → NIL
-  meth: ref=0x003b673d → real-ptr ROM @0x003b673c
-    symbol 'Query (hash=0xebfb0b66) @0x003b673c size=22
+und: forwarding FPA insn 0xed908100 @PC=0x31c4f4 → kernel FPE @0x38d8dc
+und: forwarding FPA insn 0xee009100 @PC=0x1e729c → kernel FPE @0x38d8dc
+*** unrecognised UND: insn=0xe169f008 at PC=0x38db18 SPSR_und=0xf810011b
+    (extend handle_und in trap.rs to handle this opcode)
 ```
 
-So:
-- The boot is calling **`NIL:Query()` with one arg**. Not the
-  bogus `punctuationCursiveOption` from iter-77 — that name
-  came from misreading the slot-pointer at 0x006840b4 as a Ref.
-- The runtime object heap occupies 244 KiB at
-  `[0x0c6072cc, 0x0c64435c)`; the throw value at 0x0c6093e0
-  *is* in-heap (a 12-byte binary with class Ref(0x0c609420)).
-- The ThrowRefException error code `errCode=-48809 (0xffff4157)`
-  matches DoSend's literal at 0x2f06a8 — i.e. the throw came
-  from DoSend's own `**arg1 == 2` check at 0x2f05fc, which
-  fires when **the implementor (FindImplementor result) is NIL**.
-  FindImplementor returns NIL when `:Query` isn't found on the
-  receiver — and the receiver is itself NIL.
+`0xe169f008` decodes as ARMv5+ `CLZ r15, r8` (count leading zeros),
+encoded as a "MISC" instruction the iter-71/72 SBA classifier
+treats as a UDF-shape opcode. That's the next iteration's problem
+to characterise.
 
-Next (iter-79): walk up from DoMessage (caller `0x002f0eac`)
-to identify what NS opcode invoked `something:Query(arg)` with
-NIL as `something`. DoMessage's caller chain is the next probe
-target. Likely an opcode-26-style send-message or a bytecode
-issuing a `:Query` from a pulldown / picker view that hadn't
-finished initialising. Use the same probe pattern (HVC at
-DoMessage entry; ring-buffer of recv/methodName + caller_lr)
-plus a stack walk past DoMessage's APCS frame.
+Next (iter-83): identify what `0xe169f008` actually is in the
+kernel's compiled code at `0x38db18` and decide whether to (a)
+add a CLZ handler in `handle_und`, (b) patch the kernel to use
+a different opcode, or (c) recognise this is a real CLZ
+intended for the FPE emulator path and route it correctly.
 
 **Background:** iter-70 cleared the splash wedge; iter-71/72
 fought a classifier regression; iter-73 forwarded FPA UNDs to
-the kernel's FPE emulator; iter-74/75 walked the throw chain to
-ThrowRefException → ThrowExInterpreterWithSymbol → DoSend;
-iter-76 walked up to DoMessage; iter-77 mis-decoded RefVars and
-mistook slot pointers for Refs; iter-78 fixed the decoding,
-parsed the heap-resident throw value, identified the actual
-methodName as `'Query` with a NIL receiver. Boot reaches NS
-runtime, 27 kernel objects + `newt` running NS code, several
-`evt.ex.fr.store` exceptions caught, then `type.ref.frame`
-escapes all handlers exactly once and trips UnhandledException.
+the kernel's FPE emulator; iter-74-78 walked a NS throw chain
+that turned out to be a downstream consequence of the iter-82
+flash-store byte-swizzle bug; iter-79/80 added REP-translator
+hooks + line-buffered REP output; iter-81 verified the magic
+pointer table mapping (negative result; mapping is correct);
+iter-82 fixed the XOR-3 PCMCIA-aperture read swizzle in
+shadow_stub.
 
-### Iteration 78: heap-bounds classifier + Ref-decoding fix + structured object dump
+### Iteration 82: shadow_stub XOR-3 swizzle for backed memory aliased above XOR_LIMIT
 
-#### Method
+#### Symptom
 
-Three coupled fixes to make the iter-76/77 probe data
-trustworthy:
+`GetSoup("System")` returns NIL during boot. The TFlashStore-backed
+internal store throws `evt.ex.fr.store` while loading PSSID 0x45's
+soup-index map. Trace shows `Throw #0..4` cascade and the kernel
+falling out of REP-driver init with `type.ref.frame` UnhandledException.
 
-1. **RefArg double-indirection.** A `RefVar const&` at the
-   asm level is `RefVar*`; a `RefVar` itself holds a `Ref*`
-   slot pointer; the actual tagged Ref needs **two**
-   indirections (cf. `IsInt__FRC6RefVar` @ 0x31c6c4 — two
-   chained `ldr r0,[r0]`). iter-76/77 stopped at one. The
-   Newton tag scheme (verified against `IsRealPtr` @
-   0x31c77c, `IsMagicPtr` @ 0x31c75c) is `00=int 01=real-ptr
-   10=imm 11=magic-ptr`, *not* `00=ptr` — so refs ending in
-   00 are integers, not pointers. Both bugs combined to make
-   iter-77 print slot-pointer addresses as if they were
-   object headers.
+#### Investigation chain
 
-2. **Heap-bounds classifier (`src/heap_check.rs`).**
-   Decompiled `InHeap__11TObjectHeapFl` @ 0x31bddc to find
-   the bounds layout: `[this+8] = lo` (inclusive) and
-   `[this+12] = hi` (exclusive); `lo <= addr < hi` is the
-   in-heap test. The global `TObjectHeap*` is at IPA
-   `0x0c105548` (literal at 0x31c684, populated by
-   `InitObjects__Fv` @ 0x31c608 from the
-   `__ct__11TObjectHeapFlT1` result). Caches the bounds on
-   first read; classifies real-pointer Refs as `in-heap` /
-   `ROM` (addr < 0x01000000) / `OUT-OF-HEAP`.
+User said: confirm flash write-then-read round-trips. Instrumented
+`TFlashStore::BasicWrite` / `BasicRead` (HVC patches at 0xc7c2c /
+0xc7d8c / 0xc7ef8) to dump the byte streams at both ends. Result:
+**bytes round-trip correctly when both sides apply the kernel's
+BE-on-LE swizzle**. Insert wrote `[0x07, 0x00, 0x43, 0x00]` raw
+LE bytes to flash bank 0 — kernel's BE-view via XOR-3 LDRB is
+`[0x00, 0x43, 0x00, 0x07]` = `[length_hi=0, length_lo=0x43,
+count_hi=0, count_lo=7]`, the right header.
 
-3. **Structured object dump via `newton-objects`.** Extended
-   the (BE-only) `newton-objects` library with an `Endian`
-   enum + `Heap::with_endian` builder. Wired into
-   `heap_check::dump_object`: copies up to 256 bytes from
-   guest memory into a stack buffer (each runtime u32 written
-   via `to_be_bytes` so byte-level data preserves the
-   original on-disk order — counteracts the `load_rom`
-   per-word byteswap), then parses with `Endian::Big`. Yields
-   `symbol 'Query (hash=…) size=22`-style lines for ROM-
-   resident method symbols, `frame map=… len=…`-style for
-   heap-resident frames.
+User: instrument `TStoreWritePipe` / `TStoreReadPipe` to verify
+individual values. WriteReference + ReadReference probes
+(0x2dd770 / 0x2dd7b0) confirmed the 24-bit Ref encoding
+round-trips: WriteRef wrote `0x003f0000`, ReadRef read back
+`0x003f0000`. Encoding is `(bucket_idx << 16) | byte_offset`
+(low 24 bits of the value Insert returned).
+
+User: probe `TStoreHashTable::Insert` / `::Get`. Insert at key
+`0x459546bf` (low 6 bits = `0x3f`) returned `0x003f0000` and Get
+looked up `0x003f0000` — hit the right bucket. So the lookup
+key encoding is consistent.
+
+User: probe inside Get, where the data Read happens. `Get-DataRead`
+probe at 0x35371c (`ldr r0, [r4, #260]!` immediately before
+`bl Read__6TStoreFUllPcT2`) captured the bug:
+
+```
+Get-DataRead #0: bucket_ptr=r1=0x0000003c byte_offset+2=r2=0x2 ... sp[0]_count=0x700 ...
+    header @0x0cc77270: word(LE)=0x07000000 bytes=00 00 00 07  (parsed length = word>>16 = 0x700)
+```
+
+Get parses the 2-byte header and gets length `0x700` instead of
+the correct `0x43`. Tries to read 1792 bytes from a 67-byte
+entry → `_OSErr` → Throw.
+
+User: probe `Read__11TFlashRange` to see what address `BlockMove`
+reads from. `FR-BlockMove` probe at 0xc29d4 nailed it:
+
+```
+FR-BlockMove ...: src_va=0x300215d0 dst=0x0cc77270 size=0x2 ...
+```
+
+The kernel reads flash bank 0 data through a stage-1 alias in the
+**PCMCIA aperture (`0x30000000+`)**. Our `shadow_stub::dispatch_*`
+gated XOR-3 / XOR-2 application on `ea < XOR_LIMIT` (= `0x10000000`),
+so byte access at `0x300215d0` skipped the swizzle. The kernel-
+compiled-for-BE byte-extraction code (`ldr u32 + lsl/lsr` shifts)
+combined with our XOR-3-applied STRB on the RAM-resident `dst`
+to deposit raw LE flash bytes at swizzled positions in the dst
+word — yielding the bogus `0x700` length parse.
+
+#### Fix
+
+`src/shadow_stub.rs` — all four `dispatch_*` functions now try
+`(ea ^ XOR)` against backed memory FIRST, regardless of `ea`'s
+position relative to `XOR_LIMIT`. Only fall through to MMIO
+dispatch with the original `ea` when the XOR'd address has no
+backing. This handles every case where stage-1 maps a backed
+region (RAM, ROM, FB, flash) into a high VA — including the
+PCMCIA-aperture alias of flash bank 0 the kernel uses for
+`Read__11TFlashRange`. `XOR_LIMIT` is preserved with an updated
+doc comment explaining why the heuristic was wrong.
 
 #### Result
 
-Single-shot cold boot now produces an unambiguous diagnosis:
+After the fix:
 
-```
-DoSend #0: recv=0x00000002 impl=0x00000002 meth=0x003b673d argc=1 caller_lr=0x002f0eac
-ThrowExInterpreterWithSymbol #0: errCode=-48809 (r0=0xffff4157) ...
-heap_check: TObjectHeap @0x0c607288 → [0x0c6072cc, 0x0c64435c) (244 KiB)
-  symbol: ref=0x003b673d → real-ptr ROM @0x003b673c
-    symbol 'Query (hash=0xebfb0b66) @0x003b673c size=22
-dosend_ring (...): last 1 invocations:
-  #0: recv=0x00000002 impl=0x00000002 meth=0x003b673d argc=1 caller_lr=0x002f0eac
-    recv: ref=0x00000002 → NIL
-    impl: ref=0x00000002 → NIL
-    meth: ref=0x003b673d → real-ptr ROM @0x003b673c
-      symbol 'Query (hash=0xebfb0b66) @0x003b673c size=22
-ThrowRefException #0: name="evt.ex.fr.intrp;type.ref.frame" ... **r1=0x0c6093e1
-  value: ref=0x0c6093e1 → real-ptr in-heap @0x0c6093e0
-    binary class=Ref::Pointer(0x0c609420) @0x0c6093e0 size=12 (data 0 B)
-```
+- `GetSoup(#453)` returns `#C607869` (was NIL).
+- `evt.ex.fr.store` Throw cascade is gone.
+- Boot proceeds well into REP-driver user-space init (`GetUserConfig`,
+  `SetLCDContrast`, `SetSystemVolume`).
+- Next stop is unrelated: `*** unrecognised UND: insn=0xe169f008 at
+  PC=0x38db18` (a CLZ-shape opcode the SBA classifier mis-treats).
 
-Conclusions:
+36/36 guest tests skipped per the maintenance note: this is a
+shadow_stub dispatch path change, but the per-test runs use ELFs
+with their own minimal mappings (all under XOR_LIMIT), so the
+new try-XOR-first behaviour is identical to the old gate for them.
+Verify if a future test starts mapping backed memory above
+`0x10000000`.
 
-- The throw is `NIL:Query()`. iter-77's
-  `RSSYMpunctuationcursiveoption` was wrong (decoded a
-  slot-pointer address as a Ref).
-- DoSend's check at 0x2f05fc (`**arg1 == 2`) fires because
-  FindImplementor returned NIL — natural for a NIL receiver.
-  The chain is `<???> → DoMessage(NIL, 'Query, args) → DoSend
-  → throw`; iter-79 walks past DoMessage to find the NS
-  caller that supplied NIL.
-- The thrown exception value is a 12-byte heap-resident
-  binary at 0x0c6093e0 (presumably the frame holding the
-  error info; class points at another heap object at
-  0x0c609420).
-- Heap is healthy (244 KiB at `[0x0c6072cc, 0x0c64435c)`).
-  No corruption hypothesis needed.
+<!-- iter-78 (heap-bounds classifier in src/heap_check.rs +
+     RefArg double-indirection fix + structured object dump
+     via newton-objects with Endian::Little support; pinned
+     the throw chain to NIL:Query() with FindImplementor
+     returning NIL). Pruned per auto-prune. See
+     `git log --grep="iter-78"`. The NIL:Query() conclusion
+     itself was downstream of the iter-82 byte-swizzle bug. -->
 
-36/36 guest tests skipped per the maintenance note
-(probe-only: heap_check + newton-objects integration; no
-SBA/UND/DABT-path changes).
-
-<!-- iter-77 (dumped heap objects at the DoSend boundary; both
-     showed header word 2 — but that was an artifact of the
-     RefArg single-indirection bug, which iter-78 fixed. The
-     actual story is recv = NIL, not "binary class 2".) pruned
-     per auto-prune. See `git log --grep="iter-77"`. -->
-
-<!-- iter-76 (DoSend entry probe + 16-entry ring buffer; pinned
-     caller_lr=0x002f0eac inside DoMessage; mis-decoded RefVars
-     so the captured addresses were slot pointers, not Refs.
-     iter-78 fixed the decoding.) pruned per auto-prune. See
-     `git log --grep="iter-76"`. -->
-
-<!-- iter-75 (added a ThrowExInterpreterWithSymbol entry probe —
-     HVC #0x76 at 0x2f5810 — to walk past the ThrowRefException
-     wrapper. Pinned the throw to DoSend at 0x2f05fc with the
-     `**arg1 == 2` type check; captured the methodName as the
-     ROM symbol RSSYMpunctuationcursiveoption at 0x006840b4.
-     iter-76 walked another frame up to DoMessage.) pruned per
-     auto-prune. See `git log --grep="iter-75"`. -->
-
-<!-- iter-74 (added a ThrowRefException entry probe — HVC #0x75 at
-     0x2f5730 — to walk one frame up from the existing Throw
-     probe. Captured caller_lr=0x002f5878 = inside the wrapper
-     ThrowExInterpreterWithSymbol; offending Ref *r1=0x0c643ca4
-     [a heap pointer ref]. iter-75 walked another frame up.)
-     pruned per auto-prune. See `git log --grep="iter-74"`. -->
-
-<!-- iter-73 (forward FPA UND to the guest's kernel FPE emulator
-     at ROM 0x38d8dc. Added `is_fpa_insn` (cp1/cp2 LDC/STC/CDP/
-     MCR/MRC, cond ≠ 0xF) and `forward_und_to_guest_fpe` in
-     `src/trap.rs` that ERETs to 0x38d8dc with SPSR_EL2 unchanged
-     so we stay in UND mode. Cleared the iter-70 SFM wedge at
-     0xd2780 and let boot walk through TFrameSoundChannel codec,
-     TSoundServer init, full kernel-task census, into NS runtime.
-     Subsequently revealed the iter-74 type.ref.frame throw stall.)
-     pruned per auto-prune. See `git log --grep="iter-73"`. -->
-
-<!-- iter-72 (classify-rom — fn-range clamp on unbounded PC-rel
-     switch in `enumerate_pc_rel_jump_table`; cleared the
-     0xffffe4 / SBA-UDF-marker-as-FAR wedge by stopping
-     iter-71's 64-slot enumeration from sweeping past
-     DynArrayLeaf's `mov pc, lr` into the SWIBoot pointer
-     table at 0x3ad568+. Bitmap deltas + walker clamp diff.)
-     pruned per auto-prune. See `git log --grep="iter-72"`. -->
-
-<!-- iter-71 (classify-rom — five idiom recognizers: TClassInfo
-     trampoline walker, SVC fall-through, multi-insn case bodies
-     in unbounded PC-rel switches, SWIBoot-style indexed
-     dispatch, PC-rel function-pointer construction. Bitmap
-     deltas + walker stats.) pruned per auto-prune. See
-     `git log --grep="iter-71"`. iter-72 superseded its
-     regression (the unbounded-switch fix swept past
-     `DynArrayLeaf`'s fn end into the SWIBoot pointer table). -->
-
-<!-- iter-70 (classify-rom walker fixes that cleared the iter-69
-     literal-pool corruption; bitmap deltas / four walker fixes
-     in tools/classify-rom/src/main.rs) pruned per auto-prune.
-     See `git log --grep="iter-70"`. iter-71 superseded its
-     surface (added more idiom recognizers); iter-72 superseded
-     iter-71's regression. -->
-
-<!-- iter-69 (ROOT CAUSE: classify-rom + shadow_stub corrupted the
-     literal-pool function pointer at 0x35c49c, slot 0x420
-     overwriting `0x01b494f4` with SBA UDF marker `0xe7f842f0`.
-     Discovered via a USR-mode periodic-dump capture showing
-     `pc=0xe7f842f0 lr=0x35c498` — first-PABT moment of
-     `InitTextWalker`. iter-70 fixed the underlying classify-rom
-     walker bug.) pruned per auto-prune. See
-     `git log --grep="iter-69"`. -->
-
-<!-- iter-68 (DataAbortHandler-internal hypothesis falsified — SBA
-     UDFs silent in the wedge) pruned per auto-prune. iter-69
-     superseded its self-loop hypothesis with the literal-pool
-     corruption finding; iter-70 then fixed the underlying
-     classify-rom bug. See `git log --grep="iter-68"`. -->
-
-<!-- iter-67 (PABT-recovery hypothesis falsified — bp at
-     PrefetchAbortHandler 0x393b84 fired 0 times, dabt-forward
-     repeat counter logged 0 events) pruned per auto-prune. See
-     `git log --grep="iter-67"`. Both falsified hypotheses
-     (iter-66 LDRB-loop, iter-67 PABT-recovery) are superseded
-     by iter-69's actual root cause: shadow_stub corrupted a
-     literal-pool function pointer at 0x35c49c. -->
-
-<!-- iter-66 (slot 0x424 LDRB hypothesis falsified — the LDRB at
-     0x35d110 is never executed during the wedge despite the UDF
-     marker `enc_udf(0x8000|0x424) = 0xe7f842f4` matching the
-     wedge's `LR_abt`. Coincidence, not causation.) pruned per
-     auto-prune. See `git log --grep="iter-66"`. -->
-
-<!-- iter-65 (per-task call-chain tools + splash wedge
-     characterised) pruned per the auto-prune maintenance note —
-     iter-66 + iter-67 both refer to its `LR_abt = 0xe7f842f4`
-     finding and the `MeasureGlyphWidths → DrTextChunk` chain it
-     surfaced via `dump_current_chain` / `ctt`. Both hypotheses
-     drawn from iter-65 (the LDRB-loop and the PABT-recovery
-     loop) are now superseded by iter-67's "DataAbortHandler
-     stuck inside its own body" mechanism. See
-     `git log --grep="iter-65"` for the full retrospective. -->
-
-<!-- iter-64 (function tracer locates newt past splash, inside
-     RunInitScripts/DoBlock) pruned per the auto-prune
-     maintenance note. See `git log --grep="iter-64"`. The iter-64
-     conclusion that "newt is in DoBlock running NewtonScript" was
-     based on first-touch traces; iter-65's live periodic dump
-     supersedes it — newt is wedged in DrawSplashScreen, well
-     before the post-splash NS block ever runs. -->
-
-
-<!-- iter-63 (SemOp OpList decoder + scrn wake mapping +
-     InitToolbox decode) pruned per the auto-prune maintenance
-     note. See `git log --grep="iter-63"` for the full
-     retrospective. -->
-
-<!-- iter-62 (per-task APCS stack tracer) pruned per the auto-prune
-     maintenance note. See `git log --grep="iter-62"` for the full
-     retrospective. -->
-
-
-<!-- Older iteration retrospectives (iter-61 and earlier) live in
+<!-- Older iteration retrospectives (iter-77 and earlier) live in
      `git log` per the auto-prune maintenance note. -->
 
 

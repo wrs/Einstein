@@ -283,8 +283,9 @@ halfword accesses target a different byte lane and must be fixed up.
 `src/shadow_stub.rs` handles that by replacing each LDRB/STRB/LDRH/
 STRH/LDRSB/LDRSH/SWPB in the ROM with a `UDF #imm16` marker that
 traps into EL2, where the handler decodes the original instruction
-from a site-index table and emulates the access (XOR'ing the
-effective address on real memory, passing through for MMIO). For
+from a site-index table and emulates the access (XOR-3 / XOR-2
+the effective address whenever it resolves to backed memory,
+passing through for MMIO). For
 that to be both correct (every real byte/halfword access patched)
 and safe (no data bytes overwritten), the patcher needs an exact
 list of byte-access PCs.
@@ -406,9 +407,17 @@ decoder the single source of truth.
    stashing the banked registers.
 4. Compute the effective address from Rn + offset (with optional
    Rm-shift); pre/post-index as encoded.
-5. If `ea < XOR_LIMIT` (= 0x1000_0000), XOR with 3 (byte) or 2
-   (halfword) — the BE-32 byte-lane transform. Otherwise pass
-   through (MMIO range).
+5. Always try `(ea ^ 3)` (byte) or `(ea ^ 2)` (halfword) against
+   backed memory first — the BE-32 byte-lane transform. If the
+   XOR'd address resolves to backed RAM / ROM / FB / flash, that's
+   the lookup we use. Only if the XOR'd address has no backing do
+   we fall through to the original `ea` against MMIO dispatch.
+   The `XOR_LIMIT = 0x1000_0000` constant is preserved for
+   documentation but no longer gates the dispatch — its `ea <
+   XOR_LIMIT` heuristic broke once we observed the kernel
+   reading flash bank 0 through stage-1 aliases in the PCMCIA
+   aperture (`0x30000000+`), which sits above the cutoff. See
+   iter-82 in PLAN.md for the diagnostic chain.
 6. Translate VA→PA via the live stage-1 tables if `SCTLR_EL1.M=1`;
    identity otherwise.
 7. Perform the load / store. For IPAs in ROM / RAM / FB / flash

@@ -2259,12 +2259,28 @@ fn handle_und(ctx: &mut TrapContext) {
         // pre-UND CPSR. ELR_EL2 = 0x38d8dc with SPSR_EL2 unchanged
         // (= UND mode) hands control off cleanly.
         _ if is_fpa_insn(insn) => {
-            forward_und_to_guest_fpe(faulting_pc, insn);
+            forward_und_to_guest_fpe(ctx, faulting_pc, insn, spsr_und);
         }
         _ => {
             kprintln!(
                 "*** unrecognised UND: insn={:#010x} at PC={:#x} SPSR_und={:#x}",
                 insn, faulting_pc, spsr_und
+            );
+            kprintln!(
+                "  src_mode={:#x} ({})  r0..r7:   {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+                (spsr_und as u32) & 0x1F,
+                describe_aarch32_mode((spsr_und as u32) & 0x1F),
+                ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
+                ctx.x[4] as u32, ctx.x[5] as u32, ctx.x[6] as u32, ctx.x[7] as u32,
+            );
+            kprintln!(
+                "                       r8..r15:  {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+                ctx.x[8] as u32, ctx.x[9] as u32, ctx.x[10] as u32, ctx.x[11] as u32,
+                ctx.x[12] as u32, ctx.x[13] as u32, ctx.x[14] as u32, ctx.x[15] as u32,
+            );
+            kprintln!(
+                "                       SP_und=ctx.x[23]={:#x} LR_und=ctx.x[22]={:#x}",
+                ctx.x[23] as u32, ctx.x[22] as u32,
             );
             kprintln!(
                 "    (extend handle_und in trap.rs to handle this opcode)"
@@ -2342,8 +2358,8 @@ const ROM_FPE_START_PC: u64 = 0x0038_d8dc;
 /// Leaving it unchanged ERETs back into UND mode, which is exactly what
 /// the FPE emulator expects. ELR_EL2 = 0x38d8dc points at the body that
 /// reads `LR - 4` to recover the faulting PC.
-fn forward_und_to_guest_fpe(faulting_pc: u32, insn: u32) {
-    log_fpa_forward(faulting_pc, insn);
+fn forward_und_to_guest_fpe(ctx: &TrapContext, faulting_pc: u32, insn: u32, spsr_und: u64) {
+    log_fpa_forward(faulting_pc, insn, ctx, spsr_und);
     // SAFETY: writing ELR_EL2 from EL2 is unconditionally permitted.
     // Leave SPSR_EL2 alone so ERET resumes in UND mode.
     unsafe {
@@ -2356,34 +2372,38 @@ fn forward_und_to_guest_fpe(faulting_pc: u32, insn: u32) {
     }
 }
 
-/// Budgeted log for FPA UNDs forwarded to the kernel's FPE emulator.
-/// Prints once per unique (PC, insn) so a hot FPA-using loop doesn't
-/// flood the UART.
-fn log_fpa_forward(pc: u32, insn: u32) {
-    const SEEN_CAP: usize = 32;
-    static mut SEEN: [(u32, u32); SEEN_CAP] = [(0, 0); SEEN_CAP];
+/// Diagnostic log for FPA UNDs forwarded to the kernel's FPE emulator.
+/// Prints the first `LOG_BUDGET` forwards (no PC-based dedup) so we see
+/// the full sequence of forwards leading up to any halt — when the FPE
+/// epilogue's `msr SPSR_fc, r8` fires UND because A53/QEMU treats it as
+/// undefined even from privileged AArch32, having every preceding
+/// forward's source mode + frame state on hand is what lets us
+/// characterise the R12/IP drift reported as the iter-83 stall.
+///
+/// The source mode comes from the trampoline-saved SPSR_und slot
+/// (handled to handle_und as the `spsr_und` local) — *not* SPSR_EL2,
+/// which captures the trampoline's own UND-mode CPSR after the
+/// mode-switch dance and is useless for diagnosing the actual fault.
+fn log_fpa_forward(pc: u32, insn: u32, ctx: &TrapContext, spsr_und: u64) {
+    const LOG_BUDGET: usize = 16;
     static mut SEEN_N: usize = 0;
     // SAFETY: single-threaded EL2.
-    let first = unsafe {
-        let mut found = false;
-        for i in 0..SEEN_N {
-            if SEEN[i] == (pc, insn) {
-                found = true;
-                break;
-            }
-        }
-        if !found && SEEN_N < SEEN_CAP {
-            SEEN[SEEN_N] = (pc, insn);
-            SEEN_N += 1;
-            true
+    let n = unsafe {
+        let n = SEEN_N;
+        if n < LOG_BUDGET {
+            SEEN_N = n + 1;
+            Some(n)
         } else {
-            false
+            None
         }
     };
-    if first {
+    if let Some(n) = n {
+        let src_mode = (spsr_und as u32) & 0x1F;
         kprintln!(
-            "und: forwarding FPA insn {:#010x} @PC={:#x} → kernel FPE @{:#x}",
-            insn, pc, ROM_FPE_START_PC,
+            "und: FPA forward #{} insn={:#010x} @PC={:#x} src_mode={:#x} ({}) → FPE @{:#x} \
+             r12={:#010x} sp_und={:#010x} sp_usr={:#010x}",
+            n, insn, pc, src_mode, describe_aarch32_mode(src_mode), ROM_FPE_START_PC,
+            ctx.x[12] as u32, ctx.x[23] as u32, ctx.x[13] as u32,
         );
     }
 }

@@ -17,42 +17,82 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-83):** iter-82 fixed the asymmetric XOR-3 byte
-swizzle in `shadow_stub::dispatch_*`. The kernel reads InternalStore
-flash bank 0 data through stage-1 aliases in the PCMCIA aperture
-(`0x30000000+`), which the old `ea < XOR_LIMIT` heuristic excluded
-from the BE→LE byte-swizzle. Insert wrote bucket headers via XOR-3
-STRBs (correctly, since staging is in RAM at low VAs); Get's
-`memmove`-based read read raw LE flash bytes (incorrectly), so the
-2-byte length header `[0x00, 0x43]` came back as `[0x07, 0x00]` and
-the `Get__15TStoreHashTable` parser tried to read 0x700 bytes of a
-0x43-byte entry → `_OSErr` → `evt.ex.fr.store` Throw → `GetSoup`
-returns NIL. Fixed by always trying `(ea ^ 3)` (or `^ 2` for halfword)
-against backed memory first regardless of `ea`'s range; only fall
-through to MMIO when the XOR'd address has no backing.
-
-After the fix `GetSoup(#453)` returns `#C607869` and the boot
-proceeds well into REP user-space init (`GetUserConfig`,
-`SetLCDContrast`, `SetSystemVolume`). The next stop is a different,
-unrelated problem: an unrecognised UND opcode at PC=0x38db18:
+**Current goal (iter-83):** characterise the FPE-forward state-
+corruption that surfaces during `SetSystemVolume`. With iter-82's
+flash-store byte-swizzle fix in, the boot reaches REP user-space init
+(`GetUserConfig`, `SetLCDContrast`, `SetSystemVolume`) and halts
+when the kernel's FPA emulator (`FP_UndefHandlers_Start` at 0x38d8dc)
+runs its `msr SPSR_fc, r8` epilogue:
 
 ```
-und: forwarding FPA insn 0xed908100 @PC=0x31c4f4 → kernel FPE @0x38d8dc
-und: forwarding FPA insn 0xee009100 @PC=0x1e729c → kernel FPE @0x38d8dc
+und: FPA forward #0 insn=0xed2dc203 @PC=0x2f1eec src_mode=0x10 (USR) → FPE @0x38d8dc r12=0x0cc77c80 sp_und=0x0c006000 sp_usr=0x0cc77c4c
+und: FPA forward #1 insn=0xed908100 @PC=0x31c4f4 src_mode=0x10 (USR) → FPE @0x38d8dc r12=0x0cc77b64 sp_und=0x0c006000 sp_usr=0x0cc77b64
+und: FPA forward #2 insn=0xee009100 @PC=0x1e729c src_mode=0x10 (USR) → FPE @0x38d8dc r12=0x0cc77b64 sp_und=0x0c006000 sp_usr=0x0cc77b78
 *** unrecognised UND: insn=0xe169f008 at PC=0x38db18 SPSR_und=0xf810011b
-    (extend handle_und in trap.rs to handle this opcode)
+  src_mode=0x1b (UND)  r0..r7:   80004001 c0a8c100 8000015b 00004001 fe000000 00000000 000000fe 01000010
+                       r8..r15:  0000fefe fe030303 0c105a5c ee009100 003900c8 0cc77b78 0031e694 03005afc
+                       SP_und=ctx.x[23]=0xc005fb8 LR_und=ctx.x[22]=0x38db1c
 ```
 
-`0xe169f008` decodes as ARMv5+ `CLZ r15, r8` (count leading zeros),
-encoded as a "MISC" instruction the iter-71/72 SBA classifier
-treats as a UDF-shape opcode. That's the next iteration's problem
-to characterise.
+`0xe169f008` is `msr SPSR_fc, r8` (the FPE epilogue's exception-return
+prep, **not** CLZ as PLAN.md previously claimed; the iter-72 SBA
+classifier note was a red herring). On ARMv7+ this is well-defined
+in any privileged mode that has a banked SPSR; A53 / QEMU raspi3b
+in AArch32 EL1 raises UND on it from any non-USR/SYS mode regardless.
 
-Next (iter-83): identify what `0xe169f008` actually is in the
-kernel's compiled code at `0x38db18` and decide whether to (a)
-add a CLZ handler in `handle_und`, (b) patch the kernel to use
-a different opcode, or (c) recognise this is a real CLZ
-intended for the FPE emulator path and route it correctly.
+Two open inconsistencies in the ctx dump above need to be tracked
+down before deciding how to handle the MSR:
+
+1. **R12 is wrong on entry to the epilogue.** The FPE prologue at
+   0x38d918 does `mov ip, sp`, so by 0x38db18 we expect ip =
+   sp_und_at_FPE_entry - 64 ≈ `0x0c005fc0` (matching the
+   `sp_und=0x0c006000` we logged at every FPA forward). What we see
+   is r12 = `0x003900c8` — an FPA constant table inside ROM
+   (`[0x003900c0]=0x0000fefe`, `[0x003900c4]=0xfe030303`, exactly
+   the bytes `ldmdb ip, {r8, r9}` reads into r8/r9 right before the
+   trap). Ip never gets written between 0x38d918 and 0x38db18 in
+   the static disasm, so something during the forwarded FPE's
+   execution (a nested UND we missed, a DABT-forwarded kernel
+   helper that doesn't preserve r12, a runtime ROM patch we
+   haven't accounted for) is clobbering it.
+
+2. **The trap site doesn't match the dispatch arm.** mvfs
+   (`0xee009100`, forward #2) computes r9 = `0x40000000` →
+   `add pc, pc, r9 lsr 25` lands at the dispatch entry at
+   0x38d9cc = `b 0x38dc00` — exit `msr SPSR_fc, r8` at
+   **0x38dc68**. The arm whose exit is **0x38db18** (`b 0x38daac`
+   from entry 1) requires r9 = `0x08000000`, which only happens
+   when `SPSR_und[3:0] != 0` — i.e. a privileged-mode FPA fault.
+   None of our three logged forwards fits that. Either there is
+   an unlogged intervening forward (impossible per the budget=16
+   diagnostic) or the kernel re-entered the FPE through a
+   non-vector path we haven't found.
+
+Pinning these down is the prerequisite for any real fix. Tactics
+on the table:
+
+a. Install a probe at 0x38d918 (just after `mov ip, sp`) that
+   logs r12 + sp on every FPE entry. If r12 starts correct, the
+   drift is in-FPE-body (look at the bl 0x38f04c helpers and
+   their callees, including any DABT chain that clobbers r12).
+
+b. Install a guest-bp (via `src/guest_bp.rs`) at 0x38db18 to
+   capture the full register state at the trap, then walk the
+   stack from `sp_und=0x0c005fb8` to find what frame the FPE is
+   in.
+
+c. Cross-check by also patching `msr SPSR_fc` sites at the other
+   exit PCs (0x38da94, 0x38dc68, ...) with HVCs that just log
+   "saw msr_spsr at PC=...". If only 0x38db18 ever fires, the
+   FPE is consistently taking the "from privileged mode" arm;
+   if other PCs fire too, they fire silently because we never
+   reach them in this run.
+
+Do **not** "make progress" by NOPing FPA UNDs or by emulating
+`msr SPSR_fc` against the bogus r8 — both produce a downstream
+boot state running on poisoned arithmetic and every subsequent
+"stall" becomes a phantom caused by the bypass. The MSR-SPSR
+trap is the real problem; halt loudly there and root-cause it.
 
 **Background:** iter-70 cleared the splash wedge; iter-71/72
 fought a classifier regression; iter-73 forwarded FPA UNDs to

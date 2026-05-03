@@ -123,6 +123,14 @@ pub fn render_and_log(prefix: &str, fmt_ptr: u32, mut args: VaArgs) {
                     have_width = true;
                 }
                 b'l' | b'L' => long_count = long_count.saturating_add(1),
+                b'*' => {
+                    // Width comes from the next vararg (a signed int).
+                    let w = args.next() as i32;
+                    if w >= 0 {
+                        width = w as u32;
+                    }
+                    have_width = true;
+                }
                 b'.' => {
                     // Skip a precision spec without honoring it.
                     loop {
@@ -152,11 +160,77 @@ pub fn render_and_log(prefix: &str, fmt_ptr: u32, mut args: VaArgs) {
         }
     }
 
-    // SAFETY: `buf` only ever holds bytes we pushed as ASCII / pass-through
-    // bytes; non-UTF8 caller bytes (a corrupt format string) are coerced
-    // to a lossy display, never trusted.
-    let s = core::str::from_utf8(&buf[..written]).unwrap_or("<non-utf8>");
-    crate::kprintln!("{}{}", prefix, s);
+    append_to_line(prefix, &buf[..written]);
+}
+
+// ---- line buffering ------------------------------------------------------
+//
+// The kernel's TInterpreter trace fragments arrive as separate Print
+// calls — one per token (function name, '(', each arg, ')'). Printing
+// each fragment on its own UART line is unreadable. We accumulate
+// fragments in a static byte buffer keyed by `prefix`; when a `\n`
+// appears (or `flush_line` is called explicitly), we emit the
+// accumulated line via `kprintln!` and reset.
+
+const LINE_CAP: usize = 256;
+
+struct LineBuf {
+    bytes: [u8; LINE_CAP],
+    n: usize,
+}
+
+static mut LINE: LineBuf = LineBuf { bytes: [0; LINE_CAP], n: 0 };
+
+/// Append a chunk of rendered output. Splits at `\n`: complete lines
+/// flush via `kprintln!` (with `prefix` prepended); a trailing
+/// fragment without a newline is buffered for the next call.
+pub fn append_to_line(prefix: &str, chunk: &[u8]) {
+    // SAFETY: single-threaded EL2.
+    unsafe {
+        for &b in chunk {
+            if b == b'\n' || b == b'\r' {
+                if LINE.n > 0 {
+                    let s = core::str::from_utf8(&LINE.bytes[..LINE.n])
+                        .unwrap_or("<non-utf8>");
+                    crate::kprintln!("{}{}", prefix, s);
+                    LINE.n = 0;
+                }
+                continue;
+            }
+            if LINE.n < LINE_CAP {
+                LINE.bytes[LINE.n] = b;
+                LINE.n += 1;
+            } else {
+                // Buffer full — force-flush at cap so we don't drop bytes
+                // silently.
+                let s = core::str::from_utf8(&LINE.bytes[..LINE.n])
+                    .unwrap_or("<non-utf8>");
+                crate::kprintln!("{}{} [buf-full]", prefix, s);
+                LINE.n = 0;
+                LINE.bytes[0] = b;
+                LINE.n = 1;
+            }
+        }
+    }
+}
+
+/// Flush any partial line. Called from the Flush thunk hook so an
+/// explicit kernel-side `flush()` doesn't strand a half-built line.
+pub fn flush_line(prefix: &str) {
+    // SAFETY: single-threaded EL2.
+    unsafe {
+        if LINE.n > 0 {
+            let s = core::str::from_utf8(&LINE.bytes[..LINE.n])
+                .unwrap_or("<non-utf8>");
+            crate::kprintln!("{}{}", prefix, s);
+            LINE.n = 0;
+        }
+    }
+}
+
+/// Append a single character (from the abstract `Putc` thunk).
+pub fn putc(prefix: &str, c: u8) {
+    append_to_line(prefix, &[c]);
 }
 
 #[derive(Default, Clone, Copy)]

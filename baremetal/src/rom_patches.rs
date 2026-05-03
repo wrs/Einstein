@@ -249,6 +249,32 @@ const PATCHES_717006: &[RomPatch] = &[
     //                                    = 0xE92D_DFF0)
     RomPatch { offset: 0x001F_86B4, value: 0xE3A0_0000, name: "GetMatchingPage: mov r0, #0 (return 0 — no shareable page)" },
     RomPatch { offset: 0x001F_86B8, value: 0xE12F_FF1E, name: "GetMatchingPage: bx lr (skip prologue+body)" },
+    // iter-80: trick `TraceSetOptions__12TInterpreterFv` into
+    // configuring trace mode even when the kernel's tracing
+    // options frame (`gVars.tracing` or similar) is NIL.
+    //
+    // The function reads gVars.tracing into a Ref slot, then at
+    // 0x35e7d8 tests `teq r0, #2` (Ref == NIL). On NIL it jumps
+    // straight to the "tracing off" exit at 0x35ea18 — which is
+    // the case on a stock boot. Our iter-79 force-enable poke
+    // of `gInterpreter[+124]` causes `DoSend` to call
+    // `TraceSend → TraceMethod`, but TraceMethod's *inner* gates
+    // at +105 / +112 / +74 (all configured by TraceSetOptions)
+    // suppress the actual `Print` call. Result: no trace output.
+    //
+    // Flipping the immediate from #2 to #0 turns the test into
+    // `teq r0, #0`. Genuine Refs are never zero, so the test
+    // never matches — TraceSetOptions falls through to the
+    // setup-with-NIL-defaults branch which sets `+105 = 1`,
+    // `+104 = 1`, and writes NIL to the +112 / +116 / +108
+    // filter slots. With those gates open and our
+    // `gInterpreter[+124]` poke in place, every `DoSend /
+    // DoMessage / DoFastApply` reaches `Print` with the trace
+    // event — surfaced via iter-79's Print thunk hook.
+    //
+    // Encoding: `teq r0, #N` is `e330_000N`; only the low 12
+    // bits of the immediate change (cond/op/Rn/Rd untouched).
+    RomPatch { offset: 0x0035_E7D8, value: 0xE330_0000, name: "TraceSetOptions: teq r0, #0 (was #2) — force trace setup even when gVars.tracing is NIL" },
     // Force exclusive per-stack page allocation by short-circuiting
     // `TStackManager::GetMatchingPage` to always return 0 (= "no
     // shareable page found"). This forces every `FindOrAllocPage` call

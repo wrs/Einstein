@@ -3429,27 +3429,30 @@ fn handle_thunk_probe(ctx: &mut TrapContext, kind: ThunkKind) {
     let r1 = ctx.x[1] as u32;
     match kind {
         ThunkKind::Putc => {
-            let c = (r1 & 0xFF) as u8;
-            let printable = if c.is_ascii() && (c >= 0x20 || c == b'\n' || c == b'\r' || c == b'\t') {
-                c
-            } else {
-                b'?'
-            };
-            kprintln!("REP> putc {:#04x} ({})", c, printable as char);
+            // Route the byte through the same line buffer Print uses so
+            // a stream of Putc calls renders as one UART line per
+            // newline-terminated fragment.
+            crate::rep_print::putc("REP> ", (r1 & 0xFF) as u8);
         }
         ThunkKind::Flush => {
-            kprintln!("REP> flush (translator={:#010x})", r0);
+            // Flush any partially-buffered line so an explicit
+            // kernel-side flush() doesn't strand a half-built line.
+            crate::rep_print::flush_line("REP> ");
         }
         ThunkKind::StackTrace => {
-            kprintln!("REP> StackTrace(translator={:#010x}, arg={:#010x})", r0, r1);
+            // Force a line break before/after so the StackTrace
+            // banner doesn't get fused into adjacent trace output.
+            crate::rep_print::flush_line("REP> ");
+            kprintln!("REP> [StackTrace(translator={:#010x}, arg={:#010x})]", r0, r1);
         }
         ThunkKind::ExceptionNotify => {
             // r1 = Exception*; *r1 = name C-string ptr.
             let name_ptr = guest_mem::read_word_va(r1).unwrap_or(0);
             let (buf, len) = read_cstr_at(name_ptr, 80);
             let name = core::str::from_utf8(&buf[..len]).unwrap_or("<non-utf8>");
+            crate::rep_print::flush_line("REP> ");
             kprintln!(
-                "REP> ExceptionNotify(translator={:#010x}, ex={:#010x}) name={:?}",
+                "REP> [ExceptionNotify(translator={:#010x}, ex={:#010x}) name={:?}]",
                 r0, r1, name,
             );
         }

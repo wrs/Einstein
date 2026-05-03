@@ -144,6 +144,10 @@ pub fn in_reserved_range(addr: u32) -> bool {
         return true;
     }
     if (0x00FF_FF00..0x00FF_FFF0).contains(&addr) { return true; }
+    // FPA-class UND bypass stub at 0x00FF_FEC0..0x00FF_FEE0 (8 words).
+    // Routes FPA UNDs straight to the kernel FPE; falls through to the
+    // main UND trampoline for non-FPA UNDs.
+    if (0x00FF_FEC0..0x00FF_FEE0).contains(&addr) { return true; }
     if addr == crate::rom_patches::POWEROFF_REBOOT_PC { return true; }
     if addr == crate::rom_patches::REBOOT_PC { return true; }
     if addr == crate::rom_patches::BOOTOS_PC { return true; }

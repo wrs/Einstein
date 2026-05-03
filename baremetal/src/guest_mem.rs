@@ -1310,6 +1310,51 @@ pub unsafe fn load_newton_rom() {
 /// store. Writes 13 words at the trampoline offset + 1 word at 0x04.
 const UND_TRAMP_OFFSET: usize = 0x00FF_FF00;
 
+/// FPA-class UND bypass stub at `0x00FF_FEC0`. The UND vector at IPA
+/// 0x04 branches here first; the stub checks if the faulting instruction
+/// is FPA-class (coprocessor field = 1 or 2) and, if so, branches
+/// directly to `FP_UndefHandlers_Start_JT` at `0x38d874` — exactly the
+/// path SA-110 hardware took on the original Newton (UND vector held
+/// `b 0x1a031f4` which thunked through 0x38d874 to FP_UndefHandlers_Start
+/// at 0x38d8dc). Non-FPA UNDs fall through to the existing trampoline
+/// at `UND_TRAMP_OFFSET`, which captures source-mode banked state and
+/// HVCs into EL2 for the rest of our handlers (tracer UDFs, shadow-byte-
+/// access, software breakpoints, deprecated CP15, etc.).
+///
+/// Stub layout (16 words = 64 bytes):
+///   +0x00: ee0d_cf50  mcr p15,0,r12,c13,c0,2  ; save R12 → TPIDRURW
+///   +0x04: e51e_c004  ldr r12, [lr, #-4]      ; R12 = faulting insn
+///   +0x08: e20c_c40f  and r12, r12, #0x0F000000 ; isolate bits[27:24]
+///   +0x0C: e35c_040c  cmp r12, #0x0C000000    ; LDC/STC variant?
+///   +0x10: 135c_040d  cmpne r12, #0x0D000000  ; LDC/STC variant?
+///   +0x14: 135c_040e  cmpne r12, #0x0E000000  ; CDP/MCR/MRC?
+///   +0x18: 1a00_xxxx  bne UND_TRAMP_OFFSET    ; bits[27:24] not FPA-class
+///   +0x1C: e51e_c004  ldr r12, [lr, #-4]      ; reload insn (was masked above)
+///   +0x20: e20c_cc0f  and r12, r12, #0xF00    ; isolate cp_num bits[11:8]
+///   +0x24: e35c_0c01  cmp r12, #0x100         ; cp_num == 1?
+///   +0x28: 135c_0c02  cmpne r12, #0x200       ; cp_num == 2?
+///   +0x2C: 1a00_xxxx  bne UND_TRAMP_OFFSET    ; cp_num not 1 or 2
+///   +0x30: ee1d_cf50  mrc p15,0,r12,c13,c0,2  ; restore R12 (FPA path)
+///   +0x34: ea00_xxxx  b FPE_JT (= 0x38d874)
+///   +0x38: ee1d_cf50  mrc p15,0,r12,c13,c0,2  ; restore R12 (non-FPA path)
+///   +0x3C: ea00_xxxx  b UND_TRAMP_OFFSET
+///
+/// The two `bne UND_TRAMP_OFFSET` early-outs at +0x18 and +0x2C share
+/// the not-FPA exit at +0x38; consolidating saves 8 bytes vs branching
+/// to a per-failure restore-and-jump pair.
+///
+/// Why route through 0x38d874 (the JT slot) rather than 0x38d8dc
+/// (FP_UndefHandlers_Start directly): preserves the post-ship-patch
+/// indirection — if the kernel later patches the FPE entry to a REx
+/// override, the JT slot picks up the override automatically.
+///
+/// The stub uses TPIDRURW as the R12 save slot (matching what the
+/// existing trampoline does), so the kernel's FPE sees R12 with its
+/// original USR value when it executes its own `mcr p15,0,r12,...`-
+/// less prologue. SP_und / LR_und / SPSR_und are untouched — exactly
+/// the architectural state SA-110 hardware delivered to the FPE.
+pub const FPA_BYPASS_STUB_OFFSET: usize = 0x00FF_FEC0;
+
 /// Post-emulation trampoline used by the SBA handler when byte-access
 /// writeback targets Rn ∈ {13, 14} (banked SP / LR). AArch64 ERET from
 /// EL2 doesn't propagate x13 / x14 into the target mode's banked SP /
@@ -1631,18 +1676,63 @@ unsafe fn patch_und_vector(rom: *mut u32) {
     // the literal to the VA 0x0C00_4F00, which the kernel's
     // L1[0xC0] coarse → L2[0x04] small page maps back to RAM.
 
-    let imm24 = ((UND_TRAMP_OFFSET as u32 - 0x0C) / 4) & 0x00FF_FFFF;
-    let branch_insn = 0xEA00_0000 | imm24;
-
-    // SAFETY: offsets below all sit in 0x00FF_FF00..0x00FF_FF60,
-    // well under ROM_SIZE (= 16 MiB = 0x0100_0000) and inside the
-    // 128-byte reserved window checked by `tracer::in_reserved_range`.
+    // UND vector at IPA 0x04 → branch to FPA bypass stub. The stub
+    // routes FPA-class UNDs straight to the kernel's FPE handler
+    // (matching SA-110 hardware behaviour) and falls through to the
+    // existing trampoline for everything else.
     //
-    // SAFETY: offsets below all sit in 0x00FF_FF00..0x00FF_FF60,
+    // ARM B (immediate): cond=AL=0xE, opcode=1010, imm24 = (target -
+    // (PC+8)) / 4. PC at IPA 0x04 = 0x04, PC+8 = 0x0C.
+    let imm24_to_bypass =
+        ((FPA_BYPASS_STUB_OFFSET as u32 - 0x0C) / 4) & 0x00FF_FFFF;
+    let branch_to_bypass = 0xEA00_0000 | imm24_to_bypass;
+
+    // SAFETY: offsets below all sit in 0x00FF_FEC0..0x00FF_FF60,
     // well under ROM_SIZE (= 16 MiB = 0x0100_0000) and inside the
-    // 128-byte reserved window checked by `tracer::in_reserved_range`.
+    // reserved window checked by `tracer::in_reserved_range`.
     unsafe {
-        rom.add(1).write(branch_insn);              // 0x04: b UND_TRAMP_OFFSET
+        rom.add(1).write(branch_to_bypass);         // 0x04: b FPA_BYPASS_STUB_OFFSET
+
+        // FPA-class UND bypass stub. See `FPA_BYPASS_STUB_OFFSET`
+        // doc comment for the per-word commentary; reproduced here
+        // alongside the encodings.
+        //
+        // Two-stage check: bits[27:24] in {0xC, 0xD, 0xE} (LDC/STC/CDP/MCR),
+        // *then* bits[11:8] in {1, 2} (FPA cp_num). The first stage rules
+        // out UDF (bits[27:24]=0x7), software breakpoints, tracer UDFs,
+        // shadow-byte-access UDFs (all bits[27:24]=0x7), and other
+        // non-coprocessor UND-causing insns. The second stage rules out
+        // VFP/Advanced-SIMD (cp_num 10/11) — though those don't appear
+        // in 717006 ROM, the check keeps the stub future-proof.
+        let s = FPA_BYPASS_STUB_OFFSET / 4;
+        rom.add(s +  0).write(0xEE0D_CF50);  // mcr p15,0,r12,c13,c0,2
+        rom.add(s +  1).write(0xE51E_C004);  // ldr r12, [lr, #-4]
+        rom.add(s +  2).write(0xE20C_C40F);  // and r12, r12, #0x0F000000
+        rom.add(s +  3).write(0xE35C_040C);  // cmp r12, #0x0C000000
+        rom.add(s +  4).write(0x135C_040D);  // cmpne r12, #0x0D000000
+        rom.add(s +  5).write(0x135C_040E);  // cmpne r12, #0x0E000000
+        rom.add(s +  6).write(0x1A00_0006);  // bne stub+0x38 (fall_through)
+        rom.add(s +  7).write(0xE51E_C004);  // ldr r12, [lr, #-4]  (reload)
+        rom.add(s +  8).write(0xE20C_CC0F);  // and r12, r12, #0xF00
+        rom.add(s +  9).write(0xE35C_0C01);  // cmp r12, #0x100
+        rom.add(s + 10).write(0x135C_0C02);  // cmpne r12, #0x200
+        rom.add(s + 11).write(0x1A00_0001);  // bne stub+0x38 (fall_through)
+        rom.add(s + 12).write(0xEE1D_CF50);  // mrc p15,0,r12,c13,c0,2  (FPA)
+        // b FPE_JT (0x38d874). PC at this insn = stub+0x34.
+        // PC+8 = stub+0x3C. imm24 = (target - PC+8) / 4.
+        let pc_plus_8 = (FPA_BYPASS_STUB_OFFSET + 0x34 + 8) as i32;
+        let target_fpe = 0x0038_D874_i32;
+        let imm24_fpe =
+            (((target_fpe - pc_plus_8) >> 2) as u32) & 0x00FF_FFFF;
+        rom.add(s + 13).write(0xEA00_0000 | imm24_fpe); // b FPE_JT
+        rom.add(s + 14).write(0xEE1D_CF50);  // mrc p15,0,r12,c13,c0,2  (fall_through)
+        // b UND_TRAMP_OFFSET. PC+8 = stub+0x44 = 0x00FF_FF04. Target =
+        // 0x00FF_FF00. offset = -4 bytes = -1 word; imm24 = 0xFFFFFF.
+        let pc_plus_8b = (FPA_BYPASS_STUB_OFFSET + 0x3C + 8) as i32;
+        let target_tramp = UND_TRAMP_OFFSET as i32;
+        let imm24_tramp =
+            (((target_tramp - pc_plus_8b) >> 2) as u32) & 0x00FF_FFFF;
+        rom.add(s + 15).write(0xEA00_0000 | imm24_tramp); // b UND_TRAMP
 
         let base = UND_TRAMP_OFFSET / 4;
         rom.add(base +  0).write(0xEE0D_CF50);      // mcr p15,0,r12,c13,c0,2

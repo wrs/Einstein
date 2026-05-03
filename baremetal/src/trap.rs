@@ -2242,24 +2242,25 @@ fn handle_und(ctx: &mut TrapContext) {
         _ if is_fpa_ctrl_reg_insn(insn) => {
             emulate_fpa_ctrl_reg(ctx, insn, faulting_pc, spsr_und);
         }
-        // FPA load/store/arithmetic (LDF/STF/LFM/SFM/CDP/MCR/MRC on cp1
-        // or cp2) — the Newton kernel ships a full FPA emulator at
-        // `FP_UndefHandlers_Start` (ROM 0x38d8dc), and the original UND
-        // vector at PA=0x4 was `b 0x1a031f4` (FP_UndefHandlers_Start_JT
-        // in the post-ship JT region, which thunks to 0x38d8dc). Our
-        // patched UND trampoline preempts that path; forward by ERETing
-        // into 0x38d8dc directly, in UND mode, so the kernel's FPE
-        // handles the opcode as it was designed to.
-        //
-        // The trampoline preserves all the state the FPE emulator
-        // expects on entry: orig R0..R12 (R0/R1/R12 reloaded above
-        // from stash slots; R2 reloaded by the trampoline itself
-        // before HVC; R3..R11 untouched), SP_und (never written), and
-        // the hardware-saved LR_und = faulting_pc + 4 / SPSR_und =
-        // pre-UND CPSR. ELR_EL2 = 0x38d8dc with SPSR_EL2 unchanged
-        // (= UND mode) hands control off cleanly.
+        // FPA load/store/arithmetic UNDs are bypassed at the UND-vector
+        // level by `FPA_BYPASS_STUB_OFFSET` (see guest_mem.rs) — the
+        // stub at IPA 0x00FF_FEC0 detects FPA-class insns and branches
+        // directly to `FP_UndefHandlers_Start_JT` at 0x38d874 without
+        // entering EL2. SA-110 hardware delivered the UND to the
+        // kernel's FPE this way; our previous EL2 round-trip path
+        // (`forward_und_to_guest_fpe`) leaked enough state corruption
+        // to wedge the FPE's IP-preservation invariant on certain
+        // dispatch arms (iter-83/84/85). Reaching this arm now means
+        // the bypass stub didn't recognise the opcode as FPA — halt
+        // loudly so we can investigate.
         _ if is_fpa_insn(insn) => {
-            forward_und_to_guest_fpe(ctx, faulting_pc, insn, spsr_und);
+            kprintln!(
+                "*** FPA UND reached EL2 — bypass stub at 0x00FF_FEC0 \
+                 should have routed this directly to FPE_JT. \
+                 insn={:#010x} PC={:#x}",
+                insn, faulting_pc,
+            );
+            cpu::halt();
         }
         _ => {
             kprintln!(
@@ -2335,77 +2336,6 @@ fn is_fpa_insn(insn: u32) -> bool {
         return false;
     }
     matches!((insn >> 24) & 0xF, 0xC | 0xD | 0xE)
-}
-
-/// ROM entry point of the kernel's FPA emulator
-/// (`FP_UndefHandlers_Start`). The original UND vector at PA=0x4 was
-/// `b 0x1a031f4` (FP_UndefHandlers_Start_JT in the post-ship JT region),
-/// which thunks here. We jump to the body directly to skip an indirection
-/// through the patch-table region.
-const ROM_FPE_START_PC: u64 = 0x0038_d8dc;
-
-/// Forward an unrecognized FPA-class UND to the guest's FPE emulator.
-///
-/// Trampoline state at this point: still in UND mode (CPSR_c forced to
-/// 0xdb just before the HVC), SPSR_und holds the pre-UND CPSR, LR_und
-/// holds `faulting_pc + 4`. SP_und is whatever the kernel set up at boot
-/// (the trampoline never touches SP). Orig R0/R1/R12 have been reloaded
-/// from the stash slots / TPIDR_EL0, R2 was reloaded by the trampoline
-/// itself before HVC, and R3..R11 were never clobbered — so the AArch32
-/// register file matches the moment of UND fault.
-///
-/// SPSR_EL2 captured the AArch32 CPSR at HVC time (mode=UND, I=1, F=1).
-/// Leaving it unchanged ERETs back into UND mode, which is exactly what
-/// the FPE emulator expects. ELR_EL2 = 0x38d8dc points at the body that
-/// reads `LR - 4` to recover the faulting PC.
-fn forward_und_to_guest_fpe(ctx: &TrapContext, faulting_pc: u32, insn: u32, spsr_und: u64) {
-    log_fpa_forward(faulting_pc, insn, ctx, spsr_und);
-    // SAFETY: writing ELR_EL2 from EL2 is unconditionally permitted.
-    // Leave SPSR_EL2 alone so ERET resumes in UND mode.
-    unsafe {
-        core::arch::asm!(
-            "msr elr_el2, {elr}",
-            "isb",
-            elr = in(reg) ROM_FPE_START_PC,
-            options(nostack, preserves_flags),
-        );
-    }
-}
-
-/// Diagnostic log for FPA UNDs forwarded to the kernel's FPE emulator.
-/// Prints the first `LOG_BUDGET` forwards (no PC-based dedup) so we see
-/// the full sequence of forwards leading up to any halt — when the FPE
-/// epilogue's `msr SPSR_fc, r8` fires UND because A53/QEMU treats it as
-/// undefined even from privileged AArch32, having every preceding
-/// forward's source mode + frame state on hand is what lets us
-/// characterise the R12/IP drift reported as the iter-83 stall.
-///
-/// The source mode comes from the trampoline-saved SPSR_und slot
-/// (handled to handle_und as the `spsr_und` local) — *not* SPSR_EL2,
-/// which captures the trampoline's own UND-mode CPSR after the
-/// mode-switch dance and is useless for diagnosing the actual fault.
-fn log_fpa_forward(pc: u32, insn: u32, ctx: &TrapContext, spsr_und: u64) {
-    const LOG_BUDGET: usize = 16;
-    static mut SEEN_N: usize = 0;
-    // SAFETY: single-threaded EL2.
-    let n = unsafe {
-        let n = SEEN_N;
-        if n < LOG_BUDGET {
-            SEEN_N = n + 1;
-            Some(n)
-        } else {
-            None
-        }
-    };
-    if let Some(n) = n {
-        let src_mode = (spsr_und as u32) & 0x1F;
-        kprintln!(
-            "und: FPA forward #{} insn={:#010x} @PC={:#x} src_mode={:#x} ({}) → FPE @{:#x} \
-             r12={:#010x} sp_und={:#010x} sp_usr={:#010x}",
-            n, insn, pc, src_mode, describe_aarch32_mode(src_mode), ROM_FPE_START_PC,
-            ctx.x[12] as u32, ctx.x[23] as u32, ctx.x[13] as u32,
-        );
-    }
 }
 
 /// Emulate an FPA control/status register access (RFS / WFS / RFC /

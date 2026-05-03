@@ -17,7 +17,147 @@ Bloated PLAN.md wastes context every read.
 - All 36 guest tests must pass on every commit
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-83):** characterise the FPE-forward state-
+**Current goal (iter-85):** with iter-84's FPA bypass in place
+(UND vector at IPA 0x04 routes FPA-class UNDs straight to
+`FP_UndefHandlers_Start_JT` at 0x38d874, exactly the path SA-110
+hardware took on the original Newton), the kernel's FPE *still*
+trips on the same IP-corruption trap at 0x38db18 during forward #2
+(mvfs in `SetSystemVolume`). So our trampoline / HVC round-trip /
+EL2-side `forward_und_to_guest_fpe` was *not* the cause — removing
+it and delivering UND naturally to the kernel still wedges the FPE.
+
+Something else our hypervisor does breaks the FPE's IP-preservation
+invariant (the FPE expects `ip` saved by `mov ip, sp` at 0x38d918
+to survive unmodified through every BL up to the epilogue's
+`ldmdb ip`). Candidates worth bisecting:
+
+a. **HCR_EL2 traps**: TVM, TIDCP, TPC, TPU, etc. If any FPE helper
+   issues a CP15 op that traps to EL2, our handler runs and might
+   not preserve `ctx.x[12]` correctly across the round-trip. Test
+   by clearing one HCR_EL2 trap bit at a time and re-running.
+
+b. **Stage-2 RAM RO→RW auto-flips** (`handle_data_abort`): if the
+   FPE writes to a kernel-globals page that's stage-2 RO+X (frozen
+   after shadow-stub patching), our handler silently flips it to
+   RW+XN and resumes. This shouldn't clobber R12, but it's worth
+   verifying.
+
+c. **Virtual-IRQ delivery during the FPE body**: the FPE re-enables
+   IRQ early via `bic r8, r8, #0x80; msr CPSR_fc, r8` at 0x38d960.
+   If a timer IRQ fires while the FPE is inside a BL helper, the
+   guest-side IRQ vector entry (running in IRQ mode) might not
+   preserve R12 correctly under our hypervisor. Test by masking
+   IRQs in the FPE prologue or by gating timer-IRQ injection
+   while the guest PC is in the FPE region.
+
+d. **`fix_stage1_xn_bits` AP-flattening**: we flatten ARMv4
+   subpage-AP to AP=011 on every L2 walk. This changes which
+   memory the kernel's privileged loads actually reach. If any
+   FPE helper relies on subpage-AP semantics that we've squashed,
+   the load could read from a different location than the kernel
+   intended. Less likely but bisectable.
+
+The trap signature (unchanged from iter-83 except for the missing
+`und: FPA forward` lines, which iter-84's bypass made invisible
+to EL2):
+
+```
+*** unrecognised UND: insn=0xe169f008 at PC=0x38db18 SPSR_und=0xf810011b
+  src_mode=0x1b (UND)  r0..r7:   80004001 c0a8c100 8000015b 00004001 fe000000 00000000 000000fe 01000010
+                       r8..r15:  0000fefe fe030303 0c105a5c ee009100 003900c8 0cc77b78 0031e694 03005afc
+                       SP_und=ctx.x[23]=0xc005fb8 LR_und=ctx.x[22]=0x38db1c
+```
+
+`r12 = 0x003900c8` (FPA constant table inside ROM); the prologue's
+`mov ip, sp` set it to `sp_und = 0x0c005fc0`, so corruption is
+~0xF438_A108 bytes off — clearly an external write to R12, not a
+small arithmetic drift.
+
+Background: iter-70 cleared the splash wedge; iter-71/72 fought
+a classifier regression; iter-73 forwarded FPA UNDs to the kernel's
+FPE emulator (now obsolete with iter-84's bypass); iter-74-78
+walked a NS throw chain that turned out to be a downstream
+consequence of the iter-82 flash-store byte-swizzle bug; iter-79/80
+added REP-translator hooks + line-buffered REP output; iter-81
+verified the magic pointer table mapping (negative result;
+mapping is correct); iter-82 fixed the XOR-3 PCMCIA-aperture
+read swizzle in shadow_stub; iter-83 added per-call FPA-forward
+log + full ctx dump on unrecognised UND; iter-84 installed a
+per-instruction FPA-class detector at the UND vector that branches
+straight to `FP_UndefHandlers_Start_JT`, bypassing the EL2
+round-trip for FPA UNDs (matches SA-110 behaviour) and confirming
+the IP-corruption is *not* caused by our trampoline path.
+
+### Iteration 84: FPA bypass at the UND vector (deliver UND naturally to FPE)
+
+#### Goal
+
+Remove our hypervisor's intervention from the FPA-UND path. The
+SA-110 hardware delivered FPA UNDs directly to the kernel's
+`FP_UndefHandlers_Start` via the natural UND vector (which held
+`b 0x1a031f4 = FP_UndefHandlers_Start_JT`). Our patched UND vector
+at IPA 0x04 redirected to a trampoline that captured banked
+state and HVCed into EL2; for FPA UNDs we then ERETed back into
+the FPE at 0x38d8dc. This round-trip might have been clobbering
+state in subtle ways.
+
+#### Mechanism
+
+A 16-instruction stub at IPA `0x00FF_FEC0` (between `NEW_STACK_PAD_WRAPPER`
+at 0x00FF_FE80 and `UND_TRAMP` at 0x00FF_FF00). The UND vector
+at IPA 0x04 now branches to this stub. The stub:
+
+1. Saves R12 to TPIDRURW (the same scratch the existing trampoline
+   uses).
+2. Loads the faulting insn from `[lr, #-4]` (`lr` = LR_und = pc_at_fault + 4).
+3. Tests bits[27:24] in {0xC, 0xD, 0xE} — i.e., LDC/STC/CDP/MCR
+   coprocessor-class shape (which UDF-shape with bits[27:24]=0x7
+   doesn't match).
+4. Tests bits[11:8] in {1, 2} — FPA cp_num. Excludes VFP/SIMD
+   (cp 10/11) and other coprocessors.
+5. If both checks pass, restores R12 from TPIDRURW and branches
+   to FPE_JT (0x38d874). If either fails, restores R12 and falls
+   through to `UND_TRAMP_OFFSET` for the existing tracer / SBA /
+   software-bp / generic UND handling.
+
+ARM encodings checked against `docs/ARM_Reference.txt`:
+- MCR/MRC p15: A8.8.108/A8.8.109, A1 encoding bits[27:24]=1110, opc1=0, L=0/1
+- LDR (immediate, ARM): A8.8.62, A1 encoding bits[27:25]=010 with P/U/W/L
+- AND (immediate): A8.8.13, A1 encoding bits[27:20]=00100000_S
+- CMP (immediate): A8.8.36, A1 encoding bits[27:20]=00110101 (S=1)
+- B (immediate): A8.8.18, A1 encoding bits[27:24]=1010, imm24<<2 sign-extended
+
+Encodings + branch offsets computed at install time so they're
+correct regardless of stub location.
+
+#### Result
+
+The bypass works as designed: the boot reaches `SetSystemVolume()`
+(forwards #0, #1 complete cleanly via the natural FPE path,
+no `und: FPA forward` lines reach EL2) — but forward #2 (mvfs)
+still trips the same `unrecognised UND: insn=0xe169f008 at
+PC=0x38db18` trap as iter-83 logged. The IP corruption inside
+the FPE is independent of how the UND was delivered.
+
+#### Implications
+
+The IP-corruption root cause is somewhere else in the hypervisor's
+intrusion (HCR_EL2 traps, stage-2 page faults, virtual IRQ
+delivery, AP flattening, …) — not the trampoline path. iter-85
+will bisect.
+
+Cleanup: removed `forward_und_to_guest_fpe`, `log_fpa_forward`,
+and `ROM_FPE_START_PC` from `src/trap.rs` (no longer reachable);
+the FPA-class arm in `handle_und` now halts loudly if any FPA
+UND somehow makes it to EL2 — that would mean the bypass stub
+mis-classified the insn.
+
+---
+
+(Older iter-83 status block preserved below for context until
+iter-85 supersedes; trim per auto-prune at the next iteration.)
+
+**Old iter-83 goal:** characterise the FPE-forward state-
 corruption that surfaces during `SetSystemVolume`. With iter-82's
 flash-store byte-swizzle fix in, the boot reaches REP user-space init
 (`GetUserConfig`, `SetLCDContrast`, `SetSystemVolume`) and halts

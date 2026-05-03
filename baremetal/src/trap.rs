@@ -1476,6 +1476,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::EX_NOTIFY_PROBE_HVC_IMM => {
             handle_thunk_probe(ctx, ThunkKind::ExceptionNotify);
         }
+        v if v == crate::rom_patches::RESOLVE_MAGIC_PTR_PROBE_HVC_IMM => {
+            handle_resolve_magic_ptr_probe(ctx);
+        }
         v if v == crate::rom_patches::PHYSBLOCK_ENTRY_PROBE_HVC_IMM => {
             handle_physblock_entry_probe(ctx);
         }
@@ -2158,6 +2161,11 @@ fn handle_und(ctx: &mut TrapContext) {
         }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::EX_NOTIFY_PROBE_HVC_IMM) => {
             handle_thunk_probe(ctx, ThunkKind::ExceptionNotify);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::RESOLVE_MAGIC_PTR_PROBE_HVC_IMM) => {
+            handle_resolve_magic_ptr_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -3408,6 +3416,133 @@ fn handle_rep_stack_trace_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
 fn handle_rep_ex_notify_probe(ctx: &mut TrapContext) {
     let spsr_el2 = read_sysreg!("spsr_el2") as u32;
     handle_rep_ex_notify_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+/// iter-81: probe at `ResolveMagicPtr__Fl` entry (ROM 0x31dad4).
+/// r0 = magic-pointer Ref. Decodes table/index, then on the
+/// FIRST few firings dumps what the kernel will read at
+/// `0x01D80000` (table-0 size word) and `0x01A00000` (a
+/// known-mapped jumptable VA — sanity check that stage-1
+/// reads work in this region at all).
+fn handle_resolve_magic_ptr_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_resolve_magic_ptr_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_resolve_magic_ptr_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let r0 = ctx.x[0] as u32;
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+
+    // Decode just like the function does: ref >>= 2; table = bits 31:12;
+    // index = bits 11:0.
+    let raw = r0 >> 2;
+    let table = raw >> 12;
+    let index = raw & 0xFFF;
+
+    if seq < 8 || (table == 0 && index == 276) {
+        let table0_base: u32 = 0x01D8_0000;
+        kprintln!(
+            "ResolveMagicPtr #{}: ref={:#010x} table={} index={} caller_lr={:#010x} sp={:#010x}",
+            seq, r0, table, index, lr, sp,
+        );
+        // Size word lives at table base.
+        log_word("table0[size]", table0_base);
+        // Compute the entry address using the same hash the kernel uses
+        // (cf. ResolveMagicPtr at 0x31db08-31db58):
+        //   r0 = idx + 1
+        //   page  = r0 >> 10
+        //   mid   = (r0 >> 5) & 31
+        //   low10 = r0 & 0x3FF
+        //   offset = (page << 17) | (mid << 12) | (low10 << 2)
+        //   addr   = table_base + offset
+        if table == 0 {
+            let r = index.wrapping_add(1);
+            let page = r >> 10;
+            let mid = (r >> 5) & 31;
+            let low10 = r & 0x3FF;
+            let offset = (page << 17) | (mid << 12) | (low10 << 2);
+            let entry_va = table0_base.wrapping_add(offset);
+            kprintln!(
+                "  entry calc: idx+1={} page={} mid={} low10={} → offset={:#x} → addr={:#010x}",
+                r, page, mid, low10, offset, entry_va,
+            );
+            log_word("table0[entry]", entry_va);
+            // The entry word IS the resolved Ref (already low-bit tagged
+            // 01 for a real pointer). Print its tag classification +
+            // structured object dump via the iter-78 heap_check.
+            if let Some(w) = guest_mem::read_word_va(entry_va) {
+                crate::heap_check::log_ref("  resolved", w);
+                crate::heap_check::dump_object("    ", w);
+                // Dump the binary's data bytes as UCS-2-BE if the size
+                // is divisible by 2; otherwise as ASCII. Helps confirm
+                // string-typed magic pointers (e.g. #453 = "System").
+                if (w & 0x3) == 0x1 {
+                    let obj_addr = w & !0x3;
+                    let size_word = guest_mem::read_word_va(obj_addr).unwrap_or(0);
+                    let size = (size_word >> 8) & 0x00FF_FFFF;
+                    if size > 12 && size < 64 {
+                        let data_len = (size - 12) as usize;
+                        let data_off = obj_addr.wrapping_add(12);
+                        let mut buf = [0u8; 32];
+                        let mut printable = [0u8; 32];
+                        let mut n = 0usize;
+                        while n < data_len.min(32) {
+                            let waddr = data_off.wrapping_add((n as u32) & !0x3);
+                            let w = match guest_mem::read_word_va(waddr) {
+                                Some(w) => w,
+                                None => break,
+                            };
+                            let bytes = w.to_be_bytes();
+                            let lo = (n & 3) as usize;
+                            let take = (4 - lo).min(data_len - n).min(32 - n);
+                            for i in 0..take {
+                                buf[n + i] = bytes[lo + i];
+                                let b = bytes[lo + i];
+                                printable[n + i] = if b.is_ascii() && b >= 0x20 { b }
+                                                   else if b == 0 { b'.' }
+                                                   else { b'?' };
+                            }
+                            n += take;
+                            if take == 0 { break; }
+                        }
+                        let p = core::str::from_utf8(&printable[..n]).unwrap_or("<ne>");
+                        kprintln!("    data raw bytes: {:?}  (printable: {:?})", &buf[..n], p);
+                    }
+                }
+            }
+        }
+    }
+    // Emulate `mov ip, sp`.
+    ctx.x[12] = sp as u64;
+}
+
+/// Helper for `handle_resolve_magic_ptr_probe_with`: print one
+/// guest-memory word both via stage-1 (VA) and direct PA, so we
+/// can tell whether a faulting probe means the address is unmapped
+/// at stage-1 vs at stage-2.
+fn log_word(label: &str, addr: u32) {
+    let via_va = guest_mem::read_word_va(addr);
+    let via_pa = guest_mem::read_word_pa(addr);
+    match (via_va, via_pa) {
+        (Some(v_va), Some(v_pa)) if v_va == v_pa => {
+            kprintln!("  {} = {:#010x}  (VA == PA)", label, v_va);
+        }
+        (Some(v_va), Some(v_pa)) => {
+            kprintln!("  {} = VA:{:#010x}  PA:{:#010x}", label, v_va, v_pa);
+        }
+        (Some(v_va), None) => {
+            kprintln!("  {} = VA:{:#010x}  PA:<unmapped>", label, v_va);
+        }
+        (None, Some(v_pa)) => {
+            kprintln!("  {} = VA:<stage-1 unmapped>  PA:{:#010x}", label, v_pa);
+        }
+        (None, None) => {
+            kprintln!("  {} = <unmapped at both stage-1 and stage-2>", label);
+        }
+    }
 }
 
 /// iter-79: which `POutTranslator` vtable thunk fired.

@@ -1155,6 +1155,19 @@ pub const EX_NOTIFY_PROBE_HVC_IMM:       u32 = 0x7E;
 pub const EX_NOTIFY_PROBE_PC:            u32 = 0x0038_9EF4;
 const EX_NOTIFY_PROBE_FIRST_INSN:        u32 = 0xE590_0004;
 
+/// `ResolveMagicPtr__Fl` entry @ ROM `0x0031_DAD4`. Decodes a
+/// magic-pointer Ref into the underlying object. For table 0
+/// it does `size = *0x01D80000; return *(0x01D80000 + offset)`
+/// — i.e. it reads from VA `0x01D80000`+, which lives in the
+/// kernel's stage-1 high-mapped patch / data region (NOT in
+/// our stage-2 16 MiB ROM aperture). iter-81 hooks the entry
+/// to confirm that VA is reachable through guest stage-1 and
+/// that the table-0 size + entry words look sane for refs
+/// like #453 (table 0, index 276).
+pub const RESOLVE_MAGIC_PTR_PROBE_HVC_IMM: u32 = 0x7F;
+pub const RESOLVE_MAGIC_PTR_PROBE_PC:      u32 = 0x0031_DAD4;
+const RESOLVE_MAGIC_PTR_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
+
 /// `PhysBlock__11TFlashBlockFv` first insn at ROM `0x000c_0cc4`.
 /// Iter-43 pinned the `evt.ex.abt.bus` original throw to the
 /// `bl PhysBlock` site at 0xc0cb8 (caller_lr=0xc0cbc). The fault
@@ -1787,6 +1800,14 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(EX_NOTIFY_PROBE_HVC_IMM),
             "ExceptionNotify thunk (exception-frame dump)",
             EX_NOTIFY_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            RESOLVE_MAGIC_PTR_PROBE_PC,
+            RESOLVE_MAGIC_PTR_FIRST_INSN,
+            hvc_insn(RESOLVE_MAGIC_PTR_PROBE_HVC_IMM),
+            "ResolveMagicPtr entry (verify table-0 mapping)",
+            RESOLVE_MAGIC_PTR_PROBE_HVC_IMM,
         );
         patch_probe(
             rom_ptr,

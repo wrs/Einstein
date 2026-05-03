@@ -18,22 +18,72 @@ Bloated PLAN.md wastes context every read.
   functionality (not merely diagnostics):
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-86):** chase the `LowLevelCopyEngineLong` r0=0
-regression that surfaced when iter-85 dropped R12 from
-`pick_scratch_regs_with_reader::CANDIDATES`. Boot now wedges at
-`*** unknown MMIO write halted *** IPA=0x00000000 W value=0xe8bd0030
-@ELR=0x3940b4` — `LowLevelCopyEngineLong`'s `str r3, [r0], #4` with
-`r0` wild. Some shadow_stub site that previously got covered by the
-R12-as-scratch shortcut is now picking from `[R0,R1,R2,R3]` at a
-site where the dead-reg analyzer is wrong about one of those — the
-same liveness-model issue (APCS-grounded analysis vs kernel-private
-conventions) that bit us on R12, just at a different register.
+**Current goal (iter-87):** chase the next FPE wedge.
+With iter-85's picker fix in, the boot sails past `SetSystemVolume`
+(FPE entries 0..7 all clean), reaches `TimeInSeconds()` and beyond,
+and wedges much later at:
 
-The new `--features sba-trace` lets us dump every patch's solution.
-Bisect by walking the trace lines around the wedge and looking for
-sites where the picked scratch is one of the operands of a *future*
-load that the analyzer didn't see (e.g., across an unreadable
-tail-call or a B to a post-ship-patch slot).
+```
+*** unrecognised UND: insn=0xe1400170 at PC=0xffff54 SPSR_und=0x80000110
+  src_mode=0x10 (USR)  …
+  SP_und=0xc006000 LR_und=0xffff58
+```
+
+`PC=0xffff54` is our own UND trampoline at `UND_TRAMP_OFFSET + 0x54`
+(the `hvc #UND_TAG` instruction). `LR_und=0xffff58` is the trap-if-
+returns sentinel right after. Source mode is USR. So a guest USR
+instruction took an UND, the trampoline ran, fired its HVC into EL2,
+and somehow handle_und ended up routing back through the UND vector
+again — and the SECOND time saw the trampoline's own HVC as the
+"faulting instruction." Likely a missing handler or a state
+mishandle for some opcode the FPE chain executes after forward #2's
+`SetSystemVolume` (the boot output shows it lands on `TimeInSeconds()`
+right before the wedge).
+
+Investigation handle: `--features sba-trace` is available for spot
+inspection; otherwise the iter-83-style ctx dump on unrecognised UND
+is in the boot output.
+
+### Iteration 86: skip the per-test rebuild via semihost-load
+
+#### Problem
+
+`run-all.sh` ran `cargo build --release` once per test (36 times)
+because each test's `.bin` was embedded into the hypervisor via
+`include_bytes!(env!("NH_GUEST_TEST_PATH"))`. Each rebuild was a
+relink (LTO) — ~10s each, ~5 min total wall.
+
+#### Fix
+
+Two delivery modes for the test binary, selected by the value of
+`NH_GUEST_TEST`:
+
+- **embed** (`NH_GUEST_TEST=path/to/test.bin`): compile-time
+  `include_bytes!` — current behavior, fast for iterating on a
+  fixed test where cargo's incremental build only re-emits one
+  object + relinks.
+
+- **semihost-load** (`NH_GUEST_TEST=1`): build the hypervisor as
+  a generic test image with no embedded bin; load the test
+  binary at boot via Arm semihosting. The path is passed in
+  QEMU's `-semihosting-config arg=<path>`. iter-86 added
+  `load_test_bin_via_semihosting` in `src/guest_mem.rs` that
+  calls `SYS_GET_CMDLINE` → `SYS_OPEN` → `SYS_FLEN` → `SYS_READ`
+  to fill `GUEST_TEST_BIN_BUF` before stage-2 setup.
+
+`build.rs` sets the `nh_guest_test_embed` / `nh_guest_test_semihost`
+sub-cfgs (both also set `nh_guest_test`); `guest_mem.rs` and the
+loader pick the right path.
+
+`run-test.sh` and `run-all.sh` default to semihost-load. Set
+`NH_GUEST_TEST_EMBED=1` to opt into the legacy embed mode.
+
+#### Result
+
+`run-all.sh` wall time: **~5 minutes → 6.7 seconds**. 36/36 tests
+pass under both modes.
+
+---
 
 ### Iteration 85: drop R12 from dead-reg picker + sba-trace feature
 

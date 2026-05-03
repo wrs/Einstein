@@ -30,23 +30,45 @@ fn main() {
 
     // Tell rustc that `nh_guest_test` is a known cfg so it doesn't warn.
     println!("cargo:rustc-check-cfg=cfg(nh_guest_test)");
+    println!("cargo:rustc-check-cfg=cfg(nh_guest_test_embed)");
+    println!("cargo:rustc-check-cfg=cfg(nh_guest_test_semihost)");
 
     select_platform_linker_script();
 
     let guest_test = env::var("NH_GUEST_TEST").ok();
-    if let Some(path) = &guest_test {
-        let p = PathBuf::from(path);
-        if !p.is_file() {
-            panic!("NH_GUEST_TEST={} is not a file", path);
+    if let Some(val) = &guest_test {
+        if val == "1" {
+            // Semihost-load mode: build the hypervisor as a generic
+            // test image; the actual test bin is loaded at boot via
+            // semihosting from the path passed in QEMU's
+            // `-semihosting-config arg=<path>`. iter-86 added this so
+            // `run-all.sh` can build once and run N tests without the
+            // per-test relink that dominated wall time.
+            println!("cargo:rustc-cfg=nh_guest_test");
+            println!("cargo:rustc-cfg=nh_guest_test_semihost");
+            println!(
+                "cargo:warning=nh-baremetal: guest-test mode (semihost-load)"
+            );
+        } else {
+            // Embed-from-path mode. Single-test loop hitting one fixed
+            // .bin — the path resolves to `include_bytes!` at compile
+            // time, so cargo rebuilds when the path changes (slow for
+            // run-all but fast when iterating on hypervisor changes
+            // against one fixed test).
+            let p = PathBuf::from(val);
+            if !p.is_file() {
+                panic!("NH_GUEST_TEST={} is not a file or '1'", val);
+            }
+            let abs = p.canonicalize().expect("canonicalize NH_GUEST_TEST");
+            println!(
+                "cargo:warning=nh-baremetal: guest-test mode (embed) — {}",
+                abs.display()
+            );
+            println!("cargo:rustc-env=NH_GUEST_TEST_PATH={}", abs.display());
+            println!("cargo:rustc-cfg=nh_guest_test");
+            println!("cargo:rustc-cfg=nh_guest_test_embed");
+            println!("cargo:rerun-if-changed={}", abs.display());
         }
-        let abs = p.canonicalize().expect("canonicalize NH_GUEST_TEST");
-        println!(
-            "cargo:warning=nh-baremetal: guest-test mode, embedding {}",
-            abs.display()
-        );
-        println!("cargo:rustc-env=NH_GUEST_TEST_PATH={}", abs.display());
-        println!("cargo:rustc-cfg=nh_guest_test");
-        println!("cargo:rerun-if-changed={}", abs.display());
     }
 
     // Build the symbol tables unconditionally. `trace` consumes them

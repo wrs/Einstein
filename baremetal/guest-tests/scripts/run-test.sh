@@ -43,7 +43,20 @@ if [[ ! -f "$bin" ]]; then
 fi
 
 cd "$here/../../"
-export NH_GUEST_TEST="$bin"
+# iter-86: prefer the semihost-load mode by default. The hypervisor is
+# built once with `NH_GUEST_TEST=1` (no path); the test binary is loaded
+# at boot via Arm semihosting from the path passed in QEMU's
+# `-semihosting-config arg=<path>`. This skips the per-test relink that
+# previously dominated `run-all.sh` wall time.
+#
+# Set NH_GUEST_TEST_EMBED=1 to use the legacy embed path (cargo
+# rebuilds + relinks per test), e.g. when iterating on test infra
+# in a way that benefits from compile-time embedding.
+if [[ "${NH_GUEST_TEST_EMBED:-0}" == "1" ]]; then
+    export NH_GUEST_TEST="$bin"
+else
+    export NH_GUEST_TEST=1
+fi
 
 log=/tmp/guest-${platform}-${test_name}.out
 
@@ -61,9 +74,20 @@ if [[ "$platform" == "qemu" ]]; then
     # resume mid-run and break reproducibility.
     rm -f /tmp/newton-snapshot-*.bin
 
+    semihost_arg="enable=on,target=native"
+    if [[ "${NH_GUEST_TEST_EMBED:-0}" != "1" ]]; then
+        # Pass the test bin path via QEMU semihosting cmdline; the
+        # hypervisor's `load_test_bin_via_semihosting` reads it via
+        # SYS_GET_CMDLINE on boot.
+        # `bin` is already absolute (composed from `$here` which is
+        # absolute). Resolve to a clean canonical path so QEMU's
+        # semihosting layer can open it from any cwd.
+        bin_abs="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
+        semihost_arg="${semihost_arg},arg=${bin_abs}"
+    fi
     timeout 10 qemu-system-aarch64 -M raspi3b -kernel "$img" \
         -serial stdio -display none -no-reboot \
-        -semihosting-config enable=on,target=native > "$log" 2>&1 || true
+        -semihosting-config "$semihost_arg" > "$log" 2>&1 || true
 else
     # FVP path — build with the fvp-base platform feature, run the ELF
     # directly (FVP loads by program headers), scrape the same markers.

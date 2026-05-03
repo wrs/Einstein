@@ -50,10 +50,52 @@ static ROM_BE: &[u8] = include_bytes!("../roms/newton.rom");
 static REX_BE: &[u8] = include_bytes!("../../_Data_/Einstein.rex");
 
 // Guest-test mode: `build.rs` picked up $NH_GUEST_TEST and set this cfg.
-// The embedded bytes are an AArch32 flat binary with reset vector at
-// offset 0, built by baremetal/guest-tests/scripts/build-tests.sh.
-#[cfg(nh_guest_test)]
+// The test binary is an AArch32 flat binary with reset vector at offset
+// 0, built by baremetal/guest-tests/scripts/build-tests.sh.
+//
+// Two delivery modes, selected by the value of `$NH_GUEST_TEST`:
+//
+// 1. **Path** (`NH_GUEST_TEST=path/to/test.bin`): embed the bytes into
+//    the image at compile time via `include_bytes!`. The hypervisor
+//    boots straight into the test with no runtime load step. Fast for
+//    single-test iteration when cargo's incremental build only has to
+//    re-emit one object + relink.
+//
+// 2. **Semihost** (`NH_GUEST_TEST=1`): build the hypervisor as a
+//    test-mode image with no embedded test, and load the test binary at
+//    boot time via Arm semihosting. The path is passed by the host as a
+//    semihosting cmdline arg (`qemu-system-aarch64 ... -semihosting-config
+//    arg=path/to/test.bin`). One hypervisor build serves N tests — used
+//    by `run-all.sh` to skip the per-test relink that dominates the
+//    36-test wall time.
+//
+// build.rs sets `nh_guest_test_embed` for mode 1 and `nh_guest_test_semihost`
+// for mode 2; both also set `nh_guest_test`.
+#[cfg(nh_guest_test_embed)]
 static GUEST_TEST_BIN: &[u8] = include_bytes!(env!("NH_GUEST_TEST_PATH"));
+
+// Semihost mode: a buffer the early-boot loader fills via SYS_READ.
+// Sized at GUEST_ROM's full 16 MiB so any practical test binary fits.
+#[cfg(nh_guest_test_semihost)]
+static mut GUEST_TEST_BIN_BUF: [u8; ROM_SIZE] = [0u8; ROM_SIZE];
+#[cfg(nh_guest_test_semihost)]
+static mut GUEST_TEST_BIN_LEN: usize = 0;
+
+#[cfg(nh_guest_test_semihost)]
+fn guest_test_bin() -> &'static [u8] {
+    // SAFETY: GUEST_TEST_BIN_LEN is only written by `load_test_bin_via_semihosting`
+    // before any reader runs, and EL2 boot is single-threaded.
+    unsafe {
+        let len = GUEST_TEST_BIN_LEN;
+        let ptr = addr_of_mut!(GUEST_TEST_BIN_BUF) as *const u8;
+        core::slice::from_raw_parts(ptr, len)
+    }
+}
+
+#[cfg(nh_guest_test_embed)]
+fn guest_test_bin() -> &'static [u8] {
+    GUEST_TEST_BIN
+}
 
 /// Raw big-endian on-disk bytes of the Newton ROM, pre-byteswap. Used by
 /// `shadow_stub::patch_rom_from_bitmap` to verify the embedded classify
@@ -982,21 +1024,171 @@ pub unsafe fn load_rom() {
     }
 }
 
+/// Load the test binary into `GUEST_TEST_BIN_BUF` via Arm semihosting.
+///
+/// The path is the first non-binary-name word of the cmdline, which QEMU
+/// populates from `-semihosting-config arg=<path>`. iter-86 introduced
+/// this to skip the per-test hypervisor rebuild that dominated
+/// `run-all.sh`'s 5-minute wall time. With this loader the hypervisor
+/// is built once with `NH_GUEST_TEST=1` and each test run only changes
+/// the QEMU cmdline arg.
+#[cfg(nh_guest_test_semihost)]
+unsafe fn load_test_bin_via_semihosting() {
+    use core::arch::asm;
+    const SYS_OPEN: u64 = 0x01;
+    const SYS_CLOSE: u64 = 0x02;
+    const SYS_READ: u64 = 0x06;
+    const SYS_FLEN: u64 = 0x0C;
+    const SYS_GET_CMDLINE: u64 = 0x15;
+    const MODE_READ_BINARY: u64 = 0x01;
+
+    unsafe fn semihost(op: u64, arg: *const u64) -> i64 {
+        let result: u64;
+        // SAFETY: HLT #0xF000 is the AArch64 semihosting trap; QEMU
+        // intercepts and returns to EL2 without touching state beyond x0.
+        unsafe {
+            asm!(
+                "hlt #0xF000",
+                inout("x0") op => result,
+                in("x1") arg as u64,
+                options(nostack, preserves_flags),
+            );
+        }
+        result as i64
+    }
+
+    // Buffer for the cmdline. QEMU's cmdline format on raspi3b semihosting
+    // is "<binary_name> <arg1> <arg2> ..." — for our use, arg1 is the
+    // test bin path. 256 bytes is comfortably more than any /tmp path.
+    const CMDLINE_CAP: usize = 256;
+    static mut CMDLINE_BUF: [u8; CMDLINE_CAP] = [0; CMDLINE_CAP];
+    // SYS_GET_CMDLINE: in: ptr, len; out: writes path to ptr, len-out at
+    // arg[1]. Returns 0 on success, -1 on failure.
+    let cmdline_args: [u64; 2] = [
+        addr_of_mut!(CMDLINE_BUF) as u64,
+        (CMDLINE_CAP as u64) - 1,
+    ];
+    let rc = unsafe { semihost(SYS_GET_CMDLINE, cmdline_args.as_ptr()) };
+    if rc != 0 {
+        kprintln!("guest_mem: SYS_GET_CMDLINE failed (rc={}) — no test bin", rc);
+        crate::cpu::halt();
+    }
+
+    // Parse out the second whitespace-separated word from the cmdline.
+    // The first word is the binary name (or "newton-hypervisor"), the
+    // second is our test bin path.
+    let cmdline = unsafe {
+        let ptr = addr_of_mut!(CMDLINE_BUF) as *const u8;
+        // Find NUL terminator or full buffer.
+        let mut n = 0;
+        while n < CMDLINE_CAP && core::ptr::read(ptr.add(n)) != 0 {
+            n += 1;
+        }
+        core::slice::from_raw_parts(ptr, n)
+    };
+    // QEMU's semihosting cmdline is exactly the `arg=...` value (no
+    // binary-name prefix as POSIX execve would have). Take the whole
+    // string, trimmed of leading/trailing whitespace.
+    let mut start = 0;
+    let mut end = cmdline.len();
+    while start < end && (cmdline[start] == b' ' || cmdline[start] == b'\t') {
+        start += 1;
+    }
+    while end > start && (cmdline[end - 1] == b' ' || cmdline[end - 1] == b'\t' || cmdline[end - 1] == b'\n') {
+        end -= 1;
+    }
+    let path_bytes = &cmdline[start..end];
+    if path_bytes.is_empty() {
+        kprintln!(
+            "guest_mem: cmdline empty — expected QEMU \
+             `-semihosting-config arg=<test-bin-path>`"
+        );
+        crate::cpu::halt();
+    }
+
+    // SYS_OPEN takes a NUL-terminated path; copy into a static buffer.
+    const PATH_CAP: usize = 256;
+    static mut PATH_BUF: [u8; PATH_CAP] = [0; PATH_CAP];
+    if path_bytes.len() >= PATH_CAP - 1 {
+        kprintln!("guest_mem: test path too long ({} bytes)", path_bytes.len());
+        crate::cpu::halt();
+    }
+    // SAFETY: single-threaded EL2 init; bounded write under PATH_BUF.len().
+    unsafe {
+        let dst = addr_of_mut!(PATH_BUF) as *mut u8;
+        for (i, &b) in path_bytes.iter().enumerate() {
+            dst.add(i).write(b);
+        }
+        dst.add(path_bytes.len()).write(0);
+    }
+
+    let open_args: [u64; 3] = [
+        addr_of_mut!(PATH_BUF) as u64,
+        MODE_READ_BINARY,
+        path_bytes.len() as u64,
+    ];
+    let fh = unsafe { semihost(SYS_OPEN, open_args.as_ptr()) };
+    if fh < 0 {
+        kprintln!(
+            "guest_mem: SYS_OPEN failed (rc={}) for path {:?} (len={})",
+            fh,
+            core::str::from_utf8(path_bytes).unwrap_or("<non-utf8>"),
+            path_bytes.len(),
+        );
+        crate::cpu::halt();
+    }
+    let fh = fh as u64;
+
+    let flen_args: [u64; 1] = [fh];
+    let flen = unsafe { semihost(SYS_FLEN, flen_args.as_ptr()) };
+    let buf_cap = ROM_SIZE; // GUEST_TEST_BIN_BUF is sized at ROM_SIZE
+    if flen < 0 || (flen as usize) > buf_cap {
+        kprintln!(
+            "guest_mem: SYS_FLEN={} (test bin too large or error)",
+            flen
+        );
+        crate::cpu::halt();
+    }
+    let flen = flen as usize;
+
+    // SYS_READ: ptr, len. Returns bytes-NOT-read (0 on success).
+    let read_args: [u64; 3] = [
+        fh,
+        addr_of_mut!(GUEST_TEST_BIN_BUF) as u64,
+        flen as u64,
+    ];
+    let unread = unsafe { semihost(SYS_READ, read_args.as_ptr()) };
+    if unread != 0 {
+        kprintln!("guest_mem: SYS_READ left {} bytes unread", unread);
+        crate::cpu::halt();
+    }
+    let close_args: [u64; 1] = [fh];
+    let _ = unsafe { semihost(SYS_CLOSE, close_args.as_ptr()) };
+
+    // SAFETY: single-threaded EL2 init.
+    unsafe { GUEST_TEST_BIN_LEN = flen; }
+}
+
 #[cfg(nh_guest_test)]
 pub unsafe fn load_guest_test() {
+    #[cfg(nh_guest_test_semihost)]
+    unsafe { load_test_bin_via_semihosting(); }
+
     let rom_ptr = addr_of_mut!(GUEST_ROM) as *mut u8;
+    let bin = guest_test_bin();
+    let mode = if cfg!(nh_guest_test_semihost) { "semihost-loaded" } else { "embedded" };
     kprintln!(
-        "guest_mem: GUEST-TEST MODE — embedding {} bytes",
-        GUEST_TEST_BIN.len()
+        "guest_mem: GUEST-TEST MODE ({}) — copying {} bytes into GUEST_ROM",
+        mode, bin.len()
     );
-    for (i, b) in GUEST_TEST_BIN.iter().enumerate() {
-        // SAFETY: i < GUEST_TEST_BIN.len() <= ROM_SIZE.
+    for (i, b) in bin.iter().enumerate() {
+        // SAFETY: i < bin.len() <= ROM_SIZE.
         unsafe { rom_ptr.add(i).write(*b); }
     }
     // Make the freshly-written bytes visible to the guest's instruction
     // fetcher. Without this the I-cache misses, hits memory, and reads
     // pre-init zeros (the writes are still in the D-cache).
-    crate::cpu::icache_publish_range(rom_ptr as u64, GUEST_TEST_BIN.len());
+    crate::cpu::icache_publish_range(rom_ptr as u64, bin.len());
     kprintln!(
         "guest_mem: guest-test @ host PA {:#x}, RAM @ host PA {:#x}",
         rom_host_pa(), ram_host_pa()

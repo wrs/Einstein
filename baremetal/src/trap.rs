@@ -1628,6 +1628,66 @@ pub const UND_SAVE_R2_IPA: u32 = HYP_TRAMP_SCRATCH_BASE + 0x14;
 pub const UND_SAVE_BANKED_SP_IPA: u32 = HYP_TRAMP_SCRATCH_BASE + 0x18;
 pub const UND_SAVE_BANKED_LR_IPA: u32 = HYP_TRAMP_SCRATCH_BASE + 0x1C;
 
+// iter-87 diag: rolling buffer of recent UND faults. The wedge fires
+// inside our trampoline (PC=0xffff54) — the trampoline's own HVC,
+// caught by handle_und's catch-all. To learn how USR ended up at the
+// trampoline's HVC instruction, we need to see the prior UNDs.
+#[derive(Copy, Clone)]
+struct UndHistEntry {
+    faulting_pc: u32,
+    insn: u32,
+    spsr_und: u32,
+    lr_usr: u32,
+    sp_for_mode: u32,
+}
+const UND_HIST_LEN: usize = 32;
+static mut UND_HISTORY: [UndHistEntry; UND_HIST_LEN] = [
+    UndHistEntry { faulting_pc: 0, insn: 0, spsr_und: 0, lr_usr: 0, sp_for_mode: 0 };
+    UND_HIST_LEN
+];
+static mut UND_HIST_NEXT: usize = 0;
+static mut UND_HIST_COUNT: u64 = 0;
+
+fn record_und_history(faulting_pc: u32, insn: u32, spsr_und: u32, ctx: &TrapContext) {
+    // Capture banked SP for the faulting mode, so dumps show where
+    // the faulting code's stack was. lr_usr is ctx.x[14]; for non-USR
+    // sources it's still informative as the user-space caller LR.
+    let sp = crate::banked::sp_for_mode(ctx, spsr_und);
+    let entry = UndHistEntry {
+        faulting_pc,
+        insn,
+        spsr_und,
+        lr_usr: ctx.x[14] as u32,
+        sp_for_mode: sp,
+    };
+    // SAFETY: single-threaded EL2.
+    unsafe {
+        let i = UND_HIST_NEXT;
+        UND_HISTORY[i] = entry;
+        UND_HIST_NEXT = (i + 1) % UND_HIST_LEN;
+        UND_HIST_COUNT = UND_HIST_COUNT.wrapping_add(1);
+    }
+}
+
+fn dump_und_history() {
+    // SAFETY: single-threaded EL2.
+    let (count, next) = unsafe { (UND_HIST_COUNT, UND_HIST_NEXT) };
+    let n = if count < UND_HIST_LEN as u64 { count as usize } else { UND_HIST_LEN };
+    kprintln!("UND history (last {} of {} total UNDs, oldest first):", n, count);
+    for k in 0..n {
+        let i = (next + UND_HIST_LEN - n + k) % UND_HIST_LEN;
+        // SAFETY: index in range, single-threaded.
+        let e = unsafe { UND_HISTORY[i] };
+        let mode = e.spsr_und & 0x1F;
+        kprintln!(
+            "  #{:>3}  PC={:#010x} insn={:#010x} mode={:#x}({}) sp={:#010x} lr_usr={:#010x}",
+            (count - n as u64 + k as u64),
+            e.faulting_pc, e.insn, mode, describe_aarch32_mode(mode),
+            e.sp_for_mode, e.lr_usr,
+        );
+    }
+}
+
 fn handle_und(ctx: &mut TrapContext) {
     // Restore pre-UND R0, R1, R12 from the stash slots the trampoline
     // populated at entry. R0/R1 go through RAM slots (the trampoline
@@ -1697,6 +1757,8 @@ fn handle_und(ctx: &mut TrapContext) {
             cpu::halt();
         }
     };
+
+    record_und_history(faulting_pc, insn, spsr_und as u32, ctx);
 
     // StrongARM CP15 clock-control write (MCR p15, 0, Rt, c15, c1, 2).
     // ARMv8 doesn't define that register, so the instruction raises UND
@@ -2295,6 +2357,70 @@ fn handle_und(ctx: &mut TrapContext) {
             kprintln!(
                 "    (extend handle_und in trap.rs to handle this opcode)"
             );
+            dump_und_history();
+            // iter-87 diag: dump the USR stack near SP_usr (via stage-1
+            // walk) — if USR reached PC=0xffff54 via POP {pc} or LDM,
+            // the popped value should still be visible just below SP_usr.
+            let sp_usr = ctx.x[13] as u32;
+            let read_va = |va: u32| -> Option<u32> {
+                let pa = guest_mem::translate_va(va)?;
+                read_guest_word_pa(pa)
+            };
+            kprintln!("USR stack (SP_usr={:#010x}, words at sp-32..sp+96):", sp_usr);
+            for i in 0..32i32 {
+                let addr = sp_usr.wrapping_add((i.wrapping_sub(8) * 4) as u32);
+                let v = read_va(addr)
+                    .map(|w| w as i64)
+                    .unwrap_or(-1);
+                if v < 0 {
+                    kprintln!("  [{:#010x}] = (unmapped)", addr);
+                } else {
+                    kprintln!("  [{:#010x}] = {:#010x}", addr, v as u32);
+                }
+            }
+            // Also resolve the BL target chain to spot a corrupt JT thunk:
+            // the most-recent BL was at LR_usr-4. Show its insn and decoded
+            // target, then the word at the target (the JT thunk's `b`).
+            let lr_usr = ctx.x[14] as u32;
+            let bl_pc = lr_usr.wrapping_sub(4);
+            kprintln!("BL site (LR_usr-4 = {:#010x}):", bl_pc);
+            let bl_insn = read_va(bl_pc).unwrap_or(0xDEAD_BEEF);
+            kprintln!("  insn = {:#010x}", bl_insn);
+            if (bl_insn & 0xFF00_0000) == 0xEB00_0000 {
+                let imm24 = bl_insn & 0x00FF_FFFF;
+                let signed = ((imm24 << 8) as i32) >> 8;
+                let target =
+                    bl_pc.wrapping_add(8).wrapping_add((signed as u32).wrapping_shl(2));
+                kprintln!("  decoded BL target = {:#010x}", target);
+                let target_insn = read_va(target).unwrap_or(0xDEAD_BEEF);
+                kprintln!("  insn at target = {:#010x}", target_insn);
+                // If the target is a `b imm24` (JT thunk), follow it.
+                if (target_insn & 0xFF00_0000) == 0xEA00_0000 {
+                    let imm24b = target_insn & 0x00FF_FFFF;
+                    let signedb = ((imm24b << 8) as i32) >> 8;
+                    let target2 = target
+                        .wrapping_add(8)
+                        .wrapping_add((signedb as u32).wrapping_shl(2));
+                    kprintln!("  jt target follows-> {:#010x}", target2);
+                    let target2_insn = read_va(target2).unwrap_or(0xDEAD_BEEF);
+                    kprintln!("  insn at jt target = {:#010x}", target2_insn);
+                    // And the next 3 insns of the function body.
+                    for off in [4u32, 8, 12, 16] {
+                        let v = read_va(target2.wrapping_add(off))
+                            .unwrap_or(0xDEAD_BEEF);
+                        kprintln!("  insn at {:#010x} = {:#010x}",
+                                  target2.wrapping_add(off), v);
+                    }
+                }
+            }
+            // Also dump the trampoline area so we can verify the HVC
+            // is at 0xffff54.
+            kprintln!("trampoline area:");
+            for off in [0u32, 4, 8, 0x40, 0x44, 0x50, 0x54, 0x58, 0x5C].iter() {
+                let addr = 0x00FF_FF00u32.wrapping_add(*off);
+                let v = read_va(addr).unwrap_or(0xDEAD_BEEF);
+                kprintln!("  insn at {:#010x} = {:#010x}", addr, v);
+            }
             cpu::halt();
         }
     }
@@ -7374,6 +7500,32 @@ fn resolve_guest_pa(addr: u32) -> Option<u32> {
 /// CPSR, preserved since UND entry) into CPSR, and R14_und into PC.
 /// No `msr spsr_el2`, no SPSR_EL1 side-effect.
 pub(crate) fn return_to_guest_from_und(_ctx: &mut TrapContext, elr: u64, _spsr: u64) {
+    // iter-87 diag: catch the case where we're about to ERET to USR
+    // mode at a PC inside our own trampoline window. That's never
+    // legitimate; the only trampoline-internal ERET target is the
+    // UND_RETURN_STUB which lives outside this range.
+    // iter-87 diag: only flag ERET to the trampoline body proper —
+    // ranges 0xffff00..0xffff60 (UND_TRAMP) and 0xffec0..0xffefc
+    // (FPA bypass). SBA_POST_TRAMP at 0xffff80 and UND_RETURN_STUB
+    // at 0xffffe4 are legitimate ERET targets.
+    let mode = (_spsr as u32) & 0x1F;
+    let elr32 = elr as u32;
+    let in_und_tramp = elr32 >= 0x00FF_FF00 && elr32 < 0x00FF_FF60;
+    let in_fpa_bypass = elr32 >= guest_mem::FPA_BYPASS_STUB_OFFSET as u32
+        && elr32 < (guest_mem::FPA_BYPASS_STUB_OFFSET as u32 + 0x40);
+    if mode == 0x10 && (in_und_tramp || in_fpa_bypass) {
+        kprintln!(
+            "*** return_to_guest_from_und: USR target inside trampoline body! \
+             elr={:#x} spsr={:#x} — about to wedge",
+            elr, _spsr,
+        );
+        dump_und_history();
+        kprintln!(
+            "  elr_el2={:#x} caller-trace below; halting before ERET",
+            read_sysreg!("elr_el2"),
+        );
+        cpu::halt();
+    }
     // Write target PC to the stub's literal slot, then ERET into the
     // stub in UND mode (by leaving SPSR_EL2 alone). The stub does
     // `ldr lr, [pc, #0]; movs pc, lr` — CPU restores CPSR from SPSR_und

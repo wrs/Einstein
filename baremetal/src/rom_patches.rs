@@ -376,10 +376,24 @@ const fn hvc_insn(imm: u32) -> u32 {
 ///                   shared across all non-FIQ modes, ctx.x[7])
 ///                   sidesteps that mapping question entirely.
 ///   HVC #imm      — trap to EL2
-const DEBUG_STR_STUB_PC: u32 = 0x00FF_FF30;
-const DEBUGGER_STUB_PC:  u32 = 0x00FF_FF38;
-const FTIME_STUB_PC:     u32 = 0x00FF_FF40;
-const FDATE_STUB_PC:     u32 = 0x00FF_FF60;
+// Kernel-side native-primitive stubs. These all live in the gap
+// between RESOLVE_FAULT_WRAPPER (ends at 0x00FF_FE5C) and the FPA
+// bypass stub at 0x00FF_FEC0. The previous addresses (0x00FF_FF30+)
+// overlapped the UND trampoline that `patch_und_vector` installs at
+// 0x00FF_FF00..0x00FF_FF5C; since `patch_und_vector` runs *after*
+// `apply_717006_patches`, the trampoline silently clobbered each
+// stub. The kernel's patched BL/B sites still pointed at the stub
+// addresses, so any call into FTimeInSeconds/FDate/DebugStr/Debugger
+// branched into the middle of the trampoline body — which, in USR
+// mode, eventually executed the trampoline's `hvc #UND_TAG` and
+// wedged with `*** unrecognised UND insn=0xe1400170 at PC=0xffff54`
+// (iter-87). Sizes: DEBUG_STR / DEBUGGER 2 words each (8 B);
+// FTIME / FDATE 5 words each (20 B). 56 bytes total fits in the
+// 96-byte free window.
+const DEBUG_STR_STUB_PC: u32 = 0x00FF_FE60;
+const DEBUGGER_STUB_PC:  u32 = 0x00FF_FE68;
+const FTIME_STUB_PC:     u32 = 0x00FF_FE70;
+const FDATE_STUB_PC:     u32 = 0x00FF_FE84;
 
 /// PC of the ResolveFault wrapper (see `apply_resolve_fault_wrapper`).
 /// Sits below the existing 0x00FF_FFxx stubs in the post-UND-trampoline

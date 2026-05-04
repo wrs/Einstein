@@ -28,7 +28,10 @@ use crate::kprintln;
 /// 4-KiB page-aligned VA we want to watch. `0x0cca3000` contains the
 /// alrt task's TAlertEventHandler at `0x0cca37a8` and the corrupted
 /// CList header at `0x0cca37c4`.
-const TARGET_VA: u32 = 0x0cca_3000;
+// Reserved for future re-arming logic; the dynamic Prim Remember-driven
+// arm path was removed alongside the iter-50..89 probe sweep, so
+// TARGET_VA is purely documentation now.
+// const TARGET_VA: u32 = 0x0cca_3000;
 
 /// Known-stable PA backing TARGET_VA across boots, per the prior
 /// PLAN.md alias table:
@@ -203,42 +206,6 @@ pub unsafe fn arm_at_boot() {
             SNAPSHOT_BASE_OFFSET + (i as u32) * 4, v);
         SNAPSHOT[i].store(v, Ordering::Relaxed);
     }
-}
-
-/// Called from the Prim Remember probe on every kernel install. If
-/// the install's VA page-aligns to TARGET_VA and we haven't armed
-/// yet, capture the resolved PA and impose RO+XN at stage-2. With
-/// `arm_at_boot` already running this is now a sanity check that
-/// the kernel really maps TARGET_VA → KNOWN_TARGET_PA (logs a
-/// warning if it doesn't).
-pub fn maybe_arm_for_va(va: u32, pa: u32) {
-    if (va & !0xFFF) != TARGET_VA {
-        return;
-    }
-    let pa_aligned = pa & !0xFFF;
-    let prev = TARGET_PA.compare_exchange(
-        0, pa_aligned, Ordering::AcqRel, Ordering::Relaxed,
-    );
-    if prev.is_err() {
-        // Already armed. If the kernel re-mapped TARGET_VA to a
-        // different PA, log it once — that itself would explain a
-        // whole class of corruption.
-        let cur = TARGET_PA.load(Ordering::Relaxed);
-        if cur != pa_aligned {
-            kprintln!(
-                "alrt-capture: WARNING TARGET_VA={:#010x} re-mapped: was PA={:#010x}, now PA={:#010x}",
-                TARGET_VA, cur, pa_aligned,
-            );
-        }
-        return;
-    }
-    // Successful first arm. SAFETY: helper performs its own TLB
-    // maintenance.
-    unsafe { crate::stage2::set_ram_page_ro_xn(pa_aligned); }
-    kprintln!(
-        "alrt-capture: armed RO+XN on PA={:#010x} (covers VA={:#010x}, contains alrt CList at VA=0x0cca37c4)",
-        pa_aligned, TARGET_VA,
-    );
 }
 
 /// True iff `pa` (4-KiB-aligned) is the armed alrt CList page.

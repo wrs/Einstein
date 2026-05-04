@@ -1,3 +1,10 @@
+// Many of the helpers in this module were called only by the iter-50..89
+// diagnostic probes that the BE-8 migration Phase 0 sweep removed. The
+// general-purpose Ref classifier / pretty-printer is retained for future
+// debugging iterations — including a one-line update to `read_object_bytes`
+// in Phase 4 of the migration. Silence the now-unused warnings until then.
+#![allow(dead_code)]
+
 //! iter-78: classify a Newton NS Ref against the runtime object-heap
 //! bounds.
 //!

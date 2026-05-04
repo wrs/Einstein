@@ -1530,6 +1530,24 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::ALTER_INDEXES_ENTRY_PROBE_HVC_IMM => {
             handle_alter_indexes_entry_probe(ctx);
         }
+        v if v == crate::rom_patches::STORE_PERM_ENTRY_PROBE_HVC_IMM => {
+            handle_store_perm_entry_probe(ctx);
+        }
+        v if v == crate::rom_patches::STORE_PERM_EXIT_PROBE_HVC_IMM => {
+            handle_store_perm_exit_probe(ctx);
+        }
+        v if v == crate::rom_patches::LOAD_PERM_ENTRY_PROBE_HVC_IMM => {
+            handle_load_perm_entry_probe(ctx);
+        }
+        v if v == crate::rom_patches::LOAD_PERM_EXIT_PROBE_HVC_IMM => {
+            handle_load_perm_exit_probe(ctx);
+        }
+        v if v == crate::rom_patches::TEXT_DECOMP_ENTRY_PROBE_HVC_IMM => {
+            handle_text_decomp_entry_probe(ctx);
+        }
+        v if v == crate::rom_patches::TEXT_DECOMP_EXIT_PROBE_HVC_IMM => {
+            handle_text_decomp_exit_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -2351,6 +2369,36 @@ fn handle_und(ctx: &mut TrapContext) {
         }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::ALTER_INDEXES_ENTRY_PROBE_HVC_IMM) => {
             handle_alter_indexes_entry_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::STORE_PERM_ENTRY_PROBE_HVC_IMM) => {
+            handle_store_perm_entry_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::STORE_PERM_EXIT_PROBE_HVC_IMM) => {
+            handle_store_perm_exit_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::LOAD_PERM_ENTRY_PROBE_HVC_IMM) => {
+            handle_load_perm_entry_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::LOAD_PERM_EXIT_PROBE_HVC_IMM) => {
+            handle_load_perm_exit_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::TEXT_DECOMP_ENTRY_PROBE_HVC_IMM) => {
+            handle_text_decomp_entry_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::TEXT_DECOMP_EXIT_PROBE_HVC_IMM) => {
+            handle_text_decomp_exit_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -4710,6 +4758,290 @@ fn handle_alter_indexes_entry_probe_with(ctx: &mut TrapContext, source_cpsr: u32
 
     // Emulate `mov ip, sp`.
     ctx.x[12] = (ctx.x[12] & 0xFFFF_FFFF_0000_0000) | (sp as u64);
+}
+
+/// Iter-89: Store/Load PermObject round-trip probes.
+///
+/// Pairs by store-object id. The log output is:
+///   StorePermObject ENTRY #N: refvar=... ref_in=...
+///     [pretty_print_ref of ref_in, depth=3]
+///   StorePermObject EXIT  #N: assigned_id=...
+///   LoadPermObject  ENTRY #M: id=...
+///   LoadPermObject  EXIT  #M: ref_out=...
+///     [pretty_print_ref of ref_out, depth=3]
+///
+/// Walter's hypothesis: stream parsing in `TStoreObjectReader` uses
+/// byte/halfword ops that diverge between BE-32 SA-110 and our LE
+/// A53 — so the deserialized object can differ structurally from
+/// the one that was stored. Pairing Store ENTRY ↔ Load EXIT by ID
+/// makes any divergence visible.
+fn handle_store_perm_entry_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_store_perm_entry_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_store_perm_entry_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let r0 = ctx.x[0] as u32; // &RefVar to the object being stored
+    let r1 = ctx.x[1] as u32; // TStoreWrapper*
+    let r2 = ctx.x[2] as u32; // &ulong (out object id)
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+
+    // RefVar → slot ptr → tagged Ref.
+    let slot_ptr = guest_mem::read_word_va(r0)
+        .or_else(|| guest_mem::read_word_pa(r0))
+        .unwrap_or(0xDEAD_BEEF);
+    let ref_in = guest_mem::read_word_va(slot_ptr)
+        .or_else(|| guest_mem::read_word_pa(slot_ptr))
+        .unwrap_or(0xDEAD_BEEF);
+
+    kprintln!(
+        "StorePermObject ENTRY #{}: refvar={:#010x} slot_ptr={:#010x} ref_in={:#010x} wrapper={:#010x} &id={:#010x} caller_lr={:#010x} sp={:#010x}",
+        seq, r0, slot_ptr, ref_in, r1, r2, lr, sp,
+    );
+    crate::heap_check::pretty_print_ref("ref_in", ref_in, 3);
+
+    // Emulate `mov ip, sp`.
+    ctx.x[12] = (ctx.x[12] & 0xFFFF_FFFF_0000_0000) | (sp as u64);
+}
+
+fn handle_store_perm_exit_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_store_perm_exit_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_store_perm_exit_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let r0 = ctx.x[0] as u32; // freshly assigned object id
+    let r5 = ctx.x[5] as u32; // &id (destination)
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+
+    kprintln!(
+        "StorePermObject EXIT  #{}: assigned_id={:#010x} &id={:#010x} caller_lr={:#010x}",
+        seq, r0, r5, lr,
+    );
+
+    // Emulate `str r0, [r5]`.
+    let dst = r5;
+    if !guest_mem::write_word_va(dst, r0) {
+        let _ = guest_mem::write_word_pa(dst, r0);
+    }
+}
+
+fn handle_load_perm_entry_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_load_perm_entry_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_load_perm_entry_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let r0 = ctx.x[0] as u32; // TStoreWrapper*
+    let r1 = ctx.x[1] as u32; // ulong object id
+    let r2 = ctx.x[2] as u32; // CDynamicArray** precedents
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+
+    kprintln!(
+        "LoadPermObject  ENTRY #{}: id={:#010x} wrapper={:#010x} precedents_pp={:#010x} caller_lr={:#010x} sp={:#010x}",
+        seq, r1, r0, r2, lr, sp,
+    );
+
+    // Emulate `mov ip, sp`.
+    ctx.x[12] = (ctx.x[12] & 0xFFFF_FFFF_0000_0000) | (sp as u64);
+}
+
+fn handle_load_perm_exit_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_load_perm_exit_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_load_perm_exit_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let r4 = ctx.x[4] as u32; // result Ref (function returns it via `mov r0, r4`)
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+
+    kprintln!(
+        "LoadPermObject  EXIT  #{}: ref_out={:#010x} caller_lr={:#010x}",
+        seq, r4, lr,
+    );
+    crate::heap_check::pretty_print_ref("ref_out", r4, 3);
+
+    // Emulate `mov r0, r4`.
+    ctx.x[0] = (ctx.x[0] & 0xFFFF_FFFF_0000_0000) | (r4 as u64);
+}
+
+/// Iter-89: text decompressor probes — Walter's "string-only" hypothesis.
+///
+/// At ENTRY (`Decompress__20TObjTextDecompressor`), capture the perm-object
+/// id and the in/out length pointer; save the (this, len_ptr, id) triple
+/// keyed by `this` so the EXIT probe can retrieve them. At the EXIT site
+/// (just before `ldmdb` — instruction `ldr r0, [r4, #3004]!`), the load
+/// produces the decompressed-text buffer pointer and the in/out length
+/// has been updated to the decompressed-byte count. Dump the first 64
+/// bytes of output so we can compare with what was originally compressed.
+fn handle_text_decomp_entry_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_text_decomp_entry_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+#[derive(Copy, Clone, Default)]
+struct TextDecompCall { this: u32, id: u32, len_in: i32, seq: u32 }
+
+const TEXT_DECOMP_RING: usize = 16;
+static mut TEXT_DECOMP_PENDING: [TextDecompCall; TEXT_DECOMP_RING] =
+    [TextDecompCall { this: 0, id: 0, len_in: 0, seq: 0 }; TEXT_DECOMP_RING];
+
+fn text_decomp_save(call: TextDecompCall) {
+    let arr = &raw mut TEXT_DECOMP_PENDING;
+    unsafe {
+        let slots = &mut *arr;
+        for slot in slots.iter_mut() {
+            if slot.this == 0 || slot.this == call.this {
+                *slot = call;
+                return;
+            }
+        }
+        // Ring full — overwrite slot 0 (oldest).
+        slots[0] = call;
+    }
+}
+
+fn text_decomp_take(this: u32) -> Option<TextDecompCall> {
+    let arr = &raw mut TEXT_DECOMP_PENDING;
+    unsafe {
+        let slots = &mut *arr;
+        for slot in slots.iter_mut() {
+            if slot.this == this {
+                let out = *slot;
+                slot.this = 0;
+                return Some(out);
+            }
+        }
+        None
+    }
+}
+
+fn handle_text_decomp_entry_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let r0 = ctx.x[0] as u32; // this (TObjTextDecompressor*)
+    let r1 = ctx.x[1] as u32; // wrapper
+    let r2 = ctx.x[2] as u32; // perm_obj_id
+    let r3 = ctx.x[3] as u32; // &long len_in_out
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+    let len_in = guest_mem::read_word_va(r3)
+        .or_else(|| guest_mem::read_word_pa(r3))
+        .unwrap_or(0xDEAD_BEEF) as i32;
+
+    kprintln!(
+        "TextDecomp ENTRY #{}: this={:#010x} wrapper={:#010x} id={:#010x} &len={:#010x} *len_in={} caller_lr={:#010x} sp={:#010x}",
+        seq, r0, r1, r2, r3, len_in, lr, sp,
+    );
+
+    text_decomp_save(TextDecompCall { this: r0, id: r2, len_in, seq });
+
+    // Emulate `mov ip, sp`.
+    ctx.x[12] = (ctx.x[12] & 0xFFFF_FFFF_0000_0000) | (sp as u64);
+}
+
+fn handle_text_decomp_exit_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_text_decomp_exit_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_text_decomp_exit_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    let r4_old = ctx.x[4] as u32;
+    let r5 = ctx.x[5] as u32;
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+
+    // Emulate `ldr r0, [r4, #3004]!` (pre-indexed-with-writeback):
+    //   r4 := r4 + 3004
+    //   r0 := mem[r4]
+    let new_r4 = r4_old.wrapping_add(3004);
+    let loaded = guest_mem::read_word_va(new_r4)
+        .or_else(|| guest_mem::read_word_pa(new_r4))
+        .unwrap_or(0xDEAD_BEEF);
+    ctx.x[4] = (ctx.x[4] & 0xFFFF_FFFF_0000_0000) | (new_r4 as u64);
+    ctx.x[0] = (ctx.x[0] & 0xFFFF_FFFF_0000_0000) | (loaded as u64);
+
+    let len_out = guest_mem::read_word_va(r5)
+        .or_else(|| guest_mem::read_word_pa(r5))
+        .unwrap_or(0xDEAD_BEEF) as i32;
+
+    let pending = text_decomp_take(r4_old);
+    let (id, seq, len_in) = match pending {
+        Some(c) => (c.id, c.seq, c.len_in),
+        None => (0xDEAD_BEEFu32, u32::MAX, -1),
+    };
+
+    kprintln!(
+        "TextDecomp EXIT  #{}: this={:#010x} id={:#010x} out_buf={:#010x} len_in={} len_out={} caller_lr={:#010x}",
+        seq, r4_old, id, loaded, len_in, len_out, lr,
+    );
+
+    // Dump up to 64 bytes of the decompressed output buffer.
+    let dump_n = (len_out as u32).min(64);
+    let mut bytes = [0u8; 64];
+    let mut bw = 0;
+    let mut cursor = loaded;
+    while bw + 4 <= dump_n as usize {
+        let w = guest_mem::read_word_va(cursor)
+            .or_else(|| guest_mem::read_word_pa(cursor));
+        let w = match w { Some(w) => w, None => break };
+        bytes[bw..bw + 4].copy_from_slice(&w.to_le_bytes());
+        bw += 4;
+        cursor = cursor.wrapping_add(4);
+    }
+    if bw > 0 {
+        // Hex preview.
+        let mut hex_buf = [0u8; 64 * 3];
+        let mut hp = 0;
+        for i in 0..bw {
+            if i > 0 { hex_buf[hp] = b' '; hp += 1; }
+            let b = bytes[i];
+            hex_buf[hp]     = nib(b >> 4);
+            hex_buf[hp + 1] = nib(b & 0xf);
+            hp += 2;
+        }
+        let hex = core::str::from_utf8(&hex_buf[..hp]).unwrap_or("?");
+        kprintln!("    out hex ({} B): {}", bw, hex);
+
+        // UTF-16BE preview as a quick sanity check (Newton strings are
+        // UTF-16BE in memory).
+        let mut s = [b'?'; 32];
+        let mut sn = 0;
+        for chunk in bytes[..bw].chunks_exact(2).take(s.len()) {
+            let hi = chunk[0]; let lo = chunk[1];
+            if hi == 0 && lo == 0 { break; }
+            s[sn] = if hi == 0 && (0x20..0x7f).contains(&lo) { lo } else { b'?' };
+            sn += 1;
+        }
+        if sn > 0 {
+            let txt = core::str::from_utf8(&s[..sn]).unwrap_or("?");
+            kprintln!("    out as-utf16be: \"{}\"", txt);
+        }
+    }
+    let _ = id;
+}
+
+fn nib(n: u8) -> u8 {
+    match n & 0xf { 0..=9 => b'0' + n, a => b'a' + (a - 10) }
 }
 
 /// Iter-89: probe at `EntryRemoveFromSoup__FRC6RefVar` entry

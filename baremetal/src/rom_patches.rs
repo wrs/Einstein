@@ -1431,6 +1431,60 @@ pub const ALTER_INDEXES_ENTRY_PROBE_HVC_IMM: u32 = 0x8B;
 pub const ALTER_INDEXES_ENTRY_PROBE_PC:      u32 = 0x0034_7BA0;
 const ALTER_INDEXES_ENTRY_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
 
+/// Iter-89: Store/Load round-trip probes for soup-stream serialization.
+///
+/// Walter's hypothesis: object retrieval from the soup goes through
+/// `TStoreObjectReader` whose stream parsing uses byte/halfword ops
+/// — endianness-sensitive in our LE A53 vs the SA-110 BE-32 build.
+/// To check the round-trip, capture the *input* of `StorePermObject`
+/// (the Ref being serialized) and the *output* of `LoadPermObject`
+/// (the Ref returned), each tagged with the resulting/source store
+/// object ID. Pairing by ID lets us compare what came out vs what
+/// went in — any structural divergence pins the bug to the
+/// serialize/deserialize layer.
+///
+/// `LoadPermObject(TStoreWrapper*, ulong id, CDynamicArray**) → Ref`
+///   ENTRY: r0=wrapper, r1=id (the source object ID).
+///   EXIT: r4 holds the result Ref (then `mov r0, r4` returns it).
+pub const LOAD_PERM_ENTRY_PROBE_HVC_IMM: u32 = 0x8C;
+pub const LOAD_PERM_ENTRY_PROBE_PC:      u32 = 0x002D_F454;
+const LOAD_PERM_ENTRY_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
+
+pub const LOAD_PERM_EXIT_PROBE_HVC_IMM: u32 = 0x8D;
+pub const LOAD_PERM_EXIT_PROBE_PC:      u32 = 0x002D_F4C0;
+const LOAD_PERM_EXIT_FIRST_INSN:        u32 = 0xE1A0_0004; // mov r0, r4
+
+/// `StorePermObject(RefVar const&, TStoreWrapper*, ulong&, CDynamicArray*, uchar*) → void`
+///   ENTRY: r0=&RefVar (the object to store), r1=wrapper, r2=&ulong (out id).
+///   EXIT (just before the `str r0, [r5]` that writes the assigned id):
+///     r0 holds the freshly-assigned object ID, r5 = &id.
+pub const STORE_PERM_ENTRY_PROBE_HVC_IMM: u32 = 0x8E;
+pub const STORE_PERM_ENTRY_PROBE_PC:      u32 = 0x002D_F998;
+const STORE_PERM_ENTRY_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
+
+pub const STORE_PERM_EXIT_PROBE_HVC_IMM: u32 = 0x8F;
+pub const STORE_PERM_EXIT_PROBE_PC:      u32 = 0x002D_FA48;
+const STORE_PERM_EXIT_FIRST_INSN:        u32 = 0xE585_0000; // str r0, [r5]
+
+/// Iter-89: text decompressor probes — Walter narrowed the failing-Delete
+/// entry's slot[0] divergence to text compression (string-only).
+///
+/// `Decompress__20TObjTextDecompressorFP13TStoreWrapperUlPl` at 0x002DFE70:
+///   ENTRY: r0=this (TObjTextDecompressor*), r1=wrapper (TStoreWrapper*),
+///          r2=perm_obj_id (the large-binary id holding compressed text),
+///          r3=&long (in/out length).
+/// At the post-ReadChunk return point (0x002DFF28, `ldr r0, [r4, #3004]!`):
+///   r4 = decompressor; the load emits r0 = output text buffer
+///   (decompressor field at +3004 = bbc, set by TextDecompCallback).
+///   *r5 holds the output length (r5 = saved &long from r3).
+pub const TEXT_DECOMP_ENTRY_PROBE_HVC_IMM: u32 = 0x90;
+pub const TEXT_DECOMP_ENTRY_PROBE_PC:      u32 = 0x002D_FE70;
+const TEXT_DECOMP_ENTRY_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
+
+pub const TEXT_DECOMP_EXIT_PROBE_HVC_IMM: u32 = 0x91;
+pub const TEXT_DECOMP_EXIT_PROBE_PC:      u32 = 0x002D_FF28;
+const TEXT_DECOMP_EXIT_FIRST_INSN:        u32 = 0xE5B4_0BBC; // ldr r0, [r4, #3004]!
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -2135,6 +2189,54 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(ALTER_INDEXES_ENTRY_PROBE_HVC_IMM),
             "AlterIndexes entry (capture entry RefVar at r2)",
             ALTER_INDEXES_ENTRY_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            STORE_PERM_ENTRY_PROBE_PC,
+            STORE_PERM_ENTRY_FIRST_INSN,
+            hvc_insn(STORE_PERM_ENTRY_PROBE_HVC_IMM),
+            "StorePermObject entry (capture &RefVar input + pretty-print)",
+            STORE_PERM_ENTRY_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            STORE_PERM_EXIT_PROBE_PC,
+            STORE_PERM_EXIT_FIRST_INSN,
+            hvc_insn(STORE_PERM_EXIT_PROBE_HVC_IMM),
+            "StorePermObject pre-exit (capture assigned object id at r0)",
+            STORE_PERM_EXIT_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            LOAD_PERM_ENTRY_PROBE_PC,
+            LOAD_PERM_ENTRY_FIRST_INSN,
+            hvc_insn(LOAD_PERM_ENTRY_PROBE_HVC_IMM),
+            "LoadPermObject entry (capture object id at r1)",
+            LOAD_PERM_ENTRY_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            LOAD_PERM_EXIT_PROBE_PC,
+            LOAD_PERM_EXIT_FIRST_INSN,
+            hvc_insn(LOAD_PERM_EXIT_PROBE_HVC_IMM),
+            "LoadPermObject pre-exit (capture result Ref at r4 + pretty-print)",
+            LOAD_PERM_EXIT_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            TEXT_DECOMP_ENTRY_PROBE_PC,
+            TEXT_DECOMP_ENTRY_FIRST_INSN,
+            hvc_insn(TEXT_DECOMP_ENTRY_PROBE_HVC_IMM),
+            "TObjTextDecompressor::Decompress entry (capture id + len_in)",
+            TEXT_DECOMP_ENTRY_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            TEXT_DECOMP_EXIT_PROBE_PC,
+            TEXT_DECOMP_EXIT_FIRST_INSN,
+            hvc_insn(TEXT_DECOMP_EXIT_PROBE_HVC_IMM),
+            "TObjTextDecompressor::Decompress pre-exit (dump output buf)",
+            TEXT_DECOMP_EXIT_PROBE_HVC_IMM,
         );
         patch_probe(
             rom_ptr,

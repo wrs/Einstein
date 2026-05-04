@@ -18,25 +18,109 @@ Bloated PLAN.md wastes context every read.
   functionality (not merely diagnostics):
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-88):** chase the new wedge after iter-87. Boot
-now reaches REP user-space queries (many `REP> (#…). := #…` lines),
-then trips an `evt.ex.abt.bus` Throw and the kernel falls through to
-`UnhandledException`:
+**Current goal (iter-89):** find the upstream cause of the
+`evt.ex.abt.bus` cascade — iter-88 traced the wedge but did not fix
+it. The bus-exception path is mechanically clear; the question is
+*why pckm's package iterator is reading from a never-allocated VA*
+(see iter-88 analysis below).
+
+### Iteration 88: trace the `evt.ex.abt.bus` cascade (analysis only)
+
+#### Wedge
+
+Boot reaches REP user-space, runs many `(#…):method(...)` queries,
+then halts:
 
 ```
-Throw #2: name="evt.ex.abt.bus" (r0=0x000afda0) r1=0x0cc6ed0c r2=0x00000000
+Throw #2: name="evt.ex.abt.bus" (r0=0x000afda0) r1=0x0cc6ed90 r2=0
           caller_lr=0x001f8538 sp=0x0c113388 mode=0x10
 *** invariant violation: kernel reached UnhandledException ***
 ```
 
-A scheduled task census shows several tasks blocked on `PortReceiveSWI`
-(NameServer, PSSManager, ChannelMgr) plus pckm spinning in
-`GetPartInfoDesc → BeginLoadPackage` and a `scrn` task waiting on a
-3-element semaphore-op group whose middle op (`sema[1] dec`) blocks.
-Investigation will need to follow the bus-abort path —
-`evt.ex.abt.bus` typically means the kernel saw a DABT it couldn't
-satisfy, so the ResolveFault/Remember chain is the natural starting
-point.
+#### Mechanical chain (deterministic, repro every cold boot)
+
+1. **`pckm` task** (package manager) is iterating package parts via
+   `BeginLoadPackage → LoadNextPart → GetPartInfo → GetPartInfoDesc`.
+2. Inside `GetPartInfoDesc__23TPrivatePackageIteratorFv` at `0x194594`,
+   the iterator computes `r1 = iter->[12] + part_idx<<5` (the part
+   info-table base + index*32 = pointer to one part-info entry).
+3. `ldr r3, [r1, #20]` at PC `0x001945dc` accesses
+   `iter->[12] + part_idx*32 + 0x14 = FAR=0x0c436394` — section 0xC4.
+4. **L1[0xC4] = 0x00000070** (fault, but with bits[8:5]=domain 3 set
+   as a Newton-style "lazy marker"). Stage-1 walk fails: DFSC=5
+   translation-section fault, DABT taken in USR mode.
+5. Hypervisor's DABT trampoline forwards to kernel DAH at `0x393114`
+   (γ-fix synthesises DFSR.Domain=3 from L1[0xC4]).
+6. Kernel DAH dispatches via the per-domain monitor's vtable: the
+   call at `0x25922c` (`ldr pc, [r4]`) jumps into
+   `TStackManager::Fault` at `0x1F83E4` (so domain 3's Fault entry
+   *is* the stack manager's Fault).
+7. `Fault` calls `GetStackInfo(this, FAR)`: VA `0x0c436394` is not
+   inside any registered `TStackInfo` range — returns NULL.
+8. The "no monitor matched" path in `Fault` falls through to the
+   throw site at `0x1F8534` with `r0 = mem[0x003712b8] = 0x000afda0`
+   (= "evt.ex.abt.bus" string), `r1 = USR sp` (`0x0cc6ed90`).
+9. Throw unwinds without any handler catching it →
+   `UnhandledException`.
+
+So the kernel is correctly saying "L1[0xC4] is marked lazy with
+domain 3, but the only registered owner for domain 3 cannot resolve
+this VA." The L1 marker was set, but no `TStackInfo` was registered
+to back it.
+
+#### Earlier `evt.ex.fr.store` Throws — likely same root cause
+
+Two earlier throws fire in the REP task (different task from pckm):
+
+```
+Throw #0: name="evt.ex.fr.store" r1=0xffff446a caller_lr=0x00347db8  // in AlterIndexes
+Throw #1: name="evt.ex.fr.store" r1=0xffff446a caller_lr=0x002da584  // propagation
+```
+
+`AlterIndexes` at `0x347ba0` is updating soup indexes via
+`TSoupIndex::Add/Delete`; the negative return code `0xFFFF446A`
+(= -47990) bubbles up as `evt.ex.fr.store`. This is the kernel's
+flash-store layer reporting a write failure — the same flash-backed
+store the package loader reads from.
+
+The most economical hypothesis: *both* throws are downstream of a
+flash-store write path that's still mis-handling something we
+haven't traced (iter-82 fixed XOR-3 byte-swizzle on **reads** from
+the PCMCIA-aperture flash alias; symmetric write-side handling
+needs verification).
+
+#### Diagnostics already in place (no new code in iter-88)
+
+- `STACK_MGR_FAULT_PROBE` at `0x1F83E4` dumps `procst` + saved
+  register file at every `TStackManager::Fault` entry. Confirms the
+  faulting USR PC, FAR, DFSR, saved CPSR.
+- `THROW_ENTRY_PROBE` at the Throw entry logs every throw with
+  exception-name C-string + `r1`/`r2`/caller-LR/SP/mode.
+- `dabt: forwarding to kernel DAH` log captures DFSC, FAR, mode,
+  L1-walk neighbourhood for every forwarded DABT.
+
+Combined output already pinpoints the chain above on every boot;
+the missing piece is *why pckm is reading at a never-allocated VA*.
+
+#### Candidate roots (for iter-89)
+
+a. **Package metadata corruption from an upstream flash-write
+   failure.** If the package's `iter->[12]` was sourced from flash
+   and the flash store silently dropped/corrupted a write, the base
+   pointer is bogus. Most consistent with the `evt.ex.fr.store`
+   throws in REP; they're contemporaneous and same flash subsystem.
+b. **L1[0xC4] should not have been marked 0x70 in the first
+   place.** If a different domain was the intended owner, the
+   correct monitor would handle the fault. Check who sets
+   `L1[0xC4] = 0x70` — backtrace via the
+   `handle_remember_entry_probe` aliasing tracker.
+c. **`iter->[12]` is correct but points into a yet-to-be-grown
+   page**, and the package loader expected an earlier explicit
+   allocation (heap-extend / `Remember`) which was skipped. Check
+   `pckm`'s call sequence around `BeginLoadPackage` for a missing
+   `NewVMHeap` or `RememberMappings` call.
+
+36/36 guest tests pass; no hypervisor code changed in iter-88.
 
 ### Iteration 87 follow-up: arena allocator for stubs + audit fixes
 

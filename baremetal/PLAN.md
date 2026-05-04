@@ -18,20 +18,57 @@ Bloated PLAN.md wastes context every read.
   functionality (not merely diagnostics):
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-94 follow-up):** investigate the unrecognised UND
-at `PC=0x01E00010` `insn=0xeaa695ad`. The kernel branches via VA
-0x01E00010 to a *secondary* jump-table — distinct from the post-ship
-patch-table iter-94's classifier fix covered. Stage-1 walk shows
-VA 0x01E00010 → IPA 0x7EE010 via an L2 table at PA 0x7EC000 (256
-entries; entries 0..31 alias to PA 0x7ED000, entries 32..255 alias
-to PA 0x7EE000). The 18 B-thunks at PA 0x7EE000..0x7EE048 target
-kernel-VA `0xff19xxxx`. Hard-coded ROM branches at PA 0x7a5618 /
-0x7a5680..0x7a568c jump straight to VA 0x01E0000x. classify-rom
-currently only knows about the post-ship patch-table aliasing
-(`jt_va_to_phys`); to mark these thunks as code, the walker needs a
-new resolver for VA 0x01E00000+ → PA 0x7EE000+ that parses the L2
-at PA 0x7EC000 the same way the kernel's stage-1 will use it. Once
-that's in, the boot should clear the `PC=0x01E00010` UND.
+**Current goal (iter-95 follow-up):** boot now reaches a *new* class
+of classifier-coverage gap. The kernel calls into PA 0x7a56cc — a
+real init helper (function prologue `mov ip, sp; push {fp, ip, lr,
+pc}; sub fp, ip, #4; ...; mov r2, #0x13000; ldr r1, [pc, #4]; bl
+0x7a56f8`) that registers `gROMPublicJumpTable` (PA 0x13000) under
+the magic tag 'lcdd'. The CPU UNDs at PC 0x7a56e4 because
+classify-rom marks none of PA 0x7a56cc..0x7a56f0 as code, so the
+BE-8 atomic flip leaves the bytes in BE order; CPU LE-fetch reads
+0x132aa0e3 (NE-TEQ-without-S, ARMv7+ UND) instead of `mov r2,
+#0x13000`. The function isn't reached by any walker pass: no
+`B 0x007a56cc` exists; the literal `0x007a56cc` doesn't appear as a
+4-byte BE word anywhere in ROM; the surrounding TClassInfo
+trampolines (PA 0x7a563c / 0x7a57ec) describe 60-byte structs that
+don't span this range. The kernel must reach it through an indirect
+mechanism we haven't characterised yet — likely a high-VA alias
+(the secondary jumptable's `B 0xff1936cc` chain maps somewhere into
+PA 0x7a5xxx via a stage-1 mapping we haven't decoded). Two paths
+forward: (a) characterise the 0xff1xxxxx → PA 0x7a5xxx alias and add
+a third resolver to classify-rom; (b) extend the
+`collect_classinfo_roots` heuristic to walk past the 60-byte struct
+when adjacent functions are tightly packed against it. Pick once
+the alias mechanism is clearer.
+
+### Iteration 95: classifier resolves secondary jump-table aliasing (BE-8 follow-up)
+
+iter-94 cleared the post-ship patch-table thunks but left the boot
+wedged on `PC=0x01E00010` `insn=0xeaa695ad`. The kernel branches via
+VA 0x01E00010 to a *secondary* jump-table whose 18 B-thunks live at
+PA 0x7EE000..0x7EE048 and target kernel-VA `0xff19xxxx`. Stage-1
+maps VA 0x01E0xxxx → PA 0x7EE000+ via a pre-built short-descriptor
+L2 at PA 0x7EC000 (256 entries; 224 alias to PA 0x7EE000, 32 alias
+to PA 0x7ED000 = 0xFFFFFFFF filler). The kernel installs `L1[0x01E]
+= coarse(0x7EC000)` at boot. classify-rom only knew about the
+post-ship patch-table aliasing (`jt_va_to_phys`), so the secondary
+thunks went unmarked, the BE-8 load-time byteswap skipped them, and
+the CPU's LE instruction fetch decoded garbage.
+
+Fix in `tools/classify-rom`: new `secondary_jt_va_to_phys` reads the
+L2 at PA 0x7EC000 directly to translate VA 0x01E0xxxx → ROM PA, then
+returns the *thunk* PA so `resolve_target_to_rom` (and via it the
+walker's Step::Continue / Step::Jump arms) seeds the thunk for
+walking. Reading the L2 makes the resolver tolerant of ROM
+revisions with different alias counts — it doesn't bake the
+thunk-page count or alias span into a constant.
+
+Result: 18/18 secondary jumptable thunks now classified as code (up
+from 0); cold boot runs ~1180 log lines, past the iter-94 wedge.
+Wedges next on a *new* classifier-coverage gap: kernel init helper
+at PA 0x7a56cc..0x7a56f0 that the walker doesn't reach via any
+existing pass (no direct B/BL, no PA literal, no surrounding
+TClassInfo trampoline includes it). 36/36 guest tests pass.
 
 ### Iteration 94: classifier follows patch-table thunks (BE-8 follow-up)
 
@@ -78,65 +115,7 @@ jump-table at VA 0x01E00010 (PA 0x7EE000..0x7EE048) that uses an L2
 aliasing scheme `jt_va_to_phys` doesn't yet handle — that's the
 iter-95 follow-up. 36/36 guest tests pass.
 
-### Iteration 93: byteswap guest page-table accesses + tick page + flash seed (BE-8 fix)
-
-iter-92 cleared the serial[mdem] +0x2800 wedge. Boot reached the
-second SCTLR write (M=1, MMU on) and immediately tripped a
-recursive prefetch-abort loop at `PC=0xC LR_svc=0x11ec10`. The L1
-dump showed all entries as "fault" with absurd values like
-`0x11040000`, `0x1e081000` — the `byteswap` of the kernel-intended
-descriptors `0x00000411`, `0x0010081e`. The hypervisor's L1/L2
-walkers (`fix_stage1_xn_bits`, `dump_guest_l1_table`,
-`dump_stage1_walk`, `install_scratch_pool_l1_section`,
-`translate_va`) read RAM via raw `ram.add(i).read()` LE; under BE-8
-the kernel STRs entries with CPSR.E=1 in BE byte order (matching
-what the MMU walker reads, since SCTLR.EE=1 makes both the kernel
-and the MMU use BE for page-table memory). EL2 is AArch64 LE — a
-raw read returns byteswapped values.
-
-Worse, `fix_stage1_xn_bits` was matching false-positive "section"
-entries (kernel descriptors whose byteswap happened to have
-bits[1:0]==10) and rewriting them with bogus normalised values via
-raw LE writes — corrupting the L1 such that the MMU saw garbage
-section descriptors pointing to PA 0x1e000000+. That's why the
-PABT loop fired immediately after MMU enable: the very first
-instruction fetch hit a "fault" entry and bounced into the PABT
-vector, whose own fetch hit another fault, ad infinitum.
-
-Fix in `src/guest_mem.rs`: introduce `read_pt_entry` /
-`write_pt_entry` inline helpers that always byteswap (under
-non-`nh_guest_test`) — matching what the AArch32 EL1 MMU walker
-sees with `SCTLR.EE=1`. Routed every guest L1/L2 raw access
-through them: `fix_stage1_xn_bits` (L1 + L2 reads/writes),
-`dump_guest_l1_table`, `dump_stage1_walk`, `dump_l1_neighbourhood`,
-`install_scratch_pool_l1_section`, the L1[0xCD] probe, and
-`translate_va`'s closure walk. ~10 sites in one file.
-
-Sweep for other raw guest-RAM/ROM accesses turned up two more
-byte-order bugs the kernel reads with CPSR.E=1:
-
-- `src/stage2.rs::publish` writes the synthetic tick / calendar
-  words into TICK_PAGE via raw LE; kernel BE-LDR returned
-  byteswapped values. Fixed: `swap_bytes()` before the volatile
-  write.
-- `src/peripherals/flash.rs::write_u32` (constructor seeds:
-  "DLDS", "OSCD", checksums, etc.) and
-  `flash::program_word` (kernel masked-write trap). Both raw LE;
-  kernel BE-LDRs from the stage-2-mapped flash region got
-  byteswapped headers. Fixed: route both through `swap_bytes()`
-  for BE-8, identity for `nh_guest_test`.
-
-Result: cold boot now runs ~1100 log lines (up from ~700); MMU
-enable cycles complete cleanly across multiple soft reboots; the
-L1 dump shows correct descriptors (sections at 0x100c0e..0xf00c0e,
-coarse L2[0]@0x400 with identity-map small pages); the boot
-reaches `InitCGlobals+0x18c → ReserveContiguousMemory +0x34
-LR_svc=0x313600` before tripping a real kernel data abort at
-FAR=0xfef80150 that the kernel's DataAbortHandler can't resolve
-(lazy-coarse mapping for L1[0xfef] not yet installed). 36/36 guest
-tests pass.
-
-<!-- Older iteration retrospectives (iter-92 and earlier) live in
+<!-- Older iteration retrospectives (iter-93 and earlier) live in
      `git log` per the auto-prune maintenance note. -->
 <!-- iter-90 deferred shadow_stub deletion: still gated off
      (`patch_rom_from_bitmap` no longer called from `main.rs`); full

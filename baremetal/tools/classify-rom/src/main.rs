@@ -463,11 +463,43 @@ fn resolve_jt_va(words: &[u32], target: u32) -> Option<u32> {
     Some(final_tgt)
 }
 
+/// Translate a VA in the *secondary* ROM jump-table window
+/// (0x01E00000..0x01F00000) to a ROM PA via the L2 page table at
+/// `SECONDARY_JT_L2_PA`. The 717006 ROM ships a pre-built short-
+/// descriptor L2 at PA 0x7EC000 with 256 small-page descriptors;
+/// at boot the kernel programs `L1[0x01E] = coarse(0x7EC000)` and
+/// every branch through VA 0x01E0xxxx walks via this L2. The
+/// dominant entries (224 of 256) all alias to the single thunk page
+/// at PA 0x7EE000 — a small per-thunk table of `B kernel_va_target`
+/// instructions reached from PA 0x7a5618+ in the ROM-init driver
+/// glue. We read the L2 directly so a different ROM revision with
+/// a different alias layout still resolves correctly.
+///
+/// Returns `None` for VAs outside the window or when the L2 entry
+/// isn't a small-page descriptor (type bits != 2/3).
+const SECONDARY_JT_VA_BASE: u32 = 0x01E0_0000;
+const SECONDARY_JT_VA_END:  u32 = 0x01F0_0000;
+const SECONDARY_JT_L2_PA:   u32 = 0x007E_C000;
+fn secondary_jt_va_to_phys(words: &[u32], va: u32) -> Option<u32> {
+    if va < SECONDARY_JT_VA_BASE || va >= SECONDARY_JT_VA_END { return None; }
+    let l2_idx = (va >> 12) & 0xFF;
+    let entry_pa = SECONDARY_JT_L2_PA + l2_idx * 4;
+    if (entry_pa as usize) + 4 > ROM_SIZE_BYTES { return None; }
+    let entry = words[(entry_pa >> 2) as usize];
+    // ARMv4 short-descriptor L2: bits[1:0] = 10 (small page) or 11
+    // (small-page-XN-extended). Either is acceptable here.
+    if (entry & 0b10) != 0b10 { return None; }
+    let page_pa = entry & 0xFFFF_F000;
+    let pa = page_pa | (va & 0xFFF);
+    if (pa as usize) + 4 > ROM_SIZE_BYTES { return None; }
+    Some(pa)
+}
+
 /// Normalise a branch / function-pointer target to the in-ROM PA the
 /// walker should add as a root. Returns `Some(pa)` for direct ROM-PA
-/// targets, or the *thunk* PA (PA 0x2000..0x1285C) for ROM-patch-table
-/// VAs (0x01A00000..0x01C20880). Returns `None` for arbitrary out-of-
-/// ROM addresses.
+/// targets, or the *thunk* PA for VAs that resolve through one of the
+/// kernel's known stage-1 aliases (post-ship patch table, secondary
+/// jump-table). Returns `None` for arbitrary out-of-ROM addresses.
 ///
 /// Returning the thunk PA — rather than the resolved final-target PA
 /// `resolve_jt_va` produces — lets the walker visit the thunk's B
@@ -485,11 +517,14 @@ fn resolve_jt_va(words: &[u32], target: u32) -> Option<u32> {
 fn resolve_target_to_rom(words: &[u32], target: u32) -> Option<u32> {
     if target & 3 != 0 { return None; }
     if (target as usize) < ROM_SIZE_BYTES { return Some(target); }
-    let thunk_pa = jt_va_to_phys(target)?;
-    // Sanity: confirm the slot decodes as a B/BL — patch-table slots
-    // can be patched at boot to non-B forms (the runtime patches them
-    // post-boot, but the static image we're walking is always a thunk).
-    resolve_jt_va(words, target).map(|_| thunk_pa)
+    if let Some(thunk_pa) = jt_va_to_phys(target) {
+        // Sanity: confirm the slot decodes as a B/BL — patch-table slots
+        // can be patched at boot to non-B forms (the runtime patches
+        // them post-boot, but the static image we're walking is always
+        // a thunk).
+        return resolve_jt_va(words, target).map(|_| thunk_pa);
+    }
+    secondary_jt_va_to_phys(words, target)
 }
 
 /// Enumerate the one-instruction-per-entry table that immediately

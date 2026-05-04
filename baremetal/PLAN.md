@@ -18,21 +18,49 @@ Bloated PLAN.md wastes context every read.
   functionality (not merely diagnostics):
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-90 follow-up):** chase the cold-boot wedge in
-BootOS / SafeShortTimerDelay → SaveCPUStateAndStopSystem under BE-8.
-The iter-90 atomic flip (see retrospective below) replaces the
-"BE-32 word-invariant via load-time word swap + UDF-trap byte-lane
-emulator" architecture with "BE-8 (CPSR.E=1) data accesses +
-selective code-only byteswap at load". 36/36 guest tests pass;
-production cold boot reaches BootOS init code (the SCTLR write at
-`0x18690` succeeds, the StrongARM CP15 clock UND at `0x186a8` is
-handled, several MMIO writes proceed) but trips
-`SaveCPUStateAndStopSystem +0x2bc` shortly after — so a second-tier
-debug iteration is needed to pin which kernel-data read or write is
-landing with the wrong byte order. The iter-89 alarm-soup
-`evt.ex.fr.store (-48022)` throw is the success oracle once the
-wedge is cleared; under BE-8 the underlying byte-lane bug class is
-gone, so the throw should not reappear.
+**Current goal (iter-91 follow-up):** chase the next cold-boot stop —
+an unmodelled `serial[mdem] R +0x2800` MMIO read at PC `0x19cec`,
+inside the BasicBusControlRegInit / DiagBootStub path. Standard
+"extend the peripheral on first touch" workflow per the workflow
+section below. The iter-91 classifier fix (literal-pool subtraction
+from `reach.bitmap`) cleared the BE-8 byte-order wedge that iter-90
+left at `SaveCPUStateAndStopSystem +0x2bc`; production cold boot now
+runs through ~5 KiB of post-StrongARM-clock init code (BootOS MMIO
+setup, GetRebootReason, GetUnsuccessfulBootCount, FlushTheCache,
+BasicBusControlRegInit) before the new mdem stop.
+
+### Iteration 91: classifier literal-pool subtraction
+
+iter-90 left the cold boot stuck at `SaveCPUStateAndStopSystem +0x2bc`
+(BootOS' fatal-init halt). Root cause: the classifier's
+`reach.bitmap` flagged 76 literal-pool words as code, so the BE-8
+loader byteswapped them. Smoking gun: the `LDR Rd, [pc, #-136]` at
+PC `0x186c8` reads the literal at `0x18648`, whose on-disk word is
+`0x0f242400` (a PCMCIA MMIO IPA). Byteswapped on load it lands in
+host bytes `00 24 24 0f`, so a CPSR.E=1 LDR returns `0x0024240f` —
+which the next instruction (`LDR R0, [R0]`) dereferences as an
+unmapped IPA, panicking init.
+
+The literal pool at `0x18644..0x18687` is dual-purpose at the
+encoding level — `DiagHook`'s `beq 0x1862c` at `0x185a4` lands in
+the pool, so `tools/classify-rom`'s static walker reaches it as
+code. Under BE-32 word-invariant the dual-purpose was harmless
+(word reads of the same bytes returned the same numerical value
+either way). Under BE-8 it can't be both.
+
+Fix in `tools/classify-rom`: post-walker pass
+`clear_literal_pool_targets_from_reach`. Iterates the reached
+bitmap; for each `LDR Rt, [pc, #±imm12]` (cond=AL) it computes the
+literal-pool target and clears that word from `reach`. In our boot
+the dead-code branch into the literal pool never fires, so treating
+those 76 words as data is safe and load-bearing.
+
+Same logic in `Bitmap::clear_word`. `WalkStats` gains a
+`literal_targets_cleared` counter, surfaced in `summary.txt`.
+
+Result: cold boot now runs ~5 KiB further; guest tests stay 36/36.
+Next iteration: model `serial[mdem] +0x2800` (cross-ref
+`Emulator/Serial/TVoyagerSerialPort.cpp`).
 
 ### Iteration 90: BE-8 atomic flip (PLAN_BE8_MIGRATION.md)
 
@@ -90,34 +118,16 @@ mpt..pt:
   `0x0F18_3C00`, etc.) proceed, then the kernel hits a fatal init
   check and enters `SaveCPUStateAndStopSystem +0x2bc`. Full
   `evt.ex.fr.store` success-oracle path not yet exercised — wedges
-  in early init. **Next iteration:** instrument the boot from the
-  successful StrongARM-clock UND through the wedge to identify
-  which kernel-data load or store is landing with the wrong byte
-  order under BE-8. Likely candidates: a TICK_PAGE-backed access
-  whose splice path needs BE-8 lane geometry; a kernel-globals
-  write the `g1_capture` / `alrt_capture` perm-fault sampler
-  treats as a stale value.
+  in early init. (iter-91 cleared this — see retrospective above.)
 
 #### Phase 2d / 5 deferred
 
 `shadow_stub.rs` is gated off (`patch_rom_from_bitmap` no longer
 called from `main.rs`) but the module still compiles. Full deletion
 + removal of `SBA_RETRY_TAG` / SBA dispatch arms + `unxor_sub_word`
-guest-test path is a follow-up commit. Phase 5 validation matrix
-runs once the cold-boot wedge above is cleared.
+guest-test path is a follow-up commit.
 
-### Iteration 89: re-baseline after iter-87/88 changes — superseded
-
-Iter-89 chased `evt.ex.fr.store (-48022)` throws via byte-level
-soup/B-tree probes; the iter-90 BE-8 migration eliminates the
-underlying bug class entirely (any byte-access whose PC was missing
-from the static byte-access bitmap read/wrote raw LE bytes instead
-of going through XOR-2/XOR-3). The iter-89 probe fleet was deleted
-in Phase 0 of iter-90; if the symptom recurs after the cold-boot
-wedge is cleared, regenerate probes against the new architecture.
-Full iter-89 retrospective is in `git log -- PLAN.md`.
-
-<!-- Older iteration retrospectives (iter-77 and earlier) live in
+<!-- Older iteration retrospectives (iter-89 and earlier) live in
      `git log` per the auto-prune maintenance note. -->
 
 

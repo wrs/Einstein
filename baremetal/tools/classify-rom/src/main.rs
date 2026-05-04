@@ -369,6 +369,12 @@ impl Bitmap {
         (self.bits[idx >> 3] >> (idx & 7)) & 1 != 0
     }
 
+    fn clear_word(&mut self, addr: u32) {
+        if (addr as usize) >= ROM_SIZE_BYTES || addr & 3 != 0 { return; }
+        let idx = (addr >> 2) as usize;
+        self.bits[idx >> 3] &= !(1u8 << (idx & 7));
+    }
+
     fn popcount(&self) -> u64 {
         self.bits.iter().map(|b| b.count_ones() as u64).sum()
     }
@@ -750,6 +756,17 @@ struct WalkStats {
     pc_rel_addr_roots: usize,
     classinfo_roots: usize,
     indexed_dispatch_roots: usize,
+    /// Words cleared from reach because they are the targets of
+    /// `LDR Rt, [pc, #±imm12]` from inside reached code — i.e. literal
+    /// pool entries. Under BE-8 these MUST be data: a guest LDR with
+    /// `CPSR.E=1` reads bytes in BE-natural order, but if the loader
+    /// byteswapped the word at load time (as it does for code), the
+    /// LDR returns the wrong numerical value. Some entries are also
+    /// "reached" through dual-purpose dead-code branches (e.g. the
+    /// `beq 0x1862c` in DiagHook lands in its own literal pool); the
+    /// guest never executes that path under our boot, so treating them
+    /// as data is safe.
+    literal_targets_cleared: u64,
 }
 
 /// Walk from roots, closing over indirect-targets by scanning unreached
@@ -923,7 +940,58 @@ fn walk(
         if new_roots == 0 { break; }
     }
 
+    // Post-pass: subtract literal-pool words from `reach`. Any word
+    // that is the target of an `LDR Rt, [pc, #±imm12]` from reached
+    // code is a data literal — it stores a constant the kernel reads
+    // via the LDR — and must be left in BE-natural byte order at load
+    // time so a CPSR.E=1 LDR returns the kernel's intended numerical
+    // value. The walker may also flag the same word as code if a
+    // conditional branch happens to land in the literal pool (e.g.
+    // DiagHook's `beq 0x1862c` falls into its own literal pool); under
+    // BE-8 the bytes can't be both code (byteswapped) and data
+    // (verbatim), and our boot never executes the dead-code branch,
+    // so clear it.
+    let cleared = clear_literal_pool_targets_from_reach(words, &mut reach);
+    stats.literal_targets_cleared = cleared;
+
     (reach, stats)
+}
+
+/// Clear from `reach` every word that is the target of an
+/// `LDR Rt, [pc, #±imm12]` (cond=AL) issued from a word currently in
+/// `reach`. Returns the number of bits cleared.
+///
+/// This is a static-only signal: a literal-pool word is reached as
+/// CODE by the walker (e.g. via a conditional branch) but the kernel
+/// also reads it as DATA via the LDR. Under BE-8, code and data
+/// loads have different byte-order requirements; since the LDR-data
+/// reading is the load-bearing path (constants used by the kernel),
+/// we mark the word as data.
+fn clear_literal_pool_targets_from_reach(words: &[u32], reach: &mut Bitmap) -> u64 {
+    let mut targets: Vec<u32> = Vec::new();
+    for i in 0..ROM_WORD_COUNT {
+        let addr = (i as u32) * 4;
+        if !reach.get_word(addr) { continue; }
+        let w = words[i];
+        let imm_sign: i32 = match w >> 16 {
+            0xE59F => 1,
+            0xE51F => -1,
+            _ => continue,
+        };
+        let imm12 = (w & 0xFFF) as i32;
+        let lit_pc = (addr as i64) + 8 + (imm_sign as i64) * (imm12 as i64);
+        if lit_pc < 0 || (lit_pc as usize) + 4 > ROM_SIZE_BYTES { continue; }
+        if (lit_pc as u32) & 3 != 0 { continue; }
+        targets.push(lit_pc as u32);
+    }
+    let mut cleared: u64 = 0;
+    for t in targets {
+        if reach.get_word(t) {
+            reach.clear_word(t);
+            cleared += 1;
+        }
+    }
+    cleared
 }
 
 /// Scan reached code for the LDR-PC-rel + STR-to-this install pair,
@@ -1704,6 +1772,7 @@ fn run(args: Args) -> Result<(), String> {
     writeln!(f, "    TClassInfo struct roots:    {}", stats.classinfo_roots).ok();
     writeln!(f, "    indexed-dispatch roots:     {}", stats.indexed_dispatch_roots).ok();
     writeln!(f, "    total indirect roots added: {}", stats.indirect_roots_added).ok();
+    writeln!(f, "    literal-pool words cleared: {}", stats.literal_targets_cleared).ok();
     writeln!(f, "    reachable-code popcount: {}", reach.popcount()).ok();
     writeln!(f, "  byte-access-static.bitmap popcount = {}", ba_static.popcount()).ok();
     writeln!(f, "    of which byte (LDRB/STRB):              {}", kind_counts[0]).ok();

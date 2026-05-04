@@ -1601,13 +1601,22 @@ fn handle_und(ctx: &mut TrapContext) {
     let spsr_und = read_guest_word_pa(UND_SAVE_SPSR_IPA).unwrap_or(0) as u64;
     let faulting_pc = lr_und.wrapping_sub(4);
 
-    let insn = match read_guest_word_pa(faulting_pc) {
+    // The faulting PC is a kernel VA (post-MMU); for non-identity-mapped
+    // VAs (e.g. the gROMPublicJumpTable aliased at 0x01E00000) the IPA
+    // differs from the VA. Try a PA-direct read first, then fall through
+    // to a stage-1-walked VA read so the decoder picks up bytes from
+    // the actual backing PA when the kernel has set up an aliasing
+    // L2 entry.
+    let insn = match read_guest_word_pa(faulting_pc)
+        .or_else(|| crate::guest_endian::guest_read_u32_va(faulting_pc))
+    {
         Some(w) => w,
         None => {
             kprintln!(
                 "*** handle_und: faulting PC {:#x} is outside mapped guest memory",
                 faulting_pc
             );
+            guest_mem::dump_stage1_walk(faulting_pc);
             cpu::halt();
         }
     };

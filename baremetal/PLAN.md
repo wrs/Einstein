@@ -18,18 +18,65 @@ Bloated PLAN.md wastes context every read.
   functionality (not merely diagnostics):
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-93 follow-up):** investigate the DataAbortHandler
-deep-toast alert at FAR=0xfef80150 from `ReserveContiguousMemory`
-(LR_svc=0x313600), called from `InitCGlobals+0x18c` /
-`BootOS+0x22c`. The kernel reads VA 0xfef80150 (a high VA that
-should resolve through L1[0xfef] = lazy-coarse), the L1 entry is
-fault, the kernel's DataAbortHandler can't resolve it, and
-`DebuggerUND` halts with "Non-user-mode abort (deep toast alert)".
-This is real Phase B kernel-state work — the kernel hasn't yet set
-up the lazy L1[0xfef] mapping that ReserveContiguousMemory expects.
-Likely the L1[0xCD] / FaultMonitor lazy-allocation path needs a
-hypervisor-side handler we haven't wired up yet for VAs in the
-0xfef00000 range.
+**Current goal (iter-94 follow-up):** investigate the unrecognised UND
+at `PC=0x01E00010` `insn=0xeaa695ad`. The kernel branches via VA
+0x01E00010 to a *secondary* jump-table — distinct from the post-ship
+patch-table iter-94's classifier fix covered. Stage-1 walk shows
+VA 0x01E00010 → IPA 0x7EE010 via an L2 table at PA 0x7EC000 (256
+entries; entries 0..31 alias to PA 0x7ED000, entries 32..255 alias
+to PA 0x7EE000). The 18 B-thunks at PA 0x7EE000..0x7EE048 target
+kernel-VA `0xff19xxxx`. Hard-coded ROM branches at PA 0x7a5618 /
+0x7a5680..0x7a568c jump straight to VA 0x01E0000x. classify-rom
+currently only knows about the post-ship patch-table aliasing
+(`jt_va_to_phys`); to mark these thunks as code, the walker needs a
+new resolver for VA 0x01E00000+ → PA 0x7EE000+ that parses the L2
+at PA 0x7EC000 the same way the kernel's stage-1 will use it. Once
+that's in, the boot should clear the `PC=0x01E00010` UND.
+
+### Iteration 94: classifier follows patch-table thunks (BE-8 follow-up)
+
+iter-93 cleared the byteswap of guest page-table accesses, tick page,
+and flash seed — boot reached `InitCGlobals+0x18c → ReserveContiguous-
+Memory` and tripped a kernel-side DABT at FAR=0xfef80150 inside the
+kernel's own DataAbortHandler. Diagnosis: the faulting PC was
+0x01a68430 — a post-ship patch-table thunk slot for
+`ReleaseIRQTimer`. The classifier's walker had `resolve_jt_va` follow
+patch-table VAs (0x01A00000..0x01C20000) directly to the real ROM
+target *and skip the thunk slot itself*, so all 16920 B-thunk words at
+PA 0x02000..0x12860 stayed unmarked in `reach.bitmap`. The BE-8
+atomic flip's load-time byteswap is gated on that bitmap; thunks left
+unmarked stayed in BE byte order in physical memory; the CPU's LE
+instruction fetch then decoded each thunk as a misaligned coprocessor
+/ data-processing instruction, the kernel's `B FindHighROMProtocol`
+thunk drifted into garbage, and downstream behaviour produced the
+spurious DABT.
+
+Fix in `tools/classify-rom`: `resolve_target_to_rom` now returns the
+*thunk* PA for patch-table VA targets (instead of resolving to the
+final-target PA via `resolve_jt_va`). The walker's `Step::Continue` /
+`Step::Jump` arms push that thunk PA into the worklist, which causes
+the walker to visit the thunk word, set its reach bit, and then
+follow the B naturally — landing at the same final target it would
+have reached via the old shortcut. Net effect: 14507/16920 patch-table
+thunks now classified as code (vs 3 before); the load-time byteswap
+covers them; the CPU fetches valid B instructions. The unreached
+remainder is genuinely-unused slots — the classifier remains purely
+root-driven.
+
+`handle_und` in `src/trap.rs` also got a small upgrade: the failing
+read of the faulting instruction falls back to a stage-1-walked
+`guest_endian::guest_read_u32_va` so the diagnostic picks up bytes
+from the actual backing PA when the kernel has set up an aliasing L2
+entry (e.g. VA 0x01E00010 → PA 0x7EE010). On a halt we also dump the
+stage-1 walk for the faulting PC.
+
+Result: cold boot now runs ~1170 log lines (up from 1103); past the
+`ReserveContiguousMemory` deep-toast alert, through the
+`gROMPublicJumpTable` aliasing setup, through 22 unaligned-LDR
+faults from `TPrivatePackageIterator`. Wedges next on a *secondary*
+jump-table at VA 0x01E00010 (PA 0x7EE000..0x7EE048) that uses an L2
+aliasing scheme `jt_va_to_phys` doesn't yet handle — that's the
+iter-95 follow-up. 36/36 guest tests pass.
 
 ### Iteration 93: byteswap guest page-table accesses + tick page + flash seed (BE-8 fix)
 
@@ -89,138 +136,13 @@ FAR=0xfef80150 that the kernel's DataAbortHandler can't resolve
 (lazy-coarse mapping for L1[0xfef] not yet installed). 36/36 guest
 tests pass.
 
-### Iteration 92: serial control/IE reads + qemu-reaper Stop hook
-
-iter-91 cleared the BE-8 wedge but left the boot stuck at
-`*** serial[mdem] UNKNOWN R +0x2800 ***` (PC `0x19cec`,
-BasicBusControlRegInit). The actual instruction at that PC is
-`STRB R1, [R0]` — a write — but under BE-8 the byte/halfword
-write path in `mmio::write` reads the surrounding word first to
-splice the byte into the right lane. So a kernel byte-store to
-mdem +0x2800 produced an MMIO **read** at the same offset, which
-`serial::read` had no handler for.
-
-Fix: extracted the existing write-only "control / IE consumed"
-offset list (`0x0000`, `0x0400`, …, `0x8000`) into a
-`reg::CONTROL_IE_OFFSETS` slice and made both `read` (return 0,
-"register holds zero / idle peripheral") and `write` (no-op)
-consult it. No behavioural change for writes; reads of any of
-those offsets now return zero instead of halting.
-
-Also wired a project-scoped Claude Code Stop hook
-(`.claude/settings.json`) that runs `pkill -9 qemu-system-aarch64`
-at session end, so a wedged hypervisor can't leave a zombie QEMU
-behind across sessions. The hypervisor halts loudly on its own
-unhandled cases and QEMU keeps running until something kills it;
-without the hook, every aborted `cargo run` left a process around.
-
-Result: cold boot now runs from `Entering Newton ROM…` through
-~700 log lines (BasicBusControlRegInit, DACR write, TTBR0
-programming, `fix_stage1_xn_bits` (130 sections de-XN'd, 144 fine
-→ fault), L1[0xCD] transition probe, shadow_stub scratch L1[0x60]
-install, MMU enable at SCTLR_EL1=0x000011b5) before the
-post-MMU-enable PABT loop above. 36/36 guest tests pass.
-
-### Iteration 91: classifier literal-pool subtraction
-
-iter-90 left the cold boot stuck at `SaveCPUStateAndStopSystem +0x2bc`
-(BootOS' fatal-init halt). Root cause: the classifier's
-`reach.bitmap` flagged 76 literal-pool words as code, so the BE-8
-loader byteswapped them. Smoking gun: the `LDR Rd, [pc, #-136]` at
-PC `0x186c8` reads the literal at `0x18648`, whose on-disk word is
-`0x0f242400` (a PCMCIA MMIO IPA). Byteswapped on load it lands in
-host bytes `00 24 24 0f`, so a CPSR.E=1 LDR returns `0x0024240f` —
-which the next instruction (`LDR R0, [R0]`) dereferences as an
-unmapped IPA, panicking init.
-
-The literal pool at `0x18644..0x18687` is dual-purpose at the
-encoding level — `DiagHook`'s `beq 0x1862c` at `0x185a4` lands in
-the pool, so `tools/classify-rom`'s static walker reaches it as
-code. Under BE-32 word-invariant the dual-purpose was harmless
-(word reads of the same bytes returned the same numerical value
-either way). Under BE-8 it can't be both.
-
-Fix in `tools/classify-rom`: post-walker pass
-`clear_literal_pool_targets_from_reach`. Iterates the reached
-bitmap; for each `LDR Rt, [pc, #±imm12]` (cond=AL) it computes the
-literal-pool target and clears that word from `reach`. In our boot
-the dead-code branch into the literal pool never fires, so treating
-those 76 words as data is safe and load-bearing.
-
-Same logic in `Bitmap::clear_word`. `WalkStats` gains a
-`literal_targets_cleared` counter, surfaced in `summary.txt`.
-
-Result: cold boot now runs ~5 KiB further; guest tests stay 36/36.
-Next iteration: model `serial[mdem] +0x2800` (cross-ref
-`Emulator/Serial/TVoyagerSerialPort.cpp`).
-
-### Iteration 90: BE-8 atomic flip (PLAN_BE8_MIGRATION.md)
-
-Migrated guest data accesses from "BE-32 word-invariant via load-time
-word swap + UDF-trap byte-lane emulator" to "BE-8 (CPSR.E=1) data
-accesses + selective code-only byteswap at load". Five commits across
-mpt..pt:
-
-1. **Phase 0 — sweep diagnostic probes.** Removed every iter-50..89
-   probe HVC scaffolding (immediates 0x46, 0x48–0x4E, 0x53–0x68,
-   0x6B–0x7F, 0x81–0x91) — `*_PROBE_HVC_IMM` constants in
-   `rom_patches.rs`, dispatch arms in `trap.rs`, handler functions,
-   ring buffers, and orphan helper modules (`dosend_ring.rs`,
-   `rep_print.rs`). Kept `FPE 0x80` (load-bearing) and DAH /
-   UnhandledException tripwires. ~7000 LOC removed; 36/36 guest tests
-   pass.
-
-2. **Phase 1 — `guest_endian.rs` accessors with identity behavior.**
-   Added `guest_read_u32_va/pa`, `guest_write_u32_va/pa`,
-   `guest_read_u8_va/pa`, `guest_read_u16_va/pa`, `guest_write_u8_pa`,
-   `guest_write_u16_pa`, `guest_read_bytes_va`. Migrated ~120
-   call sites across `trap.rs`, `peripherals/*`, `task_dump.rs`,
-   `heap_check.rs`, etc. through the new helpers. Snapshot, ROM
-   patches, and shadow_stub host-byte manipulation paths kept
-   unchanged.
-
-3. **Phase 2 — atomic flip to BE-8.** `load_newton_rom` consults the
-   classifier `reach.bitmap` per-word: code → byteswap on load,
-   data → byte-copy verbatim. Helpers `write_rom_code_word` /
-   `write_rom_data_word` / `write_rom_word_by_kind` route every
-   ROM patch through the right encoding. `eret_to_guest` SPSR sets
-   E=1 (`0x000003D3`); `zero_el1_guest_state` programs SCTLR_EL1
-   with `EE | E0E`. The CP15 SCTLR shim masks `EE | E0E` to `1` so
-   kernel writes can't drop us back into LE mode. `guest_endian`
-   helpers byteswap on read/write for data PAs and pass through for
-   ROM code PAs (bitmap-aware dispatch). MMIO byte/halfword writes
-   splice into the BE-8 lane (lane 0 = bits[31:24]). Snapshot
-   format version bumped 3 → 4. Guest-test mode (`nh_guest_test`
-   cfg) keeps LE semantics so the existing flat-binary corpus
-   continues to exercise the hypervisor's other mechanisms.
-
-4. **Phase 4 — diagnostics simplification.** `heap_check::dump_object`
-   updated comment around `guest_read_bytes_va` (the byte-order
-   gymnastics is now internal to the helper).
-
-#### Result
-
-- **36/36 guest tests pass** on QEMU (covers byte/halfword access
-  emulation, unaligned LDR rotate, ROM aperture SWP, snapshot
-  resume, alignment fault, etc.).
-- **Cold boot reaches BootOS init code**: BootOS canary fires,
-  SCTLR write succeeds (`0x000010b0` → hw `0x030010b2` with
-  EE/E0E held by the shim), StrongARM CP15 clock UND at `0x186a8`
-  decoded and no-op'd, several MMIO writes (`0x0F18_3800`,
-  `0x0F18_3C00`, etc.) proceed, then the kernel hits a fatal init
-  check and enters `SaveCPUStateAndStopSystem +0x2bc`. Full
-  `evt.ex.fr.store` success-oracle path not yet exercised — wedges
-  in early init. (iter-91 cleared this — see retrospective above.)
-
-#### Phase 2d / 5 deferred
-
-`shadow_stub.rs` is gated off (`patch_rom_from_bitmap` no longer
-called from `main.rs`) but the module still compiles. Full deletion
-+ removal of `SBA_RETRY_TAG` / SBA dispatch arms + `unxor_sub_word`
-guest-test path is a follow-up commit.
-
-<!-- Older iteration retrospectives (iter-89 and earlier) live in
+<!-- Older iteration retrospectives (iter-92 and earlier) live in
      `git log` per the auto-prune maintenance note. -->
+<!-- iter-90 deferred shadow_stub deletion: still gated off
+     (`patch_rom_from_bitmap` no longer called from `main.rs`); full
+     removal + SBA dispatch arms + `unxor_sub_word` guest-test path
+     is a follow-up commit. -->
+
 
 
 ## Workflow per stop

@@ -463,15 +463,33 @@ fn resolve_jt_va(words: &[u32], target: u32) -> Option<u32> {
     Some(final_tgt)
 }
 
-/// Normalise a branch / function-pointer target to its in-ROM PA.
-/// Returns `Some(pa)` if `target` is already a ROM PA, or if it's a
-/// ROM-patch-table VA that resolves through `resolve_jt_va`.
-/// Returns `None` for arbitrary out-of-ROM addresses (high VAs not in
-/// the patch table, raw addresses past the ROM aperture, etc.).
+/// Normalise a branch / function-pointer target to the in-ROM PA the
+/// walker should add as a root. Returns `Some(pa)` for direct ROM-PA
+/// targets, or the *thunk* PA (PA 0x2000..0x1285C) for ROM-patch-table
+/// VAs (0x01A00000..0x01C20880). Returns `None` for arbitrary out-of-
+/// ROM addresses.
+///
+/// Returning the thunk PA — rather than the resolved final-target PA
+/// `resolve_jt_va` produces — lets the walker visit the thunk's B
+/// instruction directly, mark it as reached, and naturally follow the
+/// B to the final target. The reach bit on the thunk is load-bearing
+/// under BE-8: the loader byteswaps every "code" word so the CPU's LE
+/// instruction fetch decodes the original BE numerical encoding; if
+/// the thunk is left as data, the kernel's branch through the
+/// patch-table VA fetches a byteswapped (garbage) instruction and
+/// either UND-faults or drifts into invalid behaviour.
+///
+/// Prologue-shape checks at thunk PAs accept B-AL via
+/// `is_known_function_start`, so callers that gate worklist pushes on
+/// `is_known_function_start(words[pa>>2])` keep working.
 fn resolve_target_to_rom(words: &[u32], target: u32) -> Option<u32> {
     if target & 3 != 0 { return None; }
     if (target as usize) < ROM_SIZE_BYTES { return Some(target); }
-    resolve_jt_va(words, target)
+    let thunk_pa = jt_va_to_phys(target)?;
+    // Sanity: confirm the slot decodes as a B/BL — patch-table slots
+    // can be patched at boot to non-B forms (the runtime patches them
+    // post-boot, but the static image we're walking is always a thunk).
+    resolve_jt_va(words, target).map(|_| thunk_pa)
 }
 
 /// Enumerate the one-instruction-per-entry table that immediately
@@ -869,15 +887,9 @@ fn walk(
                 };
                 match step_result {
                     Step::Continue { branch: Some(t) } => {
-                        // Resolve ROM-patch-table VAs to their final
-                        // ROM-PA targets. The patch-table thunks live
-                        // at ROM PA 0x2000..0x1285C and are aliased
-                        // into VA 0x01A00000..0x01C20880 by the
-                        // kernel's stage-1 mapping. Each thunk slot
-                        // is a `B real_rom_function` decoded against
-                        // the runtime VA.
-                        let t = resolve_jt_va(words, t).unwrap_or(t);
-                        worklist.push(t);
+                        if let Some(root) = resolve_target_to_rom(words, t) {
+                            worklist.push(root);
+                        }
                         prev_w = w;
                         cur = cur.wrapping_add(4);
                     }
@@ -886,10 +898,12 @@ fn walk(
                         cur = cur.wrapping_add(4);
                     }
                     Step::Jump(t) => {
-                        let t = resolve_jt_va(words, t).unwrap_or(t);
                         prev_w = 0;
                         in_table = false;
-                        cur = t;
+                        cur = match resolve_target_to_rom(words, t) {
+                            Some(pa) => pa,
+                            None => break,
+                        };
                     }
                     Step::Stop => break,
                 }

@@ -375,3 +375,214 @@ fn print_object(indent: &str, obj: newton_objects::Object<'_>, _depth: u32) {
         }
     }
 }
+
+// ---------------- recursive pretty printer ----------------------------
+//
+// `pretty_print_ref(ref_value, depth)` prints a Newton object Ref with
+// up to `depth` levels of recursive expansion. Pointer Refs read 256
+// bytes of guest memory at the pointee, parse with newton-objects, and
+// print a structured view:
+//
+//   - immediate Refs (NIL, TRUE, integers, chars, magic-pointers,
+//     specials) are printed inline on a single line.
+//   - real-pointer Refs are decoded to Object::Binary / Symbol /
+//     Array / Frame, with depth-controlled recursion into:
+//       binary class, symbol name, string contents (UTF-16BE),
+//       frame map and slot Refs, array class and element Refs.
+//
+// Each recursion level reads a fresh 256-byte buffer from guest
+// memory; per-call stack ≈ 256 + ~64 bytes of locals. Keep `depth`
+// small (≤ 4) to bound stack use.
+//
+// Single entry point used from the trap probes:
+//   crate::heap_check::pretty_print_ref("    key", key_ref, 3);
+
+/// Pretty-print a NewtonScript Ref recursively, up to `depth` levels of
+/// pointee expansion. `label` prefixes the first line; subsequent
+/// recursed levels indent with two spaces per level.
+pub fn pretty_print_ref(label: &str, ref_value: u32, depth: u32) {
+    pretty_print_ref_at(label, ref_value, depth, 0);
+}
+
+const MAX_INDENT_LEVELS: usize = 6;
+
+fn indent_str(level: u32) -> &'static str {
+    // Up to 6 levels × 2 spaces; clamp on overflow.
+    const SPACES: &str = "                "; // 16 spaces
+    let n = (level as usize * 2).min(MAX_INDENT_LEVELS * 2).min(SPACES.len());
+    &SPACES[..n]
+}
+
+fn pretty_print_ref_at(label: &str, ref_value: u32, depth: u32, level: u32) {
+    let ind = indent_str(level);
+    let r = newton_objects::Ref(ref_value);
+    use newton_objects::RefKind;
+    match r.kind() {
+        RefKind::Integer(i) => {
+            crate::kprintln!("{}{}{}: integer {} ({:#010x})", ind, label,
+                if label.is_empty() { "" } else { " " }, i, ref_value);
+        }
+        RefKind::Character(c) => {
+            crate::kprintln!("{}{}{}: char U+{:04x} ({:#010x})", ind, label,
+                if label.is_empty() { "" } else { " " }, c, ref_value);
+        }
+        RefKind::Special(_) if r.is_nil() => {
+            crate::kprintln!("{}{}{}: NIL", ind, label,
+                if label.is_empty() { "" } else { " " });
+        }
+        RefKind::Special(s) => {
+            crate::kprintln!("{}{}{}: special {:#x} ({:#010x})", ind, label,
+                if label.is_empty() { "" } else { " " }, s, ref_value);
+        }
+        RefKind::MagicPointer { table, index } => {
+            crate::kprintln!("{}{}{}: magic-ptr {}:{} ({:#010x})", ind, label,
+                if label.is_empty() { "" } else { " " }, table, index, ref_value);
+        }
+        RefKind::Pointer(addr) => {
+            // Read pointee bytes and parse with newton-objects.
+            let mut buf = [0u8; 256];
+            let n = match read_object_bytes(addr, &mut buf) {
+                Some(n) => n,
+                None => {
+                    crate::kprintln!("{}{}{}: ptr@{:#010x} <unreadable>", ind, label,
+                        if label.is_empty() { "" } else { " " }, addr);
+                    return;
+                }
+            };
+            let bytes = &buf[..n];
+            let heap = newton_objects::Heap::with_load_addr(bytes, addr);
+            match heap.object_at(addr) {
+                Ok(obj) => print_object_recursive(label, obj, depth, level),
+                Err(e) => crate::kprintln!("{}{}{}: ptr@{:#010x} parse-err: {}",
+                    ind, label, if label.is_empty() { "" } else { " " }, addr, e),
+            }
+        }
+    }
+}
+
+fn print_object_recursive(
+    label: &str,
+    obj: newton_objects::Object<'_>,
+    depth: u32,
+    level: u32,
+) {
+    use newton_objects::Object;
+    let ind = indent_str(level);
+    let lp = if label.is_empty() { "" } else { " " };
+    match obj {
+        Object::Binary(b) => {
+            if let Some(sym) = b.as_symbol() {
+                let name = sym.name().unwrap_or("<bad-utf8>");
+                crate::kprintln!("{}{}{}: symbol '{} (hash={:#010x}) @{:#010x}",
+                    ind, label, lp, name, sym.hash(), b.offset());
+            } else {
+                let class = b.class();
+                let data = b.data();
+                crate::kprintln!("{}{}{}: binary class={:?} @{:#010x} size={} data_len={}",
+                    ind, label, lp, class, b.offset(), b.size(), data.len());
+                // Try interpreting data as a UTF-16BE 'string.
+                print_data_preview(level + 1, data);
+                if depth > 0 && class.is_pointer() {
+                    pretty_print_ref_at("class", class.raw(), depth - 1, level + 1);
+                }
+            }
+        }
+        Object::Array(a) => {
+            crate::kprintln!("{}{}{}: array class={:?} @{:#010x} size={} len={}",
+                ind, label, lp, a.class(), a.offset(), a.size(), a.len());
+            for (i, slot_ref) in a.iter().enumerate().take(8) {
+                if depth > 0 {
+                    pretty_print_inline_index("[", i, slot_ref.raw(), depth - 1, level + 1);
+                } else {
+                    crate::kprintln!("{}  [{}] = {:?}", ind, i, slot_ref);
+                }
+            }
+            if a.len() > 8 {
+                crate::kprintln!("{}  ... ({} more slots)", ind, a.len() - 8);
+            }
+            if depth > 0 && a.class().is_pointer() {
+                pretty_print_ref_at("class", a.class().raw(), depth - 1, level + 1);
+            }
+        }
+        Object::Frame(f) => {
+            crate::kprintln!("{}{}{}: frame map={:?} @{:#010x} size={} len={}",
+                ind, label, lp, f.map(), f.offset(), f.size(), f.len());
+            for (i, slot_ref) in f.iter_slots().enumerate().take(8) {
+                if depth > 0 {
+                    pretty_print_inline_index("slot[", i, slot_ref.raw(), depth - 1, level + 1);
+                } else {
+                    crate::kprintln!("{}  slot[{}] = {:?}", ind, i, slot_ref);
+                }
+            }
+            if f.len() > 8 {
+                crate::kprintln!("{}  ... ({} more slots)", ind, f.len() - 8);
+            }
+            if depth > 0 && f.map().is_pointer() {
+                pretty_print_ref_at("map", f.map().raw(), depth - 1, level + 1);
+            }
+        }
+    }
+}
+
+fn pretty_print_inline_index(prefix: &str, idx: usize, ref_value: u32, depth: u32, level: u32) {
+    // Build a label like "[3]" or "slot[3]" without alloc — use kprintln
+    // directly for the header line, then recurse without a label. The
+    // simplest path: print the header+ref summary inline, then recurse
+    // for pointee details.
+    let ind = indent_str(level);
+    crate::kprintln!("{}{}{}] = {:?}", ind, prefix, idx, newton_objects::Ref(ref_value));
+    let r = newton_objects::Ref(ref_value);
+    if r.is_pointer() {
+        pretty_print_ref_at("→", ref_value, depth, level + 1);
+    }
+}
+
+/// Print an interpretation of binary `data`: UTF-16BE chars (for
+/// 'string objects) and/or a leading 4-byte hash + ASCII tail (for
+/// symbols misclassed as plain binaries). Always shows up to 16 hex
+/// bytes of raw data.
+fn print_data_preview(level: u32, data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+    let ind = indent_str(level);
+
+    // Hex preview (16 bytes max).
+    let n = data.len().min(16);
+    let mut hex = [b' '; 16 * 3];
+    let mut hp = 0;
+    for i in 0..n {
+        if i > 0 { hex[hp] = b' '; hp += 1; }
+        let b = data[i];
+        hex[hp]     = nibble_to_hex(b >> 4);
+        hex[hp + 1] = nibble_to_hex(b & 0xf);
+        hp += 2;
+    }
+    let hex_str = core::str::from_utf8(&hex[..hp]).unwrap_or("?");
+    crate::kprintln!("{}data hex: {}{}", ind, hex_str,
+        if data.len() > 16 { " ..." } else { "" });
+
+    // UTF-16BE interpretation (string).
+    let mut sbuf = [b'?'; 32];
+    let mut sn = 0usize;
+    let mut nul_seen = false;
+    for chunk in data.chunks_exact(2).take(sbuf.len()) {
+        let hi = chunk[0];
+        let lo = chunk[1];
+        if hi == 0 && lo == 0 { nul_seen = true; break; }
+        sbuf[sn] = if hi == 0 && (0x20..0x7f).contains(&lo) { lo } else { b'?' };
+        sn += 1;
+    }
+    if sn > 0 || nul_seen {
+        let s = core::str::from_utf8(&sbuf[..sn]).unwrap_or("?");
+        crate::kprintln!("{}as-utf16be: \"{}\"{}", ind, s,
+            if nul_seen { " (NUL-terminated)" } else { "" });
+    }
+}
+
+fn nibble_to_hex(n: u8) -> u8 {
+    match n & 0xf {
+        0..=9 => b'0' + n,
+        a => b'a' + (a - 10),
+    }
+}

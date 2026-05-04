@@ -4723,9 +4723,12 @@ fn handle_key_to_skey_entry_probe_with(ctx: &mut TrapContext, source_cpsr: u32) 
         "KeyToSKey #{}: key_ref={:#010x} tag_ref={:#010x} skey_buf={:#010x} size_p={:#010x} caller_lr={:#010x} sp={:#010x}",
         seq, key_ref, tag_ref, r2, r3, lr, sp,
     );
-    crate::heap_check::log_ref("    key", key_ref);
-    crate::heap_check::dump_object("      ", key_ref);
-    crate::heap_check::log_ref("    tag", tag_ref);
+    // Pretty-print both Refs structurally via newton-objects: depth
+    // 2 expands the binary's class symbol so we see "class=symbol
+    // 'string" instead of just a class pointer. The data preview
+    // shows UTF-16BE for 'string objects.
+    crate::heap_check::pretty_print_ref("key", key_ref, 2);
+    crate::heap_check::pretty_print_ref("tag", tag_ref, 2);
 
     // Emulate `mov ip, sp`.
     ctx.x[12] = (ctx.x[12] & 0xFFFF_FFFF_0000_0000) | (sp as u64);

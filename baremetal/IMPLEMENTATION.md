@@ -275,12 +275,48 @@ USB, real SD timing, display, audio. These land on real Pi 3B during the relevan
 - `gdb-multiarch` handles Rust DWARF; demangling is flakier than C but usable. Set `set print asm-demangle on`.
 - Consider `probe-rs` + JTAG on real Pi for M5+ when USB/display debugging over serial alone becomes painful.
 
-### 8.4 Classifier-driven endianness patching
+### 8.4 BE-8 mode + classifier-driven selective ROM byteswap
 
-The Newton ROM is BE-32 word-invariant: aligned word accesses are
-identical to the LE view after a load-time word swap, but byte and
-halfword accesses target a different byte lane and must be fixed up.
-`src/shadow_stub.rs` handles that by replacing each LDRB/STRB/LDRH/
+(Iter-90 replaced the BE-32 word-invariant scheme described below the
+fold with native BE-8 data accesses. Older context kept for
+archaeology — see iter-90 in PLAN.md and PLAN_BE8_MIGRATION.md for
+the migration motivation and steps.)
+
+Under iter-90+, the guest runs with `CPSR.E=1` and `SCTLR_EL1.EE=1`
+forced by the CP15 shim. ARMv7-A always fetches instructions in LE
+byte order (per `DDI 0406C.d` §A3.3.1), so code words must still be
+byteswapped at load time so a host-LE read of the host backing
+returns the original BE numerical instruction encoding. Data words
+are stored on host in BE-natural byte order (matching the on-disk
+ROM); a guest LDR with `CPSR.E=1` reads them back as the BE
+numerical value directly.
+
+`load_newton_rom` consults the classifier `reach.bitmap` per word:
+bit set → reachable code → byteswap on load; bit clear → data /
+padding → byte-copy verbatim. Same logic for Einstein.rex. ROM
+patches that write into the host backing go through
+`guest_mem::write_rom_code_word` (verbatim, for instruction
+encodings) or `write_rom_data_word` (swap, so a BE-8 LDR returns
+the kernel's intended numerical value). `apply_717006_patches`
+uses `write_rom_word_by_kind`, which dispatches on the bitmap so
+the table can mix code overrides (`MOV PC, LR`) and data overrides
+(`gDebugger`, time-base constants) cleanly.
+
+EL2 reads of guest data go through `crate::guest_endian` (the
+single bottleneck added in iter-90 Phase 1). Helpers byteswap on
+read/write for data PAs and pass-through for ROM-code PAs (so
+`handle_und` decoding the faulting instruction at PC reads the
+encoding directly, while reads of kernel structs in RAM swap to
+recover the kernel's intended numerical value).
+
+#### Legacy: BE-32 word-invariant + UDF byte-lane emulator
+
+(This is what iter-89 and earlier ran. The Newton ROM is BE-32
+word-invariant: aligned word accesses are identical to the LE view
+after a load-time word swap, but byte and halfword accesses target
+a different byte lane and had to be fixed up.)
+
+`src/shadow_stub.rs` handled that by replacing each LDRB/STRB/LDRH/
 STRH/LDRSB/LDRSH/SWPB in the ROM with a `UDF #imm16` marker that
 traps into EL2, where the handler decodes the original instruction
 from a site-index table and emulates the access (XOR-3 / XOR-2
@@ -352,7 +388,12 @@ patching wrong PCs. `scripts/regen-classify.sh` is the one-stop
 regen: it runs `classify-symbols.py` if needed, rebuilds the
 classifier, runs it with the curated inputs.
 
-### 8.5 UDF-trap emulator: layout and dispatch
+### 8.5 Legacy UDF-trap emulator: layout and dispatch
+
+(Inert under iter-90+ BE-8: `shadow_stub::patch_rom_from_bitmap` is
+no longer called from `main.rs`, so no UDF markers are installed
+and `handle_sba_udf` never fires. Module deletion is a follow-up
+commit. Section retained for git-archaeology.)
 
 Byte/halfword-access patching replaces the original ROM word in
 place with `UDF #(SBA_UDF_BASE | idx)` (SBA_UDF_BASE = 0x8000, idx

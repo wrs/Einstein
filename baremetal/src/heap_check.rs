@@ -289,13 +289,11 @@ pub fn dump_object(indent: &str, ref_value: u32) {
         }
     };
     let bytes = &buf[..n];
-    // Newton's ROM is byteswapped at load time to make u32 reads
-    // numerically correct on a little-endian CPU; this reverses
-    // bytes *within each word*. To restore the on-disk byte
-    // sequence (so symbol names read in the correct order), we
-    // wrote each word via `to_be_bytes` above. Parsing as
-    // big-endian then gives both correct u32 values *and* correct
-    // byte-level data (names, character data, raw binary blobs).
+    // `guest_read_bytes_va` returns Newton-side logical-byte order,
+    // which is the on-disk byte sequence (high byte first within a
+    // word). Parsing as big-endian gives both correct u32 values and
+    // correct byte-level data (symbol names, character data, raw
+    // binary blobs).
     let heap = newton_objects::Heap::with_load_addr(bytes, addr);
     match heap.object_at(addr) {
         Ok(obj) => print_object(indent, obj, /*depth=*/ 0),

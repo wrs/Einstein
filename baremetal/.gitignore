@@ -7,6 +7,15 @@ tarmac.log
 tarmac-window.log
 docs/ARM_*
 
+# Top-level Einstein .gitignore excludes ".claude" recursively so each
+# developer's personal Claude Code config (~/.claude or per-project
+# settings.local.json) stays untracked. The team-shared
+# .claude/settings.json (a project hook config — see iter-92) is the
+# exception: re-include just the directory entry and that one file.
+!.claude/
+.claude/*
+!.claude/settings.json
+
 # Newton ROMs are not redistributable. Each developer places their own dump
 # under roms/; the directory itself is tracked (for the README) but all
 # contents are ignored.

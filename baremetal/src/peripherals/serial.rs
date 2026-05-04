@@ -49,6 +49,22 @@ mod reg {
     pub const STATUS_TX_EMPTY: u32 = 1 << 7;
     // bit 6: RX FIFO full, bit 5: RX byte available, bit 4: DCD, bit 3: CTS
     // — all left clear (idle line, no data waiting).
+
+    /// Control / interrupt-enable register offsets the kernel touches
+    /// during `BasicBusControlRegInit` and the per-port
+    /// `TVoyagerSerialPort` setup. The Newton 2.x kernel
+    /// initialises these by writing fixed bit patterns and may also
+    /// read them back (either as part of init, or implicitly via the
+    /// BE-8 byte-write splice path, which read-modify-writes the
+    /// surrounding word). We treat reads as "register holds zero"
+    /// (idle peripheral) and writes as no-ops; the hypervisor doesn't
+    /// deliver serial interrupts yet so the actual bit state isn't
+    /// observable past this layer.
+    pub const CONTROL_IE_OFFSETS: &[u64] = &[
+        0x0000, 0x0400, 0x0800, 0x0C00, 0x1000, 0x2000, 0x2400, 0x2800,
+        0x3000, 0x3400, 0x3800, 0x3C00, 0x5000, 0x5400, 0x5800, 0x5C00,
+        0x8000,
+    ];
 }
 
 /// True iff `ipa` lands inside one of the four port windows.
@@ -91,6 +107,8 @@ pub fn read(ipa: u64) -> u32 {
         // leaves the (empty) RX FIFO empty.
         reg::RX_BYTE => 0,
 
+        _ if reg::CONTROL_IE_OFFSETS.contains(&off) => 0,
+
         _ => halt_unknown(port, off, /*write=*/ false, 0),
     }
 }
@@ -100,13 +118,7 @@ pub fn write(ipa: u64, value: u32) {
     match off {
         reg::TX_BYTE => log_tx_byte(port, value as u8),
 
-        // Control / interrupt-enable writes are consumed. They change
-        // the Newton's view of the chip but are unobservable at this
-        // layer — we don't deliver serial interrupts yet. An earlier
-        // bring-up iteration can add them back as needed.
-        0x0000 | 0x0400 | 0x0800 | 0x0C00 | 0x1000 | 0x2000 | 0x2400 | 0x2800
-        | 0x3000 | 0x3400 | 0x3800 | 0x3C00 | 0x5000 | 0x5400 | 0x5800 | 0x5C00
-        | 0x8000 => {}
+        _ if reg::CONTROL_IE_OFFSETS.contains(&off) => {}
 
         _ => halt_unknown(port, off, /*write=*/ true, value),
     }

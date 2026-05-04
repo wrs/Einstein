@@ -18,16 +18,54 @@ Bloated PLAN.md wastes context every read.
   functionality (not merely diagnostics):
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-91 follow-up):** chase the next cold-boot stop —
-an unmodelled `serial[mdem] R +0x2800` MMIO read at PC `0x19cec`,
-inside the BasicBusControlRegInit / DiagBootStub path. Standard
-"extend the peripheral on first touch" workflow per the workflow
-section below. The iter-91 classifier fix (literal-pool subtraction
-from `reach.bitmap`) cleared the BE-8 byte-order wedge that iter-90
-left at `SaveCPUStateAndStopSystem +0x2bc`; production cold boot now
-runs through ~5 KiB of post-StrongARM-clock init code (BootOS MMIO
-setup, GetRebootReason, GetUnsuccessfulBootCount, FlushTheCache,
-BasicBusControlRegInit) before the new mdem stop.
+**Current goal (iter-92 follow-up):** chase the post-MMU-enable
+prefetch-abort loop. After SCTLR_EL1.M=1 at the second SCTLR write
+(BootOS+0x16c, `0x000011b5`), the next AArch32 trap shows
+`PC=0xC LR_svc=0x11ec10 mode=0x17 (ABT) FAR_EL1=0xc00000000` and
+the system loops on timer-IRQ-with-stuck-PABT. PC=0xC is the AArch32
+PABT vector (low-vector base, since SCTLR.V=0); the kernel's
+post-MMU L1 (TTBR=0x0400_0000) leaves L1[0] as a fault descriptor
+(see "guest L1 first 32 entries" dump — every entry is "fault"),
+so the very first PABT redirected to `0xC` faults again, and the
+abort handler can't make progress. Likely a real Phase B
+gap — vector-page mapping or `gIPCVectorBase` redirection after MMU
+enable. Iter-91 fix (literal-pool subtraction) and iter-92 fix
+(serial control/IE reads) progressed the boot from
+`SaveCPUStateAndStopSystem +0x2bc` (~250 log lines) through
+BasicBusControlRegInit, DACR/TTBR programming, MMU enable, and the
+L1 dump (~700+ lines).
+
+### Iteration 92: serial control/IE reads + qemu-reaper Stop hook
+
+iter-91 cleared the BE-8 wedge but left the boot stuck at
+`*** serial[mdem] UNKNOWN R +0x2800 ***` (PC `0x19cec`,
+BasicBusControlRegInit). The actual instruction at that PC is
+`STRB R1, [R0]` — a write — but under BE-8 the byte/halfword
+write path in `mmio::write` reads the surrounding word first to
+splice the byte into the right lane. So a kernel byte-store to
+mdem +0x2800 produced an MMIO **read** at the same offset, which
+`serial::read` had no handler for.
+
+Fix: extracted the existing write-only "control / IE consumed"
+offset list (`0x0000`, `0x0400`, …, `0x8000`) into a
+`reg::CONTROL_IE_OFFSETS` slice and made both `read` (return 0,
+"register holds zero / idle peripheral") and `write` (no-op)
+consult it. No behavioural change for writes; reads of any of
+those offsets now return zero instead of halting.
+
+Also wired a project-scoped Claude Code Stop hook
+(`.claude/settings.json`) that runs `pkill -9 qemu-system-aarch64`
+at session end, so a wedged hypervisor can't leave a zombie QEMU
+behind across sessions. The hypervisor halts loudly on its own
+unhandled cases and QEMU keeps running until something kills it;
+without the hook, every aborted `cargo run` left a process around.
+
+Result: cold boot now runs from `Entering Newton ROM…` through
+~700 log lines (BasicBusControlRegInit, DACR write, TTBR0
+programming, `fix_stage1_xn_bits` (130 sections de-XN'd, 144 fine
+→ fault), L1[0xCD] transition probe, shadow_stub scratch L1[0x60]
+install, MMU enable at SCTLR_EL1=0x000011b5) before the
+post-MMU-enable PABT loop above. 36/36 guest tests pass.
 
 ### Iteration 91: classifier literal-pool subtraction
 

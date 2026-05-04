@@ -4688,6 +4688,11 @@ fn handle_entry_remove_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
         "EntryRemoveFromSoup #{}: r0(&RefVar)={:#010x} slot={:#010x} ref={:#010x} caller_lr={:#010x} sp={:#010x}",
         seq, r0, slot_ptr, tagged_ref, lr, sp,
     );
+    // Pretty-print the entry's frame structure recursively so we
+    // can see all of its slot values (including the malformed
+    // 'string slot we already know about). depth=3 expands frame
+    // map + slot Refs once each.
+    crate::heap_check::pretty_print_ref("entry", tagged_ref, 3);
 
     // Emulate `mov ip, sp` (= source-mode SP).
     ctx.x[12] = (ctx.x[12] & 0xFFFF_FFFF_0000_0000) | (sp as u64);

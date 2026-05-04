@@ -507,18 +507,29 @@ fn print_object_recursive(
         Object::Frame(f) => {
             crate::kprintln!("{}{}{}: frame map={:?} @{:#010x} size={} len={}",
                 ind, label, lp, f.map(), f.offset(), f.size(), f.len());
-            for (i, slot_ref) in f.iter_slots().enumerate().take(8) {
-                if depth > 0 {
-                    pretty_print_inline_index("slot[", i, slot_ref.raw(), depth - 1, level + 1);
+            // Resolve slot names by walking the map chain. Print
+            // "name = value" pairs rather than positional slot[N].
+            let frame_len = f.len();
+            for (i, slot_ref) in f.iter_slots().enumerate().take(16) {
+                let mut name_buf = [0u8; 64];
+                let n = resolve_slot_name_into(f.map().raw(), i, frame_len, &mut name_buf);
+                let name = if n > 0 {
+                    core::str::from_utf8(&name_buf[..n]).unwrap_or("?")
                 } else {
-                    crate::kprintln!("{}  slot[{}] = {:?}", ind, i, slot_ref);
+                    ""
+                };
+                let inner_ind = indent_str(level + 1);
+                if name.is_empty() {
+                    crate::kprintln!("{}slot[{}] = {:?}", inner_ind, i, slot_ref);
+                } else {
+                    crate::kprintln!("{}{} = {:?}", inner_ind, name, slot_ref);
+                }
+                if depth > 0 && slot_ref.is_pointer() {
+                    pretty_print_ref_at("→", slot_ref.raw(), depth - 1, level + 2);
                 }
             }
-            if f.len() > 8 {
-                crate::kprintln!("{}  ... ({} more slots)", ind, f.len() - 8);
-            }
-            if depth > 0 && f.map().is_pointer() {
-                pretty_print_ref_at("map", f.map().raw(), depth - 1, level + 1);
+            if f.len() > 16 {
+                crate::kprintln!("{}  ... ({} more slots)", ind, f.len() - 16);
             }
         }
     }
@@ -585,4 +596,84 @@ fn nibble_to_hex(n: u8) -> u8 {
         0..=9 => b'0' + n,
         a => b'a' + (a - 10),
     }
+}
+
+/// Resolve the symbol name for frame slot `slot_idx` by walking the
+/// map chain rooted at `map_ref_value`. Writes the symbol's name
+/// bytes into `out`; returns the number of bytes written (0 on any
+/// failure: NIL map, parse error, slot out of range, or non-symbol
+/// name slot).
+///
+/// Map convention (per newton-objects): slot[0] is the supermap
+/// (NIL terminator), slots[1..N] name the *last* N positional slots
+/// of the frame. We descend into the supermap first to consume the
+/// leading frame slots; what remains is named locally.
+fn resolve_slot_name_into(
+    map_ref_value: u32,
+    slot_idx: usize,
+    frame_len: usize,
+    out: &mut [u8],
+) -> usize {
+    // Iterative supermap walk. At each level we read the map's bytes
+    // into a fresh local buffer, then either descend (if slot is
+    // covered by the supermap) or emit a local-symbol name.
+    let mut current = newton_objects::Ref(map_ref_value);
+    let mut frame_slots_remaining = frame_len;
+    let slot_offset_from_top = slot_idx; // counted from frame-slot[0]
+    // Bound the supermap-walk depth to avoid runaway recursion.
+    for _ in 0..8 {
+        if !current.is_pointer() { return 0; }
+        let map_addr = match current.pointer_offset() { Some(a) => a, None => return 0 };
+        let mut map_buf = [0u8; 256];
+        let map_n = match read_object_bytes(map_addr, &mut map_buf) {
+            Some(n) => n,
+            None => return 0,
+        };
+        let heap = newton_objects::Heap::with_load_addr(&map_buf[..map_n], map_addr);
+        let arr = match heap.object_at(map_addr).ok().and_then(|o| o.as_array().ok()) {
+            Some(a) => a,
+            None => return 0,
+        };
+        // local_count = number of names this map carries (slots[1..N]).
+        let local_count = arr.len().saturating_sub(1);
+        // The map's local names cover the LAST `local_count` slots of
+        // the frame. Earlier slots (if any) come from the supermap.
+        let super_count = frame_slots_remaining.saturating_sub(local_count);
+        if slot_offset_from_top < super_count {
+            // Descend into supermap. The supermap will see a frame
+            // that's `super_count` slots long.
+            let supermap = match arr.slot(0) { Some(s) => s, None => return 0 };
+            current = supermap;
+            frame_slots_remaining = super_count;
+            // slot_offset_from_top stays the same — we're still
+            // counting from frame-slot[0].
+            continue;
+        }
+        let local_idx = slot_offset_from_top - super_count;
+        if local_idx >= local_count { return 0; }
+        // Slot 1+local_idx of the array is the name Ref (a symbol).
+        let name_ref = match arr.slot(1 + local_idx) { Some(r) => r, None => return 0 };
+        return read_symbol_name_into(name_ref, out);
+    }
+    0
+}
+
+/// Read a symbol's name bytes into `out`, returning the byte count
+/// written. Returns 0 if `r` is not a real-pointer Ref, the pointee
+/// can't be read, or the parsed object isn't a symbol.
+fn read_symbol_name_into(r: newton_objects::Ref, out: &mut [u8]) -> usize {
+    let addr = match r.pointer_offset() { Some(a) => a, None => return 0 };
+    let mut buf = [0u8; 256];
+    let n = match read_object_bytes(addr, &mut buf) {
+        Some(n) => n,
+        None => return 0,
+    };
+    let heap = newton_objects::Heap::with_load_addr(&buf[..n], addr);
+    let obj = match heap.object_at(addr) { Ok(o) => o, Err(_) => return 0 };
+    let bin = match obj.as_binary() { Ok(b) => b, Err(_) => return 0 };
+    let sym = match bin.as_symbol() { Some(s) => s, None => return 0 };
+    let nm = sym.name_bytes();
+    let copy = nm.len().min(out.len());
+    out[..copy].copy_from_slice(&nm[..copy]);
+    copy
 }

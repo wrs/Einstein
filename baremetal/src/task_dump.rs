@@ -28,7 +28,7 @@
 //!   +0xbc  (188)  TDoubleQItem (12 bytes) — wait-queue link 1
 //!   +0xc8  (200)  TDoubleQItem (12 bytes) — wait-queue link 2
 
-use crate::guest_mem::read_word_va;
+use crate::guest_endian::guest_read_u32_va as read_word_va;
 use crate::kprintln;
 
 const G_SCHEDULER_PTR: u32 = 0x0c10_0fd0;

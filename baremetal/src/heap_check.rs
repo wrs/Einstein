@@ -37,7 +37,6 @@
 //! left ambiguous (we couldn't tell if the receiver / implementor
 //! Refs were genuine heap objects or stale stack/register junk).
 
-use crate::guest_mem;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 /// Address of the global `TObjectHeap*` written by `InitObjects__Fv`.
@@ -50,7 +49,8 @@ static CACHED_LO: AtomicU32 = AtomicU32::new(0);
 static CACHED_HI: AtomicU32 = AtomicU32::new(0);
 
 fn read_word(va: u32) -> Option<u32> {
-    guest_mem::read_word_va(va).or_else(|| guest_mem::read_word_pa(va))
+    crate::guest_endian::guest_read_u32_va(va)
+        .or_else(|| crate::guest_endian::guest_read_u32_pa(va))
 }
 
 /// Read the runtime object heap's `[lo, hi)` bounds. Returns
@@ -209,10 +209,10 @@ const G_INTERPRETER_PTR:       u32 = 0x0c10_5458;
 const TINTERPRETER_TRACE_OFF:  u32 = 124;
 
 fn write_word(va: u32, value: u32) -> bool {
-    if guest_mem::write_word_va(va, value) {
+    if crate::guest_endian::guest_write_u32_va(va, value) {
         return true;
     }
-    guest_mem::write_word_pa(va, value)
+    crate::guest_endian::guest_write_u32_pa(va, value)
 }
 
 fn force_kernel_diag_on() {
@@ -270,7 +270,7 @@ const DUMP_BUF_BYTES: usize = 256;
 /// Print a human-readable structured dump of the object pointed to by
 /// `ref_value`, using the `newton-objects` parser. Only acts on
 /// real-pointer Refs (low 2 bits == 01). The pointed-to bytes are
-/// read via `guest_mem::read_word_va` (with PA fallback) into a
+/// read via `guest_endian::guest_read_bytes_va` into a
 /// stack-resident buffer, then handed to a little-endian
 /// `newton_objects::Heap` view.
 ///
@@ -281,7 +281,7 @@ pub fn dump_object(indent: &str, ref_value: u32) {
     }
     let addr = ref_value & !0x3;
     let mut buf = [0u8; DUMP_BUF_BYTES];
-    let n = match read_object_bytes(addr, &mut buf) {
+    let n = match crate::guest_endian::guest_read_bytes_va(addr, &mut buf) {
         Some(n) => n,
         None => {
             crate::kprintln!("{}<unreadable @{:#010x}>", indent, addr);
@@ -301,32 +301,6 @@ pub fn dump_object(indent: &str, ref_value: u32) {
         Ok(obj) => print_object(indent, obj, /*depth=*/ 0),
         Err(e) => crate::kprintln!("{}parse error @{:#010x}: {}", indent, addr, e),
     }
-}
-
-/// Read up to `out.len()` bytes starting at `addr` into `out`. Stops
-/// short on the first failed translation. Returns the number of bytes
-/// actually read, or `None` if the very first word fails (i.e. the
-/// address is not mapped at all).
-fn read_object_bytes(addr: u32, out: &mut [u8]) -> Option<usize> {
-    let mut written = 0;
-    let mut cursor = addr;
-    while written + 4 <= out.len() {
-        let w = guest_mem::read_word_va(cursor).or_else(|| guest_mem::read_word_pa(cursor));
-        let w = match w {
-            Some(w) => w,
-            None => break,
-        };
-        // Write each word as big-endian bytes so the buffer
-        // mirrors the original on-disk byte order: u32 reads with
-        // Endian::Big still produce the correct numeric value, but
-        // byte-level data (e.g. a symbol's name) appears in the
-        // intended sequential order rather than reversed within
-        // each 4-byte chunk.
-        out[written..written + 4].copy_from_slice(&w.to_be_bytes());
-        written += 4;
-        cursor = cursor.wrapping_add(4);
-    }
-    if written == 0 { None } else { Some(written) }
 }
 
 /// One-line object summary plus a few interior slots. The depth
@@ -448,7 +422,7 @@ fn pretty_print_ref_at(label: &str, ref_value: u32, depth: u32, level: u32) {
         RefKind::Pointer(addr) => {
             // Read pointee bytes and parse with newton-objects.
             let mut buf = [0u8; 256];
-            let n = match read_object_bytes(addr, &mut buf) {
+            let n = match crate::guest_endian::guest_read_bytes_va(addr, &mut buf) {
                 Some(n) => n,
                 None => {
                     crate::kprintln!("{}{}{}: ptr@{:#010x} <unreadable>", ind, label,
@@ -632,7 +606,7 @@ fn resolve_slot_name_into(
         if !current.is_pointer() { return 0; }
         let map_addr = match current.pointer_offset() { Some(a) => a, None => return 0 };
         let mut map_buf = [0u8; 256];
-        let map_n = match read_object_bytes(map_addr, &mut map_buf) {
+        let map_n = match crate::guest_endian::guest_read_bytes_va(map_addr, &mut map_buf) {
             Some(n) => n,
             None => return 0,
         };
@@ -671,7 +645,7 @@ fn resolve_slot_name_into(
 fn read_symbol_name_into(r: newton_objects::Ref, out: &mut [u8]) -> usize {
     let addr = match r.pointer_offset() { Some(a) => a, None => return 0 };
     let mut buf = [0u8; 256];
-    let n = match read_object_bytes(addr, &mut buf) {
+    let n = match crate::guest_endian::guest_read_bytes_va(addr, &mut buf) {
         Some(n) => n,
         None => return 0,
     };

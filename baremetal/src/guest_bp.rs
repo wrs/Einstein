@@ -464,7 +464,7 @@ pub fn handle_user_bp_und(
         // word loaded is at faulting_pc + 8 + 40. The ROM literal at
         // 0x142e20 is `0x0c10102c` (a g-pointer constant).
         let lit_addr = faulting_pc.wrapping_add(48);
-        let lit = guest_mem::read_word_va(lit_addr).unwrap_or(0);
+        let lit = crate::guest_endian::guest_read_u32_va(lit_addr).unwrap_or(0);
         ctx.x[1] = lit as u64;
         lock();
         // SAFETY: same as above — re-occupy the slot.
@@ -485,7 +485,7 @@ pub fn handle_user_bp_und(
     // released it.
     if faulting_pc == 0x0031_3308 {
         let r0 = ctx.x[0] as u32;
-        match crate::guest_mem::read_word_va(r0) {
+        match crate::guest_endian::guest_read_u32_va(r0) {
             Some(value) => {
                 ctx.x[3] = value as u64;
                 lock();
@@ -549,7 +549,7 @@ pub fn handle_user_bp_und(
     if faulting_pc == 0x0011_D844 {
         let r8 = ctx.x[8] as u32;
         let word_addr = r8.wrapping_add(12);
-        let w = crate::guest_mem::read_word_va(word_addr).unwrap_or(0xDEADBEEF);
+        let w = crate::guest_endian::guest_read_u32_va(word_addr).unwrap_or(0xDEADBEEF);
         kprintln!(
             "    mem @[r8+12]={:#010x} word={:#010x}  bytes=[{:02x},{:02x},{:02x},{:02x}]",
             word_addr, w,
@@ -563,7 +563,7 @@ pub fn handle_user_bp_und(
         let r5 = ctx.x[5] as u32;
         kprintln!("    PRIM exit: r3={:#010x} r5={:#010x}", r3, r5);
         for (label, addr) in [("r3-word-aligned", r3 & !3), ("r5-word-aligned", r5 & !3)] {
-            let w = crate::guest_mem::read_word_va(addr).unwrap_or(0xDEADBEEF);
+            let w = crate::guest_endian::guest_read_u32_va(addr).unwrap_or(0xDEADBEEF);
             kprintln!(
                 "    {} @{:#010x} word={:#010x}  bytes=[{:02x},{:02x},{:02x},{:02x}]",
                 label, addr, w,
@@ -578,10 +578,10 @@ pub fn handle_user_bp_und(
         let r7 = ctx.x[7] as u32;
         kprintln!("    PRIM @list1_load: r4=list1_ptr={:#010x} r7=entry_base={:#010x}", r4, r7);
         if r4 != 0 {
-            let first = crate::guest_mem::read_word_va(r4).unwrap_or(0xDEADBEEF);
+            let first = crate::guest_endian::guest_read_u32_va(r4).unwrap_or(0xDEADBEEF);
             kprintln!("    *list1 = {:#010x}", first);
         }
-        let entry_env = crate::guest_mem::read_word_va(r7.wrapping_sub(16))
+        let entry_env = crate::guest_endian::guest_read_u32_va(r7.wrapping_sub(16))
             .unwrap_or(0xDEADBEEF);
         kprintln!("    entry[0] (env_name) = {:#010x}", entry_env);
     }
@@ -610,7 +610,7 @@ pub fn handle_user_bp_und(
             for off in (0..128u32).step_by(16) {
                 let mut row = [0u32; 4];
                 for i in 0..4u32 {
-                    row[i as usize] = crate::guest_mem::read_word_va(r1.wrapping_add(off + i * 4))
+                    row[i as usize] = crate::guest_endian::guest_read_u32_va(r1.wrapping_add(off + i * 4))
                         .unwrap_or(0xDEADBEEF);
                 }
                 kprintln!(
@@ -621,15 +621,15 @@ pub fn handle_user_bp_und(
             // Walk freelist starting at heap[+72]: ptr to first node, then
             // node->next chain (offset +4 from each node) until we either
             // wrap to heap[+32] (start) or hit the corrupt next.
-            let mut p = crate::guest_mem::read_word_va(r1.wrapping_add(72)).unwrap_or(0);
-            let start = crate::guest_mem::read_word_va(r1.wrapping_add(32)).unwrap_or(0);
+            let mut p = crate::guest_endian::guest_read_u32_va(r1.wrapping_add(72)).unwrap_or(0);
+            let start = crate::guest_endian::guest_read_u32_va(r1.wrapping_add(32)).unwrap_or(0);
             kprintln!(
                 "      freelist walk: heap[+72]={:#010x} heap[+32]={:#010x}",
                 p, start
             );
             for step in 0..32u32 {
-                let size = crate::guest_mem::read_word_va(p).unwrap_or(0xDEADBEEF);
-                let next = crate::guest_mem::read_word_va(p.wrapping_add(4)).unwrap_or(0xDEADBEEF);
+                let size = crate::guest_endian::guest_read_u32_va(p).unwrap_or(0xDEADBEEF);
+                let next = crate::guest_endian::guest_read_u32_va(p.wrapping_add(4)).unwrap_or(0xDEADBEEF);
                 kprintln!(
                     "        node[{:>2}] @{:#010x} size={:#010x} next={:#010x}",
                     step, p, size, next

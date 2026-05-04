@@ -93,7 +93,7 @@ pub fn handle_align_fault(ctx: &mut TrapContext) {
     // populates instead — that's AArch32-native stores, reliable on
     // both platforms.
     let lr_abt = ctx.x[20] as u32;
-    let spsr_abt_save = crate::guest_mem::read_word_pa(
+    let spsr_abt_save = crate::guest_endian::guest_read_u32_pa(
         crate::guest_mem::DABT_SAVE_PA + 0x08,
     ).unwrap_or(0);
     let pre_abt_cpsr = spsr_abt_save;
@@ -492,9 +492,9 @@ fn read_guest_word(addr: u32) -> Option<u32> {
             options(nomem, nostack, preserves_flags));
     }
     if sctlr & 1 != 0 {
-        crate::guest_mem::read_word_va(addr)
+        crate::guest_endian::guest_read_u32_va(addr)
     } else {
-        crate::guest_mem::read_word_pa(addr)
+        crate::guest_endian::guest_read_u32_pa(addr)
     }
 }
 
@@ -506,8 +506,8 @@ fn write_guest_word(addr: u32, value: u32) -> bool {
             options(nomem, nostack, preserves_flags));
     }
     if sctlr & 1 != 0 {
-        crate::guest_mem::write_word_va(addr, value)
+        crate::guest_endian::guest_write_u32_va(addr, value)
     } else {
-        crate::guest_mem::write_word_pa(addr, value)
+        crate::guest_endian::guest_write_u32_pa(addr, value)
     }
 }

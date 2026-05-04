@@ -13,7 +13,7 @@
 //! values mirror Einstein's tables verbatim so the kernel's downstream
 //! consumers see the same battery state we'd see in Einstein.
 
-use crate::{cpu, guest_mem, kprintln, trap::TrapContext};
+use crate::{cpu, kprintln, trap::TrapContext};
 
 /// Battery-driver class ID in the native-primitive encoding.
 pub const DRIVER_ID: u32 = 0x00_0003;
@@ -101,8 +101,8 @@ fn fill_status(ctx: &mut TrapContext, pc: u32, fields: &[(u32, u32)]) {
 }
 
 fn write_guest_word(addr: u32, value: u32) -> bool {
-    if guest_mem::write_word_va(addr, value) {
+    if crate::guest_endian::guest_write_u32_va(addr, value) {
         return true;
     }
-    guest_mem::write_word_pa(addr, value)
+    crate::guest_endian::guest_write_u32_pa(addr, value)
 }

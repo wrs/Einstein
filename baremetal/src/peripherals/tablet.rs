@@ -15,7 +15,7 @@
 //! when the kernel sets and reads back its own calibration.
 
 use core::cell::UnsafeCell;
-use crate::{cpu, guest_mem, kprintln, trap::TrapContext};
+use crate::{cpu, kprintln, trap::TrapContext};
 
 /// Tablet-driver class ID in the native-primitive encoding.
 pub const DRIVER_ID: u32 = 0x00_0005;
@@ -153,17 +153,17 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
 }
 
 fn write_guest_word(addr: u32, value: u32) -> bool {
-    if guest_mem::write_word_va(addr, value) {
+    if crate::guest_endian::guest_write_u32_va(addr, value) {
         return true;
     }
-    guest_mem::write_word_pa(addr, value)
+    crate::guest_endian::guest_write_u32_pa(addr, value)
 }
 
 fn read_guest_word_or_halt(addr: u32, pc: u32) -> u32 {
-    if let Some(v) = guest_mem::read_word_va(addr) {
+    if let Some(v) = crate::guest_endian::guest_read_u32_va(addr) {
         return v;
     }
-    if let Some(v) = guest_mem::read_word_pa(addr) {
+    if let Some(v) = crate::guest_endian::guest_read_u32_pa(addr) {
         return v;
     }
     kprintln!("*** tablet: cannot read at {:#x} @PC={:#x}", addr, pc);

@@ -202,9 +202,9 @@ fn rewrite_first_insn(orig: u32, orig_pc: u32) -> Option<(u32, u32, bool)> {
         let imm = orig & 0xFFF;
         let literal_addr = orig_pc.wrapping_add(8).wrapping_add(imm);
         if literal_addr >= 0x0100_0000 { return None; }
-        // guest_mem::read_word_pa reads the post-swap LE view of ROM,
-        // which is exactly what an AArch32 LDR sees at run time.
-        let literal = guest_mem::read_word_pa(literal_addr)?;
+        // Read the literal as the Newton-side numerical value the
+        // AArch32 LDR would see at run time.
+        let literal = crate::guest_endian::guest_read_u32_pa(literal_addr)?;
         // Rewrite to LDR Rd, [pc, #0]. At slot[1] (offset +4 in slot),
         // pc+8 points at slot[3] (offset +12), so imm=0 reads slot[3].
         let new_insn = 0xE59F_0000 | (rd << 12);
@@ -469,10 +469,10 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
         static FIRED: core::sync::atomic::AtomicBool =
             core::sync::atomic::AtomicBool::new(false);
         if !FIRED.load(core::sync::atomic::Ordering::Relaxed) {
-            if let Some(v) = crate::guest_mem::read_word_pa(0x0402_a250) {
+            if let Some(v) = crate::guest_endian::guest_read_u32_pa(0x0402_a250) {
                 if v == 0x6e65_7774 {
                     FIRED.store(true, core::sync::atomic::Ordering::Relaxed);
-                    let v2 = crate::guest_mem::read_word_pa(0x0402_a254).unwrap_or(0);
+                    let v2 = crate::guest_endian::guest_read_u32_pa(0x0402_a254).unwrap_or(0);
                     kprintln!(
                         "*** newt-tripwire fired AT trace {} (PA 0x0402a250=0x{:08x} 0x0402a254=0x{:08x})",
                         seq, v, v2
@@ -550,7 +550,7 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
                     options(nomem, nostack, preserves_flags));
             }
             let l1_base = (ttbr & 0xFFFF_C000) as u32;
-            let l1_c0 = guest_mem::read_word_pa(l1_base + 0xC0 * 4).unwrap_or(0);
+            let l1_c0 = crate::guest_endian::guest_read_u32_pa(l1_base + 0xC0 * 4).unwrap_or(0);
             kprintln!(
                 "  L1[0xC0] @ {:#010x} = {:#010x}",
                 l1_base + 0xC0 * 4, l1_c0
@@ -559,7 +559,7 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
                 let l2_pa = l1_c0 & 0xFFFF_FC00;
                 kprintln!("  L2 for 0x0c000000..0x0c010000 (coarse table @ PA {:#010x}):", l2_pa);
                 for i in 0..16u32 {
-                    let e = guest_mem::read_word_pa(l2_pa + i * 4).unwrap_or(0);
+                    let e = crate::guest_endian::guest_read_u32_pa(l2_pa + i * 4).unwrap_or(0);
                     let va = 0x0c000000u32 + i * 0x1000;
                     let kind = match e & 3 {
                         0 => "fault",
@@ -594,7 +594,7 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
         static DONE: core::sync::atomic::AtomicBool =
             core::sync::atomic::AtomicBool::new(false);
         if !DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
-            let gcg = guest_mem::read_word_va(0x0c10105c).unwrap_or(0);
+            let gcg = crate::guest_endian::guest_read_u32_va(0x0c10105c).unwrap_or(0);
             let r8 = gcg.wrapping_sub(0x54);
             kprintln!("  USR GetEnvDomainName entry: gCurrentGlobals={:#010x} r8={:#010x}",
                       gcg, r8);
@@ -635,13 +635,13 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
                 core::arch::asm!("mrs {}, sctlr_el1", out(reg) sctlr,
                     options(nomem, nostack, preserves_flags));
             }
-            let gcg = guest_mem::read_word_va(0x0c10105c).unwrap_or(0);
+            let gcg = crate::guest_endian::guest_read_u32_va(0x0c10105c).unwrap_or(0);
             kprintln!("  @RegisterEnvironmentId: TTBR0_EL1={:#x} SCTLR.M={} gCurrentGlobals={:#010x}",
                       ttbr, sctlr & 1, gcg);
             let fparams = 0x0c111d0cu32;
             for off in [0x00u32, 0x04, 0x08, 0x0C, 0x10] {
                 let addr = fparams.wrapping_add(off);
-                let word = guest_mem::read_word_va(addr).unwrap_or(0xDEADBEEF);
+                let word = crate::guest_endian::guest_read_u32_va(addr).unwrap_or(0xDEADBEEF);
                 kprintln!("    [{:#010x}] = {:#010x}", addr, word);
             }
         }
@@ -668,7 +668,7 @@ fn check_byte_access_patches() {
         (0x0011D840, 0xe5d8100d, "MemObjManager::GetEnvDomainName: ldrb r1, [r8, #13]"),
     ];
     for (pa, orig_insn, label) in sites {
-        let live = guest_mem::read_word_va(pa).unwrap_or(0xDEAD_BEEF);
+        let live = crate::guest_endian::guest_read_u32_va(pa).unwrap_or(0xDEAD_BEEF);
         // Patched sites are a branch — bits [27:25] = 0b101 → (w >> 25) & 7 == 5.
         let is_branch = ((live >> 25) & 0x7) == 0x5;
         kprintln!(
@@ -691,7 +691,7 @@ fn dump_param_buffer(r2: u32, r3: u32) {
         let base = addr & !0x1F;  // round down to 32-byte line
         let mut buf = [0u32; 8];
         for i in 0..8 {
-            buf[i] = guest_mem::read_word_va(base.wrapping_add((i as u32) * 4))
+            buf[i] = crate::guest_endian::guest_read_u32_va(base.wrapping_add((i as u32) * 4))
                 .unwrap_or(0xDEAD_BEEF);
         }
         kprintln!(
@@ -710,7 +710,7 @@ fn dump_env_config_table() {
     let base = 0x0c10143cu32;
     let mut buf = [0u32; 96];
     for i in 0..96 {
-        buf[i] = guest_mem::read_word_va(base.wrapping_add((i as u32) * 4))
+        buf[i] = crate::guest_endian::guest_read_u32_va(base.wrapping_add((i as u32) * 4))
             .unwrap_or(0xDEAD_BEEF);
     }
     kprintln!("  env_config: flat table at {:#010x}:", base);
@@ -735,7 +735,7 @@ fn dump_env_config_table() {
         if env == 0 || list_ptr == 0 || list_ptr == 0xDEAD_BEEF { continue; }
         let mut names = [0u32; 10];
         for i in 0..10 {
-            names[i] = guest_mem::read_word_va(list_ptr.wrapping_add((i as u32) * 4))
+            names[i] = crate::guest_endian::guest_read_u32_va(list_ptr.wrapping_add((i as u32) * 4))
                 .unwrap_or(0);
             if names[i] == 0 { break; }
         }
@@ -877,7 +877,7 @@ fn dump_guest_stack(sp: u32, words: usize) {
     let n = words.min(8);
     let mut got_any = false;
     for i in 0..n {
-        match guest_mem::read_word_va(sp.wrapping_add((i as u32) * 4)) {
+        match crate::guest_endian::guest_read_u32_va(sp.wrapping_add((i as u32) * 4)) {
             Some(v) => { buf[i] = v; got_any = true; }
             None => { buf[i] = 0xDEAD_BEEF; }
         }

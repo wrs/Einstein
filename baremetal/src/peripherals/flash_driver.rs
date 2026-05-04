@@ -311,19 +311,19 @@ fn resolve_flash_pa(addr: u32) -> Option<u32> {
 /// translation then by treating it as a PA. Returns whether the
 /// backing accepted the store.
 fn write_guest_word(addr: u32, value: u32) -> bool {
-    if guest_mem::write_word_va(addr, value) {
+    if crate::guest_endian::guest_write_u32_va(addr, value) {
         return true;
     }
-    guest_mem::write_word_pa(addr, value)
+    crate::guest_endian::guest_write_u32_pa(addr, value)
 }
 
 /// Read a word at a guest address with the same VA-first / PA-fallback
 /// semantics as `write_guest_word`. Lets MMU-off callers (guest tests)
 /// pass PAs directly.
 fn read_guest_word(addr: u32) -> Option<u32> {
-    if let Some(v) = guest_mem::read_word_va(addr) {
+    if let Some(v) = crate::guest_endian::guest_read_u32_va(addr) {
         return Some(v);
     }
-    guest_mem::read_word_pa(addr)
+    crate::guest_endian::guest_read_u32_pa(addr)
 }
 

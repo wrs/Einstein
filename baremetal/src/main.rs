@@ -12,6 +12,7 @@ mod fb_dump;
 mod g1_capture;
 mod guest;
 mod guest_bp;
+mod guest_endian;
 mod guest_mem;
 mod heap_check;
 mod heap_watch;
@@ -70,7 +71,7 @@ pub extern "C" fn kmain() -> ! {
     // some later code path writes to ROM beyond REx end.
     for off in [-0x10i32, -0x4, 0, 0x4, 0x8] {
         let addr = 0x00f7_6368u32.wrapping_add(off as u32);
-        let w = guest_mem::read_word_pa(addr).unwrap_or(0xDEADBEEF);
+        let w = crate::guest_endian::guest_read_u32_pa(addr).unwrap_or(0xDEADBEEF);
         kprintln!(
             "post-load ROM dump: @{:#010x} = {:#010x}",
             addr, w,
@@ -123,7 +124,7 @@ pub extern "C" fn kmain() -> ! {
     // patcher is writing here.
     for off in [-0x10i32, -0x4, 0, 0x4, 0x8] {
         let addr = 0x00f7_6368u32.wrapping_add(off as u32);
-        let w = guest_mem::read_word_pa(addr).unwrap_or(0xDEADBEEF);
+        let w = crate::guest_endian::guest_read_u32_pa(addr).unwrap_or(0xDEADBEEF);
         kprintln!(
             "post-shadow-stub ROM dump: @{:#010x} = {:#010x}",
             addr, w,

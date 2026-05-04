@@ -114,7 +114,7 @@ fn get_screen_info(ctx: &mut TrapContext, pc: u32) {
     for (off, val) in fields {
         let va = info_addr + off;
         let pa = guest_mem::translate_va(va).unwrap_or(va);
-        if !guest_mem::write_word_pa(pa, val) {
+        if !crate::guest_endian::guest_write_u32_pa(pa, val) {
             kprintln!(
                 "*** screen.GetScreenInfo: cannot write VA {:#x} (PA {:#x}) @PC={:#x}",
                 va, pa, pc
@@ -235,9 +235,11 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
                 let abs_src_pix = pixmap_src_left as u32 + col_pix;
                 let src_va = addy + src_row_pa_off + abs_src_pix / 8;
                 let src_pa = guest_mem::translate_va(src_va).unwrap_or(src_va);
-                // BE-32 byte lane: read at `src_pa ^ 3` to land on
-                // the kernel's logical byte (see top-of-blit comment).
-                let byte = match guest_mem::read_byte_pa(src_pa ^ 3) {
+                // Read the kernel's logical byte at this PA. The XOR-3
+                // byte-lane transform is applied internally by
+                // `guest_endian::guest_read_u8_pa` (see top-of-blit
+                // comment).
+                let byte = match crate::guest_endian::guest_read_u8_pa(src_pa) {
                     Some(b) => b,
                     None => {
                         kprintln!(
@@ -299,9 +301,11 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
             // returns None in the MMU-off case; fall back to identity
             // so guest-tests' MMU-off paths still work.
             let src_pa = guest_mem::translate_va(src_va).unwrap_or(src_va);
-            // BE-32 byte lane: read at `src_pa ^ 3` to land on the
-            // kernel's logical byte (see top-of-blit comment).
-            let byte = match guest_mem::read_byte_pa(src_pa ^ 3) {
+            // Read the kernel's logical byte at this PA. The XOR-3
+            // byte-lane transform is applied internally by
+            // `guest_endian::guest_read_u8_pa` (see top-of-blit
+            // comment).
+            let byte = match crate::guest_endian::guest_read_u8_pa(src_pa) {
                 Some(b) => b,
                 None => {
                     kprintln!(
@@ -345,7 +349,7 @@ fn read_word_or_halt(va: u32, what: &str, pc: u32) -> u32 {
     // VA-aware in MMU-on mode (Newton boot); identity in MMU-off mode
     // (guest tests) — `translate_va` returns None when SCTLR.M=0.
     let pa = guest_mem::translate_va(va).unwrap_or(va);
-    match guest_mem::read_word_pa(pa) {
+    match crate::guest_endian::guest_read_u32_pa(pa) {
         Some(v) => v,
         None => {
             kprintln!(

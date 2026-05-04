@@ -604,9 +604,9 @@ fn read_guest_word(addr: u32) -> Option<u32> {
             options(nomem, nostack, preserves_flags));
     }
     if sctlr & 1 != 0 {
-        guest_mem::read_word_va(addr)
+        crate::guest_endian::guest_read_u32_va(addr)
     } else {
-        guest_mem::read_word_pa(addr)
+        crate::guest_endian::guest_read_u32_pa(addr)
     }
 }
 
@@ -617,9 +617,9 @@ fn guest_write_word(addr: u32, value: u32) -> bool {
             options(nomem, nostack, preserves_flags));
     }
     if sctlr & 1 != 0 {
-        guest_mem::write_word_va(addr, value)
+        crate::guest_endian::guest_write_u32_va(addr, value)
     } else {
-        guest_mem::write_word_pa(addr, value)
+        crate::guest_endian::guest_write_u32_pa(addr, value)
     }
 }
 

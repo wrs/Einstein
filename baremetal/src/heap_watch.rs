@@ -117,7 +117,7 @@ impl Source {
 /// owner" links during normal operation, so they false-positive
 /// against working code.
 pub fn check_heap_sanity(heap_va: u32) -> Option<(&'static str, u32, u32)> {
-    let read = |off: u32| guest_mem::read_word_va(heap_va.wrapping_add(off));
+    let read = |off: u32| crate::guest_endian::guest_read_u32_va(heap_va.wrapping_add(off));
     let base = read(0)?;
     let want_base = heap_va.wrapping_sub(16);
     if base != want_base {
@@ -173,7 +173,7 @@ const PERM_FAULT_LOG_LIMIT: u32 = 256;
 fn log_stage1_walk(va: u32) {
     let l1_idx = (va >> 20) as usize;
     let l1_pa = 0x0400_0000u32 + (l1_idx as u32) * 4;
-    let l1 = match guest_mem::read_word_pa(l1_pa) {
+    let l1 = match crate::guest_endian::guest_read_u32_pa(l1_pa) {
         Some(v) => v,
         None => {
             kprintln!("    stage-1 walk VA={:#010x}: L1 read at PA={:#x} failed", va, l1_pa);
@@ -197,7 +197,7 @@ fn log_stage1_walk(va: u32) {
             let l2_pa_base = l1 & 0xFFFF_FC00;
             let l2_idx = (va >> 12) & 0xFF;
             let l2_addr = l2_pa_base + l2_idx * 4;
-            let l2 = match guest_mem::read_word_pa(l2_addr) {
+            let l2 = match crate::guest_endian::guest_read_u32_pa(l2_addr) {
                 Some(v) => v,
                 None => {
                     kprintln!(
@@ -243,7 +243,7 @@ pub fn count_va_aliases(target_pa: u32) -> u32 {
     let mut found: u32 = 0;
     for l1_idx in 0..4096u32 {
         let l1_pa = 0x0400_0000u32 + l1_idx * 4;
-        let l1 = match guest_mem::read_word_pa(l1_pa) {
+        let l1 = match crate::guest_endian::guest_read_u32_pa(l1_pa) {
             Some(v) => v,
             None => continue,
         };
@@ -259,7 +259,7 @@ pub fn count_va_aliases(target_pa: u32) -> u32 {
                 let l2_base = l1 & 0xFFFF_FC00;
                 for l2_idx in 0..256u32 {
                     let l2_pa = l2_base + l2_idx * 4;
-                    let l2 = match guest_mem::read_word_pa(l2_pa) {
+                    let l2 = match crate::guest_endian::guest_read_u32_pa(l2_pa) {
                         Some(v) => v,
                         None => continue,
                     };
@@ -298,7 +298,7 @@ pub fn enumerate_va_aliases(target_pa: u32, cap: u32) {
     let mut found: u32 = 0;
     for l1_idx in 0..4096u32 {
         let l1_pa = 0x0400_0000u32 + l1_idx * 4;
-        let l1 = match guest_mem::read_word_pa(l1_pa) {
+        let l1 = match crate::guest_endian::guest_read_u32_pa(l1_pa) {
             Some(v) => v,
             None => continue,
         };
@@ -325,7 +325,7 @@ pub fn enumerate_va_aliases(target_pa: u32, cap: u32) {
                 let l2_base = l1 & 0xFFFF_FC00;
                 for l2_idx in 0..256u32 {
                     let l2_pa = l2_base + l2_idx * 4;
-                    let l2 = match guest_mem::read_word_pa(l2_pa) {
+                    let l2 = match crate::guest_endian::guest_read_u32_pa(l2_pa) {
                         Some(v) => v,
                         None => continue,
                     };
@@ -628,7 +628,7 @@ pub fn sample(elr_el2: u64, source: Source, ctx: &TrapContext, spsr_el2: u64) {
     RING_SP[idx].store(sp_at_trap, Ordering::Relaxed);
     RING_MODE[idx].store(cpsr & 0x1F, Ordering::Relaxed);
 
-    let value = match guest_mem::read_word_va(WATCH_VA) {
+    let value = match crate::guest_endian::guest_read_u32_va(WATCH_VA) {
         Some(v) => v,
         None => return, // VA not mapped under current task — skip.
     };
@@ -713,7 +713,7 @@ pub fn sample(elr_el2: u64, source: Source, ctx: &TrapContext, spsr_el2: u64) {
         for off in (0..0x40u32).step_by(16) {
             let mut row = [0u32; 4];
             for i in 0..4u32 {
-                row[i as usize] = guest_mem::read_word_va(
+                row[i as usize] = crate::guest_endian::guest_read_u32_va(
                     WATCH_VA.wrapping_add(off + i * 4)
                 ).unwrap_or(0xDEADBEEF);
             }
@@ -779,9 +779,9 @@ pub fn sample(elr_el2: u64, source: Source, ctx: &TrapContext, spsr_el2: u64) {
         // that GetCurrentHeap returns. Helps confirm whether the
         // legitimate RelocHeap is still installed at the moment of
         // corruption.
-        if let Some(curr_task_globals) = guest_mem::read_word_va(0x0c10_105c) {
+        if let Some(curr_task_globals) = crate::guest_endian::guest_read_u32_va(0x0c10_105c) {
             let heap_slot_va = curr_task_globals.wrapping_sub(16);
-            let heap_ptr = guest_mem::read_word_va(heap_slot_va).unwrap_or(0);
+            let heap_ptr = crate::guest_endian::guest_read_u32_va(heap_slot_va).unwrap_or(0);
             kprintln!(
                 "    gCurrentTaskGlobals={:#010x}  task[-16](=heap)={:#010x}",
                 curr_task_globals, heap_ptr,

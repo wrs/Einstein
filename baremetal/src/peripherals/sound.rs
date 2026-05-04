@@ -70,8 +70,8 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
                 // VA write fails when the guest's stage-1 MMU is off
                 // (e.g. inside a guest test); fall back to a direct PA
                 // write so the caller still sees the populated struct.
-                if !crate::guest_mem::write_word_va(addr, val) {
-                    let _ = crate::guest_mem::write_word_pa(addr, val);
+                if !crate::guest_endian::guest_write_u32_va(addr, val) {
+                    let _ = crate::guest_endian::guest_write_u32_pa(addr, val);
                 }
             }
             ctx.x[0] = 0;

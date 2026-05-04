@@ -198,10 +198,10 @@ fn get_user_info(ctx: &mut TrapContext, pc: u32) {
 }
 
 fn write_guest_word(addr: u32, value: u32) -> bool {
-    if guest_mem::write_word_va(addr, value) {
+    if crate::guest_endian::guest_write_u32_va(addr, value) {
         return true;
     }
-    guest_mem::write_word_pa(addr, value)
+    crate::guest_endian::guest_write_u32_pa(addr, value)
 }
 
 fn read_guest_byte(addr: u32) -> Option<u8> {

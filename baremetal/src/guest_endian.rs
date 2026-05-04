@@ -1,0 +1,126 @@
+//! Byte-order-aware accessors for guest memory.
+//!
+//! This module is the single bottleneck through which the hypervisor
+//! reads and writes guest memory at the architectural level (i.e. as
+//! the guest CPU itself would see it via LDR/STR). Phase 1 of the
+//! BE-8 migration (`PLAN_BE8_MIGRATION.md`) introduces these helpers
+//! with **identity behavior**: every call delegates to the matching
+//! `guest_mem::*` accessor unchanged. Phase 2c flips the byte-order
+//! policy in this one file when the guest moves from "BE-32 word-
+//! invariant via load-time word swap" to "BE-8 (CPSR.E=1) data
+//! accesses".
+//!
+//! API contract — what the helpers *return / store*:
+//!
+//! - `guest_read_u32_*` / `guest_write_u32_*`: the value is the
+//!   Newton-side numerical value, i.e. interpreted big-endian
+//!   regardless of how the bytes are physically laid out in host
+//!   memory. A caller that wants "the u32 the BE-32 source code
+//!   reads through `LDR Rd, [Rm]`" gets exactly that.
+//! - `guest_read_u8_va` / `guest_read_u16_va`: the byte (halfword)
+//!   at the given guest *logical* address. Logical byte 0 of an
+//!   aligned u32 is the most-significant byte. Today this maps to
+//!   `host[va ^ 3]` (XOR-3 byte-lane transform under BE-32
+//!   word-invariant); after Phase 2 the CPU itself does the
+//!   byte-lane transform on every store, so logical byte 0 will
+//!   live at `host[va]` directly.
+//! - `guest_read_bytes_va`: copies a contiguous range in Newton-side
+//!   logical-byte order into `out`, so the buffer matches what the
+//!   BE-32 source code would see byte-by-byte.
+
+// Some helpers (notably the u8/u16 paths and guest_read_bytes_va) don't
+// have direct call sites today — they'll be picked up by Phase 4
+// diagnostics simplification and the new peripheral byte/halfword
+// splice. Suppress dead-code warnings during the migration.
+#![allow(dead_code)]
+
+use crate::guest_mem;
+
+/// Read a 32-bit word from a guest VA and return it as a Newton-side
+/// numerical value.
+///
+/// Phase 1: identity wrapper around `guest_mem::read_word_va`. Phase 2c
+/// will `swap_bytes()` the result before returning to compensate for
+/// the new BE-8 storage policy.
+pub fn guest_read_u32_va(va: u32) -> Option<u32> {
+    guest_mem::read_word_va(va)
+}
+
+/// Read a 32-bit word from a guest PA. See `guest_read_u32_va`.
+pub fn guest_read_u32_pa(pa: u32) -> Option<u32> {
+    guest_mem::read_word_pa(pa)
+}
+
+/// Write a 32-bit Newton-side numerical value to a guest VA.
+pub fn guest_write_u32_va(va: u32, value: u32) -> bool {
+    guest_mem::write_word_va(va, value)
+}
+
+/// Write a 32-bit Newton-side numerical value to a guest PA.
+pub fn guest_write_u32_pa(pa: u32, value: u32) -> bool {
+    guest_mem::write_word_pa(pa, value)
+}
+
+/// Read a single byte from a guest PA at the given Newton-side logical
+/// byte address. Today: `host[pa ^ 3]` (XOR-3 byte-lane transform).
+/// Phase 2c: `host[pa]` directly.
+pub fn guest_read_u8_pa(pa: u32) -> Option<u8> {
+    guest_mem::read_byte_pa(pa ^ 3)
+}
+
+/// Read a single byte from a guest VA at the given Newton-side logical
+/// byte address. Walks stage-1 to find the PA, then delegates.
+pub fn guest_read_u8_va(va: u32) -> Option<u8> {
+    let pa = guest_mem::translate_va(va).unwrap_or(va);
+    guest_read_u8_pa(pa)
+}
+
+/// Read a halfword from a guest PA at the given Newton-side logical
+/// halfword address. Today: `host[pa ^ 2]` (XOR-2 byte-lane transform).
+pub fn guest_read_u16_pa(pa: u32) -> Option<u16> {
+    guest_mem::read_halfword_pa(pa ^ 2)
+}
+
+/// Read a halfword from a guest VA at the given Newton-side logical
+/// halfword address.
+pub fn guest_read_u16_va(va: u32) -> Option<u16> {
+    let pa = guest_mem::translate_va(va).unwrap_or(va);
+    guest_read_u16_pa(pa)
+}
+
+/// Write a single byte to a guest PA at the given Newton-side logical
+/// byte address.
+pub fn guest_write_u8_pa(pa: u32, value: u8) -> bool {
+    guest_mem::write_byte_pa(pa ^ 3, value)
+}
+
+/// Write a halfword to a guest PA at the given Newton-side logical
+/// halfword address.
+pub fn guest_write_u16_pa(pa: u32, value: u16) -> bool {
+    guest_mem::write_halfword_pa(pa ^ 2, value)
+}
+
+/// Read a contiguous range of guest bytes in Newton-side logical-byte
+/// order into `out`. Stops short on the first failed VA→PA translation;
+/// returns the number of bytes actually written, or `None` if the very
+/// first word fails.
+///
+/// The range is read word-by-word and each word is reformatted via
+/// `to_be_bytes()` so the buffer mirrors the original on-disk byte
+/// order. A caller that wants to print a kernel string verbatim (or
+/// hash a binary blob) gets the bytes in their natural sequence.
+pub fn guest_read_bytes_va(addr: u32, out: &mut [u8]) -> Option<usize> {
+    let mut written = 0;
+    let mut cursor = addr;
+    while written + 4 <= out.len() {
+        let w = guest_read_u32_va(cursor).or_else(|| guest_read_u32_pa(cursor));
+        let w = match w {
+            Some(w) => w,
+            None => break,
+        };
+        out[written..written + 4].copy_from_slice(&w.to_be_bytes());
+        written += 4;
+        cursor = cursor.wrapping_add(4);
+    }
+    if written == 0 { None } else { Some(written) }
+}

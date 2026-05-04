@@ -363,10 +363,10 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
         static FIRED: core::sync::atomic::AtomicBool =
             core::sync::atomic::AtomicBool::new(false);
         if !FIRED.load(core::sync::atomic::Ordering::Relaxed) {
-            if let Some(v) = guest_mem::read_word_pa(0x0402_a250) {
+            if let Some(v) = crate::guest_endian::guest_read_u32_pa(0x0402_a250) {
                 if v == 0x6e65_7774 {
                     FIRED.store(true, core::sync::atomic::Ordering::Relaxed);
-                    let next_v = guest_mem::read_word_pa(0x0402_a254).unwrap_or(0);
+                    let next_v = crate::guest_endian::guest_read_u32_pa(0x0402_a254).unwrap_or(0);
                     kprintln!(
                         "*** newt-tripwire: PA 0x0402a250=0x{:08x} 0x0402a254=0x{:08x} at heartbeat ELR={:#x}",
                         v, next_v, elr
@@ -750,8 +750,8 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
         // e.g. the post-SearchFreeList halt at 0xf76368.
         for off in [-4i32, 0, 4, 8] {
             let addr = elr.wrapping_add(off as u32);
-            let via_va = guest_mem::read_word_va(addr).unwrap_or(0xDEADBEEF);
-            let via_pa = guest_mem::read_word_pa(addr).unwrap_or(0xDEADBEEF);
+            let via_va = crate::guest_endian::guest_read_u32_va(addr).unwrap_or(0xDEADBEEF);
+            let via_pa = crate::guest_endian::guest_read_u32_pa(addr).unwrap_or(0xDEADBEEF);
             kprintln!(
                 "           insn[pc{:+#3x}] @{:#010x} = via-va:{:#010x}  via-pa:{:#010x}",
                 off, addr, via_va, via_pa,
@@ -771,7 +771,7 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
             let slot_base = crate::shadow_stub::SBA_STUB_POOL_IPA
                 + slot_idx * crate::shadow_stub::SBA_STUB_BYTES;
             let back_branch_pa = slot_base.wrapping_add(14 * 4);
-            if let Some(insn) = guest_mem::read_word_pa(back_branch_pa) {
+            if let Some(insn) = crate::guest_endian::guest_read_u32_pa(back_branch_pa) {
                 // ARM A1 B encoding: cond=1110 1010 imm24
                 if (insn & 0x0F00_0000) == 0x0A00_0000 {
                     let imm24 = insn & 0x00FF_FFFF;
@@ -802,7 +802,7 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
         // base register so the table-pointer dereference is visible
         // even when the bad value was already overwritten in `ctx`.
         for off in 0..8u32 {
-            if let Some(w) = guest_mem::read_word_va(cur_sp.wrapping_add(off * 4)) {
+            if let Some(w) = crate::guest_endian::guest_read_u32_va(cur_sp.wrapping_add(off * 4)) {
                 kprintln!(
                     "           stack[sp+{:#04x}] @{:#010x} = {:#010x}",
                     off * 4, cur_sp.wrapping_add(off * 4), w
@@ -837,7 +837,7 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
 /// conditional encodings; LDM/STM, exclusives, and register-offset
 /// LDR/STR all return false on purpose so they keep halting.
 fn try_emulate_isv0_dabt(ctx: &mut TrapContext, ipa: u64, wnr: bool, elr: u32) -> bool {
-    let insn = match guest_mem::read_word_va(elr) {
+    let insn = match crate::guest_endian::guest_read_u32_va(elr) {
         Some(v) => v,
         None => return false,
     };
@@ -913,7 +913,7 @@ fn try_absorb_rom_write(ctx: &mut TrapContext, ipa: u64, elr: u32) -> bool {
     // `read_word_va` return None — fall back to a PA-direct read,
     // matching the architectural rule that VA == IPA == PA when the
     // MMU is disabled.
-    let insn = match guest_mem::read_word_va(elr).or_else(|| guest_mem::read_word_pa(elr)) {
+    let insn = match crate::guest_endian::guest_read_u32_va(elr).or_else(|| crate::guest_endian::guest_read_u32_pa(elr)) {
         Some(v) => v,
         None => return false,
     };
@@ -936,7 +936,7 @@ fn try_absorb_rom_write(ctx: &mut TrapContext, ipa: u64, elr: u32) -> bool {
             // Rd; `read_word_pa` already returns a u32 in the guest's
             // little-endian view (matches the BE→LE byteswap done at
             // ROM load time).
-            guest_mem::read_word_pa(pa).unwrap_or(0)
+            crate::guest_endian::guest_read_u32_pa(pa).unwrap_or(0)
         };
         ctx.x[rd] = value as u64;
         return true;
@@ -993,7 +993,7 @@ fn drop_flash_write(ctx: &mut TrapContext, iss: u32, elr: u32) -> bool {
 
     // ISV=0: writeback or unusual addressing. Decode the faulting
     // instruction enough to apply the writeback to Rn (if any).
-    let insn = match guest_mem::read_word_va(elr) {
+    let insn = match crate::guest_endian::guest_read_u32_va(elr) {
         Some(v) => v,
         None => return false,
     };
@@ -2309,7 +2309,7 @@ fn read_cstr_at(va: u32, max: usize) -> ([u8; 128], usize) {
         // word-granular in our helpers.
         let word_va = (va.wrapping_add(i as u32)) & !0x3;
         let off = ((va.wrapping_add(i as u32)) & 0x3) as usize;
-        let w = match guest_mem::read_word_va(word_va) {
+        let w = match crate::guest_endian::guest_read_u32_va(word_va) {
             Some(w) => w,
             None    => break,
         };
@@ -2441,7 +2441,7 @@ fn handle_unhandled_exception(ctx: &TrapContext, non_user: bool) -> ! {
     let r1 = ctx.x[1] as u32;
     let r2 = ctx.x[2] as u32;
     let r3 = ctx.x[3] as u32;
-    let trampoline_saved_spsr = guest_mem::read_word_pa(UND_SAVE_SPSR_IPA).unwrap_or(0);
+    let trampoline_saved_spsr = crate::guest_endian::guest_read_u32_pa(UND_SAVE_SPSR_IPA).unwrap_or(0);
     let true_source_mode = trampoline_saved_spsr & 0x1F;
     let true_caller_lr = crate::banked::lr_for_mode(ctx, trampoline_saved_spsr);
     let true_source_sp = crate::banked::sp_for_mode(ctx, trampoline_saved_spsr);
@@ -2461,7 +2461,7 @@ fn handle_unhandled_exception(ctx: &TrapContext, non_user: bool) -> ! {
         kprintln!("  exception data (r1) — first 8 words:");
         for i in 0..8 {
             let va = r1.wrapping_add(i * 4);
-            match guest_mem::read_word_va(va) {
+            match crate::guest_endian::guest_read_u32_va(va) {
                 Some(w) => kprintln!("    [{:+3}] @{:#010x} = {:#010x}", (i * 4) as i32, va, w),
                 None    => kprintln!("    [{:+3}] @{:#010x} = (unmapped)", (i * 4) as i32, va),
             }
@@ -2523,7 +2523,7 @@ fn handle_reboot(ctx: &TrapContext) -> ! {
     // the original caller's. The trampoline saves the source CPSR
     // to UND_SAVE_SPSR_IPA. Read it to recover the actual caller
     // mode and banked LR.
-    let trampoline_saved_spsr = guest_mem::read_word_pa(UND_SAVE_SPSR_IPA).unwrap_or(0);
+    let trampoline_saved_spsr = crate::guest_endian::guest_read_u32_pa(UND_SAVE_SPSR_IPA).unwrap_or(0);
     let true_source_mode = (trampoline_saved_spsr & 0x1F) as u32;
     let true_caller_lr = crate::banked::lr_for_mode(ctx, trampoline_saved_spsr);
     kprintln!();
@@ -2551,7 +2551,7 @@ fn handle_reboot(ctx: &TrapContext) -> ! {
     kprintln!("  TRUE source-mode stack (16 words from {:#010x}):", true_source_sp);
     for i in 0..16 {
         let va = true_source_sp.wrapping_add(i * 4);
-        match guest_mem::read_word_va(va) {
+        match crate::guest_endian::guest_read_u32_va(va) {
             Some(w) => kprintln!("    [{:+3}] @{:#010x} = {:#010x}", (i * 4) as i32, va, w),
             None    => kprintln!("    [{:+3}] @{:#010x} = (unmapped)", (i * 4) as i32, va),
         }
@@ -2566,7 +2566,7 @@ fn handle_reboot(ctx: &TrapContext) -> ! {
         kprintln!("  SP_und stack (16 words from ctx.x[23]={:#010x}):", sp_und);
         for i in 0..16 {
             let va = sp_und.wrapping_add(i * 4);
-            match guest_mem::read_word_va(va) {
+            match crate::guest_endian::guest_read_u32_va(va) {
                 Some(w) => kprintln!("    [{:+3}] @{:#010x} = {:#010x}", (i * 4) as i32, va, w),
                 None    => kprintln!("    [{:+3}] @{:#010x} = (unmapped)", (i * 4) as i32, va),
             }
@@ -2579,7 +2579,7 @@ fn handle_reboot(ctx: &TrapContext) -> ! {
         kprintln!("  Exception-descriptor candidate at R0={:#010x}:", r0);
         for i in 0..8 {
             let va = r0.wrapping_add(i * 4);
-            match guest_mem::read_word_va(va) {
+            match crate::guest_endian::guest_read_u32_va(va) {
                 Some(w) => kprintln!("    [{:+3}] @{:#010x} = {:#010x}", (i * 4) as i32, va, w),
                 None    => kprintln!("    [{:+3}] @{:#010x} = (unmapped)", (i * 4) as i32, va),
             }
@@ -2635,15 +2635,15 @@ fn handle_reboot(ctx: &TrapContext) -> ! {
         // gKernelGlobals at 0x0c100ff8 → walk through stage-1 to find PA.
         let gkg_va: u32 = 0x0c10_0ff8;
         if let Some(gkg_pa) = guest_mem::translate_va(gkg_va) {
-            if let Some(gkg) = guest_mem::read_word_pa(gkg_pa) {
+            if let Some(gkg) = crate::guest_endian::guest_read_u32_pa(gkg_pa) {
                 kprintln!(
                     "  gKernelGlobals @VA={:#x} PA={:#x} = {:#010x}",
                     gkg_va, gkg_pa, gkg
                 );
                 if let Some(gkg_pa2) = guest_mem::translate_va(gkg) {
-                    let m74 = guest_mem::read_word_pa(gkg_pa2 + 0x74).unwrap_or(0xDEAD);
-                    let m78 = guest_mem::read_word_pa(gkg_pa2 + 0x78).unwrap_or(0xDEAD);
-                    let m7c = guest_mem::read_word_pa(gkg_pa2 + 0x7c).unwrap_or(0xDEAD);
+                    let m74 = crate::guest_endian::guest_read_u32_pa(gkg_pa2 + 0x74).unwrap_or(0xDEAD);
+                    let m78 = crate::guest_endian::guest_read_u32_pa(gkg_pa2 + 0x78).unwrap_or(0xDEAD);
+                    let m7c = crate::guest_endian::guest_read_u32_pa(gkg_pa2 + 0x7c).unwrap_or(0xDEAD);
                     kprintln!(
                         "  task @VA={:#x} PA={:#x} ->[0x74]={:#010x} ->[0x78]={:#010x} ->[0x7c]={:#010x}",
                         gkg, gkg_pa2, m74, m78, m7c
@@ -2652,7 +2652,7 @@ fn handle_reboot(ctx: &TrapContext) -> ! {
                     for (off, val) in [(0x74, m74), (0x78, m78), (0x7c, m7c)] {
                         if val != 0 {
                             if let Some(pa) = guest_mem::translate_va(val) {
-                                let bm = guest_mem::read_word_pa(pa + 0x10).unwrap_or(0xDEAD);
+                                let bm = crate::guest_endian::guest_read_u32_pa(pa + 0x10).unwrap_or(0xDEAD);
                                 kprintln!(
                                     "    monitor[+{:#x}] @VA={:#x} PA={:#x} ->[0x10]={:#010x} (fault-bitmask)",
                                     off, val, pa, bm
@@ -2700,7 +2700,7 @@ fn handle_remember_swiret_probe_with(ctx: &mut TrapContext) {
 }
 
 fn handle_dah_mrs_spsr_patch(ctx: &mut TrapContext) {
-    let spsr_abt_save = guest_mem::read_word_pa(
+    let spsr_abt_save = crate::guest_endian::guest_read_u32_pa(
         guest_mem::DABT_SAVE_PA + 8,
     ).unwrap_or(0);
     let r1_in = ctx.x[1] as u32;
@@ -2792,17 +2792,17 @@ fn handle_fme_entry_probe(ctx: &mut TrapContext) {
     let spsr_el2 = read_sysreg!("spsr_el2") as u32;
     let src_mode = spsr_el2 & 0x1F;
     let sp_src = crate::banked::sp_for_mode(ctx, spsr_el2);
-    let curr_task = guest_mem::read_word_va(
+    let curr_task = crate::guest_endian::guest_read_u32_va(
         crate::rom_patches::G_KERNEL_GLOBALS_VA,
     ).unwrap_or(0);
     let task_64 = if curr_task != 0 {
-        guest_mem::read_word_va(curr_task.wrapping_add(0x64)).unwrap_or(0)
+        crate::guest_endian::guest_read_u32_va(curr_task.wrapping_add(0x64)).unwrap_or(0)
     } else { 0 };
     let task_70 = if curr_task != 0 {
-        guest_mem::read_word_va(curr_task.wrapping_add(0x70)).unwrap_or(0)
+        crate::guest_endian::guest_read_u32_va(curr_task.wrapping_add(0x70)).unwrap_or(0)
     } else { 0 };
     let task_58 = if curr_task != 0 {
-        guest_mem::read_word_va(curr_task.wrapping_add(0x58)).unwrap_or(0)
+        crate::guest_endian::guest_read_u32_va(curr_task.wrapping_add(0x58)).unwrap_or(0)
     } else { 0 };
     static FIRED: core::sync::atomic::AtomicU32 =
         core::sync::atomic::AtomicU32::new(0);
@@ -2826,24 +2826,24 @@ fn handle_fme_entry_probe(ctx: &mut TrapContext) {
 fn handle_dah_or_chain_probe(ctx: &mut TrapContext) {
     let far = read_sysreg!("far_el1") as u32;
     let g_kernel_globals_va = crate::rom_patches::G_KERNEL_GLOBALS_VA;
-    let curr_task = guest_mem::read_word_va(g_kernel_globals_va).unwrap_or(0);
+    let curr_task = crate::guest_endian::guest_read_u32_va(g_kernel_globals_va).unwrap_or(0);
     let m74 = if curr_task != 0 {
-        guest_mem::read_word_va(curr_task.wrapping_add(0x74)).unwrap_or(0)
+        crate::guest_endian::guest_read_u32_va(curr_task.wrapping_add(0x74)).unwrap_or(0)
     } else { 0 };
     let m78 = if curr_task != 0 {
-        guest_mem::read_word_va(curr_task.wrapping_add(0x78)).unwrap_or(0)
+        crate::guest_endian::guest_read_u32_va(curr_task.wrapping_add(0x78)).unwrap_or(0)
     } else { 0 };
     let m7c = if curr_task != 0 {
-        guest_mem::read_word_va(curr_task.wrapping_add(0x7c)).unwrap_or(0)
+        crate::guest_endian::guest_read_u32_va(curr_task.wrapping_add(0x7c)).unwrap_or(0)
     } else { 0 };
     let m74_10 = if m74 != 0 {
-        guest_mem::read_word_va(m74.wrapping_add(0x10)).unwrap_or(0)
+        crate::guest_endian::guest_read_u32_va(m74.wrapping_add(0x10)).unwrap_or(0)
     } else { 0 };
     let m78_10 = if m78 != 0 {
-        guest_mem::read_word_va(m78.wrapping_add(0x10)).unwrap_or(0)
+        crate::guest_endian::guest_read_u32_va(m78.wrapping_add(0x10)).unwrap_or(0)
     } else { 0 };
     let m7c_10 = if m7c != 0 {
-        guest_mem::read_word_va(m7c.wrapping_add(0x10)).unwrap_or(0)
+        crate::guest_endian::guest_read_u32_va(m7c.wrapping_add(0x10)).unwrap_or(0)
     } else { 0 };
     static FIRED: core::sync::atomic::AtomicU32 =
         core::sync::atomic::AtomicU32::new(0);
@@ -2935,7 +2935,7 @@ fn handle_diag(ctx: &mut TrapContext) {
             // valid-domain DFSCs (the bits already match).
             if dfsc == 0x05 || dfsc == 0x07 || dfsc == 0x0D || dfsc == 0x0F {
                 let l1_pa = 0x0400_0000u32 + ((far as u32) >> 20) * 4;
-                let l1 = guest_mem::read_word_pa(l1_pa).unwrap_or(0);
+                let l1 = crate::guest_endian::guest_read_u32_pa(l1_pa).unwrap_or(0);
                 let l1_domain = (l1 >> 5) & 0xF;
                 let mut dfsr_el1: u64;
                 // SAFETY: sysreg read of DFSR_EL1 (= ESR_EL1's AArch32
@@ -3114,7 +3114,7 @@ fn handle_diag(ctx: &mut TrapContext) {
     // from PABT today (line 801 of guest_mem.rs patches PABT vector),
     // so use the PABT formula (LR-4 ARM, LR-2 Thumb).
     let faulting_pc = if thumb { lr_src.wrapping_sub(2) & !1 } else { lr_src.wrapping_sub(4) };
-    let insn = guest_mem::read_word_pa(faulting_pc & !3).unwrap_or(0xDEAD_BEEF);
+    let insn = crate::guest_endian::guest_read_u32_pa(faulting_pc & !3).unwrap_or(0xDEAD_BEEF);
     kprintln!(
         "  HVC source mode = {:#x} ({}); pre-fault mode (from SPSR_<src>) = {:#x} ({}), T={}",
         hvc_src_mode, mode_name,
@@ -3130,9 +3130,9 @@ fn handle_diag(ctx: &mut TrapContext) {
     // fast path. Print those too so any divergence between the
     // X-register view and the trampoline-stash view is visible at a
     // glance.
-    let lr_abt_save = guest_mem::read_word_pa(guest_mem::DABT_SAVE_PA).unwrap_or(0);
-    let sp_abt_save = guest_mem::read_word_pa(guest_mem::DABT_SAVE_PA + 4).unwrap_or(0);
-    let spsr_abt_save = guest_mem::read_word_pa(guest_mem::DABT_SAVE_PA + 8).unwrap_or(0);
+    let lr_abt_save = crate::guest_endian::guest_read_u32_pa(guest_mem::DABT_SAVE_PA).unwrap_or(0);
+    let sp_abt_save = crate::guest_endian::guest_read_u32_pa(guest_mem::DABT_SAVE_PA + 4).unwrap_or(0);
+    let spsr_abt_save = crate::guest_endian::guest_read_u32_pa(guest_mem::DABT_SAVE_PA + 8).unwrap_or(0);
     kprintln!(
         "  DABT-trampoline stash (cross-check):  LR_abt={:#010x} SP_abt={:#010x} SPSR_abt={:#010x}",
         lr_abt_save, sp_abt_save, spsr_abt_save
@@ -3173,13 +3173,13 @@ fn handle_diag(ctx: &mut TrapContext) {
         let pa_opt = guest_translate_va(va);
         if pa_opt.is_none() { continue; }
         let pa = pa_opt.unwrap();
-        let w = match guest_mem::read_word_pa(pa) {
+        let w = match crate::guest_endian::guest_read_u32_pa(pa) {
             Some(x) => x, None => continue,
         };
         let tgt = w & !1;
         if tgt == 0 || tgt >= 0x0100_0000 { continue; }
         if tgt & 3 != 0 { continue; }
-        if let Some(prev) = guest_mem::read_word_pa(tgt.wrapping_sub(4)) {
+        if let Some(prev) = crate::guest_endian::guest_read_u32_pa(tgt.wrapping_sub(4)) {
             let is_bl = ((prev >> 24) & 0xF) == 0xB;       // BL (unconditional)
             let is_blx_imm = ((prev >> 25) & 0x7F) == 0x7D; // BLX imm (v5+)
             if is_bl || is_blx_imm {
@@ -3204,14 +3204,14 @@ pub fn guest_translate_va(va: u32) -> Option<u32> {
     // Assume TTBR0 = 0x04000000 (per probe findings) and walk the
     // short-descriptor tables via guest_mem's PA accessors.
     let l1_idx = (va >> 20) as usize;
-    let l1_entry = guest_mem::read_word_pa(0x0400_0000 + (l1_idx as u32) * 4)?;
+    let l1_entry = crate::guest_endian::guest_read_u32_pa(0x0400_0000 + (l1_idx as u32) * 4)?;
     let ty = l1_entry & 3;
     match ty {
         2 => Some((l1_entry & 0xFFF0_0000) | (va & 0x000F_FFFF)),
         1 => {
             let l2_pa = l1_entry & 0xFFFF_FC00;
             let l2_idx = (va >> 12) & 0xFF;
-            let l2_entry = guest_mem::read_word_pa(l2_pa + l2_idx * 4)?;
+            let l2_entry = crate::guest_endian::guest_read_u32_pa(l2_pa + l2_idx * 4)?;
             match l2_entry & 3 {
                 1 => Some((l2_entry & 0xFFFF_0000) | (va & 0x0000_FFFF)),
                 2 | 3 => Some((l2_entry & 0xFFFF_F000) | (va & 0x0000_0FFF)),
@@ -3459,7 +3459,7 @@ pub(crate) fn return_to_guest_from_und(_ctx: &mut TrapContext, elr: u64, _spsr: 
 }
 
 // Guest-PA memory accessors live in guest_mem; this was an earlier
-// in-module stub. Use `guest_mem::read_word_pa` etc. directly.
+// in-module stub. Use `crate::guest_endian::guest_read_u32_pa` etc. directly.
 use guest_mem::{read_byte_pa as read_guest_byte_pa,
                 read_word_pa as read_guest_word_pa,
                 write_byte_pa as write_guest_byte_pa,
@@ -3483,7 +3483,7 @@ fn log_dabt_forward(dfsc: u32, far: u32, mode: u32, ctx: &TrapContext) {
     // for `mrs` from EL2). The trampoline writes the slot before any
     // kernel code runs, so the slot is the architecturally-correct
     // pre-abt CPSR.
-    let spsr_abt_save = guest_mem::read_word_pa(guest_mem::DABT_SAVE_PA + 8).unwrap_or(0);
+    let spsr_abt_save = crate::guest_endian::guest_read_u32_pa(guest_mem::DABT_SAVE_PA + 8).unwrap_or(0);
     let pre_abt_mode_save = spsr_abt_save & 0x1F;
     const SEEN_CAP: usize = 16;
     static mut SEEN: [(u32, u32, u32); SEEN_CAP] = [(0, 0, 0); SEEN_CAP];
@@ -3561,7 +3561,7 @@ fn log_dabt_forward(dfsc: u32, far: u32, mode: u32, ctx: &TrapContext) {
             let slot_base = crate::shadow_stub::SBA_STUB_POOL_IPA
                 + slot_idx * crate::shadow_stub::SBA_STUB_BYTES;
             let back_branch_pa = slot_base.wrapping_add(14 * 4);
-            if let Some(insn) = guest_mem::read_word_pa(back_branch_pa) {
+            if let Some(insn) = crate::guest_endian::guest_read_u32_pa(back_branch_pa) {
                 if (insn & 0x0F00_0000) == 0x0A00_0000 {
                     let imm24 = insn & 0x00FF_FFFF;
                     let signed = if imm24 & 0x0080_0000 != 0 {
@@ -4370,7 +4370,7 @@ fn handle_unknown(iss: u32) -> ! {
     kprintln!();
     kprintln!("*** EC=0 'unknown' trap halted (no silent skip per Phase A) ***");
     kprintln!("  ELR={:#x}  SPSR={:#x}  ISS={:#x}", elr, spsr, iss);
-    if let Some(w) = guest_mem::read_word_pa(elr as u32) {
+    if let Some(w) = crate::guest_endian::guest_read_u32_pa(elr as u32) {
         kprintln!("  insn at ELR = {:#010x}", w);
     }
     cpu::halt();

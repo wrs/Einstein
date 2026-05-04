@@ -88,7 +88,7 @@ fn check_snapshot_diff() {
     let mut new_words = [0u32; SNAPSHOT_WORDS];
     for i in 0..SNAPSHOT_WORDS {
         let pa = armed + SNAPSHOT_BASE_OFFSET + (i as u32) * 4;
-        let v = crate::guest_mem::read_word_pa(pa).unwrap_or(0xDEAD_BEEF);
+        let v = crate::guest_endian::guest_read_u32_pa(pa).unwrap_or(0xDEAD_BEEF);
         new_words[i] = v;
         let prev = SNAPSHOT[i].load(Ordering::Relaxed);
         if prev != v {
@@ -201,7 +201,7 @@ pub unsafe fn arm_at_boot() {
         KNOWN_TARGET_PA);
     for i in 0..SNAPSHOT_WORDS {
         let pa = KNOWN_TARGET_PA + SNAPSHOT_BASE_OFFSET + (i as u32) * 4;
-        let v = crate::guest_mem::read_word_pa(pa).unwrap_or(0xDEAD_BEEF);
+        let v = crate::guest_endian::guest_read_u32_pa(pa).unwrap_or(0xDEAD_BEEF);
         kprintln!("    +{:#x}: {:#010x}",
             SNAPSHOT_BASE_OFFSET + (i as u32) * 4, v);
         SNAPSHOT[i].store(v, Ordering::Relaxed);

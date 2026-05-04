@@ -18,28 +18,66 @@ Bloated PLAN.md wastes context every read.
   functionality (not merely diagnostics):
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-95 follow-up):** boot now reaches a *new* class
-of classifier-coverage gap. The kernel calls into PA 0x7a56cc — a
-real init helper (function prologue `mov ip, sp; push {fp, ip, lr,
-pc}; sub fp, ip, #4; ...; mov r2, #0x13000; ldr r1, [pc, #4]; bl
-0x7a56f8`) that registers `gROMPublicJumpTable` (PA 0x13000) under
-the magic tag 'lcdd'. The CPU UNDs at PC 0x7a56e4 because
-classify-rom marks none of PA 0x7a56cc..0x7a56f0 as code, so the
-BE-8 atomic flip leaves the bytes in BE order; CPU LE-fetch reads
-0x132aa0e3 (NE-TEQ-without-S, ARMv7+ UND) instead of `mov r2,
-#0x13000`. The function isn't reached by any walker pass: no
-`B 0x007a56cc` exists; the literal `0x007a56cc` doesn't appear as a
-4-byte BE word anywhere in ROM; the surrounding TClassInfo
-trampolines (PA 0x7a563c / 0x7a57ec) describe 60-byte structs that
-don't span this range. The kernel must reach it through an indirect
-mechanism we haven't characterised yet — likely a high-VA alias
-(the secondary jumptable's `B 0xff1936cc` chain maps somewhere into
-PA 0x7a5xxx via a stage-1 mapping we haven't decoded). Two paths
-forward: (a) characterise the 0xff1xxxxx → PA 0x7a5xxx alias and add
-a third resolver to classify-rom; (b) extend the
-`collect_classinfo_roots` heuristic to walk past the 60-byte struct
-when adjacent functions are tightly packed against it. Pick once
-the alias mechanism is clearer.
+**Current goal (iter-96 follow-up):** make the classifier walker
+treat `cur` as a runtime VA throughout, with a single VA→PA
+translation step at the top of the inner loop that consults all the
+in-ROM L2 page tables (patch-table family, gROMPublicJumpTable-
+PageTable, secondary-jt L2). Once that's in place the roots become a
+union of:
+  1. The full named-symbol list from `_Data_/symbols.txt` (lifting
+     the `addr >= 0x01000000` filter in `classify-symbols.py` for
+     entries whose VA falls inside a known JT range).
+  2. Every B-AL thunk VA enumerated by walking each in-ROM L2 (the
+     unnamed thunks symbols.txt doesn't cover).
+With VA-aware decoding `step()` computes B targets against the kernel's
+runtime PC, so the walker resolves through chained thunks (gROM-
+PublicJumpTable → patch-table → final ROM PA) without any pre-mark.
+Indirect-target passes (vtable, fnptr-literal, B-run dispatch, etc.)
+push the discovered VA — not the resolved PA — so the walker handles
+thunk decoding itself instead of side-stepping it. Open question: an
+earlier attempt at the restructure expanded reach from ~880K to
+~3.3M words and regressed the boot at MakePrimaryMMUTable
+(PC=0x459dc) when the kernel reads bytes we now mark as code as
+data; isolating that conflict and patching the kernel side is part
+of iter-97.
+
+### Iteration 96: pre-mark patch-table + gROMPublicJumpTable thunks via L2 walk
+
+Goal was to extend classify-rom so the BE-8 atomic flip's load-time
+byteswap covers every B-thunk the kernel branches through, including
+gROMPublicJumpTable (PA 0x13000..0x15FFF) and its sibling thunk
+pages (PA 0x1B000..0x21FFF) that share gROMPublicJumpTablePageTable's
+L2 (PA 0x18000) with a few pages of kernel-managed page-table data.
+
+Approach: add a pre-walk pass that walks each in-ROM L2 page table
+(`gROMPatchTablePageTable` family at PA 0x16000/16400/16800,
+`gROMPublicJumpTablePageTable` at PA 0x18000), filters target pages
+by shape (top byte 0xEA on the first 16 words = `B AL`), and pre-
+marks the leading B-AL run inside each thunk page. Stop-at-first-non-
+B-AL keeps real-code roots from being shadowed where pages mix a
+thunk run with kernel-code function bodies (PA 0x21000 has 270
+thunks then `TADC` method bodies starting at PA 0x21438).
+
+Result:
+- All 16919 patch-table thunk words (covers the full 17 buckets via
+  the family's three live L2s).
+- 12433 thunk words across gROMPublicJumpTable + the 7 sibling thunk
+  pages mapped by gROMPublicJumpTablePageTable.
+- GetSample's tail (PA 0x22000..0x22064) reaches via natural walker
+  control flow now that the per-word stop-at-first-non-B-AL no
+  longer marks the function-body B instructions inside the page.
+- `byte-access-static` 27750 (matches iter-95's 27749 baseline).
+- Boot reaches the same wedge as iter-95 (PC=0x7a56e4); 36/36 guest
+  tests pass.
+
+Limitation acknowledged: pre-marking is a workaround for the walker's
+PC=PA assumption. The cleaner design is to make the walker treat
+`cur` as a VA and translate via the in-ROM L2s on every step, with
+roots seeded from `symbols.txt` plus a per-L2 enumeration of the
+unnamed thunks the symbol list doesn't carry. A first attempt at
+that restructure ballooned reach from ~880K to ~3.3M words and
+regressed the boot — tracking down the data conflict is iter-97
+work.
 
 ### Iteration 95: classifier resolves secondary jump-table aliasing (BE-8 follow-up)
 
@@ -70,52 +108,7 @@ at PA 0x7a56cc..0x7a56f0 that the walker doesn't reach via any
 existing pass (no direct B/BL, no PA literal, no surrounding
 TClassInfo trampoline includes it). 36/36 guest tests pass.
 
-### Iteration 94: classifier follows patch-table thunks (BE-8 follow-up)
-
-iter-93 cleared the byteswap of guest page-table accesses, tick page,
-and flash seed — boot reached `InitCGlobals+0x18c → ReserveContiguous-
-Memory` and tripped a kernel-side DABT at FAR=0xfef80150 inside the
-kernel's own DataAbortHandler. Diagnosis: the faulting PC was
-0x01a68430 — a post-ship patch-table thunk slot for
-`ReleaseIRQTimer`. The classifier's walker had `resolve_jt_va` follow
-patch-table VAs (0x01A00000..0x01C20000) directly to the real ROM
-target *and skip the thunk slot itself*, so all 16920 B-thunk words at
-PA 0x02000..0x12860 stayed unmarked in `reach.bitmap`. The BE-8
-atomic flip's load-time byteswap is gated on that bitmap; thunks left
-unmarked stayed in BE byte order in physical memory; the CPU's LE
-instruction fetch then decoded each thunk as a misaligned coprocessor
-/ data-processing instruction, the kernel's `B FindHighROMProtocol`
-thunk drifted into garbage, and downstream behaviour produced the
-spurious DABT.
-
-Fix in `tools/classify-rom`: `resolve_target_to_rom` now returns the
-*thunk* PA for patch-table VA targets (instead of resolving to the
-final-target PA via `resolve_jt_va`). The walker's `Step::Continue` /
-`Step::Jump` arms push that thunk PA into the worklist, which causes
-the walker to visit the thunk word, set its reach bit, and then
-follow the B naturally — landing at the same final target it would
-have reached via the old shortcut. Net effect: 14507/16920 patch-table
-thunks now classified as code (vs 3 before); the load-time byteswap
-covers them; the CPU fetches valid B instructions. The unreached
-remainder is genuinely-unused slots — the classifier remains purely
-root-driven.
-
-`handle_und` in `src/trap.rs` also got a small upgrade: the failing
-read of the faulting instruction falls back to a stage-1-walked
-`guest_endian::guest_read_u32_va` so the diagnostic picks up bytes
-from the actual backing PA when the kernel has set up an aliasing L2
-entry (e.g. VA 0x01E00010 → PA 0x7EE010). On a halt we also dump the
-stage-1 walk for the faulting PC.
-
-Result: cold boot now runs ~1170 log lines (up from 1103); past the
-`ReserveContiguousMemory` deep-toast alert, through the
-`gROMPublicJumpTable` aliasing setup, through 22 unaligned-LDR
-faults from `TPrivatePackageIterator`. Wedges next on a *secondary*
-jump-table at VA 0x01E00010 (PA 0x7EE000..0x7EE048) that uses an L2
-aliasing scheme `jt_va_to_phys` doesn't yet handle — that's the
-iter-95 follow-up. 36/36 guest tests pass.
-
-<!-- Older iteration retrospectives (iter-93 and earlier) live in
+<!-- Older iteration retrospectives (iter-94 and earlier) live in
      `git log` per the auto-prune maintenance note. -->
 <!-- iter-90 deferred shadow_stub deletion: still gated off
      (`patch_rom_from_bitmap` no longer called from `main.rs`); full

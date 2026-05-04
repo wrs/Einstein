@@ -276,6 +276,73 @@ fn rex_header_roots(words: &[u32]) -> Vec<u32> {
     out
 }
 
+/// True iff every one of the first 16 words at `page_pa` looks like a
+/// `B AL` thunk (top byte 0xea = cond=AL, B-AL no-link). The Newton
+/// jump-table thunk pages are uniformly filled with B-thunks — checking
+/// 16 in a row is a confident shape match while still cheap; any
+/// page-table or data page will fail this test on the first word.
+fn page_is_thunk_shaped(words: &[u32], page_pa: u32) -> bool {
+    if (page_pa as usize) + 16 * 4 > ROM_SIZE_BYTES { return false; }
+    for i in 0..16 {
+        let w = words[((page_pa >> 2) + i) as usize];
+        if (w >> 24) != 0xEA { return false; }
+    }
+    true
+}
+
+/// Mark every B-AL thunk word inside thunk-shaped pages mapped by the
+/// in-ROM L2 at `l2_pa` as reachable code. Pre-marking is currently
+/// the right tool here because the walker decodes B targets against
+/// `cur=PA`, and for thunk pages the runtime VA differs from the PA —
+/// the walker would chase wrong targets (gROMPublicJumpTable thunks
+/// PA-decode into SYM-table data, patch-table thunks PA-decode into
+/// kernel-VA space) and either mis-classify data as code or break.
+/// Pre-marking sidesteps this until the walker plumbs runtime VA
+/// through (iter-97 work).
+///
+/// Per-word, stop-at-first-non-B-AL: pages mixing thunks at the start
+/// with real code at the tail (PA 0x21000 has 270 thunks then TADC
+/// method bodies at PA 0x21438+) get only the thunk run pre-marked,
+/// leaving the code-body roots free to walk via control flow without
+/// being shadowed.
+fn mark_thunk_pages_via_l2(
+    words: &[u32],
+    reach: &mut Bitmap,
+    l2_pa: u32,
+    label: &str,
+) -> usize {
+    let mut seen_pages: HashSet<u32> = HashSet::new();
+    let mut marked_pages = 0usize;
+    let mut marked_words = 0usize;
+    if (l2_pa as usize) + 256 * 4 > ROM_SIZE_BYTES {
+        eprintln!("  jt-thunk-pages [{}]: l2_pa=0x{:x} out of ROM range", label, l2_pa);
+        return 0;
+    }
+    for entry_idx in 0..256u32 {
+        let entry_pa = l2_pa + entry_idx * 4;
+        let entry = words[(entry_pa >> 2) as usize];
+        if (entry & 0b10) != 0b10 { continue; }
+        let page_pa = entry & 0xFFFF_F000;
+        if !seen_pages.insert(page_pa) { continue; }
+        if !page_is_thunk_shaped(words, page_pa) { continue; }
+        marked_pages += 1;
+        for w in 0..1024u32 {
+            let thunk_pa = page_pa + w * 4;
+            if (thunk_pa as usize) + 4 > ROM_SIZE_BYTES { break; }
+            let insn = words[(thunk_pa >> 2) as usize];
+            if (insn >> 24) != 0xEA { break; }
+            reach.set_word(thunk_pa);
+            marked_words += 1;
+        }
+    }
+    eprintln!(
+        "  jt-thunk-pages [{}]: l2_pa=0x{:x}  pages={}, words={}",
+        label, l2_pa, marked_pages, marked_words,
+    );
+    marked_words
+}
+
+
 /// True iff `w` looks like the first instruction of a function entry —
 /// any AL-cond word (top nibble 0xE) decoding as a known ARM
 /// instruction class. Used by indirect-target recovery (function-
@@ -495,34 +562,48 @@ fn secondary_jt_va_to_phys(words: &[u32], va: u32) -> Option<u32> {
     Some(pa)
 }
 
-/// Normalise a branch / function-pointer target to the in-ROM PA the
-/// walker should add as a root. Returns `Some(pa)` for direct ROM-PA
-/// targets, or the *thunk* PA for VAs that resolve through one of the
-/// kernel's known stage-1 aliases (post-ship patch table, secondary
-/// jump-table). Returns `None` for arbitrary out-of-ROM addresses.
+/// Translate a VA in the gROMPublicJumpTable window (1 MiB at
+/// 0x01800000) to a ROM PA via `gROMPublicJumpTablePageTable` (PA
+/// 0x18000). The kernel installs this L2 at L1[0x18] inside
+/// `BuildPatchTablePageTable` (PA 0x183230) so a branch through
+/// VA 0x0180xxxx fetches a thunk word from PA 0x13000+ (= the
+/// gROMPublicJumpTable backing) — same idiom as the secondary
+/// jump-table.
 ///
-/// Returning the thunk PA — rather than the resolved final-target PA
-/// `resolve_jt_va` produces — lets the walker visit the thunk's B
-/// instruction directly, mark it as reached, and naturally follow the
-/// B to the final target. The reach bit on the thunk is load-bearing
-/// under BE-8: the loader byteswaps every "code" word so the CPU's LE
-/// instruction fetch decodes the original BE numerical encoding; if
-/// the thunk is left as data, the kernel's branch through the
-/// patch-table VA fetches a byteswapped (garbage) instruction and
-/// either UND-faults or drifts into invalid behaviour.
-///
-/// Prologue-shape checks at thunk PAs accept B-AL via
-/// `is_known_function_start`, so callers that gate worklist pushes on
-/// `is_known_function_start(words[pa>>2])` keep working.
+/// The B encoded in each thunk targets a patch-table VA when
+/// decoded against this section's runtime PC, which then resolves
+/// via `resolve_jt_va` to a real ROM function. Callers chain the
+/// resolution through `resolve_target_to_rom`.
+const PUBLIC_JT_VA_BASE: u32 = 0x0180_0000;
+const PUBLIC_JT_VA_END:  u32 = 0x0190_0000;
+const PUBLIC_JT_L2_PA:   u32 = 0x0001_8000;
+fn public_jt_va_to_phys(words: &[u32], va: u32) -> Option<u32> {
+    if va < PUBLIC_JT_VA_BASE || va >= PUBLIC_JT_VA_END { return None; }
+    let l2_idx = (va >> 12) & 0xFF;
+    let entry_pa = PUBLIC_JT_L2_PA + l2_idx * 4;
+    if (entry_pa as usize) + 4 > ROM_SIZE_BYTES { return None; }
+    let entry = words[(entry_pa >> 2) as usize];
+    if (entry & 0b10) != 0b10 { return None; }
+    let page_pa = entry & 0xFFFF_F000;
+    let pa = page_pa | (va & 0xFFF);
+    if (pa as usize) + 4 > ROM_SIZE_BYTES { return None; }
+    Some(pa)
+}
+
+
+/// Resolve a branch / function-pointer target to its in-ROM PA.
+/// Returns the final function PA for direct ROM-PA targets, the thunk
+/// PA for patch-table VAs (so callers like the walker can step the B
+/// against the runtime VA themselves), or `None` for unresolvable
+/// kernel-VA targets.
 fn resolve_target_to_rom(words: &[u32], target: u32) -> Option<u32> {
     if target & 3 != 0 { return None; }
     if (target as usize) < ROM_SIZE_BYTES { return Some(target); }
-    if let Some(thunk_pa) = jt_va_to_phys(target) {
-        // Sanity: confirm the slot decodes as a B/BL — patch-table slots
-        // can be patched at boot to non-B forms (the runtime patches
-        // them post-boot, but the static image we're walking is always
-        // a thunk).
-        return resolve_jt_va(words, target).map(|_| thunk_pa);
+    if jt_va_to_phys(target).is_some() {
+        return resolve_jt_va(words, target);
+    }
+    if let Some(pa) = public_jt_va_to_phys(words, target) {
+        return Some(pa);
     }
     secondary_jt_va_to_phys(words, target)
 }
@@ -802,6 +883,7 @@ struct WalkStats {
     indirect_passes: u32,
     indirect_roots_added: usize,
     rex_header_roots: usize,
+    rom_jumptable_thunk_roots: usize,
     vtable_roots: usize,
     vtables_found: usize,
     fnptr_literal_roots: usize,
@@ -829,10 +911,11 @@ struct WalkStats {
 fn walk(
     words: &[u32],
     initial_roots: &[u32],
+    initial_reach: Bitmap,
     fn_ranges: &[(u32, u32)],
 ) -> (Bitmap, WalkStats) {
     let mut stats = WalkStats::default();
-    let mut reach = Bitmap::new();
+    let mut reach = initial_reach;
     let mut worklist: Vec<u32> = initial_roots
         .iter()
         .copied()
@@ -1742,6 +1825,7 @@ fn run(args: Args) -> Result<(), String> {
     let rex_roots = rex_header_roots(&words);
     let mut rex_header_root_count = rex_roots.len();
     symbols.extend(rex_roots);
+
     symbols.sort_unstable();
     symbols.dedup();
 
@@ -1760,8 +1844,42 @@ fn run(args: Args) -> Result<(), String> {
         fn_ranges.push((last, ROM_SIZE_BYTES as u32));
     }
 
-    let (reach, mut stats) = walk(&words, &symbols, &fn_ranges);
+    symbols.sort_unstable();
+    symbols.dedup();
+
+    // Pre-mark thunk-page words in `reach` before the walker runs. The
+    // patch-table thunks (PA 0x2000..0x12860) and gROMPublicJumpTable
+    // family thunks (PA 0x13000..0x15FFF + sibling pages) live in
+    // pages the kernel aliases into jump-table VAs at boot via the in-
+    // ROM L2 page tables BuildPatchTablePageTable installs. The walker
+    // currently decodes B targets at PC=cur (a PA), which gets the
+    // wrong target for these aliased thunks. Pre-marking sidesteps
+    // that — proper VA-aware walker is a follow-up.
+    //
+    //   PA 0x16000  gROMPatchTablePageTable family (thunks at PA
+    //               0x2000..0x12860, aliased to VA 0x01A00000+).
+    //   PA 0x16400/16800/16C00  the family's siblings — we only need
+    //               to walk the base since each L2 maps the same set
+    //               of bucket pages.
+    //   PA 0x18000  gROMPublicJumpTablePageTable (thunks at PA
+    //               0x13000..0x15FFF + sibling pages 0x1B000..
+    //               0x21FFF, aliased to VA 0x01800000+).
+    let mut initial_reach = Bitmap::new();
+    let mut jt_thunk_words = 0usize;
+    for &(l2_pa, label) in &[
+        (0x0001_6000u32, "gROMPatchTablePageTable"),
+        (0x0001_6400u32, "patch-table L2 sec 0x1b"),
+        (0x0001_6800u32, "patch-table L2 sec 0x1c"),
+        (0x0001_8000u32, "gROMPublicJumpTablePageTable"),
+    ] {
+        jt_thunk_words += mark_thunk_pages_via_l2(
+            &words, &mut initial_reach, l2_pa, label,
+        );
+    }
+
+    let (reach, mut stats) = walk(&words, &symbols, initial_reach, &fn_ranges);
     stats.rex_header_roots = rex_header_root_count;
+    stats.rom_jumptable_thunk_roots = jt_thunk_words;
     // Dedup sometimes removes some of the REx entries (they may
     // overlap vectors/symbols); report the actual count after merge.
     let _ = &mut rex_header_root_count;
@@ -1809,6 +1927,11 @@ fn run(args: Args) -> Result<(), String> {
     writeln!(f, "  walker:").ok();
     writeln!(f, "    symbol roots (post-merge): {}", stats.initial_roots).ok();
     writeln!(f, "    rex-header roots added:    {}", stats.rex_header_roots).ok();
+    writeln!(
+        f,
+        "    rom-jumptable thunk words: {}",
+        stats.rom_jumptable_thunk_roots
+    ).ok();
     writeln!(f, "    words walked (with revisits): {}", stats.words_walked).ok();
     writeln!(f, "    NV-cond words skipped:     {}", stats.nv_cond_skips).ok();
     writeln!(f, "    data-range terminations:   {}", stats.data_range_stops).ok();

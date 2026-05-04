@@ -18,28 +18,88 @@ Bloated PLAN.md wastes context every read.
   functionality (not merely diagnostics):
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-96 follow-up):** make the classifier walker
-treat `cur` as a runtime VA throughout, with a single VA→PA
-translation step at the top of the inner loop that consults all the
-in-ROM L2 page tables (patch-table family, gROMPublicJumpTable-
-PageTable, secondary-jt L2). Once that's in place the roots become a
-union of:
-  1. The full named-symbol list from `_Data_/symbols.txt` (lifting
-     the `addr >= 0x01000000` filter in `classify-symbols.py` for
-     entries whose VA falls inside a known JT range).
-  2. Every B-AL thunk VA enumerated by walking each in-ROM L2 (the
-     unnamed thunks symbols.txt doesn't cover).
-With VA-aware decoding `step()` computes B targets against the kernel's
-runtime PC, so the walker resolves through chained thunks (gROM-
-PublicJumpTable → patch-table → final ROM PA) without any pre-mark.
-Indirect-target passes (vtable, fnptr-literal, B-run dispatch, etc.)
-push the discovered VA — not the resolved PA — so the walker handles
-thunk decoding itself instead of side-stepping it. Open question: an
-earlier attempt at the restructure expanded reach from ~880K to
-~3.3M words and regressed the boot at MakePrimaryMMUTable
-(PC=0x459dc) when the kernel reads bytes we now mark as code as
-data; isolating that conflict and patching the kernel side is part
-of iter-97.
+**Current goal (iter-97 follow-up):** with the iter-97 framework in
+place — symbols.txt-driven seeding, DFS provenance trace, JT-thunk
+pre-mark, suspicion tagging — the eyeball cycle is the next step.
+The 488 SUSPICIOUS code regions in `classify/<hash>/code-regions.txt`
+(>25% non-AL or any NV-cond) are the queue: each is either a real
+walker drift to fix at the seed/pass level, or a legitimate
+mixed-cond function (rare in this ROM). Use `WALK_TRACE_ADDRS` to
+get the DFS path back to the originating Seed when investigating.
+The VA-aware walker is still the long-term goal but requires
+isolating the FnPtrLiteral seed-into-REx-data path that drove the
+~3.3M-word reach explosion when previously attempted.
+
+### Iteration 97: classify-rom symbols.txt + DFS provenance trace + JT chain mark
+
+Goal: rebuild classify-rom around the raw symbol list and add a
+trace facility so we can answer "why was 0x… marked code?" for any
+mystery bit.
+
+Major changes:
+- `load_symbol_roots` reads `_Data_/symbols.txt` (was
+  `code-symbols.txt`) and applies its own filters: linker markers,
+  `^[gk][A-Z0-9]` data prefixes, NV-cond skip, prologue-shape gate.
+  Per-filter drop counts in `summary.txt`.
+- `collect_classinfo_roots` extended to seed `MOV PC,LR` Branch
+  slots (default-empty methods) plus the `fBTableDelta` and
+  `fEntryProcDelta` SROs, picking up the entire B-table and the
+  monitor entry-proc target. Branch slot offsets cover the full
+  `{0x18, 0x1C, 0x20, 0x24, 0x28, 0x34, 0x38}` set per
+  OS600/Protocols.h.
+- New `seed_vector_table_roots` parses
+  `C$$ctorvec$$Base/$$Limit` (and dtorvec) pairs from symbols.txt
+  and seeds every function pointer in the array.
+- `clear_literal_pool_targets_from_reach` extended to all conds
+  (was AL-only). Catches `LDREQ`/etc. literal-pool entries the
+  kernel reads as data.
+- Pre-walk `PURE_THUNK_PAGES` mark — sets reach bits on the
+  specific PA ranges that are pure JT-thunk backing
+  (patch-table 0x2000..0x12FFF, gROMPublicJumpTable
+  0x13000..0x15FFF, secondary-jt 0x7EE000..0x7EE048). Critically
+  does NOT use the L2-blanket approach from iter-96 — those L2s
+  also map normal vtable pages (0x1b000, 0x1d000, 0x21000, …)
+  which the walker MUST follow to discover their B-AL targets.
+- `MANUAL_DATA_RANGES` for the DiagHook BEQ-into-literal-pool
+  dead-code excursion at 0x18668..0x18688 (one-off, not a general
+  pattern — only one such instance in the entire reached set).
+- `MANUAL_CODE_ROOTS` for FP-trap-dispatched error paths in
+  `sqrt` / `_ldfp` at PA 0x382418 (transitively pulls in the sqrt
+  error-path entries via `BEQ` chain).
+- Provenance trace facility: each worklist entry carries the full
+  DFS-path stack of `WalkReason` frames (`Seed(SeedSource)`, `Jump
+  from PC`, `Branch from PC`) at the moment it was pushed. Drop a
+  target PA in `WALK_TRACE_ADDRS = &[0x...]`, recompile, run; the
+  walker dumps the complete origin chain when about to mark `cur`.
+  Each `SeedSource` variant carries an originating PC (LDR PC,
+  ADR PC, trampoline PC, dispatch PC, B-run entry PA) so the
+  trace points at the exact source line.
+- `scripts/regen-classify.sh` switched input from
+  `code-symbols.txt` to `../_Data_/symbols.txt`. The function
+  tracer's `code-symbols.txt` consumer is independent.
+- `scripts/dump-data-regions.py` generalised to emit both
+  `data-regions.txt` and `code-regions.txt` under
+  `classify/<hash>/`. New `suspicion_tag` flags code regions
+  with any NV-cond or >25% non-AL — likely walker drifts. Reports
+  gitignored.
+
+Attempted but reverted: VA-aware `resolve_target_to_rom` chain
+resolution returning final ROM PA (instead of thunk PA). With the
+chain change, walker followed FnPtrLiteral seeds into REx data
+(0x80f8b4 etc., which the user identified as gROMSoup —
+NewtonScript objects, not code) and wedged the boot well before
+the iter-95/96 PC 0x7a56e4 mark. Reverted to iter-94/95 behaviour:
+return thunk PA, walker walks the B word, Step::Jump uses PA
+decoding (which goes wrong-target for aliased pages but breaks
+safely on out-of-ROM, and pre-marking covers the bytes for BE-8).
+
+Result:
+- byte-access-static 28291 (vs iter-96 27750): +541 bits, mostly
+  TClassInfo MOV PC,LR slots and ctor/dtorvec function bodies.
+- Reach popcount ~885K (vs ~880K).
+- Boot reaches the iter-95/96 wedge at PC 0x007a56e4; 36/36 guest
+  tests pass.
+- 488 SUSPICIOUS code regions queued for the eyeball pass.
 
 ### Iteration 96: pre-mark patch-table + gROMPublicJumpTable thunks via L2 walk
 
@@ -49,66 +109,22 @@ gROMPublicJumpTable (PA 0x13000..0x15FFF) and its sibling thunk
 pages (PA 0x1B000..0x21FFF) that share gROMPublicJumpTablePageTable's
 L2 (PA 0x18000) with a few pages of kernel-managed page-table data.
 
-Approach: add a pre-walk pass that walks each in-ROM L2 page table
-(`gROMPatchTablePageTable` family at PA 0x16000/16400/16800,
-`gROMPublicJumpTablePageTable` at PA 0x18000), filters target pages
-by shape (top byte 0xEA on the first 16 words = `B AL`), and pre-
-marks the leading B-AL run inside each thunk page. Stop-at-first-non-
-B-AL keeps real-code roots from being shadowed where pages mix a
-thunk run with kernel-code function bodies (PA 0x21000 has 270
-thunks then `TADC` method bodies starting at PA 0x21438).
+Approach: pre-walk pass walks the in-ROM L2 page tables, filters
+target pages by shape (top byte 0xEA on the first 16 words), pre-
+marks the leading B-AL run inside each thunk page.
 
 Result:
-- All 16919 patch-table thunk words (covers the full 17 buckets via
-  the family's three live L2s).
-- 12433 thunk words across gROMPublicJumpTable + the 7 sibling thunk
-  pages mapped by gROMPublicJumpTablePageTable.
-- GetSample's tail (PA 0x22000..0x22064) reaches via natural walker
-  control flow now that the per-word stop-at-first-non-B-AL no
-  longer marks the function-body B instructions inside the page.
-- `byte-access-static` 27750 (matches iter-95's 27749 baseline).
-- Boot reaches the same wedge as iter-95 (PC=0x7a56e4); 36/36 guest
+- 16919 patch-table thunk words + 12433 gROMPublicJumpTable family
+  thunk words pre-marked.
+- `byte-access-static` 27750. Boot reaches PC=0x7a56e4; 36/36 guest
   tests pass.
 
-Limitation acknowledged: pre-marking is a workaround for the walker's
-PC=PA assumption. The cleaner design is to make the walker treat
-`cur` as a VA and translate via the in-ROM L2s on every step, with
-roots seeded from `symbols.txt` plus a per-L2 enumeration of the
-unnamed thunks the symbol list doesn't carry. A first attempt at
-that restructure ballooned reach from ~880K to ~3.3M words and
-regressed the boot — tracking down the data conflict is iter-97
-work.
+Limitation: pre-marking blocked the walker from following B-AL
+entries in pages that the L2 also mapped as normal vtables (0x1b000,
+0x1d000, 0x21000), losing real coverage downstream — fixed in
+iter-97 by switching to PA-range-targeted pre-marking.
 
-### Iteration 95: classifier resolves secondary jump-table aliasing (BE-8 follow-up)
-
-iter-94 cleared the post-ship patch-table thunks but left the boot
-wedged on `PC=0x01E00010` `insn=0xeaa695ad`. The kernel branches via
-VA 0x01E00010 to a *secondary* jump-table whose 18 B-thunks live at
-PA 0x7EE000..0x7EE048 and target kernel-VA `0xff19xxxx`. Stage-1
-maps VA 0x01E0xxxx → PA 0x7EE000+ via a pre-built short-descriptor
-L2 at PA 0x7EC000 (256 entries; 224 alias to PA 0x7EE000, 32 alias
-to PA 0x7ED000 = 0xFFFFFFFF filler). The kernel installs `L1[0x01E]
-= coarse(0x7EC000)` at boot. classify-rom only knew about the
-post-ship patch-table aliasing (`jt_va_to_phys`), so the secondary
-thunks went unmarked, the BE-8 load-time byteswap skipped them, and
-the CPU's LE instruction fetch decoded garbage.
-
-Fix in `tools/classify-rom`: new `secondary_jt_va_to_phys` reads the
-L2 at PA 0x7EC000 directly to translate VA 0x01E0xxxx → ROM PA, then
-returns the *thunk* PA so `resolve_target_to_rom` (and via it the
-walker's Step::Continue / Step::Jump arms) seeds the thunk for
-walking. Reading the L2 makes the resolver tolerant of ROM
-revisions with different alias counts — it doesn't bake the
-thunk-page count or alias span into a constant.
-
-Result: 18/18 secondary jumptable thunks now classified as code (up
-from 0); cold boot runs ~1180 log lines, past the iter-94 wedge.
-Wedges next on a *new* classifier-coverage gap: kernel init helper
-at PA 0x7a56cc..0x7a56f0 that the walker doesn't reach via any
-existing pass (no direct B/BL, no PA literal, no surrounding
-TClassInfo trampoline includes it). 36/36 guest tests pass.
-
-<!-- Older iteration retrospectives (iter-94 and earlier) live in
+<!-- Older iteration retrospectives (iter-95 and earlier) live in
      `git log` per the auto-prune maintenance note. -->
 <!-- iter-90 deferred shadow_stub deletion: still gated off
      (`patch_rom_from_bitmap` no longer called from `main.rs`); full

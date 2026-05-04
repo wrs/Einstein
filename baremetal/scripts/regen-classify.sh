@@ -14,19 +14,16 @@ classify_out="$root/classify"
 rom="$root/roms/newton.rom"
 rex="$root/../_Data_/Einstein.rex"
 
-# Use the code-only symbol list produced by classify-symbols.py —
-# feeding the raw _Data_/demangled_symbols.txt seeds classify-rom
-# with data labels too (gFoo, kFoo, theFoo, string tables, ...),
-# which then leaks reachability into adjacent data and pulls
-# false-positive byte-access bits into the bitmap. See
-# scripts/classify-symbols.py for the rule set that sorts symbols
-# into code vs. data.
-here_sym="$here/classify-out/code-symbols.txt"
-if [[ ! -f "$here_sym" ]]; then
-    echo "regen-classify.sh: regenerating code-symbols.txt" >&2
-    "$here/classify-symbols.py" >/dev/null
-fi
-symbols="$here_sym"
+# Feed classify-rom the raw _Data_/symbols.txt — classify-rom now
+# applies its own filters (linker markers, g[A-Z]/k[A-Z] data
+# prefixes, prologue-shape gate via is_known_function_start). This
+# consolidates the symbol-classification logic in the Rust tool
+# rather than splitting it between classify-symbols.py and
+# load_symbol_roots, and lets the JT-VA range (0x01a00000..0x01c10858)
+# entries flow through once we lift the >= 0x01000000 filter.
+# The function tracer still consumes scripts/classify-out/code-symbols.txt
+# (produced by classify-symbols.py), independently of this pass.
+symbols="$root/../_Data_/symbols.txt"
 
 for f in "$rom" "$rex" "$symbols"; do
     if [[ ! -f "$f" ]]; then

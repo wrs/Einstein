@@ -2,15 +2,21 @@
 # /// script
 # requires-python = ">=3.11"
 # ///
-"""Walk the classifier's reach.bitmap and emit a hex dump of every
-contiguous data region (consecutive 32-bit words with reach bit = 0).
+"""Walk the classifier's reach.bitmap and emit hex dumps of every
+contiguous DATA region (reach bit = 0) and every contiguous CODE
+region (reach bit = 1).
 
-The output is in BE numerical view (matching what a CPSR.E=1 LDR would
-return on the guest), 8 words per line, with ASCII gloss and a heuristic
-annotation when a word looks like an in-ROM function pointer.
+Output is BE numerical view — what a CPSR.E=1 LDR returns, and the
+ARM instruction encoding pre-byteswap — 4 words per line, with ASCII
+gloss and a heuristic annotation when a word looks like an in-ROM
+function pointer.
 
-Pure-zero runs collapse to a single "ZERO FILL" summary line. Output
-goes to baremetal/data-regions.txt by default; pass --out to override.
+Pure-zero / pure-0xFFFFFFFF runs collapse to one summary line.
+
+Files written alongside the bitmap, under classify/<hash>/:
+    data-regions.txt — runs of bit=0 (data the kernel must read raw)
+    code-regions.txt — runs of bit=1 (code that gets byteswapped at
+                       load time so LE instruction fetch decodes it)
 """
 from __future__ import annotations
 import argparse
@@ -39,24 +45,24 @@ def load_rom_aperture(rom_path: Path, rex_path: Path) -> bytes:
     return bytes(buf)
 
 
-def is_data_word(bitmap: bytes, idx: int) -> bool:
-    """True iff word index `idx` is *not* marked as reachable code."""
+def reach_bit(bitmap: bytes, idx: int) -> int:
+    """Return the reach bit (0 = data, 1 = code) for word index `idx`."""
     byte = idx >> 3
     bit = idx & 7
     if byte >= len(bitmap):
-        return True
-    return ((bitmap[byte] >> bit) & 1) == 0
+        return 0
+    return (bitmap[byte] >> bit) & 1
 
 
-def find_data_runs(bitmap: bytes, total_words: int) -> list[tuple[int, int]]:
+def find_runs(bitmap: bytes, total_words: int, target_bit: int) -> list[tuple[int, int]]:
     """Return [(start_word_idx, end_word_idx_exclusive), ...] for every
-    contiguous run of data words. Skips runs that are zero-length."""
+    contiguous run of words whose reach bit equals `target_bit`."""
     runs: list[tuple[int, int]] = []
     i = 0
     while i < total_words:
-        if is_data_word(bitmap, i):
+        if reach_bit(bitmap, i) == target_bit:
             j = i
-            while j < total_words and is_data_word(bitmap, j):
+            while j < total_words and reach_bit(bitmap, j) == target_bit:
                 j += 1
             runs.append((i, j))
             i = j
@@ -82,11 +88,31 @@ def ascii_gloss(words: list[int]) -> str:
     return "".join(out)
 
 
+def suspicion_tag(words: list[int], is_code: bool) -> str:
+    """For a code region, return '' if all instructions look plausible
+    or ' SUSPICIOUS: ...' otherwise. A region is suspicious if it
+    contains any NV-cond word (cond=0xF, deprecated in ARMv7+, never
+    real code) or more than 25% non-AL-cond words. Data regions don't
+    get the tag — non-AL words are normal data shapes."""
+    if not is_code or not words:
+        return ""
+    nv = sum(1 for w in words if (w >> 28) & 0xF == 0xF)
+    non_al = sum(1 for w in words if (w >> 28) & 0xF != 0xE)
+    flags: list[str] = []
+    if nv:
+        flags.append(f"{nv} NV-cond")
+    pct = 100.0 * non_al / len(words)
+    if pct > 25.0:
+        flags.append(f"{non_al}/{len(words)} non-AL ({pct:.1f}%)")
+    return f"  SUSPICIOUS: {', '.join(flags)}" if flags else ""
+
+
 def dump_region(
     aperture: bytes,
     start_word: int,
     end_word: int,
     f,
+    is_code: bool = False,
 ) -> None:
     start_pa = start_word * 4
     end_pa = end_word * 4
@@ -96,7 +122,8 @@ def dump_region(
     # Read all words for this region (BE numerical).
     words = list(struct.unpack(f">{word_count}I", aperture[start_pa:end_pa]))
 
-    print(f"{byte_count} bytes", file=f)
+    suspicion = suspicion_tag(words, is_code)
+    print(f"{byte_count} bytes{suspicion}", file=f)
     if all(w == 0 for w in words):
         print(f"  {start_pa:08x}: (zero fill)", file=f)
         return
@@ -148,48 +175,82 @@ def dump_region(
         )
 
 
+def write_report(
+    out_path: Path,
+    label: str,
+    rom_path: Path,
+    rex_path: Path,
+    bitmap_path: Path,
+    aperture: bytes,
+    total_words: int,
+    runs: list[tuple[int, int]],
+) -> None:
+    is_code = (label == "code")
+    with out_path.open("w") as f:
+        print(f"# {label}-regions report", file=f)
+        print(f"# rom:     {rom_path}", file=f)
+        print(f"# rex:     {rex_path}", file=f)
+        print(f"# bitmap:  {bitmap_path}", file=f)
+        print(
+            f"# {len(runs)} contiguous {label} regions across "
+            f"{total_words} words ({total_words*4} bytes)",
+            file=f,
+        )
+        total = sum(e - s for s, e in runs)
+        print(
+            f"# {total} {label} words "
+            f"({total*4} bytes, "
+            f"{100.0*total/total_words:.1f}% of aperture)",
+            file=f,
+        )
+        if is_code:
+            print(
+                f"# A region is tagged SUSPICIOUS if it contains any "
+                f"NV-cond instruction (cond=0xF) or more than 25% non-AL "
+                f"instructions — likely false-positive code marks.",
+                file=f,
+            )
+        print(file=f)
+        for start_word, end_word in runs:
+            dump_region(aperture, start_word, end_word, f, is_code=is_code)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--rom", type=Path, default=Path("roms/newton.rom"))
     ap.add_argument("--rex", type=Path, default=Path("../_Data_/Einstein.rex"))
     ap.add_argument("--classify-dir", type=Path, default=Path("classify"))
-    ap.add_argument("--out", type=Path, default=Path("data-regions.txt"))
     args = ap.parse_args()
 
     here = Path(__file__).resolve().parent.parent
     rom_path = (here / args.rom).resolve()
     rex_path = (here / args.rex).resolve()
     classify_dir = (here / args.classify_dir).resolve()
-    out_path = (here / args.out).resolve()
 
     bitmap_path = find_bitmap(classify_dir)
     bitmap = bitmap_path.read_bytes()
     aperture = load_rom_aperture(rom_path, rex_path)
     total_words = ROM_SIZE // 4
-    runs = find_data_runs(bitmap, total_words)
 
-    with out_path.open("w") as f:
-        print(f"# data-regions report", file=f)
-        print(f"# rom:     {rom_path}", file=f)
-        print(f"# rex:     {rex_path}", file=f)
-        print(f"# bitmap:  {bitmap_path}", file=f)
-        print(
-            f"# {len(runs)} contiguous data regions across "
-            f"{total_words} words ({total_words*4} bytes)",
-            file=f,
-        )
-        total_data_words = sum(e - s for s, e in runs)
-        print(
-            f"# {total_data_words} data words "
-            f"({total_data_words*4} bytes, "
-            f"{100.0*total_data_words/total_words:.1f}% of aperture)",
-            file=f,
-        )
-        print(file=f)
-        for start_word, end_word in runs:
-            dump_region(aperture, start_word, end_word, f)
+    # Reports land next to the bitmap they were derived from, so a
+    # multi-hash classify/ tree (e.g. after a rebuild that changes the
+    # ROM hash) keeps each pair of reports paired with its bitmap.
+    out_dir = bitmap_path.parent
+    data_out = out_dir / "data-regions.txt"
+    code_out = out_dir / "code-regions.txt"
 
-    print(f"wrote {out_path} ({out_path.stat().st_size} bytes, {len(runs)} regions)")
+    data_runs = find_runs(bitmap, total_words, target_bit=0)
+    code_runs = find_runs(bitmap, total_words, target_bit=1)
+
+    write_report(data_out, "data", rom_path, rex_path, bitmap_path,
+                 aperture, total_words, data_runs)
+    write_report(code_out, "code", rom_path, rex_path, bitmap_path,
+                 aperture, total_words, code_runs)
+
+    print(f"wrote {data_out} ({data_out.stat().st_size} bytes, "
+          f"{len(data_runs)} regions)")
+    print(f"wrote {code_out} ({code_out.stat().st_size} bytes, "
+          f"{len(code_runs)} regions)")
     return 0
 
 

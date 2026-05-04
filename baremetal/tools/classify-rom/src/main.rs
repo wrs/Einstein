@@ -107,14 +107,57 @@ fn load_rom_and_rex(rom_path: &Path, rex_path: &Path) -> Result<(Vec<u32>, u32),
     Ok((words, hash))
 }
 
-/// Parse demangled symbols with the same three-gate filter as
-/// baremetal/build.rs:46-143.
-fn load_symbol_roots(path: &Path) -> Result<Vec<u32>, String> {
+/// Counters returned by `load_symbol_roots` so `run()` can surface
+/// per-filter drop counts in the summary report.
+#[derive(Default, Debug)]
+struct SymbolFilterStats {
+    raw_lines: usize,
+    parse_skipped: usize,
+    misaligned: usize,
+    out_of_rom: usize,
+    linker_marker_dropped: usize,
+    g_prefix_dropped: usize,
+    k_prefix_dropped: usize,
+    nv_cond_dropped: usize,
+    not_prologue_dropped: usize,
+    jt_va_resolved: usize,
+    accepted: usize,
+}
+
+/// Parse `_Data_/symbols.txt` and return the code-root list.
+///
+/// Filters applied (in order):
+///   1. Linker-marker names ($$, Image$, $Size, $Length, $Base, $Limit,
+///      $End, $ZI) — section synthetic labels, never code.
+///   2. `^g[A-Z]` / `^k[A-Z]` name prefixes — Newton convention for
+///      global variables and constants. Seeding these as code roots
+///      risks data getting marked code-reachable, and under BE-8 every
+///      code-marked word is byteswapped at load — corrupting the
+///      kernel's data reads.
+///   3. Word-aligned address.
+///   4. Address must resolve to an in-ROM PA — direct PAs (addr <
+///      ROM_SIZE_BYTES) are accepted unchanged; JT-VA addresses (the
+///      patch-table 0x01A00000..0x01C20000 range, gROMPublicJumpTable,
+///      secondary-jt) are translated through `resolve_target_to_rom`
+///      to their underlying thunk PA. Anything outside those ranges
+///      is dropped.
+///   5. NV-cond (cond=0xF, deprecated in ARMv7+) on the first word —
+///      cheap sanity filter against obvious garbage seeds.
+///
+/// No prologue-shape gate: the walker is self-correcting on data
+/// (NV-cond / Step::Stop terminate fast), and the name-prefix rules
+/// already filter the dominant data-symbol classes upstream.
+fn load_symbol_roots(
+    path: &Path,
+    words: &[u32],
+) -> Result<(Vec<u32>, SymbolFilterStats), String> {
     let text = fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
     let mut seen: HashSet<u32> = HashSet::new();
     let mut out: Vec<u32> = Vec::new();
+    let mut stats = SymbolFilterStats::default();
 
     for line in text.lines() {
+        stats.raw_lines += 1;
         let mut addr_s: Option<&str> = None;
         let mut name: Option<&str> = None;
         for (i, f) in line.split('\t').enumerate() {
@@ -136,18 +179,17 @@ fn load_symbol_roots(path: &Path) -> Result<Vec<u32>, String> {
         }
         let (addr_s, name) = match (addr_s, name) {
             (Some(a), Some(n)) => (a, n),
-            _ => continue,
+            _ => { stats.parse_skipped += 1; continue; }
         };
 
         let hex = addr_s.strip_prefix("0x").or_else(|| addr_s.strip_prefix("0X"))
             .unwrap_or(addr_s);
         let addr = match u32::from_str_radix(hex, 16) {
             Ok(a) => a,
-            Err(_) => continue,
+            Err(_) => { stats.parse_skipped += 1; continue; }
         };
 
-        if addr & 3 != 0 { continue; }
-        if addr as usize >= ROM_SIZE_BYTES { continue; }
+        if addr & 3 != 0 { stats.misaligned += 1; continue; }
 
         if name.contains("$$")
             || name.starts_with("Image$")
@@ -158,24 +200,61 @@ fn load_symbol_roots(path: &Path) -> Result<Vec<u32>, String> {
             || name.ends_with("$End")
             || name.ends_with("$ZI")
         {
+            stats.linker_marker_dropped += 1;
             continue;
         }
 
-        // Accept every symbol that passes the linker-marker filter as a
-        // candidate root. Lowercase C functions (toupper, putc, ...) lack
-        // the `::` or `(` hints of demangled C++ symbols but are real
-        // call targets. Data-symbol roots (gFoo, kFoo) whose first word
-        // is NV-cond data terminate the walker immediately; other data
-        // roots walk a few words and terminate on gibberish control flow,
-        // potentially marking a small run of data as code-reachable. That
-        // is a tolerated false-positive risk for the static bitmap; the
-        // oracle ⊆ static invariant guarantees no missed executed sites.
-        if seen.insert(addr) {
-            out.push(addr);
+        // `^g[A-Z0-9]` / `^k[A-Z0-9]`: Newton convention for global
+        // variables (`gInitial...`, `g8MegContinuousTable...`) and
+        // constants (`kEntriesPerSlot`, ...). Digit second-char matters:
+        // `g8MegContinuousTableStartFor4MbK` would slip through an
+        // uppercase-only test. Lowercase second-char (`getFoo`,
+        // `gsm_add`, `glitch_to_*`) is a real C-function convention,
+        // keep those.
+        let bytes = name.as_bytes();
+        if bytes.len() >= 2
+            && (bytes[1].is_ascii_uppercase() || bytes[1].is_ascii_digit())
+        {
+            if bytes[0] == b'g' { stats.g_prefix_dropped += 1; continue; }
+            if bytes[0] == b'k' { stats.k_prefix_dropped += 1; continue; }
+        }
+
+        // Resolve the symbol's address to an in-ROM PA. Direct PAs pass
+        // through as-is; JT-VA addresses are translated to their thunk
+        // PA. Anything that doesn't resolve is outside the address space
+        // we can mark.
+        let pa = match resolve_target_to_rom(words, addr) {
+            Some(p) => p,
+            None => { stats.out_of_rom += 1; continue; }
+        };
+        if (addr as usize) >= ROM_SIZE_BYTES {
+            stats.jt_va_resolved += 1;
+        }
+
+        let w = words[(pa >> 2) as usize];
+        if (w >> 28) == 0xF { stats.nv_cond_dropped += 1; continue; }
+
+        // Prologue gate. Despite the appeal of "the walker is self-
+        // correcting on data", the walker is *not* self-correcting on
+        // data-symbol seeds: a name like `DataAreaTable` (whose first
+        // word is `0x64617461` = 'data' ASCII, cond=VS) hits no
+        // termination in `step()` and walks linearly through the
+        // entire data region — turning ~80 bytes of table into
+        // false-positive code marks (which under BE-8 then byteswap
+        // the kernel's data reads). The prologue gate is the only
+        // filter that catches cond != AL on the first word, where
+        // most data symbols live. Real code with cond != AL on its
+        // first instruction (rare predicated tail-calls) is the
+        // tradeoff — none observed in the boot path so far.
+        if !is_known_function_start(w) { stats.not_prologue_dropped += 1; continue; }
+
+        if seen.insert(pa) {
+            out.push(pa);
+            stats.accepted += 1;
         }
     }
     out.sort_unstable();
-    Ok(out)
+    Ok((out, stats))
 }
 
 /// Parse the REx block header at guest PA 0x00800000 and harvest
@@ -276,72 +355,112 @@ fn rex_header_roots(words: &[u32]) -> Vec<u32> {
     out
 }
 
-/// True iff every one of the first 16 words at `page_pa` looks like a
-/// `B AL` thunk (top byte 0xea = cond=AL, B-AL no-link). The Newton
-/// jump-table thunk pages are uniformly filled with B-thunks — checking
-/// 16 in a row is a confident shape match while still cheap; any
-/// page-table or data page will fail this test on the first word.
-fn page_is_thunk_shaped(words: &[u32], page_pa: u32) -> bool {
-    if (page_pa as usize) + 16 * 4 > ROM_SIZE_BYTES { return false; }
-    for i in 0..16 {
-        let w = words[((page_pa >> 2) + i) as usize];
-        if (w >> 24) != 0xEA { return false; }
-    }
-    true
-}
-
-/// Mark every B-AL thunk word inside thunk-shaped pages mapped by the
-/// in-ROM L2 at `l2_pa` as reachable code. Pre-marking is currently
-/// the right tool here because the walker decodes B targets against
-/// `cur=PA`, and for thunk pages the runtime VA differs from the PA —
-/// the walker would chase wrong targets (gROMPublicJumpTable thunks
-/// PA-decode into SYM-table data, patch-table thunks PA-decode into
-/// kernel-VA space) and either mis-classify data as code or break.
-/// Pre-marking sidesteps this until the walker plumbs runtime VA
-/// through (iter-97 work).
+/// Parse `_Data_/symbols.txt` for `<prefix>$$Base` / `<prefix>$$Limit`
+/// pairs and return one `(base, limit)` range per matching `<prefix>`.
+/// Restricted to prefixes ending in `vec` so we only catch ARM linker
+/// vectors of function pointers (C$$ctorvec, C$$dtorvec, ...) — Image$
+/// and Load$ section markers don't carry function pointers.
 ///
-/// Per-word, stop-at-first-non-B-AL: pages mixing thunks at the start
-/// with real code at the tail (PA 0x21000 has 270 thunks then TADC
-/// method bodies at PA 0x21438+) get only the thunk run pre-marked,
-/// leaving the code-body roots free to walk via control flow without
-/// being shadowed.
-fn mark_thunk_pages_via_l2(
-    words: &[u32],
-    reach: &mut Bitmap,
-    l2_pa: u32,
-    label: &str,
-) -> usize {
-    let mut seen_pages: HashSet<u32> = HashSet::new();
-    let mut marked_pages = 0usize;
-    let mut marked_words = 0usize;
-    if (l2_pa as usize) + 256 * 4 > ROM_SIZE_BYTES {
-        eprintln!("  jt-thunk-pages [{}]: l2_pa=0x{:x} out of ROM range", label, l2_pa);
-        return 0;
-    }
-    for entry_idx in 0..256u32 {
-        let entry_pa = l2_pa + entry_idx * 4;
-        let entry = words[(entry_pa >> 2) as usize];
-        if (entry & 0b10) != 0b10 { continue; }
-        let page_pa = entry & 0xFFFF_F000;
-        if !seen_pages.insert(page_pa) { continue; }
-        if !page_is_thunk_shaped(words, page_pa) { continue; }
-        marked_pages += 1;
-        for w in 0..1024u32 {
-            let thunk_pa = page_pa + w * 4;
-            if (thunk_pa as usize) + 4 > ROM_SIZE_BYTES { break; }
-            let insn = words[(thunk_pa >> 2) as usize];
-            if (insn >> 24) != 0xEA { break; }
-            reach.set_word(thunk_pa);
-            marked_words += 1;
+/// Each emitted range delimits an array of function pointers (one
+/// 32-bit ROM PA per slot). The walker uses the range to seed every
+/// pointer's target as a code root; without these the ctor / dtor
+/// bodies are unreachable by any control-flow pass (the kernel's
+/// runtime invokes them via the vector, not via static B/BL).
+fn load_vector_ranges(path: &Path) -> Result<Vec<(String, u32, u32)>, String> {
+    let text = fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let mut bases: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut limits: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for line in text.lines() {
+        let mut parts = line.split('\t').map(str::trim).filter(|s| !s.is_empty());
+        let addr_s = match parts.next() { Some(s) => s, None => continue };
+        let name = match parts.next() { Some(s) => s, None => continue };
+        let hex = addr_s.strip_prefix("0x").or_else(|| addr_s.strip_prefix("0X"))
+            .unwrap_or(addr_s);
+        let addr = match u32::from_str_radix(hex, 16) { Ok(a) => a, Err(_) => continue };
+        if (addr as usize) >= ROM_SIZE_BYTES || addr & 3 != 0 { continue; }
+        if let Some(prefix) = name.strip_suffix("$$Base") {
+            if prefix.ends_with("vec") { bases.insert(prefix.to_string(), addr); }
+        } else if let Some(prefix) = name.strip_suffix("$$Limit") {
+            if prefix.ends_with("vec") { limits.insert(prefix.to_string(), addr); }
         }
     }
-    eprintln!(
-        "  jt-thunk-pages [{}]: l2_pa=0x{:x}  pages={}, words={}",
-        label, l2_pa, marked_pages, marked_words,
-    );
-    marked_words
+    let mut out: Vec<(String, u32, u32)> = Vec::new();
+    for (prefix, base) in bases {
+        if let Some(&limit) = limits.get(&prefix) {
+            if limit > base { out.push((prefix, base, limit)); }
+        }
+    }
+    out.sort_by(|a, b| a.1.cmp(&b.1));
+    Ok(out)
 }
 
+/// Seed every function-pointer target inside the supplied vector
+/// ranges. Each word in `[base, limit)` is read as a ROM PA; targets
+/// gated by `is_known_function_start` are pushed as worklist roots.
+/// Returns (vector_count, seeds_added) for summary reporting.
+fn seed_vector_table_roots(
+    words: &[u32],
+    ranges: &[(String, u32, u32)],
+    worklist: &mut Vec<u32>,
+) -> (usize, usize) {
+    // Same Vec<u32> contract as load_symbol_roots — vector-table seeds
+    // are merged into `symbols` upstream of `walk()`, so they all land
+    // tagged `Seed(Symbol)` in the trace. To distinguish, tag manually
+    // at the walk() boundary instead of here.
+    let mut added = 0usize;
+    let mut seen: HashSet<u32> = HashSet::new();
+    for (_label, base, limit) in ranges {
+        let mut pa = *base;
+        while pa < *limit {
+            let p = words[(pa >> 2) as usize];
+            pa = pa.wrapping_add(4);
+            if p & 3 != 0 || (p as usize) >= ROM_SIZE_BYTES || p == 0 { continue; }
+            let tw = words[(p >> 2) as usize];
+            if (tw >> 28) == 0xF { continue; }
+            if !is_known_function_start(tw) { continue; }
+            if seen.insert(p) {
+                worklist.push(p);
+                added += 1;
+            }
+        }
+    }
+    (ranges.len(), added)
+}
+
+/// Manual code-root exceptions for code that no static-analysis pass
+/// can reach. Each entry must be a real instruction PC; the walker
+/// seeds it as a worklist root and continues from there. Use sparingly
+/// — every entry is a hand-fixed gap and a maintenance liability.
+const MANUAL_CODE_ROOTS: &[u32] = &[
+    // FP-library trap-dispatched error paths. The IEEE-754 special-case
+    // handlers in `sqrt` (0x3823b0..0x3823d8) and `_ldfp`'s post-trap
+    // continuation (0x382418..0x38242c) are reached only via the FPE
+    // trap dispatch — no static B/BL or table reference exists.
+    // Seeding the `_ldfp` continuation entry transitively pulls in all
+    // four sqrt error paths (each falls through `b 0x3823dc` into
+    // already-reached cleanup) and the three conditional branches
+    // _ldfp uses to enter them.
+    0x0038_2418,
+];
+
+/// Manual data-range exceptions: half-open `[start, end)` ranges that
+/// the post-walk pass clears from `reach`, no matter what the walker
+/// or any indirect-pass collector did. Use for tiny corrupt corners
+/// where static analysis follows a clearly-broken or never-executed
+/// branch into a data region — fixing the walker to refuse the path
+/// would risk dropping legitimate coverage elsewhere.
+const MANUAL_DATA_RANGES: &[(u32, u32)] = &[
+    // DiagHook (PA 0x184d0, hand-written asm) contains `beq 0x1862c`
+    // at PC 0x185a4 whose target lands inside DiagHook's own literal
+    // pool — appears to be a bug; DiagHook only runs in diagnostic
+    // mode (hardware-switch-asserted boot) so the path is dead on a
+    // normal boot. The walker follows it statically, marks the
+    // literal pool, then walks past into the trailing "STUB ROM" /
+    // "diagRExBlock" header. `clear_literal_pool_targets_from_reach`
+    // cleans the literal pool itself; this range covers the trailing
+    // header words that aren't LDR-pc-rel targets.
+    (0x0001_8668, 0x0001_8688),
+];
 
 /// True iff `w` looks like the first instruction of a function entry —
 /// any AL-cond word (top nibble 0xE) decoding as a known ARM
@@ -453,6 +572,101 @@ enum Step {
     Stop,
 }
 
+/// Provenance tag carried alongside every worklist entry so the walker
+/// can answer "why was this address ever marked code?" when a mystery
+/// bit shows up. The walker maintains a small per-walk stack of these
+/// (seed reason + Step::Jump transitions) and dumps it when `cur` lands
+/// on any address listed in `WALK_TRACE_ADDRS`.
+///
+/// Increments (`cur += 4`) are NOT pushed onto the stack — they're
+/// implicit in the surrounding bracketing entries, and adding them
+/// would balloon the trace and obscure the real decisions.
+#[derive(Clone, Copy)]
+enum WalkReason {
+    /// Initial seed (root from symbols.txt, vectors, ctorvec/dtorvec,
+    /// REx header parser, MANUAL_CODE_ROOTS, or one of the indirect-
+    /// pass collectors below).
+    Seed(SeedSource),
+    /// Step::Continue { branch: Some(t) } — Bcc / BL pushed `t` to the
+    /// worklist; this entry got popped later. `from_pc` is the PC of
+    /// the branch instruction.
+    Branch { from_pc: u32 },
+    /// Step::Jump — the current walk's `cur` jumped here from a B (no
+    /// link, not in_table). Recorded on the current walk's stack, not
+    /// on the worklist.
+    Jump { from_pc: u32 },
+}
+
+impl std::fmt::Debug for WalkReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WalkReason::Seed(s) => write!(f, "Seed({s:?})"),
+            WalkReason::Branch { from_pc } => write!(f, "Branch from 0x{from_pc:08x}"),
+            WalkReason::Jump { from_pc } => write!(f, "Jump from 0x{from_pc:08x}"),
+        }
+    }
+}
+
+/// Where a worklist seed originated. Each indirect-pass collector
+/// stamps its pushes with the matching variant + the most useful
+/// originating PC so the trace points at the exact source line.
+#[derive(Clone, Copy)]
+enum SeedSource {
+    Symbol,
+    Vector,
+    Manual,
+    RexHeader,
+    /// LDR-pc-rel + STR-to-this pair installs a vtable; `ldr_pc` is
+    /// the LDR instruction that loaded the vtable address.
+    Vtable { ldr_pc: u32 },
+    /// LDR-pc-rel literal looked like a function pointer; `ldr_pc` is
+    /// the LDR. Loaded literal = popped PC of this entry.
+    FnPtrLiteral { ldr_pc: u32 },
+    /// 3+-entry B-AL run discovered at `entry_pa`.
+    BRunEntry { entry_pa: u32 },
+    /// `add Rd, PC, #imm` reaching this address; `adr_pc` is that ADR.
+    PcRelAddr { adr_pc: u32 },
+    /// TClassInfo trampoline at `tramp_pc` (`sub r0, pc, #68; mov pc,
+    /// lr; mov r0, #imm; mov pc, lr`).
+    ClassInfoTramp { tramp_pc: u32 },
+    ClassInfoBranchSlot { tramp_pc: u32 },
+    ClassInfoBTable { tramp_pc: u32 },
+    ClassInfoEntryProc { tramp_pc: u32 },
+    /// `LDR pc, [Rn, Rm, lsl #2]` indexed dispatch at `dispatch_pc`.
+    IndexedDispatch { dispatch_pc: u32 },
+    /// PC-relative jump-table dispatch at `dispatch_pc`.
+    JtTableEntry { dispatch_pc: u32 },
+    JtTableTarget { dispatch_pc: u32 },
+}
+
+impl std::fmt::Debug for SeedSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SeedSource::Symbol => write!(f, "Symbol"),
+            SeedSource::Vector => write!(f, "Vector"),
+            SeedSource::Manual => write!(f, "Manual"),
+            SeedSource::RexHeader => write!(f, "RexHeader"),
+            SeedSource::Vtable { ldr_pc } => write!(f, "Vtable @ ldr 0x{ldr_pc:08x}"),
+            SeedSource::FnPtrLiteral { ldr_pc } => write!(f, "FnPtrLiteral @ ldr 0x{ldr_pc:08x}"),
+            SeedSource::BRunEntry { entry_pa } => write!(f, "BRunEntry @ 0x{entry_pa:08x}"),
+            SeedSource::PcRelAddr { adr_pc } => write!(f, "PcRelAddr @ adr 0x{adr_pc:08x}"),
+            SeedSource::ClassInfoTramp { tramp_pc } => write!(f, "ClassInfoTramp @ 0x{tramp_pc:08x}"),
+            SeedSource::ClassInfoBranchSlot { tramp_pc } => write!(f, "ClassInfoBranchSlot @ tramp 0x{tramp_pc:08x}"),
+            SeedSource::ClassInfoBTable { tramp_pc } => write!(f, "ClassInfoBTable @ tramp 0x{tramp_pc:08x}"),
+            SeedSource::ClassInfoEntryProc { tramp_pc } => write!(f, "ClassInfoEntryProc @ tramp 0x{tramp_pc:08x}"),
+            SeedSource::IndexedDispatch { dispatch_pc } => write!(f, "IndexedDispatch @ 0x{dispatch_pc:08x}"),
+            SeedSource::JtTableEntry { dispatch_pc } => write!(f, "JtTableEntry @ dispatch 0x{dispatch_pc:08x}"),
+            SeedSource::JtTableTarget { dispatch_pc } => write!(f, "JtTableTarget @ dispatch 0x{dispatch_pc:08x}"),
+        }
+    }
+}
+
+/// Addresses to trace through the walker. When `cur` is about to mark
+/// any of these, the walker prints the current trace stack to stderr
+/// and continues. Add an address here, recompile, run; remove when
+/// the mystery is solved. Empty by default.
+const WALK_TRACE_ADDRS: &[u32] = &[];
+
 fn sign_extend(v: u32, bits: u32) -> i32 {
     let shift = 32 - bits;
     ((v << shift) as i32) >> shift
@@ -505,29 +719,6 @@ fn jt_va_to_phys(va: u32) -> Option<u32> {
     if bucket > 16 { return None; }
     let off_in_page = off & 0xFFF;
     Some(0x2000 + bucket * 0x1000 + off_in_page)
-}
-
-/// If `target` is a VA in the ROM patch-table range, decode the B/BL
-/// thunk living at the corresponding phys slot and return the final
-/// ROM-PA target. Otherwise `None`. Returns the target unchanged when
-/// the slot's word isn't a B/BL — patch-table slots can be patched at
-/// boot to non-B forms, but the static (unpatched) image is always a
-/// B-AL thunk to the real ROM function.
-fn resolve_jt_va(words: &[u32], target: u32) -> Option<u32> {
-    let phys = jt_va_to_phys(target)?;
-    if (phys as usize) + 4 > ROM_SIZE_BYTES { return None; }
-    if phys & 3 != 0 { return None; }
-    let w = words[(phys >> 2) as usize];
-    // B/BL at the slot's runtime VA: target = va + 8 + sext(imm24)<<2.
-    let cond = (w >> 28) & 0xF;
-    let kind = (w >> 25) & 0b111;
-    if cond == 0xF || kind != 0b101 { return None; }
-    let imm24 = w & 0x00FF_FFFF;
-    let simm = sign_extend(imm24, 24) << 2;
-    let final_tgt = target.wrapping_add(8).wrapping_add(simm as u32);
-    if (final_tgt as usize) >= ROM_SIZE_BYTES { return None; }
-    if final_tgt & 3 != 0 { return None; }
-    Some(final_tgt)
 }
 
 /// Translate a VA in the *secondary* ROM jump-table window
@@ -592,20 +783,69 @@ fn public_jt_va_to_phys(words: &[u32], va: u32) -> Option<u32> {
 
 
 /// Resolve a branch / function-pointer target to its in-ROM PA.
-/// Returns the final function PA for direct ROM-PA targets, the thunk
-/// PA for patch-table VAs (so callers like the walker can step the B
-/// against the runtime VA themselves), or `None` for unresolvable
-/// kernel-VA targets.
+/// Returns the thunk PA for patch-table / public-jt / secondary-jt VAs
+/// (so the walker visits the thunk word, marks it for byteswap, and
+/// follows through via `Step::Jump`'s PA-decoded fall-through into
+/// the eventual ROM target). Direct ROM PAs pass through unchanged.
+/// Returns `None` for kernel-VA targets we don't recognise.
 fn resolve_target_to_rom(words: &[u32], target: u32) -> Option<u32> {
     if target & 3 != 0 { return None; }
     if (target as usize) < ROM_SIZE_BYTES { return Some(target); }
-    if jt_va_to_phys(target).is_some() {
-        return resolve_jt_va(words, target);
+    if let Some(thunk_pa) = jt_va_to_phys(target) {
+        // Validate the slot decodes as a B/BL — patch-table slots can
+        // be patched at boot to non-B forms.
+        let w = words[(thunk_pa >> 2) as usize];
+        let cond = (w >> 28) & 0xF;
+        let kind = (w >> 25) & 0b111;
+        if cond == 0xF || kind != 0b101 { return None; }
+        return Some(thunk_pa);
     }
     if let Some(pa) = public_jt_va_to_phys(words, target) {
         return Some(pa);
     }
     secondary_jt_va_to_phys(words, target)
+}
+
+/// Result of chasing a (possibly aliased) target through the JT chain.
+/// `thunks` lists every thunk PA visited during resolution — these
+/// must be marked code at load time so BE-8 byteswap covers the bytes
+/// the kernel branches through, but they should NOT be added to the
+/// walker's worklist (PA decoding from a thunk would chase a wrong
+/// target).
+struct ChainResolution {
+    final_pa: u32,
+    thunks: Vec<u32>,
+}
+
+fn resolve_jt_chain(words: &[u32], target: u32) -> Option<ChainResolution> {
+    let mut thunks: Vec<u32> = Vec::new();
+    let mut cur = target;
+    // Defensive cap: a chain longer than this is almost certainly a
+    // cycle from misdecoded data.
+    for _ in 0..8 {
+        if cur & 3 != 0 { return None; }
+        if (cur as usize) < ROM_SIZE_BYTES {
+            return Some(ChainResolution { final_pa: cur, thunks });
+        }
+        // VA-keyed L2 lookup: returns the thunk PA for whichever JT
+        // window `cur` belongs to.
+        let thunk_pa = jt_va_to_phys(cur)
+            .or_else(|| public_jt_va_to_phys(words, cur))
+            .or_else(|| secondary_jt_va_to_phys(words, cur))?;
+        if (thunk_pa as usize) + 4 > ROM_SIZE_BYTES { return None; }
+        thunks.push(thunk_pa);
+        // Decode the thunk's B against the runtime VA (`cur`), not the
+        // thunk PA — the kernel branches via VA, so VA arithmetic gives
+        // the real next-hop target.
+        let w = words[(thunk_pa >> 2) as usize];
+        let cond = (w >> 28) & 0xF;
+        let kind = (w >> 25) & 0b111;
+        if cond == 0xF || kind != 0b101 { return None; }
+        let imm24 = w & 0x00FF_FFFF;
+        let simm = sign_extend(imm24, 24) << 2;
+        cur = cur.wrapping_add(8).wrapping_add(simm as u32);
+    }
+    None
 }
 
 /// Enumerate the one-instruction-per-entry table that immediately
@@ -629,7 +869,8 @@ fn enumerate_pc_rel_jump_table(
     pc_of_dispatch: u32,
     prev_w: u32,
     fn_ranges: &[(u32, u32)],
-    worklist: &mut Vec<u32>,
+    worklist: &mut Vec<(u32, Vec<WalkReason>)>,
+    parent_trace: &[WalkReason],
 ) -> usize {
     const MAX_ENTRIES: usize = 256;
     // Without a CMP bound, cap iteration at MAX_UNBOUNDED slots so
@@ -694,9 +935,13 @@ fn enumerate_pc_rel_jump_table(
             let imm24 = w & 0xFFFFFF;
             let simm = sign_extend(imm24, 24) << 2;
             let target = tbl.wrapping_add(8).wrapping_add(simm as u32);
-            worklist.push(target);
+            let mut child = parent_trace.to_vec();
+            child.push(WalkReason::Seed(SeedSource::JtTableTarget { dispatch_pc: pc_of_dispatch }));
+            worklist.push((target, child));
         }
-        worklist.push(tbl);
+        let mut child = parent_trace.to_vec();
+        child.push(WalkReason::Seed(SeedSource::JtTableEntry { dispatch_pc: pc_of_dispatch }));
+        worklist.push((tbl, child));
         count += 1;
         tbl = tbl.wrapping_add(4);
     }
@@ -883,7 +1128,6 @@ struct WalkStats {
     indirect_passes: u32,
     indirect_roots_added: usize,
     rex_header_roots: usize,
-    rom_jumptable_thunk_roots: usize,
     vtable_roots: usize,
     vtables_found: usize,
     fnptr_literal_roots: usize,
@@ -916,19 +1160,32 @@ fn walk(
 ) -> (Bitmap, WalkStats) {
     let mut stats = WalkStats::default();
     let mut reach = initial_reach;
-    let mut worklist: Vec<u32> = initial_roots
+    // Each worklist entry carries the FULL trace of decisions that
+    // led to it being pushed: seed → [Jump → Jump → ...] → Branch.
+    // Popping it restores that trace state, so any mystery `cur` mark
+    // dumps the complete origin chain (seed plus every Jump and Branch
+    // along the way). Increments are not on the stack — they're
+    // implicit between adjacent stack frames.
+    let mut worklist: Vec<(u32, Vec<WalkReason>)> = initial_roots
         .iter()
-        .copied()
+        .map(|&a| (a, vec![WalkReason::Seed(SeedSource::Symbol)]))
         .collect();
     stats.initial_roots = worklist.len();
 
     let mut pass = 0u32;
     loop {
         pass += 1;
-        while let Some(pc) = worklist.pop() {
+        while let Some((pc, popped_trace)) = worklist.pop() {
             let mut cur = pc;
             let mut prev_w: u32 = 0;
             let mut in_table = false;
+            // Trace stack restored from the worklist entry: the full
+            // origin chain (seed + all Jump/Branch transitions) that
+            // got us to this pop. Step::Jump appends a Jump frame as
+            // the walker hops across basic blocks; Step::Continue with
+            // a branch pushes a NEW worklist entry carrying
+            // `current_trace + Branch{from_pc}`.
+            let mut trace: Vec<WalkReason> = popped_trace;
             // LR-target tracker for multi-insn manual-BL idioms.
             // When `lr_target == Some(cur + 4)` at a PC-writing
             // instruction, the call returns at cur+4 — even when
@@ -942,6 +1199,12 @@ fn walk(
                 if (w >> 28) == 0xF {
                     stats.nv_cond_skips += 1;
                     break;
+                }
+                if WALK_TRACE_ADDRS.contains(&cur) {
+                    eprintln!("WALK_TRACE 0x{cur:08x} (pc popped 0x{pc:08x}, pass {pass}):");
+                    for (i, r) in trace.iter().enumerate() {
+                        eprintln!("  [{i}] {r:?}");
+                    }
                 }
                 reach.set_word(cur);
                 stats.words_walked += 1;
@@ -972,7 +1235,7 @@ fn walk(
                 // reachable only through the dispatch.
                 if is_pc_rel_pc_dispatch(w) {
                     enumerate_pc_rel_jump_table(
-                        words, cur, prev_w, fn_ranges, &mut worklist,
+                        words, cur, prev_w, fn_ranges, &mut worklist, &trace,
                     );
                 }
 
@@ -1006,7 +1269,9 @@ fn walk(
                 match step_result {
                     Step::Continue { branch: Some(t) } => {
                         if let Some(root) = resolve_target_to_rom(words, t) {
-                            worklist.push(root);
+                            let mut child_trace = trace.clone();
+                            child_trace.push(WalkReason::Branch { from_pc: cur });
+                            worklist.push((root, child_trace));
                         }
                         prev_w = w;
                         cur = cur.wrapping_add(4);
@@ -1018,10 +1283,12 @@ fn walk(
                     Step::Jump(t) => {
                         prev_w = 0;
                         in_table = false;
+                        let from_pc = cur;
                         cur = match resolve_target_to_rom(words, t) {
                             Some(pa) => pa,
                             None => break,
                         };
+                        trace.push(WalkReason::Jump { from_pc });
                     }
                     Step::Stop => break,
                 }
@@ -1090,8 +1357,8 @@ fn walk(
 }
 
 /// Clear from `reach` every word that is the target of an
-/// `LDR Rt, [pc, #±imm12]` (cond=AL) issued from a word currently in
-/// `reach`. Returns the number of bits cleared.
+/// `LDR Rt, [pc, #±imm12]` (any cond except NV) issued from a word
+/// currently in `reach`. Returns the number of bits cleared.
 ///
 /// This is a static-only signal: a literal-pool word is reached as
 /// CODE by the walker (e.g. via a conditional branch) but the kernel
@@ -1099,15 +1366,31 @@ fn walk(
 /// loads have different byte-order requirements; since the LDR-data
 /// reading is the load-bearing path (constants used by the kernel),
 /// we mark the word as data.
+///
+/// LDR Rt, [pc, #±imm12] encoding (immediate, pre-indexed, no writeback):
+///   [31:28] cond (any except 0xF)
+///   [27:25] = 010
+///   [24]    = 1 (P, pre-indexed)
+///   [23]    = U (1 = +imm, 0 = -imm)
+///   [22]    = 0 (B, word access)
+///   [21]    = 0 (W, no writeback)
+///   [20]    = 1 (L, load)
+///   [19:16] = 1111 (Rn = PC)
+///   [15:12] = Rt (any)
+///   [11:0]  = imm12
+/// Top 16 bits (mask 0x0FFF, cond removed): 0x59F (U=1) or 0x51F (U=0).
 fn clear_literal_pool_targets_from_reach(words: &[u32], reach: &mut Bitmap) -> u64 {
     let mut targets: Vec<u32> = Vec::new();
     for i in 0..ROM_WORD_COUNT {
         let addr = (i as u32) * 4;
         if !reach.get_word(addr) { continue; }
         let w = words[i];
-        let imm_sign: i32 = match w >> 16 {
-            0xE59F => 1,
-            0xE51F => -1,
+        let cond = (w >> 28) & 0xF;
+        if cond == 0xF { continue; }
+        let masked = (w >> 16) & 0x0FFF;
+        let imm_sign: i32 = match masked {
+            0x59F => 1,
+            0x51F => -1,
             _ => continue,
         };
         let imm12 = (w & 0xFFF) as i32;
@@ -1133,7 +1416,7 @@ fn clear_literal_pool_targets_from_reach(words: &[u32], reach: &mut Bitmap) -> u
 fn collect_vtable_roots(
     words: &[u32],
     reach: &Bitmap,
-    worklist: &mut Vec<u32>,
+    worklist: &mut Vec<(u32, Vec<WalkReason>)>,
     stats: &mut WalkStats,
 ) -> usize {
     let mut added = 0usize;
@@ -1206,7 +1489,7 @@ fn collect_vtable_roots(
             if (tgt_word >> 28) == 0xF { break; }
             if !is_known_function_start(tgt_word) { break; }
             if !reach.get_word(p) {
-                worklist.push(p);
+                worklist.push((p, vec![WalkReason::Seed(SeedSource::Vtable { ldr_pc: addr })]));
                 added += 1;
                 entries_added += 1;
             }
@@ -1232,7 +1515,7 @@ fn collect_pc_relative_addr_roots(
     words: &[u32],
     reach: &Bitmap,
     fn_ranges: &[(u32, u32)],
-    worklist: &mut Vec<u32>,
+    worklist: &mut Vec<(u32, Vec<WalkReason>)>,
     stats: &mut WalkStats,
 ) -> usize {
     let mut added = 0usize;
@@ -1286,7 +1569,7 @@ fn collect_pc_relative_addr_roots(
         if !target_is_code && !is_dispatch_base { continue; }
         if reach.get_word(target) { continue; }
         if !seen.insert(target) { continue; }
-        worklist.push(target);
+        worklist.push((target, vec![WalkReason::Seed(SeedSource::PcRelAddr { adr_pc: addr })]));
         added += 1;
     }
     stats.pc_rel_addr_roots += added;
@@ -1376,7 +1659,7 @@ fn is_used_as_dispatch_base(
 fn collect_b_run_roots(
     words: &[u32],
     reach: &Bitmap,
-    worklist: &mut Vec<u32>,
+    worklist: &mut Vec<(u32, Vec<WalkReason>)>,
     stats: &mut WalkStats,
 ) -> usize {
     const MIN_B: usize = 3;
@@ -1448,7 +1731,7 @@ fn collect_b_run_roots(
             // Seed the entry PA as a worklist root. Walker marks it
             // reach=true, then Step::Jump processes the target.
             if !reach.get_word(entry_pa) && seen.insert(entry_pa) {
-                worklist.push(entry_pa);
+                worklist.push((entry_pa, vec![WalkReason::Seed(SeedSource::BRunEntry { entry_pa })]));
                 added += 1;
             }
         }
@@ -1458,29 +1741,34 @@ fn collect_b_run_roots(
     added
 }
 
-/// Recognize TClassInfo trampoline functions and walk the inline
-/// 60-byte struct that precedes them.
+/// Recognize TClassInfo trampoline functions and seed every code
+/// pointer reachable from the inline 60-byte struct that precedes
+/// them.
 ///
-/// Newton's class metadata layout (TClassInfo, 15 longs = 60 bytes)
-/// terminates in a 4-instruction tail-stub:
+/// TClassInfo layout (per OS600/Protocols.h, 15 longs = 60 bytes):
+///
+///   +0x00 fReserved1            (zero)
+///   +0x04 fNameDelta            SRO → asciz implementation name
+///   +0x08 fInterfaceDelta       SRO → asciz protocol interface name
+///   +0x0C fSignatureDelta       SRO → asciz signature
+///   +0x10 fBTableDelta          SRO → dispatch table (B-table)  *CODE*
+///   +0x14 fEntryProcDelta       SRO → monitor entry proc        *CODE*
+///   +0x18 fSizeofBranch         B target / MOV PC,LR / 0        *CODE*
+///   +0x1C fAllocBranch          B target / MOV PC,LR / 0        *CODE*
+///   +0x20 fFreeBranch           B target / MOV PC,LR / 0        *CODE*
+///   +0x24 fDefaultNewBranch     B target / MOV PC,LR / 0        *CODE*
+///   +0x28 fDefaultDeleteBranch  B target / MOV PC,LR / 0        *CODE*
+///   +0x2C fVersion              (data)
+///   +0x30 fFlags                (data)
+///   +0x34 fSelectorBranch       B target / MOV PC,LR            *CODE*
+///   +0x38 fReserved2            (zero)
+///
+/// Trailing 4-instruction trampoline (returns struct_base or nil):
 ///
 ///   sub  r0, pc, #68     ; r0 = struct_base = pc + 8 - 68
 ///   mov  pc, lr          ; trampoline returns the struct's base PA
 ///   mov  r0, #imm        ; alt entry: bail-out function returning <imm>
 ///   mov  pc, lr          ;            (typically nil, i.e. imm == 0)
-///
-/// The 60 bytes preceding the trampoline are the struct itself, with
-/// these "Branch" fields holding inline `B method` slots:
-/// fSizeofBranch, fAllocBranch, fFreeBranch, fDefaultNewBranch,
-/// fDefaultDeleteBranch, fSelectorBranch, fReserved2. Each slot is
-/// either a real `B` to a method body, the inline `mov pc, lr` empty
-/// stub, or zero.
-///
-/// `collect_b_run_roots` catches dense runs of these (≥3 consecutive
-/// B-AL words), but isolated branches — most importantly the
-/// `B alt_entry` slot at +0x38 that points at the bail-out function —
-/// fall below that threshold and remain unreached. Recognising the
-/// trampoline pattern lets us seed the entire struct precisely.
 ///
 /// The pattern is highly specific (4 exact instructions in sequence),
 /// so this scans the full ROM+REX rather than gating on already-
@@ -1489,12 +1777,24 @@ fn collect_b_run_roots(
 fn collect_classinfo_roots(
     words: &[u32],
     reach: &Bitmap,
-    worklist: &mut Vec<u32>,
+    worklist: &mut Vec<(u32, Vec<WalkReason>)>,
     stats: &mut WalkStats,
 ) -> usize {
     const TRAMP_SUB_R0_PC_68: u32 = 0xE24F_0044;
     const MOV_PC_LR: u32 = 0xE1A0_F00E;
     const STRUCT_BYTES: u32 = 60;
+    // Branch slots: B target, MOV PC,LR (default empty), or 0 (no method).
+    // The Protocols.h layout puts fSelectorBranch at +0x34 and fReserved2
+    // at +0x38, but the 717006 ROM consistently emits the bail-out branch
+    // at +0x38 (B → trampoline alt-entry) and leaves +0x34 zero. Scan both
+    // positions; the zero slot is harmless to skip.
+    const BRANCH_OFFSETS: [u32; 7] = [0x18, 0x1C, 0x20, 0x24, 0x28, 0x34, 0x38];
+    // SRO fields whose target is code:
+    //   fBTableDelta  → first word of the dispatch table (back-pointer
+    //                   to the trampoline, encoded as B-AL).
+    //   fEntryProcDelta → monitor entry proc (function start).
+    const FBTABLE_OFFSET: u32 = 0x10;
+    const FENTRYPROC_OFFSET: u32 = 0x14;
 
     let mut added = 0usize;
     let mut seen: HashSet<u32> = HashSet::new();
@@ -1510,25 +1810,77 @@ fn collect_classinfo_roots(
         if words[fn_idx + 3] != MOV_PC_LR { continue; }
 
         let fn_pa = (fn_idx as u32) * 4;
+        let struct_base_pa = fn_pa - STRUCT_BYTES;
 
         // Seed the trampoline function itself — covers TClassInfo
-        // entries that aren't named in code-symbols.txt.
+        // entries that aren't named in symbols.txt.
         if !reach.get_word(fn_pa) && seen.insert(fn_pa) {
-            worklist.push(fn_pa);
+            worklist.push((fn_pa, vec![WalkReason::Seed(SeedSource::ClassInfoTramp { tramp_pc: fn_pa })]));
             added += 1;
         }
 
-        // Scan the 60-byte struct for B-AL slots. Each one is a
-        // method-dispatch branch; seeding it lets the walker
-        // Step::Jump to the target. The B->alt_entry slot at +0x38
-        // naturally pulls in `fn + 8` this way.
-        let sb_idx = fn_idx - struct_words;
-        for k_off in 0..struct_words {
-            let w = words[sb_idx + k_off];
-            if (w >> 24) != 0xEA { continue; }
-            let pa = (sb_idx as u32 + k_off as u32) * 4;
+        // Branch slots: accept B-AL or `MOV PC,LR` (default empty).
+        // Zero slots have no method registered and need no marking.
+        for &off in &BRANCH_OFFSETS {
+            let pa = struct_base_pa + off;
+            let w = words[(pa >> 2) as usize];
+            let is_b_al = (w >> 24) == 0xEA;
+            let is_mov_pc_lr = w == MOV_PC_LR;
+            if !is_b_al && !is_mov_pc_lr { continue; }
             if !reach.get_word(pa) && seen.insert(pa) {
-                worklist.push(pa);
+                worklist.push((pa, vec![WalkReason::Seed(SeedSource::ClassInfoBranchSlot { tramp_pc: fn_pa })]));
+                added += 1;
+            }
+        }
+
+        // Resolve fBTableDelta and fEntryProcDelta to absolute PAs.
+        // Each delta is signed 32-bit, self-relative to its field.
+        let resolve = |off: u32| -> Option<u32> {
+            let field_pa = struct_base_pa + off;
+            let delta = words[(field_pa >> 2) as usize] as i32;
+            if delta == 0 { return None; }
+            let target = (field_pa as i64).wrapping_add(delta as i64);
+            if !(0..=ROM_SIZE_BYTES as i64 - 4).contains(&target) { return None; }
+            let target = target as u32;
+            if target & 3 != 0 { return None; }
+            Some(target)
+        };
+        let btable_start = resolve(FBTABLE_OFFSET);
+        let entry_proc = resolve(FENTRYPROC_OFFSET);
+
+        // B-table: iterate [btable_start, entry_proc) and seed every
+        // B-AL entry. The B-table layout is `[opt zero header],
+        // B back-pointer-to-classinfo, B method0, B method1, ...` —
+        // bounding by the entry-proc target catches every method
+        // regardless of count, so small classes (e.g. TGrayShrink with
+        // a single method, below `collect_b_run_roots`'s 3-entry
+        // threshold) don't lose their back-pointer + method pair.
+        if let (Some(start), Some(end)) = (btable_start, entry_proc) {
+            if end > start {
+                let mut pa = start;
+                while pa < end {
+                    let w = words[(pa >> 2) as usize];
+                    if (w >> 24) == 0xEA && (w >> 28) != 0xF
+                        && !reach.get_word(pa)
+                        && seen.insert(pa)
+                    {
+                        worklist.push((pa, vec![WalkReason::Seed(SeedSource::ClassInfoBTable { tramp_pc: fn_pa })]));
+                        added += 1;
+                    }
+                    pa = pa.wrapping_add(4);
+                }
+            }
+        }
+
+        // Entry proc: arbitrary function prologue. Seed once gated.
+        if let Some(target) = entry_proc {
+            let tw = words[(target >> 2) as usize];
+            if (tw >> 28) != 0xF
+                && is_known_function_start(tw)
+                && !reach.get_word(target)
+                && seen.insert(target)
+            {
+                worklist.push((target, vec![WalkReason::Seed(SeedSource::ClassInfoEntryProc { tramp_pc: fn_pa })]));
                 added += 1;
             }
         }
@@ -1568,7 +1920,7 @@ fn collect_indexed_dispatch_roots(
     words: &[u32],
     reach: &Bitmap,
     fn_ranges: &[(u32, u32)],
-    worklist: &mut Vec<u32>,
+    worklist: &mut Vec<(u32, Vec<WalkReason>)>,
     stats: &mut WalkStats,
 ) -> usize {
     let mut added = 0usize;
@@ -1704,7 +2056,7 @@ fn collect_indexed_dispatch_roots(
             if (tgt_word >> 28) == 0xF { continue; }
             if !is_known_function_start(tgt_word) { continue; }
             if !reach.get_word(final_tgt) && seen.insert(final_tgt) {
-                worklist.push(final_tgt);
+                worklist.push((final_tgt, vec![WalkReason::Seed(SeedSource::IndexedDispatch { dispatch_pc: addr })]));
                 added += 1;
             }
         }
@@ -1724,7 +2076,7 @@ fn collect_indexed_dispatch_roots(
 fn collect_fnptr_literal_roots(
     words: &[u32],
     reach: &Bitmap,
-    worklist: &mut Vec<u32>,
+    worklist: &mut Vec<(u32, Vec<WalkReason>)>,
     stats: &mut WalkStats,
 ) -> usize {
     let mut added = 0usize;
@@ -1757,7 +2109,7 @@ fn collect_fnptr_literal_roots(
         if !is_known_function_start(tgt_word) { continue; }
         if reach.get_word(final_tgt) { continue; }
         if !seen.insert(final_tgt) { continue; }
-        worklist.push(final_tgt);
+        worklist.push((final_tgt, vec![WalkReason::Seed(SeedSource::FnPtrLiteral { ldr_pc: addr })]));
         added += 1;
     }
     stats.fnptr_literal_roots += added;
@@ -1813,9 +2165,24 @@ fn run(args: Args) -> Result<(), String> {
     let (words, hash) = load_rom_and_rex(&args.rom, &args.rex)?;
     let hash_str = format!("{:08x}", hash);
 
-    let mut symbols = load_symbol_roots(&args.symbols)?;
+    let (mut symbols, sym_filter_stats) = load_symbol_roots(&args.symbols, &words)?;
     let vectors: [u32; 8] = [0x00, 0x04, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C];
     for v in vectors { symbols.push(v); }
+
+    // Manual exceptions for code unreachable by any static pass. See
+    // `MANUAL_CODE_ROOTS` for the rationale per entry.
+    symbols.extend_from_slice(MANUAL_CODE_ROOTS);
+
+    // C$$ctorvec / C$$dtorvec ranges: each `<prefix>vec$$Base` /
+    // `<prefix>vec$$Limit` pair delimits an array of function pointers.
+    // Every pointer's target is a ctor/dtor body invoked at runtime
+    // by the C++ startup/shutdown loop, with no static control-flow
+    // reference — without seeding them, every ctor/dtor body in
+    // 0x38a4a4..0x38a930 (the entire C-runtime ctor+dtor block) goes
+    // unmarked.
+    let vector_ranges = load_vector_ranges(&args.symbols)?;
+    let (vector_count, vector_seeds) =
+        seed_vector_table_roots(&words, &vector_ranges, &mut symbols);
 
     // REx-header roots: parse the external REx's entry table at
     // guest PA 0x00800000 and harvest every absolute PA it references
@@ -1829,11 +2196,13 @@ fn run(args: Args) -> Result<(), String> {
     symbols.sort_unstable();
     symbols.dedup();
 
-    // Function ranges from code-symbols.txt: half-open spans
+    // Function ranges from the filtered symbol list: half-open spans
     // (sym_n, sym_{n+1}) for use by collect_pc_relative_addr_roots
     // to scope its dispatch-base check. The last entry stretches
-    // to the ROM aperture end.
-    let mut fn_addrs = load_symbol_roots(&args.symbols)?;
+    // to the ROM aperture end. Reuses the same filter as the seed
+    // list — entries that aren't real function entries shouldn't
+    // anchor a "function range".
+    let mut fn_addrs = symbols.clone();
     fn_addrs.sort_unstable();
     fn_addrs.dedup();
     let mut fn_ranges: Vec<(u32, u32)> = fn_addrs
@@ -1844,42 +2213,126 @@ fn run(args: Args) -> Result<(), String> {
         fn_ranges.push((last, ROM_SIZE_BYTES as u32));
     }
 
-    symbols.sort_unstable();
-    symbols.dedup();
-
-    // Pre-mark thunk-page words in `reach` before the walker runs. The
-    // patch-table thunks (PA 0x2000..0x12860) and gROMPublicJumpTable
-    // family thunks (PA 0x13000..0x15FFF + sibling pages) live in
-    // pages the kernel aliases into jump-table VAs at boot via the in-
-    // ROM L2 page tables BuildPatchTablePageTable installs. The walker
-    // currently decodes B targets at PC=cur (a PA), which gets the
-    // wrong target for these aliased thunks. Pre-marking sidesteps
-    // that — proper VA-aware walker is a follow-up.
+    // No JT-thunk pre-marking. The patch-table B-thunks are reached via
+    // their VA-keyed entries in symbols.txt — `load_symbol_roots`
+    // translates each to its thunk PA, the walker pops the thunk, marks
+    // the B-AL word, and follows Step::Jump to the real ROM target.
+    // Pre-walk: mark known JT-thunk page PAs as code so the walker
+    // breaks on entry. These are pages where the kernel branches in
+    // via VA aliasing AND the PA-decoded B target gives a wrong/garbage
+    // destination. The walker won't visit them because
+    // `resolve_target_to_rom` now follows the VA chain to the final ROM
+    // PA — pre-marking only ensures BE-8 byteswap coverage.
     //
-    //   PA 0x16000  gROMPatchTablePageTable family (thunks at PA
-    //               0x2000..0x12860, aliased to VA 0x01A00000+).
-    //   PA 0x16400/16800/16C00  the family's siblings — we only need
-    //               to walk the base since each L2 maps the same set
-    //               of bucket pages.
-    //   PA 0x18000  gROMPublicJumpTablePageTable (thunks at PA
-    //               0x13000..0x15FFF + sibling pages 0x1B000..
-    //               0x21FFF, aliased to VA 0x01800000+).
+    // CRITICAL: don't pre-mark every page mapped by the JT L2s. Those
+    // L2s alias many pages, including normal vtables (e.g. PA 0x1b000,
+    // 0x1d000) whose PA-decoded B targets ARE valid (or chain-resolve
+    // valid via patch-table VAs). Pre-marking those would block the
+    // walker from following the vtable's targets — losing real code
+    // coverage. Restrict pre-marking to the specific PA ranges we know
+    // are pure thunk backing.
+    const PURE_THUNK_PAGES: &[(u32, u32)] = &[
+        // Patch-table backing: 17 pages × 4 KiB = 0x11000 bytes.
+        // Per `docs/NEWTON_INTERNALS.md`, every word is a B-thunk
+        // aliased into VA 0x01A00000+ via gROMPatchTablePageTable.
+        (0x0000_2000, 0x0001_3000),
+        // gROMPublicJumpTable backing: 3 pages aliased into VA
+        // 0x01800000+ via gROMPublicJumpTablePageTable. PA-decoded
+        // targets look in-ROM but are wrong; the kernel's runtime
+        // VA decoding gives the real target (which then chain-
+        // resolves through patch-table thunks).
+        (0x0001_3000, 0x0001_6000),
+        // Secondary-jt backing: 1 page aliased into VA 0x01E00000+
+        // via the secondary-jt L2 at PA 0x7EC000.
+        (0x007E_E000, 0x007E_E048),
+    ];
     let mut initial_reach = Bitmap::new();
-    let mut jt_thunk_words = 0usize;
-    for &(l2_pa, label) in &[
-        (0x0001_6000u32, "gROMPatchTablePageTable"),
-        (0x0001_6400u32, "patch-table L2 sec 0x1b"),
-        (0x0001_6800u32, "patch-table L2 sec 0x1c"),
-        (0x0001_8000u32, "gROMPublicJumpTablePageTable"),
-    ] {
-        jt_thunk_words += mark_thunk_pages_via_l2(
-            &words, &mut initial_reach, l2_pa, label,
-        );
+    let mut prewalk_thunk_words = 0usize;
+    for &(start, end) in PURE_THUNK_PAGES {
+        let mut pa = start;
+        while pa < end {
+            if (pa as usize) + 4 > ROM_SIZE_BYTES { break; }
+            let insn = words[(pa >> 2) as usize];
+            // Only mark words that actually look like B-AL thunks.
+            // Trailing zero-pad / partial-page tails get skipped so
+            // post-walk chain resolution can still pick up any
+            // straggler thunks via reach-based discovery.
+            if (insn >> 24) == 0xEA && !initial_reach.get_word(pa) {
+                initial_reach.set_word(pa);
+                prewalk_thunk_words += 1;
+            }
+            pa = pa.wrapping_add(4);
+        }
     }
 
-    let (reach, mut stats) = walk(&words, &symbols, initial_reach, &fn_ranges);
+    let (mut reach, mut stats) = walk(&words, &symbols, initial_reach, &fn_ranges);
     stats.rex_header_roots = rex_header_root_count;
-    stats.rom_jumptable_thunk_roots = jt_thunk_words;
+
+    // Post-walk: scan every reached B/BL/Bcc instruction and any
+    // reached LDR-pc-rel literal. If the target/literal is a JT VA,
+    // chase the chain through `resolve_jt_chain` and mark every thunk
+    // PA along the way as code (so BE-8 byteswap covers them). The
+    // walker no longer steps into thunk pages — `resolve_target_to_rom`
+    // returns the final ROM PA via chain resolution — so without this
+    // pass the thunk bytes would stay BE and the kernel's branches
+    // through them would fetch garbage.
+    let mut public_jt_words = 0usize;
+    {
+        let mut chain_thunks: HashSet<u32> = HashSet::new();
+        for i in 0..ROM_WORD_COUNT {
+            let pc = (i as u32) * 4;
+            if !reach.get_word(pc) { continue; }
+            let w = words[i];
+            let cond = (w >> 28) & 0xF;
+            if cond == 0xF { continue; }
+            // B/BL/Bcc → target VA
+            if (w >> 25) & 0b111 == 0b101 {
+                let imm24 = w & 0xFFFFFF;
+                let simm = sign_extend(imm24, 24) << 2;
+                let target = pc.wrapping_add(8).wrapping_add(simm as u32);
+                if let Some(c) = resolve_jt_chain(&words, target) {
+                    for t in c.thunks { chain_thunks.insert(t); }
+                }
+            }
+            // LDR Rt, [pc, #±imm12] → literal value (any cond)
+            let masked = (w >> 16) & 0x0FFF;
+            if masked == 0x59F || masked == 0x51F {
+                let imm12 = (w & 0xFFF) as i32;
+                let sgn = if masked == 0x59F { 1 } else { -1 };
+                let lit_pc = (pc as i64) + 8 + (sgn as i64) * (imm12 as i64);
+                if lit_pc >= 0 && (lit_pc as usize) + 4 <= ROM_SIZE_BYTES
+                    && (lit_pc as u32) & 3 == 0
+                {
+                    let lit = words[(lit_pc as usize) >> 2];
+                    if let Some(c) = resolve_jt_chain(&words, lit) {
+                        for t in c.thunks { chain_thunks.insert(t); }
+                    }
+                }
+            }
+        }
+        for t in chain_thunks {
+            if !reach.get_word(t) {
+                reach.set_word(t);
+                public_jt_words += 1;
+            }
+        }
+    }
+
+    // Manual data-range exclusions: clear reach bits in any range
+    // listed in `MANUAL_DATA_RANGES`. Runs after the JT-thunk mark so
+    // an exclusion can override a thunk that happens to overlap (e.g.
+    // a thunk page that's actually data per a hand-fixed gap).
+    let mut manual_data_words_cleared = 0usize;
+    for &(start, end) in MANUAL_DATA_RANGES {
+        let mut pa = start;
+        while pa < end {
+            if reach.get_word(pa) {
+                reach.clear_word(pa);
+                manual_data_words_cleared += 1;
+            }
+            pa = pa.wrapping_add(4);
+        }
+    }
     // Dedup sometimes removes some of the REx entries (they may
     // overlap vectors/symbols); report the actual count after merge.
     let _ = &mut rex_header_root_count;
@@ -1924,14 +2377,33 @@ fn run(args: Args) -> Result<(), String> {
     writeln!(f, "    rex     = {}", args.rex.display()).ok();
     writeln!(f, "    symbols = {}", args.symbols.display()).ok();
     writeln!(f, "  hash(fnv1a32 of rom || rex) = 0x{}", hash_str).ok();
+    writeln!(f, "  symbol filter (load_symbol_roots):").ok();
+    writeln!(f, "    raw lines:               {}", sym_filter_stats.raw_lines).ok();
+    writeln!(f, "    parse-skipped:           {}", sym_filter_stats.parse_skipped).ok();
+    writeln!(f, "    misaligned addr:         {}", sym_filter_stats.misaligned).ok();
+    writeln!(f, "    out-of-rom addr (>=16M): {}", sym_filter_stats.out_of_rom).ok();
+    writeln!(f, "    linker-marker dropped:   {}", sym_filter_stats.linker_marker_dropped).ok();
+    writeln!(f, "    g[A-Z]* dropped:         {}", sym_filter_stats.g_prefix_dropped).ok();
+    writeln!(f, "    k[A-Z]* dropped:         {}", sym_filter_stats.k_prefix_dropped).ok();
+    writeln!(f, "    NV-cond first-word:      {}", sym_filter_stats.nv_cond_dropped).ok();
+    writeln!(f, "    not-prologue first-word: {}", sym_filter_stats.not_prologue_dropped).ok();
+    writeln!(f, "    JT-VA resolved → thunk:  {}", sym_filter_stats.jt_va_resolved).ok();
+    writeln!(f, "    accepted:                {}", sym_filter_stats.accepted).ok();
+    writeln!(f, "  vector tables (ctorvec / dtorvec):").ok();
+    writeln!(f, "    ranges discovered:       {}", vector_count).ok();
+    writeln!(f, "    function pointers seeded: {}", vector_seeds).ok();
+    for (label, base, limit) in &vector_ranges {
+        writeln!(f, "    {label}: 0x{:08x}..0x{:08x} ({} bytes)",
+                 base, limit, limit - base).ok();
+    }
+    writeln!(f, "  manual data-range exclusions:").ok();
+    writeln!(f, "    words cleared: {}", manual_data_words_cleared).ok();
+    writeln!(f, "  gROMPublicJumpTable post-walk mark:").ok();
+    writeln!(f, "    pre-walk thunk-page words: {}", prewalk_thunk_words).ok();
+    writeln!(f, "    chain-resolved thunk words: {}", public_jt_words).ok();
     writeln!(f, "  walker:").ok();
     writeln!(f, "    symbol roots (post-merge): {}", stats.initial_roots).ok();
     writeln!(f, "    rex-header roots added:    {}", stats.rex_header_roots).ok();
-    writeln!(
-        f,
-        "    rom-jumptable thunk words: {}",
-        stats.rom_jumptable_thunk_roots
-    ).ok();
     writeln!(f, "    words walked (with revisits): {}", stats.words_walked).ok();
     writeln!(f, "    NV-cond words skipped:     {}", stats.nv_cond_skips).ok();
     writeln!(f, "    data-range terminations:   {}", stats.data_range_stops).ok();

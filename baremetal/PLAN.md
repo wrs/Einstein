@@ -452,23 +452,39 @@ That entry instance thus shows up to AlterIndexes as a "real
 key for this index" but the upstream Add that should have
 indexed it was either skipped or never reached.
 
-The next step is to figure out where the entry-with-this-
-malformed-key was created. Two candidates:
+**Walter's correction (2026-05-03): there is no persistent
+storage; every boot starts with blank flash.** That rules out
+the "soup-restore from disk" hypothesis. Every entry, every
+index, every B-tree node visible in this boot was constructed
+during this boot run — including the failing entries.
 
-1. The package-install / soup-restore code path that runs
-   during early boot rebuilds the on-disk soup state into RAM
-   handles. If our hypervisor's persistent flash content
-   diverges from Einstein's at the relevant byte offsets (or if
-   the rebuild walker drops keys due to some byte-level
-   mismatch), we'd end up with entry instances whose
-   per-index-key Refs point at the keyDef tag instead of a
-   proper class. Probe `Mount__11TFlashStoreFv` /
-   `Add__11TFlashStoreFP7TObjRef` to capture the entry-creation
-   sequence.
-2. The flash-store readback path (`Read__6TStoreFUllPcT2`)
-   already proven byte-faithful for B-tree node data; less
-   likely to be the issue but worth re-checking for the entry-
-   record path specifically.
+So somewhere in this same boot's code path, the kernel:
+
+1. Built up `idx 0x4f`'s B-tree via 60+ `KeyToSKey + _BTEnterKey`
+   pairs (all using ROM-symbol-classed key binaries).
+2. Created the entry whose Delete now fails, with a per-index
+   value slot that `GetEntrySKey` returns non-NIL for.
+3. Skipped the corresponding `Add__10TSoupIndex` /
+   `_BTEnterKey` call that should have populated idx 0x4f's
+   B-tree with the entry's key.
+
+In Einstein the AlterIndexes short-circuit (`if GetEntrySKey
+returns 0 → skip throw`) presumably catches this case — i.e.
+the entry's slot is NIL there. In our hypervisor the slot
+returns a binary whose `class` IS the keyDef tag itself
+(`0x003c13a4`). That class divergence is the next thread to
+pull: we want to know how the entry's per-index slot ended up
+holding a Ref-to-keyDef-tag instead of NIL. Candidate paths to
+instrument next:
+
+- The entry's container-frame / map slot at the keyDef-named
+  field (i.e. trace the slot-write path that stamps the
+  per-index value into the entry's frame).
+- `IsFaultBlock`/`NoFaultObjectPtr` — REP first dereferences
+  the entry through `NoFaultObjectPtr` at `EntryRemoveFromSoup
+  + 0x5c`; if our hypervisor's fault-block recogniser diverges,
+  REP could be operating on what Einstein would treat as a
+  fault block.
 
 #### Found while diagnosing: ORIG_PCS table overflow
 

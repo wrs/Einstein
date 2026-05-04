@@ -1415,6 +1415,22 @@ pub const KEY_TO_SKEY_DONE_PROBE_HVC_IMM: u32 = 0x8A;
 pub const KEY_TO_SKEY_DONE_PROBE_PC:      u32 = 0x0034_DDA4;
 const KEY_TO_SKEY_DONE_FIRST_INSN:        u32 = 0xE5BD_0004; // ldr r0, [sp, #4]!
 
+/// Iter-89: probe at `AlterIndexes__FUcRC6RefVarT2Ul` entry
+/// (`0x0034_7BA0`). Args (APCS):
+///   r0 = unsigned char Add/Delete flag (1 = Add, 0 = Delete)
+///   r1 = RefVar const& (soup or index list)
+///   r2 = RefVar const& T2 — **the entry being added/deleted**
+///        (third C++ arg; the fault block has been resolved /
+///        populated by upstream code before this point per
+///        Walter's note).
+///   r3 = ulong
+/// Pretty-print the entry so we can see exactly what AlterIndexes
+/// is about to enumerate the soup's per-index keys for. Emulates
+/// `mov ip, sp`.
+pub const ALTER_INDEXES_ENTRY_PROBE_HVC_IMM: u32 = 0x8B;
+pub const ALTER_INDEXES_ENTRY_PROBE_PC:      u32 = 0x0034_7BA0;
+const ALTER_INDEXES_ENTRY_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -2111,6 +2127,14 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(ENTRY_REMOVE_PROBE_HVC_IMM),
             "EntryRemoveFromSoup entry (capture entry RefVar + tagged Ref)",
             ENTRY_REMOVE_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            ALTER_INDEXES_ENTRY_PROBE_PC,
+            ALTER_INDEXES_ENTRY_FIRST_INSN,
+            hvc_insn(ALTER_INDEXES_ENTRY_PROBE_HVC_IMM),
+            "AlterIndexes entry (capture entry RefVar at r2)",
+            ALTER_INDEXES_ENTRY_PROBE_HVC_IMM,
         );
         patch_probe(
             rom_ptr,

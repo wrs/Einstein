@@ -1527,6 +1527,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::KEY_TO_SKEY_DONE_PROBE_HVC_IMM => {
             handle_key_to_skey_done_probe(ctx);
         }
+        v if v == crate::rom_patches::ALTER_INDEXES_ENTRY_PROBE_HVC_IMM => {
+            handle_alter_indexes_entry_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -2343,6 +2346,11 @@ fn handle_und(ctx: &mut TrapContext) {
         }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::KEY_TO_SKEY_DONE_PROBE_HVC_IMM) => {
             handle_key_to_skey_done_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::ALTER_INDEXES_ENTRY_PROBE_HVC_IMM) => {
+            handle_alter_indexes_entry_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -4655,6 +4663,53 @@ fn handle_alter_indexes_throw_probe_with(ctx: &mut TrapContext, source_cpsr: u32
         ctx.x[1] = (ctx.x[1] & 0xFFFF_FFFF_0000_0000) | 106u64;
     }
     // r0 <= 0: leave r1 unchanged (movle not executed).
+}
+
+/// Iter-89: probe at `AlterIndexes__FUcRC6RefVarT2Ul` entry
+/// (`0x0034_7BA0`). The "third C++ argument" T2 is `r2` (a
+/// `RefVar const&` pointing at the entry being added/deleted);
+/// per Walter's note, the fault block has been resolved /
+/// populated by the caller before AlterIndexes runs, so r2
+/// dereferences to a fully-formed entry frame here. We pretty-
+/// print it with depth=3 so we can see the entry's full slot
+/// structure (including whatever value sits at the keyDef's
+/// slot — the 'string we keep observing as malformed at the
+/// later DeleteKey site). Emulates `mov ip, sp`.
+fn handle_alter_indexes_entry_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_alter_indexes_entry_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_alter_indexes_entry_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let r0 = ctx.x[0] as u32; // u8 Add(1)/Delete(0) flag
+    let r1 = ctx.x[1] as u32; // &RefVar (1st C++ arg)
+    let r2 = ctx.x[2] as u32; // &RefVar T2 — entry being altered
+    let r3 = ctx.x[3] as u32; // ulong
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+
+    // Two indirections to get the entry's tagged Ref: r2 = &RefVar,
+    // *r2 = slot ptr, **r2 = tagged Ref.
+    let slot_ptr = guest_mem::read_word_va(r2)
+        .or_else(|| guest_mem::read_word_pa(r2))
+        .unwrap_or(0xDEAD_BEEF);
+    let entry_ref = guest_mem::read_word_va(slot_ptr)
+        .or_else(|| guest_mem::read_word_pa(slot_ptr))
+        .unwrap_or(0xDEAD_BEEF);
+
+    let kind = if (r0 & 0xff) == 0 { "Delete" } else { "Add" };
+    kprintln!(
+        "AlterIndexes #{} ENTRY: kind={} r0={:#010x} r1(&RefVar1)={:#010x} r2(&entry)={:#010x} entry_slot={:#010x} entry_ref={:#010x} r3={:#010x} caller_lr={:#010x} sp={:#010x}",
+        seq, kind, r0, r1, r2, slot_ptr, entry_ref, r3, lr, sp,
+    );
+    crate::heap_check::pretty_print_ref("entry", entry_ref, 3);
+
+    // Emulate `mov ip, sp`.
+    ctx.x[12] = (ctx.x[12] & 0xFFFF_FFFF_0000_0000) | (sp as u64);
 }
 
 /// Iter-89: probe at `EntryRemoveFromSoup__FRC6RefVar` entry

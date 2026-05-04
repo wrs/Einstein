@@ -226,11 +226,19 @@ fn seed_block(base: u32) {
 fn write_u32(byte_offset: u32, value: u32) {
     assert!((byte_offset as usize) + 4 <= SIZE);
     assert!(byte_offset % 4 == 0);
+    // The kernel reads flash via stage-2-mapped LDR with CPSR.E=1
+    // (BE-8), so on-disk bytes must be the BE encoding of `value`.
+    // A native LE u32 store of `value.swap_bytes()` lays down the
+    // right bytes. Guest-test mode runs LE — identity store.
+    #[cfg(not(nh_guest_test))]
+    let stored = value.swap_bytes();
+    #[cfg(nh_guest_test)]
+    let stored = value;
     // SAFETY: bounds- and alignment-checked above; called single-threaded
     // from kmain on core 0 before the guest is running, so no aliasing.
     unsafe {
         let base = addr_of_mut!(GUEST_FLASH) as *mut u8;
-        (base.add(byte_offset as usize) as *mut u32).write(value);
+        (base.add(byte_offset as usize) as *mut u32).write(stored);
     }
 }
 
@@ -279,11 +287,23 @@ pub fn program_word(pa: u32, word: u32, mask: u32) -> bool {
     }
     // SAFETY: `off` bounded above; single-writer under the EL2 trap
     // handler.
+    //
+    // Under BE-8 the kernel reads the prev/new word via LDR with
+    // CPSR.E=1 (BE byte order). Round-trip through swap_bytes so the
+    // mask logic operates on the kernel-intended numerical value.
     unsafe {
         let base = addr_of_mut!(GUEST_FLASH) as *mut u8;
         let slot = base.add(off) as *mut u32;
+        #[cfg(not(nh_guest_test))]
+        let prev = core::ptr::read_volatile(slot).swap_bytes();
+        #[cfg(nh_guest_test)]
         let prev = core::ptr::read_volatile(slot);
-        core::ptr::write_volatile(slot, (prev & !mask) | word);
+        let new = (prev & !mask) | word;
+        #[cfg(not(nh_guest_test))]
+        let stored = new.swap_bytes();
+        #[cfg(nh_guest_test)]
+        let stored = new;
+        core::ptr::write_volatile(slot, stored);
     }
     true
 }

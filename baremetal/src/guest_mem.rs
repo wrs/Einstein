@@ -115,6 +115,52 @@ pub fn rom_word_is_code(idx: usize) -> bool {
     (REACH_BITMAP[idx / 8] >> (idx % 8)) & 1 != 0
 }
 
+/// Read a guest stage-1 page-table entry (L1 or L2) through a raw host
+/// pointer, returning the kernel-intended numerical value.
+///
+/// Under iter-90+ BE-8 (`SCTLR_EL1.EE=1`) the AArch32 EL1 MMU walks page
+/// tables in big-endian byte order. The kernel writes entries with
+/// CPSR.E=1 STR (also BE), so memory bytes match the MMU's view. EL2
+/// runs AArch64 little-endian; a raw u32 read returns the byteswap of
+/// what the MMU sees. Recover the kernel-intended numerical value by
+/// swapping bytes.
+///
+/// Guest-test mode runs the guest LE (CPSR.E=0, SCTLR.EE=0) — the MMU
+/// also walks LE, kernel STRs LE, and a host LE read is identity.
+///
+/// # Safety
+///
+/// `ptr` must point at a 32-bit page-table entry the caller is allowed
+/// to read (e.g. inside `GUEST_RAM` or a non-code ROM word).
+#[cfg(not(nh_guest_test))]
+#[inline]
+pub unsafe fn read_pt_entry(ptr: *const u32) -> u32 {
+    unsafe { ptr.read().swap_bytes() }
+}
+#[cfg(nh_guest_test)]
+#[inline]
+pub unsafe fn read_pt_entry(ptr: *const u32) -> u32 {
+    unsafe { ptr.read() }
+}
+
+/// Write a guest stage-1 page-table entry as the kernel-intended numerical
+/// value. See `read_pt_entry` for the BE-8 byte-order reasoning.
+///
+/// # Safety
+///
+/// `ptr` must point at a 32-bit guest-RAM (or guest-test) location that
+/// is safe to write under the paused-guest invariant.
+#[cfg(not(nh_guest_test))]
+#[inline]
+pub unsafe fn write_pt_entry(ptr: *mut u32, value: u32) {
+    unsafe { ptr.write(value.swap_bytes()); }
+}
+#[cfg(nh_guest_test)]
+#[inline]
+pub unsafe fn write_pt_entry(ptr: *mut u32, value: u32) {
+    unsafe { ptr.write(value); }
+}
+
 /// Write a 32-bit ARM instruction encoding into the ROM backing at
 /// word index `idx`. Under BE-8 the CPU's instruction fetch is always
 /// LE, so a native u32 write of the numerical encoding produces host
@@ -355,14 +401,23 @@ pub fn translate_va(va: u32) -> Option<u32> {
     if sctlr & 1 == 0 {
         return None;
     }
+    // Page-table entries are stored BE under iter-90+ (kernel STR
+    // with CPSR.E=1; MMU walker reads BE because SCTLR.EE=1). Use the
+    // PT-entry-aware reader so we recover the kernel-intended values
+    // — same byte-order convention as the hardware walker.
+    let read_pt_pa = |pa: u32| -> Option<u32> {
+        let h = host_addr_for(pa as usize, 4, /*for_write=*/ false)?;
+        // SAFETY: host_addr_for bounds-checks against the chosen backing.
+        Some(unsafe { read_pt_entry(h as *const u32) })
+    };
     let l1_idx = (va >> 20) as usize;
-    let l1_entry = read_word_pa(0x0400_0000 + (l1_idx as u32) * 4)?;
+    let l1_entry = read_pt_pa(0x0400_0000 + (l1_idx as u32) * 4)?;
     match l1_entry & 3 {
         2 => Some((l1_entry & 0xFFF0_0000) | (va & 0x000F_FFFF)),
         1 => {
             let l2_pa = l1_entry & 0xFFFF_FC00;
             let l2_idx = (va >> 12) & 0xFF;
-            let l2_entry = read_word_pa(l2_pa + l2_idx * 4)?;
+            let l2_entry = read_pt_pa(l2_pa + l2_idx * 4)?;
             match l2_entry & 3 {
                 1 => Some((l2_entry & 0xFFFF_0000) | (va & 0x0000_FFFF)),
                 2 | 3 => Some((l2_entry & 0xFFFF_F000) | (va & 0x0000_0FFF)),
@@ -453,7 +508,7 @@ pub fn fix_stage1_xn_bits() -> bool {
         }
 
         // SAFETY: L1 is 16 KiB = 4096 × 4 bytes, at RAM[0..16384].
-        let entry = unsafe { ram.add(i).read() };
+        let entry = unsafe { read_pt_entry(ram.add(i)) };
         let typ = entry & 3;
 
         // Rewrite fine-table (0b11) descriptors to fault (0b00). The ARMv4
@@ -466,7 +521,7 @@ pub fn fix_stage1_xn_bits() -> bool {
         // our abort handler can dispatch.
         if typ == 3 {
             // SAFETY: i < 4096.
-            unsafe { ram.add(i).write(0); }
+            unsafe { write_pt_entry(ram.add(i), 0); }
             fine_to_fault += 1;
             continue;
         }
@@ -478,7 +533,7 @@ pub fn fix_stage1_xn_bits() -> bool {
             let new = (entry & 0xFFF0_01E0) | 0x0000_0C0E;
             if new != entry {
                 // SAFETY: i < 4096.
-                unsafe { ram.add(i).write(new); }
+                unsafe { write_pt_entry(ram.add(i), new); }
                 sections_patched += 1;
             }
         }
@@ -489,7 +544,7 @@ pub fn fix_stage1_xn_bits() -> bool {
             let new = (entry & 0xFFFF_FC00) | (entry & 0x0000_01E0) | 0x01;
             if new != entry {
                 // SAFETY: i < 4096.
-                unsafe { ram.add(i).write(new); }
+                unsafe { write_pt_entry(ram.add(i), new); }
             }
         }
 
@@ -522,7 +577,7 @@ pub fn fix_stage1_xn_bits() -> bool {
         for j in 0..256 {
             // SAFETY: bounds checked above.
             let ptr = unsafe { base.add(l2_idx_start + j) };
-            let e = unsafe { ptr.read() };
+            let e = unsafe { read_pt_entry(ptr) };
             let typ = e & 3;
             let new = match typ {
                 0 => continue,                         // fault, leave alone
@@ -710,7 +765,7 @@ pub fn fix_stage1_xn_bits() -> bool {
             }
 
             if new != e {
-                unsafe { ptr.write(new); }
+                unsafe { write_pt_entry(ptr, new); }
                 patched += 1;
                 if is_rom {
                     rom_writes += 1;
@@ -781,7 +836,7 @@ pub fn fix_stage1_xn_bits() -> bool {
     // being invoked for our DFSC=5 fault.
     static mut LAST_L1_CD: u32 = 0xDEAD_BEEF;
     static mut TRANSITION_SEQ: u32 = 0;
-    let cur_cd = unsafe { ram.add(0xCD).read() };
+    let cur_cd = unsafe { read_pt_entry(ram.add(0xCD)) };
     // SAFETY: single-threaded EL2.
     let (last, seq) = unsafe {
         let l = LAST_L1_CD;
@@ -841,7 +896,7 @@ pub fn install_scratch_pool_l1_section() {
     let idx = (crate::shadow_stub::SCRATCH_POOL_VA >> 20) as usize;
 
     // SAFETY: idx < 4096; GUEST_RAM holds the kernel L1 at TTBR0 = 0x0400_0000.
-    let entry = unsafe { ram.add(idx).read() };
+    let entry = unsafe { read_pt_entry(ram.add(idx)) };
 
     let installed = scratch_pool_l1_section();
     // Acceptable pre-states:
@@ -874,7 +929,7 @@ pub fn install_scratch_pool_l1_section() {
 
     if entry != installed {
         // SAFETY: idx < 4096.
-        unsafe { ram.add(idx).write(installed); }
+        unsafe { write_pt_entry(ram.add(idx), installed); }
         crate::dprintln!(
             "shadow_stub scratch: installed kernel L1[{:#x}] = {:#010x} (was {:#010x})",
             idx, installed, entry,
@@ -895,7 +950,7 @@ pub fn dump_stage1_walk(va: u32) {
     // L1 sits at the start of guest RAM (TTBR0 = 0x04000000 per probe).
     // SAFETY: l1_idx < 4096 and GUEST_RAM is 4 MiB so the whole 16 KiB
     // L1 table fits.
-    let l1 = unsafe { ram.add(l1_idx).read() };
+    let l1 = unsafe { read_pt_entry(ram.add(l1_idx)) };
     let ty = l1 & 3;
     let tname = match ty { 0=>"fault", 1=>"coarse", 2=>"section", 3=>"fine", _=>"?" };
     kprintln!(
@@ -925,7 +980,7 @@ pub fn dump_stage1_walk(va: u32) {
         let l2_idx = ((va >> 12) & 0xFF) as usize;
         // SAFETY: l2_off + l2_idx < (region_size / 4) for all valid L2 tables
         // we've produced; fix_stage1_xn_bits enforces the same bound.
-        let l2 = unsafe { base.add(l2_off + l2_idx).read() };
+        let l2 = unsafe { read_pt_entry(base.add(l2_off + l2_idx)) };
         let l2_ty = l2 & 3;
         let l2_name = match l2_ty { 0=>"fault", 1=>"large", 2|3=>"small", _=>"?" };
         kprintln!(
@@ -956,7 +1011,7 @@ pub fn dump_l1_neighbourhood(va: u32) {
         let i = centre + di;
         if i < 0 || i >= 4096 { continue; }
         // SAFETY: index bounds-checked.
-        let e = unsafe { ram.add(i as usize).read() };
+        let e = unsafe { read_pt_entry(ram.add(i as usize)) };
         let ty = match e & 3 { 0=>"fault", 1=>"coarse", 2=>"section", 3=>"fine", _=>"?" };
         kprintln!("      L1[{:#x}] = {:#010x}  ({})", i, e, ty);
     }
@@ -973,7 +1028,7 @@ pub fn dump_guest_l1_table() {
     for i in 0..32 {
         // SAFETY: i < 32; guest L1 table is 4 KiB = 1024 entries so well
         // inside GUEST_RAM bounds.
-        let entry = unsafe { ram.add(i).read() };
+        let entry = unsafe { read_pt_entry(ram.add(i)) };
         let kind = match entry & 3 {
             0 => "fault",
             1 => "coarse",
@@ -1000,7 +1055,7 @@ pub fn dump_guest_l1_table() {
                     for j in [0usize, 0x18, 0x19, 0x1a, 0x1b] {
                         let off = (l2_pa & 0x00FF_FFFF) / 4 + j;
                         // SAFETY: l2_pa is in-bounds for the region we chose.
-                        let e = unsafe { src_ptr.add(off).read() };
+                        let e = unsafe { read_pt_entry(src_ptr.add(off)) };
                         kprintln!("           L2[{:#04x}] = {:#010x}", j, e);
                     }
                 }

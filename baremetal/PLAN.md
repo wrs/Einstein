@@ -18,22 +18,76 @@ Bloated PLAN.md wastes context every read.
   functionality (not merely diagnostics):
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-92 follow-up):** chase the post-MMU-enable
-prefetch-abort loop. After SCTLR_EL1.M=1 at the second SCTLR write
-(BootOS+0x16c, `0x000011b5`), the next AArch32 trap shows
-`PC=0xC LR_svc=0x11ec10 mode=0x17 (ABT) FAR_EL1=0xc00000000` and
-the system loops on timer-IRQ-with-stuck-PABT. PC=0xC is the AArch32
-PABT vector (low-vector base, since SCTLR.V=0); the kernel's
-post-MMU L1 (TTBR=0x0400_0000) leaves L1[0] as a fault descriptor
-(see "guest L1 first 32 entries" dump — every entry is "fault"),
-so the very first PABT redirected to `0xC` faults again, and the
-abort handler can't make progress. Likely a real Phase B
-gap — vector-page mapping or `gIPCVectorBase` redirection after MMU
-enable. Iter-91 fix (literal-pool subtraction) and iter-92 fix
-(serial control/IE reads) progressed the boot from
-`SaveCPUStateAndStopSystem +0x2bc` (~250 log lines) through
-BasicBusControlRegInit, DACR/TTBR programming, MMU enable, and the
-L1 dump (~700+ lines).
+**Current goal (iter-93 follow-up):** investigate the DataAbortHandler
+deep-toast alert at FAR=0xfef80150 from `ReserveContiguousMemory`
+(LR_svc=0x313600), called from `InitCGlobals+0x18c` /
+`BootOS+0x22c`. The kernel reads VA 0xfef80150 (a high VA that
+should resolve through L1[0xfef] = lazy-coarse), the L1 entry is
+fault, the kernel's DataAbortHandler can't resolve it, and
+`DebuggerUND` halts with "Non-user-mode abort (deep toast alert)".
+This is real Phase B kernel-state work — the kernel hasn't yet set
+up the lazy L1[0xfef] mapping that ReserveContiguousMemory expects.
+Likely the L1[0xCD] / FaultMonitor lazy-allocation path needs a
+hypervisor-side handler we haven't wired up yet for VAs in the
+0xfef00000 range.
+
+### Iteration 93: byteswap guest page-table accesses + tick page + flash seed (BE-8 fix)
+
+iter-92 cleared the serial[mdem] +0x2800 wedge. Boot reached the
+second SCTLR write (M=1, MMU on) and immediately tripped a
+recursive prefetch-abort loop at `PC=0xC LR_svc=0x11ec10`. The L1
+dump showed all entries as "fault" with absurd values like
+`0x11040000`, `0x1e081000` — the `byteswap` of the kernel-intended
+descriptors `0x00000411`, `0x0010081e`. The hypervisor's L1/L2
+walkers (`fix_stage1_xn_bits`, `dump_guest_l1_table`,
+`dump_stage1_walk`, `install_scratch_pool_l1_section`,
+`translate_va`) read RAM via raw `ram.add(i).read()` LE; under BE-8
+the kernel STRs entries with CPSR.E=1 in BE byte order (matching
+what the MMU walker reads, since SCTLR.EE=1 makes both the kernel
+and the MMU use BE for page-table memory). EL2 is AArch64 LE — a
+raw read returns byteswapped values.
+
+Worse, `fix_stage1_xn_bits` was matching false-positive "section"
+entries (kernel descriptors whose byteswap happened to have
+bits[1:0]==10) and rewriting them with bogus normalised values via
+raw LE writes — corrupting the L1 such that the MMU saw garbage
+section descriptors pointing to PA 0x1e000000+. That's why the
+PABT loop fired immediately after MMU enable: the very first
+instruction fetch hit a "fault" entry and bounced into the PABT
+vector, whose own fetch hit another fault, ad infinitum.
+
+Fix in `src/guest_mem.rs`: introduce `read_pt_entry` /
+`write_pt_entry` inline helpers that always byteswap (under
+non-`nh_guest_test`) — matching what the AArch32 EL1 MMU walker
+sees with `SCTLR.EE=1`. Routed every guest L1/L2 raw access
+through them: `fix_stage1_xn_bits` (L1 + L2 reads/writes),
+`dump_guest_l1_table`, `dump_stage1_walk`, `dump_l1_neighbourhood`,
+`install_scratch_pool_l1_section`, the L1[0xCD] probe, and
+`translate_va`'s closure walk. ~10 sites in one file.
+
+Sweep for other raw guest-RAM/ROM accesses turned up two more
+byte-order bugs the kernel reads with CPSR.E=1:
+
+- `src/stage2.rs::publish` writes the synthetic tick / calendar
+  words into TICK_PAGE via raw LE; kernel BE-LDR returned
+  byteswapped values. Fixed: `swap_bytes()` before the volatile
+  write.
+- `src/peripherals/flash.rs::write_u32` (constructor seeds:
+  "DLDS", "OSCD", checksums, etc.) and
+  `flash::program_word` (kernel masked-write trap). Both raw LE;
+  kernel BE-LDRs from the stage-2-mapped flash region got
+  byteswapped headers. Fixed: route both through `swap_bytes()`
+  for BE-8, identity for `nh_guest_test`.
+
+Result: cold boot now runs ~1100 log lines (up from ~700); MMU
+enable cycles complete cleanly across multiple soft reboots; the
+L1 dump shows correct descriptors (sections at 0x100c0e..0xf00c0e,
+coarse L2[0]@0x400 with identity-map small pages); the boot
+reaches `InitCGlobals+0x18c → ReserveContiguousMemory +0x34
+LR_svc=0x313600` before tripping a real kernel data abort at
+FAR=0xfef80150 that the kernel's DataAbortHandler can't resolve
+(lazy-coarse mapping for L1[0xfef] not yet installed). 36/36 guest
+tests pass.
 
 ### Iteration 92: serial control/IE reads + qemu-reaper Stop hook
 

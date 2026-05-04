@@ -599,14 +599,22 @@ pub mod tick_page {
         crate::peripherals::vic::poll_alarm();
         let ticks = crate::peripherals::vic::ticks();
         let calendar = crate::peripherals::vic::calendar_seconds();
+        // The kernel reads these words via LDR with CPSR.E=1 (BE-8),
+        // so the host bytes must be the BE encoding of the numerical
+        // value. A native LE u32 write of `value.swap_bytes()` lays
+        // down the right bytes. Guest-test mode runs LE — identity.
+        #[cfg(not(nh_guest_test))]
+        let (ticks_be, calendar_be) = (ticks.swap_bytes(), calendar.swap_bytes());
+        #[cfg(nh_guest_test)]
+        let (ticks_be, calendar_be) = (ticks, calendar);
         // SAFETY: TICK_PAGE is a statically allocated 4 KiB-aligned
         // buffer; writing u32s at fixed offsets is in-bounds.
         unsafe {
             let ptr = addr_of_mut!(TICK_PAGE) as *mut u8;
             let cal_addr = ptr.add(TICK_OFFSET_CALENDAR);
             let ticks_addr = ptr.add(TICK_OFFSET_TICKS);
-            core::ptr::write_volatile(ticks_addr as *mut u32, ticks);
-            core::ptr::write_volatile(cal_addr as *mut u32, calendar);
+            core::ptr::write_volatile(ticks_addr as *mut u32, ticks_be);
+            core::ptr::write_volatile(cal_addr as *mut u32, calendar_be);
             // Clean the cache lines to the Point of Coherency. When
             // the guest boots with stage-1 MMU off (as every
             // guest-test does — see `guest-tests/common/test_runtime.S`),

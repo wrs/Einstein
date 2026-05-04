@@ -1390,6 +1390,31 @@ pub const ENTRY_REMOVE_PROBE_HVC_IMM: u32 = 0x88;
 pub const ENTRY_REMOVE_PROBE_PC:      u32 = 0x002D_A26C;
 const ENTRY_REMOVE_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
 
+/// Iter-89: probe at `KeyToSKey__FRC6RefVarT1P4SKeyPsPUc` entry
+/// (`0x0034_AD4C`). Args:
+///   r0 = RefArg const& key (the entry's value at this index's slot
+///        — print as a Ref so we can identify what value is being
+///        converted).
+///   r1 = RefArg const& tag (the index's keyDef tag).
+///   r2 = SKey* (output buffer for the encoded sortable key).
+///   r3 = short* (output buffer size).
+/// Captures all four and decodes/prints the input Ref so we see the
+/// raw key value before encoding. Emulates `mov ip, sp`.
+pub const KEY_TO_SKEY_ENTRY_PROBE_HVC_IMM: u32 = 0x89;
+pub const KEY_TO_SKEY_ENTRY_PROBE_PC:      u32 = 0x0034_AD4C;
+const KEY_TO_SKEY_ENTRY_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
+
+/// Iter-89: probe at `GetEntrySKey__FRC6RefVarT1P4SKeyPUc + 0xB0`
+/// (`0x0034_DDA4` — the `ldr r0, [sp, #4]!` immediately after the
+/// `bl KeyToSKey` at `0x0034_DDA0`). At this PC, KeyToSKey has
+/// just returned; r6 still holds the SKey* output buffer (callee-
+/// saved), and the (sp + 8) slot holds the resolved size. We log
+/// the SKey buffer contents and the size, then emulate the
+/// pre-indexed-with-writeback `ldr r0, [sp, #4]!`.
+pub const KEY_TO_SKEY_DONE_PROBE_HVC_IMM: u32 = 0x8A;
+pub const KEY_TO_SKEY_DONE_PROBE_PC:      u32 = 0x0034_DDA4;
+const KEY_TO_SKEY_DONE_FIRST_INSN:        u32 = 0xE5BD_0004; // ldr r0, [sp, #4]!
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -2086,6 +2111,22 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(ENTRY_REMOVE_PROBE_HVC_IMM),
             "EntryRemoveFromSoup entry (capture entry RefVar + tagged Ref)",
             ENTRY_REMOVE_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            KEY_TO_SKEY_ENTRY_PROBE_PC,
+            KEY_TO_SKEY_ENTRY_FIRST_INSN,
+            hvc_insn(KEY_TO_SKEY_ENTRY_PROBE_HVC_IMM),
+            "KeyToSKey entry (capture input RefArg key + output buffer ptrs)",
+            KEY_TO_SKEY_ENTRY_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            KEY_TO_SKEY_DONE_PROBE_PC,
+            KEY_TO_SKEY_DONE_FIRST_INSN,
+            hvc_insn(KEY_TO_SKEY_DONE_PROBE_HVC_IMM),
+            "GetEntrySKey post-KeyToSKey (capture filled-in SKey buffer)",
+            KEY_TO_SKEY_DONE_PROBE_HVC_IMM,
         );
     }
 }

@@ -408,6 +408,68 @@ newton.rom _Data_/Einstein.rex 90` — if Einstein also throws
 parity. If not, we have a real divergence to chase upstream of
 where the entry's index-key is supposed to be inserted.
 
+#### Iter-89 KeyToSKey trace — the Delete key was never inserted
+
+Probes at `KeyToSKey__FRC6RefVarT1P4SKeyPsPUc` entry (HVC #0x89,
+captures the input RefArg key + decoded class info) and at
+`GetEntrySKey + 0xB0` (HVC #0x8A, captures the resolved SKey
+buffer + size after `bl KeyToSKey` returns) collected every
+RefArg-to-SKey conversion across the boot.
+
+For `idx 0x4f` (tag_ref=`0x003c13a5`, root_id=0x12c — the To-Do
+soup's secondary index), the trace shows:
+
+- 60+ KeyToSKey calls with the same tag_ref, all converting
+  different key_refs (the entry's value at this index's slot)
+  into SKeys — these are the Adds that successfully populated
+  the B-tree across boot.
+- One single call (KeyToSKey #98) with `key_ref=0x0c61d3ed,
+  tag_ref=0x003c13a5` — and that's the Delete query that
+  immediately fires. Searching for any *other* call with the
+  same `(key_ref=0x0c61d3ed, tag_ref=0x003c13a5)` pair across
+  the entire boot returns nothing.
+
+So the entry-being-deleted's per-index value (`#C61D3ED` for
+entry `#C61D1ED`) was NEVER converted to an SKey via the index's
+keyDef before the Delete fired — meaning the Add path never
+inserted that key into the B-tree. The Delete is searching for a
+key that genuinely was never indexed.
+
+Decoded class info also differs:
+
+- Last successful Add into idx 0x4f: `key_ref=0x00791bbd` (ROM
+  binary, class `0x00785374`, 12 bytes of data — the SKey
+  produced bytes match the UTF-16BE prefix of "To Do" — likely a
+  ROM-resident "To Do soup" string symbol).
+- Failing Delete query: `key_ref=0x0c61d3ed` (heap binary, class
+  **`0x003c13a4` = the keyDef tag itself**, 12 bytes of data).
+
+The entry's per-index value claims its class IS the keyDef tag
+(`0x003c13a4`), suggesting it was constructed (perhaps by the
+package install / soup-restore path) with a placeholder class
+that points at the keyDef rather than at a concrete sub-class.
+That entry instance thus shows up to AlterIndexes as a "real
+key for this index" but the upstream Add that should have
+indexed it was either skipped or never reached.
+
+The next step is to figure out where the entry-with-this-
+malformed-key was created. Two candidates:
+
+1. The package-install / soup-restore code path that runs
+   during early boot rebuilds the on-disk soup state into RAM
+   handles. If our hypervisor's persistent flash content
+   diverges from Einstein's at the relevant byte offsets (or if
+   the rebuild walker drops keys due to some byte-level
+   mismatch), we'd end up with entry instances whose
+   per-index-key Refs point at the keyDef tag instead of a
+   proper class. Probe `Mount__11TFlashStoreFv` /
+   `Add__11TFlashStoreFP7TObjRef` to capture the entry-creation
+   sequence.
+2. The flash-store readback path (`Read__6TStoreFUllPcT2`)
+   already proven byte-faithful for B-tree node data; less
+   likely to be the issue but worth re-checking for the entry-
+   record path specifically.
+
 #### Found while diagnosing: ORIG_PCS table overflow
 
 The `record_original` side-table that lets `shadow_stub`'s

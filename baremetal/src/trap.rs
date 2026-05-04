@@ -1521,6 +1521,12 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::ENTRY_REMOVE_PROBE_HVC_IMM => {
             handle_entry_remove_probe(ctx);
         }
+        v if v == crate::rom_patches::KEY_TO_SKEY_ENTRY_PROBE_HVC_IMM => {
+            handle_key_to_skey_entry_probe(ctx);
+        }
+        v if v == crate::rom_patches::KEY_TO_SKEY_DONE_PROBE_HVC_IMM => {
+            handle_key_to_skey_done_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -2327,6 +2333,16 @@ fn handle_und(ctx: &mut TrapContext) {
         }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::ENTRY_REMOVE_PROBE_HVC_IMM) => {
             handle_entry_remove_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::KEY_TO_SKEY_ENTRY_PROBE_HVC_IMM) => {
+            handle_key_to_skey_entry_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::KEY_TO_SKEY_DONE_PROBE_HVC_IMM) => {
+            handle_key_to_skey_done_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -4676,6 +4692,93 @@ fn handle_entry_remove_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
     // Emulate `mov ip, sp` (= source-mode SP).
     ctx.x[12] = (ctx.x[12] & 0xFFFF_FFFF_0000_0000) | (sp as u64);
 }
+
+/// Iter-89: probe at `KeyToSKey__FRC6RefVarT1P4SKeyPsPUc` entry
+/// (`0x0034_AD4C`). r0/r1 = `RefArg const&` for the key value and
+/// the index-keyDef tag; r2 = SKey* (output); r3 = short* (output
+/// size). We log the input Refs (decoded with newton-object style)
+/// and the output buffer pointers, then emulate `mov ip, sp`.
+fn handle_key_to_skey_entry_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_key_to_skey_entry_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_key_to_skey_entry_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let r0 = ctx.x[0] as u32; // &RefArg key
+    let r1 = ctx.x[1] as u32; // &RefArg tag
+    let r2 = ctx.x[2] as u32; // SKey*
+    let r3 = ctx.x[3] as u32; // short* (size)
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+
+    // Two indirections: &RefArg → slot ptr → tagged Ref.
+    let key_ref = read_ref_double(r0);
+    let tag_ref = read_ref_double(r1);
+
+    kprintln!(
+        "KeyToSKey #{}: key_ref={:#010x} tag_ref={:#010x} skey_buf={:#010x} size_p={:#010x} caller_lr={:#010x} sp={:#010x}",
+        seq, key_ref, tag_ref, r2, r3, lr, sp,
+    );
+    crate::heap_check::log_ref("    key", key_ref);
+    crate::heap_check::dump_object("      ", key_ref);
+    crate::heap_check::log_ref("    tag", tag_ref);
+
+    // Emulate `mov ip, sp`.
+    ctx.x[12] = (ctx.x[12] & 0xFFFF_FFFF_0000_0000) | (sp as u64);
+}
+
+/// Iter-89: probe at `GetEntrySKey + 0xB0` (`0x0034_DDA4`,
+/// `ldr r0, [sp, #4]!`) — fires immediately after
+/// `bl KeyToSKey` returns. r6 holds the SKey output buffer
+/// (callee-saved). Dump the buffer and emulate the pre-indexed-
+/// with-writeback load: `r0 = mem[sp + 4]; sp += 4`.
+fn handle_key_to_skey_done_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_key_to_skey_done_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_key_to_skey_done_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let r6 = ctx.x[6] as u32;  // SKey* (preserved across BL by GetEntrySKey)
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+
+    // The size short* was at sp+8 before the BL; that slot still
+    // has the resolved size after KeyToSKey wrote *r3.
+    let sp_slot = crate::banked::sp_slot_for_mode(source_cpsr);
+    let sp = ctx.x[sp_slot] as u32;
+    let size_va = sp.wrapping_add(8);
+    let size_word = guest_mem::read_word_va(size_va)
+        .or_else(|| guest_mem::read_word_pa(size_va))
+        .unwrap_or(0xDEAD_BEEF);
+
+    kprintln!(
+        "KeyToSKey done #{}: skey_buf={:#010x} size_word_at_sp+8={:#010x} caller_lr={:#010x}",
+        seq, r6, size_word, lr,
+    );
+    if r6 != 0 {
+        log_word_pair("    SKey+0",  r6,        r6.wrapping_add(4));
+        log_word_pair("    SKey+8",  r6.wrapping_add(8),  r6.wrapping_add(12));
+        log_word_pair("    SKey+16", r6.wrapping_add(16), r6.wrapping_add(20));
+        log_word_pair("    SKey+24", r6.wrapping_add(24), r6.wrapping_add(28));
+    }
+
+    // Emulate `ldr r0, [sp, #4]!`: r0 = mem[sp+4]; sp += 4.
+    let load_va = sp.wrapping_add(4);
+    let loaded = guest_mem::read_word_va(load_va)
+        .or_else(|| guest_mem::read_word_pa(load_va))
+        .unwrap_or(0xDEAD_BEEF);
+    ctx.x[0] = (ctx.x[0] & 0xFFFF_FFFF_0000_0000) | (loaded as u64);
+    let new_sp = sp.wrapping_add(4);
+    ctx.x[sp_slot] = (ctx.x[sp_slot] & 0xFFFF_FFFF_0000_0000) | (new_sp as u64);
+}
+
 
 fn handle_reboot(ctx: &TrapContext) -> ! {
     let spsr_el2 = read_sysreg!("spsr_el2") as u32;

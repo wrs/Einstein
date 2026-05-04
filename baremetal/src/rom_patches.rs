@@ -1294,6 +1294,102 @@ pub const FPE_ENTRY_PROBE_HVC_IMM: u32 = 0x80;
 pub const FPE_ENTRY_PROBE_PC:      u32 = 0x0038_D918;
 const FPE_ENTRY_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
 
+/// Iter-89: capture the actual return value of
+/// `Add__10TSoupIndexFP4SKeyT1` (ROM `0x002E_75CC`) and
+/// `Delete__10TSoupIndexFP4SKeyT1` (ROM `0x002E_809C`). Both
+/// functions end with `mov r0, r5; ldmdb fp, ...` where r5 holds
+/// the index-op error code (positive = error). The probe sits on
+/// the `mov r0, r5` instruction so we capture r5 BEFORE it
+/// becomes the function's return value, then emulate the
+/// instruction so the function continues normally.
+///
+/// Why it matters: every `evt.ex.fr.store` throw observed at
+/// boot collapses the underlying error to -48022
+/// (`kFramesErrInternalError`) via `movgt r1, #106; subgt r1, r1,
+/// #48128`. The original positive code from `_BTEnterKey` /
+/// `_BTRemoveKey` / `Commit__10TNodeCache` / `Abort__10TNodeCache`
+/// is the only signal that can identify which sub-system
+/// rejected the op.
+pub const SOUP_INDEX_ADD_RET_PROBE_HVC_IMM: u32 = 0x81;
+pub const SOUP_INDEX_ADD_RET_PROBE_PC:      u32 = 0x002E_7654;
+const SOUP_INDEX_ADD_RET_FIRST_INSN:        u32 = 0xE1A0_0005; // mov r0, r5
+
+pub const SOUP_INDEX_DEL_RET_PROBE_HVC_IMM: u32 = 0x82;
+pub const SOUP_INDEX_DEL_RET_PROBE_PC:      u32 = 0x002E_8140;
+const SOUP_INDEX_DEL_RET_FIRST_INSN:        u32 = 0xE1A0_0005; // mov r0, r5
+
+/// Iter-89 (next): probe just before the `bl InsertKey` call inside
+/// `_BTEnterKey__10TSoupIndexFP8KeyField` (`0x002E_6EA4`) and the
+/// matching `bl DeleteKey` site inside
+/// `_BTRemoveKey__10TSoupIndexFP8KeyField` (`0x002E_6F28`). At each
+/// site `r0=mov r0, r4` is about to load the `this` pointer; we
+/// capture (r4, r5=KeyField*, r6=NodeHeader*) and dump the key
+/// bytes + node header bytes, then emulate the `mov r0, r4` so the
+/// upcoming BL is unaffected.
+///
+/// Comparing the bytes Insert was given vs the bytes Delete walks
+/// past tells us whether the in-memory tree shape matches what
+/// the search is looking for, or whether something between Add
+/// (cache write + Commit flush) and Delete (read back / search)
+/// is corrupting the bytes.
+pub const SOUP_INSERT_KEY_PRE_PROBE_HVC_IMM: u32 = 0x83;
+pub const SOUP_INSERT_KEY_PRE_PROBE_PC:      u32 = 0x002E_6EA4;
+const SOUP_INSERT_KEY_PRE_FIRST_INSN:        u32 = 0xE1A0_0004; // mov r0, r4
+
+pub const SOUP_DELETE_KEY_PRE_PROBE_HVC_IMM: u32 = 0x84;
+pub const SOUP_DELETE_KEY_PRE_PROBE_PC:      u32 = 0x002E_6F28;
+const SOUP_DELETE_KEY_PRE_FIRST_INSN:        u32 = 0xE1A0_0004; // mov r0, r4
+
+/// Iter-89 (next): A/B comparison probes around the
+/// `Read__6TStore` / `ReplaceObject__6TStore` flash-store boundary.
+/// If the bytes the kernel hands to ReplaceObject (via the staging
+/// buffer in `UpdateNode`) differ from what `Read__6TStore` puts
+/// back into the cache slot, the divergence is in the flash
+/// read/write path.
+///
+/// `UPDATE_NODE_PRE_REPLACE` patches `mov r2, sp` (`0x002E_9DE8` —
+/// the instruction that loads the staging buffer pointer into r2
+/// just before `bl ReplaceObject`). Capture (r0=TStore*,
+/// r1=node_id, r3=byte_count, sp=staging_buffer) + dump 64 bytes
+/// at sp. Emulate `mov r2, sp` afterwards.
+///
+/// `READ_NODE_POST_READ` patches `add sp, sp, #4` (`0x002E_9C38`
+/// — first instruction after `bl Read__6TStore` in `ReadANode`).
+/// Capture (r0=result, r5=node_id, r7=NodeHeader*) + dump 64
+/// bytes at r7. Emulate `add sp, sp, #4` by bumping the source-
+/// mode SP slot.
+pub const UPDATE_NODE_PRE_REPLACE_PROBE_HVC_IMM: u32 = 0x85;
+pub const UPDATE_NODE_PRE_REPLACE_PROBE_PC:      u32 = 0x002E_9DE8;
+const UPDATE_NODE_PRE_REPLACE_FIRST_INSN:        u32 = 0xE1A0_200D; // mov r2, sp
+
+pub const READ_NODE_POST_READ_PROBE_HVC_IMM: u32 = 0x86;
+pub const READ_NODE_POST_READ_PROBE_PC:      u32 = 0x002E_9C38;
+const READ_NODE_POST_READ_FIRST_INSN:        u32 = 0xE28D_D004; // add sp, sp, #4
+
+/// Iter-89: probe at the throw site inside `AlterIndexes`
+/// (`0x0034_7DA4` — the conditional `movgt r1, #106` that
+/// constructs the `-48022` payload only when the prior Add/Delete
+/// returned a positive error). HVC #0x87 fires there with r0 holding
+/// the actual positive error from `Add__/Delete__10TSoupIndex` and
+/// r4 holding the TSoupIndex this-pointer; we log the index_id /
+/// root_node_id, then conditionally emulate `movgt r1, #106` (only
+/// if `(r0 as i32) > 0`, matching the GT condition the kernel set
+/// via the prior `cmp r0, #0`).
+pub const ALTER_INDEXES_THROW_PROBE_HVC_IMM: u32 = 0x87;
+pub const ALTER_INDEXES_THROW_PROBE_PC:      u32 = 0x0034_7DA4;
+const ALTER_INDEXES_THROW_FIRST_INSN:        u32 = 0xC3A0_106A; // movgt r1, #106
+
+/// Iter-89: probe at `EntryRemoveFromSoup__FRC6RefVar` entry
+/// (`0x002D_A26C`). r0 is the `RefVar const&` for the entry being
+/// removed; the actual tagged Ref lives at `*r0`. We log r0 and
+/// the Ref value so we can identify which entry REP is asking
+/// the soup to forget — and then trace it back through Add probes
+/// to see whether (and on which indexes) it was originally
+/// inserted. Emulates the original `mov ip, sp`.
+pub const ENTRY_REMOVE_PROBE_HVC_IMM: u32 = 0x88;
+pub const ENTRY_REMOVE_PROBE_PC:      u32 = 0x002D_A26C;
+const ENTRY_REMOVE_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -1927,6 +2023,70 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             "FP_UndefHandlers_Start mov ip, sp (count + open tarmac window on entry #2)",
             FPE_ENTRY_PROBE_HVC_IMM,
         );
+        patch_probe(
+            rom_ptr,
+            SOUP_INDEX_ADD_RET_PROBE_PC,
+            SOUP_INDEX_ADD_RET_FIRST_INSN,
+            hvc_insn(SOUP_INDEX_ADD_RET_PROBE_HVC_IMM),
+            "Add__10TSoupIndex return-value capture (mov r0, r5)",
+            SOUP_INDEX_ADD_RET_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            SOUP_INDEX_DEL_RET_PROBE_PC,
+            SOUP_INDEX_DEL_RET_FIRST_INSN,
+            hvc_insn(SOUP_INDEX_DEL_RET_PROBE_HVC_IMM),
+            "Delete__10TSoupIndex return-value capture (mov r0, r5)",
+            SOUP_INDEX_DEL_RET_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            SOUP_INSERT_KEY_PRE_PROBE_PC,
+            SOUP_INSERT_KEY_PRE_FIRST_INSN,
+            hvc_insn(SOUP_INSERT_KEY_PRE_PROBE_HVC_IMM),
+            "_BTEnterKey pre-InsertKey (mov r0, r4) capture key + root node bytes",
+            SOUP_INSERT_KEY_PRE_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            SOUP_DELETE_KEY_PRE_PROBE_PC,
+            SOUP_DELETE_KEY_PRE_FIRST_INSN,
+            hvc_insn(SOUP_DELETE_KEY_PRE_PROBE_HVC_IMM),
+            "_BTRemoveKey pre-DeleteKey (mov r0, r4) capture key + root node bytes",
+            SOUP_DELETE_KEY_PRE_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            UPDATE_NODE_PRE_REPLACE_PROBE_PC,
+            UPDATE_NODE_PRE_REPLACE_FIRST_INSN,
+            hvc_insn(UPDATE_NODE_PRE_REPLACE_PROBE_HVC_IMM),
+            "UpdateNode pre-ReplaceObject (mov r2, sp) capture staging buffer bytes",
+            UPDATE_NODE_PRE_REPLACE_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            READ_NODE_POST_READ_PROBE_PC,
+            READ_NODE_POST_READ_FIRST_INSN,
+            hvc_insn(READ_NODE_POST_READ_PROBE_HVC_IMM),
+            "ReadANode post-Read (add sp, sp, #4) capture freshly-read NodeHeader bytes",
+            READ_NODE_POST_READ_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            ALTER_INDEXES_THROW_PROBE_PC,
+            ALTER_INDEXES_THROW_FIRST_INSN,
+            hvc_insn(ALTER_INDEXES_THROW_PROBE_HVC_IMM),
+            "AlterIndexes throw site (capture failing index_id + raw retcode)",
+            ALTER_INDEXES_THROW_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            ENTRY_REMOVE_PROBE_PC,
+            ENTRY_REMOVE_FIRST_INSN,
+            hvc_insn(ENTRY_REMOVE_PROBE_HVC_IMM),
+            "EntryRemoveFromSoup entry (capture entry RefVar + tagged Ref)",
+            ENTRY_REMOVE_PROBE_HVC_IMM,
+        );
     }
 }
 
@@ -1971,10 +2131,15 @@ unsafe fn patch_probe(
 /// 0x001488ac because the original `mov r0, ip` at 0x001488c4 has
 /// been replaced with HVC #0x6E for the FINDSUPER_MID probe).
 ///
-/// Capacity = 64: well above the ~20 probes installed today, with
-/// headroom for future per-stall probes. Single-threaded boot use,
+/// Capacity = 128: comfortably covers the ~70 probes installed today
+/// (the soup-index + flash-store + per-stall probes added through
+/// iter-89). When the table fills, `record_original` warns and
+/// `read_original` returns None for the missing entries, which in turn
+/// makes `shadow_stub`'s liveness analyser see the patched HVC instead
+/// of the original — leading to subtle scratch-register misanalysis at
+/// nearby SBA / unaligned-inline stub sites. Single-threaded boot use,
 /// so a plain `static mut` with index counter is safe.
-const ORIG_CAP: usize = 64;
+const ORIG_CAP: usize = 128;
 static mut ORIG_PCS:    [u32; ORIG_CAP] = [0; ORIG_CAP];
 static mut ORIG_INSNS:  [u32; ORIG_CAP] = [0; ORIG_CAP];
 static mut ORIG_N:      usize = 0;
@@ -1988,12 +2153,19 @@ fn record_original(pc: u32, orig: u32) {
         let n_ptr = core::ptr::addr_of_mut!(ORIG_N);
         let n = n_ptr.read();
         if n >= ORIG_CAP {
+            // Silently dropping entries causes shadow_stub's liveness
+            // analyser to see the patched HVC instead of the original
+            // instruction at this PC, leading to mis-classified scratch
+            // registers at nearby SBA / unaligned-inline stub sites and
+            // hard-to-diagnose downstream corruption. Bump ORIG_CAP and
+            // rebuild rather than letting boot continue with a partial
+            // table.
             kprintln!(
-                "rom_patch: WARN — ORIG_PCS table full ({} entries) — \
-                 shadow_stub may misanalyse PC={:#010x}",
-                n, pc
+                "rom_patch: FATAL — ORIG_PCS table full ({} entries, ORIG_CAP={}) \
+                 trying to record PC={:#010x}; bump ORIG_CAP in src/rom_patches.rs",
+                n, ORIG_CAP, pc
             );
-            return;
+            crate::cpu::halt();
         }
         let pcs = core::ptr::addr_of_mut!(ORIG_PCS) as *mut u32;
         let insns = core::ptr::addr_of_mut!(ORIG_INSNS) as *mut u32;

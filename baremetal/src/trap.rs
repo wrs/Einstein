@@ -1497,6 +1497,30 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::FPE_ENTRY_PROBE_HVC_IMM => {
             handle_fpe_entry_probe(ctx);
         }
+        v if v == crate::rom_patches::SOUP_INDEX_ADD_RET_PROBE_HVC_IMM => {
+            handle_soup_index_ret_probe(ctx, /*is_delete=*/ false);
+        }
+        v if v == crate::rom_patches::SOUP_INDEX_DEL_RET_PROBE_HVC_IMM => {
+            handle_soup_index_ret_probe(ctx, /*is_delete=*/ true);
+        }
+        v if v == crate::rom_patches::SOUP_INSERT_KEY_PRE_PROBE_HVC_IMM => {
+            handle_soup_btkey_pre_probe(ctx, /*is_delete=*/ false);
+        }
+        v if v == crate::rom_patches::SOUP_DELETE_KEY_PRE_PROBE_HVC_IMM => {
+            handle_soup_btkey_pre_probe(ctx, /*is_delete=*/ true);
+        }
+        v if v == crate::rom_patches::UPDATE_NODE_PRE_REPLACE_PROBE_HVC_IMM => {
+            handle_update_node_pre_replace_probe(ctx);
+        }
+        v if v == crate::rom_patches::READ_NODE_POST_READ_PROBE_HVC_IMM => {
+            handle_read_node_post_read_probe(ctx);
+        }
+        v if v == crate::rom_patches::ALTER_INDEXES_THROW_PROBE_HVC_IMM => {
+            handle_alter_indexes_throw_probe(ctx);
+        }
+        v if v == crate::rom_patches::ENTRY_REMOVE_PROBE_HVC_IMM => {
+            handle_entry_remove_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -2263,6 +2287,46 @@ fn handle_und(ctx: &mut TrapContext) {
         }
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::LOOKUP_TABLE_IDX_PROBE_HVC_IMM) => {
             handle_lookup_table_idx_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::SOUP_INDEX_ADD_RET_PROBE_HVC_IMM) => {
+            handle_soup_index_ret_probe_with(ctx, spsr_und as u32, /*is_delete=*/ false);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::SOUP_INDEX_DEL_RET_PROBE_HVC_IMM) => {
+            handle_soup_index_ret_probe_with(ctx, spsr_und as u32, /*is_delete=*/ true);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::SOUP_INSERT_KEY_PRE_PROBE_HVC_IMM) => {
+            handle_soup_btkey_pre_probe_with(ctx, spsr_und as u32, /*is_delete=*/ false);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::SOUP_DELETE_KEY_PRE_PROBE_HVC_IMM) => {
+            handle_soup_btkey_pre_probe_with(ctx, spsr_und as u32, /*is_delete=*/ true);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::UPDATE_NODE_PRE_REPLACE_PROBE_HVC_IMM) => {
+            handle_update_node_pre_replace_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::READ_NODE_POST_READ_PROBE_HVC_IMM) => {
+            handle_read_node_post_read_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::ALTER_INDEXES_THROW_PROBE_HVC_IMM) => {
+            handle_alter_indexes_throw_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::ENTRY_REMOVE_PROBE_HVC_IMM) => {
+            handle_entry_remove_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -4314,6 +4378,303 @@ fn handle_fpe_entry_probe(ctx: &mut TrapContext) {
     }
     // Emulate `mov ip, sp` (= ctx.x[23] in UND-source mode).
     ctx.x[12] = (ctx.x[12] & 0xFFFF_FFFF_0000_0000) | (sp_und as u64);
+}
+
+/// Iter-89: capture the about-to-be-returned error code from
+/// `Add__10TSoupIndexFP4SKeyT1` (`is_delete=false`) /
+/// `Delete__10TSoupIndexFP4SKeyT1` (`is_delete=true`). The probe
+/// sits on the `mov r0, r5` instruction at the function's exit;
+/// r5 holds the index-op result code (0 = success, positive =
+/// error). Logs r5 + caller LR + mode and emulates `mov r0, r5`.
+fn handle_soup_index_ret_probe(ctx: &mut TrapContext, is_delete: bool) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_soup_index_ret_probe_with(ctx, probe_source_cpsr(spsr_el2), is_delete);
+}
+
+fn handle_soup_index_ret_probe_with(
+    ctx: &mut TrapContext,
+    source_cpsr: u32,
+    is_delete: bool,
+) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static ADD_SEQ: AtomicU32 = AtomicU32::new(0);
+    static DEL_SEQ: AtomicU32 = AtomicU32::new(0);
+    let r5 = ctx.x[5] as u32;
+    let r4 = ctx.x[4] as u32;
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+    let mode = source_cpsr & 0x1F;
+
+    let (label, seq) = if is_delete {
+        ("Delete", DEL_SEQ.fetch_add(1, Ordering::Relaxed))
+    } else {
+        ("Add", ADD_SEQ.fetch_add(1, Ordering::Relaxed))
+    };
+
+    // Dump the TSoupIndex object header. Layout (from the
+    // `Add`/`Delete` body's reads + `AlterIndexes→Throw` probe):
+    //   [+8]   = TNodeCache* (passed to Commit/Abort)
+    //   [+12]  = idx_id (unique soup-index identifier within the soup)
+    //   [+16]  = root_node_id (read by ReadRootNode; 0 means
+    //            "no root", which makes Delete return 2)
+    //   [+44]  = error slot (set as the return value path)
+    let f8 = guest_mem::read_word_va(r4.wrapping_add(8))
+        .or_else(|| guest_mem::read_word_pa(r4.wrapping_add(8)))
+        .unwrap_or(0xDEAD_BEEF);
+    let f12 = guest_mem::read_word_va(r4.wrapping_add(12))
+        .or_else(|| guest_mem::read_word_pa(r4.wrapping_add(12)))
+        .unwrap_or(0xDEAD_BEEF);
+    let f16 = guest_mem::read_word_va(r4.wrapping_add(16))
+        .or_else(|| guest_mem::read_word_pa(r4.wrapping_add(16)))
+        .unwrap_or(0xDEAD_BEEF);
+    let f44 = guest_mem::read_word_va(r4.wrapping_add(44))
+        .or_else(|| guest_mem::read_word_pa(r4.wrapping_add(44)))
+        .unwrap_or(0xDEAD_BEEF);
+    kprintln!(
+        "TSoupIndex::{} #{} RET: r5(retcode)={:#010x} (signed {}) r4(this)={:#010x} [+8]={:#010x} idx_id[+12]={:#010x} root_id[+16]={:#010x} [+44]={:#010x} caller_lr={:#010x} sp={:#010x} mode={:#x}",
+        label, seq, r5, r5 as i32, r4, f8, f12, f16, f44, lr, sp, mode,
+    );
+
+    // Emulate `mov r0, r5`: copy r5 into r0, preserving the high
+    // half of the EL2-side x[0] register (ctx.x[] are u64s).
+    ctx.x[0] = (ctx.x[0] & 0xFFFF_FFFF_0000_0000) | (r5 as u64);
+}
+
+/// Iter-89: pre-`bl InsertKey` / pre-`bl DeleteKey` probe inside
+/// `_BTEnterKey` / `_BTRemoveKey`. Captures the search KeyField
+/// (r5) and the root NodeHeader (r6) bytes before the B-tree
+/// op runs. Comparing Insert's input with Delete's search input
+/// (and the resulting node bytes) tells us whether the in-memory
+/// tree shape matches what the search expects.
+fn handle_soup_btkey_pre_probe(ctx: &mut TrapContext, is_delete: bool) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_soup_btkey_pre_probe_with(ctx, probe_source_cpsr(spsr_el2), is_delete);
+}
+
+fn handle_soup_btkey_pre_probe_with(
+    ctx: &mut TrapContext,
+    source_cpsr: u32,
+    is_delete: bool,
+) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static INS_SEQ: AtomicU32 = AtomicU32::new(0);
+    static DEL_SEQ: AtomicU32 = AtomicU32::new(0);
+    let r1 = ctx.x[1] as u32; // KeyField* (set just before by `mov r1, r5`)
+    let r2 = ctx.x[2] as u32; // NodeHeader* (set by `movs r2, r0` after ReadRootNode)
+    let r4 = ctx.x[4] as u32; // this
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+
+    let (label, seq) = if is_delete {
+        ("DeleteKey", DEL_SEQ.fetch_add(1, Ordering::Relaxed))
+    } else {
+        ("InsertKey", INS_SEQ.fetch_add(1, Ordering::Relaxed))
+    };
+
+    // Header always logged. Byte dump for the first 32 calls and
+    // for any call on the known-failing TSoupIndex instance
+    // (`r4=0x0c60a434`, the idx 0x4f / root 0x12c case from
+    // earlier captures) so we never miss the matching Insert for a
+    // failing Delete.
+    let always_dump = r4 == 0x0c60a434 || r4 == 0x0c609270;
+    let do_dump = always_dump || seq < 32;
+    kprintln!(
+        "_BTKey pre-{} #{}: r4(this)={:#010x} r1(KeyField*)={:#010x} r2(NodeHeader*)={:#010x} caller_lr={:#010x} sp={:#010x}",
+        label, seq, r4, r1, r2, lr, sp,
+    );
+    if do_dump {
+        if r1 != 0 {
+            log_word_pair("    KeyField+0",  r1,        r1.wrapping_add(4));
+            log_word_pair("    KeyField+8",  r1.wrapping_add(8),  r1.wrapping_add(12));
+            log_word_pair("    KeyField+16", r1.wrapping_add(16), r1.wrapping_add(20));
+            log_word_pair("    KeyField+24", r1.wrapping_add(24), r1.wrapping_add(28));
+        }
+        if r2 != 0 {
+            log_word_pair("    Node+0",   r2,        r2.wrapping_add(4));
+            log_word_pair("    Node+8",   r2.wrapping_add(8),  r2.wrapping_add(12));
+            log_word_pair("    Node+16",  r2.wrapping_add(16), r2.wrapping_add(20));
+            log_word_pair("    Node+24",  r2.wrapping_add(24), r2.wrapping_add(28));
+            log_word_pair("    Node+32",  r2.wrapping_add(32), r2.wrapping_add(36));
+            log_word_pair("    Node+40",  r2.wrapping_add(40), r2.wrapping_add(44));
+            log_word_pair("    Node+48",  r2.wrapping_add(48), r2.wrapping_add(52));
+            log_word_pair("    Node+56",  r2.wrapping_add(56), r2.wrapping_add(60));
+        }
+    }
+
+    // Emulate `mov r0, r4`: ctx.x[0] = ctx.x[4].
+    ctx.x[0] = (ctx.x[0] & 0xFFFF_FFFF_0000_0000) | (r4 as u64);
+}
+
+fn log_word_pair(label: &str, va_a: u32, va_b: u32) {
+    let a = guest_mem::read_word_va(va_a)
+        .or_else(|| guest_mem::read_word_pa(va_a))
+        .unwrap_or(0xDEAD_BEEF);
+    let b = guest_mem::read_word_va(va_b)
+        .or_else(|| guest_mem::read_word_pa(va_b))
+        .unwrap_or(0xDEAD_BEEF);
+    kprintln!("{}: [{:#010x}]={:#010x}  [{:#010x}]={:#010x}", label, va_a, a, va_b, b);
+}
+
+/// Iter-89 (next): probe at `UpdateNode + 0x68` (`mov r2, sp` at
+/// `0x002E_9DE8`) — just before `bl ReplaceObject`. Captures the
+/// staging buffer the kernel is about to hand to the flash-store
+/// write path.
+fn handle_update_node_pre_replace_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_update_node_pre_replace_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_update_node_pre_replace_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let r0 = ctx.x[0] as u32; // TStore*
+    let r1 = ctx.x[1] as u32; // node_id
+    let r3 = ctx.x[3] as u32; // byte count
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+
+    // Header always logged; byte dump only for the first 64 calls
+    // (volume is bounded by node-update churn).
+    kprintln!(
+        "UpdateNode→ReplaceObject #{}: TStore={:#010x} node_id={:#010x} bytes={} staging_sp={:#010x} caller_lr={:#010x}",
+        seq, r0, r1, r3, sp, lr,
+    );
+    if seq < 64 {
+        log_word_pair("    staging+0",   sp,        sp.wrapping_add(4));
+        log_word_pair("    staging+8",   sp.wrapping_add(8),  sp.wrapping_add(12));
+        log_word_pair("    staging+16",  sp.wrapping_add(16), sp.wrapping_add(20));
+        log_word_pair("    staging+24",  sp.wrapping_add(24), sp.wrapping_add(28));
+        log_word_pair("    staging+32",  sp.wrapping_add(32), sp.wrapping_add(36));
+        log_word_pair("    staging+40",  sp.wrapping_add(40), sp.wrapping_add(44));
+        log_word_pair("    staging+48",  sp.wrapping_add(48), sp.wrapping_add(52));
+        log_word_pair("    staging+56",  sp.wrapping_add(56), sp.wrapping_add(60));
+    }
+
+    // Emulate `mov r2, sp` (= source-mode SP, since this fires from USR/SVC).
+    ctx.x[2] = (ctx.x[2] & 0xFFFF_FFFF_0000_0000) | (sp as u64);
+}
+
+/// Iter-89 (next): probe at `ReadANode + 0x94` (`add sp, sp, #4` at
+/// `0x002E_9C38`) — first instruction after `bl Read__6TStore`.
+/// Captures the freshly-loaded NodeHeader.
+fn handle_read_node_post_read_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_read_node_post_read_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_read_node_post_read_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let r0 = ctx.x[0] as u32; // Read result
+    let r5 = ctx.x[5] as u32; // node_id
+    let r7 = ctx.x[7] as u32; // NodeHeader* (destination buffer)
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+
+    kprintln!(
+        "ReadANode← Read__6TStore #{}: result={:#010x} node_id={:#010x} NodeHeader*={:#010x} caller_lr={:#010x}",
+        seq, r0, r5, r7, lr,
+    );
+    if seq < 64 && r7 != 0 {
+        log_word_pair("    Node+0",   r7,        r7.wrapping_add(4));
+        log_word_pair("    Node+8",   r7.wrapping_add(8),  r7.wrapping_add(12));
+        log_word_pair("    Node+16",  r7.wrapping_add(16), r7.wrapping_add(20));
+        log_word_pair("    Node+24",  r7.wrapping_add(24), r7.wrapping_add(28));
+        log_word_pair("    Node+32",  r7.wrapping_add(32), r7.wrapping_add(36));
+        log_word_pair("    Node+40",  r7.wrapping_add(40), r7.wrapping_add(44));
+        log_word_pair("    Node+48",  r7.wrapping_add(48), r7.wrapping_add(52));
+        log_word_pair("    Node+56",  r7.wrapping_add(56), r7.wrapping_add(60));
+    }
+
+    // Emulate `add sp, sp, #4` by bumping the source-mode SP slot.
+    let sp_slot = crate::banked::sp_slot_for_mode(source_cpsr);
+    let new_sp = (ctx.x[sp_slot] as u32).wrapping_add(4);
+    ctx.x[sp_slot] = (ctx.x[sp_slot] & 0xFFFF_FFFF_0000_0000) | (new_sp as u64);
+}
+
+/// Iter-89: probe at the AlterIndexes throw site (`0x0034_7DA4` —
+/// the `movgt r1, #106` that constructs the -48022 payload). Fires
+/// only when execution reaches there, i.e. when the prior Add /
+/// Delete returned a non-zero error. We log r0 (raw retcode), r4
+/// (TSoupIndex this), and the index's id/root_node, then emulate
+/// the conditional `movgt` (only setting r1=106 when r0 > 0,
+/// matching the GT condition off the prior `cmp r0, #0`).
+fn handle_alter_indexes_throw_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_alter_indexes_throw_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_alter_indexes_throw_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let r0 = ctx.x[0] as u32; // raw Add/Delete retcode
+    let r1_in = ctx.x[1] as u32; // r1 was set to r0 by `mov r1, r0` at 0x347d98
+    let r4 = ctx.x[4] as u32; // TSoupIndex* (callee-saved across BL)
+    let r8 = ctx.x[8] as u32; // 0 = Delete, 1 = Add (set at 0x347bb0)
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+
+    // Read TSoupIndex header.
+    let idx_id_at12 = guest_mem::read_word_va(r4.wrapping_add(12))
+        .or_else(|| guest_mem::read_word_pa(r4.wrapping_add(12)))
+        .unwrap_or(0xDEAD_BEEF);
+    let root_at16 = guest_mem::read_word_va(r4.wrapping_add(16))
+        .or_else(|| guest_mem::read_word_pa(r4.wrapping_add(16)))
+        .unwrap_or(0xDEAD_BEEF);
+
+    let kind = if r8 == 0 { "Delete" } else { "Add" };
+    kprintln!(
+        "AlterIndexes→Throw #{}: kind={} raw_retcode={:#010x} (signed {}) r4(this)={:#010x} idx_id[+12]={:#010x} root_id[+16]={:#010x} caller_lr={:#010x}",
+        seq, kind, r0, r0 as i32, r4, idx_id_at12, root_at16, lr,
+    );
+    let _ = r1_in;
+
+    // Emulate `movgt r1, #106`: only set r1=106 when (r0 as i32) > 0.
+    // The prior `cmp r0, #0` set NZCV; GT means r0 > 0 (signed).
+    if (r0 as i32) > 0 {
+        ctx.x[1] = (ctx.x[1] & 0xFFFF_FFFF_0000_0000) | 106u64;
+    }
+    // r0 <= 0: leave r1 unchanged (movle not executed).
+}
+
+/// Iter-89: probe at `EntryRemoveFromSoup__FRC6RefVar` entry
+/// (`0x002D_A26C`). r0 = `RefVar const&` (= a `RefVar` whose
+/// slot pointer holds the actual tagged Ref). We log the
+/// captured Ref so we can identify which entry REP is asking
+/// the soup to forget. Emulates `mov ip, sp`.
+fn handle_entry_remove_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_entry_remove_probe_with(ctx, probe_source_cpsr(spsr_el2));
+}
+
+fn handle_entry_remove_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let r0 = ctx.x[0] as u32; // RefVar const&
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+    let lr = crate::banked::lr_for_mode(ctx, source_cpsr);
+
+    // Two indirections: r0 = &RefVar, *r0 = slot ptr, **r0 = tagged Ref.
+    let slot_ptr = guest_mem::read_word_va(r0)
+        .or_else(|| guest_mem::read_word_pa(r0))
+        .unwrap_or(0xDEAD_BEEF);
+    let tagged_ref = guest_mem::read_word_va(slot_ptr)
+        .or_else(|| guest_mem::read_word_pa(slot_ptr))
+        .unwrap_or(0xDEAD_BEEF);
+
+    kprintln!(
+        "EntryRemoveFromSoup #{}: r0(&RefVar)={:#010x} slot={:#010x} ref={:#010x} caller_lr={:#010x} sp={:#010x}",
+        seq, r0, slot_ptr, tagged_ref, lr, sp,
+    );
+
+    // Emulate `mov ip, sp` (= source-mode SP).
+    ctx.x[12] = (ctx.x[12] & 0xFFFF_FFFF_0000_0000) | (sp as u64);
 }
 
 fn handle_reboot(ctx: &TrapContext) -> ! {

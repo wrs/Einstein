@@ -677,11 +677,16 @@ pub unsafe fn apply_717006_patches(rom_ptr: *mut u32) {
         debug_assert!((p.offset as usize) < 0x0080_0000, "patch offset must be in main ROM");
         let word_idx = (p.offset / 4) as usize;
         // SAFETY: bounds-checked against the 8 MiB main-ROM region.
+        // Dispatch via the classifier bitmap so each entry is treated
+        // correctly under BE-8: instruction patches go in as native u32
+        // (= LE encoding of the BE numerical value); data patches are
+        // byte-swapped before storage so a guest LDR reads the
+        // intended value.
         unsafe {
             let prev = rom_ptr.add(word_idx).read();
-            rom_ptr.add(word_idx).write(p.value);
+            crate::guest_mem::write_rom_word_by_kind(rom_ptr, word_idx, p.value);
             kprintln!(
-                "rom_patch: {:#010x}: {:#010x} -> {:#010x}  ({})",
+                "rom_patch: {:#010x}: was_host={:#010x} -> intended={:#010x}  ({})",
                 p.offset, prev, p.value, p.name,
             );
         }
@@ -846,6 +851,10 @@ unsafe fn patch_probe(
 ) {
     let idx = (pc / 4) as usize;
     // SAFETY: caller of apply_717006_patches has already bounded rom_ptr.
+    // The probe always rewrites a code word (the original first
+    // instruction → an HVC), so the host read returns the BE numerical
+    // value of the instruction directly under BE-8 (write_rom_code_word
+    // stores native u32 = LE encoding = BE numerical when fetched LE).
     let prev = unsafe { rom_ptr.add(idx).read() };
     if prev != expected_orig {
         kprintln!(
@@ -854,7 +863,7 @@ unsafe fn patch_probe(
         );
         return;
     }
-    unsafe { rom_ptr.add(idx).write(new_insn); }
+    unsafe { crate::guest_mem::write_rom_code_word(rom_ptr, idx, new_insn); }
     record_original(pc, prev);
     kprintln!(
         "rom_patch: {:#010x}: {:#010x} -> {:#010x}  ({} probe, HVC #{:#x})",
@@ -972,7 +981,7 @@ unsafe fn apply_debug_patches(rom_ptr: *mut u32) {
         let word = (0x0038_CE6C / 4) as usize;
         let prev = rom_ptr.add(word).read();
         let insn = arm_b(0x0038_CE6C, debug_str_stub_pc);
-        rom_ptr.add(word).write(insn);
+        crate::guest_mem::write_rom_code_word(rom_ptr, word, insn);
         kprintln!(
             "rom_patch: 0x0038ce6c: {:#010x} -> {:#010x}  (DebugStr → B {:#x}, HVC #{:#x})",
             prev, insn, debug_str_stub_pc, DEBUG_STR_HVC_IMM,
@@ -980,7 +989,7 @@ unsafe fn apply_debug_patches(rom_ptr: *mut u32) {
         let word = (0x0038_CE70 / 4) as usize;
         let prev = rom_ptr.add(word).read();
         let insn = arm_b(0x0038_CE70, debugger_stub_pc);
-        rom_ptr.add(word).write(insn);
+        crate::guest_mem::write_rom_code_word(rom_ptr, word, insn);
         kprintln!(
             "rom_patch: 0x0038ce70: {:#010x} -> {:#010x}  (Debugger → B {:#x}, HVC #{:#x})",
             prev, insn, debugger_stub_pc, DEBUGGER_HVC_IMM,
@@ -988,11 +997,14 @@ unsafe fn apply_debug_patches(rom_ptr: *mut u32) {
     }
 }
 
+/// Writes a sequence of ARM instruction encodings to the ROM backing.
+/// All entries here are code (HVC stub bodies, branch targets, etc.) so
+/// they go through `write_rom_code_word`.
 unsafe fn write_stub_words(rom_ptr: *mut u32, base: u32, words: &[u32]) {
     unsafe {
         for (i, w) in words.iter().copied().enumerate() {
             let idx = ((base + (i as u32) * 4) / 4) as usize;
-            rom_ptr.add(idx).write(w);
+            crate::guest_mem::write_rom_code_word(rom_ptr, idx, w);
         }
     }
 }
@@ -1010,18 +1022,32 @@ unsafe fn apply_real_clock_seconds_patch(rom_ptr: *mut u32) {
     // 0x0025557C: LDR r0, [r0]            -- dereference calendar address
     // 0x00255580: MOV PC, LR              -- return
     // 0x00255584: .word 0x0F181000        -- calendar MMIO IPA
-    let words: [u32; 4] = [0xE59F_0004, 0xE590_0000, 0xE1A0_F00E, 0x0F18_1000];
+    //
+    // First 3 words are ARM instructions (code); the literal at +12 is
+    // data that the LDR at +0 loads into r0. Under BE-8 the LDR is
+    // byteswapping, so the literal must be written as data (BE-encoded
+    // bytes on host).
+    let insns: [u32; 3] = [0xE59F_0004, 0xE590_0000, 0xE1A0_F00E];
+    let literal: u32 = 0x0F18_1000;
     unsafe {
-        for (i, w) in words.iter().copied().enumerate() {
+        for (i, w) in insns.iter().copied().enumerate() {
             let offset = ENTRY + (i as u32) * 4;
             let idx = (offset / 4) as usize;
             let prev = rom_ptr.add(idx).read();
-            rom_ptr.add(idx).write(w);
+            crate::guest_mem::write_rom_code_word(rom_ptr, idx, w);
             kprintln!(
-                "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (RealClockSeconds)",
+                "rom_patch: {:#010x}: was_host={:#010x} -> insn={:#010x}  (RealClockSeconds)",
                 offset, prev, w,
             );
         }
+        let lit_offset = ENTRY + 12;
+        let lit_idx = (lit_offset / 4) as usize;
+        let prev = rom_ptr.add(lit_idx).read();
+        crate::guest_mem::write_rom_data_word(rom_ptr, lit_idx, literal);
+        kprintln!(
+            "rom_patch: {:#010x}: was_host={:#010x} -> lit={:#010x}  (RealClockSeconds literal)",
+            lit_offset, prev, literal,
+        );
     }
 }
 
@@ -1089,7 +1115,7 @@ unsafe fn apply_poweroff_reboot_trap(rom_ptr: *mut u32) {
     let insn = hvc_insn(POWEROFF_REBOOT_HVC_IMM);
     unsafe {
         let prev = rom_ptr.add(idx).read();
-        rom_ptr.add(idx).write(insn);
+        crate::guest_mem::write_rom_code_word(rom_ptr, idx, insn);
         kprintln!(
             "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (PowerOffAndReboot canary, HVC #{:#x})",
             POWEROFF_REBOOT_PC, prev, insn, POWEROFF_REBOOT_HVC_IMM,
@@ -1109,7 +1135,7 @@ unsafe fn apply_reboot_trap(rom_ptr: *mut u32) {
     let insn = hvc_insn(REBOOT_HVC_IMM);
     unsafe {
         let prev = rom_ptr.add(idx).read();
-        rom_ptr.add(idx).write(insn);
+        crate::guest_mem::write_rom_code_word(rom_ptr, idx, insn);
         kprintln!(
             "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (Reboot canary, HVC #{:#x})",
             REBOOT_PC, prev, insn, REBOOT_HVC_IMM,
@@ -1136,7 +1162,7 @@ unsafe fn apply_bootos_trap(rom_ptr: *mut u32) {
     }
     let insn = hvc_insn(BOOTOS_HVC_IMM);
     unsafe {
-        rom_ptr.add(idx).write(insn);
+        crate::guest_mem::write_rom_code_word(rom_ptr, idx, insn);
     }
     kprintln!(
         "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (BootOS canary, HVC #{:#x})",
@@ -1271,14 +1297,14 @@ unsafe fn apply_resolve_fault_wrapper(rom_ptr: *mut u32) {
         for (i, w) in stub.iter().copied().enumerate() {
             let offset = resolve_fault_wrapper_pc + (i as u32) * 4;
             let idx = (offset / 4) as usize;
-            rom_ptr.add(idx).write(w);
+            crate::guest_mem::write_rom_code_word(rom_ptr, idx, w);
         }
 
         // Patch the `bl ResolveFault` site inside `Fault` (0x001f84e0).
         let idx = (FAULT_BL_RESOLVE_PC / 4) as usize;
         let prev = rom_ptr.add(idx).read();
         let insn = arm_bl(FAULT_BL_RESOLVE_PC, resolve_fault_wrapper_pc);
-        rom_ptr.add(idx).write(insn);
+        crate::guest_mem::write_rom_code_word(rom_ptr, idx, insn);
         kprintln!(
             "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (Fault → ResolveFaultWrapper @{:#x})",
             FAULT_BL_RESOLVE_PC, prev, insn, resolve_fault_wrapper_pc,
@@ -1326,7 +1352,7 @@ unsafe fn apply_new_stack_pad_wrapper(rom_ptr: *mut u32) {
         for (i, w) in stub.iter().copied().enumerate() {
             let offset = wrapper_pc + (i as u32) * 4;
             let idx = (offset / 4) as usize;
-            rom_ptr.add(idx).write(w);
+            crate::guest_mem::write_rom_code_word(rom_ptr, idx, w);
         }
 
         // Patch TTask::Init's BL to point at the wrapper instead of
@@ -1341,7 +1367,7 @@ unsafe fn apply_new_stack_pad_wrapper(rom_ptr: *mut u32) {
             return;
         }
         let new_bl = arm_bl(NEW_STACK_PAD_BL_PC, wrapper_pc);
-        rom_ptr.add(idx).write(new_bl);
+        crate::guest_mem::write_rom_code_word(rom_ptr, idx, new_bl);
         kprintln!(
             "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (TTask::Init bl NewStack → +4 KiB pad wrapper @{:#x})",
             NEW_STACK_PAD_BL_PC, prev, new_bl, wrapper_pc,
@@ -1403,7 +1429,7 @@ unsafe fn apply_lock_heap_range_wrapper(rom_ptr: *mut u32) {
         unsafe {
             for (i, w) in stub.iter().copied().enumerate() {
                 let idx = ((wrapper_pc + (i as u32) * 4) / 4) as usize;
-                rom_ptr.add(idx).write(w);
+                crate::guest_mem::write_rom_code_word(rom_ptr, idx, w);
             }
 
             let fn_idx = (fn_pc / 4) as usize;
@@ -1417,7 +1443,7 @@ unsafe fn apply_lock_heap_range_wrapper(rom_ptr: *mut u32) {
                 continue;
             }
             let branch = arm_b(fn_pc, wrapper_pc);
-            rom_ptr.add(fn_idx).write(branch);
+            crate::guest_mem::write_rom_code_word(rom_ptr, fn_idx, branch);
             kprintln!(
                 "rom_patch: {:#010x}: {:#010x} -> {:#010x}  ({} → 4-KiB wrapper @{:#x})",
                 fn_pc, prev, branch, name, wrapper_pc,
@@ -1427,7 +1453,10 @@ unsafe fn apply_lock_heap_range_wrapper(rom_ptr: *mut u32) {
 }
 
 /// Shared helper for the two injection patches: write a 5-word stub at
-/// `stub_pc` and a 1-word branch at `patch_pc`.
+/// `stub_pc` (4 instruction words + 1 trailing data literal) and a
+/// 1-word branch at `patch_pc`. The first 4 stub words are written as
+/// code (native LE u32 for BE-8 fetch), the 5th word is written as
+/// data (byteswapped on host so a BE-8 LDR reads back the literal).
 unsafe fn write_stub_and_patch(
     rom_ptr: *mut u32,
     stub_pc: u32,
@@ -1440,13 +1469,17 @@ unsafe fn write_stub_and_patch(
         for (i, w) in stub.iter().copied().enumerate() {
             let offset = stub_pc + (i as u32) * 4;
             let idx = (offset / 4) as usize;
-            rom_ptr.add(idx).write(w);
+            if i < 4 {
+                crate::guest_mem::write_rom_code_word(rom_ptr, idx, w);
+            } else {
+                crate::guest_mem::write_rom_data_word(rom_ptr, idx, w);
+            }
         }
         let idx = (patch_pc / 4) as usize;
         let prev = rom_ptr.add(idx).read();
-        rom_ptr.add(idx).write(patch_insn);
+        crate::guest_mem::write_rom_code_word(rom_ptr, idx, patch_insn);
         kprintln!(
-            "rom_patch: {:#010x}: {:#010x} -> {:#010x}  ({}: B {:#x}, 5-word stub)",
+            "rom_patch: {:#010x}: was_host={:#010x} -> {:#010x}  ({}: B {:#x}, 5-word stub)",
             patch_pc, prev, patch_insn, name, stub_pc,
         );
     }

@@ -36,34 +36,75 @@
 
 use crate::guest_mem;
 
+// In normal (BE-8) builds, the guest stores values with bytes in BE
+// order. To recover the Newton-side numerical value from a host-LE
+// view, we byte-swap on read and on write. Guest-test mode runs the
+// guest in LE; the helpers act as identity wrappers so existing
+// tests keep working.
+//
+// Exception: ROM **code** words are stored as LE byte order on host
+// (the CPU's instruction fetch is always LE on Cortex-A53). When EL2
+// reads a code word for emulation (e.g. handle_und decoding the
+// faulting instruction), we want the instruction encoding back, NOT
+// the byteswap. The classifier's `reach.bitmap` (consulted via
+// `guest_mem::rom_word_is_code`) discriminates code from data per
+// 32-bit ROM word; data words and everything outside the ROM
+// aperture (RAM, framebuffer) are swapped on read/write.
+
+#[cfg(not(nh_guest_test))]
+#[inline]
+fn pa_is_rom_code(pa: u32) -> bool {
+    let pa = pa as usize;
+    pa + 4 <= guest_mem::ROM_SIZE && guest_mem::rom_word_is_code(pa / 4)
+}
+
+#[cfg(not(nh_guest_test))]
+#[inline]
+fn swap_for_pa(pa: u32, raw: u32) -> u32 {
+    if pa_is_rom_code(pa) { raw } else { raw.swap_bytes() }
+}
+
+#[cfg(nh_guest_test)]
+#[inline]
+fn swap_for_pa(_pa: u32, raw: u32) -> u32 { raw }
+
+#[cfg(not(nh_guest_test))]
+#[inline]
+fn swap16(v: u16) -> u16 { v.swap_bytes() }
+
 /// Read a 32-bit word from a guest VA and return it as a Newton-side
 /// numerical value.
-///
-/// Phase 1: identity wrapper around `guest_mem::read_word_va`. Phase 2c
-/// will `swap_bytes()` the result before returning to compensate for
-/// the new BE-8 storage policy.
 pub fn guest_read_u32_va(va: u32) -> Option<u32> {
-    guest_mem::read_word_va(va)
+    let pa = guest_mem::translate_va(va).unwrap_or(va);
+    guest_mem::read_word_pa(pa).map(|w| swap_for_pa(pa, w))
 }
 
 /// Read a 32-bit word from a guest PA. See `guest_read_u32_va`.
 pub fn guest_read_u32_pa(pa: u32) -> Option<u32> {
-    guest_mem::read_word_pa(pa)
+    guest_mem::read_word_pa(pa).map(|w| swap_for_pa(pa, w))
 }
 
 /// Write a 32-bit Newton-side numerical value to a guest VA.
 pub fn guest_write_u32_va(va: u32, value: u32) -> bool {
-    guest_mem::write_word_va(va, value)
+    let pa = guest_mem::translate_va(va).unwrap_or(va);
+    guest_mem::write_word_pa(pa, swap_for_pa(pa, value))
 }
 
 /// Write a 32-bit Newton-side numerical value to a guest PA.
 pub fn guest_write_u32_pa(pa: u32, value: u32) -> bool {
-    guest_mem::write_word_pa(pa, value)
+    guest_mem::write_word_pa(pa, swap_for_pa(pa, value))
 }
 
 /// Read a single byte from a guest PA at the given Newton-side logical
-/// byte address. Today: `host[pa ^ 3]` (XOR-3 byte-lane transform).
-/// Phase 2c: `host[pa]` directly.
+/// byte address. Under BE-8 with CPSR.E=1 the CPU stored the byte at
+/// the natural offset, so host[pa] is exactly the logical byte. Guest-
+/// test mode keeps the legacy XOR-3 byte-lane transform.
+#[cfg(not(nh_guest_test))]
+pub fn guest_read_u8_pa(pa: u32) -> Option<u8> {
+    guest_mem::read_byte_pa(pa)
+}
+
+#[cfg(nh_guest_test)]
 pub fn guest_read_u8_pa(pa: u32) -> Option<u8> {
     guest_mem::read_byte_pa(pa ^ 3)
 }
@@ -76,7 +117,13 @@ pub fn guest_read_u8_va(va: u32) -> Option<u8> {
 }
 
 /// Read a halfword from a guest PA at the given Newton-side logical
-/// halfword address. Today: `host[pa ^ 2]` (XOR-2 byte-lane transform).
+/// halfword address.
+#[cfg(not(nh_guest_test))]
+pub fn guest_read_u16_pa(pa: u32) -> Option<u16> {
+    guest_mem::read_halfword_pa(pa).map(swap16)
+}
+
+#[cfg(nh_guest_test)]
 pub fn guest_read_u16_pa(pa: u32) -> Option<u16> {
     guest_mem::read_halfword_pa(pa ^ 2)
 }
@@ -90,12 +137,24 @@ pub fn guest_read_u16_va(va: u32) -> Option<u16> {
 
 /// Write a single byte to a guest PA at the given Newton-side logical
 /// byte address.
+#[cfg(not(nh_guest_test))]
+pub fn guest_write_u8_pa(pa: u32, value: u8) -> bool {
+    guest_mem::write_byte_pa(pa, value)
+}
+
+#[cfg(nh_guest_test)]
 pub fn guest_write_u8_pa(pa: u32, value: u8) -> bool {
     guest_mem::write_byte_pa(pa ^ 3, value)
 }
 
 /// Write a halfword to a guest PA at the given Newton-side logical
 /// halfword address.
+#[cfg(not(nh_guest_test))]
+pub fn guest_write_u16_pa(pa: u32, value: u16) -> bool {
+    guest_mem::write_halfword_pa(pa, swap16(value))
+}
+
+#[cfg(nh_guest_test)]
 pub fn guest_write_u16_pa(pa: u32, value: u16) -> bool {
     guest_mem::write_halfword_pa(pa ^ 2, value)
 }

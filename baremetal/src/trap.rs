@@ -3435,11 +3435,19 @@ pub(crate) fn return_to_guest_from_und(_ctx: &mut TrapContext, elr: u64, _spsr: 
     // the ROM-backing flush is needed regardless.
     let literal_host =
         guest_mem::rom_host_pa() as usize + guest_mem::UND_RETURN_STUB_LITERAL_OFFSET;
+    // The UND_RETURN_STUB does `ldr lr, [pc, #0]` to load this literal,
+    // running under BE-8 with CPSR.E=1. Host bytes must be BE-encoded
+    // so the guest's LDR returns `elr` numerically — write swap of elr.
+    // Guest-test mode doesn't run BE-8; identity write.
+    #[cfg(not(nh_guest_test))]
+    let literal_value = (elr as u32).swap_bytes();
+    #[cfg(nh_guest_test)]
+    let literal_value = elr as u32;
     // SAFETY: bounded write in ROM backing; EL2-owned. Flush via D-cache
     // clean + I-cache invalidate so the guest fetch path sees the new
     // literal.
     unsafe {
-        core::ptr::write_volatile(literal_host as *mut u32, elr as u32);
+        core::ptr::write_volatile(literal_host as *mut u32, literal_value);
         core::arch::asm!(
             "dc cvau, {0}",
             "dsb ish",
@@ -3458,12 +3466,15 @@ pub(crate) fn return_to_guest_from_und(_ctx: &mut TrapContext, elr: u64, _spsr: 
     }
 }
 
-// Guest-PA memory accessors live in guest_mem; this was an earlier
-// in-module stub. Use `crate::guest_endian::guest_read_u32_pa` etc. directly.
+// Guest-PA memory accessors. Word/halfword reads go through
+// `guest_endian` so the BE-8 byte-order swap happens in one place.
+// Byte accessors keep the legacy `guest_mem::*_byte_pa` paths because
+// the existing call sites supply already-XOR-3-transformed addresses
+// (under BE-32 word-invariant). Phase 4 simplifies the byte sites.
+use crate::guest_endian::{guest_read_u32_pa as read_guest_word_pa,
+                          guest_write_u32_pa as write_guest_word_pa};
 use guest_mem::{read_byte_pa as read_guest_byte_pa,
-                read_word_pa as read_guest_word_pa,
-                write_byte_pa as write_guest_byte_pa,
-                write_word_pa as write_guest_word_pa};
+                write_byte_pa as write_guest_byte_pa};
 
 /// Budgeted log for the DABT→kernel forward path. Prints once per unique
 /// (FAR, hvc_src_mode, pre_abt_mode) tuple so we see each distinct fault
@@ -3888,6 +3899,14 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
             // Force SCTLR.A=1 on the guest so unaligned LDR/STR raises
             // an alignment fault at EL1. The DABT-vector trampoline
             // routes alignment faults to unaligned::handle_align_fault.
+            //
+            // Under BE-8 also force EE (bit 25) and E0E (bit 24) so the
+            // kernel's SCTLR writes (which never set EE) don't drop us
+            // back into LE data mode mid-boot. Guest-test builds keep
+            // the kernel's value verbatim so LE flat-binary tests work.
+            #[cfg(not(nh_guest_test))]
+            let value_with_a = value | 0x2 | (1u32 << 25) | (1u32 << 24);
+            #[cfg(nh_guest_test)]
             let value_with_a = value | 0x2;
             cp15::write_sctlr_el1(value_with_a as u64);
             // One-time cross-check: read SCTLR back to verify A-bit stuck,

@@ -104,20 +104,12 @@ pub extern "C" fn kmain() -> ! {
         alrt_capture::arm_at_boot();
     }
 
-    // Pre-patch every ROM site the classify-rom bitmap marked as an
-    // endianness-sensitive subword access. Must happen after
-    // stage2::enable() (the bitmap path writes through the ROM backing
-    // and branches into the shadow-stub pool IPAs, both of which need
-    // stage-2 live so the subsequent guest fetches land correctly) but
-    // before the guest runs, so the kernel's early init — including
-    // the `STRH #0, [gGlobals, #0x20]` at RExScanner entry — already
-    // sees the BE-32 semantics it expects. Skipped in guest-test mode
-    // because the ROM slot holds a test binary, not Newton 2.x; the
-    // bitmap's hash check would reject the mismatch anyway.
+    // (BE-8 migration: no byte-lane UDFs needed; shadow_stub will be
+    // deleted in a follow-up commit.)
     #[cfg(not(nh_guest_test))]
     {
-        let stats = shadow_stub::patch_rom_from_bitmap();
-        shadow_stub::log_stats(&stats);
+        let _ = shadow_stub::patch_rom_from_bitmap;
+        let _ = shadow_stub::log_stats;
     }
     // Diagnostic: post-shadow-stub-patch dump at 0x00f76368, the new
     // wedge PC. Pairs with the post-load_rom dump above to find which

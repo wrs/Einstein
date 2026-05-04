@@ -155,9 +155,17 @@ unsafe fn zero_el1_guest_state() {
         asm!("msr cpacr_el1, {}", "isb", in(reg) cpacr,
             options(nostack, preserves_flags));
 
-        // SCTLR off — ROM boot code programs it as it brings the
-        // stage-1 MMU up.
-        asm!("msr sctlr_el1, xzr", "isb",
+        // SCTLR mostly off; the rest the ROM/test programs as it brings
+        // the stage-1 MMU up. In normal (non-guest-test) builds we set
+        // EE (bit 25) + E0E (bit 24) so AArch32 EL1/EL0 data accesses
+        // run in BE-8 mode (matching the BE-8 migration). In guest-test
+        // mode the test binaries are AArch32 LE flat images; leave
+        // SCTLR=0 (LE).
+        #[cfg(not(nh_guest_test))]
+        let sctlr: u64 = (1u64 << 25) | (1u64 << 24); // EE | E0E
+        #[cfg(nh_guest_test)]
+        let sctlr: u64 = 0;
+        asm!("msr sctlr_el1, {}", "isb", in(reg) sctlr,
             options(nostack, preserves_flags));
 
         // TCR zero so guest-stage-1 uses short-descriptor VMSAv7
@@ -173,7 +181,13 @@ unsafe fn zero_el1_guest_state() {
 
 /// Enter AArch32 SVC mode at the given guest IPA. Never returns.
 unsafe fn eret_to_guest(entry_ipa: u64) -> ! {
-    // SPSR = AArch32 SVC, I=F=A=1.
+    // SPSR = AArch32 SVC, I=F=A=1. In normal (non-guest-test) builds
+    // we additionally set bit 9 (E) so the guest starts with CPSR.E=1
+    // (BE-8 data accesses), matching SCTLR_EL1.EE=1 set above. Guest-
+    // test images run in LE so leave E=0 there.
+    #[cfg(not(nh_guest_test))]
+    let spsr_aarch32_svc: u64 = 0x0000_03D3;
+    #[cfg(nh_guest_test)]
     let spsr_aarch32_svc: u64 = 0x0000_01D3;
 
     // SAFETY: caller has invoked us exactly once, after the hypervisor's

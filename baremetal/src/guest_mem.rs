@@ -97,6 +97,72 @@ fn guest_test_bin() -> &'static [u8] {
     GUEST_TEST_BIN
 }
 
+/// Per-word "code" bitmap from the classifier (`reach.bitmap`). One bit
+/// per 32-bit word across the 16 MiB ROM aperture. Bit set = the word
+/// was reached as code by the static analysis; bit clear = data /
+/// padding. Used by `load_newton_rom` for selective byteswap-on-load
+/// and by the `apply_*_patches` helpers (via `rom_word_is_code`) for
+/// runtime patch dispatch.
+const REACH_BITMAP: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/reach.bitmap"));
+
+/// True if word index `idx` (= ROM offset / 4) is reachable code per
+/// the classifier. Out-of-range indices return false (treated as data).
+pub fn rom_word_is_code(idx: usize) -> bool {
+    if idx / 8 >= REACH_BITMAP.len() {
+        return false;
+    }
+    (REACH_BITMAP[idx / 8] >> (idx % 8)) & 1 != 0
+}
+
+/// Write a 32-bit ARM instruction encoding into the ROM backing at
+/// word index `idx`. Under BE-8 the CPU's instruction fetch is always
+/// LE, so a native u32 write of the numerical encoding produces host
+/// bytes the CPU decodes correctly. Use this for every `apply_*_patch`
+/// or `apply_*_wrapper` call site that writes ARM instructions —
+/// whether the target is original-ROM code or a synthetic stub region
+/// in 0x00FF_FExx.
+///
+/// SAFETY: `rom_ptr` must point to GUEST_ROM and `idx * 4 + 4` must be
+/// within ROM_SIZE.
+pub unsafe fn write_rom_code_word(rom_ptr: *mut u32, idx: usize, insn: u32) {
+    unsafe {
+        rom_ptr.add(idx).write(insn);
+    }
+}
+
+/// Write a 32-bit data value into the ROM backing at word index `idx`
+/// such that a subsequent guest LDR reads back `value`.
+///
+/// Production builds (BE-8 CPSR.E=1): the host bytes must be the BE
+/// encoding of `value`, which is what `value.swap_bytes()` then a
+/// native LE write produces.
+///
+/// Guest-test builds (LE CPSR.E=0): a native u32 write is what an LE
+/// LDR returns; no swap needed.
+///
+/// Use this for kernel-data patches (gDebugger=1, gNewtConfig, time-
+/// base constants) and for in-stub literals loaded via `LDR Rd, [pc, #imm]`.
+pub unsafe fn write_rom_data_word(rom_ptr: *mut u32, idx: usize, value: u32) {
+    #[cfg(not(nh_guest_test))]
+    let stored = value.swap_bytes();
+    #[cfg(nh_guest_test)]
+    let stored = value;
+    unsafe {
+        rom_ptr.add(idx).write(stored);
+    }
+}
+
+/// Convenience: dispatch by the classifier bitmap. `apply_717006_patches`
+/// uses this so each entry's code-vs-data decision is data-driven.
+pub unsafe fn write_rom_word_by_kind(rom_ptr: *mut u32, idx: usize, value: u32) {
+    if rom_word_is_code(idx) {
+        unsafe { write_rom_code_word(rom_ptr, idx, value); }
+    } else {
+        unsafe { write_rom_data_word(rom_ptr, idx, value); }
+    }
+}
+
 /// Raw big-endian on-disk bytes of the Newton ROM, pre-byteswap. Used by
 /// `shadow_stub::patch_rom_from_bitmap` to verify the embedded classify
 /// bitmap matches the current ROM.
@@ -253,6 +319,7 @@ pub fn write_word_pa(pa: u32, value: u32) -> bool {
 /// 717006 probe). Mirrors `trap::guest_translate_va`. Used from EL2
 /// when we need to land a value in a kernel data structure named
 /// by a VA the guest passed us (e.g. SFlashChipInformation pointer).
+#[allow(dead_code)]
 pub fn write_word_va(va: u32, value: u32) -> bool {
     let pa = match translate_va(va) {
         Some(p) => p,
@@ -264,6 +331,7 @@ pub fn write_word_va(va: u32, value: u32) -> bool {
 /// Read a 32-bit word from a guest VA through the live stage-1 walk.
 /// Mirrors `write_word_va`. Returns None when the VA is unmapped or
 /// the translated PA lies outside a readable region.
+#[allow(dead_code)]
 pub fn read_word_va(va: u32) -> Option<u32> {
     let pa = translate_va(va)?;
     read_word_pa(pa)
@@ -1215,21 +1283,38 @@ pub unsafe fn load_newton_rom() {
     let be_words = ROM_BE.len() / 4;
 
     kprintln!(
-        "guest_mem: loading {} bytes of ROM (byteswap big-endian -> little-endian)",
+        "guest_mem: loading {} bytes of ROM (BE-8: code words byteswapped, data verbatim)",
         ROM_BE.len()
     );
 
     for i in 0..be_words {
         let off = i * 4;
-        let word_be = u32::from_ne_bytes([
+        let on_disk = [
             ROM_BE[off],
             ROM_BE[off + 1],
             ROM_BE[off + 2],
             ROM_BE[off + 3],
-        ]);
-        let word_le = word_be.swap_bytes();
+        ];
         // SAFETY: rom_ptr covers ROM_SIZE bytes; i*4 < ROM_BE.len() <= ROM_SIZE.
-        unsafe { rom_ptr.add(i).write(word_le); }
+        if rom_word_is_code(i) {
+            // Code: CPU LE fetch must decode the original BE numerical
+            // instruction. The numerical value is from_be_bytes(on_disk);
+            // a native LE write of that produces host bytes = LE encoding
+            // of the instruction.
+            let insn = u32::from_be_bytes(on_disk);
+            unsafe { rom_ptr.add(i).write(insn); }
+        } else {
+            // Data: under BE-8 CPSR.E=1, LDR reads the original BE
+            // numerical value when host bytes equal the on-disk (BE-
+            // encoded) bytes. Write each byte verbatim.
+            unsafe {
+                let dst = rom_ptr.add(i) as *mut u8;
+                dst.add(0).write(on_disk[0]);
+                dst.add(1).write(on_disk[1]);
+                dst.add(2).write(on_disk[2]);
+                dst.add(3).write(on_disk[3]);
+            }
+        }
     }
 
     // Load Einstein's REx at PA 0x00800000 (= the second 8 MB of the 16 MB
@@ -1239,22 +1324,32 @@ pub unsafe fn load_newton_rom() {
     const REX_PA_OFFSET: usize = 0x00800000;
     let rex_words = REX_BE.len() / 4;
     kprintln!(
-        "guest_mem: loading {} bytes of Einstein.rex at PA {:#x} (byteswap BE->LE)",
+        "guest_mem: loading {} bytes of Einstein.rex at PA {:#x} (BE-8: code-vs-data per bitmap)",
         REX_BE.len(), REX_PA_OFFSET,
     );
     assert!(REX_BE.len() <= ROM_SIZE - REX_PA_OFFSET);
     let rex_base_word = REX_PA_OFFSET / 4;
     for i in 0..rex_words {
         let off = i * 4;
-        let word_be = u32::from_ne_bytes([
+        let on_disk = [
             REX_BE[off],
             REX_BE[off + 1],
             REX_BE[off + 2],
             REX_BE[off + 3],
-        ]);
-        let word_le = word_be.swap_bytes();
+        ];
         // SAFETY: rex_base_word + i stays below ROM_SIZE / 4 via the assert above.
-        unsafe { rom_ptr.add(rex_base_word + i).write(word_le); }
+        if rom_word_is_code(rex_base_word + i) {
+            let insn = u32::from_be_bytes(on_disk);
+            unsafe { rom_ptr.add(rex_base_word + i).write(insn); }
+        } else {
+            unsafe {
+                let dst = rom_ptr.add(rex_base_word + i) as *mut u8;
+                dst.add(0).write(on_disk[0]);
+                dst.add(1).write(on_disk[1]);
+                dst.add(2).write(on_disk[2]);
+                dst.add(3).write(on_disk[3]);
+            }
+        }
     }
 
     // Patch the external REx's id field to one past the last embedded-REx
@@ -1282,11 +1377,15 @@ pub unsafe fn load_newton_rom() {
     const NUM_EMBEDDED_REXES_717006: u32 = 1;
     let rex_id_word_index = rex_base_word + (0x1C / 4);
     // SAFETY: rex_id_word_index < rex_base_word + 8 < ROM_SIZE / 4 (checked by assert above).
+    // The REx id field is data — under BE-8 the kernel reads it via LDR
+    // and must see the BE-encoded value, so dispatch through the
+    // bitmap-aware helper. (The bitmap should mark this word as data,
+    // but using `write_rom_word_by_kind` is robust either way.)
     unsafe {
         let old_id = rom_ptr.add(rex_id_word_index).read();
-        rom_ptr.add(rex_id_word_index).write(NUM_EMBEDDED_REXES_717006);
+        write_rom_word_by_kind(rom_ptr, rex_id_word_index, NUM_EMBEDDED_REXES_717006);
         kprintln!(
-            "guest_mem: Einstein.rex id patch {} -> {} (first free slot after embedded REx)",
+            "guest_mem: Einstein.rex id patch host_was={:#010x} -> id={} (first free slot after embedded REx)",
             old_id, NUM_EMBEDDED_REXES_717006,
         );
     }
@@ -1388,7 +1487,7 @@ pub unsafe fn load_newton_rom() {
     // REx address that our image doesn't back). Patch to HVC #DIAG_TAG
     // so any prefetch abort halts with a full banked-reg dump and we
     // can see the faulting fetch PC (= LR_abt − 4 for ARM).
-    unsafe { rom_ptr.add(3).write(0xE140_0171); } // hvc #0x11
+    unsafe { write_rom_code_word(rom_ptr, 3, 0xE140_0171); } // hvc #0x11
 
     // Bring-up shim #2: the 717006 kernel uses StrongARM's lax CP15 encoding
     // where CRm == CRn for most system-control registers. On ARMv7+ those
@@ -1689,26 +1788,28 @@ pub unsafe fn patch_dabt_vector(rom_ptr: *mut u32) {
         // DAH; uncommon cases fall through to the slow DABT_TRAMP).
         let imm24 = ((DABT_FAST_TRAMP_OFFSET as u32).wrapping_sub(0x10 + 8) / 4) & 0x00FF_FFFF;
         let branch_insn = 0xEA00_0000 | imm24;
-        rom_ptr.add(4).write(branch_insn);              // 0x10: b DABT_FAST_TRAMP_OFFSET
+        write_rom_code_word(rom_ptr, 4, branch_insn);    // 0x10: b DABT_FAST_TRAMP_OFFSET
 
         install_dabt_fast_trampoline(rom_ptr);
 
         let db = DABT_TRAMP_OFFSET / 4;
-        rom_ptr.add(db +  0).write(0xEE0D_0F50);         // mcr p15,0,r0,c13,c0,2
-        rom_ptr.add(db +  1).write(0xEE0D_1F70);         // mcr p15,0,r1,c13,c0,3
-        rom_ptr.add(db +  2).write(0xE59F_0028);         // ldr r0, [pc, #0x28] → DABT_SAVE_VA
-        rom_ptr.add(db +  3).write(0xE580_E000);         // str lr, [r0]           LR_abt
-        rom_ptr.add(db +  4).write(0xE580_D004);         // str sp, [r0, #4]       SP_abt
-        rom_ptr.add(db +  5).write(0xE14F_1000);         // mrs r1, spsr
-        rom_ptr.add(db +  6).write(0xE580_1008);         // str r1, [r0, #8]       SPSR_abt
-        rom_ptr.add(db +  7).write(0xEE15_0F10);         // mrc p15,0,r0,c5,c0,0   DFSR
-        rom_ptr.add(db +  8).write(0xE200_000F);         // and r0, r0, #0xF
-        rom_ptr.add(db +  9).write(0xE350_0001);         // cmp r0, #1
-        rom_ptr.add(db + 10).write(0x0A00_0000);         // beq +0x0 (word 12 = ALIGN hvc)
-        rom_ptr.add(db + 11).write(0xE140_0171);         // hvc #0x11 (DIAG_TAG)
-        rom_ptr.add(db + 12).write(0xE140_0173);         // hvc #0x13 (ALIGN_TAG)
-        rom_ptr.add(db + 13).write(0xEAFF_FFFE);         // b . (guard)
-        rom_ptr.add(db + 14).write(DABT_SAVE_PA);        // literal: SCRATCH_POOL IPA (works pre + post-MMU, see DABT_SAVE_PA comment)
+        write_rom_code_word(rom_ptr, db +  0, 0xEE0D_0F50); // mcr p15,0,r0,c13,c0,2
+        write_rom_code_word(rom_ptr, db +  1, 0xEE0D_1F70); // mcr p15,0,r1,c13,c0,3
+        write_rom_code_word(rom_ptr, db +  2, 0xE59F_0028); // ldr r0, [pc, #0x28] → DABT_SAVE_VA
+        write_rom_code_word(rom_ptr, db +  3, 0xE580_E000); // str lr, [r0]           LR_abt
+        write_rom_code_word(rom_ptr, db +  4, 0xE580_D004); // str sp, [r0, #4]       SP_abt
+        write_rom_code_word(rom_ptr, db +  5, 0xE14F_1000); // mrs r1, spsr
+        write_rom_code_word(rom_ptr, db +  6, 0xE580_1008); // str r1, [r0, #8]       SPSR_abt
+        write_rom_code_word(rom_ptr, db +  7, 0xEE15_0F10); // mrc p15,0,r0,c5,c0,0   DFSR
+        write_rom_code_word(rom_ptr, db +  8, 0xE200_000F); // and r0, r0, #0xF
+        write_rom_code_word(rom_ptr, db +  9, 0xE350_0001); // cmp r0, #1
+        write_rom_code_word(rom_ptr, db + 10, 0x0A00_0000); // beq +0x0 (word 12 = ALIGN hvc)
+        write_rom_code_word(rom_ptr, db + 11, 0xE140_0171); // hvc #0x11 (DIAG_TAG)
+        write_rom_code_word(rom_ptr, db + 12, 0xE140_0173); // hvc #0x13 (ALIGN_TAG)
+        write_rom_code_word(rom_ptr, db + 13, 0xEAFF_FFFE); // b . (guard)
+        // Literal slot — read by the LDR at db+2 under BE-8 (CPSR.E=1),
+        // so write as data (BE-encoded host bytes).
+        write_rom_data_word(rom_ptr, db + 14, DABT_SAVE_PA);
     }
 }
 
@@ -1784,40 +1885,42 @@ pub unsafe fn install_dabt_fast_trampoline(rom_ptr: *mut u32) {
             0xEA00_0000 | imm24
         };
 
-        // Slot writes:
-        rom_ptr.add(ft +  0).write(0xEE0D_0F50);  // mcr p15,0,r0,c13,c0,2
-        rom_ptr.add(ft +  1).write(0xEE0D_1F70);  // mcr p15,0,r1,c13,c0,3
-        rom_ptr.add(ft +  2).write(0xEE15_0F10);  // mrc p15,0,r0,c5,c0,0
-        rom_ptr.add(ft +  3).write(0xE200_000F);  // and r0, r0, #0xF
-        rom_ptr.add(ft +  4).write(0xE350_0007);  // cmp r0, #7
-        rom_ptr.add(ft +  5).write(beq(5, 18));   // beq FAST_FWD
-        rom_ptr.add(ft +  6).write(0xE350_000F);  // cmp r0, #15
-        rom_ptr.add(ft +  7).write(beq(7, 18));   // beq FAST_FWD
+        // Slot writes (instructions, native-LE u32 = LE encoding for
+        // BE-8 instruction fetch):
+        write_rom_code_word(rom_ptr, ft +  0, 0xEE0D_0F50); // mcr p15,0,r0,c13,c0,2
+        write_rom_code_word(rom_ptr, ft +  1, 0xEE0D_1F70); // mcr p15,0,r1,c13,c0,3
+        write_rom_code_word(rom_ptr, ft +  2, 0xEE15_0F10); // mrc p15,0,r0,c5,c0,0
+        write_rom_code_word(rom_ptr, ft +  3, 0xE200_000F); // and r0, r0, #0xF
+        write_rom_code_word(rom_ptr, ft +  4, 0xE350_0007); // cmp r0, #7
+        write_rom_code_word(rom_ptr, ft +  5, beq(5, 18));  // beq FAST_FWD
+        write_rom_code_word(rom_ptr, ft +  6, 0xE350_000F); // cmp r0, #15
+        write_rom_code_word(rom_ptr, ft +  7, beq(7, 18));  // beq FAST_FWD
         // iter-60: DFSC=0x05 deliberately excluded — see file-level
         // comment for rationale. Two NOPs preserve the slot layout so
         // the existing beq targets / `b SLOW_DABT_TRAMP` offset stay
         // correct without recomputing.
-        rom_ptr.add(ft +  8).write(0xE320_F000);  // nop
-        rom_ptr.add(ft +  9).write(0xE320_F000);  // nop
-        rom_ptr.add(ft + 10).write(0xE350_000D);  // cmp r0, #13
-        rom_ptr.add(ft + 11).write(beq(11, 18));  // beq FAST_FWD
-        rom_ptr.add(ft + 12).write(0xE350_0006);  // cmp r0, #6
-        rom_ptr.add(ft + 13).write(beq(13, 18));  // beq FAST_FWD
-        rom_ptr.add(ft + 14).write(0xE350_0003);  // cmp r0, #3
-        rom_ptr.add(ft + 15).write(beq(15, 18));  // beq FAST_FWD
+        write_rom_code_word(rom_ptr, ft +  8, 0xE320_F000); // nop
+        write_rom_code_word(rom_ptr, ft +  9, 0xE320_F000); // nop
+        write_rom_code_word(rom_ptr, ft + 10, 0xE350_000D); // cmp r0, #13
+        write_rom_code_word(rom_ptr, ft + 11, beq(11, 18)); // beq FAST_FWD
+        write_rom_code_word(rom_ptr, ft + 12, 0xE350_0006); // cmp r0, #6
+        write_rom_code_word(rom_ptr, ft + 13, beq(13, 18)); // beq FAST_FWD
+        write_rom_code_word(rom_ptr, ft + 14, 0xE350_0003); // cmp r0, #3
+        write_rom_code_word(rom_ptr, ft + 15, beq(15, 18)); // beq FAST_FWD
         // Slow-path fall-through: R0 was clobbered with DFSC; restore
         // it from TPIDRURW so the slow DABT_TRAMP's own `mcr` re-saves
         // the original value. R1 wasn't clobbered after its save.
-        rom_ptr.add(ft + 16).write(0xEE1D_0F50);  // mrc p15,0,r0,c13,c0,2 (restore R0)
-        rom_ptr.add(ft + 17).write(b_far(
+        write_rom_code_word(rom_ptr, ft + 16, 0xEE1D_0F50); // mrc p15,0,r0,c13,c0,2 (restore R0)
+        write_rom_code_word(rom_ptr, ft + 17, b_far(
             (DABT_FAST_TRAMP_OFFSET as u32).wrapping_add(17 * 4),
             DABT_TRAMP_OFFSET as u32,
-        ));                                        // b SLOW_DABT_TRAMP
+        ));                                                  // b SLOW_DABT_TRAMP
         // FAST_FWD:
-        rom_ptr.add(ft + 18).write(0xEE1D_0F50);  // mrc p15,0,r0,c13,c0,2 (restore R0)
-        rom_ptr.add(ft + 19).write(0xEE1D_1F70);  // mrc p15,0,r1,c13,c0,3 (restore R1)
-        rom_ptr.add(ft + 20).write(0xE51F_F004);  // ldr pc, [pc, #-4]
-        rom_ptr.add(ft + 21).write(DABT_FAST_TRAMP_DAH_TARGET);
+        write_rom_code_word(rom_ptr, ft + 18, 0xEE1D_0F50); // mrc p15,0,r0,c13,c0,2 (restore R0)
+        write_rom_code_word(rom_ptr, ft + 19, 0xEE1D_1F70); // mrc p15,0,r1,c13,c0,3 (restore R1)
+        write_rom_code_word(rom_ptr, ft + 20, 0xE51F_F004); // ldr pc, [pc, #-4]
+        // Literal slot — loaded via the LDR PC at ft+20 under BE-8.
+        write_rom_data_word(rom_ptr, ft + 21, DABT_FAST_TRAMP_DAH_TARGET);
     }
 }
 
@@ -1883,7 +1986,7 @@ unsafe fn patch_und_vector(rom: *mut u32) {
     // well under ROM_SIZE (= 16 MiB = 0x0100_0000) and inside the
     // reserved window checked by `tracer::in_reserved_range`.
     unsafe {
-        rom.add(1).write(branch_to_bypass);         // 0x04: b FPA_BYPASS_STUB_OFFSET
+        write_rom_code_word(rom, 1, branch_to_bypass);   // 0x04: b FPA_BYPASS_STUB_OFFSET
 
         // FPA-class UND bypass stub. See `FPA_BYPASS_STUB_OFFSET`
         // doc comment for the per-word commentary; reproduced here
@@ -1897,60 +2000,62 @@ unsafe fn patch_und_vector(rom: *mut u32) {
         // VFP/Advanced-SIMD (cp_num 10/11) — though those don't appear
         // in 717006 ROM, the check keeps the stub future-proof.
         let s = FPA_BYPASS_STUB_OFFSET / 4;
-        rom.add(s +  0).write(0xEE0D_CF50);  // mcr p15,0,r12,c13,c0,2
-        rom.add(s +  1).write(0xE51E_C004);  // ldr r12, [lr, #-4]
-        rom.add(s +  2).write(0xE20C_C40F);  // and r12, r12, #0x0F000000
-        rom.add(s +  3).write(0xE35C_040C);  // cmp r12, #0x0C000000
-        rom.add(s +  4).write(0x135C_040D);  // cmpne r12, #0x0D000000
-        rom.add(s +  5).write(0x135C_040E);  // cmpne r12, #0x0E000000
-        rom.add(s +  6).write(0x1A00_0006);  // bne stub+0x38 (fall_through)
-        rom.add(s +  7).write(0xE51E_C004);  // ldr r12, [lr, #-4]  (reload)
-        rom.add(s +  8).write(0xE20C_CC0F);  // and r12, r12, #0xF00
-        rom.add(s +  9).write(0xE35C_0C01);  // cmp r12, #0x100
-        rom.add(s + 10).write(0x135C_0C02);  // cmpne r12, #0x200
-        rom.add(s + 11).write(0x1A00_0001);  // bne stub+0x38 (fall_through)
-        rom.add(s + 12).write(0xEE1D_CF50);  // mrc p15,0,r12,c13,c0,2  (FPA)
+        write_rom_code_word(rom, s +  0, 0xEE0D_CF50);  // mcr p15,0,r12,c13,c0,2
+        write_rom_code_word(rom, s +  1, 0xE51E_C004);  // ldr r12, [lr, #-4]
+        write_rom_code_word(rom, s +  2, 0xE20C_C40F);  // and r12, r12, #0x0F000000
+        write_rom_code_word(rom, s +  3, 0xE35C_040C);  // cmp r12, #0x0C000000
+        write_rom_code_word(rom, s +  4, 0x135C_040D);  // cmpne r12, #0x0D000000
+        write_rom_code_word(rom, s +  5, 0x135C_040E);  // cmpne r12, #0x0E000000
+        write_rom_code_word(rom, s +  6, 0x1A00_0006);  // bne stub+0x38 (fall_through)
+        write_rom_code_word(rom, s +  7, 0xE51E_C004);  // ldr r12, [lr, #-4]  (reload)
+        write_rom_code_word(rom, s +  8, 0xE20C_CC0F);  // and r12, r12, #0xF00
+        write_rom_code_word(rom, s +  9, 0xE35C_0C01);  // cmp r12, #0x100
+        write_rom_code_word(rom, s + 10, 0x135C_0C02);  // cmpne r12, #0x200
+        write_rom_code_word(rom, s + 11, 0x1A00_0001);  // bne stub+0x38 (fall_through)
+        write_rom_code_word(rom, s + 12, 0xEE1D_CF50);  // mrc p15,0,r12,c13,c0,2  (FPA)
         // b FPE_JT (0x38d874). PC at this insn = stub+0x34.
         // PC+8 = stub+0x3C. imm24 = (target - PC+8) / 4.
         let pc_plus_8 = (FPA_BYPASS_STUB_OFFSET + 0x34 + 8) as i32;
         let target_fpe = 0x0038_D874_i32;
         let imm24_fpe =
             (((target_fpe - pc_plus_8) >> 2) as u32) & 0x00FF_FFFF;
-        rom.add(s + 13).write(0xEA00_0000 | imm24_fpe); // b FPE_JT
-        rom.add(s + 14).write(0xEE1D_CF50);  // mrc p15,0,r12,c13,c0,2  (fall_through)
+        write_rom_code_word(rom, s + 13, 0xEA00_0000 | imm24_fpe); // b FPE_JT
+        write_rom_code_word(rom, s + 14, 0xEE1D_CF50);  // mrc p15,0,r12,c13,c0,2  (fall_through)
         // b UND_TRAMP_OFFSET. PC+8 = stub+0x44 = 0x00FF_FF04. Target =
         // 0x00FF_FF00. offset = -4 bytes = -1 word; imm24 = 0xFFFFFF.
         let pc_plus_8b = (FPA_BYPASS_STUB_OFFSET + 0x3C + 8) as i32;
         let target_tramp = UND_TRAMP_OFFSET as i32;
         let imm24_tramp =
             (((target_tramp - pc_plus_8b) >> 2) as u32) & 0x00FF_FFFF;
-        rom.add(s + 15).write(0xEA00_0000 | imm24_tramp); // b UND_TRAMP
+        write_rom_code_word(rom, s + 15, 0xEA00_0000 | imm24_tramp); // b UND_TRAMP
 
         let base = UND_TRAMP_OFFSET / 4;
-        rom.add(base +  0).write(0xEE0D_CF50);      // mcr p15,0,r12,c13,c0,2
-        rom.add(base +  1).write(0xE59F_C050);      // ldr r12, [pc, #0x50]
-        rom.add(base +  2).write(0xE58C_000C);      // str r0, [r12, #0x0C]
-        rom.add(base +  3).write(0xE58C_1010);      // str r1, [r12, #0x10]
-        rom.add(base +  4).write(0xE58C_E000);      // str lr, [r12]
-        rom.add(base +  5).write(0xE14F_0000);      // mrs r0, SPSR
-        rom.add(base +  6).write(0xE58C_0004);      // str r0, [r12, #4]
-        rom.add(base +  7).write(0xE58C_2014);      // str r2, [r12, #0x14]
-        rom.add(base +  8).write(0xE200_101F);      // and r1, r0, #0x1F
-        rom.add(base +  9).write(0xE381_10C0);      // orr r1, r1, #0xC0
-        rom.add(base + 10).write(0xE351_00D0);      // cmp r1, #0xD0
-        rom.add(base + 11).write(0x03A0_10DF);      // moveq r1, #0xDF
-        rom.add(base + 12).write(0xE129_F001);      // msr cpsr_c, r1
-        rom.add(base + 13).write(0xE58C_D018);      // str sp, [r12, #0x18]
-        rom.add(base + 14).write(0xE58C_E01C);      // str lr, [r12, #0x1C]
-        rom.add(base + 15).write(0xE321_F0DB);      // msr cpsr_c, #0xdb (UND)
-        rom.add(base + 16).write(0xE59C_2014);      // ldr r2, [r12, #0x14]
-        rom.add(base + 17).write(0xE321_F0D3);      // msr cpsr_c, #0xd3 (SVC)
-        rom.add(base + 18).write(0xE1A0_000E);      // mov r0, lr
-        rom.add(base + 19).write(0xE58C_0008);      // str r0, [r12, #8]
-        rom.add(base + 20).write(0xE321_F0DB);      // msr cpsr_c, #0xdb (UND)
-        rom.add(base + 21).write(0xE140_0170);      // hvc #0x10
-        rom.add(base + 22).write(0xEAFF_FFFE);      // b . (trap)
-        rom.add(base + 23).write(crate::trap::HYP_TRAMP_SCRATCH_BASE); // literal: SCRATCH_POOL IPA (works pre + post-MMU, see trap.rs HYP_TRAMP_SCRATCH_BASE comment)
+        write_rom_code_word(rom, base +  0, 0xEE0D_CF50);  // mcr p15,0,r12,c13,c0,2
+        write_rom_code_word(rom, base +  1, 0xE59F_C050);  // ldr r12, [pc, #0x50]
+        write_rom_code_word(rom, base +  2, 0xE58C_000C);  // str r0, [r12, #0x0C]
+        write_rom_code_word(rom, base +  3, 0xE58C_1010);  // str r1, [r12, #0x10]
+        write_rom_code_word(rom, base +  4, 0xE58C_E000);  // str lr, [r12]
+        write_rom_code_word(rom, base +  5, 0xE14F_0000);  // mrs r0, SPSR
+        write_rom_code_word(rom, base +  6, 0xE58C_0004);  // str r0, [r12, #4]
+        write_rom_code_word(rom, base +  7, 0xE58C_2014);  // str r2, [r12, #0x14]
+        write_rom_code_word(rom, base +  8, 0xE200_101F);  // and r1, r0, #0x1F
+        write_rom_code_word(rom, base +  9, 0xE381_10C0);  // orr r1, r1, #0xC0
+        write_rom_code_word(rom, base + 10, 0xE351_00D0);  // cmp r1, #0xD0
+        write_rom_code_word(rom, base + 11, 0x03A0_10DF);  // moveq r1, #0xDF
+        write_rom_code_word(rom, base + 12, 0xE129_F001);  // msr cpsr_c, r1
+        write_rom_code_word(rom, base + 13, 0xE58C_D018);  // str sp, [r12, #0x18]
+        write_rom_code_word(rom, base + 14, 0xE58C_E01C);  // str lr, [r12, #0x1C]
+        write_rom_code_word(rom, base + 15, 0xE321_F0DB);  // msr cpsr_c, #0xdb (UND)
+        write_rom_code_word(rom, base + 16, 0xE59C_2014);  // ldr r2, [r12, #0x14]
+        write_rom_code_word(rom, base + 17, 0xE321_F0D3);  // msr cpsr_c, #0xd3 (SVC)
+        write_rom_code_word(rom, base + 18, 0xE1A0_000E);  // mov r0, lr
+        write_rom_code_word(rom, base + 19, 0xE58C_0008);  // str r0, [r12, #8]
+        write_rom_code_word(rom, base + 20, 0xE321_F0DB);  // msr cpsr_c, #0xdb (UND)
+        write_rom_code_word(rom, base + 21, 0xE140_0170);  // hvc #0x10
+        write_rom_code_word(rom, base + 22, 0xEAFF_FFFE);  // b . (trap)
+        // Literal slot — loaded by the `ldr r12, [pc, #0x50]` at base+1
+        // under BE-8, so write as data.
+        write_rom_data_word(rom, base + 23, crate::trap::HYP_TRAMP_SCRATCH_BASE);
 
         // SBA pre-fault stub. When the shadow-stub byte-access emulator
         // encounters a faulting EA on an unmapped guest page, it stashes
@@ -1968,14 +2073,14 @@ unsafe fn patch_und_vector(rom: *mut u32) {
         //   +0x04: e140_0174  HVC  #SBA_RETRY_TAG ; back to EL2
         //   +0x08: eaff_fffe  B .                 ; guard
         let di = SBA_PREFAULT_STUB_OFFSET / 4;
-        rom.add(di + 0).write(0xE5D0_0000);          // ldrb r0, [r0]
-        rom.add(di + 1).write(0xE140_0174);          // hvc #0x14 (SBA_RETRY_TAG)
-        rom.add(di + 2).write(0xEAFF_FFFE);          // b . (guard)
-        rom.add(di + 3).write(0xEAFF_FFFE);          // padding (guard)
-        rom.add(di + 4).write(0xEAFF_FFFE);
-        rom.add(di + 5).write(0xEAFF_FFFE);
-        rom.add(di + 6).write(0xEAFF_FFFE);
-        rom.add(di + 7).write(0xEAFF_FFFE);
+        write_rom_code_word(rom, di + 0, 0xE5D0_0000);  // ldrb r0, [r0]
+        write_rom_code_word(rom, di + 1, 0xE140_0174);  // hvc #0x14 (SBA_RETRY_TAG)
+        write_rom_code_word(rom, di + 2, 0xEAFF_FFFE);  // b . (guard)
+        write_rom_code_word(rom, di + 3, 0xEAFF_FFFE);  // padding (guard)
+        write_rom_code_word(rom, di + 4, 0xEAFF_FFFE);
+        write_rom_code_word(rom, di + 5, 0xEAFF_FFFE);
+        write_rom_code_word(rom, di + 6, 0xEAFF_FFFE);
+        write_rom_code_word(rom, di + 7, 0xEAFF_FFFE);
 
         // UND-return stub. See `return_to_guest_from_und` in trap.rs for
         // why this exists — QEMU raspi3b's `msr spsr_el2, <val>` from
@@ -2011,22 +2116,27 @@ unsafe fn patch_und_vector(rom: *mut u32) {
         // at 0x257088 directly via ELR_EL2 in an HVC handler — is the
         // path forward; it sidesteps SPSR entirely.
         let stub = UND_RETURN_STUB_OFFSET / 4;
-        rom.add(stub + 0).write(0xE59F_E000); // ldr lr, [pc, #0]
-        rom.add(stub + 1).write(0xE1B0_F00E); // movs pc, lr
-        rom.add(stub + 2).write(0xDEAD_C0DE); // placeholder literal
+        write_rom_code_word(rom, stub + 0, 0xE59F_E000); // ldr lr, [pc, #0]
+        write_rom_code_word(rom, stub + 1, 0xE1B0_F00E); // movs pc, lr
+        // Literal slot — loaded via the `ldr lr, [pc, #0]` at stub+0
+        // under BE-8 each ERET; the runtime updater also lives in
+        // `trap.rs`. Placeholder is data.
+        write_rom_data_word(rom, stub + 2, 0xDEAD_C0DE);
 
         // SBA post-emulation trampoline, at SBA_POST_TRAMP_OFFSET.
         let pt = SBA_POST_TRAMP_OFFSET / 4;
-        rom.add(pt + 0).write(0xEE0D_CF50);          // mcr p15,0,r12,c13,c0,2
-        rom.add(pt + 1).write(0xE59F_C014);          // ldr r12, [pc, #0x14]  → literal at +0x20
-        rom.add(pt + 2).write(0xE59C_D018);          // ldr sp, [r12, #0x18]
-        rom.add(pt + 3).write(0xE59C_E01C);          // ldr lr, [r12, #0x1C]
-        rom.add(pt + 4).write(0xEE1D_CF50);          // mrc p15,0,r12,c13,c0,2
-        rom.add(pt + 5).write(0xE59F_F008);          // ldr pc, [pc, #0x08]
-        rom.add(pt + 6).write(0xEAFF_FFFE);          // b . (guard)
-        rom.add(pt + 7).write(0xEAFF_FFFE);          // b . (guard)
-        rom.add(pt + 8).write(crate::trap::HYP_TRAMP_SCRATCH_BASE); // slot base (SCRATCH_POOL IPA, works pre + post-MMU)
-        rom.add(pt + 9).write(0xDEAD_C0DE);          // NEW_PC placeholder
+        write_rom_code_word(rom, pt + 0, 0xEE0D_CF50); // mcr p15,0,r12,c13,c0,2
+        write_rom_code_word(rom, pt + 1, 0xE59F_C014); // ldr r12, [pc, #0x14]  → literal at +0x20
+        write_rom_code_word(rom, pt + 2, 0xE59C_D018); // ldr sp, [r12, #0x18]
+        write_rom_code_word(rom, pt + 3, 0xE59C_E01C); // ldr lr, [r12, #0x1C]
+        write_rom_code_word(rom, pt + 4, 0xEE1D_CF50); // mrc p15,0,r12,c13,c0,2
+        write_rom_code_word(rom, pt + 5, 0xE59F_F008); // ldr pc, [pc, #0x08]
+        write_rom_code_word(rom, pt + 6, 0xEAFF_FFFE); // b . (guard)
+        write_rom_code_word(rom, pt + 7, 0xEAFF_FFFE); // b . (guard)
+        // Two literal data words — read by the `ldr r12, [pc, #0x14]`
+        // and `ldr pc, [pc, #0x08]` above.
+        write_rom_data_word(rom, pt + 8, crate::trap::HYP_TRAMP_SCRATCH_BASE);
+        write_rom_data_word(rom, pt + 9, 0xDEAD_C0DE);
     }
 }
 
@@ -2093,18 +2203,20 @@ unsafe fn patch_native_prim_mcr_lr_to_r12(rom: *mut u32, start: u32, end: u32) -
         // Rewrite Rd field (bits [15:12]) of the lead-in word from E to C.
         // For ADD we also rewrite Rn (bits [19:16]) from E to C so
         // `add lr, lr, #imm` becomes `add r12, r12, #imm`.
+        // All these are instruction rewrites in REx code, so go
+        // through write_rom_code_word so BE-8 sees the right encoding.
         let lead = unsafe { rom.add(mov_idx).read() };
         let new_lead = (lead & !0x0000_F000) | 0x0000_C000;
-        unsafe { rom.add(mov_idx).write(new_lead); }
+        unsafe { write_rom_code_word(rom, mov_idx, new_lead); }
 
         if let Some(ai) = add_idx {
             let add = unsafe { rom.add(ai).read() };
             let new_add = (add & !0x000F_F000) | 0x000C_C000;
-            unsafe { rom.add(ai).write(new_add); }
+            unsafe { write_rom_code_word(rom, ai, new_add); }
         }
 
         let new_mcr = MCR_P10_R12;
-        unsafe { rom.add(j).write(new_mcr); }
+        unsafe { write_rom_code_word(rom, j, new_mcr); }
         patched += 1;
     }
 
@@ -2130,14 +2242,18 @@ pub unsafe fn install_und_vector_swap_post_mmu() {
     // the same literal as the pre-MMU install path; kept as a callable
     // no-op to preserve the install/uninstall contract for future
     // changes that might re-introduce a swap.
+    //
+    // All three slots are LDR-loaded data literals — under BE-8 they
+    // must be byte-swapped on host so a CPSR.E=1 LDR returns the
+    // intended value.
     unsafe {
         let rom = rom_host_pa() as *mut u32;
         let base = UND_TRAMP_OFFSET / 4;
-        rom.add(base + 23).write(crate::trap::HYP_TRAMP_SCRATCH_BASE);
+        write_rom_data_word(rom, base + 23, crate::trap::HYP_TRAMP_SCRATCH_BASE);
         let pt = SBA_POST_TRAMP_OFFSET / 4;
-        rom.add(pt + 8).write(crate::trap::HYP_TRAMP_SCRATCH_BASE);
+        write_rom_data_word(rom, pt + 8, crate::trap::HYP_TRAMP_SCRATCH_BASE);
         let db = DABT_TRAMP_OFFSET / 4;
-        rom.add(db + 14).write(DABT_SAVE_PA);
+        write_rom_data_word(rom, db + 14, DABT_SAVE_PA);
     }
 }
 
@@ -2148,15 +2264,16 @@ pub unsafe fn install_und_vector_swap_post_mmu() {
 /// kernel-VA literal. (Now a no-op given HYP_TRAMP_SCRATCH_BASE works
 /// pre + post-MMU; retained for symmetry with the post-MMU swap.)
 pub unsafe fn install_und_vector_swap_pre_mmu() {
-    // SAFETY: same as the post-MMU swap above.
+    // SAFETY: same as the post-MMU swap above. Literal slots are data
+    // under BE-8.
     unsafe {
         let rom = rom_host_pa() as *mut u32;
         let base = UND_TRAMP_OFFSET / 4;
-        rom.add(base + 23).write(crate::trap::HYP_TRAMP_SCRATCH_BASE);
+        write_rom_data_word(rom, base + 23, crate::trap::HYP_TRAMP_SCRATCH_BASE);
         let pt = SBA_POST_TRAMP_OFFSET / 4;
-        rom.add(pt + 8).write(crate::trap::HYP_TRAMP_SCRATCH_BASE);
+        write_rom_data_word(rom, pt + 8, crate::trap::HYP_TRAMP_SCRATCH_BASE);
         let db = DABT_TRAMP_OFFSET / 4;
-        rom.add(db + 14).write(DABT_SAVE_PA);
+        write_rom_data_word(rom, db + 14, DABT_SAVE_PA);
     }
 }
 
@@ -2197,8 +2314,9 @@ unsafe fn patch_cp15_encodings(rom: *mut u32, word_count: usize) -> usize {
         }
 
         let new = w & !0xF; // CRm <- 0
-        // SAFETY: same index, in-range.
-        unsafe { rom.add(i).write(new); }
+        // SAFETY: same index, in-range. Code rewrite — under BE-8 we
+        // need the BE-numerical encoding stored as native u32.
+        unsafe { write_rom_code_word(rom, i, new); }
         count += 1;
     }
     count

@@ -140,7 +140,11 @@ const MAGIC: u64 = 0x0150_414E_5348_4E00;
 /// special-purpose registers with **no** architectural alias to any
 /// AArch32 banked R13/R14, so writing them at restore did nothing
 /// useful for an AArch32 guest.
-const VERSION: u32 = 3;
+// VERSION = 4: BE-8 migration. Old (BE-32 word-invariant) snapshots
+// have RAM/flash bytes in the opposite byte-lane geometry, plus EL1
+// SCTLR with EE=0; both are incompatible with a Phase-2 BE-8 boot, so
+// the version bump rejects them automatically at load time.
+const VERSION: u32 = 4;
 
 /// Number of rolling slots. Each slot is ~14 MiB, so four slots cost
 /// ~56 MiB of host disk and give the user three save windows of

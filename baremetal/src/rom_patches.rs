@@ -648,6 +648,26 @@ const FPE_ENTRY_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
 /// constant.
 const SAFE_INTERVAL_DELTA_SECONDS: u32 = 473_299_200;
 
+/// DataAbortHandler instruction-as-data load:
+/// `ldr r0, [lr]` at PC 0x003931e4 reads the faulting word so the
+/// kernel can decode the abort. Under our load-time byteswap of code-
+/// marked memory, a CPSR.E=1 LDR returns the byteswapped encoding —
+/// the kernel cannot recognise its own opcodes. Replace the LDR with
+/// a branch to a 6-word stub that does the LDR and byteswaps r0
+/// back to BE-natural before resuming at 0x003931e8.
+const DAH_FAULT_LDR_PC:        u32 = 0x0039_31E4;
+const DAH_FAULT_LDR_ORIG_INSN: u32 = 0xE59E_0000; // ldr r0, [lr]
+const DAH_FAULT_LDR_RESUME_PC: u32 = 0x0039_31E8;
+
+/// UndefinedInstruction handler instruction-as-data load:
+/// `ldr r1, [lr, #-4]` at PC 0x0038ce9c reads the faulting word so
+/// the kernel can compare against UDF marker patterns. Same byteswap
+/// problem as the DAH site; same fix shape but targets r1 with a
+/// resume at 0x0038cea0.
+const UND_FAULT_LDR_PC:        u32 = 0x0038_CE9C;
+const UND_FAULT_LDR_ORIG_INSN: u32 = 0xE51E_1004; // ldr r1, [lr, #-4]
+const UND_FAULT_LDR_RESUME_PC: u32 = 0x0038_CEA0;
+
 /// Small helper to emit an ARM `B target` at `src_pc`.
 const fn arm_b(src_pc: u32, target: u32) -> u32 {
     let off_bytes = target.wrapping_sub(src_pc.wrapping_add(8)) as i32;
@@ -732,9 +752,10 @@ pub unsafe fn apply_717006_patches(rom_ptr: *mut u32) {
         // wrapper itself is the wrong layer.
         let _ = apply_lock_heap_range_wrapper;
         apply_l1_cd_probes(rom_ptr);
+        apply_fault_handler_ldr_byteswap_patches(rom_ptr);
     }
 
-    kprintln!("rom_patch: applied {} simple patches + 5 native-call/injection ROM patches + PowerOffAndReboot + Reboot + BootOS + ResolveFault-wrapper + L1[0xCD] probes", applied);
+    kprintln!("rom_patch: applied {} simple patches + 5 native-call/injection ROM patches + PowerOffAndReboot + Reboot + BootOS + ResolveFault-wrapper + L1[0xCD] probes + fault-handler LDR byteswap stubs", applied);
 }
 
 /// Install the HVC probes that survive past the BE-8 migration. Most
@@ -833,6 +854,105 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             "FP_UndefHandlers_Start mov ip, sp (FPE bypass)",
             FPE_ENTRY_PROBE_HVC_IMM,
         );
+    }
+}
+
+/// Patch the two known kernel fault-handler `LDR` sites that read the
+/// faulting instruction word as data — DataAbortHandler 0x003931e4
+/// (`ldr r0, [lr]`) and UndefinedInstruction 0x0038ce9c (`ldr r1, [lr,
+/// #-4]`). Under load-time BE-8 byteswap of code-marked memory, the
+/// kernel's CPSR.E=1 `LDR` returns the bytes in the wrong order — the
+/// numerical value is the byteswap of the original instruction
+/// encoding the kernel was compiled to recognise.
+///
+/// Each site is replaced with `B stub`, where the stub re-emits the
+/// LDR and then byteswaps the loaded register in place using the
+/// classic ARMv4 idiom (no REV in v4) before falling through with `B
+/// resume`. We use `r12` (`ip`) as scratch — it's APCS caller-saved
+/// and the surrounding handler code does not touch it across the
+/// replaced LDR; verified by reading the disasm at both sites.
+///
+/// ARMv4 byteswap of `Rt` using scratch `Rs`:
+/// ```text
+///     EOR Rs, Rt, Rt, ROR #16    ; Rs = Rt ^ rotr(Rt, 16)
+///     BIC Rs, Rs, #0x00FF_0000   ; clear byte 2 of Rs
+///     MOV Rt, Rt, ROR #8         ; Rt rotr 8
+///     EOR Rt, Rt, Rs, LSR #8     ; Rt ^= Rs >> 8     -> byteswapped
+/// ```
+unsafe fn apply_fault_handler_ldr_byteswap_patches(rom_ptr: *mut u32) {
+    // DABT site: target r0, scratch r12.
+    //   +0x00 LDR r0, [lr]                e59e0000
+    //   +0x04 EOR r12, r0, r0, ROR #16    e0200c60
+    //   +0x08 BIC r12, r12, #0xFF0000     e3ccc8ff
+    //   +0x0C MOV r0, r0, ROR #8          e1a00460
+    //   +0x10 EOR r0, r0, r12, LSR #8     e020042c
+    //   +0x14 B   DAH_FAULT_LDR_RESUME_PC arm_b(...)
+    let dah_stub_pc = alloc_patch_stub(6, "DAH faulting-insn LDR byteswap");
+    let dah_stub: [u32; 6] = [
+        0xE59E_0000, // LDR r0, [lr]
+        0xE020_0C60, // EOR r12, r0, r0, ROR #16
+        0xE3CC_C8FF, // BIC r12, r12, #0xFF0000
+        0xE1A0_0460, // MOV r0, r0, ROR #8
+        0xE020_042C, // EOR r0, r0, r12, LSR #8
+        arm_b(dah_stub_pc + 0x14, DAH_FAULT_LDR_RESUME_PC),
+    ];
+
+    // UND site: target r1, scratch r12.
+    //   +0x00 LDR r1, [lr, #-4]           e51e1004
+    //   +0x04 EOR r12, r1, r1, ROR #16    e021c861
+    //   +0x08 BIC r12, r12, #0xFF0000     e3ccc8ff
+    //   +0x0C MOV r1, r1, ROR #8          e1a01461
+    //   +0x10 EOR r1, r1, r12, LSR #8     e021142c
+    //   +0x14 B   UND_FAULT_LDR_RESUME_PC arm_b(...)
+    let und_stub_pc = alloc_patch_stub(6, "UND faulting-insn LDR byteswap");
+    let und_stub: [u32; 6] = [
+        0xE51E_1004, // LDR r1, [lr, #-4]
+        0xE021_C861, // EOR r12, r1, r1, ROR #16
+        0xE3CC_C8FF, // BIC r12, r12, #0xFF0000
+        0xE1A0_1461, // MOV r1, r1, ROR #8
+        0xE021_142C, // EOR r1, r1, r12, LSR #8
+        arm_b(und_stub_pc + 0x14, UND_FAULT_LDR_RESUME_PC),
+    ];
+
+    unsafe {
+        write_stub_words(rom_ptr, dah_stub_pc, &dah_stub);
+        write_stub_words(rom_ptr, und_stub_pc, &und_stub);
+
+        // DAH site
+        let dah_idx = (DAH_FAULT_LDR_PC / 4) as usize;
+        let prev = rom_ptr.add(dah_idx).read();
+        if prev != DAH_FAULT_LDR_ORIG_INSN {
+            kprintln!(
+                "rom_patch: ERROR — DAH faulting-insn LDR at {:#010x} is {:#010x}, expected {:#010x}; skipping byteswap stub",
+                DAH_FAULT_LDR_PC, prev, DAH_FAULT_LDR_ORIG_INSN,
+            );
+        } else {
+            let insn = arm_b(DAH_FAULT_LDR_PC, dah_stub_pc);
+            crate::guest_mem::write_rom_code_word(rom_ptr, dah_idx, insn);
+            record_original(DAH_FAULT_LDR_PC, prev);
+            kprintln!(
+                "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (DAH ldr r0,[lr] → B stub @ {:#x}, byteswap)",
+                DAH_FAULT_LDR_PC, prev, insn, dah_stub_pc,
+            );
+        }
+
+        // UND site
+        let und_idx = (UND_FAULT_LDR_PC / 4) as usize;
+        let prev = rom_ptr.add(und_idx).read();
+        if prev != UND_FAULT_LDR_ORIG_INSN {
+            kprintln!(
+                "rom_patch: ERROR — UND faulting-insn LDR at {:#010x} is {:#010x}, expected {:#010x}; skipping byteswap stub",
+                UND_FAULT_LDR_PC, prev, UND_FAULT_LDR_ORIG_INSN,
+            );
+        } else {
+            let insn = arm_b(UND_FAULT_LDR_PC, und_stub_pc);
+            crate::guest_mem::write_rom_code_word(rom_ptr, und_idx, insn);
+            record_original(UND_FAULT_LDR_PC, prev);
+            kprintln!(
+                "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (UND ldr r1,[lr,-4] → B stub @ {:#x}, byteswap)",
+                UND_FAULT_LDR_PC, prev, insn, und_stub_pc,
+            );
+        }
     }
 }
 

@@ -163,20 +163,19 @@ const PATCHES_717006: &[RomPatch] = &[
     RomPatch { offset: 0x003A_D430, value: 0x3281_1001, name: "GetClock wrap-detect ls→cc" },
     RomPatch { offset: 0x003A_D46C, value: 0x3282_2001, name: "SetAlarm wrap-detect (1/2) ls→cc" },
     RomPatch { offset: 0x003A_D49C, value: 0x3282_2001, name: "SetAlarm wrap-detect (2/2) ls→cc" },
-    // SWIBoot's second instruction-as-data LDR at 0x003ad738.
-    // The kernel does `mov r1, lr; ldr r1, [r1, #-4]` to re-read the
-    // SWI word so it can mask out bits[31:24] and dispatch on the
-    // imm24. Under our load-time BE-8 byteswap of code-marked memory
-    // the LDR returns the bytes reversed — same problem as the first
-    // SWI LDR at 0x003ad69c, which iter-101 fixed with a B-to-stub
-    // (load + REV). Here we don't need a stub: by the time we reach
-    // 0x003ad738, `r0` already holds the byteswap-corrected SWI word
-    // from the first LDR's REV stub (the dispatch path doesn't write
-    // r0 between 0x003ad69c and 0x003ad738 except for a save/restore
-    // around a CP15 op). Patch the LDR to `mov r1, r0` so the
-    // dispatch picks the right imm24. Hypervisor-level byteswap
-    // plumbing, not a kernel-logic change.
-    RomPatch { offset: 0x003A_D738, value: 0xE1A0_1000, name: "SWIBoot dispatch LDR: mov r1, r0 (BE-8 byteswap)" },
+    // SWIBoot's second instruction-as-data LDR at 0x003ad738 is
+    // patched separately, in `apply_fault_handler_ldr_byteswap_patches`,
+    // as a B-to-stub. Iter-102 had this as `mov r1, r0` on the
+    // assumption that r0 still carried the byteswap-corrected SWI
+    // word from the iter-101 stub at 0x003ad69c — true for
+    // unconditional SVCs, but the conditional-SVC dispatcher at
+    // 0x003add7c does `mrs r0, SPSR`, clobbering r0 with the
+    // caller's CPSR. The downstream `mov r1, r0; bic r1, r1,
+    // #0xFF000000; cmp r1, #0x23` then sees CPSR-shaped garbage
+    // (low 24 bits include the mode field), the bge fires, and
+    // boot wedges in the "Undefined SWI" debug stub. The fix is a
+    // proper LDR-byteswap stub mirroring the iter-101 site so the
+    // re-read works for conditional SVCs too.
     // Force every VM heap to allocate / extend in 4-KiB chunks
     // instead of 1-KiB subpages. The kernel's design partitions
     // shared 4-KiB physical pages into 1-KiB subpages with per-
@@ -700,6 +699,20 @@ const SWIBOOT_LDR_PC:        u32 = 0x003a_D69C;
 const SWIBOOT_LDR_ORIG_INSN: u32 = 0xE51E_0004; // ldr r0, [lr, #-4]
 const SWIBOOT_LDR_RESUME_PC: u32 = 0x003a_D6A0;
 
+/// `SWIBoot` dispatch-side instruction-as-data load:
+/// `ldr r1, [r1, #-4]` at PC 0x003ad738 (with r1 = lr from the
+/// preceding `mov r1, lr` at 0x003ad734) re-reads the SWI word so the
+/// dispatch table index can be extracted via `bic r1, r1, #0xFF000000`
+/// + `cmp r1, #0x23`. The conditional-SVC dispatcher at 0x003add7c
+/// does `mrs r0, SPSR` along the way, clobbering the byteswap-
+/// corrected SWI word that the iter-101 stub at 0x003ad69c put into
+/// r0 — so reusing r0 here (as iter-102 tried to do) only works for
+/// unconditional SVCs. Same B-to-stub fix as the other three sites:
+/// re-do the LDR and REV the result.
+const SWIBOOT_DISPATCH_LDR_PC:        u32 = 0x003a_D738;
+const SWIBOOT_DISPATCH_LDR_ORIG_INSN: u32 = 0xE511_1004; // ldr r1, [r1, #-4]
+const SWIBOOT_DISPATCH_LDR_RESUME_PC: u32 = 0x003a_D73C;
+
 /// Small helper to emit an ARM `B target` at `src_pc`.
 const fn arm_b(src_pc: u32, target: u32) -> u32 {
     let off_bytes = target.wrapping_sub(src_pc.wrapping_add(8)) as i32;
@@ -890,12 +903,13 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
     }
 }
 
-/// Patch the kernel's three known `LDR` sites that read the faulting
+/// Patch the kernel's four known `LDR` sites that read the faulting
 /// (or trapping) instruction word as data:
 ///
 ///   - DataAbortHandler 0x003931e4 (`ldr r0, [lr]`)
 ///   - UndefinedInstruction 0x0038ce9c (`ldr r1, [lr, #-4]`)
 ///   - SWIBoot 0x003ad69c (`ldr r0, [lr, #-4]`)
+///   - SWIBoot dispatch 0x003ad738 (`ldr r1, [r1, #-4]` with r1 = lr)
 ///
 /// Under load-time BE-8 byteswap of code-marked memory, the kernel's
 /// CPSR.E=1 `LDR` returns the bytes in the wrong order — the
@@ -944,10 +958,24 @@ unsafe fn apply_fault_handler_ldr_byteswap_patches(rom_ptr: *mut u32) {
         arm_b(swiboot_stub_pc + 0x08, SWIBOOT_LDR_RESUME_PC),
     ];
 
+    // SWIBoot dispatch site: target r1, base register is r1 (which the
+    // preceding `mov r1, lr` at 0x003ad734 has loaded with LR_svc).
+    //   +0x00 LDR r1, [r1, #-4]                    e5111004
+    //   +0x04 REV r1, r1                           e6bf_1f31
+    //   +0x08 B   SWIBOOT_DISPATCH_LDR_RESUME_PC   arm_b(...)
+    let swiboot_dispatch_stub_pc =
+        alloc_patch_stub(3, "SWIBoot dispatch-insn LDR byteswap");
+    let swiboot_dispatch_stub: [u32; 3] = [
+        0xE511_1004, // LDR r1, [r1, #-4]
+        0xE6BF_1F31, // REV r1, r1
+        arm_b(swiboot_dispatch_stub_pc + 0x08, SWIBOOT_DISPATCH_LDR_RESUME_PC),
+    ];
+
     unsafe {
         write_stub_words(rom_ptr, dah_stub_pc, &dah_stub);
         write_stub_words(rom_ptr, und_stub_pc, &und_stub);
         write_stub_words(rom_ptr, swiboot_stub_pc, &swiboot_stub);
+        write_stub_words(rom_ptr, swiboot_dispatch_stub_pc, &swiboot_dispatch_stub);
 
         // DAH site
         let dah_idx = (DAH_FAULT_LDR_PC / 4) as usize;
@@ -1000,6 +1028,24 @@ unsafe fn apply_fault_handler_ldr_byteswap_patches(rom_ptr: *mut u32) {
             kprintln!(
                 "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (SWIBoot ldr r0,[lr,-4] → B stub @ {:#x}, byteswap)",
                 SWIBOOT_LDR_PC, prev, insn, swiboot_stub_pc,
+            );
+        }
+
+        // SWIBoot dispatch site (iter-104).
+        let swib_disp_idx = (SWIBOOT_DISPATCH_LDR_PC / 4) as usize;
+        let prev = rom_ptr.add(swib_disp_idx).read();
+        if prev != SWIBOOT_DISPATCH_LDR_ORIG_INSN {
+            kprintln!(
+                "rom_patch: ERROR — SWIBoot dispatch LDR at {:#010x} is {:#010x}, expected {:#010x}; skipping byteswap stub",
+                SWIBOOT_DISPATCH_LDR_PC, prev, SWIBOOT_DISPATCH_LDR_ORIG_INSN,
+            );
+        } else {
+            let insn = arm_b(SWIBOOT_DISPATCH_LDR_PC, swiboot_dispatch_stub_pc);
+            crate::guest_mem::write_rom_code_word(rom_ptr, swib_disp_idx, insn);
+            record_original(SWIBOOT_DISPATCH_LDR_PC, prev);
+            kprintln!(
+                "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (SWIBoot dispatch ldr r1,[r1,-4] → B stub @ {:#x}, byteswap)",
+                SWIBOOT_DISPATCH_LDR_PC, prev, insn, swiboot_dispatch_stub_pc,
             );
         }
     }

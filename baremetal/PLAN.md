@@ -18,58 +18,47 @@ Bloated PLAN.md wastes context every read.
   functionality (not merely diagnostics):
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-104):** iter-103 landed the VA-space classifier
-rework — the walker now carries `cur` as a VA throughout, with a
-single `va_to_pa` translation step, so JT-thunk page chains decode
-their B-AL words against the runtime VA the kernel actually
-branches through. Boot now advances dramatically past the iter-100
-PC=0x7a56e4 wedge: through `InitGlobalWorld`, `OsBoot`, and into
-USR-mode task code, before stalling on a kernel-internal abort
-cascade kicked off by an unrecognised SWI:
+**Current goal (iter-105):** iter-104 fixed the "Undefined SWI"
+wedge: the iter-102 `mov r1, r0` patch at SWIBoot's dispatch site
+(0x003a_d738) only worked for unconditional SVCs. For conditional
+SVCs (cond != 0xE), the conditional dispatcher at 0x003a_dd7c
+does `mrs r0, SPSR`, clobbering the byteswap-corrected SVC word in
+r0 with the caller's CPSR. Replacing the patched instruction with
+a proper LDR-byteswap stub (4th member of the family in
+`apply_fault_handler_ldr_byteswap_patches`) re-reads the SVC word
+from `[r1, #-4]` (with r1=lr from the preceding `mov r1, lr`) and
+REVs the result, mirroring the existing iter-101 site at
+0x003a_d69c.
+
+Boot now reaches `<<TRM_STOP>>` (the kernel's emergency-stop
+marker) and then trips a new wedge:
 
 ```
-und: DebuggerUND @PC=0x3add50 msg="Undefined SWI " (resume at PC=0x3add64)
-dabt: forwarding to kernel DataAbortHandler — DFSC=0x5 FAR=0x9ebdd54a mode=0x17
-  LR_abt=0x003add74 (faulting PC=0x003add6c)
-  saved-slot SPSR_abt=0x20000393 (pre-abt mode=0x13 = SVC)  *** MRS DIVERGES ***
-und: DebuggerUND @PC=0x393898 msg="Non-user-mode abort (deep toast alert)"
-unaligned: cannot write aligned 0x00000000 (EA=0x00000003) at PC=0x3940b4
+*** unrecognised UND: insn=0xea0061a0 at PC=0x0 SPSR_und=0x330
+  src_mode=0x10 (USR)  LR_und=0x4
 ```
 
-`0x003ad750` is the SWI dispatch trampoline; `0x003add50` is the
-"Undefined SWI" debug stub the dispatch falls into when the
-opcode-indexed handler table maps to it. The garbage FAR
-`0x9ebdd54a` and the cascade through "deep toast alert" + the
-unaligned write of zero to EA=3 all look like a corrupt register /
-stack frame propagated out of an earlier mishandled trap.
+PC=0x0 is the reset vector and `0xEA0061A0` is a perfectly valid
+`B` to PC+0x18688, so the UND is presumably the host catching the
+guest jumping to PC=0 — a soft-reset or a wild branch. Investigation
+order for iter-105:
 
-Investigation order for iter-104:
+1. **Locate the BL/B that lands at PC=0x0.** UND history right
+   before the wedge shows USR-mode UNDs at `0x00394318`
+   (`mrs ip, SPSR`) and `0x00258e50` (the REMEMBER_SWIRET probe
+   HVC). One of those handlers is presumably either branching to
+   0 directly or returning into garbage (LR clobber). Cross-check
+   the `<<TRM_STOP>>` source — search the ROM disasm for the
+   `TRM_STOP` literal to find which kernel routine emitted it.
+2. **Decide whether PC=0 is a real reset request or a runaway
+   branch.** A real reset (`Reboot`-class call) should land in our
+   reset canary first, not PC=0; if PC=0 fires straight, the
+   call was a wild branch and the original site is the bug. If
+   it's a deliberate reset, we need to model the kernel's
+   "graceful reboot" instead of UND-ing.
 
-1. **Identify the offending SWI.** Add a probe (HVC injected via
-   `rom_patches.rs`) on the SWI dispatch around `0x003ad750` that
-   logs the SWI number and faulting LR before falling into the
-   "Undefined SWI" stub. The SWI number tells us whether this is
-   a kernel SWI we haven't installed (which means we missed a
-   table-population step earlier in boot) or a user-side SWI we
-   should be emulating.
-2. **Validate the MRS-divergence path.** The DAH-mrs-patch log
-   already flags the saved-slot vs current SPSR mismatch — this
-   is the recurring Phase-B pattern where banked-register
-   handling at the AArch32↔AArch64 boundary doesn't restore the
-   right context. Cross-check against `docs/QEMU_BUGS.md` before
-   suspecting hypervisor code (banked SPSR_abt is in
-   `ctx.x[20]`, etc., per ARM ARM Table D1-79).
-3. **Trace the garbage FAR back to its source.** A register-state
-   dump at `und: DebuggerUND @PC=0x3add50` (before the cascade
-   starts) gives the SWI handler's input registers — likely r1
-   carries the SPSR-shaped value 0x20000393 that surfaced in the
-   later abort log, which would point at a kernel-side bug
-   accessing a stack slot with the wrong offset / wrong mode.
-
-Iter-103 retired the iter-100 APCS-prologue-scan workaround. The
-iter-99 fault-handler LDR byteswap stubs are still present in
-`rom_patches.rs`; they remain harmless and may yet be exercised by
-a fault path further on — don't revert.
+The iter-99/101/104 byteswap stubs and the iter-103 VA-space
+classifier rework remain in place; both are working as intended.
 
 ### Iteration 103: VA-space classifier walker
 
@@ -115,8 +104,75 @@ Result:
 - 70 ROM-soup walk-entries (was 35) — all legitimate ROM-driver
   TClassInfo trampolines at 0x7a5xxx; the user-defined ROM-soup
   range is intentionally over-reaching.
-- Boot advances from PC=0x7a56e4 to the iter-104 wedge described
-  above.
+- Boot advances from PC=0x7a56e4 to the iter-104 wedge.
+
+### Iteration 104: SWIBoot dispatch LDR byteswap stub
+
+Goal: clear the "Undefined SWI" cascade by fixing the assumption
+behind the iter-102 patch at SWIBoot's dispatch site
+(0x003a_d738).
+
+The kernel's SWIBoot does:
+
+1. `ldr r0, [lr, #-4]` at 0x003a_d69c — read the SVC word.
+   Iter-101 replaced this with a B-to-stub that LDRs + REVs so r0
+   ends up with the original BE-32 SVC word.
+2. Check `bits[27:24] == 0xF` (SVC opcode); if cond != 0xE, branch
+   to the conditional dispatcher at 0x003a_dd7c.
+3. Conditional dispatcher: `mrs r0, SPSR` (clobbers r0), then a
+   per-cond table of `tst SPSR_flags / b 0x003a_d6b8 (continue) /
+   b 0x003a_dd70 (return)`.
+4. Continue dispatch path: `mov r1, lr; ldr r1, [r1, #-4]` —
+   re-read the SVC word so we can mask to the imm24.
+5. `bic r1, r1, #0xFF000000; cmp r1, #0x23; bge 0x003a_dd50` —
+   range-check; out-of-range falls into the "Undefined SWI" debug
+   stub.
+
+Iter-102 patched step 4's LDR to `mov r1, r0`, betting that r0
+still carried the byteswap-corrected SVC word from step 1. That's
+true on the unconditional path but false on the conditional path,
+where step 3's `mrs r0, SPSR` overwrites r0 with the caller's
+CPSR. Subsequent `bic r1, r1, #0xFF000000` then keeps the low 24
+bits of the CPSR — including the mode field — and the cmp+bge
+fires against garbage like `0x310` (= USR mode + flags).
+
+Diagnostic probe (HVC at 0x003a_d740 capturing r0/r1/lr_svc/
+svc_word) showed the clobber concretely on a `svceq #0x1A` from
+USR mode at 0x003940ac:
+
+```
+swiboot-dispatch[9]: imm24=0x0310 r0=0x60000310 r1=0x00000310
+  lr_svc=0x003940b0 svc_word@0x003940ac=0x0f00001a
+```
+
+Fix: replace the iter-102 `mov r1, r0` with a proper LDR-byteswap
+stub mirroring the existing three sites (DAH, UND, SWIBoot first
+LDR). The stub:
+
+```
+ldr r1, [r1, #-4]   ; r1 was lr from the preceding mov r1, lr
+rev r1, r1
+b   0x003a_d73c     ; resume at original cmp setup
+```
+
+After the fix, the same probe shows `imm24=0x001a r1=0x0000001a`
+— the imm24 dispatch is correct on conditional SVCs too. Boot
+advances through hundreds more SVCs, reaches the kernel's
+`<<TRM_STOP>>` marker, and trips a new wedge at PC=0x0 (see
+Status above).
+
+Implementation lives in `src/rom_patches.rs`:
+- Removed the iter-102 `RomPatch { offset: 0x003A_D738, value:
+  0xE1A0_1000, ... }` entry from `PATCHES_717006` (replaced with
+  an explanatory comment pointing at the new stub).
+- Added `SWIBOOT_DISPATCH_LDR_PC / _ORIG_INSN / _RESUME_PC`
+  constants alongside the existing iter-99/101 ones.
+- Extended `apply_fault_handler_ldr_byteswap_patches` to allocate
+  a 4th 3-word stub and replace the original `ldr r1, [r1, #-4]`
+  with a B to it.
+
+36/36 guest tests pass; iteration is hypervisor-functional, not
+probe-only, so the run is mandatory per the workflow rule.
 
 <!-- Older iteration retrospectives (iter-98 through iter-102) live
      in `git log` per the auto-prune maintenance note. -->

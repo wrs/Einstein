@@ -2619,10 +2619,10 @@ fn handle_reboot(ctx: &TrapContext) -> ! {
     // 2026-04-26: dump kernel state to diagnose lazy-L1 wedge inside
     // TInterpreter::TInterpreter. The interesting fields:
     //   - L1[0xC0..0xD7]: which sections are coarse vs lazy 0x90 vs 0
-    //   - gKernelGlobals (= *(0x0c100ff8)): pointer used by
+    //   - gCurrentTask (= *(0x0c100ff8)): the running TTask*; used by
     //     DataAbortHandler at 0x393318 for the monitor lookup
-    //   - That global's task struct's monitor list at +0x74,+0x78,+0x7c
-    //     (read by `0x393324..0x393348` to build the dispatch bitmask)
+    //   - That task's monitor list at +0x74,+0x78,+0x7c (read by
+    //     `0x393324..0x393348` to build the dispatch bitmask)
     kprintln!();
     crate::alrt_capture::dump_counters();
     kprintln!();
@@ -2641,21 +2641,21 @@ fn handle_reboot(ctx: &TrapContext) -> ! {
             };
             kprintln!("    L1[{:#x}] = {:#010x}  ({})", i, e, kind);
         }
-        // gKernelGlobals at 0x0c100ff8 → walk through stage-1 to find PA.
-        let gkg_va: u32 = 0x0c10_0ff8;
-        if let Some(gkg_pa) = guest_mem::translate_va(gkg_va) {
-            if let Some(gkg) = crate::guest_endian::guest_read_u32_pa(gkg_pa) {
+        // gCurrentTask at 0x0c100ff8 → walk through stage-1 to find PA.
+        let gct_va: u32 = 0x0c10_0ff8;
+        if let Some(gct_pa) = guest_mem::translate_va(gct_va) {
+            if let Some(gct) = crate::guest_endian::guest_read_u32_pa(gct_pa) {
                 kprintln!(
-                    "  gKernelGlobals @VA={:#x} PA={:#x} = {:#010x}",
-                    gkg_va, gkg_pa, gkg
+                    "  gCurrentTask @VA={:#x} PA={:#x} = {:#010x}",
+                    gct_va, gct_pa, gct
                 );
-                if let Some(gkg_pa2) = guest_mem::translate_va(gkg) {
-                    let m74 = crate::guest_endian::guest_read_u32_pa(gkg_pa2 + 0x74).unwrap_or(0xDEAD);
-                    let m78 = crate::guest_endian::guest_read_u32_pa(gkg_pa2 + 0x78).unwrap_or(0xDEAD);
-                    let m7c = crate::guest_endian::guest_read_u32_pa(gkg_pa2 + 0x7c).unwrap_or(0xDEAD);
+                if let Some(gct_pa2) = guest_mem::translate_va(gct) {
+                    let m74 = crate::guest_endian::guest_read_u32_pa(gct_pa2 + 0x74).unwrap_or(0xDEAD);
+                    let m78 = crate::guest_endian::guest_read_u32_pa(gct_pa2 + 0x78).unwrap_or(0xDEAD);
+                    let m7c = crate::guest_endian::guest_read_u32_pa(gct_pa2 + 0x7c).unwrap_or(0xDEAD);
                     kprintln!(
                         "  task @VA={:#x} PA={:#x} ->[0x74]={:#010x} ->[0x78]={:#010x} ->[0x7c]={:#010x}",
-                        gkg, gkg_pa2, m74, m78, m7c
+                        gct, gct_pa2, m74, m78, m7c
                     );
                     // Walk each non-null monitor's bitmask at +0x10
                     for (off, val) in [(0x74, m74), (0x78, m78), (0x7c, m7c)] {
@@ -2802,7 +2802,7 @@ fn handle_fme_entry_probe(ctx: &mut TrapContext) {
     let src_mode = spsr_el2 & 0x1F;
     let sp_src = crate::banked::sp_for_mode(ctx, spsr_el2);
     let curr_task = crate::guest_endian::guest_read_u32_va(
-        crate::rom_patches::G_KERNEL_GLOBALS_VA,
+        crate::rom_patches::G_CURRENT_TASK_VA,
     ).unwrap_or(0);
     let task_64 = if curr_task != 0 {
         crate::guest_endian::guest_read_u32_va(curr_task.wrapping_add(0x64)).unwrap_or(0)
@@ -2830,12 +2830,13 @@ fn handle_fme_entry_probe(ctx: &mut TrapContext) {
 /// (just before the OR-chain that builds the fault mask). Logs the
 /// curr_task pointer + its `[+0x74/+0x78/+0x7c]` TUDomainManager chain
 /// + each monitor's `[+0x10]`, then emulates the original ldr by
-/// writing the literal `0x0C100FF8` (gKernelGlobals VA) into
-/// `ctx.x[1]`. ERET resumes at `0x39331c` (kernel's `ldr r1, [r1]`).
+/// writing the literal `0x0C100FF8` (the address of `gCurrentTask`)
+/// into `ctx.x[1]`. ERET resumes at `0x39331c` (kernel's
+/// `ldr r1, [r1]`).
 fn handle_dah_or_chain_probe(ctx: &mut TrapContext) {
     let far = read_sysreg!("far_el1") as u32;
-    let g_kernel_globals_va = crate::rom_patches::G_KERNEL_GLOBALS_VA;
-    let curr_task = crate::guest_endian::guest_read_u32_va(g_kernel_globals_va).unwrap_or(0);
+    let g_current_task_va = crate::rom_patches::G_CURRENT_TASK_VA;
+    let curr_task = crate::guest_endian::guest_read_u32_va(g_current_task_va).unwrap_or(0);
     let m74 = if curr_task != 0 {
         crate::guest_endian::guest_read_u32_va(curr_task.wrapping_add(0x74)).unwrap_or(0)
     } else { 0 };
@@ -2864,8 +2865,9 @@ fn handle_dah_or_chain_probe(ctx: &mut TrapContext) {
         );
     }
     // Emulate `ldr r1, [pc, #1588]`: r1 = literal at (pc + 8 + 1588) =
-    // 0x393954 = 0x0C100FF8. Write low 32 bits of ctx.x[1].
-    ctx.x[1] = (ctx.x[1] & 0xFFFF_FFFF_0000_0000) | (g_kernel_globals_va as u64);
+    // 0x393954 = 0x0C100FF8 (the address of `gCurrentTask`). Write low
+    // 32 bits of ctx.x[1].
+    ctx.x[1] = (ctx.x[1] & 0xFFFF_FFFF_0000_0000) | (g_current_task_va as u64);
 }
 
 fn handle_diag(ctx: &mut TrapContext) {

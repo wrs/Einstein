@@ -20,28 +20,48 @@ the kernel's address space (typically the `0x0c000000+` window).
 
 ## Kernel globals (at fixed VAs)
 
+Names below are taken verbatim from `_Data_/symbols.txt` — the
+authoritative oracle for the 717006 ROM. **Always cross-check
+against `symbols.txt` before naming a kernel global.** Earlier
+revisions of this table guessed names that disagreed with the
+symbol file (e.g. `0x0c100ff8` was labelled `gNewlyScheduledTask`
+when the symbol is `gCurrentTask`); those guesses propagated
+into hypervisor source code via copy-paste. Don't.
+
 ```c
-0x0c100fc4   TTask*           gPriorScheduledTask;   // *r5 in Schedule
-0x0c100fd0   TScheduler*      gScheduler;            // ptr to TScheduler
-0x0c100fd4   ULong            gWantSchedule;         // bool: scheduler tick pending
-0x0c100fd8   ULong            gHoldScheduleCount;    // depth of HoldSchedule
-0x0c100fe4   ULong            gWantScheduleAfter;    // ?
-0x0c100ff8   TTask*           gNewlyScheduledTask;   // ?
-0x0c100ffc   TTask*           gIdleTask;             // ?
-0x0c101000   TTask*           gCurrentTask;          // currently running
-0x0c101008   ULong            gSomeBool;             // ?
+// Object / scheduler / domain globals
+0x0c100fc4   TTask*           gIdleTask;
+0x0c100fc8   TObjectTable*    gObjectTable;          // pointer; instance is elsewhere
+0x0c100fcc   TPort*           gNullPort;
+0x0c100fd0   TScheduler*      gKernelScheduler;
+0x0c100fd4   ULong            gScheduleRequested;    // bool: scheduler tick pending
+0x0c100fd8   ULong            gHoldScheduleLevel;    // depth of HoldSchedule
+0x0c100fdc   void*            gUCTTable;
+0x0c100fe4   void*            gSchedule;
+0x0c100ff0   ULong            gAtomicFIQNestCount;
+0x0c100ff4   ULong            gOldFIQStatus;
+0x0c100ff8   TTask*           gCurrentTask;          // running task; SWI 0x1b
+                                                     // saves SPSR_svc into
+                                                     // gCurrentTask->[+0x50]
+0x0c100ffc   TTask*           gCurrentTimedTask;
+0x0c101000   TTask*           gCurrentMemCountTask;
+0x0c101008   ULong            gCountTaskTime;
+0x0c101010   ULong            gHandlesUsed;
+0x0c101014   ULong            gPtrsUsed;
+0x0c101018   ULong            gSavedHandlesUsed;
+0x0c10101c   ULong            gSavedPtrsUsed;
 0x0c101054   ULong            gCurrentTaskId;        // copied from task->[0]
-0x0c101058   void*            gCurrentDomainSomething; // copied from task->[0xd8]
+0x0c101058   void*            gCurrentMonitorId;
 0x0c10105c   void*            gCurrentGlobals;       // copied from task->[0xa0]
                                                      // STaskSwitchedGlobals lives just below
-0x0c101980   void*            gAccountingPage;       // accumulated CPU times etc.
-0x0c10fc34   TObjectTable     gObjectTable;          // INSTANCE (not a ptr)
+0x0c101980   void*            gTaskPriority;
 ```
 
 Citations: `Scheduler` at ROM `0x1cc1ec`; `TScheduler::Schedule` at
 `0x1cc780`; `WantSchedule__Fv` at `0x1cc7f4`; `SwapInGlobals` at
-`0x25215c`; `TObjectTable::Get` first arg in trace
-(`r0=0x0c10fc34`).
+`0x25215c`; `TObjectTable::Get` first arg in a Phase-B trace was
+observed as `r0=0x0c10fc34` — the **instance** the `gObjectTable`
+pointer at `0x0c100fc8` references, not a separate global.
 
 ---
 

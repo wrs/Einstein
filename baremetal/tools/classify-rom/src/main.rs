@@ -120,6 +120,7 @@ struct SymbolFilterStats {
     k_prefix_dropped: usize,
     nv_cond_dropped: usize,
     not_prologue_dropped: usize,
+    data_stop_dropped: usize,
     jt_va_resolved: usize,
     accepted: usize,
 }
@@ -150,10 +151,10 @@ struct SymbolFilterStats {
 fn load_symbol_roots(
     path: &Path,
     words: &[u32],
-) -> Result<(Vec<u32>, SymbolFilterStats), String> {
+) -> Result<(Vec<(u32, &'static str)>, SymbolFilterStats), String> {
     let text = fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
     let mut seen: HashSet<u32> = HashSet::new();
-    let mut out: Vec<u32> = Vec::new();
+    let mut out: Vec<(u32, &'static str)> = Vec::new();
     let mut stats = SymbolFilterStats::default();
 
     for line in text.lines() {
@@ -234,6 +235,15 @@ fn load_symbol_roots(
         let w = words[(pa >> 2) as usize];
         if (w >> 28) == 0xF { stats.nv_cond_dropped += 1; continue; }
 
+        // Drop symbol roots that fall into a known data range. Newton's
+        // demangled-symbol set includes data labels like `PublicFiller`
+        // whose first word coincidentally decodes as a known ARM
+        // instruction shape (`STRB r0, [r0], -r0, lsl #8` here). Without
+        // this gate the walker linearly walks ~90 KiB of bp-weight data,
+        // pushing branch targets into NSRuntime / package data and
+        // producing thousands of false-positive code marks.
+        if in_data_stop_range(pa) { stats.data_stop_dropped += 1; continue; }
+
         // Prologue gate. Despite the appeal of "the walker is self-
         // correcting on data", the walker is *not* self-correcting on
         // data-symbol seeds: a name like `DataAreaTable` (whose first
@@ -249,11 +259,16 @@ fn load_symbol_roots(
         if !is_known_function_start(w) { stats.not_prologue_dropped += 1; continue; }
 
         if seen.insert(pa) {
-            out.push(pa);
+            // Leak the name to get a `&'static str` we can carry in
+            // SeedSource::Symbol without having to plumb a name table
+            // through every collector. The list is bounded (~36k accepted
+            // symbols) so the leak doesn't grow without bound.
+            let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+            out.push((pa, leaked));
             stats.accepted += 1;
         }
     }
-    out.sort_unstable();
+    out.sort_unstable_by_key(|&(pa, _)| pa);
     Ok((out, stats))
 }
 
@@ -401,12 +416,8 @@ fn load_vector_ranges(path: &Path) -> Result<Vec<(String, u32, u32)>, String> {
 fn seed_vector_table_roots(
     words: &[u32],
     ranges: &[(String, u32, u32)],
-    worklist: &mut Vec<u32>,
+    worklist: &mut Vec<(u32, SeedSource)>,
 ) -> (usize, usize) {
-    // Same Vec<u32> contract as load_symbol_roots — vector-table seeds
-    // are merged into `symbols` upstream of `walk()`, so they all land
-    // tagged `Seed(Symbol)` in the trace. To distinguish, tag manually
-    // at the walk() boundary instead of here.
     let mut added = 0usize;
     let mut seen: HashSet<u32> = HashSet::new();
     for (_label, base, limit) in ranges {
@@ -419,7 +430,7 @@ fn seed_vector_table_roots(
             if (tw >> 28) == 0xF { continue; }
             if !is_known_function_start(tw) { continue; }
             if seen.insert(p) {
-                worklist.push(p);
+                worklist.push((p, SeedSource::Vector));
                 added += 1;
             }
         }
@@ -461,6 +472,65 @@ const MANUAL_DATA_RANGES: &[(u32, u32)] = &[
     // header words that aren't LDR-pc-rel targets.
     (0x0001_8668, 0x0001_8688),
 ];
+
+/// "ROM soup": the post-code region of the 717006 ROM that contains
+/// only data — neural-net weights, lex/recognition tables, NSRuntime
+/// package metadata, REx-internal structures, etc. The last real
+/// code symbol is `TCountXrAsm` at 0x003ad244 (followed by a small
+/// asm trailer); the user-defined cutoff is 0x003afda8 to be safe.
+/// The REx aperture starts at 0x00800000.
+///
+/// Any walk that reaches an address in this range is by definition
+/// a classifier failure — either a symbol root that should be data,
+/// or an indirect-pass collector following a misdecoded structure.
+/// The walker logs every entry to stderr so the offending root /
+/// trace stack can be tracked down.
+const ROM_SOUP_RANGE: (u32, u32) = (0x003a_fda8, 0x0080_0000);
+
+fn in_rom_soup(addr: u32) -> bool {
+    addr >= ROM_SOUP_RANGE.0 && addr < ROM_SOUP_RANGE.1
+}
+
+/// Half-open `[start, end)` ranges of ROM that contain no code at all.
+/// The walker terminates on entry (not just clears bits afterwards),
+/// preventing the indirect cascades data-as-code walks produce: e.g.
+/// PublicFiller (0x003948e4, byte-shape first word) seeded as a code
+/// root walks linearly through the bp-weight tables, eventually
+/// decodes a random data word as `bne 0x7a0dbc`, pushes a worklist
+/// root in the NSRuntime data region, and so on.
+///
+/// These ranges mirror `classify-symbols.py`'s `DATA_RANGES` —
+/// regions verified by inspection / bucket cross-check to contain
+/// zero code symbols.
+const DATA_STOP_RANGES: &[(u32, u32)] = &[
+    // Recognition tables + modem constants + DES tables + IrDA
+    // tables + charsets + yacc tables + C runtime globals +
+    // QuickDraw pattern data. (`classify-symbols.py:DATA_RANGES[0]`)
+    (0x0036_6f2c, 0x0038_2324),
+    // Inline ASCII string "SVC mode in MonitorEntryGlue\0" embedded
+    // at the tail of MonitorEntryGlue (0x00394318). The walker can
+    // fall into it because the preceding DebuggerUND call doesn't
+    // terminate the basic block cleanly.
+    // (`classify-symbols.py:DATA_RANGES[2]`)
+    (0x0039_433c, 0x0039_435c),
+    // PublicFiller (0x003948e4) + bpWeight (0x003948f0) + ~90 KiB
+    // back-propagation weight table + newtConnects data table at
+    // 0x003aace4. Code resumes at TCountXrAsm (0x003ad244).
+    // (`classify-symbols.py:DATA_RANGES[1]`)
+    (0x0039_48e4, 0x003a_d244),
+    // NSRuntime / package metadata: the bytes between the last
+    // ROM-driver class info trampoline run (~0x007a4xxx) and the
+    // first ClassInfo SRO struct at 0x007a4a30. The walker can
+    // get here via misdecoded `bne 0x7a0dbc` / `bne 0x7a11fc`
+    // type branches in the bp-weight data above. Bounded so the
+    // legitimate ROM-driver class-info trampolines at 0x007a5xxx+
+    // are still discovered.
+    (0x007a_0dbc, 0x007a_1200),
+];
+
+fn in_data_stop_range(addr: u32) -> bool {
+    DATA_STOP_RANGES.iter().any(|&(lo, hi)| addr >= lo && addr < hi)
+}
 
 /// True iff `w` looks like the first instruction of a function entry —
 /// any AL-cond word (top nibble 0xE) decoding as a known ARM
@@ -612,7 +682,11 @@ impl std::fmt::Debug for WalkReason {
 /// originating PC so the trace points at the exact source line.
 #[derive(Clone, Copy)]
 enum SeedSource {
-    Symbol,
+    /// Symbol-table seed. Carries the symbol name (`&'static str`,
+    /// leaked at parse time from the symbols.txt line) so the trace
+    /// is greppable: e.g. `Seed(Symbol "PublicFiller_1")` vs the
+    /// previous useless `Seed(Symbol)`.
+    Symbol(&'static str),
     Vector,
     Manual,
     RexHeader,
@@ -637,12 +711,21 @@ enum SeedSource {
     /// PC-relative jump-table dispatch at `dispatch_pc`.
     JtTableEntry { dispatch_pc: u32 },
     JtTableTarget { dispatch_pc: u32 },
+    /// `mov r0, pc; mov pc, lr` micro-trampoline immediately after a
+    /// terminal `add pc, ip, #N` (or similar PC-write through ip / lr).
+    /// Used by Newton class-info dispatch to expose a "get class name
+    /// string pointer" alt entry: caller BLs the alt-entry, the
+    /// `mov r0, pc` returns address+8 = first byte of the trailing
+    /// ASCII class-name string. Static analysis can't see the BL when
+    /// it's installed via vtable; this collector seeds the alt entry
+    /// directly so the two instructions are still byteswapped at load.
+    AltEntryAfterIpJump { trampoline_pc: u32 },
 }
 
 impl std::fmt::Debug for SeedSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SeedSource::Symbol => write!(f, "Symbol"),
+            SeedSource::Symbol(name) => write!(f, "Symbol {name:?}"),
             SeedSource::Vector => write!(f, "Vector"),
             SeedSource::Manual => write!(f, "Manual"),
             SeedSource::RexHeader => write!(f, "RexHeader"),
@@ -657,6 +740,7 @@ impl std::fmt::Debug for SeedSource {
             SeedSource::IndexedDispatch { dispatch_pc } => write!(f, "IndexedDispatch @ 0x{dispatch_pc:08x}"),
             SeedSource::JtTableEntry { dispatch_pc } => write!(f, "JtTableEntry @ dispatch 0x{dispatch_pc:08x}"),
             SeedSource::JtTableTarget { dispatch_pc } => write!(f, "JtTableTarget @ dispatch 0x{dispatch_pc:08x}"),
+            SeedSource::AltEntryAfterIpJump { trampoline_pc } => write!(f, "AltEntryAfterIpJump @ tramp 0x{trampoline_pc:08x}"),
         }
     }
 }
@@ -1134,6 +1218,7 @@ struct WalkStats {
     b_run_roots: usize,
     pc_rel_addr_roots: usize,
     classinfo_roots: usize,
+    alt_entry_roots: usize,
     indexed_dispatch_roots: usize,
     /// Words cleared from reach because they are the targets of
     /// `LDR Rt, [pc, #±imm12]` from inside reached code — i.e. literal
@@ -1146,6 +1231,9 @@ struct WalkStats {
     /// guest never executes that path under our boot, so treating them
     /// as data is safe.
     literal_targets_cleared: u64,
+    /// Count of distinct walks that crossed into ROM_SOUP_RANGE. Each
+    /// is logged to stderr with its full trace stack at entry time.
+    rom_soup_entries: u64,
 }
 
 /// Walk from roots, closing over indirect-targets by scanning unreached
@@ -1154,7 +1242,7 @@ struct WalkStats {
 /// `is_byte_access` to produce the final byte-access-static bitmap.
 fn walk(
     words: &[u32],
-    initial_roots: &[u32],
+    initial_roots: &[(u32, SeedSource)],
     initial_reach: Bitmap,
     fn_ranges: &[(u32, u32)],
 ) -> (Bitmap, WalkStats) {
@@ -1168,7 +1256,7 @@ fn walk(
     // implicit between adjacent stack frames.
     let mut worklist: Vec<(u32, Vec<WalkReason>)> = initial_roots
         .iter()
-        .map(|&a| (a, vec![WalkReason::Seed(SeedSource::Symbol)]))
+        .map(|&(a, src)| (a, vec![WalkReason::Seed(src)]))
         .collect();
     stats.initial_roots = worklist.len();
 
@@ -1192,9 +1280,18 @@ fn walk(
             // the LR setup happened several insns earlier. Cleared
             // when a non-PC, non-call instruction overwrites LR.
             let mut lr_target: Option<u32> = None;
+            // Log only the first ROM-soup entry per popped walk: once
+            // we've crossed in, every subsequent step that stays inside
+            // shares the same root cause — logging each word would
+            // bury the signal.
+            let mut soup_logged = false;
             loop {
                 if (cur as usize) >= ROM_SIZE_BYTES || cur & 3 != 0 { break; }
                 if reach.get_word(cur) { break; }
+                if in_data_stop_range(cur) {
+                    stats.data_range_stops += 1;
+                    break;
+                }
                 let w = words[(cur >> 2) as usize];
                 if (w >> 28) == 0xF {
                     stats.nv_cond_skips += 1;
@@ -1202,6 +1299,16 @@ fn walk(
                 }
                 if WALK_TRACE_ADDRS.contains(&cur) {
                     eprintln!("WALK_TRACE 0x{cur:08x} (pc popped 0x{pc:08x}, pass {pass}):");
+                    for (i, r) in trace.iter().enumerate() {
+                        eprintln!("  [{i}] {r:?}");
+                    }
+                }
+                if !soup_logged && in_rom_soup(cur) {
+                    soup_logged = true;
+                    stats.rom_soup_entries += 1;
+                    eprintln!(
+                        "ROM-SOUP CLASSIFY FAIL 0x{cur:08x} insn=0x{w:08x} (pop pc 0x{pc:08x}, pass {pass}):",
+                    );
                     for (i, r) in trace.iter().enumerate() {
                         eprintln!("  [{i}] {r:?}");
                     }
@@ -1328,6 +1435,9 @@ fn walk(
             words, &reach, fn_ranges, &mut worklist, &mut stats,
         );
         new_roots += collect_classinfo_roots(
+            words, &reach, &mut worklist, &mut stats,
+        );
+        new_roots += collect_alt_entry_roots(
             words, &reach, &mut worklist, &mut stats,
         );
         new_roots += collect_indexed_dispatch_roots(
@@ -1890,6 +2000,76 @@ fn collect_classinfo_roots(
     added
 }
 
+/// Discover micro-trampoline alt entries that follow Newton's
+/// class-info `add pc, ip, #N` dispatch: the two-instruction sequence
+///
+///   mov r0, pc   (0xE1A0_000F)
+///   mov pc, lr   (0xE1A0_F00E)
+///
+/// At runtime the caller BLs straight into `mov r0, pc`; r0 then
+/// holds `cur + 8` = the address of the immediately-following ASCII
+/// class-name string. Whether the alt entry is reachable by static
+/// analysis depends on whether the surrounding class is referenced
+/// at all in the boot path — the canonical pattern at 0x386208 IS
+/// reached via `bl 0x386208`, but the analogous pair at 0x3861e4
+/// (after the `add pc, ip, #4` epilogue of TClassInfoRegistryImpl::
+/// ClassInfo's dispatch helper) has no static caller and was being
+/// classified data.
+///
+/// Detection gate (avoid false positives): the preceding word must
+/// be a PC-writing terminal ALU op via `ip` (`add/sub pc, ip, #imm`
+/// in any form: bits[27:25]=001, bits[19:16]=1100 (Rn=ip), Rd=15) —
+/// this is the trampoline-jump pattern that the walker can't follow
+/// (since `ip` is set externally), and also the pattern that
+/// invariably precedes these alt entries in the 717006 ROM. Without
+/// this gate, the bare `e1a0_000f e1a0_f00e` pair appears in random
+/// data too often to seed safely.
+fn collect_alt_entry_roots(
+    words: &[u32],
+    reach: &Bitmap,
+    worklist: &mut Vec<(u32, Vec<WalkReason>)>,
+    stats: &mut WalkStats,
+) -> usize {
+    const MOV_R0_PC: u32 = 0xE1A0_000F;
+    const MOV_PC_LR: u32 = 0xE1A0_F00E;
+    let mut added = 0usize;
+    let mut seen: HashSet<u32> = HashSet::new();
+    let last = ROM_WORD_COUNT.saturating_sub(2);
+
+    // Index 0 is the prev-word slot; start at 1 so prev exists.
+    for i in 1..last {
+        if words[i] != MOV_R0_PC { continue; }
+        if words[i + 1] != MOV_PC_LR { continue; }
+        let prev = words[i - 1];
+        // `add/sub pc, Rn=ip, #imm12` (DP-immediate writing PC):
+        //   bits[31:28] = 1110 (cond=AL)
+        //   bits[27:25] = 001  (DP-immediate)
+        //   bits[24:21] = opcode (any: ADD/SUB/RSB/...; we accept
+        //                 ADD=4 and SUB=2, which cover the observed
+        //                 trampoline forms)
+        //   bits[19:16] = 1100 (Rn = ip)
+        //   bits[15:12] = 1111 (Rd = pc)
+        let cond = (prev >> 28) & 0xF;
+        let kind = (prev >> 25) & 0b111;
+        let rn = (prev >> 16) & 0xF;
+        let rd = (prev >> 12) & 0xF;
+        let opcode = (prev >> 21) & 0xF;
+        let prev_is_ip_jump =
+            cond == 0xE && kind == 0b001 && rn == 0xC && rd == 0xF
+                && (opcode == 0x4 || opcode == 0x2);
+        if !prev_is_ip_jump { continue; }
+
+        let alt_pa = (i as u32) * 4;
+        if reach.get_word(alt_pa) { continue; }
+        if !seen.insert(alt_pa) { continue; }
+        worklist.push((alt_pa, vec![WalkReason::Seed(SeedSource::AltEntryAfterIpJump { trampoline_pc: alt_pa })]));
+        added += 1;
+    }
+
+    stats.alt_entry_roots += added;
+    added
+}
+
 /// Recognize the bounded indexed-dispatch idiom Newton uses for
 /// kernel SWI handlers (and similar opcode tables):
 ///
@@ -2165,13 +2345,19 @@ fn run(args: Args) -> Result<(), String> {
     let (words, hash) = load_rom_and_rex(&args.rom, &args.rex)?;
     let hash_str = format!("{:08x}", hash);
 
-    let (mut symbols, sym_filter_stats) = load_symbol_roots(&args.symbols, &words)?;
+    let (sym_roots, sym_filter_stats) = load_symbol_roots(&args.symbols, &words)?;
+    let mut symbols: Vec<(u32, SeedSource)> = sym_roots
+        .into_iter()
+        .map(|(pa, name)| (pa, SeedSource::Symbol(name)))
+        .collect();
     let vectors: [u32; 8] = [0x00, 0x04, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C];
-    for v in vectors { symbols.push(v); }
+    for v in vectors { symbols.push((v, SeedSource::Vector)); }
 
     // Manual exceptions for code unreachable by any static pass. See
     // `MANUAL_CODE_ROOTS` for the rationale per entry.
-    symbols.extend_from_slice(MANUAL_CODE_ROOTS);
+    for &p in MANUAL_CODE_ROOTS {
+        symbols.push((p, SeedSource::Manual));
+    }
 
     // C$$ctorvec / C$$dtorvec ranges: each `<prefix>vec$$Base` /
     // `<prefix>vec$$Limit` pair delimits an array of function pointers.
@@ -2191,10 +2377,18 @@ fn run(args: Args) -> Result<(), String> {
     // all, since the demangled-symbol file is ROM-only.
     let rex_roots = rex_header_roots(&words);
     let mut rex_header_root_count = rex_roots.len();
-    symbols.extend(rex_roots);
+    for p in rex_roots {
+        symbols.push((p, SeedSource::RexHeader));
+    }
 
-    symbols.sort_unstable();
-    symbols.dedup();
+    // Dedup by PA, keeping the first SeedSource we saw (Symbol seeds
+    // come first so a Symbol-tagged root won't lose its name to a
+    // later vector/manual/REx duplicate).
+    symbols.sort_by_key(|&(pa, _)| pa);
+    {
+        let mut seen: HashSet<u32> = HashSet::new();
+        symbols.retain(|&(pa, _)| seen.insert(pa));
+    }
 
     // Function ranges from the filtered symbol list: half-open spans
     // (sym_n, sym_{n+1}) for use by collect_pc_relative_addr_roots
@@ -2202,7 +2396,7 @@ fn run(args: Args) -> Result<(), String> {
     // to the ROM aperture end. Reuses the same filter as the seed
     // list — entries that aren't real function entries shouldn't
     // anchor a "function range".
-    let mut fn_addrs = symbols.clone();
+    let mut fn_addrs: Vec<u32> = symbols.iter().map(|&(pa, _)| pa).collect();
     fn_addrs.sort_unstable();
     fn_addrs.dedup();
     let mut fn_ranges: Vec<(u32, u32)> = fn_addrs
@@ -2387,6 +2581,7 @@ fn run(args: Args) -> Result<(), String> {
     writeln!(f, "    k[A-Z]* dropped:         {}", sym_filter_stats.k_prefix_dropped).ok();
     writeln!(f, "    NV-cond first-word:      {}", sym_filter_stats.nv_cond_dropped).ok();
     writeln!(f, "    not-prologue first-word: {}", sym_filter_stats.not_prologue_dropped).ok();
+    writeln!(f, "    data-stop-range:         {}", sym_filter_stats.data_stop_dropped).ok();
     writeln!(f, "    JT-VA resolved → thunk:  {}", sym_filter_stats.jt_va_resolved).ok();
     writeln!(f, "    accepted:                {}", sym_filter_stats.accepted).ok();
     writeln!(f, "  vector tables (ctorvec / dtorvec):").ok();
@@ -2414,9 +2609,11 @@ fn run(args: Args) -> Result<(), String> {
     writeln!(f, "    B-run dispatch roots added: {}", stats.b_run_roots).ok();
     writeln!(f, "    PC-rel addr roots added:    {}", stats.pc_rel_addr_roots).ok();
     writeln!(f, "    TClassInfo struct roots:    {}", stats.classinfo_roots).ok();
+    writeln!(f, "    alt-entry-after-ip-jump:    {}", stats.alt_entry_roots).ok();
     writeln!(f, "    indexed-dispatch roots:     {}", stats.indexed_dispatch_roots).ok();
     writeln!(f, "    total indirect roots added: {}", stats.indirect_roots_added).ok();
     writeln!(f, "    literal-pool words cleared: {}", stats.literal_targets_cleared).ok();
+    writeln!(f, "    rom-soup walk-entries:     {}", stats.rom_soup_entries).ok();
     writeln!(f, "    reachable-code popcount: {}", reach.popcount()).ok();
     writeln!(f, "  byte-access-static.bitmap popcount = {}", ba_static.popcount()).ok();
     writeln!(f, "    of which byte (LDRB/STRB):              {}", kind_counts[0]).ok();

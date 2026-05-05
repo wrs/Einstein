@@ -18,146 +18,108 @@ Bloated PLAN.md wastes context every read.
   functionality (not merely diagnostics):
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-100):** iter-99 landed the fault-handler LDR
-byteswap stubs (B-to-stub pattern, `r12` scratch, no REV — ARMv4),
-but the boot still wedges at the same `unrecognised UND: insn=
-0xe3a02a13 at PC=0x7a56e4` — meaning the kernel's UND handler is
-NOT being reached, so the iter-99 stubs are inert. Diagnosis: this
-PC is a real CPU-fetch UND on the un-byteswapped encoding, not a
-kernel-decoded UND.
-
-Look at 0x007a56cc..0x007a56f0 in `rom.dis`:
+**Current goal (iter-104):** iter-103 landed the VA-space classifier
+rework — the walker now carries `cur` as a VA throughout, with a
+single `va_to_pa` translation step, so JT-thunk page chains decode
+their B-AL words against the runtime VA the kernel actually
+branches through. Boot now advances dramatically past the iter-100
+PC=0x7a56e4 wedge: through `InitGlobalWorld`, `OsBoot`, and into
+USR-mode task code, before stalling on a kernel-internal abort
+cascade kicked off by an unrecognised SWI:
 
 ```
-7a56cc: e1a0c00d   mov ip, sp
-7a56d0: e92dd800   push {fp, ip, lr, pc}
-7a56d4: e24cb004   sub fp, ip, #4
-...
-7a56e4: e3a02a13   mov r2, #0x13000   ; gROMPublicJumpTable
-...
-7a56f0: e91ba800   ldmdb fp, {fp, sp, pc}
+und: DebuggerUND @PC=0x3add50 msg="Undefined SWI " (resume at PC=0x3add64)
+dabt: forwarding to kernel DataAbortHandler — DFSC=0x5 FAR=0x9ebdd54a mode=0x17
+  LR_abt=0x003add74 (faulting PC=0x003add6c)
+  saved-slot SPSR_abt=0x20000393 (pre-abt mode=0x13 = SVC)  *** MRS DIVERGES ***
+und: DebuggerUND @PC=0x393898 msg="Non-user-mode abort (deep toast alert)"
+unaligned: cannot write aligned 0x00000000 (EA=0x00000003) at PC=0x3940b4
 ```
 
-A clean APCS-prologue function. But the classifier marks 0x7a56cc..
-0x7a56f0 as data — no symbol, no static B/BL anywhere in the ROM
-disasm targets it. It's reached only via runtime function-pointer
-dispatch (likely from a ROM-driver class info struct).
+`0x003ad750` is the SWI dispatch trampoline; `0x003add50` is the
+"Undefined SWI" debug stub the dispatch falls into when the
+opcode-indexed handler table maps to it. The garbage FAR
+`0x9ebdd54a` and the cascade through "deep toast alert" + the
+unaligned write of zero to EA=3 all look like a corrupt register /
+stack frame propagated out of an earlier mishandled trap.
 
-Without classification as code, the bytes are NOT byteswapped at
-load. CPU LE-fetch reads the original BE bytes interpreted as LE:
-`mov r2, #0x13000` (BE 0xe3a02a13) becomes 0x132aa0e3 — `MOVWNE
-r2, #0xa0e3` in ARMv7+ or undefined in ARMv4. The CPU UNDs.
+Investigation order for iter-104:
 
-Fix candidates:
+1. **Identify the offending SWI.** Add a probe (HVC injected via
+   `rom_patches.rs`) on the SWI dispatch around `0x003ad750` that
+   logs the SWI number and faulting LR before falling into the
+   "Undefined SWI" stub. The SWI number tells us whether this is
+   a kernel SWI we haven't installed (which means we missed a
+   table-population step earlier in boot) or a user-side SWI we
+   should be emulating.
+2. **Validate the MRS-divergence path.** The DAH-mrs-patch log
+   already flags the saved-slot vs current SPSR mismatch — this
+   is the recurring Phase-B pattern where banked-register
+   handling at the AArch32↔AArch64 boundary doesn't restore the
+   right context. Cross-check against `docs/QEMU_BUGS.md` before
+   suspecting hypervisor code (banked SPSR_abt is in
+   `ctx.x[20]`, etc., per ARM ARM Table D1-79).
+3. **Trace the garbage FAR back to its source.** A register-state
+   dump at `und: DebuggerUND @PC=0x3add50` (before the cascade
+   starts) gives the SWI handler's input registers — likely r1
+   carries the SPSR-shaped value 0x20000393 that surfaced in the
+   later abort log, which would point at a kernel-side bug
+   accessing a stack slot with the wrong offset / wrong mode.
 
-1. **MANUAL_CODE_ROOTS in classify-rom** — add 0x007a56cc and any
-   peer functions found by inspection in the 0x7a5xxx ROM-driver
-   region. Smallest change; depends on hand-finding each missing
-   entry.
-2. **Discover the runtime caller** — instrument the kernel's
-   dispatch path (likely a ClassInfo method invocation) to log the
-   target address; trace back to the static structure that stores
-   the function pointer; teach the classinfo collector to follow
-   that field.
-3. **REx-aware function discovery pass** — walk the REx package
-   data structures for any field whose word value points at
-   prologue-shaped code, seed each as a root. Catches all ROM-
-   driver entry points at once.
+Iter-103 retired the iter-100 APCS-prologue-scan workaround. The
+iter-99 fault-handler LDR byteswap stubs are still present in
+`rom_patches.rs`; they remain harmless and may yet be exercised by
+a fault path further on — don't revert.
 
-Order: try (1) for the immediate unblock, then (3) as the durable
-fix once the kernel-side dispatch is understood.
+### Iteration 103: VA-space classifier walker
 
-Iter-99 stubs are still in place and still correct — they will
-matter as soon as boot reaches a real fault-handler-decoded UND
-(e.g., FP-emulation entry, byte-access shadow_stub UDF). Don't
-revert.
+Goal: rebuild the classify-rom walker to operate on virtual
+addresses end-to-end so aliased thunk pages (patch-table,
+public-jt, secondary-jt) decode their B-AL targets against the
+runtime VA the kernel will actually branch to. Previously the
+walker pre-resolved JT VAs to their backing PAs, then decoded the
+thunk's B against the PA — wrong destination on every aliased page
+where many VAs share one PA.
 
-Remaining classifier diagnostic noise: 35 ROM-soup walk entries,
-all legitimate ROM-driver TClassInfo trampolines at 0x7a5xxx
-(TMainDisplayDriver, TScreenDriver, "four"-named driver) plus a
-handful of B-AL run dispatch tables. The user-defined ROM-soup
-range (0x3afda8..0x800000) intentionally over-reaches; the logging
-is left enabled as a tripwire.
-
-### Iteration 99: fault-handler LDR byteswap stubs
-
-Goal: clear the suspected PC=0x7a56e4 stall by making the kernel's
-instruction-as-data `LDR`s in the fault handlers return the
-encoding the kernel was compiled to recognise, despite our load-
-time byteswap of code-marked words.
-
-Patches (B-to-stub pattern, `r12` as scratch, no REV — ARMv4):
-
-| PC          | Insn                  | Stub action |
-|-------------|-----------------------|-------------|
-| `0x003931e4`| `ldr r0, [lr]`        | DABT decode: load + byteswap r0 + B 0x003931e8 |
-| `0x0038ce9c`| `ldr r1, [lr, #-4]`   | UND marker: load + byteswap r1 + B 0x0038cea0 |
-
-Each stub is 6 words allocated in the patch-stub arena
-(`alloc_patch_stub`):
-
-```text
-LDR Rt, [lr...]              ; load (byteswapped numerical)
-EOR r12, Rt, Rt, ROR #16     ; classic ARMv4 byteswap
-BIC r12, r12, #0xFF0000      ;
-MOV Rt, Rt, ROR #8           ;
-EOR Rt, Rt, r12, LSR #8      ;
-B   resume_pc                ;
-```
-
-`r12` (`ip`) verified unused across both replaced LDRs (read the
-disasm in trap.rs::handle_und context); APCS caller-saved.
-
-Result: 36/36 guest tests pass. Boot still wedges at the same
-PC=0x7a56e4 — the stubs are inert because the wedge fires before
-any kernel fault handler runs. Diagnosis (queued for iter-100):
-classifier miss at 0x7a56cc.
-
-### Iteration 98: classifier refinement — data-stop ranges, alt-entry, ROM-soup log
-
-Goal: drive the classifier's false-positive rate down by patching
-three observed misclassifications (3861e4–e8 missing as code,
-3948e8–39965c spurious as code, 7a0dbc–7a11fc spurious as code)
-and add diagnostic logging for any walk that crosses into the
-post-code ROM data region.
-
-Major changes:
-- `DATA_STOP_RANGES` — half-open `[start, end)` ranges the walker
-  refuses to enter and `load_symbol_roots` refuses to seed.
-  Mirrors `classify-symbols.py`'s `DATA_RANGES`. Stops the cascade
-  where data symbols (e.g. `PublicFiller` at 0x003948e4 with first
-  word `0xE6000410`) seed the walker, who then walks linearly
-  through bp-weight data and pushes misdecoded `bne` targets into
-  NSRuntime / package data at 0x7a0dbc, 0x7ed138, 0x7ed2ec.
-- `collect_alt_entry_roots` — new indirect-pass collector for the
-  `mov r0, pc; mov pc, lr` micro-trampoline that follows
-  `add/sub pc, ip, #N` in Newton's class-info dispatch. The pair
-  is a "get class-name string pointer" alt entry; without this
-  collector the alt entry at 0x3861e4 (TClassInfoRegistryImpl::
-  ClassInfo dispatch helper) was unmarked because no static caller
-  exists.
-- `ROM_SOUP_RANGE = 0x3afda8..0x800000` walk-entry log: per popped
-  walk, the first word inside the range produces a stderr line
-  with the full origin trace stack. Diagnostic only — does not
-  drop bits.
-- `SeedSource::Symbol` now carries the symbol name as
-  `&'static str` (leaked at parse time). `Seed(Symbol "PublicFiller_1")`
-  vs the prior useless `Seed(Symbol)`.
+Major changes (`tools/classify-rom/src/main.rs`):
+- New `va_to_pa(words, va) -> Option<u32>`: identity for main ROM
+  / REx, L2 walk for patch-table / gROMPublicJumpTable /
+  secondary-JT, silent `None` otherwise. Used by indirect-pass
+  collectors that scan literal-pool words heuristically.
+- New `va_to_pa_loud`: same translation, eprintln-once-per-unique
+  on miss. The walker's hot path uses this so any unmapped VA the
+  walker reaches surfaces immediately as a missing JT window or a
+  misdecoded data branch.
+- Walker inner loop: `cur` is a VA throughout; `cur_pa =
+  va_to_pa_loud(cur)` for bitmap and `words` access only;
+  `Step::Continue / Step::Jump` targets stay as VAs.
+- `load_symbol_roots` keeps the symbol's VA (was: resolved to
+  thunk PA). The walker pops the JT VA itself; `va_to_pa`
+  translates; the walker reads the thunk's B word and `Step::Jump`
+  dispatches to the next VA along the chain.
+- Drop `resolve_target_to_rom`, `resolve_jt_chain`,
+  `PURE_THUNK_PAGES` pre-marking, the post-walk chain-thunk-mark
+  pass, and `collect_apcs_prologue_scan_roots` (an iter-100
+  workaround for functions the broken walker missed — the rebuilt
+  walker reaches them naturally).
+- Indirect-pass collectors (vtable, fnptr-literal,
+  indexed-dispatch, classinfo, vector-table, FDRV) now seed VAs
+  via the silent `va_to_pa` + first-word shape gate.
 
 Result:
-- `byte-access-static` 28291 → 27769 (-522 false positives).
-- 1879 symbol roots dropped via data-stop-range; 2 alt-entry
-  roots added.
-- Boot reaches PC=0x7a56e4 (TMain… driver init); 35 remaining
-  ROM-soup walk-entries, all legitimate ROM-driver class info.
-- Invariant (oracle ⊆ static) still holds.
+- 36/36 guest tests pass.
+- `byte-access-static` popcount 27786 → 27790 (essentially
+  unchanged — the gain is correctness, not coverage).
+- Invariant `oracle ⊆ static` still holds (oracle 2155, static
+  27790, 0 missing).
+- 70 ROM-soup walk-entries (was 35) — all legitimate ROM-driver
+  TClassInfo trampolines at 0x7a5xxx; the user-defined ROM-soup
+  range is intentionally over-reaching.
+- Boot advances from PC=0x7a56e4 to the iter-104 wedge described
+  above.
 
-<!-- Older iteration retrospectives (iter-97 and earlier) live in
-     `git log` per the auto-prune maintenance note. -->
-<!-- iter-90 deferred shadow_stub deletion: still gated off
-     (`patch_rom_from_bitmap` no longer called from `main.rs`); full
-     removal + SBA dispatch arms + `unxor_sub_word` guest-test path
-     is a follow-up commit. -->
+<!-- Older iteration retrospectives (iter-98 through iter-102) live
+     in `git log` per the auto-prune maintenance note. -->
 
 
 

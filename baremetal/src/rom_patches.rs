@@ -163,6 +163,23 @@ const PATCHES_717006: &[RomPatch] = &[
     RomPatch { offset: 0x003A_D430, value: 0x3281_1001, name: "GetClock wrap-detect ls→cc" },
     RomPatch { offset: 0x003A_D46C, value: 0x3282_2001, name: "SetAlarm wrap-detect (1/2) ls→cc" },
     RomPatch { offset: 0x003A_D49C, value: 0x3282_2001, name: "SetAlarm wrap-detect (2/2) ls→cc" },
+    // SWIBoot mode-check at 0x003ad6c4: original `cmpne r1, #0` accepts
+    // USR (mode 16) or "mode 0" (uninitialised SPSR). Patch to also
+    // accept SVC (mode 19) by changing the cmpne's immediate from 0 to
+    // 19. Required because Newton's BootOS-time package init at
+    // 0x007a56cc — discovered as code by iter-100's APCS-prologue scan
+    // — calls GetContiguousMemory → Init__6TUPhys → MakeObject →
+    // svc 0x1b BEFORE BootOS reaches the `msr CPSR_fc, #16` USR-mode
+    // switch at 0x000188e4. Without this patch the kernel detects
+    // "SWI from non-USR mode" at 0x003ad660 and reboots.
+    RomPatch { offset: 0x003A_D6C4, value: 0x1351_0013, name: "SWIBoot mode-check: also accept SVC (cmpne r1, #19)" },
+    // SWIBoot's second instruction-as-data LDR at 0x003ad738:
+    // `ldr r1, [r1, #-4]` re-reads the SWI word (with `r1 = lr`) to
+    // extract the imm24 dispatched. Same BE-8 byteswap problem as the
+    // first LDR at 0x003ad69c — but `r0` already holds the byteswap-
+    // corrected value from our iter-101 byteswap stub. Patch the LDR
+    // to `mov r1, r0` so the dispatch uses the correct opcode.
+    RomPatch { offset: 0x003A_D738, value: 0xE1A0_1000, name: "SWIBoot dispatch LDR: mov r1, r0 (use byteswap-stub result)" },
     // Force every VM heap to allocate / extend in 4-KiB chunks
     // instead of 1-KiB subpages. The kernel's design partitions
     // shared 4-KiB physical pages into 1-KiB subpages with per-

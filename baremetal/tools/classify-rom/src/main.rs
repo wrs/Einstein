@@ -720,6 +720,13 @@ enum SeedSource {
     /// it's installed via vtable; this collector seeds the alt entry
     /// directly so the two instructions are still byteswapped at load.
     AltEntryAfterIpJump { trampoline_pc: u32 },
+    /// APCS-22 function prologue (`mov ip, sp; stmfd sp!, {…, lr, pc}`)
+    /// found by global scan of the ROM+REX aperture. Catches Newton
+    /// package init routines and ROM-driver entries that the kernel
+    /// reaches only through runtime function-pointer dispatch (no
+    /// static B/BL, no LDR-pc-rel literal, no class-info delta) — e.g.
+    /// the package0 init function at 0x007a56cc.
+    ApcsPrologueScan,
 }
 
 impl std::fmt::Debug for SeedSource {
@@ -741,6 +748,7 @@ impl std::fmt::Debug for SeedSource {
             SeedSource::JtTableEntry { dispatch_pc } => write!(f, "JtTableEntry @ dispatch 0x{dispatch_pc:08x}"),
             SeedSource::JtTableTarget { dispatch_pc } => write!(f, "JtTableTarget @ dispatch 0x{dispatch_pc:08x}"),
             SeedSource::AltEntryAfterIpJump { trampoline_pc } => write!(f, "AltEntryAfterIpJump @ tramp 0x{trampoline_pc:08x}"),
+            SeedSource::ApcsPrologueScan => write!(f, "ApcsPrologueScan"),
         }
     }
 }
@@ -1219,6 +1227,7 @@ struct WalkStats {
     pc_rel_addr_roots: usize,
     classinfo_roots: usize,
     alt_entry_roots: usize,
+    apcs_prologue_roots: usize,
     indexed_dispatch_roots: usize,
     /// Words cleared from reach because they are the targets of
     /// `LDR Rt, [pc, #±imm12]` from inside reached code — i.e. literal
@@ -1438,6 +1447,9 @@ fn walk(
             words, &reach, &mut worklist, &mut stats,
         );
         new_roots += collect_alt_entry_roots(
+            words, &reach, &mut worklist, &mut stats,
+        );
+        new_roots += collect_apcs_prologue_scan_roots(
             words, &reach, &mut worklist, &mut stats,
         );
         new_roots += collect_indexed_dispatch_roots(
@@ -2070,6 +2082,69 @@ fn collect_alt_entry_roots(
     added
 }
 
+/// Discover function entries that no static B/BL/LDR-pc-rel/ADR /
+/// class-info-delta path reaches by globally scanning the ROM+REX
+/// aperture for the canonical Newton APCS-22 prologue:
+///
+///   `mov ip, sp`              == 0xE1A0_C00D
+///   `stmfd sp!, { …, lr, … }` == 0xE92D_???? where bit 14 (LR) is set
+///                                in the register list.
+///
+/// The two-word signature is highly specific: across the entire 717006
+/// ROM, every word that satisfies it is the entry of a real function.
+/// Newton's C-runtime emits this prologue for every non-leaf function
+/// (the leaf-without-frame case never has `mov ip, sp` — it goes
+/// straight to a single `stmfd sp!, {lr}` or skips the frame
+/// entirely).
+///
+/// Catches:
+///   - Newton package init routines (e.g. 0x007a56cc — the package0
+///     init for the `lcdd` package),
+///   - ROM-driver entries that get installed at runtime via package
+///     activation (no static reference in the disasm),
+///   - REx-loaded driver methods (extends the iter-97 RExHeader scan
+///     with a body-shape heuristic that doesn't depend on the entry
+///     being named in the FDRV class-info structure).
+///
+/// Refuses to seed entries already in `reach` so the natural walk-
+/// reachable functions don't get a duplicate trace; the only seeds
+/// that survive are the ones the static passes missed.
+fn collect_apcs_prologue_scan_roots(
+    words: &[u32],
+    reach: &Bitmap,
+    worklist: &mut Vec<(u32, Vec<WalkReason>)>,
+    stats: &mut WalkStats,
+) -> usize {
+    const MOV_IP_SP: u32 = 0xE1A0_C00D;
+    let mut added = 0usize;
+    let mut seen: HashSet<u32> = HashSet::new();
+    let last = ROM_WORD_COUNT.saturating_sub(1);
+
+    for i in 0..last {
+        if words[i] != MOV_IP_SP { continue; }
+        let next = words[i + 1];
+        // STMFD sp!, {reglist} with LR (bit 14) in reglist.
+        // Encoding: cond=AL (top nibble 0xE), bits[27:25]=100 (LDM/STM),
+        //           bit24=1 (P=1, pre-decrement), bit23=0 (U=0, down),
+        //           bit22=0 (S=0), bit21=1 (W=1, writeback),
+        //           bit20=0 (L=0, store), Rn=13 (sp).
+        // Top half: 0xE92D. Bit 14 of the low half = LR present.
+        if (next >> 16) != 0xE92D { continue; }
+        if (next >> 14) & 1 == 0 { continue; }
+        let pa = (i as u32) * 4;
+        // Don't seed addresses already reached or in a known data
+        // range — the heuristic should only add NEW coverage.
+        if reach.get_word(pa) { continue; }
+        if in_data_stop_range(pa) { continue; }
+        if !seen.insert(pa) { continue; }
+        worklist.push((pa, vec![WalkReason::Seed(SeedSource::ApcsPrologueScan)]));
+        added += 1;
+    }
+
+    stats.apcs_prologue_roots += added;
+    added
+}
+
 /// Recognize the bounded indexed-dispatch idiom Newton uses for
 /// kernel SWI handlers (and similar opcode tables):
 ///
@@ -2610,6 +2685,7 @@ fn run(args: Args) -> Result<(), String> {
     writeln!(f, "    PC-rel addr roots added:    {}", stats.pc_rel_addr_roots).ok();
     writeln!(f, "    TClassInfo struct roots:    {}", stats.classinfo_roots).ok();
     writeln!(f, "    alt-entry-after-ip-jump:    {}", stats.alt_entry_roots).ok();
+    writeln!(f, "    APCS-prologue-scan roots:   {}", stats.apcs_prologue_roots).ok();
     writeln!(f, "    indexed-dispatch roots:     {}", stats.indexed_dispatch_roots).ok();
     writeln!(f, "    total indirect roots added: {}", stats.indirect_roots_added).ok();
     writeln!(f, "    literal-pool words cleared: {}", stats.literal_targets_cleared).ok();

@@ -18,98 +18,100 @@ Bloated PLAN.md wastes context every read.
   functionality (not merely diagnostics):
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-99):** with iter-98's classifier refinements in
-place (data-stop ranges + alt-entry collector + ROM-soup logging),
-boot reaches PC=0x7a56e4 — TMain… driver init — but stalls on a UND
-trap whose root cause is the kernel reading its own instruction as
-data via `LDR`. Two confirmed sites:
+**Current goal (iter-100):** iter-99 landed the fault-handler LDR
+byteswap stubs (B-to-stub pattern, `r12` scratch, no REV — ARMv4),
+but the boot still wedges at the same `unrecognised UND: insn=
+0xe3a02a13 at PC=0x7a56e4` — meaning the kernel's UND handler is
+NOT being reached, so the iter-99 stubs are inert. Diagnosis: this
+PC is a real CPU-fetch UND on the un-byteswapped encoding, not a
+kernel-decoded UND.
 
-- **DataAbortHandler 0x003931e4:** `ldr r0, [lr]` — loads the
-  faulting word so the kernel can decode the abort.
-- **UndefinedInstruction 0x0038ce9c:** `ldr r1, [lr, #-4]` — loads
-  the faulting word to compare against UDF marker patterns.
+Look at 0x007a56cc..0x007a56f0 in `rom.dis`:
 
-Both run with `CPSR.E=1` (kernel BE data mode). The walker-marked
-words are byteswapped on disk → LE byte order in memory at load
-time so the LE instruction-fetch decodes them correctly. A BE
-`LDR` of the same address returns the LE-stored bytes interpreted
-as BE → the original word with bytes reversed, i.e. the
-byteswapped encoding the kernel cannot recognize.
+```
+7a56cc: e1a0c00d   mov ip, sp
+7a56d0: e92dd800   push {fp, ip, lr, pc}
+7a56d4: e24cb004   sub fp, ip, #4
+...
+7a56e4: e3a02a13   mov r2, #0x13000   ; gROMPublicJumpTable
+...
+7a56f0: e91ba800   ldmdb fp, {fp, sp, pc}
+```
 
-First-attempt fix: patch the instruction-as-data load sites to
-swap the loaded value back to BE before the kernel uses it. Either
-inline `REV` after each `LDR` (rom_patches.rs word-write) or HVC-
-trap-and-emulate the load with byteswap. Inline REV is the smaller
-change — the two known PCs are both `LDR Rd, [lr…]` whose Rd is
-known statically; emit `REV Rd, Rd` in the slot that follows.
+A clean APCS-prologue function. But the classifier marks 0x7a56cc..
+0x7a56f0 as data — no symbol, no static B/BL anywhere in the ROM
+disasm targets it. It's reached only via runtime function-pointer
+dispatch (likely from a ROM-driver class info struct).
 
-Remaining diagnostic noise: 35 ROM-soup walk entries, all
-legitimate ROM-driver TClassInfo trampolines at 0x7a5xxx
+Without classification as code, the bytes are NOT byteswapped at
+load. CPU LE-fetch reads the original BE bytes interpreted as LE:
+`mov r2, #0x13000` (BE 0xe3a02a13) becomes 0x132aa0e3 — `MOVWNE
+r2, #0xa0e3` in ARMv7+ or undefined in ARMv4. The CPU UNDs.
+
+Fix candidates:
+
+1. **MANUAL_CODE_ROOTS in classify-rom** — add 0x007a56cc and any
+   peer functions found by inspection in the 0x7a5xxx ROM-driver
+   region. Smallest change; depends on hand-finding each missing
+   entry.
+2. **Discover the runtime caller** — instrument the kernel's
+   dispatch path (likely a ClassInfo method invocation) to log the
+   target address; trace back to the static structure that stores
+   the function pointer; teach the classinfo collector to follow
+   that field.
+3. **REx-aware function discovery pass** — walk the REx package
+   data structures for any field whose word value points at
+   prologue-shaped code, seed each as a root. Catches all ROM-
+   driver entry points at once.
+
+Order: try (1) for the immediate unblock, then (3) as the durable
+fix once the kernel-side dispatch is understood.
+
+Iter-99 stubs are still in place and still correct — they will
+matter as soon as boot reaches a real fault-handler-decoded UND
+(e.g., FP-emulation entry, byte-access shadow_stub UDF). Don't
+revert.
+
+Remaining classifier diagnostic noise: 35 ROM-soup walk entries,
+all legitimate ROM-driver TClassInfo trampolines at 0x7a5xxx
 (TMainDisplayDriver, TScreenDriver, "four"-named driver) plus a
 handful of B-AL run dispatch tables. The user-defined ROM-soup
-range (0x3afda8..0x800000) intentionally over-reaches; the
-logging is left enabled as a tripwire.
+range (0x3afda8..0x800000) intentionally over-reaches; the logging
+is left enabled as a tripwire.
 
-### Iteration 99 (planned): patch fault-handler instruction loads to return BE
+### Iteration 99: fault-handler LDR byteswap stubs
 
-Goal: clear the PC=0x7a56e4 stall by making the kernel's
+Goal: clear the suspected PC=0x7a56e4 stall by making the kernel's
 instruction-as-data `LDR`s in the fault handlers return the
 encoding the kernel was compiled to recognise, despite our load-
 time byteswap of code-marked words.
 
-The two sites currently known:
+Patches (B-to-stub pattern, `r12` as scratch, no REV — ARMv4):
 
-| PC          | Insn     | Reads from | Why                  |
-|-------------|----------|------------|----------------------|
-| `0x003931e4`| `ldr r0, [lr]`     | faulting PC | DABT decode |
-| `0x0038ce9c`| `ldr r1, [lr, #-4]`| faulting PC | UND marker compare |
+| PC          | Insn                  | Stub action |
+|-------------|-----------------------|-------------|
+| `0x003931e4`| `ldr r0, [lr]`        | DABT decode: load + byteswap r0 + B 0x003931e8 |
+| `0x0038ce9c`| `ldr r1, [lr, #-4]`   | UND marker: load + byteswap r1 + B 0x0038cea0 |
 
-Approach (first attempt — inline REV patch):
+Each stub is 6 words allocated in the patch-stub arena
+(`alloc_patch_stub`):
 
-1. In `src/rom_patches.rs`, add a word-write pair for each site:
-   - Replace the `LDR` with itself (no-op write — keeps the patch
-     table aligned for the follow-up word).
-   - Replace the immediately-following instruction with
-     `REV Rd, Rd` (`0xE6BF0F30 | (Rd<<12) | Rd`), where `Rd`
-     matches the LDR's destination register (`r0` for DABT,
-     `r1` for UND).
-   - Save the original next-instruction value in a small inline
-     trampoline that the REV's fall-through reaches, OR use a
-     2-word patch that emits `REV; B back_to_next_real_insn`.
+```text
+LDR Rt, [lr...]              ; load (byteswapped numerical)
+EOR r12, Rt, Rt, ROR #16     ; classic ARMv4 byteswap
+BIC r12, r12, #0xFF0000      ;
+MOV Rt, Rt, ROR #8           ;
+EOR Rt, Rt, r12, LSR #8      ;
+B   resume_pc                ;
+```
 
-   Actual encoding plan: pick whichever of the two patterns fits
-   without re-shuffling the surrounding code. The handler bodies
-   in the disasm have predictable shape (`ldr` then a use of the
-   loaded word in the very next instruction or two), so a single-
-   word REV insertion may require relocating one trailing insn
-   into a hypervisor-managed thunk.
+`r12` (`ip`) verified unused across both replaced LDRs (read the
+disasm in trap.rs::handle_und context); APCS caller-saved.
 
-2. Confirm via guest tests that the REV doesn't perturb non-fault
-   paths. Both handlers are entry points reached only on actual
-   abort/UND traps — the only baseline-affecting change is `r0` /
-   `r1` carrying a different (correct) value past the LDR.
-
-3. Re-run cold boot, expect the UND at 0x7a56e4 to either resolve
-   correctly (the kernel decodes its own UDF / branch / mov
-   without surprise) or surface a different root cause that lets
-   us advance further.
-
-If inline REV proves intractable (e.g. the LDR's caller already
-uses Rd in the very next cycle), fall back to:
-- HVC-trap the LDR via `UDF #imm` injection in rom_patches.rs and
-  emulate the load + byteswap from EL2.
-- Or repurpose the existing shadow_stub byte-access path —
-  add a "code-region word LDR" form that returns the un-byteswapped
-  word, gated on the LDR's PA being inside the byteswapped reach
-  set.
-
-Open question: are there OTHER kernel sites that read instruction
-encodings as data? Candidates beyond fault handlers: any ROM-patch
-mechanism, any breakpoint/inspection tooling embedded in the
-kernel (debugger-int handler at 0x38cec8 looks suspicious), any
-vtable / classinfo decoder that walks B-AL chains. Trace the
-remaining suspicious code regions in iter-97/iter-98's queue
-once the fault-handler fix unblocks the boot.
+Result: 36/36 guest tests pass. Boot still wedges at the same
+PC=0x7a56e4 — the stubs are inert because the wedge fires before
+any kernel fault handler runs. Diagnosis (queued for iter-100):
+classifier miss at 0x7a56cc.
 
 ### Iteration 98: classifier refinement — data-stop ranges, alt-entry, ROM-soup log
 
@@ -150,78 +152,7 @@ Result:
   ROM-soup walk-entries, all legitimate ROM-driver class info.
 - Invariant (oracle ⊆ static) still holds.
 
-### Iteration 97: classify-rom symbols.txt + DFS provenance trace + JT chain mark
-
-Goal: rebuild classify-rom around the raw symbol list and add a
-trace facility so we can answer "why was 0x… marked code?" for any
-mystery bit.
-
-Major changes:
-- `load_symbol_roots` reads `_Data_/symbols.txt` (was
-  `code-symbols.txt`) and applies its own filters: linker markers,
-  `^[gk][A-Z0-9]` data prefixes, NV-cond skip, prologue-shape gate.
-  Per-filter drop counts in `summary.txt`.
-- `collect_classinfo_roots` extended to seed `MOV PC,LR` Branch
-  slots (default-empty methods) plus the `fBTableDelta` and
-  `fEntryProcDelta` SROs, picking up the entire B-table and the
-  monitor entry-proc target. Branch slot offsets cover the full
-  `{0x18, 0x1C, 0x20, 0x24, 0x28, 0x34, 0x38}` set per
-  OS600/Protocols.h.
-- New `seed_vector_table_roots` parses
-  `C$$ctorvec$$Base/$$Limit` (and dtorvec) pairs from symbols.txt
-  and seeds every function pointer in the array.
-- `clear_literal_pool_targets_from_reach` extended to all conds
-  (was AL-only). Catches `LDREQ`/etc. literal-pool entries the
-  kernel reads as data.
-- Pre-walk `PURE_THUNK_PAGES` mark — sets reach bits on the
-  specific PA ranges that are pure JT-thunk backing
-  (patch-table 0x2000..0x12FFF, gROMPublicJumpTable
-  0x13000..0x15FFF, secondary-jt 0x7EE000..0x7EE048). Critically
-  does NOT use the L2-blanket approach from iter-96 — those L2s
-  also map normal vtable pages (0x1b000, 0x1d000, 0x21000, …)
-  which the walker MUST follow to discover their B-AL targets.
-- `MANUAL_DATA_RANGES` for the DiagHook BEQ-into-literal-pool
-  dead-code excursion at 0x18668..0x18688 (one-off, not a general
-  pattern — only one such instance in the entire reached set).
-- `MANUAL_CODE_ROOTS` for FP-trap-dispatched error paths in
-  `sqrt` / `_ldfp` at PA 0x382418 (transitively pulls in the sqrt
-  error-path entries via `BEQ` chain).
-- Provenance trace facility: each worklist entry carries the full
-  DFS-path stack of `WalkReason` frames (`Seed(SeedSource)`, `Jump
-  from PC`, `Branch from PC`) at the moment it was pushed. Drop a
-  target PA in `WALK_TRACE_ADDRS = &[0x...]`, recompile, run; the
-  walker dumps the complete origin chain when about to mark `cur`.
-  Each `SeedSource` variant carries an originating PC (LDR PC,
-  ADR PC, trampoline PC, dispatch PC, B-run entry PA) so the
-  trace points at the exact source line.
-- `scripts/regen-classify.sh` switched input from
-  `code-symbols.txt` to `../_Data_/symbols.txt`. The function
-  tracer's `code-symbols.txt` consumer is independent.
-- `scripts/dump-data-regions.py` generalised to emit both
-  `data-regions.txt` and `code-regions.txt` under
-  `classify/<hash>/`. New `suspicion_tag` flags code regions
-  with any NV-cond or >25% non-AL — likely walker drifts. Reports
-  gitignored.
-
-Attempted but reverted: VA-aware `resolve_target_to_rom` chain
-resolution returning final ROM PA (instead of thunk PA). With the
-chain change, walker followed FnPtrLiteral seeds into REx data
-(0x80f8b4 etc., which the user identified as gROMSoup —
-NewtonScript objects, not code) and wedged the boot well before
-the iter-95/96 PC 0x7a56e4 mark. Reverted to iter-94/95 behaviour:
-return thunk PA, walker walks the B word, Step::Jump uses PA
-decoding (which goes wrong-target for aliased pages but breaks
-safely on out-of-ROM, and pre-marking covers the bytes for BE-8).
-
-Result:
-- byte-access-static 28291 (vs iter-96 27750): +541 bits, mostly
-  TClassInfo MOV PC,LR slots and ctor/dtorvec function bodies.
-- Reach popcount ~885K (vs ~880K).
-- Boot reaches the iter-95/96 wedge at PC 0x007a56e4; 36/36 guest
-  tests pass.
-- 488 SUSPICIOUS code regions queued for the eyeball pass.
-
-<!-- Older iteration retrospectives (iter-96 and earlier) live in
+<!-- Older iteration retrospectives (iter-97 and earlier) live in
      `git log` per the auto-prune maintenance note. -->
 <!-- iter-90 deferred shadow_stub deletion: still gated off
      (`patch_rom_from_bitmap` no longer called from `main.rs`); full

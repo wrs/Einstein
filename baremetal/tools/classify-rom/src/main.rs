@@ -220,11 +220,13 @@ fn load_symbol_roots(
             if bytes[0] == b'k' { stats.k_prefix_dropped += 1; continue; }
         }
 
-        // Resolve the symbol's address to an in-ROM PA. Direct PAs pass
-        // through as-is; JT-VA addresses are translated to their thunk
-        // PA. Anything that doesn't resolve is outside the address space
-        // we can mark.
-        let pa = match resolve_target_to_rom(words, addr) {
+        // Verify the VA actually resolves to a host-image PA. Symbols
+        // outside main ROM, REx, or any known JT window get dropped.
+        // For the first-word gates below we read at the PA, but the
+        // seed list itself carries the VA so the walker decodes its
+        // branches against runtime addresses (essential for thunk
+        // pages where many VAs alias the same PA).
+        let pa = match va_to_pa(words, addr) {
             Some(p) => p,
             None => { stats.out_of_rom += 1; continue; }
         };
@@ -256,19 +258,26 @@ fn load_symbol_roots(
         // most data symbols live. Real code with cond != AL on its
         // first instruction (rare predicated tail-calls) is the
         // tradeoff — none observed in the boot path so far.
+        //
+        // Patch-table thunks (VAs 0x01A00000+) have first-word B-AL
+        // by construction; the prologue gate accepts B-AL via top3=
+        // 0b101. So thunk seeds pass naturally.
         if !is_known_function_start(w) { stats.not_prologue_dropped += 1; continue; }
 
-        if seen.insert(pa) {
+        if seen.insert(addr) {
             // Leak the name to get a `&'static str` we can carry in
             // SeedSource::Symbol without having to plumb a name table
             // through every collector. The list is bounded (~36k accepted
             // symbols) so the leak doesn't grow without bound.
             let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
-            out.push((pa, leaked));
+            // Push the VA (not the PA): the walker uses VA arithmetic
+            // for branches; for VAs in main ROM PA == VA so this is
+            // a no-op there.
+            out.push((addr, leaked));
             stats.accepted += 1;
         }
     }
-    out.sort_unstable_by_key(|&(pa, _)| pa);
+    out.sort_unstable_by_key(|&(va, _)| va);
     Ok((out, stats))
 }
 
@@ -348,16 +357,19 @@ fn rex_header_roots(words: &[u32]) -> Vec<u32> {
                     let p = words[w];
                     if p == 0 { continue; }
                     // FDRV class-info method pointers may be direct
-                    // ROM PAs or patch-table VAs.
-                    let final_tgt = match resolve_target_to_rom(words, p) {
-                        Some(t) => t,
+                    // ROM VAs or patch-table VAs. Verify the VA is
+                    // mappable and the first word looks like a known
+                    // function start (B-AL through patch-table thunk
+                    // counts), then seed the VA — walker chains the
+                    // thunk if it's one.
+                    let p_pa = match va_to_pa(words, p) {
+                        Some(pa) => pa,
                         None => continue,
                     };
-                    let tgt_idx = (final_tgt >> 2) as usize;
-                    let tgt = words[tgt_idx];
+                    let tgt = words[(p_pa >> 2) as usize];
                     if (tgt >> 28) == 0xF { continue; }
                     if !is_known_function_start(tgt) { continue; }
-                    out.push(final_tgt);
+                    out.push(p);
                 }
             }
             // 'pkgl' — embedded package list. Package internal layout
@@ -720,13 +732,6 @@ enum SeedSource {
     /// it's installed via vtable; this collector seeds the alt entry
     /// directly so the two instructions are still byteswapped at load.
     AltEntryAfterIpJump { trampoline_pc: u32 },
-    /// APCS-22 function prologue (`mov ip, sp; stmfd sp!, {…, lr, pc}`)
-    /// found by global scan of the ROM+REX aperture. Catches Newton
-    /// package init routines and ROM-driver entries that the kernel
-    /// reaches only through runtime function-pointer dispatch (no
-    /// static B/BL, no LDR-pc-rel literal, no class-info delta) — e.g.
-    /// the package0 init function at 0x007a56cc.
-    ApcsPrologueScan,
 }
 
 impl std::fmt::Debug for SeedSource {
@@ -748,7 +753,6 @@ impl std::fmt::Debug for SeedSource {
             SeedSource::JtTableEntry { dispatch_pc } => write!(f, "JtTableEntry @ dispatch 0x{dispatch_pc:08x}"),
             SeedSource::JtTableTarget { dispatch_pc } => write!(f, "JtTableTarget @ dispatch 0x{dispatch_pc:08x}"),
             SeedSource::AltEntryAfterIpJump { trampoline_pc } => write!(f, "AltEntryAfterIpJump @ tramp 0x{trampoline_pc:08x}"),
-            SeedSource::ApcsPrologueScan => write!(f, "ApcsPrologueScan"),
         }
     }
 }
@@ -874,71 +878,68 @@ fn public_jt_va_to_phys(words: &[u32], va: u32) -> Option<u32> {
 }
 
 
-/// Resolve a branch / function-pointer target to its in-ROM PA.
-/// Returns the thunk PA for patch-table / public-jt / secondary-jt VAs
-/// (so the walker visits the thunk word, marks it for byteswap, and
-/// follows through via `Step::Jump`'s PA-decoded fall-through into
-/// the eventual ROM target). Direct ROM PAs pass through unchanged.
-/// Returns `None` for kernel-VA targets we don't recognise.
-fn resolve_target_to_rom(words: &[u32], target: u32) -> Option<u32> {
-    if target & 3 != 0 { return None; }
-    if (target as usize) < ROM_SIZE_BYTES { return Some(target); }
-    if let Some(thunk_pa) = jt_va_to_phys(target) {
-        // Validate the slot decodes as a B/BL — patch-table slots can
-        // be patched at boot to non-B forms.
-        let w = words[(thunk_pa >> 2) as usize];
-        let cond = (w >> 28) & 0xF;
-        let kind = (w >> 25) & 0b111;
-        if cond == 0xF || kind != 0b101 { return None; }
-        return Some(thunk_pa);
-    }
-    if let Some(pa) = public_jt_va_to_phys(words, target) {
+/// Translate a kernel-side VA to the host-image PA where its byte
+/// storage lives. Silent on miss — for use by indirect-pass
+/// collectors that are heuristically validating "is this word a
+/// plausible function pointer / branch target?", where most input
+/// values aren't VAs and producing a log per non-pointer integer
+/// would drown the signal.
+///
+/// - Word-misaligned VAs return `None`.
+/// - VAs in the 16 MiB ROM+REx aperture (`< ROM_SIZE_BYTES`) are
+///   identity-mapped — every VA in this range is its own PA.
+/// - VAs in the patch-table window (0x01A00000..0x01C20000) translate
+///   via the page-aliasing scheme baked into the ROM
+///   (`jt_va_to_phys`).
+/// - VAs in the gROMPublicJumpTable window (0x01800000..0x01900000)
+///   translate via the L2 at PA 0x18000.
+/// - VAs in the secondary-JT window (0x01E00000..0x01F00000) translate
+///   via the L2 at PA 0x7EC000.
+/// - Anything else returns `None`.
+fn va_to_pa(words: &[u32], va: u32) -> Option<u32> {
+    if va & 3 != 0 { return None; }
+    if (va as usize) < ROM_SIZE_BYTES { return Some(va); }
+    if let Some(pa) = jt_va_to_phys(va) { return Some(pa); }
+    if let Some(pa) = public_jt_va_to_phys(words, va) { return Some(pa); }
+    if let Some(pa) = secondary_jt_va_to_phys(words, va) { return Some(pa); }
+    None
+}
+
+/// Loud variant of `va_to_pa` for the walker's hot path. Same
+/// translation logic, but on miss `eprintln!`s once per unique
+/// unresolved VA. The walker's `cur` is always a real next-hop the
+/// kernel would branch to — if `va_to_pa` rejects it, either we hit
+/// a JT/aperture window we haven't modelled or a misdecoded data
+/// branch led us astray. Either way the developer should see it.
+///
+/// This is the **single point** that converts VA→PA in the walker.
+/// The walker carries `cur` as a VA throughout; reading a word and
+/// setting a reach bit both go through this translation. Branches
+/// (B/BL/Bcc, ADR, LDR-pc-rel) are computed in pure VA arithmetic.
+/// Aliased thunk pages (where many VAs map to the same PA) work
+/// correctly because step()'s target arithmetic is keyed to the
+/// runtime VA, which is what reaches the kernel's intended next-hop.
+fn va_to_pa_loud(words: &[u32], va: u32) -> Option<u32> {
+    if let Some(pa) = va_to_pa(words, va) {
         return Some(pa);
     }
-    secondary_jt_va_to_phys(words, target)
-}
-
-/// Result of chasing a (possibly aliased) target through the JT chain.
-/// `thunks` lists every thunk PA visited during resolution — these
-/// must be marked code at load time so BE-8 byteswap covers the bytes
-/// the kernel branches through, but they should NOT be added to the
-/// walker's worklist (PA decoding from a thunk would chase a wrong
-/// target).
-struct ChainResolution {
-    final_pa: u32,
-    thunks: Vec<u32>,
-}
-
-fn resolve_jt_chain(words: &[u32], target: u32) -> Option<ChainResolution> {
-    let mut thunks: Vec<u32> = Vec::new();
-    let mut cur = target;
-    // Defensive cap: a chain longer than this is almost certainly a
-    // cycle from misdecoded data.
-    for _ in 0..8 {
-        if cur & 3 != 0 { return None; }
-        if (cur as usize) < ROM_SIZE_BYTES {
-            return Some(ChainResolution { final_pa: cur, thunks });
-        }
-        // VA-keyed L2 lookup: returns the thunk PA for whichever JT
-        // window `cur` belongs to.
-        let thunk_pa = jt_va_to_phys(cur)
-            .or_else(|| public_jt_va_to_phys(words, cur))
-            .or_else(|| secondary_jt_va_to_phys(words, cur))?;
-        if (thunk_pa as usize) + 4 > ROM_SIZE_BYTES { return None; }
-        thunks.push(thunk_pa);
-        // Decode the thunk's B against the runtime VA (`cur`), not the
-        // thunk PA — the kernel branches via VA, so VA arithmetic gives
-        // the real next-hop target.
-        let w = words[(thunk_pa >> 2) as usize];
-        let cond = (w >> 28) & 0xF;
-        let kind = (w >> 25) & 0b111;
-        if cond == 0xF || kind != 0b101 { return None; }
-        let imm24 = w & 0x00FF_FFFF;
-        let simm = sign_extend(imm24, 24) << 2;
-        cur = cur.wrapping_add(8).wrapping_add(simm as u32);
+    // Misaligned VAs aren't worth logging — those are the walker's
+    // own break check rather than a missing mapping.
+    if va & 3 != 0 { return None; }
+    use std::sync::{Mutex, OnceLock};
+    static UNRESOLVED: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+    let set = UNRESOLVED.get_or_init(|| Mutex::new(HashSet::new()));
+    if set.lock().unwrap().insert(va) {
+        eprintln!(
+            "classify-rom: UNRESOLVED VA {va:#010x} (walker) — not main \
+             ROM/REx, not patch table (0x01A00000..0x01C20000), not \
+             gROMPublicJumpTable (0x01800000..0x01900000), not \
+             secondary-JT (0x01E00000..0x01F00000)"
+        );
     }
     None
 }
+
 
 /// Enumerate the one-instruction-per-entry table that immediately
 /// follows a PC-relative dispatch (`<dpop> PC, PC, Rn[, shift]`).
@@ -1227,7 +1228,6 @@ struct WalkStats {
     pc_rel_addr_roots: usize,
     classinfo_roots: usize,
     alt_entry_roots: usize,
-    apcs_prologue_roots: usize,
     indexed_dispatch_roots: usize,
     /// Words cleared from reach because they are the targets of
     /// `LDR Rt, [pc, #±imm12]` from inside reached code — i.e. literal
@@ -1295,34 +1295,42 @@ fn walk(
             // bury the signal.
             let mut soup_logged = false;
             loop {
-                if (cur as usize) >= ROM_SIZE_BYTES || cur & 3 != 0 { break; }
-                if reach.get_word(cur) { break; }
-                if in_data_stop_range(cur) {
+                if cur & 3 != 0 { break; }
+                // Translate the VA `cur` to its host-image PA. The
+                // bitmap and `words` array are PA-indexed; `cur` is a
+                // VA. For VAs in main ROM PA == VA so this is the same
+                // as before; for thunk-page VAs we get the underlying
+                // backing-page PA. Loud variant: log if the walker
+                // reaches a VA we can't translate (= missing JT
+                // window, or misdecoded branch into wild space).
+                let cur_pa = match va_to_pa_loud(words, cur) { Some(p) => p, None => break };
+                if reach.get_word(cur_pa) { break; }
+                if in_data_stop_range(cur_pa) {
                     stats.data_range_stops += 1;
                     break;
                 }
-                let w = words[(cur >> 2) as usize];
+                let w = words[(cur_pa >> 2) as usize];
                 if (w >> 28) == 0xF {
                     stats.nv_cond_skips += 1;
                     break;
                 }
                 if WALK_TRACE_ADDRS.contains(&cur) {
-                    eprintln!("WALK_TRACE 0x{cur:08x} (pc popped 0x{pc:08x}, pass {pass}):");
+                    eprintln!("WALK_TRACE va=0x{cur:08x} pa=0x{cur_pa:08x} (pc popped 0x{pc:08x}, pass {pass}):");
                     for (i, r) in trace.iter().enumerate() {
                         eprintln!("  [{i}] {r:?}");
                     }
                 }
-                if !soup_logged && in_rom_soup(cur) {
+                if !soup_logged && in_rom_soup(cur_pa) {
                     soup_logged = true;
                     stats.rom_soup_entries += 1;
                     eprintln!(
-                        "ROM-SOUP CLASSIFY FAIL 0x{cur:08x} insn=0x{w:08x} (pop pc 0x{pc:08x}, pass {pass}):",
+                        "ROM-SOUP CLASSIFY FAIL va=0x{cur:08x} pa=0x{cur_pa:08x} insn=0x{w:08x} (pop pc 0x{pc:08x}, pass {pass}):",
                     );
                     for (i, r) in trace.iter().enumerate() {
                         eprintln!("  [{i}] {r:?}");
                     }
                 }
-                reach.set_word(cur);
+                reach.set_word(cur_pa);
                 stats.words_walked += 1;
                 // Refresh LR-target tracker. `mov lr, pc` /
                 // `add lr, pc, #imm` set LR to a static address
@@ -1384,11 +1392,13 @@ fn walk(
                 };
                 match step_result {
                     Step::Continue { branch: Some(t) } => {
-                        if let Some(root) = resolve_target_to_rom(words, t) {
-                            let mut child_trace = trace.clone();
-                            child_trace.push(WalkReason::Branch { from_pc: cur });
-                            worklist.push((root, child_trace));
-                        }
+                        // Push the target VA directly. The walker's
+                        // own bound check (`va_to_pa`) on the next pop
+                        // filters anything that doesn't translate, so
+                        // we don't need to pre-validate here.
+                        let mut child_trace = trace.clone();
+                        child_trace.push(WalkReason::Branch { from_pc: cur });
+                        worklist.push((t, child_trace));
                         prev_w = w;
                         cur = cur.wrapping_add(4);
                     }
@@ -1400,10 +1410,9 @@ fn walk(
                         prev_w = 0;
                         in_table = false;
                         let from_pc = cur;
-                        cur = match resolve_target_to_rom(words, t) {
-                            Some(pa) => pa,
-                            None => break,
-                        };
+                        // VA → VA: the loop-top va_to_pa decides
+                        // whether the new VA is mappable.
+                        cur = t;
                         trace.push(WalkReason::Jump { from_pc });
                     }
                     Step::Stop => break,
@@ -1447,9 +1456,6 @@ fn walk(
             words, &reach, &mut worklist, &mut stats,
         );
         new_roots += collect_alt_entry_roots(
-            words, &reach, &mut worklist, &mut stats,
-        );
-        new_roots += collect_apcs_prologue_scan_roots(
             words, &reach, &mut worklist, &mut stats,
         );
         new_roots += collect_indexed_dispatch_roots(
@@ -1597,20 +1603,20 @@ fn collect_vtable_roots(
             if (vptr_addr as usize) + 4 > ROM_SIZE_BYTES { break; }
             let p = words[(vptr_addr as usize) >> 2];
             if p == 0 { break; }
-            // Resolve patch-table VAs to their underlying ROM PA.
-            // Vtables in Newton overwhelmingly point at JT thunks
-            // (so methods are patchable post-ship); a vtable scan
-            // that requires direct ROM-PA targets misses every
-            // method.
-            let p = match resolve_target_to_rom(words, p) {
+            // Validate the VA is mappable and decodes as a known
+            // function-start word (B-AL through patch-table thunk
+            // counts). Vtables in Newton overwhelmingly point at JT
+            // thunks (so methods are patchable post-ship); a vtable
+            // scan that required direct ROM-PA targets would miss
+            // every method.
+            let p_pa = match va_to_pa(words, p) {
                 Some(pa) => pa,
                 None => break,
             };
-            let tgt_idx = (p >> 2) as usize;
-            let tgt_word = words[tgt_idx];
+            let tgt_word = words[(p_pa >> 2) as usize];
             if (tgt_word >> 28) == 0xF { break; }
             if !is_known_function_start(tgt_word) { break; }
-            if !reach.get_word(p) {
+            if !reach.get_word(p_pa) {
                 worklist.push((p, vec![WalkReason::Seed(SeedSource::Vtable { ldr_pc: addr })]));
                 added += 1;
                 entries_added += 1;
@@ -1837,11 +1843,16 @@ fn collect_b_run_roots(
             let imm24 = words[k] & 0xFFFFFF;
             let simm = sign_extend(imm24, 24) << 2;
             let target = entry_pa.wrapping_add(8).wrapping_add(simm as u32);
-            let final_tgt = match resolve_target_to_rom(words, target) {
-                Some(t) => t,
+            // The B-run scan operates on PA-decoded words, so the
+            // target arithmetic uses the PA — but the target VALUE is
+            // a VA (it's a real branch target the kernel would reach).
+            // Validate the VA is mappable and the first word is
+            // function-start-shaped.
+            let target_pa = match va_to_pa(words, target) {
+                Some(pa) => pa,
                 None => continue,
             };
-            let tgt_word = words[(final_tgt >> 2) as usize];
+            let tgt_word = words[(target_pa >> 2) as usize];
             if is_known_function_start(tgt_word) { good += 1; }
         }
         if good * 4 < b_count * 3 { i = j.max(i + 1); continue; }
@@ -2082,69 +2093,6 @@ fn collect_alt_entry_roots(
     added
 }
 
-/// Discover function entries that no static B/BL/LDR-pc-rel/ADR /
-/// class-info-delta path reaches by globally scanning the ROM+REX
-/// aperture for the canonical Newton APCS-22 prologue:
-///
-///   `mov ip, sp`              == 0xE1A0_C00D
-///   `stmfd sp!, { …, lr, … }` == 0xE92D_???? where bit 14 (LR) is set
-///                                in the register list.
-///
-/// The two-word signature is highly specific: across the entire 717006
-/// ROM, every word that satisfies it is the entry of a real function.
-/// Newton's C-runtime emits this prologue for every non-leaf function
-/// (the leaf-without-frame case never has `mov ip, sp` — it goes
-/// straight to a single `stmfd sp!, {lr}` or skips the frame
-/// entirely).
-///
-/// Catches:
-///   - Newton package init routines (e.g. 0x007a56cc — the package0
-///     init for the `lcdd` package),
-///   - ROM-driver entries that get installed at runtime via package
-///     activation (no static reference in the disasm),
-///   - REx-loaded driver methods (extends the iter-97 RExHeader scan
-///     with a body-shape heuristic that doesn't depend on the entry
-///     being named in the FDRV class-info structure).
-///
-/// Refuses to seed entries already in `reach` so the natural walk-
-/// reachable functions don't get a duplicate trace; the only seeds
-/// that survive are the ones the static passes missed.
-fn collect_apcs_prologue_scan_roots(
-    words: &[u32],
-    reach: &Bitmap,
-    worklist: &mut Vec<(u32, Vec<WalkReason>)>,
-    stats: &mut WalkStats,
-) -> usize {
-    const MOV_IP_SP: u32 = 0xE1A0_C00D;
-    let mut added = 0usize;
-    let mut seen: HashSet<u32> = HashSet::new();
-    let last = ROM_WORD_COUNT.saturating_sub(1);
-
-    for i in 0..last {
-        if words[i] != MOV_IP_SP { continue; }
-        let next = words[i + 1];
-        // STMFD sp!, {reglist} with LR (bit 14) in reglist.
-        // Encoding: cond=AL (top nibble 0xE), bits[27:25]=100 (LDM/STM),
-        //           bit24=1 (P=1, pre-decrement), bit23=0 (U=0, down),
-        //           bit22=0 (S=0), bit21=1 (W=1, writeback),
-        //           bit20=0 (L=0, store), Rn=13 (sp).
-        // Top half: 0xE92D. Bit 14 of the low half = LR present.
-        if (next >> 16) != 0xE92D { continue; }
-        if (next >> 14) & 1 == 0 { continue; }
-        let pa = (i as u32) * 4;
-        // Don't seed addresses already reached or in a known data
-        // range — the heuristic should only add NEW coverage.
-        if reach.get_word(pa) { continue; }
-        if in_data_stop_range(pa) { continue; }
-        if !seen.insert(pa) { continue; }
-        worklist.push((pa, vec![WalkReason::Seed(SeedSource::ApcsPrologueScan)]));
-        added += 1;
-    }
-
-    stats.apcs_prologue_roots += added;
-    added
-}
-
 /// Recognize the bounded indexed-dispatch idiom Newton uses for
 /// kernel SWI handlers (and similar opcode tables):
 ///
@@ -2302,16 +2250,18 @@ fn collect_indexed_dispatch_roots(
             let entry_pa = tbl.wrapping_add((i as u32) * 4);
             if (entry_pa as usize) + 4 > ROM_SIZE_BYTES { break; }
             let entry_val = words[(entry_pa >> 2) as usize];
-            let final_tgt = match resolve_target_to_rom(words, entry_val) {
-                Some(t) => t,
+            // entry_val is a VA the kernel will branch to. Validate
+            // it's mappable and shape-checks; push the VA so the
+            // walker chains JT thunks naturally.
+            let entry_pa2 = match va_to_pa(words, entry_val) {
+                Some(pa) => pa,
                 None => continue,
             };
-            let tgt_idx = (final_tgt >> 2) as usize;
-            let tgt_word = words[tgt_idx];
+            let tgt_word = words[(entry_pa2 >> 2) as usize];
             if (tgt_word >> 28) == 0xF { continue; }
             if !is_known_function_start(tgt_word) { continue; }
-            if !reach.get_word(final_tgt) && seen.insert(final_tgt) {
-                worklist.push((final_tgt, vec![WalkReason::Seed(SeedSource::IndexedDispatch { dispatch_pc: addr })]));
+            if !reach.get_word(entry_pa2) && seen.insert(entry_val) {
+                worklist.push((entry_val, vec![WalkReason::Seed(SeedSource::IndexedDispatch { dispatch_pc: addr })]));
                 added += 1;
             }
         }
@@ -2352,19 +2302,19 @@ fn collect_fnptr_literal_roots(
         if (lit_pc as u32) & 3 != 0 { continue; }
         let val = words[(lit_pc as usize) >> 2];
         if val == 0 { continue; }
-        // Function-pointer literal: may be a direct ROM PA or a
-        // patch-table VA. Resolve before validating shape.
-        let final_tgt = match resolve_target_to_rom(words, val) {
-            Some(t) => t,
+        // Function-pointer literal: VA (possibly a patch-table thunk
+        // VA). Validate via VA→PA, shape-check the first word, then
+        // seed the VA so the walker chains JT thunks naturally.
+        let val_pa = match va_to_pa(words, val) {
+            Some(pa) => pa,
             None => continue,
         };
-        let tgt_idx = (final_tgt >> 2) as usize;
-        let tgt_word = words[tgt_idx];
+        let tgt_word = words[(val_pa >> 2) as usize];
         if (tgt_word >> 28) == 0xF { continue; }
         if !is_known_function_start(tgt_word) { continue; }
-        if reach.get_word(final_tgt) { continue; }
-        if !seen.insert(final_tgt) { continue; }
-        worklist.push((final_tgt, vec![WalkReason::Seed(SeedSource::FnPtrLiteral { ldr_pc: addr })]));
+        if reach.get_word(val_pa) { continue; }
+        if !seen.insert(val) { continue; }
+        worklist.push((val, vec![WalkReason::Seed(SeedSource::FnPtrLiteral { ldr_pc: addr })]));
         added += 1;
     }
     stats.fnptr_literal_roots += added;
@@ -2483,109 +2433,16 @@ fn run(args: Args) -> Result<(), String> {
     }
 
     // No JT-thunk pre-marking. The patch-table B-thunks are reached via
-    // their VA-keyed entries in symbols.txt — `load_symbol_roots`
-    // translates each to its thunk PA, the walker pops the thunk, marks
-    // the B-AL word, and follows Step::Jump to the real ROM target.
-    // Pre-walk: mark known JT-thunk page PAs as code so the walker
-    // breaks on entry. These are pages where the kernel branches in
-    // via VA aliasing AND the PA-decoded B target gives a wrong/garbage
-    // destination. The walker won't visit them because
-    // `resolve_target_to_rom` now follows the VA chain to the final ROM
-    // PA — pre-marking only ensures BE-8 byteswap coverage.
-    //
-    // CRITICAL: don't pre-mark every page mapped by the JT L2s. Those
-    // L2s alias many pages, including normal vtables (e.g. PA 0x1b000,
-    // 0x1d000) whose PA-decoded B targets ARE valid (or chain-resolve
-    // valid via patch-table VAs). Pre-marking those would block the
-    // walker from following the vtable's targets — losing real code
-    // coverage. Restrict pre-marking to the specific PA ranges we know
-    // are pure thunk backing.
-    const PURE_THUNK_PAGES: &[(u32, u32)] = &[
-        // Patch-table backing: 17 pages × 4 KiB = 0x11000 bytes.
-        // Per `docs/NEWTON_INTERNALS.md`, every word is a B-thunk
-        // aliased into VA 0x01A00000+ via gROMPatchTablePageTable.
-        (0x0000_2000, 0x0001_3000),
-        // gROMPublicJumpTable backing: 3 pages aliased into VA
-        // 0x01800000+ via gROMPublicJumpTablePageTable. PA-decoded
-        // targets look in-ROM but are wrong; the kernel's runtime
-        // VA decoding gives the real target (which then chain-
-        // resolves through patch-table thunks).
-        (0x0001_3000, 0x0001_6000),
-        // Secondary-jt backing: 1 page aliased into VA 0x01E00000+
-        // via the secondary-jt L2 at PA 0x7EC000.
-        (0x007E_E000, 0x007E_E048),
-    ];
-    let mut initial_reach = Bitmap::new();
-    let mut prewalk_thunk_words = 0usize;
-    for &(start, end) in PURE_THUNK_PAGES {
-        let mut pa = start;
-        while pa < end {
-            if (pa as usize) + 4 > ROM_SIZE_BYTES { break; }
-            let insn = words[(pa >> 2) as usize];
-            // Only mark words that actually look like B-AL thunks.
-            // Trailing zero-pad / partial-page tails get skipped so
-            // post-walk chain resolution can still pick up any
-            // straggler thunks via reach-based discovery.
-            if (insn >> 24) == 0xEA && !initial_reach.get_word(pa) {
-                initial_reach.set_word(pa);
-                prewalk_thunk_words += 1;
-            }
-            pa = pa.wrapping_add(4);
-        }
-    }
+    // their VA-keyed entries in symbols.txt — the walker pops the JT
+    // VA itself (no resolve_target_to_rom flattening), `va_to_pa`
+    // translates to the thunk's backing PA, the walker reads the B
+    // word and Step::Jump dispatches to the next VA along the chain.
+    // Thunk PAs get reach=1 as a side effect of being walked; no
+    // pre-marking required.
+    let initial_reach = Bitmap::new();
 
     let (mut reach, mut stats) = walk(&words, &symbols, initial_reach, &fn_ranges);
     stats.rex_header_roots = rex_header_root_count;
-
-    // Post-walk: scan every reached B/BL/Bcc instruction and any
-    // reached LDR-pc-rel literal. If the target/literal is a JT VA,
-    // chase the chain through `resolve_jt_chain` and mark every thunk
-    // PA along the way as code (so BE-8 byteswap covers them). The
-    // walker no longer steps into thunk pages — `resolve_target_to_rom`
-    // returns the final ROM PA via chain resolution — so without this
-    // pass the thunk bytes would stay BE and the kernel's branches
-    // through them would fetch garbage.
-    let mut public_jt_words = 0usize;
-    {
-        let mut chain_thunks: HashSet<u32> = HashSet::new();
-        for i in 0..ROM_WORD_COUNT {
-            let pc = (i as u32) * 4;
-            if !reach.get_word(pc) { continue; }
-            let w = words[i];
-            let cond = (w >> 28) & 0xF;
-            if cond == 0xF { continue; }
-            // B/BL/Bcc → target VA
-            if (w >> 25) & 0b111 == 0b101 {
-                let imm24 = w & 0xFFFFFF;
-                let simm = sign_extend(imm24, 24) << 2;
-                let target = pc.wrapping_add(8).wrapping_add(simm as u32);
-                if let Some(c) = resolve_jt_chain(&words, target) {
-                    for t in c.thunks { chain_thunks.insert(t); }
-                }
-            }
-            // LDR Rt, [pc, #±imm12] → literal value (any cond)
-            let masked = (w >> 16) & 0x0FFF;
-            if masked == 0x59F || masked == 0x51F {
-                let imm12 = (w & 0xFFF) as i32;
-                let sgn = if masked == 0x59F { 1 } else { -1 };
-                let lit_pc = (pc as i64) + 8 + (sgn as i64) * (imm12 as i64);
-                if lit_pc >= 0 && (lit_pc as usize) + 4 <= ROM_SIZE_BYTES
-                    && (lit_pc as u32) & 3 == 0
-                {
-                    let lit = words[(lit_pc as usize) >> 2];
-                    if let Some(c) = resolve_jt_chain(&words, lit) {
-                        for t in c.thunks { chain_thunks.insert(t); }
-                    }
-                }
-            }
-        }
-        for t in chain_thunks {
-            if !reach.get_word(t) {
-                reach.set_word(t);
-                public_jt_words += 1;
-            }
-        }
-    }
 
     // Manual data-range exclusions: clear reach bits in any range
     // listed in `MANUAL_DATA_RANGES`. Runs after the JT-thunk mark so
@@ -2668,9 +2525,6 @@ fn run(args: Args) -> Result<(), String> {
     }
     writeln!(f, "  manual data-range exclusions:").ok();
     writeln!(f, "    words cleared: {}", manual_data_words_cleared).ok();
-    writeln!(f, "  gROMPublicJumpTable post-walk mark:").ok();
-    writeln!(f, "    pre-walk thunk-page words: {}", prewalk_thunk_words).ok();
-    writeln!(f, "    chain-resolved thunk words: {}", public_jt_words).ok();
     writeln!(f, "  walker:").ok();
     writeln!(f, "    symbol roots (post-merge): {}", stats.initial_roots).ok();
     writeln!(f, "    rex-header roots added:    {}", stats.rex_header_roots).ok();
@@ -2685,7 +2539,6 @@ fn run(args: Args) -> Result<(), String> {
     writeln!(f, "    PC-rel addr roots added:    {}", stats.pc_rel_addr_roots).ok();
     writeln!(f, "    TClassInfo struct roots:    {}", stats.classinfo_roots).ok();
     writeln!(f, "    alt-entry-after-ip-jump:    {}", stats.alt_entry_roots).ok();
-    writeln!(f, "    APCS-prologue-scan roots:   {}", stats.apcs_prologue_roots).ok();
     writeln!(f, "    indexed-dispatch roots:     {}", stats.indexed_dispatch_roots).ok();
     writeln!(f, "    total indirect roots added: {}", stats.indirect_roots_added).ok();
     writeln!(f, "    literal-pool words cleared: {}", stats.literal_targets_cleared).ok();

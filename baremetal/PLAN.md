@@ -18,17 +18,137 @@ Bloated PLAN.md wastes context every read.
   functionality (not merely diagnostics):
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-97 follow-up):** with the iter-97 framework in
-place — symbols.txt-driven seeding, DFS provenance trace, JT-thunk
-pre-mark, suspicion tagging — the eyeball cycle is the next step.
-The 488 SUSPICIOUS code regions in `classify/<hash>/code-regions.txt`
-(>25% non-AL or any NV-cond) are the queue: each is either a real
-walker drift to fix at the seed/pass level, or a legitimate
-mixed-cond function (rare in this ROM). Use `WALK_TRACE_ADDRS` to
-get the DFS path back to the originating Seed when investigating.
-The VA-aware walker is still the long-term goal but requires
-isolating the FnPtrLiteral seed-into-REx-data path that drove the
-~3.3M-word reach explosion when previously attempted.
+**Current goal (iter-99):** with iter-98's classifier refinements in
+place (data-stop ranges + alt-entry collector + ROM-soup logging),
+boot reaches PC=0x7a56e4 — TMain… driver init — but stalls on a UND
+trap whose root cause is the kernel reading its own instruction as
+data via `LDR`. Two confirmed sites:
+
+- **DataAbortHandler 0x003931e4:** `ldr r0, [lr]` — loads the
+  faulting word so the kernel can decode the abort.
+- **UndefinedInstruction 0x0038ce9c:** `ldr r1, [lr, #-4]` — loads
+  the faulting word to compare against UDF marker patterns.
+
+Both run with `CPSR.E=1` (kernel BE data mode). The walker-marked
+words are byteswapped on disk → LE byte order in memory at load
+time so the LE instruction-fetch decodes them correctly. A BE
+`LDR` of the same address returns the LE-stored bytes interpreted
+as BE → the original word with bytes reversed, i.e. the
+byteswapped encoding the kernel cannot recognize.
+
+First-attempt fix: patch the instruction-as-data load sites to
+swap the loaded value back to BE before the kernel uses it. Either
+inline `REV` after each `LDR` (rom_patches.rs word-write) or HVC-
+trap-and-emulate the load with byteswap. Inline REV is the smaller
+change — the two known PCs are both `LDR Rd, [lr…]` whose Rd is
+known statically; emit `REV Rd, Rd` in the slot that follows.
+
+Remaining diagnostic noise: 35 ROM-soup walk entries, all
+legitimate ROM-driver TClassInfo trampolines at 0x7a5xxx
+(TMainDisplayDriver, TScreenDriver, "four"-named driver) plus a
+handful of B-AL run dispatch tables. The user-defined ROM-soup
+range (0x3afda8..0x800000) intentionally over-reaches; the
+logging is left enabled as a tripwire.
+
+### Iteration 99 (planned): patch fault-handler instruction loads to return BE
+
+Goal: clear the PC=0x7a56e4 stall by making the kernel's
+instruction-as-data `LDR`s in the fault handlers return the
+encoding the kernel was compiled to recognise, despite our load-
+time byteswap of code-marked words.
+
+The two sites currently known:
+
+| PC          | Insn     | Reads from | Why                  |
+|-------------|----------|------------|----------------------|
+| `0x003931e4`| `ldr r0, [lr]`     | faulting PC | DABT decode |
+| `0x0038ce9c`| `ldr r1, [lr, #-4]`| faulting PC | UND marker compare |
+
+Approach (first attempt — inline REV patch):
+
+1. In `src/rom_patches.rs`, add a word-write pair for each site:
+   - Replace the `LDR` with itself (no-op write — keeps the patch
+     table aligned for the follow-up word).
+   - Replace the immediately-following instruction with
+     `REV Rd, Rd` (`0xE6BF0F30 | (Rd<<12) | Rd`), where `Rd`
+     matches the LDR's destination register (`r0` for DABT,
+     `r1` for UND).
+   - Save the original next-instruction value in a small inline
+     trampoline that the REV's fall-through reaches, OR use a
+     2-word patch that emits `REV; B back_to_next_real_insn`.
+
+   Actual encoding plan: pick whichever of the two patterns fits
+   without re-shuffling the surrounding code. The handler bodies
+   in the disasm have predictable shape (`ldr` then a use of the
+   loaded word in the very next instruction or two), so a single-
+   word REV insertion may require relocating one trailing insn
+   into a hypervisor-managed thunk.
+
+2. Confirm via guest tests that the REV doesn't perturb non-fault
+   paths. Both handlers are entry points reached only on actual
+   abort/UND traps — the only baseline-affecting change is `r0` /
+   `r1` carrying a different (correct) value past the LDR.
+
+3. Re-run cold boot, expect the UND at 0x7a56e4 to either resolve
+   correctly (the kernel decodes its own UDF / branch / mov
+   without surprise) or surface a different root cause that lets
+   us advance further.
+
+If inline REV proves intractable (e.g. the LDR's caller already
+uses Rd in the very next cycle), fall back to:
+- HVC-trap the LDR via `UDF #imm` injection in rom_patches.rs and
+  emulate the load + byteswap from EL2.
+- Or repurpose the existing shadow_stub byte-access path —
+  add a "code-region word LDR" form that returns the un-byteswapped
+  word, gated on the LDR's PA being inside the byteswapped reach
+  set.
+
+Open question: are there OTHER kernel sites that read instruction
+encodings as data? Candidates beyond fault handlers: any ROM-patch
+mechanism, any breakpoint/inspection tooling embedded in the
+kernel (debugger-int handler at 0x38cec8 looks suspicious), any
+vtable / classinfo decoder that walks B-AL chains. Trace the
+remaining suspicious code regions in iter-97/iter-98's queue
+once the fault-handler fix unblocks the boot.
+
+### Iteration 98: classifier refinement — data-stop ranges, alt-entry, ROM-soup log
+
+Goal: drive the classifier's false-positive rate down by patching
+three observed misclassifications (3861e4–e8 missing as code,
+3948e8–39965c spurious as code, 7a0dbc–7a11fc spurious as code)
+and add diagnostic logging for any walk that crosses into the
+post-code ROM data region.
+
+Major changes:
+- `DATA_STOP_RANGES` — half-open `[start, end)` ranges the walker
+  refuses to enter and `load_symbol_roots` refuses to seed.
+  Mirrors `classify-symbols.py`'s `DATA_RANGES`. Stops the cascade
+  where data symbols (e.g. `PublicFiller` at 0x003948e4 with first
+  word `0xE6000410`) seed the walker, who then walks linearly
+  through bp-weight data and pushes misdecoded `bne` targets into
+  NSRuntime / package data at 0x7a0dbc, 0x7ed138, 0x7ed2ec.
+- `collect_alt_entry_roots` — new indirect-pass collector for the
+  `mov r0, pc; mov pc, lr` micro-trampoline that follows
+  `add/sub pc, ip, #N` in Newton's class-info dispatch. The pair
+  is a "get class-name string pointer" alt entry; without this
+  collector the alt entry at 0x3861e4 (TClassInfoRegistryImpl::
+  ClassInfo dispatch helper) was unmarked because no static caller
+  exists.
+- `ROM_SOUP_RANGE = 0x3afda8..0x800000` walk-entry log: per popped
+  walk, the first word inside the range produces a stderr line
+  with the full origin trace stack. Diagnostic only — does not
+  drop bits.
+- `SeedSource::Symbol` now carries the symbol name as
+  `&'static str` (leaked at parse time). `Seed(Symbol "PublicFiller_1")`
+  vs the prior useless `Seed(Symbol)`.
+
+Result:
+- `byte-access-static` 28291 → 27769 (-522 false positives).
+- 1879 symbol roots dropped via data-stop-range; 2 alt-entry
+  roots added.
+- Boot reaches PC=0x7a56e4 (TMain… driver init); 35 remaining
+  ROM-soup walk-entries, all legitimate ROM-driver class info.
+- Invariant (oracle ⊆ static) still holds.
 
 ### Iteration 97: classify-rom symbols.txt + DFS provenance trace + JT chain mark
 
@@ -101,30 +221,7 @@ Result:
   tests pass.
 - 488 SUSPICIOUS code regions queued for the eyeball pass.
 
-### Iteration 96: pre-mark patch-table + gROMPublicJumpTable thunks via L2 walk
-
-Goal was to extend classify-rom so the BE-8 atomic flip's load-time
-byteswap covers every B-thunk the kernel branches through, including
-gROMPublicJumpTable (PA 0x13000..0x15FFF) and its sibling thunk
-pages (PA 0x1B000..0x21FFF) that share gROMPublicJumpTablePageTable's
-L2 (PA 0x18000) with a few pages of kernel-managed page-table data.
-
-Approach: pre-walk pass walks the in-ROM L2 page tables, filters
-target pages by shape (top byte 0xEA on the first 16 words), pre-
-marks the leading B-AL run inside each thunk page.
-
-Result:
-- 16919 patch-table thunk words + 12433 gROMPublicJumpTable family
-  thunk words pre-marked.
-- `byte-access-static` 27750. Boot reaches PC=0x7a56e4; 36/36 guest
-  tests pass.
-
-Limitation: pre-marking blocked the walker from following B-AL
-entries in pages that the L2 also mapped as normal vtables (0x1b000,
-0x1d000, 0x21000), losing real coverage downstream — fixed in
-iter-97 by switching to PA-range-targeted pre-marking.
-
-<!-- Older iteration retrospectives (iter-95 and earlier) live in
+<!-- Older iteration retrospectives (iter-96 and earlier) live in
      `git log` per the auto-prune maintenance note. -->
 <!-- iter-90 deferred shadow_stub deletion: still gated off
      (`patch_rom_from_bitmap` no longer called from `main.rs`); full

@@ -30,32 +30,67 @@ from `[r1, #-4]` (with r1=lr from the preceding `mov r1, lr`) and
 REVs the result, mirroring the existing iter-101 site at
 0x003a_d69c.
 
-Boot now reaches `<<TRM_STOP>>` (the kernel's emergency-stop
-marker) and then trips a new wedge:
+Boot now reaches a new (unrelated) wedge:
 
 ```
+<<TRM_STOP>>
 *** unrecognised UND: insn=0xea0061a0 at PC=0x0 SPSR_und=0x330
-  src_mode=0x10 (USR)  LR_und=0x4
+  src_mode=0x10 (USR)  LR_und=ctx.x[22]=0x4  LR_usr=0x01bdde84
 ```
 
-PC=0x0 is the reset vector and `0xEA0061A0` is a perfectly valid
-`B` to PC+0x18688, so the UND is presumably the host catching the
-guest jumping to PC=0 — a soft-reset or a wild branch. Investigation
-order for iter-105:
+(`<<TRM_STOP>>` is just the tarmac-window terminator emitted from
+the unrecognised-UND log path itself — no separate kernel
+"emergency stop". `0xEA0061A0` is the reset vector's
+`B BootOS` word.)
 
-1. **Locate the BL/B that lands at PC=0x0.** UND history right
-   before the wedge shows USR-mode UNDs at `0x00394318`
-   (`mrs ip, SPSR`) and `0x00258e50` (the REMEMBER_SWIRET probe
-   HVC). One of those handlers is presumably either branching to
-   0 directly or returning into garbage (LR clobber). Cross-check
-   the `<<TRM_STOP>>` source — search the ROM disasm for the
-   `TRM_STOP` literal to find which kernel routine emitted it.
-2. **Decide whether PC=0 is a real reset request or a runaway
-   branch.** A real reset (`Reboot`-class call) should land in our
-   reset canary first, not PC=0; if PC=0 fires straight, the
-   call was a wild branch and the original site is the bug. If
-   it's a deliberate reset, we need to model the kernel's
-   "graceful reboot" instead of UND-ing.
+Notes from the diagnostic dump:
+
+- `LR_usr=0x01bdde84` is the post-ship patch-table entry for
+  `TaskKillSelf` (`0x003943ac`). Some USR-mode caller did
+  `bl 0x01bdde80`, which sets LR=patch_entry+4 and B's into the
+  TaskKillSelf body via the patch slot.
+- `SPSR_und=0x330` decodes to **USR mode + T=1 (Thumb) + E=1**.
+  Newton 2.x is pure ARM — no Thumb code anywhere. Either the
+  kernel set up a context with the T-bit accidentally set, or the
+  trampoline / banked-state restore path leaked a stale CPSR.
+- BootOS canary fired only once (legitimate first boot at line
+  163 of the run log). A second fire would have produced
+  `BootOS canary fired on entry #2 — software reset detected`,
+  but no such line exists. So either (a) the UND fires *before*
+  the `B BootOS` at PC=0 actually reaches PC=0x18688, or (b) the
+  guest never actually executed PC=0 at all and the UND
+  trampoline got tricked into firing through a wild branch
+  to VA 0x4 (the UND vector).
+
+Investigation order for iter-105:
+
+1. **Trace what TaskKillSelf does in our boot.** It issues
+   `svc 0` (= GetPortInfo) then `svc 0x1B` (MonitorDispatchSWI
+   to kill the task). On a real Newton, `svc 0x1B` switches to a
+   different task and the killed task is reaped — never returns.
+   In our boot it presumably returns (we don't model
+   MonitorDispatch's task-switching) and the kernel falls into
+   the `DebuggerUND "Task did not kill self properly!!"` debug
+   stub at 0x003943c8 — but we don't see that string in the log
+   either, so the divergence is even earlier.
+2. **Distinguish "real UND at PC=0" from "wild branch to VA 0x4
+   landing in the UND trampoline".** Add a one-shot log to the
+   UND-vector trampoline (or to `handle_und`) printing
+   `lr_und`, `spsr_und`, and the *original* mode bits (read from
+   ELR_EL2 / SPSR_EL2 at HVC entry, not from the saved slot the
+   trampoline writes). If `lr_und=0x4` and the source mode bits
+   in SPSR_EL2 don't match `spsr_und`, the trampoline was
+   re-entered through a non-UND path.
+3. **If it really is a reset jump:** extend `handle_und` to
+   recognise a USR-mode UND at PC=0 with the legitimate
+   `B BootOS` word as a soft-reset request and route into
+   `handle_bootos_canary`'s second-entry path so the wedge dump
+   names the cause properly.
+4. **If it's a wild branch:** the LR_usr→TaskKillSelf patch slot
+   says the caller was somewhere that BL'd to TaskKillSelf. Walk
+   ROM xrefs to that patch slot (`bl 0x01bdde84` or `b 0x01bdde84`)
+   and instrument the call sites to find which one fires last
+   before the wedge.
 
 The iter-99/101/104 byteswap stubs and the iter-103 VA-space
 classifier rework remain in place; both are working as intended.

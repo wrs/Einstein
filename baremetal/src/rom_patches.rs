@@ -668,6 +668,17 @@ const UND_FAULT_LDR_PC:        u32 = 0x0038_CE9C;
 const UND_FAULT_LDR_ORIG_INSN: u32 = 0xE51E_1004; // ldr r1, [lr, #-4]
 const UND_FAULT_LDR_RESUME_PC: u32 = 0x0038_CEA0;
 
+/// `SWIBoot` handler instruction-as-data load:
+/// `ldr r0, [lr, #-4]` at PC 0x003ad69c reads the SWI instruction so
+/// the kernel can extract the SWI immediate (and dispatch type from
+/// bits[27:24]). Without this fix the byteswapped read makes every
+/// SWI dispatch to the wrong handler, wedging the boot in a tight
+/// loop at MonitorDispatchSWI 0x3ae320 (svc 0x1b) → SWIBoot →
+/// unhandled-SWI fallback → return → svc 0x1b again.
+const SWIBOOT_LDR_PC:        u32 = 0x003a_D69C;
+const SWIBOOT_LDR_ORIG_INSN: u32 = 0xE51E_0004; // ldr r0, [lr, #-4]
+const SWIBOOT_LDR_RESUME_PC: u32 = 0x003a_D6A0;
+
 /// Small helper to emit an ARM `B target` at `src_pc`.
 const fn arm_b(src_pc: u32, target: u32) -> u32 {
     let off_bytes = target.wrapping_sub(src_pc.wrapping_add(8)) as i32;
@@ -857,66 +868,64 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
     }
 }
 
-/// Patch the two known kernel fault-handler `LDR` sites that read the
-/// faulting instruction word as data — DataAbortHandler 0x003931e4
-/// (`ldr r0, [lr]`) and UndefinedInstruction 0x0038ce9c (`ldr r1, [lr,
-/// #-4]`). Under load-time BE-8 byteswap of code-marked memory, the
-/// kernel's CPSR.E=1 `LDR` returns the bytes in the wrong order — the
+/// Patch the kernel's three known `LDR` sites that read the faulting
+/// (or trapping) instruction word as data:
+///
+///   - DataAbortHandler 0x003931e4 (`ldr r0, [lr]`)
+///   - UndefinedInstruction 0x0038ce9c (`ldr r1, [lr, #-4]`)
+///   - SWIBoot 0x003ad69c (`ldr r0, [lr, #-4]`)
+///
+/// Under load-time BE-8 byteswap of code-marked memory, the kernel's
+/// CPSR.E=1 `LDR` returns the bytes in the wrong order — the
 /// numerical value is the byteswap of the original instruction
 /// encoding the kernel was compiled to recognise.
 ///
 /// Each site is replaced with `B stub`, where the stub re-emits the
-/// LDR and then byteswaps the loaded register in place using the
-/// classic ARMv4 idiom (no REV in v4) before falling through with `B
-/// resume`. We use `r12` (`ip`) as scratch — it's APCS caller-saved
-/// and the surrounding handler code does not touch it across the
-/// replaced LDR; verified by reading the disasm at both sites.
+/// LDR, byteswaps the result with `REV Rd, Rd`, and falls through
+/// with `B resume`. The kernel was compiled for ARMv4 (no REV) but
+/// the host CPU is ARMv8 / Cortex-A53 in AArch32 mode — which decodes
+/// every ARMv6+ instruction including REV. Three words per stub.
 ///
-/// ARMv4 byteswap of `Rt` using scratch `Rs`:
-/// ```text
-///     EOR Rs, Rt, Rt, ROR #16    ; Rs = Rt ^ rotr(Rt, 16)
-///     BIC Rs, Rs, #0x00FF_0000   ; clear byte 2 of Rs
-///     MOV Rt, Rt, ROR #8         ; Rt rotr 8
-///     EOR Rt, Rt, Rs, LSR #8     ; Rt ^= Rs >> 8     -> byteswapped
-/// ```
+/// REV (A1) encoding: `cond 0110 1011 1111 Rd 1111 0011 Rm`. For
+/// `REV Rd, Rd`: 0xE6BF_0F30 | (Rd << 12) | Rd.
 unsafe fn apply_fault_handler_ldr_byteswap_patches(rom_ptr: *mut u32) {
-    // DABT site: target r0, scratch r12.
+    // DABT site: target r0.
     //   +0x00 LDR r0, [lr]                e59e0000
-    //   +0x04 EOR r12, r0, r0, ROR #16    e0200c60
-    //   +0x08 BIC r12, r12, #0xFF0000     e3ccc8ff
-    //   +0x0C MOV r0, r0, ROR #8          e1a00460
-    //   +0x10 EOR r0, r0, r12, LSR #8     e020042c
-    //   +0x14 B   DAH_FAULT_LDR_RESUME_PC arm_b(...)
-    let dah_stub_pc = alloc_patch_stub(6, "DAH faulting-insn LDR byteswap");
-    let dah_stub: [u32; 6] = [
+    //   +0x04 REV r0, r0                  e6bf_0f30
+    //   +0x08 B   DAH_FAULT_LDR_RESUME_PC arm_b(...)
+    let dah_stub_pc = alloc_patch_stub(3, "DAH faulting-insn LDR byteswap");
+    let dah_stub: [u32; 3] = [
         0xE59E_0000, // LDR r0, [lr]
-        0xE020_0C60, // EOR r12, r0, r0, ROR #16
-        0xE3CC_C8FF, // BIC r12, r12, #0xFF0000
-        0xE1A0_0460, // MOV r0, r0, ROR #8
-        0xE020_042C, // EOR r0, r0, r12, LSR #8
-        arm_b(dah_stub_pc + 0x14, DAH_FAULT_LDR_RESUME_PC),
+        0xE6BF_0F30, // REV r0, r0
+        arm_b(dah_stub_pc + 0x08, DAH_FAULT_LDR_RESUME_PC),
     ];
 
-    // UND site: target r1, scratch r12.
+    // UND site: target r1.
     //   +0x00 LDR r1, [lr, #-4]           e51e1004
-    //   +0x04 EOR r12, r1, r1, ROR #16    e021c861
-    //   +0x08 BIC r12, r12, #0xFF0000     e3ccc8ff
-    //   +0x0C MOV r1, r1, ROR #8          e1a01461
-    //   +0x10 EOR r1, r1, r12, LSR #8     e021142c
-    //   +0x14 B   UND_FAULT_LDR_RESUME_PC arm_b(...)
-    let und_stub_pc = alloc_patch_stub(6, "UND faulting-insn LDR byteswap");
-    let und_stub: [u32; 6] = [
+    //   +0x04 REV r1, r1                  e6bf_1f31
+    //   +0x08 B   UND_FAULT_LDR_RESUME_PC arm_b(...)
+    let und_stub_pc = alloc_patch_stub(3, "UND faulting-insn LDR byteswap");
+    let und_stub: [u32; 3] = [
         0xE51E_1004, // LDR r1, [lr, #-4]
-        0xE021_C861, // EOR r12, r1, r1, ROR #16
-        0xE3CC_C8FF, // BIC r12, r12, #0xFF0000
-        0xE1A0_1461, // MOV r1, r1, ROR #8
-        0xE021_142C, // EOR r1, r1, r12, LSR #8
-        arm_b(und_stub_pc + 0x14, UND_FAULT_LDR_RESUME_PC),
+        0xE6BF_1F31, // REV r1, r1
+        arm_b(und_stub_pc + 0x08, UND_FAULT_LDR_RESUME_PC),
+    ];
+
+    // SWIBoot site: target r0. Same encoding as DAH but offset is -4.
+    //   +0x00 LDR r0, [lr, #-4]           e51e0004
+    //   +0x04 REV r0, r0                  e6bf_0f30
+    //   +0x08 B   SWIBOOT_LDR_RESUME_PC   arm_b(...)
+    let swiboot_stub_pc = alloc_patch_stub(3, "SWIBoot SWI-insn LDR byteswap");
+    let swiboot_stub: [u32; 3] = [
+        0xE51E_0004, // LDR r0, [lr, #-4]
+        0xE6BF_0F30, // REV r0, r0
+        arm_b(swiboot_stub_pc + 0x08, SWIBOOT_LDR_RESUME_PC),
     ];
 
     unsafe {
         write_stub_words(rom_ptr, dah_stub_pc, &dah_stub);
         write_stub_words(rom_ptr, und_stub_pc, &und_stub);
+        write_stub_words(rom_ptr, swiboot_stub_pc, &swiboot_stub);
 
         // DAH site
         let dah_idx = (DAH_FAULT_LDR_PC / 4) as usize;
@@ -951,6 +960,24 @@ unsafe fn apply_fault_handler_ldr_byteswap_patches(rom_ptr: *mut u32) {
             kprintln!(
                 "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (UND ldr r1,[lr,-4] → B stub @ {:#x}, byteswap)",
                 UND_FAULT_LDR_PC, prev, insn, und_stub_pc,
+            );
+        }
+
+        // SWIBoot site
+        let swib_idx = (SWIBOOT_LDR_PC / 4) as usize;
+        let prev = rom_ptr.add(swib_idx).read();
+        if prev != SWIBOOT_LDR_ORIG_INSN {
+            kprintln!(
+                "rom_patch: ERROR — SWIBoot LDR at {:#010x} is {:#010x}, expected {:#010x}; skipping byteswap stub",
+                SWIBOOT_LDR_PC, prev, SWIBOOT_LDR_ORIG_INSN,
+            );
+        } else {
+            let insn = arm_b(SWIBOOT_LDR_PC, swiboot_stub_pc);
+            crate::guest_mem::write_rom_code_word(rom_ptr, swib_idx, insn);
+            record_original(SWIBOOT_LDR_PC, prev);
+            kprintln!(
+                "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (SWIBoot ldr r0,[lr,-4] → B stub @ {:#x}, byteswap)",
+                SWIBOOT_LDR_PC, prev, insn, swiboot_stub_pc,
             );
         }
     }

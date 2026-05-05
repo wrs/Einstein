@@ -75,12 +75,14 @@ arm-none-eabi-objdump -D -b binary -m arm -EL \
     --adjust-vma=0 \
     "$tmp/rom.le" > "$raw"
 
-# Post-process: annotate branch targets and inject function headers.
-python3 - "$raw" "$syms" "$out" <<'PY'
+# Post-process: annotate branch targets, dereference literal-pool
+# `@ 0xADDR` comments, and inject function headers.
+python3 - "$raw" "$syms" "$tmp/rom.le" "$out" <<'PY'
 import re
+import struct
 import sys
 
-raw_path, syms_path, out_path = sys.argv[1:4]
+raw_path, syms_path, image_path, out_path = sys.argv[1:5]
 
 syms = {}
 with open(syms_path) as f:
@@ -100,6 +102,18 @@ with open(syms_path) as f:
         # sometimes has duplicate entries — both _Foo and Foo aliases).
         syms.setdefault(a, name)
 
+# 16 MiB ROM+REx image (LE word view). `read_word` reads a u32 at a
+# byte address and returns None if out of range or misaligned.
+with open(image_path, 'rb') as f:
+    image = f.read()
+
+def read_word(addr):
+    if addr & 3 != 0:
+        return None
+    if addr < 0 or addr + 4 > len(image):
+        return None
+    return struct.unpack_from('<I', image, addr)[0]
+
 # Operand patterns we care about:
 #   * `bl 0xXXXX`, `blx 0xXXXX`, `b 0xXXXX`, `bCC 0xXXXX`
 #   * `@ 0xXXXX` objdump side comment (PC-relative literal address)
@@ -107,6 +121,16 @@ with open(syms_path) as f:
 target_re = re.compile(
     r'(?P<prefix>\b(?:bl|blx|b|bal|beq|bne|bcs|bhs|bcc|blo|bmi|bpl|bvs|bvc|bhi|bls|bge|blt|bgt|ble)\s+)0x([0-9a-f]+)(?P<suffix>\b)'
 )
+# Literal-pool reference: `<insn> [pc, #N] ... @ 0xADDR`. Match only
+# PC-relative loads (`ldr*`) so we don't dereference objdump's
+# immediate-value glosses (`@ 0xff` etc.) which use the same `@ 0xN`
+# syntax but aren't pool addresses.
+litpool_re = re.compile(
+    r'(?P<head>\b(?:ldr|ldrh|ldrsh|ldrsb|ldrb|ldrd|ldfs|ldfd)\b[^\n]*?\[pc,\s*#-?\d+\][^\n]*?@\s+)0x(?P<addr>[0-9a-f]+)(?P<tail>\b)'
+)
+# Other `@ 0xADDR` comments — branch-target annotations on
+# conditional branches etc.; we only add a `<symbol>` lookup, not a
+# dereference, since the address itself is the target.
 comment_re = re.compile(r'(@\s+)0x([0-9a-f]+)(\b)')
 
 addr_line_re = re.compile(r'^\s+([0-9a-f]+):\s')
@@ -126,6 +150,21 @@ with open(raw_path) as fin, open(out_path, 'w') as fout:
                 return mm.group(0)
             return f'{mm.group("prefix")}0x{mm.group(2)} <{name}>{mm.group("suffix")}'
 
+        # Literal-pool dereference: replace `@ 0xADDR` (under a PC-rel
+        # `ldr*`) with `@ 0xADDR = 0xVALUE <symbol>` so each LDR shows
+        # both the pool slot and what's in it. No `<symbol>` if the
+        # value isn't a known symbol.
+        def sub_litpool(mm):
+            a = int(mm.group('addr'), 16)
+            v = read_word(a)
+            if v is None:
+                return mm.group(0)
+            value_sym = syms.get(v)
+            tail = f' = {v:#010x}'
+            if value_sym is not None:
+                tail += f' <{value_sym}>'
+            return f'{mm.group("head")}0x{mm.group("addr")}{tail}{mm.group("tail")}'
+
         def sub_comment(mm):
             a = int(mm.group(2), 16)
             name = syms.get(a)
@@ -134,6 +173,10 @@ with open(raw_path) as fin, open(out_path, 'w') as fout:
             return f'{mm.group(1)}0x{mm.group(2)} <{name}>{mm.group(3)}'
 
         line = target_re.sub(sub_target, line)
+        # Dereference literal-pool refs first; the replaced fragment no
+        # longer matches `comment_re` because the `@ 0xADDR` is now
+        # followed by ` = 0x...`.
+        line = litpool_re.sub(sub_litpool, line)
         line = comment_re.sub(sub_comment, line)
         fout.write(line)
 

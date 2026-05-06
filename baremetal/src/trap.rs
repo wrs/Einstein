@@ -1381,6 +1381,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::FPE_ENTRY_PROBE_HVC_IMM => {
             handle_fpe_entry_probe(ctx);
         }
+        v if v == crate::rom_patches::TASK_SWITCH_PROBE_HVC_IMM => {
+            handle_task_switch_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -2970,6 +2973,50 @@ fn handle_dah_or_chain_probe(ctx: &mut TrapContext) {
     // 0x393954 = 0x0C100FF8 (the address of `gCurrentTask`). Write low
     // 32 bits of ctx.x[1].
     ctx.x[1] = (ctx.x[1] & 0xFFFF_FFFF_0000_0000) | (g_current_task_va as u64);
+}
+
+/// Task-switch save-area probe (iter-105). Fires on the kernel's
+/// patched `add r0, r0, #16` at PC `0x003ad9a4`, which sits in the
+/// task-restore epilog after `bl SwapInGlobals`. At this point r0 = r4
+/// = the incoming `gCurrentTask` (the task whose registers and
+/// `movs pc, lr` are about to run); we treat the previous fire's
+/// incoming as the outgoing for this switch.
+///
+/// Each fire logs a one-line summary of the outgoing and incoming
+/// task's `TTaskSavedContext` and flags any bit-0 in saved_pc or T-bit
+/// in saved_spsr — Newton 2.x is pure ARM, so either is the iter-105
+/// PC=0/T=1 corruption we're hunting. The handler then emulates
+/// `add r0, r0, #16` so the natural ERET resumes the kernel at
+/// 0x003ad9a8 unchanged.
+fn handle_task_switch_probe(ctx: &mut TrapContext) {
+    // r4 holds the incoming task (mov r4, r0 at 0x3ad998, preserved
+    // across `bl SwapInGlobals` per APCS).
+    let incoming = ctx.x[4] as u32;
+
+    // Track the previous-fire incoming as the outgoing for this switch.
+    static PREV_INCOMING: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+    let outgoing = PREV_INCOMING.swap(
+        incoming,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+
+    static FIRED: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+    let n = FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+    kprintln!("task-switch[{}]:", n);
+    if outgoing != 0 {
+        crate::task_dump::dump_task_save_oneline("out", outgoing);
+    } else {
+        kprintln!("  task[out] (first switch — no prior incoming)");
+    }
+    crate::task_dump::dump_task_save_oneline("in ", incoming);
+
+    // Emulate `add r0, r0, #16`. Preserve high 32 bits of x0 the same
+    // way other AArch32-emulation handlers in this file do.
+    ctx.x[0] = (ctx.x[0] & 0xFFFF_FFFF_0000_0000)
+        | ((ctx.x[0] as u32).wrapping_add(0x10) as u64);
 }
 
 fn handle_diag(ctx: &mut TrapContext) {

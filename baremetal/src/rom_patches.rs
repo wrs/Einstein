@@ -663,6 +663,35 @@ pub const FPE_ENTRY_PROBE_HVC_IMM: u32 = 0x80;
 pub const FPE_ENTRY_PROBE_PC:      u32 = 0x0038_D918;
 const FPE_ENTRY_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
 
+/// Iter-105 task-switch probe. The kernel's task-restore tail at
+/// `0x003ad9a0..0x003ada6c` (entered from the SWI / IRQ epilog) loads
+/// the new TTask from `gCurrentTask`, then walks its `TTaskSavedContext`
+/// to restore registers and finally `movs pc, lr` to the saved PC. We
+/// patch the `add r0, r0, #16` at `0x003ad9a4` (the instruction that
+/// converts the TTask base pointer into a pointer to the save area)
+/// with an HVC. By that point in the epilog `r4` has been set to the
+/// incoming `gCurrentTask` (mov r4, r0 at 0x3ad998) and survives the
+/// preceding `bl SwapInGlobals` (APCS callee-saved). The handler:
+///
+///   1. Reads `r4` — the incoming task VA.
+///   2. Looks up the previous-fire incoming (= the outgoing for this
+///      switch) from a static slot.
+///   3. Logs both via `task_dump::dump_task_save_oneline`, which
+///      flags any save_pc with bit-0 set or save_spsr with T-bit set
+///      (Newton 2.x is pure ARM; either is corruption).
+///   4. Updates the static slot to the new incoming.
+///   5. Emulates the original `add r0, r0, #16` so natural ERET to
+///      `0x003ad9a8` resumes the kernel with `r0 = task_va + 16`.
+///
+/// This catches the iter-105 wild-branch hypothesis directly: if some
+/// task's save area was scribbled with a corrupt SPSR (e.g., 0x330 =
+/// USR + T + A + E) or saved_pc=0x1, the next time it's scheduled in
+/// the log will flag it before the kernel's `movs pc, lr` ERETs into
+/// PC=0 with T=1.
+pub const TASK_SWITCH_PROBE_HVC_IMM: u32 = 0x88;
+pub const TASK_SWITCH_PROBE_PC:      u32 = 0x003A_D9A4;
+const TASK_SWITCH_PROBE_INSN:        u32 = 0xE280_0010; // add r0, r0, #16
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -899,6 +928,18 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(FPE_ENTRY_PROBE_HVC_IMM),
             "FP_UndefHandlers_Start mov ip, sp (FPE bypass)",
             FPE_ENTRY_PROBE_HVC_IMM,
+        );
+        // Iter-105 task-switch probe at 0x003ad9a4 — see the constant's
+        // doc comment for the rationale. Logs incoming + outgoing task's
+        // save area on every task switch to catch a corrupt
+        // saved_pc / saved_spsr the moment the kernel installs it.
+        patch_probe(
+            rom_ptr,
+            TASK_SWITCH_PROBE_PC,
+            TASK_SWITCH_PROBE_INSN,
+            hvc_insn(TASK_SWITCH_PROBE_HVC_IMM),
+            "task-switch save-area probe (add r0, r0, #16)",
+            TASK_SWITCH_PROBE_HVC_IMM,
         );
     }
 }

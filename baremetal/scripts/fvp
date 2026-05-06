@@ -123,6 +123,19 @@ docker_args=(
     -w /work
 )
 
+# Bind-mount each snapshot ring file individually if it exists on the
+# host, so semihosting opens of `/tmp/newton-snapshot-{0..3}.bin` (the
+# `SLOT_PATHS` in `src/snapshot.rs`) resolve against the same files
+# QEMU uses. Mounting all of /tmp would clobber the container's own
+# /tmp/cca-stack/ where the FVP binary lives; per-file mounts leave
+# the rest of the container's /tmp intact.
+for slot in 0 1 2 3; do
+    snap="/tmp/newton-snapshot-${slot}.bin"
+    if [[ -f "$snap" ]]; then
+        docker_args+=(-v "${snap}:${snap}")
+    fi
+done
+
 # When tarmac logging is active, cap the container's per-process file
 # size to FVP_TARMAC_MAX bytes (default 1 GiB). A run-away TarmacTrace
 # plugin otherwise silently fills the host disk — an 11.6 GB log from a

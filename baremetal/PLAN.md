@@ -62,38 +62,67 @@ Notes from the diagnostic dump:
   trampoline got tricked into firing through a wild branch
   to VA 0x4 (the UND vector).
 
-Investigation order for iter-105:
+Diagnostic progress so far:
 
-1. **Trace what TaskKillSelf does in our boot.** It issues
-   `svc 0` (= GetPortInfo) then `svc 0x1B` (MonitorDispatchSWI
-   to kill the task). On a real Newton, `svc 0x1B` switches to a
-   different task and the killed task is reaped — never returns.
-   In our boot it presumably returns (we don't model
-   MonitorDispatch's task-switching) and the kernel falls into
-   the `DebuggerUND "Task did not kill self properly!!"` debug
-   stub at 0x003943c8 — but we don't see that string in the log
-   either, so the divergence is even earlier.
-2. **Distinguish "real UND at PC=0" from "wild branch to VA 0x4
-   landing in the UND trampoline".** Add a one-shot log to the
-   UND-vector trampoline (or to `handle_und`) printing
-   `lr_und`, `spsr_und`, and the *original* mode bits (read from
-   ELR_EL2 / SPSR_EL2 at HVC entry, not from the saved slot the
-   trampoline writes). If `lr_und=0x4` and the source mode bits
-   in SPSR_EL2 don't match `spsr_und`, the trampoline was
-   re-entered through a non-UND path.
-3. **If it really is a reset jump:** extend `handle_und` to
-   recognise a USR-mode UND at PC=0 with the legitimate
-   `B BootOS` word as a soft-reset request and route into
-   `handle_bootos_canary`'s second-entry path so the wedge dump
-   names the cause properly.
-4. **If it's a wild branch:** the LR_usr→TaskKillSelf patch slot
-   says the caller was somewhere that BL'd to TaskKillSelf. Walk
-   ROM xrefs to that patch slot (`bl 0x01bdde84` or `b 0x01bdde84`)
-   and instrument the call sites to find which one fires last
-   before the wedge.
+- `handle_und` now logs every UND whose source CPSR has T=1
+  ("thumb-und" prefix), with full register file. The first such
+  UND IS the wedge; nothing earlier flips T.
+- `SPSR_svc=0x310` (T=0) at the wedge → the kernel's last
+  `movs pc, lr` from the SWI tail returned to ARM-mode user code.
+  The interworking happened *afterwards*, in user code itself —
+  not in the SVC return path.
+- `MonitorEntryGlue` (0x394318)'s `mov pc, r3` is NOT the source.
+  A removed-since probe at 0x00394360 logged every indirect call
+  for ~345 invocations; r3 was always a valid even-aligned
+  function pointer (0x01b15ae4, 0x01b05288, 0x003860fc, 0x01afffb0).
+- LR_usr=0x01bdde84 at the wedge matches the patch-table entry
+  for TaskKillSelf, but `bl 0x01bdde84` would set
+  LR_usr=0x01bdde88. The actual BL was at PC=0x01bdde80
+  (TaskGiveObject's patch entry → main-ROM B 0x002596f0 →
+  GenericSWI svc 5 path). Whatever wild-branched is much later
+  than that BL — LR_usr just hasn't been overwritten since.
+- Function tracer (`--features trace`) doesn't reach this wedge:
+  it trips an earlier instruction-abort wedge at PC=0x6c343100
+  (FIQ mode) caused by the trampoline pool layout.
 
-The iter-99/101/104 byteswap stubs and the iter-103 VA-space
-classifier rework remain in place; both are working as intended.
+Next investigation steps:
+
+1. **Find what set T=1.** The wedge has user CPSR.T=1 with
+   PC=0. ARMv7 instructions that can set T-bit from USR:
+   - `BX Rm`, `BLX Rm` with Rm bit 0 = 1
+   - `ldr pc, [...]` with loaded value bit 0 = 1
+   - `pop {pc}` / `ldmfd …, {…, pc}` with popped value bit 0 = 1
+   - `mov pc, Rm` (ARMv7+ interworks)
+   - `BLX <imm>` (always sets T=1)
+   None of the registers at the wedge dump hold 1 (r0..r15 all
+   shown), so the wild value was written to a register and then
+   modified after the branch — most likely a `pop {pc}` /
+   `ldr pc, [...]` whose source memory contained 0x1.
+2. **Probe the SWI 5 (GenericSWI) handler.** The last BL the user
+   did was to TaskGiveObject's patch entry, which routes through
+   GenericSWI. Add a probe at the SWI 5 dispatch tail (0x3adb_xx,
+   the `ldm r1, {r1, r2, r3}` at 0x3adbec / `b 0x3ad750`) that
+   logs the user task's saved CPSR + saved PC just before the
+   movs-to-USR. If a different task gets scheduled in with a
+   T=1-tainted saved CPSR that's the smoking gun, even though
+   the LAST movs-to-USR didn't have T=1.
+3. **Carve out a tarmac window on QEMU.** We can't use the
+   FVP-bound TarmacTrace plugin, but we *could* enable QEMU's
+   `-d in_asm` in `scripts/run-qemu.sh` for a focused window
+   gated by an EL2 emit_start at the SWI 5 → MonitorDispatch
+   chain. Heavy but exhaustive.
+4. **Investigate the `r12=0` clue.** APCS uses R12 (IP) as the
+   function-pointer scratch register for vtable-style calls. In
+   the wedge dump R12=0 — possibly because a call sequence did
+   `mov ip, <vtable_slot>; bx ip`, and the slot held 1 (Thumb-
+   tagged null pointer). Check vtables of TObjectManager (whose
+   MonitorProc was the last r3 we saw) for any uninitialised
+   slots.
+
+The iter-99/101/104 byteswap stubs, the iter-103 VA-space
+classifier rework, and the iter-105 snapshot-revival fix all
+remain in place; everything is working as intended up to the
+wild-branch wedge.
 
 ### Iteration 103: VA-space classifier walker
 

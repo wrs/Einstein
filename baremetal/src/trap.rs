@@ -198,6 +198,43 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
         );
     }
 
+    // iter-105: catch the first sync trap from a guest in Thumb mode.
+    // Newton 2.x is pure ARM; T=1 in SPSR_EL2 means an interworking
+    // branch (BX, BLX, mov pc/Rm with ARMv7+ semantics, ldr pc, pop pc)
+    // landed with a Thumb-bit-set target. Logging the first such trap
+    // pins the wild-branch event close to its source.
+    {
+        let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+        if (spsr_el2 & 0x20) != 0 {
+            static mut THUMB_LOGGED: bool = false;
+            // SAFETY: single-threaded.
+            let first = unsafe {
+                let was = THUMB_LOGGED;
+                THUMB_LOGGED = true;
+                !was
+            };
+            if first {
+                let elr = read_sysreg!("elr_el2");
+                let far = read_sysreg!("far_el1");
+                kprintln!(
+                    "thumb-source: first sync trap with SPSR_EL2.T=1 — \
+                     ELR={:#x} SPSR={:#010x} FAR={:#x} EC={:#x} ({})",
+                    elr, spsr_el2, far, ec, describe_ec(ec),
+                );
+                kprintln!(
+                    "thumb-source:   r0..r7:   {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+                    ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
+                    ctx.x[4] as u32, ctx.x[5] as u32, ctx.x[6] as u32, ctx.x[7] as u32,
+                );
+                kprintln!(
+                    "thumb-source:   r8..r15:  {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+                    ctx.x[8] as u32, ctx.x[9] as u32, ctx.x[10] as u32, ctx.x[11] as u32,
+                    ctx.x[12] as u32, ctx.x[13] as u32, ctx.x[14] as u32, ctx.x[15] as u32,
+                );
+            }
+        }
+    }
+
     match ec {
         EC_DATA_ABORT_LOWER => handle_data_abort(ctx, iss),
         EC_INSN_ABORT_LOWER => handle_instruction_abort(ctx, iss),
@@ -1622,6 +1659,59 @@ fn handle_und(ctx: &mut TrapContext) {
     };
 
     record_und_history(faulting_pc, insn, spsr_und as u32, ctx);
+
+    // iter-105: catch the first UND that came from a Thumb-mode source.
+    // Newton 2.x doesn't use Thumb anywhere, so SPSR_und.T=1 means an
+    // interworking branch (BX, BLX, ARMv7+ `mov pc, Rm`, ldr pc / pop pc)
+    // landed with bit 0 set. Logging the first such UND pins the
+    // wild-branch event close to its source — and more importantly, dumps
+    // every register at the moment the CPU vectored to UND, so we can
+    // see what r0..r12, SP_usr, LR_usr looked like.
+    if (spsr_und as u32) & 0x20 != 0 {
+        static mut THUMB_UND_LOGGED: bool = false;
+        // SAFETY: single-threaded.
+        let first = unsafe {
+            let was = THUMB_UND_LOGGED;
+            THUMB_UND_LOGGED = true;
+            !was
+        };
+        if first {
+            kprintln!(
+                "thumb-und: first UND with SPSR_und.T=1 — \
+                 PC={:#x} insn={:#010x} SPSR_und={:#010x} mode={:#x}",
+                faulting_pc, insn, spsr_und as u32, (spsr_und as u32) & 0x1F,
+            );
+            kprintln!(
+                "thumb-und:   r0..r7:   {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+                ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
+                ctx.x[4] as u32, ctx.x[5] as u32, ctx.x[6] as u32, ctx.x[7] as u32,
+            );
+            kprintln!(
+                "thumb-und:   r8..r15:  {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+                ctx.x[8] as u32, ctx.x[9] as u32, ctx.x[10] as u32, ctx.x[11] as u32,
+                ctx.x[12] as u32, ctx.x[13] as u32, ctx.x[14] as u32, ctx.x[15] as u32,
+            );
+            // x[18..23] are AArch32 banked SP/LR/SPSR per Table D1-79.
+            // Also dump the SPSR_svc / SPSR_und register file so we can
+            // tell whether a recent SWI tail's `movs pc, lr` was the
+            // wild-branch source.
+            let sp_usr = ctx.x[13] as u32;
+            let lr_usr = ctx.x[14] as u32;
+            let sp_svc = ctx.x[19] as u32;
+            let lr_svc = ctx.x[18] as u32;
+            let sp_und = ctx.x[23] as u32;
+            let lr_und_reg = ctx.x[22] as u32;
+            let spsr_svc = read_sysreg!("spsr_el1") as u32;
+            kprintln!(
+                "thumb-und:   SP_usr={:#010x} LR_usr={:#010x}  SP_svc={:#010x} LR_svc={:#010x} SPSR_svc={:#010x}",
+                sp_usr, lr_usr, sp_svc, lr_svc, spsr_svc,
+            );
+            kprintln!(
+                "thumb-und:   SP_und={:#010x} LR_und={:#010x}",
+                sp_und, lr_und_reg,
+            );
+        }
+    }
 
     // StrongARM CP15 clock-control write (MCR p15, 0, Rt, c15, c1, 2).
     // ARMv8 doesn't define that register, so the instruction raises UND

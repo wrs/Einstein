@@ -185,17 +185,34 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
 
     static mut TRAP_LOG_BUDGET: usize = 500;
     // SAFETY: single-threaded; only core 0 services EL2 traps.
-    let should_log = !is_trace_hvc && unsafe {
-        let go = TRAP_LOG_BUDGET > 0;
-        if go { TRAP_LOG_BUDGET -= 1; }
-        go
-    };
+    // `trap_trace_armed()` overrides the budget so iter-105 can capture
+    // every trap from the moment drvr is scheduled in through the wedge.
+    let should_log = !is_trace_hvc
+        && (trap_trace_armed() || unsafe {
+            let go = TRAP_LOG_BUDGET > 0;
+            if go { TRAP_LOG_BUDGET -= 1; }
+            go
+        });
     if should_log {
         let elr = read_sysreg!("elr_el2");
+        let spsr = read_sysreg!("spsr_el2");
+        let far = read_sysreg!("far_el1");
         kprintln!(
-            "trap: EC={:#x} ({}) ELR={:#x} ESR={:#x}",
-            ec, describe_ec(ec), elr, esr
+            "trap: EC={:#x} ({}) ELR={:#x} SPSR={:#010x} FAR={:#x} ESR={:#x}",
+            ec, describe_ec(ec), elr, spsr, far, esr
         );
+        if trap_trace_armed() {
+            kprintln!(
+                "  r0..r7  = {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+                ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
+                ctx.x[4] as u32, ctx.x[5] as u32, ctx.x[6] as u32, ctx.x[7] as u32,
+            );
+            kprintln!(
+                "  r8..r14 = {:08x} {:08x} {:08x} {:08x} {:08x} sp_usr={:08x} lr_usr={:08x}",
+                ctx.x[8] as u32, ctx.x[9] as u32, ctx.x[10] as u32, ctx.x[11] as u32,
+                ctx.x[12] as u32, ctx.x[13] as u32, ctx.x[14] as u32,
+            );
+        }
     }
 
     // iter-105: catch the first sync trap from a guest in Thumb mode.
@@ -341,10 +358,14 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     static mut HB_IRQ_COUNT: u64 = 0;
     const HB_LATE_STRIDE: u64 = 64;
     let elr = read_sysreg!("elr_el2");
-    // SAFETY: single-threaded.
+    // SAFETY: single-threaded. `trap_trace_armed()` overrides the
+    // budget/stride so iter-105 captures every IRQ between drvr's
+    // task-switch arming and the wedge UND.
     let (should_log, tag) = unsafe {
         HB_IRQ_COUNT += 1;
-        if HB_FIRST_BUDGET > 0 && elr != HB_LAST_PC {
+        if trap_trace_armed() {
+            (true, "armed")
+        } else if HB_FIRST_BUDGET > 0 && elr != HB_LAST_PC {
             HB_LAST_PC = elr;
             HB_FIRST_BUDGET -= 1;
             (true, "first")
@@ -2978,6 +2999,21 @@ fn handle_dah_or_chain_probe(ctx: &mut TrapContext) {
     ctx.x[1] = (ctx.x[1] & 0xFFFF_FFFF_0000_0000) | (g_current_task_va as u64);
 }
 
+/// Trap-trace arming flag (iter-105). When set, every sync trap and
+/// every IRQ entry forces a verbose log line — bypassing the
+/// `TRAP_LOG_BUDGET` budget. Used to capture the full trap sequence
+/// between an "incoming task is suspect" event (e.g. drvr being
+/// scheduled in) and the wedge UND, so we can see exactly what
+/// happens during the kernel's ERET to the user and any
+/// immediately-following user-mode fault.
+pub static TRAP_TRACE_ARMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+pub fn trap_trace_armed() -> bool {
+    TRAP_TRACE_ARMED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Task-switch save-area probe (iter-105). Fires on the kernel's
 /// patched `add r0, r0, #16` at PC `0x003ad9a4`, which sits in the
 /// task-restore epilog after `bl SwapInGlobals`. At this point r0 = r4
@@ -2991,6 +3027,10 @@ fn handle_dah_or_chain_probe(ctx: &mut TrapContext) {
 /// PC=0/T=1 corruption we're hunting. The handler then emulates
 /// `add r0, r0, #16` so the natural ERET resumes the kernel at
 /// 0x003ad9a8 unchanged.
+///
+/// Also: when the incoming task's name is "drvr", arm `TRAP_TRACE_ARMED`
+/// so every subsequent sync trap and IRQ logs verbosely — pinning the
+/// wedge sequence between drvr's first ERET and the PC=0/T=1 UND.
 fn handle_task_switch_probe(ctx: &mut TrapContext) {
     // r4 holds the incoming task (mov r4, r0 at 0x3ad998, preserved
     // across `bl SwapInGlobals` per APCS).
@@ -3015,6 +3055,30 @@ fn handle_task_switch_probe(ctx: &mut TrapContext) {
         kprintln!("  task[out] (first switch — no prior incoming)");
     }
     crate::task_dump::dump_task_save_oneline("in ", incoming);
+
+    // Arm verbose trap tracing when the incoming task is named "drvr".
+    // Newton's TT_GLOBALS sits at task_va + 0xa0 and points just past
+    // the per-task globals struct; `find_task_name` scans the 128
+    // bytes below it for a printable fourcc.
+    if !trap_trace_armed() {
+        let glob = crate::guest_endian::guest_read_u32_va(incoming.wrapping_add(0xa0))
+            .unwrap_or(0);
+        if let Some((_, v)) = crate::task_dump::find_task_name(glob) {
+            let bytes = [
+                (v >> 24) as u8,
+                (v >> 16) as u8,
+                (v >> 8)  as u8,
+                v          as u8,
+            ];
+            if &bytes == b"drvr" {
+                TRAP_TRACE_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
+                kprintln!(
+                    "*** trap-trace ARMED: drvr task incoming (task={:#010x}) ***",
+                    incoming,
+                );
+            }
+        }
+    }
 
     // Emulate `add r0, r0, #16`. Preserve high 32 bits of x0 the same
     // way other AArch32-emulation handlers in this file do.
@@ -3072,6 +3136,28 @@ fn handle_task_switch_pre_eret_probe(ctx: &mut TrapContext) {
     ctx.x[1]  = (ctx.x[1] & 0xFFFF_FFFF_0000_0000)  | (p1 as u64);
     ctx.x[2]  = (ctx.x[2] & 0xFFFF_FFFF_0000_0000)  | (p2 as u64);
     ctx.x[19] = (ctx.x[19] & 0xFFFF_FFFF_0000_0000) | (sp_svc.wrapping_add(12) as u64);
+
+    // When the trap-trace is armed (drvr is incoming), also dump the
+    // 4 instructions starting at the ERET target. If the bytes at
+    // saved_pc don't match the disasm, that pins the bug to a runtime
+    // patcher; if they match, the bug is in the ERET / fault path.
+    if trap_trace_armed() {
+        let target = lr_svc;
+        let read_target = |va: u32| -> u32 {
+            match crate::guest_mem::translate_va(va) {
+                Some(pa) => crate::guest_endian::guest_read_u32_pa(pa).unwrap_or(0xDEAD_BEEF),
+                None => 0xDEAD_BEEF,
+            }
+        };
+        let w0 = read_target(target);
+        let w1 = read_target(target.wrapping_add(4));
+        let w2 = read_target(target.wrapping_add(8));
+        let w3 = read_target(target.wrapping_add(12));
+        kprintln!(
+            "  insn @ saved_pc {:#010x} = {:08x} {:08x} {:08x} {:08x}",
+            target, w0, w1, w2, w3,
+        );
+    }
 }
 
 fn handle_diag(ctx: &mut TrapContext) {

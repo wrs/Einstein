@@ -126,7 +126,7 @@ fn walk_queue(prio: u32, queue_va: u32) {
 /// the name is somewhere just below `globals_va`. Scan the 128 bytes
 /// below it for a printable 4-char tag and return the offset + value
 /// of the first hit (None if none found).
-fn find_task_name(globals_va: u32) -> Option<(i32, u32)> {
+pub fn find_task_name(globals_va: u32) -> Option<(i32, u32)> {
     if globals_va == 0 || globals_va == u32::MAX {
         return None;
     }

@@ -965,10 +965,20 @@ pub fn dump_task_save_oneline(label: &str, task_va: u32) {
         Some((_, v)) => ((v>>24) as u8, (v>>16) as u8, (v>>8) as u8, v as u8),
         None         => (b'?', b'?', b'?', b'?'),
     };
-    let saved_pc   = rd(task_va + 0x4c).unwrap_or(u32::MAX);
-    let saved_spsr = rd(task_va + 0x50).unwrap_or(u32::MAX);
+    let saved_r0   = rd(task_va + 0x10).unwrap_or(u32::MAX);
+    let saved_r1   = rd(task_va + 0x14).unwrap_or(u32::MAX);
+    let saved_r2   = rd(task_va + 0x18).unwrap_or(u32::MAX);
+    let saved_r3   = rd(task_va + 0x1c).unwrap_or(u32::MAX);
+    let saved_r4   = rd(task_va + 0x20).unwrap_or(u32::MAX);
+    let saved_r5   = rd(task_va + 0x24).unwrap_or(u32::MAX);
+    let saved_r6   = rd(task_va + 0x28).unwrap_or(u32::MAX);
+    let saved_r7   = rd(task_va + 0x2c).unwrap_or(u32::MAX);
+    let saved_r8   = rd(task_va + 0x30).unwrap_or(u32::MAX);
+    let saved_r12  = rd(task_va + 0x40).unwrap_or(u32::MAX);
     let sp_usr     = rd(task_va + 0x44).unwrap_or(u32::MAX);
     let lr_usr     = rd(task_va + 0x48).unwrap_or(u32::MAX);
+    let saved_pc   = rd(task_va + 0x4c).unwrap_or(u32::MAX);
+    let saved_spsr = rd(task_va + 0x50).unwrap_or(u32::MAX);
     let suspicious =
         (saved_pc & 1) != 0 || (saved_spsr & 0x20) != 0;
     kprintln!(
@@ -977,6 +987,15 @@ pub fn dump_task_save_oneline(label: &str, task_va: u32) {
         n0 as char, n1 as char, n2 as char, n3 as char,
         saved_pc, saved_spsr, sp_usr, lr_usr,
         if suspicious { "  *** CORRUPT (T-bit or bit-0) ***" } else { "" },
+    );
+    kprintln!(
+        "    saved r0..r7 = {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+        saved_r0, saved_r1, saved_r2, saved_r3,
+        saved_r4, saved_r5, saved_r6, saved_r7,
+    );
+    kprintln!(
+        "    saved r8={:08x} r12={:08x}",
+        saved_r8, saved_r12,
     );
 }
 

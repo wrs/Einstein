@@ -1384,6 +1384,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::TASK_SWITCH_PROBE_HVC_IMM => {
             handle_task_switch_probe(ctx);
         }
+        v if v == crate::rom_patches::TASK_SWITCH_PRE_ERET_HVC_IMM => {
+            handle_task_switch_pre_eret_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -3017,6 +3020,58 @@ fn handle_task_switch_probe(ctx: &mut TrapContext) {
     // way other AArch32-emulation handlers in this file do.
     ctx.x[0] = (ctx.x[0] & 0xFFFF_FFFF_0000_0000)
         | ((ctx.x[0] as u32).wrapping_add(0x10) as u64);
+}
+
+/// Pre-ERET probe (iter-105). Fires on the patched `pop {r0, r1, r2}`
+/// at 0x003ada68 — the very last instruction before the kernel's
+/// `movs pc, lr` at 0x003ada6c. At this point lr_svc holds the saved_pc
+/// the kernel will jump to and SPSR_EL1 (= AArch32 SPSR_svc) holds the
+/// new CPSR for the user. Logs both, plus the popped r0/r1/r2 (which
+/// become the user's r0..r2 on ERET). Then emulates the pop so natural
+/// ERET continues into the `movs pc, lr` at PC+4 unchanged.
+fn handle_task_switch_pre_eret_probe(ctx: &mut TrapContext) {
+    // SVC banked regs per Table D1-79: ctx.x[18] = LR_svc, x[19] = SP_svc.
+    let lr_svc = ctx.x[18] as u32;
+    let sp_svc = ctx.x[19] as u32;
+    let spsr_svc = read_sysreg!("spsr_el1") as u32;
+
+    // Read the 3 words about to be popped from the SVC stack via the
+    // guest stage-1 walker — same path the diagnostic dumps use, so it
+    // resolves SVC mappings even though we're at EL2.
+    let read_va = |va: u32| -> u32 {
+        match crate::guest_mem::translate_va(va) {
+            Some(pa) => crate::guest_endian::guest_read_u32_pa(pa).unwrap_or(0xDEAD_BEEF),
+            None => 0xDEAD_BEEF,
+        }
+    };
+    let p0 = read_va(sp_svc);
+    let p1 = read_va(sp_svc.wrapping_add(4));
+    let p2 = read_va(sp_svc.wrapping_add(8));
+
+    static FIRED: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+    let n = FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+    // The bug we're chasing produces lr_svc with bit-0 set or spsr_svc
+    // with the T-bit set; flag those loudly. The routine fires once per
+    // task switch (~826 times before the wedge), so the flag is what
+    // makes the smoking gun easy to spot in the log tail.
+    let suspicious = (lr_svc & 1) != 0 || (spsr_svc & 0x20) != 0;
+    kprintln!(
+        "task-eret[{}]: lr_svc={:#010x} spsr_svc={:#010x} sp_svc={:#010x} pop=[{:#010x}, {:#010x}, {:#010x}]{}",
+        n, lr_svc, spsr_svc, sp_svc, p0, p1, p2,
+        if suspicious { "  *** CORRUPT (T-bit or bit-0) ***" } else { "" },
+    );
+
+    // Emulate `pop {r0, r1, r2}` (= `ldmfd sp!, {r0, r1, r2}`):
+    //   r0 := [sp_svc + 0]
+    //   r1 := [sp_svc + 4]
+    //   r2 := [sp_svc + 8]
+    //   sp_svc += 12
+    ctx.x[0]  = (ctx.x[0] & 0xFFFF_FFFF_0000_0000)  | (p0 as u64);
+    ctx.x[1]  = (ctx.x[1] & 0xFFFF_FFFF_0000_0000)  | (p1 as u64);
+    ctx.x[2]  = (ctx.x[2] & 0xFFFF_FFFF_0000_0000)  | (p2 as u64);
+    ctx.x[19] = (ctx.x[19] & 0xFFFF_FFFF_0000_0000) | (sp_svc.wrapping_add(12) as u64);
 }
 
 fn handle_diag(ctx: &mut TrapContext) {

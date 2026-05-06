@@ -692,6 +692,18 @@ pub const TASK_SWITCH_PROBE_HVC_IMM: u32 = 0x88;
 pub const TASK_SWITCH_PROBE_PC:      u32 = 0x003A_D9A4;
 const TASK_SWITCH_PROBE_INSN:        u32 = 0xE280_0010; // add r0, r0, #16
 
+/// Companion to the task-switch probe: a second HVC at 0x003ada68
+/// (the `pop {r0, r1, r2}` immediately before `movs pc, lr` at
+/// 0x003ada6c). At this point the kernel has its outgoing-ERET state
+/// fully prepared: `lr_svc` holds the saved_pc to ERET to and
+/// `spsr_svc` holds the new CPSR. The handler logs both, then emulates
+/// the pop so the kernel's natural ERET resumes unchanged. This pins
+/// down whether a wedge is "kernel installed wrong values" vs
+/// "hypervisor's ERET path mishandles correct values".
+pub const TASK_SWITCH_PRE_ERET_HVC_IMM: u32 = 0x89;
+pub const TASK_SWITCH_PRE_ERET_PC:      u32 = 0x003A_DA68;
+const TASK_SWITCH_PRE_ERET_INSN:        u32 = 0xE8BD_0007; // pop {r0, r1, r2}
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -940,6 +952,20 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(TASK_SWITCH_PROBE_HVC_IMM),
             "task-switch save-area probe (add r0, r0, #16)",
             TASK_SWITCH_PROBE_HVC_IMM,
+        );
+        // Iter-105 pre-ERET probe at 0x003ada68 — the `pop {r0, r1, r2}`
+        // right before the `movs pc, lr` at 0x003ada6c. Captures exact
+        // lr_svc / spsr_svc at the moment of ERET so we can compare
+        // against the in-memory saved_pc / saved_spsr from the
+        // task-switch probe and tell whether the kernel's intent
+        // matches what actually gets ERET'd.
+        patch_probe(
+            rom_ptr,
+            TASK_SWITCH_PRE_ERET_PC,
+            TASK_SWITCH_PRE_ERET_INSN,
+            hvc_insn(TASK_SWITCH_PRE_ERET_HVC_IMM),
+            "task-switch pre-ERET probe (pop {r0, r1, r2})",
+            TASK_SWITCH_PRE_ERET_HVC_IMM,
         );
     }
 }

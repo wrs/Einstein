@@ -92,7 +92,6 @@ pub fn ic_ivau(va: u64) {
 /// hard-coded to 64 bytes — the value for both A53 and AEMvA. (If we
 /// ever target a part with a different `CTR_EL0.IminLine`, query CTR
 /// for line size instead.)
-#[cfg(nh_guest_test)]
 pub fn icache_publish_range(va: u64, len: usize) {
     const LINE: u64 = 64;
     let start = va & !(LINE - 1);

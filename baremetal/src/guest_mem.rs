@@ -2292,6 +2292,29 @@ unsafe fn patch_und_vector(rom: *mut u32) {
         write_rom_data_word(rom, pt + 8, crate::trap::HYP_TRAMP_SCRATCH_BASE);
         write_rom_data_word(rom, pt + 9, 0xDEAD_C0DE);
     }
+
+    // Publish the freshly-installed code to the AArch32 instruction
+    // fetch path. `write_rom_code_word` writes through Normal-WB into
+    // EL2's D-cache; on Cortex-A53 / AEMv8-A the I-cache is non-
+    // coherent, so without a `DC CVAU; DSB ISH; IC IVAU; DSB ISH; ISB`
+    // sequence the kernel's first UND can cold-fetch stale memory
+    // bytes (= the original ROM contents at these high addresses,
+    // which the classifier marks as data and the loader leaves in
+    // BE-natural form). That makes the FPA bypass stub silently
+    // execute garbage and fall through into UND_TRAMP, defeating the
+    // whole point of the in-ROM bypass. The range below covers the
+    // UND vector word at IPA 0x04, the ROM-offset-0x80 trampoline
+    // body, the FPA bypass stub, UND_TRAMP, the SBA pre-fault stub,
+    // SBA post-emulation trampoline, and UND_RETURN_STUB.
+    crate::cpu::icache_publish_range(
+        rom as u64 + 0x04,
+        0x100,
+    );
+    crate::cpu::icache_publish_range(
+        rom as u64 + FPA_BYPASS_STUB_OFFSET as u64,
+        // From FPA_BYPASS_STUB through the UND_RETURN_STUB literal.
+        0x140,
+    );
 }
 
 /// Scan the REx window (PA `start` .. `end`) for Einstein's

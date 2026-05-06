@@ -1885,25 +1885,43 @@ fn handle_und(ctx: &mut TrapContext) {
         _ if is_fpa_ctrl_reg_insn(insn) => {
             emulate_fpa_ctrl_reg(ctx, insn, faulting_pc, spsr_und);
         }
-        // FPA load/store/arithmetic UNDs are bypassed at the UND-vector
-        // level by `FPA_BYPASS_STUB_OFFSET` (see guest_mem.rs) — the
-        // stub at IPA 0x00FF_FEC0 detects FPA-class insns and branches
-        // directly to `FP_UndefHandlers_Start_JT` at 0x38d874 without
-        // entering EL2. SA-110 hardware delivered the UND to the
-        // kernel's FPE this way; our previous EL2 round-trip path
-        // (`forward_und_to_guest_fpe`) leaked enough state corruption
-        // to wedge the FPE's IP-preservation invariant on certain
-        // dispatch arms (iter-83/84/85). Reaching this arm now means
-        // the bypass stub didn't recognise the opcode as FPA — halt
-        // loudly so we can investigate.
+        // FPA load/store/arithmetic UNDs. The IPA-0x04 → bypass-stub
+        // path at `FPA_BYPASS_STUB_OFFSET` (see guest_mem.rs) was meant
+        // to catch these and `b FPE_JT` straight from UND mode without
+        // an EL2 round trip. Empirically the stub doesn't fire (every
+        // post-MMU FPA UND reaches handle_und via UND_TRAMP), and the
+        // halt-on-arrival behaviour from iter-83/84/85 era is now the
+        // boot stall. Replicate the bypass-stub semantics from EL2:
+        // ERET into UND mode at FPE_JT (= 0x0038_D874).
+        //
+        // SPSR_EL2 is left as the natural HVC-from-UND-mode capture,
+        // so the ERET drops back to AArch32 EL1 in UND mode. ELR_EL2
+        // overrides the post-HVC ELR (= UND_TRAMP base+22 = `b .`
+        // guard) with the FPE_JT entry. ctx.x[12] (= R12) was already
+        // restored from TPIDRURW at handle_und entry; ctx.x[22] (=
+        // R14_und) carries `faulting_pc + 4` from the trampoline's
+        // banked save, which is exactly what FPE_JT expects to find
+        // in LR_und so its `subs pc, lr, #4` epilog returns to the
+        // faulting site. The kernel's FPE then emulates the FPA insn
+        // and returns to source mode at faulting_pc+4 via `movs pc,
+        // lr` (the architectural movs-pc consumes SPSR_und, restoring
+        // the source-mode CPSR).
         _ if is_fpa_insn(insn) => {
-            kprintln!(
-                "*** FPA UND reached EL2 — bypass stub at 0x00FF_FEC0 \
-                 should have routed this directly to FPE_JT. \
-                 insn={:#010x} PC={:#x}",
-                insn, faulting_pc,
-            );
-            cpu::halt();
+            log_fpa_bypass_miss(faulting_pc, insn);
+            const FPE_JT_VA: u64 = 0x0038_D874;
+            // SAFETY: ELR_EL2 is the AArch64 system register that the
+            // sync-trap dispatcher's ERET stub will consume. SPSR_EL2
+            // is unchanged (still the AArch32-UND mode the HVC
+            // captured), so the ERET re-enters UND mode at FPE_JT.
+            unsafe {
+                core::arch::asm!(
+                    "msr elr_el2, {pc}",
+                    "isb",
+                    pc = in(reg) FPE_JT_VA,
+                    options(nostack, preserves_flags),
+                );
+            }
+            return;
         }
         _ => {
             // Stop the tarmac window before any further EL2 work runs
@@ -2039,6 +2057,29 @@ fn is_fpa_ctrl_reg_insn(insn: u32) -> bool {
 /// existing `is_fpa_ctrl_reg_insn` arm runs first and catches RFS/WFS/RFC/
 /// WFC as in-EL2 NOPs, so this returns true for those too but is harmless
 /// (the ctrl-reg arm matches earlier in the dispatch chain).
+/// FPA bypass-miss counter. The in-ROM `FPA_BYPASS_STUB_OFFSET` should
+/// catch every FPA-class UND and `b FPE_JT` directly without reaching
+/// EL2. Empirically (iter-107) the stub fires inconsistently — the
+/// classifier marks the high-ROM stub region as data, so the loader
+/// leaves bytes BE-natural and the AArch32 I-cache cold-fetches stale
+/// memory bytes for the stub site, falling through into UND_TRAMP and
+/// arriving here. Each miss is handled by EL2 ERETing into FPE_JT
+/// directly (option (b) per PLAN.md iter-107). The first 4 misses log;
+/// later misses bump the counter silently. A high count after a long
+/// boot is a sign the in-ROM bypass needs investigation.
+fn log_fpa_bypass_miss(faulting_pc: u32, insn: u32) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static FIRED: AtomicU32 = AtomicU32::new(0);
+    let n = FIRED.fetch_add(1, Ordering::Relaxed);
+    if n < 4 {
+        kprintln!(
+            "fpa-bypass-miss[{}]: insn={:#010x} faulting_pc={:#x} \
+             — EL2 redirects to FPE_JT",
+            n, insn, faulting_pc,
+        );
+    }
+}
+
 fn is_fpa_insn(insn: u32) -> bool {
     let cond = (insn >> 28) & 0xF;
     if cond == 0xF {

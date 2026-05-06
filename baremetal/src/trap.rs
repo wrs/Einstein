@@ -1743,6 +1743,20 @@ fn handle_und(ctx: &mut TrapContext) {
                 "thumb-und:   SP_und={:#010x} LR_und={:#010x}",
                 sp_und, lr_und_reg,
             );
+            // SCTLR_EL1.TE controls AArch32 exception entry T-bit:
+            // TE=0 → trampoline starts in ARM, TE=1 → in Thumb.
+            // If we're seeing SPSR_und.T=1 with TE=0, something is
+            // architecturally inconsistent.
+            let sctlr_el1: u64 = read_sysreg!("sctlr_el1");
+            let spsr_el2:  u64 = read_sysreg!("spsr_el2");
+            kprintln!(
+                "thumb-und:   SCTLR_EL1={:#010x} (TE={} EE={} M={}) SPSR_EL2={:#010x}",
+                sctlr_el1,
+                (sctlr_el1 >> 30) & 1,
+                (sctlr_el1 >> 25) & 1,
+                sctlr_el1 & 1,
+                spsr_el2,
+            );
         }
     }
 
@@ -3188,6 +3202,25 @@ fn handle_task_switch_pre_eret_probe(ctx: &mut TrapContext) {
         kprintln!(
             "  raw host-LE @ PA={:#010x}     = {:08x}",
             raw_lr_pa, raw,
+        );
+        // Dump SCTLR_EL1, HCR_EL2, and the AArch64 SPSR_EL2 we'll
+        // ERET with. SCTLR_EL1.TE (bit 30) controls the new T-bit
+        // on AArch32 exception entry; if it's 1 the kernel's UND
+        // trampoline runs in Thumb. SCTLR_EL1.EE (bit 25) is the
+        // exception-entry endianness. HCR_EL2 reveals our trap
+        // configuration. SPSR_EL2 is what the natural ERET back
+        // to the kernel will consume.
+        let sctlr_el1: u64 = read_sysreg!("sctlr_el1");
+        let hcr_el2:   u64 = read_sysreg!("hcr_el2");
+        let spsr_el2:  u64 = read_sysreg!("spsr_el2");
+        kprintln!(
+            "  SCTLR_EL1={:#010x} (TE={} EE={} M={}) HCR_EL2={:#010x} SPSR_EL2={:#010x}",
+            sctlr_el1,
+            (sctlr_el1 >> 30) & 1,
+            (sctlr_el1 >> 25) & 1,
+            sctlr_el1 & 1,
+            hcr_el2,
+            spsr_el2,
         );
     }
 }

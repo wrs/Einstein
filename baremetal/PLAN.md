@@ -61,72 +61,54 @@ diagnostic probes still active runs much slower per kernel-second,
 so reaching the same point will take significantly longer wall
 clock.
 
-**Next (iter-108):**
+**Next (iter-109):**
 
-iter-107 closed (commit `f66bd0a9`). Investigation overturned the
-SCTLR.V hypothesis — empirically `SCTLR.V` stays 0 throughout
-boot, so the kernel uses **low** vectors and our bypass stub at
-IPA 0x00FF_FEC0 IS the right install site. Real cause of the
-bypass-stub miss: cache coherence. `write_rom_code_word` stores
-into EL2's D-cache via Normal-WB; on Cortex-A53 / AEMv8-A the
-I-cache is non-coherent, so the AArch32 instruction fetch cold-
-loads stale memory bytes for the stub region. The classifier
-marks 0x00FF_FExx as data (no walker reach), so loader-time
-byteswap leaves bytes BE-natural; AArch32 LE instruction fetch
-decodes them as garbage and falls through to UND_TRAMP, which
-HVCs into EL2 → "FPA UND reached EL2" wedge.
+iter-108 fixed the WriteDebugByte NULL wedge by disabling the
+iter-79 `force_kernel_diag_on` poke (commit `912076b5`). With
+gWantSerialDebugging back to 0, the kernel's FPE skips its emit-
+debug-trace path and runs cleanly. **Phase-B essentially
+complete:** the boot now reaches the kernel's idle/sleep state.
 
-iter-107 fix shipped (option (b) plus cache hygiene):
-- `handle_und` FPA-arm now ERETs into FPE_JT (= 0x0038_D874) in
-  UND mode, replicating the in-ROM bypass semantic from EL2.
-  Per-miss counter; first 4 misses log.
-- `patch_und_vector` calls `cpu::icache_publish_range` after
-  installing the UND vector / bypass stub / UND_TRAMP / SBA stubs
-  / UND_RETURN_STUB so the writes are visible to the AArch32
-  I-cache fetch path (DC CVAU + DSB ISH + IC IVAU + DSB ISH +
-  ISB per cache line). `icache_publish_range` was un-gated from
-  the previous `nh_guest_test`-only build.
+Task census after iter-108: **26 unique task names alive**
+(EinsteinProbe reference: 27). All running tasks the oracle
+expects appear: newt, OBJM, idle, cdfm, cdpr, cdsv, cmgr, drvr,
+drvl, mntr, name, pckm, pg&e, PMGR, pssm, PTBL, ROMF, ROMP, scrn,
+sndm, STKF, STKP, STKU, Tmux, alrt, main. Missing: codc, inkr
+(possibly created later in boot, possibly not yet reached).
 
-New wedge — `WriteDebugByte` NULL ring-buffer:
+The boot ends in StopImage (PC=0x38d174..0x38d1e0): the kernel's
+SA-1100 idle/sleep handshake. The polling loop at 0x38d1d4..
+0x38d1dc reads IntPresent (kHdWr_IntPresent at 0x0F183000) and
+spins until bit 22 (= 0x400000) is set. That bit is the wake-up
+event from a user-input source (pen-down, button, GPIO) — exactly
+how a physical Newton sleeps until the user touches it.
 
-```
-dabt-trip: PC=0x00199ce8 mode=und writing 0x00000020 -> IPA=0x0
-           r0=0x0c1017b4 r1=0 r2=0x20 r3=0
-*** unknown MMIO read halted ***
-  IPA = 0x00000000  W  value=0x00000000  @ELR=0x199ce8
-```
+Iter-109 work — wake the idle:
 
-PC=0x00199ce8 sits inside `WriteDebugByte__Fc` (starting at
-0x00199ccc). The instruction is `strb r2, [r3, r1]` — store byte
-into a ring buffer at `obj[28]`. `r0 = 0x0c1017b4` (= the
-`rdpInfo` debug context); `obj[28]` is the buffer pointer, which
-loads as 0 → effective address 0 + 0 = 0 → the kernel writes
-0x20 to IPA 0, which our hypervisor halts on as "unknown MMIO".
+1. **Identify which IRQ source maps to IntPresent.bit-22**.
+   `src/peripherals/vic.rs` plus `probe/FINDINGS.md` should pin
+   it to one of the GPIO / tablet / button lines. Cross-check
+   against EinsteinProbe to see which IRQ it raises on idle-wake.
+2. **Model a wake event**. Options in rough order of escalation:
+   a. **One-shot wake on tick**. After N seconds of idle (= the
+      polling loop firing without exit), fire the wake IRQ once
+      and see if the kernel resumes into NewtonScript dispatch.
+   b. **Pen-tap / button-press emulation**. Forward an event from
+      a host trigger (HVC tag from a guest test, semihosting
+      stdin, or just a periodic "synthetic tap" for diagnosis)
+      into the GPIO IRQ.
+   c. **Real input plumbing**. If interactive, wire host
+      keyboard / mouse through to the tablet driver's input queue.
+3. **Verify forward progress**. Once woken, the kernel should
+   start TInterpreter and run NewtonScript. The framebuffer
+   should render the boot UI. EinsteinProbe is the visual oracle.
 
-The call comes from UND mode (`mode=und`), reached via the FPE
-handler that fired through iter-107's EL2 reroute. The FPE emits
-debug bytes via `WriteDebugByte` for emulation tracing because
-some prior init path set `gWantSerialDebugging=1` (per
-INVESTIGATION.md / iter-79 force-enable). On a real Newton the
-debug-card path (`rdpInfo` at 0x00199c10 → `ReadDebugLong` etc.)
-initialises the ring-buffer pointer first; we're reaching
-WriteDebugByte before that init runs.
-
-Investigation needed:
-1. **Confirm the call path.** Walk back from PC=0x199ce8 through
-   `lr(und)=0x001993d8` to find which FPE arm calls
-   WriteDebugByte. Likely a "log emulated FPA insn" trace.
-2. **Decide:**
-   a. Suppress the force-enable of `gWantSerialDebugging` so
-      WriteDebugByte is never called from FPE. Cleanest if iter-79
-      doesn't depend on debug output for forward progress.
-   b. Patch `WriteDebugByte` to no-op (or to validate `obj[28]`
-      before writing) so the unset-buffer case is harmless.
-   c. Initialise the debug ring buffer in `rom_patches.rs` so
-      `obj[28]` is non-NULL before the FPE runs.
-3. Cross-check against EinsteinProbe to see how the reference
-   oracle handles the same path — if EinsteinProbe never enters
-   WriteDebugByte from the FPE, the right fix is (a).
+Optional, in parallel: investigate why iter-107's FPA bypass-stub
+cache flush didn't help (only 1 fpa-bypass-miss observed before
+boot reached idle, so the cache-coherence hypothesis remains
+testable). If a longer boot eventually enters more FPA UNDs and
+the bypass works, the cache flush is doing its job; if misses
+keep accruing, look at why the in-ROM stub still doesn't fire.
 
 ### Iteration 105: REx pkgl relocation-table seeder
 

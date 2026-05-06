@@ -61,61 +61,72 @@ diagnostic probes still active runs much slower per kernel-second,
 so reaching the same point will take significantly longer wall
 clock.
 
-**Next (iter-107):**
+**Next (iter-108):**
 
-iter-106 cleanup landed (commit `49d77ced`): all iter-105
-diagnostic probes removed (task-switch save-area, pre-ERET,
-post-msr-SPSR drift, trap-trace arming, thumb-und log,
-`dump_task_save_oneline`). Boot output dropped from ~450k lines /
-60 s to ~5k lines / 60 s, and the boot now reaches significantly
-deeper kernel code before tripping the next wedge.
+iter-107 closed (commit `f66bd0a9`). Investigation overturned the
+SCTLR.V hypothesis — empirically `SCTLR.V` stays 0 throughout
+boot, so the kernel uses **low** vectors and our bypass stub at
+IPA 0x00FF_FEC0 IS the right install site. Real cause of the
+bypass-stub miss: cache coherence. `write_rom_code_word` stores
+into EL2's D-cache via Normal-WB; on Cortex-A53 / AEMv8-A the
+I-cache is non-coherent, so the AArch32 instruction fetch cold-
+loads stale memory bytes for the stub region. The classifier
+marks 0x00FF_FExx as data (no walker reach), so loader-time
+byteswap leaves bytes BE-natural; AArch32 LE instruction fetch
+decodes them as garbage and falls through to UND_TRAMP, which
+HVCs into EL2 → "FPA UND reached EL2" wedge.
 
-New wedge — FPA-bypass-stub miss:
+iter-107 fix shipped (option (b) plus cache hygiene):
+- `handle_und` FPA-arm now ERETs into FPE_JT (= 0x0038_D874) in
+  UND mode, replicating the in-ROM bypass semantic from EL2.
+  Per-miss counter; first 4 misses log.
+- `patch_und_vector` calls `cpu::icache_publish_range` after
+  installing the UND vector / bypass stub / UND_TRAMP / SBA stubs
+  / UND_RETURN_STUB so the writes are visible to the AArch32
+  I-cache fetch path (DC CVAU + DSB ISH + IC IVAU + DSB ISH +
+  ISB per cache line). `icache_publish_range` was un-gated from
+  the previous `nh_guest_test`-only build.
+
+New wedge — `WriteDebugByte` NULL ring-buffer:
 
 ```
-*** FPA UND reached EL2 — bypass stub at 0x00FF_FEC0 should have
-    routed this directly to FPE_JT. insn=0xed2dc203 PC=0x2f1eec
+dabt-trip: PC=0x00199ce8 mode=und writing 0x00000020 -> IPA=0x0
+           r0=0x0c1017b4 r1=0 r2=0x20 r3=0
+*** unknown MMIO read halted ***
+  IPA = 0x00000000  W  value=0x00000000  @ELR=0x199ce8
 ```
 
-PC=0x2f1eec is `sfm f4, 1, [sp, #-12]!` — Store FP Multiple, FPA
-encoding (cond=AL, bits[27:24]=0xD, cp_num=2). The bypass stub at
-IPA 0x00FF_FEC0 (installed by `patch_und_vector` in
-`src/guest_mem.rs`) recognises FPA-class UND insns and branches
-directly to `FP_UndefHandlers_Start_JT` at 0x38d874. Hand-tracing
-the stub's logic against this opcode says it *should* hit the
-"FPA, b FPE_JT" arm.
+PC=0x00199ce8 sits inside `WriteDebugByte__Fc` (starting at
+0x00199ccc). The instruction is `strb r2, [r3, r1]` — store byte
+into a ring buffer at `obj[28]`. `r0 = 0x0c1017b4` (= the
+`rdpInfo` debug context); `obj[28]` is the buffer pointer, which
+loads as 0 → effective address 0 + 0 = 0 → the kernel writes
+0x20 to IPA 0, which our hypervisor halts on as "unknown MMIO".
 
-The stub is wired off the UND vector at IPA 0x04 — i.e., the
-**low-vector** UND. Newton 2.x sets `SCTLR.V=1` once the kernel's
-MMU comes up, routing exceptions to **high vectors** (VA
-0xFFFF_0000+) instead. So the bypass stub is dead from the moment
-the kernel flips V — and every FPA UND post-MMU goes through the
-ROM's high-vector UND directly to `UND_TRAMP` (which HVCs to
-EL2). That explains why so many earlier FPA UNDs reached EL2
-without our bypass firing; the boot only halted when it tripped
-an opcode that `is_fpa_insn` recognised but our trap.rs handler
-isn't programmed to emulate.
+The call comes from UND mode (`mode=und`), reached via the FPE
+handler that fired through iter-107's EL2 reroute. The FPE emits
+debug bytes via `WriteDebugByte` for emulation tracing because
+some prior init path set `gWantSerialDebugging=1` (per
+INVESTIGATION.md / iter-79 force-enable). On a real Newton the
+debug-card path (`rdpInfo` at 0x00199c10 → `ReadDebugLong` etc.)
+initialises the ring-buffer pointer first; we're reaching
+WriteDebugByte before that init runs.
 
 Investigation needed:
-1. Confirm `SCTLR.V` flips during boot. (Likely; Newton runs with
-   high vectors per ARM ARM convention for ARMv5+.)
-2. Decide between:
-   a. **Mirror the bypass to the high-vector UND**. Whatever PA
-      backs VA 0xFFFF_0000 in the kernel's L1 needs the same
-      `b FPA_BYPASS_STUB` patch that IPA 0x04 has, and the stub
-      itself needs to land at a stable VA reachable from there.
-   b. **Emulate the FPA shape in EL2**. Add an `_ if is_fpa_insn`
-      handler in `handle_und` that decodes the FPA opcode and
-      routes into the kernel's FPE entry from EL2. Higher per-trap
-      cost than (a) but doesn't depend on bypass-stub geometry.
-3. Once routed, the FPE_JT path takes us into the kernel's
-   software FPA emulator — which is itself a 717006-vintage code
-   path that may have its own quirks worth checking against
-   EinsteinProbe.
-
-Optional, can run in parallel: rebuild the snapshot-resume
-workflow against the new stable boot point so iter-108+ can
-iterate faster without re-cooking the early-boot phase each run.
+1. **Confirm the call path.** Walk back from PC=0x199ce8 through
+   `lr(und)=0x001993d8` to find which FPE arm calls
+   WriteDebugByte. Likely a "log emulated FPA insn" trace.
+2. **Decide:**
+   a. Suppress the force-enable of `gWantSerialDebugging` so
+      WriteDebugByte is never called from FPE. Cleanest if iter-79
+      doesn't depend on debug output for forward progress.
+   b. Patch `WriteDebugByte` to no-op (or to validate `obj[28]`
+      before writing) so the unset-buffer case is harmless.
+   c. Initialise the debug ring buffer in `rom_patches.rs` so
+      `obj[28]` is non-NULL before the FPE runs.
+3. Cross-check against EinsteinProbe to see how the reference
+   oracle handles the same path — if EinsteinProbe never enters
+   WriteDebugByte from the FPE, the right fix is (a).
 
 ### Iteration 105: REx pkgl relocation-table seeder
 

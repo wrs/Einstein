@@ -111,30 +111,73 @@ Diagnostic progress added by the FVP DABT-trampoline fix work:
   out — the right tool for catching the precise interworking
   instruction is whole-execution tracing, not per-ERET probes.
 
-Next investigation steps:
+Diagnostic progress from the iter-105 task-switch + pre-ERET probes:
 
-1. **Use Tarmac on FVP, gated by emit_start.** Now that FVP
-   boots through the `c7-MCR` issue (this iteration's main
-   contribution), Tarmac can capture the wild branch directly.
-   FVP currently wedges at PC=0x00801964 — different from
-   QEMU's PC=0 — so the wedge tracing will be FVP-specific
-   first; we'll need to either fix FVP's REx-region wedge
-   first or accept that the iter-105 root cause may differ
-   per-platform.
-2. **Or: QEMU `-d in_asm`-gated trace.** Add `QEMU_EXTRA="-d
-   in_asm,nochain -D ..."` and emit a unique UART marker just
-   before the wedge to snip the trace tail. Heavy (millions of
-   instructions per second) but exhaustive.
-3. **Or: gdb hardware breakpoint on PC=0x0.** Run with `DEBUG=1
-   cargo run` to enable QEMU's gdbstub, attach
-   `aarch64-elf-gdb`, set HW BP on PC=0, continue. When the
-   wild branch lands, examine the call stack with `bt`.
-4. **R12=0 lead.** APCS uses R12/IP as the function-pointer
-   scratch for vtable-style calls. In the wedge dump R12=0,
-   suggesting `mov ip, <vtable_slot>; bx ip` where the slot
-   held 1. Check vtables of TObjectManager (whose MonitorProc
-   was the last `r3` value our earlier probe saw) for any
-   uninitialised slots that might read as 1.
+- New HVC probe at `0x003ad9a4` (`add r0, r0, #16` in the kernel's
+  task-restore epilog) logs the incoming + outgoing TTask save area
+  on every task switch. Compact one-line dump per task:
+  `task[in/out] <task_va> id=… '<name>' saved_pc saved_spsr sp_usr lr_usr` plus saved r0..r8 and r12.
+- Companion probe at `0x003ada68` (`pop {r0, r1, r2}` immediately
+  before the actual `movs pc, lr` at `0x003ada6c`) captures
+  `lr_svc` and `spsr_svc` — the EXACT values the hardware will
+  consume on ERET — plus the popped r0..r2 that become the user's
+  on resume.
+
+Cold-boot run reveals the wedge-causing task is `'drvr'` (id=0x1d03,
+TTask at `0x0c113ee0`) being scheduled in for the FIRST TIME. There
+is no prior `task[out]` for it, so its save area was populated by
+task-creation code (in REx, `0x008006xx` region — the function that
+loads the literal `0x64727672` = "drvr" at `0x800740`).
+
+Smoking-gun events #825:
+
+```
+task-switch[825]:
+  task[in ] drvr saved_pc=0x00800968 saved_spsr=0x00000010
+            saved r0..r7 = 0cc89ffc 4 1d03 0 0 0c113ee0 0 0
+            saved r8=0 r12=0  sp_usr=0x0cc89fa8 lr_usr=0x01bdde84
+task-eret[825]: lr_svc=0x00800968 spsr_svc=0x00000310
+                pop=[0x0cc89ffc, 0x4, 0x1d03]
+thumb-und: PC=0x0 SPSR_und=0x330 mode=0x10
+           r0..r12 IDENTICAL to drvr's saved (zero user instructions ran)
+```
+
+Both probes confirm:
+- The save area is syntactically correct (saved_pc=0x800968 is a
+  valid REx address; saved_spsr=0x10 is clean USR-32 with no flags).
+- The kernel's ERET intent is correct: `lr_svc=0x00800968` (bit-0
+  clear) and `spsr_svc=0x00000310` (T-bit clear, mode=USR, A=1, E=1
+  preserved from the prior SVC entry's CPSR via `msr SPSR_fc`).
+- `lr_usr=0x01bdde84` is the standard TaskKillSelf trampoline,
+  which Newton uses as the per-task "fall-off" return.
+
+Yet the wedge state has every register matching the save area
+EXACTLY — proving the `drvr` user task ran ZERO instructions.
+PC=0 with T=1 cannot be produced by any user instruction starting
+from PC=0x00800968 with CPSR=0x310 (the LDR at 0x800968 would
+change r0; nothing changed).
+
+This rules out task-creation corruption and rules out the kernel
+mis-installing the ERET state. The bug must be in the ERET path
+itself. Three remaining hypotheses:
+
+1. **Bytes at 0x800968 in the running guest are not `0xe5900000`
+   anymore.** Some patcher (NATIVE_PRIM rewriter, shadow_stub,
+   unaligned, etc.) rewrote them, and the new instruction takes a
+   trap whose handler corrupts CPSR.T and PC. Quick check: dump
+   the word at IPA 0x800968 in the wedge handler.
+2. **A trap fires immediately on the ERET** — e.g., a vIRQ
+   pending, a stage-2 fault on the user's first instruction fetch
+   at 0x800968, or a stage-1 access-flag fault — and our trap
+   handler's response leaves CPSR with T=1 and PC=0.
+3. **Hardware ERET edge case on Cortex-A53** — `movs pc, lr` with
+   `spsr_svc=0x310` (E=1 preserved through `msr SPSR_fc`) and
+   `lr_svc=0x00800968` somehow doesn't land at PC=0x800968.
+
+Next probe to discriminate: dump `[0x800968]` in the wedge handler
+(or as part of the pre-ERET probe), AND check what the actual
+post-ERET PC is by adding a UND/DABT probe at a *user-mode* PC
+near 0x800968 and seeing whether it ever fires.
 
 The iter-99/101/104 byteswap stubs, the iter-103 VA-space
 classifier rework, the iter-105 snapshot-revival fix, and the

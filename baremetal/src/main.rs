@@ -157,29 +157,17 @@ pub extern "C" fn kmain() -> ! {
         unsafe { guest::eret_to_restored(state); }
     }
 
-    // Auto-install one-shot BPs to dump processor state and memory at
-    // two key points on the PrimGetEnvDomainName path — post-both-STRBs
-    // in the kernel, and post-LDRB in USR — so we can compare byte flag
-    // state with Einstein at the same cycle.
-    //
-    // Diagnostic scaffolding: bp at SearchFreeList's `ldr r3, [r0]`
-    // (ROM 0x00313308) so handle_user_bp_und can intercept the wild-r0
-    // bus-error case. Benign in-RAM walks re-arm silently; wild-r0 dumps
-    // heap header + freelist chain and halts.
-    let rc = guest_bp::install_guest_bp(0x0031_3308);
-    kprintln!("guest_bp: SearchFreeList tripwire install rc={}", rc);
-    // Upstream probes for the "bogus current heap" investigation.
-    // 0x001a4948 = `__ct__9TRefStackFv` instr right after `bl NewStack`
-    // (logs r0 = stack base or 0 on failure). 0x00142df0 = SetCurrentHeap
-    // entry (logs r0 = the heap pointer being installed into the current
-    // task's globals[-16]). Both stay armed via slot re-occupation in
-    // handle_user_bp_und so every call is logged (capped at 32 lines).
-    let rc = guest_bp::install_guest_bp(0x001a_4948);
-    kprintln!("guest_bp: TRefStack-NewStack-exit probe install rc={}", rc);
-    let rc = guest_bp::install_guest_bp(0x0014_2df0);
-    kprintln!("guest_bp: SetCurrentHeap probe install rc={}", rc);
-    let rc = guest_bp::install_guest_bp(0x0031_0e24);
-    kprintln!("guest_bp: NewHeap entry probe install rc={}", rc);
+    // (iter-80s/90s heap-investigation guest_bp probes retired —
+    // SearchFreeList wild-r0 tripwire, TRefStack-post-NewStack logger,
+    // SetCurrentHeap entry probe, and NewHeap entry probe. They were
+    // diagnostic scaffolding for the "bogus current heap" wedge that
+    // iter-99..104 has long since cleared, and they permanently
+    // gated `snapshot::maybe_autosave` (any active guest_bp
+    // suppresses autosave to avoid persisting marker UDFs into the
+    // saved ROM image — see `src/snapshot.rs::maybe_autosave`). With
+    // them gone the autosave ring runs as designed. Re-add a single
+    // targeted probe via `guest_bp::install_guest_bp` if a future
+    // iteration needs to log a specific PC.)
     kprintln!();
     kprintln!("Entering Newton ROM...");
 

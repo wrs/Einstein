@@ -61,21 +61,61 @@ diagnostic probes still active runs much slower per kernel-second,
 so reaching the same point will take significantly longer wall
 clock.
 
-**Next:**
+**Next (iter-107):**
 
-1. **Clean up iter-105 diagnostic probes** — they're load-bearing
-   for the wedge investigation but now noise. Specifically the
-   task-switch save-area probe at 0x003ad9a4, the pre-ERET probe
-   at 0x003ada68, the post-msr-SPSR drift probe at 0x003ad9b4,
-   the trap-trace arming at IRQ entry, and the `thumb-und` log in
-   `handle_und`. Each adds wall-clock overhead per trap and
-   floods the log past the 500-trap budget.
-2. **Let boot run further** with the cleanup, capture the next
-   real wedge (or the moment it converges to the EinsteinProbe
-   task census).
-3. Optional: rebuild the gdb-based snapshot-resume workflow
-   against the new stable boot point so iter-107+ can iterate
-   faster.
+iter-106 cleanup landed (commit `49d77ced`): all iter-105
+diagnostic probes removed (task-switch save-area, pre-ERET,
+post-msr-SPSR drift, trap-trace arming, thumb-und log,
+`dump_task_save_oneline`). Boot output dropped from ~450k lines /
+60 s to ~5k lines / 60 s, and the boot now reaches significantly
+deeper kernel code before tripping the next wedge.
+
+New wedge — FPA-bypass-stub miss:
+
+```
+*** FPA UND reached EL2 — bypass stub at 0x00FF_FEC0 should have
+    routed this directly to FPE_JT. insn=0xed2dc203 PC=0x2f1eec
+```
+
+PC=0x2f1eec is `sfm f4, 1, [sp, #-12]!` — Store FP Multiple, FPA
+encoding (cond=AL, bits[27:24]=0xD, cp_num=2). The bypass stub at
+IPA 0x00FF_FEC0 (installed by `patch_und_vector` in
+`src/guest_mem.rs`) recognises FPA-class UND insns and branches
+directly to `FP_UndefHandlers_Start_JT` at 0x38d874. Hand-tracing
+the stub's logic against this opcode says it *should* hit the
+"FPA, b FPE_JT" arm.
+
+The stub is wired off the UND vector at IPA 0x04 — i.e., the
+**low-vector** UND. Newton 2.x sets `SCTLR.V=1` once the kernel's
+MMU comes up, routing exceptions to **high vectors** (VA
+0xFFFF_0000+) instead. So the bypass stub is dead from the moment
+the kernel flips V — and every FPA UND post-MMU goes through the
+ROM's high-vector UND directly to `UND_TRAMP` (which HVCs to
+EL2). That explains why so many earlier FPA UNDs reached EL2
+without our bypass firing; the boot only halted when it tripped
+an opcode that `is_fpa_insn` recognised but our trap.rs handler
+isn't programmed to emulate.
+
+Investigation needed:
+1. Confirm `SCTLR.V` flips during boot. (Likely; Newton runs with
+   high vectors per ARM ARM convention for ARMv5+.)
+2. Decide between:
+   a. **Mirror the bypass to the high-vector UND**. Whatever PA
+      backs VA 0xFFFF_0000 in the kernel's L1 needs the same
+      `b FPA_BYPASS_STUB` patch that IPA 0x04 has, and the stub
+      itself needs to land at a stable VA reachable from there.
+   b. **Emulate the FPA shape in EL2**. Add an `_ if is_fpa_insn`
+      handler in `handle_und` that decodes the FPA opcode and
+      routes into the kernel's FPE entry from EL2. Higher per-trap
+      cost than (a) but doesn't depend on bypass-stub geometry.
+3. Once routed, the FPE_JT path takes us into the kernel's
+   software FPA emulator — which is itself a 717006-vintage code
+   path that may have its own quirks worth checking against
+   EinsteinProbe.
+
+Optional, can run in parallel: rebuild the snapshot-resume
+workflow against the new stable boot point so iter-108+ can
+iterate faster without re-cooking the early-boot phase each run.
 
 ### Iteration 105: REx pkgl relocation-table seeder
 

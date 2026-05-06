@@ -732,6 +732,10 @@ enum SeedSource {
     /// it's installed via vtable; this collector seeds the alt entry
     /// directly so the two instructions are still byteswapped at load.
     AltEntryAfterIpJump { trampoline_pc: u32 },
+    /// Entry inside a run of `LDR pc, [pc, #-4] + <literal>` thunk
+    /// pairs. `entry_pa` is the LDR's PA; the literal at `entry_pa+4`
+    /// is the absolute VA the kernel branches to.
+    PcRelLdrThunkRun { entry_pa: u32 },
 }
 
 impl std::fmt::Debug for SeedSource {
@@ -753,6 +757,7 @@ impl std::fmt::Debug for SeedSource {
             SeedSource::JtTableEntry { dispatch_pc } => write!(f, "JtTableEntry @ dispatch 0x{dispatch_pc:08x}"),
             SeedSource::JtTableTarget { dispatch_pc } => write!(f, "JtTableTarget @ dispatch 0x{dispatch_pc:08x}"),
             SeedSource::AltEntryAfterIpJump { trampoline_pc } => write!(f, "AltEntryAfterIpJump @ tramp 0x{trampoline_pc:08x}"),
+            SeedSource::PcRelLdrThunkRun { entry_pa } => write!(f, "PcRelLdrThunkRun @ 0x{entry_pa:08x}"),
         }
     }
 }
@@ -1229,6 +1234,7 @@ struct WalkStats {
     classinfo_roots: usize,
     alt_entry_roots: usize,
     indexed_dispatch_roots: usize,
+    pcrel_ldr_thunk_run_roots: usize,
     /// Words cleared from reach because they are the targets of
     /// `LDR Rt, [pc, #±imm12]` from inside reached code — i.e. literal
     /// pool entries. Under BE-8 these MUST be data: a guest LDR with
@@ -1460,6 +1466,9 @@ fn walk(
         );
         new_roots += collect_indexed_dispatch_roots(
             words, &reach, fn_ranges, &mut worklist, &mut stats,
+        );
+        new_roots += collect_pcrel_ldr_thunk_run_roots(
+            words, &reach, &mut worklist, &mut stats,
         );
 
         stats.indirect_passes = pass;
@@ -2271,6 +2280,88 @@ fn collect_indexed_dispatch_roots(
     added
 }
 
+/// Recognize runs of `LDR pc, [pc, #-4] + <literal>` thunk pairs and
+/// seed every LDR-PA in the run as a worklist root.
+///
+/// Newton's REx packages contain vtable-like structures where each
+/// slot is an 8-byte pair:
+///
+///   ldr pc, [pc, #-4]   ; 0xE51FF004
+///   <literal>           ; absolute VA the kernel branches to
+///
+/// Slots that some other reached code BLs (e.g. `bl 0x8264d4` from
+/// the package's own function bodies) get marked naturally. Sibling
+/// slots whose only references are through structural pointers in
+/// the package's metadata block stay unmarked. Without this collector
+/// the unmarked thunks aren't byteswapped at load time, so when the
+/// kernel reaches one through the structural pointer the LDR decodes
+/// as garbage and the guest takes a UND/PABT.
+///
+/// Concrete example (Einstein.rex MoveModule, 0x8264d4..0x826548):
+/// 15 thunks targeting public-JT VAs in 0x01800000+. The 9 slots
+/// directly BL'd from neighbouring functions are reached; the 6
+/// siblings (0x8264dc, 0x8264fc, 0x82650c, 0x826524, 0x826534,
+/// 0x826544) point at the same JT VAs as their neighbours but have
+/// no in-code BL, and the kernel reaches them via the package's
+/// vtable pointer.
+///
+/// Pattern is highly specific (exact LDR encoding 0xE51FF004, every
+/// literal must resolve to function-start-shaped code via `va_to_pa`,
+/// and ≥3 pairs in a row). Run-of-3 minimum keeps isolated `LDR pc,
+/// [pc, #-4]` instructions inside ordinary code from being treated
+/// as a table.
+fn collect_pcrel_ldr_thunk_run_roots(
+    words: &[u32],
+    reach: &Bitmap,
+    worklist: &mut Vec<(u32, Vec<WalkReason>)>,
+    stats: &mut WalkStats,
+) -> usize {
+    const LDR_PC_PCM4: u32 = 0xE51F_F004;
+    const MIN_PAIRS: usize = 3;
+    let mut added = 0usize;
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut i = 0usize;
+    while i + 2 * MIN_PAIRS <= ROM_WORD_COUNT {
+        if words[i] != LDR_PC_PCM4 {
+            i += 1;
+            continue;
+        }
+        // Consume consecutive (LDR + literal) pairs whose literal
+        // resolves through `va_to_pa` to a function-start-shaped
+        // word. Stop on the first pair that fails any check.
+        let mut j = i;
+        while j + 1 < ROM_WORD_COUNT && words[j] == LDR_PC_PCM4 {
+            let lit = words[j + 1];
+            let lit_pa = match va_to_pa(words, lit) {
+                Some(pa) => pa,
+                None => break,
+            };
+            let tw = words[(lit_pa >> 2) as usize];
+            if (tw >> 28) == 0xF { break; }
+            if !is_known_function_start(tw) { break; }
+            j += 2;
+        }
+        let pairs = (j - i) / 2;
+        if pairs < MIN_PAIRS {
+            i += 1;
+            continue;
+        }
+        for k in 0..pairs {
+            let entry_pa = ((i + 2 * k) as u32) * 4;
+            if reach.get_word(entry_pa) { continue; }
+            if !seen.insert(entry_pa) { continue; }
+            worklist.push((
+                entry_pa,
+                vec![WalkReason::Seed(SeedSource::PcRelLdrThunkRun { entry_pa })],
+            ));
+            added += 1;
+        }
+        i = j;
+    }
+    stats.pcrel_ldr_thunk_run_roots += added;
+    added
+}
+
 /// Scan reached code for `LDR Rt, [pc, #±imm12]` instructions and read
 /// each literal. If the literal value points at a prologue-shaped target,
 /// seed it as a worklist root. This catches function pointers passed as
@@ -2540,6 +2631,7 @@ fn run(args: Args) -> Result<(), String> {
     writeln!(f, "    TClassInfo struct roots:    {}", stats.classinfo_roots).ok();
     writeln!(f, "    alt-entry-after-ip-jump:    {}", stats.alt_entry_roots).ok();
     writeln!(f, "    indexed-dispatch roots:     {}", stats.indexed_dispatch_roots).ok();
+    writeln!(f, "    pcrel-ldr-thunk-run roots:  {}", stats.pcrel_ldr_thunk_run_roots).ok();
     writeln!(f, "    total indirect roots added: {}", stats.indirect_roots_added).ok();
     writeln!(f, "    literal-pool words cleared: {}", stats.literal_targets_cleared).ok();
     writeln!(f, "    rom-soup walk-entries:     {}", stats.rom_soup_entries).ok();

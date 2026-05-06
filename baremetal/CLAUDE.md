@@ -202,6 +202,24 @@ saw in a log), skip the install: `bg <addr>` and `c` is enough.
 
 ## General Phase-B debugging guidance
 
+- **Bitmap-first triage.** Whenever a wedge points at a specific
+  guest PC (UND at `PC=X`, PABT at `X`, "wild branch to X", an
+  instruction at `X` decoding as garbage), check **first** whether
+  `X` is marked as code in the classifier's reach bitmap before
+  digging into trap state, banked registers, or the ERET path. If
+  `X` isn't marked, the loader didn't byteswap the word at load
+  time, the guest fetches BE bytes as LE, and the decode IS
+  garbage — no further debugging needed at the runtime layer.
+  Quick check:
+  ```bash
+  grep -E "^  $(printf '%08x' $X | cut -c1-6)" \
+    baremetal/classify/*/code-regions.txt
+  ```
+  If `X` is missing, the fix lives in `tools/classify-rom/src/main.rs`
+  (add a seeder for the structure that contains `X`), not in
+  `src/trap.rs`. After regenerating the bitmap with
+  `scripts/regen-classify.sh`, `scripts/dump-data-regions.py`
+  refreshes `code-regions.txt` so the same grep verifies the fix.
 - Every handler in `src/trap.rs` / `src/peripherals/*` halts
   loudly on unknown inputs with a context dump. When a ROM boot
   trips one, the halt message points at exactly the table entry

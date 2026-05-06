@@ -303,8 +303,8 @@ fn load_symbol_roots(
 ///
 /// Offsets inside the entry table are REx-relative (i.e. add
 /// `REX_PA_OFFSET` to get an absolute PA).
-fn rex_header_roots(words: &[u32]) -> Vec<u32> {
-    let mut out: Vec<u32> = Vec::new();
+fn rex_header_roots(words: &[u32], stats: &mut WalkStats) -> Vec<(u32, SeedSource)> {
+    let mut out: Vec<(u32, SeedSource)> = Vec::new();
     let rex_base_w = REX_PA_OFFSET / 4;
     if rex_base_w + 10 >= ROM_WORD_COUNT { return out; }
     let w0 = words[rex_base_w];
@@ -326,60 +326,202 @@ fn rex_header_roots(words: &[u32]) -> Vec<u32> {
         let data_pa = (REX_PA_OFFSET as u32).wrapping_add(off);
         let data_end = data_pa.saturating_add(size);
         // DO NOT seed entry-data PAs directly: they always point at
-        // configuration structures, not at instructions. Seeding
-        // 0x00800054 (the FDRV class info) pulls the walker into
-        // binary data where integer-offset values happen to decode
-        // as byte/halfword-shape instructions.
+        // configuration structures, not at instructions.
         match tag {
-            // 'fdrv' — 8-byte config entry. Layout: +0 version (0x01),
-            // +4 absolute PA pointing at the class-info block.
-            0x6664_7276 => {
-                let data_idx = (data_pa as usize) >> 2;
-                if data_idx + 1 < ROM_WORD_COUNT {
-                    let pa = words[data_idx + 1];
-                    if pa & 3 == 0 && (pa as usize) < ROM_SIZE_BYTES {
-                        // Still data (the class info block), but
-                        // immediately followed by pointer-shaped
-                        // words — let FDRV handler below handle it.
-                        // Don't seed the class-info PA itself as code.
-                        let _ = pa;
-                    }
-                }
+            // 'fdrv' — 8-byte config entry: { version, classInfoPA }.
+            // No seeding needed: `collect_classinfo_roots` finds the
+            // TClassInfo trampoline (sub r0,pc,#68; mov pc,lr) at the
+            // tail of the class-info struct and walks the inline
+            // btbl, monent SRO target, and per-method branch slots
+            // precisely from there.
+            0x6664_7276 => {}
+            // 'FDRV' — class info structure. Same precise walker
+            // (collect_classinfo_roots) handles it. The previous
+            // "scan every slot for code-pointer-shaped values"
+            // heuristic added 8 spurious seeds in Einstein.rex
+            // (small SRO/version/flags integers that happen to be
+            // valid main-ROM PAs and resolve to vector-table words
+            // shaped like B-AL); zero real method roots.
+            0x4644_5256 => {}
+            // 'pkgl' — embedded package list. Each NewtonOS package
+            // (`package0` / `package1` magic) carries its own
+            // relocation table when `kDirRelocationFlag = 0x04000000`
+            // is set in the package flags. The relocation table is an
+            // authoritative list of every 32-bit pointer slot in the
+            // package's part data; the kernel walks it at load time to
+            // adjust pointers for the actual load address. We use it
+            // here to seed every code-shaped pointer value as a
+            // worklist root, no shape-heuristic guessing required.
+            //
+            // Non-relocatable packages (~3/4 of Einstein.rex) carry no
+            // such list; their code is still reached through the
+            // existing shape-based collectors (LDR-pc thunk runs,
+            // B-runs, classinfo trampolines, etc.).
+            0x706b_676c => {
+                walk_pkgl_relocation_roots(words, data_pa, data_end, &mut out, stats);
             }
-            // 'FDRV' — class info structure. Scan every word-aligned
-            // slot for values that look like code pointers (point at
-            // a prologue-shaped target); each such pointer is a real
-            // method root.
-            0x4644_5256 => {
-                let start = (data_pa as usize) >> 2;
-                let end = ((data_end as usize) >> 2).min(ROM_WORD_COUNT);
-                for w in start..end {
-                    let p = words[w];
-                    if p == 0 { continue; }
-                    // FDRV class-info method pointers may be direct
-                    // ROM VAs or patch-table VAs. Verify the VA is
-                    // mappable and the first word looks like a known
-                    // function start (B-AL through patch-table thunk
-                    // counts), then seed the VA — walker chains the
-                    // thunk if it's one.
-                    let p_pa = match va_to_pa(words, p) {
-                        Some(pa) => pa,
-                        None => continue,
-                    };
-                    let tgt = words[(p_pa >> 2) as usize];
-                    if (tgt >> 28) == 0xF { continue; }
-                    if !is_known_function_start(tgt) { continue; }
-                    out.push(p);
-                }
-            }
-            // 'pkgl' — embedded package list. Package internal layout
-            // (NSRuntime header, ObjectPool, etc.) isn't parsed here;
-            // any executable package init points get reached via
-            // direct BL from the FDRV methods that invoke them.
             _ => {}
         }
     }
     out
+}
+
+/// Walk a `pkgl` block, parse each `package0`/`package1` package, and
+/// for every relocation entry append the value-as-VA to `out` if it
+/// resolves through `va_to_pa` to a function-start-shaped target.
+///
+/// Package on-disk layout (big-endian on disk; `words[]` is the
+/// byteswapped LE view, so a u16 field at byte offset b reads as
+/// `(words[b/4] >> ((2 - (b & 2)) * 8)) & 0xFFFF`):
+///
+///     +0x00 "package0" / "package1" magic        (8 bytes)
+///     +0x08 packageID                             (u32)
+///     +0x0C packageFlags                          (u32, kDirRelocationFlag = 0x04000000)
+///     +0x10 version                               (u32)
+///     +0x14 copyrightOffset, copyrightLength      (u16, u16)
+///     +0x18 nameOffset, nameLength                (u16, u16)
+///     +0x1C totalSize                             (u32 — the package's
+///                                                  size including dir,
+///                                                  relocation, parts)
+///     +0x20 creationDate                          (u32)
+///     +0x24 reserved1, reserved2                  (u32, u32)
+///     +0x2C directorySize                         (u32 — bytes from
+///                                                  package start through
+///                                                  end of directory)
+///     +0x30 numParts                              (u32)
+///     +0x34 parts[numParts]                       (32 bytes each)
+///     ... directory data (strings + part info)
+///     ... relocation block (when flag set):
+///         +0x00 reserved                          (u32)
+///         +0x04 relocationSize                    (u32)
+///         +0x08 pageSize                          (u32 = 0x400)
+///         +0x0C numEntries                        (u32 — set count)
+///         +0x10 baseAddress                       (u32 — 0 in
+///                                                  Einstein.rex; values
+///                                                  on disk are already
+///                                                  absolute PAs)
+///         +0x14 sets[numEntries]:
+///             +0 pageNumber                       (u16)
+///             +2 offsetCount                      (u16)
+///             +4 offsets[offsetCount]             (u8 each, padded to 4)
+///       Each `(pageNumber, offsetByte)` decodes to a package-relative
+///       address `addr = (pageNumber << 10) | (offsetByte << 2)`. The
+///       value at `pkg_pa + addr` is a 32-bit pointer; if it resolves
+///       to function-start-shaped code, seed it.
+///     ... part data
+fn walk_pkgl_relocation_roots(
+    words: &[u32],
+    pkgl_pa_start: u32,
+    pkgl_pa_end: u32,
+    out: &mut Vec<(u32, SeedSource)>,
+    stats: &mut WalkStats,
+) {
+    const PKG_MAGIC_W0: u32 = 0x7061_636b; // "pack"
+    const PKG_MAGIC_W1_NOS1_COMPAT: u32 = 0x6167_6530; // "age0"
+    const PKG_MAGIC_W1_NOS1_INCOMPAT: u32 = 0x6167_6531; // "age1"
+    const RELOC_FLAG: u32 = 0x0400_0000;
+
+    let mut pa = pkgl_pa_start;
+    while pa + 0x40 <= pkgl_pa_end {
+        if (pa & 3) != 0 {
+            pa = (pa + 3) & !3;
+            continue;
+        }
+        let w_idx = (pa >> 2) as usize;
+        if w_idx + 1 >= ROM_WORD_COUNT { break; }
+        let w0 = words[w_idx];
+        let w1 = words[w_idx + 1];
+        let is_pkg = w0 == PKG_MAGIC_W0
+            && (w1 == PKG_MAGIC_W1_NOS1_COMPAT || w1 == PKG_MAGIC_W1_NOS1_INCOMPAT);
+        if !is_pkg {
+            // Step forward word-by-word to find the next package magic.
+            // Packages are word-aligned in the REx; alignment padding
+            // sits between them when a part's size isn't a multiple
+            // of 4.
+            pa += 4;
+            continue;
+        }
+        stats.pkgl_packages_seen += 1;
+        let flags = words[w_idx + 3];
+        let pkg_size = words[w_idx + 7];
+        let dir_size = words[w_idx + 0xb];
+        if pkg_size < dir_size || pkg_size > pkgl_pa_end - pa {
+            // Malformed; skip past whatever we can.
+            pa += 4;
+            continue;
+        }
+        if flags & RELOC_FLAG != 0 {
+            stats.pkgl_relocatable_packages += 1;
+            walk_package_relocation_table(
+                words, pa, dir_size, out, stats,
+            );
+        }
+        pa += pkg_size;
+        pa = (pa + 3) & !3;
+    }
+}
+
+/// Parse one package's relocation table starting at `pkg_pa + dir_size`
+/// and seed every relocation-slot value that resolves to function-start-
+/// shaped code. Caller is responsible for checking `kDirRelocationFlag`.
+fn walk_package_relocation_table(
+    words: &[u32],
+    pkg_pa: u32,
+    dir_size: u32,
+    out: &mut Vec<(u32, SeedSource)>,
+    stats: &mut WalkStats,
+) {
+    let reloc_pa = pkg_pa.wrapping_add(dir_size);
+    let rb = (reloc_pa >> 2) as usize;
+    if rb + 5 >= ROM_WORD_COUNT { return; }
+    // Header: reserved, relocSize, pageSize, numEntries, baseAddress.
+    let reloc_size = words[rb + 1];
+    let _page_size = words[rb + 2];
+    let num_sets = words[rb + 3] as usize;
+    // baseAddress (words[rb + 4]) is informational: Einstein.rex
+    // packages are written with values already in their final-load
+    // frame (DCL passes `loadAddr = startAddr + offset` to
+    // WriteToStream, and parts emit pointers absolute against that),
+    // so we read the slot value verbatim. Sanity-check num_sets to
+    // avoid runaway loops on a malformed block.
+    let max_sets_by_size = (reloc_size as usize).saturating_sub(20) / 4 + 1;
+    let num_sets = num_sets.min(max_sets_by_size).min(0x10000);
+    let mut byte_pos = (reloc_pa as usize).wrapping_add(20);
+    for _ in 0..num_sets {
+        if byte_pos + 4 > ROM_SIZE_BYTES { break; }
+        let header_w = words[byte_pos / 4];
+        let page_num = (header_w >> 16) & 0xFFFF;
+        let off_count = (header_w & 0xFFFF) as usize;
+        byte_pos += 4;
+        if byte_pos + off_count > ROM_SIZE_BYTES { break; }
+        for i in 0..off_count {
+            let b = byte_pos + i;
+            // Extract the byte at file offset `b` from the BE-loaded
+            // words array. words[b/4] holds u32::from_be_bytes of
+            // bytes [b&!3 .. b&!3+4]; the byte at `b` is the
+            // ((3 - (b & 3))*8)'th-from-LSB byte of that word.
+            let off_byte = ((words[b / 4] >> ((3 - (b & 3)) * 8)) & 0xFF) as u32;
+            let reloc_addr = (page_num << 10) | (off_byte << 2);
+            let slot_pa = pkg_pa.wrapping_add(reloc_addr);
+            stats.pkgl_relocation_slots_total += 1;
+            if (slot_pa as usize) + 4 > ROM_SIZE_BYTES { continue; }
+            if slot_pa & 3 != 0 { continue; }
+            let val = words[(slot_pa >> 2) as usize];
+            if val == 0 { continue; }
+            let val_pa = match va_to_pa(words, val) {
+                Some(p) => p,
+                None => continue,
+            };
+            let tw = words[(val_pa >> 2) as usize];
+            if (tw >> 28) == 0xF { continue; }
+            if !is_known_function_start(tw) { continue; }
+            out.push((val, SeedSource::PkglRelocation { slot_pa }));
+            stats.pkgl_relocation_roots_seeded += 1;
+        }
+        byte_pos += off_count;
+        // Pad offset bytes to 4-byte alignment.
+        byte_pos += (4 - (off_count & 3)) & 3;
+    }
 }
 
 /// Parse `_Data_/symbols.txt` for `<prefix>$$Base` / `<prefix>$$Limit`
@@ -701,7 +843,6 @@ enum SeedSource {
     Symbol(&'static str),
     Vector,
     Manual,
-    RexHeader,
     /// LDR-pc-rel + STR-to-this pair installs a vtable; `ldr_pc` is
     /// the LDR instruction that loaded the vtable address.
     Vtable { ldr_pc: u32 },
@@ -736,6 +877,10 @@ enum SeedSource {
     /// pairs. `entry_pa` is the LDR's PA; the literal at `entry_pa+4`
     /// is the absolute VA the kernel branches to.
     PcRelLdrThunkRun { entry_pa: u32 },
+    /// Pointer slot listed in a `pkgl` package's relocation table.
+    /// `slot_pa` is the PA of the 32-bit pointer slot; the value
+    /// stored at `slot_pa` is the code address to seed.
+    PkglRelocation { slot_pa: u32 },
 }
 
 impl std::fmt::Debug for SeedSource {
@@ -744,7 +889,6 @@ impl std::fmt::Debug for SeedSource {
             SeedSource::Symbol(name) => write!(f, "Symbol {name:?}"),
             SeedSource::Vector => write!(f, "Vector"),
             SeedSource::Manual => write!(f, "Manual"),
-            SeedSource::RexHeader => write!(f, "RexHeader"),
             SeedSource::Vtable { ldr_pc } => write!(f, "Vtable @ ldr 0x{ldr_pc:08x}"),
             SeedSource::FnPtrLiteral { ldr_pc } => write!(f, "FnPtrLiteral @ ldr 0x{ldr_pc:08x}"),
             SeedSource::BRunEntry { entry_pa } => write!(f, "BRunEntry @ 0x{entry_pa:08x}"),
@@ -758,6 +902,7 @@ impl std::fmt::Debug for SeedSource {
             SeedSource::JtTableTarget { dispatch_pc } => write!(f, "JtTableTarget @ dispatch 0x{dispatch_pc:08x}"),
             SeedSource::AltEntryAfterIpJump { trampoline_pc } => write!(f, "AltEntryAfterIpJump @ tramp 0x{trampoline_pc:08x}"),
             SeedSource::PcRelLdrThunkRun { entry_pa } => write!(f, "PcRelLdrThunkRun @ 0x{entry_pa:08x}"),
+            SeedSource::PkglRelocation { slot_pa } => write!(f, "PkglRelocation @ slot 0x{slot_pa:08x}"),
         }
     }
 }
@@ -1235,6 +1380,10 @@ struct WalkStats {
     alt_entry_roots: usize,
     indexed_dispatch_roots: usize,
     pcrel_ldr_thunk_run_roots: usize,
+    pkgl_packages_seen: usize,
+    pkgl_relocatable_packages: usize,
+    pkgl_relocation_slots_total: usize,
+    pkgl_relocation_roots_seeded: usize,
     /// Words cleared from reach because they are the targets of
     /// `LDR Rt, [pc, #±imm12]` from inside reached code — i.e. literal
     /// pool entries. Under BE-8 these MUST be data: a guest LDR with
@@ -1255,13 +1404,17 @@ struct WalkStats {
 /// word-aligned values for function-pointer-shaped data. Returns the
 /// reachable-code bitmap. The caller then intersects with
 /// `is_byte_access` to produce the final byte-access-static bitmap.
+///
+/// `stats` is supplied by the caller (rather than constructed here) so
+/// pre-walk seeders like `rex_header_roots` can record their own
+/// counters in the same struct.
 fn walk(
     words: &[u32],
     initial_roots: &[(u32, SeedSource)],
     initial_reach: Bitmap,
     fn_ranges: &[(u32, u32)],
-) -> (Bitmap, WalkStats) {
-    let mut stats = WalkStats::default();
+    stats: &mut WalkStats,
+) -> Bitmap {
     let mut reach = initial_reach;
     // Each worklist entry carries the FULL trace of decisions that
     // led to it being pushed: seed → [Jump → Jump → ...] → Branch.
@@ -1447,28 +1600,28 @@ fn walk(
         // P=1/U=1/W=0, imm12=0.
         let mut new_roots = 0usize;
         new_roots += collect_vtable_roots(
-            words, &reach, &mut worklist, &mut stats,
+            words, &reach, &mut worklist, stats,
         );
         new_roots += collect_fnptr_literal_roots(
-            words, &reach, &mut worklist, &mut stats,
+            words, &reach, &mut worklist, stats,
         );
         new_roots += collect_b_run_roots(
-            words, &reach, &mut worklist, &mut stats,
+            words, &reach, &mut worklist, stats,
         );
         new_roots += collect_pc_relative_addr_roots(
-            words, &reach, fn_ranges, &mut worklist, &mut stats,
+            words, &reach, fn_ranges, &mut worklist, stats,
         );
         new_roots += collect_classinfo_roots(
-            words, &reach, &mut worklist, &mut stats,
+            words, &reach, &mut worklist, stats,
         );
         new_roots += collect_alt_entry_roots(
-            words, &reach, &mut worklist, &mut stats,
+            words, &reach, &mut worklist, stats,
         );
         new_roots += collect_indexed_dispatch_roots(
-            words, &reach, fn_ranges, &mut worklist, &mut stats,
+            words, &reach, fn_ranges, &mut worklist, stats,
         );
         new_roots += collect_pcrel_ldr_thunk_run_roots(
-            words, &reach, &mut worklist, &mut stats,
+            words, &reach, &mut worklist, stats,
         );
 
         stats.indirect_passes = pass;
@@ -1490,7 +1643,7 @@ fn walk(
     let cleared = clear_literal_pool_targets_from_reach(words, &mut reach);
     stats.literal_targets_cleared = cleared;
 
-    (reach, stats)
+    reach
 }
 
 /// Clear from `reach` every word that is the target of an
@@ -2488,13 +2641,14 @@ fn run(args: Args) -> Result<(), String> {
 
     // REx-header roots: parse the external REx's entry table at
     // guest PA 0x00800000 and harvest every absolute PA it references
-    // (fdrv pointer-to-classinfo, FDRV classinfo scan, pkgl data
-    // start). Without these the walker has no way into REX code at
-    // all, since the demangled-symbol file is ROM-only.
-    let rex_roots = rex_header_roots(&words);
-    let mut rex_header_root_count = rex_roots.len();
-    for p in rex_roots {
-        symbols.push((p, SeedSource::RexHeader));
+    // (fdrv pointer-to-classinfo, FDRV classinfo scan, pkgl
+    // relocation tables). Without these the walker has no way into
+    // REx code at all, since the demangled-symbol file is ROM-only.
+    let mut stats = WalkStats::default();
+    let rex_roots = rex_header_roots(&words, &mut stats);
+    let rex_header_root_count = rex_roots.len();
+    for (p, src) in rex_roots {
+        symbols.push((p, src));
     }
 
     // Dedup by PA, keeping the first SeedSource we saw (Symbol seeds
@@ -2532,7 +2686,7 @@ fn run(args: Args) -> Result<(), String> {
     // pre-marking required.
     let initial_reach = Bitmap::new();
 
-    let (mut reach, mut stats) = walk(&words, &symbols, initial_reach, &fn_ranges);
+    let mut reach = walk(&words, &symbols, initial_reach, &fn_ranges, &mut stats);
     stats.rex_header_roots = rex_header_root_count;
 
     // Manual data-range exclusions: clear reach bits in any range
@@ -2550,9 +2704,10 @@ fn run(args: Args) -> Result<(), String> {
             pa = pa.wrapping_add(4);
         }
     }
-    // Dedup sometimes removes some of the REx entries (they may
-    // overlap vectors/symbols); report the actual count after merge.
-    let _ = &mut rex_header_root_count;
+    // (rex_header_root_count is stashed pre-walk; dedup may have
+    // dropped entries that collided with symbols/vectors, but we keep
+    // the original count for the summary stat.)
+    let _ = rex_header_root_count;
 
     // Build byte-access-static: reach ∧ is_byte_access(insn).
     let mut ba_static = Bitmap::new();
@@ -2632,6 +2787,10 @@ fn run(args: Args) -> Result<(), String> {
     writeln!(f, "    alt-entry-after-ip-jump:    {}", stats.alt_entry_roots).ok();
     writeln!(f, "    indexed-dispatch roots:     {}", stats.indexed_dispatch_roots).ok();
     writeln!(f, "    pcrel-ldr-thunk-run roots:  {}", stats.pcrel_ldr_thunk_run_roots).ok();
+    writeln!(f, "    pkgl packages seen:         {}", stats.pkgl_packages_seen).ok();
+    writeln!(f, "    pkgl relocatable packages:  {}", stats.pkgl_relocatable_packages).ok();
+    writeln!(f, "    pkgl relocation slots:      {}", stats.pkgl_relocation_slots_total).ok();
+    writeln!(f, "    pkgl relocation roots:      {}", stats.pkgl_relocation_roots_seeded).ok();
     writeln!(f, "    total indirect roots added: {}", stats.indirect_roots_added).ok();
     writeln!(f, "    literal-pool words cleared: {}", stats.literal_targets_cleared).ok();
     writeln!(f, "    rom-soup walk-entries:     {}", stats.rom_soup_entries).ok();

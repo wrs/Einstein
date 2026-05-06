@@ -713,8 +713,21 @@ const TASK_SWITCH_PRE_ERET_INSN:        u32 = 0xE8BD_0007; // pop {r0, r1, r2}
 /// wedges, the bug is in some quirk of native `movs pc, lr` that our
 /// emulation skips. If it still wedges, the bug is downstream.
 pub const TASK_SWITCH_ERET_HVC_IMM: u32 = 0x8A;
+#[allow(dead_code)]
 pub const TASK_SWITCH_ERET_PC:      u32 = 0x003A_DA6C;
+#[allow(dead_code)]
 const TASK_SWITCH_ERET_INSN:        u32 = 0xE1B0_F00E; // movs pc, lr
+
+/// SPSR-drift bisect probe (iter-105). Patches the first `nop`
+/// (`mov r0, r0`) at 0x003ad9b4 — the instruction immediately after
+/// the kernel's `msr SPSR_fc, r1` at 0x003ad9b0. The handler reads
+/// SPSR_EL1 (= SPSR_svc) right after the kernel installed it and
+/// logs it. The pre-ERET probe at 0x003ada68 logs the same register
+/// later in the prologue; comparing the two values pins down where
+/// (if anywhere) SPSR_svc is being mutated between them.
+pub const POST_MSR_SPSR_PROBE_HVC_IMM: u32 = 0x8B;
+pub const POST_MSR_SPSR_PROBE_PC:      u32 = 0x003A_D9B4;
+const POST_MSR_SPSR_PROBE_INSN:        u32 = 0xE1A0_0000; // nop (mov r0, r0)
 
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
@@ -979,17 +992,36 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             "task-switch pre-ERET probe (pop {r0, r1, r2})",
             TASK_SWITCH_PRE_ERET_HVC_IMM,
         );
-        // Iter-105 ERET emulator at 0x003ada6c — replaces the native
+        // Iter-105 ERET emulator at 0x003ada6c — DISABLED for the
+        // SPSR-drift bisect. Re-enabling replaces the native
         // `movs pc, lr` so EL2 performs the AArch32 EL1 → EL0 ERET
-        // explicitly. Bisects whether the wedge is in native ERET
-        // semantics vs in the user's first instruction at the target.
+        // explicitly.
+        //
+        // patch_probe(
+        //     rom_ptr,
+        //     TASK_SWITCH_ERET_PC,
+        //     TASK_SWITCH_ERET_INSN,
+        //     hvc_insn(TASK_SWITCH_ERET_HVC_IMM),
+        //     "task-switch ERET emulator (movs pc, lr)",
+        //     TASK_SWITCH_ERET_HVC_IMM,
+        // );
+
+        // Iter-105 SPSR-drift bisect probe at 0x003ad9b4 — the first
+        // `nop` (mov r0, r0) immediately after the kernel's
+        // `msr SPSR_fc, r1` at 0x003ad9b0. Captures SPSR_EL1 right
+        // after the kernel installs it, so we can compare against the
+        // pre-ERET probe at 0x003ada68 and tell whether SPSR_svc is
+        // mutated somewhere in 0x003ad9b8..0x003ada64. The original
+        // instruction is a nop, so the handler emulates by doing
+        // nothing — natural ERET to 0x003ad9b8 resumes the kernel
+        // unchanged.
         patch_probe(
             rom_ptr,
-            TASK_SWITCH_ERET_PC,
-            TASK_SWITCH_ERET_INSN,
-            hvc_insn(TASK_SWITCH_ERET_HVC_IMM),
-            "task-switch ERET emulator (movs pc, lr)",
-            TASK_SWITCH_ERET_HVC_IMM,
+            POST_MSR_SPSR_PROBE_PC,
+            POST_MSR_SPSR_PROBE_INSN,
+            hvc_insn(POST_MSR_SPSR_PROBE_HVC_IMM),
+            "post-msr-SPSR probe (nop after msr SPSR_fc)",
+            POST_MSR_SPSR_PROBE_HVC_IMM,
         );
     }
 }

@@ -1411,6 +1411,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::TASK_SWITCH_ERET_HVC_IMM => {
             handle_task_switch_eret_emulator(ctx);
         }
+        v if v == crate::rom_patches::POST_MSR_SPSR_PROBE_HVC_IMM => {
+            handle_post_msr_spsr_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -3159,6 +3162,29 @@ fn handle_task_switch_pre_eret_probe(ctx: &mut TrapContext) {
         kprintln!(
             "  insn @ saved_pc {:#010x} = {:08x} {:08x} {:08x} {:08x}",
             target, w0, w1, w2, w3,
+        );
+    }
+}
+
+/// SPSR-drift bisect probe. Fires on the patched `nop` at 0x003ad9b4
+/// (immediately after `msr SPSR_fc, r1` at 0x003ad9b0). Logs SPSR_EL1
+/// so we can compare against the pre-ERET probe at 0x003ada68 and
+/// pinpoint where SPSR_svc is being mutated. The original instruction
+/// is `mov r0, r0` — a no-op — so the handler does nothing beyond
+/// logging; natural ERET resumes the kernel at 0x003ad9b8.
+fn handle_post_msr_spsr_probe(ctx: &mut TrapContext) {
+    let spsr_el1 = read_sysreg!("spsr_el1") as u32;
+    let r0 = ctx.x[0] as u32;
+    let r1 = ctx.x[1] as u32;
+    static FIRED: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+    let n = FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // Always log when the trap-trace is armed (drvr is incoming);
+    // throttle to first 8 fires otherwise to avoid flooding.
+    if trap_trace_armed() || n < 8 {
+        kprintln!(
+            "post-msr[{}]: spsr_el1={:#010x}  r0={:#010x} r1={:#010x}",
+            n, spsr_el1, r0, r1,
         );
     }
 }

@@ -1875,39 +1875,97 @@ pub unsafe fn patch_dabt_vector(rom_ptr: *mut u32) {
 ///
 ///   ft+0:  mcr p15,0,r0,c13,c0,2     ; TPIDRURW = R0 (save)
 ///   ft+1:  mcr p15,0,r1,c13,c0,3     ; TPIDRRO = R1 (save)
-///   ft+2:  mrc p15,0,r0,c5,c0,0      ; R0 = DFSR
-///   ft+3:  and r0, r0, #0xF          ; R0 = DFSC[3:0]
-///   ft+4:  cmp r0, #7                ; translation, page (most common)
-///   ft+5:  beq FAST_FWD              ; → ft+17
-///   ft+6:  cmp r0, #15               ; permission, page
-///   ft+7:  beq FAST_FWD
-///   ft+8:  nop                       ; (was: cmp r0, #5 — see iter-60 below)
-///   ft+9:  nop                       ; (was: beq FAST_FWD — see iter-60 below)
-///   ft+10: cmp r0, #13               ; permission, section
-///   ft+11: beq FAST_FWD
-///   ft+12: cmp r0, #6                ; access flag, page
-///   ft+13: beq FAST_FWD
-///   ft+14: cmp r0, #3                ; access flag, section
-///   ft+15: beq FAST_FWD
-///   ft+16: mrc p15,0,r0,c13,c0,2     ; restore R0 (was clobbered with DFSC)
-///   ft+17: b SLOW_DABT_TRAMP         ; → DABT_TRAMP_OFFSET (slow EL2 path)
+///   ; iter-105 (FVP fix #1): mirror the slow trampoline's save of
+///   ; LR_abt / SP_abt / SPSR_abt into the DABT_SAVE_PA scratch slots.
+///   ; The DAH-MRS-SPSR HVC patch reads SPSR_abt from the slot, so
+///   ; if only fast-path DABTs fire (the common case on FVP, where
+///   ; DFSC=5 section faults are rare during early boot) the slot
+///   ; stays at 0 and the kernel's `mrs r1, SPSR` substitution gets
+///   ; bogus data.
+///   ft+2:  ldr r0, [pc, #L_SAVE_PA]  ; r0 = DABT_SAVE_PA literal
+///   ft+3:  str lr, [r0]              ; LR_abt
+///   ft+4:  str sp, [r0, #4]          ; SP_abt
+///   ft+5:  mrs r1, spsr              ; r1 = SPSR_abt
+///   ft+6:  str r1, [r0, #8]          ; SPSR_abt
+///   ; iter-105 (FVP fix #2): c7 cache-maintenance MCR filter. The
+///   ; kernel's `CleanPageInDcache` etc. issue DCCMVAC/DCIMVAC/...
+///   ; with VAs that may be unmapped at the time. Cortex-A53 silently
+///   ; no-ops these (per its TRM); FVP_Base_RevC's strict AEM raises
+///   ; a translation fault. Forwarding the fault to DAH is fatal —
+///   ; DAH treats any SVC-mode DABT as "deep toast". Filter here:
+///   ; if the faulting instruction is `MCR p15, 0, Rt, c7, CRm, opc2`,
+///   ; just advance past it and return to the pre-abt context. The
+///   ; cache invalidation itself is a no-op on a coherent A53/AEM,
+///   ; matching Einstein's `TARMProcessor` case-7 silent-no-op.
+///   ;
+///   ; The faulting word is read in BE-8 (CPSR.E=1) and so returns
+///   ; the byteswap of the kernel's compiled-for encoding — REV
+///   ; brings it back to the kernel-format word, which we mask
+///   ; against the c7-MCR pattern.
+///   ;
+///   ; Pattern (any cond, opc1=0, MCR, CRn=7, p15, RES1 bit 4):
+///   ;   bits[27:16] == 0xE07
+///   ;   bits[11:8]  == 0xF
+///   ;   bit[4]      == 1
+///   ;   mask 0x0FFF_0F10, expected 0x0E07_0F10
+///   ft+7:  ldr r1, [lr, #-8]         ; r1 = faulting instr (BE-8 view)
+///   ft+8:  rev r1, r1                ; r1 = kernel-format word
+///   ft+9:  ldr r0, [pc, #L_C7_MASK]  ; r0 = 0x0FFF_0F10
+///   ft+10: and r1, r1, r0            ; r1 &= mask
+///   ft+11: ldr r0, [pc, #L_C7_PATT]  ; r0 = 0x0E07_0F10
+///   ft+12: teq r1, r0
+///   ft+13: beq C7_NOOP               ; → ft+34
+///   ; existing DFSC dispatch
+///   ft+14: mrc p15,0,r0,c5,c0,0      ; R0 = DFSR
+///   ft+15: and r0, r0, #0xF          ; R0 = DFSC[3:0]
+///   ft+16: cmp r0, #7                ; translation, page (most common)
+///   ft+17: beq FAST_FWD              ; → ft+30
+///   ft+18: cmp r0, #15               ; permission, page
+///   ft+19: beq FAST_FWD
+///   ft+20: nop                       ; (was: cmp r0, #5 — see iter-60 below)
+///   ft+21: nop                       ; (was: beq FAST_FWD — see iter-60 below)
+///   ft+22: cmp r0, #13               ; permission, section
+///   ft+23: beq FAST_FWD
+///   ft+24: cmp r0, #6                ; access flag, page
+///   ft+25: beq FAST_FWD
+///   ft+26: cmp r0, #3                ; access flag, section
+///   ft+27: beq FAST_FWD
+///   ; Slow-path fall-through: both R0 and R1 were clobbered (R0 by
+///   ; the DABT_SAVE_PA load + DFSR read, R1 by the SPSR_abt save and
+///   ; the c7-MCR check). Restore both before branching so the slow
+///   ; trampoline's own `mcr ...,c13,c0,2/3` sees the original
+///   ; pre-abt values when it re-saves them.
+///   ft+28: mrc p15,0,r0,c13,c0,2     ; restore R0 from TPIDRURW
+///   ft+29: mrc p15,0,r1,c13,c0,3     ; restore R1 from TPIDRRO
+///   ft+30: b SLOW_DABT_TRAMP         ; → DABT_TRAMP_OFFSET (slow EL2 path)
 ///   ; FAST_FWD:
-///   ft+18: mrc p15,0,r0,c13,c0,2     ; restore R0 from TPIDRURW
-///   ft+19: mrc p15,0,r1,c13,c0,3     ; restore R1 from TPIDRRO
-///   ft+20: ldr pc, [pc, #-4]         ; pc+8-4 = ft+20+4 → literal at ft+21
-///   ft+21: literal: 0x00393114       ; kernel DataAbortHandler VA
+///   ft+31: mrc p15,0,r0,c13,c0,2     ; restore R0 from TPIDRURW
+///   ft+32: mrc p15,0,r1,c13,c0,3     ; restore R1 from TPIDRRO
+///   ft+33: ldr pc, [pc, #-4]         ; pc+8-4 = ft+33+4 → literal at ft+34
+///   ft+34: literal: 0x00393114       ; kernel DataAbortHandler VA
+///   ; C7_NOOP:
+///   ft+35: mrc p15,0,r0,c13,c0,2     ; restore R0
+///   ft+36: mrc p15,0,r1,c13,c0,3     ; restore R1
+///   ft+37: subs pc, lr, #4           ; ERET to faulting_PC + 4
+///                                    ;   (LR_abt = faulting_PC + 8)
+///   ; literals
+///   ft+38: literal: DABT_SAVE_PA     ; for `ldr r0` at ft+2
+///   ft+39: literal: 0x0FFF_0F10      ; for `ldr r0` at ft+9
+///   ft+40: literal: 0x0E07_0F10      ; for `ldr r0` at ft+11
 ///
-/// 21 words × 4 = 84 bytes; reserved region is 256 bytes so plenty of
-/// slack.
+/// 41 words × 4 = 164 bytes; reserved region is 256 bytes so 92
+/// bytes of slack remain.
 ///
 /// Cost reduction: at iter-58 the DABT trampoline took an EL2 round-
 /// trip on every fault. iter-59 measured 20.8 M HVC #DIAG_TAG hits in
 /// ~30 s of wall (DFSCs 0x07/0x0F dominating, all forwarded to kernel
 /// DAH). Bypassing the EL2 round-trip for those cases is a direct
-/// win — same kernel-side execution, no hypervisor overhead.
+/// win — same kernel-side execution, no hypervisor overhead. The
+/// iter-105 LR/SP/SPSR save adds ~5 instructions to the fast path,
+/// negligible relative to the EL2 round-trip we're avoiding.
 ///
 /// iter-60: DFSC=0x05 (translation, section) is *deliberately
-/// excluded* from the fast path (slots ft+8/ft+9 left as NOPs). For
+/// excluded* from the fast path (slots ft+13/ft+14 left as NOPs). For
 /// section-level translation faults ARMv7 leaves DFSR.Domain UNK
 /// (= 0); the kernel's `GetDomainAndFaultMonitorFromDomainNumber(0)`
 /// then returns no monitor and DAH throws `evt.ex.abt.bus`. Pre-iter-
@@ -1918,8 +1976,8 @@ pub unsafe fn patch_dabt_vector(rom_ptr: *mut u32) {
 /// first touch of a 1 MiB section (~tens of times per boot for
 /// freshly-allocated stacks), so the slow-path cost is negligible.
 ///
-/// SAFETY: writes 21 words in the reserved range
-/// `DABT_FAST_TRAMP_OFFSET .. + 21*4`. Caller owns the ROM backing.
+/// SAFETY: writes 41 words in the reserved range
+/// `DABT_FAST_TRAMP_OFFSET .. + 41*4`. Caller owns the ROM backing.
 pub unsafe fn install_dabt_fast_trampoline(rom_ptr: *mut u32) {
     unsafe {
         let ft = DABT_FAST_TRAMP_OFFSET / 4;
@@ -1939,43 +1997,84 @@ pub unsafe fn install_dabt_fast_trampoline(rom_ptr: *mut u32) {
             let imm24 = ((off_bytes >> 2) as u32) & 0x00FF_FFFF;
             0xEA00_0000 | imm24
         };
+        // `ldr r0, [pc, #imm12]` literal-load. `from` and `to` are
+        // word indices within the trampoline. PC at execute time of
+        // an LDR at slot `from` is `(from + 2) * 4` bytes; the
+        // architectural offset is the literal slot's byte offset
+        // minus that PC value.
+        let ldr_r0_lit = |from: usize, to: usize| -> u32 {
+            let pc_at_exec = ((from as u32) + 2) * 4;
+            let target_byte = (to as u32) * 4;
+            let imm12 = target_byte.wrapping_sub(pc_at_exec) & 0xFFF;
+            0xE59F_0000 | imm12
+        };
 
         // Slot writes (instructions, native-LE u32 = LE encoding for
         // BE-8 instruction fetch):
         write_rom_code_word(rom_ptr, ft +  0, 0xEE0D_0F50); // mcr p15,0,r0,c13,c0,2
         write_rom_code_word(rom_ptr, ft +  1, 0xEE0D_1F70); // mcr p15,0,r1,c13,c0,3
-        write_rom_code_word(rom_ptr, ft +  2, 0xEE15_0F10); // mrc p15,0,r0,c5,c0,0
-        write_rom_code_word(rom_ptr, ft +  3, 0xE200_000F); // and r0, r0, #0xF
-        write_rom_code_word(rom_ptr, ft +  4, 0xE350_0007); // cmp r0, #7
-        write_rom_code_word(rom_ptr, ft +  5, beq(5, 18));  // beq FAST_FWD
-        write_rom_code_word(rom_ptr, ft +  6, 0xE350_000F); // cmp r0, #15
-        write_rom_code_word(rom_ptr, ft +  7, beq(7, 18));  // beq FAST_FWD
+        // iter-105: save LR_abt / SP_abt / SPSR_abt to DABT_SAVE_PA so
+        // the DAH-MRS-SPSR HVC handler reads a current value, not a
+        // stale-or-zero leftover from a long-ago slow-path DABT.
+        write_rom_code_word(rom_ptr, ft +  2, ldr_r0_lit(2, 38));  // ldr r0, [pc, #..] = DABT_SAVE_PA
+        write_rom_code_word(rom_ptr, ft +  3, 0xE580_E000); // str lr, [r0]
+        write_rom_code_word(rom_ptr, ft +  4, 0xE580_D004); // str sp, [r0, #4]
+        write_rom_code_word(rom_ptr, ft +  5, 0xE14F_1000); // mrs r1, spsr
+        write_rom_code_word(rom_ptr, ft +  6, 0xE580_1008); // str r1, [r0, #8]
+        // iter-105: c7 cache-maintenance MCR filter — see header.
+        write_rom_code_word(rom_ptr, ft +  7, 0xE51E_1008); // ldr r1, [lr, #-8]
+        write_rom_code_word(rom_ptr, ft +  8, 0xE6BF_1F31); // rev r1, r1
+        write_rom_code_word(rom_ptr, ft +  9, ldr_r0_lit(9, 39));  // ldr r0, [pc, #..] = mask
+        write_rom_code_word(rom_ptr, ft + 10, 0xE001_1000); // and r1, r1, r0
+        write_rom_code_word(rom_ptr, ft + 11, ldr_r0_lit(11, 40)); // ldr r0, [pc, #..] = pattern
+        write_rom_code_word(rom_ptr, ft + 12, 0xE131_0000); // teq r1, r0
+        write_rom_code_word(rom_ptr, ft + 13, beq(13, 35)); // beq C7_NOOP
+        // existing DFSC dispatch
+        write_rom_code_word(rom_ptr, ft + 14, 0xEE15_0F10); // mrc p15,0,r0,c5,c0,0 (DFSR)
+        write_rom_code_word(rom_ptr, ft + 15, 0xE200_000F); // and r0, r0, #0xF
+        write_rom_code_word(rom_ptr, ft + 16, 0xE350_0007); // cmp r0, #7
+        write_rom_code_word(rom_ptr, ft + 17, beq(17, 31)); // beq FAST_FWD
+        write_rom_code_word(rom_ptr, ft + 18, 0xE350_000F); // cmp r0, #15
+        write_rom_code_word(rom_ptr, ft + 19, beq(19, 31)); // beq FAST_FWD
         // iter-60: DFSC=0x05 deliberately excluded — see file-level
         // comment for rationale. Two NOPs preserve the slot layout so
         // the existing beq targets / `b SLOW_DABT_TRAMP` offset stay
         // correct without recomputing.
-        write_rom_code_word(rom_ptr, ft +  8, 0xE320_F000); // nop
-        write_rom_code_word(rom_ptr, ft +  9, 0xE320_F000); // nop
-        write_rom_code_word(rom_ptr, ft + 10, 0xE350_000D); // cmp r0, #13
-        write_rom_code_word(rom_ptr, ft + 11, beq(11, 18)); // beq FAST_FWD
-        write_rom_code_word(rom_ptr, ft + 12, 0xE350_0006); // cmp r0, #6
-        write_rom_code_word(rom_ptr, ft + 13, beq(13, 18)); // beq FAST_FWD
-        write_rom_code_word(rom_ptr, ft + 14, 0xE350_0003); // cmp r0, #3
-        write_rom_code_word(rom_ptr, ft + 15, beq(15, 18)); // beq FAST_FWD
-        // Slow-path fall-through: R0 was clobbered with DFSC; restore
-        // it from TPIDRURW so the slow DABT_TRAMP's own `mcr` re-saves
-        // the original value. R1 wasn't clobbered after its save.
-        write_rom_code_word(rom_ptr, ft + 16, 0xEE1D_0F50); // mrc p15,0,r0,c13,c0,2 (restore R0)
-        write_rom_code_word(rom_ptr, ft + 17, b_far(
-            (DABT_FAST_TRAMP_OFFSET as u32).wrapping_add(17 * 4),
+        write_rom_code_word(rom_ptr, ft + 20, 0xE320_F000); // nop
+        write_rom_code_word(rom_ptr, ft + 21, 0xE320_F000); // nop
+        write_rom_code_word(rom_ptr, ft + 22, 0xE350_000D); // cmp r0, #13
+        write_rom_code_word(rom_ptr, ft + 23, beq(23, 31)); // beq FAST_FWD
+        write_rom_code_word(rom_ptr, ft + 24, 0xE350_0006); // cmp r0, #6
+        write_rom_code_word(rom_ptr, ft + 25, beq(25, 31)); // beq FAST_FWD
+        write_rom_code_word(rom_ptr, ft + 26, 0xE350_0003); // cmp r0, #3
+        write_rom_code_word(rom_ptr, ft + 27, beq(27, 31)); // beq FAST_FWD
+        // Slow-path fall-through: BOTH R0 and R1 were clobbered (R0
+        // by the SAVE_PA literal load + DFSR read, R1 by SPSR_abt and
+        // the c7-MCR check). Restore both so the slow DABT_TRAMP's
+        // `mcr p15,0,r0/r1,c13,c0,{2,3}` sees the original pre-abt
+        // values when it re-saves them to TPIDR.
+        write_rom_code_word(rom_ptr, ft + 28, 0xEE1D_0F50); // mrc p15,0,r0,c13,c0,2 (restore R0)
+        write_rom_code_word(rom_ptr, ft + 29, 0xEE1D_1F70); // mrc p15,0,r1,c13,c0,3 (restore R1)
+        write_rom_code_word(rom_ptr, ft + 30, b_far(
+            (DABT_FAST_TRAMP_OFFSET as u32).wrapping_add(30 * 4),
             DABT_TRAMP_OFFSET as u32,
         ));                                                  // b SLOW_DABT_TRAMP
         // FAST_FWD:
-        write_rom_code_word(rom_ptr, ft + 18, 0xEE1D_0F50); // mrc p15,0,r0,c13,c0,2 (restore R0)
-        write_rom_code_word(rom_ptr, ft + 19, 0xEE1D_1F70); // mrc p15,0,r1,c13,c0,3 (restore R1)
-        write_rom_code_word(rom_ptr, ft + 20, 0xE51F_F004); // ldr pc, [pc, #-4]
-        // Literal slot — loaded via the LDR PC at ft+20 under BE-8.
-        write_rom_data_word(rom_ptr, ft + 21, DABT_FAST_TRAMP_DAH_TARGET);
+        write_rom_code_word(rom_ptr, ft + 31, 0xEE1D_0F50); // mrc p15,0,r0,c13,c0,2 (restore R0)
+        write_rom_code_word(rom_ptr, ft + 32, 0xEE1D_1F70); // mrc p15,0,r1,c13,c0,3 (restore R1)
+        write_rom_code_word(rom_ptr, ft + 33, 0xE51F_F004); // ldr pc, [pc, #-4]
+        write_rom_data_word(rom_ptr, ft + 34, DABT_FAST_TRAMP_DAH_TARGET);
+        // C7_NOOP: cache-maintenance MCR is a no-op on a coherent
+        // host. Restore the registers we stashed and ERET to
+        // faulting_PC + 4 in the pre-abt mode (LR_abt = pc + 8 at
+        // entry, so subs lr - 4 = faulting_PC + 4).
+        write_rom_code_word(rom_ptr, ft + 35, 0xEE1D_0F50); // mrc p15,0,r0,c13,c0,2 (restore R0)
+        write_rom_code_word(rom_ptr, ft + 36, 0xEE1D_1F70); // mrc p15,0,r1,c13,c0,3 (restore R1)
+        write_rom_code_word(rom_ptr, ft + 37, 0xE25E_F004); // subs pc, lr, #4
+        // Literal slots — all loaded via BE-8 LDR.
+        write_rom_data_word(rom_ptr, ft + 38, DABT_SAVE_PA);
+        write_rom_data_word(rom_ptr, ft + 39, 0x0FFF_0F10);
+        write_rom_data_word(rom_ptr, ft + 40, 0x0E07_0F10);
     }
 }
 

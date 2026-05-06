@@ -2802,7 +2802,11 @@ fn handle_dah_mrs_spsr_patch(ctx: &mut TrapContext) {
     let spsr_abt_save = crate::guest_endian::guest_read_u32_pa(
         guest_mem::DABT_SAVE_PA + 8,
     ).unwrap_or(0);
+    let lr_abt_save = crate::guest_endian::guest_read_u32_pa(
+        guest_mem::DABT_SAVE_PA,
+    ).unwrap_or(0);
     let r1_in = ctx.x[1] as u32;
+    let far = read_sysreg!("far_el1") as u32;
     // Cross-check: also read `mrs spsr_abt` from EL2. If it disagrees
     // with the saved slot, that's the documented QEMU staleness. We
     // always use the saved-slot value (architecturally correct on
@@ -2817,10 +2821,18 @@ fn handle_dah_mrs_spsr_patch(ctx: &mut TrapContext) {
         core::sync::atomic::AtomicU32::new(0);
     let n = FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if n < 16 {
+        // lr_abt_save here is the original faulting PC + 8 (the slow
+        // trampoline doesn't subtract; the kernel's `sub lr, lr, #8`
+        // at DAH entry runs *after* the trampoline saves it). The
+        // fast trampoline (iter-105) saves it at the same offset
+        // pre-DAH-entry, so the value is `faulting_PC + 8` on both
+        // paths.
         kprintln!(
-            "DAH-mrs-patch[{}]: r1_in={:#010x} mrs={:#010x} saved-slot={:#010x} (pre-abt mode={:#x} = {}){}",
+            "DAH-mrs-patch[{}]: r1_in={:#010x} mrs={:#010x} saved-slot={:#010x} \
+             (pre-abt mode={:#x} = {}) faulting_PC={:#010x} FAR={:#010x}{}",
             n, r1_in, mrs_view, spsr_abt_save, spsr_abt_save & 0x1F,
             describe_aarch32_mode(spsr_abt_save & 0x1F),
+            lr_abt_save.wrapping_sub(8), far,
             if (mrs_view & 0x1F) != (spsr_abt_save & 0x1F) {
                 "  *** MRS DIVERGES ***"
             } else { "" },

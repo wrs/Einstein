@@ -23,6 +23,8 @@
     .syntax unified
     .arch armv7ve
 
+#include "../common/hvc_abi.S"
+
     .equ L1_BASE,        0x04000000
     .equ FINE_SLOT_VA,   0x78000000
     .equ FINE_SLOT_IDX,  0x780              @ = FINE_SLOT_VA >> 20
@@ -70,7 +72,7 @@ test_main:
     bne     .Lfail_plant
 
     mov     r0, #1
-    hvc     #5                  @ mark 1: descriptor planted
+    hvc     #HVC_MARK                  @ mark 1: descriptor planted
 
     @ Write TTBR0. Value points at our L1 (16 KiB aligned at 0x04000000).
     @ The existing fix_stage1_xn_bits walks GUEST_RAM from offset 0 and
@@ -86,19 +88,19 @@ test_main:
     bne     .Lfail_not_rewritten
 
     mov     r0, #2
-    hvc     #5                  @ mark 2: slot rewritten to fault
-    hvc     #3                  @ PASS
+    hvc     #HVC_MARK                  @ mark 2: slot rewritten to fault
+    hvc     #HVC_PASS                  @ PASS
     bx      lr
 
     @ === Failure paths ===============================================
 .Lfail_plant:
     mov     r0, r2
-    hvc     #2                  @ print the observed value
+    hvc     #HVC_PRINT_HEX                  @ print the observed value
     mov     r0, #0x70
-    hvc     #4
+    hvc     #HVC_FAIL
 
 .Lfail_not_rewritten:
     mov     r0, r2              @ leftover value — should have been 0
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     mov     r0, #0x71
-    hvc     #4
+    hvc     #HVC_FAIL

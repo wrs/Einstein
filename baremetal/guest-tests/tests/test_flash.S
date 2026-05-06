@@ -59,7 +59,7 @@ test_main:
     bne     .Lfail_n_block1
 
     mov     r0, #1
-    hvc     #5                      @ mark 1: header intact
+    hvc     #HVC_MARK                      @ mark 1: header intact
 
     @ --- Unwritten region of bank 0 reads 0xFFFFFFFF (erased state) ---
     ldr     r0, [r4, #0x200]
@@ -84,7 +84,7 @@ test_main:
     bne     .Lfail_seed_clobbered
 
     mov     r0, #2
-    hvc     #5                      @ mark 2: bank 0 store dropped
+    hvc     #HVC_MARK                      @ mark 2: bank 0 store dropped
 
     @ --- Byte / halfword stores are likewise dropped ---
     add     r2, r4, #0x300
@@ -98,7 +98,7 @@ test_main:
     bne     .Lfail_byte_drop
 
     mov     r0, #3
-    hvc     #5                      @ mark 3: byte/halfword stores dropped
+    hvc     #HVC_MARK                      @ mark 3: byte/halfword stores dropped
 
     @ --- Bank 1 (kFlashBank2) is a separate 4 MiB region (erased) ---
     ldr     r5, =FLASH_BANK1
@@ -120,47 +120,47 @@ test_main:
     bne     .Lfail_bank1_drop
 
     mov     r0, #4
-    hvc     #5                      @ mark 4: bank independence + drop
+    hvc     #HVC_MARK                      @ mark 4: bank independence + drop
 
     hvc_pass
     bx      lr
 
 .Lfail_dlds_block0:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x20
 .Lfail_oscd_block0:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x21
 .Lfail_magic_block0:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x22
 .Lfail_n_block0:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x23
 .Lfail_dlds_block1:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x24
 .Lfail_n_block1:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x25
 .Lfail_unwritten:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x26
 .Lfail_bank0_drop:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x27
 .Lfail_seed_clobbered:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x28
 .Lfail_byte_drop:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x29
 .Lfail_bank1_seeded:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x2A
 .Lfail_bank_alias:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x2B
 .Lfail_bank1_drop:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x2C

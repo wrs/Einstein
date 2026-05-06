@@ -74,24 +74,24 @@ test_main:
     cpu_disable_irq
 
     mov     r0, #1
-    hvc     #5
+    hvc     #HVC_MARK
 
     hvc_pass
     bx      lr
 
 .Lfail_premature:
     mov     r0, r5
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xF0
 .Lfail_irq_count:
     mov     r0, r5
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xF1
 .Lfail_wrong_bit:
     mov     r0, r5
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xF2
 .Lfail_not_cleared:
     mov     r0, r5
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xF3

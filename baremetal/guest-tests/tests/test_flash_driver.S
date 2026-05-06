@@ -72,7 +72,7 @@ test_main:
     bne     .Lfail_identify_block
 
     mov     r0, #1
-    hvc     #5
+    hvc     #HVC_MARK
 
     @ -------- 0x01 Identify with bogus mask ---------------------------
     ldr     r2, =0xDEAD0000                 @ not a recognised single-lane mask
@@ -83,7 +83,7 @@ test_main:
     bne     .Lfail_identify_miss
 
     mov     r0, #2
-    hvc     #5
+    hvc     #HVC_MARK
 
     @ -------- 0x03 Init ----------------------------------------------
     ldr     r0, =0xDEADBEEF
@@ -93,7 +93,7 @@ test_main:
     bne     .Lfail_init
 
     mov     r0, #3
-    hvc     #5
+    hvc     #HVC_MARK
 
     @ -------- 0x0B IsEraseComplete -----------------------------------
     ldr     r3, =ID_STRUCT_ADDR             @ reuse scratch for the status out
@@ -108,7 +108,7 @@ test_main:
     bne     .Lfail_erase_complete_status
 
     mov     r0, #4
-    hvc     #5
+    hvc     #HVC_MARK
 
     @ -------- 0x0D BeginWrite — valid flash address -------------------
     ldr     r2, =0x02000100                 @ inside bank 0
@@ -126,7 +126,7 @@ test_main:
     bne     .Lfail_begin_write_err
 
     mov     r0, #5
-    hvc     #5
+    hvc     #HVC_MARK
 
     @ -------- 0x09 StartErase (32-bit lane, 0x20000 block) ------------
     @ flashRange is in r1; first word of *r1 = vtable selects 32-bit.
@@ -155,44 +155,44 @@ test_main:
     bne     .Lfail_erase_value
 
     mov     r0, #6
-    hvc     #5
+    hvc     #HVC_MARK
 
     hvc_pass
     bx      lr
 
 .Lfail_identify_r0:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x30
 .Lfail_identify_mfr:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x31
 .Lfail_identify_size:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x32
 .Lfail_identify_block:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x33
 .Lfail_identify_miss:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x34
 .Lfail_init:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x35
 .Lfail_erase_complete_r0:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x36
 .Lfail_erase_complete_status:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x37
 .Lfail_begin_write_ok:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x38
 .Lfail_begin_write_err:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x39
 .Lfail_erase_ret:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x3C
 .Lfail_erase_value:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x3D

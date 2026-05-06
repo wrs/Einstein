@@ -26,10 +26,10 @@ test_main:
     ldr     r1, =0x22222222
     ldr     r2, =0x33333333
     ldr     r3, =0x44444444
-    hvc     #0x20
+    hvc     #HVC_SNAPSHOT
 
     mov     r0, #1
-    hvc     #5                  @ mark 1: save returned without halt
+    hvc     #HVC_MARK                  @ mark 1: save returned without halt
 
-    hvc     #3                  @ PASS
+    hvc     #HVC_PASS                  @ PASS
     bx      lr

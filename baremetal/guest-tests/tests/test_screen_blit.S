@@ -118,7 +118,7 @@ test_main:
     bne     .Lfail_not_zero
 
     mov     r0, #1
-    hvc     #5                       @ mark 1: blit returned success
+    hvc     #HVC_MARK                       @ mark 1: blit returned success
 
     @ ---- Verify FB bytes ----
     @ Source row 0 = DE AD BE EF (LE word 0xEFBEADDE).
@@ -137,20 +137,20 @@ test_main:
     bne     .Lfail_fb1
 
     mov     r0, #2
-    hvc     #5                       @ mark 2: FB has expected bytes
+    hvc     #HVC_MARK                       @ mark 2: FB has expected bytes
 
-    hvc     #3                       @ PASS
+    hvc     #HVC_PASS                       @ PASS
     bx      lr
 
 .Lfail_not_zero:
-    hvc     #2                       @ print observed r0
+    hvc     #HVC_PRINT_HEX                       @ print observed r0
     mov     r0, #0xD0
-    hvc     #4
+    hvc     #HVC_FAIL
 .Lfail_fb0:
-    hvc     #2                       @ print observed value
+    hvc     #HVC_PRINT_HEX                       @ print observed value
     mov     r0, #0xD1
-    hvc     #4
+    hvc     #HVC_FAIL
 .Lfail_fb1:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     mov     r0, #0xD2
-    hvc     #4
+    hvc     #HVC_FAIL

@@ -25,26 +25,26 @@ test_main:
     @ `MOV r7, LR` before the HVC). This test stashes r7 itself to
     @ simulate what the stub does at the patched call site.
 
-    @ --- DebugStr HVC (#0x40): PC := r7 + 4 ---
+    @ --- DebugStr HVC: PC := r7 + 4 ---
     adr     r7, .Lafter_debugstr
     sub     r7, r7, #4          @ r7 = .Lafter_debugstr - 4
     adr     r0, msg             @ r0 = string pointer for the trap to log
-    .inst   0xE1400470          @ HVC #0x40
+    hvc     #HVC_DEBUG_STR
     hvc_fail 0x90
 
 .Lafter_debugstr:
     mov     r0, #1
-    hvc     #5                  @ mark 1: DebugStr HVC resumed at r7+4
+    hvc     #HVC_MARK                  @ mark 1: DebugStr HVC resumed at r7+4
 
-    @ --- Debugger HVC (#0x41): PC := r7 + 8 ---
+    @ --- Debugger HVC: PC := r7 + 8 ---
     adr     r7, .Lafter_debugger
     sub     r7, r7, #8          @ r7 = .Lafter_debugger - 8
-    .inst   0xE1400471          @ HVC #0x41
+    hvc     #HVC_DEBUGGER
     hvc_fail 0x91
 
 .Lafter_debugger:
     mov     r0, #2
-    hvc     #5                  @ mark 2: Debugger HVC resumed at r7+8
+    hvc     #HVC_MARK                  @ mark 2: Debugger HVC resumed at r7+8
 
     hvc_pass
     bx      lr

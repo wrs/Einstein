@@ -43,7 +43,7 @@ test_main:
     bne     .Lfail_assign_rewrite
 
     mov     r0, #1
-    hvc     #5                      @ mark 1: assignment reg R/W
+    hvc     #HVC_MARK                      @ mark 1: assignment reg R/W
 
     @ --- Enable/status: read returns 0 regardless of prior write ---
     ldr     r4, =DMA_ENABLE
@@ -64,7 +64,7 @@ test_main:
     bne     .Lfail_wordsts_nonzero
 
     mov     r0, #2
-    hvc     #5                      @ mark 2: chip-wide stubs
+    hvc     #HVC_MARK                      @ mark 2: chip-wide stubs
 
     @ --- Per-channel stub: reads zero, writes dropped ---
     ldr     r4, =DMA_CH0_R0
@@ -80,28 +80,28 @@ test_main:
     bne     .Lfail_ch_stub
 
     mov     r0, #3
-    hvc     #5                      @ mark 3: per-channel stubs
+    hvc     #HVC_MARK                      @ mark 3: per-channel stubs
 
     hvc_pass
     bx      lr
 
 .Lfail_assign_rw:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x30
 .Lfail_assign_rewrite:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x31
 .Lfail_enable_nonzero:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x32
 .Lfail_wordsts_nonzero:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x33
 .Lfail_ch_stub:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x34

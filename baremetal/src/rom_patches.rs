@@ -46,6 +46,7 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use crate::hvc_imm::HvcImm;
 use crate::kprintln;
 
 // ============================================================================
@@ -349,56 +350,35 @@ const PATCHES_717006: &[RomPatch] = &[
     // SetSubPageInfo for the rest.
 ];
 
-/// HVC immediates that the ROM-patched DebugStr / Debugger trap sites
-/// use to reach the hypervisor. Must match the dispatch in
-/// `trap::handle_hvc`.
-pub const DEBUG_STR_HVC_IMM: u32 = 0x40;
-pub const DEBUGGER_HVC_IMM: u32 = 0x41;
+// (HVC immediates live in `crate::hvc_imm::HvcImm`.)
 
 /// Phase-B canary: PowerOffAndReboot at 0x000E_6BBC. The kernel calls
 /// this whenever a fatal init-time check fails (e.g. flash chip
 /// identification yields no driver match — see INVESTIGATION.md).
-/// Under our hypervisor that means the boot has gone wrong but the
-/// kernel thinks rebooting will help — it won't, the same failure
-/// recurs and the trace fills with hundreds of post-mortem repetitions.
-///
-/// Patch the first word with `HVC #POWEROFF_REBOOT_HVC_IMM` so we
+/// Patch the first word with `HVC #HvcImm::PowerOffReboot` so we
 /// halt loudly the FIRST time it fires, with the caller's R0 (reboot
 /// reason) and the trace context immediately preceding the call.
 pub const POWEROFF_REBOOT_PC: u32 = 0x000E_6BBC;
-pub const POWEROFF_REBOOT_HVC_IMM: u32 = 0x42;
 
 /// Phase-B canary: `Reboot(long, unsigned long, unsigned char)` at
 /// 0x000D_9884. This is the "soft-reboot" path the kernel's exception
-/// unwinder calls on an UnhandledException (the path that bypassed
-/// our PowerOffAndReboot canary and wedged into a reboot loop during
-/// the 2026-04-23 StartupProtocolRegistry stall). Same canary shape:
-/// patch the first word to `HVC #REBOOT_HVC_IMM` so we halt on the
-/// first hit with the caller's R0 = reboot reason.
+/// unwinder calls on an UnhandledException. Same shape as
+/// PowerOffAndReboot: patch the first word to `HVC #HvcImm::Reboot`
+/// so we halt on the first hit with the caller's R0 = reboot reason.
 pub const REBOOT_PC: u32 = 0x000D_9884;
-pub const REBOOT_HVC_IMM: u32 = 0x43;
 
 /// Phase-B canary: `BootOS` / `ROMBoot` at 0x0001_8688. The AArch32
 /// reset vector at VA 0 is `B 0x18688`, so the first execution after
 /// the hypervisor's ERET-to-guest lands here. Any subsequent entry is
-/// a SOFTWARE RESET — regardless of whether the kernel took the
-/// `Reboot` / `PowerOffAndReboot` path (already canaried) or jumped
-/// directly to the reset vector via some other mechanism (watchdog,
-/// MOV PC,#0, etc.). Canary: patch the first word to `HVC #0x44`; the
-/// handler allows the first entry through by emulating the original
-/// first insn (`mov r0, #0xb0`) and then halts on every subsequent
-/// entry.
+/// a SOFTWARE RESET. Canary: patch the first word to
+/// `HVC #HvcImm::BootOs`; the handler allows the first entry through
+/// by emulating the original first insn (`mov r0, #0xb0`) and then
+/// halts on every subsequent entry.
 pub const BOOTOS_PC: u32 = 0x0001_8688;
-pub const BOOTOS_HVC_IMM: u32 = 0x44;
 /// The original first instruction of `BootOS`: `mov r0, #0xb0`
 /// (0xE3A000B0). The HVC handler emulates this on the legitimate
 /// first boot by setting r0 = 0xb0 and advancing ELR past the HVC.
 pub const BOOTOS_ORIG_INSN: u32 = 0xE3A0_00B0;
-
-/// AArch32 `HVC #imm16` encoding at unconditional (cond=AL).
-const fn hvc_insn(imm: u32) -> u32 {
-    0xE140_0070 | ((imm & 0xFFF0) << 4) | (imm & 0xF)
-}
 
 /// ROM offsets reserved for the per-patch stubs. All sit in the
 /// post-UND-trampoline region at 0x00FFFFxx — `tracer::in_reserved_range`
@@ -468,40 +448,22 @@ const LOCK_UNLOCK_ORIG_FIRST_INSN: u32 = 0xE1A0_C00D;
 // retained as load-bearing instrumentation for the Remember post-SWI
 // fixup.
 
-/// HVC immediate fired by the patched word at 0x00258E50 (immediately
-/// after the first `bl GenericSWI` inside Remember). Handler logs r0
-/// (= the SWI #12 return value), then emulates `mov r8, #237` so the
-/// kernel's `r8 = -10003` constant is restored before the `teq` at
-/// 0x00258E58.
-pub const REMEMBER_SWIRET_HVC_IMM:   u32 = 0x47;
-
-/// QEMU raspi3b workaround: replace the `mrs r1, SPSR` at the head of
-/// `DataAbortHandler` (PC 0x00393144) with an HVC. Empirically (see
-/// qemu7.log lines 2237/2252 and the `[mrs] -- mrs DIVERGES FROM SAVED
-/// SLOT --` marker in the dabt-forward log) `mrs spsr_abt` from EL2
-/// returns a stale value relative to the trampoline-saved SPSR_abt.
-/// Writing `msr spsr_abt, <saved>` from EL2 before ERETing to DAH did
-/// **not** propagate to the kernel's later AArch32 ABT-mode `mrs r1,
-/// SPSR` — the kernel still saw the stale value and branched to the
-/// throw exit at 0x393158, rebooting on the L1[0xCD]=0x90 fault that
-/// the recovery path would otherwise have grown lazily. The handler
-/// for this HVC reads the trampoline-saved SPSR_abt at
-/// `DABT_SAVE_PA + 8` and writes it into `ctx.x[1]`, so the kernel's
-/// next instruction (`and r1, r1, #31`) sees the architecturally-
-/// correct mode bits regardless of QEMU's staleness. On FVP the
-/// trampoline-saved value matches what `mrs r1, SPSR` would have
-/// returned, so this patch is functionally a no-op there. Mirrors
-/// docs/QEMU_BUGS.md Bug #1's banked-LR workaround.
-pub const DAH_MRS_SPSR_HVC_IMM:          u32 = 0x4F;
-
+/// `Remember` post-SWI fixup site at 0x00258E50 (after the first
+/// `bl GenericSWI`). Handler logs r0 (= the SWI #12 return value),
+/// then emulates `mov r8, #237` so the kernel's `r8 = -10003`
+/// constant is restored before the `teq` at 0x00258E58. Patched with
+/// `HVC #HvcImm::RememberSwiret`.
 const REMEMBER_SWIRET_PC:            u32 = 0x0025_8E50;
 const REMEMBER_SWIRET_ORIG_INSN:     u32 = 0xE3A0_80ED; // mov r8, #237
 
 /// `mrs r1, SPSR` at DAH entry (4th instruction past the function
 /// label, after the DACR setup). Original encoding `0xE14F_1000`. We
-/// replace it with `HVC #DAH_MRS_SPSR_HVC_IMM` so the EL2 handler can
+/// replace it with `HVC #HvcImm::DahMrsSpsr` so the EL2 handler can
 /// supply the architecturally-correct SPSR_abt from the trampoline-
 /// saved slot, working around QEMU raspi3b's stale `mrs spsr_abt`.
+/// On FVP the trampoline-saved value matches what `mrs r1, SPSR`
+/// would have returned, so this patch is functionally a no-op there.
+/// Mirrors docs/QEMU_BUGS.md Bug #1's banked-LR workaround.
 pub const DAH_MRS_SPSR_PC:           u32 = 0x0039_3144;
 const DAH_MRS_SPSR_INSN:             u32 = 0xE14F_1000;
 
@@ -516,17 +478,10 @@ const DAH_MRS_SPSR_INSN:             u32 = 0xE14F_1000;
 /// On Einstein, the abort #16 at FAR=0x0CD07400 (mode=USR, DFSC=5)
 /// recovers — i.e. FaultMonitorEntry returns 0 there. Our hypervisor
 /// reaches the throw exit on the same fault, which only happens if
-/// FaultMonitorEntry returns non-zero. Patch this `cmp` with an HVC so
-/// EL2 can log the return value and emulate the `cmp r0, #0` flag
-/// update, leaving the `beq 0x393a30` at `0x393988` to branch as the
-/// kernel intended.
-// Was 0x50 — collides with `tracer::TRACE_TAG`, which silently swallowed
-// every traced-function HVC under `--features trace` and clobbered NZCV
-// at each entry via the emulated `cmp r0, #0`. Moved to 0x53; the next
-// gap above the existing DAH probe block (0x4F..0x52). Flagged as a
-// reason to convert the per-immediate consts to an enum so collisions
-// fail to compile.
-pub const DAH_FME_RET_HVC_IMM:        u32 = 0x53;
+/// FaultMonitorEntry returns non-zero. Patch this `cmp` with
+/// `HVC #HvcImm::DahFmeRet` so EL2 can log the return value and
+/// emulate the `cmp r0, #0` flag update, leaving the `beq 0x393a30`
+/// at `0x393988` to branch as the kernel intended.
 pub const DAH_FME_RET_PC:             u32 = 0x0039_3984;
 const DAH_FME_RET_INSN:               u32 = 0xE3500000;
 
@@ -535,12 +490,11 @@ const DAH_FME_RET_INSN:               u32 = 0xE3500000;
 /// calls; if its slot redirects through the static entry (no REx
 /// override active), this probe fires and gives us the input fault
 /// mask plus the implementation flow. Original first insn:
-/// `mov ip, sp = 0xE1A0_C00D`. Replace with `HVC #DAH_FME_ENTRY_HVC_IMM`;
+/// `mov ip, sp = 0xE1A0_C00D`. Replace with `HVC #HvcImm::DahFmeEntry`;
 /// the handler emulates `mov ip, sp` (writes ctx.x[12] = ctx.x[13]),
 /// logs r0 (= input fault mask), and returns. If the probe doesn't
 /// fire, the post-ship slot is redirected to a different (REx-side)
 /// implementation we don't have disasm for.
-pub const DAH_FME_ENTRY_HVC_IMM:      u32 = 0x51;
 pub const FME_STATIC_PC:              u32 = 0x0011_FC60;
 const FME_STATIC_FIRST_INSN:          u32 = 0xE1A0_C00D;
 
@@ -549,7 +503,7 @@ const FME_STATIC_FIRST_INSN:          u32 = 0xE1A0_C00D;
 /// (= `0x0C100FF8`, per `_Data_/symbols.txt`) before the OR-chain at
 /// `0x393320..0x393344` builds the fault bitmask passed to
 /// `FaultMonitorEntry`. Original encoding `0xE59F_1634`. We replace it
-/// with `HVC #DAH_OR_CHAIN_HVC_IMM`; the handler reads
+/// with `HVC #HvcImm::DahOrChain`; the handler reads
 /// `*gCurrentTask` (= the running TTask*), then
 /// `curr_task->[+0x74/+0x78/+0x7c]` (TUDomainManager pointers) and
 /// each monitor's `[+0x10]` (the OR'd value), logs them, and emulates
@@ -566,7 +520,6 @@ const FME_STATIC_FIRST_INSN:          u32 = 0xE1A0_C00D;
 /// `gKernelGlobals` — that name was never in `symbols.txt` and
 /// shouldn't be reused. Kernel-globals naming convention lives in
 /// `docs/STRUCTURES.md`.
-pub const DAH_OR_CHAIN_HVC_IMM:       u32 = 0x52;
 pub const DAH_OR_CHAIN_PC:            u32 = 0x0039_3318;
 const DAH_OR_CHAIN_INSN:              u32 = 0xE59F_1634;
 pub const G_CURRENT_TASK_VA:          u32 = 0x0C10_0FF8;
@@ -611,7 +564,6 @@ const NEW_STACK_PAD_BL_ORIG_INSN: u32 = 0xEB66_1604;
 /// name string directly is the right wedge tripwire — far cleaner
 /// than chasing the downstream Reboot canary and decoding the
 /// stack-passed string.
-pub const UNHANDLED_EXCEPTION_HVC_IMM:    u32 = 0x69;
 pub const UNHANDLED_EXCEPTION_PC:         u32 = 0x000B_0220;
 const UNHANDLED_EXCEPTION_FIRST_INSN:     u32 = 0xE1A0_C00D; // mov ip, sp
 
@@ -619,13 +571,12 @@ const UNHANDLED_EXCEPTION_FIRST_INSN:     u32 = 0xE1A0_C00D; // mov ip, sp
 /// ROM `0x000B_031C`. Same signature as `UnhandledException` but
 /// invoked from non-USR contexts (UND/SVC/ABT). Mirrors the
 /// previous probe so we catch both paths at entry.
-pub const UNHANDLED_NUM_EXCEPTION_HVC_IMM: u32 = 0x6A;
 pub const UNHANDLED_NUM_EXCEPTION_PC:      u32 = 0x000B_031C;
 const UNHANDLED_NUM_EXCEPTION_FIRST_INSN:  u32 = 0xE1A0_C00D; // mov ip, sp
 
 /// FPE-entry probe at `FP_UndefHandlers_Start + 0x3C` = `0x0038_D918`.
 /// Original first insn is `mov ip, sp` (`0xE1A0_C00D`); replace with
-/// `HVC #FPE_ENTRY_PROBE_HVC_IMM`. The handler:
+/// `HVC #HvcImm::FpeEntryProbe`. The handler:
 ///
 ///   1. Counts FPE entries (per-call counter).
 ///   2. On entry #2 (= forward #2 = mvfs in SetSystemVolume that wedges
@@ -642,7 +593,6 @@ const UNHANDLED_NUM_EXCEPTION_FIRST_INSN:  u32 = 0xE1A0_C00D; // mov ip, sp
 /// that wedges — small enough to grep for the moment R12 transitions
 /// from `0x0c005fc0` (post-`mov ip, sp`) to `0x003900c8` (at the
 /// trap), pinning the IP-clobber site.
-pub const FPE_ENTRY_PROBE_HVC_IMM: u32 = 0x80;
 pub const FPE_ENTRY_PROBE_PC:      u32 = 0x0038_D918;
 const FPE_ENTRY_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
 
@@ -658,7 +608,6 @@ const FPE_ENTRY_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
 /// InitToolbox→DrawSplashScreen→…→TMainDisplayDriver::Blit, but
 /// no `screen::blit` ever fires, so the chain breaks somewhere
 /// upstream.
-pub const SPLASH_PROBE_HVC_IMM: u32 = 0x90;
 /// `mov ip, sp` at the entry of TNotebook::InitToolbox.
 pub const SPLASH_PROBE_INIT_TOOLBOX_PC:    u32 = 0x0014_6B28;
 const SPLASH_PROBE_INIT_TOOLBOX_INSN:      u32 = 0xE1A0_C00D; // mov ip, sp
@@ -727,15 +676,11 @@ const SPLASH_PROBE_DRAW_SPLASH_INSN:       u32 = 0xE1A0_C00D; // mov ip, sp
 /// load before proceeding so the rest of the thunk works as the kernel
 /// expects.
 #[cfg(feature = "ns_trace")]
-pub const PRINT_PROBE_HVC_IMM:           u32 = 0x78;
-#[cfg(feature = "ns_trace")]
 pub const PRINT_PROBE_PC:                u32 = 0x0038_9EB8;
 #[cfg(feature = "ns_trace")]
 const PRINT_PROBE_FIRST_INSN:            u32 = 0xE590_0004; // ldr r0, [r0, #4]
 
 /// `Putc` thunk @ ROM `0x0038_9EC4` (single-char output).
-#[cfg(feature = "ns_trace")]
-pub const PUTC_PROBE_HVC_IMM:            u32 = 0x7B;
 #[cfg(feature = "ns_trace")]
 pub const PUTC_PROBE_PC:                 u32 = 0x0038_9EC4;
 #[cfg(feature = "ns_trace")]
@@ -743,23 +688,17 @@ const PUTC_PROBE_FIRST_INSN:             u32 = 0xE590_0004;
 
 /// `Flush` thunk @ ROM `0x0038_9EA0` (flush buffered bytes).
 #[cfg(feature = "ns_trace")]
-pub const FLUSH_PROBE_HVC_IMM:           u32 = 0x7C;
-#[cfg(feature = "ns_trace")]
 pub const FLUSH_PROBE_PC:                u32 = 0x0038_9EA0;
 #[cfg(feature = "ns_trace")]
 const FLUSH_PROBE_FIRST_INSN:            u32 = 0xE590_0004;
 
 /// `StackTrace` thunk @ ROM `0x0038_9EE8` (NS-frame dump).
 #[cfg(feature = "ns_trace")]
-pub const STACK_TRACE_PROBE_HVC_IMM:     u32 = 0x7D;
-#[cfg(feature = "ns_trace")]
 pub const STACK_TRACE_PROBE_PC:          u32 = 0x0038_9EE8;
 #[cfg(feature = "ns_trace")]
 const STACK_TRACE_PROBE_FIRST_INSN:      u32 = 0xE590_0004;
 
 /// `ExceptionNotify` thunk @ ROM `0x0038_9EF4` (exception-frame dump).
-#[cfg(feature = "ns_trace")]
-pub const EX_NOTIFY_PROBE_HVC_IMM:       u32 = 0x7E;
 #[cfg(feature = "ns_trace")]
 pub const EX_NOTIFY_PROBE_PC:            u32 = 0x0038_9EF4;
 #[cfg(feature = "ns_trace")]
@@ -980,9 +919,8 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             rom_ptr,
             REMEMBER_SWIRET_PC,
             REMEMBER_SWIRET_ORIG_INSN,
-            hvc_insn(REMEMBER_SWIRET_HVC_IMM),
+            HvcImm::RememberSwiret,
             "Remember post-SWI",
-            REMEMBER_SWIRET_HVC_IMM,
         );
         // QEMU raspi3b workaround: patch the kernel's `mrs r1, SPSR`
         // at DAH entry (0x393144) so EL2 can substitute the
@@ -991,9 +929,8 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             rom_ptr,
             DAH_MRS_SPSR_PC,
             DAH_MRS_SPSR_INSN,
-            hvc_insn(DAH_MRS_SPSR_HVC_IMM),
+            HvcImm::DahMrsSpsr,
             "DataAbortHandler mrs r1, SPSR (QEMU spsr_abt staleness fix)",
-            DAH_MRS_SPSR_HVC_IMM,
         );
         // Layer-γ probe: `cmp r0, #0` after `bl FaultMonitorEntry` at
         // 0x00393984. Captures FaultMonitorEntry's return value so we
@@ -1002,9 +939,8 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             rom_ptr,
             DAH_FME_RET_PC,
             DAH_FME_RET_INSN,
-            hvc_insn(DAH_FME_RET_HVC_IMM),
+            HvcImm::DahFmeRet,
             "DAH FaultMonitorEntry return cmp r0, #0",
-            DAH_FME_RET_HVC_IMM,
         );
         // Layer-γ probe: static FaultMonitorEntry entry at 0x0011FC60.
         // Captures input fault mask in r0 if the post-ship slot
@@ -1013,9 +949,8 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             rom_ptr,
             FME_STATIC_PC,
             FME_STATIC_FIRST_INSN,
-            hvc_insn(DAH_FME_ENTRY_HVC_IMM),
+            HvcImm::DahFmeEntry,
             "FaultMonitorEntry static entry (mov ip, sp)",
-            DAH_FME_ENTRY_HVC_IMM,
         );
         // Layer-γ probe: DAH OR-chain entry at 0x00393318 (`ldr r1,
         // [pc, #1588]` loading the address of gCurrentTask). Captures
@@ -1026,9 +961,8 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             rom_ptr,
             DAH_OR_CHAIN_PC,
             DAH_OR_CHAIN_INSN,
-            hvc_insn(DAH_OR_CHAIN_HVC_IMM),
+            HvcImm::DahOrChain,
             "DAH OR-chain entry (ldr r1, &gCurrentTask)",
-            DAH_OR_CHAIN_HVC_IMM,
         );
         // UnhandledException tripwires — halt cleanly with the kernel-
         // supplied exception-name string instead of letting the boot
@@ -1037,17 +971,15 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             rom_ptr,
             UNHANDLED_EXCEPTION_PC,
             UNHANDLED_EXCEPTION_FIRST_INSN,
-            hvc_insn(UNHANDLED_EXCEPTION_HVC_IMM),
+            HvcImm::UnhandledException,
             "UnhandledException entry (halt-on-entry tripwire)",
-            UNHANDLED_EXCEPTION_HVC_IMM,
         );
         patch_probe(
             rom_ptr,
             UNHANDLED_NUM_EXCEPTION_PC,
             UNHANDLED_NUM_EXCEPTION_FIRST_INSN,
-            hvc_insn(UNHANDLED_NUM_EXCEPTION_HVC_IMM),
+            HvcImm::UnhandledNumException,
             "UnhandledNonUserModeException entry (halt-on-entry tripwire)",
-            UNHANDLED_NUM_EXCEPTION_HVC_IMM,
         );
         // FPE-entry probe — load-bearing FP-bypass plumbing. Per the
         // BE-8 migration plan this is kept regardless of the iter-50..89
@@ -1057,74 +989,65 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             rom_ptr,
             FPE_ENTRY_PROBE_PC,
             FPE_ENTRY_FIRST_INSN,
-            hvc_insn(FPE_ENTRY_PROBE_HVC_IMM),
+            HvcImm::FpeEntryProbe,
             "FP_UndefHandlers_Start mov ip, sp (FPE bypass)",
-            FPE_ENTRY_PROBE_HVC_IMM,
         );
         // Iter-108 splash-chain diagnostic.
         patch_probe(
             rom_ptr,
             SPLASH_PROBE_INIT_TOOLBOX_PC,
             SPLASH_PROBE_INIT_TOOLBOX_INSN,
-            hvc_insn(SPLASH_PROBE_HVC_IMM),
+            HvcImm::SplashProbe,
             "TNotebook::InitToolbox entry (splash-chain diag)",
-            SPLASH_PROBE_HVC_IMM,
         );
         patch_probe(
             rom_ptr,
             SPLASH_PROBE_AFTER_PARENT_PC,
             SPLASH_PROBE_AFTER_PARENT_INSN,
-            hvc_insn(SPLASH_PROBE_HVC_IMM),
+            HvcImm::SplashProbe,
             "TNotebook::InitToolbox after parent::InitToolbox (splash-chain diag)",
-            SPLASH_PROBE_HVC_IMM,
         );
         patch_probe(
             rom_ptr,
             SPLASH_PROBE_AFTER_VT_PC,
             SPLASH_PROBE_AFTER_VT_INSN,
-            hvc_insn(SPLASH_PROBE_HVC_IMM),
+            HvcImm::SplashProbe,
             "TNotebook::InitToolbox after vtable+InitScriptGlobals (splash-chain diag)",
-            SPLASH_PROBE_HVC_IMM,
         );
         patch_probe(
             rom_ptr,
             SPLASH_PROBE_AFTER_INKER_PC,
             SPLASH_PROBE_AFTER_INKER_INSN,
-            hvc_insn(SPLASH_PROBE_HVC_IMM),
+            HvcImm::SplashProbe,
             "TNotebook::InitToolbox after InitInker (splash-chain diag)",
-            SPLASH_PROBE_HVC_IMM,
         );
         patch_probe(
             rom_ptr,
             SPLASH_PROBE_ISG_ENTRY_PC,
             SPLASH_PROBE_ISG_ENTRY_INSN,
-            hvc_insn(SPLASH_PROBE_HVC_IMM),
+            HvcImm::SplashProbe,
             "InitScriptGlobals__Fv entry (splash-chain diag)",
-            SPLASH_PROBE_HVC_IMM,
         );
         patch_probe(
             rom_ptr,
             SPLASH_PROBE_AFTER_CLONE_PC,
             SPLASH_PROBE_AFTER_CLONE_INSN,
-            hvc_insn(SPLASH_PROBE_HVC_IMM),
+            HvcImm::SplashProbe,
             "InitScriptGlobals after Clone+AllocateRefHandle (splash-chain diag)",
-            SPLASH_PROBE_HVC_IMM,
         );
         patch_probe(
             rom_ptr,
             SPLASH_PROBE_BEFORE_DRAW_PC,
             SPLASH_PROBE_BEFORE_DRAW_INSN,
-            hvc_insn(SPLASH_PROBE_HVC_IMM),
+            HvcImm::SplashProbe,
             "TNotebook::InitToolbox before DrawSplashScreen call (splash-chain diag)",
-            SPLASH_PROBE_HVC_IMM,
         );
         patch_probe(
             rom_ptr,
             SPLASH_PROBE_DRAW_SPLASH_PC,
             SPLASH_PROBE_DRAW_SPLASH_INSN,
-            hvc_insn(SPLASH_PROBE_HVC_IMM),
+            HvcImm::SplashProbe,
             "TNotebook::DrawSplashScreen entry (splash-chain diag)",
-            SPLASH_PROBE_HVC_IMM,
         );
         // ns_trace: hook the abstract POutTranslator vtable thunks
         // (Print / Putc / Flush / StackTrace / ExceptionNotify) so EL2
@@ -1137,41 +1060,36 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
                 rom_ptr,
                 PRINT_PROBE_PC,
                 PRINT_PROBE_FIRST_INSN,
-                hvc_insn(PRINT_PROBE_HVC_IMM),
+                HvcImm::PrintProbe,
                 "Print thunk (capture kernel REP printf output)",
-                PRINT_PROBE_HVC_IMM,
             );
             patch_probe(
                 rom_ptr,
                 PUTC_PROBE_PC,
                 PUTC_PROBE_FIRST_INSN,
-                hvc_insn(PUTC_PROBE_HVC_IMM),
+                HvcImm::PutcProbe,
                 "Putc thunk (single-char REP output)",
-                PUTC_PROBE_HVC_IMM,
             );
             patch_probe(
                 rom_ptr,
                 FLUSH_PROBE_PC,
                 FLUSH_PROBE_FIRST_INSN,
-                hvc_insn(FLUSH_PROBE_HVC_IMM),
+                HvcImm::FlushProbe,
                 "Flush thunk (flush buffered REP output)",
-                FLUSH_PROBE_HVC_IMM,
             );
             patch_probe(
                 rom_ptr,
                 STACK_TRACE_PROBE_PC,
                 STACK_TRACE_PROBE_FIRST_INSN,
-                hvc_insn(STACK_TRACE_PROBE_HVC_IMM),
+                HvcImm::StackTraceProbe,
                 "StackTrace thunk (NS-frame dump)",
-                STACK_TRACE_PROBE_HVC_IMM,
             );
             patch_probe(
                 rom_ptr,
                 EX_NOTIFY_PROBE_PC,
                 EX_NOTIFY_PROBE_FIRST_INSN,
-                hvc_insn(EX_NOTIFY_PROBE_HVC_IMM),
+                HvcImm::ExNotifyProbe,
                 "ExceptionNotify thunk (exception-frame dump)",
-                EX_NOTIFY_PROBE_HVC_IMM,
             );
         }
     }
@@ -1334,11 +1252,12 @@ unsafe fn patch_probe(
     rom_ptr: *mut u32,
     pc: u32,
     expected_orig: u32,
-    new_insn: u32,
+    hvc_imm: HvcImm,
     name: &'static str,
-    imm: u32,
 ) {
     let idx = (pc / 4) as usize;
+    let new_insn = hvc_imm.insn();
+    let imm = hvc_imm as u32;
     // SAFETY: caller of apply_717006_patches has already bounded rom_ptr.
     // The probe always rewrites a code word (the original first
     // instruction → an HVC), so the host read returns the BE numerical
@@ -1461,8 +1380,8 @@ unsafe fn apply_debug_patches(rom_ptr: *mut u32) {
     let debug_str_stub_pc = alloc_patch_stub(2, "DebugStr stub");
     let debugger_stub_pc  = alloc_patch_stub(2, "Debugger stub");
     // MOV r7, lr = E1A0_700E ; HVC #imm
-    let debugstr_stub: [u32; 2] = [0xE1A0_700E, hvc_insn(DEBUG_STR_HVC_IMM)];
-    let debugger_stub: [u32; 2] = [0xE1A0_700E, hvc_insn(DEBUGGER_HVC_IMM)];
+    let debugstr_stub: [u32; 2] = [0xE1A0_700E, HvcImm::DebugStr.insn()];
+    let debugger_stub: [u32; 2] = [0xE1A0_700E, HvcImm::Debugger.insn()];
     unsafe {
         write_stub_words(rom_ptr, debug_str_stub_pc, &debugstr_stub);
         write_stub_words(rom_ptr, debugger_stub_pc,  &debugger_stub);
@@ -1473,7 +1392,7 @@ unsafe fn apply_debug_patches(rom_ptr: *mut u32) {
         crate::guest_mem::write_rom_code_word(rom_ptr, word, insn);
         kprintln!(
             "rom_patch: 0x0038ce6c: {:#010x} -> {:#010x}  (DebugStr → B {:#x}, HVC #{:#x})",
-            prev, insn, debug_str_stub_pc, DEBUG_STR_HVC_IMM,
+            prev, insn, debug_str_stub_pc, HvcImm::DebugStr as u32,
         );
         let word = (0x0038_CE70 / 4) as usize;
         let prev = rom_ptr.add(word).read();
@@ -1481,7 +1400,7 @@ unsafe fn apply_debug_patches(rom_ptr: *mut u32) {
         crate::guest_mem::write_rom_code_word(rom_ptr, word, insn);
         kprintln!(
             "rom_patch: 0x0038ce70: {:#010x} -> {:#010x}  (Debugger → B {:#x}, HVC #{:#x})",
-            prev, insn, debugger_stub_pc, DEBUGGER_HVC_IMM,
+            prev, insn, debugger_stub_pc, HvcImm::Debugger as u32,
         );
     }
 }
@@ -1594,20 +1513,20 @@ unsafe fn apply_fdate_from_seconds_patch(rom_ptr: *mut u32) {
 }
 
 /// Replace the first word of `PowerOffAndReboot` (0x000E_6BBC) with a
-/// single `HVC #POWEROFF_REBOOT_HVC_IMM`. The handler in
+/// single `HVC #HvcImm::PowerOffReboot`. The handler in
 /// `trap::handle_hvc` dumps the calling context (R0 = reboot reason,
 /// LR via banked-reg path, mode, ELR) and halts — we never resume.
 /// This catches the boot-fail-and-reboot loop the FIRST time it fires
 /// instead of seeing 350k repeated tracer entries before timeout.
 unsafe fn apply_poweroff_reboot_trap(rom_ptr: *mut u32) {
     let idx = (POWEROFF_REBOOT_PC / 4) as usize;
-    let insn = hvc_insn(POWEROFF_REBOOT_HVC_IMM);
+    let insn = HvcImm::PowerOffReboot.insn();
     unsafe {
         let prev = rom_ptr.add(idx).read();
         crate::guest_mem::write_rom_code_word(rom_ptr, idx, insn);
         kprintln!(
             "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (PowerOffAndReboot canary, HVC #{:#x})",
-            POWEROFF_REBOOT_PC, prev, insn, POWEROFF_REBOOT_HVC_IMM,
+            POWEROFF_REBOOT_PC, prev, insn, HvcImm::PowerOffReboot as u32,
         );
     }
 }
@@ -1621,19 +1540,19 @@ unsafe fn apply_poweroff_reboot_trap(rom_ptr: *mut u32) {
 /// it.
 unsafe fn apply_reboot_trap(rom_ptr: *mut u32) {
     let idx = (REBOOT_PC / 4) as usize;
-    let insn = hvc_insn(REBOOT_HVC_IMM);
+    let insn = HvcImm::Reboot.insn();
     unsafe {
         let prev = rom_ptr.add(idx).read();
         crate::guest_mem::write_rom_code_word(rom_ptr, idx, insn);
         kprintln!(
             "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (Reboot canary, HVC #{:#x})",
-            REBOOT_PC, prev, insn, REBOOT_HVC_IMM,
+            REBOOT_PC, prev, insn, HvcImm::Reboot as u32,
         );
     }
 }
 
 /// Software-reset canary at `BootOS` (0x0001_8688). Overwrite the
-/// first word with `HVC #BOOTOS_HVC_IMM`; the handler distinguishes
+/// first word with `HVC #HvcImm::BootOs`; the handler distinguishes
 /// the legitimate first boot from a reset by counting entries. Panics
 /// at install time if the current first word isn't the expected
 /// `mov r0, #0xb0` (0xE3A000B0) — a ROM change would silently break
@@ -1649,13 +1568,13 @@ unsafe fn apply_bootos_trap(rom_ptr: *mut u32) {
         );
         return;
     }
-    let insn = hvc_insn(BOOTOS_HVC_IMM);
+    let insn = HvcImm::BootOs.insn();
     unsafe {
         crate::guest_mem::write_rom_code_word(rom_ptr, idx, insn);
     }
     kprintln!(
         "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (BootOS canary, HVC #{:#x})",
-        BOOTOS_PC, prev, insn, BOOTOS_HVC_IMM,
+        BOOTOS_PC, prev, insn, HvcImm::BootOs as u32,
     );
 }
 

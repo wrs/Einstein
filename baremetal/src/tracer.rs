@@ -61,12 +61,8 @@ use crate::trap::TrapContext;
 // Symbol-table backing storage lives in `crate::symbols` (always
 // available). Re-export the raw helpers here so the rest of this
 // file's code reads as it did before the extract.
+use crate::hvc_imm::HvcImm;
 use crate::symbols::{FN_COUNT, fn_addr, fn_name, fn_name_off};
-
-/// HVC immediate used by trampoline slot[0]. Routed from `trap::handle_hvc`
-/// to `handle_trace_hvc`. 0x50 chosen to not collide with existing
-/// guest-test HVC IDs (0x01..0x05, 0x20, 0x30, 0x40/0x41) or UND/DIAG tags.
-pub const TRACE_TAG: u32 = 0x50;
 
 /// Trampoline pool IPA range. Lives inside the ROM backing (which is
 /// 16 MiB stage-2 RO, sections 9..F of the guest's stage-1 L1 identity-
@@ -152,14 +148,6 @@ pub fn in_reserved_range(addr: u32) -> bool {
     if addr == crate::rom_patches::REBOOT_PC { return true; }
     if addr == crate::rom_patches::BOOTOS_PC { return true; }
     false
-}
-
-/// HVC A1 encoding: `cond 0001 0100 imm12 0111 imm4`, cond=0xE (AL).
-/// The 16-bit HVC immediate is split across bits 19:8 (hi 12) and 3:0.
-fn encode_hvc(imm16: u16) -> u32 {
-    let hi12 = (imm16 as u32) >> 4;
-    let lo4 = (imm16 as u32) & 0xF;
-    0xE140_0070 | (hi12 << 8) | lo4
 }
 
 /// Unconditional branch. `from_pc` is the PC of the `B` instruction,
@@ -346,7 +334,7 @@ pub fn init() {
         // also a literal target, hence the same swap.)
         unsafe {
             let slot = rom_base.add(slot_word_index);
-            slot.add(0).write(encode_hvc(TRACE_TAG as u16));
+            slot.add(0).write(HvcImm::Trace.insn());
             slot.add(1).write(slot1);
             slot.add(2).write(0xE59F_F000); // LDR PC, [pc, #0] → slot[4]
             slot.add(3).write(slot3.swap_bytes());
@@ -887,11 +875,9 @@ fn dump_guest_stack(sp: u32, words: usize) {
     );
 }
 
-/// The HVC #TRACE_TAG instruction as it appears in slot[0] of a tracer
-/// trampoline. In USR mode HVC is UNDEFINED, so `trap::handle_und`
-/// looks for exactly this encoding and treats it as an out-of-band
-/// trace dispatch.
-pub const TRACE_HVC_INSN: u32 = 0xE140_0570;
+// (The trampoline-slot[0] instruction encoding is `HvcImm::Trace.insn()`;
+//  `trap::handle_und` matches against that directly when a USR-mode HVC
+//  raises UND.)
 
 /// Check whether an address lies inside the tracer trampoline pool.
 /// Used by `trap::handle_und` to disambiguate a USR-mode UND of

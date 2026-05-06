@@ -28,7 +28,7 @@ test_main:
     bne     .Lfail_platform_vers
 
     mov     r0, #1
-    hvc     #5
+    hvc     #HVC_MARK
 
     @ --- 0x0F00_1800 04RAMSize == 0x40400040 --------------------------
     ldr     r4, =HW_RAM_SIZE_1
@@ -44,7 +44,7 @@ test_main:
     bne     .Lfail_ramsize2
 
     mov     r0, #2
-    hvc     #5
+    hvc     #HVC_MARK
 
     @ --- 0x0F11_0400 HighSpeedClck == 0x90 ----------------------------
     ldr     r4, =HW_HIGH_SPEED
@@ -53,20 +53,20 @@ test_main:
     bne     .Lfail_high_speed
 
     mov     r0, #3
-    hvc     #5
+    hvc     #HVC_MARK
 
     hvc_pass
     bx      lr
 
 .Lfail_platform_vers:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x70
 .Lfail_ramsize1:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x71
 .Lfail_ramsize2:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x72
 .Lfail_high_speed:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x73

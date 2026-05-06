@@ -30,7 +30,7 @@ test_main:
     bne     .Lfail_voyager
 
     mov     r0, #1
-    hvc     #5                              @ mark 1: voyager path ok
+    hvc     #HVC_MARK                              @ mark 1: voyager path ok
 
     @ -------- 0x33 InstallChipHandler ---------------------------------
     ldr     r0, =0xDEADBEEF
@@ -55,7 +55,7 @@ test_main:
     bne     .Lfail_getbyte
 
     mov     r0, #2
-    hvc     #5                              @ mark 2: install/put/get ok
+    hvc     #HVC_MARK                              @ mark 2: install/put/get ok
 
     @ -------- 0x39 RxBufFull ------------------------------------------
     ldr     r0, =0xDEADBEEF
@@ -72,7 +72,7 @@ test_main:
     bne     .Lfail_poweron
 
     mov     r0, #3
-    hvc     #5                              @ mark 3: status queries ok
+    hvc     #HVC_MARK                              @ mark 3: status queries ok
 
     @ -------- 0x4C InitByOption ---------------------------------------
     @ Einstein parses an option struct at r1; with no host port we
@@ -86,29 +86,29 @@ test_main:
     bne     .Lfail_init_opt
 
     mov     r0, #4
-    hvc     #5                              @ mark 4: init by option ok
+    hvc     #HVC_MARK                              @ mark 4: init by option ok
 
     hvc_pass
     bx      lr
 
 .Lfail_voyager:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x80
 .Lfail_install:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x81
 .Lfail_putbyte:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x82
 .Lfail_getbyte:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x83
 .Lfail_rxfull:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x84
 .Lfail_poweron:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x85
 .Lfail_init_opt:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x86

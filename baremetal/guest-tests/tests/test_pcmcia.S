@@ -43,7 +43,7 @@ test_main:
     bne     .Lfail_slot0_card_write
 
     mov     r0, #1
-    hvc     #5                       @ mark 1: slot 0 card-side empty
+    hvc     #HVC_MARK                       @ mark 1: slot 0 card-side empty
 
     @ --- Slot 0: chip-detect register storage (reg_3000 / reg_3800) ---
     ldr     r5, =PCMCIA_SLOT0_BASE
@@ -66,7 +66,7 @@ test_main:
     bne     .Lfail_slot0_reg3800
 
     mov     r0, #2
-    hvc     #5                       @ mark 2: chip-detect storage works
+    hvc     #HVC_MARK                       @ mark 2: chip-detect storage works
 
     @ --- Slot 0: reg_1C00 returns "no card" flag (0x000C) ---
     add     r0, r5, #0x1C00
@@ -78,7 +78,7 @@ test_main:
     bne     .Lfail_slot0_no_card
 
     mov     r0, #3
-    hvc     #5                       @ mark 3: no-card flag set
+    hvc     #HVC_MARK                       @ mark 3: no-card flag set
 
     @ --- Slot 0: reg_4400 returns 0xFC ---
     add     r0, r5, #0x4400
@@ -87,7 +87,7 @@ test_main:
     bne     .Lfail_slot0_reg4400
 
     mov     r0, #4
-    hvc     #5                       @ mark 4: reg_4400 = 0xFC
+    hvc     #HVC_MARK                       @ mark 4: reg_4400 = 0xFC
 
     @ --- Slot 1: same chip-detect storage at a different base ---
     ldr     r5, =PCMCIA_SLOT1_BASE
@@ -102,7 +102,7 @@ test_main:
     bne     .Lfail_slot1_reg3000
 
     mov     r0, #5
-    hvc     #5                       @ mark 5: slot 1 chip-detect storage works
+    hvc     #HVC_MARK                       @ mark 5: slot 1 chip-detect storage works
 
     @ --- Cross-slot isolation: slot 0's reg_3000 still holds 0xA5A5,
     @     not slot 1's 0xDEAD. ---
@@ -117,35 +117,35 @@ test_main:
     bne     .Lfail_cross_slot
 
     mov     r0, #6
-    hvc     #5                       @ mark 6: slots are isolated
+    hvc     #HVC_MARK                       @ mark 6: slots are isolated
 
     hvc_pass
     bx      lr
 
 .Lfail_slot0_attr:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x40
 .Lfail_slot0_io:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x41
 .Lfail_slot0_card_write:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x42
 .Lfail_slot0_reg3000:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x43
 .Lfail_slot0_reg3800:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x44
 .Lfail_slot0_no_card:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x45
 .Lfail_slot0_reg4400:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x46
 .Lfail_slot1_reg3000:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x47
 .Lfail_cross_slot:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x48

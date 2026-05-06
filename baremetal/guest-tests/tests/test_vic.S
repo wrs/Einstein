@@ -66,7 +66,7 @@ test_main:
     bne     .Lfail_int_ed_1
 
     mov     r0, #1
-    hvc     #5                      @ mark 1: r/w sanity passed
+    hvc     #HVC_MARK                      @ mark 1: r/w sanity passed
 
     @ --- Part 2: first async IRQ delivery via WFI ---
     @ Route ONLY timer-2 to IRQ: clear FIQ_MASK, set INT_CTRL = BIT_TIMER_2.
@@ -121,7 +121,7 @@ test_main:
     bne     .Lfail_not_cleared
 
     mov     r0, #2
-    hvc     #5                      @ mark 2: async IRQ delivered via WFI
+    hvc     #HVC_MARK                      @ mark 2: async IRQ delivered via WFI
 
     @ --- Part 3: a second match must fire only after a re-arm ---
     @ We didn't rewrite MATCH_2, so match_fired is still latched for slot 2
@@ -142,7 +142,7 @@ test_main:
     bne     .Lfail_second_count
 
     mov     r0, #3
-    hvc     #5                      @ mark 3: second IRQ after re-arm
+    hvc     #HVC_MARK                      @ mark 3: second IRQ after re-arm
 
     @ Re-mask IRQs so the final checks aren't racing against any stray
     @ pending bit.
@@ -153,33 +153,33 @@ test_main:
 
 .Lfail_int_ctrl:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x11
 .Lfail_fiq_mask:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x12
 .Lfail_int_ed_1:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x13
 .Lfail_irq_premature:
     mov     r0, r5
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x17
 .Lfail_wfi_no_irq:
     mov     r0, r5
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x18
 .Lfail_wrong_bit:
     mov     r0, r5
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x19
 .Lfail_not_cleared:
     mov     r0, r5
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x1B
 .Lfail_second_count:
     mov     r0, r5
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x1C

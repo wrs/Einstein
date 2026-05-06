@@ -19,7 +19,7 @@
 @                                return address for BL-invoked UNDs)
 @     The last one is mandatory for the DDK-UND dispatch; the
 @     hypervisor halts if the slot is 0 rather than silently advancing.
-@   - Stub then issues `hvc #0x10` (UND_TAG).
+@   - Stub then issues `hvc     #HVC_UND` (UND_TAG).
 @
 @ Not tested here: SWP / SWPB. A53 under QEMU executes SWP natively
 @ regardless of SCTLR.SW, so the hypervisor's emulator is bypassed on
@@ -29,6 +29,8 @@
 
     .syntax unified
     .arch armv7ve
+
+#include "../common/hvc_abi.S"
 
     @ Save slots must match src/trap.rs UND_SAVE_* IPAs.
     .equ UND_SAVE_LR_ADDR,         0x04005F00
@@ -91,7 +93,7 @@ _und_trampoline:
     msr     cpsr_c, #0xDB        @ back to UND, I=1 F=1
 
     pop     {r0, r1}
-    hvc     #0x10                @ UND_TAG — hypervisor decodes and ERETs
+    hvc     #HVC_UND                @ UND_TAG — hypervisor decodes and ERETs
     b       .Lhang               @ unreachable
 
 test_main:
@@ -103,7 +105,7 @@ test_main:
     bne     .Lfail_boot_und
 
     mov     r0, #1
-    hvc     #5                  @ mark 1: SystemBootUND dispatch ok
+    hvc     #HVC_MARK                  @ mark 1: SystemBootUND dispatch ok
 
     @ ---- DebuggerUND (0xE6000510) + null-terminated ASCII payload ---
     @ Inline marker + message. Handler scans from opcode+4 for a NUL
@@ -116,7 +118,7 @@ test_main:
     bne     .Lfail_dbg_und
 
     mov     r0, #2
-    hvc     #5                  @ mark 2: DebuggerUND dispatch ok
+    hvc     #HVC_MARK                  @ mark 2: DebuggerUND dispatch ok
 
     @ ---- TapFileCntl (0xE6000810) — BL-invoked function entry ----
     @ The UND lives at a named ROM symbol (the kernel's BL target).
@@ -136,9 +138,9 @@ test_main:
     bne     .Lfail_tap_und
 
     mov     r0, #3
-    hvc     #5                  @ mark 3: TapFileCntl dispatch ok
+    hvc     #HVC_MARK                  @ mark 3: TapFileCntl dispatch ok
 
-    hvc     #3                  @ PASS
+    hvc     #HVC_PASS                  @ PASS
     bx      lr
 
 tap_file_cntl_stub:
@@ -150,16 +152,16 @@ tap_file_cntl_stub:
     @ === Failure paths ============================================
 .Lfail_boot_und:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     mov     r0, #0x84
-    hvc     #4
+    hvc     #HVC_FAIL
 .Lfail_dbg_und:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     mov     r0, #0x85
-    hvc     #4
+    hvc     #HVC_FAIL
 .Lfail_tap_und:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     mov     r0, #0x86
-    hvc     #4
+    hvc     #HVC_FAIL

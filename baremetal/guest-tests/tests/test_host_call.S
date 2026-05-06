@@ -37,7 +37,7 @@ test_main:
     bne     .Lfail_set_uint32
 
     mov     r0, #1
-    hvc     #5                              @ mark 1: arg setters ok
+    hvc     #HVC_MARK                              @ mark 1: arg setters ok
 
     @ -------- 0x20 SetResultType --------------------------------------
     ldr     r0, =0xDEADBEEF
@@ -61,26 +61,26 @@ test_main:
     bne     .Lfail_get_errno
 
     mov     r0, #2
-    hvc     #5                              @ mark 2: call/result/errno ok
+    hvc     #HVC_MARK                              @ mark 2: call/result/errno ok
 
     hvc_pass
     bx      lr
 
 .Lfail_openlib:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xA0
 .Lfail_prep_ffi:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xA1
 .Lfail_set_uint32:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xA2
 .Lfail_set_result:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xA3
 .Lfail_call_void:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xA4
 .Lfail_get_errno:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xA5

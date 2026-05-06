@@ -11,6 +11,7 @@
 
 use core::ptr::addr_of_mut;
 
+use crate::hvc_imm::HvcImm;
 use crate::kprintln;
 
 // Size of each region, in bytes. Must be multiples of 2 MiB for the stage-2
@@ -1542,7 +1543,7 @@ pub unsafe fn load_newton_rom() {
     // REx address that our image doesn't back). Patch to HVC #DIAG_TAG
     // so any prefetch abort halts with a full banked-reg dump and we
     // can see the faulting fetch PC (= LR_abt − 4 for ARM).
-    unsafe { write_rom_code_word(rom_ptr, 3, 0xE140_0171); } // hvc #0x11
+    unsafe { write_rom_code_word(rom_ptr, 3, HvcImm::Diag.insn()); } // hvc #0x11
 
     // Bring-up shim #2: the 717006 kernel uses StrongARM's lax CP15 encoding
     // where CRm == CRn for most system-control registers. On ARMv7+ those
@@ -1859,8 +1860,8 @@ pub unsafe fn patch_dabt_vector(rom_ptr: *mut u32) {
         write_rom_code_word(rom_ptr, db +  8, 0xE200_000F); // and r0, r0, #0xF
         write_rom_code_word(rom_ptr, db +  9, 0xE350_0001); // cmp r0, #1
         write_rom_code_word(rom_ptr, db + 10, 0x0A00_0000); // beq +0x0 (word 12 = ALIGN hvc)
-        write_rom_code_word(rom_ptr, db + 11, 0xE140_0171); // hvc #0x11 (DIAG_TAG)
-        write_rom_code_word(rom_ptr, db + 12, 0xE140_0173); // hvc #0x13 (ALIGN_TAG)
+        write_rom_code_word(rom_ptr, db + 11, HvcImm::Diag.insn()); // hvc #0x11 (DIAG_TAG)
+        write_rom_code_word(rom_ptr, db + 12, HvcImm::Align.insn()); // hvc #0x13 (ALIGN_TAG)
         write_rom_code_word(rom_ptr, db + 13, 0xEAFF_FFFE); // b . (guard)
         // Literal slot — read by the LDR at db+2 under BE-8 (CPSR.E=1),
         // so write as data (BE-encoded host bytes).
@@ -2205,7 +2206,7 @@ unsafe fn patch_und_vector(rom: *mut u32) {
         write_rom_code_word(rom, base + 18, 0xE1A0_000E);  // mov r0, lr
         write_rom_code_word(rom, base + 19, 0xE58C_0008);  // str r0, [r12, #8]
         write_rom_code_word(rom, base + 20, 0xE321_F0DB);  // msr cpsr_c, #0xdb (UND)
-        write_rom_code_word(rom, base + 21, 0xE140_0170);  // hvc #0x10
+        write_rom_code_word(rom, base + 21, HvcImm::Und.insn());  // hvc #0x10
         write_rom_code_word(rom, base + 22, 0xEAFF_FFFE);  // b . (trap)
         // Literal slot — loaded by the `ldr r12, [pc, #0x50]` at base+1
         // under BE-8, so write as data.
@@ -2228,7 +2229,7 @@ unsafe fn patch_und_vector(rom: *mut u32) {
         //   +0x08: eaff_fffe  B .                 ; guard
         let di = SBA_PREFAULT_STUB_OFFSET / 4;
         write_rom_code_word(rom, di + 0, 0xE5D0_0000);  // ldrb r0, [r0]
-        write_rom_code_word(rom, di + 1, 0xE140_0174);  // hvc #0x14 (SBA_RETRY_TAG)
+        write_rom_code_word(rom, di + 1, HvcImm::SbaRetry.insn());  // hvc #0x14 (SBA_RETRY_TAG)
         write_rom_code_word(rom, di + 2, 0xEAFF_FFFE);  // b . (guard)
         write_rom_code_word(rom, di + 3, 0xEAFF_FFFE);  // padding (guard)
         write_rom_code_word(rom, di + 4, 0xEAFF_FFFE);

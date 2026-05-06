@@ -64,7 +64,7 @@ test_main:
     bne     .Lfail_bit_1
 
     mov     r0, #1
-    hvc     #5
+    hvc     #HVC_MARK
 
     @ --- Sub-test 2: channel 5 (bit 5 of enable, INT bit 0x1000) ---
     ldr     r4, =DMA_ENABLE
@@ -84,7 +84,7 @@ test_main:
     bne     .Lfail_bit_2
 
     mov     r0, #2
-    hvc     #5
+    hvc     #HVC_MARK
 
     @ --- Sub-test 3: channels 3 + 7 simultaneously (bits 3 and 7 of
     @ enable; INT bits 0x400 | 0x4000 = 0x4400) ---
@@ -105,7 +105,7 @@ test_main:
     bne     .Lfail_bit_3
 
     mov     r0, #3
-    hvc     #5
+    hvc     #HVC_MARK
 
     cpu_disable_irq
 
@@ -113,20 +113,20 @@ test_main:
     bx      lr
 
 .Lfail_count_1:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xC0
 .Lfail_bit_1:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xC1
 .Lfail_count_2:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xC2
 .Lfail_bit_2:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xC3
 .Lfail_count_3:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xC4
 .Lfail_bit_3:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xC5

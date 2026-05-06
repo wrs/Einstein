@@ -37,7 +37,7 @@ test_main:
     bne     .Lfail_b0_sticky
 
     mov     r0, #1
-    hvc     #5
+    hvc     #HVC_MARK
 
     @ -------- Bank 1 --------------------------------------------------
     ldr     r4, =BIO_1
@@ -64,28 +64,28 @@ test_main:
     bne     .Lfail_b31
 
     mov     r0, #2
-    hvc     #5
+    hvc     #HVC_MARK
 
     hvc_pass
     bx      lr
 
 .Lfail_b0:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xE0
 .Lfail_b0_sticky:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xE1
 .Lfail_b1:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xE2
 .Lfail_b12:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xE3
 .Lfail_b31:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xE4

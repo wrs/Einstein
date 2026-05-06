@@ -24,7 +24,8 @@
     .syntax unified
     .arch armv7ve
 
-    .equ ALIGN_TAG,     0x13
+#include "../common/hvc_abi.S"
+
     .equ DABT_SAVE_PA,  0x04005FA0
 
     .equ SRC_ADDR,      0x04010000
@@ -83,7 +84,7 @@ _dabt_trampoline:
     str     sp,  [r0, #4]            @ SP_abt    +0x04
     mrs     r1,  spsr
     str     r1,  [r0, #8]            @ SPSR_abt  +0x08
-    hvc     #ALIGN_TAG
+    hvc     #HVC_ALIGN
     b       .                        @ guard (handler ERETs past the fault)
 
 test_main:
@@ -96,7 +97,7 @@ test_main:
     bne     .Lfail_ror8
 
     mov     r0, #1
-    hvc     #5
+    hvc     #HVC_MARK
 
     @ --- offset +2 (ROR 16) -----------------------------------------
     ldr     r0, =SRC_ADDR
@@ -107,7 +108,7 @@ test_main:
     bne     .Lfail_ror16
 
     mov     r0, #2
-    hvc     #5
+    hvc     #HVC_MARK
 
     @ --- offset +3 (ROR 24) -----------------------------------------
     ldr     r0, =SRC_ADDR
@@ -118,7 +119,7 @@ test_main:
     bne     .Lfail_ror24
 
     mov     r0, #3
-    hvc     #5
+    hvc     #HVC_MARK
 
     @ --- offset +0 (aligned — should NOT fault) --------------------
     ldr     r0, =SRC_ADDR
@@ -128,29 +129,29 @@ test_main:
     bne     .Lfail_aligned
 
     mov     r0, #4
-    hvc     #5
+    hvc     #HVC_MARK
 
-    hvc     #3                  @ PASS
+    hvc     #HVC_PASS                  @ PASS
     bx      lr
 
     @ === Failure paths ==============================================
 .Lfail_ror8:
     mov     r0, r2
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     mov     r0, #0x70
-    hvc     #4
+    hvc     #HVC_FAIL
 .Lfail_ror16:
     mov     r0, r2
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     mov     r0, #0x71
-    hvc     #4
+    hvc     #HVC_FAIL
 .Lfail_ror24:
     mov     r0, r2
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     mov     r0, #0x72
-    hvc     #4
+    hvc     #HVC_FAIL
 .Lfail_aligned:
     mov     r0, r2
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     mov     r0, #0x73
-    hvc     #4
+    hvc     #HVC_FAIL

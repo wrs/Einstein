@@ -41,7 +41,7 @@ test_main:
     beq     .Lfail_status_mdem
 
     mov     r0, #1
-    hvc     #5                  @ mark 1: all four status regs reported TX empty
+    hvc     #HVC_MARK                  @ mark 1: all four status regs reported TX empty
 
     @ ---- TX byte writes ------------------------------------------
     @ Spell "hi" out of each port to exercise the TX consume path.
@@ -70,7 +70,7 @@ test_main:
     str     r5, [r4]
 
     mov     r0, #2
-    hvc     #5                  @ mark 2: TX writes accepted
+    hvc     #HVC_MARK                  @ mark 2: TX writes accepted
 
     @ ---- RX byte read returns zero --------------------------------
     ldr     r4, =0x0F1C7000
@@ -79,7 +79,7 @@ test_main:
     bne     .Lfail_rx_nonzero
 
     mov     r0, #3
-    hvc     #5                  @ mark 3: RX read returned 0
+    hvc     #HVC_MARK                  @ mark 3: RX read returned 0
 
     @ Per Phase A, reads to unknown offsets inside a serial window
     @ now halt loudly (they used to return 0 silently, which masked
@@ -87,31 +87,31 @@ test_main:
     @ exercises the unknown-offset path; add a dedicated negative
     @ test if we want to assert the halt itself.
 
-    hvc     #3                  @ PASS
+    hvc     #HVC_PASS                  @ PASS
     bx      lr
 
 .Lfail_status_extr:
     mov     r0, r5
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     mov     r0, #0xA0
-    hvc     #4
+    hvc     #HVC_FAIL
 .Lfail_status_infr:
     mov     r0, r5
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     mov     r0, #0xA1
-    hvc     #4
+    hvc     #HVC_FAIL
 .Lfail_status_tblt:
     mov     r0, r5
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     mov     r0, #0xA2
-    hvc     #4
+    hvc     #HVC_FAIL
 .Lfail_status_mdem:
     mov     r0, r5
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     mov     r0, #0xA3
-    hvc     #4
+    hvc     #HVC_FAIL
 .Lfail_rx_nonzero:
     mov     r0, r5
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     mov     r0, #0xA4
-    hvc     #4
+    hvc     #HVC_FAIL

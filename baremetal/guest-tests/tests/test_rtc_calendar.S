@@ -44,18 +44,18 @@ test_main:
     bcc     .Lfail_nondecreasing
 
     mov     r0, #1
-    hvc     #5
+    hvc     #HVC_MARK
 
     hvc_pass
     bx      lr
 
 .Lfail_zero:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x80
 .Lfail_pre_2020:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x81
 .Lfail_nondecreasing:
     mov     r0, r5
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x82

@@ -76,7 +76,7 @@ test_main:
     bne     .Lfail_get_hw_w6
 
     mov     r0, #1
-    hvc     #5                              @ mark 1: hw info ok
+    hvc     #HVC_MARK                              @ mark 1: hw info ok
 
     @ -------- 0x05 SetOutputBuffers (no-op) ---------------------------
     ldr     r0, =0xDEADBEEF
@@ -93,41 +93,41 @@ test_main:
     bne     .Lfail_subfn_10
 
     mov     r0, #2
-    hvc     #5                              @ mark 2: no-op subfns ok
+    hvc     #HVC_MARK                              @ mark 2: no-op subfns ok
 
     hvc_pass
     bx      lr
 
 .Lfail_set_hw:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xD0
 .Lfail_get_hw_r0:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xD1
 .Lfail_get_hw_w0:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xD2
 .Lfail_get_hw_w1:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xD3
 .Lfail_get_hw_w2:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xD4
 .Lfail_get_hw_w3:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xD5
 .Lfail_get_hw_w4:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xD6
 .Lfail_get_hw_w5:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xD7
 .Lfail_get_hw_w6:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xD8
 .Lfail_subfn_05:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xD9
 .Lfail_subfn_10:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xDA

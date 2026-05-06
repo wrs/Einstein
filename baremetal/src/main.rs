@@ -16,6 +16,7 @@ mod guest_endian;
 mod guest_mem;
 mod heap_check;
 mod heap_watch;
+mod hvc_imm;
 mod mmio;
 mod mmu;
 mod pa_emulate;

@@ -23,6 +23,8 @@
     .syntax unified
     .arch armv7ve
 
+#include "../common/hvc_abi.S"
+
     .equ SCRATCH_BASE,       0x04003000   @ 16-byte scratch, word aligned
     .equ SCRATCH_HI,         0x12000000   @ test-only mmio scratch (≥ XOR_LIMIT)
 
@@ -63,14 +65,14 @@ _reset:
     @ range [PATCH_START, PATCH_END).
     load_sym r0, patch_start
     load_sym r1, patch_end
-    hvc     #0x30                       @ returns patched-count in r0
-    hvc     #2                          @ print it for the log
+    hvc     #HVC_SHADOW_PATCH_RANGE                       @ returns patched-count in r0
+    hvc     #HVC_PRINT_HEX                          @ print it for the log
 
     bl      test_main
 
     @ If test_main returns without signalling, treat as failure.
     mov     r0, #0xFF
-    hvc     #4                          @ FAIL
+    hvc     #HVC_FAIL                          @ FAIL
 .Lhang:
     b       .Lhang
 
@@ -93,7 +95,7 @@ _reset:
     mov     r0, #0x06
     b       .Lhalt_fail
 .Lhalt_fail:
-    hvc     #4
+    hvc     #HVC_FAIL
     b       .Lhang
 
     @ SWI vector dispatcher. Reads a "SWI mode" flag at 0x04003F08:
@@ -131,9 +133,9 @@ _swi_dispatch:
 
     @ Jump target: r0 = subtest number, prints and halts FAIL.
 .Lfail:
-    hvc     #2                          @ print subtest number
+    hvc     #HVC_PRINT_HEX                          @ print subtest number
     mov     r0, #0xEE
-    hvc     #4
+    hvc     #HVC_FAIL
     b       .Lhang
 
     @ Macro: fail with a subtest number.
@@ -179,16 +181,16 @@ test_main:
     pop     {r4-r11, lr}
     @ Print PASS banner via unpatched HVC_PUTC.
     mov     r0, #'P'
-    hvc     #1
+    hvc     #HVC_PRINT_BYTE
     mov     r0, #'A'
-    hvc     #1
+    hvc     #HVC_PRINT_BYTE
     mov     r0, #'S'
-    hvc     #1
+    hvc     #HVC_PRINT_BYTE
     mov     r0, #'S'
-    hvc     #1
+    hvc     #HVC_PRINT_BYTE
     mov     r0, #'\n'
-    hvc     #1
-    hvc     #3                          @ guest test PASSED
+    hvc     #HVC_PRINT_BYTE
+    hvc     #HVC_PASS                          @ guest test PASSED
     bx      lr
 
     @ ==============================================================
@@ -218,7 +220,7 @@ subtest_01_word_then_byte:
     bx      lr
 .Lst1_fail:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     fail_st 1
 
     @ ---- subtest 2: byte-writes then word-read --------------------
@@ -241,7 +243,7 @@ subtest_02_byte_then_word:
     bx      lr
 .Lst2_fail:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     fail_st 2
 
     @ ---- subtest 3: idempotent STRB then LDRB ---------------------
@@ -262,7 +264,7 @@ subtest_03_byte_then_byte:
     bx      lr
 .Lst3_fail:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     fail_st 3
 
     @ ---- subtest 4: halfword variants -----------------------------
@@ -285,7 +287,7 @@ subtest_04_halfword:
     bx      lr
 .Lst4_fail:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     fail_st 4
 
     @ ---- subtest 5: signed byte & halfword ------------------------
@@ -310,7 +312,7 @@ subtest_05_signed:
     bx      lr
 .Lst5_fail:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     fail_st 5
 
     @ ---- subtest 6: register-offset LDRB --------------------------
@@ -333,7 +335,7 @@ subtest_06_reg_offset:
     bx      lr
 .Lst6_fail:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     fail_st 6
 
     @ ---- subtest 7: register-offset with LSL #2 -------------------
@@ -354,7 +356,7 @@ subtest_07_reg_offset_shift:
     bx      lr
 .Lst7_fail:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     fail_st 7
 
     @ ---- subtest 8: pre-indexed writeback -------------------------
@@ -373,7 +375,7 @@ subtest_08_pre_writeback:
     bx      lr
 .Lst8_fail:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     fail_st 8
 
     @ ---- subtest 9: post-indexed ----------------------------------
@@ -391,7 +393,7 @@ subtest_09_post_index:
     bx      lr
 .Lst9_fail:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     fail_st 9
 
     @ ---- subtest 10: conditional LDRBEQ ---------------------------
@@ -416,7 +418,7 @@ subtest_10_conditional:
     bx      lr
 .Lst10_fail:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     fail_st 10
 
     @ ---- subtest 11: MMIO skip (addr >= XOR_LIMIT) ----------------
@@ -449,7 +451,7 @@ subtest_11_mmio_skip:
     bx      lr
 .Lst11_fail:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     fail_st 11
 
     @ ---- subtest 12: SP-relative LDRB [SP, #imm] ------------------
@@ -480,7 +482,7 @@ subtest_12_sp_imm:
     mov     r0, r6
     add     sp, sp, #16
     pop     {r4, r5, r6, r7, lr}
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     fail_st 12
 
     @ ---- subtest 13: SP-relative LDRB [SP, #-imm] -----------------
@@ -504,7 +506,7 @@ subtest_13_sp_neg_imm:
     mov     r0, r6
     add     sp, sp, #16
     pop     {r4, r5, r6, r7, lr}
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     fail_st 13
 
     @ ---- subtest 14: SP + Rm ---------------------------------------
@@ -538,7 +540,7 @@ subtest_14_sp_reg:
     mov     r0, r6
     add     sp, sp, #16
     pop     {r4, r5, r6, r7, lr}
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     fail_st 14
 
     @ ---- subtest 15: pre-index writeback through SP --------------
@@ -564,7 +566,7 @@ subtest_15_sp_writeback:
     mov     sp, r7                      @ restore SP in failure path
     add     sp, sp, #16
     pop     {r4, r5, r6, r7, lr}
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     fail_st 15
 
     @ ---- subtest 16: post-index through SP -----------------------
@@ -590,7 +592,7 @@ subtest_16_sp_post_index:
     mov     sp, r7
     add     sp, sp, #16
     pop     {r4, r5, r6, r7, lr}
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     fail_st 16
 
     @ ---- subtest 17: SWPB ----------------------------------------
@@ -632,7 +634,7 @@ subtest_17_swpb:
     bx      lr
 .Lst17_fail:
     mov     r0, r7
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     fail_st 17
 
     @ ---- subtest 18: LDRD / STRD ----------------------------------
@@ -677,7 +679,7 @@ subtest_18_ldrd_verify:
     bx      lr
 .Lst18_fail:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     fail_st 18
 
     @ ---- subtest 20: RAM-resident code ---------------------------
@@ -750,7 +752,7 @@ subtest_20_ram_resident:
     mov     r10, r0
     pop     {r4, r5, r6, r7, r8, r9, lr}
     mov     r0, r10
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     fail_st 20
 
 
@@ -845,7 +847,7 @@ subtest_21_ram_reload:
     mov     r10, r0
     pop     {r4, r5, r6, r7, r8, r9, r10, lr}
     mov     r0, r10
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     fail_st 21
 
     @ ---- subtest 22: inline-stub correctness across modes ---------
@@ -886,7 +888,7 @@ subtest_22_inline_stub_modes:
 .Lst22_fail:
     @ r0 holds the failure subcode (each helper returns its own).
     pop     {r4, lr}
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     fail_st 22
 
     @ ---- per-mode helpers ----------------------------------------
@@ -1043,7 +1045,7 @@ subtest_23_swi_during_stubs:
     movt    r1, #0x0400
     mov     r2, #0
     str     r2, [r1]
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     pop     {r4, r5, r6, lr}
     fail_st 23
 
@@ -1155,7 +1157,7 @@ subtest_24_scratch_va_preserves_caller:
 .Lst24_fail_byte:  mov r0, #0x245; b .Lst24_fail_done
 .Lst24_fail_nzcv:  mov r0, #0x246
 .Lst24_fail_done:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     pop     {r4-r11, lr}
     fail_st 24
 

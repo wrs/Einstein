@@ -8,7 +8,7 @@
 //! return — the vector trailer restores the context and ERETs. Handlers that
 //! don't want to resume never return (they call `cpu::halt`).
 
-use crate::{cpu, guest_mem, kprintln, mmio, peripherals, peripherals::{native_primitives, vic}, platform, shadow_stub, timer};
+use crate::{cpu, guest_mem, hvc_imm::HvcImm, kprintln, mmio, peripherals, peripherals::{native_primitives, vic}, platform, shadow_stub, timer};
 
 macro_rules! read_sysreg {
     ($reg:literal) => {{
@@ -43,37 +43,8 @@ const EC_HVC_A32: u32 = 0x12;
 const EC_INSN_ABORT_LOWER: u32 = 0x20;
 const EC_DATA_ABORT_LOWER: u32 = 0x24;
 
-/// HVC immediate used by the guest's UND-vector trampoline at VA 0x04.
-/// ARMv7 AArch32 has no HCR_EL2 bit that traps UND directly to EL2, so
-/// we install a one-word `HVC #UND_TAG` at the UND vector and decode
-/// the faulting instruction ourselves in `handle_und`.
-pub const UND_TAG: u32 = 0x10;
-
-/// Alignment-fault fast path. DABT trampoline at `DABT_TRAMP_OFFSET`
-/// checks `DFSR.FS[3:0] == 1` (alignment fault, ARMv7 short descriptor)
-/// right after saving R0/R1 to TPIDR scratch, and issues
-/// `HVC #ALIGN_TAG` directly instead of the DIAG state-capture path.
-/// `handle_align_fault` decodes the faulting LDR/STR and emulates it
-/// with SA-1100 rotate-LDR semantics, then ERETs past the faulting
-/// insn. See `unaligned.rs`.
-pub const ALIGN_TAG: u32 = 0x13;
-
-/// Shadow-byte-access retry HVC. Issued by the pre-fault stub at
-/// `SBA_PREFAULT_STUB_VA` after its LDRB probe completes (either
-/// natively, or after the kernel's DABT path paged in the missing
-/// page and the kernel's `subs pc, lr, #8` retried the probe).
-/// Handler restores the stashed emulator context and resumes in
-/// `shadow_stub::handle_sba_retry`.
-pub const SBA_RETRY_TAG: u32 = 0x14;
-
-/// Test-only GPIO line-rise trigger. A guest test issues `HVC #GPIO_TRIGGER_TAG`
-/// to inject a virtual GPIO event so the test can verify
-/// `peripherals::vic::INT_GPIO` (bit `0x01_000000`) lights up `int_present`
-/// and gets delivered as a virtual IRQ. Real GPIO sources don't use this
-/// path — they call `vic::raise(INT_GPIO)` directly. This is purely a
-/// test hook so `tests/test_gpio.S` doesn't need to fabricate a real
-/// device event.
-pub const GPIO_TRIGGER_TAG: u32 = 0x06;
+// (UND / ALIGN / SBA_RETRY / GPIO_TRIGGER / DIAG immediates live in
+//  `crate::hvc_imm::HvcImm` — see that module for descriptions.)
 
 /// iter-59 diagnostic counters: per-immediate HVC histogram (256
 /// slots covering imm[0..256]). Pulled from `trap_irq` every ~2 s of
@@ -132,17 +103,6 @@ pub fn dump_hvc_tag_stats() {
 }
 
 
-/// Generic "inspect-then-halt" HVC immediate, used by temporary
-/// vector-intercept patches during Phase B debugging. When we need to
-/// see the CPU state at the moment of an abort we don't otherwise see
-/// from EL2 (stage-1 aborts handled entirely by the guest), we patch
-/// the relevant guest-mode vector to `HVC #DIAG_TAG`. The handler
-/// dumps registers / banked SPSR / banked SP/LR via the X-register
-/// mapping (DDI 0487 D1.21.1 Table D1-79), walks the guest stage-1
-/// table for the faulting VA, and halts. Remove the patch once the
-/// root cause is identified.
-pub const DIAG_TAG: u32 = 0x11;
-
 /// Synchronous exception from a lower EL running AArch32.
 #[no_mangle]
 pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
@@ -179,7 +139,7 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
     // carries the same signal, and pairing each with a `trap: EC=...`
     // line doubles the output volume for no added information.
     #[cfg(feature = "trace")]
-    let is_trace_hvc = ec == EC_HVC_A32 && (iss & 0xFFFF) == crate::tracer::TRACE_TAG;
+    let is_trace_hvc = ec == EC_HVC_A32 && (iss & 0xFFFF) == HvcImm::Trace as u32;
     #[cfg(not(feature = "trace"))]
     let is_trace_hvc = false;
 
@@ -1214,35 +1174,34 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
     // iter-59 diagnostic: per-imm HVC histogram. See dump_hvc_tag_stats.
     hvc_count(imm);
     match imm {
-        0x01 => {
-            // Print one ASCII byte from r0.
+        v if v == HvcImm::GuestTestPrintByte as u32 => {
             let b = r0 as u8;
             if b == b'\n' { crate::uart::write_byte(b'\r'); }
             crate::uart::write_byte(b);
         }
-        0x02 => {
+        v if v == HvcImm::GuestTestPrintHex as u32 => {
             kprintln!("guest-hex: {:#010x}", r0);
         }
-        0x03 => {
+        v if v == HvcImm::GuestTestPass as u32 => {
             kprintln!();
             kprintln!("*** guest test PASSED (r0={:#x}) ***", r0);
             cpu::halt();
         }
-        0x04 => {
+        v if v == HvcImm::GuestTestFail as u32 => {
             kprintln!();
             kprintln!("*** guest test FAILED (code={:#x}) ***", r0);
             cpu::halt();
         }
-        0x05 => {
+        v if v == HvcImm::GuestMark as u32 => {
             kprintln!("guest-mark: {:#010x}", r0);
         }
-        0x40 => {
-            // DebugStr ROM-patch trap: the ROM-patched stub at
-            // DEBUG_STR_STUB_PC does `MOV r7, LR` before this HVC so we
-            // can read LR without relying on AArch64 banked-register
-            // accesses (MRS LR_svc is unimplemented on QEMU raspi3b's
-            // Cortex-A53 model). r0 is the guest's string pointer; we
-            // log it and resume at LR + 4, matching Einstein's callback
+        v if v == HvcImm::DebugStr as u32 => {
+            // DebugStr ROM-patch trap: the ROM-patched stub does
+            // `MOV r7, LR` before this HVC so we can read LR without
+            // relying on AArch64 banked-register accesses (MRS LR_svc
+            // is unimplemented on QEMU raspi3b's Cortex-A53 model).
+            // r0 is the guest's string pointer; we log it and resume
+            // at LR + 4, matching Einstein's callback
             // (Emulator/JIT/Generic/TJITGenericROMPatch.cpp:76).
             let addr = r0;
             log_guest_string("DebugStr", addr);
@@ -1257,12 +1216,12 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
             }
             return;
         }
-        0x41 => {
+        v if v == HvcImm::Debugger as u32 => {
             // Debugger ROM-patch trap. Stub stashed LR into r7 for the
             // same reason as DebugStr above. Einstein's callback breaks
             // into the host debugger and returns PC = LR + 8
-            // (TJITGenericROMPatch.cpp:96); we have no host debugger, so
-            // log the site and continue.
+            // (TJITGenericROMPatch.cpp:96); we have no host debugger,
+            // so log the site and continue.
             let elr = read_sysreg!("elr_el2");
             kprintln!("Debugger trap @ELR={:#x}", elr);
             let lr = ctx.x[7] as u32;
@@ -1275,11 +1234,12 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
             }
             return;
         }
-        0x30 => {
-            // Shadow-stub patch request: r0=start_ipa, r1=end_ipa (exclusive).
-            // Scans that IPA range of the ROM backing (the guest-test image)
-            // and patches every LDRB/STRB/LDRH/STRH/LDRSB/LDRSH. Emits stubs
-            // into the shadow-stub pool and rewrites originals to Bcc stub.
+        v if v == HvcImm::ShadowPatchRange as u32 => {
+            // Shadow-stub patch request: r0=start_ipa, r1=end_ipa
+            // (exclusive). Scans that IPA range of the ROM backing
+            // (the guest-test image) and patches every LDRB/STRB/
+            // LDRH/STRH/LDRSB/LDRSH. Emits stubs into the shadow-stub
+            // pool and rewrites originals to Bcc stub.
             let start = ctx.x[0] as u32;
             let end = ctx.x[1] as u32;
             let stats = crate::shadow_stub::patch_code_range(start, end);
@@ -1287,7 +1247,7 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
             // Echo the patched count back to r0 so the guest can check it.
             ctx.x[0] = stats.patched as u64;
         }
-        0x20 => {
+        v if v == HvcImm::Snapshot as u32 => {
             // Save snapshot — see src/snapshot.rs. ctx.x[0..30] is
             // the AArch64 GPR view that aliases AArch32 R0..R12 plus
             // every banked SP/LR per ARM ARM Table D1-79; ELR_EL2 /
@@ -1300,7 +1260,7 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
                 kprintln!("snapshot: save failed: {}", e);
             }
         }
-        0x21 => {
+        v if v == HvcImm::TaskDump as u32 => {
             // Full kernel-state dump on demand. Issued from a guest
             // ROM patch at well-chosen PCs (e.g. just before a
             // suspected stall, or right after Init__5TTask of a task
@@ -1308,87 +1268,85 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
             // monitors in one shot.
             crate::task_dump::dump_full();
         }
-        0x22 => {
+        v if v == HvcImm::DumpObjectById as u32 => {
             // Dump one kernel object by id. Guest puts the id in r0.
             let id = ctx.x[0] as u32;
             kprintln!("=== HVC dump_object_by_id({:#x}) ===", id);
             crate::task_dump::dump_object_by_id(id);
         }
-        v if v == crate::rom_patches::POWEROFF_REBOOT_HVC_IMM => {
+        v if v == HvcImm::PowerOffReboot as u32 => {
             handle_poweroff_reboot(ctx);
         }
-        v if v == crate::rom_patches::REBOOT_HVC_IMM => {
+        v if v == HvcImm::Reboot as u32 => {
             handle_reboot(ctx);
         }
-        v if v == crate::rom_patches::BOOTOS_HVC_IMM => {
+        v if v == HvcImm::BootOs as u32 => {
             handle_bootos_canary(ctx);
         }
-        v if v == crate::rom_patches::REMEMBER_SWIRET_HVC_IMM => {
+        v if v == HvcImm::RememberSwiret as u32 => {
             handle_remember_swiret_probe(ctx);
         }
-        v if v == crate::rom_patches::DAH_MRS_SPSR_HVC_IMM => {
+        v if v == HvcImm::DahMrsSpsr as u32 => {
             handle_dah_mrs_spsr_patch(ctx);
         }
-        v if v == crate::rom_patches::DAH_FME_RET_HVC_IMM => {
+        v if v == HvcImm::DahFmeRet as u32 => {
             handle_dah_fme_ret_probe(ctx);
         }
-        v if v == crate::rom_patches::DAH_FME_ENTRY_HVC_IMM => {
+        v if v == HvcImm::DahFmeEntry as u32 => {
             handle_fme_entry_probe(ctx);
         }
-        v if v == crate::rom_patches::DAH_OR_CHAIN_HVC_IMM => {
+        v if v == HvcImm::DahOrChain as u32 => {
             handle_dah_or_chain_probe(ctx);
         }
-        v if v == crate::rom_patches::UNHANDLED_EXCEPTION_HVC_IMM => {
+        v if v == HvcImm::UnhandledException as u32 => {
             handle_unhandled_exception(ctx, false);
         }
-        v if v == crate::rom_patches::UNHANDLED_NUM_EXCEPTION_HVC_IMM => {
+        v if v == HvcImm::UnhandledNumException as u32 => {
             handle_unhandled_exception(ctx, true);
         }
-        v if v == crate::rom_patches::FPE_ENTRY_PROBE_HVC_IMM => {
+        v if v == HvcImm::FpeEntryProbe as u32 => {
             handle_fpe_entry_probe(ctx);
         }
-        v if v == crate::rom_patches::SPLASH_PROBE_HVC_IMM => {
+        v if v == HvcImm::SplashProbe as u32 => {
             handle_splash_probe(ctx);
         }
         #[cfg(feature = "ns_trace")]
-        v if v == crate::rom_patches::PRINT_PROBE_HVC_IMM => {
+        v if v == HvcImm::PrintProbe as u32 => {
             handle_print_probe(ctx);
         }
         #[cfg(feature = "ns_trace")]
-        v if v == crate::rom_patches::PUTC_PROBE_HVC_IMM => {
+        v if v == HvcImm::PutcProbe as u32 => {
             handle_thunk_probe(ctx, ThunkKind::Putc);
         }
         #[cfg(feature = "ns_trace")]
-        v if v == crate::rom_patches::FLUSH_PROBE_HVC_IMM => {
+        v if v == HvcImm::FlushProbe as u32 => {
             handle_thunk_probe(ctx, ThunkKind::Flush);
         }
         #[cfg(feature = "ns_trace")]
-        v if v == crate::rom_patches::STACK_TRACE_PROBE_HVC_IMM => {
+        v if v == HvcImm::StackTraceProbe as u32 => {
             handle_thunk_probe(ctx, ThunkKind::StackTrace);
         }
         #[cfg(feature = "ns_trace")]
-        v if v == crate::rom_patches::EX_NOTIFY_PROBE_HVC_IMM => {
+        v if v == HvcImm::ExNotifyProbe as u32 => {
             handle_thunk_probe(ctx, ThunkKind::ExceptionNotify);
         }
-        v if v == UND_TAG => {
+        v if v == HvcImm::Und as u32 => {
             handle_und(ctx);
         }
-        v if v == DIAG_TAG => {
+        v if v == HvcImm::Diag as u32 => {
             handle_diag(ctx);
         }
-        v if v == ALIGN_TAG => {
+        v if v == HvcImm::Align as u32 => {
             crate::unaligned::handle_align_fault(ctx);
         }
-        v if v == SBA_RETRY_TAG => {
+        v if v == HvcImm::SbaRetry as u32 => {
             crate::shadow_stub::handle_sba_retry(ctx);
         }
-        v if v == GPIO_TRIGGER_TAG => {
-            // Test-only: raise the GPIO IRQ line. Delivered as a
-            // virtual IRQ on ERET via the shared update_virq path.
+        v if v == HvcImm::GpioTrigger as u32 => {
             vic::raise(vic::INT_GPIO);
         }
         #[cfg(feature = "trace")]
-        v if v == crate::tracer::TRACE_TAG => {
+        v if v == HvcImm::Trace as u32 => {
             crate::tracer::handle_trace_hvc(ctx);
         }
         _ => {
@@ -1813,7 +1771,7 @@ fn handle_und(ctx: &mut TrapContext) {
         // function the Newton kernel calls in user mode (e.g. OsBoot
         // per the `code-symbols.txt` classification) halts here.
         #[cfg(feature = "trace")]
-        _ if insn == crate::tracer::TRACE_HVC_INSN
+        _ if insn == HvcImm::Trace.insn()
             && crate::tracer::in_trampoline_pool(faulting_pc) =>
         {
             crate::tracer::log_trace_at(ctx, faulting_pc, spsr_und as u32);
@@ -1824,14 +1782,14 @@ fn handle_und(ctx: &mut TrapContext) {
         // UnhandledException; HVC at EL0 is UNDEFINED, so our
         // patched `HVC #REBOOT_HVC_IMM` lands here. Route into the
         // same halt handler the HVC path uses.
-        _ if insn == rom_patches_hvc_insn(crate::rom_patches::REBOOT_HVC_IMM)
+        _ if insn == HvcImm::Reboot.insn()
             && faulting_pc == crate::rom_patches::REBOOT_PC =>
         {
             handle_reboot(ctx);
         }
         // PowerOffAndReboot canary, symmetric case for the USR-mode
         // call path.
-        _ if insn == rom_patches_hvc_insn(crate::rom_patches::POWEROFF_REBOOT_HVC_IMM)
+        _ if insn == HvcImm::PowerOffReboot.insn()
             && faulting_pc == crate::rom_patches::POWEROFF_REBOOT_PC =>
         {
             handle_poweroff_reboot(ctx);
@@ -1843,7 +1801,7 @@ fn handle_und(ctx: &mut TrapContext) {
         // from EL0 is UNDEFINED and arrives here instead of handle_hvc.
         // Route into the same handler so the canary's "2nd+ entry →
         // halt" logic applies regardless of the source mode.
-        _ if insn == rom_patches_hvc_insn(crate::rom_patches::BOOTOS_HVC_IMM)
+        _ if insn == HvcImm::BootOs.insn()
             && faulting_pc == crate::rom_patches::BOOTOS_PC =>
         {
             handle_bootos_canary(ctx);
@@ -1858,7 +1816,7 @@ fn handle_und(ctx: &mut TrapContext) {
         // directly to the inner probe so its SP/LR lookups land on the
         // right banked register, then advance ELR via the UND-return
         // stub since UND entry doesn't auto-advance.
-        _ if insn == rom_patches_hvc_insn(crate::rom_patches::REMEMBER_SWIRET_HVC_IMM) => {
+        _ if insn == HvcImm::RememberSwiret.insn() => {
             handle_remember_swiret_probe_with(ctx);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
@@ -1870,7 +1828,7 @@ fn handle_und(ctx: &mut TrapContext) {
         // uses the trampoline-saved spsr_und to identify the source
         // mode for `mov ip, sp` emulation, then ERETs back to PC+4
         // via the UND-return stub.
-        _ if insn == rom_patches_hvc_insn(crate::rom_patches::SPLASH_PROBE_HVC_IMM) => {
+        _ if insn == HvcImm::SplashProbe.insn() => {
             handle_splash_probe_und(ctx, faulting_pc, spsr_und);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
@@ -1883,40 +1841,40 @@ fn handle_und(ctx: &mut TrapContext) {
         // on the right banked register, then advance ELR via the UND-
         // return stub since UND entry doesn't auto-advance.
         #[cfg(feature = "ns_trace")]
-        _ if insn == rom_patches_hvc_insn(crate::rom_patches::PRINT_PROBE_HVC_IMM) => {
+        _ if insn == HvcImm::PrintProbe.insn() => {
             handle_print_probe_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
         #[cfg(feature = "ns_trace")]
-        _ if insn == rom_patches_hvc_insn(crate::rom_patches::PUTC_PROBE_HVC_IMM) => {
+        _ if insn == HvcImm::PutcProbe.insn() => {
             handle_thunk_probe(ctx, ThunkKind::Putc);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
         #[cfg(feature = "ns_trace")]
-        _ if insn == rom_patches_hvc_insn(crate::rom_patches::FLUSH_PROBE_HVC_IMM) => {
+        _ if insn == HvcImm::FlushProbe.insn() => {
             handle_thunk_probe(ctx, ThunkKind::Flush);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
         #[cfg(feature = "ns_trace")]
-        _ if insn == rom_patches_hvc_insn(crate::rom_patches::STACK_TRACE_PROBE_HVC_IMM) => {
+        _ if insn == HvcImm::StackTraceProbe.insn() => {
             handle_thunk_probe(ctx, ThunkKind::StackTrace);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
         #[cfg(feature = "ns_trace")]
-        _ if insn == rom_patches_hvc_insn(crate::rom_patches::EX_NOTIFY_PROBE_HVC_IMM) => {
+        _ if insn == HvcImm::ExNotifyProbe.insn() => {
             handle_thunk_probe(ctx, ThunkKind::ExceptionNotify);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
-        _ if insn == rom_patches_hvc_insn(crate::rom_patches::UNHANDLED_EXCEPTION_HVC_IMM) => {
+        _ if insn == HvcImm::UnhandledException.insn() => {
             handle_unhandled_exception(ctx, false);
             // Never returns: handle_unhandled_exception halts.
         }
-        _ if insn == rom_patches_hvc_insn(crate::rom_patches::UNHANDLED_NUM_EXCEPTION_HVC_IMM) => {
+        _ if insn == HvcImm::UnhandledNumException.insn() => {
             handle_unhandled_exception(ctx, true);
             // Never returns: handle_unhandled_exception halts.
         }
@@ -2340,13 +2298,6 @@ fn handle_poweroff_reboot(ctx: &TrapContext) -> ! {
 /// 0x000D_9884. Symmetric with `handle_poweroff_reboot`: halt on the
 /// first hit with R0..R3 (reboot reason / flags / ...) and the preceding
 /// tracer line naming the caller.
-/// AArch32 `HVC #imm16` encoding at unconditional (cond=AL). Mirror of
-/// `rom_patches::hvc_insn` — duplicated here because that helper is
-/// `const fn` and not exported.
-const fn rom_patches_hvc_insn(imm: u32) -> u32 {
-    0xE140_0070 | ((imm & 0xFFF0) << 4) | (imm & 0xF)
-}
-
 /// Canary handler for `BootOS` / `ROMBoot` (0x0001_8688). The AArch32
 /// reset vector at VA 0 branches here, so the first entry after the
 /// hypervisor ERETs the guest is legitimate — we emulate the original

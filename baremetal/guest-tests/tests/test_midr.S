@@ -24,5 +24,5 @@ test_main:
     bx      lr
 
 .Lfail_midr:
-    hvc     #2                              @ dump the observed MIDR
+    hvc     #HVC_PRINT_HEX                              @ dump the observed MIDR
     hvc_fail 0x60

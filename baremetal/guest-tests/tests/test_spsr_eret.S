@@ -5,7 +5,7 @@
 @ ERET loads CPSR from SPSR_EL2 and leaves banked SPSRs untouched; the
 @ hypothesis is that QEMU raspi3b aliases the two and trashes SPSR_svc.
 @
-@ Two rounds, each prints the pre- and post-HVC SPSR value via hvc #2:
+@ Two rounds, each prints the pre- and post-HVC SPSR value via hvc     #HVC_PRINT_HEX:
 @   Round 1: HVC from SVC mode (ERET target = SVC)  — the suspected path.
 @   Round 2: HVC from SYS mode (ERET target = SYS)  — SYS has no SPSR, so
 @            SPSR_svc must not be touched; acts as a control.
@@ -31,14 +31,14 @@ test_main:
     mrs     r4, spsr            @ read back (some CPSR bits are RES0 etc.)
 
     mov     r0, r4
-    hvc     #2                  @ log: SPSR_svc pre-HVC (effective written value)
+    hvc     #HVC_PRINT_HEX                  @ log: SPSR_svc pre-HVC (effective written value)
 
     mov     r0, #0xA1
-    hvc     #5                  @ benign round-trip through EL2
+    hvc     #HVC_MARK                  @ benign round-trip through EL2
 
     mrs     r5, spsr            @ read SPSR_svc after ERET-to-SVC
     mov     r0, r5
-    hvc     #2                  @ log: SPSR_svc post-HVC
+    hvc     #HVC_PRINT_HEX                  @ log: SPSR_svc post-HVC
 
     @ Compare post-HVC against the effective pre-HVC value (r4), not
     @ against the raw sentinel — RES0 bits are irrelevant; the question
@@ -52,7 +52,7 @@ test_main:
     mrs     r7, spsr            @ snapshot effective SPSR_svc before trap
 
     mov     r0, r7
-    hvc     #2                  @ log: effective SPSR_svc pre-SYS-round-trip
+    hvc     #HVC_PRINT_HEX                  @ log: effective SPSR_svc pre-SYS-round-trip
 
     mrs     r0, cpsr
     bic     r1, r0, #0x1F
@@ -60,7 +60,7 @@ test_main:
     msr     cpsr_c, r1
 
     mov     r0, #0xA2
-    hvc     #5                  @ round-trip with ERET target = SYS
+    hvc     #HVC_MARK                  @ round-trip with ERET target = SYS
 
     mrs     r0, cpsr
     bic     r1, r0, #0x1F
@@ -69,7 +69,7 @@ test_main:
 
     mrs     r6, spsr            @ SPSR_svc after SYS round-trip
     mov     r0, r6
-    hvc     #2                  @ log: SPSR_svc post-SYS-round-trip
+    hvc     #HVC_PRINT_HEX                  @ log: SPSR_svc post-SYS-round-trip
 
     cmp     r6, r7
     bne     .Lclobber_sys
@@ -82,7 +82,7 @@ test_main:
     msr     spsr, r0
     mrs     r4, spsr
     mov     r0, r4
-    hvc     #2                  @ log: effective SPSR_svc pre-DABT
+    hvc     #HVC_PRINT_HEX                  @ log: effective SPSR_svc pre-DABT
 
     @ Read VIC INT_PRESENT — unmapped IPA → stage-2 abort; hypervisor's
     @ vic stub reads the shadow and ERETs back to the next insn.
@@ -91,7 +91,7 @@ test_main:
 
     mrs     r5, spsr
     mov     r0, r5
-    hvc     #2                  @ log: SPSR_svc post-DABT
+    hvc     #HVC_PRINT_HEX                  @ log: SPSR_svc post-DABT
 
     cmp     r5, r4
     bne     .Lclobber_dabt
@@ -99,17 +99,17 @@ test_main:
     @ All three survived: hypothesis refuted across HVC, HVC-from-SYS,
     @ and DABT paths on this QEMU build.
     pop     {r4-r7, lr}
-    hvc     #3                  @ PASS
+    hvc     #HVC_PASS                  @ PASS
     bx      lr
 
 .Lclobber_svc:
     mov     r0, #0xB1           @ ERET-to-SVC via HVC trashed SPSR_svc
-    hvc     #4
+    hvc     #HVC_FAIL
 
 .Lclobber_sys:
     mov     r0, #0xB2           @ ERET-to-SYS via HVC trashed SPSR_svc
-    hvc     #4
+    hvc     #HVC_FAIL
 
 .Lclobber_dabt:
     mov     r0, #0xB3           @ ERET-to-SVC via DABT trashed SPSR_svc
-    hvc     #4
+    hvc     #HVC_FAIL

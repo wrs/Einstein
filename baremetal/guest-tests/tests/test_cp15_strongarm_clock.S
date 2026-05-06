@@ -15,6 +15,8 @@
     .syntax unified
     .arch armv7ve
 
+#include "../common/hvc_abi.S"
+
     @ Match src/trap.rs UND_SAVE_LR_IPA / _SPSR_IPA — see test_und_handler.S
     @ for why we moved off of 0x04000400 (it overlaps the kernel's L1 table).
     .equ UND_SAVE_LR_ADDR,   0x04005F00
@@ -52,7 +54,7 @@ _und_trampoline:
     ldr     r0, =UND_SAVE_SPSR_ADDR
     str     r1, [r0]
     pop     {r0, r1}
-    hvc     #0x10               @ UND_TAG
+    hvc     #HVC_UND               @ UND_TAG
     b       .Lhang
 
 test_main:
@@ -60,19 +62,19 @@ test_main:
     ldr     r0, =0xDEADBEEF
     mcr     p15, 0, r0, c15, c1, 2
     mov     r0, #1
-    hvc     #5                  @ mark 1: first MCR returned
+    hvc     #HVC_MARK                  @ mark 1: first MCR returned
 
     @ Second MCR: budget exhausted, silent.
     ldr     r0, =0x00000042
     mcr     p15, 0, r0, c15, c1, 2
     mov     r0, #2
-    hvc     #5                  @ mark 2
+    hvc     #HVC_MARK                  @ mark 2
 
     @ Third MCR: still silent, still returns.
     mov     r0, #0
     mcr     p15, 0, r0, c15, c1, 2
     mov     r0, #3
-    hvc     #5                  @ mark 3
+    hvc     #HVC_MARK                  @ mark 3
 
-    hvc     #3                  @ PASS
+    hvc     #HVC_PASS                  @ PASS
     bx      lr

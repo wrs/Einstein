@@ -25,6 +25,8 @@
     .syntax unified
     .arch armv7ve
 
+#include "../common/hvc_abi.S"
+
     @ Test scratch in RAM.
     .equ ABORT_COUNT_ADDR, 0x04000200
     .equ DFAR_SAVE_ADDR,   0x04000204
@@ -125,7 +127,7 @@ test_main:
     bne     .Lfail_dfar
 
     mov     r0, #1
-    hvc     #5                     @ mark 1: abort taken, handler ran, DFAR matches
+    hvc     #HVC_MARK                     @ mark 1: abort taken, handler ran, DFAR matches
 
     @ Check 3: DFSR reports an alignment fault. In the short-descriptor
     @ format (TTBCR.EAE=0) the fault status is encoded in bits
@@ -134,7 +136,7 @@ test_main:
     ldr     r0, =DFSR_SAVE_ADDR
     ldr     r3, [r0]
     mov     r0, r3
-    hvc     #2                     @ print the raw DFSR for the log
+    hvc     #HVC_PRINT_HEX                     @ print the raw DFSR for the log
     and     r1, r3, #0xF
     cmp     r1, #1
     bne     .Lfail_dfsr_class
@@ -143,24 +145,24 @@ test_main:
     bne     .Lfail_dfsr_class
 
     mov     r0, #2
-    hvc     #5                     @ mark 2: DFSR reports alignment fault
+    hvc     #HVC_MARK                     @ mark 2: DFSR reports alignment fault
 
-    hvc     #3                     @ PASS
+    hvc     #HVC_PASS                     @ PASS
     bx      lr
 
     @ === Failure paths ===============================================
 .Lfail_count:
     mov     r0, r1
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     mov     r0, #0x60
-    hvc     #4
+    hvc     #HVC_FAIL
 .Lfail_dfar:
     mov     r0, r1
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     mov     r0, #0x61
-    hvc     #4
+    hvc     #HVC_FAIL
 .Lfail_dfsr_class:
     mov     r0, r3
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     mov     r0, #0x62
-    hvc     #4
+    hvc     #HVC_FAIL

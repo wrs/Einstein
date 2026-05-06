@@ -35,12 +35,12 @@ test_main:
     bne     .Lfail_null_prim
 
     mov     r0, #1
-    hvc     #5                  @ mark 1: null primitive dispatched ok
+    hvc     #HVC_MARK                  @ mark 1: null primitive dispatched ok
 
-    hvc     #3                  @ PASS
+    hvc     #HVC_PASS                  @ PASS
     bx      lr
 
 .Lfail_null_prim:
-    hvc     #2                  @ print the observed (non-zero) r0
+    hvc     #HVC_PRINT_HEX                  @ print the observed (non-zero) r0
     mov     r0, #0xC0
-    hvc     #4
+    hvc     #HVC_FAIL

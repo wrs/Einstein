@@ -24,6 +24,8 @@
     .equ INT_PRESENT,        0x0F183000
     .equ INT_CLEAR,          0x0F183800
 
+#include "hvc_abi.S"
+
     @ === Vector table ===========================================
     .section .text.vectors, "ax"
     .global _start
@@ -119,32 +121,32 @@ _fiq_entry:
     b       .Lreport_unexpected_exception
 
 .Lreport_unexpected_exception:
-    hvc     #4
+    hvc     #HVC_FAIL
     b       .Lhang
 
     @ === HVC / CPSR helper macros ======================
     .macro hvc_putc ch
         mov     r0, #\ch
-        hvc     #1
+        hvc     #HVC_PRINT_BYTE
     .endm
 
     .macro hvc_hex32 reg
         mov     r0, \reg
-        hvc     #2
+        hvc     #HVC_PRINT_HEX
     .endm
 
     .macro hvc_pass
-        hvc     #3
+        hvc     #HVC_PASS
     .endm
 
     .macro hvc_fail code
         mov     r0, #\code
-        hvc     #4
+        hvc     #HVC_FAIL
     .endm
 
     .macro hvc_mark reg
         mov     r0, \reg
-        hvc     #5
+        hvc     #HVC_MARK
     .endm
 
     @ CPSR bit manipulation

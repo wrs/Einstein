@@ -50,7 +50,7 @@ test_main:
     bne     .Lfail_close_page
 
     mov     r0, #1
-    hvc     #5                              @ mark 1: open/close ok
+    hvc     #HVC_MARK                              @ mark 1: open/close ok
 
     @ -------- 0x07 PDImageBand ----------------------------------------
     @ Pass plausible (but unused) pointer arguments; handler doesn't
@@ -79,29 +79,29 @@ test_main:
     bne     .Lfail_fax
 
     mov     r0, #2
-    hvc     #5                              @ mark 2: imaging path ok
+    hvc     #HVC_MARK                              @ mark 2: imaging path ok
 
     hvc_pass
     bx      lr
 
 .Lfail_open:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xC0
 .Lfail_close:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xC1
 .Lfail_open_page:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xC2
 .Lfail_close_page:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xC3
 .Lfail_imageband:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xC4
 .Lfail_problem:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xC5
 .Lfail_fax:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xC6

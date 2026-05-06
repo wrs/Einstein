@@ -37,7 +37,7 @@ test_main:
     bne     .Lfail_in_produce
 
     mov     r0, #1
-    hvc     #5                              @ mark 1: in-translator subfns ok
+    hvc     #HVC_MARK                              @ mark 1: in-translator subfns ok
 
     @ -------- 0x08 Out-translator: 0x00 New --------------------------
     ldr     r0, =0xDEADBEEF
@@ -68,29 +68,29 @@ test_main:
     bne     .Lfail_out_excnotify
 
     mov     r0, #2
-    hvc     #5                              @ mark 2: out-translator subfns ok
+    hvc     #HVC_MARK                              @ mark 2: out-translator subfns ok
 
     hvc_pass
     bx      lr
 
 .Lfail_in_new:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x90
 .Lfail_in_init:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x91
 .Lfail_in_produce:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x92
 .Lfail_out_new:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x93
 .Lfail_out_init:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x94
 .Lfail_out_print:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x95
 .Lfail_out_excnotify:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x96

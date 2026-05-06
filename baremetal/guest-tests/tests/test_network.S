@@ -33,7 +33,7 @@ test_main:
     .inst   MCR_P10_R5
 
     mov     r0, #1
-    hvc     #5                              @ mark 1: lifecycle ok
+    hvc     #HVC_MARK                              @ mark 1: lifecycle ok
 
     @ -------- 0x0A SendPacket(buf=OUT_SLOT, size=8) -------------------
     @ Pre-fill the buffer with a few bytes so the handler has something
@@ -50,7 +50,7 @@ test_main:
     @ r0 untouched per Einstein's no-manager path; just don't crash.
 
     mov     r0, #2
-    hvc     #5                              @ mark 2: SendPacket ok
+    hvc     #HVC_MARK                              @ mark 2: SendPacket ok
 
     @ -------- 0x0B GetDeviceAddress(dst=OUT_SLOT, size=6) -------------
     @ Wipe the destination first.
@@ -82,7 +82,7 @@ test_main:
     bne     .Lfail_getmac_w1
 
     mov     r0, #3
-    hvc     #5                              @ mark 3: MAC bytes verified
+    hvc     #HVC_MARK                              @ mark 3: MAC bytes verified
 
     @ -------- 0x14 DataAvailable --------------------------------------
     ldr     r0, =0xDEADBEEF
@@ -92,20 +92,20 @@ test_main:
     bne     .Lfail_avail
 
     mov     r0, #4
-    hvc     #5                              @ mark 4: DataAvailable ok
+    hvc     #HVC_MARK                              @ mark 4: DataAvailable ok
 
     hvc_pass
     bx      lr
 
 .Lfail_getmac_r0:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xB0
 .Lfail_getmac_w0:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xB1
 .Lfail_getmac_w1:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xB2
 .Lfail_avail:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0xB3

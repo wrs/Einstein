@@ -10,22 +10,22 @@
     .global test_main
 test_main:
     mov     r0, #'H'
-    hvc     #1
+    hvc     #HVC_PRINT_BYTE
     mov     r0, #'E'
-    hvc     #1
+    hvc     #HVC_PRINT_BYTE
     mov     r0, #'L'
-    hvc     #1
+    hvc     #HVC_PRINT_BYTE
     mov     r0, #'L'
-    hvc     #1
+    hvc     #HVC_PRINT_BYTE
     mov     r0, #'O'
-    hvc     #1
+    hvc     #HVC_PRINT_BYTE
     mov     r0, #'\n'
-    hvc     #1
+    hvc     #HVC_PRINT_BYTE
 
     @ Print a recognizable magic word so the hypervisor's hex-print
     @ path is exercised too.
     ldr     r0, =0xCAFEBABE
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
 
-    hvc     #3                  @ pass
+    hvc     #HVC_PASS                  @ pass
     bx      lr

@@ -23,6 +23,8 @@
     .syntax unified
     .arch armv7ve
 
+#include "../common/hvc_abi.S"
+
     .equ UND_SAVE_LR_ADDR,   0x04005F00
     .equ UND_SAVE_SPSR_ADDR, 0x04005F04
 
@@ -62,7 +64,7 @@ _und_trampoline:
     ldr     r0, =UND_SAVE_SPSR_ADDR
     str     r1, [r0]
     pop     {r0, r1}
-    hvc     #0x10               @ UND_TAG
+    hvc     #HVC_UND               @ UND_TAG
     b       .Lhang              @ unreachable
 
 test_main:
@@ -74,7 +76,7 @@ test_main:
     mrs     r4, spsr            @ effective pre-UND SPSR_svc
 
     mov     r0, r4
-    hvc     #2                  @ log it
+    hvc     #HVC_PRINT_HEX                  @ log it
 
     @ Execute SystemBootUND. UND-trampoline-bounce, EL2 handles and
     @ ERETs directly back to SVC mode at the next instruction.
@@ -87,19 +89,19 @@ test_main:
 
     mrs     r5, spsr            @ SPSR_svc after UND round-trip
     mov     r0, r5
-    hvc     #2                  @ log it
+    hvc     #HVC_PRINT_HEX                  @ log it
 
     cmp     r5, r4
     bne     .Lclobber_und
 
     pop     {r4, r5, lr}
-    hvc     #3                  @ PASS — SPSR_svc preserved across UND path
+    hvc     #HVC_PASS                  @ PASS — SPSR_svc preserved across UND path
     bx      lr
 
 .Lfail_dispatch:
     mov     r0, #0xE2           @ UND dispatch didn't resume at the right PC
-    hvc     #4
+    hvc     #HVC_FAIL
 
 .Lclobber_und:
     mov     r0, #0xB4           @ bug confirmed on UND path
-    hvc     #4
+    hvc     #HVC_FAIL

@@ -42,7 +42,7 @@ test_main:
     bne     .Lfail_shutdown
 
     mov     r0, #1
-    hvc     #5                              @ mark 1: scalars ok
+    hvc     #HVC_MARK                              @ mark 1: scalars ok
 
     @ -------- 0x08 SetSampleRate(0x12345678) --------------------------
     ldr     r1, =0x12345678
@@ -60,7 +60,7 @@ test_main:
     bne     .Lfail_get_rate
 
     mov     r0, #2
-    hvc     #5                              @ mark 2: sample rate r/w ok
+    hvc     #HVC_MARK                              @ mark 2: sample rate r/w ok
 
     @ -------- 0x0A SetTabletCalibration -------------------------------
     @ Pre-load the calibration struct in scratch RAM.
@@ -113,7 +113,7 @@ test_main:
     bne     .Lfail_cal_10
 
     mov     r0, #3
-    hvc     #5                              @ mark 3: calibration r/w ok
+    hvc     #HVC_MARK                              @ mark 3: calibration r/w ok
 
     @ -------- 0x0E GetTabletState -------------------------------------
     ldr     r0, =0xDEADBEEF
@@ -130,38 +130,38 @@ test_main:
     bne     .Lfail_needs_recal
 
     mov     r0, #4
-    hvc     #5                              @ mark 4: state queries ok
+    hvc     #HVC_MARK                              @ mark 4: state queries ok
 
     hvc_pass
     bx      lr
 
 .Lfail_wakeup:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x70
 .Lfail_shutdown:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x71
 .Lfail_set_rate:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x72
 .Lfail_get_rate:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x73
 .Lfail_cal_00:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x74
 .Lfail_cal_04:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x75
 .Lfail_cal_08:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x76
 .Lfail_cal_10:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x77
 .Lfail_state:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x78
 .Lfail_needs_recal:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x79

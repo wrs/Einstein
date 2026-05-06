@@ -90,7 +90,7 @@ test_main:
     bne     .Lfail_aliasing
 
     mov     r0, #1
-    hvc     #5                          @ mark 1: round-trip storage ok
+    hvc     #HVC_MARK                          @ mark 1: round-trip storage ok
 
     @ --- Part 2: HVC-trigger → INT_GPIO virtual IRQ -----------------
     ldr     r4, =FIQ_MASK
@@ -104,7 +104,7 @@ test_main:
     str     r5, [r4]
 
     cpu_enable_irq
-    hvc     #6                          @ GPIO_TRIGGER_TAG: vic::raise(INT_GPIO)
+    hvc     #HVC_GPIO_TRIGGER                          @ GPIO_TRIGGER_TAG: vic::raise(INT_GPIO)
 
     @ HVC entry sets ELR to the next insn; on ERET the VIRQ is taken
     @ before the next instruction executes.
@@ -123,48 +123,48 @@ test_main:
     cpu_disable_irq
 
     mov     r0, #2
-    hvc     #5                          @ mark 2: GPIO IRQ delivered
+    hvc     #HVC_MARK                          @ mark 2: GPIO IRQ delivered
 
     hvc_pass
     bx      lr
 
 .Lfail_cc00:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x40
 .Lfail_d000:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x41
 .Lfail_d800:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x42
 .Lfail_dc00:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x43
 .Lfail_e000:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x44
 .Lfail_e800:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x45
 .Lfail_ec00:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x46
 .Lfail_aliasing:
     mov     r0, r6
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x47
 .Lfail_count:
     mov     r0, r5
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x48
 .Lfail_bit:
     mov     r0, r5
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x49

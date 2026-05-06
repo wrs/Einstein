@@ -32,7 +32,7 @@ test_main:
     bne     .Lfail_init
 
     mov     r0, #1
-    hvc     #5
+    hvc     #HVC_MARK
 
     @ -------- 0x0F PowerOnSystem --------------------------------------
     ldr     r0, =0xDEADBEEF
@@ -42,7 +42,7 @@ test_main:
     bne     .Lfail_power_on
 
     mov     r0, #2
-    hvc     #5
+    hvc     #HVC_MARK
 
     @ -------- 0x11 GetPCMCIAPowerSpec slot 0 --------------------------
     ldr     r4, =OUT_SLOT
@@ -81,7 +81,7 @@ test_main:
     bne     .Lfail_pcmcia2_err
 
     mov     r0, #3
-    hvc     #5
+    hvc     #HVC_MARK
 
     @ -------- 0x14 GetSubsystemPower ----------------------------------
     mov     r0, #0xAA
@@ -97,7 +97,7 @@ test_main:
     bne     .Lfail_subsystem_val
 
     mov     r0, #4
-    hvc     #5
+    hvc     #HVC_MARK
 
     @ -------- 0x15 GetNextEvent ---------------------------------------
     ldr     r0, =0xDEADBEEF
@@ -108,7 +108,7 @@ test_main:
     bne     .Lfail_event
 
     mov     r0, #5
-    hvc     #5
+    hvc     #HVC_MARK
 
     @ -------- 0x17 FillGestaltEmulatorInfo ----------------------------
     mov     r0, #0xAA
@@ -124,7 +124,7 @@ test_main:
     bne     .Lfail_gestalt_val
 
     mov     r0, #6
-    hvc     #5
+    hvc     #HVC_MARK
 
     @ -------- 0x18 / 0x19 Lock / UnlockEventQueue ---------------------
     @ Just verify the handler accepts these; no r0 side effect.
@@ -134,44 +134,44 @@ test_main:
     .inst   MCR_P10_R5
 
     mov     r0, #7
-    hvc     #5
+    hvc     #HVC_MARK
 
     hvc_pass
     bx      lr
 
 .Lfail_init:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x50
 .Lfail_power_on:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x51
 .Lfail_pcmcia0_r0:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x52
 .Lfail_pcmcia0_val:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x53
 .Lfail_pcmcia1_r0:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x54
 .Lfail_pcmcia1_val:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x55
 .Lfail_pcmcia2_err:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x56
 .Lfail_subsystem_r0:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x57
 .Lfail_subsystem_val:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x58
 .Lfail_event:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x59
 .Lfail_gestalt_r0:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x5A
 .Lfail_gestalt_val:
-    hvc     #2
+    hvc     #HVC_PRINT_HEX
     hvc_fail 0x5B

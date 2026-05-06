@@ -148,10 +148,14 @@ pub fn log_ref(label: &str, ref_value: u32) {
 /// One-shot summary of the heap bounds, suitable for an iter-78
 /// boot-log line. Logs nothing if the heap isn't constructed yet.
 ///
-/// Doubles as a one-shot trigger for iter-79's "force kernel
-/// diagnostics on" sequence. By the time the heap exists, both
-/// `InitObjects__Fv` and `InitInterpreter__Fv` have run, so the
-/// kernel globals we want to flip are live.
+/// (Historically also fired the iter-79 "force kernel diagnostics
+/// on" sequence — see `force_kernel_diag_on` below. iter-108
+/// disabled that call: it sets `gWantSerialDebugging`, which makes
+/// the kernel's FPE call `WriteDebugByte` for emulation tracing,
+/// and the debug ring-buffer at `obj[28]` is NULL when called from
+/// UND mode → strb to address 0 → unknown-MMIO halt at PC=0x199ce8.
+/// Re-enable when a real serial-debug path is wired through to the
+/// EL2 UART that doesn't depend on the kernel's ring-buffer init.)
 pub fn log_heap_bounds_once() {
     static LOGGED: AtomicU32 = AtomicU32::new(0);
     if LOGGED.load(Ordering::Relaxed) != 0 {
@@ -168,7 +172,6 @@ pub fn log_heap_bounds_once() {
             hi,
             (hi - lo) / 1024,
         );
-        force_kernel_diag_on();
     }
     // If `heap_bounds()` returned None (heap not yet up), leave the
     // latch clear so a later poll can succeed.

@@ -155,7 +155,12 @@ pub fn log_ref(label: &str, ref_value: u32) {
 /// and the debug ring-buffer at `obj[28]` is NULL when called from
 /// UND mode → strb to address 0 → unknown-MMIO halt at PC=0x199ce8.
 /// Re-enable when a real serial-debug path is wired through to the
-/// EL2 UART that doesn't depend on the kernel's ring-buffer init.)
+/// EL2 UART that doesn't depend on the kernel's ring-buffer init.
+/// Under `ns_trace`, the lighter-weight `force_interpreter_trace_on`
+/// poke is used instead — it flips only `gInterpreter[+124]=1` so
+/// the TInterpreter trace gates open without enabling the kernel's
+/// IsSerialDebugging-gated paths that trip the FPE/WriteDebugByte
+/// crash.)
 pub fn log_heap_bounds_once() {
     static LOGGED: AtomicU32 = AtomicU32::new(0);
     if LOGGED.load(Ordering::Relaxed) != 0 {
@@ -172,6 +177,8 @@ pub fn log_heap_bounds_once() {
             hi,
             (hi - lo) / 1024,
         );
+        #[cfg(feature = "ns_trace")]
+        force_interpreter_trace_on();
     }
     // If `heap_bounds()` returned None (heap not yet up), leave the
     // latch clear so a later poll can succeed.
@@ -216,6 +223,42 @@ fn write_word(va: u32, value: u32) -> bool {
         return true;
     }
     crate::guest_endian::guest_write_u32_pa(va, value)
+}
+
+/// Subset of `force_kernel_diag_on` that pokes ONLY
+/// `gInterpreter[+124] = 1` — the TInterpreter trace gate. This
+/// causes every `DoSend / DoMessage / DoFastApply` to call
+/// `TraceSend / TraceCall / TraceApply`, which funnel into
+/// `TraceMethod → Print(POutTranslator*, fmt, ...)`. With
+/// the `ns_trace` feature's TraceSetOptions ROM patch + Print
+/// thunk hook in place, every NS-level call surfaces in the
+/// EL2 UART.
+///
+/// Deliberately does NOT touch `gWantSerialDebugging`: setting
+/// that triggers `WriteDebugByte` calls from the kernel's FPE
+/// handler running in UND mode, where the debug ring-buffer
+/// pointer at obj[28] is NULL → strb to address 0 → unknown-MMIO
+/// halt at PC=0x199ce8. See iter-108 for the regression history.
+#[cfg(feature = "ns_trace")]
+fn force_interpreter_trace_on() {
+    match read_word(G_INTERPRETER_PTR) {
+        Some(p) if p != 0 => {
+            if write_word(p.wrapping_add(TINTERPRETER_TRACE_OFF), 1) {
+                crate::kprintln!(
+                    "force_diag: TInterp_trace=on (gInterpreter={:#010x})",
+                    p,
+                );
+            } else {
+                crate::kprintln!(
+                    "force_diag: TInterp_trace=ERR (gInterpreter={:#010x}, write failed)",
+                    p,
+                );
+            }
+        }
+        _ => {
+            crate::kprintln!("force_diag: TInterp_trace=skip (gInterpreter not init)");
+        }
+    }
 }
 
 fn force_kernel_diag_on() {

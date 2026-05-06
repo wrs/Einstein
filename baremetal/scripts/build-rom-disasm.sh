@@ -75,14 +75,73 @@ arm-none-eabi-objdump -D -b binary -m arm -EL \
     --adjust-vma=0 \
     "$tmp/rom.le" > "$raw"
 
+# Locate the most recent classifier output so we can annotate each
+# disassembled word with its code/data classification. If no
+# reach.bitmap is found the disasm still builds; the marker column
+# just shows a `?` instead of `*` / space.
+classify_dir="$baremetal/classify"
+
 # Post-process: annotate branch targets, dereference literal-pool
-# `@ 0xADDR` comments, and inject function headers.
-python3 - "$raw" "$syms" "$tmp/rom.le" "$out" <<'PY'
+# `@ 0xADDR` comments, inject function headers, and add per-word
+# columns (code-marker + ASCII gloss) to the right of the hex data.
+python3 - "$raw" "$syms" "$tmp/rom.le" "$out" "$classify_dir" <<'PY'
 import re
 import struct
 import sys
+from pathlib import Path
 
-raw_path, syms_path, image_path, out_path = sys.argv[1:5]
+raw_path, syms_path, image_path, out_path, classify_dir = sys.argv[1:6]
+
+# Load the classifier's reach.bitmap (the same file
+# scripts/dump-data-regions.py reads). Pick the most-recently-written
+# subdirectory so the disasm matches the current classification. If
+# none exists, the marker column falls back to `?`.
+def find_reach_bitmap(root: Path):
+    if not root.is_dir():
+        return None
+    cands = [d / "reach.bitmap" for d in root.iterdir()
+             if (d / "reach.bitmap").is_file()]
+    if not cands:
+        return None
+    cands.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return cands[0]
+
+reach_bitmap = None
+reach_path = find_reach_bitmap(Path(classify_dir))
+if reach_path is not None:
+    reach_bitmap = reach_path.read_bytes()
+    sys.stderr.write(
+        f'rom.dis: reach.bitmap from {reach_path} '
+        f'({len(reach_bitmap)} bytes)\n'
+    )
+else:
+    sys.stderr.write(
+        f'rom.dis: no reach.bitmap under {classify_dir}; '
+        'code-marker column will show "?"\n'
+    )
+
+def reach_bit(addr: int) -> int:
+    """Return 1 if word at `addr` is classified as code, 0 if data,
+    -1 if no bitmap was loaded or the address is out of range."""
+    if reach_bitmap is None:
+        return -1
+    if addr & 3 != 0:
+        return -1
+    word_idx = addr >> 2
+    byte_idx = word_idx >> 3
+    if byte_idx >= len(reach_bitmap):
+        return -1
+    return (reach_bitmap[byte_idx] >> (word_idx & 7)) & 1
+
+def ascii_gloss(hex_word: str) -> str:
+    """Render the four bytes of an 8-hex-digit word in BE byte order
+    as printable ASCII; non-printables become '.'. Mirrors the gloss
+    used by data-regions.txt / code-regions.txt."""
+    out = []
+    for i in range(0, 8, 2):
+        b = int(hex_word[i:i+2], 16)
+        out.append(chr(b) if 0x20 <= b < 0x7f else '.')
+    return ''.join(out)
 
 syms = {}
 with open(syms_path) as f:
@@ -135,20 +194,66 @@ comment_re = re.compile(r'(@\s+)0x([0-9a-f]+)(\b)')
 
 addr_line_re = re.compile(r'^\s+([0-9a-f]+):\s')
 
+# Insert the code-marker + ASCII gloss columns after the 8-digit hex
+# word that objdump emits. The raw line shape is
+#   `  ADDR:\tHEX \tMNEMONIC...`
+# (verified with `od -c`); we want
+#   `  0xADDR:\tHEX <C> <ASCII>\tMNEMONIC...`
+# where <C> is `*` for code, space for data, `?` if no bitmap.
+# The `0x` prefix on the line-start address means a `b 0x392924`
+# branch target is grep-findable to the matching `  0x392924:` line.
+hex_col_re = re.compile(
+    r'^(?P<lead>\s+)(?P<addr>[0-9a-f]+):(?P<sep>\t)'
+    r'(?P<hex>[0-9a-f]{8}) (?P<rest>\t.*)$'
+)
+# Section/symbol headers objdump emits look like `00000000 <.data>:`.
+# Rewrite the leading address to `0x...` so they're searchable too.
+objdump_hdr_re = re.compile(r'^(?P<addr>[0-9a-f]+)(?P<rest>\s+<[^>]+>:)$')
+
 with open(raw_path) as fin, open(out_path, 'w') as fout:
     for line in fin:
         m = addr_line_re.match(line)
         if m:
             addr = int(m.group(1), 16)
             if addr in syms:
-                fout.write(f'\n{addr:08x} <{syms[addr]}>:\n')
+                fout.write(f'\n0x{addr:08x} <{syms[addr]}>:\n')
 
+        # Inject the code-marker + ASCII gloss columns when the line
+        # is a disassembled word (objdump skips this format for the
+        # "..." gap-filler lines, which we leave untouched).
+        col_m = hex_col_re.match(line)
+        if col_m:
+            addr_v = int(col_m.group('addr'), 16)
+            hex_v = col_m.group('hex')
+            bit = reach_bit(addr_v)
+            marker = '*' if bit == 1 else ' ' if bit == 0 else '?'
+            gloss = ascii_gloss(hex_v)
+            # Use a fixed 2-space lead so every instruction line
+            # column-aligns now that addresses are uniformly 8 hex
+            # digits wide (objdump's variable-width pad is no longer
+            # needed).
+            line = (
+                f"  0x{addr_v:08x}:"
+                f"{col_m.group('sep')}{hex_v} {marker} {gloss}"
+                f"{col_m.group('rest')}\n"
+            )
+        else:
+            # Rewrite objdump's own section/symbol headers
+            # (`00000000 <.data>:`) to `0x00000000 <.data>:` so they
+            # match the same `0x...` search pattern.
+            hdr_m = objdump_hdr_re.match(line.rstrip('\n'))
+            if hdr_m:
+                hdr_addr = int(hdr_m.group('addr'), 16)
+                line = f"0x{hdr_addr:08x}{hdr_m.group('rest')}\n"
+
+        # Always zero-pad the rewritten address to 8 hex digits so a
+        # single search pattern (`0x00018688`) finds both branch refs
+        # and the matching `0x00018688:` line label / `<sym>` header.
         def sub_target(mm):
             a = int(mm.group(2), 16)
             name = syms.get(a)
-            if name is None:
-                return mm.group(0)
-            return f'{mm.group("prefix")}0x{mm.group(2)} <{name}>{mm.group("suffix")}'
+            tail = f' <{name}>' if name is not None else ''
+            return f'{mm.group("prefix")}0x{a:08x}{tail}{mm.group("suffix")}'
 
         # Literal-pool dereference: replace `@ 0xADDR` (under a PC-rel
         # `ldr*`) with `@ 0xADDR = 0xVALUE <symbol>` so each LDR shows
@@ -163,14 +268,13 @@ with open(raw_path) as fin, open(out_path, 'w') as fout:
             tail = f' = {v:#010x}'
             if value_sym is not None:
                 tail += f' <{value_sym}>'
-            return f'{mm.group("head")}0x{mm.group("addr")}{tail}{mm.group("tail")}'
+            return f'{mm.group("head")}0x{a:08x}{tail}{mm.group("tail")}'
 
         def sub_comment(mm):
             a = int(mm.group(2), 16)
             name = syms.get(a)
-            if name is None:
-                return mm.group(0)
-            return f'{mm.group(1)}0x{mm.group(2)} <{name}>{mm.group(3)}'
+            tail = f' <{name}>' if name is not None else ''
+            return f'{mm.group(1)}0x{a:08x}{tail}{mm.group(3)}'
 
         line = target_re.sub(sub_target, line)
         # Dereference literal-pool refs first; the replaced fragment no

@@ -608,6 +608,42 @@ const MANUAL_CODE_ROOTS: &[u32] = &[
     0x0038_2418,
 ];
 
+/// Manual code-range overrides: half-open `[start, end)` ranges that
+/// the post-walk pass forces into `reach`, no matter what the walker
+/// did. Use for hand-written assembly the walker can't reach — entry
+/// points hidden behind PC-relative thunks, jump-table dispatch, or
+/// trap-only entry — where seeding individual `MANUAL_CODE_ROOTS`
+/// either doesn't fire (the walker reads only static B/BL chains) or
+/// would drag in too many false-positive callees.
+///
+/// Each range is verified against the disasm by inspection. Padding
+/// words inside a listed range (e.g. zero-fills between adjacent
+/// functions) are harmless — they decode as `andeq r0, r0, r0` /
+/// `0x00000000`, neither byte-swapped form changes them, and they
+/// don't trigger byte-access patches.
+const MANUAL_CODE_RANGES: &[(u32, u32)] = &[
+    // FP emulator helpers — handwritten ARM asm in the FPE block at
+    // 0x39255x..0x39289x. The walker doesn't reach these because the
+    // FPE entry chain (FPE_Install / FPE_JT / FPE undef-handler trap
+    // dispatch) calls them via PC-relative LDR + indirect branch
+    // patterns the static walker doesn't follow. Without these marks
+    // the load-time byteswap reverses the instruction encoding, the
+    // CPU fetches garbage, and the FPE wedges (most visibly at the
+    // first `sfm f4, 1, [sp, #-12]!` in `SlowRun__12TInterpreterFv`,
+    // which redirects to FPE_JT — straight into the unswapped helpers).
+    //
+    // Boundaries cross-checked against rom.dis at the listed PCs.
+    // 0x392754 is a real literal-pool word (`__fp_regs` address) and
+    // stays data; the gap between 0x392750 and 0x39275c is real.
+    (0x0039_2558, 0x0039_2628), // bitmask-driven ldm/stm reg save/restore
+    (0x0039_26dc, 0x0039_2704), // conditional-clear helper
+    (0x0039_276c, 0x0039_2898), // four small helpers + larger stmia helper
+    (0x0039_2954, 0x0039_295c), // 2-word add-pc + branch slot
+    (0x0039_07a0, 0x0039_07bc), // entry into FPE undef dispatch (beq/ands/bne/tst chain)
+    (0x0039_08e4, 0x0039_0910), // push {r4,r5,sl,fp,lr} prologue + tst-chain helper
+    (0x0039_0ae0, 0x0039_0b40), // tail of one helper + full function (push/teq/wfsmi/...)
+];
+
 /// Manual data-range exceptions: half-open `[start, end)` ranges that
 /// the post-walk pass clears from `reach`, no matter what the walker
 /// or any indirect-pass collector did. Use for tiny corrupt corners
@@ -2704,6 +2740,22 @@ fn run(args: Args) -> Result<(), String> {
             pa = pa.wrapping_add(4);
         }
     }
+
+    // Manual code-range overrides: set reach bits in any range listed
+    // in `MANUAL_CODE_RANGES`. Runs after the data-range clears so a
+    // code override always wins on conflict. Used only for hand-
+    // written asm the walker can't reach (e.g. FP emulator helpers).
+    let mut manual_code_words_set = 0usize;
+    for &(start, end) in MANUAL_CODE_RANGES {
+        let mut pa = start;
+        while pa < end {
+            if !reach.get_word(pa) {
+                reach.set_word(pa);
+                manual_code_words_set += 1;
+            }
+            pa = pa.wrapping_add(4);
+        }
+    }
     // (rex_header_root_count is stashed pre-walk; dedup may have
     // dropped entries that collided with symbols/vectors, but we keep
     // the original count for the summary stat.)
@@ -2771,6 +2823,8 @@ fn run(args: Args) -> Result<(), String> {
     }
     writeln!(f, "  manual data-range exclusions:").ok();
     writeln!(f, "    words cleared: {}", manual_data_words_cleared).ok();
+    writeln!(f, "  manual code-range overrides:").ok();
+    writeln!(f, "    words set:     {}", manual_code_words_set).ok();
     writeln!(f, "  walker:").ok();
     writeln!(f, "    symbol roots (post-merge): {}", stats.initial_roots).ok();
     writeln!(f, "    rex-header roots added:    {}", stats.rex_header_roots).ok();

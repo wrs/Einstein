@@ -309,32 +309,9 @@ const PATCHES_717006: &[RomPatch] = &[
     //                                    = 0xE92D_DFF0)
     RomPatch { offset: 0x001F_86B4, value: 0xE3A0_0000, name: "GetMatchingPage: mov r0, #0 (return 0 — no shareable page)" },
     RomPatch { offset: 0x001F_86B8, value: 0xE12F_FF1E, name: "GetMatchingPage: bx lr (skip prologue+body)" },
-    // iter-80: trick `TraceSetOptions__12TInterpreterFv` into
-    // configuring trace mode even when the kernel's tracing
-    // options frame (`gVars.tracing` or similar) is NIL.
-    //
-    // The function reads gVars.tracing into a Ref slot, then at
-    // 0x35e7d8 tests `teq r0, #2` (Ref == NIL). On NIL it jumps
-    // straight to the "tracing off" exit at 0x35ea18 — which is
-    // the case on a stock boot. Our iter-79 force-enable poke
-    // of `gInterpreter[+124]` causes `DoSend` to call
-    // `TraceSend → TraceMethod`, but TraceMethod's *inner* gates
-    // at +105 / +112 / +74 (all configured by TraceSetOptions)
-    // suppress the actual `Print` call. Result: no trace output.
-    //
-    // Flipping the immediate from #2 to #0 turns the test into
-    // `teq r0, #0`. Genuine Refs are never zero, so the test
-    // never matches — TraceSetOptions falls through to the
-    // setup-with-NIL-defaults branch which sets `+105 = 1`,
-    // `+104 = 1`, and writes NIL to the +112 / +116 / +108
-    // filter slots. With those gates open and our
-    // `gInterpreter[+124]` poke in place, every `DoSend /
-    // DoMessage / DoFastApply` reaches `Print` with the trace
-    // event — surfaced via iter-79's Print thunk hook.
-    //
-    // Encoding: `teq r0, #N` is `e330_000N`; only the low 12
-    // bits of the immediate change (cond/op/Rn/Rd untouched).
-    RomPatch { offset: 0x0035_E7D8, value: 0xE330_0000, name: "TraceSetOptions: teq r0, #0 (was #2) — force trace setup even when gVars.tracing is NIL" },
+    // (TraceSetOptions patches are gated by the `ns_trace` /
+    //  `full_ns_trace` features and applied later in
+    //  `apply_717006_patches`.)
     // Force exclusive per-stack page allocation by short-circuiting
     // `TStackManager::GetMatchingPage` to always return 0 (= "no
     // shareable page found"). This forces every `FindOrAllocPage` call
@@ -543,7 +520,13 @@ const DAH_MRS_SPSR_INSN:             u32 = 0xE14F_1000;
 /// EL2 can log the return value and emulate the `cmp r0, #0` flag
 /// update, leaving the `beq 0x393a30` at `0x393988` to branch as the
 /// kernel intended.
-pub const DAH_FME_RET_HVC_IMM:        u32 = 0x50;
+// Was 0x50 — collides with `tracer::TRACE_TAG`, which silently swallowed
+// every traced-function HVC under `--features trace` and clobbered NZCV
+// at each entry via the emulated `cmp r0, #0`. Moved to 0x53; the next
+// gap above the existing DAH probe block (0x4F..0x52). Flagged as a
+// reason to convert the per-immediate consts to an enum so collisions
+// fail to compile.
+pub const DAH_FME_RET_HVC_IMM:        u32 = 0x53;
 pub const DAH_FME_RET_PC:             u32 = 0x0039_3984;
 const DAH_FME_RET_INSN:               u32 = 0xE3500000;
 
@@ -715,6 +698,73 @@ const SPLASH_PROBE_BEFORE_DRAW_INSN:       u32 = 0xE1A0_0004; // mov r0, r4
 pub const SPLASH_PROBE_DRAW_SPLASH_PC:     u32 = 0x0014_602C;
 const SPLASH_PROBE_DRAW_SPLASH_INSN:       u32 = 0xE1A0_C00D; // mov ip, sp
 
+// ---- ns_trace: POutTranslator vtable thunk probes -------------------
+//
+// Constants gated on the `ns_trace` feature so a default build doesn't
+// drag in unused symbols.
+//
+// The kernel funnels all debug-print output through the abstract
+// `POutTranslator` interface (Drivers/POutTranslator.h). Five of its
+// vtable thunks live in a contiguous block of ROM at 0x389ea0..0x389ef4,
+// each a 3-word `ldr r0, [r0, #4]; ldr ip, [r0, #N]; add pc, ip, #M`
+// dispatch shape. We patch the first instruction of each thunk with
+// an `HVC #imm` so EL2 can capture the args before the vtable lookup
+// runs — capturing every output path regardless of which concrete
+// translator (Null / Hammer / Serial / NTK) is plugged into the
+// global `gREPout` slot.
+//
+// For Print specifically the args are `(POutTranslator* this,
+// const char* fmt, ...)` with r2/r3 holding the first two varargs and
+// the rest on the source-mode stack. `src/rep_print.rs` walks the
+// guest format string + arg list and renders to the EL2 UART.
+//
+// Putc/Flush/StackTrace/ExceptionNotify are handled with simpler,
+// arg-only logging (no format-string interpretation needed).
+
+/// `Print__14POutTranslatorFPCce` thunk @ ROM `0x0038_9EB8`. First insn
+/// is `ldr r0, [r0, #4]` (multiple-inheritance-style `this`-adjustment
+/// via the POutTranslator's inner pointer); the handler emulates that
+/// load before proceeding so the rest of the thunk works as the kernel
+/// expects.
+#[cfg(feature = "ns_trace")]
+pub const PRINT_PROBE_HVC_IMM:           u32 = 0x78;
+#[cfg(feature = "ns_trace")]
+pub const PRINT_PROBE_PC:                u32 = 0x0038_9EB8;
+#[cfg(feature = "ns_trace")]
+const PRINT_PROBE_FIRST_INSN:            u32 = 0xE590_0004; // ldr r0, [r0, #4]
+
+/// `Putc` thunk @ ROM `0x0038_9EC4` (single-char output).
+#[cfg(feature = "ns_trace")]
+pub const PUTC_PROBE_HVC_IMM:            u32 = 0x7B;
+#[cfg(feature = "ns_trace")]
+pub const PUTC_PROBE_PC:                 u32 = 0x0038_9EC4;
+#[cfg(feature = "ns_trace")]
+const PUTC_PROBE_FIRST_INSN:             u32 = 0xE590_0004;
+
+/// `Flush` thunk @ ROM `0x0038_9EA0` (flush buffered bytes).
+#[cfg(feature = "ns_trace")]
+pub const FLUSH_PROBE_HVC_IMM:           u32 = 0x7C;
+#[cfg(feature = "ns_trace")]
+pub const FLUSH_PROBE_PC:                u32 = 0x0038_9EA0;
+#[cfg(feature = "ns_trace")]
+const FLUSH_PROBE_FIRST_INSN:            u32 = 0xE590_0004;
+
+/// `StackTrace` thunk @ ROM `0x0038_9EE8` (NS-frame dump).
+#[cfg(feature = "ns_trace")]
+pub const STACK_TRACE_PROBE_HVC_IMM:     u32 = 0x7D;
+#[cfg(feature = "ns_trace")]
+pub const STACK_TRACE_PROBE_PC:          u32 = 0x0038_9EE8;
+#[cfg(feature = "ns_trace")]
+const STACK_TRACE_PROBE_FIRST_INSN:      u32 = 0xE590_0004;
+
+/// `ExceptionNotify` thunk @ ROM `0x0038_9EF4` (exception-frame dump).
+#[cfg(feature = "ns_trace")]
+pub const EX_NOTIFY_PROBE_HVC_IMM:       u32 = 0x7E;
+#[cfg(feature = "ns_trace")]
+pub const EX_NOTIFY_PROBE_PC:            u32 = 0x0038_9EF4;
+#[cfg(feature = "ns_trace")]
+const EX_NOTIFY_PROBE_FIRST_INSN:        u32 = 0xE590_0004;
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -805,6 +855,65 @@ pub unsafe fn apply_717006_patches(rom_ptr: *mut u32) {
             kprintln!(
                 "rom_patch: {:#010x}: was_host={:#010x} -> intended={:#010x}  ({})",
                 p.offset, prev, p.value, p.name,
+            );
+        }
+        applied += 1;
+    }
+
+    // ns_trace: trick `TraceSetOptions__12TInterpreterFv` into
+    // configuring trace mode even when the kernel's tracing options
+    // frame (`gVars.tracing` or similar) is NIL.
+    //
+    // The function reads gVars.tracing into a Ref slot, then at
+    // 0x35e7d8 tests `teq r0, #2` (Ref == NIL). On NIL it jumps
+    // straight to the "tracing off" exit at 0x35ea18 — which is the
+    // case on a stock boot. Flipping the immediate from #2 to #0
+    // makes the test never match (genuine Refs are never zero),
+    // so the function falls through to the setup-with-NIL-defaults
+    // branch which sets `+105 = 1`, `+104 = 1`, and writes NIL to
+    // the +112 / +116 / +108 filter slots. With those gates open
+    // and the runtime poke of `gInterpreter[+124]=1` from
+    // `heap_check::force_interpreter_trace_on`, every NS-level
+    // `DoSend / DoMessage / DoFastApply` reaches `Print` with the
+    // trace event — surfaced via the Print thunk hook below.
+    //
+    // Encoding: `teq r0, #N` is `e330_000N`; only the low 12 bits
+    // of the immediate change (cond/op/Rn/Rd untouched).
+    #[cfg(feature = "ns_trace")]
+    {
+        // SAFETY: 0x35e7d8 is in the main-ROM region (< 0x0080_0000),
+        // word-aligned, and rom_ptr backs the full 8 MiB ROM. The
+        // word is code (the original `teq r0, #2` instruction), so
+        // we use `write_rom_code_word` so the encoding is stored
+        // native-LE for the CPU's instruction fetch.
+        unsafe {
+            let word_idx = (0x0035_E7D8u32 / 4) as usize;
+            let prev = rom_ptr.add(word_idx).read();
+            crate::guest_mem::write_rom_code_word(rom_ptr, word_idx, 0xE330_0000);
+            kprintln!(
+                "rom_patch: {:#010x}: was_host={:#010x} -> intended={:#010x}  ({})",
+                0x0035_E7D8u32, prev, 0xE330_0000u32,
+                "TraceSetOptions: teq r0, #0 (was #2) — force trace setup even when gVars.tracing is NIL",
+            );
+        }
+        applied += 1;
+    }
+    // full_ns_trace: change the first store of the TInterpreter
+    // trace-mode field at 0x35e7e4 from `mov r0, #2` to `mov r0, #3`.
+    // The instruction sequence is: r0 = 2 (originally) → str r0,
+    // [r4, #124] → writes the value into TInterpreter+0x7C. The same
+    // field is later overwritten with `#3` on the EQRef branch at
+    // 0x35e880, so 3 is a value the downstream gates already handle.
+    #[cfg(feature = "full_ns_trace")]
+    {
+        unsafe {
+            let word_idx = (0x0035_E7E4u32 / 4) as usize;
+            let prev = rom_ptr.add(word_idx).read();
+            crate::guest_mem::write_rom_code_word(rom_ptr, word_idx, 0xE3A0_0003);
+            kprintln!(
+                "rom_patch: {:#010x}: was_host={:#010x} -> intended={:#010x}  ({})",
+                0x0035_E7E4u32, prev, 0xE3A0_0003u32,
+                "TraceSetOptions: mov r0, #3 (was #2) — first store to TInterpreter+0x7C",
             );
         }
         applied += 1;
@@ -1017,6 +1126,54 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             "TNotebook::DrawSplashScreen entry (splash-chain diag)",
             SPLASH_PROBE_HVC_IMM,
         );
+        // ns_trace: hook the abstract POutTranslator vtable thunks
+        // (Print / Putc / Flush / StackTrace / ExceptionNotify) so EL2
+        // captures every output path the kernel uses regardless of
+        // which concrete translator (Null / Hammer / Serial / NTK)
+        // is plugged into the global `gREPout` slot.
+        #[cfg(feature = "ns_trace")]
+        {
+            patch_probe(
+                rom_ptr,
+                PRINT_PROBE_PC,
+                PRINT_PROBE_FIRST_INSN,
+                hvc_insn(PRINT_PROBE_HVC_IMM),
+                "Print thunk (capture kernel REP printf output)",
+                PRINT_PROBE_HVC_IMM,
+            );
+            patch_probe(
+                rom_ptr,
+                PUTC_PROBE_PC,
+                PUTC_PROBE_FIRST_INSN,
+                hvc_insn(PUTC_PROBE_HVC_IMM),
+                "Putc thunk (single-char REP output)",
+                PUTC_PROBE_HVC_IMM,
+            );
+            patch_probe(
+                rom_ptr,
+                FLUSH_PROBE_PC,
+                FLUSH_PROBE_FIRST_INSN,
+                hvc_insn(FLUSH_PROBE_HVC_IMM),
+                "Flush thunk (flush buffered REP output)",
+                FLUSH_PROBE_HVC_IMM,
+            );
+            patch_probe(
+                rom_ptr,
+                STACK_TRACE_PROBE_PC,
+                STACK_TRACE_PROBE_FIRST_INSN,
+                hvc_insn(STACK_TRACE_PROBE_HVC_IMM),
+                "StackTrace thunk (NS-frame dump)",
+                STACK_TRACE_PROBE_HVC_IMM,
+            );
+            patch_probe(
+                rom_ptr,
+                EX_NOTIFY_PROBE_PC,
+                EX_NOTIFY_PROBE_FIRST_INSN,
+                hvc_insn(EX_NOTIFY_PROBE_HVC_IMM),
+                "ExceptionNotify thunk (exception-frame dump)",
+                EX_NOTIFY_PROBE_HVC_IMM,
+            );
+        }
     }
 }
 

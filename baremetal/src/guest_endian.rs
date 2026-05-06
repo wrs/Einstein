@@ -54,6 +54,17 @@ use crate::guest_mem;
 #[cfg(not(nh_guest_test))]
 #[inline]
 fn pa_is_rom_code(pa: u32) -> bool {
+    // Tracer trampoline pool: written by `tracer::init` as native-LE
+    // instruction words (slot[0]/slot[1]/slot[2]) interleaved with
+    // byte-swapped data literals (slot[3]/slot[4]). The classifier's
+    // reach.bitmap doesn't cover this address range — and can't, since
+    // the slots are populated at runtime — so without this short-circuit
+    // a `handle_und` decoding the trampoline's `hvc #TRACE_TAG` from
+    // USR mode would byteswap it and miss the dispatch arm.
+    #[cfg(feature = "trace")]
+    if pa >= crate::tracer::TRAMPOLINE_IPA && pa < crate::tracer::TRAMPOLINE_END {
+        return true;
+    }
     let pa = pa as usize;
     pa + 4 <= guest_mem::ROM_SIZE && guest_mem::rom_word_is_code(pa / 4)
 }

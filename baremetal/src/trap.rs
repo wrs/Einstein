@@ -1350,6 +1350,26 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::SPLASH_PROBE_HVC_IMM => {
             handle_splash_probe(ctx);
         }
+        #[cfg(feature = "ns_trace")]
+        v if v == crate::rom_patches::PRINT_PROBE_HVC_IMM => {
+            handle_print_probe(ctx);
+        }
+        #[cfg(feature = "ns_trace")]
+        v if v == crate::rom_patches::PUTC_PROBE_HVC_IMM => {
+            handle_thunk_probe(ctx, ThunkKind::Putc);
+        }
+        #[cfg(feature = "ns_trace")]
+        v if v == crate::rom_patches::FLUSH_PROBE_HVC_IMM => {
+            handle_thunk_probe(ctx, ThunkKind::Flush);
+        }
+        #[cfg(feature = "ns_trace")]
+        v if v == crate::rom_patches::STACK_TRACE_PROBE_HVC_IMM => {
+            handle_thunk_probe(ctx, ThunkKind::StackTrace);
+        }
+        #[cfg(feature = "ns_trace")]
+        v if v == crate::rom_patches::EX_NOTIFY_PROBE_HVC_IMM => {
+            handle_thunk_probe(ctx, ThunkKind::ExceptionNotify);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1852,6 +1872,43 @@ fn handle_und(ctx: &mut TrapContext) {
         // via the UND-return stub.
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::SPLASH_PROBE_HVC_IMM) => {
             handle_splash_probe_und(ctx, faulting_pc, spsr_und);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        // ns_trace: POutTranslator vtable thunks. The kernel's debug-
+        // print path is reached from USR for any task that runs through
+        // the NS interpreter (DoSend / DoMessage / DoFastApply); HVC
+        // from USR is UNDEFINED, so those firings come through here.
+        // Pass the trampoline-saved spsr_und so the SP/LR lookup lands
+        // on the right banked register, then advance ELR via the UND-
+        // return stub since UND entry doesn't auto-advance.
+        #[cfg(feature = "ns_trace")]
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::PRINT_PROBE_HVC_IMM) => {
+            handle_print_probe_with(ctx, spsr_und as u32);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        #[cfg(feature = "ns_trace")]
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::PUTC_PROBE_HVC_IMM) => {
+            handle_thunk_probe(ctx, ThunkKind::Putc);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        #[cfg(feature = "ns_trace")]
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::FLUSH_PROBE_HVC_IMM) => {
+            handle_thunk_probe(ctx, ThunkKind::Flush);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        #[cfg(feature = "ns_trace")]
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::STACK_TRACE_PROBE_HVC_IMM) => {
+            handle_thunk_probe(ctx, ThunkKind::StackTrace);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        #[cfg(feature = "ns_trace")]
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::EX_NOTIFY_PROBE_HVC_IMM) => {
+            handle_thunk_probe(ctx, ThunkKind::ExceptionNotify);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -2671,6 +2728,101 @@ fn splash_probe_log(ctx: &TrapContext, pc: u32, spsr: u32) {
             label, n, pc, spsr, mode, describe_aarch32_mode(mode), sp, lr,
         );
     }
+}
+
+/// ns_trace: which `POutTranslator` vtable thunk fired.
+#[cfg(feature = "ns_trace")]
+#[derive(Clone, Copy)]
+enum ThunkKind {
+    Putc,
+    Flush,
+    StackTrace,
+    ExceptionNotify,
+}
+
+/// ns_trace: probe at `Print__14POutTranslatorFPCce` entry
+/// (ROM 0x389eb8). The thunk's first insn is `ldr r0, [r0, #4]`;
+/// we emulate it after capturing args.
+///
+/// Args follow standard ARM EABI varargs:
+///   r0 = POutTranslator* this   (consumed by the thunk)
+///   r1 = format string (const char*)
+///   r2 = arg0   r3 = arg1   [sp+0..]+ = arg2..
+///
+/// The renderer's `VaArgs` pulls args from r2/r3 then walks the
+/// source-mode stack.
+#[cfg(feature = "ns_trace")]
+fn handle_print_probe(ctx: &mut TrapContext) {
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    handle_print_probe_with(ctx, spsr_el2);
+}
+
+#[cfg(feature = "ns_trace")]
+fn handle_print_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
+    let r0 = ctx.x[0] as u32;
+    let r1 = ctx.x[1] as u32;
+    let r2 = ctx.x[2] as u32;
+    let r3 = ctx.x[3] as u32;
+    let sp = crate::banked::sp_for_mode(ctx, source_cpsr);
+
+    crate::rep_print::render_and_log(
+        "REP> ",
+        r1,
+        crate::rep_print::VaArgs::new(r2, r3, sp),
+    );
+
+    // Emulate `ldr r0, [r0, #4]` so the rest of the thunk
+    // (`ldr ip, [r0, #N]; add pc, ip, #M`) sees the same r0
+    // it would have without the patch.
+    let new_r0 = crate::guest_endian::guest_read_u32_va(r0.wrapping_add(4))
+        .or_else(|| crate::guest_endian::guest_read_u32_pa(r0.wrapping_add(4)))
+        .unwrap_or(0xDEAD_BEEF);
+    ctx.x[0] = new_r0 as u64;
+}
+
+/// ns_trace: unified handler for the abstract POutTranslator thunks
+/// (Putc / Flush / StackTrace / ExceptionNotify). All four share the
+/// same first-insn shape (`ldr r0, [r0, #4]`) and the same vtable-
+/// dispatch tail; only the captured-arg formatting differs.
+#[cfg(feature = "ns_trace")]
+fn handle_thunk_probe(ctx: &mut TrapContext, kind: ThunkKind) {
+    let r0 = ctx.x[0] as u32;
+    let r1 = ctx.x[1] as u32;
+    match kind {
+        ThunkKind::Putc => {
+            // Route the byte through the same line buffer Print uses
+            // so a stream of Putc calls renders as one UART line per
+            // newline-terminated fragment.
+            crate::rep_print::putc("REP> ", (r1 & 0xFF) as u8);
+        }
+        ThunkKind::Flush => {
+            crate::rep_print::flush_line("REP> ");
+        }
+        ThunkKind::StackTrace => {
+            crate::rep_print::flush_line("REP> ");
+            kprintln!(
+                "REP> [StackTrace(translator={:#010x}, arg={:#010x})]",
+                r0, r1,
+            );
+        }
+        ThunkKind::ExceptionNotify => {
+            // r1 = Exception*; *r1 = name C-string ptr.
+            let name_ptr = crate::guest_endian::guest_read_u32_va(r1).unwrap_or(0);
+            let (buf, len) = read_cstr_at(name_ptr, 80);
+            let name = core::str::from_utf8(&buf[..len]).unwrap_or("<non-utf8>");
+            crate::rep_print::flush_line("REP> ");
+            kprintln!(
+                "REP> [ExceptionNotify(translator={:#010x}, ex={:#010x}) name={:?}]",
+                r0, r1, name,
+            );
+        }
+    }
+    // Emulate the original `ldr r0, [r0, #4]` so the rest of the
+    // thunk (vtable lookup + jump) sees the same r0.
+    let new_r0 = crate::guest_endian::guest_read_u32_va(r0.wrapping_add(4))
+        .or_else(|| crate::guest_endian::guest_read_u32_pa(r0.wrapping_add(4)))
+        .unwrap_or(0xDEAD_BEEF);
+    ctx.x[0] = new_r0 as u64;
 }
 
 fn handle_reboot(ctx: &TrapContext) -> ! {

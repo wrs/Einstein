@@ -74,8 +74,8 @@ pub const TRACE_TAG: u32 = 0x50;
 /// sites with a ±32 MiB `B` instruction AND doesn't require any extra
 /// stage-2 mapping. Well past the REx tail at ~0x0088_E500 and well
 /// before the UND-trampoline / ROM-patch injection stubs at 0x00FF_FF00.
-const TRAMPOLINE_IPA: u32 = 0x0090_0000;
-const TRAMPOLINE_END: u32 = 0x00E0_0000;
+pub const TRAMPOLINE_IPA: u32 = 0x0090_0000;
+pub const TRAMPOLINE_END: u32 = 0x00E0_0000;
 
 const SLOT_WORDS: usize = 5;
 const SLOT_SIZE: u32 = (SLOT_WORDS as u32) * 4;
@@ -334,16 +334,23 @@ pub fn init() {
         let slot_word_index = (slot_ipa / 4) as usize;
         // SAFETY: slot_ipa < 0x0100_0000 (bounded by TRAMPOLINE_END),
         // word-aligned by construction; single-threaded boot context.
+        //
+        // Slots 0/1/2 are instruction words: stored native-LE so the
+        // CPU's LE instruction fetch decodes the correct encoding.
+        // Slots 3/4 are *data* literals consumed by an AArch32 LDR
+        // running under CPSR.E=1 (BE-8); byte-swap them on store so
+        // the BE-natural numerical read returns the value we intend.
+        // Without the swap, `LDR PC, [pc, #0]` at slot[2] reads the
+        // byte-swapped target and the guest jumps to e.g. 0x6c343100
+        // instead of 0x0031346c. (slot[3] in the B-rewrite case is
+        // also a literal target, hence the same swap.)
         unsafe {
             let slot = rom_base.add(slot_word_index);
             slot.add(0).write(encode_hvc(TRACE_TAG as u16));
             slot.add(1).write(slot1);
-            // slot[2] and slot[4] are only reached when slot[1] doesn't
-            // itself transfer control. For the B-rewrite case we still
-            // fill them (defensive — unreached but consistent layout).
             slot.add(2).write(0xE59F_F000); // LDR PC, [pc, #0] → slot[4]
-            slot.add(3).write(slot3);
-            slot.add(4).write(orig_pc.wrapping_add(4));
+            slot.add(3).write(slot3.swap_bytes());
+            slot.add(4).write(orig_pc.wrapping_add(4).swap_bytes());
             let _ = sets_pc;
 
             rom_base.add(word_index).write(b_insn);
@@ -501,30 +508,18 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
         }
     }
 
-    // SVC-mode SP tracking: the Phase-B stall is a stage-1 DABT at
-    // DFAR=0x0c001000 with pre-abort mode = SVC. That's the guard
-    // page right below the SVC stack at 0x0c002000. Log SP_svc at
-    // each SVC-mode function entry in the relevant call chain so we
-    // can see exactly where SP_svc crosses the boundary.
+    // SVC-mode SP-watch hook: on every entry into a listed function
+    // running in SVC mode, emit `@<name> SP_svc=… LR_svc=…` so you can
+    // track stack high-water and call-chain across an investigation.
+    // Watchlist intentionally empty — add `0xPC` literals here during
+    // a stall hunt, recompile, and the lines fire on each entry.
     if mode == 0x13 {
-        match fa {
-            0x003AD698  // SWIBoot
-            | 0x001DFDE8 // LowLevelCopyDoneFromKernelGlue
-            | 0x001E0754 // ConvertMemOrMsgIdToObj
-            | 0x00191E80 // LocalToGlobalId
-            | 0x00191F14 // ConvertIdToObj
-            | 0x00319F14 // TObjectTable::Get
-            | 0x0009C9B0 // TDoubleQContainer::Add
-            | 0x0009C9AC // TDoubleQContainer::CheckBeforeAdd
-            | 0x0009C7C4 // TDoubleQContainer::RemoveFromQueue
-            | 0x001DFA70 // SMemCopyToKernelGlue
-                => {
-                kprintln!(
-                    "  @{} SP_svc={:#010x} LR_svc={:#010x}",
-                    fn_name(idx), cur_sp, cur_lr
-                );
-            }
-            _ => {}
+        const SVC_WATCH: &[u32] = &[];
+        if SVC_WATCH.contains(&fa) {
+            kprintln!(
+                "  @{} SP_svc={:#010x} LR_svc={:#010x}",
+                fn_name(idx), cur_sp, cur_lr,
+            );
         }
     }
 

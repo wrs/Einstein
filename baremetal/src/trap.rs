@@ -3147,14 +3147,17 @@ fn handle_task_switch_pre_eret_probe(ctx: &mut TrapContext) {
     // 4 instructions starting at the ERET target. If the bytes at
     // saved_pc don't match the disasm, that pins the bug to a runtime
     // patcher; if they match, the bug is in the ERET / fault path.
+    //
+    // Also dump the 4 ROM words at 0x003ada6c so we can confirm the
+    // `movs pc, lr` is still intact (not patched away by something).
     if trap_trace_armed() {
-        let target = lr_svc;
         let read_target = |va: u32| -> u32 {
             match crate::guest_mem::translate_va(va) {
                 Some(pa) => crate::guest_endian::guest_read_u32_pa(pa).unwrap_or(0xDEAD_BEEF),
                 None => 0xDEAD_BEEF,
             }
         };
+        let target = lr_svc;
         let w0 = read_target(target);
         let w1 = read_target(target.wrapping_add(4));
         let w2 = read_target(target.wrapping_add(8));
@@ -3162,6 +3165,29 @@ fn handle_task_switch_pre_eret_probe(ctx: &mut TrapContext) {
         kprintln!(
             "  insn @ saved_pc {:#010x} = {:08x} {:08x} {:08x} {:08x}",
             target, w0, w1, w2, w3,
+        );
+        // Bytes at 0x003ada6c (the kernel's `movs pc, lr`) and 3
+        // following words. Original disasm: e1b0f00e (movs pc, lr),
+        // e8bd5c0c (pop {r2,r3,sl,fp,ip,lr}), e92d500c, e59f1434.
+        // If word 0 isn't 0xe1b0f00e at runtime, something has
+        // rewritten it.
+        let movs_pc = 0x003a_da6c;
+        let m0 = read_target(movs_pc);
+        let m1 = read_target(movs_pc.wrapping_add(4));
+        let m2 = read_target(movs_pc.wrapping_add(8));
+        let m3 = read_target(movs_pc.wrapping_add(12));
+        kprintln!(
+            "  insn @ 0x3ada6c              = {:08x} {:08x} {:08x} {:08x}",
+            m0, m1, m2, m3,
+        );
+        // Also read via the BE-aware (numerical) path AND via the
+        // raw host-LE path. If they differ, the value-vs-bytes view
+        // is inconsistent and we can spot any byte-order issue.
+        let raw_lr_pa = crate::guest_mem::translate_va(movs_pc).unwrap_or(0);
+        let raw = crate::guest_mem::read_word_pa(raw_lr_pa).unwrap_or(0xDEAD_BEEF);
+        kprintln!(
+            "  raw host-LE @ PA={:#010x}     = {:08x}",
+            raw_lr_pa, raw,
         );
     }
 }

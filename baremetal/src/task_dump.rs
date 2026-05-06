@@ -946,59 +946,6 @@ pub fn dump_save_area(label: &str, task_va: u32) {
     }
 }
 
-/// One-line summary of a task's SWIBoot save area. Compact enough to
-/// log on every task switch without flooding output. Layout matches
-/// `TTaskSavedContext` (see docs/STRUCTURES.md): saved_pc at +0x4c,
-/// saved_spsr at +0x50, sp_usr at +0x44, lr_usr at +0x48.
-///
-/// Flags suspicious values: bit-0 set in saved_pc (interworking-style
-/// PC where Newton 2.x never produces Thumb), or T-bit set in
-/// saved_spsr (Newton 2.x is pure ARM, so T=1 means corruption).
-pub fn dump_task_save_oneline(label: &str, task_va: u32) {
-    if task_va == 0 || task_va == u32::MAX {
-        kprintln!("  task[{}] <null/unreadable>", label);
-        return;
-    }
-    let id   = rd(task_va).unwrap_or(u32::MAX);
-    let glob = rd(task_va + TT_GLOBALS).unwrap_or(u32::MAX);
-    let (n0, n1, n2, n3) = match find_task_name(glob) {
-        Some((_, v)) => ((v>>24) as u8, (v>>16) as u8, (v>>8) as u8, v as u8),
-        None         => (b'?', b'?', b'?', b'?'),
-    };
-    let saved_r0   = rd(task_va + 0x10).unwrap_or(u32::MAX);
-    let saved_r1   = rd(task_va + 0x14).unwrap_or(u32::MAX);
-    let saved_r2   = rd(task_va + 0x18).unwrap_or(u32::MAX);
-    let saved_r3   = rd(task_va + 0x1c).unwrap_or(u32::MAX);
-    let saved_r4   = rd(task_va + 0x20).unwrap_or(u32::MAX);
-    let saved_r5   = rd(task_va + 0x24).unwrap_or(u32::MAX);
-    let saved_r6   = rd(task_va + 0x28).unwrap_or(u32::MAX);
-    let saved_r7   = rd(task_va + 0x2c).unwrap_or(u32::MAX);
-    let saved_r8   = rd(task_va + 0x30).unwrap_or(u32::MAX);
-    let saved_r12  = rd(task_va + 0x40).unwrap_or(u32::MAX);
-    let sp_usr     = rd(task_va + 0x44).unwrap_or(u32::MAX);
-    let lr_usr     = rd(task_va + 0x48).unwrap_or(u32::MAX);
-    let saved_pc   = rd(task_va + 0x4c).unwrap_or(u32::MAX);
-    let saved_spsr = rd(task_va + 0x50).unwrap_or(u32::MAX);
-    let suspicious =
-        (saved_pc & 1) != 0 || (saved_spsr & 0x20) != 0;
-    kprintln!(
-        "  task[{}] {:#010x} id={:#x} '{}{}{}{}' saved_pc={:#010x} saved_spsr={:#010x} sp_usr={:#010x} lr_usr={:#010x}{}",
-        label, task_va, id,
-        n0 as char, n1 as char, n2 as char, n3 as char,
-        saved_pc, saved_spsr, sp_usr, lr_usr,
-        if suspicious { "  *** CORRUPT (T-bit or bit-0) ***" } else { "" },
-    );
-    kprintln!(
-        "    saved r0..r7 = {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
-        saved_r0, saved_r1, saved_r2, saved_r3,
-        saved_r4, saved_r5, saved_r6, saved_r7,
-    );
-    kprintln!(
-        "    saved r8={:08x} r12={:08x}",
-        saved_r8, saved_r12,
-    );
-}
-
 /// One-shot diagnostic: dump the SWIBoot save area for every task
 /// in the object table whose fTaskName matches `name_match` (4-char
 /// ASCII; `?` = wildcard byte). Plus the current task. Useful when

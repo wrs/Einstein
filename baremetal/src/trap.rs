@@ -185,14 +185,12 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
 
     static mut TRAP_LOG_BUDGET: usize = 500;
     // SAFETY: single-threaded; only core 0 services EL2 traps.
-    // `trap_trace_armed()` overrides the budget so iter-105 can capture
-    // every trap from the moment drvr is scheduled in through the wedge.
     let should_log = !is_trace_hvc
-        && (trap_trace_armed() || unsafe {
+        && unsafe {
             let go = TRAP_LOG_BUDGET > 0;
             if go { TRAP_LOG_BUDGET -= 1; }
             go
-        });
+        };
     if should_log {
         let elr = read_sysreg!("elr_el2");
         let spsr = read_sysreg!("spsr_el2");
@@ -201,55 +199,6 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
             "trap: EC={:#x} ({}) ELR={:#x} SPSR={:#010x} FAR={:#x} ESR={:#x}",
             ec, describe_ec(ec), elr, spsr, far, esr
         );
-        if trap_trace_armed() {
-            kprintln!(
-                "  r0..r7  = {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
-                ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
-                ctx.x[4] as u32, ctx.x[5] as u32, ctx.x[6] as u32, ctx.x[7] as u32,
-            );
-            kprintln!(
-                "  r8..r14 = {:08x} {:08x} {:08x} {:08x} {:08x} sp_usr={:08x} lr_usr={:08x}",
-                ctx.x[8] as u32, ctx.x[9] as u32, ctx.x[10] as u32, ctx.x[11] as u32,
-                ctx.x[12] as u32, ctx.x[13] as u32, ctx.x[14] as u32,
-            );
-        }
-    }
-
-    // iter-105: catch the first sync trap from a guest in Thumb mode.
-    // Newton 2.x is pure ARM; T=1 in SPSR_EL2 means an interworking
-    // branch (BX, BLX, mov pc/Rm with ARMv7+ semantics, ldr pc, pop pc)
-    // landed with a Thumb-bit-set target. Logging the first such trap
-    // pins the wild-branch event close to its source.
-    {
-        let spsr_el2 = read_sysreg!("spsr_el2") as u32;
-        if (spsr_el2 & 0x20) != 0 {
-            static mut THUMB_LOGGED: bool = false;
-            // SAFETY: single-threaded.
-            let first = unsafe {
-                let was = THUMB_LOGGED;
-                THUMB_LOGGED = true;
-                !was
-            };
-            if first {
-                let elr = read_sysreg!("elr_el2");
-                let far = read_sysreg!("far_el1");
-                kprintln!(
-                    "thumb-source: first sync trap with SPSR_EL2.T=1 — \
-                     ELR={:#x} SPSR={:#010x} FAR={:#x} EC={:#x} ({})",
-                    elr, spsr_el2, far, ec, describe_ec(ec),
-                );
-                kprintln!(
-                    "thumb-source:   r0..r7:   {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
-                    ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
-                    ctx.x[4] as u32, ctx.x[5] as u32, ctx.x[6] as u32, ctx.x[7] as u32,
-                );
-                kprintln!(
-                    "thumb-source:   r8..r15:  {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
-                    ctx.x[8] as u32, ctx.x[9] as u32, ctx.x[10] as u32, ctx.x[11] as u32,
-                    ctx.x[12] as u32, ctx.x[13] as u32, ctx.x[14] as u32, ctx.x[15] as u32,
-                );
-            }
-        }
     }
 
     match ec {
@@ -358,14 +307,10 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     static mut HB_IRQ_COUNT: u64 = 0;
     const HB_LATE_STRIDE: u64 = 64;
     let elr = read_sysreg!("elr_el2");
-    // SAFETY: single-threaded. `trap_trace_armed()` overrides the
-    // budget/stride so iter-105 captures every IRQ between drvr's
-    // task-switch arming and the wedge UND.
+    // SAFETY: single-threaded.
     let (should_log, tag) = unsafe {
         HB_IRQ_COUNT += 1;
-        if trap_trace_armed() {
-            (true, "armed")
-        } else if HB_FIRST_BUDGET > 0 && elr != HB_LAST_PC {
+        if HB_FIRST_BUDGET > 0 && elr != HB_LAST_PC {
             HB_LAST_PC = elr;
             HB_FIRST_BUDGET -= 1;
             (true, "first")
@@ -1402,18 +1347,6 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::FPE_ENTRY_PROBE_HVC_IMM => {
             handle_fpe_entry_probe(ctx);
         }
-        v if v == crate::rom_patches::TASK_SWITCH_PROBE_HVC_IMM => {
-            handle_task_switch_probe(ctx);
-        }
-        v if v == crate::rom_patches::TASK_SWITCH_PRE_ERET_HVC_IMM => {
-            handle_task_switch_pre_eret_probe(ctx);
-        }
-        v if v == crate::rom_patches::TASK_SWITCH_ERET_HVC_IMM => {
-            handle_task_switch_eret_emulator(ctx);
-        }
-        v if v == crate::rom_patches::POST_MSR_SPSR_PROBE_HVC_IMM => {
-            handle_post_msr_spsr_probe(ctx);
-        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1692,73 +1625,6 @@ fn handle_und(ctx: &mut TrapContext) {
     };
 
     record_und_history(faulting_pc, insn, spsr_und as u32, ctx);
-
-    // iter-105: catch the first UND that came from a Thumb-mode source.
-    // Newton 2.x doesn't use Thumb anywhere, so SPSR_und.T=1 means an
-    // interworking branch (BX, BLX, ARMv7+ `mov pc, Rm`, ldr pc / pop pc)
-    // landed with bit 0 set. Logging the first such UND pins the
-    // wild-branch event close to its source — and more importantly, dumps
-    // every register at the moment the CPU vectored to UND, so we can
-    // see what r0..r12, SP_usr, LR_usr looked like.
-    if (spsr_und as u32) & 0x20 != 0 {
-        static mut THUMB_UND_LOGGED: bool = false;
-        // SAFETY: single-threaded.
-        let first = unsafe {
-            let was = THUMB_UND_LOGGED;
-            THUMB_UND_LOGGED = true;
-            !was
-        };
-        if first {
-            kprintln!(
-                "thumb-und: first UND with SPSR_und.T=1 — \
-                 PC={:#x} insn={:#010x} SPSR_und={:#010x} mode={:#x}",
-                faulting_pc, insn, spsr_und as u32, (spsr_und as u32) & 0x1F,
-            );
-            kprintln!(
-                "thumb-und:   r0..r7:   {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
-                ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
-                ctx.x[4] as u32, ctx.x[5] as u32, ctx.x[6] as u32, ctx.x[7] as u32,
-            );
-            kprintln!(
-                "thumb-und:   r8..r15:  {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
-                ctx.x[8] as u32, ctx.x[9] as u32, ctx.x[10] as u32, ctx.x[11] as u32,
-                ctx.x[12] as u32, ctx.x[13] as u32, ctx.x[14] as u32, ctx.x[15] as u32,
-            );
-            // x[18..23] are AArch32 banked SP/LR/SPSR per Table D1-79.
-            // Also dump the SPSR_svc / SPSR_und register file so we can
-            // tell whether a recent SWI tail's `movs pc, lr` was the
-            // wild-branch source.
-            let sp_usr = ctx.x[13] as u32;
-            let lr_usr = ctx.x[14] as u32;
-            let sp_svc = ctx.x[19] as u32;
-            let lr_svc = ctx.x[18] as u32;
-            let sp_und = ctx.x[23] as u32;
-            let lr_und_reg = ctx.x[22] as u32;
-            let spsr_svc = read_sysreg!("spsr_el1") as u32;
-            kprintln!(
-                "thumb-und:   SP_usr={:#010x} LR_usr={:#010x}  SP_svc={:#010x} LR_svc={:#010x} SPSR_svc={:#010x}",
-                sp_usr, lr_usr, sp_svc, lr_svc, spsr_svc,
-            );
-            kprintln!(
-                "thumb-und:   SP_und={:#010x} LR_und={:#010x}",
-                sp_und, lr_und_reg,
-            );
-            // SCTLR_EL1.TE controls AArch32 exception entry T-bit:
-            // TE=0 → trampoline starts in ARM, TE=1 → in Thumb.
-            // If we're seeing SPSR_und.T=1 with TE=0, something is
-            // architecturally inconsistent.
-            let sctlr_el1: u64 = read_sysreg!("sctlr_el1");
-            let spsr_el2:  u64 = read_sysreg!("spsr_el2");
-            kprintln!(
-                "thumb-und:   SCTLR_EL1={:#010x} (TE={} EE={} M={}) SPSR_EL2={:#010x}",
-                sctlr_el1,
-                (sctlr_el1 >> 30) & 1,
-                (sctlr_el1 >> 25) & 1,
-                sctlr_el1 & 1,
-                spsr_el2,
-            );
-        }
-    }
 
     // StrongARM CP15 clock-control write (MCR p15, 0, Rt, c15, c1, 2).
     // ARMv8 doesn't define that register, so the instruction raises UND
@@ -3019,290 +2885,6 @@ fn handle_dah_or_chain_probe(ctx: &mut TrapContext) {
     ctx.x[1] = (ctx.x[1] & 0xFFFF_FFFF_0000_0000) | (g_current_task_va as u64);
 }
 
-/// Trap-trace arming flag (iter-105). When set, every sync trap and
-/// every IRQ entry forces a verbose log line — bypassing the
-/// `TRAP_LOG_BUDGET` budget. Used to capture the full trap sequence
-/// between an "incoming task is suspect" event (e.g. drvr being
-/// scheduled in) and the wedge UND, so we can see exactly what
-/// happens during the kernel's ERET to the user and any
-/// immediately-following user-mode fault.
-pub static TRAP_TRACE_ARMED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-#[inline]
-pub fn trap_trace_armed() -> bool {
-    TRAP_TRACE_ARMED.load(core::sync::atomic::Ordering::Relaxed)
-}
-
-/// Task-switch save-area probe (iter-105). Fires on the kernel's
-/// patched `add r0, r0, #16` at PC `0x003ad9a4`, which sits in the
-/// task-restore epilog after `bl SwapInGlobals`. At this point r0 = r4
-/// = the incoming `gCurrentTask` (the task whose registers and
-/// `movs pc, lr` are about to run); we treat the previous fire's
-/// incoming as the outgoing for this switch.
-///
-/// Each fire logs a one-line summary of the outgoing and incoming
-/// task's `TTaskSavedContext` and flags any bit-0 in saved_pc or T-bit
-/// in saved_spsr — Newton 2.x is pure ARM, so either is the iter-105
-/// PC=0/T=1 corruption we're hunting. The handler then emulates
-/// `add r0, r0, #16` so the natural ERET resumes the kernel at
-/// 0x003ad9a8 unchanged.
-///
-/// Also: when the incoming task's name is "drvr", arm `TRAP_TRACE_ARMED`
-/// so every subsequent sync trap and IRQ logs verbosely — pinning the
-/// wedge sequence between drvr's first ERET and the PC=0/T=1 UND.
-fn handle_task_switch_probe(ctx: &mut TrapContext) {
-    // r4 holds the incoming task (mov r4, r0 at 0x3ad998, preserved
-    // across `bl SwapInGlobals` per APCS).
-    let incoming = ctx.x[4] as u32;
-
-    // Track the previous-fire incoming as the outgoing for this switch.
-    static PREV_INCOMING: core::sync::atomic::AtomicU32 =
-        core::sync::atomic::AtomicU32::new(0);
-    let outgoing = PREV_INCOMING.swap(
-        incoming,
-        core::sync::atomic::Ordering::Relaxed,
-    );
-
-    static FIRED: core::sync::atomic::AtomicU32 =
-        core::sync::atomic::AtomicU32::new(0);
-    let n = FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-
-    kprintln!("task-switch[{}]:", n);
-    if outgoing != 0 {
-        crate::task_dump::dump_task_save_oneline("out", outgoing);
-    } else {
-        kprintln!("  task[out] (first switch — no prior incoming)");
-    }
-    crate::task_dump::dump_task_save_oneline("in ", incoming);
-
-    // Arm verbose trap tracing when the incoming task is named "drvr".
-    // Newton's TT_GLOBALS sits at task_va + 0xa0 and points just past
-    // the per-task globals struct; `find_task_name` scans the 128
-    // bytes below it for a printable fourcc.
-    if !trap_trace_armed() {
-        let glob = crate::guest_endian::guest_read_u32_va(incoming.wrapping_add(0xa0))
-            .unwrap_or(0);
-        if let Some((_, v)) = crate::task_dump::find_task_name(glob) {
-            let bytes = [
-                (v >> 24) as u8,
-                (v >> 16) as u8,
-                (v >> 8)  as u8,
-                v          as u8,
-            ];
-            if &bytes == b"drvr" {
-                TRAP_TRACE_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
-                kprintln!(
-                    "*** trap-trace ARMED: drvr task incoming (task={:#010x}) ***",
-                    incoming,
-                );
-                // Open the FVP TarmacTrace window. Pairs with the
-                // emit_stop in handle_und's catch-all (`unrecognised
-                // UND` path) so the trace covers exactly drvr's first
-                // ERET attempt through the wedge UND. On QEMU the
-                // markers are just kprintln strings — harmless.
-                crate::tarmac::emit_start();
-            }
-        }
-    }
-
-    // Emulate `add r0, r0, #16`. Preserve high 32 bits of x0 the same
-    // way other AArch32-emulation handlers in this file do.
-    ctx.x[0] = (ctx.x[0] & 0xFFFF_FFFF_0000_0000)
-        | ((ctx.x[0] as u32).wrapping_add(0x10) as u64);
-}
-
-/// Pre-ERET probe (iter-105). Fires on the patched `pop {r0, r1, r2}`
-/// at 0x003ada68 — the very last instruction before the kernel's
-/// `movs pc, lr` at 0x003ada6c. At this point lr_svc holds the saved_pc
-/// the kernel will jump to and SPSR_EL1 (= AArch32 SPSR_svc) holds the
-/// new CPSR for the user. Logs both, plus the popped r0/r1/r2 (which
-/// become the user's r0..r2 on ERET). Then emulates the pop so natural
-/// ERET continues into the `movs pc, lr` at PC+4 unchanged.
-fn handle_task_switch_pre_eret_probe(ctx: &mut TrapContext) {
-    // SVC banked regs per Table D1-79: ctx.x[18] = LR_svc, x[19] = SP_svc.
-    let lr_svc = ctx.x[18] as u32;
-    let sp_svc = ctx.x[19] as u32;
-    let spsr_svc = read_sysreg!("spsr_el1") as u32;
-
-    // Read the 3 words about to be popped from the SVC stack via the
-    // guest stage-1 walker — same path the diagnostic dumps use, so it
-    // resolves SVC mappings even though we're at EL2.
-    let read_va = |va: u32| -> u32 {
-        match crate::guest_mem::translate_va(va) {
-            Some(pa) => crate::guest_endian::guest_read_u32_pa(pa).unwrap_or(0xDEAD_BEEF),
-            None => 0xDEAD_BEEF,
-        }
-    };
-    let p0 = read_va(sp_svc);
-    let p1 = read_va(sp_svc.wrapping_add(4));
-    let p2 = read_va(sp_svc.wrapping_add(8));
-
-    static FIRED: core::sync::atomic::AtomicU32 =
-        core::sync::atomic::AtomicU32::new(0);
-    let n = FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-
-    // The bug we're chasing produces lr_svc with bit-0 set or spsr_svc
-    // with the T-bit set; flag those loudly. The routine fires once per
-    // task switch (~826 times before the wedge), so the flag is what
-    // makes the smoking gun easy to spot in the log tail.
-    let suspicious = (lr_svc & 1) != 0 || (spsr_svc & 0x20) != 0;
-    kprintln!(
-        "task-eret[{}]: lr_svc={:#010x} spsr_svc={:#010x} sp_svc={:#010x} pop=[{:#010x}, {:#010x}, {:#010x}]{}",
-        n, lr_svc, spsr_svc, sp_svc, p0, p1, p2,
-        if suspicious { "  *** CORRUPT (T-bit or bit-0) ***" } else { "" },
-    );
-
-    // Emulate `pop {r0, r1, r2}` (= `ldmfd sp!, {r0, r1, r2}`):
-    //   r0 := [sp_svc + 0]
-    //   r1 := [sp_svc + 4]
-    //   r2 := [sp_svc + 8]
-    //   sp_svc += 12
-    ctx.x[0]  = (ctx.x[0] & 0xFFFF_FFFF_0000_0000)  | (p0 as u64);
-    ctx.x[1]  = (ctx.x[1] & 0xFFFF_FFFF_0000_0000)  | (p1 as u64);
-    ctx.x[2]  = (ctx.x[2] & 0xFFFF_FFFF_0000_0000)  | (p2 as u64);
-    ctx.x[19] = (ctx.x[19] & 0xFFFF_FFFF_0000_0000) | (sp_svc.wrapping_add(12) as u64);
-
-    // When the trap-trace is armed (drvr is incoming), also dump the
-    // 4 instructions starting at the ERET target. If the bytes at
-    // saved_pc don't match the disasm, that pins the bug to a runtime
-    // patcher; if they match, the bug is in the ERET / fault path.
-    //
-    // Also dump the 4 ROM words at 0x003ada6c so we can confirm the
-    // `movs pc, lr` is still intact (not patched away by something).
-    if trap_trace_armed() {
-        let read_target = |va: u32| -> u32 {
-            match crate::guest_mem::translate_va(va) {
-                Some(pa) => crate::guest_endian::guest_read_u32_pa(pa).unwrap_or(0xDEAD_BEEF),
-                None => 0xDEAD_BEEF,
-            }
-        };
-        let target = lr_svc;
-        let w0 = read_target(target);
-        let w1 = read_target(target.wrapping_add(4));
-        let w2 = read_target(target.wrapping_add(8));
-        let w3 = read_target(target.wrapping_add(12));
-        kprintln!(
-            "  insn @ saved_pc {:#010x} = {:08x} {:08x} {:08x} {:08x}",
-            target, w0, w1, w2, w3,
-        );
-        // Bytes at 0x003ada6c (the kernel's `movs pc, lr`) and 3
-        // following words. Original disasm: e1b0f00e (movs pc, lr),
-        // e8bd5c0c (pop {r2,r3,sl,fp,ip,lr}), e92d500c, e59f1434.
-        // If word 0 isn't 0xe1b0f00e at runtime, something has
-        // rewritten it.
-        let movs_pc = 0x003a_da6c;
-        let m0 = read_target(movs_pc);
-        let m1 = read_target(movs_pc.wrapping_add(4));
-        let m2 = read_target(movs_pc.wrapping_add(8));
-        let m3 = read_target(movs_pc.wrapping_add(12));
-        kprintln!(
-            "  insn @ 0x3ada6c              = {:08x} {:08x} {:08x} {:08x}",
-            m0, m1, m2, m3,
-        );
-        // Also read via the BE-aware (numerical) path AND via the
-        // raw host-LE path. If they differ, the value-vs-bytes view
-        // is inconsistent and we can spot any byte-order issue.
-        let raw_lr_pa = crate::guest_mem::translate_va(movs_pc).unwrap_or(0);
-        let raw = crate::guest_mem::read_word_pa(raw_lr_pa).unwrap_or(0xDEAD_BEEF);
-        kprintln!(
-            "  raw host-LE @ PA={:#010x}     = {:08x}",
-            raw_lr_pa, raw,
-        );
-        // Dump SCTLR_EL1, HCR_EL2, and the AArch64 SPSR_EL2 we'll
-        // ERET with. SCTLR_EL1.TE (bit 30) controls the new T-bit
-        // on AArch32 exception entry; if it's 1 the kernel's UND
-        // trampoline runs in Thumb. SCTLR_EL1.EE (bit 25) is the
-        // exception-entry endianness. HCR_EL2 reveals our trap
-        // configuration. SPSR_EL2 is what the natural ERET back
-        // to the kernel will consume.
-        let sctlr_el1: u64 = read_sysreg!("sctlr_el1");
-        let hcr_el2:   u64 = read_sysreg!("hcr_el2");
-        let spsr_el2:  u64 = read_sysreg!("spsr_el2");
-        kprintln!(
-            "  SCTLR_EL1={:#010x} (TE={} EE={} M={}) HCR_EL2={:#010x} SPSR_EL2={:#010x}",
-            sctlr_el1,
-            (sctlr_el1 >> 30) & 1,
-            (sctlr_el1 >> 25) & 1,
-            sctlr_el1 & 1,
-            hcr_el2,
-            spsr_el2,
-        );
-    }
-}
-
-/// SPSR-drift bisect probe. Fires on the patched `nop` at 0x003ad9b4
-/// (immediately after `msr SPSR_fc, r1` at 0x003ad9b0). Logs SPSR_EL1
-/// so we can compare against the pre-ERET probe at 0x003ada68 and
-/// pinpoint where SPSR_svc is being mutated. The original instruction
-/// is `mov r0, r0` — a no-op — so the handler does nothing beyond
-/// logging; natural ERET resumes the kernel at 0x003ad9b8.
-fn handle_post_msr_spsr_probe(ctx: &mut TrapContext) {
-    let spsr_el1 = read_sysreg!("spsr_el1") as u32;
-    let r0 = ctx.x[0] as u32;
-    let r1 = ctx.x[1] as u32;
-    static FIRED: core::sync::atomic::AtomicU32 =
-        core::sync::atomic::AtomicU32::new(0);
-    let n = FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    // Always log when the trap-trace is armed (drvr is incoming);
-    // throttle to first 8 fires otherwise to avoid flooding.
-    if trap_trace_armed() || n < 8 {
-        kprintln!(
-            "post-msr[{}]: spsr_el1={:#010x}  r0={:#010x} r1={:#010x}",
-            n, spsr_el1, r0, r1,
-        );
-    }
-}
-
-/// Emulate the kernel's `movs pc, lr` at 0x003ada6c. We replaced the
-/// native instruction with HVC; this handler performs the AArch32 EL1
-/// exception-return semantics from EL2:
-///
-///   new_cpsr ← SPSR_svc           (= SPSR_EL1 from EL2's view)
-///   new_pc   ← lr_svc             (= ctx.x[18])
-///   coerce M[4]=1 if the kernel wrote a USR-26 encoding (M[4:0]=0)
-///   ELR_EL2  ← new_pc
-///   SPSR_EL2 ← new_cpsr           (with the coercion applied)
-///
-/// The natural HVC ERET in `trap_sync_lower_aarch32`'s assembly stub
-/// then drops to AArch32 EL0 at new_pc with new_cpsr, just like the
-/// native `movs pc, lr` would.
-fn handle_task_switch_eret_emulator(ctx: &mut TrapContext) {
-    let lr_svc = ctx.x[18] as u32;
-    let mut spsr_svc = read_sysreg!("spsr_el1") as u32;
-
-    // ARMv4 USR-26 → ARMv7 USR-32 coercion: real ARMv8 hardware
-    // coerces M[4]=0 to USR-32 on AArch32 ERET, but the SPSR_EL2 path
-    // strictly follows AArch64 rules where M[4]=0 means AArch64 EL0.
-    // Force M[4]=1 with M[3:0] forced to USR=0x0 when the kernel
-    // installed a 26-bit-style mode field.
-    if (spsr_svc & 0x10) == 0 {
-        spsr_svc = (spsr_svc & !0x1F) | 0x10;
-    }
-
-    static FIRED: core::sync::atomic::AtomicU32 =
-        core::sync::atomic::AtomicU32::new(0);
-    let n = FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if trap_trace_armed() || n < 8 {
-        kprintln!(
-            "task-eret-emu[{}]: lr_svc={:#010x} spsr_svc={:#010x} -> ELR_EL2/SPSR_EL2",
-            n, lr_svc, spsr_svc,
-        );
-    }
-
-    // SAFETY: ELR_EL2 / SPSR_EL2 control the next ERET; setting them
-    // here is the whole point of the handler. The natural ERET in the
-    // sync-trap dispatcher will consume these values.
-    unsafe {
-        core::arch::asm!(
-            "msr elr_el2, {pc}",
-            "msr spsr_el2, {sp}",
-            pc = in(reg) lr_svc as u64,
-            sp = in(reg) spsr_svc as u64,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-}
 
 fn handle_diag(ctx: &mut TrapContext) {
     let far = read_sysreg!("far_el1");

@@ -1408,6 +1408,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::TASK_SWITCH_PRE_ERET_HVC_IMM => {
             handle_task_switch_pre_eret_probe(ctx);
         }
+        v if v == crate::rom_patches::TASK_SWITCH_ERET_HVC_IMM => {
+            handle_task_switch_eret_emulator(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -3156,6 +3159,56 @@ fn handle_task_switch_pre_eret_probe(ctx: &mut TrapContext) {
         kprintln!(
             "  insn @ saved_pc {:#010x} = {:08x} {:08x} {:08x} {:08x}",
             target, w0, w1, w2, w3,
+        );
+    }
+}
+
+/// Emulate the kernel's `movs pc, lr` at 0x003ada6c. We replaced the
+/// native instruction with HVC; this handler performs the AArch32 EL1
+/// exception-return semantics from EL2:
+///
+///   new_cpsr ← SPSR_svc           (= SPSR_EL1 from EL2's view)
+///   new_pc   ← lr_svc             (= ctx.x[18])
+///   coerce M[4]=1 if the kernel wrote a USR-26 encoding (M[4:0]=0)
+///   ELR_EL2  ← new_pc
+///   SPSR_EL2 ← new_cpsr           (with the coercion applied)
+///
+/// The natural HVC ERET in `trap_sync_lower_aarch32`'s assembly stub
+/// then drops to AArch32 EL0 at new_pc with new_cpsr, just like the
+/// native `movs pc, lr` would.
+fn handle_task_switch_eret_emulator(ctx: &mut TrapContext) {
+    let lr_svc = ctx.x[18] as u32;
+    let mut spsr_svc = read_sysreg!("spsr_el1") as u32;
+
+    // ARMv4 USR-26 → ARMv7 USR-32 coercion: real ARMv8 hardware
+    // coerces M[4]=0 to USR-32 on AArch32 ERET, but the SPSR_EL2 path
+    // strictly follows AArch64 rules where M[4]=0 means AArch64 EL0.
+    // Force M[4]=1 with M[3:0] forced to USR=0x0 when the kernel
+    // installed a 26-bit-style mode field.
+    if (spsr_svc & 0x10) == 0 {
+        spsr_svc = (spsr_svc & !0x1F) | 0x10;
+    }
+
+    static FIRED: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+    let n = FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if trap_trace_armed() || n < 8 {
+        kprintln!(
+            "task-eret-emu[{}]: lr_svc={:#010x} spsr_svc={:#010x} -> ELR_EL2/SPSR_EL2",
+            n, lr_svc, spsr_svc,
+        );
+    }
+
+    // SAFETY: ELR_EL2 / SPSR_EL2 control the next ERET; setting them
+    // here is the whole point of the handler. The natural ERET in the
+    // sync-trap dispatcher will consume these values.
+    unsafe {
+        core::arch::asm!(
+            "msr elr_el2, {pc}",
+            "msr spsr_el2, {sp}",
+            pc = in(reg) lr_svc as u64,
+            sp = in(reg) spsr_svc as u64,
+            options(nomem, nostack, preserves_flags),
         );
     }
 }

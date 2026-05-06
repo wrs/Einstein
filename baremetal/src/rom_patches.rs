@@ -704,6 +704,18 @@ pub const TASK_SWITCH_PRE_ERET_HVC_IMM: u32 = 0x89;
 pub const TASK_SWITCH_PRE_ERET_PC:      u32 = 0x003A_DA68;
 const TASK_SWITCH_PRE_ERET_INSN:        u32 = 0xE8BD_0007; // pop {r0, r1, r2}
 
+/// Iter-105 task-switch ERET emulator. Replaces the `movs pc, lr` at
+/// `0x003ada6c` with an HVC that emulates the ERET ourselves: set
+/// ELR_EL2 ← lr_svc and SPSR_EL2 ← spsr_svc, with M[4]=1 coercion if
+/// the kernel wrote a USR-26 mode encoding (M[4]=0). The natural HVC
+/// ERET then drops to AArch32 EL0 at the user`s PC. If this version
+/// of the ERET produces a working drvr task while the native version
+/// wedges, the bug is in some quirk of native `movs pc, lr` that our
+/// emulation skips. If it still wedges, the bug is downstream.
+pub const TASK_SWITCH_ERET_HVC_IMM: u32 = 0x8A;
+pub const TASK_SWITCH_ERET_PC:      u32 = 0x003A_DA6C;
+const TASK_SWITCH_ERET_INSN:        u32 = 0xE1B0_F00E; // movs pc, lr
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -966,6 +978,18 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(TASK_SWITCH_PRE_ERET_HVC_IMM),
             "task-switch pre-ERET probe (pop {r0, r1, r2})",
             TASK_SWITCH_PRE_ERET_HVC_IMM,
+        );
+        // Iter-105 ERET emulator at 0x003ada6c — replaces the native
+        // `movs pc, lr` so EL2 performs the AArch32 EL1 → EL0 ERET
+        // explicitly. Bisects whether the wedge is in native ERET
+        // semantics vs in the user's first instruction at the target.
+        patch_probe(
+            rom_ptr,
+            TASK_SWITCH_ERET_PC,
+            TASK_SWITCH_ERET_INSN,
+            hvc_insn(TASK_SWITCH_ERET_HVC_IMM),
+            "task-switch ERET emulator (movs pc, lr)",
+            TASK_SWITCH_ERET_HVC_IMM,
         );
     }
 }

@@ -3096,6 +3096,12 @@ fn handle_task_switch_probe(ctx: &mut TrapContext) {
                     "*** trap-trace ARMED: drvr task incoming (task={:#010x}) ***",
                     incoming,
                 );
+                // Open the FVP TarmacTrace window. Pairs with the
+                // emit_stop in handle_und's catch-all (`unrecognised
+                // UND` path) so the trace covers exactly drvr's first
+                // ERET attempt through the wedge UND. On QEMU the
+                // markers are just kprintln strings — harmless.
+                crate::tarmac::emit_start();
             }
         }
     }

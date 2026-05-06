@@ -85,44 +85,62 @@ Diagnostic progress so far:
   it trips an earlier instruction-abort wedge at PC=0x6c343100
   (FIQ mode) caused by the trampoline pool layout.
 
+Diagnostic progress added by the FVP DABT-trampoline fix work:
+
+- A single-site HVC probe at `0x003a_dbb0` (one of the SWI tail's
+  three `movs pc, lr`) captured ~225 user-mode resumes before the
+  wedge. The LAST one had `lr_svc=0x003a_e3ec, lr_usr=0x0025a644,
+  sp_usr=0x0c108ce4`. Wedge state has `lr_usr=0x01bdde84,
+  sp_usr=0x0cc89fa8` — different stack and LR, meaning a TASK
+  SWITCH happened between that swi-tail and the wedge through a
+  *different* `movs pc, lr` site (one of the IRQ tail's at
+  `0x0039_2cd0 / 0x0039_2fd4 / 0x0039_306c / 0x0039_3110`, or
+  the other two SWI tails at `0x003a_da6c / 0x003a_db10`).
+- Multi-site probe attempts (patching all 7 `movs pc, lr` with
+  one shared HVC) ran into an emulation gotcha: the kernel
+  legitimately writes `mode=0` to SPSR_svc (ARMv4 USR-26
+  encoding) and natively the ARMv8 hardware coerces to USR-32
+  on AArch32 ERET. From EL2, ERETing via SPSR_EL2 strictly
+  follows AArch64 rules (M[4]=0 → AArch64 EL0), so simple
+  read-and-replay broke the kernel. Forcing `M[4]=1 | M[3:0]
+  = USR(0x10)` made the first `movs pc, lr` ERET correctly
+  but the user code subsequently wild-branched to PC=0x2c910e00
+  (different from the iter-105 PC=0 wedge), suggesting either
+  (a) the multi-site probe perturbs CPSR flags subtly, or
+  (b) the wild-branch landing is run-to-run variant. Backed
+  out — the right tool for catching the precise interworking
+  instruction is whole-execution tracing, not per-ERET probes.
+
 Next investigation steps:
 
-1. **Find what set T=1.** The wedge has user CPSR.T=1 with
-   PC=0. ARMv7 instructions that can set T-bit from USR:
-   - `BX Rm`, `BLX Rm` with Rm bit 0 = 1
-   - `ldr pc, [...]` with loaded value bit 0 = 1
-   - `pop {pc}` / `ldmfd …, {…, pc}` with popped value bit 0 = 1
-   - `mov pc, Rm` (ARMv7+ interworks)
-   - `BLX <imm>` (always sets T=1)
-   None of the registers at the wedge dump hold 1 (r0..r15 all
-   shown), so the wild value was written to a register and then
-   modified after the branch — most likely a `pop {pc}` /
-   `ldr pc, [...]` whose source memory contained 0x1.
-2. **Probe the SWI 5 (GenericSWI) handler.** The last BL the user
-   did was to TaskGiveObject's patch entry, which routes through
-   GenericSWI. Add a probe at the SWI 5 dispatch tail (0x3adb_xx,
-   the `ldm r1, {r1, r2, r3}` at 0x3adbec / `b 0x3ad750`) that
-   logs the user task's saved CPSR + saved PC just before the
-   movs-to-USR. If a different task gets scheduled in with a
-   T=1-tainted saved CPSR that's the smoking gun, even though
-   the LAST movs-to-USR didn't have T=1.
-3. **Carve out a tarmac window on QEMU.** We can't use the
-   FVP-bound TarmacTrace plugin, but we *could* enable QEMU's
-   `-d in_asm` in `scripts/run-qemu.sh` for a focused window
-   gated by an EL2 emit_start at the SWI 5 → MonitorDispatch
-   chain. Heavy but exhaustive.
-4. **Investigate the `r12=0` clue.** APCS uses R12 (IP) as the
-   function-pointer scratch register for vtable-style calls. In
-   the wedge dump R12=0 — possibly because a call sequence did
-   `mov ip, <vtable_slot>; bx ip`, and the slot held 1 (Thumb-
-   tagged null pointer). Check vtables of TObjectManager (whose
-   MonitorProc was the last r3 we saw) for any uninitialised
-   slots.
+1. **Use Tarmac on FVP, gated by emit_start.** Now that FVP
+   boots through the `c7-MCR` issue (this iteration's main
+   contribution), Tarmac can capture the wild branch directly.
+   FVP currently wedges at PC=0x00801964 — different from
+   QEMU's PC=0 — so the wedge tracing will be FVP-specific
+   first; we'll need to either fix FVP's REx-region wedge
+   first or accept that the iter-105 root cause may differ
+   per-platform.
+2. **Or: QEMU `-d in_asm`-gated trace.** Add `QEMU_EXTRA="-d
+   in_asm,nochain -D ..."` and emit a unique UART marker just
+   before the wedge to snip the trace tail. Heavy (millions of
+   instructions per second) but exhaustive.
+3. **Or: gdb hardware breakpoint on PC=0x0.** Run with `DEBUG=1
+   cargo run` to enable QEMU's gdbstub, attach
+   `aarch64-elf-gdb`, set HW BP on PC=0, continue. When the
+   wild branch lands, examine the call stack with `bt`.
+4. **R12=0 lead.** APCS uses R12/IP as the function-pointer
+   scratch for vtable-style calls. In the wedge dump R12=0,
+   suggesting `mov ip, <vtable_slot>; bx ip` where the slot
+   held 1. Check vtables of TObjectManager (whose MonitorProc
+   was the last `r3` value our earlier probe saw) for any
+   uninitialised slots that might read as 1.
 
 The iter-99/101/104 byteswap stubs, the iter-103 VA-space
-classifier rework, and the iter-105 snapshot-revival fix all
-remain in place; everything is working as intended up to the
-wild-branch wedge.
+classifier rework, the iter-105 snapshot-revival fix, and the
+iter-105 FVP DABT-trampoline fix (SPSR_abt save + c7-MCR
+filter) all remain in place; everything is working as intended
+up to the wild-branch wedge.
 
 ### Iteration 103: VA-space classifier walker
 

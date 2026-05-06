@@ -663,6 +663,58 @@ pub const FPE_ENTRY_PROBE_HVC_IMM: u32 = 0x80;
 pub const FPE_ENTRY_PROBE_PC:      u32 = 0x0038_D918;
 const FPE_ENTRY_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
 
+/// Iter-108 splash-chain diagnostic probes. Patches inside
+/// `TNotebook::InitToolbox` and `TNotebook::DrawSplashScreen`
+/// to follow the chain that should culminate in
+/// `TMainDisplayDriver::Blit`. The handler logs the hit (PC,
+/// source mode, stack pointer in source mode) and emulates the
+/// patched-out instruction so natural ERET resumes at PC+4.
+///
+/// User observation: "framebuffer dumps haven't worked since we
+/// switched to BE mode" — splash should be produced by
+/// InitToolbox→DrawSplashScreen→…→TMainDisplayDriver::Blit, but
+/// no `screen::blit` ever fires, so the chain breaks somewhere
+/// upstream.
+pub const SPLASH_PROBE_HVC_IMM: u32 = 0x90;
+/// `mov ip, sp` at the entry of TNotebook::InitToolbox.
+pub const SPLASH_PROBE_INIT_TOOLBOX_PC:    u32 = 0x0014_6B28;
+const SPLASH_PROBE_INIT_TOOLBOX_INSN:      u32 = 0xE1A0_C00D; // mov ip, sp
+/// `mov r0, r4` immediately after the `bl
+/// InitToolbox__12TApplicationFv` returns (= the parent class's
+/// init, the first non-trivial call inside Notebook::InitToolbox).
+pub const SPLASH_PROBE_AFTER_PARENT_PC:    u32 = 0x0014_6B3C;
+const SPLASH_PROBE_AFTER_PARENT_INSN:      u32 = 0xE1A0_0004; // mov r0, r4
+/// `mov r0, r4` immediately after both the vtable call at
+/// 0x146B48 (`add pc, r1, #44`) returns AND `bl
+/// InitScriptGlobals__Fv` at 0x146B4C returns. Reaching here
+/// proves both calls completed.
+pub const SPLASH_PROBE_AFTER_VT_PC:        u32 = 0x0014_6B50;
+const SPLASH_PROBE_AFTER_VT_INSN:          u32 = 0xE1A0_0004; // mov r0, r4
+/// `ldr r0, [pc, #48]` immediately after `bl InitInker` at
+/// 0x146B54 returns.
+pub const SPLASH_PROBE_AFTER_INKER_PC:     u32 = 0x0014_6B58;
+const SPLASH_PROBE_AFTER_INKER_INSN:       u32 = 0xE59F_0030; // ldr r0, [pc, #48]
+/// `mov ip, sp` at the entry of InitScriptGlobals__Fv (the
+/// concrete function, not the JT thunk at 0x01A99CE0).
+pub const SPLASH_PROBE_ISG_ENTRY_PC:       u32 = 0x001F_1828;
+const SPLASH_PROBE_ISG_ENTRY_INSN:         u32 = 0xE1A0_C00D; // mov ip, sp
+/// `ldr r4, [pc, #560]` at 0x1F1848 — runs after both
+/// `bl Clone__FRC6RefVar` (0x1F183C) and the first
+/// `bl AllocateRefHandle__Fl` (0x1F1840) return inside ISG.
+/// Non-destructive on visible state apart from r4, so safe to
+/// patch + emulate (read the literal, write to r4).
+pub const SPLASH_PROBE_AFTER_CLONE_PC:     u32 = 0x001F_1848;
+const SPLASH_PROBE_AFTER_CLONE_INSN:       u32 = 0xE59F_4230; // ldr r4, [pc, #560]
+/// `mov r0, r4` immediately before the `bl
+/// DrawSplashScreen__9TNotebookFv` at 0x146BB4. Reaching here
+/// means InitToolbox completed the orientation/preference setup
+/// and is about to call DrawSplashScreen.
+pub const SPLASH_PROBE_BEFORE_DRAW_PC:     u32 = 0x0014_6BB0;
+const SPLASH_PROBE_BEFORE_DRAW_INSN:       u32 = 0xE1A0_0004; // mov r0, r4
+/// `mov ip, sp` at the entry of TNotebook::DrawSplashScreen.
+pub const SPLASH_PROBE_DRAW_SPLASH_PC:     u32 = 0x0014_602C;
+const SPLASH_PROBE_DRAW_SPLASH_INSN:       u32 = 0xE1A0_C00D; // mov ip, sp
+
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
 /// constant.
@@ -899,6 +951,71 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             hvc_insn(FPE_ENTRY_PROBE_HVC_IMM),
             "FP_UndefHandlers_Start mov ip, sp (FPE bypass)",
             FPE_ENTRY_PROBE_HVC_IMM,
+        );
+        // Iter-108 splash-chain diagnostic.
+        patch_probe(
+            rom_ptr,
+            SPLASH_PROBE_INIT_TOOLBOX_PC,
+            SPLASH_PROBE_INIT_TOOLBOX_INSN,
+            hvc_insn(SPLASH_PROBE_HVC_IMM),
+            "TNotebook::InitToolbox entry (splash-chain diag)",
+            SPLASH_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            SPLASH_PROBE_AFTER_PARENT_PC,
+            SPLASH_PROBE_AFTER_PARENT_INSN,
+            hvc_insn(SPLASH_PROBE_HVC_IMM),
+            "TNotebook::InitToolbox after parent::InitToolbox (splash-chain diag)",
+            SPLASH_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            SPLASH_PROBE_AFTER_VT_PC,
+            SPLASH_PROBE_AFTER_VT_INSN,
+            hvc_insn(SPLASH_PROBE_HVC_IMM),
+            "TNotebook::InitToolbox after vtable+InitScriptGlobals (splash-chain diag)",
+            SPLASH_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            SPLASH_PROBE_AFTER_INKER_PC,
+            SPLASH_PROBE_AFTER_INKER_INSN,
+            hvc_insn(SPLASH_PROBE_HVC_IMM),
+            "TNotebook::InitToolbox after InitInker (splash-chain diag)",
+            SPLASH_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            SPLASH_PROBE_ISG_ENTRY_PC,
+            SPLASH_PROBE_ISG_ENTRY_INSN,
+            hvc_insn(SPLASH_PROBE_HVC_IMM),
+            "InitScriptGlobals__Fv entry (splash-chain diag)",
+            SPLASH_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            SPLASH_PROBE_AFTER_CLONE_PC,
+            SPLASH_PROBE_AFTER_CLONE_INSN,
+            hvc_insn(SPLASH_PROBE_HVC_IMM),
+            "InitScriptGlobals after Clone+AllocateRefHandle (splash-chain diag)",
+            SPLASH_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            SPLASH_PROBE_BEFORE_DRAW_PC,
+            SPLASH_PROBE_BEFORE_DRAW_INSN,
+            hvc_insn(SPLASH_PROBE_HVC_IMM),
+            "TNotebook::InitToolbox before DrawSplashScreen call (splash-chain diag)",
+            SPLASH_PROBE_HVC_IMM,
+        );
+        patch_probe(
+            rom_ptr,
+            SPLASH_PROBE_DRAW_SPLASH_PC,
+            SPLASH_PROBE_DRAW_SPLASH_INSN,
+            hvc_insn(SPLASH_PROBE_HVC_IMM),
+            "TNotebook::DrawSplashScreen entry (splash-chain diag)",
+            SPLASH_PROBE_HVC_IMM,
         );
     }
 }

@@ -1347,6 +1347,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == crate::rom_patches::FPE_ENTRY_PROBE_HVC_IMM => {
             handle_fpe_entry_probe(ctx);
         }
+        v if v == crate::rom_patches::SPLASH_PROBE_HVC_IMM => {
+            handle_splash_probe(ctx);
+        }
         v if v == UND_TAG => {
             handle_und(ctx);
         }
@@ -1837,6 +1840,18 @@ fn handle_und(ctx: &mut TrapContext) {
         // stub since UND entry doesn't auto-advance.
         _ if insn == rom_patches_hvc_insn(crate::rom_patches::REMEMBER_SWIRET_HVC_IMM) => {
             handle_remember_swiret_probe_with(ctx);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        // Iter-108 splash-chain probe — same physical instruction
+        // as the HVC dispatch arm above, but reached here when the
+        // HVC fired from USR mode (where HVC is UNDEFINED and goes
+        // through UND_TRAMP instead of trapping directly). The probe
+        // uses the trampoline-saved spsr_und to identify the source
+        // mode for `mov ip, sp` emulation, then ERETs back to PC+4
+        // via the UND-return stub.
+        _ if insn == rom_patches_hvc_insn(crate::rom_patches::SPLASH_PROBE_HVC_IMM) => {
+            handle_splash_probe_und(ctx, faulting_pc, spsr_und);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -2545,6 +2560,117 @@ fn handle_fpe_entry_probe(ctx: &mut TrapContext) {
     }
     // Emulate `mov ip, sp` (= ctx.x[23] in UND-source mode).
     ctx.x[12] = (ctx.x[12] & 0xFFFF_FFFF_0000_0000) | (sp_und as u64);
+}
+
+/// Iter-108 splash-chain diagnostic. Patched on the first
+/// instruction (`mov ip, sp`) of `TNotebook::InitToolbox` and
+/// `TNotebook::DrawSplashScreen`. Logs the first hit (PC, source
+/// mode, SP/LR for that mode) so we can tell whether the boot
+/// reaches the splash code path. Emulates `mov ip, sp` for the
+/// source mode and lets natural ERET resume at PC+4.
+///
+/// HVC from AArch32 to EL2 captures the source CPSR in SPSR_EL2;
+/// `crate::banked::sp_for_mode` maps that mode to the right ctx
+/// slot per Table D1-79.
+fn handle_splash_probe(ctx: &mut TrapContext) {
+    let elr = read_sysreg!("elr_el2") as u32;
+    let spsr = read_sysreg!("spsr_el2") as u32;
+    splash_probe_apply(ctx, elr, spsr);
+}
+
+/// USR-mode side of the splash probe. Fires when the patched
+/// site runs in USR mode, where HVC is UNDEFINED and the
+/// trampoline routes the resulting UND through UND_TRAMP +
+/// HVC #UND_TAG. `faulting_pc` is the original ROM PC; `spsr_und`
+/// is the trampoline-saved source CPSR.
+fn handle_splash_probe_und(ctx: &mut TrapContext, faulting_pc: u32, spsr_und: u64) {
+    splash_probe_apply(ctx, faulting_pc, spsr_und as u32);
+}
+
+fn splash_probe_apply(ctx: &mut TrapContext, pc: u32, spsr: u32) {
+    splash_probe_log(ctx, pc, spsr);
+    // Emulate the patched-out instruction. Each probe site
+    // matches one of two shapes:
+    //   `mov ip, sp` — InitToolbox entry, DrawSplashScreen entry
+    //   `mov r0, r4` — InitToolbox after-parent / before-draw
+    let init    = crate::rom_patches::SPLASH_PROBE_INIT_TOOLBOX_PC;
+    let draw    = crate::rom_patches::SPLASH_PROBE_DRAW_SPLASH_PC;
+    let isg     = crate::rom_patches::SPLASH_PROBE_ISG_ENTRY_PC;
+    let inker   = crate::rom_patches::SPLASH_PROBE_AFTER_INKER_PC;
+    let aftclon = crate::rom_patches::SPLASH_PROBE_AFTER_CLONE_PC;
+    if pc == init || pc == draw || pc == isg {
+        // mov ip, sp — ip = SP of source mode.
+        let sp = crate::banked::sp_for_mode(ctx, spsr);
+        ctx.x[12] = (ctx.x[12] & 0xFFFF_FFFF_0000_0000) | (sp as u64);
+    } else if pc == inker {
+        // ldr r0, [pc, #48] — pc-relative literal load. Original
+        // ROM at PC+8+48 = 0x146B90 holds RSSYMscreenorientation
+        // = 0x00684480. The classifier marks the literal slot as
+        // data, so the runtime guest LDR with CPSR.E=1 returns
+        // the BE-natural numerical value. Replay that here.
+        let lit_pa = pc.wrapping_add(8).wrapping_add(48);
+        let v = crate::guest_endian::guest_read_u32_pa(lit_pa).unwrap_or(0);
+        ctx.x[0] = (ctx.x[0] & 0xFFFF_FFFF_0000_0000) | (v as u64);
+    } else if pc == aftclon {
+        // ldr r4, [pc, #560] — pc-rel literal load into r4.
+        // Target = pc + 8 + 560 = 0x1F1A80 holds &gVarFrame.
+        let lit_pa = pc.wrapping_add(8).wrapping_add(560);
+        let v = crate::guest_endian::guest_read_u32_pa(lit_pa).unwrap_or(0);
+        ctx.x[4] = (ctx.x[4] & 0xFFFF_FFFF_0000_0000) | (v as u64);
+    } else {
+        // mov r0, r4 — r0 = ctx.x[4] (R0..R12 are not banked
+        // outside FIQ; ctx.x[4] is the source-mode R4 because
+        // HVC entry preserves R0..R12 of the active mode).
+        ctx.x[0] = (ctx.x[0] & 0xFFFF_FFFF_0000_0000) | (ctx.x[4] & 0xFFFF_FFFF);
+    }
+}
+
+fn splash_probe_log(ctx: &TrapContext, pc: u32, spsr: u32) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static FIRED_INIT: AtomicU32 = AtomicU32::new(0);
+    static FIRED_AFTER_PARENT: AtomicU32 = AtomicU32::new(0);
+    static FIRED_AFTER_VT: AtomicU32 = AtomicU32::new(0);
+    static FIRED_AFTER_INKER: AtomicU32 = AtomicU32::new(0);
+    static FIRED_ISG: AtomicU32 = AtomicU32::new(0);
+    static FIRED_AFTER_CLONE: AtomicU32 = AtomicU32::new(0);
+    static FIRED_BEFORE_DRAW: AtomicU32 = AtomicU32::new(0);
+    static FIRED_SPLASH: AtomicU32 = AtomicU32::new(0);
+    let mode = spsr & 0x1F;
+    let sp = crate::banked::sp_for_mode(ctx, spsr);
+    let lr = crate::banked::lr_for_mode(ctx, spsr);
+    let init   = crate::rom_patches::SPLASH_PROBE_INIT_TOOLBOX_PC;
+    let after  = crate::rom_patches::SPLASH_PROBE_AFTER_PARENT_PC;
+    let aftvt  = crate::rom_patches::SPLASH_PROBE_AFTER_VT_PC;
+    let aftin  = crate::rom_patches::SPLASH_PROBE_AFTER_INKER_PC;
+    let isg    = crate::rom_patches::SPLASH_PROBE_ISG_ENTRY_PC;
+    let before = crate::rom_patches::SPLASH_PROBE_BEFORE_DRAW_PC;
+    let draw   = crate::rom_patches::SPLASH_PROBE_DRAW_SPLASH_PC;
+    let (label, counter) = if pc == init {
+        ("InitToolbox-entry", &FIRED_INIT)
+    } else if pc == after {
+        ("after-parent",      &FIRED_AFTER_PARENT)
+    } else if pc == aftvt {
+        ("after-vt+ISG",      &FIRED_AFTER_VT)
+    } else if pc == aftin {
+        ("after-Inker",       &FIRED_AFTER_INKER)
+    } else if pc == isg {
+        ("ISG-entry",         &FIRED_ISG)
+    } else if pc == crate::rom_patches::SPLASH_PROBE_AFTER_CLONE_PC {
+        ("ISG-after-Clone",   &FIRED_AFTER_CLONE)
+    } else if pc == before {
+        ("before-DrawSplash", &FIRED_BEFORE_DRAW)
+    } else if pc == draw {
+        ("DrawSplash-entry",  &FIRED_SPLASH)
+    } else {
+        ("unknown",           &FIRED_INIT) // shouldn't happen
+    };
+    let n = counter.fetch_add(1, Ordering::Relaxed);
+    if n < 4 {
+        kprintln!(
+            "splash-probe[{}={}]: PC={:#x} spsr={:#010x} mode={:#x} ({}) SP_mode={:#010x} LR_mode={:#010x}",
+            label, n, pc, spsr, mode, describe_aarch32_mode(mode), sp, lr,
+        );
+    }
 }
 
 fn handle_reboot(ctx: &TrapContext) -> ! {

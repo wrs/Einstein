@@ -24,17 +24,50 @@ splash, and starts rendering small UI overlays. Past the gLocaleCache
 wedge, past the StorePermObject / TUnicodeCompressor abort loop, past
 the StackManager bus-error stall.
 
-The current ceiling is a **wild data-abort at FAR=0x0cce4400** — 508
-KiB above the topOfStack of a 2 MiB stack (slot 125..181 in the main
-heap-domain pool). The wrapped ResolveFault correctly returns -10204
-"FAR ≥ topOfStack", `TStackManager::Fault` then throws `exBusError`,
-no handler is installed, and the kernel hits `UnhandledException`.
-Captured via the new BusErrorThrow LoudHalt at 0x001F_8534 + the
-TStack invariant walker (`dump_tstacks_and_check_invariants`).
+The current ceiling is a **DABT at FAR=0x0cce4400 inside
+`TIntrpStack::NewState` at PC=0x001a4708**, which the kernel's wrapped
+ResolveFault returns -10204 ("FAR ≥ topOfStack") for, and
+`TStackManager::Fault` then throws `exBusError`. The new BusErrorThrow
+LoudHalt enrichment that reads `DABT_SAVE_PA` (slow + fast trampoline
+both stash `LR_abt`/`SP_abt`/`SPSR_abt` there) recovered the
+faulting context: USR mode, faulting_PC=0x001a4708, FAR=0x0cce4400.
 
-It's **not** a stack-overflow into a guard — the offending VA is half
-a megabyte above the top, suggesting a corrupt SP or wild pointer in
-some new code path the boot reached for the first time.
+This is **not** a wild pointer — `0x001a4708` is the very first store
+in `NewState__11TIntrpStackFv`:
+
+```
+0x001a46f0 NewState:
+   push {r4, fp, ip, lr, pc}
+   mov  r4, r0              ; self
+   ldr  r0, [r0]            ; r0 = self->buf  (= 0x0cce4400)
+   mov  r1, #2
+   str  r1, [r0]            ; <- DABT here
+```
+
+The TStackInfo walker shows `slot[196..197]` covering
+`[0x0cce4000, 0x0ccf6000)` with `norm=0x0cce4000 hard=0x0cce4400
+curr=0x0cce4400 top=0x0ccf6000`. So the FAR is exactly at the
+freshly-allocated stack's `curr`/`hard` boundary — the
+NewtonScript interpreter is initializing the bottom of a brand-new
+TStack, the access is at the lowest committed subpage, and the
+ResolveFault path is somehow returning -10204 anyway. The earlier
+"508 KiB above top" framing was off: the FAR fell in the *next*
+stack region (slot 196..197), not slot 125..181.
+
+`DAH-FME-ret[2]: r0=0` says the FaultMonitorEntry path *did* report
+recovery for FAR=0x0cce4400, but the `bl ResolveFault` at
+0x001F_84E0 returned -10204 anyway (R5 in the BusErrorThrow dump =
+`0xffffd824` = -10204). Possible causes worth chasing next:
+
+  - The `Fault` matcher passed the *previous* slot's TStackInfo*
+    (slot[195..195], `top=0x0cce4000`) into the wrapper — for that
+    info FAR=0x0cce4400 satisfies `FAR >= top` → -10204 in iter 0,
+    iter 1 also -10204, etc., all four iters propagate.
+  - `info[+28]` got mutated between FME recovery and the wrapper
+    call.
+  - Stage-2 mapping for IPA 0x0cce4400 isn't actually backed (the
+    `DAH-FME-ret` "success" doesn't guarantee the kernel actually
+    allocated a page).
 
 ### Stack-VM patches that got us here
 
@@ -83,46 +116,19 @@ assumption baked into the original kernel and the way we'd patched
    entire 4 KiB page is out of range) actually throws busError
    instead of silently returning 0 and busy-looping.
 
-### Wrapper-policy attempts (worth keeping for next time)
+### Wrapper policy (current)
 
-The wrapper went through three iterations before settling. The
-intermediate one is interesting because **it was the only state in
-which the splash actually rendered** — and the reason it rendered
-is informative.
-
-**Attempt A — `bne` propagates any non-zero.**
-First version. Halted early at `evt.ex.abt.bus` because iter 0 of a
-bottom-page commit (FAR = `slot_base + 0`) is *always* below
-`info[+24] = slot_base + 1 KiB` and returns -10203, which the
-wrapper then treated as a bus error. False-positive on every
-legitimate stack-grow into the bottom 4 KiB page.
-
-**Attempt B — `bgt` propagates only positive errors; negatives
-silently return success.**
-Reached and *rendered the boot splash*: `screen.blit ENTER
-@PC=0x801bd4 pixmap=0xc107d8c ... copied=19200` (full 480×320
-paint) plus the 32×32 icon blit from ROM `0x37ab5c`. 26M+ traps of
-post-splash kernel idle. **But** when *every* iter returned
-negative (the FAR's whole 4 KiB page was out of range — i.e. a
-wild access, not a stack grow), the wrapper still returned 0 and
-the kernel re-faulted forever (busy loop, no progress). The splash
-rendered specifically *because* this bug masked the wild-FAR cases
-that would otherwise have thrown busError.
-
-**Attempt C (current) — `bgt` + per-iter success tracking.**
-Cleared `r9` on any success; after the loop, return 0 only if at
-least one iter succeeded, else propagate the negative error. Wild
-FARs now correctly throw busError. The cost is that the Phase-B
-ceiling moved from "post-splash idle" to "BusErrorThrow at
-FAR=0x0cce4400, before splash render completes" — i.e. we
-exchanged a silently-masked correctness bug for a loud halt at a
-real defect.
-
-**Lesson:** rendering the splash under Attempt B did not mean the
-boot was healthy; it meant the wrapper was hiding the wild-FAR
-defect that's still there. Fixing whatever produces FAR=0x0cce4400
-(a corrupt SP or wild pointer 508 KiB above the marker stack's
-top) is the real path forward, not relaxing the wrapper.
+`bgt` propagates positive errors (e.g. `r0=4` FindOrAllocPage
+failure) immediately. Negative returns (-10203 / -10204) are
+treated per-iter as "this subpage isn't ours, skip"; an `r9`
+flag tracks whether any iter succeeded. On loop exit, return 0 if
+any iter cleared `r9`; else propagate the last negative so a truly
+wild FAR (all four iters out of range) throws busError instead of
+silently returning 0 and busy-looping. Required because under the
+1 KiB-guard geometry, iter 0 of every legitimate bottom-page commit
+sits below `info[+24]` and naturally returns -10203 — but the
+wrapper *must* still distinguish that from "all iters failed". (See
+git log for the bne→bgt→bgt+success-track history.)
 
 ### Diagnostics added
 
@@ -132,7 +138,13 @@ top) is the real path forward, not relaxing the wrapper.
   ResolveFault return code at the moment the kernel decides to
   throw busError. `handle_loud_halt` now matches the site via
   `caller_lr - 4` so user-mode HVCs (routed via the UND trampoline)
-  resolve to the patched site and not the trampoline PC.
+  resolve to the patched site and not the trampoline PC. Also
+  reads `DABT_SAVE_PA` to recover the original abort's
+  `LR_abt`/`SP_abt`/`SPSR_abt` (the fast DABT trampoline forwards
+  to kernel DAH without entering EL2, so the regular `dabt:` log
+  never fires for these — but DABT_SAVE_PA gets written by both
+  fast and slow trampolines before the kernel handler runs).
+  Yields `faulting_PC = LR_abt - 8` (or `-4` for Thumb).
 - `dump_tstacks_and_check_invariants` (in `src/trap.rs`) — walks
   `gStackManagerHeap[+4] → TStackManager → domain queue (+0xD0) →
   THeapDomain → slot_array → TStackInfo`, dedupes consecutive
@@ -152,18 +164,29 @@ top) is the real path forward, not relaxing the wrapper.
 
 ### Next
 
-1. **Identify the wild FAR=0x0cce4400 access**. Marker stack is the
-   2 MiB pool at `[0x0ca65000, 0x0cc65400)`. The FAR is 508 KiB
-   above its top. Likely a corrupt SP or pointer arithmetic gone
-   wrong. The `BusErrorThrow` LoudHalt already captures the banked
-   USR LR; needs a probe at the actual data-abort entry to recover
-   the original faulting PC (the `dabt:` log dedupes by FAR so this
-   one isn't logged at the moment).
-2. **Confirm the rest of the TStack landscape is clean.** Walker
+1. **Determine which TStackInfo* the `Fault` matcher is passing into
+   the wrapper for FAR=0x0cce4400.** Patch a probe HVC over the
+   `bl ResolveFault` at `0x001F_84E0` (or wrap the wrapper) and
+   log `(r0=TStackManager*, r1=info*, info->norm/hard/curr/top,
+   FAR)` for the call that returns -10204. If `info->top ==
+   0x0cce4000` this is the slot[195] mismatch theory — fix
+   the matcher (or the wrapper) to walk to the next slot when
+   `FAR == info->top` exactly. If `info` *is* slot[196..197], the
+   mystery is why iter 1 (`FAR == curr`) doesn't succeed — instrument
+   each iter's return value.
+2. **Cross-check stage-2 commit for IPA 0x0cce4400** at the moment of
+   the abort. `dump_stage1_walk(0x0cce4400)` from the BusErrorThrow
+   handler would show whether the stage-1 mapping is present and
+   whether the IPA is backed at stage-2. If the page isn't actually
+   committed, the `DAH-FME-ret r0=0` "success" is misleading —
+   FME may be reporting recovery without actually allocating.
+3. **Confirm the rest of the TStack landscape is clean.** Walker
    shows clean 1 KiB guards everywhere except in-flight allocations
-   in the highest pool. Once the wild-FAR is fixed, re-run the
-   walker and confirm everything's tidy.
-3. **Long-tail.** Reach NewtonScript's `TInterpreter` boot, full UI
+   in the highest pool, plus one invariant violation in the
+   `[0x0de00000..0x0e600000)` pool's slot[0]
+   (`info[+24]=0x0de08000 > top=0x0de07fff`). Investigate whether
+   that's a transient initialization state or a real bug.
+4. **Long-tail.** Reach NewtonScript's `TInterpreter` boot, full UI
    render. EinsteinProbe is the visual oracle.
 
 ## Workflow per stop

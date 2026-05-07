@@ -2413,6 +2413,37 @@ fn handle_loud_halt(ctx: &TrapContext) -> ! {
             r4, r5, r5 as i32
         );
         kprintln!("  FAR_EL1 = {:#010x}  (the faulting VA)", far);
+        // Dump the most-recent AArch32 DABT context, captured by the
+        // DABT trampoline (slow + fast paths both store to
+        // DABT_SAVE_PA before branching). For wild FARs the busError
+        // path forwards through the fast trampoline straight to the
+        // kernel's DataAbortHandler, never entering EL2 — so the
+        // `dabt:` log never fires and `log_dabt_forward` can't see
+        // the original faulting PC. Reading the slot here recovers
+        // it. Caveat: if the kernel's DAH itself faults again before
+        // reaching `Throw`, the slot would have been overwritten by
+        // the recursive abort. In practice DAH's TStackInfo walk
+        // touches only mapped memory, so the slot is the original.
+        let dabt_lr_abt   = crate::guest_endian::guest_read_u32_pa(guest_mem::DABT_SAVE_PA).unwrap_or(0);
+        let dabt_sp_abt   = crate::guest_endian::guest_read_u32_pa(guest_mem::DABT_SAVE_PA + 4).unwrap_or(0);
+        let dabt_spsr_abt = crate::guest_endian::guest_read_u32_pa(guest_mem::DABT_SAVE_PA + 8).unwrap_or(0);
+        let dabt_pre_mode = dabt_spsr_abt & 0x1F;
+        let dabt_thumb    = (dabt_spsr_abt & (1 << 5)) != 0;
+        let dabt_faulting_pc = if dabt_thumb {
+            dabt_lr_abt.wrapping_sub(4)
+        } else {
+            dabt_lr_abt.wrapping_sub(8)
+        };
+        kprintln!(
+            "  DABT-save: LR_abt={:#010x}  SP_abt={:#010x}  SPSR_abt={:#010x} (pre-abt mode={} {:#x}{})",
+            dabt_lr_abt, dabt_sp_abt, dabt_spsr_abt,
+            describe_aarch32_mode(dabt_pre_mode), dabt_pre_mode,
+            if dabt_thumb { ", T" } else { "" },
+        );
+        kprintln!(
+            "  DABT-save: faulting_PC = {:#010x}  (= LR_abt - {})",
+            dabt_faulting_pc, if dabt_thumb { 4 } else { 8 },
+        );
         kprintln!(
             "  R6 = {:#010x}  R7 = {:#010x}  R8 = {:#010x}  R9 = {:#010x}",
             ctx.x[6] as u32, ctx.x[7] as u32, ctx.x[8] as u32, ctx.x[9] as u32

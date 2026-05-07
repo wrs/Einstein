@@ -10,7 +10,7 @@ use std::process::ExitCode;
 
 use newton_objects::{Array, Binary, Frame, Heap, Object, Ref, RefKind, Symbol, SYMBOL_CLASS};
 
-const DEFAULT_DEPTH: u32 = 6;
+const DEFAULT_DEPTH: u32 = 0;
 const DEFAULT_MAX_BYTES: usize = 64;
 
 struct Args {
@@ -91,6 +91,10 @@ fn print_usage() {
          \n\
          Default: walks the NewtonScript object graph rooted at <hex-addr>\n\
          within <file> and pretty-prints it as a tree.\n\
+         \n\
+         --depth N: in tree mode, expand pointer Refs up to N levels deep.\n\
+         Default 0 — show the root only; pointer Refs to other objects are\n\
+         summarised as <...at 0x...>. Symbols always inline regardless of depth.\n\
          \n\
          --flat: instead of a tree walk, iterate packed objects starting at\n\
          <hex-addr>, advancing by each object's size rounded up to --align,\n\
@@ -213,11 +217,20 @@ fn flat_summary(heap: &Heap<'_>, offset: u32, obj: Object<'_>, max_bytes: usize)
         }
         Object::Array(a) => {
             let class = a.class();
+            let len = a.len();
             s.push_str(&format!(
-                " class={} slots={}",
+                " class={} slots[{}]:",
                 short_ref(heap, class),
-                a.len()
+                len
             ));
+            let shown = len.min(max_bytes);
+            for slot in a.iter().take(shown) {
+                s.push(' ');
+                s.push_str(&short_ref(heap, slot));
+            }
+            if shown < len {
+                s.push_str(&format!(" ... ({} more)", len - shown));
+            }
         }
         Object::Frame(f) => {
             s.push_str(&format!(
@@ -315,15 +328,33 @@ impl<'a> Printer<'a> {
             RefKind::MagicPointer { table, index } => {
                 self.out.push_str(&format!("@{table}.{index}"));
             }
-            RefKind::Pointer(off) => match self.heap.object_at(off) {
-                Ok(obj) => self.dump_object(obj, indent),
-                Err(e) => self.out.push_str(&format!("<bad-ref 0x{:08x}: {e}>", off)),
-            },
+            RefKind::Pointer(off) => {
+                // Symbols always inline regardless of depth.
+                if let Ok(Object::Binary(b)) = self.heap.object_at(off) {
+                    if let Some(sym) = b.as_symbol() {
+                        self.dump_symbol_inline(sym);
+                        return;
+                    }
+                }
+                if self.depth_left == 0 {
+                    self.out
+                        .push_str(&format!("<...at 0x{:08x}>", off));
+                    return;
+                }
+                self.depth_left -= 1;
+                match self.heap.object_at(off) {
+                    Ok(obj) => self.dump_object(obj, indent),
+                    Err(e) => self.out.push_str(&format!("<bad-ref 0x{:08x}: {e}>", off)),
+                }
+                self.depth_left += 1;
+            }
         }
     }
 
     fn dump_object(&mut self, obj: Object<'a>, indent: usize) {
-        // Symbols and "leaf" binaries get inlined; arrays/frames open a block.
+        // Symbol roots inline; otherwise dispatch by kind. Depth control
+        // lives in dump_ref so that the root passed in here always renders
+        // in full — descents from a Ref consume the depth budget.
         if let Object::Binary(b) = obj {
             if let Some(sym) = b.as_symbol() {
                 self.dump_symbol_inline(sym);
@@ -337,20 +368,11 @@ impl<'a> Printer<'a> {
             return;
         }
 
-        if self.depth_left == 0 {
-            self.out
-                .push_str(&format!("<...elided at 0x{:08x}>", obj.offset()));
-            return;
-        }
-        self.depth_left -= 1;
-
         match obj {
             Object::Binary(b) => self.dump_binary(b, indent),
             Object::Array(a) => self.dump_array(a, indent),
             Object::Frame(f) => self.dump_frame(f, indent),
         }
-
-        self.depth_left += 1;
     }
 
     fn dump_symbol_inline(&mut self, sym: Symbol<'a>) {

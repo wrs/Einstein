@@ -87,20 +87,20 @@ fn parse_args() -> Result<Args, String> {
 
 fn print_usage() {
     eprintln!(
-        "romdump <file> <hex-offset> [--depth N] [--max-bytes N] [--flat] [--align 4|8] [--loadaddr HEX]\n\
+        "romdump <file> <hex-addr> [--depth N] [--max-bytes N] [--flat] [--align 4|8] [--loadaddr HEX]\n\
          \n\
-         Default: walks the NewtonScript object graph rooted at <hex-offset>\n\
+         Default: walks the NewtonScript object graph rooted at <hex-addr>\n\
          within <file> and pretty-prints it as a tree.\n\
          \n\
          --flat: instead of a tree walk, iterate packed objects starting at\n\
-         <hex-offset>, advancing by each object's size rounded up to --align,\n\
+         <hex-addr>, advancing by each object's size rounded up to --align,\n\
          and print one summary line per object. Stops at the first parse error.\n\
          \n\
-         <hex-offset> is a file offset (what xxd shows). Pointer Refs in the\n\
-         data are absolute heap addresses; with --loadaddr HEX, a Ref to\n\
-         loadaddr+X resolves to file offset X. The dump prints absolute\n\
-         addresses (load-address-space) so they match the on-disk Refs.\n\
-         Default --loadaddr is 0, in which case file offsets == absolute.\n"
+         <hex-addr> is an absolute address in the heap's load-address space,\n\
+         i.e. the same space the on-disk pointer Refs use. With --loadaddr\n\
+         HEX, a Ref to loadaddr+X resolves to file offset X, and a <hex-addr>\n\
+         of loadaddr+X likewise reads file offset X. Default --loadaddr is 0,\n\
+         in which case <hex-addr> is just a file offset (what xxd shows).\n"
     );
 }
 
@@ -124,18 +124,10 @@ fn main() -> ExitCode {
 
     let heap = Heap::with_load_addr(&bytes, args.load_addr);
 
-    // CLI offset is a file offset; add load_addr to land in the heap's
-    // load-address space.
-    let entry_abs = match args.load_addr.checked_add(args.offset) {
-        Some(v) => v,
-        None => {
-            eprintln!(
-                "error: --loadaddr 0x{:08x} + offset 0x{:08x} overflows u32",
-                args.load_addr, args.offset
-            );
-            return ExitCode::from(2);
-        }
-    };
+    // CLI address is already in the heap's load-address space (matches
+    // on-disk Refs). The heap subtracts load_addr internally to find
+    // the file offset.
+    let entry_abs = args.offset;
 
     if args.flat {
         return dump_flat(heap, entry_abs, args.align, args.max_bytes);

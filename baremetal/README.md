@@ -47,12 +47,19 @@ What's working end-to-end:
   PCMCIA, platform, printer, screen, serial, sound, tablet, VIC,
   in/out translators) port Einstein's C++ state machines into Rust.
   See [`docs/peripherals.md`](docs/peripherals.md).
-- **Shadow page-table machinery.** The kernel uses BE-32 word-
-  invariant memory and ARMv4 subpage-AP semantics that ARMv8 doesn't
-  natively support. `src/shadow_stub.rs` + `src/shadow_pool.rs` +
-  `fix_stage1_xn_bits` in `src/guest_mem.rs` flatten subpage-AP to
-  AP=011, run an alias detector, and keep the guest-visible MMU
-  consistent.
+- **BE-8 mode + selective ROM byteswap.** The guest runs with
+  `CPSR.E=1` and `SCTLR_EL1.EE=1`. `src/guest_mem.rs::load_newton_rom`
+  consults the classifier `reach.bitmap` per word: code → byteswap
+  to LE on load (so AArch32 fetch works); data → leave BE-natural
+  (so a CPSR.E=1 LDR returns the kernel's intended numerical
+  value). `src/guest_endian.rs` is the EL2-side bottleneck for
+  reads/writes of guest data.
+- **Shadow page-table machinery.** The kernel uses ARMv4 subpage-AP
+  semantics that ARMv8 doesn't natively support.
+  `fix_stage1_xn_bits` in `src/guest_mem.rs` flattens subpage-AP
+  to AP=011 and runs an alias detector to keep the guest-visible
+  MMU consistent. `src/shadow_pool.rs` backs alias-redirected
+  pages.
 - **Async timer delivery.** CNTHP rearms on every match-reg write;
   the EL2 physical timer raises CNTHPIRQ, the BCM2836 local
   peripheral routes it to core 0, and `trap_irq` latches and sets
@@ -166,7 +173,6 @@ section in `CLAUDE.md` for the full procedure.
 | `trace`                | no      | Function-level execution trace via per-entry HVC trampolines.                        |
 | `trace_once`           | no      | First-touch variant of `trace`. Trampolines still fire; only the SEQ line is gated.  |
 | `quiet`                | no      | Silence recurring diag log lines (`fix_stage1_xn_bits:` summaries, etc.).            |
-| `validate_with_probe`  | no      | Compare the shadow translator against a golden PC list from the probe (helper).      |
 
 Common combinations:
 
@@ -346,7 +352,7 @@ baremetal/
     banked.rs            AArch32 banked-reg access from EL2
     rom_patches.rs       Einstein word-write patches; HVC injection;
                          canaries; ResolveFault wrapper
-    shadow_stub.rs       ARMv4 subpage-AP / BE-32 shadow translator
+    shadow_stub.rs       in-ROM stub-pool + per-stub scratch-pool
     shadow_pool.rs       PA-keyed shadow PT pool
     snapshot.rs          rolling 4-slot snapshot ring (semihosting I/O)
     tracer.rs            in-ROM HVC-trampoline tracer (--features trace)

@@ -62,7 +62,7 @@ use crate::trap::TrapContext;
 // available). Re-export the raw helpers here so the rest of this
 // file's code reads as it did before the extract.
 use crate::hvc_imm::HvcImm;
-use crate::symbols::{FN_COUNT, fn_addr, fn_name, fn_name_off};
+use crate::symbols::{FN_COUNT, fn_addr, fn_name};
 
 /// Trampoline pool IPA range. Lives inside the ROM backing (which is
 /// 16 MiB stage-2 RO, sections 9..F of the guest's stage-1 L1 identity-
@@ -118,16 +118,14 @@ static mut INITIALISED: bool = false;
 ///   - VA 0x00..0x20: ARM vector table. The reset vector at 0x00 runs
 ///     before we've built trampolines, and vectors at 0x04/0x0C/0x10 are
 ///     claimed by the hypervisor's UND / DIAG patches.
-///   - VA 0x00E0_0000..0x00FF_FF00: shadow-byte-access inline-stub pool.
-///     `patch_rom_from_bitmap` / `patch_code_range` emit 11-word inline
-///     emulation stubs there, reachable from every ROM call site via
-///     a ±32 MiB `B`. Sits between the tracer pool (0x0090_0000..
-///     0x00E0_0000) and the ROM-tail trampoline cluster below.
+///   - VA 0x00E0_0000..0x00FF_FF00: in-ROM stub pool used by
+///     `unaligned_inline` to fast-path SA-1100 unaligned-LDR rotate
+///     emulation (reachable from every ROM call site via a ±32 MiB
+///     `B`). Sits between the tracer pool (0x0090_0000..0x00E0_0000)
+///     and the ROM-tail trampoline cluster below.
 ///   - VA 0x00FF_FF00..0x00FF_FFF0: UND trampoline (0xFF00..0xFF60) +
-///     SBA pre-fault stub (0xFF60..0xFF80) + SBA post-emulation
-///     trampoline (0xFF80..0xFFA8) + DABT diagnostic trampoline
-///     (0xFFA8..0xFFE4, ends at the literal word at `db+14`) +
-///     UND return stub (0xFFE4..0xFFF0). See guest_mem::patch_und_vector,
+///     DABT diagnostic trampoline (0xFFA8..0xFFE4) + UND return stub
+///     (0xFFE4..0xFFF0). See guest_mem::patch_und_vector,
 ///     rom_patches::*, and the layout notes at UND_RETURN_STUB_OFFSET.
 ///   - PowerOffAndReboot: rom_patches installs a one-word HVC canary
 ///     there; the tracer overwriting it would silently mask the trap.
@@ -662,28 +660,6 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
 /// lands in *(0x0c1011b8). BuildMemObjDatabase copies entries out of that
 /// table into the runtime memobj database. Dumping both the selector value
 /// and the first few entries helps localize an init-time divergence.
-/// Check whether the shadow_stub patched the byte-access instructions
-/// that matter for the GetEnvDomainName loop. A patched site has its
-/// word replaced with a branch (B / Bcond). The top byte's low nibble is
-/// 0xA for a branch; the high nibble preserves the original condition.
-fn check_byte_access_patches() {
-    let sites: [(u32, u32, &str); 4] = [
-        (0x0011D2BC, 0x05c30000, "PrimGetEnvDomainName: strbeq r0, [r3]"),
-        (0x0011D300, 0xe5c36000, "PrimGetEnvDomainName: strb r6, [r3]"),
-        (0x0011D304, 0xe5c56000, "PrimGetEnvDomainName: strb r6, [r5]"),
-        (0x0011D840, 0xe5d8100d, "MemObjManager::GetEnvDomainName: ldrb r1, [r8, #13]"),
-    ];
-    for (pa, orig_insn, label) in sites {
-        let live = crate::guest_endian::guest_read_u32_va(pa).unwrap_or(0xDEAD_BEEF);
-        // Patched sites are a branch — bits [27:25] = 0b101 → (w >> 25) & 7 == 5.
-        let is_branch = ((live >> 25) & 0x7) == 0x5;
-        kprintln!(
-            "  byte_access_check: {:#010x}={:#010x} (orig={:#010x}, is_branch={}) {}",
-            pa, live, orig_insn, is_branch, label
-        );
-    }
-}
-
 /// Dump 32 bytes around a kernel-params buffer address to see what byte
 /// value the kernel actually sees in the flag slot. PrimGetEnvDomainName
 /// receives r2 = &fParams[domain_name_out] and r3 = &fParams[byte_flag_out].
@@ -708,7 +684,6 @@ fn dump_param_buffer(r2: u32, r3: u32) {
 }
 
 fn dump_env_config_table() {
-    check_byte_access_patches();
     // PrimGetEnvDomainName's lookup: iterate `*(0x0c10143c + idx*24)` treating
     // each 24-byte row as (env_name, ?, ?, ?, list_ptr, list_ptr2). When env
     // matches, dereference field +16 to get a pointer to a NUL-terminated 4cc

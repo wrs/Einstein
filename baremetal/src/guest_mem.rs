@@ -210,20 +210,6 @@ pub unsafe fn write_rom_word_by_kind(rom_ptr: *mut u32, idx: usize, value: u32) 
     }
 }
 
-/// Raw big-endian on-disk bytes of the Newton ROM, pre-byteswap. Used by
-/// `shadow_stub::patch_rom_from_bitmap` to verify the embedded classify
-/// bitmap matches the current ROM.
-#[cfg(not(nh_guest_test))]
-pub fn rom_be_bytes() -> &'static [u8] {
-    ROM_BE
-}
-
-/// Raw big-endian on-disk bytes of the external Einstein.rex, pre-byteswap.
-#[cfg(not(nh_guest_test))]
-pub fn rex_be_bytes() -> &'static [u8] {
-    REX_BE
-}
-
 /// Host physical base of the guest ROM backing store.
 pub fn rom_host_pa() -> u64 {
     addr_of_mut!(GUEST_ROM) as u64
@@ -1611,11 +1597,7 @@ pub unsafe fn load_newton_rom() {
 /// exception entry (and `ELR_EL1` is an AArch64-only EL1 register
 /// with no architectural alias to R14_svc). The trampoline could
 /// therefore read LR_svc directly from `ctx.x[18]` at EL2 entry,
-/// without the brief `msr cpsr_c, #0xd3` mode bounce. The bounce is
-/// kept for now because shadow_stub's faulting-mode SP/LR snapshot
-/// also runs from this trampoline path and benefits from in-mode
-/// reads when the faulting mode isn't UND/USR; revisiting after
-/// Phase B for cleanup.
+/// without the brief `msr cpsr_c, #0xd3` mode bounce.
 /// `MRS X, LR_svc` is **NOT** a defined AArch64 sysreg encoding —
 /// MRS (Banked register) is AArch32-only per F7.1.115 — so reads of
 /// `LR_svc` as if it were a sysreg always come back as 0 / undefined
@@ -1702,34 +1684,8 @@ const UND_TRAMP_OFFSET: usize = 0x00FF_FF00;
 /// the architectural state SA-110 hardware delivered to the FPE.
 pub const FPA_BYPASS_STUB_OFFSET: usize = 0x00FF_FEC0;
 
-/// Post-emulation trampoline used by the SBA handler when byte-access
-/// writeback targets Rn ∈ {13, 14} (banked SP / LR). AArch64 ERET from
-/// EL2 doesn't propagate x13 / x14 into the target mode's banked SP /
-/// LR — R0..R12 propagate, R13/R14 retain their banked values across
-/// the ERET. So we instead ERET into this trampoline *in the faulting
-/// mode*, which writes SP / LR natively (hitting the banked slot for
-/// that mode) and then branches to the final PC. NEW_SP / NEW_LR live
-/// in the `UND_SAVE_BANKED_{SP,LR}_IPA` RAM slots; the NEW_PC literal
-/// lives inline in the trampoline body and the SBA handler rewrites it
-/// (plus a DC CVAU flush) before each ERET.
-///
-/// Trampoline body (7 words + 2 literals):
-///   +0x00: ee0dcf50  mcr p15,0,r12,c13,c0,2  ; save R12 → TPIDRURW
-///   +0x04: e59fc014  ldr r12, [pc, #0x14]    ; R12 = slot-base literal at +0x20
-///   +0x08: e59cd018  ldr sp, [r12, #0x18]    ; SP = NEW_SP slot
-///   +0x0C: e59ce01c  ldr lr, [r12, #0x1C]    ; LR = NEW_LR slot
-///   +0x10: ee1dcf50  mrc p15,0,r12,c13,c0,2  ; R12 = orig R12 from TPIDRURW
-///   +0x14: e59ff008  ldr pc, [pc, #0x08]     ; branch via NEW_PC literal at +0x24
-///   +0x18: eafffffe  b .                     ; guard
-///   +0x1C: eafffffe  b .                     ; guard
-///   +0x20: slot_base_va                      ; set at install, swapped post-MMU
-///   +0x24: NEW_PC                            ; dynamically written by SBA handler
-pub const SBA_POST_TRAMP_OFFSET: usize = 0x00FF_FF80;
-pub const SBA_POST_TRAMP_NEW_PC_OFFSET: usize = SBA_POST_TRAMP_OFFSET + 0x24;
-
-/// DABT-vector trampoline body. Installed at ROM offset 0x00FF_FFA8
-/// (past the SBA post-emulation trampoline at 0x00FF_FF80, ends
-/// around 0x00FF_FFA8). Saves LR_abt/SP_abt/SPSR_abt natively from
+/// DABT-vector trampoline body. Installed at ROM offset 0x00FF_FFA8.
+/// Saves LR_abt/SP_abt/SPSR_abt natively from
 /// ABT mode, then bounces to SVC to save SP_svc/SPSR_svc/LR_svc.
 ///
 /// (Historical note: per Table D1-79, AArch32 R13_svc / R14_svc /
@@ -2101,21 +2057,6 @@ pub const UND_RETURN_STUB_VA: u32 = UND_RETURN_STUB_OFFSET as u32;
 /// handler before ERET).
 pub const UND_RETURN_STUB_LITERAL_OFFSET: usize = UND_RETURN_STUB_OFFSET + 8;
 
-/// Shadow-byte-access pre-fault stub, sitting in the 32-byte window
-/// between the UND trampoline body (ends at 0x00FF_FF60) and the SBA
-/// post-emulation trampoline (starts at 0x00FF_FF80). Used by the
-/// SBA UDF emulator to drive a natural DABT on behalf of a faulting
-/// site whose effective address is on an unmapped page — the kernel's
-/// own `DataAbortHandler` grows the page in, the probe retries, and
-/// the stub HVCs back to EL2 for the emulator to finish the access.
-///
-/// Layout (3 words, 12 bytes):
-///   +0x00: e5d0_0000   LDRB r0, [r0]       ; probe; faults if page unmapped
-///   +0x04: e140_0174   HVC  #SBA_RETRY_TAG ; return to EL2 on success
-///   +0x08: eaff_fffe   B .                 ; guard
-pub const SBA_PREFAULT_STUB_OFFSET: usize = 0x00FF_FF60;
-pub const SBA_PREFAULT_STUB_VA: u32 = SBA_PREFAULT_STUB_OFFSET as u32;
-
 unsafe fn patch_und_vector(rom: *mut u32) {
     // The trampoline's save-slot address is held in the literal at
     // offset 0x30. Pre-MMU we use the RAM *IPA* 0x0400_5F00 directly
@@ -2212,31 +2153,6 @@ unsafe fn patch_und_vector(rom: *mut u32) {
         // under BE-8, so write as data.
         write_rom_data_word(rom, base + 23, crate::trap::HYP_TRAMP_SCRATCH_BASE);
 
-        // SBA pre-fault stub. When the shadow-stub byte-access emulator
-        // encounters a faulting EA on an unmapped guest page, it stashes
-        // retry state and ERETs into this stub (in UND mode) with
-        // ctx.x[0] = EA. The LDRB probes the page: if unmapped, the CPU
-        // takes a natural DABT, the existing DABT-trampoline + handle_diag
-        // forward path invokes the kernel's own DataAbortHandler, the
-        // page is paged in, and the kernel's `subs pc, lr, #8` retries
-        // the LDRB. On success the stub HVCs back to EL2, where
-        // handle_sba_retry restores the stashed context and re-runs the
-        // emulator body. Covers SWPB / writeback / post-index / SP-reg
-        // UDF-fallback sites that can't use the inline-stub fast path.
-        //
-        //   +0x00: e5d0_0000  LDRB r0, [r0]       ; probe
-        //   +0x04: e140_0174  HVC  #SBA_RETRY_TAG ; back to EL2
-        //   +0x08: eaff_fffe  B .                 ; guard
-        let di = SBA_PREFAULT_STUB_OFFSET / 4;
-        write_rom_code_word(rom, di + 0, 0xE5D0_0000);  // ldrb r0, [r0]
-        write_rom_code_word(rom, di + 1, HvcImm::SbaRetry.insn());  // hvc #0x14 (SBA_RETRY_TAG)
-        write_rom_code_word(rom, di + 2, 0xEAFF_FFFE);  // b . (guard)
-        write_rom_code_word(rom, di + 3, 0xEAFF_FFFE);  // padding (guard)
-        write_rom_code_word(rom, di + 4, 0xEAFF_FFFE);
-        write_rom_code_word(rom, di + 5, 0xEAFF_FFFE);
-        write_rom_code_word(rom, di + 6, 0xEAFF_FFFE);
-        write_rom_code_word(rom, di + 7, 0xEAFF_FFFE);
-
         // UND-return stub. See `return_to_guest_from_und` in trap.rs for
         // why this exists — QEMU raspi3b's `msr spsr_el2, <val>` from
         // AArch64 EL2 clobbers SPSR_EL1 (= AArch32 SPSR_svc) as a side
@@ -2277,21 +2193,6 @@ unsafe fn patch_und_vector(rom: *mut u32) {
         // under BE-8 each ERET; the runtime updater also lives in
         // `trap.rs`. Placeholder is data.
         write_rom_data_word(rom, stub + 2, 0xDEAD_C0DE);
-
-        // SBA post-emulation trampoline, at SBA_POST_TRAMP_OFFSET.
-        let pt = SBA_POST_TRAMP_OFFSET / 4;
-        write_rom_code_word(rom, pt + 0, 0xEE0D_CF50); // mcr p15,0,r12,c13,c0,2
-        write_rom_code_word(rom, pt + 1, 0xE59F_C014); // ldr r12, [pc, #0x14]  → literal at +0x20
-        write_rom_code_word(rom, pt + 2, 0xE59C_D018); // ldr sp, [r12, #0x18]
-        write_rom_code_word(rom, pt + 3, 0xE59C_E01C); // ldr lr, [r12, #0x1C]
-        write_rom_code_word(rom, pt + 4, 0xEE1D_CF50); // mrc p15,0,r12,c13,c0,2
-        write_rom_code_word(rom, pt + 5, 0xE59F_F008); // ldr pc, [pc, #0x08]
-        write_rom_code_word(rom, pt + 6, 0xEAFF_FFFE); // b . (guard)
-        write_rom_code_word(rom, pt + 7, 0xEAFF_FFFE); // b . (guard)
-        // Two literal data words — read by the `ldr r12, [pc, #0x14]`
-        // and `ldr pc, [pc, #0x08]` above.
-        write_rom_data_word(rom, pt + 8, crate::trap::HYP_TRAMP_SCRATCH_BASE);
-        write_rom_data_word(rom, pt + 9, 0xDEAD_C0DE);
     }
 
     // Publish the freshly-installed code to the AArch32 instruction
@@ -2305,8 +2206,7 @@ unsafe fn patch_und_vector(rom: *mut u32) {
     // execute garbage and fall through into UND_TRAMP, defeating the
     // whole point of the in-ROM bypass. The range below covers the
     // UND vector word at IPA 0x04, the ROM-offset-0x80 trampoline
-    // body, the FPA bypass stub, UND_TRAMP, the SBA pre-fault stub,
-    // SBA post-emulation trampoline, and UND_RETURN_STUB.
+    // body, the FPA bypass stub, UND_TRAMP, and UND_RETURN_STUB.
     crate::cpu::icache_publish_range(
         rom as u64 + 0x04,
         0x100,
@@ -2410,26 +2310,22 @@ unsafe fn patch_native_prim_mcr_lr_to_r12(rom: *mut u32, start: u32, end: u32) -
 pub unsafe fn install_und_vector_swap_post_mmu() {
     // SAFETY: single-word write to each trampoline's slot-base literal.
     // Caller must hold exclusive access to the ROM backing. Swaps the
-    // UND trampoline, the SBA post-emulation trampoline, and the DABT
-    // diagnostic trampoline.
+    // UND trampoline and the DABT diagnostic trampoline.
     //
-    // 2026-04-28: with HYP_TRAMP_SCRATCH_BASE relocated into the
-    // SCRATCH_POOL IPA window, the same value works both pre-MMU
-    // (stage-1 off → IPA → stage-2 → host SCRATCH_POOL) and post-MMU
-    // (kernel L1[0x60] → IPA → stage-2). The swap therefore writes
-    // the same literal as the pre-MMU install path; kept as a callable
-    // no-op to preserve the install/uninstall contract for future
-    // changes that might re-introduce a swap.
+    // With HYP_TRAMP_SCRATCH_BASE relocated into the SCRATCH_POOL IPA
+    // window, the same value works both pre-MMU (stage-1 off → IPA →
+    // stage-2 → host SCRATCH_POOL) and post-MMU (kernel L1[0x60] →
+    // IPA → stage-2). The swap therefore writes the same literal as
+    // the pre-MMU install path; kept as a callable no-op to preserve
+    // the install/uninstall contract for future changes that might
+    // re-introduce a swap.
     //
-    // All three slots are LDR-loaded data literals — under BE-8 they
-    // must be byte-swapped on host so a CPSR.E=1 LDR returns the
-    // intended value.
+    // The literals are LDR-loaded data — under BE-8 they must be
+    // byte-swapped on host so a CPSR.E=1 LDR returns the intended value.
     unsafe {
         let rom = rom_host_pa() as *mut u32;
         let base = UND_TRAMP_OFFSET / 4;
         write_rom_data_word(rom, base + 23, crate::trap::HYP_TRAMP_SCRATCH_BASE);
-        let pt = SBA_POST_TRAMP_OFFSET / 4;
-        write_rom_data_word(rom, pt + 8, crate::trap::HYP_TRAMP_SCRATCH_BASE);
         let db = DABT_TRAMP_OFFSET / 4;
         write_rom_data_word(rom, db + 14, DABT_SAVE_PA);
     }
@@ -2437,10 +2333,9 @@ pub unsafe fn install_und_vector_swap_post_mmu() {
 
 /// Revert the trampoline's save-slot literal back to the pre-MMU value.
 /// Called when the guest turns its stage-1 MMU off — typically the
-/// SWIBoot→ROMBoot soft-reset path. Without this, a UND taken before
-/// the next MMU re-enable would store to an unmapped IPA via the stale
-/// kernel-VA literal. (Now a no-op given HYP_TRAMP_SCRATCH_BASE works
-/// pre + post-MMU; retained for symmetry with the post-MMU swap.)
+/// SWIBoot→ROMBoot soft-reset path. (Now a no-op given
+/// HYP_TRAMP_SCRATCH_BASE works pre + post-MMU; retained for symmetry
+/// with the post-MMU swap.)
 pub unsafe fn install_und_vector_swap_pre_mmu() {
     // SAFETY: same as the post-MMU swap above. Literal slots are data
     // under BE-8.
@@ -2448,8 +2343,6 @@ pub unsafe fn install_und_vector_swap_pre_mmu() {
         let rom = rom_host_pa() as *mut u32;
         let base = UND_TRAMP_OFFSET / 4;
         write_rom_data_word(rom, base + 23, crate::trap::HYP_TRAMP_SCRATCH_BASE);
-        let pt = SBA_POST_TRAMP_OFFSET / 4;
-        write_rom_data_word(rom, pt + 8, crate::trap::HYP_TRAMP_SCRATCH_BASE);
         let db = DABT_TRAMP_OFFSET / 4;
         write_rom_data_word(rom, db + 14, DABT_SAVE_PA);
     }

@@ -60,9 +60,6 @@ pub enum HvcImm {
     /// Save the four-slot rolling guest-state snapshot.
     /// (`HVC_SNAPSHOT`)
     Snapshot,
-    /// Shadow-stub bulk-patch request: scan + patch a guest IPA
-    /// range for byte/halfword accesses. (`HVC_SHADOW_PATCH_RANGE`)
-    ShadowPatchRange,
     /// `DebugStr` ROM-patch trap (logs guest string in r0).
     /// (`HVC_DEBUG_STR`)
     DebugStr,
@@ -77,10 +74,6 @@ pub enum HvcImm {
     // directly, so reordering / shifting their values is safe.
     /// Phase-B diagnostic: dump banked regs + stage-1 walk + halt.
     Diag,
-    /// Shadow-stub byte/halfword-access return path: signals that
-    /// the patched access has completed and we can resume the
-    /// original (post-patched) PC.
-    SbaRetry,
     /// Loud-halt tripwire. Patched at the first instruction of
     /// `Reboot`, `PowerOffAndReboot`, and `StopImage` — three sites
     /// the kernel reaches when it's giving up or going idle. The

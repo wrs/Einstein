@@ -8,7 +8,7 @@
 //! return — the vector trailer restores the context and ERETs. Handlers that
 //! don't want to resume never return (they call `cpu::halt`).
 
-use crate::{cpu, guest_mem, hvc_imm::HvcImm, kprintln, mmio, peripherals, peripherals::{native_primitives, vic}, platform, shadow_stub, timer};
+use crate::{cpu, guest_mem, hvc_imm::HvcImm, kprintln, mmio, peripherals, peripherals::{native_primitives, vic}, platform, timer};
 
 macro_rules! read_sysreg {
     ($reg:literal) => {{
@@ -43,7 +43,7 @@ const EC_HVC_A32: u32 = 0x12;
 const EC_INSN_ABORT_LOWER: u32 = 0x20;
 const EC_DATA_ABORT_LOWER: u32 = 0x24;
 
-// (UND / ALIGN / SBA_RETRY / GPIO_TRIGGER / DIAG immediates live in
+// (UND / ALIGN / GPIO_TRIGGER / DIAG immediates live in
 //  `crate::hvc_imm::HvcImm` — see that module for descriptions.)
 
 /// iter-59 diagnostic counters: per-immediate HVC histogram (256
@@ -625,13 +625,6 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
         );
     }
 
-    // Under the UDF-trap shadow-byte-access path, byte/halfword
-    // accesses are emulated in EL2 Rust (see shadow_stub::handle_sba_udf)
-    // rather than by an in-guest stub. No guest PC therefore lies
-    // inside a "stub pool" any more, and a stage-2 abort from the SBA
-    // emulator is a bug in the emulator itself — those fall through
-    // to the normal `mmio` dispatch with the actual (un-XORed) IPA.
-
     if isv == 0 {
         // No decodable syndrome — typically LDR/STR with writeback,
         // LDM/STM, or exclusive access. The Newton kernel uses
@@ -719,45 +712,6 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
                 "           insn[pc{:+#3x}] @{:#010x} = via-va:{:#010x}  via-pa:{:#010x}",
                 off, addr, via_va, via_pa,
             );
-        }
-        // If the faulting PC sits inside shadow_stub's SBA inline-stub
-        // pool, decode slot 14 of the containing stub — that's a
-        // `B orig_pc + 4` and gives us the original ROM PC the stub
-        // emulates. Helps localise wild branches into the pool to a
-        // specific ROM instruction.
-        if (crate::shadow_stub::SBA_STUB_POOL_IPA
-            ..crate::shadow_stub::SBA_STUB_POOL_END)
-            .contains(&elr)
-        {
-            let off = elr.wrapping_sub(crate::shadow_stub::SBA_STUB_POOL_IPA);
-            let slot_idx = off / crate::shadow_stub::SBA_STUB_BYTES;
-            let slot_base = crate::shadow_stub::SBA_STUB_POOL_IPA
-                + slot_idx * crate::shadow_stub::SBA_STUB_BYTES;
-            let back_branch_pa = slot_base.wrapping_add(14 * 4);
-            if let Some(insn) = crate::guest_endian::guest_read_u32_pa(back_branch_pa) {
-                // ARM A1 B encoding: cond=1110 1010 imm24
-                if (insn & 0x0F00_0000) == 0x0A00_0000 {
-                    let imm24 = insn & 0x00FF_FFFF;
-                    let signed = if imm24 & 0x0080_0000 != 0 {
-                        imm24 | 0xFF00_0000
-                    } else {
-                        imm24
-                    };
-                    let target = back_branch_pa
-                        .wrapping_add(8)
-                        .wrapping_add((signed as i32 as u32) << 2);
-                    let orig_pc = target.wrapping_sub(4);
-                    kprintln!(
-                        "           sba-stub: slot {} (base {:#010x}) emulates ROM PC {:#010x} (back-branch {:#010x} -> {:#010x})",
-                        slot_idx, slot_base, orig_pc, back_branch_pa, target,
-                    );
-                } else {
-                    kprintln!(
-                        "           sba-stub: slot {} (base {:#010x}) — back-branch slot {:#010x} = {:#010x} (not a B insn)",
-                        slot_idx, slot_base, back_branch_pa, insn,
-                    );
-                }
-            }
         }
         // Walk a few words of the source-mode stack via stage-1 — the
         // top entry is normally the caller's saved LR after a leaf
@@ -1080,51 +1034,24 @@ fn handle_instruction_abort(ctx: &TrapContext, iss: u32) {
     let ipa = ((hpfar >> 4) << 12) | (far & 0xFFF);
     let elr = read_sysreg!("elr_el2");
 
-    // Lazy shadow-stub discovery for RAM-resident code.
-    //
-    // RAM is mapped XN at stage-2 so the first fetch into any 2 MiB
-    // RAM block traps here. We scan the block for byte/halfword
-    // accesses, install stubs, and flip XN off on that block. ERET
-    // retries the fetch, which now succeeds.
+    // RAM is mapped XN at stage-2 so the first fetch into any RAM page
+    // traps here. Flip the page to RO + executable; the next write
+    // stage-2-faults into the data-abort handler and re-arms it RW + XN.
     //
     // IFSC values (ISS bits [5:0]) we care about:
-    //   0b000101  Translation fault, level 1 (page isn't mapped)
-    //   0b001111  Permission fault, level 3 (XN)
-    //   0b001110..0b001111 various permission-fault levels
-    // We act on any permission fault whose IPA is inside a RAM range.
+    //   0b001100..0b001111  permission fault levels
     let ifsc = (iss & 0x3f) as u32;
-    let is_permission = (ifsc & 0b111100) == 0b001100; // 0x0C..0x0F
+    let is_permission = (ifsc & 0b111100) == 0b001100;
     let ram_base = guest_mem::RAM_IPA_BASE as u64;
     let ram_end = ram_base + guest_mem::RAM_SIZE as u64;
     let in_ram = (ram_base..ram_end).contains(&ipa);
 
     if is_permission && in_ram {
-        let scan_ipa = ipa as u32;
-
-        // Scan one 4 KiB page — Newton's demand-pager operates at
-        // 4 KiB granularity, so re-arming a whole 2 MiB block on
-        // every fresh code page would force us to re-patch already-
-        // patched pages (and potentially double-emit UDFs). The
-        // stage-2 state machine (RW+XN ↔ RO+¬X per page) lets us
-        // track each page independently.
-        let page_start = scan_ipa & !0xFFFu32;
-        let page_end = page_start.wrapping_add(0x1000);
-
-        kprintln!(
-            "shadow_stub: lazy RAM patch — page {:#x}..{:#x} (fetch at {:#x})",
-            page_start, page_end, ipa
-        );
-        let stats = shadow_stub::patch_code_range(page_start, page_end);
-        shadow_stub::log_stats(&stats);
-
-        // Flip the page to RO + executable. The next write will
-        // stage-2-fault into the data-abort handler and re-arm it
-        // RW + XN, forcing a re-scan on the subsequent fetch.
+        let page_start = (ipa as u32) & !0xFFFu32;
         // SAFETY: helper performs its own TLB maintenance.
         unsafe {
             crate::stage2::set_ram_page_ro_x(page_start);
         }
-
         // Retry the fetch — don't advance ELR, just return.
         return;
     }
@@ -1234,19 +1161,6 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
             }
             return;
         }
-        v if v == HvcImm::ShadowPatchRange as u32 => {
-            // Shadow-stub patch request: r0=start_ipa, r1=end_ipa
-            // (exclusive). Scans that IPA range of the ROM backing
-            // (the guest-test image) and patches every LDRB/STRB/
-            // LDRH/STRH/LDRSB/LDRSH. Emits stubs into the shadow-stub
-            // pool and rewrites originals to Bcc stub.
-            let start = ctx.x[0] as u32;
-            let end = ctx.x[1] as u32;
-            let stats = crate::shadow_stub::patch_code_range(start, end);
-            crate::shadow_stub::log_stats(&stats);
-            // Echo the patched count back to r0 so the guest can check it.
-            ctx.x[0] = stats.patched as u64;
-        }
         v if v == HvcImm::Snapshot as u32 => {
             // Save snapshot — see src/snapshot.rs. ctx.x[0..30] is
             // the AArch64 GPR view that aliases AArch32 R0..R12 plus
@@ -1336,9 +1250,6 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == HvcImm::Align as u32 => {
             crate::unaligned::handle_align_fault(ctx);
         }
-        v if v == HvcImm::SbaRetry as u32 => {
-            crate::shadow_stub::handle_sba_retry(ctx);
-        }
         v if v == HvcImm::GpioTrigger as u32 => {
             vic::raise(vic::INT_GPIO);
         }
@@ -1424,12 +1335,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
 //   +0xA0..+0xB7  DABT trampoline save (lr_abt, sp_abt, spsr_abt,
 //                                       sp_svc, spsr_svc, lr_svc)
 //
-// 2026-05-03: relocated from 0x0600_F000 (slot 7680 inside SCRATCH_POOL)
-// to 0x0600_0000 (slot 0). The old location overlapped shadow_stub's
-// per-stub literal area once iter-85 grew SCRATCH_POOL to 384 KiB —
-// shadow_stub's NEXT_SCRATCH_SLOT now starts past RESERVED_SCRATCH_SLOTS
-// (32 slots = 256 B), keeping the trampoline's footprint (offsets
-// 0x00..0xAC) reserved and never claimed by a stub.
+// SCRATCH_POOL's per-stub allocator (`NEXT_SCRATCH_SLOT`) starts past
+// `RESERVED_SCRATCH_SLOTS` (32 slots = 256 B), keeping the trampoline's
+// footprint (offsets 0x00..0xAC) reserved and never claimed by a stub.
 pub const HYP_TRAMP_SCRATCH_BASE: u32 = crate::shadow_stub::SCRATCH_POOL_IPA;
 pub const UND_SAVE_LR_IPA: u32 = HYP_TRAMP_SCRATCH_BASE + 0x00;
 pub const UND_SAVE_SPSR_IPA: u32 = HYP_TRAMP_SCRATCH_BASE + 0x04;
@@ -1454,13 +1362,9 @@ pub const UND_SAVE_R2_IPA: u32 = HYP_TRAMP_SCRATCH_BASE + 0x14;
 
 /// Banked SP (R13) and LR (R14) of the faulting mode. Populated by the
 /// trampoline after switching to the faulting mode (or SYS when the
-/// faulting mode is USR) and saving its SP/LR. `handle_und` reads these
-/// so the shadow-byte-access emulator can access `[SP, #imm]`-style
-/// addressing with the right bank. The SBA post-emulation trampoline
-/// (see `guest_mem::patch_und_vector`) also reads these slots on the
-/// way out to write the updated values into the faulting mode's banked
-/// SP / LR, for sites that writeback Rn ∈ {13, 14}.
-pub const UND_SAVE_BANKED_SP_IPA: u32 = HYP_TRAMP_SCRATCH_BASE + 0x18;
+/// faulting mode is USR) and saving its SP/LR. `handle_und` reads
+/// `UND_SAVE_BANKED_LR_IPA` to recover the original LR for diagnostic
+/// purposes (e.g. unhandled-exception forensics).
 pub const UND_SAVE_BANKED_LR_IPA: u32 = HYP_TRAMP_SCRATCH_BASE + 0x1C;
 
 // iter-87 diag: rolling buffer of recent UND faults. The wedge fires
@@ -1875,18 +1779,6 @@ fn handle_und(ctx: &mut TrapContext) {
                 kprintln!(
                     "*** guest_bp: marker at PC={:#x} with no matching table entry — halting",
                     faulting_pc
-                );
-                cpu::halt();
-            }
-        }
-        // Shadow-byte-access UDF — the patched byte/halfword-access
-        // site raises UND, this arm emulates the access in EL2 Rust.
-        // See `src/shadow_stub.rs`.
-        _ if shadow_stub::is_sba_udf_insn(insn) => {
-            if !shadow_stub::handle_sba_udf(ctx, faulting_pc, spsr_und, insn) {
-                kprintln!(
-                    "*** shadow_stub: SBA UDF at PC={:#x} insn={:#010x} failed — halting",
-                    faulting_pc, insn
                 );
                 cpu::halt();
             }
@@ -3712,8 +3604,8 @@ pub(crate) fn return_to_guest_from_und(_ctx: &mut TrapContext, elr: u64, _spsr: 
     // UND_RETURN_STUB which lives outside this range.
     // iter-87 diag: only flag ERET to the trampoline body proper —
     // ranges 0xffff00..0xffff60 (UND_TRAMP) and 0xffec0..0xffefc
-    // (FPA bypass). SBA_POST_TRAMP at 0xffff80 and UND_RETURN_STUB
-    // at 0xffffe4 are legitimate ERET targets.
+    // (FPA bypass). UND_RETURN_STUB at 0xffffe4 is a legitimate
+    // ERET target.
     let mode = (_spsr as u32) & 0x1F;
     let elr32 = elr as u32;
     let in_und_tramp = elr32 >= 0x00FF_FF00 && elr32 < 0x00FF_FF60;
@@ -3868,40 +3760,6 @@ fn log_dabt_forward(dfsc: u32, far: u32, mode: u32, ctx: &TrapContext) {
             "  r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r12={:#010x}",
             ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32, ctx.x[12] as u32
         );
-        // If the faulting USR PC is in the SBA stub pool, decode slot
-        // 14's back-branch to recover the original ROM PC the stub
-        // emulates. Same trick as the dabt-trip handler above; lets us
-        // identify the kernel/user instruction that took the
-        // unresolvable fault even when it's a hot SBA-instrumented
-        // store.
-        if (crate::shadow_stub::SBA_STUB_POOL_IPA
-            ..crate::shadow_stub::SBA_STUB_POOL_END)
-            .contains(&faulting_pc)
-        {
-            let off = faulting_pc.wrapping_sub(crate::shadow_stub::SBA_STUB_POOL_IPA);
-            let slot_idx = off / crate::shadow_stub::SBA_STUB_BYTES;
-            let slot_base = crate::shadow_stub::SBA_STUB_POOL_IPA
-                + slot_idx * crate::shadow_stub::SBA_STUB_BYTES;
-            let back_branch_pa = slot_base.wrapping_add(14 * 4);
-            if let Some(insn) = crate::guest_endian::guest_read_u32_pa(back_branch_pa) {
-                if (insn & 0x0F00_0000) == 0x0A00_0000 {
-                    let imm24 = insn & 0x00FF_FFFF;
-                    let signed = if imm24 & 0x0080_0000 != 0 {
-                        imm24 | 0xFF00_0000
-                    } else {
-                        imm24
-                    };
-                    let target = back_branch_pa
-                        .wrapping_add(8)
-                        .wrapping_add((signed as i32 as u32) << 2);
-                    let orig_pc = target.wrapping_sub(4);
-                    kprintln!(
-                        "  sba-stub: slot {} (base {:#010x}) emulates ROM PC {:#010x} (back-branch {:#010x} -> {:#010x})",
-                        slot_idx, slot_base, orig_pc, back_branch_pa, target,
-                    );
-                }
-            }
-        }
         // Dump the stage-1 walk for the FAR. Crucial for distinguishing
         // "L1 entry missing" (DFSC=5) from "L2 entry missing"
         // (DFSC=7) — both would otherwise look the same in a brief log.
@@ -4409,8 +4267,7 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
         // Guest VBAR_EL1 write (CP15 c12, c0, opc1=0, opc2=0). Needed
         // so tests that want a non-default exception-vector table can
         // install one; the real Newton ROM never writes VBAR (it uses
-        // low vectors at 0), but the shadow_stub abort-transparency
-        // test does.
+        // low vectors at 0).
         (0, 12, 0, 0, false) => {
             let value = ctx.x[rt] as u64;
             // SAFETY: VBAR_EL1 is writable at EL2; on ERET the guest

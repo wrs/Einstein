@@ -64,23 +64,21 @@ static mut S2_L2: PageTable = PageTable([0; 512]);
 // in this L3 stay invalid and continue to stage-2-fault into mmio::.
 static mut S2_L3_HW_TICKS: PageTable = PageTable([0; 512]);
 
-// L3 table refining the 2 MiB L2 slot that covers the shadow-stub
-// scratch carve-out at IPA 0x0180_0000..0x01A0_0000 (kernel VA
-// 0x0180_0000 mapped via stage-1 L1[0x18]). The first 16 4 KiB pages
-// are populated by `install_scratch_pool` and back the
-// `shadow_stub::SCRATCH_POOL` host buffer. The remaining 496 entries
-// stay invalid and stage-2-fault if anything outside the populated
-// 64 KiB ever gets accessed (defensive — the ScratchVA stubs only
-// touch their own slot).
+// L3 table refining the 2 MiB L2 slot that covers the per-stub scratch
+// carve-out at IPA 0x0600_0000 (kernel VA 0x0600_0000 mapped via
+// stage-1 L1[0x60]). Pages are populated by `install_scratch_pool`
+// and back the `shadow_stub::SCRATCH_POOL` host buffer; remaining
+// entries stay invalid and stage-2-fault if anything outside the
+// populated region is accessed.
 static mut S2_L3_SCRATCH: PageTable = PageTable([0; 512]);
 
 // L3 tables refining the two 2 MiB L2 slots covering guest RAM
 // (IPA 0x0400_0000..0x0440_0000). Each L3 slot is a 4 KiB page; the
-// shadow-stub flips per-page permissions between `RW + XN` (initial,
-// and re-armed after a write to a previously-executed code page) and
-// `RO + ¬XN` (post-scan, the page is executable and frozen). The
-// state machine lets us re-scan a code page when it's overwritten by
-// Newton's demand-pager.
+// instruction-abort handler flips per-page permissions between
+// `RW + XN` (initial, and re-armed after a write to a previously-
+// executed code page) and `RO + ¬XN` (post-fetch, the page is
+// executable and frozen). The state machine lets us catch when
+// Newton's demand-pager rewrites a code page.
 static mut S2_L3_RAM_0: PageTable = PageTable([0; 512]);
 static mut S2_L3_RAM_1: PageTable = PageTable([0; 512]);
 
@@ -203,10 +201,10 @@ pub fn ram_page_l3_entry(ipa: u32) -> Option<u64> {
 }
 
 /// Flip the stage-2 L3 entry for the 4 KiB RAM page at `ipa` to
-/// `RO + executable`. Called by the shadow-stub after scan+patch on
-/// an instruction-abort from guest code in RAM: subsequent fetches
-/// succeed, and writes fault so the hypervisor can re-arm RW+XN and
-/// re-scan the page on the next execute.
+/// `RO + executable`. Called from the instruction-abort handler when
+/// the guest first executes a freshly-written RAM code page:
+/// subsequent fetches succeed, and writes fault so the hypervisor can
+/// re-arm RW+XN on the next overwrite.
 ///
 /// No-op when `ipa` is outside the RAM aperture.
 pub unsafe fn set_ram_page_ro_x(ipa: u32) {
@@ -327,11 +325,10 @@ pub unsafe fn init() {
 
     // RAM: 4 MiB at guest PA 0x0400_0000. Refined to 4 KiB L3 pages;
     // each page starts `RW + XN` and flips to `RO + executable` on
-    // first fetch, after the shadow-stub scan+patch pass. A subsequent
-    // write (Newton's demand-pager overwriting a code page) takes a
-    // stage-2 RO permission fault; the handler re-arms the page as
-    // `RW + XN`, the write retries, and the next fetch re-scans the
-    // fresh bytes. See `set_ram_page_{ro_x,rw_xn}`.
+    // first fetch. A subsequent write (Newton's demand-pager
+    // overwriting a code page) takes a stage-2 RO permission fault;
+    // the handler re-arms the page as `RW + XN` and the write
+    // retries. See `set_ram_page_{ro_x,rw_xn}`.
     // SAFETY: installs two L3 tables and points L2[32], L2[33] at them.
     unsafe { install_ram_l3(); }
 
@@ -353,19 +350,14 @@ pub unsafe fn init() {
     // SAFETY: see the called helper's contract.
     unsafe { install_tick_page(); }
 
-    // Carve out a 64 KiB RW window at IPA 0x0180_0000 to back
-    // shadow-stub ScratchVA-variant inline stubs. Stage-2 maps it to
-    // `shadow_stub::SCRATCH_POOL`; stage-1 (kernel L1[0x18]) is
+    // Carve out an RW window at IPA 0x0600_0000 to back the per-stub
+    // scratch pool used by inline stubs (e.g. `unaligned_inline`) and
+    // the UND/DABT trampolines' banked-register save area. Stage-2 maps
+    // it to `shadow_stub::SCRATCH_POOL`; stage-1 (kernel L1[0x60]) is
     // populated separately by `guest_mem::install_scratch_pool_l1_section`
     // on the first M=0→M=1 transition.
     // SAFETY: helper installs L3 entries and points L2[0xC] at the L3.
     unsafe { install_scratch_pool(); }
-
-    // Under the UDF-trap shadow-byte-access path there are no in-guest
-    // stub pools. Byte/halfword-access sites are replaced in place with
-    // `UDF #imm16` markers; the UND raises into EL2 and the emulator in
-    // shadow_stub::handle_sba_udf performs the access in Rust. No
-    // additional stage-2 mappings are required.
 
     // L1[0] → L2. L1[1..] stay invalid (any IPA ≥ 1 GiB faults).
     let l1_ptr = addr_of_mut!(S2_L1) as *mut u64;
@@ -421,9 +413,9 @@ pub unsafe fn init() {
 }
 
 /// Refine the 4 MiB RAM aperture into 4 KiB pages across two L3 tables.
-/// Each page starts `RW + XN`; the shadow-stub flips pages to `RO + X`
-/// after scan+patch, and the data-abort handler flips them back on
-/// write.
+/// Each page starts `RW + XN`; the instruction-abort handler flips
+/// pages to `RO + X` on first fetch, and the data-abort handler flips
+/// them back on a subsequent write.
 unsafe fn install_ram_l3() {
     let ram_pa = guest_mem::ram_host_pa();
     let n_blocks = (RAM_IPA_SIZE / TWO_MIB) as usize;
@@ -495,12 +487,12 @@ unsafe fn install_tick_page() {
     );
 }
 
-/// Wire the 64 KiB shadow-stub scratch carve-out into stage-2 as RW
-/// normal-cacheable memory backed by `shadow_stub::SCRATCH_POOL`. The
-/// 2 MiB L2 block covering IPA 0x0180_0000..0x01A0_0000 is replaced
-/// with a table descriptor pointing at `S2_L3_SCRATCH`; the first 16
-/// L3 entries (4 KiB each) point at the host pool. Pages 16..512 stay
-/// invalid so any access outside the 64 KiB window stage-2-faults.
+/// Wire the per-stub scratch carve-out into stage-2 as RW normal-
+/// cacheable memory backed by `shadow_stub::SCRATCH_POOL`. The 2 MiB
+/// L2 block covering the pool IPA is replaced with a table descriptor
+/// pointing at `S2_L3_SCRATCH`; the populated L3 entries (4 KiB each)
+/// point at the host pool. Unmapped pages stay invalid so any access
+/// outside the populated window stage-2-faults.
 unsafe fn install_scratch_pool() {
     let l2_index =
         (crate::shadow_stub::SCRATCH_POOL_IPA as u64 / TWO_MIB) as usize; // 0xC
@@ -547,7 +539,7 @@ unsafe fn install_scratch_pool() {
     unsafe { l2_ptr.add(l2_index).write(l3_phys | DESC_VALID | DESC_TABLE); }
 
     kprintln!(
-        "stage2: shadow-stub scratch pool @ IPA {:#x}..{:#x} -> host PA {:#x} (RW, {} KiB)",
+        "stage2: scratch pool @ IPA {:#x}..{:#x} -> host PA {:#x} (RW, {} KiB)",
         crate::shadow_stub::SCRATCH_POOL_IPA,
         crate::shadow_stub::SCRATCH_POOL_IPA
             + crate::shadow_stub::SCRATCH_POOL_SIZE as u32,

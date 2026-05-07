@@ -347,9 +347,8 @@ pub fn maybe_autosave(ctx: &TrapContext) {
 ///   - `0x00900000..0x00E00000` — tracer trampoline pool
 ///     (`tracer::TRAMPOLINE_IPA..TRAMPOLINE_END`).
 ///   - `0x00FFFF00..0x01000000` — UND trampoline body (0x00FFFF00),
-///     SBA post-emulation trampoline (0x00FFFF80), DABT trampoline
-///     (0x00FFFFA8), and UND return stub (0x00FFFFE0). See
-///     `guest_mem::{UND_TRAMP_OFFSET, SBA_POST_TRAMP_OFFSET,
+///     DABT trampoline (0x00FFFFA8), and UND return stub
+///     (0x00FFFFE0). See `guest_mem::{UND_TRAMP_OFFSET,
 ///     DABT_TRAMP_OFFSET, UND_RETURN_STUB_OFFSET}`.
 ///
 /// The tracer pool is only populated when the `trace` feature is on,

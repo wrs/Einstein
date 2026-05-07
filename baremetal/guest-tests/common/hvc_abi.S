@@ -17,6 +17,5 @@
     .equ HVC_UND,               0x16
     .equ HVC_ALIGN,             0x17
     .equ HVC_SNAPSHOT,          0x18
-    .equ HVC_SHADOW_PATCH_RANGE, 0x19
-    .equ HVC_DEBUG_STR,         0x1A
-    .equ HVC_DEBUGGER,          0x1B
+    .equ HVC_DEBUG_STR,         0x19
+    .equ HVC_DEBUGGER,          0x1A

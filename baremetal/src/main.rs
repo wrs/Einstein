@@ -68,19 +68,6 @@ pub extern "C" fn kmain() -> ! {
     // SAFETY: load ROM bytes into guest backing store before stage-2 maps it.
     unsafe { guest_mem::load_rom(); }
 
-    // Diagnostic: post-load_rom dump of bytes at 0x00f76368, where
-    // the new wedge fires. If this is non-zero, either ROM_BE has
-    // bytes there or something patched it during load_rom; if zero,
-    // some later code path writes to ROM beyond REx end.
-    for off in [-0x10i32, -0x4, 0, 0x4, 0x8] {
-        let addr = 0x00f7_6368u32.wrapping_add(off as u32);
-        let w = crate::guest_endian::guest_read_u32_pa(addr).unwrap_or(0xDEADBEEF);
-        kprintln!(
-            "post-load ROM dump: @{:#010x} = {:#010x}",
-            addr, w,
-        );
-    }
-
     // Seed the Newton flash filesystem header before stage-2 exposes
     // the backing to the guest. Safe because the backing is a static
     // mut touched only from core 0 during boot.
@@ -107,35 +94,12 @@ pub extern "C" fn kmain() -> ! {
         alrt_capture::arm_at_boot();
     }
 
-    // (BE-8 migration: no byte-lane UDFs needed; shadow_stub will be
-    // deleted in a follow-up commit.)
-    #[cfg(not(nh_guest_test))]
-    {
-        let _ = shadow_stub::patch_rom_from_bitmap;
-        let _ = shadow_stub::log_stats;
-    }
-    // Diagnostic: post-shadow-stub-patch dump at 0x00f76368, the new
-    // wedge PC. Pairs with the post-load_rom dump above to find which
-    // patcher is writing here.
-    for off in [-0x10i32, -0x4, 0, 0x4, 0x8] {
-        let addr = 0x00f7_6368u32.wrapping_add(off as u32);
-        let w = crate::guest_endian::guest_read_u32_pa(addr).unwrap_or(0xDEADBEEF);
-        kprintln!(
-            "post-shadow-stub ROM dump: @{:#010x} = {:#010x}",
-            addr, w,
-        );
-    }
-
     // Seed the 10-entry ROM+REx checksum table into both blocks of
     // flash bank 0. The kernel's `TReservedBlockAccessor` reads these
     // during early init and compares against its own runtime computation
     // over the live ROM bytes. Must happen AFTER all ROM mutations
-    // (rom_patches in load_rom, UND/DABT/PABT vector trampolines, AND
-    // the ~27k shadow_stub UDF rewrites) so the seeded checksums match
-    // what the guest will compute. Order bug fixed 2026-04-25: previously
-    // seeded before shadow_stub, causing checksum mismatch → kernel's
-    // recovery path (UpdateBlock0FromBlock1 → flash erase → rewrite)
-    // diverged heap state and triggered the downstream "newt" UnhandledException.
+    // (rom_patches in load_rom, UND/DABT/PABT vector trampolines) so the
+    // seeded checksums match what the guest will compute.
     #[cfg(not(nh_guest_test))]
     {
         peripherals::flash::seed_rom_rex_checksums(

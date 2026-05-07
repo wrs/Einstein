@@ -1274,11 +1274,8 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
             kprintln!("=== HVC dump_object_by_id({:#x}) ===", id);
             crate::task_dump::dump_object_by_id(id);
         }
-        v if v == HvcImm::PowerOffReboot as u32 => {
-            handle_poweroff_reboot(ctx);
-        }
-        v if v == HvcImm::Reboot as u32 => {
-            handle_reboot(ctx);
+        v if v == HvcImm::LoudHalt as u32 => {
+            handle_loud_halt(ctx);
         }
         v if v == HvcImm::BootOs as u32 => {
             handle_bootos_canary(ctx);
@@ -1777,22 +1774,13 @@ fn handle_und(ctx: &mut TrapContext) {
             crate::tracer::log_trace_at(ctx, faulting_pc, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
         }
-        // Reboot canary (rom_patches::REBOOT_PC = 0x000D_9884). The
-        // kernel calls `Reboot(long, ...)` from USR mode on
-        // UnhandledException; HVC at EL0 is UNDEFINED, so our
-        // patched `HVC #REBOOT_HVC_IMM` lands here. Route into the
-        // same halt handler the HVC path uses.
-        _ if insn == HvcImm::Reboot.insn()
-            && faulting_pc == crate::rom_patches::REBOOT_PC =>
-        {
-            handle_reboot(ctx);
-        }
-        // PowerOffAndReboot canary, symmetric case for the USR-mode
-        // call path.
-        _ if insn == HvcImm::PowerOffReboot.insn()
-            && faulting_pc == crate::rom_patches::POWEROFF_REBOOT_PC =>
-        {
-            handle_poweroff_reboot(ctx);
+        // LoudHalt canary (Reboot, PowerOffAndReboot, StopImage).
+        // The kernel calls these from USR mode on UnhandledException
+        // / idle; HVC from EL0 is UNDEFINED, so our patched
+        // `HVC #LoudHalt` lands here. Route into the same halt
+        // handler the HVC path uses.
+        _ if insn == HvcImm::LoudHalt.insn() => {
+            handle_loud_halt(ctx);
         }
         // BootOS / ROMBoot canary (rom_patches::BOOTOS_PC = 0x0001_8688).
         // The initial hypervisor-ERET lands here in SVC mode (HVC traps
@@ -2233,63 +2221,47 @@ fn log_fpa_ctrl_reg(pc: u32, insn: u32, cond_passed: bool) {
 
 // ---
 
-/// Canary handler: the guest hit `PowerOffAndReboot` (ROM PC 0x000E_6BBC).
-/// rom_patches patched the first word to `HVC #POWEROFF_REBOOT_HVC_IMM`,
-/// so we land here BEFORE the function's prologue runs — ctx.x[0..14]
-/// alias the caller's AArch32 R0..R14, and ELR_EL2 == PowerOffAndReboot
-/// entry PC.
+/// Canary handler shared by `Reboot`, `PowerOffAndReboot`, and
+/// `StopImage`. Each site is patched with `HVC #LoudHalt` over its
+/// first instruction, so we land here BEFORE the function's prologue
+/// runs — ctx.x[0..14] alias the caller's AArch32 R0..R14, and
+/// ELR_EL2 == the patched function's entry PC.
 ///
-/// The kernel calls this whenever some fatal init-time check fails
-/// (flash identification, memory test, ROM checksum, etc.). Rebooting
-/// is the kernel's response; under the hypervisor the same failure
-/// will recur indefinitely, so we dump state and halt loudly on the
-/// first hit — no ERET.
-fn handle_poweroff_reboot(ctx: &TrapContext) -> ! {
+/// All three sites are end-of-the-line for the kernel: it's either
+/// rebooting after a fatal check or going idle. Dump state, halt the
+/// host. Distinguish sites by ELR_EL2 in the log line.
+fn handle_loud_halt(ctx: &TrapContext) -> ! {
     let spsr_el2 = read_sysreg!("spsr_el2") as u32;
-    let elr_el2 = read_sysreg!("elr_el2");
+    let elr_el2 = read_sysreg!("elr_el2") as u32;
     let mode = spsr_el2 & 0x1F;
     let caller_lr = crate::banked::lr_for_mode(ctx, spsr_el2);
+    // ELR_EL2 captures the post-HVC PC (= patched-site PC + 4) for
+    // priv-mode HVCs, so subtract 4 to get the patched site itself.
+    // For USR-mode (HVC routed through UND_TRAMP) the offsets work
+    // out the same way.
+    let site_pc = elr_el2.wrapping_sub(4);
+    let site = match site_pc {
+        crate::rom_patches::REBOOT_PC => "Reboot",
+        crate::rom_patches::POWEROFF_REBOOT_PC => "PowerOffAndReboot",
+        crate::rom_patches::STOP_IMAGE_PC => "StopImage",
+        _ => "LoudHalt",
+    };
     kprintln!();
-    kprintln!("*** PowerOffAndReboot canary fired — guest is giving up ***");
     kprintln!(
-        "  ELR_EL2  = {:#010x}  (= PowerOffAndReboot entry PC)",
-        elr_el2
+        "*** LoudHalt canary fired at {} (PC={:#010x}, ELR={:#010x}) ***",
+        site, site_pc, elr_el2,
     );
     kprintln!(
         "  SPSR_EL2 = {:#010x}  mode={} ({:#x})",
         spsr_el2, describe_aarch32_mode(mode), mode
     );
     kprintln!(
-        "  R0 = {:#010x}  (reboot reason code, passed in by caller)",
-        ctx.x[0] as u32
-    );
-    kprintln!(
-        "  R1 = {:#010x}  R2 = {:#010x}  R3 = {:#010x}",
-        ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32
+        "  R0 = {:#010x}  R1 = {:#010x}  R2 = {:#010x}  R3 = {:#010x}",
+        ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32
     );
     kprintln!(
         "  R12={:#010x}  R14_{}={:#010x}  (caller LR via Table D1-79)",
         ctx.x[12] as u32, describe_aarch32_mode(mode), caller_lr
-    );
-    kprintln!();
-    kprintln!("  Flash bank 0 host bytes [0..0x40]:");
-    dump_flash_bytes(0x0200_0000, 0x40);
-    kprintln!("  Flash bank 0 host bytes [0x40..0x90]:");
-    dump_flash_bytes(0x0200_0040, 0x50);
-    kprintln!();
-    kprintln!("  RAM read-back buffer 0x034af38c..0x034af3ac (LE host bytes):");
-    dump_ram_bytes(0x034a_f38c, 0x20);
-    kprintln!("  RAM expected buffer  0x034af228..0x034af2b0 (LE host bytes):");
-    dump_ram_bytes(0x034a_f228, 0x90);
-    kprintln!();
-    kprintln!(
-        "  (See the tracer entries immediately preceding this line for the"
-    );
-    kprintln!(
-        "   caller chain. The check that failed is the last non-trivial"
-    );
-    kprintln!(
-        "   function called before PowerOffAndReboot.)"
     );
     cpu::halt();
 }
@@ -2445,60 +2417,6 @@ fn halt_invariant(label: &str, local_dump: impl FnOnce()) -> ! {
     crate::task_dump::dump();
     kprintln!("--- end task_dump ---");
     cpu::halt();
-}
-
-fn dump_flash_bytes(ipa: u32, count: u32) {
-    let base = crate::peripherals::flash::host_pa() as *const u8;
-    let flash_off = ipa.wrapping_sub(crate::peripherals::flash::BANK0_PA_BASE) as usize;
-    for row in 0..((count + 15) / 16) {
-        let off = row * 16;
-        let mut hex = [0u8; 48]; // " %02x" * 16 = 48 chars + nul
-        let mut i = 0;
-        for j in 0..16 {
-            if off + j >= count { break; }
-            // SAFETY: host_pa + flash_off + off + j bounded by BANK_SIZE.
-            let b = unsafe { *base.add(flash_off + (off as usize) + j as usize) };
-            let hi = b >> 4;
-            let lo = b & 0xF;
-            hex[i] = if hi < 10 { b'0' + hi } else { b'a' + hi - 10 };
-            hex[i+1] = if lo < 10 { b'0' + lo } else { b'a' + lo - 10 };
-            hex[i+2] = b' ';
-            i += 3;
-        }
-        let s = core::str::from_utf8(&hex[..i]).unwrap_or("<?>");
-        kprintln!("    {:#010x}: {}", ipa + off, s);
-    }
-}
-
-fn dump_ram_bytes(va: u32, count: u32) {
-    // Walk guest stage-1 to resolve VA -> PA first.
-    let pa = match guest_mem::translate_va(va) {
-        Some(p) => p,
-        None => {
-            kprintln!("    {:#010x}: <no stage-1 mapping>", va);
-            return;
-        }
-    };
-    for row in 0..((count + 15) / 16) {
-        let off = row * 16;
-        let mut hex = [0u8; 48];
-        let mut i = 0;
-        for j in 0..16 {
-            if off + j >= count { break; }
-            let b = match guest_mem::read_byte_pa(pa + off + j) {
-                Some(b) => b,
-                None => { kprintln!("    {:#010x}: <pa {:#x} unmapped>", va + off + j, pa + off + j); return; }
-            };
-            let hi = b >> 4;
-            let lo = b & 0xF;
-            hex[i] = if hi < 10 { b'0' + hi } else { b'a' + hi - 10 };
-            hex[i+1] = if lo < 10 { b'0' + lo } else { b'a' + lo - 10 };
-            hex[i+2] = b' ';
-            i += 3;
-        }
-        let s = core::str::from_utf8(&hex[..i]).unwrap_or("<?>");
-        kprintln!("    VA {:#010x} (PA {:#010x}): {}", va + off, pa + off, s);
-    }
 }
 
 /// Phase-0 stub for the kernel-intent mask tracker. The full tracker
@@ -2774,192 +2692,6 @@ fn handle_thunk_probe(ctx: &mut TrapContext, kind: ThunkKind) {
         .or_else(|| crate::guest_endian::guest_read_u32_pa(r0.wrapping_add(4)))
         .unwrap_or(0xDEAD_BEEF);
     ctx.x[0] = new_r0 as u64;
-}
-
-fn handle_reboot(ctx: &TrapContext) -> ! {
-    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
-    let elr_el2 = read_sysreg!("elr_el2");
-    let mode = spsr_el2 & 0x1F;
-    let caller_lr = crate::banked::lr_for_mode(ctx, spsr_el2);
-    kprintln!();
-    kprintln!("*** Reboot canary fired — guest kernel is rebooting ***");
-    kprintln!(
-        "  ELR_EL2  = {:#010x}  (= Reboot entry PC)",
-        elr_el2
-    );
-    kprintln!(
-        "  SPSR_EL2 = {:#010x}  mode={} ({:#x})",
-        spsr_el2, describe_aarch32_mode(mode), mode
-    );
-    kprintln!(
-        "  R0 = {:#010x}  R1 = {:#010x}  R2 = {:#010x}  R3 = {:#010x}",
-        ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
-    );
-    kprintln!(
-        "  R12={:#010x}  R14_{}={:#010x}  (caller LR via Table D1-79)",
-        ctx.x[12] as u32, describe_aarch32_mode(mode), caller_lr
-    );
-
-    // Iter-34: SPSR_EL2 mode=UND is the TRAMPOLINE'S mode (HVC
-    // was issued from the UND-mode trampoline at 0xFFFF54), not
-    // the original caller's. The trampoline saves the source CPSR
-    // to UND_SAVE_SPSR_IPA. Read it to recover the actual caller
-    // mode and banked LR.
-    let trampoline_saved_spsr = crate::guest_endian::guest_read_u32_pa(UND_SAVE_SPSR_IPA).unwrap_or(0);
-    let true_source_mode = (trampoline_saved_spsr & 0x1F) as u32;
-    let true_caller_lr = crate::banked::lr_for_mode(ctx, trampoline_saved_spsr);
-    kprintln!();
-    kprintln!(
-        "  TRUE source CPSR={:#010x} mode={} ({:#x})  TRUE caller LR={:#010x}",
-        trampoline_saved_spsr,
-        describe_aarch32_mode(true_source_mode),
-        true_source_mode,
-        true_caller_lr,
-    );
-    kprintln!(
-        "  (LR_und=0x{:08x} above is the trampoline's bookkeeping, not the caller.)",
-        ctx.x[22] as u32,
-    );
-
-    // The original-mode SP gives the call stack. For USR/SVC etc.
-    // ctx.x[13] is the active SP slot per Table D1-79.
-    let true_source_sp = crate::banked::sp_for_mode(ctx, trampoline_saved_spsr);
-    kprintln!(
-        "  TRUE source SP_{}={:#010x}",
-        describe_aarch32_mode(true_source_mode),
-        true_source_sp,
-    );
-    kprintln!();
-    kprintln!("  TRUE source-mode stack (16 words from {:#010x}):", true_source_sp);
-    for i in 0..16 {
-        let va = true_source_sp.wrapping_add(i * 4);
-        match crate::guest_endian::guest_read_u32_va(va) {
-            Some(w) => kprintln!("    [{:+3}] @{:#010x} = {:#010x}", (i * 4) as i32, va, w),
-            None    => kprintln!("    [{:+3}] @{:#010x} = (unmapped)", (i * 4) as i32, va),
-        }
-    }
-
-    // Keep the SP_und dump (under the original `if mode == 0x1B`)
-    // for backward compatibility — useful when the trampoline path
-    // happens to push something there.
-    if mode == 0x1B {
-        let sp_und = ctx.x[23] as u32;
-        kprintln!();
-        kprintln!("  SP_und stack (16 words from ctx.x[23]={:#010x}):", sp_und);
-        for i in 0..16 {
-            let va = sp_und.wrapping_add(i * 4);
-            match crate::guest_endian::guest_read_u32_va(va) {
-                Some(w) => kprintln!("    [{:+3}] @{:#010x} = {:#010x}", (i * 4) as i32, va, w),
-                None    => kprintln!("    [{:+3}] @{:#010x} = (unmapped)", (i * 4) as i32, va),
-            }
-        }
-        // R0 typically points at a TException / TThrow descriptor
-        // (per the existing handler comment). Dump 8 words at
-        // *R0 if the address translates.
-        let r0 = ctx.x[0] as u32;
-        kprintln!();
-        kprintln!("  Exception-descriptor candidate at R0={:#010x}:", r0);
-        for i in 0..8 {
-            let va = r0.wrapping_add(i * 4);
-            match crate::guest_endian::guest_read_u32_va(va) {
-                Some(w) => kprintln!("    [{:+3}] @{:#010x} = {:#010x}", (i * 4) as i32, va, w),
-                None    => kprintln!("    [{:+3}] @{:#010x} = (unmapped)", (i * 4) as i32, va),
-            }
-        }
-        // R3 is often the kErr_* code passed to Throw (signed int32).
-        // Print both unsigned and signed interpretations so we can
-        // match against kErr_- constants (typically -10000..-50000)
-        // or positive object-table indices.
-        let r3 = ctx.x[3] as u32;
-        kprintln!();
-        kprintln!(
-            "  R3 decoded as error code: {:#010x} ({}, signed={})",
-            r3, r3, r3 as i32
-        );
-    }
-
-    kprintln!();
-    kprintln!(
-        "  (Preceding tracer entries show the caller chain. A typical trigger"
-    );
-    kprintln!(
-        "   is UnhandledException → Reboot; in that case the exception name"
-    );
-    kprintln!(
-        "   is at the r0 pointer passed to `Throw` a few entries earlier.)"
-    );
-
-    // 2026-04-26: dump kernel state to diagnose lazy-L1 wedge inside
-    // TInterpreter::TInterpreter. The interesting fields:
-    //   - L1[0xC0..0xD7]: which sections are coarse vs lazy 0x90 vs 0
-    //   - gCurrentTask (= *(0x0c100ff8)): the running TTask*; used by
-    //     DataAbortHandler at 0x393318 for the monitor lookup
-    //   - That task's monitor list at +0x74,+0x78,+0x7c (read by
-    //     `0x393324..0x393348` to build the dispatch bitmask)
-    kprintln!();
-    crate::alrt_capture::dump_counters();
-    kprintln!();
-    kprintln!("=== one-shot Reboot-canary kernel-state dump ===");
-    {
-        let ram = guest_mem::ram_host_pa() as *const u32;
-        kprintln!("  L1 walk (sections 0xC0..0xD7):");
-        for i in 0xC0..=0xD7 {
-            // SAFETY: i < 4096; L1 lives at start of guest RAM.
-            let e = unsafe { ram.add(i).read() };
-            let kind = match e & 3 {
-                0 => "fault",
-                1 => "coarse",
-                2 => "section",
-                _ => "fine",
-            };
-            kprintln!("    L1[{:#x}] = {:#010x}  ({})", i, e, kind);
-        }
-        // gCurrentTask at 0x0c100ff8 → walk through stage-1 to find PA.
-        let gct_va: u32 = 0x0c10_0ff8;
-        if let Some(gct_pa) = guest_mem::translate_va(gct_va) {
-            if let Some(gct) = crate::guest_endian::guest_read_u32_pa(gct_pa) {
-                kprintln!(
-                    "  gCurrentTask @VA={:#x} PA={:#x} = {:#010x}",
-                    gct_va, gct_pa, gct
-                );
-                if let Some(gct_pa2) = guest_mem::translate_va(gct) {
-                    let m74 = crate::guest_endian::guest_read_u32_pa(gct_pa2 + 0x74).unwrap_or(0xDEAD);
-                    let m78 = crate::guest_endian::guest_read_u32_pa(gct_pa2 + 0x78).unwrap_or(0xDEAD);
-                    let m7c = crate::guest_endian::guest_read_u32_pa(gct_pa2 + 0x7c).unwrap_or(0xDEAD);
-                    kprintln!(
-                        "  task @VA={:#x} PA={:#x} ->[0x74]={:#010x} ->[0x78]={:#010x} ->[0x7c]={:#010x}",
-                        gct, gct_pa2, m74, m78, m7c
-                    );
-                    // Walk each non-null monitor's bitmask at +0x10
-                    for (off, val) in [(0x74, m74), (0x78, m78), (0x7c, m7c)] {
-                        if val != 0 {
-                            if let Some(pa) = guest_mem::translate_va(val) {
-                                let bm = crate::guest_endian::guest_read_u32_pa(pa + 0x10).unwrap_or(0xDEAD);
-                                kprintln!(
-                                    "    monitor[+{:#x}] @VA={:#x} PA={:#x} ->[0x10]={:#010x} (fault-bitmask)",
-                                    off, val, pa, bm
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    // Step 3 (2026-04-28): full task census via task_dump::dump.
-    // For the alrt-task wedge investigation, we need to see WHICH tasks
-    // are RUN/RDY/BLK at wedge time and compare with Einstein
-    // (NewtonProbe shows alrt as BLK; on us it's running CheckButton
-    // with junk this — meaning we somehow scheduled it). The
-    // census print covers run-queue traversal, all-objects walk, and
-    // semaphore-wait state — enough to spot the divergence.
-    kprintln!();
-    kprintln!("=== Step 3: full task census ===");
-    crate::task_dump::dump();
-    kprintln!("=== end Step 3 dump ===");
-    kprintln!("=== end Reboot-canary state dump ===");
-
-    cpu::halt();
 }
 
 // ---- Remember post-SWI probe (surviving the iter-50..89 sweep) ----

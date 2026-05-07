@@ -355,17 +355,25 @@ const PATCHES_717006: &[RomPatch] = &[
 /// Phase-B canary: PowerOffAndReboot at 0x000E_6BBC. The kernel calls
 /// this whenever a fatal init-time check fails (e.g. flash chip
 /// identification yields no driver match — see INVESTIGATION.md).
-/// Patch the first word with `HVC #HvcImm::PowerOffReboot` so we
-/// halt loudly the FIRST time it fires, with the caller's R0 (reboot
+/// Patch the first word with `HVC #HvcImm::LoudHalt` so we halt
+/// loudly the FIRST time it fires, with the caller's R0 (reboot
 /// reason) and the trace context immediately preceding the call.
 pub const POWEROFF_REBOOT_PC: u32 = 0x000E_6BBC;
 
 /// Phase-B canary: `Reboot(long, unsigned long, unsigned char)` at
 /// 0x000D_9884. This is the "soft-reboot" path the kernel's exception
 /// unwinder calls on an UnhandledException. Same shape as
-/// PowerOffAndReboot: patch the first word to `HVC #HvcImm::Reboot`
+/// PowerOffAndReboot: patch the first word to `HVC #HvcImm::LoudHalt`
 /// so we halt on the first hit with the caller's R0 = reboot reason.
 pub const REBOOT_PC: u32 = 0x000D_9884;
+
+/// Phase-B canary: `StopImage` at 0x0038_D174. The kernel reaches
+/// StopImage on idle/sleep — it spins in a wait-for-interrupt loop
+/// at 0x38d1d4..0x38d1dc until a wake-up bit lands in IntPresent.
+/// During diagnostic runs we don't want to spin there forever; patch
+/// the first word with `HVC #HvcImm::LoudHalt` so the host stops
+/// immediately on entry.
+pub const STOP_IMAGE_PC: u32 = 0x0038_D174;
 
 /// Phase-B canary: `BootOS` / `ROMBoot` at 0x0001_8688. The AArch32
 /// reset vector at VA 0 is `B 0x18688`, so the first execution after
@@ -754,6 +762,27 @@ const SWIBOOT_DISPATCH_LDR_PC:        u32 = 0x003a_D738;
 const SWIBOOT_DISPATCH_LDR_ORIG_INSN: u32 = 0xE511_1004; // ldr r1, [r1, #-4]
 const SWIBOOT_DISPATCH_LDR_RESUME_PC: u32 = 0x003a_D73C;
 
+/// FPE prelude instruction-as-data load:
+/// `FP_UndefHandlers_Start` at 0x0038_D8DC reads the faulting FPA
+/// instruction into fp via two conditional loads at 0x0038_D930 (EQ:
+/// `ldrteq fp, [r9], #0` for USR-source) and 0x0038_D934 (NE:
+/// `ldrne fp, [r9]` for non-USR-source). Same byteswap problem as
+/// the DAH / UND / SWIBoot sites: with CPSR.E=1 in UND mode the LDR
+/// returns the byteswap of the byteswap-stored code word, which has
+/// bit 27 clear, sending the FPE down its fall-through chain to
+/// `UndefinedInstruction` instead of decoding the real FPA insn.
+///
+/// Patch shape: replace both LDR sites with conditional branches to
+/// a single stub that does `ldr fp, [r9]; rev fp, fp; b resume`.
+/// `LDR` uses kernel permissions instead of the original `LDRT`
+/// (USR-permissions), but Newton ROM code is always kernel-readable
+/// so this is equivalent in practice.
+const FPE_LDR_EQ_PC:        u32 = 0x0038_D930;
+const FPE_LDR_EQ_ORIG_INSN: u32 = 0x04B9_B000; // ldrteq fp, [r9], #0
+const FPE_LDR_NE_PC:        u32 = 0x0038_D934;
+const FPE_LDR_NE_ORIG_INSN: u32 = 0x1599_B000; // ldrne  fp, [r9]
+const FPE_LDR_RESUME_PC:    u32 = 0x0038_D938;
+
 /// Small helper to emit an ARM `B target` at `src_pc`.
 const fn arm_b(src_pc: u32, target: u32) -> u32 {
     let off_bytes = target.wrapping_sub(src_pc.wrapping_add(8)) as i32;
@@ -766,6 +795,15 @@ const fn arm_bl(src_pc: u32, target: u32) -> u32 {
     let off_bytes = target.wrapping_sub(src_pc.wrapping_add(8)) as i32;
     let off_words = (off_bytes / 4) as u32;
     0xEB00_0000 | (off_words & 0x00FF_FFFF)
+}
+
+/// Same as `arm_b` but with an explicit ARM condition field in the
+/// high nibble (e.g. `0x0` for EQ, `0x1` for NE). The condition
+/// replaces the AL=0xE that `arm_b` hard-codes.
+const fn arm_b_cond(src_pc: u32, target: u32, cond: u32) -> u32 {
+    let off_bytes = target.wrapping_sub(src_pc.wrapping_add(8)) as i32;
+    let off_words = (off_bytes / 4) as u32;
+    ((cond & 0xF) << 28) | 0x0A00_0000 | (off_words & 0x00FF_FFFF)
 }
 
 /// Apply Einstein's word-write patches to the byteswapped main ROM
@@ -871,8 +909,7 @@ pub unsafe fn apply_717006_patches(rom_ptr: *mut u32) {
         apply_real_clock_seconds_patch(rom_ptr);
         apply_ftime_in_seconds_patch(rom_ptr);
         apply_fdate_from_seconds_patch(rom_ptr);
-        apply_poweroff_reboot_trap(rom_ptr);
-        apply_reboot_trap(rom_ptr);
+        apply_loud_halt_traps(rom_ptr);
         apply_bootos_trap(rom_ptr);
         apply_resolve_fault_wrapper(rom_ptr);
         // `apply_new_stack_pad_wrapper` is NOT installed — the
@@ -902,6 +939,7 @@ pub unsafe fn apply_717006_patches(rom_ptr: *mut u32) {
 
     kprintln!("rom_patch: applied {} simple patches + 5 native-call/injection ROM patches + PowerOffAndReboot + Reboot + BootOS + ResolveFault-wrapper + L1[0xCD] probes + fault-handler LDR byteswap stubs", applied);
 }
+
 
 /// Install the HVC probes that survive past the BE-8 migration. Most
 /// of the iter-50..89 lazy-grow / heap / soup / textdecomp probes were
@@ -1163,6 +1201,18 @@ unsafe fn apply_fault_handler_ldr_byteswap_patches(rom_ptr: *mut u32) {
         arm_b(swiboot_dispatch_stub_pc + 0x08, SWIBOOT_DISPATCH_LDR_RESUME_PC),
     ];
 
+    // FPE prelude: target fp (= r11). Both 0x38d930 and 0x38d934 land
+    // here (one via BEQ, one via BNE), and both load fp from [r9].
+    //   +0x00 LDR fp, [r9]                e599_b000
+    //   +0x04 REV fp, fp                  e6bf_bf3b
+    //   +0x08 B   FPE_LDR_RESUME_PC       arm_b(...)
+    let fpe_stub_pc = alloc_patch_stub(3, "FPE prelude faulting-insn LDR byteswap");
+    let fpe_stub: [u32; 3] = [
+        0xE599_B000, // LDR fp, [r9]
+        0xE6BF_BF3B, // REV fp, fp
+        arm_b(fpe_stub_pc + 0x08, FPE_LDR_RESUME_PC),
+    ];
+
     unsafe {
         write_stub_words(rom_ptr, dah_stub_pc, &dah_stub);
         write_stub_words(rom_ptr, und_stub_pc, &und_stub);
@@ -1238,6 +1288,34 @@ unsafe fn apply_fault_handler_ldr_byteswap_patches(rom_ptr: *mut u32) {
             kprintln!(
                 "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (SWIBoot dispatch ldr r1,[r1,-4] → B stub @ {:#x}, byteswap)",
                 SWIBOOT_DISPATCH_LDR_PC, prev, insn, swiboot_dispatch_stub_pc,
+            );
+        }
+
+        // FPE prelude: two conditional sites (BEQ for USR-source,
+        // BNE for non-USR-source) both pointing at the same byteswap
+        // stub. Stub installed here; per-site B's installed below.
+        write_stub_words(rom_ptr, fpe_stub_pc, &fpe_stub);
+        for (pc, expected, cond, label) in [
+            (FPE_LDR_EQ_PC, FPE_LDR_EQ_ORIG_INSN, 0x0u32, "FPE ldrteq fp,[r9]"),
+            (FPE_LDR_NE_PC, FPE_LDR_NE_ORIG_INSN, 0x1u32, "FPE ldrne  fp,[r9]"),
+        ] {
+            let idx = (pc / 4) as usize;
+            let prev = rom_ptr.add(idx).read();
+            if prev != expected {
+                kprintln!(
+                    "rom_patch: ERROR — {} at {:#010x} is {:#010x}, expected {:#010x}; skipping byteswap branch",
+                    label, pc, prev, expected,
+                );
+                continue;
+            }
+            let insn = arm_b_cond(pc, fpe_stub_pc, cond);
+            crate::guest_mem::write_rom_code_word(rom_ptr, idx, insn);
+            record_original(pc, prev);
+            kprintln!(
+                "rom_patch: {:#010x}: {:#010x} -> {:#010x}  ({} → B{} stub @ {:#x}, byteswap)",
+                pc, prev, insn, label,
+                if cond == 0 { "EQ" } else { "NE" },
+                fpe_stub_pc,
             );
         }
     }
@@ -1512,42 +1590,30 @@ unsafe fn apply_fdate_from_seconds_patch(rom_ptr: *mut u32) {
     }
 }
 
-/// Replace the first word of `PowerOffAndReboot` (0x000E_6BBC) with a
-/// single `HVC #HvcImm::PowerOffReboot`. The handler in
-/// `trap::handle_hvc` dumps the calling context (R0 = reboot reason,
-/// LR via banked-reg path, mode, ELR) and halts — we never resume.
-/// This catches the boot-fail-and-reboot loop the FIRST time it fires
-/// instead of seeing 350k repeated tracer entries before timeout.
-unsafe fn apply_poweroff_reboot_trap(rom_ptr: *mut u32) {
-    let idx = (POWEROFF_REBOOT_PC / 4) as usize;
-    let insn = HvcImm::PowerOffReboot.insn();
-    unsafe {
-        let prev = rom_ptr.add(idx).read();
-        crate::guest_mem::write_rom_code_word(rom_ptr, idx, insn);
-        kprintln!(
-            "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (PowerOffAndReboot canary, HVC #{:#x})",
-            POWEROFF_REBOOT_PC, prev, insn, HvcImm::PowerOffReboot as u32,
-        );
-    }
-}
-
-/// Same canary pattern as `apply_poweroff_reboot_trap`, but for the
-/// soft-reboot path `Reboot(long, unsigned long, unsigned char)` at
-/// 0x000D_9884. UnhandledException → Reboot → ROMBoot is the loop the
-/// kernel falls into when an exception isn't caught (observed during
-/// StartupProtocolRegistry); catching here reports the reboot reason
-/// (R0) immediately rather than letting the second boot cycle mask
-/// it.
-unsafe fn apply_reboot_trap(rom_ptr: *mut u32) {
-    let idx = (REBOOT_PC / 4) as usize;
-    let insn = HvcImm::Reboot.insn();
-    unsafe {
-        let prev = rom_ptr.add(idx).read();
-        crate::guest_mem::write_rom_code_word(rom_ptr, idx, insn);
-        kprintln!(
-            "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (Reboot canary, HVC #{:#x})",
-            REBOOT_PC, prev, insn, HvcImm::Reboot as u32,
-        );
+/// Patch the first word of each of `PowerOffAndReboot` (0x000E_6BBC),
+/// `Reboot` (0x000D_9884), and `StopImage` (0x0038_D174) with a single
+/// `HVC #HvcImm::LoudHalt`. The handler in `trap::handle_hvc` dumps
+/// the calling context (R0..R3, mode, caller LR) and halts — we never
+/// resume. Catches the boot-fail-and-reboot loop AND the idle/sleep
+/// wait-for-wakeup spin the FIRST time either fires, instead of letting
+/// the run go on for tens of thousands of repeated tracer entries
+/// before timeout.
+unsafe fn apply_loud_halt_traps(rom_ptr: *mut u32) {
+    let insn = HvcImm::LoudHalt.insn();
+    for (pc, name) in [
+        (POWEROFF_REBOOT_PC, "PowerOffAndReboot"),
+        (REBOOT_PC, "Reboot"),
+        (STOP_IMAGE_PC, "StopImage"),
+    ] {
+        let idx = (pc / 4) as usize;
+        unsafe {
+            let prev = rom_ptr.add(idx).read();
+            crate::guest_mem::write_rom_code_word(rom_ptr, idx, insn);
+            kprintln!(
+                "rom_patch: {:#010x}: {:#010x} -> {:#010x}  ({} loud-halt, HVC #{:#x})",
+                pc, prev, insn, name, HvcImm::LoudHalt as u32,
+            );
+        }
     }
 }
 

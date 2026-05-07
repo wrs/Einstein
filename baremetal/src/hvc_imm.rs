@@ -81,10 +81,12 @@ pub enum HvcImm {
     /// the patched access has completed and we can resume the
     /// original (post-patched) PC.
     SbaRetry,
-    /// `PowerOffAndReboot` canary — kernel rebooting.
-    PowerOffReboot,
-    /// `Reboot` canary — kernel rebooting.
-    Reboot,
+    /// Loud-halt tripwire. Patched at the first instruction of
+    /// `Reboot`, `PowerOffAndReboot`, and `StopImage` — three sites
+    /// the kernel reaches when it's giving up or going idle. The
+    /// handler prints PC + r0..r3 + caller LR and halts the host;
+    /// the run terminates immediately instead of spinning.
+    LoudHalt,
     /// `BootOS` canary — first/2nd-entry detection.
     BootOs,
     /// `Remember` post-SWI fixup — re-establish r8 sentinel.

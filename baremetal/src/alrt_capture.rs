@@ -122,24 +122,6 @@ fn check_snapshot_diff() {
     }
 }
 
-/// Print the diagnostic counters. Called by the Reboot canary.
-pub fn dump_counters() {
-    kprintln!(
-        "alrt-capture summary: armed_pa={:#010x} traps={} out_of_window={} budget_remaining={}",
-        TARGET_PA.load(Ordering::Relaxed),
-        TOTAL_TRAPS.load(Ordering::Relaxed),
-        OUT_OF_WINDOW.load(Ordering::Relaxed),
-        BUDGET.load(Ordering::Relaxed),
-    );
-    kprintln!(
-        "pa-emul summary: emulated={} unrecognized={} skipped={}",
-        crate::pa_emulate::EMULATED.load(Ordering::Relaxed),
-        crate::pa_emulate::UNRECOGNIZED.load(Ordering::Relaxed),
-        crate::pa_emulate::SKIPPED.load(Ordering::Relaxed),
-    );
-    crate::pa_emulate::dump_pc_table();
-}
-
 /// Per-page log budget. The page lives in the kernel's task-globals /
 /// stack region, so it sees a lot of legitimate writes too. With
 /// boot-time arming we capture everything from cold boot through the

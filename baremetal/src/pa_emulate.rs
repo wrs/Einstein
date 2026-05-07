@@ -192,53 +192,6 @@ fn note_pc_scan_after_race(pc: u32) {
     PC_OVERFLOW.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Dump the PC frequency table, sorted by count descending. Called
-/// from the alrt_capture summary at the Reboot canary.
-pub fn dump_pc_table() {
-    // Snapshot first to a small local array (no heap, no alloc).
-    let mut snap: [(u32, u32); PC_TABLE_SLOTS] = [(0u32, 0u32); PC_TABLE_SLOTS];
-    let mut n = 0usize;
-    for slot in &PC_TABLE {
-        let pc = slot.pc.load(Ordering::Relaxed);
-        let count = slot.count.load(Ordering::Relaxed);
-        if pc != 0 {
-            snap[n] = (pc, count);
-            n += 1;
-        }
-    }
-    // Insertion-sort by count descending (n is small).
-    for i in 1..n {
-        let key = snap[i];
-        let mut j = i;
-        while j > 0 && snap[j - 1].1 < key.1 {
-            snap[j] = snap[j - 1];
-            j -= 1;
-        }
-        snap[j] = key;
-    }
-    kprintln!("pa-emul writer-PC frequency (top hits in watch window):");
-    for &(pc, count) in &snap[..n] {
-        let label = pc_label(pc);
-        kprintln!("    PC={:#010x}  count={:6}  {}", pc, count, label);
-    }
-    let overflow = PC_OVERFLOW.load(Ordering::Relaxed);
-    if overflow != 0 {
-        kprintln!("    (table overflow: {} writes from {} additional PCs)",
-            overflow, "untracked");
-    }
-}
-
-fn pc_label(pc: u32) -> &'static str {
-    match pc {
-        0x00018ddc => "kernel zero-fill loop (boot-init)",
-        0x00019a84 | 0x00019ac0 | 0x00019af0 => "kernel poison-fill loop (boot-init)",
-        0x00310850 => "SetFreeChain prologue push",
-        0x003121b0 => "MoveFreeBlock prologue push",
-        0x003940b4 => "LowLevelCopyEngineLong memcpy",
-        _ => "?",
-    }
-}
-
 static CORRUPTION_LOG_BUDGET: AtomicU32 = AtomicU32::new(64);
 
 fn resolve_pa(va: u32) -> Option<u32> {

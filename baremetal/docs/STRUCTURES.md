@@ -1571,6 +1571,214 @@ positions cross-checked against `newton-objects/src/lib.rs::flags`.
 
 ---
 
+## REx container format (Einstein.rex)
+
+The Einstein REx loads at guest PA `0x00800000` and hosts the
+Newton-side support code that ships in RAM rather than mask ROM. At
+the container layer it's a small TOC followed by a heterogeneous
+mix of class-info structs, embedded NewtonOS packages, and
+configuration entries. All multi-byte fields are big-endian on
+disk (matching the Newton's BE-32 view); the classifier loads the
+file into a `[u32]` via `u32::from_be_bytes` so the indices below
+are word-relative against that LE view.
+
+### `RExBlock` header
+
+At REx PA `0x00800000`:
+
+```text
+  +0x00  "RExBlock"  magic (8 bytes: 0x52457842 'RExB' / 0x6c6f636b 'lock')
+  +0x08  checksum            (u32)
+  +0x0C  header version      (u32, =1)
+  +0x10  manufacturer        (u32, e.g. 'Eins')
+  +0x14  REx ID              (u32)
+  +0x18  block size          (u32)
+  +0x1C  unknown             (u32)
+  +0x20  nominal load PA     (u32, =0x00800000)
+  +0x24  numEntries          (u32)
+  +0x28  entries[numEntries] of {
+             tag:    u32,    // FOURCC
+             offset: u32,    // REx-relative byte offset
+             size:   u32,    // bytes
+         }
+```
+
+Add `REX_PA_OFFSET` (= `0x00800000`) to a `tag.offset` to get the
+absolute guest PA of the entry's data. Citation:
+`tools/classify-rom/src/main.rs::rex_header_roots` parses this and
+clamps `numEntries` at 64 for safety.
+
+### Entry tags seen in Einstein.rex
+
+| Tag      | Meaning                                                     | Classifier handling |
+|----------|-------------------------------------------------------------|---------------------|
+| `'fdrv'` | 8-byte config: `{ version, classInfoPA }`                   | No-op — `collect_classinfo_roots` walks the FDRV struct directly. |
+| `'FDRV'` | TClassInfo for a flash driver class                         | No-op for the same reason. The trampoline shape `sub r0, pc, #68; mov pc, lr` at the tail of the struct seeds btbl + monent + per-method branch slots. |
+| `'pkgl'` | Embedded package list — one or more NewtonOS packages back-to-back | `walk_pkgl_relocation_roots` parses each package, then `walk_package_relocation_table` for relocatable ones. |
+
+The previous "scan every word of an FDRV slot for fnptr-shaped
+values" heuristic was removed in iter-105: it added 8 spurious seeds
+in Einstein.rex (small SRO/version/flag integers like `0x4`, `0x10`,
+`0x14`, `0x1c` that happen to land on B-AL exception-vector words)
+and zero real method roots.
+
+### NewtonOS package layout
+
+Each entry of a `'pkgl'` block is a NewtonOS package, word-aligned,
+header in BE on disk:
+
+```text
+  +0x00  magic               "package0" or "package1"  (8 bytes)
+                             // word-pair: 0x7061636b 'pack', then
+                             // 0x61676530 'age0' or 0x61676531 'age1'.
+                             // 'age1' = NOS1-incompatible features.
+  +0x08  packageID           (u32)
+  +0x0C  packageFlags        (u32; kDirRelocationFlag = 0x04000000)
+  +0x10  version             (u32)
+  +0x14  copyrightOffset     (u16)
+  +0x16  copyrightLength     (u16)
+  +0x18  nameOffset          (u16)
+  +0x1A  nameLength          (u16)
+  +0x1C  totalSize           (u32 — directory + relocation + parts)
+  +0x20  creationDate        (u32)
+  +0x24  reserved1           (u32)
+  +0x28  reserved2           (u32)
+  +0x2C  directorySize       (u32 — bytes from package start through end of dir)
+  +0x30  numParts            (u32)
+  +0x34  parts[numParts] of SPartEntry (32 bytes each, see below)
+   ...   directory variable-length data (strings + part info blobs)
+   ...   relocation block (only when kDirRelocationFlag is set)
+   ...   part data
+```
+
+`SPartEntry` (32 bytes, `DCL/DCL/Package/TDCLPackage.h::SPartEntry`):
+
+```text
+  +0x00  fOffset      (u32 — byte offset from start of part data)
+  +0x04  fSize        (u32)
+  +0x08  fSize2       (u32 — copy of fSize)
+  +0x0C  fType        (u32 — FOURCC; see below)
+  +0x10  fReserved1   (u32 — 0)
+  +0x14  fFlags       (u32 — kPartProtocolPart=0, kPartNOSPart=1, kPartRawPart=2 in low 2 bits, plus auto-load/remove/copy flags)
+  +0x18  fInfo        (8 bytes — handed to the part manager on activation)
+  +0x20  fReserved2   (u32 — 0)
+```
+
+NOS parts (`fFlags & 3 == 1`) carry an NS object soup using the
+same `ObjHeader` layout documented in [NS object headers](#ns-object-headers-heap-layout)
+above; the `newton-objects` crate parses them.
+
+### Per-package relocation table
+
+Present iff `packageFlags & kDirRelocationFlag (0x04000000)` is
+set. Starts at `pkg_pa + directorySize` (NOT a separate offset):
+
+```text
+  +0x00  reserved          (u32)
+  +0x04  relocationSize    (u32 — bytes of the whole reloc block)
+  +0x08  pageSize          (u32 — = 0x400 in practice)
+  +0x0C  numEntries        (u32 — number of SPackageRelocationSet runs)
+  +0x10  baseAddress       (u32 — informational; 0 in Einstein.rex,
+                            since DCL writes pointers already
+                            absolute against the load address)
+  +0x14  sets[numEntries]:
+             pageNumber   (u16)
+             offsetCount  (u16)
+             offsets[offsetCount]   (u8 each, packed; runs of sets
+                                     are NOT padded between, only the
+                                     reloc block as a whole is word-
+                                     aligned at the next part)
+```
+
+Each `(pageNumber, offsetByte)` pair decodes to a package-relative
+slot address:
+
+```text
+  reloc_addr = (pageNumber << 10) | (offsetByte << 2)
+  slot_pa    = pkg_pa + reloc_addr
+```
+
+The 32-bit value at `slot_pa` is a pointer the kernel rewrites at
+load time. Classify-rom reads each slot, treats the value as a VA,
+runs `va_to_pa`, and seeds the target as a worklist root if its
+first word is function-start-shaped.
+
+Concrete impact in Einstein.rex (iter-105): 16 packages, 4
+relocatable, 6 relocation slots total. One slot at REx PA
+`0x00800df4` holds the function pointer `0x00800968` — a 2-instr
+stub `ldr r0, [r0]; b 0x800904` that nothing in ROM/REx code BLs
+directly, only reachable through the package's vtable that the
+relocation table describes. Without the seeder, that target
+stayed un-byteswapped at load time and the guest's ERET to it
+fetched garbage.
+
+### Embedded NS object soup — `BinCFunction` native code
+
+A NOS part's object soup can carry **executable ARM code** as the
+binary value of a `code` slot inside a frame whose `class` slot is
+the symbol `'BinCFunction`. Example shape:
+
+```text
+{ class:   'BinCFunction,
+  numArgs: 2,
+  offset:  0,                // entry-point byte offset within `code`
+  code:    <binary class='nativeModule size=13216 bytes at 0x00804738>
+            [ ea 00 00 86  ea 00 00 8c  ea 00 03 88  ... ] }
+```
+
+The bytes are **BE-encoded ARM instructions** (e.g. `ea 00 00 86`
+= `B +0x218` when read as a BE u32). The class symbol on the
+binary itself varies (`'nativeModule`, `'code`, etc.) and is **not**
+the marker — the trigger is the **enclosing frame's `class` slot
+being the symbol `BinCFunction`**.
+
+#### Why the classifier must care
+
+The hypervisor byteswaps every ROM/REx word that
+`reach.bitmap` marks as code (`src/guest_mem.rs::rom_word_is_code`
++ `src/guest_endian.rs`); data words stay BE on the backing store.
+Native code embedded in a `BinCFunction.code` binary lives in the
+`'pkgl'` part data and the relocation table doesn't list its
+internal words — there's nothing to relocate, the code is
+self-contained position-independent ARM. So those words
+default to "data", stay BE in physical memory, and a guest
+LE fetch of `ea 00 00 86` returns `0x860000ea`, which decodes
+to garbage.
+
+#### What the classifier needs to do
+
+When walking each package in `walk_pkgl_relocation_roots`:
+
+1. Identify NOS parts (`fFlags & kPartTypeMask == kPartNOSPart`).
+2. Use `newton-objects` to parse the part's object soup.
+3. For every frame whose `class` slot resolves to the symbol
+   `BinCFunction`:
+   - Read the `code` slot — a binary object.
+   - Compute the binary's data range
+     (`obj_pa + 12` through `obj_pa + size`; see
+     [NS object headers](#ns-object-headers-heap-layout) for the
+     8-byte `ObjHeader` + 4-byte class Ref preamble).
+   - Mark every 32-bit-aligned word in that range as code in the
+     reach bitmap. Optionally also seed `code_pa + offset` as a
+     worklist root for the symbolic disassembly.
+4. Don't seed the binary words themselves as walker roots — the
+   bytes are pure code without an APCS prologue at every word, and
+   running the walker over them will mis-classify `B`-target
+   literals as branch destinations. Marking them as code in the
+   bitmap (so the loader byteswaps them) is sufficient; the
+   `offset` slot is the only call entry the kernel uses.
+
+References:
+- `Toolkit/SampleScripts/NativeFunction.ns` — canonical user-visible
+  example of how `'BinCFunction` frames are written.
+- `Toolkit/TToolkitScriptExt.cpp::NewtMakeBinaryFromARM` — produces
+  the binary blob from inline assembly.
+- `DCL/Sample_Code/ToolchainUtils/ELFtoNTK.cpp::ParseELF` — emits
+  the same shape from a compiled ELF (`code` slot = whole image,
+  `entryPoints[].offset` = symbol address minus `baseVAddr`).
+
+---
+
 ## See also
 
 - `INVESTIGATION.md` — live wedge debugging notes

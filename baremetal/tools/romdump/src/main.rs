@@ -152,7 +152,7 @@ fn main() -> ExitCode {
         seen: HashSet::new(),
         out: String::new(),
     };
-    p.dump_object(root, 0);
+    p.dump_object(root, 0, "");
     print!("{}", p.out);
     ExitCode::SUCCESS
 }
@@ -315,63 +315,86 @@ struct Printer<'a> {
 }
 
 impl<'a> Printer<'a> {
-    fn dump_ref(&mut self, r: Ref, indent: usize) {
+    /// `suffix` is text the caller wants appended in slot-trailer position
+    /// (typically "," for non-last slots, "" otherwise). Most paths emit it
+    /// at the very end, but the binary hex-dump fallback inserts it between
+    /// the closing `]` and the trailing `// ascii` comment.
+    fn dump_ref(&mut self, r: Ref, indent: usize, suffix: &str) {
         match r.kind() {
-            RefKind::Integer(i) => self.out.push_str(&format!("{i}")),
+            RefKind::Integer(i) => self.out.push_str(&format!("{i}{suffix}")),
             RefKind::Character(c) => match char::from_u32(c as u32) {
-                Some(ch) if !ch.is_control() => self.out.push_str(&format!("$\\u{:04X} ('{ch}')", c)),
-                _ => self.out.push_str(&format!("$\\u{:04X}", c)),
+                Some(ch) if !ch.is_control() => {
+                    self.out.push_str(&format!("$\\u{:04X} ('{ch}'){suffix}", c))
+                }
+                _ => self.out.push_str(&format!("$\\u{:04X}{suffix}", c)),
             },
-            RefKind::Special(_) if r.is_nil() => self.out.push_str("NIL"),
-            RefKind::Special(s) if r == Ref::TRUE => self.out.push_str(&format!("TRUE /* 0x{s:x} */")),
-            RefKind::Special(s) => self.out.push_str(&format!("<special 0x{s:x}>")),
+            RefKind::Special(_) if r.is_nil() => {
+                self.out.push_str("NIL");
+                self.out.push_str(suffix);
+            }
+            RefKind::Special(s) if r == Ref::TRUE => self
+                .out
+                .push_str(&format!("TRUE /* 0x{s:x} */{suffix}")),
+            RefKind::Special(s) => self
+                .out
+                .push_str(&format!("<special 0x{s:x}>{suffix}")),
             RefKind::MagicPointer { table, index } => {
-                self.out.push_str(&format!("@{table}.{index}"));
+                self.out.push_str(&format!("@{table}.{index}{suffix}"));
             }
             RefKind::Pointer(off) => {
                 // Symbols always inline regardless of depth.
                 if let Ok(Object::Binary(b)) = self.heap.object_at(off) {
                     if let Some(sym) = b.as_symbol() {
                         self.dump_symbol_inline(sym);
+                        self.out.push_str(suffix);
                         return;
                     }
                 }
                 if self.depth_left == 0 {
                     self.out
-                        .push_str(&format!("<...at 0x{:08x}>", off));
+                        .push_str(&format!("<...at 0x{:08x}>{suffix}", off));
                     return;
                 }
                 self.depth_left -= 1;
                 match self.heap.object_at(off) {
-                    Ok(obj) => self.dump_object(obj, indent),
-                    Err(e) => self.out.push_str(&format!("<bad-ref 0x{:08x}: {e}>", off)),
+                    Ok(obj) => self.dump_object(obj, indent, suffix),
+                    Err(e) => self
+                        .out
+                        .push_str(&format!("<bad-ref 0x{:08x}: {e}>{suffix}", off)),
                 }
                 self.depth_left += 1;
             }
         }
     }
 
-    fn dump_object(&mut self, obj: Object<'a>, indent: usize) {
+    fn dump_object(&mut self, obj: Object<'a>, indent: usize, suffix: &str) {
         // Symbol roots inline; otherwise dispatch by kind. Depth control
         // lives in dump_ref so that the root passed in here always renders
         // in full — descents from a Ref consume the depth budget.
         if let Object::Binary(b) = obj {
             if let Some(sym) = b.as_symbol() {
                 self.dump_symbol_inline(sym);
+                self.out.push_str(suffix);
                 return;
             }
         }
 
         if !self.seen.insert(obj.offset()) {
             self.out
-                .push_str(&format!("<cycle to 0x{:08x}>", obj.offset()));
+                .push_str(&format!("<cycle to 0x{:08x}>{suffix}", obj.offset()));
             return;
         }
 
         match obj {
-            Object::Binary(b) => self.dump_binary(b, indent),
-            Object::Array(a) => self.dump_array(a, indent),
-            Object::Frame(f) => self.dump_frame(f, indent),
+            Object::Binary(b) => self.dump_binary(b, indent, suffix),
+            Object::Array(a) => {
+                self.dump_array(a, indent);
+                self.out.push_str(suffix);
+            }
+            Object::Frame(f) => {
+                self.dump_frame(f, indent);
+                self.out.push_str(suffix);
+            }
         }
     }
 
@@ -384,7 +407,7 @@ impl<'a> Printer<'a> {
         }
     }
 
-    fn dump_binary(&mut self, b: Binary<'a>, indent: usize) {
+    fn dump_binary(&mut self, b: Binary<'a>, _indent: usize, suffix: &str) {
         let class = b.class();
         // Recognise a few well-known classes for friendlier output.
         if self.is_class_named(class, "string") {
@@ -392,12 +415,14 @@ impl<'a> Printer<'a> {
             self.out.push_str(&decode_string(b));
             self.out
                 .push_str(&format!("\" // string at 0x{:08x}", b.offset()));
+            self.out.push_str(suffix);
             return;
         }
         if class == SYMBOL_CLASS {
             // Already handled above, but keep this branch for completeness.
             if let Some(sym) = b.as_symbol() {
                 self.dump_symbol_inline(sym);
+                self.out.push_str(suffix);
                 return;
             }
         }
@@ -405,33 +430,112 @@ impl<'a> Printer<'a> {
             if let Some(v) = b.as_real() {
                 self.out
                     .push_str(&format!("{v} // real at 0x{:08x}", b.offset()));
+                self.out.push_str(suffix);
                 return;
             }
         }
 
-        // Fallback: hex-dump the data.
+        self.dump_binary_fallback(b, suffix);
+    }
+
+    /// Hex+ASCII layout for the fallback (non-string/real/symbol) binary case.
+    /// Bytes are shown in 4-byte groups, two groups (8 bytes) per line.
+    /// `suffix` (typically "," for slot context) is inserted between the
+    /// closing `]` and the trailing `// ascii` comment so slot punctuation
+    /// reads as `[hex hex], // ascii` rather than after the comment.
+    /// On multi-line output, continuation lines are aligned under the
+    /// first line's `[` and padded so all `//` columns line up.
+    fn dump_binary_fallback(&mut self, b: Binary<'a>, suffix: &str) {
         let data = b.data();
-        let shown = data.len().min(self.max_bytes);
-        self.out.push_str(&format!(
-            "<binary class="
-        ));
-        self.dump_ref(class, indent);
-        self.out.push_str(&format!(
-            " size={} bytes at 0x{:08x}> [",
-            data.len(),
-            b.offset()
-        ));
-        for (i, byte) in data[..shown].iter().enumerate() {
-            if i > 0 {
-                self.out.push(' ');
+        let total = data.len();
+        let cap = self.max_bytes;
+        let shown = total.min(cap);
+        let truncated = shown < total;
+        let bytes = &data[..shown];
+
+        if shown == 0 {
+            self.out.push_str(&format!("[]{suffix}"));
+            if truncated {
+                self.out.push_str(&format!(" // ({} more)", total - shown));
             }
-            self.out.push_str(&format!("{byte:02x}"));
+            return;
         }
-        if shown < data.len() {
-            self.out
-                .push_str(&format!(" ... ({} more)", data.len() - shown));
+
+        const PER_LINE: usize = 8;
+        let n_lines = shown.div_ceil(PER_LINE);
+        let bracket_col = self.current_column();
+
+        for line_idx in 0..n_lines {
+            let off = line_idx * PER_LINE;
+            let chunk = &bytes[off..(off + PER_LINE).min(shown)];
+            let is_last = line_idx + 1 == n_lines;
+
+            if line_idx == 0 {
+                self.out.push('[');
+            } else {
+                for _ in 0..bracket_col {
+                    self.out.push(' ');
+                }
+                self.out.push(' '); // align under `[`
+            }
+
+            // Hex: two 4-byte groups, padding missing bytes with two spaces
+            // so widths match across lines.
+            for grp in 0..2 {
+                if grp > 0 {
+                    self.out.push(' ');
+                }
+                for byte_idx in 0..4 {
+                    let abs_idx = grp * 4 + byte_idx;
+                    if abs_idx < chunk.len() {
+                        self.out.push_str(&format!("{:02x}", chunk[abs_idx]));
+                    } else {
+                        self.out.push_str("  ");
+                    }
+                }
+            }
+
+            // Last line gets `]` + suffix + ` ` before the comment;
+            // continuation lines pad to the same width so all `//` align.
+            if is_last {
+                self.out.push(']');
+                self.out.push_str(suffix);
+                self.out.push(' ');
+            } else {
+                for _ in 0..(2 + suffix.len()) {
+                    self.out.push(' ');
+                }
+            }
+
+            self.out.push_str("// ");
+            for grp in 0..2 {
+                if grp > 0 {
+                    self.out.push(' ');
+                }
+                for byte_idx in 0..4 {
+                    let abs_idx = grp * 4 + byte_idx;
+                    if abs_idx < chunk.len() {
+                        let byte = chunk[abs_idx];
+                        if (0x20..=0x7e).contains(&byte) {
+                            self.out.push(byte as char);
+                        } else {
+                            self.out.push('.');
+                        }
+                    } else {
+                        self.out.push(' ');
+                    }
+                }
+            }
+
+            if is_last && truncated {
+                self.out
+                    .push_str(&format!(" ... ({} more)", total - shown));
+            }
+
+            if !is_last {
+                self.out.push('\n');
+            }
         }
-        self.out.push(']');
     }
 
     fn dump_array(&mut self, a: Array<'a>, indent: usize) {
@@ -449,15 +553,13 @@ impl<'a> Printer<'a> {
         let class = a.class();
         if !class.is_nil() {
             self.out.push_str(", class=");
-            self.dump_ref(class, indent);
+            self.dump_ref(class, indent, "");
         }
         self.out.push('\n');
         for (i, slot) in a.iter().enumerate() {
             self.indent(indent + 2);
-            self.dump_ref(slot, indent + 2);
-            if i + 1 < len {
-                self.out.push(',');
-            }
+            let suffix = if i + 1 < len { "," } else { "" };
+            self.dump_ref(slot, indent + 2, suffix);
             self.out.push('\n');
         }
         self.indent(indent);
@@ -484,10 +586,8 @@ impl<'a> Printer<'a> {
                 },
                 None => self.out.push_str(&format!("<slot{i}>: ")),
             }
-            self.dump_ref(slot, indent + 2);
-            if i + 1 < len {
-                self.out.push(',');
-            }
+            let suffix = if i + 1 < len { "," } else { "" };
+            self.dump_ref(slot, indent + 2, suffix);
             self.out.push('\n');
         }
         self.indent(indent);
@@ -498,6 +598,11 @@ impl<'a> Printer<'a> {
         for _ in 0..n {
             self.out.push(' ');
         }
+    }
+
+    fn current_column(&self) -> usize {
+        let after_newline = self.out.rfind('\n').map_or(0, |p| p + 1);
+        self.out.len() - after_newline
     }
 
     /// Returns true if `class` is a pointer Ref to a symbol whose name

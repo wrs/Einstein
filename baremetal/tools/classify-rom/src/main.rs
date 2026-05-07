@@ -76,11 +76,20 @@ fn fnv1a_32(bytes: &[u8], seed: u32) -> u32 {
     h
 }
 
-/// Load ROM (8 MiB) + REX (up to 8 MiB) into a 16 MiB little-endian word view.
+/// Load ROM (8 MiB) + REX (up to 8 MiB) into a 16 MiB little-endian word view
+/// AND a 16 MiB raw-byte view that preserves the original on-disk byte order.
 /// Each on-disk word is stored MSB-first; `from_be_bytes` yields that word
 /// directly as a host u32 (the value the ARM guest reads at that PC in LE
 /// mode). See baremetal/src/guest_mem.rs:509-519 for the reference byteswap.
-fn load_rom_and_rex(rom_path: &Path, rex_path: &Path) -> Result<(Vec<u32>, u32), String> {
+///
+/// The raw-byte view is needed by NS-soup parsing (`newton-objects::Heap`
+/// reads BE bytes via `from_be_bytes` and would double-swap if fed the
+/// already-swapped word view). Bytes outside the loaded ROM/REX windows
+/// are zeroed.
+fn load_rom_and_rex(
+    rom_path: &Path,
+    rex_path: &Path,
+) -> Result<(Vec<u32>, Vec<u8>, u32), String> {
     let rom = fs::read(rom_path).map_err(|e| format!("read {}: {}", rom_path.display(), e))?;
     let rex = fs::read(rex_path).map_err(|e| format!("read {}: {}", rex_path.display(), e))?;
 
@@ -104,7 +113,11 @@ fn load_rom_and_rex(rom_path: &Path, rex_path: &Path) -> Result<(Vec<u32>, u32),
         words[rex_word_base + i] = u32::from_be_bytes([rex[o], rex[o + 1], rex[o + 2], rex[o + 3]]);
     }
 
-    Ok((words, hash))
+    let mut raw = vec![0u8; ROM_SIZE_BYTES];
+    raw[..rom.len()].copy_from_slice(&rom);
+    raw[REX_PA_OFFSET..REX_PA_OFFSET + rex.len()].copy_from_slice(&rex);
+
+    Ok((words, raw, hash))
 }
 
 /// Counters returned by `load_symbol_roots` so `run()` can surface
@@ -303,7 +316,11 @@ fn load_symbol_roots(
 ///
 /// Offsets inside the entry table are REx-relative (i.e. add
 /// `REX_PA_OFFSET` to get an absolute PA).
-fn rex_header_roots(words: &[u32], stats: &mut WalkStats) -> Vec<(u32, SeedSource)> {
+fn rex_header_roots(
+    words: &[u32],
+    raw_bytes: &[u8],
+    stats: &mut WalkStats,
+) -> Vec<(u32, SeedSource)> {
     let mut out: Vec<(u32, SeedSource)> = Vec::new();
     let rex_base_w = REX_PA_OFFSET / 4;
     if rex_base_w + 10 >= ROM_WORD_COUNT { return out; }
@@ -358,7 +375,9 @@ fn rex_header_roots(words: &[u32], stats: &mut WalkStats) -> Vec<(u32, SeedSourc
             // existing shape-based collectors (LDR-pc thunk runs,
             // B-runs, classinfo trampolines, etc.).
             0x706b_676c => {
-                walk_pkgl_relocation_roots(words, data_pa, data_end, &mut out, stats);
+                walk_pkgl_relocation_roots(
+                    words, raw_bytes, data_pa, data_end, &mut out, stats,
+                );
             }
             _ => {}
         }
@@ -411,6 +430,7 @@ fn rex_header_roots(words: &[u32], stats: &mut WalkStats) -> Vec<(u32, SeedSourc
 ///     ... part data
 fn walk_pkgl_relocation_roots(
     words: &[u32],
+    raw_bytes: &[u8],
     pkgl_pa_start: u32,
     pkgl_pa_end: u32,
     out: &mut Vec<(u32, SeedSource)>,
@@ -450,12 +470,28 @@ fn walk_pkgl_relocation_roots(
             pa += 4;
             continue;
         }
-        if flags & RELOC_FLAG != 0 {
+        let reloc_size = if flags & RELOC_FLAG != 0 {
             stats.pkgl_relocatable_packages += 1;
             walk_package_relocation_table(
                 words, pa, dir_size, out, stats,
             );
-        }
+            // Header word at pkg_pa + dir_size + 4 = relocationSize.
+            let rb = ((pa.wrapping_add(dir_size)) >> 2) as usize;
+            words.get(rb + 1).copied().unwrap_or(0)
+        } else {
+            0
+        };
+        // Walk the part directory and parse NOS parts as NS object soup,
+        // looking for `BinCFunction` frames whose `code` slot binary
+        // holds embedded ARM code. Seed each entry point as a worklist
+        // root so the walker can reach it; the bitmap-marking side
+        // effect is what makes the load-time byteswap cover those words.
+        let part_data_start = pa
+            .wrapping_add(dir_size)
+            .wrapping_add(reloc_size);
+        seed_bincfunction_entries_in_package(
+            words, raw_bytes, pa, pkg_size, part_data_start, out, stats,
+        );
         pa += pkg_size;
         pa = (pa + 3) & !3;
     }
@@ -521,6 +557,139 @@ fn walk_package_relocation_table(
         byte_pos += off_count;
         // Pad offset bytes to 4-byte alignment.
         byte_pos += (4 - (off_count & 3)) & 3;
+    }
+}
+
+/// Walk one package's part directory; for every NOS part (fFlags low 2
+/// bits == kPartNOSPart=1) parse the part bytes as a NewtonScript object
+/// soup and seed the entry point of each `BinCFunction` frame found.
+///
+/// A `BinCFunction` is a frame whose `class` slot is the symbol
+/// `'BinCFunction`; its `code` slot is a binary holding BE-encoded ARM
+/// instructions, and the call entry sits at `code_data + offset`. The
+/// binary's own class symbol is irrelevant (`'nativeModule`, `'code`,
+/// etc. are all valid). Without seeding, those bytes default to data
+/// in the reach bitmap, the load-time byteswap doesn't touch them, and
+/// the guest's BL into the entry fetches garbage.
+///
+/// `pkg_pa` is the package's start (used as the load-address base for
+/// pointer-Ref resolution — Einstein.rex packages are written with
+/// pointers absolute against pkg_pa). `pkg_size` and `part_data_start`
+/// bound the slice handed to the NS parser.
+///
+/// Per-frame entries are pushed individually; the walker handles fan-
+/// out from there, treating the entry like any function-start root.
+fn seed_bincfunction_entries_in_package(
+    words: &[u32],
+    raw_bytes: &[u8],
+    pkg_pa: u32,
+    pkg_size: u32,
+    part_data_start: u32,
+    out: &mut Vec<(u32, SeedSource)>,
+    stats: &mut WalkStats,
+) {
+    use newton_objects::{Heap, Object, RefKind};
+
+    const PART_TYPE_MASK: u32 = 0x0000_0003;
+    const PART_NOS: u32 = 0x0000_0001;
+
+    let pkg_w = (pkg_pa >> 2) as usize;
+    if pkg_w + 13 >= ROM_WORD_COUNT { return; }
+    let num_parts = words[pkg_w + 12] as usize;
+    // Sanity clamp — package directories above this are malformed by
+    // any reasonable measure.
+    if num_parts > 64 { return; }
+
+    let pkg_end = pkg_pa.saturating_add(pkg_size);
+    let pkg_slice_end = (pkg_end as usize).min(raw_bytes.len());
+    let pkg_slice = &raw_bytes[pkg_pa as usize..pkg_slice_end];
+
+    // SPartEntry layout (32 bytes):
+    //   +0x00 fOffset, +0x04 fSize, +0x08 fSize2, +0x0C fType,
+    //   +0x10 fReserved1, +0x14 fFlags, +0x18 fInfo (8B), +0x20 reserved.
+    // Directory starts at pkg_pa + 0x34; each entry is 8 words.
+    for p in 0..num_parts {
+        let base_w = pkg_w + 13 + p * 8;
+        if base_w + 7 >= ROM_WORD_COUNT { break; }
+        let f_offset = words[base_w];
+        let f_size = words[base_w + 1];
+        let f_flags = words[base_w + 5];
+        if f_flags & PART_TYPE_MASK != PART_NOS { continue; }
+
+        let part_pa = part_data_start.wrapping_add(f_offset);
+        let part_end = part_pa.saturating_add(f_size);
+        if part_pa < pkg_pa || part_end > pkg_end { continue; }
+
+        // Soup pointer Refs are absolute against the package load
+        // address, so build the heap over the whole package's bytes
+        // with load_addr = pkg_pa, then iterate from the part's
+        // address. Einstein.rex parts use 8-byte object alignment
+        // (4-byte padding shows up between adjacent objects whose
+        // logical size is 4-byte but not 8-byte aligned, e.g. the
+        // 28-byte map → 4 bytes of zero padding → next object at +32).
+        let heap = Heap::with_load_addr(pkg_slice, pkg_pa);
+        let mut walked = false;
+        for item in heap.iter_from(part_pa, 8) {
+            let (obj_pa, obj) = match item {
+                Ok(x) => x,
+                Err(_) => break,
+            };
+            walked = true;
+            if obj_pa >= part_end { break; }
+            let frame = match obj {
+                Object::Frame(f) => f,
+                _ => continue,
+            };
+            // Class slot lookup. `class` may not be present (frames
+            // without explicit class fall back to NIL); skip those.
+            let class_ref = match frame.lookup("class") {
+                Some(r) => r,
+                None => continue,
+            };
+            let class_sym_name = heap
+                .deref(class_ref)
+                .ok()
+                .and_then(|o| o.as_binary().ok())
+                .and_then(|b| b.as_symbol())
+                .and_then(|s| s.name().ok());
+            if class_sym_name != Some("BinCFunction") { continue; }
+            stats.pkgl_bincfunction_frames += 1;
+
+            let code_bin = match frame
+                .lookup("code")
+                .and_then(|r| heap.deref(r).ok())
+                .and_then(|o| o.as_binary().ok())
+            {
+                Some(b) => b,
+                None => continue,
+            };
+            let offset = match frame.lookup("offset").map(|r| r.kind()) {
+                Some(RefKind::Integer(n)) if n >= 0 => n as u32,
+                // Missing or non-integer offset: assume 0, the canonical
+                // "entry at start of binary" form used by Toolkit
+                // BinCFunction examples.
+                None => 0,
+                _ => continue,
+            };
+
+            // The binary's data area starts at obj.offset() + 12
+            // (8-byte ObjHeader + 4-byte class Ref). The entry point
+            // sits at +offset bytes from there.
+            let code_data_pa = code_bin.offset().saturating_add(12);
+            let entry_pa = code_data_pa.saturating_add(offset);
+            // Sanity: entry must land inside the binary's data range.
+            let bin_end = code_bin.offset().saturating_add(code_bin.size());
+            if entry_pa < code_data_pa || entry_pa >= bin_end { continue; }
+            if entry_pa & 3 != 0 { continue; }
+
+            out.push((entry_pa, SeedSource::BinCFunction { frame_pa: obj_pa }));
+            stats.pkgl_bincfunction_roots_seeded += 1;
+        }
+        if walked {
+            stats.pkgl_nos_parts_walked += 1;
+        } else {
+            stats.pkgl_nos_parts_failed += 1;
+        }
     }
 }
 
@@ -917,6 +1086,12 @@ enum SeedSource {
     /// `slot_pa` is the PA of the 32-bit pointer slot; the value
     /// stored at `slot_pa` is the code address to seed.
     PkglRelocation { slot_pa: u32 },
+    /// `code` slot of a `{ class: 'BinCFunction, ... }` frame embedded
+    /// in a NOS part's NewtonScript object soup. `frame_pa` is the
+    /// frame object's header address; the seed is the entry-point
+    /// `code_data + offset` from that frame's `code` and `offset`
+    /// slots.
+    BinCFunction { frame_pa: u32 },
 }
 
 impl std::fmt::Debug for SeedSource {
@@ -939,6 +1114,7 @@ impl std::fmt::Debug for SeedSource {
             SeedSource::AltEntryAfterIpJump { trampoline_pc } => write!(f, "AltEntryAfterIpJump @ tramp 0x{trampoline_pc:08x}"),
             SeedSource::PcRelLdrThunkRun { entry_pa } => write!(f, "PcRelLdrThunkRun @ 0x{entry_pa:08x}"),
             SeedSource::PkglRelocation { slot_pa } => write!(f, "PkglRelocation @ slot 0x{slot_pa:08x}"),
+            SeedSource::BinCFunction { frame_pa } => write!(f, "BinCFunction @ frame 0x{frame_pa:08x}"),
         }
     }
 }
@@ -1420,6 +1596,16 @@ struct WalkStats {
     pkgl_relocatable_packages: usize,
     pkgl_relocation_slots_total: usize,
     pkgl_relocation_roots_seeded: usize,
+    /// NOS parts whose object soup parsed successfully end-to-end.
+    pkgl_nos_parts_walked: usize,
+    /// NOS parts whose soup parse errored before completion.
+    pkgl_nos_parts_failed: usize,
+    /// `{ class: 'BinCFunction, code: <bin>, offset: N }` frames found.
+    pkgl_bincfunction_frames: usize,
+    /// Frames above whose `code` + `offset` produced a valid in-package
+    /// entry-point address that was pushed to the worklist. May be less
+    /// than `pkgl_bincfunction_frames` if a frame is malformed.
+    pkgl_bincfunction_roots_seeded: usize,
     /// Words cleared from reach because they are the targets of
     /// `LDR Rt, [pc, #±imm12]` from inside reached code — i.e. literal
     /// pool entries. Under BE-8 these MUST be data: a guest LDR with
@@ -2647,7 +2833,7 @@ fn main() -> ExitCode {
 }
 
 fn run(args: Args) -> Result<(), String> {
-    let (words, hash) = load_rom_and_rex(&args.rom, &args.rex)?;
+    let (words, raw_bytes, hash) = load_rom_and_rex(&args.rom, &args.rex)?;
     let hash_str = format!("{:08x}", hash);
 
     let (sym_roots, sym_filter_stats) = load_symbol_roots(&args.symbols, &words)?;
@@ -2681,7 +2867,7 @@ fn run(args: Args) -> Result<(), String> {
     // relocation tables). Without these the walker has no way into
     // REx code at all, since the demangled-symbol file is ROM-only.
     let mut stats = WalkStats::default();
-    let rex_roots = rex_header_roots(&words, &mut stats);
+    let rex_roots = rex_header_roots(&words, &raw_bytes, &mut stats);
     let rex_header_root_count = rex_roots.len();
     for (p, src) in rex_roots {
         symbols.push((p, src));
@@ -2845,6 +3031,10 @@ fn run(args: Args) -> Result<(), String> {
     writeln!(f, "    pkgl relocatable packages:  {}", stats.pkgl_relocatable_packages).ok();
     writeln!(f, "    pkgl relocation slots:      {}", stats.pkgl_relocation_slots_total).ok();
     writeln!(f, "    pkgl relocation roots:      {}", stats.pkgl_relocation_roots_seeded).ok();
+    writeln!(f, "    pkgl NOS parts walked/fail: {}/{}",
+        stats.pkgl_nos_parts_walked, stats.pkgl_nos_parts_failed).ok();
+    writeln!(f, "    pkgl BinCFunction frames:   {}", stats.pkgl_bincfunction_frames).ok();
+    writeln!(f, "    pkgl BinCFunction roots:    {}", stats.pkgl_bincfunction_roots_seeded).ok();
     writeln!(f, "    total indirect roots added: {}", stats.indirect_roots_added).ok();
     writeln!(f, "    literal-pool words cleared: {}", stats.literal_targets_cleared).ok();
     writeln!(f, "    rom-soup walk-entries:     {}", stats.rom_soup_entries).ok();

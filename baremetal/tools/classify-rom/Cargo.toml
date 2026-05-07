@@ -13,6 +13,9 @@ description = "Host-side code-vs-data classifier for Newton 2.x ROM + Einstein.r
 name = "classify-rom"
 path = "src/main.rs"
 
+[dependencies]
+newton-objects = { path = "../../newton-objects" }
+
 [profile.release]
 lto = true
 codegen-units = 1

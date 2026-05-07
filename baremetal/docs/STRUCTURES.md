@@ -1730,43 +1730,15 @@ The bytes are **BE-encoded ARM instructions** (e.g. `ea 00 00 86`
 = `B +0x218` when read as a BE u32). The class symbol on the
 binary itself varies (`'nativeModule`, `'code`, etc.) and is **not**
 the marker — the trigger is the **enclosing frame's `class` slot
-being the symbol `BinCFunction`**.
+being the symbol `BinCFunction`**. The single call entry is at
+`code_pa + offset`.
 
-#### Why the classifier must care
-
-The hypervisor byteswaps every ROM/REx word that
-`reach.bitmap` marks as code (`src/guest_mem.rs::rom_word_is_code`
-+ `src/guest_endian.rs`); data words stay BE on the backing store.
-Native code embedded in a `BinCFunction.code` binary lives in the
-`'pkgl'` part data and the relocation table doesn't list its
-internal words — there's nothing to relocate, the code is
-self-contained position-independent ARM. So those words
-default to "data", stay BE in physical memory, and a guest
-LE fetch of `ea 00 00 86` returns `0x860000ea`, which decodes
-to garbage.
-
-#### What the classifier needs to do
-
-When walking each package in `walk_pkgl_relocation_roots`:
-
-1. Identify NOS parts (`fFlags & kPartTypeMask == kPartNOSPart`).
-2. Use `newton-objects` to parse the part's object soup.
-3. For every frame whose `class` slot resolves to the symbol
-   `BinCFunction`:
-   - Read the `code` slot — a binary object.
-   - Compute the binary's data range
-     (`obj_pa + 12` through `obj_pa + size`; see
-     [NS object headers](#ns-object-headers-heap-layout) for the
-     8-byte `ObjHeader` + 4-byte class Ref preamble).
-   - Mark every 32-bit-aligned word in that range as code in the
-     reach bitmap. Optionally also seed `code_pa + offset` as a
-     worklist root for the symbolic disassembly.
-4. Don't seed the binary words themselves as walker roots — the
-   bytes are pure code without an APCS prologue at every word, and
-   running the walker over them will mis-classify `B`-target
-   literals as branch destinations. Marking them as code in the
-   bitmap (so the loader byteswaps them) is sufficient; the
-   `offset` slot is the only call entry the kernel uses.
+The classifier needs to recognise these so the call entry gets
+walked like any other function start; the walker's reachability
+fan-out then causes the code words to be byteswapped at load
+time. Without this the kernel's BL into `code_pa + offset` lands
+on an LE fetch of BE-stored bytes (e.g. `ea 00 00 86` reads back
+as `0x860000ea`) and decodes to garbage.
 
 References:
 - `Toolkit/SampleScripts/NativeFunction.ns` — canonical user-visible

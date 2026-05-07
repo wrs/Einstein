@@ -52,6 +52,13 @@ void probe_record_prefetch_abort(uint32_t pc, uint32_t ifsr, uint32_t mode);
 /// from the JIT unit templates at execute time, once per actual execution.
 void probe_record_ba_site(uint32_t pc, uint32_t kind);
 
+/// Function call (BL) entered. `target_pc` is the destination PC, `lr` is
+/// the saved link register (= return address), `r0..r3` are the AAPCS args.
+/// Called from BranchWithLink JIT handlers; the probe selects which target
+/// PCs are interesting (currently the heap-allocator entry points).
+void probe_record_call(uint32_t target_pc, uint32_t lr,
+	uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
@@ -66,6 +73,7 @@ void probe_record_ba_site(uint32_t pc, uint32_t kind);
 #define probe_record_data_abort(pc, far, fsr, mode) ((void) 0)
 #define probe_record_prefetch_abort(pc, ifsr, mode) ((void) 0)
 #define probe_record_ba_site(pc, kind) ((void) 0)
+#define probe_record_call(target_pc, lr, r0, r1, r2, r3) ((void) 0)
 
 #endif
 

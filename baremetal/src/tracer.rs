@@ -455,6 +455,29 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
         );
     }
 
+    // Heap-allocator call log: every call to NewPtr/NewHandle/NewBlock/
+    // NewIndirectBlock/operator-new gets a numbered line so we can diff
+    // the allocation sequence against EinsteinProbe's identical trace.
+    let alloc_name = match fa {
+        0x0014_1538 => Some("NewHandle"),
+        0x0014_2b28 => Some("NewPtr"),
+        0x0031_1db8 => Some("NewBlock"),
+        0x0031_20bc => Some("NewIndirectBlock"),
+        0x0031_8ee8 => Some("__nw__FUi"),
+        _ => None,
+    };
+    if let Some(an) = alloc_name {
+        static ALLOC_SEQ: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        let seq = ALLOC_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        kprintln!(
+            "alloc {:5} {} pc={:#010x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} lr={:#010x}",
+            seq, an, fa,
+            ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
+            cur_lr
+        );
+    }
+
     // newt-tripwire (per-trace-event poll): catches the first trace
     // event after PA 0x0402a250 (= pckm's user stack at sp_usr+8) is
     // populated with 0x6e657774 ("newt"). Bounds the corruption write

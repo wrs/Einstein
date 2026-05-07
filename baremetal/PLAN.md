@@ -18,159 +18,153 @@ Bloated PLAN.md wastes context every read.
   functionality (not merely diagnostics):
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
-**Current goal (iter-106):** iter-105 wedge is **resolved**. Root
-cause was hypothesis #1 above (bytes at 0x800968 weren't byteswapped
-at load time). The 2-instruction stub `ldr r0, [r0]; b 0x800904`
-at REx PA 0x00800968 is reached only by the kernel dereferencing a
-package-internal function-pointer slot at 0x00800df4, which the
-shape-based REx classifier never marked as code. Without
-byteswapping, the kernel's ERET fetched garbage at the BE-format
-bytes of 0xe5900000 and the guest wild-branched to PC=0 with T=1,
-producing the "thumb-und" wedge.
+**Current state:** Boot reaches the kernel's task-scheduler running
+~27 live tasks (newt, OBJM, scrn, pckm, cmgr, …), draws the boot
+splash, and starts rendering small UI overlays. Past the gLocaleCache
+wedge, past the StorePermObject / TUnicodeCompressor abort loop, past
+the StackManager bus-error stall.
 
-Fix in iter-105:
-- `tools/classify-rom/src/main.rs` now parses each NewtonOS package
-  in the REx pkgl block, walks its relocation table when
-  `kDirRelocationFlag` is set (per DCL TDCLPackage.cpp), and seeds
-  every code-shaped pointer-slot value as a walker root via
-  `va_to_pa`. This is the kernel's own loader-format authority on
-  what's a pointer; no shape-heuristic guessing needed.
-- The 'FDRV' tag heuristic (scan every word for fnptr-shaped
-  values) was redundant with `collect_classinfo_roots` (precise
-  trampoline-shape match) and produced 8 spurious main-ROM-vector
-  seeds in Einstein.rex; removed.
-- Earlier iter-105 commit added `collect_pcrel_ldr_thunk_run_roots`
-  for non-relocatable packages whose `LDR pc, [pc, #-4] + literal`
-  thunk tables (e.g. 0x826xxx) had unmarked siblings.
-- CLAUDE.md got a "bitmap-first triage" note: when a wedge points
-  at a specific guest PC, grep `code-regions.txt` first; an
-  unmarked PC means the loader didn't byteswap the word and the
-  fix lives in `tools/classify-rom`, not in `src/trap.rs`.
+The current ceiling is a **wild data-abort at FAR=0x0cce4400** — 508
+KiB above the topOfStack of a 2 MiB stack (slot 125..181 in the main
+heap-domain pool). The wrapped ResolveFault correctly returns -10204
+"FAR ≥ topOfStack", `TStackManager::Fault` then throws `exBusError`,
+no handler is installed, and the kernel hits `UnhandledException`.
+Captured via the new BusErrorThrow LoudHalt at 0x001F_8534 + the
+TStack invariant walker (`dump_tstacks_and_check_invariants`).
 
-Boot now advances past PC=0 into real REx code at PC=0x800194
-(NATIVE_PRIM dispatch) and onward. The current visible activity
-is a tight loop between two tasks (`'user'` and `'OBJM'`) doing
-heavy MMIO traffic at 0x0F241000 (Voyager serial-chip control
-register) interleaved with NATIVE_PRIM 0x106 / 0x107
-(`PowerOnSubsystem(6)` / `PowerOffSubsystem(7)`). EinsteinProbe
-confirms this is normal early-boot flash-init activity — on the
-reference oracle the same code reaches 27 live kernel tasks (newt,
-OBJM, pckm, idle, PMGR, PTBL, alrt, sndm, scrn, …) in 2 s wall
-clock. Our hypervisor under QEMU TCG with all the iter-105
-diagnostic probes still active runs much slower per kernel-second,
-so reaching the same point will take significantly longer wall
-clock.
+It's **not** a stack-overflow into a guard — the offending VA is half
+a megabyte above the top, suggesting a corrupt SP or wild pointer in
+some new code path the boot reached for the first time.
 
-**Next (iter-109):**
+### Stack-VM patches that got us here
 
-iter-108 fixed the WriteDebugByte NULL wedge by disabling the
-iter-79 `force_kernel_diag_on` poke (commit `912076b5`). With
-gWantSerialDebugging back to 0, the kernel's FPE skips its emit-
-debug-trace path and runs cleanly. **Phase-B essentially
-complete:** the boot now reaches the kernel's idle/sleep state.
+Three coordinated fixes around the kernel's TStackInfo / ResolveFault
+path, all rooted in the `kSubPagesPerPage=4`, `kSubPageSize=1024`
+assumption baked into the original kernel and the way we'd patched
+`FMNewStack` for ARMv7's no-subpage-AP world:
 
-Task census after iter-108: **26 unique task names alive**
-(EinsteinProbe reference: 27). All running tasks the oracle
-expects appear: newt, OBJM, idle, cdfm, cdpr, cdsv, cmgr, drvr,
-drvl, mntr, name, pckm, pg&e, PMGR, pssm, PTBL, ROMF, ROMP, scrn,
-sndm, STKF, STKP, STKU, Tmux, alrt, main. Missing: codc, inkr
-(possibly created later in boot, possibly not yet reached).
+1. **`0x001F_9060` / `0x001F_9064` NOPs** (the `stackNormalization`
+   formula fix). FMNewStack computes
+   `stackNormalization = fBase + (firstFree/kSubPagesPerPage)*kPageSize
+                                + firstFree*(kStackSize - kSubPageSize)`.
+   With `kStackSize=33792`, `kSubPageSize=1024`, `kSubPagesPerPage=4`,
+   the expression simplifies to `fBase + firstFree*kStackSize`. We'd
+   patched `kStackSize` to 36864 in FMNewStack but left the divide-by-
+   `kSubPagesPerPage` intact — so for non-multiple-of-4 `firstFree` the
+   sum was off by `r * kSubPageSize` (up to 3 KiB). NOPing the
+   `addmi r0, r0, #3` and `asr r0, r0, #2` makes it
+   `fBase + firstFree*kPageSize + firstFree*32768 = fBase + firstFree*36864`
+   exact. This single change carried the boot from the gLocaleCache
+   wedge through `StartScheduler` and into the boot splash.
+2. **`0x001F_9038` reverted from `+4096` → `+1024`** (info[+4] /
+   info[+24] geometry). Initially we'd set the hard lower-bound
+   `info[+4] = slot_base + 4 KiB` to match the new 4 KiB guard size.
+   That made user-mode code expecting the original 1 KiB-guard layout
+   trip exBusError on every push 12 bytes below the original bottom-
+   of-data: `ResolveFault` saw `FAR < info[+24]` and returned -10203.
+   Reverting to `+1 KiB` keeps our `info[+24]` matching Einstein's,
+   so the same SP excursion that worked there works here. The
+   "guard" can't be hardware-enforced sub-page anyway — the bottom
+   4 KiB page commits as a whole on first access — so this is a
+   logical guard size, identical to the original kernel's view.
+3. **`apply_resolve_fault_wrapper` rewritten with success-tracking.**
+   The wrapper iterates 4× over the 1 KiB subpages of a faulting
+   4 KiB page so the kernel's per-subpage bookkeeping stays
+   consistent. Old policy `bne done` propagated any non-zero
+   `ResolveFault` return — so iter 0 of a bottom-page commit (FAR =
+   `slot_base + 0`, always below `info[+24] = slot_base + 1 KiB`)
+   false-positived as -10203 → busError. New policy: `bgt done`
+   propagates real positive errors (e.g. `r0=4` FindOrAllocPage
+   failure) immediately, but treats negative returns (-10203 /
+   -10204 "subpage out of range") as "this iter doesn't apply,
+   skip". A new `r9` flag tracks "any iter succeeded"; on loop
+   exit, `movne r0, #0` returns success only if at least one iter
+   succeeded — else propagates the error so a wild FAR (whose
+   entire 4 KiB page is out of range) actually throws busError
+   instead of silently returning 0 and busy-looping.
 
-The boot ends in StopImage (PC=0x38d174..0x38d1e0): the kernel's
-SA-1100 idle/sleep handshake. The polling loop at 0x38d1d4..
-0x38d1dc reads IntPresent (kHdWr_IntPresent at 0x0F183000) and
-spins until bit 22 (= 0x400000) is set. That bit is the wake-up
-event from a user-input source (pen-down, button, GPIO) — exactly
-how a physical Newton sleeps until the user touches it.
+### Wrapper-policy attempts (worth keeping for next time)
 
-Iter-109 work — wake the idle:
+The wrapper went through three iterations before settling. The
+intermediate one is interesting because **it was the only state in
+which the splash actually rendered** — and the reason it rendered
+is informative.
 
-1. **Identify which IRQ source maps to IntPresent.bit-22**.
-   `src/peripherals/vic.rs` plus `probe/FINDINGS.md` should pin
-   it to one of the GPIO / tablet / button lines. Cross-check
-   against EinsteinProbe to see which IRQ it raises on idle-wake.
-2. **Model a wake event**. Options in rough order of escalation:
-   a. **One-shot wake on tick**. After N seconds of idle (= the
-      polling loop firing without exit), fire the wake IRQ once
-      and see if the kernel resumes into NewtonScript dispatch.
-   b. **Pen-tap / button-press emulation**. Forward an event from
-      a host trigger (HVC tag from a guest test, semihosting
-      stdin, or just a periodic "synthetic tap" for diagnosis)
-      into the GPIO IRQ.
-   c. **Real input plumbing**. If interactive, wire host
-      keyboard / mouse through to the tablet driver's input queue.
-3. **Verify forward progress**. Once woken, the kernel should
-   start TInterpreter and run NewtonScript. The framebuffer
-   should render the boot UI. EinsteinProbe is the visual oracle.
+**Attempt A — `bne` propagates any non-zero.**
+First version. Halted early at `evt.ex.abt.bus` because iter 0 of a
+bottom-page commit (FAR = `slot_base + 0`) is *always* below
+`info[+24] = slot_base + 1 KiB` and returns -10203, which the
+wrapper then treated as a bus error. False-positive on every
+legitimate stack-grow into the bottom 4 KiB page.
 
-Optional, in parallel: investigate why iter-107's FPA bypass-stub
-cache flush didn't help (only 1 fpa-bypass-miss observed before
-boot reached idle, so the cache-coherence hypothesis remains
-testable). If a longer boot eventually enters more FPA UNDs and
-the bypass works, the cache flush is doing its job; if misses
-keep accruing, look at why the in-ROM stub still doesn't fire.
+**Attempt B — `bgt` propagates only positive errors; negatives
+silently return success.**
+Reached and *rendered the boot splash*: `screen.blit ENTER
+@PC=0x801bd4 pixmap=0xc107d8c ... copied=19200` (full 480×320
+paint) plus the 32×32 icon blit from ROM `0x37ab5c`. 26M+ traps of
+post-splash kernel idle. **But** when *every* iter returned
+negative (the FAR's whole 4 KiB page was out of range — i.e. a
+wild access, not a stack grow), the wrapper still returned 0 and
+the kernel re-faulted forever (busy loop, no progress). The splash
+rendered specifically *because* this bug masked the wild-FAR cases
+that would otherwise have thrown busError.
 
-### Iteration 105: REx pkgl relocation-table seeder
+**Attempt C (current) — `bgt` + per-iter success tracking.**
+Cleared `r9` on any success; after the loop, return 0 only if at
+least one iter succeeded, else propagate the negative error. Wild
+FARs now correctly throw busError. The cost is that the Phase-B
+ceiling moved from "post-splash idle" to "BusErrorThrow at
+FAR=0x0cce4400, before splash render completes" — i.e. we
+exchanged a silently-masked correctness bug for a loud halt at a
+real defect.
 
-Goal: kill the iter-104 wedge at PC=0 with `SPSR.T=1`, root-caused
-in the iter-105 task-switch + pre-ERET probes (see git log for the
-diagnostic stack). The drvr task's saved_pc=0x00800968 was a valid
-REx address, the kernel's ERET intent was correct, yet the user
-ran zero instructions — proving the bytes at 0x00800968 weren't
-the assembled `ldr r0, [r0]; b 0x800904` stub the disassembly
-showed.
+**Lesson:** rendering the splash under Attempt B did not mean the
+boot was healthy; it meant the wrapper was hiding the wild-FAR
+defect that's still there. Fixing whatever produces FAR=0x0cce4400
+(a corrupt SP or wild pointer 508 KiB above the marker stack's
+top) is the real path forward, not relaxing the wrapper.
 
-Cause: the classifier never reached 0x00800968. The 2-instruction
-stub is referenced only by an absolute function-pointer slot at
-0x00800df4 inside the EinsteinPlatformDriver package's part data;
-nothing in ROM/REx code BLs it directly. With the slot's first-
-word value (0x00800900-shape) failing every shape heuristic, the
-walker had no way in. Without `reach=true` the loader didn't
-byteswap the word at load time, so the kernel's BE-32 fetch of
-0xe5900000 decoded as garbage and the ERET wild-branched.
+### Diagnostics added
 
-Fix is in two parts (two separate commits):
+- `BUS_ERROR_THROW_PC` (0x001F_8534) — `bl Throw` inside
+  `TStackManager::Fault`, patched with `HVC #LoudHalt`. Captures
+  R0..R14 + banked SP/LR for every mode + FAR_EL1 + the
+  ResolveFault return code at the moment the kernel decides to
+  throw busError. `handle_loud_halt` now matches the site via
+  `caller_lr - 4` so user-mode HVCs (routed via the UND trampoline)
+  resolve to the patched site and not the trampoline PC.
+- `dump_tstacks_and_check_invariants` (in `src/trap.rs`) — walks
+  `gStackManagerHeap[+4] → TStackManager → domain queue (+0xD0) →
+  THeapDomain → slot_array → TStackInfo`, dedupes consecutive
+  same-`info` slot entries, prints per-stack `norm/hard/curr/top/
+  guard/range`, and flags violations: `guard != 1 KiB`, `info[+24]`
+  outside `[hard..top]`, `info[+4]` outside `[norm..top]`,
+  pairwise VA-range overlaps. TDoubleQContainer layout decoded
+  from `Peek__17TDoubleQContainerFv` / `GetNext` — head_item at
+  +0, item_offset at +8, items linked via TDoubleQItem (next at
+  +0, prev at +4, container back-ptr at +8).
+- DAH-FME-ret probe extended to log every failure (`r0 != 0`)
+  plus the first 24 successes — was capped at 24, missing the
+  late ones.
+- FME-entry probe extended to sample at 100 K-call intervals
+  after the first 24, so a long boot still gives a FAR
+  distribution.
 
-1. **`collect_pcrel_ldr_thunk_run_roots`** (earlier iter-105
-   commit): scan for runs of ≥3 consecutive `LDR pc, [pc, #-4]
-   + <literal>` thunk pairs and seed every LDR-PA. Catches
-   sibling thunks in a vtable-shaped table (e.g.
-   0x008264dc, 0x008264fc, … 0x00826544 in the non-relocatable
-   FGSoft package) whose only references are through structural
-   pointers.
-2. **pkgl relocation-table seeder** (this commit): parse each
-   NewtonOS package in the REx pkgl block, walk its relocation
-   table when `kDirRelocationFlag` is set (DCL TDCLPackage.cpp
-   format), read each pointer-slot value, and seed it as a
-   walker root via `va_to_pa`. The relocation table is the
-   loader's authoritative list of pointers; no shape heuristic
-   needed. In Einstein.rex this seeded 6 roots across 4
-   relocatable packages — including 0x00800968 itself.
+### Next
 
-Heuristic removal: the 'FDRV' tag scanner in `rex_header_roots`
-(scan every word of the FDRV class-info block for fnptr-shaped
-values) was redundant with `collect_classinfo_roots` (precise
-trampoline-shape match) and added 8 spurious main-ROM-vector
-seeds. Removed; popcount unchanged. SeedSource::RexHeader is
-unused now and gone.
-
-Operational follow-on: CLAUDE.md gained a "bitmap-first triage"
-note — when a wedge points at a guest PC, grep the
-`code-regions.txt` first; an unmarked PC means the loader didn't
-byteswap and the fix lives in `tools/classify-rom`, not
-`src/trap.rs`.
-
-Result:
-- 36/36 guest tests pass.
-- `reachable-code popcount` 880060 → 880087.
-- `byte-access-static popcount` unchanged at 27790 (these aren't
-  byte accesses).
-- Cold boot advances from PC=0 wedge to PC=0x800194 (NATIVE_PRIM
-  dispatch in EinsteinPlatformDriver), enters the normal early-
-  init flash/serial-chip MMIO loop confirmed against EinsteinProbe.
-
-<!-- Older iteration retrospectives (iter-98 through iter-104) live
-     in `git log` per the auto-prune maintenance note. -->
+1. **Identify the wild FAR=0x0cce4400 access**. Marker stack is the
+   2 MiB pool at `[0x0ca65000, 0x0cc65400)`. The FAR is 508 KiB
+   above its top. Likely a corrupt SP or pointer arithmetic gone
+   wrong. The `BusErrorThrow` LoudHalt already captures the banked
+   USR LR; needs a probe at the actual data-abort entry to recover
+   the original faulting PC (the `dabt:` log dedupes by FAR so this
+   one isn't logged at the moment).
+2. **Confirm the rest of the TStack landscape is clean.** Walker
+   shows clean 1 KiB guards everywhere except in-flight allocations
+   in the highest pool. Once the wild-FAR is fixed, re-run the
+   walker and confirm everything's tidy.
+3. **Long-tail.** Reach NewtonScript's `TInterpreter` boot, full UI
+   render. EinsteinProbe is the visual oracle.
 
 ## Workflow per stop
 

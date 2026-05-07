@@ -28,6 +28,7 @@
 
 // Einstein
 #include "Emulator/TARMProcessor.h"
+#include "baremetal/probe/probe_sink.h"
 #include "Emulator/TEmulator.h"
 #include "Monitor/TSymbolList.h"
 #include "Emulator/JIT/Generic/TJITGenericROMPatch.h"
@@ -295,6 +296,9 @@ JITInstructionProto(BranchWithLink)
 
 	// BL
 	ioCPU->mCurrentRegisters[14] = theNewLR;
+	probe_record_call(theNewPC, theNewLR,
+		ioCPU->mCurrentRegisters[0], ioCPU->mCurrentRegisters[1],
+		ioCPU->mCurrentRegisters[2], ioCPU->mCurrentRegisters[3]);
 	MMUCALLNEXT(theNewPC);
 }
 
@@ -312,6 +316,9 @@ JITInstructionProto(BranchWithLinkWithinPage)
 
 	// BL
 	ioCPU->mCurrentRegisters[14] = theNewLR;
+	probe_record_call(theNewPC, theNewLR,
+		ioCPU->mCurrentRegisters[0], ioCPU->mCurrentRegisters[1],
+		ioCPU->mCurrentRegisters[2], ioCPU->mCurrentRegisters[3]);
 	SETPC(theNewPC);
 	return ioUnit + theDelta;
 }
@@ -329,6 +336,9 @@ JITInstructionProto(BranchWithLinkWithinPageFindDelta)
 
 	// set the link register
 	ioCPU->mCurrentRegisters[14] = theNewLR;
+	probe_record_call(theNewPC, theNewLR,
+		ioCPU->mCurrentRegisters[0], ioCPU->mCurrentRegisters[1],
+		ioCPU->mCurrentRegisters[2], ioCPU->mCurrentRegisters[3]);
 
 	// MMUCALLNEXT()
 	TMemory* theMemIntf = ioCPU->GetMemory();

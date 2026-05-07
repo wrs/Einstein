@@ -3,8 +3,15 @@
 //! Newton wires four 256-MiB PCMCIA windows starting at 0x3000_0000,
 //! 0x4000_0000, 0x5000_0000, 0x6000_0000 (Einstein
 //! `TMemoryConsts::kPCMCIA{0..3}Base`). Real Newton hardware only
-//! populates slots 0 and 1; we model both as "controller present, no
-//! card inserted".
+//! populates slots 0 and 1 (the MP2x00 has two PCMCIA bays); slots 2
+//! and 3 have no controller chip on the bus. We model slots 0/1 as
+//! "controller present, no card inserted" and slots 2/3 as "no
+//! controller" — the latter is critical because `TCardServer`'s init
+//! loop iterates 4 sockets and only skips `RegisterInterrupt` for
+//! sockets where `TCardSocket::GetChipInfo` returns 0. If we let
+//! slots 2/3 chip-detect succeed, socket 3 calls
+//! `RegisterInterrupt(bit=14)` which then writes out-of-bounds past
+//! gGPIOInterface's 13-entry handler array into gLocaleCache.
 //!
 //! Within each slot the layout (Einstein `TPCMCIAController.h`) is:
 //!
@@ -155,22 +162,22 @@ pub fn owns(ipa: u64) -> bool {
     ipa_to_slot(ipa).is_some()
 }
 
-fn ipa_to_slot(ipa: u64) -> Option<(&'static SlotRegs, u64)> {
+fn ipa_to_slot(ipa: u64) -> Option<(&'static SlotRegs, u64, u8)> {
     if (SLOT0_BASE..SLOT0_BASE + SLOT_SIZE).contains(&ipa) {
-        Some((&SLOT0, ipa - SLOT0_BASE))
+        Some((&SLOT0, ipa - SLOT0_BASE, 0))
     } else if (SLOT1_BASE..SLOT1_BASE + SLOT_SIZE).contains(&ipa) {
-        Some((&SLOT1, ipa - SLOT1_BASE))
+        Some((&SLOT1, ipa - SLOT1_BASE, 1))
     } else if (SLOT2_BASE..SLOT2_BASE + SLOT_SIZE).contains(&ipa) {
-        Some((&SLOT2, ipa - SLOT2_BASE))
+        Some((&SLOT2, ipa - SLOT2_BASE, 2))
     } else if (SLOT3_BASE..SLOT3_BASE + SLOT_SIZE).contains(&ipa) {
-        Some((&SLOT3, ipa - SLOT3_BASE))
+        Some((&SLOT3, ipa - SLOT3_BASE, 3))
     } else {
         None
     }
 }
 
 pub fn read(ipa: u64) -> u32 {
-    let (regs, off) = match ipa_to_slot(ipa) {
+    let (regs, off, slot) = match ipa_to_slot(ipa) {
         Some(x) => x,
         None => return 0,
     };
@@ -181,6 +188,12 @@ pub fn read(ipa: u64) -> u32 {
     }
     if (REG_BASE..=REG_END).contains(&off) {
         let reg_off = off - REG_BASE;
+        // Slots 2/3 have no controller — every read returns 0 so
+        // GetChipInfo's 0xa5a5/0x5a5a write-and-read-back probe fails.
+        if slot >= 2 {
+            log("pcmcia read (no controller in slot)", ipa, 0);
+            return 0;
+        }
         // kHdWr_Reg4400 — Einstein hardcodes 0xFC.
         if reg_off == 0x4400 {
             log("pcmcia read reg_4400", ipa, 0xFC);
@@ -204,7 +217,7 @@ pub fn read(ipa: u64) -> u32 {
 }
 
 pub fn write(ipa: u64, value: u32) {
-    let (regs, off) = match ipa_to_slot(ipa) {
+    let (regs, off, slot) = match ipa_to_slot(ipa) {
         Some(x) => x,
         None => return,
     };
@@ -215,6 +228,12 @@ pub fn write(ipa: u64, value: u32) {
     }
     if (REG_BASE..=REG_END).contains(&off) {
         let reg_off = off - REG_BASE;
+        // Slots 2/3 have no controller — drop all controller-register
+        // writes so chip-detect (read-back) sees zero.
+        if slot >= 2 {
+            log("pcmcia write (no controller in slot; dropped)", ipa, value);
+            return;
+        }
         if let Some(cell) = regs.cell(reg_off) {
             cell.store(value, Ordering::Relaxed);
             log("pcmcia write reg", ipa, value);

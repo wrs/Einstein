@@ -2230,6 +2230,233 @@ fn log_fpa_ctrl_reg(pc: u32, insn: u32, cond_passed: bool) {
 /// All three sites are end-of-the-line for the kernel: it's either
 /// rebooting after a fatal check or going idle. Dump state, halt the
 /// host. Distinguish sites by ELR_EL2 in the log line.
+/// Walk the kernel's `TStackManager` and dump every `TStackInfo` it
+/// owns, checking invariants along the way:
+///
+///  - guard size (`info[+4] - info[+20]`) should be exactly 4 KiB
+///    (our patched value; original kernel was 1 KiB)
+///  - data range (`info[+28] - info[+4]`) should be a multiple of 4 KiB
+///  - current bound (`info[+24]`) should be in `[info[+4], info[+28]]`
+///  - `info[+0] == info[+28]` (top is stored twice at init)
+///  - `info[+4]` should be in `[info[+20], info[+28]]`
+///  - per-stack VA range `[info[+20], info[+28])` should not overlap
+///    any other stack's range
+///
+/// Layout source: `Init__10TStackInfoFUlN51` at ROM 0x001f6700 (we read
+/// these field offsets directly from the disassembly there).
+///
+/// Manager lookup: the kernel has the global `gStackManagerHeap` at
+/// VA 0x0c104c08 (the *literal* loaded by NewStack et al.). The actual
+/// TStackManager pointer is held at `*(gStackManagerHeap + 4)` per the
+/// ROM pattern `ldr r0, [r0, #4]` after loading the literal. The domain
+/// queue lives at `TStackManager + 208` (`+0xD0`, see
+/// `GetDomainForAddress__13TStackManager` at 0x001f8e48).
+///
+/// `marker_far` is highlighted in the output if any TStackInfo's range
+/// covers it, so the busError-causing FAR is easy to correlate.
+fn dump_tstacks_and_check_invariants(marker_far: u32) {
+    use crate::guest_endian::guest_read_u32_va as rd;
+
+    const G_STACK_MGR_HEAP_LITERAL: u32 = 0x0c10_4c08;
+    let tsm = rd(G_STACK_MGR_HEAP_LITERAL.wrapping_add(4)).unwrap_or(0);
+    if tsm == 0 || tsm < 0x0c00_0000 || tsm >= 0x0d00_0000 {
+        kprintln!(
+            "tstack-dump: gStackManagerHeap[+4]={:#010x} doesn't look like a heap pointer; skipping",
+            tsm
+        );
+        return;
+    }
+    kprintln!(
+        "tstack-dump: TStackManager @ {:#010x}  (marker FAR={:#010x})",
+        tsm, marker_far
+    );
+
+    // Domain queue lives at TStackManager + 0xD0 (verified via
+    // GetDomainForAddress at ROM 0x001f8e48: `add r0, r0, #208`).
+    //
+    // TDoubleQContainer layout (from Peek/GetNext at 0x0009c884/0x0009c89c):
+    //   +0  head_item_ptr  (NULL when empty; otherwise points at the
+    //                       TDoubleQItem inside the first element)
+    //   +4  tail_item_ptr
+    //   +8  item_offset    (offset of the embedded TDoubleQItem within
+    //                       each element, i.e. element + item_offset
+    //                       == item_ptr; THeapDomain's TDoubleQItem
+    //                       lives at +4 per its ctor)
+    //
+    // TDoubleQItem layout (from __ct__12TDoubleQItemFv at 0x0009c6dc):
+    //   +0  next_item_ptr (NULL = end of queue)
+    //   +4  prev_item_ptr
+    //   +8  back-pointer to the owning container
+    //
+    // Walking:
+    //   element = Peek(container) = container[+0] != 0 ?
+    //             container[+0] - container[+8] : NULL
+    //   next    = GetNext(container, element):
+    //             item = element + container[+8];
+    //             item[+8] must equal container (sanity);
+    //             next_item = item[+0];
+    //             return next_item != 0 ? next_item - container[+8] : NULL
+    let container = tsm.wrapping_add(0xD0);
+    let head_item   = rd(container.wrapping_add(0)).unwrap_or(0);
+    let item_offset = rd(container.wrapping_add(8)).unwrap_or(0);
+    kprintln!(
+        "  domain queue @ {:#010x}: head_item={:#010x} item_offset={:#x}",
+        container, head_item, item_offset
+    );
+    if item_offset > 0x100 {
+        kprintln!("  (item_offset suspicious; aborting walk)");
+        return;
+    }
+    let mut domain = if head_item == 0 { 0 } else { head_item.wrapping_sub(item_offset) };
+
+    // Collect ranges to check overlap.
+    let mut ranges: [(u32, u32); 64] = [(0, 0); 64];
+    let mut nranges = 0usize;
+    let mut total_stacks = 0usize;
+    let mut errors = 0usize;
+
+    for _d_iter in 0..16 {
+        if domain == 0 { break; }
+        if domain < 0x0c00_0000 || domain >= 0x0d00_0000 {
+            kprintln!("  domain @ {:#010x} not heap-shaped; stopping walk", domain);
+            break;
+        }
+        let pool_start = rd(domain.wrapping_add(16)).unwrap_or(0);
+        let pool_end   = rd(domain.wrapping_add(20)).unwrap_or(0);
+        let num_slots  = rd(domain.wrapping_add(24)).unwrap_or(0);
+        let slots_ptr  = rd(domain.wrapping_add(28)).unwrap_or(0);
+        kprintln!(
+            "  THeapDomain @ {:#010x}: pool=[{:#010x}..{:#010x}) num_slots={} slots@={:#010x}",
+            domain, pool_start, pool_end, num_slots, slots_ptr,
+        );
+        if num_slots > 1024 || slots_ptr == 0
+            || slots_ptr < 0x0c00_0000 || slots_ptr >= 0x0d00_0000 {
+            kprintln!("    (suspect domain layout — skipping slot iteration)");
+        } else {
+            // Each TStackInfo can be referenced from multiple
+            // consecutive entries in slot_array (FMNewStack fills
+            // slot_array[r6..sl] = same info* for a stack spanning
+            // multiple slot indices). Dedup by tracking the most
+            // recently-printed info pointer and the run length, then
+            // print once per distinct info with a slot-range.
+            let mut last_info: u32 = 0;
+            let mut run_first: u32 = 0;
+            let mut run_count: u32 = 0;
+            // Helper closure-equivalent: we print the run when info changes
+            // or at end of iteration. Inline below.
+            for s in 0..num_slots {
+                let info = rd(slots_ptr.wrapping_add(s.wrapping_mul(4))).unwrap_or(0);
+                if info == last_info && info != 0 {
+                    run_count += 1;
+                    continue;
+                }
+                // Flush previous run.
+                if last_info != 0 {
+                    let i_hard  = rd(last_info.wrapping_add(4)).unwrap_or(0);
+                    let i_norm  = rd(last_info.wrapping_add(20)).unwrap_or(0);
+                    let i_curr  = rd(last_info.wrapping_add(24)).unwrap_or(0);
+                    let i_end   = rd(last_info.wrapping_add(28)).unwrap_or(0);
+                    let i_field0= rd(last_info.wrapping_add(0)).unwrap_or(0);
+                    let i_n     = rd(last_info.wrapping_add(8)).unwrap_or(0);
+                    let guard   = i_hard.wrapping_sub(i_norm);
+                    let range   = i_end.wrapping_sub(i_hard);
+                    let slot_range_str_first = run_first;
+                    let slot_range_str_last  = run_first + run_count - 1;
+                    let covers_marker = marker_far >= i_norm && marker_far < i_end;
+                    kprintln!(
+                        "    slot[{:3}..{:3}] info @ {:#010x}: norm={:#010x} hard(+4)={:#010x} curr(+24)={:#010x} top(+28)={:#010x} +0={:#010x} +8(n)={:#x} guard={:#x} range={:#x}{}",
+                        slot_range_str_first, slot_range_str_last, last_info,
+                        i_norm, i_hard, i_curr, i_end, i_field0, i_n, guard, range,
+                        if covers_marker { "  ***MARKER***" } else { "" },
+                    );
+                    total_stacks += 1;
+                    if guard != 0x400 {
+                        kprintln!("      [INV] guard != 1 KiB: {:#x}", guard);
+                        errors += 1;
+                    }
+                    if i_curr < i_hard || i_curr > i_end {
+                        kprintln!("      [INV] info[+24]={:#010x} not in [hard..top]", i_curr);
+                        errors += 1;
+                    }
+                    if i_hard < i_norm || i_hard > i_end {
+                        kprintln!("      [INV] info[+4]={:#010x} not in [norm..top]", i_hard);
+                        errors += 1;
+                    }
+                    if nranges < ranges.len() {
+                        ranges[nranges] = (i_norm, i_end);
+                        nranges += 1;
+                    }
+                }
+                // Start new run.
+                last_info = info;
+                run_first = s;
+                run_count = if info == 0 { 0 } else { 1 };
+            }
+            // Flush trailing run.
+            if last_info != 0 && run_count > 0 {
+                let i_hard  = rd(last_info.wrapping_add(4)).unwrap_or(0);
+                let i_norm  = rd(last_info.wrapping_add(20)).unwrap_or(0);
+                let i_curr  = rd(last_info.wrapping_add(24)).unwrap_or(0);
+                let i_end   = rd(last_info.wrapping_add(28)).unwrap_or(0);
+                let i_field0= rd(last_info.wrapping_add(0)).unwrap_or(0);
+                let i_n     = rd(last_info.wrapping_add(8)).unwrap_or(0);
+                let guard   = i_hard.wrapping_sub(i_norm);
+                let range   = i_end.wrapping_sub(i_hard);
+                let covers_marker = marker_far >= i_norm && marker_far < i_end;
+                kprintln!(
+                    "    slot[{:3}..{:3}] info @ {:#010x}: norm={:#010x} hard(+4)={:#010x} curr(+24)={:#010x} top(+28)={:#010x} +0={:#010x} +8(n)={:#x} guard={:#x} range={:#x}{}",
+                    run_first, run_first + run_count - 1, last_info,
+                    i_norm, i_hard, i_curr, i_end, i_field0, i_n, guard, range,
+                    if covers_marker { "  ***MARKER***" } else { "" },
+                );
+                total_stacks += 1;
+                if guard != 0x400 {
+                    kprintln!("      [INV] guard != 1 KiB: {:#x}", guard);
+                    errors += 1;
+                }
+                if i_curr < i_hard || i_curr > i_end {
+                    kprintln!("      [INV] info[+24]={:#010x} not in [hard..top]", i_curr);
+                    errors += 1;
+                }
+                if i_hard < i_norm || i_hard > i_end {
+                    kprintln!("      [INV] info[+4]={:#010x} not in [norm..top]", i_hard);
+                    errors += 1;
+                }
+                if nranges < ranges.len() {
+                    ranges[nranges] = (i_norm, i_end);
+                    nranges += 1;
+                }
+            }
+        }
+
+        // GetNext: read next_item from item[+0], subtract item_offset.
+        let item = domain.wrapping_add(item_offset);
+        let next_item = rd(item.wrapping_add(0)).unwrap_or(0);
+        if next_item == 0 { break; }
+        domain = next_item.wrapping_sub(item_offset);
+    }
+
+    // Pairwise overlap check for VA ranges.
+    for i in 0..nranges {
+        let (a_lo, a_hi) = ranges[i];
+        for j in (i + 1)..nranges {
+            let (b_lo, b_hi) = ranges[j];
+            if a_lo < b_hi && b_lo < a_hi {
+                kprintln!(
+                    "      [INV] VA overlap: [{:#010x}..{:#010x}) overlaps [{:#010x}..{:#010x})",
+                    a_lo, a_hi, b_lo, b_hi
+                );
+                errors += 1;
+            }
+        }
+    }
+
+    kprintln!(
+        "tstack-dump: walked {} TStackInfo(s); {} invariant violations.",
+        total_stacks, errors
+    );
+}
+
 fn handle_loud_halt(ctx: &TrapContext) -> ! {
     let spsr_el2 = read_sysreg!("spsr_el2") as u32;
     let elr_el2 = read_sysreg!("elr_el2") as u32;
@@ -2239,11 +2466,26 @@ fn handle_loud_halt(ctx: &TrapContext) -> ! {
     // priv-mode HVCs, so subtract 4 to get the patched site itself.
     // For USR-mode (HVC routed through UND_TRAMP) the offsets work
     // out the same way.
-    let site_pc = elr_el2.wrapping_sub(4);
+    // For priv-mode HVCs ELR_EL2 points just past the patched insn, but
+    // for USR-mode (routed via the UND trampoline) ELR_EL2 lands inside
+    // the trampoline at 0xFFFFxx — the real patched site is then
+    // caller_lr - 4 (since `bl Throw` saves PC+4 in LR_UND before the
+    // trampoline emits its HVC). Pick whichever matches a known site.
+    let pc_from_elr = elr_el2.wrapping_sub(4);
+    let pc_from_lr = caller_lr.wrapping_sub(4);
+    let known = |pc: u32| matches!(pc,
+        crate::rom_patches::REBOOT_PC
+        | crate::rom_patches::POWEROFF_REBOOT_PC
+        | crate::rom_patches::STOP_IMAGE_PC
+        | crate::rom_patches::BUS_ERROR_THROW_PC);
+    let site_pc = if known(pc_from_elr) { pc_from_elr }
+                  else if known(pc_from_lr) { pc_from_lr }
+                  else { pc_from_elr };
     let site = match site_pc {
         crate::rom_patches::REBOOT_PC => "Reboot",
         crate::rom_patches::POWEROFF_REBOOT_PC => "PowerOffAndReboot",
         crate::rom_patches::STOP_IMAGE_PC => "StopImage",
+        crate::rom_patches::BUS_ERROR_THROW_PC => "BusErrorThrow",
         _ => "LoudHalt",
     };
     kprintln!();
@@ -2263,6 +2505,41 @@ fn handle_loud_halt(ctx: &TrapContext) -> ! {
         "  R12={:#010x}  R14_{}={:#010x}  (caller LR via Table D1-79)",
         ctx.x[12] as u32, describe_aarch32_mode(mode), caller_lr
     );
+    // BusErrorThrow site: also dump R4 (= TStackManager*), R5 (= the
+    // ResolveFault return value, e.g. -10203/-10204), the FAR_EL1
+    // (= the original fault VA), and the relevant TStackInfo bounds
+    // so we can identify which stack overflowed.
+    if site_pc == crate::rom_patches::BUS_ERROR_THROW_PC {
+        let far = read_sysreg!("far_el1") as u32;
+        // Walk all TStacks and check invariants — output goes BEFORE
+        // the per-register dump so the structural picture is visible.
+        dump_tstacks_and_check_invariants(far);
+        let r4 = ctx.x[4] as u32;
+        let r5 = ctx.x[5] as u32;
+        kprintln!(
+            "  R4 = {:#010x} (TStackManager*)  R5 = {:#010x} ({} signed)",
+            r4, r5, r5 as i32
+        );
+        kprintln!("  FAR_EL1 = {:#010x}  (the faulting VA)", far);
+        kprintln!(
+            "  R6 = {:#010x}  R7 = {:#010x}  R8 = {:#010x}  R9 = {:#010x}",
+            ctx.x[6] as u32, ctx.x[7] as u32, ctx.x[8] as u32, ctx.x[9] as u32
+        );
+        // Banked SP/LR for each AArch32 mode — `ctx.x` indices follow
+        // ARM ARM Table D1-79 (AArch64 EL2 view of AArch32 banked regs).
+        kprintln!(
+            "  banked: USR sp={:#010x} lr={:#010x}  SVC sp={:#010x} lr={:#010x}",
+            ctx.x[13] as u32, ctx.x[14] as u32, ctx.x[19] as u32, ctx.x[18] as u32
+        );
+        kprintln!(
+            "          ABT sp={:#010x} lr={:#010x}  IRQ sp={:#010x} lr={:#010x}",
+            ctx.x[21] as u32, ctx.x[20] as u32, ctx.x[17] as u32, ctx.x[16] as u32
+        );
+        kprintln!(
+            "          UND sp={:#010x} lr={:#010x}",
+            ctx.x[23] as u32, ctx.x[22] as u32
+        );
+    }
     cpu::halt();
 }
 
@@ -2773,7 +3050,9 @@ fn handle_dah_fme_ret_probe(_ctx: &mut TrapContext) {
     static FIRED: core::sync::atomic::AtomicU32 =
         core::sync::atomic::AtomicU32::new(0);
     let n = FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if n < 24 {
+    // Log first 24 successes, AND every failure (so we always see the
+    // FAR that triggers a busError / reboot).
+    if n < 24 || r0 != 0 {
         kprintln!(
             "DAH-FME-ret[{}]: r0={:#010x} far={:#010x}{}",
             n, r0, far,
@@ -2833,7 +3112,10 @@ fn handle_fme_entry_probe(ctx: &mut TrapContext) {
     static FIRED: core::sync::atomic::AtomicU32 =
         core::sync::atomic::AtomicU32::new(0);
     let n = FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if n < 24 {
+    // Log first 24 entries AND log a sample every 100k entries afterward —
+    // useful to see the FAR distribution late in boot when FME is still
+    // firing but the early-cap has run out.
+    if n < 24 || n % 100_000 == 0 {
         kprintln!(
             "FME-entry[{}]: r0(mask)={:#010x} far={:#010x} src_mode={:#x} sp={:#010x} task[+0x70]={:#010x} task[+0x64]={:#010x} task[+0x58]={:#010x}",
             n, r0, far, src_mode, sp_src, task_70, task_64, task_58,

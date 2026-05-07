@@ -206,6 +206,55 @@ extern "C" void probe_record_ba_site(uint32_t pc, uint32_t kind) {
 	if (kind < 4) probe_state::ba_site_by_kind[kind]++;
 }
 
+// Heap allocator call log. We watch BL targets equal to NewPtr/NewHandle/
+// NewBlock/NewIndirectBlock/operator-new entries and stream each call's
+// args + LR to stdout. Sequence number lets us correlate the order with
+// the baremetal hypervisor's identical probe.
+namespace probe_state {
+std::atomic<uint64_t> alloc_seq { 0 };
+}
+extern "C" TMemory* g_probe_mem = nullptr;
+
+// Walk a chain of unconditional `b <imm24>` instructions starting at `pc`.
+// Returns the final landing PC, or `pc` if the first instruction isn't a
+// branch. Capped at 8 hops to avoid loops. Used by probe_record_call to
+// see through the Newton ROM's BL → REx-JT → main-ROM-JT → fn chain.
+static uint32_t walk_branch_chain(uint32_t pc) {
+	if (!g_probe_mem) return pc;
+	for (int i = 0; i < 8; ++i) {
+		KUInt32 insn = 0;
+		if (g_probe_mem->ReadAligned(pc & ~3u, insn)) break;
+		// Unconditional B: cond=0xE, opcode 1010, L=0.
+		// Format: 1110 1010 imm24
+		if ((insn & 0xFF000000u) != 0xEA000000u) break;
+		int32_t off = (int32_t) ((insn & 0x00FFFFFFu) << 8) >> 6; // sign-extend, ×4
+		pc = (pc & ~3u) + 8u + (uint32_t) off;
+	}
+	return pc;
+}
+
+extern "C" void probe_record_call(uint32_t target_pc, uint32_t lr,
+	uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3) {
+	// Strip the +4 PC-prefetch offset, then walk B trampolines to the
+	// real function entry.
+	target_pc = walk_branch_chain(target_pc - 4);
+	const char* name = nullptr;
+	switch (target_pc) {
+		case 0x00141538: name = "NewHandle";        break;
+		case 0x00142b28: name = "NewPtr";           break;
+		case 0x00311db8: name = "NewBlock";         break;
+		case 0x003120bc: name = "NewIndirectBlock"; break;
+		case 0x00318ee8: name = "__nw__FUi";        break;
+		default: return;
+	}
+	uint64_t seq = probe_state::alloc_seq.fetch_add(1, std::memory_order_relaxed);
+	std::lock_guard<std::mutex> lock(probe_state::mu);
+	std::fprintf(stdout,
+		"alloc %5llu %s pc=0x%08x r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x lr=0x%08x\n",
+		(unsigned long long) seq, name, target_pc, r0, r1, r2, r3, lr);
+	std::fflush(stdout);
+}
+
 namespace {
 
 const char* mode_name(uint32_t m) {
@@ -785,6 +834,137 @@ void heap_header_dump(TMemory* mem, KUInt32 heap_va) {
 	std::fflush(stdout);
 }
 
+// Heap allocation enumerator. NewHeap initialises every Newton heap with
+// the magic bytes "aiks" (ASCII, little-endian as 0x736b6961) at heap+24
+// (ROM 0x00310e80: `str r1, [r7, #8]` where r1 = "aiks" and r7 = base+16).
+// Scan all of guest RAM (VA 0x0c000000..0x0c800000) for that magic, then
+// dump each detected heap's header so we can compare which NewHeap calls
+// Einstein has made by tag tag T against the baremetal trace.
+constexpr KUInt32 kAiksMagic = 0x736b6961u;
+void heap_alloc_enum(TMemory* mem, const char* tag) {
+	std::fprintf(stdout, "heap-alloc-enum[%s]: starting scan\n", tag);
+	std::fflush(stdout);
+	// Scan word-aligned VAs in 0x0c000000..0x0c800000 (8 MiB max, the Newton
+	// kernel + apps RAM space). Skip ATTR/IO/MEM PCMCIA windows (they're
+	// outside this range), and skip ROM (low addresses already filtered).
+	int found = 0;
+	KUInt32 va = 0x0c000000u;
+	uint64_t iter = 0;
+	const uint64_t kMaxIter = 5'000'000ULL; // bound runtime
+	while (va < 0x0d000000u && iter < kMaxIter) {
+		++iter;
+		KUInt32 word = 0;
+		if (!td_read(mem, va, word)) {
+			// Unmapped — skip whole 4 KiB page.
+			va = (va + 0x1000u) & ~0xFFFu;
+			continue;
+		}
+		if (word != kAiksMagic) { va += 4; continue; }
+		// Candidate hit. Read the rest of the header to validate: heap[+0]
+		// (= +0 from base, which is va-24) holds heap_base in NewHeap (a
+		// self-pointer, but with the +16 adjustment, NewHeap stores r5
+		// (which is base) at base+16 and r7+0 = base+16 = self+0).
+		// Easier validation: the +0xcc heap byte at NewHeap 0x00310e70
+		// (`mov r0, #204`) is written to heap[+4], so check heap[+4]=204.
+		KUInt32 base16_field = 0;
+		if (!td_read(mem, va + (-16 - 12) + 4, base16_field)) continue;
+		// Actually NewHeap layout post-init:
+		//   base[+4]    = 0xcc (204)            (str r0, [r7, #-12] @ 0x310e70)
+		//   base[+16]   = base                  (str r5, [r7, #0])
+		//   base[+24]   = 'aiks'                (str r1, [r7, #8])
+		//   base[+40]   = chunk_size            (str r4, [r7, #28])  ← actually arg1
+		//   base[+72]   = chunk_size            (str r6, [r7, #56])
+		// The magic is at base+24, so base = va-24.
+		KUInt32 base = va - 24;
+		KUInt32 b4 = 0;   td_read(mem, base + 4,  b4);
+		KUInt32 b16 = 0;  td_read(mem, base + 16, b16);
+		KUInt32 b56 = 0;  td_read(mem, base + 56, b56);
+		KUInt32 b72 = 0;  td_read(mem, base + 72, b72);
+		if (b16 != base) { va += 4; continue; } // Self-pointer check.
+		++found;
+		std::fprintf(stdout,
+			"  heap[%2d] base=0x%08x  byte+4=0x%08x  arg1@+56=0x%08x  chunk_size@+72=0x%08x\n",
+			found - 1, base, b4, b56, b72);
+		// Walk the block list within this heap. Header/state per block:
+		//   allocated: block[+0]=slack-byte<<8 (low byte 0); block[+4]=size
+		//   free:      block[+0]=size; block[+4]=next-free-pointer-ish
+		// Walk from arena+204 (the first-block VA per NewHeap layout)
+		// advancing by `size` chosen as block[+4] if nonzero else block[+0].
+		// Cap at 256 blocks per heap to bound the dump.
+		KUInt32 walk = base + 204;
+		KUInt32 heap_end = base + b56;     // arena+arg1 = end-of-arena
+		int n = 0;
+		while (walk < heap_end && n < 256) {
+			KUInt32 b0 = 0, b4w = 0, b8 = 0, b12 = 0;
+			td_read(mem, walk + 0,  b0);
+			td_read(mem, walk + 4,  b4w);
+			td_read(mem, walk + 8,  b8);
+			td_read(mem, walk + 12, b12);
+			KUInt32 sz = (b4w != 0) ? b4w : b0;
+			const char* state = ((b0 & 0xff) == 0) ? "ALLOC" : "FREE ";
+			if (sz < 16 || sz > (heap_end - walk)) {
+				std::fprintf(stdout,
+					"    block[%3d] @0x%08x SIZE-OOR sz=0x%08x b0=0x%08x b4=0x%08x  (stop walk)\n",
+					n, walk, sz, b0, b4w);
+				break;
+			}
+			std::fprintf(stdout,
+				"    block[%3d] @0x%08x %s sz=0x%08x b0=0x%08x b8=0x%08x task=0x%08x\n",
+				n, walk, state, sz, b0, b8, b12);
+			walk += sz;
+			++n;
+		}
+		// Don't re-scan inside this heap.
+		va = base + b56;
+	}
+	std::fprintf(stdout, "heap-alloc-enum[%s]: found %d heaps with 'aiks' magic\n",
+		tag, found);
+	std::fflush(stdout);
+}
+
+// Locale-init cross-check vs baremetal hypervisor. The baremetal boot
+// wedges in ROMCacheLocaleAttributes at PC=0xeccac because *gLocaleCache
+// (VA 0x0c106198) is still 0 — InitInternationalUtils hasn't run when
+// bootinitnsglobals NS code calls FSetLocale. Dump the same memory on
+// Einstein to see (a) whether *gLocaleCache becomes non-zero before
+// FSetLocale would run, and (b) what the surrounding state looks like.
+void locale_dump(TMemory* mem, const char* tag) {
+	KUInt32 glc = 0;
+	td_read(mem, 0x0c106198u, glc);
+	std::fprintf(stdout, "locale-dump[%s]: *gLocaleCache(0x0c106198)=0x%08x\n",
+		tag, glc);
+	// Dump 11 cache slots (gLocaleCache spans 0x0c106198..0x0c1061c4
+	// = 11 × 4 bytes) plus 2 derefs for slot 0/1 to compare against
+	// the baremetal probe data:
+	for (int i = 0; i < 11; ++i) {
+		KUInt32 va = 0x0c106198u + i * 4;
+		KUInt32 v = 0;
+		td_read(mem, va, v);
+		KUInt32 deref = 0;
+		if (v != 0) td_read(mem, v, deref);
+		std::fprintf(stdout,
+			"  gLocaleCache[%2d] @0x%08x = 0x%08x  *deref = 0x%08x\n",
+			i, va, v, deref);
+	}
+	// gSpaceStr / dictionary globals.
+	for (int i = 0; i < 6; ++i) {
+		KUInt32 va = 0x0c100f84u + i * 4;
+		KUInt32 v = 0;
+		td_read(mem, va, v);
+		const char* name = "";
+		switch (va) {
+			case 0x0c100f84: name = " gSpaceStr"; break;
+			case 0x0c100f88: name = " gZeroStr"; break;
+			case 0x0c100f8c: name = " gTimeLexDictionary"; break;
+			case 0x0c100f90: name = " gDateLexDictionary"; break;
+			case 0x0c100f94: name = " gPhoneLexDictionary"; break;
+			case 0x0c100f98: name = " gNumberLexDictionary"; break;
+		}
+		std::fprintf(stdout, "  @0x%08x = 0x%08x%s\n", va, v, name);
+	}
+	std::fflush(stdout);
+}
+
 void usage(const char* argv0) {
 	std::fprintf(stderr,
 		"usage: %s <rom.bin> [rex.bin|-] [wall-seconds]\n"
@@ -823,6 +1003,9 @@ int main(int argc, char** argv) {
 	TUsermodeNetwork net(&log);
 
 	TEmulator emu(&log, &rom, flashPath, &sound, &screen, &net, kDefaultRAMSize);
+	// Make memory accessible to probe_record_call's branch-chain walker.
+	extern TMemory* g_probe_mem;
+	g_probe_mem = emu.GetMemory();
 
 	// Run in a background thread and stop after wallSeconds of wall-clock
 	// time. TEmulator::Run uses the full JIT and drives interrupts, which
@@ -852,6 +1035,10 @@ int main(int argc, char** argv) {
 		if (mmuReported && now >= next_dump) {
 			char tag[32];
 			std::snprintf(tag, sizeof(tag), "t=%ds", dump_n * 2 + 2);
+			// Locale-cache check FIRST so it survives any later crash.
+			locale_dump(emu.GetMemory(), tag);
+			// Heap-allocation enumeration — what NewHeap calls have run.
+			heap_alloc_enum(emu.GetMemory(), tag);
 			task_dump(emu.GetMemory(), tag);
 			// Cross-check the cdsv-vs-pckm slot: in our hypervisor this
 			// task struct currently faults with FAR=0x6e657774 ("newt")

@@ -274,7 +274,60 @@ const PATCHES_717006: &[RomPatch] = &[
     RomPatch { offset: 0x001F_902C, value: 0xE080_9601, name: "FMNewStack: add r9, r0, r1, lsl #12 (×4096)" },
     RomPatch { offset: 0x001F_9030, value: 0xE087_0187, name: "FMNewStack: add r0, r7, r7, lsl #3 (×9)" },
     RomPatch { offset: 0x001F_9034, value: 0xE049_0600, name: "FMNewStack: sub r0, r9, r0, lsl #12 (×4096, end-of-slot)" },
-    RomPatch { offset: 0x001F_9038, value: 0xE280_2A01, name: "FMNewStack: add r2, r0, #4096 (base = slot+guard)" },
+    // info[+4] / info[+24] are initialised from this `r2 = bottomOfStack + N`.
+    // Original kernel layout had a 1 KiB guard subpage at the bottom of each
+    // stack slot — info[+24] (the kernel's "minimum SP allowed") sat at
+    // slot_base + 1 KiB, leaving 32 KiB of stack data above it. We initially
+    // patched this to `+ 4 KiB` to match our enlarged 4 KiB-page guard, but
+    // user-mode code (especially exception-frame pushes, which can land 12
+    // bytes below SP) expects the original 1 KiB-guard geometry. With a
+    // 4 KiB info[+4], any write 12 bytes below the original bottom-of-data
+    // is rejected by ResolveFault (FAR < info[+24]) and the kernel throws
+    // exBusError — see the `BusErrorThrow` LoudHalt at TStackManager::Fault
+    // 0x001F_8534 and the marker stack walk in tstack-dump.
+    //
+    // The "guard" can't be hardware-enforced at sub-4-KiB granularity under
+    // ARMv7 anyway — the bottom 4 KiB page commits as a whole on first
+    // access. Reverting to `+1 KiB` keeps our logical info[+24] matching
+    // Einstein's, so the same user-code SP excursion that worked there
+    // works here. Stack overflows are still caught by the next slot's
+    // bottom not overlapping ours (slot stride 36 KiB, no sharing).
+    //
+    // Encoding: `add r2, r0, #1024` = ADD imm12: cond=E (always), op=2
+    // (add), S=0, Rn=0, Rd=2, imm12=0xB01 (rot=B → ROR(1, 22) = 0x400 = 1024).
+    RomPatch { offset: 0x001F_9038, value: 0xE280_2B01, name: "FMNewStack: add r2, r0, #1024 (info[+4] = slot_base + 1 KiB, original geometry)" },
+
+    // FMNewStack `stackNormalization` formula (the value passed as
+    // `(topOfStack - stackNormalization) / kPageSize + 1` to
+    // `TStackInfo::Init`). Source-level form:
+    //   stackNormalization = fBase
+    //     + (firstFree / kSubPagesPerPage) * kPageSize
+    //     + firstFree * (kStackSize - kSubPageSize);
+    // Compiles at 0x001F_9060..0x001F_906C as:
+    //   addmi r0, r0, #3      ; round-to-zero for /4 of signed firstFree
+    //   asr   r0, r0, #2      ; r0 = firstFree / kSubPagesPerPage  (=4)
+    //   add   r0, r1, r0, lsl #12   ; + (firstFree/4) * kPageSize  (=4096)
+    //   add   r0, r0, r6, lsl #15   ; + firstFree * 32768
+    //                               ;   = firstFree * (kStackSize - kSubPageSize)
+    //                               ;   with kStackSize=33792, kSubPageSize=1024
+    //
+    // After the FMNewStack patches above, kStackSize is 36864 but the
+    // `lsl #15` (=32768) is still `kStackSize - kSubPageSize` for the
+    // ORIGINAL kSubPageSize=1024. We want kSubPageSize = kPageSize = 4096
+    // and kSubPagesPerPage = 1, which makes:
+    //   stackNormalization = fBase + firstFree*kPageSize + firstFree*32768
+    //                      = fBase + firstFree*(4096+32768)
+    //                      = fBase + firstFree*36864     (= firstFree*kStackSize ✓)
+    // — so the existing `lsl #15` stays, but the divide-by-4 must go.
+    // NOP both `addmi` and `asr` so r0 = firstFree (unchanged) into the
+    // `add r0, r1, r0, lsl #12`.
+    //
+    // Without this patch: stackNormalization is under-counted by
+    // r * kSubPageSize (= up to 3072 bytes) when firstFree % 4 != 0,
+    // which over-sizes num_entries passed to `TStackInfo::Init` and
+    // causes a much larger slot array than actually needed.
+    RomPatch { offset: 0x001F_9060, value: 0xE1A0_0000, name: "FMNewStack: NOP (was addmi r0, r0, #3 — kSubPagesPerPage→1)" },
+    RomPatch { offset: 0x001F_9064, value: 0xE1A0_0000, name: "FMNewStack: NOP (was asr r0, r0, #2 — kSubPagesPerPage→1)" },
 
     // Heap-domain divisor patches.
     //
@@ -374,6 +427,15 @@ pub const REBOOT_PC: u32 = 0x000D_9884;
 /// the first word with `HVC #HvcImm::LoudHalt` so the host stops
 /// immediately on entry.
 pub const STOP_IMAGE_PC: u32 = 0x0038_D174;
+
+/// Phase-B busError-throw probe: `bl Throw` inside `TStackManager::Fault`
+/// at 0x001F_8534. Reached when ResolveFault returned an error code
+/// other than 0 / 4 (i.e. `-10203`/`-10204` "FAR out of stack range").
+/// The kernel's path is: build exBusError args (r0=&exBusError, r1=info,
+/// r2=0) and `bl Throw`. We replace the `bl Throw` with `HVC #LoudHalt`
+/// so we capture r0/r1/r5/FAR + caller_lr at the throw site, before the
+/// C++ unwinder swallows the context.
+pub const BUS_ERROR_THROW_PC: u32 = 0x001F_8534;
 
 /// Phase-B canary: `BootOS` / `ROMBoot` at 0x0001_8688. The AArch32
 /// reset vector at VA 0 is `B 0x18688`, so the first execution after
@@ -1604,6 +1666,7 @@ unsafe fn apply_loud_halt_traps(rom_ptr: *mut u32) {
         (POWEROFF_REBOOT_PC, "PowerOffAndReboot"),
         (REBOOT_PC, "Reboot"),
         (STOP_IMAGE_PC, "StopImage"),
+        (BUS_ERROR_THROW_PC, "BusErrorThrow"),
     ] {
         let idx = (pc / 4) as usize;
         unsafe {
@@ -1723,25 +1786,49 @@ unsafe fn apply_resolve_fault_wrapper(rom_ptr: *mut u32) {
     //   +0x34  mov   r0, r4                    ; r0 = TStackManager*
     //   +0x38  mov   r1, r5                    ; r1 = TStackInfo*
     //   +0x3c  bl    ResolveFault              ; original kernel function
-    //   +0x40  cmp   r0, #0
-    //   +0x44  bne   done                      ; on error: skip remaining iterations
-    //   +0x48  add   r10, r10, #1
-    //   +0x4c  cmp   r10, #4
-    //   +0x50  blt   iter (back to +0x2c)
-    //   +0x54  mov   r0, #0                    ; reach done with r0=0 (success)
-    //   +0x58  done: str r8, [r6, #68]         ; restore original FAR
-    //   +0x5c  pop   {r4-r10, pc}
+    //   +0x2c  mov   r9, #1                    ; r9 = "all_failed" flag (1 = no success seen yet)
+    //   +0x30  add   r0, r7, r10, lsl #10      ; (loop start) FAR = page_base + sub*1024
+    //   +0x34  str   r0, [r6, #68]
+    //   +0x38  mov   r0, r4
+    //   +0x3c  mov   r1, r5
+    //   +0x40  bl    ResolveFault
+    //   +0x44  cmp   r0, #0
+    //   +0x48  bgt   done                      ; positive r0 (e.g. r0=4 FindOrAllocPage fail) → propagate
+    //   +0x4c  moveq r9, #0                    ; r0==0 (success): clear "all_failed" flag
+    //   +0x50  add   r10, r10, #1
+    //   +0x54  cmp   r10, #4
+    //   +0x58  blt   iter (back to +0x30)
+    //   +0x5c  cmp   r9, #1                    ; all 4 iters failed?
+    //   +0x60  movne r0, #0                    ; if not (some success), return r0=0; else keep last r0
+    //   +0x64  done: str r8, [r6, #68]         ; restore original FAR
+    //   +0x68  pop   {r4-r10, pc}
     //
     // NOTE on iter return codes: stock ResolveFault returns -10203 /
-    // -10204 if the FAR we passed is out of the stack's [info[24], info[28])
-    // range. For an edge-page FAR aligned to subpage 0 of the page, sub
-    // indices below info[24] (= the kernel's actual stack lower bound,
-    // not the page boundary computed from info[20]) generate -10203.
-    // We treat those as "subpage belongs to another stack — skip" and
-    // only propagate r0==4 (FindOrAllocPage failure) to the caller.
-    let resolve_fault_wrapper_pc = alloc_patch_stub(24, "ResolveFault wrapper");
-    let bl_pc = resolve_fault_wrapper_pc + 0x3C;
-    let stub: [u32; 24] = [
+    // -10204 if the FAR we passed is out of the stack's [info[24],
+    // info[28]) range. Under the 1 KiB-guard geometry (info[+4] =
+    // slot_base + 1 KiB), iter 0 of the bottom 4 KiB page (FAR =
+    // slot_base + 0) is *always* below info[+24] and returns -10203,
+    // even when the user's actual fault VA is in iter 1/2/3's range
+    // and a real page commit is needed there. We must NOT propagate
+    // those -10203s — doing so false-positives on every legitimate
+    // bottom-page fault. Treat any negative r0 as "this subpage isn't
+    // ours, skip" and let the iters that *are* in range commit the
+    // page. The trailing `mov r0, #0` returns success unconditionally
+    // on loop completion: at least one iter either commits the page
+    // or finds it already committed.
+    //
+    // Positive errors (r0=4 = FindOrAllocPage failure) are propagated
+    // immediately via `bgt done` — silently ignoring them would let
+    // the kernel re-fault forever on a page that can never be
+    // allocated.
+    //
+    // (An earlier revision used `bne done` and was reverted because it
+    // false-positived on iter 0's -10203 from the bottom-page commit,
+    // throwing exBusError on every legitimate stack-grow fault into
+    // the bottom 4 KiB page.)
+    let resolve_fault_wrapper_pc = alloc_patch_stub(27, "ResolveFault wrapper");
+    let bl_pc = resolve_fault_wrapper_pc + 0x40;
+    let stub: [u32; 27] = [
         0xE92D_47F0,                            // +0x00 push {r4-r10, lr}
         0xE1A0_4000,                            // +0x04 mov r4, r0
         0xE1A0_5001,                            // +0x08 mov r5, r1
@@ -1753,19 +1840,22 @@ unsafe fn apply_resolve_fault_wrapper(rom_ptr: *mut u32) {
         0xE1A0_7607,                            // +0x20 mov r7, r7, lsl #12
         0xE089_7007,                            // +0x24 add r7, r9, r7
         0xE3A0_A000,                            // +0x28 mov r10, #0
-        0xE087_050A,                            // +0x2c add r0, r7, r10, lsl #10
-        0xE586_0044,                            // +0x30 str r0, [r6, #68]
-        0xE1A0_0004,                            // +0x34 mov r0, r4
-        0xE1A0_1005,                            // +0x38 mov r1, r5
-        arm_bl(bl_pc, RESOLVE_FAULT_PC),        // +0x3c bl ResolveFault
-        0xE350_0000,                            // +0x40 cmp r0, #0
-        0x1A00_0003,                            // +0x44 bne done — propagate ANY error (was beq on r0==4 only)
-        0xE28A_A001,                            // +0x48 add r10, r10, #1
-        0xE35A_0004,                            // +0x4c cmp r10, #4
-        0xBAFF_FFF5,                            // +0x50 blt iter (offset -11 words from PC+8)
-        0xE3A0_0000,                            // +0x54 mov r0, #0  (all iters done → success)
-        0xE586_8044,                            // +0x58 done: str r8, [r6, #68]
-        0xE8BD_87F0,                            // +0x5c pop {r4-r10, pc}
+        0xE3A0_9001,                            // +0x2c mov r9, #1  (= "all_failed" flag, init = 1)
+        0xE087_050A,                            // +0x30 add r0, r7, r10, lsl #10
+        0xE586_0044,                            // +0x34 str r0, [r6, #68]
+        0xE1A0_0004,                            // +0x38 mov r0, r4
+        0xE1A0_1005,                            // +0x3c mov r1, r5
+        arm_bl(bl_pc, RESOLVE_FAULT_PC),        // +0x40 bl ResolveFault
+        0xE350_0000,                            // +0x44 cmp r0, #0
+        0xCA00_0005,                            // +0x48 bgt done — propagate r0>0 only
+        0x03A0_9000,                            // +0x4c moveq r9, #0 — success: clear "all_failed"
+        0xE28A_A001,                            // +0x50 add r10, r10, #1
+        0xE35A_0004,                            // +0x54 cmp r10, #4
+        0xBAFF_FFF5,                            // +0x58 blt iter (offset -11 words from PC+8 → +0x30)
+        0xE359_0001,                            // +0x5c cmp r9, #1 — all_failed?
+        0x13A0_0000,                            // +0x60 movne r0, #0 — some success → return 0
+        0xE586_8044,                            // +0x64 done: str r8, [r6, #68]
+        0xE8BD_87F0,                            // +0x68 pop {r4-r10, pc}
     ];
     unsafe {
         for (i, w) in stub.iter().copied().enumerate() {

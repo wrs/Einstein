@@ -401,304 +401,399 @@ fn print_object(indent: &str, obj: newton_objects::Object<'_>, _depth: u32) {
     }
 }
 
-// ---------------- recursive pretty printer ----------------------------
+// ---------------- compact pretty printer ------------------------------
 //
-// `pretty_print_ref(ref_value, depth)` prints a Newton object Ref with
-// up to `depth` levels of recursive expansion. Pointer Refs read 256
-// bytes of guest memory at the pointee, parse with newton-objects, and
-// print a structured view:
+// One-line NewtonScript-style rendering of a Ref:
 //
-//   - immediate Refs (NIL, TRUE, integers, chars, magic-pointers,
-//     specials) are printed inline on a single line.
-//   - real-pointer Refs are decoded to Object::Binary / Symbol /
-//     Array / Frame, with depth-controlled recursion into:
-//       binary class, symbol name, string contents (UTF-16BE),
-//       frame map and slot Refs, array class and element Refs.
+//   integer       → 1234
+//   character     → $a   (or $É for non-ASCII)
+//   true / nil    → true / nil
+//   special       → <? #hex>
+//   magic-ptr     → @table.index
+//   symbol        → 'name
+//   'string       → "text"          (UCS-2 BE on Newton, ASCII subset
+//                                    decoded; non-printable → \uXXXX)
+//   array         → [a, b, c, ...]
+//   frame         → {key: v, key: v, ...}
+//   unreadable / parse error / unknown binary → <? #hex>
 //
-// Each recursion level reads a fresh 256-byte buffer from guest
-// memory; per-call stack ≈ 256 + ~64 bytes of locals. Keep `depth`
-// small (≤ 4) to bound stack use.
+// `depth` controls how many levels of *structure* to expand. At
+// depth=0 every pointer Ref prints as `#hex` — including symbols
+// and strings; turn the dial up to see contents. At depth=N, an
+// array/frame is expanded once and each of its slot Refs is
+// rendered at depth=N-1.
 //
-// Single entry point used from the trap probes:
-//   crate::heap_check::pretty_print_ref("    key", key_ref, 3);
+// Per recursion level we read a fresh 256-byte buffer from guest
+// memory (≈ stack budget); keep `depth` ≤ 4.
 
-/// Pretty-print a NewtonScript Ref recursively, up to `depth` levels of
-/// pointee expansion. `label` prefixes the first line; subsequent
-/// recursed levels indent with two spaces per level.
+/// Pretty-print a NewtonScript Ref on a single line, with
+/// `depth` levels of structural expansion (default 0 — pointers
+/// render as `#hex`). Emits "label: <ref>\n"; pass `""` for a
+/// bare-line print. Inline composition (no newline, no label) is
+/// available via [`pretty_print_ref_inline`].
 pub fn pretty_print_ref(label: &str, ref_value: u32, depth: u32) {
-    pretty_print_ref_at(label, ref_value, depth, 0);
-}
-
-const MAX_INDENT_LEVELS: usize = 6;
-
-fn indent_str(level: u32) -> &'static str {
-    // Up to 6 levels × 2 spaces; clamp on overflow.
-    const SPACES: &str = "                "; // 16 spaces
-    let n = (level as usize * 2).min(MAX_INDENT_LEVELS * 2).min(SPACES.len());
-    &SPACES[..n]
-}
-
-fn pretty_print_ref_at(label: &str, ref_value: u32, depth: u32, level: u32) {
-    let ind = indent_str(level);
-    let r = newton_objects::Ref(ref_value);
-    use newton_objects::RefKind;
-    match r.kind() {
-        RefKind::Integer(i) => {
-            crate::kprintln!("{}{}{}: integer {} ({:#010x})", ind, label,
-                if label.is_empty() { "" } else { " " }, i, ref_value);
-        }
-        RefKind::Character(c) => {
-            crate::kprintln!("{}{}{}: char U+{:04x} ({:#010x})", ind, label,
-                if label.is_empty() { "" } else { " " }, c, ref_value);
-        }
-        RefKind::Special(_) if r.is_nil() => {
-            crate::kprintln!("{}{}{}: NIL", ind, label,
-                if label.is_empty() { "" } else { " " });
-        }
-        RefKind::Special(s) => {
-            crate::kprintln!("{}{}{}: special {:#x} ({:#010x})", ind, label,
-                if label.is_empty() { "" } else { " " }, s, ref_value);
-        }
-        RefKind::MagicPointer { table, index } => {
-            crate::kprintln!("{}{}{}: magic-ptr {}:{} ({:#010x})", ind, label,
-                if label.is_empty() { "" } else { " " }, table, index, ref_value);
-        }
-        RefKind::Pointer(addr) => {
-            // Read pointee bytes and parse with newton-objects.
-            let mut buf = [0u8; 256];
-            let n = match crate::guest_endian::guest_read_bytes_va(addr, &mut buf) {
-                Some(n) => n,
-                None => {
-                    crate::kprintln!("{}{}{}: ptr@{:#010x} <unreadable>", ind, label,
-                        if label.is_empty() { "" } else { " " }, addr);
-                    return;
-                }
-            };
-            let bytes = &buf[..n];
-            let heap = newton_objects::Heap::with_load_addr(bytes, addr);
-            match heap.object_at(addr) {
-                Ok(obj) => print_object_recursive(label, obj, depth, level),
-                Err(e) => crate::kprintln!("{}{}{}: ptr@{:#010x} parse-err: {}",
-                    ind, label, if label.is_empty() { "" } else { " " }, addr, e),
-            }
-        }
+    if !label.is_empty() {
+        crate::kprint!("{}: ", label);
     }
+    write_ref(ref_value, depth);
+    crate::kprintln!();
 }
 
-fn print_object_recursive(
-    label: &str,
-    obj: newton_objects::Object<'_>,
-    depth: u32,
-    level: u32,
-) {
-    use newton_objects::Object;
-    let ind = indent_str(level);
-    let lp = if label.is_empty() { "" } else { " " };
-    match obj {
-        Object::Binary(b) => {
-            if let Some(sym) = b.as_symbol() {
-                let name = sym.name().unwrap_or("<bad-utf8>");
-                crate::kprintln!("{}{}{}: symbol '{} (hash={:#010x}) @{:#010x}",
-                    ind, label, lp, name, sym.hash(), b.offset());
-            } else {
-                let class = b.class();
-                let data = b.data();
-                crate::kprintln!("{}{}{}: binary class={:?} @{:#010x} size={} data_len={}",
-                    ind, label, lp, class, b.offset(), b.size(), data.len());
-                // Try interpreting data as a UTF-16BE 'string.
-                print_data_preview(level + 1, data);
-                if depth > 0 && class.is_pointer() {
-                    pretty_print_ref_at("class", class.raw(), depth - 1, level + 1);
-                }
-            }
-        }
-        Object::Array(a) => {
-            crate::kprintln!("{}{}{}: array class={:?} @{:#010x} size={} len={}",
-                ind, label, lp, a.class(), a.offset(), a.size(), a.len());
-            for (i, slot_ref) in a.iter().enumerate().take(8) {
-                if depth > 0 {
-                    pretty_print_inline_index("[", i, slot_ref.raw(), depth - 1, level + 1);
-                } else {
-                    crate::kprintln!("{}  [{}] = {:?}", ind, i, slot_ref);
-                }
-            }
-            if a.len() > 8 {
-                crate::kprintln!("{}  ... ({} more slots)", ind, a.len() - 8);
-            }
-            if depth > 0 && a.class().is_pointer() {
-                pretty_print_ref_at("class", a.class().raw(), depth - 1, level + 1);
-            }
-        }
-        Object::Frame(f) => {
-            crate::kprintln!("{}{}{}: frame map={:?} @{:#010x} size={} len={}",
-                ind, label, lp, f.map(), f.offset(), f.size(), f.len());
-            // Resolve slot names by walking the map chain. Print
-            // "name = value" pairs rather than positional slot[N].
-            let frame_len = f.len();
-            for (i, slot_ref) in f.iter_slots().enumerate().take(16) {
-                let mut name_buf = [0u8; 64];
-                let n = resolve_slot_name_into(f.map().raw(), i, frame_len, &mut name_buf);
-                let name = if n > 0 {
-                    core::str::from_utf8(&name_buf[..n]).unwrap_or("?")
-                } else {
-                    ""
-                };
-                let inner_ind = indent_str(level + 1);
-                if name.is_empty() {
-                    crate::kprintln!("{}slot[{}] = {:?}", inner_ind, i, slot_ref);
-                } else {
-                    crate::kprintln!("{}{} = {:?}", inner_ind, name, slot_ref);
-                }
-                if depth > 0 && slot_ref.is_pointer() {
-                    pretty_print_ref_at("→", slot_ref.raw(), depth - 1, level + 2);
-                }
-            }
-            if f.len() > 16 {
-                crate::kprintln!("{}  ... ({} more slots)", ind, f.len() - 16);
-            }
-        }
-    }
+/// As [`pretty_print_ref`], but emits only the compact rendering —
+/// no label, no trailing newline. Use to compose probe headers
+/// like `kprint!("StorePermObject[{}]: ", n);
+/// pretty_print_ref_inline(r, 1); kprintln!(" lr={:#x}", lr);`.
+pub fn pretty_print_ref_inline(ref_value: u32, depth: u32) {
+    write_ref(ref_value, depth);
 }
 
-fn pretty_print_inline_index(prefix: &str, idx: usize, ref_value: u32, depth: u32, level: u32) {
-    // Build a label like "[3]" or "slot[3]" without alloc — use kprintln
-    // directly for the header line, then recurse without a label. The
-    // simplest path: print the header+ref summary inline, then recurse
-    // for pointee details.
-    let ind = indent_str(level);
-    crate::kprintln!("{}{}{}] = {:?}", ind, prefix, idx, newton_objects::Ref(ref_value));
-    let r = newton_objects::Ref(ref_value);
-    if r.is_pointer() {
-        pretty_print_ref_at("→", ref_value, depth, level + 1);
-    }
-}
-
-/// Print an interpretation of binary `data`: UTF-16BE chars (for
-/// 'string objects) and/or a leading 4-byte hash + ASCII tail (for
-/// symbols misclassed as plain binaries). Always shows up to 16 hex
-/// bytes of raw data.
-fn print_data_preview(level: u32, data: &[u8]) {
-    if data.is_empty() {
+fn write_ref(ref_value: u32, depth: u32) {
+    use newton_objects::{Ref, RefKind};
+    let r = Ref(ref_value);
+    if r.0 == Ref::TRUE.0 {
+        crate::kprint!("true");
         return;
     }
-    let ind = indent_str(level);
-
-    // Hex preview (16 bytes max).
-    let n = data.len().min(16);
-    let mut hex = [b' '; 16 * 3];
-    let mut hp = 0;
-    for i in 0..n {
-        if i > 0 { hex[hp] = b' '; hp += 1; }
-        let b = data[i];
-        hex[hp]     = nibble_to_hex(b >> 4);
-        hex[hp + 1] = nibble_to_hex(b & 0xf);
-        hp += 2;
+    if r.is_nil() {
+        crate::kprint!("nil");
+        return;
     }
-    let hex_str = core::str::from_utf8(&hex[..hp]).unwrap_or("?");
-    crate::kprintln!("{}data hex: {}{}", ind, hex_str,
-        if data.len() > 16 { " ..." } else { "" });
-
-    // UTF-16BE interpretation (string).
-    let mut sbuf = [b'?'; 32];
-    let mut sn = 0usize;
-    let mut nul_seen = false;
-    for chunk in data.chunks_exact(2).take(sbuf.len()) {
-        let hi = chunk[0];
-        let lo = chunk[1];
-        if hi == 0 && lo == 0 { nul_seen = true; break; }
-        sbuf[sn] = if hi == 0 && (0x20..0x7f).contains(&lo) { lo } else { b'?' };
-        sn += 1;
-    }
-    if sn > 0 || nul_seen {
-        let s = core::str::from_utf8(&sbuf[..sn]).unwrap_or("?");
-        crate::kprintln!("{}as-utf16be: \"{}\"{}", ind, s,
-            if nul_seen { " (NUL-terminated)" } else { "" });
+    match r.kind() {
+        RefKind::Integer(i) => crate::kprint!("{}", i),
+        RefKind::Character(c) => write_char_literal(c),
+        RefKind::Special(_) => crate::kprint!("<? #{:x}>", ref_value),
+        RefKind::MagicPointer { table, index } => crate::kprint!("@{}.{}", table, index),
+        RefKind::Pointer(addr) => write_pointee(addr, ref_value, depth),
     }
 }
 
-fn nibble_to_hex(n: u8) -> u8 {
-    match n & 0xf {
-        0..=9 => b'0' + n,
-        a => b'a' + (a - 10),
+/// Object header: high 24 bits of word 0 = size (bytes incl. header
+/// + class/map + body), low 8 bits = flags (`0x01` = slotted,
+/// `0x02` = frame, `0x40` = base bit, GC bits in the high nibble).
+/// Word 1 is the GC/refcount field (not consulted here). Class or
+/// map Ref sits at word 2 (offset +8), body slots/data start at +12.
+fn read_obj_header(addr: u32) -> Option<(u32 /*size*/, u8 /*flags*/, u32 /*class_or_map*/)> {
+    let w0 = crate::guest_endian::guest_read_u32_va(addr)?;
+    let class = crate::guest_endian::guest_read_u32_va(addr.wrapping_add(8))?;
+    let size = w0 >> 8;
+    let flags = (w0 & 0xFF) as u8;
+    if size < 12 { return None; }
+    Some((size, flags, class))
+}
+
+const KOBJ_SLOTTED: u8 = 0x01;
+const KOBJ_FRAME: u8 = 0x02;
+/// Forwarding-pointer flag in the header byte. The "object" is a
+/// 12-byte stub: header + (unused) word + the forwarding Ref at
+/// the slot normally used for class/map. Newton emits these when
+/// it relocates an object during GC/compaction so existing Refs
+/// to the old address keep resolving via one extra hop.
+const KOBJ_FORWARDED: u8 = 0x20;
+const MAX_FORWARD_HOPS: u32 = 8;
+
+/// Render the pointee of a pointer Ref. Reads the object header
+/// directly from guest memory (one word at a time) instead of
+/// buffering the whole body, so arbitrarily-sized objects (fault
+/// blocks, big slot arrays) work without an upper-bound buffer.
+fn write_pointee(addr: u32, ref_value: u32, depth: u32) {
+    if depth == 0 {
+        crate::kprint!("#{:x}", ref_value);
+        return;
+    }
+    // Resolve forwarding chain. Each hop emits a `→` and follows
+    // the forwarding Ref (stored at the class-or-map slot of the
+    // 12-byte forwarding stub). Forwarding is transparent — depth
+    // is not decremented — so the user sees the actual object as
+    // if directly referenced. Bounded to MAX_FORWARD_HOPS to
+    // protect against a self-referential forwarding bug.
+    let mut cur_addr = addr;
+    let mut cur_ref = ref_value;
+    let (size, flags, class_or_map) = {
+        let mut hops = 0u32;
+        loop {
+            let (s, f, c) = match read_obj_header(cur_addr) {
+                Some(x) => x,
+                None => { write_squirrely_at(cur_addr, cur_ref); return; }
+            };
+            if (f & KOBJ_FORWARDED) == 0 {
+                break (s, f, c);
+            }
+            crate::kprint!("→");
+            hops += 1;
+            if hops > MAX_FORWARD_HOPS {
+                crate::kprint!(" <fwd-loop?>");
+                return;
+            }
+            let next_ref = c;
+            let next = newton_objects::Ref(next_ref);
+            match next.pointer_offset() {
+                Some(a) => { cur_addr = a; cur_ref = next_ref; }
+                None => {
+                    // Forwarded to an immediate Ref — render it
+                    // and stop.
+                    write_ref(next_ref, depth);
+                    return;
+                }
+            }
+        }
+    };
+    let addr = cur_addr;
+    let ref_value = cur_ref;
+    let body_bytes = size - 12;
+    let slot_count = (body_bytes / 4) as usize;
+
+    let slotted = (flags & KOBJ_SLOTTED) != 0;
+    let is_frame = (flags & KOBJ_FRAME) != 0;
+
+    if !slotted {
+        write_binary_at(addr, ref_value, size, class_or_map);
+        return;
+    }
+
+    let (open, close) = if is_frame { ('{', '}') } else { ('[', ']') };
+    crate::kprint!("{}", open);
+    const LIMIT: usize = 8;
+    let take = slot_count.min(LIMIT);
+    for i in 0..take {
+        if i > 0 { crate::kprint!(", "); }
+        if is_frame {
+            let mut name_buf = [0u8; 64];
+            let nn = resolve_slot_name_into(class_or_map, i, slot_count, &mut name_buf);
+            if nn > 0 {
+                let name = core::str::from_utf8(&name_buf[..nn]).unwrap_or("?");
+                crate::kprint!("{}: ", name);
+            } else {
+                // Map walk failed (NIL / broken / unknown) — fall back
+                // to a positional placeholder that's clearly not a
+                // resolved name so the reader doesn't mistake it for
+                // a real frame key.
+                crate::kprint!("?{}: ", i);
+            }
+        }
+        let slot_va = addr.wrapping_add(12).wrapping_add((i as u32) * 4);
+        match crate::guest_endian::guest_read_u32_va(slot_va) {
+            Some(s) => write_ref(s, depth - 1),
+            None => crate::kprint!("<? #?>"),
+        }
+    }
+    if slot_count > LIMIT { crate::kprint!(", ..."); }
+    crate::kprint!("{}", close);
+}
+
+/// Binary body. Symbols (class == `kSymbolClass` = 0x55552) →
+/// `'name`. Strings (class is a pointer to the symbol `'string`)
+/// → `"text"`. Anything else → `<bin 'classname N bytes>` (or
+/// `<bin class=#hex N bytes>` if the class symbol can't be
+/// resolved). The class lookup is forwarding-aware.
+fn write_binary_at(addr: u32, ref_value: u32, size: u32, class_ref: u32) {
+    let _ = ref_value;
+    if class_ref == newton_objects::SYMBOL_CLASS.raw() {
+        write_symbol_name_at(addr, size, ref_value);
+        return;
+    }
+    let mut name_buf = [0u8; 32];
+    let nn = read_symbol_name_into(newton_objects::Ref(class_ref), &mut name_buf);
+    let class_name = if nn > 0 {
+        core::str::from_utf8(&name_buf[..nn]).unwrap_or("")
+    } else {
+        ""
+    };
+    if class_name == "string" {
+        write_string_body_at(addr, size);
+        return;
+    }
+    let body_bytes = size.saturating_sub(12);
+    if class_name.is_empty() {
+        crate::kprint!("<bin class=#{:x} {} bytes>", class_ref, body_bytes);
+    } else {
+        crate::kprint!("<bin '{} {} bytes>", class_name, body_bytes);
     }
 }
 
-/// Resolve the symbol name for frame slot `slot_idx` by walking the
-/// map chain rooted at `map_ref_value`. Writes the symbol's name
-/// bytes into `out`; returns the number of bytes written (0 on any
-/// failure: NIL map, parse error, slot out of range, or non-symbol
-/// name slot).
+/// Symbol body layout: 4-byte hash at +12, NUL-terminated UTF-8
+/// name at +16. Read up to a small fixed cap (symbols are short).
+fn write_symbol_name_at(addr: u32, size: u32, ref_value: u32) {
+    const NAME_CAP: usize = 96;
+    let name_bytes = (size.saturating_sub(16) as usize).min(NAME_CAP);
+    // Round up to a 4-byte boundary: `guest_read_bytes_va` only
+    // writes whole words, so an odd byte count is silently
+    // truncated down to the previous multiple of 4 — chopping 1–3
+    // characters off the end of any name whose length isn't already
+    // word-aligned.
+    let read_len = ((name_bytes + 3) & !3).min(NAME_CAP);
+    let mut buf = [0u8; NAME_CAP];
+    if crate::guest_endian::guest_read_bytes_va(addr.wrapping_add(16), &mut buf[..read_len]).is_none() {
+        write_squirrely_at(addr, ref_value);
+        return;
+    }
+    let end = buf[..name_bytes].iter().position(|&b| b == 0).unwrap_or(name_bytes);
+    match core::str::from_utf8(&buf[..end]) {
+        Ok(s) => crate::kprint!("'{}", s),
+        Err(_) => write_squirrely_at(addr, ref_value),
+    }
+}
+
+/// Read the first chunk of a `'string` body and emit it as
+/// `"text"`, decoding UCS-2 BE word-by-word so we don't depend on
+/// the full body fitting in a buffer. Caps at MAX_CHARS units.
+fn write_string_body_at(addr: u32, size: u32) {
+    crate::kprint!("\"");
+    const MAX_CHARS: usize = 48;
+    let body_chars = size.saturating_sub(12) / 2;
+    let take = (body_chars as usize).min(MAX_CHARS);
+    let base = addr.wrapping_add(12);
+    let mut emitted = 0usize;
+    for w in 0..((take + 1) / 2) {
+        let word_va = base.wrapping_add((w as u32) * 4);
+        let word = match crate::guest_endian::guest_read_u32_va(word_va) {
+            Some(w) => w,
+            None => break,
+        };
+        // BE byte order: hi-hi, hi-lo, lo-hi, lo-lo.
+        let bytes = [(word >> 24) as u8, (word >> 16) as u8, (word >> 8) as u8, word as u8];
+        for pair in bytes.chunks_exact(2) {
+            if emitted == take { break; }
+            let c = ((pair[0] as u16) << 8) | (pair[1] as u16);
+            if c == 0 { emitted = take; break; }
+            write_string_char(c);
+            emitted += 1;
+        }
+    }
+    if (body_chars as usize) > MAX_CHARS { crate::kprint!("..."); }
+    crate::kprint!("\"");
+}
+
+/// Diagnostic emission when a pointer Ref's pointee can't be
+/// recognized: prints `<? #ref [w0 w1 w2 w3 w4 w5 w6 w7]>` with
+/// the first 8 words at `addr` so the caller can eyeball the raw
+/// header / class / body and figure out why decoding bailed.
+/// Words are shown in Newton-numerical (BE-equivalent) form, the
+/// same form `read_obj_header` sees; unreadable slots show as
+/// `--------`.
+fn write_squirrely_at(addr: u32, ref_value: u32) {
+    crate::kprint!("<? #{:x} [", ref_value);
+    for i in 0..8u32 {
+        if i > 0 { crate::kprint!(" "); }
+        match crate::guest_endian::guest_read_u32_va(addr.wrapping_add(i * 4)) {
+            Some(w) => crate::kprint!("{:08x}", w),
+            None => crate::kprint!("--------"),
+        }
+    }
+    crate::kprint!("]>");
+}
+
+
+fn write_string_char(c: u16) {
+    let cu = c as u32;
+    if c == b'\\' as u16 {
+        crate::kprint!("\\\\");
+    } else if c == b'"' as u16 {
+        crate::kprint!("\\\"");
+    } else if (0x20..0x7f).contains(&cu) {
+        crate::kprint!("{}", c as u8 as char);
+    } else {
+        crate::kprint!("\\u{:04x}", c);
+    }
+}
+
+fn write_char_literal(c: u16) {
+    let cu = c as u32;
+    if (0x20..0x7f).contains(&cu) {
+        crate::kprint!("${}", c as u8 as char);
+    } else {
+        crate::kprint!("$\\u{:04x}", c);
+    }
+}
+
+/// Follow forwarding pointers starting at `addr`, returning the
+/// (final-address, size, flags, class_or_map) of the underlying
+/// non-forwarded object, or `None` if the chain breaks (unreadable
+/// header, hop limit exceeded, forwarded to a non-pointer Ref).
+fn resolve_forwarding(addr: u32) -> Option<(u32, u32, u8, u32)> {
+    let mut a = addr;
+    for _ in 0..=MAX_FORWARD_HOPS {
+        let (size, flags, c) = read_obj_header(a)?;
+        if (flags & KOBJ_FORWARDED) == 0 {
+            return Some((a, size, flags, c));
+        }
+        let next = newton_objects::Ref(c);
+        a = next.pointer_offset()?;
+    }
+    None
+}
+
+/// Read a symbol's name bytes via direct guest reads (forwarding-
+/// aware). Returns the number of bytes written into `out`, or 0 if
+/// `r` isn't a pointer Ref, the chain isn't a binary with class
+/// `SYMBOL_CLASS`, or the read fails.
+fn read_symbol_name_into(r: newton_objects::Ref, out: &mut [u8]) -> usize {
+    let addr = match r.pointer_offset() { Some(a) => a, None => return 0 };
+    let (final_addr, size, flags, class) = match resolve_forwarding(addr) {
+        Some(x) => x,
+        None => return 0,
+    };
+    if (flags & KOBJ_SLOTTED) != 0 { return 0; }
+    if class != newton_objects::SYMBOL_CLASS.raw() { return 0; }
+    let name_bytes = (size.saturating_sub(16) as usize).min(out.len());
+    // Round up to 4 — see `write_symbol_name_at` for why.
+    let read_len = ((name_bytes + 3) & !3).min(out.len());
+    if crate::guest_endian::guest_read_bytes_va(
+        final_addr.wrapping_add(16), &mut out[..read_len]
+    ).is_none() {
+        return 0;
+    }
+    out[..name_bytes].iter().position(|&b| b == 0).unwrap_or(name_bytes)
+}
+
+/// Resolve the symbol name for frame slot `slot_idx` by walking
+/// the map chain rooted at `map_ref_value`. Writes the symbol's
+/// name bytes into `out`; returns 0 on any failure (NIL map,
+/// parse error, slot out of range, non-symbol name slot, broken
+/// forwarding chain).
 ///
-/// Map convention (per newton-objects): slot[0] is the supermap
-/// (NIL terminator), slots[1..N] name the *last* N positional slots
-/// of the frame. We descend into the supermap first to consume the
-/// leading frame slots; what remains is named locally.
+/// Map convention: slot[0] is the supermap (NIL terminates),
+/// slots[1..N] name the *last* N positional slots of the frame.
+/// Maps are read via direct word loads with forwarding-pointer
+/// resolution at each level, so a relocated map still resolves.
 fn resolve_slot_name_into(
     map_ref_value: u32,
     slot_idx: usize,
     frame_len: usize,
     out: &mut [u8],
 ) -> usize {
-    // Iterative supermap walk. At each level we read the map's bytes
-    // into a fresh local buffer, then either descend (if slot is
-    // covered by the supermap) or emit a local-symbol name.
     let mut current = newton_objects::Ref(map_ref_value);
     let mut frame_slots_remaining = frame_len;
-    let slot_offset_from_top = slot_idx; // counted from frame-slot[0]
-    // Bound the supermap-walk depth to avoid runaway recursion.
+    let slot_offset_from_top = slot_idx;
     for _ in 0..8 {
         if !current.is_pointer() { return 0; }
-        let map_addr = match current.pointer_offset() { Some(a) => a, None => return 0 };
-        let mut map_buf = [0u8; 256];
-        let map_n = match crate::guest_endian::guest_read_bytes_va(map_addr, &mut map_buf) {
-            Some(n) => n,
+        let raw_addr = match current.pointer_offset() { Some(a) => a, None => return 0 };
+        let (map_addr, map_size, map_flags, _) = match resolve_forwarding(raw_addr) {
+            Some(x) => x,
             None => return 0,
         };
-        let heap = newton_objects::Heap::with_load_addr(&map_buf[..map_n], map_addr);
-        let arr = match heap.object_at(map_addr).ok().and_then(|o| o.as_array().ok()) {
-            Some(a) => a,
-            None => return 0,
-        };
-        // local_count = number of names this map carries (slots[1..N]).
-        let local_count = arr.len().saturating_sub(1);
-        // The map's local names cover the LAST `local_count` slots of
-        // the frame. Earlier slots (if any) come from the supermap.
+        if (map_flags & KOBJ_SLOTTED) == 0 { return 0; } // map must be an array
+        let arr_len = (map_size.saturating_sub(12) / 4) as usize;
+        let local_count = arr_len.saturating_sub(1);
         let super_count = frame_slots_remaining.saturating_sub(local_count);
         if slot_offset_from_top < super_count {
-            // Descend into supermap. The supermap will see a frame
-            // that's `super_count` slots long.
-            let supermap = match arr.slot(0) { Some(s) => s, None => return 0 };
-            current = supermap;
+            // Descend into supermap (slot 0 of the map array).
+            let supermap_va = map_addr.wrapping_add(12);
+            let supermap_ref = match crate::guest_endian::guest_read_u32_va(supermap_va) {
+                Some(s) => s,
+                None => return 0,
+            };
+            current = newton_objects::Ref(supermap_ref);
             frame_slots_remaining = super_count;
-            // slot_offset_from_top stays the same — we're still
-            // counting from frame-slot[0].
             continue;
         }
         let local_idx = slot_offset_from_top - super_count;
         if local_idx >= local_count { return 0; }
-        // Slot 1+local_idx of the array is the name Ref (a symbol).
-        let name_ref = match arr.slot(1 + local_idx) { Some(r) => r, None => return 0 };
-        return read_symbol_name_into(name_ref, out);
+        let name_va = map_addr.wrapping_add(12 + ((1 + local_idx) as u32) * 4);
+        let name_ref_value = match crate::guest_endian::guest_read_u32_va(name_va) {
+            Some(r) => r,
+            None => return 0,
+        };
+        return read_symbol_name_into(newton_objects::Ref(name_ref_value), out);
     }
     0
-}
-
-/// Read a symbol's name bytes into `out`, returning the byte count
-/// written. Returns 0 if `r` is not a real-pointer Ref, the pointee
-/// can't be read, or the parsed object isn't a symbol.
-fn read_symbol_name_into(r: newton_objects::Ref, out: &mut [u8]) -> usize {
-    let addr = match r.pointer_offset() { Some(a) => a, None => return 0 };
-    let mut buf = [0u8; 256];
-    let n = match crate::guest_endian::guest_read_bytes_va(addr, &mut buf) {
-        Some(n) => n,
-        None => return 0,
-    };
-    let heap = newton_objects::Heap::with_load_addr(&buf[..n], addr);
-    let obj = match heap.object_at(addr) { Ok(o) => o, Err(_) => return 0 };
-    let bin = match obj.as_binary() { Ok(b) => b, Err(_) => return 0 };
-    let sym = match bin.as_symbol() { Some(s) => s, None => return 0 };
-    let nm = sym.name_bytes();
-    let copy = nm.len().min(out.len());
-    out[..copy].copy_from_slice(&nm[..copy]);
-    copy
 }

@@ -148,6 +148,19 @@ pub enum HvcImm {
     /// whether fLowerBounds is being dynamically modified during
     /// stack growth.
     ResolveFaultEntry,
+    /// Entry probe at `StorePermObject` (ROM 0x002D_F998).
+    /// Replaces the function's first instruction (`mov ip, sp`).
+    /// Handler dereferences R0 (a `RefVar const&`) to recover the
+    /// stored Ref, pretty-prints it via `newton-objects`,
+    /// emulates `mov ip, sp`, and advances ELR.
+    StorePermObjEntry,
+    /// Return probe at `LoadPermObject` (ROM 0x002D_F4C0).
+    /// Replaces the `mov r0, r4` immediately before the function's
+    /// `ldmdb` epilogue. R4 holds the Ref returned by the inner
+    /// `Read__18TStoreObjectReaderFv`. Handler pretty-prints R4
+    /// via `newton-objects`, emulates `r0 = r4`, and advances ELR
+    /// so the epilogue's `ldmdb` returns the same Ref to the caller.
+    LoadPermObjRet,
 }
 
 impl HvcImm {

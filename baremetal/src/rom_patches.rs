@@ -1011,6 +1011,7 @@ pub unsafe fn apply_717006_patches(rom_ptr: *mut u32) {
         apply_l1_cd_probes(rom_ptr);
         apply_fault_handler_ldr_byteswap_patches(rom_ptr);
         apply_resolve_fault_entry_probe(rom_ptr);
+        apply_storeperm_loadperm_probes(rom_ptr);
     }
 
     kprintln!("rom_patch: applied {} simple patches + 5 native-call/injection ROM patches + PowerOffAndReboot + Reboot + BootOS + L1[0xCD] probes + fault-handler LDR byteswap stubs", applied);
@@ -1783,6 +1784,70 @@ unsafe fn apply_resolve_fault_entry_probe(rom_ptr: *mut u32) {
         "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (ResolveFault entry probe, HVC #{:#x})",
         RESOLVE_FAULT_ENTRY_PC, prev, insn, HvcImm::ResolveFaultEntry as u32,
     );
+}
+
+/// First instruction of `StorePermObject` (ROM 0x002D_F998) —
+/// `mov ip, sp` (`0xE1A0_C00D`). Replaced with `HVC
+/// #StorePermObjEntry`; the handler dereferences R0 (a `RefVar
+/// const&`) to recover the Ref being stored, pretty-prints it via
+/// `newton-objects`, emulates the original `mov ip, sp` (writes
+/// `ctx.x[12] = source-mode SP`), and advances ELR past the HVC so
+/// the function's prologue picks up at instruction 2 (`push {…}`).
+const STORE_PERM_OBJECT_PC: u32 = 0x002D_F998;
+const STORE_PERM_OBJECT_ORIG_INSN: u32 = 0xE1A0_C00D;
+
+/// `mov r0, r4` immediately before `LoadPermObject`'s `ldmdb`
+/// epilogue at ROM 0x002D_F4C0 (`0xE1A0_0004`). The function saves
+/// the Ref returned by `Read__18TStoreObjectReaderFv` into R4,
+/// runs the destructor chain, then `mov r0, r4` to restore the
+/// return Ref before `ldmdb`. Replacing this site with `HVC
+/// #LoadPermObjRet` lets us pretty-print the Ref about to be
+/// returned. Handler emulates `r0 = r4` (R0 and R4 are unbanked
+/// across USR/UND so a direct `ctx.x[0] = ctx.x[4]` is correct in
+/// either dispatch path) and advances ELR.
+const LOAD_PERM_OBJECT_RET_PC: u32 = 0x002D_F4C0;
+const LOAD_PERM_OBJECT_RET_ORIG_INSN: u32 = 0xE1A0_0004;
+
+/// Install the StorePermObject entry probe + LoadPermObject
+/// return-site probe. Pair: each call to StorePermObject pretty-
+/// prints the RefArg being stored, each return from LoadPermObject
+/// pretty-prints the Ref being handed back. Used to investigate
+/// whether the flash-store round-trip is corrupting the Ref graph
+/// (Phase B "infinite recursion during default-alarm setup"
+/// stall).
+unsafe fn apply_storeperm_loadperm_probes(rom_ptr: *mut u32) {
+    for (pc, orig, imm, name) in [
+        (
+            STORE_PERM_OBJECT_PC,
+            STORE_PERM_OBJECT_ORIG_INSN,
+            HvcImm::StorePermObjEntry,
+            "StorePermObject entry probe",
+        ),
+        (
+            LOAD_PERM_OBJECT_RET_PC,
+            LOAD_PERM_OBJECT_RET_ORIG_INSN,
+            HvcImm::LoadPermObjRet,
+            "LoadPermObject return probe",
+        ),
+    ] {
+        let idx = (pc / 4) as usize;
+        let prev = unsafe { rom_ptr.add(idx).read() };
+        if prev != orig {
+            kprintln!(
+                "rom_patch: ERROR — {} site at {:#010x} is {:#010x}, expected {:#010x}; skipping",
+                name, pc, prev, orig,
+            );
+            continue;
+        }
+        let insn = imm.insn();
+        unsafe {
+            crate::guest_mem::write_rom_code_word(rom_ptr, idx, insn);
+        }
+        kprintln!(
+            "rom_patch: {:#010x}: {:#010x} -> {:#010x}  ({}, HVC #{:#x})",
+            pc, prev, insn, name, imm as u32,
+        );
+    }
 }
 
 /// Install the per-stack 4 KiB padding wrapper (Option A in PLAN.md).

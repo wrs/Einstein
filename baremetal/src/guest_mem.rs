@@ -808,12 +808,19 @@ pub fn fix_stage1_xn_bits() -> bool {
     // Only log when we actually rewrote something, to avoid flooding
     // the serial when the kernel re-enables stage-1 on every task
     // switch and we re-walk idempotently.
-    if sections_patched != 0 || patched != 0 || fine_to_fault != 0 {
-        crate::dprintln!(
-            "fix_stage1_xn_bits: {} sections de-XN'd, {} L2 tables walked, {} L2 entries de-XN'd, {} fine -> fault",
-            sections_patched, l2_tables, patched, fine_to_fault
-        );
-    }
+
+    // Too noisy!
+    //
+    let _ = sections_patched;
+    let _ = patched;
+    let _ = fine_to_fault;
+    let _ = l2_tables;
+    // if sections_patched != 0 || patched != 0 || fine_to_fault != 0 {
+    //     crate::dprintln!(
+    //         "fix_stage1_xn_bits: {} sections de-XN'd, {} L2 tables walked, {} L2 entries de-XN'd, {} fine -> fault",
+    //         sections_patched, l2_tables, patched, fine_to_fault
+    //     );
+    // }
 
     // PROBE 2026-04-26: track L1[0xCD] across SCTLR M=0→M=1 transitions.
     // If the kernel ever converts the lazy 0x90 marker into a real coarse

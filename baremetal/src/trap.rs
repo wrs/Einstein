@@ -1209,6 +1209,21 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == HvcImm::ResolveFaultEntry as u32 => {
             handle_resolve_fault_entry_probe(ctx);
         }
+        v if v == HvcImm::StorePermObjEntry as u32 => {
+            handle_store_perm_obj_entry_probe(ctx);
+            // Emulate the patched-out `mov ip, sp` (R12 = SP for
+            // the source AArch32 mode). HVC entry already advanced
+            // ELR_EL2 past the trap, so no ELR adjustment needed.
+            let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+            ctx.x[12] = crate::banked::sp_for_mode(ctx, spsr_el2) as u64;
+        }
+        v if v == HvcImm::LoadPermObjRet as u32 => {
+            handle_load_perm_obj_ret_probe(ctx);
+            // Emulate the patched-out `mov r0, r4`. R0/R4 are not
+            // banked across modes, so a direct GPR copy is correct
+            // regardless of source mode.
+            ctx.x[0] = ctx.x[4];
+        }
         v if v == HvcImm::DahFmeEntry as u32 => {
             handle_fme_entry_probe(ctx);
         }
@@ -1741,6 +1756,25 @@ fn handle_und(ctx: &mut TrapContext) {
             handle_resolve_fault_entry_probe(ctx);
             // Emulate the original `mov ip, sp` (R12 = R13).
             ctx.x[12] = crate::banked::sp_for_mode(ctx, spsr_und as u32) as u64;
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        // StorePermObject entry probe — first instruction (`mov ip,
+        // sp`) was replaced with HVC. Reached here when StorePermObject
+        // is called from USR mode (the typical NS-runtime path);
+        // SVC-mode calls go through the direct HVC dispatch above.
+        _ if insn == HvcImm::StorePermObjEntry.insn() => {
+            handle_store_perm_obj_entry_probe(ctx);
+            ctx.x[12] = crate::banked::sp_for_mode(ctx, spsr_und as u32) as u64;
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        // LoadPermObject return-site probe — `mov r0, r4` was
+        // replaced with HVC. Same USR-vs-SVC routing rationale as
+        // the StorePermObject entry probe above.
+        _ if insn == HvcImm::LoadPermObjRet.insn() => {
+            handle_load_perm_obj_ret_probe(ctx);
+            ctx.x[0] = ctx.x[4];
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -3248,6 +3282,56 @@ fn handle_resolve_fault_entry_probe(ctx: &mut TrapContext) {
         i_norm, i_hard, i_lower, i_upper,
         tag,
     );
+}
+
+/// Probe handler for `StorePermObject` entry. R0 is a `RefArg`
+/// (`typedef const RefVar& RefArg`) so it's a pointer to a
+/// `RefVar`. RefVar is GC-tracked: its first field is a slot
+/// pointer (into the rooted-Refs array), and the Ref itself lives
+/// at that slot. Two loads — confirmed against `IsString` /
+/// `IsFrame` at 0x0031_9874 / 0x0031_9990 which both do
+/// `ldr r0, [r0]; ldr r0, [r0]` to fetch the Ref. Read both
+/// indirections, log a counted header, and pretty-print the Ref
+/// via `newton-objects`.
+///
+/// Caller is expected to emulate the patched-out `mov ip, sp` in
+/// the surrounding dispatch arm (HVC- or UND-path) and advance
+/// ELR; this handler only logs.
+fn handle_store_perm_obj_entry_probe(ctx: &mut TrapContext) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    let refvar_ptr = ctx.x[0] as u32;
+    let slot_ptr =
+        crate::guest_endian::guest_read_u32_va(refvar_ptr).unwrap_or(0);
+    let ref_value = if slot_ptr != 0 {
+        crate::guest_endian::guest_read_u32_va(slot_ptr).unwrap_or(0)
+    } else {
+        0
+    };
+    static FIRED: AtomicU32 = AtomicU32::new(0);
+    let n = FIRED.fetch_add(1, Ordering::Relaxed);
+    let lr = ctx.x[14] as u32;
+    let _ = (refvar_ptr, slot_ptr); // available for future detail
+    crate::kprint!("StorePermObject[{}]: ", n);
+    crate::heap_check::pretty_print_ref_inline(ref_value, 2);
+    kprintln!("  lr={:#x}", lr);
+}
+
+/// Probe handler for `LoadPermObject`'s return site. R4 holds the
+/// Ref returned by `Read__18TStoreObjectReaderFv`; the patched-out
+/// `mov r0, r4` is what propagates it into the function's return
+/// register. Pretty-print R4 so we can compare what came out of
+/// the flash store with what `StorePermObject` had put in.
+///
+/// Caller is expected to emulate `r0 = r4` and advance ELR.
+fn handle_load_perm_obj_ret_probe(ctx: &mut TrapContext) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    let ref_value = ctx.x[4] as u32;
+    static FIRED: AtomicU32 = AtomicU32::new(0);
+    let n = FIRED.fetch_add(1, Ordering::Relaxed);
+    let lr = ctx.x[14] as u32;
+    crate::kprint!("LoadPermObject[{}]: ", n);
+    crate::heap_check::pretty_print_ref_inline(ref_value, 2);
+    kprintln!("  lr={:#x}", lr);
 }
 
 /// Handler for the patched `mov ip, sp` at FaultMonitorEntry static

@@ -236,21 +236,60 @@ git log for the bne→bgt→bgt+success-track history.)
 
 ### Next
 
-1. **Run down the FAR=0x0cdb2ffc matcher mismatch.** RF-wrap[267]
-   captured `info=0x0c124254` with `top=0x0cd78000` for FAR=
-   0x0cdb2ffc — that info doesn't cover the FAR. The stack at
-   0x0cdb3000 (4 B above the FAR) is what the matcher should have
-   selected. Either:
-   - The kernel's `Fault` matcher walks domain queues and feeds
-     each candidate stack's info to ResolveFault until one
-     accepts; under the path-A wrapper, fast-fail returns -10204
-     immediately, breaking that iteration. Add a probe at the
-     `Fault` matcher entry to capture the candidate-list semantics
-     (does it expect specific -10203/-10204 codes to mean "try
-     next"?).
-   - Or the matcher is genuinely passing the wrong info and the
-     issue is upstream — find the kernel-side cause.
-   The disasm of `Fault` at 0x001F_8400..0x001F_8540 will say.
+1. **Run down the FAR=0x0cdb2ffc matcher mismatch — slots_array
+   bookkeeping.** Disasm of `Fault` at 0x001F_84E0 confirms it's
+   *not* iterating candidates; it calls `GetStackInfo(manager,
+   FAR)` exactly once. The inner walker at
+   `GetStackInfo__11THeapDomainFUlPP10TStackInfo` (0x001F_8DE0)
+   computes `slot_index = (FAR - pool_start) / 33792` and returns
+   `slots_array[slot_index]` directly. So the matcher does what
+   it's told; the question is whether the slots_array bookkeeping
+   is correct for the FAR.
+
+   For FAR=0x0cdb2ffc with pool_start=0x0c600000:
+   slot_index = (0x0cdb2ffc - 0x0c600000) / 33792 = 238. The
+   wrapper observed `info=0x0c124254` at this FAR, so the kernel
+   returned `slots_array[238] = 0x0c124254`. But that info has
+   `norm=0x0cd74000 top=0x0cd78000` and the FAR is way above top.
+
+   The TStack walker (`dump_tstacks_and_check_invariants`)
+   reports `slot[212..218]` as the last `info=0x0c124254` run,
+   then `slot[219..219]` for a different info, with the last
+   non-NULL run at `slot[228..229]` — slots 230..495 are
+   NULL by the walker. That contradicts the empirical observation
+   that `slots_array[238]=0x0c124254`.
+
+   Two sub-questions to answer next:
+   - Is the walker really showing the right state? Add a probe
+     that reads `slots_array[238]` directly at
+     BusErrorThrow time and compares to the walker's view.
+   - If the walker is right and slots_array[238] is actually
+     non-NULL between wrapper fire and BusError fire, what
+     writes it? The Fault path between wrapper return and
+     BusErrorThrow is only register compares (no memory writes
+     to slots_array). Either there's a write we're missing, or
+     the slot-allocation logic in `FMNewStack` left
+     slots_array[238] stale (= 0x0c124254 from a previous
+     allocation that overlaps slot 238 in slots_array but
+     doesn't logically own that pool VA range).
+
+   The "info[+0]" field for slot[212..218] is `0x0cdb3000` (=
+   norm of slot[219]), strongly suggesting `info[+0]` is "max
+   reserved end" and this stack has reserved [0x0cd74000,
+   0x0cdb3000) of pool VA but only grown its top to 0x0cd78000.
+   FMNewStack might be writing slots_array entries for the *full
+   reserved range* (slots 212..238 covering [0x0ccd5400,
+   0x0cdb9800) in pool VA = 7×33792-strided slot indices that
+   "logically" map to the reserved [0x0cd74000, 0x0cdb3000)
+   stack-VA range — but the walker only sees the first 7 of those
+   slots filled, suggesting there's an off-by-one or a stride
+   confusion between `FMNewStack`'s slot writes and `GetStackInfo`'s
+   slot reads.
+
+   **Next probe:** add `HVC #SlotsArrayProbe` at FMNewStack's
+   slots_array fill loop (around 0x001F_91xx) so we capture
+   exactly which slot indices it writes for each new stack, with
+   what info pointer. Compare to GetStackInfo's expected indices.
 2. **Confirm the rest of the TStack landscape is clean.** Walker
    shows clean 1 KiB guards everywhere except in-flight allocations
    in the highest pool, plus one invariant violation in the

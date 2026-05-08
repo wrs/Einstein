@@ -229,10 +229,10 @@ fn write_word(va: u32, value: u32) -> bool {
 /// `gInterpreter[+124] = 1` — the TInterpreter trace gate. This
 /// causes every `DoSend / DoMessage / DoFastApply` to call
 /// `TraceSend / TraceCall / TraceApply`, which funnel into
-/// `TraceMethod → Print(POutTranslator*, fmt, ...)`. With
-/// the `ns_trace` feature's TraceSetOptions ROM patch + Print
-/// thunk hook in place, every NS-level call surfaces in the
-/// EL2 UART.
+/// `TraceMethod → Print(POutTranslator*, fmt, ...)`. With the
+/// `ns_trace` feature's TraceSetOptions ROM patch in place plus
+/// the always-on PHammerOutTranslator body patches routing
+/// Print → EL2 UART, every NS-level call surfaces in the log.
 ///
 /// Deliberately does NOT touch `gWantSerialDebugging`: setting
 /// that triggers `WriteDebugByte` calls from the kernel's FPE

@@ -697,62 +697,68 @@ const SPLASH_PROBE_BEFORE_DRAW_INSN:       u32 = 0xE1A0_0004; // mov r0, r4
 pub const SPLASH_PROBE_DRAW_SPLASH_PC:     u32 = 0x0014_602C;
 const SPLASH_PROBE_DRAW_SPLASH_INSN:       u32 = 0xE1A0_C00D; // mov ip, sp
 
-// ---- ns_trace: POutTranslator vtable thunk probes -------------------
+// ---- POutTranslator hook: PHammerOutTranslator concrete-body patches
 //
-// Constants gated on the `ns_trace` feature so a default build doesn't
-// drag in unused symbols.
+// `gNewtConfig` is patched to `0x8202` (kEnableListener|kDefaultStdioOn|
+// kEnableStdout), so `InitREPOut__Fv` (0x12aa44) takes the listener
+// branch and stores a `PHammerOutTranslator*` in `gREPout`. Every
+// kernel debug print (`REPprintf`, `REPStackTrace`, `REPExceptionNotify`,
+// the `printf` jump-table entry, ad-hoc kernel diags, plus TInterpreter
+// trace events when the `ns_trace` gate is open) eventually reaches
+// the abstract-base thunks at `0x0038_9EA0..EF4` which vtable-dispatch
+// into PHammerOutTranslator's concrete methods. Stock those methods
+// hand bytes off to a `vfprintf`/`fputc` chain whose stream nobody
+// drains, so the bytes vanish.
 //
-// The kernel funnels all debug-print output through the abstract
-// `POutTranslator` interface (Drivers/POutTranslator.h). Five of its
-// vtable thunks live in a contiguous block of ROM at 0x389ea0..0x389ef4,
-// each a 3-word `ldr r0, [r0, #4]; ldr ip, [r0, #N]; add pc, ip, #M`
-// dispatch shape. We patch the first instruction of each thunk with
-// an `HVC #imm` so EL2 can capture the args before the vtable lookup
-// runs — capturing every output path regardless of which concrete
-// translator (Null / Hammer / Serial / NTK) is plugged into the
-// global `gREPout` slot.
+// We replace the body of each method with an `HVC` that forwards args
+// to `rep_print` (which renders via `kprintln!` to the EL2 UART) plus
+// a small return tail. The dispatch architecture is untouched —
+// `gREPout->Print(fmt, ...)` still goes through the natural
+// abstract-base thunk and concrete-subclass vtable lookup; we are
+// merely the implementation. (Earlier iterations patched the abstract
+// base's vtable thunks at 0x389EA0..EF4 with `HVC` and emulated the
+// thunk's first `LDR` from EL2; that hack is gone.)
 //
-// For Print specifically the args are `(POutTranslator* this,
-// const char* fmt, ...)` with r2/r3 holding the first two varargs and
-// the rest on the source-mode stack. `src/rep_print.rs` walks the
-// guest format string + arg list and renders to the EL2 UART.
+// For `Print`/`Putc`/`Flush` the body is overwritten with three words:
+// `HVC #imm`, `mov r0, #0`, `mov pc, lr`. The handler renders, ELR
+// advances by 4, the natively-executing `mov r0, #0; mov pc, lr`
+// returns 0 to the caller. Original body bytes beyond word 2 are
+// dead.
 //
-// Putc/Flush/StackTrace/ExceptionNotify are handled with simpler,
-// arg-only logging (no format-string interpretation needed).
+// For `StackTrace`/`ExceptionNotify` the original body is just
+// `mov r0, r1; b REP*` (8 bytes). We patch only word 0, replacing
+// `mov r0, r1` with `HVC`. The handler emulates `mov r0, r1`
+// (`ctx.x[0] = ctx.x[1]`) before ELR advances; the second word is
+// the original `b REPStackTrace`/`b REPExceptionNotify` which fires
+// natively, formats, and Prints — landing back in our patched
+// `Print` body and out the UART.
+//
+// `Print`'s args follow standard ARM EABI varargs:
+//   r0 = `this` (ignored), r1 = fmt, r2/r3 = first two args, then
+//   the rest at the caller's source-mode SP. `src/rep_print.rs`
+//   walks the format string and pulls args accordingly.
 
-/// `Print__14POutTranslatorFPCce` thunk @ ROM `0x0038_9EB8`. First insn
-/// is `ldr r0, [r0, #4]` (multiple-inheritance-style `this`-adjustment
-/// via the POutTranslator's inner pointer); the handler emulates that
-/// load before proceeding so the rest of the thunk works as the kernel
-/// expects.
-#[cfg(feature = "ns_trace")]
-pub const PRINT_PROBE_PC:                u32 = 0x0038_9EB8;
-#[cfg(feature = "ns_trace")]
-const PRINT_PROBE_FIRST_INSN:            u32 = 0xE590_0004; // ldr r0, [r0, #4]
+/// `PHammerOutTranslator::Print` body @ ROM `0x000E_6A90`.
+pub const HAMMER_PRINT_PC:               u32 = 0x000E_6A90;
+const HAMMER_PRINT_FIRST_INSN:           u32 = 0xE1A0_C00D; // mov ip, sp
 
-/// `Putc` thunk @ ROM `0x0038_9EC4` (single-char output).
-#[cfg(feature = "ns_trace")]
-pub const PUTC_PROBE_PC:                 u32 = 0x0038_9EC4;
-#[cfg(feature = "ns_trace")]
-const PUTC_PROBE_FIRST_INSN:             u32 = 0xE590_0004;
+/// `PHammerOutTranslator::Putc` body @ ROM `0x000E_6AD0`.
+pub const HAMMER_PUTC_PC:                u32 = 0x000E_6AD0;
+const HAMMER_PUTC_FIRST_INSN:            u32 = 0xE1A0_C00D; // mov ip, sp
 
-/// `Flush` thunk @ ROM `0x0038_9EA0` (flush buffered bytes).
-#[cfg(feature = "ns_trace")]
-pub const FLUSH_PROBE_PC:                u32 = 0x0038_9EA0;
-#[cfg(feature = "ns_trace")]
-const FLUSH_PROBE_FIRST_INSN:            u32 = 0xE590_0004;
+/// `PHammerOutTranslator::Flush` body @ ROM `0x000E_6A50`.
+pub const HAMMER_FLUSH_PC:               u32 = 0x000E_6A50;
+const HAMMER_FLUSH_FIRST_INSN:           u32 = 0xE1A0_C00D; // mov ip, sp
 
-/// `StackTrace` thunk @ ROM `0x0038_9EE8` (NS-frame dump).
-#[cfg(feature = "ns_trace")]
-pub const STACK_TRACE_PROBE_PC:          u32 = 0x0038_9EE8;
-#[cfg(feature = "ns_trace")]
-const STACK_TRACE_PROBE_FIRST_INSN:      u32 = 0xE590_0004;
+/// `PHammerOutTranslator::StackTrace` first insn @ ROM `0x000E_6954`.
+/// Original body is `mov r0, r1; b REPStackTrace` — we replace word 0
+/// only and let the natural `b` run after HVC.
+pub const HAMMER_STACKTRACE_PC:          u32 = 0x000E_6954;
+const HAMMER_STACKTRACE_FIRST_INSN:      u32 = 0xE1A0_0001; // mov r0, r1
 
-/// `ExceptionNotify` thunk @ ROM `0x0038_9EF4` (exception-frame dump).
-#[cfg(feature = "ns_trace")]
-pub const EX_NOTIFY_PROBE_PC:            u32 = 0x0038_9EF4;
-#[cfg(feature = "ns_trace")]
-const EX_NOTIFY_PROBE_FIRST_INSN:        u32 = 0xE590_0004;
+/// `PHammerOutTranslator::ExceptionNotify` first insn @ ROM `0x000E_695C`.
+pub const HAMMER_EXCEPTION_NOTIFY_PC:    u32 = 0x000E_695C;
+const HAMMER_EXCEPTION_NOTIFY_FIRST_INSN:u32 = 0xE1A0_0001; // mov r0, r1
 
 /// `safeIntervalDeltaSeconds` from `TJITGenericROMPatch.cpp:144` —
 /// seconds between 1993-01-01 and 2008-01-01, Einstein's Y2010 fix
@@ -894,7 +900,9 @@ pub unsafe fn apply_717006_patches(rom_ptr: *mut u32) {
     // and the runtime poke of `gInterpreter[+124]=1` from
     // `heap_check::force_interpreter_trace_on`, every NS-level
     // `DoSend / DoMessage / DoFastApply` reaches `Print` with the
-    // trace event — surfaced via the Print thunk hook below.
+    // trace event — which lands in the EL2 UART via the always-on
+    // PHammerOutTranslator body patches in
+    // `apply_pouttranslator_patches`.
     //
     // Encoding: `teq r0, #N` is `e330_000N`; only the low 12 bits
     // of the immediate change (cond/op/Rn/Rd untouched).
@@ -918,21 +926,40 @@ pub unsafe fn apply_717006_patches(rom_ptr: *mut u32) {
         applied += 1;
     }
     // full_ns_trace: change the first store of the TInterpreter
-    // trace-mode field at 0x35e7e4 from `mov r0, #2` to `mov r0, #3`.
-    // The instruction sequence is: r0 = 2 (originally) → str r0,
-    // [r4, #124] → writes the value into TInterpreter+0x7C. The same
-    // field is later overwritten with `#3` on the EQRef branch at
-    // 0x35e880, so 3 is a value the downstream gates already handle.
+    // trace-mode field at 0x35e7d4 from `mov r7, #0` to `mov r7, #3`.
+    // This changes the default to full tracing.
     #[cfg(feature = "full_ns_trace")]
     {
         unsafe {
-            let word_idx = (0x0035_E7E4u32 / 4) as usize;
+            let word_idx = (0x0035_E7D4u32 / 4) as usize;
             let prev = rom_ptr.add(word_idx).read();
-            crate::guest_mem::write_rom_code_word(rom_ptr, word_idx, 0xE3A0_0003);
+            crate::guest_mem::write_rom_code_word(rom_ptr, word_idx, 0xE3A0_7003);
             kprintln!(
                 "rom_patch: {:#010x}: was_host={:#010x} -> intended={:#010x}  ({})",
-                0x0035_E7E4u32, prev, 0xE3A0_0003u32,
+                0x0035_E7D4u32, prev, 0xE3A0_7003u32,
                 "TraceSetOptions: mov r0, #3 (was #2) — first store to TInterpreter+0x7C",
+            );
+        }
+        applied += 1;
+        unsafe {
+            let word_idx = (0x000E_6A1Cu32 / 4) as usize;
+            let prev = rom_ptr.add(word_idx).read();
+            crate::guest_mem::write_rom_code_word(rom_ptr, word_idx, 0xE330_00FF);
+            kprintln!(
+                "rom_patch: {:#010x}: was_host={:#010x} -> intended={:#010x}  ({})",
+                0x000E_6A1Cu32, prev, 0xE330_00FFu32,
+                "ConsumeFrame: teq r0, #FF (was #0) — force PrintObject call",
+            );
+        }
+        applied += 1;
+        unsafe {
+            let word_idx = (0x0033_cb24 / 4) as usize;
+            let prev = rom_ptr.add(word_idx).read();
+            crate::guest_mem::write_rom_code_word(rom_ptr, word_idx, 0xE3A0_0008);
+            kprintln!(
+                "rom_patch: {:#010x}: was_host={:#010x} -> intended={:#010x}  ({})",
+                0x0033_cb24, prev, 0xE3A0_0008u32,
+                "PrintObject: mov r0, #8 — change object depth to 2",
             );
         }
         applied += 1;
@@ -1136,49 +1163,74 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             HvcImm::SplashProbe,
             "TNotebook::DrawSplashScreen entry (splash-chain diag)",
         );
-        // ns_trace: hook the abstract POutTranslator vtable thunks
-        // (Print / Putc / Flush / StackTrace / ExceptionNotify) so EL2
-        // captures every output path the kernel uses regardless of
-        // which concrete translator (Null / Hammer / Serial / NTK)
-        // is plugged into the global `gREPout` slot.
-        #[cfg(feature = "ns_trace")]
-        {
-            patch_probe(
-                rom_ptr,
-                PRINT_PROBE_PC,
-                PRINT_PROBE_FIRST_INSN,
-                HvcImm::PrintProbe,
-                "Print thunk (capture kernel REP printf output)",
+        // PHammerOutTranslator concrete-body patches: route every
+        // `gREPout->{Print,Putc,Flush,StackTrace,ExceptionNotify}`
+        // call into the EL2 UART. Always on (no feature gate).
+        apply_pouttranslator_patches(rom_ptr);
+    }
+}
+
+/// Replace `PHammerOutTranslator`'s output method bodies with HVC
+/// stubs that forward to `rep_print` in EL2. See the constant block
+/// above for the detailed rationale and patch shape.
+unsafe fn apply_pouttranslator_patches(rom_ptr: *mut u32) {
+    // Print/Putc/Flush: 3-word body replacement.
+    //   word 0: HVC #imm
+    //   word 1: mov r0, #0   (e3a00000)
+    //   word 2: mov pc, lr   (e1a0f00e)
+    const MOV_R0_0:  u32 = 0xE3A0_0000;
+    const MOV_PC_LR: u32 = 0xE1A0_F00E;
+
+    let bodies = [
+        (HAMMER_PRINT_PC, HAMMER_PRINT_FIRST_INSN, HvcImm::HammerPrint,
+         "PHammerOutTranslator::Print body"),
+        (HAMMER_PUTC_PC, HAMMER_PUTC_FIRST_INSN, HvcImm::HammerPutc,
+         "PHammerOutTranslator::Putc body"),
+        (HAMMER_FLUSH_PC, HAMMER_FLUSH_FIRST_INSN, HvcImm::HammerFlush,
+         "PHammerOutTranslator::Flush body"),
+    ];
+    for &(pc, expected, hvc, name) in &bodies {
+        let idx = (pc / 4) as usize;
+        // SAFETY: rom_ptr backs full 8 MiB main ROM; pc < 0x80_0000.
+        let prev = unsafe { rom_ptr.add(idx).read() };
+        if prev != expected {
+            kprintln!(
+                "rom_patch: ERROR — {} at {:#010x} is {:#010x}, expected {:#010x}; skipping",
+                name, pc, prev, expected,
             );
-            patch_probe(
-                rom_ptr,
-                PUTC_PROBE_PC,
-                PUTC_PROBE_FIRST_INSN,
-                HvcImm::PutcProbe,
-                "Putc thunk (single-char REP output)",
-            );
-            patch_probe(
-                rom_ptr,
-                FLUSH_PROBE_PC,
-                FLUSH_PROBE_FIRST_INSN,
-                HvcImm::FlushProbe,
-                "Flush thunk (flush buffered REP output)",
-            );
-            patch_probe(
-                rom_ptr,
-                STACK_TRACE_PROBE_PC,
-                STACK_TRACE_PROBE_FIRST_INSN,
-                HvcImm::StackTraceProbe,
-                "StackTrace thunk (NS-frame dump)",
-            );
-            patch_probe(
-                rom_ptr,
-                EX_NOTIFY_PROBE_PC,
-                EX_NOTIFY_PROBE_FIRST_INSN,
-                HvcImm::ExNotifyProbe,
-                "ExceptionNotify thunk (exception-frame dump)",
-            );
+            continue;
         }
+        unsafe {
+            crate::guest_mem::write_rom_code_word(rom_ptr, idx,     hvc.insn());
+            crate::guest_mem::write_rom_code_word(rom_ptr, idx + 1, MOV_R0_0);
+            crate::guest_mem::write_rom_code_word(rom_ptr, idx + 2, MOV_PC_LR);
+        }
+        record_original(pc, prev);
+        kprintln!(
+            "rom_patch: {:#010x}: {:#010x} -> HVC #{:#x} + mov r0,#0 + mov pc,lr  ({})",
+            pc, prev, hvc as u32, name,
+        );
+    }
+
+    // StackTrace/ExceptionNotify: word-0 only. Original second word
+    // (`b REP*`) runs natively after HVC; handler emulates `mov r0, r1`.
+    // SAFETY: rom_ptr backs the full main ROM; both PCs are validated
+    // < 0x80_0000 by their constants.
+    unsafe {
+        patch_probe(
+            rom_ptr,
+            HAMMER_STACKTRACE_PC,
+            HAMMER_STACKTRACE_FIRST_INSN,
+            HvcImm::HammerStackTrace,
+            "PHammerOutTranslator::StackTrace body (mov r0,r1 → HVC)",
+        );
+        patch_probe(
+            rom_ptr,
+            HAMMER_EXCEPTION_NOTIFY_PC,
+            HAMMER_EXCEPTION_NOTIFY_FIRST_INSN,
+            HvcImm::HammerExceptionNotify,
+            "PHammerOutTranslator::ExceptionNotify body (mov r0,r1 → HVC)",
+        );
     }
 }
 

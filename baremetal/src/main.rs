@@ -23,7 +23,6 @@ mod pa_emulate;
 mod panic;
 mod peripherals;
 mod platform;
-#[cfg(feature = "ns_trace")]
 mod rep_print;
 mod rom_patches;
 mod shadow_pool;

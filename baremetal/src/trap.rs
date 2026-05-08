@@ -1227,25 +1227,20 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == HvcImm::SplashProbe as u32 => {
             handle_splash_probe(ctx);
         }
-        #[cfg(feature = "ns_trace")]
-        v if v == HvcImm::PrintProbe as u32 => {
-            handle_print_probe(ctx);
+        v if v == HvcImm::HammerPrint as u32 => {
+            handle_hammer_print(ctx);
         }
-        #[cfg(feature = "ns_trace")]
-        v if v == HvcImm::PutcProbe as u32 => {
-            handle_thunk_probe(ctx, ThunkKind::Putc);
+        v if v == HvcImm::HammerPutc as u32 => {
+            handle_hammer_thunk(ctx, ThunkKind::Putc);
         }
-        #[cfg(feature = "ns_trace")]
-        v if v == HvcImm::FlushProbe as u32 => {
-            handle_thunk_probe(ctx, ThunkKind::Flush);
+        v if v == HvcImm::HammerFlush as u32 => {
+            handle_hammer_thunk(ctx, ThunkKind::Flush);
         }
-        #[cfg(feature = "ns_trace")]
-        v if v == HvcImm::StackTraceProbe as u32 => {
-            handle_thunk_probe(ctx, ThunkKind::StackTrace);
+        v if v == HvcImm::HammerStackTrace as u32 => {
+            handle_hammer_thunk(ctx, ThunkKind::StackTrace);
         }
-        #[cfg(feature = "ns_trace")]
-        v if v == HvcImm::ExNotifyProbe as u32 => {
-            handle_thunk_probe(ctx, ThunkKind::ExceptionNotify);
+        v if v == HvcImm::HammerExceptionNotify as u32 => {
+            handle_hammer_thunk(ctx, ThunkKind::ExceptionNotify);
         }
         v if v == HvcImm::Und as u32 => {
             handle_und(ctx);
@@ -1749,40 +1744,36 @@ fn handle_und(ctx: &mut TrapContext) {
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
-        // ns_trace: POutTranslator vtable thunks. The kernel's debug-
-        // print path is reached from USR for any task that runs through
-        // the NS interpreter (DoSend / DoMessage / DoFastApply); HVC
-        // from USR is UNDEFINED, so those firings come through here.
-        // Pass the trampoline-saved spsr_und so the SP/LR lookup lands
-        // on the right banked register, then advance ELR via the UND-
-        // return stub since UND entry doesn't auto-advance.
-        #[cfg(feature = "ns_trace")]
-        _ if insn == HvcImm::PrintProbe.insn() => {
-            handle_print_probe_with(ctx, spsr_und as u32);
+        // PHammerOutTranslator concrete-body patches. The kernel's
+        // debug-print path is reached from USR for any task that
+        // runs through the NS interpreter (DoSend / DoMessage /
+        // DoFastApply); HVC from USR is UNDEFINED, so those firings
+        // come through here. Pass the trampoline-saved spsr_und so
+        // the SP/LR lookup lands on the right banked register, then
+        // advance ELR via the UND-return stub since UND entry
+        // doesn't auto-advance.
+        _ if insn == HvcImm::HammerPrint.insn() => {
+            handle_hammer_print_with(ctx, spsr_und as u32);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
-        #[cfg(feature = "ns_trace")]
-        _ if insn == HvcImm::PutcProbe.insn() => {
-            handle_thunk_probe(ctx, ThunkKind::Putc);
+        _ if insn == HvcImm::HammerPutc.insn() => {
+            handle_hammer_thunk(ctx, ThunkKind::Putc);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
-        #[cfg(feature = "ns_trace")]
-        _ if insn == HvcImm::FlushProbe.insn() => {
-            handle_thunk_probe(ctx, ThunkKind::Flush);
+        _ if insn == HvcImm::HammerFlush.insn() => {
+            handle_hammer_thunk(ctx, ThunkKind::Flush);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
-        #[cfg(feature = "ns_trace")]
-        _ if insn == HvcImm::StackTraceProbe.insn() => {
-            handle_thunk_probe(ctx, ThunkKind::StackTrace);
+        _ if insn == HvcImm::HammerStackTrace.insn() => {
+            handle_hammer_thunk(ctx, ThunkKind::StackTrace);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
-        #[cfg(feature = "ns_trace")]
-        _ if insn == HvcImm::ExNotifyProbe.insn() => {
-            handle_thunk_probe(ctx, ThunkKind::ExceptionNotify);
+        _ if insn == HvcImm::HammerExceptionNotify.insn() => {
+            handle_hammer_thunk(ctx, ThunkKind::ExceptionNotify);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -2907,8 +2898,7 @@ fn splash_probe_log(ctx: &TrapContext, pc: u32, spsr: u32) {
     }
 }
 
-/// ns_trace: which `POutTranslator` vtable thunk fired.
-#[cfg(feature = "ns_trace")]
+/// Which `PHammerOutTranslator` body patch fired.
 #[derive(Clone, Copy)]
 enum ThunkKind {
     Putc,
@@ -2917,26 +2907,24 @@ enum ThunkKind {
     ExceptionNotify,
 }
 
-/// ns_trace: probe at `Print__14POutTranslatorFPCce` entry
-/// (ROM 0x389eb8). The thunk's first insn is `ldr r0, [r0, #4]`;
-/// we emulate it after capturing args.
+/// Hook at `PHammerOutTranslator::Print` body entry (ROM 0x000E_6A90).
+/// The body's `mov ip, sp` prologue has been replaced with HVC; after
+/// HVC returns ELR advances by 4 and the patched `mov r0, #0` +
+/// `mov pc, lr` tail returns 0 to the caller. We just render args.
 ///
-/// Args follow standard ARM EABI varargs:
-///   r0 = POutTranslator* this   (consumed by the thunk)
+/// Args follow standard ARM EABI varargs (post-thunk this-adjustment):
+///   r0 = (this — ignored by us, overwritten by the patch tail)
 ///   r1 = format string (const char*)
 ///   r2 = arg0   r3 = arg1   [sp+0..]+ = arg2..
 ///
 /// The renderer's `VaArgs` pulls args from r2/r3 then walks the
 /// source-mode stack.
-#[cfg(feature = "ns_trace")]
-fn handle_print_probe(ctx: &mut TrapContext) {
+fn handle_hammer_print(ctx: &mut TrapContext) {
     let spsr_el2 = read_sysreg!("spsr_el2") as u32;
-    handle_print_probe_with(ctx, spsr_el2);
+    handle_hammer_print_with(ctx, spsr_el2);
 }
 
-#[cfg(feature = "ns_trace")]
-fn handle_print_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
-    let r0 = ctx.x[0] as u32;
+fn handle_hammer_print_with(ctx: &mut TrapContext, source_cpsr: u32) {
     let r1 = ctx.x[1] as u32;
     let r2 = ctx.x[2] as u32;
     let r3 = ctx.x[3] as u32;
@@ -2947,22 +2935,16 @@ fn handle_print_probe_with(ctx: &mut TrapContext, source_cpsr: u32) {
         r1,
         crate::rep_print::VaArgs::new(r2, r3, sp),
     );
-
-    // Emulate `ldr r0, [r0, #4]` so the rest of the thunk
-    // (`ldr ip, [r0, #N]; add pc, ip, #M`) sees the same r0
-    // it would have without the patch.
-    let new_r0 = crate::guest_endian::guest_read_u32_va(r0.wrapping_add(4))
-        .or_else(|| crate::guest_endian::guest_read_u32_pa(r0.wrapping_add(4)))
-        .unwrap_or(0xDEAD_BEEF);
-    ctx.x[0] = new_r0 as u64;
 }
 
-/// ns_trace: unified handler for the abstract POutTranslator thunks
-/// (Putc / Flush / StackTrace / ExceptionNotify). All four share the
-/// same first-insn shape (`ldr r0, [r0, #4]`) and the same vtable-
-/// dispatch tail; only the captured-arg formatting differs.
-#[cfg(feature = "ns_trace")]
-fn handle_thunk_probe(ctx: &mut TrapContext, kind: ThunkKind) {
+/// Unified handler for `PHammerOutTranslator::{Putc, Flush, StackTrace,
+/// ExceptionNotify}` body patches. Putc/Flush bodies are fully replaced
+/// (return 0 via the patched tail). StackTrace/ExceptionNotify have
+/// only their first word patched (replacing `mov r0, r1`); the
+/// untouched second word is `b REPStackTrace`/`b REPExceptionNotify`
+/// and runs natively after HVC, so we emulate the displaced
+/// `mov r0, r1` here.
+fn handle_hammer_thunk(ctx: &mut TrapContext, kind: ThunkKind) {
     let r0 = ctx.x[0] as u32;
     let r1 = ctx.x[1] as u32;
     match kind {
@@ -2981,6 +2963,10 @@ fn handle_thunk_probe(ctx: &mut TrapContext, kind: ThunkKind) {
                 "REP> [StackTrace(translator={:#010x}, arg={:#010x})]",
                 r0, r1,
             );
+            // Emulate the displaced `mov r0, r1` so the natively-
+            // executing `b REPStackTrace` at the next word sees
+            // r0 = stack-frame pointer (its first arg).
+            ctx.x[0] = ctx.x[1];
         }
         ThunkKind::ExceptionNotify => {
             // r1 = Exception*; *r1 = name C-string ptr.
@@ -2992,14 +2978,11 @@ fn handle_thunk_probe(ctx: &mut TrapContext, kind: ThunkKind) {
                 "REP> [ExceptionNotify(translator={:#010x}, ex={:#010x}) name={:?}]",
                 r0, r1, name,
             );
+            // Emulate the displaced `mov r0, r1` so the natively-
+            // executing `b REPExceptionNotify` sees r0 = Exception*.
+            ctx.x[0] = ctx.x[1];
         }
     }
-    // Emulate the original `ldr r0, [r0, #4]` so the rest of the
-    // thunk (vtable lookup + jump) sees the same r0.
-    let new_r0 = crate::guest_endian::guest_read_u32_va(r0.wrapping_add(4))
-        .or_else(|| crate::guest_endian::guest_read_u32_pa(r0.wrapping_add(4)))
-        .unwrap_or(0xDEAD_BEEF);
-    ctx.x[0] = new_r0 as u64;
 }
 
 // ---- Remember post-SWI probe (surviving the iter-50..89 sweep) ----

@@ -47,22 +47,29 @@ trace_once = ["trace"]
 # get a clean function-trace log.
 quiet = []
 
-# NewtonScript-level tracing. Patches `TraceSetOptions__12TInterpreterFv`
-# (0x35e7d8) so its `teq r0, #2` (Ref == NIL) check on `gVars.tracing`
-# never matches a real Ref — the function falls through to the
-# setup-with-defaults branch, opening the +104/+105/+108/+112/+116
-# gates that `TraceSend / TraceCall / TraceApply / TraceMethod`
-# consult before reaching `Print`. Pairs with a runtime poke of
-# `gInterpreter[+124]=1` (so DoSend/DoMessage/DoFastApply actually
-# call into the trace funnel) and HVC patches at the abstract
-# POutTranslator vtable thunks (Print/Putc/Flush/StackTrace/
-# ExceptionNotify @ 0x389ea0–0x389ef4) so EL2 captures the kernel-
-# rendered output through `src/rep_print.rs` instead of letting
-# the stock Null translator drop it.
+# NewtonScript-level tracing — opens the kernel's TInterpreter
+# trace gates so every NS-level `DoSend / DoMessage / DoFastApply`
+# emits a `Print` call describing the call. Two ROM-side pieces:
 #
-# Off by default — under BE-8 the patches mutate the ROM in ways
-# that invalidate snapshots saved without the feature. Cold-boot
-# on toggle (`rm -f /tmp/newton-snapshot-*.bin`).
+#   1. Patch `TraceSetOptions__12TInterpreterFv` at 0x35e7d8: its
+#      `teq r0, #2` (Ref == NIL) check on `gVars.tracing` never
+#      matches a real Ref — the function falls through to the
+#      setup-with-defaults branch, opening the +104/+105/+108/
+#      +112/+116 gates that `TraceSend / TraceCall / TraceApply /
+#      TraceMethod` consult before reaching `Print`.
+#   2. Runtime poke of `gInterpreter[+124] = 1` from
+#      `heap_check::force_interpreter_trace_on` so the trace
+#      funnels actually fire.
+#
+# This feature only enables the *gating* — it does not affect the
+# output path. ROM debug output (POutTranslator → PHammerOutTranslator
+# Print/Putc/Flush/StackTrace/ExceptionNotify) is always routed to
+# the EL2 UART by the always-on body patches in
+# `rom_patches::apply_pouttranslator_patches`.
+#
+# Off by default because TInterpreter trace produces a lot of
+# output. Toggling rewrites a ROM word, which invalidates older
+# snapshots — cold-boot on toggle (`rm -f /tmp/newton-snapshot-*.bin`).
 ns_trace = []
 # Layered on top of `ns_trace`: change the first store of the
 # TInterpreter trace-mode field at 0x35e7ec from `mov r0, #2` to

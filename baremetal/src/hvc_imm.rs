@@ -23,9 +23,9 @@
 //! builds. Reordering or removing variants does invalidate any saved
 //! snapshot — same as any ROM-patch change.
 
-// Trace / ns_trace variants are unused unless their cfg-feature is on,
-// but we keep them in the enum unconditionally so the dispatch site
-// can match without `#[cfg]` boilerplate. Suppress the dead-code lint.
+// `Trace` is unused unless its cfg-feature is on, but we keep it in the
+// enum unconditionally so the dispatch site can match without `#[cfg]`
+// boilerplate. Suppress the dead-code lint.
 #[allow(dead_code)]
 #[repr(u32)]
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -104,17 +104,26 @@ pub enum HvcImm {
     TaskDump,
     /// Dump one kernel object by its 32-bit ID (passed in r0).
     DumpObjectById,
-    /// `Print__14POutTranslatorFPCce` thunk (capture kernel
-    /// REP printf output). `ns_trace` feature.
-    PrintProbe,
-    /// `Putc` thunk. `ns_trace` feature.
-    PutcProbe,
-    /// `Flush` thunk. `ns_trace` feature.
-    FlushProbe,
-    /// `StackTrace` thunk. `ns_trace` feature.
-    StackTraceProbe,
-    /// `ExceptionNotify` thunk. `ns_trace` feature.
-    ExNotifyProbe,
+    /// `PHammerOutTranslator::Print` body — kernel REP printf
+    /// output. The body's prologue is replaced with `HVC`, so the
+    /// EL2 handler renders fmt+args via `rep_print` and returns 0.
+    /// Concrete-subclass patch (not an abstract-base thunk hook):
+    /// `gREPout` already points at PHammerOutTranslator on every
+    /// boot (gNewtConfig=0x8202 sets kEnableListener), so natural
+    /// vtable dispatch reaches the patched body.
+    HammerPrint,
+    /// `PHammerOutTranslator::Putc` body — single-char REP output.
+    HammerPutc,
+    /// `PHammerOutTranslator::Flush` body — explicit flush.
+    HammerFlush,
+    /// `PHammerOutTranslator::StackTrace` first insn (replaces
+    /// the original `mov r0, r1`); the next word is the original
+    /// `b REPStackTrace` and runs natively after HVC.
+    HammerStackTrace,
+    /// `PHammerOutTranslator::ExceptionNotify` first insn (replaces
+    /// the original `mov r0, r1`); the next word is the original
+    /// `b REPExceptionNotify` and runs natively after HVC.
+    HammerExceptionNotify,
     /// `FP_UndefHandlers_Start + 0x3C` — FPE-entry counter +
     /// `mov ip, sp` emulation.
     FpeEntryProbe,

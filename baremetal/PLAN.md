@@ -57,17 +57,69 @@ stack region (slot 196..197), not slot 125..181.
 `DAH-FME-ret[2]: r0=0` says the FaultMonitorEntry path *did* report
 recovery for FAR=0x0cce4400, but the `bl ResolveFault` at
 0x001F_84E0 returned -10204 anyway (R5 in the BusErrorThrow dump =
-`0xffffd824` = -10204). Possible causes worth chasing next:
+`0xffffd824` = -10204).
 
-  - The `Fault` matcher passed the *previous* slot's TStackInfo*
-    (slot[195..195], `top=0x0cce4000`) into the wrapper — for that
-    info FAR=0x0cce4400 satisfies `FAR >= top` → -10204 in iter 0,
-    iter 1 also -10204, etc., all four iters propagate.
-  - `info[+28]` got mutated between FME recovery and the wrapper
-    call.
-  - Stage-2 mapping for IPA 0x0cce4400 isn't actually backed (the
-    `DAH-FME-ret` "success" doesn't guarantee the kernel actually
-    allocated a page).
+**Probe finding (2026-05-07).** Added `HVC #ResolveFaultRet` at the
+exit of `apply_resolve_fault_wrapper` (one word before the final
+`pop`). The probe captures `r0`, `r4`=manager, `r5`=info, info bounds,
+`r8`=original FAR, `r9`=all_failed flag. For the busError-bound call
+at FAR=0x0cce4400 it logs:
+
+```
+RF-wrap[2]: r0=0xffffd824 (-10204) FAR=0x0cce4400 mgr=0x0c112cb8
+            info=0x0c121b90  norm=0x0cce4000 hard=0x0cce4400
+            curr=0x0cce4400 top=0x0ccf6000  all_failed=1 pos=in-range
+```
+
+So:
+
+- **The matcher passes the correct info\*** (slot[196..197], `top=
+  0x0ccf6000`) — *not* the previous slot's. PLAN's earlier theory #1
+  is ruled out.
+- **FAR=0x0cce4400 is exactly `info[+4]`** (the lowest 1-KiB subpage
+  *above* the guard). With base=0x0cce4000 and the wrapper aligning
+  FAR to the page boundary, iter 0 fires for FAR=0x0cce4000 (subpage
+  0 = guard region) and ResolveFault correctly returns -10203 (FAR <
+  info[+4]).
+- **Iters 1/2/3 fail because of an off-by-one in the wrapper's `blt`
+  encoding** — verified with arm-none-eabi-as. The stub uses
+  `0xBAFFFFF5` (imm24 = -11), which assembles to `blt 0x34` from
+  PC=0x58 (the `str r0, [r6, #68]`), *not* `blt 0x30` (the `add r0,
+  r7, r10, lsl #10` that recomputes FAR). So iters 2/3/4 reuse stale
+  `r0` (= -10203 from iter 0, then -10204 from iter 1, …) as the FAR.
+  Each subsequent ResolveFault sees garbage and returns -10204.
+  `all_failed=1` propagates → busError.
+
+Why this hasn't bitten earlier stacks: `RF-wrap[0]` at FAR=0x0cc754c8
+hits `page_base = base+0x6000` (a non-bottom page). Iter 0's FAR=
+page_base is in `[hard, top)`, ResolveFault commits subpage 0 → returns
+0, `r9=0`. Iters 1/2/3 fail with garbage but `r9` stays 0 → wrapper
+returns 0. The bug is invisible to the kernel for non-bottom pages.
+
+The visible-bug case (FAR exactly at info[+4]) lights up specifically
+because iter 0 falls into the guard region and there's no other iter
+with a valid FAR.
+
+**Why the fix isn't a one-liner.** Encoding the `blt` correctly
+(`0xBAFFFFF4`) makes iter 1 fire with FAR=base+1024 = info[+4],
+ResolveFault commits, and the busError goes away — *but* boot
+regresses to a ~5x slowdown stuck in DiagBootStub: now every fault
+through `Fault` actually iterates all 4 subpages and claims them, and
+some downstream kernel state (per-subpage refcount, RememberMappings,
+the FindOrAllocPage allocator) doesn't tolerate the change for
+early-boot stacks. The buggy `blt` was effectively running iter 0
+only — i.e., the wrapper has been a no-op pass-through for the
+non-bottom-page case all along, and a false-busError generator for
+the bottom-page case. Either:
+
+  - The wrapper's design (claim all 4 subpages on every Fault call)
+    is wrong for early boot; the fix is to skip iter 0 when
+    `page_base < info[+4]` (so we don't try to commit the guard) but
+    keep the others.
+  - Or the design is right, and there's a separate bug exposed by
+    the 4-iter behavior that needs its own investigation.
+
+The probe stays armed.
 
 ### Stack-VM patches that got us here
 
@@ -164,29 +216,30 @@ git log for the bne→bgt→bgt+success-track history.)
 
 ### Next
 
-1. **Determine which TStackInfo* the `Fault` matcher is passing into
-   the wrapper for FAR=0x0cce4400.** Patch a probe HVC over the
-   `bl ResolveFault` at `0x001F_84E0` (or wrap the wrapper) and
-   log `(r0=TStackManager*, r1=info*, info->norm/hard/curr/top,
-   FAR)` for the call that returns -10204. If `info->top ==
-   0x0cce4000` this is the slot[195] mismatch theory — fix
-   the matcher (or the wrapper) to walk to the next slot when
-   `FAR == info->top` exactly. If `info` *is* slot[196..197], the
-   mystery is why iter 1 (`FAR == curr`) doesn't succeed — instrument
-   each iter's return value.
-2. **Cross-check stage-2 commit for IPA 0x0cce4400** at the moment of
-   the abort. `dump_stage1_walk(0x0cce4400)` from the BusErrorThrow
-   handler would show whether the stage-1 mapping is present and
-   whether the IPA is backed at stage-2. If the page isn't actually
-   committed, the `DAH-FME-ret r0=0` "success" is misleading —
-   FME may be reporting recovery without actually allocating.
-3. **Confirm the rest of the TStack landscape is clean.** Walker
+1. **Untangle the wrapper's iter semantics.** The `blt` off-by-one
+   has masked the wrapper's intended 4-iter behavior since it was
+   written; "fixing" it (`0xBAFFFFF4`) is a regression for early-
+   boot Fault calls. Two paths to evaluate:
+   - **A — narrow the iter range.** Compute `start_iter =
+     max(0, (info[+4] - page_base) / 1024)` and `end_iter =
+     min(4, (info[+28] - page_base) / 1024)` so the wrapper only
+     calls ResolveFault for valid subpages. For FAR=0x0cce4400
+     that's iters 1..4 (skip the guard); for FAR in the interior
+     of a stack page that's all 4. Either fixes the busError
+     without exposing whatever else the 4-iter behavior breaks.
+   - **B — find the upstream bug.** Re-apply `0xBAFFFFF4`,
+     instrument the early-boot stall (snapshot at the first stuck
+     PC, dump per-stack info, check FindOrAllocPage retry rates,
+     check whether some subpage is being re-claimed). Whatever
+     the 4-iter path breaks is the next ceiling regardless of
+     the FAR=0x0cce4400 issue.
+2. **Confirm the rest of the TStack landscape is clean.** Walker
    shows clean 1 KiB guards everywhere except in-flight allocations
    in the highest pool, plus one invariant violation in the
    `[0x0de00000..0x0e600000)` pool's slot[0]
    (`info[+24]=0x0de08000 > top=0x0de07fff`). Investigate whether
    that's a transient initialization state or a real bug.
-4. **Long-tail.** Reach NewtonScript's `TInterpreter` boot, full UI
+3. **Long-tail.** Reach NewtonScript's `TInterpreter` boot, full UI
    render. EinsteinProbe is the visual oracle.
 
 ## Workflow per stop

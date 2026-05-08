@@ -1203,6 +1203,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == HvcImm::DahFmeRet as u32 => {
             handle_dah_fme_ret_probe(ctx);
         }
+        v if v == HvcImm::ResolveFaultRet as u32 => {
+            handle_resolve_fault_ret_probe(ctx);
+        }
         v if v == HvcImm::DahFmeEntry as u32 => {
             handle_fme_entry_probe(ctx);
         }
@@ -1722,6 +1725,17 @@ fn handle_und(ctx: &mut TrapContext) {
         // via the UND-return stub.
         _ if insn == HvcImm::SplashProbe.insn() => {
             handle_splash_probe_und(ctx, faulting_pc, spsr_und);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        // ResolveFault wrapper exit probe (PLAN.md "Next" #1). The
+        // wrapper sits in the patch-stub arena and is invoked from
+        // `TStackManager::Fault` which runs in USR mode, so the HVC
+        // at wrapper_pc+0x68 raises UND and lands here. r0/r4/r5/r8/r9
+        // are unbanked (gpr 0..12 don't bank between USR and UND), so
+        // the probe reads them straight from ctx.x[N].
+        _ if insn == HvcImm::ResolveFaultRet.insn() => {
+            handle_resolve_fault_ret_probe(ctx);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -3004,6 +3018,83 @@ fn handle_dah_fme_ret_probe(_ctx: &mut TrapContext) {
             options(nostack, preserves_flags));
         core::arch::asm!("isb", options(nostack, preserves_flags));
     }
+}
+
+/// Handler for the `HVC #ResolveFaultRet` inserted at the exit of
+/// `apply_resolve_fault_wrapper` (between the FAR-restore `str` and
+/// the final `pop {r4-r10, pc}`). Logs the wrapper's return value
+/// alongside the TStackInfo* it received and that info's bounds, so
+/// we can identify which TStackInfo `Fault`'s matcher is feeding the
+/// wrapper for the FAR=0x0cce4400 abort. The wrapper does not modify
+/// any callee-saved register past this point, so the probe only
+/// needs to read state — no register-emulation side effects.
+///
+/// Throttling: log the first 24 calls plus every non-zero return
+/// (i.e., every -10204 / -10203 / `r0=4` propagation that's about to
+/// turn into busError or a real allocator failure). Mirrors the
+/// `DahFmeRet` probe's policy.
+fn handle_resolve_fault_ret_probe(ctx: &mut TrapContext) {
+    use crate::guest_endian::guest_read_u32_va as rd;
+
+    let r0       = ctx.x[0] as u32;
+    let manager  = ctx.x[4] as u32;
+    let info     = ctx.x[5] as u32;
+    let orig_far = ctx.x[8] as u32;
+    let all_failed = ctx.x[9] as u32; // 1 = no iter cleared the flag
+
+    static FIRED: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+    let n = FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+    // Always log failures (so we never miss a busError-bound case);
+    // sample successes lightly to bound output volume.
+    let log = n < 24 || r0 != 0;
+    if !log {
+        return;
+    }
+
+    // Read TStackInfo bounds, matching dump_tstacks_and_check_invariants:
+    //   info[+4]  = hard lower bound (post-patch: base + 1 KiB)
+    //   info[+20] = norm = base VA
+    //   info[+24] = curr = current commit watermark
+    //   info[+28] = top
+    let (i_hard, i_norm, i_curr, i_top) = if info != 0
+        && info >= 0x0c00_0000 && info < 0x0d00_0000 {
+        (
+            rd(info.wrapping_add(4)).unwrap_or(0),
+            rd(info.wrapping_add(20)).unwrap_or(0),
+            rd(info.wrapping_add(24)).unwrap_or(0),
+            rd(info.wrapping_add(28)).unwrap_or(0),
+        )
+    } else {
+        (0, 0, 0, 0)
+    };
+
+    // Position of FAR within the info range, for quick eyeballing.
+    let pos = if i_norm != 0 && orig_far >= i_norm && orig_far < i_top {
+        "in-range"
+    } else if orig_far == i_top {
+        "AT-TOP"
+    } else if i_top != 0 && orig_far >= i_top {
+        "ABOVE-top"
+    } else if i_norm != 0 && orig_far < i_norm {
+        "BELOW-norm"
+    } else {
+        "??"
+    };
+
+    kprintln!(
+        "RF-wrap[{}]: r0={:#010x}{} FAR={:#010x} mgr={:#010x} info={:#010x}  norm={:#010x} hard={:#010x} curr={:#010x} top={:#010x}  all_failed={} pos={}",
+        n,
+        r0,
+        if (r0 as i32) == -10204 { " (-10204)" }
+        else if (r0 as i32) == -10203 { " (-10203)" }
+        else if r0 == 0 { " (success)" }
+        else { "" },
+        orig_far, manager, info,
+        i_norm, i_hard, i_curr, i_top,
+        all_failed, pos,
+    );
 }
 
 /// Handler for the patched `mov ip, sp` at FaultMonitorEntry static

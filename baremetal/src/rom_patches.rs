@@ -79,8 +79,8 @@ use crate::kprintln;
 // Currently-installed patches need 152 B; the LOCK/UNLOCK/NEW_STACK_PAD
 // wrappers (NOT installed) would add another 80 B, comfortably within
 // the budget.
-const PATCH_STUB_ARENA_BASE: u32 = 0x00FF_FD80;
-const PATCH_STUB_ARENA_END:  u32 = 0x00FF_FEC0;
+pub const PATCH_STUB_ARENA_BASE: u32 = 0x00FF_FD80;
+pub const PATCH_STUB_ARENA_END:  u32 = 0x00FF_FEC0;
 
 static PATCH_STUB_ARENA_CURSOR: AtomicU32 = AtomicU32::new(PATCH_STUB_ARENA_BASE);
 
@@ -1801,7 +1801,8 @@ unsafe fn apply_resolve_fault_wrapper(rom_ptr: *mut u32) {
     //   +0x5c  cmp   r9, #1                    ; all 4 iters failed?
     //   +0x60  movne r0, #0                    ; if not (some success), return r0=0; else keep last r0
     //   +0x64  done: str r8, [r6, #68]         ; restore original FAR
-    //   +0x68  pop   {r4-r10, pc}
+    //   +0x68  hvc   #ResolveFaultRet          ; probe: log r0/r4/r5/info/r8/r9 (Step PLAN.md "Next" #1)
+    //   +0x6c  pop   {r4-r10, pc}
     //
     // NOTE on iter return codes: stock ResolveFault returns -10203 /
     // -10204 if the FAR we passed is out of the stack's [info[24],
@@ -1826,9 +1827,9 @@ unsafe fn apply_resolve_fault_wrapper(rom_ptr: *mut u32) {
     // false-positived on iter 0's -10203 from the bottom-page commit,
     // throwing exBusError on every legitimate stack-grow fault into
     // the bottom 4 KiB page.)
-    let resolve_fault_wrapper_pc = alloc_patch_stub(27, "ResolveFault wrapper");
+    let resolve_fault_wrapper_pc = alloc_patch_stub(28, "ResolveFault wrapper");
     let bl_pc = resolve_fault_wrapper_pc + 0x40;
-    let stub: [u32; 27] = [
+    let stub: [u32; 28] = [
         0xE92D_47F0,                            // +0x00 push {r4-r10, lr}
         0xE1A0_4000,                            // +0x04 mov r4, r0
         0xE1A0_5001,                            // +0x08 mov r5, r1
@@ -1851,11 +1852,21 @@ unsafe fn apply_resolve_fault_wrapper(rom_ptr: *mut u32) {
         0x03A0_9000,                            // +0x4c moveq r9, #0 — success: clear "all_failed"
         0xE28A_A001,                            // +0x50 add r10, r10, #1
         0xE35A_0004,                            // +0x54 cmp r10, #4
-        0xBAFF_FFF5,                            // +0x58 blt iter (offset -11 words from PC+8 → +0x30)
+        // 2026-05-07: tried 0xBAFFFFF4 (-12 words → +0x30, the comment's
+        // intent of "branch back to recompute FAR each iter") and the boot
+        // regressed to a ~5x slowdown stuck in early DiagBootStub — the
+        // 4-iter wrapper, when actually iterating correctly, makes the
+        // kernel commit subpages it never had committed before, and that
+        // breaks something further upstream. Reverted to the original -11
+        // encoding (lands at +0x34 / str) until the upstream effect is
+        // understood. The probe HVC at +0x68 is still useful — it captures
+        // the wrapper's exit state per call.
+        0xBAFF_FFF5,                            // +0x58 blt iter (offset -11 words from PC+8 → +0x34, original)
         0xE359_0001,                            // +0x5c cmp r9, #1 — all_failed?
         0x13A0_0000,                            // +0x60 movne r0, #0 — some success → return 0
         0xE586_8044,                            // +0x64 done: str r8, [r6, #68]
-        0xE8BD_87F0,                            // +0x68 pop {r4-r10, pc}
+        HvcImm::ResolveFaultRet.insn(),         // +0x68 hvc #ResolveFaultRet — probe wrapper exit
+        0xE8BD_87F0,                            // +0x6c pop {r4-r10, pc}
     ];
     unsafe {
         for (i, w) in stub.iter().copied().enumerate() {

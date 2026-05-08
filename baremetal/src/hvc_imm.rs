@@ -123,6 +123,13 @@ pub enum HvcImm {
     /// inflection points). All sites share one immediate; the
     /// handler distinguishes by ELR.
     SplashProbe,
+    /// `apply_resolve_fault_wrapper` exit probe — fired from the
+    /// wrapper inserted between the post-loop FAR-restore and the
+    /// final `pop {r4-r10, pc}`. Captures (r0=return, r4=manager,
+    /// r5=TStackInfo*, info bounds, r8=original FAR, r9=all_failed
+    /// flag) so we can correlate `Fault`'s -10204 propagation with
+    /// the actual TStackInfo* the matcher passed in.
+    ResolveFaultRet,
 }
 
 impl HvcImm {

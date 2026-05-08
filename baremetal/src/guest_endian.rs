@@ -65,6 +65,18 @@ fn pa_is_rom_code(pa: u32) -> bool {
     if pa >= crate::tracer::TRAMPOLINE_IPA && pa < crate::tracer::TRAMPOLINE_END {
         return true;
     }
+    // Patch-stub arena: every wrapper installed by `rom_patches` (the
+    // ResolveFault wrapper, NewStack pad, LockHeapRange wrappers, …)
+    // is plain ARM-encoded LE instruction words — same situation as the
+    // tracer pool. The classifier's bitmap doesn't reach here either.
+    // Without this short-circuit, a USR-mode HVC inside a wrapper (e.g.
+    // the ResolveFault-wrapper exit probe) gets its insn byteswapped
+    // before handle_und compares against `HvcImm::*.insn()`, and the
+    // dispatch arm fails to match.
+    if pa >= crate::rom_patches::PATCH_STUB_ARENA_BASE
+        && pa < crate::rom_patches::PATCH_STUB_ARENA_END {
+        return true;
+    }
     let pa = pa as usize;
     pa + 4 <= guest_mem::ROM_SIZE && guest_mem::rom_word_is_code(pa / 4)
 }

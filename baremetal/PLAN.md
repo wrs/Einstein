@@ -19,18 +19,24 @@ Bloated PLAN.md wastes context every read.
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
 **Current state:** Boot reaches the kernel's task-scheduler running
-~27 live tasks (newt, OBJM, scrn, pckm, cmgr, …), draws the boot
-splash, and starts rendering small UI overlays. Past the gLocaleCache
-wedge, past the StorePermObject / TUnicodeCompressor abort loop, past
-the StackManager bus-error stall.
+~27 live tasks (newt, OBJM, scrn, pckm, cmgr, …), renders the boot
+splash + 32×32 icon (4 `screen.blit` calls), runs ~268 ResolveFault
+commits, then halts at a *new* ceiling — a DABT at FAR=0x0cdb2ffc
+where the `Fault` matcher passes a TStackInfo whose range doesn't
+contain the FAR (info top=0x0cd78000, FAR=0x0cdb2ffc — exactly 4 B
+below the next stack at 0x0cdb3000). The previous ceiling at
+FAR=0x0cce4400 inside `TIntrpStack::NewState` is **resolved** by
+the path-A wrapper rewrite (see below).
 
-The current ceiling is a **DABT at FAR=0x0cce4400 inside
-`TIntrpStack::NewState` at PC=0x001a4708**, which the kernel's wrapped
-ResolveFault returns -10204 ("FAR ≥ topOfStack") for, and
-`TStackManager::Fault` then throws `exBusError`. The new BusErrorThrow
-LoudHalt enrichment that reads `DABT_SAVE_PA` (slow + fast trampoline
-both stash `LR_abt`/`SP_abt`/`SPSR_abt` there) recovered the
-faulting context: USR mode, faulting_PC=0x001a4708, FAR=0x0cce4400.
+The current ceiling: a real matcher mismatch (different problem from
+the one the FAR=0x0cce4400 probe ruled out for that earlier site).
+Captured by RF-wrap[267]: `r0=-10204 FAR=0x0cdb2ffc info=0x0c124254
+norm=0x0cd74000 hard=0x0cd74400 curr=0x0cd75000 top=0x0cd78000
+pos=ABOVE-top`. Adjacent stack at 0x0cdb3000 was being initialized;
+some near-stack-base pointer arithmetic underflowed by 4 B and the
+matcher selected a non-adjacent stack. Likely a `push` past the base
+or an `STR Rd, [Rn, #-4]!` whose Rn is the just-allocated stack's
+norm.
 
 This is **not** a wild pointer — `0x001a4708` is the very first store
 in `NewState__11TIntrpStackFv`:
@@ -62,13 +68,13 @@ recovery for FAR=0x0cce4400, but the `bl ResolveFault` at
 **Probe finding (2026-05-07).** Added `HVC #ResolveFaultRet` at the
 exit of `apply_resolve_fault_wrapper` (one word before the final
 `pop`). The probe captures `r0`, `r4`=manager, `r5`=info, info bounds,
-`r8`=original FAR, `r9`=all_failed flag. For the busError-bound call
+`r8`=original FAR. For the busError-bound call
 at FAR=0x0cce4400 it logs:
 
 ```
 RF-wrap[2]: r0=0xffffd824 (-10204) FAR=0x0cce4400 mgr=0x0c112cb8
             info=0x0c121b90  norm=0x0cce4000 hard=0x0cce4400
-            curr=0x0cce4400 top=0x0ccf6000  all_failed=1 pos=in-range
+            curr=0x0cce4400 top=0x0ccf6000  pos=in-range
 ```
 
 So:
@@ -100,24 +106,38 @@ The visible-bug case (FAR exactly at info[+4]) lights up specifically
 because iter 0 falls into the guard region and there's no other iter
 with a valid FAR.
 
-**Why the fix isn't a one-liner.** Encoding the `blt` correctly
-(`0xBAFFFFF4`) makes iter 1 fire with FAR=base+1024 = info[+4],
-ResolveFault commits, and the busError goes away — *but* boot
-regresses to a ~5x slowdown stuck in DiagBootStub: now every fault
-through `Fault` actually iterates all 4 subpages and claims them, and
+**Why the encoding fix wasn't a one-liner.** Encoding the `blt`
+correctly (`0xBAFFFFF4`) makes iter 1 fire with FAR=base+1024 =
+info[+4], ResolveFault commits, and the busError goes away — *but*
+boot regresses to a ~5x slowdown stuck in DiagBootStub: every fault
+through `Fault` then iterates all 4 subpages and claims them, and
 some downstream kernel state (per-subpage refcount, RememberMappings,
 the FindOrAllocPage allocator) doesn't tolerate the change for
 early-boot stacks. The buggy `blt` was effectively running iter 0
-only — i.e., the wrapper has been a no-op pass-through for the
-non-bottom-page case all along, and a false-busError generator for
-the bottom-page case. Either:
+only — the wrapper has been a no-op pass-through for non-bottom-page
+case all along, and a false-busError generator for the bottom-page
+case.
 
-  - The wrapper's design (claim all 4 subpages on every Fault call)
-    is wrong for early boot; the fix is to skip iter 0 when
-    `page_base < info[+4]` (so we don't try to commit the guard) but
-    keep the others.
-  - Or the design is right, and there's a separate bug exposed by
-    the 4-iter behavior that needs its own investigation.
+**Path A (this branch's fix, 2026-05-07).** Rewrote the wrapper as
+44 instructions (172 B):
+
+  1. Fast-fail to -10203 if orig_FAR < info[+4] (kernel busError on
+     guard violation; without this, iters past the guard would
+     succeed and the wrapper would return 0 → infinite loop).
+  2. Fast-fail to -10204 if orig_FAR >= info[+28].
+  3. Otherwise iterate sub_idx 0..4, but skip any far_iter outside
+     [info[+4], info[+28]) — only legitimate subpages reach
+     ResolveFault.
+  4. Propagate any non-zero return immediately (no "all_failed"
+     tracking needed; the iter-skip in step 3 means the kernel never
+     gets a -10203/-10204 from us, so any non-zero is real).
+  5. HvcImm::ResolveFaultRet probe at the exit (still armed).
+
+Result: FAR=0x0cce4400 case resolves (iter 0 = guard, skipped; iter 1
+commits the page → r0=0). Splash renders (480×320 + 32×32 icon
+blits + assorted overlays). 268 wrapper calls before the next ceiling
+(unrelated matcher mismatch at FAR=0x0cdb2ffc). All earlier RF-wrap
+calls succeed.
 
 The probe stays armed.
 
@@ -216,23 +236,21 @@ git log for the bne→bgt→bgt+success-track history.)
 
 ### Next
 
-1. **Untangle the wrapper's iter semantics.** The `blt` off-by-one
-   has masked the wrapper's intended 4-iter behavior since it was
-   written; "fixing" it (`0xBAFFFFF4`) is a regression for early-
-   boot Fault calls. Two paths to evaluate:
-   - **A — narrow the iter range.** Compute `start_iter =
-     max(0, (info[+4] - page_base) / 1024)` and `end_iter =
-     min(4, (info[+28] - page_base) / 1024)` so the wrapper only
-     calls ResolveFault for valid subpages. For FAR=0x0cce4400
-     that's iters 1..4 (skip the guard); for FAR in the interior
-     of a stack page that's all 4. Either fixes the busError
-     without exposing whatever else the 4-iter behavior breaks.
-   - **B — find the upstream bug.** Re-apply `0xBAFFFFF4`,
-     instrument the early-boot stall (snapshot at the first stuck
-     PC, dump per-stack info, check FindOrAllocPage retry rates,
-     check whether some subpage is being re-claimed). Whatever
-     the 4-iter path breaks is the next ceiling regardless of
-     the FAR=0x0cce4400 issue.
+1. **Run down the FAR=0x0cdb2ffc matcher mismatch.** RF-wrap[267]
+   captured `info=0x0c124254` with `top=0x0cd78000` for FAR=
+   0x0cdb2ffc — that info doesn't cover the FAR. The stack at
+   0x0cdb3000 (4 B above the FAR) is what the matcher should have
+   selected. Either:
+   - The kernel's `Fault` matcher walks domain queues and feeds
+     each candidate stack's info to ResolveFault until one
+     accepts; under the path-A wrapper, fast-fail returns -10204
+     immediately, breaking that iteration. Add a probe at the
+     `Fault` matcher entry to capture the candidate-list semantics
+     (does it expect specific -10203/-10204 codes to mean "try
+     next"?).
+   - Or the matcher is genuinely passing the wrong info and the
+     issue is upstream — find the kernel-side cause.
+   The disasm of `Fault` at 0x001F_8400..0x001F_8540 will say.
 2. **Confirm the rest of the TStack landscape is clean.** Walker
    shows clean 1 KiB guards everywhere except in-flight allocations
    in the highest pool, plus one invariant violation in the

@@ -3022,17 +3022,24 @@ fn handle_dah_fme_ret_probe(_ctx: &mut TrapContext) {
 
 /// Handler for the `HVC #ResolveFaultRet` inserted at the exit of
 /// `apply_resolve_fault_wrapper` (between the FAR-restore `str` and
-/// the final `pop {r4-r10, pc}`). Logs the wrapper's return value
-/// alongside the TStackInfo* it received and that info's bounds, so
-/// we can identify which TStackInfo `Fault`'s matcher is feeding the
-/// wrapper for the FAR=0x0cce4400 abort. The wrapper does not modify
-/// any callee-saved register past this point, so the probe only
-/// needs to read state — no register-emulation side effects.
+/// the final `pop {r4-r11, pc}`). Logs the wrapper's return value
+/// and the TStackInfo* the kernel's `Fault` matcher fed in.
+///
+/// Register layout in the *narrowed-iter-range* wrapper at HVC time:
+///   r0  = wrapper return value
+///   r4  = TStackManager*       r5  = TStackInfo*
+///   r6  = ProcessorState*      r7  = page_base_FAR
+///   r8  = original FAR         r9  = info[+4] = hard (re-loaded post-bl)
+///   r10 = sub_idx (last)       r11 = info[+28] = top
+///
+/// (No "all_failed" flag — the new wrapper propagates any non-zero
+/// return immediately. The earlier 28-word wrapper used r9 for the
+/// flag; that's gone.)
 ///
 /// Throttling: log the first 24 calls plus every non-zero return
-/// (i.e., every -10204 / -10203 / `r0=4` propagation that's about to
-/// turn into busError or a real allocator failure). Mirrors the
-/// `DahFmeRet` probe's policy.
+/// (i.e., every fast-failed -10203/-10204 or genuine allocator error
+/// that's about to turn into busError). Mirrors the `DahFmeRet`
+/// probe's policy.
 fn handle_resolve_fault_ret_probe(ctx: &mut TrapContext) {
     use crate::guest_endian::guest_read_u32_va as rd;
 
@@ -3040,7 +3047,6 @@ fn handle_resolve_fault_ret_probe(ctx: &mut TrapContext) {
     let manager  = ctx.x[4] as u32;
     let info     = ctx.x[5] as u32;
     let orig_far = ctx.x[8] as u32;
-    let all_failed = ctx.x[9] as u32; // 1 = no iter cleared the flag
 
     static FIRED: core::sync::atomic::AtomicU32 =
         core::sync::atomic::AtomicU32::new(0);
@@ -3084,7 +3090,7 @@ fn handle_resolve_fault_ret_probe(ctx: &mut TrapContext) {
     };
 
     kprintln!(
-        "RF-wrap[{}]: r0={:#010x}{} FAR={:#010x} mgr={:#010x} info={:#010x}  norm={:#010x} hard={:#010x} curr={:#010x} top={:#010x}  all_failed={} pos={}",
+        "RF-wrap[{}]: r0={:#010x}{} FAR={:#010x} mgr={:#010x} info={:#010x}  norm={:#010x} hard={:#010x} curr={:#010x} top={:#010x}  pos={}",
         n,
         r0,
         if (r0 as i32) == -10204 { " (-10204)" }
@@ -3093,7 +3099,7 @@ fn handle_resolve_fault_ret_probe(ctx: &mut TrapContext) {
         else { "" },
         orig_far, manager, info,
         i_norm, i_hard, i_curr, i_top,
-        all_failed, pos,
+        pos,
     );
 }
 

@@ -1752,121 +1752,187 @@ unsafe fn apply_bootos_trap(rom_ptr: *mut u32) {
 /// four times, making the kernel's view of "which subpages got allocated"
 /// agree with what ARMv7 has actually exposed.
 unsafe fn apply_resolve_fault_wrapper(rom_ptr: *mut u32) {
-    // ARM AArch32 wrapper code at WRAPPER_PC. 23 words = 92 bytes.
+    // ARM AArch32 wrapper code, 43 words = 172 bytes.
     //
-    // Important register choices:
-    //   - r10 (sl) holds the sub_idx loop counter. AAPCS preserves r4-r11
-    //     across `bl`, while r12 (ip) is intra-procedure scratch and may
-    //     be clobbered by ResolveFault. Using r12 as the counter would
-    //     read garbage after the bl and break the loop.
+    // Replaces an earlier 28-word version that iterated all four
+    // subpages with a buggy `blt` (imm24=-11) — that encoding landed
+    // at +0x34 (the `str`) instead of the intended +0x30 (the `add`
+    // that recomputed FAR), so iters 1/2/3 reused stale r0 (= the
+    // previous bl's return value) as the FAR and ResolveFault
+    // returned -10204 each. Naively fixing the encoding (-12) made
+    // iters fire correctly but regressed early boot (4-iter behavior
+    // claims subpages 1/2/3 of every bottom page on every Fault call,
+    // breaking some downstream kernel state). See PLAN.md "Why the
+    // fix isn't a one-liner" for the diagnosis the probe yielded.
     //
-    // The page boundary must be computed relative to `info->base_va`
-    // (= info->[+20]) — adjacent stack slots in `FMNewStack` are placed
-    // 33 KiB apart, so `info->base_va` is *not* 4-KiB-aligned in general.
-    // Aligning the FAR to a host 4-KiB boundary would cross a stack-region
-    // boundary and trip ResolveFault's bound check (returning -10203
-    // "out of range below" for a sub-page that lives in the previous
-    // stack's slot).
+    // Path A (this version): narrow the iter range. The wrapper:
+    //   1. Fast-fails to -10203 if orig_FAR is in the guard region
+    //      (FAR < info[+4]) — kernel busError on guard violation.
+    //   2. Fast-fails to -10204 if orig_FAR is above top — kernel
+    //      busError on above-top violation.
+    //   3. Otherwise iterates sub_idx 0..4 of the page containing
+    //      orig_FAR, but skips any far_iter that falls outside
+    //      [info[+4], info[+28]). For the bottom page that means
+    //      iter 0 (the guard subpage) is skipped; for the top page
+    //      that means iters whose FARs would exceed `top` are
+    //      skipped. Only legitimate subpages are passed to
+    //      ResolveFault.
+    //   4. Propagates any non-zero return immediately (we no longer
+    //      generate negative returns from invalid-range iters since
+    //      the loop skips them, so any non-zero is a real error).
+    //   5. Fires HvcImm::ResolveFaultRet at the end to log
+    //      r0/r4/r5/r8 (probe stays armed across this rewrite).
     //
-    // Layout (offsets from WRAPPER_PC):
-    //   +0x00  push  {r4-r10, lr}
-    //   +0x04  mov   r4, r0                    ; r4 = TStackManager*
-    //   +0x08  mov   r5, r1                    ; r5 = TStackInfo*
-    //   +0x0c  ldr   r6, [r0, #64]             ; r6 = ProcessorState*
-    //   +0x10  ldr   r8, [r6, #68]             ; r8 = original FAR (for restore)
-    //   +0x14  ldr   r9, [r5, #20]             ; r9 = info->base_va
-    //   +0x18  sub   r7, r8, r9                ; r7 = orig_FAR - base = offset
-    //   +0x1c  mov   r7, r7, lsr #12           ; round down to 4-KiB-page within the stack
-    //   +0x20  mov   r7, r7, lsl #12
-    //   +0x24  add   r7, r9, r7                ; r7 = info->base_va + page_offset
-    //                                          ;     = page_base_FAR (subpage 0 of this page)
-    //   +0x28  mov   r10, #0                   ; r10 = sub_idx counter (callee-saved across bl)
-    //   +0x2c  add   r0, r7, r10, lsl #10      ; r0 = page_base_FAR + sub*1024
-    //   +0x30  str   r0, [r6, #68]             ; FAR = page_base_FAR + sub*1024
-    //   +0x34  mov   r0, r4                    ; r0 = TStackManager*
-    //   +0x38  mov   r1, r5                    ; r1 = TStackInfo*
-    //   +0x3c  bl    ResolveFault              ; original kernel function
-    //   +0x2c  mov   r9, #1                    ; r9 = "all_failed" flag (1 = no success seen yet)
-    //   +0x30  add   r0, r7, r10, lsl #10      ; (loop start) FAR = page_base + sub*1024
-    //   +0x34  str   r0, [r6, #68]
-    //   +0x38  mov   r0, r4
-    //   +0x3c  mov   r1, r5
-    //   +0x40  bl    ResolveFault
-    //   +0x44  cmp   r0, #0
-    //   +0x48  bgt   done                      ; positive r0 (e.g. r0=4 FindOrAllocPage fail) → propagate
-    //   +0x4c  moveq r9, #0                    ; r0==0 (success): clear "all_failed" flag
-    //   +0x50  add   r10, r10, #1
-    //   +0x54  cmp   r10, #4
-    //   +0x58  blt   iter (back to +0x30)
-    //   +0x5c  cmp   r9, #1                    ; all 4 iters failed?
-    //   +0x60  movne r0, #0                    ; if not (some success), return r0=0; else keep last r0
-    //   +0x64  done: str r8, [r6, #68]         ; restore original FAR
-    //   +0x68  hvc   #ResolveFaultRet          ; probe: log r0/r4/r5/info/r8/r9 (Step PLAN.md "Next" #1)
-    //   +0x6c  pop   {r4-r10, pc}
+    // Register choices (AAPCS callee-saved across BL: r4-r11, lr):
+    //   r4 = TStackManager*       r5 = TStackInfo*
+    //   r6 = ProcessorState*      r7 = page_base_FAR
+    //   r8 = original FAR         r9 = info[+20] = base
+    //   r10 = sub_idx counter     r11 = info[+28] = top
+    //   r12 = info[+4] = hard (caller-saved; read once, stable
+    //         across BL because ResolveFault doesn't write to it
+    //         and we re-load r12 at iter time only by chance — but
+    //         actually r12 IS clobbered by BL per AAPCS. We use it
+    //         only before any BL and re-test against the loaded
+    //         values inside the loop)
     //
-    // NOTE on iter return codes: stock ResolveFault returns -10203 /
-    // -10204 if the FAR we passed is out of the stack's [info[24],
-    // info[28]) range. Under the 1 KiB-guard geometry (info[+4] =
-    // slot_base + 1 KiB), iter 0 of the bottom 4 KiB page (FAR =
-    // slot_base + 0) is *always* below info[+24] and returns -10203,
-    // even when the user's actual fault VA is in iter 1/2/3's range
-    // and a real page commit is needed there. We must NOT propagate
-    // those -10203s — doing so false-positives on every legitimate
-    // bottom-page fault. Treat any negative r0 as "this subpage isn't
-    // ours, skip" and let the iters that *are* in range commit the
-    // page. The trailing `mov r0, #0` returns success unconditionally
-    // on loop completion: at least one iter either commits the page
-    // or finds it already committed.
+    // WAIT — r12 (ip) is intra-procedure scratch and CAN be
+    // clobbered by `bl ResolveFault`. If we read r12 once into the
+    // initial setup and then use it inside the iter loop AFTER bl,
+    // it'd be stale. The fix below rolls hard / top into callee-
+    // saved r12-equivalents... actually let me check: we use r12
+    // ONLY in the fast-fail paths (before the iter loop's bl) and
+    // inside iter for skip-checks (BEFORE the bl in that iter).
+    // After bl returns, the cmp r0,#0 + bne is the only check that
+    // uses any register's stale value, and that's r0 — not r12. So
+    // r12 being clobbered by bl matters only for the NEXT iter's
+    // skip-checks. To avoid that, we re-load r12 from info[+4]
+    // each iter? No — extra ldrs on the hot path. Alternative: use
+    // a callee-saved register (r11) for `top`, and r12 for `hard`,
+    // re-loading r12 at iter-loop entry. But r11 is currently
+    // holding `top`... let's swap: r11 = hard, r12 reloaded each
+    // iter as `top`? Or just use r9-equivalent slots.
     //
-    // Positive errors (r0=4 = FindOrAllocPage failure) are propagated
-    // immediately via `bgt done` — silently ignoring them would let
-    // the kernel re-fault forever on a page that can never be
-    // allocated.
+    // Cleanest: load both `hard` and `top` into callee-saved regs
+    // BEFORE the loop. We have r9 (base), r11, r12 used. Re-assign:
+    //   r9 = base   (callee-saved, used once for page_base compute)
+    //   r11 = top   (callee-saved, used in fast-fail and skip-check)
+    //   r12 = hard  (CALLER-saved — clobbered by bl)
     //
-    // (An earlier revision used `bne done` and was reverted because it
-    // false-positived on iter 0's -10203 from the bottom-page commit,
-    // throwing exBusError on every legitimate stack-grow fault into
-    // the bottom 4 KiB page.)
-    let resolve_fault_wrapper_pc = alloc_patch_stub(28, "ResolveFault wrapper");
-    let bl_pc = resolve_fault_wrapper_pc + 0x40;
-    let stub: [u32; 28] = [
-        0xE92D_47F0,                            // +0x00 push {r4-r10, lr}
+    // r12 used only in fast-fail (before any bl) and at iter-skip
+    // (before that iter's bl). Within a single iter pass, r12 is
+    // read before bl, so it's stable. Across iters, r12's value at
+    // iter N's start is whatever was last loaded — which was BEFORE
+    // the loop started (initial ldr r12, [r5, #4]). The bl in iter
+    // N-1 clobbers r12. So at iter N's skip-check, r12 is GARBAGE.
+    //
+    // Fix: load `hard` into the callee-saved bank too. We have r4,
+    // r5, r6, r7, r8, r9, r10, r11 used (8). Adding `hard` needs a
+    // 9th — and we already pushed {r4-r11, lr} = 9 saved. We can
+    // free up r9 (`base`) after computing page_base, then reuse r9
+    // for `hard`. The init code uses r9 only at +0x14..+0x5c; once
+    // page_base is computed at +0x5c, r9 is dead. Reload r9 = hard
+    // at +0x60 before the iter loop. Then iters use r9 (hard) and
+    // r11 (top) for skip-checks.
+    //
+    // Listing (offsets from wrapper_pc):
+    //   +0x00  push {r4-r11, lr}
+    //   +0x04  mov r4, r0                  ; r4 = manager
+    //   +0x08  mov r5, r1                  ; r5 = info
+    //   +0x0c  ldr r6, [r0, #64]           ; r6 = proc_state
+    //   +0x10  ldr r8, [r6, #68]           ; r8 = orig FAR (for restore)
+    //   +0x14  ldr r9, [r5, #20]           ; r9 = base (temporary)
+    //   +0x18  ldr r12, [r5, #4]           ; r12 = hard (for fast-fail)
+    //   +0x1c  ldr r11, [r5, #28]          ; r11 = top
+    //   +0x20  cmp r8, r12                 ; FAR < hard?
+    //   +0x24  bhs +0x38                   ; no → continue
+    //   +0x28  mov r0, #0x2700
+    //   +0x2c  orr r0, r0, #0xDB           ; r0 = 0x27DB = 10203
+    //   +0x30  rsb r0, r0, #0              ; r0 = -10203
+    //   +0x34  b +0xA0                     ; → done
+    //   +0x38  cmp r8, r11                 ; FAR >= top?
+    //   +0x3c  blo +0x50                   ; no → continue
+    //   +0x40  mov r0, #0x2700
+    //   +0x44  orr r0, r0, #0xDC           ; r0 = 0x27DC = 10204
+    //   +0x48  rsb r0, r0, #0              ; r0 = -10204
+    //   +0x4c  b +0xA0                     ; → done
+    //   +0x50  sub r7, r8, r9              ; offset = FAR - base
+    //   +0x54  lsr r7, r7, #12             ; round down to 4 KiB
+    //   +0x58  lsl r7, r7, #12
+    //   +0x5c  add r7, r9, r7              ; r7 = page_base
+    //   +0x60  ldr r9, [r5, #4]            ; r9 = hard (callee-saved)
+    //   +0x64  mov r10, #0                 ; sub_idx
+    //   +0x68  iter:
+    //          add r0, r7, r10, lsl #10    ; far_iter = page_base + sub*1024
+    //   +0x6c  cmp r0, r9                  ; far_iter < hard?
+    //   +0x70  blo skip_iter (+0x94)
+    //   +0x74  cmp r0, r11                 ; far_iter >= top?
+    //   +0x78  bhs skip_iter (+0x94)
+    //   +0x7c  str r0, [r6, #68]           ; FAR = far_iter
+    //   +0x80  mov r0, r4
+    //   +0x84  mov r1, r5
+    //   +0x88  bl ResolveFault             ; (clobbers r0-r3, r12)
+    //   +0x8c  cmp r0, #0
+    //   +0x90  bne done (+0xA0)            ; propagate any non-zero
+    //   +0x94  skip_iter:
+    //          add r10, r10, #1
+    //   +0x98  cmp r10, #4
+    //   +0x9c  blt iter (+0x68)
+    //   +0xA0  mov r0, #0                  ; success
+    //          (falls into done)
+    //   +0xA4  done: str r8, [r6, #68]     ; restore orig FAR
+    //   +0xA8  hvc #ResolveFaultRet
+    //   +0xAC  pop {r4-r11, pc}
+    //
+    // Encodings verified with arm-none-eabi-as. Only the bl at +0x88
+    // is patched at runtime via arm_bl(); everything else is a fixed
+    // intra-stub branch with a constant relative offset.
+    let resolve_fault_wrapper_pc = alloc_patch_stub(44, "ResolveFault wrapper");
+    let bl_pc = resolve_fault_wrapper_pc + 0x88;
+    let stub: [u32; 44] = [
+        0xE92D_4FF0,                            // +0x00 push {r4-r11, lr}
         0xE1A0_4000,                            // +0x04 mov r4, r0
         0xE1A0_5001,                            // +0x08 mov r5, r1
         0xE590_6040,                            // +0x0c ldr r6, [r0, #64]
         0xE596_8044,                            // +0x10 ldr r8, [r6, #68]
         0xE595_9014,                            // +0x14 ldr r9, [r5, #20]
-        0xE048_7009,                            // +0x18 sub r7, r8, r9
-        0xE1A0_7627,                            // +0x1c mov r7, r7, lsr #12
-        0xE1A0_7607,                            // +0x20 mov r7, r7, lsl #12
-        0xE089_7007,                            // +0x24 add r7, r9, r7
-        0xE3A0_A000,                            // +0x28 mov r10, #0
-        0xE3A0_9001,                            // +0x2c mov r9, #1  (= "all_failed" flag, init = 1)
-        0xE087_050A,                            // +0x30 add r0, r7, r10, lsl #10
-        0xE586_0044,                            // +0x34 str r0, [r6, #68]
-        0xE1A0_0004,                            // +0x38 mov r0, r4
-        0xE1A0_1005,                            // +0x3c mov r1, r5
-        arm_bl(bl_pc, RESOLVE_FAULT_PC),        // +0x40 bl ResolveFault
-        0xE350_0000,                            // +0x44 cmp r0, #0
-        0xCA00_0005,                            // +0x48 bgt done — propagate r0>0 only
-        0x03A0_9000,                            // +0x4c moveq r9, #0 — success: clear "all_failed"
-        0xE28A_A001,                            // +0x50 add r10, r10, #1
-        0xE35A_0004,                            // +0x54 cmp r10, #4
-        // 2026-05-07: tried 0xBAFFFFF4 (-12 words → +0x30, the comment's
-        // intent of "branch back to recompute FAR each iter") and the boot
-        // regressed to a ~5x slowdown stuck in early DiagBootStub — the
-        // 4-iter wrapper, when actually iterating correctly, makes the
-        // kernel commit subpages it never had committed before, and that
-        // breaks something further upstream. Reverted to the original -11
-        // encoding (lands at +0x34 / str) until the upstream effect is
-        // understood. The probe HVC at +0x68 is still useful — it captures
-        // the wrapper's exit state per call.
-        0xBAFF_FFF5,                            // +0x58 blt iter (offset -11 words from PC+8 → +0x34, original)
-        0xE359_0001,                            // +0x5c cmp r9, #1 — all_failed?
-        0x13A0_0000,                            // +0x60 movne r0, #0 — some success → return 0
-        0xE586_8044,                            // +0x64 done: str r8, [r6, #68]
-        HvcImm::ResolveFaultRet.insn(),         // +0x68 hvc #ResolveFaultRet — probe wrapper exit
-        0xE8BD_87F0,                            // +0x6c pop {r4-r10, pc}
+        0xE595_C004,                            // +0x18 ldr r12, [r5, #4]
+        0xE595_B01C,                            // +0x1c ldr r11, [r5, #28]
+        0xE158_000C,                            // +0x20 cmp r8, r12
+        0x2A00_0003,                            // +0x24 bhs +0x38 (no_fast_lo)
+        0xE3A0_0C27,                            // +0x28 mov r0, #0x2700
+        0xE380_00DB,                            // +0x2c orr r0, r0, #0xDB
+        0xE260_0000,                            // +0x30 rsb r0, r0, #0
+        0xEA00_001A,                            // +0x34 b +0xA4 (done)  imm24=0x1A
+        0xE158_000B,                            // +0x38 cmp r8, r11
+        0x3A00_0003,                            // +0x3c blo +0x50 (no_fast_hi)
+        0xE3A0_0C27,                            // +0x40 mov r0, #0x2700
+        0xE380_00DC,                            // +0x44 orr r0, r0, #0xDC
+        0xE260_0000,                            // +0x48 rsb r0, r0, #0
+        0xEA00_0014,                            // +0x4c b +0xA4 (done)  imm24=0x14
+        0xE048_7009,                            // +0x50 sub r7, r8, r9
+        0xE1A0_7627,                            // +0x54 lsr r7, r7, #12
+        0xE1A0_7607,                            // +0x58 lsl r7, r7, #12
+        0xE089_7007,                            // +0x5c add r7, r9, r7
+        0xE595_9004,                            // +0x60 ldr r9, [r5, #4]   (r9 = hard)
+        0xE3A0_A000,                            // +0x64 mov r10, #0
+        0xE087_050A,                            // +0x68 iter: add r0, r7, r10, lsl #10
+        0xE150_0009,                            // +0x6c cmp r0, r9
+        0x3A00_0007,                            // +0x70 blo +0x94 (skip_iter)
+        0xE150_000B,                            // +0x74 cmp r0, r11
+        0x2A00_0005,                            // +0x78 bhs +0x94 (skip_iter)
+        0xE586_0044,                            // +0x7c str r0, [r6, #68]
+        0xE1A0_0004,                            // +0x80 mov r0, r4
+        0xE1A0_1005,                            // +0x84 mov r1, r5
+        arm_bl(bl_pc, RESOLVE_FAULT_PC),        // +0x88 bl ResolveFault
+        0xE350_0000,                            // +0x8c cmp r0, #0
+        0x1A00_0003,                            // +0x90 bne +0xA4 (done)
+        0xE28A_A001,                            // +0x94 skip_iter: add r10, r10, #1
+        0xE35A_0004,                            // +0x98 cmp r10, #4
+        0xBAFF_FFF1,                            // +0x9c blt iter (+0x68)  imm24=-15
+        0xE3A0_0000,                            // +0xa0 mov r0, #0
+        0xE586_8044,                            // +0xa4 done: str r8, [r6, #68]
+        HvcImm::ResolveFaultRet.insn(),         // +0xa8 hvc #ResolveFaultRet
+        0xE8BD_8FF0,                            // +0xac pop {r4-r11, pc}
     ];
     unsafe {
         for (i, w) in stub.iter().copied().enumerate() {

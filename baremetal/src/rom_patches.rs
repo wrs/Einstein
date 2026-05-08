@@ -236,171 +236,162 @@ const PATCHES_717006: &[RomPatch] = &[
     // `docs/STRUCTURES.md` "1-KiB allocator audit" for the full
     // catalogue of 1-KiB sites.
     RomPatch { offset: 0x0014_28B8, value: 0xE3A0_4A01, name: "ZapHeap: force chunk/lock size = 4096" },
-    // FMNewStack + heap-domain 33→36 KiB + 3→4 KiB guard. Coordinated
-    // re-attempt covering the 17 sites in FMNewStack itself (size
-    // constants, guard offsets, slot-stride encodings) plus the 3
-    // divisor sites in surrounding heap-domain functions:
-    //   * `Init__11THeapDomain` at 0x001F_8D74 — divides pool size
-    //     by 33 KiB to compute slot count for the slot_info array.
-    //   * `GetStackInfo__11THeapDomain` at 0x001F_8E1C — divides VA
-    //     offset by 33 KiB to map VA → slot index.
-    //   * `FMFree__13TStackManager` at 0x001F_918C — same divisor
-    //     in the slot-index path.
+    // TStackManager: 4 KiB-only stack/heap allocation.
     //
-    // ARM immediate encoding: #36864 = imm12 0xA09 (rot=0xA, imm8=9
-    // → ROR(9,20) = 0x9000); #4096 = imm12 0xA01 (rot=0xA, imm8=1
-    // → ROR(1,20) = 0x1000).
+    // The kernel was compiled for ARMv4, where each L2 PTE for a 4 KiB
+    // small page held four 2-bit AP fields — one per 1 KiB sub-page —
+    // so the MMU enforced read/write/no-access independently on each
+    // 1 KiB quarter. TStackManager exploits that: stack/heap "areas"
+    // are 33 KiB (= 8 full pages + 1 sub-page), and four consecutive
+    // areas share their boundary 4 KiB page, each owning one sub-page
+    // of it.
+    //
+    // ARMv7+ small-page PTEs only have whole-page AP[2:1]; the
+    // sub-page AP bits are gone. `fix_stage1_xn_bits` flattens to
+    // AP=011, so every shared boundary page becomes whole-page RW for
+    // all four owners. A write past the end of one stack's sub-page
+    // spills into the heap or stack on the adjacent sub-page of the
+    // same physical page.
+    //
+    // Fix: stop sharing pages, AND restore stack-overflow detection.
+    // Four coupled changes accomplish this:
+    //   (A) Bump the area stride from 33 KiB to 36 KiB (= 9 full
+    //       pages). Areas are now 4 KiB-aligned and 4 KiB-multiple,
+    //       so consecutive areas use disjoint pages. 36 KiB (rather
+    //       than 32 KiB) gives each area 32 KiB usable above a 4 KiB
+    //       guard page — boot scripts run NewtonScript code that
+    //       recurses ~50 levels deep through the interpreter and
+    //       genuinely use ~32 KiB of stack; the 32 KiB-stride variant
+    //       of this patch left the deepest leaf with no headroom.
+    //   (B) The compiled per-area "page-aligned base" formula has a
+    //       sub-page staircase term that, for the 33 KiB stride, lets
+    //       four consecutive 33 KiB areas pack into 33 KiB worth of
+    //       4 KiB-aligned pages. With the 36 KiB stride each area is
+    //       already 4 KiB-aligned, so the staircase becomes just
+    //       `slot * 36864`. The compiler's two-`add` chain produces
+    //       this naturally if we drop the divide-by-4 — see below.
+    //   (C) Make every fault claim the whole 4 KiB page, not just the
+    //       1 KiB sub-page that took the fault. Otherwise the
+    //       matching cache in the page-pool would still hand a
+    //       partially-owned page from one allocator to another,
+    //       mapping the same physical page at two unrelated VAs —
+    //       the same page-alias bug, in a different layer.
+    //   (D) Bump kGuardBandSize from 3 KiB to 4 KiB so the kernel's
+    //       guard region is exactly the bottom 4 KiB page of each
+    //       area. The original kernel relied on per-sub-page AP=NA
+    //       to make the bottom 3 sub-pages of an area's first page
+    //       fault on access — ARMv4 hardware enforced the guard.
+    //       ARMv7 has no per-sub-page AP, so we instead make the
+    //       guard a *whole-page* hole: the lock-pass at task setup
+    //       starts at `bottomOfStack = norm + 4 KiB`, leaving the
+    //       bottom page never claimed and never `Remember`ed. Stack
+    //       overflow into the bottom page takes a TLB miss, routes
+    //       to the same area's TStackInfo, hits ResolveFault's
+    //       `FAR < fLowerBounds` branch, returns -10203, and throws
+    //       busError. Reliable detection without sub-page AP.
+    //
+    // The bookkeeping is still per-sub-page; the underlying MMU just
+    // collapses everything to whole-page granularity, which is what
+    // we want now that no page is ever shared. FMLockHeapRange's
+    // per-1 KiB iteration redundantly calls ResolveFault four times
+    // per page (each call increments one sub-page's lock count),
+    // still correct; FreeSubPagesBetween's per-sub-page sweeps
+    // similarly operate at finer granularity than the MMU honours,
+    // harmlessly.
+    //
+    // ARM immediate encoding: #36864 = imm12 0xA09 (rot=A, imm8=9 →
+    // ROR(9, 20) = 0x9000). The original ROM uses a different
+    // canonical encoding for #33792 (imm12 0xB21) — both forms are
+    // valid; we use the assembler's canonical output for #36864.
     //
     // Sites in CheckHeap / VetHeap (0x0027_1Exx) and SaveCPUStateAndStop
     // (0x0001_8F8C, 0x0001_8FA4, 0x0001_90EC) are NOT patched —
     // CheckHeap may not run in our boot path, and the SaveCPUState
     // sites use 0xC008400 as a fixed kernel-globals offset unrelated
-    // to per-task stack stride.
+    // to per-task area stride.
 
-    // FMNewStack (17 patches):
-    RomPatch { offset: 0x001F_8EDC, value: 0xE3A0_7A09, name: "FMNewStack: mov r7, #36864 (was 33792)" },
-    RomPatch { offset: 0x001F_8EF0, value: 0xE240_1A01, name: "FMNewStack: sub r1, r0, #4096 (was 3072)" },
-    RomPatch { offset: 0x001F_8F18, value: 0xE3A0_0A09, name: "FMNewStack: mov r0, #36864 (divisor)" },
-    RomPatch { offset: 0x001F_8F20, value: 0xE080_0180, name: "FMNewStack: add r0, r0, r0, lsl #3 (×9)" },
-    RomPatch { offset: 0x001F_8F24, value: 0xE049_0600, name: "FMNewStack: sub r0, r9, r0, lsl #12 (×4096)" },
-    RomPatch { offset: 0x001F_8F30, value: 0xE280_0A01, name: "FMNewStack: add r0, r0, #4096 (guard)" },
-    RomPatch { offset: 0x001F_8F38, value: 0xE350_0A09, name: "FMNewStack: cmp r0, #36864" },
-    RomPatch { offset: 0x001F_8F48, value: 0xE3A0_0A09, name: "FMNewStack: mov r0, #36864 (divisor)" },
-    RomPatch { offset: 0x001F_8F5C, value: 0xE3A0_0A09, name: "FMNewStack: mov r0, #36864 (divisor)" },
-    RomPatch { offset: 0x001F_8F88, value: 0xE280_0A01, name: "FMNewStack: add r0, r0, #4096 (guard, alt)" },
-    RomPatch { offset: 0x001F_8F90, value: 0xE350_0A09, name: "FMNewStack: cmp r0, #36864 (alt)" },
-    RomPatch { offset: 0x001F_8FA0, value: 0xE3A0_0A09, name: "FMNewStack: mov r0, #36864 (alt-path divisor)" },
-    RomPatch { offset: 0x001F_9024, value: 0xE08A_118A, name: "FMNewStack: add r1, sl, sl, lsl #3 (×9)" },
-    RomPatch { offset: 0x001F_902C, value: 0xE080_9601, name: "FMNewStack: add r9, r0, r1, lsl #12 (×4096)" },
-    RomPatch { offset: 0x001F_9030, value: 0xE087_0187, name: "FMNewStack: add r0, r7, r7, lsl #3 (×9)" },
-    RomPatch { offset: 0x001F_9034, value: 0xE049_0600, name: "FMNewStack: sub r0, r9, r0, lsl #12 (×4096, end-of-slot)" },
-    // info[+4] / info[+24] are initialised from this `r2 = bottomOfStack + N`.
-    // Original kernel layout had a 1 KiB guard subpage at the bottom of each
-    // stack slot — info[+24] (the kernel's "minimum SP allowed") sat at
-    // slot_base + 1 KiB, leaving 32 KiB of stack data above it. We initially
-    // patched this to `+ 4 KiB` to match our enlarged 4 KiB-page guard, but
-    // user-mode code (especially exception-frame pushes, which can land 12
-    // bytes below SP) expects the original 1 KiB-guard geometry. With a
-    // 4 KiB info[+4], any write 12 bytes below the original bottom-of-data
-    // is rejected by ResolveFault (FAR < info[+24]) and the kernel throws
-    // exBusError — see the `BusErrorThrow` LoudHalt at TStackManager::Fault
-    // 0x001F_8534 and the marker stack walk in tstack-dump.
+    // (A) FMNewStack — area stride 33792 → 36864.
     //
-    // The "guard" can't be hardware-enforced at sub-4-KiB granularity under
-    // ARMv7 anyway — the bottom 4 KiB page commits as a whole on first
-    // access. Reverting to `+1 KiB` keeps our logical info[+24] matching
-    // Einstein's, so the same user-code SP excursion that worked there
-    // works here. Stack overflows are still caught by the next slot's
-    // bottom not overlapping ours (slot stride 36 KiB, no sharing).
+    // Three udiv-by-stride sites (`mov r0, #stride; bl __rt_udiv`),
+    // two compare-against-stride sites (`cmp r0, #stride`), one
+    // clamp value (`mov r7, #stride`), and three multiply-by-stride
+    // sites.
     //
-    // Encoding: `add r2, r0, #1024` = ADD imm12: cond=E (always), op=2
-    // (add), S=0, Rn=0, Rd=2, imm12=0xB01 (rot=B → ROR(1, 22) = 0x400 = 1024).
-    RomPatch { offset: 0x001F_9038, value: 0xE280_2B01, name: "FMNewStack: add r2, r0, #1024 (info[+4] = slot_base + 1 KiB, original geometry)" },
+    // The multiply-by-stride was emitted as `r * 33` (`add r,r,r,lsl
+    // #5`) followed by `lsl #10` to land at `r * 33792`. With the new
+    // stride 36864 = 9 * 4096, the same shape becomes `r * 9` (`add
+    // r,r,r,lsl #3`) followed by `lsl #12`.
+    RomPatch { offset: 0x001F_8EDC, value: 0xE3A0_7A09, name: "FMNewStack: mov r7, #36864 (clamp value)" },
+    RomPatch { offset: 0x001F_8EF0, value: 0xE240_1A01, name: "FMNewStack: sub r1, r0, #4096 (was 3072; guard 3K → 4K)" },
+    RomPatch { offset: 0x001F_8F18, value: 0xE3A0_0A09, name: "FMNewStack: mov r0, #36864 (udiv divisor, request-addr path)" },
+    RomPatch { offset: 0x001F_8F20, value: 0xE080_0180, name: "FMNewStack: add r0, r0, r0, lsl #3 (was lsl #5; *33 → *9)" },
+    RomPatch { offset: 0x001F_8F24, value: 0xE049_0600, name: "FMNewStack: sub r0, r9, r0, lsl #12 (was lsl #10; *1024 → *4096)" },
+    RomPatch { offset: 0x001F_8F30, value: 0xE280_0A01, name: "FMNewStack: add r0, r0, #4096 (was 3072; maxSize += 4K guard, request-addr path)" },
+    RomPatch { offset: 0x001F_8F38, value: 0xE350_0A09, name: "FMNewStack: cmp r0, #36864 (clamp, request-addr path)" },
+    RomPatch { offset: 0x001F_8F48, value: 0xE3A0_0A09, name: "FMNewStack: mov r0, #36864 (udiv divisor, request-addr path)" },
+    RomPatch { offset: 0x001F_8F5C, value: 0xE3A0_0A09, name: "FMNewStack: mov r0, #36864 (udiv divisor, request-addr path)" },
+    RomPatch { offset: 0x001F_8F88, value: 0xE280_0A01, name: "FMNewStack: add r0, r0, #4096 (was 3072; maxSize += 4K guard, any-addr path)" },
+    RomPatch { offset: 0x001F_8F90, value: 0xE350_0A09, name: "FMNewStack: cmp r0, #36864 (clamp, any-addr path)" },
+    RomPatch { offset: 0x001F_8FA0, value: 0xE3A0_0A09, name: "FMNewStack: mov r0, #36864 (udiv divisor, any-addr path)" },
+    RomPatch { offset: 0x001F_9024, value: 0xE08A_118A, name: "FMNewStack: add r1, sl, sl, lsl #3 (was lsl #5; *33 → *9, top-of-area)" },
+    RomPatch { offset: 0x001F_902C, value: 0xE080_9601, name: "FMNewStack: add r9, r0, r1, lsl #12 (was lsl #10; *1024 → *4096, top-of-area)" },
+    RomPatch { offset: 0x001F_9030, value: 0xE087_0187, name: "FMNewStack: add r0, r7, r7, lsl #3 (was lsl #5; *33 → *9, area-base)" },
+    RomPatch { offset: 0x001F_9034, value: 0xE049_0600, name: "FMNewStack: sub r0, r9, r0, lsl #12 (was lsl #10; *1024 → *4096, area-base)" },
+    RomPatch { offset: 0x001F_9038, value: 0xE280_2A01, name: "FMNewStack: add r2, r0, #4096 (was 3072; bottomOfStack = norm + 4K, page-aligned)" },
 
-    // FMNewStack `stackNormalization` formula (the value passed as
-    // `(topOfStack - stackNormalization) / kPageSize + 1` to
-    // `TStackInfo::Init`). Source-level form:
-    //   stackNormalization = fBase
-    //     + (firstFree / kSubPagesPerPage) * kPageSize
-    //     + firstFree * (kStackSize - kSubPageSize);
-    // Compiles at 0x001F_9060..0x001F_906C as:
-    //   addmi r0, r0, #3      ; round-to-zero for /4 of signed firstFree
-    //   asr   r0, r0, #2      ; r0 = firstFree / kSubPagesPerPage  (=4)
-    //   add   r0, r1, r0, lsl #12   ; + (firstFree/4) * kPageSize  (=4096)
-    //   add   r0, r0, r6, lsl #15   ; + firstFree * 32768
-    //                               ;   = firstFree * (kStackSize - kSubPageSize)
-    //                               ;   with kStackSize=33792, kSubPageSize=1024
+    // (B) FMNewStack — drop the divide-by-4 in the page-aligned-base
+    // formula so the existing two-`add` chain produces
+    // `base + slot * 36864`.
     //
-    // After the FMNewStack patches above, kStackSize is 36864 but the
-    // `lsl #15` (=32768) is still `kStackSize - kSubPageSize` for the
-    // ORIGINAL kSubPageSize=1024. We want kSubPageSize = kPageSize = 4096
-    // and kSubPagesPerPage = 1, which makes:
-    //   stackNormalization = fBase + firstFree*kPageSize + firstFree*32768
-    //                      = fBase + firstFree*(4096+32768)
-    //                      = fBase + firstFree*36864     (= firstFree*kStackSize ✓)
-    // — so the existing `lsl #15` stays, but the divide-by-4 must go.
-    // NOP both `addmi` and `asr` so r0 = firstFree (unchanged) into the
-    // `add r0, r1, r0, lsl #12`.
-    //
-    // Without this patch: stackNormalization is under-counted by
-    // r * kSubPageSize (= up to 3072 bytes) when firstFree % 4 != 0,
-    // which over-sizes num_entries passed to `TStackInfo::Init` and
-    // causes a much larger slot array than actually needed.
-    RomPatch { offset: 0x001F_9060, value: 0xE1A0_0000, name: "FMNewStack: NOP (was addmi r0, r0, #3 — kSubPagesPerPage→1)" },
-    RomPatch { offset: 0x001F_9064, value: 0xE1A0_0000, name: "FMNewStack: NOP (was asr r0, r0, #2 — kSubPagesPerPage→1)" },
+    // The original formula at 0x001F_9060..0x001F_906C is:
+    //   addmi r0, r0, #3            ; round-to-zero for signed /4
+    //   asr   r0, r0, #2            ; r0 = slot / 4
+    //   add   r0, r1, r0, lsl #12   ; r0 = base + (slot/4)*4096
+    //   add   r0, r0, r6, lsl #15   ; r0 = ... + slot*32768
+    // The staircase yields a 33 KiB-stride layout: every fourth slot
+    // starts on a fresh page, the in-betweens straddle the boundary
+    // page. With slot stride = 9 pages (= 36864), every slot starts
+    // page-aligned, and the formula simplifies to slot * 9 * 4096.
+    // NOPing the addmi+asr leaves r0 = slot going into the third
+    // instruction; the third then computes `base + slot*4096`, the
+    // fourth adds `slot*32768`, total `base + slot*(4096+32768)
+    // = base + slot*36864`. Two patches; the existing two `add`
+    // instructions provide the multiplication unchanged.
+    RomPatch { offset: 0x001F_9060, value: 0xE1A0_0000, name: "FMNewStack: nop (was addmi r0, r0, #3 — drop /4)" },
+    RomPatch { offset: 0x001F_9064, value: 0xE1A0_0000, name: "FMNewStack: nop (was asr r0, r0, #2 — drop /4)" },
 
-    // Heap-domain divisor patches.
+    // (A continued) Heap-domain helpers — same stride change.
     //
-    // Init__11THeapDomain (0x001F_8D74) was patched alongside
-    // FMNewStack but reverted: that function constructs THeapDomain
-    // for BOTH stack pools and regular data heaps. Patching the
-    // divisor to 36 KiB correctly sizes the slot_info array for
-    // stack pools but UNDER-sizes the bookkeeping for data heaps,
-    // breaking ExtendVMHeap when the heap grows past what the
-    // patched-down array can index. The unpatched 33 KiB divisor
-    // OVER-sizes the array for stack pools (108 slots vs 99 actually
-    // used) — wasted memory but functionally safe; FMNewStack only
-    // ever computes indices in the 0..99 range.
+    // Init__11THeapDomain at 0x001F_8D74 is intentionally NOT patched.
+    // It constructs the slot-info array for both stack pools and
+    // regular data heaps; sizing it with the larger stride would
+    // UNDER-size the array, breaking heap growth past the 33 KiB-
+    // sized array's index range. The unpatched 33 KiB divisor
+    // OVER-sizes the array for the new stride — wasted memory but
+    // functionally safe.
+    RomPatch { offset: 0x001F_8E1C, value: 0xE3A0_0A09, name: "THeapDomain::GetStackInfo: mov r0, #36864 (slot-index divisor)" },
+    RomPatch { offset: 0x001F_918C, value: 0xE3A0_0A09, name: "FMFree: mov r0, #36864 (slot-index divisor)" },
+
+    // (C) ResolveFault — every fault claims the whole 4 KiB page.
     //
-    // GetStackInfo and FMFree are stack-only paths, so the 36-KiB
-    // divisor stays — correct slot index computation requires the
-    // matching slot stride.
-    RomPatch { offset: 0x001F_8E1C, value: 0xE3A0_0A09, name: "GetStackInfo: mov r0, #36864 (slot index divisor)" },
-    RomPatch { offset: 0x001F_918C, value: 0xE3A0_0A09, name: "FMFree: mov r0, #36864 (slot index divisor)" },
-    // GetMatchingPage = always-return-0 stub (iter 23). Forces every
-    // FindOrAllocPage_ReturnUnLockedOnNoPage call into the cache-miss
-    // branch → AllocNewPage → fresh PA from TUPageManager::Get. Without
-    // this stub, the kernel's TStackManager reuses an existing
-    // TStackPage's PA across distinct VAs (heap/stack/scratch) by relying
-    // on ARMv4 subpage-AP — exactly the alias the iter-21 stage-1 walk
-    // pinned for PA=0x04084000 (heap VA 0x0c646000 ↔ stack VA 0x0ccc8000).
-    // Under flat AP=11 the alias collapses and the compressor's count
-    // gets clobbered by another task's exception-frame push.
+    // The compiled code computes
+    //   nSubPage  = (FAR - area_base) >> 10
+    //   pageIdx   = nSubPage >> 2
+    //   subIdx    = nSubPage & 3
+    //   bitmap    = 1 << subIdx
+    // and passes `bitmap` as the requested-sub-page mask to
+    // FindOrAllocPage, which forwards it to GetMatchingPage. The
+    // matcher only accepts a candidate page if every requested
+    // sub-page is free, then assigns those sub-pages to the faulting
+    // owner. Forcing `bitmap = 0xF` makes the matcher accept only
+    // fully-free pages and assign all four sub-pages at once — no
+    // two owners can ever share a 4 KiB page after this.
     //
-    // Stub layout (replaces the original prologue at 0x001F_86B4):
-    //   0x001F_86B4: mov r0, #0   (was: mov ip, sp = 0xE1A0_C00D)
-    //   0x001F_86B8: bx lr         (was: push {r4-r10, fp, ip, lr, pc}
-    //                                    = 0xE92D_DFF0)
-    RomPatch { offset: 0x001F_86B4, value: 0xE3A0_0000, name: "GetMatchingPage: mov r0, #0 (return 0 — no shareable page)" },
-    RomPatch { offset: 0x001F_86B8, value: 0xE12F_FF1E, name: "GetMatchingPage: bx lr (skip prologue+body)" },
-    // (TraceSetOptions patches are gated by the `ns_trace` /
-    //  `full_ns_trace` features and applied later in
-    //  `apply_717006_patches`.)
-    // Force exclusive per-stack page allocation by short-circuiting
-    // `TStackManager::GetMatchingPage` to always return 0 (= "no
-    // shareable page found"). This forces every `FindOrAllocPage` call
-    // into the cache-miss path → `AllocNewPage` → fresh PA from
-    // `TUPageManager::Get`. With this, no two stacks ever share a 4-KiB
-    // physical page; ARMv7's loss of subpage-AP no longer matters
-    // because an overrun stays inside this task's exclusive PA.
-    //
-    // GetMatchingPage entry is at 0x001f86b4. Its first instruction
-    // (`mov ip, sp` = `0xE1A0_C00D`) is replaced with `mov r0, #0`
-    // (= `0xE3A0_0000`); the second instruction (`push {r4-r10, fp,
-    // ip, lr, pc}` = `0xE92D_DFF0`) is replaced with `bx lr`
-    // (= `0xE12F_FF1E`). Together these form a two-instruction stub
-    // that returns 0 immediately without touching the stack frame.
-    //
-    // Paired with the 4-iteration wrapper installed by
-    // `apply_resolve_fault_wrapper`. Each ResolveFault iter:
-    //   - iter 0 hits the first-allocation branch (page_table[N]=null),
-    //     calls FindOrAllocPage which (with cache disabled) allocates
-    //     a fresh page exclusively for this stack and sets sub 0's
-    //     owner via PageMatchFound(mask=1<<0).
-    //   - iters 1..3 hit the existing-page branch (page_table[N] is
-    //     now set), find sub.owner=NULL (only sub 0 was assigned), and
-    //     fall through to SetSubPageInfo(sub_idx) → success_tail.
-    //
-    // The kernel's existing-page comparison at 0x1f7a4c-0x1f7a5c reads
-    // a word containing page_idx_hi/lo bytes that were written via
-    // STRB (XOR-3 byte-swizzled by shadow_stub). The word read gives
-    // wrong data for sub_idx=3 (the high half of the word reads into
-    // the refcount region in LE byte-order). To avoid that path, iters
-    // 1-3 must hit r9==0 (sub unowned) so the comparison is skipped —
-    // which requires PageMatchFound to NOT preemptively assign all 4
-    // subs. That's why we don't patch `0x1f7a10` to mask=0xF; we let
-    // PageMatchFound set only sub 0 and rely on per-iter
-    // SetSubPageInfo for the rest.
+    // `subIdx` is left valid downstream so the sub-page lock-count
+    // tail still records the right index for FMLockHeapRange's
+    // per-1-KiB lock loop.
+    RomPatch { offset: 0x001F_7A0C, value: 0xE3A0_000F, name: "ResolveFault: mov r0, #15 (whole-page bitmap)" },
+    RomPatch { offset: 0x001F_7A10, value: 0xE1A0_3000, name: "ResolveFault: mov r3, r0 (drop sub-idx shift)" },
 ];
 
 // (HVC immediates live in `crate::hvc_imm::HvcImm`.)
@@ -463,17 +454,6 @@ pub const BOOTOS_ORIG_INSN: u32 = 0xE3A0_00B0;
 ///                   shared across all non-FIQ modes, ctx.x[7])
 ///                   sidesteps that mapping question entirely.
 ///   HVC #imm      — trap to EL2
-/// Entry point of `TStackManager::ResolveFault` that the wrapper invokes.
-const RESOLVE_FAULT_PC: u32 = 0x001F_7978;
-
-/// PC of the `bl ResolveFault` call inside `TStackManager::Fault` —
-/// the site we re-target to the wrapper.
-const FAULT_BL_RESOLVE_PC: u32 = 0x001F_84E0;
-
-/// PC of the `bl ResolveFault` call inside `FMLockHeapRange`. Same
-/// retarget so all `ResolveFault` invocations go through the wrapper.
-const FMLOCK_BL_RESOLVE_PC: u32 = 0x001F_6B94;
-
 /// `LockHeapRange` (caller-side glue at 0x001F_8AB4) and
 /// `UnlockHeapRange` (0x001F_8B88) — the two ABI entry points whose
 /// `(base, limit, lock_id?)` parms are forwarded to FMLockHeapRange /
@@ -973,7 +953,13 @@ pub unsafe fn apply_717006_patches(rom_ptr: *mut u32) {
         apply_fdate_from_seconds_patch(rom_ptr);
         apply_loud_halt_traps(rom_ptr);
         apply_bootos_trap(rom_ptr);
-        apply_resolve_fault_wrapper(rom_ptr);
+        // The 4-iteration `apply_resolve_fault_wrapper` was a previous
+        // strategy: pretend each real fault was four sub-page faults
+        // so all four sub-pages of the containing page got claimed
+        // through the kernel's normal one-sub-page-at-a-time path. The
+        // ResolveFault whole-page bitmap patch in PATCHES_717006 makes
+        // that unnecessary — every fault now claims all four sub-pages
+        // in a single call.
         // `apply_new_stack_pad_wrapper` is NOT installed — the
         // call-site +4 KiB pad changes the size *requested* of
         // NewStack but not the kernel's stack-pool slot stride. The
@@ -997,9 +983,10 @@ pub unsafe fn apply_717006_patches(rom_ptr: *mut u32) {
         let _ = apply_lock_heap_range_wrapper;
         apply_l1_cd_probes(rom_ptr);
         apply_fault_handler_ldr_byteswap_patches(rom_ptr);
+        apply_resolve_fault_entry_probe(rom_ptr);
     }
 
-    kprintln!("rom_patch: applied {} simple patches + 5 native-call/injection ROM patches + PowerOffAndReboot + Reboot + BootOS + ResolveFault-wrapper + L1[0xCD] probes + fault-handler LDR byteswap stubs", applied);
+    kprintln!("rom_patch: applied {} simple patches + 5 native-call/injection ROM patches + PowerOffAndReboot + Reboot + BootOS + L1[0xCD] probes + fault-handler LDR byteswap stubs", applied);
 }
 
 
@@ -1707,260 +1694,43 @@ unsafe fn apply_bootos_trap(rom_ptr: *mut u32) {
     );
 }
 
-/// Force-per-page stack allocation by re-running `TStackManager::ResolveFault`
-/// four times per kernel-side fault, once per 1-KiB subpage of the faulting
-/// 4-KiB page.
-///
-/// **Why.** The 717006 kernel uses ARMv4 subpage-AP to put up to four 1-KiB
-/// stacks on a single 4-KiB physical page, with guard subpages set to AP=00 so
-/// a stack overrun faults and the kernel can grow lazily. ARMv7 (our hardware)
-/// has no subpage-AP support — `fix_stage1_xn_bits` flattens every L2 entry to
-/// AP=011 (full RW) so the kernel can run at all, but the side effect is that
-/// after the kernel "grows" one subpage, ARMv7 unconditionally exposes the
-/// other three subpages of the same page as RW. The kernel never gets the
-/// chance to take a fault on those siblings, so its bookkeeping believes only
-/// one subpage is allocated while physically all four are accessible.
-///
-/// **Fix.** Trick the kernel into completing the bookkeeping for all four
-/// subpages on the first fault. Insert a thin wrapper at WRAPPER_PC that:
-///
-///   1. Reads the original FAR from `this->[+64]->[+68]` and saves it.
-///   2. Aligns the FAR to the 4-KiB page base.
-///   3. Calls the real `ResolveFault` four times, each time with the FAR
-///      pointing at one of the four 1-KiB subpages of that page (offsets
-///      `0x000`, `0x400`, `0x800`, `0xC00`).
-///   4. Restores the original FAR and returns.
-///
-/// The first call hits the first-allocation path (page slot is null →
-/// `FindOrAllocPage(mask=1<<0)` allocates the page and assigns subpage 0 to
-/// this stack). The next three hit the existing-page path with `owner==NULL`
-/// and call `SetSubPageInfo` to assign subpages 1/2/3. The full success-tail
-/// (SetRestrictedPage / RememberMappings / refcount bump) runs four times —
-/// once per subpage — so the kernel's per-subpage bookkeeping matches the
-/// physical reality that all four subpages of the page are now accessible.
-///
-/// Replaces an earlier set of three `mov r3, #0xF` patches at the
-/// `bl FindOrAllocPage` call sites in ResolveFault. Those patches forced
-/// each FindOrAllocPage call to claim all four subpages via `PageMatchFound`
-/// with `mask=0xF`, but only updated subpage *ownership* — the other
-/// per-subpage bookkeeping (refcount0/1, RememberMappings entries) was still
-/// done for only the faulting subpage. Under sustained allocation pressure
-/// (TInterpreter ctor's 256 KiB of lazy stacks) the kernel's allocator
-/// drifted into a state where `Remember` on a fresh L1 lazy section returned
-/// an unhandled error, propagating to `Reboot(-10075)`. The wrapper approach
-/// avoids that drift by literally running the kernel's full per-subpage path
-/// four times, making the kernel's view of "which subpages got allocated"
-/// agree with what ARMv7 has actually exposed.
-unsafe fn apply_resolve_fault_wrapper(rom_ptr: *mut u32) {
-    // ARM AArch32 wrapper code, 43 words = 172 bytes.
-    //
-    // Replaces an earlier 28-word version that iterated all four
-    // subpages with a buggy `blt` (imm24=-11) — that encoding landed
-    // at +0x34 (the `str`) instead of the intended +0x30 (the `add`
-    // that recomputed FAR), so iters 1/2/3 reused stale r0 (= the
-    // previous bl's return value) as the FAR and ResolveFault
-    // returned -10204 each. Naively fixing the encoding (-12) made
-    // iters fire correctly but regressed early boot (4-iter behavior
-    // claims subpages 1/2/3 of every bottom page on every Fault call,
-    // breaking some downstream kernel state). See PLAN.md "Why the
-    // fix isn't a one-liner" for the diagnosis the probe yielded.
-    //
-    // Path A (this version): narrow the iter range. The wrapper:
-    //   1. Fast-fails to -10203 if orig_FAR is in the guard region
-    //      (FAR < info[+4]) — kernel busError on guard violation.
-    //   2. Fast-fails to -10204 if orig_FAR is above top — kernel
-    //      busError on above-top violation.
-    //   3. Otherwise iterates sub_idx 0..4 of the page containing
-    //      orig_FAR, but skips any far_iter that falls outside
-    //      [info[+4], info[+28]). For the bottom page that means
-    //      iter 0 (the guard subpage) is skipped; for the top page
-    //      that means iters whose FARs would exceed `top` are
-    //      skipped. Only legitimate subpages are passed to
-    //      ResolveFault.
-    //   4. Propagates any non-zero return immediately (we no longer
-    //      generate negative returns from invalid-range iters since
-    //      the loop skips them, so any non-zero is a real error).
-    //   5. Fires HvcImm::ResolveFaultRet at the end to log
-    //      r0/r4/r5/r8 (probe stays armed across this rewrite).
-    //
-    // Register choices (AAPCS callee-saved across BL: r4-r11, lr):
-    //   r4 = TStackManager*       r5 = TStackInfo*
-    //   r6 = ProcessorState*      r7 = page_base_FAR
-    //   r8 = original FAR         r9 = info[+20] = base
-    //   r10 = sub_idx counter     r11 = info[+28] = top
-    //   r12 = info[+4] = hard (caller-saved; read once, stable
-    //         across BL because ResolveFault doesn't write to it
-    //         and we re-load r12 at iter time only by chance — but
-    //         actually r12 IS clobbered by BL per AAPCS. We use it
-    //         only before any BL and re-test against the loaded
-    //         values inside the loop)
-    //
-    // WAIT — r12 (ip) is intra-procedure scratch and CAN be
-    // clobbered by `bl ResolveFault`. If we read r12 once into the
-    // initial setup and then use it inside the iter loop AFTER bl,
-    // it'd be stale. The fix below rolls hard / top into callee-
-    // saved r12-equivalents... actually let me check: we use r12
-    // ONLY in the fast-fail paths (before the iter loop's bl) and
-    // inside iter for skip-checks (BEFORE the bl in that iter).
-    // After bl returns, the cmp r0,#0 + bne is the only check that
-    // uses any register's stale value, and that's r0 — not r12. So
-    // r12 being clobbered by bl matters only for the NEXT iter's
-    // skip-checks. To avoid that, we re-load r12 from info[+4]
-    // each iter? No — extra ldrs on the hot path. Alternative: use
-    // a callee-saved register (r11) for `top`, and r12 for `hard`,
-    // re-loading r12 at iter-loop entry. But r11 is currently
-    // holding `top`... let's swap: r11 = hard, r12 reloaded each
-    // iter as `top`? Or just use r9-equivalent slots.
-    //
-    // Cleanest: load both `hard` and `top` into callee-saved regs
-    // BEFORE the loop. We have r9 (base), r11, r12 used. Re-assign:
-    //   r9 = base   (callee-saved, used once for page_base compute)
-    //   r11 = top   (callee-saved, used in fast-fail and skip-check)
-    //   r12 = hard  (CALLER-saved — clobbered by bl)
-    //
-    // r12 used only in fast-fail (before any bl) and at iter-skip
-    // (before that iter's bl). Within a single iter pass, r12 is
-    // read before bl, so it's stable. Across iters, r12's value at
-    // iter N's start is whatever was last loaded — which was BEFORE
-    // the loop started (initial ldr r12, [r5, #4]). The bl in iter
-    // N-1 clobbers r12. So at iter N's skip-check, r12 is GARBAGE.
-    //
-    // Fix: load `hard` into the callee-saved bank too. We have r4,
-    // r5, r6, r7, r8, r9, r10, r11 used (8). Adding `hard` needs a
-    // 9th — and we already pushed {r4-r11, lr} = 9 saved. We can
-    // free up r9 (`base`) after computing page_base, then reuse r9
-    // for `hard`. The init code uses r9 only at +0x14..+0x5c; once
-    // page_base is computed at +0x5c, r9 is dead. Reload r9 = hard
-    // at +0x60 before the iter loop. Then iters use r9 (hard) and
-    // r11 (top) for skip-checks.
-    //
-    // Listing (offsets from wrapper_pc):
-    //   +0x00  push {r4-r11, lr}
-    //   +0x04  mov r4, r0                  ; r4 = manager
-    //   +0x08  mov r5, r1                  ; r5 = info
-    //   +0x0c  ldr r6, [r0, #64]           ; r6 = proc_state
-    //   +0x10  ldr r8, [r6, #68]           ; r8 = orig FAR (for restore)
-    //   +0x14  ldr r9, [r5, #20]           ; r9 = base (temporary)
-    //   +0x18  ldr r12, [r5, #4]           ; r12 = hard (for fast-fail)
-    //   +0x1c  ldr r11, [r5, #28]          ; r11 = top
-    //   +0x20  cmp r8, r12                 ; FAR < hard?
-    //   +0x24  bhs +0x38                   ; no → continue
-    //   +0x28  mov r0, #0x2700
-    //   +0x2c  orr r0, r0, #0xDB           ; r0 = 0x27DB = 10203
-    //   +0x30  rsb r0, r0, #0              ; r0 = -10203
-    //   +0x34  b +0xA0                     ; → done
-    //   +0x38  cmp r8, r11                 ; FAR >= top?
-    //   +0x3c  blo +0x50                   ; no → continue
-    //   +0x40  mov r0, #0x2700
-    //   +0x44  orr r0, r0, #0xDC           ; r0 = 0x27DC = 10204
-    //   +0x48  rsb r0, r0, #0              ; r0 = -10204
-    //   +0x4c  b +0xA0                     ; → done
-    //   +0x50  sub r7, r8, r9              ; offset = FAR - base
-    //   +0x54  lsr r7, r7, #12             ; round down to 4 KiB
-    //   +0x58  lsl r7, r7, #12
-    //   +0x5c  add r7, r9, r7              ; r7 = page_base
-    //   +0x60  ldr r9, [r5, #4]            ; r9 = hard (callee-saved)
-    //   +0x64  mov r10, #0                 ; sub_idx
-    //   +0x68  iter:
-    //          add r0, r7, r10, lsl #10    ; far_iter = page_base + sub*1024
-    //   +0x6c  cmp r0, r9                  ; far_iter < hard?
-    //   +0x70  blo skip_iter (+0x94)
-    //   +0x74  cmp r0, r11                 ; far_iter >= top?
-    //   +0x78  bhs skip_iter (+0x94)
-    //   +0x7c  str r0, [r6, #68]           ; FAR = far_iter
-    //   +0x80  mov r0, r4
-    //   +0x84  mov r1, r5
-    //   +0x88  bl ResolveFault             ; (clobbers r0-r3, r12)
-    //   +0x8c  cmp r0, #0
-    //   +0x90  bne done (+0xA0)            ; propagate any non-zero
-    //   +0x94  skip_iter:
-    //          add r10, r10, #1
-    //   +0x98  cmp r10, #4
-    //   +0x9c  blt iter (+0x68)
-    //   +0xA0  mov r0, #0                  ; success
-    //          (falls into done)
-    //   +0xA4  done: str r8, [r6, #68]     ; restore orig FAR
-    //   +0xA8  hvc #ResolveFaultRet
-    //   +0xAC  pop {r4-r11, pc}
-    //
-    // Encodings verified with arm-none-eabi-as. Only the bl at +0x88
-    // is patched at runtime via arm_bl(); everything else is a fixed
-    // intra-stub branch with a constant relative offset.
-    let resolve_fault_wrapper_pc = alloc_patch_stub(44, "ResolveFault wrapper");
-    let bl_pc = resolve_fault_wrapper_pc + 0x88;
-    let stub: [u32; 44] = [
-        0xE92D_4FF0,                            // +0x00 push {r4-r11, lr}
-        0xE1A0_4000,                            // +0x04 mov r4, r0
-        0xE1A0_5001,                            // +0x08 mov r5, r1
-        0xE590_6040,                            // +0x0c ldr r6, [r0, #64]
-        0xE596_8044,                            // +0x10 ldr r8, [r6, #68]
-        0xE595_9014,                            // +0x14 ldr r9, [r5, #20]
-        0xE595_C004,                            // +0x18 ldr r12, [r5, #4]
-        0xE595_B01C,                            // +0x1c ldr r11, [r5, #28]
-        0xE158_000C,                            // +0x20 cmp r8, r12
-        0x2A00_0003,                            // +0x24 bhs +0x38 (no_fast_lo)
-        0xE3A0_0C27,                            // +0x28 mov r0, #0x2700
-        0xE380_00DB,                            // +0x2c orr r0, r0, #0xDB
-        0xE260_0000,                            // +0x30 rsb r0, r0, #0
-        0xEA00_001A,                            // +0x34 b +0xA4 (done)  imm24=0x1A
-        0xE158_000B,                            // +0x38 cmp r8, r11
-        0x3A00_0003,                            // +0x3c blo +0x50 (no_fast_hi)
-        0xE3A0_0C27,                            // +0x40 mov r0, #0x2700
-        0xE380_00DC,                            // +0x44 orr r0, r0, #0xDC
-        0xE260_0000,                            // +0x48 rsb r0, r0, #0
-        0xEA00_0014,                            // +0x4c b +0xA4 (done)  imm24=0x14
-        0xE048_7009,                            // +0x50 sub r7, r8, r9
-        0xE1A0_7627,                            // +0x54 lsr r7, r7, #12
-        0xE1A0_7607,                            // +0x58 lsl r7, r7, #12
-        0xE089_7007,                            // +0x5c add r7, r9, r7
-        0xE595_9004,                            // +0x60 ldr r9, [r5, #4]   (r9 = hard)
-        0xE3A0_A000,                            // +0x64 mov r10, #0
-        0xE087_050A,                            // +0x68 iter: add r0, r7, r10, lsl #10
-        0xE150_0009,                            // +0x6c cmp r0, r9
-        0x3A00_0007,                            // +0x70 blo +0x94 (skip_iter)
-        0xE150_000B,                            // +0x74 cmp r0, r11
-        0x2A00_0005,                            // +0x78 bhs +0x94 (skip_iter)
-        0xE586_0044,                            // +0x7c str r0, [r6, #68]
-        0xE1A0_0004,                            // +0x80 mov r0, r4
-        0xE1A0_1005,                            // +0x84 mov r1, r5
-        arm_bl(bl_pc, RESOLVE_FAULT_PC),        // +0x88 bl ResolveFault
-        0xE350_0000,                            // +0x8c cmp r0, #0
-        0x1A00_0003,                            // +0x90 bne +0xA4 (done)
-        0xE28A_A001,                            // +0x94 skip_iter: add r10, r10, #1
-        0xE35A_0004,                            // +0x98 cmp r10, #4
-        0xBAFF_FFF1,                            // +0x9c blt iter (+0x68)  imm24=-15
-        0xE3A0_0000,                            // +0xa0 mov r0, #0
-        0xE586_8044,                            // +0xa4 done: str r8, [r6, #68]
-        HvcImm::ResolveFaultRet.insn(),         // +0xa8 hvc #ResolveFaultRet
-        0xE8BD_8FF0,                            // +0xac pop {r4-r11, pc}
-    ];
-    unsafe {
-        for (i, w) in stub.iter().copied().enumerate() {
-            let offset = resolve_fault_wrapper_pc + (i as u32) * 4;
-            let idx = (offset / 4) as usize;
-            crate::guest_mem::write_rom_code_word(rom_ptr, idx, w);
-        }
+/// ROM PC of the first instruction of `TStackManager::ResolveFault`.
+const RESOLVE_FAULT_ENTRY_PC: u32 = 0x001F_7978;
 
-        // Patch the `bl ResolveFault` site inside `Fault` (0x001f84e0).
-        let idx = (FAULT_BL_RESOLVE_PC / 4) as usize;
-        let prev = rom_ptr.add(idx).read();
-        let insn = arm_bl(FAULT_BL_RESOLVE_PC, resolve_fault_wrapper_pc);
-        crate::guest_mem::write_rom_code_word(rom_ptr, idx, insn);
+/// Original first word at `RESOLVE_FAULT_ENTRY_PC` — `mov ip, sp`
+/// (`0xE1A0_C00D`). Replaced with `HVC #ResolveFaultEntry`. The
+/// HVC handler in trap.rs emulates `mov ip, sp` (writes `ctx.x[12]
+/// = source-mode SP`) and advances ELR past the HVC, so the
+/// kernel's `ResolveFault` continues from instruction 2 onward
+/// with the same architectural state it would have had if `mov ip,
+/// sp` had executed normally.
+const RESOLVE_FAULT_ENTRY_ORIG: u32 = 0xE1A0_C00D;
+
+/// Probe at the entry of `TStackManager::ResolveFault`. Logs FAR,
+/// `info[+24]=fLowerBounds`, `info[+28]=fUpperBounds`, owner id,
+/// and norm on every call (with throttling — see the handler).
+/// Used to determine whether `fLowerBounds` is being moved
+/// downward dynamically during stack growth, which would explain
+/// how a deeply-recursing chain successfully descends past the
+/// initial guard ceiling.
+unsafe fn apply_resolve_fault_entry_probe(rom_ptr: *mut u32) {
+    let idx = (RESOLVE_FAULT_ENTRY_PC / 4) as usize;
+    let prev = unsafe { rom_ptr.add(idx).read() };
+    if prev != RESOLVE_FAULT_ENTRY_ORIG {
         kprintln!(
-            "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (Fault → ResolveFaultWrapper @{:#x})",
-            FAULT_BL_RESOLVE_PC, prev, insn, resolve_fault_wrapper_pc,
+            "rom_patch: ERROR — ResolveFault first word is {:#010x}, expected {:#010x}; skipping probe",
+            prev, RESOLVE_FAULT_ENTRY_ORIG,
         );
-
-        // (FMLockHeapRange BL not patched — covers early bring-up paths
-        // that allocate single physical pages eagerly, where
-        // multi-iter would over-claim and break boot. We tried wrapping
-        // it 2026-04-28; the wrapper's "swallow -10203" behaviour
-        // masks legitimate out-of-bounds errors from FMLockHeapRange's
-        // range-iteration, causing the kernel to retry forever.
-        // See INVESTIGATION.md for that diagnostic run.)
-        let _ = FMLOCK_BL_RESOLVE_PC;
-
+        return;
     }
+    let insn = HvcImm::ResolveFaultEntry.insn();
+    unsafe {
+        crate::guest_mem::write_rom_code_word(rom_ptr, idx, insn);
+    }
+    kprintln!(
+        "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (ResolveFault entry probe, HVC #{:#x})",
+        RESOLVE_FAULT_ENTRY_PC, prev, insn, HvcImm::ResolveFaultEntry as u32,
+    );
 }
 
 /// Install the per-stack 4 KiB padding wrapper (Option A in PLAN.md).

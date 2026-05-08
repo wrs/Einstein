@@ -1206,6 +1206,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == HvcImm::ResolveFaultRet as u32 => {
             handle_resolve_fault_ret_probe(ctx);
         }
+        v if v == HvcImm::ResolveFaultEntry as u32 => {
+            handle_resolve_fault_entry_probe(ctx);
+        }
         v if v == HvcImm::DahFmeEntry as u32 => {
             handle_fme_entry_probe(ctx);
         }
@@ -1736,6 +1739,13 @@ fn handle_und(ctx: &mut TrapContext) {
         // the probe reads them straight from ctx.x[N].
         _ if insn == HvcImm::ResolveFaultRet.insn() => {
             handle_resolve_fault_ret_probe(ctx);
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        _ if insn == HvcImm::ResolveFaultEntry.insn() => {
+            handle_resolve_fault_entry_probe(ctx);
+            // Emulate the original `mov ip, sp` (R12 = R13).
+            ctx.x[12] = crate::banked::sp_for_mode(ctx, spsr_und as u32) as u64;
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -2276,8 +2286,8 @@ fn dump_tstacks_and_check_invariants(marker_far: u32) {
                         if covers_marker { "  ***MARKER***" } else { "" },
                     );
                     total_stacks += 1;
-                    if guard != 0x400 {
-                        kprintln!("      [INV] guard != 1 KiB: {:#x}", guard);
+                    if guard != 0x1000 {
+                        kprintln!("      [INV] guard != 4 KiB: {:#x}", guard);
                         errors += 1;
                     }
                     if i_curr < i_hard || i_curr > i_end {
@@ -2316,8 +2326,8 @@ fn dump_tstacks_and_check_invariants(marker_far: u32) {
                     if covers_marker { "  ***MARKER***" } else { "" },
                 );
                 total_stacks += 1;
-                if guard != 0x400 {
-                    kprintln!("      [INV] guard != 1 KiB: {:#x}", guard);
+                if guard != 0x1000 {
+                    kprintln!("      [INV] guard != 4 KiB: {:#x}", guard);
                     errors += 1;
                 }
                 if i_curr < i_hard || i_curr > i_end {
@@ -2476,6 +2486,90 @@ fn handle_loud_halt(ctx: &TrapContext) -> ! {
             "          UND sp={:#010x} lr={:#010x}",
             ctx.x[23] as u32, ctx.x[22] as u32
         );
+        // Walk the failing task's APCS call chain. R1 is the user-mode
+        // SP at fault time (= second arg to Throw). The trapping insn
+        // was a PUSH that did not complete, so the topmost frame on the
+        // user stack is the CALLER of the function whose prologue
+        // faulted (here `Lookup`). With the APCS prologue
+        //   mov ip, sp
+        //   stmfd sp!, {r4..rN, fp, ip, lr, pc}
+        //   sub fp, ip, #4
+        // each frame stores saved-PC at the highest address of the
+        // frame, with saved-LR one word below, saved-IP one word below
+        // that, and saved-FP one word below that. The current-frame FP
+        // points at the saved-PC slot. Walking by `*(fp - 12)` recovers
+        // the chain.
+        //
+        // We can't read R11 of the failing task directly here (the
+        // kernel handlers between the data abort and our HVC have
+        // clobbered the GPRs we see in `ctx`). But the caller's
+        // saved-FP IS in stack memory, written by the caller's
+        // prologue. The caller's FP value points at the saved-PC slot
+        // of the caller's frame; that slot's address equals
+        // `pre_prologue_sp_of_caller - 4`. Because BL doesn't change
+        // SP, the caller's pre-prologue SP equals the SP at fault =
+        // R1. So caller-FP candidate = SP - 4 + caller_frame_size.
+        //
+        // We don't know caller_frame_size. Scan upward from SP for
+        // the first word that is itself a plausible same-stack
+        // pointer (i.e. value in [SP, SP+0x100) with low bits clear)
+        // and points one frame deeper into the chain — that's the
+        // caller's saved-FP. Then the slot just before it
+        // (pointed-at - 4) holds saved-LR; pointed-at + 0 holds
+        // saved-PC.
+        let sp_fail = ctx.x[1] as u32;
+        kprintln!("  stack-trace: fault-SP={:#010x}", sp_fail);
+        let mut start_fp: u32 = 0;
+        for i in 0..32 {
+            let slot_va = sp_fail.wrapping_add(i * 4);
+            let cand = match crate::guest_endian::guest_read_u32_va(slot_va) {
+                Some(v) => v,
+                None => continue,
+            };
+            // Plausible saved-FP: aligned, points to a slot above us
+            // but still on the same stack page.
+            if (cand & 3) != 0 { continue; }
+            if cand <= sp_fail || cand > sp_fail.wrapping_add(0x800) { continue; }
+            // The pointed-at word should look like a saved-PC (ROM
+            // text). Saved PC for ARM = entry+8 due to prefetch.
+            let pc_at_cand = match crate::guest_endian::guest_read_u32_va(cand) {
+                Some(v) => v,
+                None => continue,
+            };
+            if pc_at_cand >= 0x0080_0000 { continue; }
+            start_fp = cand;
+            kprintln!(
+                "    seed-FP = {:#010x} found in stack slot {:#010x}",
+                start_fp, slot_va
+            );
+            break;
+        }
+        if start_fp != 0 {
+            // Print the topmost (incomplete) frame ourselves: the
+            // function whose prologue faulted, i.e. PC = the
+            // faulting PC.
+            let mut depth = 0usize;
+            let frame_va_top = sp_fail; // the prologue hadn't pushed
+            let pc_top = dabt_faulting_pc;
+            let (n0, l0) = crate::task_dump::fmt_pc_name(pc_top);
+            kprintln!(
+                "    #{:<2} frame={:#010x}  pc={:#010x}  {}",
+                depth, frame_va_top, pc_top,
+                core::str::from_utf8(&n0[..l0]).unwrap_or("?"),
+            );
+            depth = 1;
+            crate::task_dump::walk_apcs_frames(start_fp, 1024, |frame_lr, frame_fp| {
+                let (n, l) = crate::task_dump::fmt_pc_name(frame_lr);
+                kprintln!(
+                    "    #{:<2} frame={:#010x}  pc={:#010x}  {}",
+                    depth, frame_fp, frame_lr,
+                    core::str::from_utf8(&n[..l]).unwrap_or("?"),
+                );
+                depth += 1;
+            });
+        } else {
+            kprintln!("    (could not locate a saved-FP near fault SP; chain unrecovered)");
+        }
     }
     cpu::halt();
 }
@@ -3100,6 +3194,76 @@ fn handle_resolve_fault_ret_probe(ctx: &mut TrapContext) {
         orig_far, manager, info,
         i_norm, i_hard, i_curr, i_top,
         pos,
+    );
+}
+
+/// Handler for the `HVC` patched over the first instruction of
+/// `TStackManager::ResolveFault` at ROM 0x001F_7978 (the original
+/// `mov ip, sp`). Logs the FAR and the stackInfo's bounds so we can
+/// observe whether `fLowerBounds` (info[+24]) is being moved
+/// downward between calls — i.e., whether some path in the kernel
+/// dynamically extends the stack before reaching this bounds check.
+///
+/// At the call site, R0 = `this` (TStackManager*), R1 = stackInfo
+/// (TStackInfo*). The function args are still in R0/R1; the
+/// prologue's `mov r4, r0; mov r5, r1` hasn't run yet.
+///
+/// Throttling: tracks per-info `(fLowerBounds, fUpperBounds)` and
+/// emits on (a) first sight, (b) bounds change, (c) every Nth call,
+/// or (d) cases where FAR is outside the current bounds (the cases
+/// that would return -10203/-10204).
+fn handle_resolve_fault_entry_probe(ctx: &mut TrapContext) {
+    use crate::guest_endian::guest_read_u32_va as rd;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    let manager = ctx.x[0] as u32;
+    let info    = ctx.x[1] as u32;
+
+    // FAR: TStackManager+64 = fFaultState; *(fFaultState)+68 = saved FAR.
+    let fault_state = rd(manager.wrapping_add(64)).unwrap_or(0);
+    let far = if fault_state != 0 {
+        rd(fault_state.wrapping_add(68)).unwrap_or(0)
+    } else { 0 };
+
+    let i_norm  = rd(info.wrapping_add(20)).unwrap_or(0);
+    let i_hard  = rd(info.wrapping_add(4)).unwrap_or(0);
+    let i_lower = rd(info.wrapping_add(24)).unwrap_or(0);
+    let i_upper = rd(info.wrapping_add(28)).unwrap_or(0);
+    let i_owner = rd(info.wrapping_add(12)).unwrap_or(0);
+
+    static FIRED: AtomicU32 = AtomicU32::new(0);
+    let n = FIRED.fetch_add(1, Ordering::Relaxed);
+
+    // Track the most-recent (info, fLowerBounds, fUpperBounds) so we
+    // can flag changes. Single-slot cache — if multiple infos cycle
+    // through, we just emit more.
+    static LAST_INFO:  AtomicU32 = AtomicU32::new(0);
+    static LAST_LOWER: AtomicU32 = AtomicU32::new(0);
+    static LAST_UPPER: AtomicU32 = AtomicU32::new(0);
+    let prev_info  = LAST_INFO.load(Ordering::Relaxed);
+    let prev_lower = LAST_LOWER.load(Ordering::Relaxed);
+    let prev_upper = LAST_UPPER.load(Ordering::Relaxed);
+    let bounds_changed = prev_info == info
+        && (prev_lower != i_lower || prev_upper != i_upper);
+    let new_info = prev_info != info;
+    LAST_INFO.store(info, Ordering::Relaxed);
+    LAST_LOWER.store(i_lower, Ordering::Relaxed);
+    LAST_UPPER.store(i_upper, Ordering::Relaxed);
+
+    let oob = far < i_lower || far >= i_upper;
+    let log = n < 32 || bounds_changed || oob || (n & 0xFF) == 0;
+    if !log { return; }
+
+    let tag = if bounds_changed { " ***BOUNDS-MOVED***" }
+        else if oob { " ***OOB***" }
+        else if new_info { " (new-info)" }
+        else { "" };
+
+    kprintln!(
+        "RF-entry[{}]: FAR={:#010x} info={:#010x} owner={:#010x}  norm={:#010x} hard(+4)={:#010x} lower(+24)={:#010x} upper(+28)={:#010x}{}",
+        n, far, info, i_owner,
+        i_norm, i_hard, i_lower, i_upper,
+        tag,
     );
 }
 

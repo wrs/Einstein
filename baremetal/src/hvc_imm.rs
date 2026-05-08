@@ -130,6 +130,15 @@ pub enum HvcImm {
     /// flag) so we can correlate `Fault`'s -10204 propagation with
     /// the actual TStackInfo* the matcher passed in.
     ResolveFaultRet,
+    /// Probe at the very first instruction of
+    /// `TStackManager::ResolveFault` (ROM 0x001F_7978). Replaces
+    /// `mov ip, sp` with an HVC. Handler logs (FAR, fLowerBounds,
+    /// fUpperBounds, fStackOwnerId, fStackNormalization) for the
+    /// stackInfo passed in R1, then emulates `mov ip, sp` (= R12
+    /// = R13) and advances ELR past the HVC. Used to verify
+    /// whether fLowerBounds is being dynamically modified during
+    /// stack growth.
+    ResolveFaultEntry,
 }
 
 impl HvcImm {

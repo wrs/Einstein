@@ -412,7 +412,7 @@ fn jt_target(pc: u32) -> Option<u32> {
 ///   pointers that fell into a saved register file from a caller.
 /// - Other VAs (`0x009..0x0B…`): `<noncode 0x…>`.
 /// - Below the first ROM symbol: `?`.
-fn fmt_pc_name(pc: u32) -> ([u8; 96], usize) {
+pub(crate) fn fmt_pc_name(pc: u32) -> ([u8; 96], usize) {
     let mut buf = [0u8; 96];
     let mut n = 0usize;
     fn push(b: u8, buf: &mut [u8; 96], n: &mut usize) {
@@ -618,7 +618,7 @@ fn dump_oplist(group_id: u32, oplist_id: u32, indent: &str) {
 /// Walk: `prev_fp = *(fp - 12)`. Stop at NULL / unaligned / bogus
 /// VA / self-loop / depth cap. Emits `(frame_lr, fp)` per frame so the
 /// caller can render a one-line-per-function chain.
-fn walk_apcs_frames(start_fp: u32, depth_cap: usize, mut emit: impl FnMut(u32, u32)) {
+pub(crate) fn walk_apcs_frames(start_fp: u32, depth_cap: usize, mut emit: impl FnMut(u32, u32)) {
     let mut fp = start_fp;
     let mut prev_fp = 0u32;
     let mut depth = 0usize;
@@ -636,10 +636,10 @@ fn walk_apcs_frames(start_fp: u32, depth_cap: usize, mut emit: impl FnMut(u32, u
 
 /// Print one chain frame: `        #N  <name+offset>`. Used by
 /// `dump_blocked_pcs` to render a stack trace as one function per line.
-fn print_chain_frame(depth: usize, pc: u32) {
+fn print_chain_frame(depth: usize, frame: u32, pc: u32) {
     let (buf, n) = fmt_pc_name(pc);
     let name = core::str::from_utf8(&buf[..n]).unwrap_or("?");
-    kprintln!("        #{:<2} {}", depth, name);
+    kprintln!("        #{:<2} frame={:#010x} pc={:#010x}  {}", depth, frame, pc, name);
 }
 
 /// (i.e. it's blocked somewhere), print its saved PC + SP_usr from the
@@ -690,14 +690,14 @@ fn dump_blocked_pcs() {
                     //        offset, more useful than the prologue-stored
                     //        saved PC). 12-frame cap guards against a
                     //        corrupt chain spamming the log.
-                    print_chain_frame(0, saved_pc);
+                    print_chain_frame(0, sp_usr, saved_pc);
                     if lr_usr != 0 && lr_usr != u32::MAX {
-                        print_chain_frame(1, lr_usr);
+                        print_chain_frame(1, fp_usr, lr_usr);
                     }
                     if fp_usr != 0 && fp_usr != u32::MAX && (fp_usr & 3) == 0 {
                         let mut depth = 2usize;
-                        walk_apcs_frames(fp_usr, 12, |frame_lr, _fp| {
-                            print_chain_frame(depth, frame_lr);
+                        walk_apcs_frames(fp_usr, 12, |frame_lr, frame_fp| {
+                            print_chain_frame(depth, frame_fp, frame_lr);
                             depth += 1;
                         });
                     }
@@ -1457,14 +1457,14 @@ pub extern "C" fn dump_chain_at(ctx: &crate::trap::TrapContext, pc: u32) {
             id, mode, elr, lr, sp, fp,
         );
     }
-    print_chain_frame(0, elr);
+    print_chain_frame(0, sp, elr);
     if lr != 0 && lr != u32::MAX {
-        print_chain_frame(1, lr);
+        print_chain_frame(1, fp, lr);
     }
     if fp != 0 && fp != u32::MAX && (fp & 3) == 0 {
         let mut depth = 2usize;
-        walk_apcs_frames(fp, 12, |frame_lr, _fp| {
-            print_chain_frame(depth, frame_lr);
+        walk_apcs_frames(fp, 12, |frame_lr, frame_fp| {
+            print_chain_frame(depth, frame_fp, frame_lr);
             depth += 1;
         });
     }

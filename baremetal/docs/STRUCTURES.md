@@ -1142,6 +1142,221 @@ Allocators audited and confirmed NOT to use 1-KiB chunking:
 `NewPtr`, `NewWiredPtr`, `AllocNewPage`, `TUPageManager::Get`. All
 allocate at 4-byte (object) or 4-KiB (page) granularity.
 
+### Stack-manager dynamics — areas, growth, guards
+
+This subsection captures the runtime model the stack/heap allocator
+implements, decoded from the ROM and verified by an HVC probe at the
+entry of `ResolveFault`. **All terminology in this subsection is
+local to this document** — neither the C source's identifiers nor
+the labels in the older `TStackInfo` decode above. The mapping at
+the end ties our names back to the C++ field offsets.
+
+#### Vocabulary
+
+- **Area** — one allocation handed out by `FMNewStack` /
+  `FMNewHeapArea`. May be a stack or a heap; both go through the
+  same allocator.
+- **Area-stride** — the kernel's allocation quantum. Default ROM:
+  33 KiB (= 32 subcells of 1 KiB). Our patches: **36 KiB (= 9
+  pages)**.
+- **Slot** — one area-stride sized unit of VA. Each slot has an
+  index in the owning domain's slot-table; an Area covers one or
+  more contiguous slots.
+- **Page** — 4 KiB. Architectural unit on ARMv4–v8.
+- **Subcell** — 1 KiB. ARMv4 sub-page; relevant only because the
+  kernel's page-record has 4-element arrays per page (one entry
+  per subcell) and `Remember` builds an 8-bit per-page permission
+  bitmap from per-subcell ownership state. ARMv7+ has no
+  per-subcell AP, so on our platform any one subcell being
+  read/write makes the whole page read/write.
+- **Domain** — a `THeapDomain`; owns a contiguous VA range
+  (`pool`) and a slot-table indexed by `(VA − pool_base) /
+  area-stride`. Each entry points at the area-info for whichever
+  Area covers that slot, or NULL if the slot is free.
+- **Area-info** — the per-Area descriptor. The kernel calls this
+  `TStackInfo`. Every fault routes to an area-info via the
+  matcher; bounds checks read fields out of it.
+- **Page-record** — the per-physical-page bookkeeping struct
+  (kernel calls it `TStackPage`). One per 4 KiB page committed
+  to an Area; tracked in the area-info's page-record array.
+
+#### Area-info layout (the fields this subsection refers to)
+
+| our name        | offset | source field        | meaning |
+|-----------------|-------:|---------------------|---------|
+| `top`           | +0     | `fTopOfStack`       | Static — the Area's exclusive upper VA limit, set at `Init`. = `origin + (slot_count × area-stride)`. |
+| `floor`         | +4     | `fBottomOfStack`    | Static — `origin + guard-slab-size`, set at `Init`. The static lower edge of the Area's user-accessible range. |
+| `page_count`    | +8     |                     | Length of the page-record array. |
+| `owner`         | +12    |                     | Task ID this Area was created for. 0 for heap Areas. |
+| `pages[]`       | +16    |                     | Pointer-array of page-records, indexed by `(VA − origin) / page-size`. |
+| `origin`        | +20    | `fStackNormalization` | Static — page-aligned base VA of the Area. |
+| `live_floor`    | +24    | `fLowerBounds`      | **Moveable** — current minimum legal VA. ResolveFault returns -10203 if `FAR < live_floor`. Initialised to `floor`; modified by `FMSetHeapLimits` and the `ReleaseRequest` callback path. |
+| `live_ceiling`  | +28    | `fUpperBounds`      | **Moveable** — current exclusive maximum legal VA. ResolveFault returns -10204 if `FAR ≥ live_ceiling`. Initialised to `top` for stacks; for heaps initialised to `floor + maxSize` and grown upward as needed. |
+
+The "live" pair drives the bounds check; the static pair records
+the geometry the Area was allocated against.
+
+#### Allocation geometry (with our 36 KiB patches)
+
+```
+              ┌────────────────────────┐  ← top   = origin + 9 × 4 KiB
+              │                        │
+              │   user-accessible      │
+              │   8 pages = 32 KiB     │
+              │                        │
+              ├────────────────────────┤  ← floor = origin + 4 KiB
+              │   guard slab (4 KiB)   │     Never mapped. Touching it
+              │   one whole 4 KiB page │     takes a TLB miss → ResolveFault
+              │                        │     → -10203 → busError.
+              └────────────────────────┘  ← origin (= live_floor for stacks at Init)
+```
+
+A multi-slot Area extends `top` upward by `(slot_count − 1) × 36
+KiB` while keeping the same `origin` and 4 KiB guard slab.
+
+`FMNewStack` rounds requests by adding the guard-slab size to the
+caller's `maxSize`, then dividing by area-stride and rounding up to
+get `slot_count`. So a request for *N* bytes consumes
+`ceil((N + 4 KiB) / 36 KiB)` × 36 KiB of VA, of which the bottom
+4 KiB is guard.
+
+#### Two kinds of Areas
+
+The same allocator backs two patterns of use:
+
+1. **Stack Area** — created by `NewStack` → `FMNewStack`. After
+   `Init`, the kernel calls `LockHeapRange(floor, top)` (via
+   `LockStack` or equivalent), which iterates per subcell from
+   `floor` upward, faulting each page into existence. Result: the
+   Area's full user-accessible range is *eagerly* committed at
+   task setup, with the guard slab left unmapped. SP descents
+   inside the Area never fault. SP descent past `origin`
+   (i.e. into the guard slab) takes a TLB miss → ResolveFault →
+   `FAR < live_floor` → -10203.
+2. **Heap Area** — created by `NewHeapArea` → `FMNewHeapArea`.
+   Initial `live_ceiling = floor + maxSize` (caller-specified) and
+   only the requested `maxSize` is committed. When a heap user
+   writes past `live_ceiling`, the access faults → `FAR ≥
+   live_ceiling` → -10204. The kernel's heap manager catches this
+   via `WiredHeap`-style retry: it calls `FMSetHeapLimits` to bump
+   `live_ceiling` upward, then re-issues the access; the second
+   attempt now passes the bounds check, ResolveFault commits the
+   page, and the heap user proceeds. **Growth-on-fault is
+   implemented entirely via the moveable upper bound.** It is not
+   automatic inside ResolveFault — the heap manager (caller of
+   `SetHeapLimits`) is responsible.
+
+The C source's "moveable lower" comment on `live_floor` is
+misleading: nothing in the stack/heap allocator's normal flow ever
+moves it *down*. The mechanisms that do touch it — `FMSetHeapLimits`,
+the `ReleaseRequest` heap-shrink callback — both *raise* it (heap
+shrink) or *lower* it (heap re-bound, but only at user-driven
+re-initialisation). There is no automatic downward extension on
+guard-slab fault.
+
+#### How a fault routes to the right Area
+
+`ResolveFault` is invoked by `TStackManager::Fault` (the virtual
+override of `TUDomainManager::Fault`'s monitor request handler).
+The dispatch:
+
+```
+hardware data abort
+  → ARM abort vector  (kernel's data-abort handler)
+  → fault-monitor: kMonitorFaultSelector
+  → TUDomainManager::FaultMonProc
+       captures the task's TProcessorState (which carries FAR)
+       fDomain = state.faultDomain
+       result = Fault(state)            // virtual; → TStackManager::Fault
+       if (fUpdateState) SetFaultState(state)  // write back any changes
+       return result
+  → TStackManager::Fault
+       look up area-info via the matcher (see below)
+       call ResolveFault(area_info)
+       if result is 4         → Reboot
+       if result is non-zero  → Throw exBusError
+```
+
+The matcher is `THeapDomain::GetStackInfo`, which computes
+`slot_index = (FAR − pool_base) / area-stride` and reads
+`slot_table[slot_index]`. The matcher always picks **exactly one**
+area-info — the one whose VA range covers the FAR. If the FAR
+lands in a slot owned by Area X, ResolveFault checks Area X's
+bounds. If FAR strays into a slot owned by Area Y (a different
+Area), ResolveFault checks Area Y's bounds and almost certainly
+rejects, because Area Y's `live_floor`/`live_ceiling` don't cover
+that FAR.
+
+#### Stack overflow detection
+
+The combination of (a) eager commit up to `floor` and (b)
+unmapped guard slab below `floor` makes overflow detection
+hardware-enforced even without per-subcell AP:
+
+- SP within `[floor, top)`: pages mapped, writes succeed.
+- SP within `[origin, floor)` (= the guard slab): pages
+  unmapped, write triggers TLB miss. Matcher routes FAR back to
+  the *same* Area (FAR is still in the Area's slot range);
+  bounds check returns -10203; busError.
+- SP below `origin`: matcher routes FAR to the *adjacent* Area
+  (the slot below this one). That Area's bounds reject — usually
+  -10204. (This is a degenerate case; the guard slab catches
+  overflow before SP reaches here under sane recursion.)
+
+The original ARMv4 kernel produced the equivalent effect with
+per-subcell AP=NA on the bottom three subcells of the bottom page
+(plus subcell-3 RW). On ARMv7 we substitute a whole-page guard.
+
+#### Why we claim all four subcells per fault
+
+Our `ResolveFault` patch (group-C) replaces the request bitmap
+`1 << subcell_index` with `0xF` so every fault commits all four
+subcells of the containing page, not just the one subcell that
+actually faulted. Two reasons:
+
+1. **Page-aliasing prevention.** `GetMatchingPage`'s candidate
+   list is the partially-allocated-page free-list, and it can
+   match a page already partially owned by Area X to a fresh
+   subcell request from Area Y. Without per-subcell AP, the
+   resulting cross-Area page-table mapping makes both areas'
+   writes hit the same physical page → silent corruption.
+   Forcing whole-page claim limits matches to fully-free pages.
+2. **Permission-bitmap collapse.** `Remember` builds a per-page
+   8-bit permission word from the per-subcell ownership state,
+   one nibble per subcell. ARMv7 ignores the per-subcell AP and
+   uses a single AP for the page; if we left subcells mixed-owned
+   we'd be relying on undefined behaviour.
+
+The trade-off — that whole-page claim erases the per-subcell AP=NA
+guard pattern — is what motivates the 4 KiB whole-page guard slab
+(group-D): we preserve overflow detection at page granularity by
+leaving the bottom page entirely unmapped.
+
+#### Mapping back to source identifiers
+
+For readers cross-referencing the C source in
+`untitled folder/StackInfo.h` and `StackManager.c`:
+
+| our name              | source identifier             |
+|-----------------------|-------------------------------|
+| Area                  | "stack" or "heap area"        |
+| Area-stride           | `kStackSize`                  |
+| Guard-slab size       | `kGuardBandSize`              |
+| Page-size             | `kPageSize`                   |
+| Subcell-size          | `kSubPageSize`                |
+| Subcells per page     | `kSubPagesPerPage`            |
+| Domain                | `THeapDomain`                 |
+| Area-info             | `TStackInfo`                  |
+| Page-record           | `TStackPage`                  |
+| `top`                 | `fTopOfStack`                 |
+| `floor`               | `fBottomOfStack`              |
+| `origin`              | `fStackNormalization`         |
+| `live_floor`          | `fLowerBounds`                |
+| `live_ceiling`        | `fUpperBounds`                |
+| `pages[]`             | `fPages`                      |
+| `owner`               | `fStackOwnerId`               |
+| matcher               | `THeapDomain::GetStackInfo`   |
+
 ## End-to-end page allocation — `AllocNewPage` → `TUDomainManager::Get`
 
 This decodes the call chain that produces a fresh `TStackPage*`

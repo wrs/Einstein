@@ -42,13 +42,28 @@ const HW_END: u64 = 0x0F40_0000;
 // loop that returns the "end marker" (0) once, then 64 bits of the
 // 2-word `mSerialNumber`, derived from the emulator's `mNewtonID[2]`
 // via `TMemory::ComputeSerialNumber`. Einstein's default NewtonID is
-// {0, 0} (TEmulator.h:515); the resulting mSerialNumber is computed at
-// compile time below — matches Python port of TMemory::ComputeSerialNumber.
+// `{0x00004E65, 0x77746F6E}` (kMyNewtonIDHigh/Low at TEmulator.cpp:65,
+// assigned in the TEmulator ctor at lines 97-98 — overrides the
+// `{0, 0}` field initialiser at TEmulator.h:515). The resulting
+// `mSerialNumber` values are computed by ComputeSerialNumber and the
+// constants below match that calculation (verified by Python port).
 // The kernel reads bit-by-bit via TSerialNumberROM::Init; each read
 // returns `(bit & 1) << 1` and advances the index mod 65.
+//
+// Why this matters: TFlashStore's "Untitled" record (the internal
+// store) seeds its `signature` slot from `GetSystemSerialNumber()`
+// (ROM 0x003543ac–0x003543c8), which packs as
+// `(mSerialNumber[0] << 24) | (mSerialNumber[1] >> 8) = 0x77746F6E`.
+// NewtonScript encodes that as an integer Ref via `value << 2`, and
+// decoding with arithmetic-shift-right-by-2 yields the signed int
+// `-143364242`, which is the value Einstein's NS trace shows for
+// `(internalFlashStore):GetSignature()`. Returning `{0,0}` here gives
+// `0` instead, which then mismatches the saved signature in the
+// CheckSerialNumber bytecode and routes the boot through an
+// uninitialised-gLocaleCache crash.
 const ROM_SERIAL_CHIP_IPA: u64 = 0x0F24_3000;
-const ROM_SERIAL_NUMBER_0: u32 = 0x3D00_0000;
-const ROM_SERIAL_NUMBER_1: u32 = 0x0000_0001;
+const ROM_SERIAL_NUMBER_0: u32 = 0x5C4E_6577;
+const ROM_SERIAL_NUMBER_1: u32 = 0x746F_6E01;
 static ROM_SERIAL_IX: AtomicU32 = AtomicU32::new(64);
 
 // Specific register reads the Newton kernel does very early.

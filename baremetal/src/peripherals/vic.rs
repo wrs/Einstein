@@ -610,6 +610,7 @@ pub fn read(ipa: u64) -> u32 {
         | K_HDWR_P0F111400
         | K_HDWR_P0F180400
         | K_HDWR_P0F185000
+        | K_HDWR_INT_CLEAR  // write-only by convention; Einstein returns 0
         | K_HDWR_GPIO_C
         | K_HDWR_GPIO_CC00
         | K_HDWR_GPIO_D000
@@ -692,7 +693,19 @@ pub fn write(ipa: u64, value: u32) {
         // applied this to int_present (wrong register). Match Einstein.
         K_HDWR_GPIO_C => s.gpio_r &= !value,
 
-        // ---- Not modeled by Einstein → silent drop --------------------
+        // ---- Stateful in Einstein for READ, but no write handler ------
+        // These addresses have a read handler in Einstein (returning
+        // some live state that's mutated by other paths — RaiseInterrupt,
+        // RaiseGPIO, etc.) but no write handler — so writes fall through
+        // to the "unknown bank #3" write default at TMemory.cpp:1903-1913
+        // and silently drop. The kernel may try to write here through
+        // a "convenient name" path; match the silent drop instead of
+        // halting.
+        K_HDWR_PLATFORM_VERS
+        | K_HDWR_INT_PRESENT
+        | K_HDWR_GPIO_R => { /* drop per Einstein */ }
+
+        // ---- Not modeled by Einstein at all → silent drop --------------
         // These addresses fall through to Einstein's "unknown bank #3"
         // write default at TMemory.cpp:1903-1913 (FLogLine + drop). Match
         // that — no state change, no error.

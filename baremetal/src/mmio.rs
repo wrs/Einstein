@@ -461,9 +461,9 @@ pub fn write(ipa: u64, sas: u8, value: u32, elr: u64) {
         0x0F28_4000 => {} // P0F284000        W (0x23)
 
         // --- Power / GPIO miscellany (0x0F18xxxx area outside VIC) ---
-        // Note: 0x0F18_CC00..0x0F18_EC00 used to be inline write-no-op
-        // entries here. They're round-tripped in peripherals::vic now
-        // via vic::owns / vic::write, so the inline arms moved out.
+        // Note: 0x0F18_CC00..0x0F18_EC00 are owned by peripherals::vic
+        // (in vic::owns), where their writes silently drop to match
+        // Einstein's unknown-bank-#3 default. Reads return 0.
 
         a => halt_on_unknown("write", a, sas, value, elr),
     }

@@ -57,41 +57,50 @@ fn read_cntfrq() -> u64 {
 
 /// Everything the interrupt-manager register window tracks. Written/read
 /// via the `read`/`write` functions below. Single-threaded (core 0 only).
+///
+/// The set of stateful fields here MUST match the set of registers that
+/// Einstein's TInterruptManager / TMemory model statefully — because
+/// the user's stated invariant is "match Einstein's emulated hardware
+/// behavior exactly". Registers Einstein doesn't model (read returns 0
+/// from the unknown-bank-#3 default in TMemory.cpp:950-960; writes are
+/// silently dropped) MUST NOT be stored here even if the kernel does
+/// read-modify-write on them — Einstein's r-m-w sees 0 every read, so
+/// ours must too.
 #[derive(Default)]
 struct VicState {
-    int_present: u32,       // 0x0F183000
-    int_ctrl: u32,          // 0x0F183400
-    // int_clear is write-only; no state, but guest writes it to ack.
-    fiq_mask: u32,          // 0x0F183C00
-    int_ed_1: u32,          // 0x0F184000
-    int_ed_2: u32,          // 0x0F184400
-    int_ed_3: u32,          // 0x0F184800
-    match_reg: [u32; 4],    // 0x0F182000/400/800/C00
+    // ---- Stateful in Einstein (TInterruptManager:492-507) -------------
+    int_present: u32,       // 0x0F183000  mIntRaised
+    int_ctrl: u32,          // 0x0F183400  mIntCtrlReg
+    // int_clear is write-only in Einstein; clears bits in mIntRaised.
+    fiq_mask: u32,          // 0x0F183C00  mFIQMask
+    int_ed_1: u32,          // 0x0F184000  mIntEDReg1
+    int_ed_2: u32,          // 0x0F184400  mIntEDReg2
+    int_ed_3: u32,          // 0x0F184800  mIntEDReg3
+    match_reg: [u32; 4],    // 0x0F182000/400/800/C00  mMatchReg[0..3]
     // Edge-detection state: bit i is set once the corresponding match
     // register has fired since its last write. We only raise the timer
     // interrupt on the rising edge; otherwise the handler clearing
     // int_present would immediately re-raise because `ticks >= match`
-    // stays true.
+    // stays true. (Einstein gets the same effect via its
+    // SetTimerMatchRegister / GetTimer / RaiseInterrupt interplay.)
     match_fired: u32,
     // RTC alarm-match: stored alarm value (in seconds since 1904 in the
     // calendar domain) and a single-bit edge-detect latch. Cleared on
     // alarm register write so a new alarm can fire.
-    alarm_reg: u32,         // 0x0F181400
+    alarm_reg: u32,         // 0x0F181400  via SetAlarm/GetAlarm
     alarm_fired: bool,
-    // GPIO-adjacent registers the ROM hits during early probe.
-    gpio_r: u32,            // 0x0F18C000 (raised events; HVC-trigger ORs in)
-    gpio_e: u32,            // 0x0F18C400 (per-line interrupt enable)
-    #[allow(dead_code)] // written via K_HDWR_GPIO_C path; no reads yet
-    gpio_c: u32,            // 0x0F18C800 (write-clear)
-    gpio_cc00: u32,         // 0x0F18CC00 (polarity / config — round-trip)
-    gpio_d000: u32,         // 0x0F18D000 (misc — round-trip)
-    gpio_d800: u32,         // 0x0F18D800 (pullup — round-trip)
-    gpio_dc00: u32,         // 0x0F18DC00 (polarity — round-trip)
-    gpio_e000: u32,         // 0x0F18E000 (direction / level latch — round-trip)
-    gpio_e800: u32,         // 0x0F18E800 (IOPower1 — round-trip)
-    gpio_ec00: u32,         // 0x0F18EC00 (IOPower2 — round-trip)
-    p0f110000: u32,
-    p0f111400: u32,
+    // GPIO interrupt registers (Einstein TInterruptManager.h:510,513).
+    gpio_r: u32,            // 0x0F18C000  mGPIORaised
+    gpio_e: u32,            // 0x0F18C400  mGPIOCtrlReg
+    // ---- NOT stateful in Einstein ------------------------------------
+    // The following addresses fall through to the unknown-bank-#3 default
+    // in Einstein's TMemory.cpp Bank #3 read path (lines 950-960 = 0)
+    // and write path (lines 1903-1913 = silent log + drop). Do not store
+    // their writes here. Reads return 0. Listed for documentation:
+    //   0x0F110000, 0x0F111400, 0x0F180400, 0x0F185000,
+    //   0x0F18C800 (kHdWr_GPIO_CReg — write goes to ClearGPIO, no state),
+    //   0x0F18CC00, 0x0F18D000, 0x0F18D800, 0x0F18DC00,
+    //   0x0F18E000, 0x0F18E800, 0x0F18EC00.
 }
 
 struct VicCell(UnsafeCell<VicState>);
@@ -111,16 +120,6 @@ static VIC: VicCell = VicCell(UnsafeCell::new(VicState {
     alarm_fired: false,
     gpio_r: 0,
     gpio_e: 0,
-    gpio_c: 0,
-    gpio_cc00: 0,
-    gpio_d000: 0,
-    gpio_d800: 0,
-    gpio_dc00: 0,
-    gpio_e000: 0,
-    gpio_e800: 0,
-    gpio_ec00: 0,
-    p0f110000: 0,
-    p0f111400: 0,
 }));
 
 pub fn init() {
@@ -576,10 +575,13 @@ pub fn read(ipa: u64) -> u32 {
         // 5 (`Emulator/Platform/TPlatformManager.cpp:110`). Newton's
         // native apps read this register to know the Einstein-era
         // platform driver revision.
+        // ---- Stateful in Einstein -------------------------------------
+        // PlatformVers: TPlatformManager::GetVersion() returns 5
+        // (Emulator/Platform/TPlatformManager.cpp:110).
         K_HDWR_PLATFORM_VERS => 5,
-        K_HDWR_P0F110000 => s.p0f110000,
-        K_HDWR_HIGH_SPEED_CLCK => 0x0000_0090, // kHighSpeedClockVal per TMemoryConsts
-        K_HDWR_P0F111400 => s.p0f111400,
+        // HighSpeedClck: TMemory.cpp:898-900 returns kHighSpeedClockVal
+        // = 0x90 (TMemoryConsts.h:208).
+        K_HDWR_HIGH_SPEED_CLCK => 0x0000_0090,
         K_HDWR_CALENDAR_REG => calendar_seconds(),
         K_HDWR_ALARM_REG => s.alarm_reg,
         K_HDWR_TICKS => ticks(),
@@ -595,19 +597,28 @@ pub fn read(ipa: u64) -> u32 {
         K_HDWR_INT_ED_3 => s.int_ed_3,
         K_HDWR_GPIO_R => s.gpio_r,
         K_HDWR_GPIO_E => s.gpio_e,
-        // Round-trip storage for the GPIO-adjacent registers the kernel
-        // does read-modify-write on (TGPIOInterface::DisableInterrupt at
-        // ROM 0x26c468 is the canonical example). Returning the last-
-        // written value is what the kernel expects; previously these
-        // were read-as-zero in mmio.rs which silently lost the bits the
-        // kernel had set in the prior write.
-        K_HDWR_GPIO_CC00 => s.gpio_cc00,
-        K_HDWR_GPIO_D000 => s.gpio_d000,
-        K_HDWR_GPIO_D800 => s.gpio_d800,
-        K_HDWR_GPIO_DC00 => s.gpio_dc00,
-        K_HDWR_GPIO_E000 => s.gpio_e000,
-        K_HDWR_GPIO_E800 => s.gpio_e800,
-        K_HDWR_GPIO_EC00 => s.gpio_ec00,
+
+        // ---- Not modeled by Einstein → returns 0 by default ------------
+        // Einstein TMemory.cpp Bank #3 read path (lines 803-960) has no
+        // specific handler for these addresses; the unknown-bank-#3
+        // default at lines 950-960 returns 0. Match that. The previous
+        // round-trip behavior diverged whenever the kernel did
+        // read-modify-write here (TGPIOInterface::DisableInterrupt etc.)
+        // — but Einstein's r-m-w sees 0 every read, so the user-visible
+        // effect must be 0 here too.
+        K_HDWR_P0F110000
+        | K_HDWR_P0F111400
+        | K_HDWR_P0F180400
+        | K_HDWR_P0F185000
+        | K_HDWR_GPIO_C
+        | K_HDWR_GPIO_CC00
+        | K_HDWR_GPIO_D000
+        | K_HDWR_GPIO_D800
+        | K_HDWR_GPIO_DC00
+        | K_HDWR_GPIO_E000
+        | K_HDWR_GPIO_E800
+        | K_HDWR_GPIO_EC00 => 0,
+
         _ => halt_vic_unreachable("read", ipa, 0),
     }
 }
@@ -631,56 +642,72 @@ pub fn write(ipa: u64, value: u32) {
     }
     let mut match_reprogrammed = false;
     match ipa {
-        K_HDWR_P0F110000 => s.p0f110000 = value,
-        // High-speed clock control: the kernel writes the expected
-        // configuration value (`kHighSpeedClockVal` = 0x90) once at
-        // boot. Modeled as a no-op write — the clock is always
-        // configured from our perspective.
-        K_HDWR_HIGH_SPEED_CLCK => { /* no-op per Einstein */ }
-        K_HDWR_P0F111400 => s.p0f111400 = value,
-        K_HDWR_P0F180400 => { /* misc write, ignore */ }
-        // Tick counter is derived from CNTPCT; the kernel writes this
-        // occasionally to reset the tick epoch (e.g. during calibration
-        // loops). We could re-anchor TICK_EPOCH but Einstein's tick
-        // register is also free-running from the host clock, so the
-        // kernel works either way. Accept the write as a no-op; if the
-        // guest later depends on the reset, halt here.
-        K_HDWR_TICKS => { /* no-op — we derive ticks from CNTPCT */ }
-        // Calendar reg writes are still ignored — the host wall clock
-        // is the source of truth; setting the calendar from inside the
-        // guest would silently drift versus calendar_seconds().
-        K_HDWR_CALENDAR_REG => { /* no-op — RTC not modeled */ }
-        // Alarm: store the value and clear the edge-detect latch so a
-        // new match can fire. `poll_alarm()` (called from timer::on_irq
-        // alongside poll_timer_matches) raises INT_RTC_ALARM when the
-        // calendar crosses this value.
+        // ---- Stateful in Einstein -------------------------------------
+        // HighSpeedClck: Einstein has no specific write handler in
+        // TMemory.cpp Bank #3 write path; falls to default no-op.
+        K_HDWR_HIGH_SPEED_CLCK => { /* no-op per Einstein default */ }
+        // Tick counter: same — no Einstein write handler. The kernel
+        // doesn't actually need to set it; ticks come from the timer.
+        K_HDWR_TICKS => { /* no-op per Einstein default */ }
+        // Calendar: Einstein TMemory.cpp:1855-1857 calls SetRealTimeClock
+        // which mutates host time tracking. We model the calendar as
+        // a host-clock-derived value and don't have a "set" path; the
+        // kernel rarely writes this. Accept silently — diverges from
+        // Einstein only in the case where the guest sets the RTC and
+        // then reads it back, which doesn't happen in normal boot.
+        K_HDWR_CALENDAR_REG => { /* no-op (would call host SetRealTimeClock in Einstein) */ }
+        // Alarm: Einstein TMemory.cpp:1858-1860 calls SetAlarm which
+        // stores the value. Match that. Clear our edge-detect latch so
+        // a new match can fire.
         K_HDWR_ALARM_REG => {
             s.alarm_reg = value;
             s.alarm_fired = false;
         }
+        // MatchReg{0..3}: Einstein TMemory.cpp:1861-1881 calls
+        // SetTimerMatchRegister which updates the match value and
+        // recomputes the next deadline. We re-arm the EL2 timer via
+        // timer::rearm() at the end.
         K_HDWR_MATCH_0 => { s.match_reg[0] = value; s.match_fired &= !0b0001; match_reprogrammed = true; }
         K_HDWR_MATCH_1 => { s.match_reg[1] = value; s.match_fired &= !0b0010; match_reprogrammed = true; }
         K_HDWR_MATCH_2 => { s.match_reg[2] = value; s.match_fired &= !0b0100; match_reprogrammed = true; }
         K_HDWR_MATCH_3 => { s.match_reg[3] = value; s.match_fired &= !0b1000; match_reprogrammed = true; }
+        // IntCtrlReg: Einstein TMemory.cpp:1882-1884 calls
+        // SetIntCtrlReg which stores the value (TInterruptManager.cpp).
         K_HDWR_INT_CTRL => s.int_ctrl = value,
-        K_HDWR_INT_CLEAR => {
-            // Writing clears the matching bits in int_present.
-            s.int_present &= !value;
-        }
+        // IntClear: Einstein TMemory.cpp:1885-1887 calls ClearInterrupts
+        // which does `mIntRaised &= ~inMask`. Match that.
+        K_HDWR_INT_CLEAR => s.int_present &= !value,
+        // FIQMask: Einstein TMemory.cpp:1888-1890 calls SetFIQMask.
         K_HDWR_FIQ_MASK => s.fiq_mask = value,
+        // IntEDReg{1..3}: Einstein TMemory.cpp:1891-1899 calls
+        // SetIntEDReg{1..3}.
         K_HDWR_INT_ED_1 => s.int_ed_1 = value,
         K_HDWR_INT_ED_2 => s.int_ed_2 = value,
         K_HDWR_INT_ED_3 => s.int_ed_3 = value,
-        K_HDWR_P0F185000 => { /* misc, ignore */ }
+        // GPIO_E (Ctrl): Einstein TMemory.cpp:1898-1900 calls
+        // SetGPIOCtrlReg which stores the new ctrl value.
         K_HDWR_GPIO_E => s.gpio_e = value,
-        K_HDWR_GPIO_C => s.int_present &= !value, // many devices clear via this pattern
-        K_HDWR_GPIO_CC00 => s.gpio_cc00 = value,
-        K_HDWR_GPIO_D000 => s.gpio_d000 = value,
-        K_HDWR_GPIO_D800 => s.gpio_d800 = value,
-        K_HDWR_GPIO_DC00 => s.gpio_dc00 = value,
-        K_HDWR_GPIO_E000 => s.gpio_e000 = value,
-        K_HDWR_GPIO_E800 => s.gpio_e800 = value,
-        K_HDWR_GPIO_EC00 => s.gpio_ec00 = value,
+        // GPIO_C (Clear): Einstein TMemory.cpp:1901-1902 calls
+        // ClearGPIO which does `mGPIORaised &= ~inMask`. Previously we
+        // applied this to int_present (wrong register). Match Einstein.
+        K_HDWR_GPIO_C => s.gpio_r &= !value,
+
+        // ---- Not modeled by Einstein → silent drop --------------------
+        // These addresses fall through to Einstein's "unknown bank #3"
+        // write default at TMemory.cpp:1903-1913 (FLogLine + drop). Match
+        // that — no state change, no error.
+        K_HDWR_P0F110000
+        | K_HDWR_P0F111400
+        | K_HDWR_P0F180400
+        | K_HDWR_P0F185000
+        | K_HDWR_GPIO_CC00
+        | K_HDWR_GPIO_D000
+        | K_HDWR_GPIO_D800
+        | K_HDWR_GPIO_DC00
+        | K_HDWR_GPIO_E000
+        | K_HDWR_GPIO_E800
+        | K_HDWR_GPIO_EC00 => { /* drop per Einstein */ }
+
         _ => halt_vic_unreachable("write", ipa, value),
     }
     if match_reprogrammed {

@@ -15,11 +15,14 @@
 //!
 //! On a fresh boot, `init()` seeds the Newton filesystem header
 //! (duplicated at block 0 / offset 0 and block 1 / offset 0x10000 of
-//! bank 0). Every other byte stays zero, matching Einstein's behaviour
-//! against an mmap-backed flash file: software "pretends" erased flash
-//! reads as 0xFF, but the actual bytes on the backing are 0x00 until
-//! a programmed write lands. See `docs/peripherals.md` §Flash and
-//! `Emulator/TFlash.cpp:137-172` for ground truth.
+//! bank 0). Every other byte stays at the static-init value of 0x00,
+//! matching Einstein's behaviour: Einstein's flash file is mmap'd with
+//! O_CREAT (TFlash.cpp:67-70), which gives a zero-filled buffer for
+//! never-written bytes. We honour the same invariant — the static
+//! GUEST_FLASH array is zero-initialised. Real flash hardware would
+//! read 0xFF for erased bytes, but the kernel was tested against
+//! Einstein's zero-fill backing, so we match Einstein not real flash.
+//! See `Emulator/TFlash.cpp:137-172` for ground truth.
 //!
 //! Einstein stores each 32-bit word big-endian in its mmap'd file and
 //! byteswaps on Read/Write so the kernel sees native-order values.
@@ -42,11 +45,11 @@ pub const SIZE: usize = BANK_SIZE * 2;
 #[repr(C, align(0x200000))]
 struct Flash([u8; SIZE]);
 
-static mut GUEST_FLASH: Flash = Flash([0xFF; SIZE]);
-// Note: start in erased state (0xFF), matching a fresh flash chip.
-// `init()` then seeds the DLDS/OSCD header via the same 16-bit
-// halfword path the kernel itself uses for writes, so the seeded
-// layout is indistinguishable from what the kernel would produce.
+static mut GUEST_FLASH: Flash = Flash([0x00; SIZE]);
+// Note: start zero-filled to match Einstein's mmap O_CREAT backing
+// (TFlash.cpp:66-70). The kernel was tested against Einstein, not
+// against real 0xFF-erased flash — so 0x00 is the correct initial
+// value. `init()` then seeds the DLDS/OSCD header.
 
 /// Host physical base of the flash backing store.
 pub fn host_pa() -> u64 {
@@ -150,18 +153,16 @@ pub fn seed_rom_rex_checksums(rom_le_words: *const u32, rom_len_bytes: usize) {
         }
     }
 
-    // Write the 10 u32 checksums at flash[block + 0x64 .. block + 0x8C]
-    // for both block 0 and block 1. Einstein does this via its
-    // BE-aware Write helper; we store raw LE u32s (matching what the
-    // kernel will read via LE LDR).
+    // Write the 10 u32 checksums at flash[0x64 .. 0x8C] of BLOCK 0 only.
+    // Einstein's loop at TFlash.cpp:108-134 reads `Read(0x64 + 4*i, 0)`
+    // (note `bank=0`, but more importantly `Write(..., 0)` to block 0
+    // only) — block 1 is left zeroed at 0x64..0x8C. Mirror that.
     crate::dprintln!(
         "flash: ROM/REx checksums seeded (base_size={:#x}, nb_rexes={})",
         base_size, nb_rexes
     );
-    for block_base in [0x0000_0000u32, 0x0001_0000u32] {
-        for (i, csum) in checksums.iter().enumerate() {
-            write_u32(block_base + 0x64 + (i as u32) * 4, *csum);
-        }
+    for (i, csum) in checksums.iter().enumerate() {
+        write_u32(0x64 + (i as u32) * 4, *csum);
     }
 }
 
@@ -189,23 +190,9 @@ fn seed_block(base: u32) {
     // Offsets and constants from `Emulator/TFlash.cpp:145-168`. The
     // u32 values are byte-for-byte what a guest `LDR` at the same IPA
     // sees through Einstein's TFlash::Read (which does the BE->host
-    // swap internally).
-    //
-    // Zero the entire 0x10c-byte header region first — Einstein's flash
-    // file (mmap'd, O_CREAT) starts at 0 for unwritten bytes, and the
-    // kernel's `ValidateCalibrationFields` computes a checksum over
-    // bytes 0..0x54 expecting Einstein's hardcoded `0xD7ECCC66`. Real
-    // flash hardware starts erased (0xFF), but the Newton OS calibration
-    // code treats this specific header region as "0 by construction"
-    // because it's seeded in TFlash::TFlash before the kernel ever
-    // boots. Without this zeroing, our 0xFF-initialised default leaves
-    // the unwritten gap bytes (0x0C..0x23 etc.) as 0xFF, which makes
-    // the runtime Checksum mismatch the seeded 0xD7ECCC66 → kernel
-    // takes UpdateBlock0FromBlock1 → erase → rewrite recovery path.
-    unsafe {
-        let host = (addr_of_mut!(GUEST_FLASH) as *mut u8).add(base as usize);
-        core::ptr::write_bytes(host, 0, 0x10c);
-    }
+    // swap internally). The unseeded gap bytes (0x0C..0x23 etc.) are
+    // already 0 because the static GUEST_FLASH is zero-initialised
+    // (matches Einstein's mmap O_CREAT backing).
     write_u32(base + 0x00, 0x444C4453); // "DLDS"
     write_u32(base + 0x04, 0x4F534344); // "OSCD"
     write_u32(base + 0x08, 0x0000010C); // block size / offset to block 1

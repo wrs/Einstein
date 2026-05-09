@@ -157,7 +157,16 @@ pub fn read(ipa: u64, sas: u8, elr: u64) -> u32 {
         a if pcmcia::owns(a) => pcmcia::read(a),
         a if serial::owns(a) => serial::read(a),
 
-        HW_RAM_SIZE_1 => 0x4040_0040,
+        // kHdWr_04RAMSize: Einstein TMemory.cpp:868-873 computes
+        //   thePageCount = (mRAMSize >> 16) & 0xFF;
+        //   return (thePageCount << 24) | (thePageCount << 16) | thePageCount;
+        // For our 4 MiB RAM (guest_mem::RAM_SIZE = 0x40_0000), pageCount
+        // = 0x40, result = 0x40400040.
+        HW_RAM_SIZE_1 => {
+            let page_count = ((crate::guest_mem::RAM_SIZE as u32) >> 16) & 0xFF;
+            (page_count << 24) | (page_count << 16) | page_count
+        }
+        // kHdWr_08RAMSize: Einstein TMemory.cpp:874-876 returns 0.
         HW_RAM_SIZE_2 => 0,
 
         // kHdWr_P0F242400: chipset revision ID. TMemoryConsts.h:144

@@ -66,6 +66,11 @@ const ROM_SERIAL_NUMBER_0: u32 = 0x5C4E_6577;
 const ROM_SERIAL_NUMBER_1: u32 = 0x746F_6E01;
 static ROM_SERIAL_IX: AtomicU32 = AtomicU32::new(64);
 
+// Stateful backing for kHdWr_BankCtrlReg (0x0F241000). Mirrors Einstein's
+// `TMemory::mBankCtrlRegister` (TMemory.h:896 — init 0; writes update
+// at TMemory.cpp:1930-1932; reads return at TMemory.cpp:981-983).
+static BANK_CTRL_REG: AtomicU32 = AtomicU32::new(0);
+
 // Specific register reads the Newton kernel does very early.
 //   TMemoryConsts::kHdWr_04RAMSize = 0x0F00_1800  — encodes installed RAM
 //   TMemoryConsts::kHdWr_08RAMSize = 0x0F00_1C00  — secondary bank size
@@ -175,10 +180,17 @@ pub fn read(ipa: u64, sas: u8, elr: u64) -> u32 {
         // reads 0 during probe. TMemoryConsts.h:56.
         0x0F00_1000 => 0,
 
-        // kHdWr_P0F241000: adjacent to the chipset-rev register and
-        // read by the same probe. No TMemoryConsts comment; return 0
-        // to match Einstein's TMemory default (read-zero on unmodelled).
-        0x0F24_1000 => 0,
+        // kHdWr_BankCtrlReg (TMemoryConsts.h:137 = 0x0F241000): bank
+        // control register. Einstein's TMemory.cpp:981-983 returns the
+        // stateful `mBankCtrlRegister` (init 0, see TMemory.h:896);
+        // writes at TMemory.cpp:1930-1932 store `inWord`. The kernel's
+        // bus-config init at ROM 0x00019644/0x00019808/0x00019840 writes
+        // values (0, 0x300, 0x0F241000) and on those latter two paths
+        // does an immediate read-back, but the read result is overwritten
+        // by the next `ldr` before consumption — so a non-stateful read
+        // returns 0 here harmlessly today. Keep it stateful regardless,
+        // matching Einstein's code.
+        0x0F24_1000 => BANK_CTRL_REG.load(Ordering::Relaxed),
 
         // ExtDataAbt1/2/3 — external data-abort status registers. The
         // kernel's DataAbortHandler at 0x0039_3268 reads all three
@@ -224,13 +236,16 @@ pub fn read(ipa: u64, sas: u8, elr: u64) -> u32 {
         // Einstein returns all-ones = "no cards / switches open".
         0x0F18_D400 => 0xFFFF_FFFF,
 
-        // Power status: 0x0F184C00 read as "all-ok high" per Einstein.
-        // (The 0x0F18_CC00..0x0F18_EC00 GPIO / IOPower registers below
-        // 0xE800 used to be inline read-as-zero stubs here; they're
-        // round-tripped in peripherals::vic now so the kernel's
-        // read-modify-write pattern in TGPIOInterface::DisableInterrupt
-        // sees the bits it most recently wrote.)
-        0x0F18_4C00 => 0xFFFF_FFFF,
+        // kHdWr_P0F184C00 (TMemoryConsts.h:101, "R"): Einstein's TMemory.cpp
+        // Bank #3 read path (lines 803-960) has NO specific handler for this
+        // address — it falls through to the "unknown bank #3" default at
+        // lines 950-960, which returns 0. The previous "all-ok high =
+        // 0xFFFFFFFF per Einstein" comment was wrong (no such Einstein
+        // code exists). Bit 21 of this register gates a kernel polling
+        // path at ROM 0x00019d34 / 0x00019d90 / 0x00019e34 (`tst r1,
+        // #0x00200000`); returning 0 makes us take the same branches as
+        // Einstein.
+        0x0F18_4C00 => 0,
 
         // RAM-probe "absent bank" window (see const comment above).
         a if (RAM_PROBE_ABSENT_BASE..RAM_PROBE_ABSENT_END).contains(&a) => 0,
@@ -405,7 +420,10 @@ pub fn write(ipa: u64, sas: u8, value: u32, elr: u64) {
         0x0F24_0000 => {} // ExtDataAbt1      R (write path accepted no-op)
         0x0F24_0400 => {} // ExtDataAbt2      W
         0x0F24_0800 => {} // ExtDataAbt3      W
-        0x0F24_1000 => {} // BankCtrlReg      R/W
+        // BankCtrlReg (0x0F241000): write updates the stateful mirror.
+        // Einstein TMemory.cpp:1930-1932 stores `inWord` to
+        // `mBankCtrlRegister`. Match that.
+        0x0F24_1000 => BANK_CTRL_REG.store(value, Ordering::Relaxed),
         0x0F24_1800 => {} // P0F241800        W (0x3916)
         0x0F24_2400 => {} // P0F242400        R/W chipset rev
         0x0F24_3000 => {} // ROMSerialChip    R/W (0, 1)

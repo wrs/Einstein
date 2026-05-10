@@ -155,7 +155,7 @@ fn main() -> ExitCode {
         out: String::new(),
     };
     p.dump_object(root, 0, "");
-    print!("{}", p.out);
+    println!("{}", p.out);
     ExitCode::SUCCESS
 }
 

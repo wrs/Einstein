@@ -21,6 +21,7 @@ struct Args {
     depth: u32,
     max_bytes: usize,
     flat: bool,
+    dump_func_frames: bool,
     align: u32,
     load_addr: u32,
 }
@@ -40,6 +41,7 @@ fn parse_args() -> Result<Args, String> {
     let mut depth = DEFAULT_DEPTH;
     let mut max_bytes = DEFAULT_MAX_BYTES;
     let mut flat = false;
+    let mut dump_func_frames = false;
     let mut align: u32 = 4;
     let mut load_addr: u32 = 0;
 
@@ -55,6 +57,7 @@ fn parse_args() -> Result<Args, String> {
                 max_bytes = v.parse().map_err(|e| format!("bad --max-bytes {v:?}: {e}"))?;
             }
             "--flat" => flat = true,
+            "--dumpfuncframes" => dump_func_frames = true,
             "--align" => {
                 let v = it.next().ok_or("--align requires a value")?;
                 align = v.parse().map_err(|e| format!("bad --align {v:?}: {e}"))?;
@@ -82,6 +85,7 @@ fn parse_args() -> Result<Args, String> {
         depth,
         max_bytes,
         flat,
+        dump_func_frames,
         align,
         load_addr,
     })
@@ -89,7 +93,8 @@ fn parse_args() -> Result<Args, String> {
 
 fn print_usage() {
     eprintln!(
-        "romdump <file> <hex-addr> [--depth N] [--max-bytes N] [--flat] [--align 4|8] [--loadaddr HEX]\n\
+        "romdump <file> <hex-addr> [--depth N] [--max-bytes N]\n\
+         \x20      [--flat | --dumpfuncframes] [--align 4|8] [--loadaddr HEX]\n\
          \n\
          Default: walks the NewtonScript object graph rooted at <hex-addr>\n\
          within <file> and pretty-prints it as a tree.\n\
@@ -101,6 +106,12 @@ fn print_usage() {
          --flat: instead of a tree walk, iterate packed objects starting at\n\
          <hex-addr>, advancing by each object's size rounded up to --align,\n\
          and print one summary line per object. Stops at the first parse error.\n\
+         \n\
+         --dumpfuncframes: like --flat, but for every frame encountered that\n\
+         is NOT a CodeBlock function frame, run the tree pretty-printer on it\n\
+         (using --depth / --max-bytes). Non-frame objects and CodeBlock frames\n\
+         are skipped silently. Useful for inventorying soup/settings/layout\n\
+         frames in a heap region without the noise of bytecode binaries.\n\
          \n\
          <hex-addr> is an absolute address in the heap's load-address space,\n\
          i.e. the same space the on-disk pointer Refs use. With --loadaddr\n\
@@ -139,6 +150,10 @@ fn main() -> ExitCode {
         return dump_flat(heap, entry_abs, args.align, args.max_bytes);
     }
 
+    if args.dump_func_frames {
+        return dump_func_frames(heap, entry_abs, args.align, args.depth, args.max_bytes);
+    }
+
     let root = match heap.object_at(entry_abs) {
         Ok(o) => o,
         Err(e) => {
@@ -156,6 +171,56 @@ fn main() -> ExitCode {
     };
     p.dump_object(root, 0, "");
     println!("{}", p.out);
+    ExitCode::SUCCESS
+}
+
+/// Walk packed objects starting at `offset`. For every Frame that is
+/// NOT a CodeBlock, run the tree pretty-printer with the given depth
+/// budget; everything else is silently skipped. Stops at the first
+/// parse error (returned via the `Err` arm of the iterator).
+fn dump_func_frames(
+    heap: Heap<'_>,
+    offset: u32,
+    align: u32,
+    depth: u32,
+    max_bytes: usize,
+) -> ExitCode {
+    let mut scanned: u32 = 0;
+    let mut printed: u32 = 0;
+    let mut last_err: Option<newton_objects::ParseError> = None;
+    for item in heap.iter_from(offset, align) {
+        match item {
+            Ok((_off, obj)) => {
+                scanned += 1;
+                let Object::Frame(f) = obj else { continue };
+                if disasm::frame_is_codeblock(&heap, &f) {
+                    continue;
+                }
+                let mut p = Printer {
+                    heap,
+                    depth_left: depth,
+                    max_bytes,
+                    seen: HashSet::new(),
+                    out: String::new(),
+                };
+                p.dump_object(obj, 0, "");
+                println!("{}", p.out);
+                printed += 1;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                break;
+            }
+        }
+    }
+    eprintln!(
+        "// scanned {} object(s) from 0x{:08x} (align={}); printed {} non-CodeBlock frame(s)",
+        scanned, offset, align, printed
+    );
+    if let Some(e) = last_err {
+        eprintln!("// stopped on parse error: {e}");
+        return ExitCode::from(1);
+    }
     ExitCode::SUCCESS
 }
 

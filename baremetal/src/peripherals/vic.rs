@@ -138,6 +138,19 @@ pub fn init() {
 /// returns seconds since 1970-01-01; the difference is a fixed constant.
 const SECS_1904_TO_1970: u32 = 2_082_844_800;
 
+/// Subtract this from the host wall-clock seconds before publishing to
+/// the guest. Einstein's NS time-base patches (`FTimeInSeconds`,
+/// `Time base (1..4/4)`) re-express seconds-since-1904 as NS-encoded
+/// seconds-since-2008, which only fits in the 30-bit signed NS Ref
+/// while seconds-since-2008 stays below 2²⁹ ≈ 17.0 years — i.e. until
+/// approximately 2025-01-08. Past that point the encoded value crosses
+/// into i32-negative territory and `SetSysAlarm` writes a hardware
+/// alarm register pointing into the past, IRQ-looping the alarm
+/// dispatcher. Until the 2026 epoch shift is wired up, just pretend
+/// it's 6 years earlier than wall-clock and stay inside the safe
+/// window. 6 × 365 × 86400 = 189,216,000.
+const RTC_HOST_TIME_OFFSET_SECONDS: u32 = 189_216_000;
+
 /// Host `time()` seconds since 1904, captured once at hypervisor boot.
 /// Paired with `CALENDAR_CNTPCT_BASELINE` to derive "now" without
 /// calling back out to semihosting on every guest read.
@@ -165,7 +178,9 @@ fn init_calendar() {
         );
         ret
     };
-    let secs_since_1904 = (unix_time as u32).wrapping_add(SECS_1904_TO_1970);
+    let secs_since_1904 = (unix_time as u32)
+        .wrapping_add(SECS_1904_TO_1970)
+        .wrapping_sub(RTC_HOST_TIME_OFFSET_SECONDS);
     CALENDAR_SECONDS_AT_BOOT.store(secs_since_1904, Ordering::Release);
     CALENDAR_CNTPCT_BASELINE.store(read_cntpct(), Ordering::Release);
     // Re-publish the tick page now that calendar_seconds() returns a
@@ -173,8 +188,8 @@ fn init_calendar() {
     // once before this, while the baseline was still zero.
     crate::stage2::tick_page::update();
     crate::kprintln!(
-        "vic: calendar = {} seconds since 1904-01-01 (host unix_time={})",
-        secs_since_1904, unix_time
+        "vic: calendar = {} seconds since 1904-01-01 (host unix_time={}, offset={}s back)",
+        secs_since_1904, unix_time, RTC_HOST_TIME_OFFSET_SECONDS
     );
 }
 

@@ -1224,6 +1224,14 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
             // regardless of source mode.
             ctx.x[0] = ctx.x[4];
         }
+        v if v == HvcImm::DoCallEntry as u32 => {
+            handle_do_call_entry_probe(ctx);
+            // Emulate the patched-out `mov ip, sp` (R12 = SP for the
+            // source AArch32 mode). HVC entry already advanced
+            // ELR_EL2 past the trap, so no ELR adjustment needed.
+            let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+            ctx.x[12] = crate::banked::sp_for_mode(ctx, spsr_el2) as u64;
+        }
         v if v == HvcImm::DahFmeEntry as u32 => {
             handle_fme_entry_probe(ctx);
         }
@@ -1775,6 +1783,17 @@ fn handle_und(ctx: &mut TrapContext) {
         _ if insn == HvcImm::LoadPermObjRet.insn() => {
             handle_load_perm_obj_ret_probe(ctx);
             ctx.x[0] = ctx.x[4];
+            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+            return;
+        }
+        // DoCall entry probe — first instruction (`mov ip, sp`)
+        // replaced with HVC. NS interpreter calls into DoCall from
+        // USR mode (NS bytecode invocations of native primitives
+        // recurse through here), so the USR HVC is UNDEFINED and
+        // arrives via this UND-trampoline path.
+        _ if insn == HvcImm::DoCallEntry.insn() => {
+            handle_do_call_entry_probe(ctx);
+            ctx.x[12] = crate::banked::sp_for_mode(ctx, spsr_und as u32) as u64;
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -3332,6 +3351,35 @@ fn handle_load_perm_obj_ret_probe(ctx: &mut TrapContext) {
     crate::kprint!("LoadPermObject[{}]: ", n);
     crate::heap_check::pretty_print_ref_inline(ref_value, 2);
     kprintln!("  lr={:#x}", lr);
+}
+
+/// Probe handler for `DoCall(RefVar const& fn, long numArgs)` entry.
+/// R0 is a pointer to a `RefVar`; deref once to get the function Ref
+/// being invoked. Print the Ref + source-mode SP + caller LR so a
+/// recursion-runaway shows up as repeated lines with monotonically
+/// decreasing SP.
+///
+/// Caller is expected to emulate `mov ip, sp` and advance ELR.
+fn handle_do_call_entry_probe(ctx: &mut TrapContext) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    let refvar_ptr = ctx.x[0] as u32;
+    let slot_ptr =
+        crate::guest_endian::guest_read_u32_va(refvar_ptr).unwrap_or(0);
+    let ref_value = if slot_ptr != 0 {
+        crate::guest_endian::guest_read_u32_va(slot_ptr).unwrap_or(0)
+    } else {
+        0
+    };
+    let num_args = ctx.x[1] as u32;
+    let lr = ctx.x[14] as u32;
+    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+    let sp_src = crate::banked::sp_for_mode(ctx, spsr_el2);
+    static FIRED: AtomicU32 = AtomicU32::new(0);
+    let n = FIRED.fetch_add(1, Ordering::Relaxed);
+    kprintln!(
+        "DoCall[{}]: fn_ref={:#010x} nargs={} sp={:#010x} lr={:#x}",
+        n, ref_value, num_args, sp_src, lr,
+    );
 }
 
 /// Handler for the patched `mov ip, sp` at FaultMonitorEntry static

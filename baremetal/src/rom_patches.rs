@@ -1641,10 +1641,13 @@ unsafe fn apply_real_clock_seconds_patch(rom_ptr: *mut u32) {
 
 /// FTimeInSeconds injection patch: replace the last shift before the
 /// function epilogue (at 0x00089B80, originally `MOV r0, r0, LSL #2`)
-/// with a branch to a stub that subtracts `safeIntervalDeltaSeconds`,
-/// performs both the callback's `<< 2` and the original instruction's
-/// `<< 2` as a single `LSL #4`, then branches back to the epilogue.
-/// Einstein's equivalent at `TJITGenericROMPatch.cpp:150`.
+/// with a branch to a stub that subtracts `safeIntervalDeltaSeconds`
+/// and performs the NS-integer `<< 2`, then branches to the epilogue
+/// — net effect `r0 = (r0 - delta) << 2`. Einstein's equivalent at
+/// `TJITGenericROMPatch.cpp:150` uses `T_ROM_PATCH` which *replaces*
+/// the original instruction (per `TJITGenericROMPatch.h:283` "return
+/// ioUnit if the next instruction is to be executed"), so the
+/// original `LSL #2` does **not** run after Einstein's callback.
 unsafe fn apply_ftime_in_seconds_patch(rom_ptr: *mut u32) {
     const PATCH_PC: u32 = 0x0008_9B80;
     const RETURN_PC: u32 = 0x0008_9B84; // original LDMDB epilogue
@@ -1652,14 +1655,14 @@ unsafe fn apply_ftime_in_seconds_patch(rom_ptr: *mut u32) {
     // Stub body (5 words):
     //   +0x00 LDR r12, [pc, #8]           ; load delta from +0x10
     //   +0x04 SUB r0, r0, r12             ; r0 = r0 - delta
-    //   +0x08 MOV r0, r0, LSL #4          ; callback << 2 + original << 2
+    //   +0x08 MOV r0, r0, LSL #2          ; NS-integer encode
     //   +0x0C B <RETURN_PC>               ; resume at the epilogue
     //   +0x10 .word safeIntervalDeltaSeconds
     let stub_b = arm_b(ftime_stub_pc + 0x0C, RETURN_PC);
     let stub: [u32; 5] = [
         0xE59F_C008,        // LDR r12, [pc, #8]
         0xE040_000C,        // SUB r0, r0, r12
-        0xE1A0_0200,        // MOV r0, r0, LSL #4
+        0xE1A0_0100,        // MOV r0, r0, LSL #2
         stub_b,             // B RETURN_PC
         SAFE_INTERVAL_DELTA_SECONDS,
     ];
@@ -1808,6 +1811,19 @@ const STORE_PERM_OBJECT_ORIG_INSN: u32 = 0xE1A0_C00D;
 const LOAD_PERM_OBJECT_RET_PC: u32 = 0x002D_F4C0;
 const LOAD_PERM_OBJECT_RET_ORIG_INSN: u32 = 0xE1A0_0004;
 
+/// First instruction of `DoCall(RefVar const& fn, long numArgs)` at
+/// ROM 0x002E_FE48 (`mov ip, sp` = `0xE1A0_C00D`). Replaced with
+/// `HVC #DoCallEntry`; the handler reads R0 (a RefVar pointer to
+/// the function being invoked), dereferences once to get the Ref,
+/// pretty-prints it, then emulates `mov ip, sp` and advances ELR
+/// so the prologue's `push {r4-r7, fp, ip, lr, pc}` picks up at
+/// instruction 2. Used to count NS-interpreter recursion depth on
+/// the runaway-stack-overflow path that fires before the boot
+/// completes (Phase B AddFlushed/StorePermObject stack-overflow
+/// stall).
+const DO_CALL_ENTRY_PC: u32 = 0x002E_FE48;
+const DO_CALL_ENTRY_ORIG_INSN: u32 = 0xE1A0_C00D;
+
 /// Install the StorePermObject entry probe + LoadPermObject
 /// return-site probe. Pair: each call to StorePermObject pretty-
 /// prints the RefArg being stored, each return from LoadPermObject
@@ -1828,6 +1844,12 @@ unsafe fn apply_storeperm_loadperm_probes(rom_ptr: *mut u32) {
             LOAD_PERM_OBJECT_RET_ORIG_INSN,
             HvcImm::LoadPermObjRet,
             "LoadPermObject return probe",
+        ),
+        (
+            DO_CALL_ENTRY_PC,
+            DO_CALL_ENTRY_ORIG_INSN,
+            HvcImm::DoCallEntry,
+            "DoCall entry probe",
         ),
     ] {
         let idx = (pc / 4) as usize;

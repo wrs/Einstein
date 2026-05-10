@@ -161,6 +161,14 @@ pub enum HvcImm {
     /// via `newton-objects`, emulates `r0 = r4`, and advances ELR
     /// so the epilogue's `ldmdb` returns the same Ref to the caller.
     LoadPermObjRet,
+    /// Entry probe at `DoCall` (ROM 0x002E_FE48). Replaces the
+    /// function's first instruction (`mov ip, sp`). Handler reads
+    /// R0 (a `RefVar const&`) and prints the Ref of the function
+    /// about to be invoked, plus the source-mode SP so we can
+    /// correlate with stack-overflow frames. Emulates `mov ip, sp`
+    /// (writes ctx.x[12] = source-mode SP) and advances ELR so the
+    /// prologue picks up at instruction 2 (`push {…}`).
+    DoCallEntry,
 }
 
 impl HvcImm {

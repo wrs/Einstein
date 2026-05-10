@@ -1966,6 +1966,99 @@ References:
 
 ---
 
+## Kernel VA layout — ROM/REx, jump tables, magic pointers
+
+The Newton kernel's MMU sets up a fixed VA layout for ROM, the
+two patch tables, and the magic-pointer tables. Citation:
+`Emulator/TMMU.cpp:1164-1190` (Einstein's documented copy of the
+guest's stage-1 page tables).
+
+| VA range                  | Size      | Contents                          |
+|---------------------------|-----------|-----------------------------------|
+| `0x00000000..0x00800000`  | 8192 KB   | Mask ROM (large pages)            |
+| `0x00800000..0x01000000`  | 8192 KB   | Optional ROM / REx (large pages)  |
+| `0x00100000..0x01000000`  | 15360 KB  | Section mapping over the above    |
+| `0x01800000..0x01810000`  | 64 KB     | (unidentified small-page region)  |
+| **`0x01A00000..0x01C20000`** | **2176 KB** | **ROM jump tables** (small pages) |
+| `0x01D80000..0x01DA0000`  | 128 KB    | **Magic pointer tables** (small pages) |
+| `0x01E00000..0x01F00000`  | 1024 KB   | **REx jump tables** (small pages) |
+| `0x03500000..0x03D00000`  | 8192 KB   | ROM mirror (section)              |
+| `0x04000000..0x04100000`  | 1024 KB   | ROM mirror (section, primary table at `0x04000000`) |
+
+The two distinct patch-table windows matter when interpreting an
+address dropped from a NS frame, MP-table entry, or trace:
+
+- A function pointer in `0x01A00000..0x01C20000` is a **ROM JT
+  thunk** — a `b imm24` redirect to the real body in mask ROM
+  (`0x00000000..0x00800000`). Patched at boot to refer to the
+  current REx-supplied implementation if any.
+- A function pointer in `0x01E00000..0x01F00000` is a **REx JT
+  thunk** — for symbols supplied by Einstein.rex.
+- `0x01D80000..0x01DA0000` holds the magic-pointer tables read
+  by `push-constant @T.N` bytecodes (table T, index N). The
+  ROM-resident table base is `gROMMagicPointerTable` at
+  `0x003af000`; the kernel installs additional REx-supplied
+  tables here at boot via `InitRExMagicPointerTables__Fv`
+  (`0x000d1038`).
+
+### Resolving a thunk to its real body
+
+Don't grep `rom.dis` for `0x01Bxxxxx` — the disassembled range
+ends at `0x00847000` (ROM + REx), so JT addresses are always
+absent. Instead:
+
+```bash
+grep -i '<funcname>'   _Data_/demangled_symbols.txt   # both rows
+grep -E '^0x01[ABE][0-9A-F]+\s' _Data_/demangled_symbols.txt | wc -l   # ~thunk count
+```
+
+`demangled_symbols.txt` lists every patchable function twice:
+once at the body address (`<= 0x00800000`) and once at the JT
+thunk (`>= 0x01A00000`). The smaller is the body — grep that
+in `rom.dis`. For runtime decoding, use `task_dump::jt_target`
+which reads the slot's `b imm24` and computes the target.
+
+### How a `<special 0x4c>` frame uses a JT thunk
+
+The plainCFunction shape (NS class `<special 0x4c>` = 76) is:
+
+```text
+  { class:   <special 0x4c>,
+    funcPtr: <integer Ref whose raw u32 word is the ARM entry PC>,
+    numArgs: <integer>,
+  }
+```
+
+When the bytecode interpreter executes `invoke N` against this
+frame, it dispatches to the ARM PC stored in the `funcPtr` slot.
+The stored value is **not** an integer-tagged Ref decoded as a
+small int — it's just the raw 32-bit word, which is interpreted
+as a code address at call time. That word commonly points into
+`0x01Axxxxx` (a ROM JT thunk that forwards to the real body).
+
+Example: `MP 0.846` → frame at `0x0064a500`:
+
+```text
+  { class:   <special 0x4c>,
+    funcPtr: 0x01ae3198,          // ROM JT thunk for FGetSerialNumber
+    numArgs: 0 }
+```
+
+`FGetSerialNumber`'s body is at `0x0020171c`; `0x01ae3198` is
+the patchable thunk (per `demangled_symbols.txt`). The bytecode
+`push-constant @0.846; invoke 0` therefore calls
+`FGetSerialNumber()` indirectly through the JT.
+
+Cross-references:
+
+- `docs/DISASM.md` "Jump-table aliasing" — DON'T mistake a thunk
+  for the body when reading disassembly.
+- `src/task_dump.rs::jt_target` (line ~393) — runtime decoder.
+- `Emulator/TMMU.cpp:1164-1190` — the table above, copied from
+  Einstein's reference dump.
+
+---
+
 ## See also
 
 - `INVESTIGATION.md` — live wedge debugging notes

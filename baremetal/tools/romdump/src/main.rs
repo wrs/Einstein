@@ -235,11 +235,20 @@ fn flat_summary(heap: &Heap<'_>, offset: u32, obj: Object<'_>, max_bytes: usize)
             }
         }
         Object::Frame(f) => {
+            let len = f.len();
             s.push_str(&format!(
-                " map={} slots={}",
+                " map={} slots[{}]:",
                 short_ref(heap, f.map()),
-                f.len()
+                len
             ));
+            let shown = len.min(max_bytes);
+            for slot in f.iter_slots().take(shown) {
+                s.push(' ');
+                s.push_str(&short_ref(heap, slot));
+            }
+            if shown < len {
+                s.push_str(&format!(" ... ({} more)", len - shown));
+            }
         }
     }
     s

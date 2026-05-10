@@ -10,6 +10,8 @@ use std::process::ExitCode;
 
 use newton_objects::{Array, Binary, Frame, Heap, Object, Ref, RefKind, Symbol, SYMBOL_CLASS};
 
+mod disasm;
+
 const DEFAULT_DEPTH: u32 = 0;
 const DEFAULT_MAX_BYTES: usize = 64;
 
@@ -285,7 +287,7 @@ fn decode_string(b: Binary<'_>) -> String {
 }
 
 /// Compact one-token rendering of a Ref for the flat summary.
-fn short_ref(heap: &Heap<'_>, r: Ref) -> String {
+pub(crate) fn short_ref(heap: &Heap<'_>, r: Ref) -> String {
     match r.kind() {
         RefKind::Integer(i) => format!("{i}"),
         RefKind::Character(c) => format!("$\\u{:04X}", c),
@@ -577,21 +579,70 @@ impl<'a> Printer<'a> {
             "{{ // frame({}) at 0x{:08x}\n",
             len, f.offset()
         ));
+        let codeblock_ctx = if disasm::frame_is_codeblock(&self.heap, &f) {
+            Some(disasm::CodeBlockCtx::from_codeblock(&self.heap, &f))
+        } else {
+            None
+        };
         for (i, (name_opt, slot)) in f.iter().enumerate() {
             self.indent(indent + 2);
-            match name_opt {
-                Some(sym) => match sym.name() {
-                    Ok(n) => self.out.push_str(&format!("{n}: ")),
-                    Err(_) => self.out.push_str("<bad-name>: "),
+            let slot_name = name_opt.and_then(|s| s.name().ok());
+            match slot_name {
+                Some(n) => self.out.push_str(&format!("{n}: ")),
+                None => match name_opt {
+                    Some(_) => self.out.push_str("<bad-name>: "),
+                    None => self.out.push_str(&format!("<slot{i}>: ")),
                 },
-                None => self.out.push_str(&format!("<slot{i}>: ")),
             }
             let suffix = if i + 1 < len { "," } else { "" };
+            if codeblock_ctx.is_some()
+                && slot_name == Some("instructions")
+                && self.try_disasm_instructions_slot(slot, codeblock_ctx.as_ref(), indent + 2, suffix)
+            {
+                self.out.push('\n');
+                continue;
+            }
             self.dump_ref(slot, indent + 2, suffix);
             self.out.push('\n');
         }
         self.indent(indent);
         self.out.push('}');
+    }
+
+    /// If `slot` is a Ref to an `'instructions` binary, render it as a
+    /// disassembly listing (consuming one depth like `dump_ref` would
+    /// for any pointer Ref). Returns `true` if disassembly was emitted;
+    /// `false` if the caller should fall back to the standard `dump_ref`
+    /// path.
+    fn try_disasm_instructions_slot(
+        &mut self,
+        slot: Ref,
+        ctx: Option<&disasm::CodeBlockCtx<'a>>,
+        indent: usize,
+        suffix: &str,
+    ) -> bool {
+        let bin = match disasm::slot_is_instructions_binary(&self.heap, slot) {
+            Some(b) => b,
+            None => return false,
+        };
+        if self.depth_left == 0 {
+            // Match dump_ref's depth-0 behavior for pointer Refs.
+            let off = slot.pointer_offset().unwrap_or(0);
+            self.out.push_str(&format!("<...at 0x{:08x}>{suffix}", off));
+            return true;
+        }
+        if !self.seen.insert(bin.offset()) {
+            self.out.push_str(&format!(
+                "<cycle to 0x{:08x}>{suffix}",
+                bin.offset()
+            ));
+            return true;
+        }
+        self.depth_left -= 1;
+        disasm::format_disasm(&mut self.out, bin, ctx, &self.heap, indent);
+        self.depth_left += 1;
+        self.out.push_str(suffix);
+        true
     }
 
     fn indent(&mut self, n: usize) {

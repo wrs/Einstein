@@ -1,0 +1,76 @@
+//! Persistent backing for the guest's internal-store flash.
+//!
+//! The flash bytes themselves live in `peripherals::flash::GUEST_FLASH`
+//! (8 MiB, two banks). This module is the I/O layer that mirrors those
+//! bytes to and from host storage so user data — soup entries,
+//! settings, installed packages — survives cold boots, snapshot
+//! invalidation, and ROM-fingerprint mismatches.
+//!
+//! ## Why a separate file from snapshots?
+//!
+//! `src/snapshot.rs` saves full guest state (CPU + RAM + FB) but its
+//! file is invalidated by ROM patches (fingerprint mismatch), VERSION
+//! bumps, and `trace` toggles. Flash, in contrast, is user data — it
+//! should outlive those events. Snapshots store a flash *fingerprint*
+//! (not the bytes) so a snapshot resume can detect divergence between
+//! the saved CPU/RAM state and the current persistent flash and fall
+//! back to a cold boot.
+//!
+//! ## Backend selection
+//!
+//! Cargo feature `flash-persist-{null,semihost,pico}` picks the
+//! backend at compile time; `build.rs` enforces exactly-one. In
+//! `nh_guest_test` mode the null backend is forced regardless so
+//! tests start from a clean GUEST_FLASH.
+
+#[cfg(all(feature = "flash-persist-semihost", not(nh_guest_test)))]
+mod semihost;
+#[cfg(any(not(feature = "flash-persist-semihost"), nh_guest_test))]
+mod null;
+
+/// Backend interface. Single-threaded EL2 callers; impls do not need
+/// to be re-entrant.
+pub trait FlashStore: Sync {
+    /// Called once at boot, between `peripherals::flash::init()` (which
+    /// seeds the DLDS/OSCD headers) and the ROM-REx checksum seeding.
+    /// If a persistent store exists, overwrites `GUEST_FLASH` with its
+    /// contents. No-op if the store is absent or wrong-sized.
+    fn try_load(&self);
+
+    /// Marks the 64 KiB blocks covered by `[off, off+len)` dirty.
+    /// Hooked from `flash::program_word` (len=4) and
+    /// `flash::erase_block` (len=erase size, typically 128 KiB).
+    fn mark_dirty(&self, off: usize, len: usize);
+
+    /// Persists any dirty blocks to the host store. Called from the
+    /// snapshot autosave path; respects the same wall-clock gate.
+    fn maybe_save(&self);
+
+    /// FNV-1a-32 over the current `GUEST_FLASH` bytes. Stored in
+    /// snapshot headers so a resume can verify the on-disk flash
+    /// matches the state the snapshot was captured against.
+    fn fingerprint(&self) -> u32;
+}
+
+// Backend selection. In nh_guest_test mode the null backend is forced
+// (tests want hermetic starts); otherwise the Cargo-feature picks.
+#[cfg(all(feature = "flash-persist-semihost", not(nh_guest_test)))]
+use self::semihost::BACKEND;
+#[cfg(any(not(feature = "flash-persist-semihost"), nh_guest_test))]
+use self::null::BACKEND;
+
+pub fn try_load() {
+    BACKEND.try_load();
+}
+
+pub fn mark_dirty(off: usize, len: usize) {
+    BACKEND.mark_dirty(off, len);
+}
+
+pub fn maybe_save() {
+    BACKEND.maybe_save();
+}
+
+pub fn fingerprint() -> u32 {
+    BACKEND.fingerprint()
+}

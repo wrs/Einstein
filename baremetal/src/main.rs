@@ -8,6 +8,7 @@ use core::arch::global_asm;
 mod alrt_capture;
 mod banked;
 mod cpu;
+mod flash_persist;
 mod g1_capture;
 mod guest;
 mod guest_bp;
@@ -71,6 +72,12 @@ pub extern "C" fn kmain() -> ! {
     // the backing to the guest. Safe because the backing is a static
     // mut touched only from core 0 during boot.
     peripherals::flash::init();
+
+    // If a persistent flash file exists at $HOME/.newton/flash.bin,
+    // overwrite GUEST_FLASH with its contents. No-op on first boot or
+    // in guest-test mode (which uses the null backend for hermetic
+    // starts).
+    flash_persist::try_load();
 
     // SAFETY: stage-2 tables reference the backing store we just populated.
     unsafe {

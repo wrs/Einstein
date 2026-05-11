@@ -10,7 +10,7 @@ name = "newton-hypervisor"
 path = "src/main.rs"
 
 [features]
-default = ["platform-raspi3b", "host-io-null"]
+default = ["platform-raspi3b", "host-io-null", "flash-persist-semihost"]
 
 # Host-platform selection. Exactly one must be enabled; build.rs panics
 # otherwise. Controls UART/GIC addresses, MMU memory map, load address
@@ -34,6 +34,21 @@ platform-fvp-base = []
 host-io-null = []
 host-io-semihost = []
 host-io-pico = []
+
+# Persistent flash-store backend selection. Exactly one must be enabled;
+# build.rs panics otherwise. See `src/flash_persist/mod.rs`.
+#
+#   flash-persist-null     — no-op; flash is volatile. Used for
+#                            guest-tests (forced via cfg(nh_guest_test))
+#                            and the future Pico backend until it has
+#                            its own SD/flash impl.
+#   flash-persist-semihost — read/write `$HOME/.newton/flash.bin` via
+#                            Arm semihosting. Default for QEMU + FVP.
+#   flash-persist-pico     — reserved for a future on-board SD-card or
+#                            external-flash backend on the Pico 2 W.
+flash-persist-null = []
+flash-persist-semihost = []
+flash-persist-pico = []
 
 # Function-level execution trace. When enabled, build.rs parses
 # ../_Data_/unified_symbols.tsv and embeds a compact address + name

@@ -292,6 +292,7 @@ pub fn program_word(pa: u32, word: u32, mask: u32) -> bool {
         let stored = new;
         core::ptr::write_volatile(slot, stored);
     }
+    crate::flash_persist::mark_dirty(off, 4);
     true
 }
 
@@ -310,5 +311,6 @@ pub fn erase_block(pa: u32, size: u32) -> bool {
         let base = addr_of_mut!(GUEST_FLASH) as *mut u8;
         core::ptr::write_bytes(base.add(off), 0xFF, size as usize);
     }
+    crate::flash_persist::mark_dirty(off, size as usize);
     true
 }

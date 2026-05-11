@@ -35,6 +35,8 @@ fn main() {
 
     select_platform_linker_script();
     check_host_io_features();
+    check_flash_persist_features();
+    emit_flash_path();
 
     let guest_test = env::var("NH_GUEST_TEST").ok();
     if let Some(val) = &guest_test {
@@ -139,6 +141,42 @@ fn check_host_io_features() {
              they are mutually exclusive"
         ),
     }
+}
+
+/// Ensure exactly one `flash-persist-*` feature is selected. Same
+/// pattern as `check_host_io_features`. The persistent-flash backend
+/// is compile-time-selected so the no-op null backend has zero cost
+/// in guest-test / hardware builds.
+fn check_flash_persist_features() {
+    let null = env::var("CARGO_FEATURE_FLASH_PERSIST_NULL").is_ok();
+    let semihost = env::var("CARGO_FEATURE_FLASH_PERSIST_SEMIHOST").is_ok();
+    let pico = env::var("CARGO_FEATURE_FLASH_PERSIST_PICO").is_ok();
+    let n = (null as u8) + (semihost as u8) + (pico as u8);
+    match n {
+        0 => panic!(
+            "no flash-persist backend selected: enable exactly one of \
+             flash-persist-null, flash-persist-semihost, or flash-persist-pico"
+        ),
+        1 => {}
+        _ => panic!(
+            "multiple flash-persist backends selected (null={null} semihost={semihost} pico={pico}); \
+             they are mutually exclusive"
+        ),
+    }
+}
+
+/// Resolve `$HOME/.newton/flash.bin` at build time and expose it as
+/// `NEWTON_FLASH_PATH` + `NEWTON_FLASH_DIR`. Callers append a literal
+/// `"\0"` via `concat!` to get the NUL-terminated form SYS_OPEN /
+/// SYS_SYSTEM need — rustc rejects NUL bytes in `cargo:rustc-env`
+/// values so we can't do it here.
+fn emit_flash_path() {
+    println!("cargo:rerun-if-env-changed=HOME");
+    let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let dir = format!("{home}/.newton");
+    let path = format!("{dir}/flash.bin");
+    println!("cargo:rustc-env=NEWTON_FLASH_PATH={path}");
+    println!("cargo:rustc-env=NEWTON_FLASH_DIR={dir}");
 }
 
 fn build_trace_tables() {

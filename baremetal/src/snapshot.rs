@@ -44,16 +44,21 @@
 //! ## Format
 //!
 //! Little-endian throughout. Header followed by raw memory regions
-//! (RAM, FB, flash) in a fixed order. Bump `VERSION` when the
-//! layout changes so stale files get rejected loudly. A FNV-1a
-//! fingerprint of the first 1 KiB of GUEST_ROM is included so a
-//! snapshot taken from one guest binary can't accidentally load
-//! into a different one.
+//! (RAM, FB) in a fixed order. Bump `VERSION` when the layout changes
+//! so stale files get rejected loudly.
+//!
+//! A FNV-1a fingerprint of the first 1 KiB of GUEST_ROM is included so
+//! a snapshot taken from one guest binary can't accidentally load into
+//! a different one. The header also carries a `flash_fingerprint` —
+//! FNV-1a over the full 8 MiB GUEST_FLASH at save time — so resume
+//! can detect a divergence between the saved CPU/RAM state and the
+//! current persistent flash and cold-boot instead. See
+//! `src/flash_persist/`.
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::{guest_mem, kprintln, peripherals, trap::TrapContext};
+use crate::{guest_mem, kprintln, trap::TrapContext};
 
 // ---- semihosting primitives ---------------------------------------
 
@@ -144,7 +149,11 @@ const MAGIC: u64 = 0x0150_414E_5348_4E00;
 // have RAM/flash bytes in the opposite byte-lane geometry, plus EL1
 // SCTLR with EE=0; both are incompatible with a Phase-2 BE-8 boot, so
 // the version bump rejects them automatically at load time.
-const VERSION: u32 = 5;
+// VERSION = 6: flash moved out of the snapshot file into
+// `src/flash_persist/`'s standalone `$HOME/.newton/flash.bin`. Header
+// `flash_size` field replaced with `flash_fingerprint` (FNV-1a-32 over
+// GUEST_FLASH at save time) used for resume-time coherence.
+const VERSION: u32 = 6;
 
 /// Number of rolling slots. Each slot is ~14 MiB, so four slots cost
 /// ~56 MiB of host disk and give the user three save windows of
@@ -216,7 +225,12 @@ struct Header {
 
     ram_size: u32,
     fb_size: u32,
-    flash_size: u32,
+    /// FNV-1a-32 over the full 8 MiB GUEST_FLASH at save time. Flash
+    /// bytes themselves live in `$HOME/.newton/flash.bin` (managed by
+    /// `src/flash_persist/`); this fingerprint lets the resume path
+    /// detect a divergence between the on-disk flash and the saved
+    /// CPU/RAM state and cold-boot if they don't match.
+    flash_fingerprint: u32,
 
     /// FNV-1a over the first 1024 bytes of GUEST_ROM post-patches.
     /// On load, we recompute and reject the snapshot if it doesn't
@@ -329,6 +343,14 @@ pub fn maybe_autosave(ctx: &TrapContext) {
     }
 
     // Either first save, or enough wall-clock has passed.
+    //
+    // Flush flash first so the snapshot's `flash_fingerprint` describes
+    // the bytes that just made it to disk. If flash save fails it'll
+    // re-mark dirty internally and retry on the next tick; we still
+    // try the snapshot save (any divergence is caught by the
+    // fingerprint check on resume).
+    crate::flash_persist::maybe_save();
+
     let mut gprs = [0u64; 31];
     for i in 0..31 {
         gprs[i] = ctx.x[i];
@@ -408,13 +430,10 @@ pub fn save(gprs: &[u64; 31]) -> Result<(), &'static str> {
     };
     write_all(&fh, fb)?;
 
-    let flash = unsafe {
-        core::slice::from_raw_parts(
-            peripherals::flash::host_pa() as *const u8,
-            peripherals::flash::SIZE,
-        )
-    };
-    write_all(&fh, flash)?;
+    // Flash bytes live in `$HOME/.newton/flash.bin` (see
+    // `flash_persist`), not in this snapshot file. The header carries
+    // a FNV-1a fingerprint of GUEST_FLASH so resume can detect a
+    // divergence between persistent-flash and saved CPU/RAM state.
 
     close(fh);
 
@@ -456,7 +475,7 @@ fn build_header(gprs_u64: &[u64; 31], seq: u64) -> Header {
         _pad1: 0,
         ram_size: guest_mem::RAM_SIZE as u32,
         fb_size: guest_mem::FRAMEBUFFER_SIZE as u32,
-        flash_size: peripherals::flash::SIZE as u32,
+        flash_fingerprint: crate::flash_persist::fingerprint(),
         rom_fingerprint: rom_fingerprint(),
         seq,
     }
@@ -586,11 +605,10 @@ pub fn load(path: &[u8]) -> Option<RestoreState> {
     }
     if header.ram_size as usize != guest_mem::RAM_SIZE
         || header.fb_size as usize != guest_mem::FRAMEBUFFER_SIZE
-        || header.flash_size as usize != peripherals::flash::SIZE
     {
         kprintln!(
-            "snapshot: region sizes don't match (ram={} fb={} flash={}); ignoring",
-            header.ram_size, header.fb_size, header.flash_size
+            "snapshot: region sizes don't match (ram={} fb={}); ignoring",
+            header.ram_size, header.fb_size
         );
         close(fh);
         return None;
@@ -630,17 +648,21 @@ pub fn load(path: &[u8]) -> Option<RestoreState> {
         return None;
     }
 
-    let flash = unsafe {
-        core::slice::from_raw_parts_mut(
-            peripherals::flash::host_pa() as *mut u8,
-            peripherals::flash::SIZE,
-        )
-    };
-    if read_all(&fh, flash).is_err() {
-        close(fh);
+    close(fh);
+
+    // Flash coherence check: GUEST_FLASH has already been populated
+    // by `flash_persist::try_load()` earlier in `kmain`. If the
+    // persistent flash diverges from what the snapshot expected, the
+    // saved CPU state may reference flash addresses with newer or
+    // older content than it assumes — cold-boot rather than risk it.
+    let current_flash_fp = crate::flash_persist::fingerprint();
+    if header.flash_fingerprint != current_flash_fp {
+        kprintln!(
+            "snapshot: flash fingerprint mismatch (file={:#010x} current={:#010x}); cold-booting",
+            header.flash_fingerprint, current_flash_fp
+        );
         return None;
     }
-    close(fh);
 
     restore_sysregs(&header);
 

@@ -9,23 +9,26 @@ cross-references) in [`docs/peripherals.md`](docs/peripherals.md).
 
 ## Status
 
-**Phase A (bring-up) is done.** Phase B is in progress: drive the 717006
-ROM through to interactive use, one stall at a time. As of iter-56:
+**Bring-up complete; the 717006 ROM boots to the Welcome UI.**
 
 - The hypervisor boots, drops to AArch32 EL1 at the ROM reset vector,
   and the Newton kernel reaches steady-state operation.
-- The splash screen renders correctly — the lightbulb logo and the
-  "Newton" caption show up in the framebuffer dump
-  (`/tmp/newton-fb/00000.png`) on every cold boot.
-- Boot no longer ends on a halt; runs end on the host-side timeout
-  with the kernel still actively spinning in its UI loop (~3.4M
-  hypervisor traps/sec, dominated by alignment-fault returns).
-- 36 guest tests exercise the handler surface in isolation; all green
-  on both QEMU and FVP.
+- The Newton kernel finishes initialisation: 26 tasks running, the
+  NewtonScript interpreter (`TInterpreter::Run`) is actively
+  executing bytecode, and the framebuffer dump
+  (`/tmp/newton-fb/NNNNN.png`) shows the "Welcome" tour intro with
+  the "Internal store was erased" first-boot dialog.
+- Boot ends on the host-side timeout with the system parked in the
+  idle task waiting on stylus / port-message input we don't yet
+  inject.
+- 35-ish guest tests exercise the handler surface in isolation; all
+  green on both QEMU and FVP modulo two pre-existing failures
+  (`test_gpio`, `test_flash`).
 
-Remaining iter-57 sub-goals: reduce the alignment-fault rate (or
-confirm the boot has reached a true idle waiting on input), then wire
-up tablet/pen input for the first observable user interaction.
+Ongoing work: wire up tablet/pen input so the user can dismiss the
+dialog and explore the setup tour; reduce alignment-fault overhead
+in the steady-state idle loop; bring the FVP path's runtime in line
+with QEMU's.
 
 What's working end-to-end:
 
@@ -77,7 +80,7 @@ What's working end-to-end:
   HVC trampoline and logs `seq PC name (mode) r0..r3` on every
   call. Variant `trace_once` gates the line on a per-function
   fired-bitmap if you want first-touch only. Used end-to-end to
-  bisect Phase B stalls against Einstein.
+  bisect boot stalls against Einstein.
 - **Framebuffer PNG dumps.** `src/fb_dump.rs` writes
   `/tmp/newton-fb/NNNNN.png` after each `screen::blit`, so visual
   regressions are observable without booting on real hardware.
@@ -139,7 +142,7 @@ slower than QEMU TCG — use longer timeouts. Add `--gdb` for an Iris
 debug server on host port 7100; add `--features trace` for the
 function-level tracer. See the comments at the top of `scripts/fvp`.
 
-### Snapshot resume — the Phase B inner loop
+### Snapshot resume — the debug inner loop
 
 `/tmp/newton-snapshot-{0..3}.bin` rolls four guest-state snapshots on
 disk. On every startup the hypervisor tries to resume from the newest
@@ -378,9 +381,8 @@ baremetal/
   docs/                  reference docs (see above)
   classify/              ROM symbol classifier
   PLAN.md                iteration log + current goal
-  HIGHLEVEL.md           architecture + phasing + open-question log
+  HIGHLEVEL.md           architecture + roadmap + open-question log
   IMPLEMENTATION.md      pure-Rust plan, language/tooling rationale
-  INVESTIGATION.md       Phase B live stall notes
   CLAUDE.md              hypervisor notes (auto-loaded by Claude Code)
 ```
 

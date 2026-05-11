@@ -1,9 +1,9 @@
 # Newton 717006 ROM kernel data structures
 
 Working catalog of kernel data structure layouts inferred from the
-ROM disassembly during Phase B debugging. All offsets are bytes
-unless otherwise noted. Values prefixed with `0x` are absolute VAs in
-the kernel's address space (typically the `0x0c000000+` window).
+ROM disassembly during boot bring-up. All offsets are bytes unless
+otherwise noted. Values prefixed with `0x` are absolute VAs in the
+kernel's address space (typically the `0x0c000000+` window).
 
 > **Convention.** Where a header or DDK reference exists, we cite it.
 > Where we inferred from the binary, we cite the ROM PC + assembly
@@ -328,7 +328,7 @@ Implication for state inference:
   (a port's waiter queue, a semaphore's waiter queue, etc.) — that
   object holds a TDoubleQContainer linking the task in via one of
   the embedded `TDoubleQItem` slots at `task+0xbc` or `task+0xc8`.
-  *But* in the current Phase B wedge, every BLK task has both wq
+  *But* in the wedge that prompted this analysis, every BLK task has both wq
   links zeroed. Either:
   - the per-port waiter mechanism lives at a *different* offset
     (TODO: trace `TUPort::Receive` blocking flow to find it), or
@@ -461,7 +461,7 @@ fourcc. Storage order in the object: signal at +0x08, class at +0x0c
 Used by `TAppWorld::AEInstallHandler` (called immediately after Init
 at 0x25648) to register the handler for an (class, signal) pair.
 
-Diagnostic relevance: on the Phase B "newt" DABT, our hypervisor's
+Diagnostic relevance: on the "newt" DABT during pckm-task RX setup, our hypervisor's
 pckm task sees `0x6e657774` ("newt") at `sp_usr+0x08` and
 `0x63647376` ("cdsv") at `sp_usr+0x0c`. That's exactly the layout of
 a `TAEventHandler` with `class='cdsv', signal='newt'` placed at
@@ -908,7 +908,7 @@ count<0); Release is `add 1` (wake on count≥0).
 
 ## TStackManager — heap / stack page allocator
 
-**Why this matters for Phase B.** The 717006 kernel was built for
+**Why this matters.** The 717006 kernel was built for
 ARMv4 and uses ARMv4 *subpage-AP* (per-1-KiB AP encoding within a 4-KiB
 page) to put up to four 1-KiB-owned objects on a single physical page,
 relying on hardware to fault on cross-subpage user writes. ARMv7 has no
@@ -1512,7 +1512,7 @@ Handler`. Total length is 100 bytes (`0x64`) — confirmed by
 `TStackManager::Fault(TProcessorState&)` (ROM `0x001F83E4`) and the
 peer `TROMDomainManager1K::Fault` (ROM `0x001AEEDC`).
 
-### Confirmed fields (Phase B iter 15, hypervisor `Fault(stackmgr)` probe)
+### Confirmed fields (iter 15, hypervisor `Fault(stackmgr)` probe)
 
 ```c
 struct TProcessorState {            // 100 bytes total (0x64)
@@ -1592,7 +1592,7 @@ Citations:
 - `WriteRun @ 0x00256F94..0x00256FFC` iterates the byte buffer at
   `[this+0xa1+r5]` for `r5 = 0..count-1`.
 
-**Phase B iter 21 wedge.** A 420-byte instance at USER pointer
+**Iter 21 wedge.** A 420-byte instance at USER pointer
 `0xc646c0c..0xc646db0`. `New` zeros count, WriteChunk enters
 with count=0. The count-load probe at ROM `0x00257074`
 (`ldr r0, [r4, #156]`) shows iter 0 starting with count=0

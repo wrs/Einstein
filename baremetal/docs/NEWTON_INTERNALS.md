@@ -1,7 +1,8 @@
 # Newton 2.x internals cheatsheet
 
 Short-form notes on 717006-ROM conventions that recur when debugging
-Phase B. Check here before reverse-engineering from bare disassembly.
+the boot path. Check here before reverse-engineering from bare
+disassembly.
 
 ## Calling convention — APCS, not AAPCS
 

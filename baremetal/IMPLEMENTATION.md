@@ -2,7 +2,7 @@
 
 **Scope:** language choice, build system, tooling, and testing strategy for the bare-metal Cortex-A53 port described in [`HIGHLEVEL.md`](./HIGHLEVEL.md). This doc does not re-state the architecture; read HIGHLEVEL.md first.
 
-**Status:** Phase A (bring-up) complete; Phase B (drive 717006 to interactive use) in progress. Most of the plan below is realized — the surviving sections capture both the rationale that shaped the codebase and current-state pointers into the tree. The iteration log and live stall live in [`PLAN.md`](./PLAN.md); the user-facing project overview is in [`README.md`](./README.md).
+**Status:** Bring-up complete; the 717006 ROM boots through to the Welcome UI. Most of the plan below is realized — the surviving sections capture both the rationale that shaped the codebase and current-state pointers into the tree. The iteration log lives in [`PLAN.md`](./PLAN.md); the user-facing project overview is in [`README.md`](./README.md).
 
 ## 1. Language split
 

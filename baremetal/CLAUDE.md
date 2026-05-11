@@ -31,19 +31,20 @@ the guest tests on QEMU, and any new divergence should be tracked
 down rather than papered over with a feature gate.
 
 See `README.md` for the user-facing project overview and
-`PLAN.md` / `HIGHLEVEL.md` / `IMPLEMENTATION.md` for the phasing.
+`PLAN.md` / `HIGHLEVEL.md` / `IMPLEMENTATION.md` for the
+architecture.
 
-Phase A is done. Phase B's goal is booting the 717006 ROM through to
-`TInterpreter::TInterpreter` at `0x002F40E0`, one stall at a time.
-Every iteration is "run, see where it stops, fix, rerun" — which
-means the snapshot workflow below matters a lot.
+The 717006 ROM boots through the kernel + scheduler + NewtonScript
+interpreter to the Welcome UI. Most ongoing work is "run, see where
+it stops, fix, rerun" — which means the snapshot workflow below
+matters a lot.
 
 **Important:** Do not trust your memory for details of ARM architecture,
 especially EL2-related registers and coprocessor instruction encodings.
 ALWAYS check against the actual ARMv7 reference, which is in
 docs/ARM_Reference.txt.
 
-## Snapshot / resume workflow (Phase B)
+## Snapshot / resume workflow
 
 `src/snapshot.rs` rolls four guest-state snapshots on disk at
 `/tmp/newton-snapshot-{0..3}.bin`. On every hypervisor startup we
@@ -80,9 +81,10 @@ ls -la /tmp/newton-snapshot-*.bin
 
 ### How to use this during debugging
 
-1. `cargo run` — hypervisor boots, saves every 2s, eventually
-   wedges (current Phase B starting point: guest stuck at
-   PC=0x10 / PC=0xC depending on which abort-loop branch).
+1. `cargo run` — hypervisor boots and saves every 2s. If you're
+   chasing a current stall, the wedge PC depends on what's being
+   investigated; check the most recent run log for the exact
+   stopping point.
 2. Notice the failure. The newest slot holds the state at the
    moment the timer last fired — usually already inside the
    failure, but the older slots cover the preceding 2 / 4 / 6
@@ -233,11 +235,11 @@ saw in a log), skip the install: `bg <addr>` and `c` is enough.
   with `cmake --build build --target NewtonProbe` and
   `build/NewtonProbe baremetal/roms/newton.rom - 90`.
 - Guest tests in `guest-tests/tests/` exercise each handler in
-  isolation. A Phase B regression in handler code should show
-  up as a failing test; run `guest-tests/scripts/run-all.sh`
-  before committing.
+  isolation. A regression in handler code should show up as a
+  failing test; run `guest-tests/scripts/run-all.sh` before
+  committing.
 - **Skip the guest-tests run** when an iteration's only changes
-  are a Phase-B probe (a new HVC immediate at a Newton-ROM PC
+  are a Newton-ROM probe (a new HVC immediate at a Newton-ROM PC
   in `src/rom_patches.rs` + a dispatch arm + handler in
   `src/trap.rs` that emulates the original instruction). The
   guest tests run isolated test ELFs that don't include the
@@ -357,12 +359,11 @@ re-deriving state from disassembly or tool output:
   `LR_abt` lives in `ctx.x[20]`, etc. Read the file before
   assuming banked-reg weirdness is a bug.**
 - [`docs/WORKFLOW.md`](docs/WORKFLOW.md) — process notes: review
-  Einstein-driver ports with a sub-agent, test-per-feature rule,
-  finish-the-phase semantics.
+  Einstein-driver ports with a sub-agent, test-per-feature rule.
 - [`docs/peripherals.md`](docs/peripherals.md) — peripheral
   implementations.
 - [`docs/STRUCTURES.md`](docs/STRUCTURES.md) — Newton kernel data
   structure layouts (TScheduler, TTask, TObjectTable, kernel ID
   encoding, observed task census). Always extend this when you
-  decode another kernel struct from the disasm — it's how Phase B
+  decode another kernel struct from the disasm — it's how
   debugging keeps cumulative.

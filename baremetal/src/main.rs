@@ -37,6 +37,7 @@ mod timer;
 #[cfg(feature = "trace")]
 mod tracer;
 mod trap;
+mod trap_hist;
 pub mod uart;
 mod unaligned;
 mod unaligned_inline;

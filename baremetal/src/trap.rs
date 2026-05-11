@@ -379,6 +379,9 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     if !spurious {
         timer::on_irq();
     }
+    // Pump host PL011 -> guest extr-port RX DMA buffer. No-op when
+    // DMA ch0 is not armed. See peripherals/dma.rs::poll_rx.
+    crate::peripherals::dma::poll_rx();
     update_virq();
     // Wall-clock-paced snapshot save. Timer IRQ is a cleaner hook
     // than sync traps: it fires regardless of whether the guest is

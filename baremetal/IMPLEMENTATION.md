@@ -112,7 +112,9 @@ src/
   main.rs              # no_std entry, kmain, ERET handoff
   boot.s               # _start: park non-zero cores, SP, bss, call kmain
   vectors.s            # EL2 vector table + context save/restore
-  cpu.rs / uart.rs / panic.rs / mmu.rs   bring-up + console
+  cpu.rs / uart.rs / panic.rs / mmu.rs   bring-up; PL011 routed to
+                                         guest extr-port DMA, kprintln
+                                         goes through semihosting
   stage2.rs            # guest-physical stage-2 tables
   guest_mem.rs         # ROM / RAM / flash / framebuffer + load-time
                        # selective byteswap (consumes reach.bitmap)
@@ -165,15 +167,21 @@ plus Einstein cross-references.
 
 - **VIC** (`vic.rs`) — interrupt controller; CNTHP edge-trigger
   delivery via `trap_irq`; `HCR_EL2.VI` virtual-IRQ injection.
-- **DMA** (`dma.rs`) — assignment register + per-channel state;
-  `dma_irq` test exercises completion-IRQ delivery.
+- **DMA** (`dma.rs`) — chip-wide assignment register; per-channel
+  state for channels 0/1 (serial 0 RX/TX) mirroring Einstein's
+  `TBasicSerialPortManager`; channels 2-7 still log+drop. Enable
+  writes do not synthesise IRQs — completion fires only when bytes
+  actually move (TX drain on enable, RX poll from `trap_irq`).
 - **Flash** (`flash.rs`, `flash_driver.rs`) — bank0/bank1
   byte-addressable backing; seeded ROM+REx checksum table for
   `TReservedBlockAccessor`.
 - **PCMCIA** (`pcmcia.rs`) — "no card" probe responses; absorbs
   enable/disable writes.
-- **Serial** (`serial.rs`, `serial_driver.rs`) — kernel's init
-  probe + minimal TX path.
+- **Serial** (`serial.rs`, `serial_driver.rs`) — TSerialChipVoyager
+  MMIO surface + TSerialChipEinstein native-primitive subfns.
+  Channels 0/1 of the external-serial port ("extr") are wired
+  through `dma.rs` to the hypervisor's host PL011 so the guest can
+  actually push and receive bytes.
 - **Native primitives** (`native_primitives.rs`) — CP10/CP11
   gateway routing screen / battery / tablet / sound / printer /
   network / host-call / in/out-translator.

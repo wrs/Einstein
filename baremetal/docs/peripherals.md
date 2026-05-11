@@ -159,21 +159,49 @@ Shape:
 
 Observed ground truth (TDMAManager.cpp):
 
-- `mAssignmentReg` is the **only** piece of real state; writes store,
-  reads return the last write (`TDMAManager.cpp:69-95`).
-- `WriteEnableRegister` logs the write and does nothing observable.
-- `WriteDisableRegister` same.
+- `mAssignmentReg` is the **only** piece of real chip-wide state;
+  writes store, reads return the last write (`TDMAManager.cpp:69-95`).
+- `WriteEnableRegister` logs the write and does nothing observable
+  *in Einstein*. The hypervisor uses it as the "kick" trigger to
+  drain a programmed TX channel or arm an RX channel; see below.
+- `WriteDisableRegister` clears the channel's `armed` flag in our
+  model; otherwise no observable effect.
 - `ReadStatusRegister` returns `0`.
 - `ReadWordStatusRegister` returns `0`.
 - Channel 0 / 1 per-register R/W delegates to the external-serial DMA
   driver via `mEmulator->SerialPorts.GetDriverFor(kExtr)`; channels
   2-7 ignore their per-register accesses (return 0 on read, log on
-  write). The hypervisor can mirror this by only dispatching the
-  assignment register and treating everything else as the obvious
-  stub.
+  write).
 
-This is important: the Newton kernel's DMA driver manages the transfer
-state machine in software; Einstein's model is almost an API stub.
+The hypervisor mirrors Einstein's chip-wide stubs but implements
+**real state** for channels 0/1 (extr port RX/TX), routing bytes
+between guest RAM and the host PL011 (`crate::uart`). Register
+meanings match Einstein's `TBasicSerialPortManager::{Read,Write}
+{Rx,Tx}DMARegister` (`Emulator/Serial/TBasicSerialPortManager.cpp:
+642-891`):
+
+- bank 1 reg 0 — buffer base PA
+- bank 1 reg 1 — current data PA (advanced per byte, wraps at
+  `buf_start + buf_size`)
+- bank 1 reg 4 — countdown (bytes remaining)
+- bank 1 reg 5 — ring size
+- bank 2 reg 0 — control (bit `0x02` = "DMA enabled")
+- bank 2 reg 1 — event/interrupt-reason (RX completion = `0x40`,
+  TX completion = `0x80`)
+- bank 2 reg 2 — write-to-clear of bank 2 reg 1
+
+TX (ch1) drains synchronously on the chip-wide enable-register
+write; RX (ch0) is polled from `trap_irq` and deposits bytes when
+the host UART has data and the channel is armed. Completion IRQs
+(`INT_DMA_CH0 = 0x80`, `INT_DMA_CH1 = 0x100`) fire only when bytes
+actually move — **not** on the bare enable write, since the
+kernel re-arms DMA from inside its own FIQ handler and a
+synthesised-on-enable IRQ creates an unbreakable FIQ loop.
+
+This is important: the Newton kernel's DMA driver manages the
+transfer state machine in software; Einstein's model is almost an
+API stub for chip-wide registers but stateful for the per-channel
+serial registers.
 
 ## ARM processor interrupt callbacks
 
@@ -185,8 +213,10 @@ method call is needed.
 
 ## Things we deliberately don't model yet
 
-- `TSerialPorts` / `TSerialChip*` — serial UARTs. Kernel touches them
-  during early init but we don't need a response for boot.
+- `TSerialPorts` for the non-extr ports (`infr`, `tblt`, `mdem`) —
+  the external-serial port (`extr`) is wired through to the host
+  PL011 via DMA channels 0/1; the other three TSerialChipVoyager
+  windows still return idle/no-data.
 - `TPCMCIAController` — two 256 MiB socket windows at
   `0x3000_0000..0x4000_0000` (slot 0, `kPCMCIA0Base`) and
   `0x4000_0000..0x5000_0000` (slot 1, `kPCMCIA1Base`). Einstein

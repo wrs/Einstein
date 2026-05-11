@@ -335,7 +335,11 @@ baremetal/
     main.rs              kmain: MMU, stage-2, vectors, VIC, timer; ERET
     boot.s               _start
     vectors.s            EL2 exception vectors, context save/restore
-    cpu.rs / uart.rs / panic.rs / mmu.rs   bring-up + console
+    cpu.rs / uart.rs / panic.rs / mmu.rs   bring-up; uart.rs holds the
+                                           PL011 wire (routed to the
+                                           guest's extr serial port via
+                                           dma.rs) and the semihosting
+                                           SYS_WRITE path for kprintln
     stage2.rs            stage-2 L1/L2/L3 tables
     guest.rs             ERET to AArch32 EL1 SVC at guest IPA 0
     guest_mem.rs         ROM load + byteswap + CP15 patch +

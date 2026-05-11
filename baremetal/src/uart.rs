@@ -39,6 +39,7 @@ const UART_CR: *mut u32 = (UART_BASE + 0x30) as *mut u32;
 const UART_IMSC: *mut u32 = (UART_BASE + 0x38) as *mut u32;
 const UART_ICR: *mut u32 = (UART_BASE + 0x44) as *mut u32;
 
+const FR_RXFE: u32 = 1 << 4; // Receive FIFO empty.
 const FR_TXFF: u32 = 1 << 5; // Transmit FIFO full.
 const LCRH_FEN: u32 = 1 << 4; // Enable TX/RX FIFOs.
 const LCRH_WLEN_8: u32 = 0b11 << 5; // 8-bit word length.
@@ -84,6 +85,26 @@ pub fn write_byte(b: u8) {
     unsafe {
         while read_volatile(UART_FR) & FR_TXFF != 0 {}
         write_volatile(UART_DR, b as u32);
+    }
+}
+
+/// Non-blocking host-PL011 RX. Returns `Some(byte)` if the receive
+/// FIFO has data, `None` otherwise. Used by `peripherals::dma` to
+/// stream incoming bytes into the guest's external-serial DMA buffer.
+///
+/// FR.RXFE bit position confirmed against Linux's
+/// `include/linux/amba/serial.h` (UART01x_FR_RXFE = `BIT(4)`),
+/// matching the PrimeCell PL011 TRM (ARM DDI 0183G §3.3.3).
+pub fn read_byte_nonblock() -> Option<u8> {
+    // SAFETY: MMIO at a fixed, documented address. Volatile access, no aliasing.
+    unsafe {
+        if read_volatile(UART_FR) & FR_RXFE != 0 {
+            None
+        } else {
+            // DR low 8 bits = data; upper bits are error flags we ignore
+            // for the host-console use case.
+            Some((read_volatile(UART_DR) & 0xFF) as u8)
+        }
     }
 }
 

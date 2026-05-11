@@ -9,11 +9,16 @@
 @   * Enable/status (0x0F09_8000), disable (0x0F09_8400), and word-
 @     status (0x0F09_8800) have no observable state. Reads return 0;
 @     writes are dropped.
-@   * Per-channel registers (banks at 0x0F08_0000 and 0x0F09_0000 with
-@     channel stride 0x2000, register stride 0x400) read as 0 and drop
-@     writes. Einstein's channel-0 / channel-1 paths would eventually
-@     delegate to an external-serial DMA driver, but that peripheral
-@     isn't wired up yet.
+@   * Per-channel registers for channels 0/1 (the external-serial
+@     port) round-trip through the modeled `TBasicSerialPortManager`
+@     state — bank 1 reg 0 = mRx/TxDMAPhysicalBufferStart, etc. See
+@     `Emulator/Serial/TBasicSerialPortManager.cpp:642-891`.
+@   * Per-channel registers for channels 2-7 are unmodeled (no host
+@     backend wired up): reads return 0, writes drop.
+@
+@ This test only probes the simplest round-trip register (bank 1 reg 0,
+@ "buffer start PA") on channel 0; deeper TX/RX flow coverage is in
+@ test_dma_irq and (eventually) a serial-data integration test.
 
 #include "../common/test_runtime.S"
 
@@ -21,9 +26,11 @@
     .equ DMA_ENABLE,    0x0F098000
     .equ DMA_DISABLE,   0x0F098400
     .equ DMA_WORDSTS,   0x0F098800
-    @ Per-channel probes: bank 1, channel 0, register 0 & register 2.
-    .equ DMA_CH0_R0,    0x0F080000
-    .equ DMA_CH0_R2,    0x0F080800
+    @ Per-channel probes:
+    @   channel 0 (serial 0 RX): bank 1, reg 0 — round-trips
+    @   channel 2 (IR):          bank 1, reg 0 — stub (reads 0)
+    .equ DMA_CH0_B1R0,  0x0F080000
+    .equ DMA_CH2_B1R0,  0x0F084000      @ channel stride = 0x2000
 
     .global test_main
 test_main:
@@ -66,21 +73,25 @@ test_main:
     mov     r0, #2
     hvc     #HVC_MARK                      @ mark 2: chip-wide stubs
 
-    @ --- Per-channel stub: reads zero, writes dropped ---
-    ldr     r4, =DMA_CH0_R0
+    @ --- Channel 0 (serial 0 RX) round-trips through the modeled
+    @ TBasicSerialPortManager state for bank 1 reg 0 (buf_start). ---
+    ldr     r4, =DMA_CH0_B1R0
     ldr     r5, =0xAABBCCDD
     str     r5, [r4]
     ldr     r6, [r4]
-    cmp     r6, #0
-    bne     .Lfail_ch_stub
+    cmp     r6, r5
+    bne     .Lfail_ch0_rw
 
-    ldr     r4, =DMA_CH0_R2
+    @ --- Channel 2 (IR) is unmodeled: write drops, read returns 0. ---
+    ldr     r4, =DMA_CH2_B1R0
+    ldr     r5, =0x11223344
+    str     r5, [r4]
     ldr     r6, [r4]
     cmp     r6, #0
-    bne     .Lfail_ch_stub
+    bne     .Lfail_ch2_stub
 
     mov     r0, #3
-    hvc     #HVC_MARK                      @ mark 3: per-channel stubs
+    hvc     #HVC_MARK                      @ mark 3: per-channel mix
 
     hvc_pass
     bx      lr
@@ -101,7 +112,11 @@ test_main:
     mov     r0, r6
     hvc     #HVC_PRINT_HEX
     hvc_fail 0x33
-.Lfail_ch_stub:
+.Lfail_ch0_rw:
     mov     r0, r6
     hvc     #HVC_PRINT_HEX
     hvc_fail 0x34
+.Lfail_ch2_stub:
+    mov     r0, r6
+    hvc     #HVC_PRINT_HEX
+    hvc_fail 0x35

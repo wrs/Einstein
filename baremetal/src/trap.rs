@@ -1708,6 +1708,23 @@ fn handle_und(ctx: &mut TrapContext) {
             ctx.x[rd] = spsr_und;
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
         }
+        // `MOVS PC, LR` (cond=AL) executed in USR mode. On ARMv4 /
+        // SA-1100 this is a standard function-return idiom: in
+        // privileged modes it returns from an exception (PC=LR,
+        // CPSR=SPSR); in USR mode there is no SPSR (Einstein's
+        // TARMProcessor::GetSPSR returns CPSR for USR, so the
+        // CPSR<-SPSR copy is a no-op). ARMv8 UNDs this in USR mode
+        // because the encoding is UNPREDICTABLE there. The Newton
+        // FPE library (rom.dis 0x0038_d000..0x0039_3b80) ends nearly
+        // every helper with this exact opcode (e.g. _rintM at
+        // 0x0038_d8c4, _sinM at 0x0039_2cd0, etc.), and the kernel's
+        // CP15 init at 0x0001_9428 uses it as well. Emulate as a
+        // plain return: ERET to LR_usr (ctx.x[14] per Table D1-79)
+        // with SPSR_und unchanged so we stay in USR mode.
+        0xe1b0_f00e if (spsr_und & 0x1F) == 0x10 => {
+            let lr_usr = ctx.x[14] as u32;
+            return_to_guest_from_und(ctx, lr_usr as u64, spsr_und);
+        }
         // Tracer trampoline slot[0] executed in USR mode. HVC is
         // UNDEFINED at EL0, so the trampoline's `hvc #TRACE_TAG`
         // raises an UND exception instead of entering EL2 directly.

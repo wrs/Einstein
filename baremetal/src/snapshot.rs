@@ -313,6 +313,20 @@ pub fn maybe_autosave(ctx: &TrapContext) {
         kprintln!("snapshot: autosave resumed — no guest_bp active");
     }
 
+    // Gate autosaves when the IRQ that woke us didn't come from the
+    // AArch32 guest. The CNTHP physical IRQ also fires while EL2 is
+    // already running (e.g. `pause_system` waiting in `wfi`), in
+    // which case `SPSR_EL2` / `ELR_EL2` hold the EL2 hypervisor's
+    // PSTATE / PC and `ctx` is the EL2 register file — saving any of
+    // those would poison the slot and a later resume would ERET into
+    // EL2 hypervisor code at an EL2 PC. SPSR_EL2 bit M[4]=1 indicates
+    // the previous PSTATE was AArch32 (DDI 0487 D13.2 / D1.21.1); any
+    // other value means we were nested inside EL2 and must skip.
+    let spsr_el2 = read_sysreg64("spsr_el2");
+    if (spsr_el2 & (1 << 4)) == 0 {
+        return;
+    }
+
     // Gate autosaves when the guest PC is inside a hypervisor-owned
     // transient region whose correct execution depends on hidden
     // scratch state (TPIDRURW, RAM stash slots, staged ERET PC).

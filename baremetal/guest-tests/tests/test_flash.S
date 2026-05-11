@@ -5,15 +5,19 @@
 @ bank is 4 MiB, mapped stage-2 *read-only* onto its half of the single
 @ 8 MiB backing in peripherals::flash. Bank 0 is seeded with Einstein's
 @ "DLDS" / "OSCD" header at block 0 (offset 0) and block 1 (offset
-@ 0x10000); bank 1 is left in its erased state (0xFF). Direct CPU
-@ writes are silently dropped (matches Einstein's TMemory::WriteP);
-@ flash mutations only happen via the TEinsteinFlashDriver native
-@ primitives. Tests:
+@ 0x10000); every other byte of both banks starts at 0x00, matching
+@ Einstein's mmap-O_CREAT backing (TFlash.cpp:66-70). Real flash would
+@ read 0xFF for erased bytes, but the Newton kernel was tested against
+@ Einstein's zero-fill, so peripherals::flash::GUEST_FLASH and this
+@ test follow Einstein, not real hardware. Direct CPU writes are
+@ silently dropped (matches Einstein's TMemory::WriteP); flash
+@ mutations only happen via the TEinsteinFlashDriver native primitives.
+@ Tests:
 @
 @   * Bank 0 header readable at its documented offsets.
-@   * Unwritten region in bank 0 reads as 0xFFFFFFFF (erased).
+@   * Unwritten region in bank 0 reads as 0x00000000 (zero-fill).
 @   * Direct stores to flash are dropped (read-back returns the
-@     unmodified backing — erased pattern or the seeded value).
+@     unmodified backing — zero pattern or the seeded value).
 @   * Byte / halfword stores likewise dropped.
 @   * Bank 0 and bank 1 are independent (no aliasing).
 
@@ -61,9 +65,9 @@ test_main:
     mov     r0, #1
     hvc     #HVC_MARK                      @ mark 1: header intact
 
-    @ --- Unwritten region of bank 0 reads 0xFFFFFFFF (erased state) ---
+    @ --- Unwritten region of bank 0 reads 0x00000000 (Einstein zero-fill) ---
     ldr     r0, [r4, #0x200]
-    ldr     r1, =0xFFFFFFFF
+    ldr     r1, =0x00000000
     cmp     r0, r1
     bne     .Lfail_unwritten
 
@@ -71,7 +75,7 @@ test_main:
     ldr     r6, =0xDEADBEEF
     str     r6, [r4, #0x200]
     ldr     r0, [r4, #0x200]
-    ldr     r1, =0xFFFFFFFF         @ store dropped → still erased
+    ldr     r1, =0x00000000         @ store dropped → still zero-fill
     cmp     r0, r1
     bne     .Lfail_bank0_drop
 
@@ -93,29 +97,29 @@ test_main:
     mov     r1, #0x22
     strh    r1, [r2, #4]
     ldr     r0, [r4, #0x300]
-    ldr     r1, =0xFFFFFFFF
+    ldr     r1, =0x00000000
     cmp     r0, r1
     bne     .Lfail_byte_drop
 
     mov     r0, #3
     hvc     #HVC_MARK                      @ mark 3: byte/halfword stores dropped
 
-    @ --- Bank 1 (kFlashBank2) is a separate 4 MiB region (erased) ---
+    @ --- Bank 1 (kFlashBank2) is a separate 4 MiB region (zero-fill) ---
     ldr     r5, =FLASH_BANK1
     ldr     r0, [r5, #0]
-    ldr     r1, =0xFFFFFFFF
+    ldr     r1, =0x00000000
     cmp     r0, r1
     bne     .Lfail_bank1_seeded
 
     ldr     r6, =0xCAFEF00D
     str     r6, [r5, #0x400]
-    ldr     r0, [r4, #0x400]        @ bank 0 at same offset still erased
-    ldr     r1, =0xFFFFFFFF
+    ldr     r0, [r4, #0x400]        @ bank 0 at same offset still zero-fill
+    ldr     r1, =0x00000000
     cmp     r0, r1
     bne     .Lfail_bank_alias
 
     ldr     r0, [r5, #0x400]        @ bank 1 store likewise dropped
-    ldr     r1, =0xFFFFFFFF
+    ldr     r1, =0x00000000
     cmp     r0, r1
     bne     .Lfail_bank1_drop
 

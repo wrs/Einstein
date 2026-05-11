@@ -30,25 +30,24 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
     match subfn {
         // No-op, no return value (New).
         0x01 => {}
+        // PauseSystem (Emulator/TNativePrimitives.cpp:749-756) — the
+        // kernel's idle-loop primitive. Real hardware enters WFI;
+        // Einstein calls `mEmulator->PauseSystem()` which halts the
+        // emulator until an event signal arrives. We do the same in
+        // EL2: WFI until the CNTHP heartbeat (or any wired physical
+        // IRQ) wakes us. See `pause_system` below.
+        0x0D => pause_system(ctx),
         // No-op, r0=0 (per Einstein Emulator/TNativePrimitives.cpp:625-849):
         //   0x02 Delete, 0x03 Init, 0x04 BacklightTrigger,
         //   0x05 RegisterPowerSwitchInterrupt, 0x06 EnableSysPowerInterrupt,
         //   0x07 InterruptHandler, 0x08 TimerInterruptHandler,
         //   0x09 ResetZAPStoreCheck, 0x0A PowerOnSubsystem,
         //   0x0B PowerOffSubsystem, 0x0C PowerOffAllSubsystems,
-        //   0x0D PauseSystem, 0x0E PowerOffSystem, 0x0F PowerOnSystem,
+        //   0x0E PowerOffSystem, 0x0F PowerOnSystem,
         //   0x10 BacklightOverride, 0x12 RegisterPowerSwitchInterrupt2,
         //   0x13 TranslatePowerEvent.
-        //
-        // 0x0D (PauseSystem) is the hot one in idle: Einstein calls
-        // `mEmulator->PauseSystem()` which actually halts the emulator
-        // until an interrupt fires (TNativePrimitives.cpp:754). On real
-        // hardware the CPU enters WFI. Our no-op treatment lets the
-        // kernel's idle loop spin at trap-rate (~40 kHz on QEMU TCG)
-        // and is responsible for ≈100% of EC=0x07 (FP/SIMD) traps in
-        // steady state — see `trap-hist`.
         0x02 | 0x03 | 0x04 | 0x05 | 0x06 | 0x07 | 0x08 | 0x09
-        | 0x0A | 0x0B | 0x0C | 0x0D | 0x0E | 0x0F
+        | 0x0A | 0x0B | 0x0C | 0x0E | 0x0F
         | 0x10 | 0x12 | 0x13 => {
             ctx.x[0] = 0;
         }
@@ -103,6 +102,98 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
 }
 
 /// TMainPlatformDriver::GetPCMCIAPowerSpec(slot=r1, out=r2).
+/// `TMainPlatformDriver::PauseSystem` (subfn 0x0D) — the kernel's
+/// idle-loop "wait for next event" primitive
+/// (Emulator/TNativePrimitives.cpp:749-756). On real hardware the
+/// kernel sequence is roughly "mask IRQs; check work queues; if empty,
+/// WFI", and PauseSystem is the WFI step. Returning immediately (the
+/// previous no-op behaviour) made the idle loop spin at trap rate —
+/// ~40 kHz on QEMU TCG — and was responsible for ≈100% of EC=0x07
+/// (FP/SIMD) traps plus the matching ≈100% of EC=0x03 (DACR writes in
+/// SWIBoot exception entry/exit). See `trap-hist`.
+///
+/// We implement the wait directly in EL2 with `wfi`:
+///
+///   * Short-circuit if a vIRQ is already pending (`vic::irq_pending()`).
+///     The kernel will take it on the next ERET; consuming a heartbeat
+///     in WFI would just delay that.
+///   * Otherwise unmask physical IRQs in EL2 (`PSTATE.I`) and issue
+///     `wfi`. The only wired physical IRQ on this hypervisor is CNTHP
+///     heartbeat (~16 ms); when it fires, the EL2 IRQ vector at offset
+///     0x280 (current-EL SPx) runs `trap_irq`, which advances synthetic
+///     ticks, polls Newton match registers, and may raise a vIRQ. After
+///     the IRQ vector ERETs back here we re-mask and return.
+///   * Loop up to `MAX_WFI_ITERS` times so a heartbeat that doesn't
+///     end up raising a vIRQ doesn't return us to the guest just to
+///     have it call PauseSystem again. The bound caps the worst-case
+///     wait at ~128 ms wall time, which is well under any timeout the
+///     kernel would notice.
+///
+/// SAFETY notes:
+///   * WFI at EL2 is architectural (DDI 0487 D7.2.20).
+///   * `msr daifclr/daifset, #2` only flips PSTATE.I; PSTATE.A/F/D stay
+///     as the EL2 entry path set them.
+///   * The IRQ vector at 0x280 is the same `trap_irq` we use for guest
+///     IRQ delivery (0x680); it has no shared mutable state with the
+///     sync-trap handler we're nested inside, so re-entry is safe.
+///   * `ELR_EL2` / `SPSR_EL2` get clobbered by the CPU on every
+///     exception entry, including the nested IRQ that wakes WFI. The
+///     outer sync-trap tail (`vectors.s::restore_context_and_eret`)
+///     ERETs with whatever those sysregs currently hold, so we MUST
+///     snapshot them on entry and restore them before returning, or
+///     ERET ends up reading the post-WFI EL2h state and jumping to
+///     PC=0 in EL2 instead of back to the guest.
+fn pause_system(ctx: &mut TrapContext) {
+    const MAX_WFI_ITERS: u32 = 8;
+
+    // Snapshot the guest's saved exception state so the nested IRQ
+    // can't lose it.
+    let saved_elr: u64;
+    let saved_spsr: u64;
+    // SAFETY: sysreg reads, side-effect free.
+    unsafe {
+        core::arch::asm!(
+            "mrs {0}, elr_el2",
+            "mrs {1}, spsr_el2",
+            out(reg) saved_elr,
+            out(reg) saved_spsr,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+
+    if !crate::peripherals::vic::irq_pending() {
+        for _ in 0..MAX_WFI_ITERS {
+            // SAFETY: see function-level SAFETY notes.
+            unsafe {
+                core::arch::asm!(
+                    "msr daifclr, #2",   // unmask IRQ (PSTATE.I = 0)
+                    "wfi",
+                    "msr daifset, #2",   // re-mask IRQ
+                    options(nostack, preserves_flags),
+                );
+            }
+            if crate::peripherals::vic::irq_pending() {
+                break;
+            }
+        }
+    }
+
+    // Restore guest exception state clobbered by the nested IRQ entry.
+    // SAFETY: writing ELR_EL2 / SPSR_EL2 from EL2 is allowed; the
+    // subsequent sync-trap-tail ERET will consume these values.
+    unsafe {
+        core::arch::asm!(
+            "msr elr_el2, {0}",
+            "msr spsr_el2, {1}",
+            in(reg) saved_elr,
+            in(reg) saved_spsr,
+            options(nostack, preserves_flags),
+        );
+    }
+
+    ctx.x[0] = 0;
+}
+
 ///
 /// Einstein returns `5` (3.3V + 5V) for slot 0, `7` (3.3V + 5V + 12V)
 /// for slot 1, `kError_NotImplemented` otherwise

@@ -30,24 +30,36 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
     match subfn {
         // No-op, no return value (New).
         0x01 => {}
-        // PauseSystem (Emulator/TNativePrimitives.cpp:749-756) — the
-        // kernel's idle-loop primitive. Real hardware enters WFI;
-        // Einstein calls `mEmulator->PauseSystem()` which halts the
-        // emulator until an event signal arrives. We do the same in
-        // EL2: WFI until the CNTHP heartbeat (or any wired physical
-        // IRQ) wakes us. See `pause_system` below.
-        0x0D => pause_system(ctx),
+        // PauseSystem (0x0D) and PowerOffSystem (0x0E) — both are
+        // "halt the CPU until an event signal arrives" primitives on
+        // real hardware. PauseSystem is the idle-loop primitive
+        // (`SleepUntilNextWakeup` path); PowerOffSystem is called
+        // from CyclePower__Fv+0xE0 inside the deep-sleep retry loop
+        // body, between `IOPowerOffAll` and `PowerOnSystem`. Einstein
+        // implements both as `mEmulator->PauseSystem()`
+        // (TNativePrimitives.cpp:754, :756). We do the same in EL2:
+        // WFI until the CNTHP heartbeat (or any wired physical IRQ)
+        // wakes us. See `pause_system` below.
+        //
+        // Without 0x0E doing wake-wait, `CyclePower` spins at trap
+        // rate after the first `SleepUntilNextWakeup`: every iteration
+        // of the retry loop reads IntPresent/IntED3 and re-cycles
+        // power immediately, generating ~365 k traps/sec on QEMU TCG
+        // (~98 k IntCtrl writes, ~65 k IntED1 reads, ~33 k DACR
+        // writes per 2 s window — see trap-hist captures in the
+        // commit history).
+        0x0D | 0x0E => pause_system(ctx),
         // No-op, r0=0 (per Einstein Emulator/TNativePrimitives.cpp:625-849):
         //   0x02 Delete, 0x03 Init, 0x04 BacklightTrigger,
         //   0x05 RegisterPowerSwitchInterrupt, 0x06 EnableSysPowerInterrupt,
         //   0x07 InterruptHandler, 0x08 TimerInterruptHandler,
         //   0x09 ResetZAPStoreCheck, 0x0A PowerOnSubsystem,
         //   0x0B PowerOffSubsystem, 0x0C PowerOffAllSubsystems,
-        //   0x0E PowerOffSystem, 0x0F PowerOnSystem,
+        //   0x0F PowerOnSystem,
         //   0x10 BacklightOverride, 0x12 RegisterPowerSwitchInterrupt2,
         //   0x13 TranslatePowerEvent.
         0x02 | 0x03 | 0x04 | 0x05 | 0x06 | 0x07 | 0x08 | 0x09
-        | 0x0A | 0x0B | 0x0C | 0x0E | 0x0F
+        | 0x0A | 0x0B | 0x0C | 0x0F
         | 0x10 | 0x12 | 0x13 => {
             ctx.x[0] = 0;
         }
@@ -102,15 +114,19 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
 }
 
 /// TMainPlatformDriver::GetPCMCIAPowerSpec(slot=r1, out=r2).
-/// `TMainPlatformDriver::PauseSystem` (subfn 0x0D) — the kernel's
-/// idle-loop "wait for next event" primitive
-/// (Emulator/TNativePrimitives.cpp:749-756). On real hardware the
-/// kernel sequence is roughly "mask IRQs; check work queues; if empty,
-/// WFI", and PauseSystem is the WFI step. Returning immediately (the
-/// previous no-op behaviour) made the idle loop spin at trap rate —
-/// ~40 kHz on QEMU TCG — and was responsible for ≈100% of EC=0x07
-/// (FP/SIMD) traps plus the matching ≈100% of EC=0x03 (DACR writes in
-/// SWIBoot exception entry/exit). See `trap-hist`.
+/// `TMainPlatformDriver::PauseSystem` (subfn 0x0D) and `PowerOffSystem`
+/// (subfn 0x0E) — both "halt the CPU until an event signal arrives"
+/// primitives (Emulator/TNativePrimitives.cpp:749-758). On real
+/// hardware the kernel sequence is roughly "mask IRQs; check work
+/// queues; if empty, WFI"; PauseSystem is the WFI step in the idle
+/// path, and PowerOffSystem is the WFI step inside CyclePower's deep-
+/// sleep retry loop. Returning immediately (the previous no-op
+/// behaviour) made each spin at trap rate — ~40 kHz on QEMU TCG for
+/// PauseSystem, and ~365 kHz aggregate for CyclePower because each
+/// retry iteration also reads/writes VIC, alarm, and FIQ-mask
+/// registers — and was responsible for ≈100% of EC=0x07 (FP/SIMD)
+/// traps plus the matching ≈100% of EC=0x03 (DACR writes in SWIBoot
+/// exception entry/exit). See `trap-hist`.
 ///
 /// We implement the wait directly in EL2 with `wfi`:
 ///

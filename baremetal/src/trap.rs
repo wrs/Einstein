@@ -4394,6 +4394,10 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
     let opc2 = ((iss >> 17) & 0x7) as u32;
     let crm = _crm;
 
+    crate::trap_hist::record_cp15(
+        crate::trap_hist::cp15_key(opc1, crn, crm, opc2, is_read),
+    );
+
     // Budget-limited CP15 logging for bring-up diagnostics. Prints only the
     // first N unique (CRn, CRm, Opc1, Opc2, dir) tuples.
     static mut CP15_SEEN: [u32; 32] = [0; 32];
@@ -4706,6 +4710,7 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
 /// ROM boot trips one.
 fn handle_fp_simd(ctx: &mut TrapContext, _iss: u32) {
     let elr = read_sysreg!("elr_el2") as u32;
+    crate::trap_hist::record_fp_simd(elr);
     let insn = match read_guest_word_pa(elr) {
         Some(w) => w,
         None => {
@@ -4980,6 +4985,7 @@ fn advance_elr(bytes: u64) {
 pub fn describe_ec(ec: u32) -> &'static str {
     match ec {
         0x00 => "Unknown reason",
+        0x03 => "Trapped CP15 MCR/MRC",
         0x07 => "SIMD/FP access trap (CPTR_EL2.TFP)",
         0x0E => "Illegal execution state",
         0x11 => "SVC from AArch32",

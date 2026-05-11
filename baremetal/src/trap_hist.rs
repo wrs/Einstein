@@ -13,14 +13,34 @@
 //!   bounded approximate top of (a) which guest PCs are generating data
 //!   aborts, and (b) which IPAs are being hit. Counts are lower bounds
 //!   on the true frequency; the slack is at most `total / 16`.
+//! - **CP15 op top-K** (Misra-Gries, 16 slots) — sub-bucketing of
+//!   `EC=0x03`. Key is the packed `(CRn, CRm, opc1, opc2, dir)` bundle
+//!   that the CP15 trap handler already builds; the dump translates
+//!   common ARMv7 CP15 ops back to register names.
+//! - **FP/SIMD PC top-K** (Misra-Gries, 16 slots) — sub-bucketing of
+//!   `EC=0x07`. Key is the faulting guest PC, which on Newton lands
+//!   directly on the `MCR p10`/`MCR p11` instruction that dispatches a
+//!   native primitive — so the top-K reads as a histogram of which
+//!   primitive sites are hot.
 //!
 //! Because each dump resets the counters, the window reflects roughly
 //! the previous 2 s — a snapshot of "what's hot right now" rather than
 //! a since-boot cumulative tally, which makes idle composition easy
 //! to read.
+//!
+//! ## Warmup
+//!
+//! The cold-boot trap mix is dominated by one-shot init paths (kernel
+//! MMU bring-up, page-table writes, native-primitive setup) that would
+//! swamp the idle signal and bias the Misra-Gries pickers toward
+//! transient PCs. To skip that noise, every `record_*` and
+//! `dump_and_reset` short-circuits until `WARMUP_TRAPS` sync traps
+//! have been observed. Once the threshold is crossed a one-shot
+//! "warmup complete" line marks the transition and recording goes
+//! live for all subsequent windows.
 
 use core::ptr::addr_of_mut;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::hvc_imm::HvcImm;
 use crate::kprintln;
@@ -29,6 +49,22 @@ const EC_BUCKETS: usize = 64;
 const HVC_BUCKETS: usize = 256;
 const TOPK: usize = 16;
 const PRINT_TOP: usize = 8;
+
+/// Number of sync traps to ignore at the start of a run before any
+/// counters move. Tuned to cover the ROM boot through to the kernel's
+/// idle/scheduler steady-state on QEMU TCG; bump this if a longer boot
+/// path is in play.
+const WARMUP_TRAPS: u64 = 200_000;
+
+/// Total sync traps observed since boot. Used only to detect when the
+/// warmup threshold is crossed; the recording counters are separate.
+static SYNC_COUNT: AtomicU64 = AtomicU64::new(0);
+static WARMUP_NOTIFIED: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+fn is_warm() -> bool {
+    SYNC_COUNT.load(Ordering::Relaxed) >= WARMUP_TRAPS
+}
 
 static EC_HIST: [AtomicU64; EC_BUCKETS] = {
     const Z: AtomicU64 = AtomicU64::new(0);
@@ -41,13 +77,26 @@ static HVC_IMM_HIST: [AtomicU64; HVC_BUCKETS] = {
 static HVC_HIGH_HIST: AtomicU64 = AtomicU64::new(0);
 
 /// Record a sync trap by its `ESR_EL2.EC`. Called once per guest sync
-/// trap at the top of the dispatcher.
+/// trap at the top of the dispatcher. Also drives the warmup counter
+/// and prints a one-shot "warmup complete" line when the threshold
+/// is crossed so the user knows measurement just went live.
 pub fn record_sync(ec: u32) {
+    let n = SYNC_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n < WARMUP_TRAPS {
+        return;
+    }
+    if n == WARMUP_TRAPS && !WARMUP_NOTIFIED.swap(true, Ordering::Relaxed) {
+        kprintln!(
+            "trap-hist: warmup complete after {} sync traps; measuring from now",
+            WARMUP_TRAPS
+        );
+    }
     EC_HIST[(ec & 0x3f) as usize].fetch_add(1, Ordering::Relaxed);
 }
 
 /// Record an `HVC #imm` by its 16-bit immediate.
 pub fn record_hvc(imm: u32) {
+    if !is_warm() { return; }
     if imm < HVC_BUCKETS as u32 {
         HVC_IMM_HIST[imm as usize].fetch_add(1, Ordering::Relaxed);
     } else {
@@ -113,10 +162,13 @@ impl TopK {
 
 static mut DABT_PC: TopK = TopK::new();
 static mut DABT_IPA: TopK = TopK::new();
+static mut CP15_OP: TopK = TopK::new();
+static mut FP_SIMD_PC: TopK = TopK::new();
 
 /// Record a data abort by `(guest PC, IPA)`. Called from
 /// `handle_data_abort` after ELR/IPA have been read.
 pub fn record_dabt(elr_pc: u32, ipa: u32) {
+    if !is_warm() { return; }
     // SAFETY: trap dispatch is single-threaded on core 0; the only
     // references to these statics are taken here and in
     // `dump_and_reset`, which can't overlap.
@@ -126,9 +178,39 @@ pub fn record_dabt(elr_pc: u32, ipa: u32) {
     }
 }
 
+/// Pack a CP15 op bundle to a `u32` key. Matches the local key build
+/// in `handle_cp15_trap` so the printout can decode it back.
+pub fn cp15_key(opc1: u32, crn: u32, crm: u32, opc2: u32, is_read: bool) -> u32 {
+    ((is_read as u32) << 13)
+        | ((crn & 0xF) << 9)
+        | ((crm & 0xF) << 5)
+        | ((opc1 & 0x7) << 2)
+        | (opc2 & 0x7)
+}
+
+/// Record a CP15 trap by its op bundle. Called from `handle_cp15_trap`
+/// after the ISS decode.
+pub fn record_cp15(key: u32) {
+    if !is_warm() { return; }
+    // SAFETY: single-threaded.
+    unsafe { (*addr_of_mut!(CP15_OP)).record(key); }
+}
+
+/// Record an FP/SIMD trap by its faulting guest PC. Called from
+/// `handle_fp_simd` once `ELR_EL2` has been read.
+pub fn record_fp_simd(elr_pc: u32) {
+    if !is_warm() { return; }
+    // SAFETY: single-threaded.
+    unsafe { (*addr_of_mut!(FP_SIMD_PC)).record(elr_pc); }
+}
+
 /// Snapshot every counter, print the top entries, and zero everything
 /// so the next dump shows a fresh window.
 pub fn dump_and_reset() {
+    if !is_warm() {
+        // Still inside the warmup window — nothing to dump.
+        return;
+    }
     // ---- EC histogram --------------------------------------------------
     let mut ec = [0u64; EC_BUCKETS];
     let mut total: u64 = 0;
@@ -146,24 +228,38 @@ pub fn dump_and_reset() {
     }
     let hvc_high = HVC_HIGH_HIST.swap(0, Ordering::Relaxed);
 
-    // ---- DABT top-K ----------------------------------------------------
-    // SAFETY: single-threaded; the only other access site is
-    // `record_dabt`, which can't overlap (no re-entry across the dump).
+    // ---- DABT / CP15 / FP-SIMD top-K -----------------------------------
+    // SAFETY: single-threaded; the only other access site is the
+    // per-trap `record_*`, which can't overlap with the dump (no
+    // re-entry across the trap-irq path that calls us).
     let dabt_pc = unsafe {
         let p = addr_of_mut!(DABT_PC);
         let s = (*p).snapshot_sorted();
         (*p).reset();
         s
     };
-    // SAFETY: same as above.
     let dabt_ipa = unsafe {
         let p = addr_of_mut!(DABT_IPA);
         let s = (*p).snapshot_sorted();
         (*p).reset();
         s
     };
+    let cp15 = unsafe {
+        let p = addr_of_mut!(CP15_OP);
+        let s = (*p).snapshot_sorted();
+        (*p).reset();
+        s
+    };
+    let fp_simd = unsafe {
+        let p = addr_of_mut!(FP_SIMD_PC);
+        let s = (*p).snapshot_sorted();
+        (*p).reset();
+        s
+    };
 
-    if total == 0 && hvc_total == 0 && hvc_high == 0 && dabt_pc[0].1 == 0 {
+    if total == 0 && hvc_total == 0 && hvc_high == 0
+        && dabt_pc[0].1 == 0 && cp15[0].1 == 0 && fp_simd[0].1 == 0
+    {
         // Nothing observed since last dump — skip to avoid log spam.
         return;
     }
@@ -245,6 +341,38 @@ pub fn dump_and_reset() {
                 describe_ipa(ipa),
                 c
             );
+        }
+    }
+
+    // CP15 op top — sub-buckets the EC=0x03 (Trapped CP15) line above.
+    if cp15[0].1 > 0 {
+        kprintln!("  cp15-op top:");
+        for k in 0..PRINT_TOP.min(TOPK) {
+            let (key, c) = cp15[k];
+            if c == 0 { break; }
+            let is_read = ((key >> 13) & 1) != 0;
+            let crn = (key >> 9) & 0xF;
+            let crm = (key >> 5) & 0xF;
+            let opc1 = (key >> 2) & 0x7;
+            let opc2 = key & 0x7;
+            kprintln!(
+                "    {} p15,{},c{},c{},{{{}}} ({}): >={}",
+                if is_read { "MRC" } else { "MCR" },
+                opc1, crn, crm, opc2,
+                describe_cp15(opc1, crn, crm, opc2, is_read),
+                c
+            );
+        }
+    }
+
+    // FP/SIMD PC top — sub-buckets the EC=0x07 line. On Newton each
+    // hit is an MCR p10/p11 native-primitive dispatch site.
+    if fp_simd[0].1 > 0 {
+        kprintln!("  fp-simd PC top (Newton native-primitive sites):");
+        for k in 0..PRINT_TOP.min(TOPK) {
+            let (pc, c) = fp_simd[k];
+            if c == 0 { break; }
+            kprintln!("    PC={:#010x}: >={}", pc, c);
         }
     }
 
@@ -332,5 +460,25 @@ fn region(ipa: u32) -> &'static str {
         0x0F11_0000..=0x0F11_FFFF => "Voyager",
         0x0F18_0000..=0x0F1F_FFFF => "MMIO",
         _ => "other",
+    }
+}
+
+/// Best-effort label for an ARMv7 CP15 op bundle. The 717006 ROM uses
+/// only the 15 tuples enumerated in `probe/FINDINGS.md §16.4`; this
+/// covers the ones `handle_cp15_trap` dispatches on plus a few extras
+/// that the kernel issues but the handler treats as a single group.
+fn describe_cp15(opc1: u32, crn: u32, crm: u32, opc2: u32, is_read: bool) -> &'static str {
+    match (opc1, crn, crm, opc2, is_read) {
+        (0, 1, 0, 0, false) => "SCTLR write",
+        (0, 1, 0, 0, true)  => "SCTLR read",
+        (0, 2, 0, 0, false) => "TTBR0 write",
+        (0, 3, 0, 0, false) => "DACR write",
+        (0, 5, 0, 0, false) => "DFSR write",
+        (0, 6, 0, 0, false) => "DFAR write",
+        (0, 7, _, _, false) => "cache maintenance / DSB",
+        (0, 8, _, _, false) => "TLB invalidate",
+        (0, 12, 0, 0, false) => "VBAR write",
+        (0, 15, 1, 2, false) => "StrongARM clock (one-shot)",
+        _ => "?",
     }
 }

@@ -77,6 +77,86 @@ static REJ_POOL_FULL: AtomicU32 = AtomicU32::new(0);
 static REJ_INSTALL_FAIL: AtomicU32 = AtomicU32::new(0);
 static REJ_DECODE_FAIL: AtomicU32 = AtomicU32::new(0);
 
+// Snapshot from the previous `log_stats` call, for windowed deltas.
+// Single-threaded EL2 access, so plain `static mut` (read-modify-write
+// inside the lone `log_stats` site) is fine.
+struct StatsSnapshot {
+    installed: u32,
+    rejected: u32,
+    rej_not_ldr: u32,
+    rej_operand_pc: u32,
+    rej_writeback: u32,
+    rej_offset_imm: u32,
+    rej_no_dead: u32,
+    rej_outside_rom: u32,
+    rej_pool_full: u32,
+    rej_install_fail: u32,
+    rej_decode_fail: u32,
+}
+static mut LAST_STATS: StatsSnapshot = StatsSnapshot {
+    installed: 0, rejected: 0,
+    rej_not_ldr: 0, rej_operand_pc: 0, rej_writeback: 0,
+    rej_offset_imm: 0, rej_no_dead: 0, rej_outside_rom: 0,
+    rej_pool_full: 0, rej_install_fail: 0, rej_decode_fail: 0,
+};
+
+// Misra-Gries top-K of recently-rejected (no_dead_scratches) PCs. The
+// dominant rejection reason in practice — the kernel emits LDRs at
+// PCs where R0..R3 and R12 are all live at PC+4, so the install
+// picker can't find scratches. Reset every dump so the top-K reflects
+// the current window, not a since-boot accumulation.
+const REJ_TOPK: usize = 16;
+struct RejTopK {
+    keys: [u32; REJ_TOPK],
+    counts: [u32; REJ_TOPK],
+}
+impl RejTopK {
+    const fn new() -> Self {
+        Self { keys: [0; REJ_TOPK], counts: [0; REJ_TOPK] }
+    }
+    fn record(&mut self, key: u32) {
+        for i in 0..REJ_TOPK {
+            if self.counts[i] > 0 && self.keys[i] == key {
+                self.counts[i] = self.counts[i].saturating_add(1);
+                return;
+            }
+        }
+        for i in 0..REJ_TOPK {
+            if self.counts[i] == 0 {
+                self.keys[i] = key;
+                self.counts[i] = 1;
+                return;
+            }
+        }
+        for c in &mut self.counts {
+            *c = c.saturating_sub(1);
+        }
+    }
+    fn snapshot_sorted(&self) -> [(u32, u32); REJ_TOPK] {
+        let mut out = [(0u32, 0u32); REJ_TOPK];
+        for i in 0..REJ_TOPK {
+            out[i] = (self.keys[i], self.counts[i]);
+        }
+        for k in 0..REJ_TOPK {
+            let mut best = k;
+            for j in (k + 1)..REJ_TOPK {
+                if out[j].1 > out[best].1 {
+                    best = j;
+                }
+            }
+            out.swap(k, best);
+        }
+        out
+    }
+    fn reset(&mut self) {
+        for i in 0..REJ_TOPK {
+            self.keys[i] = 0;
+            self.counts[i] = 0;
+        }
+    }
+}
+static mut REJ_NO_DEAD_PCS: RejTopK = RejTopK::new();
+
 /// Detailed-log budget: log every install up to this count, then
 /// summary-only. Matches `unaligned::LOG_FIRST`'s convention.
 const LOG_FIRST_INSTALLS: u32 = 40;
@@ -154,6 +234,11 @@ pub fn try_install_at(faulting_pc: u32) -> bool {
         None => {
             REJ_NO_DEAD_SCRATCHES.fetch_add(1, Ordering::Relaxed);
             STUBS_REJECTED.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: single-threaded; only access site besides the
+            // dump's snapshot+reset is this line.
+            unsafe {
+                (*core::ptr::addr_of_mut!(REJ_NO_DEAD_PCS)).record(faulting_pc);
+            }
             return false;
         }
     };
@@ -339,27 +424,101 @@ fn encode_ea_imm(
     Ok((s0, s1))
 }
 
-/// Public stats dump — useful for diagnosing how the lazy install
-/// converges over a boot.
-#[allow(dead_code)]
+/// Public stats dump — called from `trap_hist::dump_and_reset` every
+/// ~2 s of wall time. Prints the since-boot cumulative `installed=` and
+/// `rejected=` totals on a header line, then a "Δ since last dump" line
+/// for the per-reason counters so the reader can tell at a glance
+/// whether new failures are still piling up or things have plateau'd.
+/// Finally, dumps the top-K guest PCs that hit the `no_dead_scratches`
+/// rejection in this window — the picker can't find two dead scratches
+/// in {R0..R3, R12} for these LDR sites, so they keep paying the EL2
+/// trap on every fire.
 pub fn log_stats() {
     let installed = STUBS_INSTALLED.load(Ordering::Relaxed);
     let rejected = STUBS_REJECTED.load(Ordering::Relaxed);
+    let decode_fail = REJ_DECODE_FAIL.load(Ordering::Relaxed);
+    let not_ldr = REJ_NOT_LDR.load(Ordering::Relaxed);
+    let operand_pc = REJ_OPERAND_PC.load(Ordering::Relaxed);
+    let writeback = REJ_WRITEBACK.load(Ordering::Relaxed);
+    let no_dead = REJ_NO_DEAD_SCRATCHES.load(Ordering::Relaxed);
+    let outside_rom = REJ_OUTSIDE_ROM.load(Ordering::Relaxed);
+    let pool_full = REJ_POOL_FULL.load(Ordering::Relaxed);
+    let install_fail = REJ_INSTALL_FAIL.load(Ordering::Relaxed);
+    let imm_too_big = REJ_OFFSET_IMM_TOO_BIG.load(Ordering::Relaxed);
+
+    // SAFETY: single-threaded EL2 dump, no overlapping caller.
+    let prev = unsafe {
+        let p = core::ptr::addr_of_mut!(LAST_STATS);
+        let snap = StatsSnapshot {
+            installed: (*p).installed,
+            rejected: (*p).rejected,
+            rej_not_ldr: (*p).rej_not_ldr,
+            rej_operand_pc: (*p).rej_operand_pc,
+            rej_writeback: (*p).rej_writeback,
+            rej_offset_imm: (*p).rej_offset_imm,
+            rej_no_dead: (*p).rej_no_dead,
+            rej_outside_rom: (*p).rej_outside_rom,
+            rej_pool_full: (*p).rej_pool_full,
+            rej_install_fail: (*p).rej_install_fail,
+            rej_decode_fail: (*p).rej_decode_fail,
+        };
+        (*p).installed = installed;
+        (*p).rejected = rejected;
+        (*p).rej_not_ldr = not_ldr;
+        (*p).rej_operand_pc = operand_pc;
+        (*p).rej_writeback = writeback;
+        (*p).rej_offset_imm = imm_too_big;
+        (*p).rej_no_dead = no_dead;
+        (*p).rej_outside_rom = outside_rom;
+        (*p).rej_pool_full = pool_full;
+        (*p).rej_install_fail = install_fail;
+        (*p).rej_decode_fail = decode_fail;
+        snap
+    };
+
+    let d_installed = installed.wrapping_sub(prev.installed);
+    let d_rejected = rejected.wrapping_sub(prev.rejected);
+    let d_decode = decode_fail.wrapping_sub(prev.rej_decode_fail);
+    let d_not_ldr = not_ldr.wrapping_sub(prev.rej_not_ldr);
+    let d_operand_pc = operand_pc.wrapping_sub(prev.rej_operand_pc);
+    let d_writeback = writeback.wrapping_sub(prev.rej_writeback);
+    let d_no_dead = no_dead.wrapping_sub(prev.rej_no_dead);
+    let d_outside_rom = outside_rom.wrapping_sub(prev.rej_outside_rom);
+    let d_pool_full = pool_full.wrapping_sub(prev.rej_pool_full);
+    let d_install_fail = install_fail.wrapping_sub(prev.rej_install_fail);
+    let d_imm = imm_too_big.wrapping_sub(prev.rej_offset_imm);
+
     crate::kprintln!(
-        "unaligned_inline: installed={} rejected={} (decode={} not_ldr={} \
-         operand_pc={} writeback={} no_dead_scratches={} outside_rom={} \
-         pool_full={} install_fail={} imm_too_big={})",
-        installed, rejected,
-        REJ_DECODE_FAIL.load(Ordering::Relaxed),
-        REJ_NOT_LDR.load(Ordering::Relaxed),
-        REJ_OPERAND_PC.load(Ordering::Relaxed),
-        REJ_WRITEBACK.load(Ordering::Relaxed),
-        REJ_NO_DEAD_SCRATCHES.load(Ordering::Relaxed),
-        REJ_OUTSIDE_ROM.load(Ordering::Relaxed),
-        REJ_POOL_FULL.load(Ordering::Relaxed),
-        REJ_INSTALL_FAIL.load(Ordering::Relaxed),
-        REJ_OFFSET_IMM_TOO_BIG.load(Ordering::Relaxed),
+        "unaligned_inline: installed={} (+{}) rejected={} (+{}) since boot",
+        installed, d_installed, rejected, d_rejected
     );
+    if d_rejected != 0 {
+        crate::kprintln!(
+            "  Δ window: decode={} not_ldr={} operand_pc={} writeback={} \
+             no_dead_scratches={} outside_rom={} pool_full={} install_fail={} \
+             imm_too_big={}",
+            d_decode, d_not_ldr, d_operand_pc, d_writeback,
+            d_no_dead, d_outside_rom, d_pool_full, d_install_fail, d_imm,
+        );
+    }
+
+    // SAFETY: single-threaded; the only other access to REJ_NO_DEAD_PCS
+    // is the record site in `try_install_at`.
+    let pcs = unsafe {
+        let p = core::ptr::addr_of_mut!(REJ_NO_DEAD_PCS);
+        let snap = (*p).snapshot_sorted();
+        (*p).reset();
+        snap
+    };
+    if pcs[0].1 > 0 {
+        crate::kprintln!("  no_dead_scratches PC top (window):");
+        let print_top = 8.min(REJ_TOPK);
+        for k in 0..print_top {
+            let (pc, c) = pcs[k];
+            if c == 0 { break; }
+            crate::kprintln!("    PC={:#010x}: >={}", pc, c);
+        }
+    }
 }
 
 // =======================================================================

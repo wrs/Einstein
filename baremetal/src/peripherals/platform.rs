@@ -30,12 +30,23 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
     match subfn {
         // No-op, no return value (New).
         0x01 => {}
-        // No-op, r0=0 (Delete, Init, BacklightTrigger, RegisterPowerSwitchInterrupt,
-        // EnableSysPowerInterrupt, InterruptHandler, TimerInterruptHandler,
-        // ResetZAPStoreCheck [returns 0: no ZAP in progress],
-        // PauseSystem, PowerOffAllSubsystems, PowerOnSystem, PowerOffSystem,
-        // TranslatePowerEvent, PowerOnDeviceCheck, SetSubsystemPower,
-        // PowerOnSubsystem, PowerOffSubsystem, GetSubsystemPower).
+        // No-op, r0=0 (per Einstein Emulator/TNativePrimitives.cpp:625-849):
+        //   0x02 Delete, 0x03 Init, 0x04 BacklightTrigger,
+        //   0x05 RegisterPowerSwitchInterrupt, 0x06 EnableSysPowerInterrupt,
+        //   0x07 InterruptHandler, 0x08 TimerInterruptHandler,
+        //   0x09 ResetZAPStoreCheck, 0x0A PowerOnSubsystem,
+        //   0x0B PowerOffSubsystem, 0x0C PowerOffAllSubsystems,
+        //   0x0D PauseSystem, 0x0E PowerOffSystem, 0x0F PowerOnSystem,
+        //   0x10 BacklightOverride, 0x12 RegisterPowerSwitchInterrupt2,
+        //   0x13 TranslatePowerEvent.
+        //
+        // 0x0D (PauseSystem) is the hot one in idle: Einstein calls
+        // `mEmulator->PauseSystem()` which actually halts the emulator
+        // until an interrupt fires (TNativePrimitives.cpp:754). On real
+        // hardware the CPU enters WFI. Our no-op treatment lets the
+        // kernel's idle loop spin at trap-rate (~40 kHz on QEMU TCG)
+        // and is responsible for ≈100% of EC=0x07 (FP/SIMD) traps in
+        // steady state — see `trap-hist`.
         0x02 | 0x03 | 0x04 | 0x05 | 0x06 | 0x07 | 0x08 | 0x09
         | 0x0A | 0x0B | 0x0C | 0x0D | 0x0E | 0x0F
         | 0x10 | 0x12 | 0x13 => {

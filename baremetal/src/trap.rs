@@ -4396,6 +4396,7 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
 
     crate::trap_hist::record_cp15(
         crate::trap_hist::cp15_key(opc1, crn, crm, opc2, is_read),
+        read_sysreg!("elr_el2") as u32,
     );
 
     // Budget-limited CP15 logging for bring-up diagnostics. Prints only the

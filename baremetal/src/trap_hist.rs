@@ -163,6 +163,7 @@ impl TopK {
 static mut DABT_PC: TopK = TopK::new();
 static mut DABT_IPA: TopK = TopK::new();
 static mut CP15_OP: TopK = TopK::new();
+static mut CP15_PC: TopK = TopK::new();
 static mut FP_SIMD_PC: TopK = TopK::new();
 
 /// Record a data abort by `(guest PC, IPA)`. Called from
@@ -190,10 +191,13 @@ pub fn cp15_key(opc1: u32, crn: u32, crm: u32, opc2: u32, is_read: bool) -> u32 
 
 /// Record a CP15 trap by its op bundle. Called from `handle_cp15_trap`
 /// after the ISS decode.
-pub fn record_cp15(key: u32) {
+pub fn record_cp15(key: u32, elr_pc: u32) {
     if !is_warm() { return; }
     // SAFETY: single-threaded.
-    unsafe { (*addr_of_mut!(CP15_OP)).record(key); }
+    unsafe {
+        (*addr_of_mut!(CP15_OP)).record(key);
+        (*addr_of_mut!(CP15_PC)).record(elr_pc);
+    }
 }
 
 /// Record an FP/SIMD trap by its faulting guest PC. Called from
@@ -246,6 +250,12 @@ pub fn dump_and_reset() {
     };
     let cp15 = unsafe {
         let p = addr_of_mut!(CP15_OP);
+        let s = (*p).snapshot_sorted();
+        (*p).reset();
+        s
+    };
+    let cp15_pc = unsafe {
+        let p = addr_of_mut!(CP15_PC);
         let s = (*p).snapshot_sorted();
         (*p).reset();
         s
@@ -362,6 +372,17 @@ pub fn dump_and_reset() {
                 describe_cp15(opc1, crn, crm, opc2, is_read),
                 c
             );
+        }
+    }
+
+    // CP15 PC top — companion to cp15-op above. Tells us which call
+    // sites are issuing the dominant op.
+    if cp15_pc[0].1 > 0 {
+        kprintln!("  cp15-pc top:");
+        for k in 0..PRINT_TOP.min(TOPK) {
+            let (pc, c) = cp15_pc[k];
+            if c == 0 { break; }
+            kprintln!("    PC={:#010x}: >={}", pc, c);
         }
     }
 

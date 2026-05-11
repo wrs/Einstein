@@ -337,8 +337,11 @@ git log for the bne→bgt→bgt+success-track history.)
 
 - **Snapshot ring** — 4 slots at `/tmp/newton-snapshot-{0..3}.bin`,
   autosaved every 2 s from `trap_irq`.
-- **Framebuffer PNG dumps** — `/tmp/newton-fb/NNNNN.png` after
-  `screen::blit`.
+- **Live display + pen input** — `src/host_io/` forwards each
+  `screen::blit` to a companion viewer at `tools/host-viewer/`
+  via `/tmp/newton-host-io/` (semihosting files); the viewer posts
+  mouse events back as Newton pen samples. Enabled via
+  `--features host-io-semihost`.
 
 ### Debugging
 

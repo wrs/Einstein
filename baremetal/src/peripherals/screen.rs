@@ -23,7 +23,14 @@
 //! happens with the Newton kernel's MMU mapping RAM identity-first;
 //! that holds for the guest-tests and for Einstein's own captures.
 //! Post-MMU ROM boots that set up a non-identity map will need an
-//! `AT S12E1R` translation step here — Phase B when it fires.
+//! `AT S12E1R` translation step here.
+//!
+//! The MP2x00 main display panel is 320x480, 2 bpp packed (4 pixels
+//! per byte, MSB-first; pixel 0 in bits 7..6, pixel 1 in bits 5..4,
+//! …). Pixel values map to grays: 00 = white, 11 = black, with two
+//! intermediate levels. We carry the pixels verbatim into GUEST_FB —
+//! no inversion — and `host_io::push_blit` forwards each blit to a
+//! live host viewer for display.
 
 use crate::{cpu, guest_mem, kprintln, trap::TrapContext};
 
@@ -89,10 +96,13 @@ fn get_feature(ctx: &mut TrapContext) {
 /// Geometry advertised to the guest on GetScreenInfo. The values
 /// aren't hot-path: the Newton's screen bring-up just uses them to
 /// size its framebuffer bookkeeping. Matches Einstein's reply for
-/// a 320x480 / 1 bpp MP2x00 panel (TScreenManager::kBitsPerPixel).
-const SCREEN_WIDTH: u32 = 320;
-const SCREEN_HEIGHT: u32 = 480;
-const SCREEN_BPP: u32 = 1;
+/// a 320x480 / 2 bpp MP2x00 panel (TScreenManager::kBitsPerPixel).
+pub const SCREEN_WIDTH: u32 = 320;
+pub const SCREEN_HEIGHT: u32 = 480;
+pub const SCREEN_BPP: u32 = 2;
+/// Bytes per packed scanline of the on-screen framebuffer.
+/// 320 * 2 / 8 = 80.
+pub const FB_ROW_BYTES: u32 = (SCREEN_WIDTH * SCREEN_BPP) / 8;
 
 fn get_screen_info(ctx: &mut TrapContext, pc: u32) {
     let info_addr = ctx.x[1] as u32;
@@ -146,11 +156,11 @@ fn get_screen_info(ctx: &mut TrapContext, pc: u32) {
 ///   +0x14  table
 ///
 /// We copy the row band [src.top, src.bottom) of the pixmap into
-/// GUEST_FB. For 1-bpp Newton panels, rowBytes already encodes the
-/// pixel-to-byte packing, so a byte-wise copy is correct (we don't
-/// model bit-aligned masking like Einstein's `Blit_0` because the
-/// Newton ROM aligns its src rects to byte boundaries on a 320-px
-/// 1-bpp panel — `srcLeft` always lands on a multiple of 8).
+/// GUEST_FB. `rowBytes` already encodes the pixel-to-byte packing
+/// (4 px/byte on a 2 bpp panel), so a byte-wise copy is correct
+/// when `src.left` lands on a multiple of 4 px; sub-byte source
+/// rects (text glyphs, narrow icons) fall to a slow per-pixel
+/// path.
 fn blit(ctx: &mut TrapContext, pc: u32) {
     let pixmap_va = ctx.x[1] as u32;
     let src_rect_va = ctx.x[2] as u32;
@@ -205,8 +215,8 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
         src_top, src_left, src_bottom, src_right,
         dst_top, dst_left, dst_bottom, dst_right);
 
-    // 1-bpp packing: each byte holds 8 pixels. Src starts at
-    // addy + (pixmap_src_top * rowBytes) + (pixmap_src_left / 8).
+    // 2 bpp packing: each byte holds 4 pixels (pixel 0 in bits 7..6,
+    // pixel 1 in 5..4, pixel 2 in 3..2, pixel 3 in 1..0).
     //
     // BE-32 word-invariant byte access: the Newton kernel writes
     // pixmap data as BE-32, so logical byte N at PA `p` lives at
@@ -216,29 +226,68 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
     // hypervisor-managed linear-LE — host byte N is pixel byte N in
     // display order — so FB writes don't XOR.
     let src_width_pixels = (src_right - src_left) as u32;
-    let fb_row_bytes = (SCREEN_WIDTH * SCREEN_BPP) / 8;
+    let fb_row_bytes = FB_ROW_BYTES;
 
+    // Blit mode (Einstein `Emulator/Screen/TScreenManager.cpp:280`):
+    //   0 = srcCopy (default).
+    //   1 = "darken only" / pen overlay — final = max(src, dst) per
+    //       pixel under our "0=white .. 3=black" convention. Used to
+    //       draw ink over existing content without erasing surrounding
+    //       pixels. Any glyph blit issued with mode=1 that we treated
+    //       as srcCopy clears the rect around the ink.
+    // Anything else falls back to srcCopy with a log.
+    let mode = ctx_blit_mode(ctx);
+    if mode != 0 && mode != 1 {
+        kprintln!("screen.blit: unrecognised mode {} @PC={:#x} — treating as srcCopy", mode, pc);
+    }
+
+    // 4 pixels per byte → alignment unit is 4. The fast path does
+    // byte-granular GUEST_FB writes, which requires BOTH source and
+    // destination to land on a 4-pixel boundary; otherwise we'd
+    // corrupt pixels left of `dst_left` (or right of dst_left+width-1).
+    // Mode 1 also forces the slow path because it needs per-pixel
+    // dst read for the max() operation.
     let byte_aligned =
-        (pixmap_src_left & 0x7) == 0 && (src_width_pixels & 0x7) == 0;
+        mode == 0
+        && (pixmap_src_left & 0x3) == 0
+        && (src_width_pixels & 0x3) == 0
+        && (dst_left & 0x3) == 0;
+
+    // Scratch buffer used to assemble the contiguous 2-bpp payload that
+    // gets forwarded to the host viewer at the end. Sized for the
+    // worst case (full-screen redraw). Single-threaded EL2 access, no
+    // contention.
+    const SCRATCH_LEN: usize = (SCREEN_WIDTH * SCREEN_HEIGHT / 4) as usize;
+    struct ScratchCell(core::cell::UnsafeCell<[u8; SCRATCH_LEN]>);
+    // SAFETY: single-threaded EL2 trap handler.
+    unsafe impl Sync for ScratchCell {}
+    static SCRATCH: ScratchCell = ScratchCell(core::cell::UnsafeCell::new([0; SCRATCH_LEN]));
+    // SAFETY: see ScratchCell.
+    let scratch = unsafe { &mut *SCRATCH.0.get() };
+
+    let payload_row_bytes = (src_width_pixels * SCREEN_BPP).div_ceil(8) as usize;
+    let payload_len = payload_row_bytes * height as usize;
+    if payload_len > scratch.len() {
+        kprintln!(
+            "*** screen.blit: payload {} bytes exceeds scratch {}",
+            payload_len, scratch.len()
+        );
+        cpu::halt();
+    }
+    // Clear only the bytes we may touch via OR in the slow path.
+    for b in &mut scratch[..payload_len] { *b = 0; }
 
     if !byte_aligned {
-        // Non-byte-aligned blit (Newton UI passes sub-byte rects for
-        // text glyphs and small graphics). Per-pixel read/inverted-
-        // write: read source bit, write into the dst byte's matching
-        // bit position. Slow vs Einstein's word-mask Blit_0, but we
-        // run this only on cold-boot UI rendering — correctness is
-        // the priority here, not throughput.
-        let mut copied = 0u32;
+        // Sub-byte rect (Newton UI passes 1-pixel-aligned glyph blits).
+        // Per-pixel read/write: extract 2 bits from src, place at the
+        // matching 2-bit position in the dst byte. Slow vs Einstein's
+        // word-mask Blit_0 but we hit this rarely.
         for row in 0..height {
             let src_row_pa_off = (pixmap_src_top as u32 + row) * row_bytes;
             for col_pix in 0..src_width_pixels {
                 let abs_src_pix = pixmap_src_left as u32 + col_pix;
-                let src_va = addy + src_row_pa_off + abs_src_pix / 8;
+                let src_va = addy + src_row_pa_off + abs_src_pix / 4;
                 let src_pa = guest_mem::translate_va(src_va).unwrap_or(src_va);
-                // Read the kernel's logical byte at this PA. The XOR-3
-                // byte-lane transform is applied internally by
-                // `guest_endian::guest_read_u8_pa` (see top-of-blit
-                // comment).
                 let byte = match crate::guest_endian::guest_read_u8_pa(src_pa) {
                     Some(b) => b,
                     None => {
@@ -249,24 +298,36 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
                         cpu::halt();
                     }
                 };
-                // Newton 1-bpp bit ordering within the (now logical)
-                // byte: pixel 0 is bit 7 (MSB). Extract this column's
-                // bit, then INVERT (Newton's 1=pen-pressed → host FB
-                // 1=white).
-                let src_bit = (byte >> (7 - (abs_src_pix & 7))) & 1;
-                let fb_bit = src_bit ^ 1;
+                let src_shift = 6 - 2 * (abs_src_pix & 3) as u8;
+                let src_2bit = (byte >> src_shift) & 0x3;
 
+                // Read current dst pixel (needed for mode 1 max()).
                 let dst_pix = dst_left as u32 + col_pix;
-                let fb_off = (dst_top as u32 + row) * fb_row_bytes + dst_pix / 8;
+                let fb_off = (dst_top as u32 + row) * fb_row_bytes + dst_pix / 4;
                 let fb_ipa = guest_mem::FB_IPA_BASE.wrapping_add(fb_off);
                 let mut fb_byte = guest_mem::read_byte_pa(fb_ipa).unwrap_or(0);
-                let bit_pos = 7 - (dst_pix & 7) as u8;
-                let bit_mask = 1u8 << bit_pos;
-                if fb_bit != 0 {
-                    fb_byte |= bit_mask;
-                } else {
-                    fb_byte &= !bit_mask;
-                }
+                let dst_shift = 6 - 2 * (dst_pix & 3) as u8;
+                let dst_mask = 0x3u8 << dst_shift;
+                let cur_dst_2bit = (fb_byte >> dst_shift) & 0x3;
+
+                // Combine per blit mode.
+                let final_2bit = match mode {
+                    1 => src_2bit.max(cur_dst_2bit),
+                    _ => src_2bit,
+                };
+
+                // Write final pixel into payload scratch (replaces, not
+                // ORs — so mode-1 "no change" pixels carry the existing
+                // dst value through to the host viewer).
+                let pay_off =
+                    row as usize * payload_row_bytes + (col_pix / 4) as usize;
+                let pay_shift = 6 - 2 * (col_pix & 3) as u8;
+                let pay_mask = 0x3u8 << pay_shift;
+                scratch[pay_off] = (scratch[pay_off] & !pay_mask)
+                    | (final_2bit << pay_shift);
+
+                // Write final pixel into GUEST_FB.
+                fb_byte = (fb_byte & !dst_mask) | (final_2bit << dst_shift);
                 if !guest_mem::write_byte_pa(fb_ipa, fb_byte) {
                     kprintln!(
                         "*** screen.blit: FB IPA {:#x} outside framebuffer",
@@ -274,25 +335,30 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
                     );
                     cpu::halt();
                 }
-                copied += 1;
             }
         }
         log_blit(pc, addy, row_bytes, height,
             src_top, src_left, src_bottom, src_right,
             dst_top, dst_left, dst_bottom, dst_right,
-            copied);
-        crate::fb_dump::mark_dirty();
+            src_width_pixels * height);
+        push_blit_event(
+            ctx_blit_mode(ctx),
+            src_top, src_left, src_bottom, src_right,
+            dst_top, dst_left, dst_bottom, dst_right,
+            payload_row_bytes as u16, &scratch[..payload_len],
+        );
         ctx.x[0] = 0;
         return;
     }
 
     // Byte-aligned fast path.
-    let src_col0_byte = (pixmap_src_left / 8) as u32;
-    let src_width_bytes = src_width_pixels / 8;
+    let src_col0_byte = pixmap_src_left as u32 / 4;
+    let src_width_bytes = src_width_pixels / 4;
 
     let mut copied = 0u32;
     for row in 0..height {
         let src_row = addy + (pixmap_src_top as u32 + row) * row_bytes + src_col0_byte;
+        let pay_row_off = row as usize * payload_row_bytes;
         for col in 0..src_width_bytes {
             let src_va = src_row + col;
             // src_va is a guest VA when stage-1 is on (post-MMU
@@ -301,10 +367,6 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
             // returns None in the MMU-off case; fall back to identity
             // so guest-tests' MMU-off paths still work.
             let src_pa = guest_mem::translate_va(src_va).unwrap_or(src_va);
-            // Read the kernel's logical byte at this PA. The XOR-3
-            // byte-lane transform is applied internally by
-            // `guest_endian::guest_read_u8_pa` (see top-of-blit
-            // comment).
             let byte = match crate::guest_endian::guest_read_u8_pa(src_pa) {
                 Some(b) => b,
                 None => {
@@ -315,16 +377,13 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
                     cpu::halt();
                 }
             };
-            // Newton 1-bpp pixmaps are stored INVERTED (1 = white,
-            // 0 = black) relative to the host framebuffer convention
-            // we use; Einstein's Blit_0 flips with `~chunk` for
-            // srcCopy mode. Mirror that here so the FB dumps look
-            // right.
-            let fb_byte = !byte;
+            // Stash into payload scratch for the host-viewer push.
+            scratch[pay_row_off + col as usize] = byte;
+            // Mirror into GUEST_FB.
             let fb_off = (dst_top as u32 + row) * fb_row_bytes
-                + ((dst_left as u32) / 8) + col;
+                + ((dst_left as u32) / 4) + col;
             let fb_ipa = guest_mem::FB_IPA_BASE.wrapping_add(fb_off);
-            if !guest_mem::write_byte_pa(fb_ipa, fb_byte) {
+            if !guest_mem::write_byte_pa(fb_ipa, byte) {
                 kprintln!(
                     "*** screen.blit: FB IPA {:#x} outside framebuffer",
                     fb_ipa
@@ -340,9 +399,48 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
         dst_top, dst_left, dst_bottom, dst_right,
         copied);
 
-    crate::fb_dump::mark_dirty();
+    push_blit_event(
+        ctx_blit_mode(ctx),
+        src_top, src_left, src_bottom, src_right,
+        dst_top, dst_left, dst_bottom, dst_right,
+        payload_row_bytes as u16, &scratch[..payload_len],
+    );
 
     ctx.x[0] = 0;
+}
+
+/// Source the blit mode from the guest stack slot [SP+4] per the
+/// native-primitive ABI. Returns 0 if the read fails — the host
+/// viewer treats unknown modes as `srcCopy`.
+fn ctx_blit_mode(ctx: &TrapContext) -> u8 {
+    // r13 is at ctx.x[13] in AArch32 user/svc context; the mode word
+    // lives at [SP+4] (caller pushed the 4th arg there).
+    let sp = ctx.x[13] as u32;
+    let mode_va = sp.wrapping_add(4);
+    let mode_pa = guest_mem::translate_va(mode_va).unwrap_or(mode_va);
+    crate::guest_endian::guest_read_u32_pa(mode_pa)
+        .map(|w| w as u8)
+        .unwrap_or(0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_blit_event(
+    mode: u8,
+    src_top: u16, src_left: u16, src_bottom: u16, src_right: u16,
+    dst_top: u16, dst_left: u16, dst_bottom: u16, dst_right: u16,
+    row_bytes: u16, payload: &[u8],
+) {
+    let ev = crate::host_io::BlitEvent {
+        kind: crate::host_io::BLIT_KIND_BLIT,
+        mode,
+        bpp: SCREEN_BPP as u8,
+        _pad: 0,
+        src_left, src_top, src_right, src_bottom,
+        dst_left, dst_top, dst_right, dst_bottom,
+        row_bytes,
+        payload_len: payload.len() as u16,
+    };
+    crate::host_io::push_blit(&ev, payload);
 }
 
 fn read_word_or_halt(va: u32, what: &str, pc: u32) -> u32 {

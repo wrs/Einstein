@@ -134,10 +134,47 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         0x11 | 0x12 | 0x13 | 0x14 | 0x15 => {
             ctx.x[0] = 0;
         }
-        // NativeGetSample — r0 = 0 (no sample available; we don't write
-        // to *r1 / *r2 in that case).
+        // NativeGetSample — drain one sample from the host-IO pen
+        // queue. Per Einstein TNativePrimitives.cpp:2012-2015:
+        //   r0 = 1 (got sample) → *r1 = packed sample word,
+        //                         *r2 = sample time in Newton ticks.
+        //   r0 = 0 (queue empty) — leave *r1 / *r2 alone.
         0x16 => {
-            ctx.x[0] = 0;
+            // Budget-limited entry log so we can confirm the guest is
+            // actually polling NativeGetSample at all.
+            {
+                use core::sync::atomic::{AtomicUsize, Ordering};
+                static N: AtomicUsize = AtomicUsize::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                if n < 8 {
+                    kprintln!("tablet.NativeGetSample call #{} @PC={:#x}", n, pc);
+                }
+            }
+            match crate::host_io::pop_pen_sample() {
+                Some((sample, ticks)) => {
+                    let r1 = ctx.x[1] as u32;
+                    let r2 = ctx.x[2] as u32;
+                    if !write_guest_word(r1, sample) {
+                        halt_io("NativeGetSample.sample", r1, pc);
+                    }
+                    if !write_guest_word(r2, ticks) {
+                        halt_io("NativeGetSample.ticks", r2, pc);
+                    }
+                    ctx.x[0] = 1;
+                    use core::sync::atomic::{AtomicUsize, Ordering};
+                    static N: AtomicUsize = AtomicUsize::new(0);
+                    let n = N.fetch_add(1, Ordering::Relaxed);
+                    if n < 16 {
+                        kprintln!(
+                            "tablet: returned sample={:#010x} ticks={:#x}",
+                            sample, ticks
+                        );
+                    }
+                }
+                None => {
+                    ctx.x[0] = 0;
+                }
+            }
         }
         _ => {
             kprintln!(

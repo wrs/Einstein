@@ -10,13 +10,13 @@
 @                                            // HIGH 16 bits per
 @                                            // TScreenManager::Blit
 @                                            // (`srcRowBytes >> 16`).
-@     bounds = {0, 0, 2, 32}  // 2 rows x 32 pixels (1 bpp)
+@     bounds = {0, 0, 2, 16}  // 2 rows x 16 pixels (2 bpp = 32 bits = 4 bytes)
 @     flags = 0,
 @     table = 0,
 @   }
 @   bitmap data @ 0x04021000: 8 bytes { 0xDE 0xAD 0xBE 0xEF 0xCA 0xFE 0xBA 0xBE }
-@   srcRect @ 0x04030000 = {0, 0, 2, 32}
-@   dstRect @ 0x04030010 = {0, 0, 2, 32}
+@   srcRect @ 0x04030000 = {0, 0, 2, 16}
+@   dstRect @ 0x04030010 = {0, 0, 2, 16}
 @
 @ Issue the blit via `.inst 0xEE003A10` (MCR p10,0,r3,c0,c0,0) with
 @ r0 = 0x0000_0407 (driver=4 screen, subfn=7 blit), r1 = pixmap VA,
@@ -33,11 +33,11 @@
 @ so the native code lives in r5 and r1/r2/r3 keep their blit meaning.
 @
 @ After the call, read FB. The hypervisor's blit:
-@   - inverts each source byte (Newton 1-bpp convention vs host FB),
-@   - lays rows out in FB at stride SCREEN_WIDTH/8 = 40 bytes/row
+@   - carries source bytes verbatim (no inversion),
+@   - lays rows out in FB at stride SCREEN_WIDTH*2/8 = 80 bytes/row
 @     (NOT the source rowBytes).
-@ So row 0 (4 src bytes) lands at FB[0..4], row 1 lands at FB[40..44],
-@ and each byte is the bitwise NOT of the planted source byte.
+@ So row 0 (4 src bytes) lands at FB[0..4], row 1 lands at FB[80..84],
+@ with each byte preserved unchanged.
 
 #include "common/test_runtime.S"
 
@@ -62,14 +62,14 @@ test_main:
     lsl     r0, r0, #16
     str     r0, [r6, #0x04]          @ rowBytes_packed = (4<<16)
 
-    @ bounds = {top=0, left=0, bottom=2, right=32}.
+    @ bounds = {top=0, left=0, bottom=2, right=16}.
     @ Word 0 = (top<<16) | left = 0
     mov     r0, #0
     str     r0, [r6, #0x08]
-    @ Word 1 = (bottom<<16) | right = (2<<16)|32
+    @ Word 1 = (bottom<<16) | right = (2<<16)|16
     mov     r0, #2
     lsl     r0, r0, #16
-    orr     r0, r0, #32
+    orr     r0, r0, #16
     str     r0, [r6, #0x0C]
     mov     r0, #0
     str     r0, [r6, #0x10]          @ flags
@@ -95,7 +95,7 @@ test_main:
     str     r0, [r6, #0]
     mov     r0, #2
     lsl     r0, r0, #16
-    orr     r0, r0, #32
+    orr     r0, r0, #16
     str     r0, [r6, #4]
 
     ldr     r6, =DST_RECT_VA
@@ -103,7 +103,7 @@ test_main:
     str     r0, [r6, #0]
     mov     r0, #2
     lsl     r0, r0, #16
-    orr     r0, r0, #32
+    orr     r0, r0, #16
     str     r0, [r6, #4]
 
     @ ---- Issue the blit ----
@@ -121,18 +121,17 @@ test_main:
     hvc     #HVC_MARK                       @ mark 1: blit returned success
 
     @ ---- Verify FB bytes ----
-    @ Source row 0 = DE AD BE EF (LE word 0xEFBEADDE).
-    @ After `~byte` inversion: 21 52 41 10 (LE word 0x10415221).
+    @ Source row 0 = DE AD BE EF, copied verbatim, host LE word 0xEFBEADDE.
     ldr     r6, =FB_VA
     ldr     r0, [r6, #0]
-    ldr     r1, =0x10415221
+    ldr     r1, =0xEFBEADDE
     cmp     r0, r1
     bne     .Lfail_fb0
 
-    @ Source row 1 = CA FE BA BE (LE word 0xBEBAFECA), inverted = 35 01 45 41.
-    @ FB stride is SCREEN_WIDTH/8 = 40 bytes, so row 1 lives at +40, not +4.
-    ldr     r0, [r6, #40]
-    ldr     r1, =0x41450135
+    @ Source row 1 = CA FE BA BE, copied verbatim, host LE word 0xBEBAFECA.
+    @ FB stride is SCREEN_WIDTH*2/8 = 80 bytes, so row 1 lives at +80.
+    ldr     r0, [r6, #80]
+    ldr     r1, =0xBEBAFECA
     cmp     r0, r1
     bne     .Lfail_fb1
 

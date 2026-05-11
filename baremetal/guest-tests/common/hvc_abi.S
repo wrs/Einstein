@@ -19,3 +19,4 @@
     .equ HVC_SNAPSHOT,          0x18
     .equ HVC_DEBUG_STR,         0x19
     .equ HVC_DEBUGGER,          0x1A
+    .equ HVC_INJECT_PEN,        0x1B

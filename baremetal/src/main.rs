@@ -8,7 +8,6 @@ use core::arch::global_asm;
 mod alrt_capture;
 mod banked;
 mod cpu;
-mod fb_dump;
 mod g1_capture;
 mod guest;
 mod guest_bp;
@@ -16,6 +15,7 @@ mod guest_endian;
 mod guest_mem;
 mod heap_check;
 mod heap_watch;
+mod host_io;
 mod hvc_imm;
 mod mmio;
 mod mmu;
@@ -109,6 +109,7 @@ pub extern "C" fn kmain() -> ! {
 
     peripherals::vic::init();
     timer::init();
+    host_io::init();
 
     // Seed the snapshot ring's sequence counter from existing slots
     // (so resumed runs don't reuse seq numbers), then attempt to
@@ -118,6 +119,7 @@ pub extern "C" fn kmain() -> ! {
     if let Some(state) = snapshot::load_latest() {
         kprintln!();
         kprintln!("Resuming guest from snapshot at PC={:#x}", state.pc);
+        host_io::on_resume();
         // SAFETY: snapshot::load already restored EL1 sysregs; we
         // configure EL2 traps and ERET to the saved PC.
         unsafe { guest::eret_to_restored(state); }

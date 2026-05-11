@@ -185,8 +185,8 @@ plus Einstein cross-references.
 - **Native primitives** (`native_primitives.rs`) — CP10/CP11
   gateway routing screen / battery / tablet / sound / printer /
   network / host-call / in/out-translator.
-- **Screen** (`screen.rs`) — Blit intercept + framebuffer PNG
-  dumps via `fb_dump.rs`.
+- **Screen** (`screen.rs`) — Blit intercept; each blit is forwarded
+  through `host_io` to a paired host viewer for live display.
 - **Battery / tablet / sound / printer / network / platform**
   (`battery.rs`, `tablet.rs`, `sound.rs`, `printer.rs`,
   `network.rs`, `platform.rs`) — minimal stubs sufficient for

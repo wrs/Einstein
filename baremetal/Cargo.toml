@@ -10,7 +10,7 @@ name = "newton-hypervisor"
 path = "src/main.rs"
 
 [features]
-default = ["platform-raspi3b"]
+default = ["platform-raspi3b", "host-io-null"]
 
 # Host-platform selection. Exactly one must be enabled; build.rs panics
 # otherwise. Controls UART/GIC addresses, MMU memory map, load address
@@ -18,6 +18,22 @@ default = ["platform-raspi3b"]
 # guest ISA and the guest's simulated Newton hardware are unaffected.
 platform-raspi3b = []
 platform-fvp-base = []
+
+# Host display + tablet-input backend selection. Exactly one must be
+# enabled; build.rs panics otherwise. See `src/host_io/mod.rs`.
+#
+#   host-io-null     — no display sink, no input source. Default;
+#                      used by guest-tests and CI runs.
+#   host-io-semihost — forward blits to `/tmp/newton-host-io/out`,
+#                      drain pen events from `/tmp/newton-host-io/in`
+#                      via Arm semihosting. Paired with the
+#                      `tools/host-viewer` Rust crate. Use for
+#                      interactive QEMU / FVP sessions.
+#   host-io-pico     — reserved for a future Pico 2 W backend that
+#                      drives a real LCD + touch controller.
+host-io-null = []
+host-io-semihost = []
+host-io-pico = []
 
 # Function-level execution trace. When enabled, build.rs parses
 # ../_Data_/unified_symbols.tsv and embeds a compact address + name

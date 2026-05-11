@@ -1,0 +1,21 @@
+[package]
+name = "host-viewer"
+version = "0.0.1"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "Live display + mouse input bridge for the Newton hypervisor's host-io-semihost backend."
+
+# Standalone — keep out of the no_std hypervisor's workspace.
+[workspace]
+
+[[bin]]
+name = "host-viewer"
+path = "src/main.rs"
+
+[dependencies]
+softbuffer = "0.4"
+winit = "0.30"
+
+[profile.release]
+lto = true
+codegen-units = 1

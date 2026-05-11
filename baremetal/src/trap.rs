@@ -143,7 +143,7 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
     #[cfg(not(feature = "trace"))]
     let is_trace_hvc = false;
 
-    static mut TRAP_LOG_BUDGET: usize = 500;
+    static mut TRAP_LOG_BUDGET: usize = 5;
     // SAFETY: single-threaded; only core 0 services EL2 traps.
     let should_log = !is_trace_hvc
         && unsafe {
@@ -179,6 +179,12 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
             cpu::halt();
         }
     }
+
+    // Drain any pen events from the host viewer before update_virq,
+    // so a freshly raised INT_TABLET gets reflected into HCR_EL2.VI
+    // on this trap exit instead of waiting for the next CNTHP
+    // heartbeat. Cheap: backend self-throttles to 16 ms wall.
+    crate::host_io::pump_input();
 
     // Guest MMIO writes to IntCtrl / FIQMask / IntClear change the
     // effective (`int_present & int_ctrl & ~fiq_mask`) pending set and
@@ -382,6 +388,11 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     // Pump host PL011 -> guest extr-port RX DMA buffer. No-op when
     // DMA ch0 is not armed. See peripherals/dma.rs::poll_rx.
     crate::peripherals::dma::poll_rx();
+    // Pump the host-io backend: drain any pen events the viewer
+    // posted, enqueue them, and raise INT_TABLET. Must run BEFORE
+    // update_virq so the IRQ it raises lands in HCR_EL2.VI on this
+    // trap exit, not the next one.
+    crate::host_io::pump_input();
     update_virq();
     // Wall-clock-paced snapshot save. Timer IRQ is a cleaner hook
     // than sync traps: it fires regardless of whether the guest is
@@ -389,7 +400,6 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     // into the ring even when the guest is wedged. See
     // src/snapshot.rs.
     crate::snapshot::maybe_autosave(ctx);
-    crate::fb_dump::maybe_dump();
 
     // iter-59 diagnostic: every ~2 s of wall, print HVC-tag counters
     // so we can see whether the residual trap rate is byte-access
@@ -1163,6 +1173,14 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
                 );
             }
             return;
+        }
+        v if v == HvcImm::GuestInjectPen as u32 => {
+            // r0 = packed sample word, r1 = ticks. Enqueue directly,
+            // bypassing the backend (which would otherwise insert
+            // pen-down/up edge markers based on its own state).
+            let sample = ctx.x[0] as u32;
+            let ticks = ctx.x[1] as u32;
+            crate::host_io::queue::enqueue_pen_sample(sample, ticks);
         }
         v if v == HvcImm::Snapshot as u32 => {
             // Save snapshot — see src/snapshot.rs. ctx.x[0..30] is

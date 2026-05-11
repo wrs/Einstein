@@ -66,6 +66,13 @@ pub enum HvcImm {
     /// `Debugger` ROM-patch trap (logs site, no host debugger).
     /// (`HVC_DEBUGGER`)
     Debugger,
+    /// Inject a host-side pen sample directly into `host_io::queue`,
+    /// bypassing the backend's input transport. r0 = packed sample
+    /// word (Einstein format), r1 = sample time in Newton ticks.
+    /// Used by `test_tablet.S` to verify the queue + IRQ-raise +
+    /// `NativeGetSample` drain path without needing a paired viewer.
+    /// (`HVC_INJECT_PEN`)
+    GuestInjectPen,
 
     // ---- Hypervisor-internal HVCs (auto-incremented) --------------
     //

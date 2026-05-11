@@ -15,12 +15,12 @@ cross-references) in [`docs/peripherals.md`](docs/peripherals.md).
   and the Newton kernel reaches steady-state operation.
 - The Newton kernel finishes initialisation: 26 tasks running, the
   NewtonScript interpreter (`TInterpreter::Run`) is actively
-  executing bytecode, and the framebuffer dump
-  (`/tmp/newton-fb/NNNNN.png`) shows the "Welcome" tour intro with
-  the "Internal store was erased" first-boot dialog.
+  executing bytecode, and the live host viewer (`tools/host-viewer/`,
+  built with `--features host-io-semihost`) renders the "Welcome"
+  tour intro and the "Internal store was erased" first-boot dialog.
 - Boot ends on the host-side timeout with the system parked in the
-  idle task waiting on stylus / port-message input we don't yet
-  inject.
+  idle task waiting on stylus input — which the viewer now injects
+  as the user clicks.
 - 35-ish guest tests exercise the handler surface in isolation; all
   green on both QEMU and FVP modulo two pre-existing failures
   (`test_gpio`, `test_flash`).
@@ -81,9 +81,13 @@ What's working end-to-end:
   call. Variant `trace_once` gates the line on a per-function
   fired-bitmap if you want first-touch only. Used end-to-end to
   bisect boot stalls against Einstein.
-- **Framebuffer PNG dumps.** `src/fb_dump.rs` writes
-  `/tmp/newton-fb/NNNNN.png` after each `screen::blit`, so visual
-  regressions are observable without booting on real hardware.
+- **Live display + pen input.** Each `screen::blit` is forwarded
+  through `src/host_io/` to a companion viewer at
+  `tools/host-viewer/`, which opens a window via softbuffer + winit,
+  applies the blit stream to its own 320×480 2 bpp backing store, and
+  posts mouse events back as Newton pen samples. Selected with
+  `--features host-io-semihost`; the default `host-io-null` backend
+  is a no-op (used by guest-tests and CI).
 - **Guest-test tier** under `guest-tests/` — 36 small AArch32
   binaries against a shared runtime, with an HVC protocol for
   pass/fail/print. Cover every handler (CP15, VIC, DMA, flash,
@@ -141,6 +145,70 @@ FVP runs the timer and cache model accurately, so wall-clock is much
 slower than QEMU TCG — use longer timeouts. Add `--gdb` for an Iris
 debug server on host port 7100; add `--features trace` for the
 function-level tracer. See the comments at the top of `scripts/fvp`.
+
+### Live display + pen input
+
+By default the hypervisor builds with the `host-io-null` backend:
+blits are computed but not forwarded, and pen input is always
+"no sample". To get a real window with mouse-driven pen events,
+build the hypervisor with `host-io-semihost` and run the companion
+viewer in `tools/host-viewer/` in a second terminal.
+
+**One-time setup** — the viewer pulls `softbuffer` + `winit` from
+crates.io, so you need network on first build:
+
+```
+( cd tools/host-viewer && cargo build --release )
+```
+
+**Each session**, two terminals:
+
+```
+# term 1 — hypervisor with the semihost backend.
+# Always cold-boot the first time you switch in/out of semihost;
+# old snapshots from the host-io-null build are version-tagged
+# and will be rejected, but cleaning explicitly makes the first
+# boot faster.
+cd /path/to/baremetal
+rm -f /tmp/newton-snapshot-*.bin
+cargo run --release --no-default-features \
+    --features 'platform-raspi3b host-io-semihost'
+
+# term 2 — companion viewer. Start it after term 1 prints
+#   "host_io: outbound /tmp/newton-host-io/out fh=…"
+#   "host_io: inbound  /tmp/newton-host-io/in  fh=…"
+# (those mean the IPC files exist).
+cd /path/to/baremetal/tools/host-viewer
+cargo run --release
+```
+
+A 640×960 window appears (the panel is 320×480, scaled 2×). The
+Newton boot UI paints incrementally as blits arrive. Left-click to
+tap the panel; drag to drag. Mouse position is mapped 1:1 into the
+panel coord space, so taps land where you expect.
+
+**IPC details, if you need to debug.** The hypervisor opens these
+two files via Arm semihosting on init:
+
+- `/tmp/newton-host-io/out` — hypervisor → viewer. 24-byte
+  `BlitEvent` headers followed by 2 bpp packed payloads (MSB-first,
+  4 px/byte; 0 = white, 3 = black). One stream of variable-size
+  records.
+- `/tmp/newton-host-io/in`  — viewer → hypervisor. 8-byte
+  `PenEvent` records (`kind` byte + le16 `x`, `y`, `pressure`;
+  `kind` = 1 down / 2 move / 3 up). Hypervisor seeks to its last
+  read position every 16 ms and drains new bytes.
+
+The hypervisor creates the directory and `touch`es both files on
+boot, so first-time startup needs no manual prep. Restarting the
+hypervisor truncates `out`; the viewer detects "file shrunk" and
+resets its read position. Restarting just the viewer truncates `in`,
+which the hypervisor handles the same way.
+
+**FVP path.** The dockerised FVP wraps `/tmp` into the container, so
+the same paths work — start the FVP run with `scripts/fvp` from
+term 1, viewer from term 2 on the host. Path resolution goes
+through semihosting in both cases.
 
 ### Snapshot resume — the debug inner loop
 
@@ -364,7 +432,8 @@ baremetal/
     snapshot.rs          rolling 4-slot snapshot ring (semihosting I/O)
     tracer.rs            in-ROM HVC-trampoline tracer (--features trace)
     guest_bp.rs          one-shot guest software BPs (gdb 'bp <addr>')
-    fb_dump.rs           PNG dumps after screen::blit
+    host_io/             live display + pen-input plumbing
+                         (null / semihost / pico backends)
     task_dump.rs         TScheduler / TTask walker
     pa_emulate.rs        scattered PA-side instruction emulation
     unaligned.rs         unaligned-load fixup

@@ -34,6 +34,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(nh_guest_test_semihost)");
 
     select_platform_linker_script();
+    check_host_io_features();
 
     let guest_test = env::var("NH_GUEST_TEST").ok();
     if let Some(val) = &guest_test {
@@ -116,6 +117,28 @@ fn select_platform_linker_script() {
         ),
     };
     println!("cargo:rustc-link-arg=-T{script}");
+}
+
+/// Ensure exactly one `host-io-*` feature is selected. Same pattern
+/// as `select_platform_linker_script`. The host-IO backend choice is
+/// load-bearing (it controls whether `src/host_io/semihost.rs` or
+/// `null.rs` is compiled in), so we don't want a default fallback.
+fn check_host_io_features() {
+    let null = env::var("CARGO_FEATURE_HOST_IO_NULL").is_ok();
+    let semihost = env::var("CARGO_FEATURE_HOST_IO_SEMIHOST").is_ok();
+    let pico = env::var("CARGO_FEATURE_HOST_IO_PICO").is_ok();
+    let n = (null as u8) + (semihost as u8) + (pico as u8);
+    match n {
+        0 => panic!(
+            "no host-io backend selected: enable exactly one of \
+             host-io-null, host-io-semihost, or host-io-pico"
+        ),
+        1 => {}
+        _ => panic!(
+            "multiple host-io backends selected (null={null} semihost={semihost} pico={pico}); \
+             they are mutually exclusive"
+        ),
+    }
 }
 
 fn build_trace_tables() {

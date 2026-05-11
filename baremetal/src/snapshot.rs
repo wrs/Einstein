@@ -144,7 +144,7 @@ const MAGIC: u64 = 0x0150_414E_5348_4E00;
 // have RAM/flash bytes in the opposite byte-lane geometry, plus EL1
 // SCTLR with EE=0; both are incompatible with a Phase-2 BE-8 boot, so
 // the version bump rejects them automatically at load time.
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 
 /// Number of rolling slots. Each slot is ~14 MiB, so four slots cost
 /// ~56 MiB of host disk and give the user three save windows of

@@ -214,6 +214,11 @@ const INT_TIMER_3: u32 = 0x0000_0040;
 const INT_DMA_CH3: u32 = 0x0000_0400;   // sound input
 const INT_DMA_CH5: u32 = 0x0000_1000;   // sound output / tablet rcv
 pub const INT_GPIO: u32 = 0x0100_0000;
+/// Tablet (digitizer) pen-event interrupt. Einstein's
+/// `TInterruptManager.h:81 kTabletIntMask`. Raised by
+/// `host_io::queue::enqueue_pen_sample` when a fresh sample lands
+/// on the input queue.
+pub const INT_TABLET: u32 = 0x1000_0000;
 
 /// Public raiser: OR `mask` into `int_present`. The next `update_virq`
 /// (called at every sync-trap exit and after `timer::on_irq`) reflects

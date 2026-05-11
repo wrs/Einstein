@@ -1,4 +1,5 @@
 /target
+tools/*/target
 Cargo.lock.bak
 *.img
 scripts/classify-out/*

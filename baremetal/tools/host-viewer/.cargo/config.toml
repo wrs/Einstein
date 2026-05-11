@@ -1,0 +1,4 @@
+# Override the no_std cross target inherited from baremetal/.cargo/config.toml.
+# host-viewer is a host-side binary; same pattern as tools/romdump.
+[build]
+target = "aarch64-apple-darwin"

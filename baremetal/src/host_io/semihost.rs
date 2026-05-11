@@ -82,7 +82,20 @@ pub fn init() {
     }
     s.out_fh = out;
     s.in_fh = inh;
-    s.in_pos = 0;
+    // Start reading from end-of-file. /tmp/newton-host-io/in is a
+    // FIFO-ish append log shared across sessions: the host viewer
+    // appends pen events to it, but the file isn't cleared between
+    // hypervisor runs. Starting at 0 would replay stale events from
+    // the previous session — which the kernel processes as if they
+    // were current taps. The host-viewer also truncates this file on
+    // its own startup (tools/host-viewer/src/main.rs); `pump_input`
+    // handles that case separately by detecting `len < in_pos`.
+    s.in_pos = if inh >= 0 {
+        let n = sh_flen(inh);
+        if n >= 0 { n as u64 } else { 0 }
+    } else {
+        0
+    };
     INITIALISED.store(true, Ordering::Release);
 }
 
@@ -144,6 +157,15 @@ pub fn pump_input() {
         return;
     }
     let len = len as u64;
+    // The host viewer truncates `/tmp/newton-host-io/in` on its own
+    // startup, so the file can get shorter than our last-read
+    // position. Reset and read from the new beginning when that
+    // happens — otherwise we'd silently drop everything until the
+    // file grows back past the stale offset, which presents as "pen
+    // input takes a while to start working."
+    if len < s.in_pos {
+        s.in_pos = 0;
+    }
     if len <= s.in_pos {
         return;
     }

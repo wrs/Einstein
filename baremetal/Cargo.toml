@@ -10,7 +10,7 @@ name = "newton-hypervisor"
 path = "src/main.rs"
 
 [features]
-default = ["platform-raspi3b", "host-io-null", "flash-persist-semihost"]
+default = ["platform-raspi3b"]
 
 # Host-platform selection. Exactly one must be enabled; build.rs panics
 # otherwise. Controls UART/GIC addresses, MMU memory map, load address
@@ -19,8 +19,12 @@ default = ["platform-raspi3b", "host-io-null", "flash-persist-semihost"]
 platform-raspi3b = []
 platform-fvp-base = []
 
-# Host display + tablet-input backend selection. Exactly one must be
-# enabled; build.rs panics otherwise. See `src/host_io/mod.rs`.
+# Host display + tablet-input backend. Opt-in only — at most one may be
+# enabled. If none are enabled, build.rs picks "null" (so a bare
+# `cargo run` works) and `cargo run --features host-io-semihost`
+# switches without needing `--no-default-features`. Source code reads
+# `#[cfg(nh_host_io_*)]`, not the feature directly. See
+# `src/host_io/mod.rs`.
 #
 #   host-io-null     — no display sink, no input source. Default;
 #                      used by guest-tests and CI runs.
@@ -35,15 +39,15 @@ host-io-null = []
 host-io-semihost = []
 host-io-pico = []
 
-# Persistent flash-store backend selection. Exactly one must be enabled;
-# build.rs panics otherwise. See `src/flash_persist/mod.rs`.
+# Persistent flash-store backend. Opt-in only — at most one may be
+# enabled. If none are enabled, build.rs picks "semihost" (so a bare
+# `cargo run` persists flash across cold boots). `nh_guest_test` mode
+# always overrides to "null" for hermetic test runs. Source code reads
+# `#[cfg(nh_flash_persist_*)]`. See `src/flash_persist/mod.rs`.
 #
-#   flash-persist-null     — no-op; flash is volatile. Used for
-#                            guest-tests (forced via cfg(nh_guest_test))
-#                            and the future Pico backend until it has
-#                            its own SD/flash impl.
+#   flash-persist-null     — no-op; flash is volatile.
 #   flash-persist-semihost — read/write `$HOME/.newton/flash.bin` via
-#                            Arm semihosting. Default for QEMU + FVP.
+#                            Arm semihosting.
 #   flash-persist-pico     — reserved for a future on-board SD-card or
 #                            external-flash backend on the Pico 2 W.
 flash-persist-null = []

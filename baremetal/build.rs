@@ -32,10 +32,17 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(nh_guest_test)");
     println!("cargo:rustc-check-cfg=cfg(nh_guest_test_embed)");
     println!("cargo:rustc-check-cfg=cfg(nh_guest_test_semihost)");
+    // Cfg flags driven by backend selection (see resolve_*_backend).
+    println!("cargo:rustc-check-cfg=cfg(nh_host_io_null)");
+    println!("cargo:rustc-check-cfg=cfg(nh_host_io_semihost)");
+    println!("cargo:rustc-check-cfg=cfg(nh_host_io_pico)");
+    println!("cargo:rustc-check-cfg=cfg(nh_flash_persist_null)");
+    println!("cargo:rustc-check-cfg=cfg(nh_flash_persist_semihost)");
+    println!("cargo:rustc-check-cfg=cfg(nh_flash_persist_pico)");
 
     select_platform_linker_script();
-    check_host_io_features();
-    check_flash_persist_features();
+    resolve_host_io_backend();
+    resolve_flash_persist_backend();
     emit_flash_path();
 
     let guest_test = env::var("NH_GUEST_TEST").ok();
@@ -121,48 +128,57 @@ fn select_platform_linker_script() {
     println!("cargo:rustc-link-arg=-T{script}");
 }
 
-/// Ensure exactly one `host-io-*` feature is selected. Same pattern
-/// as `select_platform_linker_script`. The host-IO backend choice is
-/// load-bearing (it controls whether `src/host_io/semihost.rs` or
-/// `null.rs` is compiled in), so we don't want a default fallback.
-fn check_host_io_features() {
+/// Pick the active host-io backend and emit a `cfg(nh_host_io_*)`.
+///
+/// Cargo features are additive — `default = [..., "host-io-null"]`
+/// can't be overridden by `cargo run --features host-io-semihost`
+/// without `--no-default-features`. To make backend selection
+/// composable, the `host-io-*` features are opt-in markers (not in
+/// `default`); this function picks the active backend (with "null" as
+/// the no-features fallback) and emits a single `cfg(nh_host_io_<x>)`
+/// the source consumes. Multiple opt-ins are still MUEX.
+fn resolve_host_io_backend() {
     let null = env::var("CARGO_FEATURE_HOST_IO_NULL").is_ok();
     let semihost = env::var("CARGO_FEATURE_HOST_IO_SEMIHOST").is_ok();
     let pico = env::var("CARGO_FEATURE_HOST_IO_PICO").is_ok();
-    let n = (null as u8) + (semihost as u8) + (pico as u8);
-    match n {
-        0 => panic!(
-            "no host-io backend selected: enable exactly one of \
-             host-io-null, host-io-semihost, or host-io-pico"
-        ),
-        1 => {}
+    let chosen = match (null, semihost, pico) {
+        (false, false, false) => "null",
+        (true, false, false) => "null",
+        (false, true, false) => "semihost",
+        (false, false, true) => "pico",
         _ => panic!(
             "multiple host-io backends selected (null={null} semihost={semihost} pico={pico}); \
              they are mutually exclusive"
         ),
-    }
+    };
+    println!("cargo:rustc-cfg=nh_host_io_{chosen}");
 }
 
-/// Ensure exactly one `flash-persist-*` feature is selected. Same
-/// pattern as `check_host_io_features`. The persistent-flash backend
-/// is compile-time-selected so the no-op null backend has zero cost
-/// in guest-test / hardware builds.
-fn check_flash_persist_features() {
+/// Pick the active flash-persist backend and emit a
+/// `cfg(nh_flash_persist_*)`. Same opt-in-with-fallback pattern as
+/// `resolve_host_io_backend`. Default is "semihost" (a bare
+/// `cargo run` persists flash); `nh_guest_test` always overrides to
+/// "null" for hermetic tests regardless of features.
+fn resolve_flash_persist_backend() {
     let null = env::var("CARGO_FEATURE_FLASH_PERSIST_NULL").is_ok();
     let semihost = env::var("CARGO_FEATURE_FLASH_PERSIST_SEMIHOST").is_ok();
     let pico = env::var("CARGO_FEATURE_FLASH_PERSIST_PICO").is_ok();
-    let n = (null as u8) + (semihost as u8) + (pico as u8);
-    match n {
-        0 => panic!(
-            "no flash-persist backend selected: enable exactly one of \
-             flash-persist-null, flash-persist-semihost, or flash-persist-pico"
-        ),
-        1 => {}
-        _ => panic!(
-            "multiple flash-persist backends selected (null={null} semihost={semihost} pico={pico}); \
-             they are mutually exclusive"
-        ),
-    }
+    let guest_test = env::var("NH_GUEST_TEST").is_ok();
+    let chosen = if guest_test {
+        "null"
+    } else {
+        match (null, semihost, pico) {
+            (false, false, false) => "semihost",
+            (true, false, false) => "null",
+            (false, true, false) => "semihost",
+            (false, false, true) => "pico",
+            _ => panic!(
+                "multiple flash-persist backends selected (null={null} semihost={semihost} pico={pico}); \
+                 they are mutually exclusive"
+            ),
+        }
+    };
+    println!("cargo:rustc-cfg=nh_flash_persist_{chosen}");
 }
 
 /// Resolve `$HOME/.newton/flash.bin` at build time and expose it as

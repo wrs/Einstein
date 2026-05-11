@@ -18,14 +18,15 @@
 //!
 //! ## Backend selection
 //!
-//! Cargo feature `flash-persist-{null,semihost,pico}` picks the
-//! backend at compile time; `build.rs` enforces exactly-one. In
-//! `nh_guest_test` mode the null backend is forced regardless so
-//! tests start from a clean GUEST_FLASH.
+//! `build.rs::resolve_flash_persist_backend` picks the active backend
+//! from the `flash-persist-*` Cargo features (with "semihost" as the
+//! no-features fallback) and emits one of `cfg(nh_flash_persist_*)`.
+//! In `nh_guest_test` mode the resolver forces "null" so tests start
+//! from a clean GUEST_FLASH.
 
-#[cfg(all(feature = "flash-persist-semihost", not(nh_guest_test)))]
+#[cfg(nh_flash_persist_semihost)]
 mod semihost;
-#[cfg(any(not(feature = "flash-persist-semihost"), nh_guest_test))]
+#[cfg(any(nh_flash_persist_null, nh_flash_persist_pico))]
 mod null;
 
 /// Backend interface. Single-threaded EL2 callers; impls do not need
@@ -52,11 +53,9 @@ pub trait FlashStore: Sync {
     fn fingerprint(&self) -> u32;
 }
 
-// Backend selection. In nh_guest_test mode the null backend is forced
-// (tests want hermetic starts); otherwise the Cargo-feature picks.
-#[cfg(all(feature = "flash-persist-semihost", not(nh_guest_test)))]
+#[cfg(nh_flash_persist_semihost)]
 use self::semihost::BACKEND;
-#[cfg(any(not(feature = "flash-persist-semihost"), nh_guest_test))]
+#[cfg(any(nh_flash_persist_null, nh_flash_persist_pico))]
 use self::null::BACKEND;
 
 pub fn try_load() {

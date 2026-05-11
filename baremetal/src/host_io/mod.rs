@@ -13,17 +13,20 @@
 //!    which raises `INT_TABLET`. `tablet::handle` subfn 0x16
 //!    (`NativeGetSample`) drains via [`pop_pen_sample`].
 //!
-//! Backend selection is by Cargo feature: exactly one of
-//! `host-io-null`, `host-io-semihost`, `host-io-pico` must be enabled
-//! (`build.rs` enforces this). The default is `host-io-null`, which
-//! turns everything in here into a no-op so guest-tests and CI runs
-//! behave like the old fb_dump-less world.
+//! Backend selection: `build.rs::resolve_host_io_backend` picks one
+//! from the `host-io-*` Cargo features (opt-in only — the features are
+//! NOT in `default`, so `cargo run --features host-io-semihost` works
+//! without `--no-default-features`). With no feature enabled the
+//! resolver falls back to "null", which turns everything in here into
+//! a no-op so guest-tests and CI runs behave like the old fb_dump-less
+//! world. The resolver emits `cfg(nh_host_io_<chosen>)`; multiple
+//! opt-ins are still a hard error.
 
 pub mod queue;
 
-#[cfg(feature = "host-io-null")]
+#[cfg(nh_host_io_null)]
 mod null;
-#[cfg(feature = "host-io-semihost")]
+#[cfg(nh_host_io_semihost)]
 mod semihost;
 
 pub const BLIT_KIND_BLIT: u8 = 1;
@@ -78,9 +81,9 @@ const _: () = {
 /// One-time setup: open transport, send a hello, …. Called from
 /// `kmain` once `vic::init` has returned.
 pub fn init() {
-    #[cfg(feature = "host-io-null")]
+    #[cfg(nh_host_io_null)]
     null::init();
-    #[cfg(feature = "host-io-semihost")]
+    #[cfg(nh_host_io_semihost)]
     semihost::init();
 }
 
@@ -108,9 +111,9 @@ pub fn on_resume() {
         payload_len: payload.len() as u16,
     };
     push_blit(&ev, payload);
-    #[cfg(feature = "host-io-null")]
+    #[cfg(nh_host_io_null)]
     null::on_resume();
-    #[cfg(feature = "host-io-semihost")]
+    #[cfg(nh_host_io_semihost)]
     semihost::on_resume();
 }
 
@@ -118,9 +121,9 @@ pub fn on_resume() {
 /// calls this from a sync trap with the guest stalled. Backends that
 /// can't keep up drop events instead of blocking.
 pub fn push_blit(ev: &BlitEvent, payload: &[u8]) {
-    #[cfg(feature = "host-io-null")]
+    #[cfg(nh_host_io_null)]
     null::push_blit(ev, payload);
-    #[cfg(feature = "host-io-semihost")]
+    #[cfg(nh_host_io_semihost)]
     semihost::push_blit(ev, payload);
 }
 
@@ -136,9 +139,9 @@ pub fn pop_pen_sample() -> Option<(u32, u32)> {
 /// events, enqueue them as Newton-format samples, and raise
 /// `INT_TABLET`. Called from the trap-return tail (`trap.rs`).
 pub fn pump_input() {
-    #[cfg(feature = "host-io-null")]
+    #[cfg(nh_host_io_null)]
     null::pump_input();
-    #[cfg(feature = "host-io-semihost")]
+    #[cfg(nh_host_io_semihost)]
     semihost::pump_input();
 }
 

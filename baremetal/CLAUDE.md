@@ -21,6 +21,12 @@ guest ISA and modelled Newton hardware are identical on both.
   scripts/fvp --timeout=90 \
     target/aarch64-unknown-none-softfloat/release/newton-hypervisor
   ```
+  `host-io-*` and `flash-persist-*` are opt-in features (not in
+  `default`), so they don't need to be listed for a minimal FVP build —
+  `build.rs` falls back to `host-io-null` + `flash-persist-semihost`.
+  Add `--features host-io-semihost` to swap the host-IO backend
+  without re-listing everything.
+
   Add `--gdb` for an Iris debug server on host port 7100; add
   `--features trace` for the function-level tracer. FVP runs the
   generic timer + cache model accurately, so wall-clock is much

@@ -48,18 +48,23 @@ FW_FILES=(
 
 usage() {
     cat >&2 <<EOF
-usage: scripts/build-sd.sh <dest-dir>
+usage: scripts/build-sd.sh <dest-dir> [<sd-mount>]
 
-  <dest-dir> will contain a complete boot-partition layout: copy its
-  contents to the root of a FAT32-formatted SD card.
+  <dest-dir>  will contain a complete boot-partition layout.
+  <sd-mount>  if given, also rsync the layout to that path — typically
+              the mounted SD card (e.g. /Volumes/bootfs on macOS).
+              Only files whose mtime+size differ are written, so
+              re-running after a small kernel rebuild touches just
+              kernel8.img.
 
   Set PI_KERNEL_BIN to pick a different [[bin]] (default: pi-probe).
 EOF
     exit 1
 }
 
-[[ $# -eq 1 ]] || usage
+[[ $# -eq 1 || $# -eq 2 ]] || usage
 dest="$1"
+sd_mount="${2:-}"
 
 # Repo root = directory containing this script's parent.
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -105,11 +110,25 @@ fi
 echo "objcopy: $kernel_bin → kernel8.img"
 "$objcopy" -O binary "$elf" "$dest/kernel8.img"
 
-# --- 4. Copy firmware + config -----------------------------------------
+# --- 4. Sync firmware + config into the staging dir ----------------
+# rsync (default mtime+size compare) skips files that haven't
+# changed, so re-running after a kernel rebuild only re-writes
+# kernel8.img. Important when the dest is a slow SD card.
 for f in "${FW_FILES[@]}"; do
-    cp "$cache/$f" "$dest/$f"
+    rsync -a "$cache/$f" "$dest/$f"
 done
-cp "${repo_root}/boot-pi/config.txt" "$dest/config.txt"
+rsync -a "${repo_root}/boot-pi/config.txt" "$dest/config.txt"
+
+# --- 4b. Optionally also push to a mounted SD card -----------------
+if [[ -n "$sd_mount" ]]; then
+    if [[ ! -d "$sd_mount" ]]; then
+        echo "error: <sd-mount> '$sd_mount' is not a directory" >&2
+        exit 1
+    fi
+    echo "sync: $dest/ → $sd_mount/"
+    rsync -a "$dest/" "$sd_mount/"
+    sync
+fi
 
 # --- 5. Summary --------------------------------------------------------
 cat <<EOF
@@ -121,8 +140,12 @@ $(ls -la "$dest" "$dest/overlays" | sed 's/^/  /')
 
 next steps:
   1. Format a microSD card as FAT32 (single partition, MBR).
-  2. Copy the contents of $dest to the root of the SD card:
-       cp -R "$dest"/* /Volumes/<SD-card-name>/
+  2. Sync the contents of $dest to the SD card. Either:
+       - re-run this script with the mount path as the second arg:
+           scripts/build-sd.sh "$dest" /Volumes/<SD-card-name>
+         (only changed files are written; safe to do every rebuild)
+       - or rsync manually:
+           rsync -a "$dest"/ /Volumes/<SD-card-name>/
   3. Eject, insert into the Pi Zero 2 W (note: PWR IN port for power).
      Wire the 3.3V USB-TTL cable to the Pi GPIO header:
        Pi pin  6  (GND)        <->  cable GND

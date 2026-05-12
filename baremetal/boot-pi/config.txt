@@ -48,3 +48,11 @@ dtoverlay=disable-bt
 # Set to 0 (or delete this line) to see the icons again if you ever
 # want to diagnose a real power / thermal issue.
 avoid_warnings=1
+
+# Disable HDMI overscan padding. Default firmware behaviour assumes
+# the display has consumer-TV overscan and trims a margin (visible
+# as a fixed-colour bar at the edges, typically top/bottom). On
+# monitors with no real overscan that margin is just lost pixels —
+# and on the Pi Zero 2 W with 1360x768 EDID it looked like an
+# 8-16px white stripe across the top of our framebuffer.
+disable_overscan=1

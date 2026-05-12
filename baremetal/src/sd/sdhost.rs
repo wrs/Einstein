@@ -20,26 +20,23 @@
 //! (P. Elwell @ RPi Trading, Rust port-by-hand). Constants live in
 //! [`super::regs`].
 //!
-//! ## What's stubbed
+//! ## Bring-up status
 //!
-//! Two pieces are intentionally not implemented yet and will panic
-//! loudly if reached. Both need real-hardware bring-up to validate:
+//! All of the driver is implemented and the binary should boot
+//! through `SdHost::init` without panicking. None of it has been
+//! exercised on real hardware yet — first real-silicon test will
+//! confirm GPIO ALT routing, the mailbox-set core clock value, and
+//! whether our SDCDIV math matches what the controller wants.
+//! Likely first-failure modes:
 //!
-//! - [`gpio_setup`] — pinmux of GPIO 48–53 to the SDHOST ALT function
-//!   (and which ALT it is on the Zero 2 W vs. the Pi 3B — they
-//!   differ). The wrong ALT will leave the bus floating; the wrong
-//!   pull configuration on D0–D3 will produce CRC errors.
-//! - [`clock_setup`] — the Pi firmware controls the SDHOST clock via
-//!   a mailbox property tag (`RPI_FIRMWARE_SET_CLOCK_RATE` for
-//!   `CLOCK_ID_CORE`), and the driver computes the SDCDIV divider
-//!   from the resulting core clock. We don't have a mailbox driver
-//!   yet (Phase 4 will need one anyway); writing a poll-mode mailbox
-//!   client is small but I'd rather land that as its own change.
-//!
-//! Until both stubs are filled in, [`SdHost::init`] is gated by a
-//! `cfg!` and panics with a pointer to this comment. The rest of the
-//! driver (command pack, FIFO drain, MBR decode, FAT shim) is
-//! independently reviewable and compile-tested.
+//! - CRC errors on the response or data → bus pulls wrong on
+//!   `SD_CMD` / `SD_DAT0..3` (see [`gpio_setup`]).
+//! - `CmdError::Timeout` on every command → SDCDIV too high (or
+//!   the controller never received its core clock; check the
+//!   mailbox response in [`clock_setup`]).
+//! - `CmdError::HardwareWedge` on CMD0 → SDHOST MMIO not reachable
+//!   (stage-1 doesn't map `0x3F20_2000` — but it should, via the
+//!   raspi3b `DEVICE_MMIO_START..DEVICE_MMIO_END` window).
 
 #![allow(dead_code)] // Reachable once the SDHOST bring-up is wired in.
 
@@ -87,12 +84,11 @@ impl SdHost {
     /// Bring up the controller and enumerate the card. Returns a
     /// driver instance ready for `read_block` / `write_block`.
     ///
-    /// **Not yet runnable on real hardware**: see the module-level
-    /// "What's stubbed" note.
-    #[allow(unreachable_code, clippy::diverging_sub_expression)]
+    /// Untested on real hardware. See the module-level "Bring-up
+    /// status" note for likely first-failure modes.
     pub fn init() -> Result<Self, CmdError> {
         gpio_setup();
-        clock_setup();
+        let core_clock = clock_setup().map_err(|_| CmdError::HardwareWedge)?;
 
         reset_controller();
         delay_us(10_000);
@@ -105,8 +101,9 @@ impl SdHost {
         // bus (4-bit data path inside the controller; outside-bus
         // width is negotiated separately via ACMD6).
         write_reg(SDHCFG, SDHCFG_WIDE_INT_BUS | SDHCFG_REL_CMD_LINE);
-        // Max divider until the card is up; we'll speed up later.
-        write_reg(SDCDIV, SDCDIV_MAX_CDIV);
+        // Identification-phase clock: ≤400 kHz on the SD bus per the
+        // SD spec. The SDHOST divides core_clock by (cdiv + 2).
+        program_sdcdiv(core_clock, 400_000);
         write_reg(SDHSTS, SDHSTS_CLEAR_MASK);
 
         // Identification phase. Per SD Physical Layer Spec §4.2.
@@ -152,9 +149,15 @@ impl SdHost {
         // ignores CMD16 (always 512); send it anyway for uniformity.
         send_cmd(CMD_SET_BLOCKLEN, 512, ResponseKind::Short)?;
 
-        // TODO: ACMD6 to switch to 4-bit bus once we trust the
-        // single-line path. For first bring-up keep 1-bit; CRC errors
-        // are easier to diagnose without bus-width complications.
+        // Card is in transfer state — bump the bus clock to the
+        // default-speed 25 MHz target. The SD spec allows this
+        // immediately after CMD7 (no SD switch command required for
+        // default-speed mode).
+        //
+        // 4-bit bus width via ACMD6 is deliberately deferred until
+        // single-bit reads are confirmed solid; CRC diagnosis is
+        // easier without bus-width complications.
+        program_sdcdiv(core_clock, 25_000_000);
 
         Ok(SdHost { rca, capacity })
     }
@@ -368,29 +371,123 @@ fn finish_data_phase() -> Result<(), CmdError> {
     Err(CmdError::HardwareWedge)
 }
 
-// ---- Stubs (see module-level "What's stubbed") -----------------------
+// ---- GPIO pinmux -----------------------------------------------------
 
-/// Pinmux GPIO 48–53 onto the SDHOST controller. Needs careful
-/// per-board verification (Pi 3B and Pi Zero 2 W are not identical at
-/// the GPIO-routing level) before this can run on hardware.
+const GPIO_BASE: usize = 0x3F20_0000;
+const GPFSEL5: *mut u32 = (GPIO_BASE + 0x14) as *mut u32; // pins 50–53 here, plus 54–57.
+const GPFSEL4: *mut u32 = (GPIO_BASE + 0x10) as *mut u32; // pins 40–49 here (includes 48, 49).
+const GPPUD: *mut u32 = (GPIO_BASE + 0x94) as *mut u32;
+const GPPUDCLK1: *mut u32 = (GPIO_BASE + 0x9C) as *mut u32;
+
+const GPIO_PULL_OFF: u32 = 0;
+const GPIO_PULL_UP: u32 = 2;
+const GPIO_ALT0: u32 = 0b100;
+
+/// Route GPIO 48..53 to the SDHOST controller (ALT0) with
+/// appropriate pulls.
+///
+/// On BCM2835/2710 the alternate-function table puts SDHOST signals
+/// on GPIO 48..53 ALT0:
+/// - GPIO 48: `SD_CLK_N`  — no pull (clock-only line).
+/// - GPIO 49: `SD_CMD_N`  — pull-up.
+/// - GPIO 50..53: `SD_DAT0..3` — pull-up.
+///
+/// We deliberately do **not** touch GPIO 34..39 here: those go to
+/// the on-package WLAN/BT chip via the Arasan EMMC controller, and
+/// firmware has already configured them. Re-driving them risks
+/// dropping the Bluetooth wakeup path during a future
+/// `dtoverlay=disable-bt`-less boot. Circle's driver does touch
+/// them, but Circle is single-OS — it owns everything. We're
+/// targeted at a hypervisor that should leave anything not directly
+/// used alone.
 fn gpio_setup() {
-    unimplemented!(
-        "src/sd/sdhost.rs::gpio_setup not yet implemented — see module \
-         doc 'What's stubbed'. Needs ALT function + pull config for \
-         GPIO 48..53 verified against the BCM2835 ARM Peripherals manual \
-         and the Pi Zero 2 W datasheet."
+    // Function-select for GPIO 48 and 49 lives in GPFSEL4 at bit
+    // offsets (48-40)*3 = 24 and (49-40)*3 = 27.
+    // SAFETY: GPIO MMIO at fixed BCM2710 base.
+    unsafe {
+        let mut fsel4 = read_volatile(GPFSEL4);
+        fsel4 &= !(0b111 << 24);
+        fsel4 &= !(0b111 << 27);
+        fsel4 |= GPIO_ALT0 << 24;
+        fsel4 |= GPIO_ALT0 << 27;
+        write_volatile(GPFSEL4, fsel4);
+
+        // GPIO 50..53 in GPFSEL5 at offsets (50-50)*3, ..., (53-50)*3.
+        let mut fsel5 = read_volatile(GPFSEL5);
+        for pin in 50..=53 {
+            let shift = ((pin - 50) * 3) as u32;
+            fsel5 &= !(0b111 << shift);
+            fsel5 |= GPIO_ALT0 << shift;
+        }
+        write_volatile(GPFSEL5, fsel5);
+    }
+
+    // Pull config: BCM2835 mechanism (still works on BCM2710; Pi 4's
+    // BCM2711 changed this — irrelevant for the Zero 2 W).
+    //
+    // Sequence per the ARM Peripherals manual:
+    //   1. Write to GPPUD to set the required control signal.
+    //   2. Wait 150 cycles — for the control signal to settle.
+    //   3. Write to GPPUDCLK0/1 to clock the control signal into the
+    //      GPIO pads we care about.
+    //   4. Wait another 150 cycles.
+    //   5. Write 0 to GPPUD to remove the control signal.
+    //   6. Write 0 to GPPUDCLK0/1 to remove the clock.
+    gpio_set_pull(1 << (48 - 32), GPIO_PULL_OFF);
+    gpio_set_pull(
+        (1 << (49 - 32)) | (1 << (50 - 32)) | (1 << (51 - 32)) | (1 << (52 - 32)) | (1 << (53 - 32)),
+        GPIO_PULL_UP,
     );
 }
 
-/// Program the SDHOST clock via the firmware mailbox. Requires a
-/// mailbox driver we don't have yet.
-fn clock_setup() {
-    unimplemented!(
-        "src/sd/sdhost.rs::clock_setup not yet implemented — see module \
-         doc 'What's stubbed'. Needs a poll-mode VC mailbox client to \
-         issue RPI_FIRMWARE_SET_CLOCK_RATE on CLOCK_ID_CORE, then derive \
-         the SDCDIV divider from the resulting rate."
-    );
+fn gpio_set_pull(pin_mask_in_high_bank: u32, mode: u32) {
+    // SAFETY: GPIO MMIO; `delay_cycles` provides the mandated 150-
+    // cycle settle windows.
+    unsafe {
+        write_volatile(GPPUD, mode);
+        delay_cycles(200);
+        write_volatile(GPPUDCLK1, pin_mask_in_high_bank);
+        delay_cycles(200);
+        write_volatile(GPPUD, 0);
+        write_volatile(GPPUDCLK1, 0);
+    }
+}
+
+#[inline]
+fn delay_cycles(n: u32) {
+    for _ in 0..n {
+        unsafe { core::arch::asm!("nop") }
+    }
+}
+
+// ---- Clock setup via VC mailbox -------------------------------------
+
+/// Query (and pin) the SoC core clock the SDHOST is hung off of.
+/// Returns the rate in Hz.
+///
+/// We don't change the core clock rate — that would knock several
+/// other peripherals around. We just read what firmware has set and
+/// derive SDCDIV from it.
+fn clock_setup() -> Result<u32, crate::mailbox::MailboxError> {
+    let rate = crate::mailbox::get_clock_rate(crate::mailbox::CLOCK_ID_CORE)?;
+    // The cut-down GPU firmware on the Zero 2 W typically reports
+    // 250 MHz here. If we see something outside a sane window the
+    // mailbox response is likely garbled — fail loudly rather than
+    // dial in a wrong divider.
+    if !(50_000_000..=600_000_000).contains(&rate) {
+        return Err(crate::mailbox::MailboxError::FirmwareError);
+    }
+    Ok(rate)
+}
+
+/// Program SDCDIV so that `core_clock / (cdiv + 2)` is at most
+/// `target_hz`. SDHOST's effective SD-bus clock is
+/// `core_clock / (SDCDIV + 2)`; rounding up keeps us under the
+/// target (the SD spec ceilings are inclusive).
+fn program_sdcdiv(core_clock: u32, target_hz: u32) {
+    let div = ((core_clock + target_hz - 1) / target_hz).saturating_sub(2);
+    let cdiv = core::cmp::min(div, SDCDIV_MAX_CDIV);
+    write_reg(SDCDIV, cdiv);
 }
 
 fn delay_us(us: u32) {

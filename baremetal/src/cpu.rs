@@ -103,6 +103,45 @@ pub fn icache_publish_range(va: u64, len: usize) {
     }
 }
 
+/// Clean + invalidate a range of data cache lines to the Point of
+/// Coherency.
+///
+/// Used for buffers that a non-coherent agent (e.g. the BCM2710
+/// VideoCore via the mailbox) reads or writes via an uncached alias.
+/// Our own access goes through Normal-WB DRAM; without this the VC
+/// would see stale data on its reads and our subsequent reads would
+/// see stale data on its writes.
+///
+/// `va` is the buffer base; `len` its size in bytes. We round outward
+/// to the nearest cache-line boundary (64 B on A53/AEMvA), which is
+/// safe because adjacent data on those lines is either unrelated
+/// (then the clean is a no-op) or part of the same buffer (then it's
+/// what we want). `dsb sy` fences the effect against subsequent
+/// device-MMIO writes (mailbox doorbell).
+#[allow(dead_code)] // First caller lands in src/mailbox.rs.
+pub fn dc_civac_range(va: u64, len: usize) {
+    const LINE: u64 = 64;
+    let start = va & !(LINE - 1);
+    let end = (va + len as u64 + LINE - 1) & !(LINE - 1);
+    let mut p = start;
+    while p < end {
+        // SAFETY: cache maintenance op; `dsb sy` below fences against
+        // the device-MMIO write that follows.
+        unsafe {
+            core::arch::asm!(
+                "dc civac, {p}",
+                p = in(reg) p,
+                options(nostack, preserves_flags),
+            );
+        }
+        p += LINE;
+    }
+    // SAFETY: barrier only; no state side-effects.
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+}
+
 
 // NOTE: There is no `read_sp_abt()` helper. `MRS <Xt>, SP_abt`
 // (S3_4_C4_C1_1) is architecturally defined (DDI 0487 D19.2) but

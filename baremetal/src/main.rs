@@ -17,6 +17,8 @@ mod guest_mem;
 mod heap_check;
 mod host_io;
 mod hvc_imm;
+#[cfg(feature = "platform-raspi3b")]
+mod mailbox;
 mod mmio;
 mod mmu;
 mod pa_emulate;

@@ -69,6 +69,11 @@ pub extern "C" fn kmain() -> ! {
     unsafe { mmu::init(); }
     install_vectors();
 
+    // Real-hardware SDHOST bring-up probe. Halts at the end regardless
+    // of outcome — see src/sd/probe.rs.
+    #[cfg(feature = "sd-probe")]
+    sd::probe::run();
+
     // SAFETY: load ROM bytes into guest backing store before stage-2 maps it.
     unsafe { guest_mem::load_rom(); }
 

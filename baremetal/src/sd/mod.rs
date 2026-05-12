@@ -16,5 +16,7 @@
 //! See `docs/REAL_HW_BRINGUP.md` for the phase plan and the rationale
 //! behind picking `embedded-sdmmc` over `fatfs`.
 
+#[cfg(feature = "sd-probe")]
+pub mod probe;
 pub mod regs;
 pub mod sdhost;

@@ -87,6 +87,19 @@ no-semihost = []
 #   cargo build --release --no-default-features --features pi-bare-metal
 pi-bare-metal = ["platform-raspi3b", "no-semihost", "flash-persist-null"]
 
+# Real-hardware SDHOST bring-up probe. When enabled, kmain stops
+# immediately after MMU + vectors are up, runs the BCM2835 SDHOST
+# driver against the micro-SD slot (CMD0/CMD8/ACMD41/CMD2/CMD3/CMD9/
+# CMD7), reads sector 0, dumps the MBR signature + partition table,
+# and halts. Intended as the first-light test for src/sd; no other
+# boot state runs after the probe, so the serial output reflects
+# just SDHOST behaviour.
+#
+# Pair with pi-bare-metal for a real-Pi build:
+#   cargo build --release --no-default-features \
+#     --features "pi-bare-metal sd-probe"
+sd-probe = []
+
 # Function-level execution trace. When enabled, build.rs parses
 # ../_Data_/unified_symbols.tsv and embeds a compact address + name
 # table; at ROM load time each word-aligned function entry whose first

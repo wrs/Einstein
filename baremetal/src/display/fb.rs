@@ -74,36 +74,33 @@ pub fn alloc_native() -> Result<FbInfo, FbError> {
     alloc(w, h)
 }
 
-/// Allocate a framebuffer at the given dimensions, 32 bpp.
+/// Allocate a framebuffer at the given dimensions, 32 bpp RGB.
+///
+/// All setup tags + the allocation go through `fb_setup_and_allocate`
+/// in a single mailbox message. Splitting them across messages
+/// silently fails — the firmware processes each request atomically
+/// and the second message doesn't inherit the first's geometry, so
+/// allocation lands at firmware defaults (typically size=512,
+/// pitch=32 — a useless degenerate framebuffer).
 pub fn alloc(w: u32, h: u32) -> Result<FbInfo, FbError> {
-    let (actual_w, actual_h) = mailbox::fb_set_physical_size(w, h)?;
-    mailbox::fb_set_virtual_size(actual_w, actual_h)?;
-    mailbox::fb_set_virtual_offset(0, 0)?;
-    let bpp = mailbox::fb_set_depth(32)?;
-    // 1 = RGB. Some sources/Pi models default to BGR; explicitly
-    // request RGB for predictable colours.
-    mailbox::fb_set_pixel_order(1)?;
-    // Request 4 KiB alignment so the FB starts on a page boundary —
-    // helps if we later want to mark its mapping non-cacheable.
-    let (bus_addr, size) = mailbox::fb_allocate(4096)?;
-    let pitch = mailbox::fb_get_pitch()?;
-
-    if bus_addr == 0 || size == 0 {
+    // 32 bpp, RGB pixel order (1), 4 KiB alignment.
+    let a = mailbox::fb_setup_and_allocate(w, h, 32, 1, 4096)?;
+    if a.bus_addr == 0 || a.size == 0 {
         return Err(FbError::EmptyAllocation);
     }
 
     // Strip the VC bus-alias bits to get the ARM PA. On BCM2710
     // with VC L2 disabled, bits 30:31 carry the cached / uncached
     // alias selection and don't participate in the address.
-    let pa = (bus_addr & 0x3FFF_FFFF) as u64;
+    let pa = (a.bus_addr & 0x3FFF_FFFF) as u64;
 
     Ok(FbInfo {
         pa,
-        width: actual_w,
-        height: actual_h,
-        pitch,
-        bpp,
-        size,
+        width: a.width,
+        height: a.height,
+        pitch: a.pitch,
+        bpp: a.depth,
+        size: a.size,
     })
 }
 

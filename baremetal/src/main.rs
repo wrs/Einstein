@@ -8,6 +8,8 @@ use core::arch::global_asm;
 mod alrt_capture;
 mod banked;
 mod cpu;
+#[cfg(feature = "platform-raspi3b")]
+mod display;
 mod flash_persist;
 mod g1_capture;
 mod guest;
@@ -73,6 +75,11 @@ pub extern "C" fn kmain() -> ! {
     // of outcome — see src/sd/probe.rs.
     #[cfg(feature = "sd-probe")]
     sd::probe::run();
+
+    // Real-hardware VC framebuffer first-light probe. Same halt
+    // semantics as sd-probe; build with one OR the other.
+    #[cfg(feature = "fb-probe")]
+    display::probe::run();
 
     // SAFETY: load ROM bytes into guest backing store before stage-2 maps it.
     unsafe { guest_mem::load_rom(); }

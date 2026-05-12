@@ -41,7 +41,9 @@ impl BlockDevice for SdHost {
 /// `TimeSource` that always reports a fixed epoch — we don't have a
 /// real-time clock and FAT timestamps don't affect correctness of
 /// read or write operations. Picks 2026-05-12 to match the rough
-/// real-world date of bring-up.
+/// real-world date of bring-up. Constructed only by FAT consumers
+/// (flash-persist-sd, sd-probe); allow on the default-build path.
+#[allow(dead_code)]
 pub struct NullTime;
 
 impl TimeSource for NullTime {

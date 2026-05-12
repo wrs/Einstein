@@ -100,6 +100,16 @@ pub const TAG_GET_CLOCK_RATE: u32 = 0x0003_0002;
 pub const TAG_SET_CLOCK_RATE: u32 = 0x0003_8002;
 pub const TAG_GET_CLOCK_RATE_MEASURED: u32 = 0x0003_0047;
 
+/// Framebuffer property tags. See the firmware-wiki link above.
+pub const TAG_FB_ALLOCATE: u32 = 0x0004_0001;
+pub const TAG_FB_GET_PHYSICAL_W_H: u32 = 0x0004_0003;
+pub const TAG_FB_SET_PHYSICAL_W_H: u32 = 0x0004_8003;
+pub const TAG_FB_SET_VIRTUAL_W_H: u32 = 0x0004_8004;
+pub const TAG_FB_SET_DEPTH: u32 = 0x0004_8005;
+pub const TAG_FB_SET_PIXEL_ORDER: u32 = 0x0004_8006;
+pub const TAG_FB_GET_PITCH: u32 = 0x0004_0008;
+pub const TAG_FB_SET_VIRTUAL_OFFSET: u32 = 0x0004_8009;
+
 /// Clock-ID constants for `TAG_*_CLOCK_RATE`.
 pub const CLOCK_ID_EMMC: u32 = 1;
 pub const CLOCK_ID_UART: u32 = 2;
@@ -229,4 +239,84 @@ pub fn set_clock_rate(clock_id: u32, hz: u32) -> Result<u32, MailboxError> {
     let mut payload = [clock_id, hz, 0 /* skip_setting_turbo */];
     send_one_tag(TAG_SET_CLOCK_RATE, &mut payload)?;
     Ok(payload[1])
+}
+
+// ---- Framebuffer helpers -------------------------------------------
+//
+// Each helper is a single property-tag call. The conventional Pi
+// idiom batches the FB setup tags into one request (to save five
+// mailbox round-trips), but in polled mode round-trips are cheap
+// and one-tag-per-call is much easier to debug — if any step
+// fails, the call that returned the error is the one that failed.
+
+/// Query the panel's currently configured physical width × height
+/// (the mode HDMI is delivering). Returns `(width, height)` in
+/// pixels.
+pub fn fb_get_physical_size() -> Result<(u32, u32), MailboxError> {
+    let mut p = [0u32, 0u32];
+    send_one_tag(TAG_FB_GET_PHYSICAL_W_H, &mut p)?;
+    Ok((p[0], p[1]))
+}
+
+/// Set the framebuffer's *physical* (displayed) dimensions in
+/// pixels. Should match the panel for crisp output. Returns the
+/// dimensions firmware actually configured.
+pub fn fb_set_physical_size(w: u32, h: u32) -> Result<(u32, u32), MailboxError> {
+    let mut p = [w, h];
+    send_one_tag(TAG_FB_SET_PHYSICAL_W_H, &mut p)?;
+    Ok((p[0], p[1]))
+}
+
+/// Set the framebuffer's *virtual* (back-buffer) dimensions. Usually
+/// equal to the physical size unless you want pan/scroll. Returns
+/// the dimensions firmware actually configured.
+pub fn fb_set_virtual_size(w: u32, h: u32) -> Result<(u32, u32), MailboxError> {
+    let mut p = [w, h];
+    send_one_tag(TAG_FB_SET_VIRTUAL_W_H, &mut p)?;
+    Ok((p[0], p[1]))
+}
+
+/// Set pixel depth in bits/pixel (16 or 32 typical). Returns the
+/// depth firmware actually configured.
+pub fn fb_set_depth(bits: u32) -> Result<u32, MailboxError> {
+    let mut p = [bits];
+    send_one_tag(TAG_FB_SET_DEPTH, &mut p)?;
+    Ok(p[0])
+}
+
+/// Set the byte order of each pixel. 0 = BGR, 1 = RGB.
+pub fn fb_set_pixel_order(order: u32) -> Result<u32, MailboxError> {
+    let mut p = [order];
+    send_one_tag(TAG_FB_SET_PIXEL_ORDER, &mut p)?;
+    Ok(p[0])
+}
+
+/// Set the virtual-offset (pan) of the visible region in the
+/// virtual framebuffer. Returns the offset firmware actually
+/// applied.
+pub fn fb_set_virtual_offset(x: u32, y: u32) -> Result<(u32, u32), MailboxError> {
+    let mut p = [x, y];
+    send_one_tag(TAG_FB_SET_VIRTUAL_OFFSET, &mut p)?;
+    Ok((p[0], p[1]))
+}
+
+/// Allocate the framebuffer. `alignment` is requested in bytes;
+/// the firmware honours alignments at least up to 4 KiB. Returns
+/// `(bus_addr, size_bytes)` — `bus_addr` is the VC-bus form and
+/// usually has the L2-cached alias bit (`0x40000000`) set. Mask
+/// off the upper alias bits (`& 0x3FFF_FFFF` on a Pi 3+ with VC L2
+/// disabled) to get the ARM physical address.
+pub fn fb_allocate(alignment: u32) -> Result<(u32, u32), MailboxError> {
+    let mut p = [alignment, 0];
+    send_one_tag(TAG_FB_ALLOCATE, &mut p)?;
+    Ok((p[0], p[1]))
+}
+
+/// Query the row stride (bytes per scanline) of the currently-
+/// allocated framebuffer. Always ≥ `width * bpp / 8`; the firmware
+/// may pad each row out for alignment.
+pub fn fb_get_pitch() -> Result<u32, MailboxError> {
+    let mut p = [0u32];
+    send_one_tag(TAG_FB_GET_PITCH, &mut p)?;
+    Ok(p[0])
 }

@@ -118,6 +118,17 @@ sd-probe = []
 # it without surgery. Implies `sd-probe` for convenience.
 sd-probe-trace = ["sd-probe"]
 
+# Real-hardware VC-framebuffer first-light probe. When on, kmain
+# allocates a framebuffer at the panel's native size, paints a
+# red→green horizontal gradient, and halts. Use for checking that
+# the mailbox FB path works on a real Pi + monitor. Mutually
+# exclusive in practice with sd-probe (both halt at the end of
+# their kmain branch); build with one feature or the other.
+#
+#   cargo build --release --no-default-features \
+#     --features "pi-bare-metal fb-probe"
+fb-probe = []
+
 # Function-level execution trace. When enabled, build.rs parses
 # ../_Data_/unified_symbols.tsv and embeds a compact address + name
 # table; at ROM load time each word-aligned function entry whose first

@@ -38,6 +38,7 @@ SECTIONS
 
     /DISCARD/ : {
         *(.eh_frame)
+        *(.eh_frame_hdr)
         *(.note .note.*)
         *(.comment)
     }

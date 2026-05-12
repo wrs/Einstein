@@ -9,6 +9,16 @@ description = "Bare-metal hypervisor for running Newton 2.x ROMs natively on Cor
 name = "newton-hypervisor"
 path = "src/main.rs"
 
+# Phase-0 real-hardware probe — standalone binary, depends on nothing from
+# the main crate. Brings up PL011 directly (no semihosting), prints
+# CurrentEL / MIDR_EL1 / MPIDR_EL1, WFE-loops. Only useful with the
+# raspi3b platform (PL011 base 0x3F20_1000); FVP build will skip it via
+# required-features. See `docs/REAL_HW_BRINGUP.md`.
+[[bin]]
+name = "pi-probe"
+path = "src/pi_probe.rs"
+required-features = ["platform-raspi3b"]
+
 [features]
 default = ["platform-raspi3b"]
 

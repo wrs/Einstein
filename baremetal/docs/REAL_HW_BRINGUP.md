@@ -40,56 +40,137 @@ Phase 3+ adds:
 - USB OTG adapter + touchscreen (or a UART-tunnelled pen-event source
   during early bring-up).
 
-## Phase 0 — `kmain` at EL2, "Hello, EL2" over UART
+## Pi firmware reference (verified facts)
 
-**Closes:** Open Question §16.1 (EL2 handoff on real Pi firmware).
+These come from the actual raspberrypi.com docs and the raspberrypi/tools
+armstub source, not memory. Re-verify before relying.
+
+### EL handoff (Pi 0/2/3/4 with `arm_64bit=1`)
+
+Verified by reading `armstub8.S`
+(`github.com/raspberrypi/tools/blob/master/armstubs/armstub8.S`): the
+default stub does
+
+```
+mov x0, #SPSR_EL3_VAL          ; SPSR_EL3_MODE_EL2H
+msr spsr_el3, x0
+adr x0, in_el2
+msr elr_el3, x0
+eret
+```
+
+so **the firmware hands off `kernel8.img` at EL2h** by default. Secondary
+cores park in a WFE spin-table loop at memory offsets 0xe0/0xe8/0xf0
+(core 1/2/3 entry pointers). Kernel entry address loaded from offset
+0xfc — firmware picks `0x80000` by default for `arm_64bit=1`.
+
+This is conditional on:
+- `arm_64bit=1` in `config.txt`.
+- No `kernel_old=1` (which "disables the stub entirely, so your kernel
+  can load to 0 and run on all 4 cores in EL3 on startup" — per the
+  raspberrypi.com forum thread t=362613).
+- No custom `armstub=<file>` overriding the default.
+
+§16.1 in `HIGHLEVEL.md` is therefore effectively answered for the
+default firmware path. Phase 0 below remains a useful confirmation
+that nothing is unexpectedly different on the actual Zero 2 W in our
+hands.
+
+### UART routing on GPIO 14/15
+
+Verified from the dt-blob/overlay README (raw file in raspberrypi/
+firmware on master):
+
+> `disable-bt`: "Disable onboard Bluetooth on Bluetooth-capable Raspberry
+> Pis. On Pis prior to Pi 5 this restores UART0/ttyAMA0 over GPIOs 14 &
+> 15."
+
+So on the Pi Zero 2 W (BCM2710A1) **PL011 (UART0) is wired to the onboard
+Bluetooth chip by default**, not to GPIO 14/15. Without intervention,
+the GPIO header carries the **mini-UART** (UART1/ttyS0). The hypervisor
+already drives PL011 at `0x3F20_1000` (`src/uart.rs`,
+`src/platform/raspi3b.rs`), so for Phase 0 we put `dtoverlay=disable-bt`
+in `config.txt` to route PL011 to GPIO 14/15.
+
+`enable_uart=1` per the raspberrypi.com config.txt page:
+
+> "enable_uart=1 (in conjunction with `console=serial0,115200` in
+> cmdline.txt) requests that the kernel creates a serial console,
+> accessible using GPIOs 14 and 15 (pins 8 and 10 on the 40-pin header)."
+
+`uart_2ndstage=1`:
+
+> "If uart_2ndstage is 1 then enable debug logging to the UART. This
+> option also automatically enables UART logging in start.elf."
+
+So `uart_2ndstage=1` is a useful early checkpoint: if it produces no
+firmware-side output on the wire, the problem is upstream of our code
+(SD layout, GPIO ALT mode, baud divisor, etc.).
+
+### Boot partition contents
+
+For a Pi Zero 2 W (BCM2710A1) bare-metal boot:
+
+- `bootcode.bin` — GPU-side stage-1 loader; brings up DRAM.
+- `start.elf` — main GPU firmware; sets up everything else.
+- `fixup.dat` — memory-split parameters consumed by `start.elf`.
+- `config.txt` — our settings.
+- `kernel8.img` — our raw image loaded at `0x80000`.
+
+(Pi 4 and Pi 5 use an SPI EEPROM bootloader instead of `bootcode.bin`,
+but Pi Zero 2 W still uses the SD-card-loaded stage-1.)
+
+Source the firmware blobs from
+`github.com/raspberrypi/firmware/tree/master/boot`. Pin to a specific
+commit and record the SHA in this doc once we know what works.
+
+## Phase 0 — `kmain` at EL2, "Hello, EL2" over PL011
+
+**Closes:** Open Question §16.1 (EL2 handoff on real Pi firmware) in
+practice rather than in theory.
 **Effort:** half a day to a day.
 **Independent of:** everything else in this plan.
 
-Stub `kernel8.img` that prints `CurrentEL`, `SCR_EL3` if reachable, the
-top of `MIDR_EL1`, and a confirmation string over the mini-UART, then
-spins in WFE.
+A standalone `pi-probe` binary (separate `[[bin]]` in `Cargo.toml`, no
+linkage to the hypervisor proper) that brings up PL011 directly (no
+semihosting), reads `CurrentEL`, `MIDR_EL1`, `MPIDR_EL1`, prints them,
+WFE-loops.
 
 ### Tasks
 
-1. **SD-card image pipeline.**
-   - `boot/` partition layout: `bootcode.bin`, `start.elf`, `fixup.dat`
-     (from raspberrypi/firmware), `config.txt`, `kernel8.img`.
-   - `config.txt`:
-     ```
-     arm_64bit=1
-     enable_uart=1
-     core_freq=250         # pin core clock so mini-UART baud is stable
-     uart_2ndstage=1       # firmware-side serial debug
-     kernel=kernel8.img
-     ```
-   - Script: `scripts/build-sd.sh <output-dir>` — builds the image and
-     copies firmware + `kernel8.img` into place.
+1. **`config.txt`** (see `boot-pi/config.txt` in this repo):
+   ```
+   arm_64bit=1
+   kernel=kernel8.img
+   enable_uart=1
+   uart_2ndstage=1
+   dtoverlay=disable-bt
+   ```
+   `disable-bt` is the key line — without it the GPIO header carries
+   the mini-UART, not the PL011 our code drives.
 
-2. **Linker variant for real-Pi load address.**
-   - Pi firmware loads `kernel8.img` at `0x80000` (64-bit) by default.
-     Current `linker.ld` may target a different address for QEMU; check.
-   - Add `linker-pi-zero2w.ld` if needed, gated by a new
-     `platform-pi-zero2w` Cargo feature alongside `platform-raspi3b`.
-     Most of `platform-raspi3b` will be reusable — same MMIO map.
+2. **`scripts/build-sd.sh <dest>`** — assembles the SD boot partition:
+   firmware blobs (pinned commit) + `config.txt` + our `kernel8.img`.
 
-3. **Probe stub.**
-   - Tiny `kmain`-shaped Rust function: read `CurrentEL`, push a
-     well-known string + EL value over the mini-UART, WFE-loop.
-   - Build with the new feature, drop on SD, boot.
+3. **`src/pi_probe.rs`** — standalone `[[bin]]` that depends on nothing
+   from the main crate. Pulls in `boot.s` via `global_asm!` and
+   reaches `kmain` from there. PL011 setup duplicated inline (no
+   semihosting path).
 
 4. **Outcomes.**
-   - If serial prints `EL=2`: §16.1 is answered positively. Firmware
-     hands off at EL2 by default. Proceed.
-   - If `EL=1`: need `armstub` shim or `kernel_64bit_default_el=2` (newer
-     firmwares). Build the shim once; this answer is durable.
-   - If nothing prints: it's mini-UART setup. Cross-check against
-     `config.txt`, GPIO ALT5 routing, baud divisor. (Standard
-     bare-metal-Pi tutorial territory.)
+   - `EL=2` over the serial line: §16.1 confirmed positively on the
+     actual hardware in our hands. Proceed to Phase 1.
+   - Garbage characters: baud / clock mismatch. PL011 clock should be
+     48 MHz (firmware default) — if it's actually different, set
+     `init_uart_clock=48000000` explicitly.
+   - Firmware banner from `uart_2ndstage=1` but nothing from us: our
+     binary isn't running. Check the load address in `linker.ld`
+     (`0x80000`) matches the firmware's default for `arm_64bit=1`.
+   - No output at all: serial wiring, GPIO ALT mode, or
+     `dtoverlay=disable-bt` missing. Swap TX/RX first.
 
-5. **Capture.** Update `HIGHLEVEL.md` §16.1 from "open" to "answered:
-   firmware hands off at EL\<N\>" with the experiment date and the
-   `config.txt` used.
+5. **Capture.** Update `HIGHLEVEL.md` §16.1 to "answered on real Zero
+   2 W on \<date\>; default armstub → EL2h confirmed".
 
 ## Phase 1 — Full hypervisor `kmain` running, ROM patched, ERET
 
@@ -257,13 +338,34 @@ These don't block the plan but should be captured as they come up:
 
 | Phase | Status | Notes |
 |---|---|---|
-| 0 — EL2 handoff + UART | not started | half-day exercise; closes §16.1 |
+| 0 — EL2 handoff + UART | **ready to flash** | probe binary + SD pipeline done; awaiting boot on real Zero 2 W |
 | 1 — Hypervisor `kmain` on Zero | not started | depends on Phase 0 |
 | 2 — Persistent flash | not started | start with UART tunnel |
 | 3 — Snapshot on real hw | not started | optional |
 | 4 — Display | not started | mailbox + FB |
 | 5 — Input | not started | UART pen first, USB later |
 | 6 — Audio / serial / PCMCIA | not started | aligns with M6 |
+
+### Phase 0 — completed sub-pieces (2026-05-11)
+
+- `src/pi_probe.rs` — standalone `[[bin]]` (`pi-probe`). Prints
+  CurrentEL / MIDR_EL1 / MPIDR_EL1 over PL011, WFE-loops. Verified in
+  QEMU `raspi3b`: `CurrentEL = 2`, MIDR matches Cortex-A53.
+- `boot-pi/config.txt` — `arm_64bit=1`, `enable_uart=1`,
+  `uart_2ndstage=1`, `dtoverlay=disable-bt`.
+- `scripts/build-sd.sh <dest>` — fetches pinned Pi firmware blobs
+  (cached under `target/pi-firmware-cache/`), builds `pi-probe`,
+  objcopies to `kernel8.img`, assembles the full boot-partition
+  layout under `<dest>`. Pinned firmware commit:
+  `8fce67a9ec5668fb8d42d215c9ec4c199340bf41`.
+- `linker.ld` / `linker-fvp.ld` — added `.eh_frame_hdr` to the
+  DISCARD list. Without `.rodata` to anchor orphan-section
+  placement (the probe binary has no `.rodata` because string
+  literals fold into `.text`), the linker was placing
+  `.eh_frame_hdr` at VMA 0x80000, shifting `_start` 12 bytes
+  later and crashing on the leading UDFs. Main hypervisor binary
+  unaffected (its `.rodata` section already anchored
+  `.eh_frame_hdr` elsewhere).
 
 Update this table as phases close. Each row should eventually link to
 the commit(s) that closed it.

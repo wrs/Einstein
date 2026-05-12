@@ -77,3 +77,16 @@ disable_overscan=1
 hdmi_drive=2
 hdmi_force_hotplug=1
 config_hdmi_boost=7
+
+# Force CEA 720p60 (1280x720 @60 Hz, mode 4 in HDMI CEA group).
+# The panel's preferred DMT 39 (1360x768) mode is non-standard and
+# was producing intermittent flicker that the signal-strength knobs
+# above didn't fix. CEA timings are part of every HDMI receiver's
+# baseline support and lock reliably. The monitor will scale 720p
+# to its native 1360x768 internally.
+#
+# When this hypothesis is no longer needed (Newton ships, panel
+# choice is finalised, etc.) revisit: we lose some pixels and
+# add a scaling step, both fine for now.
+hdmi_group=1
+hdmi_mode=4

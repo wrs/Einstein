@@ -19,6 +19,7 @@ mod guest_mem;
 mod heap_check;
 mod host_io;
 mod hvc_imm;
+mod input;
 #[cfg(feature = "platform-raspi3b")]
 mod mailbox;
 mod mmio;
@@ -39,6 +40,8 @@ mod symbols;
 mod tarmac;
 mod task_dump;
 mod timer;
+#[cfg(feature = "platform-raspi3b")]
+mod usb;
 #[cfg(feature = "trace")]
 mod tracer;
 mod trap;
@@ -135,6 +138,7 @@ pub extern "C" fn kmain() -> ! {
     peripherals::vic::init();
     timer::init();
     host_io::init();
+    input::init();
 
     // Seed the snapshot ring's sequence counter from existing slots
     // (so resumed runs don't reuse seq numbers), then attempt to

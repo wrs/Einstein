@@ -124,6 +124,7 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
     // on this trap exit instead of waiting for the next CNTHP
     // heartbeat. Cheap: backend self-throttles to 16 ms wall.
     crate::host_io::pump_input();
+    crate::input::pump();
 
     // Guest MMIO writes to IntCtrl / FIQMask / IntClear change the
     // effective (`int_present & int_ctrl & ~fiq_mask`) pending set and
@@ -152,7 +153,7 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
     if n % 10_000 == 0 {
         let elr = read_sysreg!("elr_el2");
         let spsr = read_sysreg!("spsr_el2");
-        kprintln!(
+        crate::log_traps!(
             "beacon: {} traps, ELR={:#x} SPSR={:#x} int_present={:#x}",
             n, elr, spsr, vic::raised()
         );
@@ -225,14 +226,9 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
         let irq_pend = vic::irq_pending();
         // SP_svc / LR_svc via the AArch64 GPR file per ARM ARM
         // DDI 0487 D1.21.1 Table D1-79: R13_svc ↔ X19, R14_svc ↔ X18.
-        // (SP_EL1 / ELR_EL1 are AArch64-only EL0/EL1 sysregs with no
-        // architectural alias to AArch32 banked R13/R14; reading them
-        // here was the same misdiagnosis docs/QEMU_BUGS.md warns
-        // against.) Tells us where the SVC-mode call stack is parked
-        // when the guest is wedged in a kernel idle loop.
         let sp_svc = ctx.x[19] as u32;
         let lr_svc = ctx.x[18] as u32;
-        kprintln!(
+        crate::log_irqs!(
             "timer_irq[{}]: ELR={:#x} SPSR={:#x} SP_svc={:#x} LR_svc={:#x} FAR_EL1={:#x} intid={} VI={} ipres={:#x} ictrl={:#x} pend={}",
             tag, elr, spsr, sp_svc, lr_svc, far, intid, vi, int_present, int_ctrl, irq_pend
         );
@@ -320,8 +316,11 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     // Pump the host-io backend: drain any pen events the viewer
     // posted, enqueue them, and raise INT_TABLET. Must run BEFORE
     // update_virq so the IRQ it raises lands in HCR_EL2.VI on this
-    // trap exit, not the next one.
+    // trap exit, not the next one. `input::pump` is the parallel
+    // path for real-hw pen sources (USB touchscreen) — it feeds the
+    // same queue.
     crate::host_io::pump_input();
+    crate::input::pump();
     update_virq();
     // Wall-clock-paced snapshot save. Timer IRQ is a cleaner hook
     // than sync traps: it fires regardless of whether the guest is
@@ -334,6 +333,9 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     // can see what dominates the residual trap rate (EC class, HVC
     // immediate, DABT PC/IPA). See `crate::trap_hist`. Independent
     // of snapshot autosave (which is gated when guest_bp is live).
+    // Gated on `log_traps`: prints a multi-line histogram every 2s,
+    // valuable for Phase-B but noise on a real-hardware boot.
+    #[cfg(feature = "log_traps")]
     {
         use core::sync::atomic::{AtomicU64, Ordering};
         static NEXT_DUMP_TICKS: AtomicU64 = AtomicU64::new(0);

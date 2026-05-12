@@ -110,6 +110,18 @@ pub const TAG_FB_SET_PIXEL_ORDER: u32 = 0x0004_8006;
 pub const TAG_FB_GET_PITCH: u32 = 0x0004_0008;
 pub const TAG_FB_SET_VIRTUAL_OFFSET: u32 = 0x0004_8009;
 
+/// Power-state tag — request `(device, state)`, response same
+/// shape. State bit 0 = on(1)/off(0), bit 1 = block until the
+/// power state has been reached. On response bit 1 means "no
+/// such device" (NOT "wait" any more — sense flips). See Circle's
+/// `bcmpropertytags.h`.
+pub const TAG_SET_POWER_STATE: u32 = 0x0002_8001;
+pub const DEVICE_ID_USB_HCD: u32 = 3;
+pub const POWER_STATE_OFF: u32 = 0;
+pub const POWER_STATE_ON: u32 = 1 << 0;
+pub const POWER_STATE_WAIT: u32 = 1 << 1;
+pub const POWER_STATE_NO_DEVICE: u32 = 1 << 1; // response only
+
 /// Clock-ID constants for `TAG_*_CLOCK_RATE`.
 pub const CLOCK_ID_EMMC: u32 = 1;
 pub const CLOCK_ID_UART: u32 = 2;
@@ -234,6 +246,18 @@ fn send_one_tag(tag_id: u32, arg_words: &mut [u32]) -> Result<(), MailboxError> 
         *slot = buf.words[5 + i];
     }
     Ok(())
+}
+
+/// Set the power state of a SoC device. Returns the state the
+/// firmware reports after applying. With `POWER_STATE_WAIT` set,
+/// the firmware blocks until the rail has stabilised; without it
+/// the call returns immediately and the caller is expected to
+/// delay. The DWC2 USB HCD wants the rail stable before any
+/// register access, so always pass WAIT.
+pub fn set_power_state(device_id: u32, state: u32) -> Result<u32, MailboxError> {
+    let mut payload = [device_id, state];
+    send_one_tag(TAG_SET_POWER_STATE, &mut payload)?;
+    Ok(payload[1])
 }
 
 /// Query the current rate of a clock ID. Returns Hz.

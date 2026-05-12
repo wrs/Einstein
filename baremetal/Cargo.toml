@@ -19,8 +19,35 @@ name = "pi-probe"
 path = "src/pi_probe.rs"
 required-features = ["platform-raspi3b"]
 
+# Phase-5b real-hardware USB-host probe — standalone binary, brings
+# up PL011 + DWC2 OTG @ 0x3F98_0000, enumerates whatever's plugged
+# in (device + configuration + interface descriptors), prints over
+# serial, WFE-loops. Independent of the main hypervisor crate; used
+# for first-light validation of the DWC2 driver in src/usb/host/dwc2/.
+# See `docs/REAL_HW_BRINGUP.md` Phase 5b. Gated behind the
+# `usb-probe` feature because the underlying USB stack is still
+# under bring-up; build with:
+#   cargo build --release --bin usb-probe \
+#     --no-default-features --features "pi-bare-metal usb-probe"
+[[bin]]
+name = "usb-probe"
+path = "src/usb_probe.rs"
+required-features = ["platform-raspi3b", "usb-probe"]
+
 [features]
-default = ["platform-raspi3b"]
+default = ["platform-raspi3b", "log_mmu", "log_traps", "log_tasks", "log_irqs"]
+
+# Per-category log feature gates. ON by default (via the QEMU
+# `default` set) to preserve Phase-B trace-debug behaviour; OFF for
+# `pi-bare-metal-*` aggregates so real-hardware boots stay quiet.
+# See `src/uart.rs` for the macros: `log_mmu!`, `log_traps!`,
+# `log_tasks!`, `log_irqs!`. Add/remove a feature with
+# `--features log_traps` / `--no-default-features --features
+# "pi-bare-metal-input log_traps"`.
+log_mmu = []
+log_traps = []
+log_tasks = []
+log_irqs = []
 
 # Host-platform selection. Exactly one must be enabled; build.rs panics
 # otherwise. Controls UART/GIC addresses, MMU memory map, load address
@@ -72,6 +99,27 @@ flash-persist-pico = []
 # built up in src/sd. Selected by the `pi-bare-metal-sd` aggregate.
 flash-persist-sd = []
 
+# Pen-input backend. Opt-in only — at most one may be enabled. If
+# none are enabled, build.rs picks "null" (no input source; QEMU/FVP
+# get their pen events through the host_io-semihost backend, which
+# is independent of this axis). Source code reads
+# `#[cfg(nh_input_*)]`. See `src/input/mod.rs`.
+#
+#   input-null   — no pen source. Default; QEMU/FVP routes input
+#                  through host_io-semihost; real-hw builds without
+#                  the touchscreen just stay mute.
+#   input-mtouch — TSTP MTouch USB digitizer (VID 0x0416 / PID
+#                  0xC168) over the BCM2710 DWC2 OTG controller.
+#                  Polled from the timer IRQ tail. Selected by the
+#                  `pi-bare-metal-input` aggregate.
+input-null = []
+input-mtouch = []
+
+# Compile the standalone `usb-probe` binary. Off by default because
+# the USB stack underneath (`src/usb/host/dwc2/`) is bring-up code
+# and the probe pulls it in. See [[bin]] section for build line.
+usb-probe = []
+
 # Disable every in-tree call to Arm semihosting (HLT #0xF000). Required
 # when running on real silicon, where no semihosting host is listening:
 #
@@ -110,6 +158,19 @@ pi-bare-metal-display = [
     "no-semihost",
     "flash-persist-sd",
     "host-io-pi-fb",
+]
+
+# Real-Pi build with full display + TSTP MTouch USB touch panel.
+# Adds the DWC2 host-controller driver and the MTouch device
+# driver on top of pi-bare-metal-display. Build:
+#   cargo build --release --no-default-features \
+#     --features pi-bare-metal-input
+pi-bare-metal-input = [
+    "platform-raspi3b",
+    "no-semihost",
+    "flash-persist-sd",
+    "host-io-pi-fb",
+    "input-mtouch",
 ]
 
 # Real-hardware SDHOST bring-up probe. When enabled, kmain stops

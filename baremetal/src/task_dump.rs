@@ -1356,20 +1356,34 @@ pub fn dump_phys_for_pa(target_pa: u32) {
 /// the task transitions through SWI/IRQ in EL1, and our trap_irq goes
 /// straight to EL2 instead).
 pub fn periodic(ctx: &crate::trap::TrapContext) -> bool {
-    static mut COUNT: u64 = 0;
-    let n = unsafe {
-        COUNT = COUNT.wrapping_add(1);
-        COUNT
-    };
-    // Roughly every 256 heartbeats × 16 ms ≈ 4 s. The object-table walk
-    // touches up to 128 buckets through the stage-1 walker, so keeping
-    // this slow keeps UART noise under control.
-    if n % 256 == 0 {
-        dump();
-        dump_current_chain(ctx);
-        true
-    } else {
-        false
+    // Gated on `log_tasks`: the full body of `dump()` +
+    // `dump_current_chain()` writes 30+ lines of scheduler /
+    // run-queue / call-chain state per fire. Useful for Phase-B
+    // wedge investigation, noisy on real-hardware boots that just
+    // want to see "is the touchscreen working".
+    #[cfg(not(feature = "log_tasks"))]
+    {
+        let _ = ctx;
+        return false;
+    }
+    #[cfg(feature = "log_tasks")]
+    {
+        static mut COUNT: u64 = 0;
+        let n = unsafe {
+            COUNT = COUNT.wrapping_add(1);
+            COUNT
+        };
+        // Roughly every 256 heartbeats × 16 ms ≈ 4 s. The
+        // object-table walk touches up to 128 buckets through the
+        // stage-1 walker, so keeping this slow keeps UART noise
+        // under control.
+        if n % 256 == 0 {
+            dump();
+            dump_current_chain(ctx);
+            true
+        } else {
+            false
+        }
     }
 }
 

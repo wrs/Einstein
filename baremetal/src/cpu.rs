@@ -143,6 +143,35 @@ pub fn dc_civac_range(va: u64, len: usize) {
 }
 
 
+/// Spin until at least `ms` ms have elapsed by CNTPCT_EL0. Used by
+/// the DWC2 driver for spec-mandated reset / settle delays (e.g.
+/// USB 2.0 `tDRSTR` = 50 ms after asserting port reset). The timer
+/// is always running by the time anything calls this — `boot.s`
+/// programs `CNTFRQ_EL0` and the generic timer is on out of reset.
+pub fn delay_ms(ms: u32) {
+    let freq: u64;
+    let start: u64;
+    // SAFETY: sysreg reads, side-effect free.
+    unsafe {
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq,
+            options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) start,
+            options(nomem, nostack, preserves_flags));
+    }
+    let target = start.wrapping_add((freq * ms as u64) / 1000);
+    loop {
+        let now: u64;
+        // SAFETY: sysreg read.
+        unsafe {
+            core::arch::asm!("mrs {}, cntpct_el0", out(reg) now,
+                options(nomem, nostack, preserves_flags));
+        }
+        if now.wrapping_sub(target) as i64 >= 0 {
+            return;
+        }
+    }
+}
+
 // NOTE: There is no `read_sp_abt()` helper. `MRS <Xt>, SP_abt`
 // (S3_4_C4_C1_1) is architecturally defined (DDI 0487 D19.2) but
 // QEMU raspi3b's Cortex-A53 model takes an EC=0 UNDEFINED trap at

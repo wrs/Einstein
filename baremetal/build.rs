@@ -41,10 +41,13 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(nh_flash_persist_semihost)");
     println!("cargo:rustc-check-cfg=cfg(nh_flash_persist_pico)");
     println!("cargo:rustc-check-cfg=cfg(nh_flash_persist_sd)");
+    println!("cargo:rustc-check-cfg=cfg(nh_input_null)");
+    println!("cargo:rustc-check-cfg=cfg(nh_input_mtouch)");
 
     select_platform_linker_script();
     resolve_host_io_backend();
     resolve_flash_persist_backend();
+    resolve_input_backend();
     emit_flash_path();
 
     let guest_test = env::var("NH_GUEST_TEST").ok();
@@ -187,6 +190,26 @@ fn resolve_flash_persist_backend() {
         }
     };
     println!("cargo:rustc-cfg=nh_flash_persist_{chosen}");
+}
+
+/// Pick the active input backend and emit `cfg(nh_input_*)`. Same
+/// opt-in-with-fallback pattern as the host-io and flash-persist
+/// axes. Default ("null") = no pen source; QEMU/FVP routes pen
+/// events through `host_io-semihost`, which is independent of this
+/// axis. `input-mtouch` lights up `src/input/mtouch.rs` plus the
+/// USB host stack under `src/usb/`.
+fn resolve_input_backend() {
+    let null = env::var("CARGO_FEATURE_INPUT_NULL").is_ok();
+    let mtouch = env::var("CARGO_FEATURE_INPUT_MTOUCH").is_ok();
+    let chosen = match (null, mtouch) {
+        (false, false) => "null",
+        (true, false) => "null",
+        (false, true) => "mtouch",
+        (true, true) => panic!(
+            "input-null and input-mtouch are mutually exclusive"
+        ),
+    };
+    println!("cargo:rustc-cfg=nh_input_{chosen}");
 }
 
 /// Resolve `$HOME/.newton/flash.bin` at build time and expose it as

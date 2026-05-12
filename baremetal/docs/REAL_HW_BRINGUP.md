@@ -703,8 +703,13 @@ selected by aggregate features:
 | `pi-bare-metal` | off | null | null | null | first-light real-hw boot |
 | `pi-bare-metal-sd` | off | sd | null | null | real-hw with persistent state |
 | `pi-bare-metal-display` | off | sd | pi-fb | null | real-hw, full display |
-| `pi-bare-metal-input` | off | sd | pi-fb | mtouch | real-hw, full display + USB touch (Phase 5) |
+| `pi-bare-metal-input` | off | sd | pi-fb | mtouch | real-hw, full display + USB touch |
 | `platform-fvp-base` | on | semihost | null | null | FVP cycle-accurate runs |
+
+The `pi-bare-metal-input` aggregate compiles cleanly today; pen
+events flow only when the DWC2 host stub (`src/usb/host/dwc2/`)
+finishes coming up. Until then the build behaves like
+`pi-bare-metal-display`.
 
 Probe features (`sd-probe`, `fb-probe`, `sd-probe-trace`) are
 additive on top of any aggregate. The build script accepts
@@ -741,8 +746,104 @@ These don't block the plan but should be captured as they come up:
 | 2 — Persistent flash | **done (2026-05-12)** | `flash-persist-sd` backend running on real hw. SDHOST at 25 MHz / 4-bit; ~700 KB/s through the FAT layer (CMD17/CMD24 per sector — multi-block command is the obvious next optimisation). Pi-bare-metal-sd boot loads + saves `/NEWTON.BIN` end-to-end across cold boots. |
 | 3 — Snapshot on real hw | **deferred** | Snapshots are valuable when debugging late-boot state on QEMU/FVP; on real silicon the boot tends to *complete*, so the rewind-by-2s loop they accelerate isn't load-bearing. Skip until a real-hw bug demands them. |
 | 4 — Display | **done (2026-05-12)** | `host-io-pi-fb` backend running on real hw. Newton's 320x480 2 bpp FB scaled 1.5x to 480x720 centred on a 1280x720 HDMI panel (CEA mode 4 forced for link stability). Output looks like the QEMU/FVP host-viewer image but with nearest-neighbor aliasing; bilinear or integer-scale-with-letterbox is a follow-up. |
-| 5 — USB input (touchscreen) | **next** | TSTP MTouch panel characterized 2026-05-12 (see [`MTOUCH.md`](MTOUCH.md)). Five sub-phases: `PenSource` seam → DWC2 host → enumeration+HID → MTouch driver → calibration. UART tunnel dropped. |
+| 5 — USB input (touchscreen) | **done (2026-05-12)** | TSTP MTouch panel working end-to-end on Walter's Pi Zero 2 W. Taps on the HDMI-connected touchscreen drive Newton's UI (Continue button on Welcome screen responds to both fast and slow taps). |
 | 6 — HDMI audio / serial / PCMCIA | not started | Audio via HDMI through BCM2835 PCM/I2S (bench panel has speakers). USB stack stays single-device-no-hub permanently. |
+
+### Phase 5 — closed (2026-05-12)
+
+TSTP MTouch USB touchscreen working on Walter's Pi Zero 2 W. Taps
+land on the Newton UI through the full chain — confirmed with the
+Welcome screen's Continue button responding to both fast and slow
+taps.
+
+#### What landed
+
+```
+  src/input/         PenSource trait + null backend + mtouch driver
+    mod.rs           PenEvent enum, drain_into_queue marker logic
+    null.rs          no-op (default, used by every QEMU/FVP build)
+    mtouch.rs        TSTP MTouch driver — activation handshake,
+                     IN-endpoint poll, slot-0 decode, ring buffer
+    calibrate.rs     panel 1024x600 → Newton 320x480 (inverse of
+                     Phase 4 transform); compile-time spot checks
+  src/usb/
+    mod.rs           shared types: SetupPacket, UsbError, request
+                     codes, descriptor type constants
+    descriptor.rs    Device/Config/Interface/Endpoint/HID parsers +
+                     walk_config iterator
+    enumerate.rs     standard §9.1.2 sequence (GET_DESC, SET_ADDR
+                     + 50ms tDSETADDR delay, SET_CONFIG + 50ms);
+                     produces UsbDevice
+    class/hid.rs     SET_IDLE / GET_REPORT / GET_DESCRIPTOR(Report)
+    host/mod.rs      UsbHostController trait
+    host/dwc2/       Synopsys DWC2 driver — full host-mode init,
+                     channel-0 control + interrupt-IN transfers,
+                     per-endpoint DATA0/DATA1 toggle tracking,
+                     pre-transfer channel-disable safeguard
+    dispatch.rs      UsbDeviceDriver trait (for any future device)
+  src/usb_probe.rs   standalone bin — reads DWC2 GSNPSID, confirms
+                     OTG core is alive on real hw
+```
+
+Wiring:
+
+- `input::pump()` runs from the same trap-return tail as
+  `host_io::pump_input` (`src/trap.rs`); both feed the same pen-
+  sample queue (`host_io::queue`) so the rest of the hypervisor
+  (TScreenManager / INT_TABLET / `NativeGetSample`) is oblivious to
+  the source.
+- Cargo axis `nh_input_*` resolved by `build.rs`. Aggregate
+  `pi-bare-metal-input` = `pi-bare-metal-display` + `input-mtouch`.
+- DWC2 implementation cross-checked twice against Circle's
+  `lib/usb/{dwhcidevice.cpp, dwhcixferstagedata.cpp, usbendpoint.cpp,
+  usbhostcontroller.cpp, dwhciframeschednoSplit.cpp}` plus the
+  `include/circle/usb/dwhci.h` register map.
+
+Calibration math (`src/input/calibrate.rs`):
+
+- Touch 0..1024 × 0..600 maps to a 1280×720 panel; Newton paints
+  the centre 480×720 region (Phase 4).
+- Left letterbox band: panel touch X < 320 → drop.
+- Right band: panel touch X ≥ 704 → drop.
+- In-region: `newton_x = (touch_x - 320) * 320 / 384`,
+  `newton_y = touch_y * 480 / 600`.
+- Compile-time spot checks assert corner + centre map correctly.
+
+#### Bring-up lessons (each cost a real-hw round-trip)
+
+- **`HCDMA` takes the GPU-bus uncached alias, not the bare ARM PA.**
+  Pi 2/3/Zero-2-W's DWC2 AHB master sees DRAM through
+  `pa | 0xC0000000` (Circle's `BUS_ADDRESS` macro on
+  `GPU_MEM_BASE = GPU_UNCACHED_BASE`). Passing the bare PA gives
+  `XACT_ERR` on the first transaction every time. The cache-flush
+  call still uses the ARM VA — only HCDMA gets the alias.
+- **USB 2.0 §9.2.6.3 `tDSETADDR` is real.** Skipping the 50 ms post-
+  SET_ADDRESS delay makes the *next* SETUP at addr=1 hit XACT_ERR —
+  the device is still listening at addr=0. Same applies to
+  SET_CONFIGURATION. Matches `usbhostcontroller.cpp:80`.
+- **DMA mode does NOT auto-advance the host's data-toggle PID.**
+  The DWC2 core keeps its internal state, but the host driver has
+  to track DATA0↔DATA1 across separate transfers and pass the
+  expected PID in HCTSIZ. Without this, the first interrupt-IN
+  packet works and every subsequent one silently drops with
+  `DATA_TGL_ERR`. Circle's `CUSBEndpoint::SkipPID()` is the
+  reference. Ours lives on `Dwc2::int_next_pid[16]`.
+- **HID 1.11 §8.6 inserts the Report ID byte.** The MTouch
+  activation reply is `[0x03, 0x0a]` (`[ReportID=3,
+  ContactCountMax=10]`), not the `[0x0a, 0x00]` originally
+  documented in `MTOUCH.md` — Linux's `hid-multitouch` strips the
+  ID byte for userland, which is what we saw with `usbhid-dump`.
+- **`FRM_OVRUN` on a periodic-IN is the *normal* idle response,
+  not an error.** When the device NAKs and the frame ends without
+  a successful packet, the core sets FRM_OVRUN + ChHltd. Treating
+  it as a transaction error spams the console at 16 ms cadence and
+  hides real bus errors. Classify it as "no data this poll" (with
+  no log) and the steady-state goes quiet.
+- **Newton's pen-detection cares about the specific pressure value,
+  not just non-zero.** Einstein's `TScreenManager::PenDown` default
+  pressure is 4; passing 8 makes the samples reach `NativeGetSample`
+  cleanly but the UI silently ignores them. Match Einstein
+  byte-for-byte: `PRESSURE: u16 = 4` in `input::drain_into_queue`.
 
 ### Phase 2 — closed (2026-05-12)
 

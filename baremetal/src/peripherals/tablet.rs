@@ -140,14 +140,22 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         //                         *r2 = sample time in Newton ticks.
         //   r0 = 0 (queue empty) — leave *r1 / *r2 alone.
         0x16 => {
-            // Budget-limited entry log so we can confirm the guest is
-            // actually polling NativeGetSample at all.
+            // Budget-limited entry log — first 8 calls only,
+            // unconditionally (the budget self-throttles so this
+            // doesn't flood). Tells us Newton's tablet ISR
+            // responded to INT_TABLET at all. After the first 8
+            // entries, opt into log_irqs for full visibility.
             {
                 use core::sync::atomic::{AtomicUsize, Ordering};
                 static N: AtomicUsize = AtomicUsize::new(0);
                 let n = N.fetch_add(1, Ordering::Relaxed);
                 if n < 8 {
                     kprintln!("tablet.NativeGetSample call #{} @PC={:#x}", n, pc);
+                } else {
+                    crate::log_irqs!(
+                        "tablet.NativeGetSample call #{} @PC={:#x}",
+                        n, pc
+                    );
                 }
             }
             match crate::host_io::pop_pen_sample() {
@@ -166,6 +174,11 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
                     let n = N.fetch_add(1, Ordering::Relaxed);
                     if n < 16 {
                         kprintln!(
+                            "tablet: returned sample={:#010x} ticks={:#x}",
+                            sample, ticks
+                        );
+                    } else {
+                        crate::log_irqs!(
                             "tablet: returned sample={:#010x} ticks={:#x}",
                             sample, ticks
                         );

@@ -57,16 +57,22 @@ activation request and reports start flowing immediately.
 The trigger is a Feature Report fetch:
 
 ```
-GET_REPORT(type=Feature, ReportID=3, length=2)  →  bytes: 0x0a 0x00
-                                                   (Contact Count Max = 10)
+GET_REPORT(type=Feature, ReportID=3, length=2)  →  bytes: 0x03 0x0a
+                                                   ([ReportID, ContactCountMax=10])
 ```
 
 This is hid-multitouch's standard "discover max contacts" call; the
-device firmware uses it as "host is ready". Once issued, Report ID 1
-streams continuously at ~16 ms intervals (steady, with keep-alive
-reports even when nothing changes — see "Behavior notes" below). The
-hypervisor USB stack must replicate this — otherwise the panel stays
-mute despite a fully-configured endpoint.
+device firmware uses it as "host is ready". The reply layout follows
+HID 1.11 §8.6: when a device exposes multiple Report IDs, the
+control-pipe response is **prefixed with the Report ID byte**, so we
+get `0x03 0x0a` on the wire — not `0x0a 0x00`. (Earlier revisions
+of this doc had it the other way around, which was a transcription
+of what hid-multitouch surfaces to userland after stripping the ID
+byte.) Once issued, Report ID 1 streams continuously at ~16 ms
+intervals (steady, with keep-alive reports even when nothing changes
+— see "Behavior notes" below). The hypervisor USB stack must
+replicate this — otherwise the panel stays mute despite a
+fully-configured endpoint.
 
 The 142-byte vendor channel (interface 1) is a separate concern and
 appears to be quiescent in practice; we don't touch it.

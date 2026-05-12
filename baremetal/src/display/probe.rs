@@ -37,7 +37,19 @@ pub fn run() -> ! {
 
     kprintln!("fb: painting red → green gradient...");
     fb::fill_h_gradient(&info, red, green);
-    kprintln!("fb: paint done; halt");
+
+    // Diagnostic: paint the top 32 rows pure blue. A persistent
+    // white bar at the top of the screen survived both
+    // avoid_warnings=1 and disable_overscan=1, which rules out the
+    // two usual suspects. If the bar still appears white over
+    // these rows, something is drawing an overlay above our
+    // framebuffer (Dispmanx layer, firmware status bar, monitor
+    // OSD). If the blue shows through, our paint just isn't
+    // reaching the top rows for some reason (math bug? wrong
+    // base address?).
+    let blue = u32::from_le_bytes([0x00, 0x00, 0xFF, 0x00]);
+    fb::fill_top_rows(&info, 32, blue);
+    kprintln!("fb: top 32 rows painted blue (overlay-vs-paint test); halt");
 
     cpu::halt();
 }

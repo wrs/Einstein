@@ -130,6 +130,26 @@ pub fn fill_solid(fb: &FbInfo, pixel: u32) {
     crate::cpu::dc_civac_range(fb.pa, fb.size as usize);
 }
 
+/// Fill the top `n` rows of the framebuffer with a single pixel
+/// value. Used as an overlay-vs-paint diagnostic: paint a known
+/// distinctive colour, see whether the disputed bar covers it.
+pub fn fill_top_rows(fb: &FbInfo, n: u32, pixel: u32) {
+    let ptr = fb.pa as *mut u32;
+    let pixels_per_row = (fb.pitch / 4) as usize;
+    let rows = n.min(fb.height) as usize;
+    for y in 0..rows {
+        for x in 0..fb.width as usize {
+            // SAFETY: in-bounds by construction (rows ≤ fb.height,
+            // x < fb.width, ptr at fb.pa is fb.size bytes valid).
+            unsafe {
+                ptr.add(y * pixels_per_row + x).write_volatile(pixel);
+            }
+        }
+    }
+    let row_bytes = pixels_per_row * 4;
+    crate::cpu::dc_civac_range(fb.pa, rows * row_bytes);
+}
+
 /// Fill with a horizontal gradient — left = `left`, right = `right`.
 /// Interpolation is byte-wise per channel, no gamma correction.
 /// Useful as a "is the bus-order correct" probe: a red→green

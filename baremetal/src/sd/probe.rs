@@ -142,6 +142,81 @@ pub fn run() -> ! {
         }
     }
     kprintln!("\r\n====== ({} bytes) ======", total);
+    // Close the read-only handle so the volume manager's file-slot
+    // count goes back to zero before we open another file.
+    drop(file);
+
+    // Write probe: round-trip a known payload through the FAT layer.
+    // Validates the write path before flash-persist-sd commits to it.
+    write_probe(&root);
+
     kprintln!("halt");
     cpu::halt();
+}
+
+const WRITE_PROBE_NAME: &str = "EL2HELLO.TXT";
+const WRITE_PROBE_PAYLOAD: &[u8] =
+    b"hello from EL2 SDHOST probe (newton-hypervisor)\r\n";
+
+fn write_probe(root: &embedded_sdmmc::Directory<SdHost, NullTime, 4, 4, 1>) {
+    kprintln!("====== write probe ({}) ======", WRITE_PROBE_NAME);
+    {
+        // Open create-or-truncate so each run starts from a known
+        // empty file. ReadWriteCreateOrTruncate creates the file if
+        // it doesn't exist, otherwise empties it.
+        let file = match root
+            .open_file_in_dir(WRITE_PROBE_NAME, Mode::ReadWriteCreateOrTruncate)
+        {
+            Ok(f) => {
+                kprintln!("fat: open(write) ok");
+                f
+            }
+            Err(e) => {
+                kprintln!("fat: open(write) FAILED: {:?}", e);
+                cpu::halt();
+            }
+        };
+        if let Err(e) = file.write(WRITE_PROBE_PAYLOAD) {
+            kprintln!("fat: write FAILED: {:?}", e);
+            cpu::halt();
+        }
+        kprintln!("fat: wrote {} bytes", WRITE_PROBE_PAYLOAD.len());
+        if let Err(e) = file.flush() {
+            kprintln!("fat: flush FAILED: {:?}", e);
+            cpu::halt();
+        }
+        kprintln!("fat: flush ok");
+        // file dropped at end of scope -> directory entry committed.
+    }
+
+    // Reopen read-only and verify byte-for-byte.
+    let file = match root.open_file_in_dir(WRITE_PROBE_NAME, Mode::ReadOnly) {
+        Ok(f) => f,
+        Err(e) => {
+            kprintln!("fat: reopen(read) FAILED: {:?}", e);
+            cpu::halt();
+        }
+    };
+    let mut readback = [0u8; 64];
+    let n = match file.read(&mut readback) {
+        Ok(n) => n,
+        Err(e) => {
+            kprintln!("fat: readback FAILED: {:?}", e);
+            cpu::halt();
+        }
+    };
+    if n != WRITE_PROBE_PAYLOAD.len() || &readback[..n] != WRITE_PROBE_PAYLOAD {
+        kprintln!(
+            "fat: readback MISMATCH (got {} bytes, want {})",
+            n,
+            WRITE_PROBE_PAYLOAD.len(),
+        );
+        kprint!("  got:  ");
+        for &b in &readback[..n] {
+            kprint!("{:02x} ", b);
+        }
+        kprintln!();
+        cpu::halt();
+    }
+    kprintln!("fat: readback ok ({} bytes match)", n);
 }

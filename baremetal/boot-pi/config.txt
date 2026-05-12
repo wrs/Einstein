@@ -10,6 +10,15 @@
 # the 32-bit armstub.
 arm_64bit=1
 
+# Use the cut-down GPU firmware (start_cd.elf + fixup_cd.dat).
+# Per the config.txt docs: "Cut-down firmware (start*cd.elf and
+# fixup*cd.dat) cannot be selected this way [via start_file=] - the
+# system will fail to boot. The only way to enable the cut-down
+# firmware is to specify gpu_mem=16." We ship start_cd.elf, so this
+# line is mandatory — otherwise the firmware looks for start.elf
+# (which isn't on the SD) and halts after reading config.txt.
+gpu_mem=16
+
 # Our binary (built by scripts/build-sd.sh from the pi-probe [[bin]]).
 kernel=kernel8.img
 

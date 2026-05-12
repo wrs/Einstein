@@ -338,7 +338,7 @@ These don't block the plan but should be captured as they come up:
 
 | Phase | Status | Notes |
 |---|---|---|
-| 0 — EL2 handoff + UART | **ready to flash** | probe binary + SD pipeline done; awaiting boot on real Zero 2 W |
+| 0 — EL2 handoff + UART | **done (2026-05-11)** | `CurrentEL = 2` on Walter's Zero 2 W; §16.1 closed |
 | 1 — Hypervisor `kmain` on Zero | not started | depends on Phase 0 |
 | 2 — Persistent flash | not started | start with UART tunnel |
 | 3 — Snapshot on real hw | not started | optional |
@@ -346,7 +346,27 @@ These don't block the plan but should be captured as they come up:
 | 5 — Input | not started | UART pen first, USB later |
 | 6 — Audio / serial / PCMCIA | not started | aligns with M6 |
 
-### Phase 0 — completed sub-pieces (2026-05-11)
+### Phase 0 — closed (2026-05-11)
+
+Real-hardware result on Walter's Pi Zero 2 W, default firmware path
+(commit `8fce67a9`, `arm_64bit=1`, `gpu_mem=16`, `dtoverlay=disable-bt`):
+
+```
+Read File: config.txt, 1786
+Read File: start_cd.elf, 851132 (bytes)
+Read File: fixup_cd.dat, 3273 (bytes)
+
+=== newton pi-probe ===
+CurrentEL = 2
+MIDR_EL1  = 0x00000000410fd034
+MPIDR_EL1 = 0x0000000080000000
+ok, parking core 0 in WFE
+```
+
+Matches the QEMU `raspi3b` run byte-for-byte (same MIDR, same EL,
+same MPIDR with bit 31 RES1). §16.1 in `HIGHLEVEL.md` is closed.
+
+#### Completed sub-pieces
 
 - `src/pi_probe.rs` — standalone `[[bin]]` (`pi-probe`). Prints
   CurrentEL / MIDR_EL1 / MPIDR_EL1 over PL011, WFE-loops. Verified in

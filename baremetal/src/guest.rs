@@ -257,6 +257,31 @@ pub unsafe fn eret_to_restored(state: crate::snapshot::RestoreState) -> ! {
     unsafe {
         configure_el2_traps();
 
+        // Match the M=0→M=1 transition the cold-boot path takes when
+        // the guest first turns its stage-1 MMU on (see the
+        // `(0, 1, 0, 0, false)` CP15-write handler in `trap.rs` at the
+        // `was_off && now_on` branch). Snapshots are saved deep into the
+        // boot, well past that transition, so SCTLR_EL1.M is already 1
+        // when the snapshot loads — but `configure_el2_traps` just
+        // unconditionally re-asserted HCR_EL2.DC=1, which per DDI 0487
+        // D13.2.50 forces the Non-secure EL1&0 stage-1 translation
+        // regime to behave as `SCTLR_EL1.M=0`. The result is every
+        // guest VA passing through stage-2 as if it were the IPA,
+        // followed by a stage-2 translation fault (the common
+        // "unknown MMIO read at 0x0c100…" resume failure mode).
+        //
+        // Drop DC iff the restored SCTLR says the guest had its MMU
+        // on at save time. The one-shot RAM-side setups the live
+        // transition handler does (XN-bit rewrite, scratch-pool L1
+        // section install) are already baked into the snapshot's RAM
+        // image, so we don't need to repeat them here.
+        let sctlr_el1: u64;
+        asm!("mrs {}, sctlr_el1", out(reg) sctlr_el1,
+            options(nomem, nostack, preserves_flags));
+        if sctlr_el1 & 1 != 0 {
+            set_dc_for_stage1_off(false);
+        }
+
         asm!(
             "msr elr_el2, x24",
             "msr spsr_el2, x25",

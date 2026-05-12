@@ -14,6 +14,8 @@
 #   PI_KERNEL_BIN       which [[bin]] to use as kernel8.img
 #                       (default: pi-probe; Phase 1+ will swap to
 #                       newton-hypervisor)
+#   PI_EXTRA_FEATURES   space-separated Cargo features to append
+#                       to `pi-bare-metal` (e.g. `sd-probe`)
 #   PI_FIRMWARE_COMMIT  raspberrypi/firmware commit to pin to
 #
 # See docs/REAL_HW_BRINGUP.md for the full Phase-0 workflow.
@@ -77,10 +79,11 @@ done
 # pi-probe is unaffected by no-semihost / flash-persist-null but
 # satisfies its `required-features = ["platform-raspi3b"]` via the
 # aggregate. See Cargo.toml for the feature definition.
-echo "build: cargo --release --no-default-features --features pi-bare-metal --bin $kernel_bin"
+features="pi-bare-metal${PI_EXTRA_FEATURES:+ $PI_EXTRA_FEATURES}"
+echo "build: cargo --release --no-default-features --features '$features' --bin $kernel_bin"
 (
     cd "$repo_root"
-    cargo build --release --no-default-features --features pi-bare-metal \
+    cargo build --release --no-default-features --features "$features" \
         --bin "$kernel_bin"
 )
 

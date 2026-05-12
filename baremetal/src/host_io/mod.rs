@@ -26,6 +26,8 @@ pub mod queue;
 
 #[cfg(nh_host_io_null)]
 mod null;
+#[cfg(nh_host_io_pi_fb)]
+mod pi_fb;
 #[cfg(nh_host_io_semihost)]
 mod semihost;
 
@@ -88,6 +90,8 @@ const _: () = {
 pub fn init() {
     #[cfg(nh_host_io_null)]
     null::init();
+    #[cfg(nh_host_io_pi_fb)]
+    pi_fb::init();
     #[cfg(nh_host_io_semihost)]
     semihost::init();
 }
@@ -118,6 +122,8 @@ pub fn on_resume() {
     push_blit(&ev, payload);
     #[cfg(nh_host_io_null)]
     null::on_resume();
+    #[cfg(nh_host_io_pi_fb)]
+    pi_fb::on_resume();
     #[cfg(nh_host_io_semihost)]
     semihost::on_resume();
 }
@@ -128,6 +134,8 @@ pub fn on_resume() {
 pub fn push_blit(ev: &BlitEvent, payload: &[u8]) {
     #[cfg(nh_host_io_null)]
     null::push_blit(ev, payload);
+    #[cfg(nh_host_io_pi_fb)]
+    pi_fb::push_blit(ev, payload);
     #[cfg(nh_host_io_semihost)]
     semihost::push_blit(ev, payload);
 }
@@ -146,6 +154,8 @@ pub fn pop_pen_sample() -> Option<(u32, u32)> {
 pub fn pump_input() {
     #[cfg(nh_host_io_null)]
     null::pump_input();
+    #[cfg(nh_host_io_pi_fb)]
+    pi_fb::pump_input();
     #[cfg(nh_host_io_semihost)]
     semihost::pump_input();
 }

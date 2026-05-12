@@ -36,6 +36,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(nh_host_io_null)");
     println!("cargo:rustc-check-cfg=cfg(nh_host_io_semihost)");
     println!("cargo:rustc-check-cfg=cfg(nh_host_io_pico)");
+    println!("cargo:rustc-check-cfg=cfg(nh_host_io_pi_fb)");
     println!("cargo:rustc-check-cfg=cfg(nh_flash_persist_null)");
     println!("cargo:rustc-check-cfg=cfg(nh_flash_persist_semihost)");
     println!("cargo:rustc-check-cfg=cfg(nh_flash_persist_pico)");
@@ -142,13 +143,16 @@ fn resolve_host_io_backend() {
     let null = env::var("CARGO_FEATURE_HOST_IO_NULL").is_ok();
     let semihost = env::var("CARGO_FEATURE_HOST_IO_SEMIHOST").is_ok();
     let pico = env::var("CARGO_FEATURE_HOST_IO_PICO").is_ok();
-    let chosen = match (null, semihost, pico) {
-        (false, false, false) => "null",
-        (true, false, false) => "null",
-        (false, true, false) => "semihost",
-        (false, false, true) => "pico",
+    let pi_fb = env::var("CARGO_FEATURE_HOST_IO_PI_FB").is_ok();
+    let chosen = match (null, semihost, pico, pi_fb) {
+        (false, false, false, false) => "null",
+        (true, false, false, false) => "null",
+        (false, true, false, false) => "semihost",
+        (false, false, true, false) => "pico",
+        (false, false, false, true) => "pi_fb",
         _ => panic!(
-            "multiple host-io backends selected (null={null} semihost={semihost} pico={pico}); \
+            "multiple host-io backends selected \
+             (null={null} semihost={semihost} pico={pico} pi_fb={pi_fb}); \
              they are mutually exclusive"
         ),
     };

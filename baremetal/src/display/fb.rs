@@ -152,34 +152,43 @@ pub fn fill_top_rows(fb: &FbInfo, n: u32, pixel: u32) {
 
 /// Fill with a horizontal gradient — left = `left`, right = `right`.
 /// Interpolation is byte-wise per channel, no gamma correction.
-/// Useful as a "is the bus-order correct" probe: a red→green
-/// gradient should look red on the left, green on the right; if
-/// it's flipped or shifted, pixel order / pitch / channel packing
-/// is off.
+///
+/// Row-major iteration. Each row is sequential memory, so each
+/// cache line fill covers 16 pixels — ~16x fewer misses than a
+/// column-major loop. Earlier column-major version produced a
+/// visible ~0.5 s left-to-right paint sweep at boot because every
+/// store touched a fresh cache line (pitch = 5120 bytes ≫ line
+/// size 64).
+///
+/// Gradient math is recomputed per pixel rather than precomputed
+/// to a per-column lookup; recomputation is ~30 cycles, vs ~8 KiB
+/// of stack we'd otherwise consume (boot stack is 16 KiB total).
+/// Total fill at 1280×720 is well under 50 ms either way.
 pub fn fill_h_gradient(fb: &FbInfo, left: u32, right: u32) {
     let ptr = fb.pa as *mut u32;
     let pixels_per_row = (fb.pitch / 4) as usize;
     let w = fb.width as usize;
     let l = left.to_le_bytes();
     let r = right.to_le_bytes();
-    for x in 0..w {
-        let t_num = x as u32;
-        let t_den = (w as u32).saturating_sub(1).max(1);
-        let mix = |a: u8, b: u8| -> u8 {
-            let a = a as u32;
-            let b = b as u32;
-            ((a * (t_den - t_num) + b * t_num) / t_den) as u8
-        };
-        let px = u32::from_le_bytes([
-            mix(l[0], r[0]),
-            mix(l[1], r[1]),
-            mix(l[2], r[2]),
-            mix(l[3], r[3]),
-        ]);
-        for y in 0..fb.height as usize {
+    let t_den = (w as u32).saturating_sub(1).max(1);
+
+    let mix = |a: u8, b: u8, t_num: u32| -> u8 {
+        ((a as u32 * (t_den - t_num) + b as u32 * t_num) / t_den) as u8
+    };
+
+    for y in 0..fb.height as usize {
+        let row_base = y * pixels_per_row;
+        for x in 0..w {
+            let t_num = x as u32;
+            let px = u32::from_le_bytes([
+                mix(l[0], r[0], t_num),
+                mix(l[1], r[1], t_num),
+                mix(l[2], r[2], t_num),
+                mix(l[3], r[3], t_num),
+            ]);
             // SAFETY: see fill_solid.
             unsafe {
-                ptr.add(y * pixels_per_row + x).write_volatile(px);
+                ptr.add(row_base + x).write_volatile(px);
             }
         }
     }

@@ -56,3 +56,24 @@ avoid_warnings=1
 # and on the Pi Zero 2 W with 1360x768 EDID it looked like an
 # 8-16px white stripe across the top of our framebuffer.
 disable_overscan=1
+
+# HDMI link-stability knobs. Walter saw intermittent flicker that
+# unplug-replug of the cable would sometimes fix — classic
+# signature of a marginal HDMI lock at boot. The monitor under
+# test is a small Pi-targeted panel reporting DMT 39 (1360x768
+# @60); both the cable and the panel's HPD/EDID handling can be
+# borderline at that timing.
+#
+#   hdmi_drive=2          force HDMI mode (with audio) — some
+#                         marginal panels otherwise drop to DVI
+#                         and lose sync.
+#   hdmi_force_hotplug=1  ignore HPD; drive HDMI unconditionally.
+#                         Defeats noisy hotplug-detect signalling
+#                         on small panels that briefly de-assert
+#                         HPD after their own internal events.
+#   config_hdmi_boost=7   stronger differential signal (default 5,
+#                         max 11). Improves margin on borderline
+#                         cables / connectors without going crazy.
+hdmi_drive=2
+hdmi_force_hotplug=1
+config_hdmi_boost=7

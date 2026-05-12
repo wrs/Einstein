@@ -100,6 +100,13 @@ pi-bare-metal = ["platform-raspi3b", "no-semihost", "flash-persist-null"]
 #     --features "pi-bare-metal sd-probe"
 sd-probe = []
 
+# Verbose per-read tracing inside the SDHOST driver. Used during
+# bring-up; on now-working hardware the inline trace lines interleave
+# with the probe's file-content dump and make the output unreadable.
+# Keep available behind its own feature so a regression can re-enable
+# it without surgery. Implies `sd-probe` for convenience.
+sd-probe-trace = ["sd-probe"]
+
 # Function-level execution trace. When enabled, build.rs parses
 # ../_Data_/unified_symbols.tsv and embeds a compact address + name
 # table; at ROM load time each word-aligned function entry whose first

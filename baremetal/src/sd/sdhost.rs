@@ -44,16 +44,15 @@ use core::ptr::{read_volatile, write_volatile};
 
 use super::regs::*;
 
-/// Stage-by-stage trace, on only under the sd-probe feature. The
-/// probe halts at the end of init so noise here doesn't matter, but
-/// when sd-probe is off (i.e. the production hypervisor path once
-/// SDHOST is wired into flash-persist) we don't want this output.
+/// Stage-by-stage trace, gated on the verbose `sd-probe-trace`
+/// sub-feature. Used during bring-up to diagnose where init / read /
+/// write wedge. With only `sd-probe` enabled, the probe still prints
+/// outcome lines from probe.rs but the per-register / per-read
+/// chatter is off. Always type-checks (so referenced bindings stay
+/// in scope when the feature is off); LLVM drops the branch.
 macro_rules! trace {
     ($($arg:tt)*) => {
-        // Always type-checks (so referenced bindings don't go unused
-        // when the feature is off); LLVM drops the branch when
-        // `cfg!(feature = "sd-probe") == false`.
-        if cfg!(feature = "sd-probe") {
+        if cfg!(feature = "sd-probe-trace") {
             $crate::kprintln!($($arg)*);
         }
     };

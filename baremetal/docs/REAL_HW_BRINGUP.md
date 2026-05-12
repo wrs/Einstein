@@ -448,11 +448,73 @@ These don't block the plan but should be captured as they come up:
 |---|---|---|
 | 0 — EL2 handoff + UART | **done (2026-05-11)** | `CurrentEL = 2` on Walter's Zero 2 W; §16.1 closed |
 | 1 — Hypervisor `kmain` on Zero | **done (2026-05-11)** | Boots through `kmain`, ROM patches, stage-2, ERET to guest. Initial run halted on the trip-wire for an unmapped-IPA write at `0x01683800` from `DiagBootStub` `PC=0x1a01c`; a subsequent real-silicon run shows the OS continuing past that point and **booting + running without observed crashes**. No detailed serial trace captured for the longer run yet — Phase 2 below will give us a place to land logs. |
-| 2 — Persistent flash | not started | start with UART tunnel |
-| 3 — Snapshot on real hw | not started | optional |
-| 4 — Display | not started | mailbox + FB |
+| 2 — Persistent flash | **in progress (2026-05-12)** | SDHOST driver + VC mailbox + embedded-sdmmc shim land; `sd-probe` reads `config.txt` from the FAT32 boot partition end-to-end. Remaining: `flash-persist-sd` backend over the same partition. |
+| 3 — Snapshot on real hw | not started | reuses Phase 2 backend |
+| 4 — Display | not started | mailbox + FB (mailbox already done in Phase 2) |
 | 5 — Input | not started | UART pen first, USB later |
 | 6 — Audio / serial / PCMCIA | not started | aligns with M6 |
+
+### Phase 2 — base layer working (2026-05-12)
+
+The block-device + FAT32 layers are running on real silicon.
+`cargo build … --features "pi-bare-metal sd-probe"` produces a
+kernel that, on the Zero 2 W:
+
+1. Brings up the BCM2835 SDHOST controller (GPIO 48..53 → ALT0;
+   firmware CLOCK_ID_CORE rate queried via the VC mailbox at
+   `0x3F00_B880`; SDCDIV = 623 for 400 kHz identification mode).
+2. Enumerates the card: CMD0 → CMD8 → ACMD41 (HCS) → CMD2 → CMD3
+   → CMD9 → CMD7 → CMD16. The 128 GB card on hand reports as SDHC,
+   RCA=`0xd5550000`.
+3. Reads sector 0 and confirms the MBR signature + partition 1 =
+   FAT32 (type 0x0b), LBA 32768, ~122 GB.
+4. Hands the `SdHost` to `embedded_sdmmc::VolumeManager`, opens
+   volume 0, opens `/CONFIG.TXT`, reads its contents back over
+   PL011. Byte-identical to what `scripts/build-sd.sh` wrote.
+
+Pieces that fell out and won't need to be re-derived:
+
+- Polled VC mailbox property-tag client (`src/mailbox.rs`). Phase 4
+  (framebuffer) reuses this directly; the per-tag response-indicator
+  check sits on `buf.words[4]`, not `buf.words[3]` (response status
+  is in the third header word, not the second).
+- BCM2835 SDHOST register layout + FSM-state poll for data-phase
+  completion (`src/sd/sdhost.rs`). Lessons logged at the bottom of
+  this section.
+- `embedded_sdmmc::BlockDevice` + `TimeSource` impls
+  (`src/sd/block_device.rs`).
+
+What's NOT yet done:
+- `flash-persist-sd` backend implementing `FlashStore` against a
+  `NEWTON/FLASH.BIN` file on the same partition. Mechanical once a
+  file open-for-write test passes.
+- 4-bit bus width (ACMD6 + SDHCFG_WIDE_EXT_BUS) and 25 MHz default-
+  speed clock. Reads at 400 kHz / 1-bit are slow but reliable; the
+  speedup is a follow-up, not a blocker.
+- CSD decode for the actual card-size value reported through
+  `BlockDevice::num_blocks`. Currently returns `u32::MAX` (sufficient
+  for partition reads — the per-partition bounds come from MBR).
+
+**Bring-up lessons for the BCM2835 SDHOST** (in case anyone else
+ports it from scratch):
+
+- The `SDHCFG_*_IRPT_EN` bits are misnamed. They don't just gate
+  IRQ generation — `SDHCFG_DATA_IRPT_EN` gates the FSM's data-
+  movement path itself, even in polling mode. Without it the FSM
+  walks READWAIT → DATAMODE but the FIFO stays empty. The trace
+  shape of "CMD17 OK, FSM transitions, no errors, FIFO_FILL stuck
+  at 0" is the signature.
+- Don't poll `SDHSTS_DATA_FLAG` for PIO drain. It's threshold-driven
+  (set when FIFO_FILL ≥ READ_THRESHOLD, clears below) and will lie
+  to you in a word-at-a-time loop. Poll `SDEDM[8:4]` (FIFO_FILL)
+  directly; both Linux and Circle do this.
+- Data-phase completion is `SDEDM.FSM == DATAMODE | IDENTMODE`,
+  not `SDHSTS.BLOCK_IRPT`. If the FSM is stuck in READWAIT (read)
+  or WRITESTART1 (write) at end of transfer, write
+  `SDEDM | FORCE_DATA_MODE` to kick it out.
+- The Pi Zero 2 W routes the micro-SD slot to **SDHOST**, not the
+  Arasan EMMC block (which serves the on-package WLAN/BT SDIO on
+  this SoC). Pi 4 / Pi 5 invert this — their SD code won't port.
 
 ### Phase 1 — closed (2026-05-11)
 

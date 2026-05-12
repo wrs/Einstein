@@ -339,12 +339,52 @@ These don't block the plan but should be captured as they come up:
 | Phase | Status | Notes |
 |---|---|---|
 | 0 — EL2 handoff + UART | **done (2026-05-11)** | `CurrentEL = 2` on Walter's Zero 2 W; §16.1 closed |
-| 1 — Hypervisor `kmain` on Zero | not started | depends on Phase 0 |
+| 1 — Hypervisor `kmain` on Zero | **done (2026-05-11)** | Boots through `kmain`, ROM patches, stage-2, ERET to guest, runs deep into Newton `DiagBootStub`. New ceiling on real silicon: unknown-MMIO write to IPA `0x01683800` from `DiagBootStub` `PC=0x1a01c`, which QEMU never reaches (CNTFRQ-driven timing divergence: 19.2 MHz real vs 62.5 MHz QEMU). |
 | 2 — Persistent flash | not started | start with UART tunnel |
 | 3 — Snapshot on real hw | not started | optional |
 | 4 — Display | not started | mailbox + FB |
 | 5 — Input | not started | UART pen first, USB later |
 | 6 — Audio / serial / PCMCIA | not started | aligns with M6 |
+
+### Phase 1 — closed (2026-05-11)
+
+Real-hardware result on Walter's Pi Zero 2 W, `newton-hypervisor` built
+with `--no-default-features --features pi-bare-metal` (= platform-
+raspi3b + no-semihost + flash-persist-null), same SD pipeline as
+Phase 0:
+
+- Firmware reads `config.txt`, `start_cd.elf`, `fixup_cd.dat`.
+- Hypervisor banner + capability dump appear over PL011.
+  `CNTFRQ_EL0 = 19_200_000 Hz` (vs QEMU's 62.5 MHz) — real silicon's
+  generic-timer reference clock.
+- MMU EL2 stage-1, ROM load (with REx patch + 256 NATIVE_PRIM rewrites),
+  39 simple ROM patches + 5 native-call injections, 86 CP15 encoding
+  rewrites, stage-2 build (ROM/RAM/flash/framebuffer/tick-page),
+  shadow-pool smoke test, g1-capture, alrt-capture all run identically
+  to QEMU.
+- `Entering Newton ROM...` ERET fires. First few guest traps work
+  (HVC, CP15 `MCR SCTLR`, UND for StrongARM `MCR c15,c1,2`, DABT,
+  timer IRQs).
+- PCMCIA MMIO writes match the QEMU sequence.
+- Reaches Newton kernel `DiagBootStub` and continues ~0x60 bytes
+  past where QEMU's spin ceiling sits, then halts on the trip-wire
+  for an unmapped-IPA write:
+
+  ```
+  *** unknown MMIO write halted ***
+    IPA    = 0x01683800  W  value=0x000866b0  @ELR=0x1a01c
+    region: outside known windows
+  ```
+
+  This is real-silicon-specific: QEMU stays in a tight spin at
+  `DiagBootStub+0xa6c` and never reaches the write, while real
+  silicon's 3.25× slower CNTPCT lets the loop progress and triggers
+  the write. The behaviour is a Phase-B debugging target (decide
+  whether to model the IPA, widen stage-2, or patch the call site),
+  not a Phase-1 blocker.
+
+The Phase-1 exit criterion ("`kmain` runs, doesn't crash before the
+first guest-side trap") is cleared by a wide margin.
 
 ### Phase 0 — closed (2026-05-11)
 

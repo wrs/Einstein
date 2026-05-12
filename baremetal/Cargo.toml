@@ -64,6 +64,29 @@ flash-persist-null = []
 flash-persist-semihost = []
 flash-persist-pico = []
 
+# Disable every in-tree call to Arm semihosting (HLT #0xF000). Required
+# when running on real silicon, where no semihosting host is listening:
+#
+#   - `uart::Writer` routes through PL011 `write_byte` instead of
+#     `SYS_WRITE` to `:tt`. PL011 must be initialised first (it is, by
+#     `uart::init`). Bytes pre-init are silently dropped.
+#   - `snapshot.rs` skips init, autosave, and load (no /tmp/* host fs).
+#   - `peripherals::vic::init_calendar` uses a hardcoded boot epoch
+#     instead of SYS_TIME.
+#   - `cpu::halt` skips SYS_EXIT_EXTENDED and falls through to WFE.
+#
+# Source code reads `cfg(feature = "no-semihost")` directly. Orthogonal
+# to platform-* and to the host-io-* / flash-persist-* axes — pick the
+# right backends explicitly alongside.
+no-semihost = []
+
+# Aggregate feature for "build for a real Pi Zero 2 W": same SoC as
+# QEMU raspi3b (so platform-raspi3b is fine), no semihosting host, no
+# host-fs-backed flash. host-io defaults to null already, so it's
+# omitted here. Build with:
+#   cargo build --release --no-default-features --features pi-bare-metal
+pi-bare-metal = ["platform-raspi3b", "no-semihost", "flash-persist-null"]
+
 # Function-level execution trace. When enabled, build.rs parses
 # ../_Data_/unified_symbols.tsv and embeds a compact address + name
 # table; at ROM load time each word-aligned function entry whose first

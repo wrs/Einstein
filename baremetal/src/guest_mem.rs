@@ -2000,12 +2000,21 @@ pub unsafe fn install_dabt_fast_trampoline(rom_ptr: *mut u32) {
         write_rom_code_word(rom_ptr, ft + 17, beq(17, 31)); // beq FAST_FWD
         write_rom_code_word(rom_ptr, ft + 18, 0xE350_000F); // cmp r0, #15
         write_rom_code_word(rom_ptr, ft + 19, beq(19, 31)); // beq FAST_FWD
-        // iter-60: DFSC=0x05 deliberately excluded — see file-level
-        // comment for rationale. Two NOPs preserve the slot layout so
-        // the existing beq targets / `b SLOW_DABT_TRAMP` offset stay
-        // correct without recomputing.
-        write_rom_code_word(rom_ptr, ft + 20, 0xE320_F000); // nop
-        write_rom_code_word(rom_ptr, ft + 21, 0xE320_F000); // nop
+        // DFSC=0x09 (Domain fault, first level / section). The Newton
+        // kernel raises this deliberately at TCardSocket::GetChipInfo
+        // (PC ~0x55714+): the PCMCIA probe maps the candidate window
+        // VA via a section descriptor with domain=15 ("No access" in
+        // DACR=0x00055555), then accesses it inside a setjmp +
+        // AddExceptionHandler frame. The kernel's own DataAbortHandler
+        // must reach the user exception handler to longjmp past the
+        // probe — forward this DFSC to the kernel rather than DIAG'ing.
+        // Verified against ARM ARM B4.1.52 + Table B3-23 (short-
+        // descriptor FSR encoding: 0b01001 = first-level domain fault).
+        // (iter-60: DFSC=0x05 deliberately excluded — see file-level
+        // comment for rationale. The two slots formerly reserved as
+        // NOPs are reused here; existing beq / b-SLOW offsets unchanged.)
+        write_rom_code_word(rom_ptr, ft + 20, 0xE350_0009); // cmp r0, #9
+        write_rom_code_word(rom_ptr, ft + 21, beq(21, 31)); // beq FAST_FWD
         write_rom_code_word(rom_ptr, ft + 22, 0xE350_000D); // cmp r0, #13
         write_rom_code_word(rom_ptr, ft + 23, beq(23, 31)); // beq FAST_FWD
         write_rom_code_word(rom_ptr, ft + 24, 0xE350_0006); // cmp r0, #6

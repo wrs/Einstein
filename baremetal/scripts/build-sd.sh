@@ -70,8 +70,19 @@ for f in "${FW_FILES[@]}"; do
 done
 
 # --- 2. Build the chosen [[bin]] ---------------------------------------
-echo "build: cargo --release --bin $kernel_bin"
-( cd "$repo_root" && cargo build --release --bin "$kernel_bin" )
+#
+# Use the `pi-bare-metal` feature aggregate for both bins: it pulls in
+# platform-raspi3b (PL011 base, MMIO map) and no-semihost / flash-
+# persist-null for the real-silicon build of the main hypervisor.
+# pi-probe is unaffected by no-semihost / flash-persist-null but
+# satisfies its `required-features = ["platform-raspi3b"]` via the
+# aggregate. See Cargo.toml for the feature definition.
+echo "build: cargo --release --no-default-features --features pi-bare-metal --bin $kernel_bin"
+(
+    cd "$repo_root"
+    cargo build --release --no-default-features --features pi-bare-metal \
+        --bin "$kernel_bin"
+)
 
 elf="${repo_root}/target/aarch64-unknown-none-softfloat/release/${kernel_bin}"
 
@@ -111,12 +122,11 @@ next steps:
        Pi pin 10  (GPIO 15 RX) <--  cable TX
      Leave the cable's 5V/VCC pin disconnected.
      Open serial at 115200 8N1, then power on the Pi.
-  4. Expect:
-       === newton pi-probe ===
-       CurrentEL = 2
-       MIDR_EL1  = 0x...
-       MPIDR_EL1 = 0x...
-       ok, parking core 0 in WFE
+  4. Expect serial output from kernel8.img ($kernel_bin) on the wire.
+     For pi-probe: a few-line banner with CurrentEL / MIDR_EL1 / MPIDR_EL1.
+     For newton-hypervisor: the M0 banner, capability dump, MMU init,
+       stage-2 init, and progress into the Newton ROM boot. Use --features
+       trace,quiet for a function-level trace of the ROM execution.
 
   See docs/REAL_HW_BRINGUP.md if it doesn't print.
 EOF

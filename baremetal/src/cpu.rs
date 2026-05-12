@@ -119,6 +119,11 @@ pub fn icache_publish_range(va: u64, len: usize) {
 /// Semihosting SYS_EXIT_EXTENDED (op 0x20): x1 → [reason, exit_code].
 /// Reason `0x20026` = ADP_Stopped_ApplicationExit.
 pub fn halt() -> ! {
+    // On `no-semihost` builds (real silicon) there is no semihosting
+    // host listening for SYS_EXIT_EXTENDED; HLT would either NOP or
+    // generate an unintended debug exception. Fall through directly to
+    // the WFE loop, which is what the comment above promises anyway.
+    #[cfg(not(feature = "no-semihost"))]
     // SAFETY: HLT #0xF000 with semihosting enabled in QEMU is a
     // controlled trap that terminates QEMU. The parameter block
     // pointer lifetime spans the call.

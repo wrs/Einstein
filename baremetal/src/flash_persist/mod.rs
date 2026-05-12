@@ -66,6 +66,7 @@ pub fn mark_dirty(off: usize, len: usize) {
     BACKEND.mark_dirty(off, len);
 }
 
+#[cfg_attr(feature = "no-semihost", allow(dead_code))]
 pub fn maybe_save() {
     BACKEND.maybe_save();
 }

@@ -409,13 +409,75 @@ pub extern "C" fn trap_unexpected(_ctx: &mut TrapContext) -> ! {
 
 // ----------------- individual handlers -----------------
 
+/// Resolve the IPA of a stage-2 fault.
+///
+/// HPFAR_EL2 is the architectural source, but on the Cortex-A53 (and
+/// other ARMv8.0 cores) it can be **invalid for non-S1PTW permission
+/// faults** — empirically on the Pi Zero 2 W (BCM2710A1) the silicon
+/// reports the post-stage-2 host PA in HPFAR's FIPA field instead of
+/// the IPA. The classic symptom is a guest write to IPA `0x0F18_xxxx`
+/// (the Newton tick page) emerging at HPFAR-derived IPA
+/// `0x0168_xxxx` (the host PA we mapped it to).
+///
+/// The standard fix (Linux/KVM and Jailhouse both ship this) is to
+/// fall back to `AT S1E1{R,W}` for non-S1PTW permission faults: the
+/// instruction translates the FAR through the guest's stage-1 regime
+/// only, depositing the resulting IPA in PAR_EL1. With guest stage-1
+/// disabled (SCTLR_EL1.M=0) this is the identity; with it enabled
+/// AT correctly walks the guest tables.
+///
+/// `iss` is ESR_EL2.ISS[24:0]. `wnr` selects W vs R for AT (instruction
+/// aborts always pass false). Returns the resolved IPA.
+fn resolve_ipa(iss: u32, wnr: bool) -> u64 {
+    let far: u64 = read_sysreg!("far_el2");
+    let s1ptw = ((iss >> 7) & 1) != 0;
+    let xfsc = iss & 0x3f;
+    // DFSC/IFSC permission fault levels 0..3 occupy 0b001100..0b001111.
+    let is_permission = (xfsc & 0b111100) == 0b001100;
+
+    if !s1ptw && is_permission {
+        let par: u64;
+        // SAFETY: AT is a side-effecting system instruction that
+        // writes PAR_EL1; ISB orders the MRS that follows. Runs at
+        // EL2 with the guest's EL1 translation regime in effect.
+        unsafe {
+            if wnr {
+                core::arch::asm!(
+                    "at s1e1w, {0}",
+                    "isb",
+                    "mrs {1}, par_el1",
+                    in(reg) far,
+                    out(reg) par,
+                    options(nostack, preserves_flags),
+                );
+            } else {
+                core::arch::asm!(
+                    "at s1e1r, {0}",
+                    "isb",
+                    "mrs {1}, par_el1",
+                    in(reg) far,
+                    out(reg) par,
+                    options(nostack, preserves_flags),
+                );
+            }
+        }
+        if (par & 1) == 0 {
+            // F=0: success. PAR[51:12] holds the IPA[51:12].
+            return (par & 0xFFFF_FFFF_F000) | (far & 0xFFF);
+        }
+        // F=1: AT itself faulted (shouldn't happen for a genuine
+        // stage-2 perm fault). Fall through to HPFAR — best effort.
+    }
+
+    let hpfar: u64 = read_sysreg!("hpfar_el2");
+    ((hpfar >> 4) << 12) | (far & 0xFFF)
+}
+
 fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
     let far = read_sysreg!("far_el2");
-    let hpfar = read_sysreg!("hpfar_el2");
-    let ipa = ((hpfar >> 4) << 12) | (far & 0xFFF);
-
     let isv = (iss >> 24) & 1;
     let wnr = ((iss >> 6) & 1) != 0;
+    let ipa = resolve_ipa(iss, wnr);
     let sas = ((iss >> 22) & 3) as u8;
     let srt = ((iss >> 16) & 0x1F) as usize;
     let ifsc = (iss & 0x3f) as u32;
@@ -617,9 +679,9 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
 
     if wnr {
         let value = ctx.x[srt] as u32;
-        mmio::write(ipa, sas, value as u32, elr as u64);
+        mmio::write(ctx, ipa, sas, value as u32, elr as u64);
     } else {
-        let value = mmio::read(ipa, sas, elr as u64);
+        let value = mmio::read(ctx, ipa, sas, elr as u64);
         // Sign-extension (SSE) is ignored for stub reads — everything we
         // return here is either zero or a known non-negative constant.
         ctx.x[srt] = value as u64;
@@ -645,6 +707,27 @@ fn try_emulate_isv0_dabt(ctx: &mut TrapContext, ipa: u64, wnr: bool, elr: u32) -
         Some(v) => v,
         None => return false,
     };
+    // Cache-maintenance MCR by MVA via CP15 c7 (DC IVAC, DC CIVAC,
+    // DC CVAC, IC IVAU, etc.). These check the target line's stage-2
+    // permissions and trap with ISV=0 when the line maps to a RO
+    // stage-2 page (which is our intent for ROM/flash regions — see
+    // the IPA permission map in `stage2::init`). The op is meaningless
+    // on emulated MMIO/flash because no host-side cache state needs
+    // to change, so we just advance ELR past it.
+    //
+    // Encoding mask: cond 1110 0000 CRn=c7 Rt 1111 opc2 1 CRm
+    //   bits[27:24] = 1110 (MCR opcode group)
+    //   bits[23:20] = 0000 (opc1 = 0; bit 20 = 0 = MCR not MRC)
+    //   bits[19:16] = 0111 (CRn = c7)         ← was masked out before
+    //   bits[11:8]  = 1111 (coproc = p15)
+    //   bit[4]      = 1    (MCR/MRC, not CDP)
+    //   cond / Rt / CRm / opc2 are any.
+    if (insn & 0x0FFF_0F10) == 0x0E07_0F10 {
+        let _ = ctx;
+        let _ = ipa;
+        let _ = wnr;
+        return true;
+    }
     // Decode LDR/STR (immediate, A1): cond 010 P U 0 W L Rn Rt imm12.
     // We require word access (B=0); halfword/byte forms have
     // different bit 22 values and we don't support them yet.
@@ -679,11 +762,11 @@ fn try_emulate_isv0_dabt(ctx: &mut TrapContext, ipa: u64, wnr: bool, elr: u32) -
     let post_rn = pre_rn.wrapping_add(signed_off as u32);
 
     if l {
-        let value = mmio::read(ipa, 2 /* word */, elr as u64);
+        let value = mmio::read(ctx, ipa, 2 /* word */, elr as u64);
         ctx.x[rt] = value as u64;
     } else {
         let value = ctx.x[rt] as u32;
-        mmio::write(ipa, 2 /* word */, value, elr as u64);
+        mmio::write(ctx, ipa, 2 /* word */, value, elr as u64);
     }
     if writeback {
         ctx.x[rn] = post_rn as u64;
@@ -917,8 +1000,9 @@ fn aarch32_mode_label(mode: u32) -> &'static str {
 
 fn handle_instruction_abort(ctx: &TrapContext, iss: u32) {
     let far = read_sysreg!("far_el2");
-    let hpfar = read_sysreg!("hpfar_el2");
-    let ipa = ((hpfar >> 4) << 12) | (far & 0xFFF);
+    // Instruction aborts are always reads; pass wnr=false to resolve_ipa.
+    // See resolve_ipa's doc for the HPFAR-vs-AT rationale.
+    let ipa = resolve_ipa(iss, false);
     let elr = read_sysreg!("elr_el2");
 
     // RAM is mapped XN at stage-2 so the first fetch into any RAM page

@@ -143,7 +143,7 @@ fn in_bio_bank(ipa: u64) -> bool {
     ipa >= BIO_BANK_BASE && ipa < BIO_BANK_END && (ipa & 0x3FF) == 0
 }
 
-pub fn read(ipa: u64, sas: u8, elr: u64) -> u32 {
+pub fn read(ctx: &crate::trap::TrapContext, ipa: u64, sas: u8, elr: u64) -> u32 {
     // BE-8 (production builds): byte/halfword accesses from the guest
     // land at the natural IPA (the CPU does the byte-lane transform
     // itself). Guest-test builds run the guest LE under the legacy
@@ -273,7 +273,7 @@ pub fn read(ipa: u64, sas: u8, elr: u64) -> u32 {
         // "Unknown bank #5" silent-zero window (see const comment).
         a if (UNKNOWN_BANK5_BASE..UNKNOWN_BANK5_END).contains(&a) => 0,
 
-        a => halt_on_unknown("read", a, sas, 0, elr),
+        a => halt_on_unknown(ctx, "read", a, sas, 0, elr),
     };
 
     mask_for_size(value, sas)
@@ -325,7 +325,7 @@ fn test_scratch_write(ipa: u64, sas: u8, value: u32) {
     }
 }
 
-pub fn write(ipa: u64, sas: u8, value: u32, elr: u64) {
+pub fn write(ctx: &crate::trap::TrapContext, ipa: u64, sas: u8, value: u32, elr: u64) {
     // BE-8 (production): byte/halfword accesses land at the natural
     // IPA. Splice the sub-word value into the addressed lane of the
     // surrounding word so the peripheral, which dispatches at word-
@@ -337,12 +337,12 @@ pub fn write(ipa: u64, sas: u8, value: u32, elr: u64) {
     let (ipa, value) = match sas {
         0 => {
             let aligned = ipa & !0x3;
-            let prev = read(aligned, 2, elr);
+            let prev = read(ctx, aligned, 2, elr);
             (aligned, splice_byte(prev, ipa, value))
         }
         1 => {
             let aligned = ipa & !0x3;
-            let prev = read(aligned, 2, elr);
+            let prev = read(ctx, aligned, 2, elr);
             (aligned, splice_halfword(prev, ipa, value))
         }
         _ => (ipa, value),
@@ -465,7 +465,7 @@ pub fn write(ipa: u64, sas: u8, value: u32, elr: u64) {
         // (in vic::owns), where their writes silently drop to match
         // Einstein's unknown-bank-#3 default. Reads return 0.
 
-        a => halt_on_unknown("write", a, sas, value, elr),
+        a => halt_on_unknown(ctx, "write", a, sas, value, elr),
     }
     let _ = value;
 }
@@ -533,7 +533,14 @@ fn mask_for_size(value: u32, sas: u8) -> u32 {
 /// most common ways a run-away Thumb / bad-function-pointer bug slips
 /// in. Extend the peripheral modules (or add a new one) to service
 /// the IPA this halts on.
-fn halt_on_unknown(op: &'static str, ipa: u64, sas: u8, value: u32, elr: u64) -> ! {
+fn halt_on_unknown(
+    ctx: &crate::trap::TrapContext,
+    op: &'static str,
+    ipa: u64,
+    sas: u8,
+    value: u32,
+    elr: u64,
+) -> ! {
     let width = match sas {
         0 => "B", 1 => "H", 2 => "W", _ => "D",
     };
@@ -542,6 +549,24 @@ fn halt_on_unknown(op: &'static str, ipa: u64, sas: u8, value: u32, elr: u64) ->
     } else {
         "outside known windows (unmapped IPA — decide whether to model it or widen stage-2)"
     };
+    // Raw sysreg readback. These survive across the trap entry on
+    // AArch64 (handler runs at EL2 and nothing in the dispatch path
+    // before us writes them). On real silicon FAR_EL1 can carry
+    // uninitialised junk if the guest hasn't taken a stage-1 fault
+    // yet, so it's printed raw rather than synthesised into the IPA.
+    let (esr, hpfar, far_el2, far_el1, spsr) = unsafe {
+        let (a, b, c, d, e): (u64, u64, u64, u64, u64);
+        core::arch::asm!(
+            "mrs {0}, esr_el2",
+            "mrs {1}, hpfar_el2",
+            "mrs {2}, far_el2",
+            "mrs {3}, far_el1",
+            "mrs {4}, spsr_el2",
+            out(reg) a, out(reg) b, out(reg) c, out(reg) d, out(reg) e,
+            options(nomem, nostack, preserves_flags),
+        );
+        (a, b, c, d, e)
+    };
     kprintln!();
     kprintln!("*** unknown MMIO {} halted ***", op);
     kprintln!(
@@ -549,6 +574,24 @@ fn halt_on_unknown(op: &'static str, ipa: u64, sas: u8, value: u32, elr: u64) ->
         ipa, width, value, elr
     );
     kprintln!("  region: {}", region);
+    kprintln!("  guest GPRs (AArch64 view, x[0..15] alias AArch32 r0..r15):");
+    for row in 0..4 {
+        let i = row * 4;
+        kprintln!(
+            "    r{:02}={:#018x}  r{:02}={:#018x}  r{:02}={:#018x}  r{:02}={:#018x}",
+            i,     ctx.x[i],
+            i + 1, ctx.x[i + 1],
+            i + 2, ctx.x[i + 2],
+            i + 3, ctx.x[i + 3],
+        );
+    }
+    kprintln!("  raw sysregs:");
+    kprintln!("    ESR_EL2   = {:#018x}", esr);
+    kprintln!("    HPFAR_EL2 = {:#018x}  (FIPA<<8; IPA[51:12]={:#x})",
+        hpfar, (hpfar >> 4) & 0xFFFFFFFFFF);
+    kprintln!("    FAR_EL2   = {:#018x}", far_el2);
+    kprintln!("    FAR_EL1   = {:#018x}  (may be junk if guest hasn't taken a stage-1 fault yet)", far_el1);
+    kprintln!("    SPSR_EL2  = {:#018x}", spsr);
     kprintln!(
         "  (Phase A contract: every unknown sub-case is a loud trip-wire, not a silent stub.)"
     );

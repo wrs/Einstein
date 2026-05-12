@@ -165,19 +165,31 @@ static CALENDAR_CNTPCT_BASELINE: AtomicU64 = AtomicU64::new(0);
 /// host `time()` — we do it at the MMIO layer instead so we don't
 /// depend on the ROM patch firing.
 fn init_calendar() {
-    const SYS_TIME: u64 = 0x11;
-    // The ARM semihosting SYS_TIME call ignores the parameter block;
-    // pass a dummy pointer to satisfy the shared `semihost` helper.
-    let unix_time: u64 = unsafe {
-        let ret: u64;
-        core::arch::asm!(
-            "hlt #0xF000",
-            inout("x0") SYS_TIME => ret,
-            in("x1") 0u64,
-            options(nostack, preserves_flags),
-        );
-        ret
+    #[cfg(not(feature = "no-semihost"))]
+    let unix_time: u64 = {
+        const SYS_TIME: u64 = 0x11;
+        // The ARM semihosting SYS_TIME call ignores the parameter
+        // block; pass a dummy pointer to satisfy the shared `semihost`
+        // helper.
+        // SAFETY: HLT #0xF000 is the AArch64 semihosting trap.
+        unsafe {
+            let ret: u64;
+            core::arch::asm!(
+                "hlt #0xF000",
+                inout("x0") SYS_TIME => ret,
+                in("x1") 0u64,
+                options(nostack, preserves_flags),
+            );
+            ret
+        }
     };
+    // On `no-semihost` builds (real silicon) there is no host clock to
+    // ask. Use a compile-time-baked seed: midnight 2026-05-11 UTC, the
+    // first known Pi-Zero-2-W boot. Newton runs reasonably with any
+    // plausible RTC; "wrong by hours" only matters for user-visible
+    // dates. A future Phase will read a real RTC chip if we add one.
+    #[cfg(feature = "no-semihost")]
+    let unix_time: u64 = 1_778_889_600; // 2026-05-15 00:00:00 UTC
     let secs_since_1904 = (unix_time as u32)
         .wrapping_add(SECS_1904_TO_1970)
         .wrapping_sub(RTC_HOST_TIME_OFFSET_SECONDS);

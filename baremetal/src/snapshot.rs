@@ -307,10 +307,33 @@ pub fn maybe_autosave(ctx: &TrapContext) {
     #[cfg(feature = "no-semihost")]
     {
         let _ = ctx;
+        // Snapshot ring itself is inert on real silicon, but the
+        // flash-persist backend (e.g. flash-persist-sd) still needs
+        // its periodic save. Use the same wall-clock gate as the
+        // semihost path so the cadence is identical.
+        maybe_flash_autosave();
         return;
     }
     #[cfg(not(feature = "no-semihost"))]
     maybe_autosave_via_semihost(ctx)
+}
+
+#[cfg(feature = "no-semihost")]
+fn maybe_flash_autosave() {
+    let now = cntpct();
+    let freq = cntfrq();
+    if freq == 0 {
+        return;
+    }
+    let last = LAST_SAVE_TICKS.load(Ordering::Relaxed);
+    if last != 0 {
+        let interval_ticks = (AUTOSAVE_INTERVAL_MS * freq) / 1_000;
+        if now.wrapping_sub(last) < interval_ticks {
+            return;
+        }
+    }
+    LAST_SAVE_TICKS.store(now, Ordering::Relaxed);
+    crate::flash_persist::maybe_save();
 }
 
 #[cfg(not(feature = "no-semihost"))]

@@ -455,28 +455,240 @@ In rough order of how much they cost to find:
   scaler. Revisit when we ship to anything other than the panel
   on Walter's bench.
 
-## Phase 5 — Input
+## Phase 5 — USB input (touchscreen)
 
-**Closes:** pen input via USB touch device or UART tunnel.
-**Effort:** large for USB; small for UART tunnel.
+**Closes:** pen input from the TSTP MTouch USB panel on real silicon.
+**Effort:** 3–5 weeks total, split into five small phases that each
+land usable plumbing.
 **Depends on:** Phase 4 (need something on screen to point at).
+**Reference:** [`MTOUCH.md`](MTOUCH.md) — the specific panel decoded.
 
-Tracks Open Question §16.14 (input device for v1). Two paths:
+### Why USB directly (no UART tunnel)
 
-- **USB OTG + HID touchscreen.** Full `dwc_otg` host stack work. Real
-  effort, separate sub-project. Not the right first step.
-- **UART-tunnelled pen events.** Host machine sends `(x, y, down/up)`
-  packets over the mini-UART; EL2 receives them and feeds
-  `TScreenManager`. Trivial. Lets the rest of the system be exercised
-  end-to-end while USB waits.
+The earlier plan kept a UART-tunnel placeholder for input. We've
+dropped it: pen input on QEMU/FVP is already handled via the host
+viewer's pointer (no tunnel needed), and on real hw the touchscreen
+sits on the bench plugged into the Pi. Building a UART tunnel for
+test-only fake input would be writing throwaway code that delays
+the actual goal. We go straight to the USB stack.
 
-Recommendation: UART tunnel first. USB is its own milestone.
+### Pluggability requirements
 
-## Phase 6 — Audio + serial + PCMCIA
+The stack has to leave room for one future expansion: **more touch
+panels.** The TSTP MTouch is one specific device; adding "panel B"
+should be a new ~100-line driver, not a stack rewrite. Different
+panels differ in report ID, layout, and activation handshake — but
+the rest is shared.
 
-Maps to existing milestones M6 in HIGHLEVEL.md §12. Real-hw specifics
-(I2S vs PWM for audio, BCM SD vs PCMCIA image source) are not closer
-than the M6 work itself. Sequence after Phase 5 has a usable system.
+Audio is *not* a future expansion of this stack — Phase 6 takes the
+HDMI-audio path (the bench panel has speakers, the VC firmware
+emits IEC 60958 over HDMI, we feed samples via PCM/I2S). No USB hub,
+no USB DAC, no UAC class driver. See Phase 6 below.
+
+The two pluggability seams that pay for themselves:
+
+```
+   ┌───────────────────────────────────────────────────┐
+   │ TScreenManager (Newton consumer)                  │
+   ├───────────────────────────────────────────────────┤
+   │ trait PenSource                                   │   ← input seam
+   ├───────────────────────────────────────────────────┤
+   │ device drivers — match on (VID,PID)               │
+   │   impl for TSTP MTouch (0416:c168)                │
+   │   impl for <future panel>                         │   ← device seam
+   ├───────────────────────────────────────────────────┤
+   │ usb::class::hid  (helpers, not a trait yet)       │
+   ├───────────────────────────────────────────────────┤
+   │ trait UsbHostController — control + intr only     │
+   │   impl Dwc2     BCM2710 OTG, full-speed           │
+   ├───────────────────────────────────────────────────┤
+   │ DWC2 controller @ 0x3F98_0000                     │
+   └───────────────────────────────────────────────────┘
+```
+
+Permanent scope cap: **single full-speed device, no hub.** The Pi
+Zero 2 W's micro-USB OTG goes straight to the touchscreen. Audio
+exits via HDMI. We never need two USB devices on the bus, so the
+USB stack stays small forever: no hub class, no Transaction
+Translator, no split transactions, no isochronous transfers. The
+`UsbHostController` trait carries control + interrupt only.
+
+Don't pre-design what we can't see. Each trait is added when its
+second implementation makes the case for it — `PenSource` lands in
+5a with one impl (`NullPen`), `UsbHostController` is born with one
+impl (Dwc2). The HID class stays a module of helpers (not a trait)
+until a second class shows up, and on this hardware it won't.
+
+### Sub-phases
+
+#### 5a — `PenSource` seam + null backend
+**Effort:** half a day. **Depends on:** Phase 4.
+
+- `src/input/mod.rs` — `trait PenSource { fn poll(&mut self) -> Option<PenEvent>; }`
+  and a simple `PenEvent { Down{x,y}, Move{x,y}, Up }`.
+- `src/input/null.rs` — always returns `None`. Default backend for QEMU
+  and FVP (their input comes through the existing host viewer, not
+  this seam).
+- Hook one `pen.poll()` call per timer IRQ in `src/trap.rs`, feeding
+  the result to whatever feeds `TScreenManager`. Find the existing
+  guest-viewer pen path first and route through it rather than duplicating.
+- Build feature `input-null` (default), `input-mtouch` reserved.
+
+Standalone-deliverable check: cold-boot with `input-null` on real hw
+behaves identically to before — no behavioural change, just an idle
+trait call per IRQ.
+
+#### 5b — DWC2 host controller, polled
+**Effort:** 2–3 weeks. **Depends on:** 5a.
+
+Largest chunk by far; this is the actual USB stack work.
+
+- `src/usb/mod.rs` + `src/usb/host/mod.rs` with `trait UsbHostController`.
+  Minimum surface: port reset, control transfer, interrupt-IN submit,
+  interrupt-OUT submit, address assignment. No bulk, no iso — we won't
+  use them on this hardware.
+- `src/usb/host/dwc2/` — port from Circle (`addon/usb/dwchcd*` and
+  `lib/usb/dwhcixferstagedata.cpp`). Polled mode, no IRQs, no DMA. Same
+  pattern we used for the SDHOST port: re-implement against the
+  BCM2835 ARM Peripherals manual + Synopsys DWC2 Programming Guide,
+  cross-check semantics against Circle.
+- Scope cap: **full-speed only, single device, no hub, no splits, no
+  iso, no device-mode.** Pi Zero 2 W's micro-USB OTG goes straight to
+  DWC2 with no internal hub — our touchscreen is device 1. Audio is
+  HDMI in Phase 6, not USB, so iso and hub support never become
+  needed.
+- Verification: a `usb-probe` standalone bin (parallel to `pi-probe`
+  / `sd-probe` / `fb-probe`) that enumerates whatever's plugged in and
+  prints device + configuration + interface descriptors over PL011.
+  Test against the touchscreen, a known USB stick (mass storage —
+  enumerates but won't be driven), and a USB keyboard.
+
+Risks: DWC2 host-mode initialisation has known sequence sensitivities
+(power-on order, HPRT speed-detect timing). Circle's code is the oracle.
+
+#### 5c — USB enumeration + HID class
+**Effort:** ~1 week. **Depends on:** 5b.
+
+- `src/usb/enumerate.rs` — descriptor walker that fires after a port
+  reset: GET_DESCRIPTOR(Device) → SET_ADDRESS → GET_DESCRIPTOR(Config,
+  full) → SET_CONFIGURATION. Output: a small `UsbDevice` struct with
+  the parsed configuration tree.
+- `src/usb/class/hid.rs` — HID class operations: SET_IDLE,
+  GET_REPORT(type, id, len), SET_REPORT, GET_DESCRIPTOR(HID/Report).
+  All as helper functions over the host-controller trait — no class
+  trait yet (no second impl yet, see §pluggability above).
+- `src/usb/dispatch.rs` — given an enumerated `UsbDevice`, walk a
+  static `&[&dyn UsbDeviceDriver]` table and ask each driver whether
+  it claims the device. Trait surface: `fn matches(dev: &UsbDevice) -> bool`
+  and `fn attach(...) -> Result<Box<dyn DeviceHandle>, Err>`. The `Box`
+  is fine — we'll have at most a handful of attached devices ever, and
+  the alternative (static slots) buys nothing.
+
+#### 5d — TSTP MTouch device driver
+**Effort:** 1–2 days. **Depends on:** 5c.
+
+The actual touch panel. Everything we need is in `MTOUCH.md`.
+
+- `src/usb/device/mtouch.rs` — `impl UsbDeviceDriver` matching
+  VID=0x0416 / PID=0xC168. On `attach()`:
+  1. Issue the activation handshake: `GET_REPORT(Feature, ReportID=3,
+     length=2)` on interface 0. Confirm reply is `0x0a 0x00`.
+  2. Submit a periodic interrupt-IN read on EP 0x81, 64-byte buffer.
+- On each interrupt completion, parse the 56-byte Report ID 1 frame
+  per `MTOUCH.md` §"Report ID 1 wire format". Slot 0 only.
+- Emit `PenEvent::Down / Move / Up` against the panel's 1024×600
+  logical coordinate space (transform deferred to 5e).
+- `impl PenSource` over a small ring buffer of pending events. The
+  IRQ-time `pen.poll()` from 5a drains the ring.
+- Build feature `input-mtouch` enables this driver in the dispatch
+  table and selects it as the `PenSource` impl.
+
+#### 5e — Calibration / coordinate mapping
+**Effort:** 2–3 days. **Depends on:** 5d + the panel mounted on its
+final position.
+
+The panel's 1024×600 touch surface covers the full screen, but Newton
+is painted in a 480×720 region centred on a 1280×720 HDMI output (see
+Phase 4). Touches in the letterbox bands should be discarded; touches
+in the Newton region need scaling back to 0..319 × 0..479.
+
+- Implement the inverse-of-Phase-4-transform as a const function in
+  `src/input/calibrate.rs`. Output: `Option<(x, y)>` in Newton coords,
+  or `None` for letterbox / out-of-range.
+- Allow a per-panel offset/scale override loaded from a `CALIB.BIN`
+  file via the existing SD-card backend (Phase 2 plumbing). Default
+  to the constants we derived from the math.
+- Validate by tapping the four corners + centre of the screen and
+  confirming the Newton-side coordinates land where expected. Trip
+  one ROM symbol (probably `IO_TBOpenScreen` or the screen-manager
+  pen handler) under gdb to see what Newton actually sees.
+
+### Out of scope for Phase 5 (and the USB stack permanently)
+
+- **USB hubs.** Pi Zero 2 W's single OTG port goes direct to the
+  touchscreen; audio exits via HDMI in Phase 6. No second USB device
+  is ever planned, so no hub class, no port-status pipe.
+- **Split transactions / TT.** Without a hub, the bus stays at
+  full-speed throughout — no high-speed-to-full-speed translation
+  needed.
+- **Isochronous + bulk transfer types.** Audio is HDMI; mass storage
+  isn't a goal. Control + interrupt-IN cover the touchscreen.
+- **Suspend / resume.** The hypervisor doesn't suspend; the panel is
+  always-on.
+- **IRQ-driven USB.** Polling on the existing CNTHP timer IRQ is fine
+  at ~16 ms cadence. IRQ-driven USB is real engineering work and we
+  don't need it.
+- **Other panels.** 5d delivers one driver. Adding panel B is a
+  separate small change once the seams are proven.
+
+## Phase 6 — HDMI audio + serial + PCMCIA
+
+Maps to existing milestones M6 in HIGHLEVEL.md §12.
+
+### Audio: HDMI out via BCM2835 PCM/I2S
+
+**Effort:** ~1 week. **Depends on:** Phase 4 (HDMI link already up).
+**Reference:** Circle `lib/sound/hdmisoundbasedevice.cpp`.
+
+The bench panel has speakers and accepts HDMI audio. The Pi
+firmware embeds IEC 60958 PCM into the HDMI auxiliary-data
+channel; we just feed samples to the BCM2835 PCM/I2S peripheral
+at `0x3F20_3000` and the VC firmware does the rest.
+
+Sketch:
+
+1. **Mailbox setup.** Tell the VC firmware to enable HDMI audio
+   (config.txt `hdmi_drive=2` already on in Phase 4) and pick the
+   audio sample rate via the `set_clock_rate` property tag for
+   `CLOCK_ID_PCM`. 44.1 kHz stereo is fine for Newton.
+2. **PCM peripheral init.** Program CS_A, MODE_A, RXC_A, TXC_A,
+   DREQ_A registers per BCM2835 ARM Peripherals §8. Master mode,
+   2 channels, 16-bit. TX FIFO threshold halfway. No DMA initially
+   — push samples in a poll loop from the timer IRQ.
+3. **Newton sample feed.** Einstein's Voyager DSP emulation
+   produces ~22 kHz mono samples. Upsample to 44.1 kHz with linear
+   interpolation, duplicate to stereo, push into the TX FIFO from
+   the existing timer-IRQ context.
+4. **`AudioSink` trait** in `src/audio/mod.rs` with one impl
+   (`HdmiAudio`) and a `NullAudio` for QEMU. Same shape as the
+   `PenSource` seam from Phase 5a.
+
+Out of scope:
+- DMA-driven audio. Polling at IRQ rate is enough at 22 kHz mono.
+- PWM audio output. Pi Zero 2 W has no 3.5 mm jack and the GPIO
+  PWM path needs an external low-pass filter — not worth it.
+- HDMI audio CEA timing-info packets. The Pi firmware handles
+  them automatically when audio is enabled.
+
+### Serial + PCMCIA
+
+The PL011 mini-UART is already up for the kernel log; Newton's
+guest serial port maps to a separate buffer the host can drain. No
+new hardware work needed.
+
+PCMCIA image source (Newton's flash storage cards) maps to files
+on the SD card via the Phase 2 flash-persist backend; no new bus
+work needed either.
 
 ## Cross-cutting: feature aggregates
 
@@ -485,13 +697,14 @@ single `platform-raspi3b` Cargo feature drives both (no separate
 `platform-pi-zero2w`). The differences live in opt-in backends
 selected by aggregate features:
 
-| Feature | semihost | flash-persist | host-io | Intended target |
-|---|---|---|---|---|
-| (default) | on | semihost | null | `cargo run` against QEMU |
-| `pi-bare-metal` | off | null | null | first-light real-hw boot |
-| `pi-bare-metal-sd` | off | sd | null | real-hw with persistent state |
-| `pi-bare-metal-display` | off | sd | pi-fb | real-hw, full display |
-| `platform-fvp-base` | on | semihost | null | FVP cycle-accurate runs |
+| Feature | semihost | flash-persist | host-io | input | Intended target |
+|---|---|---|---|---|---|
+| (default) | on | semihost | null | null | `cargo run` against QEMU |
+| `pi-bare-metal` | off | null | null | null | first-light real-hw boot |
+| `pi-bare-metal-sd` | off | sd | null | null | real-hw with persistent state |
+| `pi-bare-metal-display` | off | sd | pi-fb | null | real-hw, full display |
+| `pi-bare-metal-input` | off | sd | pi-fb | mtouch | real-hw, full display + USB touch (Phase 5) |
+| `platform-fvp-base` | on | semihost | null | null | FVP cycle-accurate runs |
 
 Probe features (`sd-probe`, `fb-probe`, `sd-probe-trace`) are
 additive on top of any aggregate. The build script accepts
@@ -528,8 +741,8 @@ These don't block the plan but should be captured as they come up:
 | 2 — Persistent flash | **done (2026-05-12)** | `flash-persist-sd` backend running on real hw. SDHOST at 25 MHz / 4-bit; ~700 KB/s through the FAT layer (CMD17/CMD24 per sector — multi-block command is the obvious next optimisation). Pi-bare-metal-sd boot loads + saves `/NEWTON.BIN` end-to-end across cold boots. |
 | 3 — Snapshot on real hw | **deferred** | Snapshots are valuable when debugging late-boot state on QEMU/FVP; on real silicon the boot tends to *complete*, so the rewind-by-2s loop they accelerate isn't load-bearing. Skip until a real-hw bug demands them. |
 | 4 — Display | **done (2026-05-12)** | `host-io-pi-fb` backend running on real hw. Newton's 320x480 2 bpp FB scaled 1.5x to 480x720 centred on a 1280x720 HDMI panel (CEA mode 4 forced for link stability). Output looks like the QEMU/FVP host-viewer image but with nearest-neighbor aliasing; bilinear or integer-scale-with-letterbox is a follow-up. |
-| 5 — Input | **next** | UART pen first, USB later |
-| 6 — Audio / serial / PCMCIA | not started | aligns with M6 |
+| 5 — USB input (touchscreen) | **next** | TSTP MTouch panel characterized 2026-05-12 (see [`MTOUCH.md`](MTOUCH.md)). Five sub-phases: `PenSource` seam → DWC2 host → enumeration+HID → MTouch driver → calibration. UART tunnel dropped. |
+| 6 — HDMI audio / serial / PCMCIA | not started | Audio via HDMI through BCM2835 PCM/I2S (bench panel has speakers). USB stack stays single-device-no-hub permanently. |
 
 ### Phase 2 — closed (2026-05-12)
 

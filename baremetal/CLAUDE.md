@@ -378,3 +378,7 @@ re-deriving state from disassembly or tool output:
   (the documented deployment target). The Pi 3B is **not** a
   stepping stone — same SoC, same image; only the form factor
   differs. Skip the detour.
+- [`docs/MTOUCH.md`](docs/MTOUCH.md) — TSTP MTouch USB touchscreen
+  (VID 0x0416 / PID 0xC168) characterization: USB topology, HID
+  report descriptor decode, activation handshake, Report ID 1
+  wire format. Reference for Phase 5 input work.

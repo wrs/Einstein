@@ -39,32 +39,26 @@ pub fn run() -> ! {
 
     let blue = u32::from_le_bytes([0x00, 0x00, 0xFF, 0x00]);
 
-    // Continuous repaint at ~60 Hz. Earlier runs showed intermittent
-    // flicker on some boots; this loop diagnoses whether the flicker
-    // is something *else* writing into our FB (then a fast repaint
-    // should win the race and the image stays steady) or our writes
-    // not landing (then flicker continues regardless).
-    //
-    // No `halt` — the diagnostic IS the loop. Power-cycle to exit.
-    kprintln!("fb: continuous repaint loop (Ctrl-C / power off to stop)");
+    // Wait 2 s before painting so any firmware-side display
+    // initialization (splash, status indicators, mode setup) has
+    // a chance to finish before we touch the framebuffer. Earlier
+    // halt-mode runs flickered on some boots, suggesting a race
+    // with firmware activity; this gates that hypothesis.
     let freq = cntfrq();
-    let interval_ticks = freq / 60; // ~16.6 ms
-    let mut next = cntpct().wrapping_add(interval_ticks);
-    let mut frame = 0u64;
-    loop {
-        fb::fill_h_gradient(&info, red, green);
-        fb::fill_top_rows(&info, 32, blue);
-        frame += 1;
-        if frame.is_multiple_of(60) {
-            // Once a second so we can see the loop is alive over serial.
-            kprintln!("fb: frame {}", frame);
-        }
-        while cntpct() < next {
-            // SAFETY: ISB has no side effects; spinning is fine.
-            unsafe { asm!("yield", options(nomem, nostack, preserves_flags)) };
-        }
-        next = next.wrapping_add(interval_ticks);
+    let wait_ticks = freq * 2;
+    kprintln!("fb: waiting 2 s for firmware to quiesce...");
+    let deadline = cntpct().wrapping_add(wait_ticks);
+    while cntpct() < deadline {
+        // SAFETY: yield has no side effects.
+        unsafe { asm!("yield", options(nomem, nostack, preserves_flags)) };
     }
+
+    kprintln!("fb: painting red → green gradient + top-rows blue, then halt");
+    fb::fill_h_gradient(&info, red, green);
+    fb::fill_top_rows(&info, 32, blue);
+
+    kprintln!("fb: paint done; halt");
+    cpu::halt();
 }
 
 #[inline]

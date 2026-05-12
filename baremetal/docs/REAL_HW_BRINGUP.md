@@ -367,40 +367,93 @@ for ~14 MiB every 2 s. On real hw:
 Snapshot compatibility across host platforms is already gated on a ROM
 fingerprint; the storage layer change doesn't break that.
 
-## Phase 4 — Display
+## Phase 4 — Display (closed 2026-05-12)
 
-**Closes:** Newton renders to a mini-HDMI monitor.
-**Effort:** 2–4 days (framebuffer alloc + blit path; mailbox is done).
-**Depends on:** Phase 1. Mailbox already built in Phase 2.
+Newton renders end-to-end to a mini-HDMI monitor. Build the full
+real-hw image with:
 
-VideoCore framebuffer init goes through the same property-tag
-mailbox client `src/mailbox.rs` we built for SDHOST clock setup.
-After init, the framebuffer is just a chunk of physical memory at
-a mailbox-returned bus address.
+```bash
+PI_KERNEL_BIN=newton-hypervisor PI_CARGO_FEATURES=pi-bare-metal-display \
+  scripts/build-sd.sh /tmp/sd /Volumes/bootfs
+```
 
-### Tasks
+The `pi-bare-metal-display` aggregate combines `platform-raspi3b`,
+`no-semihost`, `flash-persist-sd`, and `host-io-pi-fb`. After
+power-on the panel shows Newton's boot sequence in a centred
+480×720 region, byte-identical (up to scaling) to the QEMU/FVP
+host-viewer output.
 
-1. **Framebuffer allocation tags.** Extend `src/mailbox.rs` with
-   the `FB_ALLOCATE` / `FB_SET_PHYSICAL_W_H` / `FB_SET_VIRTUAL_W_H`
-   / `FB_SET_DEPTH` / `FB_SET_PIXEL_ORDER` etc. tags. Single
-   property request bundling them is the standard idiom (saves a
-   round-trip per tag).
-2. **Bus → CPU address translation.** VC returns a bus address
-   (typically `0x4000_0000 | pa`). Identity-map the framebuffer
-   region as Normal-WB at EL2 stage-1; mark guest-visible at
-   stage-2 so the existing blit path can land bytes there.
-3. **Blit backend.** `host_io` already abstracts blits; add a
-   `host-io-pi-fb` variant that writes into the VC-returned
-   framebuffer instead of forwarding via semihosting. Pair with
-   `pi-bare-metal-sd` for the full real-hw build.
-4. **Geometry.** Newton expects 320×240 mono. Two options:
-   - Ask VC for that exact mode and let HDMI scaling stretch
-     (probably ugly).
-   - Ask for native panel resolution (1080p typical) and scale
-     in software during the blit. Open question §16.11.
+### Stack as built
 
-QEMU `raspi3b`'s mailbox is partial — this is one of the places
-real hardware is more reliable than QEMU, not less.
+```
+  ┌─────────────────────────────────────────────────────┐
+  │ host_io::pi_fb::push_blit                           │   ← consumes
+  │   2 bpp Newton FB rect → 32 bpp panel rect          │     screen.rs
+  │   nearest-neighbor 1.5x, centre-x offset            │     blits
+  ├─────────────────────────────────────────────────────┤
+  │ display::fb::alloc_native + FbInfo                  │   ← per-boot
+  │   panel native size, 32 bpp RGB, 4 KiB align        │     allocation
+  ├─────────────────────────────────────────────────────┤
+  │ mailbox::fb_setup_and_allocate (single batched msg) │   ← VC property
+  ├─────────────────────────────────────────────────────┤
+  │ mailbox_call (cache flush + doorbell + response)    │   ← shared with
+  │                                                     │     SDHOST clock
+  └─────────────────────────────────────────────────────┘
+```
+
+Newton's 320×480 2 bpp framebuffer scales 1.5× → 480×720, painted
+centred horizontally on a 1280×720 panel. Vertical fills the
+panel exactly; horizontal leaves 400 px black on each side.
+
+### Bring-up lessons
+
+In rough order of how much they cost to find:
+
+- **Batch all FB setup tags in a single mailbox message.** The Pi
+  property mailbox treats each request as an atomic transaction;
+  state set in one (e.g. `set_physical_size`) does NOT persist
+  into the next (`fb_allocate`). Allocating after separate-message
+  setup leaves you with firmware defaults (size=512, pitch=32),
+  the VC then scans random DRAM as pixels and you see crazy flicker
+  on top of garbage. One message, seven tags, fixed.
+- **Force a CEA mode if the panel's native is non-standard.** The
+  panel on the bench is a small Pi-targeted display reporting DMT
+  39 (1360x768). HDMI lock on DMT modes is borderline on cheap
+  cables / panels — produced intermittent flicker that
+  `hdmi_drive=2 / hdmi_force_hotplug=1 / config_hdmi_boost=7`
+  couldn't fix. Forcing CEA mode 4 (1280x720 @60, `hdmi_group=1
+  hdmi_mode=4`) made it rock-solid. The panel scales internally;
+  a small loss of pixels is worth the stability.
+- **Row-major blit, always.** Column-major iteration in the
+  gradient fill produced a visible left-to-right paint sweep at
+  ~0.5 s per frame because pitch (5120 B) ≫ cache line (64 B) and
+  every store was a fresh miss. Row-major gets 16 pixels per
+  cache fill — same code drops to <50 ms. The host_io blit path
+  inherits this discipline.
+- **Don't undercount stack consumption.** Naïve 'precompute the
+  per-column row into a stack buffer' would have taken half the
+  16 KiB boot stack. Per-pixel recomputation is cheap enough.
+- **`avoid_warnings=1` + `disable_overscan=1`** suppress the Pi
+  firmware's icon overlay and overscan padding respectively.
+  Neither suppresses panel-side OSD strips — the small Pi-targeted
+  panel in question has a permanent ~10 px white bar at the very
+  top that survives every Pi-side config knob. Accepted as panel
+  hardware quirk; it lives above row 0 of our framebuffer.
+
+### Known TODOs (none blocking)
+
+- **Better scaler.** 1.5× nearest-neighbor produces visible
+  jaggies, especially on diagonal edges. Bilinear or 2x-integer-
+  with-letterbox would look much cleaner. Reasonable next visual
+  polish step.
+- **Cache mapping.** The FB region is Normal-WB; we `dc_civac`
+  the touched rows after every blit. For Newton's typical small
+  dirty rects this is bounded; if a profile shows it dominating,
+  remap as Normal Non-Cacheable and drop the maintenance.
+- **Multi-mode geometry.** The 1.5× factor assumes a 720-line
+  output. A 1080p panel would benefit from 2.25× or a different
+  scaler. Revisit when we ship to anything other than the panel
+  on Walter's bench.
 
 ## Phase 5 — Input
 
@@ -425,19 +478,32 @@ Maps to existing milestones M6 in HIGHLEVEL.md §12. Real-hw specifics
 (I2S vs PWM for audio, BCM SD vs PCMCIA image source) are not closer
 than the M6 work itself. Sequence after Phase 5 has a usable system.
 
-## Cross-cutting: what changes in the build
+## Cross-cutting: feature aggregates
 
-A `platform-pi-zero2w` Cargo feature, alongside `platform-raspi3b` and
-`platform-fvp-base`. Build profile selects:
+QEMU `raspi3b` and the real Pi Zero 2 W share the same SoC, so a
+single `platform-raspi3b` Cargo feature drives both (no separate
+`platform-pi-zero2w`). The differences live in opt-in backends
+selected by aggregate features:
 
-- Linker script (real load address, real DRAM size).
-- Default `host-io-null`, `flash-persist-null` initially; later
-  `host-io-pi-fb`, `flash-persist-sd` (FAT32 on the boot partition).
-- Snapshot autosave: off by default for the real-hw profile until
-  Phase 3 finishes the storage path.
+| Feature | semihost | flash-persist | host-io | Intended target |
+|---|---|---|---|---|
+| (default) | on | semihost | null | `cargo run` against QEMU |
+| `pi-bare-metal` | off | null | null | first-light real-hw boot |
+| `pi-bare-metal-sd` | off | sd | null | real-hw with persistent state |
+| `pi-bare-metal-display` | off | sd | pi-fb | real-hw, full display |
+| `platform-fvp-base` | on | semihost | null | FVP cycle-accurate runs |
 
-`build.rs` already has the platform-feature plumbing pattern; extending
-it to a third platform is mechanical.
+Probe features (`sd-probe`, `fb-probe`, `sd-probe-trace`) are
+additive on top of any aggregate. The build script accepts
+`PI_CARGO_FEATURES` to override the base and `PI_EXTRA_FEATURES`
+to append.
+
+`build.rs` resolves the active `flash-persist-*` and `host-io-*`
+backends through small per-axis selectors that panic on mutually
+exclusive picks. To add a new backend (e.g. `host-io-pi-emmc`
+once we have one), add the feature in `Cargo.toml`, an arm in the
+relevant resolver, and a `#[cfg(nh_*)]`-gated module under the
+matching directory.
 
 ## Open questions specific to real hardware
 
@@ -461,8 +527,8 @@ These don't block the plan but should be captured as they come up:
 | 1 — Hypervisor `kmain` on Zero | **done (2026-05-11)** | Boots through `kmain`, ROM patches, stage-2, ERET to guest. Initial run halted on the trip-wire for an unmapped-IPA write at `0x01683800` from `DiagBootStub` `PC=0x1a01c`; a subsequent real-silicon run shows the OS continuing past that point and **booting + running without observed crashes**. No detailed serial trace captured for the longer run yet — Phase 2 below will give us a place to land logs. |
 | 2 — Persistent flash | **done (2026-05-12)** | `flash-persist-sd` backend running on real hw. SDHOST at 25 MHz / 4-bit; ~700 KB/s through the FAT layer (CMD17/CMD24 per sector — multi-block command is the obvious next optimisation). Pi-bare-metal-sd boot loads + saves `/NEWTON.BIN` end-to-end across cold boots. |
 | 3 — Snapshot on real hw | **deferred** | Snapshots are valuable when debugging late-boot state on QEMU/FVP; on real silicon the boot tends to *complete*, so the rewind-by-2s loop they accelerate isn't load-bearing. Skip until a real-hw bug demands them. |
-| 4 — Display | **next** | VC mailbox already runs (Phase 2 dep); framebuffer alloc + blit path is the new code. |
-| 5 — Input | not started | UART pen first, USB later |
+| 4 — Display | **done (2026-05-12)** | `host-io-pi-fb` backend running on real hw. Newton's 320x480 2 bpp FB scaled 1.5x to 480x720 centred on a 1280x720 HDMI panel (CEA mode 4 forced for link stability). Output looks like the QEMU/FVP host-viewer image but with nearest-neighbor aliasing; bilinear or integer-scale-with-letterbox is a follow-up. |
+| 5 — Input | **next** | UART pen first, USB later |
 | 6 — Audio / serial / PCMCIA | not started | aligns with M6 |
 
 ### Phase 2 — closed (2026-05-12)

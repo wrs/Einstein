@@ -202,9 +202,12 @@ fn send_one_tag(tag_id: u32, arg_words: &mut [u32]) -> Result<(), MailboxError> 
     if buf.words[1] != RESPONSE_SUCCESS {
         return Err(MailboxError::FirmwareError);
     }
-    // Per the spec, firmware sets bit 31 of `value_buffer_size` on
-    // successfully-filled responses. (Encodes which lane is which.)
-    if buf.words[3] & 0x8000_0000 == 0 {
+    // Per the property-interface spec, the per-tag response indicator
+    // lives in the tag's third header word (request_code, which the
+    // firmware turns into response_code by setting bit 31). That's
+    // buf.words[4] in our layout — buf.words[3] is the value-buffer
+    // size, unchanged by the firmware.
+    if buf.words[4] & 0x8000_0000 == 0 {
         return Err(MailboxError::TagNotHandled);
     }
     for (i, slot) in arg_words.iter_mut().enumerate() {

@@ -155,49 +155,79 @@ Reuse Einstein classes; adapt only the memory-interface boundary so the "registe
 
 ## 11. Development environment
 
-Real Pi Zero 2 W hardware is the deployment target, not the day-to-day dev target. The Zero 2 W is inconvenient to iterate on (no HDMI, no Ethernet, fiddly power, small form factor). Use progressively closer-to-real environments as each layer stabilises.
+**Deployment target: Raspberry Pi Zero 2 W. No intermediate Pi model.** The
+Zero 2 W's BCM2710A1 is a repackaged BCM2837 (same Cortex-A53 quad-core,
+same memory map, same peripherals as a Pi 3B), so the day-to-day dev loop
+is QEMU `raspi3b` + ARM FVP for emulation, and the Zero 2 W directly for
+real-silicon validation. The Pi 3B is not a stepping stone — it has the
+same SoC, runs the same `kernel8.img`, and its only practical advantage
+(full-size HDMI/USB connectors, easier bench wiring) doesn't move the
+needle on bring-up effort. The Zero 2 W has mini-HDMI, micro-USB OTG, and
+its own GPIO header; that's everything bring-up needs. Skip Pi 3B unless
+the form factor is genuinely getting in the way of a specific debugging
+session.
 
-### 11.1 Primary: QEMU `-M raspi3b`
+See `docs/REAL_HW_BRINGUP.md` for the concrete plan to go from QEMU/FVP-
+green to Zero-2-W-green.
 
-The Zero 2 W's BCM2710A1 is a repackaged BCM2837 — same Cortex-A53 quad-core, same memory map, same peripherals as the Pi 3B. QEMU's `raspi3b` machine is the closest off-the-shelf emulator.
+### 11.1 Primary dev target: QEMU `-M raspi3b`
+
+QEMU's `raspi3b` machine is the closest off-the-shelf emulator for the
+BCM2837/BCM2710A1 SoC.
 
 - Launch: `qemu-system-aarch64 -M raspi3b -cpu cortex-a53 -smp 4 -m 1G -kernel kernel8.img -serial stdio -s -S`.
-- Exposes EL3/EL2/EL1. GIC, ARM generic timer, mini-UART/PL011, SD controller all modelled.
-- `-s -S` provides a gdb stub on `:1234`; connect with `gdb-multiarch` for single-step and stage-2 fault inspection.
+- Exposes EL3/EL2/EL1. Legacy BCM2835 VIC, ARM generic timer, mini-UART/PL011, SD controller all modelled.
+- `-s -S` provides a gdb stub on `:1234`; connect with `aarch64-elf-gdb` for single-step and stage-2 fault inspection.
 - `-d int,mmu,cpu_reset,guest_errors` for early trap plumbing.
 - Instant iteration — no SD swaps, no serial wiring.
 
-Gaps in QEMU's raspi3b: VideoCore mailbox/framebuffer is partial, USB (`dwc_otg`) is quirky, I2S/PWM audio is effectively absent. Sufficient for M1–M3; insufficient for M4+.
+Gaps in QEMU's raspi3b: AArch64↔AArch32 banked-register plumbing is flaky
+(see `docs/QEMU_BUGS.md`), VideoCore mailbox/framebuffer is partial, USB
+(`dwc_otg`) is quirky, I2S/PWM audio is effectively absent. Sufficient
+for M1–M3; insufficient for M4+ peripheral bring-up.
 
-### 11.2 Secondary: real Pi 3B or Pi 3B+
+### 11.2 Co-primary dev target: ARM FVP `FVP_Base_RevC-2xAEMvA`
 
-Same SoC as the Zero 2 W; binaries run unchanged. HDMI, Ethernet, and full-size USB make driver bring-up dramatically less painful than on the Zero 2 W itself. Minimum kit: Pi 3B, USB-TTL serial cable on GPIO 14/15, SD card, HDMI monitor.
+The accurate reference model. GICv3 + generic timer + cache model are all
+modelled correctly; the AArch64↔AArch32 boundary works without QEMU's
+quirks. Used to cross-check anything that smells like a QEMU bug. Slower
+than QEMU TCG because the timer/cache model is accurate.
 
-Used from M4 onwards. The Zero 2 W itself is touched only at M6–M7 for final validation.
+- Build: `cargo build --release --no-default-features --features "platform-fvp-base quiet"`.
+- Launch: `scripts/fvp --timeout=90 <elf>` (wraps a dockerised FVP).
+- `--gdb` for Iris debug server on port 7100; `--features trace` for the function-level tracer.
 
-### 11.3 Tertiary (M1 only): QEMU `-M virt`
+Both QEMU and FVP must stay green: `guest-tests/scripts/run-all.sh` runs
+the guest tests on both. Any new divergence is tracked down rather than
+papered over with a feature gate.
 
-If the Pi boot handoff is fighting us while writing the first EL2 bytes, `-M virt -cpu cortex-a53 -machine virtualization=on` gives a clean, well-documented GICv3 + PL011 + virtio platform at EL2 with no firmware quirks. Useful for isolating "is my EL2 init correct?" from "is my Pi boot protocol correct?" Abandon once raspi3b works.
+### 11.3 Real-silicon target: Pi Zero 2 W
+
+The deployment target itself. Touched only after a milestone has passed
+on both QEMU and FVP. Bring-up sequencing and the implementation gaps
+between "works on emulators" and "works on the Zero" live in
+`docs/REAL_HW_BRINGUP.md`.
 
 ### 11.4 Things to know up front
 
-- **EL2 entry state on real Pi.** The Pi firmware's handoff to `kernel8.img` in 64-bit mode lands at EL2 by default; 32-bit lands at HYP under the right `config.txt`. QEMU `raspi3b` behaves similarly but not identically. Budget a small boot shim to converge the two.
+- **EL2 entry state on real Pi.** The Pi firmware's handoff to `kernel8.img` in 64-bit mode lands at EL2 by default; 32-bit lands at HYP under the right `config.txt`. QEMU `raspi3b` behaves similarly but not identically. Budget a small boot shim to converge the two. (§16.1.)
 - **Park cores 1–3 in WFE** at first. SMP is out of scope; the Newton doesn't know about it anyway.
 - **`-cpu cortex-a53` specifically** — not `max`, not `cortex-a72`. Otherwise system-register availability and errata diverge from the real Pi.
 - **Use recent QEMU (8.x+).** Older versions had raspi3b EL2 quirks and incomplete `HCR_EL2` trap coverage.
 
 ### 11.5 Dev loop
 
-1. Build image as `kernel8.img`.
-2. `qemu-system-aarch64 -M raspi3b -kernel kernel8.img -serial stdio -s -S &`
-3. `gdb-multiarch kernel8.elf` → `target remote :1234` → breakpoints in EL2 trap handlers.
-4. Once a milestone passes QEMU, flash the same image to an SD and boot a real Pi 3B. Discrepancies reveal where QEMU's model is lying.
-5. Pi Zero 2 W involved only for M6–M7 validation.
+1. Build image: `cargo build --release` (raspi3b) or `--no-default-features --features platform-fvp-base` (FVP).
+2. Run on QEMU (`cargo run --release`) or FVP (`scripts/fvp …`) for fast iteration.
+3. For a debug session: `DEBUG=1 cargo run --release`, then `aarch64-elf-gdb -x scripts/gdb-init …`.
+4. `guest-tests/scripts/run-all.sh [--platform fvp]` before any commit that touches hypervisor functionality.
+5. Real-silicon validation on the Zero 2 W is its own phased workstream — see `docs/REAL_HW_BRINGUP.md`.
 
 ### 11.6 Non-options
 
 - **Hypervisor.framework on Apple Silicon.** Runs AArch32 guests fast, but it isn't a Pi — no BCM peripherals, no mailbox, no Pi boot protocol. Not worth the detour.
-- **Unicorn / Renode.** Unicorn is CPU-only. Renode supports Pi models but is less battle-tested than QEMU for this specific workload.
+- **Unicorn / Renode.** Unicorn is CPU-only. Renode supports Pi models but is less battle-tested than QEMU/FVP for this specific workload.
+- **QEMU `-M virt`.** Was considered as an M1-only fallback for "is my EL2 init correct?" isolation. FVP fills that role better and is now in the loop full-time.
 
 ## 12. Phasing
 

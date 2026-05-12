@@ -373,3 +373,8 @@ re-deriving state from disassembly or tool output:
   encoding, observed task census). Always extend this when you
   decode another kernel struct from the disasm — it's how
   debugging keeps cumulative.
+- [`docs/REAL_HW_BRINGUP.md`](docs/REAL_HW_BRINGUP.md) — phased
+  plan for getting the hypervisor running on a real Pi Zero 2 W
+  (the documented deployment target). The Pi 3B is **not** a
+  stepping stone — same SoC, same image; only the form factor
+  differs. Skip the detour.

@@ -459,15 +459,14 @@ baremetal/
 
 ## Running on real hardware
 
-Not yet. The image is built for QEMU `raspi3b` or for FVP today. A real
-Pi 3B / Zero 2 W needs at minimum:
+Not yet. The image is built for QEMU `raspi3b` or for FVP today. The
+deployment target is the **Pi Zero 2 W** (not the Pi 3B — same SoC,
+no technical advantage to using it as a stepping stone).
 
-- GPIO 14/15 routed to PL011 alt function (firmware does this when
-  `enable_uart=1` in `config.txt`).
-- Verified EL2 firmware handoff — see `HIGHLEVEL.md` §16.1.
-- An SD-card image pipeline (`kernel8.img`, `config.txt`, ROM file).
-
-Defer until there's more in the image worth testing on real hardware.
+See [`docs/REAL_HW_BRINGUP.md`](docs/REAL_HW_BRINGUP.md) for the phased
+plan. Phase 0 (confirm EL2 firmware handoff via a `CurrentEL` probe) is
+a half-day exercise that closes `HIGHLEVEL.md` §16.1 and is independent
+of all the later phases.
 
 ## Cheatsheet
 

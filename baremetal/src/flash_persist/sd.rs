@@ -31,7 +31,7 @@ use embedded_sdmmc::{Mode, VolumeIdx, VolumeManager};
 use super::FlashStore;
 use crate::sd::block_device::NullTime;
 use crate::sd::sdhost::SdHost;
-use crate::{kprintln, peripherals};
+use crate::{kprint, kprintln, peripherals};
 
 /// File name at the root of the FAT32 boot partition. Short (8.3)
 /// name so we don't depend on long-filename support on the read
@@ -43,6 +43,14 @@ const FLASH_FILE: &str = "NEWTON.BIN";
 const BLOCK_SIZE: usize = 64 * 1024;
 const NUM_BLOCKS: usize = peripherals::flash::SIZE / BLOCK_SIZE; // 128
 const NUM_BITMAP_WORDS: usize = NUM_BLOCKS / 32; // 4
+
+/// Progress reporting for full-save / load. Print a '.' for every
+/// `PROGRESS_DOT` bytes transferred, writing in `PROGRESS_CHUNK`
+/// pieces. With an 8 MiB store and 256 KiB dots, that's 32 dots
+/// per full save — coarse enough to fit on a serial line, fine
+/// enough to confirm the boot isn't actually hung.
+const PROGRESS_CHUNK: usize = 64 * 1024;
+const PROGRESS_DOT: usize = 256 * 1024;
 
 static DIRTY: [AtomicU32; NUM_BITMAP_WORDS] = [
     AtomicU32::new(0),
@@ -123,6 +131,10 @@ impl FlashStore for SdBackend {
             );
             return;
         }
+        kprintln!(
+            "flash_persist_sd: loading {} bytes from {} — slow at 400 kHz",
+            len, FLASH_FILE
+        );
         // SAFETY: GUEST_FLASH backing is a static mut byte array; single-
         // threaded on core 0 during boot, before stage-2 exposes flash
         // to the guest. `len` matches SIZE, checked above.
@@ -132,17 +144,26 @@ impl FlashStore for SdBackend {
                 peripherals::flash::SIZE,
             )
         };
+        kprint!("flash_persist_sd: load [");
         let mut off = 0usize;
+        let mut next_dot = PROGRESS_DOT;
         while off < buf.len() {
             match file.read(&mut buf[off..]) {
                 Ok(0) => break,
-                Ok(n) => off += n,
+                Ok(n) => {
+                    off += n;
+                    while off >= next_dot && next_dot <= buf.len() {
+                        kprint!(".");
+                        next_dot += PROGRESS_DOT;
+                    }
+                }
                 Err(e) => {
-                    kprintln!("flash_persist_sd: read FAILED at off={}: {:?}", off, e);
+                    kprintln!("] FAILED at off={}: {:?}", off, e);
                     return;
                 }
             }
         }
+        kprintln!("]");
         if off != peripherals::flash::SIZE {
             kprintln!(
                 "flash_persist_sd: short read ({} of {}); cold-booting flash state",
@@ -217,7 +238,14 @@ impl FlashStore for SdBackend {
         };
 
         if !valid {
-            // Full write: file doesn't exist or wrong size.
+            // Full write: file doesn't exist or wrong size. Announce
+            // up-front because at 400 kHz / 1-bit the 8 MiB write
+            // takes long enough (a minute or more) that the boot
+            // looks hung without a sign-of-life message.
+            kprintln!(
+                "flash_persist_sd: starting full save ({} bytes) — slow at 400 kHz",
+                peripherals::flash::SIZE
+            );
             let file =
                 match root.open_file_in_dir(FLASH_FILE, Mode::ReadWriteCreateOrTruncate) {
                     Ok(f) => f,
@@ -232,25 +260,40 @@ impl FlashStore for SdBackend {
                     }
                 };
             // SAFETY: GUEST_FLASH is a static mut byte array; the write
-            // takes a &[u8] for the duration of this call only.
+            // takes a &[u8] for the duration of these calls only.
             let bytes = unsafe {
                 core::slice::from_raw_parts(
                     peripherals::flash::host_pa() as *const u8,
                     peripherals::flash::SIZE,
                 )
             };
-            if let Err(e) = file.write(bytes) {
-                kprintln!("flash_persist_sd: full write FAILED: {:?}", e);
-                remark_dirty(&snapshot);
-                return;
+            // Chunk the write so we can emit progress dots; one
+            // file.write call of 8 MiB is otherwise a silent
+            // multi-minute black box.
+            kprint!("flash_persist_sd: full save [");
+            let mut off = 0;
+            let mut next_dot = PROGRESS_DOT;
+            while off < bytes.len() {
+                let end = (off + PROGRESS_CHUNK).min(bytes.len());
+                if let Err(e) = file.write(&bytes[off..end]) {
+                    kprintln!("] FAILED at off={}: {:?}", off, e);
+                    remark_dirty(&snapshot);
+                    return;
+                }
+                off = end;
+                while off >= next_dot && next_dot <= bytes.len() {
+                    kprint!(".");
+                    next_dot += PROGRESS_DOT;
+                }
             }
+            kprintln!("]");
             if let Err(e) = file.flush() {
                 kprintln!("flash_persist_sd: flush after full write FAILED: {:?}", e);
                 remark_dirty(&snapshot);
                 return;
             }
             FILE_VALID.store(true, Ordering::Relaxed);
-            kprintln!("flash_persist_sd: full save ({} bytes)", bytes.len());
+            kprintln!("flash_persist_sd: full save done ({} bytes)", bytes.len());
             return;
         }
 
@@ -264,6 +307,10 @@ impl FlashStore for SdBackend {
                 return;
             }
         };
+        let total_dirty: u32 = snapshot.iter().map(|w| w.count_ones()).sum();
+        if total_dirty > 0 {
+            kprint!("flash_persist_sd: incremental save {} blk [", total_dirty);
+        }
         let mut blocks_written = 0usize;
         for blk in 0..NUM_BLOCKS {
             let word = blk / 32;
@@ -274,7 +321,7 @@ impl FlashStore for SdBackend {
             let off = blk * BLOCK_SIZE;
             if let Err(e) = file.seek_from_start(off as u32) {
                 kprintln!(
-                    "flash_persist_sd: seek to off={} FAILED: {:?}",
+                    "] seek to off={} FAILED: {:?}",
                     off, e
                 );
                 FILE_VALID.store(false, Ordering::Relaxed);
@@ -290,7 +337,7 @@ impl FlashStore for SdBackend {
             };
             if let Err(e) = file.write(bytes) {
                 kprintln!(
-                    "flash_persist_sd: write at off={} FAILED: {:?}",
+                    "] write at off={} FAILED: {:?}",
                     off, e
                 );
                 FILE_VALID.store(false, Ordering::Relaxed);
@@ -298,6 +345,10 @@ impl FlashStore for SdBackend {
                 return;
             }
             blocks_written += 1;
+            kprint!(".");
+        }
+        if total_dirty > 0 {
+            kprintln!("] done");
         }
         if let Err(e) = file.flush() {
             kprintln!("flash_persist_sd: flush after incremental save FAILED: {:?}", e);
@@ -305,12 +356,7 @@ impl FlashStore for SdBackend {
             // save will just re-flush.
             return;
         }
-        if blocks_written > 0 {
-            kprintln!(
-                "flash_persist_sd: incremental save ({} blocks)",
-                blocks_written
-            );
-        }
+        let _ = blocks_written;
     }
 
     fn fingerprint(&self) -> u32 {

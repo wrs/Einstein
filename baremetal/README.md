@@ -440,7 +440,6 @@ baremetal/
     tarmac.rs            FVP Tarmac plugin window markers
     alrt_capture.rs      ALRT capture
     g1_capture.rs        Group-1 capture
-    heap_watch.rs        kernel heap watcher
   guest-tests/
     common/              shared runtime, linker script, HVC macros
     tests/               36 .S files + MANIFEST

@@ -191,8 +191,8 @@ fn invalidate_ipa_s2(ipa: u32) {
 
 /// Read back the stage-2 L3 entry covering the 4 KiB RAM page at
 /// `ipa`. None when `ipa` is outside the RAM aperture. Diagnostic
-/// only — used by `heap_watch` to verify a permission flip actually
-/// landed in the table.
+/// helper for verifying a permission flip actually landed in the
+/// table.
 pub fn ram_page_l3_entry(ipa: u32) -> Option<u64> {
     let page = ipa & !0xFFF;
     let entry_ptr = ram_l3_entry_ptr(page)?;

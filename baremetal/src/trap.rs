@@ -62,19 +62,6 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
 
     crate::trap_hist::record_sync(ec);
 
-    // Forensic sentinel for the RelocHeap-header corruption stop:
-    // sample heap[0x0ca6b010] on every guest sync trap and log the
-    // value transition with the current ELR_EL2. Bisects the corruption
-    // writer to a function range. See `INVESTIGATION.md` and
-    // `src/heap_watch.rs`. The ctx + spsr are passed in so the
-    // sanity-halt path can dump banked SPs and probe hypothesis #1.
-    crate::heap_watch::sample(
-        read_sysreg!("elr_el2"),
-        crate::heap_watch::Source::Sync,
-        ctx,
-        read_sysreg!("spsr_el2"),
-    );
-
     // (Group-1 capture re-arm intentionally NOT here — see
     // `trap_irq` for the rationale. Sync traps include the
     // data-abort our own capture handler triggered, so re-arming
@@ -180,16 +167,6 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
 /// and update HCR_EL2.VI so the guest takes a virtual IRQ on ERET.
 #[no_mangle]
 pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
-    // Forensic sentinel for the RelocHeap-header corruption stop —
-    // sample heap[0x0ca6b010] every IRQ. Pairs with the per-sync-trap
-    // sample at trap_sync_lower_aarch32. See `src/heap_watch.rs`.
-    crate::heap_watch::sample(
-        read_sysreg!("elr_el2"),
-        crate::heap_watch::Source::Irq,
-        ctx,
-        read_sysreg!("spsr_el2"),
-    );
-
     // Group-1 capture re-arm: any G1 page that took a permission-fault
     // since the last IRQ has been auto-flipped to RW (so the store
     // could complete). Re-impose RO+XN now so the *next* G1 write
@@ -447,49 +424,6 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
 
     crate::trap_hist::record_dabt(elr, ipa as u32);
 
-    // Heap-watch debug: log every DABT on the carved-out heap page,
-    // regardless of fault class, so we can see WHY the post-rebind
-    // RO carve-out doesn't seem to trap. Remove with the rest of the
-    // heap-watch scaffolding. Always emit; the trap log budget is
-    // separate and we want every hit on this narrow window.
-    //
-    // Pre-rebind hits saturate any global cap quickly, so reset the
-    // cap whenever the armed PA changes — gives each rebind window
-    // its own log budget.
-    {
-        let armed = crate::heap_watch::carved_pa();
-        if armed != 0 && (ipa as u32) & !0xFFF == armed {
-            static HITS: core::sync::atomic::AtomicU32 =
-                core::sync::atomic::AtomicU32::new(0);
-            static LAST_ARMED: core::sync::atomic::AtomicU32 =
-                core::sync::atomic::AtomicU32::new(0);
-            if LAST_ARMED.load(core::sync::atomic::Ordering::Relaxed) != armed {
-                HITS.store(0, core::sync::atomic::Ordering::Relaxed);
-                LAST_ARMED.store(armed, core::sync::atomic::Ordering::Relaxed);
-            }
-            let n = HITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            // Always log writes to the corrupted-header window
-            // (offsets +0x10..+0x28 from heap base, = page offsets
-            // +0x10..+0x28). Filter the rest below the cap.
-            let off = (ipa as u32) & 0xFFF;
-            let in_corrupt_window = (0x10..0x28).contains(&off);
-            let value = if isv != 0 { ctx.x[srt] as u32 } else { 0 };
-            let is_wedge = (isv != 0) && matches!(
-                value,
-                0x002d_d804 | 0x001a_48f0 | 0x002d_fa20 | 0x002d_d7c4
-            );
-            if n < 256 || in_corrupt_window || is_wedge {
-                kprintln!(
-                    "heap-watch dabt-on-carve[{}]: ipa={:#010x} elr={:#010x} ifsc={:#x} wnr={} isv={} value={:#010x} srt={} (carved_pa={:#010x}){}",
-                    n, ipa, elr, ifsc, wnr as u32, isv, value, srt, armed,
-                    if is_wedge { "  *** WEDGE-VALUE ***" }
-                    else if in_corrupt_window { "  [header window]" }
-                    else { "" },
-                );
-            }
-        }
-    }
-
     // Stage-2 RO-permission fault on a RAM code page. Newton's
     // demand-pager is overwriting a page the hypervisor previously
     // froze RO+X after shadow-stub patching; flip the page back to
@@ -540,20 +474,6 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
             }
             // Fell through with Unrecognized — fall back to the
             // auto-flip behavior below so boot can continue.
-        }
-
-        // Heap-watch carve-out: log writer info before the auto-flip,
-        // and arm a re-RO at the next trap so the next write also
-        // faults. See `src/heap_watch.rs`.
-        if crate::heap_watch::is_carved_out_ipa(page) {
-            let value = if isv != 0 {
-                Some(ctx.x[srt] as u32)
-            } else {
-                None
-            };
-            crate::heap_watch::note_perm_fault_on_carve_out(
-                elr, ipa as u32, value, isv != 0, srt as u32,
-            );
         }
 
         // SAFETY: helper performs its own TLB maintenance.

@@ -453,13 +453,6 @@ pub fn handle_user_bp_und(
                 r0, ctx.x[lr_idx] as u32,
             );
         }
-        // First time we see SetCurrentHeap(0x0ca6b010), arm the
-        // stage-2 RO carve-out on the page backing that heap header.
-        // Idempotent — `arm_carve_out_at_heap_va` returns None if
-        // already armed.
-        if r0 == 0x0ca6_b010 {
-            let _ = crate::heap_watch::arm_carve_out_at_heap_va(0x0ca6_b000);
-        }
         // Emulate `ldr r1, [pc, #40]` — PC at execution = pc+8, so the
         // word loaded is at faulting_pc + 8 + 40. The ROM literal at
         // 0x142e20 is `0x0c10102c` (a g-pointer constant).

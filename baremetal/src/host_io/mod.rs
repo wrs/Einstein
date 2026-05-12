@@ -73,6 +73,11 @@ pub struct PenEvent {
 pub const PEN_DOWN: u8 = 1;
 pub const PEN_MOVE: u8 = 2;
 pub const PEN_UP: u8 = 3;
+/// Power-switch press from the host viewer. `x`, `y`, `pressure` are
+/// ignored. Wakes the guest from PowerOff state via
+/// `peripherals::vic::raise_power_switch` — equivalent to Einstein's
+/// `TPlatformManager::SendPowerSwitchEvent` when the system is off.
+pub const POWER_SWITCH: u8 = 4;
 
 const _: () = {
     assert!(core::mem::size_of::<PenEvent>() == 8);

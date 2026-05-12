@@ -133,6 +133,11 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
 ///   * Short-circuit if a vIRQ is already pending (`vic::irq_pending()`).
 ///     The kernel will take it on the next ERET; consuming a heartbeat
 ///     in WFI would just delay that.
+///   * Also short-circuit on `vic::take_wake_request()`: a host-IO
+///     power-switch press sets that flag (see `vic::raise_power_switch`)
+///     so the guest gets a chance to leave PowerOff state even though
+///     the corresponding `INT_GPIO` bit is masked out of `kPowerOffMask`.
+///     Mirrors Einstein's `mEmulatorCondVar->Signal()` back-door.
 ///   * Otherwise unmask physical IRQs in EL2 (`PSTATE.I`) and issue
 ///     `wfi`. The only wired physical IRQ on this hypervisor is CNTHP
 ///     heartbeat (~16 ms); when it fires, the EL2 IRQ vector at offset
@@ -177,7 +182,7 @@ fn pause_system(ctx: &mut TrapContext) {
         );
     }
 
-    if !crate::peripherals::vic::irq_pending() {
+    if !crate::peripherals::vic::irq_pending() && !crate::peripherals::vic::take_wake_request() {
         for _ in 0..MAX_WFI_ITERS {
             // SAFETY: see function-level SAFETY notes.
             unsafe {
@@ -188,7 +193,9 @@ fn pause_system(ctx: &mut TrapContext) {
                     options(nostack, preserves_flags),
                 );
             }
-            if crate::peripherals::vic::irq_pending() {
+            if crate::peripherals::vic::irq_pending()
+                || crate::peripherals::vic::take_wake_request()
+            {
                 break;
             }
         }

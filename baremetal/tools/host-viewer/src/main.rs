@@ -28,6 +28,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 const SCREEN_WIDTH: u32 = 320;
@@ -49,6 +50,9 @@ const PEN_EVENT_LEN: usize = 8;
 const PEN_DOWN: u8 = 1;
 const PEN_MOVE: u8 = 2;
 const PEN_UP: u8 = 3;
+/// Power-switch press, sent on `P` key. Wakes the guest from PowerOff
+/// state; see `src/host_io/mod.rs::POWER_SWITCH`.
+const POWER_SWITCH: u8 = 4;
 
 /// 4-gray palette in BGRA. 2 bpp index 0 = white, 3 = black.
 const PALETTE: [u32; 4] = [
@@ -204,6 +208,18 @@ impl ApplicationHandler for App {
                         (false, true) => self.send_pen(PEN_DOWN, x, y, 4),
                         (true, false) => self.send_pen(PEN_UP, x, y, 0),
                         _ => {}
+                    }
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state == ElementState::Pressed && !event.repeat {
+                    eprintln!(
+                        "host-viewer: key {:?} (logical={:?})",
+                        event.physical_key, event.logical_key
+                    );
+                    if event.physical_key == PhysicalKey::Code(KeyCode::KeyP) {
+                        eprintln!("host-viewer: power-switch press");
+                        self.send_pen(POWER_SWITCH, 0, 0, 0);
                     }
                 }
             }

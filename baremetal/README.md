@@ -185,7 +185,10 @@ cargo run --release
 A 640×960 window appears (the panel is 320×480, scaled 2×). The
 Newton boot UI paints incrementally as blits arrive. Left-click to
 tap the panel; drag to drag. Mouse position is mapped 1:1 into the
-panel coord space, so taps land where you expect.
+panel coord space, so taps land where you expect. Press `P` to send
+a power-switch press — the only way to wake the guest after it has
+slept into PowerOff, since Newton OS masks the tablet IRQ in that
+state (matches real hardware; equivalent to Einstein's `SendPowerSwitchEvent`).
 
 **IPC details, if you need to debug.** The hypervisor opens these
 two files via Arm semihosting on init:
@@ -196,8 +199,8 @@ two files via Arm semihosting on init:
   records.
 - `/tmp/newton-host-io/in`  — viewer → hypervisor. 8-byte
   `PenEvent` records (`kind` byte + le16 `x`, `y`, `pressure`;
-  `kind` = 1 down / 2 move / 3 up). Hypervisor seeks to its last
-  read position every 16 ms and drains new bytes.
+  `kind` = 1 down / 2 move / 3 up / 4 power-switch). Hypervisor seeks
+  to its last read position every 16 ms and drains new bytes.
 
 The hypervisor creates the directory and `touch`es both files on
 boot, so first-time startup needs no manual prep. Restarting the

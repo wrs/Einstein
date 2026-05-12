@@ -16,7 +16,7 @@
 //!   crossed bit(s) into `int_present`, so the next `update_virq` sets VI.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 // ---------- Newton tick clock (3.6864 MHz). ----------------------------------
 
@@ -247,6 +247,38 @@ pub fn inject_sound_dma_irq() {
     // SAFETY: single-threaded.
     let s = unsafe { &mut *VIC.0.get() };
     s.int_present |= INT_DMA_CH3 | INT_DMA_CH5;
+}
+
+/// One-shot wake flag for `pause_system`. Set by `raise_power_switch` so
+/// the EL2 WFI loop exits even when the corresponding IRQ bit is masked
+/// out of `int_ctrl` by `kPowerOffMask` (`TInterruptManager.h:83`).
+/// Mirrors Einstein's `mEmulatorCondVar->Signal()` back-door in
+/// `RaiseGPIO` (TInterruptManager.cpp:472): the suspended CPU resumes
+/// regardless of whether the IRQ would pass `mIntRaised & mIntCtrlReg`.
+static WAKE_REQUEST: AtomicBool = AtomicBool::new(false);
+
+/// Power-switch press from the host-IO transport. Mirrors Einstein's
+/// `TPlatformManager::RaisePlatformInterrupt() -> RaiseGPIO(0x00000001)`
+/// (TPlatformManager.cpp:484, TInterruptManager.cpp:458):
+/// sets bit 0 in `mGPIORaised`, and if `mGPIOCtrlReg` has that line
+/// enabled, raises `kGPIOIntMask` so the kernel sees it. We additionally
+/// set `WAKE_REQUEST` so `pause_system` returns to the guest — `kGPIOIntMask`
+/// is not in `kPowerOffMask` (0x0C400000), so the IRQ would otherwise stay
+/// invisible while the system is in PowerOff state.
+pub fn raise_power_switch() {
+    // SAFETY: single-threaded.
+    let s = unsafe { &mut *VIC.0.get() };
+    s.gpio_r |= 0x0000_0001;
+    if s.gpio_e & 0x0000_0001 != 0 {
+        s.int_present |= INT_GPIO;
+    }
+    WAKE_REQUEST.store(true, Ordering::Release);
+}
+
+/// Consume the pending wake request, if any. Atomically swaps the flag
+/// to false and returns its prior value.
+pub fn take_wake_request() -> bool {
+    WAKE_REQUEST.swap(false, Ordering::AcqRel)
 }
 
 /// Latch any timer-match bits whose deadline has passed into `int_present`

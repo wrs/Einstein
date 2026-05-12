@@ -202,8 +202,9 @@ pub fn pump_input() {
         let y = ev.y;
         let pressure = ev.pressure;
         // Only log pen-down / pen-up edges; move events are very noisy
-        // during a drag.
-        if kind != super::PEN_MOVE {
+        // during a drag, and POWER_SWITCH has its own dedicated log
+        // line.
+        if kind != super::PEN_MOVE && kind != super::POWER_SWITCH {
             kprintln!(
                 "host_io: pen kind={} x={} y={} p={}  vic.ictrl={:#010x} vic.ipres={:#010x}",
                 kind, x, y, pressure,
@@ -229,6 +230,10 @@ pub fn pump_input() {
                 if DOWN.swap(false, Ordering::AcqRel) {
                     super::queue::enqueue_pen_sample(super::PEN_UP_SAMPLE_MARKER, 0);
                 }
+            }
+            super::POWER_SWITCH => {
+                kprintln!("host_io: power-switch press");
+                crate::peripherals::vic::raise_power_switch();
             }
             _ => {}
         }

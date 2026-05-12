@@ -370,26 +370,37 @@ fingerprint; the storage layer change doesn't break that.
 ## Phase 4 — Display
 
 **Closes:** Newton renders to a mini-HDMI monitor.
-**Effort:** 2–4 days (mailbox + framebuffer + blit path).
-**Depends on:** Phase 1. Independent of Phase 2/3.
+**Effort:** 2–4 days (framebuffer alloc + blit path; mailbox is done).
+**Depends on:** Phase 1. Mailbox already built in Phase 2.
 
-VideoCore mailbox-channel-1 (framebuffer init) is the standard path.
-After init, the framebuffer is just a chunk of physical memory at a
-mailbox-returned address.
+VideoCore framebuffer init goes through the same property-tag
+mailbox client `src/mailbox.rs` we built for SDHOST clock setup.
+After init, the framebuffer is just a chunk of physical memory at
+a mailbox-returned bus address.
 
 ### Tasks
 
-1. **Mailbox driver.** ARM↔VC mailbox at `0x3F00B880` (BCM2710 base).
-   Property-channel call: get framebuffer at requested W×H×bpp.
-2. **Blit path.** `host_io` already abstracts blits; add a real-hw
-   backend that writes into the VC-returned framebuffer.
-3. **Geometry decision.** Newton expects 320×240 mono in its native
-   format. Either ask VC for that and let scaling happen in hardware
-   (probably ugly), or ask for native panel resolution and scale the
-   Newton FB ourselves. Open question §16.11.
+1. **Framebuffer allocation tags.** Extend `src/mailbox.rs` with
+   the `FB_ALLOCATE` / `FB_SET_PHYSICAL_W_H` / `FB_SET_VIRTUAL_W_H`
+   / `FB_SET_DEPTH` / `FB_SET_PIXEL_ORDER` etc. tags. Single
+   property request bundling them is the standard idiom (saves a
+   round-trip per tag).
+2. **Bus → CPU address translation.** VC returns a bus address
+   (typically `0x4000_0000 | pa`). Identity-map the framebuffer
+   region as Normal-WB at EL2 stage-1; mark guest-visible at
+   stage-2 so the existing blit path can land bytes there.
+3. **Blit backend.** `host_io` already abstracts blits; add a
+   `host-io-pi-fb` variant that writes into the VC-returned
+   framebuffer instead of forwarding via semihosting. Pair with
+   `pi-bare-metal-sd` for the full real-hw build.
+4. **Geometry.** Newton expects 320×240 mono. Two options:
+   - Ask VC for that exact mode and let HDMI scaling stretch
+     (probably ugly).
+   - Ask for native panel resolution (1080p typical) and scale
+     in software during the blit. Open question §16.11.
 
-QEMU `raspi3b`'s mailbox is partial — this is one of the places real
-hardware is more reliable, not less.
+QEMU `raspi3b`'s mailbox is partial — this is one of the places
+real hardware is more reliable than QEMU, not less.
 
 ## Phase 5 — Input
 
@@ -448,55 +459,64 @@ These don't block the plan but should be captured as they come up:
 |---|---|---|
 | 0 — EL2 handoff + UART | **done (2026-05-11)** | `CurrentEL = 2` on Walter's Zero 2 W; §16.1 closed |
 | 1 — Hypervisor `kmain` on Zero | **done (2026-05-11)** | Boots through `kmain`, ROM patches, stage-2, ERET to guest. Initial run halted on the trip-wire for an unmapped-IPA write at `0x01683800` from `DiagBootStub` `PC=0x1a01c`; a subsequent real-silicon run shows the OS continuing past that point and **booting + running without observed crashes**. No detailed serial trace captured for the longer run yet — Phase 2 below will give us a place to land logs. |
-| 2 — Persistent flash | **in progress (2026-05-12)** | SDHOST driver + VC mailbox + embedded-sdmmc shim land; `sd-probe` reads `config.txt` from the FAT32 boot partition end-to-end. Remaining: `flash-persist-sd` backend over the same partition. |
-| 3 — Snapshot on real hw | not started | reuses Phase 2 backend |
-| 4 — Display | not started | mailbox + FB (mailbox already done in Phase 2) |
+| 2 — Persistent flash | **done (2026-05-12)** | `flash-persist-sd` backend running on real hw. SDHOST at 25 MHz / 4-bit; ~700 KB/s through the FAT layer (CMD17/CMD24 per sector — multi-block command is the obvious next optimisation). Pi-bare-metal-sd boot loads + saves `/NEWTON.BIN` end-to-end across cold boots. |
+| 3 — Snapshot on real hw | **deferred** | Snapshots are valuable when debugging late-boot state on QEMU/FVP; on real silicon the boot tends to *complete*, so the rewind-by-2s loop they accelerate isn't load-bearing. Skip until a real-hw bug demands them. |
+| 4 — Display | **next** | VC mailbox already runs (Phase 2 dep); framebuffer alloc + blit path is the new code. |
 | 5 — Input | not started | UART pen first, USB later |
 | 6 — Audio / serial / PCMCIA | not started | aligns with M6 |
 
-### Phase 2 — base layer working (2026-05-12)
+### Phase 2 — closed (2026-05-12)
 
-The block-device + FAT32 layers are running on real silicon.
-`cargo build … --features "pi-bare-metal sd-probe"` produces a
-kernel that, on the Zero 2 W:
+The full SD storage stack runs on real silicon. Build with
+`--features pi-bare-metal-sd` and the hypervisor will:
 
-1. Brings up the BCM2835 SDHOST controller (GPIO 48..53 → ALT0;
-   firmware CLOCK_ID_CORE rate queried via the VC mailbox at
-   `0x3F00_B880`; SDCDIV = 623 for 400 kHz identification mode).
-2. Enumerates the card: CMD0 → CMD8 → ACMD41 (HCS) → CMD2 → CMD3
-   → CMD9 → CMD7 → CMD16. The 128 GB card on hand reports as SDHC,
-   RCA=`0xd5550000`.
-3. Reads sector 0 and confirms the MBR signature + partition 1 =
-   FAT32 (type 0x0b), LBA 32768, ~122 GB.
-4. Hands the `SdHost` to `embedded_sdmmc::VolumeManager`, opens
-   volume 0, opens `/CONFIG.TXT`, reads its contents back over
-   PL011. Byte-identical to what `scripts/build-sd.sh` wrote.
+1. Bring up the BCM2835 SDHOST controller. GPIO 48..53 → ALT0;
+   firmware `CLOCK_ID_CORE` rate queried via VC mailbox at
+   `0x3F00_B880`. Identification at 400 kHz / 1-bit; post-CMD7
+   bump to **25 MHz / 4-bit** (SDCDIV=8, ACMD6 then
+   `SDHCFG_WIDE_EXT_BUS`). Init prints a one-line summary:
 
-Pieces that fell out and won't need to be re-derived:
+       sd: bus ready (25.0 MHz, 4-bit)
 
-- Polled VC mailbox property-tag client (`src/mailbox.rs`). Phase 4
-  (framebuffer) reuses this directly; the per-tag response-indicator
-  check sits on `buf.words[4]`, not `buf.words[3]` (response status
-  is in the third header word, not the second).
-- BCM2835 SDHOST register layout + FSM-state poll for data-phase
-  completion (`src/sd/sdhost.rs`). Lessons logged at the bottom of
-  this section.
-- `embedded_sdmmc::BlockDevice` + `TimeSource` impls
-  (`src/sd/block_device.rs`).
+2. Enumerate the card: CMD0 → CMD8 → ACMD41 (HCS) → CMD2 → CMD3
+   → CMD9 → CMD7 → CMD16 → CMD55+ACMD6. The 128 GB SDHC card
+   used during bring-up reports RCA=`0xd5550000`.
+3. Mount the FAT32 boot partition via `embedded_sdmmc::VolumeManager`.
+   `sd-probe` builds verify the path end-to-end by reading
+   `/CONFIG.TXT` back from the same card we wrote it onto and
+   round-tripping a writeable file (`EL2HELLO.TXT`).
+4. Persist `GUEST_FLASH` (8 MiB) to `/NEWTON.BIN` on autosave
+   cadence (2 s wall-clock, driven from `trap_irq` via
+   `snapshot::maybe_autosave`'s no-semihost branch). Cold boots
+   load it back with a fingerprint check.
 
-What's NOT yet done:
-- `flash-persist-sd` backend implementing `FlashStore` against a
-  `NEWTON/FLASH.BIN` file on the same partition. Mechanical once a
-  file open-for-write test passes.
-- 4-bit bus width (ACMD6 + SDHCFG_WIDE_EXT_BUS) and 25 MHz default-
-  speed clock. Reads at 400 kHz / 1-bit are slow but reliable; the
-  speedup is a follow-up, not a blocker.
-- CSD decode for the actual card-size value reported through
-  `BlockDevice::num_blocks`. Currently returns `u32::MAX` (sufficient
-  for partition reads — the per-partition bounds come from MBR).
+#### Throughput (real-card numbers)
 
-**Bring-up lessons for the BCM2835 SDHOST** (in case anyone else
-ports it from scratch):
+At 25 MHz / 4-bit through the FAT layer:
+
+- Full 8 MiB save / load: ~12 s (≈ 700 KB/s).
+- Incremental save of N × 64 KiB blocks: roughly linear at the
+  same rate.
+
+That is **~10× below** what the bus alone can do (≈ 12.5 MB/s
+theoretical / ≈ 5–8 MB/s realistic). The gap is per-sector
+overhead — we issue a CMD17/CMD24 per 512-byte sector, so 8 MiB
+= ~16k commands. The path forward when this matters:
+
+- **CMD18 / CMD25 multi-block transfers** — single command, many
+  sectors. Amortises command latency and the FSM-completion poll
+  across the burst. Realistic target: 5+ MB/s, i.e. 1–2 s per full
+  save instead of 12.
+- Stretch: revisit `embedded-sdmmc`'s call shape to see whether it
+  ever passes us multi-block slices, or whether we'd need to
+  buffer at our `BlockDevice` impl.
+
+Not blocking for Phase 4+ — left as a "when this starts hurting"
+task.
+
+#### Bring-up lessons for the BCM2835 SDHOST
+
+In case anyone else ports it from scratch:
 
 - The `SDHCFG_*_IRPT_EN` bits are misnamed. They don't just gate
   IRQ generation — `SDHCFG_DATA_IRPT_EN` gates the FSM's data-
@@ -515,6 +535,39 @@ ports it from scratch):
 - The Pi Zero 2 W routes the micro-SD slot to **SDHOST**, not the
   Arasan EMMC block (which serves the on-package WLAN/BT SDIO on
   this SoC). Pi 4 / Pi 5 invert this — their SD code won't port.
+- ACMD6 to switch the card to 4-bit must happen **before** writing
+  `SDHCFG_WIDE_EXT_BUS` to the controller — the reverse drives 4
+  data lines into a card still in 1-bit mode and trashes every
+  transfer.
+- 25 MHz / 4-bit is reliable with default GPIO pulls (CMD + DAT0..3
+  pull-up, CLK pull-off via the BCM2835 GPPUD/GPPUDCLK1 sequence).
+  Higher (50 MHz HS, UHS) would require CMD6 SWITCH_FUNCTION
+  negotiation and likely tuning we haven't needed yet.
+- `flash_persist::maybe_save` is normally called from
+  `snapshot::maybe_autosave`. On real silicon that path is gated
+  behind `cfg(not(no-semihost))` because the snapshot ring itself
+  is inert. To get flash saves firing under `no-semihost` we
+  added a sibling branch that runs the same wall-clock gate but
+  only calls `flash_persist::maybe_save` (no snapshot work). Easy
+  to miss; the symptom is "init runs, file never written".
+
+#### Pieces reusable by later phases
+
+- Polled VC mailbox property-tag client (`src/mailbox.rs`).
+  Phase 4 framebuffer alloc is the immediate consumer. The per-
+  tag response-indicator check sits on `buf.words[4]`, not
+  `buf.words[3]` (response status is in the third header word).
+- BCM2835 SDHOST driver + `embedded_sdmmc` integration
+  (`src/sd/`). Phase 3 will lift the same dirty-tracking pattern
+  if/when we decide we want it.
+
+#### Known small TODOs
+
+- CSD decode for the actual card-size value reported through
+  `BlockDevice::num_blocks`. Currently returns `u32::MAX`
+  (sufficient for partition reads — per-partition bounds come
+  from MBR).
+- Multi-block I/O (see "Throughput" above).
 
 ### Phase 1 — closed (2026-05-11)
 

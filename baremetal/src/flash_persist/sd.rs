@@ -24,6 +24,7 @@
 //! fingerprint + load behaviour are interchangeable from the
 //! caller's POV.
 
+use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use embedded_sdmmc::{Mode, VolumeIdx, VolumeManager};
@@ -32,6 +33,37 @@ use super::FlashStore;
 use crate::sd::block_device::NullTime;
 use crate::sd::sdhost::SdHost;
 use crate::{kprint, kprintln, peripherals};
+
+/// Read the generic-timer physical count. Inlined here rather than
+/// pulling a helper from snapshot.rs so this module stays self-
+/// contained.
+#[inline]
+fn cntpct() -> u64 {
+    let v: u64;
+    // SAFETY: MRS of a RO sysreg has no side effects.
+    unsafe {
+        asm!("mrs {}, cntpct_el0", out(reg) v,
+             options(nomem, nostack, preserves_flags));
+    }
+    v
+}
+
+#[inline]
+fn cntfrq() -> u64 {
+    let v: u64;
+    // SAFETY: as above.
+    unsafe {
+        asm!("mrs {}, cntfrq_el0", out(reg) v,
+             options(nomem, nostack, preserves_flags));
+    }
+    v
+}
+
+/// Wall-clock milliseconds between two cntpct readings.
+fn elapsed_ms(start: u64, end: u64) -> u64 {
+    let freq = cntfrq().max(1);
+    end.wrapping_sub(start).saturating_mul(1000) / freq
+}
 
 /// File name at the root of the FAT32 boot partition. Short (8.3)
 /// name so we don't depend on long-filename support on the read
@@ -132,9 +164,10 @@ impl FlashStore for SdBackend {
             return;
         }
         kprintln!(
-            "flash_persist_sd: loading {} bytes from {} — slow at 400 kHz",
+            "flash_persist_sd: loading {} bytes from {}",
             len, FLASH_FILE
         );
+        let t0 = cntpct();
         // SAFETY: GUEST_FLASH backing is a static mut byte array; single-
         // threaded on core 0 during boot, before stage-2 exposes flash
         // to the guest. `len` matches SIZE, checked above.
@@ -173,10 +206,12 @@ impl FlashStore for SdBackend {
             return;
         }
         FILE_VALID.store(true, Ordering::Relaxed);
+        let ms = elapsed_ms(t0, cntpct());
         kprintln!(
-            "flash_persist_sd: loaded {} bytes from {}",
+            "flash_persist_sd: loaded {} bytes in {} ms ({} KB/s)",
             peripherals::flash::SIZE,
-            FLASH_FILE
+            ms,
+            (peripherals::flash::SIZE as u64 * 1000 / 1024) / ms.max(1),
         );
     }
 
@@ -239,13 +274,14 @@ impl FlashStore for SdBackend {
 
         if !valid {
             // Full write: file doesn't exist or wrong size. Announce
-            // up-front because at 400 kHz / 1-bit the 8 MiB write
-            // takes long enough (a minute or more) that the boot
-            // looks hung without a sign-of-life message.
+            // up-front because the write blocks EL2 (and therefore
+            // the guest) for its duration — no other sign-of-life
+            // otherwise.
             kprintln!(
-                "flash_persist_sd: starting full save ({} bytes) — slow at 400 kHz",
+                "flash_persist_sd: starting full save ({} bytes)",
                 peripherals::flash::SIZE
             );
+            let t0 = cntpct();
             let file =
                 match root.open_file_in_dir(FLASH_FILE, Mode::ReadWriteCreateOrTruncate) {
                     Ok(f) => f,
@@ -293,7 +329,13 @@ impl FlashStore for SdBackend {
                 return;
             }
             FILE_VALID.store(true, Ordering::Relaxed);
-            kprintln!("flash_persist_sd: full save done ({} bytes)", bytes.len());
+            let ms = elapsed_ms(t0, cntpct());
+            kprintln!(
+                "flash_persist_sd: full save done ({} bytes in {} ms, {} KB/s)",
+                bytes.len(),
+                ms,
+                (bytes.len() as u64 * 1000 / 1024) / ms.max(1),
+            );
             return;
         }
 
@@ -308,6 +350,7 @@ impl FlashStore for SdBackend {
             }
         };
         let total_dirty: u32 = snapshot.iter().map(|w| w.count_ones()).sum();
+        let t0 = cntpct();
         if total_dirty > 0 {
             kprint!("flash_persist_sd: incremental save {} blk [", total_dirty);
         }
@@ -348,7 +391,14 @@ impl FlashStore for SdBackend {
             kprint!(".");
         }
         if total_dirty > 0 {
-            kprintln!("] done");
+            let ms = elapsed_ms(t0, cntpct());
+            let bytes = (blocks_written as u64) * BLOCK_SIZE as u64;
+            kprintln!(
+                "] done ({} KB in {} ms, {} KB/s)",
+                bytes / 1024,
+                ms,
+                (bytes * 1000 / 1024) / ms.max(1),
+            );
         }
         if let Err(e) = file.flush() {
             kprintln!("flash_persist_sd: flush after incremental save FAILED: {:?}", e);
@@ -356,7 +406,6 @@ impl FlashStore for SdBackend {
             // save will just re-flush.
             return;
         }
-        let _ = blocks_written;
     }
 
     fn fingerprint(&self) -> u32 {

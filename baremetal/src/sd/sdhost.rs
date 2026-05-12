@@ -294,6 +294,22 @@ impl SdHost {
             read_reg(SDCDIV),
             read_reg(SDHCFG),
         );
+        // Always-on summary so users without the trace feature still
+        // see what bus they ended up on. core_clock / (cdiv+2) = bus
+        // clock in Hz; the bus-width comes from hcfg_base.
+        let cdiv = read_reg(SDCDIV);
+        let bus_hz = core_clock / (cdiv + 2);
+        let width = if hcfg_base & SDHCFG_WIDE_EXT_BUS != 0 {
+            4
+        } else {
+            1
+        };
+        crate::kprintln!(
+            "sd: bus ready ({}.{} MHz, {}-bit)",
+            bus_hz / 1_000_000,
+            (bus_hz / 100_000) % 10,
+            width
+        );
 
         Ok(SdHost {
             rca,

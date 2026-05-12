@@ -236,15 +236,24 @@ impl SdHost {
         // ignores CMD16 (always 512); send it anyway for uniformity.
         send_cmd(CMD_SET_BLOCKLEN, 512, ResponseKind::Short)?;
 
-        // Stay at the 400 kHz identification-mode clock for first
-        // reads. The SD spec allows up to 25 MHz in default-speed
-        // mode but the first real-hw run showed CRC errors at that
-        // rate before we had any bus-tuning code; until we confirm
-        // reads are reliable at 400 kHz the higher clock is a
-        // separate variable to introduce. Re-enable once we're sure.
-        // 4-bit bus width via ACMD6 is similarly deferred — single-
-        // line first.
-        let _ = core_clock;
+        // Bump the SD bus clock to default-speed 25 MHz now that the
+        // card is in transfer state. The SD spec allows this
+        // immediately after CMD7 (no SD switch command required for
+        // DS mode). 400 kHz / 1-bit is fine for identification but
+        // way too slow for a 64 KiB / 8 MiB flash save: at 400 kHz a
+        // full save is ~3 minutes, which blocks EL2 long enough to
+        // perturb the guest's timing assumptions during early boot.
+        //
+        // The early CrcError we hit at 25 MHz turned out to be a
+        // FIFO-drain bug (DATA_FLAG vs FIFO_FILL) and a SDHCFG bit
+        // (DATA_IRPT_EN gating the FSM data path), both since
+        // fixed. Reads have been stable at 400 kHz across full and
+        // incremental saves; 25 MHz is the next variable to flip.
+        //
+        // 4-bit bus width via ACMD6 is a separate change and still
+        // deferred — single-line first, then widen once that's
+        // proven solid.
+        program_sdcdiv(core_clock, 25_000_000);
         trace!(
             "sd: init complete; SDEDM=0x{:08x} (FSM={:#x}) SDCDIV={}",
             read_reg(SDEDM),

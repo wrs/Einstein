@@ -38,3 +38,13 @@ uart_2ndstage=1
 # Raspberry Pis. On Pis prior to Pi 5 this restores UART0/ttyAMA0 over
 # GPIOs 14 & 15."
 dtoverlay=disable-bt
+
+# Suppress the firmware's on-screen warning icons (the lightning bolt
+# for under-voltage, the thermometer for over-temperature, and the
+# multicolour test square). They draw on a separate overlay layer
+# above our framebuffer and would otherwise show through any
+# rendered content. Setting to 1 disables only the *icons* — the
+# underlying protection (thermal throttling, etc.) still applies.
+# Set to 0 (or delete this line) to see the icons again if you ever
+# want to diagnose a real power / thermal issue.
+avoid_warnings=1

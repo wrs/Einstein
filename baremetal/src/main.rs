@@ -25,6 +25,8 @@ mod peripherals;
 mod platform;
 mod rep_print;
 mod rom_patches;
+#[cfg(feature = "platform-raspi3b")]
+mod sd;
 mod shadow_pool;
 mod shadow_stub;
 mod snapshot;

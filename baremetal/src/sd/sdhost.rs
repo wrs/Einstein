@@ -405,52 +405,86 @@ fn map_hsts_error(hsts: u32) -> CmdError {
 }
 
 // ---- FIFO drain / fill ----------------------------------------------
+//
+// Driven by SDEDM.FIFO_FILL — number of 32-bit words currently in the
+// FIFO. The same approach Linux's bcm2835-sdhost and Circle take.
+// SDHSTS_DATA_FLAG is threshold-driven (fires at FIFO >= read
+// threshold, clears below) and doesn't behave well for word-at-a-time
+// PIO: once we read enough words to fall below the threshold,
+// DATA_FLAG clears and our wait loop can hang while data is still
+// streaming in. FIFO_FILL is the raw count and has no such hysteresis.
+
+const FIFO_DEPTH: u32 = 16;
+
+#[inline]
+fn fifo_fill() -> u32 {
+    (read_reg(SDEDM) >> SDEDM_FIFO_FILL_SHIFT) & SDEDM_FIFO_FILL_MASK
+}
 
 /// Read 512 bytes (128 32-bit words) from the FIFO into `buf`.
-///
-/// We poll `SDHSTS_DATA_FLAG` per word rather than burst-checking
-/// against the FIFO threshold; this is simpler and the loss vs. the
-/// burst path is irrelevant for a once-per-snapshot flash write.
 fn drain_fifo_to(buf: &mut [u8; 512]) -> Result<(), CmdError> {
-    for word_ix in 0..128 {
-        wait_for_data()?;
-        let w = read_reg(SDDATA);
-        let off = word_ix * 4;
-        buf[off..off + 4].copy_from_slice(&w.to_le_bytes());
+    let mut written: usize = 0;
+    while written < 128 {
+        let avail = wait_for_fifo_avail()?;
+        let take = (avail as usize).min(128 - written);
+        for _ in 0..take {
+            let w = read_reg(SDDATA);
+            let off = written * 4;
+            buf[off..off + 4].copy_from_slice(&w.to_le_bytes());
+            written += 1;
+        }
     }
     finish_data_phase()
 }
 
+/// Write 512 bytes (128 32-bit words) from `buf` to the FIFO.
 fn fill_fifo_from(buf: &[u8; 512]) -> Result<(), CmdError> {
-    for word_ix in 0..128 {
-        wait_for_fifo_space()?;
-        let off = word_ix * 4;
-        let w = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
-        write_reg(SDDATA, w);
+    let mut written: usize = 0;
+    while written < 128 {
+        let space = wait_for_fifo_space()?;
+        let put = (space as usize).min(128 - written);
+        for _ in 0..put {
+            let off = written * 4;
+            let w =
+                u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+            write_reg(SDDATA, w);
+            written += 1;
+        }
     }
     finish_data_phase()
 }
 
-fn wait_for_data() -> Result<(), CmdError> {
+/// Wait until SDEDM.FIFO_FILL > 0 (at least one word available to
+/// read). Returns the observed fill count so the caller can burst-
+/// drain up to that many words before re-polling.
+fn wait_for_fifo_avail() -> Result<u32, CmdError> {
     for _ in 0..2_000_000 {
         let h = read_reg(SDHSTS);
         if h & SDHSTS_ERROR_MASK != 0 {
             return Err(map_hsts_error(h));
         }
-        if h & SDHSTS_DATA_FLAG != 0 {
-            return Ok(());
+        let fill = fifo_fill();
+        if fill > 0 {
+            return Ok(fill);
         }
     }
     Err(CmdError::HardwareWedge)
 }
 
-fn wait_for_fifo_space() -> Result<(), CmdError> {
-    // The SDHOST exposes "FIFO has space" via the same DATA_FLAG bit,
-    // direction-dependent. For writes Circle treats it as a single
-    // ready/not-ready signal; we follow that lead. If we observe
-    // FIFO_ERROR in practice the threshold-aware path will replace
-    // this.
-    wait_for_data()
+/// Wait until SDEDM.FIFO_FILL < FIFO_DEPTH (at least one word of
+/// space). Returns the available space so the caller can burst-fill.
+fn wait_for_fifo_space() -> Result<u32, CmdError> {
+    for _ in 0..2_000_000 {
+        let h = read_reg(SDHSTS);
+        if h & SDHSTS_ERROR_MASK != 0 {
+            return Err(map_hsts_error(h));
+        }
+        let fill = fifo_fill();
+        if fill < FIFO_DEPTH {
+            return Ok(FIFO_DEPTH - fill);
+        }
+    }
+    Err(CmdError::HardwareWedge)
 }
 
 fn finish_data_phase() -> Result<(), CmdError> {

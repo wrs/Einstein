@@ -130,6 +130,14 @@ pub const SDEDM_WRITE_THRESHOLD_SHIFT: u32 = 9;
 pub const SDEDM_READ_THRESHOLD_SHIFT: u32 = 14;
 pub const SDEDM_THRESHOLD_MASK: u32 = 0x1F;
 
+/// FIFO fill count — number of 32-bit words currently in the FIFO.
+/// 5 bits at SDEDM[8:4]. Used by both directions to gate drain/fill
+/// pacing; Linux's bcm2835-sdhost and Circle both rely on this
+/// rather than SDHSTS_DATA_FLAG, which is threshold-driven and
+/// doesn't reliably fire for word-at-a-time PIO.
+pub const SDEDM_FIFO_FILL_SHIFT: u32 = 4;
+pub const SDEDM_FIFO_FILL_MASK: u32 = 0x1F;
+
 /// FSM state field — bottom 4 bits of SDEDM.
 pub const SDEDM_FSM_MASK: u32 = 0xF;
 pub const SDEDM_FSM_IDENTMODE: u32 = 0x0;

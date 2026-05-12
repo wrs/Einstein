@@ -217,29 +217,137 @@ needs to not crash before the first guest-side trap.
    - If a divergence is "QEMU bug" territory, FVP likely already agrees
      with real hw — cross-check there first before fixing.
 
-## Phase 2 — Persistent flash on real silicon
+## Phase 2 — SD-card storage (FAT32 on the boot partition)
 
-**Closes:** flash writes survive reboot on the Zero.
-**Effort:** 1–2 days for a minimal driver.
-**Depends on:** Phase 1. Optional if you only care about cold boots.
+**Closes:** flash writes survive reboot on the Zero; serial-log /
+snapshot bytes have somewhere to land.
+**Effort:** ~1 week, dominated by the block-device driver.
+**Depends on:** Phase 1.
 
 The current `flash-persist-semihost` backend writes to
 `$HOME/.newton/flash.bin` via Arm semihosting — no equivalent on real
-silicon. Options:
+silicon. The plan: read and write **files on the same FAT32 partition
+the firmware booted from**, so existing SD-card contents (firmware
+blobs + `config.txt` + `kernel8.img`) are preserved. No re-partitioning
+required.
 
-- **SD-card backend.** Add a minimal BCM2835 EMMC driver, mount a raw
-  partition (no FAT), use as a block device. This is real driver work
-  (~few hundred lines) but well-trodden territory; reference
-  implementations exist (`raspberrypi/linux` EMMC driver, plus dozens of
-  bare-metal Pi tutorials).
-- **UART tunnel.** Slot a backend that sends flash blocks over the
-  mini-UART to a host script. Slow but trivial. Useful for early
-  debugging before the EMMC driver exists.
-- **Onboard SPI flash via the `flash-persist-pico` placeholder slot.**
-  Not relevant for the Zero 2 W itself (no onboard user-writable SPI
-  flash); reserved for a future Pico-as-storage-bridge configuration.
+### Stack we're building
 
-Recommendation: UART tunnel first (it's cheap), EMMC after.
+```
+  ┌───────────────────────────────────────────────────┐
+  │ flash_persist::sd    snapshot::sd    serial::tee  │   ← consumers
+  ├───────────────────────────────────────────────────┤
+  │ embedded-sdmmc::VolumeManager (FAT32 read/write)  │   ← filesystem
+  ├───────────────────────────────────────────────────┤
+  │ MbrBlockDevice   (selects partition 1 = boot)     │   ← partition
+  ├───────────────────────────────────────────────────┤
+  │ Bcm2835SdHost    (raw 512-byte sector R/W)        │   ← driver
+  ├───────────────────────────────────────────────────┤
+  │ BCM2710 SDHOST controller @ 0x3F20_2000           │   ← hardware
+  └───────────────────────────────────────────────────┘
+```
+
+### Controller choice (read this before reaching for a Pi 4 SD driver)
+
+The Pi Zero 2 W routes the **micro-SD slot to the BCM2835 SDHOST
+controller**, not to the SDHCI-compatible "Arasan EMMC" block —
+on this SoC the EMMC block is wired to the **on-package
+BCM43436B0 Wi-Fi/BT chip via SDIO** instead. (Pi 4 / Pi 5 swap this
+around with a separate EMMC2 controller for the card slot, so Pi 4 SD
+code does **not** port.)
+
+GPIO routing on Pi Zero 2 W:
+
+- GPIO 48–53 ALT0 → SDHOST → micro-SD slot.
+- GPIO 34–39 ALT3 → Arasan EMMC → on-package WLAN/BT (SDIO).
+
+The Pi firmware (`bootcode.bin` + `start_cd.elf`) uses SDHOST to load
+`config.txt` / `kernel8.img` and leaves the controller in an
+undefined state on handoff. We must reinitialise: GPIO pinmux,
+clock setup, CMD0 / CMD8 / ACMD41 enumeration, CSD parse, then 512-
+byte sector R/W in polled mode.
+
+### Crate choice — `embedded-sdmmc` over `fatfs`
+
+[`embedded-sdmmc`](https://github.com/rust-embedded-community/embedded-sdmmc-rs)
+0.9 (Jun 2025) wins on the dimensions that matter here:
+
+- `#![no_std]`, **no allocator required**. Static sizing via
+  `VolumeManager<D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>` — defaults
+  4/4/1 are already more than we need.
+- FAT32 read + write, including `ReadWriteCreateOrAppend` for the
+  flash-persist append-only path.
+- `BlockDevice` trait surface is tiny: `read(&mut [Block], BlockIdx)`,
+  `write(&[Block], BlockIdx)`, `num_blocks() -> BlockCount`. Trivial
+  to implement against a polled-mode SDHOST driver.
+- MIT OR Apache-2.0.
+
+[`fatfs`](https://github.com/rafalh/rust-fatfs) is more feature-
+complete (LFN, FSInfo, etc.) but the on-crates.io release is from
+2020, license is MIT-only, and it expects a `Read+Write+Seek`
+adapter rather than a block device. Skip.
+
+### Tasks
+
+1. **`src/sd/sdhost.rs` — BCM2835 SDHOST driver.** Polled, no IRQs,
+   no DMA. State machine ported from
+   [Circle `addon/SDCard/sdhost.cpp`](https://github.com/rsta2/circle/blob/master/addon/SDCard/sdhost.cpp)
+   (P. Elwell @ RPi Trading, ported by R. Stange). Roughly 1.3 kLOC
+   C++ → expect ~600–800 Rust LOC plus a registers module. Expose
+   `read_sector(lba, &mut [u8; 512])` and `write_sector(lba, &[u8;
+   512])`. Validate against known-good sectors (firmware blobs are
+   readable from a host script first so we can diff).
+2. **`src/sd/mbr.rs` — MBR partition table parse.** ~80 lines. Find
+   partition 1 (FAT32, type 0x0B/0x0C), expose start LBA + length to
+   wrap the raw block device into a partition-relative one. We never
+   touch the partition table on disk.
+3. **`embedded-sdmmc` integration.** Wire the partition-relative
+   block device into `VolumeManager`. Mount as RW. Open files by
+   short name (we control the filenames so no LFN concerns).
+4. **`flash-persist-sd` backend.** New `flash_persist::sd` module
+   implementing `FlashStore` against `embedded-sdmmc`. File layout
+   TBD — likely `NEWTON/FLASH.BIN` (single 8 MiB file, dirty-block-
+   tracked, the same shape as the semihost backend). Add the
+   `flash-persist-sd` Cargo feature and `pi-bare-metal-storage`
+   aggregate. Replace `flash-persist-null` in the `pi-bare-metal`
+   feature.
+5. **Snapshot backend (defer; see Phase 3).** Same crate, different
+   files (`NEWTON/SNAP0.BIN`..`SNAP3.BIN`). 14 MiB × 4 slots = 56
+   MiB; FAT32 cluster math is fine.
+6. **Serial-log tee.** Independent, cheap, very useful: a
+   `serial-log-sd` build option that mirrors `kprintln!` to
+   `NEWTON/SERIAL.LOG` so post-mortem analysis of real-hardware
+   runs doesn't require a host attached to PL011. Probably won't
+   tee every byte (FAT writes are not free); buffer 4 KiB and flush
+   on overflow or on `halt()`.
+
+### Risks / unknowns
+
+- **SDHOST driver is the long pole.** Circle's code mixes state
+  machine with Circle-specific OS glue (timer/IRQ/GPIO classes); the
+  port needs careful re-implementation against the BCM2835 ARM
+  Peripherals manual, including CRC quirks and clock-tuning. No
+  drop-in Rust prior art exists (rust-embedded-community discussion
+  #134 acknowledges this). Plan to validate it standalone with
+  polled-mode reads against known sectors before adding FAT on top.
+- **Card-write atomicity.** Power loss mid-write can shred FAT. We're
+  not putting irreplaceable data on the card (flash + snapshots can
+  be regenerated by a cold boot), so the consequence is "lose state",
+  not "brick the SD card", but we should at least journal the
+  flash-persist writes the same way the semihost backend does.
+- **Interaction with `flash_persist::maybe_save`'s wall-clock gate.**
+  An SD write is much slower than a `SYS_WRITE`; the 2-s autosave
+  cadence may be too tight. Measure once the driver lands.
+- **Card variability.** Real-silicon testing should include both a
+  small / slow card and a large / fast one to make sure we're not
+  fitting only one timing profile.
+
+### Fallback if SDHOST proves hostile
+
+Slot the original "UART tunnel" idea in as a `flash-persist-uart`
+backend — flash blocks shipped over the mini-UART to a host script.
+Slow but trivial; gives us a working flash-persist on real silicon
+while the SDHOST driver matures.
 
 ## Phase 3 — Snapshot ring on real silicon
 
@@ -250,8 +358,8 @@ Recommendation: UART tunnel first (it's cheap), EMMC after.
 The autosave ring (`snapshot.rs`) currently calls semihosting `SYS_WRITE`
 for ~14 MiB every 2 s. On real hw:
 
-- Reuse the Phase 2 SD/EMMC backend if it exists. The four snapshot
-  slots fit easily on a partition.
+- Reuse the Phase 2 SD-card / FAT backend. The four snapshot slots
+  (56 MiB total) fit easily on the existing FAT32 boot partition.
 - Or accept that real-hw runs are cold-boot only and leave the ring
   disabled. For pure regression testing this is fine; for iterative
   hypervisor-code debugging the QEMU/FVP loop is faster anyway.
@@ -313,7 +421,7 @@ A `platform-pi-zero2w` Cargo feature, alongside `platform-raspi3b` and
 
 - Linker script (real load address, real DRAM size).
 - Default `host-io-null`, `flash-persist-null` initially; later
-  `host-io-pi-fb`, `flash-persist-pi-emmc`.
+  `host-io-pi-fb`, `flash-persist-sd` (FAT32 on the boot partition).
 - Snapshot autosave: off by default for the real-hw profile until
   Phase 3 finishes the storage path.
 
@@ -339,7 +447,7 @@ These don't block the plan but should be captured as they come up:
 | Phase | Status | Notes |
 |---|---|---|
 | 0 — EL2 handoff + UART | **done (2026-05-11)** | `CurrentEL = 2` on Walter's Zero 2 W; §16.1 closed |
-| 1 — Hypervisor `kmain` on Zero | **done (2026-05-11)** | Boots through `kmain`, ROM patches, stage-2, ERET to guest, runs deep into Newton `DiagBootStub`. New ceiling on real silicon: unknown-MMIO write to IPA `0x01683800` from `DiagBootStub` `PC=0x1a01c`, which QEMU never reaches (CNTFRQ-driven timing divergence: 19.2 MHz real vs 62.5 MHz QEMU). |
+| 1 — Hypervisor `kmain` on Zero | **done (2026-05-11)** | Boots through `kmain`, ROM patches, stage-2, ERET to guest. Initial run halted on the trip-wire for an unmapped-IPA write at `0x01683800` from `DiagBootStub` `PC=0x1a01c`; a subsequent real-silicon run shows the OS continuing past that point and **booting + running without observed crashes**. No detailed serial trace captured for the longer run yet — Phase 2 below will give us a place to land logs. |
 | 2 — Persistent flash | not started | start with UART tunnel |
 | 3 — Snapshot on real hw | not started | optional |
 | 4 — Display | not started | mailbox + FB |
@@ -347,6 +455,22 @@ These don't block the plan but should be captured as they come up:
 | 6 — Audio / serial / PCMCIA | not started | aligns with M6 |
 
 ### Phase 1 — closed (2026-05-11)
+
+**update (2026-05-11, later in the day):** a subsequent real-hardware
+boot — same `newton-hypervisor` image — runs past the
+`IPA=0x01683800` trip-wire and continues with the OS apparently
+running without further crashes. We don't have a full serial capture
+of that longer run yet (the previous halt produced one because the
+hypervisor itself halted; the post-halt run just keeps going). So:
+
+- The "Phase 1 ceiling" recorded immediately below is the **initial**
+  Phase 1 result and is no longer the boot ceiling on real silicon.
+- We need a way to persist serial logs (and ideally snapshots) from
+  real-hardware runs to study what the OS actually does after the
+  `DiagBootStub` window. That's the motivation for promoting Phase 2
+  (SD-card storage) ahead of any further investigation here.
+
+Original Phase 1 closure (kept for reference):
 
 Real-hardware result on Walter's Pi Zero 2 W, `newton-hypervisor` built
 with `--no-default-features --features pi-bare-metal` (= platform-

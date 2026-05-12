@@ -165,6 +165,13 @@ full_ns_trace = ["ns_trace"]
 
 [dependencies]
 newton-objects = { path = "newton-objects" }
+# FAT12/16/32 read+write for the Pi Zero 2 W's SD-card boot partition.
+# no_std, no_alloc, statically sized (defaults: 4 dirs / 4 files / 1
+# volume); see src/sd for the BCM2835 SDHOST block-device shim. Only
+# referenced from #[cfg(feature = "platform-raspi3b")] code, but Cargo
+# can't conditionally pull deps the way it gates `mod`s, so this
+# compiles on every target. The crate itself is no_std-compatible.
+embedded-sdmmc = { version = "0.9", default-features = false }
 
 [profile.dev]
 panic = "abort"

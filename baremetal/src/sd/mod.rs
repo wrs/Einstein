@@ -16,6 +16,7 @@
 //! See `docs/REAL_HW_BRINGUP.md` for the phase plan and the rationale
 //! behind picking `embedded-sdmmc` over `fatfs`.
 
+pub mod block_device;
 #[cfg(feature = "sd-probe")]
 pub mod probe;
 pub mod regs;

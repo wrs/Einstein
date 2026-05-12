@@ -259,6 +259,12 @@ impl SdHost {
     /// Read one 512-byte sector. `lba` is a sector index regardless
     /// of card capacity — we translate to a byte offset for SDSC
     /// cards internally.
+    ///
+    /// Takes `&self`: the underlying state lives in MMIO registers,
+    /// not in this struct, and the embedded-sdmmc `BlockDevice` trait
+    /// uses `&self` (interior-mutability model). Concurrent access
+    /// to the controller is not safe but we're single-core EL2;
+    /// nothing else touches SDHOST while this runs.
     pub fn read_block(&self, lba: u32, buf: &mut [u8; 512]) -> Result<(), CmdError> {
         let arg = match self.capacity {
             CardCapacity::HighCapacity => lba,
@@ -293,8 +299,8 @@ impl SdHost {
         r
     }
 
-    /// Write one 512-byte sector. See [`read_block`] for argument
-    /// semantics.
+    /// Write one 512-byte sector. See [`SdHost::read_block`] for
+    /// argument semantics and the `&self` rationale.
     pub fn write_block(&self, lba: u32, buf: &[u8; 512]) -> Result<(), CmdError> {
         let arg = match self.capacity {
             CardCapacity::HighCapacity => lba,

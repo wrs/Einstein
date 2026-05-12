@@ -68,8 +68,12 @@ pub enum CmdError {
     /// `SDHSTS_CMD_TIME_OUT` — card didn't respond in the 1.6 ms window
     /// programmed via SDTOUT.
     Timeout,
-    /// CRC7 mismatch on the response. Usually a bus / pull issue.
-    CrcError,
+    /// CRC7 mismatch on the command **response** token. Usually
+    /// driven by bus signal integrity (clock too high, weak pulls).
+    Crc7Error,
+    /// CRC16 mismatch on a **data** block. Same root causes as
+    /// Crc7Error but only during data-bearing transfers.
+    Crc16Error,
     /// FIFO over- or under-run during a data-bearing command.
     FifoError,
     /// `SDHSTS_REW_TIME_OUT` during data phase.
@@ -212,15 +216,21 @@ impl SdHost {
         // ignores CMD16 (always 512); send it anyway for uniformity.
         send_cmd(CMD_SET_BLOCKLEN, 512, ResponseKind::Short)?;
 
-        // Card is in transfer state — bump the bus clock to the
-        // default-speed 25 MHz target. The SD spec allows this
-        // immediately after CMD7 (no SD switch command required for
-        // default-speed mode).
-        //
-        // 4-bit bus width via ACMD6 is deliberately deferred until
-        // single-bit reads are confirmed solid; CRC diagnosis is
-        // easier without bus-width complications.
-        program_sdcdiv(core_clock, 25_000_000);
+        // Stay at the 400 kHz identification-mode clock for first
+        // reads. The SD spec allows up to 25 MHz in default-speed
+        // mode but the first real-hw run showed CRC errors at that
+        // rate before we had any bus-tuning code; until we confirm
+        // reads are reliable at 400 kHz the higher clock is a
+        // separate variable to introduce. Re-enable once we're sure.
+        // 4-bit bus width via ACMD6 is similarly deferred — single-
+        // line first.
+        let _ = core_clock;
+        trace!(
+            "sd: init complete; SDEDM=0x{:08x} (FSM={:#x}) SDCDIV={}",
+            read_reg(SDEDM),
+            read_reg(SDEDM) & SDEDM_FSM_MASK,
+            read_reg(SDCDIV),
+        );
 
         Ok(SdHost { rca, capacity })
     }
@@ -233,10 +243,33 @@ impl SdHost {
             CardCapacity::HighCapacity => lba,
             CardCapacity::StandardCapacity => lba.wrapping_mul(512),
         };
+        trace!(
+            "sd: read_block lba={} arg=0x{:08x} pre-SDHSTS=0x{:08x} pre-SDEDM=0x{:08x}",
+            lba,
+            arg,
+            read_reg(SDHSTS),
+            read_reg(SDEDM),
+        );
         write_reg(SDHBCT, 512);
         write_reg(SDHBLC, 1);
-        send_cmd_kind(CMD_READ_SINGLE_BLOCK, arg, ResponseKind::Short, CmdDir::Read)?;
-        drain_fifo_to(buf)
+        let resp = send_cmd_kind(CMD_READ_SINGLE_BLOCK, arg, ResponseKind::Short, CmdDir::Read);
+        trace!(
+            "sd: CMD17 done; resp={:?} SDHSTS=0x{:08x} SDEDM=0x{:08x} (FSM={:#x})",
+            resp,
+            read_reg(SDHSTS),
+            read_reg(SDEDM),
+            read_reg(SDEDM) & SDEDM_FSM_MASK,
+        );
+        resp?;
+        let r = drain_fifo_to(buf);
+        trace!(
+            "sd: drain done; r={:?} SDHSTS=0x{:08x} SDEDM=0x{:08x} (FSM={:#x})",
+            r,
+            read_reg(SDHSTS),
+            read_reg(SDEDM),
+            read_reg(SDEDM) & SDEDM_FSM_MASK,
+        );
+        r
     }
 
     /// Write one 512-byte sector. See [`read_block`] for argument
@@ -358,8 +391,10 @@ fn send_cmd_kind(cmd: u8, arg: u32, kind: ResponseKind, dir: CmdDir) -> Result<u
 fn map_hsts_error(hsts: u32) -> CmdError {
     if hsts & SDHSTS_CMD_TIME_OUT != 0 {
         CmdError::Timeout
-    } else if hsts & SDHSTS_CRC7_ERROR != 0 || hsts & SDHSTS_CRC16_ERROR != 0 {
-        CmdError::CrcError
+    } else if hsts & SDHSTS_CRC7_ERROR != 0 {
+        CmdError::Crc7Error
+    } else if hsts & SDHSTS_CRC16_ERROR != 0 {
+        CmdError::Crc16Error
     } else if hsts & SDHSTS_FIFO_ERROR != 0 {
         CmdError::FifoError
     } else if hsts & SDHSTS_REW_TIME_OUT != 0 {

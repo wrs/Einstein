@@ -62,6 +62,26 @@ macro_rules! trace {
 /// SDHOST base on the BCM2710 peripheral window.
 const SDHOST_BASE: usize = 0x3F20_2000;
 
+/// SDHCFG configuration for the bus while no data transfer is
+/// active. Matches Linux's bcm2835-sdhost base config:
+///
+/// - `WIDE_INT_BUS`: enable 4-bit internal data path. Always on per
+///   Linux (independent of external bus width).
+/// - `SLOW_CARD`: timing margin for slower cards — Linux sets this
+///   unconditionally.
+/// - `BUSY_IRPT_EN`: although we poll, this gates the controller's
+///   busy-wait FSM in a way that's needed for correctness on R1b
+///   commands. Same observation as DATA_IRPT_EN below — name is
+///   misleading.
+const SDHCFG_BASE: u32 = SDHCFG_WIDE_INT_BUS | SDHCFG_SLOW_CARD | SDHCFG_BUSY_IRPT_EN;
+
+/// Bits to OR into SDHCFG for data-bearing commands. Despite the
+/// name, `SDHCFG_DATA_IRPT_EN` is required even when polling — on
+/// this controller it gates the FSM's data-movement path, not just
+/// interrupt generation. Without it, the FSM walks the read/write
+/// states but doesn't actually move bytes through the FIFO.
+const SDHCFG_DATA_TRANSFER: u32 = SDHCFG_BASE | SDHCFG_DATA_IRPT_EN;
+
 /// Result of a single command execution.
 #[derive(Debug, Clone, Copy)]
 pub enum CmdError {
@@ -136,10 +156,11 @@ impl SdHost {
         delay_us(10_000);
         trace!("sd: power-up; SDVDD readback={}", read_reg(SDVDD));
 
-        // Default host config: relax CMD line, enable wide internal
-        // bus (4-bit data path inside the controller; outside-bus
-        // width is negotiated separately via ACMD6).
-        write_reg(SDHCFG, SDHCFG_WIDE_INT_BUS | SDHCFG_REL_CMD_LINE);
+        // Host config for non-data commands. See `SDHCFG_BASE` doc
+        // for what each bit does — the takeaway is that on this
+        // controller the *_IRPT_EN bits gate FSM functionality, not
+        // just interrupt generation.
+        write_reg(SDHCFG, SDHCFG_BASE);
         // Identification-phase clock: ≤400 kHz on the SD bus per the
         // SD spec. The SDHOST divides core_clock by (cdiv + 2).
         program_sdcdiv(core_clock, 400_000);
@@ -250,8 +271,7 @@ impl SdHost {
             read_reg(SDHSTS),
             read_reg(SDEDM),
         );
-        write_reg(SDHBCT, 512);
-        write_reg(SDHBLC, 1);
+        prepare_data(512, 1);
         let resp = send_cmd_kind(CMD_READ_SINGLE_BLOCK, arg, ResponseKind::Short, CmdDir::Read);
         trace!(
             "sd: CMD17 done; resp={:?} SDHSTS=0x{:08x} SDEDM=0x{:08x} (FSM={:#x})",
@@ -261,14 +281,15 @@ impl SdHost {
             read_reg(SDEDM) & SDEDM_FSM_MASK,
         );
         resp?;
-        let r = drain_fifo_to(buf);
+        let r = drain_fifo_to(buf).and_then(|()| finish_data_phase(true));
         trace!(
-            "sd: drain done; r={:?} SDHSTS=0x{:08x} SDEDM=0x{:08x} (FSM={:#x})",
+            "sd: data phase done; r={:?} SDHSTS=0x{:08x} SDEDM=0x{:08x} (FSM={:#x})",
             r,
             read_reg(SDHSTS),
             read_reg(SDEDM),
             read_reg(SDEDM) & SDEDM_FSM_MASK,
         );
+        write_reg(SDHCFG, SDHCFG_BASE);
         r
     }
 
@@ -279,10 +300,11 @@ impl SdHost {
             CardCapacity::HighCapacity => lba,
             CardCapacity::StandardCapacity => lba.wrapping_mul(512),
         };
-        write_reg(SDHBCT, 512);
-        write_reg(SDHBLC, 1);
+        prepare_data(512, 1);
         send_cmd_kind(CMD_WRITE_SINGLE_BLOCK, arg, ResponseKind::Short, CmdDir::Write)?;
-        fill_fifo_from(buf)
+        let r = fill_fifo_from(buf).and_then(|()| finish_data_phase(false));
+        write_reg(SDHCFG, SDHCFG_BASE);
+        r
     }
 
     pub fn capacity(&self) -> CardCapacity {
@@ -310,18 +332,28 @@ fn write_reg(off: usize, val: u32) {
 }
 
 fn reset_controller() {
-    // Power off, zero command/argument/timeout/divider, clear status,
-    // program FIFO thresholds. Sequence taken from Circle's
-    // `reset_internal()`.
+    // Power off, zero command/argument/timeout/divider/host config,
+    // clear status, then RMW the FIFO thresholds into SDEDM. Mirrors
+    // Linux's bcm2835_sdhost_reset_internal — in particular SDEDM is
+    // a read-modify-write so FORCE_DATA_MODE / CLOCK_PULSE / BYPASS
+    // bits are preserved, and SDHCFG / SDHBCT / SDHBLC get explicitly
+    // cleared (per "silicon bug" comment in the Linux source).
     write_reg(SDVDD, 0);
     write_reg(SDCMD, 0);
     write_reg(SDARG, 0);
     // 1.6 ms timeout at the core clock the firmware leaves us with;
-    // overwritten once `clock_setup` runs.
+    // refined later when SDCDIV is programmed.
     write_reg(SDTOUT, 0xF00000);
     write_reg(SDCDIV, 0);
     write_reg(SDHSTS, SDHSTS_CLEAR_MASK);
-    let edm = (FIFO_READ_THRESHOLD << SDEDM_READ_THRESHOLD_SHIFT)
+    write_reg(SDHCFG, 0);
+    write_reg(SDHBCT, 0);
+    write_reg(SDHBLC, 0);
+
+    let mut edm = read_reg(SDEDM);
+    edm &= !((SDEDM_THRESHOLD_MASK << SDEDM_READ_THRESHOLD_SHIFT)
+        | (SDEDM_THRESHOLD_MASK << SDEDM_WRITE_THRESHOLD_SHIFT));
+    edm |= (FIFO_READ_THRESHOLD << SDEDM_READ_THRESHOLD_SHIFT)
         | (FIFO_WRITE_THRESHOLD << SDEDM_WRITE_THRESHOLD_SHIFT);
     write_reg(SDEDM, edm);
 }
@@ -421,7 +453,9 @@ fn fifo_fill() -> u32 {
     (read_reg(SDEDM) >> SDEDM_FIFO_FILL_SHIFT) & SDEDM_FIFO_FILL_MASK
 }
 
-/// Read 512 bytes (128 32-bit words) from the FIFO into `buf`.
+/// Read 512 bytes (128 32-bit words) from the FIFO into `buf`. The
+/// caller (`read_block`) is responsible for the post-drain FSM wait
+/// via `finish_data_phase(true)`.
 fn drain_fifo_to(buf: &mut [u8; 512]) -> Result<(), CmdError> {
     let mut written: usize = 0;
     while written < 128 {
@@ -434,10 +468,12 @@ fn drain_fifo_to(buf: &mut [u8; 512]) -> Result<(), CmdError> {
             written += 1;
         }
     }
-    finish_data_phase()
+    Ok(())
 }
 
-/// Write 512 bytes (128 32-bit words) from `buf` to the FIFO.
+/// Write 512 bytes (128 32-bit words) from `buf` to the FIFO. The
+/// caller (`write_block`) is responsible for the post-fill FSM wait
+/// via `finish_data_phase(false)`.
 fn fill_fifo_from(buf: &[u8; 512]) -> Result<(), CmdError> {
     let mut written: usize = 0;
     while written < 128 {
@@ -451,7 +487,7 @@ fn fill_fifo_from(buf: &[u8; 512]) -> Result<(), CmdError> {
             written += 1;
         }
     }
-    finish_data_phase()
+    Ok(())
 }
 
 /// Wait until SDEDM.FIFO_FILL > 0 (at least one word available to
@@ -487,16 +523,54 @@ fn wait_for_fifo_space() -> Result<u32, CmdError> {
     Err(CmdError::HardwareWedge)
 }
 
-fn finish_data_phase() -> Result<(), CmdError> {
-    // Wait for the block to land (BLOCK_IRPT) and clear the sticky
-    // status flag so the next command starts clean.
+/// Set up the controller for a data-bearing transfer. Mirrors
+/// Linux's `bcm2835_sdhost_prepare_data`:
+///
+/// 1. Flip SDHCFG to `SDHCFG_DATA_TRANSFER` (adds `DATA_IRPT_EN`).
+///    On this controller that bit is functionally required, not just
+///    interrupt-related — see `SDHCFG_DATA_TRANSFER` doc.
+/// 2. Program block byte count and block count.
+///
+/// Must be called *before* writing SDCMD with the data-bearing
+/// opcode. `read_block` / `write_block` restore `SDHCFG_BASE` once
+/// the transfer is complete.
+fn prepare_data(blksz: u32, blocks: u32) {
+    write_reg(SDHCFG, SDHCFG_DATA_TRANSFER);
+    write_reg(SDHBCT, blksz);
+    write_reg(SDHBLC, blocks);
+}
+
+/// Wait for the controller's data-transfer FSM to settle after the
+/// FIFO drain (read) or fill (write) completes. Mirrors Linux's
+/// post-transfer wait:
+///
+/// - FSM in `IDENTMODE` or `DATAMODE` → transfer complete, return Ok.
+/// - FSM in the alternate-idle state (`READWAIT` for reads,
+///   `WRITESTART1` for writes) → controller is waiting for an event
+///   we won't deliver in polling mode. Kick it out by writing
+///   `SDEDM | FORCE_DATA_MODE`, then return Ok.
+/// - Anything else → keep polling.
+///
+/// SDHSTS_BLOCK_IRPT, which the previous implementation polled, is
+/// only meaningful when SDHCFG.BLOCK_IRPT_EN is set; we don't set it.
+fn finish_data_phase(is_read: bool) -> Result<(), CmdError> {
+    let alternate_idle = if is_read {
+        SDEDM_FSM_READWAIT
+    } else {
+        SDEDM_FSM_WRITESTART1
+    };
     for _ in 0..2_000_000 {
         let h = read_reg(SDHSTS);
         if h & SDHSTS_ERROR_MASK != 0 {
             return Err(map_hsts_error(h));
         }
-        if h & SDHSTS_BLOCK_IRPT != 0 {
-            write_reg(SDHSTS, SDHSTS_BLOCK_IRPT);
+        let edm = read_reg(SDEDM);
+        let fsm = edm & SDEDM_FSM_MASK;
+        if fsm == SDEDM_FSM_IDENTMODE || fsm == SDEDM_FSM_DATAMODE {
+            return Ok(());
+        }
+        if fsm == alternate_idle {
+            write_reg(SDEDM, edm | SDEDM_FORCE_DATA_MODE);
             return Ok(());
         }
     }

@@ -82,10 +82,12 @@ pub extern "C" fn kmain() -> ! {
     // mut touched only from core 0 during boot.
     peripherals::flash::init();
 
-    // If a persistent flash file exists at $HOME/.newton/flash.bin,
-    // overwrite GUEST_FLASH with its contents. No-op on first boot or
-    // in guest-test mode (which uses the null backend for hermetic
-    // starts).
+    // Backend-specific bring-up (e.g. SDHOST init for flash-persist-sd).
+    // No-op for null / semihost.
+    flash_persist::init();
+    // If a persistent flash file exists, overwrite GUEST_FLASH with
+    // its contents. No-op on first boot, in guest-test mode (null
+    // backend), or if the chosen backend can't reach its store.
     flash_persist::try_load();
 
     // SAFETY: stage-2 tables reference the backing store we just populated.

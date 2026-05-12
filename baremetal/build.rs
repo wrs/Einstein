@@ -39,6 +39,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(nh_flash_persist_null)");
     println!("cargo:rustc-check-cfg=cfg(nh_flash_persist_semihost)");
     println!("cargo:rustc-check-cfg=cfg(nh_flash_persist_pico)");
+    println!("cargo:rustc-check-cfg=cfg(nh_flash_persist_sd)");
 
     select_platform_linker_script();
     resolve_host_io_backend();
@@ -163,17 +164,20 @@ fn resolve_flash_persist_backend() {
     let null = env::var("CARGO_FEATURE_FLASH_PERSIST_NULL").is_ok();
     let semihost = env::var("CARGO_FEATURE_FLASH_PERSIST_SEMIHOST").is_ok();
     let pico = env::var("CARGO_FEATURE_FLASH_PERSIST_PICO").is_ok();
+    let sd = env::var("CARGO_FEATURE_FLASH_PERSIST_SD").is_ok();
     let guest_test = env::var("NH_GUEST_TEST").is_ok();
     let chosen = if guest_test {
         "null"
     } else {
-        match (null, semihost, pico) {
-            (false, false, false) => "semihost",
-            (true, false, false) => "null",
-            (false, true, false) => "semihost",
-            (false, false, true) => "pico",
+        match (null, semihost, pico, sd) {
+            (false, false, false, false) => "semihost",
+            (true, false, false, false) => "null",
+            (false, true, false, false) => "semihost",
+            (false, false, true, false) => "pico",
+            (false, false, false, true) => "sd",
             _ => panic!(
-                "multiple flash-persist backends selected (null={null} semihost={semihost} pico={pico}); \
+                "multiple flash-persist backends selected \
+                 (null={null} semihost={semihost} pico={pico} sd={sd}); \
                  they are mutually exclusive"
             ),
         }

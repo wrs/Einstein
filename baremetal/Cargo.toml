@@ -63,6 +63,10 @@ host-io-pico = []
 flash-persist-null = []
 flash-persist-semihost = []
 flash-persist-pico = []
+# Real-hardware backend: persists GUEST_FLASH to NEWTON.BIN on the
+# FAT32 boot partition via the embedded-sdmmc + BCM2835 SDHOST stack
+# built up in src/sd. Selected by the `pi-bare-metal-sd` aggregate.
+flash-persist-sd = []
 
 # Disable every in-tree call to Arm semihosting (HLT #0xF000). Required
 # when running on real silicon, where no semihosting host is listening:
@@ -86,6 +90,13 @@ no-semihost = []
 # omitted here. Build with:
 #   cargo build --release --no-default-features --features pi-bare-metal
 pi-bare-metal = ["platform-raspi3b", "no-semihost", "flash-persist-null"]
+
+# Real-Pi build with persistent flash backed by the SD card's FAT32
+# boot partition. Identical to `pi-bare-metal` except the flash
+# backend is `sd` instead of `null`. Build:
+#   cargo build --release --no-default-features \
+#     --features pi-bare-metal-sd
+pi-bare-metal-sd = ["platform-raspi3b", "no-semihost", "flash-persist-sd"]
 
 # Real-hardware SDHOST bring-up probe. When enabled, kmain stops
 # immediately after MMU + vectors are up, runs the BCM2835 SDHOST

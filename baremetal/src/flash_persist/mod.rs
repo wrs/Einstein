@@ -28,6 +28,8 @@
 mod semihost;
 #[cfg(any(nh_flash_persist_null, nh_flash_persist_pico))]
 mod null;
+#[cfg(nh_flash_persist_sd)]
+mod sd;
 
 /// Backend interface. Single-threaded EL2 callers; impls do not need
 /// to be re-entrant.
@@ -57,6 +59,16 @@ pub trait FlashStore: Sync {
 use self::semihost::BACKEND;
 #[cfg(any(nh_flash_persist_null, nh_flash_persist_pico))]
 use self::null::BACKEND;
+#[cfg(nh_flash_persist_sd)]
+use self::sd::BACKEND;
+
+/// Backend-specific bring-up. SD backend uses this to construct the
+/// SDHOST driver + VolumeManager before `try_load` runs. Other
+/// backends are no-ops.
+pub fn init() {
+    #[cfg(nh_flash_persist_sd)]
+    sd::init();
+}
 
 pub fn try_load() {
     BACKEND.try_load();

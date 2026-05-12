@@ -72,14 +72,17 @@ const SDHOST_BASE: usize = 0x3F20_2000;
 ///   busy-wait FSM in a way that's needed for correctness on R1b
 ///   commands. Same observation as DATA_IRPT_EN below — name is
 ///   misleading.
-const SDHCFG_BASE: u32 = SDHCFG_WIDE_INT_BUS | SDHCFG_SLOW_CARD | SDHCFG_BUSY_IRPT_EN;
+///
+/// `SDHCFG_WIDE_EXT_BUS` is OR'd in dynamically when ACMD6 has
+/// switched the card to 4-bit external; see `SdHost::hcfg_base`.
+const SDHCFG_BASE_NARROW: u32 = SDHCFG_WIDE_INT_BUS | SDHCFG_SLOW_CARD | SDHCFG_BUSY_IRPT_EN;
 
-/// Bits to OR into SDHCFG for data-bearing commands. Despite the
+/// Bit to OR into SDHCFG for data-bearing commands. Despite the
 /// name, `SDHCFG_DATA_IRPT_EN` is required even when polling — on
 /// this controller it gates the FSM's data-movement path, not just
 /// interrupt generation. Without it, the FSM walks the read/write
 /// states but doesn't actually move bytes through the FIFO.
-const SDHCFG_DATA_TRANSFER: u32 = SDHCFG_BASE | SDHCFG_DATA_IRPT_EN;
+const SDHCFG_DATA_BIT: u32 = SDHCFG_DATA_IRPT_EN;
 
 /// Result of a single command execution.
 #[derive(Debug, Clone, Copy)]
@@ -116,6 +119,12 @@ pub enum CardCapacity {
 pub struct SdHost {
     rca: u32,
     capacity: CardCapacity,
+    /// SDHCFG value to install when no data transfer is active.
+    /// Always includes `SDHCFG_BASE_NARROW`; additionally OR's in
+    /// `SDHCFG_WIDE_EXT_BUS` after ACMD6 has switched the card to
+    /// 4-bit. We never re-narrow once widened, so the field is set
+    /// in `init` and read-only afterwards.
+    hcfg_base: u32,
 }
 
 impl SdHost {
@@ -155,11 +164,12 @@ impl SdHost {
         delay_us(10_000);
         trace!("sd: power-up; SDVDD readback={}", read_reg(SDVDD));
 
-        // Host config for non-data commands. See `SDHCFG_BASE` doc
-        // for what each bit does — the takeaway is that on this
+        // Host config for non-data commands. See `SDHCFG_BASE_NARROW`
+        // doc for what each bit does — the takeaway is that on this
         // controller the *_IRPT_EN bits gate FSM functionality, not
-        // just interrupt generation.
-        write_reg(SDHCFG, SDHCFG_BASE);
+        // just interrupt generation. `WIDE_EXT_BUS` is added later
+        // (if ACMD6 succeeds).
+        write_reg(SDHCFG, SDHCFG_BASE_NARROW);
         // Identification-phase clock: ≤400 kHz on the SD bus per the
         // SD spec. The SDHOST divides core_clock by (cdiv + 2).
         program_sdcdiv(core_clock, 400_000);
@@ -236,6 +246,31 @@ impl SdHost {
         // ignores CMD16 (always 512); send it anyway for uniformity.
         send_cmd(CMD_SET_BLOCKLEN, 512, ResponseKind::Short)?;
 
+        // ACMD6: switch the card to 4-bit external bus. 4-bit is
+        // mandatory in the SD spec so this should always succeed,
+        // but treat failure as soft — stay at 1-bit, log loudly.
+        // Order matters: switch the *card* first, then the
+        // *controller* (writing SDHCFG_WIDE_EXT_BUS). Reversed, we'd
+        // drive 4-bit signals to a card still expecting 1-bit and
+        // mismatch on every transfer.
+        let mut hcfg_base = SDHCFG_BASE_NARROW;
+        match (|| -> Result<u32, CmdError> {
+            send_cmd(CMD_APP_CMD, rca, ResponseKind::Short)?;
+            send_cmd(ACMD_SET_BUS_WIDTH, 2, ResponseKind::Short)
+        })() {
+            Ok(_) => {
+                hcfg_base |= SDHCFG_WIDE_EXT_BUS;
+                write_reg(SDHCFG, hcfg_base);
+                trace!("sd: ACMD6 ok, switched to 4-bit external bus");
+            }
+            Err(e) => {
+                trace!(
+                    "sd: ACMD6 FAILED ({:?}), staying at 1-bit external bus",
+                    e
+                );
+            }
+        }
+
         // Bump the SD bus clock to default-speed 25 MHz now that the
         // card is in transfer state. The SD spec allows this
         // immediately after CMD7 (no SD switch command required for
@@ -250,18 +285,21 @@ impl SdHost {
         // fixed. Reads have been stable at 400 kHz across full and
         // incremental saves; 25 MHz is the next variable to flip.
         //
-        // 4-bit bus width via ACMD6 is a separate change and still
-        // deferred — single-line first, then widen once that's
-        // proven solid.
+        // ACMD6 above handled the 4-bit switch.
         program_sdcdiv(core_clock, 25_000_000);
         trace!(
-            "sd: init complete; SDEDM=0x{:08x} (FSM={:#x}) SDCDIV={}",
+            "sd: init complete; SDEDM=0x{:08x} (FSM={:#x}) SDCDIV={} SDHCFG=0x{:08x}",
             read_reg(SDEDM),
             read_reg(SDEDM) & SDEDM_FSM_MASK,
             read_reg(SDCDIV),
+            read_reg(SDHCFG),
         );
 
-        Ok(SdHost { rca, capacity })
+        Ok(SdHost {
+            rca,
+            capacity,
+            hcfg_base,
+        })
     }
 
     /// Read one 512-byte sector. `lba` is a sector index regardless
@@ -285,7 +323,7 @@ impl SdHost {
             read_reg(SDHSTS),
             read_reg(SDEDM),
         );
-        prepare_data(512, 1);
+        prepare_data(self.hcfg_base, 512, 1);
         let resp = send_cmd_kind(CMD_READ_SINGLE_BLOCK, arg, ResponseKind::Short, CmdDir::Read);
         trace!(
             "sd: CMD17 done; resp={:?} SDHSTS=0x{:08x} SDEDM=0x{:08x} (FSM={:#x})",
@@ -303,7 +341,7 @@ impl SdHost {
             read_reg(SDEDM),
             read_reg(SDEDM) & SDEDM_FSM_MASK,
         );
-        write_reg(SDHCFG, SDHCFG_BASE);
+        write_reg(SDHCFG, self.hcfg_base);
         r
     }
 
@@ -314,10 +352,10 @@ impl SdHost {
             CardCapacity::HighCapacity => lba,
             CardCapacity::StandardCapacity => lba.wrapping_mul(512),
         };
-        prepare_data(512, 1);
+        prepare_data(self.hcfg_base, 512, 1);
         send_cmd_kind(CMD_WRITE_SINGLE_BLOCK, arg, ResponseKind::Short, CmdDir::Write)?;
         let r = fill_fifo_from(buf).and_then(|()| finish_data_phase(false));
-        write_reg(SDHCFG, SDHCFG_BASE);
+        write_reg(SDHCFG, self.hcfg_base);
         r
     }
 
@@ -540,16 +578,18 @@ fn wait_for_fifo_space() -> Result<u32, CmdError> {
 /// Set up the controller for a data-bearing transfer. Mirrors
 /// Linux's `bcm2835_sdhost_prepare_data`:
 ///
-/// 1. Flip SDHCFG to `SDHCFG_DATA_TRANSFER` (adds `DATA_IRPT_EN`).
-///    On this controller that bit is functionally required, not just
-///    interrupt-related — see `SDHCFG_DATA_TRANSFER` doc.
+/// 1. Flip SDHCFG to `hcfg_base | SDHCFG_DATA_BIT` (adds
+///    `DATA_IRPT_EN`). On this controller that bit is functionally
+///    required, not just interrupt-related — see `SDHCFG_DATA_BIT`
+///    doc.
 /// 2. Program block byte count and block count.
 ///
 /// Must be called *before* writing SDCMD with the data-bearing
-/// opcode. `read_block` / `write_block` restore `SDHCFG_BASE` once
-/// the transfer is complete.
-fn prepare_data(blksz: u32, blocks: u32) {
-    write_reg(SDHCFG, SDHCFG_DATA_TRANSFER);
+/// opcode. `read_block` / `write_block` restore `hcfg_base` once
+/// the transfer is complete. `hcfg_base` carries any
+/// `SDHCFG_WIDE_EXT_BUS` bit set by ACMD6 during init.
+fn prepare_data(hcfg_base: u32, blksz: u32, blocks: u32) {
+    write_reg(SDHCFG, hcfg_base | SDHCFG_DATA_BIT);
     write_reg(SDHBCT, blksz);
     write_reg(SDHBLC, blocks);
 }

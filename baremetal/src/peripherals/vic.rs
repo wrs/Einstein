@@ -269,6 +269,16 @@ pub fn inject_sound_dma_irq() {
 /// regardless of whether the IRQ would pass `mIntRaised & mIntCtrlReg`.
 static WAKE_REQUEST: AtomicBool = AtomicBool::new(false);
 
+/// True while the guest is parked inside subfn 0x0E `PowerOffSystem`
+/// (deep-sleep WFI from `CyclePower__Fv`). Set/cleared by
+/// `peripherals::platform::pause_system` around its WFI loop. Read by
+/// `input::drain_into_queue` to implement the Einstein "first tap acts
+/// as the power button" hack — see `AndroidGlue.cpp:205-216`. Subfn
+/// 0x0D `PauseSystem` (idle loop) does NOT set this: the guest is
+/// already powered on then, and a synthetic power-switch press would
+/// be interpreted as a power-down request.
+static POWERED_OFF: AtomicBool = AtomicBool::new(false);
+
 /// Power-switch press from the host-IO transport. Mirrors Einstein's
 /// `TPlatformManager::RaisePlatformInterrupt() -> RaiseGPIO(0x00000001)`
 /// (TPlatformManager.cpp:484, TInterruptManager.cpp:458):
@@ -291,6 +301,17 @@ pub fn raise_power_switch() {
 /// to false and returns its prior value.
 pub fn take_wake_request() -> bool {
     WAKE_REQUEST.swap(false, Ordering::AcqRel)
+}
+
+/// Mark the guest as parked in deep-sleep PowerOffSystem WFI. Called by
+/// `pause_system` for subfn 0x0E only.
+pub fn set_powered_off(v: bool) {
+    POWERED_OFF.store(v, Ordering::Release);
+}
+
+/// True while the guest is in subfn 0x0E `PowerOffSystem` WFI.
+pub fn is_powered_off() -> bool {
+    POWERED_OFF.load(Ordering::Acquire)
 }
 
 /// Latch any timer-match bits whose deadline has passed into `int_present`

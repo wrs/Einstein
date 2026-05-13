@@ -48,7 +48,8 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         // (~98 k IntCtrl writes, ~65 k IntED1 reads, ~33 k DACR
         // writes per 2 s window — see trap-hist captures in the
         // commit history).
-        0x0D | 0x0E => pause_system(ctx),
+        0x0D => pause_system(ctx, false),
+        0x0E => pause_system(ctx, true),
         // No-op, r0=0 (per Einstein Emulator/TNativePrimitives.cpp:625-849):
         //   0x02 Delete, 0x03 Init, 0x04 BacklightTrigger,
         //   0x05 RegisterPowerSwitchInterrupt, 0x06 EnableSysPowerInterrupt,
@@ -164,7 +165,7 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
 ///     snapshot them on entry and restore them before returning, or
 ///     ERET ends up reading the post-WFI EL2h state and jumping to
 ///     PC=0 in EL2 instead of back to the guest.
-fn pause_system(ctx: &mut TrapContext) {
+fn pause_system(ctx: &mut TrapContext, powering_off: bool) {
     const MAX_WFI_ITERS: u32 = 8;
 
     // Snapshot the guest's saved exception state so the nested IRQ
@@ -180,6 +181,15 @@ fn pause_system(ctx: &mut TrapContext) {
             out(reg) saved_spsr,
             options(nomem, nostack, preserves_flags),
         );
+    }
+
+    // Tell the pen-input pump we're in deep-sleep so the next pen-down
+    // can synthesise a power-switch press (Einstein's
+    // `AndroidGlue.cpp:205-216` hack). Only for 0x0E PowerOffSystem;
+    // 0x0D PauseSystem is the on-state idle loop and must NOT trigger
+    // a power-switch press.
+    if powering_off {
+        crate::peripherals::vic::set_powered_off(true);
     }
 
     if !crate::peripherals::vic::irq_pending() && !crate::peripherals::vic::take_wake_request() {
@@ -199,6 +209,10 @@ fn pause_system(ctx: &mut TrapContext) {
                 break;
             }
         }
+    }
+
+    if powering_off {
+        crate::peripherals::vic::set_powered_off(false);
     }
 
     // Restore guest exception state clobbered by the nested IRQ entry.

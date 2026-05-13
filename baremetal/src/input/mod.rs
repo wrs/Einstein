@@ -87,6 +87,19 @@ pub(crate) fn drain_into_queue<P: PenSource>(src: &mut P) {
         match ev {
             PenEvent::Down { x, y } => {
                 if !DOWN.swap(true, Ordering::AcqRel) {
+                    // Einstein's "first tap acts as the power button"
+                    // hack (AndroidGlue.cpp:205-216): the Pi Zero 2 W
+                    // build has no physical power button, so when the
+                    // guest is parked in subfn 0x0E PowerOffSystem
+                    // (deep-sleep WFI), synthesise a power-switch press
+                    // on the pen-down edge. raise_power_switch sets
+                    // WAKE_REQUEST, which `pause_system`'s WFI loop
+                    // polls between heartbeats. The pen-down sample
+                    // itself is still enqueued so the same tap registers
+                    // in Newton's tablet driver once power-on completes.
+                    if crate::peripherals::vic::is_powered_off() {
+                        crate::peripherals::vic::raise_power_switch();
+                    }
                     queue::enqueue_pen_sample(PEN_DOWN_SAMPLE_MARKER, 0);
                 }
                 queue::enqueue_pen_sample(pack_pen_sample(x, y, PRESSURE), 0);

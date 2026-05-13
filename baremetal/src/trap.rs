@@ -3413,7 +3413,7 @@ fn handle_fme_entry_probe(ctx: &mut TrapContext) {
     // useful to see the FAR distribution late in boot when FME is still
     // firing but the early-cap has run out.
     if n < 24 || n % 100_000 == 0 {
-        kprintln!(
+        crate::log_traps!(
             "FME-entry[{}]: r0(mask)={:#010x} far={:#010x} src_mode={:#x} sp={:#010x} task[+0x70]={:#010x} task[+0x64]={:#010x} task[+0x58]={:#010x}",
             n, r0, far, src_mode, sp_src, task_70, task_64, task_58,
         );
@@ -3455,7 +3455,7 @@ fn handle_dah_or_chain_probe(ctx: &mut TrapContext) {
         core::sync::atomic::AtomicU32::new(0);
     let n = FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if n < 24 {
-        kprintln!(
+        crate::log_traps!(
             "DAH-OR[{}]: far={:#010x} curr_task={:#010x} m74={:#010x}->{:#010x} m78={:#010x}->{:#010x} m7c={:#010x}->{:#010x}",
             n, far, curr_task, m74, m74_10, m78, m78_10, m7c, m7c_10,
         );
@@ -4174,6 +4174,7 @@ fn log_dabt_forward(dfsc: u32, far: u32, mode: u32, ctx: &TrapContext) {
         // hole vs. a wider gap. Lazy "non-zero fault" descriptors
         // (e.g. 0x90 — type=00 with bit-7/bit-4 set) are a kernel
         // bookkeeping shape worth eyeballing across a window.
+        #[cfg(feature = "log_mmu")]
         if dfsc == 5 {
             guest_mem::dump_l1_neighbourhood(far);
         }
@@ -4796,11 +4797,14 @@ fn log_sctlr_write(value: u32) {
 }
 
 fn maybe_dump_l1_once() {
-    static mut L1_DUMPS: usize = 0;
-    // SAFETY: single-threaded.
-    let n = unsafe { let v = L1_DUMPS; L1_DUMPS += 1; v };
-    if n < 10 {
-        guest_mem::dump_guest_l1_table();
+    #[cfg(feature = "log_mmu")]
+    {
+        static mut L1_DUMPS: usize = 0;
+        // SAFETY: single-threaded.
+        let n = unsafe { let v = L1_DUMPS; L1_DUMPS += 1; v };
+        if n < 10 {
+            guest_mem::dump_guest_l1_table();
+        }
     }
 }
 

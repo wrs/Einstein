@@ -106,13 +106,13 @@ fn check_snapshot_diff() {
         // even after budget exhaustion (avoids spamming "everything
         // changed" once we resume).
     } else if budget > 0 {
-        kprintln!("alrt-capture SNAPSHOT diff #{} at PA={:#010x}+{:#x}:",
+        crate::log_mmu!("alrt-capture SNAPSHOT diff #{} at PA={:#010x}+{:#x}:",
             seq, armed, SNAPSHOT_BASE_OFFSET);
         for i in 0..SNAPSHOT_WORDS {
             let prev = SNAPSHOT[i].load(Ordering::Relaxed);
             let cur = new_words[i];
             if prev != cur {
-                kprintln!("    +{:#x}: {:#010x} -> {:#010x}",
+                crate::log_mmu!("    +{:#x}: {:#010x} -> {:#010x}",
                     SNAPSHOT_BASE_OFFSET + (i as u32) * 4, prev, cur);
             }
         }
@@ -159,7 +159,7 @@ pub unsafe fn arm_at_boot() {
     // SAFETY: helper performs its own TLB maintenance.
     unsafe { crate::stage2::set_ram_page_ro_xn(KNOWN_TARGET_PA); }
     let after = crate::stage2::ram_page_l3_entry(KNOWN_TARGET_PA);
-    kprintln!(
+    crate::log_mmu!(
         "alrt-capture: BOOT armed RO+XN on PA={:#010x} L3 before={:#x} after={:#x}",
         KNOWN_TARGET_PA, before.unwrap_or(0), after.unwrap_or(0),
     );
@@ -179,12 +179,12 @@ pub unsafe fn arm_at_boot() {
     // observed at IdleProc (count=32, esize=1, ebase=0x003121fc),
     // the "corruption" is actually our hypervisor's RAM-init
     // pattern — we'd be looking for a hypervisor-side bug.
-    kprintln!("alrt-capture: RAM at PA={:#010x}+0x7c0..0x800 at boot:",
+    crate::log_mmu!("alrt-capture: RAM at PA={:#010x}+0x7c0..0x800 at boot:",
         KNOWN_TARGET_PA);
     for i in 0..SNAPSHOT_WORDS {
         let pa = KNOWN_TARGET_PA + SNAPSHOT_BASE_OFFSET + (i as u32) * 4;
         let v = crate::guest_endian::guest_read_u32_pa(pa).unwrap_or(0xDEAD_BEEF);
-        kprintln!("    +{:#x}: {:#010x}",
+        crate::log_mmu!("    +{:#x}: {:#010x}",
             SNAPSHOT_BASE_OFFSET + (i as u32) * 4, v);
         SNAPSHOT[i].store(v, Ordering::Relaxed);
     }
@@ -226,11 +226,11 @@ pub fn note_perm_fault(elr: u32, ipa: u32, value: Option<u32>, srt: u32, src_cps
     }
     let mode = src_cpsr & 0x1F;
     match value {
-        Some(v) => kprintln!(
+        Some(v) => crate::log_mmu!(
             "alrt-capture[+{:#x}]: elr={:#010x} value={:#010x} srt={} src_mode={:#x}",
             off, elr, v, srt, mode,
         ),
-        None => kprintln!(
+        None => crate::log_mmu!(
             "alrt-capture[+{:#x}]: elr={:#010x} value=<isv0> srt={} src_mode={:#x}",
             off, elr, srt, mode,
         ),

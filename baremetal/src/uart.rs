@@ -264,8 +264,8 @@ macro_rules! kprintln {
 #[cfg(not(feature = "quiet"))]
 #[macro_export]
 macro_rules! dprintln {
-    () => { $crate::kprintln!(); };
-    ($($arg:tt)*) => { $crate::kprintln!($($arg)*); };
+    () => { $crate::kprintln!() };
+    ($($arg:tt)*) => { $crate::kprintln!($($arg)*) };
 }
 
 #[cfg(feature = "quiet")]
@@ -292,8 +292,8 @@ macro_rules! dprintln {
 #[cfg(feature = "log_mmu")]
 #[macro_export]
 macro_rules! log_mmu {
-    () => { $crate::kprintln!(); };
-    ($($arg:tt)*) => { $crate::kprintln!($($arg)*); };
+    () => { $crate::kprintln!() };
+    ($($arg:tt)*) => { $crate::kprintln!($($arg)*) };
 }
 #[cfg(not(feature = "log_mmu"))]
 #[macro_export]
@@ -305,8 +305,8 @@ macro_rules! log_mmu {
 #[cfg(feature = "log_traps")]
 #[macro_export]
 macro_rules! log_traps {
-    () => { $crate::kprintln!(); };
-    ($($arg:tt)*) => { $crate::kprintln!($($arg)*); };
+    () => { $crate::kprintln!() };
+    ($($arg:tt)*) => { $crate::kprintln!($($arg)*) };
 }
 #[cfg(not(feature = "log_traps"))]
 #[macro_export]
@@ -318,8 +318,8 @@ macro_rules! log_traps {
 #[cfg(feature = "log_tasks")]
 #[macro_export]
 macro_rules! log_tasks {
-    () => { $crate::kprintln!(); };
-    ($($arg:tt)*) => { $crate::kprintln!($($arg)*); };
+    () => { $crate::kprintln!() };
+    ($($arg:tt)*) => { $crate::kprintln!($($arg)*) };
 }
 #[cfg(not(feature = "log_tasks"))]
 #[macro_export]
@@ -331,12 +331,25 @@ macro_rules! log_tasks {
 #[cfg(feature = "log_irqs")]
 #[macro_export]
 macro_rules! log_irqs {
-    () => { $crate::kprintln!(); };
-    ($($arg:tt)*) => { $crate::kprintln!($($arg)*); };
+    () => { $crate::kprintln!() };
+    ($($arg:tt)*) => { $crate::kprintln!($($arg)*) };
 }
 #[cfg(not(feature = "log_irqs"))]
 #[macro_export]
 macro_rules! log_irqs {
+    () => {};
+    ($($arg:tt)*) => {{ let _ = format_args!($($arg)*); }};
+}
+
+#[cfg(feature = "log_unaligned")]
+#[macro_export]
+macro_rules! log_unaligned {
+    () => { $crate::kprintln!() };
+    ($($arg:tt)*) => { $crate::kprintln!($($arg)*) };
+}
+#[cfg(not(feature = "log_unaligned"))]
+#[macro_export]
+macro_rules! log_unaligned {
     () => {};
     ($($arg:tt)*) => {{ let _ = format_args!($($arg)*); }};
 }

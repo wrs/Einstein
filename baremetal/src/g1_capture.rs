@@ -82,7 +82,7 @@ pub unsafe fn arm() {
         unsafe { crate::stage2::set_ram_page_ro_xn(pa); }
     }
     ARMED.store(true, Ordering::Release);
-    kprintln!(
+    crate::log_mmu!(
         "g1-capture: armed RO+XN on PA={:#010x}, {:#010x}, {:#010x}",
         G1_PAS[0], G1_PAS[1], G1_PAS[2],
     );
@@ -126,11 +126,11 @@ pub fn note_perm_fault(elr: u32, ipa: u32, value: Option<u32>, srt: u32) {
     }
     let off = ipa & 0xFFF;
     match value {
-        Some(v) => kprintln!(
+        Some(v) => crate::log_mmu!(
             "g1-capture[PA={:#010x} +{:#x}]: elr={:#010x} value={:#010x} srt={}",
             G1_PAS[idx], off, elr, v, srt,
         ),
-        None => kprintln!(
+        None => crate::log_mmu!(
             "g1-capture[PA={:#010x} +{:#x}]: elr={:#010x} value=<isv0> srt={}",
             G1_PAS[idx], off, elr, srt,
         ),

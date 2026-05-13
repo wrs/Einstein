@@ -116,19 +116,19 @@ pub fn handle_align_fault(ctx: &mut TrapContext) {
             core::arch::asm!("mrs {}, spsr_el2", out(reg) spsr_el2,
                 options(nomem, nostack, preserves_flags));
         }
-        kprintln!(
+        crate::log_unaligned!(
             "unaligned[{}]: ELR_EL2={:#010x} SPSR_EL2={:#010x} (HVC-entry mode={:#x})",
             n, elr_el2 as u32, spsr_el2 as u32, (spsr_el2 as u32) & 0x1F,
         );
-        kprintln!(
+        crate::log_unaligned!(
             "unaligned[{}]: LR_abt(save)={:#010x} ctx.x[14]={:#018x} ctx.x[13]={:#018x}",
             n, lr_abt, ctx.x[14], ctx.x[13],
         );
-        kprintln!(
+        crate::log_unaligned!(
             "unaligned[{}]: SPSR_abt(save)={:#010x} FAR={:#010x} ESR_EL1={:#010x}",
             n, pre_abt_cpsr, dfar as u32, dfsr_esr as u32,
         );
-        kprintln!(
+        crate::log_unaligned!(
             "unaligned[{}]: orig_r0={:#010x} orig_r1={:#010x}",
             n, orig_r0 as u32, orig_r1 as u32,
         );
@@ -154,7 +154,7 @@ pub fn handle_align_fault(ctx: &mut TrapContext) {
     let decoded_maybe = decode(insn);
     if faulting_pc & 3 != 0 || decoded_maybe.is_none() {
         if n <= LOG_FIRST {
-            kprintln!(
+            crate::log_unaligned!(
                 "unaligned[{}]: SKIP — PC={:#010x} insn={:#010x} (decode={}, aligned={}) FAR={:#010x}",
                 n, faulting_pc, insn,
                 decoded_maybe.is_some(),

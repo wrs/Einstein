@@ -617,7 +617,7 @@ pub fn fix_stage1_xn_bits() -> bool {
                         let already = unsafe { LOGGED_ALIAS_BITMAP[word] & mask != 0 };
                         if !already {
                             unsafe { LOGGED_ALIAS_BITMAP[word] |= mask; }
-                            crate::kprintln!(
+                            crate::log_mmu!(
                                 "verify-mmu alias: PA={:#010x} VA1={:#010x} (L1[{:#x}],L2[{:#x}]) VA2={:#010x} (L1[{:#x}],L2[{:#x}])",
                                 pa,
                                 prev_va, prev_va >> 20, (prev_va >> 12) & 0xFF,
@@ -646,7 +646,7 @@ pub fn fix_stage1_xn_bits() -> bool {
                             } else {
                                 "?"
                             };
-                            crate::kprintln!(
+                            crate::log_mmu!(
                                 "verify-mmu alias L1[{:#x}]={:#010x} → L2_PT@PA={:#010x} ({})  L2[{:#x}]={:#010x} (PA={:#010x})  L2[{:#x}]={:#010x} (PA={:#010x})",
                                 i, entry, l2_pt_base, l2_loc,
                                 prev_idx, prev_l2, prev_l2 & 0xFFFF_F000,
@@ -690,7 +690,7 @@ pub fn fix_stage1_xn_bits() -> bool {
                             } else {
                                 "DISJOINT"
                             };
-                            crate::kprintln!(
+                            crate::log_mmu!(
                                 "verify-mmu alias AP-decode: {} prev=[sp0={:02b} sp1={:02b} sp2={:02b} sp3={:02b}] va=[sp0={:02b} sp1={:02b} sp2={:02b} sp3={:02b}] conflict_mask={:#x}",
                                 class,
                                 prev_aps[0], prev_aps[1], prev_aps[2], prev_aps[3],
@@ -742,7 +742,7 @@ pub fn fix_stage1_xn_bits() -> bool {
                                 }
                                 _ => "kernel-direct-or-forgotten",
                             };
-                            crate::kprintln!(
+                            crate::log_mmu!(
                                 "verify-mmu alias INTENT: {} prev_va_mask={:?} va_mask={:?}",
                                 intent_class, prev_intent, va_intent,
                             );
@@ -798,7 +798,7 @@ pub fn fix_stage1_xn_bits() -> bool {
     };
 
     if subpage_log || alias_log {
-        crate::kprintln!(
+        crate::log_mmu!(
             "verify-mmu: subpage-AP-mixed={} RAM-aliased-pages={}",
             subpage_ap_mixed, alias_count,
         );
@@ -840,7 +840,7 @@ pub fn fix_stage1_xn_bits() -> bool {
         (l, s)
     };
     if last != cur_cd {
-        crate::kprintln!(
+        crate::log_mmu!(
             "L1[0xcd] probe: transition #{} {:#010x} -> {:#010x}",
             seq, last, cur_cd
         );

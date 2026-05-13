@@ -1889,6 +1889,25 @@ fn handle_und(ctx: &mut TrapContext) {
         // lr` (the architectural movs-pc consumes SPSR_und, restoring
         // the source-mode CPSR).
         _ if is_fpa_insn(insn) => {
+            // ARMv8 Cortex-A53 deprecates conditional execution of
+            // coprocessor instructions and effectively executes them
+            // unconditionally — a conditional FPA insn UND-traps even
+            // when its cond field would have failed on ARMv4. The
+            // Newton FPE was written for ARMv4 and relies on cond-
+            // false coprocessor insns being skipped silently (e.g.,
+            // the decimal-conversion encoder's `dvfple`/`mufmie` at
+            // 0x0038F5B4/B8 must only fire on the correct sign of
+            // the binary exponent — otherwise both fire and corrupt
+            // the digit-extraction path, producing the calc bug:
+            // 0.2 → 0.02, 10 → 100, etc.). Restore ARMv4 semantics
+            // here: if cond fails, return to source mode at
+            // faulting_pc+4 without entering the FPE.
+            let cond = (insn >> 28) & 0xF;
+            if !arm_condition_passed(cond, spsr_und as u32) {
+                log_fpa_cond_skip(faulting_pc, insn);
+                return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
+                return;
+            }
             log_fpa_bypass_miss(faulting_pc, insn);
             const FPE_JT_VA: u64 = 0x0038_D874;
             // SAFETY: ELR_EL2 is the AArch64 system register that the
@@ -2163,6 +2182,42 @@ fn log_fpa_ctrl_reg(pc: u32, insn: u32, cond_passed: bool) {
             rt,
             pc,
             if cond_passed { "passed" } else { "failed" },
+        );
+    }
+}
+
+/// Log (dedupe-first-N) a conditional FPA insn whose cond field
+/// failed against source CPSR.NZCV. Without the cond-skip emulation
+/// in `handle_und`, the FPE would have executed the operation
+/// unconditionally and produced wrong results — see the calc-bug
+/// analysis (0.2 → 0.02 via decimal-encoder's dvfple/mufmie).
+fn log_fpa_cond_skip(pc: u32, insn: u32) {
+    const SEEN_CAP: usize = 16;
+    static mut SEEN: [u32; SEEN_CAP] = [0; SEEN_CAP];
+    static mut SEEN_N: usize = 0;
+    // SAFETY: single-threaded EL2.
+    let first = unsafe {
+        let mut found = false;
+        for i in 0..SEEN_N { if SEEN[i] == pc { found = true; break; } }
+        if !found && SEEN_N < SEEN_CAP {
+            SEEN[SEEN_N] = pc;
+            SEEN_N += 1;
+            true
+        } else {
+            false
+        }
+    };
+    if first {
+        let cond = (insn >> 28) & 0xF;
+        let cond_name = match cond {
+            0x0 => "EQ", 0x1 => "NE", 0x2 => "CS", 0x3 => "CC",
+            0x4 => "MI", 0x5 => "PL", 0x6 => "VS", 0x7 => "VC",
+            0x8 => "HI", 0x9 => "LS", 0xA => "GE", 0xB => "LT",
+            0xC => "GT", 0xD => "LE", _ => "??",
+        };
+        kprintln!(
+            "und: FPA cond-{} insn={:#010x} @PC={:#x} — cond failed, ARMv4 skip emulated",
+            cond_name, insn, pc,
         );
     }
 }
@@ -5022,3 +5077,8 @@ pub fn describe_ec(ec: u32) -> &'static str {
         _ => "other",
     }
 }
+
+
+
+
+

@@ -10,3 +10,5 @@
 pub mod fb;
 #[cfg(feature = "fb-probe")]
 pub mod probe;
+#[cfg(nh_host_io_pi_fb)]
+pub mod splash;

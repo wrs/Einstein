@@ -181,7 +181,13 @@ impl FlashStore for SdBackend {
         let mut off = 0usize;
         let mut next_dot = PROGRESS_DOT;
         while off < buf.len() {
-            match file.read(&mut buf[off..]) {
+            // Cap each read at PROGRESS_CHUNK so progress (dots +
+            // splash bar) updates incrementally. The SD driver
+            // happily fulfills a single multi-MiB read in one call,
+            // which would make the bar/dots jump from empty to full
+            // in one tick.
+            let end = (off + PROGRESS_CHUNK).min(buf.len());
+            match file.read(&mut buf[off..end]) {
                 Ok(0) => break,
                 Ok(n) => {
                     off += n;
@@ -189,6 +195,15 @@ impl FlashStore for SdBackend {
                         kprint!(".");
                         next_dot += PROGRESS_DOT;
                     }
+                    // Drive the lower 20% of the boot-splash bar from
+                    // SD-load progress. Gated on pi_fb; no-op on other
+                    // backends. Safe to call before
+                    // `display::splash::init` (becomes a no-op).
+                    #[cfg(all(feature = "platform-raspi3b", nh_host_io_pi_fb))]
+                    crate::display::splash::set_load_progress(
+                        off as u64,
+                        buf.len() as u64,
+                    );
                 }
                 Err(e) => {
                     kprintln!("] FAILED at off={}: {:?}", off, e);

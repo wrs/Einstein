@@ -322,6 +322,12 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     crate::host_io::pump_input();
     crate::input::pump();
     update_virq();
+    // Advance the boot-splash progress bar (no-op once the guest's
+    // first blit has frozen the splash, and on platforms without
+    // pi_fb). Driven from the timer IRQ tail so the bar grows on a
+    // steady ~16 ms cadence regardless of trap-rate variation.
+    #[cfg(all(feature = "platform-raspi3b", nh_host_io_pi_fb))]
+    crate::display::splash::update_progress(crate::trap_hist::sync_count());
     // Wall-clock-paced snapshot save. Timer IRQ is a cleaner hook
     // than sync traps: it fires regardless of whether the guest is
     // making forward progress, so we keep rolling a fresh snapshot

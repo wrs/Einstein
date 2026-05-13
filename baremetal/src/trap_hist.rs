@@ -66,6 +66,17 @@ fn is_warm() -> bool {
     SYNC_COUNT.load(Ordering::Relaxed) >= WARMUP_TRAPS
 }
 
+/// Total guest sync traps observed since boot. Stable, monotonic,
+/// cheap to read. Used as the progress source for the boot-splash
+/// bar in `display::splash`. Marked `dead_code` because only the
+/// pi_fb host-io backend consumes it; other backends compile this
+/// out at the call site.
+#[allow(dead_code)]
+#[inline]
+pub fn sync_count() -> u64 {
+    SYNC_COUNT.load(Ordering::Relaxed)
+}
+
 static EC_HIST: [AtomicU64; EC_BUCKETS] = {
     const Z: AtomicU64 = AtomicU64::new(0);
     [Z; EC_BUCKETS]

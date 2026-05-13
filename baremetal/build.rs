@@ -99,6 +99,116 @@ fn main() {
     // keeps the layout simple and catches a stale file earlier.
     let _ = guest_test;
     build_classify_bitmap();
+
+    // Stage the splash logo for include_bytes! in display::splash.
+    // Missing file = zero-size placeholder (splash skips the logo render).
+    build_splash_logo();
+}
+
+/// Read `assets/splash_logo.ppm` (P6 binary; 8-bit RGB) and write the
+/// raw RGB byte stream to `OUT_DIR/splash_logo.bin`, exposing the
+/// dimensions as `NH_SPLASH_LOGO_W` / `NH_SPLASH_LOGO_H`. If the file
+/// doesn't exist, emit an empty blob and W=H=0 so the splash renders
+/// without a logo.
+fn build_splash_logo() {
+    let out_dir = env::var("OUT_DIR").expect("OUT_DIR");
+    let bin_path = Path::new(&out_dir).join("splash_logo.bin");
+    let src = Path::new("assets/splash_logo.ppm");
+    println!("cargo:rerun-if-changed=assets/splash_logo.ppm");
+
+    let Ok(bytes) = fs::read(src) else {
+        fs::write(&bin_path, []).expect("write empty splash_logo.bin");
+        println!("cargo:rustc-env=NH_SPLASH_LOGO_W=0");
+        println!("cargo:rustc-env=NH_SPLASH_LOGO_H=0");
+        return;
+    };
+
+    let (w, h, pixels) = parse_ppm_p6(&bytes)
+        .unwrap_or_else(|e| panic!("assets/splash_logo.ppm: {e}"));
+    fs::write(&bin_path, &pixels).expect("write splash_logo.bin");
+    println!("cargo:rustc-env=NH_SPLASH_LOGO_W={w}");
+    println!("cargo:rustc-env=NH_SPLASH_LOGO_H={h}");
+}
+
+/// Minimal PPM parser. Accepts both P6 (binary RGB body) and P3 (ASCII
+/// decimal RGB triples) — `magick` produces P6 by default but switches
+/// to P3 with `-compress none`, so absorbing both removes a footgun.
+/// Header is ASCII: `<magic>\n<W> <H>\n<MAXVAL>\n` with optional
+/// `#`-comment lines anywhere in the header. MAXVAL must be 255.
+fn parse_ppm_p6(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
+    let mut p = 0usize;
+    let next_token = |p: &mut usize| -> Result<&str, String> {
+        loop {
+            while *p < bytes.len() && bytes[*p].is_ascii_whitespace() {
+                *p += 1;
+            }
+            if *p < bytes.len() && bytes[*p] == b'#' {
+                while *p < bytes.len() && bytes[*p] != b'\n' {
+                    *p += 1;
+                }
+                continue;
+            }
+            break;
+        }
+        let start = *p;
+        while *p < bytes.len() && !bytes[*p].is_ascii_whitespace() {
+            *p += 1;
+        }
+        if start == *p {
+            return Err("unexpected end of header".into());
+        }
+        std::str::from_utf8(&bytes[start..*p])
+            .map_err(|_| "non-ascii header token".to_string())
+    };
+
+    let magic = next_token(&mut p)?;
+    let is_ascii = match magic {
+        "P6" => false,
+        "P3" => true,
+        other => return Err(format!("expected P6 or P3 magic, got {other:?}")),
+    };
+    let w: u32 = next_token(&mut p)?.parse().map_err(|_| "bad width")?;
+    let h: u32 = next_token(&mut p)?.parse().map_err(|_| "bad height")?;
+    let maxval: u32 = next_token(&mut p)?
+        .parse()
+        .map_err(|_| "bad maxval")?;
+    if maxval != 255 {
+        return Err(format!(
+            "maxval must be 255 (8 bpc); got {maxval}. Re-export with 8-bit depth."
+        ));
+    }
+
+    let want = (w as usize) * (h as usize) * 3;
+
+    if is_ascii {
+        // P3: whitespace-separated decimal samples (and possibly more
+        // `#` comments) for the rest of the file. Reuse `next_token`.
+        let mut pixels = Vec::with_capacity(want);
+        for _ in 0..want {
+            let tok = next_token(&mut p)?;
+            let v: u32 = tok.parse().map_err(|_| format!("bad sample {tok:?}"))?;
+            if v > 255 {
+                return Err(format!("sample {v} > maxval"));
+            }
+            pixels.push(v as u8);
+        }
+        Ok((w, h, pixels))
+    } else {
+        // P6: exactly one whitespace byte follows MAXVAL before pixels.
+        if p >= bytes.len() {
+            return Err("no pixel data".into());
+        }
+        p += 1;
+        let body = &bytes[p..];
+        if body.len() < want {
+            return Err(format!(
+                "short pixel data: have {} bytes, need {} ({w}x{h}*3)",
+                body.len(),
+                want
+            ));
+        }
+        Ok((w, h, body[..want].to_vec()))
+    }
 }
 
 /// Select the linker script based on the platform-* feature. Panics if

@@ -87,6 +87,20 @@ pub extern "C" fn kmain() -> ! {
     // SAFETY: load ROM bytes into guest backing store before stage-2 maps it.
     unsafe { guest_mem::load_rom(); }
 
+    // Bring the HDMI framebuffer up as soon as we can and paint the
+    // splash (light-blue background + logo + progress bar). The bar
+    // advances as the guest takes sync traps; the splash disappears
+    // when the guest's first blit fires (see host_io::pi_fb). Built
+    // only with the pi_fb host_io backend — every other backend
+    // (null / semihost / pico) skips this entirely. pi_fb implies
+    // platform-raspi3b in practice (the only platform with VC
+    // mailbox), but be explicit so a misconfigured build doesn't
+    // fall over on the missing `display` module.
+    #[cfg(all(feature = "platform-raspi3b", nh_host_io_pi_fb))]
+    {
+        display::splash::init();
+    }
+
     // Seed the Newton flash filesystem header before stage-2 exposes
     // the backing to the guest. Safe because the backing is a static
     // mut touched only from core 0 during boot.

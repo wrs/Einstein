@@ -24,7 +24,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::BlitEvent;
-use crate::display::fb::{self, FbInfo};
+use crate::display::fb::FbInfo;
 use crate::kprintln;
 use crate::peripherals::screen::{SCREEN_HEIGHT, SCREEN_WIDTH};
 
@@ -74,17 +74,18 @@ fn panel_offset_x() -> usize {
 }
 
 pub fn init() {
-    let info = match fb::alloc_native() {
-        Ok(i) => i,
-        Err(e) => {
-            kprintln!("host_io_pi_fb: FB init FAILED: {:?}", e);
+    // The boot splash (`display::splash::init`, called earlier from
+    // kmain) already allocated the framebuffer, painted the
+    // background + logo + progress bar, and flushed. We adopt its
+    // FbInfo so we don't double-allocate and so the splash stays
+    // visible until the guest's first blit triggers `splash::freeze`.
+    let info = match crate::display::splash::fb_info() {
+        Some(i) => *i,
+        None => {
+            kprintln!("host_io_pi_fb: splash didn't run; no FB available");
             return;
         }
     };
-    // Clear to black (Newton background once it's drawing will be
-    // white, but on a cold boot we want a defined initial state
-    // rather than whatever firmware leftover happens to be there).
-    fb::fill_solid(&info, PALETTE[3]);
 
     // Center the scaled Newton FB on the panel.
     let scaled_newton_w = scale(SCREEN_WIDTH as usize);
@@ -124,6 +125,14 @@ pub fn push_blit(ev: &BlitEvent, payload: &[u8]) {
     let Some(fb) = fb() else {
         return;
     };
+
+    // First guest blit ends the splash. Freeze progress updates so
+    // they stop scribbling on Newton's UI, then blank the panel to
+    // black — this hides the splash logo and the bar fragments that
+    // extend past the centered Newton FB region.
+    if crate::display::splash::take_first_blit() {
+        crate::display::fb::fill_solid(fb, 0x0000_0000);
+    }
 
     let src_w = ev.src_right.saturating_sub(ev.src_left) as usize;
     let src_h = ev.src_bottom.saturating_sub(ev.src_top) as usize;

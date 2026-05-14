@@ -353,3 +353,16 @@ macro_rules! log_unaligned {
     () => {};
     ($($arg:tt)*) => {{ let _ = format_args!($($arg)*); }};
 }
+
+#[cfg(feature = "log_host_io")]
+#[macro_export]
+macro_rules! log_host_io {
+    () => { $crate::kprintln!() };
+    ($($arg:tt)*) => { $crate::kprintln!($($arg)*) };
+}
+#[cfg(not(feature = "log_host_io"))]
+#[macro_export]
+macro_rules! log_host_io {
+    () => {};
+    ($($arg:tt)*) => {{ let _ = format_args!($($arg)*); }};
+}

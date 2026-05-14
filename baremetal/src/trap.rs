@@ -1187,15 +1187,7 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == HvcImm::DahMrsSpsr as u32 => {
             handle_dah_mrs_spsr_patch(ctx);
         }
-        v if v == HvcImm::DahFmeRet as u32 => {
-            handle_dah_fme_ret_probe(ctx);
-        }
-        v if v == HvcImm::ResolveFaultRet as u32 => {
-            handle_resolve_fault_ret_probe(ctx);
-        }
-        v if v == HvcImm::ResolveFaultEntry as u32 => {
-            handle_resolve_fault_entry_probe(ctx);
-        }
+        #[cfg(feature = "log_store")]
         v if v == HvcImm::StorePermObjEntry as u32 => {
             handle_store_perm_obj_entry_probe(ctx);
             // Emulate the patched-out `mov ip, sp` (R12 = SP for
@@ -1204,6 +1196,7 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
             let spsr_el2 = read_sysreg!("spsr_el2") as u32;
             ctx.x[12] = crate::banked::sp_for_mode(ctx, spsr_el2) as u64;
         }
+        #[cfg(feature = "log_store")]
         v if v == HvcImm::LoadPermObjRet as u32 => {
             handle_load_perm_obj_ret_probe(ctx);
             // Emulate the patched-out `mov r0, r4`. R0/R4 are not
@@ -1211,31 +1204,11 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
             // regardless of source mode.
             ctx.x[0] = ctx.x[4];
         }
-        v if v == HvcImm::DoCallEntry as u32 => {
-            handle_do_call_entry_probe(ctx);
-            // Emulate the patched-out `mov ip, sp` (R12 = SP for the
-            // source AArch32 mode). HVC entry already advanced
-            // ELR_EL2 past the trap, so no ELR adjustment needed.
-            let spsr_el2 = read_sysreg!("spsr_el2") as u32;
-            ctx.x[12] = crate::banked::sp_for_mode(ctx, spsr_el2) as u64;
-        }
-        v if v == HvcImm::DahFmeEntry as u32 => {
-            handle_fme_entry_probe(ctx);
-        }
-        v if v == HvcImm::DahOrChain as u32 => {
-            handle_dah_or_chain_probe(ctx);
-        }
         v if v == HvcImm::UnhandledException as u32 => {
             handle_unhandled_exception(ctx, false);
         }
         v if v == HvcImm::UnhandledNumException as u32 => {
             handle_unhandled_exception(ctx, true);
-        }
-        v if v == HvcImm::FpeEntryProbe as u32 => {
-            handle_fpe_entry_probe(ctx);
-        }
-        v if v == HvcImm::SplashProbe as u32 => {
-            handle_splash_probe(ctx);
         }
         v if v == HvcImm::HammerPrint as u32 => {
             handle_hammer_print(ctx);
@@ -1257,6 +1230,9 @@ fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         }
         v if v == HvcImm::Diag as u32 => {
             handle_diag(ctx);
+        }
+        v if v == HvcImm::DabtDispatch as u32 => {
+            handle_dabt_dispatch(ctx);
         }
         v if v == HvcImm::Align as u32 => {
             crate::unaligned::handle_align_fault(ctx);
@@ -1741,40 +1717,11 @@ fn handle_und(ctx: &mut TrapContext) {
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
-        // Iter-108 splash-chain probe — same physical instruction
-        // as the HVC dispatch arm above, but reached here when the
-        // HVC fired from USR mode (where HVC is UNDEFINED and goes
-        // through UND_TRAMP instead of trapping directly). The probe
-        // uses the trampoline-saved spsr_und to identify the source
-        // mode for `mov ip, sp` emulation, then ERETs back to PC+4
-        // via the UND-return stub.
-        _ if insn == HvcImm::SplashProbe.insn() => {
-            handle_splash_probe_und(ctx, faulting_pc, spsr_und);
-            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
-            return;
-        }
-        // ResolveFault wrapper exit probe (PLAN.md "Next" #1). The
-        // wrapper sits in the patch-stub arena and is invoked from
-        // `TStackManager::Fault` which runs in USR mode, so the HVC
-        // at wrapper_pc+0x68 raises UND and lands here. r0/r4/r5/r8/r9
-        // are unbanked (gpr 0..12 don't bank between USR and UND), so
-        // the probe reads them straight from ctx.x[N].
-        _ if insn == HvcImm::ResolveFaultRet.insn() => {
-            handle_resolve_fault_ret_probe(ctx);
-            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
-            return;
-        }
-        _ if insn == HvcImm::ResolveFaultEntry.insn() => {
-            handle_resolve_fault_entry_probe(ctx);
-            // Emulate the original `mov ip, sp` (R12 = R13).
-            ctx.x[12] = crate::banked::sp_for_mode(ctx, spsr_und as u32) as u64;
-            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
-            return;
-        }
         // StorePermObject entry probe — first instruction (`mov ip,
         // sp`) was replaced with HVC. Reached here when StorePermObject
         // is called from USR mode (the typical NS-runtime path);
         // SVC-mode calls go through the direct HVC dispatch above.
+        #[cfg(feature = "log_store")]
         _ if insn == HvcImm::StorePermObjEntry.insn() => {
             handle_store_perm_obj_entry_probe(ctx);
             ctx.x[12] = crate::banked::sp_for_mode(ctx, spsr_und as u32) as u64;
@@ -1784,20 +1731,10 @@ fn handle_und(ctx: &mut TrapContext) {
         // LoadPermObject return-site probe — `mov r0, r4` was
         // replaced with HVC. Same USR-vs-SVC routing rationale as
         // the StorePermObject entry probe above.
+        #[cfg(feature = "log_store")]
         _ if insn == HvcImm::LoadPermObjRet.insn() => {
             handle_load_perm_obj_ret_probe(ctx);
             ctx.x[0] = ctx.x[4];
-            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
-            return;
-        }
-        // DoCall entry probe — first instruction (`mov ip, sp`)
-        // replaced with HVC. NS interpreter calls into DoCall from
-        // USR mode (NS bytecode invocations of native primitives
-        // recurse through here), so the USR HVC is UNDEFINED and
-        // arrives via this UND-trampoline path.
-        _ if insn == HvcImm::DoCallEntry.insn() => {
-            handle_do_call_entry_probe(ctx);
-            ctx.x[12] = crate::banked::sp_for_mode(ctx, spsr_und as u32) as u64;
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -2874,142 +2811,6 @@ fn handle_unhandled_exception(ctx: &TrapContext, non_user: bool) -> ! {
     });
 }
 
-/// FPE-entry probe: patched at `0x0038_D918` over `mov ip, sp`. Counts
-/// FPE entries; on the call that's expected to wedge on the
-/// IP-corruption trap (entry index 2 = forward #2 = mvfs in
-/// SetSystemVolume), opens the TarmacTrace window via
-/// `crate::tarmac::emit_start()`. The matching `emit_stop()` fires from
-/// the unrecognised-UND halt path. The trace bracketed by these two
-/// markers contains every retired instruction inside the FPE call —
-/// grep for the moment R12 is written with `0x003900c8` to pin the
-/// IP-clobber site.
-///
-/// Then emulates the original `mov ip, sp` by setting
-/// `ctx.x[12] = ctx.x[23]` (= sp_und, since the FPE always runs in
-/// UND mode after iter-84's bypass routes UND naturally to FPE_JT).
-fn handle_fpe_entry_probe(ctx: &mut TrapContext) {
-    use core::sync::atomic::{AtomicU32, Ordering};
-    static FIRED: AtomicU32 = AtomicU32::new(0);
-    let n = FIRED.fetch_add(1, Ordering::Relaxed);
-    let sp_und = ctx.x[23] as u32;
-    if n < 8 {
-        kprintln!("FPE-entry[{}]: sp_und={:#010x}", n, sp_und);
-    }
-    // Emulate `mov ip, sp` (= ctx.x[23] in UND-source mode).
-    ctx.x[12] = (ctx.x[12] & 0xFFFF_FFFF_0000_0000) | (sp_und as u64);
-}
-
-/// Iter-108 splash-chain diagnostic. Patched on the first
-/// instruction (`mov ip, sp`) of `TNotebook::InitToolbox` and
-/// `TNotebook::DrawSplashScreen`. Logs the first hit (PC, source
-/// mode, SP/LR for that mode) so we can tell whether the boot
-/// reaches the splash code path. Emulates `mov ip, sp` for the
-/// source mode and lets natural ERET resume at PC+4.
-///
-/// HVC from AArch32 to EL2 captures the source CPSR in SPSR_EL2;
-/// `crate::banked::sp_for_mode` maps that mode to the right ctx
-/// slot per Table D1-79.
-fn handle_splash_probe(ctx: &mut TrapContext) {
-    let elr = read_sysreg!("elr_el2") as u32;
-    let spsr = read_sysreg!("spsr_el2") as u32;
-    splash_probe_apply(ctx, elr, spsr);
-}
-
-/// USR-mode side of the splash probe. Fires when the patched
-/// site runs in USR mode, where HVC is UNDEFINED and the
-/// trampoline routes the resulting UND through UND_TRAMP +
-/// HVC #UND_TAG. `faulting_pc` is the original ROM PC; `spsr_und`
-/// is the trampoline-saved source CPSR.
-fn handle_splash_probe_und(ctx: &mut TrapContext, faulting_pc: u32, spsr_und: u64) {
-    splash_probe_apply(ctx, faulting_pc, spsr_und as u32);
-}
-
-fn splash_probe_apply(ctx: &mut TrapContext, pc: u32, spsr: u32) {
-    splash_probe_log(ctx, pc, spsr);
-    // Emulate the patched-out instruction. Each probe site
-    // matches one of two shapes:
-    //   `mov ip, sp` — InitToolbox entry, DrawSplashScreen entry
-    //   `mov r0, r4` — InitToolbox after-parent / before-draw
-    let init    = crate::rom_patches::SPLASH_PROBE_INIT_TOOLBOX_PC;
-    let draw    = crate::rom_patches::SPLASH_PROBE_DRAW_SPLASH_PC;
-    let isg     = crate::rom_patches::SPLASH_PROBE_ISG_ENTRY_PC;
-    let inker   = crate::rom_patches::SPLASH_PROBE_AFTER_INKER_PC;
-    let aftclon = crate::rom_patches::SPLASH_PROBE_AFTER_CLONE_PC;
-    if pc == init || pc == draw || pc == isg {
-        // mov ip, sp — ip = SP of source mode.
-        let sp = crate::banked::sp_for_mode(ctx, spsr);
-        ctx.x[12] = (ctx.x[12] & 0xFFFF_FFFF_0000_0000) | (sp as u64);
-    } else if pc == inker {
-        // ldr r0, [pc, #48] — pc-relative literal load. Original
-        // ROM at PC+8+48 = 0x146B90 holds RSSYMscreenorientation
-        // = 0x00684480. The classifier marks the literal slot as
-        // data, so the runtime guest LDR with CPSR.E=1 returns
-        // the BE-natural numerical value. Replay that here.
-        let lit_pa = pc.wrapping_add(8).wrapping_add(48);
-        let v = crate::guest_endian::guest_read_u32_pa(lit_pa).unwrap_or(0);
-        ctx.x[0] = (ctx.x[0] & 0xFFFF_FFFF_0000_0000) | (v as u64);
-    } else if pc == aftclon {
-        // ldr r4, [pc, #560] — pc-rel literal load into r4.
-        // Target = pc + 8 + 560 = 0x1F1A80 holds &gVarFrame.
-        let lit_pa = pc.wrapping_add(8).wrapping_add(560);
-        let v = crate::guest_endian::guest_read_u32_pa(lit_pa).unwrap_or(0);
-        ctx.x[4] = (ctx.x[4] & 0xFFFF_FFFF_0000_0000) | (v as u64);
-    } else {
-        // mov r0, r4 — r0 = ctx.x[4] (R0..R12 are not banked
-        // outside FIQ; ctx.x[4] is the source-mode R4 because
-        // HVC entry preserves R0..R12 of the active mode).
-        ctx.x[0] = (ctx.x[0] & 0xFFFF_FFFF_0000_0000) | (ctx.x[4] & 0xFFFF_FFFF);
-    }
-}
-
-fn splash_probe_log(ctx: &TrapContext, pc: u32, spsr: u32) {
-    use core::sync::atomic::{AtomicU32, Ordering};
-    static FIRED_INIT: AtomicU32 = AtomicU32::new(0);
-    static FIRED_AFTER_PARENT: AtomicU32 = AtomicU32::new(0);
-    static FIRED_AFTER_VT: AtomicU32 = AtomicU32::new(0);
-    static FIRED_AFTER_INKER: AtomicU32 = AtomicU32::new(0);
-    static FIRED_ISG: AtomicU32 = AtomicU32::new(0);
-    static FIRED_AFTER_CLONE: AtomicU32 = AtomicU32::new(0);
-    static FIRED_BEFORE_DRAW: AtomicU32 = AtomicU32::new(0);
-    static FIRED_SPLASH: AtomicU32 = AtomicU32::new(0);
-    let mode = spsr & 0x1F;
-    let sp = crate::banked::sp_for_mode(ctx, spsr);
-    let lr = crate::banked::lr_for_mode(ctx, spsr);
-    let init   = crate::rom_patches::SPLASH_PROBE_INIT_TOOLBOX_PC;
-    let after  = crate::rom_patches::SPLASH_PROBE_AFTER_PARENT_PC;
-    let aftvt  = crate::rom_patches::SPLASH_PROBE_AFTER_VT_PC;
-    let aftin  = crate::rom_patches::SPLASH_PROBE_AFTER_INKER_PC;
-    let isg    = crate::rom_patches::SPLASH_PROBE_ISG_ENTRY_PC;
-    let before = crate::rom_patches::SPLASH_PROBE_BEFORE_DRAW_PC;
-    let draw   = crate::rom_patches::SPLASH_PROBE_DRAW_SPLASH_PC;
-    let (label, counter) = if pc == init {
-        ("InitToolbox-entry", &FIRED_INIT)
-    } else if pc == after {
-        ("after-parent",      &FIRED_AFTER_PARENT)
-    } else if pc == aftvt {
-        ("after-vt+ISG",      &FIRED_AFTER_VT)
-    } else if pc == aftin {
-        ("after-Inker",       &FIRED_AFTER_INKER)
-    } else if pc == isg {
-        ("ISG-entry",         &FIRED_ISG)
-    } else if pc == crate::rom_patches::SPLASH_PROBE_AFTER_CLONE_PC {
-        ("ISG-after-Clone",   &FIRED_AFTER_CLONE)
-    } else if pc == before {
-        ("before-DrawSplash", &FIRED_BEFORE_DRAW)
-    } else if pc == draw {
-        ("DrawSplash-entry",  &FIRED_SPLASH)
-    } else {
-        ("unknown",           &FIRED_INIT) // shouldn't happen
-    };
-    let n = counter.fetch_add(1, Ordering::Relaxed);
-    if n < 4 {
-        kprintln!(
-            "splash-probe[{}={}]: PC={:#x} spsr={:#010x} mode={:#x} ({}) SP_mode={:#010x} LR_mode={:#010x}",
-            label, n, pc, spsr, mode, describe_aarch32_mode(mode), sp, lr,
-        );
-    }
-}
-
 /// Which `PHammerOutTranslator` body patch fired.
 #[derive(Clone, Copy)]
 enum ThunkKind {
@@ -3158,210 +2959,6 @@ fn handle_dah_mrs_spsr_patch(ctx: &mut TrapContext) {
     }
 }
 
-/// Handler for the patched `cmp r0, #0` at DAH PC `0x393984`,
-/// immediately after `bl FaultMonitorEntry`. Logs `r0` (FaultMonitorEntry's
-/// return value) plus the FAR (so we can correlate against the
-/// dabt-forward log), then emulates the original `cmp r0, #0` by
-/// updating SPSR_EL2's NZCV bits so the kernel's subsequent `beq
-/// 0x393a30` at `0x393988` branches as if the cmp had run.
-///
-/// Useful for the layer-γ investigation: Einstein's abort #16 at
-/// FAR=0x0CD07400 recovers (FaultMonitorEntry returns 0); ours doesn't
-/// (returns non-zero). This probe pins the divergent return value
-/// directly.
-fn handle_dah_fme_ret_probe(_ctx: &mut TrapContext) {
-    // r0 is in ctx.x[0] for AArch32 from EL2's view.
-    let r0 = _ctx.x[0] as u32;
-    let far = read_sysreg!("far_el1") as u32;
-    static FIRED: core::sync::atomic::AtomicU32 =
-        core::sync::atomic::AtomicU32::new(0);
-    let n = FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    // Log first 24 successes, AND every failure (so we always see the
-    // FAR that triggers a busError / reboot).
-    if n < 24 || r0 != 0 {
-        kprintln!(
-            "DAH-FME-ret[{}]: r0={:#010x} far={:#010x}{}",
-            n, r0, far,
-            if r0 == 0 { "  (success → recovery)" } else { "  (failure → reboot)" },
-        );
-    }
-    // Emulate `cmp r0, #0`:
-    //   N = (r0 >> 31) & 1
-    //   Z = (r0 == 0)
-    //   C = 1  (cmp Rn, #0 = subs scratch, Rn, #0; no borrow → C=1)
-    //   V = 0  (cmp with 0 cannot overflow)
-    let n_bit = ((r0 >> 31) & 1) as u64;
-    let z_bit = if r0 == 0 { 1u64 } else { 0u64 };
-    let c_bit = 1u64;
-    let v_bit = 0u64;
-    let new_nzcv = (n_bit << 31) | (z_bit << 30) | (c_bit << 29) | (v_bit << 28);
-    let mut spsr_el2: u64;
-    // SAFETY: sysreg read/write, no side effects.
-    unsafe {
-        core::arch::asm!("mrs {}, spsr_el2", out(reg) spsr_el2,
-            options(nomem, nostack, preserves_flags));
-    }
-    spsr_el2 = (spsr_el2 & !(0xF << 28)) | new_nzcv;
-    unsafe {
-        core::arch::asm!("msr spsr_el2, {}", in(reg) spsr_el2,
-            options(nostack, preserves_flags));
-        core::arch::asm!("isb", options(nostack, preserves_flags));
-    }
-}
-
-/// Handler for the `HVC #ResolveFaultRet` inserted at the exit of
-/// `apply_resolve_fault_wrapper` (between the FAR-restore `str` and
-/// the final `pop {r4-r11, pc}`). Logs the wrapper's return value
-/// and the TStackInfo* the kernel's `Fault` matcher fed in.
-///
-/// Register layout in the *narrowed-iter-range* wrapper at HVC time:
-///   r0  = wrapper return value
-///   r4  = TStackManager*       r5  = TStackInfo*
-///   r6  = ProcessorState*      r7  = page_base_FAR
-///   r8  = original FAR         r9  = info[+4] = hard (re-loaded post-bl)
-///   r10 = sub_idx (last)       r11 = info[+28] = top
-///
-/// (No "all_failed" flag — the new wrapper propagates any non-zero
-/// return immediately. The earlier 28-word wrapper used r9 for the
-/// flag; that's gone.)
-///
-/// Throttling: log the first 24 calls plus every non-zero return
-/// (i.e., every fast-failed -10203/-10204 or genuine allocator error
-/// that's about to turn into busError). Mirrors the `DahFmeRet`
-/// probe's policy.
-fn handle_resolve_fault_ret_probe(ctx: &mut TrapContext) {
-    use crate::guest_endian::guest_read_u32_va as rd;
-
-    let r0       = ctx.x[0] as u32;
-    let manager  = ctx.x[4] as u32;
-    let info     = ctx.x[5] as u32;
-    let orig_far = ctx.x[8] as u32;
-
-    static FIRED: core::sync::atomic::AtomicU32 =
-        core::sync::atomic::AtomicU32::new(0);
-    let n = FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-
-    // Always log failures (so we never miss a busError-bound case);
-    // sample successes lightly to bound output volume.
-    let log = n < 24 || r0 != 0;
-    if !log {
-        return;
-    }
-
-    // Read TStackInfo bounds, matching dump_tstacks_and_check_invariants:
-    //   info[+4]  = hard lower bound (post-patch: base + 1 KiB)
-    //   info[+20] = norm = base VA
-    //   info[+24] = curr = current commit watermark
-    //   info[+28] = top
-    let (i_hard, i_norm, i_curr, i_top) = if info != 0
-        && info >= 0x0c00_0000 && info < 0x0d00_0000 {
-        (
-            rd(info.wrapping_add(4)).unwrap_or(0),
-            rd(info.wrapping_add(20)).unwrap_or(0),
-            rd(info.wrapping_add(24)).unwrap_or(0),
-            rd(info.wrapping_add(28)).unwrap_or(0),
-        )
-    } else {
-        (0, 0, 0, 0)
-    };
-
-    // Position of FAR within the info range, for quick eyeballing.
-    let pos = if i_norm != 0 && orig_far >= i_norm && orig_far < i_top {
-        "in-range"
-    } else if orig_far == i_top {
-        "AT-TOP"
-    } else if i_top != 0 && orig_far >= i_top {
-        "ABOVE-top"
-    } else if i_norm != 0 && orig_far < i_norm {
-        "BELOW-norm"
-    } else {
-        "??"
-    };
-
-    kprintln!(
-        "RF-wrap[{}]: r0={:#010x}{} FAR={:#010x} mgr={:#010x} info={:#010x}  norm={:#010x} hard={:#010x} curr={:#010x} top={:#010x}  pos={}",
-        n,
-        r0,
-        if (r0 as i32) == -10204 { " (-10204)" }
-        else if (r0 as i32) == -10203 { " (-10203)" }
-        else if r0 == 0 { " (success)" }
-        else { "" },
-        orig_far, manager, info,
-        i_norm, i_hard, i_curr, i_top,
-        pos,
-    );
-}
-
-/// Handler for the `HVC` patched over the first instruction of
-/// `TStackManager::ResolveFault` at ROM 0x001F_7978 (the original
-/// `mov ip, sp`). Logs the FAR and the stackInfo's bounds so we can
-/// observe whether `fLowerBounds` (info[+24]) is being moved
-/// downward between calls — i.e., whether some path in the kernel
-/// dynamically extends the stack before reaching this bounds check.
-///
-/// At the call site, R0 = `this` (TStackManager*), R1 = stackInfo
-/// (TStackInfo*). The function args are still in R0/R1; the
-/// prologue's `mov r4, r0; mov r5, r1` hasn't run yet.
-///
-/// Throttling: tracks per-info `(fLowerBounds, fUpperBounds)` and
-/// emits on (a) first sight, (b) bounds change, (c) every Nth call,
-/// or (d) cases where FAR is outside the current bounds (the cases
-/// that would return -10203/-10204).
-fn handle_resolve_fault_entry_probe(ctx: &mut TrapContext) {
-    use crate::guest_endian::guest_read_u32_va as rd;
-    use core::sync::atomic::{AtomicU32, Ordering};
-
-    let manager = ctx.x[0] as u32;
-    let info    = ctx.x[1] as u32;
-
-    // FAR: TStackManager+64 = fFaultState; *(fFaultState)+68 = saved FAR.
-    let fault_state = rd(manager.wrapping_add(64)).unwrap_or(0);
-    let far = if fault_state != 0 {
-        rd(fault_state.wrapping_add(68)).unwrap_or(0)
-    } else { 0 };
-
-    let i_norm  = rd(info.wrapping_add(20)).unwrap_or(0);
-    let i_hard  = rd(info.wrapping_add(4)).unwrap_or(0);
-    let i_lower = rd(info.wrapping_add(24)).unwrap_or(0);
-    let i_upper = rd(info.wrapping_add(28)).unwrap_or(0);
-    let i_owner = rd(info.wrapping_add(12)).unwrap_or(0);
-
-    static FIRED: AtomicU32 = AtomicU32::new(0);
-    let n = FIRED.fetch_add(1, Ordering::Relaxed);
-
-    // Track the most-recent (info, fLowerBounds, fUpperBounds) so we
-    // can flag changes. Single-slot cache — if multiple infos cycle
-    // through, we just emit more.
-    static LAST_INFO:  AtomicU32 = AtomicU32::new(0);
-    static LAST_LOWER: AtomicU32 = AtomicU32::new(0);
-    static LAST_UPPER: AtomicU32 = AtomicU32::new(0);
-    let prev_info  = LAST_INFO.load(Ordering::Relaxed);
-    let prev_lower = LAST_LOWER.load(Ordering::Relaxed);
-    let prev_upper = LAST_UPPER.load(Ordering::Relaxed);
-    let bounds_changed = prev_info == info
-        && (prev_lower != i_lower || prev_upper != i_upper);
-    let new_info = prev_info != info;
-    LAST_INFO.store(info, Ordering::Relaxed);
-    LAST_LOWER.store(i_lower, Ordering::Relaxed);
-    LAST_UPPER.store(i_upper, Ordering::Relaxed);
-
-    let oob = far < i_lower || far >= i_upper;
-    let log = n < 32 || bounds_changed || oob || (n & 0xFF) == 0;
-    if !log { return; }
-
-    let tag = if bounds_changed { " ***BOUNDS-MOVED***" }
-        else if oob { " ***OOB***" }
-        else if new_info { " (new-info)" }
-        else { "" };
-
-    kprintln!(
-        "RF-entry[{}]: FAR={:#010x} info={:#010x} owner={:#010x}  norm={:#010x} hard(+4)={:#010x} lower(+24)={:#010x} upper(+28)={:#010x}{}",
-        n, far, info, i_owner,
-        i_norm, i_hard, i_lower, i_upper,
-        tag,
-    );
-}
-
 /// Probe handler for `StorePermObject` entry. R0 is a `RefArg`
 /// (`typedef const RefVar& RefArg`) so it's a pointer to a
 /// `RefVar`. RefVar is GC-tracked: its first field is a slot
@@ -3375,6 +2972,7 @@ fn handle_resolve_fault_entry_probe(ctx: &mut TrapContext) {
 /// Caller is expected to emulate the patched-out `mov ip, sp` in
 /// the surrounding dispatch arm (HVC- or UND-path) and advance
 /// ELR; this handler only logs.
+#[cfg(feature = "log_store")]
 fn handle_store_perm_obj_entry_probe(ctx: &mut TrapContext) {
     use core::sync::atomic::{AtomicU32, Ordering};
     let refvar_ptr = ctx.x[0] as u32;
@@ -3401,6 +2999,7 @@ fn handle_store_perm_obj_entry_probe(ctx: &mut TrapContext) {
 /// the flash store with what `StorePermObject` had put in.
 ///
 /// Caller is expected to emulate `r0 = r4` and advance ELR.
+#[cfg(feature = "log_store")]
 fn handle_load_perm_obj_ret_probe(ctx: &mut TrapContext) {
     use core::sync::atomic::{AtomicU32, Ordering};
     let ref_value = ctx.x[4] as u32;
@@ -3412,262 +3011,151 @@ fn handle_load_perm_obj_ret_probe(ctx: &mut TrapContext) {
     kprintln!("  lr={:#x}", lr);
 }
 
-/// Probe handler for `DoCall(RefVar const& fn, long numArgs)` entry.
-/// R0 is a pointer to a `RefVar`; deref once to get the function Ref
-/// being invoked. Print the Ref + source-mode SP + caller LR so a
-/// recursion-runaway shows up as repeated lines with monotonically
-/// decreasing SP.
+/// DABT-fast-trampoline fall-through. The trampoline at
+/// `DABT_TRAMP_OFFSET` runs in ABT mode after a data abort; on
+/// `DFSR.status != 1` (i.e. anything but alignment) it falls through
+/// to `HVC #DabtDispatch` and lands here. Three outcomes:
 ///
-/// Caller is expected to emulate `mov ip, sp` and advance ELR.
-fn handle_do_call_entry_probe(ctx: &mut TrapContext) {
-    use core::sync::atomic::{AtomicU32, Ordering};
-    let refvar_ptr = ctx.x[0] as u32;
-    let slot_ptr =
-        crate::guest_endian::guest_read_u32_va(refvar_ptr).unwrap_or(0);
-    let ref_value = if slot_ptr != 0 {
-        crate::guest_endian::guest_read_u32_va(slot_ptr).unwrap_or(0)
-    } else {
-        0
-    };
-    let num_args = ctx.x[1] as u32;
-    let lr = ctx.x[14] as u32;
-    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
-    let sp_src = crate::banked::sp_for_mode(ctx, spsr_el2);
-    static FIRED: AtomicU32 = AtomicU32::new(0);
-    let n = FIRED.fetch_add(1, Ordering::Relaxed);
-    kprintln!(
-        "DoCall[{}]: fn_ref={:#010x} nargs={} sp={:#010x} lr={:#x}",
-        n, ref_value, num_args, sp_src, lr,
-    );
-}
+///   * `DFSC=0x01` — alignment. The trampoline's BEQ should have
+///     caught this and routed to `HVC #Align`, but the legacy
+///     `mrc p15,0,Rt,c5,c0,0` has been observed to miss in at least
+///     one site (DrText LDR-rotate at `0x0035c554`). Cross-check
+///     ESR_EL1 here and dispatch to `handle_align_fault`
+///     unconditionally instead of halting on a known-handleable
+///     fault.
+///   * Forwardable DFSC (translation / permission / access-flag,
+///     codes 0x03 / 0x05 / 0x06 / 0x07 / 0x0D / 0x0F) — forward to
+///     the kernel's `DataAbortHandler` at VA `0x0039_3114` (the
+///     original target of the ROM's VA 0x10 branch before our DABT
+///     trampoline insertion). Lets the kernel handle routine faults
+///     like stack-collision growth without the hypervisor needing
+///     to model on-demand paging.
+///   * Anything else — delegate to `handle_diag` for the diagnostic
+///     halt + register dump.
+///
+/// For the forwardable case:
+///   * R0/R1 were clobbered by the trampoline (which stashed them
+///     in TPIDRURW / TPIDRRO and then loaded DFSR / SPSR_abt into
+///     them). Restore from those scratch slots so the kernel's
+///     handler sees the pre-abort register state. LR_abt / SP_abt /
+///     SPSR_abt are already in their post-DABT-entry values (the
+///     trampoline reads them but does not modify them).
+///   * ARMv7 leaves DFSR.Domain UNK for DFSC=5 (translation,
+///     section) — see ARMv7 ARM B4.1.51. The 717006 kernel was
+///     written for StrongARM, where the equivalent register (CP15
+///     c5,c5,0) always carried the L1 entry's domain regardless of
+///     fault status. Our hypervisor rewrites the kernel's
+///     `mrc c5,c5,0` to `mrc c5,c0,0` (= DFSR_EL1) at ROM-load time
+///     (see `guest_mem::patch_cp15_encodings`), so the kernel's
+///     later DAH read picks up whatever ARMv7 hardware put in
+///     DFSR.Domain — which is 0 for DFSC=5. The kernel then
+///     computes domain := 0 and asks
+///     `GetDomainAndFaultMonitorFromDomainNumber(0)`, which has no
+///     monitor → returns `scratch[0]=0` → `FaultMonitorEntry(r0=0)`
+///     → -10015 → reboot. Empirical wedge: qemu13.log fault #2
+///     shows `task[+0x58]=0x05` (DFSR=0x05, domain=0) where every
+///     other recovered abort had `task[+0x58]=0x47` (DFSR=0x47,
+///     domain=4). Fix: synthesise the StrongARM-style domain field
+///     by reading the L1 entry for the FAR's section and writing
+///     its bits[8:5] into DFSR_EL1.bits[7:4]. Idempotent for
+///     valid-domain DFSCs (the bits already match).
+fn handle_dabt_dispatch(ctx: &mut TrapContext) {
+    let far = read_sysreg!("far_el1");
+    let esr_el1 = read_sysreg!("esr_el1");
+    let dfsc = (esr_el1 & 0x3F) as u32;
 
-/// Handler for the patched `mov ip, sp` at FaultMonitorEntry static
-/// entry PC `0x0011FC60`. Logs r0 (input fault mask), the FAR, and
-/// emulates the original `mov ip, sp` (writes ctx.x[12] = current SP
-/// for the source AArch32 mode). Also reads `curr_task[+0x64]` (which
-/// was set just before this call to scratch[4] from
-/// GetDomainAndFaultMonitorFromDomainNumber) to test whether the
-/// return value difference is in scratch[0] only or both scratch[0]
-/// and scratch[4].
-fn handle_fme_entry_probe(ctx: &mut TrapContext) {
-    let r0 = ctx.x[0] as u32;
-    let far = read_sysreg!("far_el1") as u32;
-    let spsr_el2 = read_sysreg!("spsr_el2") as u32;
-    let src_mode = spsr_el2 & 0x1F;
-    let sp_src = crate::banked::sp_for_mode(ctx, spsr_el2);
-    let curr_task = crate::guest_endian::guest_read_u32_va(
-        crate::rom_patches::G_CURRENT_TASK_VA,
-    ).unwrap_or(0);
-    let task_64 = if curr_task != 0 {
-        crate::guest_endian::guest_read_u32_va(curr_task.wrapping_add(0x64)).unwrap_or(0)
-    } else { 0 };
-    let task_70 = if curr_task != 0 {
-        crate::guest_endian::guest_read_u32_va(curr_task.wrapping_add(0x70)).unwrap_or(0)
-    } else { 0 };
-    let task_58 = if curr_task != 0 {
-        crate::guest_endian::guest_read_u32_va(curr_task.wrapping_add(0x58)).unwrap_or(0)
-    } else { 0 };
-    static FIRED: core::sync::atomic::AtomicU32 =
-        core::sync::atomic::AtomicU32::new(0);
-    let n = FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    // Log first 24 entries AND log a sample every 100k entries afterward —
-    // useful to see the FAR distribution late in boot when FME is still
-    // firing but the early-cap has run out.
-    if n < 24 || n % 100_000 == 0 {
-        crate::log_traps!(
-            "FME-entry[{}]: r0(mask)={:#010x} far={:#010x} src_mode={:#x} sp={:#010x} task[+0x70]={:#010x} task[+0x64]={:#010x} task[+0x58]={:#010x}",
-            n, r0, far, src_mode, sp_src, task_70, task_64, task_58,
+    if dfsc == 0x01 {
+        crate::unaligned::handle_align_fault(ctx);
+        return;
+    }
+    let forwardable = matches!(dfsc, 0x03 | 0x05 | 0x06 | 0x07 | 0x0D | 0x0F);
+    if !forwardable {
+        handle_diag(ctx);
+        return;
+    }
+
+    if dfsc == 0x05 || dfsc == 0x07 || dfsc == 0x0D || dfsc == 0x0F {
+        let l1_pa = 0x0400_0000u32 + ((far as u32) >> 20) * 4;
+        let l1 = crate::guest_endian::guest_read_u32_pa(l1_pa).unwrap_or(0);
+        let l1_domain = (l1 >> 5) & 0xF;
+        let mut dfsr_el1: u64;
+        // SAFETY: sysreg read of DFSR_EL1 (= ESR_EL1's AArch32 alias
+        // for data aborts when EL1 is AArch32). On Cortex-A53 in our
+        // config, DFSR_EL1 == ESR_EL1 for AArch32 EL1 abort entries,
+        // so update both via ESR_EL1.
+        unsafe {
+            core::arch::asm!("mrs {}, esr_el1", out(reg) dfsr_el1,
+                options(nomem, nostack, preserves_flags));
+        }
+        dfsr_el1 = (dfsr_el1 & !(0xF << 4)) | ((l1_domain as u64) << 4);
+        unsafe {
+            core::arch::asm!("msr esr_el1, {}", in(reg) dfsr_el1,
+                options(nostack, preserves_flags));
+            core::arch::asm!("isb", options(nostack, preserves_flags));
+        }
+    }
+    let spsr_el2 = read_sysreg!("spsr_el2");
+    let hvc_src_mode = (spsr_el2 as u32) & 0x1F;
+    log_dabt_forward(dfsc, far as u32, hvc_src_mode, ctx);
+    // One-shot diagnostic: when the recursive-abort "newt" DABT
+    // fires (FAR=0x6e657774, mode=ABT), dump the SWIBoot save area
+    // of every cdsv-named task before forwarding to the kernel
+    // handler — the kernel's own response is to reboot, so this is
+    // our only chance to see the corrupt slot.
+    if far as u32 == 0x6e65_7774 {
+        static FIRED: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        if !FIRED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            kprintln!("=== one-shot newt-DABT diagnostic: cdsv save areas ===");
+            crate::task_dump::dump_save_area_for_named(b"cdsv");
+            kprintln!("=== one-shot newt-DABT diagnostic: full kernel dump ===");
+            crate::task_dump::dump_full();
+            kprintln!("=== end one-shot newt-DABT diagnostic ===");
+        }
+    }
+    let saved_r0: u64;
+    let saved_r1: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {}, tpidr_el0",
+            out(reg) saved_r0,
+            options(nomem, nostack, preserves_flags),
+        );
+        core::arch::asm!(
+            "mrs {}, tpidrro_el0",
+            out(reg) saved_r1,
+            options(nomem, nostack, preserves_flags),
         );
     }
-    // Emulate `mov ip, sp`: ctx.x[12] = banked SP for source mode.
-    ctx.x[12] = (ctx.x[12] & 0xFFFF_FFFF_0000_0000) | (sp_src as u64);
-}
-
-/// Handler for the patched `ldr r1, [pc, #1588]` at DAH PC `0x393318`
-/// (just before the OR-chain that builds the fault mask). Logs the
-/// curr_task pointer + its `[+0x74/+0x78/+0x7c]` TUDomainManager chain
-/// + each monitor's `[+0x10]`, then emulates the original ldr by
-/// writing the literal `0x0C100FF8` (the address of `gCurrentTask`)
-/// into `ctx.x[1]`. ERET resumes at `0x39331c` (kernel's
-/// `ldr r1, [r1]`).
-fn handle_dah_or_chain_probe(ctx: &mut TrapContext) {
-    let far = read_sysreg!("far_el1") as u32;
-    let g_current_task_va = crate::rom_patches::G_CURRENT_TASK_VA;
-    let curr_task = crate::guest_endian::guest_read_u32_va(g_current_task_va).unwrap_or(0);
-    let m74 = if curr_task != 0 {
-        crate::guest_endian::guest_read_u32_va(curr_task.wrapping_add(0x74)).unwrap_or(0)
-    } else { 0 };
-    let m78 = if curr_task != 0 {
-        crate::guest_endian::guest_read_u32_va(curr_task.wrapping_add(0x78)).unwrap_or(0)
-    } else { 0 };
-    let m7c = if curr_task != 0 {
-        crate::guest_endian::guest_read_u32_va(curr_task.wrapping_add(0x7c)).unwrap_or(0)
-    } else { 0 };
-    let m74_10 = if m74 != 0 {
-        crate::guest_endian::guest_read_u32_va(m74.wrapping_add(0x10)).unwrap_or(0)
-    } else { 0 };
-    let m78_10 = if m78 != 0 {
-        crate::guest_endian::guest_read_u32_va(m78.wrapping_add(0x10)).unwrap_or(0)
-    } else { 0 };
-    let m7c_10 = if m7c != 0 {
-        crate::guest_endian::guest_read_u32_va(m7c.wrapping_add(0x10)).unwrap_or(0)
-    } else { 0 };
-    static FIRED: core::sync::atomic::AtomicU32 =
-        core::sync::atomic::AtomicU32::new(0);
-    let n = FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if n < 24 {
-        crate::log_traps!(
-            "DAH-OR[{}]: far={:#010x} curr_task={:#010x} m74={:#010x}->{:#010x} m78={:#010x}->{:#010x} m7c={:#010x}->{:#010x}",
-            n, far, curr_task, m74, m74_10, m78, m78_10, m7c, m7c_10,
+    ctx.x[0] = saved_r0;
+    ctx.x[1] = saved_r1;
+    const DATA_ABORT_HANDLER_VA: u32 = 0x0039_3114;
+    unsafe {
+        core::arch::asm!(
+            "msr elr_el2, {elr}",
+            "isb",
+            elr = in(reg) DATA_ABORT_HANDLER_VA as u64,
+            options(nostack, preserves_flags),
         );
     }
-    // Emulate `ldr r1, [pc, #1588]`: r1 = literal at (pc + 8 + 1588) =
-    // 0x393954 = 0x0C100FF8 (the address of `gCurrentTask`). Write low
-    // 32 bits of ctx.x[1].
-    ctx.x[1] = (ctx.x[1] & 0xFFFF_FFFF_0000_0000) | (g_current_task_va as u64);
 }
 
-
+/// Diagnostic halt + register dump. Reached two ways:
+///   1. The PABT vector slot (VA 0x0C) — patched to `HVC #Diag`
+///      because the stock ROM's branch target is a missing REx
+///      address. Any prefetch abort halts the host cleanly with a
+///      full banked-register dump and stage-1 walk.
+///   2. As the fallthrough from `handle_dabt_dispatch` for DABTs
+///      with a non-forwardable DFSC.
+///
+/// Also available as an ad-hoc debugging facility: hand-patch
+/// `HVC #Diag` into any guest code site to get a halt-with-dump
+/// there.
 fn handle_diag(ctx: &mut TrapContext) {
     let far = read_sysreg!("far_el1");
     let spsr_el2 = read_sysreg!("spsr_el2");
     let elr_el2 = read_sysreg!("elr_el2");
-
-    // Fast path: DABT-vector trampoline → kernel DataAbortHandler.
-    // For DABTs whose DFSC matches a translation / permission / access-flag
-    // fault, forward to the kernel's DataAbortHandler at VA 0x0039_3114
-    // (the original target of the ROM's VA 0x10 branch before we patched
-    // it with our diagnostic trampoline). Lets the kernel handle routine
-    // faults like stack-collision growth (USR `STMFD sp!, {…}` prologue
-    // crossing into an unmapped page → TStackManager::CopyPagesAfterStack-
-    // Collided) without the hypervisor needing to model on-demand paging.
-    //
-    // Alignment faults (DFSC=0x01) take a separate HVC #ALIGN_TAG path
-    // in the DABT trampoline and never reach here. Source-mode UND (the
-    // guest_bp BP path) and PABT-source (the PABT-vector intercept at
-    // VA 0x0C) fall through to the loud halt below — that's the Phase-B
-    // trip-wire behaviour we need for those classes.
-    //
-    // DFSC values (short-descriptor, ARMv7 DFSR.FS[3:0]):
-    //   0x05 = translation, section (L1 entry fault)
-    //   0x07 = translation, page    (L2 entry fault)
-    //   0x0D = permission, section
-    //   0x0F = permission, page
-    //   0x03 = access flag, section
-    //   0x06 = access flag, page
-    //
-    // R0 and R1 were clobbered by the DABT trampoline (which stashed
-    // them in TPIDRURW / TPIDRRO and then loaded DFSR / SPSR_abt into
-    // them); restore from those scratch slots so the kernel's handler
-    // sees the pre-abort register state. Other regs and banked
-    // LR_abt / SP_abt / SPSR_abt are already in their post-DABT-entry
-    // values (the trampoline reads them but does not modify them).
     let hvc_src_mode = (spsr_el2 as u32) & 0x1F;
-    if hvc_src_mode == crate::banked::MODE_ABT {
-        let esr_el1 = read_sysreg!("esr_el1");
-        let dfsc = (esr_el1 & 0x3F) as u32;
-        // Iter-54: DFSC=0x01 is alignment fault. The DABT trampoline's
-        // legacy `mrc p15,0,Rt,c5,c0,0` ought to route alignment faults
-        // to ALIGN_TAG via the BEQ — but in practice we've seen at least
-        // one site (the LDR-with-imm-offset rotate idiom in DrText at
-        // 0x0035c554) where the trampoline still falls through to
-        // DIAG_TAG. Cross-check ESR_EL1 here and dispatch to the
-        // alignment emulator unconditionally, instead of dumping and
-        // halting on a fault the hypervisor already knows how to handle.
-        if dfsc == 0x01 {
-            crate::unaligned::handle_align_fault(ctx);
-            return;
-        }
-        let forwardable = matches!(dfsc, 0x03 | 0x05 | 0x06 | 0x07 | 0x0D | 0x0F);
-        if forwardable {
-            // ARMv7 leaves DFSR.Domain UNK for DFSC=5 (translation,
-            // section) — see ARMv7 ARM B4.1.51. The 717006 kernel was
-            // written for StrongARM, where the equivalent register
-            // (CP15 c5,c5,0) always carried the L1 entry's domain
-            // regardless of fault status. Our hypervisor rewrites
-            // the kernel's `mrc c5,c5,0` to `mrc c5,c0,0` (= DFSR_EL1)
-            // at ROM-load time (see guest_mem::patch_cp15_encodings),
-            // so the kernel's later DAH read picks up whatever ARMv7
-            // hardware put in DFSR.Domain — which is 0 for DFSC=5.
-            // The kernel then computes domain := 0 and asks
-            // `GetDomainAndFaultMonitorFromDomainNumber(0)`, which has
-            // no monitor → returns scratch[0]=0 →
-            // `FaultMonitorEntry(r0=0)` → -10015 → reboot.
-            // Empirical wedge: qemu13.log fault #2 shows
-            // task[+0x58]=0x05 (DFSR=0x05, domain=0) where every other
-            // recovered abort had task[+0x58]=0x47 (DFSR=0x47,
-            // domain=4).
-            //
-            // Fix: synthesise the StrongARM-style domain field by
-            // reading the L1 entry for the FAR's section and writing
-            // its bits[8:5] into DFSR_EL1.bits[7:4]. Idempotent for
-            // valid-domain DFSCs (the bits already match).
-            if dfsc == 0x05 || dfsc == 0x07 || dfsc == 0x0D || dfsc == 0x0F {
-                let l1_pa = 0x0400_0000u32 + ((far as u32) >> 20) * 4;
-                let l1 = crate::guest_endian::guest_read_u32_pa(l1_pa).unwrap_or(0);
-                let l1_domain = (l1 >> 5) & 0xF;
-                let mut dfsr_el1: u64;
-                // SAFETY: sysreg read of DFSR_EL1 (= ESR_EL1's AArch32
-                // alias for data aborts when EL1 is AArch32). On
-                // Cortex-A53 in our config, DFSR_EL1 == ESR_EL1 for
-                // AArch32 EL1 abort entries, so update both via
-                // ESR_EL1.
-                unsafe {
-                    core::arch::asm!("mrs {}, esr_el1", out(reg) dfsr_el1,
-                        options(nomem, nostack, preserves_flags));
-                }
-                dfsr_el1 = (dfsr_el1 & !(0xF << 4)) | ((l1_domain as u64) << 4);
-                unsafe {
-                    core::arch::asm!("msr esr_el1, {}", in(reg) dfsr_el1,
-                        options(nostack, preserves_flags));
-                    core::arch::asm!("isb", options(nostack, preserves_flags));
-                }
-            }
-            log_dabt_forward(dfsc, far as u32, hvc_src_mode, ctx);
-            // One-shot diagnostic: when the recursive-abort "newt" DABT
-            // fires (FAR=0x6e657774, mode=ABT), dump the SWIBoot save
-            // area of every cdsv-named task before forwarding to the
-            // kernel handler — the kernel's own response is to reboot,
-            // so this is our only chance to see the corrupt slot.
-            if far as u32 == 0x6e65_7774 {
-                static FIRED: core::sync::atomic::AtomicBool =
-                    core::sync::atomic::AtomicBool::new(false);
-                if !FIRED.swap(true, core::sync::atomic::Ordering::Relaxed) {
-                    kprintln!("=== one-shot newt-DABT diagnostic: cdsv save areas ===");
-                    crate::task_dump::dump_save_area_for_named(b"cdsv");
-                    kprintln!("=== one-shot newt-DABT diagnostic: full kernel dump ===");
-                    crate::task_dump::dump_full();
-                    kprintln!("=== end one-shot newt-DABT diagnostic ===");
-                }
-            }
-            let saved_r0: u64;
-            let saved_r1: u64;
-            unsafe {
-                core::arch::asm!(
-                    "mrs {}, tpidr_el0",
-                    out(reg) saved_r0,
-                    options(nomem, nostack, preserves_flags),
-                );
-                core::arch::asm!(
-                    "mrs {}, tpidrro_el0",
-                    out(reg) saved_r1,
-                    options(nomem, nostack, preserves_flags),
-                );
-            }
-            ctx.x[0] = saved_r0;
-            ctx.x[1] = saved_r1;
-            const DATA_ABORT_HANDLER_VA: u32 = 0x0039_3114;
-            unsafe {
-                core::arch::asm!(
-                    "msr elr_el2, {elr}",
-                    "isb",
-                    elr = in(reg) DATA_ABORT_HANDLER_VA as u64,
-                    options(nostack, preserves_flags),
-                );
-            }
-            return;
-        }
-    }
 
     // Banked SPSRs are AArch64-named sysregs (FVP and QEMU both honour
     // them). For SPSR_svc, the architecturally-mapped AArch64 view is
@@ -3679,12 +3167,10 @@ fn handle_diag(ctx: &mut TrapContext) {
     let spsr_irq = read_banked_spsr("irq");
     let spsr_fiq = read_banked_spsr("fiq");
 
-    // HVC-source mode: whichever AArch32 mode was active when HVC fired
-    // (ABT for the PABT-vector intercept, UND for guest_bp). The
-    // "pre-abort" / "pre-fault" mode is named by the matching banked
-    // SPSR (SPSR_abt for ABT-source, SPSR_und for UND-source).
-    // (`hvc_src_mode` was already computed above for the fast-path
-    // gate; reused here for the diagnostic dump.)
+    // HVC-source mode: whichever AArch32 mode was active when HVC
+    // fired (typically ABT for the PABT-vector intercept and the
+    // DABT-dispatch fallthrough). The "pre-abort" / "pre-fault" mode
+    // is named by the matching banked SPSR (SPSR_abt for ABT-source).
     let mode_name = describe_aarch32_mode(hvc_src_mode);
 
     kprintln!();
@@ -3766,9 +3252,10 @@ fn handle_diag(ctx: &mut TrapContext) {
     }
 
     // Pick the source mode's LR/SP. For HVC-from-ABT (the PABT-vector
-    // intercept), the pre-abort mode is named by SPSR_abt and the
-    // banked LR/SP for that mode comes from its X-register slot.
-    // For HVC-from-UND (guest_bp), use SPSR_und.
+    // intercept and the DABT-dispatch fallthrough), the pre-abort mode
+    // is named by SPSR_abt and the banked LR/SP for that mode comes
+    // from its X-register slot. Hand-patched diagnostic sites in other
+    // modes use the matching SPSR.
     let (spsr_src, lr_src) = match hvc_src_mode {
         crate::banked::MODE_UND => (spsr_und as u32, lr_und),
         crate::banked::MODE_ABT => (spsr_abt as u32, lr_abt),
@@ -3779,9 +3266,13 @@ fn handle_diag(ctx: &mut TrapContext) {
     let pre_sp = crate::banked::sp_for_mode(ctx, spsr_src);
     let thumb = (spsr_src & (1 << 5)) != 0;
     // Faulting PC adjustment: ARM DABT = LR-8, ARM PABT = LR-4,
-    // Thumb DABT = LR-4, Thumb PABT = LR-2. The DIAG path only fires
-    // from PABT today (line 801 of guest_mem.rs patches PABT vector),
-    // so use the PABT formula (LR-4 ARM, LR-2 Thumb).
+    // Thumb DABT = LR-4, Thumb PABT = LR-2. Assume PABT-source — true
+    // for the PABT vector intercept (patched in
+    // `guest_mem::patch_dabt_vector`) and for hand-patched diagnostic
+    // sites. When `handle_dabt_dispatch` delegates here for a non-
+    // forwardable DABT the formula underestimates the faulting PC by
+    // 4 bytes (ARM) or 2 bytes (Thumb); the FAR / ESR / banked
+    // register dump still pins the fault location.
     let faulting_pc = if thumb { lr_src.wrapping_sub(2) & !1 } else { lr_src.wrapping_sub(4) };
     let insn = crate::guest_endian::guest_read_u32_pa(faulting_pc & !3).unwrap_or(0xDEAD_BEEF);
     kprintln!(

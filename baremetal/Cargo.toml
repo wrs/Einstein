@@ -35,7 +35,7 @@ path = "src/usb_probe.rs"
 required-features = ["platform-raspi3b", "usb-probe"]
 
 [features]
-default = ["platform-raspi3b", "log_mmu", "log_traps", "log_tasks", "log_irqs", "log_unaligned"]
+default = ["platform-raspi3b", "log_mmu", "log_traps", "log_tasks", "log_irqs", "log_unaligned", "log_store", "log_host_io"]
 
 # Per-category log feature gates. ON by default (via the QEMU
 # `default` set) to preserve Phase-B trace-debug behaviour; OFF for
@@ -62,11 +62,22 @@ default = ["platform-raspi3b", "log_mmu", "log_traps", "log_tasks", "log_irqs", 
 #   log_unaligned — `src/unaligned.rs` per-fault decode of every
 #                   AArch32 unaligned LDR/STR fixup, including ROM-
 #                   patched ldrh/strh and ldrd targets.
+#   log_store     — StorePermObject entry + LoadPermObject return
+#                   probes: pretty-printed Ref at each flash-store
+#                   round-trip. Also gates installation of the
+#                   underlying ROM patches, so when off the guest
+#                   takes no traps at those sites.
+#   log_host_io   — host_io backend diagnostics: SYS_OPEN status at
+#                   init, every pump_input drain summary, pen-down/up
+#                   edges, power-switch presses, pi_fb adoption of the
+#                   splash framebuffer.
 log_mmu = []
 log_traps = []
 log_tasks = []
 log_irqs = []
 log_unaligned = []
+log_store = []
+log_host_io = []
 
 # Host-platform selection. Exactly one must be enabled; build.rs panics
 # otherwise. Controls UART/GIC addresses, MMU memory map, load address

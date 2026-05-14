@@ -1823,7 +1823,7 @@ pub unsafe fn patch_dabt_vector(rom_ptr: *mut u32) {
         write_rom_code_word(rom_ptr, db +  8, 0xE200_000F); // and r0, r0, #0xF
         write_rom_code_word(rom_ptr, db +  9, 0xE350_0001); // cmp r0, #1
         write_rom_code_word(rom_ptr, db + 10, 0x0A00_0000); // beq +0x0 (word 12 = ALIGN hvc)
-        write_rom_code_word(rom_ptr, db + 11, HvcImm::Diag.insn()); // hvc #0x11 (DIAG_TAG)
+        write_rom_code_word(rom_ptr, db + 11, HvcImm::DabtDispatch.insn()); // DABT-trampoline fall-through
         write_rom_code_word(rom_ptr, db + 12, HvcImm::Align.insn()); // hvc #0x13 (ALIGN_TAG)
         write_rom_code_word(rom_ptr, db + 13, 0xEAFF_FFFE); // b . (guard)
         // Literal slot — read by the LDR at db+2 under BE-8 (CPSR.E=1),
@@ -1933,12 +1933,13 @@ pub unsafe fn patch_dabt_vector(rom_ptr: *mut u32) {
 /// section-level translation faults ARMv7 leaves DFSR.Domain UNK
 /// (= 0); the kernel's `GetDomainAndFaultMonitorFromDomainNumber(0)`
 /// then returns no monitor and DAH throws `evt.ex.abt.bus`. Pre-iter-
-/// 59 the EL2 `handle_diag` synthesised DFSR.Domain from L1[FAR>>20]
-/// [8:5] before forwarding to DAH; iter-59 bypassed handle_diag. The
-/// minimal fix is to let DFSC=5 fall through to the slow EL2 path,
-/// which still does the synthesis. Section-level faults fire only on
-/// first touch of a 1 MiB section (~tens of times per boot for
-/// freshly-allocated stacks), so the slow-path cost is negligible.
+/// 59 the EL2 path (`handle_dabt_dispatch` today) synthesised
+/// DFSR.Domain from L1[FAR>>20][8:5] before forwarding to DAH; iter-
+/// 59 bypassed that path. The minimal fix is to let DFSC=5 fall
+/// through to the slow EL2 path, which still does the synthesis.
+/// Section-level faults fire only on first touch of a 1 MiB section
+/// (~tens of times per boot for freshly-allocated stacks), so the
+/// slow-path cost is negligible.
 ///
 /// SAFETY: writes 41 words in the reserved range
 /// `DABT_FAST_TRAMP_OFFSET .. + 41*4`. Caller owns the ROM backing.

@@ -79,8 +79,23 @@ pub enum HvcImm {
     // Not in the test ABI; auto-incremented from after the block
     // above. Adding a variant just appends. Tests don't issue these
     // directly, so reordering / shifting their values is safe.
-    /// Phase-B diagnostic: dump banked regs + stage-1 walk + halt.
+    /// Diagnostic halt: dump banked regs + stage-1 walk + halt the
+    /// host. Used in two places:
+    ///   1. PABT vector slot (VA 0x0C): the stock ROM branches to a
+    ///      missing REx address, so any prefetch abort routes here
+    ///      for a clean halt instead of a silent wedge.
+    ///   2. Ad-hoc hand-patches: write this HVC into any guest code
+    ///      site to get a halt-with-full-register-dump there.
     Diag,
+    /// DABT fast-trampoline fall-through. The trampoline at
+    /// `DABT_TRAMP_OFFSET` checks DFSR.status == 0x01 (alignment)
+    /// via BEQ → `HVC #Align`; on non-alignment it falls through to
+    /// this HVC. Handler dispatches forwardable DFSCs to the
+    /// kernel's `DataAbortHandler` (and patches DFSR.Domain from the
+    /// L1 entry for translation/permission/access-flag faults
+    /// where ARMv7 leaves the field UNK). Non-forwardable DFSCs
+    /// fall through to `handle_diag` for the diagnostic halt.
+    DabtDispatch,
     /// Loud-halt tripwire. Patched at the first instruction of
     /// `Reboot`, `PowerOffAndReboot`, and `StopImage` — three sites
     /// the kernel reaches when it's giving up or going idle. The
@@ -96,13 +111,6 @@ pub enum HvcImm {
     /// Tracer trampoline slot[0] entry (one HVC per traced function;
     /// the trampoline contains the rest of the prologue + branch-back).
     Trace,
-    /// Static `FaultMonitorEntry` entry probe (input fault mask).
-    DahFmeEntry,
-    /// DAH OR-chain entry probe (curr_task + monitor list capture).
-    DahOrChain,
-    /// `cmp r0, #0` after `bl FaultMonitorEntry` in DAH —
-    /// captures FME's return value, emulates the cmp, returns.
-    DahFmeRet,
     /// `UnhandledException` halt-on-entry tripwire.
     UnhandledException,
     /// `UnhandledNonUserModeException` halt-on-entry tripwire.
@@ -131,30 +139,6 @@ pub enum HvcImm {
     /// the original `mov r0, r1`); the next word is the original
     /// `b REPExceptionNotify` and runs natively after HVC.
     HammerExceptionNotify,
-    /// `FP_UndefHandlers_Start + 0x3C` — FPE-entry counter +
-    /// `mov ip, sp` emulation.
-    FpeEntryProbe,
-    /// Iter-108 splash-chain diagnostic probes (TNotebook
-    /// InitToolbox / DrawSplashScreen / InitScriptGlobals
-    /// inflection points). All sites share one immediate; the
-    /// handler distinguishes by ELR.
-    SplashProbe,
-    /// `apply_resolve_fault_wrapper` exit probe — fired from the
-    /// wrapper inserted between the post-loop FAR-restore and the
-    /// final `pop {r4-r10, pc}`. Captures (r0=return, r4=manager,
-    /// r5=TStackInfo*, info bounds, r8=original FAR, r9=all_failed
-    /// flag) so we can correlate `Fault`'s -10204 propagation with
-    /// the actual TStackInfo* the matcher passed in.
-    ResolveFaultRet,
-    /// Probe at the very first instruction of
-    /// `TStackManager::ResolveFault` (ROM 0x001F_7978). Replaces
-    /// `mov ip, sp` with an HVC. Handler logs (FAR, fLowerBounds,
-    /// fUpperBounds, fStackOwnerId, fStackNormalization) for the
-    /// stackInfo passed in R1, then emulates `mov ip, sp` (= R12
-    /// = R13) and advances ELR past the HVC. Used to verify
-    /// whether fLowerBounds is being dynamically modified during
-    /// stack growth.
-    ResolveFaultEntry,
     /// Entry probe at `StorePermObject` (ROM 0x002D_F998).
     /// Replaces the function's first instruction (`mov ip, sp`).
     /// Handler dereferences R0 (a `RefVar const&`) to recover the
@@ -168,14 +152,6 @@ pub enum HvcImm {
     /// via `newton-objects`, emulates `r0 = r4`, and advances ELR
     /// so the epilogue's `ldmdb` returns the same Ref to the caller.
     LoadPermObjRet,
-    /// Entry probe at `DoCall` (ROM 0x002E_FE48). Replaces the
-    /// function's first instruction (`mov ip, sp`). Handler reads
-    /// R0 (a `RefVar const&`) and prints the Ref of the function
-    /// about to be invoked, plus the source-mode SP so we can
-    /// correlate with stack-overflow frames. Emulates `mov ip, sp`
-    /// (writes ctx.x[12] = source-mode SP) and advances ELR so the
-    /// prologue picks up at instruction 2 (`push {…}`).
-    DoCallEntry,
 }
 
 impl HvcImm {

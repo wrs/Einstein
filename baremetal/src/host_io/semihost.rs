@@ -25,7 +25,7 @@ use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::kprintln;
+use crate::log_host_io;
 
 const SYS_OPEN: u64 = 0x01;
 const SYS_CLOSE: u64 = 0x02;
@@ -69,16 +69,16 @@ pub fn init() {
     let out = sh_open(OUT_PATH, MODE_WRITE_BINARY);
     let inh = sh_open(IN_PATH, MODE_READ_BINARY);
     if out < 0 {
-        kprintln!("host_io: SYS_OPEN {:?} (wb) failed; outbound disabled",
+        log_host_io!("host_io: SYS_OPEN {:?} (wb) failed; outbound disabled",
             core::str::from_utf8(&OUT_PATH[..OUT_PATH.len() - 1]).unwrap_or("?"));
     } else {
-        kprintln!("host_io: outbound /tmp/newton-host-io/out fh={}", out);
+        log_host_io!("host_io: outbound /tmp/newton-host-io/out fh={}", out);
     }
     if inh < 0 {
-        kprintln!("host_io: SYS_OPEN {:?} (rb) failed; inbound disabled (touch the file with the host viewer first)",
+        log_host_io!("host_io: SYS_OPEN {:?} (rb) failed; inbound disabled (touch the file with the host viewer first)",
             core::str::from_utf8(&IN_PATH[..IN_PATH.len() - 1]).unwrap_or("?"));
     } else {
-        kprintln!("host_io: inbound  /tmp/newton-host-io/in  fh={}", inh);
+        log_host_io!("host_io: inbound  /tmp/newton-host-io/in  fh={}", inh);
     }
     s.out_fh = out;
     s.in_fh = inh;
@@ -190,7 +190,7 @@ pub fn pump_input() {
     static DOWN: AtomicBool = AtomicBool::new(false);
     let ev_size = core::mem::size_of::<super::PenEvent>();
     let n_evs = got / ev_size;
-    kprintln!("host_io: pump_input drained {} byte(s), {} pen event(s)", got, n_evs);
+    log_host_io!("host_io: pump_input drained {} byte(s), {} pen event(s)", got, n_evs);
     for i in 0..n_evs {
         let off = i * ev_size;
         // SAFETY: ev_size bytes at off..off+ev_size; PenEvent is repr(C,packed).
@@ -205,7 +205,7 @@ pub fn pump_input() {
         // during a drag, and POWER_SWITCH has its own dedicated log
         // line.
         if kind != super::PEN_MOVE && kind != super::POWER_SWITCH {
-            kprintln!(
+            log_host_io!(
                 "host_io: pen kind={} x={} y={} p={}  vic.ictrl={:#010x} vic.ipres={:#010x}",
                 kind, x, y, pressure,
                 crate::peripherals::vic::int_ctrl_raw(),
@@ -232,7 +232,7 @@ pub fn pump_input() {
                 }
             }
             super::POWER_SWITCH => {
-                kprintln!("host_io: power-switch press");
+                log_host_io!("host_io: power-switch press");
                 crate::peripherals::vic::raise_power_switch();
             }
             _ => {}

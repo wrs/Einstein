@@ -489,14 +489,14 @@ const UNLOCK_HEAP_RANGE_PC: u32 = 0x001F_8B88;
 /// any future ROM build that shifts the function entries fails loudly.
 const LOCK_UNLOCK_ORIG_FIRST_INSN: u32 = 0xE1A0_C00D;
 
-// ---- L1[0xCD] lazy-grow investigation probes (2026-04-26) -----------------
+// ---- Load-bearing HVC patches ---------------------------------------------
 //
-// See docs/plans/l1-cd-lazy-investigation.md. The kernel's expected
-// `RememberMappings → Remember → SWI #12 → AllocatePageTable` chain
-// drove the original probe set. Most of those probes were swept in
-// the BE-8 migration Phase 0; the surviving 0x47 (REMEMBER_SWIRET) is
-// retained as load-bearing instrumentation for the Remember post-SWI
-// fixup.
+// The originally-Phase-B set (L1[0xCD] lazy-grow probes, DAH Layer-γ
+// trio, iter-108 splash chain, FPE-entry, ResolveFault probes) has
+// been swept. What remains are HVC patches the running hypervisor
+// depends on: the Remember post-SWI sentinel reload, the QEMU DAH
+// `mrs r1, SPSR` workaround, the Unhandled[NonUserMode]Exception
+// halt tripwires, and the PHammerOutTranslator body redirects.
 
 /// `Remember` post-SWI fixup site at 0x00258E50 (after the first
 /// `bl GenericSWI`). Handler logs r0 (= the SWI #12 return value),
@@ -516,63 +516,6 @@ const REMEMBER_SWIRET_ORIG_INSN:     u32 = 0xE3A0_80ED; // mov r8, #237
 /// Mirrors docs/QEMU_BUGS.md Bug #1's banked-LR workaround.
 pub const DAH_MRS_SPSR_PC:           u32 = 0x0039_3144;
 const DAH_MRS_SPSR_INSN:             u32 = 0xE14F_1000;
-
-/// `cmp r0, #0` immediately after `bl FaultMonitorEntry` at PC
-/// `0x00393984` (DAH's post-monitor-call branch decision). The
-/// preceding `bl` jumps through the post-ship patch table at
-/// `0x01af7bf4` to whatever current FaultMonitorEntry the kernel has
-/// installed. After the call, r0 = 0 means "monitor handled the fault,
-/// take the recovery path"; non-zero means "monitor declined, fall
-/// through toward RebootIfFaultWasInStack".
-///
-/// On Einstein, the abort #16 at FAR=0x0CD07400 (mode=USR, DFSC=5)
-/// recovers — i.e. FaultMonitorEntry returns 0 there. Our hypervisor
-/// reaches the throw exit on the same fault, which only happens if
-/// FaultMonitorEntry returns non-zero. Patch this `cmp` with
-/// `HVC #HvcImm::DahFmeRet` so EL2 can log the return value and
-/// emulate the `cmp r0, #0` flag update, leaving the `beq 0x393a30`
-/// at `0x393988` to branch as the kernel intended.
-pub const DAH_FME_RET_PC:             u32 = 0x0039_3984;
-const DAH_FME_RET_INSN:               u32 = 0xE3500000;
-
-/// Static FaultMonitorEntry entry at PC `0x0011FC60`. The post-ship
-/// patch table at `0x01AF7BF4` is the symbol target the kernel actually
-/// calls; if its slot redirects through the static entry (no REx
-/// override active), this probe fires and gives us the input fault
-/// mask plus the implementation flow. Original first insn:
-/// `mov ip, sp = 0xE1A0_C00D`. Replace with `HVC #HvcImm::DahFmeEntry`;
-/// the handler emulates `mov ip, sp` (writes ctx.x[12] = ctx.x[13]),
-/// logs r0 (= input fault mask), and returns. If the probe doesn't
-/// fire, the post-ship slot is redirected to a different (REx-side)
-/// implementation we don't have disasm for.
-pub const FME_STATIC_PC:              u32 = 0x0011_FC60;
-const FME_STATIC_FIRST_INSN:          u32 = 0xE1A0_C00D;
-
-/// `ldr r1, [pc, #1588]` at DAH PC `0x00393318`, the load that
-/// initialises `r1` with the address of `gCurrentTask`
-/// (= `0x0C100FF8`, per `_Data_/symbols.txt`) before the OR-chain at
-/// `0x393320..0x393344` builds the fault bitmask passed to
-/// `FaultMonitorEntry`. Original encoding `0xE59F_1634`. We replace it
-/// with `HVC #HvcImm::DahOrChain`; the handler reads
-/// `*gCurrentTask` (= the running TTask*), then
-/// `curr_task->[+0x74/+0x78/+0x7c]` (TUDomainManager pointers) and
-/// each monitor's `[+0x10]` (the OR'd value), logs them, and emulates
-/// the original load by writing the literal `0x0C100FF8` into
-/// `ctx.x[1]`. Natural ERET resumes at `0x39331c` (the kernel's
-/// `ldr r1, [r1]`) so the kernel proceeds normally with
-/// `r1 = 0x0C100FF8`.
-///
-/// Diagnostic for the γ probe: distinguishes (E-1) curr_task changed
-/// between fault #2 entry and Reboot from (E-2) same task but
-/// monitor[+0x74] mutated. See INVESTIGATION.md "γ probe outcome".
-///
-/// Note: earlier revisions of this comment called `0x0C100FF8`
-/// `gKernelGlobals` — that name was never in `symbols.txt` and
-/// shouldn't be reused. Kernel-globals naming convention lives in
-/// `docs/STRUCTURES.md`.
-pub const DAH_OR_CHAIN_PC:            u32 = 0x0039_3318;
-const DAH_OR_CHAIN_INSN:              u32 = 0xE59F_1634;
-pub const G_CURRENT_TASK_VA:          u32 = 0x0C10_0FF8;
 
 /// `TTask::Init`'s `bl NewStack` site at ROM `0x0025238c`. The probe
 /// in the previous iteration showed this BL is the user-mode caller
@@ -623,79 +566,6 @@ const UNHANDLED_EXCEPTION_FIRST_INSN:     u32 = 0xE1A0_C00D; // mov ip, sp
 /// previous probe so we catch both paths at entry.
 pub const UNHANDLED_NUM_EXCEPTION_PC:      u32 = 0x000B_031C;
 const UNHANDLED_NUM_EXCEPTION_FIRST_INSN:  u32 = 0xE1A0_C00D; // mov ip, sp
-
-/// FPE-entry probe at `FP_UndefHandlers_Start + 0x3C` = `0x0038_D918`.
-/// Original first insn is `mov ip, sp` (`0xE1A0_C00D`); replace with
-/// `HVC #HvcImm::FpeEntryProbe`. The handler:
-///
-///   1. Counts FPE entries (per-call counter).
-///   2. On entry #2 (= forward #2 = mvfs in SetSystemVolume that wedges
-///      the FPE on the IP-corruption trap), calls
-///      `crate::tarmac::emit_start()` to open the TarmacTrace window.
-///      The matching `emit_stop()` fires from the unrecognised-UND
-///      halt path in `handle_und`.
-///   3. Emulates the original `mov ip, sp` by setting
-///      `ctx.x[12] = ctx.x[23]` (= sp_und, since the FPE always runs
-///      in UND mode after iter-84's bypass delivers UND naturally).
-///
-/// The trace bracketed by entry #2's start and the halt's stop
-/// captures every instruction + register write inside the FPE call
-/// that wedges — small enough to grep for the moment R12 transitions
-/// from `0x0c005fc0` (post-`mov ip, sp`) to `0x003900c8` (at the
-/// trap), pinning the IP-clobber site.
-pub const FPE_ENTRY_PROBE_PC:      u32 = 0x0038_D918;
-const FPE_ENTRY_FIRST_INSN:        u32 = 0xE1A0_C00D; // mov ip, sp
-
-/// Iter-108 splash-chain diagnostic probes. Patches inside
-/// `TNotebook::InitToolbox` and `TNotebook::DrawSplashScreen`
-/// to follow the chain that should culminate in
-/// `TMainDisplayDriver::Blit`. The handler logs the hit (PC,
-/// source mode, stack pointer in source mode) and emulates the
-/// patched-out instruction so natural ERET resumes at PC+4.
-///
-/// User observation: "framebuffer dumps haven't worked since we
-/// switched to BE mode" — splash should be produced by
-/// InitToolbox→DrawSplashScreen→…→TMainDisplayDriver::Blit, but
-/// no `screen::blit` ever fires, so the chain breaks somewhere
-/// upstream.
-/// `mov ip, sp` at the entry of TNotebook::InitToolbox.
-pub const SPLASH_PROBE_INIT_TOOLBOX_PC:    u32 = 0x0014_6B28;
-const SPLASH_PROBE_INIT_TOOLBOX_INSN:      u32 = 0xE1A0_C00D; // mov ip, sp
-/// `mov r0, r4` immediately after the `bl
-/// InitToolbox__12TApplicationFv` returns (= the parent class's
-/// init, the first non-trivial call inside Notebook::InitToolbox).
-pub const SPLASH_PROBE_AFTER_PARENT_PC:    u32 = 0x0014_6B3C;
-const SPLASH_PROBE_AFTER_PARENT_INSN:      u32 = 0xE1A0_0004; // mov r0, r4
-/// `mov r0, r4` immediately after both the vtable call at
-/// 0x146B48 (`add pc, r1, #44`) returns AND `bl
-/// InitScriptGlobals__Fv` at 0x146B4C returns. Reaching here
-/// proves both calls completed.
-pub const SPLASH_PROBE_AFTER_VT_PC:        u32 = 0x0014_6B50;
-const SPLASH_PROBE_AFTER_VT_INSN:          u32 = 0xE1A0_0004; // mov r0, r4
-/// `ldr r0, [pc, #48]` immediately after `bl InitInker` at
-/// 0x146B54 returns.
-pub const SPLASH_PROBE_AFTER_INKER_PC:     u32 = 0x0014_6B58;
-const SPLASH_PROBE_AFTER_INKER_INSN:       u32 = 0xE59F_0030; // ldr r0, [pc, #48]
-/// `mov ip, sp` at the entry of InitScriptGlobals__Fv (the
-/// concrete function, not the JT thunk at 0x01A99CE0).
-pub const SPLASH_PROBE_ISG_ENTRY_PC:       u32 = 0x001F_1828;
-const SPLASH_PROBE_ISG_ENTRY_INSN:         u32 = 0xE1A0_C00D; // mov ip, sp
-/// `ldr r4, [pc, #560]` at 0x1F1848 — runs after both
-/// `bl Clone__FRC6RefVar` (0x1F183C) and the first
-/// `bl AllocateRefHandle__Fl` (0x1F1840) return inside ISG.
-/// Non-destructive on visible state apart from r4, so safe to
-/// patch + emulate (read the literal, write to r4).
-pub const SPLASH_PROBE_AFTER_CLONE_PC:     u32 = 0x001F_1848;
-const SPLASH_PROBE_AFTER_CLONE_INSN:       u32 = 0xE59F_4230; // ldr r4, [pc, #560]
-/// `mov r0, r4` immediately before the `bl
-/// DrawSplashScreen__9TNotebookFv` at 0x146BB4. Reaching here
-/// means InitToolbox completed the orientation/preference setup
-/// and is about to call DrawSplashScreen.
-pub const SPLASH_PROBE_BEFORE_DRAW_PC:     u32 = 0x0014_6BB0;
-const SPLASH_PROBE_BEFORE_DRAW_INSN:       u32 = 0xE1A0_0004; // mov r0, r4
-/// `mov ip, sp` at the entry of TNotebook::DrawSplashScreen.
-pub const SPLASH_PROBE_DRAW_SPLASH_PC:     u32 = 0x0014_602C;
-const SPLASH_PROBE_DRAW_SPLASH_INSN:       u32 = 0xE1A0_C00D; // mov ip, sp
 
 // ---- POutTranslator hook: PHammerOutTranslator concrete-body patches
 //
@@ -1010,20 +880,21 @@ pub unsafe fn apply_717006_patches(rom_ptr: *mut u32) {
         let _ = apply_lock_heap_range_wrapper;
         apply_l1_cd_probes(rom_ptr);
         apply_fault_handler_ldr_byteswap_patches(rom_ptr);
-        apply_resolve_fault_entry_probe(rom_ptr);
+        #[cfg(feature = "log_store")]
         apply_storeperm_loadperm_probes(rom_ptr);
     }
 
-    kprintln!("rom_patch: applied {} simple patches + 5 native-call/injection ROM patches + PowerOffAndReboot + Reboot + BootOS + L1[0xCD] probes + fault-handler LDR byteswap stubs", applied);
+    kprintln!("rom_patch: applied {} simple patches + 5 native-call/injection ROM patches + PowerOffAndReboot + Reboot + BootOS + load-bearing HVC patches + fault-handler LDR byteswap stubs", applied);
 }
 
 
-/// Install the HVC probes that survive past the BE-8 migration. Most
-/// of the iter-50..89 lazy-grow / heap / soup / textdecomp probes were
-/// swept in Phase 0 of the BE-8 migration; what remains is the small
-/// set of operational probes used by the running hypervisor (DAH /
-/// FaultMonitorEntry / OR-chain / FPE-entry / Remember-post-SWI /
-/// UnhandledException tripwires). See PLAN_BE8_MIGRATION.md "Phase 0".
+/// Install the load-bearing HVC patches: the Remember-post-SWI
+/// sentinel reload, the QEMU DAH `mrs r1, SPSR` workaround, the
+/// `Unhandled[NonUserMode]Exception` halt tripwires, and the
+/// PHammerOutTranslator body redirects that route the kernel's REP
+/// output into the EL2 UART. The Phase-B diagnostic probes that
+/// used to live here (DAH Layer-γ trio, iter-108 splash chain,
+/// FPE-entry, ResolveFault entry/exit) have been removed.
 unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
     unsafe {
         // Remember post-SWI fixup: the kernel's `r8 = -10003` sentinel
@@ -1047,38 +918,6 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             HvcImm::DahMrsSpsr,
             "DataAbortHandler mrs r1, SPSR (QEMU spsr_abt staleness fix)",
         );
-        // Layer-γ probe: `cmp r0, #0` after `bl FaultMonitorEntry` at
-        // 0x00393984. Captures FaultMonitorEntry's return value so we
-        // can compare against Einstein's recovery path.
-        patch_probe(
-            rom_ptr,
-            DAH_FME_RET_PC,
-            DAH_FME_RET_INSN,
-            HvcImm::DahFmeRet,
-            "DAH FaultMonitorEntry return cmp r0, #0",
-        );
-        // Layer-γ probe: static FaultMonitorEntry entry at 0x0011FC60.
-        // Captures input fault mask in r0 if the post-ship slot
-        // redirects through the static entry.
-        patch_probe(
-            rom_ptr,
-            FME_STATIC_PC,
-            FME_STATIC_FIRST_INSN,
-            HvcImm::DahFmeEntry,
-            "FaultMonitorEntry static entry (mov ip, sp)",
-        );
-        // Layer-γ probe: DAH OR-chain entry at 0x00393318 (`ldr r1,
-        // [pc, #1588]` loading the address of gCurrentTask). Captures
-        // curr_task and its monitor list to distinguish (E-1)
-        // curr_task changed from (E-2) same task with mutated monitor
-        // list.
-        patch_probe(
-            rom_ptr,
-            DAH_OR_CHAIN_PC,
-            DAH_OR_CHAIN_INSN,
-            HvcImm::DahOrChain,
-            "DAH OR-chain entry (ldr r1, &gCurrentTask)",
-        );
         // UnhandledException tripwires — halt cleanly with the kernel-
         // supplied exception-name string instead of letting the boot
         // bury the diagnostic under downstream Reboot / abort noise.
@@ -1095,74 +934,6 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
             UNHANDLED_NUM_EXCEPTION_FIRST_INSN,
             HvcImm::UnhandledNumException,
             "UnhandledNonUserModeException entry (halt-on-entry tripwire)",
-        );
-        // FPE-entry probe — load-bearing FP-bypass plumbing. Per the
-        // BE-8 migration plan this is kept regardless of the iter-50..89
-        // probe sweep: the handler emulates the FPE call without actually
-        // running the FP undef trampoline.
-        patch_probe(
-            rom_ptr,
-            FPE_ENTRY_PROBE_PC,
-            FPE_ENTRY_FIRST_INSN,
-            HvcImm::FpeEntryProbe,
-            "FP_UndefHandlers_Start mov ip, sp (FPE bypass)",
-        );
-        // Iter-108 splash-chain diagnostic.
-        patch_probe(
-            rom_ptr,
-            SPLASH_PROBE_INIT_TOOLBOX_PC,
-            SPLASH_PROBE_INIT_TOOLBOX_INSN,
-            HvcImm::SplashProbe,
-            "TNotebook::InitToolbox entry (splash-chain diag)",
-        );
-        patch_probe(
-            rom_ptr,
-            SPLASH_PROBE_AFTER_PARENT_PC,
-            SPLASH_PROBE_AFTER_PARENT_INSN,
-            HvcImm::SplashProbe,
-            "TNotebook::InitToolbox after parent::InitToolbox (splash-chain diag)",
-        );
-        patch_probe(
-            rom_ptr,
-            SPLASH_PROBE_AFTER_VT_PC,
-            SPLASH_PROBE_AFTER_VT_INSN,
-            HvcImm::SplashProbe,
-            "TNotebook::InitToolbox after vtable+InitScriptGlobals (splash-chain diag)",
-        );
-        patch_probe(
-            rom_ptr,
-            SPLASH_PROBE_AFTER_INKER_PC,
-            SPLASH_PROBE_AFTER_INKER_INSN,
-            HvcImm::SplashProbe,
-            "TNotebook::InitToolbox after InitInker (splash-chain diag)",
-        );
-        patch_probe(
-            rom_ptr,
-            SPLASH_PROBE_ISG_ENTRY_PC,
-            SPLASH_PROBE_ISG_ENTRY_INSN,
-            HvcImm::SplashProbe,
-            "InitScriptGlobals__Fv entry (splash-chain diag)",
-        );
-        patch_probe(
-            rom_ptr,
-            SPLASH_PROBE_AFTER_CLONE_PC,
-            SPLASH_PROBE_AFTER_CLONE_INSN,
-            HvcImm::SplashProbe,
-            "InitScriptGlobals after Clone+AllocateRefHandle (splash-chain diag)",
-        );
-        patch_probe(
-            rom_ptr,
-            SPLASH_PROBE_BEFORE_DRAW_PC,
-            SPLASH_PROBE_BEFORE_DRAW_INSN,
-            HvcImm::SplashProbe,
-            "TNotebook::InitToolbox before DrawSplashScreen call (splash-chain diag)",
-        );
-        patch_probe(
-            rom_ptr,
-            SPLASH_PROBE_DRAW_SPLASH_PC,
-            SPLASH_PROBE_DRAW_SPLASH_INSN,
-            HvcImm::SplashProbe,
-            "TNotebook::DrawSplashScreen entry (splash-chain diag)",
         );
         // PHammerOutTranslator concrete-body patches: route every
         // `gREPout->{Print,Putc,Flush,StackTrace,ExceptionNotify}`
@@ -1750,45 +1521,6 @@ unsafe fn apply_bootos_trap(rom_ptr: *mut u32) {
     );
 }
 
-/// ROM PC of the first instruction of `TStackManager::ResolveFault`.
-const RESOLVE_FAULT_ENTRY_PC: u32 = 0x001F_7978;
-
-/// Original first word at `RESOLVE_FAULT_ENTRY_PC` — `mov ip, sp`
-/// (`0xE1A0_C00D`). Replaced with `HVC #ResolveFaultEntry`. The
-/// HVC handler in trap.rs emulates `mov ip, sp` (writes `ctx.x[12]
-/// = source-mode SP`) and advances ELR past the HVC, so the
-/// kernel's `ResolveFault` continues from instruction 2 onward
-/// with the same architectural state it would have had if `mov ip,
-/// sp` had executed normally.
-const RESOLVE_FAULT_ENTRY_ORIG: u32 = 0xE1A0_C00D;
-
-/// Probe at the entry of `TStackManager::ResolveFault`. Logs FAR,
-/// `info[+24]=fLowerBounds`, `info[+28]=fUpperBounds`, owner id,
-/// and norm on every call (with throttling — see the handler).
-/// Used to determine whether `fLowerBounds` is being moved
-/// downward dynamically during stack growth, which would explain
-/// how a deeply-recursing chain successfully descends past the
-/// initial guard ceiling.
-unsafe fn apply_resolve_fault_entry_probe(rom_ptr: *mut u32) {
-    let idx = (RESOLVE_FAULT_ENTRY_PC / 4) as usize;
-    let prev = unsafe { rom_ptr.add(idx).read() };
-    if prev != RESOLVE_FAULT_ENTRY_ORIG {
-        kprintln!(
-            "rom_patch: ERROR — ResolveFault first word is {:#010x}, expected {:#010x}; skipping probe",
-            prev, RESOLVE_FAULT_ENTRY_ORIG,
-        );
-        return;
-    }
-    let insn = HvcImm::ResolveFaultEntry.insn();
-    unsafe {
-        crate::guest_mem::write_rom_code_word(rom_ptr, idx, insn);
-    }
-    kprintln!(
-        "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (ResolveFault entry probe, HVC #{:#x})",
-        RESOLVE_FAULT_ENTRY_PC, prev, insn, HvcImm::ResolveFaultEntry as u32,
-    );
-}
-
 /// First instruction of `StorePermObject` (ROM 0x002D_F998) —
 /// `mov ip, sp` (`0xE1A0_C00D`). Replaced with `HVC
 /// #StorePermObjEntry`; the handler dereferences R0 (a `RefVar
@@ -1811,26 +1543,17 @@ const STORE_PERM_OBJECT_ORIG_INSN: u32 = 0xE1A0_C00D;
 const LOAD_PERM_OBJECT_RET_PC: u32 = 0x002D_F4C0;
 const LOAD_PERM_OBJECT_RET_ORIG_INSN: u32 = 0xE1A0_0004;
 
-/// First instruction of `DoCall(RefVar const& fn, long numArgs)` at
-/// ROM 0x002E_FE48 (`mov ip, sp` = `0xE1A0_C00D`). Replaced with
-/// `HVC #DoCallEntry`; the handler reads R0 (a RefVar pointer to
-/// the function being invoked), dereferences once to get the Ref,
-/// pretty-prints it, then emulates `mov ip, sp` and advances ELR
-/// so the prologue's `push {r4-r7, fp, ip, lr, pc}` picks up at
-/// instruction 2. Used to count NS-interpreter recursion depth on
-/// the runaway-stack-overflow path that fires before the boot
-/// completes (Phase B AddFlushed/StorePermObject stack-overflow
-/// stall).
-const DO_CALL_ENTRY_PC: u32 = 0x002E_FE48;
-const DO_CALL_ENTRY_ORIG_INSN: u32 = 0xE1A0_C00D;
-
 /// Install the StorePermObject entry probe + LoadPermObject
 /// return-site probe. Pair: each call to StorePermObject pretty-
 /// prints the RefArg being stored, each return from LoadPermObject
 /// pretty-prints the Ref being handed back. Used to investigate
 /// whether the flash-store round-trip is corrupting the Ref graph
 /// (Phase B "infinite recursion during default-alarm setup"
-/// stall).
+/// stall). Gated by the `log_store` Cargo feature — when off, the
+/// trap dispatch arms and handlers in `src/trap.rs` are cfg'd out,
+/// so leaving these patches uninstalled is required to avoid
+/// trapping into a non-existent handler.
+#[cfg(feature = "log_store")]
 unsafe fn apply_storeperm_loadperm_probes(rom_ptr: *mut u32) {
     for (pc, orig, imm, name) in [
         (
@@ -1844,12 +1567,6 @@ unsafe fn apply_storeperm_loadperm_probes(rom_ptr: *mut u32) {
             LOAD_PERM_OBJECT_RET_ORIG_INSN,
             HvcImm::LoadPermObjRet,
             "LoadPermObject return probe",
-        ),
-        (
-            DO_CALL_ENTRY_PC,
-            DO_CALL_ENTRY_ORIG_INSN,
-            HvcImm::DoCallEntry,
-            "DoCall entry probe",
         ),
     ] {
         let idx = (pc / 4) as usize;

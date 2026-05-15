@@ -4,6 +4,15 @@
 #   - raspberrypi.com/documentation/computers/config_txt.html
 #   - raspberrypi/firmware/boot/overlays/README (master)
 #   - raspberrypi/tools/armstubs/armstub8.S
+#
+# Trimmed against a working Raspbian Bookworm boot on the same
+# Pi Zero 2 W + HDMI panel (see commit message for the dump). Removed
+# settings that didn't address the firmware-stage flicker / white-bar:
+#   hdmi_drive=2  hdmi_force_hotplug=1  config_hdmi_boost=7
+#   hdmi_group=1  hdmi_mode=4           avoid_warnings=1
+# Raspbian shows the same flicker until KMS does a clean modeset
+# partway through systemd boot, so it isn't a config-knob fix; the
+# remediation lives in our own re-modeset path (or its absence).
 
 # 64-bit kernel. Selects the AArch64 armstub which eret's to EL2h before
 # branching to kernel8.img at 0x80000. Without this we land at EL3 or
@@ -17,7 +26,16 @@ arm_64bit=1
 # firmware is to specify gpu_mem=16." We ship start_cd.elf, so this
 # line is mandatory — otherwise the firmware looks for start.elf
 # (which isn't on the SD) and halts after reading config.txt.
+#
+# We tested the full firmware (gpu_mem=64, ships start.elf): it did
+# not clear the persistent top-row white bar, so we stayed on the
+# cut-down variant. See `host_io::pi_fb::FIRMWARE_TOP_BAR_PX` for
+# the workaround.
 gpu_mem=16
+
+# Suppress the firmware's rainbow boot splash. Our own boot splash
+# takes over from the moment `display::splash::init` runs in kmain.
+disable_splash=1
 
 # Our binary (built by scripts/build-sd.sh from the pi-probe [[bin]]).
 kernel=kernel8.img
@@ -39,54 +57,15 @@ uart_2ndstage=1
 # GPIOs 14 & 15."
 dtoverlay=disable-bt
 
-# Suppress the firmware's on-screen warning icons (the lightning bolt
-# for under-voltage, the thermometer for over-temperature, and the
-# multicolour test square). They draw on a separate overlay layer
-# above our framebuffer and would otherwise show through any
-# rendered content. Setting to 1 disables only the *icons* — the
-# underlying protection (thermal throttling, etc.) still applies.
-# Set to 0 (or delete this line) to see the icons again if you ever
-# want to diagnose a real power / thermal issue.
-avoid_warnings=1
-
-# Disable HDMI overscan padding. Default firmware behaviour assumes
-# the display has consumer-TV overscan and trims a margin (visible
-# as a fixed-colour bar at the edges, typically top/bottom). On
-# monitors with no real overscan that margin is just lost pixels —
-# and on the Pi Zero 2 W with 1360x768 EDID it looked like an
-# 8-16px white stripe across the top of our framebuffer.
+# Disable HDMI overscan padding. Matches Raspbian. Some monitors trim
+# a fixed margin assuming consumer-TV overscan; on monitors with no
+# real overscan that margin is just lost pixels.
 disable_overscan=1
 
-# HDMI link-stability knobs. Walter saw intermittent flicker that
-# unplug-replug of the cable would sometimes fix — classic
-# signature of a marginal HDMI lock at boot. The monitor under
-# test is a small Pi-targeted panel reporting DMT 39 (1360x768
-# @60); both the cable and the panel's HPD/EDID handling can be
-# borderline at that timing.
-#
-#   hdmi_drive=2          force HDMI mode (with audio) — some
-#                         marginal panels otherwise drop to DVI
-#                         and lose sync.
-#   hdmi_force_hotplug=1  ignore HPD; drive HDMI unconditionally.
-#                         Defeats noisy hotplug-detect signalling
-#                         on small panels that briefly de-assert
-#                         HPD after their own internal events.
-#   config_hdmi_boost=7   stronger differential signal (default 5,
-#                         max 11). Improves margin on borderline
-#                         cables / connectors without going crazy.
-hdmi_drive=2
-hdmi_force_hotplug=1
-config_hdmi_boost=7
-
-# Force CEA 720p60 (1280x720 @60 Hz, mode 4 in HDMI CEA group).
-# The panel's preferred DMT 39 (1360x768) mode is non-standard and
-# was producing intermittent flicker that the signal-strength knobs
-# above didn't fix. CEA timings are part of every HDMI receiver's
-# baseline support and lock reliably. The monitor will scale 720p
-# to its native 1360x768 internally.
-#
-# When this hypothesis is no longer needed (Newton ships, panel
-# choice is finalised, etc.) revisit: we lose some pixels and
-# add a scaling step, both fine for now.
-hdmi_group=1
-hdmi_mode=4
+# Probe HDMI EDID and pick the panel's preferred mode. Matches the
+# Raspbian default; replaces the explicit `hdmi_group=1 hdmi_mode=4`
+# (CEA 720p60) we used as a flicker workaround. We render at panel
+# native resolution and choose Newton's screen geometry as
+# `panel / 2` so each Newton pixel is a 2×2 panel block — no panel-
+# side scaling, no resampling. See `host_io::pi_fb::init`.
+display_auto_detect=1

@@ -61,6 +61,17 @@ impl From<mailbox::MailboxError> for FbError {
 /// Fallback when the panel doesn't report a size (e.g. HDMI not
 /// negotiated, headless boot): use 1024×768 so we still produce a
 /// visible image if a monitor is later attached during the run.
+///
+/// **Modeset-reset dance.** The firmware's initial HDMI modeset
+/// (driven by config.txt / EDID at boot) leaves a thin white bar
+/// across the top of the picture and intermittent link flicker on
+/// the Pi Zero 2 W + 1024×600 panel we ship against. Raspbian shows
+/// the same symptoms until KMS later does its own modeset, which
+/// clears them. We replicate that: allocate the framebuffer once
+/// (the rough firmware modeset), release it, then allocate again —
+/// the second allocation provokes a fresh modeset that comes out
+/// clean. Cheap (two extra mailbox round-trips); no-op on platforms
+/// where the firmware modeset is already good.
 pub fn alloc_native() -> Result<FbInfo, FbError> {
     let (panel_w, panel_h) = mailbox::fb_get_physical_size()?;
     let (w, h) = if panel_w == 0 || panel_h == 0 {
@@ -71,6 +82,15 @@ pub fn alloc_native() -> Result<FbInfo, FbError> {
     } else {
         (panel_w, panel_h)
     };
+
+    // First pass: forces the firmware's initial modeset. We
+    // immediately discard the result — the FB it backs is the one
+    // that exhibits the white-bar / flicker symptoms.
+    let _ = alloc(w, h)?;
+    if let Err(e) = mailbox::fb_release() {
+        kprintln!("display: fb_release after first alloc failed: {:?}", e);
+    }
+    // Second pass: the fresh modeset. Use the returned FbInfo.
     alloc(w, h)
 }
 

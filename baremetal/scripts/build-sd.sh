@@ -35,9 +35,13 @@ PI_FIRMWARE_COMMIT="${PI_FIRMWARE_COMMIT:-8fce67a9ec5668fb8d42d215c9ec4c199340bf
 FW_BASE="https://raw.githubusercontent.com/raspberrypi/firmware/${PI_FIRMWARE_COMMIT}/boot"
 
 # Minimum set for the Pi Zero 2 W (BCM2710A1). start_cd.elf is the
-# cut-down GPU firmware (~700 KB vs ~3 MB for start.elf); it omits HDMI
-# overscan, codec licensing, and some camera support — none of which
-# we use in Phase 0. fixup_cd.dat is its matching memory-split file.
+# cut-down GPU firmware (~700 KB vs ~3 MB for start.elf); it omits
+# HDMI codec licensing and some camera support — none of which we
+# use. We tested the full firmware (start.elf, gpu_mem=64) to see
+# if it would clear the persistent firmware-side white bar at the
+# top of HDMI scan-out — it didn't, and cost 48 MB of GPU RAM, so
+# we stayed on the cut-down variant. The bar is cleared only by
+# the KMS/DispmanX path, which would be a much bigger bring-up.
 FW_FILES=(
     bootcode.bin
     start_cd.elf

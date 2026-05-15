@@ -27,7 +27,7 @@ pub mod queue;
 #[cfg(nh_host_io_null)]
 mod null;
 #[cfg(nh_host_io_pi_fb)]
-mod pi_fb;
+pub mod pi_fb;
 #[cfg(nh_host_io_semihost)]
 mod semihost;
 
@@ -103,6 +103,8 @@ pub fn init() {
 pub fn on_resume() {
     queue::reset();
     let payload = current_fb_bytes();
+    let sw = crate::peripherals::screen::screen_width() as u16;
+    let sh = crate::peripherals::screen::screen_height() as u16;
     let ev = BlitEvent {
         kind: BLIT_KIND_FULL_REPAINT,
         mode: 0,
@@ -110,13 +112,13 @@ pub fn on_resume() {
         _pad: 0,
         src_left: 0,
         src_top: 0,
-        src_right: crate::peripherals::screen::SCREEN_WIDTH as u16,
-        src_bottom: crate::peripherals::screen::SCREEN_HEIGHT as u16,
+        src_right: sw,
+        src_bottom: sh,
         dst_left: 0,
         dst_top: 0,
-        dst_right: crate::peripherals::screen::SCREEN_WIDTH as u16,
-        dst_bottom: crate::peripherals::screen::SCREEN_HEIGHT as u16,
-        row_bytes: crate::peripherals::screen::FB_ROW_BYTES as u16,
+        dst_right: sw,
+        dst_bottom: sh,
+        row_bytes: crate::peripherals::screen::fb_row_bytes() as u16,
         payload_len: payload.len() as u16,
     };
     push_blit(&ev, payload);
@@ -160,18 +162,18 @@ pub fn pump_input() {
     semihost::pump_input();
 }
 
-/// Return a slice of the 320×480 2 bpp framebuffer for the full-repaint
+/// Return a slice of the Newton 2 bpp framebuffer for the full-repaint
 /// payload. GUEST_FB is hypervisor-managed linear-LE, so no byte-swap
-/// needed.
+/// needed. Length tracks the runtime screen size.
 fn current_fb_bytes() -> &'static [u8] {
-    const FB_LEN: usize =
-        (crate::peripherals::screen::SCREEN_WIDTH
-            * crate::peripherals::screen::SCREEN_HEIGHT
-            / 4) as usize;
-    // SAFETY: `fb_host_pa` is the base of the static GUEST_FB backing.
-    // FB_LEN is in bounds (FRAMEBUFFER_SIZE is 2 MiB; FB_LEN ≈ 38 KiB).
+    let sw = crate::peripherals::screen::screen_width();
+    let sh = crate::peripherals::screen::screen_height();
+    let fb_len = (sw * sh / 4) as usize;
+    // SAFETY: `fb_host_pa` is the base of the static GUEST_FB backing
+    // (FRAMEBUFFER_SIZE = 2 MiB). The runtime screen size is bounded
+    // by `set_screen_size`, so fb_len ≪ 2 MiB.
     unsafe {
-        core::slice::from_raw_parts(crate::guest_mem::fb_host_pa() as *const u8, FB_LEN)
+        core::slice::from_raw_parts(crate::guest_mem::fb_host_pa() as *const u8, fb_len)
     }
 }
 

@@ -102,6 +102,8 @@ pub const TAG_GET_CLOCK_RATE_MEASURED: u32 = 0x0003_0047;
 
 /// Framebuffer property tags. See the firmware-wiki link above.
 pub const TAG_FB_ALLOCATE: u32 = 0x0004_0001;
+pub const TAG_FB_RELEASE: u32 = 0x0004_8001;
+pub const TAG_BLANK_SCREEN: u32 = 0x0004_0002;
 pub const TAG_FB_GET_PHYSICAL_W_H: u32 = 0x0004_0003;
 pub const TAG_FB_SET_PHYSICAL_W_H: u32 = 0x0004_8003;
 pub const TAG_FB_SET_VIRTUAL_W_H: u32 = 0x0004_8004;
@@ -282,6 +284,30 @@ pub fn set_clock_rate(clock_id: u32, hz: u32) -> Result<u32, MailboxError> {
 // mailbox round-trips), but in polled mode round-trips are cheap
 // and one-tag-per-call is much easier to debug — if any step
 // fails, the call that returned the error is the one that failed.
+
+/// Release the firmware's currently-allocated framebuffer. Used by
+/// `display::fb::alloc_native` to provoke a fresh modeset after the
+/// initial firmware-stage modeset (which, on the Pi Zero 2 W +
+/// 1024×600 HDMI panel, leaves a thin white bar and intermittent
+/// flicker until something forces a re-modeset). Raspbian's KMS
+/// driver does the same thing partway through systemd boot; we do
+/// it once, right after our first allocation.
+pub fn fb_release() -> Result<(), MailboxError> {
+    // Tag has no value buffer in either direction; pass an empty
+    // slice so `send_one_tag` lays out a `value_size = 0` tag.
+    let mut p: [u32; 0] = [];
+    send_one_tag(TAG_FB_RELEASE, &mut p)?;
+    Ok(())
+}
+
+/// Set the display blank state. `blank = true` powers the HDMI off
+/// at the firmware level; `blank = false` powers it back on. Used as
+/// part of the modeset-reset dance.
+pub fn fb_blank_screen(blank: bool) -> Result<(), MailboxError> {
+    let mut p = [if blank { 1 } else { 0 }];
+    send_one_tag(TAG_BLANK_SCREEN, &mut p)?;
+    Ok(())
+}
 
 /// Query the panel's currently configured physical width × height
 /// (the mode HDMI is delivering). Returns `(width, height)` in

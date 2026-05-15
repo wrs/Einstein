@@ -93,23 +93,68 @@ fn get_feature(ctx: &mut TrapContext) {
     ctx.x[0] = value as u64;
 }
 
-/// Geometry advertised to the guest on GetScreenInfo. The values
-/// aren't hot-path: the Newton's screen bring-up just uses them to
-/// size its framebuffer bookkeeping. Matches Einstein's reply for
-/// a 320x480 / 2 bpp MP2x00 panel (TScreenManager::kBitsPerPixel).
-pub const SCREEN_WIDTH: u32 = 320;
-pub const SCREEN_HEIGHT: u32 = 480;
+/// Geometry advertised to the guest on GetScreenInfo. Runtime so a
+/// real-hardware build can derive Newton's screen size from the
+/// negotiated HDMI panel (see `host_io::pi_fb::init`). Default
+/// matches Einstein's MP2100 reply (320x480 / 2 bpp,
+/// `TScreenManager::kBitsPerPixel`) which keeps QEMU / FVP /
+/// guest-test builds behaving as before.
+///
+/// Width must be a multiple of 4 — the 2 bpp packing puts 4 pixels
+/// in each byte and FB_ROW_BYTES must be an integer.
+///
+/// The OS-layer accepts any geometry: Einstein's `TScreenManager`
+/// takes runtime `inPortraitWidth`/`inPortraitHeight`
+/// (`Emulator/Screen/TScreenManager.h:122`), and the iOS app picks
+/// `screenBounds / 2` for "Fit to Screen" at
+/// `app/iEinstein/.../iEinsteinViewController.mm:362-367`.
+use core::sync::atomic::{AtomicU32, Ordering};
+static SCREEN_W: AtomicU32 = AtomicU32::new(320);
+static SCREEN_H: AtomicU32 = AtomicU32::new(480);
+
 pub const SCREEN_BPP: u32 = 2;
+
+pub fn screen_width() -> u32 {
+    SCREEN_W.load(Ordering::Relaxed)
+}
+pub fn screen_height() -> u32 {
+    SCREEN_H.load(Ordering::Relaxed)
+}
 /// Bytes per packed scanline of the on-screen framebuffer.
-/// 320 * 2 / 8 = 80.
-pub const FB_ROW_BYTES: u32 = (SCREEN_WIDTH * SCREEN_BPP) / 8;
+/// width × 2 bpp / 8 = width / 4.
+pub fn fb_row_bytes() -> u32 {
+    screen_width() / 4
+}
+/// Set the Newton screen size that gets reported to the guest via
+/// `GetScreenInfo`. Must be called before the guest first issues
+/// the GetScreenInfo native primitive — in practice before the
+/// guest's ERET in `kmain`. Width is clamped to a multiple of 4.
+///
+/// Only called from `host_io::pi_fb::init`; absent on builds without
+/// that backend (QEMU / FVP / guest-test) where the 320×480 default
+/// stays in effect.
+#[allow(dead_code)]
+pub fn set_screen_size(w: u32, h: u32) {
+    let w = w & !3;
+    SCREEN_W.store(w, Ordering::Relaxed);
+    SCREEN_H.store(h, Ordering::Relaxed);
+}
+
+/// Maximum Newton screen pixels the blit scratch (and any other
+/// fixed-size buffers downstream) needs to handle. Covers Newton
+/// surfaces up to 1280×960 (over an 1920×1080 panel at scale=2 →
+/// 960×540, or a 4K panel at scale=4 → 960×540). At 2 bpp that's
+/// 300 KiB. `set_screen_size` will halt the boot if asked for a
+/// larger surface.
+pub const MAX_SCREEN_W: u32 = 1280;
+pub const MAX_SCREEN_H: u32 = 960;
 
 fn get_screen_info(ctx: &mut TrapContext, pc: u32) {
     let info_addr = ctx.x[1] as u32;
     // Layout per TNativePrimitives.cpp:1590-1598.
     let fields = [
-        (0x00, SCREEN_HEIGHT),
-        (0x04, SCREEN_WIDTH),
+        (0x00, screen_height()),
+        (0x04, screen_width()),
         (0x08, SCREEN_BPP),
         (0x0C, 0x0000_0037), // unknown (Einstein verbatim)
         (0x10, 0x0064_0064), // resolution 100x100
@@ -226,7 +271,7 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
     // hypervisor-managed linear-LE — host byte N is pixel byte N in
     // display order — so FB writes don't XOR.
     let src_width_pixels = (src_right - src_left) as u32;
-    let fb_row_bytes = FB_ROW_BYTES;
+    let fb_row_bytes = fb_row_bytes();
 
     // Blit mode (Einstein `Emulator/Screen/TScreenManager.cpp:280`):
     //   0 = srcCopy (default).
@@ -255,9 +300,10 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
 
     // Scratch buffer used to assemble the contiguous 2-bpp payload that
     // gets forwarded to the host viewer at the end. Sized for the
-    // worst case (full-screen redraw). Single-threaded EL2 access, no
-    // contention.
-    const SCRATCH_LEN: usize = (SCREEN_WIDTH * SCREEN_HEIGHT / 4) as usize;
+    // worst case (full-screen redraw at the upper bound the runtime
+    // screen size is allowed to reach). Single-threaded EL2 access,
+    // no contention.
+    const SCRATCH_LEN: usize = (MAX_SCREEN_W * MAX_SCREEN_H / 4) as usize;
     struct ScratchCell(core::cell::UnsafeCell<[u8; SCRATCH_LEN]>);
     // SAFETY: single-threaded EL2 trap handler.
     unsafe impl Sync for ScratchCell {}

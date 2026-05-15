@@ -466,39 +466,40 @@ const K_HDWR_GPIO_E000: u64 = 0x0F18_E000;
 const K_HDWR_GPIO_E800: u64 = 0x0F18_E800;
 const K_HDWR_GPIO_EC00: u64 = 0x0F18_EC00;
 
-/// Synthetic Newton-tick counter. Bumped by `tick_advance` from the
-/// hypervisor's tick-page update path — once on every guest sync trap
-/// and once on every CNTHP heartbeat. **Decoupled from wall clock.**
+/// Synthetic Newton-tick counter used **only on QEMU/FVP hosts**
+/// (`cfg(not(feature = "no-semihost"))`). On real Pi silicon
+/// (`no-semihost`) `ticks()` is wall-anchored to CNTPCT_EL0 and this
+/// counter is unread — the advance functions still write to it for
+/// code-path symmetry, but those writes have no observable effect.
 ///
-/// Why not wall-anchored: under QEMU TCG with `--features trace,quiet`
-/// and the shadow-stub UDF emulator we execute ~100× fewer guest
-/// instructions per host wall-second than Einstein's JIT does (each
-/// HVC trampoline alone costs ~30 µs). When the kernel's polling loops
-/// (TBIOInterface::WaitBIOStatus, TDelayTimer::TimedOut callers, etc.)
-/// arm a wall-anchored Newton-tick deadline, our wall-clock-derived
-/// tick value crosses that deadline after far fewer poll iterations
-/// than Einstein's, perturbing the kernel's heap allocator interleave
-/// and steering `__nw__FUi(184)` towards a VA range that aliases
-/// pckm's stack page. See INVESTIGATION.md.
+/// Why not wall-anchored on QEMU: under QEMU TCG with `--features
+/// trace,quiet` and the shadow-stub UDF emulator we execute ~100×
+/// fewer guest instructions per host wall-second than Einstein's JIT
+/// does (each HVC trampoline alone costs ~30 µs). When the kernel's
+/// polling loops (TBIOInterface::WaitBIOStatus, TDelayTimer::TimedOut
+/// callers, etc.) arm a wall-anchored Newton-tick deadline, our
+/// wall-clock-derived tick value crosses that deadline after far
+/// fewer poll iterations than Einstein's, perturbing the kernel's
+/// heap allocator interleave and steering `__nw__FUi(184)` towards a
+/// VA range that aliases pckm's stack page. See INVESTIGATION.md.
 ///
 /// The synthetic clock advances proportional to **guest progress**
 /// (each sync trap ≈ a fixed slice of guest instructions), so
 /// timeout-bounded polling loops iterate about as many times in our
-/// run as in Einstein's, regardless of how slowly the host wall clock
-/// is moving.
+/// QEMU run as in Einstein's, regardless of how slowly the host
+/// wall clock is moving.
 ///
 /// Δ per `tick_advance` call is calibrated empirically. Einstein's
 /// `TBIOInterface::WaitBIOStatus` polls `TDelayTimer::TimedOut` 65
 /// times against a 400-tick threshold, i.e. ≈ 6.15 ticks per poll
 /// iteration; rounded up to 8 to allow some slack.
 ///
-/// Calendar / RTC: we deliberately do *not* try to keep this clock
-/// synchronised with wall time. `calendar_seconds()` still reads
-/// CNTPCT directly so RTC reads return plausible "seconds since 1904"
-/// values, but the kernel's tick-domain math no longer agrees with
-/// those seconds (a 1-second wall interval will not advance the tick
-/// register by 3,686,400 in this scheme). Real-time-clock semantics
-/// are not load-bearing for the Phase B boot trajectory.
+/// On real silicon the QEMU instruction-anchored rationale doesn't
+/// apply — guest code runs at native A53 speed, hypervisor trap
+/// overhead is microseconds (not tens of µs), and `SafeShortTimerDelay`
+/// loops that intend "10 ms wall" actually want 10 ms of wall time.
+/// The wall-anchored `ticks()` path in `no-semihost` builds reads
+/// CNTPCT_EL0 directly and scales by `NEWTON_TICK_HZ / CNTFRQ_EL0`.
 static SYNTH_TICKS: AtomicU32 = AtomicU32::new(0);
 
 /// How many synthetic ticks each guest sync trap adds. Tuned
@@ -524,10 +525,28 @@ const TICK_ADVANCE_PER_TRAP: u32 = 6;
 /// guest progress, defeating the instruction-anchored model.
 const TICK_ADVANCE_PER_HEARTBEAT: u32 = 1024;
 
-/// Synthetic-tick reader. Returns the current count without advancing
-/// it; advancement happens via `tick_advance` from the tick-page
-/// update path.
+/// Current Newton-tick value as seen by guest reads of `kHdWr_Ticks`
+/// (0x0F181800) — both via MMIO trap (`vic::read`) and via the
+/// non-trapping `TICK_PAGE`.
+///
+/// On real silicon (`cfg(feature = "no-semihost")`) this is wall-
+/// anchored: CNTPCT_EL0 elapsed since `init()` scaled by
+/// `NEWTON_TICK_HZ / CNTFRQ_EL0`. A `SafeShortTimerDelay` that asks
+/// for ~10 ms of ticks gets ~10 ms of wall time, modulo the
+/// `TICK_PAGE` republish granularity (every sync trap, plus the
+/// ~16 ms CNTHP heartbeat for non-trapping busy waits).
+///
+/// On QEMU/FVP this returns the `SYNTH_TICKS` synthetic counter,
+/// advanced by `tick_advance_*` from the tick-page update path. See
+/// the `SYNTH_TICKS` doc-comment for the QEMU-specific rationale.
 pub fn ticks() -> u32 {
+    #[cfg(feature = "no-semihost")]
+    {
+        let elapsed = read_cntpct().wrapping_sub(TICK_EPOCH.load(Ordering::Acquire));
+        let freq = read_cntfrq() as u128;
+        ((elapsed as u128 * NEWTON_TICK_HZ as u128) / freq) as u32
+    }
+    #[cfg(not(feature = "no-semihost"))]
     SYNTH_TICKS.load(Ordering::Acquire)
 }
 
@@ -541,7 +560,9 @@ pub fn tick_advance_sync_trap() -> u32 {
 
 /// Bump SYNTH_TICKS by the heartbeat delta. Called from
 /// `timer::on_irq` (every CNTHP heartbeat) so that non-trapping
-/// busy-wait loops still see ticks advance.
+/// busy-wait loops still see ticks advance. Unused on `no-semihost`
+/// where `ticks()` is wall-anchored.
+#[cfg(not(feature = "no-semihost"))]
 pub fn tick_advance_heartbeat() -> u32 {
     let prev = SYNTH_TICKS.fetch_add(TICK_ADVANCE_PER_HEARTBEAT, Ordering::AcqRel);
     prev.wrapping_add(TICK_ADVANCE_PER_HEARTBEAT)
@@ -577,7 +598,17 @@ pub fn tick_advance() -> u32 {
 /// guest is making progress — doing so would let the heartbeat skip
 /// past a polling loop's deadline before the loop iterated as many
 /// times as the kernel intended.
+///
+/// On real silicon (`no-semihost`) `ticks()` is wall-anchored, so
+/// match deadlines are crossed naturally by CNTPCT advancing; the
+/// fast-forward is moot. The matching
+/// `tick_page::update_from_heartbeat` call republishes the current
+/// wall-anchored `ticks()` into the guest's read-only tick page.
 pub fn heartbeat_tick_update() {
+    #[cfg(feature = "no-semihost")]
+    return;
+    #[cfg(not(feature = "no-semihost"))]
+    {
     static LAST_HEARTBEAT_TICK: AtomicU32 = AtomicU32::new(0);
     let last = LAST_HEARTBEAT_TICK.load(Ordering::Acquire);
     let cur = SYNTH_TICKS.load(Ordering::Acquire);
@@ -610,6 +641,7 @@ pub fn heartbeat_tick_update() {
     };
 
     LAST_HEARTBEAT_TICK.store(final_value, Ordering::Release);
+    }
 }
 
 // ---------- MMIO dispatch ----------------------------------------------------

@@ -129,6 +129,11 @@ pub const CLOCK_ID_EMMC: u32 = 1;
 pub const CLOCK_ID_UART: u32 = 2;
 pub const CLOCK_ID_ARM: u32 = 3;
 pub const CLOCK_ID_CORE: u32 = 4;
+/// Pixel clock — the HDMI scan-out rate. Used by audio::pi_hdmi to
+/// compute the CTS regeneration value (CTS = pixel_clock × N /
+/// (128 × samplerate)). Per the Pi firmware mailbox property-tag
+/// interface wiki, clock_id 9 is `PIXEL`.
+pub const CLOCK_ID_PIXEL: u32 = 9;
 
 #[derive(Debug, Clone, Copy)]
 pub enum MailboxError {
@@ -266,6 +271,19 @@ pub fn set_power_state(device_id: u32, state: u32) -> Result<u32, MailboxError> 
 pub fn get_clock_rate(clock_id: u32) -> Result<u32, MailboxError> {
     let mut payload = [clock_id, 0];
     send_one_tag(TAG_GET_CLOCK_RATE, &mut payload)?;
+    Ok(payload[1])
+}
+
+/// Query the *measured* rate of a clock ID, in Hz. Differs from
+/// `get_clock_rate` in that this reads back the divider currently
+/// running in silicon rather than the value firmware last configured.
+/// For the pixel clock the configured rate often reads back as 0 on
+/// a `display_auto_detect=1` boot (the firmware drove the modeset
+/// without persisting a "configured" pixel rate); the measured rate
+/// is whatever divider the encoder is actually emitting at.
+pub fn get_clock_rate_measured(clock_id: u32) -> Result<u32, MailboxError> {
+    let mut payload = [clock_id, 0];
+    send_one_tag(TAG_GET_CLOCK_RATE_MEASURED, &mut payload)?;
     Ok(payload[1])
 }
 

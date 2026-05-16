@@ -125,6 +125,12 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
     // heartbeat. Cheap: backend self-throttles to 16 ms wall.
     crate::host_io::pump_input();
     crate::input::pump();
+    // Top up the HDMI audio FIFO from the host audio ring. Polled
+    // every sync trap so we don't underrun at 44.1 kHz stereo
+    // (~768 samples per 16 ms IRQ heartbeat exceeds FIFO depth,
+    // but the trap rate is much higher than the heartbeat). No-op
+    // on the null backend.
+    crate::audio::pump();
 
     // Guest MMIO writes to IntCtrl / FIQMask / IntClear change the
     // effective (`int_present & int_ctrl & ~fiq_mask`) pending set and
@@ -303,6 +309,25 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
                     elr, same_pc, inject_count
                 );
             }
+            // On the first detection, dump the last 32 UND faulting
+            // PCs AND the kernel task census. The UND history shows
+            // the loop body (the guest PCs that keep UND-trapping —
+            // for the Phase-B sound stall it's a tight SWP-spin
+            // through TULockingSemaphore::Acquire/Release). The task
+            // dump then names the owning task and the semaphore it's
+            // waiting on, so we can identify which kernel object is
+            // never being signalled.
+            if inject_count == 1 {
+                dump_und_history();
+                crate::task_dump::dump();
+                let counts = crate::peripherals::sound::snapshot_subfn_counts();
+                kprintln!("sound subfn invocation counts (since boot):");
+                for (i, c) in counts.iter().enumerate() {
+                    if *c > 0 {
+                        kprintln!("  subfn {:#04x}: {}", i, c);
+                    }
+                }
+            }
             vic::inject_sound_dma_irq();
         }
     }
@@ -321,6 +346,9 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     // same queue.
     crate::host_io::pump_input();
     crate::input::pump();
+    // Top up HDMI audio FIFO from timer IRQ tail too — guarantees
+    // forward progress even when the guest is in a no-sync-trap idle.
+    crate::audio::pump();
     update_virq();
     // Advance the boot-splash progress bar (no-op once the guest's
     // first blit has frozen the splash, and on platforms without
@@ -1365,10 +1393,22 @@ struct UndHistEntry {
     spsr_und: u32,
     lr_usr: u32,
     sp_for_mode: u32,
+    /// Heuristic stack-walked caller LR. For SWP UNDs inside Acquire
+    /// we read SP+32; inside Release we read SP+12.
+    caller_lr: u32,
+    /// Outer-outer caller. For Acquire-from-Grabber::ct (the dominant
+    /// case in the Phase-B sound stall), this is the function that
+    /// constructed the Grabber — e.g. `TNewInternalFlash::Read`,
+    /// `TMuxStore::Read`. Read from SP+92 (Acquire push + Grabber::ct
+    /// push + Read's `sub sp,#4` slot + Read's saved LR offset).
+    outer_caller_lr: u32,
 }
 const UND_HIST_LEN: usize = 32;
 static mut UND_HISTORY: [UndHistEntry; UND_HIST_LEN] = [
-    UndHistEntry { faulting_pc: 0, insn: 0, spsr_und: 0, lr_usr: 0, sp_for_mode: 0 };
+    UndHistEntry {
+        faulting_pc: 0, insn: 0, spsr_und: 0, lr_usr: 0,
+        sp_for_mode: 0, caller_lr: 0, outer_caller_lr: 0,
+    };
     UND_HIST_LEN
 ];
 static mut UND_HIST_NEXT: usize = 0;
@@ -1379,12 +1419,47 @@ fn record_und_history(faulting_pc: u32, insn: u32, spsr_und: u32, ctx: &TrapCont
     // the faulting code's stack was. lr_usr is ctx.x[14]; for non-USR
     // sources it's still informative as the user-space caller LR.
     let sp = crate::banked::sp_for_mode(ctx, spsr_und);
+    // Heuristic caller-LR capture: SWP at the TULockingSemaphore::Swap
+    // helper (0x003ae204) is the wedge signature in `Phase-B stall after
+    // TSoundServer::TheMain stack-collision`. Acquire's prologue pushes
+    // 10 words (`push {r4-r9, fp, ip, lr, pc}`) and calls Swap with no
+    // intervening stack changes; Release's prologue pushes 5 words.
+    // Distinguish by lr_usr (= the bl-Swap return PC):
+    //   0x0025a2c8 → Acquire → caller LR at SP+32
+    //   0x0025a338 → Release → caller LR at SP+12
+    // For Acquire, the immediate caller is TULockingSemaphoreGrabber::ct
+    // (RAII helper at 0x0013b6d4). To find the outer function that
+    // constructed the Grabber we walk one more frame: Grabber::ct's
+    // own pushed LR sits at SP+(40+16) = SP+56, and the function that
+    // CALLED that constructor (i.e. TNewInternalFlash::Read, TMuxStore::Read,
+    // etc.) lives at SP+(64+24+4) = SP+92 — Read pushes 8 words then
+    // `sub sp,#4` before bl Grabber::ct.
+    let lr_usr_raw = ctx.x[14] as u32;
+    let (caller_lr, outer_caller_lr) = if faulting_pc == 0x003a_e204 {
+        if lr_usr_raw == 0x0025_a2c8 {
+            // SWP inside Acquire: SP+32 = caller of Acquire (= Grabber::ct),
+            // SP+92 = caller of Grabber::ct (= the Read function).
+            let c = crate::guest_endian::guest_read_u32_va(sp.wrapping_add(32)).unwrap_or(0);
+            let o = crate::guest_endian::guest_read_u32_va(sp.wrapping_add(92)).unwrap_or(0);
+            (c, o)
+        } else if lr_usr_raw == 0x0025_a338 {
+            // SWP inside Release: SP+12 = caller of Release (= Grabber::dt).
+            let c = crate::guest_endian::guest_read_u32_va(sp.wrapping_add(12)).unwrap_or(0);
+            (c, 0)
+        } else {
+            (0, 0)
+        }
+    } else {
+        (0, 0)
+    };
     let entry = UndHistEntry {
         faulting_pc,
         insn,
         spsr_und,
         lr_usr: ctx.x[14] as u32,
         sp_for_mode: sp,
+        caller_lr,
+        outer_caller_lr,
     };
     // SAFETY: single-threaded EL2.
     unsafe {
@@ -1406,10 +1481,10 @@ fn dump_und_history() {
         let e = unsafe { UND_HISTORY[i] };
         let mode = e.spsr_und & 0x1F;
         kprintln!(
-            "  #{:>3}  PC={:#010x} insn={:#010x} mode={:#x}({}) sp={:#010x} lr_usr={:#010x}",
+            "  #{:>3}  PC={:#010x} insn={:#010x} mode={:#x}({}) sp={:#010x} lr_usr={:#010x} caller={:#010x} outer={:#010x}",
             (count - n as u64 + k as u64),
             e.faulting_pc, e.insn, mode, describe_aarch32_mode(mode),
-            e.sp_for_mode, e.lr_usr,
+            e.sp_for_mode, e.lr_usr, e.caller_lr, e.outer_caller_lr,
         );
     }
 }

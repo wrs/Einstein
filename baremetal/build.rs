@@ -43,11 +43,14 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(nh_flash_persist_sd)");
     println!("cargo:rustc-check-cfg=cfg(nh_input_null)");
     println!("cargo:rustc-check-cfg=cfg(nh_input_mtouch)");
+    println!("cargo:rustc-check-cfg=cfg(nh_audio_null)");
+    println!("cargo:rustc-check-cfg=cfg(nh_audio_pi_hdmi)");
 
     select_platform_linker_script();
     resolve_host_io_backend();
     resolve_flash_persist_backend();
     resolve_input_backend();
+    resolve_audio_backend();
     emit_flash_path();
 
     let guest_test = env::var("NH_GUEST_TEST").ok();
@@ -320,6 +323,24 @@ fn resolve_input_backend() {
         ),
     };
     println!("cargo:rustc-cfg=nh_input_{chosen}");
+}
+
+/// Pick the active host-audio backend and emit `cfg(nh_audio_*)`.
+/// Same opt-in-with-fallback pattern as the other axes. Default
+/// ("null") means no host audio output; `audio-pi-hdmi` lights up
+/// `src/audio/pi_hdmi.rs` against the VC4 HDMI MAI block.
+fn resolve_audio_backend() {
+    let null = env::var("CARGO_FEATURE_AUDIO_NULL").is_ok();
+    let pi_hdmi = env::var("CARGO_FEATURE_AUDIO_PI_HDMI").is_ok();
+    let chosen = match (null, pi_hdmi) {
+        (false, false) => "null",
+        (true, false) => "null",
+        (false, true) => "pi_hdmi",
+        (true, true) => panic!(
+            "audio-null and audio-pi-hdmi are mutually exclusive"
+        ),
+    };
+    println!("cargo:rustc-cfg=nh_audio_{chosen}");
 }
 
 /// Resolve `$HOME/.newton/flash.bin` at build time and expose it as

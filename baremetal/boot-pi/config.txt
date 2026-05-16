@@ -69,3 +69,11 @@ disable_overscan=1
 # `panel / 2` so each Newton pixel is a 2×2 panel block — no panel-
 # side scaling, no resampling. See `host_io::pi_fb::init`.
 display_auto_detect=1
+
+# Force HDMI mode with audio support (vs DVI mode, which strips audio
+# packets at the encoder side). Required for the VC4 HDMI MAI path
+# in `src/audio/pi_hdmi.rs` to produce audible output; without it the
+# encoder discards the audio info frames and subframes regardless of
+# what we write into MAI_DATA. Safe to leave on with a pure-DVI sink
+# attached — the receiver just ignores the audio packets.
+hdmi_drive=2

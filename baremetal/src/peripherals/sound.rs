@@ -1,16 +1,22 @@
 //! Sound driver — Rust port of Einstein's `PMainSoundDriver` native
-//! primitive class. Newton has no audible-sound requirement on the path
-//! to `TInterpreter`, so every entry here is a no-op that mirrors the
-//! return value Einstein produces in `TNativePrimitives::
-//! ExecuteSoundDriverNative` (`Emulator/TNativePrimitives.cpp:1062-1400`).
+//! primitive class.
 //!
 //! Dispatched from `peripherals::native_primitives::execute` for any
-//! native call with driver=0x000002. Subfns that Einstein doesn't model
-//! (e.g. 0x01 New, 0x02 Delete) fall through to the default branch and
-//! halt loudly so we notice if the boot path ever starts depending on
-//! real sound state.
+//! native call with driver=0x000002. Each subfn mirrors the return
+//! value Einstein produces in `TNativePrimitives::ExecuteSoundDriverNative`
+//! (`Emulator/TNativePrimitives.cpp:1062-1400`) and, where relevant,
+//! forwards to the active [`crate::audio`] backend so the buffer
+//! actually reaches a host audio device. With the null backend (the
+//! default) the boot path to `TInterpreter` runs identically to the
+//! Einstein "no sound" emulation — Einstein returns success for most
+//! of these stubs because Newton has no audible-sound requirement on
+//! that path, so the kernel proceeds even when nothing actually
+//! plays. Subfns that Einstein doesn't model (e.g. 0x01 New, 0x02
+//! Delete) fall through to the default branch and halt loudly so we
+//! notice if the boot path ever starts depending on real sound
+//! state.
 
-use crate::{cpu, kprintln, trap::TrapContext};
+use crate::{audio, cpu, kprintln, trap::TrapContext};
 
 /// Sound-driver class ID in the native-primitive encoding.
 pub const DRIVER_ID: u32 = 0x00_0002;
@@ -20,9 +26,22 @@ pub const DRIVER_ID: u32 = 0x00_0002;
 /// `ExecuteSoundDriverNative`.
 const ERR_NO_SOUND_HARDWARE: u32 = (-30009i32) as u32;
 
+/// Per-subfn invocation count. Read by the wedge probe so a runaway
+/// poll on, e.g., subfn 0x13 (OutputIsRunning) is visible even when
+/// the per-subfn "first call" log filter has long since suppressed it.
+static mut SUBFN_COUNT: [u32; 32] = [0; 32];
+
+pub fn snapshot_subfn_counts() -> [u32; 32] {
+    // SAFETY: single-threaded EL2.
+    unsafe { SUBFN_COUNT }
+}
+
 pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
     // Diagnostic: log first occurrence of each subfn so we can see what
-    // the kernel exercises during sound init.
+    // the kernel exercises during sound init. Also tally per-subfn
+    // invocation counts so a tight kernel poll loop on a sound subfn
+    // (e.g., OutputIsRunning 0x13) shows up as a runaway count in the
+    // task dump even though the "first" filter suppresses repeats.
     static mut SEEN: u32 = 0;
     let bit = 1u32 << (subfn & 0x1F);
     // SAFETY: single-threaded.
@@ -34,6 +53,10 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
             "sound: first subfn {:#x} @PC={:#x} r1={:#x} r2={:#x} r3={:#x}",
             subfn, pc, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32
         );
+    }
+    if subfn < 32 {
+        // SAFETY: single-threaded EL2.
+        unsafe { SUBFN_COUNT[subfn as usize] = SUBFN_COUNT[subfn as usize].saturating_add(1); }
     }
     // Subfn arms below mirror Einstein's `ExecuteSoundDriverNative`
     // (`Emulator/TNativePrimitives.cpp:1062-1400`) one-for-one. The
@@ -81,9 +104,11 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         // (TNativePrimitives.cpp:1112-1132) stores
         //   mSoundOutputBuffer1Addr = r1
         //   mSoundOutputBuffer2Addr = r3
-        // for subfn 0x07 to read back. STUB: we drop both addresses;
-        // the matching 0x07 below also no-ops, so nothing reads them.
+        // for subfn 0x07 to read back. We hand both VAs to the
+        // audio backend so the ping-pong 0x07 calls can pick the
+        // right one.
         0x05 => {
+            audio::set_output_buffers(ctx.x[1] as u32, ctx.x[3] as u32);
             ctx.x[0] = 0;
         }
 
@@ -96,10 +121,12 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         // 0x07 ScheduleOutputBuffer(r1=which, r2=amount) — Einstein
         // (TNativePrimitives.cpp:1151-1172) picks
         // `mSoundOutputBuffer{1,2}Addr` per `r1` and calls
-        // `mSoundManager->ScheduleOutputBuffer(buffer, amount)`. STUB:
-        // no host sound backend, no scheduled playback; the buffer
-        // address from 0x05 was never stored anyway.
+        // `mSoundManager->ScheduleOutputBuffer(buffer, amount)`. We
+        // delegate to the audio backend, which reads the indicated
+        // half of the ping-pong, resamples + SPDIF-encodes, and
+        // queues a buffer-complete IRQ once the tail catches up.
         0x07 => {
+            audio::schedule_output(ctx.x[1] as u32, ctx.x[2] as u32);
             ctx.x[0] = 0;
         }
 
@@ -118,8 +145,11 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
 
         // 0x0D StartOutput — Einstein calls
         // `mSoundManager->StartOutput()` and returns 0
-        // (TNativePrimitives.cpp:1219-1226). STUB: no host sound.
+        // (TNativePrimitives.cpp:1219-1226). We arm MAI_CTL.ENABLE
+        // on the active audio backend so HDMI audio packets start
+        // streaming.
         0x0D => {
+            audio::start_output();
             ctx.x[0] = 0;
         }
 
@@ -131,8 +161,11 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
 
         // 0x0F StopOutput — Einstein calls
         // `mSoundManager->StopOutput()` and returns 0
-        // (TNativePrimitives.cpp:1236-1243). STUB: no host sound.
+        // (TNativePrimitives.cpp:1236-1243). Drop the MAI ENABLE bit
+        // so the HDMI receiver doesn't keep hearing residual ring
+        // contents between Newton clips.
         0x0F => {
+            audio::stop_output();
             ctx.x[0] = 0;
         }
 
@@ -151,9 +184,9 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
 
         // 0x13 OutputIsRunning — Einstein returns
         // `mSoundManager->OutputIsRunning()` (TNativePrimitives.cpp:
-        // 1269-1275). STUB: no host sound, so nothing is running.
+        // 1269-1275). Defers to the active audio backend.
         0x13 => {
-            ctx.x[0] = 0;
+            ctx.x[0] = if audio::output_is_running() { 1 } else { 0 };
         }
 
         // 0x14 InputIsRunning, 0x15 CurrentOutputPtr,
@@ -165,17 +198,21 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
 
         // 0x17 OutputVolume(r1) — Einstein calls
         // `mSoundManager->OutputVolume(r1)` and returns 0
-        // (TNativePrimitives.cpp:1301-1310). STUB: no host sound;
-        // the requested volume is dropped.
+        // (TNativePrimitives.cpp:1301-1310). We stash the value on
+        // the backend so the matching 0x18 getter sees the same
+        // fader the kernel just set, even though the HDMI MAI
+        // hardware has no software fader of its own.
         0x17 => {
+            audio::output_volume_set(ctx.x[1] as u32);
             ctx.x[0] = 0;
         }
 
         // 0x18 OutputVolume getter — Einstein returns
         // `mSoundManager->OutputVolume()` (TNativePrimitives.cpp:
-        // 1312-1318). STUB: no host sound; we report 0.
+        // 1312-1318). Returns the value passed to the most recent
+        // 0x17, or kOutputVolume_Max if the kernel queried first.
         0x18 => {
-            ctx.x[0] = 0;
+            ctx.x[0] = audio::output_volume_get() as u64;
         }
 
         // 0x19 InputVolume(r1) — Einstein clamps r1 to 0xFF and
@@ -210,9 +247,14 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         // 0x1F NativeSetInterruptMask(r1=in_mask, r2=out_mask) —
         // Einstein calls `mSoundManager->SetInterruptMask(r1, r2)`
         // and explicitly leaves r0 unchanged (no `SetRegister(0,…)`
-        // in TNativePrimitives.cpp:1378-1389). STUB: no host sound,
-        // mask dropped; we mirror the "r0 untouched" detail.
-        0x1F => {}
+        // in TNativePrimitives.cpp:1378-1389). The output mask is
+        // what the backend raises through `vic::raise` after a
+        // buffer's worth of samples has drained, so the kernel
+        // calls 0x07 again with the next half of the ping-pong. We
+        // mirror Einstein's "r0 untouched" detail.
+        0x1F => {
+            audio::set_interrupt_mask(ctx.x[1] as u32, ctx.x[2] as u32);
+        }
 
         _ => {
             kprintln!(

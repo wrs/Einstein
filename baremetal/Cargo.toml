@@ -145,6 +145,27 @@ flash-persist-sd = []
 input-null = []
 input-mtouch = []
 
+# Host audio backend. Opt-in only — at most one may be enabled. If
+# none are enabled, build.rs picks "null" (no host audio output).
+# Source code reads `#[cfg(nh_audio_*)]`. See `src/audio/mod.rs`.
+#
+#   audio-null    — no host audio output. Default; QEMU/FVP and any
+#                   real-hw build that doesn't include the HDMI
+#                   driver. The Newton sound code is still
+#                   exercised — buffers are just dropped.
+#   audio-pi-hdmi — VC4 HDMI MAI audio injector at 0x3F90_2000.
+#                   Encodes Newton PCM to IEC 60958 (SPDIF) subframes
+#                   and pokes them into the HDMI block's audio FIFO;
+#                   the VC firmware embeds the subframes into the
+#                   video blanking interval. Requires
+#                   `hdmi_drive=2` in config.txt to enable HDMI
+#                   audio at the firmware level. Selected by the
+#                   `pi-bare-metal-audio` aggregate (and rolled into
+#                   `pi-bare-metal-input` so real-hw builds with the
+#                   touchscreen also get sound).
+audio-null = []
+audio-pi-hdmi = []
+
 # Compile the standalone `usb-probe` binary. Off by default because
 # the USB stack underneath (`src/usb/host/dwc2/`) is bring-up code
 # and the probe pulls it in. See [[bin]] section for build line.
@@ -201,6 +222,7 @@ pi-bare-metal-input = [
     "flash-persist-sd",
     "host-io-pi-fb",
     "input-mtouch",
+    "audio-pi-hdmi",
 ]
 
 # Real-hardware SDHOST bring-up probe. When enabled, kmain stops

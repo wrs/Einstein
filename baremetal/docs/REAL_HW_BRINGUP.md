@@ -645,40 +645,80 @@ in the Newton region need scaling back to 0..319 × 0..479.
 
 Maps to existing milestones M6 in HIGHLEVEL.md §12.
 
-### Audio: HDMI out via BCM2835 PCM/I2S
+### Audio: HDMI out via the VC4 HDMI MAI block
 
-**Effort:** ~1 week. **Depends on:** Phase 4 (HDMI link already up).
-**Reference:** Circle `lib/sound/hdmisoundbasedevice.cpp`.
+**Effort:** in progress. **Depends on:** Phase 4 (HDMI link already up).
+**Reference:** Circle `lib/sound/hdmisoundbasedevice.cpp`,
+`drivers/gpu/drm/vc4/vc4_hdmi.c`.
 
-The bench panel has speakers and accepts HDMI audio. The Pi
-firmware embeds IEC 60958 PCM into the HDMI auxiliary-data
-channel; we just feed samples to the BCM2835 PCM/I2S peripheral
-at `0x3F20_3000` and the VC firmware does the rest.
+**Correction over an earlier version of this doc:** the original
+plan said "feed BCM2835 PCM/I2S peripheral at `0x3F20_3000` and the
+VC firmware embeds it into HDMI". That's wrong on Pi 0–3: the
+PCM/I2S peripheral only reaches GPIO 18–21 (external I²S DAC). HDMI
+audio on Pi 0–3 goes through the VC4 HDMI block's MAI ("Multi-
+channel Audio Interconnect") FIFO at `0x3F90_2000`, fed by SPDIF /
+IEC 60958 subframes that the HDMI encoder embeds into the video
+blanking interval. The bench panel has speakers and accepts HDMI
+audio; that path is what `src/audio/pi_hdmi.rs` drives.
 
-Sketch:
+Landed (initial cut, needs real-hw validation):
 
-1. **Mailbox setup.** Tell the VC firmware to enable HDMI audio
-   (config.txt `hdmi_drive=2` already on in Phase 4) and pick the
-   audio sample rate via the `set_clock_rate` property tag for
-   `CLOCK_ID_PCM`. 44.1 kHz stereo is fine for Newton.
-2. **PCM peripheral init.** Program CS_A, MODE_A, RXC_A, TXC_A,
-   DREQ_A registers per BCM2835 ARM Peripherals §8. Master mode,
-   2 channels, 16-bit. TX FIFO threshold halfway. No DMA initially
-   — push samples in a poll loop from the timer IRQ.
-3. **Newton sample feed.** Einstein's Voyager DSP emulation
-   produces ~22 kHz mono samples. Upsample to 44.1 kHz with linear
-   interpolation, duplicate to stereo, push into the TX FIFO from
-   the existing timer-IRQ context.
-4. **`AudioSink` trait** in `src/audio/mod.rs` with one impl
-   (`HdmiAudio`) and a `NullAudio` for QEMU. Same shape as the
-   `PenSource` seam from Phase 5a.
+1. **`audio` module seam** (`src/audio/mod.rs`) — same shape as
+   `host_io` / `input` axes; backend selected by `audio-*` Cargo
+   features and resolved in `build.rs` to `cfg(nh_audio_*)`. Null
+   default for QEMU/FVP; `audio-pi-hdmi` rolled into
+   `pi-bare-metal-input` so the existing real-hw aggregate gets
+   sound for free.
+2. **VC4 HDMI MAI bring-up** (`src/audio/pi_hdmi.rs`) — MAI_CTL
+   reset + flush, MAI_FMT = 44.1 kHz PCM, MAI_CONFIG bit-reverse +
+   format-reverse + channel-mask = stereo, MAI_CHANNEL_MAP =
+   0b001000 (Pi ≤3 stereo L+R), AUDIO_PACKET_CONFIG = stereo +
+   B-preamble, CRP_CFG external-CTS + N=5644 for 44.1 kHz, CTS0/1
+   = 27000 (default 27 MHz pixel clock).
+3. **CEA Audio InfoFrame** so the receiver knows to expect PCM
+   stereo 16-bit 44.1 kHz. Written into the HDMI RAM packet slot
+   and enabled via `HDMI_RAM_PACKET_CONFIG`.
+4. **Newton sample feed** — Newton's 22.05 kHz mono BE-S16 is
+   sample-and-hold upsampled to 44.1 kHz stereo (exact 2× ratio,
+   so no interpolator), pushed into a 4096-frame ring from
+   `sound::handle` subfn 0x07.
+5. **SPDIF encoding + polled FIFO feed** — `audio::pump` from the
+   trap-IRQ and sync-trap tails: for each ring frame, build two
+   IEC 60958 subframes (24-bit sample shifted into bits 27..4,
+   parity in bit 31, B-preamble on the first subframe of each
+   192-frame block) and write to `HDMI_MAI_DATA`.
+6. **Buffer-completion IRQ** — once `pump` drains the ring to the
+   mark the producer recorded, raise the output-interrupt mask the
+   kernel passed in subfn 0x1F so subfn 0x07 fires again with the
+   next half of the ping-pong.
 
-Out of scope:
-- DMA-driven audio. Polling at IRQ rate is enough at 22 kHz mono.
+What still needs first-light testing on real hw:
+
+- **MAI register bitfields are reconstructed**, not validated. The
+  exact bit positions for `MAI_CTL_ENABLE`, `MAI_CTL_FULL`,
+  `MAI_CTL_CHNUM_SHIFT`, the sample-rate code in `MAI_FMT`, etc.
+  came from Circle's `hdmisoundbasedevice.cpp` + `vc4_hdmi.c`
+  cross-reference. Live silicon may need tweaks — `bringup_mai`
+  in `pi_hdmi.rs` is where to twiddle.
+- **CTS regeneration math** — we hard-code CTS = 27000 for a
+  27 MHz pixel clock, which is the standard 720p60 audio clock.
+  Panels at non-standard modes (1366×768, 1024×600, …) need CTS
+  recomputed against the real pixel clock; if audio comes out
+  pitch-shifted or stutters with no underrun warnings, this is
+  the first place to check.
+- **`hdmi_drive=2`** in `boot-pi/config.txt` (landed alongside).
+  Without it the encoder strips audio packets regardless of what
+  we write into MAI_DATA.
+
+Out of scope for this cut:
+- DMA-driven audio. Polling from the trap tail is enough at
+  44.1 kHz stereo if the trap rate doesn't drop below ~700 Hz.
+  If a quiet stretch of the guest underruns the FIFO and the
+  output sounds chunked, switch to BCM2835 DMA via DREQ from the
+  HDMI block — Circle's reference does exactly this.
 - PWM audio output. Pi Zero 2 W has no 3.5 mm jack and the GPIO
   PWM path needs an external low-pass filter — not worth it.
-- HDMI audio CEA timing-info packets. The Pi firmware handles
-  them automatically when audio is enabled.
+- BCM2835 PCM/I2S to GPIO. Same reason — needs an external DAC.
 
 ### Serial + PCMCIA
 
@@ -697,14 +737,14 @@ single `platform-raspi3b` Cargo feature drives both (no separate
 `platform-pi-zero2w`). The differences live in opt-in backends
 selected by aggregate features:
 
-| Feature | semihost | flash-persist | host-io | input | Intended target |
-|---|---|---|---|---|---|
-| (default) | on | semihost | null | null | `cargo run` against QEMU |
-| `pi-bare-metal` | off | null | null | null | first-light real-hw boot |
-| `pi-bare-metal-sd` | off | sd | null | null | real-hw with persistent state |
-| `pi-bare-metal-display` | off | sd | pi-fb | null | real-hw, full display |
-| `pi-bare-metal-input` | off | sd | pi-fb | mtouch | real-hw, full display + USB touch |
-| `platform-fvp-base` | on | semihost | null | null | FVP cycle-accurate runs |
+| Feature | semihost | flash-persist | host-io | input | audio | Intended target |
+|---|---|---|---|---|---|---|
+| (default) | on | semihost | null | null | null | `cargo run` against QEMU |
+| `pi-bare-metal` | off | null | null | null | null | first-light real-hw boot |
+| `pi-bare-metal-sd` | off | sd | null | null | null | real-hw with persistent state |
+| `pi-bare-metal-display` | off | sd | pi-fb | null | null | real-hw, full display |
+| `pi-bare-metal-input` | off | sd | pi-fb | mtouch | pi-hdmi | real-hw, full display + USB touch + HDMI audio |
+| `platform-fvp-base` | on | semihost | null | null | null | FVP cycle-accurate runs |
 
 The `pi-bare-metal-input` aggregate compiles cleanly today; pen
 events flow only when the DWC2 host stub (`src/usb/host/dwc2/`)
@@ -747,7 +787,7 @@ These don't block the plan but should be captured as they come up:
 | 3 — Snapshot on real hw | **deferred** | Snapshots are valuable when debugging late-boot state on QEMU/FVP; on real silicon the boot tends to *complete*, so the rewind-by-2s loop they accelerate isn't load-bearing. Skip until a real-hw bug demands them. |
 | 4 — Display | **done (2026-05-12)** | `host-io-pi-fb` backend running on real hw. Newton's 320x480 2 bpp FB scaled 1.5x to 480x720 centred on a 1280x720 HDMI panel (CEA mode 4 forced for link stability). Output looks like the QEMU/FVP host-viewer image but with nearest-neighbor aliasing; bilinear or integer-scale-with-letterbox is a follow-up. |
 | 5 — USB input (touchscreen) | **done (2026-05-12)** | TSTP MTouch panel working end-to-end on Walter's Pi Zero 2 W. Taps on the HDMI-connected touchscreen drive Newton's UI (Continue button on Welcome screen responds to both fast and slow taps). |
-| 6 — HDMI audio / serial / PCMCIA | not started | Audio via HDMI through BCM2835 PCM/I2S (bench panel has speakers). USB stack stays single-device-no-hub permanently. |
+| 6 — HDMI audio / serial / PCMCIA | audio: initial cut landed, real-hw validation pending | HDMI audio via the VC4 HDMI MAI block at 0x3F90_2000 (not the BCM2835 PCM/I2S — that goes to GPIO 18-21 only). `pi-bare-metal-input` aggregate now includes `audio-pi-hdmi`. Bench panel has speakers. USB stack stays single-device-no-hub permanently. |
 
 ### Phase 5 — closed (2026-05-12)
 

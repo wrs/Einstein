@@ -6,6 +6,7 @@
 use core::arch::global_asm;
 
 mod alrt_capture;
+mod audio;
 mod banked;
 mod cpu;
 #[cfg(feature = "platform-raspi3b")]
@@ -101,6 +102,14 @@ pub extern "C" fn kmain() -> ! {
         display::splash::init();
     }
 
+    // Bring audio up here, before the slow flash_persist::init load.
+    // For the normal boot path this is just an early move — audio
+    // doesn't depend on anything below this point. For the tone-test
+    // diagnostic in `audio::pi_hdmi::init`, this lets the test
+    // take over the CPU without waiting 5+ seconds for the 8 MiB
+    // NEWTON.BIN copy from SD.
+    audio::init();
+
     // Seed the Newton flash filesystem header before stage-2 exposes
     // the backing to the guest. Safe because the backing is a static
     // mut touched only from core 0 during boot.
@@ -153,6 +162,7 @@ pub extern "C" fn kmain() -> ! {
     timer::init();
     host_io::init();
     input::init();
+    // audio::init() moved earlier — see comment above flash::init.
 
     // Seed the snapshot ring's sequence counter from existing slots
     // (so resumed runs don't reuse seq numbers), then attempt to

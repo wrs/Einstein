@@ -39,6 +39,8 @@ const UART_LCRH: *mut u32 = (UART_BASE + 0x2C) as *mut u32;
 const UART_CR: *mut u32 = (UART_BASE + 0x30) as *mut u32;
 const UART_IMSC: *mut u32 = (UART_BASE + 0x38) as *mut u32;
 const UART_ICR: *mut u32 = (UART_BASE + 0x44) as *mut u32;
+#[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+const UART_DMACR: *mut u32 = (UART_BASE + 0x48) as *mut u32;
 
 const FR_RXFE: u32 = 1 << 4; // Receive FIFO empty.
 const FR_TXFF: u32 = 1 << 5; // Transmit FIFO full.
@@ -62,8 +64,8 @@ const FBRD_VAL: u32 = {
 /// console output.
 ///
 /// With `no-semihost` enabled (real-silicon builds), the semihosting
-/// stdout open is skipped and `kprintln!` routes through the PL011 wire
-/// instead — see `write_str` below.
+/// stdout open is skipped and `kprintln!` routes through a ring buffer
+/// drained by BCM2835 DMA — see `write_str` and `tx_dma` below.
 pub fn init() {
     // SAFETY: MMIO at fixed, documented addresses; called once at startup
     // before other cores are running any hypervisor code.
@@ -78,6 +80,25 @@ pub fn init() {
     }
     #[cfg(not(feature = "no-semihost"))]
     sh::open_stdout();
+    // DMA-driven TX is brought up separately via `init_dma_tx`, which
+    // MUST run after `mmu::init` enables Normal-WB cacheable RAM.
+    // Before the MMU is on, RAM is treated as Normal Non-cacheable
+    // memory, and exclusive accesses (LDXR/STXR, which Rust uses for
+    // atomic RMW on a v8.0 core like Cortex-A53) are CONSTRAINED
+    // UNPREDICTABLE on Non-cacheable memory — in practice the A53
+    // raises a synchronous abort. The ring's bookkeeping uses
+    // AtomicU32 RMW ops, so we cannot start the DMA path before the
+    // MMU is up. Output before `init_dma_tx` keeps going through the
+    // polled `write_byte` fallback inside `write_str`.
+}
+
+/// Bring up the DMA-driven TX path. Must be called AFTER `mmu::init`
+/// — see comment in `init` above. Idempotent. No-op outside the
+/// `no-semihost` + `platform-raspi3b` build, so callers don't need to
+/// mirror the cfg.
+pub fn init_dma_tx() {
+    #[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+    tx_dma::init();
 }
 
 /// Write a single byte to the PL011, busy-waiting until the TX FIFO has
@@ -202,12 +223,24 @@ mod sh {
 /// Default build: routes through Arm Semihosting `SYS_WRITE` to `:tt`,
 /// keeping PL011 free for the guest's external-serial chip emulation.
 ///
-/// `no-semihost` build (real Pi silicon): routes through `write_byte`
-/// over PL011 directly. The guest's external-serial chip is not yet
-/// hooked up on real hw, so the wire is ours. Bytes emitted before
-/// `init()` are silently dropped (UARTEN=0).
+/// `no-semihost` build (real Pi silicon): routes through the
+/// DMA-fed TX ring (`tx_dma`). Pre-init bytes (before `init()` has
+/// brought up the ring) fall back to the polled `write_byte` path so
+/// the kmain banner doesn't disappear.
 pub fn write_str(s: &str) {
-    #[cfg(feature = "no-semihost")]
+    #[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+    {
+        if tx_dma::enqueue(s.as_bytes()) {
+            return;
+        }
+        // Pre-init or ring-init failure: fall back to per-byte busy
+        // wait so early boot banners still appear.
+        for &b in s.as_bytes() {
+            write_byte(b);
+        }
+        return;
+    }
+    #[cfg(all(feature = "no-semihost", not(feature = "platform-raspi3b")))]
     {
         for &b in s.as_bytes() {
             write_byte(b);
@@ -227,6 +260,15 @@ pub fn write_str(s: &str) {
     }
 }
 
+/// DMA-completion hook called from `peripherals::host_dma::on_completion`
+/// when channel `host_dma::UART_TX_CHANNEL` reports a finished transfer.
+/// Always defined so callers don't need to mirror the cfg.
+#[inline]
+pub fn on_tx_done() {
+    #[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+    tx_dma::on_done();
+}
+
 /// Writer implementing [`core::fmt::Write`] so callers can `write!` formatted
 /// output. Routes through semihosting (`SYS_WRITE` to `:tt`).
 pub struct Writer;
@@ -234,6 +276,48 @@ pub struct Writer;
 impl fmt::Write for Writer {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         write_str(s);
+        Ok(())
+    }
+}
+
+/// Polled escape hatch: write directly to the PL011 wire (or, on the
+/// semihost build, to the host stdout) without going through the
+/// DMA ring. Use this when the fancy printer might be broken — DMA
+/// not draining, channel wedged, etc. — and you still need bytes to
+/// reach the wire.
+///
+/// Slow by design: at 115200 baud each byte busy-waits up to 87 µs
+/// once the FIFO is full. Don't use on the hot path. The
+/// `raw_println!` / `raw_print!` macros below are the ergonomic
+/// front door.
+pub fn write_str_polled(s: &str) {
+    #[cfg(feature = "no-semihost")]
+    {
+        for &b in s.as_bytes() {
+            write_byte(b);
+        }
+    }
+    #[cfg(not(feature = "no-semihost"))]
+    {
+        let fh = sh::STDOUT_FH.load(Ordering::Acquire);
+        if fh >= 0 {
+            sh::write_bytes(fh, s.as_bytes());
+        } else {
+            for &b in s.as_bytes() {
+                sh::writec(b);
+            }
+        }
+    }
+}
+
+/// `core::fmt::Write` adapter that routes through `write_str_polled`.
+/// Lets `raw_print!` / `raw_println!` format through `write!` without
+/// allocating.
+pub struct RawWriter;
+
+impl fmt::Write for RawWriter {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        write_str_polled(s);
         Ok(())
     }
 }
@@ -253,6 +337,32 @@ macro_rules! kprintln {
     ($($arg:tt)*) => {{
         use core::fmt::Write as _;
         let _ = writeln!($crate::uart::Writer, $($arg)*);
+    }};
+}
+
+/// Polled-only variants of `kprint!` / `kprintln!`. Bytes go straight
+/// to the PL011 wire via busy-waiting on FR.TXFF (or to host stdout
+/// via per-byte SYS_WRITEC on the semihost build), bypassing the DMA
+/// ring entirely. Use these:
+///   * before `uart::init()` returns (the ring isn't armed yet),
+///   * inside diagnostics that are debugging the ring itself,
+///   * from any path where you don't trust the fancy printer to
+///     have made progress.
+/// Slow — don't use on the hot path.
+#[macro_export]
+macro_rules! raw_print {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write as _;
+        let _ = write!($crate::uart::RawWriter, $($arg)*);
+    }};
+}
+
+#[macro_export]
+macro_rules! raw_println {
+    () => { $crate::raw_print!("\n"); };
+    ($($arg:tt)*) => {{
+        use core::fmt::Write as _;
+        let _ = writeln!($crate::uart::RawWriter, $($arg)*);
     }};
 }
 
@@ -365,4 +475,329 @@ macro_rules! log_host_io {
 macro_rules! log_host_io {
     () => {};
     ($($arg:tt)*) => {{ let _ = format_args!($($arg)*); }};
+}
+
+// ---- DMA-fed TX ring (real Pi only) ---------------------------------
+//
+// Without this layer, every kprintln/dprintln byte busy-waits the PL011
+// TX FIFO at 115200 baud (~87 µs/byte once full), so a 100-byte log
+// line burns ~6 ms of EL2 CPU. That's enough to break the audio pump
+// (44.1 kHz frames = 22 µs) and anything else gated on the trap-tail
+// cadence.
+//
+// The ring approach: writers enqueue bytes into a fixed RAM ring with
+// IRQs masked; a BCM2835 DMA channel paced by PL011 TX DREQ drains the
+// ring at wire rate without further CPU involvement. The completion
+// IRQ kicks the next chunk if more bytes have arrived in the meantime.
+// Wrap-around is handled by issuing one CB per contiguous tail→end or
+// start→head segment.
+#[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+mod tx_dma {
+    use core::cell::UnsafeCell;
+    use core::ptr::addr_of_mut;
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    use crate::peripherals::host_dma::{
+        self, bus_addr_periph, bus_addr_ram, DmaCb, DREQ_UART_TX, TI_DEST_DREQ, TI_INTEN,
+        TI_PERMAP_SHIFT, TI_SRC_INC, TI_WAIT_RESP,
+    };
+
+    /// 16384 characters. Sustained wire ceiling at 115200 baud is
+    /// ~11.5 KB/s, so this absorbs ~1.4 s of bursty logging before
+    /// the drop-newest policy kicks in. 8192 was tight enough on
+    /// real-hw boot bursts to trip the drop counter occasionally;
+    /// doubling costs another 32 KiB of BSS and clears it.
+    ///
+    /// Storage is one u32 per character, not one byte. The BCM2835
+    /// DMA controller has no 8-bit transfer width; the narrowest it
+    /// can do is 32-bit reads + 32-bit writes (TI.SRC_WIDTH=0,
+    /// TI.DEST_WIDTH=0). Each 32-bit write to PL011 DR transmits
+    /// only the low 8 bits, discarding the other 24, so we need the
+    /// source to be one byte per 32-bit slot with the character in
+    /// the low octet. Per-beat: DMA reads one u32 = one char, writes
+    /// it to DR, PL011 transmits it, src pointer advances by 4 bytes
+    /// to the next slot. Total ring size in RAM is RING_LEN × 4 = 64
+    /// KiB, the price for the controller having no narrower mode.
+    const RING_LEN: usize = 16384;
+
+    /// Cache-line-aligned ring storage. Cortex-A53 line size is 64 B
+    /// (see `cpu::dc_civac_range`), and the producer cleans whatever
+    /// span it's about to DMA, so aligning to 64 B avoids cleaning
+    /// adjacent unrelated data.
+    #[repr(C, align(64))]
+    struct Ring(UnsafeCell<[u32; RING_LEN]>);
+
+    // SAFETY: single-CPU hypervisor; concurrency is between mainline
+    // and the EL2 IRQ handler, mediated by IRQ-masked critical
+    // sections in `enqueue`.
+    unsafe impl Sync for Ring {}
+
+    static RING: Ring = Ring(UnsafeCell::new([0u32; RING_LEN]));
+
+    /// Producer cursor (next write index, mod RING_LEN). Advanced by
+    /// `enqueue` only.
+    static HEAD: AtomicU32 = AtomicU32::new(0);
+    /// Consumer cursor (next byte the DMA will read, mod RING_LEN).
+    /// Advanced by `kick` and `on_done`.
+    static TAIL: AtomicU32 = AtomicU32::new(0);
+    /// Length of the currently-in-flight transfer, in bytes. Zero
+    /// when the channel is idle.
+    static IN_FLIGHT_LEN: AtomicU32 = AtomicU32::new(0);
+    /// True once `init()` succeeds and writes should route through
+    /// the ring.
+    static READY: AtomicBool = AtomicBool::new(false);
+    /// Bytes the drop-newest policy refused since the last successful
+    /// enqueue with room. Flushed into the next "<<N bytes dropped>>"
+    /// marker injected ahead of normal traffic.
+    static DROPPED: AtomicU32 = AtomicU32::new(0);
+
+    /// Control block. Repacked on every `kick`.
+    static mut CB: DmaCb = DmaCb::zero();
+
+    /// Bring up the DMA controller's UART-TX channel and mark the
+    /// ring ready. Idempotent. Must run after `uart::init` has
+    /// configured PL011 (the channel destination).
+    pub fn init() {
+        if !host_dma::init() {
+            // Firmware hasn't powered this channel on. Leave READY
+            // false and PL011 DMACR at 0; writers fall back to the
+            // polled `write_byte` path.
+            return;
+        }
+        // The DMA controller paces destination writes on the
+        // peripheral's TX DREQ signal, but PL011 doesn't assert TX
+        // DREQ until DMACR.TXDMAE is set. Without this, a DMA
+        // configured with `DEST_DREQ` would sit waiting for a DREQ
+        // that never comes and no bytes would reach the wire (PL011
+        // TRM §3.3.8). Order: set this only AFTER host_dma::init
+        // succeeds, so a failed bring-up doesn't change PL011 state
+        // out from under the polled fallback path.
+        // SAFETY: MMIO write at a fixed peripheral address, identity-
+        // mapped at boot and Device-nGnRE after mmu::init.
+        unsafe { core::ptr::write_volatile(super::UART_DMACR, 1 << 1) };
+        READY.store(true, Ordering::Release);
+    }
+
+    /// Append `s` to the ring. Returns `true` if the ring is in use
+    /// (callers should not fall back to polled writes), `false` if
+    /// the DMA path isn't ready yet.
+    ///
+    /// Drop-newest on overflow: if the ring is full, the trailing
+    /// bytes are dropped and counted; the next successful enqueue
+    /// injects a `<<N bytes dropped>>` marker.
+    pub fn enqueue(s: &[u8]) -> bool {
+        if !READY.load(Ordering::Acquire) {
+            return false;
+        }
+        if s.is_empty() {
+            return true;
+        }
+        // Mask EL2 IRQ/FIQ for the head-advance + cache-clean +
+        // kick window. The on_done path runs in IRQ context and
+        // touches TAIL/IN_FLIGHT/CB; the producer must not race
+        // with it. Single-CPU, so masking is sufficient.
+        let daif = mask_irqs();
+        // Opportunistic completion check. The real consumer is the
+        // BCM2835 IRQ controller dispatch in `trap_irq`, but until
+        // EL2 IRQs are unmasked (post-kmain vector install) no
+        // completion IRQ ever fires, so the channel would otherwise
+        // stop after the very first CB. We're already IRQ-masked,
+        // so checking the status register and re-kicking is
+        // race-free.
+        if IN_FLIGHT_LEN.load(Ordering::Acquire) != 0
+            && host_dma::uart_tx_pending()
+        {
+            host_dma::on_completion(host_dma::UART_TX_CHANNEL);
+        }
+        let dropped = DROPPED.swap(0, Ordering::Relaxed);
+        if dropped > 0 {
+            // Best-effort: a fresh ring with no in-flight transfer
+            // has full RING_LEN-1 bytes free, plenty for this notice.
+            let mut buf = [0u8; 32];
+            let n = fmt_dropped(&mut buf, dropped);
+            write_unmasked(&buf[..n]);
+        }
+        write_unmasked(s);
+        maybe_kick();
+        unmask_irqs(daif);
+        true
+    }
+
+    /// Called by the DMA-completion IRQ hook in
+    /// `peripherals::host_dma::on_completion`. Advances `TAIL` by
+    /// the just-finished length, and kicks the next contiguous
+    /// segment if more bytes are queued.
+    pub fn on_done() {
+        let len = IN_FLIGHT_LEN.swap(0, Ordering::AcqRel);
+        if len == 0 {
+            return;
+        }
+        let tail = TAIL.load(Ordering::Relaxed);
+        let new_tail = (tail + len) % (RING_LEN as u32);
+        TAIL.store(new_tail, Ordering::Release);
+        maybe_kick();
+    }
+
+    // ---- internals -------------------------------------------------
+
+    /// Push `s` into the ring without touching IRQ state — caller has
+    /// already masked. Drops bytes that overflow.
+    ///
+    /// Each source byte goes into the low octet of one u32 slot.
+    /// See the `RING_LEN` doc-comment for why.
+    fn write_unmasked(s: &[u8]) {
+        let head = HEAD.load(Ordering::Relaxed) as usize;
+        let tail = TAIL.load(Ordering::Acquire) as usize;
+        // Slot indices, not byte indices. `used` is the number of
+        // character slots physically in the ring not yet consumed
+        // by DMA. `free` is the slot capacity minus used minus the
+        // one empty slot the head==tail convention reserves for
+        // "empty".
+        let used = (head + RING_LEN - tail) % RING_LEN;
+        let free = RING_LEN - used - 1;
+        let take = core::cmp::min(s.len(), free);
+        let dropped = s.len() - take;
+        if dropped > 0 {
+            DROPPED.fetch_add(dropped as u32, Ordering::Relaxed);
+        }
+        // SAFETY: We hold the IRQ-masked critical section and are
+        // the sole writer of slots [head..head+take). The reads of
+        // the same slots by the DMA controller, if any, are
+        // governed by IN_FLIGHT_LEN — and IN_FLIGHT_LEN only covers
+        // slots strictly before HEAD at the moment kick() built
+        // the CB.
+        unsafe {
+            let buf = &mut *RING.0.get();
+            for i in 0..take {
+                buf[(head + i) % RING_LEN] = s[i] as u32;
+            }
+        }
+        let new_head = ((head + take) % RING_LEN) as u32;
+        HEAD.store(new_head, Ordering::Release);
+    }
+
+    /// If the channel is idle and bytes are queued, build a CB for
+    /// the next contiguous segment and arm the DMA. Caller is in
+    /// IRQ-masked context.
+    fn maybe_kick() {
+        if IN_FLIGHT_LEN.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        let head = HEAD.load(Ordering::Acquire) as usize;
+        let tail = TAIL.load(Ordering::Acquire) as usize;
+        if head == tail {
+            return;
+        }
+        // Contiguous slot segment: tail .. min(head, RING_LEN). A
+        // wrap is handled by the *next* on_done firing maybe_kick
+        // again.
+        let end = if head > tail { head } else { RING_LEN };
+        let len = end - tail; // count of u32 slots = chars
+        let byte_len = len * core::mem::size_of::<u32>();
+        // SAFETY: RING.0 is a `'static` UnsafeCell; we're the sole
+        // owner of slots [tail..tail+len) until on_done.
+        let ring_ptr = unsafe { (*RING.0.get()).as_ptr() } as u64;
+        let src_arm_phys = ring_ptr + (tail * core::mem::size_of::<u32>()) as u64;
+        // Flush ARM L1/L2 of the segment so the DMA reading via the
+        // uncached 0xC000_0000 bus alias sees what we wrote
+        // (BCM2835 §1.2.3: bus alias bypasses ARM caches).
+        crate::cpu::dc_civac_range(src_arm_phys, byte_len);
+        // Build the single-shot CB. SRC_INC + 32-bit beats from
+        // RAM; DEST_DREQ paced by PL011 TX DREQ writes one beat
+        // per char into PL011 DR (low octet of the 32-bit slot is
+        // transmitted, upper 24 are discarded by the chip);
+        // WAIT_RESP prevents AXI pipelining writes ahead of FIFO
+        // drains; INTEN raises the channel's completion IRQ.
+        let ti = (DREQ_UART_TX << TI_PERMAP_SHIFT)
+            | TI_SRC_INC
+            | TI_DEST_DREQ
+            | TI_WAIT_RESP
+            | TI_INTEN;
+        // SAFETY: single-writer (this function under IRQ mask);
+        // the DMA controller will only read CB after we write
+        // CONBLK_AD inside arm_uart_tx.
+        unsafe {
+            let cb = &mut *addr_of_mut!(CB);
+            cb.ti = ti;
+            cb.source_ad = bus_addr_ram(src_arm_phys);
+            cb.dest_ad = bus_addr_periph(super::UART_DR as u32);
+            // TXFR_LEN is in bytes; one beat = 4 bytes of source =
+            // one transmitted char.
+            cb.txfr_len = byte_len as u32;
+            cb.stride = 0;
+            cb.nextconbk = 0;
+        }
+        IN_FLIGHT_LEN.store(len as u32, Ordering::Release);
+        // SAFETY: CB lives in a static; contents are stable until
+        // the channel raises completion (which sets IN_FLIGHT_LEN
+        // back to 0 in on_done before maybe_kick rewrites it).
+        unsafe {
+            host_dma::arm_uart_tx(&*addr_of_mut!(CB));
+        }
+    }
+
+    /// Format "<<N bytes dropped>>" into `buf` and return the length.
+    /// Bounded to ~32 chars even for a u32-max counter.
+    fn fmt_dropped(buf: &mut [u8; 32], n: u32) -> usize {
+        let prefix = b"<<";
+        let mid = b" bytes dropped>>";
+        // Decimal-encode n. u32::MAX is 10 digits; buf is sized for
+        // prefix+10+mid+spare = 28 bytes plus padding.
+        let mut digits = [0u8; 10];
+        let mut d = 0usize;
+        let mut v = n;
+        if v == 0 {
+            digits[0] = b'0';
+            d = 1;
+        } else {
+            while v > 0 {
+                digits[d] = b'0' + (v % 10) as u8;
+                v /= 10;
+                d += 1;
+            }
+        }
+        let mut p = 0usize;
+        for &b in prefix {
+            buf[p] = b;
+            p += 1;
+        }
+        for i in 0..d {
+            buf[p] = digits[d - 1 - i];
+            p += 1;
+        }
+        for &b in mid {
+            buf[p] = b;
+            p += 1;
+        }
+        p
+    }
+
+    /// Mask EL2 IRQ + FIQ, return previous DAIF state.
+    #[inline]
+    fn mask_irqs() -> u64 {
+        let daif: u64;
+        // SAFETY: sysreg read + write to DAIF, side-effect on IRQ mask.
+        unsafe {
+            core::arch::asm!(
+                "mrs {}, daif",
+                "msr daifset, #3",
+                out(reg) daif,
+                options(nostack, preserves_flags),
+            );
+        }
+        daif
+    }
+
+    /// Restore DAIF to its previous value.
+    #[inline]
+    fn unmask_irqs(daif: u64) {
+        // SAFETY: sysreg write to DAIF, restoring caller-saved state.
+        unsafe {
+            core::arch::asm!(
+                "msr daif, {}",
+                in(reg) daif,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
 }

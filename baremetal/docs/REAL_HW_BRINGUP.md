@@ -720,6 +720,85 @@ Out of scope for this cut:
   PWM path needs an external low-pass filter — not worth it.
 - BCM2835 PCM/I2S to GPIO. Same reason — needs an external DAC.
 
+### Kernel log: DMA-fed PL011 TX
+
+The polled PL011 path that Phase 0 stood up busy-waits on
+`FR.TXFF` for every byte, ~87 µs per byte at 115200 baud once the
+FIFO fills. A 100-byte `kprintln!` burns ~6 ms of EL2 CPU. That
+window is wider than the HDMI audio pump's tolerance (44.1 kHz
+stereo = 22 µs/sample, fed from the trap tail), so turning on
+`log_traps` / `log_irqs` on real hardware made audio glitch
+audibly. This subsection replaces the producer-side busy-wait with
+BCM2835 DMA paced by PL011 TX DREQ. `kprintln!` returns in
+microseconds; the wire drains at its baud-rate ceiling without
+further CPU involvement.
+
+Stack as built:
+
+1. **`src/peripherals/host_dma.rs`** — minimal BCM2835 DMA driver
+   covering only what UART TX needs. Register map, CB layout, TI/CS
+   bit fields, DREQ table, and IRQ-controller offsets are cited
+   inline against BCM2835 ARM Peripherals (2012-02-06) §1.2.3–4,
+   §4.2.1, §7.5; the rows Broadcom's IRQ table leaves blank
+   (specifically the DMA channels) are cross-checked against
+   rsta2/circle `include/circle/bcm2835int.h`. Channel 5 owned —
+   conventionally free; `init()` asserts `DMA_ENABLE` bit 5 is set
+   by firmware and resets the channel before use.
+2. **`src/platform/raspi3b.rs`** — adds `enable_bcm2835_irq` /
+   `bcm2835_irq_pending_1` for the ARM Peripherals IC at
+   `0x3F00_B000`. DMA channel N → GPU IRQ source `16 + N`. CNTHP
+   still arrives via the BCM2836 local-peripheral block at
+   `0x4000_0040` and is unaffected.
+3. **`src/uart.rs::tx_dma`** — 16384-slot ring. `enqueue` masks
+   DAIF, copies bytes into the ring, calls `maybe_kick`;
+   `maybe_kick` builds one CB per contiguous tail→end-of-ring
+   segment; completion-IRQ dispatch in `trap_irq` acks
+   `CS.INT`/`END`, advances tail, and re-kicks. Drop-newest with a
+   counter that emits `<<N bytes dropped>>` on the next call with
+   room.
+4. **`src/trap.rs`** — additive dispatch at the top of `trap_irq`:
+   reads `IRQ_PEND_1`, checks bit `(16 + UART_TX_CHANNEL)` for
+   DMA-channel-5 completion, calls `host_dma::on_completion(5)`
+   before the existing CNTHP path.
+
+Three iteration-costing gotchas worth flagging:
+
+- **Storage is one u32 per character, not one byte.** BCM2835 DMA
+  has no 8-bit transfer width; the narrowest is 32-bit reads +
+  32-bit writes. Each 32-bit write to PL011 DR transmits only the
+  low 8 bits and discards the other 24 (PL011 TRM §3.3.1), so a
+  byte source delivers 1 of every 4 characters and the wire shows
+  garbled text. Each ring slot holds one character in the low
+  octet of a u32. `RING_LEN × 4 = 64 KiB` is the price for the
+  controller having no narrower mode.
+- **PL011 `DMACR.TXDMAE` must be set** (bit 1 at offset 0x48).
+  Without it the chip never asserts TX DREQ and a DMA configured
+  with `DEST_DREQ=1` sits forever waiting (PL011 TRM §3.3.8). Set
+  inside `tx_dma::init` only after `host_dma::init` succeeds, so a
+  failed bring-up leaves PL011 identical to the polled-only build.
+- **`tx_dma::init` must run after `mmu::init`, not from
+  `uart::init`.** Pre-MMU, Cortex-A53 treats RAM as Normal
+  Non-cacheable; `LDXR/STXR` on that memory type is CONSTRAINED
+  UNPREDICTABLE and the A53 raises a synchronous abort. Rust
+  compiles `AtomicU32::swap` / `fetch_add` to `LDXR/STXR` loops on
+  v8.0 (no LSE), so the very first `enqueue` would crash with no
+  vector installed.
+
+Debug facility: `uart::write_str_polled` + `raw_print!` /
+`raw_println!` macros bypass the ring and go straight to the wire
+via busy-wait. Useful when the DMA path itself is suspect — see
+`host_dma::uart_tx_diag()` for a `(CS, DEBUG)` snapshot to log
+through `raw_println!` if the channel ever wedges.
+
+Scoped to `cfg(all(no-semihost, platform-raspi3b))`. QEMU
+(semihosting) and FVP paths are unchanged.
+
+Carryover: HDMI MAI has the same busy-wait-on-FIFO-full
+antipattern in `pi_hdmi.rs:891-901`. Symptomatically fine now that
+logging stops stealing trap-tail time, but the same `host_dma`
+module ports straight over when we want it — different DREQ ID,
+different destination register, same CB layout.
+
 ### Serial + PCMCIA
 
 The PL011 mini-UART is already up for the kernel log; Newton's

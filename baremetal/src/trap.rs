@@ -195,6 +195,22 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     let intid = platform::irq_ack();
     let spurious = intid == platform::irq_spurious();
 
+    // BCM2835 IRQ controller dispatch (additive — CNTHP arrives via
+    // the local-peripheral block at 0x4000_0040 and isn't reflected
+    // here). Currently only the UART-TX DMA channel raises a GPU IRQ
+    // we care about; expand the mask as we wire more peripherals.
+    #[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+    {
+        let pend1 = platform::bcm2835_irq_pending_1();
+        let dma_mask =
+            1u32 << (16 + crate::peripherals::host_dma::UART_TX_CHANNEL);
+        if pend1 & dma_mask != 0 {
+            crate::peripherals::host_dma::on_completion(
+                crate::peripherals::host_dma::UART_TX_CHANNEL,
+            );
+        }
+    }
+
     // Diagnostic heartbeat: sample guest PC so we can see where it's
     // executing when no MMIO traps are firing.
     //

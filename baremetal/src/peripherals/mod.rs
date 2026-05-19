@@ -10,6 +10,7 @@ pub mod dma;
 pub mod flash;
 pub mod flash_driver;
 pub mod host_call;
+pub mod host_dma;
 pub mod in_translator;
 pub mod native_primitives;
 pub mod network;

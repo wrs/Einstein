@@ -73,6 +73,12 @@ pub extern "C" fn kmain() -> ! {
     // SAFETY: called exactly once from boot.s on core 0 before any
     // cache- or virtual-addressing-dependent code runs.
     unsafe { mmu::init(); }
+    // Now that RAM is mapped Normal-WB inner-shareable, the ring's
+    // atomic RMW operations (used internally by AtomicU32::swap /
+    // fetch_add) can run without aborting on the Cortex-A53. Switch
+    // the kprintln backend from polled to DMA. Before this line all
+    // output went through the busy-wait fallback in `write_str`.
+    uart::init_dma_tx();
     install_vectors();
 
     // Real-hardware SDHOST bring-up probe. Halts at the end regardless

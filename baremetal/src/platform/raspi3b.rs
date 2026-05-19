@@ -75,3 +75,56 @@ pub fn irq_eoi(_intid: u32) {}
 /// u32::MAX as a sentinel the handler will never see from `irq_ack`.
 #[inline]
 pub fn irq_spurious() -> u32 { u32::MAX }
+
+// ---- BCM2835 ARM interrupt controller -------------------------------
+//
+// CNTHP arrives via the BCM2836 local-peripheral block at 0x4000_0040
+// (see `install_cnthp_irq_routing` above). Everything else — DMA
+// completion, UART, GPIO, etc. — comes from the BCM2835 IRQ
+// controller at ARM physical 0x3F00_B000 (peripheral bus
+// 0x7E00_B000). Source-numbering convention (BCM2835 ARM Peripherals
+// §7.5 p.112): sources 0..31 live in IRQ_PEND_1, 32..63 in IRQ_PEND_2.
+// Enable bits sit at the same bit positions in ENABLE_IRQS_1/2 and
+// are write-1-to-set (other bits preserved). Disable bits at
+// DISABLE_IRQS_1/2 are write-1-to-clear.
+
+const BCM2835_IC_BASE: usize = 0x3F00_B000;
+const BCM2835_IC_PEND_1: *const u32 = (BCM2835_IC_BASE + 0x204) as *const u32;
+const BCM2835_IC_PEND_2: *const u32 = (BCM2835_IC_BASE + 0x208) as *const u32;
+const BCM2835_IC_ENABLE_1: *mut u32 = (BCM2835_IC_BASE + 0x210) as *mut u32;
+const BCM2835_IC_ENABLE_2: *mut u32 = (BCM2835_IC_BASE + 0x214) as *mut u32;
+
+/// Enable a single GPU interrupt source (0..63) at the BCM2835 IRQ
+/// controller. Write-1-to-set: other enabled sources are preserved
+/// (BCM2835 §7.5 p.116).
+#[allow(dead_code)] // First caller is host_dma's init path.
+pub fn enable_bcm2835_irq(src: u32) {
+    assert!(src < 64);
+    // SAFETY: MMIO write at a fixed peripheral address.
+    unsafe {
+        if src < 32 {
+            core::ptr::write_volatile(BCM2835_IC_ENABLE_1, 1u32 << src);
+        } else {
+            core::ptr::write_volatile(BCM2835_IC_ENABLE_2, 1u32 << (src - 32));
+        }
+    }
+}
+
+/// Read the BCM2835 IRQ_PEND_1 register (sources 0..31). Returns the
+/// enabled-AND-pending bitmask — the controller only sets pending bits
+/// for sources whose enable bit is set, so the caller can dispatch
+/// directly off this value (BCM2835 §7.5 p.115).
+#[allow(dead_code)] // First caller is trap_irq's DMA dispatch.
+#[inline]
+pub fn bcm2835_irq_pending_1() -> u32 {
+    // SAFETY: MMIO read at a fixed peripheral address.
+    unsafe { core::ptr::read_volatile(BCM2835_IC_PEND_1) }
+}
+
+/// Read the BCM2835 IRQ_PEND_2 register (sources 32..63).
+#[allow(dead_code)] // Reserved for future UART RX / HDMI sources.
+#[inline]
+pub fn bcm2835_irq_pending_2() -> u32 {
+    // SAFETY: MMIO read at a fixed peripheral address.
+    unsafe { core::ptr::read_volatile(BCM2835_IC_PEND_2) }
+}

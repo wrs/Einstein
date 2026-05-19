@@ -55,6 +55,7 @@ pub const CS_PRIORITY_SHIFT: u32 = 16;
 // ---- TI register bits (BCM2835 §4.2.1 pp.50–51) ---------------------
 
 pub const TI_PERMAP_SHIFT: u32 = 16;
+pub const TI_BURST_LENGTH_SHIFT: u32 = 12;
 pub const TI_SRC_INC: u32 = 1 << 8;
 pub const TI_DEST_DREQ: u32 = 1 << 6;
 pub const TI_WAIT_RESP: u32 = 1 << 3;
@@ -63,6 +64,12 @@ pub const TI_INTEN: u32 = 1 << 0;
 // ---- DREQ peripheral mapping (BCM2835 §4.2.1.3 p.61) ----------------
 
 pub const DREQ_UART_TX: u32 = 12;
+/// HDMI MAI write side. Per BCM2835 §4.2.1.3 p.61 the value for the
+/// BCM2835/2836/2837 (Pi 0/2/3) is 17; Circle's TDREQ enum agrees
+/// (`DREQSourceHDMI = 17` for RASPPI <= 3 in
+/// `include/circle/dmacommon.h`). On Pi 4 (RASPPI >= 4) the value
+/// changes to 10, but this hypervisor doesn't target Pi 4.
+pub const DREQ_HDMI: u32 = 17;
 
 // ---- Control block (BCM2835 §4.2.1.1 p.40 — 8 × 32-bit words,
 // 256-bit aligned) -----------------------------------------------------
@@ -164,37 +171,69 @@ fn read_debug(ch: u32) -> u32 {
 /// it on.
 pub const UART_TX_CHANNEL: u32 = 5;
 
-/// Set true once init() succeeds. `kick()` and `on_completion()` are
-/// no-ops before this; lets the uart layer call into us unconditionally.
+/// The DMA channel that audio::pi_hdmi owns for HDMI MAI feed.
+/// Channel 4 is conventionally free on Pi 3 / Zero 2 W; firmware
+/// reservations typically touch 0, 2, 3.
+pub const MAI_TX_CHANNEL: u32 = 4;
+
+/// Set true once UART TX init() succeeds. `arm_uart_tx()` and the
+/// uart-side completion dispatch are gated on this so the uart layer
+/// can call into us unconditionally.
 static READY: AtomicBool = AtomicBool::new(false);
 
-/// One-time bring-up. Asserts that the chosen UART-TX channel is
-/// firmware-enabled, resets it, and clears any stale END/INT bits.
-/// Returns true on success. Idempotent.
-pub fn init() -> bool {
-    if READY.load(Ordering::Acquire) {
-        return true;
-    }
+/// Set true once MAI TX init_mai_tx() succeeds. Same role for the
+/// audio backend.
+static MAI_READY: AtomicBool = AtomicBool::new(false);
+
+/// Bring up one DMA channel: assert firmware has powered it, reset
+/// it, clear stale END/INT, enable its GPU IRQ. Used by both
+/// `init` (UART) and `init_mai_tx` (MAI). Returns true on success.
+fn init_channel(ch: u32) -> bool {
     let enable = read_enable();
-    if (enable >> UART_TX_CHANNEL) & 1 == 0 {
+    if (enable >> ch) & 1 == 0 {
         return false;
     }
     // CS_RESET self-clears; wait for it to drop. Worst case a handful
     // of MMIO read cycles per the datasheet.
-    write_cs(UART_TX_CHANNEL, CS_RESET);
+    write_cs(ch, CS_RESET);
     for _ in 0..1000 {
-        if read_cs(UART_TX_CHANNEL) & CS_RESET == 0 {
+        if read_cs(ch) & CS_RESET == 0 {
             break;
         }
     }
     // Clear any latched INT/END/ERROR bits from a prior owner.
-    write_cs(UART_TX_CHANNEL, CS_INT | CS_END);
+    write_cs(ch, CS_INT | CS_END);
     // Wire the channel's completion IRQ at the BCM2835 IRQ
     // controller. DMA channel N → GPU IRQ source 16+N (Circle's
     // ARM_IRQ_DMA0 = 16). trap_irq's additive dispatch picks it up
     // from IRQ_PEND_1 on the next CPU IRQ.
-    crate::platform::enable_bcm2835_irq(16 + UART_TX_CHANNEL);
+    crate::platform::enable_bcm2835_irq(16 + ch);
+    true
+}
+
+/// One-time bring-up of the UART-TX channel. Idempotent.
+pub fn init() -> bool {
+    if READY.load(Ordering::Acquire) {
+        return true;
+    }
+    if !init_channel(UART_TX_CHANNEL) {
+        return false;
+    }
     READY.store(true, Ordering::Release);
+    true
+}
+
+/// One-time bring-up of the MAI-TX channel. Idempotent. Must run
+/// after `mmu::init` (see uart.rs::init for the AArch64/Cortex-A53
+/// LDXR-on-non-cacheable rationale).
+pub fn init_mai_tx() -> bool {
+    if MAI_READY.load(Ordering::Acquire) {
+        return true;
+    }
+    if !init_channel(MAI_TX_CHANNEL) {
+        return false;
+    }
+    MAI_READY.store(true, Ordering::Release);
     true
 }
 
@@ -204,10 +243,15 @@ pub fn is_ready() -> bool {
     READY.load(Ordering::Acquire)
 }
 
-/// Arm a DMA transfer on the UART TX channel. The CB must already
-/// describe a single-shot mem→PL011 transfer (NEXTCONBK = 0); the
-/// caller is responsible for cache-cleaning the source range before
-/// calling.
+/// Returns whether `init_mai_tx()` has completed successfully.
+#[inline]
+pub fn is_mai_ready() -> bool {
+    MAI_READY.load(Ordering::Acquire)
+}
+
+/// Arm a DMA transfer on `ch` with caller-supplied CS bits. The CB
+/// must already describe a transfer; the caller is responsible for
+/// cache-cleaning the source range before calling.
 ///
 /// We `dc civac` the CB itself here: the controller reads CB through
 /// the uncached bus alias (BCM2835 §1.2.3), so any CB writes the
@@ -218,27 +262,62 @@ pub fn is_ready() -> bool {
 /// stable for the duration of the transfer (until `on_completion`
 /// fires for this channel). The caller has exclusive use of the
 /// channel.
-pub unsafe fn arm_uart_tx(cb: &DmaCb) {
+unsafe fn arm_with_cs(ch: u32, cb: &DmaCb, cs: u32) {
     let cb_arm_phys = cb as *const DmaCb as u64;
     crate::cpu::dc_civac_range(cb_arm_phys, core::mem::size_of::<DmaCb>());
     let cb_bus = bus_addr_ram(cb_arm_phys);
-    write_conblk_ad(UART_TX_CHANNEL, cb_bus);
-    // Channel arming sequence per Circle's `CDMAChannel::Start`:
-    // WAIT_FOR_OUTSTANDING_WRITES at end of transfer + priority 1 +
-    // ACTIVE.
+    write_conblk_ad(ch, cb_bus);
+    write_cs(ch, cs);
+}
+
+/// Arm a DMA transfer on the UART TX channel.
+///
+/// Uses Circle's `CDMAChannel::Start` arming bits:
+/// WAIT_FOR_OUTSTANDING_WRITES + priority 1 + ACTIVE. The UART
+/// destination is PL011 DR which retires writes promptly, so
+/// WAIT_FOR_OUTSTANDING_WRITES doesn't delay completion in practice.
+///
+/// SAFETY: see [`arm_with_cs`].
+pub unsafe fn arm_uart_tx(cb: &DmaCb) {
     let cs = CS_WAIT_FOR_OUTSTANDING_WRITES | (1 << CS_PRIORITY_SHIFT) | CS_ACTIVE;
-    write_cs(UART_TX_CHANNEL, cs);
+    // SAFETY: caller's invariant matches `arm_with_cs`'s.
+    unsafe { arm_with_cs(UART_TX_CHANNEL, cb, cs) }
+}
+
+/// Arm a DMA transfer on the MAI TX channel.
+///
+/// Uses Linux's lean cyclic arming pattern: just ACTIVE. The
+/// `WAIT_FOR_OUTSTANDING_WRITES` bit makes the channel stall at every
+/// CB boundary until each AXI write to HDMI_MAI_DATA is fully
+/// retired; on the HDMI MAI block, "retired" may not happen until
+/// the FIFO consumes the sample on its own clock, which can defer
+/// the period-completion INT signal indefinitely. Matches
+/// `bcm2835_dma_start_desc` in `drivers/dma/bcm2835-dma.c` which
+/// writes only `BCM2835_DMA_ACTIVE`.
+///
+/// SAFETY: see [`arm_with_cs`].
+pub unsafe fn arm_mai_tx(cb: &DmaCb) {
+    // SAFETY: caller's invariant matches `arm_with_cs`'s.
+    unsafe { arm_with_cs(MAI_TX_CHANNEL, cb, CS_ACTIVE) }
 }
 
 /// Called from `trap_irq` when the BCM2835 IRQ controller reports a
 /// pending DMA completion on `ch`. Acks the channel's INT/END bits
 /// and dispatches to the registered consumer.
 pub fn on_completion(ch: u32) {
+    // ACK by writing the read value straight back: the W1C bits
+    // (INT/END/ERROR) clear because they were 1 on read, while the
+    // R/W bits (ACTIVE, WAIT_FOR_OUTSTANDING_WRITES, PRIORITY) keep
+    // whatever the channel currently has. Masking those R/W bits to 0
+    // — as the previous `cs & (INT|END|ERROR)` did — pauses the
+    // cyclic MAI chain after exactly one period IRQ on hardware where
+    // ACTIVE behaves as standard R/W rather than W1S.
     let cs = read_cs(ch);
-    // W1C — write the bits set, the chip clears them.
-    write_cs(ch, cs & (CS_INT | CS_END | CS_ERROR));
-    if ch == UART_TX_CHANNEL {
-        crate::uart::on_tx_done();
+    write_cs(ch, cs);
+    match ch {
+        UART_TX_CHANNEL => crate::uart::on_tx_done(),
+        MAI_TX_CHANNEL => crate::audio::on_mai_dma_done(),
+        _ => {}
     }
 }
 
@@ -252,7 +331,18 @@ pub fn uart_tx_pending() -> bool {
     is_ready() && (read_int_status() & (1 << UART_TX_CHANNEL)) != 0
 }
 
+/// Same poll for the MAI-TX channel.
+#[inline]
+pub fn mai_tx_pending() -> bool {
+    is_mai_ready() && (read_int_status() & (1 << MAI_TX_CHANNEL)) != 0
+}
+
 /// Snapshot for diagnostic logging — CS / DEBUG of the UART TX channel.
 pub fn uart_tx_diag() -> (u32, u32) {
     (read_cs(UART_TX_CHANNEL), read_debug(UART_TX_CHANNEL))
+}
+
+/// Snapshot for diagnostic logging — CS / DEBUG of the MAI TX channel.
+pub fn mai_tx_diag() -> (u32, u32) {
+    (read_cs(MAI_TX_CHANNEL), read_debug(MAI_TX_CHANNEL))
 }

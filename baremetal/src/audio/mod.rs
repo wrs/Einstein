@@ -39,13 +39,17 @@
 //!     [`vic::raise`] the stored output interrupt mask so the kernel
 //!     calls 0x07 with the next buffer.
 //!   - `start_output()` / `stop_output()` / `output_is_running()`
-//!     gate MAI_CTL.ENABLE so the HDMI receiver doesn't see stale
-//!     audio packets between Newton sound clips.
-//!   - `pump()` runs from the trap-IRQ and sync-trap tails to drain
-//!     the ring into MAI_DATA. CPU-direct writes; the MAI FIFO is
-//!     deep enough that a ~16 ms timer cadence keeps it alive at
-//!     48 kHz stereo (~768 frames per cadence vs. 64-frame FIFO is
-//!     not enough on its own, but the trap rate is much higher).
+//!     flip an `OUTPUT_RUNNING` producer gate, but do NOT touch
+//!     `MAI_CTL.ENABLE` — see `pi_hdmi::bringup_mai`. The HDMI link
+//!     is established once and never disturbed.
+//!   - `on_mai_dma_done()` is the audio subsystem's only "tick"
+//!     entry point, fired from the BCM2835 DMA period-completion
+//!     IRQ via `peripherals::host_dma::on_completion`. It refills
+//!     the cyclic DMA ring with the next period's worth of audio
+//!     (real samples from the stereo ring, or silence between
+//!     clips) and raises the kernel's output IRQ when the stereo
+//!     ring is running low. Same shape as Linux's
+//!     `vchan_cyclic_callback` in `drivers/dma/bcm2835-dma.c`.
 
 #[cfg(nh_audio_null)]
 mod null;
@@ -63,9 +67,9 @@ pub fn init() {
 }
 
 /// Newton kernel-side interrupt masks: input bit in `r1`, output bit
-/// in `r2`. The output mask is what `pump` raises through `vic::raise`
-/// after a Newton buffer's worth of samples has been consumed. Subfn
-/// 0x1F.
+/// in `r2`. The output mask is what `on_mai_dma_done` raises through
+/// `vic::raise` when the stereo ring drops below the low-watermark.
+/// Subfn 0x1F.
 pub fn set_interrupt_mask(_input_mask: u32, _output_mask: u32) {
     #[cfg(nh_audio_pi_hdmi)]
     pi_hdmi::set_interrupt_mask(_input_mask, _output_mask);
@@ -138,10 +142,15 @@ pub fn output_volume_get() -> u32 {
     0
 }
 
-/// Drain the ring buffer into MAI_DATA. Called from the trap-IRQ
-/// and sync-trap tails in `trap.rs`. Must be non-blocking — `pump`
-/// runs with the guest stalled.
-pub fn pump() {
+/// DMA period-completion hook for the HDMI MAI TX channel,
+/// dispatched by `peripherals::host_dma::on_completion`. This is the
+/// audio subsystem's natural tick — the only thing that drives ring
+/// refills and watermark IRQs. There is intentionally no trap-tail
+/// pump entry point: audio liveness must not depend on trap rate,
+/// which other hypervisor work is trying to reduce. The shape
+/// matches Linux's `vchan_cyclic_callback` in `bcm2835-dma.c`.
+#[inline]
+pub fn on_mai_dma_done() {
     #[cfg(nh_audio_pi_hdmi)]
-    pi_hdmi::pump();
+    pi_hdmi::on_mai_dma_done();
 }

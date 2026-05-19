@@ -125,12 +125,13 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
     // heartbeat. Cheap: backend self-throttles to 16 ms wall.
     crate::host_io::pump_input();
     crate::input::pump();
-    // Top up the HDMI audio FIFO from the host audio ring. Polled
-    // every sync trap so we don't underrun at 44.1 kHz stereo
-    // (~768 samples per 16 ms IRQ heartbeat exceeds FIFO depth,
-    // but the trap rate is much higher than the heartbeat). No-op
-    // on the null backend.
-    crate::audio::pump();
+    // (audio used to be pumped here from the trap tail. With cyclic
+    // DMA driving MAI from a hardware-paced CB chain, audio refills
+    // happen from `audio::on_mai_dma_done` — the DMA
+    // period-completion IRQ — and from `schedule_output` when the
+    // kernel queues a new buffer. Liveness no longer depends on
+    // trap rate, which is something the rest of the hypervisor is
+    // trying to reduce.)
 
     // Guest MMIO writes to IntCtrl / FIQMask / IntClear change the
     // effective (`int_present & int_ctrl & ~fiq_mask`) pending set and
@@ -197,17 +198,16 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
 
     // BCM2835 IRQ controller dispatch (additive — CNTHP arrives via
     // the local-peripheral block at 0x4000_0040 and isn't reflected
-    // here). Currently only the UART-TX DMA channel raises a GPU IRQ
-    // we care about; expand the mask as we wire more peripherals.
+    // here). DMA channel N raises GPU IRQ source 16+N (Circle's
+    // ARM_IRQ_DMA0 = 16). UART-TX owns ch 5, MAI-TX owns ch 4.
     #[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
     {
+        use crate::peripherals::host_dma;
         let pend1 = platform::bcm2835_irq_pending_1();
-        let dma_mask =
-            1u32 << (16 + crate::peripherals::host_dma::UART_TX_CHANNEL);
-        if pend1 & dma_mask != 0 {
-            crate::peripherals::host_dma::on_completion(
-                crate::peripherals::host_dma::UART_TX_CHANNEL,
-            );
+        for &ch in &[host_dma::UART_TX_CHANNEL, host_dma::MAI_TX_CHANNEL] {
+            if pend1 & (1u32 << (16 + ch)) != 0 {
+                host_dma::on_completion(ch);
+            }
         }
     }
 
@@ -362,9 +362,9 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     // same queue.
     crate::host_io::pump_input();
     crate::input::pump();
-    // Top up HDMI audio FIFO from timer IRQ tail too — guarantees
-    // forward progress even when the guest is in a no-sync-trap idle.
-    crate::audio::pump();
+    // (audio is driven from its own DMA-period IRQ now —
+    // `audio::on_mai_dma_done` — not from this trap tail. See the
+    // trap_sync_lower_aarch32 path for the rationale.)
     update_virq();
     // Advance the boot-splash progress bar (no-op once the guest's
     // first blit has frozen the splash, and on platforms without

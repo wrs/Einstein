@@ -218,6 +218,29 @@ mod sh {
     }
 }
 
+/// Wall-clock since EL2 reset, in microseconds. Reads CNTPCT_EL0 and
+/// scales by CNTFRQ_EL0. Both are AArch64 generic-timer sysregs;
+/// CNTPCT_EL0 is monotonic, free-running since power-on. Use as a
+/// log prefix via `kprintln!` (which is already wired to call this)
+/// to disambiguate the order of fast-firing events that share a
+/// single output line in the UART ring.
+#[inline(always)]
+pub fn now_us() -> u64 {
+    // SAFETY: sysreg reads, no side effects.
+    let (pct, freq): (u64, u64);
+    unsafe {
+        core::arch::asm!(
+            "mrs {0}, cntpct_el0",
+            "mrs {1}, cntfrq_el0",
+            out(reg) pct, out(reg) freq,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    // freq is typically 19_200_000 Hz on BCM2710. Scale to microseconds:
+    // us = pct * 1_000_000 / freq.
+    if freq == 0 { 0 } else { pct.wrapping_mul(1_000_000) / freq }
+}
+
 /// Write a string to the console.
 ///
 /// Default build: routes through Arm Semihosting `SYS_WRITE` to `:tt`,
@@ -323,6 +346,13 @@ impl fmt::Write for RawWriter {
 }
 
 /// Convenience macros for formatted output. Use like `kprintln!("val={:#x}", x);`.
+///
+/// Every line is prefixed with `[s.uuuuuu]` — seconds.microseconds
+/// since EL2 reset, sourced from CNTPCT_EL0. The prefix is added at
+/// the start of every `kprint!` *line* (i.e., only when the message
+/// starts a new line); a `kprint!` that adds to an existing line
+/// just appends, since we can't tell where in a partial line we are
+/// from inside the macro. `kprintln!` always emits the prefix.
 #[macro_export]
 macro_rules! kprint {
     ($($arg:tt)*) => {{
@@ -333,10 +363,20 @@ macro_rules! kprint {
 
 #[macro_export]
 macro_rules! kprintln {
-    () => { $crate::kprint!("\n"); };
+    () => {{
+        use core::fmt::Write as _;
+        let _ = writeln!($crate::uart::Writer);
+    }};
     ($($arg:tt)*) => {{
         use core::fmt::Write as _;
-        let _ = writeln!($crate::uart::Writer, $($arg)*);
+        let _us = $crate::uart::now_us();
+        let _ = writeln!(
+            $crate::uart::Writer,
+            "[{:>4}.{:06}] {}",
+            _us / 1_000_000,
+            _us % 1_000_000,
+            format_args!($($arg)*),
+        );
     }};
 }
 

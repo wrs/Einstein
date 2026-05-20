@@ -66,6 +66,11 @@ pub fn init() {
     pi_hdmi::init();
 }
 
+pub fn poll_mai_dma_completion() {
+    #[cfg(nh_audio_pi_hdmi)]
+    pi_hdmi::poll_mai_dma_completion();
+}
+
 /// Newton kernel-side interrupt masks: input bit in `r1`, output bit
 /// in `r2`. The output mask is what `on_mai_dma_done` raises through
 /// `vic::raise` when the stereo ring drops below the low-watermark.

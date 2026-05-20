@@ -53,6 +53,10 @@ struct State {
     addr: u8,
     in_ep_addr: u8,
     in_ep_mps: u16,
+    /// Consecutive hard transfer errors from `pump`'s interrupt-IN.
+    /// Reset on any success/idle poll; at `DETACH_ERROR_THRESHOLD`
+    /// the device is declared gone (panel reboot) and polling stops.
+    consec_errors: u32,
     /// Last-seen (pressed, x, y) so we can suppress idle keep-alive
     /// reports (the panel emits ID 1 at ~16 ms regardless of whether
     /// anything changed — see `docs/MTOUCH.md` §Behavior notes).
@@ -74,6 +78,7 @@ impl State {
             addr: 0,
             in_ep_addr: 0x81,
             in_ep_mps: 64,
+            consec_errors: 0,
             last_pressed: false,
             last_x: 0,
             last_y: 0,
@@ -199,6 +204,13 @@ fn attach<H: crate::usb::host::UsbHostController>(
     Ok(())
 }
 
+/// Consecutive hard-error count at which the device is declared
+/// detached. The dwc2 core already retries 3× internally per
+/// attempt, so 8 attempts ≈ a sustained ~128 ms outage at the 16 ms
+/// pump cadence — far beyond any transient the panel produces when
+/// alive.
+const DETACH_ERROR_THRESHOLD: u32 = 8;
+
 pub fn pump() {
     // Cheap idle path when no device attached.
     if !with_state(|s| s.attached) {
@@ -207,8 +219,38 @@ pub fn pump() {
     let (addr, ep_addr, mps) =
         with_state(|s| (s.addr, s.in_ep_addr, s.in_ep_mps));
     let mut buf = [0u8; REPORT_BUF_LEN];
-    let n = dwc2::with(|host| host.interrupt_in(addr, ep_addr, mps, &mut buf))
-        .unwrap_or(0);
+    let n = match dwc2::with(|host| host.interrupt_in(addr, ep_addr, mps, &mut buf)) {
+        Ok(n) => {
+            with_state(|s| s.consec_errors = 0);
+            n
+        }
+        // Idle NAK / no data this frame — the normal quiet-panel case.
+        Err(UsbError::Timeout) => {
+            with_state(|s| s.consec_errors = 0);
+            0
+        }
+        // Port down: the panel rebooted out from under us (its USB
+        // hub function dies with it). Detach immediately — every
+        // further attempt against a downed port would burn the full
+        // transfer timeout inside the trap tail and starve the guest.
+        Err(UsbError::NotReady) => {
+            detach("port down (panel reset?)");
+            return;
+        }
+        // Hard wire errors (XACT_ERR after the core's own retries,
+        // babble, AHB): tolerate transients, detach when sustained.
+        Err(e) => {
+            let errs = with_state(|s| {
+                s.consec_errors = s.consec_errors.saturating_add(1);
+                s.consec_errors
+            });
+            if errs >= DETACH_ERROR_THRESHOLD {
+                kprintln!("input-mtouch: {} consecutive errors (last {:?})", errs, e);
+                detach("persistent transfer errors");
+            }
+            return;
+        }
+    };
     if n >= 6 {
         // First few successful packets get a one-shot byte dump so
         // we can sanity-check the USB pipe without opting into
@@ -232,6 +274,20 @@ pub fn pump() {
     // Drain any new events into the host_io queue.
     let mut src = Drain;
     super::drain_into_queue(&mut src);
+}
+
+/// Declare the device gone and stop polling it. Touch input is lost
+/// until the next boot — hot re-enumeration after the port comes
+/// back is not implemented yet (needs a port reset + address/config
+/// replay; tracked in the change description). The point here is
+/// damage containment: a dead device must not keep consuming
+/// trap-tail time.
+fn detach(why: &str) {
+    with_state(|s| {
+        s.attached = false;
+        s.consec_errors = 0;
+    });
+    kprintln!("input-mtouch: detached — {}", why);
 }
 
 /// Drain adapter — `super::drain_into_queue` wants a `PenSource`

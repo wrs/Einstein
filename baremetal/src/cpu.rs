@@ -159,6 +159,8 @@ pub fn delay_ms(ms: u32) {
             options(nomem, nostack, preserves_flags));
     }
     let target = start.wrapping_add((freq * ms as u64) / 1000);
+    let mut next_audio_poll = start;
+    let audio_poll_interval = (freq / 1000).max(1);
     loop {
         let now: u64;
         // SAFETY: sysreg read.
@@ -168,6 +170,10 @@ pub fn delay_ms(ms: u32) {
         }
         if now.wrapping_sub(target) as i64 >= 0 {
             return;
+        }
+        if now.wrapping_sub(next_audio_poll) as i64 >= 0 {
+            crate::audio::poll_mai_dma_completion();
+            next_audio_poll = now.wrapping_add(audio_poll_interval);
         }
     }
 }

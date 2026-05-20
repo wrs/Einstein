@@ -16,7 +16,7 @@
 //! notice if the boot path ever starts depending on real sound
 //! state.
 
-use crate::{audio, cpu, kprintln, trap::TrapContext};
+use crate::{audio, cpu, kprintln, peripherals::vic, trap::TrapContext};
 
 /// Sound-driver class ID in the native-primitive encoding.
 pub const DRIVER_ID: u32 = 0x00_0002;
@@ -57,6 +57,28 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
     if subfn < 32 {
         // SAFETY: single-threaded EL2.
         unsafe { SUBFN_COUNT[subfn as usize] = SUBFN_COUNT[subfn as usize].saturating_add(1); }
+    }
+    let subfn_count = if subfn < 32 {
+        // SAFETY: single-threaded EL2.
+        unsafe { SUBFN_COUNT[subfn as usize] }
+    } else {
+        0
+    };
+    // Trace the sound state machine's load-bearing subfns: schedule
+    // (0x07), start (0x0D), stop (0x0F), running? (0x13), the
+    // IRQ-handler path (0x1D), and mask install (0x1F). First 32
+    // calls each, then 1-in-64.
+    let is_traced_subfn = matches!(subfn, 0x07 | 0x0D | 0x0F | 0x13 | 0x1D | 0x1F);
+    if is_traced_subfn && (subfn_count <= 32 || (subfn_count & 0x3F) == 0) {
+        kprintln!(
+            "sound: subfn {:#04x} #{} r1={:#x} r2={:#x} r3={:#x} ipres={:#x}",
+            subfn,
+            subfn_count,
+            ctx.x[1] as u32,
+            ctx.x[2] as u32,
+            ctx.x[3] as u32,
+            vic::int_present_raw()
+        );
     }
     // Subfn arms below mirror Einstein's `ExecuteSoundDriverNative`
     // (`Emulator/TNativePrimitives.cpp:1062-1400`) one-for-one. The

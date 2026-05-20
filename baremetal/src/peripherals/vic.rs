@@ -231,6 +231,10 @@ pub const INT_GPIO: u32 = 0x0100_0000;
 /// `host_io::queue::enqueue_pen_sample` when a fresh sample lands
 /// on the input queue.
 pub const INT_TABLET: u32 = 0x1000_0000;
+static VIC_DMA_RAISE_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+static VIC_DMA_CLEAR_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+static VIC_DMA_CTRL_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+static VIC_DMA_FIQ_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Public raiser: OR `mask` into `int_present`. The next `update_virq`
 /// (called at every sync-trap exit and after `timer::on_irq`) reflects
@@ -245,6 +249,21 @@ pub fn raise(mask: u32) {
     // SAFETY: single-threaded.
     let s = unsafe { &mut *VIC.0.get() };
     s.int_present |= mask;
+    // Sound-DMA raises: log the first few so IRQ delivery into the
+    // guest is auditable (present + enabled + unmasked = deliverable).
+    if mask & INT_DMA_CH5 != 0 {
+        let n = VIC_DMA_RAISE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < 8 || n % 64 == 0 {
+            crate::kprintln!(
+                "vic: raise dma mask={:#x} ipres={:#x} ictrl={:#x} fiq={:#x} deliverable={:#x}",
+                mask,
+                s.int_present,
+                s.int_ctrl,
+                s.fiq_mask,
+                s.int_present & s.int_ctrl & !s.fiq_mask
+            );
+        }
+    }
 }
 
 /// Diagnostic: force-raise the two sound-DMA IRQ bits (DMA channel 3 and
@@ -427,6 +446,13 @@ pub fn int_ctrl_raw() -> u32 {
     // SAFETY: single-threaded.
     let s = unsafe { &*VIC.0.get() };
     s.int_ctrl
+}
+
+/// Diagnostic: raw FIQ mask register.
+pub fn fiq_mask_raw() -> u32 {
+    // SAFETY: single-threaded.
+    let s = unsafe { &*VIC.0.get() };
+    s.fiq_mask
 }
 
 // ---------- Hardware register addresses --------------------------------------
@@ -791,12 +817,55 @@ pub fn write(ipa: u64, value: u32) {
         K_HDWR_MATCH_3 => { s.match_reg[3] = value; s.match_fired &= !0b1000; match_reprogrammed = true; }
         // IntCtrlReg: Einstein TMemory.cpp:1882-1884 calls
         // SetIntCtrlReg which stores the value (TInterruptManager.cpp).
-        K_HDWR_INT_CTRL => s.int_ctrl = value,
+        K_HDWR_INT_CTRL => {
+            let before = s.int_ctrl;
+            s.int_ctrl = value;
+            // Sound-DMA enable-bit edges, first few only: shows when
+            // the kernel arms/disarms its sound IRQ source.
+            if ((before ^ value) & INT_DMA_CH5) != 0 {
+                let n = VIC_DMA_CTRL_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+                if n < 16 {
+                    crate::kprintln!(
+                        "vic: int_ctrl {:#x} -> {:#x} (dma5 {})",
+                        before,
+                        value,
+                        if value & INT_DMA_CH5 != 0 { "on" } else { "off" }
+                    );
+                }
+            }
+        }
         // IntClear: Einstein TMemory.cpp:1885-1887 calls ClearInterrupts
         // which does `mIntRaised &= ~inMask`. Match that.
-        K_HDWR_INT_CLEAR => s.int_present &= !value,
+        K_HDWR_INT_CLEAR => {
+            let before = s.int_present;
+            s.int_present &= !value;
+            // Sound-DMA acks, first few + 1-in-64: the counterpart of
+            // `vic: raise dma` — pairs of raise/clear prove the guest
+            // is servicing the sound IRQ.
+            if value & INT_DMA_CH5 != 0 {
+                let n = VIC_DMA_CLEAR_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+                if n < 8 || n % 64 == 0 {
+                    crate::kprintln!(
+                        "vic: clear dma value={:#x} ipres {:#x} -> {:#x}",
+                        value,
+                        before,
+                        s.int_present
+                    );
+                }
+            }
+        }
         // FIQMask: Einstein TMemory.cpp:1888-1890 calls SetFIQMask.
-        K_HDWR_FIQ_MASK => s.fiq_mask = value,
+        K_HDWR_FIQ_MASK => {
+            let before = s.fiq_mask;
+            s.fiq_mask = value;
+            // Sound-DMA FIQ-routing edges, first few only.
+            if ((before ^ value) & INT_DMA_CH5) != 0 {
+                let n = VIC_DMA_FIQ_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+                if n < 16 {
+                    crate::kprintln!("vic: fiq_mask {:#x} -> {:#x}", before, value);
+                }
+            }
+        }
         // IntEDReg{1..3}: Einstein TMemory.cpp:1891-1899 calls
         // SetIntEDReg{1..3}.
         K_HDWR_INT_ED_1 => s.int_ed_1 = value,

@@ -186,7 +186,10 @@ fn mailbox_call(
     // BCM2710 peripheral window, identity-mapped Device-nGnRE by
     // `mmu::init`. Single-core EL2; no concurrency.
     unsafe {
-        for _ in 0..10_000_000 {
+        for i in 0..10_000_000 {
+            if (i & 0x3ff) == 0 {
+                crate::audio::poll_mai_dma_completion();
+            }
             if read_volatile(MBOX_STATUS) & STATUS_FULL == 0 {
                 break;
             }
@@ -197,7 +200,10 @@ fn mailbox_call(
 
         write_volatile(MBOX_WRITE, bus_addr | CHANNEL_PROPERTY);
 
-        for _ in 0..10_000_000 {
+        for i in 0..10_000_000 {
+            if (i & 0x3ff) == 0 {
+                crate::audio::poll_mai_dma_completion();
+            }
             if read_volatile(MBOX_STATUS) & STATUS_EMPTY != 0 {
                 continue;
             }

@@ -474,8 +474,14 @@ fn send_cmd_kind(cmd: u8, arg: u32, kind: ResponseKind, dir: CmdDir) -> Result<u
 
     // Poll NEW_FLAG to drop. Bounded; if we sit here too long the
     // controller is wedged (clock not running, card not present,
-    // bus floating).
-    for _ in 0..1_000_000 {
+    // bus floating). The audio poll keeps the HDMI MAI ring fed
+    // while a slow card holds the bus — an SD write can stall in
+    // here for >100 ms of card-internal program time, far past the
+    // ~46 ms of audio the refill path stages ahead.
+    for i in 0..1_000_000u32 {
+        if (i & 0x3ff) == 0 {
+            crate::audio::poll_mai_dma_completion();
+        }
         let c = read_reg(SDCMD);
         if (c & SDCMD_NEW_FLAG) == 0 {
             if (c & SDCMD_FAIL_FLAG) != 0 {
@@ -562,7 +568,10 @@ fn fill_fifo_from(buf: &[u8; 512]) -> Result<(), CmdError> {
 /// read). Returns the observed fill count so the caller can burst-
 /// drain up to that many words before re-polling.
 fn wait_for_fifo_avail() -> Result<u32, CmdError> {
-    for _ in 0..2_000_000 {
+    for i in 0..2_000_000u32 {
+        if (i & 0x3ff) == 0 {
+            crate::audio::poll_mai_dma_completion();
+        }
         let h = read_reg(SDHSTS);
         if h & SDHSTS_ERROR_MASK != 0 {
             return Err(map_hsts_error(h));
@@ -578,7 +587,10 @@ fn wait_for_fifo_avail() -> Result<u32, CmdError> {
 /// Wait until SDEDM.FIFO_FILL < FIFO_DEPTH (at least one word of
 /// space). Returns the available space so the caller can burst-fill.
 fn wait_for_fifo_space() -> Result<u32, CmdError> {
-    for _ in 0..2_000_000 {
+    for i in 0..2_000_000u32 {
+        if (i & 0x3ff) == 0 {
+            crate::audio::poll_mai_dma_completion();
+        }
         let h = read_reg(SDHSTS);
         if h & SDHSTS_ERROR_MASK != 0 {
             return Err(map_hsts_error(h));

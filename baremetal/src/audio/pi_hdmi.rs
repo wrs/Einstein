@@ -60,7 +60,7 @@
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use crate::{dprintln, kprintln, peripherals::vic};
+use crate::{kprintln, peripherals::vic};
 
 /// Full system data-synchronization barrier. Ensures all prior memory
 /// accesses (including Device-nGnRE MMIO writes) have completed before
@@ -134,9 +134,12 @@ const HDMI_RAM_PACKET_START: usize = HDMI_BASE + 0x0400;
 //   CM base                  0x3F10_1000   (peripheral base + 0x101000)
 //   CM_HSMCTL                +0x88   src mux, enable
 //   CM_HSMDIV                +0x8C   12.12 integer.fractional divider
-//   A2W_PLLD_CTRL            +0x1140 PLLD integer NDIV (bits 0..9)
+//   A2W_PLLD_CTRL            +0x1140 PLLD integer NDIV (bits 0..9), PDIV (bits 12..14)
 //   A2W_PLLD_FRAC            +0x1240 PLLD fractional NDIV (bits 0..19)
 //   A2W_PLLD_PER             +0x1540 PLLD per-output divider (bits 0..7)
+//   A2W_PLLD_ANA0            +0x1050 PLLD analog block; ANA1 = ANA0+4
+//                                    carries the feedback pre-divider
+//                                    bit (BIT(14) on 2835-family)
 //
 // All offsets confirmed against `drivers/clk/bcm/clk-bcm2835.c`. PLLD
 // is the typical HSM source on Pi 3/Zero 2 W. If CM_HSMCTL.SRC ever
@@ -148,12 +151,22 @@ const CM_CTL_SRC_MASK: u32 = 0xF;
 const A2W_PLLA_CTRL: usize = CM_BASE + 0x1100;
 const A2W_PLLA_FRAC: usize = CM_BASE + 0x1200;
 const A2W_PLLA_PER: usize = CM_BASE + 0x1500;
+const A2W_PLLA_ANA0: usize = CM_BASE + 0x1010;
 const A2W_PLLC_CTRL: usize = CM_BASE + 0x1120;
 const A2W_PLLC_FRAC: usize = CM_BASE + 0x1220;
 const A2W_PLLC_PER: usize = CM_BASE + 0x1520;
+const A2W_PLLC_ANA0: usize = CM_BASE + 0x1030;
 const A2W_PLLD_CTRL: usize = CM_BASE + 0x1140;
 const A2W_PLLD_FRAC: usize = CM_BASE + 0x1240;
 const A2W_PLLD_PER: usize = CM_BASE + 0x1540;
+const A2W_PLLD_ANA0: usize = CM_BASE + 0x1050;
+/// `A2W_PLL_CTRL_PDIV_MASK`/`SHIFT` — post-VCO divider inside the PLL.
+const A2W_PLL_CTRL_PDIV_SHIFT: u32 = 12;
+const A2W_PLL_CTRL_PDIV_MASK: u32 = 0x7 << A2W_PLL_CTRL_PDIV_SHIFT;
+/// `bcm2835_ana_default.fb_prediv_mask` — ANA1 bit that halves the
+/// feedback path, doubling the effective NDIV/FDIV. (On BCM2711 these
+/// bits are repurposed as VCO-range bits, but Zero 2 W is 2835-family.)
+const A2W_PLL_ANA1_FB_PREDIV: u32 = 1 << 14;
 
 /// BCM283x crystal frequency. Fixed at 19.2 MHz on every Pi from the
 /// original through the Pi 3B+ / Zero 2 W (Pi 4 moved to 54 MHz).
@@ -319,8 +332,13 @@ const TONE_TEST_STARTUP_REG_LOG: bool = true;
 /// less than 1 ms of stereo audio, while UART output can stall for many ms.
 /// Keep per-second diagnostics off for listening tests.
 const TONE_TEST_HEARTBEAT_LOG: bool = false;
-/// Use Raspberry Pi Linux VC4 gen4 FIFO thresholds instead of Circle's 0x10s.
-const USE_LINUX_GEN4_MAI_THRESHOLDS: bool = true;
+/// Use Raspberry Pi Linux's gen3 MAI FIFO threshold values (the path
+/// `vc4_hdmi_audio_prepare` takes when `vc4->gen < VC4_GEN_5`, which
+/// is BCM2835/2710/2837 — i.e. the Pi Zero 2 W we target):
+/// `panic_high=0x8, panic_low=0x8, dreq_high=0x6, dreq_low=0x8`,
+/// packed as `0x0808_0608`. Flip false to use Circle's `0x10`s in
+/// every field if comparing to that reference.
+const USE_LINUX_GEN3_MAI_THRESHOLDS: bool = true;
 /// Linux's working VC4 path enables MAI during prepare, before the Audio
 /// InfoFrame helper returns.
 const ENABLE_MAI_AFTER_INFOFRAME: bool = false;
@@ -336,10 +354,6 @@ const FORCE_AUDIO_B_FRAME: bool = false;
 const TONE_TEST_ONE_SECOND_SILENCE_NOTCH: bool = false;
 /// Match Linux/Circle by powering the HDMI TX PHY RNG before audio starts.
 const ENABLE_HDMI_PHY_RNG: bool = true;
-/// Match the ACR values observed from Linux on the same panel. Linux programs
-/// the legacy VC4 N value and a CTS derived from its active HDMI pixel clock,
-/// not the 85.5 MHz PLLH pixel rate our firmware mailbox reports.
-const USE_LINUX_OBSERVED_ACR: bool = true;
 /// Match Linux's working RAM packet schedule on this panel: AVI/SPD/Audio
 /// slots 2, 3, and 4 enabled. Firmware leaves us with slots 0, 2, and 4.
 const USE_LINUX_RAM_PACKET_CONFIG: bool = true;
@@ -375,14 +389,19 @@ const fn mai_sample_rate_code() -> u32 {
     }
 }
 
+/// N for the HDMI ACR (Audio Clock Regeneration) packet.
+///
+/// Matches Linux's `vc4_hdmi_set_n_cts`:
+/// ```c
+/// n = 128 * samplerate / 1000;
+/// ```
+///
+/// For 44.1 kHz this gives 5644 (slightly less than the HDMI 1.4
+/// spec table's recommended 6272, but Linux uses this formula
+/// rather than the table). For 48 kHz it gives 6144 which matches
+/// the spec table exactly.
 const fn hdmi_acr_n() -> u32 {
-    if USE_LINUX_OBSERVED_ACR && !TONE_TEST_48_KHZ {
-        5644
-    } else if TONE_TEST_48_KHZ {
-        6144
-    } else {
-        6272
-    }
+    128 * HDMI_RATE_HZ / 1000
 }
 
 const fn iec_b_frame_preamble() -> u32 {
@@ -414,6 +433,25 @@ const fn use_alsa_iec_preambles() -> bool {
 /// the ping-pong cleanly.)
 const RING_FRAMES: usize = 8192;
 const RING_MASK: usize = RING_FRAMES - 1;
+
+/// Fill the MAI ring with a continuous tone instead of digital silence
+/// during the gaps between Newton sound clips. Diagnostic: if the
+/// HDMI link or our DMA feed ever glitches, the audible tone will
+/// click/dropout — so we can catch it without any guest activity. A
+/// genuine silence fill makes glitches inaudible.
+///
+/// The diagnostic waveform is deliberately loop-perfect for the cyclic
+/// MAI ring: 128 stereo frames per cycle divides the 8192-frame ring
+/// exactly. If the guest supplies no audio, the hardware can loop
+/// already-written idle slots without introducing a synthetic click at
+/// the DMA-ring wrap. Amplitude 0x0400 ≈ −36 dBFS is quiet enough to be
+/// unobtrusive but loud enough to hear real HDMI / MAI / DMA glitches.
+///
+/// To restore digital silence (e.g. for a production build) flip this
+/// to `false`.
+const DIAGNOSTIC_TONE_FILL: bool = true;
+const DIAGNOSTIC_TONE_AMPLITUDE: i32 = 0x0400;
+const DIAGNOSTIC_TONE_PERIOD_SAMPLES: u32 = 128;
 
 // ---------- State ---------------------------------------------------------
 
@@ -456,27 +494,33 @@ static SCHED_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
 static START_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
 static STOP_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
 static IRQ_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+static OUTPUT_IS_RUNNING_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
 static PUMP_TICK_LOG: AtomicU32 = AtomicU32::new(0);
 /// CNTPCT_EL0 timestamp of the last `vic::raise(output_mask)` in
-/// `pump`. Zero before the first IRQ. Used as a defensive
-/// rate-limit floor below the edge-trigger gate.
-static LAST_IRQ_TICKS: AtomicU64 = AtomicU64::new(0);
-/// Edge-trigger gate for the "ask for more" IRQ. Armed by
-/// `start_output` (entering a clip) and by `schedule_output` (fresh
-/// samples have arrived, so the kernel is again interested in being
-/// told when the ring drains). Cleared by `maybe_raise_watermark_irq`
-/// after a successful raise.
+/// `pump`. Zero before the first IRQ. Rate-limit floor for the
+/// level-triggered nudge below.
 ///
-/// This makes the nudge edge-triggered (one IRQ per buffer-empty
-/// crossing), not level-triggered. Without it a Newton sound shorter
-/// than one DMA period (~46 ms) traps the kernel in an IRQ storm:
-/// the ring stays below the watermark while `OUTPUT_RUNNING` is
-/// still true, and we'd nudge every 11 ms forever — `sndm` spins in
-/// `TULockingSemaphore::Acquire/Release` processing buffer-done
-/// messages with no real work to do, and any RPC sent to it (e.g.,
-/// the next `FPlaySound`) never gets dispatched. Matches the
-/// "kBufferDoneFlag" edge in Einstein's `PMainSoundDriver`.
-static NUDGE_ARMED: AtomicBool = AtomicBool::new(false);
+/// The nudge is LEVEL-triggered, matching Einstein's CoreAudio
+/// oracle: `TCoreAudioSoundManager::RenderCallback` raises the
+/// output interrupt on *every* render quantum while the buffer
+/// holds less than one Newton buffer — including when it is fully
+/// empty — and only `StopOutput` ends the stream of interrupts.
+/// The kernel terminates that stream itself: when it has nothing
+/// left to play it answers a nudge with a zero-size
+/// `ScheduleOutput` (→ `stop_output`, see the PulseAudio oracle's
+/// `else if (mOutputIsRunning) StopOutput();`) or calls subfn 0x0F
+/// directly.
+///
+/// History: an earlier revision made this edge-triggered (one IRQ
+/// per `schedule_output`) because level-triggering appeared to trap
+/// `sndm` in an IRQ storm. The real defect then was that zero-size
+/// schedules were silently ignored, so `OUTPUT_RUNNING` never
+/// dropped and the nudges genuinely never stopped. With the
+/// zero-size → `stop_output` translation in place the oracle's
+/// level-triggered contract is the correct one; the edge gate
+/// instead starved the kernel of the post-drain IRQ it needs to
+/// notice a finished clip (the "sndm wedge after the last buffer").
+static LAST_IRQ_TICKS: AtomicU64 = AtomicU64::new(0);
 
 // ---- DMA TX ring for HDMI MAI ---------------------------------------
 //
@@ -502,7 +546,8 @@ static NUDGE_ARMED: AtomicBool = AtomicBool::new(false);
 //     any DMA pointer — that's hardware's job via the chain. It
 //     just increments our consumer counter so `pump` knows how
 //     much of the ring is safe to overwrite.
-//   * `BURST_LENGTH = 2` matches vc4_hdmi's `maxburst = 2`.
+//   * Single-word transfers (no BURST flag), matching the bare
+//     `dmas = <&dma 17>` DT cookie Linux builds the TI from.
 //
 // The DMA is armed exactly once in `mai_dma_init_cyclic`. It never
 // stops. Start/stop of Newton clips is purely a producer-side gate
@@ -512,10 +557,16 @@ static NUDGE_ARMED: AtomicBool = AtomicBool::new(false);
 
 /// One CB per period × `N_PERIODS` periods per ring loop. CoreAudio's
 /// natural period is 512 frames at 44.1 kHz ≈ 11.6 ms = 1024
-/// subframes. With 4 periods × 4096 subframes each, IRQ rate is
-/// ~21 Hz and the full ring loops every ~186 ms.
-const N_PERIODS: usize = 4;
-const PERIOD_SLOTS: usize = 4096;
+/// subframes. With 8 periods × 2048 subframes each, the IRQ cadence
+/// is ~23 ms and the full ring loops every ~186 ms.
+///
+/// The period MUST be shorter than one Newton ping-pong buffer
+/// (1872 frames ≈ 42.4 ms): the period IRQ is what drives the
+/// watermark nudge, so if a whole buffer can drain inside a single
+/// period the kernel is asked for the next buffer too late and every
+/// clip stutters at the buffer seams.
+const N_PERIODS: usize = 8;
+const PERIOD_SLOTS: usize = 2048;
 const MAI_TX_RING_LEN: usize = N_PERIODS * PERIOD_SLOTS;
 
 #[repr(C, align(64))]
@@ -554,6 +605,7 @@ static MAI_PERIODS_DONE: AtomicU64 = AtomicU64::new(0);
 /// is a no-op for the DMA side — only the stereo→MAI staging code
 /// runs (which is harmless because nothing reads the ring).
 static MAI_CYCLIC_ARMED: AtomicBool = AtomicBool::new(false);
+static LAST_PERIOD_IRQ_TICKS: AtomicU64 = AtomicU64::new(0);
 /// Last volume passed to `output_volume_set`; reported back by
 /// `output_volume_get`. Default = `kOutputVolume_Max = 0`.
 static OUTPUT_VOLUME: AtomicU32 = AtomicU32::new(0);
@@ -563,6 +615,9 @@ static BUF2_ADDR: AtomicU32 = AtomicU32::new(0);
 /// IEC 60958 frame counter (mod 192). Used to set the B-frame
 /// preamble bits on the first subframe of each block.
 static IEC_FRAME_CTR: AtomicU32 = AtomicU32::new(0);
+/// Phase counter for the diagnostic-fill tone. Advances by one per
+/// stereo frame emitted as fill; wraps at `DIAGNOSTIC_TONE_PERIOD_SAMPLES`.
+static DIAGNOSTIC_TONE_PHASE: AtomicU32 = AtomicU32::new(0);
 /// IEC 60958-3 consumer channel-status, 192 bits = 24 bytes, one bit
 /// per frame mapped into bit 30 (C) of each subframe across a block.
 ///
@@ -607,6 +662,29 @@ const CHANNEL_STATUS_BYTES: [u8; 24] = [
 /// the audio path itself is broken and the kernel-side issues are
 /// downstream of that. Either way it isolates the problem.
 const TONE_TEST: bool = false;
+
+fn debug_counter() -> (u64, u64) {
+    let now: u64;
+    let freq: u64;
+    // SAFETY: sysreg reads, side-effect free.
+    unsafe {
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) now,
+            options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq,
+            options(nomem, nostack, preserves_flags));
+    }
+    (now, freq)
+}
+
+
+pub fn poll_mai_dma_completion() {
+    if !INIT_DONE.load(Ordering::Acquire) || !MAI_CYCLIC_ARMED.load(Ordering::Acquire) {
+        return;
+    }
+    if crate::peripherals::host_dma::mai_tx_pending() {
+        crate::peripherals::host_dma::on_completion(crate::peripherals::host_dma::MAI_TX_CHANNEL);
+    }
+}
 
 pub fn init() {
     // We don't probe HDMI link state here — `display::splash` has
@@ -703,6 +781,11 @@ pub fn init() {
 pub fn set_interrupt_mask(input_mask: u32, output_mask: u32) {
     INPUT_INT_MASK.store(input_mask, Ordering::Relaxed);
     OUTPUT_INT_MASK.store(output_mask, Ordering::Relaxed);
+    kprintln!(
+        "audio_pi_hdmi: irq masks in={:#x} out={:#x}",
+        input_mask,
+        output_mask
+    );
 }
 
 pub fn set_output_buffers(buf1_addr: u32, buf2_addr: u32) {
@@ -712,6 +795,16 @@ pub fn set_output_buffers(buf1_addr: u32, buf2_addr: u32) {
 
 pub fn output_volume_set(volume: u32) {
     OUTPUT_VOLUME.store(volume, Ordering::Relaxed);
+    static VOLUME_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+    let n = VOLUME_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 8 {
+        kprintln!(
+            "audio_pi_hdmi: volume set #{} raw={:#010x} gain_q15={}",
+            n + 1,
+            volume,
+            output_gain_q15()
+        );
+    }
 }
 
 pub fn output_volume_get() -> u32 {
@@ -723,10 +816,6 @@ pub fn start_output() {
         return;
     }
     OUTPUT_RUNNING.store(true, Ordering::Release);
-    // Arm the watermark IRQ for this clip. The first time the ring
-    // falls below LOW_WATERMARK_FRAMES we'll nudge the kernel once;
-    // schedule_output re-arms on every fresh buffer.
-    NUDGE_ARMED.store(true, Ordering::Release);
     // `MAI_CTL.ENABLE` is set once in `bringup_mai` and is left on
     // for the lifetime of the hypervisor. Toggling it per clip
     // (Newton calls subfn 0x0F StopOutput → 0x0D StartOutput
@@ -765,11 +854,6 @@ pub fn start_output() {
 /// fed with silence between clips so the wire stays continuous.
 pub fn stop_output() {
     OUTPUT_RUNNING.store(false, Ordering::Release);
-    // Disarm the nudge so a late DMA-period IRQ can't fire a stale
-    // watermark IRQ after the kernel has decided to stop. (OUTPUT_
-    // RUNNING already gates it, but being explicit avoids a race
-    // window in case a future change reorders these stores.)
-    NUDGE_ARMED.store(false, Ordering::Release);
     // Drop any in-flight samples — start fresh on the next clip.
     let ring = ring_state();
     let head = ring.head.load(Ordering::Acquire);
@@ -787,7 +871,17 @@ pub fn output_is_running() -> bool {
     let ring = ring_state();
     let head = ring.head.load(Ordering::Acquire);
     let tail = ring.tail.load(Ordering::Acquire);
-    head != tail
+    let running = head != tail;
+    let n = OUTPUT_IS_RUNNING_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 16 {
+        kprintln!(
+            "audio_pi_hdmi: output_is_running #{} -> {} (queued={})",
+            n + 1,
+            running,
+            head.wrapping_sub(tail)
+        );
+    }
+    running
 }
 
 pub fn schedule_output(which: u32, byte_count: u32) {
@@ -813,7 +907,16 @@ pub fn schedule_output(which: u32, byte_count: u32) {
     // commented-out `// RaiseOutputInterrupt();` at line 271) — IRQ
     // generation is the consumer's job, fired from the playback
     // side (our `pump`) when the buffer is running low.
-    if byte_count == 0 || base == 0 {
+    if byte_count == 0 {
+        // Einstein's null/PulseAudio backends treat a zero-size schedule
+        // as the end of the current output run. Keep HDMI MAI physically
+        // streaming, but stop the Newton-facing producer state so the
+        // kernel does not wait forever for another buffer-done edge.
+        kprintln!("audio_pi_hdmi: zero-size schedule -> stop");
+        stop_output();
+        return;
+    }
+    if base == 0 {
         return;
     }
     let input_samples = (byte_count / 2) as usize;
@@ -850,17 +953,9 @@ pub fn schedule_output(which: u32, byte_count: u32) {
     }
     ring.head.store(head, Ordering::Release);
 
-    // Re-arm the watermark nudge: the kernel just gave us fresh
-    // samples, so the next time the ring crosses below the low
-    // watermark we should ask for the *next* buffer. Without this
-    // re-arm, sounds longer than one DMA period (which produce
-    // multiple below-watermark crossings) would only get one IRQ
-    // total instead of one per buffer.
-    NUDGE_ARMED.store(true, Ordering::Release);
-
     // Immediately stage what we just queued into the MAI DMA ring
     // so the new audio reaches the wire promptly instead of waiting
-    // up to one period (~46 ms) for the next DMA-completion IRQ.
+    // up to one period (~23 ms) for the next DMA-completion IRQ.
     // No watermark-IRQ check here: the kernel JUST handed us data;
     // nudging it again would spin.
     refill_mai_dma_ring();
@@ -895,28 +990,58 @@ fn refill_mai_dma_ring() {
     let head_stereo = ring.head.load(Ordering::Acquire);
     let mut tail_stereo = ring.tail.load(Ordering::Acquire);
 
-    // Consumer cursor in subframes, monotonic u64. The DMA may be
-    // anywhere inside the current period (after `periods_done`
-    // periods have completed); we treat the entire current period
-    // as off-limits via the `max_ahead` bound below.
+    // Consumer cursor in subframes, monotonic u64. After
+    // `periods_done` period-completion IRQs the DMA has finished
+    // periods [0..periods_done) and is now reading the period at
+    // [periods_done * PERIOD_SLOTS, (periods_done+1) * PERIOD_SLOTS).
+    // That entire period is OFF-LIMITS to writes — racing with the
+    // DMA's current read produces torn IEC subframes (audible as a
+    // periodic click at the period rate, ~43 Hz).
     let periods_done = MAI_PERIODS_DONE.load(Ordering::Acquire);
     let consumer = periods_done.saturating_mul(PERIOD_SLOTS as u64);
-    let head = MAI_TX_HEAD.load(Ordering::Relaxed);
-    let ahead_subframes = head.saturating_sub(consumer) as usize;
+    // Minimum-safe producer position: one full period AHEAD of the
+    // period the DMA is currently reading (DMA reads
+    // [consumer, consumer + PERIOD_SLOTS); safe writes start at
+    // consumer + PERIOD_SLOTS). If `head` has fallen below this
+    // (e.g. after a long EL2 stall that swallowed several period
+    // IRQs), advance it. The slots we skip retain whatever
+    // subframe pattern they already held from earlier refills (or
+    // from `mai_dma_init_cyclic`'s pre-fill at boot) — still valid
+    // IEC, just from a previous cycle.
+    let safe_head_min = consumer.saturating_add(PERIOD_SLOTS as u64);
+    let mut head = MAI_TX_HEAD.load(Ordering::Relaxed);
+    let original_head = head;
+    let adjusted_for_consumer = head < safe_head_min;
+    if adjusted_for_consumer {
+        head = safe_head_min;
+        MAI_TX_HEAD.store(head, Ordering::Release);
+    }
+    let ahead_subframes = (head - consumer) as usize;
     let head_slot = (head % MAI_TX_RING_LEN as u64) as usize;
-    // Safety margin: never write closer than one period to the
-    // consumer (the DMA is currently reading somewhere in that
-    // period). Max legitimate `ahead` is RING_LEN - PERIOD_SLOTS.
+    // Max legitimate `ahead` is RING_LEN - PERIOD_SLOTS (so the
+    // tail of our write doesn't wrap into the DMA's current period).
     let max_ahead = MAI_TX_RING_LEN - PERIOD_SLOTS;
     let writable_subframes = max_ahead.saturating_sub(ahead_subframes);
     let writable_pairs = writable_subframes / 2;
 
-    // Target enough ahead-of-consumer audio that the next
-    // refill (typically one period later) finds the ring still
-    // well-fed even if it's delayed. Two periods = ~46 ms.
-    const TARGET_AHEAD_SUBFRAMES: usize = 2 * PERIOD_SLOTS;
-    let want_pairs = if ahead_subframes < TARGET_AHEAD_SUBFRAMES {
-        (TARGET_AHEAD_SUBFRAMES - ahead_subframes) / 2
+    // Target enough ahead-of-consumer audio that the next refill finds
+    // the ring well-fed even if EL2 is momentarily busy.
+    //
+    // When guest samples are queued, keep the old two-period cushion to
+    // avoid adding unnecessary playback latency. When the guest has no
+    // samples queued, treat the hardware side like CoreAudio's idle
+    // stream and fill the entire safe window with deterministic idle
+    // audio. That makes "no guest audio" independent of guest progress:
+    // the cyclic DMA can keep looping valid, seamless content.
+    const ACTIVE_TARGET_AHEAD_SUBFRAMES: usize = 2 * PERIOD_SLOTS;
+    let idle_only = head_stereo == tail_stereo;
+    let target_ahead_subframes = if idle_only {
+        max_ahead
+    } else {
+        ACTIVE_TARGET_AHEAD_SUBFRAMES
+    };
+    let want_pairs = if ahead_subframes < target_ahead_subframes {
+        (target_ahead_subframes - ahead_subframes) / 2
     } else {
         0
     };
@@ -964,11 +1089,18 @@ fn refill_mai_dma_ring() {
     }
     ring.tail.store(tail_stereo, Ordering::Release);
 
-    // Phase 2: silence padding to reach the ahead-of-consumer target.
+    // Phase 2: idle-fill padding to reach the ahead-of-consumer target.
+    // Default is a continuous 441 Hz tone (see `DIAGNOSTIC_TONE_FILL`) so
+    // any HDMI / MAI / DMA glitch is audible as a click or dropout even
+    // without any guest sound activity — without the tone, silence makes
+    // such glitches inaudible. Flip the flag to emit true silence in a
+    // production build.
     to_write_pairs = to_write_pairs.saturating_sub(pairs_written);
+    let real_pairs_written = pairs_written;
     for _ in 0..to_write_pairs {
         let frame_idx_in_block = IEC_FRAME_CTR.load(Ordering::Relaxed);
-        let (sf_l, sf_r) = encode_iec958_pair(0, 0, frame_idx_in_block);
+        let sample = next_diagnostic_fill_sample();
+        let (sf_l, sf_r) = encode_iec958_pair(sample, sample, frame_idx_in_block);
         // SAFETY: same exclusive-producer invariant as Phase 1.
         unsafe {
             let buf = &mut *MAI_TX_RING.0.get();
@@ -981,6 +1113,19 @@ fn refill_mai_dma_ring() {
             Ordering::Relaxed,
         );
         pairs_written += 1;
+    }
+
+    // A consumer-driven head adjustment means an EL2 stall let the
+    // DMA lap our producer cursor — always worth a line.
+    if adjusted_for_consumer {
+        kprintln!(
+            "audio_pi_hdmi: refill head adjusted {} -> {} (consumer={}, real_pairs={}, fill_pairs={})",
+            original_head,
+            safe_head_min,
+            consumer,
+            real_pairs_written,
+            pairs_written.saturating_sub(real_pairs_written)
+        );
     }
 
     if pairs_written == 0 {
@@ -1026,13 +1171,15 @@ fn refill_mai_dma_ring() {
 /// it again immediately would spin.
 ///
 /// `LOW_WATERMARK_FRAMES` is the queue depth at which we ask the
-/// kernel for more audio. Edge-triggered via [`NUDGE_ARMED`]: each
-/// `start_output` / `schedule_output` arms the gate, and we fire at
-/// most one IRQ per arm. This matches Einstein's `kBufferDoneFlag`
-/// edge in `PMainSoundDriver` — one IRQ per buffer consumed, not a
-/// continuous "queue is empty" stream. The 11 ms rate-limit below
-/// is a defensive floor only; with edge-triggering it should never
-/// be the gating factor in practice.
+/// kernel for more audio. LEVEL-triggered, per the Einstein oracle
+/// (`TCoreAudioSoundManager::RenderCallback`): while output is
+/// running and the queue is below one Newton buffer — including
+/// fully drained — every render quantum raises the interrupt. The
+/// kernel ends the stream itself via `stop_output` (subfn 0x0F or a
+/// zero-size `ScheduleOutput`). Our "render quantum" is the DMA
+/// period IRQ (`on_mai_dma_done`); the 11 ms floor below bounds the
+/// rate if periods ever fire in bursts. See the [`LAST_IRQ_TICKS`]
+/// doc-comment for why this must not be edge-triggered.
 fn maybe_raise_watermark_irq() {
     if !OUTPUT_RUNNING.load(Ordering::Acquire) {
         return;
@@ -1043,14 +1190,6 @@ fn maybe_raise_watermark_irq() {
     let queued = head.wrapping_sub(tail);
     const LOW_WATERMARK_FRAMES: u32 = 2000;
     if queued >= LOW_WATERMARK_FRAMES {
-        return;
-    }
-    // Edge-trigger: atomically test-and-clear. If NUDGE_ARMED was
-    // already false the kernel hasn't fed us anything new since the
-    // last nudge, so a second IRQ would just spin sndm in its
-    // Acquire/Release dispatch loop without progressing the sound
-    // state machine.
-    if !NUDGE_ARMED.swap(false, Ordering::AcqRel) {
         return;
     }
     const NUDGE_INTERVAL_MS: u64 = 11;
@@ -1067,35 +1206,105 @@ fn maybe_raise_watermark_irq() {
     let interval = freq * NUDGE_INTERVAL_MS / 1000;
     let last = LAST_IRQ_TICKS.load(Ordering::Relaxed);
     if now.wrapping_sub(last) < interval {
-        // Hit the defensive floor — re-arm so the next call can fire
-        // once enough time has elapsed.
-        NUDGE_ARMED.store(true, Ordering::Release);
         return;
     }
     let output_mask = OUTPUT_INT_MASK.load(Ordering::Relaxed);
     if output_mask == 0 {
-        // No mask installed yet (subfn 0x1F hasn't run). Re-arm so
-        // we don't lose the edge.
-        NUDGE_ARMED.store(true, Ordering::Release);
+        // No mask installed yet (subfn 0x1F hasn't run).
         return;
     }
     vic::raise(output_mask);
     LAST_IRQ_TICKS.store(now, Ordering::Relaxed);
+    // First few nudges of each clip are the interesting ones (the
+    // post-drain nudge the kernel uses to finish a clip is usually
+    // within the first handful); after that, sample 1-in-32 so a
+    // hung kernel shows up as a sparse trickle instead of 50 B every
+    // 23 ms saturating the UART.
     let n = IRQ_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    dprintln!(
-        "audio_pi_hdmi: nudge IRQ #{} mask={:#x} queued={}",
-        n + 1,
-        output_mask,
-        queued
-    );
+    if n < 8 || n % 32 == 0 {
+        kprintln!(
+            "audio_pi_hdmi: nudge IRQ #{} mask={:#x} queued={} ipres={:#x}",
+            n + 1,
+            output_mask,
+            queued,
+            vic::int_present_raw()
+        );
+    }
 }
 
 // ---------- Internals -----------------------------------------------------
 
+/// EXPERIMENT (display-reset isolation): extra right-shift applied to
+/// every guest sample on top of the Newton volume gain. The panel
+/// reboots ~250 ms into the full-scale boot chime while the −36 dBFS
+/// diagnostic tone streams for 14+ s without incident — amplitude
+/// (speaker-amp current → supply brownout) is the prime suspect. 2
+/// bits = −12 dB. If the panel survives the chime with this set, the
+/// amplitude hypothesis is confirmed; set back to 0 afterwards.
+const GUEST_SAMPLE_ATTENUATION_SHIFT: u32 = 2;
+
+/// Q15 output gain from the Newton volume word, per Einstein's
+/// `TSoundManager::OutputVolumeNormalized` (TSoundManager.cpp:78-92):
+///
+/// ```c
+/// if (mOutputVolume == kOutputVolume_Zero /* 0x80000000 */) v = 0.0;
+/// else if (mOutputVolume == kOutputVolume_Max /* 0x00000000 */) v = 1.0;
+/// else v = (mOutputVolume - kOutputVolume_Min)
+///        / (double)(0xffffffff - kOutputVolume_Min);
+/// ```
+///
+/// with `kOutputVolume_Min = 0xFFDDBD71`. The subtraction is C++
+/// unsigned arithmetic — values in (Min..0xFFFFFFFF] map linearly to
+/// (0..1]. Einstein hands the float to the host mixer; we have no
+/// hardware fader on the MAI path, so the gain is applied to the
+/// samples themselves.
+fn output_gain_q15() -> u32 {
+    const VOLUME_ZERO: u32 = 0x8000_0000;
+    const VOLUME_MAX: u32 = 0x0000_0000;
+    const VOLUME_MIN: u32 = 0xFFDD_BD71;
+    let vol = OUTPUT_VOLUME.load(Ordering::Relaxed);
+    match vol {
+        VOLUME_ZERO => 0,
+        VOLUME_MAX => 1 << 15,
+        v => {
+            let num = v.wrapping_sub(VOLUME_MIN) as u64;
+            let den = (u32::MAX - VOLUME_MIN) as u64;
+            ((num << 15) / den).min(1 << 15) as u32
+        }
+    }
+}
+
 fn encode_stereo_frame(mono_be_sample: i16) -> StereoFrame {
+    let gain = output_gain_q15() as i32;
+    let scaled =
+        (((mono_be_sample as i32) * gain) >> 15) >> GUEST_SAMPLE_ATTENUATION_SHIFT;
     // Newton is mono — duplicate to both channels.
-    let lo = (mono_be_sample as u16) as u32;
+    let lo = (scaled as i16 as u16) as u32;
     StereoFrame(lo | (lo << 16))
+}
+
+/// Diagnostic idle-fill sample. Returns 0 when `DIAGNOSTIC_TONE_FILL`
+/// is false (true silence); otherwise advances a phase counter and
+/// returns the next sample of a low-amplitude triangle wave at
+/// `DIAGNOSTIC_TONE_FREQ_HZ`. Called once per stereo frame from
+/// `refill_mai_dma_ring`'s Phase 2; both L and R channels get the
+/// same sample so the wave is centered (no L/R panning artefacts).
+fn next_diagnostic_fill_sample() -> i16 {
+    if !DIAGNOSTIC_TONE_FILL {
+        return 0;
+    }
+    let phase = DIAGNOSTIC_TONE_PHASE.fetch_add(1, Ordering::Relaxed)
+        % DIAGNOSTIC_TONE_PERIOD_SAMPLES;
+    let half = DIAGNOSTIC_TONE_PERIOD_SAMPLES as i32 / 2;
+    let amp = DIAGNOSTIC_TONE_AMPLITUDE;
+    let val = if (phase as i32) < half {
+        // Rising ramp: −amp at phase=0, +amp at phase=half.
+        -amp + 2 * amp * (phase as i32) / half
+    } else {
+        // Falling ramp: +amp at phase=half, −amp at phase=period.
+        amp - 2 * amp * ((phase as i32) - half) / half
+    };
+    val as i16
 }
 
 /// Encode a (left, right) 16-bit pair into two IEC 60958 subframes.
@@ -1196,8 +1405,8 @@ fn write_mai_data_wait(word: u32) {
 /// failed to bring up the channel (firmware reservation, etc.).
 fn mai_dma_init_cyclic() -> bool {
     use crate::peripherals::host_dma::{
-        self, bus_addr_periph, bus_addr_ram, DmaCb, DREQ_HDMI, TI_BURST_LENGTH_SHIFT,
-        TI_DEST_DREQ, TI_INTEN, TI_PERMAP_SHIFT, TI_SRC_INC, TI_WAIT_RESP,
+        self, bus_addr_periph, bus_addr_ram, DmaCb, DREQ_HDMI, TI_DEST_DREQ, TI_INTEN,
+        TI_PERMAP_SHIFT, TI_SRC_INC, TI_WAIT_RESP,
     };
     if !host_dma::is_mai_ready() {
         return false;
@@ -1206,22 +1415,53 @@ fn mai_dma_init_cyclic() -> bool {
         return true;
     }
 
-    // Leave the ring as the static zero-init left it. The first
-    // `schedule_output` then sees `ahead_subframes = 0` and is free
-    // to write up to `max_ahead = RING_LEN - PERIOD_SLOTS` subframes
-    // of real audio immediately, instead of waiting ~3 period IRQs
-    // for the consumer to drain enough silence padding to free up
-    // room. The brief window between DMA arm and first refill emits
-    // all-zero subframes (no IEC preamble), which the receiver may
-    // mute or interpret as flatline — acceptable for boot bring-up.
+    // Pre-fill the entire ring with valid IEC subframes (either the
+    // diagnostic tone or true silence — see DIAGNOSTIC_TONE_FILL).
+    // Without this the first ~186 ms after DMA arm would emit the
+    // BSS-zero pattern: a stream of 0x00000000 u32s, which has no
+    // IEC preamble and no parity bit set, and which the receiver
+    // either mutes or rejects. After the pre-fill MAI_TX_HEAD points
+    // one full ring ahead of the consumer; the first
+    // on_mai_dma_done call will see `ahead = RING_LEN - PERIOD_SLOTS`
+    // and write nothing, which is the correct steady-state shape.
     let ring_ptr = unsafe { (*MAI_TX_RING.0.get()).as_mut_ptr() };
-    MAI_TX_HEAD.store(0, Ordering::Release);
+    unsafe {
+        let buf = &mut *MAI_TX_RING.0.get();
+        // Iterate in stereo pairs (L then R), driving IEC_FRAME_CTR
+        // through the 192-frame block boundaries so the receiver
+        // sees a proper Z/X/Y preamble cadence from the first
+        // subframe.
+        for i in (0..MAI_TX_RING_LEN).step_by(2) {
+            let frame_idx_in_block = IEC_FRAME_CTR.load(Ordering::Relaxed);
+            let sample = next_diagnostic_fill_sample();
+            let (sf_l, sf_r) =
+                encode_iec958_pair(sample, sample, frame_idx_in_block);
+            buf[i] = sf_l;
+            buf[i + 1] = sf_r;
+            IEC_FRAME_CTR.store(
+                (frame_idx_in_block + 1) % IEC958_BLOCK_FRAMES,
+                Ordering::Relaxed,
+            );
+        }
+    }
+    MAI_TX_HEAD.store(MAI_TX_RING_LEN as u64, Ordering::Release);
     MAI_PERIODS_DONE.store(0, Ordering::Release);
 
     // Build the CB chain.
     let ring_arm_phys = ring_ptr as u64;
+    // Linux's `bcm2835_dma_prep_dma_cyclic` builds the TI from the DT
+    // dreq cookie. For vc4_hdmi the DT entry is `dmas = <&dma 17>` —
+    // bare DREQ number, no flag bits — so `BURST_LENGTH(17) = 0`
+    // (single-word transfers; the BCM2835_DMA_BURST = BIT(30) flag
+    // isn't in the cookie), `WIDE_SOURCE/DEST(17) = 0`, and
+    // `WAIT_RESP(17) = BCM2835_DMA_WAIT_RESP`. The MEM_TO_DEV
+    // direction adds `D_DREQ | S_INC`, and INT_EN goes on every CB
+    // that closes a period (which is every CB in our N_PERIODS
+    // chain). We were previously writing `BURST_LENGTH(2)` here —
+    // the vc4_hdmi.c slave-config `maxburst = 2` value, which the
+    // bcm2835-dma driver actually IGNORES at runtime in favor of
+    // the binary BURST cookie flag.
     let ti = (DREQ_HDMI << TI_PERMAP_SHIFT)
-        | (2u32 << TI_BURST_LENGTH_SHIFT) // matches Linux vc4_hdmi maxburst = 2
         | TI_SRC_INC
         | TI_DEST_DREQ
         | TI_WAIT_RESP
@@ -1285,11 +1525,82 @@ fn mai_dma_init_cyclic() -> bool {
 /// site is needed for the audio "tick" — explicitly NOT the trap
 /// tail, which the rest of the hypervisor is trying to thin out.
 pub fn on_mai_dma_done() {
-    MAI_PERIODS_DONE.fetch_add(1u64, Ordering::AcqRel);
+    let (now, freq) = debug_counter();
+    let last = LAST_PERIOD_IRQ_TICKS.swap(now, Ordering::AcqRel);
+    let delta_us = if last == 0 {
+        0
+    } else {
+        now.wrapping_sub(last).saturating_mul(1_000_000) / freq.max(1)
+    };
+    let mut periods_done = MAI_PERIODS_DONE.fetch_add(1u64, Ordering::AcqRel) + 1;
+
+    // Drift check: the IRQ-counted consumer estimate assumes one
+    // dispatched completion per CB boundary. If EL2 ever services the
+    // IRQ a full period late, two CBs have completed but CS.INT only
+    // records one — the estimate then lags the hardware FOREVER, and
+    // every refill writes into the period the DMA is actually
+    // reading (persistent torn audio). CONBLK_AD is ground truth:
+    // it holds the bus address of the CB the channel is executing
+    // right now, i.e. the true current period. Resync forward (the
+    // estimate can only lag, never lead) and log loudly — this
+    // firing at all means an EL2 stall exceeded one period (~23 ms).
+    let conblk = crate::peripherals::host_dma::mai_tx_conblk();
+    let actual_period = {
+        let mut found = None;
+        for i in 0..N_PERIODS {
+            // SAFETY: address-of only — single-threaded EL2, and the
+            // CB array is never moved after init.
+            let cb_addr = unsafe { core::ptr::addr_of!(MAI_TX_CBS.0[i]) } as u64;
+            let cb_bus = crate::peripherals::host_dma::bus_addr_ram(cb_addr);
+            if cb_bus == conblk {
+                found = Some(i);
+                break;
+            }
+        }
+        found
+    };
+    if let Some(actual) = actual_period {
+        let expected = (periods_done % N_PERIODS as u64) as usize;
+        if actual != expected {
+            let lag = (actual + N_PERIODS - expected) % N_PERIODS;
+            // Cap the accepted lag at half the ring: an apparent lag
+            // of N-1 is indistinguishable from reading CONBLK_AD in
+            // the (theoretical) window before the controller loads
+            // the next CB. A genuine stall longer than N/2 periods
+            // still converges — the next IRQ re-detects the residue.
+            if lag <= N_PERIODS / 2 {
+                periods_done = MAI_PERIODS_DONE
+                    .fetch_add(lag as u64, Ordering::AcqRel)
+                    + lag as u64;
+                kprintln!(
+                    "audio_pi_hdmi: period-IRQ coalesced — CONBLK says period {} but estimate said {} (lag {}); resynced periods_done to {}",
+                    actual,
+                    expected,
+                    lag,
+                    periods_done
+                );
+            } else {
+                kprintln!(
+                    "audio_pi_hdmi: CONBLK period {} vs estimate {} (apparent lag {} > {}); not resyncing",
+                    actual,
+                    expected,
+                    lag,
+                    N_PERIODS / 2
+                );
+            }
+        }
+    }
+
     refill_mai_dma_ring();
     maybe_raise_watermark_irq();
 
-    // Status line on every period.
+    // Compact period status: first 16 periods (boot bring-up), then
+    // 1-in-64 (~every 1.5 s) as a liveness heartbeat, plus any
+    // period whose IRQ arrived late (an EL2 stall ate into the
+    // refill margin — exactly the precondition for consumer drift
+    // and audible tearing). A late period also dumps the DMA CS /
+    // DEBUG registers and MAI_CTL so wire-level errors (DLATE etc.)
+    // land in the same line.
     let tick = PUMP_TICK_LOG.fetch_add(1, Ordering::Relaxed);
     // SAFETY: MMIO read.
     let ctl = unsafe { read_volatile(HDMI_MAI_CTL as *const u32) };
@@ -1297,12 +1608,32 @@ pub fn on_mai_dma_done() {
     let head = ring.head.load(Ordering::Acquire);
     let tail = ring.tail.load(Ordering::Acquire);
     let queued = head.wrapping_sub(tail);
-    kprintln!(
-        "audio_pi_hdmi: period {} stereo_queued={} MAI_CTL={:#x}",
-        tick,
-        queued,
-        ctl
-    );
+    // "Late" = more than ~1.7 period-times between dispatches. Must
+    // clear the boot-time polling quantization: a ~10 ms poll cadence
+    // on top of the 23.2 ms period puts worst-case healthy dt at
+    // ~33 ms (the 30.06 ms lines in earlier captures were false
+    // positives at a 30 ms threshold).
+    let late = delta_us > 40_000;
+    if tick < 16 || tick % 64 == 0 || late {
+        kprintln!(
+            "audio_pi_hdmi: period {} queued={} MAI_CTL={:#x} dt_us={}",
+            tick,
+            queued,
+            ctl,
+            delta_us
+        );
+    }
+    if late {
+        let mai_head = MAI_TX_HEAD.load(Ordering::Acquire);
+        let consumer = periods_done.saturating_mul(PERIOD_SLOTS as u64);
+        let (dma_cs, dma_dbg) = crate::peripherals::host_dma::mai_tx_diag();
+        kprintln!(
+            "audio_pi_hdmi: late period: ahead={} dma_cs={:#x} dma_dbg={:#x}",
+            mai_head.saturating_sub(consumer),
+            dma_cs,
+            dma_dbg
+        );
+    }
 }
 
 fn log_packet_scheduler_regs(context: &str, seconds: u64) {
@@ -1379,27 +1710,42 @@ fn mai_ctl_enable_playback() {
     }
 }
 
-/// Write the "stopped" MAI_CTL bit pattern, matching
-/// `vc4_hdmi_audio_shutdown` in vc4_hdmi.c:
+/// Write the "shutdown" MAI_CTL bit pattern, matching
+/// `vc4_hdmi_audio_shutdown` in vc4_hdmi.c byte-for-byte:
 ///
 /// ```c
 /// HDMI_WRITE(HDMI_MAI_CTL,
-///     VC4_HD_MAI_CTL_RESET |
-///     VC4_HD_MAI_CTL_ERRORF |
+///     VC4_HD_MAI_CTL_DLATE |
 ///     VC4_HD_MAI_CTL_ERRORE |
-///     VC4_HD_MAI_CTL_DLATE);
+///     VC4_HD_MAI_CTL_ERRORF);
 /// ```
 ///
-/// (Previously this wrote zero, which is wrong: zero doesn't assert
-/// RESET, so the engine remains in a half-enabled state between
-/// playbacks and the next `start_output` doesn't get a clean FIFO.)
+/// Note: Linux's `vc4_hdmi_audio_shutdown` also calls `phy_rng_disable`
+/// and `vc4_hdmi_audio_reset` (see [`mai_ctl_reset`]) after this
+/// write. Currently unused — kept for symmetry.
+#[allow(dead_code)]
 fn mai_ctl_shutdown() {
     // SAFETY: MMIO write in the Device-nGnRE window.
     unsafe {
         write_volatile(
             HDMI_MAI_CTL as *mut u32,
-            MAI_CTL_RESET | MAI_CTL_ERRORF | MAI_CTL_ERRORE | MAI_CTL_DLATE,
+            MAI_CTL_DLATE | MAI_CTL_ERRORE | MAI_CTL_ERRORF,
         );
+    }
+}
+
+/// Pulse the MAI block through Linux's `vc4_hdmi_audio_reset`
+/// sequence: three separate single-bit MAI_CTL writes (RESET,
+/// ERRORF, FLUSH). The OR'd-into-one variant we had before is NOT
+/// equivalent — the hardware latches each bit on a rising edge and
+/// the OR'd write only produces one edge. Currently unused.
+#[allow(dead_code)]
+fn mai_ctl_reset() {
+    // SAFETY: MMIO writes in the Device-nGnRE window.
+    unsafe {
+        write_volatile(HDMI_MAI_CTL as *mut u32, MAI_CTL_RESET);
+        write_volatile(HDMI_MAI_CTL as *mut u32, MAI_CTL_ERRORF);
+        write_volatile(HDMI_MAI_CTL as *mut u32, MAI_CTL_FLUSH);
     }
 }
 
@@ -1429,8 +1775,9 @@ fn pixel_clock_hz() -> Option<(u32, &'static str)> {
 /// Path: `CM_HSMCTL.SRC` selects a PLL output (PLLA-per / PLLC-per /
 /// PLLD-per / oscillator). `CM_HSMDIV` divides that down with a
 /// 12.12 integer.fractional divider. Each per-output PLL is itself
-/// `OSC * (NDIV + FRAC / 2^20) / PER_DIV`, with NDIV/FRAC/PER_DIV
-/// living in the A2W_PLLx_* registers.
+/// `OSC * (NDIV + FRAC / 2^20) / PDIV / PER_DIV`, with NDIV doubled
+/// (FRAC too) when the ANA1 feedback pre-divider bit is set — all
+/// fields living in the A2W_PLLx_* registers.
 ///
 /// All offsets and field widths verified against
 /// `drivers/clk/bcm/clk-bcm2835.c` (which is the kernel's only
@@ -1459,32 +1806,53 @@ fn read_audio_clock_hz() -> Option<u32> {
     }
     let divider_q12: u64 = (divi as u64) * 4096 + (divf as u64);
 
-    // Source PLL output rate. The A2W_PLLx_CTRL register's bottom 10
-    // bits are the integer NDIV; A2W_PLLx_FRAC's bottom 20 bits are
-    // the fractional NDIV. A2W_PLLx_PER's bottom 8 bits are the
-    // per-output divider that takes the VCO down to the *_PER lane.
-    fn read_pll_per_hz(ctrl_reg: usize, frac_reg: usize, per_reg: usize) -> Option<u32> {
+    // Source PLL output rate, matching `bcm2835_pll_get_rate` +
+    // `bcm2835_pll_divider_get_rate` in clk-bcm2835.c exactly:
+    //
+    // - A2W_PLLx_CTRL bits 0..9 are the integer NDIV; bits 12..14 are
+    //   PDIV, a post-VCO divider (firmware normally programs 1).
+    // - A2W_PLLx_FRAC bits 0..19 are the fractional NDIV.
+    // - ANA1 (= ANA0 + 4) bit 14 is the feedback pre-divider: when
+    //   set, the feedback path is halved, so the effective NDIV and
+    //   FDIV are DOUBLED (`if (using_prediv) { ndiv *= 2; fdiv *= 2; }`).
+    //   The Pi firmware runs PLLD with this bit set; ignoring it
+    //   computes the VCO at half its true rate — which made the MAI
+    //   sample clock land at 88.2 kHz and every HDMI sound play at
+    //   double speed.
+    // - A2W_PLLx_PER bits 0..7 divide the (post-PDIV) VCO down to the
+    //   *_PER lane (fixed_divider = 1 for PLLA/C/D per Linux).
+    fn read_pll_per_hz(
+        ctrl_reg: usize,
+        frac_reg: usize,
+        per_reg: usize,
+        ana0_reg: usize,
+    ) -> Option<u32> {
         let ctrl = unsafe { read_volatile(ctrl_reg as *const u32) };
         let frac = unsafe { read_volatile(frac_reg as *const u32) };
         let per = unsafe { read_volatile(per_reg as *const u32) };
-        let ndiv = (ctrl & 0x3FF) as u64;
-        let frac20 = (frac & 0xFFFFF) as u64;
+        let ana1 = unsafe { read_volatile((ana0_reg + 4) as *const u32) };
+        let mut ndiv = (ctrl & 0x3FF) as u64;
+        let mut frac20 = (frac & 0xFFFFF) as u64;
+        let pdiv = ((ctrl & A2W_PLL_CTRL_PDIV_MASK) >> A2W_PLL_CTRL_PDIV_SHIFT) as u64;
         let per_div = (per & 0xFF) as u64;
-        if ndiv == 0 || per_div == 0 {
+        if ndiv == 0 || pdiv == 0 || per_div == 0 {
             return None;
         }
-        // VCO = OSC * (NDIV + FRAC / 2^20)
-        //     = (OSC * NDIV * 2^20 + OSC * FRAC) / 2^20
+        if ana1 & A2W_PLL_ANA1_FB_PREDIV != 0 {
+            ndiv *= 2;
+            frac20 *= 2;
+        }
+        // VCO = OSC * (NDIV + FRAC / 2^20) / PDIV
         // PER = VCO / PER_DIV
         let osc = BCM283X_OSC_HZ as u64;
-        let vco = osc * ndiv + (osc * frac20) / (1u64 << 20);
+        let vco = (osc * ndiv + (osc * frac20) / (1u64 << 20)) / pdiv;
         Some((vco / per_div) as u32)
     }
     let src_hz = match src {
         1 => BCM283X_OSC_HZ,
-        4 => read_pll_per_hz(A2W_PLLA_CTRL, A2W_PLLA_FRAC, A2W_PLLA_PER)?,
-        5 => read_pll_per_hz(A2W_PLLC_CTRL, A2W_PLLC_FRAC, A2W_PLLC_PER)?,
-        6 => read_pll_per_hz(A2W_PLLD_CTRL, A2W_PLLD_FRAC, A2W_PLLD_PER)?,
+        4 => read_pll_per_hz(A2W_PLLA_CTRL, A2W_PLLA_FRAC, A2W_PLLA_PER, A2W_PLLA_ANA0)?,
+        5 => read_pll_per_hz(A2W_PLLC_CTRL, A2W_PLLC_FRAC, A2W_PLLC_PER, A2W_PLLC_ANA0)?,
+        6 => read_pll_per_hz(A2W_PLLD_CTRL, A2W_PLLD_FRAC, A2W_PLLD_PER, A2W_PLLD_ANA0)?,
         _ => return None, // SRC 0=GND, 2/3=test, 7=HDMI-aux; none make sense for HSM
     };
 
@@ -1527,15 +1895,14 @@ fn play_test_tone() -> ! {
         kprintln!("audio_pi_hdmi: TONE_TEST — playing 200 Hz triangle wave forever");
     }
     kprintln!(
-        "audio_pi_hdmi: TONE_TEST config rate={}Hz infoframe_stream={} linux_thr={} late_enable={} zero_flags={} paren={} phy_rng={} linux_acr={} linux_rpc={} iec_mode={} notch={} heartbeat_log={}",
+        "audio_pi_hdmi: TONE_TEST config rate={}Hz infoframe_stream={} linux_thr={} late_enable={} zero_flags={} paren={} phy_rng={} linux_rpc={} iec_mode={} notch={} heartbeat_log={}",
         HDMI_RATE_HZ,
         AUDIO_INFOFRAME_REFER_TO_STREAM,
-        USE_LINUX_GEN4_MAI_THRESHOLDS,
+        USE_LINUX_GEN3_MAI_THRESHOLDS,
         ENABLE_MAI_AFTER_INFOFRAME,
         USE_AUDIO_PACKET_ZERO_FLAGS,
         USE_MAI_CTL_PAREN,
         ENABLE_HDMI_PHY_RNG,
-        USE_LINUX_OBSERVED_ACR,
         USE_LINUX_RAM_PACKET_CONFIG,
         IEC_DIAGNOSTIC_MODE,
         TONE_TEST_ONE_SECOND_SILENCE_NOTCH,
@@ -1656,19 +2023,25 @@ fn bringup_mai() -> bool {
         }
     };
 
-    // N value: HDMI 1.4a Table 7-1 recommends 6272 for 44.1 kHz, but
-    // Linux's working VC4 stream on this exact panel programs the legacy
-    // VC4 value 5644 plus CTS=0xc7f8, so we use the observed working pair.
+    // ACR N matches `vc4_hdmi_set_n_cts` verbatim: n = 128 * fs / 1000.
     //
-    //   CTS = (pixel_clock * N) / (128 * sample_rate)
-    //       = pixel_clock / 900    at fs=44100, N=6272
-    //       = pixel_clock / 1000   at fs=48000, N=6144
+    // CTS is supposed to follow Linux's formula:
+    //   cts = (mode->clock * 1000 * n) / (128 * samplerate);
+    // — but on this Pi Zero 2 W + touchscreen-panel combo, the
+    // firmware mailbox's CLOCK_ID_PIXEL returns 85.5 MHz while
+    // the actual on-wire TMDS pixel clock is 51.2 MHz (verified by
+    // observing Linux's working CTS=0xC7F8 on the same panel and
+    // back-solving for mode->clock = 51199.5 kHz). We don't have a
+    // KMS modeline to read; the firmware mailbox is the wrong tag
+    // for what we need (it returns a PLL source rate, not the
+    // post-divider TMDS rate). Until we find a reliable way to
+    // query the live TMDS pixel clock, we use the empirically-known
+    // good value for this panel: equivalent to mode->clock=51199 kHz.
     let n: u32 = hdmi_acr_n();
-    let cts: u32 = if USE_LINUX_OBSERVED_ACR && !TONE_TEST_48_KHZ {
-        0x0000_c7f8
-    } else {
-        ((pixel_clock_hz as u64 * n as u64) / (128 * HDMI_RATE_HZ as u64)) as u32
-    };
+    const PANEL_PIXEL_CLOCK_HZ: u64 = 51_200_000;
+    let cts: u32 =
+        ((PANEL_PIXEL_CLOCK_HZ * n as u64) / (128 * HDMI_RATE_HZ as u64)) as u32;
+    let _ = pixel_clock_hz; // currently only used in the boot log below
 
     // MAI_SMP per `vc4_hdmi_audio_set_mai_clock`:
     //   rational_best_approximation(audio_clock, samplerate, max_n, max_m+1, &n, &m)
@@ -1723,7 +2096,7 @@ fn bringup_mai() -> bool {
         | (channel_mask & MAI_CONFIG_CHANNEL_MASK_STEREO);
     let mai_fmt_val: u32 = (MAI_FORMAT_PCM << MAI_FMT_AUDIO_FORMAT_SHIFT)
         | (mai_sample_rate_code() << MAI_FMT_SAMPLE_RATE_SHIFT);
-    let mai_thr_val: u32 = if USE_LINUX_GEN4_MAI_THRESHOLDS {
+    let mai_thr_val: u32 = if USE_LINUX_GEN3_MAI_THRESHOLDS {
         // Raspberry Pi Linux vc4 gen4 thresholds:
         // PANICHIGH=0x08, PANICLOW=0x08, DREQHIGH=0x06, DREQLOW=0x08.
         0x0808_0608
@@ -1906,16 +2279,36 @@ fn set_audio_info_frame() {
     }
     buffer[3] = (0u32.wrapping_sub(sum) & 0xFF) as u8;
 
+    // Pack as Linux's `vc4_hdmi_write_infoframe` does: 7 payload bytes
+    // per 8-byte sub-block, where the first word holds 3 bytes (with
+    // the high byte zero) and the second word holds 4 bytes. For a
+    // 14-byte audio InfoFrame this is two sub-blocks (bytes [0..7]
+    // and [7..14]):
+    //
+    //   for (i = 0; i < len; i += 7) {
+    //     writel(buffer[i+0] | buffer[i+1]<<8 | buffer[i+2]<<16,
+    //            base + packet_reg);            packet_reg += 4;
+    //     writel(buffer[i+3] | buffer[i+4]<<8 | buffer[i+5]<<16 |
+    //            buffer[i+6]<<24,
+    //            base + packet_reg);            packet_reg += 4;
+    //   }
+    //
+    // Previously we packed buffer[7..11] into word2 and buffer[11..14]
+    // into word3 — a 4+3 split that shifts buffer[10..13] by one
+    // byte slot relative to what the hardware expects. Bytes 10..13
+    // are PB7..PB10 of the Audio InfoFrame, which are zero in our
+    // stream, so this was benign for audio but would corrupt any
+    // InfoFrame with nonzero high PB bytes (AVI, SPD, etc.).
     let word0 = (buffer[0] as u32) | ((buffer[1] as u32) << 8) | ((buffer[2] as u32) << 16);
     let word1 = (buffer[3] as u32)
         | ((buffer[4] as u32) << 8)
         | ((buffer[5] as u32) << 16)
         | ((buffer[6] as u32) << 24);
-    let word2 = (buffer[7] as u32)
-        | ((buffer[8] as u32) << 8)
-        | ((buffer[9] as u32) << 16)
-        | ((buffer[10] as u32) << 24);
-    let word3 = (buffer[11] as u32) | ((buffer[12] as u32) << 8) | ((buffer[13] as u32) << 16);
+    let word2 = (buffer[7] as u32) | ((buffer[8] as u32) << 8) | ((buffer[9] as u32) << 16);
+    let word3 = (buffer[10] as u32)
+        | ((buffer[11] as u32) << 8)
+        | ((buffer[12] as u32) << 16)
+        | ((buffer[13] as u32) << 24);
 
     // Linux's `vc4_hdmi_stop_packet` clears the slot's enable bit,
     // then polls RAM_PACKET_STATUS for the slot to read back as 0.

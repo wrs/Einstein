@@ -110,6 +110,8 @@ impl Dwc2 {
                 options(nomem, nostack, preserves_flags));
         }
         let deadline = start.wrapping_add((freq * timeout_ms as u64) / 1000);
+        let mut next_audio_poll = start;
+        let audio_poll_interval = (freq / 1000).max(1);
         loop {
             let v = self.read(offset);
             let set = (v & mask) == mask;
@@ -124,6 +126,10 @@ impl Dwc2 {
             }
             if now.wrapping_sub(deadline) as i64 >= 0 {
                 return false;
+            }
+            if now.wrapping_sub(next_audio_poll) as i64 >= 0 {
+                crate::audio::poll_mai_dma_completion();
+                next_audio_poll = now.wrapping_add(audio_poll_interval);
             }
         }
     }
@@ -552,6 +558,22 @@ impl Dwc2 {
         /// L2 maintenance in sync, but we don't.
         const GPU_UNCACHED_BASE: u32 = 0xC000_0000;
 
+        // Port-state gate. If the device dropped off the bus (the
+        // touchscreen panel rebooting takes its hub function down),
+        // an enabled channel raises no HCINT bits at all, so the
+        // poll loop below would burn its full 50 ms timeout — and
+        // since this runs from the trap_irq tail, a 50 ms tail per
+        // ~16 ms timer period means the next IRQ is already pending
+        // at every ERET and the guest executes ZERO instructions
+        // until the device returns (observed as the "kernel hang"
+        // with the guest PC frozen mid- straight-line code). Bail
+        // before touching the channel; the caller is responsible
+        // for detaching its device on NotReady.
+        let hprt = self.read(regs::HPRT);
+        if hprt & regs::HPRT_PRT_CONN_STS == 0 || hprt & regs::HPRT_PRT_ENA == 0 {
+            return Err(UsbError::NotReady);
+        }
+
         // Defensive: Circle's StartTransaction checks HCCHAR.CHENA
         // on entry and runs a CHDIS sequence if the channel hasn't
         // fully halted from a previous transfer. We always disable
@@ -635,6 +657,10 @@ impl Dwc2 {
                 options(nomem, nostack, preserves_flags));
         }
         let deadline = start.wrapping_add(freq * 50 / 1000);
+        // Keep HDMI MAI's cyclic DMA completion path alive while this
+        // polled USB transaction owns the CPU.
+        let mut next_audio_poll = start;
+        let audio_poll_interval = (freq / 1000).max(1);
         // Error-bit classification:
         //
         //   Hard bus errors: AHB_ERR, XACT_ERR (after the core's
@@ -686,6 +712,10 @@ impl Dwc2 {
             }
             if now.wrapping_sub(deadline) as i64 >= 0 {
                 break Err(UsbError::Timeout);
+            }
+            if now.wrapping_sub(next_audio_poll) as i64 >= 0 {
+                crate::audio::poll_mai_dma_completion();
+                next_audio_poll = now.wrapping_add(audio_poll_interval);
             }
         };
 

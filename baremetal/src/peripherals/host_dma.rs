@@ -51,6 +51,7 @@ pub const CS_INT: u32 = 1 << 2;
 pub const CS_END: u32 = 1 << 1;
 pub const CS_ACTIVE: u32 = 1 << 0;
 pub const CS_PRIORITY_SHIFT: u32 = 16;
+pub const CS_PANIC_PRIORITY_SHIFT: u32 = 20;
 
 // ---- TI register bits (BCM2835 §4.2.1 pp.50–51) ---------------------
 
@@ -176,6 +177,21 @@ pub const UART_TX_CHANNEL: u32 = 5;
 /// reservations typically touch 0, 2, 3.
 pub const MAI_TX_CHANNEL: u32 = 4;
 
+/// Per-channel CS flag bits (priority / panic-priority / wait-for-
+/// writes / dis-debug) ORed into both the arm-time and ACK-time
+/// writes. Mirrors Linux's `BCM2835_DMA_CS_FLAGS(dreq)` pattern,
+/// where the consumer encodes its AXI-arbitration preferences via
+/// the DT dma-cell and the driver carries them into every CS write.
+///
+/// UART = 0: matches Linux's PL011 DT entry `dmas = <&dma 12>` (bare
+/// DREQ, no high bits).
+///
+/// MAI = `PRIORITY(8) | PANIC_PRIORITY(15)`: diverges from Linux on
+/// purpose; see [`arm_mai_tx`] for the rationale.
+const UART_TX_CS_FLAGS: u32 = 0;
+const MAI_TX_CS_FLAGS: u32 =
+    (8u32 << CS_PRIORITY_SHIFT) | (15u32 << CS_PANIC_PRIORITY_SHIFT);
+
 /// Set true once UART TX init() succeeds. `arm_uart_tx()` and the
 /// uart-side completion dispatch are gated on this so the uart layer
 /// can call into us unconditionally.
@@ -266,54 +282,75 @@ unsafe fn arm_with_cs(ch: u32, cb: &DmaCb, cs: u32) {
     let cb_arm_phys = cb as *const DmaCb as u64;
     crate::cpu::dc_civac_range(cb_arm_phys, core::mem::size_of::<DmaCb>());
     let cb_bus = bus_addr_ram(cb_arm_phys);
+    // Match Linux's `bcm2835_dma_start_desc` byte-for-byte: three
+    // writes — CS=RESET (BIT(31), self-clearing) → CONBLK_AD →
+    // CS=ACTIVE|FLAGS. The pre-arm reset ensures any stale half-
+    // configured channel state from a prior arm is cleared before
+    // the new CB is loaded.
+    write_cs(ch, CS_RESET);
     write_conblk_ad(ch, cb_bus);
     write_cs(ch, cs);
 }
 
 /// Arm a DMA transfer on the UART TX channel.
 ///
-/// Uses Circle's `CDMAChannel::Start` arming bits:
-/// WAIT_FOR_OUTSTANDING_WRITES + priority 1 + ACTIVE. The UART
-/// destination is PL011 DR which retires writes promptly, so
-/// WAIT_FOR_OUTSTANDING_WRITES doesn't delay completion in practice.
+/// Matches Linux's `bcm2835_dma_start_desc` for the PL011 audio path:
+/// `BCM2835_DMA_CS_FLAGS(dreq)` extracts priority/wait-for-writes/
+/// dis-debug bits from the DT dma-cookie, and the Pi DT entry for
+/// PL011 is `dmas = <&dma 12>` — a bare DREQ number with no flag
+/// bits set — so `CS_FLAGS` evaluates to 0 and the write is just
+/// `ACTIVE`. We were previously using Circle's `priority 1 +
+/// WAIT_FOR_OUTSTANDING_WRITES` pattern; matching Linux removes the
+/// AXI-arbitration imbalance that let UART DMA bursts perturb the
+/// concurrent HDMI MAI feed (audible glitch correlated with each
+/// flash-persist load dot).
 ///
 /// SAFETY: see [`arm_with_cs`].
 pub unsafe fn arm_uart_tx(cb: &DmaCb) {
-    let cs = CS_WAIT_FOR_OUTSTANDING_WRITES | (1 << CS_PRIORITY_SHIFT) | CS_ACTIVE;
     // SAFETY: caller's invariant matches `arm_with_cs`'s.
-    unsafe { arm_with_cs(UART_TX_CHANNEL, cb, cs) }
+    unsafe { arm_with_cs(UART_TX_CHANNEL, cb, CS_ACTIVE | UART_TX_CS_FLAGS) }
 }
 
 /// Arm a DMA transfer on the MAI TX channel.
 ///
-/// Uses Linux's lean cyclic arming pattern: just ACTIVE. The
-/// `WAIT_FOR_OUTSTANDING_WRITES` bit makes the channel stall at every
-/// CB boundary until each AXI write to HDMI_MAI_DATA is fully
-/// retired; on the HDMI MAI block, "retired" may not happen until
-/// the FIFO consumes the sample on its own clock, which can defer
-/// the period-completion INT signal indefinitely. Matches
-/// `bcm2835_dma_start_desc` in `drivers/dma/bcm2835-dma.c` which
-/// writes only `BCM2835_DMA_ACTIVE`.
+/// JUSTIFIED divergence from Linux's `bcm2835_dma_start_desc` (which
+/// writes just `ACTIVE`, since the vc4_hdmi DT cookie `dmas = <&dma 17>`
+/// has no priority bits set): we raise AXI priority + panic_priority
+/// because our usage pattern differs from Linux's. Linux runs the
+/// HDMI MAI DMA intermittently — only while ALSA has data to stream
+/// — so DMA-controller arbitration with concurrent UART TX / EMMC
+/// reads never builds enough pressure to underrun the MAI FIFO.
+/// We feed MAI continuously (real audio when Newton is playing, a
+/// silence/tone fill otherwise) to keep the HDMI link's audio
+/// channel from renegotiating, and during heavy EL2 I/O (flash_sd
+/// restore = SD reads + UART log spam) the resulting sustained
+/// contention DOES underrun the FIFO. Promoting MAI to AXI
+/// priority 8 + panic priority 15 keeps the FIFO ahead through
+/// those bursts.
 ///
 /// SAFETY: see [`arm_with_cs`].
 pub unsafe fn arm_mai_tx(cb: &DmaCb) {
     // SAFETY: caller's invariant matches `arm_with_cs`'s.
-    unsafe { arm_with_cs(MAI_TX_CHANNEL, cb, CS_ACTIVE) }
+    unsafe { arm_with_cs(MAI_TX_CHANNEL, cb, CS_ACTIVE | MAI_TX_CS_FLAGS) }
 }
 
 /// Called from `trap_irq` when the BCM2835 IRQ controller reports a
 /// pending DMA completion on `ch`. Acks the channel's INT/END bits
 /// and dispatches to the registered consumer.
 pub fn on_completion(ch: u32) {
-    // ACK by writing the read value straight back: the W1C bits
-    // (INT/END/ERROR) clear because they were 1 on read, while the
-    // R/W bits (ACTIVE, WAIT_FOR_OUTSTANDING_WRITES, PRIORITY) keep
-    // whatever the channel currently has. Masking those R/W bits to 0
-    // — as the previous `cs & (INT|END|ERROR)` did — pauses the
-    // cyclic MAI chain after exactly one period IRQ on hardware where
-    // ACTIVE behaves as standard R/W rather than W1S.
-    let cs = read_cs(ch);
-    write_cs(ch, cs);
+    // Match Linux's `bcm2835_dma_callback` ACK shape:
+    //   writel(BCM2835_DMA_INT | BCM2835_DMA_ACTIVE | CS_FLAGS(dreq),
+    //          chan_base + CS);
+    // — INT to W1C the IRQ, ACTIVE to keep the cyclic chain running,
+    // plus the per-channel CS_FLAGS so priority bits aren't clobbered
+    // on every IRQ. (Without re-asserting CS_FLAGS, our MAI priority
+    // promotion would only last one period.)
+    let cs_flags = match ch {
+        UART_TX_CHANNEL => UART_TX_CS_FLAGS,
+        MAI_TX_CHANNEL => MAI_TX_CS_FLAGS,
+        _ => 0,
+    };
+    write_cs(ch, CS_INT | CS_ACTIVE | cs_flags);
     match ch {
         UART_TX_CHANNEL => crate::uart::on_tx_done(),
         MAI_TX_CHANNEL => crate::audio::on_mai_dma_done(),
@@ -345,4 +382,15 @@ pub fn uart_tx_diag() -> (u32, u32) {
 /// Snapshot for diagnostic logging — CS / DEBUG of the MAI TX channel.
 pub fn mai_tx_diag() -> (u32, u32) {
     (read_cs(MAI_TX_CHANNEL), read_debug(MAI_TX_CHANNEL))
+}
+
+/// Bus address of the control block the MAI TX channel is currently
+/// executing (CONBLK_AD). With the cyclic one-CB-per-period chain
+/// this identifies the period the DMA is reading *right now*,
+/// independent of how many completion IRQs were actually dispatched
+/// — the ground truth the IRQ-counted consumer estimate is checked
+/// against.
+pub fn mai_tx_conblk() -> u32 {
+    // SAFETY: MMIO read in the Device-nGnRE window.
+    unsafe { read_volatile(chan_reg(MAI_TX_CHANNEL, REG_CONBLK_AD)) }
 }

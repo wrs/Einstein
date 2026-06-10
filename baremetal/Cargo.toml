@@ -327,7 +327,7 @@ newton-objects = { path = "newton-objects" }
 # referenced from #[cfg(feature = "platform-raspi3b")] code, but Cargo
 # can't conditionally pull deps the way it gates `mod`s, so this
 # compiles on every target. The crate itself is no_std-compatible.
-embedded-sdmmc = { version = "0.9", default-features = false }
+embedded-sdmmc = { path = "vendor/embedded-sdmmc", default-features = false }
 
 [profile.dev]
 panic = "abort"

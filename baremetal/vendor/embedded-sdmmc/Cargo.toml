@@ -1,0 +1,36 @@
+# Vendored copy of embedded-sdmmc 0.9.0 — see VENDOR.md for why and
+# what we changed. Trimmed vs. the upstream manifest: the [[example]] /
+# [[test]] stanzas and their dev-dependencies are dropped (we don't
+# build them as a path dependency), leaving just the library.
+[package]
+name = "embedded-sdmmc"
+version = "0.9.0"
+edition = "2021"
+rust-version = "1.76"
+license = "MIT OR Apache-2.0"
+description = "A basic SD/MMC driver for Embedded Rust (vendored — see VENDOR.md)."
+repository = "https://github.com/rust-embedded-community/embedded-sdmmc-rs"
+
+[lib]
+name = "embedded_sdmmc"
+path = "src/lib.rs"
+
+# As a path dependency this crate doesn't get cargo's implicit
+# `cap-lints=allow` (which suppresses registry-dep warnings), so its
+# own upstream lint warnings would otherwise flood our build. Allow
+# them here instead of editing upstream source.
+[lints.rust]
+warnings = "allow"
+
+[features]
+default = ["log"]
+defmt-log = ["dep:defmt"]
+log = ["dep:log"]
+
+[dependencies]
+byteorder = { version = "1", default-features = false }
+defmt = { version = "0.3", optional = true }
+embedded-hal = "1.0.0"
+embedded-io = "0.6.1"
+heapless = "0.8"
+log = { version = "0.4", optional = true, default-features = false }

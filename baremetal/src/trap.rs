@@ -168,13 +168,96 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
     crate::tarmac::maybe_emit_start(n);
 }
 
-/// Asynchronous IRQ taken at EL2. On this target the only physical IRQ
-/// source we wire up is CNTHP (EL2 physical timer). Any fire is a Newton
-/// timer-match deadline expiring: we latch the crossed match bit(s) into
-/// `vic::int_present`, rearm CNTHP_CVAL_EL2 to the next pending deadline,
-/// and update HCR_EL2.VI so the guest takes a virtual IRQ on ERET.
+/// Asynchronous IRQ taken at EL2. Dispatched by interruptee: an IRQ
+/// taken while the AArch32 guest was running needs the full guest-path
+/// servicing (`irq_from_guest`); an IRQ taken while EL2 itself was
+/// running (boot, or a long operation inside an `with_irqs_unmasked`
+/// window) gets the slim, interruptee-agnostic `irq_from_el2`.
+///
+/// The interruptee is identified from SPSR_EL2. SPSR_EL2.M[4]==1 means
+/// the previous PSTATE was AArch32 — that's always the guest at EL1
+/// (the hypervisor never executes AArch32), so it takes the guest path.
+/// With M[4]==0 (AArch64) the level is M[3:2]: 0b10 is EL2 (mode 0x8
+/// EL2t / 0x9 EL2h), i.e. we interrupted hypervisor code.
 #[no_mangle]
 pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
+    let spsr = read_sysreg!("spsr_el2");
+    let aarch32 = (spsr & (1 << 4)) != 0;
+    let el2 = !aarch32 && ((spsr & 0b1100) == 0b1000);
+    if el2 {
+        irq_from_el2();
+    } else {
+        irq_from_guest(ctx);
+    }
+}
+
+/// Slim same-EL ISR: services an IRQ taken while EL2 hypervisor code
+/// was running (boot before guest entry, or inside an
+/// `cpu::with_irqs_unmasked` window in a trap handler).
+///
+/// ## Contract
+///
+/// 1. May run nested inside *any* other EL2 handler (or unmasked boot
+///    code). It must therefore touch no `ctx`-derived guest state and
+///    nothing that interprets ELR_EL2 / SPSR_EL2 as the guest's.
+/// 2. The complete set of state it mutates:
+///    - VIC tick/match state, via `timer::on_irq` (latches crossed
+///      match bits into `vic::int_present`, rearms CNTHP_CVAL_EL2).
+///    - host_dma channel CS registers, via `host_dma::on_completion`.
+///    - the uart TX ring tail, via `uart::on_tx_done` (reached through
+///      `host_dma::on_completion` of the UART TX channel).
+///    - the audio MAI ring + stereo ring tail + `vic::raise`, via
+///      `audio::on_mai_dma_done` (reached through
+///      `host_dma::on_completion` of the MAI TX channel).
+///    - kprintln's own uart ring (it masks IRQs around its critical
+///      section, so it is re-entrant-safe from here).
+/// 3. Therefore code running inside `cpu::with_irqs_unmasked` must not
+///    touch any of the above.
+///
+/// Deliberately absent vs. the guest path: no `ctx` access, no
+/// heartbeat / wedge / task_dump / heap_check / tripwire sampling, no
+/// host_io / input pumps, no `update_virq` (the guest is not running
+/// while EL2 executes on this single core, so vIRQ delivery correctly
+/// waits for the next guest trap exit), no snapshot autosave, no splash
+/// progress, no g1/alrt capture rearm.
+fn irq_from_el2() {
+    // Acknowledge on the host CPU-interface (GICv3 on FVP, no-op on
+    // BCM2836). A spurious ACK means nothing is pending and we skip
+    // timer::on_irq, mirroring the guest path.
+    let intid = platform::irq_ack();
+    let spurious = intid == platform::irq_spurious();
+
+    // BCM2835 DMA channel dispatch: channel N raises GPU IRQ source
+    // 16+N. UART-TX owns ch 5, MAI-TX owns ch 4.
+    #[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+    {
+        use crate::peripherals::host_dma;
+        let pend1 = platform::bcm2835_irq_pending_1();
+        for &ch in &[host_dma::UART_TX_CHANNEL, host_dma::MAI_TX_CHANNEL] {
+            if pend1 & (1u32 << (16 + ch)) != 0 {
+                host_dma::on_completion(ch);
+            }
+        }
+    }
+
+    // CNTHP is level-triggered; not rearming it would storm. Calling
+    // it when the real source was a DMA channel is harmless — it is
+    // wall-clock-paced — and matches the guest path's behavior on BCM
+    // where the ack is a no-op.
+    if !spurious {
+        timer::on_irq();
+    }
+
+    // EOI last so the GIC is ready to deliver the next interrupt.
+    // No-op on BCM2836.
+    platform::irq_eoi(intid);
+}
+
+/// Guest-path IRQ servicing: an IRQ taken while the AArch32 guest was
+/// running. Latches Newton timer-match deadlines into `vic::int_present`,
+/// rearms CNTHP_CVAL_EL2, runs the diagnostic / input-pump / autosave
+/// tail, and updates HCR_EL2.VI so the guest takes a virtual IRQ on ERET.
+fn irq_from_guest(ctx: &mut TrapContext) {
     // Group-1 capture re-arm: any G1 page that took a permission-fault
     // since the last IRQ has been auto-flipped to RW (so the store
     // could complete). Re-impose RO+XN now so the *next* G1 write

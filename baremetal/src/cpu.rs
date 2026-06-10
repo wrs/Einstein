@@ -159,8 +159,6 @@ pub fn delay_ms(ms: u32) {
             options(nomem, nostack, preserves_flags));
     }
     let target = start.wrapping_add((freq * ms as u64) / 1000);
-    let mut next_audio_poll = start;
-    let audio_poll_interval = (freq / 1000).max(1);
     loop {
         let now: u64;
         // SAFETY: sysreg read.
@@ -171,11 +169,96 @@ pub fn delay_ms(ms: u32) {
         if now.wrapping_sub(target) as i64 >= 0 {
             return;
         }
-        if now.wrapping_sub(next_audio_poll) as i64 >= 0 {
-            crate::audio::poll_mai_dma_completion();
-            next_audio_poll = now.wrapping_add(audio_poll_interval);
-        }
     }
+}
+
+/// Unmask EL2 physical IRQs (clear PSTATE.I) for the remainder of the
+/// current execution context. Used once from `kmain` after the IRQ
+/// sources we drive (BCM2835 DMA channels feeding UART TX and the HDMI
+/// MAI ring, and later CNTHP) are wired up: from that point on their
+/// completions arrive as real interrupts into `trap::irq_from_el2`
+/// instead of being polled cooperatively, which is what lets a long
+/// EL2 operation (e.g. the 5-second SD flash load) run without
+/// starving the audio ring.
+///
+/// EL2's PSTATE.I set here only governs EL2 execution. Once the guest
+/// is entered, ERET loads the guest's PSTATE; every subsequent EL2
+/// entry is an exception handler, which enters with I masked again.
+#[inline]
+pub fn unmask_irqs_el2() {
+    // SAFETY: flipping PSTATE.I only; the EL2 vector table is installed
+    // and `trap::irq_from_el2` is safe to run nested in any EL2 context.
+    unsafe {
+        core::arch::asm!("msr daifclr, #2", options(nostack, preserves_flags));
+    }
+}
+
+/// Run `f` with EL2 physical IRQs unmasked, restoring the prior DAIF
+/// state afterwards. Wraps a long-running EL2 operation that executes
+/// in trap-handler context (where IRQs are masked on entry) so that
+/// DMA-completion and timer IRQs are serviced by `trap::irq_from_el2`
+/// while `f` runs — keeping the HDMI audio ring fed and CNTHP rearmed
+/// even when `f` blocks for hundreds of milliseconds.
+///
+/// ## Why ELR_EL2 / SPSR_EL2 are snapshotted
+///
+/// `save_context` in `vectors.s` spills only x0..x30, not ELR_EL2 /
+/// SPSR_EL2. A nested exception (the IRQ taken inside `f`) clobbers
+/// those sysregs, and the surrounding handler's
+/// `restore_context_and_eret` ERETs on whatever they hold. Without
+/// restoring them, ERET would jump to the post-IRQ EL2 state instead
+/// of back to the guest. We re-mask IRQs *before* writing them back so
+/// a late IRQ can't clobber them again after the restore. This
+/// generalizes the manual snapshot/restore that `pause_system` does
+/// around its WFI loop.
+///
+/// ## Caller invariants
+///
+/// - `f` must not touch any state that `trap::irq_from_el2` touches
+///   (the VIC tick/match state, host_dma channel CS registers, the
+///   uart TX ring tail, the audio MAI/stereo rings, or vic::raise) —
+///   a nested IRQ may mutate it concurrently. kprintln is safe (it
+///   masks IRQs around its own critical section).
+/// - Only call after the surrounding handler has finished reading
+///   ESR_EL2 / FAR_EL2: a nested exception entry overwrites those too.
+pub fn with_irqs_unmasked<R>(f: impl FnOnce() -> R) -> R {
+    let saved_elr: u64;
+    let saved_spsr: u64;
+    let saved_daif: u64;
+    // SAFETY: sysreg reads, side-effect free.
+    unsafe {
+        core::arch::asm!(
+            "mrs {0}, elr_el2",
+            "mrs {1}, spsr_el2",
+            "mrs {2}, daif",
+            out(reg) saved_elr,
+            out(reg) saved_spsr,
+            out(reg) saved_daif,
+            options(nomem, nostack, preserves_flags),
+        );
+        core::arch::asm!("msr daifclr, #2", options(nostack, preserves_flags));
+    }
+
+    let r = f();
+
+    // Restore DAIF to its saved value (composes with already-unmasked
+    // or nested windows) BEFORE restoring ELR/SPSR, so a late IRQ
+    // taken during this window can't clobber them after the write.
+    // SAFETY: writing DAIF / ELR_EL2 / SPSR_EL2 from EL2 is allowed;
+    // the surrounding handler's ERET will consume the restored values.
+    unsafe {
+        core::arch::asm!(
+            "msr daif, {0}",
+            "msr elr_el2, {1}",
+            "msr spsr_el2, {2}",
+            in(reg) saved_daif,
+            in(reg) saved_elr,
+            in(reg) saved_spsr,
+            options(nostack, preserves_flags),
+        );
+    }
+
+    r
 }
 
 // NOTE: There is no `read_sp_abt()` helper. `MRS <Xt>, SP_abt`

@@ -153,35 +153,19 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
 ///
 /// SAFETY notes:
 ///   * WFI at EL2 is architectural (DDI 0487 D7.2.20).
-///   * `msr daifclr/daifset, #2` only flips PSTATE.I; PSTATE.A/F/D stay
-///     as the EL2 entry path set them.
-///   * The IRQ vector at 0x280 is the same `trap_irq` we use for guest
-///     IRQ delivery (0x680); it has no shared mutable state with the
-///     sync-trap handler we're nested inside, so re-entry is safe.
-///   * `ELR_EL2` / `SPSR_EL2` get clobbered by the CPU on every
-///     exception entry, including the nested IRQ that wakes WFI. The
-///     outer sync-trap tail (`vectors.s::restore_context_and_eret`)
-///     ERETs with whatever those sysregs currently hold, so we MUST
-///     snapshot them on entry and restore them before returning, or
-///     ERET ends up reading the post-WFI EL2h state and jumping to
-///     PC=0 in EL2 instead of back to the guest.
+///   * The nested IRQ that wakes WFI is taken while EL2 is running, so
+///     it dispatches to `trap::irq_from_el2` — the slim ISR that only
+///     advances synthetic ticks / DMA completions and rearms CNTHP. It
+///     touches no `ctx`-derived guest state and is safe to run nested
+///     inside the sync-trap handler we're in.
+///   * `cpu::with_irqs_unmasked` snapshots and restores `ELR_EL2` /
+///     `SPSR_EL2` around the WFI window: the CPU clobbers them on the
+///     nested IRQ entry, and the outer sync-trap tail
+///     (`vectors.s::restore_context_and_eret`) ERETs on whatever they
+///     hold — without the restore, ERET would read the post-WFI EL2h
+///     state and jump to PC=0 in EL2 instead of back to the guest.
 fn pause_system(ctx: &mut TrapContext, powering_off: bool) {
     const MAX_WFI_ITERS: u32 = 8;
-
-    // Snapshot the guest's saved exception state so the nested IRQ
-    // can't lose it.
-    let saved_elr: u64;
-    let saved_spsr: u64;
-    // SAFETY: sysreg reads, side-effect free.
-    unsafe {
-        core::arch::asm!(
-            "mrs {0}, elr_el2",
-            "mrs {1}, spsr_el2",
-            out(reg) saved_elr,
-            out(reg) saved_spsr,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
 
     // Tell the pen-input pump we're in deep-sleep so the next pen-down
     // can synthesise a power-switch press (Einstein's
@@ -193,39 +177,25 @@ fn pause_system(ctx: &mut TrapContext, powering_off: bool) {
     }
 
     if !crate::peripherals::vic::irq_pending() && !crate::peripherals::vic::take_wake_request() {
-        for _ in 0..MAX_WFI_ITERS {
-            // SAFETY: see function-level SAFETY notes.
-            unsafe {
-                core::arch::asm!(
-                    "msr daifclr, #2",   // unmask IRQ (PSTATE.I = 0)
-                    "wfi",
-                    "msr daifset, #2",   // re-mask IRQ
-                    options(nostack, preserves_flags),
-                );
+        cpu::with_irqs_unmasked(|| {
+            for _ in 0..MAX_WFI_ITERS {
+                // SAFETY: WFI at EL2 is architectural; IRQs are
+                // unmasked for the duration of this closure so a wired
+                // physical IRQ (CNTHP heartbeat) wakes it.
+                unsafe {
+                    core::arch::asm!("wfi", options(nostack, preserves_flags));
+                }
+                if crate::peripherals::vic::irq_pending()
+                    || crate::peripherals::vic::take_wake_request()
+                {
+                    break;
+                }
             }
-            if crate::peripherals::vic::irq_pending()
-                || crate::peripherals::vic::take_wake_request()
-            {
-                break;
-            }
-        }
+        });
     }
 
     if powering_off {
         crate::peripherals::vic::set_powered_off(false);
-    }
-
-    // Restore guest exception state clobbered by the nested IRQ entry.
-    // SAFETY: writing ELR_EL2 / SPSR_EL2 from EL2 is allowed; the
-    // subsequent sync-trap-tail ERET will consume these values.
-    unsafe {
-        core::arch::asm!(
-            "msr elr_el2, {0}",
-            "msr spsr_el2, {1}",
-            in(reg) saved_elr,
-            in(reg) saved_spsr,
-            options(nostack, preserves_flags),
-        );
     }
 
     ctx.x[0] = 0;

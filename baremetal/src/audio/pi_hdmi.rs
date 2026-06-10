@@ -676,16 +676,6 @@ fn debug_counter() -> (u64, u64) {
     (now, freq)
 }
 
-
-pub fn poll_mai_dma_completion() {
-    if !INIT_DONE.load(Ordering::Acquire) || !MAI_CYCLIC_ARMED.load(Ordering::Acquire) {
-        return;
-    }
-    if crate::peripherals::host_dma::mai_tx_pending() {
-        crate::peripherals::host_dma::on_completion(crate::peripherals::host_dma::MAI_TX_CHANNEL);
-    }
-}
-
 pub fn init() {
     // We don't probe HDMI link state here — `display::splash` has
     // configured the framebuffer and the HDMI encoder by the time we

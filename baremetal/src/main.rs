@@ -116,6 +116,15 @@ pub extern "C" fn kmain() -> ! {
     // NEWTON.BIN copy from SD.
     audio::init();
 
+    // Unmask EL2 physical IRQs for the rest of boot. The vector table
+    // is installed (above), and the IRQ sources we drive — BCM2835 DMA
+    // completions for UART TX (ch 5) and the HDMI MAI ring (ch 4), and
+    // later CNTHP — now arrive as real interrupts into
+    // `trap::irq_from_el2` instead of cooperative polls. This is what
+    // lets the 5-second SD flash load (and other long EL2 operations)
+    // run without starving the HDMI audio ring.
+    cpu::unmask_irqs_el2();
+
     // Seed the Newton flash filesystem header before stage-2 exposes
     // the backing to the guest. Safe because the backing is a static
     // mut touched only from core 0 during boot.

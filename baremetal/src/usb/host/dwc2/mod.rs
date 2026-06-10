@@ -110,8 +110,6 @@ impl Dwc2 {
                 options(nomem, nostack, preserves_flags));
         }
         let deadline = start.wrapping_add((freq * timeout_ms as u64) / 1000);
-        let mut next_audio_poll = start;
-        let audio_poll_interval = (freq / 1000).max(1);
         loop {
             let v = self.read(offset);
             let set = (v & mask) == mask;
@@ -126,10 +124,6 @@ impl Dwc2 {
             }
             if now.wrapping_sub(deadline) as i64 >= 0 {
                 return false;
-            }
-            if now.wrapping_sub(next_audio_poll) as i64 >= 0 {
-                crate::audio::poll_mai_dma_completion();
-                next_audio_poll = now.wrapping_add(audio_poll_interval);
             }
         }
     }
@@ -657,10 +651,6 @@ impl Dwc2 {
                 options(nomem, nostack, preserves_flags));
         }
         let deadline = start.wrapping_add(freq * 50 / 1000);
-        // Keep HDMI MAI's cyclic DMA completion path alive while this
-        // polled USB transaction owns the CPU.
-        let mut next_audio_poll = start;
-        let audio_poll_interval = (freq / 1000).max(1);
         // Error-bit classification:
         //
         //   Hard bus errors: AHB_ERR, XACT_ERR (after the core's
@@ -712,10 +702,6 @@ impl Dwc2 {
             }
             if now.wrapping_sub(deadline) as i64 >= 0 {
                 break Err(UsbError::Timeout);
-            }
-            if now.wrapping_sub(next_audio_poll) as i64 >= 0 {
-                crate::audio::poll_mai_dma_completion();
-                next_audio_poll = now.wrapping_add(audio_poll_interval);
             }
         };
 

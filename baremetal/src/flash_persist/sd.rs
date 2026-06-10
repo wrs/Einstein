@@ -80,9 +80,9 @@ const NUM_BITMAP_WORDS: usize = NUM_BLOCKS / 32; // 4
 /// `PROGRESS_DOT` bytes transferred, writing in `PROGRESS_CHUNK`
 /// pieces. With an 8 MiB store and 256 KiB dots, that's 32 dots
 /// per full save — coarse enough to fit on a serial line, fine
-/// enough to confirm the boot isn't actually hung. The HDMI-audio build
-/// uses smaller chunks so early `kmain` can poll MAI DMA completions between
-/// SD reads while EL2 IRQs are still masked.
+/// enough to confirm the boot isn't actually hung. The HDMI-audio
+/// build uses smaller chunks so progress dots / splash bar update
+/// incrementally as the multi-MiB transfer streams.
 const PROGRESS_CHUNK: usize = if cfg!(nh_audio_pi_hdmi) {
     16 * 1024
 } else {
@@ -197,7 +197,6 @@ impl FlashStore for SdBackend {
                 Ok(0) => break,
                 Ok(n) => {
                     off += n;
-                    crate::audio::poll_mai_dma_completion();
                     while off >= next_dot && next_dot <= buf.len() {
                         kprint!(".");
                         next_dot += PROGRESS_DOT;
@@ -339,7 +338,6 @@ impl FlashStore for SdBackend {
                     return;
                 }
                 off = end;
-                crate::audio::poll_mai_dma_completion();
                 while off >= next_dot && next_dot <= bytes.len() {
                     kprint!(".");
                     next_dot += PROGRESS_DOT;

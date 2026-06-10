@@ -333,7 +333,9 @@ fn maybe_flash_autosave() {
         }
     }
     LAST_SAVE_TICKS.store(now, Ordering::Relaxed);
-    crate::flash_persist::maybe_save();
+    // The SD write blocks EL2 for hundreds of ms; unmask IRQs so the
+    // audio MAI ring stays fed and CNTHP keeps rearming while it runs.
+    crate::cpu::with_irqs_unmasked(|| crate::flash_persist::maybe_save());
 }
 
 #[cfg(not(feature = "no-semihost"))]
@@ -415,7 +417,12 @@ fn maybe_autosave_via_semihost(ctx: &TrapContext) {
     // re-mark dirty internally and retry on the next tick; we still
     // try the snapshot save (any divergence is caught by the
     // fingerprint check on resume).
-    crate::flash_persist::maybe_save();
+    //
+    // The flash store's SD write (real-hardware backend) blocks EL2
+    // for hundreds of ms; unmask IRQs so audio/CNTHP stay serviced
+    // while it runs. The semihost backend's write is fast and
+    // unaffected.
+    crate::cpu::with_irqs_unmasked(|| crate::flash_persist::maybe_save());
 
     let mut gprs = [0u64; 31];
     for i in 0..31 {

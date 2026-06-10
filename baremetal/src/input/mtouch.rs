@@ -219,7 +219,14 @@ pub fn pump() {
     let (addr, ep_addr, mps) =
         with_state(|s| (s.addr, s.in_ep_addr, s.in_ep_mps));
     let mut buf = [0u8; REPORT_BUF_LEN];
-    let n = match dwc2::with(|host| host.interrupt_in(addr, ep_addr, mps, &mut buf)) {
+    // The polled interrupt-IN can burn its full transfer timeout on a
+    // slow / dead panel. `pump` runs from the guest IRQ tail
+    // (`trap::irq_from_guest` via `input::pump`); unmask IRQs around
+    // the transfer so a stalled USB device can't starve the audio ring
+    // or delay CNTHP rearm.
+    let n = match crate::cpu::with_irqs_unmasked(|| {
+        dwc2::with(|host| host.interrupt_in(addr, ep_addr, mps, &mut buf))
+    }) {
         Ok(n) => {
             with_state(|s| s.consec_errors = 0);
             n

@@ -134,6 +134,54 @@ static FLASH_CLUSTER_LBAS: ClusterLbaMap =
 static FLASH_NUM_CLUSTERS: AtomicUsize = AtomicUsize::new(0);
 static FLASH_BLOCKS_PER_CLUSTER: AtomicU32 = AtomicU32::new(0);
 
+// ---- Background DMA save state machine (milestone 4b) ---------------
+//
+// The autosave tick (`maybe_save`) starts a save by snapshotting the
+// dirty bitmap, computing the set of dirty clusters, and kicking off
+// the first cluster's DMA write — then returns to the guest. Each
+// SD-TX channel completion IRQ (`on_dma_completion`) finishes the
+// cluster just written (CMD12 + busy, under an IRQ-unmasked window so
+// audio stays fed) and starts the next, until the set drains.
+//
+// All of this runs in IRQ context on a single core and is never
+// re-entered: a save is only started while `SAVE_ACTIVE == false`, and
+// the only place that re-enters the SD controller — the completion
+// handler's unmasked `finish` — takes nested IRQs through the slim
+// `irq_from_el2` path, which does not start saves. So plain atomics +
+// an `UnsafeCell` bitmap are sufficient; no locking.
+
+/// True while a cluster's DMA write is in flight (state `Writing`),
+/// from `start_sectors_dma` until its completion IRQ finishes it.
+static SAVE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// The cluster index currently being DMA-written (valid iff
+/// `SAVE_ACTIVE`). Read by the completion handler to finish it.
+static SAVE_CLUSTER: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of completion IRQs needed to drain the in-flight save — i.e.
+/// remaining + in-flight clusters. Diagnostic only.
+static SAVE_REMAINING: AtomicUsize = AtomicUsize::new(0);
+
+const CL_BITMAP_WORDS: usize = MAX_FLASH_CLUSTERS / 32; // 64
+
+/// Bitmap of clusters still to write in the in-flight save (the
+/// currently-`Writing` cluster's bit is already cleared). Built by
+/// `start_dma_save`, consumed by `advance_save`.
+struct ClusterBitmap(UnsafeCell<[u32; CL_BITMAP_WORDS]>);
+// SAFETY: touched only by the save machine, which runs single-core in
+// IRQ context and is never re-entered (see the module note above).
+unsafe impl Sync for ClusterBitmap {}
+static SAVE_PENDING_CL: ClusterBitmap = ClusterBitmap(UnsafeCell::new([0; CL_BITMAP_WORDS]));
+
+/// The dirty-block snapshot backing the in-flight save, kept so a
+/// mid-save failure can re-mark exactly those blocks dirty for retry.
+static SAVE_SNAPSHOT: [AtomicU32; NUM_BITMAP_WORDS] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+
 #[allow(static_mut_refs)]
 fn vm() -> Option<&'static Vm> {
     if !INIT_DONE.load(Ordering::Relaxed) {
@@ -344,6 +392,16 @@ impl FlashStore for SdBackend {
             return;
         }
 
+        // Background DMA save path (milestone 4b). Eligible once the
+        // file exists at full size (`valid`) and its per-cluster LBA map
+        // resolved (`FLASH_NUM_CLUSTERS != 0`). Starts the write and
+        // returns immediately; the SD-TX completion IRQ drains it while
+        // the guest keeps running. Falls through to the synchronous FAT
+        // path below when not eligible (first save / unresolved map).
+        if valid && try_start_dma_save(&snapshot) {
+            return;
+        }
+
         let volume = match mgr.open_volume(VolumeIdx(0)) {
             Ok(v) => v,
             Err(e) => {
@@ -521,6 +579,213 @@ fn remark_dirty(snapshot: &[u32; NUM_BITMAP_WORDS]) {
     for (i, w) in snapshot.iter().enumerate() {
         DIRTY[i].fetch_or(*w, Ordering::Relaxed);
     }
+}
+
+// ---- Background DMA save state machine ------------------------------
+
+#[inline]
+fn cl_test(bm: &[u32; CL_BITMAP_WORDS], i: usize) -> bool {
+    bm[i / 32] & (1 << (i % 32)) != 0
+}
+
+#[inline]
+fn cl_set(bm: &mut [u32; CL_BITMAP_WORDS], i: usize) {
+    bm[i / 32] |= 1 << (i % 32);
+}
+
+#[inline]
+fn cl_clear(bm: &mut [u32; CL_BITMAP_WORDS], i: usize) {
+    bm[i / 32] &= !(1 << (i % 32));
+}
+
+/// First set cluster bit at index >= `from`, or `None` if the bitmap is
+/// drained from there on.
+fn cl_next(bm: &[u32; CL_BITMAP_WORDS], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i < MAX_FLASH_CLUSTERS {
+        // Skip whole zero words for speed (2048 bits = 64 words).
+        if i % 32 == 0 && bm[i / 32] == 0 {
+            i += 32;
+            continue;
+        }
+        if cl_test(bm, i) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Try to start a background DMA save of the dirty clusters covered by
+/// `snapshot`. Returns true if the DMA path handled this tick — a save
+/// was started, one is already in flight, or there was nothing to do —
+/// and false if the caller should fall back to the synchronous FAT save
+/// (per-cluster map unresolved).
+///
+/// Caller guarantees `FILE_VALID` (the file exists at full size); the
+/// raw cluster writes don't touch FAT metadata, so the dir entry and
+/// allocation chain stay stable.
+fn try_start_dma_save(snapshot: &[u32; NUM_BITMAP_WORDS]) -> bool {
+    let n = FLASH_NUM_CLUSTERS.load(Ordering::Acquire);
+    let bpc = FLASH_BLOCKS_PER_CLUSTER.load(Ordering::Relaxed) as usize;
+    if n == 0 || bpc == 0 {
+        return false; // map unresolved → caller uses the FAT path
+    }
+    if SAVE_ACTIVE.load(Ordering::Relaxed) {
+        // A save from a previous tick is still draining. Re-mark this
+        // tick's dirty blocks so the next pass picks them up, and let
+        // the in-flight save run.
+        remark_dirty(snapshot);
+        return true;
+    }
+
+    // Build the dirty-cluster set from the dirty 64 KiB blocks. A block
+    // maps to the clusters its byte range overlaps; a 64 KiB block can
+    // span several smaller clusters or sit inside a larger one.
+    let cluster_bytes = bpc * 512;
+    // SAFETY: single-core IRQ context, save machine not re-entered.
+    let pend = unsafe { &mut *SAVE_PENDING_CL.0.get() };
+    pend.iter_mut().for_each(|w| *w = 0);
+    let mut count = 0usize;
+    for blk in 0..NUM_BLOCKS {
+        if snapshot[blk / 32] & (1 << (blk % 32)) == 0 {
+            continue;
+        }
+        let bstart = blk * BLOCK_SIZE;
+        let c0 = bstart / cluster_bytes;
+        let c1 = (bstart + BLOCK_SIZE - 1) / cluster_bytes;
+        for ci in c0..=c1 {
+            if ci < n && !cl_test(pend, ci) {
+                cl_set(pend, ci);
+                count += 1;
+            }
+        }
+    }
+    if count == 0 {
+        return true; // nothing to write
+    }
+
+    // Stash the snapshot so a mid-save failure re-marks exactly these
+    // blocks dirty for the next pass.
+    for (i, w) in snapshot.iter().enumerate() {
+        SAVE_SNAPSHOT[i].store(*w, Ordering::Relaxed);
+    }
+    SAVE_REMAINING.store(count, Ordering::Relaxed);
+    kprintln!(
+        "flash_persist_sd: DMA save start ({} cluster(s), {} KiB each)",
+        count,
+        cluster_bytes / 1024
+    );
+    advance_save(0);
+    true
+}
+
+/// Start the next pending cluster's DMA write, scanning from cluster
+/// index `from`, or close out the save when the set is drained. Sets
+/// `SAVE_ACTIVE` on a successful start; aborts (re-mark + FAT fallback)
+/// on a start failure.
+fn advance_save(from: usize) {
+    let Some(mgr) = vm() else {
+        abort_save();
+        return;
+    };
+    // SAFETY: single-core IRQ context, save machine not re-entered.
+    let pend = unsafe { &mut *SAVE_PENDING_CL.0.get() };
+    let Some(ci) = cl_next(pend, from) else {
+        finish_save();
+        return;
+    };
+    cl_clear(pend, ci);
+
+    let bpc = FLASH_BLOCKS_PER_CLUSTER.load(Ordering::Relaxed) as usize;
+    let cluster_bytes = bpc * 512;
+    let off = ci * cluster_bytes;
+    let len = cluster_bytes.min(peripherals::flash::SIZE - off);
+    // SAFETY: GUEST_FLASH backing is a static byte array. The DMA reads
+    // this range while the guest may keep writing it — acceptable: any
+    // block dirtied during the save stays set in DIRTY (we swapped the
+    // snapshot out) and is re-captured by the next pass.
+    let src = unsafe {
+        core::slice::from_raw_parts(
+            peripherals::flash::host_pa().wrapping_add(off as u64) as *const u8,
+            len,
+        )
+    };
+    // SAFETY: FLASH_CLUSTER_LBAS written once in try_load before any save.
+    let lba = unsafe { (*FLASH_CLUSTER_LBAS.0.get())[ci] };
+
+    match mgr.device(|d| d.start_sectors_dma(lba, src)) {
+        Ok(()) => {
+            SAVE_CLUSTER.store(ci, Ordering::Relaxed);
+            SAVE_ACTIVE.store(true, Ordering::Relaxed);
+        }
+        Err(e) => {
+            kprintln!(
+                "flash_persist_sd: DMA save start cluster {} (lba {}) FAILED: {:?} — \
+                 disabling DMA save, FAT fallback",
+                ci, lba, e
+            );
+            abort_save();
+        }
+    }
+}
+
+/// SD-TX completion IRQ handler: finish the cluster just DMA-written
+/// (settle FSM + CMD12 busy-wait) and advance to the next. Runs in IRQ
+/// context; the CMD12 busy-wait is wrapped in an IRQ-unmasked window so
+/// it doesn't starve the audio MAI feed / CNTHP rearm.
+pub fn on_dma_completion() {
+    if !SAVE_ACTIVE.load(Ordering::Relaxed) {
+        // Stray completion (e.g. the polled bring-up path armed the
+        // channel with INTEN, or a late IRQ after a finished save).
+        return;
+    }
+    let ci = SAVE_CLUSTER.load(Ordering::Relaxed);
+    let Some(mgr) = vm() else {
+        abort_save();
+        return;
+    };
+    let r = crate::cpu::with_irqs_unmasked(|| mgr.device(|d| d.finish_sectors_dma()));
+    if let Err(e) = r {
+        kprintln!(
+            "flash_persist_sd: DMA save cluster {} finish FAILED: {:?} — \
+             disabling DMA save, FAT fallback",
+            ci, e
+        );
+        abort_save();
+        return;
+    }
+    let left = SAVE_REMAINING.load(Ordering::Relaxed).saturating_sub(1);
+    SAVE_REMAINING.store(left, Ordering::Relaxed);
+    // SAVE_ACTIVE stays true through advance_save (which either starts
+    // the next cluster or clears it in finish_save) so a concurrent
+    // autosave tick won't start a second save.
+    advance_save(ci + 1);
+}
+
+/// All clusters drained — the background save is complete.
+fn finish_save() {
+    SAVE_REMAINING.store(0, Ordering::Relaxed);
+    SAVE_ACTIVE.store(false, Ordering::Relaxed);
+    kprintln!("flash_persist_sd: DMA save complete");
+}
+
+/// Abort the in-flight save on a hardware error: tear down the channel,
+/// re-mark the snapshot's blocks dirty for retry, and disable the DMA
+/// save path so the next tick falls back to the proven FAT writes
+/// rather than retrying a latched-error channel forever.
+fn abort_save() {
+    peripherals::host_dma::sd_tx_abort();
+    let snap = [
+        SAVE_SNAPSHOT[0].load(Ordering::Relaxed),
+        SAVE_SNAPSHOT[1].load(Ordering::Relaxed),
+        SAVE_SNAPSHOT[2].load(Ordering::Relaxed),
+        SAVE_SNAPSHOT[3].load(Ordering::Relaxed),
+    ];
+    remark_dirty(&snap);
+    FLASH_NUM_CLUSTERS.store(0, Ordering::Release);
+    SAVE_REMAINING.store(0, Ordering::Relaxed);
+    SAVE_ACTIVE.store(false, Ordering::Relaxed);
 }
 
 /// One-time SDHOST bring-up + VolumeManager construction. Called

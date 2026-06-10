@@ -407,16 +407,25 @@ pub fn on_completion(ch: u32) {
     // plus the per-channel CS_FLAGS so priority bits aren't clobbered
     // on every IRQ. (Without re-asserting CS_FLAGS, our MAI priority
     // promotion would only last one period.)
-    let cs_flags = match ch {
-        UART_TX_CHANNEL => UART_TX_CS_FLAGS,
-        MAI_TX_CHANNEL => MAI_TX_CS_FLAGS,
-        _ => 0,
-    };
-    write_cs(ch, CS_INT | CS_ACTIVE | cs_flags);
     match ch {
-        UART_TX_CHANNEL => crate::uart::on_tx_done(),
-        MAI_TX_CHANNEL => crate::audio::on_mai_dma_done(),
-        _ => {}
+        UART_TX_CHANNEL => {
+            write_cs(ch, CS_INT | CS_ACTIVE | UART_TX_CS_FLAGS);
+            crate::uart::on_tx_done();
+        }
+        MAI_TX_CHANNEL => {
+            write_cs(ch, CS_INT | CS_ACTIVE | MAI_TX_CS_FLAGS);
+            crate::audio::on_mai_dma_done();
+        }
+        SD_TX_CHANNEL => {
+            // One-shot block write, not a cyclic chain — ack the latched
+            // INT/END without re-asserting ACTIVE (no next CB to run).
+            // The next save's `arm_sd_tx` issues CS_RESET first anyway.
+            write_cs(ch, CS_INT | CS_END);
+            crate::flash_persist::on_sd_dma_done();
+        }
+        _ => {
+            write_cs(ch, CS_INT | CS_END);
+        }
     }
 }
 

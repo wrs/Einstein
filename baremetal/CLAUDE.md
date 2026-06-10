@@ -382,3 +382,12 @@ re-deriving state from disassembly or tool output:
   (VID 0x0416 / PID 0xC168) characterization: USB topology, HID
   report descriptor decode, activation handshake, Report ID 1
   wire format. Reference for Phase 5 input work.
+- [`docs/SD_DMA_AUTOSAVE.md`](docs/SD_DMA_AUTOSAVE.md) — making the
+  flash autosave non-blocking (DMA + completion IRQ) so it stops
+  freezing the guest and causing audio dropouts. Plan + status:
+  milestones 1–3 done/validated (DREQ 13, single-block DMA write,
+  per-cluster LBA map via vendored embedded-sdmmc); milestone 4
+  (multi-block `CMD25`/`CMD12` write + IRQ-driven per-cluster save
+  state machine) is implemented but not yet hardware-validated — the
+  remaining work is on-Pi validation and the optional `WaitBusy`
+  refinement noted in the doc.

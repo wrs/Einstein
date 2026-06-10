@@ -202,7 +202,8 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
             use crate::peripherals::host_dma;
             let other_bcm = pend1
                 & ((1 << (16 + host_dma::UART_TX_CHANNEL))
-                    | (1 << (16 + host_dma::MAI_TX_CHANNEL)));
+                    | (1 << (16 + host_dma::MAI_TX_CHANNEL))
+                    | (1 << (16 + host_dma::SD_TX_CHANNEL)));
             if other_bcm == 0 && !platform::cnthp_irq_pending() {
                 // USB was the only pending source — skip the heavy body.
                 // If a sample was enqueued and we're returning to the
@@ -243,6 +244,12 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
 ///    - the audio MAI ring + stereo ring tail + `vic::raise`, via
 ///      `audio::on_mai_dma_done` (reached through
 ///      `host_dma::on_completion` of the MAI TX channel).
+///    - the SDHOST controller registers + the flash-persist background
+///      DMA save state machine, via `flash_persist::on_sd_dma_done`
+///      (reached through `host_dma::on_completion` of the SD TX
+///      channel). Its completion handler briefly unmasks IRQs for the
+///      CMD12 busy-wait; the nested IRQs re-enter this slim path, which
+///      does not start saves, so the SD controller is never re-entered.
 ///    - kprintln's own uart ring (it masks IRQs around its critical
 ///      section, so it is re-entrant-safe from here).
 /// 3. Therefore code running inside `cpu::with_irqs_unmasked` must not
@@ -267,7 +274,11 @@ fn irq_from_el2() {
     {
         use crate::peripherals::host_dma;
         let pend1 = platform::bcm2835_irq_pending_1();
-        for &ch in &[host_dma::UART_TX_CHANNEL, host_dma::MAI_TX_CHANNEL] {
+        for &ch in &[
+            host_dma::UART_TX_CHANNEL,
+            host_dma::MAI_TX_CHANNEL,
+            host_dma::SD_TX_CHANNEL,
+        ] {
             if pend1 & (1u32 << (16 + ch)) != 0 {
                 host_dma::on_completion(ch);
             }
@@ -321,7 +332,11 @@ fn irq_from_guest(ctx: &mut TrapContext) {
     {
         use crate::peripherals::host_dma;
         let pend1 = platform::bcm2835_irq_pending_1();
-        for &ch in &[host_dma::UART_TX_CHANNEL, host_dma::MAI_TX_CHANNEL] {
+        for &ch in &[
+            host_dma::UART_TX_CHANNEL,
+            host_dma::MAI_TX_CHANNEL,
+            host_dma::SD_TX_CHANNEL,
+        ] {
             if pend1 & (1u32 << (16 + ch)) != 0 {
                 host_dma::on_completion(ch);
             }

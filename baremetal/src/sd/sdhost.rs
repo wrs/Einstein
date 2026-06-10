@@ -378,6 +378,19 @@ impl SdHost {
         r
     }
 
+    /// Translate a sector index to the SDCMD argument for this card:
+    /// block index on SDHC (block-addressed) or byte offset on SDSC.
+    /// Only the DMA write paths use this; gated with them on the
+    /// real-hardware config where `host_dma` exists.
+    #[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+    #[inline]
+    fn cmd_arg(&self, lba: u32) -> u32 {
+        match self.capacity {
+            CardCapacity::HighCapacity => lba,
+            CardCapacity::StandardCapacity => lba.wrapping_mul(512),
+        }
+    }
+
     /// Like [`write_block`], but the 512-byte data phase is fed by DMA
     /// (a DREQ-paced channel into the `SDDATA` FIFO) instead of PIO.
     ///
@@ -387,50 +400,19 @@ impl SdHost {
     /// completion IRQ. Its job here is to prove the DMA→SDHOST path in
     /// isolation (milestone 2): the DREQ number, the FIFO addressing,
     /// and the command/data sequencing.
+    #[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
     pub fn write_block_dma(&self, lba: u32, buf: &[u8; 512]) -> Result<(), CmdError> {
         use crate::peripherals::host_dma as dma;
         if !dma::init_sd_tx() {
             // Channel not firmware-enabled; caller may fall back to PIO.
             return Err(CmdError::DmaError);
         }
-        let arg = match self.capacity {
-            CardCapacity::HighCapacity => lba,
-            CardCapacity::StandardCapacity => lba.wrapping_mul(512),
-        };
-
-        // Build the control block: source = buf (RAM, incrementing) →
-        // dest = SDDATA FIFO (peripheral, DREQ-paced, no increment),
-        // 512 bytes in 32-bit beats.
-        let buf_pa = buf.as_ptr() as u64;
-        let sddata_pa = (SDHOST_BASE + SDDATA) as u32;
-        let ti = (dma::DREQ_SDHOST << dma::TI_PERMAP_SHIFT)
-            | dma::TI_SRC_INC
-            | dma::TI_DEST_DREQ
-            | dma::TI_WAIT_RESP;
-        // SAFETY: single-core EL2; the SD-TX channel and this CB are
-        // owned here, and we poll the transfer to completion before
-        // returning, so the CB stays stable for its whole lifetime.
-        let cb = SD_TX_CB.0.get();
-        unsafe {
-            (*cb).ti = ti;
-            (*cb).source_ad = dma::bus_addr_ram(buf_pa);
-            (*cb).dest_ad = dma::bus_addr_periph(sddata_pa);
-            (*cb).txfr_len = 512;
-            (*cb).stride = 0;
-            (*cb).nextconbk = 0;
-        }
-        // Push the source buffer to RAM: the DMA master reads it via
-        // the uncached bus alias, so cacheable writes must be flushed.
-        crate::cpu::dc_civac_range(buf_pa, 512);
-
+        let arg = self.cmd_arg(lba);
         prepare_data(self.hcfg_base, 512, 1);
         // Arm first; the channel idles on DREQ until the command opens
         // the data phase and SDHOST starts asserting FIFO-space DREQs.
-        // SAFETY: `SD_TX_CB` is 'static and stable until we poll done.
-        unsafe {
-            dma::arm_sd_tx(&*cb);
-        }
-
+        // Polled form → no completion IRQ (inten=false).
+        arm_sd_dma(buf.as_ptr() as u64, 512, false);
         if let Err(e) =
             send_cmd_kind(CMD_WRITE_SINGLE_BLOCK, arg, ResponseKind::Short, CmdDir::Write)
         {
@@ -438,27 +420,100 @@ impl SdHost {
             write_reg(SDHCFG, self.hcfg_base);
             return Err(e);
         }
+        let r = poll_sd_dma_done().and_then(|()| finish_data_phase(false));
+        write_reg(SDHCFG, self.hcfg_base);
+        r
+    }
 
-        // Poll for DMA completion, watching for SDHOST errors meanwhile.
-        let mut spins = 0u32;
-        let r = loop {
-            if !dma::sd_tx_active() {
-                break if dma::sd_tx_error() {
-                    Err(CmdError::DmaError)
-                } else {
-                    finish_data_phase(false)
-                };
-            }
-            let h = read_reg(SDHSTS);
-            if h & SDHSTS_ERROR_MASK != 0 {
-                dma::sd_tx_abort();
-                break Err(map_hsts_error(h));
-            }
-            spins += 1;
-            if spins > 5_000_000 {
-                dma::sd_tx_abort();
-                break Err(CmdError::HardwareWedge);
-            }
+    /// Multi-block DMA write of `buf` (length a multiple of 512) to
+    /// the sectors starting at `lba`, polled to completion. The
+    /// isolated bring-up / validation form (milestone 4a); the
+    /// background save (milestone 4b) uses [`start_sectors_dma`] /
+    /// [`finish_sectors_dma`] to take the completion IRQ instead.
+    ///
+    /// Sequence mirrors Linux's `bcm2835-sdhost` multi-block write:
+    /// `prepare_data(blocks=n)` → `CMD25` (WRITE_MULTIPLE_BLOCK) → DMA
+    /// the whole buffer (DREQ-paced) → settle the write FSM → `CMD12`
+    /// (STOP_TRANSMISSION, R1b busy-wait, applied automatically by
+    /// `send_cmd_kind`).
+    #[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+    pub fn write_sectors_dma(&self, lba: u32, buf: &[u8]) -> Result<(), CmdError> {
+        use crate::peripherals::host_dma as dma;
+        if buf.is_empty() || buf.len() % 512 != 0 {
+            return Err(CmdError::DmaError);
+        }
+        if !dma::init_sd_tx() {
+            return Err(CmdError::DmaError);
+        }
+        let n_blocks = (buf.len() / 512) as u32;
+        let arg = self.cmd_arg(lba);
+        prepare_data(self.hcfg_base, 512, n_blocks);
+        arm_sd_dma(buf.as_ptr() as u64, buf.len() as u32, false);
+        if let Err(e) =
+            send_cmd_kind(CMD_WRITE_MULTIPLE_BLOCK, arg, ResponseKind::Short, CmdDir::Write)
+        {
+            dma::sd_tx_abort();
+            write_reg(SDHCFG, self.hcfg_base);
+            return Err(e);
+        }
+        let r = poll_sd_dma_done()
+            .and_then(|()| finish_data_phase(false))
+            .and_then(|()| send_cmd(CMD_STOP_TRANSMISSION, 0, ResponseKind::Short).map(|_| ()));
+        write_reg(SDHCFG, self.hcfg_base);
+        r
+    }
+
+    /// Begin a background multi-block DMA write: program the block
+    /// count, arm the SD-TX channel with completion-IRQ enabled, and
+    /// issue `CMD25`, then return immediately. The data phase runs in
+    /// the background; the caller must call [`finish_sectors_dma`] from
+    /// the SD-TX completion IRQ. `buf` must stay stable until then and
+    /// be a non-empty multiple of 512 bytes.
+    ///
+    /// On a setup / `CMD25` failure the channel is aborted and the idle
+    /// `SDHCFG` restored before returning Err.
+    #[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+    pub fn start_sectors_dma(&self, lba: u32, buf: &[u8]) -> Result<(), CmdError> {
+        use crate::peripherals::host_dma as dma;
+        if buf.is_empty() || buf.len() % 512 != 0 {
+            return Err(CmdError::DmaError);
+        }
+        if !dma::init_sd_tx() {
+            return Err(CmdError::DmaError);
+        }
+        let n_blocks = (buf.len() / 512) as u32;
+        let arg = self.cmd_arg(lba);
+        prepare_data(self.hcfg_base, 512, n_blocks);
+        // inten=true → the channel raises GPU IRQ source 16+SD_TX_CHANNEL
+        // on completion; `host_dma::on_completion` dispatches it.
+        arm_sd_dma(buf.as_ptr() as u64, buf.len() as u32, true);
+        if let Err(e) =
+            send_cmd_kind(CMD_WRITE_MULTIPLE_BLOCK, arg, ResponseKind::Short, CmdDir::Write)
+        {
+            dma::sd_tx_abort();
+            write_reg(SDHCFG, self.hcfg_base);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Complete a write begun by [`start_sectors_dma`], after the SD-TX
+    /// channel has signalled completion. Checks for a latched DMA error,
+    /// settles the write FSM, issues `CMD12` (STOP_TRANSMISSION, R1b
+    /// busy-wait), and restores the idle `SDHCFG`.
+    ///
+    /// The caller runs this from the completion IRQ inside an
+    /// IRQ-unmasked window so the `CMD12` busy-wait (card program time)
+    /// doesn't starve the audio MAI feed / CNTHP rearm while it waits.
+    #[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+    pub fn finish_sectors_dma(&self) -> Result<(), CmdError> {
+        use crate::peripherals::host_dma as dma;
+        let r = if dma::sd_tx_error() {
+            dma::sd_tx_abort();
+            Err(CmdError::DmaError)
+        } else {
+            finish_data_phase(false)
+                .and_then(|()| send_cmd(CMD_STOP_TRANSMISSION, 0, ResponseKind::Short).map(|_| ()))
         };
         write_reg(SDHCFG, self.hcfg_base);
         r
@@ -476,11 +531,81 @@ impl SdHost {
 /// Static control block for the SD-TX DMA channel. `UnsafeCell` (not
 /// `static mut`) so taking `&DmaCb` for `arm_sd_tx` doesn't trip the
 /// `static_mut_refs` lint; single-core EL2 makes the aliasing sound.
+#[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
 struct SdTxCbCell(core::cell::UnsafeCell<crate::peripherals::host_dma::DmaCb>);
-// SAFETY: single-core EL2; only `write_block_dma` touches it, serialised.
+// SAFETY: single-core EL2; only the SD DMA write paths touch it, serialised.
+#[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
 unsafe impl Sync for SdTxCbCell {}
+#[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
 static SD_TX_CB: SdTxCbCell =
     SdTxCbCell(core::cell::UnsafeCell::new(crate::peripherals::host_dma::DmaCb::zero()));
+
+/// Build the SD-TX control block for a RAM→`SDDATA` transfer of `len`
+/// bytes from `buf_pa` (RAM, incrementing) into the DREQ-paced FIFO
+/// (peripheral, no increment), flush the source range to RAM, and arm
+/// the channel. `inten` requests a completion IRQ — set for the
+/// background async save, clear for the polled bring-up paths that spin
+/// on `sd_tx_active`.
+#[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+fn arm_sd_dma(buf_pa: u64, len: u32, inten: bool) {
+    use crate::peripherals::host_dma as dma;
+    let sddata_pa = (SDHOST_BASE + SDDATA) as u32;
+    let mut ti = (dma::DREQ_SDHOST << dma::TI_PERMAP_SHIFT)
+        | dma::TI_SRC_INC
+        | dma::TI_DEST_DREQ
+        | dma::TI_WAIT_RESP;
+    if inten {
+        ti |= dma::TI_INTEN;
+    }
+    // SAFETY: single-core EL2; the SD-TX channel and this CB are owned
+    // by the serialised SD write paths. The CB stays stable until the
+    // transfer completes — the polled paths spin on `sd_tx_active`, the
+    // async path holds it until the completion IRQ runs `finish`.
+    let cb = SD_TX_CB.0.get();
+    unsafe {
+        (*cb).ti = ti;
+        (*cb).source_ad = dma::bus_addr_ram(buf_pa);
+        (*cb).dest_ad = dma::bus_addr_periph(sddata_pa);
+        (*cb).txfr_len = len;
+        (*cb).stride = 0;
+        (*cb).nextconbk = 0;
+    }
+    // The DMA master reads the source via the uncached bus alias, so
+    // cacheable writes must be flushed to RAM first.
+    crate::cpu::dc_civac_range(buf_pa, len as usize);
+    // SAFETY: `SD_TX_CB` is 'static and stable for the transfer.
+    unsafe {
+        dma::arm_sd_tx(&*cb);
+    }
+}
+
+/// Spin until the SD-TX DMA channel finishes, watching SDHOST status
+/// for errors meanwhile. Returns Ok when the channel goes idle cleanly,
+/// Err on a latched CS.ERROR, an SDHOST error flag, or a SW timeout.
+#[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+fn poll_sd_dma_done() -> Result<(), CmdError> {
+    use crate::peripherals::host_dma as dma;
+    let mut spins = 0u32;
+    loop {
+        if !dma::sd_tx_active() {
+            return if dma::sd_tx_error() {
+                Err(CmdError::DmaError)
+            } else {
+                Ok(())
+            };
+        }
+        let h = read_reg(SDHSTS);
+        if h & SDHSTS_ERROR_MASK != 0 {
+            dma::sd_tx_abort();
+            return Err(map_hsts_error(h));
+        }
+        spins += 1;
+        if spins > 5_000_000 {
+            dma::sd_tx_abort();
+            return Err(CmdError::HardwareWedge);
+        }
+    }
+}
 
 // ---- Register helpers ------------------------------------------------
 

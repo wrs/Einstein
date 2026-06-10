@@ -25,7 +25,8 @@
 //! caller's POV.
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use embedded_sdmmc::{Mode, VolumeIdx, VolumeManager};
 
@@ -113,6 +114,25 @@ type Vm = VolumeManager<SdHost, NullTime, 4, 4, 1>;
 /// no locking. `static mut` access is gated behind `INIT_DONE` and
 /// the `unsafe` block in `vm()`.
 static mut VOL_MGR: Option<Vm> = None;
+
+/// Max clusters in NEWTON.BIN's per-cluster LBA map. Sized for the
+/// smallest FAT32 cluster we'd accept (4 KiB); a card with smaller
+/// clusters resolves to `None` and falls back to the FAT save. A
+/// 128 GB card uses 32–64 KiB clusters → 128–256 entries, well under.
+const MAX_FLASH_CLUSTERS: usize = peripherals::flash::SIZE / 4096;
+
+/// NEWTON.BIN's per-cluster start-LBA map, set by `try_load` once the
+/// file is resolved and its first cluster verified. The background DMA
+/// save (milestone 4) writes each dirty cluster raw to its LBA here —
+/// fragmentation-immune, since a cluster is intrinsically contiguous.
+/// Guarded by `FLASH_NUM_CLUSTERS` (0 = unresolved → FAT save path).
+struct ClusterLbaMap(UnsafeCell<[u32; MAX_FLASH_CLUSTERS]>);
+// SAFETY: written once in `try_load` on core 0 during boot, read after.
+unsafe impl Sync for ClusterLbaMap {}
+static FLASH_CLUSTER_LBAS: ClusterLbaMap =
+    ClusterLbaMap(UnsafeCell::new([0; MAX_FLASH_CLUSTERS]));
+static FLASH_NUM_CLUSTERS: AtomicUsize = AtomicUsize::new(0);
+static FLASH_BLOCKS_PER_CLUSTER: AtomicU32 = AtomicU32::new(0);
 
 #[allow(static_mut_refs)]
 fn vm() -> Option<&'static Vm> {
@@ -234,6 +254,54 @@ impl FlashStore for SdBackend {
             ms,
             (peripherals::flash::SIZE as u64 * 1000 / 1024) / ms.max(1),
         );
+
+        // Resolve NEWTON.BIN's per-cluster LBA map for the background
+        // DMA save (milestones 3/4). The image is now loaded, so
+        // GUEST_FLASH[0..512] equals the file's first sector — read
+        // cluster 0's LBA raw and compare to confirm the cluster→LBA
+        // mapping before we ever trust it for writes. On any doubt
+        // (too many clusters / mismatch / error) we leave
+        // FLASH_NUM_CLUSTERS at 0 and the save stays on the proven FAT
+        // writes. Per-cluster, so file fragmentation is fine.
+        let raw = file.to_raw_file();
+        // SAFETY: single-threaded boot; FLASH_CLUSTER_LBAS is written
+        // only here, before any reader (the save path) runs.
+        let lbas = unsafe { &mut *FLASH_CLUSTER_LBAS.0.get() };
+        match mgr.file_cluster_lbas(raw, lbas) {
+            Ok(Some((n, bpc))) => {
+                let lba0 = lbas[0];
+                let mut sec = [0u8; 512];
+                let rd = mgr.device(|d| d.read_block(lba0, &mut sec));
+                // SAFETY: GUEST_FLASH backing; single-threaded boot.
+                let head = unsafe {
+                    core::slice::from_raw_parts(peripherals::flash::host_pa() as *const u8, 512)
+                };
+                match rd {
+                    Ok(()) if &sec[..] == head => {
+                        FLASH_BLOCKS_PER_CLUSTER.store(bpc, Ordering::Relaxed);
+                        FLASH_NUM_CLUSTERS.store(n, Ordering::Release);
+                        kprintln!(
+                            "flash_persist_sd: extent {} clusters, {} blocks/cluster, lba[0]={} — verified (DMA save eligible)",
+                            n, bpc, lba0
+                        );
+                    }
+                    Ok(()) => kprintln!(
+                        "flash_persist_sd: extent lba[0]={} MISMATCH vs loaded image — DMA save disabled",
+                        lba0
+                    ),
+                    Err(e) => kprintln!(
+                        "flash_persist_sd: extent lba[0]={} raw read FAILED: {:?} — DMA save disabled",
+                        lba0, e
+                    ),
+                }
+            }
+            Ok(None) => kprintln!(
+                "flash_persist_sd: {} too many clusters or empty — DMA save disabled (FAT save path)",
+                FLASH_FILE
+            ),
+            Err(e) => kprintln!("flash_persist_sd: extent resolve FAILED: {:?}", e),
+        }
+        let _ = mgr.close_file(raw);
     }
 
     fn mark_dirty(&self, off: usize, len: usize) {

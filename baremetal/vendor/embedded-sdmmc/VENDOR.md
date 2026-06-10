@@ -20,11 +20,15 @@ parallel FAT32 implementation in the hypervisor.
 - `Cargo.toml`: trimmed to the library target (dropped the upstream
   `[[example]]`/`[[test]]` stanzas and dev-dependencies; we don't build
   them as a path dependency).
-- `src/volume_mgr.rs`: added `VolumeManager::file_contiguous_extent`
-  (and its return type) — resolves an open file's data to a single
-  contiguous `(start_block, block_count)` LBA run, or `None` if the
-  cluster chain is fragmented. Reuses the existing internal
-  `cluster_to_block` / `next_cluster`. No upstream behaviour changed.
+- `src/volume_mgr.rs`: added `VolumeManager::file_cluster_lbas` — fills
+  a caller buffer with the starting LBA of each of an open file's data
+  clusters (file order), returning `(num_clusters, blocks_per_cluster)`.
+  Lets a caller DMA-write each cluster independently regardless of
+  fragmentation. Reuses the existing internal `cluster_to_block` /
+  `next_cluster`. No upstream behaviour changed.
+- `src/volume_mgr.rs`: `device()` made generic over the closure return
+  type `R` (was hardcoded `-> T`, the TimeSource type — an upstream
+  wart that made the accessor unusable for returning a read result).
 
 To re-vendor a newer upstream: re-copy `src/`, reapply the
 `file_contiguous_extent` addition, and diff this file's change list.

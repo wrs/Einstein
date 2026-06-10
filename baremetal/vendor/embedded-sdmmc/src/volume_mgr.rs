@@ -94,9 +94,14 @@ where
     }
 
     /// Temporarily get access to the underlying block device.
-    pub fn device<F>(&self, f: F) -> T
+    ///
+    /// LOCAL CHANGE (vendored — see VENDOR.md): generic over the
+    /// closure's return type `R`. Upstream 0.9.0 declared `-> T` (the
+    /// TimeSource type), which makes it impossible to return e.g. a
+    /// device read result. `R` is the obviously-intended type.
+    pub fn device<F, R>(&self, f: F) -> R
     where
-        F: FnOnce(&mut D) -> T,
+        F: FnOnce(&mut D) -> R,
     {
         let mut data = self.data.borrow_mut();
         let result = f(data.block_cache.block_device());
@@ -775,6 +780,65 @@ where
                 .unwrap();
         }
         Ok(read)
+    }
+
+    /// LOCAL ADDITION (vendored — see VENDOR.md). Fill `out` with the
+    /// starting device block (LBA) of each of an open file's data
+    /// clusters, in file order.
+    ///
+    /// Returns `Some((num_clusters, blocks_per_cluster))` on success
+    /// (`out[..num_clusters]` is then valid), or `None` if the file is
+    /// empty / has no allocated cluster / needs more clusters than
+    /// `out` can hold. A cluster is intrinsically contiguous
+    /// (`blocks_per_cluster` consecutive blocks), so a caller can write
+    /// each cluster as a single DMA transfer to `out[i]` regardless of
+    /// how the file is fragmented on disk — addressing the file's
+    /// sectors directly, outside the synchronous `read`/`write` path.
+    /// The map reflects the file's current on-disk size, so the file
+    /// must already be the size it will be written at. Reuses the same
+    /// `cluster_to_block` / `next_cluster` the normal data path uses;
+    /// reads no file data.
+    pub fn file_cluster_lbas(
+        &self,
+        file: RawFile,
+        out: &mut [u32],
+    ) -> Result<Option<(usize, u32)>, Error<D::Error>> {
+        let mut data = self.data.try_borrow_mut().map_err(|_| Error::LockError)?;
+        let data = data.deref_mut();
+
+        let file_idx = data.get_file_by_id(file)?;
+        let volume_idx = data.get_volume_by_id(data.open_files[file_idx].raw_volume)?;
+        let first_cluster = data.open_files[file_idx].entry.cluster;
+        let size = data.open_files[file_idx].entry.size;
+
+        let (bytes_per_cluster, blocks_per_cluster) =
+            match &data.open_volumes[volume_idx].volume_type {
+                VolumeType::Fat(fat) => (fat.bytes_per_cluster(), u32::from(fat.blocks_per_cluster)),
+            };
+        if size == 0 || first_cluster.0 < fat::RESERVED_ENTRIES {
+            return Ok(None);
+        }
+        let num_clusters = size.div_ceil(bytes_per_cluster) as usize;
+        if num_clusters > out.len() {
+            return Ok(None); // caller's buffer too small
+        }
+        // Walk the FAT chain, recording each cluster's LBA. No
+        // contiguity requirement — fragmentation is fine, since each
+        // cluster is written independently. Same disjoint-borrow shape
+        // as `find_data_on_disk` (immutable `open_volumes`, mutable
+        // `block_cache`).
+        let mut cur = first_cluster;
+        for i in 0..num_clusters {
+            out[i] = match &data.open_volumes[volume_idx].volume_type {
+                VolumeType::Fat(fat) => fat.cluster_to_block(cur).0,
+            };
+            if i + 1 < num_clusters {
+                cur = match &data.open_volumes[volume_idx].volume_type {
+                    VolumeType::Fat(fat) => fat.next_cluster(&mut data.block_cache, cur)?,
+                };
+            }
+        }
+        Ok(Some((num_clusters, blocks_per_cluster)))
     }
 
     /// Write to a open file.

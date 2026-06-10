@@ -195,10 +195,13 @@ const MAI_CTL_CHNUM_SHIFT: u32 = 4;
 /// Parity enable. Linux's vc4_hdmi.c does not set this bit.
 const MAI_CTL_PAREN: u32 = 1 << 8;
 const MAI_CTL_FLUSH: u32 = 1 << 9;
+#[allow(dead_code)] // RO FIFO status bit; kept for register documentation.
 const MAI_CTL_EMPTY: u32 = 1 << 10; // RO; FIFO drained-to-empty indicator.
-const MAI_CTL_FULL: u32 = 1 << 11; // RO; pump bails when set.
+#[allow(dead_code)] // RO FIFO status bit; kept for register documentation.
+const MAI_CTL_FULL: u32 = 1 << 11; // RO; FIFO-full indicator (DMA-paced now).
 const MAI_CTL_WHOLSMP: u32 = 1 << 12;
 const MAI_CTL_CHALIGN: u32 = 1 << 13;
+#[allow(dead_code)] // RO FIFO status bit; kept for register documentation.
 const MAI_CTL_BUSY: u32 = 1 << 14; // RO.
 #[allow(dead_code)] // setting DLATE may be needed on some receivers; keep the constant available.
 const MAI_CTL_DLATE: u32 = 1 << 15;
@@ -326,12 +329,6 @@ const HDMI_RATE_HZ: u32 = if TONE_TEST_48_KHZ { 48_000 } else { 44_100 };
 /// Linux/Circle-style Audio InfoFrame: PB2=0 means sample size/frequency are
 /// taken from the stream header rather than duplicated in the InfoFrame.
 const AUDIO_INFOFRAME_REFER_TO_STREAM: bool = true;
-/// One-shot startup register dump for the tone test.
-const TONE_TEST_STARTUP_REG_LOG: bool = true;
-/// Periodic logging from the tone-test feeder underruns MAI: the FIFO holds
-/// less than 1 ms of stereo audio, while UART output can stall for many ms.
-/// Keep per-second diagnostics off for listening tests.
-const TONE_TEST_HEARTBEAT_LOG: bool = false;
 /// Use Raspberry Pi Linux's gen3 MAI FIFO threshold values (the path
 /// `vc4_hdmi_audio_prepare` takes when `vc4->gen < VC4_GEN_5`, which
 /// is BCM2835/2710/2837 — i.e. the Pi Zero 2 W we target):
@@ -350,8 +347,6 @@ const USE_MAI_CTL_PAREN: bool = false;
 const FORCE_AUDIO_SAMPLE_PRESENT: bool = false;
 /// Linux/Circle do not force every IEC block boundary as a B frame.
 const FORCE_AUDIO_B_FRAME: bool = false;
-/// Insert a 10 ms silent notch at exactly our one-second sample boundary.
-const TONE_TEST_ONE_SECOND_SILENCE_NOTCH: bool = false;
 /// Match Linux/Circle by powering the HDMI TX PHY RNG before audio starts.
 const ENABLE_HDMI_PHY_RNG: bool = true;
 /// Match Linux's working RAM packet schedule on this panel: AVI/SPD/Audio
@@ -434,25 +429,6 @@ const fn use_alsa_iec_preambles() -> bool {
 const RING_FRAMES: usize = 8192;
 const RING_MASK: usize = RING_FRAMES - 1;
 
-/// Fill the MAI ring with a continuous tone instead of digital silence
-/// during the gaps between Newton sound clips. Diagnostic: if the
-/// HDMI link or our DMA feed ever glitches, the audible tone will
-/// click/dropout — so we can catch it without any guest activity. A
-/// genuine silence fill makes glitches inaudible.
-///
-/// The diagnostic waveform is deliberately loop-perfect for the cyclic
-/// MAI ring: 128 stereo frames per cycle divides the 8192-frame ring
-/// exactly. If the guest supplies no audio, the hardware can loop
-/// already-written idle slots without introducing a synthetic click at
-/// the DMA-ring wrap. Amplitude 0x0400 ≈ −36 dBFS is quiet enough to be
-/// unobtrusive but loud enough to hear real HDMI / MAI / DMA glitches.
-///
-/// To restore digital silence (e.g. for a production build) flip this
-/// to `false`.
-const DIAGNOSTIC_TONE_FILL: bool = true;
-const DIAGNOSTIC_TONE_AMPLITUDE: i32 = 0x0400;
-const DIAGNOSTIC_TONE_PERIOD_SAMPLES: u32 = 128;
-
 // ---------- State ---------------------------------------------------------
 
 /// One stereo frame in the ring: lower 16 bits = left, upper = right.
@@ -490,12 +466,6 @@ static INIT_DONE: AtomicBool = AtomicBool::new(false);
 static OUTPUT_RUNNING: AtomicBool = AtomicBool::new(false);
 static OUTPUT_INT_MASK: AtomicU32 = AtomicU32::new(0);
 static INPUT_INT_MASK: AtomicU32 = AtomicU32::new(0);
-static SCHED_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
-static START_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
-static STOP_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
-static IRQ_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
-static OUTPUT_IS_RUNNING_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
-static PUMP_TICK_LOG: AtomicU32 = AtomicU32::new(0);
 /// CNTPCT_EL0 timestamp of the last `vic::raise(output_mask)` in
 /// `pump`. Zero before the first IRQ. Rate-limit floor for the
 /// level-triggered nudge below.
@@ -615,9 +585,6 @@ static BUF2_ADDR: AtomicU32 = AtomicU32::new(0);
 /// IEC 60958 frame counter (mod 192). Used to set the B-frame
 /// preamble bits on the first subframe of each block.
 static IEC_FRAME_CTR: AtomicU32 = AtomicU32::new(0);
-/// Phase counter for the diagnostic-fill tone. Advances by one per
-/// stereo frame emitted as fill; wraps at `DIAGNOSTIC_TONE_PERIOD_SAMPLES`.
-static DIAGNOSTIC_TONE_PHASE: AtomicU32 = AtomicU32::new(0);
 /// IEC 60958-3 consumer channel-status, 192 bits = 24 bytes, one bit
 /// per frame mapped into bit 30 (C) of each subframe across a block.
 ///
@@ -652,18 +619,10 @@ const CHANNEL_STATUS_BYTES: [u8; 24] = [
 
 // ---------- Public entry points -------------------------------------------
 
-/// Diagnostic toggle: when `true`, `init` brings up MAI and then
-/// hijacks the CPU to play a 200 Hz triangle wave forever via the
-/// HDMI MAI block, bypassing all Newton-kernel sound integration.
-///
-/// If you hear a clean continuous tone, the entire HDMI/MAI path is
-/// good — clocks, FIFO, IEC subframe encoding, AUDIO_PACKET_CONFIG,
-/// CRP/CTS, the receiver. If you hear noise, distortion, or silence,
-/// the audio path itself is broken and the kernel-side issues are
-/// downstream of that. Either way it isolates the problem.
-const TONE_TEST: bool = false;
-
-fn debug_counter() -> (u64, u64) {
+/// Read `(CNTPCT_EL0, CNTFRQ_EL0)` — wall-clock tick count and its
+/// frequency. Used to measure the inter-period interval in
+/// `on_mai_dma_done` so a late DMA completion (EL2 stall) is detected.
+fn read_timer() -> (u64, u64) {
     let now: u64;
     let freq: u64;
     // SAFETY: sysreg reads, side-effect free.
@@ -717,65 +676,15 @@ pub fn init() {
     }
     INIT_DONE.store(true, Ordering::Release);
 
-    if TONE_TEST {
-        // Self-test: take over the CPU and play a pure tone forever.
-        // The Newton kernel never runs. Diagnostic-only.
-        play_test_tone();
-    }
-
-    // Post-init register dump. Useful for verifying we hit the
-    // intended bit patterns when something goes wrong on real
-    // hardware. The log volume is one-shot, not per-buffer.
-    // SAFETY: MMIO reads in the Device-nGnRE window mapped by mmu::init.
-    let (ctl, fmt, cfg, thr, smap, mcfg, apc, crp, cts, rpc, sched) = unsafe {
-        (
-            read_volatile(HDMI_MAI_CTL as *const u32),
-            read_volatile(HDMI_MAI_FMT as *const u32),
-            read_volatile(HDMI_MAI_CONFIG as *const u32),
-            read_volatile(HDMI_MAI_THR as *const u32),
-            read_volatile(HDMI_MAI_SMP as *const u32),
-            read_volatile(HDMI_MAI_CHANNEL_MAP as *const u32),
-            read_volatile(HDMI_AUDIO_PACKET_CONFIG as *const u32),
-            read_volatile(HDMI_CRP_CFG as *const u32),
-            read_volatile(HDMI_CTS_0 as *const u32),
-            read_volatile(HDMI_RAM_PACKET_CONFIG as *const u32),
-            read_volatile(HDMI_SCHEDULER_CONTROL as *const u32),
-        )
-    };
     kprintln!(
         "audio_pi_hdmi: MAI initialised, output {} Hz stereo PCM",
         HDMI_RATE_HZ
-    );
-    kprintln!(
-        "audio_pi_hdmi: post-init regs CTL={:#x} FMT={:#x} CONFIG={:#x} THR={:#x}",
-        ctl,
-        fmt,
-        cfg,
-        thr
-    );
-    kprintln!(
-        "audio_pi_hdmi: post-init regs SMP={:#x} CHMAP={:#x} APC={:#x} CRP={:#x}",
-        smap,
-        mcfg,
-        apc,
-        crp
-    );
-    kprintln!(
-        "audio_pi_hdmi: post-init regs CTS_0={} RAM_PACKET_CONFIG={:#x} SCHEDULER={:#x}",
-        cts,
-        rpc,
-        sched
     );
 }
 
 pub fn set_interrupt_mask(input_mask: u32, output_mask: u32) {
     INPUT_INT_MASK.store(input_mask, Ordering::Relaxed);
     OUTPUT_INT_MASK.store(output_mask, Ordering::Relaxed);
-    kprintln!(
-        "audio_pi_hdmi: irq masks in={:#x} out={:#x}",
-        input_mask,
-        output_mask
-    );
 }
 
 pub fn set_output_buffers(buf1_addr: u32, buf2_addr: u32) {
@@ -785,16 +694,6 @@ pub fn set_output_buffers(buf1_addr: u32, buf2_addr: u32) {
 
 pub fn output_volume_set(volume: u32) {
     OUTPUT_VOLUME.store(volume, Ordering::Relaxed);
-    static VOLUME_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
-    let n = VOLUME_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 8 {
-        kprintln!(
-            "audio_pi_hdmi: volume set #{} raw={:#010x} gain_q15={}",
-            n + 1,
-            volume,
-            output_gain_q15()
-        );
-    }
 }
 
 pub fn output_volume_get() -> u32 {
@@ -816,19 +715,6 @@ pub fn start_output() {
     // keeps the MAI FIFO continuously fed (real samples while
     // OUTPUT_RUNNING is true, silence padding otherwise) so we
     // never need to toggle ENABLE to stop audible playback.
-    let n = START_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    // SAFETY: MMIO read in the Device-nGnRE window mapped by mmu::init.
-    let ctl = unsafe { read_volatile(HDMI_MAI_CTL as *const u32) };
-    let ring = ring_state();
-    let head = ring.head.load(Ordering::Relaxed);
-    let tail = ring.tail.load(Ordering::Relaxed);
-    kprintln!(
-        "audio_pi_hdmi: start_output #{} MAI_CTL={:#x} ring head={} tail={}",
-        n + 1,
-        ctl,
-        head,
-        tail
-    );
 }
 
 /// Subfn 0x0F. The Newton kernel calls this between sound clips. We
@@ -848,8 +734,6 @@ pub fn stop_output() {
     let ring = ring_state();
     let head = ring.head.load(Ordering::Acquire);
     ring.tail.store(head, Ordering::Release);
-    let n = STOP_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    kprintln!("audio_pi_hdmi: stop_output #{}", n + 1);
 }
 
 /// Subfn 0x13. Per TCoreAudioSoundManager::OutputIsRunning
@@ -861,17 +745,7 @@ pub fn output_is_running() -> bool {
     let ring = ring_state();
     let head = ring.head.load(Ordering::Acquire);
     let tail = ring.tail.load(Ordering::Acquire);
-    let running = head != tail;
-    let n = OUTPUT_IS_RUNNING_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 16 {
-        kprintln!(
-            "audio_pi_hdmi: output_is_running #{} -> {} (queued={})",
-            n + 1,
-            running,
-            head.wrapping_sub(tail)
-        );
-    }
-    running
+    head != tail
 }
 
 pub fn schedule_output(which: u32, byte_count: u32) {
@@ -883,14 +757,6 @@ pub fn schedule_output(which: u32, byte_count: u32) {
     } else {
         BUF2_ADDR.load(Ordering::Relaxed)
     };
-    let n = SCHED_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    kprintln!(
-        "audio_pi_hdmi: schedule_output #{} which={} bytes={:#x} base={:#x}",
-        n + 1,
-        which,
-        byte_count,
-        base
-    );
     // Per TCoreAudioSoundManager::ScheduleOutput
     // (TCoreAudioSoundManager.cpp:261-273): queue the samples and
     // return. The IRQ is NOT raised here (note Einstein's explicit
@@ -902,7 +768,6 @@ pub fn schedule_output(which: u32, byte_count: u32) {
         // as the end of the current output run. Keep HDMI MAI physically
         // streaming, but stop the Newton-facing producer state so the
         // kernel does not wait forever for another buffer-done edge.
-        kprintln!("audio_pi_hdmi: zero-size schedule -> stop");
         stop_output();
         return;
     }
@@ -1079,18 +944,15 @@ fn refill_mai_dma_ring() {
     }
     ring.tail.store(tail_stereo, Ordering::Release);
 
-    // Phase 2: idle-fill padding to reach the ahead-of-consumer target.
-    // Default is a continuous 441 Hz tone (see `DIAGNOSTIC_TONE_FILL`) so
-    // any HDMI / MAI / DMA glitch is audible as a click or dropout even
-    // without any guest sound activity — without the tone, silence makes
-    // such glitches inaudible. Flip the flag to emit true silence in a
-    // production build.
+    // Phase 2: pad with digital silence to reach the ahead-of-consumer
+    // target. Between clips the DMA reads these valid silent IEC
+    // subframes, so the wire stays continuous and the receiver never
+    // sees a stream interruption.
     to_write_pairs = to_write_pairs.saturating_sub(pairs_written);
     let real_pairs_written = pairs_written;
     for _ in 0..to_write_pairs {
         let frame_idx_in_block = IEC_FRAME_CTR.load(Ordering::Relaxed);
-        let sample = next_diagnostic_fill_sample();
-        let (sf_l, sf_r) = encode_iec958_pair(sample, sample, frame_idx_in_block);
+        let (sf_l, sf_r) = encode_iec958_pair(0, 0, frame_idx_in_block);
         // SAFETY: same exclusive-producer invariant as Phase 1.
         unsafe {
             let buf = &mut *MAI_TX_RING.0.get();
@@ -1205,32 +1067,17 @@ fn maybe_raise_watermark_irq() {
     }
     vic::raise(output_mask);
     LAST_IRQ_TICKS.store(now, Ordering::Relaxed);
-    // First few nudges of each clip are the interesting ones (the
-    // post-drain nudge the kernel uses to finish a clip is usually
-    // within the first handful); after that, sample 1-in-32 so a
-    // hung kernel shows up as a sparse trickle instead of 50 B every
-    // 23 ms saturating the UART.
-    let n = IRQ_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 8 || n % 32 == 0 {
-        kprintln!(
-            "audio_pi_hdmi: nudge IRQ #{} mask={:#x} queued={} ipres={:#x}",
-            n + 1,
-            output_mask,
-            queued,
-            vic::int_present_raw()
-        );
-    }
 }
 
 // ---------- Internals -----------------------------------------------------
 
-/// EXPERIMENT (display-reset isolation): extra right-shift applied to
-/// every guest sample on top of the Newton volume gain. The panel
-/// reboots ~250 ms into the full-scale boot chime while the −36 dBFS
-/// diagnostic tone streams for 14+ s without incident — amplitude
-/// (speaker-amp current → supply brownout) is the prime suspect. 2
-/// bits = −12 dB. If the panel survives the chime with this set, the
-/// amplitude hypothesis is confirmed; set back to 0 afterwards.
+/// Extra right-shift applied to every guest sample on top of the
+/// Newton volume gain (2 bits = −12 dB). The panel was observed to
+/// reboot ~250 ms into the full-scale boot chime; low-amplitude output
+/// streamed for 14+ s without incident, so speaker-amp current →
+/// supply brownout is the prime suspect. This attenuation keeps the
+/// chime below the brownout threshold. Set to 0 for full-scale output
+/// if the brownout is later root-caused and fixed at the supply.
 const GUEST_SAMPLE_ATTENUATION_SHIFT: u32 = 2;
 
 /// Q15 output gain from the Newton volume word, per Einstein's
@@ -1271,30 +1118,6 @@ fn encode_stereo_frame(mono_be_sample: i16) -> StereoFrame {
     // Newton is mono — duplicate to both channels.
     let lo = (scaled as i16 as u16) as u32;
     StereoFrame(lo | (lo << 16))
-}
-
-/// Diagnostic idle-fill sample. Returns 0 when `DIAGNOSTIC_TONE_FILL`
-/// is false (true silence); otherwise advances a phase counter and
-/// returns the next sample of a low-amplitude triangle wave at
-/// `DIAGNOSTIC_TONE_FREQ_HZ`. Called once per stereo frame from
-/// `refill_mai_dma_ring`'s Phase 2; both L and R channels get the
-/// same sample so the wave is centered (no L/R panning artefacts).
-fn next_diagnostic_fill_sample() -> i16 {
-    if !DIAGNOSTIC_TONE_FILL {
-        return 0;
-    }
-    let phase = DIAGNOSTIC_TONE_PHASE.fetch_add(1, Ordering::Relaxed)
-        % DIAGNOSTIC_TONE_PERIOD_SAMPLES;
-    let half = DIAGNOSTIC_TONE_PERIOD_SAMPLES as i32 / 2;
-    let amp = DIAGNOSTIC_TONE_AMPLITUDE;
-    let val = if (phase as i32) < half {
-        // Rising ramp: −amp at phase=0, +amp at phase=half.
-        -amp + 2 * amp * (phase as i32) / half
-    } else {
-        // Falling ramp: +amp at phase=half, −amp at phase=period.
-        amp - 2 * amp * ((phase as i32) - half) / half
-    };
-    val as i16
 }
 
 /// Encode a (left, right) 16-bit pair into two IEC 60958 subframes.
@@ -1366,24 +1189,6 @@ fn channel_status_bit(frame_idx_in_block: u32) -> u32 {
     ((CHANNEL_STATUS_BYTES[byte_idx] >> bit_idx) & 1) as u32
 }
 
-fn mai_fifo_full() -> bool {
-    // SAFETY: MMIO read in the Device-nGnRE window mapped by mmu::init.
-    let ctl = unsafe { read_volatile(HDMI_MAI_CTL as *const u32) };
-    (ctl & MAI_CTL_FULL) != 0
-}
-
-fn write_mai_data_wait(word: u32) {
-    // FULL is a per-32-bit-word FIFO status, not a per-stereo-frame
-    // status. Linux uses DMA DREQ pacing and Circle's polling path writes
-    // one subframe per writable check; do the same to avoid FIFO-full
-    // errors from writing L+R after only one slot became available.
-    while mai_fifo_full() {}
-    // SAFETY: HDMI_MAI_DATA is MMIO in the Device-nGnRE window.
-    unsafe {
-        write_volatile(HDMI_MAI_DATA as *mut u32, word);
-    }
-}
-
 /// Build the cyclic CB chain (one CB per period, last CB looping
 /// back to CB[0]), pre-fill the whole MAI ring with silence
 /// subframes, cache-flush both, and arm DMA channel 4 with CB[0].
@@ -1405,8 +1210,7 @@ fn mai_dma_init_cyclic() -> bool {
         return true;
     }
 
-    // Pre-fill the entire ring with valid IEC subframes (either the
-    // diagnostic tone or true silence — see DIAGNOSTIC_TONE_FILL).
+    // Pre-fill the entire ring with valid silent IEC subframes.
     // Without this the first ~186 ms after DMA arm would emit the
     // BSS-zero pattern: a stream of 0x00000000 u32s, which has no
     // IEC preamble and no parity bit set, and which the receiver
@@ -1423,9 +1227,7 @@ fn mai_dma_init_cyclic() -> bool {
         // subframe.
         for i in (0..MAI_TX_RING_LEN).step_by(2) {
             let frame_idx_in_block = IEC_FRAME_CTR.load(Ordering::Relaxed);
-            let sample = next_diagnostic_fill_sample();
-            let (sf_l, sf_r) =
-                encode_iec958_pair(sample, sample, frame_idx_in_block);
+            let (sf_l, sf_r) = encode_iec958_pair(0, 0, frame_idx_in_block);
             buf[i] = sf_l;
             buf[i + 1] = sf_r;
             IEC_FRAME_CTR.store(
@@ -1515,7 +1317,7 @@ fn mai_dma_init_cyclic() -> bool {
 /// site is needed for the audio "tick" — explicitly NOT the trap
 /// tail, which the rest of the hypervisor is trying to thin out.
 pub fn on_mai_dma_done() {
-    let (now, freq) = debug_counter();
+    let (now, freq) = read_timer();
     let last = LAST_PERIOD_IRQ_TICKS.swap(now, Ordering::AcqRel);
     let delta_us = if last == 0 {
         0
@@ -1584,76 +1386,38 @@ pub fn on_mai_dma_done() {
     refill_mai_dma_ring();
     maybe_raise_watermark_irq();
 
-    // Compact period status: first 16 periods (boot bring-up), then
-    // 1-in-64 (~every 1.5 s) as a liveness heartbeat, plus any
-    // period whose IRQ arrived late (an EL2 stall ate into the
-    // refill margin — exactly the precondition for consumer drift
-    // and audible tearing). A late period also dumps the DMA CS /
-    // DEBUG registers and MAI_CTL so wire-level errors (DLATE etc.)
-    // land in the same line.
-    let tick = PUMP_TICK_LOG.fetch_add(1, Ordering::Relaxed);
-    // SAFETY: MMIO read.
-    let ctl = unsafe { read_volatile(HDMI_MAI_CTL as *const u32) };
-    let ring = ring_state();
-    let head = ring.head.load(Ordering::Acquire);
-    let tail = ring.tail.load(Ordering::Acquire);
-    let queued = head.wrapping_sub(tail);
+    // Only a LATE period IRQ is worth a line: an EL2 stall ate into the
+    // refill margin — exactly the precondition for consumer drift and
+    // audible tearing. A late period dumps the DMA CS / DEBUG registers
+    // and MAI_CTL so wire-level errors (DLATE etc.) land in the same
+    // line.
+    //
     // "Late" = more than ~1.7 period-times between dispatches. Must
     // clear the boot-time polling quantization: a ~10 ms poll cadence
     // on top of the 23.2 ms period puts worst-case healthy dt at
     // ~33 ms (the 30.06 ms lines in earlier captures were false
     // positives at a 30 ms threshold).
-    let late = delta_us > 40_000;
-    if tick < 16 || tick % 64 == 0 || late {
-        kprintln!(
-            "audio_pi_hdmi: period {} queued={} MAI_CTL={:#x} dt_us={}",
-            tick,
-            queued,
-            ctl,
-            delta_us
-        );
-    }
-    if late {
+    if delta_us > 40_000 {
+        // SAFETY: MMIO read.
+        let ctl = unsafe { read_volatile(HDMI_MAI_CTL as *const u32) };
+        let ring = ring_state();
+        let head = ring.head.load(Ordering::Acquire);
+        let tail = ring.tail.load(Ordering::Acquire);
+        let queued = head.wrapping_sub(tail);
         let mai_head = MAI_TX_HEAD.load(Ordering::Acquire);
         let consumer = periods_done.saturating_mul(PERIOD_SLOTS as u64);
         let (dma_cs, dma_dbg) = crate::peripherals::host_dma::mai_tx_diag();
         kprintln!(
-            "audio_pi_hdmi: late period: ahead={} dma_cs={:#x} dma_dbg={:#x}",
+            "audio_pi_hdmi: late period {} queued={} MAI_CTL={:#x} dt_us={} ahead={} dma_cs={:#x} dma_dbg={:#x}",
+            periods_done,
+            queued,
+            ctl,
+            delta_us,
             mai_head.saturating_sub(consumer),
             dma_cs,
             dma_dbg
         );
     }
-}
-
-fn log_packet_scheduler_regs(context: &str, seconds: u64) {
-    // SAFETY: MMIO reads in the Device-nGnRE window mapped by mmu::init.
-    let (rpc, rps, apc, crp, cts0, cts1, sched, thr, fmt, smp) = unsafe {
-        (
-            read_volatile(HDMI_RAM_PACKET_CONFIG as *const u32),
-            read_volatile(HDMI_RAM_PACKET_STATUS as *const u32),
-            read_volatile(HDMI_AUDIO_PACKET_CONFIG as *const u32),
-            read_volatile(HDMI_CRP_CFG as *const u32),
-            read_volatile(HDMI_CTS_0 as *const u32),
-            read_volatile(HDMI_CTS_1 as *const u32),
-            read_volatile(HDMI_SCHEDULER_CONTROL as *const u32),
-            read_volatile(HDMI_MAI_THR as *const u32),
-            read_volatile(HDMI_MAI_FMT as *const u32),
-            read_volatile(HDMI_MAI_SMP as *const u32),
-        )
-    };
-    kprintln!(
-        "audio_pi_hdmi: {} t={}s RPC={:#x} RPS={:#x} APC={:#x} CRP={:#x} CTS0={} CTS1={} SCHED={:#x}",
-        context, seconds, rpc, rps, apc, crp, cts0, cts1, sched
-    );
-    kprintln!(
-        "audio_pi_hdmi: {} t={}s THR={:#x} FMT={:#x} SMP={:#x}",
-        context,
-        seconds,
-        thr,
-        fmt,
-        smp
-    );
 }
 
 fn enable_hdmi_phy_rng() {
@@ -1665,18 +1429,11 @@ fn enable_hdmi_phy_rng() {
     // enabling MAI; Linux does the same through vc4_hdmi->phy_rng_enable.
     // The firmware modeset may leave this powered down, so make it explicit.
     // SAFETY: HDMI_TX_PHY_CTL0 is MMIO in the Device-nGnRE window.
-    let (before, after) = unsafe {
+    unsafe {
         let before = read_volatile(HDMI_TX_PHY_CTL0 as *const u32);
-        let after = before & !TX_PHY_CTL0_RNG_POWER_DOWN;
-        write_volatile(HDMI_TX_PHY_CTL0 as *mut u32, after);
+        write_volatile(HDMI_TX_PHY_CTL0 as *mut u32, before & !TX_PHY_CTL0_RNG_POWER_DOWN);
         dsb_sy();
-        (before, read_volatile(HDMI_TX_PHY_CTL0 as *const u32))
-    };
-    kprintln!(
-        "audio_pi_hdmi: HDMI TX PHY RNG enable CTL0 {:#x} -> {:#x}",
-        before,
-        after
-    );
+    }
 }
 
 /// Write the "playing" MAI_CTL bit pattern, mirroring
@@ -1688,6 +1445,10 @@ fn enable_hdmi_phy_rng() {
 ///     VC4_HD_MAI_CTL_WHOLSMP | VC4_HD_MAI_CTL_CHALIGN |
 ///     VC4_HD_MAI_CTL_ENABLE);
 /// ```
+///
+/// `bringup_mai` inlines this same pattern; kept for symmetry with
+/// [`mai_ctl_shutdown`] / [`mai_ctl_reset`].
+#[allow(dead_code)]
 fn mai_ctl_enable_playback() {
     let mut ctl =
         (2u32 << MAI_CTL_CHNUM_SHIFT) | MAI_CTL_WHOLSMP | MAI_CTL_CHALIGN | MAI_CTL_ENABLE;
@@ -1855,132 +1616,6 @@ fn read_audio_clock_hz() -> Option<u32> {
 /// read fails (caller must then leave INIT_DONE unset so all the
 /// per-sound entry points become no-ops). Both clock values land in
 /// the boot log so a misread is visible without instrumentation.
-/// Diagnostic self-test: feed HDMI MAI forever, bypassing all
-/// Newton-kernel sound integration. Three modes, chosen by these
-/// const flags:
-///
-/// - `TONE_TEST_SILENCE = true`: all-zero samples.
-/// - `TONE_TEST_SILENCE = false`, `TONE_TEST_DC = true`: constant
-///   non-zero `TONE_TEST_DC_VALUE` samples (no modulation).
-/// - both false: 200 Hz triangle wave.
-///
-/// Comparing zero vs constant-non-zero vs triangle isolates whether
-/// the panel/encoder reacts to "non-zero payload anywhere" or to
-/// "changing samples".
-const TONE_TEST_SILENCE: bool = false;
-const TONE_TEST_DC: bool = false;
-const TONE_TEST_DC_VALUE: i16 = 0x4000;
-
-fn play_test_tone() -> ! {
-    if ENABLE_MAI_AFTER_INFOFRAME {
-        mai_ctl_enable_playback();
-    }
-
-    if TONE_TEST_SILENCE {
-        kprintln!("audio_pi_hdmi: TONE_TEST — writing zero samples forever (DC silence)");
-    } else if TONE_TEST_DC {
-        kprintln!("audio_pi_hdmi: TONE_TEST — writing constant non-zero ({:#x}) samples forever (DC offset)",
-                  TONE_TEST_DC_VALUE);
-    } else {
-        kprintln!("audio_pi_hdmi: TONE_TEST — playing 200 Hz triangle wave forever");
-    }
-    kprintln!(
-        "audio_pi_hdmi: TONE_TEST config rate={}Hz infoframe_stream={} linux_thr={} late_enable={} zero_flags={} paren={} phy_rng={} linux_rpc={} iec_mode={} notch={} heartbeat_log={}",
-        HDMI_RATE_HZ,
-        AUDIO_INFOFRAME_REFER_TO_STREAM,
-        USE_LINUX_GEN3_MAI_THRESHOLDS,
-        ENABLE_MAI_AFTER_INFOFRAME,
-        USE_AUDIO_PACKET_ZERO_FLAGS,
-        USE_MAI_CTL_PAREN,
-        ENABLE_HDMI_PHY_RNG,
-        USE_LINUX_RAM_PACKET_CONFIG,
-        IEC_DIAGNOSTIC_MODE,
-        TONE_TEST_ONE_SECOND_SILENCE_NOTCH,
-        TONE_TEST_HEARTBEAT_LOG
-    );
-
-    // Triangle wave state.
-    const AMPLITUDE: i32 = 0x4000;
-    const HALF_PERIOD: i32 = (HDMI_RATE_HZ / 400) as i32;
-    const STEP: i32 = AMPLITUDE * 2 / HALF_PERIOD;
-    const NOTCH_FRAMES: u64 = (HDMI_RATE_HZ as u64) / 100;
-
-    let mut value: i32 = -AMPLITUDE;
-    let mut direction: i32 = STEP;
-    let mut frame_idx_in_block: u32 = 0;
-
-    // MAI_CTL monitoring state. FULL is masked out because it toggles every
-    // frame as a side effect of FIFO drain. Periodic heartbeat logging stays
-    // disabled for listening tests because UART output starves the FIFO.
-    const CTL_DIFF_MASK: u32 = !MAI_CTL_FULL;
-    let mut last_logged_ctl: u32 = 0xFFFF_FFFF; // forces first read to log.
-    let mut frame_count: u64 = 0;
-
-    loop {
-        let sample: i16 = if TONE_TEST_SILENCE {
-            0
-        } else if TONE_TEST_DC {
-            TONE_TEST_DC_VALUE
-        } else if TONE_TEST_ONE_SECOND_SILENCE_NOTCH
-            && frame_count % (HDMI_RATE_HZ as u64) < NOTCH_FRAMES
-        {
-            0
-        } else {
-            value as i16
-        };
-        let (sf_l, sf_r) = encode_iec958_pair(sample, sample, frame_idx_in_block);
-        write_mai_data_wait(sf_l);
-        write_mai_data_wait(sf_r);
-
-        // Snapshot MAI_CTL after the writes. Log on any non-FULL flip
-        // and (separately) on a 1 Hz heartbeat. The busy-poll above
-        // rate-limits the loop to the FIFO drain rate (~44.1 kHz), so
-        // `frame_count` is a faithful wall-clock proxy.
-        // SAFETY: MMIO read in Device-nGnRE window.
-        let ctl = unsafe { read_volatile(HDMI_MAI_CTL as *const u32) };
-        if (ctl & CTL_DIFF_MASK) != (last_logged_ctl & CTL_DIFF_MASK) {
-            let flips = (ctl ^ last_logged_ctl) & CTL_DIFF_MASK;
-            let ms = frame_count.saturating_mul(1000) / (HDMI_RATE_HZ as u64);
-            kprintln!(
-                "audio_pi_hdmi: TONE_TEST t={}ms MAI_CTL {:#010x} -> {:#010x} flips={:#010x}{}{}{}{}{}{}{}{}",
-                ms, last_logged_ctl, ctl, flips,
-                if flips & MAI_CTL_RESET  != 0 { " RESET"  } else { "" },
-                if flips & MAI_CTL_ERRORF != 0 { " ERRORF" } else { "" },
-                if flips & MAI_CTL_ERRORE != 0 { " ERRORE" } else { "" },
-                if flips & MAI_CTL_ENABLE != 0 { " ENABLE" } else { "" },
-                if flips & MAI_CTL_PAREN  != 0 { " PAREN"  } else { "" },
-                if flips & MAI_CTL_FLUSH  != 0 { " FLUSH"  } else { "" },
-                if flips & MAI_CTL_EMPTY  != 0 { " EMPTY"  } else { "" },
-                if flips & MAI_CTL_BUSY   != 0 { " BUSY"   } else { "" },
-            );
-            last_logged_ctl = ctl;
-        }
-        if TONE_TEST_HEARTBEAT_LOG && frame_count > 0 && frame_count % (HDMI_RATE_HZ as u64) == 0 {
-            let seconds = frame_count / HDMI_RATE_HZ as u64;
-            kprintln!(
-                "audio_pi_hdmi: TONE_TEST heartbeat t={}s MAI_CTL={:#010x}",
-                seconds,
-                ctl
-            );
-            log_packet_scheduler_regs("TONE_TEST heartbeat", seconds);
-        }
-        frame_count = frame_count.wrapping_add(1);
-
-        // Advance triangle wave state (harmless when silence mode is on).
-        value += direction;
-        if value >= AMPLITUDE {
-            value = AMPLITUDE;
-            direction = -STEP;
-        } else if value <= -AMPLITUDE {
-            value = -AMPLITUDE;
-            direction = STEP;
-        }
-
-        // Advance IEC 60958 frame counter (mod 192-frame block).
-        frame_idx_in_block = (frame_idx_in_block + 1) % IEC958_BLOCK_FRAMES;
-    }
-}
-
 fn bringup_mai() -> bool {
     // The pixel clock determines CTS. We refuse to fabricate a value:
     // a wrong CTS yields a wrong receiver-recovered audio clock, which
@@ -2200,9 +1835,6 @@ fn bringup_mai() -> bool {
     // re-arms in trigger(START) because it supports rate changes; we
     // don't.
     set_audio_info_frame();
-    if TONE_TEST_STARTUP_REG_LOG {
-        log_packet_scheduler_regs("post-infoframe", 0);
-    }
     true
 }
 

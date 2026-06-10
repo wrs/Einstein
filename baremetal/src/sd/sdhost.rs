@@ -103,6 +103,9 @@ pub enum CmdError {
     /// SW timeout polling `SDCMD_NEW_FLAG` — we never observed the
     /// hardware accept the command.
     HardwareWedge,
+    /// DMA-path failure: the SD-TX channel isn't firmware-enabled, or
+    /// it latched CS.ERROR during the transfer.
+    DmaError,
 }
 
 /// Card-type signal we get from the OCR response to ACMD41.
@@ -375,6 +378,92 @@ impl SdHost {
         r
     }
 
+    /// Like [`write_block`], but the 512-byte data phase is fed by DMA
+    /// (a DREQ-paced channel into the `SDDATA` FIFO) instead of PIO.
+    ///
+    /// This is the *isolated bring-up* form: it still **polls** the
+    /// channel to completion, so the CPU/guest isn't freed yet — that
+    /// arrives when the autosave is restructured around the channel's
+    /// completion IRQ. Its job here is to prove the DMA→SDHOST path in
+    /// isolation (milestone 2): the DREQ number, the FIFO addressing,
+    /// and the command/data sequencing.
+    pub fn write_block_dma(&self, lba: u32, buf: &[u8; 512]) -> Result<(), CmdError> {
+        use crate::peripherals::host_dma as dma;
+        if !dma::init_sd_tx() {
+            // Channel not firmware-enabled; caller may fall back to PIO.
+            return Err(CmdError::DmaError);
+        }
+        let arg = match self.capacity {
+            CardCapacity::HighCapacity => lba,
+            CardCapacity::StandardCapacity => lba.wrapping_mul(512),
+        };
+
+        // Build the control block: source = buf (RAM, incrementing) →
+        // dest = SDDATA FIFO (peripheral, DREQ-paced, no increment),
+        // 512 bytes in 32-bit beats.
+        let buf_pa = buf.as_ptr() as u64;
+        let sddata_pa = (SDHOST_BASE + SDDATA) as u32;
+        let ti = (dma::DREQ_SDHOST << dma::TI_PERMAP_SHIFT)
+            | dma::TI_SRC_INC
+            | dma::TI_DEST_DREQ
+            | dma::TI_WAIT_RESP;
+        // SAFETY: single-core EL2; the SD-TX channel and this CB are
+        // owned here, and we poll the transfer to completion before
+        // returning, so the CB stays stable for its whole lifetime.
+        let cb = SD_TX_CB.0.get();
+        unsafe {
+            (*cb).ti = ti;
+            (*cb).source_ad = dma::bus_addr_ram(buf_pa);
+            (*cb).dest_ad = dma::bus_addr_periph(sddata_pa);
+            (*cb).txfr_len = 512;
+            (*cb).stride = 0;
+            (*cb).nextconbk = 0;
+        }
+        // Push the source buffer to RAM: the DMA master reads it via
+        // the uncached bus alias, so cacheable writes must be flushed.
+        crate::cpu::dc_civac_range(buf_pa, 512);
+
+        prepare_data(self.hcfg_base, 512, 1);
+        // Arm first; the channel idles on DREQ until the command opens
+        // the data phase and SDHOST starts asserting FIFO-space DREQs.
+        // SAFETY: `SD_TX_CB` is 'static and stable until we poll done.
+        unsafe {
+            dma::arm_sd_tx(&*cb);
+        }
+
+        if let Err(e) =
+            send_cmd_kind(CMD_WRITE_SINGLE_BLOCK, arg, ResponseKind::Short, CmdDir::Write)
+        {
+            dma::sd_tx_abort();
+            write_reg(SDHCFG, self.hcfg_base);
+            return Err(e);
+        }
+
+        // Poll for DMA completion, watching for SDHOST errors meanwhile.
+        let mut spins = 0u32;
+        let r = loop {
+            if !dma::sd_tx_active() {
+                break if dma::sd_tx_error() {
+                    Err(CmdError::DmaError)
+                } else {
+                    finish_data_phase(false)
+                };
+            }
+            let h = read_reg(SDHSTS);
+            if h & SDHSTS_ERROR_MASK != 0 {
+                dma::sd_tx_abort();
+                break Err(map_hsts_error(h));
+            }
+            spins += 1;
+            if spins > 5_000_000 {
+                dma::sd_tx_abort();
+                break Err(CmdError::HardwareWedge);
+            }
+        };
+        write_reg(SDHCFG, self.hcfg_base);
+        r
+    }
+
     pub fn capacity(&self) -> CardCapacity {
         self.capacity
     }
@@ -383,6 +472,15 @@ impl SdHost {
         self.rca
     }
 }
+
+/// Static control block for the SD-TX DMA channel. `UnsafeCell` (not
+/// `static mut`) so taking `&DmaCb` for `arm_sd_tx` doesn't trip the
+/// `static_mut_refs` lint; single-core EL2 makes the aliasing sound.
+struct SdTxCbCell(core::cell::UnsafeCell<crate::peripherals::host_dma::DmaCb>);
+// SAFETY: single-core EL2; only `write_block_dma` touches it, serialised.
+unsafe impl Sync for SdTxCbCell {}
+static SD_TX_CB: SdTxCbCell =
+    SdTxCbCell(core::cell::UnsafeCell::new(crate::peripherals::host_dma::DmaCb::zero()));
 
 // ---- Register helpers ------------------------------------------------
 

@@ -71,6 +71,11 @@ pub const DREQ_UART_TX: u32 = 12;
 /// `include/circle/dmacommon.h`). On Pi 4 (RASPPI >= 4) the value
 /// changes to 10, but this hypervisor doesn't target Pi 4.
 pub const DREQ_HDMI: u32 = 17;
+/// BCM2835 SDHOST FIFO (`SDDATA`). Cross-checked two ways: Linux's
+/// device tree has `sdhost { dmas = <&dma 13>; }`
+/// (`bcm2835-common.dtsi`), and Circle's `TDREQ` leaves 13 between
+/// `DREQSourceUARTTX = 12` and `DREQSourceUARTRX = 14`.
+pub const DREQ_SDHOST: u32 = 13;
 
 // ---- Control block (BCM2835 §4.2.1.1 p.40 — 8 × 32-bit words,
 // 256-bit aligned) -----------------------------------------------------
@@ -177,6 +182,11 @@ pub const UART_TX_CHANNEL: u32 = 5;
 /// reservations typically touch 0, 2, 3.
 pub const MAI_TX_CHANNEL: u32 = 4;
 
+/// The DMA channel the SDHOST flash-autosave owns for block writes.
+/// Channel 6 is conventionally free on Pi 3 / Zero 2 W (firmware
+/// reservations touch 0/2/3; 4 and 5 are MAI / UART).
+pub const SD_TX_CHANNEL: u32 = 6;
+
 /// Per-channel CS flag bits (priority / panic-priority / wait-for-
 /// writes / dis-debug) ORed into both the arm-time and ACK-time
 /// writes. Mirrors Linux's `BCM2835_DMA_CS_FLAGS(dreq)` pattern,
@@ -191,6 +201,11 @@ pub const MAI_TX_CHANNEL: u32 = 4;
 const UART_TX_CS_FLAGS: u32 = 0;
 const MAI_TX_CS_FLAGS: u32 =
     (8u32 << CS_PRIORITY_SHIFT) | (15u32 << CS_PANIC_PRIORITY_SHIFT);
+/// SD block-write: bare DREQ like UART (Linux's sdhost DT cookie is
+/// `dmas = <&dma 13>`, no flag bits). Audio (MAI) is deliberately kept
+/// at higher AXI priority, so SD writes yield to it under contention —
+/// which is exactly the point of moving the save off the CPU.
+const SD_TX_CS_FLAGS: u32 = 0;
 
 /// Set true once UART TX init() succeeds. `arm_uart_tx()` and the
 /// uart-side completion dispatch are gated on this so the uart layer
@@ -200,6 +215,9 @@ static READY: AtomicBool = AtomicBool::new(false);
 /// Set true once MAI TX init_mai_tx() succeeds. Same role for the
 /// audio backend.
 static MAI_READY: AtomicBool = AtomicBool::new(false);
+
+/// Set true once SD TX init_sd_tx() succeeds.
+static SD_READY: AtomicBool = AtomicBool::new(false);
 
 /// Bring up one DMA channel: assert firmware has powered it, reset
 /// it, clear stale END/INT, enable its GPU IRQ. Used by both
@@ -263,6 +281,35 @@ pub fn is_ready() -> bool {
 #[inline]
 pub fn is_mai_ready() -> bool {
     MAI_READY.load(Ordering::Acquire)
+}
+
+/// One-time bring-up of the SD-TX channel. Idempotent. Returns false
+/// if firmware hasn't powered channel `SD_TX_CHANNEL` (the caller then
+/// falls back to PIO).
+pub fn init_sd_tx() -> bool {
+    if SD_READY.load(Ordering::Acquire) {
+        return true;
+    }
+    if !init_channel(SD_TX_CHANNEL) {
+        return false;
+    }
+    SD_READY.store(true, Ordering::Release);
+    true
+}
+
+/// True while the SD-TX channel is still running a transfer (CS.ACTIVE
+/// set). The polled `write_block_dma` spins on this; the future
+/// background save will instead take the channel's completion IRQ.
+#[inline]
+pub fn sd_tx_active() -> bool {
+    read_cs(SD_TX_CHANNEL) & CS_ACTIVE != 0
+}
+
+/// True if the SD-TX channel latched a DMA error (CS.ERROR) on its
+/// last transfer. Checked by `write_block_dma` after completion.
+#[inline]
+pub fn sd_tx_error() -> bool {
+    read_cs(SD_TX_CHANNEL) & CS_ERROR != 0
 }
 
 /// Arm a DMA transfer on `ch` with caller-supplied CS bits. The CB
@@ -332,6 +379,21 @@ pub unsafe fn arm_uart_tx(cb: &DmaCb) {
 pub unsafe fn arm_mai_tx(cb: &DmaCb) {
     // SAFETY: caller's invariant matches `arm_with_cs`'s.
     unsafe { arm_with_cs(MAI_TX_CHANNEL, cb, CS_ACTIVE | MAI_TX_CS_FLAGS) }
+}
+
+/// Arm a DMA transfer on the SD-TX channel (RAM → `SDDATA` FIFO,
+/// DREQ-paced). Bare DREQ flags, mirroring Linux's sdhost DT cookie.
+///
+/// SAFETY: see [`arm_with_cs`].
+pub unsafe fn arm_sd_tx(cb: &DmaCb) {
+    // SAFETY: caller's invariant matches `arm_with_cs`'s.
+    unsafe { arm_with_cs(SD_TX_CHANNEL, cb, CS_ACTIVE | SD_TX_CS_FLAGS) }
+}
+
+/// Tear down the SD-TX channel (CS.RESET) after a failed or aborted
+/// transfer so a half-armed channel can't linger.
+pub fn sd_tx_abort() {
+    write_cs(SD_TX_CHANNEL, CS_RESET);
 }
 
 /// Called from `trap_irq` when the BCM2835 IRQ controller reports a

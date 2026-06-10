@@ -80,6 +80,48 @@ pub fn run() -> ! {
         );
     }
 
+    // Milestone 2: prove the DMA → SDHOST write path in isolation.
+    // Sector 1 lives in the MBR gap (partitions start at LBA 2048), so
+    // it's safe to scribble; we save and restore it regardless. The
+    // write goes via DMA, the read-back via the proven PIO path, so a
+    // match confirms the DMA path end-to-end (DREQ 13, FIFO addressing,
+    // command/data sequencing).
+    {
+        const TEST_LBA: u32 = 1;
+        kprintln!("dma-write: testing DMA block-write at LBA {}", TEST_LBA);
+        let mut orig = [0u8; 512];
+        match host.read_block(TEST_LBA, &mut orig) {
+            Ok(()) => {
+                let mut pattern = [0u8; 512];
+                for (i, b) in pattern.iter_mut().enumerate() {
+                    *b = (i as u8) ^ 0xA5;
+                }
+                match host.write_block_dma(TEST_LBA, &pattern) {
+                    Ok(()) => {
+                        let mut back = [0u8; 512];
+                        match host.read_block(TEST_LBA, &mut back) {
+                            Ok(()) => match back.iter().zip(pattern.iter()).position(|(a, b)| a != b)
+                            {
+                                None => kprintln!("dma-write: PASS — 512 bytes match"),
+                                Some(i) => kprintln!(
+                                    "dma-write: MISMATCH at byte {} (got 0x{:02x}, want 0x{:02x})",
+                                    i, back[i], pattern[i]
+                                ),
+                            },
+                            Err(e) => kprintln!("dma-write: read-back FAILED: {:?}", e),
+                        }
+                    }
+                    Err(e) => kprintln!("dma-write: write_block_dma FAILED: {:?}", e),
+                }
+                // Restore the original contents via the PIO path.
+                if let Err(e) = host.write_block(TEST_LBA, &orig) {
+                    kprintln!("dma-write: WARNING restore of LBA {} FAILED: {:?}", TEST_LBA, e);
+                }
+            }
+            Err(e) => kprintln!("dma-write: save of LBA {} FAILED, skipping test: {:?}", TEST_LBA, e),
+        }
+    }
+
     kprintln!("fat: handing off to embedded-sdmmc...");
     let vmgr = VolumeManager::new(host, NullTime);
 

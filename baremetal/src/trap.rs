@@ -184,6 +184,40 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     let spsr = read_sysreg!("spsr_el2");
     let aarch32 = (spsr & (1 << 4)) != 0;
     let el2 = !aarch32 && ((spsr & 0b1100) == 0b1000);
+
+    // Slim USB interrupt-IN fast path (real-hw touchscreen). The
+    // IRQ-driven DWC2 channel re-arms every frame, so source 9 fires at
+    // up to ~1 kHz (mostly NAKs) — far above the ~62 Hz the heavy
+    // guest-IRQ body is built for. Harvest the report here, off that
+    // path, regardless of interruptee. Early-return only when USB is the
+    // *sole* cause: the level-triggered CNTHP timer and our DMA channels
+    // must still reach `irq_from_*`, so we check them before skipping.
+    // (CNTHP is level — it simply re-fires if we returned too early — but
+    // we'd then spin here on every USB IRQ and starve it, so test it.)
+    #[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+    {
+        let pend1 = platform::bcm2835_irq_pending_1();
+        if pend1 & (1 << 9) != 0 {
+            let enqueued = crate::input::on_usb_irq();
+            use crate::peripherals::host_dma;
+            let other_bcm = pend1
+                & ((1 << (16 + host_dma::UART_TX_CHANNEL))
+                    | (1 << (16 + host_dma::MAI_TX_CHANNEL)));
+            if other_bcm == 0 && !platform::cnthp_irq_pending() {
+                // USB was the only pending source — skip the heavy body.
+                // If a sample was enqueued and we're returning to the
+                // guest, reflect INT_TABLET into HCR_EL2.VI now so the
+                // pen event is delivered on this exit, not the next one.
+                if !el2 && enqueued {
+                    update_virq();
+                }
+                return;
+            }
+            // Other sources co-pending: fall through. The guest path's
+            // tail `update_virq` picks up any sample enqueued above.
+        }
+    }
+
     if el2 {
         irq_from_el2();
     } else {

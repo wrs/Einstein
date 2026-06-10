@@ -56,19 +56,6 @@ pub trait UsbHostController {
         setup: &SetupPacket,
         data: ControlData<'_>,
     ) -> UsbResult<usize>;
-
-    /// Run one interrupt-IN transfer on `ep_addr` (must include the
-    /// IN bit, 0x80). `max_packet_size` matches the endpoint
-    /// descriptor. Returns the number of bytes received, or
-    /// [`UsbError::Timeout`] if no NAK→DATA transition happens
-    /// before our deadline.
-    fn interrupt_in(
-        &mut self,
-        addr: u8,
-        ep_addr: u8,
-        max_packet_size: u16,
-        buf: &mut [u8],
-    ) -> UsbResult<usize>;
 }
 
 /// Data buffer for a control transfer's optional data stage.

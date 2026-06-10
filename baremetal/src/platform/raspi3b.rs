@@ -128,3 +128,24 @@ pub fn bcm2835_irq_pending_2() -> u32 {
     // SAFETY: MMIO read at a fixed peripheral address.
     unsafe { core::ptr::read_volatile(BCM2835_IC_PEND_2) }
 }
+
+/// BCM2836 per-core IRQ source register for core 0 (local peripheral
+/// block). CNTHPIRQ (the EL2 physical timer routed by
+/// `install_cnthp_irq_routing`) shows up as bit 2 here — the same bit
+/// position the routing register at +0x40 selects.
+const BCM2836_CORE0_IRQ_SOURCE: *const u32 = 0x4000_0060 as *const u32;
+const BCM2836_CNTHPIRQ: u32 = 1 << 2;
+
+/// True if the EL2 hyp-timer IRQ (CNTHPIRQ) is currently asserted at
+/// core 0's local-peripheral IRQ-source register. The line is level —
+/// it stays set until `timer::on_irq` rearms CNTHP_CVAL_EL2 — so a
+/// high-rate co-pending source (the USB interrupt-IN re-arm) can test
+/// this to decide whether it may early-return without starving the
+/// timer.
+#[allow(dead_code)] // First caller is trap_irq's slim USB fast path.
+#[inline]
+pub fn cnthp_irq_pending() -> bool {
+    // SAFETY: MMIO read; the 1 GiB block at 0x4000_0000 is mapped
+    // Device-nGnRE via DEVICE_MMIO_1GIB_BLOCK.
+    unsafe { core::ptr::read_volatile(BCM2836_CORE0_IRQ_SOURCE) & BCM2836_CNTHPIRQ != 0 }
+}

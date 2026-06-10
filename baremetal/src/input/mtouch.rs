@@ -10,14 +10,17 @@
 //! 1. `init` enumerates the bus once at boot. If the device is the
 //!    MTouch, we issue the activation handshake
 //!    `GET_REPORT(Feature, ReportID=3, length=2)` — expected reply
-//!    `0x0a 0x00` — and cache the interrupt-IN endpoint.
-//! 2. `pump` (called from `input::pump` on every trap/IRQ exit)
-//!    issues one polled `interrupt_in` on EP 0x81. If we get a
-//!    full 56-byte Report ID 1 frame we parse slot 0 (tip + X + Y),
-//!    compare against the previous report, and translate any change
-//!    into a [`PenEvent`] inserted into our internal ring.
-//! 3. `drain_into_queue` runs over the ring on the same tick and
-//!    feeds Einstein-format samples to the host_io pen queue.
+//!    `0x0a 0x00` — cache the interrupt-IN endpoint, hand it to the
+//!    DWC2 IRQ-driven path (`start_int_in`), and enable BCM2835 GPU
+//!    source 9 so the panel's reports arrive as USB IRQs.
+//! 2. `on_usb_irq` (called from `trap_irq`'s slim USB fast path the
+//!    instant a report completes) harvests the 56-byte Report ID 1
+//!    frame, parses slot 0 (tip + X + Y), compares against the
+//!    previous report, and translates any change into a [`PenEvent`]
+//!    inserted into our internal ring — no polling, so a report is
+//!    never dropped because the guest happened not to be trapping.
+//! 3. `drain_into_queue` runs over the ring on the same IRQ and feeds
+//!    Einstein-format samples to the host_io pen queue.
 //!
 //! The activation handshake matches `hid-multitouch`'s standard
 //! "Contact Count Max" probe — see Linux
@@ -53,10 +56,6 @@ struct State {
     addr: u8,
     in_ep_addr: u8,
     in_ep_mps: u16,
-    /// Consecutive hard transfer errors from `pump`'s interrupt-IN.
-    /// Reset on any success/idle poll; at `DETACH_ERROR_THRESHOLD`
-    /// the device is declared gone (panel reboot) and polling stops.
-    consec_errors: u32,
     /// Last-seen (pressed, x, y) so we can suppress idle keep-alive
     /// reports (the panel emits ID 1 at ~16 ms regardless of whether
     /// anything changed — see `docs/MTOUCH.md` §Behavior notes).
@@ -78,7 +77,6 @@ impl State {
             addr: 0,
             in_ep_addr: 0x81,
             in_ep_mps: 64,
-            consec_errors: 0,
             last_pressed: false,
             last_x: 0,
             last_y: 0,
@@ -127,16 +125,26 @@ pub fn init() {
     if INIT_DONE.swap(true, Ordering::AcqRel) {
         return;
     }
-    // Run bus enumeration once. Failures here aren't fatal — the
-    // hypervisor continues with no pen input, which is the same
-    // state as a `pi-bare-metal-display` build.
+    // Run bus enumeration once, then arm the IRQ-driven interrupt-IN.
+    // Failures here aren't fatal — the hypervisor continues with no
+    // pen input, the same state as a `pi-bare-metal-display` build.
     let r = dwc2::with(|host| {
         let _ = host.port_reset_and_speed()?;
         let dev = enumerate::enumerate(host)?;
-        attach(host, &dev)
+        attach(host, &dev)?;
+        // `host` is the concrete `&mut Dwc2` here, so we can hand the
+        // cached endpoint to the IRQ-driven path directly.
+        let (addr, ep, mps) = with_state(|s| (s.addr, s.in_ep_addr, s.in_ep_mps));
+        host.start_int_in(addr, ep, mps)
     });
     match r {
-        Ok(()) => kprintln!("input-mtouch: attached"),
+        Ok(()) => {
+            // Route the DWC2 IRQ line (BCM2835 GPU source 9) to the CPU
+            // so harvested reports arrive as USB IRQs into `trap_irq`.
+            #[cfg(feature = "platform-raspi3b")]
+            crate::platform::enable_bcm2835_irq(9);
+            kprintln!("input-mtouch: attached (IRQ-driven)");
+        }
         Err(UsbError::NotReady) => {
             kprintln!("input-mtouch: DWC2 not ready; pen input disabled");
         }
@@ -204,64 +212,26 @@ fn attach<H: crate::usb::host::UsbHostController>(
     Ok(())
 }
 
-/// Consecutive hard-error count at which the device is declared
-/// detached. The dwc2 core already retries 3× internally per
-/// attempt, so 8 attempts ≈ a sustained ~128 ms outage at the 16 ms
-/// pump cadence — far beyond any transient the panel produces when
-/// alive.
-const DETACH_ERROR_THRESHOLD: u32 = 8;
+/// Trap-tail pump. Touchscreen input is IRQ-driven now (`on_usb_irq`),
+/// so there is nothing to poll here. Kept as a no-op so the shared
+/// `input::pump` seam and its call sites stay backend-agnostic.
+pub fn pump() {}
 
-pub fn pump() {
-    // Cheap idle path when no device attached.
-    if !with_state(|s| s.attached) {
-        return;
-    }
-    let (addr, ep_addr, mps) =
-        with_state(|s| (s.addr, s.in_ep_addr, s.in_ep_mps));
+/// Harvest and dispatch one touchscreen report from the USB IRQ.
+/// Called from `trap_irq`'s slim USB fast path (ISR context, possibly
+/// nested in an EL2 `with_irqs_unmasked` window). Returns `true` if a
+/// pen sample was enqueued onto the host_io queue, so the caller can
+/// reflect the freshly-raised `INT_TABLET` into the guest's vIRQ on
+/// this same trap exit.
+pub fn on_usb_irq() -> bool {
     let mut buf = [0u8; REPORT_BUF_LEN];
-    // The polled interrupt-IN can burn its full transfer timeout on a
-    // slow / dead panel. `pump` runs from the guest IRQ tail
-    // (`trap::irq_from_guest` via `input::pump`); unmask IRQs around
-    // the transfer so a stalled USB device can't starve the audio ring
-    // or delay CNTHP rearm.
-    let n = match crate::cpu::with_irqs_unmasked(|| {
-        dwc2::with(|host| host.interrupt_in(addr, ep_addr, mps, &mut buf))
-    }) {
-        Ok(n) => {
-            with_state(|s| s.consec_errors = 0);
-            n
-        }
-        // Idle NAK / no data this frame — the normal quiet-panel case.
-        Err(UsbError::Timeout) => {
-            with_state(|s| s.consec_errors = 0);
-            0
-        }
-        // Port down: the panel rebooted out from under us (its USB
-        // hub function dies with it). Detach immediately — every
-        // further attempt against a downed port would burn the full
-        // transfer timeout inside the trap tail and starve the guest.
-        Err(UsbError::NotReady) => {
-            detach("port down (panel reset?)");
-            return;
-        }
-        // Hard wire errors (XACT_ERR after the core's own retries,
-        // babble, AHB): tolerate transients, detach when sustained.
-        Err(e) => {
-            let errs = with_state(|s| {
-                s.consec_errors = s.consec_errors.saturating_add(1);
-                s.consec_errors
-            });
-            if errs >= DETACH_ERROR_THRESHOLD {
-                kprintln!("input-mtouch: {} consecutive errors (last {:?})", errs, e);
-                detach("persistent transfer errors");
-            }
-            return;
-        }
+    let n = match dwc2::service_int_in_irq(&mut buf) {
+        Some(n) => n,
+        None => return false, // NAK / error / not our channel
     };
     if n >= 6 {
-        // First few successful packets get a one-shot byte dump so
-        // we can sanity-check the USB pipe without opting into
-        // log_irqs. Self-throttles after `MAX` reports.
+        // First few reports get a one-shot dump to sanity-check the
+        // IRQ-driven pipe without opting into log_irqs.
         use core::sync::atomic::{AtomicUsize, Ordering};
         static SEEN: AtomicUsize = AtomicUsize::new(0);
         const MAX: usize = 4;
@@ -278,28 +248,13 @@ pub fn pump() {
         }
         decode_and_enqueue(&buf[..n]);
     }
-    // Drain any new events into the host_io queue.
     let mut src = Drain;
-    super::drain_into_queue(&mut src);
-}
-
-/// Declare the device gone and stop polling it. Touch input is lost
-/// until the next boot — hot re-enumeration after the port comes
-/// back is not implemented yet (needs a port reset + address/config
-/// replay; tracked in the change description). The point here is
-/// damage containment: a dead device must not keep consuming
-/// trap-tail time.
-fn detach(why: &str) {
-    with_state(|s| {
-        s.attached = false;
-        s.consec_errors = 0;
-    });
-    kprintln!("input-mtouch: detached — {}", why);
+    super::drain_into_queue(&mut src)
 }
 
 /// Drain adapter — `super::drain_into_queue` wants a `PenSource`
 /// reference; we use a zero-sized type so a fresh one can be made
-/// on every `pump`.
+/// on every harvest.
 struct Drain;
 
 impl PenSource for Drain {

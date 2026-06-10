@@ -69,6 +69,19 @@ pub fn pump() {
     mtouch::pump();
 }
 
+/// Service an interrupt-driven input source from the trap-IRQ path
+/// (ISR context). Returns `true` if a pen sample was enqueued, so the
+/// caller can reflect `INT_TABLET` into the guest's vIRQ on this exit.
+/// A no-op (returns `false`) for backends that don't take IRQs.
+pub fn on_usb_irq() -> bool {
+    #[cfg(nh_input_mtouch)]
+    {
+        return mtouch::on_usb_irq();
+    }
+    #[cfg(not(nh_input_mtouch))]
+    false
+}
+
 /// Helper used by every concrete backend's pump implementation:
 /// pulls events from a `PenSource` until it's empty, tracks the
 /// pen-down edge, and writes the Einstein-format sample pairs onto
@@ -77,13 +90,21 @@ pub fn pump() {
 /// `TScreenManager::PenDown` default pressure is also 4); the
 /// kernel only consults the low 4 bits but specific values can
 /// matter to downstream pen-event handlers.
+///
+/// Returns `true` if at least one pen event was processed — the
+/// caller (the USB-IRQ harvest) uses this to reflect a freshly-raised
+/// `INT_TABLET` into the guest's vIRQ on the current trap exit. A
+/// `Move` arriving while up enqueues nothing, but the resulting
+/// `update_virq` is idempotent, so the slight over-eagerness is safe.
 #[cfg(any(nh_input_mtouch))]
-pub(crate) fn drain_into_queue<P: PenSource>(src: &mut P) {
+pub(crate) fn drain_into_queue<P: PenSource>(src: &mut P) -> bool {
     use core::sync::atomic::{AtomicBool, Ordering};
     use crate::host_io::{pack_pen_sample, queue, PEN_DOWN_SAMPLE_MARKER, PEN_UP_SAMPLE_MARKER};
     static DOWN: AtomicBool = AtomicBool::new(false);
     const PRESSURE: u16 = 4;
+    let mut enqueued = false;
     while let Some(ev) = src.poll() {
+        enqueued = true;
         match ev {
             PenEvent::Down { x, y } => {
                 if !DOWN.swap(true, Ordering::AcqRel) {
@@ -116,6 +137,7 @@ pub(crate) fn drain_into_queue<P: PenSource>(src: &mut P) {
             }
         }
     }
+    enqueued
 }
 
 #[cfg(nh_input_mtouch)]

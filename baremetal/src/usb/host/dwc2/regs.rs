@@ -190,3 +190,11 @@ pub const HCINT_DATA_TGL_ERR: u32 = 1 << 10;
 
 pub const HCTSIZ_PKTCNT_SHIFT: u32 = 19;
 pub const HCTSIZ_PID_SHIFT: u32 = 29; // 00=DATA0, 10=DATA1, 11=MDATA, 11=SETUP for control
+
+// GINTSTS / GINTMSK bits (same bit positions in both). Only the
+// subset the IRQ-driven interrupt-IN path uses. GINTSTS.HCINT is
+// read-only — it reflects the OR of HAINT and clears when the
+// underlying per-channel HCINT bits are cleared (W1C).
+pub const GINTSTS_SOF: u32 = 1 << 3; // Start-of-frame (1 ms FS)
+pub const GINTSTS_PRTINT: u32 = 1 << 24; // Host port status change
+pub const GINTSTS_HCINT: u32 = 1 << 25; // Host channels interrupt (RO)

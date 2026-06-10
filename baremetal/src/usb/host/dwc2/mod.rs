@@ -15,10 +15,12 @@
 //! of subsequent writes (e.g. ULPI_UTMI_SEL has to be cleared after
 //! soft reset, not before, or the PHY clock won't restart).
 //!
-//! Transfer methods (`control_transfer`, `interrupt_in`) are still
-//! stubs — they need the per-channel programming sequence that
-//! lives in Circle's `dwhcxferstagedata.cpp`, which is the next
-//! work item after init proves out on hardware.
+//! `control_transfer` (used during enumeration) is polled. The
+//! touchscreen's interrupt-IN runs IRQ-driven instead: `start_int_in`
+//! arms channel `INT_CH` and enables the core's host-channel IRQ, and
+//! `service_int_in` (called from the trap-IRQ path on BCM2835 GPU
+//! source 9) harvests each report and re-arms. See the "IRQ-driven
+//! interrupt-IN" section below.
 
 pub mod regs;
 
@@ -50,7 +52,23 @@ pub struct Dwc2 {
     /// SETUP, which has its own PID encoding and resets the toggle
     /// implicitly, so they ignore this table.
     int_next_pid: [Pid; 16],
+
+    /// IRQ-driven interrupt-IN endpoint state (the touchscreen). Once
+    /// `start_int_in` arms channel `INT_CH`, the panel's reports arrive
+    /// as USB IRQs (BCM2835 GPU source 9) and are harvested by
+    /// `service_int_in` from the trap-IRQ path — no more polling. Zero
+    /// until armed.
+    int_in_armed: bool,
+    int_in_addr: u8,
+    int_in_ep: u8,
+    int_in_mps: u16,
 }
+
+/// Dedicated host channel for the persistent interrupt-IN. Kept
+/// distinct from channel 0 (which `dma_xfer` uses for control transfers
+/// during enumeration) so a future control transfer can't clobber the
+/// armed touchscreen channel.
+const INT_CH: usize = 1;
 
 impl Dwc2 {
     const fn new(base: usize) -> Self {
@@ -64,6 +82,10 @@ impl Dwc2 {
             // SET_CONFIGURATION the device's toggles all reset to
             // DATA0, so we mirror it host-side.
             int_next_pid: [Pid::Data0; 16],
+            int_in_armed: false,
+            int_in_addr: 0,
+            int_in_ep: 0,
+            int_in_mps: 0,
         }
     }
 
@@ -462,47 +484,6 @@ impl UsbHostController for Dwc2 {
         Ok(bytes_xferred)
     }
 
-    fn interrupt_in(
-        &mut self,
-        addr: u8,
-        ep_addr: u8,
-        max_packet_size: u16,
-        buf: &mut [u8],
-    ) -> UsbResult<usize> {
-        if !self.inited {
-            return Err(UsbError::NotReady);
-        }
-        let ep_num = (ep_addr & 0x0F) as usize;
-        let pid = self.int_next_pid[ep_num];
-        let scratch = scratch_buf();
-        let want = buf.len().min(scratch.len()).min(max_packet_size as usize);
-        let r = self.dma_xfer(
-            addr,
-            ep_num as u8,
-            true, /* IN */
-            EpType::Interrupt,
-            max_packet_size,
-            pid,
-            scratch.as_mut_ptr(),
-            want,
-        );
-        match r {
-            Ok(n) => {
-                buf[..n].copy_from_slice(&scratch[..n]);
-                // Successful transaction: advance the data toggle
-                // exactly as Circle's CUSBEndpoint::SkipPID() does
-                // (one packet completed → flip).
-                self.int_next_pid[ep_num] = match pid {
-                    Pid::Data0 => Pid::Data1,
-                    Pid::Data1 => Pid::Data0,
-                    other => other,
-                };
-                Ok(n)
-            }
-            Err(UsbError::Timeout) => Ok(0), // NAK / FRM_OVRUN — no toggle change
-            Err(e) => Err(e),
-        }
-    }
 }
 
 /// Endpoint type encoded into HCCHAR.EpType[19:18].
@@ -727,6 +708,168 @@ impl Dwc2 {
             Err(e) => Err(e),
         }
     }
+}
+
+// ---- IRQ-driven interrupt-IN (touchscreen) --------------------------
+//
+// Polling the panel from the trap tail captured a report only when the
+// guest happened to trap soon after it arrived; reports landing while
+// the guest ran straight-line code (inker / recognizer) were dropped,
+// breaking strokes. Instead `INT_CH` stays armed and the DWC2 raises a
+// USB IRQ (BCM2835 GPU source 9) on each channel halt, harvested below
+// from the trap-IRQ path the instant it fires.
+
+/// GPU-bus uncached alias the DWC2 AHB master uses to view DRAM (see
+/// `dma_xfer`'s note on HCDMA addressing).
+const GPU_UNCACHED_BASE: u32 = 0xC000_0000;
+
+/// 64-byte DMA landing buffer for the persistent interrupt-IN channel,
+/// cache-line aligned so `dc_civac` maintenance is exact. The channel
+/// DMAs each report here; `service_int_in` invalidates and copies it
+/// out on the channel-halt IRQ.
+#[repr(C, align(64))]
+struct IntInBuf([u8; 64]);
+static mut INT_IN_BUF: IntInBuf = IntInBuf([0; 64]);
+
+#[allow(static_mut_refs)]
+fn int_in_buf_pa() -> u64 {
+    // SAFETY: a single fixed static; the DWC2 channel and the harvest
+    // ISR are its only accessors, in one (interrupt) context.
+    unsafe { core::ptr::addr_of!(INT_IN_BUF.0) as u64 }
+}
+
+impl Dwc2 {
+    /// Switch host-channel interrupts to IRQ delivery and arm a
+    /// persistent interrupt-IN on `INT_CH` for the touchscreen. After
+    /// this the panel's ~16 ms reports arrive as USB IRQs instead of
+    /// being polled. The caller is responsible for enabling BCM2835 GPU
+    /// source 9 so the line reaches the CPU.
+    pub fn start_int_in(&mut self, addr: u8, ep_addr: u8, mps: u16) -> UsbResult<()> {
+        if !self.inited {
+            return Err(UsbError::NotReady);
+        }
+        self.int_in_addr = addr;
+        self.int_in_ep = ep_addr & 0x0F;
+        self.int_in_mps = mps;
+
+        // CHHLTD fires at the end of every transaction (NAK or data) —
+        // our single re-arm point. Route INT_CH up to GINTSTS.HCINT,
+        // unmask HCINT in the core, then enable global IRQ delivery
+        // (init left it off for the polled path).
+        self.write(regs::hcintmsk(INT_CH), regs::HCINT_CHHLTD);
+        self.write(regs::HAINTMSK, 1 << INT_CH);
+        self.modify(regs::GINTMSK, 0, regs::GINTSTS_HCINT);
+        self.modify(regs::GAHBCFG, 0, regs::GAHBCFG_GLOBALINT_MASK);
+
+        self.int_in_armed = true;
+        self.arm_int_in();
+        Ok(())
+    }
+
+    /// (Re-)enable `INT_CH` for one interrupt-IN transaction into
+    /// `INT_IN_BUF`. The core runs it at the next (odd/even) frame and
+    /// halts with CHHLTD on NAK or completion. Maintains the data
+    /// toggle in `int_next_pid`.
+    fn arm_int_in(&mut self) {
+        let ch = INT_CH;
+        let ep = self.int_in_ep as usize;
+        let pid = self.int_next_pid[ep];
+        let mps = self.int_in_mps;
+        let buf_pa = int_in_buf_pa();
+
+        // Force-disable if the channel didn't fully halt from its
+        // previous use (mirrors dma_xfer's CHENA safeguard).
+        let pre = self.read(regs::hcchar(ch));
+        if pre & regs::HCCHAR_CHENA != 0 {
+            self.write(
+                regs::hcchar(ch),
+                (pre & !regs::HCCHAR_CHENA) | regs::HCCHAR_CHDIS,
+            );
+            let _ = self.wait_for_bit(regs::hcint(ch), regs::HCINT_CHHLTD, true, 5);
+        }
+
+        crate::cpu::dc_civac_range(buf_pa, mps.max(1) as usize);
+
+        self.write(regs::hcint(ch), 0xFFFF_FFFF); // clear stale W1C bits
+        self.write(regs::hcintmsk(ch), regs::HCINT_CHHLTD);
+        self.write(regs::hcdma(ch), (buf_pa as u32) | GPU_UNCACHED_BASE);
+        self.write(regs::hcsplt(ch), 0);
+
+        let tsiz = (mps as u32 & 0x7_FFFF)
+            | (1 << regs::HCTSIZ_PKTCNT_SHIFT)
+            | ((pid as u32) << regs::HCTSIZ_PID_SHIFT);
+        self.write(regs::hctsiz(ch), tsiz);
+
+        let mut hcchar = (mps as u32) & regs::HCCHAR_MPS_MASK;
+        hcchar |= ((self.int_in_ep as u32) & 0xF) << regs::HCCHAR_EPNUM_SHIFT;
+        hcchar |= regs::HCCHAR_EPDIR_IN;
+        hcchar |= (EpType::Interrupt as u32 & 0x3) << regs::HCCHAR_EPTYPE_SHIFT;
+        hcchar |= 1 << 20; // MULTI_CNT = 1 (non-iso)
+        hcchar |= ((self.int_in_addr as u32) & 0x7F) << regs::HCCHAR_DEV_ADDR_SHIFT;
+        if self.read(regs::HFNUM) & 1 != 0 {
+            hcchar |= regs::HCCHAR_ODD_FRAME;
+        }
+        hcchar |= regs::HCCHAR_CHENA;
+        self.write(regs::hcchar(ch), hcchar);
+    }
+
+    /// Service a host-channel IRQ on `INT_CH`. Returns `Some(n)` with
+    /// the bytes harvested into `out` when a report completed, else
+    /// `None` (NAK / error / channel not halted). Always re-arms so the
+    /// next report is captured. ISR context.
+    fn service_int_in(&mut self, out: &mut [u8]) -> Option<usize> {
+        let ch = INT_CH;
+        let int = self.read(regs::hcint(ch));
+        if int & regs::HCINT_CHHLTD == 0 {
+            return None; // not our channel's halt
+        }
+        let ep = self.int_in_ep as usize;
+        let mps = self.int_in_mps;
+
+        let mut harvested = None;
+        if int & regs::HCINT_XFER_COMPL != 0 {
+            let remaining = self.read(regs::hctsiz(ch)) & 0x7_FFFF;
+            let n = (mps as u32).saturating_sub(remaining) as usize;
+            if n > 0 {
+                let buf_pa = int_in_buf_pa();
+                crate::cpu::dc_civac_range(buf_pa, n);
+                // SAFETY: INT_IN_BUF holds `n <= mps <= 64` valid bytes.
+                let src = unsafe {
+                    core::slice::from_raw_parts(buf_pa as *const u8, n.min(out.len()))
+                };
+                let take = src.len();
+                out[..take].copy_from_slice(src);
+                harvested = Some(take);
+            }
+            // Completed transaction → advance the data toggle.
+            self.int_next_pid[ep] = match self.int_next_pid[ep] {
+                Pid::Data0 => Pid::Data1,
+                Pid::Data1 => Pid::Data0,
+                other => other,
+            };
+        }
+        // Clear the channel interrupt (W1C); GINTSTS.HCINT clears with
+        // it. Errors (XACT/BBL/AHB/STALL) just fall through to a re-arm
+        // — the panel recovers on its next frame.
+        self.write(regs::hcint(ch), 0xFFFF_FFFF);
+        self.arm_int_in();
+        harvested
+    }
+}
+
+/// Harvest a touchscreen report from the IRQ-driven interrupt-IN
+/// channel, if one completed this IRQ. Trap-IRQ (ISR) context: never
+/// blocks and never runs core init. Returns the bytes copied into
+/// `out`, or `None` for a NAK / error / no-op.
+pub fn service_int_in_irq(out: &mut [u8]) -> Option<usize> {
+    // SAFETY: single-core EL2. In IRQ mode (after `start_int_in`) the
+    // channel and this accessor are the only users of INSTANCE — the
+    // touchscreen no longer polls through `with`.
+    let d = unsafe { &mut *INSTANCE.0.get() };
+    if !d.inited || !d.int_in_armed {
+        return None;
+    }
+    d.service_int_in(out)
 }
 
 /// 1 KiB DMA scratch buffer. Aligned to a cache line so cache

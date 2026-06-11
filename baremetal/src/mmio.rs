@@ -150,7 +150,7 @@ fn in_bio_bank(ipa: u64) -> bool {
     ipa >= BIO_BANK_BASE && ipa < BIO_BANK_END && (ipa & 0x3FF) == 0
 }
 
-pub fn read(ctx: &crate::trap::TrapContext, ipa: u64, sas: u8, elr: u64) -> u32 {
+pub fn read(ctx: &crate::trap_context::TrapContext, ipa: u64, sas: u8, elr: u64) -> u32 {
     // BE-8 (production builds): byte/halfword accesses from the guest
     // land at the natural IPA (the CPU does the byte-lane transform
     // itself). Guest-test builds run the guest LE under the legacy
@@ -201,7 +201,7 @@ pub fn read(ctx: &crate::trap::TrapContext, ipa: u64, sas: u8, elr: u64) -> u32 
 /// Halts loudly on a genuinely-unknown address. `sas` is forwarded for
 /// the guest-test scratch arm (byte-granular storage) and the halt
 /// label; the modelled-register dispatch itself is word-granular.
-fn read_word(ctx: &crate::trap::TrapContext, ipa: u64, elr: u64, sas: u8) -> u32 {
+fn read_word(ctx: &crate::trap_context::TrapContext, ipa: u64, elr: u64, sas: u8) -> u32 {
     match read_word_opt(ctx, ipa, elr, /*advance_serial=*/ true, sas) {
         Some(v) => v,
         None => halt_on_unknown(ctx, "read", ipa, sas, 0, elr),
@@ -217,7 +217,7 @@ fn read_word(ctx: &crate::trap::TrapContext, ipa: u64, elr: u64, sas: u8) -> u32
 /// genuinely-unknown address rather than halting — the caller decides
 /// what to do with an unknown aligned word.
 #[cfg(not(nh_guest_test))]
-fn peek_word(ctx: &crate::trap::TrapContext, ipa: u64, elr: u64) -> Option<u32> {
+fn peek_word(ctx: &crate::trap_context::TrapContext, ipa: u64, elr: u64) -> Option<u32> {
     if let Some(v) = read_word_opt(ctx, ipa, elr, /*advance_serial=*/ false, 2) {
         return Some(v);
     }
@@ -235,7 +235,7 @@ fn peek_word(ctx: &crate::trap::TrapContext, ipa: u64, elr: u64) -> Option<u32> 
 /// (the ROM-serial-chip bit index): `read_word` passes `true`,
 /// `peek_word` passes `false`.
 fn read_word_opt(
-    ctx: &crate::trap::TrapContext,
+    ctx: &crate::trap_context::TrapContext,
     ipa: u64,
     elr: u64,
     advance_serial: bool,
@@ -433,7 +433,7 @@ fn test_scratch_write(ipa: u64, sas: u8, value: u32) {
     }
 }
 
-pub fn write(ctx: &crate::trap::TrapContext, ipa: u64, sas: u8, value: u32, elr: u64) {
+pub fn write(ctx: &crate::trap_context::TrapContext, ipa: u64, sas: u8, value: u32, elr: u64) {
     // BE-8 (production): byte/halfword accesses land at the natural
     // IPA. Splice the sub-word value into the addressed lane of the
     // surrounding word so the peripheral, which dispatches at word-
@@ -713,7 +713,7 @@ fn mask_for_size(value: u32, sas: u8) -> u32 {
 /// in. Extend the peripheral modules (or add a new one) to service
 /// the IPA this halts on.
 fn halt_on_unknown(
-    ctx: &crate::trap::TrapContext,
+    ctx: &crate::trap_context::TrapContext,
     op: &'static str,
     ipa: u64,
     sas: u8,

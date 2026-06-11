@@ -39,7 +39,7 @@
 
 use crate::cpu;
 use crate::kprintln;
-use crate::trap::TrapContext;
+use crate::trap_context::TrapContext;
 
 /// HVC handler for `ALIGN_TAG` (0x13). Called from `handle_hvc` when
 /// the DABT trampoline's alignment-fault fast path fires. Emulates the

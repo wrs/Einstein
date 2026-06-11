@@ -16,7 +16,7 @@
 //! `TNativePrimitives::ExecuteHostCallNative`
 //! (`Emulator/TNativePrimitives.cpp:2515-2882`).
 
-use crate::{cpu, kprintln, trap::TrapContext};
+use crate::{cpu, kprintln, trap_context::TrapContext};
 
 /// Host-call driver class ID in the native-primitive encoding.
 pub const DRIVER_ID: u32 = 0x00_0009;

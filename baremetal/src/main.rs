@@ -45,6 +45,7 @@ mod usb;
 #[cfg(feature = "trace")]
 mod tracer;
 mod trap;
+mod trap_context;
 mod trap_hist;
 pub mod uart;
 mod unaligned;

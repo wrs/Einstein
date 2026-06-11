@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::{audio, cpu, dprintln, kprintln};
 use crate::peripherals::vic;
-use crate::trap::TrapContext;
+use crate::trap_context::TrapContext;
 
 /// Sound-driver class ID in the native-primitive encoding.
 pub const DRIVER_ID: u32 = 0x00_0002;

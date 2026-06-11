@@ -55,7 +55,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use crate::cpu;
 use crate::guest_mem;
 use crate::kprintln;
-use crate::trap::{self, TrapContext};
+use crate::trap;
+use crate::trap_context::TrapContext;
 
 /// Max number of live breakpoints at once.
 pub const TABLE_SIZE: usize = 16;
@@ -114,7 +115,7 @@ static GUEST_BP_FORCE_KEEP: (
     extern "C" fn(u32) -> i32,
     extern "C" fn(u32) -> i32,
     extern "C" fn(),
-    extern "C" fn(u32, &crate::trap::TrapContext),
+    extern "C" fn(u32, &crate::trap_context::TrapContext),
 ) = (install_guest_bp, remove_guest_bp, list_guest_bps, bp_hit_anchor);
 
 /// Stable, gdb-friendly stop point for user-installed guest BPs. Called
@@ -137,7 +138,7 @@ static GUEST_BP_FORCE_KEEP: (
 /// unused-arg might be missing from DWARF at the frame.
 #[no_mangle]
 #[inline(never)]
-pub extern "C" fn bp_hit_anchor(faulting_pc: u32, ctx: &crate::trap::TrapContext) {
+pub extern "C" fn bp_hit_anchor(faulting_pc: u32, ctx: &crate::trap_context::TrapContext) {
     // SAFETY: empty body — the call/return is the entire purpose.
     core::hint::black_box(faulting_pc);
     core::hint::black_box(ctx);

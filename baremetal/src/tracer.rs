@@ -60,7 +60,7 @@
 
 use crate::guest_mem;
 use crate::kprintln;
-use crate::trap::TrapContext;
+use crate::trap_context::TrapContext;
 
 // Symbol-table backing storage lives in `crate::symbols` (always
 // available). Re-export the raw helpers here so the rest of this

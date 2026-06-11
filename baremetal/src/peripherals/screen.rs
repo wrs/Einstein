@@ -32,7 +32,7 @@
 //! no inversion — and `host_io::push_blit` forwards each blit to a
 //! live host viewer for display.
 
-use crate::{cpu, guest_mem, kprintln, peripherals::guest_access, trap::TrapContext};
+use crate::{cpu, guest_mem, kprintln, peripherals::guest_access, trap_context::TrapContext};
 
 /// Screen-class driver ID in the native-primitive encoding.
 pub const DRIVER_ID: u32 = 0x00_0004;

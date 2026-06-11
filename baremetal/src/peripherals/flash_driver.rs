@@ -22,7 +22,7 @@
 //! Writes and erases call into `peripherals::flash` which owns the
 //! backing bytes (same backing stage-2 maps RW).
 
-use crate::{cpu, guest_mem, kprintln, peripherals::flash, peripherals::guest_access, trap::TrapContext};
+use crate::{cpu, guest_mem, kprintln, peripherals::flash, peripherals::guest_access, trap_context::TrapContext};
 
 /// Flash-driver class ID in the native-primitive encoding.
 pub const DRIVER_ID: u32 = 0x00_0000;

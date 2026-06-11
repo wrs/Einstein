@@ -14,7 +14,7 @@
 //!
 //! Logging subfns (0x1A Log) write through to the hypervisor UART.
 
-use crate::{cpu, kprintln, peripherals::guest_access, trap::TrapContext};
+use crate::{cpu, kprintln, peripherals::guest_access, trap_context::TrapContext};
 
 /// Platform-driver class ID in the native-primitive encoding.
 pub const DRIVER_ID: u32 = 0x00_0001;

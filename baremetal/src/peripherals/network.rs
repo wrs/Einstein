@@ -9,7 +9,7 @@
 //! `TNativePrimitives::ExecuteNetworkManagerNative`
 //! (`Emulator/TNativePrimitives.cpp:2889-3151`).
 
-use crate::{cpu, kprintln, peripherals::guest_access, trap::TrapContext};
+use crate::{cpu, kprintln, peripherals::guest_access, trap_context::TrapContext};
 
 /// Network-manager driver class ID in the native-primitive encoding.
 pub const DRIVER_ID: u32 = 0x00_000A;

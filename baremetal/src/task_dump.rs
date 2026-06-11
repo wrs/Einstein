@@ -1310,7 +1310,7 @@ pub fn dump_all_phys() {
 /// task+0x4c is stale for the running task — it only gets written when
 /// the task transitions through SWI/IRQ in EL1, and our trap_irq goes
 /// straight to EL2 instead).
-pub fn periodic(ctx: &crate::trap::TrapContext) -> bool {
+pub fn periodic(ctx: &crate::trap_context::TrapContext) -> bool {
     // Gated on `log_tasks`: the full body of `dump()` +
     // `dump_current_chain()` writes 30+ lines of scheduler /
     // run-queue / call-chain state per fire. Useful for Phase-B
@@ -1364,7 +1364,7 @@ pub fn periodic(ctx: &crate::trap::TrapContext) -> bool {
 /// the gdb-init `ctt <pc>` form does when the user passes `faulting_pc`.
 #[no_mangle]
 #[inline(never)]
-pub extern "C" fn dump_current_chain(ctx: &crate::trap::TrapContext) {
+pub extern "C" fn dump_current_chain(ctx: &crate::trap_context::TrapContext) {
     let elr: u64;
     // SAFETY: reading sysregs has no side effects.
     unsafe {
@@ -1384,7 +1384,7 @@ pub extern "C" fn dump_current_chain(ctx: &crate::trap::TrapContext) {
 /// in SPSR_EL2.
 #[no_mangle]
 #[inline(never)]
-pub extern "C" fn dump_chain_at(ctx: &crate::trap::TrapContext, pc: u32) {
+pub extern "C" fn dump_chain_at(ctx: &crate::trap_context::TrapContext, pc: u32) {
     let spsr: u64;
     // SAFETY: reading sysregs has no side effects.
     unsafe {
@@ -1446,6 +1446,6 @@ pub extern "C" fn dump_chain_at(ctx: &crate::trap::TrapContext, pc: u32) {
 /// in-tree caller at all.
 #[used]
 static DUMP_CHAIN_FORCE_KEEP: (
-    extern "C" fn(&crate::trap::TrapContext),
-    extern "C" fn(&crate::trap::TrapContext, u32),
+    extern "C" fn(&crate::trap_context::TrapContext),
+    extern "C" fn(&crate::trap_context::TrapContext, u32),
 ) = (dump_current_chain, dump_chain_at);

@@ -12,7 +12,7 @@
 //! the ones the protocol defines — matching Einstein's "no real protocol
 //! modelled" stance when no host translator backend is configured.
 
-use crate::{cpu, kprintln, trap::TrapContext};
+use crate::{cpu, kprintln, trap_context::TrapContext};
 
 /// In-translator driver class ID in the native-primitive encoding.
 pub const DRIVER_ID: u32 = 0x00_0007;

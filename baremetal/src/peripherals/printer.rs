@@ -14,7 +14,7 @@
 //! `TNativePrimitives::ExecutePrinterDriverNative`
 //! (`Emulator/TNativePrimitives.cpp:3237-3375`).
 
-use crate::{cpu, kprintln, trap::TrapContext};
+use crate::{cpu, kprintln, trap_context::TrapContext};
 
 /// Printer-driver class ID in the native-primitive encoding.
 pub const DRIVER_ID: u32 = 0x00_000C;

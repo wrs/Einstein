@@ -11,7 +11,7 @@
 //! opcode points exactly at the missing entry, then return r0 = 0 for the
 //! ones the protocol defines.
 
-use crate::{cpu, kprintln, trap::TrapContext};
+use crate::{cpu, kprintln, trap_context::TrapContext};
 
 /// Out-translator driver class ID in the native-primitive encoding.
 pub const DRIVER_ID: u32 = 0x00_0008;

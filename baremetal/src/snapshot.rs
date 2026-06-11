@@ -68,7 +68,7 @@ use core::arch::asm;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{guest_mem, kprintln, trap::TrapContext};
+use crate::{guest_mem, kprintln, trap_context::TrapContext};
 
 // ---- semihosting primitives ---------------------------------------
 

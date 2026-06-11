@@ -30,7 +30,7 @@
 //! on AArch32→AArch64 exception entry are CONSTRAINED UNPREDICTABLE,
 //! so all reads here truncate to `u32`.
 
-use crate::trap::TrapContext;
+use crate::trap_context::TrapContext;
 
 /// AArch32 mode field values (low 5 bits of CPSR / SPSR_EL2).
 pub const MODE_USR: u32 = 0x10;

@@ -20,7 +20,7 @@
 use crate::{cpu, kprintln, peripherals::{
     battery, flash_driver, host_call, in_translator, network, out_translator,
     platform, printer, screen, serial_driver, sound, tablet,
-}, trap::TrapContext};
+}, trap_context::TrapContext};
 
 /// Dispatch a native-primitive call.
 ///

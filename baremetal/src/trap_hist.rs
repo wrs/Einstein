@@ -257,7 +257,7 @@ pub fn dump_and_reset() {
         kprintln!(
             "  EC={:#04x} {}: {}",
             i,
-            crate::trap::describe_ec(i as u32),
+            crate::trap_context::describe_ec(i as u32),
             ec[i]
         );
     }

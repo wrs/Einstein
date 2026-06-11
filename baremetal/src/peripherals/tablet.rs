@@ -15,7 +15,7 @@
 //! when the kernel sets and reads back its own calibration.
 
 use core::cell::UnsafeCell;
-use crate::{cpu, kprintln, peripherals::guest_access, trap::TrapContext};
+use crate::{cpu, kprintln, peripherals::guest_access, trap_context::TrapContext};
 
 /// Tablet-driver class ID in the native-primitive encoding.
 pub const DRIVER_ID: u32 = 0x00_0005;

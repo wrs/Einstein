@@ -71,6 +71,8 @@ pub fn init() {
 /// `vic::raise` when the stereo ring drops below the low-watermark.
 /// Subfn 0x1F.
 pub fn set_interrupt_mask(_input_mask: u32, _output_mask: u32) {
+    #[cfg(nh_audio_null)]
+    null::set_interrupt_mask(_input_mask, _output_mask);
     #[cfg(nh_audio_pi_hdmi)]
     pi_hdmi::set_interrupt_mask(_input_mask, _output_mask);
 }
@@ -79,6 +81,8 @@ pub fn set_interrupt_mask(_input_mask: u32, _output_mask: u32) {
 /// 0x05. Subfn 0x07 later picks one of them by index (`which=0` →
 /// buf1, `which=1` → buf2).
 pub fn set_output_buffers(_buf1_addr: u32, _buf2_addr: u32) {
+    #[cfg(nh_audio_null)]
+    null::set_output_buffers(_buf1_addr, _buf2_addr);
     #[cfg(nh_audio_pi_hdmi)]
     pi_hdmi::set_output_buffers(_buf1_addr, _buf2_addr);
 }
@@ -88,6 +92,8 @@ pub fn set_output_buffers(_buf1_addr: u32, _buf2_addr: u32) {
 /// resample + SPDIF-encode + enqueue. Schedule a buffer-complete IRQ
 /// for when the tail catches up.
 pub fn schedule_output(_which: u32, _byte_count: u32) {
+    #[cfg(nh_audio_null)]
+    null::schedule_output(_which, _byte_count);
     #[cfg(nh_audio_pi_hdmi)]
     pi_hdmi::schedule_output(_which, _byte_count);
 }
@@ -95,6 +101,8 @@ pub fn schedule_output(_which: u32, _byte_count: u32) {
 /// Subfn 0x0D — enable MAI output (audio packets start emitting on
 /// HDMI).
 pub fn start_output() {
+    #[cfg(nh_audio_null)]
+    null::start_output();
     #[cfg(nh_audio_pi_hdmi)]
     pi_hdmi::start_output();
 }
@@ -103,6 +111,8 @@ pub fn start_output() {
 /// clips; without it the HDMI receiver hears whatever residual
 /// samples are in the ring.
 pub fn stop_output() {
+    #[cfg(nh_audio_null)]
+    null::stop_output();
     #[cfg(nh_audio_pi_hdmi)]
     pi_hdmi::stop_output();
 }
@@ -110,6 +120,10 @@ pub fn stop_output() {
 /// Subfn 0x13 — true while [`start_output`] has been called and the
 /// ring isn't yet drained.
 pub fn output_is_running() -> bool {
+    #[cfg(nh_audio_null)]
+    {
+        return null::output_is_running();
+    }
     #[cfg(nh_audio_pi_hdmi)]
     {
         return pi_hdmi::output_is_running();
@@ -126,6 +140,8 @@ pub fn output_is_running() -> bool {
 /// the receiver side handles its own master volume — so muting via
 /// software would just need a tighter loop than this initial cut.
 pub fn output_volume_set(_volume: u32) {
+    #[cfg(nh_audio_null)]
+    null::output_volume_set(_volume);
     #[cfg(nh_audio_pi_hdmi)]
     pi_hdmi::output_volume_set(_volume);
 }
@@ -134,12 +150,28 @@ pub fn output_volume_set(_volume: u32) {
 /// defaulting to `kOutputVolume_Max = 0` if the kernel queried before
 /// it set a value.
 pub fn output_volume_get() -> u32 {
+    #[cfg(nh_audio_null)]
+    {
+        return null::output_volume_get();
+    }
     #[cfg(nh_audio_pi_hdmi)]
     {
         return pi_hdmi::output_volume_get();
     }
     #[allow(unreachable_code)]
     0
+}
+
+/// Per-timer-tick audio pump, called from `trap_irq`'s IRQ tail
+/// (`irq_from_guest`). The null backend uses it to fire armed
+/// buffer-completion IRQs once a buffer's playback duration has
+/// elapsed. The `pi_hdmi` backend drives completion from its own DMA
+/// period IRQ (`on_mai_dma_done`) instead, so this is a no-op there —
+/// audio liveness on real hardware must not depend on trap rate.
+#[inline]
+pub fn tick() {
+    #[cfg(nh_audio_null)]
+    null::tick();
 }
 
 /// DMA period-completion hook for the HDMI MAI TX channel,

@@ -372,55 +372,6 @@ fn irq_from_guest(ctx: &mut TrapContext) {
         }
     }
 
-    // Wedge probe: if the guest's PC parks at the same value across many
-    // consecutive heartbeats AND the int_ctrl mask says sound-DMA IRQs
-    // are enabled (TSoundServer::TheMain has run and registered them),
-    // periodically inject a synthetic sound-DMA-complete IRQ. This
-    // tests the Phase-B hypothesis that the boot wedges after sound
-    // init because the kernel has armed a wait on a sound-DMA IRQ that
-    // we never fire. If the kernel resumes forward progress after
-    // injection, we know the gating factor; we can then move the
-    // injection to a more targeted path (e.g., a real sound-driver
-    // StartOutput emulation).
-    static mut WEDGE_SAME_PC: u64 = 0;
-    static mut WEDGE_LAST_PC: u64 = u64::MAX;
-    static mut WEDGE_INJECT_COUNT: u64 = 0;
-    // SAFETY: single-threaded.
-    unsafe {
-        if elr == WEDGE_LAST_PC {
-            WEDGE_SAME_PC += 1;
-        } else {
-            WEDGE_LAST_PC = elr;
-            WEDGE_SAME_PC = 1;
-        }
-        let int_ctrl = vic::int_ctrl_raw();
-        let sound_armed = (int_ctrl & 0x0000_1400) == 0x0000_1400; // DMA3+DMA5
-        if WEDGE_SAME_PC >= 64 && WEDGE_SAME_PC % 32 == 0 && sound_armed {
-            WEDGE_INJECT_COUNT += 1;
-            let same_pc = WEDGE_SAME_PC;
-            let inject_count = WEDGE_INJECT_COUNT;
-            if inject_count <= 4 {
-                kprintln!(
-                    "wedge-probe: PC={:#x} stuck for {} samples; injecting sound DMA IRQ (#{})",
-                    elr, same_pc, inject_count
-                );
-            }
-            // On the first detection, dump the last 32 UND faulting
-            // PCs AND the kernel task census. The UND history shows
-            // the loop body (the guest PCs that keep UND-trapping —
-            // for the Phase-B sound stall it's a tight SWP-spin
-            // through TULockingSemaphore::Acquire/Release). The task
-            // dump then names the owning task and the semaphore it's
-            // waiting on, so we can identify which kernel object is
-            // never being signalled.
-            if inject_count == 1 {
-                dump_und_history();
-                crate::task_dump::dump();
-            }
-            vic::inject_sound_dma_irq();
-        }
-    }
-
     if !spurious {
         timer::on_irq();
     }
@@ -435,9 +386,13 @@ fn irq_from_guest(ctx: &mut TrapContext) {
     // same queue.
     crate::host_io::pump_input();
     crate::input::pump();
-    // (audio is driven from its own DMA-period IRQ now —
-    // `audio::on_mai_dma_done` — not from this trap tail. See the
-    // trap_sync_lower_aarch32 path for the rationale.)
+    // Audio tick: the null backend fires armed buffer-completion IRQs
+    // here once a scheduled buffer's playback duration has elapsed,
+    // raising the kernel's sound-output interrupt mask. Must run
+    // BEFORE update_virq so a raised IRQ lands in HCR_EL2.VI on this
+    // trap exit. The pi_hdmi backend ignores this and completes from
+    // its own DMA-period IRQ (`audio::on_mai_dma_done`) instead.
+    crate::audio::tick();
     update_virq();
     // Advance the boot-splash progress bar (no-op once the guest's
     // first blit has frozen the splash, and on platforms without

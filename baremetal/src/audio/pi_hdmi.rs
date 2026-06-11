@@ -500,10 +500,10 @@ static MAI_TX_RING: MaiTxRing = MaiTxRing(core::cell::UnsafeCell::new([0u32; MAI
 /// to CB[0]. 32-byte aligned per BCM2835 §4.2.1.1 p.40 (the inner
 /// `DmaCb` carries `#[repr(C, align(32))]`).
 #[repr(C, align(32))]
-struct MaiCbChain([crate::peripherals::host_dma::DmaCb; N_PERIODS]);
+struct MaiCbChain([crate::host_dma::DmaCb; N_PERIODS]);
 
 static mut MAI_TX_CBS: MaiCbChain =
-    MaiCbChain([const { crate::peripherals::host_dma::DmaCb::zero() }; N_PERIODS]);
+    MaiCbChain([const { crate::host_dma::DmaCb::zero() }; N_PERIODS]);
 
 /// Producer cursor in subframes since cyclic-DMA arm. Monotonic u64
 /// (wraps in practice never — 2^64 subframes is millions of years
@@ -598,10 +598,10 @@ pub fn init() {
     // `host_dma::is_mai_ready()` false; the cyclic-arm step below
     // bails too and pump becomes a silent no-op for DMA — the wire
     // stays silent but the rest of the hypervisor runs.
-    if !crate::peripherals::host_dma::init_mai_tx() {
+    if !crate::host_dma::init_mai_tx() {
         kprintln!(
             "audio_pi_hdmi: host_dma::init_mai_tx FAILED (channel {} not enabled by firmware)",
-            crate::peripherals::host_dma::MAI_TX_CHANNEL
+            crate::host_dma::MAI_TX_CHANNEL
         );
     }
     // Build the cyclic CB chain and arm DMA. After this returns
@@ -610,11 +610,11 @@ pub fn init() {
     // the ring contents (real audio over silence, silence over
     // silence) ahead of the consumer pointer.
     if mai_dma_init_cyclic() {
-        let (cs, dbg) = crate::peripherals::host_dma::mai_tx_diag();
+        let (cs, dbg) = crate::host_dma::mai_tx_diag();
         kprintln!(
             "audio_pi_hdmi: cyclic MAI DMA armed ch={} cs={:#x} dbg={:#x} \
              periods={} period_slots={}",
-            crate::peripherals::host_dma::MAI_TX_CHANNEL,
+            crate::host_dma::MAI_TX_CHANNEL,
             cs,
             dbg,
             N_PERIODS,
@@ -1132,7 +1132,7 @@ fn channel_status_bit(frame_idx_in_block: u32) -> u32 {
 /// `false` (without arming) if `host_dma::init_mai_tx` had previously
 /// failed to bring up the channel (firmware reservation, etc.).
 fn mai_dma_init_cyclic() -> bool {
-    use crate::peripherals::host_dma::{
+    use crate::host_dma::{
         self, bus_addr_periph, bus_addr_ram, DmaCb, DREQ_HDMI, TI_DEST_DREQ, TI_INTEN,
         TI_PERMAP_SHIFT, TI_SRC_INC, TI_WAIT_RESP,
     };
@@ -1268,14 +1268,14 @@ pub fn on_mai_dma_done() {
     // right now, i.e. the true current period. Resync forward (the
     // estimate can only lag, never lead) and log loudly — this
     // firing at all means an EL2 stall exceeded one period (~23 ms).
-    let conblk = crate::peripherals::host_dma::mai_tx_conblk();
+    let conblk = crate::host_dma::mai_tx_conblk();
     let actual_period = {
         let mut found = None;
         for i in 0..N_PERIODS {
             // SAFETY: address-of only — single-threaded EL2, and the
             // CB array is never moved after init.
             let cb_addr = unsafe { core::ptr::addr_of!(MAI_TX_CBS.0[i]) } as u64;
-            let cb_bus = crate::peripherals::host_dma::bus_addr_ram(cb_addr);
+            let cb_bus = crate::host_dma::bus_addr_ram(cb_addr);
             if cb_bus == conblk {
                 found = Some(i);
                 break;
@@ -1338,7 +1338,7 @@ pub fn on_mai_dma_done() {
         let queued = head.wrapping_sub(tail);
         let mai_head = MAI_TX_HEAD.load(Ordering::Acquire);
         let consumer = periods_done.saturating_mul(PERIOD_SLOTS as u64);
-        let (dma_cs, dma_dbg) = crate::peripherals::host_dma::mai_tx_diag();
+        let (dma_cs, dma_dbg) = crate::host_dma::mai_tx_diag();
         kprintln!(
             "audio_pi_hdmi: late period {} queued={} MAI_CTL={:#x} dt_us={} ahead={} dma_cs={:#x} dma_dbg={:#x}",
             periods_done,

@@ -82,6 +82,18 @@ pub fn irq_spurious() -> u32 {
     super::gicv3::INTID_SPURIOUS
 }
 
+/// EL2 IRQ-entry dispatch hooks. The FVP host has no BCM2835 DMA engine
+/// or USB touchscreen — those are real-Pi-only — so both are no-ops.
+/// They exist so the IRQ path in `trap` is free of platform cfg blocks
+/// (the BCM2835 versions live in `raspi3b.rs`).
+#[inline]
+pub fn dispatch_dma_completions() {}
+
+#[inline]
+pub fn poll_usb_fast_path() -> super::UsbFastPath {
+    super::UsbFastPath::NotUsb
+}
+
 /// Early per-platform CPU sysreg fixups before we touch anything that
 /// reads them. On FVP with `has_el3=1` (our chosen config — see
 /// `scripts/fvp` and the EL3 stub in `boot.s` for why), CNTFRQ_EL0 is

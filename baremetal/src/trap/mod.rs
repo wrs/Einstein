@@ -153,38 +153,19 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     let aarch32 = (spsr & (1 << 4)) != 0;
     let el2 = !aarch32 && ((spsr & 0b1100) == 0b1000);
 
-    // Slim USB interrupt-IN fast path (real-hw touchscreen). The
-    // IRQ-driven DWC2 channel re-arms every frame, so source 9 fires at
-    // up to ~1 kHz (mostly NAKs) — far above the ~62 Hz the heavy
-    // guest-IRQ body is built for. Harvest the report here, off that
-    // path, regardless of interruptee. Early-return only when USB is the
-    // *sole* cause: the level-triggered CNTHP timer and our DMA channels
-    // must still reach `irq_from_*`, so we check them before skipping.
-    // (CNTHP is level — it simply re-fires if we returned too early — but
-    // we'd then spin here on every USB IRQ and starve it, so test it.)
-    #[cfg(nh_real_hw)]
-    {
-        let pend1 = platform::bcm2835_irq_pending_1();
-        if pend1 & (1 << 9) != 0 {
-            let enqueued = crate::input::on_usb_irq();
-            use crate::peripherals::host_dma;
-            let other_bcm = pend1
-                & ((1 << (16 + host_dma::UART_TX_CHANNEL))
-                    | (1 << (16 + host_dma::MAI_TX_CHANNEL))
-                    | (1 << (16 + host_dma::SD_TX_CHANNEL)));
-            if other_bcm == 0 && !platform::cnthp_irq_pending() {
-                // USB was the only pending source — skip the heavy body.
-                // If a sample was enqueued and we're returning to the
-                // guest, reflect INT_TABLET into HCR_EL2.VI now so the
-                // pen event is delivered on this exit, not the next one.
-                if !el2 && enqueued {
-                    update_virq();
-                }
-                return;
-            }
-            // Other sources co-pending: fall through. The guest path's
-            // tail `update_virq` picks up any sample enqueued above.
+    // Slim USB interrupt-IN fast path (real-hw touchscreen) — the
+    // platform layer owns the BCM2835 pending-register decode and the
+    // pen harvest. When USB was the sole pending source we skip the
+    // heavy body; if a sample was enqueued and we're returning to the
+    // guest, reflect INT_TABLET into HCR_EL2.VI now so the pen event is
+    // delivered on this exit, not the next one. Co-pending sources fall
+    // through to the normal path, whose tail `update_virq` picks up any
+    // harvested sample.
+    if let platform::UsbFastPath::UsbOnly { enqueued } = platform::poll_usb_fast_path() {
+        if !el2 && enqueued {
+            update_virq();
         }
+        return;
     }
 
     if el2 {
@@ -237,21 +218,9 @@ fn irq_from_el2() {
     let spurious = intid == platform::irq_spurious();
 
     // BCM2835 DMA channel dispatch: channel N raises GPU IRQ source
-    // 16+N. UART-TX owns ch 5, MAI-TX owns ch 4.
-    #[cfg(nh_real_hw)]
-    {
-        use crate::peripherals::host_dma;
-        let pend1 = platform::bcm2835_irq_pending_1();
-        for &ch in &[
-            host_dma::UART_TX_CHANNEL,
-            host_dma::MAI_TX_CHANNEL,
-            host_dma::SD_TX_CHANNEL,
-        ] {
-            if pend1 & (1u32 << (16 + ch)) != 0 {
-                host_dma::on_completion(ch);
-            }
-        }
-    }
+    // 16+N. UART-TX owns ch 5, MAI-TX owns ch 4. Platform-owned; a
+    // no-op on FVP and on QEMU raspi3b (no BCM2835 DMA engine there).
+    platform::dispatch_dma_completions();
 
     // CNTHP is level-triggered; not rearming it would storm. Calling
     // it when the real source was a DMA channel is harmless — it is
@@ -282,20 +251,8 @@ fn irq_from_guest(ctx: &mut TrapContext) {
     // the local-peripheral block at 0x4000_0040 and isn't reflected
     // here). DMA channel N raises GPU IRQ source 16+N (Circle's
     // ARM_IRQ_DMA0 = 16). UART-TX owns ch 5, MAI-TX owns ch 4.
-    #[cfg(nh_real_hw)]
-    {
-        use crate::peripherals::host_dma;
-        let pend1 = platform::bcm2835_irq_pending_1();
-        for &ch in &[
-            host_dma::UART_TX_CHANNEL,
-            host_dma::MAI_TX_CHANNEL,
-            host_dma::SD_TX_CHANNEL,
-        ] {
-            if pend1 & (1u32 << (16 + ch)) != 0 {
-                host_dma::on_completion(ch);
-            }
-        }
-    }
+    // Platform-owned; a no-op off real hardware.
+    platform::dispatch_dma_completions();
 
     // Diagnostic heartbeat: sample guest PC so we can see where it's
     // executing when no MMIO traps are firing.

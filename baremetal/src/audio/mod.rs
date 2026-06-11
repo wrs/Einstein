@@ -44,7 +44,7 @@
 //!     is established once and never disturbed.
 //!   - `on_mai_dma_done()` is the audio subsystem's only "tick"
 //!     entry point, fired from the BCM2835 DMA period-completion
-//!     IRQ via `peripherals::host_dma::on_completion`. It refills
+//!     IRQ via `host_dma::on_completion`. It refills
 //!     the cyclic DMA ring with the next period's worth of audio
 //!     (real samples from the stereo ring, or silence between
 //!     clips) and raises the kernel's output IRQ when the stereo
@@ -175,7 +175,7 @@ pub fn tick() {
 }
 
 /// DMA period-completion hook for the HDMI MAI TX channel,
-/// dispatched by `peripherals::host_dma::on_completion`. This is the
+/// dispatched by `host_dma::on_completion`. This is the
 /// audio subsystem's natural tick — the only thing that drives ring
 /// refills and watermark IRQs. There is intentionally no trap-tail
 /// pump entry point: audio liveness must not depend on trap rate,

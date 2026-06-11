@@ -775,7 +775,7 @@ fn finish_save() {
 /// save path so the next tick falls back to the proven FAT writes
 /// rather than retrying a latched-error channel forever.
 fn abort_save() {
-    peripherals::host_dma::sd_tx_abort();
+    crate::host_dma::sd_tx_abort();
     let snap = [
         SAVE_SNAPSHOT[0].load(Ordering::Relaxed),
         SAVE_SNAPSHOT[1].load(Ordering::Relaxed),

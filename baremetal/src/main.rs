@@ -18,6 +18,7 @@ mod guest_bp;
 mod guest_endian;
 mod guest_mem;
 mod heap_check;
+mod host_dma;
 mod host_io;
 mod hvc_imm;
 mod input;

@@ -425,7 +425,7 @@ impl SdHost {
     /// and the command/data sequencing.
     #[cfg(nh_real_hw)]
     pub fn write_block_dma(&self, lba: u32, buf: &[u8; 512]) -> Result<(), CmdError> {
-        use crate::peripherals::host_dma as dma;
+        use crate::host_dma as dma;
         if !dma::init_sd_tx() {
             // Channel not firmware-enabled; caller may fall back to PIO.
             return Err(CmdError::DmaError);
@@ -461,7 +461,7 @@ impl SdHost {
     /// `send_cmd_kind`).
     #[cfg(nh_real_hw)]
     pub fn write_sectors_dma(&self, lba: u32, buf: &[u8]) -> Result<(), CmdError> {
-        use crate::peripherals::host_dma as dma;
+        use crate::host_dma as dma;
         if buf.is_empty() || buf.len() % 512 != 0 {
             return Err(CmdError::DmaError);
         }
@@ -497,7 +497,7 @@ impl SdHost {
     /// `SDHCFG` restored before returning Err.
     #[cfg(nh_real_hw)]
     pub fn start_sectors_dma(&self, lba: u32, buf: &[u8]) -> Result<(), CmdError> {
-        use crate::peripherals::host_dma as dma;
+        use crate::host_dma as dma;
         if buf.is_empty() || buf.len() % 512 != 0 {
             return Err(CmdError::DmaError);
         }
@@ -530,7 +530,7 @@ impl SdHost {
     /// doesn't starve the audio MAI feed / CNTHP rearm while it waits.
     #[cfg(nh_real_hw)]
     pub fn finish_sectors_dma(&self) -> Result<(), CmdError> {
-        use crate::peripherals::host_dma as dma;
+        use crate::host_dma as dma;
         let r = if dma::sd_tx_error() {
             dma::sd_tx_abort();
             Err(CmdError::DmaError)
@@ -555,13 +555,13 @@ impl SdHost {
 /// `static mut`) so taking `&DmaCb` for `arm_sd_tx` doesn't trip the
 /// `static_mut_refs` lint; single-core EL2 makes the aliasing sound.
 #[cfg(nh_real_hw)]
-struct SdTxCbCell(core::cell::UnsafeCell<crate::peripherals::host_dma::DmaCb>);
+struct SdTxCbCell(core::cell::UnsafeCell<crate::host_dma::DmaCb>);
 // SAFETY: single-core EL2; only the SD DMA write paths touch it, serialised.
 #[cfg(nh_real_hw)]
 unsafe impl Sync for SdTxCbCell {}
 #[cfg(nh_real_hw)]
 static SD_TX_CB: SdTxCbCell =
-    SdTxCbCell(core::cell::UnsafeCell::new(crate::peripherals::host_dma::DmaCb::zero()));
+    SdTxCbCell(core::cell::UnsafeCell::new(crate::host_dma::DmaCb::zero()));
 
 /// Build the SD-TX control block for a RAM→`SDDATA` transfer of `len`
 /// bytes from `buf_pa` (RAM, incrementing) into the DREQ-paced FIFO
@@ -571,7 +571,7 @@ static SD_TX_CB: SdTxCbCell =
 /// on `sd_tx_active`.
 #[cfg(nh_real_hw)]
 fn arm_sd_dma(buf_pa: u64, len: u32, inten: bool) {
-    use crate::peripherals::host_dma as dma;
+    use crate::host_dma as dma;
     let sddata_pa = (SDHOST_BASE + SDDATA) as u32;
     let mut ti = (dma::DREQ_SDHOST << dma::TI_PERMAP_SHIFT)
         | dma::TI_SRC_INC
@@ -607,7 +607,7 @@ fn arm_sd_dma(buf_pa: u64, len: u32, inten: bool) {
 /// Err on a latched CS.ERROR, an SDHOST error flag, or a SW timeout.
 #[cfg(nh_real_hw)]
 fn poll_sd_dma_done() -> Result<(), CmdError> {
-    use crate::peripherals::host_dma as dma;
+    use crate::host_dma as dma;
     let mut spins = 0u32;
     loop {
         if !dma::sd_tx_active() {

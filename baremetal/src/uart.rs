@@ -283,7 +283,7 @@ pub fn write_str(s: &str) {
     }
 }
 
-/// DMA-completion hook called from `peripherals::host_dma::on_completion`
+/// DMA-completion hook called from `host_dma::on_completion`
 /// when channel `host_dma::UART_TX_CHANNEL` reports a finished transfer.
 /// Always defined so callers don't need to mirror the cfg.
 #[inline]
@@ -537,7 +537,7 @@ mod tx_dma {
     use core::ptr::addr_of_mut;
     use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-    use crate::peripherals::host_dma::{
+    use crate::host_dma::{
         self, bus_addr_periph, bus_addr_ram, DmaCb, DREQ_UART_TX, TI_DEST_DREQ, TI_INTEN,
         TI_PERMAP_SHIFT, TI_SRC_INC, TI_WAIT_RESP,
     };
@@ -664,7 +664,7 @@ mod tx_dma {
     }
 
     /// Called by the DMA-completion IRQ hook in
-    /// `peripherals::host_dma::on_completion`. Advances `TAIL` by
+    /// `host_dma::on_completion`. Advances `TAIL` by
     /// the just-finished length, and kicks the next contiguous
     /// segment if more bytes are queued.
     pub fn on_done() {

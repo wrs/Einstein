@@ -149,3 +149,73 @@ pub fn cnthp_irq_pending() -> bool {
     // Device-nGnRE via DEVICE_MMIO_1GIB_BLOCK.
     unsafe { core::ptr::read_volatile(BCM2836_CORE0_IRQ_SOURCE) & BCM2836_CNTHPIRQ != 0 }
 }
+
+// ---- EL2 IRQ-entry dispatch (BCM2835 pending-register decode) -------
+//
+// These two functions own the BCM2835-specific pending-register decode
+// that used to be inlined as `#[cfg(nh_real_hw)]` blocks in
+// `trap_irq` / `irq_from_*`. Keeping it here makes the IRQ path in
+// `trap` free of platform cfg blocks: the platform layer (which already
+// owns `irq_ack`/`irq_eoi`) now also owns the host IRQ-controller
+// dispatch. On QEMU raspi3b (semihost, i.e. not `nh_real_hw`) there is
+// no BCM2835 DMA engine to service, so both are no-ops.
+
+/// Drain any completed BCM2835 DMA channels (UART TX ch5, MAI TX ch4,
+/// SD TX) by reading IRQ_PEND_1 and forwarding each pending channel to
+/// `host_dma::on_completion`. Called from both the slim same-EL ISR and
+/// the guest-path IRQ body.
+#[cfg(nh_real_hw)]
+#[inline]
+pub fn dispatch_dma_completions() {
+    use crate::host_dma;
+    let pend1 = bcm2835_irq_pending_1();
+    for &ch in &[
+        host_dma::UART_TX_CHANNEL,
+        host_dma::MAI_TX_CHANNEL,
+        host_dma::SD_TX_CHANNEL,
+    ] {
+        if pend1 & (1u32 << (16 + ch)) != 0 {
+            host_dma::on_completion(ch);
+        }
+    }
+}
+
+#[cfg(not(nh_real_hw))]
+#[inline]
+pub fn dispatch_dma_completions() {}
+
+/// Slim USB interrupt-IN fast path (real-hw touchscreen). The IRQ-driven
+/// DWC2 channel re-arms every frame, so source 9 fires at up to ~1 kHz
+/// (mostly NAKs) — far above the ~62 Hz the heavy guest-IRQ body is
+/// built for. Harvest the report here, off that path, regardless of
+/// interruptee, and report back whether the heavy body can be skipped.
+/// `UsbOnly` is returned only when USB is the *sole* cause: the
+/// level-triggered CNTHP timer and our DMA channels must still reach the
+/// IRQ body, so we check them before signalling a skip. (CNTHP is level
+/// — it simply re-fires if we returned too early — but we'd then spin on
+/// every USB IRQ and starve it, so test it.)
+#[cfg(nh_real_hw)]
+#[inline]
+pub fn poll_usb_fast_path() -> super::UsbFastPath {
+    use crate::host_dma;
+    let pend1 = bcm2835_irq_pending_1();
+    if pend1 & (1 << 9) == 0 {
+        return super::UsbFastPath::NotUsb;
+    }
+    let enqueued = crate::input::on_usb_irq();
+    let other_bcm = pend1
+        & ((1 << (16 + host_dma::UART_TX_CHANNEL))
+            | (1 << (16 + host_dma::MAI_TX_CHANNEL))
+            | (1 << (16 + host_dma::SD_TX_CHANNEL)));
+    if other_bcm == 0 && !cnthp_irq_pending() {
+        super::UsbFastPath::UsbOnly { enqueued }
+    } else {
+        super::UsbFastPath::UsbCoPending
+    }
+}
+
+#[cfg(not(nh_real_hw))]
+#[inline]
+pub fn poll_usb_fast_path() -> super::UsbFastPath {
+    super::UsbFastPath::NotUsb
+}

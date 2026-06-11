@@ -27,3 +27,23 @@ mod imp;
 pub mod gicv3;
 
 pub use imp::*;
+
+/// Outcome of the per-IRQ USB interrupt-IN fast path
+/// (`poll_usb_fast_path`). Lets the EL2 IRQ entry decide whether the
+/// heavy guest-IRQ body can be skipped without the dispatcher knowing
+/// anything about the BCM2835 pending registers.
+///
+/// `UsbOnly` / `UsbCoPending` are constructed only by the `raspi3b.rs`
+/// `nh_real_hw` path; off real hardware `poll_usb_fast_path` always
+/// returns `NotUsb`, so they read as dead there.
+#[allow(dead_code)]
+pub enum UsbFastPath {
+    /// USB source 9 was not pending — take the normal IRQ path.
+    NotUsb,
+    /// USB was the *sole* pending source; the heavy body can be
+    /// skipped. `enqueued` is true if a pen sample was harvested.
+    UsbOnly { enqueued: bool },
+    /// USB was pending but other sources (DMA channels / CNTHP) are
+    /// co-pending — harvest done, but still take the normal path.
+    UsbCoPending,
+}

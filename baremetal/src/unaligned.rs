@@ -93,9 +93,21 @@ pub fn handle_align_fault(ctx: &mut TrapContext) {
     // populates instead — that's AArch32-native stores, reliable on
     // both platforms.
     let lr_abt = ctx.x[20] as u32;
-    let spsr_abt_save = crate::guest_endian::guest_read_u32_pa(
+    // The saved SPSR_abt becomes the ERET target CPSR (mode + Thumb
+    // bit) — a fabricated value would resume the guest in the wrong
+    // mode, so an unreadable slot is a halt, not a default.
+    let spsr_abt_save = match crate::guest_endian::guest_read_u32_pa(
         crate::guest_mem::DABT_SAVE_PA + 0x08,
-    ).unwrap_or(0);
+    ) {
+        Some(v) => v,
+        None => {
+            kprintln!(
+                "*** unaligned: DABT_SAVE SPSR slot @{:#x} unreadable (LR_abt={:#010x}) ***",
+                crate::guest_mem::DABT_SAVE_PA + 0x08, lr_abt,
+            );
+            crate::cpu::halt();
+        }
+    };
     let pre_abt_cpsr = spsr_abt_save;
     let dfar: u64;
     let dfsr_esr: u64;

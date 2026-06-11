@@ -458,7 +458,20 @@ pub fn handle_user_bp_und(
         // word loaded is at faulting_pc + 8 + 40. The ROM literal at
         // 0x142e20 is `0x0c10102c` (a g-pointer constant).
         let lit_addr = faulting_pc.wrapping_add(48);
-        let lit = crate::guest_endian::guest_read_u32_va(lit_addr).unwrap_or(0);
+        // The literal is written back to the guest's r1 (emulating the
+        // displaced `ldr r1, [pc, #40]`) — halt loudly rather than
+        // injecting a fabricated value.
+        let lit = match crate::guest_endian::guest_read_u32_va(lit_addr) {
+            Some(v) => v,
+            None => {
+                kprintln!(
+                    "*** guest_bp: SetCurrentHeap literal @VA={:#010x} unreadable \
+                     (probe PC={:#010x}) ***",
+                    lit_addr, faulting_pc,
+                );
+                crate::cpu::halt();
+            }
+        };
         ctx.x[1] = lit as u64;
         lock();
         // SAFETY: same as above — re-occupy the slot.

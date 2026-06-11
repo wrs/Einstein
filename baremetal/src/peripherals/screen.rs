@@ -351,7 +351,19 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
                 let dst_pix = dst_left as u32 + col_pix;
                 let fb_off = (dst_top as u32 + row) * fb_row_bytes + dst_pix / 4;
                 let fb_ipa = guest_mem::FB_IPA_BASE.wrapping_add(fb_off);
-                let mut fb_byte = guest_mem::read_byte_pa(fb_ipa).unwrap_or(0);
+                // The dst byte feeds the mode-1 max() merge — an
+                // out-of-range dst rect must halt (mirroring the src
+                // read above), not merge against a fabricated 0.
+                let mut fb_byte = match guest_mem::read_byte_pa(fb_ipa) {
+                    Some(b) => b,
+                    None => {
+                        kprintln!(
+                            "*** screen.blit: dst FB IPA {:#x} outside mapped regions",
+                            fb_ipa
+                        );
+                        cpu::halt();
+                    }
+                };
                 let dst_shift = 6 - 2 * (dst_pix & 3) as u8;
                 let dst_mask = 0x3u8 << dst_shift;
                 let cur_dst_2bit = (fb_byte >> dst_shift) & 0x3;

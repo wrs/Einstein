@@ -335,8 +335,21 @@ fn drain_tx_channel(ch_idx: u32) {
     while ch.countdown > 0 {
         // Read one byte at the current PA, push to host UART. The
         // serial DMA buffer is in guest RAM and BE-8 host bytes match
-        // logical byte addresses (see src/guest_endian.rs).
-        let byte = guest_endian::guest_read_u8_pa(ch.data_ptr).unwrap_or(0);
+        // logical byte addresses (see src/guest_endian.rs). A data_ptr
+        // outside guest memory means the kernel armed the channel with
+        // a wild buffer pointer — halt loudly rather than draining
+        // fabricated bytes.
+        let byte = match guest_endian::guest_read_u8_pa(ch.data_ptr) {
+            Some(b) => b,
+            None => {
+                crate::kprintln!(
+                    "*** dma: TX drain ch{} data_ptr={:#010x} outside guest memory \
+                     (buf_start={:#010x} buf_size={:#x} countdown={:#x}) ***",
+                    ch_idx, ch.data_ptr, ch.buf_start, ch.buf_size, ch.countdown,
+                );
+                crate::cpu::halt();
+            }
+        };
         uart::write_byte(byte);
         ch.data_ptr = ch.data_ptr.wrapping_add(1);
         ch.buf_size = ch.buf_size.wrapping_sub(1);

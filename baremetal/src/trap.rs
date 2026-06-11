@@ -900,14 +900,25 @@ fn try_absorb_rom_write(ctx: &mut TrapContext, ipa: u64, elr: u32) -> bool {
             return false;
         }
         let pa = ipa as u32;
-        let value = if b {
-            guest_mem::read_byte_pa(pa).unwrap_or(0) as u32
+        let loaded = if b {
+            guest_mem::read_byte_pa(pa).map(|v| v as u32)
         } else {
             // Plain SWP zero-extends bits[31:0] of the loaded word into
             // Rd; `read_word_pa` already returns a u32 in the guest's
             // little-endian view (matches the BE→LE byteswap done at
             // ROM load time).
-            crate::guest_endian::guest_read_u32_pa(pa).unwrap_or(0)
+            crate::guest_endian::guest_read_u32_pa(pa)
+        };
+        let value = match loaded {
+            Some(v) => v,
+            None => {
+                kprintln!(
+                    "*** try_absorb_rom_write: SWP{} load PA={:#010x} outside guest memory \
+                     (insn={:#010x} @ELR={:#010x}) ***",
+                    if b { "B" } else { "" }, pa, insn, elr,
+                );
+                cpu::halt();
+            }
         };
         ctx.x[rd] = value as u64;
         return true;
@@ -1553,8 +1564,20 @@ fn handle_und(ctx: &mut TrapContext) {
     // need R12 (every Newton 2.x prologue begins `MOV R12, R13`), but
     // doing the restore unconditionally is cheaper than branching on
     // the UDF kind.
-    ctx.x[0] = read_guest_word_pa(UND_SAVE_R0_IPA).unwrap_or(ctx.x[0] as u32) as u64;
-    ctx.x[1] = read_guest_word_pa(UND_SAVE_R1_IPA).unwrap_or(ctx.x[1] as u32) as u64;
+    ctx.x[0] = match read_guest_word_pa(UND_SAVE_R0_IPA) {
+        Some(v) => v as u64,
+        None => {
+            kprintln!("*** handle_und: UND_SAVE_R0 slot @{:#x} unreadable", UND_SAVE_R0_IPA);
+            cpu::halt();
+        }
+    };
+    ctx.x[1] = match read_guest_word_pa(UND_SAVE_R1_IPA) {
+        Some(v) => v as u64,
+        None => {
+            kprintln!("*** handle_und: UND_SAVE_R1 slot @{:#x} unreadable", UND_SAVE_R1_IPA);
+            cpu::halt();
+        }
+    };
     ctx.x[12] = read_sysreg!("tpidr_el0");
 
     // DIAG: prove handle_und is being reached at all. Single-shot log.
@@ -1593,7 +1616,13 @@ fn handle_und(ctx: &mut TrapContext) {
             cpu::halt();
         }
     };
-    let spsr_und = read_guest_word_pa(UND_SAVE_SPSR_IPA).unwrap_or(0) as u64;
+    let spsr_und = match read_guest_word_pa(UND_SAVE_SPSR_IPA) {
+        Some(v) => v as u64,
+        None => {
+            kprintln!("*** handle_und: UND_SAVE_SPSR slot @{:#x} unreadable", UND_SAVE_SPSR_IPA);
+            cpu::halt();
+        }
+    };
     let faulting_pc = lr_und.wrapping_sub(4);
 
     // The faulting PC is a kernel VA (post-MMU); for non-identity-mapped
@@ -3035,9 +3064,22 @@ fn handle_remember_swiret_probe(ctx: &mut TrapContext) {
 }
 
 fn handle_dah_mrs_spsr_patch(ctx: &mut TrapContext) {
-    let spsr_abt_save = crate::guest_endian::guest_read_u32_pa(
+    // The saved SPSR_abt replaces the guest's r1 — a fabricated value
+    // here would silently corrupt the kernel's abort-mode decode, so an
+    // unreadable slot is a halt, not a default.
+    let spsr_abt_save = match crate::guest_endian::guest_read_u32_pa(
         guest_mem::DABT_SAVE_PA + 8,
-    ).unwrap_or(0);
+    ) {
+        Some(v) => v,
+        None => {
+            kprintln!(
+                "*** handle_dah_mrs_spsr_patch: DABT_SAVE SPSR slot @{:#x} unreadable \
+                 (ELR_EL2={:#x}) ***",
+                guest_mem::DABT_SAVE_PA + 8, read_sysreg!("elr_el2"),
+            );
+            cpu::halt();
+        }
+    };
     let lr_abt_save = crate::guest_endian::guest_read_u32_pa(
         guest_mem::DABT_SAVE_PA,
     ).unwrap_or(0);
@@ -3193,7 +3235,21 @@ fn handle_dabt_dispatch(ctx: &mut TrapContext) {
 
     if dfsc == 0x05 || dfsc == 0x07 || dfsc == 0x0D || dfsc == 0x0F {
         let l1_pa = 0x0400_0000u32 + ((far as u32) >> 20) * 4;
-        let l1 = crate::guest_endian::guest_read_u32_pa(l1_pa).unwrap_or(0);
+        // The L1 entry's domain bits are synthesised into the DFSR the
+        // kernel's DataAbortHandler reads — a fabricated entry would
+        // steer the kernel's fault-monitor lookup, so halt loudly if
+        // the table read fails.
+        let l1 = match crate::guest_endian::guest_read_u32_pa(l1_pa) {
+            Some(v) => v,
+            None => {
+                kprintln!(
+                    "*** handle_dabt_dispatch: L1 entry @PA={:#010x} unreadable \
+                     (FAR={:#010x} DFSC={:#x} ELR_EL2={:#x}) ***",
+                    l1_pa, far as u32, dfsc, read_sysreg!("elr_el2"),
+                );
+                cpu::halt();
+            }
+        };
         let l1_domain = (l1 >> 5) & 0xF;
         let mut dfsr_el1: u64;
         // SAFETY: sysreg read of DFSR_EL1 (= ESR_EL1's AArch32 alias
@@ -3943,7 +3999,21 @@ fn log_guest_string(prefix: &'static str, addr: u32) {
 fn scan_to_null_word_aligned(start: u32, max_words: u32) -> u32 {
     let mut va = start & !0x3;
     for _ in 0..max_words {
-        let w = read_guest_word_pa(va).unwrap_or(0);
+        // The scan result becomes the guest's resume PC (the word after
+        // the DebuggerUND payload's terminator) — fabricating a
+        // terminator at an unreadable word would resume at a wrong PC,
+        // so halt loudly instead.
+        let w = match read_guest_word_pa(va) {
+            Some(v) => v,
+            None => {
+                kprintln!(
+                    "*** scan_to_null_word_aligned: PA={:#010x} unreadable \
+                     (scan started at {:#010x}) ***",
+                    va, start,
+                );
+                cpu::halt();
+            }
+        };
         // The ROM is stored big-endian (original 1990s Newton bytes)
         // and our load_rom byteswaps each word so LDR in our LE guest
         // returns the same u32 the original BE CPU saw. That means a

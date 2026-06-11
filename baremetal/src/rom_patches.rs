@@ -876,7 +876,14 @@ pub unsafe fn apply_717006_patches(rom_ptr: *mut u32) {
         apply_storeperm_loadperm_probes(rom_ptr);
     }
 
-    kprintln!("rom_patch: applied {} simple patches + 5 native-call/injection ROM patches + PowerOffAndReboot + Reboot + BootOS + load-bearing HVC patches + fault-handler LDR byteswap stubs", applied);
+    // The loud-halt canaries (StopImage/Reboot/PowerOffAndReboot/
+    // busError) are dev-only — absent under no-semihost — so the
+    // summary names them only when they were actually installed.
+    #[cfg(nh_loud_halt_canaries)]
+    const CANARIES: &str = " + loud-halt canaries";
+    #[cfg(not(nh_loud_halt_canaries))]
+    const CANARIES: &str = "";
+    kprintln!("rom_patch: applied {} simple patches + 5 native-call/injection ROM patches{} + BootOS + load-bearing HVC patches + fault-handler LDR byteswap stubs", applied, CANARIES);
 }
 
 

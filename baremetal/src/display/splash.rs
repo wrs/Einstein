@@ -10,9 +10,9 @@
 //!
 //! The splash owns the [`FbInfo`] for the rest of the run; the
 //! `host_io::pi_fb` backend picks it up via [`fb_info`] and reuses it
-//! for guest blits. The first guest blit calls [`freeze`], after which
-//! `update_progress` becomes a no-op — Newton's UI is what the user
-//! sees from then on.
+//! for guest blits. The first guest blit (via [`take_first_blit`])
+//! sets the frozen flag, after which `update_progress` becomes a
+//! no-op — Newton's UI is what the user sees from then on.
 //!
 //! Logo source: `assets/splash_logo.ppm` (P6, 8 bpc RGB). `build.rs`
 //! converts it to a raw RGB blob in OUT_DIR; missing file => zero-size
@@ -145,18 +145,11 @@ pub fn fb_info() -> Option<&'static FbInfo> {
     unsafe { FB.as_ref() }
 }
 
-/// Mark the splash as done; subsequent `update_progress` calls are
-/// no-ops. Called from `host_io::pi_fb` on the first guest blit so the
-/// bar doesn't repaint over Newton's UI.
-pub fn freeze() {
-    FROZEN.store(true, Ordering::Relaxed);
-}
-
 /// Returns `true` exactly once: the first call after `init` has run
-/// and `freeze` has not yet been called. Sets the frozen flag as a
-/// side-effect. Used by `host_io::pi_fb::push_blit` to detect the
-/// hand-off from splash to guest UI and trigger a one-shot panel
-/// blank.
+/// while the splash is not yet frozen. Sets the frozen flag as a
+/// side-effect (so the bar doesn't repaint over Newton's UI). Used by
+/// `host_io::pi_fb::push_blit` to detect the hand-off from splash to
+/// guest UI and trigger a one-shot panel blank.
 pub fn take_first_blit() -> bool {
     if !INIT_DONE.load(Ordering::Relaxed) {
         return false;
@@ -166,7 +159,7 @@ pub fn take_first_blit() -> bool {
 
 /// Update the white-fill width based on `traps`. Cheap to call on
 /// every timer IRQ: paints at most `target - BAR_FILLED` pixels and
-/// flushes only the bar rows. No-op once `freeze` has been called.
+/// flushes only the bar rows. No-op once the splash is frozen.
 /// Trap progress drives only the upper segment of the bar
 /// (`LOAD_BAR_W..BAR_W`); the lower segment is owned by
 /// [`set_load_progress`].

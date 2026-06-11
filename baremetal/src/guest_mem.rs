@@ -997,6 +997,7 @@ pub fn dump_stage1_walk(va: u32) {
 /// has weird bookkeeping bits set" — we want to see whether the
 /// neighbours are coarse / section / fault, and what the lazy-state
 /// pattern looks like across a kernel-allocated VA range.
+#[cfg(feature = "log_mmu")]
 pub fn dump_l1_neighbourhood(va: u32) {
     let ram = addr_of_mut!(GUEST_RAM) as *const u32;
     let centre = (va >> 20) as i32;
@@ -1015,6 +1016,7 @@ pub fn dump_l1_neighbourhood(va: u32) {
 /// assume lives at the start of guest RAM (TTBR0 = 0x0400_0000 per the
 /// 717006 probe; stage-2 maps that IPA to the host ram backing). Each
 /// entry covers 1 MiB of VA, so this is the VA 0..32 MiB window.
+#[cfg(feature = "log_mmu")]
 pub fn dump_guest_l1_table() {
     let ram = addr_of_mut!(GUEST_RAM) as *const u32;
     let rom = addr_of_mut!(GUEST_ROM) as *const u32;

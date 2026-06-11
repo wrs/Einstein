@@ -72,13 +72,17 @@ pub struct PenEvent {
     pub pressure: u16,
 }
 
+#[cfg(nh_host_io_semihost)]
 pub const PEN_DOWN: u8 = 1;
+#[cfg(nh_host_io_semihost)]
 pub const PEN_MOVE: u8 = 2;
+#[cfg(nh_host_io_semihost)]
 pub const PEN_UP: u8 = 3;
 /// Power-switch press from the host viewer. `x`, `y`, `pressure` are
 /// ignored. Wakes the guest from PowerOff state via
 /// `peripherals::vic::raise_power_switch` — equivalent to Einstein's
 /// `TPlatformManager::SendPowerSwitchEvent` when the system is off.
+#[cfg(nh_host_io_semihost)]
 pub const POWER_SWITCH: u8 = 4;
 
 const _: () = {
@@ -180,6 +184,9 @@ fn current_fb_bytes() -> &'static [u8] {
 /// Encode pen event into Einstein's packed sample format. Mirrors
 /// `TScreenManager::PenDown` in `Emulator/Screen/TScreenManager.cpp`:
 /// `((x & 0x7FF) << 21) | ((y & 0x7FF) << 7) | (pressure & 0x0F)`.
+/// Compiled only for the two pen-event producers (the semihost
+/// host-IO backend and the mtouch input backend).
+#[cfg(any(nh_host_io_semihost, nh_input_mtouch))]
 pub fn pack_pen_sample(x: u16, y: u16, pressure: u16) -> u32 {
     ((x as u32 & 0x7FF) << 21) | ((y as u32 & 0x7FF) << 7) | (pressure as u32 & 0x0F)
 }
@@ -187,5 +194,7 @@ pub fn pack_pen_sample(x: u16, y: u16, pressure: u16) -> u32 {
 /// Einstein's `kPenDownSample` / `kPenUpSample` markers from
 /// `TScreenManager.cpp:932-940` — inserted before a x/y packed sample
 /// at the pen-down edge / on pen-up.
+#[cfg(any(nh_host_io_semihost, nh_input_mtouch))]
 pub const PEN_DOWN_SAMPLE_MARKER: u32 = 0x0000_000D;
+#[cfg(any(nh_host_io_semihost, nh_input_mtouch))]
 pub const PEN_UP_SAMPLE_MARKER: u32 = 0x0000_000E;

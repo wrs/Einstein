@@ -148,6 +148,8 @@ pub fn dc_civac_range(va: u64, len: usize) {
 /// USB 2.0 `tDRSTR` = 50 ms after asserting port reset). The timer
 /// is always running by the time anything calls this — `boot.s`
 /// programs `CNTFRQ_EL0` and the generic timer is on out of reset.
+/// The USB stack is its only consumer, so it's gated with it.
+#[cfg(nh_input_mtouch)]
 pub fn delay_ms(ms: u32) {
     let freq: u64;
     let start: u64;

@@ -489,8 +489,7 @@ Gotchas:
 
 Debug facility: `uart::write_str_polled` + `raw_print!` /
 `raw_println!` bypass the ring via busy-wait — for when the DMA path
-itself is suspect; `host_dma::uart_tx_diag()` gives a `(CS, DEBUG)`
-snapshot.
+itself is suspect.
 
 Scoped to `cfg(all(no-semihost, platform-raspi3b))`; QEMU
 (semihosting) and FVP paths are unchanged.

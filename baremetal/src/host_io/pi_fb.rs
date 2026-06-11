@@ -95,7 +95,8 @@ pub fn init() {
     // kmain) already allocated the framebuffer, painted the
     // background + logo + progress bar, and flushed. We adopt its
     // FbInfo so we don't double-allocate and so the splash stays
-    // visible until the guest's first blit triggers `splash::freeze`.
+    // visible until the guest's first blit freezes the splash
+    // (`splash::take_first_blit`).
     let info = match crate::display::splash::fb_info() {
         Some(i) => *i,
         None => {
@@ -279,13 +280,17 @@ pub fn pump_input() {
     // No input source on this backend directly; see `input::mtouch`.
 }
 
-/// Panel pixel dimensions, or `None` if init didn't run.
+/// Panel pixel dimensions, or `None` if init didn't run. Only the
+/// mtouch calibration transform consumes the painted-geometry
+/// helpers below.
+#[cfg(nh_input_mtouch)]
 pub fn panel_size() -> Option<(u32, u32)> {
     fb().map(|f| (f.width, f.height))
 }
 
 /// Top-left of the painted Newton region inside the panel, in panel
 /// pixels.
+#[cfg(nh_input_mtouch)]
 pub fn painted_offset() -> (usize, usize) {
     (
         OFFSET_X.load(Ordering::Relaxed) as usize,
@@ -295,6 +300,7 @@ pub fn painted_offset() -> (usize, usize) {
 
 /// Painted Newton region size in panel pixels (after aspect-
 /// preserving bilinear scale of the 320×480 Newton surface).
+#[cfg(nh_input_mtouch)]
 pub fn painted_size() -> (u32, u32) {
     (
         PAINTED_W.load(Ordering::Relaxed),

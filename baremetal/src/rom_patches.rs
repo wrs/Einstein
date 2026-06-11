@@ -1515,7 +1515,9 @@ unsafe fn apply_bootos_trap(rom_ptr: *mut u32) {
 /// `newton-objects`, emulates the original `mov ip, sp` (writes
 /// `ctx.x[12] = source-mode SP`), and advances ELR past the HVC so
 /// the function's prologue picks up at instruction 2 (`push {…}`).
+#[cfg(feature = "log_store")]
 const STORE_PERM_OBJECT_PC: u32 = 0x002D_F998;
+#[cfg(feature = "log_store")]
 const STORE_PERM_OBJECT_ORIG_INSN: u32 = 0xE1A0_C00D;
 
 /// `mov r0, r4` immediately before `LoadPermObject`'s `ldmdb`
@@ -1527,7 +1529,9 @@ const STORE_PERM_OBJECT_ORIG_INSN: u32 = 0xE1A0_C00D;
 /// returned. Handler emulates `r0 = r4` (R0 and R4 are unbanked
 /// across USR/UND so a direct `ctx.x[0] = ctx.x[4]` is correct in
 /// either dispatch path) and advances ELR.
+#[cfg(feature = "log_store")]
 const LOAD_PERM_OBJECT_RET_PC: u32 = 0x002D_F4C0;
+#[cfg(feature = "log_store")]
 const LOAD_PERM_OBJECT_RET_ORIG_INSN: u32 = 0xE1A0_0004;
 
 /// Install the StorePermObject entry probe + LoadPermObject

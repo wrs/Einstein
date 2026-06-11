@@ -149,6 +149,8 @@ pub fn output_volume_get() -> u32 {
 /// pump entry point: audio liveness must not depend on trap rate,
 /// which other hypervisor work is trying to reduce. The shape
 /// matches Linux's `vchan_cyclic_callback` in `bcm2835-dma.c`.
+/// Compiled exactly where its only caller — `host_dma` — is.
+#[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
 #[inline]
 pub fn on_mai_dma_done() {
     #[cfg(nh_audio_pi_hdmi)]

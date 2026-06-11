@@ -42,12 +42,14 @@
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+#[cfg(feature = "log_traps")]
 use crate::hvc_imm::HvcImm;
 use crate::kprintln;
 
 const EC_BUCKETS: usize = 64;
 const HVC_BUCKETS: usize = 256;
 const TOPK: usize = 16;
+#[cfg(feature = "log_traps")]
 const PRINT_TOP: usize = 8;
 
 /// Number of sync traps to ignore at the start of a run before any
@@ -146,6 +148,7 @@ impl TopK {
         }
     }
 
+    #[cfg(feature = "log_traps")]
     fn snapshot_sorted(&self) -> [(u32, u64); TOPK] {
         let mut out = [(0u32, 0u64); TOPK];
         for i in 0..TOPK {
@@ -163,6 +166,7 @@ impl TopK {
         out
     }
 
+    #[cfg(feature = "log_traps")]
     fn reset(&mut self) {
         for i in 0..TOPK {
             self.keys[i] = 0;
@@ -220,7 +224,9 @@ pub fn record_fp_simd(elr_pc: u32) {
 }
 
 /// Snapshot every counter, print the top entries, and zero everything
-/// so the next dump shows a fresh window.
+/// so the next dump shows a fresh window. Only the `log_traps`
+/// histogram dump in `trap_irq` calls this.
+#[cfg(feature = "log_traps")]
 pub fn dump_and_reset() {
     if !is_warm() {
         // Still inside the warmup window — nothing to dump.
@@ -413,6 +419,7 @@ pub fn dump_and_reset() {
 
 /// Map an HVC immediate to its `HvcImm` variant name, or `"?"` if
 /// unknown (e.g. a guest-test imm in a non-test build or a stale slot).
+#[cfg(feature = "log_traps")]
 fn hvc_imm_name(imm: u32) -> &'static str {
     match imm {
         v if v == HvcImm::GuestTestPrintByte as u32 => "GuestTestPrintByte",
@@ -452,6 +459,7 @@ fn hvc_imm_name(imm: u32) -> &'static str {
 /// Coarse peripheral / memory-region label for an IPA. Hot Voyager
 /// MMIO registers from `peripherals/vic.rs` get their own name; the
 /// rest collapse to a region.
+#[cfg(feature = "log_traps")]
 fn describe_ipa(ipa: u32) -> &'static str {
     match ipa & !0x3FF {
         0x0F18_1000 => "Calendar",
@@ -475,6 +483,7 @@ fn describe_ipa(ipa: u32) -> &'static str {
     }
 }
 
+#[cfg(feature = "log_traps")]
 fn region(ipa: u32) -> &'static str {
     match ipa {
         0x0000_0000..=0x00FF_FFFF => "ROM",
@@ -492,6 +501,7 @@ fn region(ipa: u32) -> &'static str {
 /// only the 15 tuples enumerated in `probe/FINDINGS.md §16.4`; this
 /// covers the ones `handle_cp15_trap` dispatches on plus a few extras
 /// that the kernel issues but the handler treats as a single group.
+#[cfg(feature = "log_traps")]
 fn describe_cp15(opc1: u32, crn: u32, crm: u32, opc2: u32, is_read: bool) -> &'static str {
     match (opc1, crn, crm, opc2, is_read) {
         (0, 1, 0, 0, false) => "SCTLR write",

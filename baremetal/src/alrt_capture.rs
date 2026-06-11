@@ -23,7 +23,6 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use crate::kprintln;
 
 /// PA of the watched page (VA `0x0cca3000`, which holds the alrt
 /// task's TAlertEventHandler at `0x0cca37a8` and its CList header at

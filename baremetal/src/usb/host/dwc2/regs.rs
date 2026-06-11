@@ -10,10 +10,6 @@
 
 // ---- Core global registers (GLOBAL block, offset 0x000..0x040) ----
 
-/// OTG Control and Status.
-pub const GOTGCTL: usize = 0x000;
-/// OTG Interrupt Status.
-pub const GOTGINT: usize = 0x004;
 /// AHB Configuration. Bit 0 = global interrupt mask (we leave 0 for
 /// polling).
 pub const GAHBCFG: usize = 0x008;
@@ -22,29 +18,18 @@ pub const GAHBCFG: usize = 0x008;
 pub const GUSBCFG: usize = 0x00C;
 /// Core Reset. Bit 0 = CSftRst, bit 31 = AHBIdle.
 pub const GRSTCTL: usize = 0x010;
-/// Core Interrupt Status (write-1-to-clear).
-pub const GINTSTS: usize = 0x014;
 /// Core Interrupt Mask. Polling — kept 0 except for the bits we sample.
 pub const GINTMSK: usize = 0x018;
-/// Receive Status Read (debug).
-pub const GRXSTSR: usize = 0x01C;
-/// Receive Status Read + pop.
-pub const GRXSTSP: usize = 0x020;
 /// Receive FIFO Size (in dwords).
 pub const GRXFSIZ: usize = 0x024;
 /// Non-periodic Transmit FIFO Size: low half = StartAddr, high =
 /// Depth.
 pub const GNPTXFSIZ: usize = 0x028;
-/// Non-periodic Transmit FIFO/Queue Status.
-pub const GNPTXSTS: usize = 0x02C;
 /// SNPS Identification — reads e.g. 0x4F54_280A on BCM2710.
 pub const GSNPSID: usize = 0x040;
-/// User HW Config 1..4 (channel count, FIFO depths, etc.). HWCFG2's
-/// bits 17:14 = num host channels - 1.
-pub const GHWCFG1: usize = 0x044;
+/// User HW Config 2 (channel count, FIFO depths, etc.): bits
+/// 17:14 = num host channels - 1.
 pub const GHWCFG2: usize = 0x048;
-pub const GHWCFG3: usize = 0x04C;
-pub const GHWCFG4: usize = 0x050;
 /// Host periodic Transmit FIFO Size.
 pub const HPTXFSIZ: usize = 0x100;
 
@@ -57,8 +42,6 @@ pub const HCFG: usize = 0x400;
 pub const HFIR: usize = 0x404;
 /// Host Frame Number / Frame Time Remaining.
 pub const HFNUM: usize = 0x408;
-/// Host All Channels Interrupt.
-pub const HAINT: usize = 0x414;
 /// Host All Channels Interrupt Mask.
 pub const HAINTMSK: usize = 0x418;
 /// Host Port Control and Status (HPRT). Important bits:
@@ -98,13 +81,6 @@ pub const fn hcdma(ch: usize) -> usize {
     0x514 + ch * 0x20
 }
 
-/// Per-channel FIFO push/pop area. Each channel has a 4 KiB
-/// aperture; we only ever touch dwords [0..n] of channel n.
-#[inline]
-pub const fn dfifo(ch: usize) -> usize {
-    0x1000 + ch * 0x1000
-}
-
 // ---- Power and clock gating ----
 
 /// PCGCCTL — Power & Clock Gating Control. Setting any bit gates
@@ -129,30 +105,23 @@ pub const GAHBCFG_DMA_ENABLE: u32 = 1 << 5;
 // GUSBCFG bits — Circle `dwhci.h`. PHYIF is bit 3, ULPI_UTMI_SEL bit 4.
 pub const GUSBCFG_PHYIF: u32 = 1 << 3;
 pub const GUSBCFG_ULPI_UTMI_SEL: u32 = 1 << 4;
-pub const GUSBCFG_PHY_SEL_FS: u32 = 1 << 6;
 pub const GUSBCFG_SRP_CAPABLE: u32 = 1 << 8;
 pub const GUSBCFG_HNP_CAPABLE: u32 = 1 << 9;
-pub const GUSBCFG_TRDT_SHIFT: u32 = 10;
-pub const GUSBCFG_TRDT_MASK: u32 = 0xF << GUSBCFG_TRDT_SHIFT;
 pub const GUSBCFG_ULPI_FSLS: u32 = 1 << 17;
 pub const GUSBCFG_ULPI_CLK_SUS_M: u32 = 1 << 19;
 pub const GUSBCFG_ULPI_EXT_VBUS_DRV: u32 = 1 << 20;
 pub const GUSBCFG_TERM_SEL_DL_PULSE: u32 = 1 << 22;
-pub const GUSBCFG_FORCEHOSTMODE: u32 = 1 << 29;
-pub const GUSBCFG_FORCEDEVMODE: u32 = 1 << 30;
 
 // HCFG.FSLSPClkSel — bits[1:0]: 0=30/60 MHz (HS/FS, UTMI+),
 // 1=48 MHz (FS-only ULPI), 2=6 MHz (low-speed ULPI).
 pub const HCFG_FSLSPCLK_SEL_MASK: u32 = 0x3;
 pub const HCFG_FSLSPCLK_SEL_30_60M: u32 = 0;
 pub const HCFG_FSLSPCLK_SEL_48M: u32 = 1;
-pub const HCFG_FSLSSUPP: u32 = 1 << 2;
 
 pub const HPRT_PRT_CONN_STS: u32 = 1 << 0;
 pub const HPRT_PRT_CONN_DET: u32 = 1 << 1; // W1C
 pub const HPRT_PRT_ENA: u32 = 1 << 2;
 pub const HPRT_PRT_ENCHNG: u32 = 1 << 3; // W1C
-pub const HPRT_PRT_OVRCURR_ACT: u32 = 1 << 4;
 pub const HPRT_PRT_OVRCURR_CHNG: u32 = 1 << 5; // W1C
 pub const HPRT_PRT_RST: u32 = 1 << 8;
 pub const HPRT_PRT_PWR: u32 = 1 << 12;
@@ -169,7 +138,6 @@ pub const HPRT_W1C: u32 =
 pub const HCCHAR_MPS_MASK: u32 = 0x7FF;
 pub const HCCHAR_EPNUM_SHIFT: u32 = 11;
 pub const HCCHAR_EPDIR_IN: u32 = 1 << 15;
-pub const HCCHAR_LOW_SPEED: u32 = 1 << 17;
 pub const HCCHAR_EPTYPE_SHIFT: u32 = 18; // 0=Ctrl,1=Iso,2=Bulk,3=Intr
 pub const HCCHAR_DEV_ADDR_SHIFT: u32 = 22;
 pub const HCCHAR_ODD_FRAME: u32 = 1 << 29;
@@ -180,13 +148,8 @@ pub const HCINT_XFER_COMPL: u32 = 1 << 0;
 pub const HCINT_CHHLTD: u32 = 1 << 1;
 pub const HCINT_AHBERR: u32 = 1 << 2;
 pub const HCINT_STALL: u32 = 1 << 3;
-pub const HCINT_NAK: u32 = 1 << 4;
-pub const HCINT_ACK: u32 = 1 << 5;
-pub const HCINT_NYET: u32 = 1 << 6;
 pub const HCINT_XACT_ERR: u32 = 1 << 7;
 pub const HCINT_BBL_ERR: u32 = 1 << 8;
-pub const HCINT_FRM_OVRUN: u32 = 1 << 9;
-pub const HCINT_DATA_TGL_ERR: u32 = 1 << 10;
 
 pub const HCTSIZ_PKTCNT_SHIFT: u32 = 19;
 pub const HCTSIZ_PID_SHIFT: u32 = 29; // 00=DATA0, 10=DATA1, 11=MDATA, 11=SETUP for control
@@ -195,6 +158,4 @@ pub const HCTSIZ_PID_SHIFT: u32 = 29; // 00=DATA0, 10=DATA1, 11=MDATA, 11=SETUP 
 // subset the IRQ-driven interrupt-IN path uses. GINTSTS.HCINT is
 // read-only — it reflects the OR of HAINT and clears when the
 // underlying per-channel HCINT bits are cleared (W1C).
-pub const GINTSTS_SOF: u32 = 1 << 3; // Start-of-frame (1 ms FS)
-pub const GINTSTS_PRTINT: u32 = 1 << 24; // Host port status change
 pub const GINTSTS_HCINT: u32 = 1 << 25; // Host channels interrupt (RO)

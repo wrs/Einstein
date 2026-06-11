@@ -42,11 +42,10 @@ pub trait UsbHostController {
     ///   first GET_DESCRIPTOR(Device, 8) before SET_ADDRESS uses
     ///   `8` as a safe lower bound.
     /// - `setup` is the 8-byte Setup stage packet.
-    /// - `data_in` (if `setup.bm_request_type` is IN) is filled with
-    ///   the device's reply; the number of bytes actually returned
-    ///   is the return value.
-    /// - `data_out` (if direction is OUT and there's a data stage) is
-    ///   sent verbatim.
+    /// - `data` (for an IN data stage) is filled with the device's
+    ///   reply; the number of bytes actually returned is the return
+    ///   value. None of the requests we issue carries an OUT data
+    ///   stage, so there is no OUT buffer variant.
     ///
     /// Returns `Ok(bytes_transferred)` on success.
     fn control_transfer(
@@ -64,6 +63,4 @@ pub enum ControlData<'a> {
     None,
     /// IN: buffer is filled by the device.
     In(&'a mut [u8]),
-    /// OUT: bytes are sent to the device.
-    Out(&'a [u8]),
 }

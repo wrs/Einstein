@@ -33,7 +33,6 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use crate::kprintln;
 
 /// The three Group-1 PAs (kernel-globals self-mapping). Held as a
 /// fixed array so `is_armed_pa` is a 3-comparison hot path.

@@ -305,7 +305,10 @@ static POWERED_OFF: AtomicBool = AtomicBool::new(false);
 /// enabled, raises `kGPIOIntMask` so the kernel sees it. We additionally
 /// set `WAKE_REQUEST` so `pause_system` returns to the guest — `kGPIOIntMask`
 /// is not in `kPowerOffMask` (0x0C400000), so the IRQ would otherwise stay
-/// invisible while the system is in PowerOff state.
+/// invisible while the system is in PowerOff state. Compiled only for
+/// the two transports that deliver power-switch presses (the semihost
+/// host viewer and the mtouch first-tap-wakes hack).
+#[cfg(any(nh_host_io_semihost, nh_input_mtouch))]
 pub fn raise_power_switch() {
     // SAFETY: single-threaded.
     let s = unsafe { &mut *VIC.0.get() };
@@ -328,7 +331,9 @@ pub fn set_powered_off(v: bool) {
     POWERED_OFF.store(v, Ordering::Release);
 }
 
-/// True while the guest is in subfn 0x0E `PowerOffSystem` WFI.
+/// True while the guest is in subfn 0x0E `PowerOffSystem` WFI. Only
+/// the mtouch backend's first-tap-wakes hack consults it.
+#[cfg(nh_input_mtouch)]
 pub fn is_powered_off() -> bool {
     POWERED_OFF.load(Ordering::Acquire)
 }
@@ -384,6 +389,10 @@ pub fn poll_alarm() {
 /// Earliest pending Newton match deadline, or None if all four matches
 /// have already fired (or are zero). Returned in the Newton tick domain;
 /// callers wanting a CNTPCT-domain deadline must translate themselves.
+/// Only the synthetic-tick fast-forward in `heartbeat_tick_update`
+/// consults it; on `no-semihost` ticks are wall-anchored and the
+/// fast-forward path is compiled out.
+#[cfg(not(feature = "no-semihost"))]
 pub fn next_pending_match() -> Option<u32> {
     // SAFETY: single-threaded.
     let s = unsafe { &*VIC.0.get() };
@@ -446,13 +455,6 @@ pub fn int_ctrl_raw() -> u32 {
     // SAFETY: single-threaded.
     let s = unsafe { &*VIC.0.get() };
     s.int_ctrl
-}
-
-/// Diagnostic: raw FIQ mask register.
-pub fn fiq_mask_raw() -> u32 {
-    // SAFETY: single-threaded.
-    let s = unsafe { &*VIC.0.get() };
-    s.fiq_mask
 }
 
 // ---------- Hardware register addresses --------------------------------------
@@ -549,6 +551,7 @@ const TICK_ADVANCE_PER_TRAP: u32 = 6;
 /// crawl; values much larger let preemption-tier deadlines (73 720
 /// ticks for the 20 ms slice) fire on every heartbeat regardless of
 /// guest progress, defeating the instruction-anchored model.
+#[cfg(not(feature = "no-semihost"))]
 const TICK_ADVANCE_PER_HEARTBEAT: u32 = 1024;
 
 /// Current Newton-tick value as seen by guest reads of `kHdWr_Ticks`

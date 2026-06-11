@@ -41,8 +41,6 @@ pub struct Dwc2 {
     /// Number of host channels exposed by the core (read from
     /// GHWCFG2 during init; BCM2710 reports 8).
     pub num_channels: u8,
-    /// Cached EP0 max packet size for the attached device.
-    pub ep0_mps: u8,
     /// Per-endpoint data-toggle state. Indexed by `ep_num & 0xF`.
     /// In DMA mode the DWC2 core does *not* auto-advance the host's
     /// expected DATA0/DATA1 PID across separate transfers — the
@@ -76,7 +74,6 @@ impl Dwc2 {
             base,
             inited: false,
             num_channels: 0,
-            ep0_mps: 8,
             // First IN packet on a freshly-configured endpoint is
             // DATA0 (USB 2.0 §8.5.1). After enumeration's
             // SET_CONFIGURATION the device's toggles all reset to
@@ -448,22 +445,6 @@ impl UsbHostController for Dwc2 {
                     buf[..got].copy_from_slice(&scratch[..got]);
                     got
                 }
-                ControlData::Out(src) => {
-                    had_data_stage = true;
-                    let want = src.len().min(scratch.len());
-                    scratch[..want].copy_from_slice(&src[..want]);
-                    self.dma_xfer(
-                        addr,
-                        0,
-                        false, /* OUT */
-                        EpType::Control,
-                        max_packet_size0 as u16,
-                        Pid::Data1,
-                        scratch.as_mut_ptr(),
-                        want,
-                    )?;
-                    want
-                }
             }
         };
 
@@ -486,23 +467,19 @@ impl UsbHostController for Dwc2 {
 
 }
 
-/// Endpoint type encoded into HCCHAR.EpType[19:18].
+/// Endpoint type encoded into HCCHAR.EpType[19:18]. Hardware also
+/// defines Isochronous = 1 and Bulk = 2; permanently out of scope.
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum EpType {
     Control = 0,
-    #[allow(dead_code)]
-    Isochronous = 1,
-    #[allow(dead_code)]
-    Bulk = 2,
     Interrupt = 3,
 }
 
-/// PID encoded into HCTSIZ[30:29].
+/// PID encoded into HCTSIZ[30:29]. Hardware also defines Data2 = 1
+/// (high-speed high-bandwidth only; never used at full speed).
 #[derive(Copy, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 enum Pid {
     Data0 = 0,
-    Data2 = 1,
     Data1 = 2,
     /// MDATA for non-control; SETUP for control (same encoding 0b11).
     Setup = 3,
@@ -918,13 +895,4 @@ where
         return Err(UsbError::NotReady);
     }
     f(dwc2)
-}
-
-/// Diagnostic-only: return the controller's SNPSID register. The
-/// `usb-probe` binary uses this to confirm the MMIO window is alive
-/// even before full init.
-pub fn read_snpsid() -> u32 {
-    // SAFETY: see `Wrapper`. Read is side-effect free.
-    let dwc2 = unsafe { &*INSTANCE.0.get() };
-    dwc2.read(regs::GSNPSID)
 }

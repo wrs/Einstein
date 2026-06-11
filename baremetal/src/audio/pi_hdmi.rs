@@ -1282,8 +1282,7 @@ fn mai_dma_init_cyclic() -> bool {
         MAI_TX_RING_LEN * core::mem::size_of::<u32>(),
     );
     crate::cpu::dc_civac_range(
-        // SAFETY: addr-of static.
-        unsafe { &MAI_TX_CBS as *const MaiCbChain as u64 },
+        core::ptr::addr_of!(MAI_TX_CBS) as u64,
         core::mem::size_of::<MaiCbChain>(),
     );
 

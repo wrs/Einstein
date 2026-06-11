@@ -80,6 +80,7 @@ static REJ_DECODE_FAIL: AtomicU32 = AtomicU32::new(0);
 // Snapshot from the previous `log_stats` call, for windowed deltas.
 // Single-threaded EL2 access, so plain `static mut` (read-modify-write
 // inside the lone `log_stats` site) is fine.
+#[cfg(feature = "log_traps")]
 struct StatsSnapshot {
     installed: u32,
     rejected: u32,
@@ -93,6 +94,7 @@ struct StatsSnapshot {
     rej_install_fail: u32,
     rej_decode_fail: u32,
 }
+#[cfg(feature = "log_traps")]
 static mut LAST_STATS: StatsSnapshot = StatsSnapshot {
     installed: 0, rejected: 0,
     rej_not_ldr: 0, rej_operand_pc: 0, rej_writeback: 0,
@@ -132,6 +134,7 @@ impl RejTopK {
             *c = c.saturating_sub(1);
         }
     }
+    #[cfg(feature = "log_traps")]
     fn snapshot_sorted(&self) -> [(u32, u32); REJ_TOPK] {
         let mut out = [(0u32, 0u32); REJ_TOPK];
         for i in 0..REJ_TOPK {
@@ -148,6 +151,7 @@ impl RejTopK {
         }
         out
     }
+    #[cfg(feature = "log_traps")]
     fn reset(&mut self) {
         for i in 0..REJ_TOPK {
             self.keys[i] = 0;
@@ -433,6 +437,7 @@ fn encode_ea_imm(
 /// rejection in this window — the picker can't find two dead scratches
 /// in {R0..R3, R12} for these LDR sites, so they keep paying the EL2
 /// trap on every fire.
+#[cfg(feature = "log_traps")]
 pub fn log_stats() {
     let installed = STUBS_INSTALLED.load(Ordering::Relaxed);
     let rejected = STUBS_REJECTED.load(Ordering::Relaxed);

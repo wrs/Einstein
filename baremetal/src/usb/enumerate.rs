@@ -19,7 +19,7 @@
 //! IN+OUT pair); we surface enough of that in `UsbDevice` for the
 //! dispatcher to match by VID/PID and the driver to find its IN ep.
 
-pub use super::descriptor::{EndpointDescriptor, InterfaceDescriptor};
+pub use super::descriptor::EndpointDescriptor;
 use super::descriptor::{
     walk_config, ConfigDescriptor, ConfigItem, DeviceDescriptor,
 };
@@ -36,8 +36,6 @@ use super::{
 pub struct UsbDevice {
     pub address: u8,
     pub device: DeviceDescriptor,
-    pub config: ConfigDescriptor,
-    pub interfaces: [Option<InterfaceDescriptor>; MAX_INTERFACES],
     pub endpoints: [Option<EndpointEntry>; MAX_ENDPOINTS],
 }
 
@@ -47,7 +45,6 @@ pub struct EndpointEntry {
     pub ep: EndpointDescriptor,
 }
 
-pub const MAX_INTERFACES: usize = 4;
 pub const MAX_ENDPOINTS: usize = 8;
 
 impl UsbDevice {
@@ -141,19 +138,12 @@ pub fn enumerate<H: UsbHostController>(host: &mut H) -> UsbResult<UsbDevice> {
         &mut cfg_buf[..want],
     )?;
 
-    let mut interfaces: [Option<InterfaceDescriptor>; MAX_INTERFACES] =
-        Default::default();
     let mut endpoints: [Option<EndpointEntry>; MAX_ENDPOINTS] = Default::default();
     let mut current_iface: u8 = 0;
-    let mut iface_idx = 0usize;
     let mut ep_idx = 0usize;
     walk_config(&cfg_buf[..got], |item| match item {
-        ConfigItem::Interface(iface) => {
-            current_iface = iface.interface_number;
-            if iface_idx < MAX_INTERFACES {
-                interfaces[iface_idx] = Some(iface);
-                iface_idx += 1;
-            }
+        ConfigItem::Interface { interface_number } => {
+            current_iface = interface_number;
         }
         ConfigItem::Endpoint(ep) => {
             if ep_idx < MAX_ENDPOINTS {
@@ -164,7 +154,6 @@ pub fn enumerate<H: UsbHostController>(host: &mut H) -> UsbResult<UsbDevice> {
                 ep_idx += 1;
             }
         }
-        ConfigItem::Hid { .. } | ConfigItem::Other { .. } => {}
     });
 
     // Stage 6: SET_CONFIGURATION.
@@ -183,8 +172,6 @@ pub fn enumerate<H: UsbHostController>(host: &mut H) -> UsbResult<UsbDevice> {
     Ok(UsbDevice {
         address: 1,
         device,
-        config,
-        interfaces,
         endpoints,
     })
 }

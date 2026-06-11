@@ -41,7 +41,7 @@ mod symbols;
 mod tarmac;
 mod task_dump;
 mod timer;
-#[cfg(feature = "platform-raspi3b")]
+#[cfg(nh_input_mtouch)]
 mod usb;
 #[cfg(feature = "trace")]
 mod tracer;

@@ -33,6 +33,9 @@ pub mod mtouch;
 /// vertically) — backends are responsible for any
 /// panel-to-Newton transform (see `input::calibrate` for the
 /// `pi-bare-metal-input` build) before producing one of these.
+/// Only real pen backends (mtouch is the only one today) need the
+/// type; the null backend produces nothing.
+#[cfg(nh_input_mtouch)]
 #[derive(Copy, Clone, Debug)]
 pub enum PenEvent {
     Down { x: u16, y: u16 },
@@ -44,6 +47,7 @@ pub enum PenEvent {
 /// active backend module and accessed exclusively from `pump` on the
 /// trap-return tail (single-threaded EL2), so no internal locking is
 /// required.
+#[cfg(nh_input_mtouch)]
 pub trait PenSource {
     /// Return the next pending event, or `None` if the source has
     /// nothing buffered. Must be non-blocking — `pump` runs from a
@@ -73,6 +77,9 @@ pub fn pump() {
 /// (ISR context). Returns `true` if a pen sample was enqueued, so the
 /// caller can reflect `INT_TABLET` into the guest's vIRQ on this exit.
 /// A no-op (returns `false`) for backends that don't take IRQs.
+/// Compiled exactly where its only caller — `trap_irq`'s slim USB
+/// fast path — is.
+#[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
 pub fn on_usb_irq() -> bool {
     #[cfg(nh_input_mtouch)]
     {
@@ -96,7 +103,7 @@ pub fn on_usb_irq() -> bool {
 /// `INT_TABLET` into the guest's vIRQ on the current trap exit. A
 /// `Move` arriving while up enqueues nothing, but the resulting
 /// `update_virq` is idempotent, so the slight over-eagerness is safe.
-#[cfg(any(nh_input_mtouch))]
+#[cfg(nh_input_mtouch)]
 pub(crate) fn drain_into_queue<P: PenSource>(src: &mut P) -> bool {
     use core::sync::atomic::{AtomicBool, Ordering};
     use crate::host_io::{pack_pen_sample, queue, PEN_DOWN_SAMPLE_MARKER, PEN_UP_SAMPLE_MARKER};

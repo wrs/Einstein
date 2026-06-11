@@ -50,6 +50,10 @@ pub fn handle_align_fault(ctx: &mut TrapContext) {
     use core::sync::atomic::{AtomicU32, Ordering};
     static N: AtomicU32 = AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    // Throttle the per-fault decode diagnostic to the first N faults —
+    // alignment faults fire millions of times over a boot, so unbounded
+    // logging would drown the console. (The undecodable/unreadable cases
+    // below halt loudly regardless of this budget.)
     const LOG_FIRST: u32 = 40;
     // iter-85: tarmac window is now bracketed by the FPE-entry probe
     // (open) and the unrecognised-UND halt (close). The first-alignment-
@@ -156,32 +160,46 @@ pub fn handle_align_fault(ctx: &mut TrapContext) {
     // ARM R14_abt = faulting_pc + 8. (For Thumb it would be +4; we've
     // already ruled Thumb out above.)
     let faulting_pc = lr_abt.wrapping_sub(8);
-    let insn = read_guest_word(faulting_pc).unwrap_or(0);
-    // Early-boot diagnostic: if the PC looks invalid or we can't
-    // decode, log once and skip (advance to raw_r14 - 4 — the
-    // "skip-faulting-insn" AArch32 return address). The guest may
-    // not recover correctly since we haven't performed the load/
-    // store, but this lets boot advance enough to see downstream
-    // effects rather than halting on the first weird fault.
-    let decoded_maybe = decode(insn);
-    if faulting_pc & 3 != 0 || decoded_maybe.is_none() {
-        if n <= LOG_FIRST {
-            crate::log_unaligned!(
-                "unaligned[{}]: SKIP — PC={:#010x} insn={:#010x} (decode={}, aligned={}) FAR={:#010x}",
-                n, faulting_pc, insn,
-                decoded_maybe.is_some(),
-                faulting_pc & 3 == 0,
-                dfar as u32,
-            );
-        }
-        // Skip the faulting instruction: advance pre-abt PC by 4
-        // (ARM) and ERET to the pre-abt mode. If the PC wasn't
-        // 4-aligned we just advance by 4 anyway to avoid an infinite
-        // trap loop in the trampoline.
-        set_return(ctx, faulting_pc.wrapping_add(4), pre_abt_cpsr);
-        return;
+    // A non-word-aligned faulting PC means we mis-derived it (ARM PCs
+    // are word-aligned); emulating from a bad PC would fabricate guest
+    // state, so halt loudly rather than skipping the load/store.
+    if faulting_pc & 3 != 0 {
+        kprintln!(
+            "*** unaligned: non-aligned faulting PC={:#010x} (LR_abt={:#010x}) FAR={:#010x} ***",
+            faulting_pc, lr_abt, dfar as u32,
+        );
+        dump_state(ctx, pre_abt_cpsr);
+        cpu::halt();
     }
-    let decoded = decoded_maybe.unwrap();
+    // Unreadable faulting instruction: we can't emulate what we can't
+    // read. Skipping would resume the guest at PC+4 with a stale Rt and
+    // unwritten memory — silent guest-state corruption — so halt loudly.
+    let insn = match read_guest_word(faulting_pc) {
+        Some(w) => w,
+        None => {
+            kprintln!(
+                "*** unaligned: faulting insn @PC={:#010x} unreadable FAR={:#010x} ***",
+                faulting_pc, dfar as u32,
+            );
+            dump_state(ctx, pre_abt_cpsr);
+            cpu::halt();
+        }
+    };
+    // Undecodable faulting instruction: the alignment-fault fast path
+    // only handles the ROM's rotate-LDR/STR idioms. Anything else here
+    // is an emulation gap, not a guest bug — halt loudly with context so
+    // the missing decode is added, rather than skipping it silently.
+    let decoded = match decode(insn) {
+        Some(d) => d,
+        None => {
+            kprintln!(
+                "*** unaligned: undecodable insn={:#010x} @PC={:#010x} FAR={:#010x} ***",
+                insn, faulting_pc, dfar as u32,
+            );
+            dump_state(ctx, pre_abt_cpsr);
+            cpu::halt();
+        }
+    };
 
     // Sanity: an insn that alignment-faulted must have passed its
     // condition. If it didn't, we shouldn't be here — but skip insn
@@ -339,7 +357,7 @@ fn ctx_slot_for_reg(reg: u32, pre_mode: u32) -> usize {
     }
 }
 
-fn set_return(ctx: &mut TrapContext, next_pc: u32, _pre_abt_cpsr: u32) {
+fn set_return(ctx: &mut TrapContext, next_pc: u32, pre_abt_cpsr: u32) {
     // Avoid `msr spsr_el2, x` from EL2: per docs/QEMU_BUGS.md Bug #1
     // that write leaks into AArch32 SPSR_svc (banked_spsr[1]) on QEMU
     // raspi3b. If the alignment fault fires while the guest is mid-SVC
@@ -360,9 +378,13 @@ fn set_return(ctx: &mut TrapContext, next_pc: u32, _pre_abt_cpsr: u32) {
     // scope (here SPSR_abt, untouched by any EL2 code, so it still
     // holds the pre-fault CPSR set by hardware on DABT entry).
     //
-    // `_pre_abt_cpsr` equals SPSR_abt by construction, so the stub
-    // doesn't need it — kept on the signature for caller clarity.
-    crate::trap::return_to_guest_from_und(ctx, next_pc as u64, 0);
+    // `pre_abt_cpsr` equals SPSR_abt by construction, so the stub
+    // doesn't need it for the ERET itself (it transitions via the
+    // untouched banked SPSR_abt). But `return_to_guest_from_und` reads
+    // the SPSR argument for its USR-target-in-trampoline diagnostic, so
+    // forward the real pre-abort CPSR rather than 0 — otherwise the
+    // diagnostic's mode check is permanently dead on this path.
+    crate::trap::return_to_guest_from_und(ctx, next_pc as u64, pre_abt_cpsr as u64);
 }
 
 fn dump_state(ctx: &TrapContext, pre_abt_cpsr: u32) {

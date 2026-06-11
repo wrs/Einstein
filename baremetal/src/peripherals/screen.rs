@@ -281,7 +281,7 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
     //       pixels. Any glyph blit issued with mode=1 that we treated
     //       as srcCopy clears the rect around the ink.
     // Anything else falls back to srcCopy with a log.
-    let mode = ctx_blit_mode(ctx);
+    let mode = ctx_blit_mode(ctx, pc);
     if mode != 0 && mode != 1 {
         kprintln!("screen.blit: unrecognised mode {} @PC={:#x} — treating as srcCopy", mode, pc);
     }
@@ -400,7 +400,7 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
             dst_top, dst_left, dst_bottom, dst_right,
             src_width_pixels * height);
         push_blit_event(
-            ctx_blit_mode(ctx),
+            mode,
             src_top, src_left, src_bottom, src_right,
             dst_top, dst_left, dst_bottom, dst_right,
             payload_row_bytes as u16, &scratch[..payload_len],
@@ -458,7 +458,7 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
         copied);
 
     push_blit_event(
-        ctx_blit_mode(ctx),
+        mode,
         src_top, src_left, src_bottom, src_right,
         dst_top, dst_left, dst_bottom, dst_right,
         payload_row_bytes as u16, &scratch[..payload_len],
@@ -468,17 +468,27 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
 }
 
 /// Source the blit mode from the guest stack slot [SP+4] per the
-/// native-primitive ABI. Returns 0 if the read fails — the host
-/// viewer treats unknown modes as `srcCopy`.
-fn ctx_blit_mode(ctx: &TrapContext) -> u8 {
-    // r13 is at ctx.x[13] in AArch32 user/svc context; the mode word
-    // lives at [SP+4] (caller pushed the 4th arg there).
-    let sp = ctx.x[13] as u32;
-    let mode_va = sp.wrapping_add(4);
-    let mode_pa = guest_mem::translate_va(mode_va).unwrap_or(mode_va);
-    crate::guest_endian::guest_read_u32_pa(mode_pa)
-        .map(|w| w as u8)
-        .unwrap_or(0)
+/// native-primitive ABI. Halts loudly on a read failure (the same
+/// convention as the rest of the blit emulation) rather than silently
+/// degrading a mode-1 ink overlay into a srcCopy rect-clear.
+fn ctx_blit_mode(ctx: &TrapContext, pc: u32) -> u8 {
+    // Einstein reads `GetRegister(13)` — the *current-mode* banked R13.
+    // ctx.x[13] is SP_usr regardless of the trapping mode, so reading it
+    // directly is the historical wrong-slot bug (see flash_driver.rs and
+    // docs/QEMU_BUGS.md). Resolve the banked SP for the trapping mode via
+    // SPSR_EL2 + Table D1-79; the mode word lives at [SP+4] (the caller
+    // pushed the 4th arg there).
+    let spsr: u64;
+    // SAFETY: reading a sysreg has no side effects.
+    unsafe {
+        core::arch::asm!(
+            "mrs {}, spsr_el2",
+            out(reg) spsr,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    let sp = crate::banked::sp_for_mode(ctx, spsr as u32);
+    read_word_or_halt(sp.wrapping_add(4), "blit mode word [SP+4]", pc) as u8
 }
 
 #[allow(clippy::too_many_arguments)]

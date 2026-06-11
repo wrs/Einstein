@@ -278,6 +278,13 @@ enum BranchKind {
     /// {R0..R3, R12, R14}; analyzer continues at PC+4 with those regs
     /// effectively "written".
     BLink,
+    /// Conditional BL/BLX/SVC/HVC/SMC. The taken path is an APCS call
+    /// (reads {R0..R3}, clobbers {R0..R3, R12, R14}); the not-taken path
+    /// preserves those registers. Mirrors the conditional-write rule:
+    /// reads are counted conservatively (so call params stay live), but
+    /// the caller-saved clobber is NOT added to `written`, because a
+    /// downstream read can be upward-exposed through the not-taken edge.
+    CondBLink,
     /// Unconditional branch. Analyzer follows `target` and stops.
     Direct { target: u32 },
     /// Conditional branch (Bcc, no link). Analyzer must consider both
@@ -319,7 +326,7 @@ fn analyze_insn(insn: u32, pc: u32) -> (RegMask, RegMask, BranchKind) {
         let l = (insn >> 24) & 1;
         let target = branch_target(insn, pc);
         let kind = if l == 1 {
-            BranchKind::BLink
+            if cond_al { BranchKind::BLink } else { BranchKind::CondBLink }
         } else if cond_al {
             BranchKind::Direct { target }
         } else {
@@ -336,13 +343,15 @@ fn analyze_insn(insn: u32, pc: u32) -> (RegMask, RegMask, BranchKind) {
         }
         let is_blx = (insn & 0x20) != 0;
         if is_blx {
-            return (1u16 << rm, 0, BranchKind::BLink);
+            let kind = if cond_al { BranchKind::BLink } else { BranchKind::CondBLink };
+            return (1u16 << rm, 0, kind);
         }
         return (1u16 << rm, 0, BranchKind::Indirect);
     }
     // SVC / SWI: cond 1111 imm24 — APCS-call shape.
     if (insn & 0x0F00_0000) == 0x0F00_0000 {
-        return (0, 0, BranchKind::BLink);
+        let kind = if cond_al { BranchKind::BLink } else { BranchKind::CondBLink };
+        return (0, 0, kind);
     }
     // BKPT
     if (insn & 0x0FF0_00F0) == 0x0120_0070 {
@@ -350,11 +359,13 @@ fn analyze_insn(insn: u32, pc: u32) -> (RegMask, RegMask, BranchKind) {
     }
     // HVC: cond 0001 0100 imm12 0111 imm4. APCS-call shape.
     if (insn & 0x0FF0_00F0) == 0x0140_0070 {
-        return (0, 0, BranchKind::BLink);
+        let kind = if cond_al { BranchKind::BLink } else { BranchKind::CondBLink };
+        return (0, 0, kind);
     }
     // SMC: same shape as HVC.
     if (insn & 0x0FF0_00F0) == 0x0160_0070 {
-        return (0, 0, BranchKind::BLink);
+        let kind = if cond_al { BranchKind::BLink } else { BranchKind::CondBLink };
+        return (0, 0, kind);
     }
 
     // MOVW (A2): cond 0011 0000 imm4 Rd imm12 — writes Rd.
@@ -716,6 +727,18 @@ where R: Fn(u32) -> Option<u32> {
                 live |= APCS_PARAMS & !written;
                 let bl_clobber = APCS_CALLER_SAVED & !live;
                 written |= bl_clobber;
+                pc = pc.wrapping_add(4);
+                continue;
+            }
+            BranchKind::CondBLink => {
+                // Conditional call: the taken edge reads the param regs and
+                // clobbers the caller-saved set, but the not-taken edge
+                // preserves them. Count the param reads conservatively, but
+                // do NOT add the clobber to `written` — otherwise a
+                // downstream read that is upward-exposed through the
+                // not-taken path would be masked out and the register
+                // wrongly reported dead (false negative).
+                live |= APCS_PARAMS & !written;
                 pc = pc.wrapping_add(4);
                 continue;
             }

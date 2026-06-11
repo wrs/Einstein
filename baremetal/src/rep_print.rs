@@ -119,14 +119,18 @@ pub fn render_and_log(prefix: &str, fmt_ptr: u32, mut args: VaArgs) {
                     have_width = true;
                 }
                 b'.' => {
-                    // Skip a precision spec without honoring it.
+                    // Skip a precision spec without honoring it. A `*`
+                    // precision (`%.*s`) still consumes its argument so
+                    // every following argument stays aligned.
                     loop {
                         let p = match read_byte(cursor) {
                             Some(p) => p,
                             None => break 'outer,
                         };
                         cursor = cursor.wrapping_add(1);
-                        if !p.is_ascii_digit() && p != b'*' {
+                        if p == b'*' {
+                            let _ = args.next();
+                        } else if !p.is_ascii_digit() {
                             handle_spec(p, &flags, width, long_count, &mut args, &mut buf, &mut written);
                             break;
                         }

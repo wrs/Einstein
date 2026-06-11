@@ -607,6 +607,21 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
     let srt = ((iss >> 16) & 0x1F) as usize;
     let ifsc = (iss & 0x3f) as u32;
 
+    // ISS.SRT (ESR_EL2 bits[20:16]) names the AArch64 register the
+    // transfer used. For AArch32 guest traps the mapped register is
+    // always X0..X14 (R0..R14), so SRT == 31 (the WZR/XZR encoding) is
+    // architecturally impossible here. `ctx.x` only has slots 0..30, so
+    // an unexpected 31 would panic on the index below; halt loudly with
+    // context instead.
+    if srt == 31 {
+        kprintln!(
+            "*** handle_data_abort: ISS.SRT == 31 (XZR) on AArch32 trap — \
+             impossible; iss={:#010x} FAR={:#010x} IPA={:#010x} ***",
+            iss, far as u32, ipa as u32,
+        );
+        cpu::halt();
+    }
+
     let elr = read_sysreg!("elr_el2") as u32;
 
     crate::trap_hist::record_dabt(elr, ipa as u32);
@@ -4133,6 +4148,17 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
     let is_read = (iss & 1) != 0;
     let _crm = ((iss >> 1) & 0xF) as u32;
     let rt = ((iss >> 5) & 0x1F) as usize;
+    // ISS.Rt[9:5] names the AArch64 register operand. An AArch32
+    // MCR/MRC maps Rt to X0..X14, so 31 (XZR/WZR) cannot occur here and
+    // would panic on the `ctx.x[rt]` index below; halt loudly instead.
+    if rt == 31 {
+        kprintln!(
+            "*** handle_cp15_trap: ISS.Rt == 31 (XZR) on AArch32 trap — \
+             impossible; iss={:#010x} ***",
+            iss,
+        );
+        cpu::halt();
+    }
     let crn = ((iss >> 10) & 0xF) as u32;
     let opc1 = ((iss >> 14) & 0x7) as u32;
     let opc2 = ((iss >> 17) & 0x7) as u32;

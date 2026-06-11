@@ -79,7 +79,7 @@ pub fn pump() {
 /// A no-op (returns `false`) for backends that don't take IRQs.
 /// Compiled exactly where its only caller — `trap_irq`'s slim USB
 /// fast path — is.
-#[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+#[cfg(nh_real_hw)]
 pub fn on_usb_irq() -> bool {
     #[cfg(nh_input_mtouch)]
     {

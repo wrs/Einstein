@@ -163,7 +163,7 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     // must still reach `irq_from_*`, so we check them before skipping.
     // (CNTHP is level — it simply re-fires if we returned too early — but
     // we'd then spin here on every USB IRQ and starve it, so test it.)
-    #[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+    #[cfg(nh_real_hw)]
     {
         let pend1 = platform::bcm2835_irq_pending_1();
         if pend1 & (1 << 9) != 0 {
@@ -239,7 +239,7 @@ fn irq_from_el2() {
 
     // BCM2835 DMA channel dispatch: channel N raises GPU IRQ source
     // 16+N. UART-TX owns ch 5, MAI-TX owns ch 4.
-    #[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+    #[cfg(nh_real_hw)]
     {
         use crate::peripherals::host_dma;
         let pend1 = platform::bcm2835_irq_pending_1();
@@ -283,7 +283,7 @@ fn irq_from_guest(ctx: &mut TrapContext) {
     // the local-peripheral block at 0x4000_0040 and isn't reflected
     // here). DMA channel N raises GPU IRQ source 16+N (Circle's
     // ARM_IRQ_DMA0 = 16). UART-TX owns ch 5, MAI-TX owns ch 4.
-    #[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+    #[cfg(nh_real_hw)]
     {
         use crate::peripherals::host_dma;
         let pend1 = platform::bcm2835_irq_pending_1();

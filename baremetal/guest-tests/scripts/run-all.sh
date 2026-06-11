@@ -17,6 +17,14 @@ done
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
 
+# Opt-in feature-matrix build check (CHECK_MATRIX=1). Off by default so
+# the normal test loop doesn't pay ~10 extra cargo checks.
+if [[ "${CHECK_MATRIX:-0}" == "1" ]]; then
+    echo "feature-matrix check:"
+    bash "$root/../scripts/check-matrix.sh"
+    echo
+fi
+
 "$here/build-tests.sh" >/dev/null
 
 pass=0

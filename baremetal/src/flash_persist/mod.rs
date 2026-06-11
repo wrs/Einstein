@@ -90,7 +90,7 @@ pub fn fingerprint() -> u32 {
 /// the SD backend's background DMA save state machine on each SD-TX
 /// channel completion IRQ. No-op for backends without an async DMA save
 /// (only the SD backend on real-hardware Pi builds owns that channel).
-#[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+#[cfg(nh_real_hw)]
 pub fn on_sd_dma_done() {
     #[cfg(nh_flash_persist_sd)]
     sd::on_dma_completion();

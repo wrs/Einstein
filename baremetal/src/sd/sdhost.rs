@@ -405,7 +405,7 @@ impl SdHost {
     /// block index on SDHC (block-addressed) or byte offset on SDSC.
     /// Only the DMA write paths use this; gated with them on the
     /// real-hardware config where `host_dma` exists.
-    #[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+    #[cfg(nh_real_hw)]
     #[inline]
     fn cmd_arg(&self, lba: u32) -> u32 {
         match self.capacity {
@@ -423,7 +423,7 @@ impl SdHost {
     /// completion IRQ. Its job here is to prove the DMA→SDHOST path in
     /// isolation (milestone 2): the DREQ number, the FIFO addressing,
     /// and the command/data sequencing.
-    #[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+    #[cfg(nh_real_hw)]
     pub fn write_block_dma(&self, lba: u32, buf: &[u8; 512]) -> Result<(), CmdError> {
         use crate::peripherals::host_dma as dma;
         if !dma::init_sd_tx() {
@@ -459,7 +459,7 @@ impl SdHost {
     /// the whole buffer (DREQ-paced) → settle the write FSM → `CMD12`
     /// (STOP_TRANSMISSION, R1b busy-wait, applied automatically by
     /// `send_cmd_kind`).
-    #[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+    #[cfg(nh_real_hw)]
     pub fn write_sectors_dma(&self, lba: u32, buf: &[u8]) -> Result<(), CmdError> {
         use crate::peripherals::host_dma as dma;
         if buf.is_empty() || buf.len() % 512 != 0 {
@@ -495,7 +495,7 @@ impl SdHost {
     ///
     /// On a setup / `CMD25` failure the channel is aborted and the idle
     /// `SDHCFG` restored before returning Err.
-    #[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+    #[cfg(nh_real_hw)]
     pub fn start_sectors_dma(&self, lba: u32, buf: &[u8]) -> Result<(), CmdError> {
         use crate::peripherals::host_dma as dma;
         if buf.is_empty() || buf.len() % 512 != 0 {
@@ -528,7 +528,7 @@ impl SdHost {
     /// The caller runs this from the completion IRQ inside an
     /// IRQ-unmasked window so the `CMD12` busy-wait (card program time)
     /// doesn't starve the audio MAI feed / CNTHP rearm while it waits.
-    #[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+    #[cfg(nh_real_hw)]
     pub fn finish_sectors_dma(&self) -> Result<(), CmdError> {
         use crate::peripherals::host_dma as dma;
         let r = if dma::sd_tx_error() {
@@ -554,12 +554,12 @@ impl SdHost {
 /// Static control block for the SD-TX DMA channel. `UnsafeCell` (not
 /// `static mut`) so taking `&DmaCb` for `arm_sd_tx` doesn't trip the
 /// `static_mut_refs` lint; single-core EL2 makes the aliasing sound.
-#[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+#[cfg(nh_real_hw)]
 struct SdTxCbCell(core::cell::UnsafeCell<crate::peripherals::host_dma::DmaCb>);
 // SAFETY: single-core EL2; only the SD DMA write paths touch it, serialised.
-#[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+#[cfg(nh_real_hw)]
 unsafe impl Sync for SdTxCbCell {}
-#[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+#[cfg(nh_real_hw)]
 static SD_TX_CB: SdTxCbCell =
     SdTxCbCell(core::cell::UnsafeCell::new(crate::peripherals::host_dma::DmaCb::zero()));
 
@@ -569,7 +569,7 @@ static SD_TX_CB: SdTxCbCell =
 /// the channel. `inten` requests a completion IRQ — set for the
 /// background async save, clear for the polled bring-up paths that spin
 /// on `sd_tx_active`.
-#[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+#[cfg(nh_real_hw)]
 fn arm_sd_dma(buf_pa: u64, len: u32, inten: bool) {
     use crate::peripherals::host_dma as dma;
     let sddata_pa = (SDHOST_BASE + SDDATA) as u32;
@@ -605,7 +605,7 @@ fn arm_sd_dma(buf_pa: u64, len: u32, inten: bool) {
 /// Spin until the SD-TX DMA channel finishes, watching SDHOST status
 /// for errors meanwhile. Returns Ok when the channel goes idle cleanly,
 /// Err on a latched CS.ERROR, an SDHOST error flag, or a SW timeout.
-#[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+#[cfg(nh_real_hw)]
 fn poll_sd_dma_done() -> Result<(), CmdError> {
     use crate::peripherals::host_dma as dma;
     let mut spins = 0u32;

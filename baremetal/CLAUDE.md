@@ -247,6 +247,19 @@ saw in a log), skip the install: `bg <addr>` and `c` is enough.
   isolation. A regression in handler code should show up as a
   failing test; run `guest-tests/scripts/run-all.sh` before
   committing.
+- **Feature-matrix build check.** `scripts/check-matrix.sh`
+  `cargo check`s every supported build combination (default;
+  `platform-fvp-base`; the four `pi-bare-metal*` aggregates;
+  `trace,quiet`; `host-io-semihost`; the `sd-probe` aggregate; the
+  guest-test cfg) in one shared target dir and prints a per-combo
+  PASS/FAIL summary (~10 s warm). Run it after touching `build.rs`,
+  feature gates, or any cfg-dispatched backend. It's also wired into
+  `run-all.sh` as an opt-in step gated on `CHECK_MATRIX=1`
+  (`CHECK_MATRIX=1 guest-tests/scripts/run-all.sh`) — off by default so
+  the normal test loop doesn't pay the extra checks. build.rs's
+  `validate_feature_matrix()` rejects impossible cross-axis combos at
+  configure time, so a forbidden `--features` set fails with a named
+  message, not a deep compile error.
 - **Skip the guest-tests run** when an iteration's only changes
   are a Newton-ROM probe (a new HVC immediate at a Newton-ROM PC
   in `src/rom_patches.rs` + a dispatch arm + handler in

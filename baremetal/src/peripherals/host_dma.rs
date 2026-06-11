@@ -18,7 +18,7 @@
 //!   RAM bus alias = `arm_phys | 0xC000_0000`; peripheral bus alias =
 //!   `(arm_phys & 0x00FF_FFFF) | 0x7E00_0000`.
 
-#![cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+#![cfg(nh_real_hw)]
 
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, Ordering};

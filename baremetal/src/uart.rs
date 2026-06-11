@@ -39,7 +39,7 @@ const UART_LCRH: *mut u32 = (UART_BASE + 0x2C) as *mut u32;
 const UART_CR: *mut u32 = (UART_BASE + 0x30) as *mut u32;
 const UART_IMSC: *mut u32 = (UART_BASE + 0x38) as *mut u32;
 const UART_ICR: *mut u32 = (UART_BASE + 0x44) as *mut u32;
-#[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+#[cfg(nh_real_hw)]
 const UART_DMACR: *mut u32 = (UART_BASE + 0x48) as *mut u32;
 
 const FR_RXFE: u32 = 1 << 4; // Receive FIFO empty.
@@ -97,7 +97,7 @@ pub fn init() {
 /// `no-semihost` + `platform-raspi3b` build, so callers don't need to
 /// mirror the cfg.
 pub fn init_dma_tx() {
-    #[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+    #[cfg(nh_real_hw)]
     tx_dma::init();
 }
 
@@ -251,7 +251,7 @@ pub fn now_us() -> u64 {
 /// brought up the ring) fall back to the polled `write_byte` path so
 /// the kmain banner doesn't disappear.
 pub fn write_str(s: &str) {
-    #[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+    #[cfg(nh_real_hw)]
     {
         if tx_dma::enqueue(s.as_bytes()) {
             return;
@@ -288,7 +288,7 @@ pub fn write_str(s: &str) {
 /// Always defined so callers don't need to mirror the cfg.
 #[inline]
 pub fn on_tx_done() {
-    #[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+    #[cfg(nh_real_hw)]
     tx_dma::on_done();
 }
 
@@ -531,7 +531,7 @@ macro_rules! log_host_io {
 // IRQ kicks the next chunk if more bytes have arrived in the meantime.
 // Wrap-around is handled by issuing one CB per contiguous tail→end or
 // start→head segment.
-#[cfg(all(feature = "no-semihost", feature = "platform-raspi3b"))]
+#[cfg(nh_real_hw)]
 mod tx_dma {
     use core::cell::UnsafeCell;
     use core::ptr::addr_of_mut;

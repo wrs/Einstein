@@ -198,7 +198,7 @@ pub fn handle_align_fault(ctx: &mut TrapContext) {
     // Sanity: an insn that alignment-faulted must have passed its
     // condition. If it didn't, we shouldn't be here — but skip insn
     // defensively rather than loop.
-    if !cond_passes(decoded.cond, pre_abt_cpsr) {
+    if !crate::arm_decode::arm_cond_passed(decoded.cond, pre_abt_cpsr) {
         kprintln!(
             "unaligned: WARN cond fails (cond={:#x}, CPSR={:#010x}) at PC={:#x} — skipping",
             decoded.cond, pre_abt_cpsr, faulting_pc
@@ -237,7 +237,7 @@ pub fn handle_align_fault(ctx: &mut TrapContext) {
         OffsetForm::Imm(imm) => imm,
         OffsetForm::Reg { rm, shift_type, shift_amount } => {
             let rm_val = read_reg(ctx, rm, pre_mode);
-            apply_shift(rm_val, shift_type, shift_amount, pre_abt_cpsr)
+            crate::arm_decode::arm_shift(rm_val, shift_type, shift_amount, pre_abt_cpsr)
         }
     };
     let ea_offsetted = if decoded.u {
@@ -303,52 +303,13 @@ pub fn handle_align_fault(ctx: &mut TrapContext) {
 /// FIQ-mode R8-R12 live in x24..x28 (the banked FIQ regs); for all
 /// other modes they share R8_usr..R12_usr in x8..x12.
 fn read_reg(ctx: &TrapContext, reg: u32, pre_mode: u32) -> u32 {
-    let idx = ctx_slot_for_reg(reg, pre_mode);
+    let idx = crate::banked::ctx_slot_for_reg(reg, pre_mode);
     ctx.x[idx] as u32
 }
 
 fn write_reg(ctx: &mut TrapContext, reg: u32, pre_mode: u32, value: u32) {
-    let idx = ctx_slot_for_reg(reg, pre_mode);
+    let idx = crate::banked::ctx_slot_for_reg(reg, pre_mode);
     ctx.x[idx] = value as u64;
-}
-
-fn ctx_slot_for_reg(reg: u32, pre_mode: u32) -> usize {
-    // R0..R7 and R8..R12 for non-FIQ modes: direct index.
-    if reg <= 7 {
-        return reg as usize;
-    }
-    const FIQ: u32 = 0x11;
-    if reg <= 12 {
-        if pre_mode == FIQ {
-            return (24 + (reg - 8)) as usize;  // R8_fiq..R12_fiq → x24..x28
-        }
-        return reg as usize;                   // R8_usr..R12_usr → x8..x12
-    }
-    // R13 (SP) and R14 (LR): banked per mode. Table D1-79:
-    //   mode       SP_slot  LR_slot
-    //   USR/SYS    x13      x14
-    //   FIQ        x29      x30
-    //   IRQ        x17      x16
-    //   SVC        x19      x18
-    //   ABT        x21      x20
-    //   UND        x23      x22
-    //   HYP        x15      (doesn't apply — we're EL1)
-    // Fall-through: treat unknown modes as USR (defensive).
-    match (reg, pre_mode) {
-        (13, 0x10) | (13, 0x1F) => 13,  // SP_usr
-        (14, 0x10) | (14, 0x1F) => 14,  // LR_usr
-        (13, 0x11) => 29,               // SP_fiq
-        (14, 0x11) => 30,               // LR_fiq
-        (13, 0x12) => 17,               // SP_irq
-        (14, 0x12) => 16,               // LR_irq
-        (13, 0x13) => 19,               // SP_svc
-        (14, 0x13) => 18,               // LR_svc
-        (13, 0x17) => 21,               // SP_abt
-        (14, 0x17) => 20,               // LR_abt
-        (13, 0x1B) => 23,               // SP_und
-        (14, 0x1B) => 22,               // LR_und
-        _ => reg as usize,              // fall-through (unknown mode → USR bank)
-    }
 }
 
 fn set_return(ctx: &mut TrapContext, next_pc: u32, pre_abt_cpsr: u32) {
@@ -455,60 +416,6 @@ pub(crate) fn decode(insn: u32) -> Option<Decoded> {
         });
     }
     None
-}
-
-fn cond_passes(cond: u32, cpsr: u32) -> bool {
-    let n = (cpsr >> 31) & 1 != 0;
-    let z = (cpsr >> 30) & 1 != 0;
-    let c = (cpsr >> 29) & 1 != 0;
-    let v = (cpsr >> 28) & 1 != 0;
-    match cond & 0xF {
-        0x0 => z,
-        0x1 => !z,
-        0x2 => c,
-        0x3 => !c,
-        0x4 => n,
-        0x5 => !n,
-        0x6 => v,
-        0x7 => !v,
-        0x8 => c && !z,
-        0x9 => !c || z,
-        0xA => n == v,
-        0xB => n != v,
-        0xC => !z && (n == v),
-        0xD => z || (n != v),
-        0xE => true,
-        _ => true,
-    }
-}
-
-fn apply_shift(val: u32, shift_type: u32, amount: u32, cpsr: u32) -> u32 {
-    match shift_type & 3 {
-        0 /* LSL */ => {
-            if amount >= 32 { 0 } else { val.wrapping_shl(amount) }
-        }
-        1 /* LSR */ => {
-            let n = if amount == 0 { 32 } else { amount };
-            if n >= 32 { 0 } else { val >> n }
-        }
-        2 /* ASR */ => {
-            let n = if amount == 0 { 32 } else { amount };
-            if n >= 32 {
-                if (val as i32) < 0 { u32::MAX } else { 0 }
-            } else {
-                ((val as i32) >> n) as u32
-            }
-        }
-        3 /* ROR / RRX */ => {
-            if amount == 0 {
-                let c = (cpsr >> 29) & 1;
-                (val >> 1) | (c << 31)
-            } else {
-                val.rotate_right(amount & 31)
-            }
-        }
-        _ => unreachable!(),
-    }
 }
 
 fn read_guest_word(addr: u32) -> Option<u32> {

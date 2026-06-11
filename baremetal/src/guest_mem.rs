@@ -312,9 +312,9 @@ pub fn write_word_pa(pa: u32, value: u32) -> bool {
 
 /// Write a 32-bit word to a guest VA by walking the live stage-1
 /// short-descriptor tables (rooted at TTBR0 = 0x0400_0000 per the
-/// 717006 probe). Mirrors `trap::guest_translate_va`. Used from EL2
-/// when we need to land a value in a kernel data structure named
-/// by a VA the guest passed us (e.g. SFlashChipInformation pointer).
+/// 717006 probe) via `translate_va`. Used from EL2 when we need to
+/// land a value in a kernel data structure named by a VA the guest
+/// passed us (e.g. SFlashChipInformation pointer).
 #[allow(dead_code)]
 pub fn write_word_va(va: u32, value: u32) -> bool {
     let pa = match translate_va(va) {
@@ -1458,6 +1458,53 @@ pub const DABT_FAST_TRAMP_DAH_TARGET: u32 = 0x0039_3114;
 /// for the rationale. The same value works pre-MMU and post-MMU,
 /// so no swap is required.
 pub const DABT_SAVE_PA: u32 = crate::trap::HYP_TRAMP_SCRATCH_BASE + 0xA0;
+
+/// Upper bound of the contiguous patch-stub / FPA-bypass / UND-return /
+/// UND-trampoline code region in the ROM aperture tail. The region runs
+/// from `rom_patches::PATCH_STUB_ARENA_BASE` (0x00FF_FD80) up to the top
+/// of the 16 MiB ROM aperture; it holds, in order, the patch-stub arena,
+/// the FPA bypass stub (`FPA_BYPASS_STUB_OFFSET`), the UND-return stub
+/// (`UND_RETURN_STUB_OFFSET`), and the UND trampoline (0x00FF_FF00).
+pub const ROM_TAIL_STUBS_END: u32 = 0x0100_0000;
+
+/// True if `pa` lies in a region that the hypervisor populates at
+/// runtime with native (little-endian) AArch32 instruction words rather
+/// than guest-authored data. Single source of truth shared by:
+///   * `guest_endian::pa_is_rom_code` — these words must NOT be
+///     byte-swapped on a guest read (they're already host-LE code), and
+///   * `snapshot::pc_in_hypervisor_transient_region` — a guest PC parked
+///     in one of these regions is mid-trampoline and must not anchor an
+///     autosave (the EL2-side code at that IPA is rebuilt every boot).
+///
+/// Covers every runtime-written code region: the DABT fast trampoline,
+/// the tracer trampoline pool, and the contiguous patch-stub arena / FPA
+/// bypass stub / UND-return stub / UND trampoline tail. None of these
+/// regions hold guest data the hypervisor reads back through
+/// `guest_endian`, so the byte-order predicate and the autosave-gating
+/// predicate want exactly the same set.
+pub fn is_hypervisor_code_region(pa: u32) -> bool {
+    // Tracer trampoline pool, `tracer::TRAMPOLINE_IPA..TRAMPOLINE_END`.
+    // Hardcoded here (not via `crate::tracer`) because the `tracer`
+    // module is `#[cfg(feature = "trace")]`-only, while this predicate
+    // must compile in every build. The pool is empty ROM tail when the
+    // feature is off, so applying the range unconditionally is harmless.
+    const TRACER_POOL_BASE: u32 = 0x0090_0000;
+    const TRACER_POOL_END: u32 = 0x00E0_0000;
+
+    // DABT fast trampoline (between Einstein.rex tail and tracer pool).
+    if (DABT_FAST_TRAMP_OFFSET as u32..TRACER_POOL_BASE).contains(&pa) {
+        return true;
+    }
+    if (TRACER_POOL_BASE..TRACER_POOL_END).contains(&pa) {
+        return true;
+    }
+    // Patch-stub arena → FPA bypass stub → UND-return stub → UND
+    // trampoline, all contiguous in the ROM aperture tail.
+    if (crate::rom_patches::PATCH_STUB_ARENA_BASE..ROM_TAIL_STUBS_END).contains(&pa) {
+        return true;
+    }
+    false
+}
 
 /// Install the DABT-vector intercept stub at `DABT_TRAMP_OFFSET` and
 /// patch VA 0x10 to branch to it. Serves two roles:

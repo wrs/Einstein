@@ -9,7 +9,7 @@
 //! `TNativePrimitives::ExecuteNetworkManagerNative`
 //! (`Emulator/TNativePrimitives.cpp:2889-3151`).
 
-use crate::{cpu, guest_mem, kprintln, trap::TrapContext};
+use crate::{cpu, kprintln, peripherals::guest_access, trap::TrapContext};
 
 /// Network-manager driver class ID in the native-primitive encoding.
 pub const DRIVER_ID: u32 = 0x00_000A;
@@ -56,14 +56,9 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
             let dst = ctx.x[1] as u32;
             let size = (ctx.x[2] as u32).min(DEFAULT_MAC.len() as u32);
             for i in 0..size {
-                let pa = guest_mem::translate_va(dst.wrapping_add(i)).unwrap_or(dst.wrapping_add(i));
-                if !guest_mem::write_byte_pa(pa, DEFAULT_MAC[i as usize]) {
-                    kprintln!(
-                        "*** network.GetDeviceAddress: cannot write byte at {:#x} @PC={:#x}",
-                        dst.wrapping_add(i), pc
-                    );
-                    cpu::halt();
-                }
+                guest_access::write_byte_or_halt(
+                    dst.wrapping_add(i), DEFAULT_MAC[i as usize],
+                    "network.GetDeviceAddress", pc);
             }
             ctx.x[0] = 0;
         }
@@ -112,26 +107,16 @@ fn log_string(ctx: &mut TrapContext, pc: u32) {
     let mut buf = [0u8; 1023];
     let mut len = 0usize;
     while len < buf.len() {
-        let pa = guest_mem::translate_va(addr).unwrap_or(addr);
-        match guest_mem::read_byte_pa(pa) {
-            Some(0) => break,
-            Some(b) => {
-                buf[len] = b;
-                len += 1;
-                addr = addr.wrapping_add(1);
-            }
-            None => {
-                // Einstein completes this log path, so a failed guest
-                // read is a hypervisor emulation bug, not a guest bug —
-                // halt loudly like every other native-prim guest access
-                // (periph-L6).
-                kprintln!(
-                    "*** network.Log: cannot read at {:#x} @PC={:#x}",
-                    addr, pc
-                );
-                cpu::halt();
-            }
+        // Einstein completes this log path, so a failed guest read is a
+        // hypervisor emulation bug, not a guest bug — halt loudly like
+        // every other native-prim guest access (periph-L6).
+        let b = guest_access::read_byte_or_halt(addr, "network.Log", pc);
+        if b == 0 {
+            break;
         }
+        buf[len] = b;
+        len += 1;
+        addr = addr.wrapping_add(1);
     }
     if let Ok(s) = core::str::from_utf8(&buf[..len]) {
         kprintln!("network.Log: {}", s);

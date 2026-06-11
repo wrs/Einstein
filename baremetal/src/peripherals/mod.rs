@@ -9,6 +9,7 @@ pub mod battery;
 pub mod dma;
 pub mod flash;
 pub mod flash_driver;
+pub mod guest_access;
 pub mod host_call;
 pub mod host_dma;
 pub mod in_translator;

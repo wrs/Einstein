@@ -5,9 +5,11 @@
 #[cfg(not(test))]
 use core::arch::global_asm;
 
+mod arm_decode;
 mod audio;
 mod banked;
 mod cpu;
+mod diag_util;
 #[cfg(feature = "platform-raspi3b")]
 mod display;
 mod flash_persist;

@@ -494,17 +494,12 @@ fn maybe_autosave_via_semihost(ctx: &TrapContext) {
 /// The tracer pool is only populated when the `trace` feature is on,
 /// but checking always is cheap and harmless — nothing the guest
 /// does naturally lands ELR_EL2 in that range otherwise.
+///
+/// Delegates to `guest_mem::is_hypervisor_code_region` — the single
+/// source of truth for these ranges, shared with
+/// `guest_endian::pa_is_rom_code` so the two lists can't drift.
 fn pc_in_hypervisor_transient_region(pc: u32) -> bool {
-    if (0x008F_FF00..0x0090_0000).contains(&pc) {
-        return true;
-    }
-    if (0x0090_0000..0x00E0_0000).contains(&pc) {
-        return true;
-    }
-    if (0x00FF_FD80..0x0100_0000).contains(&pc) {
-        return true;
-    }
-    false
+    crate::guest_mem::is_hypervisor_code_region(pc)
 }
 
 /// Write a snapshot to the next ring slot. Called from periodic

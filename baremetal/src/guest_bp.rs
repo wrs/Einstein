@@ -35,7 +35,7 @@
 //!
 //! The tracer (`src/tracer.rs`) uses `UDF #imm16` with `imm16` in
 //! `0..FN_COUNT` (Newton's table is ~20k entries). We reserve
-//! `UDF #0xFFFE` as our marker — safely above any plausible
+//! `UDF #0xFF0E` as our marker — safely above any plausible
 //! `FN_COUNT`. `handle_und` in `trap.rs` dispatches to us first, so
 //! we never reach tracer's code path.
 //!
@@ -60,8 +60,9 @@ use crate::trap::{self, TrapContext};
 /// Max number of live breakpoints at once.
 pub const TABLE_SIZE: usize = 16;
 
-/// UDF A1 encoding for `UDF #0xFFFE`. Unique enough to distinguish
-/// from tracer UDFs (which use `imm16 < FN_COUNT`).
+/// UDF A1 encoding for `UDF #0xFF0E` (verified with
+/// `arm-none-eabi-objdump`: `0xE7FFF0FE` → `udf #0xff0e`). Unique
+/// enough to distinguish from tracer UDFs (which use `imm16 < FN_COUNT`).
 pub const BP_UDF_INSN: u32 = 0xE7FF_F0FE;
 
 /// Top of the ROM stage-2 window; `install` rejects higher addresses.

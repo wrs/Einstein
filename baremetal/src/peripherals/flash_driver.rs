@@ -22,7 +22,7 @@
 //! Writes and erases call into `peripherals::flash` which owns the
 //! backing bytes (same backing stage-2 maps RW).
 
-use crate::{cpu, guest_mem, kprintln, peripherals::flash, trap::TrapContext};
+use crate::{cpu, guest_mem, kprintln, peripherals::flash, peripherals::guest_access, trap::TrapContext};
 
 /// Flash-driver class ID in the native-primitive encoding.
 pub const DRIVER_ID: u32 = 0x00_0000;
@@ -94,13 +94,8 @@ fn identify(ctx: &mut TrapContext, pc: u32) {
         (0x14, 0x0001_0000), // block size
     ];
     for (off, val) in fields {
-        if !write_guest_word(id_struct_addr + off, val) {
-            kprintln!(
-                "*** flash_driver.Identify: cannot write at addr={:#x} @PC={:#x}",
-                id_struct_addr + off, pc
-            );
-            cpu::halt();
-        }
+        guest_access::write_word_or_halt(
+            id_struct_addr + off, val, "flash_driver.Identify", pc);
     }
     ctx.x[0] = 1;
 }
@@ -135,16 +130,8 @@ fn write(ctx: &mut TrapContext, pc: u32) {
     // DoWrite invokes TFlashDriver::Write, the vtable first-word
     // check below will catch the mismatch.
     let flash_range = ctx.x[4] as u32;
-    let v_table = match read_guest_word(flash_range) {
-        Some(v) => v,
-        None => {
-            kprintln!(
-                "*** flash_driver.Write: cannot read virtualTable via flashRange={:#x} @PC={:#x}",
-                flash_range, pc
-            );
-            cpu::halt();
-        }
-    };
+    let v_table = guest_access::read_word_or_halt(
+        flash_range, "flash_driver.Write virtualTable", pc);
     let is_32bit = VTABLES_32BIT.contains(&v_table);
 
     let pa = match resolve_flash_pa(addr) {
@@ -212,16 +199,8 @@ fn start_erase(ctx: &mut TrapContext, pc: u32) {
     let flash_range = ctx.x[1] as u32;
     let addr = ctx.x[2] as u32;
 
-    let v_table = match read_guest_word(flash_range) {
-        Some(v) => v,
-        None => {
-            kprintln!(
-                "*** flash_driver.StartErase: cannot read virtualTable via flashRange={:#x} @PC={:#x}",
-                flash_range, pc
-            );
-            cpu::halt();
-        }
-    };
+    let v_table = guest_access::read_word_or_halt(
+        flash_range, "flash_driver.StartErase virtualTable", pc);
     let block_size = if VTABLES_32BIT.contains(&v_table) { 0x2_0000 } else { 0x1_0000 };
 
     let pa = match resolve_flash_pa(addr) {
@@ -243,13 +222,8 @@ fn start_erase(ctx: &mut TrapContext, pc: u32) {
 /// Einstein and here, so set r0=1 (complete) and *r3=0 (no error).
 fn is_erase_complete(ctx: &mut TrapContext, pc: u32) {
     let result_addr = ctx.x[3] as u32;
-    if !write_guest_word(result_addr, 0) {
-        kprintln!(
-            "*** flash_driver.IsEraseComplete: cannot write result at {:#x} @PC={:#x}",
-            result_addr, pc
-        );
-        cpu::halt();
-    }
+    guest_access::write_word_or_halt(
+        result_addr, 0, "flash_driver.IsEraseComplete result", pc);
     ctx.x[0] = 1;
 }
 
@@ -305,25 +279,5 @@ fn do_erase(ctx: &mut TrapContext, _pc: u32) {
 fn resolve_flash_pa(addr: u32) -> Option<u32> {
     let pa = guest_mem::translate_va(addr).unwrap_or(addr);
     flash::pa_to_offset(pa).map(|_| pa)
-}
-
-/// Helper: try writing `value` at a guest address, first by VA
-/// translation then by treating it as a PA. Returns whether the
-/// backing accepted the store.
-fn write_guest_word(addr: u32, value: u32) -> bool {
-    if crate::guest_endian::guest_write_u32_va(addr, value) {
-        return true;
-    }
-    crate::guest_endian::guest_write_u32_pa(addr, value)
-}
-
-/// Read a word at a guest address with the same VA-first / PA-fallback
-/// semantics as `write_guest_word`. Lets MMU-off callers (guest tests)
-/// pass PAs directly.
-fn read_guest_word(addr: u32) -> Option<u32> {
-    if let Some(v) = crate::guest_endian::guest_read_u32_va(addr) {
-        return Some(v);
-    }
-    crate::guest_endian::guest_read_u32_pa(addr)
 }
 

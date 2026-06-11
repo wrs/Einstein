@@ -48,27 +48,16 @@ use crate::guest_mem;
 #[cfg(not(nh_guest_test))]
 #[inline]
 fn pa_is_rom_code(pa: u32) -> bool {
-    // Tracer trampoline pool: written by `tracer::init` as native-LE
-    // instruction words (slot[0]/slot[1]/slot[2]) interleaved with
-    // byte-swapped data literals (slot[3]/slot[4]). The classifier's
-    // reach.bitmap doesn't cover this address range — and can't, since
-    // the slots are populated at runtime — so without this short-circuit
-    // a `handle_und` decoding the trampoline's `hvc #TRACE_TAG` from
-    // USR mode would byteswap it and miss the dispatch arm.
-    #[cfg(feature = "trace")]
-    if pa >= crate::tracer::TRAMPOLINE_IPA && pa < crate::tracer::TRAMPOLINE_END {
-        return true;
-    }
-    // Patch-stub arena: every wrapper installed by `rom_patches` (the
-    // ResolveFault wrapper, NewStack pad, LockHeapRange wrappers, …)
-    // is plain ARM-encoded LE instruction words — same situation as the
-    // tracer pool. The classifier's bitmap doesn't reach here either.
-    // Without this short-circuit, a USR-mode HVC inside a wrapper (e.g.
-    // the ResolveFault-wrapper exit probe) gets its insn byteswapped
-    // before handle_und compares against `HvcImm::*.insn()`, and the
-    // dispatch arm fails to match.
-    if pa >= crate::rom_patches::PATCH_STUB_ARENA_BASE
-        && pa < crate::rom_patches::PATCH_STUB_ARENA_END {
+    // Regions the hypervisor populates at runtime with native-LE
+    // instruction words — the tracer trampoline pool, the patch-stub
+    // arena and the FPA/UND/DABT trampoline stubs. The classifier's
+    // reach.bitmap can't cover them (they're written after load), so a
+    // `handle_und` decoding e.g. the tracer trampoline's `hvc #TRACE_TAG`
+    // or a USR-mode HVC inside a patch wrapper would byteswap the word
+    // and miss the dispatch arm without this short-circuit. Shared with
+    // `snapshot::pc_in_hypervisor_transient_region` so the two range
+    // lists can't drift.
+    if guest_mem::is_hypervisor_code_region(pa) {
         return true;
     }
     let pa = pa as usize;

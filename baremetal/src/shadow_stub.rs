@@ -92,9 +92,10 @@ pub fn scratch_pool_host_pa() -> u64 {
 fn code_write_word(ipa: u32, word: u32) -> Result<(), &'static str> {
     if (ipa as usize) + 4 <= crate::guest_mem::ROM_SIZE {
         let host = crate::guest_mem::rom_host_pa() as usize + ipa as usize;
-        // SAFETY: ROM backing is hypervisor-owned and word-sized writes are
-        // race-free against the guest before stage2 enable; we're called
-        // from the stub installer.
+        // SAFETY: word-sized write into the hypervisor-owned ROM backing.
+        // Called from the stub installer while the guest is paused in an
+        // EL2 trap on the only core, so nothing else can read or write
+        // this word concurrently.
         unsafe { core::ptr::write_volatile(host as *mut u32, word); }
         return Ok(());
     }

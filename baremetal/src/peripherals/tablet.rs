@@ -15,7 +15,7 @@
 //! when the kernel sets and reads back its own calibration.
 
 use core::cell::UnsafeCell;
-use crate::{cpu, kprintln, trap::TrapContext};
+use crate::{cpu, kprintln, peripherals::guest_access, trap::TrapContext};
 
 /// Tablet-driver class ID in the native-primitive encoding.
 pub const DRIVER_ID: u32 = 0x00_0005;
@@ -87,9 +87,8 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
                 (0x10, s.cal_0c),
                 (0x10, s.cal_0c), // Einstein writes 0x10 twice.
             ] {
-                if !write_guest_word(base.wrapping_add(off), val) {
-                    halt_io("GetTabletCalibration", base.wrapping_add(off), pc);
-                }
+                guest_access::write_word_or_halt(
+                    base.wrapping_add(off), val, "tablet.GetTabletCalibration", pc);
             }
         }
         // SetTabletCalibration(in=r1) — mirror Einstein: read +0x00/+0x04/
@@ -97,11 +96,11 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         // value). No r0 write per Einstein.
         0x0A => {
             let base = ctx.x[1] as u32;
-            s.cal_00 = read_guest_word_or_halt(base.wrapping_add(0x00), pc);
-            s.cal_04 = read_guest_word_or_halt(base.wrapping_add(0x04), pc);
-            s.cal_08 = read_guest_word_or_halt(base.wrapping_add(0x08), pc);
-            s.cal_0c = read_guest_word_or_halt(base.wrapping_add(0x10), pc);
-            s.cal_0c = read_guest_word_or_halt(base.wrapping_add(0x10), pc);
+            s.cal_00 = guest_access::read_word_or_halt(base.wrapping_add(0x00), "tablet.SetTabletCalibration", pc);
+            s.cal_04 = guest_access::read_word_or_halt(base.wrapping_add(0x04), "tablet.SetTabletCalibration", pc);
+            s.cal_08 = guest_access::read_word_or_halt(base.wrapping_add(0x08), "tablet.SetTabletCalibration", pc);
+            s.cal_0c = guest_access::read_word_or_halt(base.wrapping_add(0x10), "tablet.SetTabletCalibration", pc);
+            s.cal_0c = guest_access::read_word_or_halt(base.wrapping_add(0x10), "tablet.SetTabletCalibration", pc);
         }
         // SetDoingCalibration — r0 = 0.
         0x0B => {
@@ -111,9 +110,8 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         // No r0 write per Einstein.
         0x0C => {
             for which in [ctx.x[1] as u32, ctx.x[2] as u32] {
-                if !write_guest_word(which, 0x0320_0000) {
-                    halt_io("GetTabletResolution", which, pc);
-                }
+                guest_access::write_word_or_halt(
+                    which, 0x0320_0000, "tablet.GetTabletResolution", pc);
             }
         }
         // TabSetOrientation — r0 = 0.
@@ -162,12 +160,8 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
                 Some((sample, ticks)) => {
                     let r1 = ctx.x[1] as u32;
                     let r2 = ctx.x[2] as u32;
-                    if !write_guest_word(r1, sample) {
-                        halt_io("NativeGetSample.sample", r1, pc);
-                    }
-                    if !write_guest_word(r2, ticks) {
-                        halt_io("NativeGetSample.ticks", r2, pc);
-                    }
+                    guest_access::write_word_or_halt(r1, sample, "tablet.NativeGetSample.sample", pc);
+                    guest_access::write_word_or_halt(r2, ticks, "tablet.NativeGetSample.ticks", pc);
                     ctx.x[0] = 1;
                     use core::sync::atomic::{AtomicUsize, Ordering};
                     static N: AtomicUsize = AtomicUsize::new(0);
@@ -202,25 +196,3 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
     }
 }
 
-fn write_guest_word(addr: u32, value: u32) -> bool {
-    if crate::guest_endian::guest_write_u32_va(addr, value) {
-        return true;
-    }
-    crate::guest_endian::guest_write_u32_pa(addr, value)
-}
-
-fn read_guest_word_or_halt(addr: u32, pc: u32) -> u32 {
-    if let Some(v) = crate::guest_endian::guest_read_u32_va(addr) {
-        return v;
-    }
-    if let Some(v) = crate::guest_endian::guest_read_u32_pa(addr) {
-        return v;
-    }
-    kprintln!("*** tablet: cannot read at {:#x} @PC={:#x}", addr, pc);
-    cpu::halt();
-}
-
-fn halt_io(what: &str, addr: u32, pc: u32) -> ! {
-    kprintln!("*** tablet.{}: cannot write at {:#x} @PC={:#x}", what, addr, pc);
-    cpu::halt();
-}

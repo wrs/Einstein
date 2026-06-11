@@ -9,6 +9,8 @@
 //! don't want to resume never return (they call `cpu::halt`).
 
 use crate::{cpu, guest_mem, hvc_imm::HvcImm, kprintln, mmio, peripherals, peripherals::{native_primitives, vic}, platform, timer};
+use crate::diag_util::SeenSet;
+use core::ptr::addr_of_mut;
 
 macro_rules! read_sysreg {
     ($reg:literal) => {{
@@ -649,7 +651,7 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
     if is_obviously_unreachable_ipa(ipa) {
         let spsr = read_sysreg!("spsr_el2") as u32;
         let mode = spsr & 0x1F;
-        let mode_label = aarch32_mode_label(mode);
+        let mode_label = crate::arm_decode::aarch32_mode_name(mode);
         // r13/r14 of the source mode via Table D1-79 (ctx.x[13]/[14]
         // are SP_usr/LR_usr regardless of source mode).
         let cur_sp = crate::banked::sp_for_mode(ctx, spsr);
@@ -979,8 +981,11 @@ fn drop_flash_write(ctx: &mut TrapContext, iss: u32, elr: u32) -> bool {
         }
         let writeback = (!p) || w;
         if writeback {
+            // Guest CPSR at the data abort = SPSR_EL2; RRX writeback needs
+            // its carry flag (arm_decode::arm_shift reads CPSR.C).
+            let guest_cpsr = read_sysreg!("spsr_el2") as u32;
             let rm_val = ctx.x[rm] as u32;
-            let shifted = arm_shift(rm_val, shift_type, imm5);
+            let shifted = crate::arm_decode::arm_shift(rm_val, shift_type, imm5, guest_cpsr);
             let pre_rn = ctx.x[rn] as u32;
             let post_rn = if u {
                 pre_rn.wrapping_add(shifted)
@@ -993,48 +998,6 @@ fn drop_flash_write(ctx: &mut TrapContext, iss: u32, elr: u32) -> bool {
     }
 
     false
-}
-
-/// ARMv7 immediate-shift evaluation for the `imm5/type` field of LDR/STR
-/// register-offset forms. The carry-out is unused here (we only need the
-/// shifted value for address arithmetic).
-fn arm_shift(value: u32, shift_type: u32, imm5: u32) -> u32 {
-    match shift_type {
-        // LSL
-        0 => value.wrapping_shl(imm5),
-        // LSR — imm5==0 means shift by 32, yielding 0
-        1 => if imm5 == 0 { 0 } else { value.wrapping_shr(imm5) },
-        // ASR — imm5==0 means shift by 32 (sign extend)
-        2 => {
-            if imm5 == 0 {
-                ((value as i32) >> 31) as u32
-            } else {
-                ((value as i32).wrapping_shr(imm5)) as u32
-            }
-        }
-        // ROR / RRX — imm5==0 is RRX (one-bit rotate through carry); we
-        // don't have carry here, so approximate with a logical right-1.
-        _ => {
-            if imm5 == 0 {
-                value >> 1
-            } else {
-                value.rotate_right(imm5)
-            }
-        }
-    }
-}
-
-fn aarch32_mode_label(mode: u32) -> &'static str {
-    match mode {
-        0x10 => "usr",
-        0x11 => "fiq",
-        0x12 => "irq",
-        0x13 => "svc",
-        0x17 => "abt",
-        0x1B => "und",
-        0x1F => "sys",
-        _    => "???",
-    }
 }
 
 fn handle_instruction_abort(ctx: &TrapContext, iss: u32) {
@@ -1074,11 +1037,7 @@ fn handle_instruction_abort(ctx: &TrapContext, iss: u32) {
     );
     let spsr = read_sysreg!("spsr_el2") as u32;
     let mode = spsr & 0x1F;
-    let mode_name = match mode {
-        0x10 => "usr", 0x11 => "fiq", 0x12 => "irq", 0x13 => "svc",
-        0x16 => "mon", 0x17 => "abt", 0x1A => "hyp", 0x1B => "und",
-        0x1F => "sys", _ => "???",
-    };
+    let mode_name = crate::arm_decode::aarch32_mode_name(mode);
     // R14 of the active mode via Table D1-79 (ctx.x[14] is LR_usr
     // regardless of source mode; LR_und lives in ctx.x[22], etc.).
     let mode_lr = crate::banked::lr_for_mode(ctx, spsr);
@@ -1486,7 +1445,7 @@ fn dump_und_history() {
         kprintln!(
             "  #{:>3}  PC={:#010x} insn={:#010x} mode={:#x}({}) sp={:#010x} lr_usr={:#010x} caller={:#010x} outer={:#010x}",
             (count - n as u64 + k as u64),
-            e.faulting_pc, e.insn, mode, describe_aarch32_mode(mode),
+            e.faulting_pc, e.insn, mode, crate::arm_decode::aarch32_mode_name(mode),
             e.sp_for_mode, e.lr_usr, e.caller_lr, e.outer_caller_lr,
         );
     }
@@ -1907,7 +1866,7 @@ fn handle_und(ctx: &mut TrapContext) {
             // here: if cond fails, return to source mode at
             // faulting_pc+4 without entering the FPE.
             let cond = (insn >> 28) & 0xF;
-            if !arm_condition_passed(cond, spsr_und as u32) {
+            if !crate::arm_decode::arm_cond_passed(cond, spsr_und as u32) {
                 log_fpa_cond_skip(faulting_pc, insn);
                 return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
                 return;
@@ -1940,7 +1899,7 @@ fn handle_und(ctx: &mut TrapContext) {
             kprintln!(
                 "  src_mode={:#x} ({})  r0..r7:   {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
                 (spsr_und as u32) & 0x1F,
-                describe_aarch32_mode((spsr_und as u32) & 0x1F),
+                crate::arm_decode::aarch32_mode_name((spsr_und as u32) & 0x1F),
                 ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
                 ctx.x[4] as u32, ctx.x[5] as u32, ctx.x[6] as u32, ctx.x[7] as u32,
             );
@@ -2107,7 +2066,7 @@ fn emulate_fpa_ctrl_reg(
     spsr_und: u64,
 ) {
     let cond = (insn >> 28) & 0xF;
-    let passed = arm_condition_passed(cond, spsr_und as u32);
+    let passed = crate::arm_decode::arm_cond_passed(cond, spsr_und as u32);
     if passed {
         let is_read = ((insn >> 20) & 1) != 0;
         let rt = ((insn >> 12) & 0xF) as usize;
@@ -2124,51 +2083,10 @@ fn emulate_fpa_ctrl_reg(
     return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
 }
 
-/// Evaluate an ARM A1 condition field against NZCV flags from a CPSR
-/// snapshot. Cond == 0xF (unconditional) is not reachable here because
-/// the FPA control/status encodings always have a real condition in
-/// bits 31:28; defensively we treat it as AL.
-fn arm_condition_passed(cond: u32, cpsr: u32) -> bool {
-    let n = (cpsr >> 31) & 1;
-    let z = (cpsr >> 30) & 1;
-    let c = (cpsr >> 29) & 1;
-    let v = (cpsr >> 28) & 1;
-    match cond & 0xF {
-        0x0 => z == 1,                  // EQ
-        0x1 => z == 0,                  // NE
-        0x2 => c == 1,                  // CS / HS
-        0x3 => c == 0,                  // CC / LO
-        0x4 => n == 1,                  // MI
-        0x5 => n == 0,                  // PL
-        0x6 => v == 1,                  // VS
-        0x7 => v == 0,                  // VC
-        0x8 => c == 1 && z == 0,        // HI
-        0x9 => c == 0 || z == 1,        // LS
-        0xA => n == v,                  // GE
-        0xB => n != v,                  // LT
-        0xC => z == 0 && n == v,        // GT
-        0xD => z == 1 || n != v,        // LE
-        0xE => true,                    // AL
-        _ => true,                      // 0xF: defensive
-    }
-}
-
 fn log_fpa_ctrl_reg(pc: u32, insn: u32, cond_passed: bool) {
-    const SEEN_CAP: usize = 16;
-    static mut SEEN: [u32; SEEN_CAP] = [0; SEEN_CAP];
-    static mut SEEN_N: usize = 0;
-    // SAFETY: single-threaded EL2.
-    let first = unsafe {
-        let mut found = false;
-        for i in 0..SEEN_N { if SEEN[i] == pc { found = true; break; } }
-        if !found && SEEN_N < SEEN_CAP {
-            SEEN[SEEN_N] = pc;
-            SEEN_N += 1;
-            true
-        } else {
-            false
-        }
-    };
+    static mut SEEN: SeenSet<u32, 16> = SeenSet::new(0);
+    // SAFETY: single-core EL2; see diag_util module docs.
+    let first = unsafe { (*addr_of_mut!(SEEN)).first_time(pc) };
     if first {
         let name = match (insn >> 20) & 0xF {
             2 => "WFS",
@@ -2194,21 +2112,9 @@ fn log_fpa_ctrl_reg(pc: u32, insn: u32, cond_passed: bool) {
 /// unconditionally and produced wrong results — see the calc-bug
 /// analysis (0.2 → 0.02 via decimal-encoder's dvfple/mufmie).
 fn log_fpa_cond_skip(pc: u32, insn: u32) {
-    const SEEN_CAP: usize = 16;
-    static mut SEEN: [u32; SEEN_CAP] = [0; SEEN_CAP];
-    static mut SEEN_N: usize = 0;
-    // SAFETY: single-threaded EL2.
-    let first = unsafe {
-        let mut found = false;
-        for i in 0..SEEN_N { if SEEN[i] == pc { found = true; break; } }
-        if !found && SEEN_N < SEEN_CAP {
-            SEEN[SEEN_N] = pc;
-            SEEN_N += 1;
-            true
-        } else {
-            false
-        }
-    };
+    static mut SEEN: SeenSet<u32, 16> = SeenSet::new(0);
+    // SAFETY: single-core EL2; see diag_util module docs.
+    let first = unsafe { (*addr_of_mut!(SEEN)).first_time(pc) };
     if first {
         let cond = (insn >> 28) & 0xF;
         let cond_name = match cond {
@@ -2336,6 +2242,54 @@ fn dump_tstacks_and_check_invariants(marker_far: u32) {
     let mut total_stacks = 0usize;
     let mut errors = 0usize;
 
+    // Print one TStackInfo run (slots `run_first..=run_first+run_count-1`
+    // all pointing at the same `info`), check its invariants, and record
+    // its VA range for the overlap pass. Used both when a run ends mid-
+    // iteration and for the trailing run.
+    let flush_run = |info: u32,
+                     run_first: u32,
+                     run_count: u32,
+                     total_stacks: &mut usize,
+                     errors: &mut usize,
+                     ranges: &mut [(u32, u32); 64],
+                     nranges: &mut usize| {
+        if info == 0 || run_count == 0 {
+            return;
+        }
+        let i_hard  = rd(info.wrapping_add(4)).unwrap_or(0);
+        let i_norm  = rd(info.wrapping_add(20)).unwrap_or(0);
+        let i_curr  = rd(info.wrapping_add(24)).unwrap_or(0);
+        let i_end   = rd(info.wrapping_add(28)).unwrap_or(0);
+        let i_field0= rd(info.wrapping_add(0)).unwrap_or(0);
+        let i_n     = rd(info.wrapping_add(8)).unwrap_or(0);
+        let guard   = i_hard.wrapping_sub(i_norm);
+        let range   = i_end.wrapping_sub(i_hard);
+        let covers_marker = marker_far >= i_norm && marker_far < i_end;
+        kprintln!(
+            "    slot[{:3}..{:3}] info @ {:#010x}: norm={:#010x} hard(+4)={:#010x} curr(+24)={:#010x} top(+28)={:#010x} +0={:#010x} +8(n)={:#x} guard={:#x} range={:#x}{}",
+            run_first, run_first + run_count - 1, info,
+            i_norm, i_hard, i_curr, i_end, i_field0, i_n, guard, range,
+            if covers_marker { "  ***MARKER***" } else { "" },
+        );
+        *total_stacks += 1;
+        if guard != 0x1000 {
+            kprintln!("      [INV] guard != 4 KiB: {:#x}", guard);
+            *errors += 1;
+        }
+        if i_curr < i_hard || i_curr > i_end {
+            kprintln!("      [INV] info[+24]={:#010x} not in [hard..top]", i_curr);
+            *errors += 1;
+        }
+        if i_hard < i_norm || i_hard > i_end {
+            kprintln!("      [INV] info[+4]={:#010x} not in [norm..top]", i_hard);
+            *errors += 1;
+        }
+        if *nranges < ranges.len() {
+            ranges[*nranges] = (i_norm, i_end);
+            *nranges += 1;
+        }
+    };
+
     for _d_iter in 0..16 {
         if domain == 0 { break; }
         if domain < 0x0c00_0000 || domain >= 0x0d00_0000 {
@@ -2363,91 +2317,22 @@ fn dump_tstacks_and_check_invariants(marker_far: u32) {
             let mut last_info: u32 = 0;
             let mut run_first: u32 = 0;
             let mut run_count: u32 = 0;
-            // Helper closure-equivalent: we print the run when info changes
-            // or at end of iteration. Inline below.
             for s in 0..num_slots {
                 let info = rd(slots_ptr.wrapping_add(s.wrapping_mul(4))).unwrap_or(0);
                 if info == last_info && info != 0 {
                     run_count += 1;
                     continue;
                 }
-                // Flush previous run.
-                if last_info != 0 {
-                    let i_hard  = rd(last_info.wrapping_add(4)).unwrap_or(0);
-                    let i_norm  = rd(last_info.wrapping_add(20)).unwrap_or(0);
-                    let i_curr  = rd(last_info.wrapping_add(24)).unwrap_or(0);
-                    let i_end   = rd(last_info.wrapping_add(28)).unwrap_or(0);
-                    let i_field0= rd(last_info.wrapping_add(0)).unwrap_or(0);
-                    let i_n     = rd(last_info.wrapping_add(8)).unwrap_or(0);
-                    let guard   = i_hard.wrapping_sub(i_norm);
-                    let range   = i_end.wrapping_sub(i_hard);
-                    let slot_range_str_first = run_first;
-                    let slot_range_str_last  = run_first + run_count - 1;
-                    let covers_marker = marker_far >= i_norm && marker_far < i_end;
-                    kprintln!(
-                        "    slot[{:3}..{:3}] info @ {:#010x}: norm={:#010x} hard(+4)={:#010x} curr(+24)={:#010x} top(+28)={:#010x} +0={:#010x} +8(n)={:#x} guard={:#x} range={:#x}{}",
-                        slot_range_str_first, slot_range_str_last, last_info,
-                        i_norm, i_hard, i_curr, i_end, i_field0, i_n, guard, range,
-                        if covers_marker { "  ***MARKER***" } else { "" },
-                    );
-                    total_stacks += 1;
-                    if guard != 0x1000 {
-                        kprintln!("      [INV] guard != 4 KiB: {:#x}", guard);
-                        errors += 1;
-                    }
-                    if i_curr < i_hard || i_curr > i_end {
-                        kprintln!("      [INV] info[+24]={:#010x} not in [hard..top]", i_curr);
-                        errors += 1;
-                    }
-                    if i_hard < i_norm || i_hard > i_end {
-                        kprintln!("      [INV] info[+4]={:#010x} not in [norm..top]", i_hard);
-                        errors += 1;
-                    }
-                    if nranges < ranges.len() {
-                        ranges[nranges] = (i_norm, i_end);
-                        nranges += 1;
-                    }
-                }
-                // Start new run.
+                // Flush previous run, then start a new one.
+                flush_run(last_info, run_first, run_count,
+                    &mut total_stacks, &mut errors, &mut ranges, &mut nranges);
                 last_info = info;
                 run_first = s;
                 run_count = if info == 0 { 0 } else { 1 };
             }
             // Flush trailing run.
-            if last_info != 0 && run_count > 0 {
-                let i_hard  = rd(last_info.wrapping_add(4)).unwrap_or(0);
-                let i_norm  = rd(last_info.wrapping_add(20)).unwrap_or(0);
-                let i_curr  = rd(last_info.wrapping_add(24)).unwrap_or(0);
-                let i_end   = rd(last_info.wrapping_add(28)).unwrap_or(0);
-                let i_field0= rd(last_info.wrapping_add(0)).unwrap_or(0);
-                let i_n     = rd(last_info.wrapping_add(8)).unwrap_or(0);
-                let guard   = i_hard.wrapping_sub(i_norm);
-                let range   = i_end.wrapping_sub(i_hard);
-                let covers_marker = marker_far >= i_norm && marker_far < i_end;
-                kprintln!(
-                    "    slot[{:3}..{:3}] info @ {:#010x}: norm={:#010x} hard(+4)={:#010x} curr(+24)={:#010x} top(+28)={:#010x} +0={:#010x} +8(n)={:#x} guard={:#x} range={:#x}{}",
-                    run_first, run_first + run_count - 1, last_info,
-                    i_norm, i_hard, i_curr, i_end, i_field0, i_n, guard, range,
-                    if covers_marker { "  ***MARKER***" } else { "" },
-                );
-                total_stacks += 1;
-                if guard != 0x1000 {
-                    kprintln!("      [INV] guard != 4 KiB: {:#x}", guard);
-                    errors += 1;
-                }
-                if i_curr < i_hard || i_curr > i_end {
-                    kprintln!("      [INV] info[+24]={:#010x} not in [hard..top]", i_curr);
-                    errors += 1;
-                }
-                if i_hard < i_norm || i_hard > i_end {
-                    kprintln!("      [INV] info[+4]={:#010x} not in [norm..top]", i_hard);
-                    errors += 1;
-                }
-                if nranges < ranges.len() {
-                    ranges[nranges] = (i_norm, i_end);
-                    nranges += 1;
-                }
-            }
+            flush_run(last_info, run_first, run_count,
+                &mut total_stacks, &mut errors, &mut ranges, &mut nranges);
         }
 
         // GetNext: read next_item from item[+0], subtract item_offset.
@@ -2478,6 +2363,14 @@ fn dump_tstacks_and_check_invariants(marker_far: u32) {
     );
 }
 
+/// Loud-halt canary dispatcher. The `apply_loud_halt_traps` ROM patches
+/// rewrite the first instruction of the kernel reset / fault sinks
+/// (`Reboot`, `PowerOffAndReboot`, `StopImage`, the bus-error `Throw`)
+/// to an `HVC` that routes here, so the boot stops at the first hit with
+/// a full context dump instead of silently rebooting. Identifies which
+/// site fired (priv-mode HVCs land ELR_EL2 just past the patched insn;
+/// USR-mode HVCs route through the UND trampoline so the real site is
+/// `LR_<mode> - 4`), prints the canary, and halts.
 fn handle_loud_halt(ctx: &TrapContext) -> ! {
     let spsr_el2 = read_sysreg!("spsr_el2") as u32;
     let elr_el2 = read_sysreg!("elr_el2") as u32;
@@ -2516,7 +2409,7 @@ fn handle_loud_halt(ctx: &TrapContext) -> ! {
     );
     kprintln!(
         "  SPSR_EL2 = {:#010x}  mode={} ({:#x})",
-        spsr_el2, describe_aarch32_mode(mode), mode
+        spsr_el2, crate::arm_decode::aarch32_mode_name(mode), mode
     );
     kprintln!(
         "  R0 = {:#010x}  R1 = {:#010x}  R2 = {:#010x}  R3 = {:#010x}",
@@ -2524,7 +2417,7 @@ fn handle_loud_halt(ctx: &TrapContext) -> ! {
     );
     kprintln!(
         "  R12={:#010x}  R14_{}={:#010x}  (caller LR via Table D1-79)",
-        ctx.x[12] as u32, describe_aarch32_mode(mode), caller_lr
+        ctx.x[12] as u32, crate::arm_decode::aarch32_mode_name(mode), caller_lr
     );
     // BusErrorThrow site: also dump R4 (= TStackManager*), R5 (= the
     // ResolveFault return value, e.g. -10203/-10204), the FAR_EL1
@@ -2566,7 +2459,7 @@ fn handle_loud_halt(ctx: &TrapContext) -> ! {
         kprintln!(
             "  DABT-save: LR_abt={:#010x}  SP_abt={:#010x}  SPSR_abt={:#010x} (pre-abt mode={} {:#x}{})",
             dabt_lr_abt, dabt_sp_abt, dabt_spsr_abt,
-            describe_aarch32_mode(dabt_pre_mode), dabt_pre_mode,
+            crate::arm_decode::aarch32_mode_name(dabt_pre_mode), dabt_pre_mode,
             if dabt_thumb { ", T" } else { "" },
         );
         kprintln!(
@@ -2679,10 +2572,6 @@ fn handle_loud_halt(ctx: &TrapContext) -> ! {
     cpu::halt();
 }
 
-/// Canary handler for `Reboot(long, unsigned long, unsigned char)` at
-/// 0x000D_9884. Symmetric with `handle_poweroff_reboot`: halt on the
-/// first hit with R0..R3 (reboot reason / flags / ...) and the preceding
-/// tracer line naming the caller.
 /// Canary handler for `BootOS` / `ROMBoot` (0x0001_8688). The AArch32
 /// reset vector at VA 0 branches here, so the first entry after the
 /// hypervisor ERETs the guest is legitimate — we emulate the original
@@ -2731,7 +2620,7 @@ fn handle_bootos_canary(ctx: &mut TrapContext) {
     );
     kprintln!(
         "  SPSR_EL2 = {:#010x}  mode={} ({:#x})",
-        spsr_el2, describe_aarch32_mode(mode), mode
+        spsr_el2, crate::arm_decode::aarch32_mode_name(mode), mode
     );
     kprintln!(
         "  R0 = {:#010x}  R1 = {:#010x}  R2 = {:#010x}  R3 = {:#010x}",
@@ -2739,7 +2628,7 @@ fn handle_bootos_canary(ctx: &mut TrapContext) {
     );
     kprintln!(
         "  R12={:#010x}  R14_{}={:#010x}  (caller LR via Table D1-79)",
-        ctx.x[12] as u32, describe_aarch32_mode(mode), caller_lr
+        ctx.x[12] as u32, crate::arm_decode::aarch32_mode_name(mode), caller_lr
     );
     kprintln!();
     kprintln!(
@@ -2800,14 +2689,6 @@ fn print_exception_name(label: &str, name_va: u32) {
     }
 }
 
-/// Halt-on-entry tripwire for `UnhandledException(char*, void*,
-/// void(*)(void*))` (and the NonUserMode variant). The kernel calls
-/// these when it can't dispatch an exception to any installed handler;
-/// the caller passes the exception NAME as a C-string in r0. Catching
-/// here is far cleaner than letting Reboot fire and decoding the
-/// stack-passed string from a downstream caller.
-///
-/// `non_user` distinguishes the two variants (false ⇒ regular USR
 /// Common halt path for invariant-violation tripwires (iter-30+
 /// instrumentation pass). Emits a uniform header, runs the per-
 /// assertion local-context dump, runs `task_dump::dump()` for
@@ -2837,6 +2718,14 @@ fn halt_invariant(label: &str, local_dump: impl FnOnce()) -> ! {
     cpu::halt();
 }
 
+/// Halt-on-entry tripwire for `UnhandledException(char*, void*,
+/// void(*)(void*))` (and the NonUserMode variant). The kernel calls
+/// these when it can't dispatch an exception to any installed handler;
+/// the caller passes the exception NAME as a C-string in r0. Catching
+/// here is far cleaner than letting Reboot fire and decoding the
+/// stack-passed string from a downstream caller.
+///
+/// `non_user` distinguishes the two variants (false ⇒ regular USR
 /// path, true ⇒ kernel/UND path). Halts via `halt_invariant`.
 fn handle_unhandled_exception(ctx: &TrapContext, non_user: bool) -> ! {
     let r0 = ctx.x[0] as u32;
@@ -2857,7 +2746,7 @@ fn handle_unhandled_exception(ctx: &TrapContext, non_user: bool) -> ! {
         print_exception_name("exception name (r0)", r0);
         kprintln!(
             "  TRUE source mode={} ({:#x})  caller_lr={:#010x}  sp={:#010x}",
-            describe_aarch32_mode(true_source_mode),
+            crate::arm_decode::aarch32_mode_name(true_source_mode),
             true_source_mode, true_caller_lr, true_source_sp,
         );
         kprintln!("  exception data (r1) — first 8 words:");
@@ -3019,7 +2908,7 @@ fn handle_dah_mrs_spsr_patch(ctx: &mut TrapContext) {
             "DAH-mrs-patch[{}]: r1_in={:#010x} mrs={:#010x} saved-slot={:#010x} \
              (pre-abt mode={:#x} = {}) faulting_PC={:#010x} FAR={:#010x}{}",
             n, r1_in, mrs_view, spsr_abt_save, spsr_abt_save & 0x1F,
-            describe_aarch32_mode(spsr_abt_save & 0x1F),
+            crate::arm_decode::aarch32_mode_name(spsr_abt_save & 0x1F),
             lr_abt_save.wrapping_sub(8), far,
             if (mrs_view & 0x1F) != (spsr_abt_save & 0x1F) {
                 "  *** MRS DIVERGES ***"
@@ -3238,7 +3127,7 @@ fn handle_diag(ctx: &mut TrapContext) {
     // fired (typically ABT for the PABT-vector intercept and the
     // DABT-dispatch fallthrough). The "pre-abort" / "pre-fault" mode
     // is named by the matching banked SPSR (SPSR_abt for ABT-source).
-    let mode_name = describe_aarch32_mode(hvc_src_mode);
+    let mode_name = crate::arm_decode::aarch32_mode_name(hvc_src_mode);
 
     kprintln!();
     kprintln!("*** DIAG vector intercept (HVC #DIAG_TAG from mode {}) ***", mode_name);
@@ -3345,7 +3234,7 @@ fn handle_diag(ctx: &mut TrapContext) {
     kprintln!(
         "  HVC source mode = {:#x} ({}); pre-fault mode (from SPSR_<src>) = {:#x} ({}), T={}",
         hvc_src_mode, mode_name,
-        pre_mode, describe_aarch32_mode(pre_mode), thumb as u32
+        pre_mode, crate::arm_decode::aarch32_mode_name(pre_mode), thumb as u32
     );
     kprintln!(
         "  pre-fault SP={:#010x} LR={:#010x}  -> faulting PC {:#010x}  insn={:#010x}",
@@ -3397,7 +3286,7 @@ fn handle_diag(ctx: &mut TrapContext) {
     let mut frame = 2usize;
     for i in 0..64u32 {
         let va = sp_svc.wrapping_add(i * 4);
-        let pa_opt = guest_translate_va(va);
+        let pa_opt = guest_mem::translate_va(va);
         if pa_opt.is_none() { continue; }
         let pa = pa_opt.unwrap();
         let w = match crate::guest_endian::guest_read_u32_pa(pa) {
@@ -3423,32 +3312,6 @@ fn handle_diag(ctx: &mut TrapContext) {
     cpu::halt();
 }
 
-/// Translate a guest VA to its guest PA via the current stage-1
-/// tables. Returns None on a fault (unmapped / wrong descriptor type).
-/// Uses the same logic as `guest_mem::dump_stage1_walk` but returns
-/// the PA instead of printing.
-pub fn guest_translate_va(va: u32) -> Option<u32> {
-    // Assume TTBR0 = 0x04000000 (per probe findings) and walk the
-    // short-descriptor tables via guest_mem's PA accessors.
-    let l1_idx = (va >> 20) as usize;
-    let l1_entry = crate::guest_endian::guest_read_u32_pa(0x0400_0000 + (l1_idx as u32) * 4)?;
-    let ty = l1_entry & 3;
-    match ty {
-        2 => Some((l1_entry & 0xFFF0_0000) | (va & 0x000F_FFFF)),
-        1 => {
-            let l2_pa = l1_entry & 0xFFFF_FC00;
-            let l2_idx = (va >> 12) & 0xFF;
-            let l2_entry = crate::guest_endian::guest_read_u32_pa(l2_pa + l2_idx * 4)?;
-            match l2_entry & 3 {
-                1 => Some((l2_entry & 0xFFFF_0000) | (va & 0x0000_FFFF)),
-                2 | 3 => Some((l2_entry & 0xFFFF_F000) | (va & 0x0000_0FFF)),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
 fn read_banked_spsr(which: &'static str) -> u64 {
     // SAFETY: these are defined AArch64 system registers at EL2.
     unsafe {
@@ -3465,21 +3328,6 @@ fn read_banked_spsr(which: &'static str) -> u64 {
             _ => { v = 0; }
         }
         v
-    }
-}
-
-fn describe_aarch32_mode(mode: u32) -> &'static str {
-    match mode & 0x1F {
-        0x10 => "USR",
-        0x11 => "FIQ",
-        0x12 => "IRQ",
-        0x13 => "SVC",
-        0x16 => "MON",
-        0x17 => "ABT",
-        0x1A => "HYP",
-        0x1B => "UND",
-        0x1F => "SYS",
-        _    => "?",
     }
 }
 
@@ -3721,27 +3569,13 @@ fn log_dabt_forward(dfsc: u32, far: u32, mode: u32, ctx: &TrapContext) {
     // pre-abt CPSR.
     let spsr_abt_save = crate::guest_endian::guest_read_u32_pa(guest_mem::DABT_SAVE_PA + 8).unwrap_or(0);
     let pre_abt_mode_save = spsr_abt_save & 0x1F;
-    const SEEN_CAP: usize = 16;
-    static mut SEEN: [(u32, u32, u32); SEEN_CAP] = [(0, 0, 0); SEEN_CAP];
-    static mut SEEN_N: usize = 0;
+    static mut SEEN: SeenSet<(u32, u32, u32), 16> = SeenSet::new((0, 0, 0));
     // Dedup on the saved-slot mode (architecturally correct) so a single
     // physical fault doesn't double-print just because `mrs spsr_abt`
     // reads a different (stale) value than the saved slot.
     let dedup_mode = pre_abt_mode_save;
-    // SAFETY: single-threaded EL2.
-    let first = unsafe {
-        let mut found = false;
-        for i in 0..SEEN_N {
-            if SEEN[i] == (far, mode, dedup_mode) { found = true; break; }
-        }
-        if !found && SEEN_N < SEEN_CAP {
-            SEEN[SEEN_N] = (far, mode, dedup_mode);
-            SEEN_N += 1;
-            true
-        } else {
-            false
-        }
-    };
+    // SAFETY: single-core EL2; see diag_util module docs.
+    let first = unsafe { (*addr_of_mut!(SEEN)).first_time((far, mode, dedup_mode)) };
     if first {
         // Capture more context: LR_abt (faulting PC + 8) tells us *where*
         // the kernel was when the abort happened — critical when
@@ -3772,7 +3606,7 @@ fn log_dabt_forward(dfsc: u32, far: u32, mode: u32, ctx: &TrapContext) {
         );
         kprintln!(
             "  saved-slot SPSR_abt={:#010x} (pre-abt mode={:#x} = {})",
-            spsr_abt_save, pre_abt_mode_save, describe_aarch32_mode(pre_abt_mode_save),
+            spsr_abt_save, pre_abt_mode_save, crate::arm_decode::aarch32_mode_name(pre_abt_mode_save),
         );
         kprintln!(
             "  USR sp={:#010x} lr={:#010x}   SVC sp={:#010x} lr={:#010x}",
@@ -3802,21 +3636,9 @@ fn log_und_budgeted(name: &str, pc: u32, payload: Option<u32>) {
     // Dedup SystemBootUND / TapFileCntlUND by PC — only 6 sites in ROM
     // total. Same rationale as log_debugger_und: one log per site gives
     // us clear bring-up breadcrumbs without flooding on tight loops.
-    const SEEN_CAP: usize = 16;
-    static mut SEEN: [u32; SEEN_CAP] = [0; SEEN_CAP];
-    static mut SEEN_N: usize = 0;
-    // SAFETY: single-threaded.
-    let first = unsafe {
-        let mut found = false;
-        for i in 0..SEEN_N { if SEEN[i] == pc { found = true; break; } }
-        if !found && SEEN_N < SEEN_CAP {
-            SEEN[SEEN_N] = pc;
-            SEEN_N += 1;
-            true
-        } else {
-            false
-        }
-    };
+    static mut SEEN: SeenSet<u32, 16> = SeenSet::new(0);
+    // SAFETY: single-core EL2; see diag_util module docs.
+    let first = unsafe { (*addr_of_mut!(SEEN)).first_time(pc) };
     if first {
         match payload {
             Some(p) => kprintln!("und: {} @PC={:#x} payload={:#010x}", name, pc, p),
@@ -3934,21 +3756,9 @@ fn log_debugger_und(pc: u32, msg_start: u32, msg_end: u32) {
     // diverged. There are ~22 sites across ROM + REx, so an unfiltered
     // log of first-hits isn't noisy. Repeated hits at the same PC are
     // suppressed.
-    const SEEN_CAP: usize = 32;
-    static mut SEEN: [u32; SEEN_CAP] = [0; SEEN_CAP];
-    static mut SEEN_N: usize = 0;
-    // SAFETY: single-threaded.
-    let first = unsafe {
-        let mut found = false;
-        for i in 0..SEEN_N { if SEEN[i] == pc { found = true; break; } }
-        if !found && SEEN_N < SEEN_CAP {
-            SEEN[SEEN_N] = pc;
-            SEEN_N += 1;
-            true
-        } else {
-            false
-        }
-    };
+    static mut SEEN: SeenSet<u32, 32> = SeenSet::new(0);
+    // SAFETY: single-core EL2; see diag_util module docs.
+    let first = unsafe { (*addr_of_mut!(SEEN)).first_time(pc) };
     if first {
         // Extract the string (first up to 120 bytes) for the log.
         // See scan_to_null_word_aligned for why we iterate bytes in
@@ -4050,27 +3860,14 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
 
     // Budget-limited CP15 logging for bring-up diagnostics. Prints only the
     // first N unique (CRn, CRm, Opc1, Opc2, dir) tuples.
-    static mut CP15_SEEN: [u32; 32] = [0; 32];
-    static mut CP15_N: usize = 0;
+    static mut CP15_SEEN: SeenSet<u32, 32> = SeenSet::new(0);
     let key = ((is_read as u32) << 13)
         | (crn << 9)
         | (crm << 5)
         | (opc1 << 2)
         | opc2;
-    // SAFETY: single-threaded.
-    let should_log = unsafe {
-        let mut found = false;
-        for i in 0..CP15_N {
-            if CP15_SEEN[i] == key { found = true; break; }
-        }
-        if !found && CP15_N < 32 {
-            CP15_SEEN[CP15_N] = key;
-            CP15_N += 1;
-            true
-        } else {
-            false
-        }
-    };
+    // SAFETY: single-core EL2; see diag_util module docs.
+    let should_log = unsafe { (*addr_of_mut!(CP15_SEEN)).first_time(key) };
     if should_log {
         let value_log = if is_read { 0 } else { ctx.x[rt] as u32 };
         let elr = read_sysreg!("elr_el2");

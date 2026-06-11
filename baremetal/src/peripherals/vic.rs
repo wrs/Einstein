@@ -240,10 +240,11 @@ pub const INT_GPIO: u32 = 0x0100_0000;
 /// `host_io::queue::enqueue_pen_sample` when a fresh sample lands
 /// on the input queue.
 pub const INT_TABLET: u32 = 0x1000_0000;
-static VIC_DMA_RAISE_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
-static VIC_DMA_CLEAR_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
-static VIC_DMA_CTRL_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
-static VIC_DMA_FIQ_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+use crate::diag_util::LogBudget;
+static VIC_DMA_RAISE_LOG: LogBudget = LogBudget::new(8);
+static VIC_DMA_CLEAR_LOG: LogBudget = LogBudget::new(8);
+static VIC_DMA_CTRL_LOG: LogBudget = LogBudget::new(16);
+static VIC_DMA_FIQ_LOG: LogBudget = LogBudget::new(16);
 
 /// Public raiser: OR `mask` into `int_present`. The next `update_virq`
 /// (called at every sync-trap exit and after `timer::on_irq`) reflects
@@ -261,8 +262,7 @@ pub fn raise(mask: u32) {
     // Sound-DMA raises: log the first few so IRQ delivery into the
     // guest is auditable (present + enabled + unmasked = deliverable).
     if mask & INT_DMA_CH5 != 0 {
-        let n = VIC_DMA_RAISE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-        if n < 8 || n % 64 == 0 {
+        if VIC_DMA_RAISE_LOG.allow_or_every(64) {
             crate::kprintln!(
                 "vic: raise dma mask={:#x} ipres={:#x} ictrl={:#x} fiq={:#x} deliverable={:#x}",
                 mask,
@@ -756,17 +756,14 @@ pub fn write(ipa: u64, value: u32) {
     let s = unsafe { &mut *VIC.0.get() };
     // Log architecturally-significant VIC writes for diagnostic purposes.
     // Budget-limited so we don't drown in logs.
-    static LOG_N: AtomicU32 = AtomicU32::new(0);
+    static WRITE_LOG: LogBudget = LogBudget::new(32);
     let interesting = matches!(ipa,
         K_HDWR_MATCH_0 | K_HDWR_MATCH_1 | K_HDWR_MATCH_2 | K_HDWR_MATCH_3
         | K_HDWR_INT_CTRL | K_HDWR_FIQ_MASK
         | K_HDWR_INT_ED_1 | K_HDWR_INT_ED_2 | K_HDWR_INT_ED_3
     );
-    if interesting {
-        let n = LOG_N.fetch_add(1, Ordering::Relaxed);
-        if n < 32 {
-            crate::kprintln!("vic: write IPA={:#010x} <- {:#010x}", ipa, value);
-        }
+    if interesting && WRITE_LOG.allow() {
+        crate::kprintln!("vic: write IPA={:#010x} <- {:#010x}", ipa, value);
     }
     let mut match_reprogrammed = false;
     match ipa {
@@ -807,8 +804,7 @@ pub fn write(ipa: u64, value: u32) {
             // Sound-DMA enable-bit edges, first few only: shows when
             // the kernel arms/disarms its sound IRQ source.
             if ((before ^ value) & INT_DMA_CH5) != 0 {
-                let n = VIC_DMA_CTRL_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-                if n < 16 {
+                if VIC_DMA_CTRL_LOG.allow() {
                     crate::kprintln!(
                         "vic: int_ctrl {:#x} -> {:#x} (dma5 {})",
                         before,
@@ -827,8 +823,7 @@ pub fn write(ipa: u64, value: u32) {
             // `vic: raise dma` — pairs of raise/clear prove the guest
             // is servicing the sound IRQ.
             if value & INT_DMA_CH5 != 0 {
-                let n = VIC_DMA_CLEAR_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-                if n < 8 || n % 64 == 0 {
+                if VIC_DMA_CLEAR_LOG.allow_or_every(64) {
                     crate::kprintln!(
                         "vic: clear dma value={:#x} ipres {:#x} -> {:#x}",
                         value,
@@ -844,8 +839,7 @@ pub fn write(ipa: u64, value: u32) {
             s.fiq_mask = value;
             // Sound-DMA FIQ-routing edges, first few only.
             if ((before ^ value) & INT_DMA_CH5) != 0 {
-                let n = VIC_DMA_FIQ_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-                if n < 16 {
+                if VIC_DMA_FIQ_LOG.allow() {
                     crate::kprintln!("vic: fiq_mask {:#x} -> {:#x}", before, value);
                 }
             }

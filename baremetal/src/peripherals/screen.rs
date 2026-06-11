@@ -32,7 +32,7 @@
 //! no inversion — and `host_io::push_blit` forwards each blit to a
 //! live host viewer for display.
 
-use crate::{cpu, guest_mem, kprintln, trap::TrapContext};
+use crate::{cpu, guest_mem, kprintln, peripherals::guest_access, trap::TrapContext};
 
 /// Screen-class driver ID in the native-primitive encoding.
 pub const DRIVER_ID: u32 = 0x00_0004;
@@ -167,15 +167,7 @@ fn get_screen_info(ctx: &mut TrapContext, pc: u32) {
     // through the live stage-1 walk; fall back to identity when the
     // MMU is off (guest-test runtime path).
     for (off, val) in fields {
-        let va = info_addr + off;
-        let pa = guest_mem::translate_va(va).unwrap_or(va);
-        if !crate::guest_endian::guest_write_u32_pa(pa, val) {
-            kprintln!(
-                "*** screen.GetScreenInfo: cannot write VA {:#x} (PA {:#x}) @PC={:#x}",
-                va, pa, pc
-            );
-            cpu::halt();
-        }
+        guest_access::write_word_or_halt(info_addr + off, val, "screen.GetScreenInfo", pc);
     }
     ctx.x[0] = 0;
 }
@@ -211,17 +203,17 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
     let src_rect_va = ctx.x[2] as u32;
     let dst_rect_va = ctx.x[3] as u32;
 
-    let addy = read_word_or_halt(pixmap_va, "pixmap.addy", pc);
+    let addy = guest_access::read_word_or_halt(pixmap_va, "pixmap.addy", pc);
     // rowBytes is in the HIGH 16 bits of the word at +0x04 (per
     // TScreenManager::Blit `srcRowBytes >> 16`). Iter-53 wedge:
     // reading the full word gave row_bytes = 0x00280000 — a 2.5 MB
     // stride that walked addy+(src_top*row_bytes) into unmapped
     // memory at 0xc64d000 within a few rows.
-    let row_bytes_pkd = read_word_or_halt(pixmap_va + 4, "pixmap.rowBytes_pkd", pc);
+    let row_bytes_pkd = guest_access::read_word_or_halt(pixmap_va + 4, "pixmap.rowBytes_pkd", pc);
     let row_bytes = row_bytes_pkd >> 16;
     // pixmap origin: src/dst rects are in this coord space; subtract
     // to get byte offsets relative to `addy`.
-    let pixmap_top_left = read_word_or_halt(pixmap_va + 8, "pixmap.topLeft", pc);
+    let pixmap_top_left = guest_access::read_word_or_halt(pixmap_va + 8, "pixmap.topLeft", pc);
     let pixmap_top = (pixmap_top_left >> 16) as u16;
     let pixmap_left = (pixmap_top_left & 0xFFFF) as u16;
 
@@ -488,7 +480,7 @@ fn ctx_blit_mode(ctx: &TrapContext, pc: u32) -> u8 {
         );
     }
     let sp = crate::banked::sp_for_mode(ctx, spsr as u32);
-    read_word_or_halt(sp.wrapping_add(4), "blit mode word [SP+4]", pc) as u8
+    guest_access::read_word_or_halt(sp.wrapping_add(4), "blit mode word [SP+4]", pc) as u8
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -511,26 +503,10 @@ fn push_blit_event(
     crate::host_io::push_blit(&ev, payload);
 }
 
-fn read_word_or_halt(va: u32, what: &str, pc: u32) -> u32 {
-    // VA-aware in MMU-on mode (Newton boot); identity in MMU-off mode
-    // (guest tests) — `translate_va` returns None when SCTLR.M=0.
-    let pa = guest_mem::translate_va(va).unwrap_or(va);
-    match crate::guest_endian::guest_read_u32_pa(pa) {
-        Some(v) => v,
-        None => {
-            kprintln!(
-                "*** screen.blit: cannot read {} at VA {:#x} (PA {:#x}) @PC={:#x}",
-                what, va, pa, pc
-            );
-            cpu::halt();
-        }
-    }
-}
-
 fn read_rect(rect_va: u32, what: &str, pc: u32) -> (u16, u16, u16, u16) {
     // Two packed u32s: first = (top << 16) | left, second = (bottom << 16) | right.
-    let w0 = read_word_or_halt(rect_va, what, pc);
-    let w1 = read_word_or_halt(rect_va + 4, what, pc);
+    let w0 = guest_access::read_word_or_halt(rect_va, what, pc);
+    let w1 = guest_access::read_word_or_halt(rect_va + 4, what, pc);
     (
         (w0 >> 16) as u16,
         (w0 & 0xFFFF) as u16,
@@ -544,11 +520,8 @@ fn log_blit(pc: u32, addy: u32, row_bytes: u32, height: u32,
     dt: u16, dl: u16, db: u16, dr: u16,
     copied: u32,
 ) {
-    use core::sync::atomic::{AtomicUsize, Ordering};
-    static BUDGET: AtomicUsize = AtomicUsize::new(0);
-    const MAX: usize = 8;
-    let n = BUDGET.fetch_add(1, Ordering::Relaxed);
-    if n < MAX {
+    static BUDGET: crate::diag_util::LogBudget = crate::diag_util::LogBudget::new(8);
+    if BUDGET.allow() {
         kprintln!(
             "screen.blit @PC={:#x} addy={:#x} rowBytes={} h={} src=({},{},{},{}) dst=({},{},{},{}) copied={}",
             pc, addy, row_bytes, height,
@@ -562,11 +535,8 @@ fn log_blit_enter(pc: u32, pixmap_va: u32, addy: u32, row_bytes: u32,
     st: u16, sl: u16, sb: u16, sr: u16,
     dt: u16, dl: u16, db: u16, dr: u16,
 ) {
-    use core::sync::atomic::{AtomicUsize, Ordering};
-    static BUDGET: AtomicUsize = AtomicUsize::new(0);
-    const MAX: usize = 8;
-    let n = BUDGET.fetch_add(1, Ordering::Relaxed);
-    if n < MAX {
+    static BUDGET: crate::diag_util::LogBudget = crate::diag_util::LogBudget::new(8);
+    if BUDGET.allow() {
         kprintln!(
             "screen.blit ENTER @PC={:#x} pixmap={:#x} addy={:#x} rowBytes={} pmTL=({},{}) src=({},{},{},{}) dst=({},{},{},{})",
             pc, pixmap_va, addy,

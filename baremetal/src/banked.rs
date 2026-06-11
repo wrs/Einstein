@@ -87,7 +87,6 @@ pub fn lr_for_mode(ctx: &TrapContext, cpsr: u32) -> u32 {
 ///
 /// FIQ-mode R8..R12 live in X24..X28 (FIQ-banked); for all other modes
 /// they alias R8_usr..R12_usr in X8..X12.
-#[allow(dead_code)]
 pub fn ctx_slot_for_reg(reg: u32, cpsr: u32) -> usize {
     if reg <= 7 {
         return reg as usize;

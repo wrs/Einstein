@@ -2,7 +2,7 @@
 //!
 //! `#[repr(u32)]` enum: variants in two contiguous blocks.
 //!
-//! 1. **Guest-test ABI** (`0x10..` — `GuestTestPrintByte..Debugger`):
+//! 1. **Guest-test ABI** (`0x10..` — `GuestTestPrintByte..GuestInjectPen`):
 //!    test binaries issue these as `hvc #imm` literals via the
 //!    `HVC_*` macros in `guest-tests/common/test_runtime.S`. The
 //!    block is anchored at 0x10 so the auto-incrementing rest can't

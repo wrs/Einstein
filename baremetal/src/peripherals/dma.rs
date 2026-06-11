@@ -50,7 +50,6 @@
 //! diagnostic chain.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{guest_endian, kprintln, peripherals::vic, uart};
 
@@ -162,10 +161,7 @@ static DMA: DmaCell = DmaCell(UnsafeCell::new(DmaState {
 /// console, while genuinely-unknown register offsets get their own
 /// generous budget so discovery never goes fully silent on the back of
 /// routine traffic.
-static EXPECTED_BUDGET: AtomicUsize = AtomicUsize::new(0);
-const EXPECTED_MAX: usize = 8;
-static UNKNOWN_BUDGET: AtomicUsize = AtomicUsize::new(0);
-const UNKNOWN_MAX: usize = 64;
+static LOG: crate::diag_util::TwoTierLog = crate::diag_util::TwoTierLog::new(8, 64);
 
 /// Returns true if `ipa` falls in the DMA register window this module
 /// owns.
@@ -445,15 +441,13 @@ pub fn poll_tx() {
 
 /// Expected-stub traffic (unmodeled channels 2-7): tight budget.
 fn log_expected(what: &str, ipa: u64, value: u32) {
-    let n = EXPECTED_BUDGET.fetch_add(1, Ordering::Relaxed);
-    if n < EXPECTED_MAX {
+    if LOG.expected() {
         kprintln!("{} IPA={:#010x} val={:#010x}", what, ipa, value);
     }
 }
 
 fn log_expected_chan(what: &str, bank: u32, channel: u32, register: u32, value: u32) {
-    let n = EXPECTED_BUDGET.fetch_add(1, Ordering::Relaxed);
-    if n < EXPECTED_MAX {
+    if LOG.expected() {
         kprintln!(
             "{} bank={} ch={} reg={} val={:#010x}",
             what, bank, channel, register, value
@@ -464,8 +458,7 @@ fn log_expected_chan(what: &str, bank: u32, channel: u32, register: u32, value: 
 /// Genuinely-unknown register offsets (discovery): own generous budget
 /// so routine stub traffic can't silence it.
 fn log_unknown_chan(what: &str, bank: u32, channel: u32, register: u32, value: u32) {
-    let n = UNKNOWN_BUDGET.fetch_add(1, Ordering::Relaxed);
-    if n < UNKNOWN_MAX {
+    if LOG.unknown() {
         kprintln!(
             "{} bank={} ch={} reg={} val={:#010x}",
             what, bank, channel, register, value

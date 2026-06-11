@@ -117,69 +117,15 @@ pub fn record_hvc(imm: u32) {
     }
 }
 
-/// Single-threaded Misra-Gries top-K tracker. Trap dispatch is core-0
-/// only, so plain `static mut` with a single critical section is fine.
-struct TopK {
-    keys: [u32; TOPK],
-    counts: [u64; TOPK],
-}
+// Misra-Gries top-K trackers (shared impl in `diag_util`). Single-core
+// EL2 safety is documented there.
+use crate::diag_util::TopK;
 
-impl TopK {
-    const fn new() -> Self {
-        Self { keys: [0; TOPK], counts: [0; TOPK] }
-    }
-
-    fn record(&mut self, key: u32) {
-        for i in 0..TOPK {
-            if self.counts[i] > 0 && self.keys[i] == key {
-                self.counts[i] = self.counts[i].saturating_add(1);
-                return;
-            }
-        }
-        for i in 0..TOPK {
-            if self.counts[i] == 0 {
-                self.keys[i] = key;
-                self.counts[i] = 1;
-                return;
-            }
-        }
-        for c in &mut self.counts {
-            *c = c.saturating_sub(1);
-        }
-    }
-
-    #[cfg(feature = "log_traps")]
-    fn snapshot_sorted(&self) -> [(u32, u64); TOPK] {
-        let mut out = [(0u32, 0u64); TOPK];
-        for i in 0..TOPK {
-            out[i] = (self.keys[i], self.counts[i]);
-        }
-        for k in 0..TOPK {
-            let mut best = k;
-            for j in (k + 1)..TOPK {
-                if out[j].1 > out[best].1 {
-                    best = j;
-                }
-            }
-            out.swap(k, best);
-        }
-        out
-    }
-
-    #[cfg(feature = "log_traps")]
-    fn reset(&mut self) {
-        for i in 0..TOPK {
-            self.keys[i] = 0;
-            self.counts[i] = 0;
-        }
-    }
-}
-
-static mut DABT_PC: TopK = TopK::new();
-static mut DABT_IPA: TopK = TopK::new();
-static mut CP15_OP: TopK = TopK::new();
-static mut CP15_PC: TopK = TopK::new();
-static mut FP_SIMD_PC: TopK = TopK::new();
+static mut DABT_PC: TopK<TOPK> = TopK::new();
+static mut DABT_IPA: TopK<TOPK> = TopK::new();
+static mut CP15_OP: TopK<TOPK> = TopK::new();
+static mut CP15_PC: TopK<TOPK> = TopK::new();
+static mut FP_SIMD_PC: TopK<TOPK> = TopK::new();
 
 /// Record a data abort by `(guest PC, IPA)`. Called from
 /// `handle_data_abort` after ELR/IPA have been read.

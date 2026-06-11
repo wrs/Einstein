@@ -106,60 +106,26 @@ static mut LAST_STATS: StatsSnapshot = StatsSnapshot {
 // dominant rejection reason in practice — the kernel emits LDRs at
 // PCs where R0..R3 and R12 are all live at PC+4, so the install
 // picker can't find scratches. Reset every dump so the top-K reflects
-// the current window, not a since-boot accumulation.
+// the current window, not a since-boot accumulation. Shared impl in
+// `diag_util::TopK`; single-core-EL2 safety documented there.
 const REJ_TOPK: usize = 16;
-struct RejTopK {
-    keys: [u32; REJ_TOPK],
-    counts: [u32; REJ_TOPK],
-}
-impl RejTopK {
-    const fn new() -> Self {
-        Self { keys: [0; REJ_TOPK], counts: [0; REJ_TOPK] }
-    }
-    fn record(&mut self, key: u32) {
-        for i in 0..REJ_TOPK {
-            if self.counts[i] > 0 && self.keys[i] == key {
-                self.counts[i] = self.counts[i].saturating_add(1);
-                return;
-            }
-        }
-        for i in 0..REJ_TOPK {
-            if self.counts[i] == 0 {
-                self.keys[i] = key;
-                self.counts[i] = 1;
-                return;
-            }
-        }
-        for c in &mut self.counts {
-            *c = c.saturating_sub(1);
-        }
-    }
-    #[cfg(feature = "log_traps")]
-    fn snapshot_sorted(&self) -> [(u32, u32); REJ_TOPK] {
-        let mut out = [(0u32, 0u32); REJ_TOPK];
-        for i in 0..REJ_TOPK {
-            out[i] = (self.keys[i], self.counts[i]);
-        }
-        for k in 0..REJ_TOPK {
-            let mut best = k;
-            for j in (k + 1)..REJ_TOPK {
-                if out[j].1 > out[best].1 {
-                    best = j;
-                }
-            }
-            out.swap(k, best);
-        }
-        out
-    }
-    #[cfg(feature = "log_traps")]
-    fn reset(&mut self) {
-        for i in 0..REJ_TOPK {
-            self.keys[i] = 0;
-            self.counts[i] = 0;
-        }
-    }
-}
-static mut REJ_NO_DEAD_PCS: RejTopK = RejTopK::new();
+static mut REJ_NO_DEAD_PCS: crate::diag_util::TopK<REJ_TOPK> =
+    crate::diag_util::TopK::new();
+
+/// Known-rejected-PC cache. A PC that fails `pick_scratches`
+/// (no_dead_scratches) is rejected *deterministically*: the rejection
+/// depends only on the code at that PC — the decoded operands and the
+/// CFG-liveness set at PC+4 — never on dynamic state (see
+/// `try_install_at`). So once a PC is known rejected, re-running the
+/// decode + `live_regs_at` CFG walk on every subsequent alignment fault
+/// at that PC is pure waste. Cache up to `REJ_CACHE_N` such PCs and
+/// short-circuit them at entry. Capacity-bounded: once full, new
+/// rejected PCs aren't cached (they just keep paying the walk), which is
+/// correct, just slower for the tail. Single-core-EL2 safety is
+/// documented on `diag_util::SeenSet`.
+const REJ_CACHE_N: usize = 32;
+static mut REJECTED_PC_CACHE: crate::diag_util::SeenSet<u32, REJ_CACHE_N> =
+    crate::diag_util::SeenSet::new(0);
 
 /// Detailed-log budget: log every install up to this count, then
 /// summary-only. Matches `unaligned::LOG_FIRST`'s convention.
@@ -186,6 +152,15 @@ pub fn try_install_at(faulting_pc: u32) -> bool {
     const ALIGN_INLINE_PC_LIMIT: u32 = 0x0090_0000;
     if faulting_pc & 3 != 0 || faulting_pc >= ALIGN_INLINE_PC_LIMIT {
         REJ_OUTSIDE_ROM.fetch_add(1, Ordering::Relaxed);
+        STUBS_REJECTED.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+
+    // Short-circuit PCs we've already deterministically rejected for
+    // no_dead_scratches: skip the decode + CFG-liveness walk entirely.
+    // SAFETY: single-core EL2; see diag_util module docs.
+    if unsafe { (*core::ptr::addr_of!(REJECTED_PC_CACHE)).contains(faulting_pc) } {
+        REJ_NO_DEAD_SCRATCHES.fetch_add(1, Ordering::Relaxed);
         STUBS_REJECTED.fetch_add(1, Ordering::Relaxed);
         return false;
     }
@@ -238,10 +213,15 @@ pub fn try_install_at(faulting_pc: u32) -> bool {
         None => {
             REJ_NO_DEAD_SCRATCHES.fetch_add(1, Ordering::Relaxed);
             STUBS_REJECTED.fetch_add(1, Ordering::Relaxed);
-            // SAFETY: single-threaded; only access site besides the
-            // dump's snapshot+reset is this line.
+            // SAFETY: single-core EL2; the REJ_NO_DEAD_PCS top-K is also
+            // touched by the dump's snapshot+reset, the REJECTED_PC_CACHE
+            // only by the entry probe above — all on core 0 in-trap.
             unsafe {
                 (*core::ptr::addr_of_mut!(REJ_NO_DEAD_PCS)).record(faulting_pc);
+                // Cache this PC so the next fault here skips the decode +
+                // CFG walk. Deterministic: the rejection is a function of
+                // the code at `faulting_pc` alone.
+                (*core::ptr::addr_of_mut!(REJECTED_PC_CACHE)).insert(faulting_pc);
             }
             return false;
         }

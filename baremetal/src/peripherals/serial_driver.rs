@@ -16,7 +16,6 @@
 //! 0x35 PutByte routes the byte (r1) through `kprintln!` with a budgeted
 //! log so guest serial output is visible without flooding the UART.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::{cpu, kprintln, trap::TrapContext};
 
 /// Serial-chip-driver class ID in the native-primitive encoding.
@@ -105,10 +104,8 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
 /// so a chatty guest doesn't drown the UART log; after BUDGET hits we
 /// drop bytes silently.
 fn log_putbyte(byte: u8) {
-    static BUDGET: AtomicUsize = AtomicUsize::new(0);
-    const MAX: usize = 256;
-    let n = BUDGET.fetch_add(1, Ordering::Relaxed);
-    if n < MAX {
+    static BUDGET: crate::diag_util::LogBudget = crate::diag_util::LogBudget::new(256);
+    if BUDGET.allow() {
         if byte.is_ascii() && (byte == b'\n' || byte == b'\r' || (byte >= 0x20 && byte < 0x7F)) {
             kprintln!("serial.PutByte: {:?}", byte as char);
         } else {

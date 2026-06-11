@@ -47,7 +47,7 @@
 //! them lazily than block the boot. Reads of unknown offsets in the
 //! controller range return 0.
 
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::kprintln;
 
@@ -161,10 +161,7 @@ static SLOT3: SlotRegs = SlotRegs::new();
 /// console, while genuinely-unknown register offsets and out-of-range
 /// accesses get their own generous budget so lazy discovery never goes
 /// silent behind routine traffic.
-static EXPECTED_BUDGET: AtomicUsize = AtomicUsize::new(0);
-const EXPECTED_MAX: usize = 8;
-static UNKNOWN_BUDGET: AtomicUsize = AtomicUsize::new(0);
-const UNKNOWN_MAX: usize = 64;
+static LOG: crate::diag_util::TwoTierLog = crate::diag_util::TwoTierLog::new(8, 64);
 
 pub fn owns(ipa: u64) -> bool {
     ipa_to_slot(ipa).is_some()
@@ -261,8 +258,7 @@ pub fn write(ipa: u64, value: u32) {
 
 /// Routine/expected traffic (card-side, known registers): tight budget.
 fn log_expected(what: &str, ipa: u64, value: u32) {
-    let n = EXPECTED_BUDGET.fetch_add(1, Ordering::Relaxed);
-    if n < EXPECTED_MAX {
+    if LOG.expected() {
         kprintln!("{} IPA={:#010x} val={:#010x}", what, ipa, value);
     }
 }
@@ -270,8 +266,7 @@ fn log_expected(what: &str, ipa: u64, value: u32) {
 /// Genuinely-unknown offsets / out-of-range (discovery): own budget so
 /// routine traffic can't silence it.
 fn log_unknown(what: &str, ipa: u64, value: u32) {
-    let n = UNKNOWN_BUDGET.fetch_add(1, Ordering::Relaxed);
-    if n < UNKNOWN_MAX {
+    if LOG.unknown() {
         kprintln!("{} IPA={:#010x} val={:#010x}", what, ipa, value);
     }
 }

@@ -14,7 +14,7 @@
 //!
 //! Logging subfns (0x1A Log) write through to the hypervisor UART.
 
-use crate::{cpu, guest_mem, kprintln, trap::TrapContext};
+use crate::{cpu, kprintln, peripherals::guest_access, trap::TrapContext};
 
 /// Platform-driver class ID in the native-primitive encoding.
 pub const DRIVER_ID: u32 = 0x00_0001;
@@ -216,13 +216,7 @@ fn get_pcmcia_power_spec(ctx: &mut TrapContext, pc: u32) {
             return;
         }
     };
-    if !write_guest_word(out_addr, value) {
-        kprintln!(
-            "*** platform.GetPCMCIAPowerSpec: cannot write at {:#x} @PC={:#x}",
-            out_addr, pc
-        );
-        cpu::halt();
-    }
+    guest_access::write_word_or_halt(out_addr, value, "platform.GetPCMCIAPowerSpec", pc);
     ctx.x[0] = 0;
 }
 
@@ -232,13 +226,7 @@ fn get_pcmcia_power_spec(ctx: &mut TrapContext, pc: u32) {
 /// (TNativePrimitives.cpp:906-914).
 fn fill_gestalt_emulator_info(ctx: &mut TrapContext, pc: u32) {
     let out_addr = ctx.x[1] as u32;
-    if !write_guest_word(out_addr, UP2_VERSION) {
-        kprintln!(
-            "*** platform.FillGestaltEmulatorInfo: cannot write at {:#x} @PC={:#x}",
-            out_addr, pc
-        );
-        cpu::halt();
-    }
+    guest_access::write_word_or_halt(out_addr, UP2_VERSION, "platform.FillGestaltEmulatorInfo", pc);
     ctx.x[0] = 0;
 }
 
@@ -246,13 +234,7 @@ fn fill_gestalt_emulator_info(ctx: &mut TrapContext, pc: u32) {
 /// Einstein writes 0 (off) to *r2 regardless of subsystem (TNP.cpp:873).
 fn get_subsystem_power(ctx: &mut TrapContext, pc: u32) {
     let out_addr = ctx.x[2] as u32;
-    if !write_guest_word(out_addr, 0) {
-        kprintln!(
-            "*** platform.GetSubsystemPower: cannot write at {:#x} @PC={:#x}",
-            out_addr, pc
-        );
-        cpu::halt();
-    }
+    guest_access::write_word_or_halt(out_addr, 0, "platform.GetSubsystemPower", pc);
     ctx.x[0] = 0;
 }
 
@@ -266,25 +248,17 @@ fn log_message(ctx: &mut TrapContext, pc: u32) {
     let mut buf = [0u8; 512];
     let mut len = 0usize;
     while len < buf.len() {
-        match read_guest_byte(addr) {
-            Some(0) => break,
-            Some(b) => {
-                buf[len] = b;
-                len += 1;
-                addr = addr.wrapping_add(1);
-            }
-            None => {
-                // Einstein's FastReadString completes this path, so a
-                // failed guest read is a hypervisor emulation bug, not a
-                // guest bug — halt loudly like every other native-prim
-                // guest access (periph-L6).
-                kprintln!(
-                    "*** platform.Log: cannot read at {:#x} @PC={:#x}",
-                    addr, pc
-                );
-                cpu::halt();
-            }
+        // Einstein's FastReadString completes this path, so a failed
+        // guest read is a hypervisor emulation bug, not a guest bug —
+        // halt loudly like every other native-prim guest access
+        // (periph-L6).
+        let b = guest_access::read_byte_or_halt(addr, "platform.Log", pc);
+        if b == 0 {
+            break;
         }
+        buf[len] = b;
+        len += 1;
+        addr = addr.wrapping_add(1);
     }
     if let Ok(s) = core::str::from_utf8(&buf[..len]) {
         kprintln!("platform.Log: {}", s);
@@ -300,29 +274,8 @@ fn log_message(ctx: &mut TrapContext, pc: u32) {
 fn get_user_info(ctx: &mut TrapContext, pc: u32) {
     let buf_size = ctx.x[2] as u32;
     let buf_addr = ctx.x[3] as u32;
-    if buf_size >= 1 && !write_guest_byte(buf_addr, 0) {
-        kprintln!(
-            "*** platform.GetUserInfo: cannot write NUL at {:#x} @PC={:#x}",
-            buf_addr, pc
-        );
-        cpu::halt();
+    if buf_size >= 1 {
+        guest_access::write_byte_or_halt(buf_addr, 0, "platform.GetUserInfo", pc);
     }
     ctx.x[0] = 0;
-}
-
-fn write_guest_word(addr: u32, value: u32) -> bool {
-    if crate::guest_endian::guest_write_u32_va(addr, value) {
-        return true;
-    }
-    crate::guest_endian::guest_write_u32_pa(addr, value)
-}
-
-fn read_guest_byte(addr: u32) -> Option<u8> {
-    let pa = guest_mem::translate_va(addr).unwrap_or(addr);
-    guest_mem::read_byte_pa(pa)
-}
-
-fn write_guest_byte(addr: u32, value: u8) -> bool {
-    let pa = guest_mem::translate_va(addr).unwrap_or(addr);
-    guest_mem::write_byte_pa(pa, value)
 }

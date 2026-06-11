@@ -20,7 +20,7 @@
 //! outside the four windows never reach this module (mmio.rs
 //! dispatches elsewhere).
 
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::{kprintln, uart};
 
@@ -126,13 +126,14 @@ pub fn write(ipa: u64, value: u32) {
 
 // ---- diagnostics --------------------------------------------------
 
-static TX_BUDGETS: [AtomicUsize; 4] = [
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-];
+use crate::diag_util::LogBudget;
 const TX_LOG_MAX: usize = 64;
+static TX_BUDGETS: [LogBudget; 4] = [
+    LogBudget::new(TX_LOG_MAX),
+    LogBudget::new(TX_LOG_MAX),
+    LogBudget::new(TX_LOG_MAX),
+    LogBudget::new(TX_LOG_MAX),
+];
 
 /// Running count of PIO TX bytes dropped on ports 1-3 (infrared, tablet,
 /// modem) — those ports have no modeled host backend, so their bytes are
@@ -160,8 +161,7 @@ fn log_tx_byte(port: u8, byte: u8) {
     } else {
         DROPPED_TX[port as usize].fetch_add(1, Ordering::Relaxed);
     }
-    let n = TX_BUDGETS[port as usize].fetch_add(1, Ordering::Relaxed);
-    if n < TX_LOG_MAX {
+    if TX_BUDGETS[port as usize].allow() {
         kprintln!("serial[{}]: TX {:#04x} ({})",
             port_name(port), byte,
             if byte.is_ascii_graphic() || byte == b' ' {

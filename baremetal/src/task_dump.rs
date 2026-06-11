@@ -381,7 +381,6 @@ pub fn dump() {
     dump_blocked_pcs();
 }
 
-/// For each task that's not RUN and has q.prev or wq1/wq2 non-zero
 /// Decode a jump-table slot at `pc` (must be in
 /// `0x01A0_0000..0x01C2_0000`). The JT is full of `b imm24`
 /// unconditional branches put there by post-ship ROM patches; the
@@ -642,6 +641,7 @@ fn print_chain_frame(depth: usize, frame: u32, pc: u32) {
     kprintln!("        #{:<2} frame={:#010x} pc={:#010x}  {}", depth, frame, pc, name);
 }
 
+/// For each task that's not RUN and has q.prev or wq1/wq2 non-zero
 /// (i.e. it's blocked somewhere), print its saved PC + SP_usr from the
 /// SWIBoot save area at task+0x4c / task+0x44. Useful for seeing
 /// "where is newt stuck?" without spamming the per-task save-area

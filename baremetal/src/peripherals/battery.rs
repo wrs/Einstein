@@ -89,20 +89,8 @@ const RAW_STATUS_FIELDS: [(u32, u32); 13] = [
 fn fill_status(ctx: &mut TrapContext, pc: u32, fields: &[(u32, u32)]) {
     let base = ctx.x[2] as u32;
     for &(off, val) in fields {
-        if !write_guest_word(base.wrapping_add(off), val) {
-            kprintln!(
-                "*** battery.fill_status: cannot write at {:#x} @PC={:#x}",
-                base.wrapping_add(off), pc
-            );
-            cpu::halt();
-        }
+        crate::peripherals::guest_access::write_word_or_halt(
+            base.wrapping_add(off), val, "battery.fill_status", pc);
     }
     ctx.x[0] = 0;
-}
-
-fn write_guest_word(addr: u32, value: u32) -> bool {
-    if crate::guest_endian::guest_write_u32_va(addr, value) {
-        return true;
-    }
-    crate::guest_endian::guest_write_u32_pa(addr, value)
 }

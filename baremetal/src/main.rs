@@ -27,6 +27,7 @@ mod mmio;
 mod mmu;
 mod panic;
 mod peripherals;
+mod probes;
 mod platform;
 mod rep_print;
 mod rom_patches;

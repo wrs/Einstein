@@ -2176,3 +2176,152 @@ unsafe fn patch_cp15_encodings(rom: *mut u32, word_count: usize) -> usize {
     }
     count
 }
+
+
+// ---- VA-walk / guest-string utilities (moved from trap.rs, review phase 9b) ----
+
+use crate::guest_endian::guest_read_u32_pa as read_guest_word_pa;
+
+
+/// Read up to `max` bytes of an ASCII C-string from guest VA, stopping
+/// at NUL or unmapped page. Used for exception-name dumps.
+pub(crate) fn read_cstr_at(va: u32, max: usize) -> ([u8; 128], usize) {
+    let mut buf = [0u8; 128];
+    let cap = max.min(128);
+    let mut len = 0;
+    let mut i = 0usize;
+    while i < cap {
+        // Read a 32-bit word at the next word-aligned position so we
+        // can extract the relevant bytes — stage-1 translate is
+        // word-granular in our helpers.
+        let word_va = (va.wrapping_add(i as u32)) & !0x3;
+        let off = ((va.wrapping_add(i as u32)) & 0x3) as usize;
+        let w = match crate::guest_endian::guest_read_u32_va(word_va) {
+            Some(w) => w,
+            None    => break,
+        };
+        // Newton 2.x stores strings in BE-byte-order even in our LE-
+        // word view (BE32 kernel built against SA-1100; iter-30 docs).
+        // Within a word, byte k of the string is `(w >> ((3-k)*8))`.
+        for j in off..4 {
+            if i >= cap { break; }
+            let shift = (3 - j) * 8;
+            let b = ((w >> shift) & 0xFF) as u8;
+            if b == 0 { return (buf, len); }
+            buf[i] = b;
+            len = i + 1;
+            i += 1;
+        }
+    }
+    (buf, len)
+}
+
+
+/// Resolve a guest address as seen by an AArch32 load/store instruction
+/// into a guest PA. Identity when the stage-1 MMU is off (SCTLR_EL1.M=0);
+/// stage-1 walk otherwise. Returns `None` only when the MMU is on and
+/// the VA is unmapped.
+pub(crate) fn resolve_guest_pa(addr: u32) -> Option<u32> {
+    let sctlr: u64;
+    // SAFETY: SCTLR_EL1 read has no side effects.
+    unsafe {
+        core::arch::asm!(
+            "mrs {}, sctlr_el1",
+            out(reg) sctlr,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    if sctlr & 1 == 0 {
+        Some(addr)
+    } else {
+        translate_va(addr)
+    }
+}
+
+
+/// Scan guest memory from `start` word-by-word for a null byte in
+/// any of the bytes of each word, and return the VA one past the end
+/// of the word that contains the null (aligned, since words are
+/// 4-byte aligned). `max_words` bounds the search so a missing null
+/// doesn't infinite-loop.
+/// Log a guest C string pointed to by `addr`.
+///
+/// The Newton 717006 ROM is stored big-endian in the image file and
+/// byteswapped per word at load time so LDR in our LE guest returns
+/// the u32 the original BE CPU saw (see `guest_mem::load_newton_rom`).
+/// Bytes within each 4-byte word end up reversed in host memory: a
+/// word originally `0x48 0x65 0x6C 0x6C` ("Hell" in BE) is laid out
+/// as `0x6C 0x6C 0x65 0x48` in host LE memory. To recover the
+/// original byte sequence we re-swap each loaded word via
+/// `to_be_bytes()`.
+///
+/// Guest-test binaries are LE-native (no ROM byteswap on load), so
+/// the bytes in host memory are already in natural order — use
+/// `to_le_bytes()`. We pick at compile time via `nh_guest_test`.
+pub(crate) fn log_guest_string(prefix: &'static str, addr: u32) {
+    const CAP: usize = 256;
+    let mut buf = [0u8; CAP];
+    let mut len = 0usize;
+    let mut va = addr;
+    'outer: while len < CAP {
+        let w = match read_guest_word_pa(va & !0x3) {
+            Some(v) => v,
+            None => break,
+        };
+        #[cfg(nh_guest_test)]
+        let bytes = w.to_le_bytes();
+        #[cfg(not(nh_guest_test))]
+        let bytes = w.to_be_bytes();
+        let first = (va & 0x3) as usize;
+        for i in first..4 {
+            let b = bytes[i];
+            if b == 0 { break 'outer; }
+            buf[len] = b;
+            len += 1;
+            if len == CAP { break 'outer; }
+        }
+        va = (va & !0x3).wrapping_add(4);
+    }
+    match core::str::from_utf8(&buf[..len]) {
+        Ok(s) => kprintln!("{}: {:?}", prefix, s),
+        Err(_) => kprintln!("{}: <{} non-utf8 bytes @ {:#x}>", prefix, len, addr),
+    }
+}
+
+
+pub(crate) fn scan_to_null_word_aligned(start: u32, max_words: u32) -> u32 {
+    let mut va = start & !0x3;
+    for _ in 0..max_words {
+        // The scan result becomes the guest's resume PC (the word after
+        // the DebuggerUND payload's terminator) — fabricating a
+        // terminator at an unreadable word would resume at a wrong PC,
+        // so halt loudly instead.
+        let w = match read_guest_word_pa(va) {
+            Some(v) => v,
+            None => {
+                kprintln!(
+                    "*** scan_to_null_word_aligned: PA={:#010x} unreadable \
+                     (scan started at {:#010x}) ***",
+                    va, start,
+                );
+                crate::cpu::halt();
+            }
+        };
+        // The ROM is stored big-endian (original 1990s Newton bytes)
+        // and our load_rom byteswaps each word so LDR in our LE guest
+        // returns the same u32 the original BE CPU saw. That means a
+        // byte-level string search has to examine the word in BE byte
+        // order — the null terminator is *BE-byte-order* inside a
+        // word, which is why we use to_be_bytes here, not to_le_bytes.
+        let bytes = w.to_be_bytes();
+        if bytes[0] == 0 || bytes[1] == 0 || bytes[2] == 0 || bytes[3] == 0 {
+            return va.wrapping_add(4);
+        }
+        va = va.wrapping_add(4);
+    }
+    // No null found within bound — return (start + max_words*4) as a
+    // best-effort stop. Caller will log + the guest may fault on the
+    // next fetch, which makes the miss visible.
+    va
+}
+

@@ -37,10 +37,21 @@ git history; the durable findings are in `docs/STRUCTURES.md` and
    load a known-simple package, see where it stops, fix, repeat.
 2. **Phase 6 remainder** — serial port and PCMCIA images on real
    hardware (audio is done). See `docs/REAL_HW_BRINGUP.md` §Phase 6.
-3. **Debug-scaffolding teardown** — boot has quiesced; the
-   Phase-B probes listed under "Diagnostic scaffolding" below are now
-   removal candidates.
-4. **M7 — performance and polish** (HIGHLEVEL.md §12): measurement vs
+3. **Debug-scaffolding teardown** — done. The one-off Phase-B
+   write-capture probes are gone; what remains is listed under
+   "Diagnostic scaffolding" below, kept deliberately as tripwires
+   and debugging tooling.
+4. **Targeted guest-TLB maintenance.** The hypervisor rewrites guest
+   stage-1 PTEs behind the guest's back (`fix_stage1_xn_bits`,
+   shadow-stub alias redirects, scratch-pool install) with no TLBI at
+   the rewrite sites; today a blanket `vmalle1` per 16 ms heartbeat
+   (`timer::on_irq`) bounds stale-entry lifetime. (Removing the g1 /
+   alrt capture probes — whose flip/rearm cycle did full
+   `VMALLE1IS` flushes as a side effect — exposed this: boot hung at
+   the post-`SystemBootUND` timer wait on real hw and intermittently
+   on QEMU.) Replace the blanket flush with targeted TLBIs at each
+   rewrite site, then drop it.
+5. **M7 — performance and polish** (HIGHLEVEL.md §12): measurement vs
    the real 162 MHz StrongARM; display-scaling quality on real hw.
 
 ## Workflow per stop
@@ -159,14 +170,11 @@ All 35 tests must pass.
 
 ## Diagnostic scaffolding (active)
 
-Boot has quiesced; these are now teardown candidates (goal 3 above).
+The one-off Phase-B probes are gone; these stay as permanent
+tripwires and debugging tooling.
 
 - `verify-mmu` in `fix_stage1_xn_bits` — ratchet-logs subpage-AP
   heterogeneity and per-alias-onset `(PA, VA1, VA2)` tuples.
-- `handle_page_get_probe` (PAGE_GET_PROBE_HVC_IMM=0x53) on
-  `0x00258EFC` — page-allocator return logger + dup detector.
-- `handle_remember_entry_probe_with` (REMEMBER_PROBE_HVC_IMM=0x46)
-  on `0x00258E0C` — Remember-side per-PA → first-VA aliasing tracker.
 - DABT/PABT DIAG vectors at ROM offsets `0x10` / `0x0C`.
-- BootOS / PowerOffAndReboot / Reboot canaries in `rom_patches.rs`.
-- `alrt_capture` / `g1_capture` stage-2 write captures, armed at boot.
+- BootOS / PowerOffAndReboot / Reboot canaries and the
+  BUS_ERROR_THROW loud-halt capture in `rom_patches.rs`.

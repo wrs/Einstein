@@ -62,44 +62,6 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
 
     crate::trap_hist::record_sync(ec);
 
-    // (Group-1 capture re-arm intentionally NOT here — see
-    // `trap_irq` for the rationale. Sync traps include the
-    // data-abort our own capture handler triggered, so re-arming
-    // here would race with STMIA-style multi-register stores that
-    // span a page boundary: each STMIA retry re-faults on the still-
-    // RO page and the loop never makes progress.)
-
-    // DIAG: log the first N sync traps' EC + ELR + ESR, no dedup, so
-    // we can see the guest PC timeline in the window leading up to a
-    // stall. Remove once Phase B stall is past.
-    //
-    // When the `trace` feature is on, suppress the trap log for
-    // HVC #TRACE_TAG: the tracer's own `trace <seq> ...` line
-    // carries the same signal, and pairing each with a `trap: EC=...`
-    // line doubles the output volume for no added information.
-    #[cfg(feature = "trace")]
-    let is_trace_hvc = ec == EC_HVC_A32 && (iss & 0xFFFF) == HvcImm::Trace as u32;
-    #[cfg(not(feature = "trace"))]
-    let is_trace_hvc = false;
-
-    static mut TRAP_LOG_BUDGET: usize = 5;
-    // SAFETY: single-threaded; only core 0 services EL2 traps.
-    let should_log = !is_trace_hvc
-        && unsafe {
-            let go = TRAP_LOG_BUDGET > 0;
-            if go { TRAP_LOG_BUDGET -= 1; }
-            go
-        };
-    if should_log {
-        let elr = read_sysreg!("elr_el2");
-        let spsr = read_sysreg!("spsr_el2");
-        let far = read_sysreg!("far_el1");
-        kprintln!(
-            "trap: EC={:#x} ({}) ELR={:#x} SPSR={:#010x} FAR={:#x} ESR={:#x}",
-            ec, describe_ec(ec), elr, spsr, far, esr
-        );
-    }
-
     match ec {
         EC_DATA_ABORT_LOWER => handle_data_abort(ctx, iss),
         EC_INSN_ABORT_LOWER => handle_instruction_abort(ctx, iss),
@@ -303,20 +265,6 @@ fn irq_from_el2() {
 /// rearms CNTHP_CVAL_EL2, runs the diagnostic / input-pump / autosave
 /// tail, and updates HCR_EL2.VI so the guest takes a virtual IRQ on ERET.
 fn irq_from_guest(ctx: &mut TrapContext) {
-    // Group-1 capture re-arm: any G1 page that took a permission-fault
-    // since the last IRQ has been auto-flipped to RW (so the store
-    // could complete). Re-impose RO+XN now so the *next* G1 write
-    // after this IRQ also faults and gets logged. Re-arming on IRQ
-    // (not sync trap) avoids racing with multi-register stores —
-    // STMIA-style instructions can span a page boundary, and each
-    // retry takes a sync trap; re-arming between retries would
-    // perpetually re-fault the same store. Timer IRQs fire on a
-    // ~16 ms cadence which is long enough for in-flight multi-stores
-    // to complete and short enough to capture distinct writer PCs
-    // through the boot.
-    crate::g1_capture::maybe_rearm();
-    crate::alrt_capture::maybe_rearm();
-
     // Acknowledge the interrupt on the host CPU-interface (GICv3 on
     // FVP, no-op on BCM2836) before doing any work. On GICv3 the
     // returned INTID identifies which source fired; a spurious ACK
@@ -468,13 +416,6 @@ fn irq_from_guest(ctx: &mut TrapContext) {
             if inject_count == 1 {
                 dump_und_history();
                 crate::task_dump::dump();
-                let counts = crate::peripherals::sound::snapshot_subfn_counts();
-                kprintln!("sound subfn invocation counts (since boot):");
-                for (i, c) in counts.iter().enumerate() {
-                    if *c > 0 {
-                        kprintln!("  subfn {:#04x}: {}", i, c);
-                    }
-                }
             }
             vic::inject_sound_dma_irq();
         }
@@ -681,47 +622,6 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
     let is_permission = (ifsc & 0b111100) == 0b001100;
     if wnr && is_permission && (ram_base..ram_end).contains(&ipa) {
         let page = (ipa as u32) & !0xFFF;
-
-        // Group-1 kernel-globals self-map capture: log the writer
-        // before the auto-flip lets the store complete. The
-        // re-arm-on-next-trap hook (`g1_capture::maybe_rearm`) will
-        // restore RO+XN so subsequent writes also fault.
-        if crate::g1_capture::is_armed_pa(page) {
-            let value = if isv != 0 { Some(ctx.x[srt] as u32) } else { None };
-            crate::g1_capture::note_perm_fault(elr, ipa as u32, value, srt as u32);
-        }
-
-        // alrt-task CList header capture: same shape as g1, dynamically
-        // armed when Prim Remember installs VA=0x0cca3000 (see
-        // `src/alrt_capture.rs`). Try instruction-level emulation
-        // first so the page can stay RO across consecutive writes;
-        // falls through to the auto-flip path on unrecognized
-        // instruction forms.
-        if crate::alrt_capture::is_armed_pa(page) {
-            let value = if isv != 0 { Some(ctx.x[srt] as u32) } else { None };
-            let spsr_el2 = read_sysreg!("spsr_el2") as u32;
-            crate::alrt_capture::note_perm_fault(
-                elr, ipa as u32, value, srt as u32, spsr_el2,
-            );
-            let result = crate::pa_emulate::try_emulate_store(
-                ctx, elr, spsr_el2, ipa as u32,
-            );
-            crate::pa_emulate::note(result);
-            if matches!(
-                result,
-                crate::pa_emulate::EmulationResult::Emulated
-                    | crate::pa_emulate::EmulationResult::Skipped,
-            ) {
-                // ELR already advanced and the store applied. Leave
-                // the page RO so the next write also faults; we keep
-                // capturing every store until the corruption is
-                // pinned to a specific (PC, value) pair.
-                return;
-            }
-            // Fell through with Unrecognized — fall back to the
-            // auto-flip behavior below so boot can continue.
-        }
-
         // SAFETY: helper performs its own TLB maintenance.
         unsafe { crate::stage2::set_ram_page_rw_xn(page); }
         // Don't advance ELR — the CPU retries the write.
@@ -1936,7 +1836,7 @@ fn handle_und(ctx: &mut TrapContext) {
         // right banked register, then advance ELR via the UND-return
         // stub since UND entry doesn't auto-advance.
         _ if insn == HvcImm::RememberSwiret.insn() => {
-            handle_remember_swiret_probe_with(ctx);
+            handle_remember_swiret_probe(ctx);
             return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
             return;
         }
@@ -2990,12 +2890,10 @@ fn halt_invariant(label: &str, local_dump: impl FnOnce()) -> ! {
     cpu::halt();
 }
 
-/// Phase-0 stub for the kernel-intent mask tracker. The full tracker
-/// (`KERNEL_INTENT_MASK` + `kim_remember` / `kim_forget`) was driven by
-/// the deleted PrimRememberMapping / PrimForgetMapping probes and went
-/// away with them. The pa_emulate / guest_mem callers handle `None`
-/// gracefully (treat as "no kernel intent recorded → don't flag"), so
-/// the stub keeps the API live without resurrecting the data path.
+/// Stub for the kernel-intent mask tracker: no intent data is
+/// recorded, so this always returns `None`. The `verify-mmu` alias
+/// audit in `guest_mem` handles `None` gracefully (treat as "no
+/// kernel intent recorded → don't flag").
 pub fn kernel_intent_mask_for(_pa: u32, _va: u32) -> Option<u32> {
     None
 }
@@ -3121,7 +3019,7 @@ fn handle_hammer_thunk(ctx: &mut TrapContext, kind: ThunkKind) {
     }
 }
 
-// ---- Remember post-SWI probe (surviving the iter-50..89 sweep) ----
+// ---- Remember post-SWI fixup (load-bearing, not a probe) ----
 //
 // Re-establishes the kernel's `r8 = -10003` sentinel after the SWI
 // return inside `TUDomainManager::Remember (static)`. The SWI dispatch
@@ -3130,10 +3028,6 @@ fn handle_hammer_thunk(ctx: &mut TrapContext, kind: ThunkKind) {
 // retry path doesn't engage. See `src/rom_patches.rs::apply_l1_cd_probes`.
 
 fn handle_remember_swiret_probe(ctx: &mut TrapContext) {
-    handle_remember_swiret_probe_with(ctx);
-}
-
-fn handle_remember_swiret_probe_with(ctx: &mut TrapContext) {
     // Emulate `mov r8, #237`. Together with the next ROM instruction
     // `sub r8, r8, #10240` this materialises r8 = -10003 (the kernel's
     // sentinel value loaded after the SWI return).
@@ -4628,7 +4522,7 @@ fn halt_unknown_cp15(is_read: bool, opc1: u32, crn: u32, crm: u32, opc2: u32, rt
 
 // Small inline module with the raw sysreg touches, kept close to the
 // dispatch above so the trap handler stays readable.
-mod cp15 {
+pub(crate) mod cp15 {
     // Only the write paths are used by the hypervisor: we intercept
     // guest MCRs to these CP15 registers via HCR_EL2.TVM and mirror
     // the value into the corresponding EL2 sysreg. Guest reads are

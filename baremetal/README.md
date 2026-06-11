@@ -97,8 +97,8 @@ What's working end-to-end:
   round-trip, banked-reg paths, `LDR` rotate, SWP, …).
 - **Diagnostic scaffolding.** DABT/PABT DIAG vectors at ROM offsets
   `0x10` / `0x0C`, BootOS / PowerOff / Reboot canaries, `verify-mmu`
-  alias-onset ratchet, page-allocator probe, kernel struct dumps
-  (`task_dump.rs` walks `TScheduler` / `TTask`).
+  alias-onset ratchet, kernel struct dumps (`task_dump.rs` walks
+  `TScheduler` / `TTask`).
 
 ## Prerequisites
 
@@ -473,11 +473,8 @@ baremetal/
     display/             VC4 mailbox framebuffer + boot splash
     mailbox.rs           VC firmware mailbox interface
     task_dump.rs         TScheduler / TTask walker
-    pa_emulate.rs        scattered PA-side instruction emulation
     unaligned.rs         unaligned-load fixup
     tarmac.rs            FVP Tarmac plugin window markers
-    alrt_capture.rs      ALRT capture
-    g1_capture.rs        Group-1 capture
   guest-tests/
     common/              shared runtime, linker script, HVC macros
     tests/               35 .S files + MANIFEST

@@ -189,17 +189,6 @@ fn invalidate_ipa_s2(ipa: u32) {
     }
 }
 
-/// Read back the stage-2 L3 entry covering the 4 KiB RAM page at
-/// `ipa`. None when `ipa` is outside the RAM aperture. Diagnostic
-/// helper for verifying a permission flip actually landed in the
-/// table.
-pub fn ram_page_l3_entry(ipa: u32) -> Option<u64> {
-    let page = ipa & !0xFFF;
-    let entry_ptr = ram_l3_entry_ptr(page)?;
-    // SAFETY: pointer bounded to one of two 512-entry L3 tables.
-    Some(unsafe { entry_ptr.read() })
-}
-
 /// Flip the stage-2 L3 entry for the 4 KiB RAM page at `ipa` to
 /// `RO + executable`. Called from the instruction-abort handler when
 /// the guest first executes a freshly-written RAM code page:
@@ -212,23 +201,6 @@ pub unsafe fn set_ram_page_ro_x(ipa: u32) {
     let Some(entry_ptr) = ram_l3_entry_ptr(page) else { return; };
     let host_pa = guest_mem::ram_host_pa() + (page as u64 - RAM_IPA_BASE);
     let new = host_pa | PAGE_NORMAL_RO;
-    // SAFETY: entry_ptr bounded to one of two 512-entry L3 tables.
-    unsafe { entry_ptr.write(new); }
-    invalidate_ipa_s2(page);
-}
-
-/// Flip the stage-2 L3 entry for the 4 KiB RAM page at `ipa` to
-/// `RO + execute-never`. Same trapping behaviour as `set_ram_page_ro_x`
-/// for writes (write-permission fault to EL2) but unlike the ro_x
-/// variant, instruction fetches also fault. Used by the Group-1
-/// kernel-globals self-map capture probe — those PA pages back the
-/// guest L1/L2 page-tables and should never be executed, so XN is
-/// the correct hardening.
-pub unsafe fn set_ram_page_ro_xn(ipa: u32) {
-    let page = ipa & !0xFFF;
-    let Some(entry_ptr) = ram_l3_entry_ptr(page) else { return; };
-    let host_pa = guest_mem::ram_host_pa() + (page as u64 - RAM_IPA_BASE);
-    let new = host_pa | PAGE_NORMAL_RO | S2_XN;
     // SAFETY: entry_ptr bounded to one of two 512-entry L3 tables.
     unsafe { entry_ptr.write(new); }
     invalidate_ipa_s2(page);

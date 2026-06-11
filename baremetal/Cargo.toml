@@ -2,6 +2,7 @@
 name = "newton-hypervisor"
 version = "0.0.1"
 edition = "2021"
+default-run = "newton-hypervisor"
 license = "GPL-2.0-or-later"
 description = "Bare-metal hypervisor for running Newton 2.x ROMs natively on Cortex-A53 Raspberry Pi."
 

@@ -5,14 +5,12 @@
 #[cfg(not(test))]
 use core::arch::global_asm;
 
-mod alrt_capture;
 mod audio;
 mod banked;
 mod cpu;
 #[cfg(feature = "platform-raspi3b")]
 mod display;
 mod flash_persist;
-mod g1_capture;
 mod guest;
 mod guest_bp;
 mod guest_endian;
@@ -25,7 +23,6 @@ mod input;
 mod mailbox;
 mod mmio;
 mod mmu;
-mod pa_emulate;
 mod panic;
 mod peripherals;
 mod platform;
@@ -146,17 +143,6 @@ pub extern "C" fn kmain() -> ! {
         // backing for the alias-redirect shadow pool are wired up
         // before any policy code uses the pool. One-line diagnostic.
         shadow_pool::smoke_test();
-        // Group-1 self-map capture: mark the 3 kernel-globals self-mapping
-        // PAs RO+XN at stage-2 so any guest write to them traps to EL2.
-        // Must run before the guest gets ERET'd in so we catch TTBR0
-        // setup writes from the very first guest instruction.
-        g1_capture::arm();
-        // alrt-task CList header capture: same idea but on the page
-        // backing VA=0x0cca3000 (PA=0x0402e000 per prior alias-table).
-        // Boot-time arm so we catch every write — the dynamic
-        // (Prim Remember-driven) arm in the previous probe iteration
-        // fired too late and missed the corrupting writer.
-        alrt_capture::arm_at_boot();
     }
 
     // Seed the 10-entry ROM+REx checksum table into both blocks of

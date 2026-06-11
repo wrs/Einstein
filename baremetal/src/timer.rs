@@ -114,6 +114,16 @@ pub fn rearm() {
 /// for the next heartbeat. trap.rs's shared `update_virq` then sets
 /// HCR_EL2.VI for delivery to the guest.
 pub fn on_irq() {
+    // Stale-TLB guard. The hypervisor rewrites guest stage-1 PTEs
+    // behind the guest's back (fix_stage1_xn_bits, the shadow-stub
+    // alias redirects, the scratch-pool install) without targeted TLB
+    // maintenance at the rewrite sites — and the guest can't TLBI
+    // after writes it never made. Flushing the EL1&0 stage-1 TLB
+    // here bounds any stale entry's lifetime to one ~16 ms
+    // heartbeat. Replacing this blanket flush with targeted TLBIs at
+    // each rewrite site is tracked in PLAN.md.
+    crate::trap::cp15::invalidate_tlb();
+
     // If the guest has made no sync-trap progress since the last
     // heartbeat, push synthetic ticks past the next pending match so
     // the deadline fires here instead of waiting for guest progress

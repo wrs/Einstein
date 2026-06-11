@@ -26,22 +26,13 @@ pub const DRIVER_ID: u32 = 0x00_0002;
 /// `ExecuteSoundDriverNative`.
 const ERR_NO_SOUND_HARDWARE: u32 = (-30009i32) as u32;
 
-/// Per-subfn invocation count. Read by the wedge probe so a runaway
-/// poll on, e.g., subfn 0x13 (OutputIsRunning) is visible even when
-/// the per-subfn "first call" log filter has long since suppressed it.
+/// Per-subfn invocation count, used to throttle the traced-subfn
+/// log lines in `handle` (first 32 calls each, then 1-in-64).
 static mut SUBFN_COUNT: [u32; 32] = [0; 32];
-
-pub fn snapshot_subfn_counts() -> [u32; 32] {
-    // SAFETY: single-threaded EL2.
-    unsafe { SUBFN_COUNT }
-}
 
 pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
     // Diagnostic: log first occurrence of each subfn so we can see what
-    // the kernel exercises during sound init. Also tally per-subfn
-    // invocation counts so a tight kernel poll loop on a sound subfn
-    // (e.g., OutputIsRunning 0x13) shows up as a runaway count in the
-    // task dump even though the "first" filter suppresses repeats.
+    // the kernel exercises during sound init.
     static mut SEEN: u32 = 0;
     let bit = 1u32 << (subfn & 0x1F);
     // SAFETY: single-threaded.

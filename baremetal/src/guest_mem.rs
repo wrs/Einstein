@@ -248,6 +248,17 @@ pub fn read_word_pa(pa: u32) -> Option<u32> {
     Some(unsafe { core::ptr::read_volatile(h as *const u32) })
 }
 
+/// Read a 32-bit page-table entry from a guest physical address,
+/// applying the same BE-8 byte-order recovery as `read_pt_entry` (which
+/// takes a pointer). Use this when the L1/L2 entry's PA is known but the
+/// backing (ROM vs RAM) must be resolved. A raw `read_word_pa` returns
+/// the byteswap of what the MMU sees under CPSR.E=1; this corrects it.
+pub fn read_pt_entry_pa(pa: u32) -> Option<u32> {
+    let h = host_addr_for(pa as usize, 4, /*for_write=*/ false)?;
+    // SAFETY: host_addr_for bounds-checks against the chosen backing.
+    Some(unsafe { read_pt_entry(h as *const u32) })
+}
+
 /// Decode the 4 per-subpage AP fields from an ARMv4 small-page L2
 /// descriptor (typ=2). Returns `[AP[0], AP[1], AP[2], AP[3]]` where
 /// AP[i] covers subpage i (1 KiB at offset i*0x400 within the page).
@@ -629,15 +640,20 @@ pub fn fix_stage1_xn_bits() -> bool {
                             // alias is ROM-baked vs RAM-resident. `entry`
                             // is the L1 descriptor from this walk's
                             // outer loop; the L2 reads go through
-                            // `read_word_pa` which honours both ROM and
-                            // RAM backings.
+                            // `read_pt_entry_pa`, the BE-8-aware
+                            // page-table reader (honours both ROM and
+                            // RAM backings and byteswaps under
+                            // CPSR.E=1), so the decoded descriptors,
+                            // PAs, and AP fields below print the
+                            // kernel-intended values rather than
+                            // byteswapped garbage.
                             let l2_pt_base = entry & 0xFFFF_FC00;
                             let prev_idx = ((prev_va >> 12) & 0xFF) as u32;
                             let va_idx   = ((va      >> 12) & 0xFF) as u32;
                             let prev_l2_pa = l2_pt_base + prev_idx * 4;
                             let va_l2_pa   = l2_pt_base + va_idx   * 4;
-                            let prev_l2 = read_word_pa(prev_l2_pa).unwrap_or(0xDEAD_BEEF);
-                            let va_l2   = read_word_pa(va_l2_pa  ).unwrap_or(0xDEAD_BEEF);
+                            let prev_l2 = read_pt_entry_pa(prev_l2_pa).unwrap_or(0xDEAD_BEEF);
+                            let va_l2   = read_pt_entry_pa(va_l2_pa  ).unwrap_or(0xDEAD_BEEF);
                             let l2_loc = if (l2_pt_base as usize) < ROM_SIZE {
                                 "ROM"
                             } else if (RAM_BASE_USIZE..RAM_BASE_USIZE + RAM_SIZE)
@@ -1554,6 +1570,44 @@ pub unsafe fn load_newton_rom() {
         patched
     );
 
+    // Publish every byte of the patched ROM aperture to the Point of
+    // Unification in one sweep. `write_rom_code_word` / the load loop
+    // write instruction bytes through Normal-WB into EL2's D-cache; on
+    // Cortex-A53 / AEMv8-A the I-cache is non-coherent, so a guest fetch
+    // can cold-read stale memory unless the dirty D-cache lines are
+    // cleaned to PoU (DC CVAU) and the I-cache lines invalidated
+    // (IC IVAU). The `ic iallu` in `eret_to_guest` invalidates the
+    // I-cache but does NOT clean dirty D-cache lines — it works today
+    // only because the 16 MiB load loop evicts most lines incidentally.
+    // This sweep makes the guarantee explicit and supersedes the
+    // narrower per-range publishes formerly in `patch_und_vector`
+    // (same DC CVAU; DSB; IC IVAU; DSB; ISB per line, over a wider
+    // range, run strictly after every patcher). Cost is measured below
+    // and printed so a future change can re-check it.
+    let (icache_t0, icache_freq): (u64, u64);
+    // SAFETY: MRS of RO timer sysregs, no side effects.
+    unsafe {
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) icache_t0,
+            options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) icache_freq,
+            options(nomem, nostack, preserves_flags));
+    }
+    crate::cpu::icache_publish_range(rom_ptr as u64, ROM_SIZE);
+    let icache_t1: u64;
+    // SAFETY: as above.
+    unsafe {
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) icache_t1,
+            options(nomem, nostack, preserves_flags));
+    }
+    let icache_dt = icache_t1.wrapping_sub(icache_t0);
+    kprintln!(
+        "guest_mem: icache_publish_range over {} MiB ROM aperture: {} ticks (~{} us @ {} Hz)",
+        ROM_SIZE / (1024 * 1024),
+        icache_dt,
+        if icache_freq != 0 { icache_dt * 1_000_000 / icache_freq } else { 0 },
+        icache_freq,
+    );
+
     // Register the tracer; actual ROM patching is deferred until the
     // guest turns on its stage-1 MMU (see src/tracer.rs for why).
     #[cfg(feature = "trace")]
@@ -2214,27 +2268,12 @@ unsafe fn patch_und_vector(rom: *mut u32) {
         write_rom_data_word(rom, stub + 2, 0xDEAD_C0DE);
     }
 
-    // Publish the freshly-installed code to the AArch32 instruction
-    // fetch path. `write_rom_code_word` writes through Normal-WB into
-    // EL2's D-cache; on Cortex-A53 / AEMv8-A the I-cache is non-
-    // coherent, so without a `DC CVAU; DSB ISH; IC IVAU; DSB ISH; ISB`
-    // sequence the kernel's first UND can cold-fetch stale memory
-    // bytes (= the original ROM contents at these high addresses,
-    // which the classifier marks as data and the loader leaves in
-    // BE-natural form). That makes the FPA bypass stub silently
-    // execute garbage and fall through into UND_TRAMP, defeating the
-    // whole point of the in-ROM bypass. The range below covers the
-    // UND vector word at IPA 0x04, the ROM-offset-0x80 trampoline
-    // body, the FPA bypass stub, UND_TRAMP, and UND_RETURN_STUB.
-    crate::cpu::icache_publish_range(
-        rom as u64 + 0x04,
-        0x100,
-    );
-    crate::cpu::icache_publish_range(
-        rom as u64 + FPA_BYPASS_STUB_OFFSET as u64,
-        // From FPA_BYPASS_STUB through the UND_RETURN_STUB literal.
-        0x140,
-    );
+    // No per-range I-cache publish here: the single
+    // `icache_publish_range` sweep over the whole ROM aperture at the
+    // end of `load_newton_rom` runs strictly after this function and
+    // covers the UND vector word at IPA 0x04, the trampoline body, the
+    // FPA bypass stub, UND_TRAMP, and UND_RETURN_STUB with the same
+    // DC CVAU; DSB; IC IVAU; DSB; ISB sequence over a wider range.
 }
 
 /// Scan the REx window (PA `start` .. `end`) for Einstein's
@@ -2274,6 +2313,14 @@ unsafe fn patch_native_prim_mcr_lr_to_r12(rom: *mut u32, start: u32, end: u32) -
     let mut patched = 0usize;
 
     for j in (start_idx + 2)..end_idx {
+        // Same code/data discipline as patch_cp15_encodings: only
+        // rewrite words the classifier marks as code. The exact-word
+        // match below makes a false positive unlikely, but a data word
+        // equal to 0xEE00_EA10 would still be silently corrupted
+        // without this gate.
+        if !rom_word_is_code(j) {
+            continue;
+        }
         // SAFETY: j < end_idx, and end_idx is word-bounded.
         let mcr = unsafe { rom.add(j).read() };
         if mcr != MCR_P10_LR {
@@ -2384,7 +2431,17 @@ pub unsafe fn install_und_vector_swap_pre_mmu() {
 ///   bits[3:0]   = CRm
 unsafe fn patch_cp15_encodings(rom: *mut u32, word_count: usize) -> usize {
     let mut count = 0usize;
+    let mut first_pcs: [u32; 4] = [0; 4];
     for i in 0..word_count {
+        // Only rewrite words the classifier marks as code. A *data*
+        // word (stored BE, read back byteswapped) that happens to match
+        // the ~15-fixed-bit MCR/MRC shape would otherwise be silently
+        // corrupted through `write_rom_code_word`. The current ROM+REx
+        // pair has no false hits, but every Einstein.rex rebuild
+        // re-rolls those dice.
+        if !rom_word_is_code(i) {
+            continue;
+        }
         // SAFETY: i < word_count matches ROM_SIZE/4.
         let w = unsafe { rom.add(i).read() };
 
@@ -2407,7 +2464,17 @@ unsafe fn patch_cp15_encodings(rom: *mut u32, word_count: usize) -> usize {
         // SAFETY: same index, in-range. Code rewrite — under BE-8 we
         // need the BE-numerical encoding stored as native u32.
         unsafe { write_rom_code_word(rom, i, new); }
+        if count < first_pcs.len() {
+            first_pcs[count] = (i * 4) as u32;
+        }
         count += 1;
+    }
+    if count > 0 {
+        let shown = count.min(first_pcs.len());
+        kprintln!(
+            "guest_mem: patch_cp15_encodings: {} code words rewritten; first PCs: {:#x?}",
+            count, &first_pcs[..shown],
+        );
     }
     count
 }

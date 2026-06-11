@@ -4341,6 +4341,22 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
             // invisible to it in practice.
             const TTBR_WB_WA: u32 = (1 << 6) | (1 << 3);
             let raw = ctx.x[rt] as u32;
+            // The EL2-side stage-1 walkers (`translate_va`,
+            // `fix_stage1_xn_bits`, the L1 dumpers) all assume the
+            // kernel L1 table lives at the start of guest RAM
+            // (0x0400_0000) per the 717006 probe, rather than reading
+            // TTBR0 back. Enforce that invariant: if the Newton kernel
+            // ever programs a different root, those walkers would
+            // silently read the wrong table. Guest tests legitimately
+            // pick their own L1 base, so the assertion is dev/ROM-only.
+            #[cfg(not(nh_guest_test))]
+            if (raw & 0xFFFF_C000) != 0x0400_0000 {
+                kprintln!(
+                    "trap: guest programmed TTBR0={:#010x} (base {:#010x}); EL2 stage-1 walkers assume 0x0400_0000",
+                    raw, raw & 0xFFFF_C000,
+                );
+                cpu::halt();
+            }
             let value = raw | TTBR_WB_WA;
             cp15::write_ttbr0_el1(value as u64);
             // First TTBR write locks in the guest's stage-1 table

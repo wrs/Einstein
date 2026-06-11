@@ -45,6 +45,9 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(nh_input_mtouch)");
     println!("cargo:rustc-check-cfg=cfg(nh_audio_null)");
     println!("cargo:rustc-check-cfg=cfg(nh_audio_pi_hdmi)");
+    println!("cargo:rustc-check-cfg=cfg(nh_loud_halt_canaries)");
+
+    resolve_loud_halt_canaries();
 
     select_platform_linker_script();
     resolve_host_io_backend();
@@ -341,6 +344,19 @@ fn resolve_audio_backend() {
         ),
     };
     println!("cargo:rustc-cfg=nh_audio_{chosen}");
+}
+
+/// Emit `cfg(nh_loud_halt_canaries)` for dev (semihost / QEMU / FVP)
+/// builds, where halting on StopImage/Reboot/PowerOffAndReboot/busError
+/// is a useful debugging tripwire. Real-hardware builds (the
+/// `no-semihost` feature) must NOT have these canaries: a user reset or
+/// idle/sleep entry would halt the hypervisor. The canary install
+/// (`rom_patches::apply_loud_halt_traps`) is gated on this cfg.
+fn resolve_loud_halt_canaries() {
+    let no_semihost = env::var("CARGO_FEATURE_NO_SEMIHOST").is_ok();
+    if !no_semihost {
+        println!("cargo:rustc-cfg=nh_loud_halt_canaries");
+    }
 }
 
 /// Resolve `$HOME/.newton/flash.bin` at build time and expose it as

@@ -835,6 +835,11 @@ pub unsafe fn apply_717006_patches(rom_ptr: *mut u32) {
         apply_real_clock_seconds_patch(rom_ptr);
         apply_ftime_in_seconds_patch(rom_ptr);
         apply_fdate_from_seconds_patch(rom_ptr);
+        // Loud-halt canaries are dev-only tripwires: on real hardware a
+        // user reset or idle/sleep entry would halt the hypervisor.
+        // build.rs emits `nh_loud_halt_canaries` for semihost/dev
+        // builds and omits it under `no-semihost`.
+        #[cfg(nh_loud_halt_canaries)]
         apply_loud_halt_traps(rom_ptr);
         apply_bootos_trap(rom_ptr);
         // The 4-iteration `apply_resolve_fault_wrapper` was a previous
@@ -1461,6 +1466,7 @@ unsafe fn apply_fdate_from_seconds_patch(rom_ptr: *mut u32) {
 /// wait-for-wakeup spin the FIRST time either fires, instead of letting
 /// the run go on for tens of thousands of repeated tracer entries
 /// before timeout.
+#[cfg(nh_loud_halt_canaries)]
 unsafe fn apply_loud_halt_traps(rom_ptr: *mut u32) {
     let insn = HvcImm::LoudHalt.insn();
     for (pc, name) in [

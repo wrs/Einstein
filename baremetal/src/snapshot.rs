@@ -44,8 +44,8 @@
 //! ## Format
 //!
 //! Little-endian throughout. Header followed by raw memory regions
-//! (RAM, FB) in a fixed order. Bump `VERSION` when the layout changes
-//! so stale files get rejected loudly.
+//! (RAM, FB, SCRATCH_POOL) in a fixed order. Bump `VERSION` when the
+//! layout changes so stale files get rejected loudly.
 //!
 //! A FNV-1a fingerprint of the first 1 KiB of GUEST_ROM is included so
 //! a snapshot taken from one guest binary can't accidentally load into
@@ -163,7 +163,14 @@ const MAGIC: u64 = 0x0150_414E_5348_4E00;
 // `src/flash_persist/`'s standalone `$HOME/.newton/flash.bin`. Header
 // `flash_size` field replaced with `flash_fingerprint` (FNV-1a-32 over
 // GUEST_FLASH at save time) used for resume-time coherence.
-const VERSION: u32 = 6;
+// VERSION = 7: added the 384 KiB shadow_stub::SCRATCH_POOL as a third
+// saved region (guest-visible RW at IPA 0x0600_0000; holds DABT-save
+// scratch consumed by later kernel code), and three guest-fault sysreg
+// homes (far_el1/esr_el1/ifsr32_el2 = AArch32 DFAR/DFSR/IFSR) plus the
+// stub-stash TLS registers (tpidr_el0/tpidrro_el0 = TPIDRURW/TPIDRRO)
+// to the header. The version bump rejects v6 (and earlier) files at
+// load time, before any field is parsed — see `peek_seq` / `load`.
+const VERSION: u32 = 7;
 
 /// Number of rolling slots. Each slot is ~14 MiB, so four slots cost
 /// ~56 MiB of host disk and give the user three save windows of
@@ -214,13 +221,39 @@ struct Header {
     gprs: [u32; 31],
 
     sctlr_el1: u32,
+    /// Explicit padding so the following u64 fields are naturally
+    /// aligned without an implicit `repr(C)` hole that
+    /// `save_via_semihost` would serialize as uninitialized stack
+    /// garbage (nondeterministic file bytes / UB-by-the-book). Mirrors
+    /// `_pad0` / `_pad1`.
+    _pad2: u32,
     ttbr0_el1: u64,
     ttbr1_el1: u64,
     tcr_el1: u64,
     dacr32_el2: u32,
+    _pad3: u32,
     vbar_el1: u64,
     cpacr_el1: u64,
     mair_el1: u64,
+
+    /// AArch32 guest fault sysregs, captured at their AArch64 homes
+    /// (DDI 0487): DFAR = `FAR_EL1[31:0]`, DFSR = `ESR_EL1`, IFSR =
+    /// `IFSR32_EL2`. The DABT fast trampoline forwards aborts to the
+    /// kernel's DAH, which reads DFSR/DFAR natively several instructions
+    /// later; an autosave landing in that window must resume with the
+    /// fault registers the abort produced, not cold-boot values.
+    far_el1: u64,
+    esr_el1: u64,
+    ifsr32_el2: u32,
+    _pad4: u32,
+
+    /// Per-thread TLS scratch (AArch32 TPIDRURW = `TPIDR_EL0`,
+    /// TPIDRRO = `TPIDRRO_EL0`). The DABT fast trampoline and the FPA
+    /// bypass stub stash R0/R1/R12 here across their bodies; capturing
+    /// them is defense-in-depth so a resume that lands at a stub PC the
+    /// transient-PC gate somehow let through doesn't restore garbage.
+    tpidr_el0: u64,
+    tpidrro_el0: u64,
 
     /// SPSR_<mode> banked sysregs (AArch64-named, accessible via
     /// `mrs/msr spsr_abt` etc.). SPSR_svc is the AArch64 SPSR_EL1
@@ -235,6 +268,10 @@ struct Header {
 
     ram_size: u32,
     fb_size: u32,
+    /// Size of the saved `shadow_stub::SCRATCH_POOL` region (guest-
+    /// visible RW at IPA 0x0600_0000). Serialized after FB; checked on
+    /// load like ram/fb so a layout mismatch rejects the file.
+    scratch_size: u32,
     /// FNV-1a-32 over the full 8 MiB GUEST_FLASH at save time. Flash
     /// bytes themselves live in `$HOME/.newton/flash.bin` (managed by
     /// `src/flash_persist/`); this fingerprint lets the resume path
@@ -438,22 +475,33 @@ fn maybe_autosave_via_semihost(ctx: &TrapContext) {
 /// RAM save slots, banked-mode SP/LR captures, staged ERET PC). A
 /// snapshot taken at such a PC cannot be faithfully resumed.
 ///
-/// Ranges covered:
+/// Ranges covered (constants verified against `guest_mem` /
+/// `rom_patches`):
+///   - `0x008FFF00..0x00900000` — DABT fast trampoline
+///     (`guest_mem::DABT_FAST_TRAMP_OFFSET`, 41 words). Saves
+///     LR_abt/SP_abt/SPSR_abt and stashes R0/R1 in TPIDRURW/TPIDRRO;
+///     handles the dominant fault stream, so a nontrivial fraction of
+///     wall time sits here.
 ///   - `0x00900000..0x00E00000` — tracer trampoline pool
 ///     (`tracer::TRAMPOLINE_IPA..TRAMPOLINE_END`).
-///   - `0x00FFFF00..0x01000000` — UND trampoline body (0x00FFFF00),
-///     DABT trampoline (0x00FFFFA8), and UND return stub
-///     (0x00FFFFE0). See `guest_mem::{UND_TRAMP_OFFSET,
-///     DABT_TRAMP_OFFSET, UND_RETURN_STUB_OFFSET}`.
+///   - `0x00FFFD80..0x01000000` — patch-stub arena
+///     (`rom_patches::PATCH_STUB_ARENA_BASE`), FPA bypass stub
+///     (`guest_mem::FPA_BYPASS_STUB_OFFSET` = 0x00FFFEC0), UND
+///     trampoline (0x00FFFF00), DABT trampoline (0x00FFFFA8), and UND
+///     return stub (0x00FFFFE4). The FPA stub and DABT trampoline also
+///     stash R0/R1/R12 in TPIDRURW/TPIDRRO.
 ///
 /// The tracer pool is only populated when the `trace` feature is on,
 /// but checking always is cheap and harmless — nothing the guest
 /// does naturally lands ELR_EL2 in that range otherwise.
 fn pc_in_hypervisor_transient_region(pc: u32) -> bool {
+    if (0x008F_FF00..0x0090_0000).contains(&pc) {
+        return true;
+    }
     if (0x0090_0000..0x00E0_0000).contains(&pc) {
         return true;
     }
-    if (0x00FF_FF00..0x0100_0000).contains(&pc) {
+    if (0x00FF_FD80..0x0100_0000).contains(&pc) {
         return true;
     }
     false
@@ -514,6 +562,19 @@ fn save_via_semihost(gprs: &[u64; 31]) -> Result<(), &'static str> {
     };
     write_all(&fh, fb)?;
 
+    // SCRATCH_POOL is mapped RW into the guest (stage-2 at IPA
+    // 0x0600_0000) and holds cross-trap state — notably the DABT
+    // trampoline's LR_abt/SP_abt/SPSR_abt save slots, which patched
+    // kernel code reads back several instructions after the abort. It
+    // is guest-visible state, so it belongs in the snapshot.
+    let scratch = unsafe {
+        core::slice::from_raw_parts(
+            crate::shadow_stub::scratch_pool_host_pa() as *const u8,
+            crate::shadow_stub::SCRATCH_POOL_SIZE,
+        )
+    };
+    write_all(&fh, scratch)?;
+
     // Flash bytes live in `$HOME/.newton/flash.bin` (see
     // `flash_persist`), not in this snapshot file. The header carries
     // a FNV-1a fingerprint of GUEST_FLASH so resume can detect a
@@ -544,13 +605,21 @@ fn build_header(gprs_u64: &[u64; 31], seq: u64) -> Header {
         saved_cpsr: read_sysreg64("spsr_el2") as u32,
         gprs,
         sctlr_el1: read_sysreg64("sctlr_el1") as u32,
+        _pad2: 0,
         ttbr0_el1: read_sysreg64("ttbr0_el1"),
         ttbr1_el1: read_sysreg64("ttbr1_el1"),
         tcr_el1: read_sysreg64("tcr_el1"),
         dacr32_el2: read_sysreg64("dacr32_el2") as u32,
+        _pad3: 0,
         vbar_el1: read_sysreg64("vbar_el1"),
         cpacr_el1: read_sysreg64("cpacr_el1"),
         mair_el1: read_sysreg64("mair_el1"),
+        far_el1: read_sysreg64("far_el1"),
+        esr_el1: read_sysreg64("esr_el1"),
+        ifsr32_el2: read_sysreg64("ifsr32_el2") as u32,
+        _pad4: 0,
+        tpidr_el0: read_sysreg64("tpidr_el0"),
+        tpidrro_el0: read_sysreg64("tpidrro_el0"),
         spsr_svc: read_sysreg64("spsr_svc") as u32,
         spsr_abt: read_sysreg64("spsr_abt") as u32,
         spsr_und: read_sysreg64("spsr_und") as u32,
@@ -559,6 +628,7 @@ fn build_header(gprs_u64: &[u64; 31], seq: u64) -> Header {
         _pad1: 0,
         ram_size: guest_mem::RAM_SIZE as u32,
         fb_size: guest_mem::FRAMEBUFFER_SIZE as u32,
+        scratch_size: crate::shadow_stub::SCRATCH_POOL_SIZE as u32,
         flash_fingerprint: crate::flash_persist::fingerprint(),
         rom_fingerprint: rom_fingerprint(),
         seq,
@@ -694,10 +764,11 @@ pub fn load(path: &[u8]) -> Option<RestoreState> {
     }
     if header.ram_size as usize != guest_mem::RAM_SIZE
         || header.fb_size as usize != guest_mem::FRAMEBUFFER_SIZE
+        || header.scratch_size as usize != crate::shadow_stub::SCRATCH_POOL_SIZE
     {
         kprintln!(
-            "snapshot: region sizes don't match (ram={} fb={}); ignoring",
-            header.ram_size, header.fb_size
+            "snapshot: region sizes don't match (ram={} fb={} scratch={}); ignoring",
+            header.ram_size, header.fb_size, header.scratch_size
         );
         close(fh);
         return None;
@@ -733,6 +804,18 @@ pub fn load(path: &[u8]) -> Option<RestoreState> {
         )
     };
     if read_all(&fh, fb).is_err() {
+        close(fh);
+        return None;
+    }
+
+    // SCRATCH_POOL — written in the same fixed order as `save`.
+    let scratch = unsafe {
+        core::slice::from_raw_parts_mut(
+            crate::shadow_stub::scratch_pool_host_pa() as *mut u8,
+            crate::shadow_stub::SCRATCH_POOL_SIZE,
+        )
+    };
+    if read_all(&fh, scratch).is_err() {
         close(fh);
         return None;
     }
@@ -786,6 +869,17 @@ fn restore_sysregs(h: &Header) {
     write_sysreg64("vbar_el1", h.vbar_el1);
     write_sysreg64("cpacr_el1", h.cpacr_el1);
     write_sysreg64("mair_el1", h.mair_el1);
+    // AArch32 guest fault sysregs at their AArch64 homes (DDI 0487):
+    // DFAR = FAR_EL1, DFSR = ESR_EL1, IFSR = IFSR32_EL2. Restoring
+    // these lets a resume that lands between a DABT and the kernel DAH's
+    // native DFSR/DFAR read see the fault registers the abort produced.
+    write_sysreg64("far_el1", h.far_el1);
+    write_sysreg64("esr_el1", h.esr_el1);
+    write_sysreg64("ifsr32_el2", h.ifsr32_el2 as u64);
+    // Per-thread TLS scratch (TPIDRURW/TPIDRRO). The trampoline stubs
+    // stash R0/R1/R12 here; restoring keeps a stub-PC resume coherent.
+    write_sysreg64("tpidr_el0", h.tpidr_el0);
+    write_sysreg64("tpidrro_el0", h.tpidrro_el0);
     // SP_EL0 / SP_EL1 / ELR_EL1 are AArch64-only EL0/EL1 registers
     // with no architectural alias to AArch32 banked R13/R14. AArch32
     // SP_usr / SP_svc / LR_svc are restored via the GPR file (x13,
@@ -849,7 +943,20 @@ fn read_sysreg64(reg: &'static str) -> u64 {
         "spsr_und" => sr_reader!("spsr_und"),
         "spsr_irq" => sr_reader!("spsr_irq"),
         "spsr_fiq" => sr_reader!("spsr_fiq"),
-        _ => 0,
+        // AArch32 fault-register homes (DDI 0487): DFAR = FAR_EL1,
+        // DFSR = ESR_EL1, IFSR = IFSR32_EL2.
+        "far_el1" => sr_reader!("far_el1"),
+        "esr_el1" => sr_reader!("esr_el1"),
+        "ifsr32_el2" => sr_reader!("ifsr32_el2"),
+        "tpidr_el0" => sr_reader!("tpidr_el0"),
+        "tpidrro_el0" => sr_reader!("tpidrro_el0"),
+        // A name not in the table means a header field was wired to a
+        // sysreg this dispatch doesn't know about — a programming error
+        // that must never silently read 0. Halt loudly.
+        other => {
+            kprintln!("snapshot: read_sysreg64 unknown register '{}'", other);
+            crate::cpu::halt();
+        }
     }
 }
 
@@ -882,6 +989,16 @@ fn write_sysreg64(reg: &'static str, v: u64) {
         "spsr_und" => sr_writer!("spsr_und", v),
         "spsr_irq" => sr_writer!("spsr_irq", v),
         "spsr_fiq" => sr_writer!("spsr_fiq", v),
-        _ => {}
+        "far_el1" => sr_writer!("far_el1", v),
+        "esr_el1" => sr_writer!("esr_el1", v),
+        "ifsr32_el2" => sr_writer!("ifsr32_el2", v),
+        "tpidr_el0" => sr_writer!("tpidr_el0", v),
+        "tpidrro_el0" => sr_writer!("tpidrro_el0", v),
+        // As in `read_sysreg64`: an unknown name means a restore would
+        // be silently dropped. Halt loudly instead.
+        other => {
+            kprintln!("snapshot: write_sysreg64 unknown register '{}'", other);
+            crate::cpu::halt();
+        }
     }
 }

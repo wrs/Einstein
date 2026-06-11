@@ -176,6 +176,14 @@ unsafe fn zero_el1_guest_state() {
         // TTBR{0,1} to known state; ROM overwrites via the CP15 shim.
         asm!("msr ttbr0_el1, xzr", "msr ttbr1_el1, xzr", "isb",
             options(nostack, preserves_flags));
+
+        // VBAR_EL1 (AArch32 guest legacy vector base) to 0. The Newton
+        // guest needs its vectors at VA 0; trusting whatever the
+        // firmware left in VBAR_EL1 would send the first guest
+        // exception into the weeds. (Snapshot resume restores the saved
+        // value separately; this is the cold-boot guarantee.)
+        asm!("msr vbar_el1, xzr", "isb",
+            options(nostack, preserves_flags));
     }
 }
 

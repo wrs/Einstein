@@ -15,7 +15,8 @@
 //!         ↓                 + duplicate to stereo
 //!   LE-S16 stereo @ 44.1 kHz, in a host RING buffer
 //!         ↓ pump: SPDIF-encode (24-bit shift + parity)
-//!   IEC 60958 subframes → MAI_DATA register
+//!   IEC 60958 subframes, in the DMA TX ring
+//!         ↓ cyclic DMA (channel 4, DREQ 17) → MAI_DATA register
 //!         ↓ VC4 hardware
 //!   HDMI audio packets in video blank → receiver speakers
 //! ```
@@ -28,18 +29,16 @@
 //! the initial cut. Quality is dominated by Newton's source material
 //! (8-bit mu-law alerts upsampled to S16), not by our upsampler.
 //!
-//! ## Polled, not DMA
+//! ## DMA-fed MAI
 //!
-//! Circle's `hdmisoundbasedevice.cpp` uses a cyclic DMA channel into
-//! MAI_DATA. We're polled: each `pump()` call writes up to
-//! PUMP_MAX_FRAMES stereo frames while the FIFO reports not-full.
-//! The trap-IRQ tail fires on every Newton timer match (~16 ms
-//! cadence), and sync traps fire at multiples-of-kHz rates during
-//! normal boot, so the aggregate pump cadence is comfortable for a
-//! 44.1 kHz stereo feed. If a clip plays through a quiet stretch of
-//! the guest where neither sync traps nor timer IRQs fire often
-//! enough, we'll hear underruns and the right answer is to switch
-//! to DMA.
+//! MAI_DATA is fed by a cyclic BCM2835 DMA chain (channel 4, paced
+//! by DREQ 17), the same shape as Circle's
+//! `hdmisoundbasedevice.cpp` and Linux's dmaengine cyclic transfer.
+//! `pump()` (called from the trap-IRQ and sync-trap tails) only
+//! SPDIF-encodes ring frames into the DMA TX ring; the hardware
+//! drains it without CPU involvement, so a quiet stretch of the
+//! guest can't underrun the FIFO as long as the ring holds encoded
+//! frames. See "DMA TX ring for HDMI MAI" below.
 //!
 //! ## Clock derivation
 //!
@@ -354,7 +353,6 @@ const ENABLE_HDMI_PHY_RNG: bool = true;
 const USE_LINUX_RAM_PACKET_CONFIG: bool = true;
 
 // Unavoidable non-Linux infrastructure still called out explicitly:
-// - MAI_DATA is CPU-fed, not cyclic DMA/DREQ.
 // - HSM is inherited from the firmware-owned HDMI modeset. Directly poking
 //   CM_HSMCTL/CM_HSMDIV while the firmware encoder is live is not equivalent
 //   to Linux's KMS + common-clock-framework path and produced quiet hiss.
@@ -494,15 +492,13 @@ static LAST_IRQ_TICKS: AtomicU64 = AtomicU64::new(0);
 
 // ---- DMA TX ring for HDMI MAI ---------------------------------------
 //
-// The CPU-fed pump that lived here used to busy-wait on
-// `MAI_CTL_FULL` and write each SPDIF subframe to `HDMI_MAI_DATA`
-// one at a time from the trap tail. At 88.2 kHz subframe rate the
-// FIFO empties in ~725 µs, so any trap-tail delay > 725 µs produced
-// `MAI_CTL.DLATE` (a chip-reported underrun), which on this
-// touchscreen-integrated panel manifests as the panel powering down
-// and rebooting.
+// A CPU-fed MAI feed can't tolerate trap-tail latency: at the
+// 88.2 kHz subframe rate the FIFO empties in ~725 µs, and a late
+// refill raises `MAI_CTL.DLATE` (a chip-reported underrun), which on
+// this touchscreen-integrated panel manifests as the panel powering
+// down and rebooting. Hence DMA:
 //
-// We now drive MAI via BCM2835 DMA channel 4 paced by DREQ 17
+// MAI is driven via BCM2835 DMA channel 4 paced by DREQ 17
 // (BCM2835 §4.2.1.3 p.61 — Circle's `DREQSourceHDMI = 17` for
 // RASPPI <= 3 confirms; Pi 4 uses 10). The layout mirrors Linux's
 // dmaengine cyclic transfer (drivers/dma/bcm2835-dma.c

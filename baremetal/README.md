@@ -9,26 +9,28 @@ cross-references) in [`docs/peripherals.md`](docs/peripherals.md).
 
 ## Status
 
-**Bring-up complete; the 717006 ROM boots to the Welcome UI.**
+**The 717006 ROM boots to the Welcome UI and the builtin apps work —
+on QEMU, on FVP, and on a real Pi Zero 2 W.**
 
 - The hypervisor boots, drops to AArch32 EL1 at the ROM reset vector,
-  and the Newton kernel reaches steady-state operation.
-- The Newton kernel finishes initialisation: 26 tasks running, the
-  NewtonScript interpreter (`TInterpreter::Run`) is actively
-  executing bytecode, and the live host viewer (`tools/host-viewer/`,
-  built with `--features host-io-semihost`) renders the "Welcome"
-  tour intro and the "Internal store was erased" first-boot dialog.
-- Boot ends on the host-side timeout with the system parked in the
-  idle task waiting on stylus input — which the viewer now injects
-  as the user clicks.
-- 35-ish guest tests exercise the handler surface in isolation; all
-  green on both QEMU and FVP modulo two pre-existing failures
-  (`test_gpio`, `test_flash`).
+  and the Newton kernel reaches steady-state interactive operation:
+  ~27 tasks running, the NewtonScript interpreter executing bytecode,
+  pen input driving the UI.
+- On QEMU/FVP the live host viewer (`tools/host-viewer/`, built with
+  `--features host-io-semihost`) renders the display and injects
+  mouse clicks as pen taps.
+- On real hardware (Pi Zero 2 W, `pi-bare-metal-input` aggregate
+  feature) the full stack runs natively: HDMI display (`host-io-pi-fb`),
+  USB touchscreen input (`input-mtouch`), HDMI audio (`audio-pi-hdmi`),
+  and flash persistence to SD card (`flash-persist-sd`) with
+  non-blocking DMA autosave. See
+  [`docs/REAL_HW_BRINGUP.md`](docs/REAL_HW_BRINGUP.md).
+- 35 guest tests exercise the handler surface in isolation; all green
+  on both QEMU and FVP.
 
-Ongoing work: wire up tablet/pen input so the user can dismiss the
-dialog and explore the setup tour; reduce alignment-fault overhead
-in the steady-state idle loop; bring the FVP path's runtime in line
-with QEMU's.
+The known functional gap is **add-on app packages** — the ROM and
+builtin apps run, but Newton's `.pkg` installation flow (which can
+carry native code) is not yet supported.
 
 What's working end-to-end:
 
@@ -88,7 +90,7 @@ What's working end-to-end:
   posts mouse events back as Newton pen samples. Selected with
   `--features host-io-semihost`; the default `host-io-null` backend
   is a no-op (used by guest-tests and CI).
-- **Guest-test tier** under `guest-tests/` — 36 small AArch32
+- **Guest-test tier** under `guest-tests/` — 35 small AArch32
   binaries against a shared runtime, with an HVC protocol for
   pass/fail/print. Cover every handler (CP15, VIC, DMA, flash,
   serial, screen blit, native primitives, tablet, PCMCIA, snapshot
@@ -240,13 +242,31 @@ section in `CLAUDE.md` for the full procedure.
 
 ## Cargo features
 
-| Feature                | Default | Purpose                                                                              |
+Features come in independent axes — a platform, plus one backend per
+I/O seam. `build.rs` validates the combination at build time (exactly
+one platform, at most one backend per axis) and falls back to the
+`null` backend for any axis left unspecified.
+
+| Axis / feature         | Default | Purpose                                                                              |
 |------------------------|---------|--------------------------------------------------------------------------------------|
-| `platform-raspi3b`     | yes     | QEMU raspi3b host. BCM2835 VIC, BCM2836 local peripheral, PL011 at 0x3F201000.       |
+| `platform-raspi3b`     | yes     | QEMU raspi3b host (and real Pi Zero 2 W). BCM2835 VIC, PL011 at 0x3F201000.          |
 | `platform-fvp-base`    | no      | FVP `FVP_Base_RevC-2xAEMvA` host. GICv3 brought up through an EL3 stub.              |
+| `host-io-{null,semihost,pi-fb}` | null | Display + pen seam: no-op, semihost viewer IPC, or real VC4 framebuffer.      |
+| `flash-persist-{null,semihost,sd}` | semihost | Flash persistence: volatile, `/tmp` file via semihosting, or FAT32 SD card. |
+| `input-{null,mtouch}`  | null    | Pen-input seam: no-op or TSTP MTouch USB touchscreen (real hw).                      |
+| `audio-{null,pi-hdmi}` | null    | Sound seam: no-op or VC4 HDMI MAI audio (real hw).                                   |
+| `no-semihost`          | no      | Real hardware: no `HLT #0xF000` semihosting calls anywhere.                          |
 | `trace`                | no      | Function-level execution trace via per-entry HVC trampolines.                        |
 | `trace_once`           | no      | First-touch variant of `trace`. Trampolines still fire; only the SEQ line is gated.  |
 | `quiet`                | no      | Silence recurring diag log lines (`fix_stage1_xn_bits:` summaries, etc.).            |
+| `log_*`                | yes     | Per-subsystem diagnostic logging (`log_mmu`, `log_traps`, `log_tasks`, …).           |
+| `sd-probe`, `fb-probe`, `usb-probe` | no | Standalone real-hw bring-up probes (boot, test one peripheral, exit).      |
+
+Aggregates for real hardware (`pi-bare-metal`, `pi-bare-metal-sd`,
+`pi-bare-metal-display`, `pi-bare-metal-input`) roll up
+`platform-raspi3b + no-semihost` plus progressively more backends;
+`pi-bare-metal-input` is the full stack (SD flash, HDMI display +
+audio, USB touch). The authoritative list is `Cargo.toml`.
 
 Common combinations:
 
@@ -256,6 +276,8 @@ cargo run --release --features quiet                   # QEMU, no diag noise
 cargo run --release --features trace,quiet             # QEMU, clean function trace
 cargo build --release --no-default-features \
     --features "platform-fvp-base quiet"               # FVP build (then scripts/fvp)
+PI_CARGO_FEATURES=pi-bare-metal-input scripts/build-sd.sh /Volumes/PIBOOT
+                                                       # bootable SD for the Pi Zero 2 W
 ```
 
 `trace` mutates ROM words at install time, so existing snapshots are
@@ -296,15 +318,15 @@ of the ROM.
 ```
 guest-tests/scripts/build-tests.sh                # build everything in MANIFEST
 guest-tests/scripts/run-test.sh test_vic          # build + run one test
-guest-tests/scripts/run-all.sh                    # run all 36 tests on QEMU
-guest-tests/scripts/run-all.sh --platform fvp     # run all 36 tests on FVP
+guest-tests/scripts/run-all.sh                    # run all 35 tests on QEMU
+guest-tests/scripts/run-all.sh --platform fvp     # run all 35 tests on FVP
 ```
 
 Add a new test by dropping `tests/<name>.S` in place, appending the
 name to `tests/MANIFEST`, and rerunning. See `guest-tests/README.md`
 for the full HVC protocol.
 
-**Every commit must pass `guest-tests/scripts/run-all.sh`.** All 36
+**Every commit must pass `guest-tests/scripts/run-all.sh`.** All 35
 tests must stay green. (Probe-only iterations that touch nothing
 outside `src/rom_patches.rs` and the dispatch in `src/trap.rs` can
 skip the run — see the note in `CLAUDE.md`.)
@@ -405,6 +427,8 @@ baremetal/
     classify-out/        curated symbol lists
     disasm-out/          rom.dis + indices
     trace-diff.sh        diff Einstein vs hypervisor function traces
+    build-sd.sh          assemble a bootable Pi SD card
+    regen-classify.sh    regenerate the classifier reach.bitmap
   src/
     main.rs              kmain: MMU, stage-2, vectors, VIC, timer; ERET
     boot.s               _start
@@ -436,7 +460,18 @@ baremetal/
     tracer.rs            in-ROM HVC-trampoline tracer (--features trace)
     guest_bp.rs          one-shot guest software BPs (gdb 'bp <addr>')
     host_io/             live display + pen-input plumbing
-                         (null / semihost / pico backends)
+                         (null / semihost / pi-fb backends)
+    flash_persist/       flash persistence backends
+                         (null / semihost / sd)
+    sd/                  BCM2835 SDHOST driver + block device
+                         + bring-up probe
+    usb/                 DWC2 USB host stack (enumeration, HID)
+    input/               pen-input backends (null / mtouch) +
+                         touch calibration
+    audio/               sound backends (null / pi_hdmi —
+                         VC4 HDMI MAI)
+    display/             VC4 mailbox framebuffer + boot splash
+    mailbox.rs           VC firmware mailbox interface
     task_dump.rs         TScheduler / TTask walker
     pa_emulate.rs        scattered PA-side instruction emulation
     unaligned.rs         unaligned-load fixup
@@ -445,12 +480,17 @@ baremetal/
     g1_capture.rs        Group-1 capture
   guest-tests/
     common/              shared runtime, linker script, HVC macros
-    tests/               36 .S files + MANIFEST
+    tests/               35 .S files + MANIFEST
     scripts/             build-tests.sh, run-test.sh, run-all.sh
     README.md            HVC protocol, how to add a test
   probe/                 instrumented-Einstein oracle build
   docs/                  reference docs (see above)
-  classify/              ROM symbol classifier
+  classify/              cached classifier output (reach.bitmap per ROM hash)
+  tools/                 classify-rom, host-viewer, romdump
+  vendor/                vendored embedded-sdmmc 0.9.0 (path dep,
+                         local changes listed in VENDOR.md)
+  boot-pi/               Pi firmware config.txt for the SD boot partition
+  assets/                boot splash image
   PLAN.md                iteration log + current goal
   HIGHLEVEL.md           architecture + roadmap + open-question log
   IMPLEMENTATION.md      pure-Rust plan, language/tooling rationale
@@ -459,14 +499,22 @@ baremetal/
 
 ## Running on real hardware
 
-Not yet. The image is built for QEMU `raspi3b` or for FVP today. The
-deployment target is the **Pi Zero 2 W** (not the Pi 3B — same SoC,
-no technical advantage to using it as a stepping stone).
+**Works.** The deployment target is the **Pi Zero 2 W** (not the
+Pi 3B — same SoC, same image; only the form factor differs), and the
+full stack is hardware-validated: EL2 handoff, ROM boot, HDMI display,
+USB touchscreen, HDMI audio, and SD-card flash persistence with
+non-blocking DMA autosave.
 
-See [`docs/REAL_HW_BRINGUP.md`](docs/REAL_HW_BRINGUP.md) for the phased
-plan. Phase 0 (confirm EL2 firmware handoff via a `CurrentEL` probe) is
-a half-day exercise that closes `HIGHLEVEL.md` §16.1 and is independent
-of all the later phases.
+Build a bootable SD card with:
+
+```
+PI_CARGO_FEATURES=pi-bare-metal-input scripts/build-sd.sh <dest> [sd-mount]
+```
+
+See [`docs/REAL_HW_BRINGUP.md`](docs/REAL_HW_BRINGUP.md) for the
+hardware specifics — `config.txt`, UART routing, the TSTP MTouch
+panel, SDHOST details. The serial port and PCMCIA images are the
+remaining unported peripherals.
 
 ## Cheatsheet
 

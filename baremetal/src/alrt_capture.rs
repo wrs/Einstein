@@ -25,21 +25,10 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::kprintln;
 
-/// 4-KiB page-aligned VA we want to watch. `0x0cca3000` contains the
-/// alrt task's TAlertEventHandler at `0x0cca37a8` and the corrupted
-/// CList header at `0x0cca37c4`.
-// Reserved for future re-arming logic; the dynamic Prim Remember-driven
-// arm path was removed alongside the iter-50..89 probe sweep, so
-// TARGET_VA is purely documentation now.
-// const TARGET_VA: u32 = 0x0cca_3000;
-
-/// Known-stable PA backing TARGET_VA across boots, per the prior
-/// PLAN.md alias table:
-///   `PA=0x0402e000  VA=0x0cc9b000 ↔ VA=0x0cca3000`
-/// Used as a boot-time arm fallback so we catch writes that happen
-/// BEFORE the first Prim Remember install of TARGET_VA. The dynamic
-/// arm path (`maybe_arm_for_va`) re-confirms this PA at install time;
-/// a mismatch is logged.
+/// PA of the watched page (VA `0x0cca3000`, which holds the alrt
+/// task's TAlertEventHandler at `0x0cca37a8` and its CList header at
+/// `0x0cca37c4`; the PA↔VA pairing is stable across boots:
+/// `PA=0x0402e000  VA=0x0cc9b000 ↔ VA=0x0cca3000`). Armed at boot.
 const KNOWN_TARGET_PA: u32 = 0x0402_e000;
 
 /// PA backing TARGET_VA, captured at first Prim Remember install or

@@ -41,9 +41,12 @@ See `README.md` for the user-facing project overview and
 architecture.
 
 The 717006 ROM boots through the kernel + scheduler + NewtonScript
-interpreter to the Welcome UI. Most ongoing work is "run, see where
-it stops, fix, rerun" — which means the snapshot workflow below
-matters a lot.
+interpreter to the Welcome UI, and the builtin apps work — on QEMU,
+FVP, and a real Pi Zero 2 W (display, USB touch, HDMI audio, SD
+flash persistence; see `docs/REAL_HW_BRINGUP.md`). The known
+functional gap is add-on app packages. Debugging work is still
+"run, see where it stops, fix, rerun" — which means the snapshot
+workflow below matters a lot.
 
 **Important:** Do not trust your memory for details of ARM architecture,
 especially EL2-related registers and coprocessor instruction encodings.
@@ -373,21 +376,18 @@ re-deriving state from disassembly or tool output:
   encoding, observed task census). Always extend this when you
   decode another kernel struct from the disasm — it's how
   debugging keeps cumulative.
-- [`docs/REAL_HW_BRINGUP.md`](docs/REAL_HW_BRINGUP.md) — phased
-  plan for getting the hypervisor running on a real Pi Zero 2 W
-  (the documented deployment target). The Pi 3B is **not** a
-  stepping stone — same SoC, same image; only the form factor
-  differs. Skip the detour.
+- [`docs/REAL_HW_BRINGUP.md`](docs/REAL_HW_BRINGUP.md) — real
+  hardware (Pi Zero 2 W) reference: firmware contracts, the
+  as-built SDHOST / display / USB / audio / log-DMA stacks, and
+  porting notes. The Pi 3B is **not** a stepping stone — same SoC,
+  same image; only the form factor differs. Skip the detour.
 - [`docs/MTOUCH.md`](docs/MTOUCH.md) — TSTP MTouch USB touchscreen
   (VID 0x0416 / PID 0xC168) characterization: USB topology, HID
   report descriptor decode, activation handshake, Report ID 1
   wire format. Reference for Phase 5 input work.
-- [`docs/SD_DMA_AUTOSAVE.md`](docs/SD_DMA_AUTOSAVE.md) — making the
-  flash autosave non-blocking (DMA + completion IRQ) so it stops
-  freezing the guest and causing audio dropouts. Plan + status:
-  milestones 1–3 done/validated (DREQ 13, single-block DMA write,
-  per-cluster LBA map via vendored embedded-sdmmc); milestone 4
-  (multi-block `CMD25`/`CMD12` write + IRQ-driven per-cluster save
-  state machine) is implemented but not yet hardware-validated — the
-  remaining work is on-Pi validation and the optional `WaitBusy`
-  refinement noted in the doc.
+- [`docs/SD_DMA_AUTOSAVE.md`](docs/SD_DMA_AUTOSAVE.md) — the
+  non-blocking flash autosave: multi-block `CMD25`/`CMD12` DMA
+  writes (DREQ 13) driven cluster-by-cluster from the completion
+  IRQ, with the file's per-cluster LBA map resolved through the
+  vendored embedded-sdmmc. The only open item is the optional
+  `WaitBusy` refinement noted in the doc.

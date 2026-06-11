@@ -212,7 +212,7 @@ fn attach<H: crate::usb::host::UsbHostController>(
     Ok(())
 }
 
-/// Trap-tail pump. Touchscreen input is IRQ-driven now (`on_usb_irq`),
+/// Trap-tail pump. Touchscreen input is IRQ-driven (`on_usb_irq`),
 /// so there is nothing to poll here. Kept as a no-op so the shared
 /// `input::pump` seam and its call sites stay backend-agnostic.
 pub fn pump() {}

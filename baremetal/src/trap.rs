@@ -3866,9 +3866,7 @@ use guest_mem::{read_byte_pa as read_guest_byte_pa,
 ///
 /// Including `pre_abt_mode` (`SPSR_abt & 0x1F`) in the dedup key
 /// distinguishes a USR-pre-abt fault from an SVC-pre-abt fault at the
-/// same FAR — needed for the L1[0xCD] investigation, where we suspect
-/// a silently-handled USR-pre-abt fault precedes the visible SVC-pre-abt
-/// one. See `docs/plans/l1-cd-lazy-investigation.md` Step 6a.
+/// same FAR.
 fn log_dabt_forward(dfsc: u32, far: u32, mode: u32, ctx: &TrapContext) {
     let spsr_abt = read_banked_spsr("abt") as u32;
     let pre_abt_mode = spsr_abt & 0x1F;

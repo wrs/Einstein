@@ -1,4 +1,4 @@
-//! BCM2835 SDHOST controller driver (polled mode, no IRQ, no DMA).
+//! BCM2835 SDHOST controller driver.
 //!
 //! Targets the Raspberry Pi Zero 2 W's micro-SD slot, which on
 //! BCM2710 routes to the **SDHOST** controller (NOT the SDHCI-style
@@ -14,31 +14,18 @@
 //!   SDSC (byte-addressed) and stashes the RCA.
 //! - Block I/O (`read_block` / `write_block`) — single-block PIO
 //!   transfer via SDDATA FIFO.
+//! - DMA block I/O — DREQ-paced writes through DMA channel 6:
+//!   `write_block_dma` / `write_sectors_dma` (polled), and the
+//!   `start_sectors_dma` / `finish_sectors_dma` async pair that
+//!   drives the background flash autosave
+//!   (see `docs/SD_DMA_AUTOSAVE.md`).
 //!
 //! Ported from Circle's
 //! [`addon/SDCard/sdhost.cpp`](https://github.com/rsta2/circle/blob/master/addon/SDCard/sdhost.cpp)
 //! (P. Elwell @ RPi Trading, Rust port-by-hand). Constants live in
 //! [`super::regs`].
-//!
-//! ## Bring-up status
-//!
-//! All of the driver is implemented and the binary should boot
-//! through `SdHost::init` without panicking. None of it has been
-//! exercised on real hardware yet — first real-silicon test will
-//! confirm GPIO ALT routing, the mailbox-set core clock value, and
-//! whether our SDCDIV math matches what the controller wants.
-//! Likely first-failure modes:
-//!
-//! - CRC errors on the response or data → bus pulls wrong on
-//!   `SD_CMD` / `SD_DAT0..3` (see [`gpio_setup`]).
-//! - `CmdError::Timeout` on every command → SDCDIV too high (or
-//!   the controller never received its core clock; check the
-//!   mailbox response in [`clock_setup`]).
-//! - `CmdError::HardwareWedge` on CMD0 → SDHOST MMIO not reachable
-//!   (stage-1 doesn't map `0x3F20_2000` — but it should, via the
-//!   raspi3b `DEVICE_MMIO_START..DEVICE_MMIO_END` window).
 
-#![allow(dead_code)] // Reachable once the SDHOST bring-up is wired in.
+#![allow(dead_code)] // Parts go unused in probe-only / non-DMA feature combinations.
 
 use core::ptr::{read_volatile, write_volatile};
 

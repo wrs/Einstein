@@ -65,10 +65,9 @@ This is hid-multitouch's standard "discover max contacts" call; the
 device firmware uses it as "host is ready". The reply layout follows
 HID 1.11 §8.6: when a device exposes multiple Report IDs, the
 control-pipe response is **prefixed with the Report ID byte**, so we
-get `0x03 0x0a` on the wire — not `0x0a 0x00`. (Earlier revisions
-of this doc had it the other way around, which was a transcription
-of what hid-multitouch surfaces to userland after stripping the ID
-byte.) Once issued, Report ID 1 streams continuously at ~16 ms
+get `0x03 0x0a` on the wire — not the `0x0a 0x00` that
+hid-multitouch surfaces to userland after stripping the ID byte.
+Once issued, Report ID 1 streams continuously at ~16 ms
 intervals (steady, with keep-alive reports even when nothing changes
 — see "Behavior notes" below). The hypervisor USB stack must
 replicate this — otherwise the panel stays mute despite a

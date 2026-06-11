@@ -231,20 +231,28 @@ between "works on emulators" and "works on the Zero" live in
 
 ## 12. Phasing
 
-| Milestone | Exit criterion |
-|---|---|
-| **M1 — "Hello, EL2."** | Bare-metal Pi image, UART console, EL2 entry, stage-2 identity map, return to a trivial EL1 AArch32 payload that prints via HVC. |
-| **M2 — Guest ROM fetch.** | Load ROM/flash to guest physical; jump guest to `0x00000000`; observe first MMIO fault and log `ESR_EL2` / `HPFAR_EL2`. |
-| **M3 — Interrupt controller + timer.** | `TInterruptManager` wired through EL2 traps; first vIRQ delivered; scheduler ticks fire. |
-| **M4 — DMA, flash, screen.** | Boot progresses to the Notes screen. |
-| **M5 — Pen input.** | USB or UART-tunneled touch events into `TScreenManager`; user interaction works. |
-| **M6 — Audio, serial, PCMCIA images.** | Feature-complete stock Newton. |
-| **M7 — Performance and polish.** | Measurement vs real 162 MHz StrongARM. |
+| Milestone | Exit criterion | Status |
+|---|---|---|
+| **M1 — "Hello, EL2."** | Bare-metal Pi image, UART console, EL2 entry, stage-2 identity map, return to a trivial EL1 AArch32 payload that prints via HVC. | **done** |
+| **M2 — Guest ROM fetch.** | Load ROM/flash to guest physical; jump guest to `0x00000000`; observe first MMIO fault and log `ESR_EL2` / `HPFAR_EL2`. | **done** |
+| **M3 — Interrupt controller + timer.** | `TInterruptManager` wired through EL2 traps; first vIRQ delivered; scheduler ticks fire. | **done** |
+| **M4 — DMA, flash, screen.** | Boot progresses to the Notes screen. | **done** |
+| **M5 — Pen input.** | USB or UART-tunneled touch events into `TScreenManager`; user interaction works. | **done (2026-05-12, real hw)** |
+| **M6 — Audio, serial, PCMCIA images.** | Feature-complete stock Newton. | **audio done; serial + PCMCIA open** |
+| **M7 — Performance and polish.** | Measurement vs real 162 MHz StrongARM. | not started |
+
+M1–M5 are validated end-to-end on real hardware (Pi Zero 2 W) as well
+as QEMU/FVP — see `docs/REAL_HW_BRINGUP.md`. Beyond M7, the known
+functional gap not captured by this table is **add-on app packages**
+(the `.pkg` installation flow); the stock ROM and builtin apps run
+without it.
 
 ## 13. Risks, ranked
 
+All retired by the working v1; kept as design rationale.
+
 1. **Unknown ARMv4 quirks the Newton ROM depends on.** Mitigation: trap-and-emulate; Einstein's implementation as behavioral ground truth.
-2. **USB stack effort.** Real work. Mitigation: PS/2 or serial input for v1.
+2. **USB stack effort.** Real work. Mitigation: PS/2 or serial input for v1. (In the end the USB host stack was built — minimal, single-device, no hub.)
 3. **CP15 shim completeness.** Can only be enumerated empirically. Mitigation: instrument Einstein to collect the full set before starting (§16.4).
 4. **Physical aliases and mirrors.** `TMMU.cpp` dump shows flash/ROM mirrors at `0x30000000`, `0x34000000`, `0x90000000`, `0xAC000000`. Need stage-2 entries for each, or trap-and-remap (§16.8).
 5. **Thermal / power on Pi Zero 2 W.** Minor; A53 at 1 GHz under an emulator-sized workload is well within thermal envelope.
@@ -259,7 +267,7 @@ JIT, recompilation, any software CPU emulation, Einstein's UI layer, Linux depen
 
 ## 16. Open questions
 
-All of these want verification against the actual ROM or hardware rather than memory or inference. As of the first probe pass (see [`probe/FINDINGS.md`](probe/FINDINGS.md)), §16.2–§16.7 are answered for the 717006 ROM. §16.1 was the last remaining design-level gate; it closed on 2026-05-11 when `pi-probe` booted on Walter's Zero 2 W and printed `CurrentEL = 2`.
+All of these wanted verification against the actual ROM or hardware rather than memory or inference. **Every design-level question is now closed** — §16.2–§16.7 by the first probe pass (see [`probe/FINDINGS.md`](probe/FINDINGS.md)), §16.1 on 2026-05-11 when `pi-probe` booted on Walter's Zero 2 W and printed `CurrentEL = 2`, and the rest empirically by the full boot on real hardware (2026-05-12). Per-item status is noted inline; §16.13 (licensing) is the only one that remains a decision rather than a finding.
 
 1. **EL2 availability at boot on Pi Zero 2 W.** *Answered (2026-05-11).* `pi-probe` (a standalone `[[bin]]` — see `src/pi_probe.rs`) ran on real hardware and reported `CurrentEL = 2`, `MIDR_EL1 = 0x410fd034` (Cortex-A53 r0p4). Matches the QEMU `raspi3b` run byte-for-byte. The default Pi firmware path (`arm_64bit=1`, no `kernel_old`, no custom `armstub=`) loads `armstub8.S` from `raspberrypi/tools`, which eret's to EL2h before branching to `kernel8.img` at `0x80000`. PL011 routing to GPIO 14/15 requires `dtoverlay=disable-bt` in `config.txt`; otherwise the header carries the mini-UART. See `docs/REAL_HW_BRINGUP.md`.
 2. **Descriptor formats used by 2.x ROMs.** *Partially answered for 717006 — see [`probe/FINDINGS.md`](probe/FINDINGS.md).* Only sections, 64 KiB large pages, and 4 KiB small pages are actively mapped. No tiny pages. Three L1 slots (at VA 0x78000000, 0x90000000, 0xAC000000) hold fine-table descriptors but their L2 entries are all fault — placeholder reservations for PCMCIA card windows. Fine tables don't walk on A53 short descriptor, but since nothing is actually mapped through them, a straightforward hypervisor-side rewrite (L1 0b11 → 0b00) at guest TTBR-install time preserves semantics. Still needs verification against 737041, localised variants, and eMate ROMs.
@@ -268,11 +276,11 @@ All of these want verification against the actual ROM or hardware rather than me
 5. **SWP / SWPB frequency and call sites.** *Answered.* 405 810 SWPs from **one** PC (`0x003AE200`), zero SWPB. Single ROM patch at that site replaces the entire SWP surface with `LDREX`/`STREX`. Trap-and-emulate also viable at ~4.5 k/s peak.
 6. **Domain usage.** *Answered.* DACR is written 38 953 times with the same value `0x00055555` — eight client domains, eight no-access domains, no manager domains, no StrongARM-specific side effects. A53 short-descriptor DACR semantics match exactly.
 7. **Cache-line op encodings.** *Answered.* Six distinct c7 ops, all standard ARMv4, all trivially mappable to AArch32-on-A53 (`DCCMVAC`, `DCCIMVAC`, `DSB SY`, etc.) or safely no-oppable if we pass through A53 coherency.
-8. **Physical aliases and mirrors.** Enumerate every distinct guest-physical region the ROM actually touches; confirm stage-2 coverage.
-9. **RAM-size assumptions.** Does 2.x handle arbitrary RAM sizes via the `kHdWr_04RAMSize` register, or are there hard-coded assumptions somewhere? `TMemory.cpp:868–876` suggests the register is honored; verify for each ROM.
-10. **PCMCIA and modem runtime assumptions.** Does 2.x require a card present at boot? How is modem absence tolerated?
-11. **Display geometry and depth.** Newton expects specific framebuffer dimensions; Pi framebuffer is configurable. Confirm mapping.
-12. **Self-modifying ROM code.** If any exists, stage-2 write-protect-and-invalidate becomes relevant. If not, simpler.
-13. **Licensing.** Einstein is GPLv2. Reusing peripheral classes imposes GPLv2 on the hypervisor. Confirm intent.
-14. **Input device for v1.** USB touchscreen, UART-tunneled pen, or PS/2 keyboard + mouse-as-pen?
-15. **Minimum viable v1.** Pick the smallest ROM + flash + screen + pen configuration that proves the architecture end-to-end.
+8. **Physical aliases and mirrors.** *Answered empirically.* The stage-2 map covers every region the 717006 ROM touches through a full interactive boot; unknown IPAs halt loudly and none fire.
+9. **RAM-size assumptions.** *Answered for 717006.* The `kHdWr_04RAMSize` path is honored with the configuration we present; full boot + builtin apps run. Other ROM variants unverified.
+10. **PCMCIA and modem runtime assumptions.** *Answered.* 2.x boots and runs with no card present and no modem; the PCMCIA peripheral surface reports empty slots.
+11. **Display geometry and depth.** *Answered.* Newton's 320×480 2 bpp framebuffer is hypervisor-side scaled (1.5× → 480×720, centred on a 1280×720 HDMI mode) on real hw; 1:1 in the host viewer on QEMU/FVP.
+12. **Self-modifying ROM code.** *Answered.* The ROM itself is not self-modifying, but the kernel demand-pages code into RAM and rewrites it; handled by stage-2 RO+X ↔ RW+XN flipping with rescan-on-fetch (`src/stage2.rs`, `src/shadow_stub.rs`).
+13. **Licensing.** *Still open (decision, not finding).* The peripheral layer ports Einstein (GPLv2) state machines; confirm intended license for the hypervisor before any public release.
+14. **Input device for v1.** *Answered.* USB touchscreen (TSTP MTouch, `docs/MTOUCH.md`) on real hw; mouse-as-pen via the host viewer on QEMU/FVP.
+15. **Minimum viable v1.** *Achieved.* Pi Zero 2 W + 717006 ROM + HDMI panel with speakers + USB touch + SD card proves the architecture end-to-end.

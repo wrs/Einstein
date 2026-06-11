@@ -193,17 +193,6 @@ pub extern "C" fn kmain() -> ! {
         unsafe { guest::eret_to_restored(state); }
     }
 
-    // (iter-80s/90s heap-investigation guest_bp probes retired —
-    // SearchFreeList wild-r0 tripwire, TRefStack-post-NewStack logger,
-    // SetCurrentHeap entry probe, and NewHeap entry probe. They were
-    // diagnostic scaffolding for the "bogus current heap" wedge that
-    // iter-99..104 has long since cleared, and they permanently
-    // gated `snapshot::maybe_autosave` (any active guest_bp
-    // suppresses autosave to avoid persisting marker UDFs into the
-    // saved ROM image — see `src/snapshot.rs::maybe_autosave`). With
-    // them gone the autosave ring runs as designed. Re-add a single
-    // targeted probe via `guest_bp::install_guest_bp` if a future
-    // iteration needs to log a specific PC.)
     kprintln!();
     kprintln!("Entering Newton ROM...");
 

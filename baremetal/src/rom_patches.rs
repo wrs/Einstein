@@ -128,19 +128,6 @@ struct RomPatch {
 const PATCHES_717006: &[RomPatch] = &[
     RomPatch { offset: 0x0000_13F4, value: 0x0000_0001, name: "gDebugger patch" },
     RomPatch { offset: 0x0000_13FC, value: 0x0000_8202, name: "gNewtConfig patch" },
-    // (Dedup attempt 2026-04-28: even after relocating the hypervisor
-    // UND/DABT/SBA trampoline scratch out of the L1[0xc0] self-map
-    // region (HYP_TRAMP_SCRATCH_BASE moved to 0x0600_F000),
-    // ROM-patching the alternate L2 descriptors (L2[0x2,4,5,6,8] of
-    // the L2 PT at PA=0x00001400) STILL wedges boot — verify-mmu
-    // aliases drop 15→0 but DABT loops at FAR=0xc004bf8 (subpage 2
-    // of PA=0x04005000 via VA=0xc004XXX). So the kernel DOES use the
-    // alternate VAs at runtime — just via base+offset indirection
-    // rather than direct literals (the literal grep was misleading).
-    // Dropping the descriptors unmaps the subpages → DABT loop in
-    // BootOS post-HandleDebugCard. Pivot is Option β = stage-2 PA
-    // splitting at the duplicate VA. See INVESTIGATION.md for the
-    // full diagnostic.)
     RomPatch { offset: 0x0008_A20C, value: 0xE1A0_F00E, name: "Ignore setting time" },
     RomPatch { offset: 0x000D_B0D8, value: 0xE3A0_0000, name: "BeaconDetect (1/2)" },
     RomPatch { offset: 0x000D_B0DC, value: 0xE1A0_F00E, name: "BeaconDetect (2/2)" },

@@ -2,7 +2,15 @@
 //!
 //! Boot recipe lives in `baremetal/scripts/fvp` (and the user's
 //! `reference_fvp_base_revc.md` memory). Summary: RVBAR=0x80000000,
-//! has_el3=0, secure_memory=0, PL011 UART0 enabled, stdout.
+//! has_el3=1, secure_memory=0, PL011 UART0 enabled, stdout.
+//!
+//! We run the model with `has_el3=1`, so the CPU resets into EL3 and
+//! `boot.s` runs a minimal EL3 stub (wake the GICv3 redistributor,
+//! set GICD_CTLR.DS, program CNTFRQ/CNTCR, then ERET to NS-EL2) before
+//! the hypervisor proper starts at EL2. `boot.s` is the ground truth
+//! for that sequence — it branches on `CurrentEL`, so the same image
+//! also boots a `has_el3=0` model by entering directly at EL2, but the
+//! shipped `scripts/fvp` invocation uses `has_el3=1`.
 //!
 //! The hypervisor code and the guest ROM live in the non-secure DRAM
 //! that starts at 0x80000000. Device windows of interest are UART0 at
@@ -44,9 +52,10 @@ pub const NEWTON_TICK_HZ: u64 = 3_686_400;
 
 /// Route CNTHP to the CPU's IRQ input via the GICv3. Brings the whole
 /// GIC up (ICC_SRE_EL2, distributor, redistributor, CPU interface)
-/// because nothing else will: on FVP with `has_el3=0` there is no
-/// secure firmware to do it. See `super::gicv3` for the bare-metal
-/// initialisation sequence.
+/// from EL2 because there is no TF-A / secure OS to do it — `boot.s`'s
+/// EL3 stub only wakes the redistributor and sets GICD_CTLR.DS so the
+/// EL2 path here can reach the GICR_* / distributor registers. See
+/// `super::gicv3` for the bare-metal initialisation sequence.
 pub fn install_cnthp_irq_routing() {
     super::gicv3::init();
     super::gicv3::enable_ppi(super::gicv3::INTID_CNTHP);

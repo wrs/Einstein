@@ -191,8 +191,6 @@ const MAI_CTL_ERRORF: u32 = 1 << 1;
 const MAI_CTL_ERRORE: u32 = 1 << 2;
 const MAI_CTL_ENABLE: u32 = 1 << 3;
 const MAI_CTL_CHNUM_SHIFT: u32 = 4;
-/// Parity enable. Linux's vc4_hdmi.c does not set this bit.
-const MAI_CTL_PAREN: u32 = 1 << 8;
 const MAI_CTL_FLUSH: u32 = 1 << 9;
 #[allow(dead_code)] // RO FIFO status bit; kept for register documentation.
 const MAI_CTL_EMPTY: u32 = 1 << 10; // RO; FIFO drained-to-empty indicator.
@@ -217,8 +215,6 @@ const MAI_CTL_DLATE: u32 = 1 << 15;
 // VC4_HDMI_AUDIO_PACKET_CEA_MASK            VC4_MASK(7, 0)    shift 0
 const AUDIO_PACKET_CONFIG_ZERO_DATA_ON_SAMPLE_FLAT: u32 = 1 << 29;
 const AUDIO_PACKET_CONFIG_ZERO_DATA_ON_INACTIVE_CHANNELS: u32 = 1 << 24;
-const AUDIO_PACKET_CONFIG_FORCE_SAMPLE_PRESENT: u32 = 1 << 19;
-const AUDIO_PACKET_CONFIG_FORCE_B_FRAME: u32 = 1 << 18;
 const AUDIO_PACKET_CONFIG_B_FRAME_IDENTIFIER_SHIFT: u32 = 10;
 const AUDIO_PACKET_CONFIG_CEA_MASK_STEREO: u32 = 0b11;
 
@@ -252,8 +248,6 @@ const MAI_FMT_SAMPLE_RATE_SHIFT: u32 = 8;
 const MAI_FORMAT_PCM: u32 = 2;
 /// `enum VC4_HDMI_MAI_SAMPLE_RATE_44100 = 8` in `vc4_regs.h`.
 const MAI_SAMPLE_RATE_CODE_44_1_KHZ: u32 = 8;
-/// `enum VC4_HDMI_MAI_SAMPLE_RATE_48000 = 9` in `vc4_regs.h`.
-const MAI_SAMPLE_RATE_CODE_48_KHZ: u32 = 9;
 
 // ---- RAM_PACKET_CONFIG bits (from vc4_regs.h) ----------------------------
 //
@@ -295,18 +289,22 @@ const TX_PHY_CTL0_RNG_POWER_DOWN: u32 = 1 << 25;
 // and to find 192-frame block boundaries via
 // `VC4_HDMI_AUDIO_PACKET_B_FRAME_IDENTIFIER` in HDMI_AUDIO_PACKET_CONFIG.
 //
-// Two known-good conventions exist; the pair must match:
-//   - Linux/alsa-lib: 0x8 / 0x8
-//   - Circle:         0xF / 0xF
+// The shipped configuration uses ALSA's IEC958 preamble convention
+// (0x8 for the block-start B-frame), which the hardware's
+// AUDIO_PACKET_CONFIG B_FRAME_IDENTIFIER is paired against below.
 //
-// On real Pi Zero 2 W hardware we observed `0x8` causing intermittent
-// boot hangs (~5/6) where `0xF` reliably boots; the failure mode is
-// in the kernel's polling loop after StartOutput, suggesting that
-// the Linux convention's more aggressive block-boundary detection
-// interacts badly with the firmware-managed HDMI block we share.
-// The active value is selected by `IEC_DIAGNOSTIC_MODE` below so the
-// preamble and AUDIO_PACKET_CONFIG B_FRAME_IDENTIFIER stay paired.
-const IEC958_B_FRAME_PREAMBLE_CIRCLE: u32 = 0xF;
+// Alternatives tried and why they lost: two known-good preamble
+// conventions exist — Linux/alsa-lib (0x8/0x8) and Circle (0xF/0xF).
+// During bring-up a *bare* 0x8 block-start-only preamble (Circle's
+// shape but with the ALSA nibble) caused intermittent boot hangs
+// (~5/6 boots) in the kernel's post-StartOutput polling loop, where
+// 0xF booted reliably. The resolution was not "use 0xF" but to
+// supply ALSA's *full* software-preamble set (Z=0x8 on left
+// block-start, X=0x2 on other left subframes, Y=0x4 on every right
+// subframe) together with the complete channel-status bytes — that
+// combination boots reliably and matches what the ALSA IEC958 plugin
+// emits, so the hardware's block detection has the framing it
+// expects. That is the configuration the code below bakes in.
 const IEC958_B_FRAME_PREAMBLE_ALSA: u32 = 0x8;
 
 /// Newton source audio parameters (Einstein PulseAudio backend,
@@ -316,57 +314,27 @@ const NEWTON_RATE_HZ: u32 = 22050;
 
 // ---- HDMI audio configuration ---------------------------------------------
 //
-// Defaults here follow the working Linux/Circle path unless the name says it
-// is a tone-test probe.
+// The shipped configuration follows the working Linux/Circle VC4 path. The
+// audio bring-up went through a diagnostic-matrix bisection (tone-test rate,
+// five IEC channel-status modes, several MAI_CTL / AUDIO_PACKET_CONFIG
+// toggles); the matrix has been removed now that one configuration is known
+// good. The constants and code below are exactly that configuration; the
+// "alternatives tried and why they lost" knowledge is preserved as prose
+// where each decision lives.
 
-/// 48 kHz cadence probe. Diagnostic-only: Newton's current resampler emits
-/// 44.1 kHz, so leave this false for normal guest audio.
-const TONE_TEST_48_KHZ: bool = false;
-/// HDMI output audio rate for the current diagnostic build.
-const HDMI_RATE_HZ: u32 = if TONE_TEST_48_KHZ { 48_000 } else { 44_100 };
+/// HDMI output audio rate. 44.1 kHz — an exact 2× of Newton's 22.05 kHz
+/// source, so the resampler is a trivial sample-and-hold. (A 48 kHz
+/// tone-test cadence was used during bring-up to compare against Linux's
+/// spec-table N=6144; it produced no signal Newton ever emits and was
+/// dropped.)
+const HDMI_RATE_HZ: u32 = 44_100;
 
-/// Linux/Circle-style Audio InfoFrame: PB2=0 means sample size/frequency are
-/// taken from the stream header rather than duplicated in the InfoFrame.
-const AUDIO_INFOFRAME_REFER_TO_STREAM: bool = true;
-/// Use Raspberry Pi Linux's gen3 MAI FIFO threshold values (the path
-/// `vc4_hdmi_audio_prepare` takes when `vc4->gen < VC4_GEN_5`, which
-/// is BCM2835/2710/2837 — i.e. the Pi Zero 2 W we target):
-/// `panic_high=0x8, panic_low=0x8, dreq_high=0x6, dreq_low=0x8`,
-/// packed as `0x0808_0608`. Flip false to use Circle's `0x10`s in
-/// every field if comparing to that reference.
-const USE_LINUX_GEN3_MAI_THRESHOLDS: bool = true;
-/// Linux's working VC4 path enables MAI during prepare, before the Audio
-/// InfoFrame helper returns.
-const ENABLE_MAI_AFTER_INFOFRAME: bool = false;
-/// Linux/Circle set the packetizer's zero-data flags.
-const USE_AUDIO_PACKET_ZERO_FLAGS: bool = true;
-/// Linux and Circle leave MAI_CTL.PAREN clear.
-const USE_MAI_CTL_PAREN: bool = false;
-/// Linux/Circle do not force every CEA channel sample as present.
-const FORCE_AUDIO_SAMPLE_PRESENT: bool = false;
-/// Linux/Circle do not force every IEC block boundary as a B frame.
-const FORCE_AUDIO_B_FRAME: bool = false;
-/// Match Linux/Circle by powering the HDMI TX PHY RNG before audio starts.
-const ENABLE_HDMI_PHY_RNG: bool = true;
-/// Match Linux's working RAM packet schedule on this panel: AVI/SPD/Audio
-/// slots 2, 3, and 4 enabled. Firmware leaves us with slots 0, 2, and 4.
-const USE_LINUX_RAM_PACKET_CONFIG: bool = true;
-
-// Unavoidable non-Linux infrastructure still called out explicitly:
+// Non-Linux infrastructure still called out explicitly:
 // - HSM is inherited from the firmware-owned HDMI modeset. Directly poking
 //   CM_HSMCTL/CM_HSMDIV while the firmware encoder is live is not equivalent
 //   to Linux's KMS + common-clock-framework path and produced quiet hiss.
 // - Normal Newton playback writes the Audio InfoFrame once at bringup, not on
-//   every ALSA prepare/start.
-
-const IEC_MODE_SUPPRESS_ALL: u8 = 0;
-const IEC_MODE_ALSA_B_ONLY: u8 = 1;
-const IEC_MODE_ALSA_B_AND_CS_BYTE3: u8 = 2;
-const IEC_MODE_ALSA_B_AND_CS_BYTE4: u8 = 3;
-const IEC_MODE_ALSA_B_AND_ALL_CS: u8 = 4;
-/// IEC bisection mode. Default now matches Linux's ALSA IEC958 plugin:
-/// X/Y/Z preamble nibbles plus full channel-status bytes.
-const IEC_DIAGNOSTIC_MODE: u8 = IEC_MODE_ALSA_B_AND_ALL_CS;
+//   every ALSA prepare/start (our stream format is fixed).
 
 /// IEC 60958 block size — 192 frames. The B-frame preamble marks the
 /// start of each block; subsequent frames use M/W preambles which the
@@ -375,11 +343,7 @@ const IEC_DIAGNOSTIC_MODE: u8 = IEC_MODE_ALSA_B_AND_ALL_CS;
 const IEC958_BLOCK_FRAMES: u32 = 192;
 
 const fn mai_sample_rate_code() -> u32 {
-    if TONE_TEST_48_KHZ {
-        MAI_SAMPLE_RATE_CODE_48_KHZ
-    } else {
-        MAI_SAMPLE_RATE_CODE_44_1_KHZ
-    }
+    MAI_SAMPLE_RATE_CODE_44_1_KHZ
 }
 
 /// N for the HDMI ACR (Audio Clock Regeneration) packet.
@@ -391,29 +355,9 @@ const fn mai_sample_rate_code() -> u32 {
 ///
 /// For 44.1 kHz this gives 5644 (slightly less than the HDMI 1.4
 /// spec table's recommended 6272, but Linux uses this formula
-/// rather than the table). For 48 kHz it gives 6144 which matches
-/// the spec table exactly.
+/// rather than the table).
 const fn hdmi_acr_n() -> u32 {
     128 * HDMI_RATE_HZ / 1000
-}
-
-const fn iec_b_frame_preamble() -> u32 {
-    if IEC_DIAGNOSTIC_MODE == IEC_MODE_ALSA_B_ONLY
-        || IEC_DIAGNOSTIC_MODE == IEC_MODE_ALSA_B_AND_CS_BYTE3
-        || IEC_DIAGNOSTIC_MODE == IEC_MODE_ALSA_B_AND_CS_BYTE4
-        || IEC_DIAGNOSTIC_MODE == IEC_MODE_ALSA_B_AND_ALL_CS
-    {
-        IEC958_B_FRAME_PREAMBLE_ALSA
-    } else {
-        IEC958_B_FRAME_PREAMBLE_CIRCLE
-    }
-}
-
-const fn use_alsa_iec_preambles() -> bool {
-    IEC_DIAGNOSTIC_MODE == IEC_MODE_ALSA_B_ONLY
-        || IEC_DIAGNOSTIC_MODE == IEC_MODE_ALSA_B_AND_CS_BYTE3
-        || IEC_DIAGNOSTIC_MODE == IEC_MODE_ALSA_B_AND_CS_BYTE4
-        || IEC_DIAGNOSTIC_MODE == IEC_MODE_ALSA_B_AND_ALL_CS
 }
 
 /// Ring capacity in stereo frames. Newton ping-pongs two 1872-sample
@@ -444,20 +388,27 @@ struct RingState {
     /// Consumer index (frames played, monotonic).
     tail: AtomicU32,
     /// `schedule_output` writes encoded stereo frames here; `pump`
-    /// pulls them out and pushes to MAI_DATA.
-    frames: [StereoFrame; RING_FRAMES],
+    /// pulls them out and pushes to MAI_DATA. `UnsafeCell` because the
+    /// producer writes individual slots through a `*mut` derived from a
+    /// shared `&RingState` — plain (non-`UnsafeCell`) interior mutation
+    /// through a shared reference is UB under Rust's aliasing model.
+    /// The head/tail atomics serialise which slots each side touches;
+    /// the same pattern as `MAI_TX_RING` below.
+    frames: core::cell::UnsafeCell<[StereoFrame; RING_FRAMES]>,
 }
 
-#[allow(static_mut_refs)]
+// SAFETY: single-CPU EL2; producer (schedule_output) and consumer
+// (pump) are serialised by EL2 trap context and by the head/tail
+// ordering, the same as the `MaiTxRing` Sync rationale below.
+unsafe impl Sync for RingState {}
+
 fn ring_state() -> &'static RingState {
-    static mut STATE: RingState = RingState {
+    static STATE: RingState = RingState {
         head: AtomicU32::new(0),
         tail: AtomicU32::new(0),
-        frames: [StereoFrame(0); RING_FRAMES],
+        frames: core::cell::UnsafeCell::new([StereoFrame(0); RING_FRAMES]),
     };
-    // SAFETY: single-core EL2; all interior fields are atomics or
-    // accessed only via the producer / consumer indices' ordering.
-    unsafe { &STATE }
+    &STATE
 }
 
 static INIT_DONE: AtomicBool = AtomicBool::new(false);
@@ -793,11 +744,10 @@ pub fn schedule_output(which: u32, byte_count: u32) {
         // SAFETY: head is our exclusive producer index; the
         // consumer never reads slots beyond `tail < head`.
         unsafe {
-            let p = ring.frames.as_ptr().add(slot) as *mut StereoFrame;
-            *p = frame;
+            let base = ring.frames.get() as *mut StereoFrame;
+            *base.add(slot) = frame;
             let slot2 = (head.wrapping_add(1) as usize) & RING_MASK;
-            let p2 = ring.frames.as_ptr().add(slot2) as *mut StereoFrame;
-            *p2 = frame;
+            *base.add(slot2) = frame;
         }
         head = head.wrapping_add(2);
         input_idx += 1;
@@ -913,7 +863,7 @@ fn refill_mai_dma_ring() {
         // exclusive domain until we advance `tail_stereo`.
         let frame = unsafe {
             let slot = (tail_stereo as usize) & RING_MASK;
-            let p = ring.frames.as_ptr().add(slot);
+            let p = (ring.frames.get() as *const StereoFrame).add(slot);
             (*p).0
         };
         let left = (frame & 0xFFFF) as i16;
@@ -1121,30 +1071,19 @@ fn encode_stereo_frame(mono_be_sample: i16) -> StereoFrame {
 /// when it's 0, the left subframe carries the B-frame preamble bits
 /// that mark the start of a block.
 fn encode_iec958_pair(left: i16, right: i16, frame_idx_in_block: u32) -> (u32, u32) {
-    // Diagnostic mode 0 forces every subframe with the same sample to be
-    // byte-identical: no C-bit variation and no B-frame preamble flip.
-    if IEC_DIAGNOSTIC_MODE == IEC_MODE_SUPPRESS_ALL {
-        let sf_l = build_iec958_subframe(left, 0);
-        let sf_r = build_iec958_subframe(right, 0);
-        return (sf_l, sf_r);
-    }
-
     let c_l = channel_status_bit(frame_idx_in_block);
     let c_r = c_l;
     let mut sf_l = build_iec958_subframe(left, c_l);
     let mut sf_r = build_iec958_subframe(right, c_r);
-    if use_alsa_iec_preambles() {
-        // ALSA's IEC958 plugin supplies all software preamble nibbles:
-        // Z=0x8 on left block-start, X=0x2 on other left subframes,
-        // Y=0x4 on every right subframe.
-        let left_preamble = if frame_idx_in_block == 0 { 0x8 } else { 0x2 };
-        sf_l = (sf_l & !0xF) | left_preamble;
-        sf_r = (sf_r & !0xF) | 0x4;
-    } else if frame_idx_in_block == 0 {
-        // Circle sets only the block-start marker, on both subframes.
-        sf_l = (sf_l & !0xF) | iec_b_frame_preamble();
-        sf_r = (sf_r & !0xF) | iec_b_frame_preamble();
-    }
+    // ALSA's IEC958 plugin supplies all software preamble nibbles:
+    // Z=0x8 on left block-start, X=0x2 on other left subframes,
+    // Y=0x4 on every right subframe. (Bring-up also tried Circle's
+    // block-start-only marker and an all-suppressed variant; only the
+    // full ALSA preamble set booted reliably — see the IEC 60958
+    // preamble note above.)
+    let left_preamble = if frame_idx_in_block == 0 { 0x8 } else { 0x2 };
+    sf_l = (sf_l & !0xF) | left_preamble;
+    sf_r = (sf_r & !0xF) | 0x4;
     (sf_l, sf_r)
 }
 
@@ -1170,17 +1109,15 @@ fn even_parity(v: u32) -> bool {
 }
 
 fn channel_status_bit(frame_idx_in_block: u32) -> u32 {
+    // Emit the full IEC 60958 channel-status bytes (the shipped
+    // configuration). Bring-up bisected this against variants that
+    // suppressed all CS, or sent only CS byte 3 / byte 4, to isolate a
+    // receiver re-sync click; the full-CS variant was the one that
+    // booted and played reliably.
     let byte_idx = (frame_idx_in_block / 8) as usize;
     let bit_idx = (frame_idx_in_block % 8) as u32;
     if byte_idx >= CHANNEL_STATUS_BYTES.len() {
         return 0;
-    }
-    match IEC_DIAGNOSTIC_MODE {
-        IEC_MODE_ALSA_B_ONLY => return 0,
-        IEC_MODE_ALSA_B_AND_CS_BYTE3 if byte_idx != 3 => return 0,
-        IEC_MODE_ALSA_B_AND_CS_BYTE4 if byte_idx != 4 => return 0,
-        IEC_MODE_ALSA_B_AND_ALL_CS => {}
-        _ => return 0,
     }
     ((CHANNEL_STATUS_BYTES[byte_idx] >> bit_idx) & 1) as u32
 }
@@ -1416,10 +1353,6 @@ pub fn on_mai_dma_done() {
 }
 
 fn enable_hdmi_phy_rng() {
-    if !ENABLE_HDMI_PHY_RNG {
-        return;
-    }
-
     // Circle clears TxPhyControl0.RngPowerDown on RPi <= 3 before
     // enabling MAI; Linux does the same through vc4_hdmi->phy_rng_enable.
     // The firmware modeset may leave this powered down, so make it explicit.
@@ -1428,70 +1361,6 @@ fn enable_hdmi_phy_rng() {
         let before = read_volatile(HDMI_TX_PHY_CTL0 as *const u32);
         write_volatile(HDMI_TX_PHY_CTL0 as *mut u32, before & !TX_PHY_CTL0_RNG_POWER_DOWN);
         dsb_sy();
-    }
-}
-
-/// Write the "playing" MAI_CTL bit pattern, mirroring
-/// `vc4_hdmi_audio_trigger(START)` in vc4_hdmi.c:
-///
-/// ```c
-/// HDMI_WRITE(HDMI_MAI_CTL,
-///     VC4_SET_FIELD(channels, VC4_HD_MAI_CTL_CHNUM) |
-///     VC4_HD_MAI_CTL_WHOLSMP | VC4_HD_MAI_CTL_CHALIGN |
-///     VC4_HD_MAI_CTL_ENABLE);
-/// ```
-///
-/// `bringup_mai` inlines this same pattern; kept for symmetry with
-/// [`mai_ctl_shutdown`] / [`mai_ctl_reset`].
-#[allow(dead_code)]
-fn mai_ctl_enable_playback() {
-    let mut ctl =
-        (2u32 << MAI_CTL_CHNUM_SHIFT) | MAI_CTL_WHOLSMP | MAI_CTL_CHALIGN | MAI_CTL_ENABLE;
-    if USE_MAI_CTL_PAREN {
-        ctl |= MAI_CTL_PAREN;
-    }
-    // SAFETY: MMIO write in the Device-nGnRE window.
-    unsafe {
-        write_volatile(HDMI_MAI_CTL as *mut u32, ctl);
-    }
-}
-
-/// Write the "shutdown" MAI_CTL bit pattern, matching
-/// `vc4_hdmi_audio_shutdown` in vc4_hdmi.c byte-for-byte:
-///
-/// ```c
-/// HDMI_WRITE(HDMI_MAI_CTL,
-///     VC4_HD_MAI_CTL_DLATE |
-///     VC4_HD_MAI_CTL_ERRORE |
-///     VC4_HD_MAI_CTL_ERRORF);
-/// ```
-///
-/// Note: Linux's `vc4_hdmi_audio_shutdown` also calls `phy_rng_disable`
-/// and `vc4_hdmi_audio_reset` (see [`mai_ctl_reset`]) after this
-/// write. Currently unused — kept for symmetry.
-#[allow(dead_code)]
-fn mai_ctl_shutdown() {
-    // SAFETY: MMIO write in the Device-nGnRE window.
-    unsafe {
-        write_volatile(
-            HDMI_MAI_CTL as *mut u32,
-            MAI_CTL_DLATE | MAI_CTL_ERRORE | MAI_CTL_ERRORF,
-        );
-    }
-}
-
-/// Pulse the MAI block through Linux's `vc4_hdmi_audio_reset`
-/// sequence: three separate single-bit MAI_CTL writes (RESET,
-/// ERRORF, FLUSH). The OR'd-into-one variant we had before is NOT
-/// equivalent — the hardware latches each bit on a rising edge and
-/// the OR'd write only produces one edge. Currently unused.
-#[allow(dead_code)]
-fn mai_ctl_reset() {
-    // SAFETY: MMIO writes in the Device-nGnRE window.
-    unsafe {
-        write_volatile(HDMI_MAI_CTL as *mut u32, MAI_CTL_RESET);
-        write_volatile(HDMI_MAI_CTL as *mut u32, MAI_CTL_ERRORF);
-        write_volatile(HDMI_MAI_CTL as *mut u32, MAI_CTL_FLUSH);
     }
 }
 
@@ -1511,6 +1380,47 @@ fn pixel_clock_hz() -> Option<(u32, &'static str)> {
         }
     }
     None
+}
+
+/// Empirically-known-good TMDS pixel clock for the shipped 1024×600
+/// touchscreen panel. The firmware mailbox `CLOCK_ID_PIXEL` reports
+/// ~85.5 MHz for this panel (it returns a PLL *source* rate, not the
+/// post-divider on-wire TMDS rate), but Linux's working CTS on the
+/// same panel (CTS=0xC7F8 = 51192 with N=5644 @ 44.1 kHz) back-solves
+/// to mode->clock ≈ 51.2 MHz. We have no KMS modeline to read, so this
+/// constant is the override used when the mailbox reading is the
+/// known-bad one.
+const PANEL_PIXEL_CLOCK_HZ: u64 = 51_200_000;
+
+/// Decide which pixel clock to feed into CTS, given the live mailbox
+/// reading.
+///
+/// A correct TMDS pixel clock for any HDMI mode Newton drives lands
+/// well under 80 MHz (the panel's is ~51 MHz; even 720p60 is 74.25
+/// MHz). The shipped panel's firmware mailbox instead reports a PLL
+/// source rate of ~85.5 MHz — the *only* documented bad reading — so
+/// any reading at/above 80 MHz is treated as that PLL-source artifact
+/// and replaced with `PANEL_PIXEL_CLOCK_HZ`. A reading in the
+/// plausible TMDS range (25..80 MHz) is the real post-divider rate and
+/// is used directly, so a different monitor/mode gets a CTS computed
+/// from its own clock. Returns `(clock_hz, provenance_label)`.
+fn cts_pixel_clock_hz(measured_hz: u32) -> (u64, &'static str) {
+    const TMDS_PLAUSIBLE_LO_HZ: u32 = 25_000_000;
+    const PLL_SOURCE_ARTIFACT_LO_HZ: u32 = 80_000_000;
+    if (TMDS_PLAUSIBLE_LO_HZ..PLL_SOURCE_ARTIFACT_LO_HZ).contains(&measured_hz) {
+        (measured_hz as u64, "mailbox")
+    } else {
+        // ≥80 MHz: the known-bad PLL-source reading (≈85.5 MHz on the
+        // shipped panel). <25 MHz: implausibly low — also distrusted.
+        (PANEL_PIXEL_CLOCK_HZ, "panel-override")
+    }
+}
+
+/// CTS for the HDMI ACR packet: `pixel_clock_hz * n / (128 * fs)`,
+/// Linux's `vc4_hdmi_set_n_cts` formula. One home for the math so the
+/// boot log and the register write can't disagree.
+fn compute_cts(pixel_clock_hz: u64, n: u32) -> u32 {
+    ((pixel_clock_hz * n as u64) / (128 * HDMI_RATE_HZ as u64)) as u32
 }
 
 /// Resolve the HSM ("HDMI State Machine") clock rate in Hz. This is
@@ -1644,24 +1554,15 @@ fn bringup_mai() -> bool {
     };
 
     // ACR N matches `vc4_hdmi_set_n_cts` verbatim: n = 128 * fs / 1000.
-    //
-    // CTS is supposed to follow Linux's formula:
-    //   cts = (mode->clock * 1000 * n) / (128 * samplerate);
-    // — but on this Pi Zero 2 W + touchscreen-panel combo, the
-    // firmware mailbox's CLOCK_ID_PIXEL returns 85.5 MHz while
-    // the actual on-wire TMDS pixel clock is 51.2 MHz (verified by
-    // observing Linux's working CTS=0xC7F8 on the same panel and
-    // back-solving for mode->clock = 51199.5 kHz). We don't have a
-    // KMS modeline to read; the firmware mailbox is the wrong tag
-    // for what we need (it returns a PLL source rate, not the
-    // post-divider TMDS rate). Until we find a reliable way to
-    // query the live TMDS pixel clock, we use the empirically-known
-    // good value for this panel: equivalent to mode->clock=51199 kHz.
     let n: u32 = hdmi_acr_n();
-    const PANEL_PIXEL_CLOCK_HZ: u64 = 51_200_000;
-    let cts: u32 =
-        ((PANEL_PIXEL_CLOCK_HZ * n as u64) / (128 * HDMI_RATE_HZ as u64)) as u32;
-    let _ = pixel_clock_hz; // currently only used in the boot log below
+    // CTS follows Linux's formula
+    //   cts = (pixel_clock_hz * n) / (128 * samplerate)
+    // using the live pixel clock — *except* for the one known-bad
+    // mailbox reading documented in `cts_pixel_clock_hz`. The pixel
+    // clock that actually goes into CTS (and its provenance) is
+    // resolved there in one place, then logged below as `cts_pixel`.
+    let (cts_pixel_hz, cts_pixel_src) = cts_pixel_clock_hz(pixel_clock_hz);
+    let cts: u32 = compute_cts(cts_pixel_hz, n);
 
     // MAI_SMP per `vc4_hdmi_audio_set_mai_clock`:
     //   rational_best_approximation(audio_clock, samplerate, max_n, max_m+1, &n, &m)
@@ -1678,10 +1579,12 @@ fn bringup_mai() -> bool {
         | ((smp_m.saturating_sub(1)) & (MAI_SMP_M_MASK >> MAI_SMP_M_SHIFT));
 
     kprintln!(
-        "audio_pi_hdmi: pixel_clock={} Hz (src={}), audio_clock={} Hz, \
-         N={}, CTS={}, MAI_SMP n={} m={} ({:#x})",
+        "audio_pi_hdmi: pixel_clock={} Hz (src={}), cts_pixel={} Hz ({}), \
+         audio_clock={} Hz, N={}, CTS={}, MAI_SMP n={} m={} ({:#x})",
         pixel_clock_hz,
         pixel_clock_src,
+        cts_pixel_hz,
+        cts_pixel_src,
         audio_clock_hz,
         n,
         cts,
@@ -1696,47 +1599,36 @@ fn bringup_mai() -> bool {
     let channel_map: u32 = 0x8;
     let channel_mask: u32 = 0b11;
     // B_FRAME_IDENTIFIER — the 4-bit value the hardware scans bits 0..3
-    // of each IEC subframe for to detect block starts. Must match
-    // the software preamble selected by `IEC_DIAGNOSTIC_MODE`.
-    let mut audio_packet_config: u32 = (iec_b_frame_preamble()
+    // of each IEC subframe for to detect block starts. Must match the
+    // software preamble we emit (ALSA's 0x8 block-start nibble).
+    // Linux/Circle set the packetizer's zero-data flags; we do too.
+    // (Bring-up also tried FORCE_SAMPLE_PRESENT and FORCE_B_FRAME here;
+    // neither helped the receiver re-sync click, so both stay clear,
+    // matching Linux/Circle.)
+    let audio_packet_config: u32 = (IEC958_B_FRAME_PREAMBLE_ALSA
         << AUDIO_PACKET_CONFIG_B_FRAME_IDENTIFIER_SHIFT)
-        | (channel_mask & AUDIO_PACKET_CONFIG_CEA_MASK_STEREO);
-    if USE_AUDIO_PACKET_ZERO_FLAGS {
-        audio_packet_config |= AUDIO_PACKET_CONFIG_ZERO_DATA_ON_SAMPLE_FLAT
-            | AUDIO_PACKET_CONFIG_ZERO_DATA_ON_INACTIVE_CHANNELS;
-    }
-    if FORCE_AUDIO_SAMPLE_PRESENT {
-        audio_packet_config |= AUDIO_PACKET_CONFIG_FORCE_SAMPLE_PRESENT;
-    }
-    if FORCE_AUDIO_B_FRAME {
-        audio_packet_config |= AUDIO_PACKET_CONFIG_FORCE_B_FRAME;
-    }
+        | (channel_mask & AUDIO_PACKET_CONFIG_CEA_MASK_STEREO)
+        | AUDIO_PACKET_CONFIG_ZERO_DATA_ON_SAMPLE_FLAT
+        | AUDIO_PACKET_CONFIG_ZERO_DATA_ON_INACTIVE_CHANNELS;
     let mai_config_val: u32 = MAI_CONFIG_BIT_REVERSE
         | MAI_CONFIG_FORMAT_REVERSE
         | (channel_mask & MAI_CONFIG_CHANNEL_MASK_STEREO);
     let mai_fmt_val: u32 = (MAI_FORMAT_PCM << MAI_FMT_AUDIO_FORMAT_SHIFT)
         | (mai_sample_rate_code() << MAI_FMT_SAMPLE_RATE_SHIFT);
-    let mai_thr_val: u32 = if USE_LINUX_GEN3_MAI_THRESHOLDS {
-        // Raspberry Pi Linux vc4 gen4 thresholds:
-        // PANICHIGH=0x08, PANICLOW=0x08, DREQHIGH=0x06, DREQLOW=0x08.
-        0x0808_0608
-    } else {
-        // Circle's non-RPi5 value.
-        0x1010_1010
-    };
+    // Raspberry Pi Linux vc4 gen3 thresholds (the `vc4->gen < VC4_GEN_5`
+    // path taken on BCM2835/2710/2837): PANICHIGH=0x08, PANICLOW=0x08,
+    // DREQHIGH=0x06, DREQLOW=0x08. (Circle's 0x1010_1010 was the other
+    // candidate; the gen3 values are the ones that matched our SoC.)
+    let mai_thr_val: u32 = 0x0808_0608;
 
     // Linear sequence below mirrors vc4_hdmi_audio_startup +
     // vc4_hdmi_audio_prepare (vc4_hdmi.c).
     //
     // SAFETY: MMIO writes in the Device-nGnRE window mapped by mmu::init.
     unsafe {
+        // Linux/Circle leave MAI_CTL.PAREN clear, so we do too.
         let playback_ctl =
             (2u32 << MAI_CTL_CHNUM_SHIFT) | MAI_CTL_WHOLSMP | MAI_CTL_CHALIGN | MAI_CTL_ENABLE;
-        let playback_ctl = if USE_MAI_CTL_PAREN {
-            playback_ctl | MAI_CTL_PAREN
-        } else {
-            playback_ctl
-        };
 
         // `vc4_hdmi_audio_startup` — RESET + FLUSH + DLATE + error
         // masking. Both Linux (vc4_hdmi.c:2505) and Circle
@@ -1752,17 +1644,16 @@ fn bringup_mai() -> bool {
         // `vc4_hdmi_audio_set_mai_clock`.
         write_volatile(HDMI_MAI_SMP as *mut u32, smp_val);
 
-        if !ENABLE_MAI_AFTER_INFOFRAME {
-            // `vc4_hdmi_audio_prepare` — CTL with channels + WHOLSMP +
-            // CHALIGN + ENABLE.
-            write_volatile(HDMI_MAI_CTL as *mut u32, playback_ctl);
-        }
+        // `vc4_hdmi_audio_prepare` — CTL with channels + WHOLSMP +
+        // CHALIGN + ENABLE. (Linux's working VC4 path enables MAI here,
+        // during prepare; deferring it until after the Audio InfoFrame
+        // write was tried and made no difference, so we follow Linux.)
+        write_volatile(HDMI_MAI_CTL as *mut u32, playback_ctl);
 
         // `vc4_hdmi_audio_prepare` — MAI_FMT.
         write_volatile(HDMI_MAI_FMT as *mut u32, mai_fmt_val);
 
-        // FIFO thresholds. Linux picks generation-specific values;
-        // Circle uses 0x10 in each field on non-RPi5.
+        // FIFO thresholds (gen3 values, see `mai_thr_val` above).
         write_volatile(HDMI_MAI_THR as *mut u32, mai_thr_val);
 
         // `vc4_hdmi_audio_prepare` — MAI_CONFIG.
@@ -1808,20 +1699,6 @@ fn bringup_mai() -> bool {
         );
         return false;
     }
-    // Diagnostic: skip the Audio InfoFrame write to test whether the
-    // ~1 second receiver re-sync cycle is being triggered by the
-    // InfoFrame contents being mis-parsed. Previous result with
-    // SKIP=true AND SUPPRESS_FRAME_VARIATION=true (CS bits all zero
-    // on wire) was "no effect on the click cadence". This time we're
-    // turning it back on (SKIP=false) while keeping CS bits empty,
-    // to test whether the click is the receiver periodically failing
-    // to recognise audio format in the absence of *both* CS content
-    // and a CEA-861 Audio InfoFrame.
-    const SKIP_AUDIO_INFOFRAME: bool = false;
-    if SKIP_AUDIO_INFOFRAME {
-        kprintln!("audio_pi_hdmi: SKIP_AUDIO_INFOFRAME — not writing the Audio InfoFrame");
-        return true;
-    }
     // Write the Audio InfoFrame ONCE at bringup. Our stream format is
     // fixed (PCM stereo 16-bit 44.1 kHz) and never changes between
     // clips, so re-arming the RAM_PACKET_CONFIG slot per StartOutput
@@ -1838,11 +1715,13 @@ fn bringup_mai() -> bool {
 /// CEA-861-F §6.6: 10-byte payload for an audio info frame, plus a
 /// 4-byte header (packet type 0x84, version 1, length 10).
 ///
-/// Called from `start_output` on each `StartOutput` subfn, matching
-/// vc4_hdmi.c's trigger(START) sequence — receivers expect the
-/// InfoFrame around the time playback begins, and the slot needs
-/// re-arming each time because firmware may have rotated the RAM
-/// packet schedule between starts.
+/// Called exactly once, from `bringup_mai`. Our stream format is fixed
+/// (PCM stereo 16-bit 44.1 kHz) and never changes between clips, so the
+/// InfoFrame is written once at bring-up rather than re-armed per
+/// `StartOutput`: re-arming the RAM_PACKET_CONFIG slot would only
+/// perturb the firmware-managed HDMI schedule (visible as a display
+/// re-modeset). Linux re-arms in trigger(START) because it supports
+/// rate changes; we don't. See `start_output`'s comments.
 ///
 /// Byte stream laid out per `vc4_hdmi_write_infoframe` (vc4_hdmi.c):
 /// the on-wire packet is `[type, ver, len, checksum, PB1..PBn]` and
@@ -1883,11 +1762,9 @@ fn set_audio_info_frame() {
     buffer[1] = 0x01;
     buffer[2] = 0x0A;
     buffer[4] = 0x01;
-    buffer[5] = if AUDIO_INFOFRAME_REFER_TO_STREAM {
-        0x00
-    } else {
-        0x09
-    };
+    // PB2=0: sample size/frequency are "refer to stream header" rather
+    // than duplicated in the InfoFrame (matches Linux hdmi-codec/Circle).
+    buffer[5] = 0x00;
     // Checksum = -sum(bytes) over the full packet (header + payload),
     // with the checksum slot itself counted as 0.
     let mut sum: u32 = 0;
@@ -1966,16 +1843,11 @@ fn set_audio_info_frame() {
         }
 
         // 4. Re-enable the slot and the master packet-transmit gate.
-        //    By default preserve every other bit the firmware had set.
-        //    Diagnostic override: Linux's working state on this panel
-        //    enables slots 2, 3, and 4 (`0x1001c`), while firmware leaves
-        //    us with slots 0, 2, and 4 (`0x10015`).
-        let cur = read_volatile(HDMI_RAM_PACKET_CONFIG as *const u32);
-        let next = if USE_LINUX_RAM_PACKET_CONFIG {
-            RAM_PACKET_ENABLE | (1u32 << 2) | (1u32 << 3) | slot_bit
-        } else {
-            cur | RAM_PACKET_ENABLE | slot_bit
-        };
+        //    We match Linux's working RAM-packet schedule on this panel
+        //    — slots 2, 3, and 4 enabled (`0x1001c`) — rather than
+        //    preserving the firmware's slots 0, 2, 4 (`0x10015`), which
+        //    did not transmit our audio InfoFrame reliably.
+        let next = RAM_PACKET_ENABLE | (1u32 << 2) | (1u32 << 3) | slot_bit;
         write_volatile(HDMI_RAM_PACKET_CONFIG as *mut u32, next);
         // 5. Wait for the hardware to acknowledge by setting STATUS.
         if !wait_for_ram_packet_status(slot_bit, true) {

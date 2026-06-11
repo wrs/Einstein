@@ -145,6 +145,9 @@ pub fn init() {
             crate::platform::enable_bcm2835_irq(9);
             kprintln!("input-mtouch: attached (IRQ-driven)");
         }
+        Err(UsbError::WrongDevice) => {
+            kprintln!("input-mtouch: no TSTP touch panel found; pen input disabled");
+        }
         Err(UsbError::NotReady) => {
             kprintln!("input-mtouch: DWC2 not ready; pen input disabled");
         }
@@ -158,11 +161,11 @@ fn attach<H: crate::usb::host::UsbHostController>(
 ) -> crate::usb::UsbResult<()> {
     if dev.vendor_id() != TSTP_MTOUCH_VID || dev.product_id() != TSTP_MTOUCH_PID {
         kprintln!(
-            "input-mtouch: ignoring device VID={:#06x} PID={:#06x}",
+            "input-mtouch: ignoring device VID={:#06x} PID={:#06x} (not the TSTP touch panel)",
             dev.vendor_id(),
             dev.product_id()
         );
-        return Err(UsbError::NotReady);
+        return Err(UsbError::WrongDevice);
     }
     // Interface 0 is the digitizer; look up its interrupt-IN endpoint.
     let in_ep: EndpointDescriptor = match dev.first_in_endpoint(0) {

@@ -29,12 +29,11 @@ impl BlockDevice for SdHost {
     }
 
     fn num_blocks(&self) -> Result<BlockCount, Self::Error> {
-        // We don't decode CSD yet (CMD9 result is currently ignored),
-        // so report the largest count embedded-sdmmc tolerates.
-        // The crate's bounds checks fire against actual partition
-        // sizes from the MBR, which is what we care about; the raw
-        // card capacity only matters for whole-disk operations.
-        Ok(BlockCount(u32::MAX))
+        // Decoded from the CSD at init (see `decode_csd_num_blocks`).
+        // `u32::MAX` if the CSD structure version was unknown, in which
+        // case embedded-sdmmc's whole-device bounds checks fall back to
+        // the partition sizes from the MBR.
+        Ok(BlockCount(self.num_blocks()))
     }
 }
 

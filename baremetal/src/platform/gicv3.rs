@@ -1,12 +1,17 @@
-//! Minimal GICv3 bring-up for FVP Base RevC (has_el3=0, single CPU at EL2).
+//! Minimal GICv3 bring-up for FVP Base RevC (single CPU, runs at EL2).
 //!
-//! On FVP with `cluster0.has_el3=0` there is no secure firmware, so the
-//! GICv3 comes up with ICC_SRE_EL2 clear, the redistributor asleep
-//! (GICR_WAKER.ProcessorSleep=1), and the distributor disabled. Nothing
-//! in the boot path programs these for us — we have to do it at EL2
-//! before touching any ICC_* system register at EL1 (they UNDEF until
-//! ICC_SRE_EL2 permits them) and before any GICR_* PPI-frame write
-//! (IMPLEMENTATION DEFINED while the redistributor is asleep).
+//! We run the model with `has_el3=1`, so `boot.s`'s EL3 stub has already
+//! done the Secure-only part: it clears GICR_WAKER.ProcessorSleep on
+//! this CPU's redistributor and sets GICD_CTLR.DS (single security
+//! state) + ICC_SRE_EL3 so NS-EL2 can reach the GICR_* / distributor /
+//! ICC_* registers at all. Everything else — ICC_SRE_EL2, the
+//! distributor enables, the CPU interface, per-PPI config — is still
+//! ours to program here from EL2, before any ICC_* system-register
+//! access at EL1 (they UNDEF until ICC_SRE_EL2 permits them) and before
+//! any GICR_* PPI-frame write. `wake_redistributor` is repeated here so
+//! the sequence reads as self-contained, but on the shipped has_el3=1
+//! config the RD is already awake when we arrive (it is idempotent;
+//! `boot.s` is the ground truth for what the stub did).
 //!
 //! Init ordering (matters — deviates from Linux's order because Linux
 //! assumes firmware has already woken the RD):

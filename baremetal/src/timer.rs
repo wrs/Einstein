@@ -10,7 +10,8 @@
 //!
 //! Routing the CNTHP PPI to the CPU's IRQ input is host-specific:
 //!   raspi3b  — BCM2836 per-core "ARM local" peripheral at 0x4000_0040.
-//!   fvp-base — GICv3 (TODO; currently a no-op — see platform::fvp_base).
+//!   fvp-base — GICv3 (brought up by `platform::fvp_base`, which calls
+//!              `gicv3::init` + `enable_ppi(INTID_CNTHP)`).
 //! See `crate::platform::install_cnthp_irq_routing`.
 
 use crate::{kprintln, peripherals::vic, platform};

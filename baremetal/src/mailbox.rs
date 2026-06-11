@@ -89,7 +89,7 @@ const REQUEST_CODE: u32 = 0;
 const RESPONSE_SUCCESS: u32 = 0x8000_0000;
 const RESPONSE_ERROR: u32 = 0x8000_0001;
 
-/// Bus-address tag bit. ANDing this in turns a u32 PA into the
+/// Bus-address tag bit. OR'ing this in turns a u32 PA into the
 /// VC-bus uncached alias.
 const BUS_UNCACHED: u32 = 0xC000_0000;
 
@@ -147,14 +147,24 @@ pub enum MailboxError {
     TagNotHandled,
 }
 
-/// 16-byte-aligned buffer wrapping one property request.
+/// Cache-line-aligned buffer wrapping one property request.
 ///
-/// We use a fixed 64-word buffer. The largest single-tag message
-/// (get-or-set clock) needs ~8 words; the multi-tag FB setup
-/// request needs ~35. The buffer is on the stack so each call gets
-/// a fresh, uncontended copy — no global state to lock, no
-/// re-entrancy hazard.
-#[repr(C, align(16))]
+/// We use a fixed 64-word buffer (256 bytes — a 64-byte multiple).
+/// The largest single-tag message (get-or-set clock) needs ~8 words;
+/// the multi-tag FB setup request needs ~35. The buffer is on the
+/// stack so each call gets a fresh, uncontended copy — no global
+/// state to lock, no re-entrancy hazard.
+///
+/// `align(64)` (not the protocol-minimum 16) matters because the VC
+/// writes its response into this buffer through the uncached alias
+/// and we `dc civac` the whole span afterward. If the buffer shared
+/// a cache line with adjacent dirty stack data, the post-response
+/// clean-and-invalidate would write that dirty line back *over* the
+/// VC's freshly-written bytes before invalidating. Aligning to a
+/// full cache line and sizing to a line multiple keeps the buffer's
+/// lines private to it. (Same reasoning as `MaiTxRing` and the UART
+/// `Ring`.)
+#[repr(C, align(64))]
 struct Buffer {
     words: [u32; 64],
 }
@@ -197,14 +207,23 @@ fn mailbox_call(
 
         write_volatile(MBOX_WRITE, bus_addr | CHANNEL_PROPERTY);
 
+        let mut got_reply = false;
         for _ in 0..10_000_000 {
             if read_volatile(MBOX_STATUS) & STATUS_EMPTY != 0 {
                 continue;
             }
             let m = read_volatile(MBOX_READ);
             if m & 0xF == CHANNEL_PROPERTY {
+                got_reply = true;
                 break;
             }
+        }
+        // Loop exhaustion without a channel-8 reply means the VC never
+        // answered — report it as a timeout rather than falling through
+        // to the response-code check below, which would misreport a
+        // wedged VideoCore as a firmware NAK.
+        if !got_reply {
+            return Err(MailboxError::Timeout);
         }
     }
 

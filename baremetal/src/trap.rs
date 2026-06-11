@@ -143,6 +143,12 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
 /// EL2t / 0x9 EL2h), i.e. we interrupted hypervisor code.
 #[no_mangle]
 pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
+    // Cheap EL2 stack-overflow tripwire: if a nested-IRQ / deep-frame
+    // path has descended into the stack's guard canary, halt here
+    // rather than let the corruption propagate. Runs on every timer/USB
+    // IRQ, which is the steady cadence this guard relies on.
+    cpu::check_stack_guard();
+
     let spsr = read_sysreg!("spsr_el2");
     let aarch32 = (spsr & (1 << 4)) != 0;
     let el2 = !aarch32 && ((spsr & 0b1100) == 0b1000);
@@ -2877,6 +2883,11 @@ fn print_exception_name(label: &str, name_va: u32) {
 /// than chase the symptom downstream.
 #[inline(never)]
 fn halt_invariant(label: &str, local_dump: impl FnOnce()) -> ! {
+    // A corrupted EL2 stack guard often *causes* the invariant we're
+    // about to report (overflow clobbers state, that state then trips a
+    // check). Surface it first so the root cause isn't buried under a
+    // downstream symptom. `check_stack_guard` itself halts on mismatch.
+    cpu::check_stack_guard();
     let elr = read_sysreg!("elr_el2");
     let spsr = read_sysreg!("spsr_el2") as u32;
     kprintln!();

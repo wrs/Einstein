@@ -115,14 +115,16 @@ pub struct SdHost {
     /// 4-bit. We never re-narrow once widened, so the field is set
     /// in `init` and read-only afterwards.
     hcfg_base: u32,
+    /// Total addressable 512-byte sectors, decoded from the CSD at
+    /// `init`. `u32::MAX` if the CSD structure version was unknown
+    /// (decode declined to guess) — see `decode_csd_num_blocks`.
+    num_blocks: u32,
 }
 
 impl SdHost {
     /// Bring up the controller and enumerate the card. Returns a
-    /// driver instance ready for `read_block` / `write_block`.
-    ///
-    /// Untested on real hardware. See the module-level "Bring-up
-    /// status" note for likely first-failure modes.
+    /// driver instance ready for `read_block` / `write_block`. This is
+    /// the production SD path on the Pi Zero 2 W (flash persistence).
     pub fn init() -> Result<Self, CmdError> {
         trace!(
             "sd: pre-init SDEDM=0x{:08x} (FSM={:#x}) SDVDD=0x{:08x}",
@@ -225,9 +227,21 @@ impl SdHost {
         trace!("sd: CMD3 SEND_RELATIVE_ADDR...");
         let rca = send_cmd(CMD_SEND_RELATIVE_ADDR, 0, ResponseKind::Short)? & 0xFFFF_0000;
         trace!("sd: RCA=0x{:08x}", rca);
-        // CMD9 — CSD; again we don't decode it yet.
+        // CMD9 — fetch the CSD (136-bit R2). The controller leaves the
+        // response in SDRSP0..3; read all four to decode the card
+        // capacity. SDRSP3 = bits[127:96] (top), SDRSP0 = bits[31:0]
+        // (bottom), matching the standard CRC-stripped R2 layout
+        // (verified against Linux bcm2835-sdhost: it copies SDRSP0..3
+        // straight into resp[3..0] with no cross-register shift).
         trace!("sd: CMD9 SEND_CSD...");
         send_cmd(CMD_SEND_CSD, rca, ResponseKind::Long)?;
+        let csd = [
+            read_reg(SDRSP0),
+            read_reg(SDRSP1),
+            read_reg(SDRSP2),
+            read_reg(SDRSP3),
+        ];
+        let num_blocks = decode_csd_num_blocks(&csd);
         // CMD7 — select the card, putting it in transfer state.
         trace!("sd: CMD7 SELECT_CARD...");
         send_cmd(CMD_SELECT_CARD, rca, ResponseKind::Short)?;
@@ -300,12 +314,26 @@ impl SdHost {
             (bus_hz / 100_000) % 10,
             width
         );
+        if num_blocks == u32::MAX {
+            crate::kprintln!("sd: capacity unknown (CSD undecoded)");
+        } else {
+            // num_blocks * 512 / 1 MiB, computed without overflowing u32.
+            crate::kprintln!("sd: capacity {} MiB ({} sectors)", num_blocks / 2048, num_blocks);
+        }
 
         Ok(SdHost {
             rca,
             capacity,
             hcfg_base,
+            num_blocks,
         })
+    }
+
+    /// Total addressable 512-byte sectors on the card, decoded from
+    /// the CSD at init. `u32::MAX` if the CSD structure version was
+    /// unknown.
+    pub fn num_blocks(&self) -> u32 {
+        self.num_blocks
     }
 
     /// Read one 512-byte sector. `lba` is a sector index regardless
@@ -330,6 +358,12 @@ impl SdHost {
             read_reg(SDEDM),
         );
         prepare_data(self.hcfg_base, 512, 1);
+        // Single exit through the SDHCFG restore below: `prepare_data`
+        // sets `DATA_IRPT_EN`, which gates the FSM's data path, and it
+        // must be cleared back to `hcfg_base` on *every* path — an
+        // early CMD17 failure included — so a stale value can't leak
+        // into the next non-data command. (The DMA variants restore on
+        // their error paths for the same reason.)
         let resp = send_cmd_kind(CMD_READ_SINGLE_BLOCK, arg, ResponseKind::Short, CmdDir::Read);
         trace!(
             "sd: CMD17 done; resp={:?} SDHSTS=0x{:08x} SDEDM=0x{:08x} (FSM={:#x})",
@@ -338,8 +372,7 @@ impl SdHost {
             read_reg(SDEDM),
             read_reg(SDEDM) & SDEDM_FSM_MASK,
         );
-        resp?;
-        let r = drain_fifo_to(buf).and_then(|()| finish_data_phase(true));
+        let r = resp.and_then(|_| drain_fifo_to(buf).and_then(|()| finish_data_phase(true)));
         trace!(
             "sd: data phase done; r={:?} SDHSTS=0x{:08x} SDEDM=0x{:08x} (FSM={:#x})",
             r,
@@ -359,8 +392,11 @@ impl SdHost {
             CardCapacity::StandardCapacity => lba.wrapping_mul(512),
         };
         prepare_data(self.hcfg_base, 512, 1);
-        send_cmd_kind(CMD_WRITE_SINGLE_BLOCK, arg, ResponseKind::Short, CmdDir::Write)?;
-        let r = fill_fifo_from(buf).and_then(|()| finish_data_phase(false));
+        // Single exit through the SDHCFG restore below — see the note
+        // in `read_block`: `DATA_IRPT_EN` must be cleared on the early
+        // CMD24-failure path too, not just the success path.
+        let r = send_cmd_kind(CMD_WRITE_SINGLE_BLOCK, arg, ResponseKind::Short, CmdDir::Write)
+            .and_then(|_| fill_fifo_from(buf).and_then(|()| finish_data_phase(false)));
         write_reg(SDHCFG, self.hcfg_base);
         r
     }
@@ -672,11 +708,11 @@ fn send_cmd_kind(cmd: u8, arg: u32, kind: ResponseKind, dir: CmdDir) -> Result<u
         CmdDir::Read => SDCMD_READ_CMD,
         CmdDir::Write => SDCMD_WRITE_CMD,
     };
-    // Treat all R1b commands as busy-wait. We don't currently issue
-    // any (CMD7/CMD12 are R1b; the only one we send is CMD7 during
-    // init, which the hardware can wait for without us looking at the
-    // BUSY line). Left as a TODO to revisit if a future caller needs
-    // CMD12 mid-transfer.
+    // Set BUSYWAIT for the R1b commands we issue: CMD7 (SELECT_CARD)
+    // during init and CMD12 (STOP_TRANSMISSION) on the multi-block DMA
+    // write paths (`write_sectors_dma` / `finish_sectors_dma`). The
+    // controller waits out the card's BUSY assertion internally, so we
+    // never poll the DAT0 BUSY line ourselves.
     if matches!(cmd, CMD_SELECT_CARD | CMD_STOP_TRANSMISSION) {
         cmd_word |= SDCMD_BUSYWAIT;
     }
@@ -700,6 +736,16 @@ fn send_cmd_kind(cmd: u8, arg: u32, kind: ResponseKind, dir: CmdDir) -> Result<u
     Err(CmdError::HardwareWedge)
 }
 
+// CRC7-error handling vs. Linux's bcm2835-sdhost: Linux
+// (`drivers/mmc/host/bcm2835.c`, `bcm2835_finish_command`) swallows a
+// hardware CRC7 error for exactly one opcode — `MMC_SEND_OP_COND`
+// (CMD1, the *MMC* op-cond), which carries an all-ones (0xFF) CRC
+// field. It does NOT exempt SD's ACMD41 (`SD_SEND_OP_COND`), nor the
+// R2 responses (CMD2/CMD9/CMD10). Our init path is SD-only: it uses
+// ACMD41, never CMD1. So there is no command in our path that the
+// Linux precedent would exempt, and we deliberately keep CRC7 a hard
+// error here. (If a future MMC-card path issues CMD1, add the
+// single-opcode exemption matching Linux — not a blanket R3 exemption.)
 fn map_hsts_error(hsts: u32) -> CmdError {
     if hsts & SDHSTS_CMD_TIME_OUT != 0 {
         CmdError::Timeout
@@ -968,6 +1014,83 @@ fn clock_setup() -> Result<u32, crate::mailbox::MailboxError> {
     Ok(rate)
 }
 
+/// Decode the addressable 512-byte sector count from a 136-bit CSD.
+///
+/// `csd[i]` holds CSD bits `[32*i + 31 : 32*i]` — i.e. `csd[0]` is
+/// SDRSP0 (bits[31:0]) and `csd[3]` is SDRSP3 (bits[127:96]), the
+/// standard CRC-stripped R2 word order. We extract the standard SD
+/// fields and return the device size in 512-byte sectors.
+///
+/// Both CSD v1 (SDSC) and v2 (SDHC/SDXC) are decoded. The cards in
+/// the field are SDHC (v2), but v1 is handled defensively. An unknown
+/// `CSD_STRUCTURE` value is NOT guessed: we return `u32::MAX` (the
+/// "bounds-check disabled" sentinel) and log loudly, so a future card
+/// reporting a v3+ structure never produces a *wrong* size that could
+/// misdirect a raw block write.
+fn decode_csd_num_blocks(csd: &[u32; 4]) -> u32 {
+    // Extract `width` bits starting at bit `lo` of the 128-bit CSD.
+    // All fields we read fit within a single 32-bit word boundary
+    // except none span words here, so the simple form suffices: but
+    // guard against spanning by reading up to 64 bits around `lo`.
+    let bits = |lo: u32, width: u32| -> u64 {
+        debug_assert!(width >= 1 && width <= 32);
+        let word = |i: usize| -> u64 { csd[i] as u64 };
+        // Bit `b` lives in word `b/32` at offset `b%32`. A field of
+        // width ≤ 32 spans at most two adjacent words.
+        let lo_word = (lo / 32) as usize;
+        let lo_off = lo % 32;
+        let low = word(lo_word) >> lo_off;
+        let window = if lo_off == 0 || lo_word + 1 >= 4 {
+            low
+        } else {
+            // High word contributes the bits above the (32 - lo_off)
+            // bits the low word already supplied.
+            low | (word(lo_word + 1) << (32 - lo_off))
+        };
+        window & ((1u64 << width) - 1)
+    };
+
+    // CSD_STRUCTURE: bits [127:126].
+    let structure = bits(126, 2);
+    match structure {
+        0 => {
+            // CSD v1 (SDSC).
+            //   READ_BL_LEN  [83:80]  (4 bits) — log2(max read block len)
+            //   C_SIZE       [73:62]  (12 bits)
+            //   C_SIZE_MULT  [49:47]  (3 bits)
+            // capacity_bytes = (C_SIZE+1) * 2^(C_SIZE_MULT+2) * 2^READ_BL_LEN
+            let read_bl_len = bits(80, 4) as u32;
+            let c_size = bits(62, 12) as u64;
+            let c_size_mult = bits(47, 3) as u32;
+            // mult = 2^(C_SIZE_MULT+2); block_len = 2^READ_BL_LEN.
+            let blocknr = (c_size + 1) << (c_size_mult + 2);
+            let block_len: u64 = 1u64 << read_bl_len;
+            let capacity_bytes = blocknr * block_len;
+            // Whole 512-byte sectors. Saturate to u32 (SDSC ≤ 2 GiB so
+            // this fits, but be defensive).
+            (capacity_bytes / 512).min(u32::MAX as u64) as u32
+        }
+        1 => {
+            // CSD v2 (SDHC/SDXC). C_SIZE [69:48] (22 bits); device size
+            // in 512-byte sectors = (C_SIZE + 1) * 1024.
+            let c_size = bits(48, 22);
+            ((c_size + 1) * 1024).min(u32::MAX as u64) as u32
+        }
+        other => {
+            crate::kprintln!(
+                "sd: WARN unknown CSD_STRUCTURE={} (csd=[{:08x} {:08x} {:08x} {:08x}]); \
+                 leaving num_blocks=u32::MAX (bounds checks disabled)",
+                other,
+                csd[0],
+                csd[1],
+                csd[2],
+                csd[3],
+            );
+            u32::MAX
+        }
+    }
+}
+
 /// Program SDCDIV so that `core_clock / (cdiv + 2)` is at most
 /// `target_hz`. SDHOST's effective SD-bus clock is
 /// `core_clock / (SDCDIV + 2)`; rounding up keeps us under the
@@ -978,13 +1101,33 @@ fn program_sdcdiv(core_clock: u32, target_hz: u32) {
     write_reg(SDCDIV, cdiv);
 }
 
+/// Spin until at least `us` microseconds have elapsed by CNTPCT_EL0.
+/// The generic timer is running out of reset (`boot.s` programs
+/// `CNTFRQ_EL0`), so the named SD power-up/reset settles are now
+/// real microseconds rather than the ~20×-fast nop loop they were.
+/// Same CNTPCT pattern as `cpu::delay_ms`.
 fn delay_us(us: u32) {
-    // Coarse busy loop. Refined once we have a real-silicon timer
-    // reference; CNTPCT runs at 19.2 MHz on the Zero 2 W so a "rough"
-    // loop count of ~50 per microsecond is a placeholder, not a
-    // calibrated delay.
-    let iters = us.saturating_mul(50);
-    for _ in 0..iters {
-        unsafe { core::arch::asm!("nop") }
+    let freq: u64;
+    let start: u64;
+    // SAFETY: sysreg reads, side-effect free.
+    unsafe {
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq,
+            options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) start,
+            options(nomem, nostack, preserves_flags));
+    }
+    // ticks = freq[Hz] * us / 1_000_000. Compute in u64 to avoid
+    // overflow at the largest call site (10_000 us).
+    let target = start.wrapping_add((freq.saturating_mul(us as u64)) / 1_000_000);
+    loop {
+        let now: u64;
+        // SAFETY: sysreg read.
+        unsafe {
+            core::arch::asm!("mrs {}, cntpct_el0", out(reg) now,
+                options(nomem, nostack, preserves_flags));
+        }
+        if now.wrapping_sub(target) as i64 >= 0 {
+            return;
+        }
     }
 }

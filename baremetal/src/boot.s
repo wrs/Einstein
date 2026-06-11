@@ -154,6 +154,20 @@ _start:
     add     x0, x0, #:lo12:__stack_top
     mov     sp, x0
 
+    // Seed the EL2 stack guard canary at the bottom of the stack
+    // region (__stack_guard). It is checked against
+    // cpu::STACK_GUARD_MAGIC (== 0x5354_4B47_5541_5244, "STKGUARD") in
+    // trap_irq and on the halt paths; an overflow that descends past
+    // the usable stack clobbers this word, so the next check loud-halts
+    // instead of letting the overflow silently corrupt .bss below.
+    adrp    x1, __stack_guard
+    add     x1, x1, #:lo12:__stack_guard
+    movz    x2, #0x5244                  // bits [15:0]
+    movk    x2, #0x5541, lsl #16         // bits [31:16]
+    movk    x2, #0x4b47, lsl #32         // bits [47:32]
+    movk    x2, #0x5354, lsl #48         // bits [63:48]  → 0x5354_4B47_5541_5244
+    str     x2, [x1]
+
     // Zero .bss. Linker aligns both ends to 16 so we can store pairs.
     adrp    x0, __bss_start
     add     x0, x0, #:lo12:__bss_start

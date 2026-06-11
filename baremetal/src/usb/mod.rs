@@ -117,6 +117,10 @@ pub enum UsbError {
     /// Controller is in an unexpected state (port not connected,
     /// driver hasn't been initialised, etc.).
     NotReady,
+    /// The enumerated device is not the one this driver binds to
+    /// (VID/PID mismatch). Distinct from `NotReady` so a bring-up log
+    /// can tell "wrong USB device plugged in" from "controller fault".
+    WrongDevice,
     /// Generic catch-all for cases we haven't named yet.
     Other,
 }

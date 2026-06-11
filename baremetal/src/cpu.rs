@@ -31,6 +31,56 @@ pub fn core_id() -> u32 {
     (v & 0xff) as u32
 }
 
+// ---- EL2 stack overflow guard ---------------------------------------
+//
+// The EL2 stack is a fixed 16 KiB region directly above `.bss` (see the
+// linker scripts). `with_irqs_unmasked` permits one level of IRQ
+// nesting on it, and `pi_fb::push_blit`'s bilinear loop plus
+// embedded-sdmmc frames run there too, so an overflow is plausible and
+// would silently corrupt whatever lands at the top of `.bss`. The
+// lowest 8 bytes of the stack region hold a guard canary, seeded to
+// `STACK_GUARD_MAGIC` by `boot.s`. `check_stack_guard` re-reads it; if
+// the stack has descended into the canary the word no longer matches
+// and we loud-halt.
+
+extern "C" {
+    static __stack_guard: u8;
+}
+
+/// Canary value seeded at `__stack_guard` by `boot.s`. Must match the
+/// literal built there (movz/movk sequence in `.Lat_el2`).
+pub const STACK_GUARD_MAGIC: u64 = 0x5354_4B47_5541_5244; // "STKGUARD"
+
+/// Read the stack-guard canary word.
+#[inline]
+fn stack_guard_word() -> u64 {
+    // SAFETY: `__stack_guard` is a valid 8-byte slot inside the image's
+    // stack region; the read is aligned (the stack region is page
+    // aligned) and side-effect free.
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(__stack_guard) as *const u64) }
+}
+
+/// Verify the EL2 stack hasn't overflowed into its guard canary. On
+/// corruption, loud-halt with a context line — letting execution
+/// continue would mean trusting a stack that has already clobbered
+/// adjacent state. Cheap enough (one aligned load + compare) to call
+/// from the timer-IRQ path and the halt paths.
+#[inline]
+pub fn check_stack_guard() {
+    let w = stack_guard_word();
+    if w != STACK_GUARD_MAGIC {
+        // Use kprintln (masks IRQs around its own critical section) and
+        // then spin without re-checking the guard.
+        crate::kprintln!(
+            "*** EL2 STACK OVERFLOW: guard canary = {:#018x}, expected {:#018x} \
+             — the EL2 stack has descended into its guard word; halting.",
+            w,
+            STACK_GUARD_MAGIC,
+        );
+        halt();
+    }
+}
+
 /// Generate a `read_<reg>()` helper for a system register.
 macro_rules! read_sysreg {
     ($name:ident, $reg:literal) => {
@@ -113,11 +163,18 @@ pub fn icache_publish_range(va: u64, len: usize) {
 /// see stale data on its writes.
 ///
 /// `va` is the buffer base; `len` its size in bytes. We round outward
-/// to the nearest cache-line boundary (64 B on A53/AEMvA), which is
-/// safe because adjacent data on those lines is either unrelated
-/// (then the clean is a no-op) or part of the same buffer (then it's
-/// what we want). `dsb sy` fences the effect against subsequent
-/// device-MMIO writes (mailbox doorbell).
+/// to the nearest cache-line boundary (64 B on A53/AEMvA). For the
+/// *outbound* direction (clean before the doorbell) the rounding is
+/// harmless: any adjacent data sharing the end lines is simply
+/// written back too. For the *inbound* direction (invalidate after a
+/// device wrote the buffer) it is NOT harmless if the buffer's end
+/// lines are shared — `dc civac` cleans before it invalidates, so a
+/// dirty adjacent byte on a shared line would be written back over
+/// the device's freshly-DMA'd bytes. Buffers a device writes into
+/// must therefore be cache-line aligned AND line-padded so their
+/// lines are private (see `mailbox::Buffer`, `MaiTxRing`). `dsb sy`
+/// fences the effect against subsequent device-MMIO writes (mailbox
+/// doorbell).
 #[allow(dead_code)] // First caller lands in src/mailbox.rs.
 pub fn dc_civac_range(va: u64, len: usize) {
     const LINE: u64 = 64;

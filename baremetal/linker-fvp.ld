@@ -36,7 +36,16 @@ SECTIONS
     __bss_end = .;
 
     . = ALIGN(4096);
-    . = . + 0x4000;   /* 16 KiB stack for core 0. */
+    /*
+     * EL2 stack for core 0. The lowest 8 bytes hold a guard canary
+     * (__stack_guard), seeded in boot.s and checked in trap_irq + the
+     * halt paths: if the stack ever descends into it, the magic word is
+     * clobbered and the next check loud-halts instead of letting an
+     * overflow silently corrupt .bss below. Usable stack is therefore
+     * (__stack_guard + 8 .. __stack_top].
+     */
+    __stack_guard = .;
+    . = . + 0x4000;   /* 16 KiB stack for core 0 (incl. the guard word). */
     __stack_top = .;
 
     __image_end = .;

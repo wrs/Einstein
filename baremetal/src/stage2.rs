@@ -429,7 +429,7 @@ unsafe fn install_tick_page() {
     // the first timer IRQ returns something non-zero-but-consistent.
     // Calendar / alarm offsets stay zero-initialised, which matches the
     // values `vic::read` returns for those registers today.
-    tick_page::update();
+    tick_page::update_from_sync_trap();
 
     // L2 index for the 2 MiB block containing TICK_PAGE_IPA.
     let l2_index = (TICK_PAGE_IPA / TWO_MIB) as usize; // = 0x78 (120) for 0x0F000000
@@ -541,7 +541,7 @@ pub mod tick_page {
     /// guest progress rather than wall clock — see
     /// `vic::SYNTH_TICKS`.
     pub fn update_from_sync_trap() {
-        crate::peripherals::vic::tick_advance();
+        crate::peripherals::vic::tick_advance_sync_trap();
         publish();
     }
     /// Heartbeat path: do NOT advance ticks ourselves (so the heartbeat
@@ -551,12 +551,6 @@ pub mod tick_page {
     /// `timer::on_irq` before this.
     pub fn update_from_heartbeat() {
         publish();
-    }
-    /// Back-compat shim — older call sites that don't yet distinguish
-    /// path. New code should use `update_from_sync_trap` /
-    /// `update_from_heartbeat` directly.
-    pub fn update() {
-        update_from_sync_trap();
     }
     fn publish() {
         crate::peripherals::vic::poll_timer_matches();

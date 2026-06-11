@@ -16,7 +16,11 @@
 //! notice if the boot path ever starts depending on real sound
 //! state.
 
-use crate::{audio, cpu, kprintln, peripherals::vic, trap::TrapContext};
+use core::sync::atomic::{AtomicU32, Ordering};
+
+use crate::{audio, cpu, dprintln, kprintln};
+use crate::peripherals::vic;
+use crate::trap::TrapContext;
 
 /// Sound-driver class ID in the native-primitive encoding.
 pub const DRIVER_ID: u32 = 0x00_0002;
@@ -28,30 +32,24 @@ const ERR_NO_SOUND_HARDWARE: u32 = (-30009i32) as u32;
 
 /// Per-subfn invocation count, used to throttle the traced-subfn
 /// log lines in `handle` (first 32 calls each, then 1-in-64).
-static mut SUBFN_COUNT: [u32; 32] = [0; 32];
+static SUBFN_COUNT: [AtomicU32; 32] = [const { AtomicU32::new(0) }; 32];
+
+/// Bitmask of subfns seen at least once, for the first-occurrence trace.
+static SEEN: AtomicU32 = AtomicU32::new(0);
 
 pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
     // Diagnostic: log first occurrence of each subfn so we can see what
     // the kernel exercises during sound init.
-    static mut SEEN: u32 = 0;
     let bit = 1u32 << (subfn & 0x1F);
-    // SAFETY: single-threaded.
-    let first = unsafe {
-        let v = SEEN; if (v & bit) == 0 { SEEN = v | bit; true } else { false }
-    };
+    let first = (SEEN.fetch_or(bit, Ordering::Relaxed) & bit) == 0;
     if first && subfn <= 0x1F {
-        kprintln!(
+        dprintln!(
             "sound: first subfn {:#x} @PC={:#x} r1={:#x} r2={:#x} r3={:#x}",
             subfn, pc, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32
         );
     }
-    if subfn < 32 {
-        // SAFETY: single-threaded EL2.
-        unsafe { SUBFN_COUNT[subfn as usize] = SUBFN_COUNT[subfn as usize].saturating_add(1); }
-    }
     let subfn_count = if subfn < 32 {
-        // SAFETY: single-threaded EL2.
-        unsafe { SUBFN_COUNT[subfn as usize] }
+        SUBFN_COUNT[subfn as usize].fetch_add(1, Ordering::Relaxed).saturating_add(1)
     } else {
         0
     };
@@ -61,7 +59,7 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
     // calls each, then 1-in-64.
     let is_traced_subfn = matches!(subfn, 0x07 | 0x0D | 0x0F | 0x13 | 0x1D | 0x1F);
     if is_traced_subfn && (subfn_count <= 32 || (subfn_count & 0x3F) == 0) {
-        kprintln!(
+        dprintln!(
             "sound: subfn {:#04x} #{} r1={:#x} r2={:#x} r3={:#x} ipres={:#x}",
             subfn,
             subfn_count,

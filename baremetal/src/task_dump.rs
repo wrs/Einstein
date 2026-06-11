@@ -1210,6 +1210,7 @@ pub fn dump_full() {
     // stack). Print them explicitly so the comparison against Einstein
     // is a simple grep.
     dump_phys_for_pa(0x0402_a000);
+    crate::peripherals::serial::dump_dropped_tx();
     kprintln!("=== kdump::dump_full end ===");
 }
 

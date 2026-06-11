@@ -119,9 +119,16 @@ const UNKNOWN_BANK5_END:  u64 = 0x3000_0000;
 // shadow-stub byte/halfword accesses bypass the BE-32 XOR for IPAs >=
 // XOR_LIMIT. Real Newton hardware doesn't expose anything in this
 // window; the kernel never touches it during boot. A byte-granular
-// 16-byte storage cell is enough for the test.
+// 16-byte storage cell is enough for the test. Gated to guest-test
+// builds (periph-M7) so production never round-trips real storage in a
+// window the comment itself says hardware leaves unmapped — there the
+// range falls through to the NO_REX_PROBE absent window (reads 0,
+// drops writes).
+#[cfg(nh_guest_test)]
 const TEST_SCRATCH_BASE: u64 = 0x1200_0000;
+#[cfg(nh_guest_test)]
 const TEST_SCRATCH_END:  u64 = 0x1200_0010;
+#[cfg(nh_guest_test)]
 static mut TEST_SCRATCH: [u8; 16] = [0; 16];
 
 // BIO interface register bank. `TBIOInterface::BIOReadRegister` /
@@ -151,6 +158,96 @@ pub fn read(ctx: &crate::trap::TrapContext, ipa: u64, sas: u8, elr: u64) -> u32 
     // pre-XOR'd by 3/2; un-XOR here.
     #[cfg(nh_guest_test)]
     let ipa = unxor_sub_word(ipa, sas);
+
+    // BE-8 sub-word reads (periph-H2). Two peripheral classes with two
+    // sub-word conventions, both taken from Einstein's `TMemory::ReadBP`
+    // as the oracle.
+    #[cfg(not(nh_guest_test))]
+    if sas < 2 {
+        // Byte-addressed peripherals (the serial windows) model each
+        // register at its byte offset and return the register byte
+        // directly — Einstein's `TMemory::ReadBP` dispatches a serial
+        // byte read straight to `ReadRegister(offset)`
+        // (TMemory.cpp:1518-1541), e.g. status reg 0x4400 → 0x80, with
+        // NO BE-8 lane transform. Pass these through to the natural
+        // offset and mask to the sub-word width.
+        if serial::owns(ipa) {
+            return mask_for_size(read_word(ctx, ipa, elr, sas), sas);
+        }
+        // Word-addressed peripherals (vic/dma/pcmcia and the inline
+        // stubs) hold genuine 32-bit registers; a guest LDRB at lane 0
+        // under BE-8 observes bits[31:24] — the same lane the write
+        // splice (`splice_byte`) targets, so write-then-read of a single
+        // byte round-trips. Read the aligned word side-effect-free and
+        // extract the addressed lane.
+        let aligned = ipa & !0x3;
+        let word = match peek_word(ctx, aligned, elr) {
+            Some(w) => w,
+            // The aligned word isn't a modelled register; the guest is
+            // doing a sub-word read of an address only the write
+            // whitelist knows (or an unknown address). Fall through to
+            // the full read path so the unknown-address case still
+            // halts loudly with the original IPA.
+            None => return mask_for_size(read_word(ctx, aligned, elr, sas), sas),
+        };
+        return extract_sub_word(word, ipa, sas);
+    }
+
+    mask_for_size(read_word(ctx, ipa, elr, sas), sas)
+}
+
+/// Word-granular read of a modelled register, side effects included.
+/// `read` (above) handles the sub-word lane transform on top of this.
+/// Halts loudly on a genuinely-unknown address. `sas` is forwarded for
+/// the guest-test scratch arm (byte-granular storage) and the halt
+/// label; the modelled-register dispatch itself is word-granular.
+fn read_word(ctx: &crate::trap::TrapContext, ipa: u64, elr: u64, sas: u8) -> u32 {
+    match read_word_opt(ctx, ipa, elr, /*advance_serial=*/ true, sas) {
+        Some(v) => v,
+        None => halt_on_unknown(ctx, "read", ipa, sas, 0, elr),
+    }
+}
+
+/// Side-effect-free peek of the word at `ipa`, used by the sub-word
+/// write splice and the sub-word read extraction (periph-M1). Unlike
+/// `read_word` it (a) does not advance the ROM-serial-chip bit index,
+/// (b) returns `Some(0)` for registers that exist only in the write
+/// whitelist (so a sub-word write to a write-only register doesn't
+/// misfire the "unknown MMIO read" halt), and (c) returns `None` for a
+/// genuinely-unknown address rather than halting — the caller decides
+/// what to do with an unknown aligned word.
+#[cfg(not(nh_guest_test))]
+fn peek_word(ctx: &crate::trap::TrapContext, ipa: u64, elr: u64) -> Option<u32> {
+    if let Some(v) = read_word_opt(ctx, ipa, elr, /*advance_serial=*/ false, 2) {
+        return Some(v);
+    }
+    // Not a readable register. Registers that exist only in the write
+    // whitelist peek as 0 (write-only: the guest never reads them back,
+    // and a sub-word RMW of one must not halt as an "unknown read").
+    if is_write_only_reg(ipa) {
+        return Some(0);
+    }
+    None
+}
+
+/// Word read returning `None` on an unknown address instead of halting.
+/// `advance_serial` gates the one read side effect in this dispatch
+/// (the ROM-serial-chip bit index): `read_word` passes `true`,
+/// `peek_word` passes `false`.
+fn read_word_opt(
+    ctx: &crate::trap::TrapContext,
+    ipa: u64,
+    elr: u64,
+    advance_serial: bool,
+    sas: u8,
+) -> Option<u32> {
+    let _ = (ctx, elr);
+    // Word-granular dispatch; the only sub-word-aware arm is the
+    // guest-test scratch window, whose storage is byte-granular — it
+    // must receive the real access size so a byte read near the end of
+    // the 16-byte window doesn't assemble a word past the array bounds.
+    #[cfg(not(nh_guest_test))]
+    let _ = sas;
     let value = match ipa {
         a if vic::owns(a) => vic::read(a),
         a if dma::owns(a) => dma::read(a),
@@ -228,7 +325,12 @@ pub fn read(ctx: &crate::trap::TrapContext, ipa: u64, sas: u8, elr: u64) -> u32 
             } else {
                 ROM_SERIAL_NUMBER_1 >> ix
             };
-            ROM_SERIAL_IX.store((ix + 1) % 65, Ordering::Relaxed);
+            // The bit-index advance is this dispatch's only read side
+            // effect; `peek_word` (advance_serial=false) reads the
+            // current bit without consuming it.
+            if advance_serial {
+                ROM_SERIAL_IX.store((ix + 1) % 65, Ordering::Relaxed);
+            }
             (bit & 1) << 1
         }
 
@@ -262,7 +364,10 @@ pub fn read(ctx: &crate::trap::TrapContext, ipa: u64, sas: u8, elr: u64) -> u32 
         // Test-only scratch window (see TEST_SCRATCH_BASE comment) —
         // ordered before the NO_REX_PROBE arm because the scratch
         // sub-window sits inside the same 0x1040_0000..0x2000_0000 IPA
-        // range.
+        // range. Gated to guest-test builds (periph-M7); in production
+        // the same range falls through to the NO_REX_PROBE absent
+        // window below (reads 0).
+        #[cfg(nh_guest_test)]
         a if (TEST_SCRATCH_BASE..TEST_SCRATCH_END).contains(&a) => {
             test_scratch_read(a, sas)
         }
@@ -273,15 +378,17 @@ pub fn read(ctx: &crate::trap::TrapContext, ipa: u64, sas: u8, elr: u64) -> u32 
         // "Unknown bank #5" silent-zero window (see const comment).
         a if (UNKNOWN_BANK5_BASE..UNKNOWN_BANK5_END).contains(&a) => 0,
 
-        a => halt_on_unknown(ctx, "read", a, sas, 0, elr),
+        // Genuinely unknown: report absence so the caller (read_word
+        // halts, peek_word falls through to the write-only check).
+        _ => return None,
     };
-
-    mask_for_size(value, sas)
+    Some(value)
 }
 
 /// Byte-granular read from the test scratch window. Byte (sas=0) and
 /// halfword (sas=1) accesses return the raw bytes from `TEST_SCRATCH`;
 /// word reads (sas=2) assemble a u32 from four consecutive bytes.
+#[cfg(nh_guest_test)]
 fn test_scratch_read(ipa: u64, sas: u8) -> u32 {
     let off = (ipa - TEST_SCRATCH_BASE) as usize;
     // SAFETY: single-threaded EL2 access; bounds checked above.
@@ -302,6 +409,7 @@ fn test_scratch_read(ipa: u64, sas: u8) -> u32 {
 
 /// Byte-granular write into the test scratch window. Mirrors the
 /// `test_scratch_read` size dispatch.
+#[cfg(nh_guest_test)]
 fn test_scratch_write(ipa: u64, sas: u8, value: u32) {
     let off = (ipa - TEST_SCRATCH_BASE) as usize;
     // SAFETY: single-threaded EL2 access; bounds checked.
@@ -333,19 +441,39 @@ pub fn write(ctx: &crate::trap::TrapContext, ipa: u64, sas: u8, value: u32, elr:
     // state. Guest-test mode keeps the legacy un-XOR path.
     #[cfg(nh_guest_test)]
     let ipa = unxor_sub_word(ipa, sas);
+    // Byte-addressed peripherals (the serial windows) pass the sub-word
+    // value through unspliced at its natural offset — Einstein's
+    // `TMemory::WriteBP` dispatches a serial byte write straight to
+    // `WriteRegister(offset, inByte)` (TMemory.cpp:2435-2457), with NO
+    // BE-8 lane transform. `serial::write` consumes the low byte
+    // directly, matching the symmetric byte read above.
     #[cfg(not(nh_guest_test))]
-    let (ipa, value) = match sas {
-        0 => {
-            let aligned = ipa & !0x3;
-            let prev = read(ctx, aligned, 2, elr);
-            (aligned, splice_byte(prev, ipa, value))
+    let serial_byte_addressed = sas < 2 && serial::owns(ipa);
+    #[cfg(not(nh_guest_test))]
+    let (ipa, value) = if serial_byte_addressed {
+        (ipa, value)
+    } else {
+        match sas {
+            0 => {
+                let aligned = ipa & !0x3;
+                // Side-effect-free read of the surrounding word
+                // (periph-M1). `peek_word` returns Some(0) for write-only
+                // registers (so a sub-word write to a write-only register
+                // doesn't misfire the "unknown MMIO read" halt) and never
+                // advances a stateful read side effect (e.g.
+                // ROM_SERIAL_IX). None → the aligned word is genuinely
+                // unknown; splice onto 0 and let the write dispatch below
+                // halt loudly with the spliced value.
+                let prev = peek_word(ctx, aligned, elr).unwrap_or(0);
+                (aligned, splice_byte(prev, ipa, value))
+            }
+            1 => {
+                let aligned = ipa & !0x3;
+                let prev = peek_word(ctx, aligned, elr).unwrap_or(0);
+                (aligned, splice_halfword(prev, ipa, value))
+            }
+            _ => (ipa, value),
         }
-        1 => {
-            let aligned = ipa & !0x3;
-            let prev = read(ctx, aligned, 2, elr);
-            (aligned, splice_halfword(prev, ipa, value))
-        }
-        _ => (ipa, value),
     };
     // Tick-page sub-word write catch-net. The tick cluster at
     // 0x0F18_1000..0x0F18_2000 is stage-2 RO (see
@@ -389,8 +517,11 @@ pub fn write(ctx: &crate::trap::TrapContext, ipa: u64, sas: u8, value: u32, elr:
     if (RAM_PROBE_ABSENT_BASE..RAM_PROBE_ABSENT_END).contains(&ipa) {
         return;
     }
-    // Test-only scratch window — round-trip storage above XOR_LIMIT.
-    // Checked before NO_REX_PROBE because it sits inside that range.
+    // Test-only scratch window — round-trip storage above XOR_LIMIT
+    // (guest-test builds only, periph-M7). Checked before NO_REX_PROBE
+    // because it sits inside that range; in production the same range
+    // falls through to NO_REX_PROBE's silent drop below.
+    #[cfg(nh_guest_test)]
     if (TEST_SCRATCH_BASE..TEST_SCRATCH_END).contains(&ipa) {
         test_scratch_write(ipa, sas, value);
         return;
@@ -467,30 +598,78 @@ pub fn write(ctx: &crate::trap::TrapContext, ipa: u64, sas: u8, value: u32, elr:
 
         a => halt_on_unknown(ctx, "write", a, sas, value, elr),
     }
-    let _ = value;
+}
+
+/// True for registers that exist only in the write whitelist above —
+/// the kernel writes them at BootOS time and never reads them back, so
+/// `read_word_opt` returns `None` for them. `peek_word` reports these
+/// as `Some(0)` so a sub-word RMW of a write-only register splices onto
+/// 0 instead of misfiring the "unknown MMIO read" halt (periph-M1).
+///
+/// This list must track the write-only arms of `write`'s second match
+/// (the closed Phase-A whitelist). Readable registers there
+/// (0x0F00_1000, 0x0F00_1800/1C00, 0x0F04_8000, 0x0F24_0000/0400/0800,
+/// 0x0F24_1000 BankCtrl, 0x0F24_2400, 0x0F24_3000 ROM serial,
+/// in_bio_bank) are intentionally absent — `read_word_opt` already
+/// returns their value, so peek never reaches here for them.
+#[cfg(not(nh_guest_test))]
+fn is_write_only_reg(ipa: u64) -> bool {
+    matches!(ipa,
+        0x0F00_2000
+        | 0x0F04_3000 | 0x0F04_3800
+        | 0x0F24_1800 | 0x0F24_7000
+        | 0x0F28_0000 | 0x0F28_0400 | 0x0F28_0800 | 0x0F28_0C00
+        | 0x0F28_2000 | 0x0F28_3000 | 0x0F28_3400 | 0x0F28_4000
+    )
+}
+
+/// BE-8 byte-lane shift for `ipa`: lane 0 (IPA mod 4 == 0) is
+/// bits[31:24] (MSB-side under BE-8, since the guest sees byte 0 of an
+/// aligned word as the MSB), lane 3 is bits[7:0]. Shared by the write
+/// splice and the sub-word read extraction so both target the same lane
+/// (periph-H2 / periph-M1).
+#[cfg(not(nh_guest_test))]
+fn byte_lane_shift(ipa: u64) -> u32 {
+    let lane = (ipa & 3) as u32;
+    24 - 8 * lane // lane 0 → 24 (bits[31:24] = MSB)
+}
+
+/// BE-8 halfword-lane shift for `ipa`: halfword 0 (IPA aligned mod 4
+/// == 0) is bits[31:16]; halfword 1 is bits[15:0].
+#[cfg(not(nh_guest_test))]
+fn halfword_lane_shift(ipa: u64) -> u32 {
+    let lane = ((ipa >> 1) & 1) as u32;
+    if lane == 0 { 16 } else { 0 }
 }
 
 /// Splice a guest BE-8 byte write into the existing word at `prev`.
-/// The byte goes at the IPA-selected lane: lane 0 (= IPA mod 4 == 0)
-/// is bits[31:24] (MSB-side under BE-8, since the guest sees byte 0
-/// of an aligned word as the MSB), lane 3 is bits[7:0].
 #[cfg(not(nh_guest_test))]
 fn splice_byte(prev: u32, ipa: u64, byte: u32) -> u32 {
-    let lane = (ipa & 3) as u32;
-    let shift = 24 - 8 * lane; // lane 0 → 24 (bits[31:24] = MSB)
+    let shift = byte_lane_shift(ipa);
     let mask = !(0xFFu32 << shift);
     (prev & mask) | ((byte & 0xFF) << shift)
 }
 
-/// Splice a guest BE-8 halfword write into the existing word at
-/// `prev`. Halfword 0 (IPA aligned mod 4 == 0) is bits[31:16];
-/// halfword 1 is bits[15:0].
+/// Splice a guest BE-8 halfword write into the existing word at `prev`.
 #[cfg(not(nh_guest_test))]
 fn splice_halfword(prev: u32, ipa: u64, half: u32) -> u32 {
-    let lane = ((ipa >> 1) & 1) as u32;
-    let shift = if lane == 0 { 16 } else { 0 };
+    let shift = halfword_lane_shift(ipa);
     let mask = !(0xFFFFu32 << shift);
     (prev & mask) | ((half & 0xFFFF) << shift)
+}
+
+/// Extract the BE-8 sub-word lane addressed by `ipa` from the aligned
+/// register word `word` (periph-H2). The inverse of the write splice:
+/// a byte read at lane 0 returns bits[31:24], the same lane a byte
+/// write at lane 0 targets, so write-then-read of a single byte
+/// round-trips. `sas` is 0 (byte) or 1 (halfword); a word read never
+/// reaches here.
+#[cfg(not(nh_guest_test))]
+fn extract_sub_word(word: u32, ipa: u64, sas: u8) -> u32 {
+    match sas {
+        0 => (word >> byte_lane_shift(ipa)) & 0xFF,
+        _ => (word >> halfword_lane_shift(ipa)) & 0xFFFF,
+    }
 }
 
 fn sas_label(sas: u8) -> &'static str {

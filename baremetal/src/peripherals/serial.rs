@@ -20,9 +20,9 @@
 //! outside the four windows never reach this module (mmio.rs
 //! dispatches elsewhere).
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-use crate::kprintln;
+use crate::{kprintln, uart};
 
 /// Base of the external-serial port (TMemoryConsts::kExternalSerialBase).
 pub const EXTERNAL_BASE: u64 = 0x0F1C_0000;
@@ -134,9 +134,31 @@ static TX_BUDGETS: [AtomicUsize; 4] = [
 ];
 const TX_LOG_MAX: usize = 64;
 
+/// Running count of PIO TX bytes dropped on ports 1-3 (infrared, tablet,
+/// modem) — those ports have no modeled host backend, so their bytes are
+/// discarded rather than forwarded. Surfaced by `dump_dropped_tx` so the
+/// drop is visible in a diagnostic dump instead of vanishing silently.
+static DROPPED_TX: [AtomicU32; 4] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+
+/// PIO TX-byte write to a port's TX FIFO. Port 0 (extr) is forwarded to
+/// the host PL011 (`uart::write_byte`), matching the DMA channel-1 path
+/// so PIO and DMA output interleave into the same host serial stream.
+/// Ports 1-3 have no host backend; their bytes are counted as dropped
+/// (`DROPPED_TX`) rather than silently discarded. All ports keep a
+/// budgeted console log for diagnostics.
 fn log_tx_byte(port: u8, byte: u8) {
     if port >= 4 {
         return;
+    }
+    if port == 0 {
+        uart::write_byte(byte);
+    } else {
+        DROPPED_TX[port as usize].fetch_add(1, Ordering::Relaxed);
     }
     let n = TX_BUDGETS[port as usize].fetch_add(1, Ordering::Relaxed);
     if n < TX_LOG_MAX {
@@ -148,6 +170,19 @@ fn log_tx_byte(port: u8, byte: u8) {
                 '.'
             },
         );
+    }
+}
+
+/// Print the per-port dropped-PIO-TX-byte counts (ports 1-3). Called
+/// from diagnostic dumps so truncated output on the unmodeled ports is
+/// surfaced rather than lost.
+pub fn dump_dropped_tx() {
+    for port in 1..4u8 {
+        let n = DROPPED_TX[port as usize].load(Ordering::Relaxed);
+        if n > 0 {
+            kprintln!("serial[{}]: {} PIO TX byte(s) dropped (no host backend)",
+                port_name(port), n);
+        }
     }
 }
 

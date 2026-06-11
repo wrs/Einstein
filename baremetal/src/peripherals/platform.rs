@@ -274,11 +274,15 @@ fn log_message(ctx: &mut TrapContext, pc: u32) {
                 addr = addr.wrapping_add(1);
             }
             None => {
+                // Einstein's FastReadString completes this path, so a
+                // failed guest read is a hypervisor emulation bug, not a
+                // guest bug — halt loudly like every other native-prim
+                // guest access (periph-L6).
                 kprintln!(
                     "*** platform.Log: cannot read at {:#x} @PC={:#x}",
                     addr, pc
                 );
-                return;
+                cpu::halt();
             }
         }
     }

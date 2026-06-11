@@ -111,7 +111,7 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
     // delay-loop iterations than Einstein for the same kernel logic — and
     // the resulting trace-count drift is what causes the heap-allocator
     // divergence at TStackInfo::Init #12 (see INVESTIGATION.md).
-    crate::stage2::tick_page::update();
+    crate::stage2::tick_page::update_from_sync_trap();
 
     // Budget-limited "progress beacon": print PC every 10k traps so we
     // can see if the guest is making forward progress or looping in one
@@ -124,7 +124,7 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
         let spsr = read_sysreg!("spsr_el2");
         crate::log_traps!(
             "beacon: {} traps, ELR={:#x} SPSR={:#x} int_present={:#x}",
-            n, elr, spsr, vic::raised()
+            n, elr, spsr, vic::int_present_raw()
         );
     }
     crate::tarmac::maybe_emit_start(n);
@@ -378,6 +378,10 @@ fn irq_from_guest(ctx: &mut TrapContext) {
     // Pump host PL011 -> guest extr-port RX DMA buffer. No-op when
     // DMA ch0 is not armed. See peripherals/dma.rs::poll_rx.
     crate::peripherals::dma::poll_rx();
+    // Continue any in-flight guest extr-port TX DMA past the per-call
+    // 4 KiB drain cap. No-op when DMA ch1 is not armed. See
+    // peripherals/dma.rs::poll_tx.
+    crate::peripherals::dma::poll_tx();
     // Pump the host-io backend: drain any pen events the viewer
     // posted, enqueue them, and raise INT_TABLET. Must run BEFORE
     // update_virq so the IRQ it raises lands in HCR_EL2.VI on this

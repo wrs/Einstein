@@ -155,8 +155,16 @@ static SLOT1: SlotRegs = SlotRegs::new();
 static SLOT2: SlotRegs = SlotRegs::new();
 static SLOT3: SlotRegs = SlotRegs::new();
 
-static LOG_BUDGET: AtomicUsize = AtomicUsize::new(0);
-const LOG_MAX: usize = 16;
+/// Split log budgets (periph-M4): routine/expected traffic (card-side
+/// "no card" reads/writes, known controller-register accesses) burns a
+/// tight budget so the boot-time chip-detect probes can't exhaust the
+/// console, while genuinely-unknown register offsets and out-of-range
+/// accesses get their own generous budget so lazy discovery never goes
+/// silent behind routine traffic.
+static EXPECTED_BUDGET: AtomicUsize = AtomicUsize::new(0);
+const EXPECTED_MAX: usize = 8;
+static UNKNOWN_BUDGET: AtomicUsize = AtomicUsize::new(0);
+const UNKNOWN_MAX: usize = 64;
 
 pub fn owns(ipa: u64) -> bool {
     ipa_to_slot(ipa).is_some()
@@ -179,11 +187,16 @@ fn ipa_to_slot(ipa: u64) -> Option<(&'static SlotRegs, u64, u8)> {
 pub fn read(ipa: u64) -> u32 {
     let (regs, off, slot) = match ipa_to_slot(ipa) {
         Some(x) => x,
-        None => return 0,
+        // mmio.rs only routes here when `owns()` (== ipa_to_slot is
+        // Some) already matched, so this arm is unreachable. If it ever
+        // fires, owns()/dispatch have desynced — halt loudly like
+        // vic::halt_vic_unreachable / dma::halt_unknown_dma rather than
+        // silently fabricating a value.
+        None => halt_pcmcia_unreachable("read", ipa, 0),
     };
     if off <= ATTR_END || (IO_BASE..=IO_END).contains(&off) || (MEM_BASE..=MEM_END).contains(&off) {
         // Card-side spaces — no card inserted, return 0 (Einstein default).
-        log("pcmcia read (card-side, no card)", ipa, 0);
+        log_expected("pcmcia read (card-side, no card)", ipa, 0);
         return 0;
     }
     if (REG_BASE..=REG_END).contains(&off) {
@@ -191,12 +204,12 @@ pub fn read(ipa: u64) -> u32 {
         // Slots 2/3 have no controller — every read returns 0 so
         // GetChipInfo's 0xa5a5/0x5a5a write-and-read-back probe fails.
         if slot >= 2 {
-            log("pcmcia read (no controller in slot)", ipa, 0);
+            log_expected("pcmcia read (no controller in slot)", ipa, 0);
             return 0;
         }
         // kHdWr_Reg4400 — Einstein hardcodes 0xFC.
         if reg_off == 0x4400 {
-            log("pcmcia read reg_4400", ipa, 0xFC);
+            log_expected("pcmcia read reg_4400", ipa, 0xFC);
             return 0xFC;
         }
         if let Some(cell) = regs.cell(reg_off) {
@@ -206,24 +219,25 @@ pub fn read(ipa: u64) -> u32 {
                 // named — set means "no card"). Match Einstein.
                 v |= K1C00_CARD_IS_PRESENT;
             }
-            log("pcmcia read reg", ipa, v);
+            log_expected("pcmcia read reg", ipa, v);
             return v;
         }
-        log("pcmcia read unknown reg (returning 0)", ipa, 0);
+        log_unknown("pcmcia read unknown reg (returning 0)", ipa, 0);
         return 0;
     }
-    log("pcmcia read out-of-range (returning 0)", ipa, 0);
+    log_unknown("pcmcia read out-of-range (returning 0)", ipa, 0);
     0
 }
 
 pub fn write(ipa: u64, value: u32) {
     let (regs, off, slot) = match ipa_to_slot(ipa) {
         Some(x) => x,
-        None => return,
+        // Unreachable for the same reason as `read` — see there.
+        None => halt_pcmcia_unreachable("write", ipa, value),
     };
     if off <= ATTR_END || (IO_BASE..=IO_END).contains(&off) || (MEM_BASE..=MEM_END).contains(&off) {
         // Card-side write with no card inserted — drop silently.
-        log("pcmcia write (card-side, no card; dropped)", ipa, value);
+        log_expected("pcmcia write (card-side, no card; dropped)", ipa, value);
         return;
     }
     if (REG_BASE..=REG_END).contains(&off) {
@@ -231,23 +245,51 @@ pub fn write(ipa: u64, value: u32) {
         // Slots 2/3 have no controller — drop all controller-register
         // writes so chip-detect (read-back) sees zero.
         if slot >= 2 {
-            log("pcmcia write (no controller in slot; dropped)", ipa, value);
+            log_expected("pcmcia write (no controller in slot; dropped)", ipa, value);
             return;
         }
         if let Some(cell) = regs.cell(reg_off) {
             cell.store(value, Ordering::Relaxed);
-            log("pcmcia write reg", ipa, value);
+            log_expected("pcmcia write reg", ipa, value);
             return;
         }
-        log("pcmcia write unknown reg (dropped)", ipa, value);
+        log_unknown("pcmcia write unknown reg (dropped)", ipa, value);
         return;
     }
-    log("pcmcia write out-of-range (dropped)", ipa, value);
+    log_unknown("pcmcia write out-of-range (dropped)", ipa, value);
 }
 
-fn log(what: &str, ipa: u64, value: u32) {
-    let n = LOG_BUDGET.fetch_add(1, Ordering::Relaxed);
-    if n < LOG_MAX {
+/// Routine/expected traffic (card-side, known registers): tight budget.
+fn log_expected(what: &str, ipa: u64, value: u32) {
+    let n = EXPECTED_BUDGET.fetch_add(1, Ordering::Relaxed);
+    if n < EXPECTED_MAX {
         kprintln!("{} IPA={:#010x} val={:#010x}", what, ipa, value);
     }
+}
+
+/// Genuinely-unknown offsets / out-of-range (discovery): own budget so
+/// routine traffic can't silence it.
+fn log_unknown(what: &str, ipa: u64, value: u32) {
+    let n = UNKNOWN_BUDGET.fetch_add(1, Ordering::Relaxed);
+    if n < UNKNOWN_MAX {
+        kprintln!("{} IPA={:#010x} val={:#010x}", what, ipa, value);
+    }
+}
+
+fn halt_pcmcia_unreachable(op: &'static str, ipa: u64, value: u32) -> ! {
+    kprintln!();
+    kprintln!(
+        "*** pcmcia::{} IPA={:#010x} val={:#010x} — owns() said mine, no slot ***",
+        op, ipa, value
+    );
+    kprintln!(
+        "  (mmio.rs routes here only when owns() matched; an unmatched"
+    );
+    kprintln!(
+        "   ipa_to_slot here means owns()/dispatch desynced. Reconcile"
+    );
+    kprintln!(
+        "   pcmcia::owns and ipa_to_slot in peripherals/pcmcia.rs.)"
+    );
+    crate::cpu::halt();
 }

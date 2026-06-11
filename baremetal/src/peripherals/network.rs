@@ -121,11 +121,15 @@ fn log_string(ctx: &mut TrapContext, pc: u32) {
                 addr = addr.wrapping_add(1);
             }
             None => {
+                // Einstein completes this log path, so a failed guest
+                // read is a hypervisor emulation bug, not a guest bug —
+                // halt loudly like every other native-prim guest access
+                // (periph-L6).
                 kprintln!(
                     "*** network.Log: cannot read at {:#x} @PC={:#x}",
                     addr, pc
                 );
-                return;
+                cpu::halt();
             }
         }
     }

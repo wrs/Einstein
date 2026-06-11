@@ -131,6 +131,16 @@ struct DmaState {
 
 struct DmaCell(UnsafeCell<DmaState>);
 // SAFETY: accessed only from the single EL2 trap handler on core 0.
+//
+// Borrow invariant: no `&mut DmaState` borrow (via `DMA.0.get()`) may be
+// live across any point where EL2 IRQs are unmasked. The only such point
+// today is `platform::pause_system`'s WFI loop, which unmasks IRQs at EL2
+// so a nested `trap_irq` can run; that nested handler re-borrows DMA state
+// (`poll_rx`, `poll_tx`). A `&mut` held across the unmask window would
+// alias the nested borrow — undefined behavior. Each `read`/`write`/
+// `poll_*` derives one `&mut` and threads it through its helpers (e.g.
+// `write_enable` → `drain_tx_channel`); never re-derive a second `&mut`
+// while one is live, and never hold one across a WFI/unmask.
 unsafe impl Sync for DmaCell {}
 
 static DMA: DmaCell = DmaCell(UnsafeCell::new(DmaState {
@@ -146,11 +156,16 @@ static DMA: DmaCell = DmaCell(UnsafeCell::new(DmaState {
     }; 8],
 }));
 
-/// Log budget for stub accesses on unmodeled channels (2-7) and the
-/// chip-wide assign/word-status registers — keeps a spinning kernel
-/// driver from drowning the console.
-static LOG_BUDGET: AtomicUsize = AtomicUsize::new(0);
-const LOG_MAX: usize = 32;
+/// Split log budgets (periph-M4): "expected stub" traffic
+/// (unmodeled channels 2-7, the chip-wide enable on those channels)
+/// burns a tight budget so a spinning kernel driver can't drown the
+/// console, while genuinely-unknown register offsets get their own
+/// generous budget so discovery never goes fully silent on the back of
+/// routine traffic.
+static EXPECTED_BUDGET: AtomicUsize = AtomicUsize::new(0);
+const EXPECTED_MAX: usize = 8;
+static UNKNOWN_BUDGET: AtomicUsize = AtomicUsize::new(0);
+const UNKNOWN_MAX: usize = 64;
 
 /// Returns true if `ipa` falls in the DMA register window this module
 /// owns.
@@ -218,7 +233,7 @@ pub fn write(ipa: u64, value: u32) {
 fn read_channel_reg(s: &mut DmaState, bank: u32, channel: u32, register: u32) -> u32 {
     let stateful = channel < 2;
     if !stateful {
-        log_stub_chan("dma channel read (unmodeled, returning 0)", bank, channel, register, 0);
+        log_expected_chan("dma channel read (unmodeled, returning 0)", bank, channel, register, 0);
         return 0;
     }
     let ch = &s.channels[channel as usize];
@@ -234,7 +249,7 @@ fn read_channel_reg(s: &mut DmaState, bank: u32, channel: u32, register: u32) ->
         (2, 2) | (2, 3) => 0,
         _ => {
             // Einstein logs unknown reads via KPrintf but returns 0.
-            log_stub_chan("dma channel read (unknown reg, returning 0)", bank, channel, register, 0);
+            log_unknown_chan("dma channel read (unknown reg, returning 0)", bank, channel, register, 0);
             0
         }
     }
@@ -246,7 +261,7 @@ fn read_channel_reg(s: &mut DmaState, bank: u32, channel: u32, register: u32) ->
 fn write_channel_reg(s: &mut DmaState, bank: u32, channel: u32, register: u32, value: u32) {
     let stateful = channel < 2;
     if !stateful {
-        log_stub_chan("dma channel write (unmodeled, dropped)", bank, channel, register, value);
+        log_expected_chan("dma channel write (unmodeled, dropped)", bank, channel, register, value);
         return;
     }
     let ch = &mut s.channels[channel as usize];
@@ -261,7 +276,7 @@ fn write_channel_reg(s: &mut DmaState, bank: u32, channel: u32, register: u32, v
         (2, 2) => ch.event &= !value, // write-to-clear (Einstein TBSPM.cpp:751,881)
         (2, 3) => { /* interrupt-select / direction; ignored, no FIQ routing decision */ }
         _ => {
-            log_stub_chan("dma channel write (unknown reg, dropped)", bank, channel, register, value);
+            log_unknown_chan("dma channel write (unknown reg, dropped)", bank, channel, register, value);
         }
     }
 }
@@ -290,11 +305,13 @@ fn write_enable(s: &mut DmaState, value: u32) {
                 // (`Emulator/Serial/TPtySerialPortManager.cpp:215-240`)
                 // which fires once per byte at 38400 bps; we coalesce
                 // all bytes into one synchronous drain since the host
-                // PL011 already has its own FIFO.
-                drain_tx_channel(ch_idx);
+                // PL011 already has its own FIFO. If the request exceeds
+                // the per-call 4 KiB cap, `poll_tx` continues the drain
+                // on subsequent trap_irq ticks.
+                drain_tx_channel(s, ch_idx);
             }
             _ => {
-                log_stub("dma enable (unmodeled channel, no IRQ)", K_HDWR_ENABLE_STATUS, value);
+                log_expected("dma enable (unmodeled channel, no IRQ)", K_HDWR_ENABLE_STATUS, value);
             }
         }
     }
@@ -317,9 +334,7 @@ fn write_disable(s: &mut DmaState, value: u32) {
 /// `countdown`/`buf_size`, wraps `data_ptr` at the end of the ring,
 /// and on countdown=0 raises `INT_DMA_CH1` with `event=0x80` —
 /// mirroring `TPtySerialPortManager::HandleDMA` TX branch.
-fn drain_tx_channel(ch_idx: u32) {
-    // SAFETY: single-threaded.
-    let s = unsafe { &mut *DMA.0.get() };
+fn drain_tx_channel(s: &mut DmaState, ch_idx: u32) {
     let ch = &mut s.channels[ch_idx as usize];
     // Einstein's PTY loop only does work when control bit 0x02 is set.
     // The Newton kernel writes that bit in `StartTxDMA` just before
@@ -409,16 +424,48 @@ pub fn poll_rx() {
     }
 }
 
-fn log_stub(what: &str, ipa: u64, value: u32) {
-    let n = LOG_BUDGET.fetch_add(1, Ordering::Relaxed);
-    if n < LOG_MAX {
+/// Continue draining channel 1 (serial 0 TX) to the host PL011.
+/// Called from `trap_irq` on each timer-IRQ tick alongside `poll_rx`.
+/// `write_enable` drains the initial burst synchronously but caps a
+/// single drain at 4 KiB; for a TX request larger than that the cap
+/// breaks the loop with `countdown > 0` and no completion IRQ. This
+/// resumes the drain each tick so the transfer eventually reaches
+/// `countdown == 0` and raises `INT_DMA_CH1` (mTxDMAEvent=0x80) — the
+/// same terminal condition Einstein's `TPtySerialPortManager::HandleDMA`
+/// TX branch reaches one byte at a time
+/// (`Emulator/Serial/TPtySerialPortManager.cpp:215-238`).
+pub fn poll_tx() {
+    // SAFETY: single-threaded.
+    let s = unsafe { &mut *DMA.0.get() };
+    if !s.channels[1].armed {
+        return;
+    }
+    drain_tx_channel(s, 1);
+}
+
+/// Expected-stub traffic (unmodeled channels 2-7): tight budget.
+fn log_expected(what: &str, ipa: u64, value: u32) {
+    let n = EXPECTED_BUDGET.fetch_add(1, Ordering::Relaxed);
+    if n < EXPECTED_MAX {
         kprintln!("{} IPA={:#010x} val={:#010x}", what, ipa, value);
     }
 }
 
-fn log_stub_chan(what: &str, bank: u32, channel: u32, register: u32, value: u32) {
-    let n = LOG_BUDGET.fetch_add(1, Ordering::Relaxed);
-    if n < LOG_MAX {
+fn log_expected_chan(what: &str, bank: u32, channel: u32, register: u32, value: u32) {
+    let n = EXPECTED_BUDGET.fetch_add(1, Ordering::Relaxed);
+    if n < EXPECTED_MAX {
+        kprintln!(
+            "{} bank={} ch={} reg={} val={:#010x}",
+            what, bank, channel, register, value
+        );
+    }
+}
+
+/// Genuinely-unknown register offsets (discovery): own generous budget
+/// so routine stub traffic can't silence it.
+fn log_unknown_chan(what: &str, bank: u32, channel: u32, register: u32, value: u32) {
+    let n = UNKNOWN_BUDGET.fetch_add(1, Ordering::Relaxed);
+    if n < UNKNOWN_MAX {
         kprintln!(
             "{} bank={} ch={} reg={} val={:#010x}",
             what, bank, channel, register, value

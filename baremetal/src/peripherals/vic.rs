@@ -105,6 +105,15 @@ struct VicState {
 
 struct VicCell(UnsafeCell<VicState>);
 // SAFETY: accessed only from the single EL2 trap handler on core 0.
+//
+// Borrow invariant: no `&mut VicState` borrow (via `VIC.0.get()`) may be
+// live across any point where EL2 IRQs are unmasked. The only such point
+// today is `platform::pause_system`'s WFI loop, which unmasks IRQs at EL2
+// so a nested `trap_irq` can run; that nested handler re-borrows VIC state
+// (`poll_timer_matches`, `vic::raise`, …). A `&mut` held across the unmask
+// window would alias the nested borrow — undefined behavior. Hold borrows
+// only for the duration of a single `read`/`write`/`poll_*` call, never
+// across a WFI/unmask.
 unsafe impl Sync for VicCell {}
 
 static VIC: VicCell = VicCell(UnsafeCell::new(VicState {
@@ -184,21 +193,22 @@ fn init_calendar() {
         }
     };
     // On `no-semihost` builds (real silicon) there is no host clock to
-    // ask. Use a compile-time-baked seed: midnight 2026-05-11 UTC, the
-    // first known Pi-Zero-2-W boot. Newton runs reasonably with any
-    // plausible RTC; "wrong by hours" only matters for user-visible
-    // dates. A future Phase will read a real RTC chip if we add one.
+    // ask. Use a compile-time-baked seed: midnight 2026-05-16 UTC.
+    // Newton runs reasonably with any plausible RTC; "wrong by hours"
+    // only matters for user-visible dates. A future Phase will read a
+    // real RTC chip if we add one.
     #[cfg(feature = "no-semihost")]
-    let unix_time: u64 = 1_778_889_600; // 2026-05-15 00:00:00 UTC
+    let unix_time: u64 = 1_778_889_600; // 2026-05-16 00:00:00 UTC
     let secs_since_1904 = (unix_time as u32)
         .wrapping_add(SECS_1904_TO_1970)
         .wrapping_sub(RTC_HOST_TIME_OFFSET_SECONDS);
     CALENDAR_SECONDS_AT_BOOT.store(secs_since_1904, Ordering::Release);
     CALENDAR_CNTPCT_BASELINE.store(read_cntpct(), Ordering::Release);
     // Re-publish the tick page now that calendar_seconds() returns a
-    // real value — `stage2::init` already called `tick_page::update`
-    // once before this, while the baseline was still zero.
-    crate::stage2::tick_page::update();
+    // real value — `stage2::init` already called
+    // `tick_page::update_from_sync_trap` once before this, while the
+    // baseline was still zero.
+    crate::stage2::tick_page::update_from_sync_trap();
     crate::kprintln!(
         "vic: calendar = {} seconds since 1904-01-01 (host unix_time={}, offset={}s back)",
         secs_since_1904, unix_time, RTC_HOST_TIME_OFFSET_SECONDS
@@ -421,14 +431,7 @@ pub fn fiq_pending() -> bool {
     pending != 0
 }
 
-/// Current raised interrupt bits. For diagnostics.
-pub fn raised() -> u32 {
-    // SAFETY: single-threaded.
-    let s = unsafe { &*VIC.0.get() };
-    s.int_present
-}
-
-/// Diagnostic: raw `int_present` register.
+/// Diagnostic: raw `int_present` register (raised interrupt bits).
 pub fn int_present_raw() -> u32 {
     // SAFETY: single-threaded.
     let s = unsafe { &*VIC.0.get() };
@@ -580,13 +583,6 @@ pub fn tick_advance_sync_trap() -> u32 {
 pub fn tick_advance_heartbeat() -> u32 {
     let prev = SYNTH_TICKS.fetch_add(TICK_ADVANCE_PER_HEARTBEAT, Ordering::AcqRel);
     prev.wrapping_add(TICK_ADVANCE_PER_HEARTBEAT)
-}
-
-/// Back-compat alias for the sync-trap path. Older callers used
-/// `tick_advance()` for both paths; new code should pick the
-/// matching variant.
-pub fn tick_advance() -> u32 {
-    tick_advance_sync_trap()
 }
 
 /// CNTHP heartbeat tick update: advance synthetic ticks for any guest
@@ -760,14 +756,14 @@ pub fn write(ipa: u64, value: u32) {
     let s = unsafe { &mut *VIC.0.get() };
     // Log architecturally-significant VIC writes for diagnostic purposes.
     // Budget-limited so we don't drown in logs.
-    static mut LOG_N: usize = 0;
+    static LOG_N: AtomicU32 = AtomicU32::new(0);
     let interesting = matches!(ipa,
         K_HDWR_MATCH_0 | K_HDWR_MATCH_1 | K_HDWR_MATCH_2 | K_HDWR_MATCH_3
         | K_HDWR_INT_CTRL | K_HDWR_FIQ_MASK
         | K_HDWR_INT_ED_1 | K_HDWR_INT_ED_2 | K_HDWR_INT_ED_3
     );
     if interesting {
-        let n = unsafe { let v = LOG_N; LOG_N += 1; v };
+        let n = LOG_N.fetch_add(1, Ordering::Relaxed);
         if n < 32 {
             crate::kprintln!("vic: write IPA={:#010x} <- {:#010x}", ipa, value);
         }

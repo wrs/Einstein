@@ -20,21 +20,6 @@ name = "pi-probe"
 path = "src/pi_probe.rs"
 required-features = ["platform-raspi3b"]
 
-# Phase-5b real-hardware USB-host probe — standalone binary, brings
-# up PL011 + DWC2 OTG @ 0x3F98_0000, enumerates whatever's plugged
-# in (device + configuration + interface descriptors), prints over
-# serial, WFE-loops. Independent of the main hypervisor crate; used
-# for first-light validation of the DWC2 driver in src/usb/host/dwc2/.
-# See `docs/REAL_HW_BRINGUP.md` Phase 5b. Gated behind the
-# `usb-probe` feature because the underlying USB stack is still
-# under bring-up; build with:
-#   cargo build --release --bin usb-probe \
-#     --no-default-features --features "pi-bare-metal usb-probe"
-[[bin]]
-name = "usb-probe"
-path = "src/usb_probe.rs"
-required-features = ["platform-raspi3b", "usb-probe"]
-
 [features]
 default = ["platform-raspi3b", "log_mmu", "log_traps", "log_tasks", "log_irqs", "log_unaligned", "log_store", "log_host_io"]
 
@@ -166,11 +151,6 @@ input-mtouch = []
 #                   touchscreen also get sound).
 audio-null = []
 audio-pi-hdmi = []
-
-# Compile the standalone `usb-probe` binary. Off by default because
-# the USB stack underneath (`src/usb/host/dwc2/`) is bring-up code
-# and the probe pulls it in. See [[bin]] section for build line.
-usb-probe = []
 
 # Disable every in-tree call to Arm semihosting (HLT #0xF000). Required
 # when running on real silicon, where no semihosting host is listening:

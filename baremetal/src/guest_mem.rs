@@ -248,36 +248,6 @@ pub fn read_word_pa(pa: u32) -> Option<u32> {
     Some(unsafe { core::ptr::read_volatile(h as *const u32) })
 }
 
-/// Read a 32-bit page-table entry from a guest physical address,
-/// applying the same BE-8 byte-order recovery as `read_pt_entry` (which
-/// takes a pointer). Use this when the L1/L2 entry's PA is known but the
-/// backing (ROM vs RAM) must be resolved. A raw `read_word_pa` returns
-/// the byteswap of what the MMU sees under CPSR.E=1; this corrects it.
-pub fn read_pt_entry_pa(pa: u32) -> Option<u32> {
-    let h = host_addr_for(pa as usize, 4, /*for_write=*/ false)?;
-    // SAFETY: host_addr_for bounds-checks against the chosen backing.
-    Some(unsafe { read_pt_entry(h as *const u32) })
-}
-
-/// Decode the 4 per-subpage AP fields from an ARMv4 small-page L2
-/// descriptor (typ=2). Returns `[AP[0], AP[1], AP[2], AP[3]]` where
-/// AP[i] covers subpage i (1 KiB at offset i*0x400 within the page).
-/// Encoding (per the 717006 ROM disasm):
-///   bits [5:4]   = AP[0]
-///   bits [7:6]   = AP[1]
-///   bits [9:8]   = AP[2]
-///   bits [11:10] = AP[3]
-/// Each 2-bit field: 0b00 sys (priv-RO with SCTLR.SR=1), 0b01 priv-RW
-/// user-RO, 0b10 priv-RW user-RO-deprecated, 0b11 full RW.
-fn decode_subpage_ap(desc: u32) -> [u8; 4] {
-    [
-        ((desc >> 4)  & 0x3) as u8,
-        ((desc >> 6)  & 0x3) as u8,
-        ((desc >> 8)  & 0x3) as u8,
-        ((desc >> 10) & 0x3) as u8,
-    ]
-}
-
 /// Map a guest IPA + size to the host backing pointer. Centralises the
 /// region table used by the typed PA helpers so regions added here
 /// (e.g. the shadow-stub `SCRATCH_POOL`) are visible to all callers
@@ -305,36 +275,18 @@ fn host_addr_for(pa: usize, size: usize, for_write: bool) -> Option<usize> {
     if (scratch_base..scratch_end).contains(&pa) && pa + size <= scratch_end {
         return Some(crate::shadow_stub::scratch_pool_host_pa() as usize + (pa - scratch_base));
     }
-    // Hypervisor shadow pool. Used by the alias-redirect path to
-    // back VA-redirected shadow pages (see `src/shadow_pool.rs`).
-    let shadow_base = crate::shadow_pool::SHADOW_POOL_IPA as usize;
-    let shadow_end = shadow_base + crate::shadow_pool::SHADOW_POOL_SIZE;
-    if (shadow_base..shadow_end).contains(&pa) && pa + size <= shadow_end {
-        return Some(crate::shadow_pool::host_pa() as usize + (pa - shadow_base));
-    }
     None
 }
 
 /// Read one halfword (16 bits) from a guest PA. Alignment is the
 /// caller's responsibility; misaligned reads silently split across the
-/// host pointer the way the CPU would cross bytes.
+/// host pointer the way the CPU would cross bytes. Reached only through
+/// the `audio-pi-hdmi`-only u16 read helpers in `guest_endian`.
+#[allow(dead_code)]
 pub fn read_halfword_pa(pa: u32) -> Option<u16> {
     let h = host_addr_for(pa as usize, 2, /*for_write=*/ false)?;
     // SAFETY: host_addr_for bounds-checked.
     Some(unsafe { core::ptr::read_volatile(h as *const u16) })
-}
-
-/// Write one halfword to a guest PA. Returns true on success; writes
-/// to ROM / unmapped regions are refused.
-pub fn write_halfword_pa(pa: u32, value: u16) -> bool {
-    match host_addr_for(pa as usize, 2, /*for_write=*/ true) {
-        Some(h) => {
-            // SAFETY: host_addr_for bounds-checked, ROM excluded.
-            unsafe { core::ptr::write_volatile(h as *mut u16, value); }
-            true
-        }
-        None => false,
-    }
 }
 
 /// Read one byte from a guest PA.
@@ -460,36 +412,7 @@ pub fn fix_stage1_xn_bits() -> bool {
     let ram = addr_of_mut!(GUEST_RAM) as *mut u32;
     let rom = addr_of_mut!(GUEST_ROM) as *mut u32;
 
-    let mut l2_tables = 0usize;
-    let mut patched = 0usize;
-    let mut sections_patched = 0usize;
-    let mut fine_to_fault = 0usize;
     let mut rom_writes = 0usize;
-
-    // Verification scaffolding (2026-04-28): on every XN-fix walk, sanity-check
-    //   (a) no L2 small/large-page entry has a heterogeneous ARMv4 subpage-AP
-    //       encoding (all four 1-KiB subpages must share the same AP[1:0]),
-    //       i.e. the kernel is no longer relying on subpage AP for isolation
-    //       after our 1-KiB-allocator patches; and
-    //   (b) no RAM physical page is mapped by more than one VA.
-    // Both are silent when clean; print a *summary* line on the first call
-    // that surfaces violations and the running totals on each subsequent
-    // call where the count changes — so a stable boot stays quiet.
-    //
-    // Subpage-AP heterogeneity check uses the ORIGINAL ARMv4 entry (read
-    // before normalisation). Aliasing check uses the original PA bits.
-    //
-    // RAM has 1024 4-KiB pages (RAM_SIZE / 4 KiB = 4 MiB / 4 KiB). Use a
-    // local 1024-entry stack array as a `pa_page_idx → first VA seen` map;
-    // 0 means the slot is free (no real VA maps to address 0 via stage-1).
-    let mut subpage_ap_mixed = 0usize;
-    let mut alias_count = 0usize;
-    let ram_pages = RAM_SIZE / 4096;
-    let mut va_for_pa = [0u32; 1024];
-    debug_assert!(ram_pages <= va_for_pa.len(), "ram_pages exceeds verification table");
-    // Bitmap of PAs we've already logged as aliased (one-shot per PA across
-    // all walks). 1024 bits = 16 u64 words.
-    static mut LOGGED_ALIAS_BITMAP: [u64; 16] = [0; 16];
 
     let scratch_l1_idx = (crate::shadow_stub::SCRATCH_POOL_VA >> 20) as usize;
 
@@ -520,7 +443,6 @@ pub fn fix_stage1_xn_bits() -> bool {
         if typ == 3 {
             // SAFETY: i < 4096.
             unsafe { write_pt_entry(ram.add(i), 0); }
-            fine_to_fault += 1;
             continue;
         }
 
@@ -532,7 +454,6 @@ pub fn fix_stage1_xn_bits() -> bool {
             if new != entry {
                 // SAFETY: i < 4096.
                 unsafe { write_pt_entry(ram.add(i), new); }
-                sections_patched += 1;
             }
         }
 
@@ -565,7 +486,6 @@ pub fn fix_stage1_xn_bits() -> bool {
         if l2_idx_start + 256 > region_size / 4 {
             continue;
         }
-        l2_tables += 1;
 
         // Coarse L2 has 256 entries, each 4 bytes. Rewrite each non-fault
         // entry into minimal valid ARMv7 form: preserve the PA, force
@@ -584,282 +504,13 @@ pub fn fix_stage1_xn_bits() -> bool {
                 _ => unreachable!(),
             };
 
-            // ---- Verification (a): subpage-AP heterogeneity ----
-            // ARMv4 small/large-page L2 layout encodes four per-1-KiB-subpage
-            // AP[1:0] fields at bits [11:10] (sub3), [9:8] (sub2), [7:6]
-            // (sub1), [5:4] (sub0). All four must match — heterogeneity
-            // means the kernel is partitioning a 4-KiB page into per-subpage
-            // owners, which our flatten-to-AP=011 step destroys. After the
-            // 1-KiB-allocator patches we expect ZERO heterogeneous entries.
-            // We check before we rewrite (`new` strips these bits).
-            if typ == 2 || typ == 3 || typ == 1 {
-                let sub0 = (e >> 4) & 0b11;
-                let sub1 = (e >> 6) & 0b11;
-                let sub2 = (e >> 8) & 0b11;
-                let sub3 = (e >> 10) & 0b11;
-                if !(sub0 == sub1 && sub1 == sub2 && sub2 == sub3) {
-                    subpage_ap_mixed += 1;
-                }
-            }
-
-            // ---- Verification (b): PA→VA aliasing ----
-            // For every small-page entry that maps a RAM PA, record the
-            // VA. If we see two distinct VAs for the same PA, log it. We
-            // check small-page entries only (typ == 2 || typ == 3); large
-            // pages span 16 entries with the same PA so they'd false-alias
-            // against themselves and require a different walker — out of
-            // scope for now (the 717006 ROM hardly uses large pages).
-            if typ == 2 || typ == 3 {
-                let pa = e & 0xFFFF_F000;
-                if (RAM_BASE_USIZE..RAM_BASE_USIZE + RAM_SIZE).contains(&(pa as usize)) {
-                    let page_idx = ((pa as usize) - RAM_BASE_USIZE) / 4096;
-                    let va = ((i << 20) | (j << 12)) as u32;
-                    let prev_va = va_for_pa[page_idx];
-                    if prev_va == 0 {
-                        va_for_pa[page_idx] = va;
-                    } else if prev_va != va {
-                        alias_count += 1;
-                        // One-shot per aliased PA: log full (PA, VA1, VA2)
-                        // the first time we see THIS PA aliased. Subsequent
-                        // walks where the same PA is aliased are silent.
-                        let bit = page_idx;
-                        let word = bit / 64;
-                        let mask = 1u64 << (bit % 64);
-                        let already = unsafe { LOGGED_ALIAS_BITMAP[word] & mask != 0 };
-                        if !already {
-                            unsafe { LOGGED_ALIAS_BITMAP[word] |= mask; }
-                            crate::log_mmu!(
-                                "verify-mmu alias: PA={:#010x} VA1={:#010x} (L1[{:#x}],L2[{:#x}]) VA2={:#010x} (L1[{:#x}],L2[{:#x}])",
-                                pa,
-                                prev_va, prev_va >> 20, (prev_va >> 12) & 0xFF,
-                                va, va >> 20, (va >> 12) & 0xFF,
-                            );
-                            // Dump the L1[i] descriptor and the two L2
-                            // entries (at L2[prev_va_idx], L2[va_idx]) so
-                            // the next iteration can see whether the
-                            // alias is ROM-baked vs RAM-resident. `entry`
-                            // is the L1 descriptor from this walk's
-                            // outer loop; the L2 reads go through
-                            // `read_pt_entry_pa`, the BE-8-aware
-                            // page-table reader (honours both ROM and
-                            // RAM backings and byteswaps under
-                            // CPSR.E=1), so the decoded descriptors,
-                            // PAs, and AP fields below print the
-                            // kernel-intended values rather than
-                            // byteswapped garbage.
-                            let l2_pt_base = entry & 0xFFFF_FC00;
-                            let prev_idx = ((prev_va >> 12) & 0xFF) as u32;
-                            let va_idx   = ((va      >> 12) & 0xFF) as u32;
-                            let prev_l2_pa = l2_pt_base + prev_idx * 4;
-                            let va_l2_pa   = l2_pt_base + va_idx   * 4;
-                            let prev_l2 = read_pt_entry_pa(prev_l2_pa).unwrap_or(0xDEAD_BEEF);
-                            let va_l2   = read_pt_entry_pa(va_l2_pa  ).unwrap_or(0xDEAD_BEEF);
-                            let l2_loc = if (l2_pt_base as usize) < ROM_SIZE {
-                                "ROM"
-                            } else if (RAM_BASE_USIZE..RAM_BASE_USIZE + RAM_SIZE)
-                                .contains(&(l2_pt_base as usize)) {
-                                "RAM"
-                            } else {
-                                "?"
-                            };
-                            crate::log_mmu!(
-                                "verify-mmu alias L1[{:#x}]={:#010x} → L2_PT@PA={:#010x} ({})  L2[{:#x}]={:#010x} (PA={:#010x})  L2[{:#x}]={:#010x} (PA={:#010x})",
-                                i, entry, l2_pt_base, l2_loc,
-                                prev_idx, prev_l2, prev_l2 & 0xFFFF_F000,
-                                va_idx,   va_l2,   va_l2   & 0xFFFF_F000,
-                            );
-                            // Subpage-AP decode + conflict classification.
-                            // ARMv4 small-page (typ=2) AP layout:
-                            //   bits [11:10] = AP[3] (subpage 3, offsets 0xC00..0xFFF)
-                            //   bits [9:8]   = AP[2] (subpage 2, offsets 0x800..0xBFF)
-                            //   bits [7:6]   = AP[1] (subpage 1, offsets 0x400..0x7FF)
-                            //   bits [5:4]   = AP[0] (subpage 0, offsets 0x000..0x3FF)
-                            // Value 0b11 = priv-RW + user-RW (full RW grant).
-                            // Anything else (00 sys, 01 priv-RW user-RO, 10
-                            // priv-RW user-RW-deprecated) we treat as
-                            // "non-RW" for the disjointness check — only
-                            // an AP=11 subpage is one the kernel might
-                            // actively write through this VA. If both
-                            // descriptors grant AP=11 to the SAME subpage,
-                            // both VAs can write the same bytes → real
-                            // alias-corruption hazard. Otherwise the
-                            // alias is "subpage-disjoint benign".
-                            let prev_aps = decode_subpage_ap(prev_l2);
-                            let va_aps   = decode_subpage_ap(va_l2);
-                            let conflict_mask =
-                                (prev_aps[0] == 0b11 && va_aps[0] == 0b11) as u8
-                              | (((prev_aps[1] == 0b11 && va_aps[1] == 0b11) as u8) << 1)
-                              | (((prev_aps[2] == 0b11 && va_aps[2] == 0b11) as u8) << 2)
-                              | (((prev_aps[3] == 0b11 && va_aps[3] == 0b11) as u8) << 3);
-                            let class = if conflict_mask != 0 {
-                                "CONFLICT"
-                            } else if prev_l2 == va_l2 {
-                                // Identical descriptors at two VAs — same
-                                // AP grants, so any RW subpage is RW from
-                                // both VAs. Flag explicitly because the
-                                // bit-mask check above only fires on
-                                // AP=11 overlap; identical descs that
-                                // share AP=01 / 10 / 00 grants on the
-                                // same subpage are still byte-overlapping
-                                // RW from kernel perspective.
-                                "IDENTICAL"
-                            } else {
-                                "DISJOINT"
-                            };
-                            crate::log_mmu!(
-                                "verify-mmu alias AP-decode: {} prev=[sp0={:02b} sp1={:02b} sp2={:02b} sp3={:02b}] va=[sp0={:02b} sp1={:02b} sp2={:02b} sp3={:02b}] conflict_mask={:#x}",
-                                class,
-                                prev_aps[0], prev_aps[1], prev_aps[2], prev_aps[3],
-                                va_aps[0],   va_aps[1],   va_aps[2],   va_aps[3],
-                                conflict_mask,
-                            );
-
-                            // Kernel-intent (pre-flatten) classification.
-                            // Look up the accumulated PrimRememberMapping
-                            // mask for each VA. Each mask bit-pair encodes
-                            // an AP field: bits[1:0]=AP[0], [3:2]=AP[1],
-                            // [5:4]=AP[2], [7:6]=AP[3]. Treat each AP-pair
-                            // as "kernel intends subpage-RW iff field==11".
-                            // Two VAs are kernel-intent disjoint iff their
-                            // sets of "==11" subpages don't overlap.
-                            //
-                            // Misses (None) come from two cases:
-                            //  (a) Group-1 — Direct kernel L2 writes during
-                            //      TTBR0 setup never traverse Prim. We log
-                            //      "INTENT: kernel-direct (Group-1)" and
-                            //      defer to InitSpecialStacks analysis.
-                            //  (b) Group-2 transient — VA was forgotten
-                            //      before this audit walk fired. The
-                            //      tracker slot is empty; the alias is
-                            //      live in stage-1 only because the L2
-                            //      descriptor hasn't been zeroed yet by
-                            //      the kernel's batch flush. Either way,
-                            //      no current kernel-RW intent.
-                            fn intent_subpage_ap_set(mask: u32) -> u8 {
-                                // Returns a 4-bit set: bit i = "AP[i]==11".
-                                let mut s = 0u8;
-                                if mask         & 0b11 == 0b11 { s |= 1; }
-                                if (mask >> 2)  & 0b11 == 0b11 { s |= 1 << 1; }
-                                if (mask >> 4)  & 0b11 == 0b11 { s |= 1 << 2; }
-                                if (mask >> 6)  & 0b11 == 0b11 { s |= 1 << 3; }
-                                s
-                            }
-                            let prev_intent = crate::trap::kernel_intent_mask_for(pa, prev_va);
-                            let va_intent   = crate::trap::kernel_intent_mask_for(pa, va);
-                            let intent_class = match (prev_intent, va_intent) {
-                                (Some(m1), Some(m2)) => {
-                                    let s1 = intent_subpage_ap_set(m1);
-                                    let s2 = intent_subpage_ap_set(m2);
-                                    if s1 & s2 != 0 {
-                                        "CONFLICT"
-                                    } else {
-                                        "DISJOINT"
-                                    }
-                                }
-                                _ => "kernel-direct-or-forgotten",
-                            };
-                            crate::log_mmu!(
-                                "verify-mmu alias INTENT: {} prev_va_mask={:?} va_mask={:?}",
-                                intent_class, prev_intent, va_intent,
-                            );
-                        }
-                    }
-                }
-            }
-
             if new != e {
                 unsafe { write_pt_entry(ptr, new); }
-                patched += 1;
                 if is_rom {
                     rom_writes += 1;
                 }
             }
         }
-    }
-
-    // Logging policy: this function fires on every M-toggle (very hot).
-    // Noisy logs drown the boot trace. RATCHET upward only — print when
-    // either count exceeds the highest value ever seen, never on dips.
-    // For subpage_ap_mixed (which grows continuously as the kernel
-    // installs more L2 tables) gate on power-of-2 watermark crossings
-    // to limit log volume to ~12 lines for a full boot. For
-    // alias_count (rarer events) print every new high. The "first
-    // alias" details are static across walks so we print them once
-    // alongside the first non-zero alias_count.
-    // Single-threaded EL2 → static mut is fine.
-    static mut HIGH_SUBPAGE_MIXED_BUCKET: usize = 0;
-    static mut HIGH_ALIAS_COUNT: usize = 0;
-    static mut FIRST_ALIAS_LOGGED: bool = false;
-    let bucket = if subpage_ap_mixed == 0 { 0 } else { subpage_ap_mixed.next_power_of_two() / 2 };
-    let (subpage_log, alias_log, alias_details_log) = unsafe {
-        let prev_bucket = HIGH_SUBPAGE_MIXED_BUCKET;
-        let prev_alias = HIGH_ALIAS_COUNT;
-        let prev_alias_details = FIRST_ALIAS_LOGGED;
-        let mut log_subpage = false;
-        let mut log_alias = false;
-        let mut log_details = false;
-        if bucket > prev_bucket {
-            HIGH_SUBPAGE_MIXED_BUCKET = bucket;
-            log_subpage = true;
-        }
-        if alias_count > prev_alias {
-            HIGH_ALIAS_COUNT = alias_count;
-            log_alias = true;
-            if !prev_alias_details && alias_count != 0 {
-                FIRST_ALIAS_LOGGED = true;
-                log_details = true;
-            }
-        }
-        (log_subpage, log_alias, log_details)
-    };
-
-    if subpage_log || alias_log {
-        crate::log_mmu!(
-            "verify-mmu: subpage-AP-mixed={} RAM-aliased-pages={}",
-            subpage_ap_mixed, alias_count,
-        );
-    }
-    let _ = alias_details_log;
-
-    // Only log when we actually rewrote something, to avoid flooding
-    // the serial when the kernel re-enables stage-1 on every task
-    // switch and we re-walk idempotently.
-
-    // Too noisy!
-    //
-    let _ = sections_patched;
-    let _ = patched;
-    let _ = fine_to_fault;
-    let _ = l2_tables;
-    // if sections_patched != 0 || patched != 0 || fine_to_fault != 0 {
-    //     crate::dprintln!(
-    //         "fix_stage1_xn_bits: {} sections de-XN'd, {} L2 tables walked, {} L2 entries de-XN'd, {} fine -> fault",
-    //         sections_patched, l2_tables, patched, fine_to_fault
-    //     );
-    // }
-
-    // PROBE 2026-04-26: track L1[0xCD] across SCTLR M=0→M=1 transitions.
-    // If the kernel ever converts the lazy 0x90 marker into a real coarse
-    // L2 pointer, we should see the transition here. If the entry stays
-    // at 0x90 throughout boot up to the wedge, the kernel never grows
-    // it — meaning the FaultMonitor / AllocatePageTable chain is not
-    // being invoked for our DFSC=5 fault.
-    static mut LAST_L1_CD: u32 = 0xDEAD_BEEF;
-    static mut TRANSITION_SEQ: u32 = 0;
-    let cur_cd = unsafe { read_pt_entry(ram.add(0xCD)) };
-    // SAFETY: single-threaded EL2.
-    let (last, seq) = unsafe {
-        let l = LAST_L1_CD;
-        TRANSITION_SEQ += 1;
-        let s = TRANSITION_SEQ;
-        if l != cur_cd { LAST_L1_CD = cur_cd; }
-        (l, s)
-    };
-    if last != cur_cd {
-        crate::log_mmu!(
-            "L1[0xcd] probe: transition #{} {:#010x} -> {:#010x}",
-            seq, last, cur_cd
-        );
     }
 
     rom_writes > 0

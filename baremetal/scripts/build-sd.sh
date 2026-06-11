@@ -12,13 +12,18 @@
 # Env vars:
 #   PI_FIRMWARE_CACHE   override the default cache location
 #   PI_KERNEL_BIN       which [[bin]] to use as kernel8.img
-#                       (default: pi-probe; Phase 1+ will swap to
-#                       newton-hypervisor)
-#   PI_CARGO_FEATURES   base Cargo features (default: pi-bare-metal).
-#                       Set to `pi-bare-metal-sd` for SD-backed flash
-#                       persistence — that feature aggregate is
-#                       mutually exclusive with the default's null
-#                       backend so it must replace, not append.
+#                       (default: newton-hypervisor — the full
+#                       hypervisor, which boots to the Welcome UI on
+#                       the Pi. Set to `pi-probe` for the first-light
+#                       serial-triage probe instead.)
+#   PI_CARGO_FEATURES   base Cargo features (default: pi-bare-metal-input,
+#                       the display + touch + audio + SD-flash aggregate
+#                       for the full hypervisor). Set to `pi-bare-metal`
+#                       for the minimal null-backend build, or
+#                       `pi-bare-metal-sd` for SD-backed flash
+#                       persistence — the aggregates are mutually
+#                       exclusive so PI_CARGO_FEATURES replaces, not
+#                       appends.
 #   PI_EXTRA_FEATURES   space-separated Cargo features appended to
 #                       PI_CARGO_FEATURES (e.g. `sd-probe`)
 #   PI_FIRMWARE_COMMIT  raspberrypi/firmware commit to pin to
@@ -73,7 +78,7 @@ sd_mount="${2:-}"
 # Repo root = directory containing this script's parent.
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cache="${PI_FIRMWARE_CACHE:-${repo_root}/target/pi-firmware-cache}"
-kernel_bin="${PI_KERNEL_BIN:-pi-probe}"
+kernel_bin="${PI_KERNEL_BIN:-newton-hypervisor}"
 
 mkdir -p "$dest" "$dest/overlays" "$cache" "$cache/overlays"
 
@@ -87,13 +92,13 @@ done
 
 # --- 2. Build the chosen [[bin]] ---------------------------------------
 #
-# Use the `pi-bare-metal` feature aggregate for both bins: it pulls in
-# platform-raspi3b (PL011 base, MMIO map) and no-semihost / flash-
-# persist-null for the real-silicon build of the main hypervisor.
-# pi-probe is unaffected by no-semihost / flash-persist-null but
-# satisfies its `required-features = ["platform-raspi3b"]` via the
-# aggregate. See Cargo.toml for the feature definition.
-features="${PI_CARGO_FEATURES:-pi-bare-metal}${PI_EXTRA_FEATURES:+ $PI_EXTRA_FEATURES}"
+# Default to the `pi-bare-metal-input` aggregate for the full
+# hypervisor (display + touch + audio + SD-flash on top of
+# platform-raspi3b + no-semihost). The minimal `pi-bare-metal`
+# aggregate still works for `pi-probe` (it only needs platform-raspi3b)
+# or a null-backend hypervisor build — set PI_CARGO_FEATURES to pick.
+# See Cargo.toml for the feature definitions.
+features="${PI_CARGO_FEATURES:-pi-bare-metal-input}${PI_EXTRA_FEATURES:+ $PI_EXTRA_FEATURES}"
 echo "build: cargo --release --no-default-features --features '$features' --bin $kernel_bin"
 (
     cd "$repo_root"

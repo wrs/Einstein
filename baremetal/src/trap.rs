@@ -127,6 +127,7 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
             n, elr, spsr, vic::int_present_raw()
         );
     }
+    #[cfg(feature = "platform-fvp-base")]
     crate::tarmac::maybe_emit_start(n);
 }
 
@@ -349,34 +350,10 @@ fn irq_from_guest(ctx: &mut TrapContext) {
     // regs (its SWIBoot save area is stale for the running task).
     crate::task_dump::periodic(ctx);
 
-    // iter-79: periodically check whether the runtime heap has come
-    // up; on the first successful check, fire the force-enable
-    // sequence (sets gWantSerialDebugging + gInterpreter trace
-    // flag). Cheap idempotent — atomic guard inside the helper
-    // ensures it only does real work once.
+    // Periodically check whether the runtime heap has come up and log
+    // its bounds once. Cheap idempotent — an atomic guard inside the
+    // helper ensures it only does real work on the first success.
     crate::heap_check::log_heap_bounds_once();
-
-    // One-shot tripwire: poll PA 0x0402a250 every heartbeat and log the
-    // first time it transitions to 0x6e657774 ("newt"). Lets us bound
-    // the trace event range during which the corruption was written
-    // (see INVESTIGATION.md "Currently at — pckm task at sp_usr=
-    // 0x0cc7a248"). Cleared once it fires.
-    {
-        static FIRED: core::sync::atomic::AtomicBool =
-            core::sync::atomic::AtomicBool::new(false);
-        if !FIRED.load(core::sync::atomic::Ordering::Relaxed) {
-            if let Some(v) = crate::guest_endian::guest_read_u32_pa(0x0402_a250) {
-                if v == 0x6e65_7774 {
-                    FIRED.store(true, core::sync::atomic::Ordering::Relaxed);
-                    let next_v = crate::guest_endian::guest_read_u32_pa(0x0402_a254).unwrap_or(0);
-                    kprintln!(
-                        "*** newt-tripwire: PA 0x0402a250=0x{:08x} 0x0402a254=0x{:08x} at heartbeat ELR={:#x}",
-                        v, next_v, elr
-                    );
-                }
-            }
-        }
-    }
 
     if !spurious {
         timer::on_irq();
@@ -623,19 +600,6 @@ fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
     if wnr && peripherals::flash::is_flash_pa(ipa) && drop_flash_write(ctx, iss, elr) {
         advance_elr(4);
         return;
-    }
-
-    // Phase B diagnostic: log any access from inside the REx-scanner
-    // function range with full register context, to understand what
-    // addresses it's probing (for pre-MMU first boot).
-    if (0x003137dc..0x00313960).contains(&elr) {
-        kprintln!(
-            "rex-dabt: ELR={:#010x} {} IPA={:#x} FAR={:#x}  r0={:#x} r1={:#x} r2={:#x} r3={:#x} r4={:#x}",
-            elr,
-            if wnr { "W" } else { "R" },
-            ipa, far,
-            ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32, ctx.x[4] as u32
-        );
     }
 
     if isv == 0 {
@@ -1560,35 +1524,6 @@ fn handle_und(ctx: &mut TrapContext) {
     };
     ctx.x[12] = read_sysreg!("tpidr_el0");
 
-    // DIAG: prove handle_und is being reached at all. Single-shot log.
-    static mut UND_ENTRY_LOGGED: bool = false;
-    // SAFETY: single-threaded.
-    let first = unsafe {
-        let was = UND_ENTRY_LOGGED;
-        UND_ENTRY_LOGGED = true;
-        !was
-    };
-    if first {
-        let elr = read_sysreg!("elr_el2");
-        let spsr = read_sysreg!("spsr_el2");
-        let far = read_sysreg!("far_el1");
-        // ctx.x[13] is SP_usr, ctx.x[14] is LR_usr per Table D1-79 —
-        // *not* the source mode's banked SP/LR. The trampoline HVCs
-        // from UND mode, so SP_und/LR_und are in ctx.x[23]/ctx.x[22].
-        kprintln!(
-            "und: handle_und first entry, ELR_EL2={:#x} SPSR_EL2={:#x} FAR_EL1={:#x}",
-            elr, spsr, far
-        );
-        kprintln!(
-            "und:   SP_und=ctx.x[23]={:#x}  LR_und=ctx.x[22]={:#x} — LR_und-4 is the faulting PC",
-            ctx.x[23] as u32, ctx.x[22] as u32
-        );
-        kprintln!(
-            "und:   r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}",
-            ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32
-        );
-    }
-
     let lr_und = match read_guest_word_pa(UND_SAVE_LR_IPA) {
         Some(v) => v,
         None => {
@@ -1994,11 +1929,9 @@ fn handle_und(ctx: &mut TrapContext) {
             return;
         }
         _ => {
-            // Stop the tarmac window before any further EL2 work runs
-            // (the diagnostic kprintln!'s below would otherwise appear
-            // in the trace and bloat it). The window was opened by the
-            // FPE-entry probe at 0x38d918 on the third FPE entry —
-            // exactly the call that wedges on the IP-corruption trap.
+            // Close any open tarmac window before the diagnostic
+            // kprintln!'s below run, so they don't bloat the trace.
+            #[cfg(feature = "platform-fvp-base")]
             crate::tarmac::emit_stop();
             kprintln!(
                 "*** unrecognised UND: insn={:#010x} at PC={:#x} SPSR_und={:#x}",
@@ -2782,9 +2715,9 @@ fn handle_bootos_canary(ctx: &mut TrapContext) {
     }
 
     // Second+ entry — software reset.
-    // Stop the tarmac-window capture before any further EL2 work runs
-    // (the halt message itself will appear in the trace if we emit the
-    // stop AFTER the `*** BootOS canary fired ...` line).
+    // Close any open tarmac-window capture before further EL2 work runs
+    // (the halt message itself would otherwise appear in the trace).
+    #[cfg(feature = "platform-fvp-base")]
     crate::tarmac::emit_stop();
     let spsr_el2 = read_sysreg!("spsr_el2") as u32;
     let elr_el2 = read_sysreg!("elr_el2");
@@ -2902,14 +2835,6 @@ fn halt_invariant(label: &str, local_dump: impl FnOnce()) -> ! {
     crate::task_dump::dump();
     kprintln!("--- end task_dump ---");
     cpu::halt();
-}
-
-/// Stub for the kernel-intent mask tracker: no intent data is
-/// recorded, so this always returns `None`. The `verify-mmu` alias
-/// audit in `guest_mem` handles `None` gracefully (treat as "no
-/// kernel intent recorded → don't flag").
-pub fn kernel_intent_mask_for(_pa: u32, _va: u32) -> Option<u32> {
-    None
 }
 
 /// path, true ⇒ kernel/UND path). Halts via `halt_invariant`.
@@ -3255,22 +3180,6 @@ fn handle_dabt_dispatch(ctx: &mut TrapContext) {
     let spsr_el2 = read_sysreg!("spsr_el2");
     let hvc_src_mode = (spsr_el2 as u32) & 0x1F;
     log_dabt_forward(dfsc, far as u32, hvc_src_mode, ctx);
-    // One-shot diagnostic: when the recursive-abort "newt" DABT
-    // fires (FAR=0x6e657774, mode=ABT), dump the SWIBoot save area
-    // of every cdsv-named task before forwarding to the kernel
-    // handler — the kernel's own response is to reboot, so this is
-    // our only chance to see the corrupt slot.
-    if far as u32 == 0x6e65_7774 {
-        static FIRED: core::sync::atomic::AtomicBool =
-            core::sync::atomic::AtomicBool::new(false);
-        if !FIRED.swap(true, core::sync::atomic::Ordering::Relaxed) {
-            kprintln!("=== one-shot newt-DABT diagnostic: cdsv save areas ===");
-            crate::task_dump::dump_save_area_for_named(b"cdsv");
-            kprintln!("=== one-shot newt-DABT diagnostic: full kernel dump ===");
-            crate::task_dump::dump_full();
-            kprintln!("=== end one-shot newt-DABT diagnostic ===");
-        }
-    }
     let saved_r0: u64;
     let saved_r1: u64;
     unsafe {
@@ -4222,11 +4131,8 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
             #[cfg(nh_guest_test)]
             let value_with_a = value | 0x2;
             cp15::write_sctlr_el1(value_with_a as u64);
-            // One-time cross-check: read SCTLR back to verify A-bit stuck,
-            // and emit <<TRM_START>> so the tarmac-window capture begins
-            // at the moment A=1 becomes live. Paired with emit_stop()
-            // in handle_align_fault so we get the exact window from
-            // "A=1 applied" through "first alignment fault decoded".
+            // One-time cross-check: read SCTLR back to verify the A-bit
+            // stuck on the first guest SCTLR write.
             static LOGGED_SCTLR_A_ONCE: core::sync::atomic::AtomicBool =
                 core::sync::atomic::AtomicBool::new(false);
             if !LOGGED_SCTLR_A_ONCE.swap(true, core::sync::atomic::Ordering::Relaxed) {
@@ -4236,14 +4142,6 @@ fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
                     value, readback, (readback >> 1) & 1, readback & 1,
                     (readback >> 13) & 1,
                 );
-                // iter-85: tarmac window now opens from the FPE-entry
-                // probe at 0x38d918 on entry #2 (= forward #2 = mvfs in
-                // SetSystemVolume that wedges the FPE on IP corruption).
-                // The SCTLR-A=1 trigger from the iter-78 alignment-fault
-                // investigation is left disabled so it doesn't preempt
-                // the FPE window. Re-enable when the active investigation
-                // changes.
-                let _ = ();  // tarmac::emit_start() suppressed for iter-85
             }
             log_sctlr_write(value);
             if was_off && now_on {

@@ -25,9 +25,7 @@
 //! Only builds that select the `input-mtouch` backend compile the
 //! stack — `src/main.rs` gates `mod usb` on `cfg(nh_input_mtouch)`
 //! (see `src/input/mod.rs` for the axis), so QEMU / FVP / bench
-//! builds without a touchscreen pay nothing. The standalone
-//! `usb-probe` binary carries its own inline MMIO probe and doesn't
-//! link this module.
+//! builds without a touchscreen pay nothing.
 
 pub mod descriptor;
 pub mod enumerate;

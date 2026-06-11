@@ -428,54 +428,6 @@ pub const BOOTOS_PC: u32 = 0x0001_8688;
 /// first boot by setting r0 = 0xb0 and advancing ELR past the HVC.
 pub const BOOTOS_ORIG_INSN: u32 = 0xE3A0_00B0;
 
-/// ROM offsets reserved for the per-patch stubs. All sit in the
-/// post-UND-trampoline region at 0x00FFFFxx — `tracer::in_reserved_range`
-/// excludes them so they're never UDF-patched by the function tracer.
-///
-/// Each DebugStr / Debugger stub is 2 words:
-///   MOV r7, LR    — copy the AArch32 source-mode LR into r7, a non-
-///                   banked GPR. Source mode is SVC for the ROM call
-///                   sites; LR in SVC is R14_svc, which per ARM ARM
-///                   Table D1-79 lives in `ctx.x[18]` from EL2, not
-///                   `ctx.x[14]` (= LR_usr). Stashing into r7 (= R7,
-///                   shared across all non-FIQ modes, ctx.x[7])
-///                   sidesteps that mapping question entirely.
-///   HVC #imm      — trap to EL2
-/// `LockHeapRange` (caller-side glue at 0x001F_8AB4) and
-/// `UnlockHeapRange` (0x001F_8B88) — the two ABI entry points whose
-/// `(base, limit, lock_id?)` parms are forwarded to FMLockHeapRange /
-/// FMUnlockHeapRange via SafeUserRequestEntry req-ids 6 and 7.
-///
-/// We patch each function's first instruction (`mov ip, sp`) with a
-/// `b WRAPPER`. The wrapper aligns r0 (base) DOWN to a 4-KiB boundary
-/// and r1 (limit) UP to a 4-KiB boundary, then re-enters the real
-/// function at +4 (skipping the patched-out `mov ip, sp` after
-/// replicating it locally).
-///
-/// Why: the kernel's design partitions a 4-KiB physical page into
-/// four 1-KiB subpages, each VA-owned by a different heap/stack/driver
-/// object via ARMv4 subpage-AP. ARMv7 has no subpage-AP — once we
-/// flatten to AP=011 (full RW), any user write hits all four subpages.
-/// FMLockHeapRange's per-1-KiB-subpage `ResolveFault` iteration
-/// happily allocates subpage 1 of an existing page to a different
-/// owner than subpage 0; that's the bug. Forcing every caller's range
-/// to a 4-KiB boundary makes FMLockHeapRange iterate exactly four
-/// times per page, claiming all four subpages for ONE owner. The
-/// `page_table[page_index]` slot then names a page exclusively owned
-/// by that caller; subsequent callers asking for adjacent VA pages
-/// can't accidentally land on the same physical page.
-///
-/// This SUBSUMES the per-call-site fix (29 distinct LockHeapRange
-/// callers) and matches the existing NewHeap/NewVMHeap chunk_size=4096
-/// patches at the heap-allocation layer.
-const LOCK_HEAP_RANGE_PC: u32 = 0x001F_8AB4;
-const UNLOCK_HEAP_RANGE_PC: u32 = 0x001F_8B88;
-
-/// The original first word of LockHeapRange / UnlockHeapRange — the
-/// standard `mov ip, sp` AArch32 prologue. Asserted at install time so
-/// any future ROM build that shifts the function entries fails loudly.
-const LOCK_UNLOCK_ORIG_FIRST_INSN: u32 = 0xE1A0_C00D;
-
 // ---- Load-bearing HVC patches ---------------------------------------------
 //
 // The originally-Phase-B set (L1[0xCD] lazy-grow probes, DAH Layer-γ
@@ -504,38 +456,6 @@ const REMEMBER_SWIRET_ORIG_INSN:     u32 = 0xE3A0_80ED; // mov r8, #237
 pub const DAH_MRS_SPSR_PC:           u32 = 0x0039_3144;
 const DAH_MRS_SPSR_INSN:             u32 = 0xE14F_1000;
 
-/// `TTask::Init`'s `bl NewStack` site at ROM `0x0025238c`. The probe
-/// in the previous iteration showed this BL is the user-mode caller
-/// upstream of 11 of 12 Group-2 aliased PAs. The aliasing comes from
-/// adjacent stacks deliberately sharing 4-KiB boundary pages
-/// (ARMv4 subpage-AP design); under our flat AP=011 the boundary
-/// becomes a real PA alias.
-///
-/// **Per-stack 4 KiB padding (Option A in PLAN.md):** redirect the
-/// BL to a wrapper at `NEW_STACK_PAD_WRAPPER_PC` which adds 0x1000
-/// to `r1` (size argument) before tail-calling the real `NewStack`
-/// at `NEW_STACK_PC`. The 4 KiB pad gives every stack one extra
-/// page beyond its requested size; the kernel's per-domain
-/// "next stack VA" pointer decrements by the new (larger) size on
-/// each allocation, so adjacent stacks no longer share boundary
-/// pages. The encoding `add r1, r1, #4180` (84 + 4096) doesn't fit
-/// in a single ARM imm12, so the wrapper is the cleanest place to
-/// inject the +4 KiB.
-const NEW_STACK_PAD_BL_PC:        u32 = 0x0025_238C;
-/// The BL at `NEW_STACK_PAD_BL_PC` originally targets the post-ship
-/// patch-table thunk for NewStack at `0x001BD7BA4` (visible in the
-/// disasm as a `<NewStack>` label inside the 0x01A00000..0x01C20000
-/// patch-table region). The wrapper preserves that target via
-/// tail-call so any future REx-side override of NewStack still
-/// applies. The static body is at `0x001F8968` (also labelled
-/// `<NewStack>` — the user-mode SWI shim) but going through the
-/// thunk is the architecturally correct path.
-const NEW_STACK_THUNK_PC:         u32 = 0x001B_D7BA4;
-/// Original first-word at the BL site — used to assert the patch
-/// applies to the expected ROM. `bl 0x001bd7ba4` from PC 0x25238c
-/// has offset bytes `(0x1bd7ba4 - 0x252394) = 0x1985810`, off in
-/// words = `0x6_6160`, encoded as `0xEB66_1604`.
-const NEW_STACK_PAD_BL_ORIG_INSN: u32 = 0xEB66_1604;
 
 /// `UnhandledException(char* name, void* data, void(*handler)(void*))`
 /// at ROM `0x000B_0220`. The first arg `r0` is a pointer to the
@@ -695,13 +615,6 @@ const fn arm_b(src_pc: u32, target: u32) -> u32 {
     0xEA00_0000 | (off_words & 0x00FF_FFFF)
 }
 
-/// Same as `arm_b`, but emits `BL` (link bit set).
-const fn arm_bl(src_pc: u32, target: u32) -> u32 {
-    let off_bytes = target.wrapping_sub(src_pc.wrapping_add(8)) as i32;
-    let off_words = (off_bytes / 4) as u32;
-    0xEB00_0000 | (off_words & 0x00FF_FFFF)
-}
-
 /// Same as `arm_b` but with an explicit ARM condition field in the
 /// high nibble (e.g. `0x0` for EQ, `0x1` for NE). The condition
 /// replaces the AL=0xE that `arm_b` hard-codes.
@@ -842,34 +755,13 @@ pub unsafe fn apply_717006_patches(rom_ptr: *mut u32) {
         #[cfg(nh_loud_halt_canaries)]
         apply_loud_halt_traps(rom_ptr);
         apply_bootos_trap(rom_ptr);
-        // The 4-iteration `apply_resolve_fault_wrapper` was a previous
-        // strategy: pretend each real fault was four sub-page faults
-        // so all four sub-pages of the containing page got claimed
-        // through the kernel's normal one-sub-page-at-a-time path. The
-        // ResolveFault whole-page bitmap patch in PATCHES_717006 makes
-        // that unnecessary — every fault now claims all four sub-pages
-        // in a single call.
-        // `apply_new_stack_pad_wrapper` is NOT installed — the
-        // call-site +4 KiB pad changes the size *requested* of
-        // NewStack but not the kernel's stack-pool slot stride. The
-        // result is that fewer-but-larger stacks fit per pool and
-        // the kernel's per-task pool index runs past the upper
-        // bound on the (N+1)-th stack, producing an infinite
-        // ResolveFault-loop at `FAR == info_bounds.end + 3`. See
-        // INVESTIGATION.md "Option A pad attempt — wedges on
-        // info_bounds overflow" for the full diagnostic.
-        let _ = apply_new_stack_pad_wrapper;
-        // `apply_lock_heap_range_wrapper` stays in the source for
-        // reference but is NOT installed. The 4-KiB-rounding wrapper at
-        // LockHeapRange/UnlockHeapRange entry corrupts adjacent
-        // allocations because FMLockHeapRange's `parms[+8] != 0`
-        // flag-set loop writes `[TStackPage+subpage]+44 = 1` for the
-        // widened range, pinning subpages owned by OTHER stack_infos
-        // (Pattern A driver inits use lock_id=1; see
-        // `docs/STRUCTURES.md` "TStackManager"). The right fix is
-        // per-allocator (see ZapHeap patch in PATCHES_717006); the
-        // wrapper itself is the wrong layer.
-        let _ = apply_lock_heap_range_wrapper;
+        // Two NewStack/LockHeapRange wrapper strategies were tried and
+        // abandoned: a +4 KiB NewStack-size pad (overran the kernel's
+        // stack-pool slot stride → ResolveFault loop) and a 4-KiB-rounding
+        // LockHeapRange wrapper (pinned subpages owned by other
+        // stack_infos). Both lived in the wrong layer; the shipped fix is
+        // per-allocator (the ResolveFault whole-page bitmap + ZapHeap
+        // patches in PATCHES_717006). Not reinstating either.
         apply_l1_cd_probes(rom_ptr);
         apply_fault_handler_ldr_byteswap_patches(rom_ptr);
         #[cfg(feature = "log_store")]
@@ -1590,136 +1482,6 @@ unsafe fn apply_storeperm_loadperm_probes(rom_ptr: *mut u32) {
             "rom_patch: {:#010x}: {:#010x} -> {:#010x}  ({}, HVC #{:#x})",
             pc, prev, insn, name, imm as u32,
         );
-    }
-}
-
-/// Install the per-stack 4 KiB padding wrapper (Option A in PLAN.md).
-/// `TTask::Init`'s `bl NewStack` at `0x0025238c` is the upstream
-/// caller for 11 of 12 Group-2 verify-mmu aliases. Each adjacent
-/// stack pair shares a 4 KiB boundary page (ARMv4 subpage-AP-era
-/// design); ARMv7 has no subpage AP, so under our flat AP=011 the
-/// boundary is a real PA alias. Adding 4 KiB to every stack
-/// allocation request bumps the kernel's per-domain "next stack
-/// VA" pointer by an extra page on each call, eliminating the
-/// shared-boundary pattern.
-///
-/// Wrapper layout at `NEW_STACK_PAD_WRAPPER_PC` (2 words = 8 B):
-///   +0x00  add r1, r1, #4096   — pad the size argument
-///   +0x04  b   <NewStack thunk> — tail-call into the kernel function
-///
-/// The original BL site's link register (set by the caller's BL
-/// to the wrapper) is preserved unchanged across the tail-call
-/// `b`, so when NewStack eventually returns, control flows back
-/// to TTask::Init's post-BL site (0x00252390) as if the call had
-/// gone directly.
-unsafe fn apply_new_stack_pad_wrapper(rom_ptr: *mut u32) {
-    let wrapper_pc = alloc_patch_stub(2, "NewStack pad wrapper");
-    // ARM `add r1, r1, #4096` (= 0xE2811A01) — imm12 with rot=0xA,
-    // imm8=0x01 → ROR(0x01, 20) = 0x1000.
-    let add_r1_4k = 0xE281_1A01u32;
-    let b_target  = arm_b(wrapper_pc + 4, NEW_STACK_THUNK_PC);
-    let stub: [u32; 2] = [add_r1_4k, b_target];
-    unsafe {
-        for (i, w) in stub.iter().copied().enumerate() {
-            let offset = wrapper_pc + (i as u32) * 4;
-            let idx = (offset / 4) as usize;
-            crate::guest_mem::write_rom_code_word(rom_ptr, idx, w);
-        }
-
-        // Patch TTask::Init's BL to point at the wrapper instead of
-        // directly at the post-ship NewStack thunk.
-        let idx = (NEW_STACK_PAD_BL_PC / 4) as usize;
-        let prev = rom_ptr.add(idx).read();
-        if prev != NEW_STACK_PAD_BL_ORIG_INSN {
-            kprintln!(
-                "rom_patch: ERROR — TTask::Init bl NewStack site at {:#010x} is {:#010x}, expected {:#010x}; skipping per-stack pad wrapper",
-                NEW_STACK_PAD_BL_PC, prev, NEW_STACK_PAD_BL_ORIG_INSN,
-            );
-            return;
-        }
-        let new_bl = arm_bl(NEW_STACK_PAD_BL_PC, wrapper_pc);
-        crate::guest_mem::write_rom_code_word(rom_ptr, idx, new_bl);
-        kprintln!(
-            "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (TTask::Init bl NewStack → +4 KiB pad wrapper @{:#x})",
-            NEW_STACK_PAD_BL_PC, prev, new_bl, wrapper_pc,
-        );
-    }
-}
-
-/// Install the LockHeapRange / UnlockHeapRange entry-point wrappers
-/// that round (base, limit) to 4-KiB boundaries before the original
-/// function body runs. See the constant doc-comments at
-/// `LOCK_HEAP_RANGE_PC` for the full rationale.
-///
-/// Wrapper layout (9 words = 36 bytes per stub):
-///   +0x00  mov  ip, sp                ; replicate patched-out 1st insn
-///   +0x04  lsr  r0, r0, #12           ; r0 = base & ~0xFFF (align down)
-///   +0x08  lsl  r0, r0, #12
-///   +0x0c  sub  r1, r1, #1            ; r1 = end_inclusive (orig limit-1)
-///   +0x10  orr  r1, r1, #0xC00        ; |= bits 10-11 (subpage 3 marker)
-///   +0x14  orr  r1, r1, #0x3F0        ; |= bits 4-9
-///   +0x18  orr  r1, r1, #0x0F         ; |= bits 0-3
-///   ;      r1 is now (end_inclusive | 0xFFF) — last byte of the 4-KiB
-///   ;      page that contains the caller's original end.
-///   +0x1c  add  r1, r1, #1            ; restore "limit" form (one past end)
-///   +0x20  b    <function entry>+4    ; rejoin at second instruction
-///
-/// The 0xFFF mask is split into 0xC00 + 0x3F0 + 0x0F because ARMv7's
-/// 8-bit-rotated immediate encoding can't represent 0xFFF in a single
-/// op. The three pieces are individually encodable:
-///   - 0xC00: imm8=0x0C, rot_imm=12 → ROR(0x0C, 24) = 0xC00
-///   - 0x3F0: imm8=0x3F, rot_imm=14 → ROR(0x3F, 28) = 0x3F0
-///   - 0x0F:  imm8=0x0F, rot_imm=0  → 0x0F
-///
-/// **Why both LockHeapRange AND UnlockHeapRange are patched.** The
-/// kernel's lock/unlock invariant requires the unlock range to match
-/// the lock range exactly. If we widen the lock to 4 KiB but leave
-/// the unlock at 1-KiB granularity, the extra subpages stay locked
-/// indefinitely. Symmetric patching keeps the kernel's per-subpage
-/// refcounts balanced.
-unsafe fn apply_lock_heap_range_wrapper(rom_ptr: *mut u32) {
-    let stub_template: [u32; 9] = [
-        0xE1A0_C00D,                                                    // +0x00 mov ip, sp
-        0xE1A0_0620,                                                    // +0x04 lsr r0, r0, #12
-        0xE1A0_0600,                                                    // +0x08 lsl r0, r0, #12
-        0xE241_1001,                                                    // +0x0c sub r1, r1, #1
-        0xE381_1C0C,                                                    // +0x10 orr r1, r1, #0xC00
-        0xE381_1E3F,                                                    // +0x14 orr r1, r1, #0x3F0
-        0xE381_100F,                                                    // +0x18 orr r1, r1, #0x0F
-        0xE281_1001,                                                    // +0x1c add r1, r1, #1
-        0,                                                              // +0x20 b function+4 (filled in)
-    ];
-
-    for (wrapper_pc, fn_pc, name) in [
-        (alloc_patch_stub(9, "LockHeapRange wrapper"),   LOCK_HEAP_RANGE_PC,   "LockHeapRange"),
-        (alloc_patch_stub(9, "UnlockHeapRange wrapper"), UNLOCK_HEAP_RANGE_PC, "UnlockHeapRange"),
-    ] {
-        let mut stub = stub_template;
-        stub[8] = arm_b(wrapper_pc + 0x20, fn_pc + 4);
-
-        unsafe {
-            for (i, w) in stub.iter().copied().enumerate() {
-                let idx = ((wrapper_pc + (i as u32) * 4) / 4) as usize;
-                crate::guest_mem::write_rom_code_word(rom_ptr, idx, w);
-            }
-
-            let fn_idx = (fn_pc / 4) as usize;
-            let prev = rom_ptr.add(fn_idx).read();
-            if prev != LOCK_UNLOCK_ORIG_FIRST_INSN {
-                kprintln!(
-                    "rom_patch: ERROR — {} first word is {:#010x}, expected {:#010x}; \
-                     skipping 4-KiB wrapper",
-                    name, prev, LOCK_UNLOCK_ORIG_FIRST_INSN,
-                );
-                continue;
-            }
-            let branch = arm_b(fn_pc, wrapper_pc);
-            crate::guest_mem::write_rom_code_word(rom_ptr, fn_idx, branch);
-            kprintln!(
-                "rom_patch: {:#010x}: {:#010x} -> {:#010x}  ({} → 4-KiB wrapper @{:#x})",
-                fn_pc, prev, branch, name, wrapper_pc,
-            );
-        }
     }
 }
 

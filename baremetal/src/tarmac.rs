@@ -1,30 +1,34 @@
-//! FVP TarmacTrace windowing hook.
+//! FVP TarmacTrace windowing markers (FVP-plugin-specific).
 //!
 //! FVP's TarmacTrace plugin produces enormous output — every retired
 //! instruction plus CP15/events/etc. A full-boot trace is tens of GiB.
 //! To keep traces focused on a specific stall we pair the plugin's
 //! `bp.pl011_uart0.toggle_mti` UART-token mechanism with two markers
-//! emitted by the hypervisor on `kprintln!`:
+//! the hypervisor emits straight to the mini-UART:
 //!
 //!   `<<TRM_START>>`  — TarmacTrace begins capturing
 //!   `<<TRM_STOP>>`   — TarmacTrace stops
 //!
 //! The FVP wrapper (`scripts/fvp --tarmac-window=<file>`) configures the
 //! UART toggle unit with `start_substr` / `stop_substr` on these exact
-//! tokens and disables tracing at boot. We then emit the markers at
-//! whatever point the current investigation cares about. Default: fire
-//! START once TRAP_COUNTER crosses `START_AT_TRAP` (edit for the current
-//! stall); fire STOP in `handle_bootos_canary`'s entry-#2 halt path.
+//! tokens and disables tracing at boot.
 //!
-//! To disable windowing, set `START_AT_TRAP = 0`.
+//! Hook points for a windowed trace:
+//!   - START: either set `START_AT_TRAP` to a sync-trap count (the
+//!     `maybe_emit_start` path, called once per sync trap from
+//!     `trap_sync_lower_aarch32`), or call `emit_start()` from the
+//!     specific EL2 event you want the window to open on.
+//!   - STOP: `emit_stop()` is already wired into the halt paths
+//!     (`handle_und`'s unrecognised-UND halt and
+//!     `halt_bootloader_canary`); add further `emit_stop()` calls at
+//!     any point the window should close.
 //!
-//! Active investigation (2026-04-24): alignment-fault emulator's first
-//! fault shows an impossible R14_abt (0x97 for an ARM-mode DABT). We
-//! want a tarmac trace of exactly the window from "SCTLR.A=1 becomes
-//! live" to "alignment-fault handler entry", so the SCTLR write
-//! handler calls `emit_start()` explicitly and
-//! `unaligned::handle_align_fault` calls `emit_stop()` on first entry.
-//! `START_AT_TRAP = 0` disables the trap-count path.
+//! With `START_AT_TRAP = 0` and no explicit `emit_start()` call, no
+//! window opens and the markers never fire — the shipped default.
+//!
+//! Compiled only on the FVP-base platform, where the TarmacTrace
+//! plugin exists; on QEMU/real hardware the markers would land in a
+//! log no plugin is reading, so the module is gated out entirely.
 
 use crate::uart;
 

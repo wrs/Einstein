@@ -194,7 +194,7 @@ impl UsbHostController for Dwc2 {
             return Ok(());
         }
 
-        // 1. Sanity: DWC2 OTG core present? Same probe as `usb-probe`.
+        // 1. Sanity: DWC2 OTG core present? (read GSNPSID).
         let id = self.read(regs::GSNPSID);
         kprintln!("dwc2: GSNPSID = {:#010x}", id);
         if (id >> 16) != 0x4F54 {

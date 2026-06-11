@@ -1,12 +1,5 @@
-// Many of the helpers in this module were called only by the iter-50..89
-// diagnostic probes that the BE-8 migration Phase 0 sweep removed. The
-// general-purpose Ref classifier / pretty-printer is retained for future
-// debugging iterations — including a one-line update to `read_object_bytes`
-// in Phase 4 of the migration. Silence the now-unused warnings until then.
-#![allow(dead_code)]
-
-//! iter-78: classify a Newton NS Ref against the runtime object-heap
-//! bounds.
+//! Classify a Newton NS Ref against the runtime object-heap bounds and
+//! pretty-print it for the `log_store` / `ns_trace` probes.
 //!
 //! Newton's NewtonScript Ref tag scheme (verified against
 //! `IsInt__FRC6RefVar` @ ROM 0x31c6c4 and friends):
@@ -27,15 +20,9 @@
 //! (the literal at `0x31c684`). `InHeap__11TObjectHeapFl` does a
 //! plain `lo <= addr < hi` check — same logic mirrored here.
 //!
-//! Read-the-heap reliably returns `None` early (before
+//! `heap_bounds()` reliably returns `None` early (before
 //! `InitObjects__Fv` has run) so callers can fall back to a
 //! tag-only classification.
-//!
-//! Used by the iter-75/76/77 throw / DoSend / dosend-ring probes
-//! to label captured Refs as "in-heap pointer", "ROM pointer",
-//! or "OUTSIDE heap" — which is the missing piece that iter-77
-//! left ambiguous (we couldn't tell if the receiver / implementor
-//! Refs were genuine heap objects or stale stack/register junk).
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -56,18 +43,25 @@ fn read_word(va: u32) -> Option<u32> {
 /// Read the runtime object heap's `[lo, hi)` bounds. Returns
 /// `None` before `InitObjects__Fv` has run (the global is still
 /// zero) or if any of the dependent reads fail.
+///
+/// The result is cached permanently once read, so the dependent
+/// reads go through the stage-1 VA walk only — never the PA
+/// fallback `read_word` uses. A PA-fallback read of a kernel-VA
+/// global like `G_OBJECT_HEAP` lands on unrelated physical memory
+/// and would poison the permanent cache with garbage bounds.
 pub fn heap_bounds() -> Option<(u32, u32)> {
+    use crate::guest_endian::guest_read_u32_va;
     let cached_lo = CACHED_LO.load(Ordering::Relaxed);
     let cached_hi = CACHED_HI.load(Ordering::Relaxed);
     if cached_lo != 0 || cached_hi != 0 {
         return Some((cached_lo, cached_hi));
     }
-    let heap_ptr = read_word(G_OBJECT_HEAP)?;
+    let heap_ptr = guest_read_u32_va(G_OBJECT_HEAP)?;
     if heap_ptr == 0 {
         return None;
     }
-    let lo = read_word(heap_ptr.wrapping_add(8))?;
-    let hi = read_word(heap_ptr.wrapping_add(12))?;
+    let lo = guest_read_u32_va(heap_ptr.wrapping_add(8))?;
+    let hi = guest_read_u32_va(heap_ptr.wrapping_add(12))?;
     if lo == 0 && hi == 0 {
         return None;
     }
@@ -79,88 +73,9 @@ pub fn heap_bounds() -> Option<(u32, u32)> {
     Some((lo, hi))
 }
 
-/// Where a real-pointer Ref's underlying address lives.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum PtrLoc {
-    /// Inside `[heap_lo, heap_hi)` — a runtime-allocated NS object.
-    InHeap,
-    /// Outside the heap range. Could be a ROM frame (low addresses)
-    /// or stale junk; `kind_label` distinguishes by ROM range.
-    OutOfHeap,
-    /// Heap not yet initialised — can't tell.
-    HeapUnknown,
-}
-
-/// Classify the address of a real-pointer Ref against heap bounds.
-pub fn classify_ptr(addr: u32) -> PtrLoc {
-    match heap_bounds() {
-        Some((lo, hi)) if addr >= lo && addr < hi => PtrLoc::InHeap,
-        Some(_) => PtrLoc::OutOfHeap,
-        None => PtrLoc::HeapUnknown,
-    }
-}
-
-/// Print a one-line classification of a Ref to the kernel log,
-/// prefixed by `label`. Decodes the tag bits and, for real
-/// pointers, reports heap-membership and the underlying address.
-///
-/// Examples:
-///   "    recv: ref=0x0c109f01 → real-ptr in-heap @0x0c109f00"
-///   "    args: ref=0x00684085 → real-ptr ROM     @0x00684084"
-///   "    meth: ref=0x00000002 → NIL"
-///   "    recv: ref=0x0000003c → integer 15"
-pub fn log_ref(label: &str, ref_value: u32) {
-    let tag = ref_value & 0x3;
-    match tag {
-        0 => {
-            let v = (ref_value as i32) >> 2;
-            crate::kprintln!("{}: ref={:#010x} → integer {}", label, ref_value, v);
-        }
-        1 => {
-            let addr = ref_value & !0x3; // ref - 1, but pointers are 4-aligned
-            let class = match classify_ptr(addr) {
-                PtrLoc::InHeap => "in-heap",
-                PtrLoc::OutOfHeap if addr < 0x0100_0000 => "ROM   ",
-                PtrLoc::OutOfHeap => "OUT-OF-HEAP",
-                PtrLoc::HeapUnknown => "heap?",
-            };
-            crate::kprintln!(
-                "{}: ref={:#010x} → real-ptr {} @{:#010x}",
-                label, ref_value, class, addr
-            );
-        }
-        2 => match ref_value {
-            0x0000_0002 => crate::kprintln!("{}: ref={:#010x} → NIL", label, ref_value),
-            0x0000_001a => crate::kprintln!("{}: ref={:#010x} → TRUE", label, ref_value),
-            _ => crate::kprintln!(
-                "{}: ref={:#010x} → immediate (char/special)",
-                label, ref_value
-            ),
-        },
-        3 => {
-            let idx = ref_value >> 2;
-            crate::kprintln!("{}: ref={:#010x} → magic-ptr {}", label, ref_value, idx);
-        }
-        _ => unreachable!(),
-    }
-}
-
-/// One-shot summary of the heap bounds, suitable for an iter-78
-/// boot-log line. Logs nothing if the heap isn't constructed yet.
-///
-/// (Historically also fired the iter-79 "force kernel diagnostics
-/// on" sequence — see `force_kernel_diag_on` below. iter-108
-/// disabled that call: it sets `gWantSerialDebugging`, which makes
-/// the kernel's FPE call `WriteDebugByte` for emulation tracing,
-/// and the debug ring-buffer at `obj[28]` is NULL when called from
-/// UND mode → strb to address 0 → unknown-MMIO halt at PC=0x199ce8.
-/// Re-enable when a real serial-debug path is wired through to the
-/// EL2 UART that doesn't depend on the kernel's ring-buffer init.
-/// Under `ns_trace`, the lighter-weight `force_interpreter_trace_on`
-/// poke is used instead — it flips only `gInterpreter[+124]=1` so
-/// the TInterpreter trace gates open without enabling the kernel's
-/// IsSerialDebugging-gated paths that trip the FPE/WriteDebugByte
-/// crash.)
+/// One-shot summary of the heap bounds. Logs nothing if the heap
+/// isn't constructed yet. Under `ns_trace`, also flips the
+/// TInterpreter trace gate via `force_interpreter_trace_on`.
 pub fn log_heap_bounds_once() {
     static LOGGED: AtomicU32 = AtomicU32::new(0);
     if LOGGED.load(Ordering::Relaxed) != 0 {
@@ -184,40 +99,19 @@ pub fn log_heap_bounds_once() {
     // latch clear so a later poll can succeed.
 }
 
-// ----- iter-79: force-enable kernel diagnostic flags -----------------
-//
-// Two Newton-side flags gate most of the kernel's diagnostic
-// output:
-//
-// 1. `gWantSerialDebugging` — a packed u32 at IPA `0x0c1017c4`
-//    (the +16 field of the global at `0x0c1017b4`, set by
-//    `SetgWantSerialDebugging__FUl` @ `0x199e68`). Encoding:
-//    high byte must be `0x48` to validate, low 24 bits are
-//    sub-flag bits queried via `IsSerialDebuggingAndFlag`
-//    (`0x199e80`). On a stock boot this stays 0 because nothing
-//    sends the Hammer handshake. We force it to `0x48FFFFFF`
-//    so every IsSerialDebugging-gated branch (~30 sites in
-//    717006) takes the "yes, log it" path.
-//
-// 2. `gInterpreter[124]` — the byte at offset `+0x7C` in the
-//    `TInterpreter` singleton. `gInterpreter` is reachable as
-//    `*0x0c105458` (cf. DoSend's literal at `0x2f06a4`). When
-//    non-zero, every `DoSend / DoMessage / DoFastApply` calls
-//    `TraceSend / TraceCall / TraceApply` which funnel into
-//    `TraceMethod` → `Print(POutTranslator*, fmt, ...)`. With our
-//    Print thunk hook in place that surfaces every NS-level
-//    call into the EL2 UART.
-//
-// `force_kernel_diag_on` is invoked once (from
-// `log_heap_bounds_once`, which fires after `InitInterpreter__Fv`
-// has already run). Both writes are word-sized into kernel-data
-// RAM that's mapped writable; failure to translate is logged
-// and silently dropped.
+// `gInterpreter[124]` — the byte at offset `+0x7C` in the
+// `TInterpreter` singleton (`gInterpreter` is reachable as
+// `*0x0c105458`, cf. DoSend's literal at `0x2f06a4`). When non-zero,
+// every `DoSend / DoMessage / DoFastApply` calls `TraceSend /
+// TraceCall / TraceApply`, which funnel into `TraceMethod →
+// Print(POutTranslator*, fmt, ...)`. With the `ns_trace` Print thunk
+// hook in place that surfaces every NS-level call into the EL2 UART.
+#[cfg(feature = "ns_trace")]
+const G_INTERPRETER_PTR: u32 = 0x0c10_5458;
+#[cfg(feature = "ns_trace")]
+const TINTERPRETER_TRACE_OFF: u32 = 124;
 
-const G_WANT_SERIAL_DEBUGGING: u32 = 0x0c10_17c4;
-const G_INTERPRETER_PTR:       u32 = 0x0c10_5458;
-const TINTERPRETER_TRACE_OFF:  u32 = 124;
-
+#[cfg(feature = "ns_trace")]
 fn write_word(va: u32, value: u32) -> bool {
     if crate::guest_endian::guest_write_u32_va(va, value) {
         return true;
@@ -225,20 +119,13 @@ fn write_word(va: u32, value: u32) -> bool {
     crate::guest_endian::guest_write_u32_pa(va, value)
 }
 
-/// Subset of `force_kernel_diag_on` that pokes ONLY
-/// `gInterpreter[+124] = 1` — the TInterpreter trace gate. This
-/// causes every `DoSend / DoMessage / DoFastApply` to call
-/// `TraceSend / TraceCall / TraceApply`, which funnel into
-/// `TraceMethod → Print(POutTranslator*, fmt, ...)`. With the
-/// `ns_trace` feature's TraceSetOptions ROM patch in place plus
-/// the always-on PHammerOutTranslator body patches routing
-/// Print → EL2 UART, every NS-level call surfaces in the log.
+/// Poke `gInterpreter[+124] = 1` — the TInterpreter trace gate.
 ///
-/// Deliberately does NOT touch `gWantSerialDebugging`: setting
-/// that triggers `WriteDebugByte` calls from the kernel's FPE
-/// handler running in UND mode, where the debug ring-buffer
-/// pointer at obj[28] is NULL → strb to address 0 → unknown-MMIO
-/// halt at PC=0x199ce8. See iter-108 for the regression history.
+/// Deliberately does NOT touch `gWantSerialDebugging`: setting that
+/// triggers `WriteDebugByte` calls from the kernel's FPE handler
+/// running in UND mode, where the debug ring-buffer pointer at
+/// obj[28] is NULL → strb to address 0 → unknown-MMIO halt at
+/// PC=0x199ce8.
 #[cfg(feature = "ns_trace")]
 fn force_interpreter_trace_on() {
     match read_word(G_INTERPRETER_PTR) {
@@ -257,146 +144,6 @@ fn force_interpreter_trace_on() {
         }
         _ => {
             crate::kprintln!("force_diag: TInterp_trace=skip (gInterpreter not init)");
-        }
-    }
-}
-
-fn force_kernel_diag_on() {
-    let mut summary = [0u8; 96];
-    let mut n = 0usize;
-
-    // (1) gWantSerialDebugging — 0x48 sentinel + all sub-flags on.
-    if write_word(G_WANT_SERIAL_DEBUGGING, 0x48FF_FFFF) {
-        summary[n..n + 13].copy_from_slice(b"WantSerial=on");
-        n += 13;
-    } else {
-        summary[n..n + 14].copy_from_slice(b"WantSerial=ERR");
-        n += 14;
-    }
-
-    // (2) TInterpreter trace flag.
-    summary[n] = b' ';
-    n += 1;
-    match read_word(G_INTERPRETER_PTR) {
-        Some(p) if p != 0 => {
-            if write_word(p.wrapping_add(TINTERPRETER_TRACE_OFF), 1) {
-                summary[n..n + 11].copy_from_slice(b"TInterp=on ");
-                n += 11;
-            } else {
-                summary[n..n + 12].copy_from_slice(b"TInterp=ERR ");
-                n += 12;
-            }
-        }
-        _ => {
-            summary[n..n + 17].copy_from_slice(b"TInterp=not-init ");
-            n += 17;
-        }
-    }
-
-    let s = core::str::from_utf8(&summary[..n]).unwrap_or("<utf8>");
-    crate::kprintln!("force_diag: {}", s);
-}
-
-// ----- newton-objects integration ---------------------------------------
-//
-// Pull-in: dump the structure of an object pointed to by a real-pointer
-// Ref. Works for both heap-resident objects and ROM-resident objects
-// (e.g. ROM symbols). The runtime stores objects in CPU-native byte
-// order — little-endian on this Cortex-A53 — so we feed `newton-objects`
-// a `Heap` configured with `Endian::Little`. Pointer Refs in the
-// runtime use absolute addresses (not file offsets), so the buffer's
-// load-address is the raw object address.
-
-/// Maximum bytes copied per object dump. Big enough to cover the
-/// header + class/map word + a reasonable number of slots. A frame /
-/// array with more slots than this fits will report the truncation
-/// rather than fail.
-const DUMP_BUF_BYTES: usize = 256;
-
-/// Print a human-readable structured dump of the object pointed to by
-/// `ref_value`, using the `newton-objects` parser. Only acts on
-/// real-pointer Refs (low 2 bits == 01). The pointed-to bytes are
-/// read via `guest_endian::guest_read_bytes_va` into a
-/// stack-resident buffer, then handed to a little-endian
-/// `newton_objects::Heap` view.
-///
-/// `indent` is prefixed to each output line.
-pub fn dump_object(indent: &str, ref_value: u32) {
-    if (ref_value & 0x3) != 0x1 {
-        return;
-    }
-    let addr = ref_value & !0x3;
-    let mut buf = [0u8; DUMP_BUF_BYTES];
-    let n = match crate::guest_endian::guest_read_bytes_va(addr, &mut buf) {
-        Some(n) => n,
-        None => {
-            crate::kprintln!("{}<unreadable @{:#010x}>", indent, addr);
-            return;
-        }
-    };
-    let bytes = &buf[..n];
-    // `guest_read_bytes_va` returns Newton-side logical-byte order,
-    // which is the on-disk byte sequence (high byte first within a
-    // word). Parsing as big-endian gives both correct u32 values and
-    // correct byte-level data (symbol names, character data, raw
-    // binary blobs).
-    let heap = newton_objects::Heap::with_load_addr(bytes, addr);
-    match heap.object_at(addr) {
-        Ok(obj) => print_object(indent, obj, /*depth=*/ 0),
-        Err(e) => crate::kprintln!("{}parse error @{:#010x}: {}", indent, addr, e),
-    }
-}
-
-/// One-line object summary plus a few interior slots. The depth
-/// parameter is reserved for future recursive expansion (resolving
-/// frame map names etc.); for iter-78 we keep it at depth 0 to avoid
-/// blowing the UART budget on cyclic structures.
-fn print_object(indent: &str, obj: newton_objects::Object<'_>, _depth: u32) {
-    use newton_objects::Object;
-    match obj {
-        Object::Binary(b) => {
-            let class = b.class();
-            if let Some(sym) = b.as_symbol() {
-                match sym.name() {
-                    Ok(n) => crate::kprintln!(
-                        "{}symbol '{} (hash={:#010x}) @{:#010x} size={}",
-                        indent, n, sym.hash(), b.offset(), b.size()
-                    ),
-                    Err(_) => crate::kprintln!(
-                        "{}symbol <bad-utf8> @{:#010x} size={}",
-                        indent, b.offset(), b.size()
-                    ),
-                }
-            } else {
-                crate::kprintln!(
-                    "{}binary class={:?} @{:#010x} size={} (data {} B)",
-                    indent, class, b.offset(), b.size(), b.data().len()
-                );
-            }
-        }
-        Object::Array(a) => {
-            crate::kprintln!(
-                "{}array class={:?} @{:#010x} size={} len={}",
-                indent, a.class(), a.offset(), a.size(), a.len()
-            );
-            for (i, r) in a.iter().enumerate().take(8) {
-                crate::kprintln!("{}  [{}] = {:?}", indent, i, r);
-            }
-            if a.len() > 8 {
-                crate::kprintln!("{}  ... ({} more slots)", indent, a.len() - 8);
-            }
-        }
-        Object::Frame(f) => {
-            crate::kprintln!(
-                "{}frame map={:?} @{:#010x} size={} len={}",
-                indent, f.map(), f.offset(), f.size(), f.len()
-            );
-            for (i, r) in f.iter_slots().enumerate().take(8) {
-                crate::kprintln!("{}  slot[{}] = {:?}", indent, i, r);
-            }
-            if f.len() > 8 {
-                crate::kprintln!("{}  ... ({} more slots)", indent, f.len() - 8);
-            }
         }
     }
 }
@@ -426,27 +173,17 @@ fn print_object(indent: &str, obj: newton_objects::Object<'_>, _depth: u32) {
 // Per recursion level we read a fresh 256-byte buffer from guest
 // memory (≈ stack budget); keep `depth` ≤ 4.
 
-/// Pretty-print a NewtonScript Ref on a single line, with
-/// `depth` levels of structural expansion (default 0 — pointers
-/// render as `#hex`). Emits "label: <ref>\n"; pass `""` for a
-/// bare-line print. Inline composition (no newline, no label) is
-/// available via [`pretty_print_ref_inline`].
-pub fn pretty_print_ref(label: &str, ref_value: u32, depth: u32) {
-    if !label.is_empty() {
-        crate::kprint!("{}: ", label);
-    }
-    write_ref(ref_value, depth);
-    crate::kprintln!();
-}
-
-/// As [`pretty_print_ref`], but emits only the compact rendering —
-/// no label, no trailing newline. Use to compose probe headers
+#[cfg(feature = "log_store")]
+/// Pretty-print a NewtonScript Ref inline — no label, no trailing
+/// newline — with `depth` levels of structural expansion (default
+/// 0 — pointers render as `#hex`). Use to compose probe headers
 /// like `kprint!("StorePermObject[{}]: ", n);
 /// pretty_print_ref_inline(r, 1); kprintln!(" lr={:#x}", lr);`.
 pub fn pretty_print_ref_inline(ref_value: u32, depth: u32) {
     write_ref(ref_value, depth);
 }
 
+#[cfg(feature = "log_store")]
 fn write_ref(ref_value: u32, depth: u32) {
     use newton_objects::{Ref, RefKind};
     let r = Ref(ref_value);
@@ -467,6 +204,7 @@ fn write_ref(ref_value: u32, depth: u32) {
     }
 }
 
+#[cfg(feature = "log_store")]
 /// Object header: high 24 bits of word 0 = size (bytes incl. header
 /// + class/map + body), low 8 bits = flags (`0x01` = slotted,
 /// `0x02` = frame, `0x40` = base bit, GC bits in the high nibble).
@@ -481,16 +219,21 @@ fn read_obj_header(addr: u32) -> Option<(u32 /*size*/, u8 /*flags*/, u32 /*class
     Some((size, flags, class))
 }
 
+#[cfg(feature = "log_store")]
 const KOBJ_SLOTTED: u8 = 0x01;
+#[cfg(feature = "log_store")]
 const KOBJ_FRAME: u8 = 0x02;
+#[cfg(feature = "log_store")]
 /// Forwarding-pointer flag in the header byte. The "object" is a
 /// 12-byte stub: header + (unused) word + the forwarding Ref at
 /// the slot normally used for class/map. Newton emits these when
 /// it relocates an object during GC/compaction so existing Refs
 /// to the old address keep resolving via one extra hop.
 const KOBJ_FORWARDED: u8 = 0x20;
+#[cfg(feature = "log_store")]
 const MAX_FORWARD_HOPS: u32 = 8;
 
+#[cfg(feature = "log_store")]
 /// Render the pointee of a pointer Ref. Reads the object header
 /// directly from guest memory (one word at a time) instead of
 /// buffering the whole body, so arbitrarily-sized objects (fault
@@ -580,6 +323,7 @@ fn write_pointee(addr: u32, ref_value: u32, depth: u32) {
     crate::kprint!("{}", close);
 }
 
+#[cfg(feature = "log_store")]
 /// Binary body. Symbols (class == `kSymbolClass` = 0x55552) →
 /// `'name`. Strings (class is a pointer to the symbol `'string`)
 /// → `"text"`. Anything else → `<bin 'classname N bytes>` (or
@@ -610,6 +354,7 @@ fn write_binary_at(addr: u32, ref_value: u32, size: u32, class_ref: u32) {
     }
 }
 
+#[cfg(feature = "log_store")]
 /// Symbol body layout: 4-byte hash at +12, NUL-terminated UTF-8
 /// name at +16. Read up to a small fixed cap (symbols are short).
 fn write_symbol_name_at(addr: u32, size: u32, ref_value: u32) {
@@ -633,6 +378,7 @@ fn write_symbol_name_at(addr: u32, size: u32, ref_value: u32) {
     }
 }
 
+#[cfg(feature = "log_store")]
 /// Read the first chunk of a `'string` body and emit it as
 /// `"text"`, decoding UCS-2 BE word-by-word so we don't depend on
 /// the full body fitting in a buffer. Caps at MAX_CHARS units.
@@ -663,6 +409,7 @@ fn write_string_body_at(addr: u32, size: u32) {
     crate::kprint!("\"");
 }
 
+#[cfg(feature = "log_store")]
 /// Diagnostic emission when a pointer Ref's pointee can't be
 /// recognized: prints `<? #ref [w0 w1 w2 w3 w4 w5 w6 w7]>` with
 /// the first 8 words at `addr` so the caller can eyeball the raw
@@ -683,6 +430,7 @@ fn write_squirrely_at(addr: u32, ref_value: u32) {
 }
 
 
+#[cfg(feature = "log_store")]
 fn write_string_char(c: u16) {
     let cu = c as u32;
     if c == b'\\' as u16 {
@@ -696,6 +444,7 @@ fn write_string_char(c: u16) {
     }
 }
 
+#[cfg(feature = "log_store")]
 fn write_char_literal(c: u16) {
     let cu = c as u32;
     if (0x20..0x7f).contains(&cu) {
@@ -705,6 +454,7 @@ fn write_char_literal(c: u16) {
     }
 }
 
+#[cfg(feature = "log_store")]
 /// Follow forwarding pointers starting at `addr`, returning the
 /// (final-address, size, flags, class_or_map) of the underlying
 /// non-forwarded object, or `None` if the chain breaks (unreadable
@@ -722,6 +472,7 @@ fn resolve_forwarding(addr: u32) -> Option<(u32, u32, u8, u32)> {
     None
 }
 
+#[cfg(feature = "log_store")]
 /// Read a symbol's name bytes via direct guest reads (forwarding-
 /// aware). Returns the number of bytes written into `out`, or 0 if
 /// `r` isn't a pointer Ref, the chain isn't a binary with class
@@ -745,6 +496,7 @@ fn read_symbol_name_into(r: newton_objects::Ref, out: &mut [u8]) -> usize {
     out[..name_bytes].iter().position(|&b| b == 0).unwrap_or(name_bytes)
 }
 
+#[cfg(feature = "log_store")]
 /// Resolve the symbol name for frame slot `slot_idx` by walking
 /// the map chain rooted at `map_ref_value`. Writes the symbol's
 /// name bytes into `out`; returns 0 on any failure (NIL map,

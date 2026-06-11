@@ -30,11 +30,11 @@ mod rep_print;
 mod rom_patches;
 #[cfg(feature = "platform-raspi3b")]
 mod sd;
-mod shadow_pool;
 mod shadow_stub;
 mod snapshot;
 mod stage2;
 mod symbols;
+#[cfg(feature = "platform-fvp-base")]
 mod tarmac;
 mod task_dump;
 mod timer;
@@ -139,10 +139,6 @@ pub extern "C" fn kmain() -> ! {
     unsafe {
         stage2::init();
         stage2::enable();
-        // Shadow-pool smoke test: verify the stage-2 mapping + host
-        // backing for the alias-redirect shadow pool are wired up
-        // before any policy code uses the pool. One-line diagnostic.
-        shadow_pool::smoke_test();
     }
 
     // Seed the 10-entry ROM+REx checksum table into both blocks of

@@ -28,12 +28,6 @@
 //!   logical-byte order into `out`, so the buffer matches what the
 //!   BE-32 source code would see byte-by-byte.
 
-// Some helpers (notably the u8/u16 paths and guest_read_bytes_va) don't
-// have direct call sites today — they'll be picked up by Phase 4
-// diagnostics simplification and the new peripheral byte/halfword
-// splice. Suppress dead-code warnings during the migration.
-#![allow(dead_code)]
-
 use crate::guest_mem;
 
 // In normal (BE-8) builds, the guest stores values with bytes in BE
@@ -91,8 +85,11 @@ fn swap_for_pa(pa: u32, raw: u32) -> u32 {
 #[inline]
 fn swap_for_pa(_pa: u32, raw: u32) -> u32 { raw }
 
+// Used only by the u16 read helpers, which are consumed solely by the
+// `audio-pi-hdmi` backend — dead in the default/FVP builds.
 #[cfg(not(nh_guest_test))]
 #[inline]
+#[allow(dead_code)]
 fn swap16(v: u16) -> u16 { v.swap_bytes() }
 
 /// Read a 32-bit word from a guest VA and return it as a Newton-side
@@ -140,19 +137,22 @@ pub fn guest_read_u8_va(va: u32) -> Option<u8> {
 }
 
 /// Read a halfword from a guest PA at the given Newton-side logical
-/// halfword address.
+/// halfword address. Consumed only by the `audio-pi-hdmi` backend.
 #[cfg(not(nh_guest_test))]
+#[allow(dead_code)]
 pub fn guest_read_u16_pa(pa: u32) -> Option<u16> {
     guest_mem::read_halfword_pa(pa).map(swap16)
 }
 
 #[cfg(nh_guest_test)]
+#[allow(dead_code)]
 pub fn guest_read_u16_pa(pa: u32) -> Option<u16> {
     guest_mem::read_halfword_pa(pa ^ 2)
 }
 
 /// Read a halfword from a guest VA at the given Newton-side logical
-/// halfword address.
+/// halfword address. Consumed only by the `audio-pi-hdmi` backend.
+#[allow(dead_code)]
 pub fn guest_read_u16_va(va: u32) -> Option<u16> {
     let pa = guest_mem::translate_va(va).unwrap_or(va);
     guest_read_u16_pa(pa)
@@ -170,18 +170,6 @@ pub fn guest_write_u8_pa(pa: u32, value: u8) -> bool {
     guest_mem::write_byte_pa(pa ^ 3, value)
 }
 
-/// Write a halfword to a guest PA at the given Newton-side logical
-/// halfword address.
-#[cfg(not(nh_guest_test))]
-pub fn guest_write_u16_pa(pa: u32, value: u16) -> bool {
-    guest_mem::write_halfword_pa(pa, swap16(value))
-}
-
-#[cfg(nh_guest_test)]
-pub fn guest_write_u16_pa(pa: u32, value: u16) -> bool {
-    guest_mem::write_halfword_pa(pa ^ 2, value)
-}
-
 /// Read a contiguous range of guest bytes in Newton-side logical-byte
 /// order into `out`. Stops short on the first failed VA→PA translation;
 /// returns the number of bytes actually written, or `None` if the very
@@ -191,6 +179,9 @@ pub fn guest_write_u16_pa(pa: u32, value: u16) -> bool {
 /// `to_be_bytes()` so the buffer mirrors the original on-disk byte
 /// order. A caller that wants to print a kernel string verbatim (or
 /// hash a binary blob) gets the bytes in their natural sequence.
+///
+/// Consumed only by the `log_store` Ref pretty-printer today.
+#[allow(dead_code)]
 pub fn guest_read_bytes_va(addr: u32, out: &mut [u8]) -> Option<usize> {
     let mut written = 0;
     let mut cursor = addr;

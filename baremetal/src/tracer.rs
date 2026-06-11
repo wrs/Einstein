@@ -47,13 +47,17 @@
 //!   - first-touch (`--features trace_once`): each function's main
 //!     trace line is emitted once per session, gated on `FIRED_BITMAP`
 //!     in `log_trace_at`. The trampoline itself still fires on every
-//!     call so targeted debug side-effects (putc buffering, newt-
-//!     tripwire poll, mode-13 SP_svc tracking) keep working.
+//!     call so targeted debug side-effects (putc buffering) keep
+//!     working.
+//!
+//! `SVC_WATCH` (in `log_trace_at`) is the documented extension point
+//! for a stall hunt: add a function's PC literal to the list, rebuild,
+//! and each SVC-mode entry prints its banked SP/LR. It is empty in the
+//! shipped tree.
 //!
 //! Changes the snapshot ROM fingerprint (many ROM words move), so runs
 //! with `trace` enabled always cold-boot in practice.
 
-use crate::cpu;
 use crate::guest_mem;
 use crate::kprintln;
 use crate::trap::TrapContext;
@@ -77,7 +81,8 @@ const SLOT_WORDS: usize = 5;
 const SLOT_SIZE: u32 = (SLOT_WORDS as u32) * 4;
 
 /// Sequence counter for the trace log. Bumped on every HVC fire.
-static mut TRACE_SEQ: u32 = 0;
+static TRACE_SEQ: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
 
 /// Per-function "already logged" bitmap, used by the `trace_once`
 /// feature to gate the main trace line. One bit per slot index;
@@ -166,14 +171,12 @@ fn encode_b(from_pc: u32, target: u32) -> Option<u32> {
 /// Build slot[1] and slot[3] (the literal / branch-target slot) for a
 /// function whose original first instruction is `orig` at PA `orig_pc`.
 /// Returns:
-///   Some((insn_slot1, literal_slot3, sets_pc))
+///   Some((insn_slot1, literal_slot3))
 ///     - `insn_slot1`: word to place at slot[1].
 ///     - `literal_slot3`: word to place at slot[3] (0 if unused).
-///     - `sets_pc == true`: slot[1] itself transfers control (B rewrite
-///       via LDR PC). Slot[2]/slot[4] are unreached in that case.
 ///   None: the first instruction uses a PC-relative form we can't
 ///     safely rewrite, or the referenced literal is outside ROM.
-fn rewrite_first_insn(orig: u32, orig_pc: u32) -> Option<(u32, u32, bool)> {
+fn rewrite_first_insn(orig: u32, orig_pc: u32) -> Option<(u32, u32)> {
     // LDR Rd, [pc, #imm], cond=AL, U=1 (add), B=0, W=0, L=1, Rn=PC.
     // Encoding: 1110 0101 1001 1111 Rd  imm12 = 0xE59F_Rxxx.
     // Matches when bits 27:20 == 0x59 and Rn == 0xF. Rd is extracted
@@ -194,7 +197,7 @@ fn rewrite_first_insn(orig: u32, orig_pc: u32) -> Option<(u32, u32, bool)> {
         // Rewrite to LDR Rd, [pc, #0]. At slot[1] (offset +4 in slot),
         // pc+8 points at slot[3] (offset +12), so imm=0 reads slot[3].
         let new_insn = 0xE59F_0000 | (rd << 12);
-        return Some((new_insn, literal, false));
+        return Some((new_insn, literal));
     }
 
     // B <label>, cond=AL. Encoding: 1110 1010 imm24 = 0xEAxx_xxxx.
@@ -208,7 +211,7 @@ fn rewrite_first_insn(orig: u32, orig_pc: u32) -> Option<(u32, u32, bool)> {
         let target = (orig_pc.wrapping_add(8) as i32).wrapping_add(offset) as u32;
         // LDR PC, [pc, #0] reads slot[3] at offset +12 from slot[1].
         let new_insn = 0xE59F_F000;
-        return Some((new_insn, target, true));
+        return Some((new_insn, target));
     }
 
     // ADD/SUB Rd, PC, #imm (the ADR idiom, ARMv7 data-processing
@@ -248,7 +251,7 @@ fn rewrite_first_insn(orig: u32, orig_pc: u32) -> Option<(u32, u32, bool)> {
         };
         // Rewrite to LDR Rd, [pc, #0]; literal goes in slot[3].
         let new_insn = 0xE59F_0000 | (rd << 12);
-        return Some((new_insn, literal, false));
+        return Some((new_insn, literal));
     }
 
     // Everything else: copy verbatim. Handles PUSH / STMFD, SUB sp imm,
@@ -258,7 +261,7 @@ fn rewrite_first_insn(orig: u32, orig_pc: u32) -> Option<(u32, u32, bool)> {
     // with register offset involving PC; anything that branches via
     // PC) are very rare as function entries — if one shows up, the
     // HVC will log it but subsequent execution will be wrong.
-    Some((orig, 0, false))
+    Some((orig, 0))
 }
 
 /// Install trampolines for every function in the embedded table.
@@ -297,7 +300,7 @@ pub fn init() {
         // SAFETY: build.rs filtered orig_pc to < 0x0100_0000 and word-aligned.
         let orig = unsafe { rom_base.add(word_index).read() };
 
-        let (slot1, slot3, sets_pc) = match rewrite_first_insn(orig, orig_pc) {
+        let (slot1, slot3) = match rewrite_first_insn(orig, orig_pc) {
             Some(v) => v,
             None => {
                 skipped_rewrite += 1;
@@ -337,7 +340,6 @@ pub fn init() {
             slot.add(2).write(0xE59F_F000); // LDR PC, [pc, #0] → slot[4]
             slot.add(3).write(slot3.swap_bytes());
             slot.add(4).write(orig_pc.wrapping_add(4).swap_bytes());
-            let _ = sets_pc;
 
             rom_base.add(word_index).write(b_insn);
         }
@@ -408,10 +410,9 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
         return;
     }
 
-    let seq = unsafe {
-        TRACE_SEQ = TRACE_SEQ.wrapping_add(1);
-        TRACE_SEQ
-    };
+    let seq = TRACE_SEQ
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        .wrapping_add(1);
     let mode = spsr & 0x1F;
     let mode_label = match mode {
         0x10 => "usr", 0x11 => "fiq", 0x12 => "irq", 0x13 => "svc",
@@ -453,75 +454,12 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
         );
     }
 
-    // Heap-allocator call log: every call to NewPtr/NewHandle/NewBlock/
-    // NewIndirectBlock/operator-new gets a numbered line so we can diff
-    // the allocation sequence against EinsteinProbe's identical trace.
-    let alloc_name = match fa {
-        0x0014_1538 => Some("NewHandle"),
-        0x0014_2b28 => Some("NewPtr"),
-        0x0031_1db8 => Some("NewBlock"),
-        0x0031_20bc => Some("NewIndirectBlock"),
-        0x0031_8ee8 => Some("__nw__FUi"),
-        _ => None,
-    };
-    if let Some(an) = alloc_name {
-        static ALLOC_SEQ: core::sync::atomic::AtomicU64 =
-            core::sync::atomic::AtomicU64::new(0);
-        let seq = ALLOC_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        kprintln!(
-            "alloc {:5} {} pc={:#010x} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} lr={:#010x}",
-            seq, an, fa,
-            ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
-            cur_lr
-        );
-    }
-
-    // newt-tripwire (per-trace-event poll): catches the first trace
-    // event after PA 0x0402a250 (= pckm's user stack at sp_usr+8) is
-    // populated with 0x6e657774 ("newt"). Bounds the corruption write
-    // to between this trace event and the previous one. See
-    // INVESTIGATION.md "Currently at — pckm task at sp_usr=0x0cc7a248".
-    {
-        static FIRED: core::sync::atomic::AtomicBool =
-            core::sync::atomic::AtomicBool::new(false);
-        if !FIRED.load(core::sync::atomic::Ordering::Relaxed) {
-            if let Some(v) = crate::guest_endian::guest_read_u32_pa(0x0402_a250) {
-                if v == 0x6e65_7774 {
-                    FIRED.store(true, core::sync::atomic::Ordering::Relaxed);
-                    let v2 = crate::guest_endian::guest_read_u32_pa(0x0402_a254).unwrap_or(0);
-                    kprintln!(
-                        "*** newt-tripwire fired AT trace {} (PA 0x0402a250=0x{:08x} 0x0402a254=0x{:08x})",
-                        seq, v, v2
-                    );
-                    // Verify the suspected alias: VA 0x0cc82250 (where
-                    // TCardMessage::TCardMessage writes "newt"+"cdsv")
-                    // and VA 0x0cc7a250 (pckm's user stack at sp+8).
-                    // Both should walk to PA 0x0402a250 if aliased.
-                    kprintln!("   stage-1 walk for VA 0x0cc82250:");
-                    crate::guest_mem::dump_stage1_walk(0x0cc82250);
-                    kprintln!("   stage-1 walk for VA 0x0cc7a250 (pckm sp+8):");
-                    crate::guest_mem::dump_stage1_walk(0x0cc7a250);
-                }
-            }
-        }
-    }
-
-    // Targeted one-shot-style dumps. Gated on function index to avoid log
-    // spam.
-    if mode == 0x10 {
-        if fa == 0x0025BC14 || fa == 0x0025BBD4 || fa == 0x001F8EAC {
-            // KSRVTask spawn path — dump guest stack so we see env_id /
-            // name / priority stack args passed to TUTask::Init /
-            // FMNewStack.
-            dump_guest_stack(cur_sp, 8);
-        }
-    }
-
     // SVC-mode SP-watch hook: on every entry into a listed function
     // running in SVC mode, emit `@<name> SP_svc=… LR_svc=…` so you can
     // track stack high-water and call-chain across an investigation.
     // Watchlist intentionally empty — add `0xPC` literals here during
-    // a stall hunt, recompile, and the lines fire on each entry.
+    // a stall hunt, recompile, and the lines fire on each entry. This
+    // is the documented extension point for targeted probing.
     if mode == 0x13 {
         const SVC_WATCH: &[u32] = &[];
         if SVC_WATCH.contains(&fa) {
@@ -530,202 +468,6 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
                 fn_name(idx), cur_sp, cur_lr,
             );
         }
-    }
-
-    // USR-mode SMemCopyToSharedSWI entry: the Phase-B stall is here.
-    // Dump SP, LR, and the stage-1 mappings around SP so we can see
-    // which USR stack pages are actually backed. One-shot to avoid
-    // flooding if we ever get past the stall and re-enter.
-    if fa == 0x003AE3DC && mode == 0x10 {
-        static DONE: core::sync::atomic::AtomicBool =
-            core::sync::atomic::AtomicBool::new(false);
-        if !DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
-            let sp = cur_sp;
-            let lr = cur_lr;
-            kprintln!(
-                "  @SMemCopyToSharedSWI entry: SP={:#010x} LR={:#010x}",
-                sp, lr
-            );
-            // Walk the USR task's TT for every 4-KiB slot in
-            // 0x0c000000..0x0c010000 so we see the actual stack layout.
-            let ttbr: u64;
-            unsafe {
-                core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr,
-                    options(nomem, nostack, preserves_flags));
-            }
-            let l1_base = (ttbr & 0xFFFF_C000) as u32;
-            let l1_c0 = crate::guest_endian::guest_read_u32_pa(l1_base + 0xC0 * 4).unwrap_or(0);
-            kprintln!(
-                "  L1[0xC0] @ {:#010x} = {:#010x}",
-                l1_base + 0xC0 * 4, l1_c0
-            );
-            if (l1_c0 & 3) == 1 {
-                let l2_pa = l1_c0 & 0xFFFF_FC00;
-                kprintln!("  L2 for 0x0c000000..0x0c010000 (coarse table @ PA {:#010x}):", l2_pa);
-                for i in 0..16u32 {
-                    let e = crate::guest_endian::guest_read_u32_pa(l2_pa + i * 4).unwrap_or(0);
-                    let va = 0x0c000000u32 + i * 0x1000;
-                    let kind = match e & 3 {
-                        0 => "fault",
-                        1 => "large",
-                        2 | 3 => "small",
-                        _ => unreachable!(),
-                    };
-                    let pa = if (e & 3) == 1 { e & 0xFFFF_0000 }
-                             else if (e & 3) != 0 { e & 0xFFFF_F000 }
-                             else { 0 };
-                    kprintln!(
-                        "    L2[{:#04x}] VA={:#010x} raw={:#010x} ({}) -> PA {:#010x}",
-                        i, va, e, kind, pa
-                    );
-                }
-            }
-        }
-    }
-    if fa == 0x0011D254 {
-        // PrimGetEnvDomainName (kernel-side). We want to observe both
-        // the env-config table source AND the byte-level state of the
-        // fKernelParams buffer the kernel will read/write. One-shot.
-        static DONE: core::sync::atomic::AtomicBool =
-            core::sync::atomic::AtomicBool::new(false);
-        if !DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
-            dump_env_config_table();
-            dump_param_buffer(ctx.x[2] as u32, ctx.x[3] as u32);
-        }
-    }
-    if fa == 0x0011D7B8 {
-        // USR-side MemObjManager::GetEnvDomainName entry. One-shot.
-        static DONE: core::sync::atomic::AtomicBool =
-            core::sync::atomic::AtomicBool::new(false);
-        if !DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
-            let gcg = crate::guest_endian::guest_read_u32_va(0x0c10105c).unwrap_or(0);
-            let r8 = gcg.wrapping_sub(0x54);
-            kprintln!("  USR GetEnvDomainName entry: gCurrentGlobals={:#010x} r8={:#010x}",
-                      gcg, r8);
-        }
-    }
-    // MoveFreeBlock — the heap-block walker that Einstein observes
-    // taking a stack-fault on `name` task at trace ~147 500. Our
-    // equivalent call (same args r0=0x0c2041e0 r1=0x20) returns
-    // normally without a fault, so the divergence is in stack-page
-    // mapping state at the moment of the SP-relative store. Dump
-    // SP_usr / LR_usr, the stage-1 walks for the SP-covering pages,
-    // and the existing stack-frame contents so we can correlate
-    // against Einstein's fault PC. Filter on the specific signature
-    // to avoid logging the 423 other MoveFreeBlock calls.
-    if fa == 0x003121AC && mode == 0x10
-        && ctx.x[0] as u32 == 0x0c204_1e0 && ctx.x[1] as u32 == 0x20
-    {
-        static DONE: core::sync::atomic::AtomicBool =
-            core::sync::atomic::AtomicBool::new(false);
-        if !DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
-            dump_movefreeblock_entry(cur_sp, cur_lr, ctx);
-        }
-    }
-    if fa == 0x0011D544 {
-        // First RegisterEnvironmentId — this runs right after USR
-        // GetEnvDomainName wrapper returns. Dump the fParams buffer
-        // via the LIVE TTBR0 (not the hardcoded 0x04000000 in
-        // guest_mem::translate_va) so we see whatever the current task
-        // actually has mapped at VA 0x0c111d0c.
-        static DONE: core::sync::atomic::AtomicBool =
-            core::sync::atomic::AtomicBool::new(false);
-        if !DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
-            let ttbr: u64;
-            let sctlr: u64;
-            unsafe {
-                core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr,
-                    options(nomem, nostack, preserves_flags));
-                core::arch::asm!("mrs {}, sctlr_el1", out(reg) sctlr,
-                    options(nomem, nostack, preserves_flags));
-            }
-            let gcg = crate::guest_endian::guest_read_u32_va(0x0c10105c).unwrap_or(0);
-            kprintln!("  @RegisterEnvironmentId: TTBR0_EL1={:#x} SCTLR.M={} gCurrentGlobals={:#010x}",
-                      ttbr, sctlr & 1, gcg);
-            let fparams = 0x0c111d0cu32;
-            for off in [0x00u32, 0x04, 0x08, 0x0C, 0x10] {
-                let addr = fparams.wrapping_add(off);
-                let word = crate::guest_endian::guest_read_u32_va(addr).unwrap_or(0xDEADBEEF);
-                kprintln!("    [{:#010x}] = {:#010x}", addr, word);
-            }
-        }
-    }
-    let _ = cpu::halt; // suppress unused-import warning under some cfgs
-}
-
-/// Dump the env-config table source that the kernel's PrimGetEnvDomainName
-/// reads. The kernel's InitCGlobals / PostCGlobalsHWInit selects either the
-/// "small" table (0x0c1011bc, ≤1 MiB RAM) or the "large" table (0x0c1012ac,
-/// >1 MiB RAM) based on GetRamSize; the selected ROM-resident table pointer
-/// lands in *(0x0c1011b8). BuildMemObjDatabase copies entries out of that
-/// table into the runtime memobj database. Dumping both the selector value
-/// and the first few entries helps localize an init-time divergence.
-/// Dump 32 bytes around a kernel-params buffer address to see what byte
-/// value the kernel actually sees in the flag slot. PrimGetEnvDomainName
-/// receives r2 = &fParams[domain_name_out] and r3 = &fParams[byte_flag_out].
-/// We print both regions so we can compare against what the USR wrapper
-/// will read via LDRB offset+13.
-fn dump_param_buffer(r2: u32, r3: u32) {
-    kprintln!("  param buffers: r2={:#010x} r3={:#010x} delta={}",
-              r2, r3, r3 as i64 - r2 as i64);
-    for (label, addr) in [("r2", r2), ("r3", r3)] {
-        if addr == 0 { continue; }
-        let base = addr & !0x1F;  // round down to 32-byte line
-        let mut buf = [0u32; 8];
-        for i in 0..8 {
-            buf[i] = crate::guest_endian::guest_read_u32_va(base.wrapping_add((i as u32) * 4))
-                .unwrap_or(0xDEAD_BEEF);
-        }
-        kprintln!(
-            "  buf({}) @{:#010x}: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
-            label, base, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]
-        );
-    }
-}
-
-fn dump_env_config_table() {
-    // PrimGetEnvDomainName's lookup: iterate `*(0x0c10143c + idx*24)` treating
-    // each 24-byte row as (env_name, ?, ?, ?, list_ptr, list_ptr2). When env
-    // matches, dereference field +16 to get a pointer to a NUL-terminated 4cc
-    // list of domain names.
-    let base = 0x0c10143cu32;
-    let mut buf = [0u32; 96];
-    for i in 0..96 {
-        buf[i] = crate::guest_endian::guest_read_u32_va(base.wrapping_add((i as u32) * 4))
-            .unwrap_or(0xDEAD_BEEF);
-    }
-    kprintln!("  env_config: flat table at {:#010x}:", base);
-    for row in 0..8 {
-        let addr = base.wrapping_add((row as u32) * 24);
-        let off = (row * 24) / 4;
-        if off + 5 >= buf.len() { break; }
-        kprintln!(
-            "  [{:#010x}] env={:08x} d0={:08x} d1={:08x} d2={:08x} list={:08x} list2={:08x}",
-            addr, buf[off], buf[off+1], buf[off+2], buf[off+3], buf[off+4], buf[off+5],
-        );
-    }
-
-    // Now dereference each entry's list pointer (field +16) and dump the
-    // domain-name list until we hit a zero terminator. Limit per-list dump
-    // to avoid runaway reads.
-    for row in 0..8 {
-        let off = (row * 24) / 4;
-        if off + 4 >= buf.len() { break; }
-        let env = buf[off];
-        let list_ptr = buf[off + 4];
-        if env == 0 || list_ptr == 0 || list_ptr == 0xDEAD_BEEF { continue; }
-        let mut names = [0u32; 10];
-        for i in 0..10 {
-            names[i] = crate::guest_endian::guest_read_u32_va(list_ptr.wrapping_add((i as u32) * 4))
-                .unwrap_or(0);
-            if names[i] == 0 { break; }
-        }
-        kprintln!(
-            "  env {:#010x} list@{:#010x}: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
-            env, list_ptr,
-            names[0], names[1], names[2], names[3],
-            names[4], names[5], names[6], names[7],
-        );
     }
 }
 
@@ -774,103 +516,6 @@ fn buffer_putc_char(ch: u32, lr: u32, seq: u32) {
             LEN = 0;
         }
     }
-}
-
-/// One-shot dump at the entry of `MoveFreeBlock(0x0c2041e0, 0x20)` —
-/// the call that faults on Einstein's `name` task and returns normally
-/// on ours. Captures SP_usr / LR_usr, walks stage-1 for several pages
-/// straddling SP (so we can see whether the pages immediately below
-/// SP are mapped or fault), dumps the existing stack frame contents,
-/// and prints the live TTBR0 / SCTLR.
-fn dump_movefreeblock_entry(sp: u32, lr: u32, ctx: &TrapContext) {
-    let ttbr: u64;
-    let sctlr: u64;
-    let dacr: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr,
-            options(nomem, nostack, preserves_flags));
-        core::arch::asm!("mrs {}, sctlr_el1", out(reg) sctlr,
-            options(nomem, nostack, preserves_flags));
-        // DACR32_EL2 mirrors AArch32 DACR.
-        core::arch::asm!("mrs {}, dacr32_el2", out(reg) dacr,
-            options(nomem, nostack, preserves_flags));
-    }
-    kprintln!(
-        "  @MoveFreeBlock[name]: SP={:#010x} LR={:#010x} TTBR0={:#x} SCTLR.M={} DACR={:#010x}",
-        sp, lr, ttbr, sctlr & 1, dacr as u32,
-    );
-    // Decode DACR: 16 × 2-bit fields. 00=fault, 01=client, 11=manager.
-    {
-        let d = dacr as u32;
-        kprintln!(
-            "  DACR domains:  D0={} D1={} D2={} D3={} D4={} D5={} D6={} D7={}",
-            (d >> 0) & 3, (d >> 2) & 3, (d >> 4) & 3, (d >> 6) & 3,
-            (d >> 8) & 3, (d >> 10) & 3, (d >> 12) & 3, (d >> 14) & 3,
-        );
-        kprintln!(
-            "                 D8={} D9={} D10={} D11={} D12={} D13={} D14={} D15={}",
-            (d >> 16) & 3, (d >> 18) & 3, (d >> 20) & 3, (d >> 22) & 3,
-            (d >> 24) & 3, (d >> 26) & 3, (d >> 28) & 3, (d >> 30) & 3,
-        );
-    }
-    kprintln!(
-        "  ctx: r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x}",
-        ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
-        ctx.x[4] as u32, ctx.x[5] as u32, ctx.x[6] as u32, ctx.x[7] as u32,
-    );
-    kprintln!(
-        "  ctx: r8={:#010x} r9={:#010x} r10={:#010x} r11={:#010x} r12={:#010x}",
-        ctx.x[8] as u32, ctx.x[9] as u32, ctx.x[10] as u32, ctx.x[11] as u32,
-        ctx.x[12] as u32,
-    );
-
-    // Stage-1 walks at SP and 8 pages above + below — we want to see
-    // exactly where the mapped→fault boundary is around the current
-    // SP. Newton stack pages grow DOWN, so the fault page (if any)
-    // sits below SP at some 4 KiB offset.
-    let sp_page = sp & !0xFFFu32;
-    kprintln!("  stage-1 walks around SP (page-aligned base {:#010x}):", sp_page);
-    for delta_pages in (-8i32..=8).rev() {
-        let va = sp_page.wrapping_add((delta_pages as u32).wrapping_mul(0x1000));
-        // Print only every 4 KiB; dump_stage1_walk handles its own
-        // formatting and emits multiple lines per call.
-        kprintln!("  [SP{:+}*0x1000] VA={:#010x}", delta_pages, va);
-        guest_mem::dump_stage1_walk(va);
-    }
-
-    // Dump the existing stack frame contents — 64 words above SP
-    // (= existing frame data — already pushed by callers / parent
-    // frames). 32 words below SP show what's about to be touched.
-    kprintln!("  stack contents around SP:");
-    for off in [-32i32, -16, -8, 0, 8, 16, 32, 48].iter().copied() {
-        let addr = sp.wrapping_add((off as u32).wrapping_mul(4));
-        dump_guest_stack(addr, 8);
-    }
-}
-
-fn dump_guest_stack(sp: u32, words: usize) {
-    if sp == 0 {
-        kprintln!("  stack dump: sp=0 (banked SP not plumbed)");
-        return;
-    }
-    // Gather into a small fixed-size array so we can print as one line.
-    let mut buf = [0u32; 8];
-    let n = words.min(8);
-    let mut got_any = false;
-    for i in 0..n {
-        match crate::guest_endian::guest_read_u32_va(sp.wrapping_add((i as u32) * 4)) {
-            Some(v) => { buf[i] = v; got_any = true; }
-            None => { buf[i] = 0xDEAD_BEEF; }
-        }
-    }
-    if !got_any {
-        kprintln!("  stack dump @sp={:#010x}: all translations failed", sp);
-        return;
-    }
-    kprintln!(
-        "  stack @sp={:#010x}: {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}",
-        sp, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]
-    );
 }
 
 // (The trampoline-slot[0] instruction encoding is `HvcImm::Trace.insn()`;

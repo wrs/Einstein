@@ -710,14 +710,6 @@ fn dump_blocked_pcs() {
                         let r1 = rd(node + 0x14).unwrap_or(0);
                         dump_oplist(r0, r1, "      ");
                     }
-                    if n0 == b'n' && n1 == b'e' && n2 == b'w' && n3 == b't' {
-                        kprintln!("      newt user-stack window (sp_usr +0x00..+0x80):");
-                        for i in 0..32u32 {
-                            let va = sp_usr.wrapping_add(i * 4);
-                            let v = rd(va).unwrap_or(u32::MAX);
-                            kprintln!("        [+{:#04x}] @{:#010x} = {:#010x}", i*4, va, v);
-                        }
-                    }
                 }
             }
             node = match rd(node + 4) { Some(v) => v, None => break };
@@ -894,6 +886,10 @@ fn find_semaphore_owner(sema_va: u32) {
 ///   +0x44 sp_usr   +0x48 lr_usr
 ///   +0x4c saved-pc (LR_svc at SWI tail; becomes target of `movs pc, lr`)
 ///   +0x50 saved-SPSR (CPSR to restore via `msr SPSR_fc` then `movs`)
+///
+/// Generic introspection helper kept for gdb / future probes; no
+/// in-tree caller after the named-task lookup it backed was removed.
+#[allow(dead_code)]
 pub fn dump_save_area(label: &str, task_va: u32) {
     let id   = rd(task_va).unwrap_or(u32::MAX);
     let glob = rd(task_va + TT_GLOBALS).unwrap_or(u32::MAX);
@@ -935,22 +931,14 @@ pub fn dump_save_area(label: &str, task_va: u32) {
         }
         kprintln!("    stage-1 walk for sp_usr:");
         crate::guest_mem::dump_stage1_walk(sp_usr);
-        // Also walk a few aliasing-suspect VAs: any AEInstallHandler
-        // we registered with class/signal pairs lands signal at +8 and
-        // class at +12 of its TAEventHandler. If our user stack at
-        // sp_usr+8/+12 contains 'newt'/'cdsv', the suspect handler is
-        // at VA 0x0c602e2c (per trace 183155). If those VAs walk to
-        // the same PA as sp_usr → confirmed stage-1 alias.
-        kprintln!("    stage-1 walk for 0x0c602e2c (suspected alias):");
-        crate::guest_mem::dump_stage1_walk(0x0c602e2c);
     }
 }
 
-/// One-shot diagnostic: dump the SWIBoot save area for every task
-/// in the object table whose fTaskName matches `name_match` (4-char
-/// ASCII; `?` = wildcard byte). Plus the current task. Useful when
-/// chasing per-task corruption: at the moment the "newt" DABT fires
-/// we want to see all tasks named 'cdsv'.
+/// Dump the SWIBoot save area for every task in the object table
+/// whose fTaskName matches `name_match` (4-char ASCII; `?` = wildcard
+/// byte), plus the current task. Generic per-task-corruption probe
+/// kept for gdb / future hunts; no in-tree caller today.
+#[allow(dead_code)]
 pub fn dump_save_area_for_named(name_match: &[u8; 4]) {
     let curr = rd(G_CURRENT_TASK).unwrap_or(0);
     if curr != 0 {
@@ -1205,11 +1193,6 @@ pub fn dump_full() {
     dump_all_ports();
     dump_all_monitors();
     dump_all_phys();
-    // The Phase B "newt-DABT" investigation needs to know which TPhys
-    // descriptors claim PA 0x0402a000 (the page that aliases pckm's
-    // stack). Print them explicitly so the comparison against Einstein
-    // is a simple grep.
-    dump_phys_for_pa(0x0402_a000);
     crate::peripherals::serial::dump_dropped_tx();
     kprintln!("=== kdump::dump_full end ===");
 }
@@ -1319,35 +1302,6 @@ pub fn dump_all_phys() {
 
     kprintln!("=== {} phys total (TblA={}, TblB={}, gObjectTable={}) ===",
         count_a + count_b + count_g, count_a, count_b, count_g);
-}
-
-/// Dump every TPhys whose PA matches `target_pa`, walking all three
-/// kernel object tables. Stronger signal than `dump_all_phys` for the
-/// alias question: if more than one entry prints, the kernel has
-/// multiple TPhys descriptors for the same physical page.
-pub fn dump_phys_for_pa(target_pa: u32) {
-    kprintln!("=== phys with PA={:#x} (across all three tables) ===", target_pa);
-    let mut count = 0u32;
-    let mut report = |va: u32, _id: u32| {
-        let state = rd(va + 0x10).unwrap_or(0);
-        if (state & 0xffff_f000) == target_pa {
-            dump_phys(va);
-            count += 1;
-        }
-    };
-
-    let table_a = read_object_table_ptr(0x0c10_1164);
-    let table_b = read_object_table_ptr(0x0c10_0fc8);
-
-    if table_a != 0 && table_a != u32::MAX {
-        for_each_in_table(table_a, OBJ_TYPE_PHYS, |va, id| report(va, id));
-    }
-    if table_b != 0 && table_b != u32::MAX && table_b != table_a {
-        for_each_in_table(table_b, OBJ_TYPE_PHYS, |va, id| report(va, id));
-    }
-    for_each_object_of_kind(OBJ_TYPE_PHYS, |va, id| report(va, id));
-
-    kprintln!("=== {} TPhys descriptors map PA={:#x} ===", count, target_pa);
 }
 
 /// Heartbeat-rate dump trigger. Returns true on the firing iterations.

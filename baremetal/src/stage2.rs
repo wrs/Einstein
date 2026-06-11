@@ -487,23 +487,6 @@ unsafe fn install_scratch_pool() {
         unsafe { l3_ptr.add(l3_index_base + i).write(entry); }
     }
 
-    // Map the shadow pool (`shadow_pool::SHADOW_POOL`) right after the
-    // scratch pool — same 2 MiB block, just different L3 slot range.
-    // The pool backs alias-redirected pages; see `src/shadow_pool.rs`.
-    let shadow_pa = crate::shadow_pool::host_pa();
-    let shadow_ipa = crate::shadow_pool::SHADOW_POOL_IPA as u64;
-    let shadow_pages = crate::shadow_pool::SHADOW_POOL_SIZE / 0x1000;
-    let shadow_l3_base = ((shadow_ipa - l3_base_ipa) / 0x1000) as usize;
-    debug_assert!(
-        shadow_l3_base + shadow_pages <= 512,
-        "shadow pool overflows the scratch L2 block",
-    );
-    for i in 0..shadow_pages {
-        let entry = (shadow_pa + (i as u64) * 0x1000) | PAGE_NORMAL_RW;
-        // SAFETY: shadow_l3_base + i < 512 (debug_assert above).
-        unsafe { l3_ptr.add(shadow_l3_base + i).write(entry); }
-    }
-
     // Replace the L2 slot with a table descriptor pointing at the L3.
     let l2_ptr = addr_of_mut!(S2_L2) as *mut u64;
     let l3_phys = l3_ptr as u64;
@@ -517,14 +500,6 @@ unsafe fn install_scratch_pool() {
             + crate::shadow_stub::SCRATCH_POOL_SIZE as u32,
         pool_pa,
         crate::shadow_stub::SCRATCH_POOL_SIZE / 1024,
-    );
-    kprintln!(
-        "stage2: alias-redirect shadow pool @ IPA {:#x}..{:#x} -> host PA {:#x} (RW, {} KiB)",
-        crate::shadow_pool::SHADOW_POOL_IPA,
-        crate::shadow_pool::SHADOW_POOL_IPA
-            + crate::shadow_pool::SHADOW_POOL_SIZE as u32,
-        shadow_pa,
-        crate::shadow_pool::SHADOW_POOL_SIZE / 1024,
     );
 }
 

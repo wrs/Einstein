@@ -55,12 +55,6 @@ pub fn handle_align_fault(ctx: &mut TrapContext) {
     // logging would drown the console. (The undecodable/unreadable cases
     // below halt loudly regardless of this budget.)
     const LOG_FIRST: u32 = 40;
-    // iter-85: tarmac window is now bracketed by the FPE-entry probe
-    // (open) and the unrecognised-UND halt (close). The first-alignment-
-    // fault stop trigger from the iter-78 investigation would close
-    // the window way before the FPE call we want to trace, so it's
-    // disabled. Re-enable when the active investigation changes.
-    let _ = n; // tarmac::emit_stop() suppressed for iter-85
 
     // Recover pre-abt R0 / R1 from TPIDR scratch regs.
     let orig_r0: u64;

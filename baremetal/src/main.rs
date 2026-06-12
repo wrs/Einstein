@@ -5,6 +5,7 @@
 #[cfg(not(test))]
 use core::arch::global_asm;
 
+mod aarch32_emit;
 mod arm_decode;
 mod audio;
 mod banked;
@@ -18,6 +19,7 @@ mod guest_bp;
 mod guest_endian;
 mod guest_mem;
 mod guest_regions;
+mod guest_trampolines;
 mod heap_check;
 mod host_dma;
 mod host_io;

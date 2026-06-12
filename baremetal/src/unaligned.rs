@@ -95,13 +95,13 @@ pub fn handle_align_fault(ctx: &mut TrapContext) {
     // bit) — a fabricated value would resume the guest in the wrong
     // mode, so an unreadable slot is a halt, not a default.
     let spsr_abt_save = match crate::guest_endian::guest_read_u32_pa(
-        crate::guest_mem::DABT_SAVE_PA + 0x08,
+        crate::guest_trampolines::DABT_SAVE_PA + 0x08,
     ) {
         Some(v) => v,
         None => {
             kprintln!(
                 "*** unaligned: DABT_SAVE SPSR slot @{:#x} unreadable (LR_abt={:#010x}) ***",
-                crate::guest_mem::DABT_SAVE_PA + 0x08, lr_abt,
+                crate::guest_trampolines::DABT_SAVE_PA + 0x08, lr_abt,
             );
             crate::cpu::halt();
         }

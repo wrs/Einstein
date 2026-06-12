@@ -108,9 +108,15 @@ fn alloc_patch_stub(n_words: usize, name: &'static str) -> u32 {
 }
 
 /// A single word-write patch against the main ROM (IPA 0..0x00800000).
+///
+/// `orig` is the guest-numerical word the site must currently hold (the
+/// value `scripts/disasm-out/rom.dis` prints) — `install_patch` verifies
+/// it and halts loudly on mismatch. The code-vs-data storage decision is
+/// driven off the classifier bitmap (`rom_word_is_code`) at install time.
 #[derive(Copy, Clone)]
 struct RomPatch {
     offset: u32,
+    orig:   u32,
     value:  u32,
     name:   &'static str,
 }
@@ -126,16 +132,16 @@ struct RomPatch {
 ///   - `gNewtConfig` combines `kEnableListener (0x2)`,
 ///     `kDefaultStdioOn (0x200)`, `kEnableStdout (0x8000)`.
 const PATCHES_717006: &[RomPatch] = &[
-    RomPatch { offset: 0x0000_13F4, value: 0x0000_0001, name: "gDebugger patch" },
-    RomPatch { offset: 0x0000_13FC, value: 0x0000_8202, name: "gNewtConfig patch" },
-    RomPatch { offset: 0x0008_A20C, value: 0xE1A0_F00E, name: "Ignore setting time" },
-    RomPatch { offset: 0x000D_B0D8, value: 0xE3A0_0000, name: "BeaconDetect (1/2)" },
-    RomPatch { offset: 0x000D_B0DC, value: 0xE1A0_F00E, name: "BeaconDetect (2/2)" },
-    RomPatch { offset: 0x0014_12F8, value: 0xEA00_0009, name: "Avoid screen calibration" },
-    RomPatch { offset: 0x0030_F088, value: 0xC3A5_1800, name: "Time base (4/4)" },
-    RomPatch { offset: 0x0042_0750, value: 0x0D09_5000, name: "Time base (1/4)" },
-    RomPatch { offset: 0x0042_0798, value: 0x0D09_5000, name: "Time base (2/4)" },
-    RomPatch { offset: 0x004D_CA14, value: 0x0D09_5000, name: "Time base (3/4)" },
+    RomPatch { offset: 0x0000_13F4, orig: 0x0000_0040, value: 0x0000_0001, name: "gDebugger patch" },
+    RomPatch { offset: 0x0000_13FC, orig: 0x0000_0000, value: 0x0000_8202, name: "gNewtConfig patch" },
+    RomPatch { offset: 0x0008_A20C, orig: 0xE1A0_C00D, value: 0xE1A0_F00E, name: "Ignore setting time" },
+    RomPatch { offset: 0x000D_B0D8, orig: 0xE1A0_C00D, value: 0xE3A0_0000, name: "BeaconDetect (1/2)" },
+    RomPatch { offset: 0x000D_B0DC, orig: 0xE92D_D9F0, value: 0xE1A0_F00E, name: "BeaconDetect (2/2)" },
+    RomPatch { offset: 0x0014_12F8, orig: 0x0A00_0002, value: 0xEA00_0009, name: "Avoid screen calibration" },
+    RomPatch { offset: 0x0030_F088, orig: 0xA769_3A00, value: 0xC3A5_1800, name: "Time base (4/4)" },
+    RomPatch { offset: 0x0042_0750, orig: 0x0B29_2600, value: 0x0D09_5000, name: "Time base (1/4)" },
+    RomPatch { offset: 0x0042_0798, orig: 0x0B29_2600, value: 0x0D09_5000, name: "Time base (2/4)" },
+    RomPatch { offset: 0x004D_CA14, orig: 0x0B29_2600, value: 0x0D09_5000, name: "Time base (3/4)" },
     // GetClock / SetAlarm 32-bit-wrap detection: replace `addls`
     // (less-or-equal) with `addcc` (strictly-less) so the kernel
     // doesn't treat *equal* successive tick-register reads as a wrap
@@ -148,9 +154,9 @@ const PATCHES_717006: &[RomPatch] = &[
     // See INVESTIGATION.md "alarm-loop wedge from spurious wrap
     // detection". Encoding: cond field [31:28] LS=9 → CC=3; the rest
     // of the instruction (`add Rn, Rn, #1`) is unchanged.
-    RomPatch { offset: 0x003A_D430, value: 0x3281_1001, name: "GetClock wrap-detect ls→cc" },
-    RomPatch { offset: 0x003A_D46C, value: 0x3282_2001, name: "SetAlarm wrap-detect (1/2) ls→cc" },
-    RomPatch { offset: 0x003A_D49C, value: 0x3282_2001, name: "SetAlarm wrap-detect (2/2) ls→cc" },
+    RomPatch { offset: 0x003A_D430, orig: 0x9281_1001, value: 0x3281_1001, name: "GetClock wrap-detect ls→cc" },
+    RomPatch { offset: 0x003A_D46C, orig: 0x9282_2001, value: 0x3282_2001, name: "SetAlarm wrap-detect (1/2) ls→cc" },
+    RomPatch { offset: 0x003A_D49C, orig: 0x9282_2001, value: 0x3282_2001, name: "SetAlarm wrap-detect (2/2) ls→cc" },
     // SWIBoot's second instruction-as-data LDR at 0x003ad738 is
     // patched separately, in `apply_fault_handler_ldr_byteswap_patches`,
     // as a B-to-stub. Iter-102 had this as `mov r1, r0` on the
@@ -186,7 +192,7 @@ const PATCHES_717006: &[RomPatch] = &[
     //     (e), op=1110_0011_1010 (3a), SBZ=0000, Rd=0110 (6),
     //     immediate12 = 0xa01 (= imm8=0x01, rot=0xa → ROR(0x01, 20)
     //     = 0x1000 = 4096).
-    RomPatch { offset: 0x0031_0E38, value: 0xE3A0_6A01, name: "NewHeap: force chunk_size=4096" },
+    RomPatch { offset: 0x0031_0E38, orig: 0xE1A0_6002, value: 0xE3A0_6A01, name: "NewHeap: force chunk_size=4096" },
     // (2) `NewVMHeap` 0x001423A0 originally `beq 0x001423C0`
     //     (`0x0A00_0006`) skips the 4-KiB-init path when the
     //     `kFlagAllocateInPages` (bit 30) flag is clear. Replace
@@ -203,7 +209,7 @@ const PATCHES_717006: &[RomPatch] = &[
     //     (50 KiB), which would round up to 52 KiB. NewHeapArea's
     //     internal alignment likely accommodates this; if not,
     //     we'll need a third patch making the addne unconditional.
-    RomPatch { offset: 0x0014_23A0, value: 0xE1A0_0000, name: "NewVMHeap: force 4 KiB init path (nop branch)" },
+    RomPatch { offset: 0x0014_23A0, orig: 0x0A00_0006, value: 0xE1A0_0000, name: "NewVMHeap: force 4 KiB init path (nop branch)" },
     // ZapHeap (0x00142844) builds a heap on top of a heap-area produced
     // by GetHeapAreaInfo. When the caller passes a flag byte of 0
     // (the common case), `0x001428B8 moveq r4, #1024` (`0x03A04B01`)
@@ -222,7 +228,7 @@ const PATCHES_717006: &[RomPatch] = &[
     // flag arm is taken — same value our patch produces). See
     // `docs/STRUCTURES.md` "1-KiB allocator audit" for the full
     // catalogue of 1-KiB sites.
-    RomPatch { offset: 0x0014_28B8, value: 0xE3A0_4A01, name: "ZapHeap: force chunk/lock size = 4096" },
+    RomPatch { offset: 0x0014_28B8, orig: 0x03A0_4B01, value: 0xE3A0_4A01, name: "ZapHeap: force chunk/lock size = 4096" },
     // TStackManager: 4 KiB-only stack/heap allocation.
     //
     // The kernel was compiled for ARMv4, where each L2 PTE for a 4 KiB
@@ -308,23 +314,23 @@ const PATCHES_717006: &[RomPatch] = &[
     // #5`) followed by `lsl #10` to land at `r * 33792`. With the new
     // stride 36864 = 9 * 4096, the same shape becomes `r * 9` (`add
     // r,r,r,lsl #3`) followed by `lsl #12`.
-    RomPatch { offset: 0x001F_8EDC, value: 0xE3A0_7A09, name: "FMNewStack: mov r7, #36864 (clamp value)" },
-    RomPatch { offset: 0x001F_8EF0, value: 0xE240_1A01, name: "FMNewStack: sub r1, r0, #4096 (was 3072; guard 3K → 4K)" },
-    RomPatch { offset: 0x001F_8F18, value: 0xE3A0_0A09, name: "FMNewStack: mov r0, #36864 (udiv divisor, request-addr path)" },
-    RomPatch { offset: 0x001F_8F20, value: 0xE080_0180, name: "FMNewStack: add r0, r0, r0, lsl #3 (was lsl #5; *33 → *9)" },
-    RomPatch { offset: 0x001F_8F24, value: 0xE049_0600, name: "FMNewStack: sub r0, r9, r0, lsl #12 (was lsl #10; *1024 → *4096)" },
-    RomPatch { offset: 0x001F_8F30, value: 0xE280_0A01, name: "FMNewStack: add r0, r0, #4096 (was 3072; maxSize += 4K guard, request-addr path)" },
-    RomPatch { offset: 0x001F_8F38, value: 0xE350_0A09, name: "FMNewStack: cmp r0, #36864 (clamp, request-addr path)" },
-    RomPatch { offset: 0x001F_8F48, value: 0xE3A0_0A09, name: "FMNewStack: mov r0, #36864 (udiv divisor, request-addr path)" },
-    RomPatch { offset: 0x001F_8F5C, value: 0xE3A0_0A09, name: "FMNewStack: mov r0, #36864 (udiv divisor, request-addr path)" },
-    RomPatch { offset: 0x001F_8F88, value: 0xE280_0A01, name: "FMNewStack: add r0, r0, #4096 (was 3072; maxSize += 4K guard, any-addr path)" },
-    RomPatch { offset: 0x001F_8F90, value: 0xE350_0A09, name: "FMNewStack: cmp r0, #36864 (clamp, any-addr path)" },
-    RomPatch { offset: 0x001F_8FA0, value: 0xE3A0_0A09, name: "FMNewStack: mov r0, #36864 (udiv divisor, any-addr path)" },
-    RomPatch { offset: 0x001F_9024, value: 0xE08A_118A, name: "FMNewStack: add r1, sl, sl, lsl #3 (was lsl #5; *33 → *9, top-of-area)" },
-    RomPatch { offset: 0x001F_902C, value: 0xE080_9601, name: "FMNewStack: add r9, r0, r1, lsl #12 (was lsl #10; *1024 → *4096, top-of-area)" },
-    RomPatch { offset: 0x001F_9030, value: 0xE087_0187, name: "FMNewStack: add r0, r7, r7, lsl #3 (was lsl #5; *33 → *9, area-base)" },
-    RomPatch { offset: 0x001F_9034, value: 0xE049_0600, name: "FMNewStack: sub r0, r9, r0, lsl #12 (was lsl #10; *1024 → *4096, area-base)" },
-    RomPatch { offset: 0x001F_9038, value: 0xE280_2A01, name: "FMNewStack: add r2, r0, #4096 (was 3072; bottomOfStack = norm + 4K, page-aligned)" },
+    RomPatch { offset: 0x001F_8EDC, orig: 0xE3A0_7B21, value: 0xE3A0_7A09, name: "FMNewStack: mov r7, #36864 (clamp value)" },
+    RomPatch { offset: 0x001F_8EF0, orig: 0xE240_1B03, value: 0xE240_1A01, name: "FMNewStack: sub r1, r0, #4096 (was 3072; guard 3K → 4K)" },
+    RomPatch { offset: 0x001F_8F18, orig: 0xE3A0_0B21, value: 0xE3A0_0A09, name: "FMNewStack: mov r0, #36864 (udiv divisor, request-addr path)" },
+    RomPatch { offset: 0x001F_8F20, orig: 0xE080_0280, value: 0xE080_0180, name: "FMNewStack: add r0, r0, r0, lsl #3 (was lsl #5; *33 → *9)" },
+    RomPatch { offset: 0x001F_8F24, orig: 0xE049_0500, value: 0xE049_0600, name: "FMNewStack: sub r0, r9, r0, lsl #12 (was lsl #10; *1024 → *4096)" },
+    RomPatch { offset: 0x001F_8F30, orig: 0xE280_0B03, value: 0xE280_0A01, name: "FMNewStack: add r0, r0, #4096 (was 3072; maxSize += 4K guard, request-addr path)" },
+    RomPatch { offset: 0x001F_8F38, orig: 0xE350_0B21, value: 0xE350_0A09, name: "FMNewStack: cmp r0, #36864 (clamp, request-addr path)" },
+    RomPatch { offset: 0x001F_8F48, orig: 0xE3A0_0B21, value: 0xE3A0_0A09, name: "FMNewStack: mov r0, #36864 (udiv divisor, request-addr path)" },
+    RomPatch { offset: 0x001F_8F5C, orig: 0xE3A0_0B21, value: 0xE3A0_0A09, name: "FMNewStack: mov r0, #36864 (udiv divisor, request-addr path)" },
+    RomPatch { offset: 0x001F_8F88, orig: 0xE280_0B03, value: 0xE280_0A01, name: "FMNewStack: add r0, r0, #4096 (was 3072; maxSize += 4K guard, any-addr path)" },
+    RomPatch { offset: 0x001F_8F90, orig: 0xE350_0B21, value: 0xE350_0A09, name: "FMNewStack: cmp r0, #36864 (clamp, any-addr path)" },
+    RomPatch { offset: 0x001F_8FA0, orig: 0xE3A0_0B21, value: 0xE3A0_0A09, name: "FMNewStack: mov r0, #36864 (udiv divisor, any-addr path)" },
+    RomPatch { offset: 0x001F_9024, orig: 0xE08A_128A, value: 0xE08A_118A, name: "FMNewStack: add r1, sl, sl, lsl #3 (was lsl #5; *33 → *9, top-of-area)" },
+    RomPatch { offset: 0x001F_902C, orig: 0xE080_9501, value: 0xE080_9601, name: "FMNewStack: add r9, r0, r1, lsl #12 (was lsl #10; *1024 → *4096, top-of-area)" },
+    RomPatch { offset: 0x001F_9030, orig: 0xE087_0287, value: 0xE087_0187, name: "FMNewStack: add r0, r7, r7, lsl #3 (was lsl #5; *33 → *9, area-base)" },
+    RomPatch { offset: 0x001F_9034, orig: 0xE049_0500, value: 0xE049_0600, name: "FMNewStack: sub r0, r9, r0, lsl #12 (was lsl #10; *1024 → *4096, area-base)" },
+    RomPatch { offset: 0x001F_9038, orig: 0xE280_2B03, value: 0xE280_2A01, name: "FMNewStack: add r2, r0, #4096 (was 3072; bottomOfStack = norm + 4K, page-aligned)" },
 
     // (B) FMNewStack — drop the divide-by-4 in the page-aligned-base
     // formula so the existing two-`add` chain produces
@@ -344,8 +350,8 @@ const PATCHES_717006: &[RomPatch] = &[
     // fourth adds `slot*32768`, total `base + slot*(4096+32768)
     // = base + slot*36864`. Two patches; the existing two `add`
     // instructions provide the multiplication unchanged.
-    RomPatch { offset: 0x001F_9060, value: 0xE1A0_0000, name: "FMNewStack: nop (was addmi r0, r0, #3 — drop /4)" },
-    RomPatch { offset: 0x001F_9064, value: 0xE1A0_0000, name: "FMNewStack: nop (was asr r0, r0, #2 — drop /4)" },
+    RomPatch { offset: 0x001F_9060, orig: 0x4280_0003, value: 0xE1A0_0000, name: "FMNewStack: nop (was addmi r0, r0, #3 — drop /4)" },
+    RomPatch { offset: 0x001F_9064, orig: 0xE1A0_0140, value: 0xE1A0_0000, name: "FMNewStack: nop (was asr r0, r0, #2 — drop /4)" },
 
     // (A continued) Heap-domain helpers — same stride change.
     //
@@ -356,8 +362,8 @@ const PATCHES_717006: &[RomPatch] = &[
     // sized array's index range. The unpatched 33 KiB divisor
     // OVER-sizes the array for the new stride — wasted memory but
     // functionally safe.
-    RomPatch { offset: 0x001F_8E1C, value: 0xE3A0_0A09, name: "THeapDomain::GetStackInfo: mov r0, #36864 (slot-index divisor)" },
-    RomPatch { offset: 0x001F_918C, value: 0xE3A0_0A09, name: "FMFree: mov r0, #36864 (slot-index divisor)" },
+    RomPatch { offset: 0x001F_8E1C, orig: 0xE3A0_0B21, value: 0xE3A0_0A09, name: "THeapDomain::GetStackInfo: mov r0, #36864 (slot-index divisor)" },
+    RomPatch { offset: 0x001F_918C, orig: 0xE3A0_0B21, value: 0xE3A0_0A09, name: "FMFree: mov r0, #36864 (slot-index divisor)" },
 
     // (C) ResolveFault — every fault claims the whole 4 KiB page.
     //
@@ -377,8 +383,8 @@ const PATCHES_717006: &[RomPatch] = &[
     // `subIdx` is left valid downstream so the sub-page lock-count
     // tail still records the right index for FMLockHeapRange's
     // per-1-KiB lock loop.
-    RomPatch { offset: 0x001F_7A0C, value: 0xE3A0_000F, name: "ResolveFault: mov r0, #15 (whole-page bitmap)" },
-    RomPatch { offset: 0x001F_7A10, value: 0xE1A0_3000, name: "ResolveFault: mov r3, r0 (drop sub-idx shift)" },
+    RomPatch { offset: 0x001F_7A0C, orig: 0xE3A0_0001, value: 0xE3A0_000F, name: "ResolveFault: mov r0, #15 (whole-page bitmap)" },
+    RomPatch { offset: 0x001F_7A10, orig: 0xE1A0_3810, value: 0xE1A0_3000, name: "ResolveFault: mov r3, r0 (drop sub-idx shift)" },
 ];
 
 // (HVC immediates live in `crate::hvc_imm::HvcImm`.)
@@ -608,20 +614,123 @@ const FPE_LDR_NE_PC:        u32 = 0x0038_D934;
 const FPE_LDR_NE_ORIG_INSN: u32 = 0x1599_B000; // ldrne  fp, [r9]
 const FPE_LDR_RESUME_PC:    u32 = 0x0038_D938;
 
-/// Small helper to emit an ARM `B target` at `src_pc`.
-const fn arm_b(src_pc: u32, target: u32) -> u32 {
-    let off_bytes = target.wrapping_sub(src_pc.wrapping_add(8)) as i32;
-    let off_words = (off_bytes / 4) as u32;
-    0xEA00_0000 | (off_words & 0x00FF_FFFF)
+use crate::aarch32_emit::{b as arm_b, b_cond as arm_b_cond};
+
+// ============================================================================
+// Unified patch installer
+// ============================================================================
+//
+// Every code-word overwrite against the ROM backing goes through
+// `install_patch`. It folds the three install conventions that used to
+// coexist (verify-and-skip, verify-and-bail, blind-overwrite) into one
+// policy: verify the expected original word and LOUD HALT on mismatch,
+// record the original into the shadow-stub side table, and write the new
+// word(s) in the correct endianness for their kind. The post-load
+// whole-ROM `icache_publish_range` sweep in `load_newton_rom` publishes
+// every patched byte to the PoU, so the installer itself does no cache
+// maintenance — every caller runs strictly before that sweep.
+//
+// "Expected original" and the replacement `words` are always expressed in
+// guest-numerical form — exactly the value `scripts/disasm-out/rom.dis`
+// prints in its second column. The kind selects the storage endianness:
+// `Code` words are stored native (the CPU fetches LE; a native u32 write
+// of the numerical encoding is what it decodes), `Data` words are stored
+// byteswapped so a BE-8 guest `LDR` reads back the numerical value.
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum WordKind {
+    /// ARM instruction encoding — stored native-LE, recorded for the
+    /// shadow-stub liveness analyser.
+    Code,
+    /// Literal data word — stored byteswapped for a BE-8 guest load.
+    Data,
 }
 
-/// Same as `arm_b` but with an explicit ARM condition field in the
-/// high nibble (e.g. `0x0` for EQ, `0x1` for NE). The condition
-/// replaces the AL=0xE that `arm_b` hard-codes.
-const fn arm_b_cond(src_pc: u32, target: u32, cond: u32) -> u32 {
-    let off_bytes = target.wrapping_sub(src_pc.wrapping_add(8)) as i32;
-    let off_words = (off_bytes / 4) as u32;
-    ((cond & 0xF) << 28) | 0x0A00_0000 | (off_words & 0x00FF_FFFF)
+/// Read the current ROM word at `idx` in guest-numerical form (the value
+/// `rom.dis` prints), accounting for the BE-8 storage convention: code
+/// words are stored native, data words are stored byteswapped.
+///
+/// SAFETY: `rom_ptr` must back the full ROM and `idx * 4 + 4 <= ROM_SIZE`.
+unsafe fn read_rom_word_numeric(rom_ptr: *mut u32, idx: usize, kind: WordKind) -> u32 {
+    let raw = unsafe { rom_ptr.add(idx).read() };
+    match kind {
+        WordKind::Code => raw,
+        #[cfg(not(nh_guest_test))]
+        WordKind::Data => raw.swap_bytes(),
+        #[cfg(nh_guest_test)]
+        WordKind::Data => raw,
+    }
+}
+
+/// Install one code-or-data patch against the ROM backing.
+///
+/// - `pc` is the guest byte address of the first word.
+/// - `kind` selects the storage endianness and whether the original is
+///   recorded for shadow_stub (code words are; data words are not — the
+///   liveness analyser only ever decodes instruction words).
+/// - `expected_orig` is the guest-numerical word the site must currently
+///   hold (read it from `rom.dis`). `None` means "blind write" — used only
+///   for fresh patch-stub-arena slots that have no meaningful prior value.
+/// - `words` are the guest-numerical replacement word(s), written
+///   consecutively from `pc` in `kind`'s endianness.
+/// - `optional` downgrades a verify mismatch from a loud halt to a
+///   log-and-skip. Reserve it for genuinely optional probes; the default
+///   (`false`) halts, because a silent skip of a load-bearing patch
+///   guarantees a baffling downstream wedge.
+///
+/// SAFETY: `rom_ptr` must back the full ROM aperture; `pc` and every
+/// word it spans must be word-aligned and within `ROM_SIZE`.
+unsafe fn install_patch(
+    rom_ptr: *mut u32,
+    pc: u32,
+    kind: WordKind,
+    expected_orig: Option<u32>,
+    words: &[u32],
+    optional: bool,
+    name: &'static str,
+) {
+    debug_assert!(pc & 3 == 0, "patch pc must be word-aligned");
+    let idx = (pc / 4) as usize;
+    if let Some(expected) = expected_orig {
+        // SAFETY: caller guarantees rom_ptr / pc bounds.
+        let prev = unsafe { read_rom_word_numeric(rom_ptr, idx, kind) };
+        if prev != expected {
+            if optional {
+                kprintln!(
+                    "rom_patch: optional patch {} at {:#010x}: have {:#010x}, \
+                     expected {:#010x}; skipping",
+                    name, pc, prev, expected,
+                );
+                return;
+            }
+            kprintln!(
+                "*** rom_patch: {} at {:#010x} is {:#010x}, expected {:#010x} — \
+                 ROM shifted under the patch installer; refusing to continue",
+                name, pc, prev, expected,
+            );
+            crate::cpu::halt();
+        }
+    }
+    // SAFETY: bounds guaranteed by the caller; write each word per kind.
+    unsafe {
+        for (i, &w) in words.iter().enumerate() {
+            let widx = idx + i;
+            // Record the original of EVERY code word we overwrite (not
+            // just the verified first word) so shadow_stub's liveness
+            // analyser always sees the pre-patch instruction stream.
+            // Blind writes (`expected_orig == None`) target fresh
+            // patch-stub-arena slots whose prior bytes are meaningless;
+            // nothing to record there.
+            if kind == WordKind::Code && expected_orig.is_some() {
+                let orig = read_rom_word_numeric(rom_ptr, widx, WordKind::Code);
+                record_original(pc + (i as u32) * 4, orig);
+            }
+            match kind {
+                WordKind::Code => crate::guest_mem::write_rom_code_word(rom_ptr, widx, w),
+                WordKind::Data => crate::guest_mem::write_rom_data_word(rom_ptr, widx, w),
+            }
+        }
+    }
 }
 
 /// Apply Einstein's word-write patches to the byteswapped main ROM
@@ -635,23 +744,34 @@ const fn arm_b_cond(src_pc: u32, target: u32, cond: u32) -> u32 {
 pub unsafe fn apply_717006_patches(rom_ptr: *mut u32) {
     let mut applied = 0usize;
     for p in PATCHES_717006 {
-        debug_assert!(p.offset & 3 == 0, "patch offset must be word-aligned");
         debug_assert!((p.offset as usize) < 0x0080_0000, "patch offset must be in main ROM");
-        let word_idx = (p.offset / 4) as usize;
-        // SAFETY: bounds-checked against the 8 MiB main-ROM region.
         // Dispatch via the classifier bitmap so each entry is treated
         // correctly under BE-8: instruction patches go in as native u32
         // (= LE encoding of the BE numerical value); data patches are
-        // byte-swapped before storage so a guest LDR reads the
-        // intended value.
+        // byte-swapped before storage so a guest LDR reads the intended
+        // value. `install_patch` verifies `p.orig`, halts on mismatch,
+        // and records code-word originals for the shadow-stub analyser.
+        let kind = if crate::guest_mem::rom_word_is_code((p.offset / 4) as usize) {
+            WordKind::Code
+        } else {
+            WordKind::Data
+        };
+        // SAFETY: bounds-checked against the 8 MiB main-ROM region.
         unsafe {
-            let prev = rom_ptr.add(word_idx).read();
-            crate::guest_mem::write_rom_word_by_kind(rom_ptr, word_idx, p.value);
-            kprintln!(
-                "rom_patch: {:#010x}: was_host={:#010x} -> intended={:#010x}  ({})",
-                p.offset, prev, p.value, p.name,
+            install_patch(
+                rom_ptr,
+                p.offset,
+                kind,
+                Some(p.orig),
+                &[p.value],
+                /*optional=*/ false,
+                p.name,
             );
         }
+        kprintln!(
+            "rom_patch: {:#010x}: {:#010x} -> {:#010x}  ({})",
+            p.offset, p.orig, p.value, p.name,
+        );
         applied += 1;
     }
 
@@ -680,16 +800,15 @@ pub unsafe fn apply_717006_patches(rom_ptr: *mut u32) {
     {
         // SAFETY: 0x35e7d8 is in the main-ROM region (< 0x0080_0000),
         // word-aligned, and rom_ptr backs the full 8 MiB ROM. The
-        // word is code (the original `teq r0, #2` instruction), so
-        // we use `write_rom_code_word` so the encoding is stored
-        // native-LE for the CPU's instruction fetch.
+        // original `teq r0, #2` is a code word.
         unsafe {
-            let word_idx = (0x0035_E7D8u32 / 4) as usize;
-            let prev = rom_ptr.add(word_idx).read();
-            crate::guest_mem::write_rom_code_word(rom_ptr, word_idx, 0xE330_0000);
-            kprintln!(
-                "rom_patch: {:#010x}: was_host={:#010x} -> intended={:#010x}  ({})",
-                0x0035_E7D8u32, prev, 0xE330_0000u32,
+            install_patch(
+                rom_ptr,
+                0x0035_E7D8,
+                WordKind::Code,
+                Some(0xE330_0002),
+                &[0xE330_0000],
+                /*optional=*/ false,
                 "TraceSetOptions: teq r0, #0 (was #2) — force trace setup even when gVars.tracing is NIL",
             );
         }
@@ -700,39 +819,26 @@ pub unsafe fn apply_717006_patches(rom_ptr: *mut u32) {
     // This changes the default to full tracing.
     #[cfg(feature = "full_ns_trace")]
     {
-        unsafe {
-            let word_idx = (0x0035_E7D4u32 / 4) as usize;
-            let prev = rom_ptr.add(word_idx).read();
-            crate::guest_mem::write_rom_code_word(rom_ptr, word_idx, 0xE3A0_7003);
+        // Originals verified against rom.dis: mov r7,#0 / teq r0,#0 /
+        // bl GetFrameSlotRef__FlT1.
+        for (pc, orig, new, name) in [
+            (0x0035_E7D4u32, 0xE3A0_7000u32, 0xE3A0_7003u32,
+             "TraceSetOptions: mov r7, #3 (was #0) — first store to TInterpreter+0x7C"),
+            (0x000E_6A1Cu32, 0xE330_0000u32, 0xE330_00FFu32,
+             "ConsumeFrame: teq r0, #FF (was #0) — force PrintObject call"),
+            (0x0033_CB24u32, 0xEB62_1DCDu32, 0xE3A0_0008u32,
+             "PrintObject: mov r0, #8 (was bl GetFrameSlotRef) — change object depth"),
+        ] {
+            unsafe {
+                install_patch(rom_ptr, pc, WordKind::Code, Some(orig), &[new],
+                    /*optional=*/ false, name);
+            }
             kprintln!(
-                "rom_patch: {:#010x}: was_host={:#010x} -> intended={:#010x}  ({})",
-                0x0035_E7D4u32, prev, 0xE3A0_7003u32,
-                "TraceSetOptions: mov r0, #3 (was #2) — first store to TInterpreter+0x7C",
+                "rom_patch: {:#010x}: {:#010x} -> {:#010x}  ({})",
+                pc, orig, new, name,
             );
+            applied += 1;
         }
-        applied += 1;
-        unsafe {
-            let word_idx = (0x000E_6A1Cu32 / 4) as usize;
-            let prev = rom_ptr.add(word_idx).read();
-            crate::guest_mem::write_rom_code_word(rom_ptr, word_idx, 0xE330_00FF);
-            kprintln!(
-                "rom_patch: {:#010x}: was_host={:#010x} -> intended={:#010x}  ({})",
-                0x000E_6A1Cu32, prev, 0xE330_00FFu32,
-                "ConsumeFrame: teq r0, #FF (was #0) — force PrintObject call",
-            );
-        }
-        applied += 1;
-        unsafe {
-            let word_idx = (0x0033_cb24 / 4) as usize;
-            let prev = rom_ptr.add(word_idx).read();
-            crate::guest_mem::write_rom_code_word(rom_ptr, word_idx, 0xE3A0_0008);
-            kprintln!(
-                "rom_patch: {:#010x}: was_host={:#010x} -> intended={:#010x}  ({})",
-                0x0033_cb24, prev, 0xE3A0_0008u32,
-                "PrintObject: mov r0, #8 — change object depth to 2",
-            );
-        }
-        applied += 1;
     }
 
     // Einstein's TJITGenericPatchNativeCall / TJITGenericPatchNativeInjection
@@ -853,25 +959,24 @@ unsafe fn apply_pouttranslator_patches(rom_ptr: *mut u32) {
          "PHammerOutTranslator::Flush body"),
     ];
     for &(pc, expected, hvc, name) in &bodies {
-        let idx = (pc / 4) as usize;
         // SAFETY: rom_ptr backs full 8 MiB main ROM; pc < 0x80_0000.
-        let prev = unsafe { rom_ptr.add(idx).read() };
-        if prev != expected {
-            kprintln!(
-                "rom_patch: ERROR — {} at {:#010x} is {:#010x}, expected {:#010x}; skipping",
-                name, pc, prev, expected,
-            );
-            continue;
-        }
+        // These bodies are load-bearing (the kernel's REP output path);
+        // install_patch halts on a first-word mismatch rather than
+        // skipping, and records all three overwritten originals.
         unsafe {
-            crate::guest_mem::write_rom_code_word(rom_ptr, idx,     hvc.insn());
-            crate::guest_mem::write_rom_code_word(rom_ptr, idx + 1, MOV_R0_0);
-            crate::guest_mem::write_rom_code_word(rom_ptr, idx + 2, MOV_PC_LR);
+            install_patch(
+                rom_ptr,
+                pc,
+                WordKind::Code,
+                Some(expected),
+                &[hvc.insn(), MOV_R0_0, MOV_PC_LR],
+                /*optional=*/ false,
+                name,
+            );
         }
-        record_original(pc, prev);
         kprintln!(
             "rom_patch: {:#010x}: {:#010x} -> HVC #{:#x} + mov r0,#0 + mov pc,lr  ({})",
-            pc, prev, hvc as u32, name,
+            pc, expected, hvc as u32, name,
         );
     }
 
@@ -983,75 +1088,25 @@ unsafe fn apply_fault_handler_ldr_byteswap_patches(rom_ptr: *mut u32) {
         write_stub_words(rom_ptr, swiboot_stub_pc, &swiboot_stub);
         write_stub_words(rom_ptr, swiboot_dispatch_stub_pc, &swiboot_dispatch_stub);
 
-        // DAH site
-        let dah_idx = (DAH_FAULT_LDR_PC / 4) as usize;
-        let prev = rom_ptr.add(dah_idx).read();
-        if prev != DAH_FAULT_LDR_ORIG_INSN {
+        // The four LDR-byteswap redirect sites. All load-bearing (the
+        // kernel's own fault handlers read garbage without them), so a
+        // mismatch halts via install_patch instead of skipping.
+        for (pc, orig, stub_pc, what) in [
+            (DAH_FAULT_LDR_PC, DAH_FAULT_LDR_ORIG_INSN, dah_stub_pc,
+             "DAH ldr r0,[lr]"),
+            (UND_FAULT_LDR_PC, UND_FAULT_LDR_ORIG_INSN, und_stub_pc,
+             "UND ldr r1,[lr,-4]"),
+            (SWIBOOT_LDR_PC, SWIBOOT_LDR_ORIG_INSN, swiboot_stub_pc,
+             "SWIBoot ldr r0,[lr,-4]"),
+            (SWIBOOT_DISPATCH_LDR_PC, SWIBOOT_DISPATCH_LDR_ORIG_INSN,
+             swiboot_dispatch_stub_pc, "SWIBoot dispatch ldr r1,[r1,-4]"),
+        ] {
+            let insn = arm_b(pc, stub_pc);
+            install_patch(rom_ptr, pc, WordKind::Code, Some(orig), &[insn],
+                /*optional=*/ false, what);
             kprintln!(
-                "rom_patch: ERROR — DAH faulting-insn LDR at {:#010x} is {:#010x}, expected {:#010x}; skipping byteswap stub",
-                DAH_FAULT_LDR_PC, prev, DAH_FAULT_LDR_ORIG_INSN,
-            );
-        } else {
-            let insn = arm_b(DAH_FAULT_LDR_PC, dah_stub_pc);
-            crate::guest_mem::write_rom_code_word(rom_ptr, dah_idx, insn);
-            record_original(DAH_FAULT_LDR_PC, prev);
-            kprintln!(
-                "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (DAH ldr r0,[lr] → B stub @ {:#x}, byteswap)",
-                DAH_FAULT_LDR_PC, prev, insn, dah_stub_pc,
-            );
-        }
-
-        // UND site
-        let und_idx = (UND_FAULT_LDR_PC / 4) as usize;
-        let prev = rom_ptr.add(und_idx).read();
-        if prev != UND_FAULT_LDR_ORIG_INSN {
-            kprintln!(
-                "rom_patch: ERROR — UND faulting-insn LDR at {:#010x} is {:#010x}, expected {:#010x}; skipping byteswap stub",
-                UND_FAULT_LDR_PC, prev, UND_FAULT_LDR_ORIG_INSN,
-            );
-        } else {
-            let insn = arm_b(UND_FAULT_LDR_PC, und_stub_pc);
-            crate::guest_mem::write_rom_code_word(rom_ptr, und_idx, insn);
-            record_original(UND_FAULT_LDR_PC, prev);
-            kprintln!(
-                "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (UND ldr r1,[lr,-4] → B stub @ {:#x}, byteswap)",
-                UND_FAULT_LDR_PC, prev, insn, und_stub_pc,
-            );
-        }
-
-        // SWIBoot site
-        let swib_idx = (SWIBOOT_LDR_PC / 4) as usize;
-        let prev = rom_ptr.add(swib_idx).read();
-        if prev != SWIBOOT_LDR_ORIG_INSN {
-            kprintln!(
-                "rom_patch: ERROR — SWIBoot LDR at {:#010x} is {:#010x}, expected {:#010x}; skipping byteswap stub",
-                SWIBOOT_LDR_PC, prev, SWIBOOT_LDR_ORIG_INSN,
-            );
-        } else {
-            let insn = arm_b(SWIBOOT_LDR_PC, swiboot_stub_pc);
-            crate::guest_mem::write_rom_code_word(rom_ptr, swib_idx, insn);
-            record_original(SWIBOOT_LDR_PC, prev);
-            kprintln!(
-                "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (SWIBoot ldr r0,[lr,-4] → B stub @ {:#x}, byteswap)",
-                SWIBOOT_LDR_PC, prev, insn, swiboot_stub_pc,
-            );
-        }
-
-        // SWIBoot dispatch site (iter-104).
-        let swib_disp_idx = (SWIBOOT_DISPATCH_LDR_PC / 4) as usize;
-        let prev = rom_ptr.add(swib_disp_idx).read();
-        if prev != SWIBOOT_DISPATCH_LDR_ORIG_INSN {
-            kprintln!(
-                "rom_patch: ERROR — SWIBoot dispatch LDR at {:#010x} is {:#010x}, expected {:#010x}; skipping byteswap stub",
-                SWIBOOT_DISPATCH_LDR_PC, prev, SWIBOOT_DISPATCH_LDR_ORIG_INSN,
-            );
-        } else {
-            let insn = arm_b(SWIBOOT_DISPATCH_LDR_PC, swiboot_dispatch_stub_pc);
-            crate::guest_mem::write_rom_code_word(rom_ptr, swib_disp_idx, insn);
-            record_original(SWIBOOT_DISPATCH_LDR_PC, prev);
-            kprintln!(
-                "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (SWIBoot dispatch ldr r1,[r1,-4] → B stub @ {:#x}, byteswap)",
-                SWIBOOT_DISPATCH_LDR_PC, prev, insn, swiboot_dispatch_stub_pc,
+                "rom_patch: {:#010x}: {:#010x} -> {:#010x}  ({} → B stub @ {:#x}, byteswap)",
+                pc, orig, insn, what, stub_pc,
             );
         }
 
@@ -1063,21 +1118,12 @@ unsafe fn apply_fault_handler_ldr_byteswap_patches(rom_ptr: *mut u32) {
             (FPE_LDR_EQ_PC, FPE_LDR_EQ_ORIG_INSN, 0x0u32, "FPE ldrteq fp,[r9]"),
             (FPE_LDR_NE_PC, FPE_LDR_NE_ORIG_INSN, 0x1u32, "FPE ldrne  fp,[r9]"),
         ] {
-            let idx = (pc / 4) as usize;
-            let prev = rom_ptr.add(idx).read();
-            if prev != expected {
-                kprintln!(
-                    "rom_patch: ERROR — {} at {:#010x} is {:#010x}, expected {:#010x}; skipping byteswap branch",
-                    label, pc, prev, expected,
-                );
-                continue;
-            }
             let insn = arm_b_cond(pc, fpe_stub_pc, cond);
-            crate::guest_mem::write_rom_code_word(rom_ptr, idx, insn);
-            record_original(pc, prev);
+            install_patch(rom_ptr, pc, WordKind::Code, Some(expected), &[insn],
+                /*optional=*/ false, label);
             kprintln!(
                 "rom_patch: {:#010x}: {:#010x} -> {:#010x}  ({} → B{} stub @ {:#x}, byteswap)",
-                pc, prev, insn, label,
+                pc, expected, insn, label,
                 if cond == 0 { "EQ" } else { "NE" },
                 fpe_stub_pc,
             );
@@ -1085,11 +1131,12 @@ unsafe fn apply_fault_handler_ldr_byteswap_patches(rom_ptr: *mut u32) {
     }
 }
 
-/// Helper: replace one ROM word with an HVC, panicking loudly if the
+/// Helper: replace one ROM word with an HVC, halting loudly if the
 /// previous word doesn't match the recorded original. A mismatch means
 /// the ROM has shifted under us (different ROM image or earlier patch
 /// stomped the same offset) and the probe handler's emulation of the
-/// "original" first instruction would be wrong.
+/// "original" first instruction would be wrong — a skip here would
+/// guarantee a baffling downstream wedge, so `install_patch` halts.
 unsafe fn patch_probe(
     rom_ptr: *mut u32,
     pc: u32,
@@ -1097,27 +1144,23 @@ unsafe fn patch_probe(
     hvc_imm: HvcImm,
     name: &'static str,
 ) {
-    let idx = (pc / 4) as usize;
     let new_insn = hvc_imm.insn();
     let imm = hvc_imm as u32;
     // SAFETY: caller of apply_717006_patches has already bounded rom_ptr.
-    // The probe always rewrites a code word (the original first
-    // instruction → an HVC), so the host read returns the BE numerical
-    // value of the instruction directly under BE-8 (write_rom_code_word
-    // stores native u32 = LE encoding = BE numerical when fetched LE).
-    let prev = unsafe { rom_ptr.add(idx).read() };
-    if prev != expected_orig {
-        kprintln!(
-            "rom_patch: ERROR — {} at {:#010x} is {:#010x}, expected {:#010x}; skipping HVC #{:#x} probe",
-            name, pc, prev, expected_orig, imm
+    unsafe {
+        install_patch(
+            rom_ptr,
+            pc,
+            WordKind::Code,
+            Some(expected_orig),
+            &[new_insn],
+            /*optional=*/ false,
+            name,
         );
-        return;
     }
-    unsafe { crate::guest_mem::write_rom_code_word(rom_ptr, idx, new_insn); }
-    record_original(pc, prev);
     kprintln!(
         "rom_patch: {:#010x}: {:#010x} -> {:#010x}  ({} probe, HVC #{:#x})",
-        pc, prev, new_insn, name, imm
+        pc, expected_orig, new_insn, name, imm
     );
 }
 
@@ -1131,15 +1174,16 @@ unsafe fn patch_probe(
 /// 0x001488ac because the original `mov r0, ip` at 0x001488c4 has
 /// been replaced with HVC #0x6E for the FINDSUPER_MID probe).
 ///
-/// Capacity = 128: comfortably covers the ~70 probes installed today
-/// (the soup-index + flash-store + per-stall probes added through
-/// iter-89). When the table fills, `record_original` warns and
+/// Capacity = 256: covers every code word any installer overwrites —
+/// `install_patch` now records ALL overwritten code words (multi-word
+/// bodies included) plus the PATCHES_717006 code entries, not just the
+/// HVC probe sites. When the table fills, `record_original` warns and
 /// `read_original` returns None for the missing entries, which in turn
 /// makes `shadow_stub`'s liveness analyser see the patched HVC instead
 /// of the original — leading to subtle scratch-register misanalysis at
 /// nearby SBA / unaligned-inline stub sites. Single-threaded boot use,
 /// so a plain `static mut` with index counter is safe.
-const ORIG_CAP: usize = 128;
+const ORIG_CAP: usize = 256;
 static mut ORIG_PCS:    [u32; ORIG_CAP] = [0; ORIG_CAP];
 static mut ORIG_INSNS:  [u32; ORIG_CAP] = [0; ORIG_CAP];
 static mut ORIG_N:      usize = 0;
@@ -1228,34 +1272,35 @@ unsafe fn apply_debug_patches(rom_ptr: *mut u32) {
         write_stub_words(rom_ptr, debug_str_stub_pc, &debugstr_stub);
         write_stub_words(rom_ptr, debugger_stub_pc,  &debugger_stub);
 
-        let word = (0x0038_CE6C / 4) as usize;
-        let prev = rom_ptr.add(word).read();
-        let insn = arm_b(0x0038_CE6C, debug_str_stub_pc);
-        crate::guest_mem::write_rom_code_word(rom_ptr, word, insn);
-        kprintln!(
-            "rom_patch: 0x0038ce6c: {:#010x} -> {:#010x}  (DebugStr → B {:#x}, HVC #{:#x})",
-            prev, insn, debug_str_stub_pc, HvcImm::DebugStr as u32,
-        );
-        let word = (0x0038_CE70 / 4) as usize;
-        let prev = rom_ptr.add(word).read();
-        let insn = arm_b(0x0038_CE70, debugger_stub_pc);
-        crate::guest_mem::write_rom_code_word(rom_ptr, word, insn);
-        kprintln!(
-            "rom_patch: 0x0038ce70: {:#010x} -> {:#010x}  (Debugger → B {:#x}, HVC #{:#x})",
-            prev, insn, debugger_stub_pc, HvcImm::Debugger as u32,
-        );
+        // UND-table slot originals verified against rom.dis: the
+        // DebugStr/Debugger entries hold the UNDEFINED-space words
+        // 0xE6000310 / 0xE6000210 (the kernel's debugger UND markers).
+        for (pc, orig, stub_pc, hvc, what) in [
+            (0x0038_CE6Cu32, 0xE600_0310u32, debug_str_stub_pc,
+             HvcImm::DebugStr, "DebugStr"),
+            (0x0038_CE70u32, 0xE600_0210u32, debugger_stub_pc,
+             HvcImm::Debugger, "Debugger"),
+        ] {
+            let insn = arm_b(pc, stub_pc);
+            install_patch(rom_ptr, pc, WordKind::Code, Some(orig), &[insn],
+                /*optional=*/ false, what);
+            kprintln!(
+                "rom_patch: {:#010x}: {:#010x} -> {:#010x}  ({} → B {:#x}, HVC #{:#x})",
+                pc, orig, insn, what, stub_pc, hvc as u32,
+            );
+        }
     }
 }
 
-/// Writes a sequence of ARM instruction encodings to the ROM backing.
-/// All entries here are code (HVC stub bodies, branch targets, etc.) so
-/// they go through `write_rom_code_word`.
+/// Writes a sequence of ARM instruction encodings into a fresh
+/// patch-stub-arena slot. All entries here are code (HVC stub bodies,
+/// branch targets, etc.). Arena slots have no meaningful prior
+/// contents, so this is `install_patch`'s one sanctioned blind-write
+/// caller (`expected_orig = None`: no verify, no original recorded).
 unsafe fn write_stub_words(rom_ptr: *mut u32, base: u32, words: &[u32]) {
     unsafe {
-        for (i, w) in words.iter().copied().enumerate() {
-            let idx = ((base + (i as u32) * 4) / 4) as usize;
-            crate::guest_mem::write_rom_code_word(rom_ptr, idx, w);
-        }
+        install_patch(rom_ptr, base, WordKind::Code, None, words,
+            /*optional=*/ false, "patch-stub arena slot");
     }
 }
 
@@ -1277,25 +1322,44 @@ unsafe fn apply_real_clock_seconds_patch(rom_ptr: *mut u32) {
     // data that the LDR at +0 loads into r0. Under BE-8 the LDR is
     // byteswapping, so the literal must be written as data (BE-encoded
     // bytes on host).
-    let insns: [u32; 3] = [0xE59F_0004, 0xE590_0000, 0xE1A0_F00E];
+    // Originals verified against rom.dis — the function's own prologue
+    // (mov ip,sp / push {r4,fp,ip,lr,pc} / sub fp,ip,#4 / sub sp,sp,#8).
+    let insns: [(u32, u32); 3] = [
+        (0xE1A0_C00D, 0xE59F_0004),
+        (0xE92D_D810, 0xE590_0000),
+        (0xE24C_B004, 0xE1A0_F00E),
+    ];
     let literal: u32 = 0x0F18_1000;
     unsafe {
-        for (i, w) in insns.iter().copied().enumerate() {
+        for (i, (orig, w)) in insns.iter().copied().enumerate() {
             let offset = ENTRY + (i as u32) * 4;
-            let idx = (offset / 4) as usize;
-            let prev = rom_ptr.add(idx).read();
-            crate::guest_mem::write_rom_code_word(rom_ptr, idx, w);
+            install_patch(rom_ptr, offset, WordKind::Code, Some(orig), &[w],
+                /*optional=*/ false, "RealClockSeconds body");
             kprintln!(
-                "rom_patch: {:#010x}: was_host={:#010x} -> insn={:#010x}  (RealClockSeconds)",
-                offset, prev, w,
+                "rom_patch: {:#010x}: {:#010x} -> insn={:#010x}  (RealClockSeconds)",
+                offset, orig, w,
             );
         }
+        // The literal slot overwrites a CODE word (the prologue's
+        // `sub sp, sp, #8`) with a DATA word, so install_patch's
+        // single-kind read/write contract doesn't fit: verify and
+        // record the original via the Code view, then write as data so
+        // the kernel's BE-8 LDR reads the literal back numerically.
         let lit_offset = ENTRY + 12;
         let lit_idx = (lit_offset / 4) as usize;
-        let prev = rom_ptr.add(lit_idx).read();
+        const LIT_ORIG: u32 = 0xE24D_D008; // sub sp, sp, #8 (rom.dis)
+        let prev = read_rom_word_numeric(rom_ptr, lit_idx, WordKind::Code);
+        if prev != LIT_ORIG {
+            kprintln!(
+                "*** rom_patch: RealClockSeconds literal at {:#010x} is {:#010x}, expected {:#010x} — ROM shifted under the patch installer; refusing to continue",
+                lit_offset, prev, LIT_ORIG,
+            );
+            crate::cpu::halt();
+        }
+        record_original(lit_offset, prev);
         crate::guest_mem::write_rom_data_word(rom_ptr, lit_idx, literal);
         kprintln!(
-            "rom_patch: {:#010x}: was_host={:#010x} -> lit={:#010x}  (RealClockSeconds literal)",
+            "rom_patch: {:#010x}: {:#010x} -> lit={:#010x}  (RealClockSeconds literal)",
             lit_offset, prev, literal,
         );
     }
@@ -1329,8 +1393,10 @@ unsafe fn apply_ftime_in_seconds_patch(rom_ptr: *mut u32) {
         SAFE_INTERVAL_DELTA_SECONDS,
     ];
     let patch_insn = arm_b(PATCH_PC, ftime_stub_pc);
+    // Original at PATCH_PC verified against rom.dis: lsl r0, r0, #2.
     unsafe {
-        write_stub_and_patch(rom_ptr, ftime_stub_pc, &stub, PATCH_PC, patch_insn, "FTimeInSeconds");
+        write_stub_and_patch(rom_ptr, ftime_stub_pc, &stub, PATCH_PC,
+            0xE1A0_0100, patch_insn, "FTimeInSeconds");
     }
 }
 
@@ -1352,8 +1418,10 @@ unsafe fn apply_fdate_from_seconds_patch(rom_ptr: *mut u32) {
         SAFE_INTERVAL_DELTA_SECONDS,
     ];
     let patch_insn = arm_b(PATCH_PC, fdate_stub_pc);
+    // Original at PATCH_PC verified against rom.dis: mov r0, sp.
     unsafe {
-        write_stub_and_patch(rom_ptr, fdate_stub_pc, &stub, PATCH_PC, patch_insn, "FDateFromSeconds");
+        write_stub_and_patch(rom_ptr, fdate_stub_pc, &stub, PATCH_PC,
+            0xE1A0_000D, patch_insn, "FDateFromSeconds");
     }
 }
 
@@ -1368,21 +1436,23 @@ unsafe fn apply_fdate_from_seconds_patch(rom_ptr: *mut u32) {
 #[cfg(nh_loud_halt_canaries)]
 unsafe fn apply_loud_halt_traps(rom_ptr: *mut u32) {
     let insn = HvcImm::LoudHalt.insn();
-    for (pc, name) in [
-        (POWEROFF_REBOOT_PC, "PowerOffAndReboot"),
-        (REBOOT_PC, "Reboot"),
-        (STOP_IMAGE_PC, "StopImage"),
-        (BUS_ERROR_THROW_PC, "BusErrorThrow"),
+    // Originals verified against rom.dis: the first three are function
+    // prologues (mov ip,sp ×2 / mrc p15 CPU-ID read); the fourth is the
+    // busError `bl Throw`.
+    for (pc, orig, name) in [
+        (POWEROFF_REBOOT_PC, 0xE1A0_C00Du32, "PowerOffAndReboot"),
+        (REBOOT_PC, 0xE1A0_C00D, "Reboot"),
+        (STOP_IMAGE_PC, 0xEE10_0F10, "StopImage"),
+        (BUS_ERROR_THROW_PC, 0xEB67_AB18, "BusErrorThrow"),
     ] {
-        let idx = (pc / 4) as usize;
         unsafe {
-            let prev = rom_ptr.add(idx).read();
-            crate::guest_mem::write_rom_code_word(rom_ptr, idx, insn);
-            kprintln!(
-                "rom_patch: {:#010x}: {:#010x} -> {:#010x}  ({} loud-halt, HVC #{:#x})",
-                pc, prev, insn, name, HvcImm::LoudHalt as u32,
-            );
+            install_patch(rom_ptr, pc, WordKind::Code, Some(orig), &[insn],
+                /*optional=*/ false, name);
         }
+        kprintln!(
+            "rom_patch: {:#010x}: {:#010x} -> {:#010x}  ({} loud-halt, HVC #{:#x})",
+            pc, orig, insn, name, HvcImm::LoudHalt as u32,
+        );
     }
 }
 
@@ -1393,23 +1463,19 @@ unsafe fn apply_loud_halt_traps(rom_ptr: *mut u32) {
 /// `mov r0, #0xb0` (0xE3A000B0) — a ROM change would silently break
 /// the emulation path, so we want a loud notification at install.
 unsafe fn apply_bootos_trap(rom_ptr: *mut u32) {
-    let idx = (BOOTOS_PC / 4) as usize;
-    // SAFETY: bounded; patch runs on the main ROM half.
-    let prev = unsafe { rom_ptr.add(idx).read() };
-    if prev != BOOTOS_ORIG_INSN {
-        kprintln!(
-            "rom_patch: ERROR — BootOS first word is {:#010x}, expected {:#010x}; skipping canary",
-            prev, BOOTOS_ORIG_INSN,
-        );
-        return;
-    }
     let insn = HvcImm::BootOs.insn();
+    // SAFETY: bounded; patch runs on the main ROM half. install_patch
+    // halts on a mismatch — the loud notification the doc above asks
+    // for (the handler's emulation of `mov r0, #0xb0` would be wrong
+    // against a shifted ROM).
     unsafe {
-        crate::guest_mem::write_rom_code_word(rom_ptr, idx, insn);
+        install_patch(rom_ptr, BOOTOS_PC, WordKind::Code,
+            Some(BOOTOS_ORIG_INSN), &[insn], /*optional=*/ false,
+            "BootOS canary");
     }
     kprintln!(
         "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (BootOS canary, HVC #{:#x})",
-        BOOTOS_PC, prev, insn, HvcImm::BootOs as u32,
+        BOOTOS_PC, BOOTOS_ORIG_INSN, insn, HvcImm::BootOs as u32,
     );
 }
 
@@ -1465,55 +1531,41 @@ unsafe fn apply_storeperm_loadperm_probes(rom_ptr: *mut u32) {
             "LoadPermObject return probe",
         ),
     ] {
-        let idx = (pc / 4) as usize;
-        let prev = unsafe { rom_ptr.add(idx).read() };
-        if prev != orig {
-            kprintln!(
-                "rom_patch: ERROR — {} site at {:#010x} is {:#010x}, expected {:#010x}; skipping",
-                name, pc, prev, orig,
-            );
-            continue;
-        }
         let insn = imm.insn();
         unsafe {
-            crate::guest_mem::write_rom_code_word(rom_ptr, idx, insn);
+            install_patch(rom_ptr, pc, WordKind::Code, Some(orig), &[insn],
+                /*optional=*/ false, name);
         }
         kprintln!(
             "rom_patch: {:#010x}: {:#010x} -> {:#010x}  ({}, HVC #{:#x})",
-            pc, prev, insn, name, imm as u32,
+            pc, orig, insn, name, imm as u32,
         );
     }
 }
 
 /// Shared helper for the two injection patches: write a 5-word stub at
-/// `stub_pc` (4 instruction words + 1 trailing data literal) and a
-/// 1-word branch at `patch_pc`. The first 4 stub words are written as
-/// code (native LE u32 for BE-8 fetch), the 5th word is written as
-/// data (byteswapped on host so a BE-8 LDR reads back the literal).
+/// `stub_pc` (4 instruction words + 1 trailing data literal, fresh
+/// arena slots — blind writes) and a 1-word branch at `patch_pc`
+/// (verified against `expected_orig`, halting on mismatch).
 unsafe fn write_stub_and_patch(
     rom_ptr: *mut u32,
     stub_pc: u32,
     stub: &[u32; 5],
     patch_pc: u32,
+    expected_orig: u32,
     patch_insn: u32,
     name: &'static str,
 ) {
     unsafe {
-        for (i, w) in stub.iter().copied().enumerate() {
-            let offset = stub_pc + (i as u32) * 4;
-            let idx = (offset / 4) as usize;
-            if i < 4 {
-                crate::guest_mem::write_rom_code_word(rom_ptr, idx, w);
-            } else {
-                crate::guest_mem::write_rom_data_word(rom_ptr, idx, w);
-            }
-        }
-        let idx = (patch_pc / 4) as usize;
-        let prev = rom_ptr.add(idx).read();
-        crate::guest_mem::write_rom_code_word(rom_ptr, idx, patch_insn);
+        install_patch(rom_ptr, stub_pc, WordKind::Code, None, &stub[..4],
+            /*optional=*/ false, "patch-stub arena slot");
+        install_patch(rom_ptr, stub_pc + 16, WordKind::Data, None, &stub[4..],
+            /*optional=*/ false, "patch-stub arena literal");
+        install_patch(rom_ptr, patch_pc, WordKind::Code, Some(expected_orig),
+            &[patch_insn], /*optional=*/ false, name);
         kprintln!(
-            "rom_patch: {:#010x}: was_host={:#010x} -> {:#010x}  ({}: B {:#x}, 5-word stub)",
-            patch_pc, prev, patch_insn, name, stub_pc,
+            "rom_patch: {:#010x}: {:#010x} -> {:#010x}  ({}: B {:#x}, 5-word stub)",
+            patch_pc, expected_orig, patch_insn, name, stub_pc,
         );
     }
 }

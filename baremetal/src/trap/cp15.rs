@@ -202,7 +202,7 @@ pub(crate) fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
                 // literal needs to track every MMU transition).
                 // SAFETY: single-word ROM-backing write under the
                 // paused-guest invariant.
-                unsafe { guest_mem::install_und_vector_swap_post_mmu(); }
+                unsafe { crate::guest_trampolines::install_und_vector_swap_post_mmu(); }
             }
             // M=1→M=0: the guest is turning its stage-1 MMU off
             // (typically the SWIBoot→ROMBoot soft-reset path). Revert
@@ -218,7 +218,7 @@ pub(crate) fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
                 crate::guest::set_dc_for_stage1_off(true);
                 // SAFETY: single-word ROM-backing write under the
                 // same paused-guest invariant as the original patch.
-                unsafe { guest_mem::install_und_vector_swap_pre_mmu(); }
+                unsafe { crate::guest_trampolines::install_und_vector_swap_pre_mmu(); }
             }
         }
         (0, 2, 0, 0, false) => {

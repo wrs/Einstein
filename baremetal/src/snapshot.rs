@@ -478,7 +478,7 @@ fn maybe_autosave_via_semihost(ctx: &TrapContext) {
 /// Ranges covered (constants verified against `guest_mem` /
 /// `rom_patches`):
 ///   - `0x008FFF00..0x00900000` — DABT fast trampoline
-///     (`guest_mem::DABT_FAST_TRAMP_OFFSET`, 41 words). Saves
+///     (`guest_trampolines::DABT_FAST_TRAMP_OFFSET`, 41 words). Saves
 ///     LR_abt/SP_abt/SPSR_abt and stashes R0/R1 in TPIDRURW/TPIDRRO;
 ///     handles the dominant fault stream, so a nontrivial fraction of
 ///     wall time sits here.
@@ -486,7 +486,7 @@ fn maybe_autosave_via_semihost(ctx: &TrapContext) {
 ///     (`tracer::TRAMPOLINE_IPA..TRAMPOLINE_END`).
 ///   - `0x00FFFD80..0x01000000` — patch-stub arena
 ///     (`rom_patches::PATCH_STUB_ARENA_BASE`), FPA bypass stub
-///     (`guest_mem::FPA_BYPASS_STUB_OFFSET` = 0x00FFFEC0), UND
+///     (`guest_trampolines::FPA_BYPASS_STUB_OFFSET` = 0x00FFFEC0), UND
 ///     trampoline (0x00FFFF00), DABT trampoline (0x00FFFFA8), and UND
 ///     return stub (0x00FFFFE4). The FPA stub and DABT trampoline also
 ///     stash R0/R1/R12 in TPIDRURW/TPIDRRO.
@@ -495,11 +495,11 @@ fn maybe_autosave_via_semihost(ctx: &TrapContext) {
 /// but checking always is cheap and harmless — nothing the guest
 /// does naturally lands ELR_EL2 in that range otherwise.
 ///
-/// Delegates to `guest_mem::is_hypervisor_code_region` — the single
+/// Delegates to `guest_trampolines::is_hypervisor_code_region` — the single
 /// source of truth for these ranges, shared with
 /// `guest_endian::pa_is_rom_code` so the two lists can't drift.
 fn pc_in_hypervisor_transient_region(pc: u32) -> bool {
-    crate::guest_mem::is_hypervisor_code_region(pc)
+    crate::guest_trampolines::is_hypervisor_code_region(pc)
 }
 
 /// Write a snapshot to the next ring slot. Called from periodic

@@ -325,9 +325,9 @@ pub(crate) fn handle_loud_halt(ctx: &TrapContext) -> ! {
         // reaching `Throw`, the slot would have been overwritten by
         // the recursive abort. In practice DAH's TStackInfo walk
         // touches only mapped memory, so the slot is the original.
-        let dabt_lr_abt   = crate::guest_endian::guest_read_u32_pa(guest_mem::DABT_SAVE_PA).unwrap_or(0);
-        let dabt_sp_abt   = crate::guest_endian::guest_read_u32_pa(guest_mem::DABT_SAVE_PA + 4).unwrap_or(0);
-        let dabt_spsr_abt = crate::guest_endian::guest_read_u32_pa(guest_mem::DABT_SAVE_PA + 8).unwrap_or(0);
+        let dabt_lr_abt   = crate::guest_endian::guest_read_u32_pa(crate::guest_trampolines::DABT_SAVE_PA).unwrap_or(0);
+        let dabt_sp_abt   = crate::guest_endian::guest_read_u32_pa(crate::guest_trampolines::DABT_SAVE_PA + 4).unwrap_or(0);
+        let dabt_spsr_abt = crate::guest_endian::guest_read_u32_pa(crate::guest_trampolines::DABT_SAVE_PA + 8).unwrap_or(0);
         let dabt_pre_mode = dabt_spsr_abt & 0x1F;
         let dabt_thumb    = (dabt_spsr_abt & (1 << 5)) != 0;
         let dabt_faulting_pc = if dabt_thumb {
@@ -682,9 +682,9 @@ pub(crate) fn handle_diag(ctx: &mut TrapContext) {
     // fast path. Print those too so any divergence between the
     // X-register view and the trampoline-stash view is visible at a
     // glance.
-    let lr_abt_save = crate::guest_endian::guest_read_u32_pa(guest_mem::DABT_SAVE_PA).unwrap_or(0);
-    let sp_abt_save = crate::guest_endian::guest_read_u32_pa(guest_mem::DABT_SAVE_PA + 4).unwrap_or(0);
-    let spsr_abt_save = crate::guest_endian::guest_read_u32_pa(guest_mem::DABT_SAVE_PA + 8).unwrap_or(0);
+    let lr_abt_save = crate::guest_endian::guest_read_u32_pa(crate::guest_trampolines::DABT_SAVE_PA).unwrap_or(0);
+    let sp_abt_save = crate::guest_endian::guest_read_u32_pa(crate::guest_trampolines::DABT_SAVE_PA + 4).unwrap_or(0);
+    let spsr_abt_save = crate::guest_endian::guest_read_u32_pa(crate::guest_trampolines::DABT_SAVE_PA + 8).unwrap_or(0);
     kprintln!(
         "  DABT-trampoline stash (cross-check):  LR_abt={:#010x} SP_abt={:#010x} SPSR_abt={:#010x}",
         lr_abt_save, sp_abt_save, spsr_abt_save

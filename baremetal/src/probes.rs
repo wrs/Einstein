@@ -2,7 +2,7 @@
 //! `rom_patches.rs` (Hammer print/thunk, StorePermObj, the BootOS
 //! reboot canary, and the DAH MRS-SPSR rewrite).
 
-use crate::{cpu, guest_mem};
+use crate::cpu;
 use crate::trap_context::{read_sysreg, TrapContext};
 use crate::kprintln;
 use crate::trap::und::read_banked_spsr;
@@ -190,20 +190,20 @@ pub(crate) fn handle_dah_mrs_spsr_patch(ctx: &mut TrapContext) {
     // here would silently corrupt the kernel's abort-mode decode, so an
     // unreadable slot is a halt, not a default.
     let spsr_abt_save = match crate::guest_endian::guest_read_u32_pa(
-        guest_mem::DABT_SAVE_PA + 8,
+        crate::guest_trampolines::DABT_SAVE_PA + 8,
     ) {
         Some(v) => v,
         None => {
             kprintln!(
                 "*** handle_dah_mrs_spsr_patch: DABT_SAVE SPSR slot @{:#x} unreadable \
                  (ELR_EL2={:#x}) ***",
-                guest_mem::DABT_SAVE_PA + 8, read_sysreg!("elr_el2"),
+                crate::guest_trampolines::DABT_SAVE_PA + 8, read_sysreg!("elr_el2"),
             );
             cpu::halt();
         }
     };
     let lr_abt_save = crate::guest_endian::guest_read_u32_pa(
-        guest_mem::DABT_SAVE_PA,
+        crate::guest_trampolines::DABT_SAVE_PA,
     ).unwrap_or(0);
     let r1_in = ctx.x[1] as u32;
     let far = read_sysreg!("far_el1") as u32;

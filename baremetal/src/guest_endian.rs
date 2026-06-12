@@ -57,7 +57,7 @@ fn pa_is_rom_code(pa: u32) -> bool {
     // and miss the dispatch arm without this short-circuit. Shared with
     // `snapshot::pc_in_hypervisor_transient_region` so the two range
     // lists can't drift.
-    if guest_mem::is_hypervisor_code_region(pa) {
+    if crate::guest_trampolines::is_hypervisor_code_region(pa) {
         return true;
     }
     let pa = pa as usize;

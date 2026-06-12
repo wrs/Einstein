@@ -954,8 +954,8 @@ pub(crate) fn return_to_guest_from_und(_ctx: &mut TrapContext, elr: u64, _spsr: 
     let mode = (_spsr as u32) & 0x1F;
     let elr32 = elr as u32;
     let in_und_tramp = elr32 >= 0x00FF_FF00 && elr32 < 0x00FF_FF60;
-    let in_fpa_bypass = elr32 >= guest_mem::FPA_BYPASS_STUB_OFFSET as u32
-        && elr32 < (guest_mem::FPA_BYPASS_STUB_OFFSET as u32 + 0x40);
+    let in_fpa_bypass = elr32 >= crate::guest_trampolines::FPA_BYPASS_STUB_OFFSET as u32
+        && elr32 < (crate::guest_trampolines::FPA_BYPASS_STUB_OFFSET as u32 + 0x40);
     if mode == 0x10 && (in_und_tramp || in_fpa_bypass) {
         kprintln!(
             "*** return_to_guest_from_und: USR target inside trampoline body! \
@@ -982,7 +982,7 @@ pub(crate) fn return_to_guest_from_und(_ctx: &mut TrapContext, elr: u64, _spsr: 
     // route x[22] into R14_und across both QEMU raspi3b and FVP, and
     // the ROM-backing flush is needed regardless.
     let literal_host =
-        guest_mem::rom_host_pa() as usize + guest_mem::UND_RETURN_STUB_LITERAL_OFFSET;
+        guest_mem::rom_host_pa() as usize + crate::guest_trampolines::UND_RETURN_STUB_LITERAL_OFFSET;
     // The UND_RETURN_STUB does `ldr lr, [pc, #0]` to load this literal,
     // running under BE-8 with CPSR.E=1. Host bytes must be BE-encoded
     // so the guest's LDR returns `elr` numerically — write swap of elr.
@@ -1008,7 +1008,7 @@ pub(crate) fn return_to_guest_from_und(_ctx: &mut TrapContext, elr: u64, _spsr: 
         core::arch::asm!(
             "msr elr_el2, {elr}",
             "isb",
-            elr = in(reg) guest_mem::UND_RETURN_STUB_VA as u64,
+            elr = in(reg) crate::guest_trampolines::UND_RETURN_STUB_VA as u64,
             options(nostack, preserves_flags),
         );
     }

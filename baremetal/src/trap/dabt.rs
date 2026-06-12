@@ -678,7 +678,7 @@ pub(crate) fn log_dabt_forward(dfsc: u32, far: u32, mode: u32, ctx: &TrapContext
     // for `mrs` from EL2). The trampoline writes the slot before any
     // kernel code runs, so the slot is the architecturally-correct
     // pre-abt CPSR.
-    let spsr_abt_save = crate::guest_endian::guest_read_u32_pa(guest_mem::DABT_SAVE_PA + 8).unwrap_or(0);
+    let spsr_abt_save = crate::guest_endian::guest_read_u32_pa(crate::guest_trampolines::DABT_SAVE_PA + 8).unwrap_or(0);
     let pre_abt_mode_save = spsr_abt_save & 0x1F;
     static mut SEEN: SeenSet<(u32, u32, u32), 16> = SeenSet::new((0, 0, 0));
     // Dedup on the saved-slot mode (architecturally correct) so a single

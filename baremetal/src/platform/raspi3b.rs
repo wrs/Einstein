@@ -166,7 +166,7 @@ pub fn cnthp_irq_pending() -> bool {
 /// the guest-path IRQ body.
 #[cfg(nh_real_hw)]
 #[inline]
-pub fn dispatch_dma_completions() {
+pub fn dispatch_dma_completions(_cap: crate::slim_isr::IrqCap) {
     use crate::host_dma;
     let pend1 = bcm2835_irq_pending_1();
     for &ch in &[
@@ -182,7 +182,7 @@ pub fn dispatch_dma_completions() {
 
 #[cfg(not(nh_real_hw))]
 #[inline]
-pub fn dispatch_dma_completions() {}
+pub fn dispatch_dma_completions(_cap: crate::slim_isr::IrqCap) {}
 
 /// Slim USB interrupt-IN fast path (real-hw touchscreen). The IRQ-driven
 /// DWC2 channel re-arms every frame, so source 9 fires at up to ~1 kHz

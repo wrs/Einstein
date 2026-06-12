@@ -11,12 +11,22 @@
 //! opcode points exactly at the missing entry, then return r0 = 0 for the
 //! ones the protocol defines.
 
-use crate::{cpu, kprintln, trap_context::TrapContext};
+use crate::trap_context::TrapContext;
+use crate::peripherals::native_primitives::NativeDriver;
 
-/// Out-translator driver class ID in the native-primitive encoding.
-pub const DRIVER_ID: u32 = 0x00_0008;
+/// Marker for the [`NativeDriver`] dispatch in
+/// `peripherals/native_primitives.rs`.
+pub struct OutTranslator;
 
-pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
+impl NativeDriver for OutTranslator {
+    /// Out-translator driver class ID in the native-primitive encoding.
+    const DRIVER_ID: u32 = 0x00_0008;
+    fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
+        handle(ctx, subfn, pc)
+    }
+}
+
+fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
     match subfn {
         // POutTranslator protocol method indices: New, Delete, Init,
         // Idle, ConsumeFrame, Flush, Prompt, Print, Putc, EnterBreakLoop,
@@ -25,15 +35,9 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         | 0x07 | 0x08 | 0x09 | 0x0A | 0x0B | 0x0C => {
             ctx.x[0] = 0;
         }
-        _ => {
-            kprintln!(
-                "*** out_translator: unknown subfn {:#x} @PC={:#x} r1={:#x} r2={:#x} r3={:#x}",
-                subfn, pc, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32
-            );
-            kprintln!(
-                "    (extend peripherals/out_translator.rs::handle to add this subfn)"
-            );
-            cpu::halt();
-        }
+        _ => crate::diag_util::halt_unknown_subfn(
+            "out_translator", subfn, pc,
+            ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
+        ),
     }
 }

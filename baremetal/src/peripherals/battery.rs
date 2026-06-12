@@ -13,12 +13,22 @@
 //! values mirror Einstein's tables verbatim so the kernel's downstream
 //! consumers see the same battery state we'd see in Einstein.
 
-use crate::{cpu, kprintln, trap_context::TrapContext};
+use crate::trap_context::TrapContext;
+use crate::peripherals::native_primitives::NativeDriver;
 
-/// Battery-driver class ID in the native-primitive encoding.
-pub const DRIVER_ID: u32 = 0x00_0003;
+/// Marker for the [`NativeDriver`] dispatch in
+/// `peripherals/native_primitives.rs`.
+pub struct Battery;
 
-pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
+impl NativeDriver for Battery {
+    /// Battery-driver class ID in the native-primitive encoding.
+    const DRIVER_ID: u32 = 0x00_0003;
+    fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
+        handle(ctx, subfn, pc)
+    }
+}
+
+fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
     match subfn {
         // New — no r0 write per Einstein.
         0x01 => {}
@@ -37,16 +47,10 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         0x09 | 0x0A | 0x0B | 0x0C => {
             ctx.x[0] = 0;
         }
-        _ => {
-            kprintln!(
-                "*** battery: unknown subfn {:#x} @PC={:#x} r1={:#x} r2={:#x} r3={:#x}",
-                subfn, pc, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32
-            );
-            kprintln!(
-                "    (extend peripherals/battery.rs::handle to add this subfn)"
-            );
-            cpu::halt();
-        }
+        _ => crate::diag_util::halt_unknown_subfn(
+            "battery", subfn, pc,
+            ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
+        ),
     }
 }
 

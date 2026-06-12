@@ -22,10 +22,20 @@
 //! Writes and erases call into `peripherals::flash` which owns the
 //! backing bytes (same backing stage-2 maps RW).
 
-use crate::{cpu, guest_mem, kprintln, peripherals::flash, peripherals::guest_access, trap_context::TrapContext};
+use crate::{guest_mem, peripherals::flash, peripherals::guest_access, trap_context::TrapContext};
+use crate::peripherals::native_primitives::NativeDriver;
 
-/// Flash-driver class ID in the native-primitive encoding.
-pub const DRIVER_ID: u32 = 0x00_0000;
+/// Marker for the [`NativeDriver`] dispatch in
+/// `peripherals/native_primitives.rs`.
+pub struct FlashDriver;
+
+impl NativeDriver for FlashDriver {
+    /// Flash-driver class ID in the native-primitive encoding.
+    const DRIVER_ID: u32 = 0x00_0000;
+    fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
+        handle(ctx, subfn, pc)
+    }
+}
 
 /// `kError_Flash_AddressOutOfRange` (NewtonErrors.h; Einstein uses -10562).
 const ERR_FLASH_ADDR_OUT_OF_RANGE: u32 = (-10562i32) as u32;
@@ -39,7 +49,7 @@ const ERR_FLASH_ADDR_OUT_OF_RANGE: u32 = (-10562i32) as u32;
 /// cover EM300 and MP2100D.
 const VTABLES_32BIT: [u32; 3] = [0x0001_E3D4, 0x0001_E3E0, 0x0001_E180];
 
-pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
+fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
     match subfn {
         0x01 => identify(ctx, pc),
         // CleanUp / Init / InitializeDriverData / CleanUpDriverData /
@@ -57,13 +67,10 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         0x0D => begin_write(ctx, pc),
         0x0F => do_write(ctx, pc),
         0x10 => do_erase(ctx, pc),
-        _ => {
-            kprintln!(
-                "*** flash_driver: unknown subfn {:#x} @PC={:#x} r1={:#x} r2={:#x} r3={:#x}",
-                subfn, pc, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32
-            );
-            cpu::halt();
-        }
+        _ => crate::diag_util::halt_unknown_subfn(
+            "flash_driver", subfn, pc,
+            ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
+        ),
     }
 }
 

@@ -114,7 +114,11 @@ pub fn rearm() {
 /// refresh the non-trapping tick page, latch crossed matches, and rearm
 /// for the next heartbeat. trap.rs's shared `update_virq` then sets
 /// HCR_EL2.VI for delivery to the guest.
-pub fn on_irq() {
+///
+/// Takes a [`crate::slim_isr::IrqCap`] so it can only be reached from the
+/// EL2 IRQ-vector path, never from a `cpu::with_irqs_unmasked` window —
+/// see `slim_isr` for the ownership contract.
+pub fn on_irq(_cap: crate::slim_isr::IrqCap) {
     // Stale-TLB guard. The hypervisor rewrites guest stage-1 PTEs
     // behind the guest's back (fix_stage1_xn_bits, the shadow-stub
     // alias redirects, the scratch-pool install) without targeted TLB

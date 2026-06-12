@@ -38,6 +38,7 @@ mod rom_patches;
 #[cfg(feature = "platform-raspi3b")]
 mod sd;
 mod shadow_stub;
+mod slim_isr;
 mod snapshot;
 mod stage2;
 mod symbols;

@@ -16,12 +16,22 @@
 //! `TNativePrimitives::ExecuteHostCallNative`
 //! (`Emulator/TNativePrimitives.cpp:2515-2882`).
 
-use crate::{cpu, kprintln, trap_context::TrapContext};
+use crate::trap_context::TrapContext;
+use crate::peripherals::native_primitives::NativeDriver;
 
-/// Host-call driver class ID in the native-primitive encoding.
-pub const DRIVER_ID: u32 = 0x00_0009;
+/// Marker for the [`NativeDriver`] dispatch in
+/// `peripherals/native_primitives.rs`.
+pub struct HostCall;
 
-pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
+impl NativeDriver for HostCall {
+    /// Host-call driver class ID in the native-primitive encoding.
+    const DRIVER_ID: u32 = 0x00_0009;
+    fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
+        handle(ctx, subfn, pc)
+    }
+}
+
+fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
     match subfn {
         // Init/Delete (Einstein doesn't write r0 for these on its
         // 32-bit Linux path; just no-op).
@@ -58,15 +68,9 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
             ctx.x[0] = 0;
         }
 
-        _ => {
-            kprintln!(
-                "*** host_call: unknown subfn {:#x} @PC={:#x} r1={:#x} r2={:#x} r3={:#x}",
-                subfn, pc, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32
-            );
-            kprintln!(
-                "    (extend peripherals/host_call.rs::handle to add this subfn)"
-            );
-            cpu::halt();
-        }
+        _ => crate::diag_util::halt_unknown_subfn(
+            "host_call", subfn, pc,
+            ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
+        ),
     }
 }

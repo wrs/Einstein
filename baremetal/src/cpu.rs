@@ -273,11 +273,11 @@ pub fn unmask_irqs_el2() {
 ///
 /// ## Caller invariants
 ///
-/// - `f` must not touch any state that `trap::irq_from_el2` touches
-///   (the VIC tick/match state, host_dma channel CS registers, the
-///   uart TX ring tail, the audio MAI/stereo rings, or vic::raise) —
-///   a nested IRQ may mutate it concurrently. kprintln is safe (it
-///   masks IRQs around its own critical section).
+/// - `f` must not touch any state that `trap::irq_from_el2` owns — a
+///   nested IRQ may mutate it concurrently. That set, and the
+///   compiler-enforced gate on the slim-ISR dispatch (the `IrqCap`
+///   token `f` cannot obtain), are documented once in [`crate::slim_isr`].
+///   kprintln is safe (it masks IRQs around its own critical section).
 /// - Only call after the surrounding handler has finished reading
 ///   ESR_EL2 / FAR_EL2: a nested exception entry overwrites those too.
 pub fn with_irqs_unmasked<R>(f: impl FnOnce() -> R) -> R {

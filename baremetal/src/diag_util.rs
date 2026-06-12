@@ -199,3 +199,38 @@ impl TwoTierLog {
         self.unknown.allow()
     }
 }
+
+/// Loud halt for an unrecognised native-primitive sub-function.
+///
+/// Every native driver (`peripherals/native_primitives.rs` dispatches to
+/// flash_driver, platform, sound, …) routes its `_ =>` arm here so the
+/// "unknown subfn" trip-wire prints a uniform, fully-actionable context
+/// dump: the driver/file name, the sub-function, the guest PC, the
+/// argument registers, and the exact file to extend. `file` is the
+/// driver's source file stem (e.g. `"battery"`), used both as the
+/// message label and in the "extend peripherals/<file>.rs::handle" hint.
+///
+/// r0..r3 are printed unconditionally — the superset of what the
+/// per-driver copies this replaces used to print, so no argument is ever
+/// dropped from a halt (the prior copies variously printed r1..r3,
+/// r0..r2, or r1..r2).
+pub fn halt_unknown_subfn(
+    file: &'static str,
+    subfn: u32,
+    pc: u32,
+    r0: u32,
+    r1: u32,
+    r2: u32,
+    r3: u32,
+) -> ! {
+    crate::kprintln!();
+    crate::kprintln!(
+        "*** {}: unknown subfn {:#x} @PC={:#x} r0={:#x} r1={:#x} r2={:#x} r3={:#x}",
+        file, subfn, pc, r0, r1, r2, r3
+    );
+    crate::kprintln!(
+        "    (extend peripherals/{}.rs::handle to add this subfn)",
+        file
+    );
+    crate::cpu::halt();
+}

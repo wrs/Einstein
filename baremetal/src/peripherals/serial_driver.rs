@@ -16,16 +16,26 @@
 //! 0x35 PutByte routes the byte (r1) through `kprintln!` with a budgeted
 //! log so guest serial output is visible without flooding the UART.
 
-use crate::{cpu, kprintln, trap_context::TrapContext};
+use crate::{kprintln, trap_context::TrapContext};
+use crate::peripherals::native_primitives::NativeDriver;
 
-/// Serial-chip-driver class ID in the native-primitive encoding.
-pub const DRIVER_ID: u32 = 0x00_0006;
+/// Marker for the [`NativeDriver`] dispatch in
+/// `peripherals/native_primitives.rs`.
+pub struct SerialDriver;
+
+impl NativeDriver for SerialDriver {
+    /// Serial-chip-driver class ID in the native-primitive encoding.
+    const DRIVER_ID: u32 = 0x00_0006;
+    fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
+        handle(ctx, subfn, pc)
+    }
+}
 
 /// `kSerErrTimeout` / generic Voyager-deprecated error per Einstein
 /// (TNativePrimitives.cpp:2045).
 const ERR_VOYAGER_DEPRECATED: u32 = (-10000i32) as u32;
 
-pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
+fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
     // < 0x30 is the deprecated Voyager-chip dispatch path.
     if subfn < 0x30 {
         ctx.x[0] = ERR_VOYAGER_DEPRECATED as u64;
@@ -87,16 +97,10 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
             ctx.x[0] = 0;
         }
 
-        _ => {
-            kprintln!(
-                "*** serial_driver: unknown subfn {:#x} @PC={:#x} r1={:#x} r2={:#x}",
-                subfn, pc, ctx.x[1] as u32, ctx.x[2] as u32
-            );
-            kprintln!(
-                "    (extend peripherals/serial_driver.rs::handle to add this subfn)"
-            );
-            cpu::halt();
-        }
+        _ => crate::diag_util::halt_unknown_subfn(
+            "serial_driver", subfn, pc,
+            ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
+        ),
     }
 }
 

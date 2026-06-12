@@ -163,9 +163,26 @@ static DMA: DmaCell = DmaCell(UnsafeCell::new(DmaState {
 /// routine traffic.
 static LOG: crate::diag_util::TwoTierLog = crate::diag_util::TwoTierLog::new(8, 64);
 
+/// Marker for the [`crate::mmio::MmioPeripheral`] router. The DMA
+/// register state lives in the module-level `DMA` cell; this zero-sized
+/// type only names the model for static dispatch.
+pub struct Dma;
+
+impl crate::mmio::MmioPeripheral for Dma {
+    fn owns(ipa: u64) -> bool {
+        owns(ipa)
+    }
+    fn read(ipa: u64) -> u32 {
+        read(ipa)
+    }
+    fn write(ipa: u64, value: u32) {
+        write(ipa, value)
+    }
+}
+
 /// Returns true if `ipa` falls in the DMA register window this module
 /// owns.
-pub fn owns(ipa: u64) -> bool {
+fn owns(ipa: u64) -> bool {
     (BANK1_BASE..BANK1_END).contains(&ipa)
         || ipa == K_HDWR_ASSIGN
         || (BANK2_BASE..BANK2_END).contains(&ipa)
@@ -194,7 +211,7 @@ fn split_channel_reg(ipa: u64) -> (u32, u32, u32) {
     (bank, channel, register)
 }
 
-pub fn read(ipa: u64) -> u32 {
+fn read(ipa: u64) -> u32 {
     // SAFETY: single-threaded.
     let s = unsafe { &mut *DMA.0.get() };
     match ipa {
@@ -208,7 +225,7 @@ pub fn read(ipa: u64) -> u32 {
     }
 }
 
-pub fn write(ipa: u64, value: u32) {
+fn write(ipa: u64, value: u32) {
     // SAFETY: single-threaded.
     let s = unsafe { &mut *DMA.0.get() };
     match ipa {

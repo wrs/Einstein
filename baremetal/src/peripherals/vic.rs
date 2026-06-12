@@ -656,9 +656,26 @@ pub fn heartbeat_tick_update() {
 
 // ---------- MMIO dispatch ----------------------------------------------------
 
+/// Marker for the [`crate::mmio::MmioPeripheral`] router. The register
+/// state lives in the module-level `VIC` cell; this zero-sized type only
+/// names the model for static dispatch.
+pub struct Vic;
+
+impl crate::mmio::MmioPeripheral for Vic {
+    fn owns(ipa: u64) -> bool {
+        owns(ipa)
+    }
+    fn read(ipa: u64) -> u32 {
+        read(ipa)
+    }
+    fn write(ipa: u64, value: u32) {
+        write(ipa, value)
+    }
+}
+
 /// True if `ipa` is handled by this module. Keeps `mmio::read/write`
 /// tidy without forcing it to know every register address.
-pub fn owns(ipa: u64) -> bool {
+fn owns(ipa: u64) -> bool {
     match ipa {
         K_HDWR_PLATFORM_VERS
         | K_HDWR_P0F110000
@@ -694,7 +711,7 @@ pub fn owns(ipa: u64) -> bool {
     }
 }
 
-pub fn read(ipa: u64) -> u32 {
+fn read(ipa: u64) -> u32 {
     // SAFETY: single-threaded access from the trap handler.
     let s = unsafe { &mut *VIC.0.get() };
     match ipa {
@@ -751,7 +768,7 @@ pub fn read(ipa: u64) -> u32 {
     }
 }
 
-pub fn write(ipa: u64, value: u32) {
+fn write(ipa: u64, value: u32) {
     // SAFETY: single-threaded access.
     let s = unsafe { &mut *VIC.0.get() };
     // Log architecturally-significant VIC writes for diagnostic purposes.

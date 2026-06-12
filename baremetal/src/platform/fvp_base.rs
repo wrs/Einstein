@@ -87,7 +87,7 @@ pub fn irq_spurious() -> u32 {
 /// They exist so the IRQ path in `trap` is free of platform cfg blocks
 /// (the BCM2835 versions live in `raspi3b.rs`).
 #[inline]
-pub fn dispatch_dma_completions() {}
+pub fn dispatch_dma_completions(_cap: crate::slim_isr::IrqCap) {}
 
 #[inline]
 pub fn poll_usb_fast_path() -> super::UsbFastPath {

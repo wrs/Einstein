@@ -163,7 +163,24 @@ static SLOT3: SlotRegs = SlotRegs::new();
 /// silent behind routine traffic.
 static LOG: crate::diag_util::TwoTierLog = crate::diag_util::TwoTierLog::new(8, 64);
 
-pub fn owns(ipa: u64) -> bool {
+/// Marker for the [`crate::mmio::MmioPeripheral`] router. The four slot
+/// register banks are module-level statics; this zero-sized type only
+/// names the model for static dispatch.
+pub struct Pcmcia;
+
+impl crate::mmio::MmioPeripheral for Pcmcia {
+    fn owns(ipa: u64) -> bool {
+        owns(ipa)
+    }
+    fn read(ipa: u64) -> u32 {
+        read(ipa)
+    }
+    fn write(ipa: u64, value: u32) {
+        write(ipa, value)
+    }
+}
+
+fn owns(ipa: u64) -> bool {
     ipa_to_slot(ipa).is_some()
 }
 
@@ -181,7 +198,7 @@ fn ipa_to_slot(ipa: u64) -> Option<(&'static SlotRegs, u64, u8)> {
     }
 }
 
-pub fn read(ipa: u64) -> u32 {
+fn read(ipa: u64) -> u32 {
     let (regs, off, slot) = match ipa_to_slot(ipa) {
         Some(x) => x,
         // mmio.rs only routes here when `owns()` (== ipa_to_slot is
@@ -226,7 +243,7 @@ pub fn read(ipa: u64) -> u32 {
     0
 }
 
-pub fn write(ipa: u64, value: u32) {
+fn write(ipa: u64, value: u32) {
     let (regs, off, slot) = match ipa_to_slot(ipa) {
         Some(x) => x,
         // Unreachable for the same reason as `read` — see there.

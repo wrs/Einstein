@@ -33,11 +33,21 @@
 //! live host viewer for display.
 
 use crate::{cpu, guest_mem, kprintln, peripherals::guest_access, trap_context::TrapContext};
+use crate::peripherals::native_primitives::NativeDriver;
 
-/// Screen-class driver ID in the native-primitive encoding.
-pub const DRIVER_ID: u32 = 0x00_0004;
+/// Marker for the [`NativeDriver`] dispatch in
+/// `peripherals/native_primitives.rs`.
+pub struct Screen;
 
-pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
+impl NativeDriver for Screen {
+    /// Screen-class driver ID in the native-primitive encoding.
+    const DRIVER_ID: u32 = 0x00_0004;
+    fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
+        handle(ctx, subfn, pc)
+    }
+}
+
+fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
     match subfn {
         0x01 => {
             // Delete — no-op, success.
@@ -63,13 +73,10 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
             // accept the write (return 0).
             ctx.x[0] = 0;
         }
-        _ => {
-            kprintln!(
-                "*** screen: unknown subfn {:#x} @PC={:#x} r1={:#x} r2={:#x} r3={:#x}",
-                subfn, pc, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32
-            );
-            cpu::halt();
-        }
+        _ => crate::diag_util::halt_unknown_subfn(
+            "screen", subfn, pc,
+            ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
+        ),
     }
 }
 

@@ -9,17 +9,27 @@
 //! `TNativePrimitives::ExecuteNetworkManagerNative`
 //! (`Emulator/TNativePrimitives.cpp:2889-3151`).
 
-use crate::{cpu, kprintln, peripherals::guest_access, trap_context::TrapContext};
+use crate::{kprintln, peripherals::guest_access, trap_context::TrapContext};
+use crate::peripherals::native_primitives::NativeDriver;
 
-/// Network-manager driver class ID in the native-primitive encoding.
-pub const DRIVER_ID: u32 = 0x00_000A;
+/// Marker for the [`NativeDriver`] dispatch in
+/// `peripherals/native_primitives.rs`.
+pub struct Network;
+
+impl NativeDriver for Network {
+    /// Network-manager driver class ID in the native-primitive encoding.
+    const DRIVER_ID: u32 = 0x00_000A;
+    fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
+        handle(ctx, subfn, pc)
+    }
+}
 
 /// MAC address Einstein's `TUsermodeNetwork::GetDeviceAddress` reports
 /// when no host bridge is configured. Mirrored verbatim so a Newton
 /// guest sees the same hardware identity it would on Einstein.
 const DEFAULT_MAC: [u8; 6] = [0x58, 0xB0, 0x35, 0x77, 0xD7, 0x22];
 
-pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
+fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
     match subfn {
         // 0x00 Unknown — no-op log slot. r0 untouched per Einstein.
         0x00 => {}
@@ -86,16 +96,10 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         // 0x16 — debug print of memory location; no-op.
         0x16 => {}
 
-        _ => {
-            kprintln!(
-                "*** network: unknown subfn {:#x} @PC={:#x} r0={:#x} r1={:#x} r2={:#x}",
-                subfn, pc, ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32
-            );
-            kprintln!(
-                "    (extend peripherals/network.rs::handle to add this subfn)"
-            );
-            cpu::halt();
-        }
+        _ => crate::diag_util::halt_unknown_subfn(
+            "network", subfn, pc,
+            ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
+        ),
     }
 }
 

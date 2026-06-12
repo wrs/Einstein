@@ -67,8 +67,25 @@ mod reg {
     ];
 }
 
+/// Marker for the [`crate::mmio::MmioPeripheral`] router. The four
+/// TSerialChip windows are stateless models; this zero-sized type only
+/// names the model for static dispatch.
+pub struct Serial;
+
+impl crate::mmio::MmioPeripheral for Serial {
+    fn owns(ipa: u64) -> bool {
+        owns(ipa)
+    }
+    fn read(ipa: u64) -> u32 {
+        read(ipa)
+    }
+    fn write(ipa: u64, value: u32) {
+        write(ipa, value)
+    }
+}
+
 /// True iff `ipa` lands inside one of the four port windows.
-pub fn owns(ipa: u64) -> bool {
+fn owns(ipa: u64) -> bool {
     (EXTERNAL_BASE..SERIAL_END).contains(&ipa)
 }
 
@@ -92,7 +109,7 @@ fn port_name(port: u8) -> &'static str {
     }
 }
 
-pub fn read(ipa: u64) -> u32 {
+fn read(ipa: u64) -> u32 {
     let (port, off) = split(ipa);
     match off {
         // Status: TX FIFO empty, RX FIFO empty, no handshake lines. A
@@ -113,7 +130,7 @@ pub fn read(ipa: u64) -> u32 {
     }
 }
 
-pub fn write(ipa: u64, value: u32) {
+fn write(ipa: u64, value: u32) {
     let (port, off) = split(ipa);
     match off {
         reg::TX_BYTE => log_tx_byte(port, value as u8),

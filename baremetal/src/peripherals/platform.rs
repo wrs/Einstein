@@ -15,9 +15,19 @@
 //! Logging subfns (0x1A Log) write through to the hypervisor UART.
 
 use crate::{cpu, kprintln, peripherals::guest_access, trap_context::TrapContext};
+use crate::peripherals::native_primitives::NativeDriver;
 
-/// Platform-driver class ID in the native-primitive encoding.
-pub const DRIVER_ID: u32 = 0x00_0001;
+/// Marker for the [`NativeDriver`] dispatch in
+/// `peripherals/native_primitives.rs`.
+pub struct Platform;
+
+impl NativeDriver for Platform {
+    /// Platform-driver class ID in the native-primitive encoding.
+    const DRIVER_ID: u32 = 0x00_0001;
+    fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
+        handle(ctx, subfn, pc)
+    }
+}
 
 /// `kUP2Version` from `Emulator/Platform/PlatformGestalt.h:43`.
 const UP2_VERSION: u32 = 0x0001_0003;
@@ -26,7 +36,7 @@ const UP2_VERSION: u32 = 0x0001_0003;
 /// unsupported GetPCMCIAPowerSpec selectors (TNativePrimitives.cpp:823).
 const ERR_NOT_IMPLEMENTED: u32 = (-10005i32) as u32;
 
-pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
+fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
     match subfn {
         // No-op, no return value (New).
         0x01 => {}
@@ -104,13 +114,10 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         0x22 => {
             ctx.x[0] = 0;
         }
-        _ => {
-            kprintln!(
-                "*** platform: unknown subfn {:#x} @PC={:#x} r1={:#x} r2={:#x} r3={:#x}",
-                subfn, pc, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32
-            );
-            cpu::halt();
-        }
+        _ => crate::diag_util::halt_unknown_subfn(
+            "platform", subfn, pc,
+            ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
+        ),
     }
 }
 

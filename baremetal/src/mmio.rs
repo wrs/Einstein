@@ -32,7 +32,52 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::{cpu, kprintln, peripherals::{dma, pcmcia, serial, vic}};
+use crate::{cpu, kprintln};
+use crate::peripherals::{dma::Dma, pcmcia::Pcmcia, serial::Serial, vic::Vic};
+
+/// Uniform contract for a peripheral model routed by this file.
+///
+/// Every model that sits in the [`read`]/[`write`] router below
+/// implements all four methods, so a model that forgets one fails to
+/// compile rather than silently falling through. Dispatch stays static:
+/// the router matches on `owns` and calls the inherent trait methods on
+/// the per-module zero-sized markers ([`Vic`], [`Dma`], [`Pcmcia`],
+/// [`Serial`]) — no `dyn`, no vtable.
+///
+/// `peek` is the side-effect-free read used by the BE-8 sub-word splice
+/// and extraction (see [`peek_word`]): it must observe the same value
+/// `read` would return without advancing any read side effect. The
+/// default forwards to `read`, valid only for models whose reads are
+/// genuinely side-effect-free — verified per model (vic/dma/pcmcia/serial
+/// all read pure state or recomputed clocks). The one stateful read in
+/// this dispatch, the ROM-serial-chip bit index, is an inline stub in
+/// this file (`read_word_opt`'s `advance_serial` flag), not one of these
+/// models.
+pub trait MmioPeripheral {
+    /// True if `ipa` falls in this model's register window.
+    fn owns(ipa: u64) -> bool;
+    /// Word read of the register at `ipa`, side effects included.
+    fn read(ipa: u64) -> u32;
+    /// Word write of `value` to the register at `ipa`.
+    fn write(ipa: u64, value: u32);
+    /// Side-effect-free read of the register at `ipa`.
+    fn peek(ipa: u64) -> u32 {
+        Self::read(ipa)
+    }
+}
+
+/// Route a model read through `read` (a real, side-effect-advancing
+/// access) or `peek` (the side-effect-free variant used by the sub-word
+/// splice / extraction) per `advance_serial`. The `_p` argument fixes
+/// the model type for inference without naming it twice at the call site.
+#[inline]
+fn mmio_read<P: MmioPeripheral>(_p: P, ipa: u64, advance_serial: bool) -> u32 {
+    if advance_serial {
+        P::read(ipa)
+    } else {
+        P::peek(ipa)
+    }
+}
 
 const HW_BASE: u64 = 0x0F00_0000;
 const HW_END: u64 = 0x0F40_0000;
@@ -171,7 +216,7 @@ pub fn read(ctx: &crate::trap_context::TrapContext, ipa: u64, sas: u8, elr: u64)
         // (TMemory.cpp:1518-1541), e.g. status reg 0x4400 → 0x80, with
         // NO BE-8 lane transform. Pass these through to the natural
         // offset and mask to the sub-word width.
-        if serial::owns(ipa) {
+        if Serial::owns(ipa) {
             return mask_for_size(read_word(ctx, ipa, elr, sas), sas);
         }
         // Word-addressed peripherals (vic/dma/pcmcia and the inline
@@ -249,10 +294,15 @@ fn read_word_opt(
     #[cfg(not(nh_guest_test))]
     let _ = sas;
     let value = match ipa {
-        a if vic::owns(a) => vic::read(a),
-        a if dma::owns(a) => dma::read(a),
-        a if pcmcia::owns(a) => pcmcia::read(a),
-        a if serial::owns(a) => serial::read(a),
+        // `advance_serial` distinguishes a real read from a peek. For
+        // these models read and peek are identical (their reads are
+        // side-effect-free), so the contract method picked here only
+        // documents intent; the ROM-serial-chip arm below is the one
+        // arm where the distinction is observable.
+        a if Vic::owns(a) => mmio_read(Vic, a, advance_serial),
+        a if Dma::owns(a) => mmio_read(Dma, a, advance_serial),
+        a if Pcmcia::owns(a) => mmio_read(Pcmcia, a, advance_serial),
+        a if Serial::owns(a) => mmio_read(Serial, a, advance_serial),
 
         // kHdWr_04RAMSize: Einstein TMemory.cpp:868-873 computes
         //   thePageCount = (mRAMSize >> 16) & 0xFF;
@@ -448,7 +498,7 @@ pub fn write(ctx: &crate::trap_context::TrapContext, ipa: u64, sas: u8, value: u
     // BE-8 lane transform. `serial::write` consumes the low byte
     // directly, matching the symmetric byte read above.
     #[cfg(not(nh_guest_test))]
-    let serial_byte_addressed = sas < 2 && serial::owns(ipa);
+    let serial_byte_addressed = sas < 2 && Serial::owns(ipa);
     #[cfg(not(nh_guest_test))]
     let (ipa, value) = if serial_byte_addressed {
         (ipa, value)
@@ -496,20 +546,20 @@ pub fn write(ctx: &crate::trap_context::TrapContext, ipa: u64, sas: u8, value: u
         );
         cpu::halt();
     }
-    if vic::owns(ipa) {
-        vic::write(ipa, value);
+    if Vic::owns(ipa) {
+        Vic::write(ipa, value);
         return;
     }
-    if dma::owns(ipa) {
-        dma::write(ipa, value);
+    if Dma::owns(ipa) {
+        Dma::write(ipa, value);
         return;
     }
-    if pcmcia::owns(ipa) {
-        pcmcia::write(ipa, value);
+    if Pcmcia::owns(ipa) {
+        Pcmcia::write(ipa, value);
         return;
     }
-    if serial::owns(ipa) {
-        serial::write(ipa, value);
+    if Serial::owns(ipa) {
+        Serial::write(ipa, value);
         return;
     }
     // RAM-probe "absent bank" window — dropped writes, deterministic

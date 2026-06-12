@@ -14,12 +14,22 @@
 //! `TNativePrimitives::ExecutePrinterDriverNative`
 //! (`Emulator/TNativePrimitives.cpp:3237-3375`).
 
-use crate::{cpu, kprintln, trap_context::TrapContext};
+use crate::trap_context::TrapContext;
+use crate::peripherals::native_primitives::NativeDriver;
 
-/// Printer-driver class ID in the native-primitive encoding.
-pub const DRIVER_ID: u32 = 0x00_000C;
+/// Marker for the [`NativeDriver`] dispatch in
+/// `peripherals/native_primitives.rs`.
+pub struct Printer;
 
-pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
+impl NativeDriver for Printer {
+    /// Printer-driver class ID in the native-primitive encoding.
+    const DRIVER_ID: u32 = 0x00_000C;
+    fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
+        handle(ctx, subfn, pc)
+    }
+}
+
+fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
     match subfn {
         // PDNew — void. No r0 write.
         0x01 => {}
@@ -47,15 +57,9 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         0x0C => {
             ctx.x[0] = 0;
         }
-        _ => {
-            kprintln!(
-                "*** printer: unknown subfn {:#x} @PC={:#x} r0={:#x} r1={:#x} r2={:#x}",
-                subfn, pc, ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32
-            );
-            kprintln!(
-                "    (extend peripherals/printer.rs::handle to add this subfn)"
-            );
-            cpu::halt();
-        }
+        _ => crate::diag_util::halt_unknown_subfn(
+            "printer", subfn, pc,
+            ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
+        ),
     }
 }

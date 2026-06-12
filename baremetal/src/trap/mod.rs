@@ -149,6 +149,10 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     // IRQ, which is the steady cadence this guard relies on.
     cpu::check_stack_guard();
 
+    // SAFETY: this is the EL2 IRQ vector entry — the one place permitted
+    // to mint a slim-ISR capability. See `slim_isr` for the contract.
+    let cap = unsafe { crate::slim_isr::IrqCap::mint() };
+
     let spsr = read_sysreg!("spsr_el2");
     let aarch32 = (spsr & (1 << 4)) != 0;
     let el2 = !aarch32 && ((spsr & 0b1100) == 0b1000);
@@ -169,9 +173,9 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     }
 
     if el2 {
-        irq_from_el2();
+        irq_from_el2(cap);
     } else {
-        irq_from_guest(ctx);
+        irq_from_guest(ctx, cap);
     }
 }
 
@@ -181,28 +185,17 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
 ///
 /// ## Contract
 ///
-/// 1. May run nested inside *any* other EL2 handler (or unmasked boot
-///    code). It must therefore touch no `ctx`-derived guest state and
-///    nothing that interprets ELR_EL2 / SPSR_EL2 as the guest's.
-/// 2. The complete set of state it mutates:
-///    - VIC tick/match state, via `timer::on_irq` (latches crossed
-///      match bits into `vic::int_present`, rearms CNTHP_CVAL_EL2).
-///    - host_dma channel CS registers, via `host_dma::on_completion`.
-///    - the uart TX ring tail, via `uart::on_tx_done` (reached through
-///      `host_dma::on_completion` of the UART TX channel).
-///    - the audio MAI ring + stereo ring tail + `vic::raise`, via
-///      `audio::on_mai_dma_done` (reached through
-///      `host_dma::on_completion` of the MAI TX channel).
-///    - the SDHOST controller registers + the flash-persist background
-///      DMA save state machine, via `flash_persist::on_sd_dma_done`
-///      (reached through `host_dma::on_completion` of the SD TX
-///      channel). Its completion handler briefly unmasks IRQs for the
-///      CMD12 busy-wait; the nested IRQs re-enter this slim path, which
-///      does not start saves, so the SD controller is never re-entered.
-///    - kprintln's own uart ring (it masks IRQs around its critical
-///      section, so it is re-entrant-safe from here).
-/// 3. Therefore code running inside `cpu::with_irqs_unmasked` must not
-///    touch any of the above.
+/// May run nested inside *any* other EL2 handler (or unmasked boot
+/// code). It must therefore touch no `ctx`-derived guest state and
+/// nothing that interprets ELR_EL2 / SPSR_EL2 as the guest's, and it
+/// owns a bounded set of mutable state that code in a
+/// `cpu::with_irqs_unmasked` window must not touch. That state set, and
+/// the compiler-enforced `IrqCap` gate on its two dispatch entry points
+/// (`timer::on_irq`, `platform::dispatch_dma_completions`), are
+/// documented once in [`crate::slim_isr`]. One subtlety worth keeping
+/// local: `flash_persist::on_sd_dma_done`'s CMD12 busy-wait briefly
+/// unmasks IRQs, so a nested IRQ re-enters this slim path — which does
+/// not start saves, so the SD controller is never re-entered.
 ///
 /// Deliberately absent vs. the guest path: no `ctx` access, no
 /// heartbeat / wedge / task_dump / heap_check / tripwire sampling, no
@@ -210,7 +203,7 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
 /// while EL2 executes on this single core, so vIRQ delivery correctly
 /// waits for the next guest trap exit), no snapshot autosave, no splash
 /// progress, no g1/alrt capture rearm.
-fn irq_from_el2() {
+fn irq_from_el2(cap: crate::slim_isr::IrqCap) {
     // Acknowledge on the host CPU-interface (GICv3 on FVP, no-op on
     // BCM2836). A spurious ACK means nothing is pending and we skip
     // timer::on_irq, mirroring the guest path.
@@ -220,14 +213,14 @@ fn irq_from_el2() {
     // BCM2835 DMA channel dispatch: channel N raises GPU IRQ source
     // 16+N. UART-TX owns ch 5, MAI-TX owns ch 4. Platform-owned; a
     // no-op on FVP and on QEMU raspi3b (no BCM2835 DMA engine there).
-    platform::dispatch_dma_completions();
+    platform::dispatch_dma_completions(cap);
 
     // CNTHP is level-triggered; not rearming it would storm. Calling
     // it when the real source was a DMA channel is harmless — it is
     // wall-clock-paced — and matches the guest path's behavior on BCM
     // where the ack is a no-op.
     if !spurious {
-        timer::on_irq();
+        timer::on_irq(cap);
     }
 
     // EOI last so the GIC is ready to deliver the next interrupt.
@@ -239,7 +232,7 @@ fn irq_from_el2() {
 /// running. Latches Newton timer-match deadlines into `vic::int_present`,
 /// rearms CNTHP_CVAL_EL2, runs the diagnostic / input-pump / autosave
 /// tail, and updates HCR_EL2.VI so the guest takes a virtual IRQ on ERET.
-fn irq_from_guest(ctx: &mut TrapContext) {
+fn irq_from_guest(ctx: &mut TrapContext, cap: crate::slim_isr::IrqCap) {
     // Acknowledge the interrupt on the host CPU-interface (GICv3 on
     // FVP, no-op on BCM2836) before doing any work. On GICv3 the
     // returned INTID identifies which source fired; a spurious ACK
@@ -252,7 +245,7 @@ fn irq_from_guest(ctx: &mut TrapContext) {
     // here). DMA channel N raises GPU IRQ source 16+N (Circle's
     // ARM_IRQ_DMA0 = 16). UART-TX owns ch 5, MAI-TX owns ch 4.
     // Platform-owned; a no-op off real hardware.
-    platform::dispatch_dma_completions();
+    platform::dispatch_dma_completions(cap);
 
     // Diagnostic heartbeat: sample guest PC so we can see where it's
     // executing when no MMIO traps are firing.
@@ -312,7 +305,7 @@ fn irq_from_guest(ctx: &mut TrapContext) {
     crate::heap_check::log_heap_bounds_once();
 
     if !spurious {
-        timer::on_irq();
+        timer::on_irq(cap);
     }
     // Pump host PL011 -> guest extr-port RX DMA buffer. No-op when
     // DMA ch0 is not armed. See peripherals/dma.rs::poll_rx.

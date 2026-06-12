@@ -18,12 +18,23 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::{audio, cpu, dprintln, kprintln};
+use crate::{audio, dprintln};
 use crate::peripherals::vic;
 use crate::trap_context::TrapContext;
 
-/// Sound-driver class ID in the native-primitive encoding.
-pub const DRIVER_ID: u32 = 0x00_0002;
+use crate::peripherals::native_primitives::NativeDriver;
+
+/// Marker for the [`NativeDriver`] dispatch in
+/// `peripherals/native_primitives.rs`.
+pub struct Sound;
+
+impl NativeDriver for Sound {
+    /// Sound-driver class ID in the native-primitive encoding.
+    const DRIVER_ID: u32 = 0x00_0002;
+    fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
+        handle(ctx, subfn, pc)
+    }
+}
 
 /// NewtonErrors "Sound hardware not present" — returned by
 /// SetSoundHardwareInfo. Matches Einstein's constant in the 0x03 arm of
@@ -37,7 +48,7 @@ static SUBFN_COUNT: [AtomicU32; 32] = [const { AtomicU32::new(0) }; 32];
 /// Bitmask of subfns seen at least once, for the first-occurrence trace.
 static SEEN: AtomicU32 = AtomicU32::new(0);
 
-pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
+fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
     // Diagnostic: log first occurrence of each subfn so we can see what
     // the kernel exercises during sound init.
     let bit = 1u32 << (subfn & 0x1F);
@@ -267,19 +278,9 @@ pub fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
             audio::set_interrupt_mask(ctx.x[1] as u32, ctx.x[2] as u32);
         }
 
-        _ => {
-            kprintln!(
-                "*** unknown sound-driver native primitive subfn={:#x} @PC={:#x}",
-                subfn, pc
-            );
-            kprintln!(
-                "    r0={:#x} r1={:#x} r2={:#x} r3={:#x}",
-                ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32
-            );
-            kprintln!(
-                "    (extend peripherals/sound.rs::handle to add this subfn)"
-            );
-            cpu::halt();
-        }
+        _ => crate::diag_util::halt_unknown_subfn(
+            "sound", subfn, pc,
+            ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
+        ),
     }
 }

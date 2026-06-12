@@ -17,6 +17,7 @@ mod guest;
 mod guest_bp;
 mod guest_endian;
 mod guest_mem;
+mod guest_regions;
 mod heap_check;
 mod host_dma;
 mod host_io;

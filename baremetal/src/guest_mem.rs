@@ -234,9 +234,6 @@ pub const FB_SIZE: usize = FRAMEBUFFER_SIZE;
 /// Guest RAM IPA base (stage-2 maps this to `ram_host_pa`).
 pub const RAM_IPA_BASE: u32 = 0x0400_0000;
 
-const RAM_BASE_USIZE: usize = RAM_IPA_BASE as usize;
-const FB_BASE_USIZE: usize = FB_IPA_BASE as usize;
-
 /// Read a 32-bit word from a guest physical address by resolving the
 /// backing store directly. Returns None if `pa` is outside the ROM /
 /// RAM / framebuffer / scratch-pool regions we own. Pre-MMU
@@ -248,34 +245,30 @@ pub fn read_word_pa(pa: u32) -> Option<u32> {
     Some(unsafe { core::ptr::read_volatile(h as *const u32) })
 }
 
-/// Map a guest IPA + size to the host backing pointer. Centralises the
-/// region table used by the typed PA helpers so regions added here
-/// (e.g. the shadow-stub `SCRATCH_POOL`) are visible to all callers
-/// in one shot. `for_write=true` excludes ROM (read-only at the
-/// hypervisor backing layer).
+/// Map a guest IPA + size to the host backing pointer. Drives off the
+/// single region manifest (`guest_regions::REGIONS`) so the set of
+/// EL2-reachable backings has one definition shared with stage-2 and the
+/// snapshot. `for_write=true` excludes read-only regions (ROM is RO at
+/// the hypervisor backing layer; flash is RO and not reachable here at
+/// all). Only manifest entries flagged `host_addr_for` participate —
+/// the flash banks are stage-2-mapped but their backing is owned by
+/// `peripherals::flash`, so they fall through to `None` here.
+/// Public probe used by `stage2::cross_check_manifest` to confirm a
+/// manifest region that claims `host_addr_for` actually resolves through
+/// this layer. Resolves a 4-byte access at `ipa`.
+pub fn host_pa_for_ipa(ipa: u64, for_write: bool) -> Option<usize> {
+    host_addr_for(ipa as usize, 4, for_write)
+}
+
 fn host_addr_for(pa: usize, size: usize, for_write: bool) -> Option<usize> {
-    if !for_write && pa + size <= ROM_SIZE {
-        return Some(rom_host_pa() as usize + pa);
+    let r = crate::guest_regions::region_for(pa as u64, size as u64)?;
+    if !r.host_addr_for {
+        return None;
     }
-    if (RAM_BASE_USIZE..RAM_BASE_USIZE + RAM_SIZE).contains(&pa)
-        && pa + size <= RAM_BASE_USIZE + RAM_SIZE
-    {
-        return Some(ram_host_pa() as usize + (pa - RAM_BASE_USIZE));
+    if for_write && r.perm == crate::guest_regions::Stage2Perm::ReadOnly {
+        return None;
     }
-    if (FB_BASE_USIZE..FB_BASE_USIZE + FB_SIZE).contains(&pa)
-        && pa + size <= FB_BASE_USIZE + FB_SIZE
-    {
-        return Some(fb_host_pa() as usize + (pa - FB_BASE_USIZE));
-    }
-    // Shadow-stub scratch pool. Covers the hypervisor-managed RW IPA
-    // window at `SCRATCH_POOL_IPA..+SCRATCH_POOL_SIZE`. Behaves like
-    // RAM at this layer — full RW from EL2 via the host backing.
-    let scratch_base = crate::shadow_stub::SCRATCH_POOL_IPA as usize;
-    let scratch_end = scratch_base + crate::shadow_stub::SCRATCH_POOL_SIZE;
-    if (scratch_base..scratch_end).contains(&pa) && pa + size <= scratch_end {
-        return Some(crate::shadow_stub::scratch_pool_host_pa() as usize + (pa - scratch_base));
-    }
-    None
+    Some(r.host_pa() as usize + (pa - r.ipa as usize))
 }
 
 /// Read one halfword (16 bits) from a guest PA. Alignment is the

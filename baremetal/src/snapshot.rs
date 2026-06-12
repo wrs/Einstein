@@ -538,37 +538,21 @@ fn save_via_semihost(gprs: &[u64; 31]) -> Result<(), &'static str> {
     };
     write_all(&fh, header_bytes)?;
 
+    // Region bytes, in the order defined by the manifest's snapshotted
+    // entries (RAM, FB, SCRATCH_POOL). The manifest is the single source
+    // of truth shared with stage-2 and host_addr_for; driving the save
+    // loop off it keeps the on-disk region set/order from drifting away
+    // from what stage-2 actually exposes to the guest.
+    //
     // SAFETY: the backing stores are static mut u8 arrays; we take a
     // read-only view for the duration of the semihosting write, no
     // concurrent writer is possible on single-core EL2.
-    let ram = unsafe {
-        core::slice::from_raw_parts(
-            guest_mem::ram_host_pa() as *const u8,
-            guest_mem::RAM_SIZE,
-        )
-    };
-    write_all(&fh, ram)?;
-
-    let fb = unsafe {
-        core::slice::from_raw_parts(
-            guest_mem::fb_host_pa() as *const u8,
-            guest_mem::FRAMEBUFFER_SIZE,
-        )
-    };
-    write_all(&fh, fb)?;
-
-    // SCRATCH_POOL is mapped RW into the guest (stage-2 at IPA
-    // 0x0600_0000) and holds cross-trap state — notably the DABT
-    // trampoline's LR_abt/SP_abt/SPSR_abt save slots, which patched
-    // kernel code reads back several instructions after the abort. It
-    // is guest-visible state, so it belongs in the snapshot.
-    let scratch = unsafe {
-        core::slice::from_raw_parts(
-            crate::shadow_stub::scratch_pool_host_pa() as *const u8,
-            crate::shadow_stub::SCRATCH_POOL_SIZE,
-        )
-    };
-    write_all(&fh, scratch)?;
+    for region in crate::guest_regions::snapshot_regions() {
+        let bytes = unsafe {
+            core::slice::from_raw_parts(region.host_pa() as *const u8, region.size as usize)
+        };
+        write_all(&fh, bytes)?;
+    }
 
     // Flash bytes live in `$HOME/.newton/flash.bin` (see
     // `flash_persist`), not in this snapshot file. The header carries
@@ -779,40 +763,19 @@ pub fn load(path: &[u8]) -> Option<RestoreState> {
         return None;
     }
 
+    // Region bytes, read back in the same manifest-defined order the
+    // save loop wrote them (RAM, FB, SCRATCH_POOL).
+    //
     // SAFETY: backing stores are static mut u8 arrays; we overwrite
     // them entirely before the guest runs again.
-    let ram = unsafe {
-        core::slice::from_raw_parts_mut(
-            guest_mem::ram_host_pa() as *mut u8,
-            guest_mem::RAM_SIZE,
-        )
-    };
-    if read_all(&fh, ram).is_err() {
-        close(fh);
-        return None;
-    }
-
-    let fb = unsafe {
-        core::slice::from_raw_parts_mut(
-            guest_mem::fb_host_pa() as *mut u8,
-            guest_mem::FRAMEBUFFER_SIZE,
-        )
-    };
-    if read_all(&fh, fb).is_err() {
-        close(fh);
-        return None;
-    }
-
-    // SCRATCH_POOL — written in the same fixed order as `save`.
-    let scratch = unsafe {
-        core::slice::from_raw_parts_mut(
-            crate::shadow_stub::scratch_pool_host_pa() as *mut u8,
-            crate::shadow_stub::SCRATCH_POOL_SIZE,
-        )
-    };
-    if read_all(&fh, scratch).is_err() {
-        close(fh);
-        return None;
+    for region in crate::guest_regions::snapshot_regions() {
+        let dst = unsafe {
+            core::slice::from_raw_parts_mut(region.host_pa() as *mut u8, region.size as usize)
+        };
+        if read_all(&fh, dst).is_err() {
+            close(fh);
+            return None;
+        }
     }
 
     close(fh);

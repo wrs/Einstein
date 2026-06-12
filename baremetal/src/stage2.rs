@@ -15,7 +15,7 @@
 
 use core::ptr::addr_of_mut;
 
-use crate::{guest_mem, kprintln, peripherals};
+use crate::{guest_mem, guest_regions, kprintln};
 
 // VMSAv8-64 stage-2 descriptor bits
 const DESC_VALID: u64 = 1 << 0;
@@ -116,20 +116,17 @@ const TICK_PAGE_IPA: u64 = 0x0F18_1000;
 
 const TWO_MIB: u64 = 0x0020_0000;
 
-// IPA ranges the guest expects. Keep in sync with TMemoryConsts on the
-// Einstein side.
-pub const ROM_IPA_BASE: u64 = 0x0000_0000;
-pub const ROM_IPA_SIZE: u64 = 0x0100_0000; // 16 MiB
+// IPA ranges the guest expects are defined once in the region manifest
+// (`guest_regions::REGIONS`); stage-2, host_addr_for, and the snapshot
+// all consume that table. Only the RAM base/size are duplicated here
+// because the L3 install helpers index into the RAM aperture directly.
+//
 // Flash is split in two disjoint windows on real Newton hardware:
-// bank 0 at `kFlashBank1` (0x02000000..0x02400000) and bank 1 at
-// `kFlashBank2` (0x10000000..0x10400000), each 4 MiB. Einstein keeps
-// both banks back-to-back in a single 8 MiB backing; the mapping
-// below surfaces each half at the right guest IPA.
-pub const FLASH_BANK_IPA_SIZE: u64 = 0x0040_0000; // 4 MiB per bank
-pub const FLASH_BANK0_IPA_BASE: u64 = 0x0200_0000;
-pub const FLASH_BANK1_IPA_BASE: u64 = 0x1000_0000;
-pub const RAM_IPA_BASE: u64 = 0x0400_0000;
-pub const RAM_IPA_SIZE: u64 = 0x0040_0000; // 4 MiB
+// bank 0 at `kFlashBank1` (0x02000000) and bank 1 at `kFlashBank2`
+// (0x10000000), each 4 MiB. Einstein keeps both banks back-to-back in a
+// single 8 MiB backing; the manifest surfaces each half at the right
+// guest IPA.
+//
 // There is intentionally no IPA 0x0C mirror. Einstein's `TMemoryConsts`
 // and `TMMU.cpp:1186-1193` document the real Newton layout: `kRAMStart =
 // 0x04000000` is the only RAM PA; VA `0x0C000000+` is purely a stage-1
@@ -137,11 +134,8 @@ pub const RAM_IPA_SIZE: u64 = 0x0040_0000; // 4 MiB
 // IPA `0x0C` would alias every pre-MMU 0x0C access to a contiguous RAM
 // window that stage-1 will then remap to a *different* PA, causing
 // pre-MMU writes and post-MMU reads to land in different host cells.
-// Framebuffer scratch: a dumpable RAM region where guest screen drivers can
-// deposit pixels. Not yet wired to any Newton display emulation; the region
-// exists so M5 can point `TScreenManager`-equivalent code at it.
-pub const FB_IPA_BASE: u64 = 0x0E00_0000;
-pub const FB_IPA_SIZE: u64 = 0x0020_0000; // 2 MiB
+pub const RAM_IPA_BASE: u64 = 0x0400_0000;
+pub const RAM_IPA_SIZE: u64 = 0x0040_0000; // 4 MiB
 
 const VTCR_EL2_VAL: u64 = (32 << 0)
     | (0b01 << 6)          // SL0 = start at level 1
@@ -243,7 +237,41 @@ unsafe fn set_l2_blocks(ipa_base: u64, host_pa_base: u64, count: u64, attrs: u64
 /// Build stage-2 tables reflecting the Newton memory map, program VTCR_EL2
 /// and VTTBR_EL2. Must be called after `guest_mem::load_rom` so the backing
 /// stores are ready, and before stage2::enable().
+/// Boot-time consistency check across the region manifest and the three
+/// subsystems that consume it. Const evaluation already enforces 4 KiB
+/// alignment + non-overlap (`guest_regions`'s `const _` blocks); this
+/// adds the runtime invariants that can't be expressed at const time:
+///   * block-mapped (non-paged) regions must be 2 MiB aligned so
+///     `set_l2_blocks` can map them, and
+///   * every region that claims `host_addr_for` must resolve through
+///     `guest_mem::host_addr_for` for a probe read at its base — i.e. a
+///     region mapped in stage-2 cannot be silently missing from the
+///     EL2 IPA→host layer.
+/// Halts loudly on any violation rather than letting a misconfigured
+/// manifest boot into hard-to-diagnose corruption.
+fn cross_check_manifest() {
+    for r in guest_regions::REGIONS {
+        let paged = r.perm == guest_regions::Stage2Perm::ReadWritePaged;
+        if !paged && (r.ipa % TWO_MIB != 0 || r.size % TWO_MIB != 0) {
+            kprintln!(
+                "*** stage2: block-mapped region {} not 2 MiB aligned (ipa={:#x} size={:#x}) ***",
+                r.name, r.ipa, r.size
+            );
+            crate::cpu::halt();
+        }
+        if r.host_addr_for && guest_mem::host_pa_for_ipa(r.ipa, /*for_write=*/ false).is_none() {
+            kprintln!(
+                "*** stage2: region {} claims host_addr_for but {:#x} is unmapped there ***",
+                r.name, r.ipa
+            );
+            crate::cpu::halt();
+        }
+    }
+}
+
 pub unsafe fn init() {
+    cross_check_manifest();
+
     // All L2 entries start invalid (fault on access).
     let l2_ptr = addr_of_mut!(S2_L2) as *mut u64;
     for i in 0..512usize {
@@ -251,48 +279,32 @@ pub unsafe fn init() {
         unsafe { l2_ptr.add(i).write(0); }
     }
 
-    // ROM: 16 MiB read-only at guest PA 0.
-    let rom_pa = guest_mem::rom_host_pa();
-    // SAFETY: helper writes `count` entries starting at a known index.
-    unsafe {
-        set_l2_blocks(
-            ROM_IPA_BASE,
-            rom_pa,
-            ROM_IPA_SIZE / TWO_MIB,
-            BLOCK_NORMAL_RO,
-        );
-    }
-
-    // Flash bank 0/1: 4 MiB read-only at guest PA 0x0200_0000 / 0x1000_0000.
-    // Einstein's `TMemory::WriteP` silently ignores all direct CPU writes
-    // to flash bank addresses (`Emulator/TMemory.cpp:1777` returns
-    // without storing); flash is mutated only via the
-    // `TEinsteinFlashDriver` native primitives (WriteToFlash16/32Bits,
-    // EraseFlash) which call into our `peripherals::flash_driver`,
-    // touching the host backing directly without going through stage-2.
+    // Block-mapped regions (ROM, flash bank 0/1, framebuffer) come
+    // straight from the manifest: each is a contiguous 2 MiB-block
+    // mapping with RO or RW permissions. The L3-paged regions (RAM,
+    // scratch pool) are installed by their dedicated helpers below.
     //
-    // Mapping the banks RO at stage-2 trips a write-permission fault
-    // for any direct CPU store from the guest (e.g. AMD-style
-    // command-sequence writes the kernel's flash chip code emits).
-    // `trap::handle_data_abort` recognises flash-bank IPAs and silently
-    // drops the write (matching Einstein), so the backing keeps the
-    // values seeded by `flash::init` / programmed by the native
-    // primitives.
-    let flash_pa = peripherals::flash::host_pa();
-    // SAFETY: helper bounds-checks; flash_pa is 2-MiB aligned.
-    unsafe {
-        set_l2_blocks(
-            FLASH_BANK0_IPA_BASE,
-            flash_pa,
-            FLASH_BANK_IPA_SIZE / TWO_MIB,
-            BLOCK_NORMAL_RO,
-        );
-        set_l2_blocks(
-            FLASH_BANK1_IPA_BASE,
-            flash_pa + FLASH_BANK_IPA_SIZE,
-            FLASH_BANK_IPA_SIZE / TWO_MIB,
-            BLOCK_NORMAL_RO,
-        );
+    // Flash banks: mapped RO so a direct CPU store traps. Einstein's
+    // `TMemory::WriteP` silently ignores all direct writes to flash
+    // bank addresses (`Emulator/TMemory.cpp:1777`); flash is mutated
+    // only via the `TEinsteinFlashDriver` native primitives, which
+    // touch the host backing directly without going through stage-2.
+    // `trap::handle_data_abort` recognises flash-bank IPAs and drops
+    // the write (matching Einstein), so the backing keeps the seeded /
+    // programmed values.
+    for region in guest_regions::REGIONS {
+        let attrs = match region.perm {
+            guest_regions::Stage2Perm::ReadOnly => BLOCK_NORMAL_RO,
+            guest_regions::Stage2Perm::ReadWrite => BLOCK_NORMAL_RW,
+            // RAM / scratch pool are refined into 4 KiB L3 pages by the
+            // dedicated installers below, not block-mapped here.
+            guest_regions::Stage2Perm::ReadWritePaged => continue,
+        };
+        // SAFETY: helper bounds-checks; region IPA/size are 2 MiB
+        // aligned for block-mapped regions (asserted in set_l2_blocks).
+        unsafe {
+            set_l2_blocks(region.ipa, region.host_pa(), region.size / TWO_MIB, attrs);
+        }
     }
 
     // RAM: 4 MiB at guest PA 0x0400_0000. Refined to 4 KiB L3 pages;
@@ -303,18 +315,6 @@ pub unsafe fn init() {
     // retries. See `set_ram_page_{ro_x,rw_xn}`.
     // SAFETY: installs two L3 tables and points L2[32], L2[33] at them.
     unsafe { install_ram_l3(); }
-
-    // Framebuffer: dumpable RAM for future screen-manager code.
-    let fb_pa = guest_mem::fb_host_pa();
-    // SAFETY: as above.
-    unsafe {
-        set_l2_blocks(
-            FB_IPA_BASE,
-            fb_pa,
-            FB_IPA_SIZE / TWO_MIB,
-            BLOCK_NORMAL_RW,
-        );
-    }
 
     // Refine one 2 MiB L2 slot into 4 KiB pages so we can plant the
     // non-trapping tick register inside the otherwise-MMIO peripheral
@@ -358,29 +358,17 @@ pub unsafe fn init() {
         );
     }
 
-    kprintln!(
-        "stage2: ROM @ IPA {:#x}..{:#x} -> host PA {:#x} (RO)",
-        ROM_IPA_BASE, ROM_IPA_BASE + ROM_IPA_SIZE, rom_pa
-    );
-    kprintln!(
-        "stage2: RAM @ IPA {:#x}..{:#x} -> host PA {:#x} (per-page RW+XN initially)",
-        RAM_IPA_BASE, RAM_IPA_BASE + RAM_IPA_SIZE, guest_mem::ram_host_pa()
-    );
-    kprintln!(
-        "stage2: flash bank 0 @ IPA {:#x}..{:#x} -> host PA {:#x} (RO, {} MiB)",
-        FLASH_BANK0_IPA_BASE, FLASH_BANK0_IPA_BASE + FLASH_BANK_IPA_SIZE,
-        flash_pa, FLASH_BANK_IPA_SIZE / (1024 * 1024)
-    );
-    kprintln!(
-        "stage2: flash bank 1 @ IPA {:#x}..{:#x} -> host PA {:#x} (RO, {} MiB)",
-        FLASH_BANK1_IPA_BASE, FLASH_BANK1_IPA_BASE + FLASH_BANK_IPA_SIZE,
-        flash_pa + FLASH_BANK_IPA_SIZE, FLASH_BANK_IPA_SIZE / (1024 * 1024)
-    );
-    kprintln!(
-        "stage2: framebuffer @ IPA {:#x}..{:#x} -> host PA {:#x} (RW, {} MiB)",
-        FB_IPA_BASE, FB_IPA_BASE + FB_IPA_SIZE, fb_pa,
-        FB_IPA_SIZE / (1024 * 1024)
-    );
+    for region in guest_regions::REGIONS {
+        let perm = match region.perm {
+            guest_regions::Stage2Perm::ReadOnly => "RO",
+            guest_regions::Stage2Perm::ReadWrite => "RW",
+            guest_regions::Stage2Perm::ReadWritePaged => "per-page RW+XN initially",
+        };
+        kprintln!(
+            "stage2: {} @ IPA {:#x}..{:#x} -> host PA {:#x} ({})",
+            region.name, region.ipa, region.ipa + region.size, region.host_pa(), perm
+        );
+    }
     kprintln!("stage2: all other IPAs fault to EL2");
 }
 

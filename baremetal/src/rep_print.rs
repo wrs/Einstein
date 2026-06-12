@@ -63,8 +63,22 @@ impl VaArgs {
 /// printing the result through `kprintln!`. The `prefix` is
 /// emitted before the formatted line so the operator can tell
 /// which probe produced it.
-pub fn render_and_log(prefix: &str, fmt_ptr: u32, mut args: VaArgs) {
+pub fn render_and_log(prefix: &str, fmt_ptr: u32, args: VaArgs) {
     let mut buf = [0u8; RENDER_CAP];
+    let written = render_into(&mut buf, fmt_ptr, args);
+    append_to_line(prefix, &buf[..written]);
+}
+
+/// Render `fmt` (an address in guest memory) with `args` into
+/// `buf`, returning the number of bytes written (capped at
+/// `buf.len()`). This is the format-string interpreter shared by
+/// `render_and_log` (which then forwards to the UART line buffer)
+/// and the `nh_guest_test` `GuestTestRepRender` HVC (which lets a
+/// guest test assert the rendered bytes directly). Keeping one
+/// interpreter means the test exercises the exact production
+/// VaArgs / specifier path, not a parallel copy.
+pub fn render_into(buf: &mut [u8], fmt_ptr: u32, mut args: VaArgs) -> usize {
+    let cap = buf.len();
     let mut written = 0usize;
     let mut cursor = fmt_ptr;
 
@@ -78,8 +92,8 @@ pub fn render_and_log(prefix: &str, fmt_ptr: u32, mut args: VaArgs) {
             break;
         }
         if b != b'%' {
-            push_byte(&mut buf, &mut written, b);
-            if written == RENDER_CAP {
+            push_byte(buf, &mut written, b);
+            if written == cap {
                 break;
             }
             continue;
@@ -131,27 +145,27 @@ pub fn render_and_log(prefix: &str, fmt_ptr: u32, mut args: VaArgs) {
                         if p == b'*' {
                             let _ = args.next();
                         } else if !p.is_ascii_digit() {
-                            handle_spec(p, &flags, width, long_count, &mut args, &mut buf, &mut written);
+                            handle_spec(p, &flags, width, long_count, &mut args, buf, &mut written);
                             break;
                         }
                     }
                     break;
                 }
                 _ => {
-                    handle_spec(c, &flags, width, long_count, &mut args, &mut buf, &mut written);
+                    handle_spec(c, &flags, width, long_count, &mut args, buf, &mut written);
                     break;
                 }
             }
-            if written == RENDER_CAP {
+            if written == cap {
                 break 'outer;
             }
         }
-        if written == RENDER_CAP {
+        if written == cap {
             break;
         }
     }
 
-    append_to_line(prefix, &buf[..written]);
+    written
 }
 
 // ---- line buffering ------------------------------------------------------

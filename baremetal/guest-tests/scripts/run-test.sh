@@ -91,7 +91,17 @@ if [[ "$platform" == "qemu" ]]; then
 else
     # FVP path — build with the fvp-base platform feature, run the ELF
     # directly (FVP loads by program headers), scrape the same markers.
-    cargo build --release --no-default-features --features platform-fvp-base 2>&1 | tail -5
+    #
+    # FVP uses EMBED mode (test bin compiled into the hypervisor),
+    # unconditionally: scripts/fvp has no semihosting-cmdline plumbing
+    # (the QEMU `arg=<path>` mechanism), so the semihost-load path's
+    # SYS_GET_CMDLINE comes back empty and the loader halts. Compiling
+    # the bin in sidesteps the cmdline entirely. (Per-test relink is the
+    # cost, but FVP's per-run wall time dwarfs it.)
+    rm -f /tmp/newton-snapshot-*.bin
+    bin_abs="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
+    NH_GUEST_TEST="$bin_abs" cargo build --release \
+        --no-default-features --features platform-fvp-base 2>&1 | tail -5
     elf=target/aarch64-unknown-none-softfloat/release/newton-hypervisor
     scripts/fvp --timeout=300 "$elf" > "$log" 2>&1 || true
 fi

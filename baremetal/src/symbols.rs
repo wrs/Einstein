@@ -15,6 +15,27 @@
 //! The tracer (when its feature is on) and the task-dump stack
 //! walker (always on) both want PC → name lookups. This module is
 //! the shared backing.
+//!
+//! ## Why the symbol blob ships in every image (diag-M6)
+//!
+//! These three `include_bytes!` constants are linked into rodata of
+//! *every* build, including real-hardware `pi-bare-metal-*` images
+//! where there is no host debugger and the only failure channel is a
+//! UART halt dump. That is deliberate: when the hypervisor loud-halts
+//! on hardware, `task_dump`'s stack walker turns raw return addresses
+//! into `name+0xNN` frames via `fn_name_for_pc`, which is the
+//! difference between an actionable backtrace and a column of bare
+//! hex. The bytes are worth it.
+//!
+//! Measured cost, `--no-default-features --features pi-bare-metal-input`
+//! (build.rs's `symbol table` line + the on-disk OUT_DIR blobs):
+//!   - 18925 function entries
+//!   - fn_addrs.bin     =  75_700 bytes (4 B/entry, sorted u32 addrs)
+//!   - fn_name_offs.bin =  75_700 bytes (4 B/entry, parallel offsets)
+//!   - fn_names.bin     = 609_289 bytes (concatenated NUL-term names)
+//!   - total            = 760_689 bytes (~743 KiB of rodata)
+//! The image already embeds the full 8 MiB Newton ROM, so this is a
+//! ~9% rodata add for the backtrace capability — a trade we keep.
 
 const FN_ADDRS_RAW: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fn_addrs.bin"));
 const FN_NAME_OFFS_RAW: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fn_name_offs.bin"));

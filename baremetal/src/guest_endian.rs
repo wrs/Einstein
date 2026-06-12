@@ -125,6 +125,18 @@ pub fn guest_read_u8_va(va: u32) -> Option<u8> {
     guest_read_u8_pa(pa)
 }
 
+/// Write a single byte to a guest VA at the given Newton-side logical
+/// byte address. Walks stage-1 to find the PA, then delegates to
+/// `guest_write_u8_pa` so the byte-lane transform matches the
+/// `guest_read_u8_va` read side. Used by the `nh_guest_test`
+/// `GuestTestRepRender` HVC to deposit rendered bytes back into a
+/// guest buffer the test then reads with ordinary loads.
+#[cfg(nh_guest_test)]
+pub fn guest_write_u8_va(va: u32, value: u8) -> bool {
+    let pa = guest_mem::translate_va(va).unwrap_or(va);
+    guest_write_u8_pa(pa, value)
+}
+
 /// Read a halfword from a guest PA at the given Newton-side logical
 /// halfword address. Consumed only by the `audio-pi-hdmi` backend.
 #[cfg(not(nh_guest_test))]

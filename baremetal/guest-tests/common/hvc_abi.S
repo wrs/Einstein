@@ -1,5 +1,5 @@
 @ HVC ABI constants — keep in lockstep with the
-@ `HvcImm::GuestTestPrintByte..Debugger` block in
+@ `HvcImm::GuestTestPrintByte..GuestTestRepRender` block in
 @ src/hvc_imm.rs. The block is anchored at 0x10 there, so adding a
 @ variant to the ABI requires bumping every literal here AND
 @ updating any test that issues the affected HVC by name.
@@ -20,3 +20,4 @@
     .equ HVC_DEBUG_STR,         0x19
     .equ HVC_DEBUGGER,          0x1A
     .equ HVC_INJECT_PEN,        0x1B
+    .equ HVC_REP_RENDER,        0x1C

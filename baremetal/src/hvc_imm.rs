@@ -2,7 +2,7 @@
 //!
 //! `#[repr(u32)]` enum: variants in two contiguous blocks.
 //!
-//! 1. **Guest-test ABI** (`0x10..` — `GuestTestPrintByte..GuestInjectPen`):
+//! 1. **Guest-test ABI** (`0x10..` — `GuestTestPrintByte..GuestTestRepRender`):
 //!    test binaries issue these as `hvc #imm` literals via the
 //!    `HVC_*` macros in `guest-tests/common/test_runtime.S`. The
 //!    block is anchored at 0x10 so the auto-incrementing rest can't
@@ -73,6 +73,17 @@ pub enum HvcImm {
     /// `NativeGetSample` drain path without needing a paired viewer.
     /// (`HVC_INJECT_PEN`)
     GuestInjectPen,
+    /// Guest-test: render a REP/Hammer format string via the
+    /// production `rep_print` interpreter into a guest-supplied
+    /// buffer (rather than the UART line buffer), so a test can
+    /// byte-assert the VaArgs/specifier ABI. r0 = format string
+    /// pointer, r1 = out buffer pointer, r2 = first vararg,
+    /// r3 = second vararg, [sp+0..] = third+ varargs; on return
+    /// r0 = number of bytes rendered. Only meaningful in
+    /// `nh_guest_test` builds — the dispatcher arm is cfg-gated, so
+    /// a production guest issuing it hits the unknown-HVC halt.
+    /// (`HVC_REP_RENDER`)
+    GuestTestRepRender,
 
     // ---- Hypervisor-internal HVCs (auto-incremented) --------------
     //

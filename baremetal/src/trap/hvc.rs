@@ -180,6 +180,43 @@ pub(crate) fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == HvcImm::GpioTrigger as u32 => {
             vic::raise(vic::INT_GPIO);
         }
+        #[cfg(nh_guest_test)]
+        v if v == HvcImm::GuestTestRepRender as u32 => {
+            // Test-only: render a format string through the production
+            // `rep_print` interpreter into a guest-supplied buffer and
+            // return the rendered length in r0, so `test_rep_print.S`
+            // can byte-assert the VaArgs/specifier ABI guest-side.
+            //
+            //   r0 = format string ptr   r1 = out buffer ptr
+            //   r2 = vararg0  r3 = vararg1  [SP+0..] = vararg2..
+            //
+            // The render writes bytes directly into guest RAM at r1 via
+            // the BE-8 store path. VaArgs pulls r2/r3 then walks the
+            // source-mode (SVC) stack, exactly as the Hammer Print hook
+            // does on a real boot.
+            let fmt_ptr = ctx.x[0] as u32;
+            let out_ptr = ctx.x[1] as u32;
+            let r2 = ctx.x[2] as u32;
+            let r3 = ctx.x[3] as u32;
+            let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+            let sp = crate::banked::sp_for_mode(ctx, spsr_el2);
+            let mut buf = [0u8; 512];
+            let n = crate::rep_print::render_into(
+                &mut buf,
+                fmt_ptr,
+                crate::rep_print::VaArgs::new(r2, r3, sp),
+            );
+            for (i, &b) in buf[..n].iter().enumerate() {
+                if !crate::guest_endian::guest_write_u8_va(out_ptr.wrapping_add(i as u32), b) {
+                    kprintln!(
+                        "*** GuestTestRepRender: guest_write_u8_va failed at out+{} ***",
+                        i
+                    );
+                    cpu::halt();
+                }
+            }
+            ctx.x[0] = n as u64;
+        }
         #[cfg(feature = "trace")]
         v if v == HvcImm::Trace as u32 => {
             crate::tracer::handle_trace_hvc(ctx);

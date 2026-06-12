@@ -31,7 +31,7 @@
 //!   a pathological abort loop would generate many traps per second
 //!   and thrash saves; a quiet guest would barely save at all.
 //!   Wall-clock pacing smooths both.
-//! - Guest-triggered: HVC `#0x20` from the guest issues an immediate
+//! - Guest-triggered: HVC `#0x18` (`HvcImm::Snapshot`) from the guest issues an immediate
 //!   save (useful inside tests or wedged into specific code paths).
 //!
 //! ## Semihosting
@@ -503,7 +503,7 @@ fn pc_in_hypervisor_transient_region(pc: u32) -> bool {
 }
 
 /// Write a snapshot to the next ring slot. Called from periodic
-/// autosaves and from the HVC #0x20 handler.
+/// autosaves and from the HVC #0x18 (HvcImm::Snapshot) handler.
 ///
 /// `gprs` must hold x0..x30 of the guest at save time (the AArch64
 /// view that aliases AArch32 R0..R12 and every banked SP/LR per

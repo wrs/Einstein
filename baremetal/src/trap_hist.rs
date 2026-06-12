@@ -380,6 +380,7 @@ fn hvc_imm_name(imm: u32) -> &'static str {
         v if v == HvcImm::DebugStr as u32 => "DebugStr",
         v if v == HvcImm::Debugger as u32 => "Debugger",
         v if v == HvcImm::GuestInjectPen as u32 => "GuestInjectPen",
+        v if v == HvcImm::GuestTestRepRender as u32 => "GuestTestRepRender",
         v if v == HvcImm::Diag as u32 => "Diag",
         v if v == HvcImm::DabtDispatch as u32 => "DabtDispatch",
         v if v == HvcImm::LoudHalt as u32 => "LoudHalt",

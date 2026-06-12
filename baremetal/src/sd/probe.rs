@@ -33,6 +33,21 @@ use super::sdhost::{CardCapacity, SdHost};
 pub fn run() -> ! {
     kprintln!("\r\n=== SDHOST probe ===");
 
+    // host_dma validation route. QEMU raspi3b's BCM2835 DMA model can't
+    // exercise src/host_dma.rs (it ignores DREQ pacing and doesn't
+    // deliver DMA'd bytes to peripheral FIFOs; and host_dma is
+    // cfg(nh_real_hw), not compiled into the QEMU guest-test build at
+    // all — see guest-tests/tests/MANIFEST). This is the documented
+    // hardware route: arm a RAM→RAM control block on the SD-TX channel
+    // (idle until write_block_dma below; the UART-TX channel is OFF
+    // LIMITS — it is live as the console backend by probe time) and
+    // confirm the CB-chain arming + completion path works before the
+    // SD-TX path below relies on the same machinery.
+    match crate::host_dma::sd_tx_dma_selfcheck() {
+        Ok(()) => kprintln!("host_dma: SD-TX CB-chain self-check PASS"),
+        Err(e) => kprintln!("host_dma: SD-TX CB-chain self-check FAIL: {}", e),
+    }
+
     let host = match SdHost::init() {
         Ok(h) => {
             let cap = match h.capacity() {

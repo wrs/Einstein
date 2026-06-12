@@ -33,3 +33,35 @@ test_alarm
 test_dma_irq
 test_gpio
 test_swp_rom_aperture
+test_rep_print
+# test_snapshot_resume is a TWO-RUN test: run-all.sh special-cases this
+# name to invoke scripts/run-snapshot-resume.sh (run 1 saves via
+# HVC #0x18 HVC_SNAPSHOT, run 2 must resume from the snapshot). The normal one-shot
+# run-test.sh would clear snapshots and only exercise the save half, so
+# it must not be dispatched there. build-tests.sh still builds it.
+test_snapshot_resume
+# ---- host_dma (BCM2835 DMA engine) — NO QEMU test, by platform limit ----
+# src/host_dma.rs (UART/MAI/SD-TX CB-chain arming) is #![cfg(nh_real_hw)]
+# (no-semihost + platform-raspi3b) and is therefore not even compiled
+# into the QEMU guest-test build (default = semihost). Beyond the cfg,
+# QEMU raspi3b's BCM2835 DMA model (hw/dma/bcm2835_dma.c, QEMU 10.1.1)
+# cannot exercise the path faithfully:
+#   - It IGNORES DREQ / TI.PERMAP peripheral flow-control entirely
+#     (bcm2835_dma_update copies at full speed), so the DREQ-paced
+#     UART-TX / SD FIFO feed host_dma arms is not modelled.
+#   - A write to a peripheral FIFO via the bus alias is a plain
+#     stl_le_phys memory store; QEMU does not deliver DMA'd bytes to the
+#     PL011 transmit path the way real silicon does, so "DMA a string,
+#     observe it on the wire" has nothing to observe.
+# (The CB-chain walk, CONBLK_AD advance, gpu_bus_mr 0xC0000000/0x7E000000
+# alias, and CS.INT/END completion IRQ ARE modelled — the gaps above are
+# the DREQ pacing and peripheral-FIFO delivery, exactly the parts a
+# UART-TX-DMA completion test would assert.)
+# Documented validation route: the sd-probe hardware probe
+# (src/sd/probe.rs, built with `--features "pi-bare-metal sd-probe"`,
+# run on a real Pi Zero 2 W) exercises host_dma's CB-chain arming via
+# the SD-TX channel (write_block_dma -> arm_sd_tx) AND a dedicated
+# RAM-to-RAM self-check on the same channel
+# (host_dma::sd_tx_dma_selfcheck — the UART-TX channel is off limits
+# for the check, since it is live as the console backend by probe
+# time). See docs/SD_DMA_AUTOSAVE.md and the sd-probe write-up.

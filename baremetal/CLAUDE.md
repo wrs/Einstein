@@ -84,7 +84,7 @@ ls -la /tmp/newton-snapshot-*.bin
   wall time, hooked into `trap_irq` (timer IRQ) in `src/trap.rs`.
   Wall-clock pacing, not trap count — a pathological abort loop
   won't thrash saves.
-- **Guest-triggered:** `HVC #0x20` from the guest issues an
+- **Guest-triggered:** `HVC #0x18` (`HvcImm::Snapshot`) from the guest issues an
   immediate save. Handy for guest tests that want to snapshot at
   a specific PC.
 

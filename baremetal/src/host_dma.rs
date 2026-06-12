@@ -444,6 +444,107 @@ pub fn uart_tx_pending() -> bool {
     is_ready() && (read_int_status() & (1 << UART_TX_CHANNEL)) != 0
 }
 
+/// Hardware self-check for the DMA CB-chain arming machinery, for the
+/// `sd-probe` validation route (QEMU's BCM2835 DMA model can't
+/// exercise `host_dma` — see `guest-tests/tests/MANIFEST`). Arms a
+/// single RAM→RAM control block on `SD_TX_CHANNEL` (no DREQ pacing,
+/// so the controller runs it to completion immediately) and verifies:
+///   1. `init_sd_tx` brought the channel up (firmware powered it),
+///   2. `arm_with_cs` loaded CONBLK_AD and the controller walked the CB
+///      (CS.ACTIVE asserts then clears, CS.END latches),
+///   3. the bytes actually moved (dest == src after completion),
+///   4. no CS.ERROR latched.
+/// This covers the same `init_channel` + `arm_with_cs` + bus-address
+/// translation + CB cache-clean + completion path the DREQ-paced
+/// UART/SD arms use; the only piece it can't self-contain is the
+/// peripheral-FIFO DREQ feed, which the probe validates implicitly by
+/// the fact that its own console output reaches the wire through the
+/// real `arm_uart_tx` path. Returns `Ok(())` on success.
+///
+/// The check MUST NOT run on `UART_TX_CHANNEL`: by probe time the
+/// console kprintln backend is already feeding that channel
+/// (`uart::init_dma_tx` runs before `sd::probe::run`), and
+/// `arm_with_cs`'s pre-arm CS_RESET would kill an in-flight console
+/// transfer and eat the CS_INT/END completion the uart ring polls for
+/// — wedging all subsequent console output. `SD_TX_CHANNEL` is idle
+/// until the probe's own `write_block_dma` later in the run, and is
+/// the channel whose arming the probe exists to validate anyway.
+#[cfg(feature = "sd-probe")]
+pub fn sd_tx_dma_selfcheck() -> Result<(), &'static str> {
+    use core::ptr::addr_of_mut;
+
+    if !init_sd_tx() {
+        return Err("SD-TX channel not powered by firmware");
+    }
+
+    // Distinct, cache-line-aligned src/dst so the cache-clean spans
+    // exactly the buffers we DMA.
+    #[repr(C, align(64))]
+    struct Buf([u32; 4]);
+    static mut SRC: Buf = Buf([0xDEAD_0001, 0xBEEF_0002, 0xF00D_0003, 0xCAFE_0004]);
+    static mut DST: Buf = Buf([0; 4]);
+    static mut CB: DmaCb = DmaCb::zero();
+
+    // BCM2835 §4.2.1 p.50: TI.DEST_INC is bit 4 (increment the
+    // destination address per beat — needed for a RAM→RAM copy, where
+    // neither side is a fixed FIFO).
+    const TI_DEST_INC: u32 = 1 << 4;
+
+    // SAFETY: single-core EL2 probe, exclusive use of these statics and
+    // the channel; the buffers outlive the (immediate, unpaced) transfer.
+    unsafe {
+        let src_phys = addr_of_mut!(SRC) as u64;
+        let dst_phys = addr_of_mut!(DST) as u64;
+        for d in (*addr_of_mut!(DST)).0.iter_mut() {
+            *d = 0;
+        }
+        // Clean both buffers: the controller reads/writes via the
+        // uncached 0xC000_0000 bus alias.
+        crate::cpu::dc_civac_range(src_phys, core::mem::size_of::<Buf>());
+        crate::cpu::dc_civac_range(dst_phys, core::mem::size_of::<Buf>());
+
+        let cb = &mut *addr_of_mut!(CB);
+        cb.ti = TI_SRC_INC | TI_DEST_INC | TI_WAIT_RESP | TI_INTEN;
+        cb.source_ad = bus_addr_ram(src_phys);
+        cb.dest_ad = bus_addr_ram(dst_phys);
+        cb.txfr_len = core::mem::size_of::<Buf>() as u32;
+        cb.stride = 0;
+        cb.nextconbk = 0;
+
+        arm_with_cs(SD_TX_CHANNEL, &*addr_of_mut!(CB), CS_ACTIVE | SD_TX_CS_FLAGS);
+
+        // RAM→RAM with no DREQ completes in a handful of cycles; spin a
+        // bounded number of MMIO reads on CS.ACTIVE.
+        let mut spun = 0u32;
+        while read_cs(SD_TX_CHANNEL) & CS_ACTIVE != 0 {
+            spun += 1;
+            if spun > 1_000_000 {
+                return Err("SD-TX DMA never cleared CS.ACTIVE");
+            }
+        }
+        let cs = read_cs(SD_TX_CHANNEL);
+        // Ack the latched INT/END so the channel is clean for the real
+        // SD write path that follows.
+        write_cs(SD_TX_CHANNEL, CS_INT | CS_END);
+
+        if cs & CS_ERROR != 0 {
+            return Err("SD-TX DMA latched CS.ERROR");
+        }
+        if cs & CS_END == 0 {
+            return Err("SD-TX DMA did not set CS.END");
+        }
+        // Invalidate dst in cache before reading it back (the DMA wrote
+        // it via the bus alias, bypassing our caches).
+        crate::cpu::dc_civac_range(dst_phys, core::mem::size_of::<Buf>());
+        let src_vals = (*addr_of_mut!(SRC)).0;
+        let dst_vals = (*addr_of_mut!(DST)).0;
+        if src_vals != dst_vals {
+            return Err("SD-TX DMA copied wrong bytes");
+        }
+    }
+    Ok(())
+}
+
 /// Snapshot for diagnostic logging — CS / DEBUG of the MAI TX channel.
 #[cfg(nh_audio_pi_hdmi)]
 pub fn mai_tx_diag() -> (u32, u32) {

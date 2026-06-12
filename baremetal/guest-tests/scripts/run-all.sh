@@ -32,7 +32,15 @@ fail=0
 while read -r name; do
     [[ -z "$name" ]] && continue
     [[ "$name" =~ ^# ]] && continue
-    if "$here/run-test.sh" --platform "$platform" "$name" </dev/null >/dev/null 2>&1; then
+    # test_snapshot_resume is a two-run save/resume test, not a one-shot.
+    # Dispatch it to its dedicated driver; everything else goes through
+    # the normal single-run run-test.sh.
+    if [[ "$name" == "test_snapshot_resume" ]]; then
+        runner=("$here/run-snapshot-resume.sh" --platform "$platform")
+    else
+        runner=("$here/run-test.sh" --platform "$platform" "$name")
+    fi
+    if "${runner[@]}" </dev/null >/dev/null 2>&1; then
         printf "  \e[32mPASS\e[0m  %s\n" "$name"
         pass=$((pass+1))
     else

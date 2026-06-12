@@ -5,13 +5,23 @@
 use crate::{cpu, guest_mem, mmio, peripherals};
 use crate::diag_util::SeenSet;
 use crate::trap_context::{advance_elr, read_sysreg, TrapContext};
-use crate::kprintln;
+use crate::{dprintln, kprintln};
 use core::ptr::addr_of_mut;
+use core::sync::atomic::{AtomicU32, Ordering};
 use super::und::read_banked_spsr;
 use super::diag::handle_diag;
 
 
 // ----------------- individual handlers -----------------
+
+/// Einstein's `kHighROMEnd`: the ROM aperture is IPA 0..16 MiB. Writes
+/// below this are absorbed (mask ROM ignores them on real hardware).
+const HIGH_ROM_END: u64 = 0x0100_0000;
+
+/// Count of absorbed ROM-aperture stores, for log rate-limiting: the
+/// first few are kprintln'd (each one is a guest null-pointer-class
+/// write worth seeing), the rest go through `dprintln!`.
+static ROM_WRITE_DROPS: AtomicU32 = AtomicU32::new(0);
 
 /// Resolve the IPA of a stage-2 fault.
 ///
@@ -135,6 +145,33 @@ pub(crate) fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
     // / `flash::erase_block`, which write the host backing directly and
     // bypass stage-2 entirely.
     if wnr && peripherals::flash::is_flash_pa(ipa) && drop_flash_write(ctx, iss, elr) {
+        advance_elr(4);
+        return;
+    }
+
+    // Decodable stores (ISV=1) into the ROM aperture: mirror Einstein's
+    // `TMemory::WriteP` (Emulator/TMemory.cpp:1755-1766), which logs and
+    // drops every write below kHighROMEnd. Newton null-pointer writes
+    // land here: VA 0 maps to ROM page 0 and a Manager-domain stage-1
+    // mapping skips the AP check, so the store sails through to the
+    // stage-2 RO ROM mapping (first seen: the internal store's
+    // `KillBlock` @0x31230c storing through a NULL free-list pointer).
+    // Real hardware's mask ROM ignores the write; so do we. ISV=1 has
+    // no writeback, so there's no guest register state to fix up.
+    // ISV=0 shapes (SWP) are absorbed by `try_absorb_rom_write` below.
+    if wnr && isv == 1 && is_permission && ipa < HIGH_ROM_END {
+        let n = ROM_WRITE_DROPS.fetch_add(1, Ordering::Relaxed);
+        if n < 4 {
+            kprintln!(
+                "dabt: ignored write to ROM IPA={:#010x} value={:#010x} @PC={:#010x} (#{})",
+                ipa as u32, ctx.x[srt] as u32, elr, n + 1
+            );
+        } else {
+            dprintln!(
+                "dabt: ignored write to ROM IPA={:#010x} value={:#010x} @PC={:#010x} (#{})",
+                ipa as u32, ctx.x[srt] as u32, elr, n + 1
+            );
+        }
         advance_elr(4);
         return;
     }
@@ -358,7 +395,7 @@ fn try_emulate_isv0_dabt(ctx: &mut TrapContext, ipa: u64, wnr: bool, elr: u32) -
 /// wire for novel cases (pre/post-indexed STR with writeback, LDM/STM,
 /// inline-stub byte/halfword stores, …).
 fn try_absorb_rom_write(ctx: &mut TrapContext, ipa: u64, elr: u32) -> bool {
-    if ipa >= 0x0100_0000 {
+    if ipa >= HIGH_ROM_END {
         return false;
     }
     // Stage-1 off (pre-MMU and the guest-test runtime) makes
@@ -413,7 +450,7 @@ fn try_absorb_rom_write(ctx: &mut TrapContext, ipa: u64, elr: u32) -> bool {
 /// halting.
 fn is_obviously_unreachable_ipa(ipa: u64) -> bool {
     // Inside ROM (stage-2 RO). Any write is doomed.
-    if ipa < 0x0100_0000 { return true; }
+    if ipa < HIGH_ROM_END { return true; }
     // "Unknown bank #5" gap (between flash bank 2 end at 0x10400000
     // and PCMCIA0Base at 0x30000000). Einstein's TMemory silently
     // returns 0 here; we now do the same in mmio.rs but the kernel

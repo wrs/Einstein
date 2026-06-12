@@ -58,14 +58,21 @@ cargo build --release --features "trace quiet"                   # tracer build
 # src/guest.rs, generic SBA/UND/DABT/IRQ paths in src/trap.rs, or guest-tests/:
 guest-tests/scripts/run-all.sh
 
-# QEMU boot smoke test. RULES (hard-won; see ~/.claude memory):
+# QEMU boot smoke test. RULES (hard-won; two agents wedged on the old
+# form — see the qemu memory note):
 #   - NEVER pipe cargo run through tail/head — redirect to a file, then read it.
-#   - `timeout N cargo run` orphans qemu — ALWAYS `pkill qemu-system` afterwards.
+#   - `timeout N cargo run` orphans qemu, AND timeout itself can hang
+#     (cargo survives SIGTERM while waiting on qemu, so a trailing
+#     pkill never runs). Use `timeout -k 5` so SIGKILL backstops it.
+#   - Pre-flight check before EVERY qemu launch; ONE qemu at a time —
+#     concurrent instances (guest-test runs included) throttle each
+#     other ~10x and both results are garbage.
 #   - Scratch files under /tmp/newton-claude/.
 mkdir -p /tmp/newton-claude
+pgrep qemu-system >/dev/null && { pkill -9 qemu-system; sleep 2; }   # pre-flight
 rm -f /tmp/newton-snapshot-*.bin            # cold boot
-timeout 150 cargo run --release > /tmp/newton-claude/boot-<phase>.log 2>&1
-pkill qemu-system
+timeout -k 5 150 cargo run --release > /tmp/newton-claude/boot-<phase>.log 2>&1 || true
+pkill -9 qemu-system                        # always reap
 # Compare against the baseline log /tmp/newton-claude/boot-baseline.log:
 # boot must reach the same end state (Welcome UI / steady idle), with no new
 # "*** " halt lines, no new UNHANDLED/halt dumps. diff the trap-summary shape,

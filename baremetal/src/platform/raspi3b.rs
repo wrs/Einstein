@@ -38,8 +38,7 @@ pub const DRAM_1GIB_BLOCK: Option<u64> = None;
 /// avoids a class of divergence where wall-anchored fast ticks make
 /// kernel-armed timer matches fire too early relative to guest
 /// instruction throughput (every spurious alarm IRQ allocates from
-/// the safe heap and perturbs subsequent allocations — see
-/// INVESTIGATION.md).
+/// the safe heap and perturbs subsequent allocations).
 pub const NEWTON_TICK_HZ: u64 = 3_686_400;
 
 /// Route the EL2 physical timer PPI (CNTHPIRQ) to core 0's IRQ input.

@@ -497,7 +497,7 @@ const K_HDWR_GPIO_EC00: u64 = 0x0F18_EC00;
 /// wall-clock-derived tick value crosses that deadline after far
 /// fewer poll iterations than Einstein's, perturbing the kernel's
 /// heap allocator interleave and steering `__nw__FUi(184)` towards a
-/// VA range that aliases pckm's stack page. See INVESTIGATION.md.
+/// VA range that aliases pckm's stack page.
 ///
 /// The synthetic clock advances proportional to **guest progress**
 /// (each sync trap ≈ a fixed slice of guest instructions), so

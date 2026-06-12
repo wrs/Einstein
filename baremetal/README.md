@@ -25,7 +25,7 @@ on QEMU, on FVP, and on a real Pi Zero 2 W.**
   and flash persistence to SD card (`flash-persist-sd`) with
   non-blocking DMA autosave. See
   [`docs/REAL_HW_BRINGUP.md`](docs/REAL_HW_BRINGUP.md).
-- 35 guest tests exercise the handler surface in isolation; all green
+- 37 guest tests exercise the handler surface in isolation; all green
   on both QEMU and FVP.
 
 The known functional gap is **add-on app packages** — the ROM and
@@ -59,24 +59,26 @@ What's working end-to-end:
   (so a CPSR.E=1 LDR returns the kernel's intended numerical
   value). `src/guest_endian.rs` is the EL2-side bottleneck for
   reads/writes of guest data.
-- **Shadow page-table machinery.** The kernel uses ARMv4 subpage-AP
+- **Stage-1 normalisation.** The kernel uses ARMv4 subpage-AP
   semantics that ARMv8 doesn't natively support.
-  `fix_stage1_xn_bits` in `src/guest_mem.rs` flattens subpage-AP
-  to AP=011 and runs an alias detector to keep the guest-visible
-  MMU consistent. `src/shadow_pool.rs` backs alias-redirected
-  pages.
+  `fix_stage1_xn_bits` in `src/guest_mem.rs`, run on every guest
+  TTBR0 install, edits the guest's own L1/L2 descriptors in place:
+  it flattens subpage-AP to AP=011, clears the XN bits ARMv7
+  reinterprets from ARMv4 SBZ, and rewrites the ROM's fine-table L1
+  placeholders to fault. No parallel shadow page-table tree.
 - **Async timer delivery.** CNTHP rearms on every match-reg write;
   the EL2 physical timer raises CNTHPIRQ, the BCM2836 local
   peripheral routes it to core 0, and `trap_irq` latches and sets
   `HCR_EL2.VI`. WFI wakes on real wall time.
 - **Snapshot ring** at `/tmp/newton-snapshot-{0..3}.bin`, autosaved
   every 2 s of wall time from the timer-IRQ hook. Saves guest-visible
-  state (RAM, FB, flash, EL1 CP15 regs, current AArch32 mode regs)
-  with a ROM fingerprint so resume rejects mismatched binaries.
-  `HVC #0x20` from the guest forces an immediate save. Lets you edit
-  hypervisor code, `cargo run` again, and ERET back into the
-  failure point in the time it takes the loader to read 14 MiB —
-  the foundation of the per-iteration debug loop.
+  state (RAM, FB, SCRATCH_POOL, EL1 CP15 regs, all 31 AArch64 GPRs —
+  which alias every AArch32 banked R0..R14) with ROM + flash
+  fingerprints so resume rejects mismatched binaries or diverged
+  flash. `HVC #0x18` from the guest forces an immediate save. Lets
+  you edit hypervisor code, `cargo run` again, and ERET back into the
+  failure point in the time it takes the loader to read ~6 MiB — the
+  foundation of the per-iteration debug loop.
 - **Function-level execution tracer.** `--features trace,quiet`
   patches every entry in the curated `code-symbols.txt` with an
   HVC trampoline and logs `seq PC name (mode) r0..r3` on every
@@ -90,15 +92,15 @@ What's working end-to-end:
   posts mouse events back as Newton pen samples. Selected with
   `--features host-io-semihost`; the default `host-io-null` backend
   is a no-op (used by guest-tests and CI).
-- **Guest-test tier** under `guest-tests/` — 35 small AArch32
+- **Guest-test tier** under `guest-tests/` — 37 small AArch32
   binaries against a shared runtime, with an HVC protocol for
   pass/fail/print. Cover every handler (CP15, VIC, DMA, flash,
   serial, screen blit, native primitives, tablet, PCMCIA, snapshot
   round-trip, banked-reg paths, `LDR` rotate, SWP, …).
 - **Diagnostic scaffolding.** DABT/PABT DIAG vectors at ROM offsets
-  `0x10` / `0x0C`, BootOS / PowerOff / Reboot canaries, `verify-mmu`
-  alias-onset ratchet, kernel struct dumps (`task_dump.rs` walks
-  `TScheduler` / `TTask`).
+  `0x10` / `0x0C`, BootOS / PowerOff / Reboot canaries (semihost/dev
+  builds only, gated on `cfg(nh_loud_halt_canaries)`), kernel struct
+  dumps (`task_dump.rs` walks `TScheduler` / `TTask`).
 
 ## Prerequisites
 
@@ -234,7 +236,7 @@ cp /tmp/newton-snapshot-2.bin /tmp/newton-snapshot-0.bin
 ```
 
 Save triggers: every 2 s of wall time from `trap_irq`, plus
-`HVC #0x20` from the guest for explicit checkpoints. Only guest-visible
+`HVC #0x18` from the guest for explicit checkpoints. Only guest-visible
 state is persisted; hypervisor-side EL2 code, trap tables, and timer
 deadlines are fresh each boot — the whole point: edit hypervisor code,
 rebuild, resume mid-failure. See the "Snapshot / resume workflow"
@@ -254,7 +256,7 @@ one platform, at most one backend per axis) and falls back to the
 | `host-io-{null,semihost,pi-fb}` | null | Display + pen seam: no-op, semihost viewer IPC, or real VC4 framebuffer.      |
 | `flash-persist-{null,semihost,sd}` | semihost | Flash persistence: volatile, `/tmp` file via semihosting, or FAT32 SD card. |
 | `input-{null,mtouch}`  | null    | Pen-input seam: no-op or TSTP MTouch USB touchscreen (real hw).                      |
-| `audio-{null,pi-hdmi}` | null    | Sound seam: no-op or VC4 HDMI MAI audio (real hw).                                   |
+| `audio-{null,pi-hdmi}` | null    | Sound seam: null (no output, but arms timer-paced DMA-completion IRQs) or VC4 HDMI MAI audio (real hw). |
 | `no-semihost`          | no      | Real hardware: no `HLT #0xF000` semihosting calls anywhere.                          |
 | `trace`                | no      | Function-level execution trace via per-entry HVC trampolines.                        |
 | `trace_once`           | no      | First-touch variant of `trace`. Trampolines still fire; only the SEQ line is gated.  |
@@ -318,17 +320,17 @@ of the ROM.
 ```
 guest-tests/scripts/build-tests.sh                # build everything in MANIFEST
 guest-tests/scripts/run-test.sh test_vic          # build + run one test
-guest-tests/scripts/run-all.sh                    # run all 35 tests on QEMU
-guest-tests/scripts/run-all.sh --platform fvp     # run all 35 tests on FVP
+guest-tests/scripts/run-all.sh                    # run all 37 tests on QEMU
+guest-tests/scripts/run-all.sh --platform fvp     # run all 37 tests on FVP
 ```
 
 Add a new test by dropping `tests/<name>.S` in place, appending the
 name to `tests/MANIFEST`, and rerunning. See `guest-tests/README.md`
 for the full HVC protocol.
 
-**Every commit must pass `guest-tests/scripts/run-all.sh`.** All 35
+**Every commit must pass `guest-tests/scripts/run-all.sh`.** All 37
 tests must stay green. (Probe-only iterations that touch nothing
-outside `src/rom_patches.rs` and the dispatch in `src/trap.rs` can
+outside `src/rom_patches.rs` and the dispatch in `src/trap/` can
 skip the run — see the note in `CLAUDE.md`.)
 
 ## Debug with gdb
@@ -358,7 +360,7 @@ hypervisor:
 ```
 (gdb) break kmain
 (gdb) break trap_sync_lower_aarch32
-(gdb) break src/trap.rs:103
+(gdb) break src/trap/mod.rs:103
 (gdb) continue
 ```
 
@@ -441,10 +443,22 @@ baremetal/
     stage2.rs            stage-2 L1/L2/L3 tables
     guest.rs             ERET to AArch32 EL1 SVC at guest IPA 0
     guest_mem.rs         ROM load + byteswap + CP15 patch +
-                         fix_stage1_xn_bits + verify-mmu alias detector
-    trap.rs              sync-trap dispatch, MMIO decoder, CP15 shim,
-                         trap_irq, update_virq, HVC tag table
-    mmio.rs              IPA dispatch into peripherals/
+                         fix_stage1_xn_bits (stage-1 normalisation)
+    guest_endian.rs      BE-8 byte-order-aware guest memory accessors
+    guest_regions.rs     single region manifest (ipa/size/host_pa/
+                         perms/snapshot) for stage2 + host_addr_for +
+                         snapshot
+    guest_trampolines.rs UND/DABT vector trampolines + hypervisor-code
+                         range predicate
+    aarch32_emit.rs      AArch32 branch/literal encoders + install_patch
+    trap/                sync-trap dispatch (mod.rs), per-EC handlers
+                         (dabt.rs, und.rs, cp15.rs, hvc.rs, diag.rs),
+                         trap_irq + slim ISR, update_virq, HVC tag table
+    trap_context.rs      TrapContext + read_sysreg! macros + describe_ec
+    probes.rs            Newton-ROM probe handler bodies
+    slim_isr.rs          slim-ISR state ownership (IrqCap token)
+    host_dma.rs          host-side BCM2835 DMA driver (UART TX, MAI, SD)
+    mmio.rs              IPA dispatch into peripherals/ (MmioPeripheral)
     peripherals/         battery, dma, flash[_driver], host_call,
                          native_primitives, network, pcmcia, platform,
                          printer, screen, serial[_driver], sound,
@@ -455,7 +469,6 @@ baremetal/
     rom_patches.rs       Einstein word-write patches; HVC injection;
                          canaries; ResolveFault wrapper
     shadow_stub.rs       in-ROM stub-pool + per-stub scratch-pool
-    shadow_pool.rs       PA-keyed shadow PT pool
     snapshot.rs          rolling 4-slot snapshot ring (semihosting I/O)
     tracer.rs            in-ROM HVC-trampoline tracer (--features trace)
     guest_bp.rs          one-shot guest software BPs (gdb 'bp <addr>')

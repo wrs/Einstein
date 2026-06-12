@@ -2,31 +2,32 @@
 //!
 //! This module is the single bottleneck through which the hypervisor
 //! reads and writes guest memory at the architectural level (i.e. as
-//! the guest CPU itself would see it via LDR/STR). Phase 1 of the
-//! BE-8 migration (`PLAN_BE8_MIGRATION.md`) introduces these helpers
-//! with **identity behavior**: every call delegates to the matching
-//! `guest_mem::*` accessor unchanged. Phase 2c flips the byte-order
-//! policy in this one file when the guest moves from "BE-32 word-
-//! invariant via load-time word swap" to "BE-8 (CPSR.E=1) data
-//! accesses".
+//! the guest CPU itself would see it via LDR/STR). The guest runs in
+//! BE-8 (the Newton kernel sets CPSR.E=1): data bytes are stored in
+//! big-endian order, so to recover the Newton-side numerical value
+//! from a host-LE view these helpers byte-swap on read and on write.
+//! ROM **code** words are the exception — instruction fetch is always
+//! LE on Cortex-A53, so code words are stored native-LE and read back
+//! without a swap (the classifier reach-bitmap, consulted via
+//! `guest_mem::rom_word_is_code`, discriminates code from data per
+//! 32-bit ROM word). Guest-test mode runs the guest LE; the helpers
+//! act as identity wrappers there so existing tests keep working.
 //!
 //! API contract — what the helpers *return / store*:
 //!
 //! - `guest_read_u32_*` / `guest_write_u32_*`: the value is the
-//!   Newton-side numerical value, i.e. interpreted big-endian
-//!   regardless of how the bytes are physically laid out in host
-//!   memory. A caller that wants "the u32 the BE-32 source code
-//!   reads through `LDR Rd, [Rm]`" gets exactly that.
-//! - `guest_read_u8_va` / `guest_read_u16_va`: the byte (halfword)
-//!   at the given guest *logical* address. Logical byte 0 of an
-//!   aligned u32 is the most-significant byte. Today this maps to
-//!   `host[va ^ 3]` (XOR-3 byte-lane transform under BE-32
-//!   word-invariant); after Phase 2 the CPU itself does the
-//!   byte-lane transform on every store, so logical byte 0 will
-//!   live at `host[va]` directly.
+//!   Newton-side numerical value, interpreted big-endian regardless of
+//!   how the bytes are physically laid out in host memory. A caller
+//!   that wants "the u32 the Newton source reads through
+//!   `LDR Rd, [Rm]`" gets exactly that.
+//! - `guest_read_u8_va` / `guest_read_u16_va`: the byte (halfword) at
+//!   the given guest *logical* address. Logical byte 0 of an aligned
+//!   u32 is the most-significant byte. Under BE-8 the CPU does the
+//!   byte-lane transform on every store, so logical byte 0 lives at
+//!   `host[va]` directly.
 //! - `guest_read_bytes_va`: copies a contiguous range in Newton-side
 //!   logical-byte order into `out`, so the buffer matches what the
-//!   BE-32 source code would see byte-by-byte.
+//!   Newton source would see byte-by-byte.
 
 use crate::guest_mem;
 

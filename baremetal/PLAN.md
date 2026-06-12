@@ -14,7 +14,7 @@ Bloated PLAN.md wastes context every read.
   the table (2026-04-29). The fix MUST be a kernel patch.
 - Run the *original ROM code*; no workarounds, no deferrals, no
   shortcuts; fix all warnings before each commit.
-- All 35 guest tests must pass on every commit that touches hypervisor
+- All 37 guest tests must pass on every commit that touches hypervisor
   functionality (not merely diagnostics):
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
@@ -22,7 +22,7 @@ Bloated PLAN.md wastes context every read.
 717006 ROM boots to the Welcome UI and the builtin apps work
 interactively — on QEMU raspi3b, on ARM FVP, and on a real
 Pi Zero 2 W with HDMI display, USB touch, HDMI audio, and SD-backed
-flash persistence (non-blocking DMA autosave). All 35 guest tests are
+flash persistence (non-blocking DMA autosave). All 37 guest tests are
 green. The Phase-B debugging diary that used to live here (stack-VM
 patches, ResolveFault wrapper, matcher-mismatch hunts) is archived in
 git history; the durable findings are in `docs/STRUCTURES.md` and
@@ -37,37 +37,38 @@ git history; the durable findings are in `docs/STRUCTURES.md` and
    load a known-simple package, see where it stops, fix, repeat.
 2. **Phase 6 remainder** — serial port and PCMCIA images on real
    hardware (audio is done). See `docs/REAL_HW_BRINGUP.md` §Phase 6.
-3. **Debug-scaffolding teardown** — done. The one-off Phase-B
-   write-capture probes are gone; what remains is listed under
-   "Diagnostic scaffolding" below, kept deliberately as tripwires
-   and debugging tooling.
+3. **Debug-scaffolding teardown** — done. The one-off Phase-B residue
+   has been deleted: the write-capture/`newt`/`cdsv` tripwires, the
+   subpage-AP and alias-onset audit inside `fix_stage1_xn_bits`, the
+   parked-PC wedge probe (audio-null now arms its own DMA-completion
+   IRQ), the never-installed stack-pad/lock-heap wrappers, and the
+   dead `shadow_pool` / `usb_probe` modules. What remains is listed
+   under "Diagnostic scaffolding" below, kept deliberately as
+   tripwires and debugging tooling.
 4. **Targeted guest-TLB maintenance.** The hypervisor rewrites guest
    stage-1 PTEs behind the guest's back (`fix_stage1_xn_bits`,
-   shadow-stub alias redirects, scratch-pool install) with no TLBI at
-   the rewrite sites; today a blanket `vmalle1` per 16 ms heartbeat
-   (`timer::on_irq`) bounds stale-entry lifetime. (Removing the g1 /
-   alrt capture probes — whose flip/rearm cycle did full
-   `VMALLE1IS` flushes as a side effect — exposed this: boot hung at
-   the post-`SystemBootUND` timer wait on real hw and intermittently
-   on QEMU.) Replace the blanket flush with targeted TLBIs at each
-   rewrite site, then drop it.
+   scratch-pool L1-section install) with no TLBI at the rewrite sites;
+   today a blanket `vmalle1` per 16 ms heartbeat (`timer::on_irq`)
+   bounds stale-entry lifetime. Replace the blanket flush with
+   targeted TLBIs at each rewrite site, then drop it.
 5. **M7 — performance and polish** (HIGHLEVEL.md §12): measurement vs
    the real 162 MHz StrongARM; display-scaling quality on real hw.
 
 ## Workflow per stop
 
-1. Capture verify-mmu output (`fix_stage1_xn_bits` ratchets per
-   alias-onset). Each alias is a `(PA, VA1, VA2)` tuple.
-2. Identify the kernel-side write that creates each alias by
-   instrumenting the relevant L2-write entry point with an HVC probe.
+1. Reproduce the stall on QEMU and capture the loud-halt context dump
+   (or the last snapshot before the wedge — see CLAUDE.md).
+2. Identify the kernel-side code at the wedge PC from the disasm
+   (`scripts/disasm-out/rom.dis`) and instrument the relevant entry
+   point with an HVC probe if more detail is needed.
 3. Cross-reference with Einstein (`build/NewtonProbe baremetal/roms/
    newton.rom _Data_/Einstein.rex 30`) so we have a known-good oracle.
 4. Decide where the fix belongs:
-   - **Hypervisor handler gap** — `src/peripherals/*.rs`, `src/trap.rs`.
+   - **Hypervisor handler gap** — `src/peripherals/*.rs`, `src/trap/`.
    - **Einstein behavioural quirk** — port the matching logic.
    - **ROM patch** — `src/rom_patches.rs`. Only when no other layer can
      host the fix.
-5. Re-run, observe alias count, repeat until zero.
+5. Re-run, confirm the wedge is gone, repeat for the next stop.
 
 ## Tools
 
@@ -124,17 +125,25 @@ git history; the durable findings are in `docs/STRUCTURES.md` and
 
 ### Tests
 
-`baremetal/guest-tests/scripts/run-all.sh` runs the 35 guest tests on
-QEMU; `--platform fvp` on the FVP. Both must stay green.
+`baremetal/guest-tests/scripts/run-all.sh` runs the 37 guest tests on
+QEMU; `--platform fvp` on the FVP. Both must stay green. Set
+`CHECK_MATRIX=1` to also run `scripts/check-matrix.sh` (10 feature
+combos) at the top of the run.
 
 ## Critical files
 
 - `src/guest_mem.rs` — ROM load + byteswap; `fix_stage1_xn_bits`
-  flattens ARMv4 subpage-AP to AP=011 and runs the verify-mmu
-  alias detector; UND-vector trampoline; DABT/PABT DIAG patches.
-- `src/trap.rs` — CP15 shim, HVC dispatch (UND_TAG / DIAG_TAG / SBA /
-  tracer / canary / probe tags); `handle_data_abort` with kernel-DABT
-  forwarding for lazy stack growth; `trap_irq` + the same-EL slim ISR.
+  flattens ARMv4 subpage-AP to AP=011, clears XN, rewrites fine-table
+  L1 placeholders to fault; CP15-encoding rewrites.
+- `src/guest_trampolines.rs` — UND/DABT/PABT vector trampolines + the
+  hypervisor-code range predicate.
+- `src/guest_regions.rs` — the single region manifest (ipa/size/
+  host_pa/perms/snapshot) driving stage2, host_addr_for, and snapshot.
+- `src/trap/` — `mod.rs` (sync-trap + IRQ dispatch, same-EL slim ISR),
+  `dabt.rs` (`handle_data_abort` with kernel-DABT forwarding for lazy
+  stack growth), `und.rs`, `cp15.rs` (CP15 shim), `hvc.rs` (tag
+  dispatch); `src/probes.rs` for the Newton-ROM probe handler bodies.
+- `src/host_dma.rs` — host-side BCM2835 DMA driver (UART TX, MAI, SD).
 - `src/guest.rs` — HCR_EL2 (TVM, TIDCP, TSW, TPC, TPU, IMO, FMO, AMO,
   DC); CPTR_EL2.TFP for CP10/11.
 - `src/stage2.rs` — stage-2 L1/L2/L3.
@@ -151,7 +160,7 @@ QEMU; `--platform fvp` on the FVP. Both must stay green.
 - `src/tracer.rs` — function-level tracer.
 - `src/guest_bp.rs` — `bp <addr>` for the gdb workflow.
 - `src/task_dump.rs` — `TScheduler` / `TTask` dumps from EL2.
-- `guest-tests/tests/` — 35 tests; `guest-tests/scripts/run-all.sh`.
+- `guest-tests/tests/` — 37 tests; `guest-tests/scripts/run-all.sh`.
 
 ## Verification
 
@@ -161,7 +170,7 @@ Every commit:
 baremetal/guest-tests/scripts/run-all.sh
 ```
 
-All 35 tests must pass.
+All 37 tests must pass.
 
 ## Non-goals
 
@@ -170,11 +179,15 @@ All 35 tests must pass.
 
 ## Diagnostic scaffolding (active)
 
-The one-off Phase-B probes are gone; these stay as permanent
+The one-off Phase-B probes are gone (the write-capture tripwires,
+the subpage-AP/alias audit inside `fix_stage1_xn_bits`, the parked-PC
+wedge probe, `shadow_pool`, `usb_probe`); these stay as permanent
 tripwires and debugging tooling.
 
-- `verify-mmu` in `fix_stage1_xn_bits` — ratchet-logs subpage-AP
-  heterogeneity and per-alias-onset `(PA, VA1, VA2)` tuples.
 - DABT/PABT DIAG vectors at ROM offsets `0x10` / `0x0C`.
 - BootOS / PowerOffAndReboot / Reboot canaries and the
-  BUS_ERROR_THROW loud-halt capture in `rom_patches.rs`.
+  BUS_ERROR_THROW loud-halt capture in `rom_patches.rs`, gated on
+  `cfg(nh_loud_halt_canaries)` (semihost/dev builds only — off on
+  real hardware so a user reset doesn't halt the hypervisor).
+- The function-level tracer (`--features trace`) and `guest_bp`
+  one-shot software breakpoints for the gdb workflow.

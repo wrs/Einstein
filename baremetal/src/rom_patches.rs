@@ -151,8 +151,8 @@ const PATCHES_717006: &[RomPatch] = &[
     // heartbeat, so two guest tick reads inside one ~16 ms heartbeat
     // window observe identical values. The ls/cc swap keeps real
     // wraps detected (new < old) but ignores the spurious equality.
-    // See INVESTIGATION.md "alarm-loop wedge from spurious wrap
-    // detection". Encoding: cond field [31:28] LS=9 → CC=3; the rest
+    // (Root cause: an alarm-loop wedge from spurious wrap detection.)
+    // Encoding: cond field [31:28] LS=9 → CC=3; the rest
     // of the instruction (`add Rn, Rn, #1`) is unchanged.
     RomPatch { offset: 0x003A_D430, orig: 0x9281_1001, value: 0x3281_1001, name: "GetClock wrap-detect ls→cc" },
     RomPatch { offset: 0x003A_D46C, orig: 0x9282_2001, value: 0x3282_2001, name: "SetAlarm wrap-detect (1/2) ls→cc" },
@@ -176,8 +176,7 @@ const PATCHES_717006: &[RomPatch] = &[
     // subpage AP, enforced by ARMv4's subpage-AP. ARMv7 has no
     // subpage-AP — `fix_stage1_xn_bits` flattens to AP=011, so a
     // stack write to "its" subpage spills into the heap's adjacent
-    // subpage on the same physical page. See
-    // `INVESTIGATION.md` "Subpage-AP decoded" for the full picture.
+    // subpage on the same physical page.
     //
     // Surgical fix: make heap[+0x38] (= chunk_size, written by
     // NewHeap from its 3rd arg) always 4096. Then `ExtendVMHeap`
@@ -391,7 +390,7 @@ const PATCHES_717006: &[RomPatch] = &[
 
 /// Phase-B canary: PowerOffAndReboot at 0x000E_6BBC. The kernel calls
 /// this whenever a fatal init-time check fails (e.g. flash chip
-/// identification yields no driver match — see INVESTIGATION.md).
+/// identification yields no driver match).
 /// Patch the first word with `HVC #HvcImm::LoudHalt` so we halt
 /// loudly the FIRST time it fires, with the caller's R0 (reboot
 /// reason) and the trace context immediately preceding the call.

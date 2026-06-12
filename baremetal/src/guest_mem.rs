@@ -1138,7 +1138,6 @@ pub unsafe fn load_newton_rom() {
     // SPSR_EL2; the rewrite path is kept because it gives a smaller
     // and more localised hot path on every native-primitive call.)
     //
-    // See INVESTIGATION.md for the debug trace that exposed this.
     // SAFETY: operates within the REx window we just loaded; bounds
     // checked against REX_BE.len().
     unsafe {
@@ -1176,18 +1175,21 @@ pub unsafe fn load_newton_rom() {
     unsafe { crate::rom_patches::apply_717006_patches(rom_ptr); }
 
     // UND vector (VA 0x04) + trampoline body: overwrite the ROM's
-    // branch-to-REx-handler with a branch to a small AArch32 stub we
-    // install at ROM offset 0x80. The stub saves R14_und and SPSR_und
-    // to fixed RAM slots (0x04000400 / 0x04000404), then issues
-    // HVC #UND_TAG so src/trap.rs::handle_und can decode and emulate
-    // the faulting instruction. Without this the A53-only CP15 UNDs
-    // (c15 c1 op2=2) and the Einstein UND opcodes would take the
-    // REx handler's path, which our hypervisor isn't set up to
-    // service. Phase A.2 of PLAN.md.
-    // SAFETY: rom_ptr covers ROM_SIZE bytes; patch_und_vector writes
-    // 4 bytes at offset 0x04 and 36 bytes starting at offset 0x80 —
-    // both in the first 256 bytes of ROM, confirmed zero from offset
-    // 0x58 onwards on Newton 2.x ROMs.
+    // branch-to-REx-handler with a branch to the FPA-bypass stub and
+    // UND trampoline that `guest_trampolines::patch_und_vector` installs
+    // in the ROM-tail stub cluster (FPA bypass at
+    // `FPA_BYPASS_STUB_OFFSET`, trampoline at `UND_TRAMP_OFFSET` =
+    // 0x00FF_FF00). The trampoline saves R14_und/SPSR_und to the
+    // SCRATCH_POOL save area, then issues HVC #UND_TAG so
+    // `trap::und::handle_und` can decode and emulate the faulting
+    // instruction; FPA-class UNDs are routed straight to the kernel's
+    // FPE handler. Without this the A53-only CP15 UNDs (c15 c1 op2=2)
+    // and the Einstein UND opcodes would take the REx handler's path,
+    // which our hypervisor isn't set up to service.
+    // SAFETY: rom_ptr covers ROM_SIZE bytes; patch_und_vector writes the
+    // branch word at offset 0x04 and the stub bodies in the reserved
+    // ROM-tail window (0x00FF_FEC0..0x00FF_FF60), all well under
+    // ROM_SIZE. See `guest_trampolines` for the per-word layout.
     unsafe { crate::guest_trampolines::patch_und_vector(rom_ptr); }
 
     // Install the DABT-vector intercept. See

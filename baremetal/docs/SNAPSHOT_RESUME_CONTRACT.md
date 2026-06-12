@@ -1,0 +1,128 @@
+# Snapshot resume contract
+
+What a snapshot save/load round-trip restores, and — more importantly
+— which guest-visible state it deliberately does **not** restore, with
+the reason reset-on-resume is safe for each. This is the companion to
+the workflow notes in `CLAUDE.md` (§Snapshot / resume workflow) and the
+field-level layout documented in `src/snapshot.rs`.
+
+## What is saved
+
+`src/snapshot.rs` serializes, per slot:
+
+- **Three memory regions**, in the order the region manifest
+  (`src/guest_regions.rs`) lists them as snapshotted: `GUEST_RAM`
+  (4 MiB), `GUEST_FB` (2 MiB), and `shadow_stub::SCRATCH_POOL`
+  (384 KiB at IPA `0x0600_0000`).
+- **Guest CPU state**: all 31 AArch64 GPRs (`x0..x30`, which alias every
+  AArch32 banked `R0..R14` per ARM ARM Table D1-79), `ELR_EL2` /
+  `SPSR_EL2` (the resume PC / CPSR), and the per-mode banked SPSRs.
+- **EL1 / guest sysregs reachable from EL2**: `SCTLR_EL1`,
+  `TTBR0/1_EL1`, `TCR_EL1`, `DACR32_EL2`, `VBAR_EL1`, `CPACR_EL1`,
+  `MAIR_EL1`; the AArch32 fault-register homes (`FAR_EL1` = DFAR,
+  `ESR_EL1` = DFSR, `IFSR32_EL2`); and the TLS scratch (`TPIDR_EL0` /
+  `TPIDRRO_EL0`) the trampoline stubs stash through.
+
+Persistent flash is **not** in the file — it lives in
+`$HOME/.newton/flash.bin` (`src/flash_persist/`). The header carries an
+FNV-1a fingerprint of `GUEST_FLASH` at save time; on resume a mismatch
+forces a cold boot rather than risk resuming CPU state against diverged
+flash.
+
+## What is NOT saved (reset-on-resume), and why that is safe
+
+The hypervisor's peripheral models hold guest-visible MMIO register
+state in module statics. None of it is in the snapshot; on resume each
+model starts from its `Default`/`new` value and the guest re-drives it.
+The save path makes this safe by construction:
+
+**The save is gated to a stable, between-transactions moment.**
+`maybe_autosave` only writes a slot when:
+
+1. the IRQ that woke EL2 came from the AArch32 guest (`SPSR_EL2.M[4]==1`),
+   not from a nested EL2 timer IRQ; and
+2. the guest `ELR_EL2` is **not** inside a hypervisor-owned trampoline /
+   stub (`pc_in_hypervisor_transient_region`, delegating to
+   `guest_trampolines::is_hypervisor_code_region`); and
+3. no guest software breakpoint is installed (`guest_bp::any_installed`).
+
+So a saved PC is always a guest instruction boundary reached via a timer
+IRQ — never mid-MMIO-emulation, never mid-stub. The peripheral models
+are only ever mutated synchronously inside a trap handler that runs to
+completion before the guest is re-entered, so at the save point no model
+is "half-updated". What remains is whether the *steady-state* register
+contents matter across the gap. Per peripheral:
+
+- **VIC** (`peripherals/vic.rs`, `VicState`): `int_present`, `int_ctrl`,
+  `fiq_mask`, `int_ed_*`, `match_reg[]`, `match_fired`, `alarm_reg`,
+  `alarm_fired`, `gpio_*`. Reset to zero on resume. **Safe** because the
+  Newton kernel reinstalls the entire interrupt-controller configuration
+  early and continuously: match registers are re-armed on every timer
+  service, DACR/`int_ctrl` are rewritten at each context switch, and the
+  edge-detect latches (`match_fired`, `alarm_fired`) exist only to
+  suppress a re-raise within one already-serviced tick. A fresh latch at
+  resume can at worst cause one extra timer IRQ on the first post-resume
+  tick, which the kernel handles idempotently. `TICK_EPOCH` /
+  `CALENDAR_*` re-seed from `CNTPCT` at init, so wall-clock continuity is
+  re-established, not carried.
+
+- **Serial DMA** (`peripherals/dma.rs`, `DmaState` / `ChannelState`):
+  `assign`, per-channel `data_ptr`, `countdown`, `buf_size`, `control`,
+  `event`, `armed`. Reset on resume. **Safe** for the boot/idle states
+  the snapshot workflow targets: the snapshot is a developer tool for
+  re-reaching a boot stall, and at the gated save points there is no
+  in-flight host-fed serial DMA transfer whose mid-transfer cursor would
+  need to survive. *Caveat (filed, not hand-waved):* if a snapshot were
+  ever taken with a guest-armed TX/RX DMA mid-ring (non-zero `countdown`
+  with `armed==true`), resuming would drop the remaining transfer and
+  the guest would wait on a completion IRQ that never comes. This has not
+  been observed because the workflow saves during boot, where serial DMA
+  is quiescent — but a snapshot taken during active serial traffic is
+  outside the contract.
+
+- **Tablet** (`peripherals/tablet.rs`, `TabletState`): the pen-sample
+  queue and digitizer register shadows. Reset on resume. **Safe**: the
+  queue holds host-injected pen events that have no meaning across a
+  rebuild (the host viewer / MTouch driver is re-initialized fresh), and
+  the kernel re-reads the digitizer through `NativeGetSample` rather than
+  caching it.
+
+- **Sound model** (`peripherals/sound.rs`): the `SUBFN_COUNT` / `SEEN`
+  diagnostic counters. Reset on resume. **Safe**: these are
+  log-budget/observability counters, not guest-visible register state.
+
+- **Null-audio completion (Phase 2)** (`audio/null.rs`):
+  `OUTPUT_INT_MASK`, `OUTPUT_RUNNING`, `PENDING_EDGES`, `NEXT_DEADLINE`,
+  `LAST_DURATION_TICKS`. Reset on resume. **Safe with a one-tick
+  caveat**: this is the state that arms a sound-DMA completion IRQ a
+  buffer-duration after `schedule_output`. If a snapshot is taken in the
+  window between `schedule_output` and the paced completion, the armed
+  completion is lost on resume and the guest's sound code would wait for
+  a buffer-done IRQ that was dropped. In practice the boot chime's
+  buffers complete sub-second and the save cadence is ~2 s, so a resume
+  almost never lands inside an armed-but-unfired window; and even when it
+  does, the kernel's sound path tolerates a missed completion on the
+  boot chime (it does not gate further boot progress on it). Re-arming
+  on resume is **not** implemented — filed here as the one place where
+  reset-on-resume is lossy rather than provably transparent.
+
+- **PCMCIA** (`peripherals/pcmcia.rs`): the controller-register storage
+  that backs chip-detect. Reset on resume. **Safe**: with no card
+  present the kernel re-probes the controller (`TCardSocket::GetChipInfo`
+  writes its own sentinels and reads them back); the storage exists only
+  to make that round-trip succeed, and a freshly-zeroed store satisfies
+  the very first write-then-read the probe performs.
+
+## Summary
+
+Everything the guest can observe *and depends on across the gap* is in
+the snapshot: RAM, FB, the SCRATCH_POOL the trampolines stash through,
+and the CPU/MMU/fault sysregs. The peripheral-model statics are reset
+because the save is gated to a between-transactions guest IRQ boundary
+where their steady-state contents are either (a) re-driven by the kernel
+immediately (VIC, PCMCIA), (b) meaningless across a host re-init
+(tablet, diagnostic counters), or (c) quiescent in the boot/idle states
+the workflow targets (serial DMA). The two lossy edges — a snapshot
+taken mid serial-DMA-ring, or inside an armed-but-unfired null-audio
+completion window — are documented above as out-of-contract rather than
+silently assumed away.

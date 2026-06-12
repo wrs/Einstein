@@ -878,11 +878,10 @@ back, and Acquire blocks on `BlockOnInc` of a count that no one
 will increment (since the holder is itself the blocked task). This
 is a self-deadlock — any caller of `Acquire` must guarantee a
 matching `Release` on **all** exit paths, including the C++
-exception unwind chain. (See `INVESTIGATION.md` for a worked
-example: `MakeStoreObject`'s catch handler calls
-`TStoreWrapper::Abort` but **not** `UnlockStore`, so a Throw inside
-the locked region leaves the heap-store TULockingSemaphore held by
-the throwing task.)
+exception unwind chain. (Worked example: `MakeStoreObject`'s catch
+handler calls `TStoreWrapper::Abort` but **not** `UnlockStore`, so a
+Throw inside the locked region leaves the heap-store
+TULockingSemaphore held by the throwing task.)
 
 `Release__18TULockingSemaphoreFv` ROM `0x25a31c`:
 
@@ -2061,7 +2060,6 @@ Cross-references:
 
 ## See also
 
-- `INVESTIGATION.md` — live wedge debugging notes
 - `src/task_dump.rs` — runtime walker that materializes the above
 - `docs/DISASM.md` — how to use `scripts/disasm-out/rom.dis`
 - `/Users/walter/Projects/newton/ghidra/DDKIncludes/OS600/` — public

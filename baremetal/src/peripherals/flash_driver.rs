@@ -248,9 +248,10 @@ fn begin_write(ctx: &mut TrapContext, _pc: u32) {
 /// TEinsteinFlashDriver::DoWrite(word=r1, mask=r2, addr=r3,
 /// startOfBlock=[sp+4]). Einstein's case 0x0F just logs and returns
 /// r0=0 — `startOfBlock` is informational only. We mirror that
-/// behaviour: `BeginWrite` already programmed the masked word into
-/// flash, and DoWrite is the kernel-side bookkeeping wrapper around
-/// the per-word loop. Our state has nothing to update.
+/// behaviour: the actual masked-word programming happens in the
+/// `write` primitive (subfn 0x08); `begin_write` (0x0D) only
+/// range-checks, and DoWrite is the kernel-side bookkeeping wrapper
+/// around the per-word loop. Our state has nothing to update.
 fn do_write(ctx: &mut TrapContext, _pc: u32) {
     ctx.x[0] = 0;
 }

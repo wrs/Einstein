@@ -1,9 +1,10 @@
 //! Function-level execution trace (every-call, with argument registers).
 //!
-//! When the `trace` cargo feature is on, `build.rs` parses
-//! `scripts/classify-out/code-symbols.txt` (the curated code-only symbol
-//! list the shadow-stub classifier's walker also uses) and emits three
-//! blobs into OUT_DIR which we include here:
+//! `build.rs` parses `scripts/classify-out/code-symbols.txt` (the curated
+//! code-only symbol list the shadow-stub classifier's walker also uses)
+//! and emits three blobs into OUT_DIR unconditionally — `crate::symbols`
+//! includes them for PC→name lookup in halt-path stack traces, and this
+//! module consults them for its trampoline pool when `trace` is enabled:
 //!
 //!   fn_addrs.bin       packed u32 LE — sorted ROM-range entry PAs
 //!   fn_name_offs.bin   packed u32 LE — offsets into the name pool

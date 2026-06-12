@@ -237,26 +237,27 @@ sd-probe-trace = ["sd-probe"]
 #     --features "pi-bare-metal fb-probe"
 fb-probe = []
 
-# Function-level execution trace. When enabled, build.rs parses
-# ../_Data_/unified_symbols.tsv and embeds a compact address + name
-# table; at ROM load time each word-aligned function entry whose first
-# instruction matches a known ARM prologue is overwritten with
-# `UDF #index` (0xE7F1_xxxx) and the original word is stashed in an
-# EL2-side table. The UND handler logs the function name, restores
-# the original instruction, invalidates the icache line, and rewinds
-# ELR — so each function logs once per boot ("first-touch" trace).
-# Off by default because the symbol blob adds ~400 KiB to the image
-# and mutates the ROM in ways that invalidate existing snapshots.
+# Function-level execution trace (every-call). When enabled, ROM load
+# installs a 5-word trampoline per function in a reserved ROM-aperture
+# window: the function's first word is rewritten to `B trampoline`, and
+# the slot issues `HVC #TRACE_TAG` (logging the name + r0..r3 at entry),
+# runs the original first instruction, then branches back. A function
+# called ten times produces ten trace lines. The symbol address/name
+# tables it consults are built by build.rs unconditionally (they also
+# back PC→name lookup in halt-path stack traces); this feature only
+# turns on the trampoline install in `tracer::init`. See the module doc
+# in `src/tracer.rs`. Off by default because the install mutates many
+# ROM words, which changes the snapshot ROM fingerprint and forces a
+# cold boot.
 trace = []
 
-# First-touch variant of `trace`: each function logs its entry line
-# once per session. The trampolines still fire on every call (so the
-# targeted debug instrumentation in `tracer::log_trace_at` — putc
-# buffering, newt-tripwire poll, mode-13 SP_svc tracking, etc. — keeps
-# working), but the main `trace SEQ PC NAME (mode) r0..r3 lr=...` line
-# is gated on a per-function fired-bitmap. Use when you want to see
-# *which* functions execute without the loop-spam from re-entries.
-# Implies `trace`.
+# First-touch variant of `trace`: the main `trace SEQ PC NAME (mode)
+# r0..r3` line is emitted once per function per session, gated on a
+# per-function fired-bitmap in `log_trace_at`. The trampolines still
+# fire on every call, so targeted side-effects in `tracer::log_trace_at`
+# (putc line-buffering, the `SVC_WATCH` banked-SP/LR probe) keep working.
+# Use when you want to see *which* functions execute without the
+# loop-spam from re-entries. Implies `trace`.
 trace_once = ["trace"]
 
 # Silence recurring diagnostic logs that dominate the console during

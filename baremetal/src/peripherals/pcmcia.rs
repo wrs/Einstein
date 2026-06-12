@@ -25,12 +25,11 @@
 //! controller-register range is what `TCardSocket::GetChipInfo` (ROM
 //! 0x55714) probes — it writes 0xa5a5 to reg_3000, 0x5a5a to reg_3800,
 //! reads them back, and only proceeds with socket bring-up if the
-//! values stuck. Earlier we returned 0xFFFF_FFFF for every read,
-//! failing chip-detect and steering the boot down the heavy
-//! "no chip" teardown path that ultimately exhausts the kernel's
-//! stack-page pool and triggers the L2 alias wedge — see
-//! `INVESTIGATION.md` "PCMCIA chip-detect fails because controller has
-//! no register storage".
+//! values stuck. The controller therefore backs its registers with
+//! real read/write storage: returning a fixed sentinel for every read
+//! fails chip-detect and steers the boot down the heavy "no chip"
+//! teardown path that exhausts the kernel's stack-page pool and
+//! triggers an L2 alias wedge.
 //!
 //! Storage scope: every write to a known controller register sticks;
 //! every read returns the stored value, with two exceptions that

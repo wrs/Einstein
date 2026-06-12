@@ -46,9 +46,10 @@
 //! marker UDF would halt on resume with "marker at PC=… with no
 //! matching table entry". The gating logs a single transition line
 //! when it starts/stops suppressing saves. Explicit
-//! HVC-#0x20-triggered saves still go through; if you really want a
-//! save with BPs installed, you're telling the hypervisor on
-//! purpose, and it's your problem to clear them before resume.
+//! HVC-#0x18-triggered saves (`HvcImm::Snapshot`) still go through; if
+//! you really want a save with BPs installed, you're telling the
+//! hypervisor on purpose, and it's your problem to clear them before
+//! resume.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 

@@ -81,7 +81,7 @@ ls -la /tmp/newton-snapshot-*.bin
 ### Save triggers
 
 - **Periodic (default):** every `AUTOSAVE_INTERVAL_MS = 2000` ms of
-  wall time, hooked into `trap_irq` (timer IRQ) in `src/trap.rs`.
+  wall time, hooked into `trap_irq` (timer IRQ) in `src/trap/mod.rs`.
   Wall-clock pacing, not trap count — a pathological abort loop
   won't thrash saves.
 - **Guest-triggered:** `HVC #0x18` (`HvcImm::Snapshot`) from the guest issues an
@@ -120,12 +120,18 @@ deterministically, and restores the older state.)
 
 ### What survives a rebuild
 
-Only guest-visible state: GUEST_RAM, GUEST_FB, flash, the EL1
-CP15 regs we can reach from AArch64 EL2, and x0..x14 of the
-currently-active guest AArch32 mode. Hypervisor-side EL2 code
-addresses, trap tables, VIC state, timer deadlines, and so on
-are fresh each boot. That's the point: edit hypervisor code,
-rebuild, resume.
+Only guest-visible state: GUEST_RAM, GUEST_FB, the
+shadow_stub SCRATCH_POOL, the EL1 CP15 regs we can reach from
+AArch64 EL2, and all 31 AArch64 GPRs (x0..x30) of the guest.
+Persistent flash is not in the snapshot file (it lives in
+`$HOME/.newton/flash.bin`); the header carries an FNV-1a
+fingerprint of GUEST_FLASH so a resume cold-boots if the on-disk
+flash has diverged from the saved CPU/RAM state. Because x0..x30
+alias every AArch32 banked R0..R14 per ARM ARM Table D1-79,
+capturing all 31 also captures the per-mode banked SP/LR.
+Hypervisor-side EL2 code addresses, trap tables, VIC state, timer
+deadlines, and so on are fresh each boot. That's the point: edit
+hypervisor code, rebuild, resume.
 
 ### ROM fingerprint
 
@@ -138,16 +144,10 @@ early ROM bytes.
 
 ### Known limitations
 
-- Banked `SP_` / `LR_` for non-active AArch32 modes are not saved
-  (LLVM's AArch64 assembler doesn't expose the banked mnemonics
-  for those). The Newton kernel initialises SP per-mode on mode
-  entry, so this matches observed behaviour. If a future
-  snapshot resumes inside an exception handler that was taken
-  through a banked SP that we didn't restore, we'll need an
-  AArch32 stub to widen coverage.
-- Each save is ~14 MiB (RAM + FB + flash + header) through
-  semihosting SYS_WRITE. Fast enough at 2 s cadence but will
-  become painful if the cadence tightens.
+- Each save is ~6 MiB (4 MiB RAM + 2 MiB FB + 384 KiB SCRATCH_POOL +
+  header) through semihosting SYS_WRITE. Flash is no longer in the
+  file. Fast enough at 2 s cadence but will become painful if the
+  cadence tightens.
 - The autosave hook runs from `trap_irq`, so a guest that never
   takes a timer IRQ won't produce fresh snapshots. In practice
   the Newton kernel arms its match registers very early and
@@ -179,7 +179,7 @@ aarch64-elf-gdb -x scripts/gdb-init \
     time we're at trap_sync entry, `ELR_EL2` points at the trampoline,
     not the original PC.
   - **`bp <addr>`** — install a one-shot guest software BP (see
-    `src/guest_bp.rs`). Patches the ROM word with `UDF #0xFFFE` and
+    `src/guest_bp.rs`). Patches the ROM word with `UDF #0xFF0E` and
     stops in `handle_user_bp_und` with `faulting_pc` = the guest PC.
     Works for any ROM-range PC regardless of whether it naturally
     traps. One-shot: `bp <addr>` again to re-arm. Snapshot autosaves
@@ -228,10 +228,10 @@ saw in a log), skip the install: `bg <addr>` and `c` is enough.
   ```
   If `X` is missing, the fix lives in `tools/classify-rom/src/main.rs`
   (add a seeder for the structure that contains `X`), not in
-  `src/trap.rs`. After regenerating the bitmap with
+  `src/trap/`. After regenerating the bitmap with
   `scripts/regen-classify.sh`, `scripts/dump-data-regions.py`
   refreshes `code-regions.txt` so the same grep verifies the fix.
-- Every handler in `src/trap.rs` / `src/peripherals/*` halts
+- Every handler in `src/trap/` / `src/peripherals/*` halts
   loudly on unknown inputs with a context dump. When a ROM boot
   trips one, the halt message points at exactly the table entry
   that needs adding. **Don't paper over it** by adding a silent
@@ -262,15 +262,16 @@ saw in a log), skip the install: `bg <addr>` and `c` is enough.
   message, not a deep compile error.
 - **Skip the guest-tests run** when an iteration's only changes
   are a Newton-ROM probe (a new HVC immediate at a Newton-ROM PC
-  in `src/rom_patches.rs` + a dispatch arm + handler in
-  `src/trap.rs` that emulates the original instruction). The
-  guest tests run isolated test ELFs that don't include the
-  Newton ROM, so probe-only changes can't regress them.
+  in `src/rom_patches.rs` + a dispatch arm in `src/trap/hvc.rs` +
+  a handler body in `src/probes.rs` that emulates the original
+  instruction). The guest tests run isolated test ELFs that don't
+  include the Newton ROM, so probe-only changes can't regress them.
   Walter has called this out as wasted time. Run them when
   changes touch `src/shadow_stub.rs`, `src/unaligned.rs`,
   `src/peripherals/*`, `src/banked.rs`, `src/stage2.rs`,
-  `src/guest.rs`, generic SBA/UND/DABT/IRQ paths in
-  `src/trap.rs`, or `guest-tests/` itself.
+  `src/guest.rs`, the generic SBA/UND/DABT/IRQ paths in
+  `src/trap/` (`mod.rs`, `dabt.rs`, `und.rs`, `cp15.rs`), or
+  `guest-tests/` itself.
 
 ## Function-level execution trace
 
@@ -404,3 +405,15 @@ re-deriving state from disassembly or tool output:
   IRQ, with the file's per-cluster LBA map resolved through the
   vendored embedded-sdmmc. The only open item is the optional
   `WaitBusy` refinement noted in the doc.
+- [`docs/SNAPSHOT_RESUME_CONTRACT.md`](docs/SNAPSHOT_RESUME_CONTRACT.md)
+  — what a snapshot save/load restores, and which peripheral-model
+  statics are guest-visible-but-deliberately-not-saved (VIC, serial
+  DMA, tablet, sound, null-audio completion, PCMCIA) with the reason
+  reset-on-resume is safe for each — and the two lossy edges that are
+  out of contract.
+- [`docs/PACKAGE_NATIVE_CODE.md`](docs/PACKAGE_NATIVE_CODE.md) —
+  design note for native code inside add-on packages: which
+  `shadow_stub` "real code" invariants extend above the ROM aperture,
+  what the stage-2 RW+XN ↔ RO+X rescan path guarantees, and the
+  triage recipe when a wedge PC is in RAM (where the bitmap-first
+  doctrine does not apply).

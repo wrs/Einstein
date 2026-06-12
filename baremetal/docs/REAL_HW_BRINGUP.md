@@ -418,7 +418,7 @@ The stack:
    channel 4 paced by the HDMI DREQ (17), a looped CB chain that
    never stops (silence subframes between clips keep the receiver
    from renegotiating); per-period completion IRQs advance the
-   consumer counter. See `src/peripherals/host_dma.rs` and the "DMA
+   consumer counter. See `src/host_dma.rs` and the "DMA
    TX ring" section in `pi_hdmi.rs`.
 7. **Buffer-completion IRQ to the guest** — once the ring drains to
    the producer's mark, raise the output-interrupt mask the kernel
@@ -452,7 +452,7 @@ glitch audio audibly. Instead, `kprintln!` enqueues and returns in
 microseconds; BCM2835 DMA paced by PL011 TX DREQ drains the wire at
 its baud-rate ceiling.
 
-1. **`src/peripherals/host_dma.rs`** — BCM2835 DMA driver (register
+1. **`src/host_dma.rs`** — BCM2835 DMA driver (register
    map, CB layout, TI/CS bit fields, DREQ table, IRQ-controller
    offsets cited against BCM2835 ARM Peripherals (2012-02-06)
    §1.2.3–4, §4.2.1, §7.5; the DMA rows Broadcom's IRQ table leaves

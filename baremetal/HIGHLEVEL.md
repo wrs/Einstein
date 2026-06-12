@@ -1,13 +1,12 @@
 # Newton 2.x on Bare-Metal Pi Zero 2 W — High-Level Design
 
-**Status:** draft
 **Target host:** Raspberry Pi Zero 2 W (BCM2710A1, Cortex-A53 ×4)
 **Guest:** Newton OS 2.x ROMs (unmodified)
-**Relationship to Einstein:** reuses Einstein's peripheral emulation classes; replaces Einstein's software MMU, JIT, and host-OS layer.
+**Relationship to Einstein:** ports Einstein's peripheral emulation state machines (re-implemented in Rust, register-level behaviour preserved); replaces Einstein's software MMU, JIT, and host-OS layer. The C++ link route was tried and abandoned — see IMPLEMENTATION.md §1.2.
 
 ## 1. Goal
 
-Boot an unmodified Newton 2.x ROM on a bare-metal Pi Zero 2 W such that the guest CPU instructions execute natively on the A53 under a small Type-1 hypervisor running at EL2. Reuse Einstein's peripheral emulation (`TDMAManager`, `TInterruptManager`, `TSerialChip*`, `TScreenManager`, `TSoundManager`, `TFlash`, `TPCMCIAController`) invoked from EL2 trap handlers. Replace Einstein's software MMU and JIT entirely.
+Boot an unmodified Newton 2.x ROM on a bare-metal Pi Zero 2 W such that the guest CPU instructions execute natively on the A53 under a small Type-1 hypervisor running at EL2. Port Einstein's peripheral emulation (`TDMAManager`, `TInterruptManager`, `TSerialChip*`, `TScreenManager`, `TSoundManager`, `TFlash`, `TPCMCIAController`) to Rust — register-level behaviour preserved — invoked from EL2 trap handlers. Replace Einstein's software MMU and JIT entirely.
 
 ### Non-goals (v1)
 
@@ -38,7 +37,7 @@ Boot an unmodified Newton 2.x ROM on a bare-metal Pi Zero 2 W such that the gues
   |   - world setup, stage-2 mapping                       |
   |   - trap dispatch: MMIO, CP15, SWP, undef              |
   |   - vIRQ/vFIQ injection                                |
-  |   - reused Einstein peripheral managers                |
+  |   - ported Einstein peripheral managers (Rust)         |
   |   - bare-metal Pi drivers                              |
   +--------------------------------------------------------+
 ```
@@ -52,7 +51,7 @@ Boot an unmodified Newton 2.x ROM on a bare-metal Pi Zero 2 W such that the gues
 | EL2 init, stage-2 MMU, trap vectors | new | — |
 | Page-table seeding (guest physical layout) | new | `TMemoryConsts`, `TFlash` image format as reference |
 | Trap decoder (`ESR_EL2` / `HPFAR_EL2` → handler) | new | — |
-| Peripheral emulation | reused, reglued | `TDMAManager`, `TInterruptManager`, `TSerialPortManager` + `TSerialChip*`, `TSoundManager`, `TScreenManager`, `TFlash`, `TPCMCIAController`, `TNetworkManager` |
+| Peripheral emulation | ported to Rust | `TDMAManager`, `TInterruptManager`, `TSerialPortManager` + `TSerialChip*`, `TSoundManager`, `TScreenManager`, `TFlash`, `TPCMCIAController`, `TNetworkManager` (register-level behaviour preserved; C++ link route abandoned — IMPLEMENTATION.md §1.2) |
 | CP15 shim | new | `TARMProcessor` CP15 dispatch as reference |
 | Pi bare-metal drivers (UART, mailbox/framebuffer, SD, USB HID, I2S) | new | — |
 | Boot/config loader | new | Einstein prefs format as reference |
@@ -93,9 +92,47 @@ Carve ~32 MiB from Pi DRAM for guest physical; remainder is EL2 heap, framebuffe
 
 ### 5.4 Stage-1 (guest)
 
-The Newton's own page tables. Hardware walks them. AP bits, domains, and cacheability attributes are preserved unchanged. No software shadow table, no AP flattening.
+The Newton's own page tables. Hardware walks them in place — there is no
+parallel shadow page-table tree and no per-walk rewrite. Domains and
+cacheability attributes pass through unchanged. Two narrow EL2-side
+normalisations are required because the ROM's tables use ARMv4
+short-descriptor bit assignments that ARMv7/v8 re-interpret, and a small
+per-PC stub facility is needed for instructions ARMv8 made UNDEFINED.
 
-**One fix-up pass.** 717006 installs three L1 fine-table descriptors (bits 0b11) covering VAs `0x78000000`, `0x90000000`, `0xAC000000`, for PCMCIA window placeholders — all their L2 entries are fault. AArch32 on A53 doesn't walk 0b11 L1 descriptors. On every guest `MCR p15, 0, Rn, c2, c0, 0` (TTBR install, trapped via `HCR_EL2.TVM`), scan the new L1 table and rewrite 0b11 → 0b00 in a shadow copy; point real TTBR at the shadow. Semantics-preserving because nothing is actually mapped through those descriptors.
+**Stage-1 normalisation pass** (`fix_stage1_xn_bits` in `guest_mem.rs`,
+run on every guest TTBR0 install — `MCR p15,0,Rn,c2,c0,0`, trapped via
+`HCR_EL2.TVM`). It walks the guest's live L1 table and every coarse L2
+table it reaches, editing the descriptors *in place* in the ROM/RAM
+backing the hypervisor owns:
+
+- **Subpage-AP flattening.** ARMv4 small/large-page descriptors carry
+  four 2-bit AP subfields; ARMv7 short descriptors reinterpret those bits
+  as AP[2]/TEX/S/nG/XN. Each page entry is rewritten to a single uniform
+  `AP[1:0] = 0b11` (RW from any mode), `C = B = 1`, `XN = 0`. This is the
+  AP flattening — it exists and is load-bearing. The kernel's actual
+  USR-vs-PL1 protection is still enforced, via the kernel's own DACR +
+  L1-domain assignment, not via the discarded subpage bits.
+- **XN clearing.** ARMv4 treats L2 bit 15 as SBZ; ARMv7/v8 read it as XN.
+  Many of the ROM's prebuilt L2 entries have bit 15 set, which would make
+  the corresponding code pages non-executable and abort every fetch, so
+  the pass clears XN on page entries.
+- **Fine-table rewrite.** 717006 installs three L1 fine-table descriptors
+  (type `0b11`) covering VAs `0x78000000` / `0x90000000` / `0xAC000000`
+  as PCMCIA-window placeholders; all their L2 entries are fault, and A53
+  short-descriptor doesn't walk `0b11` L1 descriptors. They are rewritten
+  to L1 fault (`0b00`), so any access raises a translation fault the abort
+  handler dispatches — semantics-preserving because nothing is mapped
+  through them.
+
+**Per-PC inline stubs** (`shadow_stub.rs`). ARMv8 made `SWP`/`SWPB` and the
+StrongARM FPA-class coprocessor ops UNDEFINED. Rather than trap-and-emulate
+every occurrence, the hypervisor installs short AArch32 stubs in a reserved
+window of the ROM aperture (`0x00E0_0000..0x00FF_FF00`) and rewrites the
+originating PC to `B stub`. The same module provides an APCS-conformant
+liveness walker (`live_regs_at`) so a stub can borrow dead caller-saved
+registers as scratch. "Real code" for this walker (and for the BE-8
+code/data discrimination, §6.2 / `guest_endian.rs`) is defined by the
+classifier reach-bitmap baked in at build time from `tools/classify-rom`.
 
 **Domains.** DACR is always `0x00055555` (domains 0–7 = client, 8–15 = no-access), written 38 953 times with the same value — the kernel reinstalls DACR at every context-switch. A53 short-descriptor DACR semantics match; just pass the writes through.
 
@@ -127,9 +164,9 @@ Newton doesn't use it. `HSCTLR.TE = 0`.
 - Peripheral managers decide when the guest should see a virtual Newton interrupt. EL2 updates the Newton VIC shadow state (`TInterruptManager`) and raises `VI` / `VF` to the guest via `HCR_EL2`. The A53 vectors to the guest's IRQ/FIQ handlers.
 - Timer: use the A53 generic timer at EL2 for host ticks; synthesize Newton's 3.6864 MHz tick and match registers (`TMemoryConsts.h:85–92`) from it.
 
-## 8. Peripherals — guest side (reused from Einstein)
+## 8. Peripherals — guest side (ported from Einstein)
 
-Reuse Einstein classes; adapt only the memory-interface boundary so the "register read/write" entry points are called from EL2 trap handlers instead of from the software MMU.
+Port Einstein's classes to Rust, preserving register-level behaviour; the "register read/write" entry points are called from EL2 trap handlers instead of from a software MMU. The MMIO-window peripherals (vic, dma, pcmcia, serial, flash, screen) share an `MmioPeripheral { owns, read, write, peek_word }` contract; the native-primitive peripherals share a `NativeDriver { DRIVER_ID, handle(ctx, subfn, pc) }` contract (`src/peripherals/`). The C++-link alternative was tried and abandoned (IMPLEMENTATION.md §1.2).
 
 - `TInterruptManager`, `TDMAManager`, `TFlash` — pure state machines, no host-OS dependencies.
 - `TScreenManager` — redirect output to the Pi framebuffer.

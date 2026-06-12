@@ -217,10 +217,10 @@ pub const DABT_TRAMP_OFFSET: usize = 0x00FF_FFA8;
 /// reserved; the trampoline body uses ~16.
 pub const DABT_FAST_TRAMP_OFFSET: usize = 0x008F_FF00;
 pub const DABT_FAST_TRAMP_DAH_TARGET: u32 = 0x0039_3114;
-/// 2026-04-28: relocated from PA=0x04005FA0 to IPA=0x0600_F0A0
-/// (last 4 KiB of the SCRATCH_POOL). See `trap::HYP_TRAMP_SCRATCH_BASE`
-/// for the rationale. The same value works pre-MMU and post-MMU,
-/// so no swap is required.
+/// Save area for the DABT trampoline, at `HYP_TRAMP_SCRATCH_BASE + 0xA0`
+/// = IPA 0x0600_00A0 (the first page of the SCRATCH_POOL). Identity-
+/// mapped, so the same address works pre-MMU and post-MMU and no
+/// literal swap is required. See `trap::HYP_TRAMP_SCRATCH_BASE`.
 pub const DABT_SAVE_PA: u32 = crate::trap::HYP_TRAMP_SCRATCH_BASE + 0xA0;
 
 /// Upper bound of the contiguous patch-stub / FPA-bypass / UND-return /

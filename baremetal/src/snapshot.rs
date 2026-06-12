@@ -39,7 +39,8 @@
 //! AArch64 HLT `#0xF000` with SYS_OPEN / SYS_WRITE / SYS_READ /
 //! SYS_CLOSE (Arm Semihosting for AArch32/64, section 5.3). Paths
 //! are resolved against the host process's cwd when QEMU is started
-//! with `-semihosting-config enable=on,target=native`.
+//! with `-semihosting-config enable=on,target=native`. Each slot is
+//! ~6 MiB (RAM + FB + SCRATCH_POOL + header).
 //!
 //! ## Format
 //!
@@ -172,8 +173,9 @@ const MAGIC: u64 = 0x0150_414E_5348_4E00;
 // load time, before any field is parsed — see `peek_seq` / `load`.
 const VERSION: u32 = 7;
 
-/// Number of rolling slots. Each slot is ~14 MiB, so four slots cost
-/// ~56 MiB of host disk and give the user three save windows of
+/// Number of rolling slots. Each slot is ~6 MiB (RAM + FB +
+/// SCRATCH_POOL + header; flash lives outside the file), so four slots
+/// cost ~24 MiB of host disk and give the user three save windows of
 /// rewind space before the oldest gets overwritten.
 const NUM_SLOTS: usize = 4;
 
@@ -190,7 +192,7 @@ const SLOT_PATHS: [&[u8]; NUM_SLOTS] = [
 /// against CNTPCT_EL0 in `maybe_autosave`. Chosen to save ~once
 /// every couple of seconds during a ROM boot — fast enough to
 /// capture progress before an oncoming failure, slow enough to
-/// not dominate wall time with 14 MiB semihosting writes.
+/// not dominate wall time with ~6 MiB semihosting writes.
 pub const AUTOSAVE_INTERVAL_MS: u64 = 2_000;
 
 #[repr(C)]

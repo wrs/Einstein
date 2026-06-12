@@ -502,7 +502,7 @@ pub(crate) fn handle_und(ctx: &mut TrapContext) {
         // FPE_Install's helper at 0x392704 uses `rfceq`/`wfceq` to init
         // the emulator state, and the context-word semantic (rounding
         // mode, trap enables) is never consulted by integer-math boot
-        // code. See INVESTIGATION.md for the full FPE_Install analysis.
+        // code.
         _ if is_fpa_ctrl_reg_insn(insn) => {
             emulate_fpa_ctrl_reg(ctx, insn, faulting_pc, spsr_und);
         }

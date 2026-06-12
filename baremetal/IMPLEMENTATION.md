@@ -72,7 +72,7 @@ These findings mean several items that `HIGHLEVEL.md` §6 flagged as "enumerate 
 - Build: `cargo build --release`, emit a flat binary with `rust-objcopy -O binary target/aarch64-unknown-none-softfloat/release/newton-hypervisor kernel8.img`.
 - Lints: `#![deny(unsafe_op_in_unsafe_fn)]`, `#![warn(clippy::pedantic)]` at crate level; per-module relaxations as needed. `rustfmt` on commit.
 
-### 2.2 Crates (candidate set, to be validated)
+### 2.2 Crates (candidate set, as evaluated)
 
 | Purpose | Crate | Notes |
 |---|---|---|
@@ -81,6 +81,13 @@ These findings mean several items that `HIGHLEVEL.md` §6 flagged as "enumerate 
 | Bit flags | `bitflags` | stage-2 descriptors, HCR_EL2 bits |
 | Compile-time register layout | `register` or hand-rolled | choose one, avoid both |
 | Panic handling | hand-rolled | prints to mini-UART, halts |
+
+**None of these helper crates were adopted.** System-register access,
+MMIO, bit-flag encoding, and panic handling are all hand-rolled with
+inline `asm!` and plain constants; the only path dependencies are
+`newton-objects` (in-tree) and the vendored `embedded-sdmmc` (see
+`Cargo.toml`). The hand-rolled forms kept the unsafe surface visible at
+each use site and avoided an external API to track.
 
 Avoid: anything that pulls in `alloc` or `std` transitively. No global allocator in v1. Use static arenas and fixed-size buffers.
 

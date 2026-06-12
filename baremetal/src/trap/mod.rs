@@ -109,7 +109,7 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
     // tracer overhead amplifying per-trap wall) makes us run ~4x more
     // delay-loop iterations than Einstein for the same kernel logic — and
     // the resulting trace-count drift is what causes the heap-allocator
-    // divergence at TStackInfo::Init #12 (see INVESTIGATION.md).
+    // divergence at TStackInfo::Init #12.
     crate::stage2::tick_page::update_from_sync_trap();
 
     // Budget-limited "progress beacon": print PC every 10k traps so we

@@ -3,11 +3,12 @@
 // - Selects between booting the real Newton ROM (default) and a small ARM
 //   guest test image (if $NH_GUEST_TEST is set to a .bin file). Sets the
 //   `nh_guest_test` cfg so `guest_mem.rs` takes the test-mode branch.
-// - When the `trace` cargo feature is on, parses
-//   scripts/classify-out/code-symbols.txt for the vetted code-only address
-//   list and ../_Data_/symbols.txt for the matching mangled names, then
-//   emits three compact binary blobs into OUT_DIR for src/tracer.rs and
-//   src/task_dump.rs to `include_bytes!`:
+// - Always parses scripts/classify-out/code-symbols.txt for the vetted
+//   code-only address list and ../_Data_/symbols.txt for the matching
+//   mangled names, then emits three compact binary blobs into OUT_DIR.
+//   `src/task_dump.rs` includes them unconditionally (PC→name lookup in
+//   halt-path stack traces); `src/tracer.rs` additionally consults them
+//   for its trampoline pool when the `trace` feature is on. The blobs are:
 //     fn_addrs.bin       — packed u32 LE, sorted ROM-range function entry PAs
 //     fn_name_offs.bin   — parallel u32 LE offsets into fn_names.bin
 //     fn_names.bin       — NUL-separated mangled names (name pool). Mangled

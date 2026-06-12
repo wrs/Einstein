@@ -292,6 +292,16 @@ pub fn on_tx_done() {
     tx_dma::on_done();
 }
 
+/// Drain the DMA TX ring to the wire by polling, for halt/panic paths
+/// where the completion IRQ will never fire again (IRQs masked, CPU
+/// about to park). Without this, a "loud halt" leaves its entire
+/// context dump undelivered in the ring and presents as a silent
+/// freeze. Always defined; no-op on non-DMA console builds.
+pub fn flush_tx_dma_polled() {
+    #[cfg(nh_real_hw)]
+    tx_dma::flush_polled();
+}
+
 /// Writer implementing [`core::fmt::Write`] so callers can `write!` formatted
 /// output. Routes through semihosting (`SYS_WRITE` to `:tt`).
 pub struct Writer;
@@ -652,6 +662,69 @@ mod tx_dma {
         let new_tail = (tail + len) % (RING_LEN as u32);
         TAIL.store(new_tail, Ordering::Release);
         maybe_kick();
+    }
+
+    /// Polled drain for halt/panic paths — see `uart::flush_tx_dma_polled`.
+    ///
+    /// Pumps the completion status register and re-kicks segments until
+    /// the ring is empty, all without needing the completion IRQ. If the
+    /// channel stops making progress (wedged DMA — the very failure some
+    /// halts are reporting), falls back after a wall-clock budget: takes
+    /// PL011 out of DMA mode and pushes the remaining bytes through the
+    /// polled FIFO so the dump reaches the wire regardless.
+    pub fn flush_polled() {
+        if !READY.load(Ordering::Acquire) {
+            return;
+        }
+        let daif = mask_irqs();
+        let (mut now, freq): (u64, u64);
+        // SAFETY: counter reads, side-effect free.
+        unsafe {
+            core::arch::asm!("mrs {}, cntpct_el0", out(reg) now,
+                options(nomem, nostack, preserves_flags));
+            core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq,
+                options(nomem, nostack, preserves_flags));
+        }
+        // 64 KiB of ring at 115200 baud ≈ 6 s; give it 8 s.
+        let deadline = now + freq.saturating_mul(8);
+        loop {
+            let in_flight = IN_FLIGHT_LEN.load(Ordering::Acquire);
+            let head = HEAD.load(Ordering::Acquire);
+            let tail = TAIL.load(Ordering::Acquire);
+            if in_flight == 0 && head == tail {
+                unmask_irqs(daif);
+                return;
+            }
+            if in_flight != 0 && host_dma::uart_tx_pending() {
+                host_dma::on_completion(host_dma::UART_TX_CHANNEL);
+            } else if in_flight == 0 {
+                maybe_kick();
+            }
+            // SAFETY: counter read, side-effect free.
+            unsafe {
+                core::arch::asm!("mrs {}, cntpct_el0", out(reg) now,
+                    options(nomem, nostack, preserves_flags));
+            }
+            if now >= deadline {
+                break;
+            }
+        }
+        // DMA stopped making progress. Disable PL011's DMA handshake and
+        // hand-feed the remaining slots through the polled FIFO.
+        // SAFETY: MMIO write; channel is being abandoned on a halt path.
+        unsafe { core::ptr::write_volatile(super::UART_DMACR, 0) };
+        let head = HEAD.load(Ordering::Acquire);
+        let mut tail = TAIL.load(Ordering::Acquire) as usize;
+        // SAFETY: halt path, single core, IRQs masked — exclusive ring
+        // access; the DMA consumer is disabled above.
+        let buf = unsafe { &*RING.0.get() };
+        while tail != head as usize {
+            super::write_byte(buf[tail] as u8);
+            tail = (tail + 1) % RING_LEN;
+        }
+        TAIL.store(head, Ordering::Release);
+        IN_FLIGHT_LEN.store(0, Ordering::Release);
+        unmask_irqs(daif);
     }
 
     // ---- internals -------------------------------------------------

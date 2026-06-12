@@ -261,7 +261,7 @@ one platform, at most one backend per axis) and falls back to the
 | `trace`                | no      | Function-level execution trace via per-entry HVC trampolines.                        |
 | `trace_once`           | no      | First-touch variant of `trace`. Trampolines still fire; only the SEQ line is gated.  |
 | `quiet`                | no      | Silence recurring diag log lines (`fix_stage1_xn_bits:` summaries, etc.).            |
-| `log_*`                | yes     | Per-subsystem diagnostic logging (`log_mmu`, `log_traps`, `log_tasks`, …).           |
+| `log_*`                | partial | Per-subsystem diagnostic logging. Default carries the low-volume tier (`log_traps`, `log_irqs`, `log_host_io`); the investigation tiers (`log_mmu`, `log_unaligned`, `log_tasks`, `log_store`) are opt-in. |
 | `sd-probe`, `fb-probe`, `usb-probe` | no | Standalone real-hw bring-up probes (boot, test one peripheral, exit).      |
 
 Aggregates for real hardware (`pi-bare-metal`, `pi-bare-metal-sd`,

@@ -427,30 +427,19 @@ macro_rules! dprintln {
 
 // ---- Per-category log macros ----------------------------------------
 //
-// Opt-in via the `log_mmu`, `log_traps`, `log_tasks`, `log_irqs`
-// Cargo features. All four are pulled in by the `default` feature
-// set so a bare `cargo run` against QEMU keeps the existing
-// trace-debug behaviour. The `pi-bare-metal*` aggregates omit them,
-// so real-hardware builds boot quietly.
+// Opt-in via the `log_traps`, `log_irqs`, `log_unaligned`,
+// `log_host_io` Cargo features (see Cargo.toml for the category
+// inventory and which of them the `default` set carries). The
+// `pi-bare-metal*` aggregates omit them all, so real-hardware builds
+// boot quietly. The `log_mmu` / `log_tasks` / `log_store` categories
+// gate whole diagnostic bodies with `#[cfg]` directly and have no
+// macro here.
 //
 // Each macro expands to `kprintln!` when its feature is enabled and
 // to a no-op (formatting argument expression discarded) when it
 // isn't. Sites should use these instead of `kprintln!` whenever the
 // log line fires periodically — every timer IRQ, every N traps,
 // every NativeGetSample, etc.
-
-#[cfg(feature = "log_mmu")]
-#[macro_export]
-macro_rules! log_mmu {
-    () => { $crate::kprintln!() };
-    ($($arg:tt)*) => { $crate::kprintln!($($arg)*) };
-}
-#[cfg(not(feature = "log_mmu"))]
-#[macro_export]
-macro_rules! log_mmu {
-    () => {};
-    ($($arg:tt)*) => {{ let _ = format_args!($($arg)*); }};
-}
 
 #[cfg(feature = "log_traps")]
 #[macro_export]
@@ -461,19 +450,6 @@ macro_rules! log_traps {
 #[cfg(not(feature = "log_traps"))]
 #[macro_export]
 macro_rules! log_traps {
-    () => {};
-    ($($arg:tt)*) => {{ let _ = format_args!($($arg)*); }};
-}
-
-#[cfg(feature = "log_tasks")]
-#[macro_export]
-macro_rules! log_tasks {
-    () => { $crate::kprintln!() };
-    ($($arg:tt)*) => { $crate::kprintln!($($arg)*) };
-}
-#[cfg(not(feature = "log_tasks"))]
-#[macro_export]
-macro_rules! log_tasks {
     () => {};
     ($($arg:tt)*) => {{ let _ = format_args!($($arg)*); }};
 }

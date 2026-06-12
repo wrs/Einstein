@@ -21,27 +21,30 @@ path = "src/pi_probe.rs"
 required-features = ["platform-raspi3b"]
 
 [features]
-default = ["platform-raspi3b", "log_mmu", "log_traps", "log_tasks", "log_irqs", "log_unaligned", "log_store", "log_host_io"]
+default = ["platform-raspi3b", "log_traps", "log_irqs", "log_host_io"]
 
-# Per-category log feature gates. ON by default (via the QEMU
-# `default` set) to preserve Phase-B trace-debug behaviour; OFF for
-# `pi-bare-metal-*` aggregates so real-hardware boots stay quiet.
-# See `src/uart.rs` for the macros: `log_mmu!`, `log_traps!`,
-# `log_tasks!`, `log_irqs!`, `log_unaligned!`. Add/remove a feature
-# with `--features log_traps` or, alongside an aggregate,
-# `--no-default-features --features "pi-bare-metal-input log_traps"`.
+# Per-category log feature gates. The `default` set carries only the
+# low-volume "is it making progress / are IRQs flowing / is host I/O
+# alive" tier (log_traps, log_irqs, log_host_io); the high-volume
+# investigation tiers (log_mmu, log_unaligned, log_tasks, log_store)
+# are opt-in when chasing a specific class of stall. All are OFF for
+# the `pi-bare-metal-*` aggregates so real-hardware boots stay quiet.
+# Add a feature with `--features log_unaligned` or, alongside an
+# aggregate, `--no-default-features --features "pi-bare-metal-input
+# log_traps"`. log_traps/log_irqs/log_unaligned/log_host_io wrap
+# kprintln via the `log_*!` macros in `src/uart.rs`; log_mmu /
+# log_tasks / log_store gate whole diagnostic bodies via `#[cfg]`.
 #
-# Category coverage (each macro wraps the equivalent kprintln):
-#   log_mmu       — stage-1 / stage-2 MMU diagnostics: verify-mmu
-#                   alias decode, guest-L1 dump, kernel-L1 dump,
-#                   g1-capture rearm, alrt-capture rearm + diffs.
+# Category coverage:
+#   log_mmu       — stage-1 diagnostic dumps: `dump_guest_l1_table` /
+#                   `dump_l1_neighbourhood` (used by the DABT section-
+#                   fault path to eyeball lazy L1 descriptor shapes).
 #   log_traps     — bulk trap-handler diagnostics: progress beacon
 #                   every 10k traps, trap-frequency histogram every
-#                   2s, the FME-entry / DAH-OR Phase-B probes
-#                   patched into specific kernel exception sites.
-#   log_tasks     — TScheduler / object-table walk: the periodic
-#                   run-queue + current-task chain dump (every
-#                   ~4s of wall time).
+#                   2s, the FME-entry / DAH-OR probes patched into
+#                   specific kernel exception sites.
+#   log_tasks     — `task_dump::periodic`: the ~4 s run-queue +
+#                   current-task chain dump (30+ lines per fire).
 #   log_irqs      — timer-IRQ heartbeat (ELR/SPSR/SP_svc/LR_svc
 #                   sampling) plus post-budget tablet NativeGetSample
 #                   entry/return logs.
@@ -50,9 +53,14 @@ default = ["platform-raspi3b", "log_mmu", "log_traps", "log_tasks", "log_irqs", 
 #                   patched ldrh/strh and ldrd targets.
 #   log_store     — StorePermObject entry + LoadPermObject return
 #                   probes: pretty-printed Ref at each flash-store
-#                   round-trip. Also gates installation of the
-#                   underlying ROM patches, so when off the guest
-#                   takes no traps at those sites.
+#                   round-trip. Instrumentation only — the gated ROM
+#                   patches replace one instruction per site with an
+#                   HVC whose handler emulates that instruction
+#                   exactly, so guest semantics are identical either
+#                   way. The patched ROM bytes do change the snapshot
+#                   ROM fingerprint: snapshots saved with log_store on
+#                   cold-boot with it off, and vice versa (same rule
+#                   as `trace`).
 #   log_host_io   — host_io backend diagnostics: SYS_OPEN status at
 #                   init, every pump_input drain summary, pen-down/up
 #                   edges, power-switch presses, pi_fb adoption of the

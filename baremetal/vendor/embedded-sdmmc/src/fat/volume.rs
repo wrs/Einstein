@@ -1180,6 +1180,192 @@ impl FatVolume {
         Ok(new_cluster)
     }
 
+    /// LOCAL ADDITION (vendored — see VENDOR.md). Allocate a whole
+    /// cluster chain in one pass over the FAT, instead of one
+    /// `alloc_cluster` call (with its per-cluster rescans and
+    /// per-entry FAT writes) per cluster.
+    ///
+    /// `head` is an optional existing single-cluster, EOF-terminated
+    /// chain to extend (the cluster `Mode::ReadWriteTruncate`
+    /// retains); `None` allocates a fresh chain. `total_clusters` is
+    /// the length the whole chain must have, *including* `head`.
+    /// Returns the chain's head cluster.
+    ///
+    /// Each touched FAT sector is read and written once (duplicated to
+    /// the second FAT like `update_fat`), plus one re-patch per sector
+    /// transition for the link that crosses it. Claimed entries are
+    /// written END_OF_FILE before anything links to them, so the
+    /// on-disk chain reachable from `head` is EOF-terminated at every
+    /// intermediate state — a power cut mid-call can orphan a few
+    /// claimed clusters but never leaves the file's chain pointing at
+    /// a free entry.
+    ///
+    /// On exhaustion (a full scan plus one wrap finds too few free
+    /// entries) the newly claimed clusters are freed again and `head`
+    /// re-terminated before returning `Err(NotEnoughSpace)`.
+    pub(crate) fn alloc_cluster_chain<D>(
+        &mut self,
+        block_cache: &mut BlockCache<D>,
+        head: Option<ClusterId>,
+        total_clusters: u32,
+    ) -> Result<ClusterId, Error<D::Error>>
+    where
+        D: BlockDevice,
+    {
+        let needed = total_clusters - u32::from(head.is_some());
+        if needed == 0 {
+            // Nothing to allocate: only valid when extending a head to
+            // a 1-cluster chain (total_clusters == 0 is a caller bug).
+            return head.ok_or(Error::NotEnoughSpace);
+        }
+        // Early-out on the FSInfo free count. It's a hint, so this can
+        // refuse where a scan would succeed (stale undercount) — the
+        // caller's fallback path still works in that case.
+        if let Some(free) = self.free_clusters_count {
+            if free < needed {
+                return Err(Error::NotEnoughSpace);
+            }
+        }
+        let fat32 = matches!(self.fat_specific_info, FatSpecificInfo::Fat32(_));
+        let es: u32 = if fat32 { 4 } else { 2 };
+        let end = self.cluster_count + RESERVED_ENTRIES;
+        let mut cur = match self.next_free_cluster {
+            Some(c) if c.0 < end => c,
+            _ => ClusterId(RESERVED_ENTRIES),
+        };
+        let mut wrapped = false;
+        let mut prev = head;
+        let mut first_new: Option<ClusterId> = None;
+        let mut last = ClusterId(RESERVED_ENTRIES);
+        let mut allocated = 0u32;
+
+        while allocated < needed {
+            if cur.0 >= end {
+                if wrapped {
+                    // Exhausted after a full wrap: free what we
+                    // claimed and re-terminate the head.
+                    if let Some(mut c) = first_new {
+                        loop {
+                            let nxt = match self.next_cluster(block_cache, c) {
+                                Ok(n) => Some(n),
+                                Err(Error::EndOfFile) => None,
+                                Err(e) => return Err(e),
+                            };
+                            self.update_fat(block_cache, c, ClusterId::EMPTY)?;
+                            match nxt {
+                                Some(n) => c = n,
+                                None => break,
+                            }
+                        }
+                    }
+                    if let Some(h) = head {
+                        self.update_fat(block_cache, h, ClusterId::END_OF_FILE)?;
+                    }
+                    warn!("Out of space...");
+                    return Err(Error::NotEnoughSpace);
+                }
+                wrapped = true;
+                cur = ClusterId(RESERVED_ENTRIES);
+            }
+            // Process the FAT sector containing `cur`, claiming as
+            // many free entries as we still need.
+            let sector_fat_offset = cur.0 * es;
+            let this_fat_block_num =
+                self.lba_start + self.fat_start.offset_bytes(sector_fat_offset);
+            // The cross-sector link discovered while scanning this
+            // sector (at most one: previous sector's last claim → this
+            // sector's first claim, or the `head` link). Patched after
+            // this sector is written back, so claimed entries hit the
+            // disk as END_OF_FILE before anything points at them.
+            let mut pending_link: Option<(ClusterId, ClusterId)> = None;
+            let mut modified = false;
+            {
+                let block = block_cache
+                    .read_mut(this_fat_block_num)
+                    .map_err(Error::DeviceError)?;
+                let mut ent = (sector_fat_offset % Block::LEN_U32) as usize;
+                while ent + es as usize <= Block::LEN && cur.0 < end && allocated < needed {
+                    let free = if fat32 {
+                        LittleEndian::read_u32(&block[ent..ent + 4]) & 0x0FFF_FFFF == 0
+                    } else {
+                        LittleEndian::read_u16(&block[ent..ent + 2]) == 0
+                    };
+                    if free {
+                        // Claim as END_OF_FILE (FAT32: preserve the
+                        // reserved top nibble, as update_fat does).
+                        if fat32 {
+                            let existing = LittleEndian::read_u32(&block[ent..ent + 4]);
+                            LittleEndian::write_u32(
+                                &mut block[ent..ent + 4],
+                                (existing & 0xF000_0000) | 0x0FFF_FFFF,
+                            );
+                        } else {
+                            LittleEndian::write_u16(&mut block[ent..ent + 2], 0xFFFF);
+                        }
+                        modified = true;
+                        if first_new.is_none() {
+                            first_new = Some(cur);
+                        }
+                        if let Some(p) = prev {
+                            let p_offset = p.0 * es;
+                            let p_block_num =
+                                self.lba_start + self.fat_start.offset_bytes(p_offset);
+                            if p_block_num == this_fat_block_num {
+                                let p_ent = (p_offset % Block::LEN_U32) as usize;
+                                if fat32 {
+                                    let existing =
+                                        LittleEndian::read_u32(&block[p_ent..p_ent + 4]);
+                                    LittleEndian::write_u32(
+                                        &mut block[p_ent..p_ent + 4],
+                                        (existing & 0xF000_0000) | (cur.0 & 0x0FFF_FFFF),
+                                    );
+                                } else {
+                                    LittleEndian::write_u16(
+                                        &mut block[p_ent..p_ent + 2],
+                                        cur.0 as u16,
+                                    );
+                                }
+                            } else {
+                                pending_link = Some((p, cur));
+                            }
+                        }
+                        prev = Some(cur);
+                        last = cur;
+                        allocated += 1;
+                    }
+                    cur += 1;
+                    ent += es as usize;
+                }
+            }
+            if modified {
+                if let Some(second_fat_start) = self.second_fat_start {
+                    let duplicate =
+                        self.lba_start + second_fat_start.offset_bytes(sector_fat_offset);
+                    block_cache.write_back_with_duplicate(duplicate)?;
+                } else {
+                    block_cache.write_back()?;
+                }
+            }
+            if let Some((p, c)) = pending_link {
+                self.update_fat(block_cache, p, c)?;
+            }
+        }
+
+        if let Some(ref mut free) = self.free_clusters_count {
+            *free -= needed;
+        }
+        // Search hint only; alloc_cluster / the next call here clamp
+        // out-of-range values back to RESERVED_ENTRIES.
+        self.next_free_cluster = Some(ClusterId(last.0 + 1));
+        debug!(
+            "Allocated {} cluster(s), head {:?}, last {:?}",
+            allocated,
+            head.or(first_new),
+            last
+        );
+        head.or(first_new).ok_or(Error::NotEnoughSpace)
+    }
+
     /// Marks the input cluster as an EOF and all the subsequent clusters in the chain as free
     pub(crate) fn truncate_cluster_chain<D>(
         &mut self,
@@ -1437,6 +1623,248 @@ mod tests {
             contents: *b"Hello \xA399  ",
         };
         assert_eq!(sfn, VolumeName::create_from_str("Hello £99").unwrap())
+    }
+}
+
+// ****************************************************************************
+//
+// Unit Tests
+//
+// ****************************************************************************
+
+/// LOCAL ADDITION (vendored — see VENDOR.md): host-side tests for
+/// `alloc_cluster_chain`. Run from the crate directory with an explicit
+/// host target (the repo-level `.cargo/config.toml` pins a bare-metal
+/// target), e.g. `cargo test --target aarch64-apple-darwin`.
+#[cfg(test)]
+mod alloc_chain_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::vec::Vec;
+
+    /// In-memory block device, enough to host a hand-built FAT.
+    struct MemDevice(RefCell<Vec<Block>>);
+
+    impl MemDevice {
+        fn new(num_blocks: usize) -> Self {
+            MemDevice(RefCell::new(vec![Block::new(); num_blocks]))
+        }
+    }
+
+    #[derive(Debug)]
+    struct MemError;
+
+    impl BlockDevice for MemDevice {
+        type Error = MemError;
+        fn read(&self, blocks: &mut [Block], start: BlockIdx) -> Result<(), MemError> {
+            let store = self.0.borrow();
+            for (i, b) in blocks.iter_mut().enumerate() {
+                *b = store[start.0 as usize + i].clone();
+            }
+            Ok(())
+        }
+        fn write(&self, blocks: &[Block], start: BlockIdx) -> Result<(), MemError> {
+            let mut store = self.0.borrow_mut();
+            for (i, b) in blocks.iter().enumerate() {
+                store[start.0 as usize + i] = b.clone();
+            }
+            Ok(())
+        }
+        fn num_blocks(&self) -> Result<BlockCount, MemError> {
+            Ok(BlockCount(self.0.borrow().len() as u32))
+        }
+    }
+
+    /// Test layout: FAT 1 at blocks 1..=2, FAT 2 at blocks 3..=4,
+    /// data area from block 5. One block per cluster.
+    const FAT_BLOCKS: u32 = 2;
+
+    fn test_volume(fat32: bool, cluster_count: u32, free: Option<u32>) -> FatVolume {
+        FatVolume {
+            lba_start: BlockIdx(0),
+            num_blocks: BlockCount(64),
+            name: VolumeName {
+                contents: *b"UNITTEST   ",
+            },
+            blocks_per_cluster: 1,
+            first_data_block: BlockCount(1 + 2 * FAT_BLOCKS),
+            fat_start: BlockCount(1),
+            second_fat_start: Some(BlockCount(1 + FAT_BLOCKS)),
+            free_clusters_count: free,
+            next_free_cluster: None,
+            cluster_count,
+            fat_specific_info: if fat32 {
+                FatSpecificInfo::Fat32(Fat32Info {
+                    first_root_dir_cluster: ClusterId(2),
+                    info_location: BlockIdx(0),
+                })
+            } else {
+                FatSpecificInfo::Fat16(Fat16Info {
+                    first_root_dir_block: BlockCount(0),
+                    root_entries_count: 0,
+                })
+            },
+        }
+    }
+
+    const F32_EOF: u32 = 0x0FFF_FFFF;
+    const F16_EOF: u32 = 0xFFFF;
+
+    /// Read a raw FAT entry from the first FAT copy.
+    fn fat_entry(dev: &MemDevice, cluster: u32, fat32: bool) -> u32 {
+        let es = if fat32 { 4 } else { 2 };
+        let off = cluster as usize * es;
+        let store = dev.0.borrow();
+        let block = &store[1 + off / Block::LEN];
+        let ent = off % Block::LEN;
+        if fat32 {
+            LittleEndian::read_u32(&block[ent..ent + 4]) & 0x0FFF_FFFF
+        } else {
+            u32::from(LittleEndian::read_u16(&block[ent..ent + 2]))
+        }
+    }
+
+    /// Write a raw FAT entry to both FAT copies (pre-seeding helper).
+    fn set_fat_entry(dev: &MemDevice, cluster: u32, value: u32, fat32: bool) {
+        let es = if fat32 { 4 } else { 2 };
+        let off = cluster as usize * es;
+        let ent = off % Block::LEN;
+        let mut store = dev.0.borrow_mut();
+        for base in [1usize, 1 + FAT_BLOCKS as usize] {
+            let block = &mut store[base + off / Block::LEN];
+            if fat32 {
+                LittleEndian::write_u32(&mut block[ent..ent + 4], value);
+            } else {
+                LittleEndian::write_u16(&mut block[ent..ent + 2], value as u16);
+            }
+        }
+    }
+
+    fn assert_fats_match(dev: &MemDevice) {
+        let store = dev.0.borrow();
+        for i in 0..FAT_BLOCKS as usize {
+            assert_eq!(
+                store[1 + i].contents,
+                store[1 + FAT_BLOCKS as usize + i].contents,
+                "FAT copies differ at sector {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn fat32_fresh_chain() {
+        let dev = MemDevice::new(16);
+        let mut cache = BlockCache::new(dev);
+        let mut vol = test_volume(true, 200, Some(200));
+        let head = vol
+            .alloc_cluster_chain(&mut cache, None, 10)
+            .expect("alloc");
+        assert_eq!(head, ClusterId(2));
+        let dev = cache.free();
+        for c in 2..11u32 {
+            assert_eq!(fat_entry(&dev, c, true), c + 1, "link {} broken", c);
+        }
+        assert_eq!(fat_entry(&dev, 11, true), F32_EOF);
+        assert_eq!(fat_entry(&dev, 12, true), 0);
+        assert_fats_match(&dev);
+        assert_eq!(vol.free_clusters_count, Some(190));
+        assert_eq!(vol.next_free_cluster, Some(ClusterId(12)));
+    }
+
+    #[test]
+    fn fat32_fragmented_cross_sector() {
+        let dev = MemDevice::new(16);
+        // Use up clusters 2..=125 and 130. A FAT32 sector holds 128
+        // entries, so the chain must cross the sector-0/1 boundary
+        // (exercising the deferred cross-sector link) and skip 130.
+        for c in 2..=125u32 {
+            set_fat_entry(&dev, c, F32_EOF, true);
+        }
+        set_fat_entry(&dev, 130, F32_EOF, true);
+        let mut cache = BlockCache::new(dev);
+        let mut vol = test_volume(true, 200, None);
+        let head = vol
+            .alloc_cluster_chain(&mut cache, None, 6)
+            .expect("alloc");
+        assert_eq!(head, ClusterId(126));
+        let dev = cache.free();
+        assert_eq!(fat_entry(&dev, 126, true), 127);
+        assert_eq!(fat_entry(&dev, 127, true), 128); // cross-sector link
+        assert_eq!(fat_entry(&dev, 128, true), 129);
+        assert_eq!(fat_entry(&dev, 129, true), 131); // skips used 130
+        assert_eq!(fat_entry(&dev, 131, true), 132);
+        assert_eq!(fat_entry(&dev, 132, true), F32_EOF);
+        assert_eq!(fat_entry(&dev, 130, true), F32_EOF); // pre-used, untouched
+        assert_fats_match(&dev);
+    }
+
+    #[test]
+    fn fat32_extend_from_truncated_head() {
+        let dev = MemDevice::new(16);
+        // The head cluster a ReadWriteTruncate retains: EOF-terminated.
+        set_fat_entry(&dev, 5, F32_EOF, true);
+        let mut cache = BlockCache::new(dev);
+        let mut vol = test_volume(true, 200, Some(199));
+        let head = vol
+            .alloc_cluster_chain(&mut cache, Some(ClusterId(5)), 4)
+            .expect("alloc");
+        assert_eq!(head, ClusterId(5));
+        let dev = cache.free();
+        assert_eq!(fat_entry(&dev, 5, true), 2); // head → first new
+        assert_eq!(fat_entry(&dev, 2, true), 3);
+        assert_eq!(fat_entry(&dev, 3, true), 4);
+        assert_eq!(fat_entry(&dev, 4, true), F32_EOF);
+        assert_fats_match(&dev);
+        assert_eq!(vol.free_clusters_count, Some(196));
+    }
+
+    #[test]
+    fn fat32_not_enough_space_rolls_back() {
+        let dev = MemDevice::new(16);
+        // 10 clusters (ids 2..=11); 3,5,7,9 pre-used; 11 is the head.
+        // Only 2,4,6,8,10 are free but 7 are needed → exhaustion after
+        // the wrap, and everything claimed must be released again.
+        for c in [3u32, 5, 7, 9] {
+            set_fat_entry(&dev, c, F32_EOF, true);
+        }
+        set_fat_entry(&dev, 11, F32_EOF, true);
+        let mut cache = BlockCache::new(dev);
+        let mut vol = test_volume(true, 10, None);
+        let err = vol
+            .alloc_cluster_chain(&mut cache, Some(ClusterId(11)), 8)
+            .expect_err("must run out of space");
+        assert!(matches!(err, Error::NotEnoughSpace));
+        let dev = cache.free();
+        for c in [2u32, 4, 6, 8, 10] {
+            assert_eq!(fat_entry(&dev, c, true), 0, "cluster {} not freed", c);
+        }
+        for c in [3u32, 5, 7, 9] {
+            assert_eq!(fat_entry(&dev, c, true), F32_EOF);
+        }
+        assert_eq!(fat_entry(&dev, 11, true), F32_EOF); // head re-terminated
+        assert_fats_match(&dev);
+    }
+
+    #[test]
+    fn fat16_fresh_chain_cross_sector() {
+        let dev = MemDevice::new(16);
+        let mut cache = BlockCache::new(dev);
+        let mut vol = test_volume(false, 300, Some(300));
+        // 260 clusters crosses the 256-entries-per-sector boundary.
+        let head = vol
+            .alloc_cluster_chain(&mut cache, None, 260)
+            .expect("alloc");
+        assert_eq!(head, ClusterId(2));
+        let dev = cache.free();
+        for c in 2..261u32 {
+            assert_eq!(fat_entry(&dev, c, false), c + 1, "link {} broken", c);
+        }
+        assert_eq!(fat_entry(&dev, 261, false), F16_EOF);
+        assert_eq!(fat_entry(&dev, 262, false), 0);
+        assert_fats_match(&dev);
+        assert_eq!(vol.free_clusters_count, Some(40));
+        assert_eq!(vol.next_free_cluster, Some(ClusterId(262)));
     }
 }
 

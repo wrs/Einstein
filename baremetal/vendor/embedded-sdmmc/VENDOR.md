@@ -29,6 +29,25 @@ parallel FAT32 implementation in the hypervisor.
 - `src/volume_mgr.rs`: `device()` made generic over the closure return
   type `R` (was hardcoded `-> T`, the TimeSource type — an upstream
   wart that made the accessor unusable for returning a read result).
+- `src/fat/volume.rs`: added `FatVolume::alloc_cluster_chain` —
+  allocates a file's whole cluster chain for a known final size in one
+  pass over the FAT (each touched FAT sector read + written once,
+  duplicated to the second FAT), instead of one `alloc_cluster` call
+  (with its rescans and per-entry writes) per cluster. Claimed entries
+  hit the disk EOF-terminated before anything links to them, and
+  exhaustion rolls the new chain back before `NotEnoughSpace`.
+- `src/volume_mgr.rs`: added `VolumeManager::file_preallocate` — bulk-
+  allocates an open zero-length file's chain via `alloc_cluster_chain`,
+  persists the dir entry's cluster (on-disk size stays 0 until the next
+  `flush_file`, so an interrupted data transfer is never presented as a
+  valid file) and sets the in-memory size for `file_cluster_lbas`.
+- `src/fat/volume.rs`: added `alloc_chain_tests`, host-side unit tests
+  for `alloc_cluster_chain` (fresh/fragmented/extend/rollback, FAT16 +
+  FAT32). Run from this directory with an explicit host target, because
+  the repo-level `.cargo/config.toml` pins the bare-metal target:
+  `cargo test --target aarch64-apple-darwin`.
+- `Cargo.toml`: re-added the `hex-literal` dev-dependency — upstream's
+  in-library `#[cfg(test)]` fixtures need it under `cargo test`.
 
-To re-vendor a newer upstream: re-copy `src/`, reapply the
-`file_contiguous_extent` addition, and diff this file's change list.
+To re-vendor a newer upstream: re-copy `src/`, reapply the additions
+above, and diff this file's change list.

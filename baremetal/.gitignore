@@ -1,6 +1,9 @@
 /target
 tools/*/target
+# Standalone `cargo test` runs inside the vendored crate (see
+# vendor/embedded-sdmmc/VENDOR.md) produce their own target/ + lockfile.
 vendor/*/target
+vendor/*/Cargo.lock
 Cargo.lock.bak
 *.img
 scripts/classify-out/*

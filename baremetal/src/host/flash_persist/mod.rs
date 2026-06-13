@@ -40,7 +40,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub const FLASH_SIZE: usize = 8 * 1024 * 1024;
 
 /// Host physical base of the guest-flash backing store, registered by
-/// `main.rs` boot wiring (`peripherals::flash::host_pa()`). 0 =
+/// `main.rs` boot wiring (`set_backing`). 0 =
 /// unregistered; [`backing_base`] halts loudly on use before wiring.
 static BACKING_BASE: AtomicU64 = AtomicU64::new(0);
 

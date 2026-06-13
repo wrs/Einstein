@@ -103,6 +103,46 @@ busy-completion semantics cross-checked against the datasheet / Linux
 `bcm2835-sdhost` and a measured per-cluster busy time to justify the
 added hot-path complexity.
 
+## Initial full save (fresh card / wrong-size NEWTON.BIN)
+
+The first save has no file to write into, so the background machine
+above can't run. Historically it grew `NEWTON.BIN` through the FAT
+layer's generic write path — one single-block CMD24 (each with card
+program/busy time) per 512 bytes, ~16 k commands for 8 MiB, plus one
+`alloc_cluster` FAT scan-and-update round trip per cluster: minutes of
+frozen guest on a fresh card.
+
+`fast_full_save` (`src/host/flash_persist/sd.rs`) replaces that:
+
+1. `VolumeManager::file_preallocate` (vendored LOCAL ADDITION) bulk-
+   allocates the whole cluster chain in one FAT pass
+   (`FatVolume::alloc_cluster_chain` — each touched FAT sector written
+   once) and persists the dir entry's **cluster only**; the on-disk
+   size stays 0.
+2. `file_cluster_lbas` fills `FLASH_CLUSTER_LBAS` *without* publishing
+   it (`FLASH_NUM_CLUSTERS` was zeroed before the truncate, so the
+   background path can't read a stale map).
+3. The data streams out as coalesced multi-block CMD25 transfers
+   (`write_sectors_dma`): contiguous cluster runs — on a fresh card,
+   usually one run for the whole file — chunked at 256 KiB so progress
+   dots tick and each trailing CMD12 busy stays bounded.
+4. Only after the data is on disk does `flush_file` write FSInfo and
+   the dir entry with the real size, and `resolve_extent_map` verify +
+   publish the map (background DMA eligible from the next tick, no
+   reboot needed).
+
+Crash-safety ordering: the FAT chain on disk is EOF-terminated at every
+intermediate step, and the dir entry says size 0 until the final flush —
+a power cut mid-save leaves a file `try_load` rejects (`len != SIZE` →
+cold boot) and the next save's truncate reclaims, never a chain pointing
+at free clusters.
+
+Fallback: any `fast_full_save` failure (cluster size < 4 KiB makes the
+map exceed `MAX_FLASH_CLUSTERS`, DMA init/CMD25 error, disk full) logs
+`fast full save unavailable (…) — FAT-path fallback` and reruns the old
+chunked `file.write` loop on the same open file. The log line tells the
+paths apart: `full save done (DMA, …)` vs `full save done (FAT, …)`.
+
 ## Build / observe
 
 ```bash

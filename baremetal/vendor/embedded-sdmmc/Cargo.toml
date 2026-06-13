@@ -34,3 +34,9 @@ embedded-hal = "1.0.0"
 embedded-io = "0.6.1"
 heapless = "0.8"
 log = { version = "0.4", optional = true, default-features = false }
+
+# Upstream's in-library #[cfg(test)] modules use hex! fixtures, so
+# `cargo test` (host target — see VENDOR.md) needs this dev-dependency
+# back even with the example/test stanzas trimmed.
+[dev-dependencies]
+hex-literal = "0.4.1"

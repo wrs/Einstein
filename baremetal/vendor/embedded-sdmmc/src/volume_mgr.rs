@@ -841,6 +841,61 @@ where
         Ok(Some((num_clusters, blocks_per_cluster)))
     }
 
+    /// LOCAL ADDITION (vendored — see VENDOR.md). Pre-allocate an
+    /// open, writable, zero-length file's cluster chain to hold `size`
+    /// bytes, via a single FAT pass ([`FatVolume::alloc_cluster_chain`])
+    /// instead of one allocation per cluster during `write`.
+    ///
+    /// Persists the FAT chain and the directory entry's *cluster* (the
+    /// on-disk size stays 0) and sets the in-memory size, so
+    /// `file_cluster_lbas` and subsequent `write`/`seek` calls see the
+    /// full extent. The on-disk size is only written by the next
+    /// `flush_file`/`close_file` — call that after the file's data is
+    /// on disk, so an interrupted transfer leaves a zero-length entry
+    /// (the chain never dangles, and stale cluster content is never
+    /// presented as valid file data).
+    pub fn file_preallocate(&self, file: RawFile, size: u32) -> Result<(), Error<D::Error>> {
+        let mut data = self.data.try_borrow_mut().map_err(|_| Error::LockError)?;
+        let data = data.deref_mut();
+
+        let file_idx = data.get_file_by_id(file)?;
+        let volume_idx = data.get_volume_by_id(data.open_files[file_idx].raw_volume)?;
+        if data.open_files[file_idx].mode == Mode::ReadOnly {
+            return Err(Error::ReadOnly);
+        }
+        if data.open_files[file_idx].entry.size != 0 || size == 0 {
+            // Only the fresh / just-truncated case is supported.
+            return Err(Error::InvalidOffset);
+        }
+        // A truncated file retains its (EOF-terminated) head cluster;
+        // a brand-new file has none yet.
+        let cluster = data.open_files[file_idx].entry.cluster;
+        let head = (cluster.0 >= fat::RESERVED_ENTRIES).then_some(cluster);
+        let total_clusters = match &data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => size.div_ceil(fat.bytes_per_cluster()),
+        };
+        let head = match data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(ref mut fat) => {
+                fat.alloc_cluster_chain(&mut data.block_cache, head, total_clusters)?
+            }
+        };
+        // Tie the chain to the directory entry now (cluster only, size
+        // still 0) so a power cut can never orphan it.
+        let mut entry = data.open_files[file_idx].entry.clone();
+        entry.cluster = head;
+        match &data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => {
+                fat.write_entry_to_disk(&mut data.block_cache, &entry)?;
+            }
+        }
+        let fi = &mut data.open_files[file_idx];
+        fi.entry.cluster = head;
+        fi.update_length(size);
+        fi.current_cluster = (0, head);
+        fi.dirty = true;
+        Ok(())
+    }
+
     /// Write to a open file.
     pub fn write(&self, file: RawFile, buffer: &[u8]) -> Result<(), Error<D::Error>> {
         #[cfg(feature = "defmt-log")]

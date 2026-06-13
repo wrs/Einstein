@@ -14,7 +14,10 @@
 //!   the 128 × 64 KiB blocks of the 8 MiB GUEST_FLASH backing.
 //! - `maybe_save()`:
 //!   - If `FILE_VALID == false`: open `NEWTON.BIN` ReadWriteCreateOrTruncate,
-//!     write the full 8 MiB, set `FILE_VALID = true`, and resolve the
+//!     pre-allocate the whole cluster chain in one FAT pass and stream
+//!     the 8 MiB as coalesced CMD25 DMA writes (`fast_full_save`;
+//!     falls back to the FAT layer's single-block write path if that
+//!     isn't possible), set `FILE_VALID = true`, and resolve the
 //!     per-cluster LBA map so later saves take the background DMA path.
 //!   - Otherwise: open ReadWriteAppend, for each dirty block
 //!     `seek_from_start(off)` then `write(&block[64 KiB])`. Same
@@ -388,6 +391,12 @@ impl FlashStore for SdBackend {
                 "flash_persist_sd: starting full save ({} bytes)",
                 super::FLASH_SIZE
             );
+            // Unpublish any previously resolved extent map: the
+            // create-or-truncate below may reassign the file's
+            // clusters, and the fast path reuses FLASH_CLUSTER_LBAS as
+            // its scratch buffer. resolve_extent_map re-publishes once
+            // the new chain holds the data.
+            FLASH_NUM_CLUSTERS.store(0, Ordering::Release);
             let t0 = cntpct();
             let file =
                 match root.open_file_in_dir(FLASH_FILE, Mode::ReadWriteCreateOrTruncate) {
@@ -410,10 +419,44 @@ impl FlashStore for SdBackend {
                     super::FLASH_SIZE,
                 )
             };
-            // Chunk the write so we can emit progress dots; one
-            // file.write call of 8 MiB is otherwise a silent
-            // multi-minute black box.
-            kprint!("flash_persist_sd: full save [");
+            let raw = file.to_raw_file();
+            match fast_full_save(mgr, raw, bytes) {
+                Ok(runs) => {
+                    // Data is on disk; only now let the directory entry
+                    // claim the full size (flush also writes FSInfo).
+                    if let Err(e) = mgr.flush_file(raw) {
+                        kprintln!(
+                            "flash_persist_sd: flush after full save FAILED: {:?}",
+                            e
+                        );
+                        let _ = mgr.close_file(raw);
+                        remark_dirty(&snapshot);
+                        return;
+                    }
+                    FILE_VALID.store(true, Ordering::Relaxed);
+                    let ms = elapsed_ms(t0, cntpct());
+                    kprintln!(
+                        "flash_persist_sd: full save done (DMA, {} bytes in {} ms, {} KB/s, {} run(s))",
+                        bytes.len(),
+                        ms,
+                        (bytes.len() as u64 * 1000 / 1024) / ms.max(1),
+                        runs,
+                    );
+                    resolve_extent_map(mgr, raw);
+                    return;
+                }
+                Err(why) => kprintln!(
+                    "flash_persist_sd: fast full save unavailable ({}) — FAT-path fallback",
+                    why
+                ),
+            }
+
+            // Fallback: grow + write through the FAT layer's
+            // single-block path. Chunk the write so we can emit
+            // progress dots; one file.write call of 8 MiB is otherwise
+            // a silent multi-minute black box.
+            let file = raw.to_file(mgr);
+            kprint!("flash_persist_sd: full save (FAT) [");
             let mut off = 0;
             let mut next_dot = PROGRESS_DOT;
             while off < bytes.len() {
@@ -438,7 +481,7 @@ impl FlashStore for SdBackend {
             FILE_VALID.store(true, Ordering::Relaxed);
             let ms = elapsed_ms(t0, cntpct());
             kprintln!(
-                "flash_persist_sd: full save done ({} bytes in {} ms, {} KB/s)",
+                "flash_persist_sd: full save done (FAT, {} bytes in {} ms, {} KB/s)",
                 bytes.len(),
                 ms,
                 (bytes.len() as u64 * 1000 / 1024) / ms.max(1),
@@ -631,6 +674,78 @@ fn resolve_extent_map(mgr: &Vm, raw: RawFile) {
         Err(e) => kprintln!("flash_persist_sd: extent resolve FAILED: {:?}", e),
     }
     let _ = mgr.close_file(raw);
+}
+
+/// Fast initial full save: pre-allocate `NEWTON.BIN`'s whole cluster
+/// chain in one FAT pass (`file_preallocate`), then stream GUEST_FLASH
+/// to the chain's sectors with coalesced multi-block CMD25 DMA writes —
+/// instead of growing the file cluster-by-cluster through the FAT
+/// layer's single-block CMD24 path (~16k commands for 8 MiB; minutes on
+/// a fresh card).
+///
+/// Returns the number of contiguous cluster runs written, or a reason
+/// string when the caller should fall back to the FAT write path. The
+/// caller flushes the file afterwards: the dir entry's size and FSInfo
+/// reach the disk only after the data, so a power cut mid-save leaves a
+/// zero-length entry that `try_load` rejects (→ clean cold boot).
+fn fast_full_save(mgr: &Vm, raw: RawFile, bytes: &[u8]) -> Result<usize, &'static str> {
+    if let Err(e) = mgr.file_preallocate(raw, bytes.len() as u32) {
+        kprintln!("flash_persist_sd: preallocate FAILED: {:?}", e);
+        return Err("preallocate failed");
+    }
+    // Fill the LBA buffer without publishing it: the caller zeroed
+    // FLASH_NUM_CLUSTERS before truncating, and resolve_extent_map
+    // verifies + re-publishes only after the data is written.
+    // SAFETY: single-core EL2; the save path is synchronous here and
+    // no background save is in flight (SAVE_ACTIVE implies a resolved
+    // map, which implies FILE_VALID — see try_start_dma_save).
+    let lbas = unsafe { &mut *FLASH_CLUSTER_LBAS.0.get() };
+    let (n, bpc) = match mgr.file_cluster_lbas(raw, lbas) {
+        Ok(Some((n, bpc))) => (n, bpc),
+        Ok(None) => return Err("cluster map too large or empty"),
+        Err(e) => {
+            kprintln!("flash_persist_sd: extent resolve FAILED: {:?}", e);
+            return Err("extent resolve failed");
+        }
+    };
+    let cluster_bytes = bpc as usize * 512;
+    kprint!("flash_persist_sd: full save (DMA) [");
+    let mut next_dot = PROGRESS_DOT;
+    let mut written = 0usize;
+    let mut runs = 0usize;
+    let mut i = 0usize;
+    while i < n {
+        // Coalesce the contiguous cluster run starting at i. On a
+        // fresh card this is usually the whole file in one run.
+        let mut j = i + 1;
+        while j < n && lbas[j] == lbas[j - 1] + bpc {
+            j += 1;
+        }
+        runs += 1;
+        // Stream the run in PROGRESS_DOT-sized CMD25 transfers:
+        // progress dots tick, and each transfer's trailing CMD12
+        // busy-wait stays bounded.
+        let run_start = i * cluster_bytes;
+        let run_end = (j * cluster_bytes).min(bytes.len());
+        let mut off = run_start;
+        while off < run_end {
+            let end = (off + PROGRESS_DOT).min(run_end);
+            let lba = lbas[i] + ((off - run_start) / 512) as u32;
+            if let Err(e) = mgr.device(|d| d.write_sectors_dma(lba, &bytes[off..end])) {
+                kprintln!("] CMD25 DMA write at lba {} FAILED: {:?}", lba, e);
+                return Err("DMA write failed");
+            }
+            written += end - off;
+            off = end;
+            while written >= next_dot && next_dot <= bytes.len() {
+                kprint!(".");
+                next_dot += PROGRESS_DOT;
+            }
+        }
+        i = j;
+    }
+    kprintln!("]");
+    Ok(runs)
 }
 
 /// Try to start a background DMA save of the dirty clusters covered by

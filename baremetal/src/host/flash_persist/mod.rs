@@ -136,3 +136,18 @@ pub fn on_sd_dma_done() {
     #[cfg(nh_flash_persist_sd)]
     sd::on_dma_completion();
 }
+
+/// Timer-tick poll of the background DMA save's `WaitBusy` sub-state
+/// (the CMD12 card-program wait). Called every guest-path timer IRQ so
+/// the save advances across ticks instead of busy-waiting the card in
+/// the completion IRQ. No-op unless a save is mid-`WaitBusy`, and a
+/// no-op for backends without an async DMA save.
+#[cfg(nh_real_hw)]
+pub fn poll_dma_save() {
+    #[cfg(nh_flash_persist_sd)]
+    sd::poll_dma_save();
+}
+
+/// Non-real-hw builds (semihost / QEMU) have no async SD DMA save.
+#[cfg(not(nh_real_hw))]
+pub fn poll_dma_save() {}

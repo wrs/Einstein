@@ -82,12 +82,19 @@ pub fn irq_spurious() -> u32 {
     super::gicv3::INTID_SPURIOUS
 }
 
-/// EL2 IRQ-entry dispatch hooks. The FVP host has no BCM2835 DMA engine
-/// or USB touchscreen — those are real-Pi-only — so both are no-ops.
-/// They exist so the IRQ path in `trap` is free of platform cfg blocks
-/// (the BCM2835 versions live in `raspi3b.rs`).
+/// EL2 IRQ-entry dispatch hooks. The FVP host has no BCM2835 DMA engine,
+/// SD flash backend or USB touchscreen — those are real-Pi-only — so all
+/// three are no-ops. They exist so the IRQ path in `trap` is free of
+/// platform cfg blocks (the BCM2835 versions live in `raspi3b.rs`).
 #[inline]
 pub fn dispatch_dma_completions(_cap: crate::arch::slim_isr::IrqCap) {}
+
+#[inline]
+pub fn poll_dma_save() {
+    // Forwarded like raspi3b so the backend-side no-op stays reachable
+    // on every platform; the SD backend is never built for FVP.
+    crate::host::flash_persist::poll_dma_save();
+}
 
 #[inline]
 pub fn poll_usb_fast_path() -> super::UsbFastPath {

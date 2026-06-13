@@ -30,7 +30,7 @@
 
 use core::arch::asm;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use embedded_sdmmc::{Mode, RawFile, VolumeIdx, VolumeManager};
 
@@ -156,9 +156,28 @@ static FLASH_BLOCKS_PER_CLUSTER: AtomicU32 = AtomicU32::new(0);
 // `irq_from_el2` path, which does not start saves. So plain atomics +
 // an `UnsafeCell` bitmap are sufficient; no locking.
 
-/// True while a cluster's DMA write is in flight (state `Writing`),
-/// from `start_sectors_dma` until its completion IRQ finishes it.
+/// True while a save is in progress — either a cluster's DMA write is in
+/// flight (`Writing`) or its CMD12 is settling the card (`WaitBusy`).
+/// Gates a second save from starting and gates the timer-tick poll.
 static SAVE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// True in the `WaitBusy` sub-state: the cluster's DMA finished, CMD12
+/// (STOP_TRANSMISSION) was issued, and we're polling `SDCMD.NEW_FLAG`
+/// from the timer tick (`poll_dma_save`) for the card's program time to
+/// elapse — *without* a busy-wait in IRQ context. Cleared back to
+/// `Writing` when `advance_save` arms the next cluster, or with
+/// `SAVE_ACTIVE` when the save completes/aborts.
+static SAVE_WAIT_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// CNTPCT at CMD12 issue (valid iff `SAVE_WAIT_BUSY`). `poll_dma_save`
+/// bounds the `WaitBusy` sub-state against it.
+static SAVE_WAIT_SINCE: AtomicU64 = AtomicU64::new(0);
+
+/// Longest the `WaitBusy` sub-state may last before the card is declared
+/// wedged. The SD spec caps a write's program time at 250 ms; a card
+/// that is still busy after this has stopped responding, and the old
+/// in-IRQ busy-wait would have hit its `HardwareWedge` bound too.
+const WAIT_BUSY_TIMEOUT_MS: u64 = 2_000;
 
 /// The cluster index currently being DMA-written (valid iff
 /// `SAVE_ACTIVE`). Read by the completion handler to finish it.
@@ -178,6 +197,54 @@ struct ClusterBitmap(UnsafeCell<[u32; CL_BITMAP_WORDS]>);
 // IRQ context and is never re-entered (see the module note above).
 unsafe impl Sync for ClusterBitmap {}
 static SAVE_PENDING_CL: ClusterBitmap = ClusterBitmap(UnsafeCell::new([0; CL_BITMAP_WORDS]));
+
+/// Save staging buffer — a consistent snapshot of the dirty clusters,
+/// taken at save-start while the guest is paused in the autosave IRQ. The
+/// background DMA reads from here, not live GUEST_FLASH, so the guest's
+/// concurrent store mutations can't tear the persisted image.
+///
+/// Without this, the multi-cluster DMA reads GUEST_FLASH over ~100 ms+
+/// while the guest keeps writing the store: clusters captured at different
+/// instants mix old/new state, yielding an internally-inconsistent store
+/// image. It round-trips byte-faithfully (the fold matches) but crashes
+/// the ROM's `TFlashStore` reader on the next resume — the torn-snapshot
+/// bug; see `docs/SD_DMA_AUTOSAVE.md`. Mirrors GUEST_FLASH's layout; only
+/// the dirty clusters are refreshed each save (the rest is never read).
+#[repr(C, align(64))]
+struct Staging([u8; super::FLASH_SIZE]);
+struct StagingCell(UnsafeCell<Staging>);
+// SAFETY: single-core EL2; written only at save-start (guest paused in the
+// autosave IRQ) and read by the SD-TX DMA, serialised by the save machine.
+unsafe impl Sync for StagingCell {}
+static SAVE_STAGING: StagingCell =
+    StagingCell(UnsafeCell::new(Staging([0; super::FLASH_SIZE])));
+
+/// Copy every cluster set in `pend` from live GUEST_FLASH into the staging
+/// buffer at the same offset. Runs at save-start with the guest paused, so
+/// the copy is one atomic, consistent snapshot of the store.
+fn stage_pending_clusters(pend: &[u32; CL_BITMAP_WORDS], cluster_bytes: usize) {
+    let src_base = super::backing_base();
+    let staging = SAVE_STAGING.0.get();
+    // SAFETY: addr_of_mut avoids forming a reference to the whole 8 MiB
+    // array; single-core, guest paused.
+    let dst_base = unsafe { core::ptr::addr_of_mut!((*staging).0) as *mut u8 };
+    for ci in 0..MAX_FLASH_CLUSTERS {
+        if !cl_test(pend, ci) {
+            continue;
+        }
+        let off = ci * cluster_bytes;
+        let len = cluster_bytes.min(super::FLASH_SIZE - off);
+        // SAFETY: off+len <= SIZE; src is GUEST_FLASH backing, dst is the
+        // same-sized staging mirror; ranges are distinct objects.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                src_base.wrapping_add(off as u64) as *const u8,
+                dst_base.add(off),
+                len,
+            );
+        }
+    }
+}
 
 /// The dirty-block snapshot backing the in-flight save, kept so a
 /// mid-save failure can re-mark exactly those blocks dirty for retry.
@@ -803,6 +870,10 @@ fn try_start_dma_save(snapshot: &[u32; NUM_BITMAP_WORDS]) -> bool {
         SAVE_SNAPSHOT[i].store(*w, Ordering::Relaxed);
     }
     SAVE_REMAINING.store(count, Ordering::Relaxed);
+    // Capture a consistent snapshot of the dirty clusters NOW, while the
+    // guest is paused in this autosave IRQ, so the background DMA reads
+    // frozen bytes instead of the live store (torn-snapshot fix).
+    stage_pending_clusters(pend, cluster_bytes);
     kprintln!(
         "flash_persist_sd: DMA save start ({} cluster(s), {} KiB each)",
         count,
@@ -833,15 +904,17 @@ fn advance_save(from: usize) {
     let cluster_bytes = bpc * 512;
     let off = ci * cluster_bytes;
     let len = cluster_bytes.min(super::FLASH_SIZE - off);
-    // SAFETY: GUEST_FLASH backing is a static byte array. The DMA reads
-    // this range while the guest may keep writing it — acceptable: any
-    // block dirtied during the save stays set in DIRTY (we swapped the
-    // snapshot out) and is re-captured by the next pass.
+    // Read from the staging snapshot, NOT live GUEST_FLASH: the bytes were
+    // frozen at save-start (`stage_pending_clusters`) while the guest was
+    // paused, so the guest's concurrent store mutations can't tear the
+    // image this save persists. Blocks the guest dirties during the save
+    // stay set in DIRTY and are re-captured (and re-staged) next pass.
+    let staging = SAVE_STAGING.0.get();
+    // SAFETY: single-core EL2; staging mirrors GUEST_FLASH's layout and
+    // off+len <= SIZE. addr_of avoids forming a whole-array reference.
     let src = unsafe {
-        core::slice::from_raw_parts(
-            super::backing_base().wrapping_add(off as u64) as *const u8,
-            len,
-        )
+        let base = core::ptr::addr_of!((*staging).0) as *const u8;
+        core::slice::from_raw_parts(base.add(off), len)
     };
     // SAFETY: FLASH_CLUSTER_LBAS written by resolve_extent_map before
     // FLASH_NUM_CLUSTERS released the DMA save path; never written again.
@@ -850,6 +923,7 @@ fn advance_save(from: usize) {
     match mgr.device(|d| d.start_sectors_dma(lba, src)) {
         Ok(()) => {
             SAVE_CLUSTER.store(ci, Ordering::Relaxed);
+            SAVE_WAIT_BUSY.store(false, Ordering::Relaxed); // state `Writing`
             SAVE_ACTIVE.store(true, Ordering::Relaxed);
         }
         Err(e) => {
@@ -863,14 +937,61 @@ fn advance_save(from: usize) {
     }
 }
 
-/// SD-TX completion IRQ handler: finish the cluster just DMA-written
-/// (settle FSM + CMD12 busy-wait) and advance to the next. Runs in IRQ
-/// context; the CMD12 busy-wait is wrapped in an IRQ-unmasked window so
-/// it doesn't starve the audio MAI feed / CNTHP rearm.
+/// SD-TX completion IRQ handler: the cluster's DMA transfer finished, so
+/// settle the write FSM and *issue* CMD12, then enter `WaitBusy` and
+/// return. The card's program time is NOT spun on here — it's polled
+/// from the timer tick by [`poll_dma_save`]. This keeps the completion
+/// handler as cheap as the UART/MAI ones (ack + a couple of MMIO
+/// writes), with no `with_irqs_unmasked` window and no nested-IRQ
+/// re-entry — which is what made the old in-IRQ busy-wait fragile.
 pub fn on_dma_completion() {
     if !SAVE_ACTIVE.load(Ordering::Relaxed) {
         // Stray completion (e.g. the polled bring-up path armed the
         // channel with INTEN, or a late IRQ after a finished save).
+        return;
+    }
+    if SAVE_WAIT_BUSY.load(Ordering::Relaxed) {
+        // Already past the transfer; a spurious second completion.
+        return;
+    }
+    begin_finish_current();
+}
+
+/// Settle the just-finished cluster transfer: check for a latched DMA
+/// error, issue CMD12, and enter the `WaitBusy` sub-state, stamping
+/// `SAVE_WAIT_SINCE` so [`poll_dma_save`] can bound the wait.
+fn begin_finish_current() {
+    let ci = SAVE_CLUSTER.load(Ordering::Relaxed);
+    let Some(mgr) = vm() else {
+        abort_save();
+        return;
+    };
+    if let Err(e) = mgr.device(|d| d.begin_finish_sectors_dma()) {
+        kprintln!(
+            "flash_persist_sd: DMA save cluster {} finish-begin FAILED: {:?} — \
+             disabling DMA save, FAT fallback",
+            ci, e
+        );
+        abort_save();
+        return;
+    }
+    SAVE_WAIT_SINCE.store(cntpct(), Ordering::Relaxed);
+    SAVE_WAIT_BUSY.store(true, Ordering::Relaxed);
+}
+
+/// Timer-tick poll of the `WaitBusy` sub-state: if the just-written
+/// cluster's CMD12 has cleared the card's BUSY, advance to the next
+/// cluster (or finish). Called every guest-path timer IRQ; a no-op
+/// unless a save is mid-`WaitBusy`. This replaces the old in-IRQ
+/// busy-wait: the card program time elapses across ticks while the guest
+/// keeps running, instead of being spun on inside the completion IRQ.
+pub fn poll_dma_save() {
+    if !SAVE_ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
+    if !SAVE_WAIT_BUSY.load(Ordering::Relaxed) {
+        // `Writing` sub-state: the DMA-done edge arrives via the
+        // completion IRQ (`on_dma_completion`), nothing to poll.
         return;
     }
     let ci = SAVE_CLUSTER.load(Ordering::Relaxed);
@@ -878,27 +999,47 @@ pub fn on_dma_completion() {
         abort_save();
         return;
     };
-    let r = crate::arch::cpu::with_irqs_unmasked(|| mgr.device(|d| d.finish_sectors_dma()));
-    if let Err(e) = r {
-        kprintln!(
-            "flash_persist_sd: DMA save cluster {} finish FAILED: {:?} — \
-             disabling DMA save, FAT fallback",
-            ci, e
-        );
-        abort_save();
-        return;
+    match mgr.device(|d| d.poll_finish_sectors_dma()) {
+        None => {
+            // Card still programming — try again next tick, unless it
+            // has sat there far past any legal program time: then the
+            // controller/card is wedged and the save would otherwise
+            // hold SAVE_ACTIVE forever, silently stopping persistence.
+            let waited = elapsed_ms(SAVE_WAIT_SINCE.load(Ordering::Relaxed), cntpct());
+            if waited > WAIT_BUSY_TIMEOUT_MS {
+                kprintln!(
+                    "flash_persist_sd: DMA save cluster {} CMD12 busy for {} ms — \
+                     card wedged; disabling DMA save, FAT fallback",
+                    ci, waited
+                );
+                mgr.device(|d| d.abandon_finish_sectors_dma());
+                abort_save();
+            }
+        }
+        Some(Ok(())) => {
+            SAVE_WAIT_BUSY.store(false, Ordering::Relaxed);
+            let left = SAVE_REMAINING.load(Ordering::Relaxed).saturating_sub(1);
+            SAVE_REMAINING.store(left, Ordering::Relaxed);
+            // SAVE_ACTIVE stays true through advance_save (which either
+            // arms the next cluster or clears it in finish_save), so a
+            // concurrent autosave tick won't start a second save.
+            advance_save(ci + 1);
+        }
+        Some(Err(e)) => {
+            kprintln!(
+                "flash_persist_sd: DMA save cluster {} CMD12 FAILED: {:?} — \
+                 disabling DMA save, FAT fallback",
+                ci, e
+            );
+            abort_save();
+        }
     }
-    let left = SAVE_REMAINING.load(Ordering::Relaxed).saturating_sub(1);
-    SAVE_REMAINING.store(left, Ordering::Relaxed);
-    // SAVE_ACTIVE stays true through advance_save (which either starts
-    // the next cluster or clears it in finish_save) so a concurrent
-    // autosave tick won't start a second save.
-    advance_save(ci + 1);
 }
 
 /// All clusters drained — the background save is complete.
 fn finish_save() {
     SAVE_REMAINING.store(0, Ordering::Relaxed);
+    SAVE_WAIT_BUSY.store(false, Ordering::Relaxed);
     SAVE_ACTIVE.store(false, Ordering::Relaxed);
     kprintln!("flash_persist_sd: DMA save complete");
 }
@@ -918,6 +1059,7 @@ fn abort_save() {
     remark_dirty(&snap);
     FLASH_NUM_CLUSTERS.store(0, Ordering::Release);
     SAVE_REMAINING.store(0, Ordering::Relaxed);
+    SAVE_WAIT_BUSY.store(false, Ordering::Relaxed);
     SAVE_ACTIVE.store(false, Ordering::Relaxed);
 }
 

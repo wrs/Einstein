@@ -2,9 +2,16 @@
 
 The flash-persist autosave writes dirty blocks of `NEWTON.BIN` to the
 SD card via DMA, advanced cluster-by-cluster from the DMA completion
-IRQ, so the guest keeps running during a save. A synchronous FAT
-write path remains as the fallback for first-time/full saves and for
-error recovery.
+IRQ, so the guest keeps running during a save. The background save is
+always on — there is no feature gate or toggle. A synchronous FAT
+write path remains as the fallback for error recovery and for cards
+whose per-cluster map cannot be resolved.
+
+(Historical note: a long intermittent-corruption hunt once implicated
+this save path; the root cause turned out to be hypervisor TLB
+maintenance around the kernel's MMU-off windows, not the save —
+`HIGHLEVEL.md` §4.4, `docs/project-history.md` §9. The save's design
+is corruption-safe as described below.)
 
 ## Why DMA
 
@@ -28,16 +35,23 @@ same-EL ISR (`trap::irq_from_el2` / `host_dma::on_completion`).
   - `write_block_dma(lba, &[u8;512])` — single block, polled.
   - `write_sectors_dma(lba, &[u8])` — N sectors via `CMD25` +
     DREQ-paced DMA + `CMD12`, polled. Kept for isolated bring-up.
-  - `start_sectors_dma(lba, &[u8])` / `finish_sectors_dma()` — the
-    async pair the autosave uses. `start` does `prepare_data`, arms
+  - `start_sectors_dma(lba, &[u8])` /
+    `begin_finish_sectors_dma()` / `poll_finish_sectors_dma()` — the
+    async triple the autosave uses. `start` does `prepare_data`, arms
     the channel **with `TI_INTEN`** (GPU IRQ 16+`SD_TX_CHANNEL` on
     completion), issues `CMD25`, and returns immediately; the source
-    buffer is cache-flushed (`dc_civac`) by `arm_sd_dma` and must
-    stay stable until completion. `finish` runs from the completion
-    IRQ: check CS.ERROR, settle the write FSM, `CMD12` + busy,
-    restore idle `SDHCFG`.
+    buffer must stay stable until completion. `begin_finish` runs
+    from the completion IRQ: check CS.ERROR, settle the write FSM,
+    and *issue* `CMD12` — no wait. `poll_finish` is a non-blocking
+    `SDCMD.NEW_FLAG` check that restores the idle `SDHCFG` once the
+    card's program time has elapsed.
   - The CB-build/arm and completion poll are shared module helpers
     (`arm_sd_dma(buf_pa, len, inten)`, `poll_sd_dma_done`).
+    `arm_sd_dma` cleans the source range to RAM with `dc_cvac_range`
+    — clean-only, **not** clean+invalidate: the DMA only reads the
+    buffer, and invalidating GUEST_FLASH on every autosave would
+    evict the guest's live store working set (observed as a general
+    UI slowdown).
 - **Per-cluster LBA map:** the vendored embedded-sdmmc exposes
   `VolumeManager::file_cluster_lbas(file, out: &mut [u32]) ->
   Option<(num_clusters, blocks_per_cluster)>`
@@ -63,45 +77,55 @@ same-EL ISR (`trap::irq_from_el2` / `host_dma::on_completion`).
 - **Completion IRQ plumbing:** `host_dma::on_completion(ch)`
   dispatched from `trap::irq_from_el2` / `irq_from_guest` for
   channels 4 (MAI), 5 (UART), and 6 (SD). Mind the slim-ISR contract
-  doc in `trap.rs` (list any new state it touches).
+  doc in `hv/trap/mod.rs` (list any new state it touches). The same
+  guest-path timer tick also drives `poll_dma_save` (the `WaitBusy`
+  poll, below).
 
 ## The save state machine
 
-In `src/host/flash_persist/sd.rs` (`SAVE_ACTIVE` / `SAVE_CLUSTER` /
-`SAVE_PENDING_CL` bitmap / `SAVE_SNAPSHOT`):
+In `src/host/flash_persist/sd.rs` (`SAVE_ACTIVE` / `SAVE_WAIT_BUSY` /
+`SAVE_CLUSTER` / `SAVE_PENDING_CL` bitmap / `SAVE_SNAPSHOT` /
+`SAVE_STAGING`):
 
 - `maybe_save` tick: when `valid && FLASH_NUM_CLUSTERS != 0`,
   `try_start_dma_save` swaps out the dirty bitmap (guest can keep
   dirtying), builds the dirty-**cluster** set (each dirty 64 KiB
-  block → the clusters its byte range overlaps), and `advance_save`
-  starts the first cluster's DMA, then returns to the guest. If a
-  save is still in flight it re-marks this tick's blocks for the next
-  pass.
+  block → the clusters its byte range overlaps), **stages** those
+  clusters (below), and `advance_save` starts the first cluster's
+  DMA, then returns to the guest. If a save is still in flight it
+  re-marks this tick's blocks for the next pass.
+- **Save staging.** `stage_pending_clusters` memcpys the dirty
+  clusters from GUEST_FLASH into an 8 MiB staging mirror
+  (`SAVE_STAGING`) while the guest is still paused in the autosave
+  IRQ, and the DMA reads from staging, never from live GUEST_FLASH.
+  This makes the persisted image one atomic, consistent instant of
+  the store. Without it, the multi-cluster DMA reads the live store
+  over ~100 ms+ while the guest mutates it: the saved image is
+  byte-faithful but stitched from different instants — cluster N's
+  updated pointer with cluster M's not-yet-updated target — and the
+  ROM's `TFlashStore` reader crashes on it at the next load. Blocks
+  the guest dirties during a save stay set in `DIRTY` and are
+  re-staged on the next pass.
 - Completion IRQ (`host_dma::on_completion(SD_TX_CHANNEL)` →
-  `flash_persist::on_sd_dma_done` → `sd::on_dma_completion`): finish
-  the cluster just written, then `advance_save` starts the next,
-  until the set drains (`finish_save` → `Idle`).
-- Each cluster: DMA `GUEST_FLASH[ci*cluster_bytes .. +cluster_bytes]`
+  `flash_persist::on_sd_dma_done` → `sd::on_dma_completion`):
+  `begin_finish_sectors_dma` settles the FSM and *issues* `CMD12`,
+  then the handler sets the `WaitBusy` sub-state and returns — no
+  busy-wait, no `with_irqs_unmasked`, no nested-IRQ re-entry.
+- `WaitBusy` (`poll_dma_save`, called from every timer tick in
+  `hv::trap`): `poll_finish_sectors_dma` checks whether the card's
+  program time has elapsed; when it has, `advance_save` starts the
+  next cluster, until the set drains (`finish_save` → idle). The
+  guest runs through both the DMA data phase *and* the card-program
+  busy of every cluster. The wait is bounded by
+  `WAIT_BUSY_TIMEOUT_MS` (2 s; the SD spec caps a write's program
+  time at 250 ms) — a card still busy past that is declared wedged
+  and the save aborts.
+- Each cluster: DMA `staging[ci*cluster_bytes .. +cluster_bytes]`
   → `FLASH_CLUSTER_LBAS[ci]` (per-cluster, so fragmentation is fine).
-- On any DMA/finish error: `abort_save` tears down the channel,
-  re-marks the snapshot dirty, and clears `FLASH_NUM_CLUSTERS` so the
-  next tick falls back to the synchronous FAT writes (rather than
-  retrying a latched-error channel forever).
-
-**Design note — CMD12 busy is handled inline, not as a polled
-`WaitBusy` state.** The completion handler runs `finish_sectors_dma`
-(which busy-waits out the card program time after `CMD12`) inside a
-`cpu::with_irqs_unmasked` window, so the audio MAI feed / CNTHP rearm
-stay serviced through the wait; the nested IRQs take the slim
-`irq_from_el2` path, which never starts a save, so the SD controller
-is never re-entered. The guest runs during each cluster's DMA **data
-phase** (the part DMA offloads) but is still paused during each
-cluster's card-program busy. Fully overlapping the busy with guest
-execution — a true polled `WaitBusy` advanced from the timer tick —
-is the one remaining optional refinement; it needs the BCM2835-SDHOST
-busy-completion semantics cross-checked against the datasheet / Linux
-`bcm2835-sdhost` and a measured per-cluster busy time to justify the
-added hot-path complexity.
+- On any DMA/finish error or `WaitBusy` timeout: `abort_save` tears
+  down the channel, re-marks the snapshot dirty, and clears
+  `FLASH_NUM_CLUSTERS` so the next tick falls back to the synchronous
+  FAT writes (rather than retrying a latched-error channel forever).
 
 ## Initial full save (fresh card / wrong-size NEWTON.BIN)
 

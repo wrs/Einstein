@@ -204,6 +204,40 @@ pub fn dc_civac_range(va: u64, len: usize) {
     }
 }
 
+/// Clean (write back, but do NOT invalidate) `[va, va+len)` to the PoC.
+///
+/// The correct op for the *outbound* DMA direction — flushing a buffer a
+/// device is about to **read** (e.g. GUEST_FLASH for an SD-TX cluster
+/// write). Unlike [`dc_civac_range`], the CPU's cache copy survives, so
+/// the source's working set isn't evicted: a guest that keeps touching
+/// the just-saved store pages doesn't eat a cache-miss refetch storm on
+/// every autosave. `dsb sy` fences the writeback against the subsequent
+/// DMA arm. (Invalidate is only needed for the *inbound* direction,
+/// where a device wrote the buffer and the CPU must drop stale lines.)
+#[cfg(nh_real_hw)] // Only caller: `sdhost::arm_sd_dma`.
+pub fn dc_cvac_range(va: u64, len: usize) {
+    const LINE: u64 = 64;
+    let start = va & !(LINE - 1);
+    let end = (va + len as u64 + LINE - 1) & !(LINE - 1);
+    let mut p = start;
+    while p < end {
+        // SAFETY: cache maintenance op; `dsb sy` below fences against
+        // the DMA arm that follows.
+        unsafe {
+            core::arch::asm!(
+                "dc cvac, {p}",
+                p = in(reg) p,
+                options(nostack, preserves_flags),
+            );
+        }
+        p += LINE;
+    }
+    // SAFETY: barrier only; no state side-effects.
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+}
+
 
 /// Spin until at least `ms` ms have elapsed by CNTPCT_EL0. Used by
 /// the DWC2 driver for spec-mandated reset / settle delays (e.g.

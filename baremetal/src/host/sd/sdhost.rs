@@ -16,8 +16,10 @@
 //!   transfer via SDDATA FIFO.
 //! - DMA block I/O — DREQ-paced writes through DMA channel 6:
 //!   `write_block_dma` / `write_sectors_dma` (polled), and the
-//!   `start_sectors_dma` / `finish_sectors_dma` async pair that
-//!   drives the background flash autosave
+//!   `start_sectors_dma` + `begin_finish_sectors_dma` /
+//!   `poll_finish_sectors_dma` async trio that drives the background
+//!   flash autosave (the CMD12 card-program wait is polled across timer
+//!   ticks, not spun on in the completion IRQ)
 //!   (see `docs/SD_DMA_AUTOSAVE.md`).
 //!
 //! Ported from Circle's
@@ -358,8 +360,9 @@ impl SdHost {
     /// Multi-block DMA write of `buf` (length a multiple of 512) to
     /// the sectors starting at `lba`, polled to completion. The
     /// isolated bring-up / validation form (milestone 4a); the
-    /// background save (milestone 4b) uses [`start_sectors_dma`] /
-    /// [`finish_sectors_dma`] to take the completion IRQ instead.
+    /// background save (milestone 4b) uses [`start_sectors_dma`] +
+    /// [`begin_finish_sectors_dma`] / [`poll_finish_sectors_dma`] to take
+    /// the completion IRQ and poll CMD12 across ticks instead.
     ///
     /// Sequence mirrors Linux's `bcm2835-sdhost` multi-block write:
     /// `prepare_data(blocks=n)` → `CMD25` (WRITE_MULTIPLE_BLOCK) → DMA
@@ -396,8 +399,9 @@ impl SdHost {
     /// Begin a background multi-block DMA write: program the block
     /// count, arm the SD-TX channel with completion-IRQ enabled, and
     /// issue `CMD25`, then return immediately. The data phase runs in
-    /// the background; the caller must call [`finish_sectors_dma`] from
-    /// the SD-TX completion IRQ. `buf` must stay stable until then and
+    /// the background; the caller must call [`begin_finish_sectors_dma`]
+    /// from the SD-TX completion IRQ, then poll [`poll_finish_sectors_dma`]
+    /// until it reports CMD12 done. `buf` must stay stable until then and
     /// be a non-empty multiple of 512 bytes.
     ///
     /// On a setup / `CMD25` failure the channel is aborted and the idle
@@ -427,26 +431,57 @@ impl SdHost {
         Ok(())
     }
 
-    /// Complete a write begun by [`start_sectors_dma`], after the SD-TX
-    /// channel has signalled completion. Checks for a latched DMA error,
-    /// settles the write FSM, issues `CMD12` (STOP_TRANSMISSION, R1b
-    /// busy-wait), and restores the idle `SDHCFG`.
-    ///
-    /// The caller runs this from the completion IRQ inside an
-    /// IRQ-unmasked window so the `CMD12` busy-wait (card program time)
-    /// doesn't starve the audio MAI feed / CNTHP rearm while it waits.
+    /// Begin completing a write begun by [`start_sectors_dma`], after the
+    /// SD-TX channel signalled completion: check for a latched DMA error,
+    /// settle the write FSM, and *issue* `CMD12` (STOP_TRANSMISSION) — but
+    /// do NOT wait out the card's program time here. The controller
+    /// asserts BUSY internally and holds `SDCMD.NEW_FLAG`; the caller
+    /// polls it from the timer tick via [`poll_finish_sectors_dma`] so
+    /// the completion IRQ doesn't block (nested inside `with_irqs_unmasked`)
+    /// on card-program time. On a setup error the idle `SDHCFG` is
+    /// restored and `Err` returned; on success `SDHCFG` stays in its data
+    /// configuration until the poll observes CMD12 completion.
     #[cfg(nh_real_hw)]
-    pub fn finish_sectors_dma(&self) -> Result<(), CmdError> {
+    pub fn begin_finish_sectors_dma(&self) -> Result<(), CmdError> {
         use crate::host::host_dma as dma;
-        let r = if dma::sd_tx_error() {
+        if dma::sd_tx_error() {
             dma::sd_tx_abort();
-            Err(CmdError::DmaError)
-        } else {
-            finish_data_phase(false)
-                .and_then(|()| send_cmd(CMD_STOP_TRANSMISSION, 0, ResponseKind::Short).map(|_| ()))
-        };
+            write_reg(SDHCFG, self.hcfg_base);
+            return Err(CmdError::DmaError);
+        }
+        if let Err(e) = finish_data_phase(false) {
+            write_reg(SDHCFG, self.hcfg_base);
+            return Err(e);
+        }
+        // Issue CMD12 (R1b → BUSYWAIT set in `issue_cmd`) and return; the
+        // card's program time is polled asynchronously, not spun on here.
+        issue_cmd(CMD_STOP_TRANSMISSION, 0, ResponseKind::Short, CmdDir::NoData);
+        Ok(())
+    }
+
+    /// Poll the `CMD12` issued by [`begin_finish_sectors_dma`]. `None`
+    /// while the card is still programming (`NEW_FLAG` set); on
+    /// completion restores the idle `SDHCFG` and returns `Some(Ok)` /
+    /// `Some(Err)`.
+    #[cfg(nh_real_hw)]
+    pub fn poll_finish_sectors_dma(&self) -> Option<Result<(), CmdError>> {
+        match poll_cmd() {
+            None => None,
+            Some(r) => {
+                write_reg(SDHCFG, self.hcfg_base);
+                Some(r.map(|_| ()))
+            }
+        }
+    }
+
+    /// Give up on the `CMD12` issued by [`begin_finish_sectors_dma`]
+    /// (the caller's wait bound expired): restore the idle `SDHCFG` so
+    /// the controller is back in the state the synchronous paths expect,
+    /// the same recovery [`wait_cmd`]'s `HardwareWedge` bound leaves
+    /// behind.
+    #[cfg(nh_real_hw)]
+    pub fn abandon_finish_sectors_dma(&self) {
         write_reg(SDHCFG, self.hcfg_base);
-        r
     }
 
     pub fn capacity(&self) -> CardCapacity {
@@ -501,8 +536,13 @@ fn arm_sd_dma(buf_pa: u64, len: u32, inten: bool) {
         (*cb).nextconbk = 0;
     }
     // The DMA master reads the source via the uncached bus alias, so
-    // cacheable writes must be flushed to RAM first.
-    crate::arch::cpu::dc_civac_range(buf_pa, len as usize);
+    // cacheable writes must be flushed to RAM first. Clean-only (NOT
+    // clean+invalidate): the DMA only reads this buffer, so there's no
+    // reason to drop the CPU's copy — and for the background save the
+    // source is GUEST_FLASH, the live guest store. Invalidating it on
+    // every autosave evicts the guest's store working set and forces a
+    // cache-miss refetch storm (observed as general UI slowdown).
+    crate::arch::cpu::dc_cvac_range(buf_pa, len as usize);
     // SAFETY: `SD_TX_CB` is 'static and stable for the transfer.
     unsafe {
         dma::arm_sd_tx(&*cb);
@@ -600,6 +640,16 @@ fn send_cmd(cmd: u8, arg: u32, kind: ResponseKind) -> Result<u32, CmdError> {
 }
 
 fn send_cmd_kind(cmd: u8, arg: u32, kind: ResponseKind, dir: CmdDir) -> Result<u32, CmdError> {
+    issue_cmd(cmd, arg, kind, dir);
+    wait_cmd()
+}
+
+/// Write the command registers to start a command, *without* waiting
+/// for it to complete. Pair with `wait_cmd` (block until done) or
+/// `poll_cmd` (non-blocking) — the latter is how the async CMD12
+/// `WaitBusy` path avoids spinning out the card's program time in IRQ
+/// context.
+fn issue_cmd(cmd: u8, arg: u32, kind: ResponseKind, dir: CmdDir) {
     // Clear stale status from the previous transfer.
     write_reg(SDHSTS, SDHSTS_CLEAR_MASK);
 
@@ -617,30 +667,41 @@ fn send_cmd_kind(cmd: u8, arg: u32, kind: ResponseKind, dir: CmdDir) -> Result<u
     };
     // Set BUSYWAIT for the R1b commands we issue: CMD7 (SELECT_CARD)
     // during init and CMD12 (STOP_TRANSMISSION) on the multi-block DMA
-    // write paths (`write_sectors_dma` / `finish_sectors_dma`). The
-    // controller waits out the card's BUSY assertion internally, so we
-    // never poll the DAT0 BUSY line ourselves.
+    // write paths. The controller waits out the card's BUSY assertion
+    // internally and holds SDCMD.NEW_FLAG until then, so we never poll
+    // the DAT0 BUSY line ourselves.
     if matches!(cmd, CMD_SELECT_CARD | CMD_STOP_TRANSMISSION) {
         cmd_word |= SDCMD_BUSYWAIT;
     }
     write_reg(SDCMD, cmd_word);
+}
 
-    // Poll NEW_FLAG to drop. Bounded; if we sit here too long the
-    // controller is wedged (clock not running, card not present,
-    // bus floating). An SD write can stall here for >100 ms of
-    // card-internal program time; the EL2 IRQ path keeps the HDMI
-    // MAI ring fed and CNTHP rearmed in the background.
+/// Block until the in-flight command (and, for R1b, the card's BUSY)
+/// completes. Bounded SW timeout; if we sit here too long the
+/// controller is wedged (clock not running, card not present, bus
+/// floating).
+fn wait_cmd() -> Result<u32, CmdError> {
     for _ in 0..1_000_000u32 {
-        let c = read_reg(SDCMD);
-        if (c & SDCMD_NEW_FLAG) == 0 {
-            if (c & SDCMD_FAIL_FLAG) != 0 {
-                let hsts = read_reg(SDHSTS);
-                return Err(map_hsts_error(hsts));
-            }
-            return Ok(read_reg(SDRSP0));
+        if let Some(r) = poll_cmd() {
+            return r;
         }
     }
     Err(CmdError::HardwareWedge)
+}
+
+/// Non-blocking check of the in-flight command. `None` while
+/// SDCMD.NEW_FLAG is still set (controller busy, or — for R1b — the
+/// card's program time still elapsing); `Some(Ok(resp))` on success,
+/// `Some(Err)` on a FAIL_FLAG latch.
+fn poll_cmd() -> Option<Result<u32, CmdError>> {
+    let c = read_reg(SDCMD);
+    if (c & SDCMD_NEW_FLAG) != 0 {
+        return None;
+    }
+    if (c & SDCMD_FAIL_FLAG) != 0 {
+        return Some(Err(map_hsts_error(read_reg(SDHSTS))));
+    }
+    Some(Ok(read_reg(SDRSP0)))
 }
 
 // CRC7-error handling vs. Linux's bcm2835-sdhost: Linux

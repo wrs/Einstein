@@ -206,6 +206,15 @@ fn irq_from_guest(ctx: &mut TrapContext, cap: crate::arch::slim_isr::IrqCap) {
     // Platform-owned; a no-op off real hardware.
     platform::dispatch_dma_completions(cap);
 
+    // Advance the background flash-DMA save's CMD12 `WaitBusy` poll. The
+    // completion IRQ above only *issues* CMD12 and returns; the card's
+    // program time is waited out here, across timer ticks, so it never
+    // blocks the IRQ path (no in-IRQ busy-wait, no `with_irqs_unmasked`
+    // re-entry). No-op unless a save is mid-`WaitBusy`. Platform-owned
+    // for the same reason as the dispatch above: the flash backend is a
+    // host driver, reached from here only through the board API.
+    platform::poll_dma_save();
+
     // Diagnostic heartbeat: sample guest PC so we can see where it's
     // executing when no MMIO traps are firing. Lives in the diag layer
     // (which may read the VIC model's raw state for log decoration).

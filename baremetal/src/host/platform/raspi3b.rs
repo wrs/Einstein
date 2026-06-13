@@ -181,6 +181,17 @@ pub fn dispatch_dma_completions(_cap: crate::arch::slim_isr::IrqCap) {
 #[inline]
 pub fn dispatch_dma_completions(_cap: crate::arch::slim_isr::IrqCap) {}
 
+/// Advance the flash backend's background DMA save across a timer tick.
+/// Called from the guest-path IRQ body right after the completion
+/// dispatch above, which only *issues* the save's CMD12; the card's
+/// program-time wait is stepped here instead of busy-waiting in the
+/// completion IRQ. A no-op unless a save is mid-`WaitBusy`, and a no-op
+/// for backends without an async DMA save.
+#[inline]
+pub fn poll_dma_save() {
+    crate::host::flash_persist::poll_dma_save();
+}
+
 /// Slim USB interrupt-IN fast path (real-hw touchscreen). The IRQ-driven
 /// DWC2 channel re-arms every frame, so source 9 fires at up to ~1 kHz
 /// (mostly NAKs) — far above the ~62 Hz the heavy guest-IRQ body is

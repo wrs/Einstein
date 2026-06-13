@@ -66,6 +66,7 @@ pub fn vic_raw_summary() -> (u32, u32) {
 // pays for a value that only diagnostics would consume.
 // ---------------------------------------------------------------------
 
+
 #[cfg(not(nh_diag))]
 pub mod guest_bp {
     //! Stub: no guest breakpoints without `diag`.
@@ -103,9 +104,12 @@ pub mod heap_check {
     #[inline(always)]
     pub fn log_heap_bounds_once() {}
 
-    #[cfg(feature = "log_store")]
+    /// No `newton-objects` without `diag`: the notify probes' args
+    /// render as the raw Ref word instead of a pretty-printed frame.
     #[inline(always)]
-    pub fn pretty_print_ref_inline(_ref_value: u32, _depth: u32) {}
+    pub fn pretty_print_ref_inline(ref_value: u32, _depth: u32) {
+        crate::kprint!("#{:x}", ref_value);
+    }
 }
 
 #[cfg(not(nh_diag))]
@@ -158,6 +162,9 @@ pub mod task_dump {
 
     use crate::arch::trap_context::TrapContext;
 
+    /// Stub: no task census without `diag`.
+    #[inline(always)]
+    pub fn dump() {}
     /// Never fires a dump.
     #[inline(always)]
     pub fn periodic(_ctx: &TrapContext) -> bool {

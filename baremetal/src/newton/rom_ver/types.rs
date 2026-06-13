@@ -209,3 +209,15 @@ pub struct KernelGlobals {
     /// `gStackManagerHeap` literal; TStackManager* is at `+4`.
     pub stack_mgr_heap_literal: u32,
 }
+
+/// Notification entry probes: `Notify(RefVar const&)`,
+/// `ErrorNotify(long, long)`, `ActionErrorNotify(long, long)` — the
+/// three ROM entry points into `DoMessage(gRootView, 'notify, …)`.
+/// Always installed: on-screen notices are otherwise invisible on a
+/// headless capture.
+#[derive(Copy, Clone)]
+pub struct NotifySites {
+    pub notify: ProbeSite,
+    pub error_notify: ProbeSite,
+    pub action_error_notify: ProbeSite,
+}

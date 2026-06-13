@@ -161,6 +161,18 @@ pub enum HvcImm {
     /// via `newton-objects`, emulates `r0 = r4`, and advances ELR
     /// so the epilogue's `ldmdb` returns the same Ref to the caller.
     LoadPermObjRet,
+    /// Entry probe at `Notify(RefVar const&)` (ROM 0x0014_6584):
+    /// the NewtonScript-level notification path (`DoMessage(gRootView,
+    /// 'notify, args)`). Replaces the first insn `mov r2, r0`; the
+    /// handler pretty-prints the args Ref (`[type, title, text]`) so
+    /// on-screen notices reach the serial log, then emulates the mov.
+    NotifyEntry,
+    /// Entry probe at `ErrorNotify(long err, long id)` (ROM
+    /// 0x0014_65A4). Replaces `mov ip, sp`; handler prints both ints.
+    ErrorNotifyEntry,
+    /// Entry probe at `ActionErrorNotify(long err, long id)` (ROM
+    /// 0x0014_6648). Same shape as `ErrorNotifyEntry`.
+    ActionErrorNotifyEntry,
 }
 
 impl HvcImm {

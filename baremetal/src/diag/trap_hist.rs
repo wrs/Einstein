@@ -432,6 +432,9 @@ fn hvc_imm_name(imm: u32) -> &'static str {
         v if v == HvcImm::HammerExceptionNotify as u32 => "HammerExceptionNotify",
         v if v == HvcImm::StorePermObjEntry as u32 => "StorePermObjEntry",
         v if v == HvcImm::LoadPermObjRet as u32 => "LoadPermObjRet",
+        v if v == HvcImm::NotifyEntry as u32 => "NotifyEntry",
+        v if v == HvcImm::ErrorNotifyEntry as u32 => "ErrorNotifyEntry",
+        v if v == HvcImm::ActionErrorNotifyEntry as u32 => "ActionErrorNotifyEntry",
         _ => "?",
     }
 }

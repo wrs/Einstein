@@ -388,6 +388,46 @@ unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
         // `gREPout->{Print,Putc,Flush,StackTrace,ExceptionNotify}`
         // call into the EL2 UART. Always on (no feature gate).
         apply_pouttranslator_patches(rom_ptr);
+        // Notification entry probes: every on-screen notice
+        // (`Notify` / `ErrorNotify` / `ActionErrorNotify`) is echoed
+        // to the EL2 UART. Always on, like the REP output above.
+        apply_notify_probes(rom_ptr);
+    }
+}
+
+/// Install the notification entry probes (`rom_ver::NOTIFY_PROBES`):
+/// `Notify(RefVar const&)`'s first insn (`mov r2, r0`) and the
+/// `mov ip, sp` prologues of `ErrorNotify` / `ActionErrorNotify` become
+/// HVCs. The handlers print the notice's args and emulate the displaced
+/// instruction, so the dialog still appears on screen exactly as before
+/// — the probe only adds a `notify:` line on serial, which is how a
+/// headless power-cycle loop can tell a "clean" boot from one that put
+/// up an error notice (e.g. an unexpected REx dialog).
+unsafe fn apply_notify_probes(rom_ptr: *mut u32) {
+    let Some(sites) = rom_ver::NOTIFY_PROBES else {
+        return;
+    };
+    for (site, imm, name) in [
+        (sites.notify, HvcImm::NotifyEntry, "Notify entry probe"),
+        (sites.error_notify, HvcImm::ErrorNotifyEntry, "ErrorNotify entry probe"),
+        (sites.action_error_notify, HvcImm::ActionErrorNotifyEntry, "ActionErrorNotify entry probe"),
+    ] {
+        let insn = imm.insn();
+        unsafe {
+            install_patch(
+                rom_ptr,
+                site.pc,
+                WordKind::Code,
+                Some(site.orig_insn),
+                &[insn],
+                /*optional=*/ false,
+                name,
+            );
+        }
+        kprintln!(
+            "rom_patch: {:#010x}: {:#010x} -> {:#010x}  ({}, HVC #{:#x})",
+            site.pc, site.orig_insn, insn, name, imm as u32,
+        );
     }
 }
 

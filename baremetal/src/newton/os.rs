@@ -947,6 +947,34 @@ impl GuestOs for NewtonOs {
                     spsr: spsr_und,
                 }
             }
+            // Notification entry probes — reached here for USR-mode
+            // callers (the NewtonScript runtime); SVC callers take the
+            // direct HVC dispatch. Emulate the displaced instruction and
+            // resume past it.
+            _ if insn == HvcImm::NotifyEntry.insn() => {
+                probes::handle_notify_probe(ctx);
+                ctx.x[2] = ctx.x[0]; // displaced `mov r2, r0`
+                UndHvcOutcome::Resume {
+                    pc: (faulting_pc + 4) as u64,
+                    spsr: spsr_und,
+                }
+            }
+            _ if insn == HvcImm::ErrorNotifyEntry.insn()
+                || insn == HvcImm::ActionErrorNotifyEntry.insn() =>
+            {
+                let what = if insn == HvcImm::ErrorNotifyEntry.insn() {
+                    "ErrorNotify"
+                } else {
+                    "ActionErrorNotify"
+                };
+                probes::handle_error_notify_probe(ctx, what);
+                // displaced `mov ip, sp`
+                ctx.x[12] = crate::arch::banked::sp_for_mode(ctx, spsr_und as u32) as u64;
+                UndHvcOutcome::Resume {
+                    pc: (faulting_pc + 4) as u64,
+                    spsr: spsr_und,
+                }
+            }
             // StorePermObject entry probe — first instruction (`mov ip,
             // sp`) was replaced with HVC. Reached here when StorePermObject
             // is called from USR mode (the typical NS-runtime path);
@@ -1033,6 +1061,23 @@ impl GuestOs for NewtonOs {
             }
             v if v == HvcImm::DahMrsSpsr as u32 => {
                 probes::handle_dah_mrs_spsr_patch(ctx);
+            }
+            v if v == HvcImm::NotifyEntry as u32 => {
+                probes::handle_notify_probe(ctx);
+                ctx.x[2] = ctx.x[0]; // displaced `mov r2, r0`; ELR already advanced
+            }
+            v if v == HvcImm::ErrorNotifyEntry as u32
+                || v == HvcImm::ActionErrorNotifyEntry as u32 =>
+            {
+                let what = if v == HvcImm::ErrorNotifyEntry as u32 {
+                    "ErrorNotify"
+                } else {
+                    "ActionErrorNotify"
+                };
+                probes::handle_error_notify_probe(ctx, what);
+                // displaced `mov ip, sp` (R12 = SP of the source mode)
+                let spsr_el2 = read_sysreg!("spsr_el2") as u32;
+                ctx.x[12] = crate::arch::banked::sp_for_mode(ctx, spsr_el2) as u64;
             }
             #[cfg(feature = "log_store")]
             v if v == HvcImm::StorePermObjEntry as u32 => {

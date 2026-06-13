@@ -191,6 +191,15 @@ pub const STORE_PROBES: Option<StoreProbeSites> = Some(StoreProbeSites {
     load_perm_ret:    ProbeSite { pc: 0x002D_F4C0, orig_insn: 0xE1A0_0004 },
 });
 
+/// Notification entry probes (see `rom_patches::apply_notify_probes`).
+/// Originals: `mov r2, r0` (Notify's first insn) and `mov ip, sp`
+/// prologues ×2 — verified against rom.dis.
+pub const NOTIFY_PROBES: Option<NotifySites> = Some(NotifySites {
+    notify:              ProbeSite { pc: 0x0014_6584, orig_insn: 0xE1A0_2000 },
+    error_notify:        ProbeSite { pc: 0x0014_65A4, orig_insn: 0xE1A0_C00D },
+    action_error_notify: ProbeSite { pc: 0x0014_6648, orig_insn: 0xE1A0_C00D },
+});
+
 /// The kernel's `DataAbortHandler` entry VA — the original target of
 /// the ROM's VA 0x10 branch before our DABT trampoline insertion.
 /// Routine faults (translation / permission / access-flag) are

@@ -86,6 +86,9 @@ pub(crate) fn handle_bootos_canary(ctx: &mut TrapContext) {
     kprintln!(
         "  the reset vector at VA 0."
     );
+    // Who asked for the reset: the task census names the current task
+    // and gives its user-mode backtrace (the Reboot SWI's caller).
+    crate::diag::task_dump::dump();
     cpu::halt();
 }
 
@@ -174,6 +177,37 @@ pub(crate) fn handle_hammer_thunk(ctx: &mut TrapContext, kind: ThunkKind) {
             ctx.x[0] = ctx.x[1];
         }
     }
+}
+
+// ---- Notification probes ----
+
+/// `Notify(RefVar const&)` entry: r0 → RefVar → Ref of the args the
+/// ROM is about to send as `'notify` to the root view (an array
+/// `[type, title, text]`). Pretty-print it with enough depth to show
+/// the strings, so the on-screen notice is readable on serial. The
+/// caller emulates the displaced `mov r2, r0`.
+pub(crate) fn handle_notify_probe(ctx: &mut TrapContext) {
+    let refvar_ptr = ctx.x[0] as u32;
+    let slot_ptr = crate::hv::guest_endian::guest_read_u32_va(refvar_ptr).unwrap_or(0);
+    let ref_value = if slot_ptr != 0 {
+        crate::hv::guest_endian::guest_read_u32_va(slot_ptr).unwrap_or(0)
+    } else {
+        0
+    };
+    crate::kprint!("notify: ");
+    crate::diag::heap_check::pretty_print_ref_inline(ref_value, 3);
+    kprintln!("  lr={:#x}", ctx.x[14] as u32);
+}
+
+/// `ErrorNotify` / `ActionErrorNotify` entry: `(long err, long id)`
+/// in r0/r1 — the ROM wraps both as integer Refs into a `'notify`
+/// array. Print them as signed so Newton error codes read naturally.
+/// The caller emulates the displaced `mov ip, sp`.
+pub(crate) fn handle_error_notify_probe(ctx: &mut TrapContext, what: &'static str) {
+    kprintln!(
+        "notify: {}(err={}, id={})  lr={:#x}",
+        what, ctx.x[0] as u32 as i32, ctx.x[1] as u32 as i32, ctx.x[14] as u32,
+    );
 }
 
 // ---- Remember post-SWI fixup (load-bearing, not a probe) ----

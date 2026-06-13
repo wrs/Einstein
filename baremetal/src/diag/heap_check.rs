@@ -182,7 +182,6 @@ fn force_interpreter_trace_on() {
 // Per recursion level we read a fresh 256-byte buffer from guest
 // memory (≈ stack budget); keep `depth` ≤ 4.
 
-#[cfg(feature = "log_store")]
 /// Pretty-print a NewtonScript Ref inline — no label, no trailing
 /// newline — with `depth` levels of structural expansion (default
 /// 0 — pointers render as `#hex`). Use to compose probe headers
@@ -192,7 +191,6 @@ pub fn pretty_print_ref_inline(ref_value: u32, depth: u32) {
     write_ref(ref_value, depth);
 }
 
-#[cfg(feature = "log_store")]
 fn write_ref(ref_value: u32, depth: u32) {
     use newton_objects::{Ref, RefKind};
     let r = Ref(ref_value);
@@ -213,7 +211,6 @@ fn write_ref(ref_value: u32, depth: u32) {
     }
 }
 
-#[cfg(feature = "log_store")]
 /// Object header: high 24 bits of word 0 = size (bytes incl. header
 /// + class/map + body), low 8 bits = flags (`0x01` = slotted,
 /// `0x02` = frame, `0x40` = base bit, GC bits in the high nibble).
@@ -228,21 +225,16 @@ fn read_obj_header(addr: u32) -> Option<(u32 /*size*/, u8 /*flags*/, u32 /*class
     Some((size, flags, class))
 }
 
-#[cfg(feature = "log_store")]
 const KOBJ_SLOTTED: u8 = 0x01;
-#[cfg(feature = "log_store")]
 const KOBJ_FRAME: u8 = 0x02;
-#[cfg(feature = "log_store")]
 /// Forwarding-pointer flag in the header byte. The "object" is a
 /// 12-byte stub: header + (unused) word + the forwarding Ref at
 /// the slot normally used for class/map. Newton emits these when
 /// it relocates an object during GC/compaction so existing Refs
 /// to the old address keep resolving via one extra hop.
 const KOBJ_FORWARDED: u8 = 0x20;
-#[cfg(feature = "log_store")]
 const MAX_FORWARD_HOPS: u32 = 8;
 
-#[cfg(feature = "log_store")]
 /// Render the pointee of a pointer Ref. Reads the object header
 /// directly from guest memory (one word at a time) instead of
 /// buffering the whole body, so arbitrarily-sized objects (fault
@@ -332,7 +324,6 @@ fn write_pointee(addr: u32, ref_value: u32, depth: u32) {
     crate::kprint!("{}", close);
 }
 
-#[cfg(feature = "log_store")]
 /// Binary body. Symbols (class == `kSymbolClass` = 0x55552) →
 /// `'name`. Strings (class is a pointer to the symbol `'string`)
 /// → `"text"`. Anything else → `<bin 'classname N bytes>` (or
@@ -363,7 +354,6 @@ fn write_binary_at(addr: u32, ref_value: u32, size: u32, class_ref: u32) {
     }
 }
 
-#[cfg(feature = "log_store")]
 /// Symbol body layout: 4-byte hash at +12, NUL-terminated UTF-8
 /// name at +16. Read up to a small fixed cap (symbols are short).
 fn write_symbol_name_at(addr: u32, size: u32, ref_value: u32) {
@@ -387,7 +377,6 @@ fn write_symbol_name_at(addr: u32, size: u32, ref_value: u32) {
     }
 }
 
-#[cfg(feature = "log_store")]
 /// Read the first chunk of a `'string` body and emit it as
 /// `"text"`, decoding UCS-2 BE word-by-word so we don't depend on
 /// the full body fitting in a buffer. Caps at MAX_CHARS units.
@@ -418,7 +407,6 @@ fn write_string_body_at(addr: u32, size: u32) {
     crate::kprint!("\"");
 }
 
-#[cfg(feature = "log_store")]
 /// Diagnostic emission when a pointer Ref's pointee can't be
 /// recognized: prints `<? #ref [w0 w1 w2 w3 w4 w5 w6 w7]>` with
 /// the first 8 words at `addr` so the caller can eyeball the raw
@@ -439,7 +427,6 @@ fn write_squirrely_at(addr: u32, ref_value: u32) {
 }
 
 
-#[cfg(feature = "log_store")]
 fn write_string_char(c: u16) {
     let cu = c as u32;
     if c == b'\\' as u16 {
@@ -453,7 +440,6 @@ fn write_string_char(c: u16) {
     }
 }
 
-#[cfg(feature = "log_store")]
 fn write_char_literal(c: u16) {
     let cu = c as u32;
     if (0x20..0x7f).contains(&cu) {
@@ -463,7 +449,6 @@ fn write_char_literal(c: u16) {
     }
 }
 
-#[cfg(feature = "log_store")]
 /// Follow forwarding pointers starting at `addr`, returning the
 /// (final-address, size, flags, class_or_map) of the underlying
 /// non-forwarded object, or `None` if the chain breaks (unreadable
@@ -481,7 +466,6 @@ fn resolve_forwarding(addr: u32) -> Option<(u32, u32, u8, u32)> {
     None
 }
 
-#[cfg(feature = "log_store")]
 /// Read a symbol's name bytes via direct guest reads (forwarding-
 /// aware). Returns the number of bytes written into `out`, or 0 if
 /// `r` isn't a pointer Ref, the chain isn't a binary with class
@@ -505,7 +489,6 @@ fn read_symbol_name_into(r: newton_objects::Ref, out: &mut [u8]) -> usize {
     out[..name_bytes].iter().position(|&b| b == 0).unwrap_or(name_bytes)
 }
 
-#[cfg(feature = "log_store")]
 /// Resolve the symbol name for frame slot `slot_idx` by walking
 /// the map chain rooted at `map_ref_value`. Writes the symbol's
 /// name bytes into `out`; returns 0 on any failure (NIL map,

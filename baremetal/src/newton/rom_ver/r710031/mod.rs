@@ -66,6 +66,7 @@ pub const FDATE_FROM_SECONDS: Option<InjectionSite> = None;
 pub const INSN_AS_DATA_LDRS: &[InsnAsDataLdr] = &[];
 pub const FPE_LDRS: Option<FpeLdrSites> = None;
 pub const STORE_PROBES: Option<StoreProbeSites> = None;
+pub const NOTIFY_PROBES: Option<NotifySites> = None;
 pub const DATA_ABORT_HANDLER_VA: Option<u32> = None;
 pub const FPE_JT_VA: Option<u32> = None;
 pub const KERNEL_GLOBALS: Option<KernelGlobals> = None;

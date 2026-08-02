@@ -45,10 +45,9 @@
 //! behaviour; we don't have a modeled backend for IR / modem / sound
 //! DMA yet. Crucially we *don't* synthesise a completion IRQ on the
 //! enable-register write: doing so caused a FIQ runaway when the
-//! kernel re-armed channel 0 from inside the FIQ handler (the IRQ we
+//! kernel re-armed channel 0 from inside the FIQ handler (the IRQ
 //! raised on the re-arm immediately re-took the FIQ before it could
-//! exit). See commit message of `f5944dcd5`'s parent for the
-//! diagnostic chain.
+//! exit).
 
 use core::cell::UnsafeCell;
 

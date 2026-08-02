@@ -5,11 +5,10 @@
 //! - [`sdhost`] — bare-metal driver for the BCM2835 SDHOST
 //!   controller. Polled mode, no IRQ, no DMA. 512-byte single-block
 //!   read/write.
-//! - `mbr` (planned) — parse the MBR partition table, expose
-//!   partition 1 (the FAT32 boot partition we already have) as a
-//!   partition-relative block device.
-//! - `block_device` (planned) — adapt the SDHOST + MBR layers to
-//!   `embedded_sdmmc::BlockDevice`.
+//! - [`block_device`] — adapts the SDHOST driver to
+//!   `embedded_sdmmc::BlockDevice`. MBR and FAT parsing come from
+//!   the vendored `embedded-sdmmc`, which reaches partition 1 (the
+//!   FAT32 boot partition) through this impl.
 //! - Consumers: `flash_persist::sd` (Phase 2 of the real-hardware
 //!   bring-up) and eventually `snapshot::sd` (Phase 3).
 //!

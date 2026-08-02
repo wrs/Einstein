@@ -14,7 +14,7 @@
 //!         ↓ schedule_output: read guest buffer, 2× upsample (S&H)
 //!         ↓                 + duplicate to stereo
 //!   LE-S16 stereo @ 44.1 kHz, in a host RING buffer
-//!         ↓ pump: SPDIF-encode (24-bit shift + parity)
+//!         ↓ refill_mai_dma_ring: SPDIF-encode (24-bit shift + parity)
 //!   IEC 60958 subframes, in the DMA TX ring
 //!         ↓ cyclic DMA (channel 4, DREQ 17) → MAI_DATA register
 //!         ↓ VC4 hardware
@@ -34,7 +34,8 @@
 //! MAI_DATA is fed by a cyclic BCM2835 DMA chain (channel 4, paced
 //! by DREQ 17), the same shape as Circle's
 //! `hdmisoundbasedevice.cpp` and Linux's dmaengine cyclic transfer.
-//! `pump()` (called from the trap-IRQ and sync-trap tails) only
+//! `refill_mai_dma_ring()` (called from the DMA period-completion IRQ
+//! and from `schedule_output`) only
 //! SPDIF-encodes ring frames into the DMA TX ring; the hardware
 //! drains it without CPU involvement, so a quiet stretch of the
 //! guest can't underrun the FIFO as long as the ring holds encoded
@@ -357,12 +358,12 @@ const fn hdmi_acr_n() -> u32 {
 
 /// Ring capacity in stereo frames. Newton ping-pongs two 1872-sample
 /// buffers — at the 2× upsample to 44.1 kHz that's 7488 frames total
-/// queued before our pump has drained the first half. 8192 frames
-/// (~186 ms) gives enough headroom for the full ping-pong without
-/// overrun. Power-of-two for cheap modulo with `& MASK`. (16384 was
-/// tried earlier and produced intermittent boot hangs that we
-/// suspected were BSS-layout-related; 8192 is the minimum that fits
-/// the ping-pong cleanly.)
+/// queued before `refill_mai_dma_ring` has drained the first half.
+/// 8192 frames (~186 ms) gives enough headroom for the full ping-pong
+/// without overrun. Power-of-two for cheap modulo with `& MASK`.
+/// (16384 produces intermittent boot hangs, suspected to be
+/// BSS-layout-related; 8192 is the minimum that fits the ping-pong
+/// cleanly.)
 const RING_FRAMES: usize = 8192;
 const RING_MASK: usize = RING_FRAMES - 1;
 
@@ -370,8 +371,8 @@ const RING_MASK: usize = RING_FRAMES - 1;
 
 /// One stereo frame in the ring: lower 16 bits = left, upper = right.
 /// Stored as LE-S16 already byte-swapped from Newton's BE-S16; the
-/// SPDIF encoder in `pump` shifts each channel up into the subframe
-/// payload position.
+/// SPDIF encoder in `refill_mai_dma_ring` shifts each channel up into
+/// the subframe payload position.
 #[repr(transparent)]
 #[derive(Copy, Clone, Default)]
 struct StereoFrame(u32);
@@ -382,8 +383,9 @@ struct RingState {
     head: AtomicU32,
     /// Consumer index (frames played, monotonic).
     tail: AtomicU32,
-    /// `schedule_output` writes encoded stereo frames here; `pump`
-    /// pulls them out and pushes to MAI_DATA. `UnsafeCell` because the
+    /// `schedule_output` writes encoded stereo frames here;
+    /// `refill_mai_dma_ring` pulls them out and SPDIF-encodes them into
+    /// the DMA TX ring. `UnsafeCell` because the
     /// producer writes individual slots through a `*mut` derived from a
     /// shared `&RingState` — plain (non-`UnsafeCell`) interior mutation
     /// through a shared reference is UB under Rust's aliasing model.
@@ -393,7 +395,8 @@ struct RingState {
 }
 
 // SAFETY: single-CPU EL2; producer (schedule_output) and consumer
-// (pump) are serialised by EL2 trap context and by the head/tail
+// (refill_mai_dma_ring) are serialised by EL2 trap context and by the
+// head/tail
 // ordering, the same as the `MaiTxRing` Sync rationale below.
 unsafe impl Sync for RingState {}
 
@@ -411,7 +414,8 @@ static OUTPUT_RUNNING: AtomicBool = AtomicBool::new(false);
 static OUTPUT_INT_MASK: AtomicU32 = AtomicU32::new(0);
 static INPUT_INT_MASK: AtomicU32 = AtomicU32::new(0);
 /// CNTPCT_EL0 timestamp of the last `vic::raise(output_mask)` in
-/// `pump`. Zero before the first IRQ. Rate-limit floor for the
+/// `maybe_raise_watermark_irq`. Zero before the first IRQ. Rate-limit
+/// floor for the
 /// level-triggered nudge below.
 ///
 /// The nudge is LEVEL-triggered, matching Einstein's CoreAudio
@@ -425,14 +429,11 @@ static INPUT_INT_MASK: AtomicU32 = AtomicU32::new(0);
 /// `else if (mOutputIsRunning) StopOutput();`) or calls subfn 0x0F
 /// directly.
 ///
-/// History: an earlier revision made this edge-triggered (one IRQ
-/// per `schedule_output`) because level-triggering appeared to trap
-/// `sndm` in an IRQ storm. The real defect then was that zero-size
-/// schedules were silently ignored, so `OUTPUT_RUNNING` never
-/// dropped and the nudges genuinely never stopped. With the
-/// zero-size → `stop_output` translation in place the oracle's
-/// level-triggered contract is the correct one; the edge gate
-/// instead starved the kernel of the post-drain IRQ it needs to
+/// Level-triggering depends on that zero-size → `stop_output`
+/// translation: ignore zero-size schedules and `OUTPUT_RUNNING` never
+/// drops, the nudges never stop, and `sndm` sits in an IRQ storm.
+/// Gating to edge-triggered (one IRQ per `schedule_output`) is not the
+/// fix for that — it starves the kernel of the post-drain IRQ it needs to
 /// notice a finished clip (the "sndm wedge after the last buffer").
 static LAST_IRQ_TICKS: AtomicU64 = AtomicU64::new(0);
 
@@ -456,8 +457,8 @@ static LAST_IRQ_TICKS: AtomicU64 = AtomicU64::new(0);
 //   * Each CB sets `TI.INTEN`, so the BCM2835 IRQ controller fires
 //     once per period completion. The IRQ handler does NOT advance
 //     any DMA pointer — that's hardware's job via the chain. It
-//     just increments our consumer counter so `pump` knows how
-//     much of the ring is safe to overwrite.
+//     just increments our consumer counter so `refill_mai_dma_ring`
+//     knows how much of the ring is safe to overwrite.
 //   * Single-word transfers (no BURST flag), matching the bare
 //     `dmas = <&dma 17>` DT cookie Linux builds the TI from.
 //
@@ -484,7 +485,7 @@ const MAI_TX_RING_LEN: usize = N_PERIODS * PERIOD_SLOTS;
 #[repr(C, align(64))]
 struct MaiTxRing(core::cell::UnsafeCell<[u32; MAI_TX_RING_LEN]>);
 
-// SAFETY: single-CPU EL2; the producer (pump from trap-tail) and
+// SAFETY: single-CPU EL2; the producer (refill_mai_dma_ring) and
 // consumer (DMA + on_mai_dma_done) are serialised by EL2 trap
 // context, the same as the stereo `RingState` above.
 unsafe impl Sync for MaiTxRing {}
@@ -503,17 +504,18 @@ static mut MAI_TX_CBS: MaiCbChain =
 /// Producer cursor in subframes since cyclic-DMA arm. Monotonic u64
 /// (wraps in practice never — 2^64 subframes is millions of years
 /// of audio). Ring index = `(MAI_TX_HEAD.load() % MAI_TX_RING_LEN) as usize`.
-/// Advanced only by `pump` after it writes new content.
+/// Advanced only by `refill_mai_dma_ring` after it writes new content.
 static MAI_TX_HEAD: AtomicU64 = AtomicU64::new(0);
 
 /// Count of period-completion IRQs received since cyclic DMA was
 /// armed. Each IRQ means "the period the DMA *just finished* is now
-/// safe for `pump` to overwrite." The consumer cursor (in subframes)
+/// safe for `refill_mai_dma_ring` to overwrite." The consumer cursor (in subframes)
 /// is `MAI_PERIODS_DONE * PERIOD_SLOTS`. Monotonic u64 — same
 /// rationale as `MAI_TX_HEAD` for not worrying about wrap.
 static MAI_PERIODS_DONE: AtomicU64 = AtomicU64::new(0);
 
-/// True once the cyclic chain has been armed. Before this, `pump`
+/// True once the cyclic chain has been armed. Before this,
+/// `refill_mai_dma_ring`
 /// is a no-op for the DMA side — only the stereo→MAI staging code
 /// runs (which is harmless because nothing reads the ring).
 static MAI_CYCLIC_ARMED: AtomicBool = AtomicBool::new(false);
@@ -631,7 +633,8 @@ pub fn init() {
     // Bring up the BCM2835 DMA channel that feeds MAI_DATA paced by
     // DREQ 17. Failure (channel not firmware-enabled) leaves
     // `host_dma::is_mai_ready()` false; the cyclic-arm step below
-    // bails too and pump becomes a silent no-op for DMA — the wire
+    // bails too and `refill_mai_dma_ring` becomes a silent no-op for
+    // DMA — the wire
     // stays silent but the rest of the hypervisor runs.
     if !crate::host::host_dma::init_mai_tx() {
         kprintln!(
@@ -641,7 +644,8 @@ pub fn init() {
     }
     // Build the cyclic CB chain and arm DMA. After this returns
     // true, the DMA controller is running forever, feeding the MAI
-    // FIFO at DREQ-paced wire rate. `pump` thereafter only refreshes
+    // FIFO at DREQ-paced wire rate. `refill_mai_dma_ring` thereafter
+    // only refreshes
     // the ring contents (real audio over silence, silence over
     // silence) ahead of the consumer pointer.
     if mai_dma_init_cyclic() {
@@ -693,14 +697,15 @@ pub fn start_output() {
     // between sounds) causes the HDMI receiver to renegotiate the
     // audio capability of the link, which on the touchscreen-panel
     // we target manifests as a full panel boot — see the
-    // doc-comment on `stop_output` for the symptom chain. `pump`
+    // doc-comment on `stop_output` for the symptom chain.
+    // `refill_mai_dma_ring`
     // keeps the MAI FIFO continuously fed (real samples while
     // OUTPUT_RUNNING is true, silence padding otherwise) so we
     // never need to toggle ENABLE to stop audible playback.
 }
 
 /// Subfn 0x0F. The Newton kernel calls this between sound clips. We
-/// drop OUTPUT_RUNNING so the watermark-IRQ logic in `pump` stops
+/// drop OUTPUT_RUNNING so `maybe_raise_watermark_irq` stops
 /// nudging the kernel, and we discard any unplayed stereo samples
 /// (the kernel will queue fresh ones for the next clip). We
 /// deliberately do NOT clear `MAI_CTL.ENABLE` or assert RESET: doing
@@ -708,8 +713,8 @@ pub fn start_output() {
 /// receiver to renegotiate, which on the touchscreen-panel target
 /// reboots the whole panel (and its USB-attached touchscreen, hence
 /// the dwc2 XACT_ERR storm that follows). `bringup_mai` set ENABLE
-/// once at init time and leaves it on; `pump` keeps the MAI FIFO
-/// fed with silence between clips so the wire stays continuous.
+/// once at init time and leaves it on; `refill_mai_dma_ring` keeps the
+/// MAI FIFO fed with silence between clips so the wire stays continuous.
 pub fn stop_output() {
     OUTPUT_RUNNING.store(false, Ordering::Release);
     // Drop any in-flight samples — start fresh on the next clip.
@@ -744,7 +749,8 @@ pub fn schedule_output(which: u32, byte_count: u32) {
     // return. The IRQ is NOT raised here (note Einstein's explicit
     // commented-out `// RaiseOutputInterrupt();` at line 271) — IRQ
     // generation is the consumer's job, fired from the playback
-    // side (our `pump`) when the buffer is running low.
+    // side (our `maybe_raise_watermark_irq`) when the buffer is
+    // running low.
     if byte_count == 0 {
         // Einstein's null/PulseAudio backends treat a zero-size schedule
         // as the end of the current output run. Keep HDMI MAI physically
@@ -1666,9 +1672,9 @@ fn bringup_mai() -> bool {
             (2u32 << MAI_CTL_CHNUM_SHIFT) | MAI_CTL_WHOLSMP | MAI_CTL_CHALIGN | MAI_CTL_ENABLE;
 
         // `vc4_hdmi_audio_startup` — RESET + FLUSH + DLATE + error
-        // masking. Both Linux (vc4_hdmi.c:2505) and Circle
-        // (hdmisoundbasedevice.cpp:388) include DLATE here; previous
-        // comment claimed it was per-frame-only, which was wrong.
+        // masking. DLATE belongs here, not per-frame: both Linux
+        // (vc4_hdmi.c:2505) and Circle (hdmisoundbasedevice.cpp:388)
+        // include it in this write.
         write_volatile(
             HDMI_MAI_CTL as *mut u32,
             MAI_CTL_RESET | MAI_CTL_FLUSH | MAI_CTL_DLATE | MAI_CTL_ERRORE | MAI_CTL_ERRORF,

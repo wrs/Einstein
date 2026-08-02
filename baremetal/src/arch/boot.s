@@ -91,9 +91,9 @@ _start:
     isb
 
     // Program CNTFRQ_EL0 while we're at the highest implemented EL.
-    // With has_el3=1 that's EL3; EL2 can only read CNTFRQ_EL0, not
-    // write it, so the previous no-EL3 fixup in fvp_base.rs is now
-    // ineffective (and UNDEFs if attempted from EL2). FVP models the
+    // With has_el3=1 that's EL3, and it has to happen here: EL2 can
+    // only read CNTFRQ_EL0, not write it (an EL2-side write UNDEFs),
+    // so `fvp_base::init_cpu_sysregs` can't do it. FVP models the
     // generic timer at 100 MHz of wall time.
     mov     x10, #0
     movk    x10, #0x05f5, lsl #16

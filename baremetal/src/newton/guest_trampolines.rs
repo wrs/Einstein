@@ -41,12 +41,11 @@ use super::rom_ver;
 /// can't plausibly touch. A 64-byte ROM region this deep is free
 /// game for us. The vector at VA 0x04 branches to it.
 ///
-/// An earlier iteration parked the body at ROM offset 0x80 (inside
-/// the 256-byte header that reads as zeros in the raw dump). That
-/// broke boot: the 717006 kernel reads that region as a table, so
-/// turning zeros into instructions shifted the DABT/PABT loop the
-/// boot gets stuck in. Moving the body far beyond the REx tail
-/// avoids any such aliasing.
+/// It must not sit at ROM offset 0x80 (inside the 256-byte header
+/// that reads as zeros in the raw dump) even though that region also
+/// looks free: the 717006 kernel reads it as a table, so turning
+/// those zeros into instructions breaks the boot. Only placement far
+/// beyond the REx tail avoids that aliasing.
 ///
 /// Trampoline body:
 ///   +0x00: ee0dcf50  mcr p15,0,r12,c13,c0,2 ; TPIDRURW <- R12 (save orig R12)
@@ -502,7 +501,7 @@ pub unsafe fn patch_dabt_vector(rom_ptr: *mut u32) {
 ///   ft+10: and r1, r1, r0            ; r1 &= mask
 ///   ft+11: ldr r0, [pc, #L_C7_PATT]  ; r0 = 0x0E07_0F10
 ///   ft+12: teq r1, r0
-///   ft+13: beq C7_NOOP               ; → ft+34
+///   ft+13: beq C7_NOOP               ; → ft+35
 ///   ; existing DFSC dispatch
 ///   ft+14: mrc p15,0,r0,c5,c0,0      ; R0 = DFSR
 ///   ft+15: and r0, r0, #0xF          ; R0 = DFSC[3:0]
@@ -673,13 +672,13 @@ pub unsafe fn install_dabt_fast_trampoline(rom_ptr: *mut u32, dah_va: u32) {
 /// trampolines non-overlapping; the stub is 3 words (12 bytes) so it
 /// ends at 0x00FF_FFF0, still inside ROM.
 ///
-/// Prior layout placed the stub at 0x00FF_FFE0, which coincided
-/// byte-for-byte with the DABT-trampoline's literal slot. On QEMU
-/// raspi3b the clobbered first word (0x0400_5FA0 / 0x0C00_4FA0, written
-/// by `install_und_vector_swap_*`) happened to decode as an
-/// EQ-conditional LDC that the TCG model treated as a NOP. On FVP Base
-/// RevC the same encoding raises an UNDEFINED exception, so the UND
-/// return path halted with an "unrecognised UND" in early boot.
+/// The overlap matters even when it looks harmless: at 0x00FF_FFE0 the
+/// stub coincides byte-for-byte with the DABT-trampoline's literal
+/// slot, and the clobbered first word (0x0400_5FA0 / 0x0C00_4FA0,
+/// written by `install_und_vector_swap_*`) decodes as an
+/// EQ-conditional LDC. QEMU raspi3b's TCG model treats that as a NOP;
+/// FVP Base RevC raises an UNDEFINED exception, so the UND return path
+/// halts with an "unrecognised UND" in early boot.
 pub const UND_RETURN_STUB_OFFSET: usize = rom_ver::ROM_TAIL.und_return_stub as usize;
 pub const UND_RETURN_STUB_VA: u32 = UND_RETURN_STUB_OFFSET as u32;
 /// Offset of the target-PC literal inside the stub (written by Rust

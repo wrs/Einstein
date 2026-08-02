@@ -11,6 +11,7 @@
 //!   0x06  TMainDisplayDriver::PowerOff      — r0 = 0
 //!   0x07  TMainDisplayDriver::Blit          — copy PixelMap into FB
 //!   0x08  TMainDisplayDriver::GetFeature    — returns per-feature id
+//!   0x09  TMainDisplayDriver::SetFeature    — r0 = 0
 //!   0x0A  TMainDisplayDriver::AutoAdjustFeatures — r0 = 0
 //!
 //! Unknown subfunctions halt loudly — the trip-wire for cases the
@@ -305,9 +306,9 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
     //
     // BE-32 word-invariant byte access: the Newton kernel writes
     // pixmap data as BE-32, so logical byte N at PA `p` lives at
-    // host PA `p ^ 3` (within each 4-byte word). Mirror the convention
-    // shadow_stub uses for in-guest LDRB (see `shadow_stub::XOR_LIMIT`
-    // and `shadow_stub::dispatch_byte_read`). The FB itself is
+    // host PA `p ^ 3` (within each 4-byte word). Same lane convention
+    // as the sub-word MMIO path in `hv::be8` (see `unxor_sub_word`
+    // and its `XOR_LIMIT`). The FB itself is
     // hypervisor-managed linear-LE — host byte N is pixel byte N in
     // display order — so FB writes don't XOR.
     let src_width_pixels = (src_right - src_left) as u32;
@@ -318,8 +319,8 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
     //   1 = "darken only" / pen overlay — final = max(src, dst) per
     //       pixel under our "0=white .. 3=black" convention. Used to
     //       draw ink over existing content without erasing surrounding
-    //       pixels. Any glyph blit issued with mode=1 that we treated
-    //       as srcCopy clears the rect around the ink.
+    //       pixels — treating a mode=1 glyph blit as srcCopy would
+    //       clear the rect around the ink.
     // Anything else falls back to srcCopy with a log.
     let mode = ctx_blit_mode(ctx, pc);
     if mode != 0 && mode != 1 {

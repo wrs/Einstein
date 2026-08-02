@@ -224,12 +224,6 @@ impl SdHost {
         // full save is ~3 minutes, which blocks EL2 long enough to
         // perturb the guest's timing assumptions during early boot.
         //
-        // The early CrcError we hit at 25 MHz turned out to be a
-        // FIFO-drain bug (DATA_FLAG vs FIFO_FILL) and a SDHCFG bit
-        // (DATA_IRPT_EN gating the FSM data path), both since
-        // fixed. Reads have been stable at 400 kHz across full and
-        // incremental saves; 25 MHz is the next variable to flip.
-        //
         // ACMD6 above handled the 4-bit switch.
         program_sdcdiv(core_clock, 25_000_000);
         // Boot-time summary of what bus we ended up on.

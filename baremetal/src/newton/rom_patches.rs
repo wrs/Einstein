@@ -43,12 +43,11 @@ use super::rom_ver;
 // FTimeInSeconds, FDateFromSeconds, ResolveFault wrapper, …) needs a
 // few words of guest-visible ROM space to hold its replacement-stub
 // body, and the kernel-patched BL/B site needs to know that stub's PC
-// to encode the redirect. Picking those PCs by hand is exactly how the
-// iter-87 wedge happened: a hand-picked FTIME_STUB_PC silently
-// overlapped the UND trampoline `patch_und_vector` writes, the
-// trampoline ran second, the stub was clobbered, and the kernel's
-// patched `b` fell into trampoline code mid-instruction-stream. Even
-// after that fix the audit found a second latent collision.
+// to encode the redirect. Picking those PCs by hand is how stubs
+// collide silently: a hand-picked FTIME_STUB_PC that overlaps the
+// region `patch_und_vector` writes gets clobbered when the trampoline
+// installs second, and the kernel's patched `b` then lands in
+// trampoline code mid-instruction-stream.
 //
 // The arena removes the manual address management entirely. Each
 // `apply_*` function calls `alloc_patch_stub(n)` at install time and
@@ -295,13 +294,13 @@ pub unsafe fn apply_rom_patches(rom_ptr: *mut u32) {
         #[cfg(nh_loud_halt_canaries)]
         apply_loud_halt_traps(rom_ptr);
         apply_bootos_trap(rom_ptr);
-        // Two NewStack/LockHeapRange wrapper strategies were tried and
-        // abandoned: a +4 KiB NewStack-size pad (overran the kernel's
-        // stack-pool slot stride → ResolveFault loop) and a 4-KiB-rounding
-        // LockHeapRange wrapper (pinned subpages owned by other
-        // stack_infos). Both lived in the wrong layer; the shipped fix is
-        // per-allocator (the ResolveFault whole-page bitmap + ZapHeap
-        // entries in `rom_ver::PATCHES`). Not reinstating either.
+        // Sub-page ownership is fixed per-allocator (the ResolveFault
+        // whole-page bitmap + ZapHeap entries in `rom_ver::PATCHES`),
+        // not by wrapping NewStack/LockHeapRange. A +4 KiB NewStack-size
+        // pad overruns the kernel's stack-pool slot stride (→
+        // ResolveFault loop), and a 4-KiB-rounding LockHeapRange wrapper
+        // pins subpages owned by other stack_infos; both sit in the
+        // wrong layer.
         apply_l1_cd_probes(rom_ptr);
         apply_fault_handler_ldr_byteswap_patches(rom_ptr);
         // `cfg!`, not `#[cfg]`: the probe *sites* are version data and

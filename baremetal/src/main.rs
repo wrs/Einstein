@@ -210,7 +210,6 @@ pub extern "C" fn kmain() -> ! {
         peripherals::screen::set_screen_size(w, h);
     }
     host::input::init();
-    // host::audio::init() moved earlier — see comment above flash::init.
 
     // Seed the snapshot ring's sequence counter from existing slots
     // (so resumed runs don't reuse seq numbers), then attempt to

@@ -121,18 +121,17 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
     }
 }
 
-/// TMainPlatformDriver::GetPCMCIAPowerSpec(slot=r1, out=r2).
 /// `TMainPlatformDriver::PauseSystem` (subfn 0x0D) and `PowerOffSystem`
 /// (subfn 0x0E) — both "halt the CPU until an event signal arrives"
 /// primitives (Emulator/TNativePrimitives.cpp:749-758). On real
 /// hardware the kernel sequence is roughly "mask IRQs; check work
 /// queues; if empty, WFI"; PauseSystem is the WFI step in the idle
 /// path, and PowerOffSystem is the WFI step inside CyclePower's deep-
-/// sleep retry loop. Returning immediately (the previous no-op
-/// behaviour) made each spin at trap rate — ~40 kHz on QEMU TCG for
+/// sleep retry loop. Returning immediately instead of waiting makes
+/// each of those spin at trap rate — ~40 kHz on QEMU TCG for
 /// PauseSystem, and ~365 kHz aggregate for CyclePower because each
 /// retry iteration also reads/writes VIC, alarm, and FIQ-mask
-/// registers — and was responsible for ≈100% of EC=0x07 (FP/SIMD)
+/// registers — which accounts for ≈100% of EC=0x07 (FP/SIMD)
 /// traps plus the matching ≈100% of EC=0x03 (DACR writes in SWIBoot
 /// exception entry/exit). See `trap-hist`.
 ///
@@ -208,6 +207,7 @@ fn pause_system(ctx: &mut TrapContext, powering_off: bool) {
     ctx.x[0] = 0;
 }
 
+/// `TMainPlatformDriver::GetPCMCIAPowerSpec(slot=r1, out=r2)`.
 ///
 /// Einstein returns `5` (3.3V + 5V) for slot 0, `7` (3.3V + 5V + 12V)
 /// for slot 1, `kError_NotImplemented` otherwise

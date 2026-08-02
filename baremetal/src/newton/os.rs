@@ -854,7 +854,7 @@ impl GuestOs for NewtonOs {
         // cacheable while we're back in the "MMU off" regime.
         crate::hv::guest::set_dc_for_stage1_off(true);
         // SAFETY: single-word ROM-backing write under the
-        // same paused-guest invariant as the original patch.
+        // same paused-guest invariant as the load-time patch.
         unsafe { guest_trampolines::install_und_vector_swap_pre_mmu(); }
     }
 

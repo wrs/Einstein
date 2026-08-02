@@ -121,8 +121,7 @@ fn write(ctx: &mut TrapContext, pc: u32) {
     // **X19** (`ctx.x[19]`), NOT X13 (which is SP_usr regardless of
     // source mode) and NOT SP_EL0/SP_EL1 (which are AArch64-only EL0/
     // EL1 stack pointers with no architectural alias to AArch32
-    // banked R13). Reading the wrong slot was the historical bug
-    // here.
+    // banked R13).
     //
     // Workaround: every caller of the `TFlashDriver::Write` vtable
     // trampoline at 0x00384790 is a `T{8,16,32}BitFlashRange::DoWrite`

@@ -600,13 +600,10 @@ pub(crate) fn handle_unhandled_exception(ctx: &TrapContext, non_user: bool) -> !
     });
 }
 
-/// Diagnostic halt + register dump. Reached two ways:
-///   1. The PABT vector slot (VA 0x0C) — patched to `HVC #Diag`
-///      because the stock ROM's branch target is a missing REx
-///      address. Any prefetch abort halts the host cleanly with a
-///      full banked-register dump and stage-1 walk.
-///   2. As the fallthrough from `handle_dabt_dispatch` for DABTs
-///      with a non-forwardable DFSC.
+/// Diagnostic halt + register dump. Reached as the fallthrough from
+/// `handle_dabt_dispatch` for DABTs with a non-forwardable DFSC: the
+/// host halts cleanly with a full banked-register dump and stage-1
+/// walk.
 ///
 /// Also available as an ad-hoc debugging facility: hand-patch
 /// `HVC #Diag` into any guest code site to get a halt-with-dump
@@ -727,8 +724,7 @@ pub(crate) fn handle_diag(ctx: &mut TrapContext) {
     let thumb = (spsr_src & (1 << 5)) != 0;
     // Faulting PC adjustment: ARM DABT = LR-8, ARM PABT = LR-4,
     // Thumb DABT = LR-4, Thumb PABT = LR-2. Assume PABT-source — true
-    // for the PABT vector intercept (patched in
-    // `guest_mem::patch_dabt_vector`) and for hand-patched diagnostic
+    // for hand-patched diagnostic
     // sites. When `handle_dabt_dispatch` delegates here for a non-
     // forwardable DABT the formula underestimates the faulting PC by
     // 4 bytes (ARM) or 2 bytes (Thumb); the FAR / ESR / banked

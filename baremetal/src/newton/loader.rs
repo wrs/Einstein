@@ -13,7 +13,7 @@
 use core::ptr::addr_of_mut;
 
 use crate::hv::guest_mem::{
-    rom_host_pa, ram_host_pa, rom_word_is_code, write_rom_code_word, write_rom_word_by_kind,
+    ram_host_pa, rom_host_pa, rom_word_is_code, write_rom_code_word, write_rom_word_by_kind,
     ROM_SIZE,
 };
 use crate::kprintln;
@@ -141,10 +141,7 @@ unsafe fn load_test_bin_via_semihosting() {
     static mut CMDLINE_BUF: [u8; CMDLINE_CAP] = [0; CMDLINE_CAP];
     // SYS_GET_CMDLINE: in: ptr, len; out: writes path to ptr, len-out at
     // arg[1]. Returns 0 on success, -1 on failure.
-    let cmdline_args: [u64; 2] = [
-        addr_of_mut!(CMDLINE_BUF) as u64,
-        (CMDLINE_CAP as u64) - 1,
-    ];
+    let cmdline_args: [u64; 2] = [addr_of_mut!(CMDLINE_BUF) as u64, (CMDLINE_CAP as u64) - 1];
     let rc = unsafe { semihost(SYS_GET_CMDLINE, cmdline_args.as_ptr()) };
     if rc != 0 {
         kprintln!("loader: SYS_GET_CMDLINE failed (rc={}) — no test bin", rc);
@@ -171,7 +168,9 @@ unsafe fn load_test_bin_via_semihosting() {
     while start < end && (cmdline[start] == b' ' || cmdline[start] == b'\t') {
         start += 1;
     }
-    while end > start && (cmdline[end - 1] == b' ' || cmdline[end - 1] == b'\t' || cmdline[end - 1] == b'\n') {
+    while end > start
+        && (cmdline[end - 1] == b' ' || cmdline[end - 1] == b'\t' || cmdline[end - 1] == b'\n')
+    {
         end -= 1;
     }
     let path_bytes = &cmdline[start..end];
@@ -220,20 +219,13 @@ unsafe fn load_test_bin_via_semihosting() {
     let flen = unsafe { semihost(SYS_FLEN, flen_args.as_ptr()) };
     let buf_cap = ROM_SIZE; // GUEST_TEST_BIN_BUF is sized at ROM_SIZE
     if flen < 0 || (flen as usize) > buf_cap {
-        kprintln!(
-            "loader: SYS_FLEN={} (test bin too large or error)",
-            flen
-        );
+        kprintln!("loader: SYS_FLEN={} (test bin too large or error)", flen);
         crate::arch::cpu::halt();
     }
     let flen = flen as usize;
 
     // SYS_READ: ptr, len. Returns bytes-NOT-read (0 on success).
-    let read_args: [u64; 3] = [
-        fh,
-        addr_of_mut!(GUEST_TEST_BIN_BUF) as u64,
-        flen as u64,
-    ];
+    let read_args: [u64; 3] = [fh, addr_of_mut!(GUEST_TEST_BIN_BUF) as u64, flen as u64];
     let unread = unsafe { semihost(SYS_READ, read_args.as_ptr()) };
     if unread != 0 {
         kprintln!("loader: SYS_READ left {} bytes unread", unread);
@@ -243,24 +235,35 @@ unsafe fn load_test_bin_via_semihosting() {
     let _ = unsafe { semihost(SYS_CLOSE, close_args.as_ptr()) };
 
     // SAFETY: single-threaded EL2 init.
-    unsafe { GUEST_TEST_BIN_LEN = flen; }
+    unsafe {
+        GUEST_TEST_BIN_LEN = flen;
+    }
 }
 
 #[cfg(nh_guest_test)]
 pub unsafe fn load_guest_test() {
     #[cfg(nh_guest_test_semihost)]
-    unsafe { load_test_bin_via_semihosting(); }
+    unsafe {
+        load_test_bin_via_semihosting();
+    }
 
     let rom_ptr = rom_host_pa() as *mut u8;
     let bin = guest_test_bin();
-    let mode = if cfg!(nh_guest_test_semihost) { "semihost-loaded" } else { "embedded" };
+    let mode = if cfg!(nh_guest_test_semihost) {
+        "semihost-loaded"
+    } else {
+        "embedded"
+    };
     kprintln!(
         "loader: GUEST-TEST MODE ({}) — copying {} bytes into GUEST_ROM",
-        mode, bin.len()
+        mode,
+        bin.len()
     );
     for (i, b) in bin.iter().enumerate() {
         // SAFETY: i < bin.len() <= ROM_SIZE.
-        unsafe { rom_ptr.add(i).write(*b); }
+        unsafe {
+            rom_ptr.add(i).write(*b);
+        }
     }
     // Make the freshly-written bytes visible to the guest's instruction
     // fetcher. Without this the I-cache misses, hits memory, and reads
@@ -268,7 +271,8 @@ pub unsafe fn load_guest_test() {
     crate::arch::cpu::icache_publish_range(rom_ptr as u64, bin.len());
     kprintln!(
         "loader: guest-test @ host PA {:#x}, RAM @ host PA {:#x}",
-        rom_host_pa(), ram_host_pa()
+        rom_host_pa(),
+        ram_host_pa()
     );
     // Install the UND trampoline so shadow-byte-access UDF markers,
     // guest_bp UDFs, and tracer USR-fallback UDFs reach EL2. The ROM
@@ -305,7 +309,9 @@ pub unsafe fn load_newton_rom() {
         kprintln!(
             "*** loader: ROM image is {} bytes but rom_ver::ROM_IMAGE_SIZE \
              for {} is {:#x}; wrong image? halting",
-            ROM_BE.len(), super::rom_ver::NAME, super::rom_ver::ROM_IMAGE_SIZE,
+            ROM_BE.len(),
+            super::rom_ver::NAME,
+            super::rom_ver::ROM_IMAGE_SIZE,
         );
         crate::arch::cpu::halt();
     }
@@ -332,7 +338,9 @@ pub unsafe fn load_newton_rom() {
             // a native LE write of that produces host bytes = LE encoding
             // of the instruction.
             let insn = u32::from_be_bytes(on_disk);
-            unsafe { rom_ptr.add(i).write(insn); }
+            unsafe {
+                rom_ptr.add(i).write(insn);
+            }
         } else {
             // Data: under BE-8 CPSR.E=1, LDR reads the original BE
             // numerical value when host bytes equal the on-disk (BE-
@@ -355,7 +363,8 @@ pub unsafe fn load_newton_rom() {
     let rex_words = REX_BE.len() / 4;
     kprintln!(
         "loader: loading {} bytes of Einstein.rex at PA {:#x} (BE-8: code-vs-data per bitmap)",
-        REX_BE.len(), rex_pa_offset,
+        REX_BE.len(),
+        rex_pa_offset,
     );
     assert!(REX_BE.len() <= ROM_SIZE - rex_pa_offset);
     let rex_base_word = rex_pa_offset / 4;
@@ -370,7 +379,9 @@ pub unsafe fn load_newton_rom() {
         // SAFETY: rex_base_word + i stays below ROM_SIZE / 4 via the assert above.
         if rom_word_is_code(rex_base_word + i) {
             let insn = u32::from_be_bytes(on_disk);
-            unsafe { rom_ptr.add(rex_base_word + i).write(insn); }
+            unsafe {
+                rom_ptr.add(rex_base_word + i).write(insn);
+            }
         } else {
             unsafe {
                 let dst = rom_ptr.add(rex_base_word + i) as *mut u8;
@@ -437,11 +448,12 @@ pub unsafe fn load_newton_rom() {
     // would get LR_usr (whatever the user-mode return address was),
     // not the native-call ID the preceding MOV wrote into LR_svc.
     //
-    // The original `handle_fp_simd` decodes the MCR encoding's Rd
+    // The native-call decode (`NewtonOs::handle_native_call`, reached
+    // from `hv::trap::handle_fp_simd`) takes the MCR encoding's Rd
     // field (an AArch32 register number, 0-15) and reads `ctx.x[Rd]`
     // — which is the AArch64 view of R<Rd>_usr, never the source
-    // mode's banked R14. So Rd=14 in SVC mode would deliver LR_usr,
-    // not LR_svc, and every native primitive would decode as garbage.
+    // mode's banked R14. So Rd=14 in SVC mode delivers LR_usr, not
+    // LR_svc, and every native primitive would decode as garbage.
     //
     // Fix at load time: rewrite every MCR p10 Rd=LR in the REx to use
     // Rd=R12 (IP, non-banked: R12_usr lives in X12, and X12 ≡ AArch32
@@ -455,7 +467,7 @@ pub unsafe fn load_newton_rom() {
     //
     // (A more general fix would be to teach the native-call decode to
     // map Rd → ctx slot via Table D1-79 using the source mode in
-    // SPSR_EL2; the rewrite path is kept because it gives a smaller
+    // SPSR_EL2; the rewrite is preferred because it gives a smaller
     // and more localised hot path on every native-primitive call.)
     //
     // SAFETY: operates within the REx window we just loaded; bounds
@@ -472,8 +484,6 @@ pub unsafe fn load_newton_rom() {
         );
     }
 
-
-
     kprintln!(
         "loader: ROM @ host PA {:#x}, RAM @ host PA {:#x}",
         rom_host_pa(),
@@ -486,13 +496,16 @@ pub unsafe fn load_newton_rom() {
     let second: u32 = unsafe { rom_ptr.add(1).read() };
     kprintln!(
         "loader: ROM[0..2] (LE after swap) = {:#010x} {:#010x}",
-        first, second
+        first,
+        second
     );
 
     // Einstein's word-write ROM patches. Without them the kernel takes
     // the wrong boot path — see `rom_ver::PATCHES` for the list and
     // `rom_patches` for the installer.
-    unsafe { super::rom_patches::apply_rom_patches(rom_ptr); }
+    unsafe {
+        super::rom_patches::apply_rom_patches(rom_ptr);
+    }
 
     // UND vector (VA 0x04) + trampoline body: overwrite the ROM's
     // branch-to-REx-handler with a branch to the FPA-bypass stub and
@@ -510,11 +523,15 @@ pub unsafe fn load_newton_rom() {
     // branch word at offset 0x04 and the stub bodies in the reserved
     // ROM-tail window (0x00FF_FEC0..0x00FF_FF60), all well under
     // ROM_SIZE. See `guest_trampolines` for the per-word layout.
-    unsafe { super::guest_trampolines::patch_und_vector(rom_ptr); }
+    unsafe {
+        super::guest_trampolines::patch_und_vector(rom_ptr);
+    }
 
     // Install the DABT-vector intercept. See
     // `guest_trampolines::patch_dabt_vector`.
-    unsafe { super::guest_trampolines::patch_dabt_vector(rom_ptr); }
+    unsafe {
+        super::guest_trampolines::patch_dabt_vector(rom_ptr);
+    }
 
     // Bring-up shim #2: the 717006 kernel uses StrongARM's lax CP15 encoding
     // where CRm == CRn for most system-control registers. On ARMv7+ those
@@ -562,7 +579,11 @@ pub unsafe fn load_newton_rom() {
         "loader: icache_publish_range over {} MiB ROM aperture: {} ticks (~{} us @ {} Hz)",
         ROM_SIZE / (1024 * 1024),
         icache_dt,
-        if icache_freq != 0 { icache_dt * 1_000_000 / icache_freq } else { 0 },
+        if icache_freq != 0 {
+            icache_dt * 1_000_000 / icache_freq
+        } else {
+            0
+        },
         icache_freq,
     );
 
@@ -571,7 +592,6 @@ pub unsafe fn load_newton_rom() {
     #[cfg(feature = "trace")]
     crate::diag::tracer::init();
 }
-
 
 /// Scan the REx window (PA `start` .. `end`) for Einstein's
 /// `NATIVE_PRIM` MCR p10 call sites (Rd = LR / R14) and rewrite each
@@ -603,8 +623,8 @@ unsafe fn patch_native_prim_mcr_lr_to_r12(rom: *mut u32, start: u32, end: u32) -
     const MOV_LR_IMM_BITS: u32 = 0xE3A0_E000; // mov lr, #imm
     const ADD_LR_IMM_MASK: u32 = 0xFFFF_F000;
     const ADD_LR_IMM_BITS: u32 = 0xE28E_E000; // add lr, lr, #imm
-    const LDR_LR_PC_MASK:  u32 = 0xFFFF_F000;
-    const LDR_LR_PC_BITS:  u32 = 0xE59F_E000; // ldr lr, [pc, #imm]
+    const LDR_LR_PC_MASK: u32 = 0xFFFF_F000;
+    const LDR_LR_PC_BITS: u32 = 0xE59F_E000; // ldr lr, [pc, #imm]
 
     let start_idx = (start / 4) as usize;
     let end_idx = (end / 4) as usize;
@@ -649,22 +669,27 @@ unsafe fn patch_native_prim_mcr_lr_to_r12(rom: *mut u32, start: u32, end: u32) -
         // through write_rom_code_word so BE-8 sees the right encoding.
         let lead = unsafe { rom.add(mov_idx).read() };
         let new_lead = (lead & !0x0000_F000) | 0x0000_C000;
-        unsafe { write_rom_code_word(rom, mov_idx, new_lead); }
+        unsafe {
+            write_rom_code_word(rom, mov_idx, new_lead);
+        }
 
         if let Some(ai) = add_idx {
             let add = unsafe { rom.add(ai).read() };
             let new_add = (add & !0x000F_F000) | 0x000C_C000;
-            unsafe { write_rom_code_word(rom, ai, new_add); }
+            unsafe {
+                write_rom_code_word(rom, ai, new_add);
+            }
         }
 
         let new_mcr = MCR_P10_R12;
-        unsafe { write_rom_code_word(rom, j, new_mcr); }
+        unsafe {
+            write_rom_code_word(rom, j, new_mcr);
+        }
         patched += 1;
     }
 
     patched
 }
-
 
 /// Scan ROM words and rewrite MCR/MRC to CP15 c{1,2,3,5,6} with non-zero CRm
 /// to the equivalent standard ARMv7 encoding with CRm=0. Returns the number
@@ -714,9 +739,11 @@ unsafe fn patch_cp15_encodings(rom: *mut u32, word_count: usize) -> usize {
         }
 
         let new = w & !0xF; // CRm <- 0
-        // SAFETY: same index, in-range. Code rewrite — under BE-8 we
-        // need the BE-numerical encoding stored as native u32.
-        unsafe { write_rom_code_word(rom, i, new); }
+                            // SAFETY: same index, in-range. Code rewrite — under BE-8 we
+                            // need the BE-numerical encoding stored as native u32.
+        unsafe {
+            write_rom_code_word(rom, i, new);
+        }
         if count < first_pcs.len() {
             first_pcs[count] = (i * 4) as u32;
         }
@@ -726,7 +753,8 @@ unsafe fn patch_cp15_encodings(rom: *mut u32, word_count: usize) -> usize {
         let shown = count.min(first_pcs.len());
         kprintln!(
             "loader: patch_cp15_encodings: {} code words rewritten; first PCs: {:#x?}",
-            count, &first_pcs[..shown],
+            count,
+            &first_pcs[..shown],
         );
     }
     count

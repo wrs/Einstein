@@ -2,9 +2,10 @@
 //!
 //! Used by the SDHOST driver to query / set the SoC core clock rate
 //! (which is the SDHOST's input clock — SDCDIV is the only further
-//! divider). Phase 4 (display) will reuse the same module to allocate
-//! a framebuffer; that's why this lives at the crate root rather than
-//! inside `src/host/sd/`.
+//! divider), by `host::display` to allocate a framebuffer, by the
+//! DWC2 driver to power on the USB host controller, and by
+//! `audio::pi_hdmi` to read the pixel clock. Shared by all of those,
+//! so it lives here rather than inside `src/host/sd/`.
 //!
 //! ## Hardware reference
 //!
@@ -69,7 +70,7 @@
 //! both directions. [`crate::arch::cpu::dc_civac_range`] does both in one
 //! pass; we call it before and after.
 
-#![allow(dead_code)] // SDHOST uses one tag today; Phase 4 will add more.
+#![allow(dead_code)] // Not every tag defined here has an in-tree caller.
 
 use core::ptr::{read_volatile, write_volatile};
 

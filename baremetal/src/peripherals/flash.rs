@@ -95,7 +95,8 @@ pub fn init() {
 /// Compute the 10-entry ROM-REx checksum table the kernel's
 /// `TReservedBlockAccessor` uses for its post-read validation pass
 /// (`trace 1628 operator==(TROMREXCheckSums...)`), and seed it into
-/// flash at `0x64..0x8C` of both block 0 and block 1.
+/// flash at `0x64..0x8C` of block 0 (block 1 is left zeroed there —
+/// see the write loop for why).
 ///
 /// Each `ComputeSegmentChecksums` entry is two u32s (`highBits`,
 /// `lowBits`) where `highBits += word >> 16` and

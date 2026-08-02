@@ -443,13 +443,17 @@ fn select_platform_linker_script() {
 }
 
 // Cross-axis feature constraints are expressed as Cargo feature
-// dependencies in Cargo.toml (hardware-implying backends pull in
-// `platform-raspi3b`; `sd-probe` pulls in `no-semihost` too), so a
-// hardware backend on the wrong platform cannot be selected — the
-// dependency drags in the second platform and
+// dependencies in Cargo.toml: `host-io-pi-fb`, `flash-persist-sd`,
+// `audio-pi-hdmi` and `sd-probe` all pull in `platform-raspi3b`
+// (`sd-probe` pulls in `no-semihost` too). Naming one of those
+// alongside the other platform therefore drags in both, and
 // `select_platform_linker_script` rejects the contradiction with a
-// named message. That platform mutual-exclusion check is the only
-// imperative gate.
+// named message rather than a deep compile error. That platform
+// mutual-exclusion check is the only imperative gate.
+//
+// `input-mtouch` is the exception: it carries no `platform-raspi3b`
+// dependency, so selecting it on FVP fails inside the USB stack
+// instead of at the named gate.
 
 /// Emit `cfg(nh_semihost)` when a semihosting host is listening, i.e.
 /// the `no-semihost` feature is absent.

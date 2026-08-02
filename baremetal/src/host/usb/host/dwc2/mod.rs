@@ -689,12 +689,13 @@ impl Dwc2 {
 
 // ---- IRQ-driven interrupt-IN (touchscreen) --------------------------
 //
-// Polling the panel from the trap tail captured a report only when the
-// guest happened to trap soon after it arrived; reports landing while
-// the guest ran straight-line code (inker / recognizer) were dropped,
-// breaking strokes. Instead `INT_CH` stays armed and the DWC2 raises a
-// USB IRQ (BCM2835 GPU source 9) on each channel halt, harvested below
-// from the trap-IRQ path the instant it fires.
+// `INT_CH` stays armed and the DWC2 raises a USB IRQ (BCM2835 GPU
+// source 9) on each channel halt, harvested below from the trap-IRQ
+// path the instant it fires. Polling the panel from the trap tail
+// instead would capture a report only when the guest happened to trap
+// soon after it arrived: reports landing while the guest runs
+// straight-line code (inker / recognizer) get dropped, which breaks
+// strokes.
 
 /// GPU-bus uncached alias the DWC2 AHB master uses to view DRAM (see
 /// `dma_xfer`'s note on HCDMA addressing).

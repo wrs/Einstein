@@ -185,8 +185,8 @@ fn rewrite_first_insn(orig: u32, orig_pc: u32) -> Option<(u32, u32)> {
     // LDR Rd, [pc, #imm], cond=AL, U=1 (add), B=0, W=0, L=1, Rn=PC.
     // Encoding: 1110 0101 1001 1111 Rd  imm12 = 0xE59F_Rxxx.
     // Matches when bits 27:20 == 0x59 and Rn == 0xF. Rd is extracted
-    // from bits 15:12; we allow any Rd (the original tracer was R0-only,
-    // but there's no reason to restrict).
+    // from bits 15:12. Any Rd is accepted — nothing in the rewrite
+    // depends on which register the load targets.
     if (orig & 0x0FFF_0000) == 0x059F_0000 {
         let rd = (orig >> 12) & 0xF;
         // PC destination LDR isn't a prologue pattern — if we see it

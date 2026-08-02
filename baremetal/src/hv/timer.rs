@@ -94,7 +94,7 @@ fn program_cval(cval: u64) {
 /// `vic::SYNTH_TICKS`) there is no fixed wall-time → tick mapping,
 /// so a wall-anchored CNTPCT deadline can't be derived from a Newton
 /// tick value. Instead, every sync trap advances synthetic ticks via
-/// `tick_advance` and runs `poll_timer_matches` — match deliveries
+/// `vic::tick_advance_sync_trap` and runs `poll_timer_matches` — match deliveries
 /// happen at sync-trap granularity, which is plenty fine for the
 /// kernel's preemption / alarm cadence.
 pub fn rearm() {

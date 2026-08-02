@@ -274,7 +274,8 @@ static VIC_DMA_FIQ_LOG: LogBudget = LogBudget::new(16);
 /// the change into HCR_EL2.VI / VF, so the guest takes a virtual IRQ
 /// on the next ERET if the unmask gates allow it.
 ///
-/// Used by external raisers — DMA channel completion (`dma::write`),
+/// Used by external raisers — DMA channel completion
+/// (`dma::poll_tx` / `dma::poll_rx`),
 /// GPIO line events (HVC test trigger / future native-event hooks),
 /// RTC alarm match, etc. Timer matches go through the existing
 /// `poll_timer_matches` edge-detect path.
@@ -728,9 +729,9 @@ fn read(ipa: u64) -> u32 {
         // kHdWr_P0F184C00 (TMemoryConsts.h:101, "R"): Einstein's TMemory.cpp
         // Bank #3 read path (lines 803-960) has NO specific handler for this
         // address — it falls through to the "unknown bank #3" default at
-        // lines 950-960, which returns 0. The previous "all-ok high =
-        // 0xFFFFFFFF per Einstein" comment was wrong (no such Einstein
-        // code exists). Bit 21 of this register gates a kernel polling
+        // lines 950-960, which returns 0. (There is no Einstein code
+        // returning an "all-ok high" 0xFFFFFFFF for this address.)
+        // Bit 21 of this register gates a kernel polling
         // path at ROM 0x00019d34 / 0x00019d90 / 0x00019e34 (`tst r1,
         // #0x00200000`); returning 0 makes us take the same branches as
         // Einstein.
@@ -739,11 +740,11 @@ fn read(ipa: u64) -> u32 {
         // ---- Not modeled by Einstein → returns 0 by default ------------
         // Einstein TMemory.cpp Bank #3 read path (lines 803-960) has no
         // specific handler for these addresses; the unknown-bank-#3
-        // default at lines 950-960 returns 0. Match that. The previous
-        // round-trip behavior diverged whenever the kernel did
-        // read-modify-write here (TGPIOInterface::DisableInterrupt etc.)
-        // — but Einstein's r-m-w sees 0 every read, so the user-visible
-        // effect must be 0 here too.
+        // default at lines 950-960 returns 0. Match that: storing the
+        // written value and reading it back would diverge whenever the
+        // kernel does read-modify-write here
+        // (TGPIOInterface::DisableInterrupt etc.), since Einstein's
+        // r-m-w sees 0 on every read.
         K_HDWR_P0F110000
         | K_HDWR_P0F111400
         | K_HDWR_P0F180400

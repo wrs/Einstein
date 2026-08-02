@@ -28,11 +28,10 @@ pub const DRAM_1GIB_BLOCK: Option<u64> = None;
 /// report the natural rate; CNTPCT_EL0 (running at ~62 MHz on QEMU
 /// raspi3b) is rate-converted in `vic::ticks()`.
 ///
-/// Earlier code multiplied this by 16 (and before that 128) to make
-/// early calibrated delay loops finish promptly. With the 16 ms
-/// CNTHP heartbeat in `timer.rs` driving `tick_page::update()`, the
-/// guest sees ticks advance even during tight non-trapping polls
-/// without any rate scaling, so the multiplier is gone. Keeping the
+/// No rate scaling is applied: with the 16 ms CNTHP heartbeat in
+/// `timer.rs` driving `tick_page::update()`, the guest sees ticks
+/// advance even during tight non-trapping polls, so early calibrated
+/// delay loops finish promptly without one. Keeping the
 /// natural rate matches what the kernel computes from `kFreqGenFreq`
 /// and matches Einstein's `TInterruptManager::GetTimeInTicks`, which
 /// avoids a class of divergence where wall-anchored fast ticks make

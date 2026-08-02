@@ -23,7 +23,7 @@
 //! ```
 //!
 //! Only builds that select the `input-mtouch` backend compile the
-//! stack — `src/main.rs` gates `mod usb` on `cfg(nh_input_mtouch)`
+//! stack — `src/host/mod.rs` gates `mod usb` on `cfg(nh_input_mtouch)`
 //! (see `src/host/input/mod.rs` for the axis), so QEMU / FVP / bench
 //! builds without a touchscreen pay nothing.
 

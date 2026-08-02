@@ -4,10 +4,10 @@
 //! memory map: `stage2::init` (what to map and with which permissions),
 //! `guest_mem::host_addr_for` (IPA → host-pointer dispatch for EL2-side
 //! reads/writes), and `snapshot::{save,load}` (which regions to
-//! serialize). Before this manifest those three places hand-maintained
-//! the list independently, which is exactly how SCRATCH_POOL ended up
-//! guest-visible at stage-2 but absent from the snapshot (review finding
-//! mem-H2). This table is the single source of truth; the boot-time
+//! serialize). Hand-maintaining that list in three places is how a
+//! region ends up guest-visible at stage-2 but absent from the
+//! snapshot — the failure SCRATCH_POOL hit (review finding mem-H2).
+//! This table is the single source of truth; the boot-time
 //! [`cross_check`] makes "mapped in stage-2 but missing from
 //! host_addr_for / snapshot" a loud halt rather than a silent omission.
 //!

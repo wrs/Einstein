@@ -114,7 +114,7 @@ pub(crate) fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
     // froze RO+X after shadow-stub patching; flip the page back to
     // RW+XN and retry the write natively. The next fetch into the
     // page will trap again (XN) so the handler re-scans the fresh
-    // bytes. See `src/stage2.rs::set_ram_page_{ro_x,rw_xn}`.
+    // bytes. See `hv::stage2::set_ram_page_{ro_x,rw_xn}`.
     let is_permission = (ifsc & 0b111100) == 0b001100;
     if wnr && is_permission && layout::ram_range().contains(&ipa) {
         let page = (ipa as u32) & !0xFFF;
@@ -305,7 +305,7 @@ fn try_emulate_isv0_dabt(ctx: &mut TrapContext, ipa: u64, wnr: bool, elr: u32) -
     // Encoding mask: cond 1110 0000 CRn=c7 Rt 1111 opc2 1 CRm
     //   bits[27:24] = 1110 (MCR opcode group)
     //   bits[23:20] = 0000 (opc1 = 0; bit 20 = 0 = MCR not MRC)
-    //   bits[19:16] = 0111 (CRn = c7)         ← was masked out before
+    //   bits[19:16] = 0111 (CRn = c7)
     //   bits[11:8]  = 1111 (coproc = p15)
     //   bit[4]      = 1    (MCR/MRC, not CDP)
     //   cond / Rt / CRm / opc2 are any.

@@ -76,12 +76,12 @@ const REG_END:    u64 = 0x0C00_4400;
 /// when the socket is empty (the card-detect lines float high).
 const K1C00_CARD_IS_PRESENT: u32 = 0x000C;
 
-/// Per-slot controller-register storage. There are 18 word registers
-/// laid out at offsets 0x0000, 0x0800, 0x0C00, 0x1000, ..., 0x4000,
-/// 0x4400 — i.e. mostly every 0x400 bytes. We keep a flat
-/// `[AtomicU32; 18]` indexed by the offset/0x400 hash below; offsets
+/// Per-slot controller-register storage: 17 word registers at offsets
+/// 0x0000, 0x0400, 0x0800, ..., 0x4000 — every 0x400 bytes. One named
+/// field per register, selected by the `cell()` match below; offsets
 /// that don't map to a register fall through to the unknown-offset
-/// path.
+/// path. (0x4400 is not stored — `read` answers it with a constant
+/// 0xFC.)
 struct SlotRegs {
     reg_0000: AtomicU32, // int raised
     reg_0800: AtomicU32,

@@ -155,8 +155,8 @@ flash-persist-sd = ["platform-raspi3b"]
 #                  the touchscreen just stay mute.
 #   input-mtouch — TSTP MTouch USB digitizer (VID 0x0416 / PID
 #                  0xC168) over the BCM2710 DWC2 OTG controller.
-#                  Polled from the timer IRQ tail. Selected by the
-#                  `pi-bare-metal-input` aggregate.
+#                  IRQ-driven (DWC2 channel-halt IRQ). Selected by
+#                  the `pi-bare-metal-input` aggregate.
 input-null = []
 input-mtouch = []
 

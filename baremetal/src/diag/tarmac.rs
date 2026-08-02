@@ -20,7 +20,7 @@
 //!     specific EL2 event you want the window to open on.
 //!   - STOP: `emit_stop()` is already wired into the halt paths
 //!     (`handle_und`'s unrecognised-UND halt and
-//!     `halt_bootloader_canary`); add further `emit_stop()` calls at
+//!     `probes::handle_bootos_canary`); add further `emit_stop()` calls at
 //!     any point the window should close.
 //!
 //! With `START_AT_TRAP = 0` and no explicit `emit_start()` call, no

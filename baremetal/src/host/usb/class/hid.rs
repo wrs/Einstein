@@ -19,7 +19,8 @@ pub const HID_REPORT_FEATURE: u8 = 0x03;
 
 /// `GET_REPORT(type, id, length)` — HID 1.11 §7.2.1. This is the
 /// MTouch activation handshake: `get_report(Feature, 3, 2)` returns
-/// `0x0a 0x00` ("Contact Count Max = 10") and unblocks the
+/// `[0x03, 0x0a]` (Report ID 3, "Contact Count Max = 10" — see the
+/// note in `input::mtouch` on the Report-ID prefix) and unblocks the
 /// interrupt stream.
 pub fn get_report<H: UsbHostController>(
     host: &mut H,

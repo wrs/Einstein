@@ -28,9 +28,9 @@ pub struct ProbeSite {
 #[derive(Copy, Clone)]
 pub struct RomPatch {
     pub offset: u32,
-    pub orig:   u32,
-    pub value:  u32,
-    pub name:   &'static str,
+    pub orig: u32,
+    pub value: u32,
+    pub name: &'static str,
 }
 
 /// Where the external REx loads in the ROM aperture and how many REx
@@ -54,7 +54,7 @@ pub struct RexInfo {
 /// Consumers: `rom_patches` (patch-stub arena), `guest_trampolines`
 /// (trampoline installers + `register_hyp_code_ranges`, which feeds
 /// both `guest_endian`'s byte-order predicate and the snapshot
-/// autosave gate), `shadow_stub` (SBA stub pool), `diag::tracer`
+/// autosave gate), `inline_patch` (SBA stub pool), `diag::tracer`
 /// (trampoline pool), and `unaligned_inline` (its inline-patch PC
 /// limit is `tracer_pool_base`).
 #[derive(Copy, Clone)]
@@ -65,7 +65,7 @@ pub struct RomTailLayout {
     /// Tracer trampoline pool (5-word slots, one per traced function).
     pub tracer_pool_base: u32,
     pub tracer_pool_end: u32,
-    /// Shadow-stub SBA stub pool (16-word slots).
+    /// inline-patch SBA stub pool (16-word slots).
     pub sba_stub_pool_base: u32,
     pub sba_stub_pool_end: u32,
     /// Patch-stub arena (`rom_patches::alloc_patch_stub`).

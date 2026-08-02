@@ -14,8 +14,8 @@
 //!              `gicv3::init` + `enable_ppi(INTID_CNTHP)`).
 //! See `crate::host::platform::install_cnthp_irq_routing`.
 
-use crate::{kprintln, host::platform};
 use crate::hv::hooks::{ActiveGuest, GuestOs};
+use crate::{host::platform, kprintln};
 
 /// CNTHP_CTL_EL2: ENABLE=1, IMASK=0 → timer fires an IRQ when
 /// CNTPCT_EL0 crosses CNTHP_CVAL_EL2.
@@ -121,7 +121,7 @@ pub fn rearm() {
 /// see `slim_isr` for the ownership contract.
 pub fn on_irq(_cap: crate::arch::slim_isr::IrqCap) {
     // Stale-TLB guard. The hypervisor rewrites guest stage-1 PTEs
-    // behind the guest's back (fix_stage1_xn_bits, the shadow-stub
+    // behind the guest's back (fix_stage1_xn_bits, the inline-patch
     // alias redirects, the scratch-pool install) without targeted TLB
     // maintenance at the rewrite sites — and the guest can't TLBI
     // after writes it never made. Flushing the EL1&0 stage-1 TLB

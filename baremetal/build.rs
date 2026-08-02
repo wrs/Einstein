@@ -76,9 +76,7 @@ fn main() {
             // per-test relink that dominated wall time.
             println!("cargo:rustc-cfg=nh_guest_test");
             println!("cargo:rustc-cfg=nh_guest_test_semihost");
-            println!(
-                "cargo:warning=nh-baremetal: guest-test mode (semihost-load)"
-            );
+            println!("cargo:warning=nh-baremetal: guest-test mode (semihost-load)");
         } else {
             // Embed-from-path mode. Single-test loop hitting one fixed
             // .bin — the path resolves to `include_bytes!` at compile
@@ -110,7 +108,7 @@ fn main() {
         build_trace_tables(&rom_ver);
     }
 
-    // Stage the classify bitmap for include_bytes! in shadow_stub.
+    // Stage the classify bitmap for include_bytes! in inline_patch.
     // In guest-test mode the bitmap is embedded but never consulted —
     // patch_rom_from_bitmap is skipped because the ROM slot holds the
     // test binary, not Newton 2.x. Requiring the bitmap unconditionally
@@ -194,12 +192,18 @@ fn resolve_rom_version() -> RomVersion {
     let (rom_candidates, rex_candidates, code_sym_candidates, sym_candidates) = if tag == "717006" {
         (
             vec![ver_dir.join("newton.rom"), manifest.join("roms/newton.rom")],
-            vec![ver_dir.join("Einstein.rex"), manifest.join("../_Data_/Einstein.rex")],
+            vec![
+                ver_dir.join("Einstein.rex"),
+                manifest.join("../_Data_/Einstein.rex"),
+            ],
             vec![
                 ver_dir.join("code-symbols.txt"),
                 manifest.join("scripts/classify-out/code-symbols.txt"),
             ],
-            vec![ver_dir.join("symbols.txt"), manifest.join("../_Data_/symbols.txt")],
+            vec![
+                ver_dir.join("symbols.txt"),
+                manifest.join("../_Data_/symbols.txt"),
+            ],
         )
     } else {
         (
@@ -306,8 +310,8 @@ fn build_splash_logo() {
         return;
     };
 
-    let (w, h, pixels) = parse_ppm_p6(&bytes)
-        .unwrap_or_else(|e| panic!("assets/splash_logo.ppm: {e}"));
+    let (w, h, pixels) =
+        parse_ppm_p6(&bytes).unwrap_or_else(|e| panic!("assets/splash_logo.ppm: {e}"));
     fs::write(&bin_path, &pixels).expect("write splash_logo.bin");
     println!("cargo:rustc-env=NH_SPLASH_LOGO_W={w}");
     println!("cargo:rustc-env=NH_SPLASH_LOGO_H={h}");
@@ -340,8 +344,7 @@ fn parse_ppm_p6(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
         if start == *p {
             return Err("unexpected end of header".into());
         }
-        std::str::from_utf8(&bytes[start..*p])
-            .map_err(|_| "non-ascii header token".to_string())
+        std::str::from_utf8(&bytes[start..*p]).map_err(|_| "non-ascii header token".to_string())
     };
 
     let magic = next_token(&mut p)?;
@@ -352,9 +355,7 @@ fn parse_ppm_p6(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
     };
     let w: u32 = next_token(&mut p)?.parse().map_err(|_| "bad width")?;
     let h: u32 = next_token(&mut p)?.parse().map_err(|_| "bad height")?;
-    let maxval: u32 = next_token(&mut p)?
-        .parse()
-        .map_err(|_| "bad maxval")?;
+    let maxval: u32 = next_token(&mut p)?.parse().map_err(|_| "bad maxval")?;
     if maxval != 255 {
         return Err(format!(
             "maxval must be 255 (8 bpc); got {maxval}. Re-export with 8-bit depth."
@@ -423,13 +424,11 @@ fn select_platform_linker_script() {
             "no platform selected: enable exactly one of \
              --features platform-raspi3b or --features platform-fvp-base"
         ),
-        (true, true) => panic!(
-            "platform-raspi3b and platform-fvp-base are mutually exclusive"
-        ),
+        (true, true) => panic!("platform-raspi3b and platform-fvp-base are mutually exclusive"),
     };
 
-    let template = fs::read_to_string("linker.ld.in")
-        .unwrap_or_else(|e| panic!("read linker.ld.in: {e}"));
+    let template =
+        fs::read_to_string("linker.ld.in").unwrap_or_else(|e| panic!("read linker.ld.in: {e}"));
     if !template.contains("@IMAGE_BASE@") {
         panic!("linker.ld.in has no @IMAGE_BASE@ placeholder");
     }
@@ -437,8 +436,7 @@ fn select_platform_linker_script() {
 
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR");
     let script_path = Path::new(&out_dir).join("linker.ld");
-    fs::write(&script_path, script)
-        .unwrap_or_else(|e| panic!("write {:?}: {e}", script_path));
+    fs::write(&script_path, script).unwrap_or_else(|e| panic!("write {:?}: {e}", script_path));
     println!("cargo:rustc-link-arg=-T{}", script_path.display());
 }
 
@@ -565,9 +563,7 @@ fn resolve_input_backend() {
         (false, false) => "null",
         (true, false) => "null",
         (false, true) => "mtouch",
-        (true, true) => panic!(
-            "input-null and input-mtouch are mutually exclusive"
-        ),
+        (true, true) => panic!("input-null and input-mtouch are mutually exclusive"),
     };
     println!("cargo:rustc-cfg=nh_input_{chosen}");
 }
@@ -583,9 +579,7 @@ fn resolve_audio_backend() {
         (false, false) => "null",
         (true, false) => "null",
         (false, true) => "pi_hdmi",
-        (true, true) => panic!(
-            "audio-null and audio-pi-hdmi are mutually exclusive"
-        ),
+        (true, true) => panic!("audio-null and audio-pi-hdmi are mutually exclusive"),
     };
     println!("cargo:rustc-cfg=nh_audio_{chosen}");
 }
@@ -633,7 +627,7 @@ fn emit_flash_path(ver: &RomVersion) {
 fn build_trace_tables(ver: &RomVersion) {
     // Source of truth: the version's `code-symbols.txt`, the curated
     // code-only symbol list produced by classify-symbols.py. It's the
-    // same list that seeds the shadow-stub classifier's walker, so
+    // same list that seeds the inline-patch classifier's walker, so
     // anything in it has already been vetted as a real function entry
     // (not a global, string-table, or mislabelled data symbol). This
     // lets the tracer trust the address list without applying first-word
@@ -661,8 +655,8 @@ fn build_trace_tables(ver: &RomVersion) {
         return;
     }
 
-    let text = fs::read_to_string(sym_path)
-        .unwrap_or_else(|e| panic!("trace: read {:?}: {e}", sym_path));
+    let text =
+        fs::read_to_string(sym_path).unwrap_or_else(|e| panic!("trace: read {:?}: {e}", sym_path));
 
     // Mangled-name source. classify-symbols.py reads demangled_symbols.txt
     // (because the classifier rules match on demangled patterns), so
@@ -679,11 +673,23 @@ fn build_trace_tables(ver: &RomVersion) {
             .unwrap_or_else(|e| panic!("trace: read {:?}: {e}", mangled_path));
         for line in mtext.lines() {
             let mut it = line.splitn(3, '\t');
-            let addr_s = match it.next() { Some(s) => s.trim(), None => continue };
-            let name = match it.next() { Some(s) => s.trim(), None => continue };
-            if name.is_empty() { continue; }
-            let hex = match addr_s.strip_prefix("0x").or_else(|| addr_s.strip_prefix("0X")) {
-                Some(h) => h, None => continue,
+            let addr_s = match it.next() {
+                Some(s) => s.trim(),
+                None => continue,
+            };
+            let name = match it.next() {
+                Some(s) => s.trim(),
+                None => continue,
+            };
+            if name.is_empty() {
+                continue;
+            }
+            let hex = match addr_s
+                .strip_prefix("0x")
+                .or_else(|| addr_s.strip_prefix("0X"))
+            {
+                Some(h) => h,
+                None => continue,
             };
             if let Ok(addr) = u32::from_str_radix(hex, 16) {
                 mangled_map.entry(addr).or_insert_with(|| name.to_string());
@@ -700,11 +706,22 @@ fn build_trace_tables(ver: &RomVersion) {
 
     for line in text.lines() {
         let mut it = line.splitn(2, '\t');
-        let addr_s = match it.next() { Some(s) => s.trim(), None => continue };
-        let name = match it.next() { Some(s) => s.trim(), None => continue };
-        if name.is_empty() { continue; }
+        let addr_s = match it.next() {
+            Some(s) => s.trim(),
+            None => continue,
+        };
+        let name = match it.next() {
+            Some(s) => s.trim(),
+            None => continue,
+        };
+        if name.is_empty() {
+            continue;
+        }
 
-        let hex = match addr_s.strip_prefix("0x").or_else(|| addr_s.strip_prefix("0X")) {
+        let hex = match addr_s
+            .strip_prefix("0x")
+            .or_else(|| addr_s.strip_prefix("0X"))
+        {
             Some(h) => h,
             None => continue,
         };
@@ -713,11 +730,18 @@ fn build_trace_tables(ver: &RomVersion) {
             Err(_) => continue,
         };
 
-        if addr & 3 != 0 { continue; }
-        if addr >= ver.rom_code_end { continue; }
+        if addr & 3 != 0 {
+            continue;
+        }
+        if addr >= ver.rom_code_end {
+            continue;
+        }
 
         if seen.insert(addr) {
-            let final_name = mangled_map.get(&addr).cloned().unwrap_or_else(|| name.to_string());
+            let final_name = mangled_map
+                .get(&addr)
+                .cloned()
+                .unwrap_or_else(|| name.to_string());
             entries.push((addr, final_name));
         }
     }
@@ -786,8 +810,11 @@ fn build_classify_bitmap(ver: &RomVersion) {
              placeholder (no ROM image to classify)",
             ver.tag
         );
-        fs::write(out.join("reach.bitmap"), vec![0u8; EXPECTED_BITMAP_BYTES as usize])
-            .unwrap_or_else(|e| panic!("classify: write placeholder bitmap: {e}"));
+        fs::write(
+            out.join("reach.bitmap"),
+            vec![0u8; EXPECTED_BITMAP_BYTES as usize],
+        )
+        .unwrap_or_else(|e| panic!("classify: write placeholder bitmap: {e}"));
         return;
     }
 

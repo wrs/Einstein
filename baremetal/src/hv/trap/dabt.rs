@@ -3,12 +3,11 @@
 //! drop and the `HVC #DabtDispatch` forwarding probe are guest-OS
 //! bodies reached through the hooks.
 
-use crate::{arch::cpu, hv::guest_mem, hv::layout, hv::mmio};
 use crate::arch::trap_context::{advance_elr, read_sysreg, TrapContext};
+use crate::hv::hooks::{ActiveGuest, GuestOs};
+use crate::{arch::cpu, hv::guest_mem, hv::layout, hv::mmio};
 use crate::{dprintln, kprintln};
 use core::sync::atomic::{AtomicU32, Ordering};
-use crate::hv::hooks::{ActiveGuest, GuestOs};
-
 
 // ----------------- individual handlers -----------------
 
@@ -100,7 +99,9 @@ pub(crate) fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
         kprintln!(
             "*** handle_data_abort: ISS.SRT == 31 (XZR) on AArch32 trap — \
              impossible; iss={:#010x} FAR={:#010x} IPA={:#010x} ***",
-            iss, far as u32, ipa as u32,
+            iss,
+            far as u32,
+            ipa as u32,
         );
         cpu::halt();
     }
@@ -111,7 +112,7 @@ pub(crate) fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
 
     // Stage-2 RO-permission fault on a RAM code page. Newton's
     // demand-pager is overwriting a page the hypervisor previously
-    // froze RO+X after shadow-stub patching; flip the page back to
+    // froze RO+X after inline-patch patching; flip the page back to
     // RW+XN and retry the write natively. The next fetch into the
     // page will trap again (XN) so the handler re-scans the fresh
     // bytes. See `hv::stage2::set_ram_page_{ro_x,rw_xn}`.
@@ -119,7 +120,9 @@ pub(crate) fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
     if wnr && is_permission && layout::ram_range().contains(&ipa) {
         let page = (ipa as u32) & !0xFFF;
         // SAFETY: helper performs its own TLB maintenance.
-        unsafe { crate::hv::stage2::set_ram_page_rw_xn(page); }
+        unsafe {
+            crate::hv::stage2::set_ram_page_rw_xn(page);
+        }
         // Don't advance ELR — the CPU retries the write.
         return;
     }
@@ -149,12 +152,18 @@ pub(crate) fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
         if n < 4 {
             kprintln!(
                 "dabt: ignored write to ROM IPA={:#010x} value={:#010x} @PC={:#010x} (#{})",
-                ipa as u32, ctx.x[srt] as u32, elr, n + 1
+                ipa as u32,
+                ctx.x[srt] as u32,
+                elr,
+                n + 1
             );
         } else {
             dprintln!(
                 "dabt: ignored write to ROM IPA={:#010x} value={:#010x} @PC={:#010x} (#{})",
-                ipa as u32, ctx.x[srt] as u32, elr, n + 1
+                ipa as u32,
+                ctx.x[srt] as u32,
+                elr,
+                n + 1
             );
         }
         advance_elr(4);
@@ -188,7 +197,11 @@ pub(crate) fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
         let sctlr_el1 = read_sysreg!("sctlr_el1");
         kprintln!(
             "*** data abort ISV=0 at ELR={:#x} SPSR={:#x} IPA={:#x} FAR={:#x} iss={:#x}",
-            elr, spsr, ipa, far, iss
+            elr,
+            spsr,
+            ipa,
+            far,
+            iss
         );
         kprintln!(
             "    SCTLR_EL1 (guest) M-bit = {} (stage-1 {})",
@@ -217,23 +230,40 @@ pub(crate) fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
         let val = if wnr { ctx.x[srt] as u32 } else { 0 };
         kprintln!(
             "dabt-trip: PC={:#010x} mode={} {} {:#010x} -> IPA={:#x}",
-            elr, mode_label, dir, val, ipa
+            elr,
+            mode_label,
+            dir,
+            val,
+            ipa
         );
         kprintln!(
             "           r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}",
-            ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32
+            ctx.x[0] as u32,
+            ctx.x[1] as u32,
+            ctx.x[2] as u32,
+            ctx.x[3] as u32
         );
         kprintln!(
             "           r4={:#010x} r5={:#010x} r6={:#010x} r7={:#010x}",
-            ctx.x[4] as u32, ctx.x[5] as u32, ctx.x[6] as u32, ctx.x[7] as u32
+            ctx.x[4] as u32,
+            ctx.x[5] as u32,
+            ctx.x[6] as u32,
+            ctx.x[7] as u32
         );
         kprintln!(
             "           r8={:#010x} r9={:#010x} r10={:#010x} r11={:#010x}",
-            ctx.x[8] as u32, ctx.x[9] as u32, ctx.x[10] as u32, ctx.x[11] as u32
+            ctx.x[8] as u32,
+            ctx.x[9] as u32,
+            ctx.x[10] as u32,
+            ctx.x[11] as u32
         );
         kprintln!(
             "           r12={:#010x} sp({})={:#010x} lr({})={:#010x}",
-            ctx.x[12] as u32, mode_label, cur_sp, mode_label, cur_lr
+            ctx.x[12] as u32,
+            mode_label,
+            cur_sp,
+            mode_label,
+            cur_lr
         );
         // Dump the instruction word at the faulting PC + 1 word of
         // surrounding context, both via stage-1 (so we honour the
@@ -246,7 +276,10 @@ pub(crate) fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
             let via_pa = crate::hv::guest_endian::guest_read_u32_pa(addr).unwrap_or(0xDEADBEEF);
             kprintln!(
                 "           insn[pc{:+#3x}] @{:#010x} = via-va:{:#010x}  via-pa:{:#010x}",
-                off, addr, via_va, via_pa,
+                off,
+                addr,
+                via_va,
+                via_pa,
             );
         }
         // Walk a few words of the source-mode stack via stage-1 — the
@@ -255,10 +288,14 @@ pub(crate) fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
         // base register so the table-pointer dereference is visible
         // even when the bad value was already overwritten in `ctx`.
         for off in 0..8u32 {
-            if let Some(w) = crate::hv::guest_endian::guest_read_u32_va(cur_sp.wrapping_add(off * 4)) {
+            if let Some(w) =
+                crate::hv::guest_endian::guest_read_u32_va(cur_sp.wrapping_add(off * 4))
+            {
                 kprintln!(
                     "           stack[sp+{:#04x}] @{:#010x} = {:#010x}",
-                    off * 4, cur_sp.wrapping_add(off * 4), w
+                    off * 4,
+                    cur_sp.wrapping_add(off * 4),
+                    w
                 );
             }
         }
@@ -387,7 +424,9 @@ fn try_absorb_rom_write(ctx: &mut TrapContext, ipa: u64, elr: u32) -> bool {
     // `read_word_va` return None — fall back to a PA-direct read,
     // matching the architectural rule that VA == IPA == PA when the
     // MMU is disabled.
-    let insn = match crate::hv::guest_endian::guest_read_u32_va(elr).or_else(|| crate::hv::guest_endian::guest_read_u32_pa(elr)) {
+    let insn = match crate::hv::guest_endian::guest_read_u32_va(elr)
+        .or_else(|| crate::hv::guest_endian::guest_read_u32_pa(elr))
+    {
         Some(v) => v,
         None => return false,
     };
@@ -418,7 +457,10 @@ fn try_absorb_rom_write(ctx: &mut TrapContext, ipa: u64, elr: u32) -> bool {
                 kprintln!(
                     "*** try_absorb_rom_write: SWP{} load PA={:#010x} outside guest memory \
                      (insn={:#010x} @ELR={:#010x}) ***",
-                    if b { "B" } else { "" }, pa, insn, elr,
+                    if b { "B" } else { "" },
+                    pa,
+                    insn,
+                    elr,
                 );
                 cpu::halt();
             }
@@ -435,7 +477,9 @@ fn try_absorb_rom_write(ctx: &mut TrapContext, ipa: u64, elr: u32) -> bool {
 /// halting.
 fn is_obviously_unreachable_ipa(ipa: u64) -> bool {
     // Inside ROM (stage-2 RO). Any write is doomed.
-    if ipa < layout::high_rom_end() { return true; }
+    if ipa < layout::high_rom_end() {
+        return true;
+    }
     // "Unknown bank #5" gap (between flash bank 2 end at 0x10400000
     // and PCMCIA0Base at 0x30000000). Einstein's TMemory silently
     // returns 0 here, and so does mmio.rs, but the kernel still gets
@@ -445,7 +489,8 @@ fn is_obviously_unreachable_ipa(ipa: u64) -> bool {
     // for the first such access per boot is cheap and decisive.
     // Skip the NO_REX_PROBE sub-window (0x10400000..0x20000000) —
     // that's a known ROM-driven scan that legitimately reads zeros.
-    if layout::UNKNOWN_BANK5.contains(ipa) { return true; }
+    if layout::UNKNOWN_BANK5.contains(ipa) {
+        return true;
+    }
     false
 }
-

@@ -57,7 +57,7 @@ src/host/sd/sdhost.rs 0xf00000 # [hw] SDHOST HC_VER field mask
 src/newton/loader.rs 0x000cc000 # [enc] Rd+Rn=R12 rewrite bits (NATIVE_PRIM)
 src/newton/loader.rs 0x000ff000 # [enc] Rd+Rn field mask (NATIVE_PRIM)
 src/newton/os.rs 0x004000b0 # [enc] STRH (immediate, A1) pattern
-src/newton/shadow_stub.rs 0x00800090 # [enc] UMULL/SMULL/UMLAL/SMLAL pattern
+src/newton/inline_patch.rs 0x00800090 # [enc] UMULL/SMULL/UMLAL/SMLAL pattern
 src/peripherals/battery.rs 0x000587c0 # [einstein] ADC scaling constant
 src/peripherals/battery.rs 0x001a2f28 # [einstein] ADC scaling constant
 src/peripherals/battery.rs 0x001a8d79 # [einstein] ADC scaling constant

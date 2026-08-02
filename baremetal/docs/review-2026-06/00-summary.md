@@ -48,8 +48,8 @@ for the documented sound follow-on work.
   save between DABT forwarding and the kernel's DFSR read resumes with
   cold-boot fault registers. (mem-M1)
 
-**Shadow-stub liveness treats conditional calls as unconditional**
-(src/shadow_stub.rs:317-358, trap-H3): `BLNE`/`SVCcc` get the
+**inline-patch liveness treats conditional calls as unconditional**
+(src/inline_patch.rs:317-358, trap-H3): `BLNE`/`SVCcc` get the
 caller-saved-clobber treatment regardless of condition, so a register live on
 the not-taken path can be reported dead and clobbered by an `unaligned_inline`
 stub. By the module's own contract this class "must not happen". Fix is cheap

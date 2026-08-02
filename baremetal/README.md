@@ -472,7 +472,7 @@ baremetal/
                          enable ritual), loader.rs (ROM load + selective
                          byteswap + CP15 rewrite), rom_patches.rs,
                          probes.rs (probe handler bodies),
-                         shadow_stub.rs (in-ROM stub pool),
+                         inline_patch.rs (in-ROM stub pool),
                          guest_trampolines.rs (UND/DABT vector
                          trampolines), unaligned.rs + unaligned_inline.rs
                          (unaligned-access fixups), rom_ver/ (per-ROM-

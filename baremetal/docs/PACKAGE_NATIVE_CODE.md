@@ -7,12 +7,12 @@ where package code stresses a hypervisor invariant is **native code
 inside a package**: it arrives at runtime in RAM (or flash), not at ROM
 load time, so it is invisible to the build-time classifier that the rest
 of the BE-8 code/data discipline leans on. This note states which
-`shadow_stub` "real code" invariants extend to that code, what the
+`inline_patch` "real code" invariants extend to that code, what the
 dynamic stage-2 rescan path guarantees, and how to triage a wedge whose
 PC is above the ROM aperture — because the bitmap-first doctrine in
 `CLAUDE.md` does **not** apply there.
 
-Grounded in: `src/newton/shadow_stub.rs`, `src/hv/stage2.rs`
+Grounded in: `src/newton/inline_patch.rs`, `src/hv/stage2.rs`
 (`set_ram_page_ro_x` / `set_ram_page_rw_xn`, `ram_l3_entry_ptr`),
 `src/hv/trap/mod.rs::handle_instruction_abort`, `src/hv/trap/dabt.rs`,
 `src/hv/guest_endian.rs`, `tools/classify-rom`.
@@ -32,7 +32,7 @@ from a vetted symbol root set and emits `reach.bitmap`: one bit per
    faulting instruction in `handle_und`. The bitmap is what tells those
    two cases apart.
 
-2. **The `shadow_stub` liveness walker** (`live_regs_at`), which walks an
+2. **The `inline_patch` liveness walker** (`live_regs_at`), which walks an
    APCS-conformant CFG forward from a PC to find dead caller-saved
    registers a stub can borrow. Its root set is the same vetted symbol
    list.
@@ -71,7 +71,7 @@ it.**
   RAM code has no such marking. This is the first thing that will bite
   package native code that isn't pure straight-line integer math.
 
-- **The `shadow_stub` inline-stub facility cannot be aimed at RAM.** Its
+- **The `inline_patch` inline-stub facility cannot be aimed at RAM.** Its
   stub pool lives in the ROM aperture and its liveness walker is seeded
   from ROM symbols; it has no notion of a RAM-resident function. Any
   `SWP`/FPA rewrite strategy for package code would need a different

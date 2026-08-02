@@ -9,7 +9,7 @@
 #   2. tools/classify-rom — walks the ROM+REx from the symbol roots and
 #      writes baremetal/classify/<hash>/reach.bitmap (plus companion
 #      region dumps), where <hash> is the FNV-1a of ROM||REx. build.rs
-#      stages reach.bitmap into the image for the shadow-stub
+#      stages reach.bitmap into the image for the inline-patch
 #      code/data classifier.
 #
 # Input selection mirrors resolve_rom_version() in build.rs: 717006

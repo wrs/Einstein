@@ -124,7 +124,7 @@ backing the hypervisor owns:
   handler dispatches — semantics-preserving because nothing is mapped
   through them.
 
-**Per-PC inline stubs** (`src/newton/shadow_stub.rs`). ARMv8 made `SWP`/`SWPB` and the
+**Per-PC inline stubs** (`src/newton/inline_patch.rs`). ARMv8 made `SWP`/`SWPB` and the
 StrongARM FPA-class coprocessor ops UNDEFINED. Rather than trap-and-emulate
 every occurrence, the hypervisor installs short AArch32 stubs in a reserved
 window of the ROM aperture (`0x00E0_0000..0x00FF_FF00`) and rewrites the
@@ -317,7 +317,7 @@ All of these wanted verification against the actual ROM or hardware rather than 
 9. **RAM-size assumptions.** *Answered for 717006.* The `kHdWr_04RAMSize` path is honored with the configuration we present; full boot + builtin apps run. Other ROM variants unverified.
 10. **PCMCIA and modem runtime assumptions.** *Answered.* 2.x boots and runs with no card present and no modem; the PCMCIA peripheral surface reports empty slots.
 11. **Display geometry and depth.** *Answered.* Newton's 320×480 2 bpp framebuffer is hypervisor-side scaled (1.5× → 480×720, centred on a 1280×720 HDMI mode) on real hw; 1:1 in the host viewer on QEMU/FVP.
-12. **Self-modifying ROM code.** *Answered.* The ROM itself is not self-modifying, but the kernel demand-pages code into RAM and rewrites it; handled by stage-2 RO+X ↔ RW+XN flipping with rescan-on-fetch (`src/hv/stage2.rs`, `src/newton/shadow_stub.rs`).
+12. **Self-modifying ROM code.** *Answered.* The ROM itself is not self-modifying, but the kernel demand-pages code into RAM and rewrites it; handled by stage-2 RO+X ↔ RW+XN flipping with rescan-on-fetch (`src/hv/stage2.rs`, `src/newton/inline_patch.rs`).
 13. **Licensing.** *Still open (decision, not finding).* The peripheral layer ports Einstein (GPLv2) state machines; confirm intended license for the hypervisor before any public release.
 14. **Input device for v1.** *Answered.* USB touchscreen (TSTP MTouch, `docs/MTOUCH.md`) on real hw; mouse-as-pen via the host viewer on QEMU/FVP.
 15. **Minimum viable v1.** *Achieved.* Pi Zero 2 W + 717006 ROM + HDMI panel with speakers + USB touch + SD card proves the architecture end-to-end.

@@ -29,7 +29,7 @@
 //! Layering: this module imports nothing above `arch` (plus same-layer
 //! `guest_mem` for the backing-array sizes). The host base address of
 //! each region's backing store is a runtime value owned by an upper
-//! layer (`guest_mem` statics, `shadow_stub::SCRATCH_POOL`,
+//! layer (`guest_mem` statics, `inline_patch::SCRATCH_POOL`,
 //! `peripherals::flash`), so it is resolved through the
 //! [`register_backing`] table that `main.rs` wires at boot instead of
 //! through direct imports.
@@ -85,7 +85,7 @@ pub enum RegionTag {
     Ram,
     /// `guest_mem::GUEST_FB`.
     Framebuffer,
-    /// `shadow_stub::SCRATCH_POOL`.
+    /// `inline_patch::SCRATCH_POOL`.
     ScratchPool,
     /// `peripherals::flash::GUEST_FLASH` (8 MiB, both banks).
     Flash,
@@ -146,7 +146,8 @@ impl Region {
             kprintln!(
                 "*** layout: region {} has no registered backing ({:?}) — \
                  main.rs must register_backing() before use ***",
-                self.name, self.tag
+                self.name,
+                self.tag
             );
             crate::arch::cpu::halt();
         }
@@ -159,7 +160,10 @@ impl Region {
     /// True when guest PA `pa` (size `sz`) lies entirely within this
     /// region's IPA window.
     pub fn contains(&self, pa: u64, sz: u64) -> bool {
-        pa >= self.ipa && pa.checked_add(sz).is_some_and(|end| end <= self.ipa + self.size)
+        pa >= self.ipa
+            && pa
+                .checked_add(sz)
+                .is_some_and(|end| end <= self.ipa + self.size)
     }
 }
 
@@ -183,7 +187,7 @@ const FB_SZ: u64 = guest_mem::FB_SIZE as u64; // 2 MiB
 // 384 KiB carve-out at IPA == VA == 0x0600_0000. Identity-mapped so:
 //   * Newton boot (kernel stage-1 on): kernel L1[VA>>20] = section
 //     descriptor identity-mapping VA→IPA. Stage-2 maps IPA →
-//     `shadow_stub::SCRATCH_POOL`.
+//     `inline_patch::SCRATCH_POOL`.
 //   * Guest-test mode (kernel stage-1 off): stage-1 is bypassed; the
 //     CPU emits VA as IPA directly. Stage-2 sees IPA == VA and maps
 //     to SCRATCH_POOL.
@@ -522,8 +526,11 @@ struct HypCodeRange {
     end: u32,
 }
 
-static mut HYP_CODE_RANGES: [HypCodeRange; MAX_HYP_CODE_RANGES] =
-    [HypCodeRange { name: "", start: 0, end: 0 }; MAX_HYP_CODE_RANGES];
+static mut HYP_CODE_RANGES: [HypCodeRange; MAX_HYP_CODE_RANGES] = [HypCodeRange {
+    name: "",
+    start: 0,
+    end: 0,
+}; MAX_HYP_CODE_RANGES];
 static HYP_CODE_RANGE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Register a guest-IPA range the hypervisor populates at runtime with
@@ -542,7 +549,9 @@ pub fn register_hyp_code_range(name: &'static str, start: u32, end: u32) {
         kprintln!(
             "*** layout: hyp-code-range table full registering {} ({:#x}..{:#x}) — \
              raise MAX_HYP_CODE_RANGES ***",
-            name, start, end
+            name,
+            start,
+            end
         );
         crate::arch::cpu::halt();
     }
@@ -617,7 +626,9 @@ pub fn cross_check() {
         if !(rom_range().contains(&(r.start as u64)) && r.end as u64 <= rom_range().end) {
             kprintln!(
                 "*** layout: hyp code range {} ({:#x}..{:#x}) outside the ROM aperture ***",
-                r.name, r.start, r.end
+                r.name,
+                r.start,
+                r.end
             );
             crate::arch::cpu::halt();
         }
@@ -659,6 +670,12 @@ const _: () = {
 // The tick page must sit inside the hardware window, and the scratch
 // pool identity-map assumption (VA == IPA) must hold.
 const _: () = {
-    assert!(HW_WINDOW.contains(TICK_PAGE_IPA), "tick page outside HW window");
-    assert!(SCRATCH_POOL_VA == SCRATCH_POOL_IPA, "scratch pool must be identity-mapped");
+    assert!(
+        HW_WINDOW.contains(TICK_PAGE_IPA),
+        "tick page outside HW window"
+    );
+    assert!(
+        SCRATCH_POOL_VA == SCRATCH_POOL_IPA,
+        "scratch pool must be identity-mapped"
+    );
 };

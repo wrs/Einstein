@@ -53,7 +53,7 @@ cargo build --release --no-default-features --features "platform-fvp-base quiet"
 cargo build --release --no-default-features --features pi-bare-metal-input     # real-hw aggregate
 cargo build --release --features "trace quiet"                   # tracer build
 
-# Guest tests (QEMU). Required whenever changes touch src/shadow_stub.rs,
+# Guest tests (QEMU). Required whenever changes touch src/inline_patch.rs,
 # src/unaligned*.rs, src/peripherals/*, src/banked.rs, src/stage2.rs,
 # src/guest.rs, generic SBA/UND/DABT/IRQ paths in src/trap.rs, or guest-tests/:
 guest-tests/scripts/run-all.sh
@@ -93,7 +93,7 @@ A baseline boot log is captured by the coordinator before Phase 1 and kept at
 
 QEMU-validatable; guest tests REQUIRED. One commit.
 
-1. **trap-H3 (verify first, then fix):** `shadow_stub::analyze_insn` /
+1. **trap-H3 (verify first, then fix):** `inline_patch::analyze_insn` /
    `live_regs_at` treat conditional `BL`/`BLX`/`SVC`/`HVC`/`SMC` as
    unconditional calls — the caller-saved clobber set
    (`APCS_CALLER_SAVED & !live` marked written) is wrong for `cond != AL`,
@@ -166,7 +166,7 @@ once for all changes.
    against the constants in `guest_mem.rs` before hardcoding). Additionally
    add `tpidr_el0`/`tpidrro_el0` to the snapshot header (defense in depth —
    the stubs stash live state there).
-2. **mem-H2:** snapshot the 384 KiB `shadow_stub::SCRATCH_POOL` region
+2. **mem-H2:** snapshot the 384 KiB `inline_patch::SCRATCH_POOL` region
    (guest-visible at IPA 0x0600_0000) alongside RAM + FB.
 3. **mem-M1:** add `far_el1`, `esr_el1`, `ifsr32_el2` to the header and
    restore path (AArch32 DFAR/DFSR/IFSR homes).
@@ -532,7 +532,7 @@ generations of install conventions" classes. Two commits.
      `install_patch { expected_orig, words, record }` API that verifies the
      original word (loud halt on mismatch — with an explicit opt-out flag
      for the genuinely optional probes, used sparingly and visibly), records
-     originals into the shadow-stub side table unconditionally, and
+     originals into the inline-patch side table unconditionally, and
      I-cache-publishes. Migrate ALL installers onto it: `patch_probe`,
      `write_stub_and_patch`, `write_stub_words`, `apply_loud_halt_traps`,
      `apply_debug_patches`, `apply_real_clock_seconds_patch`, the
@@ -613,7 +613,7 @@ Final phase — runs last so it documents the post-stabilization reality. One
 commit. No code changes (comment-only edits in source are allowed).
 
 1. **HIGHLEVEL.md:** fix §5.4 (AP flattening / shadow tables exist and are
-   load-bearing — describe what `fix_stage1_xn_bits` and `shadow_stub`
+   load-bearing — describe what `fix_stage1_xn_bits` and `inline_patch`
    actually do post-Phase-6), §3/§8 "reused" → "ported" + the cxx-core
    decision pointer to IMPLEMENTATION §1.2, drop "Status: draft".
 2. **Cargo.toml:** rewrite the `trace`/`trace_once` feature comments to match
@@ -637,7 +637,7 @@ commit. No code changes (comment-only edits in source are allowed).
    state from Phase 2. Where reset-on-resume is NOT obviously safe, say so
    and file the concern in the doc rather than hand-waving.
 6. **arch-§6:** write the package-native-code design note (`docs/`): which
-   invariants of `shadow_stub`'s "real code" definition extend to
+   invariants of `inline_patch`'s "real code" definition extend to
    runtime-loaded package code above the ROM aperture, what the dynamic
    RW+XN ↔ RO+X rescan path guarantees, and the triage recipe when a wedge
    PC is above the aperture (the bitmap-first doctrine doesn't apply there).

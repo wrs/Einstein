@@ -69,7 +69,7 @@ use core::arch::asm;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{hv::guest_mem, kprintln, arch::trap_context::TrapContext};
+use crate::{arch::trap_context::TrapContext, hv::guest_mem, kprintln};
 
 // ---- flash-persistence provider ------------------------------------
 
@@ -96,9 +96,7 @@ fn unwired_fingerprint() -> u32 {
 }
 
 fn unwired_flash_provider() -> ! {
-    kprintln!(
-        "*** snapshot: no flash provider — main.rs must set_flash_provider() before use ***"
-    );
+    kprintln!("*** snapshot: no flash provider — main.rs must set_flash_provider() before use ***");
     crate::arch::cpu::halt();
 }
 
@@ -107,12 +105,11 @@ struct FlashProviderCell(core::cell::UnsafeCell<FlashProvider>);
 // before snapshot init/save/load run; read-only afterwards.
 unsafe impl Sync for FlashProviderCell {}
 
-static FLASH_PROVIDER: FlashProviderCell = FlashProviderCell(core::cell::UnsafeCell::new(
-    FlashProvider {
+static FLASH_PROVIDER: FlashProviderCell =
+    FlashProviderCell(core::cell::UnsafeCell::new(FlashProvider {
         maybe_save: unwired_maybe_save,
         fingerprint: unwired_fingerprint,
-    },
-));
+    }));
 
 /// Install the flash-persistence provider. Called once from `main.rs`
 /// boot wiring, before `snapshot::init`.
@@ -303,7 +300,7 @@ struct Header {
 
     ram_size: u32,
     fb_size: u32,
-    /// Size of the saved `shadow_stub::SCRATCH_POOL` region (guest-
+    /// Size of the saved `inline_patch::SCRATCH_POOL` region (guest-
     /// visible RW at IPA 0x0600_0000). Serialized after FB; checked on
     /// load like ram/fb so a layout mismatch rejects the file.
     scratch_size: u32,
@@ -663,9 +660,7 @@ fn rom_fingerprint() -> u32 {
     // patches have been applied. Distinct guest binaries (different
     // test builds, ROM vs test) diverge in those bytes.
     // SAFETY: reading static backing store; single-threaded.
-    let bytes = unsafe {
-        core::slice::from_raw_parts(guest_mem::rom_host_pa() as *const u8, 1024)
-    };
+    let bytes = unsafe { core::slice::from_raw_parts(guest_mem::rom_host_pa() as *const u8, 1024) };
     let mut h: u32 = 0x811c_9dc5;
     for &b in bytes {
         h ^= b as u32;
@@ -720,8 +715,7 @@ fn peek_seq(path: &[u8]) -> Option<u64> {
     let read_result = read_all(&fh, &mut header_buf);
     close(fh);
     read_result.ok()?;
-    let header: Header =
-        unsafe { core::ptr::read_unaligned(header_buf.as_ptr() as *const Header) };
+    let header: Header = unsafe { core::ptr::read_unaligned(header_buf.as_ptr() as *const Header) };
     if header.magic != MAGIC || header.version != VERSION {
         return None;
     }
@@ -744,13 +738,13 @@ pub fn load(path: &[u8]) -> Option<RestoreState> {
     }
     // SAFETY: read-unaligned in case the buffer alignment is <8; the
     // bytes were written from a valid Header on the same target ABI.
-    let header: Header =
-        unsafe { core::ptr::read_unaligned(header_buf.as_ptr() as *const Header) };
+    let header: Header = unsafe { core::ptr::read_unaligned(header_buf.as_ptr() as *const Header) };
 
     if header.magic != MAGIC {
         kprintln!(
             "snapshot: bad magic {:#x} (want {:#x}); ignoring",
-            header.magic, MAGIC
+            header.magic,
+            MAGIC
         );
         close(fh);
         return None;
@@ -758,7 +752,8 @@ pub fn load(path: &[u8]) -> Option<RestoreState> {
     if header.version != VERSION {
         kprintln!(
             "snapshot: version {} doesn't match expected {}; ignoring",
-            header.version, VERSION
+            header.version,
+            VERSION
         );
         close(fh);
         return None;
@@ -769,7 +764,9 @@ pub fn load(path: &[u8]) -> Option<RestoreState> {
     {
         kprintln!(
             "snapshot: region sizes don't match (ram={} fb={} scratch={}); ignoring",
-            header.ram_size, header.fb_size, header.scratch_size
+            header.ram_size,
+            header.fb_size,
+            header.scratch_size
         );
         close(fh);
         return None;
@@ -811,7 +808,8 @@ pub fn load(path: &[u8]) -> Option<RestoreState> {
     if header.flash_fingerprint != current_flash_fp {
         kprintln!(
             "snapshot: flash fingerprint mismatch (file={:#010x} current={:#010x}); cold-booting",
-            header.flash_fingerprint, current_flash_fp
+            header.flash_fingerprint,
+            current_flash_fp
         );
         return None;
     }

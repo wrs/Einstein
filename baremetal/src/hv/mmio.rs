@@ -25,9 +25,9 @@
 //! and check Einstein's behaviour first — see `probe/FINDINGS.md`.
 
 use crate::hv::be8;
-use crate::{arch::cpu, hv::layout, kprintln};
 use crate::hv::layout::{MmioPolicy, MmioWindow, PeriphId};
 use crate::peripherals::{asic::Asic, dma::Dma, pcmcia::Pcmcia, serial::Serial, vic::Vic};
+use crate::{arch::cpu, hv::layout, kprintln};
 
 /// Uniform contract for a peripheral model routed by this file.
 ///
@@ -112,7 +112,7 @@ pub fn read(ctx: &crate::arch::trap_context::TrapContext, ipa: u64, sas: u8, elr
     // BE-8 (production builds): byte/halfword accesses from the guest
     // land at the natural IPA (the CPU does the byte-lane transform
     // itself). Guest-test builds run the guest LE under the legacy
-    // shadow-stub path, where inline-stub byte/halfword accesses are
+    // inline-patch path, where inline-stub byte/halfword accesses are
     // pre-XOR'd by 3/2; un-XOR here.
     #[cfg(nh_guest_test)]
     let ipa = be8::unxor_sub_word(ipa, sas);
@@ -160,9 +160,7 @@ fn read_word(ctx: &crate::arch::trap_context::TrapContext, ipa: u64, elr: u64, s
     match window_for(ipa).map(|w| w.policy) {
         Some(MmioPolicy::Peripheral(id)) => periph_read(id, ipa),
         Some(MmioPolicy::ReadZeroDropWrite) => 0,
-        Some(MmioPolicy::HaltUnknown) | None => {
-            halt_on_unknown(ctx, "read", ipa, sas, 0, elr)
-        }
+        Some(MmioPolicy::HaltUnknown) | None => halt_on_unknown(ctx, "read", ipa, sas, 0, elr),
     }
 }
 
@@ -183,7 +181,13 @@ fn peek_word(ipa: u64) -> Option<u32> {
     }
 }
 
-pub fn write(ctx: &crate::arch::trap_context::TrapContext, ipa: u64, sas: u8, value: u32, elr: u64) {
+pub fn write(
+    ctx: &crate::arch::trap_context::TrapContext,
+    ipa: u64,
+    sas: u8,
+    value: u32,
+    elr: u64,
+) {
     // BE-8 (production): byte/halfword accesses land at the natural
     // IPA. Splice the sub-word value into the addressed lane of the
     // surrounding word so the peripheral, which dispatches at word-
@@ -220,14 +224,15 @@ pub fn write(ctx: &crate::arch::trap_context::TrapContext, ipa: u64, sas: u8, va
     // address still lies in the tick page; halt so we notice if any
     // guest code legitimately writes here. Fix when / if it fires:
     // route through `backed_*_write` on `stage2::TICK_PAGE`.
-    if sas < 2
-        && (layout::TICK_PAGE_IPA..layout::TICK_PAGE_IPA + 0x1000).contains(&ipa)
-    {
+    if sas < 2 && (layout::TICK_PAGE_IPA..layout::TICK_PAGE_IPA + 0x1000).contains(&ipa) {
         kprintln!();
         kprintln!(
             "*** tick-page sub-word write reached mmio::write — \
              IPA={:#010x} size={} value={:#010x} @ELR={:#x}",
-            ipa, sas_label(sas), value, elr
+            ipa,
+            sas_label(sas),
+            value,
+            elr
         );
         kprintln!(
             "  (inline stub wrote to stage-2 RO tick page. See the \
@@ -239,9 +244,7 @@ pub fn write(ctx: &crate::arch::trap_context::TrapContext, ipa: u64, sas: u8, va
     match window_for(ipa).map(|w| w.policy) {
         Some(MmioPolicy::Peripheral(id)) => periph_write(id, ipa, value),
         Some(MmioPolicy::ReadZeroDropWrite) => {}
-        Some(MmioPolicy::HaltUnknown) | None => {
-            halt_on_unknown(ctx, "write", ipa, sas, value, elr)
-        }
+        Some(MmioPolicy::HaltUnknown) | None => halt_on_unknown(ctx, "write", ipa, sas, value, elr),
     }
 }
 
@@ -271,7 +274,10 @@ fn halt_on_unknown(
     elr: u64,
 ) -> ! {
     let width = match sas {
-        0 => "B", 1 => "H", 2 => "W", _ => "D",
+        0 => "B",
+        1 => "H",
+        2 => "W",
+        _ => "D",
     };
     let region = if layout::HW_WINDOW.contains(ipa) {
         "inside 0x0F00_0000..0x0F40_0000 (Newton hardware window — add to a peripheral model)"
@@ -300,7 +306,10 @@ fn halt_on_unknown(
     kprintln!("*** unknown MMIO {} halted ***", op);
     kprintln!(
         "  IPA    = {:#010x}  {}  value={:#010x}  @ELR={:#x}",
-        ipa, width, value, elr
+        ipa,
+        width,
+        value,
+        elr
     );
     kprintln!("  region: {}", region);
     kprintln!("  guest GPRs (AArch64 view, x[0..15] alias AArch32 r0..r15):");
@@ -308,18 +317,28 @@ fn halt_on_unknown(
         let i = row * 4;
         kprintln!(
             "    r{:02}={:#018x}  r{:02}={:#018x}  r{:02}={:#018x}  r{:02}={:#018x}",
-            i,     ctx.x[i],
-            i + 1, ctx.x[i + 1],
-            i + 2, ctx.x[i + 2],
-            i + 3, ctx.x[i + 3],
+            i,
+            ctx.x[i],
+            i + 1,
+            ctx.x[i + 1],
+            i + 2,
+            ctx.x[i + 2],
+            i + 3,
+            ctx.x[i + 3],
         );
     }
     kprintln!("  raw sysregs:");
     kprintln!("    ESR_EL2   = {:#018x}", esr);
-    kprintln!("    HPFAR_EL2 = {:#018x}  (FIPA<<8; IPA[51:12]={:#x})",
-        hpfar, (hpfar >> 4) & 0xFFFFFFFFFF);
+    kprintln!(
+        "    HPFAR_EL2 = {:#018x}  (FIPA<<8; IPA[51:12]={:#x})",
+        hpfar,
+        (hpfar >> 4) & 0xFFFFFFFFFF
+    );
     kprintln!("    FAR_EL2   = {:#018x}", far_el2);
-    kprintln!("    FAR_EL1   = {:#018x}  (may be junk if guest hasn't taken a stage-1 fault yet)", far_el1);
+    kprintln!(
+        "    FAR_EL1   = {:#018x}  (may be junk if guest hasn't taken a stage-1 fault yet)",
+        far_el1
+    );
     kprintln!("    SPSR_EL2  = {:#018x}", spsr);
     kprintln!(
         "  (Phase A contract: every unknown sub-case is a loud trip-wire, not a silent stub.)"

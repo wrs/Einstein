@@ -34,15 +34,13 @@ const S2_AP_RO: u64 = S2_AP_READ;
 const S2_SH_INNER: u64 = 0b11 << 8;
 const S2_AF: u64 = 1 << 10;
 
-const BLOCK_COMMON: u64 = DESC_VALID | DESC_BLOCK
-    | S2_MEMATTR_NORMAL_WB | S2_SH_INNER | S2_AF;
+const BLOCK_COMMON: u64 = DESC_VALID | DESC_BLOCK | S2_MEMATTR_NORMAL_WB | S2_SH_INNER | S2_AF;
 const BLOCK_NORMAL_RO: u64 = BLOCK_COMMON | S2_AP_RO;
 const BLOCK_NORMAL_RW: u64 = BLOCK_COMMON | S2_AP_RW;
 
 // L3 page descriptor — same attribute bits as a block descriptor, just
 // different type field and naturally smaller (4 KiB).
-const PAGE_COMMON: u64 = DESC_VALID | DESC_PAGE
-    | S2_MEMATTR_NORMAL_WB | S2_SH_INNER | S2_AF;
+const PAGE_COMMON: u64 = DESC_VALID | DESC_PAGE | S2_MEMATTR_NORMAL_WB | S2_SH_INNER | S2_AF;
 const PAGE_NORMAL_RO: u64 = PAGE_COMMON | S2_AP_RO;
 const PAGE_NORMAL_RW: u64 = PAGE_COMMON | S2_AP_RW;
 
@@ -67,7 +65,7 @@ static mut S2_L3_HW_TICKS: PageTable = PageTable([0; 512]);
 // L3 table refining the 2 MiB L2 slot that covers the per-stub scratch
 // carve-out at IPA 0x0600_0000 (kernel VA 0x0600_0000 mapped via
 // stage-1 L1[0x60]). Pages are populated by `install_scratch_pool`
-// and back the `shadow_stub::SCRATCH_POOL` host buffer; remaining
+// and back the `inline_patch::SCRATCH_POOL` host buffer; remaining
 // entries stay invalid and stage-2-fault if anything outside the
 // populated region is accessed.
 static mut S2_L3_SCRATCH: PageTable = PageTable([0; 512]);
@@ -118,7 +116,7 @@ const VTCR_EL2_VAL: u64 = (32 << 0)
     | (0b11 << 12)         // SH0 = inner shareable
     | (0b00 << 14)         // TG0 = 4 KiB
     | (0b010 << 16)        // PS = 40-bit
-    | (1u64 << 31);        // RES1 (DDI 0487 VTCR_EL2 description)
+    | (1u64 << 31); // RES1 (DDI 0487 VTCR_EL2 description)
 
 /// Return a mutable pointer to the L3 entry covering the 4 KiB RAM page
 /// at `ipa`. None if `ipa` is outside the 4 MiB RAM aperture.
@@ -129,7 +127,7 @@ fn ram_l3_entry_ptr(ipa: u32) -> Option<*mut u64> {
         return None;
     }
     let off = ipa64 - ram.start;
-    let table_ix = (off / TWO_MIB) as usize;         // 0 or 1
+    let table_ix = (off / TWO_MIB) as usize; // 0 or 1
     let slot_ix = ((off % TWO_MIB) / 0x1000) as usize; // 0..512
     let base = match table_ix {
         0 => addr_of_mut!(S2_L3_RAM_0) as *mut u64,
@@ -167,11 +165,15 @@ fn invalidate_ipa_s2(ipa: u32) {
 /// No-op when `ipa` is outside the RAM aperture.
 pub unsafe fn set_ram_page_ro_x(ipa: u32) {
     let page = ipa & !0xFFF;
-    let Some(entry_ptr) = ram_l3_entry_ptr(page) else { return; };
+    let Some(entry_ptr) = ram_l3_entry_ptr(page) else {
+        return;
+    };
     let host_pa = guest_mem::ram_host_pa() + (page as u64 - layout::ram_range().start);
     let new = host_pa | PAGE_NORMAL_RO;
     // SAFETY: entry_ptr bounded to one of two 512-entry L3 tables.
-    unsafe { entry_ptr.write(new); }
+    unsafe {
+        entry_ptr.write(new);
+    }
     invalidate_ipa_s2(page);
 }
 
@@ -184,11 +186,15 @@ pub unsafe fn set_ram_page_ro_x(ipa: u32) {
 /// No-op when `ipa` is outside the RAM aperture.
 pub unsafe fn set_ram_page_rw_xn(ipa: u32) {
     let page = ipa & !0xFFF;
-    let Some(entry_ptr) = ram_l3_entry_ptr(page) else { return; };
+    let Some(entry_ptr) = ram_l3_entry_ptr(page) else {
+        return;
+    };
     let host_pa = guest_mem::ram_host_pa() + (page as u64 - layout::ram_range().start);
     let new = host_pa | PAGE_NORMAL_RW | S2_XN;
     // SAFETY: entry_ptr bounded to one of two 512-entry L3 tables.
-    unsafe { entry_ptr.write(new); }
+    unsafe {
+        entry_ptr.write(new);
+    }
     invalidate_ipa_s2(page);
 }
 
@@ -205,7 +211,9 @@ unsafe fn set_l2_blocks(ipa_base: u64, host_pa_base: u64, count: u64, attrs: u64
         let pa = host_pa_base + i * TWO_MIB;
         let index = (ipa / TWO_MIB) as usize;
         // SAFETY: indices kept below 512 by caller's use of this helper.
-        unsafe { l2_ptr.add(index).write(pa | attrs); }
+        unsafe {
+            l2_ptr.add(index).write(pa | attrs);
+        }
     }
 }
 
@@ -233,14 +241,17 @@ fn cross_check_manifest() {
         if !paged && (r.ipa % TWO_MIB != 0 || r.size % TWO_MIB != 0) {
             kprintln!(
                 "*** stage2: block-mapped region {} not 2 MiB aligned (ipa={:#x} size={:#x}) ***",
-                r.name, r.ipa, r.size
+                r.name,
+                r.ipa,
+                r.size
             );
             crate::arch::cpu::halt();
         }
         if r.host_addr_for && guest_mem::host_pa_for_ipa(r.ipa, /*for_write=*/ false).is_none() {
             kprintln!(
                 "*** stage2: region {} claims host_addr_for but {:#x} is unmapped there ***",
-                r.name, r.ipa
+                r.name,
+                r.ipa
             );
             crate::arch::cpu::halt();
         }
@@ -254,7 +265,9 @@ pub unsafe fn init() {
     let l2_ptr = addr_of_mut!(S2_L2) as *mut u64;
     for i in 0..512usize {
         // SAFETY: 0 ≤ i < 512, table holds 512 entries.
-        unsafe { l2_ptr.add(i).write(0); }
+        unsafe {
+            l2_ptr.add(i).write(0);
+        }
     }
 
     // Block-mapped regions (ROM, flash bank 0/1, framebuffer) come
@@ -292,28 +305,36 @@ pub unsafe fn init() {
     // the handler re-arms the page as `RW + XN` and the write
     // retries. See `set_ram_page_{ro_x,rw_xn}`.
     // SAFETY: installs two L3 tables and points L2[32], L2[33] at them.
-    unsafe { install_ram_l3(); }
+    unsafe {
+        install_ram_l3();
+    }
 
     // Refine one 2 MiB L2 slot into 4 KiB pages so we can plant the
     // non-trapping tick register inside the otherwise-MMIO peripheral
     // window. See TICK_PAGE / tick_page::update for the rationale.
     // SAFETY: see the called helper's contract.
-    unsafe { install_tick_page(); }
+    unsafe {
+        install_tick_page();
+    }
 
     // Carve out an RW window at IPA 0x0600_0000 to back the per-stub
     // scratch pool used by inline stubs (e.g. `unaligned_inline`) and
     // the UND/DABT trampolines' banked-register save area. Stage-2 maps
-    // it to `shadow_stub::SCRATCH_POOL`; stage-1 (kernel L1[0x60]) is
+    // it to `inline_patch::SCRATCH_POOL`; stage-1 (kernel L1[0x60]) is
     // populated separately by `newton::os`'s scratch-pool L1 installer
     // on the first M=0→M=1 transition.
     // SAFETY: helper installs L3 entries and points L2[0xC] at the L3.
-    unsafe { install_scratch_pool(); }
+    unsafe {
+        install_scratch_pool();
+    }
 
     // L1[0] → L2. L1[1..] stay invalid (any IPA ≥ 1 GiB faults).
     let l1_ptr = addr_of_mut!(S2_L1) as *mut u64;
     let l2_phys = addr_of_mut!(S2_L2) as u64;
     // SAFETY: single index write.
-    unsafe { l1_ptr.write(l2_phys | DESC_VALID | DESC_TABLE); }
+    unsafe {
+        l1_ptr.write(l2_phys | DESC_VALID | DESC_TABLE);
+    }
 
     // Publish the tables and flush any stale translations.
     // SAFETY: MMU maintenance instructions.
@@ -344,7 +365,11 @@ pub unsafe fn init() {
         };
         kprintln!(
             "stage2: {} @ IPA {:#x}..{:#x} -> host PA {:#x} ({})",
-            region.name, region.ipa, region.ipa + region.size, region.host_pa(), perm
+            region.name,
+            region.ipa,
+            region.ipa + region.size,
+            region.host_pa(),
+            perm
         );
     }
     kprintln!("stage2: all other IPAs fault to EL2");
@@ -358,7 +383,10 @@ unsafe fn install_ram_l3() {
     let ram = layout::ram_range();
     let ram_pa = guest_mem::ram_host_pa();
     let n_blocks = ((ram.end - ram.start) / TWO_MIB) as usize;
-    assert!(n_blocks <= 2, "RAM L3 tables assume ≤ 2 × 2 MiB; widen if RAM grows");
+    assert!(
+        n_blocks <= 2,
+        "RAM L3 tables assume ≤ 2 × 2 MiB; widen if RAM grows"
+    );
 
     for block in 0..n_blocks {
         let l3_base = match block {
@@ -373,14 +401,20 @@ unsafe fn install_ram_l3() {
             // Initial permissions: RW, execute-never.
             let entry = host_pa | PAGE_NORMAL_RW | S2_XN;
             // SAFETY: slot < 512.
-            unsafe { l3_base.add(slot).write(entry); }
+            unsafe {
+                l3_base.add(slot).write(entry);
+            }
         }
         // Point the L2 slot at the L3 table.
         let l2_index = (block_ipa_base / TWO_MIB) as usize;
         let l2_ptr = addr_of_mut!(S2_L2) as *mut u64;
         let l3_phys = l3_base as u64;
         // SAFETY: l2_index < 512 (RAM IPAs are within the L2 table).
-        unsafe { l2_ptr.add(l2_index).write(l3_phys | DESC_VALID | DESC_TABLE); }
+        unsafe {
+            l2_ptr
+                .add(l2_index)
+                .write(l3_phys | DESC_VALID | DESC_TABLE);
+        }
     }
 }
 
@@ -405,28 +439,36 @@ unsafe fn install_tick_page() {
     // Clear the L3 table (all invalid).
     for i in 0..512usize {
         // SAFETY: 0 ≤ i < 512.
-        unsafe { l3_ptr.add(i).write(0); }
+        unsafe {
+            l3_ptr.add(i).write(0);
+        }
     }
     // L3 slot for the tick page within this L2-covered 2 MiB window.
-    let l3_index =
-        ((layout::TICK_PAGE_IPA - (l2_index as u64) * TWO_MIB) / 0x1000) as usize;
+    let l3_index = ((layout::TICK_PAGE_IPA - (l2_index as u64) * TWO_MIB) / 0x1000) as usize;
     // SAFETY: 0 ≤ l3_index < 512.
-    unsafe { l3_ptr.add(l3_index).write(tick_pa | PAGE_NORMAL_RO); }
+    unsafe {
+        l3_ptr.add(l3_index).write(tick_pa | PAGE_NORMAL_RO);
+    }
 
     // Replace the L2 slot with a table descriptor pointing at the L3.
     let l2_ptr = addr_of_mut!(S2_L2) as *mut u64;
     let l3_phys = l3_ptr as u64;
     // SAFETY: l2_index < 512.
-    unsafe { l2_ptr.add(l2_index).write(l3_phys | DESC_VALID | DESC_TABLE); }
+    unsafe {
+        l2_ptr
+            .add(l2_index)
+            .write(l3_phys | DESC_VALID | DESC_TABLE);
+    }
 
     kprintln!(
         "stage2: tick page (calendar / alarm / ticks) @ IPA {:#x} -> host PA {:#x} (RO, 4 KiB)",
-        layout::TICK_PAGE_IPA, tick_pa
+        layout::TICK_PAGE_IPA,
+        tick_pa
     );
 }
 
 /// Wire the per-stub scratch carve-out into stage-2 as RW normal-
-/// cacheable memory backed by `shadow_stub::SCRATCH_POOL`. The 2 MiB
+/// cacheable memory backed by `inline_patch::SCRATCH_POOL`. The 2 MiB
 /// L2 block covering the pool IPA is replaced with a table descriptor
 /// pointing at `S2_L3_SCRATCH`; the populated L3 entries (4 KiB each)
 /// point at the host pool. Unmapped pages stay invalid so any access
@@ -436,7 +478,7 @@ unsafe fn install_scratch_pool() {
     let l2_index = (pool_ipa / TWO_MIB) as usize; // 0xC
     let l3_ptr = addr_of_mut!(S2_L3_SCRATCH) as *mut u64;
     // The manifest region resolves the host backing
-    // (`shadow_stub::SCRATCH_POOL` via the registered resolver).
+    // (`inline_patch::SCRATCH_POOL` via the registered resolver).
     let pool_pa = match layout::region_for(pool_ipa, 4) {
         Some(r) => r.host_pa(),
         None => {
@@ -449,7 +491,9 @@ unsafe fn install_scratch_pool() {
     // Clear the L3 table (all invalid).
     for i in 0..512usize {
         // SAFETY: 0 ≤ i < 512.
-        unsafe { l3_ptr.add(i).write(0); }
+        unsafe {
+            l3_ptr.add(i).write(0);
+        }
     }
     // Map the populated pages of the SCRATCH_POOL carve-out.
     let l3_base_ipa = (l2_index as u64) * TWO_MIB;
@@ -457,14 +501,20 @@ unsafe fn install_scratch_pool() {
     for i in 0..pool_pages {
         let entry = (pool_pa + (i as u64) * 0x1000) | PAGE_NORMAL_RW;
         // SAFETY: l3_index_base + i < 512 by construction (pool fits).
-        unsafe { l3_ptr.add(l3_index_base + i).write(entry); }
+        unsafe {
+            l3_ptr.add(l3_index_base + i).write(entry);
+        }
     }
 
     // Replace the L2 slot with a table descriptor pointing at the L3.
     let l2_ptr = addr_of_mut!(S2_L2) as *mut u64;
     let l3_phys = l3_ptr as u64;
     // SAFETY: l2_index < 512.
-    unsafe { l2_ptr.add(l2_index).write(l3_phys | DESC_VALID | DESC_TABLE); }
+    unsafe {
+        l2_ptr
+            .add(l2_index)
+            .write(l3_phys | DESC_VALID | DESC_TABLE);
+    }
 
     kprintln!(
         "stage2: scratch pool @ IPA {:#x}..{:#x} -> host PA {:#x} (RW, {} KiB)",
@@ -559,6 +609,8 @@ pub unsafe fn enable() {
     }
     kprintln!(
         "stage2: HCR_EL2 = {:#x}  VTCR_EL2 = {:#x}  VTTBR_EL2 = {:#x}",
-        hcr, vtcr, vttbr
+        hcr,
+        vtcr,
+        vttbr
     );
 }

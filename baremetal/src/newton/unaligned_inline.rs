@@ -10,7 +10,7 @@
 //! This module installs an in-ROM inline stub at each faulting PC the
 //! first time we see it, so subsequent executions of the same word LDR
 //! run natively in AArch32 without trapping. The mechanism is the same
-//! as `shadow_stub` (B-to-stub, body, B-back-to-`orig_pc + 4`, in the
+//! as `inline_patch` (B-to-stub, body, B-back-to-`orig_pc + 4`, in the
 //! shared SBA stub pool); only the stub body differs.
 //!
 //! Stub body for `LDR{cond} Rt, [Rn, ±#imm]` or `[Rn, ±Rm, shift]`:
@@ -54,9 +54,9 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::newton::shadow_stub::{
-    alloc_stub_slot, encode, install_inline_at, live_regs_at,
-    read_insn_original_first, SBA_STUB_WORDS,
+use crate::newton::inline_patch::{
+    alloc_stub_slot, encode, install_inline_at, live_regs_at, read_insn_original_first,
+    SBA_STUB_WORDS,
 };
 use crate::newton::unaligned::{decode, Decoded, OffsetForm};
 
@@ -96,10 +96,17 @@ struct StatsSnapshot {
 }
 #[cfg(all(nh_diag, feature = "log_traps"))]
 static mut LAST_STATS: StatsSnapshot = StatsSnapshot {
-    installed: 0, rejected: 0,
-    rej_not_ldr: 0, rej_operand_pc: 0, rej_writeback: 0,
-    rej_offset_imm: 0, rej_no_dead: 0, rej_outside_rom: 0,
-    rej_pool_full: 0, rej_install_fail: 0, rej_decode_fail: 0,
+    installed: 0,
+    rejected: 0,
+    rej_not_ldr: 0,
+    rej_operand_pc: 0,
+    rej_writeback: 0,
+    rej_offset_imm: 0,
+    rej_no_dead: 0,
+    rej_outside_rom: 0,
+    rej_pool_full: 0,
+    rej_install_fail: 0,
+    rej_decode_fail: 0,
 };
 
 // Misra-Gries top-K of recently-rejected (no_dead_scratches) PCs. The
@@ -255,12 +262,17 @@ pub fn try_install_at(faulting_pc: u32) -> bool {
     if n <= LOG_FIRST_INSTALLS {
         crate::kprintln!(
             "unaligned_inline[{}]: installed (slot_ix={}, PC={:#010x}, sea=R{} ssh=R{})",
-            n, slot_idx, faulting_pc, sea, ssh
+            n,
+            slot_idx,
+            faulting_pc,
+            sea,
+            ssh
         );
     } else if PERIODIC_STATS_EVERY != 0 && n % PERIODIC_STATS_EVERY == 0 {
         crate::kprintln!(
             "unaligned_inline: {} stubs installed (latest PC={:#010x})",
-            n, faulting_pc
+            n,
+            faulting_pc
         );
     }
     true
@@ -297,22 +309,26 @@ fn pick_scratches(d: &Decoded, orig_pc: u32) -> Option<(u32, u32)> {
 /// Build the stub words. Layout fits in `SBA_STUB_WORDS == 16` slots;
 /// trailing slots are NOPs.
 fn build_stub_words(
-    d: &Decoded, orig_pc: u32, stub_ipa: u32, sea: u32, ssh: u32,
+    d: &Decoded,
+    orig_pc: u32,
+    stub_ipa: u32,
+    sea: u32,
+    ssh: u32,
 ) -> Result<[u32; SBA_STUB_WORDS], &'static str> {
     let mut out = [encode::nop(); SBA_STUB_WORDS];
 
     // Slots 0/1: compute EA into `sea`.
     let (slot0, slot1) = match d.offset {
         OffsetForm::Imm(imm) => encode_ea_imm(d.u, sea, d.rn, imm)?,
-        OffsetForm::Reg { rm, shift_type, shift_amount } => {
+        OffsetForm::Reg {
+            rm,
+            shift_type,
+            shift_amount,
+        } => {
             let s0 = if d.u {
-                encode::add_reg_shifted(
-                    encode::AL, sea, d.rn, rm, shift_type, shift_amount,
-                )
+                encode::add_reg_shifted(encode::AL, sea, d.rn, rm, shift_type, shift_amount)
             } else {
-                encode::sub_reg_shifted(
-                    encode::AL, sea, d.rn, rm, shift_type, shift_amount,
-                )
+                encode::sub_reg_shifted(encode::AL, sea, d.rn, rm, shift_type, shift_amount)
             };
             (s0, encode::nop())
         }
@@ -354,31 +370,19 @@ fn encode_ldr_zero(cond: u32, rt: u32, rn: u32) -> u32 {
 
 /// Encode MOV{cond} Rd, Rm, LSL #shamt — register form, S=0, type=00.
 fn encode_mov_reg_lsl_imm(cond: u32, rd: u32, rm: u32, shamt: u32) -> u32 {
-    (cond << 28)
-        | 0x01A0_0000
-        | (rd << 12)
-        | ((shamt & 0x1F) << 7)
-        | (rm & 0xF)
+    (cond << 28) | 0x01A0_0000 | (rd << 12) | ((shamt & 0x1F) << 7) | (rm & 0xF)
 }
 
 /// Encode MOV{cond} Rd, Rm, ROR Rs — register-shifted-register form,
 /// S=0, type=11 (ROR).
 fn encode_mov_reg_ror_reg(cond: u32, rd: u32, rm: u32, rs: u32) -> u32 {
-    (cond << 28)
-        | 0x01A0_0000
-        | (rd << 12)
-        | ((rs & 0xF) << 8)
-        | (3 << 5)
-        | (1 << 4)
-        | (rm & 0xF)
+    (cond << 28) | 0x01A0_0000 | (rd << 12) | ((rs & 0xF) << 8) | (3 << 5) | (1 << 4) | (rm & 0xF)
 }
 
 /// Encode the EA-compute instruction(s) for an immediate offset.
 /// Single ADD/SUB if `imm` is encodable as a modified-immediate,
 /// otherwise (high & 0xF00, low & 0xFF) — both always encodable.
-fn encode_ea_imm(
-    u: bool, sea: u32, rn: u32, imm: u32,
-) -> Result<(u32, u32), &'static str> {
+fn encode_ea_imm(u: bool, sea: u32, rn: u32, imm: u32) -> Result<(u32, u32), &'static str> {
     if imm > 0xFFF {
         return Err("imm > 0xFFF");
     }
@@ -475,15 +479,25 @@ pub fn log_stats() {
 
     crate::kprintln!(
         "unaligned_inline: installed={} (+{}) rejected={} (+{}) since boot",
-        installed, d_installed, rejected, d_rejected
+        installed,
+        d_installed,
+        rejected,
+        d_rejected
     );
     if d_rejected != 0 {
         crate::kprintln!(
             "  Δ window: decode={} not_ldr={} operand_pc={} writeback={} \
              no_dead_scratches={} outside_rom={} pool_full={} install_fail={} \
              imm_too_big={}",
-            d_decode, d_not_ldr, d_operand_pc, d_writeback,
-            d_no_dead, d_outside_rom, d_pool_full, d_install_fail, d_imm,
+            d_decode,
+            d_not_ldr,
+            d_operand_pc,
+            d_writeback,
+            d_no_dead,
+            d_outside_rom,
+            d_pool_full,
+            d_install_fail,
+            d_imm,
         );
     }
 
@@ -500,7 +514,9 @@ pub fn log_stats() {
         let print_top = 8.min(REJ_TOPK);
         for k in 0..print_top {
             let (pc, c) = pcs[k];
-            if c == 0 { break; }
+            if c == 0 {
+                break;
+            }
             crate::kprintln!("    PC={:#010x}: >={}", pc, c);
         }
     }

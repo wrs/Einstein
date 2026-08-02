@@ -10,7 +10,7 @@
 //! write-then-read of a single byte round-trips (periph-H2/periph-M1).
 //!
 //! Guest-test builds (`nh_guest_test`) run the guest LE under the
-//! legacy shadow-stub path, where inline-stub byte/halfword accesses
+//! legacy inline-patch path, where inline-stub byte/halfword accesses
 //! are pre-XOR'd by 3/2; [`unxor_sub_word`] undoes that instead, and
 //! the lane splice/extract path is compiled out.
 
@@ -38,7 +38,11 @@ pub const fn byte_lane_shift(ipa: u64) -> u32 {
 #[cfg(not(nh_guest_test))]
 pub const fn halfword_lane_shift(ipa: u64) -> u32 {
     let lane = ((ipa >> 1) & 1) as u32;
-    if lane == 0 { 16 } else { 0 }
+    if lane == 0 {
+        16
+    } else {
+        0
+    }
 }
 
 /// Splice a guest BE-8 byte write into the existing word `prev`.
@@ -73,12 +77,14 @@ pub const fn extract_sub_word(word: u32, ipa: u64, sas: u8) -> u32 {
 
 /// Un-XOR the BE-32 byte / halfword XOR that the inline-stub emitter
 /// applies before an MMIO-range access. Only used in guest-test mode
-/// (the legacy shadow-stub path). Above XOR_LIMIT (PCMCIA etc.),
+/// (the legacy inline-patch path). Above XOR_LIMIT (PCMCIA etc.),
 /// inline stubs skip the XOR and we shouldn't un-XOR.
 #[cfg(nh_guest_test)]
 pub const fn unxor_sub_word(ipa: u64, sas: u8) -> u64 {
     const XOR_LIMIT: u64 = 0x1000_0000;
-    if ipa >= XOR_LIMIT { return ipa; }
+    if ipa >= XOR_LIMIT {
+        return ipa;
+    }
     match sas {
         0 => ipa ^ 3,
         1 => ipa ^ 2,

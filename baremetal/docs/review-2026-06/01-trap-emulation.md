@@ -2,7 +2,7 @@
 
 > Review agent report, 2026-06-11, at working copy `somv 8b564c93`.
 > Scope: `src/trap.rs`, `unaligned.rs`, `unaligned_inline.rs`, `banked.rs`,
-> `hvc_imm.rs`, `guest_bp.rs`, `shadow_stub.rs`, `shadow_pool.rs`,
+> `hvc_imm.rs`, `guest_bp.rs`, `inline_patch.rs`, `shadow_pool.rs`,
 > `trap_hist.rs` (working-copy state, including the WIP "audit silent-default
 > guest reads" changes). Line numbers refer to that revision.
 
@@ -28,7 +28,7 @@ if faulting_pc & 3 != 0 || decoded_maybe.is_none() {
 An unreadable faulting PC becomes `insn = 0`, which fails decode, which takes the SKIP path: the load/store is *never performed* and the guest resumes at PC+4 with a stale Rt / unwritten memory. The comment calls it an "early-boot diagnostic", but it is permanent, and after the first 40 events it is completely silent. This is precisely the "silent default on an emulation path" category the current WIP commit is eliminating elsewhere (`handle_und` save slots, `handle_dah_mrs_spsr_patch`, `handle_dabt_dispatch` all now halt loudly). A genuine alignment fault whose instruction we can't emulate is guest-state corruption in flight. **Fix:** halt loudly with the usual context dump (`dump_state`) for both the unreadable-insn and undecodable-insn cases; keep a skip only if there's a documented, reproducible early-boot case that needs it — and then gate and count it.
 
 ### H3. Suspected unsound liveness treatment of conditional calls in the scratch-register picker
-`src/shadow_stub.rs:317-328, 344-358, 715-721`
+`src/inline_patch.rs:317-328, 344-358, 715-721`
 
 `analyze_insn` classifies *any* BL (and any SVC/HVC/SMC) as `BranchKind::BLink` regardless of its condition field, and the walker then marks `APCS_CALLER_SAVED & !live` as **written**. For a conditional call (`BLNE foo`, `SVCcc`), the not-taken path preserves R0–R3/R12/R14, so a later read of one of those registers on the not-taken path is a real upward-exposed use — but the analyzer sees it as "already written" and reports the register dead. Per the module's own contract ("false negatives … are correctness bugs and must not happen"), this is a latent wrong-code path: `unaligned_inline` would clobber a live register in its stub. Note the analyzer is otherwise careful about conditions (data-processing/load writes only count when `cond_al`), which makes the BL case look like an oversight rather than a decision. **Fix:** for `cond != AL` calls, don't add the caller-saved clobber to `written` (treat reads-side conservatively as live, same as the conditional-write rule); same for conditional SVC/HVC/SMC. Cheap, strictly conservative.
 
@@ -95,7 +95,7 @@ Verified with `arm-none-eabi-objdump`: `0xE7FF_F0FE` disassembles as `udf #0xff0
 Both 5-bit fields index `ctx.x[..31]`. For AArch32 traps the architecture reports the mapped AArch64 register (≤30), so this shouldn't fire — but if it ever does, the failure is a Rust panic at EL2 rather than the project-standard context dump. A one-line `if srt == 31` loud-halt (or WZR semantics) would make the trip-wire explicit. (Flagging as a suspicion per the "don't trust memory for encodings" rule — worth a check against `docs/ARM_Reference.txt` ISS.SRT semantics.)
 
 ### L3. Stale SAFETY comment on runtime code patching
-`src/shadow_stub.rs:96-98` — `code_write_word`'s SAFETY says writes are "race-free against the guest before stage2 enable", but `unaligned_inline::try_install_at` calls it at runtime from the alignment-fault handler, long after stage-2 enable. The actual invariant (guest is paused in an EL2 trap on the only core) is fine — the comment justifies the wrong thing.
+`src/inline_patch.rs:96-98` — `code_write_word`'s SAFETY says writes are "race-free against the guest before stage2 enable", but `unaligned_inline::try_install_at` calls it at runtime from the alignment-fault handler, long after stage-2 enable. The actual invariant (guest is paused in an EL2 trap on the only core) is fine — the comment justifies the wrong thing.
 
 ### L4. Rejected unaligned-PCs re-run full eligibility (incl. CFG liveness walk) on every fault
 `src/unaligned_inline.rs:179-287` — a PC that fails `pick_scratches` pays decode + `live_regs_at` (up to 64 blocks × 32 instructions) on *every* subsequent alignment fault, in the path that was identified as the dominant trap source (~3.4 M faults/s). A small "known-rejected PC" cache (even 32 entries) would remove the recurring cost. The existing `REJ_NO_DEAD_PCS` top-K shows the team already measures this.

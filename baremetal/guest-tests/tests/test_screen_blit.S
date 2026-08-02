@@ -78,7 +78,7 @@ test_main:
     @ ---- Plant bitmap bytes (8 bytes, 2 rows * 4 bytes) ----
     @ The screen.blit handler reads source pixmap bytes in BE-32
     @ word-invariant order (read_byte_pa(pa ^ 3)) — the same
-    @ convention shadow_stub uses for guest LDRB. To feed it the
+    @ convention inline_patch uses for guest LDRB. To feed it the
     @ logical byte stream "DE AD BE EF / CA FE BA BE", plant the
     @ STR'd word as the BE-byte-stream encoded as an integer:
     @   STR 0xDEADBEEF → host LE bytes EF BE AD DE

@@ -94,14 +94,14 @@ fn read_cntfrq() -> u64 {
 #[derive(Default)]
 struct VicState {
     // ---- Stateful in Einstein (TInterruptManager:492-507) -------------
-    int_present: u32,       // 0x0F183000  mIntRaised
-    int_ctrl: u32,          // 0x0F183400  mIntCtrlReg
+    int_present: u32, // 0x0F183000  mIntRaised
+    int_ctrl: u32,    // 0x0F183400  mIntCtrlReg
     // int_clear is write-only in Einstein; clears bits in mIntRaised.
-    fiq_mask: u32,          // 0x0F183C00  mFIQMask
-    int_ed_1: u32,          // 0x0F184000  mIntEDReg1
-    int_ed_2: u32,          // 0x0F184400  mIntEDReg2
-    int_ed_3: u32,          // 0x0F184800  mIntEDReg3
-    match_reg: [u32; 4],    // 0x0F182000/400/800/C00  mMatchReg[0..3]
+    fiq_mask: u32,       // 0x0F183C00  mFIQMask
+    int_ed_1: u32,       // 0x0F184000  mIntEDReg1
+    int_ed_2: u32,       // 0x0F184400  mIntEDReg2
+    int_ed_3: u32,       // 0x0F184800  mIntEDReg3
+    match_reg: [u32; 4], // 0x0F182000/400/800/C00  mMatchReg[0..3]
     // Edge-detection state: bit i is set once the corresponding match
     // register has fired since its last write. We only raise the timer
     // interrupt on the rising edge; otherwise the handler clearing
@@ -112,20 +112,20 @@ struct VicState {
     // RTC alarm-match: stored alarm value (in seconds since 1904 in the
     // calendar domain) and a single-bit edge-detect latch. Cleared on
     // alarm register write so a new alarm can fire.
-    alarm_reg: u32,         // 0x0F181400  via SetAlarm/GetAlarm
+    alarm_reg: u32, // 0x0F181400  via SetAlarm/GetAlarm
     alarm_fired: bool,
     // GPIO interrupt registers (Einstein TInterruptManager.h:510,513).
-    gpio_r: u32,            // 0x0F18C000  mGPIORaised
-    gpio_e: u32,            // 0x0F18C400  mGPIOCtrlReg
-    // ---- NOT stateful in Einstein ------------------------------------
-    // The following addresses fall through to the unknown-bank-#3 default
-    // in Einstein's TMemory.cpp Bank #3 read path (lines 950-960 = 0)
-    // and write path (lines 1903-1913 = silent log + drop). Do not store
-    // their writes here. Reads return 0. Listed for documentation:
-    //   0x0F110000, 0x0F111400, 0x0F180400, 0x0F185000,
-    //   0x0F18C800 (kHdWr_GPIO_CReg — write goes to ClearGPIO, no state),
-    //   0x0F18CC00, 0x0F18D000, 0x0F18D800, 0x0F18DC00,
-    //   0x0F18E000, 0x0F18E800, 0x0F18EC00.
+    gpio_r: u32, // 0x0F18C000  mGPIORaised
+    gpio_e: u32, // 0x0F18C400  mGPIOCtrlReg
+                 // ---- NOT stateful in Einstein ------------------------------------
+                 // The following addresses fall through to the unknown-bank-#3 default
+                 // in Einstein's TMemory.cpp Bank #3 read path (lines 950-960 = 0)
+                 // and write path (lines 1903-1913 = silent log + drop). Do not store
+                 // their writes here. Reads return 0. Listed for documentation:
+                 //   0x0F110000, 0x0F111400, 0x0F180400, 0x0F185000,
+                 //   0x0F18C800 (kHdWr_GPIO_CReg — write goes to ClearGPIO, no state),
+                 //   0x0F18CC00, 0x0F18D000, 0x0F18D800, 0x0F18DC00,
+                 //   0x0F18E000, 0x0F18E800, 0x0F18EC00.
 }
 
 struct VicCell(UnsafeCell<VicState>);
@@ -234,7 +234,9 @@ fn init_calendar() {
     // earlier post-stage-2 seed ran while the baseline was still zero.)
     crate::kprintln!(
         "vic: calendar = {} seconds since 1904-01-01 (host unix_time={}, offset={}s back)",
-        secs_since_1904, unix_time, RTC_HOST_TIME_OFFSET_SECONDS
+        secs_since_1904,
+        unix_time,
+        RTC_HOST_TIME_OFFSET_SECONDS
     );
 }
 
@@ -256,7 +258,7 @@ const INT_TIMER_0: u32 = 0x0000_0008;
 const INT_TIMER_1: u32 = 0x0000_0010;
 const INT_TIMER_2: u32 = 0x0000_0020;
 const INT_TIMER_3: u32 = 0x0000_0040;
-const INT_DMA_CH5: u32 = 0x0000_1000;   // sound output / tablet rcv
+const INT_DMA_CH5: u32 = 0x0000_1000; // sound output / tablet rcv
 pub const INT_GPIO: u32 = 0x0100_0000;
 /// Tablet (digitizer) pen-event interrupt. Einstein's
 /// `TInterruptManager.h:81 kTabletIntMask`. Raised by
@@ -375,8 +377,7 @@ pub fn poll_timer_matches() {
     ] {
         let slot_bit = 1u32 << i;
         let already_fired = (s.match_fired & slot_bit) != 0;
-        let crossed = s.match_reg[i] != 0
-            && now.wrapping_sub(s.match_reg[i]) < 0x8000_0000;
+        let crossed = s.match_reg[i] != 0 && now.wrapping_sub(s.match_reg[i]) < 0x8000_0000;
         if crossed && !already_fired {
             raise |= bit;
             s.match_fired |= slot_bit;
@@ -419,8 +420,12 @@ pub fn next_pending_match() -> Option<u32> {
     let mut best: Option<u32> = None;
     for i in 0..4usize {
         let slot_bit = 1u32 << i;
-        if (s.match_fired & slot_bit) != 0 { continue; }
-        if s.match_reg[i] == 0 { continue; }
+        if (s.match_fired & slot_bit) != 0 {
+            continue;
+        }
+        if s.match_reg[i] == 0 {
+            continue;
+        }
         // Only consider matches in the near future (or already crossed).
         // Distant future deadlines (> 2^31 ticks away) we treat as stale.
         let delta = s.match_reg[i].wrapping_sub(now);
@@ -431,7 +436,11 @@ pub fn next_pending_match() -> Option<u32> {
         best = Some(match best {
             None => s.match_reg[i],
             Some(cur) => {
-                if delta < cur.wrapping_sub(now) { s.match_reg[i] } else { cur }
+                if delta < cur.wrapping_sub(now) {
+                    s.match_reg[i]
+                } else {
+                    cur
+                }
             }
         });
     }
@@ -514,7 +523,7 @@ const K_HDWR_GPIO_EC00: u64 = 0x0F18_EC00;
 /// code-path symmetry, but those writes have no observable effect.
 ///
 /// Why not wall-anchored on QEMU: under QEMU TCG with `--features
-/// trace,quiet` and the shadow-stub UDF emulator we execute ~100×
+/// trace,quiet` and the inline-patch UDF emulator we execute ~100×
 /// fewer guest instructions per host wall-second than Einstein's JIT
 /// does (each HVC trampoline alone costs ~30 µs). When the kernel's
 /// polling loops (TBIOInterface::WaitBIOStatus, TDelayTimer::TimedOut
@@ -644,38 +653,38 @@ pub fn heartbeat_tick_update() {
     return;
     #[cfg(nh_semihost)]
     {
-    static LAST_HEARTBEAT_TICK: AtomicU32 = AtomicU32::new(0);
-    let last = LAST_HEARTBEAT_TICK.load(Ordering::Acquire);
-    let cur = SYNTH_TICKS.load(Ordering::Acquire);
-    let no_guest_progress = cur == last;
+        static LAST_HEARTBEAT_TICK: AtomicU32 = AtomicU32::new(0);
+        let last = LAST_HEARTBEAT_TICK.load(Ordering::Acquire);
+        let cur = SYNTH_TICKS.load(Ordering::Acquire);
+        let no_guest_progress = cur == last;
 
-    // Apply the heartbeat's own tick advance — needed so non-trapping
-    // busy-wait loops on TICK_PAGE see forward progress at all.
-    let after = tick_advance_heartbeat();
+        // Apply the heartbeat's own tick advance — needed so non-trapping
+        // busy-wait loops on TICK_PAGE see forward progress at all.
+        let after = tick_advance_heartbeat();
 
-    // If the guest hadn't moved since the last heartbeat AND there's
-    // a pending match deadline, jump past it. This trims wake latency
-    // for WFI-on-match scenarios from "deadline / Δ_heartbeat * 16 ms"
-    // down to one heartbeat.
-    let final_value = if no_guest_progress {
-        if let Some(deadline) = next_pending_match() {
-            let target = if deadline.wrapping_sub(after) < 0x8000_0000 {
-                // Deadline is at or after the just-advanced value.
-                deadline.wrapping_add(1)
+        // If the guest hadn't moved since the last heartbeat AND there's
+        // a pending match deadline, jump past it. This trims wake latency
+        // for WFI-on-match scenarios from "deadline / Δ_heartbeat * 16 ms"
+        // down to one heartbeat.
+        let final_value = if no_guest_progress {
+            if let Some(deadline) = next_pending_match() {
+                let target = if deadline.wrapping_sub(after) < 0x8000_0000 {
+                    // Deadline is at or after the just-advanced value.
+                    deadline.wrapping_add(1)
+                } else {
+                    // Deadline already crossed; nothing to do.
+                    after
+                };
+                SYNTH_TICKS.store(target, Ordering::Release);
+                target
             } else {
-                // Deadline already crossed; nothing to do.
                 after
-            };
-            SYNTH_TICKS.store(target, Ordering::Release);
-            target
+            }
         } else {
             after
-        }
-    } else {
-        after
-    };
+        };
 
-    LAST_HEARTBEAT_TICK.store(final_value, Ordering::Release);
+        LAST_HEARTBEAT_TICK.store(final_value, Ordering::Release);
     }
 }
 
@@ -769,10 +778,17 @@ fn write(ipa: u64, value: u32) {
     // Log architecturally-significant VIC writes for diagnostic purposes.
     // Budget-limited so we don't drown in logs.
     static WRITE_LOG: LogBudget = LogBudget::new(32);
-    let interesting = matches!(ipa,
-        K_HDWR_MATCH_0 | K_HDWR_MATCH_1 | K_HDWR_MATCH_2 | K_HDWR_MATCH_3
-        | K_HDWR_INT_CTRL | K_HDWR_FIQ_MASK
-        | K_HDWR_INT_ED_1 | K_HDWR_INT_ED_2 | K_HDWR_INT_ED_3
+    let interesting = matches!(
+        ipa,
+        K_HDWR_MATCH_0
+            | K_HDWR_MATCH_1
+            | K_HDWR_MATCH_2
+            | K_HDWR_MATCH_3
+            | K_HDWR_INT_CTRL
+            | K_HDWR_FIQ_MASK
+            | K_HDWR_INT_ED_1
+            | K_HDWR_INT_ED_2
+            | K_HDWR_INT_ED_3
     );
     if interesting && WRITE_LOG.allow() {
         crate::kprintln!("vic: write IPA={:#010x} <- {:#010x}", ipa, value);
@@ -804,10 +820,26 @@ fn write(ipa: u64, value: u32) {
         // SetTimerMatchRegister which updates the match value and
         // recomputes the next deadline. We re-arm the EL2 timer via
         // timer::rearm() at the end.
-        K_HDWR_MATCH_0 => { s.match_reg[0] = value; s.match_fired &= !0b0001; match_reprogrammed = true; }
-        K_HDWR_MATCH_1 => { s.match_reg[1] = value; s.match_fired &= !0b0010; match_reprogrammed = true; }
-        K_HDWR_MATCH_2 => { s.match_reg[2] = value; s.match_fired &= !0b0100; match_reprogrammed = true; }
-        K_HDWR_MATCH_3 => { s.match_reg[3] = value; s.match_fired &= !0b1000; match_reprogrammed = true; }
+        K_HDWR_MATCH_0 => {
+            s.match_reg[0] = value;
+            s.match_fired &= !0b0001;
+            match_reprogrammed = true;
+        }
+        K_HDWR_MATCH_1 => {
+            s.match_reg[1] = value;
+            s.match_fired &= !0b0010;
+            match_reprogrammed = true;
+        }
+        K_HDWR_MATCH_2 => {
+            s.match_reg[2] = value;
+            s.match_fired &= !0b0100;
+            match_reprogrammed = true;
+        }
+        K_HDWR_MATCH_3 => {
+            s.match_reg[3] = value;
+            s.match_fired &= !0b1000;
+            match_reprogrammed = true;
+        }
         // IntCtrlReg: Einstein TMemory.cpp:1882-1884 calls
         // SetIntCtrlReg which stores the value (TInterruptManager.cpp).
         K_HDWR_INT_CTRL => {
@@ -821,7 +853,11 @@ fn write(ipa: u64, value: u32) {
                         "vic: int_ctrl {:#x} -> {:#x} (dma5 {})",
                         before,
                         value,
-                        if value & INT_DMA_CH5 != 0 { "on" } else { "off" }
+                        if value & INT_DMA_CH5 != 0 {
+                            "on"
+                        } else {
+                            "off"
+                        }
                     );
                 }
             }
@@ -877,24 +913,15 @@ fn write(ipa: u64, value: u32) {
         // and silently drop. The kernel may try to write here through
         // a "convenient name" path; match the silent drop instead of
         // halting.
-        K_HDWR_INT_PRESENT
-        | K_HDWR_GPIO_R => { /* drop per Einstein */ }
+        K_HDWR_INT_PRESENT | K_HDWR_GPIO_R => { /* drop per Einstein */ }
 
         // ---- Not modeled by Einstein at all → silent drop --------------
         // These addresses fall through to Einstein's "unknown bank #3"
         // write default at TMemory.cpp:1903-1913 (FLogLine + drop). Match
         // that — no state change, no error.
-        K_HDWR_P0F110000
-        | K_HDWR_P0F111400
-        | K_HDWR_P0F180400
-        | K_HDWR_P0F185000
-        | K_HDWR_GPIO_CC00
-        | K_HDWR_GPIO_D000
-        | K_HDWR_GPIO_D800
-        | K_HDWR_GPIO_DC00
-        | K_HDWR_GPIO_E000
-        | K_HDWR_GPIO_E800
-        | K_HDWR_GPIO_EC00 => { /* drop per Einstein */ }
+        K_HDWR_P0F110000 | K_HDWR_P0F111400 | K_HDWR_P0F180400 | K_HDWR_P0F185000
+        | K_HDWR_GPIO_CC00 | K_HDWR_GPIO_D000 | K_HDWR_GPIO_D800 | K_HDWR_GPIO_DC00
+        | K_HDWR_GPIO_E000 | K_HDWR_GPIO_E800 | K_HDWR_GPIO_EC00 => { /* drop per Einstein */ }
 
         _ => halt_vic_unknown("write", ipa, value),
     }

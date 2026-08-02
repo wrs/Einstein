@@ -1,7 +1,7 @@
 //! Function-level execution trace (every-call, with argument registers).
 //!
 //! `build.rs` parses `scripts/classify-out/code-symbols.txt` (the curated
-//! code-only symbol list the shadow-stub classifier's walker also uses)
+//! code-only symbol list the inline-patch classifier's walker also uses)
 //! and emits three blobs into OUT_DIR unconditionally — `crate::diag::symbols`
 //! includes them for PC→name lookup in halt-path stack traces, and this
 //! module consults them for its trampoline pool when `trace` is enabled:
@@ -59,15 +59,15 @@
 //! Changes the snapshot ROM fingerprint (many ROM words move), so runs
 //! with `trace` enabled always cold-boot in practice.
 
+use crate::arch::trap_context::TrapContext;
 use crate::hv::guest_mem;
 use crate::kprintln;
-use crate::arch::trap_context::TrapContext;
 
 // Symbol-table backing storage lives in `crate::diag::symbols` (always
 // available). Re-export the raw helpers here so the rest of this
 // file's code reads as it did before the extract.
+use crate::diag::symbols::{fn_addr, fn_name, FN_COUNT};
 use crate::hv::hvc_imm::HvcImm;
-use crate::diag::symbols::{FN_COUNT, fn_addr, fn_name};
 
 /// Trampoline pool IPA range. Lives inside the ROM backing (which is
 /// 16 MiB stage-2 RO, sections 9..F of the guest's stage-1 L1 identity-
@@ -82,8 +82,7 @@ const SLOT_WORDS: usize = 5;
 const SLOT_SIZE: u32 = (SLOT_WORDS as u32) * 4;
 
 /// Sequence counter for the trace log. Bumped on every HVC fire.
-static TRACE_SEQ: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+static TRACE_SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Per-function "already logged" bitmap, used by the `trace_once`
 /// feature to gate the main trace line. One bit per slot index;
@@ -105,8 +104,7 @@ fn already_fired(_idx: usize) -> bool {
     {
         let word = _idx / 32;
         let bit = 1u32 << (_idx & 31);
-        let prev = FIRED_BITMAP[word]
-            .fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
+        let prev = FIRED_BITMAP[word].fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
         return (prev & bit) != 0;
     }
     #[cfg(not(feature = "trace_once"))]
@@ -118,7 +116,6 @@ fn already_fired(_idx: usize) -> bool {
 /// True once `init()` has installed the trampolines. Prevents double-install
 /// if called from multiple boot paths (e.g. cold boot vs. snapshot resume).
 static mut INITIALISED: bool = false;
-
 
 /// ROM ranges we must not overwrite with a `B trampoline`:
 ///   - VA 0x00..0x20: ARM vector table. The reset vector at 0x00 runs
@@ -137,24 +134,28 @@ static mut INITIALISED: bool = false;
 ///     there; the tracer overwriting it would silently mask the trap.
 pub fn in_reserved_range(addr: u32) -> bool {
     use crate::newton::rom_ver;
-    if addr < 0x0000_0020 { return true; }
-    if (crate::newton::shadow_stub::SBA_STUB_POOL_IPA
-        ..crate::newton::shadow_stub::SBA_STUB_POOL_END)
+    if addr < 0x0000_0020 {
+        return true;
+    }
+    if (crate::newton::inline_patch::SBA_STUB_POOL_IPA
+        ..crate::newton::inline_patch::SBA_STUB_POOL_END)
         .contains(&addr)
     {
         return true;
     }
     // The contiguous ROM-tail cluster: patch-stub arena, FPA-class UND
     // bypass stub, UND trampoline, DABT trampoline, UND return stub.
-    if (rom_ver::ROM_TAIL.patch_stub_arena_base..rom_ver::ROM_TAIL.stubs_end)
-        .contains(&addr)
-    {
+    if (rom_ver::ROM_TAIL.patch_stub_arena_base..rom_ver::ROM_TAIL.stubs_end).contains(&addr) {
         return true;
     }
     if let Some(lh) = rom_ver::LOUD_HALT {
-        if addr == lh.poweroff_reboot.pc || addr == lh.reboot.pc { return true; }
+        if addr == lh.poweroff_reboot.pc || addr == lh.reboot.pc {
+            return true;
+        }
     }
-    if rom_ver::BOOT.is_some_and(|b| b.bootos.pc == addr) { return true; }
+    if rom_ver::BOOT.is_some_and(|b| b.bootos.pc == addr) {
+        return true;
+    }
     false
 }
 
@@ -164,7 +165,9 @@ pub fn in_reserved_range(addr: u32) -> bool {
 fn encode_b(from_pc: u32, target: u32) -> Option<u32> {
     let pc_plus_8 = from_pc.wrapping_add(8);
     let offset = (target as i64) - (pc_plus_8 as i64);
-    if offset & 3 != 0 { return None; }
+    if offset & 3 != 0 {
+        return None;
+    }
     let offset_words = offset >> 2;
     if !(-(1i64 << 23)..(1i64 << 23)).contains(&offset_words) {
         return None;
@@ -192,10 +195,14 @@ fn rewrite_first_insn(orig: u32, orig_pc: u32) -> Option<(u32, u32)> {
         // PC destination LDR isn't a prologue pattern — if we see it
         // here it's likely a thunk/tail jump; skip (we can't both log
         // AND transfer control safely).
-        if rd == 0xF { return None; }
+        if rd == 0xF {
+            return None;
+        }
         let imm = orig & 0xFFF;
         let literal_addr = orig_pc.wrapping_add(8).wrapping_add(imm);
-        if literal_addr >= 0x0100_0000 { return None; }
+        if literal_addr >= 0x0100_0000 {
+            return None;
+        }
         // Read the literal as the Newton-side numerical value the
         // AArch32 LDR would see at run time.
         let literal = crate::hv::guest_endian::guest_read_u32_pa(literal_addr)?;
@@ -244,7 +251,9 @@ fn rewrite_first_insn(orig: u32, orig_pc: u32) -> Option<(u32, u32)> {
     let is_sub_pc = (orig & 0x0FFF_0000) == 0x024F_0000;
     if is_add_pc || is_sub_pc {
         let rd = (orig >> 12) & 0xF;
-        if rd == 0xF { return None; }  // PC destination — bail.
+        if rd == 0xF {
+            return None;
+        } // PC destination — bail.
         let imm8 = orig & 0xFF;
         let rot = ((orig >> 8) & 0xF) * 2;
         let imm = imm8.rotate_right(rot);
@@ -275,17 +284,19 @@ fn rewrite_first_insn(orig: u32, orig_pc: u32) -> Option<(u32, u32)> {
 pub fn init() {
     // SAFETY: single-threaded at boot; `INITIALISED` is only consulted/set here.
     unsafe {
-        if INITIALISED { return; }
+        if INITIALISED {
+            return;
+        }
         INITIALISED = true;
     }
 
     let rom_base = guest_mem::rom_host_pa() as *mut u32;
-    let pool_capacity =
-        ((TRAMPOLINE_END - TRAMPOLINE_IPA) / SLOT_SIZE) as usize;
+    let pool_capacity = ((TRAMPOLINE_END - TRAMPOLINE_IPA) / SLOT_SIZE) as usize;
     if FN_COUNT > pool_capacity {
         kprintln!(
             "trace: WARNING — {} functions, pool holds only {} slots; truncating",
-            FN_COUNT, pool_capacity
+            FN_COUNT,
+            pool_capacity
         );
     }
     let n = FN_COUNT.min(pool_capacity);
@@ -366,7 +377,11 @@ pub fn init() {
 
     kprintln!(
         "trace: patched {} / {} entries ({} reserved, {} rewrite-skip, {} B out-of-reach)",
-        patched, n, skipped_reserved, skipped_rewrite, skipped_b_reach
+        patched,
+        n,
+        skipped_reserved,
+        skipped_rewrite,
+        skipped_b_reach
     );
 }
 
@@ -397,7 +412,9 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
     if slot_base < TRAMPOLINE_IPA || slot_base >= TRAMPOLINE_END {
         kprintln!(
             "trace: slot_base={:#x} outside trampoline pool ({:#x}..{:#x})",
-            slot_base, TRAMPOLINE_IPA, TRAMPOLINE_END
+            slot_base,
+            TRAMPOLINE_IPA,
+            TRAMPOLINE_END
         );
         return;
     }
@@ -405,7 +422,8 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
     if slot_offset % SLOT_SIZE != 0 {
         kprintln!(
             "trace: slot_base={:#x} not aligned (offset={:#x})",
-            slot_base, slot_offset
+            slot_base,
+            slot_offset
         );
         return;
     }
@@ -420,8 +438,14 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
         .wrapping_add(1);
     let mode = spsr & 0x1F;
     let mode_label = match mode {
-        0x10 => "usr", 0x11 => "fiq", 0x12 => "irq", 0x13 => "svc",
-        0x17 => "abt", 0x1B => "und", 0x1F => "sys", _ => "???",
+        0x10 => "usr",
+        0x11 => "fiq",
+        0x12 => "irq",
+        0x13 => "svc",
+        0x17 => "abt",
+        0x1B => "und",
+        0x1F => "sys",
+        _ => "???",
     };
 
     // Mode-aware SP / LR. Per ARM ARM Table D1-79 the AArch64 GPR
@@ -470,7 +494,9 @@ pub fn log_trace_at(ctx: &TrapContext, slot_base: u32, spsr: u32) {
         if SVC_WATCH.contains(&fa) {
             kprintln!(
                 "  @{} SP_svc={:#010x} LR_svc={:#010x}",
-                fn_name(idx), cur_sp, cur_lr,
+                fn_name(idx),
+                cur_sp,
+                cur_lr,
             );
         }
     }
@@ -507,16 +533,17 @@ fn buffer_putc_char(ch: u32, lr: u32, seq: u32) {
         }
         // Flush on newline, on unprintable-control (other than CR/LF),
         // or when the buffer is about to overflow.
-        let should_flush = newline
-            || (!printable && !newline)
-            || LEN == CAP;
+        let should_flush = newline || (!printable && !newline) || LEN == CAP;
         if should_flush && LEN > 0 {
             let s = core::str::from_utf8(&BUF[..LEN]).unwrap_or("<non-utf8>");
             let first_seq = FIRST_SEQ;
             let first_lr = FIRST_LR;
             kprintln!(
                 "putc {:5}..{:5} lr={:#010x}: {}",
-                first_seq, seq, first_lr, s
+                first_seq,
+                seq,
+                first_lr,
+                s
             );
             LEN = 0;
         }

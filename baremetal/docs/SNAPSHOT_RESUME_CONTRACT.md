@@ -12,7 +12,7 @@ field-level layout documented in `src/hv/snapshot.rs`.
 
 - **Three memory regions**, in the order the region manifest
   (`src/hv/layout.rs`) lists them as snapshotted: `GUEST_RAM`
-  (4 MiB), `GUEST_FB` (2 MiB), and `shadow_stub::SCRATCH_POOL`
+  (4 MiB), `GUEST_FB` (2 MiB), and `inline_patch::SCRATCH_POOL`
   (384 KiB at IPA `0x0600_0000`).
 - **Guest CPU state**: all 31 AArch64 GPRs (`x0..x30`, which alias every
   AArch32 banked `R0..R14` per ARM ARM Table D1-79), `ELR_EL2` /

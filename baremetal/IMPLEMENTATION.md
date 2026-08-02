@@ -135,7 +135,7 @@ src/                   # one crate, six layer directories; import
   newton/              # Newton-specific: os (GuestOs impls), loader
                        # (ROM load + selective byteswap, consumes
                        # reach.bitmap), rom_patches, probes,
-                       # shadow_stub, guest_trampolines,
+                       # inline_patch, guest_trampolines,
                        # unaligned[_inline], rom_ver/ (per-version
                        # constants: r717006, r710031 skeleton)
   peripherals/         # Rust ports of Einstein's peripheral models

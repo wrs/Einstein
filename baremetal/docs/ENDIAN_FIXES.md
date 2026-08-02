@@ -118,34 +118,34 @@ Strategy:
    `src/newton/loader.rs`.
 
 3. **Every sub-word access in the ROM is rewritten.**
-   `shadow_stub::patch_rom_from_bitmap` walks a build-time classifier
+   `inline_patch::patch_rom_from_bitmap` walks a build-time classifier
    bitmap and replaces every `LDRB` / `STRB` / `LDRH` / `STRH` /
    `LDRSB` / `LDRSH` / `SWPB` with `UDF #(0x8000|idx)`. The UND
    trampoline drops into `handle_sba_udf`, which recomputes the
    effective address and does `phys[A ^ 3]` (byte) or `phys[A ^ 2]`
    (halfword), then ERETs past the UDF with CPSR flags intact. See
-   `src/newton/shadow_stub.rs`.
+   `src/newton/inline_patch.rs`.
 
 Verification against the difference table above:
 
 | Difference class | Mitigation | Status |
 |---|---|---|
-| `LDRB` / `LDRBT` / `LDRSB` / `LDRSBT` | `shadow_stub::decode` Form 1 (cond 010…B=1) catches `LDRB`/`LDRBT`. Form 2 (op=10, L=1) catches `LDRSB`/`LDRSBT`. XOR 3 applied in Rust. `src/newton/shadow_stub.rs`. | ✅ |
+| `LDRB` / `LDRBT` / `LDRSB` / `LDRSBT` | `inline_patch::decode` Form 1 (cond 010…B=1) catches `LDRB`/`LDRBT`. Form 2 (op=10, L=1) catches `LDRSB`/`LDRSBT`. XOR 3 applied in Rust. `src/newton/inline_patch.rs`. | ✅ |
 | `STRB` / `STRBT` | Form 1, L=0 path. XOR 3. | ✅ |
 | `LDRH` / `LDRHT` / `LDRSH` / `LDRSHT` | Form 2, op=01 and op=11. XOR 2. | ✅ |
 | `STRH` / `STRHT` | Form 2, op=01, L=0. XOR 2. | ✅ |
-| `SWPB` | Form 3 (`0x0140_0090` pattern). XOR 3 on the atomic byte swap. `src/newton/shadow_stub.rs`. | ✅ |
+| `SWPB` | Form 3 (`0x0140_0090` pattern). XOR 3 on the atomic byte swap. `src/newton/inline_patch.rs`. | ✅ |
 | Word-aligned `LDR`/`STR`/`LDM`/`STM`/`LDRD`/`STRD`/`SWP` | No action needed — word access is architecturally identical. Byteswap-at-load makes LE `Word[X]` = BE-32 `Word[X]`. | ✅ |
 | Unaligned `LDR` rotate | Not a B-bit difference, but an ARMv4↔ARMv7 mismatch that any BE-32 ROM running on A53 hits. Handled **systematically via SCTLR.A=1 alignment-fault emulation**. The CP15 shim at `src/hv/trap/cp15.rs` ORs `A=1` into every guest SCTLR write, so any unaligned LDR/STR raises an alignment fault at EL1; the DABT-vector trampoline (`src/newton/guest_trampolines.rs::patch_dabt_vector`) fast-paths `DFSR.FS[3:0]==1` to `HVC #ALIGN_TAG`, and `src/newton/unaligned.rs::handle_align_fault` decodes the faulting instruction and performs the aligned word load + ROR in EL2 Rust. Covers every static unaligned LDR imm + every `[Rn, Rm, LSL #1]` site without needing a ROM-patch whitelist. | ✅ |
 | Instruction fetch / exception vector fetch / PTW | Word-aligned — identical. No mitigation needed. | ✅ |
 | Thumb instruction fetch / Thumb halfword fetch | Newton 2.x ROM is pure ARMv4 (SA-1100 target), no Thumb. Unused. | ✅ (by absence) |
-| MMIO sub-word accesses | Two regimes: IPAs `< 0x1000_0000` (includes the tick-page at `0x0F18_1000`) are stage-2-mapped RAM and the shadow-stub XOR applies uniformly. Trapped MMIO at `≥ 0x1000_0000` is not XOR'd by shadow_stub; peripheral byte accesses are documented as not used in this band (see `src/newton/shadow_stub.rs`). `src/hv/mmio.rs` handles the word/halfword/byte SAS from ESR syndrome. | ✅ for the ROM as observed; fragile assumption for new peripheral code |
-| Guest write of B bit (`MCR p15, 0, Rd, c1, c0`) | Trapped, forwarded to `SCTLR_EL1`. Bit 7 of `SCTLR_EL1` is ITD (not B), so the write is architecturally a no-op for endianness on A53 — exactly the behavior we want, since shadow_stub + byteswap make the CPU *already* appear BE-32 to the ROM regardless of what the ROM programs. `src/hv/trap/cp15.rs`. | ✅ |
+| MMIO sub-word accesses | Two regimes: IPAs `< 0x1000_0000` (includes the tick-page at `0x0F18_1000`) are stage-2-mapped RAM and the inline-patch XOR applies uniformly. Trapped MMIO at `≥ 0x1000_0000` is not XOR'd by inline_patch; peripheral byte accesses are documented as not used in this band (see `src/newton/inline_patch.rs`). `src/hv/mmio.rs` handles the word/halfword/byte SAS from ESR syndrome. | ✅ for the ROM as observed; fragile assumption for new peripheral code |
+| Guest write of B bit (`MCR p15, 0, Rd, c1, c0`) | Trapped, forwarded to `SCTLR_EL1`. Bit 7 of `SCTLR_EL1` is ITD (not B), so the write is architecturally a no-op for endianness on A53 — exactly the behavior we want, since inline_patch + byteswap make the CPU *already* appear BE-32 to the ROM regardless of what the ROM programs. `src/hv/trap/cp15.rs`. | ✅ |
 | Guest write of `CPSR.E` / `SCTLR.EE` | ARMv4 code never issues `SETEND` and doesn't touch bits 25/9 of SCTLR. Not observed in the ROM. | ✅ (by absence) |
 
 ## Gaps and caveats worth knowing
 
-1. **`shadow_stub` skips FIQ mode.** `src/newton/shadow_stub.rs`
+1. **`inline_patch` skips FIQ mode.** `src/newton/inline_patch.rs`
    documents it: the UND trampoline and the AArch64-view-of-AArch32-
    R8..R12 path don't cover FIQ. The Newton FIQ handler doesn't do
    sub-word access in observed runs, but it's an open edge.
@@ -171,20 +171,20 @@ Verification against the difference table above:
    code; we halt loudly in the align handler rather than emulate.
 
 5. **`Rt==Rm` `SWPB` is refused at patch time**
-   (`src/newton/shadow_stub.rs`) — architecturally `UNPREDICTABLE`,
+   (`src/newton/inline_patch.rs`) — architecturally `UNPREDICTABLE`,
    so refusing is correct, but worth knowing.
 
 6. **Trapped MMIO above `XOR_LIMIT` (0x1000_0000) is not XOR'd.** The
    design assumes no sub-word MMIO accesses land there, which is
    currently true for the Newton peripheral map — adding a new
    byte-level MMIO register above that boundary would silently
-   mishandle endianness. Documented at `src/newton/shadow_stub.rs`.
+   mishandle endianness. Documented at `src/newton/inline_patch.rs`.
 
 ## Bottom line
 
 Every architectural divergence between B=1 and B=0 on ARMv4 — i.e.
 the seven sub-word memory-access forms — is mitigated by the
-combination of load-time per-word byteswap and shadow_stub's
+combination of load-time per-word byteswap and inline_patch's
 UDF-trap emulation with `A^3` / `A^2`. Word-sized accesses need no
 mitigation because they are bit-identical under word-invariant BE.
 
@@ -199,5 +199,5 @@ semantics in EL2 Rust. No per-site ROM-patch whitelist needed.
 - ARM Architecture Reference Manual, ARM DDI 0100I (Rev I, 2005) —
   covers ARMv4 through ARMv6, including the full BE-32 legacy spec.
 - `src/hv/guest.rs`, `src/hv/guest_mem.rs` + `src/newton/loader.rs`,
-  `src/newton/shadow_stub.rs`, `src/newton/rom_patches.rs`,
+  `src/newton/inline_patch.rs`, `src/newton/rom_patches.rs`,
   `src/hv/trap/`, `src/hv/mmio.rs` in this tree.

@@ -9,7 +9,7 @@
 //!
 //! This is the authoritative patch list for the endianness pre-patching
 //! pass. By construction every bit set corresponds to an instruction that
-//! baremetal/src/shadow_stub.rs::decode would accept.
+//! baremetal/src/inline_patch.rs::decode would accept.
 //!
 //! Invariant (when the oracle bitmap is present): every bit set in
 //! byte-access.bitmap (oracle, from NewtonProbe) must be set in
@@ -42,10 +42,12 @@ fn parse_args() -> Result<Args, String> {
 
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
-        let take = |it: &mut std::iter::Skip<std::env::Args>, flag: &str| -> Result<PathBuf, String> {
-            it.next().map(PathBuf::from)
-                .ok_or_else(|| format!("{flag} requires a path argument"))
-        };
+        let take =
+            |it: &mut std::iter::Skip<std::env::Args>, flag: &str| -> Result<PathBuf, String> {
+                it.next()
+                    .map(PathBuf::from)
+                    .ok_or_else(|| format!("{flag} requires a path argument"))
+            };
         match a.as_str() {
             "--rom" => rom = Some(take(&mut it, "--rom")?),
             "--rex" => rex = Some(take(&mut it, "--rex")?),
@@ -86,10 +88,7 @@ fn fnv1a_32(bytes: &[u8], seed: u32) -> u32 {
 /// reads BE bytes via `from_be_bytes` and would double-swap if fed the
 /// already-swapped word view). Bytes outside the loaded ROM/REX windows
 /// are zeroed.
-fn load_rom_and_rex(
-    rom_path: &Path,
-    rex_path: &Path,
-) -> Result<(Vec<u32>, Vec<u8>, u32), String> {
+fn load_rom_and_rex(rom_path: &Path, rex_path: &Path) -> Result<(Vec<u32>, Vec<u8>, u32), String> {
     let rom = fs::read(rom_path).map_err(|e| format!("read {}: {}", rom_path.display(), e))?;
     let rex = fs::read(rex_path).map_err(|e| format!("read {}: {}", rex_path.display(), e))?;
 
@@ -176,10 +175,10 @@ fn load_symbol_roots(
         let mut name: Option<&str> = None;
         for (i, f) in line.split('\t').enumerate() {
             let t = f.trim();
-            if t.is_empty() { continue; }
-            if addr_s.is_none()
-                && (t.starts_with("0x") || t.starts_with("0X"))
-            {
+            if t.is_empty() {
+                continue;
+            }
+            if addr_s.is_none() && (t.starts_with("0x") || t.starts_with("0X")) {
                 addr_s = Some(t);
                 continue;
             }
@@ -193,17 +192,28 @@ fn load_symbol_roots(
         }
         let (addr_s, name) = match (addr_s, name) {
             (Some(a), Some(n)) => (a, n),
-            _ => { stats.parse_skipped += 1; continue; }
+            _ => {
+                stats.parse_skipped += 1;
+                continue;
+            }
         };
 
-        let hex = addr_s.strip_prefix("0x").or_else(|| addr_s.strip_prefix("0X"))
+        let hex = addr_s
+            .strip_prefix("0x")
+            .or_else(|| addr_s.strip_prefix("0X"))
             .unwrap_or(addr_s);
         let addr = match u32::from_str_radix(hex, 16) {
             Ok(a) => a,
-            Err(_) => { stats.parse_skipped += 1; continue; }
+            Err(_) => {
+                stats.parse_skipped += 1;
+                continue;
+            }
         };
 
-        if addr & 3 != 0 { stats.misaligned += 1; continue; }
+        if addr & 3 != 0 {
+            stats.misaligned += 1;
+            continue;
+        }
 
         if name.contains("$$")
             || name.starts_with("Image$")
@@ -226,11 +236,15 @@ fn load_symbol_roots(
         // `gsm_add`, `glitch_to_*`) is a real C-function convention,
         // keep those.
         let bytes = name.as_bytes();
-        if bytes.len() >= 2
-            && (bytes[1].is_ascii_uppercase() || bytes[1].is_ascii_digit())
-        {
-            if bytes[0] == b'g' { stats.g_prefix_dropped += 1; continue; }
-            if bytes[0] == b'k' { stats.k_prefix_dropped += 1; continue; }
+        if bytes.len() >= 2 && (bytes[1].is_ascii_uppercase() || bytes[1].is_ascii_digit()) {
+            if bytes[0] == b'g' {
+                stats.g_prefix_dropped += 1;
+                continue;
+            }
+            if bytes[0] == b'k' {
+                stats.k_prefix_dropped += 1;
+                continue;
+            }
         }
 
         // Verify the VA actually resolves to a host-image PA. Symbols
@@ -241,14 +255,20 @@ fn load_symbol_roots(
         // pages where many VAs alias the same PA).
         let pa = match va_to_pa(words, addr) {
             Some(p) => p,
-            None => { stats.out_of_rom += 1; continue; }
+            None => {
+                stats.out_of_rom += 1;
+                continue;
+            }
         };
         if (addr as usize) >= ROM_SIZE_BYTES {
             stats.jt_va_resolved += 1;
         }
 
         let w = words[(pa >> 2) as usize];
-        if (w >> 28) == 0xF { stats.nv_cond_dropped += 1; continue; }
+        if (w >> 28) == 0xF {
+            stats.nv_cond_dropped += 1;
+            continue;
+        }
 
         // Drop symbol roots that fall into a known data range. Newton's
         // demangled-symbol set includes data labels like `PublicFiller`
@@ -257,7 +277,10 @@ fn load_symbol_roots(
         // this gate the walker linearly walks ~90 KiB of bp-weight data,
         // pushing branch targets into NSRuntime / package data and
         // producing thousands of false-positive code marks.
-        if in_data_stop_range(pa) { stats.data_stop_dropped += 1; continue; }
+        if in_data_stop_range(pa) {
+            stats.data_stop_dropped += 1;
+            continue;
+        }
 
         // Prologue gate. Despite the appeal of "the walker is self-
         // correcting on data", the walker is *not* self-correcting on
@@ -275,7 +298,10 @@ fn load_symbol_roots(
         // Patch-table thunks (VAs 0x01A00000+) have first-word B-AL
         // by construction; the prologue gate accepts B-AL via top3=
         // 0b101. So thunk seeds pass naturally.
-        if !is_known_function_start(w) { stats.not_prologue_dropped += 1; continue; }
+        if !is_known_function_start(w) {
+            stats.not_prologue_dropped += 1;
+            continue;
+        }
 
         if seen.insert(addr) {
             // Leak the name to get a `&'static str` we can carry in
@@ -323,11 +349,15 @@ fn rex_header_roots(
 ) -> Vec<(u32, SeedSource)> {
     let mut out: Vec<(u32, SeedSource)> = Vec::new();
     let rex_base_w = REX_PA_OFFSET / 4;
-    if rex_base_w + 10 >= ROM_WORD_COUNT { return out; }
+    if rex_base_w + 10 >= ROM_WORD_COUNT {
+        return out;
+    }
     let w0 = words[rex_base_w];
     let w1 = words[rex_base_w + 1];
     // "RExBlock" = 0x52457842 'RExB' / 0x6c6f636b 'lock'
-    if w0 != 0x5245_7842 || w1 != 0x6c6f_636b { return out; }
+    if w0 != 0x5245_7842 || w1 != 0x6c6f_636b {
+        return out;
+    }
 
     let num_entries = words[rex_base_w + 9] as usize;
     // Clamp — if the field is garbage (mis-aligned REx, truncated
@@ -336,7 +366,9 @@ fn rex_header_roots(
     let n = num_entries.min(max_entries);
     for i in 0..n {
         let ent_w = rex_base_w + 10 + i * 3;
-        if ent_w + 2 >= ROM_WORD_COUNT { break; }
+        if ent_w + 2 >= ROM_WORD_COUNT {
+            break;
+        }
         let tag = words[ent_w];
         let off = words[ent_w + 1];
         let size = words[ent_w + 2];
@@ -375,9 +407,7 @@ fn rex_header_roots(
             // existing shape-based collectors (LDR-pc thunk runs,
             // B-runs, classinfo trampolines, etc.).
             0x706b_676c => {
-                walk_pkgl_relocation_roots(
-                    words, raw_bytes, data_pa, data_end, &mut out, stats,
-                );
+                walk_pkgl_relocation_roots(words, raw_bytes, data_pa, data_end, &mut out, stats);
             }
             _ => {}
         }
@@ -448,7 +478,9 @@ fn walk_pkgl_relocation_roots(
             continue;
         }
         let w_idx = (pa >> 2) as usize;
-        if w_idx + 1 >= ROM_WORD_COUNT { break; }
+        if w_idx + 1 >= ROM_WORD_COUNT {
+            break;
+        }
         let w0 = words[w_idx];
         let w1 = words[w_idx + 1];
         let is_pkg = w0 == PKG_MAGIC_W0
@@ -472,9 +504,7 @@ fn walk_pkgl_relocation_roots(
         }
         let reloc_size = if flags & RELOC_FLAG != 0 {
             stats.pkgl_relocatable_packages += 1;
-            walk_package_relocation_table(
-                words, pa, dir_size, out, stats,
-            );
+            walk_package_relocation_table(words, pa, dir_size, out, stats);
             // Header word at pkg_pa + dir_size + 4 = relocationSize.
             let rb = ((pa.wrapping_add(dir_size)) >> 2) as usize;
             words.get(rb + 1).copied().unwrap_or(0)
@@ -486,11 +516,15 @@ fn walk_pkgl_relocation_roots(
         // holds embedded ARM code. Seed each entry point as a worklist
         // root so the walker can reach it; the bitmap-marking side
         // effect is what makes the load-time byteswap cover those words.
-        let part_data_start = pa
-            .wrapping_add(dir_size)
-            .wrapping_add(reloc_size);
+        let part_data_start = pa.wrapping_add(dir_size).wrapping_add(reloc_size);
         seed_bincfunction_entries_in_package(
-            words, raw_bytes, pa, pkg_size, part_data_start, out, stats,
+            words,
+            raw_bytes,
+            pa,
+            pkg_size,
+            part_data_start,
+            out,
+            stats,
         );
         pa += pkg_size;
         pa = (pa + 3) & !3;
@@ -509,7 +543,9 @@ fn walk_package_relocation_table(
 ) {
     let reloc_pa = pkg_pa.wrapping_add(dir_size);
     let rb = (reloc_pa >> 2) as usize;
-    if rb + 5 >= ROM_WORD_COUNT { return; }
+    if rb + 5 >= ROM_WORD_COUNT {
+        return;
+    }
     // Header: reserved, relocSize, pageSize, numEntries, baseAddress.
     let reloc_size = words[rb + 1];
     let _page_size = words[rb + 2];
@@ -524,12 +560,16 @@ fn walk_package_relocation_table(
     let num_sets = num_sets.min(max_sets_by_size).min(0x10000);
     let mut byte_pos = (reloc_pa as usize).wrapping_add(20);
     for _ in 0..num_sets {
-        if byte_pos + 4 > ROM_SIZE_BYTES { break; }
+        if byte_pos + 4 > ROM_SIZE_BYTES {
+            break;
+        }
         let header_w = words[byte_pos / 4];
         let page_num = (header_w >> 16) & 0xFFFF;
         let off_count = (header_w & 0xFFFF) as usize;
         byte_pos += 4;
-        if byte_pos + off_count > ROM_SIZE_BYTES { break; }
+        if byte_pos + off_count > ROM_SIZE_BYTES {
+            break;
+        }
         for i in 0..off_count {
             let b = byte_pos + i;
             // Extract the byte at file offset `b` from the BE-loaded
@@ -540,17 +580,27 @@ fn walk_package_relocation_table(
             let reloc_addr = (page_num << 10) | (off_byte << 2);
             let slot_pa = pkg_pa.wrapping_add(reloc_addr);
             stats.pkgl_relocation_slots_total += 1;
-            if (slot_pa as usize) + 4 > ROM_SIZE_BYTES { continue; }
-            if slot_pa & 3 != 0 { continue; }
+            if (slot_pa as usize) + 4 > ROM_SIZE_BYTES {
+                continue;
+            }
+            if slot_pa & 3 != 0 {
+                continue;
+            }
             let val = words[(slot_pa >> 2) as usize];
-            if val == 0 { continue; }
+            if val == 0 {
+                continue;
+            }
             let val_pa = match va_to_pa(words, val) {
                 Some(p) => p,
                 None => continue,
             };
             let tw = words[(val_pa >> 2) as usize];
-            if (tw >> 28) == 0xF { continue; }
-            if !is_known_function_start(tw) { continue; }
+            if (tw >> 28) == 0xF {
+                continue;
+            }
+            if !is_known_function_start(tw) {
+                continue;
+            }
             out.push((val, SeedSource::PkglRelocation { slot_pa }));
             stats.pkgl_relocation_roots_seeded += 1;
         }
@@ -594,11 +644,15 @@ fn seed_bincfunction_entries_in_package(
     const PART_NOS: u32 = 0x0000_0001;
 
     let pkg_w = (pkg_pa >> 2) as usize;
-    if pkg_w + 13 >= ROM_WORD_COUNT { return; }
+    if pkg_w + 13 >= ROM_WORD_COUNT {
+        return;
+    }
     let num_parts = words[pkg_w + 12] as usize;
     // Sanity clamp — package directories above this are malformed by
     // any reasonable measure.
-    if num_parts > 64 { return; }
+    if num_parts > 64 {
+        return;
+    }
 
     let pkg_end = pkg_pa.saturating_add(pkg_size);
     let pkg_slice_end = (pkg_end as usize).min(raw_bytes.len());
@@ -610,15 +664,21 @@ fn seed_bincfunction_entries_in_package(
     // Directory starts at pkg_pa + 0x34; each entry is 8 words.
     for p in 0..num_parts {
         let base_w = pkg_w + 13 + p * 8;
-        if base_w + 7 >= ROM_WORD_COUNT { break; }
+        if base_w + 7 >= ROM_WORD_COUNT {
+            break;
+        }
         let f_offset = words[base_w];
         let f_size = words[base_w + 1];
         let f_flags = words[base_w + 5];
-        if f_flags & PART_TYPE_MASK != PART_NOS { continue; }
+        if f_flags & PART_TYPE_MASK != PART_NOS {
+            continue;
+        }
 
         let part_pa = part_data_start.wrapping_add(f_offset);
         let part_end = part_pa.saturating_add(f_size);
-        if part_pa < pkg_pa || part_end > pkg_end { continue; }
+        if part_pa < pkg_pa || part_end > pkg_end {
+            continue;
+        }
 
         // Soup pointer Refs are absolute against the package load
         // address, so build the heap over the whole package's bytes
@@ -635,7 +695,9 @@ fn seed_bincfunction_entries_in_package(
                 Err(_) => break,
             };
             walked = true;
-            if obj_pa >= part_end { break; }
+            if obj_pa >= part_end {
+                break;
+            }
             let frame = match obj {
                 Object::Frame(f) => f,
                 _ => continue,
@@ -652,7 +714,9 @@ fn seed_bincfunction_entries_in_package(
                 .and_then(|o| o.as_binary().ok())
                 .and_then(|b| b.as_symbol())
                 .and_then(|s| s.name().ok());
-            if class_sym_name != Some("BinCFunction") { continue; }
+            if class_sym_name != Some("BinCFunction") {
+                continue;
+            }
             stats.pkgl_bincfunction_frames += 1;
 
             let code_bin = match frame
@@ -679,8 +743,12 @@ fn seed_bincfunction_entries_in_package(
             let entry_pa = code_data_pa.saturating_add(offset);
             // Sanity: entry must land inside the binary's data range.
             let bin_end = code_bin.offset().saturating_add(code_bin.size());
-            if entry_pa < code_data_pa || entry_pa >= bin_end { continue; }
-            if entry_pa & 3 != 0 { continue; }
+            if entry_pa < code_data_pa || entry_pa >= bin_end {
+                continue;
+            }
+            if entry_pa & 3 != 0 {
+                continue;
+            }
 
             out.push((entry_pa, SeedSource::BinCFunction { frame_pa: obj_pa }));
             stats.pkgl_bincfunction_roots_seeded += 1;
@@ -710,22 +778,41 @@ fn load_vector_ranges(path: &Path) -> Result<Vec<(String, u32, u32)>, String> {
     let mut limits: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     for line in text.lines() {
         let mut parts = line.split('\t').map(str::trim).filter(|s| !s.is_empty());
-        let addr_s = match parts.next() { Some(s) => s, None => continue };
-        let name = match parts.next() { Some(s) => s, None => continue };
-        let hex = addr_s.strip_prefix("0x").or_else(|| addr_s.strip_prefix("0X"))
+        let addr_s = match parts.next() {
+            Some(s) => s,
+            None => continue,
+        };
+        let name = match parts.next() {
+            Some(s) => s,
+            None => continue,
+        };
+        let hex = addr_s
+            .strip_prefix("0x")
+            .or_else(|| addr_s.strip_prefix("0X"))
             .unwrap_or(addr_s);
-        let addr = match u32::from_str_radix(hex, 16) { Ok(a) => a, Err(_) => continue };
-        if (addr as usize) >= ROM_SIZE_BYTES || addr & 3 != 0 { continue; }
+        let addr = match u32::from_str_radix(hex, 16) {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        if (addr as usize) >= ROM_SIZE_BYTES || addr & 3 != 0 {
+            continue;
+        }
         if let Some(prefix) = name.strip_suffix("$$Base") {
-            if prefix.ends_with("vec") { bases.insert(prefix.to_string(), addr); }
+            if prefix.ends_with("vec") {
+                bases.insert(prefix.to_string(), addr);
+            }
         } else if let Some(prefix) = name.strip_suffix("$$Limit") {
-            if prefix.ends_with("vec") { limits.insert(prefix.to_string(), addr); }
+            if prefix.ends_with("vec") {
+                limits.insert(prefix.to_string(), addr);
+            }
         }
     }
     let mut out: Vec<(String, u32, u32)> = Vec::new();
     for (prefix, base) in bases {
         if let Some(&limit) = limits.get(&prefix) {
-            if limit > base { out.push((prefix, base, limit)); }
+            if limit > base {
+                out.push((prefix, base, limit));
+            }
         }
     }
     out.sort_by(|a, b| a.1.cmp(&b.1));
@@ -748,10 +835,16 @@ fn seed_vector_table_roots(
         while pa < *limit {
             let p = words[(pa >> 2) as usize];
             pa = pa.wrapping_add(4);
-            if p & 3 != 0 || (p as usize) >= ROM_SIZE_BYTES || p == 0 { continue; }
+            if p & 3 != 0 || (p as usize) >= ROM_SIZE_BYTES || p == 0 {
+                continue;
+            }
             let tw = words[(p >> 2) as usize];
-            if (tw >> 28) == 0xF { continue; }
-            if !is_known_function_start(tw) { continue; }
+            if (tw >> 28) == 0xF {
+                continue;
+            }
+            if !is_known_function_start(tw) {
+                continue;
+            }
             if seen.insert(p) {
                 worklist.push((p, SeedSource::Vector));
                 added += 1;
@@ -888,7 +981,9 @@ const DATA_STOP_RANGES: &[(u32, u32)] = &[
 ];
 
 fn in_data_stop_range(addr: u32) -> bool {
-    DATA_STOP_RANGES.iter().any(|&(lo, hi)| addr >= lo && addr < hi)
+    DATA_STOP_RANGES
+        .iter()
+        .any(|&(lo, hi)| addr >= lo && addr < hi)
 }
 
 /// True iff `w` looks like the first instruction of a function entry —
@@ -902,15 +997,21 @@ fn in_data_stop_range(addr: u32) -> bool {
 /// `is_known_function_start` accepts top3 ∈ {000..101, 111}.
 /// 110 (coproc LDC/STC) is rare as a first insn and excluded.
 fn is_known_function_start(w: u32) -> bool {
-    if (w >> 28) & 0xF != 0xE { return false; }
+    if (w >> 28) & 0xF != 0xE {
+        return false;
+    }
     let top3 = (w >> 25) & 0b111;
-    if top3 <= 0b101 { return true; }
-    if top3 == 0b111 { return true; }
+    if top3 <= 0b101 {
+        return true;
+    }
+    if top3 == 0b111 {
+        return true;
+    }
     false
 }
 
 /// Byte/halfword-access decoder. MUST match the acceptance set of
-/// baremetal/src/shadow_stub.rs::decode (lines 259-377). Divergence is
+/// baremetal/src/inline_patch.rs::decode (lines 259-377). Divergence is
 /// caught by the oracle ⊆ static invariant check at run end.
 ///
 /// Returns true iff `insn` is an endianness-sensitive subword access that
@@ -932,23 +1033,23 @@ fn is_byte_access(insn: u32) -> bool {
 
     // Form 2: extra load/store (halfword / signed byte / signed halfword).
     // Keyed on bits[27:25]=000, bit 7=1, bit 4=1, op=(bits[6:5])!=0.
-    // Excludes LDRD (op=10, L=0) and STRD (op=11, L=0) — shadow_stub::decode
+    // Excludes LDRD (op=10, L=0) and STRD (op=11, L=0) — inline_patch::decode
     // returns None for those.
     if (insn & 0x0E00_0090) == 0x0000_0090 {
         let op = (insn >> 5) & 0x3;
         let l = (insn >> 20) & 1 != 0;
         return match (op, l) {
-            (0b01, _) => true,           // LDRH / STRH
-            (0b10, true) => true,        // LDRSB
-            (0b10, false) => false,      // LDRD
-            (0b11, true) => true,        // LDRSH
-            (0b11, false) => false,      // STRD
-            _ => false,                  // op=00 falls to sync primitives
+            (0b01, _) => true,      // LDRH / STRH
+            (0b10, true) => true,   // LDRSB
+            (0b10, false) => false, // LDRD
+            (0b11, true) => true,   // LDRSH
+            (0b11, false) => false, // STRD
+            _ => false,             // op=00 falls to sync primitives
         };
     }
 
     // Form 3: SWPB. cond 0001 0100 Rn Rt 0000 1001 Rm.
-    // shadow_stub::decode refuses Rt == Rm (UNPREDICTABLE); match that.
+    // inline_patch::decode refuses Rt == Rm (UNPREDICTABLE); match that.
     if (insn & 0x0FF0_0FF0) == 0x0140_0090 {
         let rt = (insn >> 12) & 0xF;
         let rm = insn & 0xF;
@@ -963,7 +1064,11 @@ struct Bitmap {
 }
 
 impl Bitmap {
-    fn new() -> Self { Self { bits: vec![0u8; BITMAP_BYTES] } }
+    fn new() -> Self {
+        Self {
+            bits: vec![0u8; BITMAP_BYTES],
+        }
+    }
 
     fn from_bytes(b: Vec<u8>) -> Result<Self, String> {
         if b.len() != BITMAP_BYTES {
@@ -973,19 +1078,25 @@ impl Bitmap {
     }
 
     fn set_word(&mut self, addr: u32) {
-        if (addr as usize) >= ROM_SIZE_BYTES || addr & 3 != 0 { return; }
+        if (addr as usize) >= ROM_SIZE_BYTES || addr & 3 != 0 {
+            return;
+        }
         let idx = (addr >> 2) as usize;
         self.bits[idx >> 3] |= 1u8 << (idx & 7);
     }
 
     fn get_word(&self, addr: u32) -> bool {
-        if (addr as usize) >= ROM_SIZE_BYTES || addr & 3 != 0 { return false; }
+        if (addr as usize) >= ROM_SIZE_BYTES || addr & 3 != 0 {
+            return false;
+        }
         let idx = (addr >> 2) as usize;
         (self.bits[idx >> 3] >> (idx & 7)) & 1 != 0
     }
 
     fn clear_word(&mut self, addr: u32) {
-        if (addr as usize) >= ROM_SIZE_BYTES || addr & 3 != 0 { return; }
+        if (addr as usize) >= ROM_SIZE_BYTES || addr & 3 != 0 {
+            return;
+        }
         let idx = (addr >> 2) as usize;
         self.bits[idx >> 3] &= !(1u8 << (idx & 7));
     }
@@ -1050,25 +1161,47 @@ enum SeedSource {
     Manual,
     /// LDR-pc-rel + STR-to-this pair installs a vtable; `ldr_pc` is
     /// the LDR instruction that loaded the vtable address.
-    Vtable { ldr_pc: u32 },
+    Vtable {
+        ldr_pc: u32,
+    },
     /// LDR-pc-rel literal looked like a function pointer; `ldr_pc` is
     /// the LDR. Loaded literal = popped PC of this entry.
-    FnPtrLiteral { ldr_pc: u32 },
+    FnPtrLiteral {
+        ldr_pc: u32,
+    },
     /// 3+-entry B-AL run discovered at `entry_pa`.
-    BRunEntry { entry_pa: u32 },
+    BRunEntry {
+        entry_pa: u32,
+    },
     /// `add Rd, PC, #imm` reaching this address; `adr_pc` is that ADR.
-    PcRelAddr { adr_pc: u32 },
+    PcRelAddr {
+        adr_pc: u32,
+    },
     /// TClassInfo trampoline at `tramp_pc` (`sub r0, pc, #68; mov pc,
     /// lr; mov r0, #imm; mov pc, lr`).
-    ClassInfoTramp { tramp_pc: u32 },
-    ClassInfoBranchSlot { tramp_pc: u32 },
-    ClassInfoBTable { tramp_pc: u32 },
-    ClassInfoEntryProc { tramp_pc: u32 },
+    ClassInfoTramp {
+        tramp_pc: u32,
+    },
+    ClassInfoBranchSlot {
+        tramp_pc: u32,
+    },
+    ClassInfoBTable {
+        tramp_pc: u32,
+    },
+    ClassInfoEntryProc {
+        tramp_pc: u32,
+    },
     /// `LDR pc, [Rn, Rm, lsl #2]` indexed dispatch at `dispatch_pc`.
-    IndexedDispatch { dispatch_pc: u32 },
+    IndexedDispatch {
+        dispatch_pc: u32,
+    },
     /// PC-relative jump-table dispatch at `dispatch_pc`.
-    JtTableEntry { dispatch_pc: u32 },
-    JtTableTarget { dispatch_pc: u32 },
+    JtTableEntry {
+        dispatch_pc: u32,
+    },
+    JtTableTarget {
+        dispatch_pc: u32,
+    },
     /// `mov r0, pc; mov pc, lr` micro-trampoline immediately after a
     /// terminal `add pc, ip, #N` (or similar PC-write through ip / lr).
     /// Used by Newton class-info dispatch to expose a "get class name
@@ -1077,21 +1210,29 @@ enum SeedSource {
     /// ASCII class-name string. Static analysis can't see the BL when
     /// it's installed via vtable; this collector seeds the alt entry
     /// directly so the two instructions are still byteswapped at load.
-    AltEntryAfterIpJump { trampoline_pc: u32 },
+    AltEntryAfterIpJump {
+        trampoline_pc: u32,
+    },
     /// Entry inside a run of `LDR pc, [pc, #-4] + <literal>` thunk
     /// pairs. `entry_pa` is the LDR's PA; the literal at `entry_pa+4`
     /// is the absolute VA the kernel branches to.
-    PcRelLdrThunkRun { entry_pa: u32 },
+    PcRelLdrThunkRun {
+        entry_pa: u32,
+    },
     /// Pointer slot listed in a `pkgl` package's relocation table.
     /// `slot_pa` is the PA of the 32-bit pointer slot; the value
     /// stored at `slot_pa` is the code address to seed.
-    PkglRelocation { slot_pa: u32 },
+    PkglRelocation {
+        slot_pa: u32,
+    },
     /// `code` slot of a `{ class: 'BinCFunction, ... }` frame embedded
     /// in a NOS part's NewtonScript object soup. `frame_pa` is the
     /// frame object's header address; the seed is the entry-point
     /// `code_data + offset` from that frame's `code` and `offset`
     /// slots.
-    BinCFunction { frame_pa: u32 },
+    BinCFunction {
+        frame_pa: u32,
+    },
 }
 
 impl std::fmt::Debug for SeedSource {
@@ -1104,17 +1245,39 @@ impl std::fmt::Debug for SeedSource {
             SeedSource::FnPtrLiteral { ldr_pc } => write!(f, "FnPtrLiteral @ ldr 0x{ldr_pc:08x}"),
             SeedSource::BRunEntry { entry_pa } => write!(f, "BRunEntry @ 0x{entry_pa:08x}"),
             SeedSource::PcRelAddr { adr_pc } => write!(f, "PcRelAddr @ adr 0x{adr_pc:08x}"),
-            SeedSource::ClassInfoTramp { tramp_pc } => write!(f, "ClassInfoTramp @ 0x{tramp_pc:08x}"),
-            SeedSource::ClassInfoBranchSlot { tramp_pc } => write!(f, "ClassInfoBranchSlot @ tramp 0x{tramp_pc:08x}"),
-            SeedSource::ClassInfoBTable { tramp_pc } => write!(f, "ClassInfoBTable @ tramp 0x{tramp_pc:08x}"),
-            SeedSource::ClassInfoEntryProc { tramp_pc } => write!(f, "ClassInfoEntryProc @ tramp 0x{tramp_pc:08x}"),
-            SeedSource::IndexedDispatch { dispatch_pc } => write!(f, "IndexedDispatch @ 0x{dispatch_pc:08x}"),
-            SeedSource::JtTableEntry { dispatch_pc } => write!(f, "JtTableEntry @ dispatch 0x{dispatch_pc:08x}"),
-            SeedSource::JtTableTarget { dispatch_pc } => write!(f, "JtTableTarget @ dispatch 0x{dispatch_pc:08x}"),
-            SeedSource::AltEntryAfterIpJump { trampoline_pc } => write!(f, "AltEntryAfterIpJump @ tramp 0x{trampoline_pc:08x}"),
-            SeedSource::PcRelLdrThunkRun { entry_pa } => write!(f, "PcRelLdrThunkRun @ 0x{entry_pa:08x}"),
-            SeedSource::PkglRelocation { slot_pa } => write!(f, "PkglRelocation @ slot 0x{slot_pa:08x}"),
-            SeedSource::BinCFunction { frame_pa } => write!(f, "BinCFunction @ frame 0x{frame_pa:08x}"),
+            SeedSource::ClassInfoTramp { tramp_pc } => {
+                write!(f, "ClassInfoTramp @ 0x{tramp_pc:08x}")
+            }
+            SeedSource::ClassInfoBranchSlot { tramp_pc } => {
+                write!(f, "ClassInfoBranchSlot @ tramp 0x{tramp_pc:08x}")
+            }
+            SeedSource::ClassInfoBTable { tramp_pc } => {
+                write!(f, "ClassInfoBTable @ tramp 0x{tramp_pc:08x}")
+            }
+            SeedSource::ClassInfoEntryProc { tramp_pc } => {
+                write!(f, "ClassInfoEntryProc @ tramp 0x{tramp_pc:08x}")
+            }
+            SeedSource::IndexedDispatch { dispatch_pc } => {
+                write!(f, "IndexedDispatch @ 0x{dispatch_pc:08x}")
+            }
+            SeedSource::JtTableEntry { dispatch_pc } => {
+                write!(f, "JtTableEntry @ dispatch 0x{dispatch_pc:08x}")
+            }
+            SeedSource::JtTableTarget { dispatch_pc } => {
+                write!(f, "JtTableTarget @ dispatch 0x{dispatch_pc:08x}")
+            }
+            SeedSource::AltEntryAfterIpJump { trampoline_pc } => {
+                write!(f, "AltEntryAfterIpJump @ tramp 0x{trampoline_pc:08x}")
+            }
+            SeedSource::PcRelLdrThunkRun { entry_pa } => {
+                write!(f, "PcRelLdrThunkRun @ 0x{entry_pa:08x}")
+            }
+            SeedSource::PkglRelocation { slot_pa } => {
+                write!(f, "PkglRelocation @ slot 0x{slot_pa:08x}")
+            }
+            SeedSource::BinCFunction { frame_pa } => {
+                write!(f, "BinCFunction @ frame 0x{frame_pa:08x}")
+            }
         }
     }
 }
@@ -1144,10 +1307,14 @@ fn sign_extend(v: u32, bits: u32) -> i32 {
 ///     add pc, ip, #12`); the imm offset accounts for the
 ///     intermediate insns so LR still lands at jump_pc + 4.
 fn lr_setup_imm(w: u32) -> Option<u32> {
-    if w == 0xE1A0_E00F { return Some(0); }       // MOV LR, PC
-    if w == 0xE28F_E000 { return Some(0); }       // ADD LR, PC, #0
-    // ADD LR, PC, #imm: cond=AL(E) 001 opcode=ADD(0100) S=0 Rn=15 Rd=14.
-    // Mask: 0xFFFF_F000 = E28F_E000; check imm12 in the low 12 bits.
+    if w == 0xE1A0_E00F {
+        return Some(0);
+    } // MOV LR, PC
+    if w == 0xE28F_E000 {
+        return Some(0);
+    } // ADD LR, PC, #0
+      // ADD LR, PC, #imm: cond=AL(E) 001 opcode=ADD(0100) S=0 Rn=15 Rd=14.
+      // Mask: 0xFFFF_F000 = E28F_E000; check imm12 in the low 12 bits.
     if (w & 0xFFFF_F000) == 0xE28F_E000 {
         let rot = ((w >> 8) & 0xF) * 2;
         let val8 = w & 0xFF;
@@ -1171,10 +1338,14 @@ fn lr_setup_imm(w: u32) -> Option<u32> {
 /// range to the same 4 KB phys page at the bucket's phys base, with
 /// `va_offset_in_page == phys_offset_in_page`.
 fn jt_va_to_phys(va: u32) -> Option<u32> {
-    if va < 0x01A0_0000 || va >= 0x01C2_0880 { return None; }
+    if va < 0x01A0_0000 || va >= 0x01C2_0880 {
+        return None;
+    }
     let off = va - 0x01A0_0000;
     let bucket = off / 0x2_0000;
-    if bucket > 16 { return None; }
+    if bucket > 16 {
+        return None;
+    }
     let off_in_page = off & 0xFFF;
     Some(0x2000 + bucket * 0x1000 + off_in_page)
 }
@@ -1194,20 +1365,28 @@ fn jt_va_to_phys(va: u32) -> Option<u32> {
 /// Returns `None` for VAs outside the window or when the L2 entry
 /// isn't a small-page descriptor (type bits != 2/3).
 const SECONDARY_JT_VA_BASE: u32 = 0x01E0_0000;
-const SECONDARY_JT_VA_END:  u32 = 0x01F0_0000;
-const SECONDARY_JT_L2_PA:   u32 = 0x007E_C000;
+const SECONDARY_JT_VA_END: u32 = 0x01F0_0000;
+const SECONDARY_JT_L2_PA: u32 = 0x007E_C000;
 fn secondary_jt_va_to_phys(words: &[u32], va: u32) -> Option<u32> {
-    if va < SECONDARY_JT_VA_BASE || va >= SECONDARY_JT_VA_END { return None; }
+    if va < SECONDARY_JT_VA_BASE || va >= SECONDARY_JT_VA_END {
+        return None;
+    }
     let l2_idx = (va >> 12) & 0xFF;
     let entry_pa = SECONDARY_JT_L2_PA + l2_idx * 4;
-    if (entry_pa as usize) + 4 > ROM_SIZE_BYTES { return None; }
+    if (entry_pa as usize) + 4 > ROM_SIZE_BYTES {
+        return None;
+    }
     let entry = words[(entry_pa >> 2) as usize];
     // ARMv4 short-descriptor L2: bits[1:0] = 10 (small page) or 11
     // (small-page-XN-extended). Either is acceptable here.
-    if (entry & 0b10) != 0b10 { return None; }
+    if (entry & 0b10) != 0b10 {
+        return None;
+    }
     let page_pa = entry & 0xFFFF_F000;
     let pa = page_pa | (va & 0xFFF);
-    if (pa as usize) + 4 > ROM_SIZE_BYTES { return None; }
+    if (pa as usize) + 4 > ROM_SIZE_BYTES {
+        return None;
+    }
     Some(pa)
 }
 
@@ -1224,21 +1403,28 @@ fn secondary_jt_va_to_phys(words: &[u32], va: u32) -> Option<u32> {
 /// via `resolve_jt_va` to a real ROM function. Callers chain the
 /// resolution through `resolve_target_to_rom`.
 const PUBLIC_JT_VA_BASE: u32 = 0x0180_0000;
-const PUBLIC_JT_VA_END:  u32 = 0x0190_0000;
-const PUBLIC_JT_L2_PA:   u32 = 0x0001_8000;
+const PUBLIC_JT_VA_END: u32 = 0x0190_0000;
+const PUBLIC_JT_L2_PA: u32 = 0x0001_8000;
 fn public_jt_va_to_phys(words: &[u32], va: u32) -> Option<u32> {
-    if va < PUBLIC_JT_VA_BASE || va >= PUBLIC_JT_VA_END { return None; }
+    if va < PUBLIC_JT_VA_BASE || va >= PUBLIC_JT_VA_END {
+        return None;
+    }
     let l2_idx = (va >> 12) & 0xFF;
     let entry_pa = PUBLIC_JT_L2_PA + l2_idx * 4;
-    if (entry_pa as usize) + 4 > ROM_SIZE_BYTES { return None; }
+    if (entry_pa as usize) + 4 > ROM_SIZE_BYTES {
+        return None;
+    }
     let entry = words[(entry_pa >> 2) as usize];
-    if (entry & 0b10) != 0b10 { return None; }
+    if (entry & 0b10) != 0b10 {
+        return None;
+    }
     let page_pa = entry & 0xFFFF_F000;
     let pa = page_pa | (va & 0xFFF);
-    if (pa as usize) + 4 > ROM_SIZE_BYTES { return None; }
+    if (pa as usize) + 4 > ROM_SIZE_BYTES {
+        return None;
+    }
     Some(pa)
 }
-
 
 /// Translate a kernel-side VA to the host-image PA where its byte
 /// storage lives. Silent on miss — for use by indirect-pass
@@ -1259,11 +1445,21 @@ fn public_jt_va_to_phys(words: &[u32], va: u32) -> Option<u32> {
 ///   via the L2 at PA 0x7EC000.
 /// - Anything else returns `None`.
 fn va_to_pa(words: &[u32], va: u32) -> Option<u32> {
-    if va & 3 != 0 { return None; }
-    if (va as usize) < ROM_SIZE_BYTES { return Some(va); }
-    if let Some(pa) = jt_va_to_phys(va) { return Some(pa); }
-    if let Some(pa) = public_jt_va_to_phys(words, va) { return Some(pa); }
-    if let Some(pa) = secondary_jt_va_to_phys(words, va) { return Some(pa); }
+    if va & 3 != 0 {
+        return None;
+    }
+    if (va as usize) < ROM_SIZE_BYTES {
+        return Some(va);
+    }
+    if let Some(pa) = jt_va_to_phys(va) {
+        return Some(pa);
+    }
+    if let Some(pa) = public_jt_va_to_phys(words, va) {
+        return Some(pa);
+    }
+    if let Some(pa) = secondary_jt_va_to_phys(words, va) {
+        return Some(pa);
+    }
     None
 }
 
@@ -1287,7 +1483,9 @@ fn va_to_pa_loud(words: &[u32], va: u32) -> Option<u32> {
     }
     // Misaligned VAs aren't worth logging — those are the walker's
     // own break check rather than a missing mapping.
-    if va & 3 != 0 { return None; }
+    if va & 3 != 0 {
+        return None;
+    }
     use std::sync::{Mutex, OnceLock};
     static UNRESOLVED: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
     let set = UNRESOLVED.get_or_init(|| Mutex::new(HashSet::new()));
@@ -1301,7 +1499,6 @@ fn va_to_pa_loud(words: &[u32], va: u32) -> Option<u32> {
     }
     None
 }
-
 
 /// Enumerate the one-instruction-per-entry table that immediately
 /// follows a PC-relative dispatch (`<dpop> PC, PC, Rn[, shift]`).
@@ -1352,9 +1549,7 @@ fn enumerate_pc_rel_jump_table(
             None
         }
     };
-    let limit = bounded_size
-        .unwrap_or(MAX_UNBOUNDED)
-        .min(MAX_ENTRIES);
+    let limit = bounded_size.unwrap_or(MAX_UNBOUNDED).min(MAX_ENTRIES);
     // Iter-72 fix: clamp seeding to the containing function's range.
     // For DynArrayLeaf (0x3ad4e4..0x3ad524), the dispatch at 0x3ad4e4
     // is followed by 14 case-body insns ending in `mov pc, lr`; data
@@ -1370,10 +1565,16 @@ fn enumerate_pc_rel_jump_table(
     let mut tbl = pc_of_dispatch.wrapping_add(8);
     let mut count = 0usize;
     for _ in 0..limit {
-        if (tbl as usize) + 4 > ROM_SIZE_BYTES { break; }
-        if tbl & 3 != 0 { break; }
+        if (tbl as usize) + 4 > ROM_SIZE_BYTES {
+            break;
+        }
+        if tbl & 3 != 0 {
+            break;
+        }
         if let Some(end) = fn_end {
-            if tbl >= end { break; }
+            if tbl >= end {
+                break;
+            }
         }
         let w = words[(tbl >> 2) as usize];
         // Each 4-byte slot is one of:
@@ -1391,11 +1592,15 @@ fn enumerate_pc_rel_jump_table(
             let simm = sign_extend(imm24, 24) << 2;
             let target = tbl.wrapping_add(8).wrapping_add(simm as u32);
             let mut child = parent_trace.to_vec();
-            child.push(WalkReason::Seed(SeedSource::JtTableTarget { dispatch_pc: pc_of_dispatch }));
+            child.push(WalkReason::Seed(SeedSource::JtTableTarget {
+                dispatch_pc: pc_of_dispatch,
+            }));
             worklist.push((target, child));
         }
         let mut child = parent_trace.to_vec();
-        child.push(WalkReason::Seed(SeedSource::JtTableEntry { dispatch_pc: pc_of_dispatch }));
+        child.push(WalkReason::Seed(SeedSource::JtTableEntry {
+            dispatch_pc: pc_of_dispatch,
+        }));
         worklist.push((tbl, child));
         count += 1;
         tbl = tbl.wrapping_add(4);
@@ -1410,17 +1615,25 @@ fn enumerate_pc_rel_jump_table(
 /// table entries are unconditional `B`s starting at `pc + 8`.
 fn is_pc_rel_pc_dispatch(w: u32) -> bool {
     // DP family (bits[27:26]=00).
-    if (w >> 26) & 0b11 != 0b00 { return false; }
+    if (w >> 26) & 0b11 != 0b00 {
+        return false;
+    }
     // Register operand (bit 25 = 0).
-    if (w >> 25) & 1 != 0 { return false; }
+    if (w >> 25) & 1 != 0 {
+        return false;
+    }
     let rd = (w >> 12) & 0xF;
     let rn = (w >> 16) & 0xF;
-    if rd != 15 || rn != 15 { return false; }
+    if rd != 15 || rn != 15 {
+        return false;
+    }
     let opcode = (w >> 21) & 0xF;
     let s_bit = (w >> 20) & 1;
     // Reject TST/TEQ/CMP/CMN (opcodes 8..=B with S=0) — those are
     // compare-only forms that don't write Rd.
-    if matches!(opcode, 0x8..=0xB) && s_bit == 0 { return false; }
+    if matches!(opcode, 0x8..=0xB) && s_bit == 0 {
+        return false;
+    }
     true
 }
 
@@ -1435,21 +1648,29 @@ fn is_pc_write(w: u32) -> bool {
         let opcode = (w >> 21) & 0xF;
         let s_bit = (w >> 20) & 1;
         let is_dp_standard = !matches!(opcode, 0x8..=0xB) || s_bit == 1;
-        if is_dp_standard && rd == 15 { return true; }
+        if is_dp_standard && rd == 15 {
+            return true;
+        }
     }
     // LDR with Rd=15 (any cond).
     if (w >> 26) & 0b11 == 0b01 {
         let l_bit = (w >> 20) & 1;
         let rd = (w >> 12) & 0xF;
-        if l_bit == 1 && rd == 15 { return true; }
+        if l_bit == 1 && rd == 15 {
+            return true;
+        }
     }
     // BX Rn (any cond, A1 encoding).
-    if (w & 0x0FFF_FFF0) == 0x012F_FF10 { return true; }
+    if (w & 0x0FFF_FFF0) == 0x012F_FF10 {
+        return true;
+    }
     // LDM with PC in reglist.
     if (w >> 25) & 0b111 == 0b100 {
         let l_bit = (w >> 20) & 1;
         let has_pc = (w >> 15) & 1 == 1;
-        if l_bit == 1 && has_pc { return true; }
+        if l_bit == 1 && has_pc {
+            return true;
+        }
     }
     false
 }
@@ -1477,15 +1698,21 @@ fn step(w: u32, _pc: u32, manual_bl: bool, in_table: bool) -> Step {
         if cond == 0xE {
             let is_link = (w >> 24) & 1 != 0;
             if in_table && !is_link {
-                return Step::Continue { branch: Some(target) };
+                return Step::Continue {
+                    branch: Some(target),
+                };
             }
             return if is_link {
-                Step::Continue { branch: Some(target) }
+                Step::Continue {
+                    branch: Some(target),
+                }
             } else {
                 Step::Jump(target)
             };
         } else {
-            return Step::Continue { branch: Some(target) };
+            return Step::Continue {
+                branch: Some(target),
+            };
         }
     }
 
@@ -1566,7 +1793,7 @@ fn step(w: u32, _pc: u32, manual_bl: bool, in_table: bool) -> Step {
     // it the walker falls through into the message and marks string
     // words as code (string chars happen to decode as LDRB/STRB shape
     // with Rn=PC, then leak into the byte-access bitmap and force
-    // shadow_stub to skip them at install time).
+    // inline_patch to skip them at install time).
     if w == 0xE600_0510 {
         return Step::Stop;
     }
@@ -1676,7 +1903,9 @@ fn walk(
             // bury the signal.
             let mut soup_logged = false;
             loop {
-                if cur & 3 != 0 { break; }
+                if cur & 3 != 0 {
+                    break;
+                }
                 // Translate the VA `cur` to its host-image PA. The
                 // bitmap and `words` array are PA-indexed; `cur` is a
                 // VA. For VAs in main ROM PA == VA so this is the same
@@ -1684,8 +1913,13 @@ fn walk(
                 // backing-page PA. Loud variant: log if the walker
                 // reaches a VA we can't translate (= missing JT
                 // window, or misdecoded branch into wild space).
-                let cur_pa = match va_to_pa_loud(words, cur) { Some(p) => p, None => break };
-                if reach.get_word(cur_pa) { break; }
+                let cur_pa = match va_to_pa_loud(words, cur) {
+                    Some(p) => p,
+                    None => break,
+                };
+                if reach.get_word(cur_pa) {
+                    break;
+                }
                 if in_data_stop_range(cur_pa) {
                     stats.data_range_stops += 1;
                     break;
@@ -1740,7 +1974,12 @@ fn walk(
                 // reachable only through the dispatch.
                 if is_pc_rel_pc_dispatch(w) {
                     enumerate_pc_rel_jump_table(
-                        words, cur, prev_w, fn_ranges, &mut worklist, &trace,
+                        words,
+                        cur,
+                        prev_w,
+                        fn_ranges,
+                        &mut worklist,
+                        &trace,
                     );
                 }
 
@@ -1761,9 +2000,7 @@ fn walk(
                 // up classified as a byte-access instruction
                 // (iter-69: 0x35c49c → 0x01b494f4 corruption).
                 let cond = (w >> 28) & 0xF;
-                let is_b_al = ((w >> 25) & 0b111) == 0b101
-                    && cond == 0xE
-                    && ((w >> 24) & 1) == 0;
+                let is_b_al = ((w >> 25) & 0b111) == 0b101 && cond == 0xE && ((w >> 24) & 1) == 0;
                 in_table = if is_pc_write(w) && !manual_bl {
                     true
                 } else if in_table && is_b_al {
@@ -1821,34 +2058,20 @@ fn walk(
         // following STR stores; store must be to Rn=r0 (this),
         // P=1/U=1/W=0, imm12=0.
         let mut new_roots = 0usize;
-        new_roots += collect_vtable_roots(
-            words, &reach, &mut worklist, stats,
-        );
-        new_roots += collect_fnptr_literal_roots(
-            words, &reach, &mut worklist, stats,
-        );
-        new_roots += collect_b_run_roots(
-            words, &reach, &mut worklist, stats,
-        );
-        new_roots += collect_pc_relative_addr_roots(
-            words, &reach, fn_ranges, &mut worklist, stats,
-        );
-        new_roots += collect_classinfo_roots(
-            words, &reach, &mut worklist, stats,
-        );
-        new_roots += collect_alt_entry_roots(
-            words, &reach, &mut worklist, stats,
-        );
-        new_roots += collect_indexed_dispatch_roots(
-            words, &reach, fn_ranges, &mut worklist, stats,
-        );
-        new_roots += collect_pcrel_ldr_thunk_run_roots(
-            words, &reach, &mut worklist, stats,
-        );
+        new_roots += collect_vtable_roots(words, &reach, &mut worklist, stats);
+        new_roots += collect_fnptr_literal_roots(words, &reach, &mut worklist, stats);
+        new_roots += collect_b_run_roots(words, &reach, &mut worklist, stats);
+        new_roots += collect_pc_relative_addr_roots(words, &reach, fn_ranges, &mut worklist, stats);
+        new_roots += collect_classinfo_roots(words, &reach, &mut worklist, stats);
+        new_roots += collect_alt_entry_roots(words, &reach, &mut worklist, stats);
+        new_roots += collect_indexed_dispatch_roots(words, &reach, fn_ranges, &mut worklist, stats);
+        new_roots += collect_pcrel_ldr_thunk_run_roots(words, &reach, &mut worklist, stats);
 
         stats.indirect_passes = pass;
         stats.indirect_roots_added += new_roots;
-        if new_roots == 0 { break; }
+        if new_roots == 0 {
+            break;
+        }
     }
 
     // Post-pass: subtract literal-pool words from `reach`. Any word
@@ -1895,10 +2118,14 @@ fn clear_literal_pool_targets_from_reach(words: &[u32], reach: &mut Bitmap) -> u
     let mut targets: Vec<u32> = Vec::new();
     for i in 0..ROM_WORD_COUNT {
         let addr = (i as u32) * 4;
-        if !reach.get_word(addr) { continue; }
+        if !reach.get_word(addr) {
+            continue;
+        }
         let w = words[i];
         let cond = (w >> 28) & 0xF;
-        if cond == 0xF { continue; }
+        if cond == 0xF {
+            continue;
+        }
         let masked = (w >> 16) & 0x0FFF;
         let imm_sign: i32 = match masked {
             0x59F => 1,
@@ -1907,8 +2134,12 @@ fn clear_literal_pool_targets_from_reach(words: &[u32], reach: &mut Bitmap) -> u
         };
         let imm12 = (w & 0xFFF) as i32;
         let lit_pc = (addr as i64) + 8 + (imm_sign as i64) * (imm12 as i64);
-        if lit_pc < 0 || (lit_pc as usize) + 4 > ROM_SIZE_BYTES { continue; }
-        if (lit_pc as u32) & 3 != 0 { continue; }
+        if lit_pc < 0 || (lit_pc as usize) + 4 > ROM_SIZE_BYTES {
+            continue;
+        }
+        if (lit_pc as u32) & 3 != 0 {
+            continue;
+        }
         targets.push(lit_pc as u32);
     }
     let mut cleared: u64 = 0;
@@ -1938,7 +2169,9 @@ fn collect_vtable_roots(
 
     for addr_idx in 0..ROM_WORD_COUNT.saturating_sub(1) {
         let addr = (addr_idx as u32) * 4;
-        if !reach.get_word(addr) { continue; }
+        if !reach.get_word(addr) {
+            continue;
+        }
         let w0 = words[addr_idx];
         // LDR Rt, [pc, #+-imm12]: bits[27:20]=0101_0001 (L=1, U=?),
         // P=1, W=0, B=0, Rn=15. The two valid top halves are
@@ -1963,18 +2196,32 @@ fn collect_vtable_roots(
         // STR Rt,[Rn,#0]: cond=AL(0xE) 010 P=1 U=1 B=0 W=0 L=0 Rn Rt imm12=0.
         // Fixed bits are [31:20] = 0xE58 and [11:0] = 0; Rn (19:16) and
         // Rt (15:12) are variable. Mask = 0xFFF0_0FFF, value = 0xE580_0000.
-        if (w1 & 0xFFF0_0FFF) != 0xE580_0000 { continue; }
+        if (w1 & 0xFFF0_0FFF) != 0xE580_0000 {
+            continue;
+        }
         let rt_w1 = (w1 >> 12) & 0xF;
-        if rt_w1 != rt { continue; }
+        if rt_w1 != rt {
+            continue;
+        }
 
         // Literal address: pc_of_ldr + 8 + signed_offset.
         let lit_pc = (addr as i64) + 8 + (imm_sign as i64 * imm12 as i64);
-        if lit_pc < 0 || (lit_pc as usize) + 4 > ROM_SIZE_BYTES { continue; }
-        if (lit_pc as u32) & 3 != 0 { continue; }
+        if lit_pc < 0 || (lit_pc as usize) + 4 > ROM_SIZE_BYTES {
+            continue;
+        }
+        if (lit_pc as u32) & 3 != 0 {
+            continue;
+        }
         let vtable_addr = words[(lit_pc as usize) >> 2];
-        if (vtable_addr as usize) >= ROM_SIZE_BYTES { continue; }
-        if vtable_addr & 3 != 0 { continue; }
-        if !seen.insert(vtable_addr) { continue; }
+        if (vtable_addr as usize) >= ROM_SIZE_BYTES {
+            continue;
+        }
+        if vtable_addr & 3 != 0 {
+            continue;
+        }
+        if !seen.insert(vtable_addr) {
+            continue;
+        }
 
         // Enumerate consecutive method pointers at vtable_addr.
         // Stop at the first word that doesn't point at a prologue-
@@ -1984,9 +2231,13 @@ fn collect_vtable_roots(
         let mut entries_added = 0usize;
         for j in 0..MAX_VTABLE_ENTRIES {
             let vptr_addr = vtable_addr.wrapping_add((j as u32) * 4);
-            if (vptr_addr as usize) + 4 > ROM_SIZE_BYTES { break; }
+            if (vptr_addr as usize) + 4 > ROM_SIZE_BYTES {
+                break;
+            }
             let p = words[(vptr_addr as usize) >> 2];
-            if p == 0 { break; }
+            if p == 0 {
+                break;
+            }
             // Validate the VA is mappable and decodes as a known
             // function-start word (B-AL through patch-table thunk
             // counts). Vtables in Newton overwhelmingly point at JT
@@ -1998,10 +2249,17 @@ fn collect_vtable_roots(
                 None => break,
             };
             let tgt_word = words[(p_pa >> 2) as usize];
-            if (tgt_word >> 28) == 0xF { break; }
-            if !is_known_function_start(tgt_word) { break; }
+            if (tgt_word >> 28) == 0xF {
+                break;
+            }
+            if !is_known_function_start(tgt_word) {
+                break;
+            }
             if !reach.get_word(p_pa) {
-                worklist.push((p, vec![WalkReason::Seed(SeedSource::Vtable { ldr_pc: addr })]));
+                worklist.push((
+                    p,
+                    vec![WalkReason::Seed(SeedSource::Vtable { ldr_pc: addr })],
+                ));
                 added += 1;
                 entries_added += 1;
             }
@@ -2034,7 +2292,9 @@ fn collect_pc_relative_addr_roots(
     let mut seen: HashSet<u32> = HashSet::new();
     for addr_idx in 0..ROM_WORD_COUNT {
         let addr = (addr_idx as u32) * 4;
-        if !reach.get_word(addr) { continue; }
+        if !reach.get_word(addr) {
+            continue;
+        }
         let w = words[addr_idx];
         // ADD/SUB cond=AL imm: 0xE28FRddd (ADD) / 0xE24FRddd (SUB).
         let kind = w >> 16;
@@ -2044,14 +2304,20 @@ fn collect_pc_relative_addr_roots(
             _ => continue,
         };
         let rd = (w >> 12) & 0xF;
-        if rd == 15 { continue; }
+        if rd == 15 {
+            continue;
+        }
         let rot = ((w >> 8) & 0xF) * 2;
         let val8 = w & 0xFF;
         let imm = val8.rotate_right(rot);
-        let target = (addr.wrapping_add(8) as i64)
-            .wrapping_add(imm_sign as i64 * imm as i64) as u32;
-        if (target as usize) >= ROM_SIZE_BYTES { continue; }
-        if target & 3 != 0 { continue; }
+        let target =
+            (addr.wrapping_add(8) as i64).wrapping_add(imm_sign as i64 * imm as i64) as u32;
+        if (target as usize) >= ROM_SIZE_BYTES {
+            continue;
+        }
+        if target & 3 != 0 {
+            continue;
+        }
         // Two ways for the PC-rel computed address to be code:
         //
         //   (a) Dispatch-base setup: Rd is later used as the base
@@ -2071,17 +2337,28 @@ fn collect_pc_relative_addr_roots(
         // can't pass (b)'s prologue gate because ASCII top nibbles
         // are 0x2..0x7, not 0xE.
         let tw = words[(target >> 2) as usize];
-        if (tw >> 28) == 0xF { continue; }
+        if (tw >> 28) == 0xF {
+            continue;
+        }
         let target_is_code = is_known_function_start(tw);
         let fn_range = match find_fn_range(fn_ranges, addr) {
             Some(r) => r,
             None => continue,
         };
         let is_dispatch_base = is_used_as_dispatch_base(words, reach, fn_range, rd, addr);
-        if !target_is_code && !is_dispatch_base { continue; }
-        if reach.get_word(target) { continue; }
-        if !seen.insert(target) { continue; }
-        worklist.push((target, vec![WalkReason::Seed(SeedSource::PcRelAddr { adr_pc: addr })]));
+        if !target_is_code && !is_dispatch_base {
+            continue;
+        }
+        if reach.get_word(target) {
+            continue;
+        }
+        if !seen.insert(target) {
+            continue;
+        }
+        worklist.push((
+            target,
+            vec![WalkReason::Seed(SeedSource::PcRelAddr { adr_pc: addr })],
+        ));
         added += 1;
     }
     stats.pc_rel_addr_roots += added;
@@ -2093,9 +2370,15 @@ fn collect_pc_relative_addr_roots(
 /// outside any known function.
 fn find_fn_range(fn_ranges: &[(u32, u32)], addr: u32) -> Option<(u32, u32)> {
     let idx = fn_ranges.partition_point(|&(s, _)| s <= addr);
-    if idx == 0 { return None; }
+    if idx == 0 {
+        return None;
+    }
     let (s, e) = fn_ranges[idx - 1];
-    if s <= addr && addr < e { Some((s, e)) } else { None }
+    if s <= addr && addr < e {
+        Some((s, e))
+    } else {
+        None
+    }
 }
 
 /// Returns true if any word in `[fn_range.0, fn_range.1)` decodes as a
@@ -2121,7 +2404,9 @@ fn is_used_as_dispatch_base(
     let end_idx = ((e >> 2) as usize).min(ROM_WORD_COUNT);
     for i in start_idx..end_idx {
         let pa = (i as u32) * 4;
-        if pa == skip_addr { continue; }
+        if pa == skip_addr {
+            continue;
+        }
         // The hypothesis being tested is that rd_target was loaded
         // here for a dispatch later in the function. By the time the
         // indirect pass runs, the dispatch instruction itself must
@@ -2129,27 +2414,43 @@ fn is_used_as_dispatch_base(
         // there from the function entry). Skipping unreached words
         // prevents data inside the synthetic last-fn-range bucket
         // from masquerading as a dispatch.
-        if !reach.get_word(pa) { continue; }
+        if !reach.get_word(pa) {
+            continue;
+        }
         let w = words[i];
         // DP family with Rd=15, Rn=rd_target, register operand,
         // any cond (LS/CC/AL etc).
-        if (w >> 26) & 0b11 != 0b00 { continue; }
-        if (w >> 25) & 1 != 0 { continue; }
+        if (w >> 26) & 0b11 != 0b00 {
+            continue;
+        }
+        if (w >> 25) & 1 != 0 {
+            continue;
+        }
         // bits[27:25]=000 with bit 4 = 1 splits into:
         //   bit 7 = 0 → DP register-specified shift (real DP)
         //   bit 7 = 1 → multiply / extra LD-ST / sync primitive
         // The latter aren't DP at all but happen to share Rd/Rn field
         // positions, so without this filter random data words match
         // the dispatch-base check (~670 false hits in REX alone).
-        if (w >> 4) & 1 != 0 && (w >> 7) & 1 != 0 { continue; }
+        if (w >> 4) & 1 != 0 && (w >> 7) & 1 != 0 {
+            continue;
+        }
         let rd = (w >> 12) & 0xF;
         let rn = (w >> 16) & 0xF;
-        if rd != 15 { continue; }
-        if rn != rd_target { continue; }
+        if rd != 15 {
+            continue;
+        }
+        if rn != rd_target {
+            continue;
+        }
         let opcode = (w >> 21) & 0xF;
         let s_bit = (w >> 20) & 1;
-        if matches!(opcode, 0x8..=0xB) && s_bit == 0 { continue; }
-        if matches!(opcode, 0xD | 0xF) { continue; }
+        if matches!(opcode, 0x8..=0xB) && s_bit == 0 {
+            continue;
+        }
+        if matches!(opcode, 0xD | 0xF) {
+            continue;
+        }
         return true;
     }
     false
@@ -2210,9 +2511,14 @@ fn collect_b_run_roots(
             }
         }
         // Trim trailing zeros so the run ends on a B-AL.
-        while j > i && words[j - 1] == 0 { j -= 1; }
+        while j > i && words[j - 1] == 0 {
+            j -= 1;
+        }
         let b_count = (i..j).filter(|&k| (words[k] >> 24) == 0xEA).count();
-        if b_count < MIN_B { i = j.max(i + 1); continue; }
+        if b_count < MIN_B {
+            i = j.max(i + 1);
+            continue;
+        }
         // Validate: real dispatch tables target prologue-shaped code.
         // Reject runs whose targets land on non-code words (e.g.
         // gROMPublicJumpTable, whose entries point at unresolved
@@ -2222,7 +2528,9 @@ fn collect_b_run_roots(
         // Zero placeholder slots don't participate in the count.
         let mut good = 0usize;
         for k in i..j {
-            if (words[k] >> 24) != 0xEA { continue; }
+            if (words[k] >> 24) != 0xEA {
+                continue;
+            }
             let entry_pa = (k as u32) * 4;
             let imm24 = words[k] & 0xFFFFFF;
             let simm = sign_extend(imm24, 24) << 2;
@@ -2237,18 +2545,28 @@ fn collect_b_run_roots(
                 None => continue,
             };
             let tgt_word = words[(target_pa >> 2) as usize];
-            if is_known_function_start(tgt_word) { good += 1; }
+            if is_known_function_start(tgt_word) {
+                good += 1;
+            }
         }
-        if good * 4 < b_count * 3 { i = j.max(i + 1); continue; }
+        if good * 4 < b_count * 3 {
+            i = j.max(i + 1);
+            continue;
+        }
         for k in i..j {
             // Skip zero placeholder slots — they're data; only the
             // B-AL entries are method bodies the walker should walk.
-            if (words[k] >> 24) != 0xEA { continue; }
+            if (words[k] >> 24) != 0xEA {
+                continue;
+            }
             let entry_pa = (k as u32) * 4;
             // Seed the entry PA as a worklist root. Walker marks it
             // reach=true, then Step::Jump processes the target.
             if !reach.get_word(entry_pa) && seen.insert(entry_pa) {
-                worklist.push((entry_pa, vec![WalkReason::Seed(SeedSource::BRunEntry { entry_pa })]));
+                worklist.push((
+                    entry_pa,
+                    vec![WalkReason::Seed(SeedSource::BRunEntry { entry_pa })],
+                ));
                 added += 1;
             }
         }
@@ -2319,12 +2637,20 @@ fn collect_classinfo_roots(
     let struct_words = (STRUCT_BYTES / 4) as usize;
 
     for fn_idx in struct_words..last {
-        if words[fn_idx] != TRAMP_SUB_R0_PC_68 { continue; }
-        if words[fn_idx + 1] != MOV_PC_LR { continue; }
+        if words[fn_idx] != TRAMP_SUB_R0_PC_68 {
+            continue;
+        }
+        if words[fn_idx + 1] != MOV_PC_LR {
+            continue;
+        }
         // Alt entry: `mov r0, #imm` (any 12-bit rotated imm).
         let w_alt = words[fn_idx + 2];
-        if (w_alt & 0xFFFF_F000) != 0xE3A0_0000 { continue; }
-        if words[fn_idx + 3] != MOV_PC_LR { continue; }
+        if (w_alt & 0xFFFF_F000) != 0xE3A0_0000 {
+            continue;
+        }
+        if words[fn_idx + 3] != MOV_PC_LR {
+            continue;
+        }
 
         let fn_pa = (fn_idx as u32) * 4;
         let struct_base_pa = fn_pa - STRUCT_BYTES;
@@ -2332,7 +2658,12 @@ fn collect_classinfo_roots(
         // Seed the trampoline function itself — covers TClassInfo
         // entries that aren't named in symbols.txt.
         if !reach.get_word(fn_pa) && seen.insert(fn_pa) {
-            worklist.push((fn_pa, vec![WalkReason::Seed(SeedSource::ClassInfoTramp { tramp_pc: fn_pa })]));
+            worklist.push((
+                fn_pa,
+                vec![WalkReason::Seed(SeedSource::ClassInfoTramp {
+                    tramp_pc: fn_pa,
+                })],
+            ));
             added += 1;
         }
 
@@ -2343,9 +2674,16 @@ fn collect_classinfo_roots(
             let w = words[(pa >> 2) as usize];
             let is_b_al = (w >> 24) == 0xEA;
             let is_mov_pc_lr = w == MOV_PC_LR;
-            if !is_b_al && !is_mov_pc_lr { continue; }
+            if !is_b_al && !is_mov_pc_lr {
+                continue;
+            }
             if !reach.get_word(pa) && seen.insert(pa) {
-                worklist.push((pa, vec![WalkReason::Seed(SeedSource::ClassInfoBranchSlot { tramp_pc: fn_pa })]));
+                worklist.push((
+                    pa,
+                    vec![WalkReason::Seed(SeedSource::ClassInfoBranchSlot {
+                        tramp_pc: fn_pa,
+                    })],
+                ));
                 added += 1;
             }
         }
@@ -2355,11 +2693,17 @@ fn collect_classinfo_roots(
         let resolve = |off: u32| -> Option<u32> {
             let field_pa = struct_base_pa + off;
             let delta = words[(field_pa >> 2) as usize] as i32;
-            if delta == 0 { return None; }
+            if delta == 0 {
+                return None;
+            }
             let target = (field_pa as i64).wrapping_add(delta as i64);
-            if !(0..=ROM_SIZE_BYTES as i64 - 4).contains(&target) { return None; }
+            if !(0..=ROM_SIZE_BYTES as i64 - 4).contains(&target) {
+                return None;
+            }
             let target = target as u32;
-            if target & 3 != 0 { return None; }
+            if target & 3 != 0 {
+                return None;
+            }
             Some(target)
         };
         let btable_start = resolve(FBTABLE_OFFSET);
@@ -2377,11 +2721,17 @@ fn collect_classinfo_roots(
                 let mut pa = start;
                 while pa < end {
                     let w = words[(pa >> 2) as usize];
-                    if (w >> 24) == 0xEA && (w >> 28) != 0xF
+                    if (w >> 24) == 0xEA
+                        && (w >> 28) != 0xF
                         && !reach.get_word(pa)
                         && seen.insert(pa)
                     {
-                        worklist.push((pa, vec![WalkReason::Seed(SeedSource::ClassInfoBTable { tramp_pc: fn_pa })]));
+                        worklist.push((
+                            pa,
+                            vec![WalkReason::Seed(SeedSource::ClassInfoBTable {
+                                tramp_pc: fn_pa,
+                            })],
+                        ));
                         added += 1;
                     }
                     pa = pa.wrapping_add(4);
@@ -2397,7 +2747,12 @@ fn collect_classinfo_roots(
                 && !reach.get_word(target)
                 && seen.insert(target)
             {
-                worklist.push((target, vec![WalkReason::Seed(SeedSource::ClassInfoEntryProc { tramp_pc: fn_pa })]));
+                worklist.push((
+                    target,
+                    vec![WalkReason::Seed(SeedSource::ClassInfoEntryProc {
+                        tramp_pc: fn_pa,
+                    })],
+                ));
                 added += 1;
             }
         }
@@ -2445,8 +2800,12 @@ fn collect_alt_entry_roots(
 
     // Index 0 is the prev-word slot; start at 1 so prev exists.
     for i in 1..last {
-        if words[i] != MOV_R0_PC { continue; }
-        if words[i + 1] != MOV_PC_LR { continue; }
+        if words[i] != MOV_R0_PC {
+            continue;
+        }
+        if words[i + 1] != MOV_PC_LR {
+            continue;
+        }
         let prev = words[i - 1];
         // `add/sub pc, Rn=ip, #imm12` (DP-immediate writing PC):
         //   bits[31:28] = 1110 (cond=AL)
@@ -2461,15 +2820,28 @@ fn collect_alt_entry_roots(
         let rn = (prev >> 16) & 0xF;
         let rd = (prev >> 12) & 0xF;
         let opcode = (prev >> 21) & 0xF;
-        let prev_is_ip_jump =
-            cond == 0xE && kind == 0b001 && rn == 0xC && rd == 0xF
-                && (opcode == 0x4 || opcode == 0x2);
-        if !prev_is_ip_jump { continue; }
+        let prev_is_ip_jump = cond == 0xE
+            && kind == 0b001
+            && rn == 0xC
+            && rd == 0xF
+            && (opcode == 0x4 || opcode == 0x2);
+        if !prev_is_ip_jump {
+            continue;
+        }
 
         let alt_pa = (i as u32) * 4;
-        if reach.get_word(alt_pa) { continue; }
-        if !seen.insert(alt_pa) { continue; }
-        worklist.push((alt_pa, vec![WalkReason::Seed(SeedSource::AltEntryAfterIpJump { trampoline_pc: alt_pa })]));
+        if reach.get_word(alt_pa) {
+            continue;
+        }
+        if !seen.insert(alt_pa) {
+            continue;
+        }
+        worklist.push((
+            alt_pa,
+            vec![WalkReason::Seed(SeedSource::AltEntryAfterIpJump {
+                trampoline_pc: alt_pa,
+            })],
+        ));
         added += 1;
     }
 
@@ -2514,25 +2886,51 @@ fn collect_indexed_dispatch_roots(
     let mut seen: HashSet<u32> = HashSet::new();
     for addr_idx in 0..ROM_WORD_COUNT {
         let addr = (addr_idx as u32) * 4;
-        if !reach.get_word(addr) { continue; }
+        if !reach.get_word(addr) {
+            continue;
+        }
         let w = words[addr_idx];
         // LDR pc, [Rn, Rm, lsl #2], cond=AL, P=1 U=1 B=0 W=0 L=1.
         // Encoding: cond | 011 | P U B W L | Rn | Rt | shift_imm | type | 0 | Rm.
         // Required bit fields (top byte): 0xE7 (cond=AL, 011 P=1).
-        if (w >> 28) != 0xE { continue; }
-        if (w >> 25) & 0b111 != 0b011 { continue; }
-        if (w >> 24) & 1 != 1 { continue; }    // P=1 (pre-indexed)
-        if (w >> 23) & 1 != 1 { continue; }    // U=1 (positive offset)
-        if (w >> 22) & 1 != 0 { continue; }    // B=0 (word access)
-        if (w >> 21) & 1 != 0 { continue; }    // W=0
-        if (w >> 20) & 1 != 1 { continue; }    // L=1 (load)
-        if (w >> 12) & 0xF != 0xF { continue; } // Rt = pc
-        if (w >> 4) & 1 != 0 { continue; }     // immediate-shift form
-        if (w >> 5) & 0b11 != 0b00 { continue; } // LSL
-        if (w >> 7) & 0b11111 != 2 { continue; } // shift_imm = 2 (4-byte stride)
+        if (w >> 28) != 0xE {
+            continue;
+        }
+        if (w >> 25) & 0b111 != 0b011 {
+            continue;
+        }
+        if (w >> 24) & 1 != 1 {
+            continue;
+        } // P=1 (pre-indexed)
+        if (w >> 23) & 1 != 1 {
+            continue;
+        } // U=1 (positive offset)
+        if (w >> 22) & 1 != 0 {
+            continue;
+        } // B=0 (word access)
+        if (w >> 21) & 1 != 0 {
+            continue;
+        } // W=0
+        if (w >> 20) & 1 != 1 {
+            continue;
+        } // L=1 (load)
+        if (w >> 12) & 0xF != 0xF {
+            continue;
+        } // Rt = pc
+        if (w >> 4) & 1 != 0 {
+            continue;
+        } // immediate-shift form
+        if (w >> 5) & 0b11 != 0b00 {
+            continue;
+        } // LSL
+        if (w >> 7) & 0b11111 != 2 {
+            continue;
+        } // shift_imm = 2 (4-byte stride)
         let rn = (w >> 16) & 0xF;
         let rm = w & 0xF;
-        if rn == 15 || rm == 15 { continue; }
+        if rn == 15 || rm == 15 {
+            continue;
+        }
 
         let fn_range = match find_fn_range(fn_ranges, addr) {
             Some(r) => r,
@@ -2549,8 +2947,13 @@ fn collect_indexed_dispatch_roots(
         let mut cmp_imm: Option<u32> = None;
         let mut bound_cond: Option<u32> = None;
         for back in 1..=16u32 {
-            let pa = match addr.checked_sub(back * 4) { Some(p) => p, None => break };
-            if ((pa >> 2) as usize) < start_idx { break; }
+            let pa = match addr.checked_sub(back * 4) {
+                Some(p) => p,
+                None => break,
+            };
+            if ((pa >> 2) as usize) < start_idx {
+                break;
+            }
             let pw = words[(pa >> 2) as usize];
 
             if table_base.is_none() {
@@ -2592,7 +2995,9 @@ fn collect_indexed_dispatch_roots(
                     // expected cc.
                     for fwd in 1..=4u32 {
                         let bpa = pa.wrapping_add(fwd * 4);
-                        if bpa >= addr { break; }
+                        if bpa >= addr {
+                            break;
+                        }
                         let bw = words[(bpa >> 2) as usize];
                         if (bw >> 25) & 0b111 == 0b101 && (bw >> 24) & 1 == 0 {
                             // Unconditional B (cond=AL) is the
@@ -2608,7 +3013,9 @@ fn collect_indexed_dispatch_roots(
                 }
             }
 
-            if table_base.is_some() && cmp_imm.is_some() { break; }
+            if table_base.is_some() && cmp_imm.is_some() {
+                break;
+            }
         }
 
         let (tbl, imm, cc) = match (table_base, cmp_imm, bound_cond) {
@@ -2632,7 +3039,9 @@ fn collect_indexed_dispatch_roots(
 
         for i in 0..count {
             let entry_pa = tbl.wrapping_add((i as u32) * 4);
-            if (entry_pa as usize) + 4 > ROM_SIZE_BYTES { break; }
+            if (entry_pa as usize) + 4 > ROM_SIZE_BYTES {
+                break;
+            }
             let entry_val = words[(entry_pa >> 2) as usize];
             // entry_val is a VA the kernel will branch to. Validate
             // it's mappable and shape-checks; push the VA so the
@@ -2642,10 +3051,19 @@ fn collect_indexed_dispatch_roots(
                 None => continue,
             };
             let tgt_word = words[(entry_pa2 >> 2) as usize];
-            if (tgt_word >> 28) == 0xF { continue; }
-            if !is_known_function_start(tgt_word) { continue; }
+            if (tgt_word >> 28) == 0xF {
+                continue;
+            }
+            if !is_known_function_start(tgt_word) {
+                continue;
+            }
             if !reach.get_word(entry_pa2) && seen.insert(entry_val) {
-                worklist.push((entry_val, vec![WalkReason::Seed(SeedSource::IndexedDispatch { dispatch_pc: addr })]));
+                worklist.push((
+                    entry_val,
+                    vec![WalkReason::Seed(SeedSource::IndexedDispatch {
+                        dispatch_pc: addr,
+                    })],
+                ));
                 added += 1;
             }
         }
@@ -2712,8 +3130,12 @@ fn collect_pcrel_ldr_thunk_run_roots(
                 None => break,
             };
             let tw = words[(lit_pa >> 2) as usize];
-            if (tw >> 28) == 0xF { break; }
-            if !is_known_function_start(tw) { break; }
+            if (tw >> 28) == 0xF {
+                break;
+            }
+            if !is_known_function_start(tw) {
+                break;
+            }
             j += 2;
         }
         let pairs = (j - i) / 2;
@@ -2723,8 +3145,12 @@ fn collect_pcrel_ldr_thunk_run_roots(
         }
         for k in 0..pairs {
             let entry_pa = ((i + 2 * k) as u32) * 4;
-            if reach.get_word(entry_pa) { continue; }
-            if !seen.insert(entry_pa) { continue; }
+            if reach.get_word(entry_pa) {
+                continue;
+            }
+            if !seen.insert(entry_pa) {
+                continue;
+            }
             worklist.push((
                 entry_pa,
                 vec![WalkReason::Seed(SeedSource::PcRelLdrThunkRun { entry_pa })],
@@ -2754,7 +3180,9 @@ fn collect_fnptr_literal_roots(
     let mut seen: HashSet<u32> = HashSet::new();
     for addr_idx in 0..ROM_WORD_COUNT {
         let addr = (addr_idx as u32) * 4;
-        if !reach.get_word(addr) { continue; }
+        if !reach.get_word(addr) {
+            continue;
+        }
         let w = words[addr_idx];
         // LDR Rt, [pc, #±imm12], cond=AL: 0xE59Fxxxx (U=1) or 0xE51Fxxxx (U=0).
         let imm_sign: i32 = match w >> 16 {
@@ -2764,10 +3192,16 @@ fn collect_fnptr_literal_roots(
         };
         let imm12 = (w & 0xFFF) as i32;
         let lit_pc = (addr as i64) + 8 + (imm_sign as i64 * imm12 as i64);
-        if lit_pc < 0 || (lit_pc as usize) + 4 > ROM_SIZE_BYTES { continue; }
-        if (lit_pc as u32) & 3 != 0 { continue; }
+        if lit_pc < 0 || (lit_pc as usize) + 4 > ROM_SIZE_BYTES {
+            continue;
+        }
+        if (lit_pc as u32) & 3 != 0 {
+            continue;
+        }
         let val = words[(lit_pc as usize) >> 2];
-        if val == 0 { continue; }
+        if val == 0 {
+            continue;
+        }
         // Function-pointer literal: VA (possibly a patch-table thunk
         // VA). Validate via VA→PA, shape-check the first word, then
         // seed the VA so the walker chains JT thunks naturally.
@@ -2776,11 +3210,22 @@ fn collect_fnptr_literal_roots(
             None => continue,
         };
         let tgt_word = words[(val_pa >> 2) as usize];
-        if (tgt_word >> 28) == 0xF { continue; }
-        if !is_known_function_start(tgt_word) { continue; }
-        if reach.get_word(val_pa) { continue; }
-        if !seen.insert(val) { continue; }
-        worklist.push((val, vec![WalkReason::Seed(SeedSource::FnPtrLiteral { ldr_pc: addr })]));
+        if (tgt_word >> 28) == 0xF {
+            continue;
+        }
+        if !is_known_function_start(tgt_word) {
+            continue;
+        }
+        if reach.get_word(val_pa) {
+            continue;
+        }
+        if !seen.insert(val) {
+            continue;
+        }
+        worklist.push((
+            val,
+            vec![WalkReason::Seed(SeedSource::FnPtrLiteral { ldr_pc: addr })],
+        ));
         added += 1;
     }
     stats.fnptr_literal_roots += added;
@@ -2788,8 +3233,7 @@ fn collect_fnptr_literal_roots(
 }
 
 fn write_bitmap(path: &Path, bm: &Bitmap) -> Result<(), String> {
-    fs::write(path, &bm.bits)
-        .map_err(|e| format!("write {}: {}", path.display(), e))
+    fs::write(path, &bm.bits).map_err(|e| format!("write {}: {}", path.display(), e))
 }
 
 struct InvariantReport {
@@ -2824,11 +3268,17 @@ fn check_invariant(oracle: &Bitmap, static_bm: &Bitmap) -> InvariantReport {
 fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(a) => a,
-        Err(e) => { eprintln!("classify-rom: {}", e); return ExitCode::from(2); }
+        Err(e) => {
+            eprintln!("classify-rom: {}", e);
+            return ExitCode::from(2);
+        }
     };
     match run(args) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => { eprintln!("classify-rom: {}", e); ExitCode::FAILURE }
+        Err(e) => {
+            eprintln!("classify-rom: {}", e);
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -2842,7 +3292,9 @@ fn run(args: Args) -> Result<(), String> {
         .map(|(pa, name)| (pa, SeedSource::Symbol(name)))
         .collect();
     let vectors: [u32; 8] = [0x00, 0x04, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C];
-    for v in vectors { symbols.push((v, SeedSource::Vector)); }
+    for v in vectors {
+        symbols.push((v, SeedSource::Vector));
+    }
 
     // Manual exceptions for code unreachable by any static pass. See
     // `MANUAL_CODE_ROOTS` for the rationale per entry.
@@ -2891,10 +3343,7 @@ fn run(args: Args) -> Result<(), String> {
     let mut fn_addrs: Vec<u32> = symbols.iter().map(|&(pa, _)| pa).collect();
     fn_addrs.sort_unstable();
     fn_addrs.dedup();
-    let mut fn_ranges: Vec<(u32, u32)> = fn_addrs
-        .windows(2)
-        .map(|w| (w[0], w[1]))
-        .collect();
+    let mut fn_ranges: Vec<(u32, u32)> = fn_addrs.windows(2).map(|w| (w[0], w[1])).collect();
     if let Some(&last) = fn_addrs.last() {
         fn_ranges.push((last, ROM_SIZE_BYTES as u32));
     }
@@ -2952,17 +3401,20 @@ fn run(args: Args) -> Result<(), String> {
     let mut kind_counts: [u64; 3] = [0, 0, 0]; // byte / halfword-ish / swpb (informational)
     for i in 0..ROM_WORD_COUNT {
         let addr = (i as u32) * 4;
-        if !reach.get_word(addr) { continue; }
+        if !reach.get_word(addr) {
+            continue;
+        }
         let w = words[i];
-        if !is_byte_access(w) { continue; }
+        if !is_byte_access(w) {
+            continue;
+        }
         ba_static.set_word(addr);
         let classify = classify_kind(w);
         kind_counts[classify] += 1;
     }
 
     let out_dir: PathBuf = args.out_root.join(&hash_str);
-    fs::create_dir_all(&out_dir)
-        .map_err(|e| format!("mkdir {}: {}", out_dir.display(), e))?;
+    fs::create_dir_all(&out_dir).map_err(|e| format!("mkdir {}: {}", out_dir.display(), e))?;
 
     write_bitmap(&out_dir.join("byte-access-static.bitmap"), &ba_static)?;
     write_bitmap(&out_dir.join("reach.bitmap"), &reach)?;
@@ -2988,24 +3440,90 @@ fn run(args: Args) -> Result<(), String> {
     writeln!(f, "    symbols = {}", args.symbols.display()).ok();
     writeln!(f, "  hash(fnv1a32 of rom || rex) = 0x{}", hash_str).ok();
     writeln!(f, "  symbol filter (load_symbol_roots):").ok();
-    writeln!(f, "    raw lines:               {}", sym_filter_stats.raw_lines).ok();
-    writeln!(f, "    parse-skipped:           {}", sym_filter_stats.parse_skipped).ok();
-    writeln!(f, "    misaligned addr:         {}", sym_filter_stats.misaligned).ok();
-    writeln!(f, "    out-of-rom addr (>=16M): {}", sym_filter_stats.out_of_rom).ok();
-    writeln!(f, "    linker-marker dropped:   {}", sym_filter_stats.linker_marker_dropped).ok();
-    writeln!(f, "    g[A-Z]* dropped:         {}", sym_filter_stats.g_prefix_dropped).ok();
-    writeln!(f, "    k[A-Z]* dropped:         {}", sym_filter_stats.k_prefix_dropped).ok();
-    writeln!(f, "    NV-cond first-word:      {}", sym_filter_stats.nv_cond_dropped).ok();
-    writeln!(f, "    not-prologue first-word: {}", sym_filter_stats.not_prologue_dropped).ok();
-    writeln!(f, "    data-stop-range:         {}", sym_filter_stats.data_stop_dropped).ok();
-    writeln!(f, "    JT-VA resolved → thunk:  {}", sym_filter_stats.jt_va_resolved).ok();
-    writeln!(f, "    accepted:                {}", sym_filter_stats.accepted).ok();
+    writeln!(
+        f,
+        "    raw lines:               {}",
+        sym_filter_stats.raw_lines
+    )
+    .ok();
+    writeln!(
+        f,
+        "    parse-skipped:           {}",
+        sym_filter_stats.parse_skipped
+    )
+    .ok();
+    writeln!(
+        f,
+        "    misaligned addr:         {}",
+        sym_filter_stats.misaligned
+    )
+    .ok();
+    writeln!(
+        f,
+        "    out-of-rom addr (>=16M): {}",
+        sym_filter_stats.out_of_rom
+    )
+    .ok();
+    writeln!(
+        f,
+        "    linker-marker dropped:   {}",
+        sym_filter_stats.linker_marker_dropped
+    )
+    .ok();
+    writeln!(
+        f,
+        "    g[A-Z]* dropped:         {}",
+        sym_filter_stats.g_prefix_dropped
+    )
+    .ok();
+    writeln!(
+        f,
+        "    k[A-Z]* dropped:         {}",
+        sym_filter_stats.k_prefix_dropped
+    )
+    .ok();
+    writeln!(
+        f,
+        "    NV-cond first-word:      {}",
+        sym_filter_stats.nv_cond_dropped
+    )
+    .ok();
+    writeln!(
+        f,
+        "    not-prologue first-word: {}",
+        sym_filter_stats.not_prologue_dropped
+    )
+    .ok();
+    writeln!(
+        f,
+        "    data-stop-range:         {}",
+        sym_filter_stats.data_stop_dropped
+    )
+    .ok();
+    writeln!(
+        f,
+        "    JT-VA resolved → thunk:  {}",
+        sym_filter_stats.jt_va_resolved
+    )
+    .ok();
+    writeln!(
+        f,
+        "    accepted:                {}",
+        sym_filter_stats.accepted
+    )
+    .ok();
     writeln!(f, "  vector tables (ctorvec / dtorvec):").ok();
     writeln!(f, "    ranges discovered:       {}", vector_count).ok();
     writeln!(f, "    function pointers seeded: {}", vector_seeds).ok();
     for (label, base, limit) in &vector_ranges {
-        writeln!(f, "    {label}: 0x{:08x}..0x{:08x} ({} bytes)",
-                 base, limit, limit - base).ok();
+        writeln!(
+            f,
+            "    {label}: 0x{:08x}..0x{:08x} ({} bytes)",
+            base,
+            limit,
+            limit - base
+        )
+        .ok();
     }
     writeln!(f, "  manual data-range exclusions:").ok();
     writeln!(f, "    words cleared: {}", manual_data_words_cleared).ok();
@@ -3013,43 +3531,172 @@ fn run(args: Args) -> Result<(), String> {
     writeln!(f, "    words set:     {}", manual_code_words_set).ok();
     writeln!(f, "  walker:").ok();
     writeln!(f, "    symbol roots (post-merge): {}", stats.initial_roots).ok();
-    writeln!(f, "    rex-header roots added:    {}", stats.rex_header_roots).ok();
-    writeln!(f, "    words walked (with revisits): {}", stats.words_walked).ok();
+    writeln!(
+        f,
+        "    rex-header roots added:    {}",
+        stats.rex_header_roots
+    )
+    .ok();
+    writeln!(
+        f,
+        "    words walked (with revisits): {}",
+        stats.words_walked
+    )
+    .ok();
     writeln!(f, "    NV-cond words skipped:     {}", stats.nv_cond_skips).ok();
-    writeln!(f, "    data-range terminations:   {}", stats.data_range_stops).ok();
-    writeln!(f, "    vtable passes:             {}", stats.indirect_passes).ok();
+    writeln!(
+        f,
+        "    data-range terminations:   {}",
+        stats.data_range_stops
+    )
+    .ok();
+    writeln!(
+        f,
+        "    vtable passes:             {}",
+        stats.indirect_passes
+    )
+    .ok();
     writeln!(f, "    vtables found:             {}", stats.vtables_found).ok();
     writeln!(f, "    vtable method roots added: {}", stats.vtable_roots).ok();
-    writeln!(f, "    fnptr literal roots added: {}", stats.fnptr_literal_roots).ok();
+    writeln!(
+        f,
+        "    fnptr literal roots added: {}",
+        stats.fnptr_literal_roots
+    )
+    .ok();
     writeln!(f, "    B-run dispatch roots added: {}", stats.b_run_roots).ok();
-    writeln!(f, "    PC-rel addr roots added:    {}", stats.pc_rel_addr_roots).ok();
-    writeln!(f, "    TClassInfo struct roots:    {}", stats.classinfo_roots).ok();
-    writeln!(f, "    alt-entry-after-ip-jump:    {}", stats.alt_entry_roots).ok();
-    writeln!(f, "    indexed-dispatch roots:     {}", stats.indexed_dispatch_roots).ok();
-    writeln!(f, "    pcrel-ldr-thunk-run roots:  {}", stats.pcrel_ldr_thunk_run_roots).ok();
-    writeln!(f, "    pkgl packages seen:         {}", stats.pkgl_packages_seen).ok();
-    writeln!(f, "    pkgl relocatable packages:  {}", stats.pkgl_relocatable_packages).ok();
-    writeln!(f, "    pkgl relocation slots:      {}", stats.pkgl_relocation_slots_total).ok();
-    writeln!(f, "    pkgl relocation roots:      {}", stats.pkgl_relocation_roots_seeded).ok();
-    writeln!(f, "    pkgl NOS parts walked/fail: {}/{}",
-        stats.pkgl_nos_parts_walked, stats.pkgl_nos_parts_failed).ok();
-    writeln!(f, "    pkgl BinCFunction frames:   {}", stats.pkgl_bincfunction_frames).ok();
-    writeln!(f, "    pkgl BinCFunction roots:    {}", stats.pkgl_bincfunction_roots_seeded).ok();
-    writeln!(f, "    total indirect roots added: {}", stats.indirect_roots_added).ok();
-    writeln!(f, "    literal-pool words cleared: {}", stats.literal_targets_cleared).ok();
-    writeln!(f, "    rom-soup walk-entries:     {}", stats.rom_soup_entries).ok();
+    writeln!(
+        f,
+        "    PC-rel addr roots added:    {}",
+        stats.pc_rel_addr_roots
+    )
+    .ok();
+    writeln!(
+        f,
+        "    TClassInfo struct roots:    {}",
+        stats.classinfo_roots
+    )
+    .ok();
+    writeln!(
+        f,
+        "    alt-entry-after-ip-jump:    {}",
+        stats.alt_entry_roots
+    )
+    .ok();
+    writeln!(
+        f,
+        "    indexed-dispatch roots:     {}",
+        stats.indexed_dispatch_roots
+    )
+    .ok();
+    writeln!(
+        f,
+        "    pcrel-ldr-thunk-run roots:  {}",
+        stats.pcrel_ldr_thunk_run_roots
+    )
+    .ok();
+    writeln!(
+        f,
+        "    pkgl packages seen:         {}",
+        stats.pkgl_packages_seen
+    )
+    .ok();
+    writeln!(
+        f,
+        "    pkgl relocatable packages:  {}",
+        stats.pkgl_relocatable_packages
+    )
+    .ok();
+    writeln!(
+        f,
+        "    pkgl relocation slots:      {}",
+        stats.pkgl_relocation_slots_total
+    )
+    .ok();
+    writeln!(
+        f,
+        "    pkgl relocation roots:      {}",
+        stats.pkgl_relocation_roots_seeded
+    )
+    .ok();
+    writeln!(
+        f,
+        "    pkgl NOS parts walked/fail: {}/{}",
+        stats.pkgl_nos_parts_walked, stats.pkgl_nos_parts_failed
+    )
+    .ok();
+    writeln!(
+        f,
+        "    pkgl BinCFunction frames:   {}",
+        stats.pkgl_bincfunction_frames
+    )
+    .ok();
+    writeln!(
+        f,
+        "    pkgl BinCFunction roots:    {}",
+        stats.pkgl_bincfunction_roots_seeded
+    )
+    .ok();
+    writeln!(
+        f,
+        "    total indirect roots added: {}",
+        stats.indirect_roots_added
+    )
+    .ok();
+    writeln!(
+        f,
+        "    literal-pool words cleared: {}",
+        stats.literal_targets_cleared
+    )
+    .ok();
+    writeln!(
+        f,
+        "    rom-soup walk-entries:     {}",
+        stats.rom_soup_entries
+    )
+    .ok();
     writeln!(f, "    reachable-code popcount: {}", reach.popcount()).ok();
-    writeln!(f, "  byte-access-static.bitmap popcount = {}", ba_static.popcount()).ok();
-    writeln!(f, "    of which byte (LDRB/STRB):              {}", kind_counts[0]).ok();
-    writeln!(f, "    of which halfword/signed (LDRH/...):    {}", kind_counts[1]).ok();
-    writeln!(f, "    of which swpb:                          {}", kind_counts[2]).ok();
+    writeln!(
+        f,
+        "  byte-access-static.bitmap popcount = {}",
+        ba_static.popcount()
+    )
+    .ok();
+    writeln!(
+        f,
+        "    of which byte (LDRB/STRB):              {}",
+        kind_counts[0]
+    )
+    .ok();
+    writeln!(
+        f,
+        "    of which halfword/signed (LDRH/...):    {}",
+        kind_counts[1]
+    )
+    .ok();
+    writeln!(
+        f,
+        "    of which swpb:                          {}",
+        kind_counts[2]
+    )
+    .ok();
     if let Some(rep) = &invariant {
         writeln!(f, "  invariant check (oracle ⊆ static):").ok();
         writeln!(f, "    oracle popcount = {}", rep.oracle_popcount).ok();
         writeln!(f, "    static popcount = {}", rep.static_popcount).ok();
-        writeln!(f, "    oracle bits missing from static = {}", rep.oracle_only_count).ok();
+        writeln!(
+            f,
+            "    oracle bits missing from static = {}",
+            rep.oracle_only_count
+        )
+        .ok();
         if !rep.oracle_only_samples.is_empty() {
-            writeln!(f, "    first {} offending PCs:", rep.oracle_only_samples.len()).ok();
+            writeln!(
+                f,
+                "    first {} offending PCs:",
+                rep.oracle_only_samples.len()
+            )
+            .ok();
             for pc in &rep.oracle_only_samples {
                 let w = words[(*pc >> 2) as usize];
                 writeln!(f, "      0x{:08x}  insn=0x{:08x}", pc, w).ok();
@@ -3059,16 +3706,23 @@ fn run(args: Args) -> Result<(), String> {
 
     println!("classify-rom: wrote {}", out_dir.display());
     println!("  byte-access-static popcount = {}", ba_static.popcount());
-    println!("  (byte={} halfword={} swpb={})", kind_counts[0], kind_counts[1], kind_counts[2]);
+    println!(
+        "  (byte={} halfword={} swpb={})",
+        kind_counts[0], kind_counts[1], kind_counts[2]
+    );
     match invariant {
         Some(rep) if rep.oracle_only_count == 0 => {
-            println!("  invariant OK: oracle {} ⊆ static {}",
-                rep.oracle_popcount, rep.static_popcount);
+            println!(
+                "  invariant OK: oracle {} ⊆ static {}",
+                rep.oracle_popcount, rep.static_popcount
+            );
             Ok(())
         }
         Some(rep) => {
-            eprintln!("classify-rom: INVARIANT VIOLATED — {} oracle bits missing from static",
-                rep.oracle_only_count);
+            eprintln!(
+                "classify-rom: INVARIANT VIOLATED — {} oracle bits missing from static",
+                rep.oracle_only_count
+            );
             eprintln!("  first offending PCs (see summary.txt for details):");
             for pc in rep.oracle_only_samples.iter().take(8) {
                 let w = words[(*pc >> 2) as usize];
@@ -3077,8 +3731,10 @@ fn run(args: Args) -> Result<(), String> {
             Err("invariant violated".into())
         }
         None => {
-            println!("  (no oracle bitmap at {} — invariant not checked)",
-                oracle_path.display());
+            println!(
+                "  (no oracle bitmap at {} — invariant not checked)",
+                oracle_path.display()
+            );
             Ok(())
         }
     }
@@ -3086,10 +3742,16 @@ fn run(args: Args) -> Result<(), String> {
 
 fn classify_kind(w: u32) -> usize {
     // LDRB/STRB immediate or register.
-    if (w & 0x0E00_0000) == 0x0400_0000 && (w & (1 << 22)) != 0 { return 0; }
-    if (w & 0x0E00_0010) == 0x0600_0000 && (w & (1 << 22)) != 0 { return 0; }
+    if (w & 0x0E00_0000) == 0x0400_0000 && (w & (1 << 22)) != 0 {
+        return 0;
+    }
+    if (w & 0x0E00_0010) == 0x0600_0000 && (w & (1 << 22)) != 0 {
+        return 0;
+    }
     // SWPB.
-    if (w & 0x0FF0_0FF0) == 0x0140_0090 { return 2; }
+    if (w & 0x0FF0_0FF0) == 0x0140_0090 {
+        return 2;
+    }
     // Halfword/signed — everything else accepted by is_byte_access.
     1
 }

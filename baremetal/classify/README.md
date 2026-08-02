@@ -1,9 +1,9 @@
 # Endianness-patch classifier artifacts
 
 Per-ROM-hash bitmaps of every ARM instruction in `newton.rom` + `Einstein.rex`
-that needs the shadow-stub endianness fix-up (LDRB / STRB / LDRH / STRH /
+that needs the inline-patch endianness fix-up (LDRB / STRB / LDRH / STRH /
 LDRSB / LDRSH / SWPB). Eventual intent: drive a pre-launch patching pass
-that pre-computes every stub, eliminating `shadow_stub::patch_code_range`'s
+that pre-computes every stub, eliminating `inline_patch::patch_code_range`'s
 runtime linear scan from the hypervisor entirely.
 
 ## Layout
@@ -37,7 +37,7 @@ classify-rom checks `oracle ⊆ static` as a hard post-condition. If an oracle
 bit is missing from static, it exits non-zero and lists the offending PCs —
 that means either the walker lost reachability to a real call site or the
 JIT hook records something `is_byte_access` doesn't (drift from
-`shadow_stub::decode`).
+`inline_patch::decode`).
 
 ## Oracle source
 
@@ -51,14 +51,14 @@ literal-pool words that look like byte accesses):
 - `Emulator/JIT/Generic/TJITGeneric_SingleDataSwap_template.h` — `#if FLAG_B && (Rd != Rm)`
 
 The carve-outs (LDRD/STRD, SWPB Rt==Rm) mirror the refusal set of
-`baremetal/src/shadow_stub.rs::decode`, which is what the patcher will
+`baremetal/src/inline_patch.rs::decode`, which is what the patcher will
 actually consult. Identical acceptance sets = invariant preservable.
 
 ## Static source
 
 `baremetal/tools/classify-rom/src/main.rs` — standalone host Rust crate.
 Walks every reachable word, runs a line-for-line port of
-`shadow_stub::decode` (as `is_byte_access`), sets bits for accepted words.
+`inline_patch::decode` (as `is_byte_access`), sets bits for accepted words.
 
 Reachability is built in three passes, re-running to a fixed point:
 

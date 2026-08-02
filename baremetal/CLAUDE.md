@@ -139,7 +139,7 @@ deterministically, and restores the older state.)
 ### What survives a rebuild
 
 Only guest-visible state: GUEST_RAM, GUEST_FB, the
-shadow_stub SCRATCH_POOL, the EL1 CP15 regs we can reach from
+inline_patch SCRATCH_POOL, the EL1 CP15 regs we can reach from
 AArch64 EL2, and all 31 AArch64 GPRs (x0..x30) of the guest.
 Persistent flash is not in the snapshot file (it lives in
 `$HOME/.newton/flash.bin`); the header carries an FNV-1a
@@ -290,7 +290,7 @@ saw in a log), skip the install: `bg <addr>` and `c` is enough.
   instruction). The guest tests run isolated test ELFs that don't
   include the Newton ROM, so probe-only changes can't regress them.
   Walter has called this out as wasted time. Run them when
-  changes touch `src/newton/shadow_stub.rs`, `src/newton/unaligned.rs`,
+  changes touch `src/newton/inline_patch.rs`, `src/newton/unaligned.rs`,
   `src/peripherals/*`, `src/arch/banked.rs`, `src/hv/stage2.rs`,
   `src/hv/guest.rs`, the generic SBA/UND/DABT/IRQ paths in
   `src/hv/trap/` (`mod.rs`, `dabt.rs`, `und.rs`, `cp15.rs`), or
@@ -320,7 +320,7 @@ etc.).
    (for 717006: `scripts/classify-out/code-symbols.txt`, unless a
    `roms/717006/` override exists) — the curated code-only symbol
    list produced by `classify-symbols.py`, i.e. the same vetted list
-   the shadow-stub classifier's walker
+   the inline-patch classifier's walker
    uses as its root set — and emits `fn_addrs.bin`,
    `fn_name_offs.bin`, `fn_names.bin` into OUT_DIR. The address list
    is trusted — no runtime prologue heuristic, no "does this word
@@ -353,7 +353,7 @@ first-word shape (must match PUSH / SUB sp / MOV imm / …). That was
 a heuristic fence against mislabelled data entries. The classifier's
 `code-symbols.txt` has already partitioned symbols into code / data /
 drop; using it directly removes an independent heuristic and keeps
-the tracer's coverage in lock-step with shadow_stub's definition of
+the tracer's coverage in lock-step with inline_patch's definition of
 "real code".
 
 ### Logging budget
@@ -438,7 +438,7 @@ re-deriving state from disassembly or tool output:
   out of contract.
 - [`docs/PACKAGE_NATIVE_CODE.md`](docs/PACKAGE_NATIVE_CODE.md) —
   design note for native code inside add-on packages: which
-  `shadow_stub` "real code" invariants extend above the ROM aperture,
+  `inline_patch` "real code" invariants extend above the ROM aperture,
   what the stage-2 RW+XN ↔ RO+X rescan path guarantees, and the
   triage recipe when a wedge PC is in RAM (where the bitmap-first
   doctrine does not apply).

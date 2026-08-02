@@ -71,10 +71,13 @@ pub extern "C" fn kmain() -> ! {
     // cross-check halts if any region is left unwired.
     hv::layout::register_backing(hv::layout::RegionTag::Rom, hv::guest_mem::rom_host_pa);
     hv::layout::register_backing(hv::layout::RegionTag::Ram, hv::guest_mem::ram_host_pa);
-    hv::layout::register_backing(hv::layout::RegionTag::Framebuffer, hv::guest_mem::fb_host_pa);
+    hv::layout::register_backing(
+        hv::layout::RegionTag::Framebuffer,
+        hv::guest_mem::fb_host_pa,
+    );
     hv::layout::register_backing(
         hv::layout::RegionTag::ScratchPool,
-        newton::shadow_stub::scratch_pool_host_pa,
+        newton::inline_patch::scratch_pool_host_pa,
     );
     hv::layout::register_backing(hv::layout::RegionTag::Flash, peripherals::flash::host_pa);
     // Same inversion for the hypervisor-written code ranges (tracer
@@ -125,7 +128,9 @@ pub extern "C" fn kmain() -> ! {
     });
 
     // SAFETY: load ROM bytes into guest backing store before stage-2 maps it.
-    unsafe { newton::loader::load_rom(); }
+    unsafe {
+        newton::loader::load_rom();
+    }
 
     // Bring the HDMI framebuffer up as soon as we can and paint the
     // splash (light-blue background + logo + progress bar). The bar
@@ -222,14 +227,18 @@ pub extern "C" fn kmain() -> ! {
         host::host_io::on_resume();
         // SAFETY: hv::snapshot::load already restored EL1 sysregs; we
         // configure EL2 traps and ERET to the saved PC.
-        unsafe { hv::guest::eret_to_restored(state); }
+        unsafe {
+            hv::guest::eret_to_restored(state);
+        }
     }
 
     kprintln!();
     kprintln!("Entering Newton ROM...");
 
     // SAFETY: every subsystem the guest relies on is up.
-    unsafe { hv::guest::run_newton_rom(); }
+    unsafe {
+        hv::guest::run_newton_rom();
+    }
 
     // If we ever reach this (we won't) — halt so the machine is safe.
     #[allow(unreachable_code)]
@@ -281,22 +290,56 @@ fn print_caps() {
     kprintln!("MIDR_EL1          = {:#018x}", midr);
     kprintln!("  implementer     = {:#04x}", (midr >> 24) & 0xff);
     kprintln!("  part number     = {:#05x}", (midr >> 4) & 0xfff);
-    kprintln!("  variant/rev     = {:#x}/{:#x}", (midr >> 20) & 0xf, midr & 0xf);
+    kprintln!(
+        "  variant/rev     = {:#x}/{:#x}",
+        (midr >> 20) & 0xf,
+        midr & 0xf
+    );
     kprintln!("ID_AA64PFR0_EL1   = {:#018x}", pfr0);
-    kprintln!("  EL0             = {:#x}  (0=not, 1=AArch64, 2=AArch64+AArch32)", (pfr0 >> 0) & 0xf);
+    kprintln!(
+        "  EL0             = {:#x}  (0=not, 1=AArch64, 2=AArch64+AArch32)",
+        (pfr0 >> 0) & 0xf
+    );
     kprintln!("  EL1             = {:#x}", (pfr0 >> 4) & 0xf);
-    kprintln!("  EL2             = {:#x}  (non-zero = virtualisation supported)", (pfr0 >> 8) & 0xf);
+    kprintln!(
+        "  EL2             = {:#x}  (non-zero = virtualisation supported)",
+        (pfr0 >> 8) & 0xf
+    );
     kprintln!("  EL3             = {:#x}", (pfr0 >> 12) & 0xf);
     kprintln!("ID_AA64MMFR0_EL1  = {:#018x}", mmfr0);
-    kprintln!("  PARange         = {:#x}  (0=32b, 1=36b, 2=40b, 3=42b, 4=44b, 5=48b)", (mmfr0 >> 0) & 0xf);
-    kprintln!("  ASIDBits        = {:#x}  (0=8-bit, 2=16-bit)", (mmfr0 >> 4) & 0xf);
-    kprintln!("  TGran4          = {:#x}  (0=supported, F=not)", (mmfr0 >> 28) & 0xf);
-    kprintln!("  TGran16         = {:#x}  (1=supported, 0=not)", (mmfr0 >> 20) & 0xf);
-    kprintln!("  TGran64         = {:#x}  (0=supported, F=not)", (mmfr0 >> 24) & 0xf);
+    kprintln!(
+        "  PARange         = {:#x}  (0=32b, 1=36b, 2=40b, 3=42b, 4=44b, 5=48b)",
+        (mmfr0 >> 0) & 0xf
+    );
+    kprintln!(
+        "  ASIDBits        = {:#x}  (0=8-bit, 2=16-bit)",
+        (mmfr0 >> 4) & 0xf
+    );
+    kprintln!(
+        "  TGran4          = {:#x}  (0=supported, F=not)",
+        (mmfr0 >> 28) & 0xf
+    );
+    kprintln!(
+        "  TGran16         = {:#x}  (1=supported, 0=not)",
+        (mmfr0 >> 20) & 0xf
+    );
+    kprintln!(
+        "  TGran64         = {:#x}  (0=supported, F=not)",
+        (mmfr0 >> 24) & 0xf
+    );
     kprintln!("ID_AA64MMFR1_EL1  = {:#018x}", mmfr1);
-    kprintln!("  HAFDBS          = {:#x}  (hardware access flag / dirty state)", (mmfr1 >> 0) & 0xf);
-    kprintln!("  VMIDBits        = {:#x}  (0=8-bit, 2=16-bit)", (mmfr1 >> 4) & 0xf);
-    kprintln!("  VH              = {:#x}  (virtualisation host extensions)", (mmfr1 >> 8) & 0xf);
+    kprintln!(
+        "  HAFDBS          = {:#x}  (hardware access flag / dirty state)",
+        (mmfr1 >> 0) & 0xf
+    );
+    kprintln!(
+        "  VMIDBits        = {:#x}  (0=8-bit, 2=16-bit)",
+        (mmfr1 >> 4) & 0xf
+    );
+    kprintln!(
+        "  VH              = {:#x}  (virtualisation host extensions)",
+        (mmfr1 >> 8) & 0xf
+    );
     kprintln!("ID_AA64ISAR0_EL1  = {:#018x}", isar0);
     kprintln!("HCR_EL2 (current) = {:#018x}", hcr);
     kprintln!("--- end capability registers ---");

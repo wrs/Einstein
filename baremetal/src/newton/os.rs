@@ -149,7 +149,7 @@ fn fix_stage1_xn_bits() -> bool {
 
     // L1 sits at the start of guest RAM (TTBR0 = 0x0400_0000 per probe).
     for i in 0..4096 {
-        // Skip the shadow-stub scratch L1 slot — it's owned by
+        // Skip the inline-patch scratch L1 slot — it's owned by
         // `install_scratch_pool_l1_section`, which installs a section
         // with XN=1. The section-normalisation block below would clear
         // XN every M-toggle, forcing the installer to re-set it on
@@ -173,7 +173,9 @@ fn fix_stage1_xn_bits() -> bool {
         // our abort handler can dispatch.
         if typ == 3 {
             // SAFETY: i < 4096.
-            unsafe { write_pt_entry(ram.add(i), 0); }
+            unsafe {
+                write_pt_entry(ram.add(i), 0);
+            }
             continue;
         }
 
@@ -184,7 +186,9 @@ fn fix_stage1_xn_bits() -> bool {
             let new = (entry & 0xFFF0_01E0) | 0x0000_0C0E;
             if new != entry {
                 // SAFETY: i < 4096.
-                unsafe { write_pt_entry(ram.add(i), new); }
+                unsafe {
+                    write_pt_entry(ram.add(i), new);
+                }
             }
         }
 
@@ -194,7 +198,9 @@ fn fix_stage1_xn_bits() -> bool {
             let new = (entry & 0xFFFF_FC00) | (entry & 0x0000_01E0) | 0x01;
             if new != entry {
                 // SAFETY: i < 4096.
-                unsafe { write_pt_entry(ram.add(i), new); }
+                unsafe {
+                    write_pt_entry(ram.add(i), new);
+                }
             }
         }
 
@@ -205,9 +211,7 @@ fn fix_stage1_xn_bits() -> bool {
         // Pick backing store pointer by region.
         let (base, region_start, region_size) = if l2_pa < guest_mem::ROM_SIZE {
             (rom, 0usize, guest_mem::ROM_SIZE)
-        } else if (0x04000000..0x04000000 + guest_mem::RAM_SIZE as u64)
-            .contains(&(l2_pa as u64))
-        {
+        } else if (0x04000000..0x04000000 + guest_mem::RAM_SIZE as u64).contains(&(l2_pa as u64)) {
             (ram, 0x04000000usize, guest_mem::RAM_SIZE)
         } else {
             continue;
@@ -229,14 +233,16 @@ fn fix_stage1_xn_bits() -> bool {
             let e = unsafe { read_pt_entry(ptr) };
             let typ = e & 3;
             let new = match typ {
-                0 => continue,                         // fault, leave alone
-                1 => (e & 0xFFFF_0000) | 0x0000_003D,  // large page, RW/RW, CB
+                0 => continue,                            // fault, leave alone
+                1 => (e & 0xFFFF_0000) | 0x0000_003D,     // large page, RW/RW, CB
                 2 | 3 => (e & 0xFFFF_F000) | 0x0000_003E, // small page, XN=0
                 _ => unreachable!(),
             };
 
             if new != e {
-                unsafe { write_pt_entry(ptr, new); }
+                unsafe {
+                    write_pt_entry(ptr, new);
+                }
                 if is_rom {
                     rom_writes += 1;
                 }
@@ -247,7 +253,7 @@ fn fix_stage1_xn_bits() -> bool {
     rom_writes > 0
 }
 
-/// ARMv7 short-descriptor section attributes for the shadow-stub
+/// ARMv7 short-descriptor section attributes for the inline-patch
 /// ScratchVA carve-out installed at the kernel VA
 /// `crate::hv::layout::SCRATCH_POOL_VA`. The section's PA bits encode
 /// the IPA `SCRATCH_POOL_IPA`, which stage-2 then translates to the
@@ -270,7 +276,7 @@ fn scratch_pool_l1_section() -> u32 {
     crate::hv::layout::SCRATCH_POOL_IPA | SCRATCH_POOL_L1_SECTION_ATTRS
 }
 
-/// Install the kernel-side L1 mapping for the shadow-stub ScratchVA
+/// Install the kernel-side L1 mapping for the inline-patch ScratchVA
 /// scratch carve-out at VA `crate::hv::layout::SCRATCH_POOL_IPA`. The
 /// section descriptor identity-maps the VA to itself; stage-2 then
 /// translates that IPA to the host `SCRATCH_POOL` backing.
@@ -301,30 +307,33 @@ fn install_scratch_pool_l1_section() {
     //     untouched.
     //   * Normalised by fix_stage1_xn_bits to (entry & 0xFFF0_01E0) |
     //     0x0C0E — the walker flipped XN=1 → 0 inside our section.
-    let normalised_after_walker: u32 =
-        (installed & 0xFFF0_01E0) | 0x0000_0C0E;
+    let normalised_after_walker: u32 = (installed & 0xFFF0_01E0) | 0x0000_0C0E;
     let is_fault_entry = (entry & 3) == 0;
-    let acceptable =
-        is_fault_entry
-        || entry == installed
-        || entry == normalised_after_walker;
+    let acceptable = is_fault_entry || entry == installed || entry == normalised_after_walker;
 
     if !acceptable {
         kprintln!(
-            "shadow_stub scratch: FATAL — kernel L1[{:#x}] = {:#010x}, type bits {:#x}; \
+            "inline_patch scratch: FATAL — kernel L1[{:#x}] = {:#010x}, type bits {:#x}; \
              not a fault entry and not our installed section. ROM revision uses VA {:#x}? \
              Pick a different SCRATCH_POOL_VA.",
-            idx, entry, entry & 3, crate::hv::layout::SCRATCH_POOL_VA,
+            idx,
+            entry,
+            entry & 3,
+            crate::hv::layout::SCRATCH_POOL_VA,
         );
         cpu::halt();
     }
 
     if entry != installed {
         // SAFETY: idx < 4096.
-        unsafe { write_pt_entry(ram.add(idx), installed); }
+        unsafe {
+            write_pt_entry(ram.add(idx), installed);
+        }
         dprintln!(
-            "shadow_stub scratch: installed kernel L1[{:#x}] = {:#010x} (was {:#010x})",
-            idx, installed, entry,
+            "inline_patch scratch: installed kernel L1[{:#x}] = {:#010x} (was {:#010x})",
+            idx,
+            installed,
+            entry,
         );
     }
 }
@@ -334,7 +343,11 @@ fn maybe_dump_l1_once() {
     {
         static mut L1_DUMPS: usize = 0;
         // SAFETY: single-threaded.
-        let n = unsafe { let v = L1_DUMPS; L1_DUMPS += 1; v };
+        let n = unsafe {
+            let v = L1_DUMPS;
+            L1_DUMPS += 1;
+            v
+        };
         if n < 10 {
             guest_mem::dump_guest_l1_table();
         }
@@ -562,7 +575,10 @@ fn handle_dabt_dispatch(ctx: &mut TrapContext) {
                 kprintln!(
                     "*** handle_dabt_dispatch: L1 entry @PA={:#010x} unreadable \
                      (FAR={:#010x} DFSC={:#x} ELR_EL2={:#x}) ***",
-                    l1_pa, far as u32, dfsc, read_sysreg!("elr_el2"),
+                    l1_pa,
+                    far as u32,
+                    dfsc,
+                    read_sysreg!("elr_el2"),
                 );
                 cpu::halt();
             }
@@ -629,7 +645,9 @@ fn log_dabt_forward(dfsc: u32, far: u32, mode: u32, ctx: &TrapContext) {
     // for `mrs` from EL2). The trampoline writes the slot before any
     // kernel code runs, so the slot is the architecturally-correct
     // pre-abt CPSR.
-    let spsr_abt_save = crate::hv::guest_endian::guest_read_u32_pa(guest_trampolines::DABT_SAVE_PA + 8).unwrap_or(0);
+    let spsr_abt_save =
+        crate::hv::guest_endian::guest_read_u32_pa(guest_trampolines::DABT_SAVE_PA + 8)
+            .unwrap_or(0);
     let pre_abt_mode_save = spsr_abt_save & 0x1F;
     static mut SEEN: SeenSet<(u32, u32, u32), 16> = SeenSet::new((0, 0, 0));
     // Dedup on the saved-slot mode (architecturally correct) so a single
@@ -657,7 +675,9 @@ fn log_dabt_forward(dfsc: u32, far: u32, mode: u32, ctx: &TrapContext) {
         let faulting_pc = lr_abt.wrapping_sub(8);
         kprintln!(
             "dabt: forwarding to kernel DataAbortHandler — DFSC={:#x} FAR={:#010x} mode={:#x}",
-            dfsc, far, mode
+            dfsc,
+            far,
+            mode
         );
         kprintln!(
             "  LR_abt={:#010x} (faulting PC={:#010x}) SP_abt={:#010x} SPSR_abt={:#010x} (pre-abt mode={:#x}){}",
@@ -668,15 +688,24 @@ fn log_dabt_forward(dfsc: u32, far: u32, mode: u32, ctx: &TrapContext) {
         );
         kprintln!(
             "  saved-slot SPSR_abt={:#010x} (pre-abt mode={:#x} = {})",
-            spsr_abt_save, pre_abt_mode_save, crate::arch::arm_decode::aarch32_mode_name(pre_abt_mode_save),
+            spsr_abt_save,
+            pre_abt_mode_save,
+            crate::arch::arm_decode::aarch32_mode_name(pre_abt_mode_save),
         );
         kprintln!(
             "  USR sp={:#010x} lr={:#010x}   SVC sp={:#010x} lr={:#010x}",
-            sp_usr, lr_usr, sp_svc, lr_svc
+            sp_usr,
+            lr_usr,
+            sp_svc,
+            lr_svc
         );
         kprintln!(
             "  r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r12={:#010x}",
-            ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32, ctx.x[12] as u32
+            ctx.x[0] as u32,
+            ctx.x[1] as u32,
+            ctx.x[2] as u32,
+            ctx.x[3] as u32,
+            ctx.x[12] as u32
         );
         // Dump the stage-1 walk for the FAR. Crucial for distinguishing
         // "L1 entry missing" (DFSC=5) from "L2 entry missing"
@@ -845,7 +874,9 @@ impl GuestOs for NewtonOs {
         // literal needs to track every MMU transition).
         // SAFETY: single-word ROM-backing write under the
         // paused-guest invariant.
-        unsafe { guest_trampolines::install_und_vector_swap_post_mmu(); }
+        unsafe {
+            guest_trampolines::install_und_vector_swap_post_mmu();
+        }
     }
 
     fn on_stage1_mmu_disable(_ctx: &mut TrapContext) {
@@ -855,7 +886,9 @@ impl GuestOs for NewtonOs {
         crate::hv::guest::set_dc_for_stage1_off(true);
         // SAFETY: single-word ROM-backing write under the
         // same paused-guest invariant as the load-time patch.
-        unsafe { guest_trampolines::install_und_vector_swap_pre_mmu(); }
+        unsafe {
+            guest_trampolines::install_und_vector_swap_pre_mmu();
+        }
     }
 
     fn on_stage1_ttbr0_write(raw: u32) {
@@ -909,7 +942,10 @@ impl GuestOs for NewtonOs {
             // stub since UND entry doesn't auto-advance.
             _ if insn == HvcImm::RememberSwiret.insn() => {
                 probes::handle_remember_swiret_probe(ctx);
-                UndHvcOutcome::Resume { pc: (faulting_pc + 4) as u64, spsr: spsr_und }
+                UndHvcOutcome::Resume {
+                    pc: (faulting_pc + 4) as u64,
+                    spsr: spsr_und,
+                }
             }
             // StorePermObject entry probe — first instruction (`mov ip,
             // sp`) was replaced with HVC. Reached here when StorePermObject
@@ -919,7 +955,10 @@ impl GuestOs for NewtonOs {
             _ if insn == HvcImm::StorePermObjEntry.insn() => {
                 probes::handle_store_perm_obj_entry_probe(ctx);
                 ctx.x[12] = crate::arch::banked::sp_for_mode(ctx, spsr_und as u32) as u64;
-                UndHvcOutcome::Resume { pc: (faulting_pc + 4) as u64, spsr: spsr_und }
+                UndHvcOutcome::Resume {
+                    pc: (faulting_pc + 4) as u64,
+                    spsr: spsr_und,
+                }
             }
             // LoadPermObject return-site probe — `mov r0, r4` was
             // replaced with HVC. Same USR-vs-SVC routing rationale as
@@ -928,7 +967,10 @@ impl GuestOs for NewtonOs {
             _ if insn == HvcImm::LoadPermObjRet.insn() => {
                 probes::handle_load_perm_obj_ret_probe(ctx);
                 ctx.x[0] = ctx.x[4];
-                UndHvcOutcome::Resume { pc: (faulting_pc + 4) as u64, spsr: spsr_und }
+                UndHvcOutcome::Resume {
+                    pc: (faulting_pc + 4) as u64,
+                    spsr: spsr_und,
+                }
             }
             // PHammerOutTranslator concrete-body patches. The kernel's
             // debug-print path is reached from USR for any task that
@@ -940,23 +982,38 @@ impl GuestOs for NewtonOs {
             // doesn't auto-advance.
             _ if insn == HvcImm::HammerPrint.insn() => {
                 probes::handle_hammer_print_with(ctx, spsr_und as u32);
-                UndHvcOutcome::Resume { pc: (faulting_pc + 4) as u64, spsr: spsr_und }
+                UndHvcOutcome::Resume {
+                    pc: (faulting_pc + 4) as u64,
+                    spsr: spsr_und,
+                }
             }
             _ if insn == HvcImm::HammerPutc.insn() => {
                 probes::handle_hammer_thunk(ctx, ThunkKind::Putc);
-                UndHvcOutcome::Resume { pc: (faulting_pc + 4) as u64, spsr: spsr_und }
+                UndHvcOutcome::Resume {
+                    pc: (faulting_pc + 4) as u64,
+                    spsr: spsr_und,
+                }
             }
             _ if insn == HvcImm::HammerFlush.insn() => {
                 probes::handle_hammer_thunk(ctx, ThunkKind::Flush);
-                UndHvcOutcome::Resume { pc: (faulting_pc + 4) as u64, spsr: spsr_und }
+                UndHvcOutcome::Resume {
+                    pc: (faulting_pc + 4) as u64,
+                    spsr: spsr_und,
+                }
             }
             _ if insn == HvcImm::HammerStackTrace.insn() => {
                 probes::handle_hammer_thunk(ctx, ThunkKind::StackTrace);
-                UndHvcOutcome::Resume { pc: (faulting_pc + 4) as u64, spsr: spsr_und }
+                UndHvcOutcome::Resume {
+                    pc: (faulting_pc + 4) as u64,
+                    spsr: spsr_und,
+                }
             }
             _ if insn == HvcImm::HammerExceptionNotify.insn() => {
                 probes::handle_hammer_thunk(ctx, ThunkKind::ExceptionNotify);
-                UndHvcOutcome::Resume { pc: (faulting_pc + 4) as u64, spsr: spsr_und }
+                UndHvcOutcome::Resume {
+                    pc: (faulting_pc + 4) as u64,
+                    spsr: spsr_und,
+                }
             }
             _ => UndHvcOutcome::NotMine,
         }
@@ -1039,7 +1096,8 @@ impl GuestOs for NewtonOs {
         if !(is_mcr_mrc && (cop == 10 || cop == 11)) {
             kprintln!(
                 "*** fp_simd trap on unexpected instruction {:#010x} @PC={:#x}, halting",
-                insn, elr
+                insn,
+                elr
             );
             cpu::halt();
         }

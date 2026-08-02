@@ -24,6 +24,16 @@ cd "$root"
 # incremental cache of interactive `cargo build`/`cargo run` sessions.
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$root/target/check-matrix}"
 
+# Import-discipline lint (cheap, always run — like build.rs's
+# validate_feature_matrix, it guards structure rather than a combo).
+if bash "$here/check-layering.sh" >/tmp/check-matrix-last.log 2>&1; then
+    printf "  \e[32mPASS\e[0m  %-24s\n" "check-layering"
+else
+    printf "  \e[31mFAIL\e[0m  %-24s\n" "check-layering"
+    sed 's/^/        /' /tmp/check-matrix-last.log
+    exit 1
+fi
+
 # Each entry: "label::<cargo check args>". Args are eval'd so quoted
 # feature lists survive. Env-prefixed entries (NH_GUEST_TEST=1) set the
 # guest-test cfg the same way run-test.sh does.
@@ -35,8 +45,12 @@ combos=(
     "pi-bare-metal-display::cargo check --release --no-default-features --features pi-bare-metal-display"
     "pi-bare-metal-input::cargo check --release --no-default-features --features pi-bare-metal-input"
     "trace,quiet::cargo check --release --features \"trace quiet\""
+    "trace_once::cargo check --release --features \"trace_once quiet\""
     "host-io-semihost::cargo check --release --features host-io-semihost"
     "sd-probe::cargo check --release --no-default-features --features \"pi-bare-metal sd-probe\""
+    "fb-probe::cargo check --release --no-default-features --features \"pi-bare-metal fb-probe\""
+    "ns_trace::cargo check --release --features ns_trace"
+    "log-all::cargo check --release --features \"log_mmu log_tasks log_unaligned log_store\""
     "guest-test::NH_GUEST_TEST=1 cargo check --release"
 )
 

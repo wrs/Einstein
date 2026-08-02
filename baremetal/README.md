@@ -423,6 +423,8 @@ baremetal/
   linker-fvp.ld          FVP-base image layout
   scripts/
     run-qemu.sh          cargo runner for QEMU
+    boot-check.sh        marker-based QEMU boot verifier (kills QEMU
+                         once the boot milestone appears in the log)
     fvp                  cargo-runner-equivalent for FVP (dockerised)
     gdb-init             gdb helpers (bg, bp, tt, guest-state, …)
     classify-symbols.py  ROM symbol partitioner (code/data/drop)

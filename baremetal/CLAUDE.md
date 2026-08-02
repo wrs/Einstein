@@ -76,6 +76,14 @@ chmod 000 /tmp/newton-snapshot-*.bin && cargo run --release
 
 # Inspect slots (size + mtime).
 ls -la /tmp/newton-snapshot-*.bin
+
+# Headless boot verification: run QEMU with the log redirected, poll
+# for the Welcome-UI markers, SIGKILL QEMU the moment they appear
+# (exit 0), or exit 1 on --timeout with the log tail. Use this
+# instead of hand-rolled `timeout N cargo run … ; pkill` recipes —
+# QEMU defers SIGTERM while the guest is busy (docs/QEMU_BUGS.md).
+scripts/boot-check.sh --cold          # forces a cold boot first
+scripts/boot-check.sh --marker 'Resuming guest from snapshot'
 ```
 
 ### Save triggers

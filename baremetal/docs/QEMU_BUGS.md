@@ -187,6 +187,12 @@ rm -f /tmp/newton-snapshot-{0..3}.bin
 timeout -k 2 30 cargo run --release > /tmp/cold.log 2>&1
 ```
 
+For boot verification, prefer `scripts/boot-check.sh`: it launches
+the run with the log redirected, polls for success markers (default:
+the Welcome-UI milestone), and SIGKILLs QEMU the moment they all
+appear — the check costs one boot instead of a fixed worst-case
+window, and every exit path (match, timeout, Ctrl-C) kills QEMU.
+
 Discovered iter-60 (2026-04-30): a `timeout 30` measurement of
 "249 M DIAG_TAGs over 30 s" was actually a 5+ minute run because
 QEMU never received SIGKILL. The same fix applied with `-k 2`

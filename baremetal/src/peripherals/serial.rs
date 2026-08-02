@@ -25,9 +25,9 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use crate::{kprintln, host::console};
 
 /// Base of the external-serial port (TMemoryConsts::kExternalSerialBase).
+/// The four-port window it starts (`0x0F1C_0000..0x0F20_0000`) is
+/// declared as the `PeriphId::Serial` entry in `layout::MMIO_WINDOWS`.
 pub const EXTERNAL_BASE: u64 = 0x0F1C_0000;
-/// End of the modem window, exclusive.
-pub const SERIAL_END: u64 = 0x0F20_0000;
 
 /// Size of one port's register window.
 const PORT_STRIDE: u64 = 0x0001_0000;
@@ -73,9 +73,6 @@ mod reg {
 pub struct Serial;
 
 impl crate::hv::mmio::MmioPeripheral for Serial {
-    fn owns(ipa: u64) -> bool {
-        owns(ipa)
-    }
     fn read(ipa: u64) -> u32 {
         read(ipa)
     }
@@ -84,14 +81,9 @@ impl crate::hv::mmio::MmioPeripheral for Serial {
     }
 }
 
-/// True iff `ipa` lands inside one of the four port windows.
-fn owns(ipa: u64) -> bool {
-    (EXTERNAL_BASE..SERIAL_END).contains(&ipa)
-}
-
 /// Identify the port (0..=3) and register offset (0..0xFFFF) for an
-/// address inside the serial window. Caller must have already
-/// verified `owns(ipa)`.
+/// address inside the serial window (the router only dispatches here
+/// for IPAs inside the `PeriphId::Serial` layout window).
 fn split(ipa: u64) -> (u8, u64) {
     let rel = ipa - EXTERNAL_BASE;
     let port = (rel / PORT_STRIDE) as u8;

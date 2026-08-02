@@ -168,19 +168,12 @@ static LOG: crate::diag::diag_util::TwoTierLog = crate::diag::diag_util::TwoTier
 pub struct Pcmcia;
 
 impl crate::hv::mmio::MmioPeripheral for Pcmcia {
-    fn owns(ipa: u64) -> bool {
-        owns(ipa)
-    }
     fn read(ipa: u64) -> u32 {
         read(ipa)
     }
     fn write(ipa: u64, value: u32) {
         write(ipa, value)
     }
-}
-
-fn owns(ipa: u64) -> bool {
-    ipa_to_slot(ipa).is_some()
 }
 
 fn ipa_to_slot(ipa: u64) -> Option<(&'static SlotRegs, u64, u8)> {
@@ -200,10 +193,11 @@ fn ipa_to_slot(ipa: u64) -> Option<(&'static SlotRegs, u64, u8)> {
 fn read(ipa: u64) -> u32 {
     let (regs, off, slot) = match ipa_to_slot(ipa) {
         Some(x) => x,
-        // mmio.rs only routes here when `owns()` (== ipa_to_slot is
-        // Some) already matched, so this arm is unreachable. If it ever
-        // fires, owns()/dispatch have desynced — halt loudly like
-        // vic::halt_vic_unreachable / dma::halt_unknown_dma rather than
+        // The router only dispatches here for IPAs inside the layout
+        // PCMCIA window, which the four slot ranges cover exactly, so
+        // this arm is unreachable. If it ever fires, the window and
+        // ipa_to_slot have desynced — halt loudly like
+        // vic::halt_vic_unknown / dma::halt_unknown_dma rather than
         // silently fabricating a value.
         None => halt_pcmcia_unreachable("read", ipa, 0),
     };
@@ -290,17 +284,17 @@ fn log_unknown(what: &str, ipa: u64, value: u32) {
 fn halt_pcmcia_unreachable(op: &'static str, ipa: u64, value: u32) -> ! {
     kprintln!();
     kprintln!(
-        "*** pcmcia::{} IPA={:#010x} val={:#010x} — owns() said mine, no slot ***",
+        "*** pcmcia::{} IPA={:#010x} val={:#010x} — inside the PCMCIA window but no slot ***",
         op, ipa, value
     );
     kprintln!(
-        "  (mmio.rs routes here only when owns() matched; an unmatched"
+        "  (the layout PCMCIA window and ipa_to_slot's slot ranges have"
     );
     kprintln!(
-        "   ipa_to_slot here means owns()/dispatch desynced. Reconcile"
+        "   desynced. Reconcile layout::MMIO_WINDOWS's PCMCIA entry and"
     );
     kprintln!(
-        "   pcmcia::owns and ipa_to_slot in peripherals/pcmcia.rs.)"
+        "   ipa_to_slot in peripherals/pcmcia.rs.)"
     );
     crate::arch::cpu::halt();
 }

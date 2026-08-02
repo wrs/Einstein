@@ -5,10 +5,22 @@
 # direction between them:
 #
 #   arch        — pure AArch64/AArch32 mechanism; zero upward deps.
-#   hv          — generic hypervisor core; may use arch.
+#   hv          — generic hypervisor core; may use arch. Sanctioned
+#                 hv→peripherals edge: src/hv/mmio.rs (the MMIO
+#                 router) is THE single file allowed to import
+#                 peripherals — its closed-enum PeriphId match is the
+#                 dispatch point, so a forgotten model stays a compile
+#                 error (no fn-pointer registration). No other hv file
+#                 may import peripherals.
 #   newton      — Newton-OS-specific logic; may use arch, hv,
 #                 peripherals.
-#   peripherals — guest device models; usable by newton and hv.
+#   peripherals — guest device models; usable by newton and (via the
+#                 router) hv. Sanctioned peripherals→hv edge: models
+#                 may import the hv service modules hv::{layout,
+#                 guest_endian, guest_mem} and hv::mmio (the
+#                 MmioPeripheral trait). Everything else in hv —
+#                 trap internals, stage2, timer, snapshot — stays
+#                 forbidden.
 #   host        — host drivers/backends; below main, not imported by
 #                 the guest-facing layers. Sanctioned upward edge:
 #                 host backends may call the peripherals::{vic::raise_*,
@@ -29,7 +41,7 @@
 # scripts/layering-allowlist.txt (`<file-glob> <line-regex> # phase N`);
 # uncovered hits fail the lint, and so do stale allowlist entries that
 # no longer match anything — the allowlist may only shrink as phases
-# 4-7 remove the legacy edges.
+# 5-7 remove the legacy edges.
 set -uo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -51,6 +63,13 @@ forbidden_host="hv newton peripherals"
 # constants, or a plain module import of peripherals::vic (whose only
 # legitimate use from host is raising interrupts into the guest model).
 host_sanctioned='peripherals::vic::(raise|INT_)|use crate::([a-z_:, {]*)peripherals::vic[};]'
+
+# Sanctioned peripherals→hv service modules: layout, guest_endian,
+# guest_mem, and mmio (the MmioPeripheral trait). A line is sanctioned
+# only if ALL its hv:: references target these modules — checked by
+# stripping the sanctioned references and testing for leftovers, so a
+# grouped import mixing hv::mmio with e.g. hv::stage2 still flags.
+periph_sanctioned_strip='hv::(layout|guest_endian|guest_mem|mmio)'
 
 # Load allowlist entries (glob, regex), skipping comments/blank lines.
 allow_globs=()
@@ -79,6 +98,20 @@ for layer in "${layers[@]}"; do
             if [[ "$layer" == host && "$forb" == peripherals ]] \
                 && grep -qE "$host_sanctioned" <<<"$text"; then
                 continue
+            fi
+            # The MMIO router is the single sanctioned hv→peripherals
+            # edge (closed-enum dispatch to the device models).
+            if [[ "$layer" == hv && "$forb" == peripherals \
+                && "$file" == src/hv/mmio.rs ]]; then
+                continue
+            fi
+            # Models may use the hv service modules; skip only when no
+            # unsanctioned hv:: reference remains on the line.
+            if [[ "$layer" == peripherals && "$forb" == hv ]]; then
+                residue="$(sed -E "s/${periph_sanctioned_strip}//g" <<<"$text")"
+                if ! grep -qE '(^|[^A-Za-z0-9_])hv::' <<<"$residue"; then
+                    continue
+                fi
             fi
             hit_allowed=0
             for i in "${!allow_globs[@]}"; do
@@ -120,4 +153,4 @@ if [[ $violations -gt 0 || $stale -gt 0 ]]; then
     echo "check-layering: FAIL — $violations unlisted violation(s), $stale stale allowlist entr(y/ies)"
     exit 1
 fi
-echo "check-layering: OK — 0 unlisted violations ($allowed allowlisted legacy edges pending phases 4-7)"
+echo "check-layering: OK — 0 unlisted violations ($allowed allowlisted legacy edges pending phases 5-7)"

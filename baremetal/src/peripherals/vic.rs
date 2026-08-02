@@ -448,7 +448,6 @@ pub fn int_ctrl_raw() -> u32 {
 // ---------- Hardware register addresses --------------------------------------
 // Mirroring the subset of TMemoryConsts.h relevant to early boot.
 
-const K_HDWR_PLATFORM_VERS: u64 = 0x0F00_0008;
 const K_HDWR_P0F110000: u64 = 0x0F11_0000;
 const K_HDWR_HIGH_SPEED_CLCK: u64 = 0x0F11_0400;
 const K_HDWR_P0F111400: u64 = 0x0F11_1400;
@@ -469,6 +468,7 @@ const K_HDWR_FIQ_MASK: u64 = 0x0F18_3C00;
 const K_HDWR_INT_ED_1: u64 = 0x0F18_4000;
 const K_HDWR_INT_ED_2: u64 = 0x0F18_4400;
 const K_HDWR_INT_ED_3: u64 = 0x0F18_4800;
+const K_HDWR_P0F184C00: u64 = 0x0F18_4C00;
 const K_HDWR_P0F185000: u64 = 0x0F18_5000;
 
 const K_HDWR_GPIO_R: u64 = 0x0F18_C000;
@@ -476,6 +476,7 @@ const K_HDWR_GPIO_E: u64 = 0x0F18_C400;
 const K_HDWR_GPIO_C: u64 = 0x0F18_C800;
 const K_HDWR_GPIO_CC00: u64 = 0x0F18_CC00;
 const K_HDWR_GPIO_D000: u64 = 0x0F18_D000;
+const K_HDWR_GPIO_D400: u64 = 0x0F18_D400;
 const K_HDWR_GPIO_D800: u64 = 0x0F18_D800;
 const K_HDWR_GPIO_DC00: u64 = 0x0F18_DC00;
 const K_HDWR_GPIO_E000: u64 = 0x0F18_E000;
@@ -658,13 +659,13 @@ pub fn heartbeat_tick_update() {
 
 /// Marker for the [`crate::hv::mmio::MmioPeripheral`] router. The register
 /// state lives in the module-level `VIC` cell; this zero-sized type only
-/// names the model for static dispatch.
+/// names the model for static dispatch. The router sends every access
+/// inside the VIC windows (`layout::MMIO_WINDOWS` entries with
+/// `PeriphId::Vic`) here; unmodelled addresses inside those windows
+/// halt via [`halt_vic_unknown`].
 pub struct Vic;
 
 impl crate::hv::mmio::MmioPeripheral for Vic {
-    fn owns(ipa: u64) -> bool {
-        owns(ipa)
-    }
     fn read(ipa: u64) -> u32 {
         read(ipa)
     }
@@ -673,56 +674,11 @@ impl crate::hv::mmio::MmioPeripheral for Vic {
     }
 }
 
-/// True if `ipa` is handled by this module. Keeps `mmio::read/write`
-/// tidy without forcing it to know every register address.
-fn owns(ipa: u64) -> bool {
-    match ipa {
-        K_HDWR_PLATFORM_VERS
-        | K_HDWR_P0F110000
-        | K_HDWR_HIGH_SPEED_CLCK
-        | K_HDWR_P0F111400
-        | K_HDWR_P0F180400
-        | K_HDWR_CALENDAR_REG
-        | K_HDWR_ALARM_REG
-        | K_HDWR_TICKS
-        | K_HDWR_MATCH_0
-        | K_HDWR_MATCH_1
-        | K_HDWR_MATCH_2
-        | K_HDWR_MATCH_3
-        | K_HDWR_INT_PRESENT
-        | K_HDWR_INT_CTRL
-        | K_HDWR_INT_CLEAR
-        | K_HDWR_FIQ_MASK
-        | K_HDWR_INT_ED_1
-        | K_HDWR_INT_ED_2
-        | K_HDWR_INT_ED_3
-        | K_HDWR_P0F185000
-        | K_HDWR_GPIO_R
-        | K_HDWR_GPIO_E
-        | K_HDWR_GPIO_C
-        | K_HDWR_GPIO_CC00
-        | K_HDWR_GPIO_D000
-        | K_HDWR_GPIO_D800
-        | K_HDWR_GPIO_DC00
-        | K_HDWR_GPIO_E000
-        | K_HDWR_GPIO_E800
-        | K_HDWR_GPIO_EC00 => true,
-        _ => false,
-    }
-}
-
 fn read(ipa: u64) -> u32 {
     // SAFETY: single-threaded access from the trap handler.
     let s = unsafe { &mut *VIC.0.get() };
     match ipa {
-        // Einstein's TPlatformManager::GetVersion returns the constant
-        // 5 (`Emulator/Platform/TPlatformManager.cpp:110`). Newton's
-        // native apps read this register to know the Einstein-era
-        // platform driver revision.
         // ---- Stateful in Einstein -------------------------------------
-        // PlatformVers: TPlatformManager::GetVersion() returns 5
-        // (Emulator/Platform/TPlatformManager.cpp:110).
-        K_HDWR_PLATFORM_VERS => 5,
         // HighSpeedClck: TMemory.cpp:898-900 returns kHighSpeedClockVal
         // = 0x90 (TMemoryConsts.h:208).
         K_HDWR_HIGH_SPEED_CLCK => 0x0000_0090,
@@ -741,6 +697,21 @@ fn read(ipa: u64) -> u32 {
         K_HDWR_INT_ED_3 => s.int_ed_3,
         K_HDWR_GPIO_R => s.gpio_r,
         K_HDWR_GPIO_E => s.gpio_e,
+
+        // GPIO input (PCMCIA door-lock + misc sense lines).
+        // Einstein returns all-ones = "no cards / switches open".
+        K_HDWR_GPIO_D400 => 0xFFFF_FFFF,
+
+        // kHdWr_P0F184C00 (TMemoryConsts.h:101, "R"): Einstein's TMemory.cpp
+        // Bank #3 read path (lines 803-960) has NO specific handler for this
+        // address — it falls through to the "unknown bank #3" default at
+        // lines 950-960, which returns 0. The previous "all-ok high =
+        // 0xFFFFFFFF per Einstein" comment was wrong (no such Einstein
+        // code exists). Bit 21 of this register gates a kernel polling
+        // path at ROM 0x00019d34 / 0x00019d90 / 0x00019e34 (`tst r1,
+        // #0x00200000`); returning 0 makes us take the same branches as
+        // Einstein.
+        K_HDWR_P0F184C00 => 0,
 
         // ---- Not modeled by Einstein → returns 0 by default ------------
         // Einstein TMemory.cpp Bank #3 read path (lines 803-960) has no
@@ -764,7 +735,7 @@ fn read(ipa: u64) -> u32 {
         | K_HDWR_GPIO_E800
         | K_HDWR_GPIO_EC00 => 0,
 
-        _ => halt_vic_unreachable("read", ipa, 0),
+        _ => halt_vic_unknown("read", ipa, 0),
     }
 }
 
@@ -882,8 +853,7 @@ fn write(ipa: u64, value: u32) {
         // and silently drop. The kernel may try to write here through
         // a "convenient name" path; match the silent drop instead of
         // halting.
-        K_HDWR_PLATFORM_VERS
-        | K_HDWR_INT_PRESENT
+        K_HDWR_INT_PRESENT
         | K_HDWR_GPIO_R => { /* drop per Einstein */ }
 
         // ---- Not modeled by Einstein at all → silent drop --------------
@@ -902,7 +872,7 @@ fn write(ipa: u64, value: u32) {
         | K_HDWR_GPIO_E800
         | K_HDWR_GPIO_EC00 => { /* drop per Einstein */ }
 
-        _ => halt_vic_unreachable("write", ipa, value),
+        _ => halt_vic_unknown("write", ipa, value),
     }
     if match_reprogrammed {
         // A match register changed — recompute the nearest deadline and
@@ -911,17 +881,18 @@ fn write(ipa: u64, value: u32) {
     }
 }
 
-/// Fallback halt for match-arm branches that shouldn't be reachable
-/// because `owns()` filters the same address set. If they do fire,
-/// Phase A says halt loudly rather than silently stubbing.
-fn halt_vic_unreachable(op: &'static str, ipa: u64, value: u32) -> ! {
+/// Loud halt for an access inside a VIC-policy window that no match
+/// arm above recognises. Per Phase A, extend the model deliberately
+/// (with the Einstein cross-reference) rather than silently stubbing.
+fn halt_vic_unknown(op: &'static str, ipa: u64, value: u32) -> ! {
     crate::kprintln!();
     crate::kprintln!(
-        "*** vic::{} IPA={:#010x} val={:#010x} — owns() says mine but match has no arm ***",
+        "*** vic::{} IPA={:#010x} val={:#010x} — inside a VIC window but not a modelled register ***",
         op, ipa, value
     );
     crate::kprintln!(
-        "  (bug in peripherals/vic.rs: owns() and read/write disagree.)"
+        "  (add the register to peripherals/vic.rs with its Einstein \
+         cross-reference, or fix the layout window.)"
     );
     crate::arch::cpu::halt();
 }

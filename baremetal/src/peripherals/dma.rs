@@ -169,26 +169,12 @@ static LOG: crate::diag::diag_util::TwoTierLog = crate::diag::diag_util::TwoTier
 pub struct Dma;
 
 impl crate::hv::mmio::MmioPeripheral for Dma {
-    fn owns(ipa: u64) -> bool {
-        owns(ipa)
-    }
     fn read(ipa: u64) -> u32 {
         read(ipa)
     }
     fn write(ipa: u64, value: u32) {
         write(ipa, value)
     }
-}
-
-/// Returns true if `ipa` falls in the DMA register window this module
-/// owns.
-fn owns(ipa: u64) -> bool {
-    (BANK1_BASE..BANK1_END).contains(&ipa)
-        || ipa == K_HDWR_ASSIGN
-        || (BANK2_BASE..BANK2_END).contains(&ipa)
-        || ipa == K_HDWR_ENABLE_STATUS
-        || ipa == K_HDWR_DISABLE
-        || ipa == K_HDWR_WORD_STATUS
 }
 
 /// True iff `ipa` is inside the per-channel register banks.
@@ -486,7 +472,7 @@ fn log_unknown_chan(what: &str, bank: u32, channel: u32, register: u32, value: u
 fn halt_unknown_dma(op: &'static str, ipa: u64, value: u32) -> ! {
     kprintln!();
     kprintln!(
-        "*** dma::{} IPA={:#010x} val={:#010x} — owns() said mine, no match ***",
+        "*** dma::{} IPA={:#010x} val={:#010x} — inside the DMA window but not a modelled register ***",
         op, ipa, value
     );
     kprintln!(

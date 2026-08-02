@@ -13,12 +13,12 @@
 //!
 //! Beyond the memory-backed [`REGIONS`], the manifest also names:
 //!   * [`MMIO_WINDOWS`] — the trap-handled IPA windows and their
-//!     policies. This phase the `mmio` router still does its own
-//!     dispatch (via each model's `owns`); the windows are the
-//!     declarative source for the range constants it consults and for
-//!     the cross-check invariants. Individually-modelled register
-//!     *addresses* (ROM serial chip, BankCtrl, RAM-size, …) stay in the
-//!     module that models them — only windows/ranges live here.
+//!     policies. The `mmio` router walks this table first-match-wins
+//!     and dispatches on each window's [`MmioPolicy`].
+//!     Individually-modelled register *addresses* (ROM serial chip,
+//!     BankCtrl, RAM-size, …) stay in the module that models them
+//!     (`peripherals::asic` for the miscellany) — only windows/ranges
+//!     live here.
 //!   * [`TICK_PAGE_IPA`] — the one 4 KiB non-trapping page inside the
 //!     hardware window (backed by `stage2::TICK_PAGE`).
 //!   * The scratch-pool carve-out constants (`SCRATCH_POOL_*`).
@@ -315,6 +315,9 @@ pub enum PeriphId {
     Dma,
     Pcmcia,
     Serial,
+    /// Memory-controller / bank-config / bus-strap miscellany
+    /// (`peripherals::asic`).
+    Asic,
 }
 
 /// What the router does with an access inside a window.
@@ -420,27 +423,23 @@ pub const UNKNOWN_BANK5: MmioWindow = MmioWindow {
 // doesn't model these registers — the "unknown bank #3" fallback
 // accepts writes silently and returns 0 for reads (TMemory.cpp:952-959).
 // Rather than whack-a-mole each register as the iterator advances,
-// accept the whole known-stride range in one explicit entry (the
-// 0x400 stride check itself stays in `mmio::in_bio_bank`). This is
-// still a closed whitelist — addresses outside the stride or outside
-// the 32-register window continue to halt loudly.
+// accept the whole known-stride range in one explicit entry. The
+// 0x400 stride check lives in `peripherals::asic::in_bio_bank`, which
+// is why the policy is `Peripheral(Asic)` rather than
+// `ReadZeroDropWrite`: this is still a closed whitelist — addresses
+// off the stride inside the window continue to halt loudly.
 pub const BIO_BANKS: MmioWindow = MmioWindow {
     name: "BIO register banks",
     base: 0x0F05_0000,
     end: 0x0F05_8000,
-    policy: MmioPolicy::ReadZeroDropWrite,
+    policy: MmioPolicy::Peripheral(PeriphId::Asic),
 };
 
-/// The trap-handled IPA windows. This phase the router (`hv::mmio`)
-/// still dispatches through each model's `owns()`; the entries here are
-/// the declarative source for the range constants it consults and for
-/// [`cross_check`]'s invariants. Phase 4 rewrites the router to walk
-/// this table first-match-wins, so finer windows precede the
-/// `HW_WINDOW` catch-all.
-///
-/// The VIC model additionally owns a few registers outside its windows
-/// (kHdWr_PlatformVers at 0x0F00_0008); those are register addresses,
-/// modelled where they live, not windows.
+/// The trap-handled IPA windows, walked first-match-wins by the
+/// `hv::mmio` router — finer windows precede the `HW_WINDOW`
+/// catch-all. Each `Peripheral` window routes to the model named by
+/// its [`PeriphId`]; the model owns the register decode inside the
+/// window and halts loudly on unmodelled addresses.
 pub const MMIO_WINDOWS: &[MmioWindow] = &[
     MmioWindow {
         name: "VIC clocks",
@@ -471,6 +470,35 @@ pub const MMIO_WINDOWS: &[MmioWindow] = &[
         base: 0x3000_0000,
         end: 0x7000_0000,
         policy: MmioPolicy::Peripheral(PeriphId::Pcmcia),
+    },
+    // ASIC / memory-controller register clusters (`peripherals::asic`):
+    // the bank-config area (incl. kHdWr_PlatformVers at 0x0F00_0008 and
+    // the RAM-size registers), two mid-range config registers, the
+    // external-abort / bank-control / chip-rev / ROM-serial cluster,
+    // and the write-only bus / pin-strap block.
+    MmioWindow {
+        name: "ASIC bank config",
+        base: 0x0F00_0000,
+        end: 0x0F00_2400,
+        policy: MmioPolicy::Peripheral(PeriphId::Asic),
+    },
+    MmioWindow {
+        name: "ASIC mem config",
+        base: 0x0F04_3000,
+        end: 0x0F04_8400,
+        policy: MmioPolicy::Peripheral(PeriphId::Asic),
+    },
+    MmioWindow {
+        name: "ASIC abort/bank/chip-rev",
+        base: 0x0F24_0000,
+        end: 0x0F24_7400,
+        policy: MmioPolicy::Peripheral(PeriphId::Asic),
+    },
+    MmioWindow {
+        name: "ASIC bus straps",
+        base: 0x0F28_0000,
+        end: 0x0F28_4400,
+        policy: MmioPolicy::Peripheral(PeriphId::Asic),
     },
     BIO_BANKS,
     RAM_PROBE_ABSENT,

@@ -5,27 +5,26 @@
 # check-layering.sh flags any forbidden import NOT matched here, and
 # fails on stale entries (a listed edge that no longer exists must be
 # deleted in the same change). This list may only shrink: each entry
-# names the refactor phase that removes it (phase 4: mmio cleanup,
-# phase 5: backend seams, phase 6: diag layer, phase 7: GuestOs hooks).
+# names the refactor phase that removes it (phase 5: backend seams,
+# phase 6: diag layer, phase 7: GuestOs hooks).
 
 # ---- arch ------------------------------------------------------------
 src/arch/cpu.rs host::console # phase 6 — halt-path DMA-console drain moves behind the diag on_loud_halt surface
 
 # ---- hv --------------------------------------------------------------
-src/hv/timer.rs peripherals::vic # phase 4 — timer→VIC tick plumbing via the router split
+src/hv/timer.rs peripherals::vic # phase 7 — timer↔VIC match/rearm coupling unwinds with the GuestOs hooks (counterpart of vic.rs hv::timer)
 src/hv/timer.rs host::platform # phase 5 — NEWTON_TICK_HZ/platform constants behind the backend seam
-src/hv/mmio.rs peripherals:: # phase 4 — router dispatch becomes layout::MMIO_WINDOWS + PeriphId
 src/hv/stage2.rs peripherals::vic # phase 7 — tick-page VIC advance moves into on_sync_trap_exit hook
 src/hv/guest_mem.rs newton::(rom_patches|guest_trampolines) # phase 7 — ROM-loader half splits into newton/loader.rs
 src/hv/snapshot.rs host::flash_persist # phase 5 — flash-persist backend seam
-src/hv/trap/mod.rs peripherals:: # phase 4 — VIC/native-primitives dispatch via the router split
+src/hv/trap/mod.rs peripherals:: # phase 7 — VIC tick/alarm + native-primitives dispatch move behind on_sync_trap_exit / on_irq_tail / handle_native_call hooks
 src/hv/trap/mod.rs host::platform # phase 5 — platform glue behind the backend seam
 src/hv/trap/mod.rs host::(host_io|input|audio|display|tarmac) # phase 7 — IRQ-tail pumps move into on_irq_tail hook
-src/hv/trap/dabt.rs peripherals:: # phase 4 — flash-write dispatch via the router split
+src/hv/trap/dabt.rs peripherals:: # phase 7 — flash-write dispatch moves behind GuestOs hooks
 src/hv/trap/dabt.rs newton::(unaligned|guest_trampolines) # phase 7 — Newton DABT handling behind GuestOs hooks
 src/hv/trap/cp15.rs newton::guest_trampolines # phase 7 — stage-1 MMU ritual moves into NewtonOs verbatim
 src/hv/trap/cp15.rs peripherals::flash # phase 7 — checksum re-seed inside on_stage1_mmu_enable hook
-src/hv/trap/hvc.rs peripherals::vic # phase 4 — VIC dispatch via the router split
+src/hv/trap/hvc.rs peripherals::vic # phase 7 — VIC dispatch moves behind GuestOs hooks
 src/hv/trap/hvc.rs newton::(probes|unaligned) # phase 7 — ROM-probe tags behind handle_hvc_probe hook
 src/hv/trap/hvc.rs host::(console|host_io) # phase 5 — guest-console + pen-queue backend seams
 src/hv/trap/und.rs newton::(probes|rom_patches|guest_trampolines) # phase 7 — UND probe re-route behind handle_und_hvc hook
@@ -35,20 +34,15 @@ src/hv/trap/und.rs host::tarmac # phase 5 — tarmac marker behind the backend s
 src/newton/probes.rs host::tarmac # phase 5 — tarmac marker behind the backend seam
 
 # ---- peripherals -----------------------------------------------------
-src/peripherals/dma.rs hv::(guest_endian|mmio) # phase 4 — MmioPeripheral trait + guest access via router split
+# (hv::{layout, guest_endian, guest_mem} and the hv::mmio MmioPeripheral
+# trait are the sanctioned service imports — allowed by
+# check-layering.sh itself, not listed here.)
 src/peripherals/dma.rs host::console # phase 5 — guest-serial ↔ host-console seam (peripherals/console.rs)
 src/peripherals/flash.rs host::flash_persist # phase 5 — flash-persist backend seam (mark_dirty)
-src/peripherals/flash_driver.rs hv::guest_mem # phase 4 — guest access via router split
-src/peripherals/guest_access.rs hv::(guest_endian|guest_mem) # phase 4 — guest access via router split
-src/peripherals/pcmcia.rs hv::mmio # phase 4 — MmioPeripheral trait moves with the router split
-src/peripherals/screen.rs hv::(guest_mem|guest_endian) # phase 4 — guest access via router split
 src/peripherals/screen.rs host::host_io # phase 5 — push_blit backend seam
-src/peripherals/serial.rs hv::mmio # phase 4 — MmioPeripheral trait moves with the router split
 src/peripherals/serial.rs host::console # phase 5 — guest-serial ↔ host-console seam (peripherals/console.rs)
-src/peripherals/sound.rs hv::guest_endian # phase 4 — guest access via router split
 src/peripherals/sound.rs host::audio # phase 5 — AudioBackend seam
 src/peripherals/tablet.rs host::host_io # phase 5 — pen-sample queue backend seam
-src/peripherals/vic.rs hv::mmio # phase 4 — MmioPeripheral trait moves with the router split
 src/peripherals/vic.rs hv::(stage2|timer) # phase 7 — tick-page update + timer rearm behind hooks
 src/peripherals/vic.rs host::platform # phase 5 — NEWTON_TICK_HZ behind the backend seam
 

@@ -1,6 +1,7 @@
 //! Generic hypervisor core: stage-2 translation, guest entry/exit,
 //! trap dispatch, MMIO routing, snapshots, guest memory map.
 
+pub mod be8;
 pub mod guest;
 pub mod guest_endian;
 pub mod guest_mem;

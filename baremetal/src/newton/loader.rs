@@ -631,11 +631,6 @@ unsafe fn patch_native_prim_mcr_lr_to_r12(rom: *mut u32, start: u32, end: u32) -
     let mut patched = 0usize;
 
     for j in (start_idx + 2)..end_idx {
-        // Same code/data discipline as patch_cp15_encodings: only
-        // rewrite words the classifier marks as code. The exact-word
-        // match below makes a false positive unlikely, but a data word
-        // equal to 0xEE00_EA10 would still be silently corrupted
-        // without this gate.
         if !rom_word_is_code(j) {
             continue;
         }
@@ -711,12 +706,6 @@ unsafe fn patch_cp15_encodings(rom: *mut u32, word_count: usize) -> usize {
     let mut count = 0usize;
     let mut first_pcs: [u32; 4] = [0; 4];
     for i in 0..word_count {
-        // Only rewrite words the classifier marks as code. A *data*
-        // word (stored BE, read back byteswapped) that happens to match
-        // the ~15-fixed-bit MCR/MRC shape would otherwise be silently
-        // corrupted through `write_rom_code_word`. The current ROM+REx
-        // pair has no false hits, but every Einstein.rex rebuild
-        // re-rolls those dice.
         if !rom_word_is_code(i) {
             continue;
         }

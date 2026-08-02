@@ -37,14 +37,11 @@ use crate::hv::guest_mem;
 // guest in LE; the helpers act as identity wrappers so existing
 // tests keep working.
 //
-// Exception: ROM **code** words are stored as LE byte order on host
-// (the CPU's instruction fetch is always LE on Cortex-A53). When EL2
-// reads a code word for emulation (e.g. handle_und decoding the
-// faulting instruction), we want the instruction encoding back, NOT
-// the byteswap. The classifier's `reach.bitmap` (consulted via
-// `guest_mem::rom_word_is_code`) discriminates code from data per
-// 32-bit ROM word; data words and everything outside the ROM
-// aperture (RAM, framebuffer) are swapped on read/write.
+// Exception: when EL2 reads a ROM code word for emulation (e.g.
+// handle_und decoding the faulting instruction) we want the
+// instruction encoding back, NOT the byteswap. Data words and
+// everything outside the ROM aperture (RAM, framebuffer) are swapped
+// on read/write.
 
 #[cfg(not(nh_guest_test))]
 #[inline]

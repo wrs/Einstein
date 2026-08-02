@@ -222,12 +222,8 @@ pub unsafe fn apply_rom_patches(rom_ptr: *mut u32) {
             (p.offset as usize) < rom_ver::ROM_IMAGE_SIZE,
             "patch offset must be in main ROM"
         );
-        // Dispatch via the classifier bitmap so each entry is treated
-        // correctly under BE-8: instruction patches go in as native u32
-        // (= LE encoding of the BE numerical value); data patches are
-        // byte-swapped before storage so a guest LDR reads the intended
-        // value. `install_patch` verifies `p.orig`, halts on mismatch,
-        // and records code-word originals for the shadow-stub analyser.
+        // `install_patch` verifies `p.orig`, halts on mismatch, and
+        // records code-word originals for the shadow-stub analyser.
         let kind = if crate::hv::guest_mem::rom_word_is_code((p.offset / 4) as usize) {
             WordKind::Code
         } else {

@@ -6,6 +6,12 @@ the reason reset-on-resume is safe for each. This is the companion to
 the workflow notes in `CLAUDE.md` (§Snapshot / resume workflow) and the
 field-level layout documented in `src/hv/snapshot.rs`.
 
+**Caveat:** this describes the intended contract. Resuming a
+*Newton-ROM* snapshot currently wedges the guest in a prefetch-abort
+loop at the vector page; only the two-run `test_snapshot_resume` guest
+test resumes correctly. Fixing or removing the resume path is tracked
+in [`../PLAN.md`](../PLAN.md).
+
 ## What is saved
 
 `src/hv/snapshot.rs` serializes, per slot:
@@ -91,7 +97,7 @@ contents matter across the gap. Per peripheral:
   diagnostic counters. Reset on resume. **Safe**: these are
   log-budget/observability counters, not guest-visible register state.
 
-- **Null-audio completion (Phase 2)** (`audio/null.rs`):
+- **Null-audio completion** (`audio/null.rs`):
   `OUTPUT_INT_MASK`, `OUTPUT_RUNNING`, `PENDING_EDGES`, `NEXT_DEADLINE`,
   `LAST_DURATION_TICKS`. Reset on resume. **Safe with a one-tick
   caveat**: this is the state that arms a sound-DMA completion IRQ a

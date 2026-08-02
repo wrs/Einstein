@@ -154,7 +154,7 @@ static SLOT1: SlotRegs = SlotRegs::new();
 static SLOT2: SlotRegs = SlotRegs::new();
 static SLOT3: SlotRegs = SlotRegs::new();
 
-/// Split log budgets (periph-M4): routine/expected traffic (card-side
+/// Split log budgets: routine/expected traffic (card-side
 /// "no card" reads/writes, known controller-register accesses) burns a
 /// tight budget so the boot-time chip-detect probes can't exhaust the
 /// console, while genuinely-unknown register offsets and out-of-range

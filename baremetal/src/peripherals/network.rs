@@ -113,7 +113,7 @@ fn log_string(ctx: &mut TrapContext, pc: u32) {
     while len < buf.len() {
         // Einstein completes this log path, so a failed guest read is a
         // hypervisor emulation bug, not a guest bug — halt loudly like
-        // every other native-prim guest access (periph-L6).
+        // every other native-prim guest access.
         let b = guest_access::read_byte_or_halt(addr, "network.Log", pc);
         if b == 0 {
             break;

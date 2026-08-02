@@ -41,34 +41,37 @@ Both platforms must stay green: `guest-tests/scripts/run-all.sh` runs
 the guest tests on QEMU, and any new divergence should be tracked
 down rather than papered over with a feature gate.
 
-See `README.md` for the user-facing project overview and
-`PLAN.md` / `HIGHLEVEL.md` / `IMPLEMENTATION.md` for the
-architecture.
+See `README.md` for the user-facing project overview,
+`HIGHLEVEL.md` / `IMPLEMENTATION.md` for the architecture and the
+implementation decisions, and `PLAN.md` for current state and
+remaining work.
 
 The 717006 ROM boots through the kernel + scheduler + NewtonScript
 interpreter to the Welcome UI, and the builtin apps work — on QEMU,
 FVP, and a real Pi Zero 2 W (display, USB touch, HDMI audio, SD
 flash persistence; see `docs/REAL_HW_BRINGUP.md`). The known
-functional gap is add-on app packages. Debugging work is still
-"run, see where it stops, fix, rerun" — which means the snapshot
-workflow below matters a lot.
+functional gap is add-on app packages. Debugging work is
+"run, see where it stops, fix, rerun".
 
 **Important:** Do not trust your memory for details of ARM architecture,
 especially EL2-related registers and coprocessor instruction encodings.
 ALWAYS check against the actual ARMv7 reference, which is in
 docs/ARM_Reference.txt.
 
-## Snapshot / resume workflow
+## Snapshots
 
 `src/hv/snapshot.rs` rolls four guest-state snapshots on disk at
 `/tmp/newton-snapshot-{0..3}.bin`. On every hypervisor startup we
 try to resume from the newest valid slot; missing or mismatched
 files fall through to a cold boot.
 
-**Warning: resume is currently broken** (the guest wedges at the
-abort vector on resume) and slated for post-refactor
-fix-or-elimination; saves and the commands below still work, but
-cold-boot for reliable runs.
+**Resuming a Newton-ROM snapshot is broken** — the guest ERETs to the
+saved PC and wedges in a prefetch-abort loop at the vector page, and
+the 2 s autosave then overwrites every slot with the wedged state.
+Saving works, and the two-run `test_snapshot_resume` guest test
+resumes correctly. **Always cold-boot** (`rm -f
+/tmp/newton-snapshot-*.bin` first), and never treat a resumed run as
+a verification signal. Fix-or-remove is tracked in `PLAN.md`.
 
 ### Commands
 
@@ -93,7 +96,7 @@ ls -la /tmp/newton-snapshot-*.bin
 # instead of hand-rolled `timeout N cargo run … ; pkill` recipes —
 # QEMU defers SIGTERM while the guest is busy (docs/QEMU_BUGS.md).
 scripts/boot-check.sh --cold          # forces a cold boot first
-scripts/boot-check.sh --marker 'Resuming guest from snapshot'
+scripts/boot-check.sh --marker 'some other log line'
 ```
 
 ### Save triggers
@@ -106,37 +109,14 @@ scripts/boot-check.sh --marker 'Resuming guest from snapshot'
   immediate save. Handy for guest tests that want to snapshot at
   a specific PC.
 
-### How to use this during debugging
+### Slot selection
 
-1. `cargo run` — hypervisor boots and saves every 2s. If you're
-   chasing a current stall, the wedge PC depends on what's being
-   investigated; check the most recent run log for the exact
-   stopping point.
-2. Notice the failure. The newest slot holds the state at the
-   moment the timer last fired — usually already inside the
-   failure, but the older slots cover the preceding 2 / 4 / 6
-   seconds. Four slots = ~8 seconds of rewindable history.
-3. Edit hypervisor code. `cargo run` again.
-4. On startup the hypervisor loads the newest slot and ERETs to
-   its saved PC, bypassing the entire ROM boot-up. You see
-   "Resuming guest from snapshot at PC=…" instead of "Entering
-   Newton ROM…".
-5. Observe whether the fix changed behaviour past the saved point.
+The loader picks the file with the highest `seq`. Copying an older
+file over a newer slot (`cp /tmp/newton-snapshot-2.bin
+/tmp/newton-snapshot-0.bin`) carries its own seq with it, so the older
+state wins — useful once resume works again.
 
-If the newest slot is already past where you want to land, copy an
-older slot on top:
-
-```bash
-cp /tmp/newton-snapshot-2.bin /tmp/newton-snapshot-0.bin  # pin slot 0 to the older state
-```
-
-(The loader picks the file with the highest `seq`. Copying an
-older file into a newer-seq slot puts it at the top of the stack
-because the copied file's header carries its own seq — so the
-loader sees two slots with the same high seq, picks one
-deterministically, and restores the older state.)
-
-### What survives a rebuild
+### What a save contains
 
 Only guest-visible state: GUEST_RAM, GUEST_FB, the
 inline_patch SCRATCH_POOL, the EL1 CP15 regs we can reach from
@@ -148,8 +128,9 @@ flash has diverged from the saved CPU/RAM state. Because x0..x30
 alias every AArch32 banked R0..R14 per ARM ARM Table D1-79,
 capturing all 31 also captures the per-mode banked SP/LR.
 Hypervisor-side EL2 code addresses, trap tables, VIC state, timer
-deadlines, and so on are fresh each boot. That's the point: edit
-hypervisor code, rebuild, resume.
+deadlines, and so on are fresh each boot — see
+`docs/SNAPSHOT_RESUME_CONTRACT.md` for which guest-visible peripheral
+state is deliberately reset on resume and why.
 
 ### ROM fingerprint
 
@@ -229,7 +210,7 @@ aarch64-elf-gdb -x scripts/gdb-init \
 For a guest PC that naturally traps (e.g., the MMIO access you already
 saw in a log), skip the install: `bg <addr>` and `c` is enough.
 
-## General Phase-B debugging guidance
+## Debugging a wedge
 
 - **Bitmap-first triage.** Whenever a wedge points at a specific
   guest PC (UND at `PC=X`, PABT at `X`, "wild branch to X", an
@@ -309,7 +290,7 @@ trace     2 0x00045b78 HandleDebugCard (svc) r0=0x... r1=0x... r2=0x... r3=0x...
 ```
 
 Every call, not first-touch — a function that's invoked ten times
-produces ten trace lines. Useful for Phase-B bisection: you see not
+produces ten trace lines. Useful for bisecting a stall: you see not
 just *which* function is at the top of the stall, but what arguments
 it's being called with over time (loop counter advancing, page index,
 etc.).
@@ -423,7 +404,7 @@ re-deriving state from disassembly or tool output:
 - [`docs/MTOUCH.md`](docs/MTOUCH.md) — TSTP MTouch USB touchscreen
   (VID 0x0416 / PID 0xC168) characterization: USB topology, HID
   report descriptor decode, activation handshake, Report ID 1
-  wire format. Reference for Phase 5 input work.
+  wire format.
 - [`docs/SD_DMA_AUTOSAVE.md`](docs/SD_DMA_AUTOSAVE.md) — the
   non-blocking flash autosave: multi-block `CMD25`/`CMD12` DMA
   writes (DREQ 13) driven cluster-by-cluster from the completion

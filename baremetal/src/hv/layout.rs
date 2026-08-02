@@ -6,7 +6,7 @@
 //! reads/writes), and `snapshot::{save,load}` (which regions to
 //! serialize). Hand-maintaining that list in three places is how a
 //! region ends up guest-visible at stage-2 but absent from the
-//! snapshot — the failure SCRATCH_POOL hit (review finding mem-H2).
+//! snapshot — the failure the SCRATCH_POOL region hit.
 //! This table is the single source of truth; the boot-time
 //! [`cross_check`] makes "mapped in stage-2 but missing from
 //! host_addr_for / snapshot" a loud halt rather than a silent omission.

@@ -7,7 +7,7 @@
 //! word-granular peripheral models: writes splice the sub-word value
 //! into the surrounding register word, reads extract the addressed
 //! lane, and splice/extract share the lane-shift functions so a
-//! write-then-read of a single byte round-trips (periph-H2/periph-M1).
+//! write-then-read of a single byte round-trips.
 //!
 //! Guest-test builds (`nh_guest_test`) run the guest LE under the
 //! legacy inline-patch path, where inline-stub byte/halfword accesses
@@ -62,7 +62,7 @@ pub const fn splice_halfword(prev: u32, ipa: u64, half: u32) -> u32 {
 }
 
 /// Extract the BE-8 sub-word lane addressed by `ipa` from the aligned
-/// register word `word` (periph-H2). The inverse of the write splice:
+/// register word `word`. The inverse of the write splice:
 /// a byte read at lane 0 returns bits[31:24], the same lane a byte
 /// write at lane 0 targets, so write-then-read of a single byte
 /// round-trips. `sas` is 0 (byte) or 1 (halfword); a word read never

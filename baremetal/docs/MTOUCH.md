@@ -133,8 +133,8 @@ the whole displayed image (including the black letterbox bands around
 Newton's 480×720 region). The coordinate mapping has to invert the
 display transform: touches in the letterbox should be discarded, and
 touches in the Newton region scaled back to 0..319 × 0..479. Exact
-constants get pinned during calibration (see Phase 5e in
-`REAL_HW_BRINGUP.md`).
+constants are pinned during calibration (see the display and input
+sections of `REAL_HW_BRINGUP.md`).
 
 ## Behavior notes
 
@@ -172,8 +172,8 @@ matched `ABS_X=399 / ABS_Y=132` in the parallel evtest log.
 
 ## Recipe for characterizing a different panel
 
-When another touch panel needs adding (Phase 5d is class-pluggable —
-see `REAL_HW_BRINGUP.md`):
+When another touch panel needs adding (the input layer is
+class-pluggable — see `REAL_HW_BRINGUP.md`):
 
 1. Plug into a Pi running Raspbian.
 2. `dmesg | tail -20` after attach — note hidraw node + VID/PID. If

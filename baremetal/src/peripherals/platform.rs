@@ -257,8 +257,7 @@ fn log_message(ctx: &mut TrapContext, pc: u32) {
     while len < buf.len() {
         // Einstein's FastReadString completes this path, so a failed
         // guest read is a hypervisor emulation bug, not a guest bug —
-        // halt loudly like every other native-prim guest access
-        // (periph-L6).
+        // halt loudly like every other native-prim guest access.
         let b = guest_access::read_byte_or_halt(addr, "platform.Log", pc);
         if b == 0 {
             break;

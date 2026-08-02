@@ -14,7 +14,7 @@ Files reviewed on our side:
 - `src/host/audio/mod.rs` — backend selection + the sound-driver contract.
 - `src/host/audio/pi_hdmi.rs` (~2000 lines) — VC4 HDMI/MAI driver, IEC
   encoder, cyclic-DMA chain, audio infoframe.
-- `src/host_dma.rs` — BCM2835 DMA driver shared with the
+- `src/host/host_dma.rs` — BCM2835 DMA driver shared with the
   PL011 TX path.
 - `src/host/platform/` — owns the BCM2835 pending-register IRQ dispatch
   (`bcm2835_irq_pending_1` → DMA channel N's `on_completion`); the
@@ -106,7 +106,7 @@ audio::pi_hdmi::refill_mai_dma_ring
    │  → fall through to silence-padding to keep the ring TARGET_AHEAD
    │    of the consumer
    ▼
-BCM2835 DMA channel 4  (src/host_dma.rs)
+BCM2835 DMA channel 4  (src/host/host_dma.rs)
    │  cyclic CB chain, N_PERIODS=4 × PERIOD_SLOTS=4096 subframes
    │  TI = (DREQ_HDMI=17 << 16) | (2 << 12 burst) | SRC_INC | DEST_DREQ
    │       | WAIT_RESP | INTEN     (INTEN on EVERY CB, since each CB is

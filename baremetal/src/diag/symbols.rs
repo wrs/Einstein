@@ -16,7 +16,7 @@
 //! walker both want PC → name lookups. This module is the shared
 //! backing.
 //!
-//! ## Why the symbol blob ships in every `diag` image (diag-M6)
+//! ## Why the symbol blob ships in every `diag` image
 //!
 //! These three `include_bytes!` constants are linked into rodata of
 //! every diag-carrying build — which by policy is every default build

@@ -169,7 +169,7 @@ impl LogBudget {
 }
 
 /// Two-tier log budget with the expected-stub vs unknown-input split
-/// from periph-M4 built in: routine/expected traffic gets a tight
+/// built in: routine/expected traffic gets a tight
 /// budget so it can't flood, while genuinely-unknown inputs get their
 /// own (generous) budget so discovery never goes silent just because
 /// the expected stream filled the shared quota.

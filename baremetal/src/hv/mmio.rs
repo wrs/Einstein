@@ -117,7 +117,7 @@ pub fn read(ctx: &crate::arch::trap_context::TrapContext, ipa: u64, sas: u8, elr
     #[cfg(nh_guest_test)]
     let ipa = be8::unxor_sub_word(ipa, sas);
 
-    // BE-8 sub-word reads (periph-H2). Two peripheral classes with two
+    // BE-8 sub-word reads. Two peripheral classes with two
     // sub-word conventions, both taken from Einstein's `TMemory::ReadBP`
     // as the oracle.
     #[cfg(not(nh_guest_test))]
@@ -165,7 +165,7 @@ fn read_word(ctx: &crate::arch::trap_context::TrapContext, ipa: u64, elr: u64, s
 }
 
 /// Side-effect-free peek of the word at `ipa`, used by the sub-word
-/// write splice and the sub-word read extraction (periph-M1). Unlike
+/// write splice and the sub-word read extraction. Unlike
 /// `read_word` it (a) routes through each model's `peek` (so e.g. the
 /// ROM-serial-chip bit index doesn't advance, and write-only ASIC
 /// registers report 0 instead of misfiring the unknown-read halt), and
@@ -205,7 +205,7 @@ pub fn write(
     let (ipa, value) = if sas >= 2 || is_serial_window(ipa) {
         (ipa, value)
     } else {
-        // Side-effect-free read of the surrounding word (periph-M1).
+        // Side-effect-free read of the surrounding word.
         // None → the aligned word is outside every window; splice onto
         // 0 and let the write dispatch below halt loudly with the
         // spliced value.

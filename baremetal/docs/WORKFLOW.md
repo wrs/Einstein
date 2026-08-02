@@ -71,7 +71,7 @@ When adding a new handler / MMIO stub / CP15 behavior:
 
 1. Write the hypervisor code.
 2. Write `guest-tests/tests/test_<feature>.S` that drives the
-   feature and uses HVC #0x03 / #0x04 (PASS / FAIL) to signal
+   feature and uses HVC #0x12 / #0x13 (PASS / FAIL) to signal
    outcome.
 3. Add a MANIFEST entry so `run-all.sh` picks it up.
 4. Run the full test suite before marking the task done.

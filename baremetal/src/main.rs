@@ -266,7 +266,7 @@ fn install_vectors() {
 fn print_banner() {
     kprintln!();
     kprintln!("===============================================");
-    kprintln!(" Newton Hypervisor v{}  (baremetal, M0)", VERSION);
+    kprintln!(" Newton Hypervisor v{}", VERSION);
     kprintln!(" Target: {}", host::platform::NAME);
     kprintln!(" ROM:    {}", newton::rom_ver::NAME);
     kprintln!("===============================================");
@@ -274,7 +274,7 @@ fn print_banner() {
     kprintln!("Core ID:    {}", arch::cpu::core_id());
 }
 
-/// Dump the capability registers we need to confirm before M1.5 — EL2
+/// Dump the capability registers the hypervisor depends on — EL2
 /// presence, stage-2 / virtualization support, cache and MMU granularity
 /// support. We only print; interpretation is in the user-facing output.
 fn print_caps() {

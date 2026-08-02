@@ -220,8 +220,8 @@ pi-bare-metal = ["platform-raspi3b", "rom-717006", "no-semihost", "flash-persist
 pi-bare-metal-sd = ["platform-raspi3b", "rom-717006", "no-semihost", "flash-persist-sd", "diag"]
 
 # Full real-Pi build: SD-backed flash + HDMI framebuffer output.
-# Newton boots and paints to a mini-HDMI monitor. Pen input is
-# still unwired (Phase 5).
+# Newton boots and paints to a mini-HDMI monitor; no pen input (use
+# `pi-bare-metal-input` for the touch panel).
 pi-bare-metal-display = [
     "platform-raspi3b",
     "rom-717006",
@@ -297,8 +297,8 @@ trace = ["diag"]
 # loop-spam from re-entries. Implies `trace`.
 trace_once = ["trace"]
 
-# Silence recurring diagnostic logs that dominate the console during
-# phase-B development (stage-1 XN re-walks on every MMU toggle, etc.).
+# Silence recurring diagnostic logs that otherwise dominate the console
+# (stage-1 XN re-walks on every MMU toggle, etc.).
 # Off by default; enable with `--features quiet` alongside `trace` to
 # get a clean function-trace log.
 quiet = []

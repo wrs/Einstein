@@ -156,7 +156,7 @@ static DMA: DmaCell = DmaCell(UnsafeCell::new(DmaState {
     }; 8],
 }));
 
-/// Split log budgets (periph-M4): "expected stub" traffic
+/// Split log budgets: "expected stub" traffic
 /// (unmodeled channels 2-7, the chip-wide enable on those channels)
 /// burns a tight budget so a spinning kernel driver can't drown the
 /// console, while genuinely-unknown register offsets get their own

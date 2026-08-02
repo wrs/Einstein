@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Import-discipline lint for the layered source tree (see the layering
-# refactor plan / docs/review-2026-06). One crate, six layer directories
-# mirroring the eventual crates; this script enforces the dependency
-# direction between them:
+# Import-discipline lint for the layered source tree. One crate, six
+# layer directories mirroring the eventual crates; this script enforces
+# the dependency direction between them:
 #
 #   arch        — pure AArch64/AArch32 mechanism; zero upward deps.
 #   hv          — generic hypervisor core; may use arch. Sanctioned

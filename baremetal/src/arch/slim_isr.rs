@@ -1,4 +1,4 @@
-//! Slim-ISR state ownership (review arch-§4).
+//! Slim-ISR state ownership.
 //!
 //! # The contract, stated once
 //!

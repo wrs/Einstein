@@ -1,193 +1,174 @@
-# Plan — Drive Newton OS to interactive use
+# Plan — current state and remaining work
 
-## Status
+## State
 
-**Maintenance note (auto-prune):** Each iteration, BEFORE adding a new
-iter-N section, prune the old one(s) so PLAN.md stays small. The full
-history lives in `git log`. Keep only: this Status block + the most
-recent 1-2 iteration sections + the reference sections at the bottom.
-Bloated PLAN.md wastes context every read.
+The 717006 ROM boots through kernel, scheduler and NewtonScript
+interpreter to the Welcome UI, and the builtin apps work
+interactively — on QEMU `raspi3b`, on ARM FVP, and on a real
+Pi Zero 2 W with HDMI display, USB touch, HDMI audio and SD-backed
+flash persistence. All 38 guest tests are green on both emulated
+hosts; all 18 build combinations in `scripts/check-matrix.sh` pass.
 
-**Hard rules** (user directives still in force):
+## Standing rules
 
-- Hypervisor-side compensation for subpage-AP incompatibility is OFF
-  the table (2026-04-29). The fix MUST be a kernel patch.
-- Run the *original ROM code*; no workarounds, no deferrals, no
-  shortcuts; fix all warnings before each commit.
-- All 38 guest tests must pass on every commit that touches hypervisor
-  functionality (not merely diagnostics):
-  (`baremetal/guest-tests/scripts/run-all.sh`).
+- Run the *original ROM code*. No workarounds, no shortcuts. ROM
+  patches are the last resort, only when no other layer can host the
+  fix.
+- No shadow page tables and no per-access AP emulation: guest stage-1
+  incompatibilities are resolved by normalising the guest's own
+  descriptors in place (`HIGHLEVEL.md` §4.3).
+- Every commit that touches hypervisor functionality (not merely
+  diagnostics) must pass `guest-tests/scripts/run-all.sh`, all 38
+  tests. Fix warnings before committing.
+- Unknown inputs on emulation paths halt loudly with a context dump.
+  Never add a silent default to quiet a halt — the halt is the
+  trip-wire that says which table entry to extend.
 
-**Current state (2026-06-10):** The goal of this plan is reached. The
-717006 ROM boots to the Welcome UI and the builtin apps work
-interactively — on QEMU raspi3b, on ARM FVP, and on a real
-Pi Zero 2 W with HDMI display, USB touch, HDMI audio, and SD-backed
-flash persistence (non-blocking DMA autosave). All 38 guest tests are
-green. The Phase-B debugging diary that used to live here (stack-VM
-patches, ResolveFault wrapper, matcher-mismatch hunts) is archived in
-git history; the durable findings are in `docs/STRUCTURES.md` and
-`docs/NEWTON_INTERNALS.md`. Real-hardware bring-up is tracked in
-`docs/REAL_HW_BRINGUP.md`.
+## Remaining work
 
-## Current goals
+1. **Add-on app packages.** The main functional gap. The `.pkg`
+   installation flow — soup storage, package loader, and native code
+   inside packages — is unexercised. Needs an investigation pass:
+   install a known-simple package, see where it stops, fix, repeat.
+   The design note for the native-code half (which `inline_patch`
+   "real code" invariants extend above the ROM aperture, what the
+   stage-2 RW+XN ↔ RO+X rescan guarantees, how to triage a wedge PC in
+   RAM) is [`docs/PACKAGE_NATIVE_CODE.md`](docs/PACKAGE_NATIVE_CODE.md).
 
-1. **Add-on app packages** — the known functional gap. The `.pkg`
-   installation flow (soup storage, package loader, possibly native
-   code inside packages) is unexercised. Needs an investigation pass:
-   load a known-simple package, see where it stops, fix, repeat.
-2. **Phase 6 remainder** — serial port and PCMCIA images on real
-   hardware (audio is done). See `docs/REAL_HW_BRINGUP.md` §Phase 6.
-3. **Debug-scaffolding teardown** — done. The one-off Phase-B residue
-   has been deleted: the write-capture/`newt`/`cdsv` tripwires, the
-   subpage-AP and alias-onset audit inside `fix_stage1_xn_bits`, the
-   parked-PC wedge probe (audio-null now arms its own DMA-completion
-   IRQ), the never-installed stack-pad/lock-heap wrappers, and the
-   dead `shadow_pool` / `usb_probe` modules. What remains is listed
-   under "Diagnostic scaffolding" below, kept deliberately as
-   tripwires and debugging tooling.
-4. **Targeted guest-TLB maintenance.** The hypervisor rewrites guest
-   stage-1 PTEs behind the guest's back (`fix_stage1_xn_bits`,
-   scratch-pool L1-section install) with no TLBI at the rewrite sites;
-   today a blanket `vmalle1` per 16 ms heartbeat (`timer::on_irq`)
-   bounds stale-entry lifetime. Replace the blanket flush with
-   targeted TLBIs at each rewrite site, then drop it.
-5. **M7 — performance and polish** (HIGHLEVEL.md §12): measurement vs
-   the real 162 MHz StrongARM; display-scaling quality on real hw.
+2. **Snapshot resume — fix or remove.** Saving works, and the two-run
+   `test_snapshot_resume` guest test resumes correctly; resuming the
+   *Newton ROM* does not. The resumed guest ERETs to the saved PC and
+   immediately wedges in a prefetch-abort loop at the vector page
+   (`ELR = IFAR = 0xc`, ABT mode), after which the 2 s autosave
+   overwrites all four slots with the wedged state within ~8 s.
+   Until this is resolved, cold-boot for every run and do not use
+   resume as a verification signal. Decide between fixing the restore
+   path (`src/hv/snapshot.rs`, and the state it deliberately does not
+   restore — see
+   [`docs/SNAPSHOT_RESUME_CONTRACT.md`](docs/SNAPSHOT_RESUME_CONTRACT.md))
+   and deleting the mechanism.
+
+3. **Guest serial port on real hardware.** PL011 carries the kernel
+   log; the guest's own serial port needs a separate host-side
+   sink/source. Channels 0/1 already route through the guest DMA model
+   on the emulated hosts.
+
+4. **PCMCIA card images.** Newton flash-card images map naturally onto
+   files on the SD card through the existing `flash_persist` backend;
+   not wired. The PCMCIA model currently reports empty slots.
+
+5. **Targeted guest-TLB maintenance.** The hypervisor rewrites guest
+   stage-1 PTEs behind the guest's back (`fix_stage1_xn_bits`, the
+   scratch-pool L1 section install) with no TLBI at the rewrite sites;
+   a blanket `tlbi vmalle1` on the 16 ms heartbeat
+   (`hv::timer::on_irq`) currently bounds how long a stale entry can
+   live. Replace it with targeted TLBIs at each rewrite site, then
+   drop the blanket flush.
+
+6. **Other ROM versions.** Only 717006 boots. `rom-710031` is a
+   compiling skeleton (Tier-1 constants only, no ROM image checked in)
+   that proves the `rom_ver` seam; filling it in — and re-verifying
+   the stage-1 descriptor-format findings against 737041, localised
+   variants and eMate ROMs — is open work.
+
+7. **Performance and polish.** No measurement against the real
+   162 MHz StrongARM has been done. Display-scaling quality on real
+   hardware is the other polish item.
+
+Real-hardware specifics (cores 1–3 left parked, snapshot ring deferred
+on hardware, thermal re-verification) are tracked in
+[`docs/REAL_HW_BRINGUP.md`](docs/REAL_HW_BRINGUP.md).
 
 ## Workflow per stop
 
-1. Reproduce the stall on QEMU and capture the loud-halt context dump
-   (or the last snapshot before the wedge — see CLAUDE.md).
-2. Identify the kernel-side code at the wedge PC from the disasm
-   (`scripts/disasm-out/rom.dis`) and instrument the relevant entry
-   point with an HVC probe if more detail is needed.
-3. Cross-reference with Einstein (`build/NewtonProbe baremetal/roms/
-   newton.rom _Data_/Einstein.rex 30`) so we have a known-good oracle.
-4. Decide where the fix belongs:
-   - **Hypervisor handler gap** — `src/peripherals/*.rs`, `src/hv/trap/`.
-   - **Einstein behavioural quirk** — port the matching logic.
-   - **ROM patch** — `src/newton/rom_patches.rs`. Only when no other layer can
-     host the fix.
-5. Re-run, confirm the wedge is gone, repeat for the next stop.
+1. Reproduce the stall on QEMU and capture the loud-halt context dump.
+2. **Bitmap-first triage** when the wedge names a guest PC in ROM:
+   check whether that address is marked as code in the classifier
+   bitmap before digging into trap state (see `CLAUDE.md`). If it
+   isn't, the fix is a classifier seeder, not a runtime handler.
+3. Identify the kernel-side code at the wedge PC from
+   `scripts/disasm-out/rom.dis`, and instrument the entry point with
+   an HVC probe if more detail is needed.
+4. Cross-reference Einstein as the oracle
+   (`build/NewtonProbe baremetal/roms/newton.rom _Data_/Einstein.rex 30`).
+5. Decide where the fix belongs — a hypervisor handler gap
+   (`src/peripherals/*`, `src/hv/trap/`), an Einstein behavioural
+   quirk to port, or, only when no other layer can host it, a ROM patch
+   in `src/newton/rom_patches.rs`.
+6. Re-run, confirm the wedge is gone, repeat.
 
 ## Tools
 
 ### Hosts
 
-- **QEMU raspi3b** (default; `cargo run --release`) — fast, BCM2835
-  VIC, AArch32↔AArch64 banking quirks documented in `docs/QEMU_BUGS.md`.
-- **ARM FVP `FVP_Base_RevC-2xAEMvA`** — `scripts/fvp <elf>`. Accurate
-  reference: GICv3, generic timer + cache model exact. Build with
-  `--no-default-features --features platform-fvp-base`.
-- **Pi Zero 2 W** — real hardware.
-  `PI_CARGO_FEATURES=pi-bare-metal-input scripts/build-sd.sh <dest>`
-  assembles the boot partition. See `docs/REAL_HW_BRINGUP.md`.
+- **QEMU raspi3b** (default; `cargo run --release`) — fast; banking
+  quirks in `docs/QEMU_BUGS.md`.
+- **ARM FVP `FVP_Base_RevC-2xAEMvA`** — `scripts/fvp <elf>`. GICv3,
+  accurate timer + cache model. Build with `--no-default-features
+  --features "platform-fvp-base rom-717006 quiet diag"`.
+- **Pi Zero 2 W** — `PI_CARGO_FEATURES=pi-bare-metal-input
+  scripts/build-sd.sh <dest>`; see `docs/REAL_HW_BRINGUP.md`.
 
 ### Trace and observation
 
-- **Function tracer** — `--features trace[_once],quiet`. Patches every
-  `scripts/classify-out/code-symbols.txt` entry with HVC trampoline.
-- **`scripts/trace-diff.sh`** — diff Einstein vs hypervisor function-
-  entry traces.
-- **`build/NewtonProbe`** — Einstein-as-oracle.
+- **Function tracer** — `--features trace[_once],quiet`: an HVC
+  trampoline on every entry in `scripts/classify-out/code-symbols.txt`.
+- **`scripts/trace-diff.sh`** — diff Einstein vs hypervisor traces.
+- **`build/NewtonProbe`** — Einstein as oracle;
+  `probe/FINDINGS.md` is the captured golden record.
 - **Tarmac on FVP** — `scripts/fvp --tarmac=<file>`.
-
-### State capture
-
-- **Snapshot ring** — 4 slots at `/tmp/newton-snapshot-{0..3}.bin`,
-  autosaved every 2 s from `trap_irq` (QEMU/FVP; deferred on real hw).
-- **Live display + pen input** — `src/host_io/` forwards each
-  `screen::blit` to a companion viewer at `tools/host-viewer/`
-  via `/tmp/newton-host-io/` (semihosting files); the viewer posts
-  mouse events back as Newton pen samples. Enabled via
-  `--features host-io-semihost`.
+- **Trap histograms / task dumps** — `src/diag/`, feature `diag`.
 
 ### Debugging
 
 - **gdb on QEMU** — `DEBUG=1 cargo run --release` (term 1) +
-  `aarch64-elf-gdb -x scripts/gdb-init <elf>` (term 2). Helpers `bg
-  <addr>`, `bp <addr>`, `tt N`, `guest-state`.
+  `aarch64-elf-gdb -x scripts/gdb-init <elf>` (term 2). Helpers
+  `bg <addr>`, `bp <addr>`, `tt N`, `guest-state`.
 - **DABT/PABT DIAG HVCs** at ROM offsets `0x10` / `0x0C`.
-- **Software-reset canaries** — BootOS / PowerOffAndReboot / Reboot.
+- **Loud-halt canaries** on `BootOS` / `PowerOffAndReboot` / `Reboot`
+  and the bus-error throw, gated on `cfg(nh_loud_halt_canaries)` so a
+  user reset on real hardware doesn't halt the hypervisor.
 
-### Reference
+### Live display and pen input
 
-- `scripts/disasm-out/rom.dis` — symbol-annotated ROM+REx disassembly.
-- `docs/DISASM.md` (incl. "Jump-table aliasing — DON'T mistake the
-  thunk for the body").
-- `docs/NEWTON_INTERNALS.md` — APCS, ClassInfo dispatch, ROM patch
-  table 0x01A00000..0x01C20000.
-- `docs/QEMU_BUGS.md` — raspi3b AArch64↔AArch32 quirks.
-- `docs/STRUCTURES.md` — kernel struct layouts (TScheduler, TTask,
-  TStackManager, end-to-end page allocation).
-- `docs/peripherals.md` — peripheral implementations.
-- `probe/FINDINGS.md` — golden record from a fully-booted Newton.
-
-### Tests
-
-`baremetal/guest-tests/scripts/run-all.sh` runs the 38 guest tests on
-QEMU; `--platform fvp` on the FVP. Both must stay green. Set
-`CHECK_MATRIX=1` to also run `scripts/check-matrix.sh` (17 feature
-combos + the layering/rom-addr lints) at the top of the run.
+`src/host/host_io/` forwards each `screen::blit` to
+`tools/host-viewer/` through `/tmp/newton-host-io/` (semihosting
+files); the viewer posts mouse events back as pen samples. Enable with
+`--features host-io-semihost`.
 
 ## Critical files
 
-- `src/newton/loader.rs` — ROM load + byteswap; `src/newton/os.rs` — `fix_stage1_xn_bits`
-  flattens ARMv4 subpage-AP to AP=011, clears XN, rewrites fine-table
-  L1 placeholders to fault; CP15-encoding rewrites.
-- `src/newton/guest_trampolines.rs` — UND/DABT/PABT vector trampolines + the
-  hypervisor-code range predicate.
-- `src/hv/layout.rs` — the single region manifest (ipa/size/
-  host_pa/perms/snapshot) driving stage2, host_addr_for, and snapshot.
-- `src/hv/trap/` — `mod.rs` (sync-trap + IRQ dispatch, same-EL slim ISR),
-  `dabt.rs` (`handle_data_abort` with kernel-DABT forwarding for lazy
-  stack growth), `und.rs`, `cp15.rs` (CP15 shim), `hvc.rs` (tag
-  dispatch); `src/newton/probes.rs` for the Newton-ROM probe handler bodies.
-- `src/host/host_dma.rs` — host-side BCM2835 DMA driver (UART TX, MAI, SD).
-- `src/hv/guest.rs` — HCR_EL2 (TVM, TIDCP, TSW, TPC, TPU, IMO, FMO, AMO,
-  DC); CPTR_EL2.TFP for CP10/11.
-- `src/hv/stage2.rs` — stage-2 L1/L2/L3.
-- `src/arch/banked.rs` — AArch32 banked-register access from EL2 (Table
-  D1-79).
-- `src/newton/rom_patches.rs` — Einstein word-write patches; HVC injection
-  helpers; canaries; ResolveFault wrapper.
-- `src/peripherals/*` — Newton driver / native-primitive surface.
-- `src/hv/snapshot.rs` — rolling ring under `/tmp/newton-snapshot-*.bin`.
-- `src/host/flash_persist/` + `src/host/sd/` — SD-backed flash persistence with
-  DMA autosave (`docs/SD_DMA_AUTOSAVE.md`).
-- `src/host/usb/` + `src/host/input/` — DWC2 USB host + MTouch pen input.
-- `src/host/audio/` — VC4 HDMI MAI sound output.
-- `src/diag/tracer.rs` — function-level tracer.
-- `src/diag/guest_bp.rs` — `bp <addr>` for the gdb workflow.
-- `src/diag/task_dump.rs` — `TScheduler` / `TTask` dumps from EL2.
+- `src/newton/loader.rs` — ROM load, selective byteswap, CP15-encoding
+  rewrite; `src/newton/os.rs` — `fix_stage1_xn_bits` and the MMU-enable
+  ritual.
+- `src/newton/rom_patches.rs` / `probes.rs` — the patch table, the
+  unified installer, probe handler bodies.
+- `src/newton/guest_trampolines.rs` — UND/DABT vector trampolines.
+- `src/newton/inline_patch.rs` + `unaligned[_inline].rs` — stub pool,
+  liveness walker, SA-1100 rotate-LDR emulation.
+- `src/hv/layout.rs` — the region + MMIO-window manifest.
+- `src/hv/trap/` — `mod.rs` (dispatch + IRQ), `dabt.rs`, `und.rs`,
+  `cp15.rs`, `hvc.rs`.
+- `src/hv/stage2.rs` — stage-2 tables and the RW+XN ↔ RO+X page state
+  machine; `src/hv/guest.rs` — `HCR_EL2` / `CPTR_EL2` setup.
+- `src/arch/banked.rs` — AArch32 banked registers from EL2
+  (ARM ARM Table D1-79).
+- `src/peripherals/*` — Newton device models.
+- `src/host/{sd,usb,input,audio,display,host_dma}` — real-hardware
+  stacks; `src/host/flash_persist/` — SD-backed flash with DMA
+  autosave.
 - `guest-tests/tests/` — 38 tests; `guest-tests/scripts/run-all.sh`.
 
 ## Verification
 
-Every commit:
-
 ```
-baremetal/guest-tests/scripts/run-all.sh
+guest-tests/scripts/run-all.sh                 # 38 tests, QEMU
+guest-tests/scripts/run-all.sh --platform fvp  # same on FVP
+CHECK_MATRIX=1 guest-tests/scripts/run-all.sh  # + the 18-combo build matrix
+scripts/boot-check.sh --cold                   # ROM boot to the Welcome UI
 ```
-
-All 38 tests must pass.
 
 ## Non-goals
 
-- Multi-ROM switching, JIT, software CPU emulation, Pi 4/5 support
-  (HIGHLEVEL.md §15).
-
-## Diagnostic scaffolding (active)
-
-The one-off Phase-B probes are gone (the write-capture tripwires,
-the subpage-AP/alias audit inside `fix_stage1_xn_bits`, the parked-PC
-wedge probe, `shadow_pool`, `usb_probe`); these stay as permanent
-tripwires and debugging tooling.
-
-- DABT/PABT DIAG vectors at ROM offsets `0x10` / `0x0C`.
-- BootOS / PowerOffAndReboot / Reboot canaries and the
-  BUS_ERROR_THROW loud-halt capture in `rom_patches.rs`, gated on
-  `cfg(nh_loud_halt_canaries)` (semihost/dev builds only — off on
-  real hardware so a user reset doesn't halt the hypervisor).
-- The function-level tracer (`--features trace`) and `guest_bp`
-  one-shot software breakpoints for the gdb workflow.
+Multi-ROM switching at runtime, JIT or software CPU emulation, Pi 4/5
+support, Einstein's UI layer, running under Linux.

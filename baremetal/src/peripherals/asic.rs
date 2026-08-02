@@ -294,7 +294,7 @@ fn write(ipa: u64, value: u32) {
 /// the kernel writes them at BootOS time and never reads them back, so
 /// `read_opt` returns `None` for them. `peek` reports these as 0 so a
 /// sub-word RMW of a write-only register splices onto 0 instead of
-/// misfiring the unknown-read halt (periph-M1).
+/// misfiring the unknown-read halt.
 ///
 /// This list must track the write-only arms of `write`'s match (the
 /// closed Phase-A whitelist). Readable registers there (PlatformVers,

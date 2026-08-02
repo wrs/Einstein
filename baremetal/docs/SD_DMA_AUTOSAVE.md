@@ -21,7 +21,7 @@ same-EL ISR (`trap::irq_from_el2` / `host_dma::on_completion`).
 ## Pieces / where things live
 
 - **DMA channel:** `SD_TX_CHANNEL = 6`, `DREQ_SDHOST = 13` in
-  `src/host_dma.rs`. Helpers there: `init_sd_tx`,
+  `src/host/host_dma.rs`. Helpers there: `init_sd_tx`,
   `arm_sd_tx`, `sd_tx_active`, `sd_tx_error`, `sd_tx_abort`. Bare-DREQ
   CS flags (SD yields to MAI's higher AXI priority — intended).
 - **SDHOST DMA writes** in `src/host/sd/sdhost.rs`:

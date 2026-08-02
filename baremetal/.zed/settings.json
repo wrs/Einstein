@@ -1,0 +1,22 @@
+{
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        // The hypervisor is a bare-metal bin crate for
+        // aarch64-unknown-none-softfloat. `--all-targets` adds the
+        // bin's test target, which sets cfg(test) and so drops
+        // `#![cfg_attr(not(test), no_std)]` — rustc then wants `std`
+        // and `test` for a target that has neither, and every prelude
+        // item (Option, writeln!, matches!, …) reports as unresolved.
+        "check": {
+          "allTargets": false
+        },
+        // Same reason, for rust-analyzer's own crate-graph analysis.
+        // The crate has no cfg(test) code, so nothing is hidden.
+        "cfg": {
+          "setTest": false
+        }
+      }
+    }
+  }
+}

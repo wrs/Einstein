@@ -39,7 +39,8 @@ const EC_DATA_ABORT_LOWER: u32 = 0x24;
 // `crate::diag::trap_hist`. The sync dispatcher below calls
 // `trap_hist::record_sync(ec)` for every sync trap and the HVC + DABT
 // handlers feed in their own sub-bucket records; `trap_irq` calls
-// `trap_hist::dump_and_reset()` every ~2 s to print and zero the window.
+// `trap_hist::histogram_tick()`, which prints and zeroes the window
+// every ~2 s.
 
 
 /// Synchronous exception from a lower EL running AArch32.
@@ -111,22 +112,10 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
     // divergence at TStackInfo::Init #12.
     crate::hv::stage2::tick_page::update_from_sync_trap();
 
-    // Budget-limited "progress beacon": print PC every 10k traps so we
-    // can see if the guest is making forward progress or looping in one
-    // place. Doesn't halt — lets boot continue.
-    static mut TRAP_COUNTER: u64 = 0;
-    // SAFETY: single-threaded.
-    let n = unsafe { TRAP_COUNTER += 1; TRAP_COUNTER };
-    if n % 10_000 == 0 {
-        let elr = read_sysreg!("elr_el2");
-        let spsr = read_sysreg!("spsr_el2");
-        crate::log_traps!(
-            "beacon: {} traps, ELR={:#x} SPSR={:#x} int_present={:#x}",
-            n, elr, spsr, vic::int_present_raw()
-        );
-    }
-    #[cfg(feature = "platform-fvp-base")]
-    crate::host::tarmac::maybe_emit_start(n);
+    // Trap-progress beacon + (FVP) tarmac window-open check — one
+    // call per sync trap into the diag surface; stubbed to nothing
+    // without the `diag` feature.
+    crate::diag::trap_diag::sync_trap_beacon();
 }
 
 /// Asynchronous IRQ taken at EL2. Dispatched by interruptee: an IRQ
@@ -343,33 +332,10 @@ fn irq_from_guest(ctx: &mut TrapContext, cap: crate::arch::slim_isr::IrqCap) {
     crate::hv::snapshot::maybe_autosave(ctx);
 
     // Every ~2 s of wall, print the trap-frequency histogram so we
-    // can see what dominates the residual trap rate (EC class, HVC
-    // immediate, DABT PC/IPA). See `crate::diag::trap_hist`. Independent
-    // of snapshot autosave (which is gated when guest_bp is live).
-    // Gated on `log_traps`: prints a multi-line histogram every 2s,
-    // valuable for Phase-B but noise on a real-hardware boot.
-    #[cfg(feature = "log_traps")]
-    {
-        use core::sync::atomic::{AtomicU64, Ordering};
-        static NEXT_DUMP_TICKS: AtomicU64 = AtomicU64::new(0);
-        let now: u64;
-        let freq: u64;
-        // SAFETY: sysreg reads, side-effect free.
-        unsafe {
-            core::arch::asm!("mrs {}, cntpct_el0", out(reg) now,
-                options(nomem, nostack, preserves_flags));
-            core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq,
-                options(nomem, nostack, preserves_flags));
-        }
-        let interval = freq.wrapping_mul(2);  // 2 seconds
-        let next = NEXT_DUMP_TICKS.load(Ordering::Relaxed);
-        if next == 0 {
-            NEXT_DUMP_TICKS.store(now.wrapping_add(interval), Ordering::Relaxed);
-        } else if now >= next {
-            crate::diag::trap_hist::dump_and_reset();
-            NEXT_DUMP_TICKS.store(now.wrapping_add(interval), Ordering::Relaxed);
-        }
-    }
+    // can see what dominates the residual trap rate. The pacing and
+    // the `log_traps`-gated dump both live behind the diag surface;
+    // see `crate::diag::trap_hist::histogram_tick`.
+    crate::diag::trap_hist::histogram_tick();
 
     // EOI last so the GIC is ready to deliver the next interrupt.
     // No-op on BCM2836.

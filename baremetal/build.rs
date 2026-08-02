@@ -3,12 +3,16 @@
 // - Selects between booting the real Newton ROM (default) and a small ARM
 //   guest test image (if $NH_GUEST_TEST is set to a .bin file). Sets the
 //   `nh_guest_test` cfg so `guest_mem.rs` takes the test-mode branch.
-// - Always parses scripts/classify-out/code-symbols.txt for the vetted
-//   code-only address list and ../_Data_/symbols.txt for the matching
-//   mangled names, then emits three compact binary blobs into OUT_DIR.
-//   `src/diag/task_dump.rs` includes them unconditionally (PC→name lookup in
-//   halt-path stack traces); `src/diag/tracer.rs` additionally consults them
-//   for its trampoline pool when the `trace` feature is on. The blobs are:
+// - When the `diag` feature is on, parses
+//   scripts/classify-out/code-symbols.txt for the vetted code-only
+//   address list and ../_Data_/symbols.txt for the matching mangled
+//   names, then emits three compact binary blobs into OUT_DIR.
+//   `src/diag/symbols.rs` includes them (PC→name lookup in halt-path
+//   stack traces); `src/diag/tracer.rs` additionally consults them
+//   for its trampoline pool when the `trace` feature is on. With
+//   `diag` off the staging is skipped entirely — `symbols.rs` is
+//   cfg-gated out and the ~743 KiB of rodata disappears from the
+//   image. The blobs are:
 //     fn_addrs.bin       — packed u32 LE, sorted ROM-range function entry PAs
 //     fn_name_offs.bin   — parallel u32 LE offsets into fn_names.bin
 //     fn_names.bin       — NUL-separated mangled names (name pool). Mangled
@@ -46,9 +50,11 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(nh_audio_pi_hdmi)");
     println!("cargo:rustc-check-cfg=cfg(nh_loud_halt_canaries)");
     println!("cargo:rustc-check-cfg=cfg(nh_real_hw)");
+    println!("cargo:rustc-check-cfg=cfg(nh_diag)");
 
     resolve_loud_halt_canaries();
     resolve_real_hw();
+    resolve_diag();
 
     select_platform_linker_script();
     resolve_host_io_backend();
@@ -93,11 +99,14 @@ fn main() {
         }
     }
 
-    // Build the symbol tables unconditionally. `trace` consumes them
-    // for its trampoline pool; `task_dump` consumes them (always) for
-    // PC → name lookup in stack traces. Cost is just a few hundred KB
-    // of `include_bytes!` data in the image.
-    build_trace_tables();
+    // Build the symbol tables when the diag layer is in the image.
+    // `trace` consumes them for its trampoline pool; `task_dump`
+    // consumes them for PC → name lookup in stack traces. With `diag`
+    // off, `src/diag/symbols.rs` (the sole includer) is compiled out,
+    // so the staging is skipped too.
+    if env::var("CARGO_FEATURE_DIAG").is_ok() {
+        build_trace_tables();
+    }
 
     // Stage the classify bitmap for include_bytes! in shadow_stub.
     // In guest-test mode the bitmap is embedded but never consulted —
@@ -377,6 +386,17 @@ fn resolve_loud_halt_canaries() {
     let no_semihost = env::var("CARGO_FEATURE_NO_SEMIHOST").is_ok();
     if !no_semihost {
         println!("cargo:rustc-cfg=nh_loud_halt_canaries");
+    }
+}
+
+/// Emit `cfg(nh_diag)` when the `diag` feature is enabled. Source code
+/// reads the cfg, never the raw feature — same rule as the backend
+/// axes — so the "which builds carry diagnostics" policy lives in
+/// Cargo.toml (`default` + the `pi-bare-metal*` aggregates) and here,
+/// not scattered across `#[cfg(feature = …)]` sites.
+fn resolve_diag() {
+    if env::var("CARGO_FEATURE_DIAG").is_ok() {
+        println!("cargo:rustc-cfg=nh_diag");
     }
 }
 

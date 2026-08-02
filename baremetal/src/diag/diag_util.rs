@@ -109,8 +109,9 @@ impl<const N: usize> TopK<N> {
     }
 
     /// Snapshot the tracked entries in descending count order. Only
-    /// compiled where a dump site consumes it.
-    #[cfg(feature = "log_traps")]
+    /// compiled where a dump site consumes it (the dump sites all
+    /// live behind the diag surface + `log_traps`).
+    #[cfg(all(nh_diag, feature = "log_traps"))]
     pub fn snapshot_sorted(&self) -> [(u32, u64); N] {
         let mut out = [(0u32, 0u64); N];
         for i in 0..N {
@@ -128,7 +129,7 @@ impl<const N: usize> TopK<N> {
         out
     }
 
-    #[cfg(feature = "log_traps")]
+    #[cfg(all(nh_diag, feature = "log_traps"))]
     pub fn reset(&mut self) {
         for i in 0..N {
             self.keys[i] = 0;

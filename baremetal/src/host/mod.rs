@@ -15,7 +15,5 @@ pub mod mailbox;
 pub mod platform;
 #[cfg(feature = "platform-raspi3b")]
 pub mod sd;
-#[cfg(feature = "platform-fvp-base")]
-pub mod tarmac;
 #[cfg(nh_input_mtouch)]
 pub mod usb;

@@ -29,6 +29,11 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub extern "C" fn kmain() -> ! {
     host::platform::init_cpu_sysregs();
     host::console::init();
+    // Register the halt-path console drain: `cpu::halt` parks with
+    // IRQs masked, so the DMA console ring must be drained by polling
+    // or the final context dump never reaches the wire. A hook rather
+    // than a direct call so `arch` keeps zero upward imports.
+    arch::cpu::set_halt_flush(host::console::flush_tx_dma_polled);
     print_banner();
     print_caps();
 

@@ -185,8 +185,10 @@ fn log_tx_byte(port: u8, byte: u8) {
 }
 
 /// Print the per-port dropped-PIO-TX-byte counts (ports 1-3). Called
-/// from diagnostic dumps so truncated output on the unmodeled ports is
-/// surfaced rather than lost.
+/// from `diag::task_dump` (its only consumer, hence the cfg) so
+/// truncated output on the unmodeled ports is surfaced rather than
+/// lost.
+#[cfg(nh_diag)]
 pub fn dump_dropped_tx() {
     for port in 1..4u8 {
         let n = DROPPED_TX[port as usize].load(Ordering::Relaxed);

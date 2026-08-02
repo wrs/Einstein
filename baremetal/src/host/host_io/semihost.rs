@@ -239,8 +239,8 @@ fn pump_input() {
             log_host_io!(
                 "host_io: pen kind={} x={} y={} p={}  vic.ictrl={:#010x} vic.ipres={:#010x}",
                 kind, x, y, pressure,
-                crate::peripherals::vic::int_ctrl_raw(),
-                crate::peripherals::vic::int_present_raw(),
+                crate::diag::vic_raw_summary().0,
+                crate::diag::vic_raw_summary().1,
             );
         }
         // ticks = 0 — Einstein's InsertSample tolerates this and the

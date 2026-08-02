@@ -567,7 +567,7 @@ pub(crate) fn handle_und(ctx: &mut TrapContext) {
             // Close any open tarmac window before the diagnostic
             // kprintln!'s below run, so they don't bloat the trace.
             #[cfg(feature = "platform-fvp-base")]
-            crate::host::tarmac::emit_stop();
+            crate::diag::tarmac::emit_stop();
             kprintln!(
                 "*** unrecognised UND: insn={:#010x} at PC={:#x} SPSR_und={:#x}",
                 insn, faulting_pc, spsr_und

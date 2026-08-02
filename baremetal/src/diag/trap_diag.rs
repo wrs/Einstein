@@ -1,5 +1,6 @@
-//! Diagnostics with behaviour: the heartbeat / TStack-invariant dump,
-//! the budgeted loggers, the loud-halt rendering, and `handle_diag`.
+//! Diagnostics with behaviour: the trap-progress beacon, the
+//! heartbeat / TStack-invariant dump, the budgeted loggers, the
+//! loud-halt rendering, and `handle_diag`.
 
 use crate::{arch::cpu, hv::guest_mem};
 use crate::arch::trap_context::{read_sysreg, TrapContext};
@@ -7,6 +8,27 @@ use crate::kprintln;
 use crate::hv::trap::UND_SAVE_SPSR_IPA;
 use crate::hv::trap::und::read_banked_spsr;
 use crate::hv::guest_mem::read_cstr_at;
+
+/// Budget-limited "progress beacon": print PC every 10k traps so we
+/// can see if the guest is making forward progress or looping in one
+/// place. Doesn't halt — lets boot continue. Called once per sync
+/// trap from `trap_sync_lower_aarch32`'s exit tail; also drives the
+/// FVP tarmac window-open check off the same counter.
+pub fn sync_trap_beacon() {
+    static mut TRAP_COUNTER: u64 = 0;
+    // SAFETY: single-threaded.
+    let n = unsafe { TRAP_COUNTER += 1; TRAP_COUNTER };
+    if n % 10_000 == 0 {
+        let elr = read_sysreg!("elr_el2");
+        let spsr = read_sysreg!("spsr_el2");
+        crate::log_traps!(
+            "beacon: {} traps, ELR={:#x} SPSR={:#x} int_present={:#x}",
+            n, elr, spsr, crate::peripherals::vic::int_present_raw()
+        );
+    }
+    #[cfg(feature = "platform-fvp-base")]
+    crate::diag::tarmac::maybe_emit_start(n);
+}
 
 
 /// Generic "inspect-then-halt" diagnostic HVC handler.

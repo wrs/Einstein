@@ -35,9 +35,10 @@
 #                 accessors (host renders/streams guest memory: pi_fb
 #                 scaling, pi_hdmi PCM reads). Nothing else crosses.
 #   diag        — diagnostics; reachable from anywhere via its stable
-#                 surface (real impls or no-op stubs). Any layer may
-#                 import diag; diag's own imports are unconstrained
-#                 until the phase-6 diag-layer split.
+#                 surface (real impls behind cfg(nh_diag), no-op stubs
+#                 otherwise — see src/diag/mod.rs). Any layer may
+#                 import diag; diag's own imports are unconstrained —
+#                 it sits atop every layer and renders their state.
 #
 # Allowed direction, low to high: arch ← hv ← newton. main.rs and
 # panic.rs wire everything together and may import all layers.
@@ -48,8 +49,8 @@
 # imports both match. Every hit must be covered by an entry in
 # scripts/layering-allowlist.txt (`<file-glob> <line-regex> # phase N`);
 # uncovered hits fail the lint, and so do stale allowlist entries that
-# no longer match anything — the allowlist may only shrink as phases
-# 5-7 remove the legacy edges.
+# no longer match anything — the allowlist may only shrink as phase 7
+# removes the remaining legacy edges.
 set -uo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -187,4 +188,4 @@ if [[ $violations -gt 0 || $stale -gt 0 ]]; then
     echo "check-layering: FAIL — $violations unlisted violation(s), $stale stale allowlist entr(y/ies)"
     exit 1
 fi
-echo "check-layering: OK — 0 unlisted violations ($allowed allowlisted legacy edges pending phases 5-7)"
+echo "check-layering: OK — 0 unlisted violations ($allowed allowlisted legacy edges pending phase 7)"

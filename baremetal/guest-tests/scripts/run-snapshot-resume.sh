@@ -63,7 +63,7 @@ else
     # guest's semihosting writes reach the host files; we pre-create all
     # four slots before run 1 so the save side has a mount to write to.
     NH_GUEST_TEST="$bin_abs" cargo build --release \
-        --no-default-features --features platform-fvp-base 2>&1 | tail -5
+        --no-default-features --features "platform-fvp-base diag" 2>&1 | tail -5
     elf=target/aarch64-unknown-none-softfloat/release/newton-hypervisor
     qemu_run() {
         scripts/fvp --timeout=300 "$elf" > "$1" 2>&1 || true

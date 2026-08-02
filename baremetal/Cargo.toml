@@ -11,7 +11,21 @@ name = "newton-hypervisor"
 path = "src/main.rs"
 
 [features]
-default = ["platform-raspi3b", "log_traps", "log_irqs", "log_host_io"]
+default = ["platform-raspi3b", "log_traps", "log_irqs", "log_host_io", "diag"]
+
+# Diagnostics layer (src/diag/): trap histograms, task/heap dumps, REP
+# output rendering, guest breakpoints, the ROM symbol tables backing
+# PC→name lookup (and, via `trace`, the tracer). ON by default and in
+# every `pi-bare-metal*` aggregate — real-hw debugging is the current
+# workflow, so the gate exists as a layer boundary, not a size trim.
+# With the feature off, `src/diag/mod.rs` swaps in no-op stubs with the
+# identical surface: loud halts still dump basic trap context and park
+# (correctness surface), but the kernel-aware rendering, histograms,
+# task dumps, REP decoding, guest breakpoints, and the ~743 KiB
+# symbol-table rodata drop out (build.rs also skips staging the symbol
+# blobs). build.rs emits `cfg(nh_diag)`; source never reads the feature
+# directly. Pulls in `newton-objects` (heap_check is its only consumer).
+diag = ["dep:newton-objects"]
 
 # Per-category log feature gates. The `default` set carries only the
 # low-volume "is it making progress / are IRQs flowing / is host I/O
@@ -172,14 +186,14 @@ no-semihost = []
 # host-fs-backed flash. host-io defaults to null already, so it's
 # omitted here. Build with:
 #   cargo build --release --no-default-features --features pi-bare-metal
-pi-bare-metal = ["platform-raspi3b", "no-semihost", "flash-persist-null"]
+pi-bare-metal = ["platform-raspi3b", "no-semihost", "flash-persist-null", "diag"]
 
 # Real-Pi build with persistent flash backed by the SD card's FAT32
 # boot partition. Identical to `pi-bare-metal` except the flash
 # backend is `sd` instead of `null`. Build:
 #   cargo build --release --no-default-features \
 #     --features pi-bare-metal-sd
-pi-bare-metal-sd = ["platform-raspi3b", "no-semihost", "flash-persist-sd"]
+pi-bare-metal-sd = ["platform-raspi3b", "no-semihost", "flash-persist-sd", "diag"]
 
 # Full real-Pi build: SD-backed flash + HDMI framebuffer output.
 # Newton boots and paints to a mini-HDMI monitor. Pen input is
@@ -189,6 +203,7 @@ pi-bare-metal-display = [
     "no-semihost",
     "flash-persist-sd",
     "host-io-pi-fb",
+    "diag",
 ]
 
 # Real-Pi build with full display + TSTP MTouch USB touch panel.
@@ -203,6 +218,7 @@ pi-bare-metal-input = [
     "host-io-pi-fb",
     "input-mtouch",
     "audio-pi-hdmi",
+    "diag",
 ]
 
 # Real-hardware SDHOST bring-up probe. When enabled, kmain stops
@@ -237,13 +253,14 @@ fb-probe = []
 # the slot issues `HVC #TRACE_TAG` (logging the name + r0..r3 at entry),
 # runs the original first instruction, then branches back. A function
 # called ten times produces ten trace lines. The symbol address/name
-# tables it consults are built by build.rs unconditionally (they also
-# back PC→name lookup in halt-path stack traces); this feature only
-# turns on the trampoline install in `tracer::init`. See the module doc
+# tables it consults are staged by build.rs whenever `diag` is on
+# (they also back PC→name lookup in halt-path stack traces); this
+# feature only turns on the trampoline install in `tracer::init`. See the module doc
 # in `src/tracer.rs`. Off by default because the install mutates many
 # ROM words, which changes the snapshot ROM fingerprint and forces a
-# cold boot.
-trace = []
+# cold boot. Requires `diag` for the symbol tables the trampoline
+# install consults.
+trace = ["diag"]
 
 # First-touch variant of `trace`: the main `trace SEQ PC NAME (mode)
 # r0..r3` line is emitted once per function per session, gated on a
@@ -286,7 +303,10 @@ quiet = []
 ns_trace = []
 
 [dependencies]
-newton-objects = { path = "newton-objects" }
+# NS Ref tag decoding for `diag::heap_check`'s pretty-printer — the
+# only consumer, so the dep is optional and pulled in by the `diag`
+# feature.
+newton-objects = { path = "newton-objects", optional = true }
 # FAT12/16/32 read+write for the Pi Zero 2 W's SD-card boot partition.
 # no_std, no_alloc, statically sized (defaults: 4 dirs / 4 files / 1
 # volume); see src/sd for the BCM2835 SDHOST block-device shim. Only

@@ -1,7 +1,8 @@
 //! Trap-frequency histograms for idle/wedge diagnostics.
 //!
 //! Three rolling counters reset after every periodic dump
-//! (`trap_irq` calls `dump_and_reset()` every ~2 s of wall time):
+//! (`trap_irq` calls `histogram_tick()`, whose pacing block dumps
+//! and resets every ~2 s of wall time):
 //!
 //! - **EC histogram** (64 atomic slots) — `ESR_EL2.EC` of every
 //!   guest sync trap. Tells you whether the rate is dominated by
@@ -169,11 +170,43 @@ pub fn record_fp_simd(elr_pc: u32) {
     unsafe { (*addr_of_mut!(FP_SIMD_PC)).record(elr_pc); }
 }
 
+/// Wall-clock-paced histogram dump: every ~2 s of wall time, print
+/// the trap-frequency window and reset it, so we can see what
+/// dominates the residual trap rate (EC class, HVC immediate, DABT
+/// PC/IPA). Called once per timer IRQ from `trap_irq`'s tail;
+/// independent of snapshot autosave (which is gated when guest_bp is
+/// live). The dump is gated on `log_traps`: a multi-line histogram
+/// every 2 s is valuable for Phase-B but noise on a real-hardware
+/// boot.
+pub fn histogram_tick() {
+    #[cfg(feature = "log_traps")]
+    {
+        static NEXT_DUMP_TICKS: AtomicU64 = AtomicU64::new(0);
+        let now: u64;
+        let freq: u64;
+        // SAFETY: sysreg reads, side-effect free.
+        unsafe {
+            core::arch::asm!("mrs {}, cntpct_el0", out(reg) now,
+                options(nomem, nostack, preserves_flags));
+            core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq,
+                options(nomem, nostack, preserves_flags));
+        }
+        let interval = freq.wrapping_mul(2);  // 2 seconds
+        let next = NEXT_DUMP_TICKS.load(Ordering::Relaxed);
+        if next == 0 {
+            NEXT_DUMP_TICKS.store(now.wrapping_add(interval), Ordering::Relaxed);
+        } else if now >= next {
+            dump_and_reset();
+            NEXT_DUMP_TICKS.store(now.wrapping_add(interval), Ordering::Relaxed);
+        }
+    }
+}
+
 /// Snapshot every counter, print the top entries, and zero everything
-/// so the next dump shows a fresh window. Only the `log_traps`
-/// histogram dump in `trap_irq` calls this.
+/// so the next dump shows a fresh window. Only `histogram_tick`'s
+/// pacing block calls this.
 #[cfg(feature = "log_traps")]
-pub fn dump_and_reset() {
+fn dump_and_reset() {
     if !is_warm() {
         // Still inside the warmup window — nothing to dump.
         return;

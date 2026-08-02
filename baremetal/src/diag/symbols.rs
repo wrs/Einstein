@@ -1,5 +1,5 @@
-//! ROM-symbol lookup, always available (independent of the `trace`
-//! feature gate around `mod tracer`).
+//! ROM-symbol lookup, available whenever the diag layer is compiled
+//! in (independent of the `trace` feature gate around `mod tracer`).
 //!
 //! `build.rs` reads `scripts/classify-out/code-symbols.txt` (the
 //! curated code-only address list) and `../_Data_/symbols.txt` (the
@@ -13,19 +13,21 @@
 //!   - `fn_names.bin`     — concatenated NUL-terminated names.
 //!
 //! The tracer (when its feature is on) and the task-dump stack
-//! walker (always on) both want PC → name lookups. This module is
-//! the shared backing.
+//! walker both want PC → name lookups. This module is the shared
+//! backing.
 //!
-//! ## Why the symbol blob ships in every image (diag-M6)
+//! ## Why the symbol blob ships in every `diag` image (diag-M6)
 //!
 //! These three `include_bytes!` constants are linked into rodata of
-//! *every* build, including real-hardware `pi-bare-metal-*` images
-//! where there is no host debugger and the only failure channel is a
-//! UART halt dump. That is deliberate: when the hypervisor loud-halts
-//! on hardware, `task_dump`'s stack walker turns raw return addresses
-//! into `name+0xNN` frames via `fn_name_for_pc`, which is the
-//! difference between an actionable backtrace and a column of bare
-//! hex. The bytes are worth it.
+//! every diag-carrying build — which by policy is every default build
+//! and every real-hardware `pi-bare-metal-*` image, where there is no
+//! host debugger and the only failure channel is a UART halt dump.
+//! That is deliberate: when the hypervisor loud-halts on hardware,
+//! `task_dump`'s stack walker turns raw return addresses into
+//! `name+0xNN` frames via `fn_name_for_pc`, which is the difference
+//! between an actionable backtrace and a column of bare hex. The
+//! bytes are worth it. (Only a `diag`-less build sheds them —
+//! build.rs skips staging the blobs entirely there.)
 //!
 //! Measured cost, `--no-default-features --features pi-bare-metal-input`
 //! (build.rs's `symbol table` line + the on-disk OUT_DIR blobs):

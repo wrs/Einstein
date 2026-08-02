@@ -8,7 +8,7 @@
 //! The PL011 itself is still brought up and exposed through
 //! `write_byte` for callers that must hit the real wire:
 //!
-//!   * `tarmac::emit_marker` — the FVP TarmacTrace plugin's UART-token
+//!   * `diag::tarmac::emit_marker` — the FVP TarmacTrace plugin's UART-token
 //!     window-gating watches PL011 byte stream for `<<TRM_START>>` /
 //!     `<<TRM_STOP>>`. Semihosting bytes aren't visible to the
 //!     plugin.
@@ -103,7 +103,7 @@ pub fn init_dma_tx() {
 
 /// Write a single byte to the PL011, busy-waiting until the TX FIFO has
 /// room. Reserved for callers that must produce bytes on the actual
-/// wire — `tarmac.rs::emit_marker` and the `GuestTestPrintByte` HVC.
+/// wire — `diag/tarmac.rs::emit_marker` and the `GuestTestPrintByte` HVC.
 /// Console output (`kprintln!`/`dprintln!`) goes through semihosting
 /// via `Writer` instead; routing it here would defeat the purpose of
 /// freeing PL011 for the guest's serial chip.

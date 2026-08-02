@@ -320,6 +320,18 @@ pub fn with_irqs_unmasked<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+/// Console-drain hook run at the top of `halt()`. Stored as a raw fn
+/// address (0 = unset) so `arch` needs no upward import: main.rs
+/// registers `host::console::flush_tx_dma_polled` here at boot.
+static HALT_FLUSH: AtomicUsize = AtomicUsize::new(0);
+
+/// Register the console-drain hook `halt()` runs before parking.
+pub fn set_halt_flush(f: fn()) {
+    HALT_FLUSH.store(f as usize, Ordering::Relaxed);
+}
+
 // NOTE: There is no `read_sp_abt()` helper. `MRS <Xt>, SP_abt`
 // (S3_4_C4_C1_1) is architecturally defined (DDI 0487 D19.2) but
 // QEMU raspi3b's Cortex-A53 model takes an EC=0 UNDEFINED trap at
@@ -335,14 +347,22 @@ pub fn with_irqs_unmasked<R>(f: impl FnOnce() -> R) -> R {
 /// Semihosting SYS_EXIT_EXTENDED (op 0x20): x1 → [reason, exit_code].
 /// Reason `0x20026` = ADP_Stopped_ApplicationExit.
 pub fn halt() -> ! {
-    // Drain the buffered DMA console before parking. halt() runs with
+    // Drain the buffered console before parking. halt() runs with
     // IRQs masked and never unmasks, so the UART TX completion IRQ
-    // that normally re-kicks the ring will never fire again — without
-    // an explicit polled drain, every "loud halt" context dump stays
-    // in the ring and the operator sees a silent freeze instead of
-    // the diagnostics (which is exactly how the 2026-06 splash-hang
-    // investigation started). No-op on non-DMA console builds.
-    crate::host::console::flush_tx_dma_polled();
+    // that normally re-kicks the DMA ring will never fire again —
+    // without an explicit polled drain, every "loud halt" context
+    // dump stays in the ring and the operator sees a silent freeze
+    // instead of the diagnostics (which is exactly how the 2026-06
+    // splash-hang investigation started). The drain is a hook
+    // registered by main.rs (`set_halt_flush`) so `arch` keeps zero
+    // upward imports; unset (pre-kmain, or a build with no DMA
+    // console) it is a no-op.
+    let flush = HALT_FLUSH.load(Ordering::Relaxed);
+    if flush != 0 {
+        // SAFETY: only `set_halt_flush` stores here, and it only
+        // stores a valid `fn()` address.
+        (unsafe { core::mem::transmute::<usize, fn()>(flush) })();
+    }
     // On `no-semihost` builds (real silicon) there is no semihosting
     // host listening for SYS_EXIT_EXTENDED; HLT would either NOP or
     // generate an unintended debug exception. Fall through directly to

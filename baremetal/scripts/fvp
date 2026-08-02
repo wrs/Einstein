@@ -25,7 +25,7 @@ FVP_BIN=/tmp/cca-stack/Base_RevC_AEMvA_pkg/models/Linux64_armv8l_GCC-9.3/FVP_Bas
 gdb=0
 tarmac=""
 # --tarmac-window enables the plugin but starts with tracing DISABLED.
-# The hypervisor's src/host/tarmac.rs emits `<<TRM_START>>` / `<<TRM_STOP>>`
+# The hypervisor's src/diag/tarmac.rs emits `<<TRM_START>>` / `<<TRM_STOP>>`
 # on UART; bp.pl011_uart0.toggle_mti toggles TarmacTrace on/off when
 # those tokens appear. Useful for capturing a focused slice around a
 # Phase B stall rather than a 10+ GiB full-boot trace.
@@ -183,7 +183,7 @@ fi
 
 # TarmacTrace with UART-token-gated windowing. Plugin is loaded but
 # tracing is OFF until the hypervisor emits `<<TRM_START>>` on UART0,
-# and resumes OFF again on `<<TRM_STOP>>`. Paired with src/host/tarmac.rs
+# and resumes OFF again on `<<TRM_STOP>>`. Paired with src/diag/tarmac.rs
 # which emits those markers around the stall site currently being
 # investigated.
 if [[ -n "$tarmac_window" ]]; then

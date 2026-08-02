@@ -44,7 +44,7 @@ pub(crate) fn handle_bootos_canary(ctx: &mut TrapContext) {
     // Close any open tarmac-window capture before further EL2 work runs
     // (the halt message itself would otherwise appear in the trace).
     #[cfg(feature = "platform-fvp-base")]
-    crate::host::tarmac::emit_stop();
+    crate::diag::tarmac::emit_stop();
     let spsr_el2 = read_sysreg!("spsr_el2") as u32;
     let elr_el2 = read_sysreg!("elr_el2");
     let mode = spsr_el2 & 0x1F;

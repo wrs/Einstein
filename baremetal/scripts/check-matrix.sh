@@ -41,7 +41,9 @@ fi
 # guest-test cfg the same way run-test.sh does.
 combos=(
     "default::cargo check --release"
-    "platform-fvp-base::cargo check --release --no-default-features --features \"platform-fvp-base quiet\""
+    "no-diag::cargo check --release --no-default-features --features \"platform-raspi3b log_traps log_irqs log_host_io\""
+    "platform-fvp-base::cargo check --release --no-default-features --features \"platform-fvp-base quiet diag\""
+    "fvp-no-diag::cargo check --release --no-default-features --features \"platform-fvp-base quiet\""
     "pi-bare-metal::cargo check --release --no-default-features --features pi-bare-metal"
     "pi-bare-metal-sd::cargo check --release --no-default-features --features pi-bare-metal-sd"
     "pi-bare-metal-display::cargo check --release --no-default-features --features pi-bare-metal-display"

@@ -121,7 +121,10 @@ pub fn guest_read_u8_pa(pa: u32) -> Option<u8> {
 }
 
 /// Read a single byte from a guest VA at the given Newton-side logical
-/// byte address. Walks stage-1 to find the PA, then delegates.
+/// byte address. Walks stage-1 to find the PA, then delegates. Sole
+/// consumer is `diag::rep_print`'s guest-format-string reader, hence
+/// the cfg.
+#[cfg(nh_diag)]
 pub fn guest_read_u8_va(va: u32) -> Option<u8> {
     let pa = guest_mem::translate_va(va).unwrap_or(va);
     guest_read_u8_pa(pa)

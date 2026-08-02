@@ -16,7 +16,7 @@
 //! Hook points for a windowed trace:
 //!   - START: either set `START_AT_TRAP` to a sync-trap count (the
 //!     `maybe_emit_start` path, called once per sync trap from
-//!     `trap_sync_lower_aarch32`), or call `emit_start()` from the
+//!     `trap_diag::sync_trap_beacon`), or call `emit_start()` from the
 //!     specific EL2 event you want the window to open on.
 //!   - STOP: `emit_stop()` is already wired into the halt paths
 //!     (`handle_und`'s unrecognised-UND halt and
@@ -42,8 +42,8 @@ const STOP_MARKER: &str = "<<TRM_STOP>>";
 static mut STARTED: bool = false;
 static mut STOPPED: bool = false;
 
-/// Called from `trap_sync_lower_aarch32` once per sync trap. Emits the
-/// start marker when `trap_counter` first reaches `START_AT_TRAP`.
+/// Called from `trap_diag::sync_trap_beacon` once per sync trap. Emits
+/// the start marker when `trap_counter` first reaches `START_AT_TRAP`.
 pub fn maybe_emit_start(trap_counter: u64) {
     if START_AT_TRAP == 0 {
         return;

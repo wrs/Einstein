@@ -30,6 +30,53 @@ pub fn sync_trap_beacon() {
     crate::diag::tarmac::maybe_emit_start(n);
 }
 
+/// Diagnostic heartbeat for the guest-path IRQ flow: sample guest PC
+/// so we can see where it's executing when no MMIO traps are firing.
+///
+/// Two-phase behaviour: the first `HB_FIRST_BUDGET` distinct PCs
+/// get logged unconditionally — useful while early boot is still
+/// walking new code. After that we switch to a "stuck detector":
+/// every `HB_LATE_STRIDE`-th IRQ we log the current PC+SPSR, so a
+/// guest that's wedged in an idle / alarm loop shows its actual
+/// steady-state PC rather than just the first time we saw it.
+pub fn irq_heartbeat(ctx: &TrapContext, intid: u32) {
+    static mut HB_LAST_PC: u64 = u64::MAX;
+    static mut HB_FIRST_BUDGET: usize = 16;
+    static mut HB_IRQ_COUNT: u64 = 0;
+    const HB_LATE_STRIDE: u64 = 64;
+    let elr = read_sysreg!("elr_el2");
+    // SAFETY: single-threaded.
+    let (should_log, tag) = unsafe {
+        HB_IRQ_COUNT += 1;
+        if HB_FIRST_BUDGET > 0 && elr != HB_LAST_PC {
+            HB_LAST_PC = elr;
+            HB_FIRST_BUDGET -= 1;
+            (true, "first")
+        } else if HB_IRQ_COUNT % HB_LATE_STRIDE == 0 {
+            (true, "late")
+        } else {
+            (false, "")
+        }
+    };
+    if should_log {
+        let spsr = read_sysreg!("spsr_el2");
+        let far = read_sysreg!("far_el1");
+        let hcr = read_sysreg!("hcr_el2");
+        let vi = (hcr >> 7) & 1;
+        let int_present = crate::peripherals::vic::int_present_raw();
+        let int_ctrl = crate::peripherals::vic::int_ctrl_raw();
+        let irq_pend = crate::peripherals::vic::irq_pending();
+        // SP_svc / LR_svc via the AArch64 GPR file per ARM ARM
+        // DDI 0487 D1.21.1 Table D1-79: R13_svc ↔ X19, R14_svc ↔ X18.
+        let sp_svc = ctx.x[19] as u32;
+        let lr_svc = ctx.x[18] as u32;
+        crate::log_irqs!(
+            "timer_irq[{}]: ELR={:#x} SPSR={:#x} SP_svc={:#x} LR_svc={:#x} FAR_EL1={:#x} intid={} VI={} ipres={:#x} ictrl={:#x} pend={}",
+            tag, elr, spsr, sp_svc, lr_svc, far, intid, vi, int_present, int_ctrl, irq_pend
+        );
+    }
+}
+
 
 /// Generic "inspect-then-halt" diagnostic HVC handler.
 ///

@@ -14,7 +14,8 @@
 //!              `gicv3::init` + `enable_ppi(INTID_CNTHP)`).
 //! See `crate::host::platform::install_cnthp_irq_routing`.
 
-use crate::{kprintln, peripherals::vic, host::platform};
+use crate::{kprintln, host::platform};
+use crate::hv::hooks::{ActiveGuest, GuestOs};
 
 /// CNTHP_CTL_EL2: ENABLE=1, IMASK=0 → timer fires an IRQ when
 /// CNTPCT_EL0 crosses CNTHP_CVAL_EL2.
@@ -129,18 +130,12 @@ pub fn on_irq(_cap: crate::arch::slim_isr::IrqCap) {
     // each rewrite site is tracked in PLAN.md.
     crate::hv::trap::cp15::invalidate_tlb();
 
-    // If the guest has made no sync-trap progress since the last
-    // heartbeat, push synthetic ticks past the next pending match so
-    // the deadline fires here instead of waiting for guest progress
-    // that won't come (WFI / long busy-wait). No-op when the guest is
-    // making progress.
-    // Heartbeat path bumps SYNTH_TICKS by Δ_heartbeat (so non-trapping
-    // busy-waits make progress) and fast-forwards past any pending
-    // match deadline if the guest is parked.
-    vic::heartbeat_tick_update();
-    // Republish ticks + poll match crossings.
-    crate::hv::stage2::tick_page::update_from_heartbeat();
-    // The match that woke us is now latched in vic::int_present; rearm
-    // for the next 16 ms heartbeat so we don't re-fire immediately.
+    // Guest-OS heartbeat body: advance the tick model for any guest
+    // parked in WFI / a non-trapping busy-wait, latch crossed matches,
+    // and republish the tick page. See the `on_heartbeat` hook impl.
+    ActiveGuest::on_heartbeat();
+    // The match that woke us is now latched in the guest interrupt
+    // model; rearm for the next 16 ms heartbeat so we don't re-fire
+    // immediately.
     rearm();
 }

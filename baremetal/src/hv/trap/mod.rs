@@ -8,8 +8,9 @@
 //! return — the vector trailer restores the context and ERETs. Handlers that
 //! don't want to resume never return (they call `cpu::halt`).
 
-use crate::{arch::cpu, kprintln, peripherals::{native_primitives, vic}, host::platform, hv::timer};
+use crate::{arch::cpu, kprintln, host::platform, hv::timer};
 use crate::arch::trap_context::{advance_elr, describe_ec, read_sysreg, TrapContext};
+use crate::hv::hooks::{ActiveGuest, GuestOs};
 
 mod dabt;
 pub(crate) mod hvc;
@@ -19,7 +20,6 @@ pub(crate) mod und;
 use dabt::{handle_data_abort, resolve_ipa};
 use cp15::handle_cp15_trap;
 use hvc::handle_hvc;
-pub(crate) use und::return_to_guest_from_und;
 use crate::hv::guest_endian::guest_read_u32_pa as read_guest_word_pa;
 
 const EC_UNKNOWN: u32 = 0x00;
@@ -77,40 +77,11 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
     // not the next), but the two are NOT a single sequence: the IRQ tail
     // additionally services the timer, DMA pumps, audio tick, heartbeat
     // sampling, autosave, and the histogram dump — work that must not run
-    // on every sync trap. They are kept separate by design and
-    // co-located here so the shared core stays visible.
-    //
-    // Drain any pen events from the host viewer before update_virq,
-    // so a freshly raised INT_TABLET gets reflected into HCR_EL2.VI
-    // on this trap exit instead of waiting for the next CNTHP
-    // heartbeat. Cheap: backend self-throttles to 16 ms wall.
-    crate::host::host_io::pump_input();
-    crate::host::input::pump();
-    // (audio used to be pumped here from the trap tail. With cyclic
-    // DMA driving MAI from a hardware-paced CB chain, audio refills
-    // happen from `audio::on_mai_dma_done` — the DMA
-    // period-completion IRQ — and from `schedule_output` when the
-    // kernel queues a new buffer. Liveness no longer depends on
-    // trap rate, which is something the rest of the hypervisor is
-    // trying to reduce.)
-
-    // Guest MMIO writes to IntCtrl / FIQMask / IntClear change the
-    // effective (`int_present & int_ctrl & ~fiq_mask`) pending set and
-    // must be reflected into HCR_EL2.VI / VF before ERET, or a cleared
-    // interrupt keeps re-firing (or an unmasked one never delivers).
-    update_virq();
-
-    // Refresh the non-trapping tick page on every sync-trap exit so the
-    // guest's tight delay loops (e.g. TSerialNumberROM::Init at 0x1dd8d0,
-    // bit-bang protocol with cmp-against-#20-tick deadlines) see a fresh
-    // tick value on the next read instead of spinning until the 16 ms
-    // CNTHP heartbeat fires. Without this each delay loop runs ~heartbeat
-    // wall time regardless of the requested delay, which on QEMU TCG (with
-    // tracer overhead amplifying per-trap wall) makes us run ~4x more
-    // delay-loop iterations than Einstein for the same kernel logic — and
-    // the resulting trace-count drift is what causes the heap-allocator
-    // divergence at TStackInfo::Init #12.
-    crate::hv::stage2::tick_page::update_from_sync_trap();
+    // on every sync trap. The behavior-bearing bodies (input pumps →
+    // update_virq → tick-page refresh here; the wider pump sequence in
+    // the IRQ path) live in the guest-OS hook impls so their ordering
+    // stays in one place per tail.
+    ActiveGuest::on_sync_trap_exit(ctx);
 
     // Trap-progress beacon + (FVP) tarmac window-open check — one
     // call per sync trap into the diag surface; stubbed to nothing
@@ -236,49 +207,9 @@ fn irq_from_guest(ctx: &mut TrapContext, cap: crate::arch::slim_isr::IrqCap) {
     platform::dispatch_dma_completions(cap);
 
     // Diagnostic heartbeat: sample guest PC so we can see where it's
-    // executing when no MMIO traps are firing.
-    //
-    // Two-phase behaviour: the first `HB_FIRST_BUDGET` distinct PCs
-    // get logged unconditionally — useful while early boot is still
-    // walking new code. After that we switch to a "stuck detector":
-    // every `HB_LATE_STRIDE`-th IRQ we log the current PC+SPSR, so a
-    // guest that's wedged in an idle / alarm loop shows its actual
-    // steady-state PC rather than just the first time we saw it.
-    static mut HB_LAST_PC: u64 = u64::MAX;
-    static mut HB_FIRST_BUDGET: usize = 16;
-    static mut HB_IRQ_COUNT: u64 = 0;
-    const HB_LATE_STRIDE: u64 = 64;
-    let elr = read_sysreg!("elr_el2");
-    // SAFETY: single-threaded.
-    let (should_log, tag) = unsafe {
-        HB_IRQ_COUNT += 1;
-        if HB_FIRST_BUDGET > 0 && elr != HB_LAST_PC {
-            HB_LAST_PC = elr;
-            HB_FIRST_BUDGET -= 1;
-            (true, "first")
-        } else if HB_IRQ_COUNT % HB_LATE_STRIDE == 0 {
-            (true, "late")
-        } else {
-            (false, "")
-        }
-    };
-    if should_log {
-        let spsr = read_sysreg!("spsr_el2");
-        let far = read_sysreg!("far_el1");
-        let hcr = read_sysreg!("hcr_el2");
-        let vi = (hcr >> 7) & 1;
-        let int_present = vic::int_present_raw();
-        let int_ctrl = vic::int_ctrl_raw();
-        let irq_pend = vic::irq_pending();
-        // SP_svc / LR_svc via the AArch64 GPR file per ARM ARM
-        // DDI 0487 D1.21.1 Table D1-79: R13_svc ↔ X19, R14_svc ↔ X18.
-        let sp_svc = ctx.x[19] as u32;
-        let lr_svc = ctx.x[18] as u32;
-        crate::log_irqs!(
-            "timer_irq[{}]: ELR={:#x} SPSR={:#x} SP_svc={:#x} LR_svc={:#x} FAR_EL1={:#x} intid={} VI={} ipres={:#x} ictrl={:#x} pend={}",
-            tag, elr, spsr, sp_svc, lr_svc, far, intid, vi, int_present, int_ctrl, irq_pend
-        );
-    }
+    // executing when no MMIO traps are firing. Lives in the diag layer
+    // (which may read the VIC model's raw state for log decoration).
+    crate::diag::trap_diag::irq_heartbeat(ctx, intid);
 
     // Periodic scheduler / run-queue dump. Cheap (64-iteration stride) and
     // gives forward-progress signal that's independent of the function
@@ -295,35 +226,10 @@ fn irq_from_guest(ctx: &mut TrapContext, cap: crate::arch::slim_isr::IrqCap) {
     if !spurious {
         timer::on_irq(cap);
     }
-    // Pump host PL011 -> guest extr-port RX DMA buffer. No-op when
-    // DMA ch0 is not armed. See peripherals/dma.rs::poll_rx.
-    crate::peripherals::dma::poll_rx();
-    // Continue any in-flight guest extr-port TX DMA past the per-call
-    // 4 KiB drain cap. No-op when DMA ch1 is not armed. See
-    // peripherals/dma.rs::poll_tx.
-    crate::peripherals::dma::poll_tx();
-    // Pump the host-io backend: drain any pen events the viewer
-    // posted, enqueue them, and raise INT_TABLET. Must run BEFORE
-    // update_virq so the IRQ it raises lands in HCR_EL2.VI on this
-    // trap exit, not the next one. `input::pump` is the parallel
-    // path for real-hw pen sources (USB touchscreen) — it feeds the
-    // same queue.
-    crate::host::host_io::pump_input();
-    crate::host::input::pump();
-    // Audio tick: the null backend fires armed buffer-completion IRQs
-    // here once a scheduled buffer's playback duration has elapsed,
-    // raising the kernel's sound-output interrupt mask. Must run
-    // BEFORE update_virq so a raised IRQ lands in HCR_EL2.VI on this
-    // trap exit. The pi_hdmi backend ignores this and completes from
-    // its own DMA-period IRQ (`audio::on_mai_dma_done`) instead.
-    crate::host::audio::tick();
-    update_virq();
-    // Advance the boot-splash progress bar (no-op once the guest's
-    // first blit has frozen the splash, and on platforms without
-    // pi_fb). Driven from the timer IRQ tail so the bar grows on a
-    // steady ~16 ms cadence regardless of trap-rate variation.
-    #[cfg(all(feature = "platform-raspi3b", nh_host_io_pi_fb))]
-    crate::host::display::splash::update_progress(crate::diag::trap_hist::sync_count());
+    // The behavior-bearing IRQ tail — extr-port DMA pumps, input
+    // pumps, audio tick, update_virq, splash progress — is
+    // order-sensitive and lives in the guest-OS hook impl.
+    ActiveGuest::on_irq_tail(ctx);
     // Wall-clock-paced snapshot save. Timer IRQ is a cleaner hook
     // than sync traps: it fires regardless of whether the guest is
     // making forward progress, so we keep rolling a fresh snapshot
@@ -342,11 +248,12 @@ fn irq_from_guest(ctx: &mut TrapContext, cap: crate::arch::slim_isr::IrqCap) {
     platform::irq_eoi(intid);
 }
 
-/// Set HCR_EL2.VI / VF according to whether the VIC has any enabled IRQ
-/// or FIQ pending. Sampled on every trap exit.
-fn update_virq() {
-    let irq = vic::irq_pending();
-    let fiq = vic::fiq_pending();
+/// Set HCR_EL2.VI / VF according to whether the guest's interrupt
+/// model has any enabled IRQ or FIQ pending (queried through the
+/// `virq_lines` hook). Sampled on every trap exit; also called from
+/// the hook impls' trap tails, hence pub(crate).
+pub(crate) fn update_virq() {
+    let (irq, fiq) = ActiveGuest::virq_lines();
     let mut hcr: u64;
     // SAFETY: sysreg access at EL2.
     unsafe {
@@ -548,16 +455,10 @@ pub const UND_SAVE_R2_IPA: u32 = HYP_TRAMP_SCRATCH_BASE + 0x14;
 pub const UND_SAVE_BANKED_LR_IPA: u32 = HYP_TRAMP_SCRATCH_BASE + 0x1C;
 
 /// FP / SIMD access trap from a lower EL (EC=0x07), routed to EL2 by
-/// CPTR_EL2.TFP. On Newton this is how native-primitive calls arrive:
-/// the guest executes `MCR p10, 0, Rd, cN, cM, {opc2}` and Einstein's
-/// convention is that the CPU register Rd holds the "native call code"
-/// (driver ID << 8 | sub-function). We decode the faulting instruction
-/// from guest memory, read the named register, and hand it to
-/// peripherals::native_primitives::execute.
-///
-/// MRC reads from CP10/CP11 (and any other FP/SIMD shape we don't
-/// expect from Newton OS) halt loudly — extend the handler when a
-/// ROM boot trips one.
+/// CPTR_EL2.TFP. On Newton this is how native-primitive calls arrive
+/// (the `MCR p10` native-call convention). We fetch the faulting
+/// instruction from guest memory and hand the decode + dispatch to the
+/// `handle_native_call` hook.
 fn handle_fp_simd(ctx: &mut TrapContext, _iss: u32) {
     let elr = read_sysreg!("elr_el2") as u32;
     crate::diag::trap_hist::record_fp_simd(elr);
@@ -572,50 +473,7 @@ fn handle_fp_simd(ctx: &mut TrapContext, _iss: u32) {
         }
     };
 
-    // Decode ARMv7 MCR / MRC (load/store to coprocessor, single
-    // register). Encoding: cond 1110 opc1 L CRn Rd coproc opc2 1 CRm
-    // Mask for (MCR or MRC) with bit 4 = 1 and the fixed 1110 prefix
-    // is (insn & 0x0F00_0010) == 0x0E00_0010.
-    let is_mcr_mrc = (insn & 0x0F00_0010) == 0x0E00_0010;
-    let cop = (insn >> 8) & 0xF;
-    let l_bit = (insn >> 20) & 1; // 0 = MCR, 1 = MRC
-
-    if !(is_mcr_mrc && (cop == 10 || cop == 11)) {
-        kprintln!(
-            "*** fp_simd trap on unexpected instruction {:#010x} @PC={:#x}, halting",
-            insn, elr
-        );
-        cpu::halt();
-    }
-
-    let rd = ((insn >> 12) & 0xF) as usize;
-    let crn = (insn >> 16) & 0xF;
-    let crm = insn & 0xF;
-    let opc1 = (insn >> 21) & 0x7;
-    let opc2 = (insn >> 5) & 0x7;
-
-    if l_bit != 0 {
-        kprintln!(
-            "*** MRC from CP{} not supported: insn={:#010x} @PC={:#x} (opc1={} Rd=r{} CRn=c{} CRm=c{} opc2={})",
-            cop, insn, elr, opc1, rd, crn, crm, opc2
-        );
-        cpu::halt();
-    }
-
-    // Einstein's NativeCoprocRegisterTransfer reads CPU register Rd as
-    // the "native call" code. ARMv4 MCR with Rd=PC reads PC+12, but
-    // the Newton kernel never uses PC there; flag it if we ever see
-    // one so we can match Einstein's quirk.
-    if rd == 15 {
-        kprintln!(
-            "*** MCR p{}: Rd=PC is an Einstein quirk (mCurrentRegisters[15]+4); halting to investigate",
-            cop
-        );
-        cpu::halt();
-    }
-
-    let native_insn = ctx.x[rd] as u32;
-    native_primitives::execute(ctx, native_insn, elr);
+    ActiveGuest::handle_native_call(ctx, insn, elr);
 
     advance_elr(4);
 }

@@ -210,7 +210,7 @@ unsafe fn set_l2_blocks(ipa_base: u64, host_pa_base: u64, count: u64, attrs: u64
 }
 
 /// Build stage-2 tables reflecting the Newton memory map, program VTCR_EL2
-/// and VTTBR_EL2. Must be called after `guest_mem::load_rom` so the backing
+/// and VTTBR_EL2. Must be called after `newton::loader::load_rom` so the backing
 /// stores are ready, and before stage2::enable().
 /// Boot-time consistency check across the region manifest and the three
 /// subsystems that consume it. Const evaluation already enforces 4 KiB
@@ -304,7 +304,7 @@ pub unsafe fn init() {
     // scratch pool used by inline stubs (e.g. `unaligned_inline`) and
     // the UND/DABT trampolines' banked-register save area. Stage-2 maps
     // it to `shadow_stub::SCRATCH_POOL`; stage-1 (kernel L1[0x60]) is
-    // populated separately by `guest_mem::install_scratch_pool_l1_section`
+    // populated separately by `newton::os`'s scratch-pool L1 installer
     // on the first M=0→M=1 transition.
     // SAFETY: helper installs L3 entries and points L2[0xC] at the L3.
     unsafe { install_scratch_pool(); }
@@ -392,11 +392,10 @@ unsafe fn install_ram_l3() {
 /// handle_data_abort → mmio:: like before, so peripherals outside this
 /// one page keep their trap-based register model.
 unsafe fn install_tick_page() {
-    // Seed the page with the "current" ticks() value so any read before
-    // the first timer IRQ returns something non-zero-but-consistent.
-    // Calendar / alarm offsets stay zero-initialised, which matches the
-    // values `vic::read` returns for those registers today.
-    tick_page::update_from_sync_trap();
+    // (The initial tick/calendar seed — so any read before the first
+    // timer IRQ returns something non-zero-but-consistent — is done
+    // from main.rs via `newton::os::seed_tick_page` right after
+    // stage-2 comes up; the guest cannot run before that point.)
 
     // L2 index for the 2 MiB block containing the tick page.
     let l2_index = (layout::TICK_PAGE_IPA / TWO_MIB) as usize; // = 0x78 (120) for 0x0F000000
@@ -476,35 +475,18 @@ unsafe fn install_scratch_pool() {
     );
 }
 
-/// Writer-side helpers for `TICK_PAGE`. Invoked from the CNTHP IRQ
-/// handler so the guest's non-trapping reads observe a monotonically
-/// advancing tick value in lockstep with EL2 wall-clock heartbeats.
+/// Writer side of `TICK_PAGE` — the table mechanics only. The guest-OS
+/// tick model (synthetic-tick advance, match/alarm polling, and the
+/// choice of published values) lives in `newton::os`; both the
+/// sync-trap-exit and heartbeat hook paths end by calling [`tick_page::publish`]
+/// with the values the guest should observe.
 pub mod tick_page {
     use super::*;
 
-    /// Sync-trap path: advance synthetic ticks, poll match crossings,
-    /// and republish the non-trapping tick / calendar registers.
-    /// Called from `trap_sync_lower_aarch32` after every guest sync
-    /// trap. The `tick_advance` here is what makes the tick rate track
-    /// guest progress rather than wall clock — see
-    /// `vic::SYNTH_TICKS`.
-    pub fn update_from_sync_trap() {
-        crate::peripherals::vic::tick_advance_sync_trap();
-        publish();
-    }
-    /// Heartbeat path: do NOT advance ticks ourselves (so the heartbeat
-    /// can detect "no guest progress" by SYNTH_TICKS being unchanged).
-    /// Just poll matches and republish. Forward-progress fast-forward
-    /// is handled in `vic::heartbeat_forward_progress`, called from
-    /// `timer::on_irq` before this.
-    pub fn update_from_heartbeat() {
-        publish();
-    }
-    fn publish() {
-        crate::peripherals::vic::poll_timer_matches();
-        crate::peripherals::vic::poll_alarm();
-        let ticks = crate::peripherals::vic::ticks();
-        let calendar = crate::peripherals::vic::calendar_seconds();
+    /// Lay the given tick + calendar values into the non-trapping tick
+    /// page and push them to the Point of Coherency so the guest's
+    /// reads observe them.
+    pub fn publish(ticks: u32, calendar: u32) {
         // The kernel reads these words via LDR with CPSR.E=1 (BE-8),
         // so the host bytes must be the BE encoding of the numerical
         // value. A native LE u32 write of `value.swap_bytes()` lays

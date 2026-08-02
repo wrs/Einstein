@@ -1,15 +1,12 @@
 //! HVC (EC=0x12) tag dispatch: the guest-test ABI, the ROM-probe
 //! immediates, and the diagnostic / breakpoint tags.
 
-use crate::{arch::cpu, hv::hvc_imm::HvcImm, peripherals::vic};
+use crate::{arch::cpu, hv::hvc_imm::HvcImm};
 use crate::arch::trap_context::{read_sysreg, TrapContext};
 use crate::kprintln;
-use super::dabt::handle_dabt_dispatch;
 use crate::diag::trap_diag::{handle_diag, handle_loud_halt, handle_unhandled_exception};
+use crate::hv::hooks::{ActiveGuest, GuestOs};
 use super::und::handle_und;
-use crate::newton::probes::{ThunkKind, handle_bootos_canary, handle_dah_mrs_spsr_patch, handle_hammer_print, handle_hammer_thunk, handle_remember_swiret_probe};
-#[cfg(feature = "log_store")]
-use crate::newton::probes::{handle_load_perm_obj_ret_probe, handle_store_perm_obj_entry_probe};
 use crate::hv::guest_mem::log_guest_string;
 
 
@@ -144,52 +141,11 @@ pub(crate) fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
         v if v == HvcImm::LoudHalt as u32 => {
             handle_loud_halt(ctx);
         }
-        v if v == HvcImm::BootOs as u32 => {
-            handle_bootos_canary(ctx);
-        }
-        v if v == HvcImm::RememberSwiret as u32 => {
-            handle_remember_swiret_probe(ctx);
-        }
-        v if v == HvcImm::DahMrsSpsr as u32 => {
-            handle_dah_mrs_spsr_patch(ctx);
-        }
-        #[cfg(feature = "log_store")]
-        v if v == HvcImm::StorePermObjEntry as u32 => {
-            handle_store_perm_obj_entry_probe(ctx);
-            // Emulate the patched-out `mov ip, sp` (R12 = SP for
-            // the source AArch32 mode). HVC entry already advanced
-            // ELR_EL2 past the trap, so no ELR adjustment needed.
-            let spsr_el2 = read_sysreg!("spsr_el2") as u32;
-            ctx.x[12] = crate::arch::banked::sp_for_mode(ctx, spsr_el2) as u64;
-        }
-        #[cfg(feature = "log_store")]
-        v if v == HvcImm::LoadPermObjRet as u32 => {
-            handle_load_perm_obj_ret_probe(ctx);
-            // Emulate the patched-out `mov r0, r4`. R0/R4 are not
-            // banked across modes, so a direct GPR copy is correct
-            // regardless of source mode.
-            ctx.x[0] = ctx.x[4];
-        }
         v if v == HvcImm::UnhandledException as u32 => {
             handle_unhandled_exception(ctx, false);
         }
         v if v == HvcImm::UnhandledNumException as u32 => {
             handle_unhandled_exception(ctx, true);
-        }
-        v if v == HvcImm::HammerPrint as u32 => {
-            handle_hammer_print(ctx);
-        }
-        v if v == HvcImm::HammerPutc as u32 => {
-            handle_hammer_thunk(ctx, ThunkKind::Putc);
-        }
-        v if v == HvcImm::HammerFlush as u32 => {
-            handle_hammer_thunk(ctx, ThunkKind::Flush);
-        }
-        v if v == HvcImm::HammerStackTrace as u32 => {
-            handle_hammer_thunk(ctx, ThunkKind::StackTrace);
-        }
-        v if v == HvcImm::HammerExceptionNotify as u32 => {
-            handle_hammer_thunk(ctx, ThunkKind::ExceptionNotify);
         }
         v if v == HvcImm::Und as u32 => {
             handle_und(ctx);
@@ -198,13 +154,10 @@ pub(crate) fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
             handle_diag(ctx);
         }
         v if v == HvcImm::DabtDispatch as u32 => {
-            handle_dabt_dispatch(ctx);
+            ActiveGuest::handle_dabt_dispatch(ctx);
         }
         v if v == HvcImm::Align as u32 => {
-            crate::newton::unaligned::handle_align_fault(ctx);
-        }
-        v if v == HvcImm::GpioTrigger as u32 => {
-            vic::raise(vic::INT_GPIO);
+            ActiveGuest::handle_align_fault(ctx);
         }
         #[cfg(nh_guest_test)]
         v if v == HvcImm::GuestTestRepRender as u32 => {
@@ -248,10 +201,15 @@ pub(crate) fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
             crate::diag::tracer::handle_trace_hvc(ctx);
         }
         _ => {
-            let elr = read_sysreg!("elr_el2");
-            kprintln!();
-            kprintln!("*** unknown HVC #{:#x} at ELR={:#x} (halting)", imm, elr);
-            cpu::halt();
+            // ROM-probe tags (probe bodies, Hammer thunks, GPIO test
+            // trigger) are guest-OS-specific — consult the hook before
+            // declaring the immediate unknown.
+            if !ActiveGuest::handle_hvc_probe(ctx, imm) {
+                let elr = read_sysreg!("elr_el2");
+                kprintln!();
+                kprintln!("*** unknown HVC #{:#x} at ELR={:#x} (halting)", imm, elr);
+                cpu::halt();
+            }
         }
     }
     // No ELR advance needed: HVC entry sets ELR_EL2 to the PC of the

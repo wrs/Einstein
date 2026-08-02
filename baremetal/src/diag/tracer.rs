@@ -266,7 +266,7 @@ fn rewrite_first_insn(orig: u32, orig_pc: u32) -> Option<(u32, u32)> {
 }
 
 /// Install trampolines for every function in the embedded table.
-/// Called exactly once, at ROM load time (from `guest_mem::load_newton_rom`
+/// Called exactly once, at ROM load time (from `newton::loader::load_newton_rom`
 /// after all other ROM patches have been applied). Idempotent.
 pub fn init() {
     // SAFETY: single-threaded at boot; `INITIALISED` is only consulted/set here.

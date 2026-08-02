@@ -185,7 +185,7 @@ unsafe fn eret_to_guest(entry_ipa: u64) -> ! {
         configure_el2_traps();
         zero_el1_guest_state();
 
-        // Point-of-unification sync. `guest_mem::load_rom` /
+        // Point-of-unification sync. `newton::loader::load_rom` /
         // `load_guest_test` wrote instruction bytes into Normal-WB DRAM
         // through the data-cache path; the guest's first fetch comes
         // through the I-cache. Without a DSB+IC+ISB the guest can fetch

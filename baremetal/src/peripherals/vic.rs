@@ -16,7 +16,32 @@
 //!   crossed bit(s) into `int_present`, so the next `update_virq` sets VI.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+/// Match-deadline rearm sink, installed by `main.rs` boot wiring
+/// (`hv::timer::rearm`) so this guest model stays free of hv imports.
+/// Raw fn pointer, 0 = uninstalled — [`match_rearm`] halts loudly on
+/// use before wiring (a guest match-register write cannot happen
+/// before the boot wiring runs).
+static MATCH_REARM: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the match-deadline rearm sink. Called once from `main.rs`.
+pub fn install_match_rearm(sink: fn()) {
+    MATCH_REARM.store(sink as usize, Ordering::Release);
+}
+
+fn match_rearm() -> fn() {
+    let raw = MATCH_REARM.load(Ordering::Acquire);
+    if raw == 0 {
+        crate::kprintln!(
+            "*** vic: no match-rearm sink — main.rs must install_match_rearm() before use ***"
+        );
+        crate::arch::cpu::halt();
+    }
+    // SAFETY: the only writer is install_match_rearm, which stores a
+    // valid `fn()`; 0 is filtered above.
+    unsafe { core::mem::transmute(raw) }
+}
 
 // ---------- Newton tick clock (3.6864 MHz). ----------------------------------
 
@@ -204,11 +229,9 @@ fn init_calendar() {
         .wrapping_sub(RTC_HOST_TIME_OFFSET_SECONDS);
     CALENDAR_SECONDS_AT_BOOT.store(secs_since_1904, Ordering::Release);
     CALENDAR_CNTPCT_BASELINE.store(read_cntpct(), Ordering::Release);
-    // Re-publish the tick page now that calendar_seconds() returns a
-    // real value — `stage2::init` already called
-    // `tick_page::update_from_sync_trap` once before this, while the
-    // baseline was still zero.
-    crate::hv::stage2::tick_page::update_from_sync_trap();
+    // (main.rs re-seeds the tick page right after `vic::init` returns,
+    // so the page picks up the real calendar_seconds() value — the
+    // earlier post-stage-2 seed ran while the baseline was still zero.)
     crate::kprintln!(
         "vic: calendar = {} seconds since 1904-01-01 (host unix_time={}, offset={}s back)",
         secs_since_1904, unix_time, RTC_HOST_TIME_OFFSET_SECONDS
@@ -569,7 +592,7 @@ pub fn ticks() -> u32 {
 }
 
 /// Bump SYNTH_TICKS by the sync-trap delta. Called from
-/// `stage2::tick_page::update_from_sync_trap` (= every guest sync trap
+/// the sync-trap-exit tick-page update in `newton::os` (= every guest sync trap
 /// via `trap_sync_lower_aarch32`).
 pub fn tick_advance_sync_trap() -> u32 {
     let prev = SYNTH_TICKS.fetch_add(TICK_ADVANCE_PER_TRAP, Ordering::AcqRel);
@@ -613,7 +636,7 @@ pub fn tick_advance_heartbeat() -> u32 {
 /// On real silicon (`no-semihost`) `ticks()` is wall-anchored, so
 /// match deadlines are crossed naturally by CNTPCT advancing; the
 /// fast-forward is moot. The matching
-/// `tick_page::update_from_heartbeat` call republishes the current
+/// heartbeat tick-page republish in `newton::os` publishes the current
 /// wall-anchored `ticks()` into the guest's read-only tick page.
 pub fn heartbeat_tick_update() {
     #[cfg(feature = "no-semihost")]
@@ -876,8 +899,9 @@ fn write(ipa: u64, value: u32) {
     }
     if match_reprogrammed {
         // A match register changed — recompute the nearest deadline and
-        // reprogram CNTHP_CVAL_EL2 so the async timer path delivers.
-        crate::hv::timer::rearm();
+        // reprogram CNTHP_CVAL_EL2 (via the installed `hv::timer::rearm`
+        // sink) so the async timer path delivers.
+        (match_rearm())();
     }
 }
 

@@ -235,6 +235,10 @@ pub mod trap_diag {
 
     #[inline(always)]
     pub fn sync_trap_beacon() {}
+
+    /// Stub: no IRQ-heartbeat PC sampling without `diag`.
+    #[inline(always)]
+    pub fn irq_heartbeat(_ctx: &TrapContext, _intid: u32) {}
 }
 
 #[cfg(not(nh_diag))]

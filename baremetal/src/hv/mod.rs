@@ -5,6 +5,7 @@ pub mod be8;
 pub mod guest;
 pub mod guest_endian;
 pub mod guest_mem;
+pub mod hooks;
 pub mod hvc_imm;
 pub mod layout;
 pub mod mmio;

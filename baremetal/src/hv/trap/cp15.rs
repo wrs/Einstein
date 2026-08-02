@@ -1,8 +1,9 @@
 //! CP15 (EC=0x03) trap handling: the SCTLR / TLBI / cache-op shim, the
 //! `cp15` accessor sub-module, and the flash-checksum reseed hook.
 
-use crate::{arch::cpu, hv::guest_mem};
+use crate::arch::cpu;
 use crate::diag::diag_util::SeenSet;
+use crate::hv::hooks::GuestOs;
 use crate::arch::trap_context::{advance_elr, read_sysreg, TrapContext};
 use crate::kprintln;
 use core::ptr::addr_of_mut;
@@ -132,18 +133,10 @@ pub(crate) fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
             let prev_sctlr = cp15::read_sctlr_el1() as u32;
             let was_off = (prev_sctlr & 1) == 0;
             let now_on = (value & 1) != 0;
-            // Force SCTLR.A=1 on the guest so unaligned LDR/STR raises
-            // an alignment fault at EL1. The DABT-vector trampoline
-            // routes alignment faults to unaligned::handle_align_fault.
-            //
-            // Under BE-8 also force EE (bit 25) and E0E (bit 24) so the
-            // kernel's SCTLR writes (which never set EE) don't drop us
-            // back into LE data mode mid-boot. Guest-test builds keep
-            // the kernel's value verbatim so LE flat-binary tests work.
-            #[cfg(not(nh_guest_test))]
-            let value_with_a = value | 0x2 | (1u32 << 25) | (1u32 << 24);
-            #[cfg(nh_guest_test)]
-            let value_with_a = value | 0x2;
+            // Guest-OS massage (Newton forces A|EE|E0E, guest-test
+            // forces A — see the hook impl) before the value reaches
+            // hardware.
+            let value_with_a = crate::hv::hooks::ActiveGuest::massage_sctlr(value);
             cp15::write_sctlr_el1(value_with_a as u64);
             // One-time cross-check: read SCTLR back to verify the A-bit
             // stuck on the first guest SCTLR write.
@@ -159,66 +152,22 @@ pub(crate) fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
             }
             log_sctlr_write(value);
             if was_off && now_on {
-                // Drop HCR_EL2.DC. While the guest ran with stage-1
-                // off, DC=1 gave its data accesses Normal-WB semantics
-                // so they hit the same cache lines the hypervisor
-                // writes. But DC=1 also suppresses the guest's stage-1
-                // translation from EL2's side (DDI 0487 D13.2.50):
-                // leaving it set past this point means every non-
-                // identity VA → IPA mapping the guest sets up (the
-                // UND trampoline's save slot being the first one we
-                // hit) falls through as VA=IPA and stage-2-faults.
-                crate::hv::guest::set_dc_for_stage1_off(false);
-                // The XN-rewrite walks RAM[0..0x4000] interpreting it
-                // as the L1 table — that's correct only when the
-                // guest's TTBR0 actually points there. Guest tests
-                // that pick a different L1 base (e.g. their own table
-                // at 0x04004000) would otherwise have RAM[0..0x4000]
-                // (stack / scratch) corrupted by the walker. Gate on
-                // the live TTBR0 value.
-                if (cp15::read_ttbr0_el1() as u32 & 0xFFFF_C000) == 0x0400_0000 {
-                    let rom_dirty = guest_mem::fix_stage1_xn_bits();
-                    guest_mem::install_scratch_pool_l1_section();
-                    if rom_dirty {
-                        reseed_flash_checksums_if_needed();
-                    }
-                }
-                // No cache maintenance here: the TTBR0 write handler
-                // below OR's Inner/Outer-WB cacheability bits into
-                // every guest TTBR0 write, so stage-1 walks share the
-                // D-cache view of the producer (kernel's own page-
-                // table writes, and our in-place rewrites in
-                // fix_stage1_xn_bits). Producer + walker matched-
-                // attributes keeps them coherent per ARM ARM §B2.8
-                // without any DC CVAC burst. See the comment block at
-                // the (0, 2, 0, 0) CP15-write case for the full
-                // rationale.
-                maybe_dump_l1_once();
-                // Swap the UND trampoline's save-slot literal to the
-                // kernel VA that L1[0xC0] maps to the RAM slot. Done
-                // outside `enable_patches()` so a soft-reboot that
-                // cycles M=1→0→1 re-applies the swap (the tracer
-                // gates its UDF install on a one-shot flag, but the
-                // literal needs to track every MMU transition).
-                // SAFETY: single-word ROM-backing write under the
-                // paused-guest invariant.
-                unsafe { crate::newton::guest_trampolines::install_und_vector_swap_post_mmu(); }
+                // Stage-1 MMU rising edge: the DC drop, stage-1 table
+                // normalisation, checksum reseed, and UND-vector
+                // literal swap are guest-OS ritual — see the hook impl.
+                crate::hv::hooks::ActiveGuest::on_stage1_mmu_enable(
+                    ctx,
+                    cp15::read_ttbr0_el1() as u32,
+                );
             }
             // M=1→M=0: the guest is turning its stage-1 MMU off
-            // (typically the SWIBoot→ROMBoot soft-reset path). Revert
-            // the UND trampoline's save-slot literal to the pre-MMU
-            // RAM IPA so any UND taken before MMU re-enable lands in
-            // a stage-2-mapped IPA. Without this, the first trace-UDF
-            // after a soft reboot stores to VA 0x0C00_4F0C with MMU
-            // off, which faults at an unmapped IPA.
+            // (typically the SWIBoot→ROMBoot soft-reset path). The
+            // hook re-enables HCR_EL2.DC and reverts the UND
+            // trampoline's save-slot literal to the pre-MMU RAM IPA so
+            // any UND taken before MMU re-enable lands in a
+            // stage-2-mapped IPA.
             if !was_off && !now_on {
-                // Soft reboot: the guest turned its stage-1 MMU off.
-                // Re-enable HCR_EL2.DC so data accesses stay Normal-WB
-                // cacheable while we're back in the "MMU off" regime.
-                crate::hv::guest::set_dc_for_stage1_off(true);
-                // SAFETY: single-word ROM-backing write under the
-                // same paused-guest invariant as the original patch.
-                unsafe { crate::newton::guest_trampolines::install_und_vector_swap_pre_mmu(); }
+                crate::hv::hooks::ActiveGuest::on_stage1_mmu_disable(ctx);
             }
         }
         (0, 2, 0, 0, false) => {
@@ -286,23 +235,9 @@ pub(crate) fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
             }
             let value = raw | TTBR_WB_WA;
             cp15::write_ttbr0_el1(value as u64);
-            // First TTBR write locks in the guest's stage-1 table
-            // location. Walk it once and normalise the XN / SBZ bits
-            // before the guest turns stage-1 on.
-            static mut TTBR_FIXED: bool = false;
-            // SAFETY: single-threaded.
-            let already = unsafe {
-                let v = TTBR_FIXED;
-                TTBR_FIXED = true;
-                v
-            };
-            if !already && (raw & 0xFFFF_C000) == 0x0400_0000 {
-                let rom_dirty = guest_mem::fix_stage1_xn_bits();
-                guest_mem::install_scratch_pool_l1_section();
-                if rom_dirty {
-                    reseed_flash_checksums_if_needed();
-                }
-            }
+            // First-write stage-1 table normalisation (+ checksum
+            // reseed) is guest-OS ritual — see the hook impl.
+            crate::hv::hooks::ActiveGuest::on_stage1_ttbr0_write(raw);
         }
         (0, 3, 0, 0, false) => cp15::write_dacr32(ctx.x[rt]),
         (0, 5, 0, 0, false) => {
@@ -382,44 +317,6 @@ fn log_sctlr_write(value: u32) {
         );
         kprintln!("   SCTLR_EL1 after write = {:#018x}", sctlr_now);
     }
-}
-
-fn maybe_dump_l1_once() {
-    #[cfg(feature = "log_mmu")]
-    {
-        static mut L1_DUMPS: usize = 0;
-        // SAFETY: single-threaded.
-        let n = unsafe { let v = L1_DUMPS; L1_DUMPS += 1; v };
-        if n < 10 {
-            guest_mem::dump_guest_l1_table();
-        }
-    }
-}
-
-/// Re-seed the flash ROM/REx checksums after `fix_stage1_xn_bits` has
-/// modified ROM-resident L2 page tables. The original boot-time seed
-/// (in main.rs) computed checksums over the unpatched ROM bytes; once
-/// the kernel writes TTBR0 we walk its L1 table, find L2 tables that
-/// live in ROM, and rewrite them in place to ARMv7-compatible form
-/// (XN/AP/CB normalisation). That mutation invalidates the seeded
-/// checksums — the kernel then sees flash[0x64..0x8C] mismatch its own
-/// runtime CalculateROMREXCheckSums result and takes the heavyweight
-/// `UpdateBlock0FromBlock1 → erase → rewrite` recovery path, which
-/// diverges heap state and feeds the downstream "newt" UnhandledException.
-/// Re-running the seed function recomputes over the post-mutation ROM
-/// and overwrites flash[0x64..0x8C] so the kernel's later comparison
-/// passes. Idempotent: subsequent calls (the kernel re-enables MMU on
-/// every task switch) recompute the same value.
-fn reseed_flash_checksums_if_needed() {
-    // Idempotent: each call recomputes from the current ROM bytes and
-    // writes flash[0x64..0x8C]. Subsequent calls (the kernel re-enables
-    // MMU on every task switch) recompute, and any further L2-table
-    // mutations in ROM get reflected before the kernel reaches the
-    // checksum comparison in TReservedBlockAccessor::CheckIfRecoveryIsNeeded.
-    crate::peripherals::flash::seed_rom_rex_checksums(
-        guest_mem::rom_host_pa() as *const u32,
-        guest_mem::ROM_SIZE,
-    );
 }
 
 fn halt_unknown_cp15(is_read: bool, opc1: u32, crn: u32, crm: u32, opc2: u32, rt: usize, ctx: &TrapContext) -> ! {

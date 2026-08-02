@@ -14,10 +14,16 @@ use guest_mem::{read_byte_pa as read_guest_byte_pa,
 use super::{UND_SAVE_BANKED_LR_IPA, UND_SAVE_LR_IPA, UND_SAVE_R0_IPA, UND_SAVE_R1_IPA, UND_SAVE_SPSR_IPA};
 use super::cp15::{self, log_cp15_deprecated_cache_all, log_cp15_strongarm_clock};
 use crate::diag::trap_diag::{handle_loud_halt, handle_unhandled_exception};
-use crate::newton::probes::{ThunkKind, handle_bootos_canary, handle_hammer_print_with, handle_hammer_thunk, handle_remember_swiret_probe};
-#[cfg(feature = "log_store")]
-use crate::newton::probes::{handle_load_perm_obj_ret_probe, handle_store_perm_obj_entry_probe};
+use crate::hv::hooks::{ActiveGuest, GuestOs, UndHvcOutcome};
 use guest_mem::{resolve_guest_pa, scan_to_null_word_aligned};
+
+/// UND-path guest resume through the guest-OS UND-return stub. The
+/// staging mechanics (literal write + I-cache publish into the stub
+/// the trampoline patcher installed) live guest-side; see
+/// `newton::guest_trampolines::return_to_guest_from_und`.
+fn return_to_guest_from_und(ctx: &mut TrapContext, elr: u64, spsr: u64) {
+    ActiveGuest::und_resume(ctx, elr, spsr);
+}
 
 
 // iter-87 diag: rolling buffer of recent UND faults. The wedge fires
@@ -108,7 +114,7 @@ fn record_und_history(faulting_pc: u32, insn: u32, spsr_und: u32, ctx: &TrapCont
     }
 }
 
-fn dump_und_history() {
+pub(crate) fn dump_und_history() {
     // SAFETY: single-threaded EL2.
     let (count, next) = unsafe { (UND_HIST_COUNT, UND_HIST_NEXT) };
     let n = if count < UND_HIST_LEN as u64 { count as usize } else { UND_HIST_LEN };
@@ -196,6 +202,21 @@ pub(crate) fn handle_und(ctx: &mut TrapContext) {
     };
 
     record_und_history(faulting_pc, insn, spsr_und as u32, ctx);
+
+    // USR-mode HVC probe re-route: HVC is UNDEFINED at EL0, so a guest
+    // ROM probe patched as `HVC #imm` and executed from USR mode raises
+    // UND and arrives here instead of `handle_hvc`. The probe set (and
+    // the BOOTOS_PC guard) is guest-OS knowledge — consult the hook
+    // first; its instruction set is disjoint from every generic arm
+    // below, so `NotMine` falls through with unchanged semantics.
+    match ActiveGuest::handle_und_hvc(ctx, insn, faulting_pc, spsr_und) {
+        UndHvcOutcome::Resume { pc, spsr } => {
+            return_to_guest_from_und(ctx, pc, spsr);
+            return;
+        }
+        UndHvcOutcome::Done => return,
+        UndHvcOutcome::NotMine => {}
+    }
 
     // StrongARM CP15 clock-control write (MCR p15, 0, Rt, c15, c1, 2).
     // ARMv8 doesn't define that register, so the instruction raises UND
@@ -392,87 +413,9 @@ pub(crate) fn handle_und(ctx: &mut TrapContext) {
         _ if insn == HvcImm::LoudHalt.insn() => {
             handle_loud_halt(ctx);
         }
-        // BootOS / ROMBoot canary (rom_patches::BOOTOS_PC = 0x0001_8688).
-        // The initial hypervisor-ERET lands here in SVC mode (HVC traps
-        // normally to EL2). Any later entry from USR mode is a software
-        // reset reached via a task branching to the reset vector — HVC
-        // from EL0 is UNDEFINED and arrives here instead of handle_hvc.
-        // Route into the same handler so the canary's "2nd+ entry →
-        // halt" logic applies regardless of the source mode.
-        _ if insn == HvcImm::BootOs.insn()
-            && faulting_pc == crate::newton::rom_patches::BOOTOS_PC =>
-        {
-            handle_bootos_canary(ctx);
-            return;
-        }
-        // L1[0xCD] investigation probes: the patched HVC instructions
-        // sit inside `Remember` and `AllocatePageTable`, which the
-        // kernel calls from both SVC (kernel-side fault chain) and USR
-        // (user-mode wrappers like the post-ship patch table). HVC
-        // from USR is UNDEFINED, so those calls land here. Pass the
-        // trampoline-saved `spsr_und` (= the original USR-caller CPSR)
-        // directly to the inner probe so its SP/LR lookups land on the
-        // right banked register, then advance ELR via the UND-return
-        // stub since UND entry doesn't auto-advance.
-        _ if insn == HvcImm::RememberSwiret.insn() => {
-            handle_remember_swiret_probe(ctx);
-            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
-            return;
-        }
-        // StorePermObject entry probe — first instruction (`mov ip,
-        // sp`) was replaced with HVC. Reached here when StorePermObject
-        // is called from USR mode (the typical NS-runtime path);
-        // SVC-mode calls go through the direct HVC dispatch above.
-        #[cfg(feature = "log_store")]
-        _ if insn == HvcImm::StorePermObjEntry.insn() => {
-            handle_store_perm_obj_entry_probe(ctx);
-            ctx.x[12] = crate::arch::banked::sp_for_mode(ctx, spsr_und as u32) as u64;
-            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
-            return;
-        }
-        // LoadPermObject return-site probe — `mov r0, r4` was
-        // replaced with HVC. Same USR-vs-SVC routing rationale as
-        // the StorePermObject entry probe above.
-        #[cfg(feature = "log_store")]
-        _ if insn == HvcImm::LoadPermObjRet.insn() => {
-            handle_load_perm_obj_ret_probe(ctx);
-            ctx.x[0] = ctx.x[4];
-            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
-            return;
-        }
-        // PHammerOutTranslator concrete-body patches. The kernel's
-        // debug-print path is reached from USR for any task that
-        // runs through the NS interpreter (DoSend / DoMessage /
-        // DoFastApply); HVC from USR is UNDEFINED, so those firings
-        // come through here. Pass the trampoline-saved spsr_und so
-        // the SP/LR lookup lands on the right banked register, then
-        // advance ELR via the UND-return stub since UND entry
-        // doesn't auto-advance.
-        _ if insn == HvcImm::HammerPrint.insn() => {
-            handle_hammer_print_with(ctx, spsr_und as u32);
-            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
-            return;
-        }
-        _ if insn == HvcImm::HammerPutc.insn() => {
-            handle_hammer_thunk(ctx, ThunkKind::Putc);
-            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
-            return;
-        }
-        _ if insn == HvcImm::HammerFlush.insn() => {
-            handle_hammer_thunk(ctx, ThunkKind::Flush);
-            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
-            return;
-        }
-        _ if insn == HvcImm::HammerStackTrace.insn() => {
-            handle_hammer_thunk(ctx, ThunkKind::StackTrace);
-            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
-            return;
-        }
-        _ if insn == HvcImm::HammerExceptionNotify.insn() => {
-            handle_hammer_thunk(ctx, ThunkKind::ExceptionNotify);
-            return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
-            return;
-        }
+        // (The USR-mode probe HVCs — BootOs, RememberSwiret, the
+        // PHammerOutTranslator thunks, the log_store probes — are
+        // claimed by `ActiveGuest::handle_und_hvc` before this match.)
         _ if insn == HvcImm::UnhandledException.insn() => {
             handle_unhandled_exception(ctx, false);
             // Never returns: handle_unhandled_exception halts.
@@ -921,97 +864,6 @@ fn emulate_swp(ctx: &mut TrapContext, insn: u32, faulting_pc: u32) {
     }
 
     log_swp_budgeted(faulting_pc, is_byte, rn, rd, rm, addr);
-}
-
-/// UND-path return. Must NOT use `return_to_guest` — that calls
-/// `msr spsr_el2, <val>`, which on QEMU raspi3b has a documented side
-/// effect: it clobbers SPSR_EL1 (= AArch32 SPSR_svc) with the value
-/// being written. Since the UND trampoline HVCs from UND mode, `<val>`
-/// is the pre-UND CPSR (e.g. 0x1D3 for SVC mode); that pollutes the
-/// guest's live SPSR_svc from USR → SVC, and the kernel's subsequent
-/// `movs pc, lr` at SWIBoot's epilog stays in SVC instead of returning
-/// to USR. Stalls Phase B at DFAR=0x0c001000 in SVC on `pop {r4, r5}`
-/// at PC 0x3ae3ec.
-///
-/// Workaround (suggested by the verification agent on 2026-04-23):
-/// don't write SPSR_EL2 at all. Instead, ERET into a `ldr lr, [pc,
-/// #0]; movs pc, lr` stub at `UND_RETURN_STUB_VA`. SPSR_EL2 stays as
-/// the CPU's auto-saved value from HVC entry (= UND, mode 0x1B), so
-/// the ERET lands in UND mode. The stub loads the target PC from a
-/// post-LDR literal we write to the ROM backing, then `movs pc, lr`
-/// architecturally — the CPU copies SPSR_und (still the pre-UND
-/// CPSR, preserved since UND entry) into CPSR, and R14_und into PC.
-/// No `msr spsr_el2`, no SPSR_EL1 side-effect.
-pub(crate) fn return_to_guest_from_und(_ctx: &mut TrapContext, elr: u64, _spsr: u64) {
-    // iter-87 diag: catch the case where we're about to ERET to USR
-    // mode at a PC inside our own trampoline window. That's never
-    // legitimate; the only trampoline-internal ERET target is the
-    // UND_RETURN_STUB which lives outside this range.
-    // iter-87 diag: only flag ERET to the trampoline body proper —
-    // ranges 0xffff00..0xffff60 (UND_TRAMP) and 0xffec0..0xffefc
-    // (FPA bypass). UND_RETURN_STUB at 0xffffe4 is a legitimate
-    // ERET target.
-    let mode = (_spsr as u32) & 0x1F;
-    let elr32 = elr as u32;
-    let in_und_tramp = elr32 >= 0x00FF_FF00 && elr32 < 0x00FF_FF60;
-    let in_fpa_bypass = elr32 >= crate::newton::guest_trampolines::FPA_BYPASS_STUB_OFFSET as u32
-        && elr32 < (crate::newton::guest_trampolines::FPA_BYPASS_STUB_OFFSET as u32 + 0x40);
-    if mode == 0x10 && (in_und_tramp || in_fpa_bypass) {
-        kprintln!(
-            "*** return_to_guest_from_und: USR target inside trampoline body! \
-             elr={:#x} spsr={:#x} — about to wedge",
-            elr, _spsr,
-        );
-        dump_und_history();
-        kprintln!(
-            "  elr_el2={:#x} caller-trace below; halting before ERET",
-            read_sysreg!("elr_el2"),
-        );
-        cpu::halt();
-    }
-    // Write target PC to the stub's literal slot, then ERET into the
-    // stub in UND mode (by leaving SPSR_EL2 alone). The stub does
-    // `ldr lr, [pc, #0]; movs pc, lr` — CPU restores CPSR from SPSR_und
-    // (preserved since UND entry) and PC from the literal.
-    //
-    // Using a literal in the stub (rather than staging the return PC
-    // into LR_und = ctx.x[22] per Table D1-79) is the simpler and
-    // platform-portable choice: `ic ivau` on the literal address is
-    // a single barrier-coupled instruction, whereas the X22 path
-    // would require relying on AArch64-ERET-to-AArch32 to faithfully
-    // route x[22] into R14_und across both QEMU raspi3b and FVP, and
-    // the ROM-backing flush is needed regardless.
-    let literal_host =
-        guest_mem::rom_host_pa() as usize + crate::newton::guest_trampolines::UND_RETURN_STUB_LITERAL_OFFSET;
-    // The UND_RETURN_STUB does `ldr lr, [pc, #0]` to load this literal,
-    // running under BE-8 with CPSR.E=1. Host bytes must be BE-encoded
-    // so the guest's LDR returns `elr` numerically — write swap of elr.
-    // Guest-test mode doesn't run BE-8; identity write.
-    #[cfg(not(nh_guest_test))]
-    let literal_value = (elr as u32).swap_bytes();
-    #[cfg(nh_guest_test)]
-    let literal_value = elr as u32;
-    // SAFETY: bounded write in ROM backing; EL2-owned. Flush via D-cache
-    // clean + I-cache invalidate so the guest fetch path sees the new
-    // literal.
-    unsafe {
-        core::ptr::write_volatile(literal_host as *mut u32, literal_value);
-        core::arch::asm!(
-            "dc cvau, {0}",
-            "dsb ish",
-            "ic ivau, {0}",
-            "dsb ish",
-            "isb",
-            in(reg) literal_host as u64,
-            options(nostack, preserves_flags),
-        );
-        core::arch::asm!(
-            "msr elr_el2, {elr}",
-            "isb",
-            elr = in(reg) crate::newton::guest_trampolines::UND_RETURN_STUB_VA as u64,
-            options(nostack, preserves_flags),
-        );
-    }
 }
 
 fn log_und_budgeted(name: &str, pc: u32, payload: Option<u32>) {

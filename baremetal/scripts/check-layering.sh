@@ -11,7 +11,11 @@
 #                 peripherals — its closed-enum PeriphId match is the
 #                 dispatch point, so a forgotten model stays a compile
 #                 error (no fn-pointer registration). No other hv file
-#                 may import peripherals.
+#                 may import peripherals. Sanctioned hv→newton edge:
+#                 src/hv/hooks.rs is THE single file allowed to name
+#                 newton — its `type ActiveGuest = newton::NewtonOs`
+#                 alias is the GuestOs hook seam; every other hv file
+#                 reaches Newton logic via `hooks::ActiveGuest::…`.
 #   newton      — Newton-OS-specific logic; may use arch, hv,
 #                 peripherals.
 #   peripherals — guest device models; usable by newton and (via the
@@ -140,6 +144,12 @@ for layer in "${layers[@]}"; do
                 && "$file" == src/hv/mmio.rs ]]; then
                 continue
             fi
+            # hooks.rs is the single sanctioned hv→newton edge (the
+            # `ActiveGuest = newton::NewtonOs` GuestOs seam).
+            if [[ "$layer" == hv && "$forb" == newton \
+                && "$file" == src/hv/hooks.rs ]]; then
+                continue
+            fi
             # Models may use the hv service modules; skip only when no
             # unsanctioned hv:: reference remains on the line.
             if [[ "$layer" == peripherals && "$forb" == hv ]]; then
@@ -188,4 +198,4 @@ if [[ $violations -gt 0 || $stale -gt 0 ]]; then
     echo "check-layering: FAIL — $violations unlisted violation(s), $stale stale allowlist entr(y/ies)"
     exit 1
 fi
-echo "check-layering: OK — 0 unlisted violations ($allowed allowlisted legacy edges pending phase 7)"
+echo "check-layering: OK — 0 unlisted violations ($allowed allowlisted legacy edges)"

@@ -339,7 +339,7 @@ fn set_return(ctx: &mut TrapContext, next_pc: u32, pre_abt_cpsr: u32) {
     // the SPSR argument for its USR-target-in-trampoline diagnostic, so
     // forward the real pre-abort CPSR rather than 0 — otherwise the
     // diagnostic's mode check is permanently dead on this path.
-    crate::hv::trap::return_to_guest_from_und(ctx, next_pc as u64, pre_abt_cpsr as u64);
+    crate::newton::guest_trampolines::return_to_guest_from_und(ctx, next_pc as u64, pre_abt_cpsr as u64);
 }
 
 fn dump_state(ctx: &TrapContext, pre_abt_cpsr: u32) {

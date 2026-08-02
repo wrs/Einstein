@@ -4,32 +4,9 @@
 #
 # check-layering.sh flags any forbidden import NOT matched here, and
 # fails on stale entries (a listed edge that no longer exists must be
-# deleted in the same change). This list may only shrink: each entry
-# names the refactor phase that removes it (phase 7: GuestOs hooks).
-
-# ---- hv --------------------------------------------------------------
-src/hv/timer.rs peripherals::vic # phase 7 — timer↔VIC match/rearm coupling unwinds with the GuestOs hooks (counterpart of vic.rs hv::timer)
-src/hv/stage2.rs peripherals::vic # phase 7 — tick-page VIC advance moves into on_sync_trap_exit hook
-src/hv/guest_mem.rs newton::(rom_patches|guest_trampolines) # phase 7 — ROM-loader half splits into newton/loader.rs
-src/hv/trap/mod.rs peripherals:: # phase 7 — VIC tick/alarm + native-primitives dispatch move behind on_sync_trap_exit / on_irq_tail / handle_native_call hooks
-src/hv/trap/mod.rs host::(host_io|input|audio|display) # phase 7 — IRQ-tail pumps move into on_irq_tail hook
-src/hv/trap/dabt.rs peripherals:: # phase 7 — flash-write dispatch moves behind GuestOs hooks
-src/hv/trap/dabt.rs newton::(unaligned|guest_trampolines) # phase 7 — Newton DABT handling behind GuestOs hooks
-src/hv/trap/cp15.rs newton::guest_trampolines # phase 7 — stage-1 MMU ritual moves into NewtonOs verbatim
-src/hv/trap/cp15.rs peripherals::flash # phase 7 — checksum re-seed inside on_stage1_mmu_enable hook
-src/hv/trap/hvc.rs peripherals::vic # phase 7 — VIC dispatch moves behind GuestOs hooks
-src/hv/trap/hvc.rs newton::(probes|unaligned) # phase 7 — ROM-probe tags behind handle_hvc_probe hook
-src/hv/trap/und.rs newton::(probes|rom_patches|guest_trampolines) # phase 7 — UND probe re-route behind handle_und_hvc hook
-
-# ---- peripherals -----------------------------------------------------
-# (hv::{layout, guest_endian, guest_mem} and the hv::mmio MmioPeripheral
-# trait are the sanctioned service imports — allowed by
-# check-layering.sh itself, not listed here.)
-src/peripherals/vic.rs hv::(stage2|timer) # phase 7 — tick-page update + timer rearm behind hooks
-
-# ---- host ------------------------------------------------------------
-# (peripherals::vic::{raise_*, INT_*, is_powered_off} / plain
-# `use …peripherals::vic;` module imports (event injection + power
-# policy) and the hv::{guest_mem, guest_endian} accessors are the
-# sanctioned edges — allowed by check-layering.sh itself, not listed
-# here.)
+# deleted in the same change). This list may only shrink.
+#
+# Empty since refactor phase 7 (GuestOs hooks): the sanctioned edges —
+# hv/mmio.rs → peripherals (closed-enum MMIO dispatch), hv/hooks.rs →
+# newton (the ActiveGuest GuestOs seam), the peripherals/host service
+# imports — are rules in check-layering.sh itself, not entries here.

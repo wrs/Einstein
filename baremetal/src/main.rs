@@ -111,9 +111,21 @@ pub extern "C" fn kmain() -> ! {
         fingerprint: host::flash_persist::fingerprint,
     });
     hv::trap::hvc::install_pen_inject(host::host_io::queue::enqueue_pen_sample);
+    // The guest interrupt model rearms the EL2 timer deadline through
+    // this sink when the kernel reprograms a match register.
+    peripherals::vic::install_match_rearm(hv::timer::rearm);
+    // Host pumps the NewtonOs trap-tail hooks drive (newton must not
+    // import host directly): input pumps, audio tick, splash progress.
+    newton::os::install_host_pumps(newton::os::HostPumpOps {
+        host_io_pump_input: host::host_io::pump_input,
+        input_pump: host::input::pump,
+        audio_tick: host::audio::tick,
+        #[cfg(all(feature = "platform-raspi3b", nh_host_io_pi_fb))]
+        splash_progress: host::display::splash::update_progress,
+    });
 
     // SAFETY: load ROM bytes into guest backing store before stage-2 maps it.
-    unsafe { hv::guest_mem::load_rom(); }
+    unsafe { newton::loader::load_rom(); }
 
     // Bring the HDMI framebuffer up as soon as we can and paint the
     // splash (light-blue background + logo + progress bar). The bar
@@ -165,6 +177,11 @@ pub extern "C" fn kmain() -> ! {
         hv::stage2::enable();
     }
 
+    // Seed the non-trapping tick page so any read before the first
+    // timer IRQ returns something non-zero-but-consistent. (Re-seeded
+    // after `vic::init` below once the calendar baseline is real.)
+    newton::os::seed_tick_page();
+
     // Seed the 10-entry ROM+REx checksum table into both blocks of
     // flash bank 0. The kernel's `TReservedBlockAccessor` reads these
     // during early init and compares against its own runtime computation
@@ -180,6 +197,10 @@ pub extern "C" fn kmain() -> ! {
     }
 
     peripherals::vic::init();
+    // Re-publish the tick page now that calendar_seconds() returns a
+    // real value — the post-stage-2 seed above ran while the calendar
+    // baseline was still zero.
+    newton::os::seed_tick_page();
     hv::timer::init();
     host::host_io::init();
     // Pull the Newton screen geometry the host-IO backend mandates

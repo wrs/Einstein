@@ -24,11 +24,12 @@
 //!
 //! The I-cache publish for everything written here is the single
 //! whole-ROM `icache_publish_range` sweep at the end of
-//! `guest_mem::load_newton_rom`, which runs strictly after every
+//! `loader::load_newton_rom`, which runs strictly after every
 //! installer in this module.
 
 use crate::hv::guest_mem::{rom_host_pa, write_rom_code_word, write_rom_data_word};
 use crate::hv::hvc_imm::HvcImm;
+use crate::kprintln;
 
 /// Install the AArch32 UND-vector trampoline.
 ///
@@ -231,6 +232,102 @@ pub const DABT_SAVE_PA: u32 = crate::hv::trap::HYP_TRAMP_SCRATCH_BASE + 0xA0;
 /// the FPA bypass stub (`FPA_BYPASS_STUB_OFFSET`), the UND-return stub
 /// (`UND_RETURN_STUB_OFFSET`), and the UND trampoline (0x00FF_FF00).
 pub const ROM_TAIL_STUBS_END: u32 = 0x0100_0000;
+
+// ---------------------------------------------------------------------
+// UND-path guest resume (through the UND-return stub above)
+// ---------------------------------------------------------------------
+
+/// UND-path return. Must NOT use `return_to_guest` — that calls
+/// `msr spsr_el2, <val>`, which on QEMU raspi3b has a documented side
+/// effect: it clobbers SPSR_EL1 (= AArch32 SPSR_svc) with the value
+/// being written. Since the UND trampoline HVCs from UND mode, `<val>`
+/// is the pre-UND CPSR (e.g. 0x1D3 for SVC mode); that pollutes the
+/// guest's live SPSR_svc from USR → SVC, and the kernel's subsequent
+/// `movs pc, lr` at SWIBoot's epilog stays in SVC instead of returning
+/// to USR. Stalls Phase B at DFAR=0x0c001000 in SVC on `pop {r4, r5}`
+/// at PC 0x3ae3ec.
+///
+/// Workaround (suggested by the verification agent on 2026-04-23):
+/// don't write SPSR_EL2 at all. Instead, ERET into a `ldr lr, [pc,
+/// #0]; movs pc, lr` stub at `UND_RETURN_STUB_VA`. SPSR_EL2 stays as
+/// the CPU's auto-saved value from HVC entry (= UND, mode 0x1B), so
+/// the ERET lands in UND mode. The stub loads the target PC from a
+/// post-LDR literal we write to the ROM backing, then `movs pc, lr`
+/// architecturally — the CPU copies SPSR_und (still the pre-UND
+/// CPSR, preserved since UND entry) into CPSR, and R14_und into PC.
+/// No `msr spsr_el2`, no SPSR_EL1 side-effect.
+pub fn return_to_guest_from_und(_ctx: &mut crate::arch::trap_context::TrapContext, elr: u64, _spsr: u64) {
+    // iter-87 diag: catch the case where we're about to ERET to USR
+    // mode at a PC inside our own trampoline window. That's never
+    // legitimate; the only trampoline-internal ERET target is the
+    // UND_RETURN_STUB which lives outside this range.
+    // iter-87 diag: only flag ERET to the trampoline body proper —
+    // ranges 0xffff00..0xffff60 (UND_TRAMP) and 0xffec0..0xffefc
+    // (FPA bypass). UND_RETURN_STUB at 0xffffe4 is a legitimate
+    // ERET target.
+    let mode = (_spsr as u32) & 0x1F;
+    let elr32 = elr as u32;
+    let in_und_tramp = elr32 >= 0x00FF_FF00 && elr32 < 0x00FF_FF60;
+    let in_fpa_bypass = elr32 >= FPA_BYPASS_STUB_OFFSET as u32
+        && elr32 < (FPA_BYPASS_STUB_OFFSET as u32 + 0x40);
+    if mode == 0x10 && (in_und_tramp || in_fpa_bypass) {
+        kprintln!(
+            "*** return_to_guest_from_und: USR target inside trampoline body! \
+             elr={:#x} spsr={:#x} — about to wedge",
+            elr, _spsr,
+        );
+        crate::hv::trap::und::dump_und_history();
+        kprintln!(
+            "  elr_el2={:#x} caller-trace below; halting before ERET",
+            crate::arch::trap_context::read_sysreg!("elr_el2"),
+        );
+        crate::arch::cpu::halt();
+    }
+    // Write target PC to the stub's literal slot, then ERET into the
+    // stub in UND mode (by leaving SPSR_EL2 alone). The stub does
+    // `ldr lr, [pc, #0]; movs pc, lr` — CPU restores CPSR from SPSR_und
+    // (preserved since UND entry) and PC from the literal.
+    //
+    // Using a literal in the stub (rather than staging the return PC
+    // into LR_und = ctx.x[22] per Table D1-79) is the simpler and
+    // platform-portable choice: `ic ivau` on the literal address is
+    // a single barrier-coupled instruction, whereas the X22 path
+    // would require relying on AArch64-ERET-to-AArch32 to faithfully
+    // route x[22] into R14_und across both QEMU raspi3b and FVP, and
+    // the ROM-backing flush is needed regardless.
+    let literal_host =
+        rom_host_pa() as usize + UND_RETURN_STUB_LITERAL_OFFSET;
+    // The UND_RETURN_STUB does `ldr lr, [pc, #0]` to load this literal,
+    // running under BE-8 with CPSR.E=1. Host bytes must be BE-encoded
+    // so the guest's LDR returns `elr` numerically — write swap of elr.
+    // Guest-test mode doesn't run BE-8; identity write.
+    #[cfg(not(nh_guest_test))]
+    let literal_value = (elr as u32).swap_bytes();
+    #[cfg(nh_guest_test)]
+    let literal_value = elr as u32;
+    // SAFETY: bounded write in ROM backing; EL2-owned. Flush via D-cache
+    // clean + I-cache invalidate so the guest fetch path sees the new
+    // literal.
+    unsafe {
+        core::ptr::write_volatile(literal_host as *mut u32, literal_value);
+        core::arch::asm!(
+            "dc cvau, {0}",
+            "dsb ish",
+            "ic ivau, {0}",
+            "dsb ish",
+            "isb",
+            in(reg) literal_host as u64,
+            options(nostack, preserves_flags),
+        );
+        core::arch::asm!(
+            "msr elr_el2, {elr}",
+            "isb",
+            elr = in(reg) UND_RETURN_STUB_VA as u64,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 
 /// Register the regions the hypervisor populates at runtime with native
 /// (little-endian) AArch32 instruction words — rather than

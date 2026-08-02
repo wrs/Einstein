@@ -56,7 +56,6 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use crate::arch::cpu;
 use crate::hv::guest_mem;
 use crate::kprintln;
-use crate::hv::trap;
 use crate::arch::trap_context::TrapContext;
 
 /// Max number of live breakpoints at once.
@@ -397,6 +396,6 @@ pub fn handle_user_bp_und(
 
     // Rewind ELR so the restored instruction re-executes at native
     // speed. Shares the UND-path return logic with the tracer.
-    trap::return_to_guest_from_und(ctx, faulting_pc as u64, spsr_und);
+    crate::newton::guest_trampolines::return_to_guest_from_und(ctx, faulting_pc as u64, spsr_und);
     true
 }

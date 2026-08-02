@@ -3,7 +3,7 @@
 # main.rs uses `#![cfg_attr(not(test), no_std)]` so the crate is no_std on
 # aarch64-unknown-none-softfloat (the build/run target) but std on the host
 # triple (used by `cargo test --target x86_64-unknown-linux-gnu` for the
-# unit tests in src/shadow_stub.rs).
+# unit tests in src/newton/shadow_stub.rs).
 #
 # rust-analyzer defaults to `cfg.set_test = true` and `cargo.all_targets =
 # true`, which forces cfg(test) on while checking against the bare-metal

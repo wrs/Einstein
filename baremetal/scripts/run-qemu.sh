@@ -48,7 +48,7 @@ fi
 # the mini-UART. We use PL011 for the console.
 #
 # Semihosting is enabled so the hypervisor can save/load snapshots via
-# HLT #0xF000 (see src/snapshot.rs). target=native makes the hypervisor
+# HLT #0xF000 (see src/hv/snapshot.rs). target=native makes the hypervisor
 # itself own the semihosting surface; paths are resolved against the
 # host's cwd.
 exec qemu-system-aarch64 \

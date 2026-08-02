@@ -55,7 +55,7 @@ docs/ARM_Reference.txt.
 
 ## Snapshot / resume workflow
 
-`src/snapshot.rs` rolls four guest-state snapshots on disk at
+`src/hv/snapshot.rs` rolls four guest-state snapshots on disk at
 `/tmp/newton-snapshot-{0..3}.bin`. On every hypervisor startup we
 try to resume from the newest valid slot; missing or mismatched
 files fall through to a cold boot.
@@ -89,7 +89,7 @@ scripts/boot-check.sh --marker 'Resuming guest from snapshot'
 ### Save triggers
 
 - **Periodic (default):** every `AUTOSAVE_INTERVAL_MS = 2000` ms of
-  wall time, hooked into `trap_irq` (timer IRQ) in `src/trap/mod.rs`.
+  wall time, hooked into `trap_irq` (timer IRQ) in `src/hv/trap/mod.rs`.
   Wall-clock pacing, not trap count — a pathological abort loop
   won't thrash saves.
 - **Guest-triggered:** `HVC #0x18` (`HvcImm::Snapshot`) from the guest issues an
@@ -187,7 +187,7 @@ aarch64-elf-gdb -x scripts/gdb-init \
     time we're at trap_sync entry, `ELR_EL2` points at the trampoline,
     not the original PC.
   - **`bp <addr>`** — install a one-shot guest software BP (see
-    `src/guest_bp.rs`). Patches the ROM word with `UDF #0xFF0E` and
+    `src/diag/guest_bp.rs`). Patches the ROM word with `UDF #0xFF0E` and
     stops in `handle_user_bp_und` with `faulting_pc` = the guest PC.
     Works for any ROM-range PC regardless of whether it naturally
     traps. One-shot: `bp <addr>` again to re-arm. Snapshot autosaves
@@ -236,10 +236,10 @@ saw in a log), skip the install: `bg <addr>` and `c` is enough.
   ```
   If `X` is missing, the fix lives in `tools/classify-rom/src/main.rs`
   (add a seeder for the structure that contains `X`), not in
-  `src/trap/`. After regenerating the bitmap with
+  `src/hv/trap/`. After regenerating the bitmap with
   `scripts/regen-classify.sh`, `scripts/dump-data-regions.py`
   refreshes `code-regions.txt` so the same grep verifies the fix.
-- Every handler in `src/trap/` / `src/peripherals/*` halts
+- Every handler in `src/hv/trap/` / `src/peripherals/*` halts
   loudly on unknown inputs with a context dump. When a ROM boot
   trips one, the halt message points at exactly the table entry
   that needs adding. **Don't paper over it** by adding a silent
@@ -270,15 +270,15 @@ saw in a log), skip the install: `bg <addr>` and `c` is enough.
   message, not a deep compile error.
 - **Skip the guest-tests run** when an iteration's only changes
   are a Newton-ROM probe (a new HVC immediate at a Newton-ROM PC
-  in `src/rom_patches.rs` + a dispatch arm in `src/trap/hvc.rs` +
-  a handler body in `src/probes.rs` that emulates the original
+  in `src/newton/rom_patches.rs` + a dispatch arm in `src/hv/trap/hvc.rs` +
+  a handler body in `src/newton/probes.rs` that emulates the original
   instruction). The guest tests run isolated test ELFs that don't
   include the Newton ROM, so probe-only changes can't regress them.
   Walter has called this out as wasted time. Run them when
-  changes touch `src/shadow_stub.rs`, `src/unaligned.rs`,
-  `src/peripherals/*`, `src/banked.rs`, `src/stage2.rs`,
-  `src/guest.rs`, the generic SBA/UND/DABT/IRQ paths in
-  `src/trap/` (`mod.rs`, `dabt.rs`, `und.rs`, `cp15.rs`), or
+  changes touch `src/newton/shadow_stub.rs`, `src/newton/unaligned.rs`,
+  `src/peripherals/*`, `src/arch/banked.rs`, `src/hv/stage2.rs`,
+  `src/hv/guest.rs`, the generic SBA/UND/DABT/IRQ paths in
+  `src/hv/trap/` (`mod.rs`, `dabt.rs`, `und.rs`, `cp15.rs`), or
   `guest-tests/` itself.
 
 ## Function-level execution trace
@@ -299,7 +299,7 @@ just *which* function is at the top of the stall, but what arguments
 it's being called with over time (loop counter advancing, page index,
 etc.).
 
-### Mechanism (`src/tracer.rs`)
+### Mechanism (`src/diag/tracer.rs`)
 
 1. `build.rs` reads `scripts/classify-out/code-symbols.txt` (the
    curated code-only symbol list produced by `classify-symbols.py`,
@@ -342,7 +342,7 @@ the tracer's coverage in lock-step with shadow_stub's definition of
 ### Logging budget
 
 - `quiet` feature silences `fix_stage1_xn_bits:` summaries via
-  `dprintln!` in `src/uart.rs`. Route further recurring diagnostic
+  `dprintln!` in `src/host/macros.rs`. Route further recurring diagnostic
   logs through `dprintln!` (not `kprintln!`) to keep trace output
   readable. `dprintln!` is a no-op under `quiet`; `kprintln!` is
   always emitted.

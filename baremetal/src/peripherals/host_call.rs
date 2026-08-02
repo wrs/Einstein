@@ -16,7 +16,7 @@
 //! `TNativePrimitives::ExecuteHostCallNative`
 //! (`Emulator/TNativePrimitives.cpp:2515-2882`).
 
-use crate::trap_context::TrapContext;
+use crate::arch::trap_context::TrapContext;
 use crate::peripherals::native_primitives::NativeDriver;
 
 /// Marker for the [`NativeDriver`] dispatch in
@@ -68,7 +68,7 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
             ctx.x[0] = 0;
         }
 
-        _ => crate::diag_util::halt_unknown_subfn(
+        _ => crate::diag::diag_util::halt_unknown_subfn(
             "host_call", subfn, pc,
             ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
         ),

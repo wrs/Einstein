@@ -22,7 +22,7 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::{kprintln, uart};
+use crate::{kprintln, host::console};
 
 /// Base of the external-serial port (TMemoryConsts::kExternalSerialBase).
 pub const EXTERNAL_BASE: u64 = 0x0F1C_0000;
@@ -67,12 +67,12 @@ mod reg {
     ];
 }
 
-/// Marker for the [`crate::mmio::MmioPeripheral`] router. The four
+/// Marker for the [`crate::hv::mmio::MmioPeripheral`] router. The four
 /// TSerialChip windows are stateless models; this zero-sized type only
 /// names the model for static dispatch.
 pub struct Serial;
 
-impl crate::mmio::MmioPeripheral for Serial {
+impl crate::hv::mmio::MmioPeripheral for Serial {
     fn owns(ipa: u64) -> bool {
         owns(ipa)
     }
@@ -143,7 +143,7 @@ fn write(ipa: u64, value: u32) {
 
 // ---- diagnostics --------------------------------------------------
 
-use crate::diag_util::LogBudget;
+use crate::diag::diag_util::LogBudget;
 const TX_LOG_MAX: usize = 64;
 static TX_BUDGETS: [LogBudget; 4] = [
     LogBudget::new(TX_LOG_MAX),
@@ -164,7 +164,7 @@ static DROPPED_TX: [AtomicU32; 4] = [
 ];
 
 /// PIO TX-byte write to a port's TX FIFO. Port 0 (extr) is forwarded to
-/// the host PL011 (`uart::write_byte`), matching the DMA channel-1 path
+/// the host PL011 (`console::write_byte`), matching the DMA channel-1 path
 /// so PIO and DMA output interleave into the same host serial stream.
 /// Ports 1-3 have no host backend; their bytes are counted as dropped
 /// (`DROPPED_TX`) rather than silently discarded. All ports keep a
@@ -174,7 +174,7 @@ fn log_tx_byte(port: u8, byte: u8) {
         return;
     }
     if port == 0 {
-        uart::write_byte(byte);
+        console::write_byte(byte);
     } else {
         DROPPED_TX[port as usize].fetch_add(1, Ordering::Relaxed);
     }
@@ -215,5 +215,5 @@ fn halt_unknown(port: u8, off: u64, write: bool, value: u32) -> ! {
     kprintln!(
         "   Emulator/Serial/TVoyagerSerialPort.cpp for the register layout.)"
     );
-    crate::cpu::halt();
+    crate::arch::cpu::halt();
 }

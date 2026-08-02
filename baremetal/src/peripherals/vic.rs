@@ -30,8 +30,8 @@ static TICK_EPOCH: AtomicU64 = AtomicU64::new(0);
 /// time, so the raspi3b platform reports a scaled rate (3.6864 MHz × 128)
 /// to keep boot-wall-time under a minute. FVP runs the generic timer at
 /// the architectural 100 MHz, so it uses the unscaled rate. The choice
-/// lives in `crate::platform::NEWTON_TICK_HZ`.
-pub use crate::platform::NEWTON_TICK_HZ;
+/// lives in `crate::host::platform::NEWTON_TICK_HZ`.
+pub use crate::host::platform::NEWTON_TICK_HZ;
 
 fn read_cntpct() -> u64 {
     let v: u64;
@@ -208,7 +208,7 @@ fn init_calendar() {
     // real value — `stage2::init` already called
     // `tick_page::update_from_sync_trap` once before this, while the
     // baseline was still zero.
-    crate::stage2::tick_page::update_from_sync_trap();
+    crate::hv::stage2::tick_page::update_from_sync_trap();
     crate::kprintln!(
         "vic: calendar = {} seconds since 1904-01-01 (host unix_time={}, offset={}s back)",
         secs_since_1904, unix_time, RTC_HOST_TIME_OFFSET_SECONDS
@@ -240,7 +240,7 @@ pub const INT_GPIO: u32 = 0x0100_0000;
 /// `host_io::queue::enqueue_pen_sample` when a fresh sample lands
 /// on the input queue.
 pub const INT_TABLET: u32 = 0x1000_0000;
-use crate::diag_util::LogBudget;
+use crate::diag::diag_util::LogBudget;
 static VIC_DMA_RAISE_LOG: LogBudget = LogBudget::new(8);
 static VIC_DMA_CLEAR_LOG: LogBudget = LogBudget::new(8);
 static VIC_DMA_CTRL_LOG: LogBudget = LogBudget::new(16);
@@ -656,12 +656,12 @@ pub fn heartbeat_tick_update() {
 
 // ---------- MMIO dispatch ----------------------------------------------------
 
-/// Marker for the [`crate::mmio::MmioPeripheral`] router. The register
+/// Marker for the [`crate::hv::mmio::MmioPeripheral`] router. The register
 /// state lives in the module-level `VIC` cell; this zero-sized type only
 /// names the model for static dispatch.
 pub struct Vic;
 
-impl crate::mmio::MmioPeripheral for Vic {
+impl crate::hv::mmio::MmioPeripheral for Vic {
     fn owns(ipa: u64) -> bool {
         owns(ipa)
     }
@@ -907,7 +907,7 @@ fn write(ipa: u64, value: u32) {
     if match_reprogrammed {
         // A match register changed — recompute the nearest deadline and
         // reprogram CNTHP_CVAL_EL2 so the async timer path delivers.
-        crate::timer::rearm();
+        crate::hv::timer::rearm();
     }
 }
 
@@ -923,5 +923,5 @@ fn halt_vic_unreachable(op: &'static str, ipa: u64, value: u32) -> ! {
     crate::kprintln!(
         "  (bug in peripherals/vic.rs: owns() and read/write disagree.)"
     );
-    crate::cpu::halt();
+    crate::arch::cpu::halt();
 }

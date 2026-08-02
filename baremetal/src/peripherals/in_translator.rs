@@ -12,7 +12,7 @@
 //! the ones the protocol defines — matching Einstein's "no real protocol
 //! modelled" stance when no host translator backend is configured.
 
-use crate::trap_context::TrapContext;
+use crate::arch::trap_context::TrapContext;
 use crate::peripherals::native_primitives::NativeDriver;
 
 /// Marker for the [`NativeDriver`] dispatch in
@@ -34,7 +34,7 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         0x00 | 0x01 | 0x02 | 0x03 | 0x04 | 0x05 => {
             ctx.x[0] = 0;
         }
-        _ => crate::diag_util::halt_unknown_subfn(
+        _ => crate::diag::diag_util::halt_unknown_subfn(
             "in_translator", subfn, pc,
             ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
         ),

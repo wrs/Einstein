@@ -16,7 +16,7 @@
 //! 0x35 PutByte routes the byte (r1) through `kprintln!` with a budgeted
 //! log so guest serial output is visible without flooding the UART.
 
-use crate::{kprintln, trap_context::TrapContext};
+use crate::{kprintln, arch::trap_context::TrapContext};
 use crate::peripherals::native_primitives::NativeDriver;
 
 /// Marker for the [`NativeDriver`] dispatch in
@@ -97,7 +97,7 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
             ctx.x[0] = 0;
         }
 
-        _ => crate::diag_util::halt_unknown_subfn(
+        _ => crate::diag::diag_util::halt_unknown_subfn(
             "serial_driver", subfn, pc,
             ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
         ),
@@ -108,7 +108,7 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
 /// so a chatty guest doesn't drown the UART log; after BUDGET hits we
 /// drop bytes silently.
 fn log_putbyte(byte: u8) {
-    static BUDGET: crate::diag_util::LogBudget = crate::diag_util::LogBudget::new(256);
+    static BUDGET: crate::diag::diag_util::LogBudget = crate::diag::diag_util::LogBudget::new(256);
     if BUDGET.allow() {
         if byte.is_ascii() && (byte == b'\n' || byte == b'\r' || (byte >= 0x20 && byte < 0x7F)) {
             kprintln!("serial.PutByte: {:?}", byte as char);

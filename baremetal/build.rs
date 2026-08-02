@@ -6,8 +6,8 @@
 // - Always parses scripts/classify-out/code-symbols.txt for the vetted
 //   code-only address list and ../_Data_/symbols.txt for the matching
 //   mangled names, then emits three compact binary blobs into OUT_DIR.
-//   `src/task_dump.rs` includes them unconditionally (PC→name lookup in
-//   halt-path stack traces); `src/tracer.rs` additionally consults them
+//   `src/diag/task_dump.rs` includes them unconditionally (PC→name lookup in
+//   halt-path stack traces); `src/diag/tracer.rs` additionally consults them
 //   for its trampoline pool when the `trace` feature is on. The blobs are:
 //     fn_addrs.bin       — packed u32 LE, sorted ROM-range function entry PAs
 //     fn_name_offs.bin   — parallel u32 LE offsets into fn_names.bin
@@ -262,17 +262,17 @@ fn select_platform_linker_script() {
 /// `select_platform_linker_script`.
 ///
 /// Constraints (each verified against the actual cfg gates in source):
-///   - `input-mtouch` → `src/input/calibrate.rs` unconditionally imports
-///     `crate::host_io::pi_fb`, which only exists under
+///   - `input-mtouch` → `src/host/input/calibrate.rs` unconditionally imports
+///     `crate::host::host_io::pi_fb`, which only exists under
 ///     `nh_host_io_pi_fb`. Requires `host-io-pi-fb`.
-///   - `sd-probe` → `src/sd/probe.rs` calls `write_block_dma`, gated
+///   - `sd-probe` → `src/host/sd/probe.rs` calls `write_block_dma`, gated
 ///     `cfg(nh_real_hw)` (`no-semihost` + `platform-raspi3b`). Requires
 ///     both.
-///   - `host-io-pi-fb` → `src/host_io/pi_fb.rs` uses `crate::display::*`
+///   - `host-io-pi-fb` → `src/host/host_io/pi_fb.rs` uses `crate::display::*`
 ///     (`mod display` is `cfg(feature = "platform-raspi3b")`).
-///   - `flash-persist-sd` → `src/flash_persist/sd.rs` uses
+///   - `flash-persist-sd` → `src/host/flash_persist/sd.rs` uses
 ///     `crate::sd::*` (`mod sd` is `cfg(feature = "platform-raspi3b")`).
-///   - `audio-pi-hdmi` → `src/audio/pi_hdmi.rs` uses `crate::mailbox::*`
+///   - `audio-pi-hdmi` → `src/host/audio/pi_hdmi.rs` uses `crate::host::mailbox::*`
 ///     (`mod mailbox` is `cfg(feature = "platform-raspi3b")`).
 fn validate_feature_matrix() {
     // Only meaningful for the bare-metal target; the host-test build
@@ -294,7 +294,7 @@ fn validate_feature_matrix() {
     if input_mtouch && !host_io_pi_fb {
         panic!(
             "input-mtouch requires host-io-pi-fb \
-             (src/input/calibrate.rs imports crate::host_io::pi_fb). \
+             (src/host/input/calibrate.rs imports crate::host::host_io::pi_fb). \
              Use the pi-bare-metal-input aggregate, or add --features host-io-pi-fb."
         );
     }
@@ -302,7 +302,7 @@ fn validate_feature_matrix() {
     if sd_probe && !(no_semihost && raspi3b) {
         panic!(
             "sd-probe requires no-semihost + platform-raspi3b \
-             (src/sd/probe.rs uses the real-hardware BCM2835 DMA path). \
+             (src/host/sd/probe.rs uses the real-hardware BCM2835 DMA path). \
              Build with --features \"pi-bare-metal sd-probe\"."
         );
     }
@@ -310,21 +310,21 @@ fn validate_feature_matrix() {
     if host_io_pi_fb && !raspi3b {
         panic!(
             "host-io-pi-fb requires platform-raspi3b \
-             (src/host_io/pi_fb.rs uses crate::display, which is \
+             (src/host/host_io/pi_fb.rs uses crate::host::display, which is \
              platform-raspi3b-only)."
         );
     }
     if flash_persist_sd && !raspi3b {
         panic!(
             "flash-persist-sd requires platform-raspi3b \
-             (src/flash_persist/sd.rs uses crate::sd, which is \
+             (src/host/flash_persist/sd.rs uses crate::host::sd, which is \
              platform-raspi3b-only)."
         );
     }
     if audio_pi_hdmi && !raspi3b {
         panic!(
             "audio-pi-hdmi requires platform-raspi3b \
-             (src/audio/pi_hdmi.rs uses crate::mailbox, which is \
+             (src/host/audio/pi_hdmi.rs uses crate::mailbox, which is \
              platform-raspi3b-only)."
         );
     }
@@ -404,8 +404,8 @@ fn resolve_flash_persist_backend() {
 /// opt-in-with-fallback pattern as the host-io and flash-persist
 /// axes. Default ("null") = no pen source; QEMU/FVP routes pen
 /// events through `host_io-semihost`, which is independent of this
-/// axis. `input-mtouch` lights up `src/input/mtouch.rs` plus the
-/// USB host stack under `src/usb/`.
+/// axis. `input-mtouch` lights up `src/host/input/mtouch.rs` plus the
+/// USB host stack under `src/host/usb/`.
 fn resolve_input_backend() {
     let null = env::var("CARGO_FEATURE_INPUT_NULL").is_ok();
     let mtouch = env::var("CARGO_FEATURE_INPUT_MTOUCH").is_ok();
@@ -423,7 +423,7 @@ fn resolve_input_backend() {
 /// Pick the active host-audio backend and emit `cfg(nh_audio_*)`.
 /// Same opt-in-with-fallback pattern as the other axes. Default
 /// ("null") means no host audio output; `audio-pi-hdmi` lights up
-/// `src/audio/pi_hdmi.rs` against the VC4 HDMI MAI block.
+/// `src/host/audio/pi_hdmi.rs` against the VC4 HDMI MAI block.
 fn resolve_audio_backend() {
     let null = env::var("CARGO_FEATURE_AUDIO_NULL").is_ok();
     let pi_hdmi = env::var("CARGO_FEATURE_AUDIO_PI_HDMI").is_ok();

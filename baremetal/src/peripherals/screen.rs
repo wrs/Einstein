@@ -32,7 +32,7 @@
 //! no inversion — and `host_io::push_blit` forwards each blit to a
 //! live host viewer for display.
 
-use crate::{cpu, guest_mem, kprintln, peripherals::guest_access, trap_context::TrapContext};
+use crate::{arch::cpu, hv::guest_mem, kprintln, peripherals::guest_access, arch::trap_context::TrapContext};
 use crate::peripherals::native_primitives::NativeDriver;
 
 /// Marker for the [`NativeDriver`] dispatch in
@@ -73,7 +73,7 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
             // accept the write (return 0).
             ctx.x[0] = 0;
         }
-        _ => crate::diag_util::halt_unknown_subfn(
+        _ => crate::diag::diag_util::halt_unknown_subfn(
             "screen", subfn, pc,
             ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
         ),
@@ -333,7 +333,7 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
                 let abs_src_pix = pixmap_src_left as u32 + col_pix;
                 let src_va = addy + src_row_pa_off + abs_src_pix / 4;
                 let src_pa = guest_mem::translate_va(src_va).unwrap_or(src_va);
-                let byte = match crate::guest_endian::guest_read_u8_pa(src_pa) {
+                let byte = match crate::hv::guest_endian::guest_read_u8_pa(src_pa) {
                     Some(b) => b,
                     None => {
                         kprintln!(
@@ -424,7 +424,7 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
             // returns None in the MMU-off case; fall back to identity
             // so guest-tests' MMU-off paths still work.
             let src_pa = guest_mem::translate_va(src_va).unwrap_or(src_va);
-            let byte = match crate::guest_endian::guest_read_u8_pa(src_pa) {
+            let byte = match crate::hv::guest_endian::guest_read_u8_pa(src_pa) {
                 Some(b) => b,
                 None => {
                     kprintln!(
@@ -486,7 +486,7 @@ fn ctx_blit_mode(ctx: &TrapContext, pc: u32) -> u8 {
             options(nomem, nostack, preserves_flags),
         );
     }
-    let sp = crate::banked::sp_for_mode(ctx, spsr as u32);
+    let sp = crate::arch::banked::sp_for_mode(ctx, spsr as u32);
     guest_access::read_word_or_halt(sp.wrapping_add(4), "blit mode word [SP+4]", pc) as u8
 }
 
@@ -497,8 +497,8 @@ fn push_blit_event(
     dst_top: u16, dst_left: u16, dst_bottom: u16, dst_right: u16,
     row_bytes: u16, payload: &[u8],
 ) {
-    let ev = crate::host_io::BlitEvent {
-        kind: crate::host_io::BLIT_KIND_BLIT,
+    let ev = crate::host::host_io::BlitEvent {
+        kind: crate::host::host_io::BLIT_KIND_BLIT,
         mode,
         bpp: SCREEN_BPP as u8,
         _pad: 0,
@@ -507,7 +507,7 @@ fn push_blit_event(
         row_bytes,
         payload_len: payload.len() as u16,
     };
-    crate::host_io::push_blit(&ev, payload);
+    crate::host::host_io::push_blit(&ev, payload);
 }
 
 fn read_rect(rect_va: u32, what: &str, pc: u32) -> (u16, u16, u16, u16) {
@@ -527,7 +527,7 @@ fn log_blit(pc: u32, addy: u32, row_bytes: u32, height: u32,
     dt: u16, dl: u16, db: u16, dr: u16,
     copied: u32,
 ) {
-    static BUDGET: crate::diag_util::LogBudget = crate::diag_util::LogBudget::new(8);
+    static BUDGET: crate::diag::diag_util::LogBudget = crate::diag::diag_util::LogBudget::new(8);
     if BUDGET.allow() {
         kprintln!(
             "screen.blit @PC={:#x} addy={:#x} rowBytes={} h={} src=({},{},{},{}) dst=({},{},{},{}) copied={}",
@@ -542,7 +542,7 @@ fn log_blit_enter(pc: u32, pixmap_va: u32, addy: u32, row_bytes: u32,
     st: u16, sl: u16, sb: u16, sr: u16,
     dt: u16, dl: u16, db: u16, dr: u16,
 ) {
-    static BUDGET: crate::diag_util::LogBudget = crate::diag_util::LogBudget::new(8);
+    static BUDGET: crate::diag::diag_util::LogBudget = crate::diag::diag_util::LogBudget::new(8);
     if BUDGET.allow() {
         kprintln!(
             "screen.blit ENTER @PC={:#x} pixmap={:#x} addy={:#x} rowBytes={} pmTL=({},{}) src=({},{},{},{}) dst=({},{},{},{})",

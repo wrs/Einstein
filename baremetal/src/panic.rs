@@ -27,7 +27,7 @@ fn panic(info: &PanicInfo) -> ! {
 
     // The wfe park below never services the TX completion IRQ — drain
     // the DMA console by polling so the panic report reaches the wire.
-    crate::uart::flush_tx_dma_polled();
+    crate::host::console::flush_tx_dma_polled();
 
     compiler_fence(Ordering::SeqCst);
 

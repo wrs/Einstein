@@ -13,7 +13,7 @@
 //! values mirror Einstein's tables verbatim so the kernel's downstream
 //! consumers see the same battery state we'd see in Einstein.
 
-use crate::trap_context::TrapContext;
+use crate::arch::trap_context::TrapContext;
 use crate::peripherals::native_primitives::NativeDriver;
 
 /// Marker for the [`NativeDriver`] dispatch in
@@ -47,7 +47,7 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         0x09 | 0x0A | 0x0B | 0x0C => {
             ctx.x[0] = 0;
         }
-        _ => crate::diag_util::halt_unknown_subfn(
+        _ => crate::diag::diag_util::halt_unknown_subfn(
             "battery", subfn, pc,
             ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
         ),

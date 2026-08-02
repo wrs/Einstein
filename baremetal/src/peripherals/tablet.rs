@@ -15,7 +15,7 @@
 //! when the kernel sets and reads back its own calibration.
 
 use core::cell::UnsafeCell;
-use crate::{kprintln, peripherals::guest_access, trap_context::TrapContext};
+use crate::{kprintln, peripherals::guest_access, arch::trap_context::TrapContext};
 use crate::peripherals::native_primitives::NativeDriver;
 
 /// Marker for the [`NativeDriver`] dispatch in
@@ -166,7 +166,7 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
                     );
                 }
             }
-            match crate::host_io::pop_pen_sample() {
+            match crate::host::host_io::pop_pen_sample() {
                 Some((sample, ticks)) => {
                     let r1 = ctx.x[1] as u32;
                     let r2 = ctx.x[2] as u32;
@@ -193,7 +193,7 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
                 }
             }
         }
-        _ => crate::diag_util::halt_unknown_subfn(
+        _ => crate::diag::diag_util::halt_unknown_subfn(
             "tablet", subfn, pc,
             ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
         ),

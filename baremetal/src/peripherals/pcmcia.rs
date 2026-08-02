@@ -160,14 +160,14 @@ static SLOT3: SlotRegs = SlotRegs::new();
 /// console, while genuinely-unknown register offsets and out-of-range
 /// accesses get their own generous budget so lazy discovery never goes
 /// silent behind routine traffic.
-static LOG: crate::diag_util::TwoTierLog = crate::diag_util::TwoTierLog::new(8, 64);
+static LOG: crate::diag::diag_util::TwoTierLog = crate::diag::diag_util::TwoTierLog::new(8, 64);
 
-/// Marker for the [`crate::mmio::MmioPeripheral`] router. The four slot
+/// Marker for the [`crate::hv::mmio::MmioPeripheral`] router. The four slot
 /// register banks are module-level statics; this zero-sized type only
 /// names the model for static dispatch.
 pub struct Pcmcia;
 
-impl crate::mmio::MmioPeripheral for Pcmcia {
+impl crate::hv::mmio::MmioPeripheral for Pcmcia {
     fn owns(ipa: u64) -> bool {
         owns(ipa)
     }
@@ -302,5 +302,5 @@ fn halt_pcmcia_unreachable(op: &'static str, ipa: u64, value: u32) -> ! {
     kprintln!(
         "   pcmcia::owns and ipa_to_slot in peripherals/pcmcia.rs.)"
     );
-    crate::cpu::halt();
+    crate::arch::cpu::halt();
 }

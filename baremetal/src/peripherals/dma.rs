@@ -11,7 +11,7 @@
 //! `Emulator/TDMAManager.cpp:172-277`).
 //!
 //! For phase-B we wire those two channels through to the hypervisor's
-//! host PL011 (see `crate::uart`) so the guest's external-serial port
+//! host PL011 (see `crate::host::console`) so the guest's external-serial port
 //! (`extr`) actually moves bytes. The register-level semantics here
 //! mirror Einstein's `TBasicSerialPortManager::{Read,Write}{Rx,Tx}DMARegister`
 //! (`Emulator/Serial/TBasicSerialPortManager.cpp:642-891`):
@@ -51,7 +51,7 @@
 
 use core::cell::UnsafeCell;
 
-use crate::{guest_endian, kprintln, peripherals::vic, uart};
+use crate::{hv::guest_endian, kprintln, peripherals::vic, host::console};
 
 /// Per-channel completion-IRQ mask. From `TBasicSerialPortManager.cpp:
 /// 295-296` (`kDMAChannel0IntMask = 0x80`, `kDMAChannel1IntMask = 0x100`).
@@ -161,14 +161,14 @@ static DMA: DmaCell = DmaCell(UnsafeCell::new(DmaState {
 /// console, while genuinely-unknown register offsets get their own
 /// generous budget so discovery never goes fully silent on the back of
 /// routine traffic.
-static LOG: crate::diag_util::TwoTierLog = crate::diag_util::TwoTierLog::new(8, 64);
+static LOG: crate::diag::diag_util::TwoTierLog = crate::diag::diag_util::TwoTierLog::new(8, 64);
 
-/// Marker for the [`crate::mmio::MmioPeripheral`] router. The DMA
+/// Marker for the [`crate::hv::mmio::MmioPeripheral`] router. The DMA
 /// register state lives in the module-level `DMA` cell; this zero-sized
 /// type only names the model for static dispatch.
 pub struct Dma;
 
-impl crate::mmio::MmioPeripheral for Dma {
+impl crate::hv::mmio::MmioPeripheral for Dma {
     fn owns(ipa: u64) -> bool {
         owns(ipa)
     }
@@ -375,10 +375,10 @@ fn drain_tx_channel(s: &mut DmaState, ch_idx: u32) {
                      (buf_start={:#010x} buf_size={:#x} countdown={:#x}) ***",
                     ch_idx, ch.data_ptr, ch.buf_start, ch.buf_size, ch.countdown,
                 );
-                crate::cpu::halt();
+                crate::arch::cpu::halt();
             }
         };
-        uart::write_byte(byte);
+        console::write_byte(byte);
         ch.data_ptr = ch.data_ptr.wrapping_add(1);
         ch.buf_size = ch.buf_size.wrapping_sub(1);
         if ch.buf_size == 0 {
@@ -416,7 +416,7 @@ pub fn poll_rx() {
     }
     let mut deposited = 0u32;
     while ch.countdown > 0 {
-        let Some(byte) = uart::read_byte_nonblock() else { break };
+        let Some(byte) = console::read_byte_nonblock() else { break };
         guest_endian::guest_write_u8_pa(ch.data_ptr, byte);
         ch.data_ptr = ch.data_ptr.wrapping_add(1);
         ch.buf_size = ch.buf_size.wrapping_sub(1);
@@ -498,5 +498,5 @@ fn halt_unknown_dma(op: &'static str, ipa: u64, value: u32) -> ! {
     kprintln!(
         "   Emulator/Serial/TBasicSerialPortManager.cpp.)"
     );
-    crate::cpu::halt();
+    crate::arch::cpu::halt();
 }

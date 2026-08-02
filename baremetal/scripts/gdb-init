@@ -28,7 +28,7 @@
 #      it UND-traps into EL2, gdb stops at trap_sync_lower_aarch32
 #      with $ELR_EL2 == <addr>, and the hypervisor restores the
 #      original instruction before ERET. One-shot — re-install to
-#      re-arm. ROM range only (0..0x01000000). See src/guest_bp.rs.
+#      re-arm. ROM range only (0..0x01000000). See src/diag/guest_bp.rs.
 
 set pagination off
 set confirm off
@@ -71,19 +71,19 @@ end
 # the 16 MiB ROM window, not just natural trap points. Invokes
 # `install_guest_bp` in the hypervisor via gdb's `call`.
 define bp
-  # Call the extern "C" entry point in src/guest_bp.rs. The Rust-
+  # Call the extern "C" entry point in src/diag/guest_bp.rs. The Rust-
   # mangled version and the unmangled #[no_mangle] symbol both exist;
   # we qualify by module path so gdb picks the Rust signature with
   # DWARF types.
   set $_rc = newton_hypervisor::guest_bp::install_guest_bp($arg0)
   if $_rc < 0
-    printf "install_guest_bp(0x%x) failed: rc=%d (see src/guest_bp.rs for codes)\n", $arg0, $_rc
+    printf "install_guest_bp(0x%x) failed: rc=%d (see src/diag/guest_bp.rs for codes)\n", $arg0, $_rc
   else
     printf "guest_bp installed at 0x%x (slot %d); arming stop...\n", $arg0, $_rc
     # Stable stop point: `bp_hit_anchor`, an empty `#[inline(never)]`
     # `extern "C"` function called from `handle_user_bp_und` right
     # after the slot lookup confirms a real BP hit, before any
-    # special-case PC dispatch. See src/guest_bp.rs.
+    # special-case PC dispatch. See src/diag/guest_bp.rs.
     #
     # Why a function and not a line-numbered breakpoint:
     #   - line numbers drift as the source moves (we've already had

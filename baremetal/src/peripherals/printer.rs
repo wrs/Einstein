@@ -14,7 +14,7 @@
 //! `TNativePrimitives::ExecutePrinterDriverNative`
 //! (`Emulator/TNativePrimitives.cpp:3237-3375`).
 
-use crate::trap_context::TrapContext;
+use crate::arch::trap_context::TrapContext;
 use crate::peripherals::native_primitives::NativeDriver;
 
 /// Marker for the [`NativeDriver`] dispatch in
@@ -57,7 +57,7 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         0x0C => {
             ctx.x[0] = 0;
         }
-        _ => crate::diag_util::halt_unknown_subfn(
+        _ => crate::diag::diag_util::halt_unknown_subfn(
             "printer", subfn, pc,
             ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
         ),

@@ -14,7 +14,7 @@
 //! encode that fallback, and we additionally retry the raw PA form so a
 //! caller that passes a PA directly still succeeds.
 
-use crate::{cpu, guest_endian, guest_mem, kprintln};
+use crate::{arch::cpu, hv::guest_endian, hv::guest_mem, kprintln};
 
 /// Read a 32-bit guest word (VA-first, PA-fallback). Halts loudly with
 /// `what` and `pc` in the message if neither access resolves.

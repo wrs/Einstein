@@ -11,7 +11,7 @@
 //! opcode points exactly at the missing entry, then return r0 = 0 for the
 //! ones the protocol defines.
 
-use crate::trap_context::TrapContext;
+use crate::arch::trap_context::TrapContext;
 use crate::peripherals::native_primitives::NativeDriver;
 
 /// Marker for the [`NativeDriver`] dispatch in
@@ -35,7 +35,7 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         | 0x07 | 0x08 | 0x09 | 0x0A | 0x0B | 0x0C => {
             ctx.x[0] = 0;
         }
-        _ => crate::diag_util::halt_unknown_subfn(
+        _ => crate::diag::diag_util::halt_unknown_subfn(
             "out_translator", subfn, pc,
             ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
         ),

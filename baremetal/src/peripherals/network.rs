@@ -9,7 +9,7 @@
 //! `TNativePrimitives::ExecuteNetworkManagerNative`
 //! (`Emulator/TNativePrimitives.cpp:2889-3151`).
 
-use crate::{kprintln, peripherals::guest_access, trap_context::TrapContext};
+use crate::{kprintln, peripherals::guest_access, arch::trap_context::TrapContext};
 use crate::peripherals::native_primitives::NativeDriver;
 
 /// Marker for the [`NativeDriver`] dispatch in
@@ -96,7 +96,7 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         // 0x16 — debug print of memory location; no-op.
         0x16 => {}
 
-        _ => crate::diag_util::halt_unknown_subfn(
+        _ => crate::diag::diag_util::halt_unknown_subfn(
             "network", subfn, pc,
             ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
         ),

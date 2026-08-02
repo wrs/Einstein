@@ -5,7 +5,7 @@
 //! native call with driver=0x000002. Each subfn mirrors the return
 //! value Einstein produces in `TNativePrimitives::ExecuteSoundDriverNative`
 //! (`Emulator/TNativePrimitives.cpp:1062-1400`) and, where relevant,
-//! forwards to the active [`crate::audio`] backend so the buffer
+//! forwards to the active [`crate::host::audio`] backend so the buffer
 //! actually reaches a host audio device. With the null backend (the
 //! default) the boot path to `TInterpreter` runs identically to the
 //! Einstein "no sound" emulation — Einstein returns success for most
@@ -18,9 +18,9 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::{audio, dprintln};
+use crate::{host::audio, dprintln};
 use crate::peripherals::vic;
-use crate::trap_context::TrapContext;
+use crate::arch::trap_context::TrapContext;
 
 use crate::peripherals::native_primitives::NativeDriver;
 
@@ -115,8 +115,8 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
                 // VA write fails when the guest's stage-1 MMU is off
                 // (e.g. inside a guest test); fall back to a direct PA
                 // write so the caller still sees the populated struct.
-                if !crate::guest_endian::guest_write_u32_va(addr, val) {
-                    let _ = crate::guest_endian::guest_write_u32_pa(addr, val);
+                if !crate::hv::guest_endian::guest_write_u32_va(addr, val) {
+                    let _ = crate::hv::guest_endian::guest_write_u32_pa(addr, val);
                 }
             }
             ctx.x[0] = 0;
@@ -278,7 +278,7 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
             audio::set_interrupt_mask(ctx.x[1] as u32, ctx.x[2] as u32);
         }
 
-        _ => crate::diag_util::halt_unknown_subfn(
+        _ => crate::diag::diag_util::halt_unknown_subfn(
             "sound", subfn, pc,
             ctx.x[0] as u32, ctx.x[1] as u32, ctx.x[2] as u32, ctx.x[3] as u32,
         ),

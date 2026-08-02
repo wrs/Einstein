@@ -17,10 +17,10 @@
 //! unknown code halts loudly with a full context dump so the next
 //! ROM boot that hits one points exactly at the missing table entry.
 
-use crate::{cpu, kprintln, peripherals::{
+use crate::{arch::cpu, kprintln, peripherals::{
     battery, flash_driver, host_call, in_translator, network, out_translator,
     platform, printer, screen, serial_driver, sound, tablet,
-}, trap_context::TrapContext};
+}, arch::trap_context::TrapContext};
 
 /// Uniform contract for a native-primitive driver.
 ///
@@ -34,7 +34,7 @@ use crate::{cpu, kprintln, peripherals::{
 /// `dyn`, no vtable.
 ///
 /// Unrecognised sub-functions must route to
-/// [`crate::diag_util::halt_unknown_subfn`] so every driver gets the same
+/// [`crate::diag::diag_util::halt_unknown_subfn`] so every driver gets the same
 /// loud, actionable context dump for free.
 pub trait NativeDriver {
     /// The 24-bit driver ID this model answers to (`native_insn >> 8`).

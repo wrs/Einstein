@@ -22,10 +22,18 @@
 #                 trap internals, stage2, timer, snapshot — stays
 #                 forbidden.
 #   host        — host drivers/backends; below main, not imported by
-#                 the guest-facing layers. Sanctioned upward edge:
-#                 host backends may call the peripherals::{vic::raise_*,
-#                 queue} event-injection APIs (host feeds events into
-#                 guest models). Nothing else crosses upward.
+#                 the guest-facing layers — with one global exception:
+#                 host::platform is the board API (conceptually the
+#                 lowest crate despite its location) and is importable
+#                 from ANY layer. Sanctioned upward edges from host:
+#                 backends may call the peripherals::{vic::raise_*,
+#                 vic::is_powered_off, queue} event-injection APIs
+#                 (host feeds events into guest models; the powered-off
+#                 read backs Einstein's first-tap-is-power-button
+#                 policy in the input layer), and may consume the
+#                 hv::{guest_mem, guest_endian} read/translate
+#                 accessors (host renders/streams guest memory: pi_fb
+#                 scaling, pi_hdmi PCM reads). Nothing else crosses.
 #   diag        — diagnostics; reachable from anywhere via its stable
 #                 surface (real impls or no-op stubs). Any layer may
 #                 import diag; diag's own imports are unconstrained
@@ -60,9 +68,10 @@ forbidden_peripherals="hv newton host"
 forbidden_host="hv newton peripherals"
 
 # Sanctioned host→peripherals event-injection edge: vic raise_*/INT_*
-# constants, or a plain module import of peripherals::vic (whose only
+# constants, the is_powered_off read (input-layer power-button
+# policy), or a plain module import of peripherals::vic (whose only
 # legitimate use from host is raising interrupts into the guest model).
-host_sanctioned='peripherals::vic::(raise|INT_)|use crate::([a-z_:, {]*)peripherals::vic[};]'
+host_sanctioned='peripherals::vic::(raise|INT_|is_powered_off)|use crate::([a-z_:, {]*)peripherals::vic[};]'
 
 # Sanctioned peripherals→hv service modules: layout, guest_endian,
 # guest_mem, and mmio (the MmioPeripheral trait). A line is sanctioned
@@ -70,6 +79,15 @@ host_sanctioned='peripherals::vic::(raise|INT_)|use crate::([a-z_:, {]*)peripher
 # stripping the sanctioned references and testing for leftovers, so a
 # grouped import mixing hv::mmio with e.g. hv::stage2 still flags.
 periph_sanctioned_strip='hv::(layout|guest_endian|guest_mem|mmio)'
+
+# Sanctioned host→hv service modules: the guest_mem / guest_endian
+# read/translate accessors (host backends consume guest memory — fb
+# scaling, PCM sample reads). Same strip-and-test mechanics.
+host_hv_sanctioned_strip='hv::(guest_mem|guest_endian)'
+
+# host::platform is globally importable (see the layer table above).
+# Applied to every layer's forbidden-host scan via strip-and-test.
+host_platform_strip='host::platform'
 
 # Load allowlist entries (glob, regex), skipping comments/blank lines.
 allow_globs=()
@@ -98,6 +116,22 @@ for layer in "${layers[@]}"; do
             if [[ "$layer" == host && "$forb" == peripherals ]] \
                 && grep -qE "$host_sanctioned" <<<"$text"; then
                 continue
+            fi
+            # host::platform is the board API — importable from any
+            # layer; skip when no other host:: reference remains.
+            if [[ "$forb" == host ]]; then
+                residue="$(sed -E "s/${host_platform_strip}//g" <<<"$text")"
+                if ! grep -qE '(^|[^A-Za-z0-9_])host::' <<<"$residue"; then
+                    continue
+                fi
+            fi
+            # Host backends may use the hv guest-memory accessors; skip
+            # only when no unsanctioned hv:: reference remains.
+            if [[ "$layer" == host && "$forb" == hv ]]; then
+                residue="$(sed -E "s/${host_hv_sanctioned_strip}//g" <<<"$text")"
+                if ! grep -qE '(^|[^A-Za-z0-9_])hv::' <<<"$residue"; then
+                    continue
+                fi
             fi
             # The MMIO router is the single sanctioned hv→peripherals
             # edge (closed-enum dispatch to the device models).

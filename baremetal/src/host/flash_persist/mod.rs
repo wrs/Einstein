@@ -31,6 +31,47 @@ mod null;
 #[cfg(nh_flash_persist_sd)]
 mod sd;
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Size of the guest-flash backing this layer persists (two 4 MiB
+/// banks). The backing itself belongs to `peripherals::flash`;
+/// [`set_backing`] cross-checks the registered store against this
+/// constant so the two layers can't silently diverge.
+pub const FLASH_SIZE: usize = 8 * 1024 * 1024;
+
+/// Host physical base of the guest-flash backing store, registered by
+/// `main.rs` boot wiring (`peripherals::flash::host_pa()`). 0 =
+/// unregistered; [`backing_base`] halts loudly on use before wiring.
+static BACKING_BASE: AtomicU64 = AtomicU64::new(0);
+
+/// Register the guest-flash backing store. Called once from `main.rs`
+/// before [`init`] / [`try_load`] run.
+pub fn set_backing(base: u64, len: usize) {
+    if len != FLASH_SIZE {
+        crate::kprintln!(
+            "*** flash_persist: registered backing is {} bytes, expected {} ***",
+            len,
+            FLASH_SIZE
+        );
+        crate::arch::cpu::halt();
+    }
+    BACKING_BASE.store(base, Ordering::Release);
+}
+
+/// Host physical base of the registered backing. Halts loudly if
+/// `main.rs` never registered one — a boot wiring bug.
+#[cfg(any(nh_flash_persist_semihost, nh_flash_persist_sd))]
+fn backing_base() -> u64 {
+    let base = BACKING_BASE.load(Ordering::Acquire);
+    if base == 0 {
+        crate::kprintln!(
+            "*** flash_persist: no backing registered — main.rs must set_backing() before use ***"
+        );
+        crate::arch::cpu::halt();
+    }
+    base
+}
+
 /// Backend interface. Single-threaded EL2 callers; impls do not need
 /// to be re-entrant.
 pub trait FlashStore: Sync {

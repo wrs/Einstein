@@ -21,7 +21,7 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::FlashStore;
-use crate::{kprintln, peripherals};
+use crate::kprintln;
 
 // Semihosting op IDs (ARM Semihosting for AArch32/64, section 5.3).
 const SYS_OPEN: u64 = 0x01;
@@ -47,7 +47,7 @@ const FLASH_DIR: &str = env!("NEWTON_FLASH_DIR");
 /// Block granularity for dirty tracking + I/O. Each set bit in DIRTY
 /// covers BLOCK_SIZE bytes of GUEST_FLASH.
 const BLOCK_SIZE: usize = 64 * 1024;
-const NUM_BLOCKS: usize = peripherals::flash::SIZE / BLOCK_SIZE; // 128
+const NUM_BLOCKS: usize = super::FLASH_SIZE / BLOCK_SIZE; // 128
 
 // 128 bits = 4 × u32. Per-word AtomicU32 lets `mark_dirty` use
 // fetch_or with no global lock; saves use swap(0) for the
@@ -83,12 +83,12 @@ impl FlashStore for SemihostBackend {
             return;
         }
         let len = sh_flen(fh);
-        if len != peripherals::flash::SIZE as i64 {
+        if len != super::FLASH_SIZE as i64 {
             kprintln!(
                 "flash_persist: {} is {} bytes, want {} — ignoring, will rewrite on next save",
                 path_str(),
                 len,
-                peripherals::flash::SIZE
+                super::FLASH_SIZE
             );
             sh_close(fh);
             return;
@@ -98,8 +98,8 @@ impl FlashStore for SemihostBackend {
         // the flash to the guest. `len` matches SIZE, checked above.
         let buf = unsafe {
             core::slice::from_raw_parts_mut(
-                peripherals::flash::host_pa() as *mut u8,
-                peripherals::flash::SIZE,
+                super::backing_base() as *mut u8,
+                super::FLASH_SIZE,
             )
         };
         let ok = sh_read(fh, buf) == 0;
@@ -120,7 +120,7 @@ impl FlashStore for SemihostBackend {
         FILE_VALID.store(true, Ordering::Relaxed);
         kprintln!(
             "flash_persist: loaded {} bytes from {}",
-            peripherals::flash::SIZE,
+            super::FLASH_SIZE,
             path_str()
         );
     }
@@ -198,8 +198,8 @@ impl FlashStore for SemihostBackend {
             // it for the duration of the semihosting write call.
             let bytes = unsafe {
                 core::slice::from_raw_parts(
-                    peripherals::flash::host_pa() as *const u8,
-                    peripherals::flash::SIZE,
+                    super::backing_base() as *const u8,
+                    super::FLASH_SIZE,
                 )
             };
             let unwritten = sh_write(fh, bytes);
@@ -217,7 +217,7 @@ impl FlashStore for SemihostBackend {
             FILE_VALID.store(true, Ordering::Relaxed);
             kprintln!(
                 "flash_persist: wrote full {} bytes to {}",
-                peripherals::flash::SIZE,
+                super::FLASH_SIZE,
                 path_str()
             );
             return;
@@ -261,7 +261,7 @@ impl FlashStore for SemihostBackend {
                 // duration of the write call; bounded by SIZE.
                 let block_bytes = unsafe {
                     core::slice::from_raw_parts(
-                        (peripherals::flash::host_pa() as *const u8).add(off),
+                        (super::backing_base() as *const u8).add(off),
                         BLOCK_SIZE,
                     )
                 };
@@ -308,8 +308,8 @@ impl FlashStore for SemihostBackend {
         // SAFETY: static mut byte array; single-threaded EL2.
         let bytes = unsafe {
             core::slice::from_raw_parts(
-                peripherals::flash::host_pa() as *const u8,
-                peripherals::flash::SIZE,
+                super::backing_base() as *const u8,
+                super::FLASH_SIZE,
             )
         };
         let mut h: u32 = 0x811c_9dc5;

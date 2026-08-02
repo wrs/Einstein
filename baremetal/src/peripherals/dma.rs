@@ -10,9 +10,10 @@
 //! (`TDMAManager::Read/WriteChannel{1,2}Register` at
 //! `Emulator/TDMAManager.cpp:172-277`).
 //!
-//! For phase-B we wire those two channels through to the hypervisor's
-//! host PL011 (see `crate::host::console`) so the guest's external-serial port
-//! (`extr`) actually moves bytes. The register-level semantics here
+//! For phase-B we wire those two channels through the guest-console
+//! seam (`peripherals::console`, installed by `main.rs` with the host
+//! PL011 endpoints) so the guest's external-serial port (`extr`)
+//! actually moves bytes. The register-level semantics here
 //! mirror Einstein's `TBasicSerialPortManager::{Read,Write}{Rx,Tx}DMARegister`
 //! (`Emulator/Serial/TBasicSerialPortManager.cpp:642-891`):
 //!
@@ -51,7 +52,8 @@
 
 use core::cell::UnsafeCell;
 
-use crate::{hv::guest_endian, kprintln, peripherals::vic, host::console};
+use crate::{hv::guest_endian, kprintln, peripherals::vic};
+use crate::peripherals::console;
 
 /// Per-channel completion-IRQ mask. From `TBasicSerialPortManager.cpp:
 /// 295-296` (`kDMAChannel0IntMask = 0x80`, `kDMAChannel1IntMask = 0x100`).
@@ -281,7 +283,7 @@ fn write_channel_reg(s: &mut DmaState, bank: u32, channel: u32, register: u32, v
 }
 
 /// Chip-wide enable register write. For channels 0/1 we kick the
-/// transfer immediately: TX drains the buffer to the host PL011, RX
+/// transfer immediately: TX drains the buffer to the host console wire, RX
 /// just marks the channel armed (poll picks up bytes later). Other
 /// channels are logged-and-dropped.
 fn write_enable(s: &mut DmaState, value: u32) {
@@ -304,7 +306,7 @@ fn write_enable(s: &mut DmaState, value: u32) {
                 // (`Emulator/Serial/TPtySerialPortManager.cpp:215-240`)
                 // which fires once per byte at 38400 bps; we coalesce
                 // all bytes into one synchronous drain since the host
-                // PL011 already has its own FIFO. If the request exceeds
+                // wire already has its own FIFO. If the request exceeds
                 // the per-call 4 KiB cap, `poll_tx` continues the drain
                 // on subsequent trap_irq ticks.
                 drain_tx_channel(s, ch_idx);
@@ -329,7 +331,7 @@ fn write_disable(s: &mut DmaState, value: u32) {
     }
 }
 
-/// Drain channel 1 (serial 0 TX) to the host PL011. Decrements
+/// Drain channel 1 (serial 0 TX) to the host console wire. Decrements
 /// `countdown`/`buf_size`, wraps `data_ptr` at the end of the ring,
 /// and on countdown=0 raises `INT_DMA_CH1` with `event=0x80` —
 /// mirroring `TPtySerialPortManager::HandleDMA` TX branch.
@@ -364,7 +366,7 @@ fn drain_tx_channel(s: &mut DmaState, ch_idx: u32) {
                 crate::arch::cpu::halt();
             }
         };
-        console::write_byte(byte);
+        console::tx(byte);
         ch.data_ptr = ch.data_ptr.wrapping_add(1);
         ch.buf_size = ch.buf_size.wrapping_sub(1);
         if ch.buf_size == 0 {
@@ -388,7 +390,7 @@ fn drain_tx_channel(s: &mut DmaState, ch_idx: u32) {
     }
 }
 
-/// Pump channel 0 (serial 0 RX) from the host PL011 into guest RAM.
+/// Pump channel 0 (serial 0 RX) from the host console wire into guest RAM.
 /// Called from `trap_irq` on each timer-IRQ tick. Raises
 /// `INT_DMA_CH0` (event=0x40) whenever at least one byte was
 /// deposited, matching `TPtySerialPortManager::HandleDMA` RX branch
@@ -402,7 +404,7 @@ pub fn poll_rx() {
     }
     let mut deposited = 0u32;
     while ch.countdown > 0 {
-        let Some(byte) = console::read_byte_nonblock() else { break };
+        let Some(byte) = console::rx() else { break };
         guest_endian::guest_write_u8_pa(ch.data_ptr, byte);
         ch.data_ptr = ch.data_ptr.wrapping_add(1);
         ch.buf_size = ch.buf_size.wrapping_sub(1);
@@ -423,7 +425,7 @@ pub fn poll_rx() {
     }
 }
 
-/// Continue draining channel 1 (serial 0 TX) to the host PL011.
+/// Continue draining channel 1 (serial 0 TX) to the host console wire.
 /// Called from `trap_irq` on each timer-IRQ tick alongside `poll_rx`.
 /// `write_enable` drains the initial burst synchronously but caps a
 /// single drain at 4 KiB; for a TX request larger than that the cap

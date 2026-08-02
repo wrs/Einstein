@@ -47,7 +47,6 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(nh_loud_halt_canaries)");
     println!("cargo:rustc-check-cfg=cfg(nh_real_hw)");
 
-    validate_feature_matrix();
     resolve_loud_halt_canaries();
     resolve_real_hw();
 
@@ -251,84 +250,14 @@ fn select_platform_linker_script() {
     println!("cargo:rustc-link-arg=-T{script}");
 }
 
-/// Enforce the cross-axis feature constraints that the platform/backend
-/// modules assume but Cargo's additive features can't express. Each
-/// `host-io-*` / `flash-persist-*` / `audio-*` / `input-*` axis composes
-/// syntactically with any platform, but several backends reference
-/// `platform-raspi3b`-only modules (`display`, `sd`, `mailbox` in
-/// `main.rs`) or each other, so the wrong combination fails deep in
-/// `src/` with an opaque `E0432`/`E0599`. Panic here instead, with the
-/// constraint named — same actionable style as
-/// `select_platform_linker_script`.
-///
-/// Constraints (each verified against the actual cfg gates in source):
-///   - `input-mtouch` → `src/host/input/calibrate.rs` unconditionally imports
-///     `crate::host::host_io::pi_fb`, which only exists under
-///     `nh_host_io_pi_fb`. Requires `host-io-pi-fb`.
-///   - `sd-probe` → `src/host/sd/probe.rs` calls `write_block_dma`, gated
-///     `cfg(nh_real_hw)` (`no-semihost` + `platform-raspi3b`). Requires
-///     both.
-///   - `host-io-pi-fb` → `src/host/host_io/pi_fb.rs` uses `crate::display::*`
-///     (`mod display` is `cfg(feature = "platform-raspi3b")`).
-///   - `flash-persist-sd` → `src/host/flash_persist/sd.rs` uses
-///     `crate::sd::*` (`mod sd` is `cfg(feature = "platform-raspi3b")`).
-///   - `audio-pi-hdmi` → `src/host/audio/pi_hdmi.rs` uses `crate::host::mailbox::*`
-///     (`mod mailbox` is `cfg(feature = "platform-raspi3b")`).
-fn validate_feature_matrix() {
-    // Only meaningful for the bare-metal target; the host-test build
-    // (`cargo test --target aarch64-apple-darwin`) compiles a reduced
-    // surface and these modules aren't in play.
-    let target = env::var("TARGET").unwrap_or_default();
-    if !target.contains("none") {
-        return;
-    }
-
-    let raspi3b = env::var("CARGO_FEATURE_PLATFORM_RASPI3B").is_ok();
-    let no_semihost = env::var("CARGO_FEATURE_NO_SEMIHOST").is_ok();
-    let host_io_pi_fb = env::var("CARGO_FEATURE_HOST_IO_PI_FB").is_ok();
-    let flash_persist_sd = env::var("CARGO_FEATURE_FLASH_PERSIST_SD").is_ok();
-    let audio_pi_hdmi = env::var("CARGO_FEATURE_AUDIO_PI_HDMI").is_ok();
-    let input_mtouch = env::var("CARGO_FEATURE_INPUT_MTOUCH").is_ok();
-    let sd_probe = env::var("CARGO_FEATURE_SD_PROBE").is_ok();
-
-    if input_mtouch && !host_io_pi_fb {
-        panic!(
-            "input-mtouch requires host-io-pi-fb \
-             (src/host/input/calibrate.rs imports crate::host::host_io::pi_fb). \
-             Use the pi-bare-metal-input aggregate, or add --features host-io-pi-fb."
-        );
-    }
-
-    if sd_probe && !(no_semihost && raspi3b) {
-        panic!(
-            "sd-probe requires no-semihost + platform-raspi3b \
-             (src/host/sd/probe.rs uses the real-hardware BCM2835 DMA path). \
-             Build with --features \"pi-bare-metal sd-probe\"."
-        );
-    }
-
-    if host_io_pi_fb && !raspi3b {
-        panic!(
-            "host-io-pi-fb requires platform-raspi3b \
-             (src/host/host_io/pi_fb.rs uses crate::host::display, which is \
-             platform-raspi3b-only)."
-        );
-    }
-    if flash_persist_sd && !raspi3b {
-        panic!(
-            "flash-persist-sd requires platform-raspi3b \
-             (src/host/flash_persist/sd.rs uses crate::host::sd, which is \
-             platform-raspi3b-only)."
-        );
-    }
-    if audio_pi_hdmi && !raspi3b {
-        panic!(
-            "audio-pi-hdmi requires platform-raspi3b \
-             (src/host/audio/pi_hdmi.rs uses crate::mailbox, which is \
-             platform-raspi3b-only)."
-        );
-    }
-}
+// Cross-axis feature constraints are expressed as Cargo feature
+// dependencies in Cargo.toml (hardware-implying backends pull in
+// `platform-raspi3b`; `sd-probe` pulls in `no-semihost` too), so a
+// hardware backend on the wrong platform can no longer be selected —
+// the dependency drags in the second platform and
+// `select_platform_linker_script` rejects the contradiction with a
+// named message. That platform mutual-exclusion check is the only
+// imperative gate left.
 
 /// Emit `cfg(nh_real_hw)` when the build targets a real Pi Zero 2 W:
 /// `no-semihost` + `platform-raspi3b`, i.e. the BCM2835 DMA engine and

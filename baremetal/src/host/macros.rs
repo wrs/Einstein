@@ -59,6 +59,21 @@ macro_rules! raw_println {
     }};
 }
 
+/// Emit one raw byte on the host console *wire* (PL011 TX, busy-wait
+/// on FIFO room) — NOT the `kprintln!` stream, which goes to
+/// semihosting stdout on QEMU/FVP builds. For the rare paths that
+/// must produce literal bytes on the physical serial line (the
+/// guest-test print-byte HVC); everything else should use the
+/// `kprint!` family. Macro (rather than a direct
+/// `host::console::write_byte` call) so non-host layers can emit a
+/// wire byte without importing `host::*`.
+#[macro_export]
+macro_rules! raw_wire_byte {
+    ($b:expr) => {
+        $crate::host::console::write_byte($b)
+    };
+}
+
 /// Debug-log variant of `kprintln!` for recurring diagnostic messages
 /// that dominate the console during phase-B bring-up (e.g., per-trap
 /// ELR logs, stage-1 walk summaries, SCTLR writes). Expands to the

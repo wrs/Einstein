@@ -35,9 +35,51 @@ use crate::log_host_io;
 
 /// Newton's screen dimensions, pinned to MP2100 native 320×480 to
 /// avoid ROM landscape-mode quirks. The OS-layer would accept other
-/// sizes; the ROM does not.
+/// sizes; the ROM does not. Reported to `peripherals::screen` through
+/// [`super::HostIo::panel_geometry`] (pulled by `main.rs` at boot).
 const NEWTON_W: u32 = 320;
 const NEWTON_H: u32 = 480;
+/// 2 bpp grayscale — the MP2x00 panel depth `peripherals::screen`
+/// models.
+const NEWTON_BPP: u32 = 2;
+
+pub struct PiFbBackend;
+
+impl super::HostIo for PiFbBackend {
+    fn init(&self) {
+        init()
+    }
+    fn on_resume(&self) {
+        // Repaint the panel from the restored GUEST_FB. No host-side
+        // state of our own to reset beyond that.
+        super::push_full_repaint(NEWTON_W, NEWTON_H, NEWTON_BPP);
+    }
+    fn push_blit(&self, ev: &super::BlitEvent, payload: &[u8]) {
+        push_blit(ev, payload)
+    }
+    fn pump_input(&self) {
+        // No input source on this backend directly; see `input::mtouch`.
+    }
+    fn panel_geometry(&self) -> Option<(u32, u32)> {
+        // The pin is a compile-time property of this backend, not an
+        // outcome of panel bring-up — report it unconditionally.
+        Some((NEWTON_W, NEWTON_H))
+    }
+    #[cfg(nh_input_mtouch)]
+    fn painted_region(&self) -> Option<super::PaintedRegion> {
+        let f = fb()?;
+        Some(super::PaintedRegion {
+            panel_w: f.width,
+            panel_h: f.height,
+            offset_x: OFFSET_X.load(Ordering::Relaxed),
+            offset_y: OFFSET_Y.load(Ordering::Relaxed),
+            painted_w: PAINTED_W.load(Ordering::Relaxed),
+            painted_h: PAINTED_H.load(Ordering::Relaxed),
+        })
+    }
+}
+
+pub static BACKEND: PiFbBackend = PiFbBackend;
 
 /// Panel rows the Pi firmware reserves at the top of the scan-out
 /// region for its own loader UI — observed as a persistent thin
@@ -90,7 +132,7 @@ fn fb() -> Option<&'static FbInfo> {
     unsafe { FB.as_ref() }
 }
 
-pub fn init() {
+fn init() {
     // The boot splash (`display::splash::init`, called earlier from
     // kmain) already allocated the framebuffer, painted the
     // background + logo + progress bar, and flushed. We adopt its
@@ -104,8 +146,6 @@ pub fn init() {
             return;
         }
     };
-
-    crate::peripherals::screen::set_screen_size(NEWTON_W, NEWTON_H);
 
     // The firmware reserves `FIRMWARE_TOP_BAR_PX` rows at the top
     // of the scan-out region; FB row 0 lands at panel row
@@ -162,13 +202,7 @@ pub fn init() {
     );
 }
 
-pub fn on_resume() {
-    // The host_io::on_resume layer pushes a full-repaint blit ahead
-    // of calling backend on_resume; we don't need to do anything
-    // here. (No host-side state of our own to reset.)
-}
-
-pub fn push_blit(ev: &BlitEvent, _payload: &[u8]) {
+fn push_blit(ev: &BlitEvent, _payload: &[u8]) {
     let Some(fb) = fb() else {
         return;
     };
@@ -276,34 +310,3 @@ fn newton_gray(fb: *const u8, stride: usize, x: usize, y: usize) -> u32 {
     GRAY_TABLE[v]
 }
 
-pub fn pump_input() {
-    // No input source on this backend directly; see `input::mtouch`.
-}
-
-/// Panel pixel dimensions, or `None` if init didn't run. Only the
-/// mtouch calibration transform consumes the painted-geometry
-/// helpers below.
-#[cfg(nh_input_mtouch)]
-pub fn panel_size() -> Option<(u32, u32)> {
-    fb().map(|f| (f.width, f.height))
-}
-
-/// Top-left of the painted Newton region inside the panel, in panel
-/// pixels.
-#[cfg(nh_input_mtouch)]
-pub fn painted_offset() -> (usize, usize) {
-    (
-        OFFSET_X.load(Ordering::Relaxed) as usize,
-        OFFSET_Y.load(Ordering::Relaxed) as usize,
-    )
-}
-
-/// Painted Newton region size in panel pixels (after aspect-
-/// preserving bilinear scale of the 320×480 Newton surface).
-#[cfg(nh_input_mtouch)]
-pub fn painted_size() -> (u32, u32) {
-    (
-        PAINTED_W.load(Ordering::Relaxed),
-        PAINTED_H.load(Ordering::Relaxed),
-    )
-}

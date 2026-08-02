@@ -2,8 +2,9 @@
 //!
 //! Two roles:
 //!
-//! 1. **Outbound display.** `screen::blit` calls [`push_blit`] each time
-//!    it paints pixels. The active backend forwards a `BlitEvent` plus
+//! 1. **Outbound display.** `screen::blit` calls its installed blit
+//!    sink — wired by `main.rs` to [`push_guest_blit`] — each time it
+//!    paints pixels. The active backend forwards a `BlitEvent` plus
 //!    its 2 bpp packed payload to whatever sink it owns (host viewer
 //!    over semihosting IPC for QEMU/FVP, the VC framebuffer on a
 //!    real Pi).
@@ -21,7 +22,10 @@
 //! resolver falls back to "null", which turns everything in here into
 //! a no-op so guest-tests and CI runs behave like the old fb_dump-less
 //! world. The resolver emits `cfg(nh_host_io_<chosen>)`; multiple
-//! opt-ins are still a hard error.
+//! opt-ins are still a hard error. Each backend implements the
+//! [`HostIo`] trait and exports a `static BACKEND`; the one cfg'd
+//! `use` below is the only backend dispatch point (same shape as
+//! `host::flash_persist`'s `FlashStore`).
 
 pub mod queue;
 
@@ -32,7 +36,81 @@ pub mod pi_fb;
 #[cfg(nh_host_io_semihost)]
 mod semihost;
 
+/// Backend interface. Single-threaded EL2 callers; impls do not need
+/// to be re-entrant. Backend asymmetries (a panel to report, a resume
+/// repaint to synthesise) live in the per-backend overrides of the
+/// defaulted methods, not in cfg'd shim code.
+pub trait HostIo: Sync {
+    /// One-time setup: open transport, send a hello, adopt the splash
+    /// framebuffer, …. Called from `kmain` once `vic::init` has
+    /// returned.
+    fn init(&self);
+
+    /// Called after a snapshot restore, before `eret_to_restored`.
+    /// Backends with a display sink push a synthesised full-screen
+    /// repaint here (see [`push_full_repaint`]) so their sink re-syncs
+    /// with the restored GUEST_FB; input backends drop timing-stale
+    /// pending events.
+    fn on_resume(&self);
+
+    /// Forward one blit to the host. Must be non-blocking —
+    /// `screen::blit` calls this from a sync trap with the guest
+    /// stalled. Backends that can't keep up drop events instead of
+    /// blocking.
+    fn push_blit(&self, ev: &BlitEvent, payload: &[u8]);
+
+    /// Pump the backend's input transport: drain newly-arrived host
+    /// pen events, enqueue them as Newton-format samples, and raise
+    /// `INT_TABLET`. Called from the trap-return tail (`trap.rs`).
+    fn pump_input(&self);
+
+    /// The Newton guest screen geometry `(width, height)` this backend
+    /// mandates, or `None` to keep `peripherals::screen`'s model
+    /// default (320×480). `main.rs` pulls this once at boot and pushes
+    /// it into the screen model.
+    fn panel_geometry(&self) -> Option<(u32, u32)> {
+        None
+    }
+
+    /// Where the Newton surface lands on the backend's physical panel,
+    /// for the touch-input calibration transform. `None` when the
+    /// backend has no physical panel (null, semihost) or the panel
+    /// isn't up yet — touch input then no-ops. Compiled exactly where
+    /// its only consumer — `input::calibrate` — is.
+    #[cfg(nh_input_mtouch)]
+    fn painted_region(&self) -> Option<PaintedRegion> {
+        None
+    }
+}
+
+/// Geometry of the painted Newton region on a physical panel, all in
+/// panel pixels. Produced by [`HostIo::painted_region`]; consumed by
+/// `input::calibrate`.
+#[cfg(nh_input_mtouch)]
+#[derive(Copy, Clone)]
+pub struct PaintedRegion {
+    /// Full panel size.
+    pub panel_w: u32,
+    pub panel_h: u32,
+    /// Top-left of the painted Newton region inside the panel.
+    pub offset_x: u32,
+    pub offset_y: u32,
+    /// Painted Newton region size (after aspect-preserving scale).
+    pub painted_w: u32,
+    pub painted_h: u32,
+}
+
+#[cfg(nh_host_io_null)]
+use self::null::BACKEND;
+#[cfg(nh_host_io_pi_fb)]
+use self::pi_fb::BACKEND;
+#[cfg(nh_host_io_semihost)]
+use self::semihost::BACKEND;
+
 pub const BLIT_KIND_BLIT: u8 = 1;
+/// Kind byte for the resume-time repaint — only produced by backends
+/// with a display sink (see [`push_full_repaint`]).
+#[cfg(any(nh_host_io_semihost, nh_host_io_pi_fb))]
 pub const BLIT_KIND_FULL_REPAINT: u8 = 2;
 
 /// Wire-format header for one blit forwarded to the host viewer.
@@ -90,61 +168,85 @@ const _: () = {
     assert!(core::mem::size_of::<PenEvent>() == 8);
 };
 
-/// One-time setup: open transport, send a hello, …. Called from
-/// `kmain` once `vic::init` has returned.
+/// One-time setup. Called from `kmain` once `vic::init` has returned.
 pub fn init() {
-    #[cfg(nh_host_io_null)]
-    null::init();
-    #[cfg(nh_host_io_pi_fb)]
-    pi_fb::init();
-    #[cfg(nh_host_io_semihost)]
-    semihost::init();
+    BACKEND.init();
 }
 
 /// Called after `snapshot::load_latest` restores guest state but
-/// before `eret_to_restored`. Flushes the input queue and pushes a
-/// synthesised full-screen blit so the host viewer's backing store
-/// re-syncs with the restored GUEST_FB.
+/// before `eret_to_restored`. Flushes the shared input queue, then
+/// hands off to the backend (which pushes its own full-screen repaint
+/// if it owns a display sink — see [`HostIo::on_resume`]).
 pub fn on_resume() {
     queue::reset();
-    let payload = current_fb_bytes();
-    let sw = crate::peripherals::screen::screen_width() as u16;
-    let sh = crate::peripherals::screen::screen_height() as u16;
+    BACKEND.on_resume();
+}
+
+/// Blit-sink adapter with the `peripherals::screen::BlitSink`
+/// signature, installed into the screen model by `main.rs`. Wraps the
+/// raw blit parameters in the viewer wire-format [`BlitEvent`]
+/// (kind = [`BLIT_KIND_BLIT`]) and forwards to the active backend.
+/// Rects are `(left, top, right, bottom)` in Newton pixels, matching
+/// the `BlitEvent` field order.
+pub fn push_guest_blit(
+    mode: u8,
+    bpp: u8,
+    src: (u16, u16, u16, u16),
+    dst: (u16, u16, u16, u16),
+    row_bytes: u16,
+    payload: &[u8],
+) {
+    let ev = BlitEvent {
+        kind: BLIT_KIND_BLIT,
+        mode,
+        bpp,
+        _pad: 0,
+        src_left: src.0,
+        src_top: src.1,
+        src_right: src.2,
+        src_bottom: src.3,
+        dst_left: dst.0,
+        dst_top: dst.1,
+        dst_right: dst.2,
+        dst_bottom: dst.3,
+        row_bytes,
+        payload_len: payload.len() as u16,
+    };
+    BACKEND.push_blit(&ev, payload);
+}
+
+/// Synthesise and push a full-screen repaint of the guest framebuffer
+/// (kind = [`BLIT_KIND_FULL_REPAINT`]). Used by display-owning
+/// backends' `on_resume` so their sink re-syncs with the restored
+/// GUEST_FB; the caller supplies its own notion of the Newton screen
+/// geometry, so this shim stays geometry-free.
+#[cfg(any(nh_host_io_semihost, nh_host_io_pi_fb))]
+fn push_full_repaint(w: u32, h: u32, bpp: u32) {
+    let row_bytes = (w * bpp).div_ceil(8);
+    let fb_len = (row_bytes * h) as usize;
+    // SAFETY: `fb_host_pa` is the base of the static GUEST_FB backing
+    // (FRAMEBUFFER_SIZE = 2 MiB); every supported geometry keeps
+    // fb_len ≪ 2 MiB.
+    let payload = unsafe {
+        core::slice::from_raw_parts(crate::hv::guest_mem::fb_host_pa() as *const u8, fb_len)
+    };
     let ev = BlitEvent {
         kind: BLIT_KIND_FULL_REPAINT,
         mode: 0,
-        bpp: crate::peripherals::screen::SCREEN_BPP as u8,
+        bpp: bpp as u8,
         _pad: 0,
         src_left: 0,
         src_top: 0,
-        src_right: sw,
-        src_bottom: sh,
+        src_right: w as u16,
+        src_bottom: h as u16,
         dst_left: 0,
         dst_top: 0,
-        dst_right: sw,
-        dst_bottom: sh,
-        row_bytes: crate::peripherals::screen::fb_row_bytes() as u16,
+        dst_right: w as u16,
+        dst_bottom: h as u16,
+        row_bytes: row_bytes as u16,
         payload_len: payload.len() as u16,
     };
-    push_blit(&ev, payload);
-    #[cfg(nh_host_io_null)]
-    null::on_resume();
-    #[cfg(nh_host_io_pi_fb)]
-    pi_fb::on_resume();
-    #[cfg(nh_host_io_semihost)]
-    semihost::on_resume();
-}
-
-/// Forward one blit to the host. Must be non-blocking — `screen::blit`
-/// calls this from a sync trap with the guest stalled. Backends that
-/// can't keep up drop events instead of blocking.
-pub fn push_blit(ev: &BlitEvent, payload: &[u8]) {
-    #[cfg(nh_host_io_null)]
-    null::push_blit(ev, payload);
-    #[cfg(nh_host_io_pi_fb)]
-    pi_fb::push_blit(ev, payload);
-    #[cfg(nh_host_io_semihost)]
-    semihost::push_blit(ev, payload);
+    BACKEND.push_blit(&ev, payload);
 }
 
 /// Pull a single pen sample off the input queue. Returns
@@ -155,31 +257,23 @@ pub fn pop_pen_sample() -> Option<(u32, u32)> {
     queue::pop()
 }
 
-/// Pump the backend's input transport: drain newly-arrived host pen
-/// events, enqueue them as Newton-format samples, and raise
-/// `INT_TABLET`. Called from the trap-return tail (`trap.rs`).
+/// Pump the backend's input transport — see [`HostIo::pump_input`].
 pub fn pump_input() {
-    #[cfg(nh_host_io_null)]
-    null::pump_input();
-    #[cfg(nh_host_io_pi_fb)]
-    pi_fb::pump_input();
-    #[cfg(nh_host_io_semihost)]
-    semihost::pump_input();
+    BACKEND.pump_input();
 }
 
-/// Return a slice of the Newton 2 bpp framebuffer for the full-repaint
-/// payload. GUEST_FB is hypervisor-managed linear-LE, so no byte-swap
-/// needed. Length tracks the runtime screen size.
-fn current_fb_bytes() -> &'static [u8] {
-    let sw = crate::peripherals::screen::screen_width();
-    let sh = crate::peripherals::screen::screen_height();
-    let fb_len = (sw * sh / 4) as usize;
-    // SAFETY: `fb_host_pa` is the base of the static GUEST_FB backing
-    // (FRAMEBUFFER_SIZE = 2 MiB). The runtime screen size is bounded
-    // by `set_screen_size`, so fb_len ≪ 2 MiB.
-    unsafe {
-        core::slice::from_raw_parts(crate::hv::guest_mem::fb_host_pa() as *const u8, fb_len)
-    }
+/// The Newton screen geometry the active backend mandates — see
+/// [`HostIo::panel_geometry`]. Pulled once by `main.rs` at boot.
+pub fn panel_geometry() -> Option<(u32, u32)> {
+    BACKEND.panel_geometry()
+}
+
+/// Panel transform for the touch-input calibration — see
+/// [`HostIo::painted_region`]. Compiled only where its one consumer
+/// (`input::calibrate`) is.
+#[cfg(nh_input_mtouch)]
+pub fn painted_region() -> Option<PaintedRegion> {
+    BACKEND.painted_region()
 }
 
 /// Encode pen event into Einstein's packed sample format. Mirrors

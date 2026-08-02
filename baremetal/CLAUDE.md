@@ -264,10 +264,12 @@ saw in a log), skip the install: `bg <addr>` and `c` is enough.
   feature gates, or any cfg-dispatched backend. It's also wired into
   `run-all.sh` as an opt-in step gated on `CHECK_MATRIX=1`
   (`CHECK_MATRIX=1 guest-tests/scripts/run-all.sh`) — off by default so
-  the normal test loop doesn't pay the extra checks. build.rs's
-  `validate_feature_matrix()` rejects impossible cross-axis combos at
-  configure time, so a forbidden `--features` set fails with a named
-  message, not a deep compile error.
+  the normal test loop doesn't pay the extra checks. Cross-axis
+  constraints are Cargo feature dependencies (hardware backends imply
+  `platform-raspi3b`; `sd-probe` implies `no-semihost` too), so a
+  forbidden `--features` set drags in the second platform and fails
+  build.rs's platform mutual-exclusion check with a named message,
+  not a deep compile error.
 - **Skip the guest-tests run** when an iteration's only changes
   are a Newton-ROM probe (a new HVC immediate at a Newton-ROM PC
   in `src/newton/rom_patches.rs` + a dispatch arm in `src/hv/trap/hvc.rs` +

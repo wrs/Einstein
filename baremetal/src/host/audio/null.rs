@@ -35,6 +35,39 @@
 use crate::peripherals::vic;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+pub struct NullBackend;
+
+impl super::AudioBackend for NullBackend {
+    fn init(&self) {}
+    fn set_interrupt_mask(&self, input_mask: u32, output_mask: u32) {
+        set_interrupt_mask(input_mask, output_mask)
+    }
+    fn set_output_buffers(&self, _buf1_addr: u32, _buf2_addr: u32) {}
+    fn schedule_output(&self, which: u32, byte_count: u32) {
+        schedule_output(which, byte_count)
+    }
+    fn start_output(&self) {
+        start_output()
+    }
+    fn stop_output(&self) {
+        stop_output()
+    }
+    fn output_is_running(&self) -> bool {
+        // Einstein's `TNullSoundManager::OutputIsRunning` always
+        // returns `false`.
+        false
+    }
+    fn output_volume_set(&self, _volume: u32) {}
+    fn output_volume_get(&self) -> u32 {
+        0
+    }
+    fn tick(&self) {
+        tick()
+    }
+}
+
+pub static BACKEND: NullBackend = NullBackend;
+
 /// Newton output sample rate (BE S16 mono). See `audio::mod`'s
 /// driver contract.
 const NEWTON_RATE_HZ: u64 = 22_050;
@@ -108,18 +141,14 @@ fn disarm_completions() {
     PENDING_EDGES.store(0, Ordering::Relaxed);
 }
 
-pub fn init() {}
-
-pub fn set_interrupt_mask(_input_mask: u32, output_mask: u32) {
+fn set_interrupt_mask(_input_mask: u32, output_mask: u32) {
     OUTPUT_INT_MASK.store(output_mask, Ordering::Relaxed);
 }
-
-pub fn set_output_buffers(_buf1_addr: u32, _buf2_addr: u32) {}
 
 /// Subfn 0x07. `byte_count == 0` ends the output run (matching
 /// `TNullSoundManager::ScheduleOutputBuffer`); otherwise, while
 /// running, arm a completion paced to the buffer's playback duration.
-pub fn schedule_output(_which: u32, byte_count: u32) {
+fn schedule_output(_which: u32, byte_count: u32) {
     if byte_count == 0 {
         OUTPUT_RUNNING.store(false, Ordering::Relaxed);
         disarm_completions();
@@ -134,27 +163,15 @@ pub fn schedule_output(_which: u32, byte_count: u32) {
 /// Subfn 0x0D. `TNullSoundManager::StartOutput` sets running and
 /// raises the output interrupt immediately; we arm the completion for
 /// the next tick so the kernel sees a prompt first edge.
-pub fn start_output() {
+fn start_output() {
     OUTPUT_RUNNING.store(true, Ordering::Relaxed);
     arm_completion(0);
 }
 
 /// Subfn 0x0F.
-pub fn stop_output() {
+fn stop_output() {
     OUTPUT_RUNNING.store(false, Ordering::Relaxed);
     disarm_completions();
-}
-
-/// Subfn 0x13. Einstein's `TNullSoundManager::OutputIsRunning` always
-/// returns `false`.
-pub fn output_is_running() -> bool {
-    false
-}
-
-pub fn output_volume_set(_volume: u32) {}
-
-pub fn output_volume_get() -> u32 {
-    0
 }
 
 /// Audio tick, driven from the timer IRQ via `audio::tick`. When the
@@ -163,7 +180,7 @@ pub fn output_volume_get() -> u32 {
 /// waits on after scheduling a buffer — and re-arm for the next owed
 /// edge, if any. This is the null backend's sole completion path; it
 /// replaces the former wedge probe in `trap.rs`.
-pub fn tick() {
+fn tick() {
     if PENDING_EDGES.load(Ordering::Relaxed) == 0 {
         return;
     }

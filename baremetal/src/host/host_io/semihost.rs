@@ -62,7 +62,35 @@ static STATE: StateCell = StateCell(UnsafeCell::new(State {
 static INITIALISED: AtomicBool = AtomicBool::new(false);
 static NEXT_PUMP_CNTPCT: AtomicU64 = AtomicU64::new(0);
 
-pub fn init() {
+/// The Newton screen geometry a semihost-viewer session runs at. The
+/// semihost backend never negotiates a physical panel, so the guest
+/// screen is always `peripherals::screen`'s MP2x00 default — restated
+/// here for the resume repaint because host code can't read the screen
+/// model (layering).
+const NEWTON_W: u32 = 320;
+const NEWTON_H: u32 = 480;
+const NEWTON_BPP: u32 = 2;
+
+pub struct SemihostBackend;
+
+impl super::HostIo for SemihostBackend {
+    fn init(&self) {
+        init()
+    }
+    fn on_resume(&self) {
+        on_resume()
+    }
+    fn push_blit(&self, ev: &super::BlitEvent, payload: &[u8]) {
+        push_blit(ev, payload)
+    }
+    fn pump_input(&self) {
+        pump_input()
+    }
+}
+
+pub static BACKEND: SemihostBackend = SemihostBackend;
+
+fn init() {
     ensure_output_dir();
     // SAFETY: single-threaded init from kmain.
     let s = unsafe { &mut *STATE.0.get() };
@@ -99,7 +127,10 @@ pub fn init() {
     INITIALISED.store(true, Ordering::Release);
 }
 
-pub fn on_resume() {
+fn on_resume() {
+    // Re-sync the host viewer's backing store with the restored
+    // GUEST_FB before anything else touches the outbound stream.
+    super::push_full_repaint(NEWTON_W, NEWTON_H, NEWTON_BPP);
     // Drop any pen events that arrived between snapshot save and
     // resume — they're timing-stale. The shared input queue is
     // already cleared by the caller.
@@ -113,7 +144,7 @@ pub fn on_resume() {
     }
 }
 
-pub fn push_blit(ev: &super::BlitEvent, payload: &[u8]) {
+fn push_blit(ev: &super::BlitEvent, payload: &[u8]) {
     if !INITIALISED.load(Ordering::Acquire) {
         return;
     }
@@ -135,7 +166,7 @@ pub fn push_blit(ev: &super::BlitEvent, payload: &[u8]) {
     }
 }
 
-pub fn pump_input() {
+fn pump_input() {
     if !INITIALISED.load(Ordering::Acquire) {
         return;
     }

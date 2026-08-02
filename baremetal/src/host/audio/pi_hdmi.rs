@@ -566,6 +566,46 @@ const CHANNEL_STATUS_BYTES: [u8; 24] = [
 
 // ---------- Public entry points -------------------------------------------
 
+pub struct PiHdmiBackend;
+
+impl super::AudioBackend for PiHdmiBackend {
+    fn init(&self) {
+        init()
+    }
+    fn set_interrupt_mask(&self, input_mask: u32, output_mask: u32) {
+        set_interrupt_mask(input_mask, output_mask)
+    }
+    fn set_output_buffers(&self, buf1_addr: u32, buf2_addr: u32) {
+        set_output_buffers(buf1_addr, buf2_addr)
+    }
+    fn schedule_output(&self, which: u32, byte_count: u32) {
+        schedule_output(which, byte_count)
+    }
+    fn start_output(&self) {
+        start_output()
+    }
+    fn stop_output(&self) {
+        stop_output()
+    }
+    fn output_is_running(&self) -> bool {
+        output_is_running()
+    }
+    fn output_volume_set(&self, volume: u32) {
+        output_volume_set(volume)
+    }
+    fn output_volume_get(&self) -> u32 {
+        output_volume_get()
+    }
+    // `tick` keeps the default no-op: this backend completes from its
+    // own DMA period IRQ, never from trap rate.
+    #[cfg(nh_real_hw)]
+    fn on_mai_dma_done(&self) {
+        on_mai_dma_done()
+    }
+}
+
+pub static BACKEND: PiHdmiBackend = PiHdmiBackend;
+
 /// Read `(CNTPCT_EL0, CNTFRQ_EL0)` — wall-clock tick count and its
 /// frequency. Used to measure the inter-period interval in
 /// `on_mai_dma_done` so a late DMA completion (EL2 stall) is detected.

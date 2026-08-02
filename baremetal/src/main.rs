@@ -78,6 +78,35 @@ pub extern "C" fn kmain() -> ! {
     // byte-order and snapshot-gating queries.
     newton::guest_trampolines::register_hyp_code_ranges();
 
+    // Cross-layer seams (fn-pointer inversions): guest device models
+    // and the hv core consult host services only through ops installed
+    // here, so the lower layers stay free of upward imports. All of
+    // these must be wired before the guest runs; the flash-persist
+    // backing additionally before `flash_persist::try_load` below.
+    peripherals::console::install(peripherals::console::GuestConsoleOps {
+        tx: host::console::write_byte,
+        rx: host::console::read_byte_nonblock,
+    });
+    peripherals::screen::install_blit_sink(host::host_io::push_guest_blit);
+    peripherals::tablet::install_pen_source(host::host_io::pop_pen_sample);
+    peripherals::sound::install_audio_ops(peripherals::sound::AudioOps {
+        set_interrupt_mask: host::audio::set_interrupt_mask,
+        set_output_buffers: host::audio::set_output_buffers,
+        schedule_output: host::audio::schedule_output,
+        start_output: host::audio::start_output,
+        stop_output: host::audio::stop_output,
+        output_is_running: host::audio::output_is_running,
+        output_volume_set: host::audio::output_volume_set,
+        output_volume_get: host::audio::output_volume_get,
+    });
+    peripherals::flash::install_dirty_sink(host::flash_persist::mark_dirty);
+    host::flash_persist::set_backing(peripherals::flash::host_pa(), peripherals::flash::SIZE);
+    hv::snapshot::set_flash_provider(hv::snapshot::FlashProvider {
+        maybe_save: host::flash_persist::maybe_save,
+        fingerprint: host::flash_persist::fingerprint,
+    });
+    hv::trap::hvc::install_pen_inject(host::host_io::queue::enqueue_pen_sample);
+
     // SAFETY: load ROM bytes into guest backing store before stage-2 maps it.
     unsafe { hv::guest_mem::load_rom(); }
 
@@ -148,6 +177,12 @@ pub extern "C" fn kmain() -> ! {
     peripherals::vic::init();
     hv::timer::init();
     host::host_io::init();
+    // Pull the Newton screen geometry the host-IO backend mandates
+    // (pi_fb pins the MP2100-native 320×480) into the screen model;
+    // `None` keeps the model's own 320×480 default.
+    if let Some((w, h)) = host::host_io::panel_geometry() {
+        peripherals::screen::set_screen_size(w, h);
+    }
     host::input::init();
     // host::audio::init() moved earlier — see comment above flash::init.
 

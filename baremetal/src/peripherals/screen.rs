@@ -29,7 +29,8 @@
 //! per byte, MSB-first; pixel 0 in bits 7..6, pixel 1 in bits 5..4,
 //! …). Pixel values map to grays: 00 = white, 11 = black, with two
 //! intermediate levels. We carry the pixels verbatim into GUEST_FB —
-//! no inversion — and `host_io::push_blit` forwards each blit to a
+//! no inversion — and forward each blit through the [`BlitSink`]
+//! installed by `main.rs` (the active `host::host_io` backend) to a
 //! live host viewer for display.
 
 use crate::{arch::cpu, hv::guest_mem, kprintln, peripherals::guest_access, arch::trap_context::TrapContext};
@@ -137,14 +138,54 @@ pub fn fb_row_bytes() -> u32 {
 /// the GetScreenInfo native primitive — in practice before the
 /// guest's ERET in `kmain`. Width is clamped to a multiple of 4.
 ///
-/// Only called from `host_io::pi_fb::init`; absent on builds without
-/// that backend (QEMU / FVP / guest-test) where the 320×480 default
-/// stays in effect.
-#[allow(dead_code)]
+/// Called from `main.rs` boot wiring with the geometry the active
+/// host-IO backend reports (`host_io::panel_geometry()`); backends
+/// without a mandate (QEMU / FVP / guest-test) report `None` and the
+/// 320×480 default stays in effect.
 pub fn set_screen_size(w: u32, h: u32) {
     let w = w & !3;
     SCREEN_W.store(w, Ordering::Relaxed);
     SCREEN_H.store(h, Ordering::Relaxed);
+}
+
+/// Host blit sink: forwards one finished blit (parameters + packed
+/// 2 bpp payload) to whatever the host displays on. Rects are
+/// `(left, top, right, bottom)` in Newton pixels. Installed once from
+/// `main.rs` with the active `host::host_io` backend's adapter; the
+/// default drops blits (headless / uninstalled).
+pub type BlitSink = fn(
+    mode: u8,
+    bpp: u8,
+    src: (u16, u16, u16, u16),
+    dst: (u16, u16, u16, u16),
+    row_bytes: u16,
+    payload: &[u8],
+);
+
+fn blit_sink_drop(
+    _mode: u8,
+    _bpp: u8,
+    _src: (u16, u16, u16, u16),
+    _dst: (u16, u16, u16, u16),
+    _row_bytes: u16,
+    _payload: &[u8],
+) {
+}
+
+struct BlitSinkCell(core::cell::UnsafeCell<BlitSink>);
+// SAFETY: written once by `install_blit_sink` from kmain on core 0
+// before the guest runs; read-only afterwards from the single EL2
+// trap handler.
+unsafe impl Sync for BlitSinkCell {}
+
+static BLIT_SINK: BlitSinkCell = BlitSinkCell(core::cell::UnsafeCell::new(blit_sink_drop));
+
+/// Install the host blit sink. Called once from `main.rs` boot wiring.
+pub fn install_blit_sink(sink: BlitSink) {
+    // SAFETY: single-core EL2, called before any blit can run.
+    unsafe {
+        *BLIT_SINK.0.get() = sink;
+    }
 }
 
 /// Maximum Newton screen pixels the blit scratch (and any other
@@ -497,17 +538,16 @@ fn push_blit_event(
     dst_top: u16, dst_left: u16, dst_bottom: u16, dst_right: u16,
     row_bytes: u16, payload: &[u8],
 ) {
-    let ev = crate::host::host_io::BlitEvent {
-        kind: crate::host::host_io::BLIT_KIND_BLIT,
+    // SAFETY: see BlitSinkCell.
+    let sink = unsafe { *BLIT_SINK.0.get() };
+    sink(
         mode,
-        bpp: SCREEN_BPP as u8,
-        _pad: 0,
-        src_left, src_top, src_right, src_bottom,
-        dst_left, dst_top, dst_right, dst_bottom,
+        SCREEN_BPP as u8,
+        (src_left, src_top, src_right, src_bottom),
+        (dst_left, dst_top, dst_right, dst_bottom),
         row_bytes,
-        payload_len: payload.len() as u16,
-    };
-    crate::host::host_io::push_blit(&ev, payload);
+        payload,
+    );
 }
 
 fn read_rect(rect_va: u32, what: &str, pc: u32) -> (u16, u16, u16, u16) {

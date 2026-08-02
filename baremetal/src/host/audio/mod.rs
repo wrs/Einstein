@@ -56,135 +56,135 @@ mod null;
 #[cfg(nh_audio_pi_hdmi)]
 pub mod pi_hdmi;
 
-/// One-time setup. Called from `kmain` once `host_io::init` has
-/// returned (so the framebuffer/HDMI link is up if the platform has
-/// one to bring up).
+/// Backend interface — the sound-driver contract above, as a trait.
+/// Single-threaded EL2 callers; impls do not need to be re-entrant.
+/// Backend asymmetries live in the defaulted methods: the null
+/// backend paces completions from the trap-tail [`AudioBackend::tick`]
+/// while `pi_hdmi` completes from its DMA period IRQ
+/// ([`AudioBackend::on_mai_dma_done`]) — each overrides exactly the
+/// pump it uses.
+pub trait AudioBackend: Sync {
+    /// One-time setup. Called from `kmain` (before the slow flash
+    /// load; the HDMI link is already trained by `display::splash`).
+    fn init(&self);
+
+    /// Subfn 0x1F — store the kernel's interrupt masks: input bit in
+    /// `r1`, output bit in `r2`. The output mask is what the
+    /// completion path raises through `vic::raise`.
+    fn set_interrupt_mask(&self, input_mask: u32, output_mask: u32);
+
+    /// Subfn 0x05 — stash the two ping-pong output buffer addresses.
+    /// Subfn 0x07 later picks one of them by index (`which=0` → buf1,
+    /// `which=1` → buf2).
+    fn set_output_buffers(&self, buf1_addr: u32, buf2_addr: u32);
+
+    /// Subfn 0x07 — read `byte_count` bytes of Newton-format audio
+    /// (BE S16 mono @ 22.05 kHz) from the buffer indexed by `which`,
+    /// resample + SPDIF-encode + enqueue. Schedule a buffer-complete
+    /// IRQ for when the tail catches up.
+    fn schedule_output(&self, which: u32, byte_count: u32);
+
+    /// Subfn 0x0D — enable audio output.
+    fn start_output(&self);
+
+    /// Subfn 0x0F — disable audio output. The kernel calls this
+    /// between clips.
+    fn stop_output(&self);
+
+    /// Subfn 0x13 — true while output is started and the ring isn't
+    /// yet drained.
+    fn output_is_running(&self) -> bool;
+
+    /// Subfn 0x17 — kernel-set output volume (signed-Q12.20 fader;
+    /// `kOutputVolume_Max = 0`). Stored for [`Self::output_volume_get`]
+    /// to read back; no backend has a software fader.
+    fn output_volume_set(&self, volume: u32);
+
+    /// Subfn 0x18 — return the volume passed to
+    /// [`Self::output_volume_set`], defaulting to `kOutputVolume_Max
+    /// = 0` if the kernel queried before it set a value.
+    fn output_volume_get(&self) -> u32;
+
+    /// Per-timer-tick audio pump, called from `trap_irq`'s IRQ tail.
+    /// The null backend fires armed buffer-completion IRQs here once
+    /// a buffer's playback duration has elapsed; `pi_hdmi` keeps the
+    /// default no-op — audio liveness on real hardware must not
+    /// depend on trap rate.
+    fn tick(&self) {}
+
+    /// DMA period-completion hook for the HDMI MAI TX channel,
+    /// dispatched by `host_dma::on_completion`. `pi_hdmi`'s natural
+    /// tick (refills the cyclic ring, raises the watermark IRQ —
+    /// same shape as Linux's `vchan_cyclic_callback` in
+    /// `bcm2835-dma.c`); default no-op for backends without an MAI
+    /// ring. Compiled exactly where its only caller — `host_dma` —
+    /// is.
+    #[cfg(nh_real_hw)]
+    fn on_mai_dma_done(&self) {}
+}
+
+#[cfg(nh_audio_null)]
+use self::null::BACKEND;
+#[cfg(nh_audio_pi_hdmi)]
+use self::pi_hdmi::BACKEND;
+
+/// One-time setup. Called from `kmain` — see [`AudioBackend::init`].
 pub fn init() {
-    #[cfg(nh_audio_null)]
-    null::init();
-    #[cfg(nh_audio_pi_hdmi)]
-    pi_hdmi::init();
+    BACKEND.init();
 }
 
-/// Newton kernel-side interrupt masks: input bit in `r1`, output bit
-/// in `r2`. The output mask is what `on_mai_dma_done` raises through
-/// `vic::raise` when the stereo ring drops below the low-watermark.
-/// Subfn 0x1F.
-pub fn set_interrupt_mask(_input_mask: u32, _output_mask: u32) {
-    #[cfg(nh_audio_null)]
-    null::set_interrupt_mask(_input_mask, _output_mask);
-    #[cfg(nh_audio_pi_hdmi)]
-    pi_hdmi::set_interrupt_mask(_input_mask, _output_mask);
+/// Subfn 0x1F — see [`AudioBackend::set_interrupt_mask`].
+pub fn set_interrupt_mask(input_mask: u32, output_mask: u32) {
+    BACKEND.set_interrupt_mask(input_mask, output_mask);
 }
 
-/// Stash the two ping-pong output buffer addresses passed by subfn
-/// 0x05. Subfn 0x07 later picks one of them by index (`which=0` →
-/// buf1, `which=1` → buf2).
-pub fn set_output_buffers(_buf1_addr: u32, _buf2_addr: u32) {
-    #[cfg(nh_audio_null)]
-    null::set_output_buffers(_buf1_addr, _buf2_addr);
-    #[cfg(nh_audio_pi_hdmi)]
-    pi_hdmi::set_output_buffers(_buf1_addr, _buf2_addr);
+/// Subfn 0x05 — see [`AudioBackend::set_output_buffers`].
+pub fn set_output_buffers(buf1_addr: u32, buf2_addr: u32) {
+    BACKEND.set_output_buffers(buf1_addr, buf2_addr);
 }
 
-/// Subfn 0x07 — read `byte_count` bytes of Newton-format audio (BE
-/// S16 mono @ 22.05 kHz) from the buffer indexed by `which` (0 or 1),
-/// resample + SPDIF-encode + enqueue. Schedule a buffer-complete IRQ
-/// for when the tail catches up.
-pub fn schedule_output(_which: u32, _byte_count: u32) {
-    #[cfg(nh_audio_null)]
-    null::schedule_output(_which, _byte_count);
-    #[cfg(nh_audio_pi_hdmi)]
-    pi_hdmi::schedule_output(_which, _byte_count);
+/// Subfn 0x07 — see [`AudioBackend::schedule_output`].
+pub fn schedule_output(which: u32, byte_count: u32) {
+    BACKEND.schedule_output(which, byte_count);
 }
 
-/// Subfn 0x0D — enable MAI output (audio packets start emitting on
-/// HDMI).
+/// Subfn 0x0D — see [`AudioBackend::start_output`].
 pub fn start_output() {
-    #[cfg(nh_audio_null)]
-    null::start_output();
-    #[cfg(nh_audio_pi_hdmi)]
-    pi_hdmi::start_output();
+    BACKEND.start_output();
 }
 
-/// Subfn 0x0F — disable MAI output. The kernel calls this between
-/// clips; without it the HDMI receiver hears whatever residual
-/// samples are in the ring.
+/// Subfn 0x0F — see [`AudioBackend::stop_output`].
 pub fn stop_output() {
-    #[cfg(nh_audio_null)]
-    null::stop_output();
-    #[cfg(nh_audio_pi_hdmi)]
-    pi_hdmi::stop_output();
+    BACKEND.stop_output();
 }
 
-/// Subfn 0x13 — true while [`start_output`] has been called and the
-/// ring isn't yet drained.
+/// Subfn 0x13 — see [`AudioBackend::output_is_running`].
 pub fn output_is_running() -> bool {
-    #[cfg(nh_audio_null)]
-    {
-        return null::output_is_running();
-    }
-    #[cfg(nh_audio_pi_hdmi)]
-    {
-        return pi_hdmi::output_is_running();
-    }
-    #[allow(unreachable_code)]
-    false
+    BACKEND.output_is_running()
 }
 
-/// Subfn 0x17 — kernel-set output volume. Newton's volume is a
-/// signed-Q12.20 fader (`kOutputVolume_Min = 0xFFDDBD71`,
-/// `kOutputVolume_Max = 0x00000000`, `kOutputVolume_Zero =
-/// 0x80000000`); we just store it for [`output_volume_get`] to read
-/// back. The HDMI MAI hardware doesn't expose a software fader, and
-/// the receiver side handles its own master volume — so muting via
-/// software would just need a tighter loop than this initial cut.
-pub fn output_volume_set(_volume: u32) {
-    #[cfg(nh_audio_null)]
-    null::output_volume_set(_volume);
-    #[cfg(nh_audio_pi_hdmi)]
-    pi_hdmi::output_volume_set(_volume);
+/// Subfn 0x17 — see [`AudioBackend::output_volume_set`].
+pub fn output_volume_set(volume: u32) {
+    BACKEND.output_volume_set(volume);
 }
 
-/// Subfn 0x18 — return the volume passed to [`output_volume_set`],
-/// defaulting to `kOutputVolume_Max = 0` if the kernel queried before
-/// it set a value.
+/// Subfn 0x18 — see [`AudioBackend::output_volume_get`].
 pub fn output_volume_get() -> u32 {
-    #[cfg(nh_audio_null)]
-    {
-        return null::output_volume_get();
-    }
-    #[cfg(nh_audio_pi_hdmi)]
-    {
-        return pi_hdmi::output_volume_get();
-    }
-    #[allow(unreachable_code)]
-    0
+    BACKEND.output_volume_get()
 }
 
 /// Per-timer-tick audio pump, called from `trap_irq`'s IRQ tail
-/// (`irq_from_guest`). The null backend uses it to fire armed
-/// buffer-completion IRQs once a buffer's playback duration has
-/// elapsed. The `pi_hdmi` backend drives completion from its own DMA
-/// period IRQ (`on_mai_dma_done`) instead, so this is a no-op there —
-/// audio liveness on real hardware must not depend on trap rate.
+/// (`irq_from_guest`) — see [`AudioBackend::tick`].
 #[inline]
 pub fn tick() {
-    #[cfg(nh_audio_null)]
-    null::tick();
+    BACKEND.tick();
 }
 
-/// DMA period-completion hook for the HDMI MAI TX channel,
-/// dispatched by `host_dma::on_completion`. This is the
-/// audio subsystem's natural tick — the only thing that drives ring
-/// refills and watermark IRQs. There is intentionally no trap-tail
-/// pump entry point: audio liveness must not depend on trap rate,
-/// which other hypervisor work is trying to reduce. The shape
-/// matches Linux's `vchan_cyclic_callback` in `bcm2835-dma.c`.
-/// Compiled exactly where its only caller — `host_dma` — is.
+/// DMA period-completion hook, dispatched by `host_dma::on_completion`
+/// — see [`AudioBackend::on_mai_dma_done`]. Compiled exactly where its
+/// only caller — `host_dma` — is.
 #[cfg(nh_real_hw)]
 #[inline]
 pub fn on_mai_dma_done() {
-    #[cfg(nh_audio_pi_hdmi)]
-    pi_hdmi::on_mai_dma_done();
+    BACKEND.on_mai_dma_done();
 }

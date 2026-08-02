@@ -32,6 +32,33 @@
 //! same logical word as it would through Einstein.
 
 use core::ptr::addr_of_mut;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+/// Dirty-range sink for the flash-persistence layer: called with
+/// `(off, len)` — a byte range of the backing store just programmed
+/// or erased — so the host side can mark the covering blocks dirty
+/// for its next save. Stored as a raw fn pointer (0 = uninstalled →
+/// writes aren't tracked, matching the null-persistence behaviour);
+/// installed once from `main.rs` boot wiring with
+/// `host::flash_persist::mark_dirty`.
+static DIRTY_SINK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the dirty-range sink. Called once from `main.rs` boot
+/// wiring, before the guest can program flash.
+pub fn install_dirty_sink(sink: fn(usize, usize)) {
+    DIRTY_SINK.store(sink as usize, Ordering::Release);
+}
+
+/// Report a just-written byte range to the installed dirty sink.
+fn mark_dirty(off: usize, len: usize) {
+    let raw = DIRTY_SINK.load(Ordering::Acquire);
+    if raw != 0 {
+        // SAFETY: the only writer is install_dirty_sink, which stores
+        // a valid `fn(usize, usize)`; 0 is filtered above.
+        let f: fn(usize, usize) = unsafe { core::mem::transmute(raw) };
+        f(off, len);
+    }
+}
 
 /// Size of each bank (4 MiB). `kFlashBank1Size` / `kFlashBank2Size` in
 /// `Emulator/TFlash.h`.
@@ -287,7 +314,7 @@ pub fn program_word(pa: u32, word: u32, mask: u32) -> bool {
         let stored = new;
         core::ptr::write_volatile(slot, stored);
     }
-    crate::host::flash_persist::mark_dirty(off, 4);
+    mark_dirty(off, 4);
     true
 }
 
@@ -306,6 +333,6 @@ pub fn erase_block(pa: u32, size: u32) -> bool {
         let base = addr_of_mut!(GUEST_FLASH) as *mut u8;
         core::ptr::write_bytes(base.add(off), 0xFF, size as usize);
     }
-    crate::host::flash_persist::mark_dirty(off, size as usize);
+    mark_dirty(off, size as usize);
     true
 }

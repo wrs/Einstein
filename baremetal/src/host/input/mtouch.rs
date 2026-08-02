@@ -115,13 +115,31 @@ unsafe impl Sync for StateCell {}
 static STATE: StateCell = StateCell(core::cell::UnsafeCell::new(State::new()));
 static INIT_DONE: AtomicBool = AtomicBool::new(false);
 
+pub struct MtouchBackend;
+
+impl super::PenInput for MtouchBackend {
+    fn init(&self) {
+        init()
+    }
+    fn pump(&self) {
+        // Touchscreen input is IRQ-driven (`on_usb_irq`), so there is
+        // nothing to poll on the trap-return tail.
+    }
+    #[cfg(nh_real_hw)]
+    fn on_usb_irq(&self) -> bool {
+        on_usb_irq()
+    }
+}
+
+pub static BACKEND: MtouchBackend = MtouchBackend;
+
 fn with_state<R, F: FnOnce(&mut State) -> R>(f: F) -> R {
     // SAFETY: see StateCell.
     let s = unsafe { &mut *STATE.0.get() };
     f(s)
 }
 
-pub fn init() {
+fn init() {
     if INIT_DONE.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -215,18 +233,13 @@ fn attach<H: crate::host::usb::host::UsbHostController>(
     Ok(())
 }
 
-/// Trap-tail pump. Touchscreen input is IRQ-driven (`on_usb_irq`),
-/// so there is nothing to poll here. Kept as a no-op so the shared
-/// `input::pump` seam and its call sites stay backend-agnostic.
-pub fn pump() {}
-
 /// Harvest and dispatch one touchscreen report from the USB IRQ.
 /// Called from `trap_irq`'s slim USB fast path (ISR context, possibly
 /// nested in an EL2 `with_irqs_unmasked` window). Returns `true` if a
 /// pen sample was enqueued onto the host_io queue, so the caller can
 /// reflect the freshly-raised `INT_TABLET` into the guest's vIRQ on
 /// this same trap exit.
-pub fn on_usb_irq() -> bool {
+fn on_usb_irq() -> bool {
     let mut buf = [0u8; REPORT_BUF_LEN];
     let n = match dwc2::service_int_in_irq(&mut buf) {
         Some(n) => n,

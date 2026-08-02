@@ -89,7 +89,9 @@ host-io-semihost = []
 # VC-framebuffer backend for the Pi Zero 2 W. Renders Newton's
 # 320x480 2 bpp framebuffer into the HDMI panel through the
 # allocator built in src/display/. See src/host_io/pi_fb.rs.
-host-io-pi-fb = []
+# Implies platform-raspi3b: the backend renders through
+# src/host/display, which only exists on that platform.
+host-io-pi-fb = ["platform-raspi3b"]
 
 # Persistent flash-store backend. Opt-in only — at most one may be
 # enabled. If none are enabled, build.rs picks "semihost" (so a bare
@@ -105,7 +107,9 @@ flash-persist-semihost = []
 # Real-hardware backend: persists GUEST_FLASH to NEWTON.BIN on the
 # FAT32 boot partition via the embedded-sdmmc + BCM2835 SDHOST stack
 # built up in src/sd. Selected by the `pi-bare-metal-sd` aggregate.
-flash-persist-sd = []
+# Implies platform-raspi3b: the backend drives the BCM2835 SDHOST
+# in src/host/sd, which only exists on that platform.
+flash-persist-sd = ["platform-raspi3b"]
 
 # Pen-input backend. Opt-in only — at most one may be enabled. If
 # none are enabled, build.rs picks "null" (no input source; QEMU/FVP
@@ -140,9 +144,12 @@ input-mtouch = []
 #                   audio at the firmware level. Selected by the
 #                   `pi-bare-metal-audio` aggregate (and rolled into
 #                   `pi-bare-metal-input` so real-hw builds with the
-#                   touchscreen also get sound).
+#                   touchscreen also get sound). Implies
+#                   platform-raspi3b: the backend pokes the VC4 HDMI
+#                   block through src/host/mailbox, which only exists
+#                   on that platform.
 audio-null = []
-audio-pi-hdmi = []
+audio-pi-hdmi = ["platform-raspi3b"]
 
 # Disable every in-tree call to Arm semihosting (HLT #0xF000). Required
 # when running on real silicon, where no semihosting host is listening:
@@ -209,7 +216,9 @@ pi-bare-metal-input = [
 # Pair with pi-bare-metal for a real-Pi build:
 #   cargo build --release --no-default-features \
 #     --features "pi-bare-metal sd-probe"
-sd-probe = []
+# Implies no-semihost + platform-raspi3b: the probe drives the
+# real-hardware BCM2835 DMA path (`nh_real_hw`).
+sd-probe = ["no-semihost", "platform-raspi3b"]
 
 # Real-hardware VC-framebuffer first-light probe. When on, kmain
 # allocates a framebuffer at the panel's native size, paints a

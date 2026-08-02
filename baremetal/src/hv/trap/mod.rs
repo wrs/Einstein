@@ -12,7 +12,7 @@ use crate::{arch::cpu, kprintln, peripherals::{native_primitives, vic}, host::pl
 use crate::arch::trap_context::{advance_elr, describe_ec, read_sysreg, TrapContext};
 
 mod dabt;
-mod hvc;
+pub(crate) mod hvc;
 pub(crate) mod cp15;
 pub(crate) mod und;
 

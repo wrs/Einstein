@@ -55,38 +55,52 @@ pub trait PenSource {
     fn poll(&mut self) -> Option<PenEvent>;
 }
 
-/// Called once from `kmain` after `host_io::init`. Lets the backend
-/// open whatever transport it needs (USB controller bring-up, etc.).
+/// Backend interface. Single-threaded EL2 callers; impls do not need
+/// to be re-entrant. The IRQ-driven USB fast path is a defaulted
+/// method so polled (or absent) backends don't carry it.
+pub trait PenInput: Sync {
+    /// Called once from `kmain` after `host_io::init`. Lets the
+    /// backend open whatever transport it needs (USB controller
+    /// bring-up, etc.).
+    fn init(&self);
+
+    /// Drain the backend and forward events to the guest. Runs on the
+    /// trap-return tail (`trap.rs`).
+    fn pump(&self);
+
+    /// Service an interrupt-driven input source from the trap-IRQ
+    /// path (ISR context). Returns `true` if a pen sample was
+    /// enqueued, so the caller can reflect `INT_TABLET` into the
+    /// guest's vIRQ on this exit. Default: no IRQ source, `false`.
+    /// Compiled exactly where its only caller — `trap_irq`'s slim USB
+    /// fast path — is.
+    #[cfg(nh_real_hw)]
+    fn on_usb_irq(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(nh_input_null)]
+use self::null::BACKEND;
+#[cfg(nh_input_mtouch)]
+use self::mtouch::BACKEND;
+
+/// One-time setup — see [`PenInput::init`].
 pub fn init() {
-    #[cfg(nh_input_null)]
-    null::init();
-    #[cfg(nh_input_mtouch)]
-    mtouch::init();
+    BACKEND.init();
 }
 
-/// Drain the active backend and forward events to the guest. Runs
-/// on the trap-return tail (`trap.rs`).
+/// Trap-tail pump — see [`PenInput::pump`].
 pub fn pump() {
-    #[cfg(nh_input_null)]
-    null::pump();
-    #[cfg(nh_input_mtouch)]
-    mtouch::pump();
+    BACKEND.pump();
 }
 
-/// Service an interrupt-driven input source from the trap-IRQ path
-/// (ISR context). Returns `true` if a pen sample was enqueued, so the
-/// caller can reflect `INT_TABLET` into the guest's vIRQ on this exit.
-/// A no-op (returns `false`) for backends that don't take IRQs.
-/// Compiled exactly where its only caller — `trap_irq`'s slim USB
-/// fast path — is.
+/// IRQ-context service hook — see [`PenInput::on_usb_irq`]. Compiled
+/// exactly where its only caller — `trap_irq`'s slim USB fast path —
+/// is.
 #[cfg(nh_real_hw)]
 pub fn on_usb_irq() -> bool {
-    #[cfg(nh_input_mtouch)]
-    {
-        return mtouch::on_usb_irq();
-    }
-    #[cfg(not(nh_input_mtouch))]
-    false
+    BACKEND.on_usb_irq()
 }
 
 /// Helper used by every concrete backend's pump implementation:

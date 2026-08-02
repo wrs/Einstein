@@ -22,7 +22,8 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::{kprintln, host::console};
+use crate::kprintln;
+use crate::peripherals::console;
 
 /// Base of the external-serial port (TMemoryConsts::kExternalSerialBase).
 /// The four-port window it starts (`0x0F1C_0000..0x0F20_0000`) is
@@ -156,7 +157,8 @@ static DROPPED_TX: [AtomicU32; 4] = [
 ];
 
 /// PIO TX-byte write to a port's TX FIFO. Port 0 (extr) is forwarded to
-/// the host PL011 (`console::write_byte`), matching the DMA channel-1 path
+/// the host wire through the guest-console seam
+/// (`peripherals::console::tx`), matching the DMA channel-1 path
 /// so PIO and DMA output interleave into the same host serial stream.
 /// Ports 1-3 have no host backend; their bytes are counted as dropped
 /// (`DROPPED_TX`) rather than silently discarded. All ports keep a
@@ -166,7 +168,7 @@ fn log_tx_byte(port: u8, byte: u8) {
         return;
     }
     if port == 0 {
-        console::write_byte(byte);
+        console::tx(byte);
     } else {
         DROPPED_TX[port as usize].fetch_add(1, Ordering::Relaxed);
     }

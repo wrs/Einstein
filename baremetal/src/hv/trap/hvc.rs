@@ -13,6 +13,31 @@ use crate::newton::probes::{handle_load_perm_obj_ret_probe, handle_store_perm_ob
 use crate::hv::guest_mem::log_guest_string;
 
 
+/// Pen-sample sink for the `GuestInjectPen` test HVC, installed by
+/// `main.rs` boot wiring (`host::host_io::queue::enqueue_pen_sample`)
+/// so this hv-layer dispatcher stays free of host imports. Raw fn
+/// pointer, 0 = uninstalled — [`pen_inject`] halts loudly on use
+/// before wiring.
+static PEN_INJECT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Install the pen-sample sink. Called once from `main.rs`.
+pub(crate) fn install_pen_inject(sink: fn(u32, u32)) {
+    PEN_INJECT.store(sink as usize, core::sync::atomic::Ordering::Release);
+}
+
+fn pen_inject() -> fn(u32, u32) {
+    let raw = PEN_INJECT.load(core::sync::atomic::Ordering::Acquire);
+    if raw == 0 {
+        kprintln!(
+            "*** hvc: no pen-inject sink — main.rs must install_pen_inject() before use ***"
+        );
+        cpu::halt();
+    }
+    // SAFETY: the only writer is install_pen_inject, which stores a
+    // valid `fn(u32, u32)`; 0 is filtered above.
+    unsafe { core::mem::transmute(raw) }
+}
+
 pub(crate) fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
     // Guest-test protocol — see baremetal/guest-tests/README.md.
     let imm = iss & 0xFFFF;
@@ -22,8 +47,8 @@ pub(crate) fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
     match imm {
         v if v == HvcImm::GuestTestPrintByte as u32 => {
             let b = r0 as u8;
-            if b == b'\n' { crate::host::console::write_byte(b'\r'); }
-            crate::host::console::write_byte(b);
+            if b == b'\n' { crate::raw_wire_byte!(b'\r'); }
+            crate::raw_wire_byte!(b);
         }
         v if v == HvcImm::GuestTestPrintHex as u32 => {
             kprintln!("guest-hex: {:#010x}", r0);
@@ -81,12 +106,13 @@ pub(crate) fn handle_hvc(ctx: &mut TrapContext, iss: u32) {
             return;
         }
         v if v == HvcImm::GuestInjectPen as u32 => {
-            // r0 = packed sample word, r1 = ticks. Enqueue directly,
+            // r0 = packed sample word, r1 = ticks. Enqueue through the
+            // installed sink directly onto the host pen queue,
             // bypassing the backend (which would otherwise insert
             // pen-down/up edge markers based on its own state).
             let sample = ctx.x[0] as u32;
             let ticks = ctx.x[1] as u32;
-            crate::host::host_io::queue::enqueue_pen_sample(sample, ticks);
+            (pen_inject())(sample, ticks);
         }
         v if v == HvcImm::Snapshot as u32 => {
             // Save snapshot — see src/hv/snapshot.rs. ctx.x[0..30] is

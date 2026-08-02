@@ -34,7 +34,7 @@ use embedded_sdmmc::{Mode, RawFile, VolumeIdx, VolumeManager};
 use super::FlashStore;
 use crate::host::sd::block_device::NullTime;
 use crate::host::sd::sdhost::SdHost;
-use crate::{kprint, kprintln, peripherals};
+use crate::{kprint, kprintln};
 
 /// Read the generic-timer physical count. Inlined here rather than
 /// pulling a helper from snapshot.rs so this module stays self-
@@ -75,7 +75,7 @@ const FLASH_FILE: &str = "NEWTON.BIN";
 /// Block granularity for dirty tracking + I/O. Each set bit covers
 /// `BLOCK_SIZE` bytes of GUEST_FLASH. Matches the semihost backend.
 const BLOCK_SIZE: usize = 64 * 1024;
-const NUM_BLOCKS: usize = peripherals::flash::SIZE / BLOCK_SIZE; // 128
+const NUM_BLOCKS: usize = super::FLASH_SIZE / BLOCK_SIZE; // 128
 const NUM_BITMAP_WORDS: usize = NUM_BLOCKS / 32; // 4
 
 /// Progress reporting for full-save / load. Print a '.' for every
@@ -120,7 +120,7 @@ static mut VOL_MGR: Option<Vm> = None;
 /// smallest FAT32 cluster we'd accept (4 KiB); a card with smaller
 /// clusters resolves to `None` and falls back to the FAT save. A
 /// 128 GB card uses 32–64 KiB clusters → 128–256 entries, well under.
-const MAX_FLASH_CLUSTERS: usize = peripherals::flash::SIZE / 4096;
+const MAX_FLASH_CLUSTERS: usize = super::FLASH_SIZE / 4096;
 
 /// NEWTON.BIN's per-cluster start-LBA map, set by `resolve_extent_map`
 /// (from `try_load`, or right after the first full save creates the
@@ -231,12 +231,12 @@ impl FlashStore for SdBackend {
             }
         };
         let len = file.length();
-        if len as usize != peripherals::flash::SIZE {
+        if len as usize != super::FLASH_SIZE {
             kprintln!(
                 "flash_persist_sd: {} is {} bytes, want {} — ignoring, will rewrite on next save",
                 FLASH_FILE,
                 len,
-                peripherals::flash::SIZE
+                super::FLASH_SIZE
             );
             return;
         }
@@ -250,8 +250,8 @@ impl FlashStore for SdBackend {
         // to the guest. `len` matches SIZE, checked above.
         let buf = unsafe {
             core::slice::from_raw_parts_mut(
-                peripherals::flash::host_pa() as *mut u8,
-                peripherals::flash::SIZE,
+                super::backing_base() as *mut u8,
+                super::FLASH_SIZE,
             )
         };
         kprint!("flash_persist_sd: load [");
@@ -289,11 +289,11 @@ impl FlashStore for SdBackend {
             }
         }
         kprintln!("]");
-        if off != peripherals::flash::SIZE {
+        if off != super::FLASH_SIZE {
             kprintln!(
                 "flash_persist_sd: short read ({} of {}); cold-booting flash state",
                 off,
-                peripherals::flash::SIZE,
+                super::FLASH_SIZE,
             );
             return;
         }
@@ -301,9 +301,9 @@ impl FlashStore for SdBackend {
         let ms = elapsed_ms(t0, cntpct());
         kprintln!(
             "flash_persist_sd: loaded {} bytes in {} ms ({} KB/s)",
-            peripherals::flash::SIZE,
+            super::FLASH_SIZE,
             ms,
-            (peripherals::flash::SIZE as u64 * 1000 / 1024) / ms.max(1),
+            (super::FLASH_SIZE as u64 * 1000 / 1024) / ms.max(1),
         );
 
         // The image is now loaded, so GUEST_FLASH[0..512] equals the
@@ -386,7 +386,7 @@ impl FlashStore for SdBackend {
             // otherwise.
             kprintln!(
                 "flash_persist_sd: starting full save ({} bytes)",
-                peripherals::flash::SIZE
+                super::FLASH_SIZE
             );
             let t0 = cntpct();
             let file =
@@ -406,8 +406,8 @@ impl FlashStore for SdBackend {
             // takes a &[u8] for the duration of these calls only.
             let bytes = unsafe {
                 core::slice::from_raw_parts(
-                    peripherals::flash::host_pa() as *const u8,
-                    peripherals::flash::SIZE,
+                    super::backing_base() as *const u8,
+                    super::FLASH_SIZE,
                 )
             };
             // Chunk the write so we can emit progress dots; one
@@ -487,7 +487,7 @@ impl FlashStore for SdBackend {
             // SAFETY: GUEST_FLASH static mut byte array, single-threaded.
             let bytes = unsafe {
                 core::slice::from_raw_parts(
-                    peripherals::flash::host_pa().wrapping_add(off as u64) as *const u8,
+                    super::backing_base().wrapping_add(off as u64) as *const u8,
                     BLOCK_SIZE,
                 )
             };
@@ -526,8 +526,8 @@ impl FlashStore for SdBackend {
         // reads during snapshot save / load.
         let bytes = unsafe {
             core::slice::from_raw_parts(
-                peripherals::flash::host_pa() as *const u8,
-                peripherals::flash::SIZE,
+                super::backing_base() as *const u8,
+                super::FLASH_SIZE,
             )
         };
         let mut h: u32 = 0x811c_9dc5;
@@ -603,7 +603,7 @@ fn resolve_extent_map(mgr: &Vm, raw: RawFile) {
             let rd = mgr.device(|d| d.read_block(lba0, &mut sec));
             // SAFETY: GUEST_FLASH backing; single-core EL2.
             let head = unsafe {
-                core::slice::from_raw_parts(peripherals::flash::host_pa() as *const u8, 512)
+                core::slice::from_raw_parts(super::backing_base() as *const u8, 512)
             };
             match rd {
                 Ok(()) if &sec[..] == head => {
@@ -717,14 +717,14 @@ fn advance_save(from: usize) {
     let bpc = FLASH_BLOCKS_PER_CLUSTER.load(Ordering::Relaxed) as usize;
     let cluster_bytes = bpc * 512;
     let off = ci * cluster_bytes;
-    let len = cluster_bytes.min(peripherals::flash::SIZE - off);
+    let len = cluster_bytes.min(super::FLASH_SIZE - off);
     // SAFETY: GUEST_FLASH backing is a static byte array. The DMA reads
     // this range while the guest may keep writing it — acceptable: any
     // block dirtied during the save stays set in DIRTY (we swapped the
     // snapshot out) and is re-captured by the next pass.
     let src = unsafe {
         core::slice::from_raw_parts(
-            peripherals::flash::host_pa().wrapping_add(off as u64) as *const u8,
+            super::backing_base().wrapping_add(off as u64) as *const u8,
             len,
         )
     };

@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Feature-matrix build check: `cargo check` over every supported build
 # combination so the axis architecture (host-io / flash-persist / input
-# / audio / platform) stays green off the default path. build.rs's
-# validate_feature_matrix() rejects the impossible cross-axis combos at
-# configure time; this script proves the *supported* set still compiles.
+# / audio / platform) stays green off the default path. Cargo feature
+# dependencies (hardware backends imply platform-raspi3b) plus the
+# platform mutual-exclusion check in build.rs reject the impossible
+# cross-axis combos at configure time; this script proves the
+# *supported* set still compiles.
 #
 # Each combination is a sequential `cargo check` in ONE shared target
 # dir (CARGO_TARGET_DIR below). The combos share almost all of their
@@ -24,8 +26,8 @@ cd "$root"
 # incremental cache of interactive `cargo build`/`cargo run` sessions.
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$root/target/check-matrix}"
 
-# Import-discipline lint (cheap, always run — like build.rs's
-# validate_feature_matrix, it guards structure rather than a combo).
+# Import-discipline lint (cheap, always run — it guards structure
+# rather than a combo).
 if bash "$here/check-layering.sh" >/tmp/check-matrix-last.log 2>&1; then
     printf "  \e[32mPASS\e[0m  %-24s\n" "check-layering"
 else

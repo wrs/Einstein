@@ -71,6 +71,63 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{hv::guest_mem, kprintln, arch::trap_context::TrapContext};
 
+// ---- flash-persistence provider ------------------------------------
+
+/// Entry points into the flash-persistence layer this module consults
+/// during save/load. `hv` imports nothing above itself, so `main.rs`
+/// installs the concrete `host::flash_persist` functions at boot via
+/// [`set_flash_provider`] (same inversion as `layout::register_backing`).
+pub struct FlashProvider {
+    /// Persist any dirty flash blocks (wall-clock-gated internally).
+    /// Called before each snapshot save so `fingerprint` describes
+    /// bytes that made it to the host store.
+    pub maybe_save: fn(),
+    /// FNV-1a-32 over the current guest-flash bytes; stored in the
+    /// snapshot header and re-checked on resume.
+    pub fingerprint: fn() -> u32,
+}
+
+fn unwired_maybe_save() {
+    unwired_flash_provider();
+}
+
+fn unwired_fingerprint() -> u32 {
+    unwired_flash_provider()
+}
+
+fn unwired_flash_provider() -> ! {
+    kprintln!(
+        "*** snapshot: no flash provider — main.rs must set_flash_provider() before use ***"
+    );
+    crate::arch::cpu::halt();
+}
+
+struct FlashProviderCell(core::cell::UnsafeCell<FlashProvider>);
+// SAFETY: written once by `set_flash_provider` from kmain on core 0
+// before snapshot init/save/load run; read-only afterwards.
+unsafe impl Sync for FlashProviderCell {}
+
+static FLASH_PROVIDER: FlashProviderCell = FlashProviderCell(core::cell::UnsafeCell::new(
+    FlashProvider {
+        maybe_save: unwired_maybe_save,
+        fingerprint: unwired_fingerprint,
+    },
+));
+
+/// Install the flash-persistence provider. Called once from `main.rs`
+/// boot wiring, before `snapshot::init`.
+pub fn set_flash_provider(provider: FlashProvider) {
+    // SAFETY: single-core EL2, called before any snapshot activity.
+    unsafe {
+        *FLASH_PROVIDER.0.get() = provider;
+    }
+}
+
+fn flash_provider() -> &'static FlashProvider {
+    // SAFETY: see FlashProviderCell.
+    unsafe { &*FLASH_PROVIDER.0.get() }
+}
+
 // ---- semihosting primitives ---------------------------------------
 
 const SYS_OPEN: u64 = 0x01;
@@ -374,7 +431,7 @@ fn maybe_flash_autosave() {
     LAST_SAVE_TICKS.store(now, Ordering::Relaxed);
     // The SD write blocks EL2 for hundreds of ms; unmask IRQs so the
     // audio MAI ring stays fed and CNTHP keeps rearming while it runs.
-    crate::arch::cpu::with_irqs_unmasked(|| crate::host::flash_persist::maybe_save());
+    crate::arch::cpu::with_irqs_unmasked(flash_provider().maybe_save);
 }
 
 #[cfg(not(feature = "no-semihost"))]
@@ -461,7 +518,7 @@ fn maybe_autosave_via_semihost(ctx: &TrapContext) {
     // for hundreds of ms; unmask IRQs so audio/CNTHP stay serviced
     // while it runs. The semihost backend's write is fast and
     // unaffected.
-    crate::arch::cpu::with_irqs_unmasked(|| crate::host::flash_persist::maybe_save());
+    crate::arch::cpu::with_irqs_unmasked(flash_provider().maybe_save);
 
     let mut gprs = [0u64; 31];
     for i in 0..31 {
@@ -598,7 +655,7 @@ fn build_header(gprs_u64: &[u64; 31], seq: u64) -> Header {
         ram_size: guest_mem::RAM_SIZE as u32,
         fb_size: guest_mem::FRAMEBUFFER_SIZE as u32,
         scratch_size: crate::hv::layout::SCRATCH_POOL_SIZE as u32,
-        flash_fingerprint: crate::host::flash_persist::fingerprint(),
+        flash_fingerprint: (flash_provider().fingerprint)(),
         rom_fingerprint: rom_fingerprint(),
         seq,
     }
@@ -775,7 +832,7 @@ pub fn load(path: &[u8]) -> Option<RestoreState> {
     // persistent flash diverges from what the snapshot expected, the
     // saved CPU state may reference flash addresses with newer or
     // older content than it assumes — cold-boot rather than risk it.
-    let current_flash_fp = crate::host::flash_persist::fingerprint();
+    let current_flash_fp = (flash_provider().fingerprint)();
     if header.flash_fingerprint != current_flash_fp {
         kprintln!(
             "snapshot: flash fingerprint mismatch (file={:#010x} current={:#010x}); cold-booting",

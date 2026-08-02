@@ -7,6 +7,7 @@
 
 pub mod asic;
 pub mod battery;
+pub mod console;
 pub mod dma;
 pub mod flash;
 pub mod flash_driver;

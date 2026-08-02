@@ -12,5 +12,13 @@
 //! avoids two parallel pen-event streams competing for the same
 //! `INT_TABLET`.
 
-pub fn init() {}
-pub fn pump() {}
+use super::PenInput;
+
+pub struct NullBackend;
+
+impl PenInput for NullBackend {
+    fn init(&self) {}
+    fn pump(&self) {}
+}
+
+pub static BACKEND: NullBackend = NullBackend;

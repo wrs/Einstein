@@ -5,8 +5,9 @@
 //! native call with driver=0x000002. Each subfn mirrors the return
 //! value Einstein produces in `TNativePrimitives::ExecuteSoundDriverNative`
 //! (`Emulator/TNativePrimitives.cpp:1062-1400`) and, where relevant,
-//! forwards to the active [`crate::host::audio`] backend so the buffer
-//! actually reaches a host audio device. With the null backend (the
+//! forwards through the [`AudioOps`] installed by `main.rs` (the
+//! active `host::audio` backend) so the buffer actually reaches a
+//! host audio device. With the null backend (the
 //! default) the boot path to `TInterpreter` runs identically to the
 //! Einstein "no sound" emulation — Einstein returns success for most
 //! of these stubs because Newton has no audible-sound requirement on
@@ -18,11 +19,76 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::{host::audio, dprintln};
+use crate::dprintln;
 use crate::peripherals::vic;
 use crate::arch::trap_context::TrapContext;
 
 use crate::peripherals::native_primitives::NativeDriver;
+
+/// Host audio-backend entry points the sound model delegates to, one
+/// per delegating subfn. Installed once from `main.rs` boot wiring
+/// with the active `host::audio` backend's forwarders; the defaults
+/// are the "no host audio" behaviour (drop buffers, not running,
+/// volume 0), which is what an uninstalled seam should do.
+pub struct AudioOps {
+    /// Subfn 0x1F — kernel interrupt masks (input, output).
+    pub set_interrupt_mask: fn(u32, u32),
+    /// Subfn 0x05 — ping-pong output buffer addresses.
+    pub set_output_buffers: fn(u32, u32),
+    /// Subfn 0x07 — schedule `byte_count` bytes from buffer `which`.
+    pub schedule_output: fn(u32, u32),
+    /// Subfn 0x0D — start output.
+    pub start_output: fn(),
+    /// Subfn 0x0F — stop output.
+    pub stop_output: fn(),
+    /// Subfn 0x13 — output still running?
+    pub output_is_running: fn() -> bool,
+    /// Subfn 0x17 — store the kernel's output volume.
+    pub output_volume_set: fn(u32),
+    /// Subfn 0x18 — read the stored output volume.
+    pub output_volume_get: fn() -> u32,
+}
+
+fn noop_u32_u32(_a: u32, _b: u32) {}
+fn noop_u32(_a: u32) {}
+fn noop() {}
+fn ret_false() -> bool {
+    false
+}
+fn ret_zero() -> u32 {
+    0
+}
+
+struct AudioOpsCell(core::cell::UnsafeCell<AudioOps>);
+// SAFETY: written once by `install_audio_ops` from kmain on core 0
+// before the guest runs; read-only afterwards from the single EL2
+// trap handler.
+unsafe impl Sync for AudioOpsCell {}
+
+static AUDIO_OPS: AudioOpsCell = AudioOpsCell(core::cell::UnsafeCell::new(AudioOps {
+    set_interrupt_mask: noop_u32_u32,
+    set_output_buffers: noop_u32_u32,
+    schedule_output: noop_u32_u32,
+    start_output: noop,
+    stop_output: noop,
+    output_is_running: ret_false,
+    output_volume_set: noop_u32,
+    output_volume_get: ret_zero,
+}));
+
+/// Install the host audio entry points. Called once from `main.rs`
+/// boot wiring.
+pub fn install_audio_ops(ops: AudioOps) {
+    // SAFETY: single-core EL2, called before any sound subfn can run.
+    unsafe {
+        *AUDIO_OPS.0.get() = ops;
+    }
+}
+
+fn audio() -> &'static AudioOps {
+    // SAFETY: see AudioOpsCell.
+    unsafe { &*AUDIO_OPS.0.get() }
+}
 
 /// Marker for the [`NativeDriver`] dispatch in
 /// `peripherals/native_primitives.rs`.
@@ -130,7 +196,7 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         // audio backend so the ping-pong 0x07 calls can pick the
         // right one.
         0x05 => {
-            audio::set_output_buffers(ctx.x[1] as u32, ctx.x[3] as u32);
+            (audio().set_output_buffers)(ctx.x[1] as u32, ctx.x[3] as u32);
             ctx.x[0] = 0;
         }
 
@@ -148,7 +214,7 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         // half of the ping-pong, resamples + SPDIF-encodes, and
         // queues a buffer-complete IRQ once the tail catches up.
         0x07 => {
-            audio::schedule_output(ctx.x[1] as u32, ctx.x[2] as u32);
+            (audio().schedule_output)(ctx.x[1] as u32, ctx.x[2] as u32);
             ctx.x[0] = 0;
         }
 
@@ -171,7 +237,7 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         // on the active audio backend so HDMI audio packets start
         // streaming.
         0x0D => {
-            audio::start_output();
+            (audio().start_output)();
             ctx.x[0] = 0;
         }
 
@@ -187,7 +253,7 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         // so the HDMI receiver doesn't keep hearing residual ring
         // contents between Newton clips.
         0x0F => {
-            audio::stop_output();
+            (audio().stop_output)();
             ctx.x[0] = 0;
         }
 
@@ -208,7 +274,7 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         // `mSoundManager->OutputIsRunning()` (TNativePrimitives.cpp:
         // 1269-1275). Defers to the active audio backend.
         0x13 => {
-            ctx.x[0] = if audio::output_is_running() { 1 } else { 0 };
+            ctx.x[0] = if (audio().output_is_running)() { 1 } else { 0 };
         }
 
         // 0x14 InputIsRunning, 0x15 CurrentOutputPtr,
@@ -225,7 +291,7 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         // fader the kernel just set, even though the HDMI MAI
         // hardware has no software fader of its own.
         0x17 => {
-            audio::output_volume_set(ctx.x[1] as u32);
+            (audio().output_volume_set)(ctx.x[1] as u32);
             ctx.x[0] = 0;
         }
 
@@ -234,7 +300,7 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         // 1312-1318). Returns the value passed to the most recent
         // 0x17, or kOutputVolume_Max if the kernel queried first.
         0x18 => {
-            ctx.x[0] = audio::output_volume_get() as u64;
+            ctx.x[0] = (audio().output_volume_get)() as u64;
         }
 
         // 0x19 InputVolume(r1) — Einstein clamps r1 to 0xFF and
@@ -275,7 +341,7 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         // calls 0x07 again with the next half of the ping-pong. We
         // mirror Einstein's "r0 untouched" detail.
         0x1F => {
-            audio::set_interrupt_mask(ctx.x[1] as u32, ctx.x[2] as u32);
+            (audio().set_interrupt_mask)(ctx.x[1] as u32, ctx.x[2] as u32);
         }
 
         _ => crate::diag::diag_util::halt_unknown_subfn(

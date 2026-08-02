@@ -18,6 +18,34 @@ use core::cell::UnsafeCell;
 use crate::{kprintln, peripherals::guest_access, arch::trap_context::TrapContext};
 use crate::peripherals::native_primitives::NativeDriver;
 
+/// Host pen-sample source drained by `NativeGetSample` (subfn 0x16):
+/// returns `Some((packed_sample, ticks))` matching Einstein's
+/// `TScreenManager::GetSample` semantics, or `None` when no sample is
+/// pending. Installed once from `main.rs` boot wiring with the host-IO
+/// pen queue's pop; the default reports an empty queue.
+pub type PenSource = fn() -> Option<(u32, u32)>;
+
+fn pen_source_empty() -> Option<(u32, u32)> {
+    None
+}
+
+struct PenSourceCell(UnsafeCell<PenSource>);
+// SAFETY: written once by `install_pen_source` from kmain on core 0
+// before the guest runs; read-only afterwards from the single EL2
+// trap handler.
+unsafe impl Sync for PenSourceCell {}
+
+static PEN_SOURCE: PenSourceCell = PenSourceCell(UnsafeCell::new(pen_source_empty));
+
+/// Install the host pen-sample source. Called once from `main.rs`
+/// boot wiring.
+pub fn install_pen_source(src: PenSource) {
+    // SAFETY: single-core EL2, called before any tablet subfn can run.
+    unsafe {
+        *PEN_SOURCE.0.get() = src;
+    }
+}
+
 /// Marker for the [`NativeDriver`] dispatch in
 /// `peripherals/native_primitives.rs`.
 pub struct Tablet;
@@ -142,8 +170,8 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
         0x11 | 0x12 | 0x13 | 0x14 | 0x15 => {
             ctx.x[0] = 0;
         }
-        // NativeGetSample — drain one sample from the host-IO pen
-        // queue. Per Einstein TNativePrimitives.cpp:2012-2015:
+        // NativeGetSample — drain one sample from the installed host
+        // pen source. Per Einstein TNativePrimitives.cpp:2012-2015:
         //   r0 = 1 (got sample) → *r1 = packed sample word,
         //                         *r2 = sample time in Newton ticks.
         //   r0 = 0 (queue empty) — leave *r1 / *r2 alone.
@@ -166,7 +194,8 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
                     );
                 }
             }
-            match crate::host::host_io::pop_pen_sample() {
+            // SAFETY: see PenSourceCell.
+            match (unsafe { *PEN_SOURCE.0.get() })() {
                 Some((sample, ticks)) => {
                     let r1 = ctx.x[1] as u32;
                     let r2 = ctx.x[2] as u32;

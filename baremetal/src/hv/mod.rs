@@ -4,8 +4,8 @@
 pub mod guest;
 pub mod guest_endian;
 pub mod guest_mem;
-pub mod guest_regions;
 pub mod hvc_imm;
+pub mod layout;
 pub mod mmio;
 pub mod snapshot;
 pub mod stage2;

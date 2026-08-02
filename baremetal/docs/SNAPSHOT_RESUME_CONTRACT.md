@@ -11,7 +11,7 @@ field-level layout documented in `src/snapshot.rs`.
 `src/snapshot.rs` serializes, per slot:
 
 - **Three memory regions**, in the order the region manifest
-  (`src/guest_regions.rs`) lists them as snapshotted: `GUEST_RAM`
+  (`src/hv/layout.rs`) lists them as snapshotted: `GUEST_RAM`
   (4 MiB), `GUEST_FB` (2 MiB), and `shadow_stub::SCRATCH_POOL`
   (384 KiB at IPA `0x0600_0000`).
 - **Guest CPU state**: all 31 AArch64 GPRs (`x0..x30`, which alias every

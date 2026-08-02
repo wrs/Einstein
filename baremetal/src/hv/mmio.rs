@@ -32,7 +32,7 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::{arch::cpu, kprintln};
+use crate::{arch::cpu, hv::layout, kprintln};
 use crate::peripherals::{dma::Dma, pcmcia::Pcmcia, serial::Serial, vic::Vic};
 
 /// Uniform contract for a peripheral model routed by this file.
@@ -79,9 +79,6 @@ fn mmio_read<P: MmioPeripheral>(_p: P, ipa: u64, advance_serial: bool) -> u32 {
     }
 }
 
-const HW_BASE: u64 = 0x0F00_0000;
-const HW_END: u64 = 0x0F40_0000;
-
 // ROM serial-chip (kHdWr_P0F243000). Einstein models this as a 1-Wire
 // serial-ROM bit stream (TMemory.cpp:984-999, 2723-2762): a 65-tick
 // loop that returns the "end marker" (0) once, then 64 bits of the
@@ -122,60 +119,16 @@ static BANK_CTRL_REG: AtomicU32 = AtomicU32::new(0);
 const HW_RAM_SIZE_1: u64 = 0x0F00_1800;
 const HW_RAM_SIZE_2: u64 = 0x0F00_1C00;
 
+// The window/range constants this router consults (RAM_PROBE_ABSENT,
+// NO_REX_PROBE, UNKNOWN_BANK5, BIO_BANKS, HW_WINDOW, TICK_PAGE_IPA)
+// live in the layout manifest (`hv::layout`), with the per-window
+// rationale next to each definition.
 
-// MP2x00 RAM-bank probe window. BootOS probes 0x04000000 (present,
-// 4 MiB — we map it) and 0x08000000 (absent — the "we have 4 MiB not
-// 8 MiB" path). The probe does a signature write/read at `base +
-// 0x200000`; if the read doesn't match the signature, the bank is
-// declared absent. We model the second bank as "no memory": writes
-// are dropped deterministically, reads return 0. That gives the
-// probe a clean "absent" signal without a silent ignored write.
-const RAM_PROBE_ABSENT_BASE: u64 = 0x0800_0000;
-const RAM_PROBE_ABSENT_END:  u64 = 0x0900_0000;
-
-// "No extra ROM / REx / flash" probe window. The Newton kernel's
-// TestForREx (rom 0x3137dc) and related probes scan fixed addresses
-// past the mapped flash-bank-2 window (0x10400000 upward) looking
-// for RExBlock magic at fixed offsets. We explicitly model these as
-// absent so reads return 0 and the probe's magic-compare fails
-// cleanly. PCMCIA (0x30000000+) is handled separately.
-const NO_REX_PROBE_BASE: u64 = 0x1040_0000;
-const NO_REX_PROBE_END:  u64 = 0x2000_0000;
-
-// "Unknown bank #5" silent-zero window — the gap between Newton MP2x00's
-// kFlashBank2End (0x1040_0000) and kPCMCIA0Base (0x3000_0000). Einstein's
-// `TMemory::ReadP` (Emulator/TMemory.cpp:1026-1034) returns 0 silently
-// for any read in this range and absorbs writes. The 717006 kernel hits
-// this on a TInterpreter-side `MakeString__FPCc` whose to-Unicode
-// translator descriptor's `+16` slot (the per-encoding lookup table
-// base) is 0x2000_0110 — a bogus pointer the kernel computed from
-// uninitialised / partially-installed encoding state. Einstein tolerates
-// it via this silent-zero path (the convert function reads 0 → emits
-// U+0000 → boot continues with garbled string output instead of a hard
-// fault). Match that behaviour here so the trip-wire isn't load-bearing
-// past the modelled-MMIO window. The deeper "why is the descriptor
-// wrong" question is decoupled from this wedge: it's a NewtonScript-
-// level bug Einstein masks the same way.
-const UNKNOWN_BANK5_BASE: u64 = 0x2000_0000;
-const UNKNOWN_BANK5_END:  u64 = 0x3000_0000;
-
-// BIO interface register bank. `TBIOInterface::BIOReadRegister` /
-// `BIOWriteCommand` / etc. at ROM `0x26b878..0x26ba10` compute the
-// target register address as `0x0F05_0000 + (bank_index << 10)`, so
-// the 32 registers live at `0x0F05_0000`, `0x0F05_0400`, …,
-// `0x0F05_7C00`. The early-boot kernel iterates over several banks
-// (14, 15, 16, 17, 18, 19, 20, …) during BIO init; Einstein's TMemory
-// doesn't model these registers — the "unknown bank #3" fallback
-// accepts writes silently and returns 0 for reads (TMemory.cpp:952-959).
-// Rather than whack-a-mole each register as the iterator advances,
-// accept the whole known-stride range in one explicit entry. This is
-// still a closed whitelist — addresses outside the stride or outside
-// the 32-register window continue to halt loudly.
-const BIO_BANK_BASE: u64 = 0x0F05_0000;
-const BIO_BANK_END:  u64 = 0x0F05_8000;
-
+// BIO registers sit on a 0x400 stride inside `layout::BIO_BANKS`
+// (address = 0x0F05_0000 + bank << 10); off-stride addresses inside
+// the window still halt loudly.
 fn in_bio_bank(ipa: u64) -> bool {
-    ipa >= BIO_BANK_BASE && ipa < BIO_BANK_END && (ipa & 0x3FF) == 0
+    layout::BIO_BANKS.contains(ipa) && (ipa & 0x3FF) == 0
 }
 
 pub fn read(ctx: &crate::arch::trap_context::TrapContext, ipa: u64, sas: u8, elr: u64) -> u32 {
@@ -384,14 +337,14 @@ fn read_word_opt(
         // Einstein.
         0x0F18_4C00 => 0,
 
-        // RAM-probe "absent bank" window (see const comment above).
-        a if (RAM_PROBE_ABSENT_BASE..RAM_PROBE_ABSENT_END).contains(&a) => 0,
+        // RAM-probe "absent bank" window (see layout's window comment).
+        a if layout::RAM_PROBE_ABSENT.contains(a) => 0,
 
-        // REx / extra-flash "absent" probe window (see const comment).
-        a if (NO_REX_PROBE_BASE..NO_REX_PROBE_END).contains(&a) => 0,
+        // REx / extra-flash "absent" probe window (see layout).
+        a if layout::NO_REX_PROBE.contains(a) => 0,
 
-        // "Unknown bank #5" silent-zero window (see const comment).
-        a if (UNKNOWN_BANK5_BASE..UNKNOWN_BANK5_END).contains(&a) => 0,
+        // "Unknown bank #5" silent-zero window (see layout).
+        a if layout::UNKNOWN_BANK5.contains(a) => 0,
 
         // Genuinely unknown: report absence so the caller (read_word
         // halts, peek_word falls through to the write-only check).
@@ -442,14 +395,16 @@ pub fn write(ctx: &crate::arch::trap_context::TrapContext, ipa: u64, sas: u8, va
             _ => (ipa, value),
         }
     };
-    // Tick-page sub-word write catch-net. The tick cluster at
-    // 0x0F18_1000..0x0F18_2000 is stage-2 RO (see
+    // Tick-page sub-word write catch-net. The tick page at
+    // `layout::TICK_PAGE_IPA` is stage-2 RO (see
     // `stage2::install_tick_page`). Under BE-8 the original sub-word
     // write may have been spliced into a word at this point, but the
     // address still lies in the tick page; halt so we notice if any
     // guest code legitimately writes here. Fix when / if it fires:
     // route through `backed_*_write` on `stage2::TICK_PAGE`.
-    if sas < 2 && (0x0F18_1000..0x0F18_2000).contains(&ipa) {
+    if sas < 2
+        && (layout::TICK_PAGE_IPA..layout::TICK_PAGE_IPA + 0x1000).contains(&ipa)
+    {
         kprintln!();
         kprintln!(
             "*** tick-page sub-word write reached mmio::write — \
@@ -480,16 +435,16 @@ pub fn write(ctx: &crate::arch::trap_context::TrapContext, ipa: u64, sas: u8, va
         return;
     }
     // RAM-probe "absent bank" window — dropped writes, deterministic
-    // (see const comment above).
-    if (RAM_PROBE_ABSENT_BASE..RAM_PROBE_ABSENT_END).contains(&ipa) {
+    // (see layout's window comment).
+    if layout::RAM_PROBE_ABSENT.contains(ipa) {
         return;
     }
     // Probe-for-absent-REx window — same semantics.
-    if (NO_REX_PROBE_BASE..NO_REX_PROBE_END).contains(&ipa) {
+    if layout::NO_REX_PROBE.contains(ipa) {
         return;
     }
-    // "Unknown bank #5" silent-drop (see UNKNOWN_BANK5_BASE comment).
-    if (UNKNOWN_BANK5_BASE..UNKNOWN_BANK5_END).contains(&ipa) {
+    // "Unknown bank #5" silent-drop (see layout::UNKNOWN_BANK5).
+    if layout::UNKNOWN_BANK5.contains(ipa) {
         return;
     }
     // Platform "write-only" control registers. Each is a Newton ASIC
@@ -681,7 +636,7 @@ fn halt_on_unknown(
     let width = match sas {
         0 => "B", 1 => "H", 2 => "W", _ => "D",
     };
-    let region = if (HW_BASE..HW_END).contains(&ipa) {
+    let region = if layout::HW_WINDOW.contains(ipa) {
         "inside 0x0F00_0000..0x0F40_0000 (Newton hardware window — add to a peripheral module)"
     } else {
         "outside known windows (unmapped IPA — decide whether to model it or widen stage-2)"

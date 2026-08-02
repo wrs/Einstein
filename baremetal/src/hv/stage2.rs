@@ -15,7 +15,7 @@
 
 use core::ptr::addr_of_mut;
 
-use crate::{hv::guest_mem, hv::guest_regions, kprintln};
+use crate::{hv::guest_mem, hv::layout, kprintln};
 
 // VMSAv8-64 stage-2 descriptor bits
 const DESC_VALID: u64 = 1 << 0;
@@ -109,33 +109,7 @@ pub(crate) static mut TICK_PAGE: TickPage = TickPage([0; 4096]);
 pub(crate) const TICK_OFFSET_CALENDAR: usize = 0x000;
 pub(crate) const TICK_OFFSET_TICKS: usize = 0x800;
 
-// Base IPA of the 4 KiB page holding the tick cluster (calendar / alarm
-// / ticks). The L3 slot index is `(base / 4 KiB) % 512` — we pick
-// whichever L3 is covering the enclosing 2 MiB block.
-const TICK_PAGE_IPA: u64 = 0x0F18_1000;
-
 const TWO_MIB: u64 = 0x0020_0000;
-
-// IPA ranges the guest expects are defined once in the region manifest
-// (`guest_regions::REGIONS`); stage-2, host_addr_for, and the snapshot
-// all consume that table. Only the RAM base/size are duplicated here
-// because the L3 install helpers index into the RAM aperture directly.
-//
-// Flash is split in two disjoint windows on real Newton hardware:
-// bank 0 at `kFlashBank1` (0x02000000) and bank 1 at `kFlashBank2`
-// (0x10000000), each 4 MiB. Einstein keeps both banks back-to-back in a
-// single 8 MiB backing; the manifest surfaces each half at the right
-// guest IPA.
-//
-// There is intentionally no IPA 0x0C mirror. Einstein's `TMemoryConsts`
-// and `TMMU.cpp:1186-1193` document the real Newton layout: `kRAMStart =
-// 0x04000000` is the only RAM PA; VA `0x0C000000+` is purely a stage-1
-// remap to discrete 4 KiB pages in PA `0x04xxxxxx`. A blanket mirror at
-// IPA `0x0C` would alias every pre-MMU 0x0C access to a contiguous RAM
-// window that stage-1 will then remap to a *different* PA, causing
-// pre-MMU writes and post-MMU reads to land in different host cells.
-pub const RAM_IPA_BASE: u64 = 0x0400_0000;
-pub const RAM_IPA_SIZE: u64 = 0x0040_0000; // 4 MiB
 
 const VTCR_EL2_VAL: u64 = (32 << 0)
     | (0b01 << 6)          // SL0 = start at level 1
@@ -149,11 +123,12 @@ const VTCR_EL2_VAL: u64 = (32 << 0)
 /// Return a mutable pointer to the L3 entry covering the 4 KiB RAM page
 /// at `ipa`. None if `ipa` is outside the 4 MiB RAM aperture.
 fn ram_l3_entry_ptr(ipa: u32) -> Option<*mut u64> {
+    let ram = layout::ram_range();
     let ipa64 = ipa as u64;
-    if ipa64 < RAM_IPA_BASE || ipa64 >= RAM_IPA_BASE + RAM_IPA_SIZE {
+    if !ram.contains(&ipa64) {
         return None;
     }
-    let off = ipa64 - RAM_IPA_BASE;
+    let off = ipa64 - ram.start;
     let table_ix = (off / TWO_MIB) as usize;         // 0 or 1
     let slot_ix = ((off % TWO_MIB) / 0x1000) as usize; // 0..512
     let base = match table_ix {
@@ -193,7 +168,7 @@ fn invalidate_ipa_s2(ipa: u32) {
 pub unsafe fn set_ram_page_ro_x(ipa: u32) {
     let page = ipa & !0xFFF;
     let Some(entry_ptr) = ram_l3_entry_ptr(page) else { return; };
-    let host_pa = guest_mem::ram_host_pa() + (page as u64 - RAM_IPA_BASE);
+    let host_pa = guest_mem::ram_host_pa() + (page as u64 - layout::ram_range().start);
     let new = host_pa | PAGE_NORMAL_RO;
     // SAFETY: entry_ptr bounded to one of two 512-entry L3 tables.
     unsafe { entry_ptr.write(new); }
@@ -210,7 +185,7 @@ pub unsafe fn set_ram_page_ro_x(ipa: u32) {
 pub unsafe fn set_ram_page_rw_xn(ipa: u32) {
     let page = ipa & !0xFFF;
     let Some(entry_ptr) = ram_l3_entry_ptr(page) else { return; };
-    let host_pa = guest_mem::ram_host_pa() + (page as u64 - RAM_IPA_BASE);
+    let host_pa = guest_mem::ram_host_pa() + (page as u64 - layout::ram_range().start);
     let new = host_pa | PAGE_NORMAL_RW | S2_XN;
     // SAFETY: entry_ptr bounded to one of two 512-entry L3 tables.
     unsafe { entry_ptr.write(new); }
@@ -239,8 +214,10 @@ unsafe fn set_l2_blocks(ipa_base: u64, host_pa_base: u64, count: u64, attrs: u64
 /// stores are ready, and before stage2::enable().
 /// Boot-time consistency check across the region manifest and the three
 /// subsystems that consume it. Const evaluation already enforces 4 KiB
-/// alignment + non-overlap (`guest_regions`'s `const _` blocks); this
-/// adds the runtime invariants that can't be expressed at const time:
+/// alignment + non-overlap (`layout`'s `const _` blocks), and
+/// `layout::cross_check` covers the layout-level runtime invariants
+/// (registered backings, MMIO-window/region disjointness, tick page,
+/// hyp-code ranges); this adds the stage-2-specific ones:
 ///   * block-mapped (non-paged) regions must be 2 MiB aligned so
 ///     `set_l2_blocks` can map them, and
 ///   * every region that claims `host_addr_for` must resolve through
@@ -250,8 +227,9 @@ unsafe fn set_l2_blocks(ipa_base: u64, host_pa_base: u64, count: u64, attrs: u64
 /// Halts loudly on any violation rather than letting a misconfigured
 /// manifest boot into hard-to-diagnose corruption.
 fn cross_check_manifest() {
-    for r in guest_regions::REGIONS {
-        let paged = r.perm == guest_regions::Stage2Perm::ReadWritePaged;
+    layout::cross_check();
+    for r in layout::REGIONS {
+        let paged = r.perm == layout::Stage2Perm::ReadWritePaged;
         if !paged && (r.ipa % TWO_MIB != 0 || r.size % TWO_MIB != 0) {
             kprintln!(
                 "*** stage2: block-mapped region {} not 2 MiB aligned (ipa={:#x} size={:#x}) ***",
@@ -292,13 +270,13 @@ pub unsafe fn init() {
     // `trap::handle_data_abort` recognises flash-bank IPAs and drops
     // the write (matching Einstein), so the backing keeps the seeded /
     // programmed values.
-    for region in guest_regions::REGIONS {
+    for region in layout::REGIONS {
         let attrs = match region.perm {
-            guest_regions::Stage2Perm::ReadOnly => BLOCK_NORMAL_RO,
-            guest_regions::Stage2Perm::ReadWrite => BLOCK_NORMAL_RW,
+            layout::Stage2Perm::ReadOnly => BLOCK_NORMAL_RO,
+            layout::Stage2Perm::ReadWrite => BLOCK_NORMAL_RW,
             // RAM / scratch pool are refined into 4 KiB L3 pages by the
             // dedicated installers below, not block-mapped here.
-            guest_regions::Stage2Perm::ReadWritePaged => continue,
+            layout::Stage2Perm::ReadWritePaged => continue,
         };
         // SAFETY: helper bounds-checks; region IPA/size are 2 MiB
         // aligned for block-mapped regions (asserted in set_l2_blocks).
@@ -358,11 +336,11 @@ pub unsafe fn init() {
         );
     }
 
-    for region in guest_regions::REGIONS {
+    for region in layout::REGIONS {
         let perm = match region.perm {
-            guest_regions::Stage2Perm::ReadOnly => "RO",
-            guest_regions::Stage2Perm::ReadWrite => "RW",
-            guest_regions::Stage2Perm::ReadWritePaged => "per-page RW+XN initially",
+            layout::Stage2Perm::ReadOnly => "RO",
+            layout::Stage2Perm::ReadWrite => "RW",
+            layout::Stage2Perm::ReadWritePaged => "per-page RW+XN initially",
         };
         kprintln!(
             "stage2: {} @ IPA {:#x}..{:#x} -> host PA {:#x} ({})",
@@ -377,8 +355,9 @@ pub unsafe fn init() {
 /// pages to `RO + X` on first fetch, and the data-abort handler flips
 /// them back on a subsequent write.
 unsafe fn install_ram_l3() {
+    let ram = layout::ram_range();
     let ram_pa = guest_mem::ram_host_pa();
-    let n_blocks = (RAM_IPA_SIZE / TWO_MIB) as usize;
+    let n_blocks = ((ram.end - ram.start) / TWO_MIB) as usize;
     assert!(n_blocks <= 2, "RAM L3 tables assume ≤ 2 × 2 MiB; widen if RAM grows");
 
     for block in 0..n_blocks {
@@ -387,7 +366,7 @@ unsafe fn install_ram_l3() {
             1 => addr_of_mut!(S2_L3_RAM_1) as *mut u64,
             _ => unreachable!(),
         };
-        let block_ipa_base = RAM_IPA_BASE + (block as u64) * TWO_MIB;
+        let block_ipa_base = ram.start + (block as u64) * TWO_MIB;
         let block_host_base = ram_pa + (block as u64) * TWO_MIB;
         for slot in 0..512usize {
             let host_pa = block_host_base + (slot as u64) * 0x1000;
@@ -419,8 +398,8 @@ unsafe fn install_tick_page() {
     // values `vic::read` returns for those registers today.
     tick_page::update_from_sync_trap();
 
-    // L2 index for the 2 MiB block containing TICK_PAGE_IPA.
-    let l2_index = (TICK_PAGE_IPA / TWO_MIB) as usize; // = 0x78 (120) for 0x0F000000
+    // L2 index for the 2 MiB block containing the tick page.
+    let l2_index = (layout::TICK_PAGE_IPA / TWO_MIB) as usize; // = 0x78 (120) for 0x0F000000
     let l3_ptr = addr_of_mut!(S2_L3_HW_TICKS) as *mut u64;
     let tick_pa = addr_of_mut!(TICK_PAGE) as u64;
 
@@ -431,7 +410,7 @@ unsafe fn install_tick_page() {
     }
     // L3 slot for the tick page within this L2-covered 2 MiB window.
     let l3_index =
-        ((TICK_PAGE_IPA - (l2_index as u64) * TWO_MIB) / 0x1000) as usize;
+        ((layout::TICK_PAGE_IPA - (l2_index as u64) * TWO_MIB) / 0x1000) as usize;
     // SAFETY: 0 ≤ l3_index < 512.
     unsafe { l3_ptr.add(l3_index).write(tick_pa | PAGE_NORMAL_RO); }
 
@@ -443,7 +422,7 @@ unsafe fn install_tick_page() {
 
     kprintln!(
         "stage2: tick page (calendar / alarm / ticks) @ IPA {:#x} -> host PA {:#x} (RO, 4 KiB)",
-        TICK_PAGE_IPA, tick_pa
+        layout::TICK_PAGE_IPA, tick_pa
     );
 }
 
@@ -454,11 +433,19 @@ unsafe fn install_tick_page() {
 /// point at the host pool. Unmapped pages stay invalid so any access
 /// outside the populated window stage-2-faults.
 unsafe fn install_scratch_pool() {
-    let l2_index =
-        (crate::newton::shadow_stub::SCRATCH_POOL_IPA as u64 / TWO_MIB) as usize; // 0xC
+    let pool_ipa = layout::SCRATCH_POOL_IPA as u64;
+    let l2_index = (pool_ipa / TWO_MIB) as usize; // 0xC
     let l3_ptr = addr_of_mut!(S2_L3_SCRATCH) as *mut u64;
-    let pool_pa = crate::newton::shadow_stub::scratch_pool_host_pa();
-    let pool_pages = crate::newton::shadow_stub::SCRATCH_POOL_SIZE / 0x1000; // 16
+    // The manifest region resolves the host backing
+    // (`shadow_stub::SCRATCH_POOL` via the registered resolver).
+    let pool_pa = match layout::region_for(pool_ipa, 4) {
+        Some(r) => r.host_pa(),
+        None => {
+            kprintln!("*** stage2: scratch pool IPA missing from the manifest ***");
+            crate::arch::cpu::halt();
+        }
+    };
+    let pool_pages = layout::SCRATCH_POOL_SIZE / 0x1000; // 96
 
     // Clear the L3 table (all invalid).
     for i in 0..512usize {
@@ -467,7 +454,6 @@ unsafe fn install_scratch_pool() {
     }
     // Map the populated pages of the SCRATCH_POOL carve-out.
     let l3_base_ipa = (l2_index as u64) * TWO_MIB;
-    let pool_ipa = crate::newton::shadow_stub::SCRATCH_POOL_IPA as u64;
     let l3_index_base = ((pool_ipa - l3_base_ipa) / 0x1000) as usize;
     for i in 0..pool_pages {
         let entry = (pool_pa + (i as u64) * 0x1000) | PAGE_NORMAL_RW;
@@ -483,11 +469,10 @@ unsafe fn install_scratch_pool() {
 
     kprintln!(
         "stage2: scratch pool @ IPA {:#x}..{:#x} -> host PA {:#x} (RW, {} KiB)",
-        crate::newton::shadow_stub::SCRATCH_POOL_IPA,
-        crate::newton::shadow_stub::SCRATCH_POOL_IPA
-            + crate::newton::shadow_stub::SCRATCH_POOL_SIZE as u32,
+        layout::SCRATCH_POOL_IPA,
+        layout::SCRATCH_POOL_IPA + layout::SCRATCH_POOL_SIZE as u32,
         pool_pa,
-        crate::newton::shadow_stub::SCRATCH_POOL_SIZE / 1024,
+        layout::SCRATCH_POOL_SIZE / 1024,
     );
 }
 

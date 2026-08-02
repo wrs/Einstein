@@ -11,10 +11,11 @@
 //!     `DABT_FAST_TRAMP_OFFSET`, `UND_RETURN_STUB_OFFSET`, …),
 //!   * the installers (`patch_und_vector`, `patch_dabt_vector`,
 //!     `install_dabt_fast_trampoline`, `install_und_vector_swap_*`), and
-//!   * `is_hypervisor_code_region` — the predicate naming every
-//!     runtime-written code region, shared by `guest_endian` (don't
-//!     byte-swap these words) and `snapshot` (a guest PC parked here is
-//!     mid-trampoline and must not anchor an autosave).
+//!   * `register_hyp_code_ranges` — registers every runtime-written
+//!     code region with the layout manifest, whose `is_hyp_code` query
+//!     is shared by `guest_endian` (don't byte-swap these words) and
+//!     `snapshot` (a guest PC parked here is mid-trampoline and must
+//!     not anchor an autosave).
 //!
 //! `guest_mem` keeps the memory-access layer (typed PA reads/writes,
 //! the stage-1 walker, the ROM/RAM/FB backing stores); this module is
@@ -231,14 +232,14 @@ pub const DABT_SAVE_PA: u32 = crate::hv::trap::HYP_TRAMP_SCRATCH_BASE + 0xA0;
 /// (`UND_RETURN_STUB_OFFSET`), and the UND trampoline (0x00FF_FF00).
 pub const ROM_TAIL_STUBS_END: u32 = 0x0100_0000;
 
-/// True if `pa` lies in a region that the hypervisor populates at
-/// runtime with native (little-endian) AArch32 instruction words rather
-/// than guest-authored data. Single source of truth shared by:
-///   * `guest_endian::pa_is_rom_code` — these words must NOT be
-///     byte-swapped on a guest read (they're already host-LE code), and
-///   * `snapshot::pc_in_hypervisor_transient_region` — a guest PC parked
-///     in one of these regions is mid-trampoline and must not anchor an
-///     autosave (the EL2-side code at that IPA is rebuilt every boot).
+/// Register the regions the hypervisor populates at runtime with native
+/// (little-endian) AArch32 instruction words — rather than
+/// guest-authored data — with the layout manifest's hyp-code-range
+/// table (`layout::register_hyp_code_range`). Called once from
+/// `main.rs` before the ROM is loaded; `layout::is_hyp_code` is the
+/// query shared by `guest_endian::pa_is_rom_code` (don't byte-swap
+/// these words) and the snapshot autosave gate (a guest PC parked here
+/// is mid-trampoline).
 ///
 /// Covers every runtime-written code region: the DABT fast trampoline,
 /// the tracer trampoline pool, and the contiguous patch-stub arena / FPA
@@ -246,28 +247,34 @@ pub const ROM_TAIL_STUBS_END: u32 = 0x0100_0000;
 /// regions hold guest data the hypervisor reads back through
 /// `guest_endian`, so the byte-order predicate and the autosave-gating
 /// predicate want exactly the same set.
-pub fn is_hypervisor_code_region(pa: u32) -> bool {
+pub fn register_hyp_code_ranges() {
     // Tracer trampoline pool, `tracer::TRAMPOLINE_IPA..TRAMPOLINE_END`.
     // Hardcoded here (not via `crate::diag::tracer`) because the `tracer`
-    // module is `#[cfg(feature = "trace")]`-only, while this predicate
-    // must compile in every build. The pool is empty ROM tail when the
-    // feature is off, so applying the range unconditionally is harmless.
+    // module is `#[cfg(feature = "trace")]`-only, while these ranges
+    // must be registered in every build. The pool is empty ROM tail when
+    // the feature is off, so registering the range unconditionally is
+    // harmless.
     const TRACER_POOL_BASE: u32 = 0x0090_0000;
     const TRACER_POOL_END: u32 = 0x00E0_0000;
 
     // DABT fast trampoline (between Einstein.rex tail and tracer pool).
-    if (DABT_FAST_TRAMP_OFFSET as u32..TRACER_POOL_BASE).contains(&pa) {
-        return true;
-    }
-    if (TRACER_POOL_BASE..TRACER_POOL_END).contains(&pa) {
-        return true;
-    }
+    crate::hv::layout::register_hyp_code_range(
+        "DABT fast trampoline",
+        DABT_FAST_TRAMP_OFFSET as u32,
+        TRACER_POOL_BASE,
+    );
+    crate::hv::layout::register_hyp_code_range(
+        "tracer trampoline pool",
+        TRACER_POOL_BASE,
+        TRACER_POOL_END,
+    );
     // Patch-stub arena → FPA bypass stub → UND-return stub → UND
     // trampoline, all contiguous in the ROM aperture tail.
-    if (crate::newton::rom_patches::PATCH_STUB_ARENA_BASE..ROM_TAIL_STUBS_END).contains(&pa) {
-        return true;
-    }
-    false
+    crate::hv::layout::register_hyp_code_range(
+        "patch-stub arena + ROM-tail stubs",
+        crate::newton::rom_patches::PATCH_STUB_ARENA_BASE,
+        ROM_TAIL_STUBS_END,
+    );
 }
 
 /// Install the DABT-vector intercept stub at `DABT_TRAMP_OFFSET` and

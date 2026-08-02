@@ -29,7 +29,7 @@
 # scripts/layering-allowlist.txt (`<file-glob> <line-regex> # phase N`);
 # uncovered hits fail the lint, and so do stale allowlist entries that
 # no longer match anything — the allowlist may only shrink as phases
-# 3-7 remove the legacy edges.
+# 4-7 remove the legacy edges.
 set -uo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -120,4 +120,4 @@ if [[ $violations -gt 0 || $stale -gt 0 ]]; then
     echo "check-layering: FAIL — $violations unlisted violation(s), $stale stale allowlist entr(y/ies)"
     exit 1
 fi
-echo "check-layering: OK — 0 unlisted violations ($allowed allowlisted legacy edges pending phases 3-7)"
+echo "check-layering: OK — 0 unlisted violations ($allowed allowlisted legacy edges pending phases 4-7)"

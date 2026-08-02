@@ -8,7 +8,7 @@
 //! return — the vector trailer restores the context and ERETs. Handlers that
 //! don't want to resume never return (they call `cpu::halt`).
 
-use crate::{arch::cpu, hv::guest_mem, kprintln, peripherals::{native_primitives, vic}, host::platform, hv::timer};
+use crate::{arch::cpu, kprintln, peripherals::{native_primitives, vic}, host::platform, hv::timer};
 use crate::arch::trap_context::{advance_elr, describe_ec, read_sysreg, TrapContext};
 
 mod dabt;
@@ -437,9 +437,7 @@ fn handle_instruction_abort(ctx: &TrapContext, iss: u32) {
     //   0b001100..0b001111  permission fault levels
     let ifsc = (iss & 0x3f) as u32;
     let is_permission = (ifsc & 0b111100) == 0b001100;
-    let ram_base = guest_mem::RAM_IPA_BASE as u64;
-    let ram_end = ram_base + guest_mem::RAM_SIZE as u64;
-    let in_ram = (ram_base..ram_end).contains(&ipa);
+    let in_ram = crate::hv::layout::ram_range().contains(&ipa);
 
     if is_permission && in_ram {
         let page_start = (ipa as u32) & !0xFFFu32;
@@ -554,7 +552,7 @@ fn handle_instruction_abort(ctx: &TrapContext, iss: u32) {
 // SCRATCH_POOL's per-stub allocator (`NEXT_SCRATCH_SLOT`) starts past
 // `RESERVED_SCRATCH_SLOTS` (32 slots = 256 B), keeping the trampoline's
 // footprint (offsets 0x00..0xAC) reserved and never claimed by a stub.
-pub const HYP_TRAMP_SCRATCH_BASE: u32 = crate::newton::shadow_stub::SCRATCH_POOL_IPA;
+pub const HYP_TRAMP_SCRATCH_BASE: u32 = crate::hv::layout::SCRATCH_POOL_IPA;
 pub const UND_SAVE_LR_IPA: u32 = HYP_TRAMP_SCRATCH_BASE + 0x00;
 pub const UND_SAVE_SPSR_IPA: u32 = HYP_TRAMP_SCRATCH_BASE + 0x04;
 /// LR_svc captured by the trampoline's brief SVC-mode bounce. Only

@@ -2,7 +2,7 @@
 //! instruction emulation, ROM-write absorb, flash-write drop, and the
 //! `handle_dabt_dispatch` forwarding probe.
 
-use crate::{arch::cpu, hv::guest_mem, hv::mmio, peripherals};
+use crate::{arch::cpu, hv::guest_mem, hv::layout, hv::mmio, peripherals};
 use crate::diag::diag_util::SeenSet;
 use crate::arch::trap_context::{advance_elr, read_sysreg, TrapContext};
 use crate::{dprintln, kprintln};
@@ -13,10 +13,6 @@ use crate::diag::trap_diag::handle_diag;
 
 
 // ----------------- individual handlers -----------------
-
-/// Einstein's `kHighROMEnd`: the ROM aperture is IPA 0..16 MiB. Writes
-/// below this are absorbed (mask ROM ignores them on real hardware).
-const HIGH_ROM_END: u64 = 0x0100_0000;
 
 /// Count of absorbed ROM-aperture stores, for log rate-limiting: the
 /// first few are kprintln'd (each one is a guest null-pointer-class
@@ -121,10 +117,8 @@ pub(crate) fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
     // RW+XN and retry the write natively. The next fetch into the
     // page will trap again (XN) so the handler re-scans the fresh
     // bytes. See `src/stage2.rs::set_ram_page_{ro_x,rw_xn}`.
-    let ram_base = guest_mem::RAM_IPA_BASE as u64;
-    let ram_end = ram_base + guest_mem::RAM_SIZE as u64;
     let is_permission = (ifsc & 0b111100) == 0b001100;
-    if wnr && is_permission && (ram_base..ram_end).contains(&ipa) {
+    if wnr && is_permission && layout::ram_range().contains(&ipa) {
         let page = (ipa as u32) & !0xFFF;
         // SAFETY: helper performs its own TLB maintenance.
         unsafe { crate::hv::stage2::set_ram_page_rw_xn(page); }
@@ -159,7 +153,7 @@ pub(crate) fn handle_data_abort(ctx: &mut TrapContext, iss: u32) {
     // Real hardware's mask ROM ignores the write; so do we. ISV=1 has
     // no writeback, so there's no guest register state to fix up.
     // ISV=0 shapes (SWP) are absorbed by `try_absorb_rom_write` below.
-    if wnr && isv == 1 && is_permission && ipa < HIGH_ROM_END {
+    if wnr && isv == 1 && is_permission && ipa < layout::high_rom_end() {
         let n = ROM_WRITE_DROPS.fetch_add(1, Ordering::Relaxed);
         if n < 4 {
             kprintln!(
@@ -395,7 +389,7 @@ fn try_emulate_isv0_dabt(ctx: &mut TrapContext, ipa: u64, wnr: bool, elr: u32) -
 /// wire for novel cases (pre/post-indexed STR with writeback, LDM/STM,
 /// inline-stub byte/halfword stores, …).
 fn try_absorb_rom_write(ctx: &mut TrapContext, ipa: u64, elr: u32) -> bool {
-    if ipa >= HIGH_ROM_END {
+    if ipa >= layout::high_rom_end() {
         return false;
     }
     // Stage-1 off (pre-MMU and the guest-test runtime) makes
@@ -450,7 +444,7 @@ fn try_absorb_rom_write(ctx: &mut TrapContext, ipa: u64, elr: u32) -> bool {
 /// halting.
 fn is_obviously_unreachable_ipa(ipa: u64) -> bool {
     // Inside ROM (stage-2 RO). Any write is doomed.
-    if ipa < HIGH_ROM_END { return true; }
+    if ipa < layout::high_rom_end() { return true; }
     // "Unknown bank #5" gap (between flash bank 2 end at 0x10400000
     // and PCMCIA0Base at 0x30000000). Einstein's TMemory silently
     // returns 0 here; we now do the same in mmio.rs but the kernel
@@ -460,7 +454,7 @@ fn is_obviously_unreachable_ipa(ipa: u64) -> bool {
     // for the first such access per boot is cheap and decisive.
     // Skip the NO_REX_PROBE sub-window (0x10400000..0x20000000) —
     // that's a known ROM-driven scan that legitimately reads zeros.
-    if (0x2000_0000..0x3000_0000).contains(&ipa) { return true; }
+    if layout::UNKNOWN_BANK5.contains(ipa) { return true; }
     false
 }
 

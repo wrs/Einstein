@@ -1,8 +1,9 @@
 //! EL2 stage-1 MMU setup for identity-mapping the low N GiB of the host's
 //! physical address space.
 //!
-//! The MMIO and DRAM windows differ between hosts; the layout itself is
-//! parameterised by `crate::host::platform`:
+//! The MMIO and DRAM windows differ between hosts; `init` takes them as
+//! parameters (main.rs passes `host::platform`'s constants — arch
+//! imports nothing above itself):
 //!
 //!   raspi3b  — DRAM 0x0..0x3F00_0000, MMIO 0x3F00_0000..0x4000_0000,
 //!              BCM2836 local peripheral 0x4000_0000..0x8000_0000.
@@ -19,7 +20,7 @@
 //!
 //!   L2 table: 512 × 2 MiB block entries.
 //!     identity-map PA == VA, Device-nGnRE inside the platform's
-//!     [DEVICE_MMIO_START..DEVICE_MMIO_END), Normal WB elsewhere.
+//!     `device_mmio` window, Normal WB elsewhere.
 //!
 //! Attribute encoding via MAIR_EL2:
 //!   index 0: Normal inner+outer WB write-allocate cacheable (0xFF)
@@ -31,7 +32,6 @@
 use core::ptr::addr_of_mut;
 
 use crate::kprintln;
-use crate::host::platform;
 
 // --------------- Descriptor layout (VMSAv8-64 short form) ---------------
 
@@ -104,15 +104,24 @@ const SCTLR_EL2_RES1: u64 = (1 << 4) | (1 << 5) | (1 << 11)
 ///
 /// Must be called once from `kmain` on core 0 before any code that relies on
 /// caches or virtual addressing. After this returns the MMU is on and the
-/// low 1 GiB is identity-mapped: RAM as Normal WB, the BCM2837 MMIO window
-/// (0x3F000000–0x40000000) as Device-nGnRE.
-pub unsafe fn init() {
+/// low 1 GiB is identity-mapped: RAM as Normal WB, the platform's MMIO
+/// window as Device-nGnRE.
+///
+/// `device_mmio` is the low-GiB PA window to map Device-nGnRE;
+/// `device_mmio_1gib_block` / `dram_1gib_block` optionally install one
+/// extra 1 GiB L1 block each (Device / Normal WB) at the named PA.
+/// The caller (`main.rs`) supplies `host::platform`'s constants.
+pub unsafe fn init(
+    device_mmio: core::ops::Range<u64>,
+    device_mmio_1gib_block: Option<u64>,
+    dram_1gib_block: Option<u64>,
+) {
     // Populate L2 (covers PAs 0..1 GiB): identity-map each 2 MiB block as
     // Device-nGnRE inside the platform's MMIO window, Normal WB elsewhere.
     let l2_ptr = addr_of_mut!(L2) as *mut u64;
     for i in 0..512_u64 {
         let pa = i * TWO_MIB;
-        let attr = if pa >= platform::DEVICE_MMIO_START && pa < platform::DEVICE_MMIO_END {
+        let attr = if device_mmio.contains(&pa) {
             BLOCK_DEVICE
         } else {
             BLOCK_NORMAL
@@ -132,11 +141,11 @@ pub unsafe fn init() {
     // SAFETY: L1 has 512 entries; we only touch indices 0 and one optional slot per platform.
     unsafe {
         l1_ptr.write(l2_addr | DESC_VALID | DESC_TABLE);
-        if let Some(pa) = platform::DEVICE_MMIO_1GIB_BLOCK {
+        if let Some(pa) = device_mmio_1gib_block {
             let idx = (pa / ONE_GIB) as usize;
             l1_ptr.add(idx).write(pa | BLOCK_DEVICE);
         }
-        if let Some(pa) = platform::DRAM_1GIB_BLOCK {
+        if let Some(pa) = dram_1gib_block {
             let idx = (pa / ONE_GIB) as usize;
             l1_ptr.add(idx).write(pa | BLOCK_NORMAL);
         }

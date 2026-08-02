@@ -5,29 +5,20 @@
 # check-layering.sh flags any forbidden import NOT matched here, and
 # fails on stale entries (a listed edge that no longer exists must be
 # deleted in the same change). This list may only shrink: each entry
-# names the refactor phase that removes it (phase 3: layout manifest,
-# phase 4: mmio cleanup, phase 5: backend seams, phase 6: diag layer,
-# phase 7: GuestOs hooks).
+# names the refactor phase that removes it (phase 4: mmio cleanup,
+# phase 5: backend seams, phase 6: diag layer, phase 7: GuestOs hooks).
 
 # ---- arch ------------------------------------------------------------
 src/arch/cpu.rs host::console # phase 6 — halt-path DMA-console drain moves behind the diag on_loud_halt surface
-src/arch/mmu.rs host::platform # phase 3 — DEVICE_MMIO_RANGE folds into the layout manifest
 
 # ---- hv --------------------------------------------------------------
 src/hv/timer.rs peripherals::vic # phase 4 — timer→VIC tick plumbing via the router split
 src/hv/timer.rs host::platform # phase 5 — NEWTON_TICK_HZ/platform constants behind the backend seam
 src/hv/mmio.rs peripherals:: # phase 4 — router dispatch becomes layout::MMIO_WINDOWS + PeriphId
-src/hv/stage2.rs newton::shadow_stub # phase 3 — SCRATCH_POOL layout into the manifest
 src/hv/stage2.rs peripherals::vic # phase 7 — tick-page VIC advance moves into on_sync_trap_exit hook
-src/hv/guest_mem.rs newton::shadow_stub # phase 3 — SCRATCH_POOL layout into the manifest
 src/hv/guest_mem.rs newton::(rom_patches|guest_trampolines) # phase 7 — ROM-loader half splits into newton/loader.rs
-src/hv/guest_endian.rs newton::guest_trampolines # phase 7 — is_hypervisor_code_region → layout HYP_CODE_RANGES query
-src/hv/guest_regions.rs newton::shadow_stub # phase 3 — SCRATCH_POOL layout into the manifest
-src/hv/guest_regions.rs peripherals # phase 3 — flash backing host_pa via the layout manifest
-src/hv/snapshot.rs newton::(guest_trampolines|shadow_stub) # phase 3 — HYP_CODE_RANGES + SCRATCH_POOL into the manifest
 src/hv/snapshot.rs host::flash_persist # phase 5 — flash-persist backend seam
 src/hv/trap/mod.rs peripherals:: # phase 4 — VIC/native-primitives dispatch via the router split
-src/hv/trap/mod.rs newton::shadow_stub # phase 3 — SCRATCH_POOL layout into the manifest
 src/hv/trap/mod.rs host::platform # phase 5 — platform glue behind the backend seam
 src/hv/trap/mod.rs host::(host_io|input|audio|display|tarmac) # phase 7 — IRQ-tail pumps move into on_irq_tail hook
 src/hv/trap/dabt.rs peripherals:: # phase 4 — flash-write dispatch via the router split

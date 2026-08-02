@@ -245,7 +245,7 @@ pub fn read_word_pa(pa: u32) -> Option<u32> {
 }
 
 /// Map a guest IPA + size to the host backing pointer. Drives off the
-/// single region manifest (`guest_regions::REGIONS`) so the set of
+/// single region manifest (`layout::REGIONS`) so the set of
 /// EL2-reachable backings has one definition shared with stage-2 and the
 /// snapshot. `for_write=true` excludes read-only regions (ROM is RO at
 /// the hypervisor backing layer; flash is RO and not reachable here at
@@ -260,11 +260,11 @@ pub fn host_pa_for_ipa(ipa: u64, for_write: bool) -> Option<usize> {
 }
 
 fn host_addr_for(pa: usize, size: usize, for_write: bool) -> Option<usize> {
-    let r = crate::hv::guest_regions::region_for(pa as u64, size as u64)?;
+    let r = crate::hv::layout::region_for(pa as u64, size as u64)?;
     if !r.host_addr_for {
         return None;
     }
-    if for_write && r.perm == crate::hv::guest_regions::Stage2Perm::ReadOnly {
+    if for_write && r.perm == crate::hv::layout::Stage2Perm::ReadOnly {
         return None;
     }
     Some(r.host_pa() as usize + (pa - r.ipa as usize))
@@ -406,7 +406,7 @@ pub fn fix_stage1_xn_bits() -> bool {
 
     let mut rom_writes = 0usize;
 
-    let scratch_l1_idx = (crate::newton::shadow_stub::SCRATCH_POOL_VA >> 20) as usize;
+    let scratch_l1_idx = (crate::hv::layout::SCRATCH_POOL_VA >> 20) as usize;
 
     // L1 sits at the start of guest RAM (TTBR0 = 0x0400_0000 per probe).
     for i in 0..4096 {
@@ -510,7 +510,7 @@ pub fn fix_stage1_xn_bits() -> bool {
 
 /// ARMv7 short-descriptor section attributes for the shadow-stub
 /// ScratchVA carve-out installed at the kernel VA
-/// `crate::newton::shadow_stub::SCRATCH_POOL_VA`. The section's PA bits encode
+/// `crate::hv::layout::SCRATCH_POOL_VA`. The section's PA bits encode
 /// the IPA `SCRATCH_POOL_IPA`, which stage-2 then translates to the
 /// host SCRATCH_POOL backing.
 ///
@@ -528,11 +528,11 @@ pub fn fix_stage1_xn_bits() -> bool {
 /// DDI 0406C B3-19.
 const SCRATCH_POOL_L1_SECTION_ATTRS: u32 = 0x0000_0C1E;
 fn scratch_pool_l1_section() -> u32 {
-    crate::newton::shadow_stub::SCRATCH_POOL_IPA | SCRATCH_POOL_L1_SECTION_ATTRS
+    crate::hv::layout::SCRATCH_POOL_IPA | SCRATCH_POOL_L1_SECTION_ATTRS
 }
 
 /// Install the kernel-side L1 mapping for the shadow-stub ScratchVA
-/// scratch carve-out at VA `crate::newton::shadow_stub::SCRATCH_POOL_IPA`. The
+/// scratch carve-out at VA `crate::hv::layout::SCRATCH_POOL_IPA`. The
 /// section descriptor identity-maps the VA to itself; stage-2 then
 /// translates that IPA to the host `SCRATCH_POOL` backing.
 ///
@@ -546,7 +546,7 @@ fn scratch_pool_l1_section() -> u32 {
 /// VA must be picked).
 pub fn install_scratch_pool_l1_section() {
     let ram = addr_of_mut!(GUEST_RAM) as *mut u32;
-    let idx = (crate::newton::shadow_stub::SCRATCH_POOL_VA >> 20) as usize;
+    let idx = (crate::hv::layout::SCRATCH_POOL_VA >> 20) as usize;
 
     // SAFETY: idx < 4096; GUEST_RAM holds the kernel L1 at TTBR0 = 0x0400_0000.
     let entry = unsafe { read_pt_entry(ram.add(idx)) };
@@ -575,7 +575,7 @@ pub fn install_scratch_pool_l1_section() {
             "shadow_stub scratch: FATAL — kernel L1[{:#x}] = {:#010x}, type bits {:#x}; \
              not a fault entry and not our installed section. ROM revision uses VA {:#x}? \
              Pick a different SCRATCH_POOL_VA.",
-            idx, entry, entry & 3, crate::newton::shadow_stub::SCRATCH_POOL_VA,
+            idx, entry, entry & 3, crate::hv::layout::SCRATCH_POOL_VA,
         );
         crate::arch::cpu::halt();
     }

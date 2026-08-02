@@ -54,24 +54,11 @@ static NEXT_STUB: AtomicUsize = AtomicUsize::new(0);
 // Scratch pool
 // =======================================================================
 //
-// 384 KiB carve-out at IPA == VA == 0x0600_0000. Identity-mapped so:
-//   * Newton boot (kernel stage-1 on): kernel L1[VA>>20] = section
-//     descriptor identity-mapping VA→IPA. Stage-2 maps IPA →
-//     SCRATCH_POOL.
-//   * Guest-test mode (kernel stage-1 off): stage-1 is bypassed; the
-//     CPU emits VA as IPA directly. Stage-2 sees IPA == VA and maps
-//     to SCRATCH_POOL.
-//
-// Identity mapping keeps per-slot literals usable from both regimes
-// without two separate stage-2 mappings.
-//
-// L1[0x60] sits in a free gap of the kernel's L1 census (slots
-// 0x52..0xBF are unused) and is also free in the existing stage-2
-// layout (between RAM at 0x0440_0000 and the framebuffer at
-// 0x0E00_0000).
-pub const SCRATCH_POOL_VA: u32 = 0x0600_0000;
-pub const SCRATCH_POOL_IPA: u32 = 0x0600_0000;
-pub const SCRATCH_POOL_SIZE: usize = 384 * 1024; // 96 × 4 KiB pages
+// The carve-out's guest-address-map facts (IPA / VA / size, and why it
+// is identity-mapped) live in the layout manifest — see the scratch
+// pool section of `hv::layout`. This module owns the host backing
+// buffer and the per-slot allocator.
+use crate::hv::layout::SCRATCH_POOL_SIZE;
 
 #[repr(C, align(4096))]
 pub struct ScratchPool(pub [u8; SCRATCH_POOL_SIZE]);

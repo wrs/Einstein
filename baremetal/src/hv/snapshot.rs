@@ -477,31 +477,19 @@ fn maybe_autosave_via_semihost(ctx: &TrapContext) {
 /// RAM save slots, banked-mode SP/LR captures, staged ERET PC). A
 /// snapshot taken at such a PC cannot be faithfully resumed.
 ///
-/// Ranges covered (constants verified against `guest_mem` /
-/// `rom_patches`):
-///   - `0x008FFF00..0x00900000` — DABT fast trampoline
-///     (`guest_trampolines::DABT_FAST_TRAMP_OFFSET`, 41 words). Saves
-///     LR_abt/SP_abt/SPSR_abt and stashes R0/R1 in TPIDRURW/TPIDRRO;
-///     handles the dominant fault stream, so a nontrivial fraction of
-///     wall time sits here.
-///   - `0x00900000..0x00E00000` — tracer trampoline pool
-///     (`tracer::TRAMPOLINE_IPA..TRAMPOLINE_END`).
-///   - `0x00FFFD80..0x01000000` — patch-stub arena
-///     (`rom_patches::PATCH_STUB_ARENA_BASE`), FPA bypass stub
-///     (`guest_trampolines::FPA_BYPASS_STUB_OFFSET` = 0x00FFFEC0), UND
-///     trampoline (0x00FFFF00), DABT trampoline (0x00FFFFA8), and UND
-///     return stub (0x00FFFFE4). The FPA stub and DABT trampoline also
-///     stash R0/R1/R12 in TPIDRURW/TPIDRRO.
+/// The ranges are the ones the Newton install paths registered with
+/// `layout::register_hyp_code_range` at boot (DABT fast trampoline,
+/// tracer trampoline pool, patch-stub arena / FPA bypass / UND
+/// trampoline tail — see `guest_trampolines::register_hyp_code_ranges`
+/// for the per-range commentary). Delegates to `layout::is_hyp_code` —
+/// the single source of truth for these ranges, shared with
+/// `guest_endian::pa_is_rom_code` so the two lists can't drift.
 ///
 /// The tracer pool is only populated when the `trace` feature is on,
 /// but checking always is cheap and harmless — nothing the guest
 /// does naturally lands ELR_EL2 in that range otherwise.
-///
-/// Delegates to `guest_trampolines::is_hypervisor_code_region` — the single
-/// source of truth for these ranges, shared with
-/// `guest_endian::pa_is_rom_code` so the two lists can't drift.
 fn pc_in_hypervisor_transient_region(pc: u32) -> bool {
-    crate::newton::guest_trampolines::is_hypervisor_code_region(pc)
+    crate::hv::layout::is_hyp_code(pc)
 }
 
 /// Write a snapshot to the next ring slot. Called from periodic
@@ -549,7 +537,7 @@ fn save_via_semihost(gprs: &[u64; 31]) -> Result<(), &'static str> {
     // SAFETY: the backing stores are static mut u8 arrays; we take a
     // read-only view for the duration of the semihosting write, no
     // concurrent writer is possible on single-core EL2.
-    for region in crate::hv::guest_regions::snapshot_regions() {
+    for region in crate::hv::layout::snapshot_regions() {
         let bytes = unsafe {
             core::slice::from_raw_parts(region.host_pa() as *const u8, region.size as usize)
         };
@@ -609,7 +597,7 @@ fn build_header(gprs_u64: &[u64; 31], seq: u64) -> Header {
         _pad1: 0,
         ram_size: guest_mem::RAM_SIZE as u32,
         fb_size: guest_mem::FRAMEBUFFER_SIZE as u32,
-        scratch_size: crate::newton::shadow_stub::SCRATCH_POOL_SIZE as u32,
+        scratch_size: crate::hv::layout::SCRATCH_POOL_SIZE as u32,
         flash_fingerprint: crate::host::flash_persist::fingerprint(),
         rom_fingerprint: rom_fingerprint(),
         seq,
@@ -745,7 +733,7 @@ pub fn load(path: &[u8]) -> Option<RestoreState> {
     }
     if header.ram_size as usize != guest_mem::RAM_SIZE
         || header.fb_size as usize != guest_mem::FRAMEBUFFER_SIZE
-        || header.scratch_size as usize != crate::newton::shadow_stub::SCRATCH_POOL_SIZE
+        || header.scratch_size as usize != crate::hv::layout::SCRATCH_POOL_SIZE
     {
         kprintln!(
             "snapshot: region sizes don't match (ram={} fb={} scratch={}); ignoring",
@@ -770,7 +758,7 @@ pub fn load(path: &[u8]) -> Option<RestoreState> {
     //
     // SAFETY: backing stores are static mut u8 arrays; we overwrite
     // them entirely before the guest runs again.
-    for region in crate::hv::guest_regions::snapshot_regions() {
+    for region in crate::hv::layout::snapshot_regions() {
         let dst = unsafe {
             core::slice::from_raw_parts_mut(region.host_pa() as *mut u8, region.size as usize)
         };

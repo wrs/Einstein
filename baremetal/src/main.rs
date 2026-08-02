@@ -33,8 +33,15 @@ pub extern "C" fn kmain() -> ! {
     print_caps();
 
     // SAFETY: called exactly once from boot.s on core 0 before any
-    // cache- or virtual-addressing-dependent code runs.
-    unsafe { arch::mmu::init(); }
+    // cache- or virtual-addressing-dependent code runs. The platform's
+    // memory map is passed in so `arch` stays free of upward imports.
+    unsafe {
+        arch::mmu::init(
+            host::platform::DEVICE_MMIO_START..host::platform::DEVICE_MMIO_END,
+            host::platform::DEVICE_MMIO_1GIB_BLOCK,
+            host::platform::DRAM_1GIB_BLOCK,
+        );
+    }
     // Now that RAM is mapped Normal-WB inner-shareable, the ring's
     // atomic RMW operations (used internally by AtomicU32::swap /
     // fetch_add) can run without aborting on the Cortex-A53. Switch
@@ -52,6 +59,24 @@ pub extern "C" fn kmain() -> ! {
     // semantics as sd-probe; build with one OR the other.
     #[cfg(feature = "fb-probe")]
     host::display::probe::run();
+
+    // Wire the layout manifest's host-backing resolvers: `hv::layout`
+    // imports nothing above arch, so the upper-layer statics that back
+    // each guest region are registered here instead. `stage2::init`'s
+    // cross-check halts if any region is left unwired.
+    hv::layout::register_backing(hv::layout::RegionTag::Rom, hv::guest_mem::rom_host_pa);
+    hv::layout::register_backing(hv::layout::RegionTag::Ram, hv::guest_mem::ram_host_pa);
+    hv::layout::register_backing(hv::layout::RegionTag::Framebuffer, hv::guest_mem::fb_host_pa);
+    hv::layout::register_backing(
+        hv::layout::RegionTag::ScratchPool,
+        newton::shadow_stub::scratch_pool_host_pa,
+    );
+    hv::layout::register_backing(hv::layout::RegionTag::Flash, peripherals::flash::host_pa);
+    // Same inversion for the hypervisor-written code ranges (tracer
+    // pool, patch-stub arena, trampoline tail): newton registers its
+    // ranges with the manifest, `layout::is_hyp_code` serves the
+    // byte-order and snapshot-gating queries.
+    newton::guest_trampolines::register_hyp_code_ranges();
 
     // SAFETY: load ROM bytes into guest backing store before stage-2 maps it.
     unsafe { hv::guest_mem::load_rom(); }

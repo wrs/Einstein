@@ -51,14 +51,15 @@ use crate::hv::guest_mem;
 fn pa_is_rom_code(pa: u32) -> bool {
     // Regions the hypervisor populates at runtime with native-LE
     // instruction words — the tracer trampoline pool, the patch-stub
-    // arena and the FPA/UND/DABT trampoline stubs. The classifier's
+    // arena and the FPA/UND/DABT trampoline stubs, registered with the
+    // layout manifest by the Newton install paths. The classifier's
     // reach.bitmap can't cover them (they're written after load), so a
     // `handle_und` decoding e.g. the tracer trampoline's `hvc #TRACE_TAG`
     // or a USR-mode HVC inside a patch wrapper would byteswap the word
     // and miss the dispatch arm without this short-circuit. Shared with
     // `snapshot::pc_in_hypervisor_transient_region` so the two range
     // lists can't drift.
-    if crate::newton::guest_trampolines::is_hypervisor_code_region(pa) {
+    if crate::hv::layout::is_hyp_code(pa) {
         return true;
     }
     let pa = pa as usize;

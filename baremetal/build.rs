@@ -47,10 +47,12 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(nh_audio_null)");
     println!("cargo:rustc-check-cfg=cfg(nh_audio_pi_hdmi)");
     println!("cargo:rustc-check-cfg=cfg(nh_loud_halt_canaries)");
+    println!("cargo:rustc-check-cfg=cfg(nh_semihost)");
     println!("cargo:rustc-check-cfg=cfg(nh_real_hw)");
     println!("cargo:rustc-check-cfg=cfg(nh_diag)");
 
     resolve_loud_halt_canaries();
+    resolve_semihost();
     resolve_real_hw();
     resolve_diag();
 
@@ -448,6 +450,33 @@ fn select_platform_linker_script() {
 // `select_platform_linker_script` rejects the contradiction with a
 // named message. That platform mutual-exclusion check is the only
 // imperative gate left.
+
+/// Emit `cfg(nh_semihost)` when a semihosting host is listening, i.e.
+/// the `no-semihost` feature is absent.
+///
+/// The Cargo feature has to be negative because features are additive:
+/// semihosting is the default-on behaviour, and a positive `semihost`
+/// feature in `default` would be silently dropped by every
+/// `--no-default-features` build (the FVP invocation, all four
+/// `pi-bare-metal*` aggregates). Aggregates also can only *add*
+/// features, so "this build targets real silicon" is only expressible
+/// as `no-semihost`.
+///
+/// Source code reads this positive cfg rather than
+/// `not(feature = "no-semihost")`, so the common case stops being a
+/// double negative and the polarity is stated once, here.
+///
+/// Distinct from `nh_real_hw` even though the two coincide in every
+/// combo `scripts/check-matrix.sh` builds: `nh_semihost` governs
+/// what needs a *host* (snapshot files, `SYS_TIME`, `SYS_EXIT`,
+/// stdout), `nh_real_hw` governs what needs *Pi silicon* (BCM2835
+/// DMA, sdhost, USB). `platform-fvp-base + no-semihost` separates
+/// them: no host, no BCM2835 either.
+fn resolve_semihost() {
+    if env::var("CARGO_FEATURE_NO_SEMIHOST").is_err() {
+        println!("cargo:rustc-cfg=nh_semihost");
+    }
+}
 
 /// Emit `cfg(nh_real_hw)` when the build targets a real Pi Zero 2 W:
 /// `no-semihost` + `platform-raspi3b`, i.e. the BCM2835 DMA engine and

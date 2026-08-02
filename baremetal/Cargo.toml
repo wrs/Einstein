@@ -195,9 +195,14 @@ audio-pi-hdmi = ["platform-raspi3b"]
 #     instead of SYS_TIME.
 #   - `cpu::halt` skips SYS_EXIT_EXTENDED and falls through to WFE.
 #
-# Source code reads `cfg(feature = "no-semihost")` directly. Orthogonal
-# to platform-* and to the host-io-* / flash-persist-* axes — pick the
-# right backends explicitly alongside.
+# The feature is negative because Cargo features are additive:
+# semihosting is the default-on behaviour, so a positive `semihost`
+# feature in `default` would vanish from every `--no-default-features`
+# build, and an aggregate like `pi-bare-metal` could never switch it
+# off. Source code doesn't read the feature — build.rs inverts it into
+# `cfg(nh_semihost)` (see `resolve_semihost`) so the common case isn't
+# a double negative. Orthogonal to platform-* and to the host-io-* /
+# flash-persist-* axes — pick the right backends explicitly alongside.
 no-semihost = []
 
 # Aggregate feature for "build for a real Pi Zero 2 W": same SoC as

@@ -199,7 +199,7 @@ static CALENDAR_CNTPCT_BASELINE: AtomicU64 = AtomicU64::new(0);
 /// host `time()` — we do it at the MMIO layer instead so we don't
 /// depend on the ROM patch firing.
 fn init_calendar() {
-    #[cfg(not(feature = "no-semihost"))]
+    #[cfg(nh_semihost)]
     let unix_time: u64 = {
         const SYS_TIME: u64 = 0x11;
         // The ARM semihosting SYS_TIME call ignores the parameter
@@ -217,12 +217,12 @@ fn init_calendar() {
             ret
         }
     };
-    // On `no-semihost` builds (real silicon) there is no host clock to
+    // Without `nh_semihost` there is no host clock to
     // ask. Use a compile-time-baked seed: midnight 2026-05-16 UTC.
     // Newton runs reasonably with any plausible RTC; "wrong by hours"
     // only matters for user-visible dates. A future Phase will read a
     // real RTC chip if we add one.
-    #[cfg(feature = "no-semihost")]
+    #[cfg(not(nh_semihost))]
     let unix_time: u64 = 1_778_889_600; // 2026-05-16 00:00:00 UTC
     let secs_since_1904 = (unix_time as u32)
         .wrapping_add(SECS_1904_TO_1970)
@@ -408,9 +408,9 @@ pub fn poll_alarm() {
 /// have already fired (or are zero). Returned in the Newton tick domain;
 /// callers wanting a CNTPCT-domain deadline must translate themselves.
 /// Only the synthetic-tick fast-forward in `heartbeat_tick_update`
-/// consults it; on `no-semihost` ticks are wall-anchored and the
+/// consults it; without `nh_semihost` ticks are wall-anchored and the
 /// fast-forward path is compiled out.
-#[cfg(not(feature = "no-semihost"))]
+#[cfg(nh_semihost)]
 pub fn next_pending_match() -> Option<u32> {
     // SAFETY: single-threaded.
     let s = unsafe { &*VIC.0.get() };
@@ -507,8 +507,8 @@ const K_HDWR_GPIO_E800: u64 = 0x0F18_E800;
 const K_HDWR_GPIO_EC00: u64 = 0x0F18_EC00;
 
 /// Synthetic Newton-tick counter used **only on QEMU/FVP hosts**
-/// (`cfg(not(feature = "no-semihost"))`). On real Pi silicon
-/// (`no-semihost`) `ticks()` is wall-anchored to CNTPCT_EL0 and this
+/// (`cfg(nh_semihost)`). On real Pi silicon
+/// (`cfg(not(nh_semihost))`) `ticks()` is wall-anchored to CNTPCT_EL0 and this
 /// counter is unread — the advance functions still write to it for
 /// code-path symmetry, but those writes have no observable effect.
 ///
@@ -538,7 +538,7 @@ const K_HDWR_GPIO_EC00: u64 = 0x0F18_EC00;
 /// apply — guest code runs at native A53 speed, hypervisor trap
 /// overhead is microseconds (not tens of µs), and `SafeShortTimerDelay`
 /// loops that intend "10 ms wall" actually want 10 ms of wall time.
-/// The wall-anchored `ticks()` path in `no-semihost` builds reads
+/// The wall-anchored `ticks()` path taken without `nh_semihost` reads
 /// CNTPCT_EL0 directly and scales by `NEWTON_TICK_HZ / CNTFRQ_EL0`.
 static SYNTH_TICKS: AtomicU32 = AtomicU32::new(0);
 
@@ -563,14 +563,14 @@ const TICK_ADVANCE_PER_TRAP: u32 = 6;
 /// crawl; values much larger let preemption-tier deadlines (73 720
 /// ticks for the 20 ms slice) fire on every heartbeat regardless of
 /// guest progress, defeating the instruction-anchored model.
-#[cfg(not(feature = "no-semihost"))]
+#[cfg(nh_semihost)]
 const TICK_ADVANCE_PER_HEARTBEAT: u32 = 1024;
 
 /// Current Newton-tick value as seen by guest reads of `kHdWr_Ticks`
 /// (0x0F181800) — both via MMIO trap (`vic::read`) and via the
 /// non-trapping `TICK_PAGE`.
 ///
-/// On real silicon (`cfg(feature = "no-semihost")`) this is wall-
+/// On real silicon (`cfg(not(nh_semihost))`) this is wall-
 /// anchored: CNTPCT_EL0 elapsed since `init()` scaled by
 /// `NEWTON_TICK_HZ / CNTFRQ_EL0`. A `SafeShortTimerDelay` that asks
 /// for ~10 ms of ticks gets ~10 ms of wall time, modulo the
@@ -581,13 +581,13 @@ const TICK_ADVANCE_PER_HEARTBEAT: u32 = 1024;
 /// advanced by `tick_advance_*` from the tick-page update path. See
 /// the `SYNTH_TICKS` doc-comment for the QEMU-specific rationale.
 pub fn ticks() -> u32 {
-    #[cfg(feature = "no-semihost")]
+    #[cfg(not(nh_semihost))]
     {
         let elapsed = read_cntpct().wrapping_sub(TICK_EPOCH.load(Ordering::Acquire));
         let freq = read_cntfrq() as u128;
         ((elapsed as u128 * NEWTON_TICK_HZ as u128) / freq) as u32
     }
-    #[cfg(not(feature = "no-semihost"))]
+    #[cfg(nh_semihost)]
     SYNTH_TICKS.load(Ordering::Acquire)
 }
 
@@ -601,9 +601,9 @@ pub fn tick_advance_sync_trap() -> u32 {
 
 /// Bump SYNTH_TICKS by the heartbeat delta. Called from
 /// `timer::on_irq` (every CNTHP heartbeat) so that non-trapping
-/// busy-wait loops still see ticks advance. Unused on `no-semihost`
+/// busy-wait loops still see ticks advance. Unused without `nh_semihost`,
 /// where `ticks()` is wall-anchored.
-#[cfg(not(feature = "no-semihost"))]
+#[cfg(nh_semihost)]
 pub fn tick_advance_heartbeat() -> u32 {
     let prev = SYNTH_TICKS.fetch_add(TICK_ADVANCE_PER_HEARTBEAT, Ordering::AcqRel);
     prev.wrapping_add(TICK_ADVANCE_PER_HEARTBEAT)
@@ -633,15 +633,15 @@ pub fn tick_advance_heartbeat() -> u32 {
 /// past a polling loop's deadline before the loop iterated as many
 /// times as the kernel intended.
 ///
-/// On real silicon (`no-semihost`) `ticks()` is wall-anchored, so
+/// On real silicon (`cfg(not(nh_semihost))`) `ticks()` is wall-anchored, so
 /// match deadlines are crossed naturally by CNTPCT advancing; the
 /// fast-forward is moot. The matching
 /// heartbeat tick-page republish in `newton::os` publishes the current
 /// wall-anchored `ticks()` into the guest's read-only tick page.
 pub fn heartbeat_tick_update() {
-    #[cfg(feature = "no-semihost")]
+    #[cfg(not(nh_semihost))]
     return;
-    #[cfg(not(feature = "no-semihost"))]
+    #[cfg(nh_semihost)]
     {
     static LAST_HEARTBEAT_TICK: AtomicU32 = AtomicU32::new(0);
     let last = LAST_HEARTBEAT_TICK.load(Ordering::Acquire);

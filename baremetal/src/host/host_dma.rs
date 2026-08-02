@@ -1,8 +1,8 @@
 //! BCM2835 DMA controller — minimum slice needed to feed PL011 TX
 //! without busy-waiting on the FIFO.
 //!
-//! Only compiled into real-hardware Pi builds (`no-semihost` +
-//! `platform-raspi3b`). On the default QEMU build, console output goes
+//! Only compiled into real-hardware Pi builds (`nh_real_hw`). On the
+//! default QEMU build, console output goes
 //! through Arm Semihosting, which already doesn't block on a peripheral
 //! FIFO, so there's no need to model DMA there.
 //!

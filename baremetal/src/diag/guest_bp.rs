@@ -183,7 +183,7 @@ pub extern "C" fn remove_guest_bp(ipa: u32) -> i32 {
 /// `snapshot::maybe_autosave` to avoid persisting a ROM image that
 /// contains our marker UDF — see the module-level note on snapshot
 /// interaction.
-#[cfg_attr(feature = "no-semihost", allow(dead_code))]
+#[cfg_attr(not(nh_semihost), allow(dead_code))]
 pub fn any_installed() -> bool {
     lock();
     // SAFETY: LOCK gives exclusive access.

@@ -24,7 +24,7 @@
 
 use core::fmt;
 use core::ptr::{read_volatile, write_volatile};
-#[cfg(not(feature = "no-semihost"))]
+#[cfg(nh_semihost)]
 use core::sync::atomic::Ordering;
 
 use crate::host::platform::{UART_BASE, UART_CLOCK_HZ};
@@ -63,9 +63,10 @@ const FBRD_VAL: u32 = {
 /// [`crate::kmain`] on core 0 before any other code that produces
 /// console output.
 ///
-/// With `no-semihost` enabled (real-silicon builds), the semihosting
-/// stdout open is skipped and `kprintln!` routes through a ring buffer
-/// drained by BCM2835 DMA — see `write_str` and `tx_dma` below.
+/// Without `nh_semihost` (no host is listening) the stdout open is
+/// skipped and `kprintln!` goes to the wire instead — through the
+/// BCM2835 DMA ring on `nh_real_hw`, polled `write_byte` otherwise.
+/// See `write_str` and `tx_dma` below.
 pub fn init() {
     // SAFETY: MMIO at fixed, documented addresses; called once at startup
     // before other cores are running any hypervisor code.
@@ -78,7 +79,7 @@ pub fn init() {
         write_volatile(UART_IMSC, 0); // Mask all interrupts for now.
         write_volatile(UART_CR, CR_UARTEN | CR_TXE | CR_RXE);
     }
-    #[cfg(not(feature = "no-semihost"))]
+    #[cfg(nh_semihost)]
     sh::open_stdout();
     // DMA-driven TX is brought up separately via `init_dma_tx`, which
     // MUST run after `mmu::init` enables Normal-WB cacheable RAM.
@@ -93,9 +94,8 @@ pub fn init() {
 }
 
 /// Bring up the DMA-driven TX path. Must be called AFTER `mmu::init`
-/// — see comment in `init` above. Idempotent. No-op outside the
-/// `no-semihost` + `platform-raspi3b` build, so callers don't need to
-/// mirror the cfg.
+/// — see comment in `init` above. Idempotent. No-op outside
+/// `nh_real_hw`, so callers don't need to mirror the cfg.
 pub fn init_dma_tx() {
     #[cfg(nh_real_hw)]
     tx_dma::init();
@@ -137,10 +137,10 @@ pub fn read_byte_nonblock() -> Option<u8> {
 
 // ---- semihosting host stdout ------------------------------------------
 //
-// This whole block is compiled out under `no-semihost` (real-silicon
-// builds). `write_str` then routes through `write_byte` over PL011.
+// This whole block is compiled out without `nh_semihost` (no host is
+// listening). `write_str` then routes to the PL011 wire instead.
 
-#[cfg(not(feature = "no-semihost"))]
+#[cfg(nh_semihost)]
 mod sh {
     use core::sync::atomic::{AtomicI64, Ordering};
 
@@ -246,10 +246,13 @@ pub fn now_us() -> u64 {
 /// Default build: routes through Arm Semihosting `SYS_WRITE` to `:tt`,
 /// keeping PL011 free for the guest's external-serial chip emulation.
 ///
-/// `no-semihost` build (real Pi silicon): routes through the
-/// DMA-fed TX ring (`tx_dma`). Pre-init bytes (before `init()` has
-/// brought up the ring) fall back to the polled `write_byte` path so
-/// the kmain banner doesn't disappear.
+/// `nh_real_hw` (real Pi silicon): routes through the DMA-fed TX ring
+/// (`tx_dma`). Pre-init bytes (before `init()` has brought up the ring)
+/// fall back to the polled `write_byte` path so the kmain banner
+/// doesn't disappear.
+///
+/// No host and no BCM2835 DMA (FVP with `no-semihost`): polled
+/// `write_byte` throughout.
 pub fn write_str(s: &str) {
     #[cfg(nh_real_hw)]
     {
@@ -263,14 +266,14 @@ pub fn write_str(s: &str) {
         }
         return;
     }
-    #[cfg(all(feature = "no-semihost", not(feature = "platform-raspi3b")))]
+    #[cfg(all(not(nh_semihost), not(nh_real_hw)))]
     {
         for &b in s.as_bytes() {
             write_byte(b);
         }
         return;
     }
-    #[cfg(not(feature = "no-semihost"))]
+    #[cfg(nh_semihost)]
     {
         let fh = sh::STDOUT_FH.load(Ordering::Acquire);
         if fh >= 0 {
@@ -326,13 +329,13 @@ impl fmt::Write for Writer {
 /// `raw_println!` / `raw_print!` macros below are the ergonomic
 /// front door.
 pub fn write_str_polled(s: &str) {
-    #[cfg(feature = "no-semihost")]
+    #[cfg(not(nh_semihost))]
     {
         for &b in s.as_bytes() {
             write_byte(b);
         }
     }
-    #[cfg(not(feature = "no-semihost"))]
+    #[cfg(nh_semihost)]
     {
         let fh = sh::STDOUT_FH.load(Ordering::Acquire);
         if fh >= 0 {

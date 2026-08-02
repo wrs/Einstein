@@ -363,11 +363,11 @@ pub fn halt() -> ! {
         // stores a valid `fn()` address.
         (unsafe { core::mem::transmute::<usize, fn()>(flush) })();
     }
-    // On `no-semihost` builds (real silicon) there is no semihosting
+    // Without `nh_semihost` there is no semihosting
     // host listening for SYS_EXIT_EXTENDED; HLT would either NOP or
     // generate an unintended debug exception. Fall through directly to
     // the WFE loop, which is what the comment above promises anyway.
-    #[cfg(not(feature = "no-semihost"))]
+    #[cfg(nh_semihost)]
     // SAFETY: HLT #0xF000 with semihosting enabled in QEMU is a
     // controlled trap that terminates QEMU. The parameter block
     // pointer lifetime spans the call.

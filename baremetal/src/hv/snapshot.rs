@@ -56,16 +56,16 @@
 //! current persistent flash and cold-boot instead. See
 //! `src/host/flash_persist/`.
 
-// On `no-semihost` builds the public entry points early-return, so
+// Without `nh_semihost` the public entry points early-return, so
 // every private helper below (`open`, `peek_seq`, `build_header`,
 // `cntpct`, `load`, …) is unreachable. They're still useful to keep
 // in the source so swapping back to the semihost-host build path is
 // a feature-flag toggle — silence dead-code warnings for them
 // in that configuration.
-#![cfg_attr(feature = "no-semihost", allow(dead_code))]
+#![cfg_attr(not(nh_semihost), allow(dead_code))]
 
 use core::arch::asm;
-#[cfg(not(feature = "no-semihost"))]
+#[cfg(nh_semihost)]
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -375,12 +375,12 @@ pub fn current_seq() -> u64 {
 /// runs don't reuse sequence numbers. Call exactly once before the
 /// first `save()` / `load()`.
 ///
-/// On `no-semihost` builds (real silicon) there is no host filesystem
+/// Without `nh_semihost` there is no host filesystem
 /// to scan; the whole snapshot subsystem is inert.
 pub fn init() {
-    #[cfg(feature = "no-semihost")]
+    #[cfg(not(nh_semihost))]
     return;
-    #[cfg(not(feature = "no-semihost"))]
+    #[cfg(nh_semihost)]
     {
         let mut max_seq: u64 = 0;
         for slot in 0..NUM_SLOTS {
@@ -400,7 +400,7 @@ pub fn init() {
 /// never reaches a synchronous trap. Saves iff CNTPCT_EL0 has
 /// advanced at least `AUTOSAVE_INTERVAL_MS` since the last save.
 pub fn maybe_autosave(ctx: &TrapContext) {
-    #[cfg(feature = "no-semihost")]
+    #[cfg(not(nh_semihost))]
     {
         let _ = ctx;
         // Snapshot ring itself is inert on real silicon, but the
@@ -410,11 +410,11 @@ pub fn maybe_autosave(ctx: &TrapContext) {
         maybe_flash_autosave();
         return;
     }
-    #[cfg(not(feature = "no-semihost"))]
+    #[cfg(nh_semihost)]
     maybe_autosave_via_semihost(ctx)
 }
 
-#[cfg(feature = "no-semihost")]
+#[cfg(not(nh_semihost))]
 fn maybe_flash_autosave() {
     let now = cntpct();
     let freq = cntfrq();
@@ -434,7 +434,7 @@ fn maybe_flash_autosave() {
     crate::arch::cpu::with_irqs_unmasked(flash_provider().maybe_save);
 }
 
-#[cfg(not(feature = "no-semihost"))]
+#[cfg(nh_semihost)]
 fn maybe_autosave_via_semihost(ctx: &TrapContext) {
     let now = cntpct();
     let freq = cntfrq();
@@ -557,16 +557,16 @@ fn pc_in_hypervisor_transient_region(pc: u32) -> bool {
 /// Table D1-79); ELR_EL2 and SPSR_EL2 give the PC and CPSR to resume
 /// at.
 pub fn save(gprs: &[u64; 31]) -> Result<(), &'static str> {
-    #[cfg(feature = "no-semihost")]
+    #[cfg(not(nh_semihost))]
     {
         let _ = gprs;
         return Err("snapshot unavailable on no-semihost builds");
     }
-    #[cfg(not(feature = "no-semihost"))]
+    #[cfg(nh_semihost)]
     save_via_semihost(gprs)
 }
 
-#[cfg(not(feature = "no-semihost"))]
+#[cfg(nh_semihost)]
 fn save_via_semihost(gprs: &[u64; 31]) -> Result<(), &'static str> {
     let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
     let slot = (seq as usize) % NUM_SLOTS;
@@ -717,9 +717,9 @@ pub struct RestoreState {
 /// silently; if no slot qualifies we return None and the caller
 /// cold-boots.
 pub fn load_latest() -> Option<RestoreState> {
-    #[cfg(feature = "no-semihost")]
+    #[cfg(not(nh_semihost))]
     return None;
-    #[cfg(not(feature = "no-semihost"))]
+    #[cfg(nh_semihost)]
     {
         let mut best: Option<(u64, &[u8])> = None;
         for slot in 0..NUM_SLOTS {

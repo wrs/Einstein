@@ -258,7 +258,7 @@ one platform, at most one backend per axis) and falls back to the
 | `flash-persist-{null,semihost,sd}` | semihost | Flash persistence: volatile, `/tmp` file via semihosting, or FAT32 SD card. |
 | `input-{null,mtouch}`  | null    | Pen-input seam: no-op or TSTP MTouch USB touchscreen (real hw).                      |
 | `audio-{null,pi-hdmi}` | null    | Sound seam: null (no output, but arms timer-paced DMA-completion IRQs) or VC4 HDMI MAI audio (real hw). |
-| `no-semihost`          | no      | Real hardware: no `HLT #0xF000` semihosting calls anywhere.                          |
+| `no-semihost`          | no      | No semihosting host is listening: no `HLT #0xF000` calls anywhere. Negative because Cargo features only add; `build.rs` inverts it to `cfg(nh_semihost)` for source to read. |
 | `trace`                | no      | Function-level execution trace via per-entry HVC trampolines.                        |
 | `trace_once`           | no      | First-touch variant of `trace`. Trampolines still fire; only the SEQ line is gated.  |
 | `quiet`                | no      | Silence recurring diag log lines (`fix_stage1_xn_bits:` summaries, etc.).            |

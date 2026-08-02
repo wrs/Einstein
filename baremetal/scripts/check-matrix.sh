@@ -46,6 +46,10 @@ combos=(
     "no-diag::cargo check --release --no-default-features --features \"platform-raspi3b rom-717006 log_traps log_irqs log_host_io\""
     "platform-fvp-base::cargo check --release --no-default-features --features \"platform-fvp-base rom-717006 quiet diag\""
     "fvp-no-diag::cargo check --release --no-default-features --features \"platform-fvp-base rom-717006 quiet\""
+    # The only combo where nh_semihost and nh_real_hw diverge: no host
+    # listening, and no BCM2835 either. Keeps the polled-PL011 arm in
+    # console::write_str compiled.
+    "fvp-no-semihost::cargo check --release --no-default-features --features \"platform-fvp-base rom-717006 quiet diag no-semihost\""
     "rom-710031::cargo check --release --no-default-features --features \"platform-raspi3b rom-710031 diag log_traps log_irqs log_host_io\""
     "pi-bare-metal::cargo check --release --no-default-features --features pi-bare-metal"
     "pi-bare-metal-sd::cargo check --release --no-default-features --features pi-bare-metal-sd"

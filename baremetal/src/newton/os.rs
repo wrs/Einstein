@@ -706,13 +706,13 @@ impl GuestOs for NewtonOs {
         // heartbeat. Cheap: backend self-throttles to 16 ms wall.
         (host_pumps().host_io_pump_input)();
         (host_pumps().input_pump)();
-        // (audio used to be pumped here from the trap tail. With cyclic
-        // DMA driving MAI from a hardware-paced CB chain, audio refills
+        // (Audio is deliberately not pumped from the trap tail. Cyclic
+        // DMA drives MAI from a hardware-paced CB chain, so refills
         // happen from `audio::on_mai_dma_done` — the DMA
         // period-completion IRQ — and from `schedule_output` when the
-        // kernel queues a new buffer. Liveness no longer depends on
-        // trap rate, which is something the rest of the hypervisor is
-        // trying to reduce.)
+        // kernel queues a new buffer. Liveness therefore doesn't depend
+        // on trap rate, which is something the rest of the hypervisor
+        // is trying to reduce.)
 
         // Guest MMIO writes to IntCtrl / FIQMask / IntClear change the
         // effective (`int_present & int_ctrl & ~fiq_mask`) pending set and

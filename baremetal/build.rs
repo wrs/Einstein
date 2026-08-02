@@ -445,11 +445,11 @@ fn select_platform_linker_script() {
 // Cross-axis feature constraints are expressed as Cargo feature
 // dependencies in Cargo.toml (hardware-implying backends pull in
 // `platform-raspi3b`; `sd-probe` pulls in `no-semihost` too), so a
-// hardware backend on the wrong platform can no longer be selected —
-// the dependency drags in the second platform and
+// hardware backend on the wrong platform cannot be selected — the
+// dependency drags in the second platform and
 // `select_platform_linker_script` rejects the contradiction with a
 // named message. That platform mutual-exclusion check is the only
-// imperative gate left.
+// imperative gate.
 
 /// Emit `cfg(nh_semihost)` when a semihosting host is listening, i.e.
 /// the `no-semihost` feature is absent.

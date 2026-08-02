@@ -113,7 +113,7 @@ pub fn rearm() {
 /// wire up CNTHP, so any IRQ here is a heartbeat expiry: drive forward
 /// progress for any guest parked in WFI on a Newton-match deadline,
 /// refresh the non-trapping tick page, latch crossed matches, and rearm
-/// for the next heartbeat. trap.rs's shared `update_virq` then sets
+/// for the next heartbeat. `hv::trap`'s shared `update_virq` then sets
 /// HCR_EL2.VI for delivery to the guest.
 ///
 /// Takes a [`crate::arch::slim_isr::IrqCap`] so it can only be reached from the

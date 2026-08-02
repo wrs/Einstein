@@ -25,9 +25,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 /// tight guest loop doesn't flood the console.
 ///
 /// Capacity `N` is fixed; once full, every subsequent unseen key reports
-/// "not first" (i.e. is silently dropped) — matching the hand-rolled
-/// blocks this replaces. `T` is the key type (a `u32` PC, a packed op
-/// key, or a small tuple of `u32`s).
+/// "not first" (i.e. is silently dropped). `T` is the key type (a `u32`
+/// PC, a packed op key, or a small tuple of `u32`s).
 pub struct SeenSet<T: Copy + PartialEq, const N: usize> {
     keys: [T; N],
     len: usize,
@@ -75,10 +74,9 @@ impl<T: Copy + PartialEq, const N: usize> SeenSet<T, N> {
 }
 
 /// Misra-Gries top-K frequency tracker over `u32` keys with `u64`
-/// counts. Replaces the duplicated `TopK` (trap_hist) and `RejTopK`
-/// (unaligned_inline). `record` is O(N); `snapshot_sorted` returns the
-/// tracked (key, count) pairs in descending count order; `reset` clears
-/// the window.
+/// counts. `record` is O(N); `snapshot_sorted` returns the tracked
+/// (key, count) pairs in descending count order; `reset` clears the
+/// window.
 pub struct TopK<const N: usize> {
     keys: [u32; N],
     counts: [u64; N],
@@ -139,9 +137,9 @@ impl<const N: usize> TopK<N> {
 }
 
 /// Atomic log budget: lets the first `max` calls log, then goes silent.
-/// Replaces the hand-rolled `static AtomicU32/Usize` + `fetch_add` +
-/// `if n < MAX` patterns scattered across the peripherals. Safe to share
-/// from any context (it's purely atomic).
+/// Use this rather than a hand-rolled `static AtomicU32/Usize` +
+/// `fetch_add` + `if n < MAX`. Safe to share from any context (it's
+/// purely atomic).
 ///
 /// Use `allow()` for a flat first-`max` budget, or `allow_or_every(p)`
 /// for "first `max`, then 1-in-`p`" so a long-running signal keeps a
@@ -211,10 +209,8 @@ impl TwoTierLog {
 /// driver's source file stem (e.g. `"battery"`), used both as the
 /// message label and in the "extend peripherals/<file>.rs::handle" hint.
 ///
-/// r0..r3 are printed unconditionally — the superset of what the
-/// per-driver copies this replaces used to print, so no argument is ever
-/// dropped from a halt (the prior copies variously printed r1..r3,
-/// r0..r2, or r1..r2).
+/// r0..r3 are printed unconditionally — a superset of what any one
+/// driver's handler reads, so no argument is ever dropped from a halt.
 pub fn halt_unknown_subfn(
     file: &'static str,
     subfn: u32,

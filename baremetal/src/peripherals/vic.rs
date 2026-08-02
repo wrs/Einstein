@@ -12,7 +12,7 @@
 //!
 //!   Timer match registers — each write rearms the CNTHP_CVAL_EL2 deadline
 //!   through `timer::rearm`. When the EL2 physical timer fires, the IRQ
-//!   handler in `trap.rs` calls `poll_timer_matches` here to latch the
+//!   handler in `hv::trap` calls `poll_timer_matches` here to latch the
 //!   crossed bit(s) into `int_present`, so the next `update_virq` sets VI.
 
 use core::cell::UnsafeCell;
@@ -864,8 +864,8 @@ fn write(ipa: u64, value: u32) {
         // SetGPIOCtrlReg which stores the new ctrl value.
         K_HDWR_GPIO_E => s.gpio_e = value,
         // GPIO_C (Clear): Einstein TMemory.cpp:1901-1902 calls
-        // ClearGPIO which does `mGPIORaised &= ~inMask`. Previously we
-        // applied this to int_present (wrong register). Match Einstein.
+        // ClearGPIO which does `mGPIORaised &= ~inMask` — the GPIO
+        // raised register, not int_present.
         K_HDWR_GPIO_C => s.gpio_r &= !value,
 
         // ---- Stateful in Einstein for READ, but no write handler ------

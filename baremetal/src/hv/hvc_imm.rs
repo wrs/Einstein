@@ -14,8 +14,8 @@
 //!    auto-incremented. Adding a variant just appends; the compiler
 //!    catches anything that would collide with a guest-test anchor
 //!    or a previously-anchored value. The whole point of putting
-//!    these in one enum is so the iter-109 collision (DAH_FME_RET
-//!    silently sharing 0x50 with TRACE_TAG) becomes a build error.
+//!    these in one enum is that a collision — say `DAH_FME_RET`
+//!    silently sharing 0x50 with `TRACE_TAG` — becomes a build error.
 //!
 //! Both ends of an HVC live in the same build (the patcher writes
 //! `HVC #imm` into ROM; the dispatcher matches `imm` after the trap),

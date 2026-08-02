@@ -9,8 +9,8 @@
 //! painted Newton region is described by the active host-IO
 //! backend's `host_io::painted_region()` report — with a backend
 //! that owns no physical panel (null, semihost) the report is
-//! `None` and every touch is dropped, so `input-mtouch` no longer
-//! requires the `host-io-pi-fb` backend at build time.
+//! `None` and every touch is dropped, so `input-mtouch` does not
+//! require the `host-io-pi-fb` backend at build time.
 
 use crate::host::host_io;
 

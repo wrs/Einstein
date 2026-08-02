@@ -448,12 +448,12 @@ pub(crate) fn handle_und(ctx: &mut TrapContext) {
             emulate_fpa_ctrl_reg(ctx, insn, faulting_pc, spsr_und);
         }
         // FPA load/store/arithmetic UNDs. The IPA-0x04 → bypass-stub
-        // path at `FPA_BYPASS_STUB_OFFSET` (see guest_mem.rs) was meant
+        // path at `FPA_BYPASS_STUB_OFFSET` (see guest_mem.rs) is meant
         // to catch these and `b FPE_JT` straight from UND mode without
         // an EL2 round trip. Empirically the stub doesn't fire (every
-        // post-MMU FPA UND reaches handle_und via UND_TRAMP), and the
-        // halt-on-arrival behaviour from iter-83/84/85 era is now the
-        // boot stall. Replicate the bypass-stub semantics from EL2:
+        // post-MMU FPA UND reaches handle_und via UND_TRAMP), so
+        // halting on arrival here would stall the boot. Replicate the
+        // bypass-stub semantics from EL2:
         // ERET into UND mode at FPE_JT (`ActiveGuest::fpe_redirect_va`).
         //
         // SPSR_EL2 is left as the natural HVC-from-UND-mode capture,
@@ -541,7 +541,7 @@ pub(crate) fn handle_und(ctx: &mut TrapContext) {
                 ctx.x[23] as u32, ctx.x[22] as u32,
             );
             kprintln!(
-                "    (extend handle_und in trap.rs to handle this opcode)"
+                "    (extend handle_und in hv/trap/und.rs to handle this opcode)"
             );
             dump_und_history();
             // iter-87 diag: dump the USR stack near SP_usr (via stage-1

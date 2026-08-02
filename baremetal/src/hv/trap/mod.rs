@@ -393,26 +393,25 @@ fn handle_instruction_abort(ctx: &TrapContext, iss: u32) {
 ///   ROM actually exercises filesystem UNDs.)
 /// - Anything else: log opcode + PC, halt loudly.
 ///
-/// Fixed RAM slots used by the trampoline (must match guest tests and,
-/// eventually, the ROM's patch_und_vector):
-///   0x04000400  — saved LR_und (faulting_pc + 4)
-///   0x04000404  — saved SPSR_und (pre-UND CPSR)
-// 2026-04-28: relocated trampoline scratch from PA=0x04005F00 (the
-// kernel-globals self-mapped region at L1[0xc0]) to the last 4 KiB of
-// the hypervisor scratch pool at IPA=0x0600_F000. The previous PA was
-// reachable post-MMU only through the kernel's pre-baked L2[0x4]
-// descriptor — a deliberate ARMv4 subpage-AP permission-overlay
-// mapping the kernel-globals page at PA=0x04005000 at multiple kernel
-// VAs. That created a verify-mmu Group-1 alias under our flat AP=011.
-// The new IPA lives in the hypervisor-managed `SCRATCH_POOL` region
-// (mapped via the L1[0x60] section we install at MMU-enable time),
-// so the same value works pre-MMU (stage-1 off → stage-2 maps IPA →
-// host SCRATCH_POOL) and post-MMU (kernel L1[0x60] → IPA → stage-2).
-// No swap pre/post-MMU needed.
+/// Fixed RAM slots used by the trampoline (must match guest tests and
+/// the ROM's patch_und_vector) — see the `UND_SAVE_*_IPA` constants
+/// below.
+// The trampoline scratch is the last 4 KiB of the hypervisor scratch
+// pool, at IPA=0x0600_F000. That IPA lives in the hypervisor-managed
+// `SCRATCH_POOL` region (mapped via the L1[0x60] section we install at
+// MMU-enable time), so the same value works pre-MMU (stage-1 off →
+// stage-2 maps IPA → host SCRATCH_POOL) and post-MMU (kernel L1[0x60]
+// → IPA → stage-2). No swap pre/post-MMU needed.
 //
-// Older (buggy) slots at 0x0400_0400 — those lived inside the kernel's
-// L1 table; writing there fails post-MMU and would corrupt the guest's
-// own L1 if it succeeded.
+// Two nearby addresses are unusable and must stay that way:
+//   - PA=0x04005F00, in the kernel-globals self-mapped region at
+//     L1[0xc0]. Post-MMU it is reachable only through the kernel's
+//     pre-baked L2[0x4] descriptor — a deliberate ARMv4 subpage-AP
+//     permission-overlay mapping the kernel-globals page at
+//     PA=0x04005000 at multiple kernel VAs — which creates a
+//     verify-mmu Group-1 alias under our flat AP=011.
+//   - 0x0400_0400, inside the kernel's L1 table. Writing there fails
+//     post-MMU and would corrupt the guest's own L1 if it succeeded.
 //
 // Layout (offsets from `HYP_TRAMP_SCRATCH_BASE`):
 //   +0x00 LR_und       +0x10 R1

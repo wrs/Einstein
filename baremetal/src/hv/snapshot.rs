@@ -200,34 +200,10 @@ fn read_all(h: &FileHandle, buf: &mut [u8]) -> Result<(), &'static str> {
 
 /// "NHSNAP\0\x01" encoded little-endian.
 const MAGIC: u64 = 0x0150_414E_5348_4E00;
-/// Bump whenever the Header layout changes. Old snapshot files get
-/// rejected loudly by `peek_seq` / `load`.
-///
-/// v3: replaced the 15-entry `gprs` array with the full 31-entry
-/// AArch64 GPR view (`x0..x30`). At AArch32→AArch64 exception entry
-/// the AArch64 GPR file aliases AArch32 banked registers per ARM ARM
-/// DDI 0487 D1.21.1 Table D1-79, so capturing all 31 X registers
-/// preserves R0..R12 and the per-mode banked SP/LR (USR/SVC/ABT/UND/
-/// IRQ/FIQ) without any AArch32-side stash dance. Removed the
-/// `sp_el0 / sp_el1 / elr_el1` fields: those are AArch64-only EL0/EL1
-/// special-purpose registers with **no** architectural alias to any
-/// AArch32 banked R13/R14, so writing them at restore did nothing
-/// useful for an AArch32 guest.
-// VERSION = 4: BE-8 migration. Old (BE-32 word-invariant) snapshots
-// have RAM/flash bytes in the opposite byte-lane geometry, plus EL1
-// SCTLR with EE=0; both are incompatible with a Phase-2 BE-8 boot, so
-// the version bump rejects them automatically at load time.
-// VERSION = 6: flash moved out of the snapshot file into
-// `src/host/flash_persist/`'s standalone `$HOME/.newton/flash.bin`. Header
-// `flash_size` field replaced with `flash_fingerprint` (FNV-1a-32 over
-// GUEST_FLASH at save time) used for resume-time coherence.
-// VERSION = 7: added the 384 KiB shadow_stub::SCRATCH_POOL as a third
-// saved region (guest-visible RW at IPA 0x0600_0000; holds DABT-save
-// scratch consumed by later kernel code), and three guest-fault sysreg
-// homes (far_el1/esr_el1/ifsr32_el2 = AArch32 DFAR/DFSR/IFSR) plus the
-// stub-stash TLS registers (tpidr_el0/tpidrro_el0 = TPIDRURW/TPIDRRO)
-// to the header. The version bump rejects v6 (and earlier) files at
-// load time, before any field is parsed — see `peek_seq` / `load`.
+/// Bump whenever the `Header` layout, the byte-lane geometry of the
+/// saved memory, or the set of saved regions changes. A file carrying
+/// any other version is rejected loudly at load time, before a single
+/// field is parsed — see `peek_seq` / `load`.
 const VERSION: u32 = 7;
 
 /// Number of rolling slots. Each slot is ~6 MiB (RAM + FB +
@@ -364,8 +340,7 @@ static LAST_SAVE_TICKS: AtomicU64 = AtomicU64::new(0);
 /// Current value of the save sequence counter — number of rolling
 /// saves performed so far in this hypervisor run. Used by debug
 /// triggers that want to halt / diverge after a known number of
-/// snapshots have been taken (see the `FAKE BUG` demo in trap.rs
-/// for the pattern).
+/// snapshots have been taken.
 #[allow(dead_code)]
 pub fn current_seq() -> u64 {
     SAVE_SEQ.load(Ordering::Relaxed)
@@ -395,7 +370,7 @@ pub fn init() {
 }
 
 /// Periodic-save hook. Called from the EL2 timer IRQ path
-/// (`trap.rs::trap_irq`) so wall-clock progression drives the
+/// (`hv::trap::trap_irq`) so wall-clock progression drives the
 /// cadence even when the guest is spinning in an abort loop that
 /// never reaches a synchronous trap. Saves iff CNTPCT_EL0 has
 /// advanced at least `AUTOSAVE_INTERVAL_MS` since the last save.

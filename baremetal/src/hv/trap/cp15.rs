@@ -330,7 +330,7 @@ fn halt_unknown_cp15(is_read: bool, opc1: u32, crn: u32, crm: u32, opc2: u32, rt
         opc1, rt, crn, crm, opc2, value, elr
     );
     kprintln!(
-        "  (extend handle_cp15_trap in trap.rs to service this tuple; cross-reference"
+        "  (extend handle_cp15_trap in hv/trap/cp15.rs to service this tuple; cross-reference"
     );
     kprintln!(
         "   probe/FINDINGS.md §16.4 for the 15 tuples the 717006 ROM exercises.)"

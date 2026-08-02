@@ -29,8 +29,7 @@
 //! duration keeps the kernel's notion of elapsed playback time
 //! roughly honest (a synchronous raise would let the chime "play" in
 //! zero wall time), while still completing promptly — sub-second for
-//! the boot chime's buffers — instead of via the old parked-PC wedge
-//! probe's ~1 s latency.
+//! the boot chime's buffers.
 
 use crate::peripherals::vic;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -178,8 +177,7 @@ fn stop_output() {
 /// front owed completion's deadline has elapsed, raise the stored
 /// output interrupt mask through the VIC — the same bit(s) the kernel
 /// waits on after scheduling a buffer — and re-arm for the next owed
-/// edge, if any. This is the null backend's sole completion path; it
-/// replaces the former wedge probe in `trap.rs`.
+/// edge, if any. This is the null backend's sole completion path.
 fn tick() {
     if PENDING_EDGES.load(Ordering::Relaxed) == 0 {
         return;

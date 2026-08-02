@@ -53,8 +53,8 @@
 # imports both match. Every hit must be covered by an entry in
 # scripts/layering-allowlist.txt (`<file-glob> <line-regex> # phase N`);
 # uncovered hits fail the lint, and so do stale allowlist entries that
-# no longer match anything — the allowlist may only shrink as phase 7
-# removes the remaining legacy edges.
+# no longer match anything — the allowlist may only shrink as the
+# remaining legacy edges are removed.
 set -uo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"

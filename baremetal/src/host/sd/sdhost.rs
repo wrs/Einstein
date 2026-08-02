@@ -792,8 +792,8 @@ fn prepare_data(hcfg_base: u32, blksz: u32, blocks: u32) {
 ///   `SDEDM | FORCE_DATA_MODE`, then return Ok.
 /// - Anything else → keep polling.
 ///
-/// SDHSTS_BLOCK_IRPT, which the previous implementation polled, is
-/// only meaningful when SDHCFG.BLOCK_IRPT_EN is set; we don't set it.
+/// SDHSTS_BLOCK_IRPT is deliberately not polled: it is only meaningful
+/// when SDHCFG.BLOCK_IRPT_EN is set, and we don't set it.
 fn finish_data_phase(is_read: bool) -> Result<(), CmdError> {
     let alternate_idle = if is_read {
         SDEDM_FSM_READWAIT

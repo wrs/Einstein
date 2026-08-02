@@ -5,7 +5,7 @@
 //! NATIVE_PRIM encoding rewrites — then publishes the result to the
 //! Point of Unification for the guest's instruction fetcher.
 //!
-//! Split out of `hv::guest_mem` (which keeps the backing stores and
+//! Distinct from `hv::guest_mem` (which keeps the backing stores and
 //! the IPA/VA access layer): everything here is Newton- or test-image-
 //! specific load orchestration.
 
@@ -489,10 +489,9 @@ pub unsafe fn load_newton_rom() {
         first, second
     );
 
-    // Phase A baseline: Einstein's word-write ROM patches. Skipping
-    // these left the kernel in the wrong boot path during Phase B —
-    // see `rom_ver::PATCHES` for the list and `rom_patches` for the
-    // installer.
+    // Einstein's word-write ROM patches. Without them the kernel takes
+    // the wrong boot path — see `rom_ver::PATCHES` for the list and
+    // `rom_patches` for the installer.
     unsafe { super::rom_patches::apply_rom_patches(rom_ptr); }
 
     // UND vector (VA 0x04) + trampoline body: overwrite the ROM's
@@ -538,13 +537,11 @@ pub unsafe fn load_newton_rom() {
     // can cold-read stale memory bytes unless the dirty D-cache lines are
     // cleaned to PoU (DC CVAU) and the I-cache lines invalidated
     // (IC IVAU). The `ic iallu` in `eret_to_guest` invalidates the
-    // I-cache but does NOT clean dirty D-cache lines — it works today
-    // only because the 16 MiB load loop evicts most lines incidentally.
-    // This sweep makes the guarantee explicit and supersedes the
-    // narrower per-range publishes formerly in `patch_und_vector`
-    // (same DC CVAU; DSB; IC IVAU; DSB; ISB per line, over a wider
-    // range, run strictly after every patcher). Cost is measured below
-    // and printed so a future change can re-check it.
+    // I-cache but does NOT clean dirty D-cache lines, so it cannot
+    // give that guarantee on its own. This sweep does: DC CVAU; DSB;
+    // IC IVAU; DSB; ISB per line across the whole aperture, run
+    // strictly after every patcher. Cost is measured below and printed
+    // so a future change can re-check it.
     let (icache_t0, icache_freq): (u64, u64);
     // SAFETY: MRS of RO timer sysregs, no side effects.
     unsafe {

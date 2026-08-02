@@ -2,10 +2,8 @@
 //! patch installer (`rom_patches`) and the guest trampoline assembler
 //! (`guest_trampolines`).
 //!
-//! These were previously scattered as `arm_b` / `arm_b_cond` in
-//! `rom_patches.rs` and as the `beq` / `b_far` / `ldr_r0_lit` closures
-//! inside `guest_mem.rs`'s trampoline builders. Collecting them here
-//! gives one verified home with compile-time self-checks following
+//! Collecting every encoder here gives one verified home with
+//! compile-time self-checks following
 //! `unaligned_inline::_check_encoders`.
 //!
 //! Every encoding below is cross-checked against `arm-none-eabi-as` /

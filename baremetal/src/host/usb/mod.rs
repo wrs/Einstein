@@ -9,7 +9,7 @@
 //! - **Control + interrupt transfers only.** No bulk, no
 //!   isochronous, no split transactions, no device mode. The HID
 //!   class we care about runs on EP0 (control) + interrupt-IN.
-//! - **Polled.** Driven from the timer-IRQ tail in `trap.rs`. The
+//! - **Polled.** Driven from the timer-IRQ tail in `hv::trap`. The
 //!   touchscreen reports at ~16 ms cadence, which lines up
 //!   naturally with our existing CNTHP heartbeat.
 //!

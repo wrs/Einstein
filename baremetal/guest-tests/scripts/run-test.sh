@@ -47,9 +47,9 @@ cd "$here/../../"
 # built once with `NH_GUEST_TEST=1` (no path); the test binary is loaded
 # at boot via Arm semihosting from the path passed in QEMU's
 # `-semihosting-config arg=<path>`. This skips the per-test relink that
-# previously dominated `run-all.sh` wall time.
+# otherwise dominates `run-all.sh` wall time.
 #
-# Set NH_GUEST_TEST_EMBED=1 to use the legacy embed path (cargo
+# Set NH_GUEST_TEST_EMBED=1 to use the embed path instead (cargo
 # rebuilds + relinks per test), e.g. when iterating on test infra
 # in a way that benefits from compile-time embedding.
 if [[ "${NH_GUEST_TEST_EMBED:-0}" == "1" ]]; then

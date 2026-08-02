@@ -10,7 +10,7 @@
 //!    real Pi).
 //!
 //! 2. **Inbound pen input.** The active backend's [`pump_input`] runs
-//!    from the trap-return tail (`trap.rs`); it pulls pen events off
+//!    from the trap-return tail (`hv::trap`); it pulls pen events off
 //!    its source and feeds them into [`queue::enqueue_pen_sample`],
 //!    which raises `INT_TABLET`. `tablet::handle` subfn 0x16
 //!    (`NativeGetSample`) drains via [`pop_pen_sample`].
@@ -20,8 +20,8 @@
 //! NOT in `default`, so `cargo run --features host-io-semihost` works
 //! without `--no-default-features`). With no feature enabled the
 //! resolver falls back to "null", which turns everything in here into
-//! a no-op so guest-tests and CI runs behave like the old fb_dump-less
-//! world. The resolver emits `cfg(nh_host_io_<chosen>)`; multiple
+//! a no-op so guest-tests and CI runs behave as if no host IO were
+//! compiled in. The resolver emits `cfg(nh_host_io_<chosen>)`; multiple
 //! opt-ins are still a hard error. Each backend implements the
 //! [`HostIo`] trait and exports a `static BACKEND`; the one cfg'd
 //! `use` below is the only backend dispatch point (same shape as
@@ -61,7 +61,7 @@ pub trait HostIo: Sync {
 
     /// Pump the backend's input transport: drain newly-arrived host
     /// pen events, enqueue them as Newton-format samples, and raise
-    /// `INT_TABLET`. Called from the trap-return tail (`trap.rs`).
+    /// `INT_TABLET`. Called from the trap-return tail (`hv::trap`).
     fn pump_input(&self);
 
     /// The Newton guest screen geometry `(width, height)` this backend

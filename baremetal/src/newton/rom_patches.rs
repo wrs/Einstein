@@ -96,12 +96,11 @@ use crate::arch::aarch32_emit::{b as arm_b, b_cond as arm_b_cond};
 // ============================================================================
 //
 // Every code-word overwrite against the ROM backing goes through
-// `install_patch`. It folds the three install conventions that used to
-// coexist (verify-and-skip, verify-and-bail, blind-overwrite) into one
-// policy: verify the expected original word and LOUD HALT on mismatch,
-// record the original into the shadow-stub side table, and write the new
-// word(s) in the correct endianness for their kind. The post-load
-// whole-ROM `icache_publish_range` sweep in `load_newton_rom` publishes
+// `install_patch`, which applies one policy for every site: verify the
+// expected original word and LOUD HALT on mismatch, record the original
+// into the shadow-stub side table, and write the new word(s) in the
+// correct endianness for their kind. The post-load whole-ROM
+// `icache_publish_range` sweep in `load_newton_rom` publishes
 // every patched byte to the PoU, so the installer itself does no cache
 // maintenance — every caller runs strictly before that sweep.
 //
@@ -330,9 +329,7 @@ pub unsafe fn apply_rom_patches(rom_ptr: *mut u32) {
 /// sentinel reload, the QEMU DAH `mrs r1, SPSR` workaround, the
 /// `Unhandled[NonUserMode]Exception` halt tripwires, and the
 /// PHammerOutTranslator body redirects that route the kernel's REP
-/// output into the EL2 UART. The Phase-B diagnostic probes that
-/// used to live here (DAH Layer-γ trio, iter-108 splash chain,
-/// FPE-entry, ResolveFault entry/exit) have been removed.
+/// output into the EL2 UART.
 unsafe fn apply_l1_cd_probes(rom_ptr: *mut u32) {
     unsafe {
         // Remember post-SWI fixup: the kernel's `r8 = -10003` sentinel
@@ -678,17 +675,6 @@ pub fn read_original(pc: u32) -> Option<u32> {
     None
 }
 
-/// (Previously we patched every `T28F016_SA_SVDriver` method to emit
-/// a NATIVE_PRIM(0, subfn) call, short-circuiting the real-Intel-chip
-/// protocol the ROM driver speaks against our plain-RAM flash backing.
-/// That worked as far as trace 142 but left the ROM's own method
-/// prologues half-overwritten, and the write-verify path still
-/// rebooted because endianness/lane assumptions didn't line up with
-/// what the kernel then read back. The correct fix is to restore the
-/// REx-based substitution so the kernel picks Einstein.rex's
-/// `TEinsteinFlashDriver` from the 'fdrv' entry — the same mechanism
-/// every other Einstein-provided driver uses. That investigation is
-/// parked.)
 /// Replace the UND-table slots for DebugStr / Debugger
 /// (`rom_ver::DEBUG_UND_SLOTS`) with branches to small stubs that
 /// stash the guest's LR into r7 and then HVC to EL2. Einstein's

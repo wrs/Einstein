@@ -841,7 +841,7 @@ impl Dwc2 {
 pub fn service_int_in_irq(out: &mut [u8]) -> Option<usize> {
     // SAFETY: single-core EL2. In IRQ mode (after `start_int_in`) the
     // channel and this accessor are the only users of INSTANCE — the
-    // touchscreen no longer polls through `with`.
+    // touchscreen does not poll through `with`.
     let d = unsafe { &mut *INSTANCE.0.get() };
     if !d.inited || !d.int_in_armed {
         return None;

@@ -314,19 +314,14 @@ const NEWTON_RATE_HZ: u32 = 22050;
 
 // ---- HDMI audio configuration ---------------------------------------------
 //
-// The shipped configuration follows the working Linux/Circle VC4 path. The
-// audio bring-up went through a diagnostic-matrix bisection (tone-test rate,
-// five IEC channel-status modes, several MAI_CTL / AUDIO_PACKET_CONFIG
-// toggles); the matrix has been removed now that one configuration is known
-// good. The constants and code below are exactly that configuration; the
-// "alternatives tried and why they lost" knowledge is preserved as prose
-// where each decision lives.
+// The shipped configuration follows the working Linux/Circle VC4 path:
+// one known-good combination of sample rate, IEC channel-status mode and
+// MAI_CTL / AUDIO_PACKET_CONFIG bits. The rationale for each choice — and
+// why the alternatives lose — lives with the constant or register write
+// it governs.
 
 /// HDMI output audio rate. 44.1 kHz — an exact 2× of Newton's 22.05 kHz
-/// source, so the resampler is a trivial sample-and-hold. (A 48 kHz
-/// tone-test cadence was used during bring-up to compare against Linux's
-/// spec-table N=6144; it produced no signal Newton ever emits and was
-/// dropped.)
+/// source, so the resampler is a trivial sample-and-hold.
 const HDMI_RATE_HZ: u32 = 44_100;
 
 // Non-Linux infrastructure still called out explicitly:
@@ -868,7 +863,7 @@ fn refill_mai_dma_ring() {
     // Target enough ahead-of-consumer audio that the next refill finds
     // the ring well-fed even if EL2 is momentarily busy.
     //
-    // When guest samples are queued, keep the old two-period cushion to
+    // When guest samples are queued, keep to a two-period cushion to
     // avoid adding unnecessary playback latency. When the guest has no
     // samples queued, treat the hardware side like CoreAudio's idle
     // stream and fill the entire safe window with deterministic idle
@@ -1222,10 +1217,10 @@ fn mai_dma_init_cyclic() -> bool {
     // `WAIT_RESP(17) = BCM2835_DMA_WAIT_RESP`. The MEM_TO_DEV
     // direction adds `D_DREQ | S_INC`, and INT_EN goes on every CB
     // that closes a period (which is every CB in our N_PERIODS
-    // chain). We were previously writing `BURST_LENGTH(2)` here —
-    // the vc4_hdmi.c slave-config `maxburst = 2` value, which the
-    // bcm2835-dma driver actually IGNORES at runtime in favor of
-    // the binary BURST cookie flag.
+    // chain). Note this is not `BURST_LENGTH(2)`: that is the
+    // vc4_hdmi.c slave-config `maxburst = 2` value, which the
+    // bcm2835-dma driver IGNORES at runtime in favor of the binary
+    // BURST cookie flag.
     let ti = (DREQ_HDMI << TI_PERMAP_SHIFT)
         | TI_SRC_INC
         | TI_DEST_DREQ
@@ -1775,11 +1770,10 @@ fn bringup_mai() -> bool {
 /// ```
 ///
 /// `buffer[0..3]` = `{type, version, length}`, `buffer[3]` = checksum,
-/// `buffer[4..]` = PB1..PB10. The previous implementation packed the
-/// checksum into the *high* byte of word 0 (i.e. as if it were
-/// `buffer[3]` *of word 0*), which shifts the receiver's view of the
-/// payload by one byte and reliably trashes the InfoFrame. Re-derived
-/// from the upstream loop:
+/// `buffer[4..]` = PB1..PB10. Note the checksum lands in the *low* byte
+/// of word 1, not the high byte of word 0 — packing it into word 0
+/// shifts the receiver's view of the payload by one byte and reliably
+/// trashes the InfoFrame. Derived from the upstream loop:
 ///
 /// ```c
 ///   writel(buffer[i] | buffer[i+1]<<8 | buffer[i+2]<<16, …);
@@ -1827,12 +1821,13 @@ fn set_audio_info_frame() {
     //            base + packet_reg);            packet_reg += 4;
     //   }
     //
-    // Previously we packed buffer[7..11] into word2 and buffer[11..14]
-    // into word3 — a 4+3 split that shifts buffer[10..13] by one
-    // byte slot relative to what the hardware expects. Bytes 10..13
-    // are PB7..PB10 of the Audio InfoFrame, which are zero in our
-    // stream, so this was benign for audio but would corrupt any
-    // InfoFrame with nonzero high PB bytes (AVI, SPD, etc.).
+    // The 3+4 split repeats for the second pair. A 4+3 split
+    // (buffer[7..11] into word2, buffer[11..14] into word3) would
+    // shift buffer[10..13] by one byte slot relative to what the
+    // hardware expects. Bytes 10..13 are PB7..PB10 of the Audio
+    // InfoFrame, which are zero in our stream, so that is benign for
+    // audio but corrupts any InfoFrame with nonzero high PB bytes
+    // (AVI, SPD, etc.).
     let word0 = (buffer[0] as u32) | ((buffer[1] as u32) << 8) | ((buffer[2] as u32) << 16);
     let word1 = (buffer[3] as u32)
         | ((buffer[4] as u32) << 8)

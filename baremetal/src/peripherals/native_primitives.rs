@@ -8,7 +8,7 @@
 //! on the `inInstruction >> 8` driver ID.
 //!
 //! The hypervisor enables CPTR_EL2.TFP to trap these to EL2 with
-//! EC=0x07; `trap.rs::handle_fp_simd` decodes the instruction, reads
+//! EC=0x07; `hv::trap::handle_fp_simd` decodes the instruction, reads
 //! the CPU register the MCR names, and calls `execute` below with the
 //! "native call code" the guest packed into that register.
 //!

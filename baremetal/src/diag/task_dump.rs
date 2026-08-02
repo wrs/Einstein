@@ -908,8 +908,8 @@ fn find_semaphore_owner(sema_va: u32) {
 ///   +0x4c saved-pc (LR_svc at SWI tail; becomes target of `movs pc, lr`)
 ///   +0x50 saved-SPSR (CPSR to restore via `msr SPSR_fc` then `movs`)
 ///
-/// Generic introspection helper kept for gdb / future probes; no
-/// in-tree caller after the named-task lookup it backed was removed.
+/// Generic introspection helper kept for gdb / future probes; it has
+/// no in-tree caller.
 #[allow(dead_code)]
 pub fn dump_save_area(label: &str, task_va: u32) {
     let id   = rd(task_va).unwrap_or(u32::MAX);

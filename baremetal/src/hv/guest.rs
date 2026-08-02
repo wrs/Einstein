@@ -248,7 +248,7 @@ pub unsafe fn eret_to_restored(state: crate::hv::snapshot::RestoreState) -> ! {
 
         // Match the M=0→M=1 transition the cold-boot path takes when
         // the guest first turns its stage-1 MMU on (see the
-        // `(0, 1, 0, 0, false)` CP15-write handler in `trap.rs` at the
+        // `(0, 1, 0, 0, false)` CP15-write handler in `hv::trap::cp15` at the
         // `was_off && now_on` branch). Snapshots are saved deep into the
         // boot, well past that transition, so SCTLR_EL1.M is already 1
         // when the snapshot loads — but `configure_el2_traps` just

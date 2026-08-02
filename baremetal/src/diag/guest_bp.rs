@@ -36,7 +36,7 @@
 //! The tracer (`src/diag/tracer.rs`) uses `UDF #imm16` with `imm16` in
 //! `0..FN_COUNT` (Newton's table is ~20k entries). We reserve
 //! `UDF #0xFF0E` as our marker — safely above any plausible
-//! `FN_COUNT`. `handle_und` in `trap.rs` dispatches to us first, so
+//! `FN_COUNT`. `handle_und` in `hv::trap::und` dispatches to us first, so
 //! we never reach tracer's code path.
 //!
 //! # Interaction with snapshots
@@ -320,7 +320,7 @@ fn restore_word(ipa: u32, orig: u32) {
     }
 }
 
-/// UND handler entry point. Called from `handle_und` in `trap.rs`.
+/// UND handler entry point. Called from `handle_und` in `hv::trap::und`.
 /// Returns `true` if we recognised the marker and handled the trap
 /// (restored the word + issued `return_to_guest`), `false` otherwise so
 /// the caller can fall through to the tracer / unknown paths.

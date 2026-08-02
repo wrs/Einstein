@@ -260,7 +260,7 @@ pub fn init() -> bool {
 }
 
 /// One-time bring-up of the MAI-TX channel. Idempotent. Must run
-/// after `mmu::init` (see uart.rs::init for the AArch64/Cortex-A53
+/// after `mmu::init` (see `console::init` for the AArch64/Cortex-A53
 /// LDXR-on-non-cacheable rationale).
 #[cfg(nh_audio_pi_hdmi)]
 pub fn init_mai_tx() -> bool {
@@ -350,11 +350,10 @@ unsafe fn arm_with_cs(ch: u32, cb: &DmaCb, cs: u32) {
 /// dis-debug bits from the DT dma-cookie, and the Pi DT entry for
 /// PL011 is `dmas = <&dma 12>` — a bare DREQ number with no flag
 /// bits set — so `CS_FLAGS` evaluates to 0 and the write is just
-/// `ACTIVE`. We were previously using Circle's `priority 1 +
-/// WAIT_FOR_OUTSTANDING_WRITES` pattern; matching Linux removes the
-/// AXI-arbitration imbalance that let UART DMA bursts perturb the
-/// concurrent HDMI MAI feed (audible glitch correlated with each
-/// flash-persist load dot).
+/// `ACTIVE`. Circle's `priority 1 + WAIT_FOR_OUTSTANDING_WRITES`
+/// pattern instead creates an AXI-arbitration imbalance that lets UART
+/// DMA bursts perturb the concurrent HDMI MAI feed (audible glitch
+/// correlated with each flash-persist load dot).
 ///
 /// SAFETY: see [`arm_with_cs`].
 pub unsafe fn arm_uart_tx(cb: &DmaCb) {

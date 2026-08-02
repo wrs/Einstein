@@ -526,7 +526,7 @@ const _: () = assert!(ROM_SIZE % TWO_MIB == 0);
 const _: () = assert!(RAM_SIZE % TWO_MIB == 0);
 const _: () = assert!(FRAMEBUFFER_SIZE % TWO_MIB == 0);
 
-// ---- VA-walk / guest-string utilities (moved from trap.rs, review phase 9b) ----
+// ---- VA-walk / guest-string utilities ----
 
 use crate::hv::guest_endian::guest_read_u32_pa as read_guest_word_pa;
 

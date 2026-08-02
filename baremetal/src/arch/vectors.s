@@ -119,7 +119,7 @@ el2_vector_table:
     entry_halt   trap_unexpected          // 0x780
 
 // Shared tail for resumable entries: restore the spilled context and ERET.
-// Pulled out of the per-vector macro to keep each vector slot under the
+// Kept out of the per-vector macro so each vector slot stays under the
 // 128-byte cap; see the entry_resume comment above.
 .Lresume_tail:
     restore_context_and_eret

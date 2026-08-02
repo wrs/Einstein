@@ -65,7 +65,7 @@ pub trait PenInput: Sync {
     fn init(&self);
 
     /// Drain the backend and forward events to the guest. Runs on the
-    /// trap-return tail (`trap.rs`).
+    /// trap-return tail (`hv::trap`).
     fn pump(&self);
 
     /// Service an interrupt-driven input source from the trap-IRQ

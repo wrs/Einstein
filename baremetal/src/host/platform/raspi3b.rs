@@ -151,13 +151,12 @@ pub fn cnthp_irq_pending() -> bool {
 
 // ---- EL2 IRQ-entry dispatch (BCM2835 pending-register decode) -------
 //
-// These two functions own the BCM2835-specific pending-register decode
-// that used to be inlined as `#[cfg(nh_real_hw)]` blocks in
-// `trap_irq` / `irq_from_*`. Keeping it here makes the IRQ path in
-// `trap` free of platform cfg blocks: the platform layer (which already
-// owns `irq_ack`/`irq_eoi`) now also owns the host IRQ-controller
-// dispatch. On QEMU raspi3b (semihost, i.e. not `nh_real_hw`) there is
-// no BCM2835 DMA engine to service, so both are no-ops.
+// These two functions own the BCM2835-specific pending-register decode.
+// Keeping it here makes the IRQ path in `trap` free of platform cfg
+// blocks: the platform layer (which already owns `irq_ack`/`irq_eoi`)
+// also owns the host IRQ-controller dispatch. On QEMU raspi3b
+// (semihost, i.e. not `nh_real_hw`) there is no BCM2835 DMA engine to
+// service, so both are no-ops.
 
 /// Drain any completed BCM2835 DMA channels (UART TX ch5, MAI TX ch4,
 /// SD TX) by reading IRQ_PEND_1 and forwarding each pending channel to

@@ -62,17 +62,17 @@ pub(super) const PATCHES_717006: &[RomPatch] = &[
     RomPatch { offset: 0x003A_D46C, orig: 0x9282_2001, value: 0x3282_2001, name: "SetAlarm wrap-detect (1/2) ls→cc" },
     RomPatch { offset: 0x003A_D49C, orig: 0x9282_2001, value: 0x3282_2001, name: "SetAlarm wrap-detect (2/2) ls→cc" },
     // SWIBoot's second instruction-as-data LDR at 0x003ad738 is
-    // patched separately, via `INSN_AS_DATA_LDRS`, as a B-to-stub.
-    // Iter-102 had this as `mov r1, r0` on the assumption that r0
-    // still carried the byteswap-corrected SWI word from the iter-101
-    // stub at 0x003ad69c — true for unconditional SVCs, but the
-    // conditional-SVC dispatcher at 0x003add7c does `mrs r0, SPSR`,
-    // clobbering r0 with the caller's CPSR. The downstream
-    // `mov r1, r0; bic r1, r1, #0xFF000000; cmp r1, #0x23` then sees
-    // CPSR-shaped garbage (low 24 bits include the mode field), the
-    // bge fires, and boot wedges in the "Undefined SWI" debug stub.
-    // The fix is a proper LDR-byteswap stub mirroring the iter-101
-    // site so the re-read works for conditional SVCs too.
+    // patched separately, via `INSN_AS_DATA_LDRS`, as a B-to-stub —
+    // a full LDR-byteswap stub mirroring the site at 0x003ad69c, so
+    // the re-read works for conditional SVCs too. A cheaper
+    // `mov r1, r0` does not work: it assumes r0 still carries the
+    // byteswap-corrected SWI word, which holds for unconditional SVCs
+    // but not for the conditional-SVC dispatcher at 0x003add7c, which
+    // does `mrs r0, SPSR` and clobbers r0 with the caller's CPSR. The
+    // downstream `mov r1, r0; bic r1, r1, #0xFF000000; cmp r1, #0x23`
+    // then sees CPSR-shaped garbage (low 24 bits include the mode
+    // field), the bge fires, and boot wedges in the "Undefined SWI"
+    // debug stub.
     // Force every VM heap to allocate / extend in 4-KiB chunks
     // instead of 1-KiB subpages. The kernel's design partitions
     // shared 4-KiB physical pages into 1-KiB subpages with per-

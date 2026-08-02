@@ -229,9 +229,8 @@ with open(raw_path) as fin, open(out_path, 'w') as fout:
             marker = '*' if bit == 1 else ' ' if bit == 0 else '?'
             gloss = ascii_gloss(hex_v)
             # Use a fixed 2-space lead so every instruction line
-            # column-aligns now that addresses are uniformly 8 hex
-            # digits wide (objdump's variable-width pad is no longer
-            # needed).
+            # column-aligns: addresses are uniformly 8 hex digits
+            # wide, so objdump's variable-width pad isn't needed.
             line = (
                 f"  0x{addr_v:08x}:"
                 f"{col_m.group('sep')}{hex_v} {marker} {gloss}"

@@ -170,13 +170,12 @@ pub const FPA_BYPASS_STUB_OFFSET: usize = rom_ver::ROM_TAIL.fpa_bypass_stub as u
 /// Saves LR_abt/SP_abt/SPSR_abt natively from
 /// ABT mode, then bounces to SVC to save SP_svc/SPSR_svc/LR_svc.
 ///
-/// (Historical note: per Table D1-79, AArch32 R13_svc / R14_svc /
-/// SPSR_svc are reachable from AArch64 EL2 as `ctx.x[19]` / `ctx.x[18]`
-/// / `spsr_el1` respectively, so the SVC bounce is no longer
-/// strictly necessary. The trampoline path is retained because the
-/// alignment-fault fast path's HVC-entry handler reads from
-/// `DABT_SAVE_PA` directly; refactoring that to use ctx.x[] is a
-/// follow-up.)
+/// (Per Table D1-79, AArch32 R13_svc / R14_svc / SPSR_svc are reachable
+/// from AArch64 EL2 as `ctx.x[19]` / `ctx.x[18]` / `spsr_el1`
+/// respectively, so the SVC bounce is not strictly necessary. It is
+/// retained because the alignment-fault fast path's HVC-entry handler
+/// reads from `DABT_SAVE_PA` directly; refactoring that to use ctx.x[]
+/// is a follow-up.)
 ///
 /// The literal at the end of the trampoline is swapped between
 /// pre/post-MMU VAs by `install_und_vector_swap_{pre,post}_mmu`.
@@ -511,8 +510,8 @@ pub unsafe fn patch_dabt_vector(rom_ptr: *mut u32) {
 ///   ft+17: beq FAST_FWD              ; → ft+30
 ///   ft+18: cmp r0, #15               ; permission, page
 ///   ft+19: beq FAST_FWD
-///   ft+20: nop                       ; (was: cmp r0, #5 — see iter-60 below)
-///   ft+21: nop                       ; (was: beq FAST_FWD — see iter-60 below)
+///   ft+20: cmp r0, #9                ; domain, first level / section
+///   ft+21: beq FAST_FWD
 ///   ft+22: cmp r0, #13               ; permission, section
 ///   ft+23: beq FAST_FWD
 ///   ft+24: cmp r0, #6                ; access flag, page
@@ -545,23 +544,22 @@ pub unsafe fn patch_dabt_vector(rom_ptr: *mut u32) {
 /// 41 words × 4 = 164 bytes; reserved region is 256 bytes so 92
 /// bytes of slack remain.
 ///
-/// Cost reduction: at iter-58 the DABT trampoline took an EL2 round-
-/// trip on every fault. iter-59 measured 20.8 M HVC #DIAG_TAG hits in
-/// ~30 s of wall (DFSCs 0x07/0x0F dominating, all forwarded to kernel
-/// DAH). Bypassing the EL2 round-trip for those cases is a direct
-/// win — same kernel-side execution, no hypervisor overhead. The
-/// iter-105 LR/SP/SPSR save adds ~5 instructions to the fast path,
-/// negligible relative to the EL2 round-trip we're avoiding.
+/// Cost reduction: taking an EL2 round-trip on every DABT is
+/// measurably expensive — 20.8 M HVC #DIAG_TAG hits in ~30 s of wall
+/// (DFSCs 0x07/0x0F dominating, all forwarded to kernel DAH).
+/// Bypassing the EL2 round-trip for those cases is a direct win —
+/// same kernel-side execution, no hypervisor overhead. The
+/// LR/SP/SPSR save adds ~5 instructions to the fast path, negligible
+/// relative to the EL2 round-trip it avoids.
 ///
-/// iter-60: DFSC=0x05 (translation, section) is *deliberately
-/// excluded* from the fast path (slots ft+13/ft+14 left as NOPs). For
-/// section-level translation faults ARMv7 leaves DFSR.Domain UNK
-/// (= 0); the kernel's `GetDomainAndFaultMonitorFromDomainNumber(0)`
-/// then returns no monitor and DAH throws `evt.ex.abt.bus`. Pre-iter-
-/// 59 the EL2 path (`handle_dabt_dispatch` today) synthesised
-/// DFSR.Domain from L1[FAR>>20][8:5] before forwarding to DAH; iter-
-/// 59 bypassed that path. The minimal fix is to let DFSC=5 fall
-/// through to the slow EL2 path, which still does the synthesis.
+/// DFSC=0x05 (translation, section) is *deliberately excluded* from
+/// the fast path. For section-level translation faults ARMv7 leaves
+/// DFSR.Domain UNK (= 0); the kernel's
+/// `GetDomainAndFaultMonitorFromDomainNumber(0)` then returns no
+/// monitor and DAH throws `evt.ex.abt.bus`. Only the slow EL2 path
+/// (`handle_dabt_dispatch`) synthesises DFSR.Domain from
+/// L1[FAR>>20][8:5] before forwarding to DAH, so DFSC=5 has to fall
+/// through to it.
 /// Section-level faults fire only on first touch of a 1 MiB section
 /// (~tens of times per boot for freshly-allocated stacks), so the
 /// slow-path cost is negligible.
@@ -626,9 +624,8 @@ pub unsafe fn install_dabt_fast_trampoline(rom_ptr: *mut u32, dah_va: u32) {
         // probe — forward this DFSC to the kernel rather than DIAG'ing.
         // Verified against ARM ARM B4.1.52 + Table B3-23 (short-
         // descriptor FSR encoding: 0b01001 = first-level domain fault).
-        // (iter-60: DFSC=0x05 deliberately excluded — see file-level
-        // comment for rationale. The two slots formerly reserved as
-        // NOPs are reused here; existing beq / b-SLOW offsets unchanged.)
+        // (DFSC=0x05 is deliberately excluded — see the doc comment
+        // above for the rationale.)
         write_rom_code_word(rom_ptr, ft + 20, 0xE350_0009); // cmp r0, #9
         write_rom_code_word(rom_ptr, ft + 21, beq(21, 31)); // beq FAST_FWD
         write_rom_code_word(rom_ptr, ft + 22, 0xE350_000D); // cmp r0, #13
@@ -668,7 +665,7 @@ pub unsafe fn install_dabt_fast_trampoline(rom_ptr: *mut u32, dah_va: u32) {
 }
 
 /// `movs pc, lr` stub in the ROM trampoline region. See the installation
-/// site in `patch_und_vector` and `return_to_guest_from_und` in trap.rs
+/// site in `patch_und_vector` and `return_to_guest_from_und` in `hv::trap::und`
 /// for rationale. Must not overlap the DABT trampoline, which spans
 /// `DABT_TRAMP_OFFSET .. DABT_TRAMP_OFFSET + 15*4`  (= 0x00FF_FFA8 ..
 /// 0x00FF_FFE4 inclusive of the literal word at `db+14`). Placing the
@@ -795,7 +792,8 @@ pub unsafe fn patch_und_vector(rom: *mut u32) {
         // under BE-8, so write as data.
         write_rom_data_word(rom, base + 23, crate::hv::trap::HYP_TRAMP_SCRATCH_BASE);
 
-        // UND-return stub. See `return_to_guest_from_und` in trap.rs for
+        // UND-return stub. See `return_to_guest_from_und` in
+        // `hv::trap::und` for
         // why this exists — QEMU raspi3b's `msr spsr_el2, <val>` from
         // AArch64 EL2 clobbers SPSR_EL1 (= AArch32 SPSR_svc) as a side
         // effect. The UND-return path must avoid writing SPSR_EL2, so
@@ -814,26 +812,25 @@ pub unsafe fn patch_und_vector(rom: *mut u32) {
         //   +0x04: e1b0f00e  movs pc, lr         ; CPSR = SPSR_und, PC = lr
         //   +0x08: <target PC literal, updated per ERET>
         //
-        // Iter-28 attempted to extend this stub to also reload banked
-        // SPSR_und from UND_SAVE_SPSR_IPA via `MSR SPSR_cxsf, lr` (so
-        // flag-emulating probes' SPSR updates would propagate). The
-        // attempt failed: with the MSR in place QEMU raspi3b broke the
-        // boot with cascading data aborts at the next kernel store
-        // (0x186b4). Loads + movs without the MSR are stable; only
-        // the MSR triggers the regression. Suspected QEMU raspi3b
+        // The stub deliberately stops at three words. Extending it to
+        // also reload banked SPSR_und from UND_SAVE_SPSR_IPA via `MSR
+        // SPSR_cxsf, lr` (which would let flag-emulating probes' SPSR
+        // updates propagate) breaks the boot on QEMU raspi3b with
+        // cascading data aborts at the next kernel store (0x186b4).
+        // Loads + movs without the MSR are stable; only the MSR
+        // triggers the regression. Suspected QEMU raspi3b
         // banked-SPSR-write quirk (consistent with docs/QEMU_BUGS.md
         // Bug #1's family of `banked_spsr[]` indexing issues; possibly
         // distinct because Bug #1 is about EL2 → AArch32 propagation,
         // whereas this is AArch32-internal MSR SPSR from UND mode).
-        // Reverted to the 3-word stub. Approach (b) — emulate the bne
-        // at 0x257088 directly via ELR_EL2 in an HVC handler — is the
-        // path forward; it sidesteps SPSR entirely.
+        // Emulating the bne at 0x257088 directly via ELR_EL2 in an HVC
+        // handler is the path forward; it sidesteps SPSR entirely.
         let stub = UND_RETURN_STUB_OFFSET / 4;
         write_rom_code_word(rom, stub + 0, 0xE59F_E000); // ldr lr, [pc, #0]
         write_rom_code_word(rom, stub + 1, 0xE1B0_F00E); // movs pc, lr
         // Literal slot — loaded via the `ldr lr, [pc, #0]` at stub+0
-        // under BE-8 each ERET; the runtime updater also lives in
-        // `trap.rs`. Placeholder is data.
+        // under BE-8 each ERET; the runtime updater is
+        // `return_to_guest_from_und`. Placeholder is data.
         write_rom_data_word(rom, stub + 2, 0xDEAD_C0DE);
     }
 

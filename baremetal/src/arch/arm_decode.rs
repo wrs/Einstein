@@ -1,5 +1,5 @@
 //! Small AArch32 instruction-decode helpers shared across the emulation
-//! paths (`trap.rs`, `unaligned.rs`). Single home for the ARM condition
+//! paths (`hv::trap`, `newton::unaligned`). Single home for the ARM condition
 //! truth table, the immediate-shift evaluator, and the mode-name
 //! formatter so the copies can't drift.
 //!

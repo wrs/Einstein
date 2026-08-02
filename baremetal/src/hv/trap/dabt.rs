@@ -438,8 +438,8 @@ fn is_obviously_unreachable_ipa(ipa: u64) -> bool {
     if ipa < layout::high_rom_end() { return true; }
     // "Unknown bank #5" gap (between flash bank 2 end at 0x10400000
     // and PCMCIA0Base at 0x30000000). Einstein's TMemory silently
-    // returns 0 here; we now do the same in mmio.rs but the kernel
-    // still gets here only via uninitialised-pointer paths (e.g.
+    // returns 0 here, and so does mmio.rs, but the kernel still gets
+    // here only via uninitialised-pointer paths (e.g.
     // the TEncodingMap.+16 = 0x20000110 from the MakeString fault
     // we resolved on 2026-04-27). Surfacing the register context
     // for the first such access per boot is cheap and decisive.

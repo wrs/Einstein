@@ -1,6 +1,6 @@
 //! SA-1100 rotate-LDR emulation for unaligned LDR/STR faults.
 //!
-//! With `SCTLR_EL1.A` forced to 1 by the CP15 shim in trap.rs, every
+//! With `SCTLR_EL1.A` forced to 1 by the CP15 shim in `hv::trap::cp15`, every
 //! AArch32 unaligned LDR/STR raises a stage-1 alignment fault at EL1.
 //! The kernel's DABT vector at VA 0x10 is patched to a trampoline
 //! that detects `DFSR.FS[3:0] == 0b0001` (the ARMv7 short-descriptor

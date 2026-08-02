@@ -31,20 +31,6 @@ use core::ptr::{read_volatile, write_volatile};
 
 use super::regs::*;
 
-/// Stage-by-stage trace, gated on the verbose `sd-probe-trace`
-/// sub-feature. Used during bring-up to diagnose where init / read /
-/// write wedge. With only `sd-probe` enabled, the probe still prints
-/// outcome lines from probe.rs but the per-register / per-read
-/// chatter is off. Always type-checks (so referenced bindings stay
-/// in scope when the feature is off); LLVM drops the branch.
-macro_rules! trace {
-    ($($arg:tt)*) => {
-        if cfg!(feature = "sd-probe-trace") {
-            $crate::kprintln!($($arg)*);
-        }
-    };
-}
-
 /// SDHOST base on the BCM2710 peripheral window.
 const SDHOST_BASE: usize = 0x3F20_2000;
 
@@ -126,35 +112,19 @@ impl SdHost {
     /// driver instance ready for `read_block` / `write_block`. This is
     /// the production SD path on the Pi Zero 2 W (flash persistence).
     pub fn init() -> Result<Self, CmdError> {
-        trace!(
-            "sd: pre-init SDEDM=0x{:08x} (FSM={:#x}) SDVDD=0x{:08x}",
-            read_reg(SDEDM),
-            read_reg(SDEDM) & SDEDM_FSM_MASK,
-            read_reg(SDVDD),
-        );
-
         gpio_setup();
-        trace!("sd: gpio_setup done");
 
         let core_clock = match clock_setup() {
-            Ok(r) => {
-                trace!("sd: CLOCK_ID_CORE = {} Hz", r);
-                r
-            }
-            Err(e) => {
-                trace!("sd: clock_setup FAILED: {:?}", e);
-                return Err(CmdError::HardwareWedge);
-            }
+            Ok(r) => r,
+            Err(_) => return Err(CmdError::HardwareWedge),
         };
 
         reset_controller();
         delay_us(10_000);
-        trace!("sd: reset done; SDEDM=0x{:08x}", read_reg(SDEDM));
 
         // Card power-up via SDVDD (1 = on).
         write_reg(SDVDD, 1);
         delay_us(10_000);
-        trace!("sd: power-up; SDVDD readback={}", read_reg(SDVDD));
 
         // Host config for non-data commands. See `SDHCFG_BASE_NARROW`
         // doc for what each bit does — the takeaway is that on this
@@ -166,49 +136,31 @@ impl SdHost {
         // SD spec. The SDHOST divides core_clock by (cdiv + 2).
         program_sdcdiv(core_clock, 400_000);
         write_reg(SDHSTS, SDHSTS_CLEAR_MASK);
-        trace!(
-            "sd: SDHCFG=0x{:08x} SDCDIV={} SDHSTS=0x{:08x}",
-            read_reg(SDHCFG),
-            read_reg(SDCDIV),
-            read_reg(SDHSTS),
-        );
 
         // Identification phase. Per SD Physical Layer Spec §4.2.
-        trace!("sd: CMD0 GO_IDLE_STATE...");
         send_cmd(CMD_GO_IDLE_STATE, 0, ResponseKind::None)?;
         delay_us(1_000);
-        trace!("sd: CMD0 ok");
 
         // CMD8: probe for SDv2 / supply-voltage match. A v1.x card
         // returns CMD_TIME_OUT here; that's not a fatal error.
-        trace!("sd: CMD8 SEND_IF_COND...");
         let v2 = match send_cmd(CMD_SEND_IF_COND, CMD8_VHS_27_36_PATTERN, ResponseKind::Short) {
-            Ok(resp) => {
-                trace!("sd: CMD8 resp=0x{:08x}", resp);
-                (resp & CMD8_R7_PATTERN_MASK) == CMD8_R7_PATTERN_VALUE
-            }
-            Err(CmdError::Timeout) => {
-                trace!("sd: CMD8 timeout (treating as v1.x card)");
-                false
-            }
+            Ok(resp) => (resp & CMD8_R7_PATTERN_MASK) == CMD8_R7_PATTERN_VALUE,
+            Err(CmdError::Timeout) => false,
             Err(e) => return Err(e),
         };
 
         // ACMD41 loop until OCR_BUSY clears. Argument carries our
         // voltage window and (for v2 cards) the HCS bit.
         let arg = OCR_VOLT_3V2_3V4 | if v2 { OCR_HCS } else { 0 };
-        trace!("sd: ACMD41 loop (arg=0x{:08x})...", arg);
         let mut acmd41_iter: u32 = 0;
         let ocr = loop {
             send_cmd(CMD_APP_CMD, 0, ResponseKind::Short)?;
             let resp = send_cmd(ACMD_SD_SEND_OP_COND, arg, ResponseKind::Short)?;
             acmd41_iter += 1;
             if resp & OCR_BUSY != 0 {
-                trace!("sd: ACMD41 ready after {} iter, ocr=0x{:08x}", acmd41_iter, resp);
                 break resp;
             }
             if acmd41_iter >= 1000 {
-                trace!("sd: ACMD41 never ready ({} iters)", acmd41_iter);
                 return Err(CmdError::HardwareWedge);
             }
             delay_us(10_000);
@@ -221,19 +173,15 @@ impl SdHost {
 
         // CMD2 — fetch CID (we don't decode it; just complete the
         // protocol step).
-        trace!("sd: CMD2 ALL_SEND_CID...");
         send_cmd(CMD_ALL_SEND_CID, 0, ResponseKind::Long)?;
         // CMD3 — card returns its RCA in bits [31:16].
-        trace!("sd: CMD3 SEND_RELATIVE_ADDR...");
         let rca = send_cmd(CMD_SEND_RELATIVE_ADDR, 0, ResponseKind::Short)? & 0xFFFF_0000;
-        trace!("sd: RCA=0x{:08x}", rca);
         // CMD9 — fetch the CSD (136-bit R2). The controller leaves the
         // response in SDRSP0..3; read all four to decode the card
         // capacity. SDRSP3 = bits[127:96] (top), SDRSP0 = bits[31:0]
         // (bottom), matching the standard CRC-stripped R2 layout
         // (verified against Linux bcm2835-sdhost: it copies SDRSP0..3
         // straight into resp[3..0] with no cross-register shift).
-        trace!("sd: CMD9 SEND_CSD...");
         send_cmd(CMD_SEND_CSD, rca, ResponseKind::Long)?;
         let csd = [
             read_reg(SDRSP0),
@@ -243,7 +191,6 @@ impl SdHost {
         ];
         let num_blocks = decode_csd_num_blocks(&csd);
         // CMD7 — select the card, putting it in transfer state.
-        trace!("sd: CMD7 SELECT_CARD...");
         send_cmd(CMD_SELECT_CARD, rca, ResponseKind::Short)?;
 
         // Set 512-byte block length for byte-addressed cards. SDHC
@@ -252,27 +199,21 @@ impl SdHost {
 
         // ACMD6: switch the card to 4-bit external bus. 4-bit is
         // mandatory in the SD spec so this should always succeed,
-        // but treat failure as soft — stay at 1-bit, log loudly.
+        // but treat failure as soft — stay at 1-bit; the always-on
+        // "bus ready" summary below reports the resulting width.
         // Order matters: switch the *card* first, then the
         // *controller* (writing SDHCFG_WIDE_EXT_BUS). Reversed, we'd
         // drive 4-bit signals to a card still expecting 1-bit and
         // mismatch on every transfer.
         let mut hcfg_base = SDHCFG_BASE_NARROW;
-        match (|| -> Result<u32, CmdError> {
+        if (|| -> Result<u32, CmdError> {
             send_cmd(CMD_APP_CMD, rca, ResponseKind::Short)?;
             send_cmd(ACMD_SET_BUS_WIDTH, 2, ResponseKind::Short)
-        })() {
-            Ok(_) => {
-                hcfg_base |= SDHCFG_WIDE_EXT_BUS;
-                write_reg(SDHCFG, hcfg_base);
-                trace!("sd: ACMD6 ok, switched to 4-bit external bus");
-            }
-            Err(e) => {
-                trace!(
-                    "sd: ACMD6 FAILED ({:?}), staying at 1-bit external bus",
-                    e
-                );
-            }
+        })()
+        .is_ok()
+        {
+            hcfg_base |= SDHCFG_WIDE_EXT_BUS;
+            write_reg(SDHCFG, hcfg_base);
         }
 
         // Bump the SD bus clock to default-speed 25 MHz now that the
@@ -291,16 +232,9 @@ impl SdHost {
         //
         // ACMD6 above handled the 4-bit switch.
         program_sdcdiv(core_clock, 25_000_000);
-        trace!(
-            "sd: init complete; SDEDM=0x{:08x} (FSM={:#x}) SDCDIV={} SDHCFG=0x{:08x}",
-            read_reg(SDEDM),
-            read_reg(SDEDM) & SDEDM_FSM_MASK,
-            read_reg(SDCDIV),
-            read_reg(SDHCFG),
-        );
-        // Always-on summary so users without the trace feature still
-        // see what bus they ended up on. core_clock / (cdiv+2) = bus
-        // clock in Hz; the bus-width comes from hcfg_base.
+        // Boot-time summary of what bus we ended up on.
+        // core_clock / (cdiv+2) = bus clock in Hz; the bus-width
+        // comes from hcfg_base.
         let cdiv = read_reg(SDCDIV);
         let bus_hz = core_clock / (cdiv + 2);
         let width = if hcfg_base & SDHCFG_WIDE_EXT_BUS != 0 {
@@ -350,13 +284,6 @@ impl SdHost {
             CardCapacity::HighCapacity => lba,
             CardCapacity::StandardCapacity => lba.wrapping_mul(512),
         };
-        trace!(
-            "sd: read_block lba={} arg=0x{:08x} pre-SDHSTS=0x{:08x} pre-SDEDM=0x{:08x}",
-            lba,
-            arg,
-            read_reg(SDHSTS),
-            read_reg(SDEDM),
-        );
         prepare_data(self.hcfg_base, 512, 1);
         // Single exit through the SDHCFG restore below: `prepare_data`
         // sets `DATA_IRPT_EN`, which gates the FSM's data path, and it
@@ -365,21 +292,7 @@ impl SdHost {
         // into the next non-data command. (The DMA variants restore on
         // their error paths for the same reason.)
         let resp = send_cmd_kind(CMD_READ_SINGLE_BLOCK, arg, ResponseKind::Short, CmdDir::Read);
-        trace!(
-            "sd: CMD17 done; resp={:?} SDHSTS=0x{:08x} SDEDM=0x{:08x} (FSM={:#x})",
-            resp,
-            read_reg(SDHSTS),
-            read_reg(SDEDM),
-            read_reg(SDEDM) & SDEDM_FSM_MASK,
-        );
         let r = resp.and_then(|_| drain_fifo_to(buf).and_then(|()| finish_data_phase(true)));
-        trace!(
-            "sd: data phase done; r={:?} SDHSTS=0x{:08x} SDEDM=0x{:08x} (FSM={:#x})",
-            r,
-            read_reg(SDHSTS),
-            read_reg(SDEDM),
-            read_reg(SDEDM) & SDEDM_FSM_MASK,
-        );
         write_reg(SDHCFG, self.hcfg_base);
         r
     }

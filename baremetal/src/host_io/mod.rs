@@ -5,7 +5,8 @@
 //! 1. **Outbound display.** `screen::blit` calls [`push_blit`] each time
 //!    it paints pixels. The active backend forwards a `BlitEvent` plus
 //!    its 2 bpp packed payload to whatever sink it owns (host viewer
-//!    over semihosting IPC for QEMU/FVP, a real LCD on Pico 2 W).
+//!    over semihosting IPC for QEMU/FVP, the VC framebuffer on a
+//!    real Pi).
 //!
 //! 2. **Inbound pen input.** The active backend's [`pump_input`] runs
 //!    from the trap-return tail (`trap.rs`); it pulls pen events off
@@ -24,10 +25,7 @@
 
 pub mod queue;
 
-// `host-io-pico` is reserved/unimplemented; like `flash-persist-pico`
-// it routes onto the null backend so its dispatch arms are real no-ops
-// rather than empty bodies.
-#[cfg(any(nh_host_io_null, nh_host_io_pico))]
+#[cfg(nh_host_io_null)]
 mod null;
 #[cfg(nh_host_io_pi_fb)]
 pub mod pi_fb;
@@ -95,7 +93,7 @@ const _: () = {
 /// One-time setup: open transport, send a hello, …. Called from
 /// `kmain` once `vic::init` has returned.
 pub fn init() {
-    #[cfg(any(nh_host_io_null, nh_host_io_pico))]
+    #[cfg(nh_host_io_null)]
     null::init();
     #[cfg(nh_host_io_pi_fb)]
     pi_fb::init();
@@ -129,7 +127,7 @@ pub fn on_resume() {
         payload_len: payload.len() as u16,
     };
     push_blit(&ev, payload);
-    #[cfg(any(nh_host_io_null, nh_host_io_pico))]
+    #[cfg(nh_host_io_null)]
     null::on_resume();
     #[cfg(nh_host_io_pi_fb)]
     pi_fb::on_resume();
@@ -141,7 +139,7 @@ pub fn on_resume() {
 /// calls this from a sync trap with the guest stalled. Backends that
 /// can't keep up drop events instead of blocking.
 pub fn push_blit(ev: &BlitEvent, payload: &[u8]) {
-    #[cfg(any(nh_host_io_null, nh_host_io_pico))]
+    #[cfg(nh_host_io_null)]
     null::push_blit(ev, payload);
     #[cfg(nh_host_io_pi_fb)]
     pi_fb::push_blit(ev, payload);
@@ -161,7 +159,7 @@ pub fn pop_pen_sample() -> Option<(u32, u32)> {
 /// events, enqueue them as Newton-format samples, and raise
 /// `INT_TABLET`. Called from the trap-return tail (`trap.rs`).
 pub fn pump_input() {
-    #[cfg(any(nh_host_io_null, nh_host_io_pico))]
+    #[cfg(nh_host_io_null)]
     null::pump_input();
     #[cfg(nh_host_io_pi_fb)]
     pi_fb::pump_input();

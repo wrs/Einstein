@@ -11,7 +11,6 @@
 
 use core::ptr::addr_of_mut;
 
-use crate::hvc_imm::HvcImm;
 use crate::kprintln;
 
 // Size of each region, in bytes. Must be multiples of 2 MiB for the stage-2
@@ -1195,13 +1194,6 @@ pub unsafe fn load_newton_rom() {
     // Install the DABT-vector intercept. See
     // `guest_trampolines::patch_dabt_vector`.
     unsafe { crate::guest_trampolines::patch_dabt_vector(rom_ptr); }
-
-    // TEMPORARY diagnostic — PABT-vector intercept.
-    // The stock ROM vector at VA 0x0C branches to 0x01A00010 (a HAL
-    // REx address that our image doesn't back). Patch to HVC #DIAG_TAG
-    // so any prefetch abort halts with a full banked-reg dump and we
-    // can see the faulting fetch PC (= LR_abt − 4 for ARM).
-    unsafe { write_rom_code_word(rom_ptr, 3, HvcImm::Diag.insn()); } // hvc #0x11
 
     // Bring-up shim #2: the 717006 kernel uses StrongARM's lax CP15 encoding
     // where CRm == CRn for most system-control registers. On ARMv7+ those

@@ -26,7 +26,7 @@
 
 #[cfg(nh_flash_persist_semihost)]
 mod semihost;
-#[cfg(any(nh_flash_persist_null, nh_flash_persist_pico))]
+#[cfg(nh_flash_persist_null)]
 mod null;
 #[cfg(nh_flash_persist_sd)]
 mod sd;
@@ -57,7 +57,7 @@ pub trait FlashStore: Sync {
 
 #[cfg(nh_flash_persist_semihost)]
 use self::semihost::BACKEND;
-#[cfg(any(nh_flash_persist_null, nh_flash_persist_pico))]
+#[cfg(nh_flash_persist_null)]
 use self::null::BACKEND;
 #[cfg(nh_flash_persist_sd)]
 use self::sd::BACKEND;

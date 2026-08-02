@@ -36,11 +36,9 @@ fn main() {
     // Cfg flags driven by backend selection (see resolve_*_backend).
     println!("cargo:rustc-check-cfg=cfg(nh_host_io_null)");
     println!("cargo:rustc-check-cfg=cfg(nh_host_io_semihost)");
-    println!("cargo:rustc-check-cfg=cfg(nh_host_io_pico)");
     println!("cargo:rustc-check-cfg=cfg(nh_host_io_pi_fb)");
     println!("cargo:rustc-check-cfg=cfg(nh_flash_persist_null)");
     println!("cargo:rustc-check-cfg=cfg(nh_flash_persist_semihost)");
-    println!("cargo:rustc-check-cfg=cfg(nh_flash_persist_pico)");
     println!("cargo:rustc-check-cfg=cfg(nh_flash_persist_sd)");
     println!("cargo:rustc-check-cfg=cfg(nh_input_null)");
     println!("cargo:rustc-check-cfg=cfg(nh_input_mtouch)");
@@ -356,27 +354,18 @@ fn resolve_real_hw() {
 /// `default`); this function picks the active backend (with "null" as
 /// the no-features fallback) and emits a single `cfg(nh_host_io_<x>)`
 /// the source consumes. Multiple opt-ins are still MUEX.
-///
-/// `host-io-pico` is reserved (a future Pico 2 W LCD/touch backend) and
-/// has no implementation yet; like `flash-persist-pico` it resolves
-/// onto the null backend (the `nh_host_io_pico` cfg is emitted but
-/// `host_io/mod.rs` routes it through the null module) so a build that
-/// selects it links a working no-op sink instead of empty dispatch
-/// bodies.
 fn resolve_host_io_backend() {
     let null = env::var("CARGO_FEATURE_HOST_IO_NULL").is_ok();
     let semihost = env::var("CARGO_FEATURE_HOST_IO_SEMIHOST").is_ok();
-    let pico = env::var("CARGO_FEATURE_HOST_IO_PICO").is_ok();
     let pi_fb = env::var("CARGO_FEATURE_HOST_IO_PI_FB").is_ok();
-    let chosen = match (null, semihost, pico, pi_fb) {
-        (false, false, false, false) => "null",
-        (true, false, false, false) => "null",
-        (false, true, false, false) => "semihost",
-        (false, false, true, false) => "pico",
-        (false, false, false, true) => "pi_fb",
+    let chosen = match (null, semihost, pi_fb) {
+        (false, false, false) => "null",
+        (true, false, false) => "null",
+        (false, true, false) => "semihost",
+        (false, false, true) => "pi_fb",
         _ => panic!(
             "multiple host-io backends selected \
-             (null={null} semihost={semihost} pico={pico} pi_fb={pi_fb}); \
+             (null={null} semihost={semihost} pi_fb={pi_fb}); \
              they are mutually exclusive"
         ),
     };
@@ -391,21 +380,19 @@ fn resolve_host_io_backend() {
 fn resolve_flash_persist_backend() {
     let null = env::var("CARGO_FEATURE_FLASH_PERSIST_NULL").is_ok();
     let semihost = env::var("CARGO_FEATURE_FLASH_PERSIST_SEMIHOST").is_ok();
-    let pico = env::var("CARGO_FEATURE_FLASH_PERSIST_PICO").is_ok();
     let sd = env::var("CARGO_FEATURE_FLASH_PERSIST_SD").is_ok();
     let guest_test = env::var("NH_GUEST_TEST").is_ok();
     let chosen = if guest_test {
         "null"
     } else {
-        match (null, semihost, pico, sd) {
-            (false, false, false, false) => "semihost",
-            (true, false, false, false) => "null",
-            (false, true, false, false) => "semihost",
-            (false, false, true, false) => "pico",
-            (false, false, false, true) => "sd",
+        match (null, semihost, sd) {
+            (false, false, false) => "semihost",
+            (true, false, false) => "null",
+            (false, true, false) => "semihost",
+            (false, false, true) => "sd",
             _ => panic!(
                 "multiple flash-persist backends selected \
-                 (null={null} semihost={semihost} pico={pico} sd={sd}); \
+                 (null={null} semihost={semihost} sd={sd}); \
                  they are mutually exclusive"
             ),
         }

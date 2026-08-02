@@ -4,7 +4,7 @@
 #
 # Usage:
 #   scripts/build-sd.sh <dest-dir>
-#       Build the pi-probe binary, fetch the Pi firmware blobs (cached
+#       Build the hypervisor binary, fetch the Pi firmware blobs (cached
 #       under target/pi-firmware-cache/), and assemble a complete boot-
 #       partition layout under <dest-dir>. The user then copies the
 #       contents to the root of a FAT32-formatted SD card.
@@ -14,8 +14,7 @@
 #   PI_KERNEL_BIN       which [[bin]] to use as kernel8.img
 #                       (default: newton-hypervisor — the full
 #                       hypervisor, which boots to the Welcome UI on
-#                       the Pi. Set to `pi-probe` for the first-light
-#                       serial-triage probe instead.)
+#                       the Pi)
 #   PI_CARGO_FEATURES   base Cargo features (default: pi-bare-metal-input,
 #                       the display + touch + audio + SD-flash aggregate
 #                       for the full hypervisor). Set to `pi-bare-metal`
@@ -66,7 +65,7 @@ usage: scripts/build-sd.sh <dest-dir> [<sd-mount>]
               re-running after a small kernel rebuild touches just
               kernel8.img.
 
-  Set PI_KERNEL_BIN to pick a different [[bin]] (default: pi-probe).
+  Set PI_KERNEL_BIN to pick a different [[bin]] (default: newton-hypervisor).
 EOF
     exit 1
 }
@@ -94,10 +93,9 @@ done
 #
 # Default to the `pi-bare-metal-input` aggregate for the full
 # hypervisor (display + touch + audio + SD-flash on top of
-# platform-raspi3b + no-semihost). The minimal `pi-bare-metal`
-# aggregate still works for `pi-probe` (it only needs platform-raspi3b)
-# or a null-backend hypervisor build — set PI_CARGO_FEATURES to pick.
-# See Cargo.toml for the feature definitions.
+# platform-raspi3b + no-semihost). Set PI_CARGO_FEATURES for the
+# minimal `pi-bare-metal` null-backend build instead. See Cargo.toml
+# for the feature definitions.
 features="${PI_CARGO_FEATURES:-pi-bare-metal-input}${PI_EXTRA_FEATURES:+ $PI_EXTRA_FEATURES}"
 echo "build: cargo --release --no-default-features --features '$features' --bin $kernel_bin"
 (
@@ -162,11 +160,10 @@ next steps:
        Pi pin 10  (GPIO 15 RX) <--  cable TX
      Leave the cable's 5V/VCC pin disconnected.
      Open serial at 115200 8N1, then power on the Pi.
-  4. Expect serial output from kernel8.img ($kernel_bin) on the wire.
-     For pi-probe: a few-line banner with CurrentEL / MIDR_EL1 / MPIDR_EL1.
-     For newton-hypervisor: the M0 banner, capability dump, MMU init,
-       stage-2 init, and progress into the Newton ROM boot. Use --features
-       trace,quiet for a function-level trace of the ROM execution.
+  4. Expect serial output from kernel8.img ($kernel_bin) on the wire:
+     the M0 banner, capability dump, MMU init, stage-2 init, and
+     progress into the Newton ROM boot. Use --features trace,quiet
+     for a function-level trace of the ROM execution.
 
   See docs/REAL_HW_BRINGUP.md if it doesn't print.
 EOF

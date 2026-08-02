@@ -4,29 +4,10 @@
 //! (the ROM reset vector) in AArch32 SVC mode with stage-1 MMU off. Stage-2
 //! carries every load/store through the mapping installed by `stage2::init`:
 //! ROM is read-only at IPA 0, RAM is R/W at IPA 0x04000000, MMIO faults.
-//!
-//! The toy guest (used for M1.5) is kept as a hidden alternative in case we
-//! need to isolate stage-2 behaviour from real-ROM behaviour later; call
-//! `run_toy_guest` instead of `run_newton_rom` for that.
 
 use core::arch::asm;
 
 use crate::kprintln;
-
-#[repr(C, align(4))]
-struct ToyImage([u32; 8]);
-
-#[allow(dead_code)]
-static TOY: ToyImage = ToyImage([
-    0xE59F_0010,
-    0xE590_1000,
-    0xE3A0_2033,
-    0xE080_3001,
-    0xE140_0070,
-    0xEAFF_FFFE,
-    0x0010_0000,
-    0xEAFF_FFFE,
-]);
 
 /// Configure the EL2 trap bits that stay constant for the life of
 /// the guest. Called unconditionally from both cold boot and
@@ -333,14 +314,4 @@ pub unsafe fn run_newton_rom() -> ! {
     kprintln!("Dropping to EL1 AArch32 at guest IPA 0x00000000 (ROM reset vector)");
     // SAFETY: MMU, stage-2, vectors all up by the time the caller invokes us.
     unsafe { eret_to_guest(0x0000_0000) }
-}
-
-/// Alternative entry: the small toy guest that exercises stage-2 trap-and-halt.
-/// Left in for diagnostics; not used in the M2a boot path.
-#[allow(dead_code)]
-pub unsafe fn run_toy_guest() -> ! {
-    let entry = TOY.0.as_ptr() as u64;
-    kprintln!("Dropping to EL1 AArch32 at toy-guest PC = {:#x}", entry);
-    // SAFETY: as above.
-    unsafe { eret_to_guest(entry) }
 }

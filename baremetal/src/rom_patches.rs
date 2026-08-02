@@ -813,32 +813,6 @@ pub unsafe fn apply_717006_patches(rom_ptr: *mut u32) {
         }
         applied += 1;
     }
-    // full_ns_trace: change the first store of the TInterpreter
-    // trace-mode field at 0x35e7d4 from `mov r7, #0` to `mov r7, #3`.
-    // This changes the default to full tracing.
-    #[cfg(feature = "full_ns_trace")]
-    {
-        // Originals verified against rom.dis: mov r7,#0 / teq r0,#0 /
-        // bl GetFrameSlotRef__FlT1.
-        for (pc, orig, new, name) in [
-            (0x0035_E7D4u32, 0xE3A0_7000u32, 0xE3A0_7003u32,
-             "TraceSetOptions: mov r7, #3 (was #0) — first store to TInterpreter+0x7C"),
-            (0x000E_6A1Cu32, 0xE330_0000u32, 0xE330_00FFu32,
-             "ConsumeFrame: teq r0, #FF (was #0) — force PrintObject call"),
-            (0x0033_CB24u32, 0xEB62_1DCDu32, 0xE3A0_0008u32,
-             "PrintObject: mov r0, #8 (was bl GetFrameSlotRef) — change object depth"),
-        ] {
-            unsafe {
-                install_patch(rom_ptr, pc, WordKind::Code, Some(orig), &[new],
-                    /*optional=*/ false, name);
-            }
-            kprintln!(
-                "rom_patch: {:#010x}: {:#010x} -> {:#010x}  ({})",
-                pc, orig, new, name,
-            );
-            applied += 1;
-        }
-    }
 
     // Einstein's TJITGenericPatchNativeCall / TJITGenericPatchNativeInjection
     // patches, translated from SWI-dispatch into inline ARM so we don't

@@ -10,16 +10,6 @@ description = "Bare-metal hypervisor for running Newton 2.x ROMs natively on Cor
 name = "newton-hypervisor"
 path = "src/main.rs"
 
-# Phase-0 real-hardware probe — standalone binary, depends on nothing from
-# the main crate. Brings up PL011 directly (no semihosting), prints
-# CurrentEL / MIDR_EL1 / MPIDR_EL1, WFE-loops. Only useful with the
-# raspi3b platform (PL011 base 0x3F20_1000); FVP build will skip it via
-# required-features. See `docs/REAL_HW_BRINGUP.md`.
-[[bin]]
-name = "pi-probe"
-path = "src/pi_probe.rs"
-required-features = ["platform-raspi3b"]
-
 [features]
 default = ["platform-raspi3b", "log_traps", "log_irqs", "log_host_io"]
 
@@ -94,11 +84,8 @@ platform-fvp-base = []
 #                      via Arm semihosting. Paired with the
 #                      `tools/host-viewer` Rust crate. Use for
 #                      interactive QEMU / FVP sessions.
-#   host-io-pico     — reserved for a future Pico 2 W backend that
-#                      drives a real LCD + touch controller.
 host-io-null = []
 host-io-semihost = []
-host-io-pico = []
 # VC-framebuffer backend for the Pi Zero 2 W. Renders Newton's
 # 320x480 2 bpp framebuffer into the HDMI panel through the
 # allocator built in src/display/. See src/host_io/pi_fb.rs.
@@ -113,11 +100,8 @@ host-io-pi-fb = []
 #   flash-persist-null     — no-op; flash is volatile.
 #   flash-persist-semihost — read/write `$HOME/.newton/flash.bin` via
 #                            Arm semihosting.
-#   flash-persist-pico     — reserved for a future on-board SD-card or
-#                            external-flash backend on the Pico 2 W.
 flash-persist-null = []
 flash-persist-semihost = []
-flash-persist-pico = []
 # Real-hardware backend: persists GUEST_FLASH to NEWTON.BIN on the
 # FAT32 boot partition via the embedded-sdmmc + BCM2835 SDHOST stack
 # built up in src/sd. Selected by the `pi-bare-metal-sd` aggregate.
@@ -227,13 +211,6 @@ pi-bare-metal-input = [
 #     --features "pi-bare-metal sd-probe"
 sd-probe = []
 
-# Verbose per-read tracing inside the SDHOST driver. Used during
-# bring-up; on now-working hardware the inline trace lines interleave
-# with the probe's file-content dump and make the output unreadable.
-# Keep available behind its own feature so a regression can re-enable
-# it without surgery. Implies `sd-probe` for convenience.
-sd-probe-trace = ["sd-probe"]
-
 # Real-hardware VC-framebuffer first-light probe. When on, kmain
 # allocates a framebuffer at the panel's native size, paints a
 # red→green horizontal gradient, and halts. Use for checking that
@@ -298,16 +275,6 @@ quiet = []
 # output. Toggling rewrites a ROM word, which invalidates older
 # snapshots — cold-boot on toggle (`rm -f /tmp/newton-snapshot-*.bin`).
 ns_trace = []
-# Layered on top of `ns_trace`: change the first store of the
-# TInterpreter trace-mode field at 0x35e7ec from `mov r0, #2` to
-# `mov r0, #3`. The field at TInterpreter+0x7C selects which
-# family of trace events fires; the EQRef/symbol-match branch
-# later in the same function already writes 3 for one specific
-# symbol, so 3 is a value the downstream gates already handle.
-# Use when `ns_trace`'s default mode (#2) isn't surfacing the
-# events you want and you'd rather start from the broader #3
-# default.
-full_ns_trace = ["ns_trace"]
 
 [dependencies]
 newton-objects = { path = "newton-objects" }

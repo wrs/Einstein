@@ -38,7 +38,7 @@ armstub source, not memory. Re-verify before relying.
 
 Verified by reading `armstub8.S`
 (`github.com/raspberrypi/tools/blob/master/armstubs/armstub8.S`) and
-confirmed on the actual board (`pi-probe` prints `CurrentEL = 2`,
+confirmed on the actual board (the boot banner prints `CurrentEL = 2`,
 `MIDR_EL1 = 0x410fd034`, matching QEMU byte-for-byte): the default
 stub does
 
@@ -126,9 +126,8 @@ backends selected by aggregate features:
 | `pi-bare-metal-input` | off | sd | pi-fb | mtouch | pi-hdmi | real-hw, display + touch + audio |
 | `platform-fvp-base` | on | semihost | null | null | null | FVP cycle-accurate runs |
 
-Probe features (`sd-probe`, `fb-probe`, `sd-probe-trace`,
-`usb-probe`, plus the standalone `pi-probe` bin) are additive on top
-of any aggregate; each boots, tests one peripheral, and parks. The
+Probe features (`sd-probe`, `fb-probe`, `usb-probe`) are additive on
+top of any aggregate; each boots, tests one peripheral, and parks. The
 build script accepts `PI_CARGO_FEATURES` to override the base and
 `PI_EXTRA_FEATURES` to append.
 

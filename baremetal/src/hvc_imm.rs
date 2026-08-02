@@ -91,12 +91,10 @@ pub enum HvcImm {
     // above. Adding a variant just appends. Tests don't issue these
     // directly, so reordering / shifting their values is safe.
     /// Diagnostic halt: dump banked regs + stage-1 walk + halt the
-    /// host. Used in two places:
-    ///   1. PABT vector slot (VA 0x0C): the stock ROM branches to a
-    ///      missing REx address, so any prefetch abort routes here
-    ///      for a clean halt instead of a silent wedge.
-    ///   2. Ad-hoc hand-patches: write this HVC into any guest code
-    ///      site to get a halt-with-full-register-dump there.
+    /// host. For ad-hoc hand-patches: write this HVC into any guest
+    /// code site to get a halt-with-full-register-dump there. Also
+    /// reached from the DABT dispatch path for shapes it can't
+    /// forward (`trap::dabt::handle_dabt_dispatch`).
     Diag,
     /// DABT fast-trampoline fall-through. The trampoline at
     /// `DABT_TRAMP_OFFSET` checks DFSR.status == 0x01 (alignment)

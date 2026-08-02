@@ -99,7 +99,7 @@ normalisations are required because the ROM's tables use ARMv4
 short-descriptor bit assignments that ARMv7/v8 re-interpret, and a small
 per-PC stub facility is needed for instructions ARMv8 made UNDEFINED.
 
-**Stage-1 normalisation pass** (`fix_stage1_xn_bits` in `guest_mem.rs`,
+**Stage-1 normalisation pass** (`fix_stage1_xn_bits` in `src/newton/os.rs`,
 run on every guest TTBR0 install — `MCR p15,0,Rn,c2,c0,0`, trapped via
 `HCR_EL2.TVM`). It walks the guest's live L1 table and every coarse L2
 table it reaches, editing the descriptors *in place* in the ROM/RAM
@@ -124,14 +124,14 @@ backing the hypervisor owns:
   handler dispatches — semantics-preserving because nothing is mapped
   through them.
 
-**Per-PC inline stubs** (`shadow_stub.rs`). ARMv8 made `SWP`/`SWPB` and the
+**Per-PC inline stubs** (`src/newton/shadow_stub.rs`). ARMv8 made `SWP`/`SWPB` and the
 StrongARM FPA-class coprocessor ops UNDEFINED. Rather than trap-and-emulate
 every occurrence, the hypervisor installs short AArch32 stubs in a reserved
 window of the ROM aperture (`0x00E0_0000..0x00FF_FF00`) and rewrites the
 originating PC to `B stub`. The same module provides an APCS-conformant
 liveness walker (`live_regs_at`) so a stub can borrow dead caller-saved
 registers as scratch. "Real code" for this walker (and for the BE-8
-code/data discrimination, §6.2 / `guest_endian.rs`) is defined by the
+code/data discrimination, §6.2 / `src/hv/guest_endian.rs`) is defined by the
 classifier reach-bitmap baked in at build time from `tools/classify-rom`.
 
 **Domains.** DACR is always `0x00055555` (domains 0–7 = client, 8–15 = no-access), written 38 953 times with the same value — the kernel reinstalls DACR at every context-switch. A53 short-descriptor DACR semantics match; just pass the writes through.
@@ -317,7 +317,7 @@ All of these wanted verification against the actual ROM or hardware rather than 
 9. **RAM-size assumptions.** *Answered for 717006.* The `kHdWr_04RAMSize` path is honored with the configuration we present; full boot + builtin apps run. Other ROM variants unverified.
 10. **PCMCIA and modem runtime assumptions.** *Answered.* 2.x boots and runs with no card present and no modem; the PCMCIA peripheral surface reports empty slots.
 11. **Display geometry and depth.** *Answered.* Newton's 320×480 2 bpp framebuffer is hypervisor-side scaled (1.5× → 480×720, centred on a 1280×720 HDMI mode) on real hw; 1:1 in the host viewer on QEMU/FVP.
-12. **Self-modifying ROM code.** *Answered.* The ROM itself is not self-modifying, but the kernel demand-pages code into RAM and rewrites it; handled by stage-2 RO+X ↔ RW+XN flipping with rescan-on-fetch (`src/stage2.rs`, `src/shadow_stub.rs`).
+12. **Self-modifying ROM code.** *Answered.* The ROM itself is not self-modifying, but the kernel demand-pages code into RAM and rewrites it; handled by stage-2 RO+X ↔ RW+XN flipping with rescan-on-fetch (`src/hv/stage2.rs`, `src/newton/shadow_stub.rs`).
 13. **Licensing.** *Still open (decision, not finding).* The peripheral layer ports Einstein (GPLv2) state machines; confirm intended license for the hypervisor before any public release.
 14. **Input device for v1.** *Answered.* USB touchscreen (TSTP MTouch, `docs/MTOUCH.md`) on real hw; mouse-as-pen via the host viewer on QEMU/FVP.
 15. **Minimum viable v1.** *Achieved.* Pi Zero 2 W + 717006 ROM + HDMI panel with speakers + USB touch + SD card proves the architecture end-to-end.

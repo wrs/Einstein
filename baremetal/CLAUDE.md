@@ -65,6 +65,11 @@ docs/ARM_Reference.txt.
 try to resume from the newest valid slot; missing or mismatched
 files fall through to a cold boot.
 
+**Warning: resume is currently broken** (the guest wedges at the
+abort vector on resume) and slated for post-refactor
+fix-or-elimination; saves and the commands below still work, but
+cold-boot for reliable runs.
+
 ### Commands
 
 ```bash
@@ -242,7 +247,8 @@ saw in a log), skip the install: `bg <addr>` and `c` is enough.
   If `X` is missing, the fix lives in `tools/classify-rom/src/main.rs`
   (add a seeder for the structure that contains `X`), not in
   `src/hv/trap/`. After regenerating the bitmap with
-  `scripts/regen-classify.sh`, `scripts/dump-data-regions.py`
+  `scripts/regen-classify.sh [ver]` (default 717006; also refreshes
+  `code-symbols.txt`), `scripts/dump-data-regions.py`
   refreshes `code-regions.txt` so the same grep verifies the fix.
 - Every handler in `src/hv/trap/` / `src/peripherals/*` halts
   loudly on unknown inputs with a context dump. When a ROM boot
@@ -260,10 +266,12 @@ saw in a log), skip the install: `bg <addr>` and `c` is enough.
   isolation. A regression in handler code should show up as a
   failing test; run `guest-tests/scripts/run-all.sh` before
   committing.
-- **Feature-matrix build check.** `scripts/check-matrix.sh`
-  `cargo check`s every supported build combination (default;
-  `platform-fvp-base`; the four `pi-bare-metal*` aggregates;
-  `trace,quiet`; `host-io-semihost`; the `sd-probe` aggregate; the
+- **Feature-matrix build check.** `scripts/check-matrix.sh` first
+  runs the two structure lints (`check-layering.sh` import
+  discipline, `check-rom-addrs.sh` ROM-address containment), then
+  `cargo check`s all 17 supported build combinations (default,
+  no-diag variants, both platforms, `rom-710031`, the four
+  `pi-bare-metal*` aggregates, trace/probe/log combos, the
   guest-test cfg) in one shared target dir and prints a per-combo
   PASS/FAIL summary (~10 s warm). Run it after touching `build.rs`,
   feature gates, or any cfg-dispatched backend. It's also wired into
@@ -308,10 +316,12 @@ etc.).
 
 ### Mechanism (`src/diag/tracer.rs`)
 
-1. `build.rs` reads `scripts/classify-out/code-symbols.txt` (the
-   curated code-only symbol list produced by `classify-symbols.py`,
-   i.e. the same vetted list the shadow-stub classifier's walker
-   uses as its root set) and emits `fn_addrs.bin`,
+1. `build.rs` reads the selected ROM version's `code-symbols.txt`
+   (for 717006: `scripts/classify-out/code-symbols.txt`, unless a
+   `roms/717006/` override exists) — the curated code-only symbol
+   list produced by `classify-symbols.py`, i.e. the same vetted list
+   the shadow-stub classifier's walker
+   uses as its root set — and emits `fn_addrs.bin`,
    `fn_name_offs.bin`, `fn_names.bin` into OUT_DIR. The address list
    is trusted — no runtime prologue heuristic, no "does this word
    look like a function start" check.
@@ -371,7 +381,7 @@ the tracer's coverage in lock-step with shadow_stub's definition of
   `rewrite-skip` column at install time and left unpatched. The
   function still runs correctly; it just isn't traced.
 - Every call fires an HVC. On a long boot the trace volume can
-  saturate the mini-UART; lean on `quiet` and/or grep.
+  saturate the console UART; lean on `quiet` and/or grep.
 - *Don't* rely on your ability to handle exact ARM instruction encodings, always
   double check with the actual assembler/disassembler.
 

@@ -1,6 +1,6 @@
 @ HVC ABI constants — keep in lockstep with the
 @ `HvcImm::GuestTestPrintByte..GuestTestRepRender` block in
-@ src/hvc_imm.rs. The block is anchored at 0x10 there, so adding a
+@ src/hv/hvc_imm.rs. The block is anchored at 0x10 there, so adding a
 @ variant to the ABI requires bumping every literal here AND
 @ updating any test that issues the affected HVC by name.
 @

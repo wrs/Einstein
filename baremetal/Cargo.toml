@@ -55,7 +55,7 @@ diag = ["dep:newton-objects"]
 # Add a feature with `--features log_unaligned` or, alongside an
 # aggregate, `--no-default-features --features "pi-bare-metal-input
 # log_traps"`. log_traps/log_irqs/log_unaligned/log_host_io wrap
-# kprintln via the `log_*!` macros in `src/uart.rs`; log_mmu /
+# kprintln via the `log_*!` macros in `src/host/macros.rs`; log_mmu /
 # log_tasks / log_store gate whole diagnostic bodies via `#[cfg]`.
 #
 # Category coverage:
@@ -71,7 +71,7 @@ diag = ["dep:newton-objects"]
 #   log_irqs      — timer-IRQ heartbeat (ELR/SPSR/SP_svc/LR_svc
 #                   sampling) plus post-budget tablet NativeGetSample
 #                   entry/return logs.
-#   log_unaligned — `src/unaligned.rs` per-fault decode of every
+#   log_unaligned — `src/newton/unaligned.rs` per-fault decode of every
 #                   AArch32 unaligned LDR/STR fixup, including ROM-
 #                   patched ldrh/strh and ldrd targets.
 #   log_store     — StorePermObject entry + LoadPermObject return
@@ -108,7 +108,7 @@ platform-fvp-base = []
 # `cargo run` works) and `cargo run --features host-io-semihost`
 # switches without needing `--no-default-features`. Source code reads
 # `#[cfg(nh_host_io_*)]`, not the feature directly. See
-# `src/host_io/mod.rs`.
+# `src/host/host_io/mod.rs`.
 #
 #   host-io-null     — no display sink, no input source. Default;
 #                      used by guest-tests and CI runs.
@@ -121,7 +121,7 @@ host-io-null = []
 host-io-semihost = []
 # VC-framebuffer backend for the Pi Zero 2 W. Renders Newton's
 # 320x480 2 bpp framebuffer into the HDMI panel through the
-# allocator built in src/display/. See src/host_io/pi_fb.rs.
+# allocator built in src/display/. See src/host/host_io/pi_fb.rs.
 # Implies platform-raspi3b: the backend renders through
 # src/host/display, which only exists on that platform.
 host-io-pi-fb = ["platform-raspi3b"]
@@ -130,7 +130,7 @@ host-io-pi-fb = ["platform-raspi3b"]
 # enabled. If none are enabled, build.rs picks "semihost" (so a bare
 # `cargo run` persists flash across cold boots). `nh_guest_test` mode
 # always overrides to "null" for hermetic test runs. Source code reads
-# `#[cfg(nh_flash_persist_*)]`. See `src/flash_persist/mod.rs`.
+# `#[cfg(nh_flash_persist_*)]`. See `src/host/flash_persist/mod.rs`.
 #
 #   flash-persist-null     — no-op; flash is volatile.
 #   flash-persist-semihost — read/write `$HOME/.newton/flash.bin` via
@@ -139,7 +139,7 @@ flash-persist-null = []
 flash-persist-semihost = []
 # Real-hardware backend: persists GUEST_FLASH to NEWTON.BIN on the
 # FAT32 boot partition via the embedded-sdmmc + BCM2835 SDHOST stack
-# built up in src/sd. Selected by the `pi-bare-metal-sd` aggregate.
+# built up in src/host/sd. Selected by the `pi-bare-metal-sd` aggregate.
 # Implies platform-raspi3b: the backend drives the BCM2835 SDHOST
 # in src/host/sd, which only exists on that platform.
 flash-persist-sd = ["platform-raspi3b"]
@@ -148,7 +148,7 @@ flash-persist-sd = ["platform-raspi3b"]
 # none are enabled, build.rs picks "null" (no input source; QEMU/FVP
 # get their pen events through the host_io-semihost backend, which
 # is independent of this axis). Source code reads
-# `#[cfg(nh_input_*)]`. See `src/input/mod.rs`.
+# `#[cfg(nh_input_*)]`. See `src/host/input/mod.rs`.
 #
 #   input-null   — no pen source. Default; QEMU/FVP routes input
 #                  through host_io-semihost; real-hw builds without
@@ -162,7 +162,7 @@ input-mtouch = []
 
 # Host audio backend. Opt-in only — at most one may be enabled. If
 # none are enabled, build.rs picks "null" (no host audio output).
-# Source code reads `#[cfg(nh_audio_*)]`. See `src/audio/mod.rs`.
+# Source code reads `#[cfg(nh_audio_*)]`. See `src/host/audio/mod.rs`.
 #
 #   audio-null    — no host audio output. Default; QEMU/FVP and any
 #                   real-hw build that doesn't include the HDMI
@@ -246,7 +246,7 @@ pi-bare-metal-input = [
 # immediately after MMU + vectors are up, runs the BCM2835 SDHOST
 # driver against the micro-SD slot (CMD0/CMD8/ACMD41/CMD2/CMD3/CMD9/
 # CMD7), reads sector 0, dumps the MBR signature + partition table,
-# and halts. Intended as the first-light test for src/sd; no other
+# and halts. Intended as the first-light test for src/host/sd; no other
 # boot state runs after the probe, so the serial output reflects
 # just SDHOST behaviour.
 #
@@ -277,7 +277,7 @@ fb-probe = []
 # tables it consults are staged by build.rs whenever `diag` is on
 # (they also back PC→name lookup in halt-path stack traces); this
 # feature only turns on the trampoline install in `tracer::init`. See the module doc
-# in `src/tracer.rs`. Off by default because the install mutates many
+# in `src/diag/tracer.rs`. Off by default because the install mutates many
 # ROM words, which changes the snapshot ROM fingerprint and forces a
 # cold boot. Requires `diag` for the symbol tables the trampoline
 # install consults.
@@ -330,7 +330,7 @@ ns_trace = []
 newton-objects = { path = "newton-objects", optional = true }
 # FAT12/16/32 read+write for the Pi Zero 2 W's SD-card boot partition.
 # no_std, no_alloc, statically sized (defaults: 4 dirs / 4 files / 1
-# volume); see src/sd for the BCM2835 SDHOST block-device shim. Only
+# volume); see src/host/sd for the BCM2835 SDHOST block-device shim. Only
 # referenced from #[cfg(feature = "platform-raspi3b")] code, but Cargo
 # can't conditionally pull deps the way it gates `mod`s, so this
 # compiles on every target. The crate itself is no_std-compatible.

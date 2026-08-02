@@ -29,8 +29,7 @@ use std::path::{Path, PathBuf};
 fn main() {
     println!("cargo:rerun-if-env-changed=NH_GUEST_TEST");
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=linker.ld");
-    println!("cargo:rerun-if-changed=linker-fvp.ld");
+    println!("cargo:rerun-if-changed=linker.ld.in");
 
     // Tell rustc that `nh_guest_test` is a known cfg so it doesn't warn.
     println!("cargo:rustc-check-cfg=cfg(nh_guest_test)");
@@ -393,10 +392,14 @@ fn parse_ppm_p6(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
     }
 }
 
-/// Select the linker script based on the platform-* feature. Panics if
-/// zero or multiple platform features are enabled (they are mutually
-/// exclusive — they fix the load address, MMIO addresses, and UART base
-/// into the image). The `.cargo/config.toml` deliberately doesn't set
+/// Instantiate `linker.ld.in` for the selected platform-* feature and
+/// link against the result. The platforms share one section layout and
+/// differ only in the load address, so the template carries a single
+/// `@IMAGE_BASE@` placeholder that is substituted here and the resolved
+/// script written to `OUT_DIR/linker.ld`. Panics if zero or multiple
+/// platform features are enabled (they are mutually exclusive — they
+/// fix the load address, MMIO addresses, and UART base into the
+/// image). The `.cargo/config.toml` deliberately doesn't set
 /// `-Tlinker.ld` so this is the single source of truth.
 fn select_platform_linker_script() {
     // Skip linker-script selection when building for a host target
@@ -411,9 +414,9 @@ fn select_platform_linker_script() {
     let raspi3b = env::var("CARGO_FEATURE_PLATFORM_RASPI3B").is_ok();
     let fvp_base = env::var("CARGO_FEATURE_PLATFORM_FVP_BASE").is_ok();
 
-    let script = match (raspi3b, fvp_base) {
-        (true, false) => "linker.ld",
-        (false, true) => "linker-fvp.ld",
+    let image_base = match (raspi3b, fvp_base) {
+        (true, false) => "0x80000",
+        (false, true) => "0x80000000",
         (false, false) => panic!(
             "no platform selected: enable exactly one of \
              --features platform-raspi3b or --features platform-fvp-base"
@@ -422,7 +425,19 @@ fn select_platform_linker_script() {
             "platform-raspi3b and platform-fvp-base are mutually exclusive"
         ),
     };
-    println!("cargo:rustc-link-arg=-T{script}");
+
+    let template = fs::read_to_string("linker.ld.in")
+        .unwrap_or_else(|e| panic!("read linker.ld.in: {e}"));
+    if !template.contains("@IMAGE_BASE@") {
+        panic!("linker.ld.in has no @IMAGE_BASE@ placeholder");
+    }
+    let script = template.replace("@IMAGE_BASE@", image_base);
+
+    let out_dir = env::var("OUT_DIR").expect("OUT_DIR");
+    let script_path = Path::new(&out_dir).join("linker.ld");
+    fs::write(&script_path, script)
+        .unwrap_or_else(|e| panic!("write {:?}: {e}", script_path));
+    println!("cargo:rustc-link-arg=-T{}", script_path.display());
 }
 
 // Cross-axis feature constraints are expressed as Cargo feature
@@ -600,9 +615,10 @@ fn build_trace_tables(ver: &RomVersion) {
         println!(
             "cargo:warning=nh-baremetal: rom-{}: no code-symbols.txt at {} — \
              emitting empty symbol tables (hex-only backtraces; tracer inert). \
-             Run baremetal/scripts/regen-classify.sh to generate it.",
+             Run baremetal/scripts/regen-classify.sh {} to generate it.",
             ver.tag,
-            sym_path.display()
+            sym_path.display(),
+            ver.tag
         );
         let out_dir = env::var("OUT_DIR").expect("OUT_DIR");
         let out = Path::new(&out_dir);
@@ -758,9 +774,10 @@ fn build_classify_bitmap(ver: &RomVersion) {
     if !reach_bitmap_path.is_file() {
         panic!(
             "classify: reach.bitmap for rom-{} ROM+REX hash {hash_hex} not found at {}. \
-             Run baremetal/scripts/regen-classify.sh to generate it.",
+             Run baremetal/scripts/regen-classify.sh {} to generate it.",
             ver.tag,
-            reach_bitmap_path.display()
+            reach_bitmap_path.display(),
+            ver.tag
         );
     }
 

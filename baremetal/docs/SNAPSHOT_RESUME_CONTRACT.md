@@ -4,11 +4,11 @@ What a snapshot save/load round-trip restores, and — more importantly
 — which guest-visible state it deliberately does **not** restore, with
 the reason reset-on-resume is safe for each. This is the companion to
 the workflow notes in `CLAUDE.md` (§Snapshot / resume workflow) and the
-field-level layout documented in `src/snapshot.rs`.
+field-level layout documented in `src/hv/snapshot.rs`.
 
 ## What is saved
 
-`src/snapshot.rs` serializes, per slot:
+`src/hv/snapshot.rs` serializes, per slot:
 
 - **Three memory regions**, in the order the region manifest
   (`src/hv/layout.rs`) lists them as snapshotted: `GUEST_RAM`
@@ -24,7 +24,7 @@ field-level layout documented in `src/snapshot.rs`.
   `TPIDRRO_EL0`) the trampoline stubs stash through.
 
 Persistent flash is **not** in the file — it lives in
-`$HOME/.newton/flash.bin` (`src/flash_persist/`). The header carries an
+`$HOME/.newton/flash.bin` (`src/host/flash_persist/`). The header carries an
 FNV-1a fingerprint of `GUEST_FLASH` at save time; on resume a mismatch
 forces a cold boot rather than risk resuming CPU state against diverged
 flash.

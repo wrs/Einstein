@@ -8,26 +8,35 @@ hypervisor to report success or failure, and halts.
 These are integration tests: they verify that when the guest does the
 same MMIO access patterns the Newton kernel does, the hypervisor
 correctly routes them to the right peripheral and returns the right
-value. They complement the C++ host tests in `baremetal/cxx-core/tests`
-(which test the peripheral class in isolation) — we run both to
-distinguish "the peripheral is broken" from "the FFI / MMIO dispatch is
-broken."
+value — the full EL2 trap path → MMIO dispatcher → peripheral model →
+return value into the guest's register.
 
 ## HVC protocol (guest → hypervisor)
 
 A test reports its progress via `HVC #imm`; `r0` carries a value if
-relevant.
+relevant. The immediates live in `common/hvc_abi.S`, kept in lockstep
+with the `HvcImm` enum in `src/hv/hvc_imm.rs` (the guest-test block is
+anchored at 0x10 there).
 
-| imm   | meaning                           | `r0`                 |
-|-------|-----------------------------------|----------------------|
-| 0x01  | print one ASCII byte              | char                 |
-| 0x02  | print a 32-bit hex word           | value                |
-| 0x03  | pass — exit hypervisor OK         | (ignored)            |
-| 0x04  | fail — exit hypervisor nonzero    | error code / line no |
-| 0x05  | mark — print `"mark %08x\n"`      | marker value         |
+| imm   | name              | meaning                                     | `r0`                 |
+|-------|-------------------|---------------------------------------------|----------------------|
+| 0x10  | HVC_PRINT_BYTE    | print one ASCII byte                        | char                 |
+| 0x11  | HVC_PRINT_HEX     | print a 32-bit hex word                     | value                |
+| 0x12  | HVC_PASS          | pass — exit hypervisor OK                   | code                 |
+| 0x13  | HVC_FAIL          | fail — exit hypervisor nonzero              | error code / line no |
+| 0x14  | HVC_MARK          | mark — print `"mark %08x\n"`                | marker value         |
+| 0x15  | HVC_GPIO_TRIGGER  | raise `vic::INT_GPIO` (IRQ-delivery test)   | (ignored)            |
+| 0x16  | HVC_UND           | `handle_und` entry (UND-trampoline tag)     | (trampoline state)   |
+| 0x17  | HVC_ALIGN         | alignment-fixup entry (EL2 emulates rotate) | (stub state)         |
+| 0x18  | HVC_SNAPSHOT      | save the rolling guest-state snapshot       | (ignored)            |
+| 0x19  | HVC_DEBUG_STR     | `DebugStr` trap — log guest string          | string address       |
+| 0x1A  | HVC_DEBUGGER      | `Debugger` trap — log site                  | (ignored)            |
+| 0x1B  | HVC_INJECT_PEN    | inject a pen sample into `host_io::queue`   | packed sample (r1 = ticks) |
+| 0x1C  | HVC_REP_RENDER    | render a REP format string into a buffer    | fmt ptr (r1 = out buf) |
 
 The hypervisor in "guest-test mode" prints HVC output to its UART and
-halts on 0x03 / 0x04 so QEMU exits with a distinguishable message.
+halts on HVC_PASS / HVC_FAIL so QEMU exits with a distinguishable
+message.
 
 ## Test image layout
 
@@ -41,9 +50,12 @@ Newton convention (they're unused by most tests; typical content is
 
 ```
 scripts/build-tests.sh          # cross-builds all tests/*.S -> *.bin
-scripts/run-test.sh test_hello  # embeds test_hello.bin into a hypervisor
-                                # build and runs under QEMU; asserts HVC
-                                # 0x03 fires.
+scripts/run-test.sh test_hello  # builds the hypervisor in guest-test
+                                # mode, loads test_hello.bin via
+                                # semihosting, runs under QEMU; asserts
+                                # HVC_PASS fires.
+scripts/run-all.sh              # every MANIFEST test (38); use
+                                # --platform fvp for the FVP host.
 ```
 
 Each test is a single `.S` file with a header comment describing what
@@ -53,19 +65,17 @@ it checks. To add a test:
 2. Add its name to `tests/MANIFEST`.
 3. `scripts/build-tests.sh` picks it up.
 
-No linker script today — tests are built with `-Ttext=0 -N` and
-stripped to flat binary.
+Tests link against `common/linker.ld` (text at 0) and are stripped to
+flat binary; most pull in `common/test_runtime.S` for the vector table
+and the HVC helper macros.
 
-## Why both tiers?
+## Where these fit
 
-- Host tests (`baremetal/cxx-core/tests`) run the peripheral C++ code
-  in a friendly x86-64 environment. Fast feedback on shim correctness,
-  C ABI contracts, and algorithmic behaviour.
-- Guest tests (this directory) validate that when everything is
-  assembled on bare metal — EL2 trap path → Rust MMIO dispatcher →
-  C-ABI shim → C++ peripheral → shim → return value to guest — the
-  right value shows up in the guest's register.
-
-If the host test passes and the guest test fails, the bug is somewhere
-in the EL2 / dispatch / FFI layer. If both fail, it's in the peripheral
-C++.
+Guest tests are the behavioural tier of the verification stack: they
+run the production trap/dispatch/peripheral code end-to-end, one
+handler surface at a time, without needing the Newton ROM. The
+structural tiers — `scripts/check-matrix.sh` (feature-combination
+builds plus the check-layering / check-rom-addrs lints) and
+`scripts/boot-check.sh` (full ROM boot to a known marker) — live in
+`baremetal/scripts/`. **Every commit must pass
+`guest-tests/scripts/run-all.sh`.**

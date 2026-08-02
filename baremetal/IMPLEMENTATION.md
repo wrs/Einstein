@@ -45,7 +45,7 @@ We tried. See `cxx-core/` at commit `26c1816` (now removed):
 
 ### 1.3 Peripheral ports — where they live
 
-Each peripheral is one Rust module under `src/peripherals/`. State-machine code is platform-neutral and separated from the MMIO trap glue in `src/mmio.rs`. Where a peripheral has logic worth unit-testing in isolation, `#[cfg(test)]` host-side tests sit alongside the module — but the dominant test tier is the AArch32 guest-test suite in `guest-tests/`, which exercises the full hypervisor stack against the same handlers the ROM hits.
+Each peripheral is one Rust module under `src/peripherals/`. State-machine code is platform-neutral and separated from the MMIO routing in `src/hv/mmio.rs`. The test tier is the AArch32 guest-test suite in `guest-tests/`, which exercises the full hypervisor stack against the same handlers the ROM hits.
 
 ### 1.4 Concrete scope from the probe runs
 
@@ -104,42 +104,48 @@ to the build / language / structural shape.
 Cargo.toml             # crate manifest (no_std, panic=abort)
 Cargo.lock
 rust-toolchain.toml    # pinned toolchain + target
-build.rs               # platform select, classify-bitmap stage,
-                       # symbol blob (NH_GUEST_TEST embeds a test image)
+build.rs               # platform + ROM-version resolution, linker-script
+                       # templating, classify-bitmap stage, symbol blob
+                       # (NH_GUEST_TEST switches to guest-test mode)
 .cargo/config.toml     # target, rustflags, cargo-run runner
-linker.ld              # raspi3b image layout
-linker-fvp.ld          # FVP-base image layout
+linker.ld.in           # image-layout template; build.rs substitutes the
+                       # per-platform load address into OUT_DIR/linker.ld
 scripts/
   run-qemu.sh          # cargo runner: ELF → kernel8.img → QEMU
   fvp                  # cargo-runner-equivalent for FVP (dockerised)
+  check-matrix.sh      # cargo-check all feature combos + the two lints
+  check-layering.sh    # import-discipline lint for the src/ layers
+  check-rom-addrs.sh   # ROM-address containment lint (rom_ver/)
   classify-symbols.py  # ROM symbol partitioner (code/data/drop)
-  regen-classify.sh    # one-stop bitmap regeneration
+  regen-classify.sh    # code-symbols.txt + reach.bitmap regeneration
   gdb-init             # gdb helpers (bg, bp, tt, guest-state, …)
-src/
-  main.rs              # no_std entry, kmain, ERET handoff
-  boot.s               # _start: park non-zero cores, SP, bss, call kmain
-  vectors.s            # EL2 vector table + context save/restore
-  cpu.rs / uart.rs / panic.rs / mmu.rs   bring-up; PL011 routed to
-                                         guest extr-port DMA, kprintln
-                                         goes through semihosting
-  stage2.rs            # guest-physical stage-2 tables
-  guest_mem.rs         # ROM / RAM / flash / framebuffer + load-time
-                       # selective byteswap (consumes reach.bitmap)
-  guest_endian.rs      # EL2 byteswap helpers for guest data accesses
-  guest.rs             # ERET to AArch32 EL1
-  trap.rs              # sync-trap dispatch, CP15 shim, HVC table, IRQ
-  mmio.rs              # IPA → peripheral routing
-  banked.rs            # AArch32 banked-reg access from EL2
-  rom_patches.rs       # word-write patches; HVC injection helpers
-  shadow_stub.rs       # in-ROM stub-pool + per-stub scratch-pool
-  unaligned.rs         # alignment-fault rotate-LDR emulator
-  unaligned_inline.rs  # lazy inline-stub fast path for unaligned LDR
-  snapshot.rs          # rolling 4-slot snapshot ring
-  tracer.rs            # function-level tracer (--features trace)
-  guest_bp.rs          # one-shot guest software BPs (gdb 'bp')
-  task_dump.rs         # TScheduler / TTask walker
-  peripherals/         # Rust ports of Einstein's peripherals
-  platform/            # raspi3b / FVP_Base host glue + GICv3 (FVP)
+src/                   # one crate, six layer directories; import
+                       # direction low→high: arch ← hv ← newton (see
+                       # scripts/check-layering.sh for the full rules)
+  main.rs              # no_std entry, kmain boot narrative, ERET handoff
+  panic.rs             # panic handler → loud halt
+  arch/                # AArch64/AArch32 mechanism: boot.s, vectors.s,
+                       # trap_context, mmu, cpu, banked, arm_decode,
+                       # aarch32_emit, slim_isr
+  hv/                  # generic hypervisor core: stage2, guest,
+                       # guest_mem, guest_endian, be8, layout (single
+                       # region/MMIO-window manifest), mmio router,
+                       # timer, snapshot, hvc_imm, hooks (GuestOs
+                       # seam), trap/{mod,dabt,und,cp15,hvc}
+  newton/              # Newton-specific: os (GuestOs impls), loader
+                       # (ROM load + selective byteswap, consumes
+                       # reach.bitmap), rom_patches, probes,
+                       # shadow_stub, guest_trampolines,
+                       # unaligned[_inline], rom_ver/ (per-version
+                       # constants: r717006, r710031 skeleton)
+  peripherals/         # Rust ports of Einstein's peripheral models
+  host/                # host drivers + backends: console/macros,
+                       # platform/ (raspi3b, fvp_base, gicv3), mailbox,
+                       # host_dma, sd/, usb/, display/, audio/, input/,
+                       # host_io/, flash_persist/
+  diag/                # diagnostics layer (feature `diag`): trap_diag,
+                       # trap_hist, task_dump, heap_check, rep_print,
+                       # symbols, guest_bp, tracer, tarmac
 docs/
   peripherals.md       # peripheral spec + Einstein cross-references
   DISASM.md / NEWTON_INTERNALS.md / STRUCTURES.md / WORKFLOW.md
@@ -261,7 +267,7 @@ impl State {
 }
 ```
 
-The MMIO dispatcher in `src/mmio.rs` routes the IPA + size +
+The MMIO dispatcher in `src/hv/mmio.rs` routes the IPA + size +
 value to the right peripheral's `read` / `write`. No FFI, no opaque
 handles — the Rust type system is the contract.
 
@@ -281,61 +287,69 @@ with a host-platform select at compile time:
   `platform-raspi3b` / `platform-fvp-base` mutually-exclusive
   features. The AArch32 guest ISA and the simulated Newton
   hardware are unaffected.
-- `build.rs` does three things at compile time:
-  (1) selects the linker script for the chosen platform;
-  (2) stages the per-ROM-hash `reach.bitmap` from
-  `classify/<hash>/` into `OUT_DIR` so `guest_mem` can
+- `build.rs` does four things at compile time:
+  (1) instantiates `linker.ld.in` with the chosen platform's load
+  address and links against the result in `OUT_DIR`;
+  (2) resolves the `rom-*` feature to its build inputs (ROM/REx
+  paths, symbol tables, flash filename) via `resolve_rom_version()`;
+  (3) stages the per-ROM-hash `reach.bitmap` from
+  `classify/<hash>/` into `OUT_DIR` so the loader can
   `include_bytes!` it;
-  (3) reads `NH_GUEST_TEST` and, if set, embeds the named AArch32
-  guest-test binary instead of the Newton ROM (the
-  `guest-tests/` framework drives this).
+  (4) reads `NH_GUEST_TEST` and, if set, builds in guest-test mode
+  (the test binary is semihost-loaded, or embedded when the var
+  names a path) instead of booting the Newton ROM.
 
 No CMake, no external C toolchain, no linker gymnastics. Output:
 a single flat `kernel8.img` plus an ELF with DWARF for gdb.
 
 ## 6. Testing strategy
 
-Two tiers, both run on every commit that touches hypervisor code:
+Two tiers — behavioural (guest tests) and structural (build-matrix
+plus lints) — with the ROM boot itself as the end-to-end canary:
 
-### 6.1 Host-side unit tests
+### 6.1 Structural tier: check-matrix + lints
 
-Logic that doesn't touch hardware (encoders, liveness analyser,
-stage-2 table builder fragments, peripheral state-machines with
-`#[cfg(test)]` modules) is compiled for the host target and tested
-with `cargo test`. Bound by `#[cfg]` gating to exclude `no_std`
-panics and CPU intrinsics from the host build.
+`scripts/check-matrix.sh` runs `cargo check` over every supported
+feature combination (platforms, real-hw aggregates, trace, probes,
+guest-test cfg) in a shared target dir, after first running the two
+structure lints: `scripts/check-layering.sh` (import discipline
+between the six `src/` layer directories) and
+`scripts/check-rom-addrs.sh` (ROM-space hex literals confined to
+`src/newton/rom_ver/` + allowlist). There is no host-side
+`cargo test` tier — all runtime verification happens in the guest
+tests and the ROM boot.
 
 ### 6.2 Guest-test tier
 
-`guest-tests/` holds 35 small AArch32 binaries linked against a
+`guest-tests/` holds 38 small AArch32 binaries linked against a
 shared runtime (`common/test_runtime.S`) that sets up SVC / IRQ /
 FIQ stacks, installs an IRQ handler, and exposes an HVC protocol
-the hypervisor understands (`HVC #1` putchar, `HVC #3` PASS, `HVC
-#4` FAIL, `HVC #5` mark). The hypervisor is built with
-`NH_GUEST_TEST=<bin>` set; guest memory is populated with the test
-instead of the ROM. Each test exercises one trap path or
-peripheral surface and reports pass/fail on the mini-UART.
+the hypervisor understands (`HVC #0x10` putchar, `HVC #0x12` PASS,
+`HVC #0x13` FAIL, `HVC #0x14` mark; see `guest-tests/README.md`).
+The hypervisor is built with `NH_GUEST_TEST` set; guest memory is
+populated with the test instead of the ROM. Each test exercises one
+trap path or peripheral surface and reports pass/fail on the UART.
 
 ```
 guest-tests/scripts/build-tests.sh                # build everything
 guest-tests/scripts/run-test.sh test_vic          # one test
-guest-tests/scripts/run-all.sh                    # all 35 on QEMU
-guest-tests/scripts/run-all.sh --platform fvp     # all 35 on FVP
+guest-tests/scripts/run-all.sh                    # all 38 on QEMU
+guest-tests/scripts/run-all.sh --platform fvp     # all 38 on FVP
 ```
 
-Both QEMU and FVP must stay green on every commit. (Phase-B probe
-iterations that touch only `src/rom_patches.rs` and the dispatch
-in `src/trap.rs` can skip the run — see `CLAUDE.md`.)
+Both QEMU and FVP must stay green on every commit. (Probe
+iterations that touch only `src/newton/rom_patches.rs`,
+`src/hv/trap/hvc.rs`, and `src/newton/probes.rs` can skip the
+run — see `CLAUDE.md`.)
 
-### 6.3 Phase-B ROM-boot canary
+### 6.3 ROM-boot canary
 
 The Newton ROM boot itself acts as a regression target: the
-hypervisor must reach the current Phase-B ceiling (see
-[`PLAN.md`](./PLAN.md)) without an unexpected fault. The snapshot
-ring at `/tmp/newton-snapshot-{0..3}.bin` makes this iteration loop
-fast — edit hypervisor code, `cargo run --release`, and the loader
-ERETs back into the failure point in the time it takes to read
-~14 MiB.
+hypervisor must reach the current boot ceiling (see
+[`PLAN.md`](./PLAN.md)) without an unexpected fault.
+`scripts/boot-check.sh` automates the check — it boots the ROM
+under QEMU and kills it once the expected milestone marker appears
+in the log (`--cold` clears snapshots first for a full cold boot).
 
 ### 6.4 What isn't testable without hardware
 
@@ -520,7 +534,7 @@ as a record of how each was answered.
 4. **Static stacks.** Resolved: sizes set in `boot.s` per
    exception level / per core; no panics from exhaustion to
    date.
-5. **MMU-on handoff.** Resolved: `src/mmu.rs` identity-maps the
+5. **MMU-on handoff.** Resolved: `src/arch/mmu.rs` identity-maps the
    currently-executing code region before enabling stage-1 at
    EL2.
 6. **Build reproducibility.** `rust-toolchain.toml` is pinned;

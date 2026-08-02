@@ -14,7 +14,7 @@ Bloated PLAN.md wastes context every read.
   the table (2026-04-29). The fix MUST be a kernel patch.
 - Run the *original ROM code*; no workarounds, no deferrals, no
   shortcuts; fix all warnings before each commit.
-- All 37 guest tests must pass on every commit that touches hypervisor
+- All 38 guest tests must pass on every commit that touches hypervisor
   functionality (not merely diagnostics):
   (`baremetal/guest-tests/scripts/run-all.sh`).
 
@@ -22,7 +22,7 @@ Bloated PLAN.md wastes context every read.
 717006 ROM boots to the Welcome UI and the builtin apps work
 interactively — on QEMU raspi3b, on ARM FVP, and on a real
 Pi Zero 2 W with HDMI display, USB touch, HDMI audio, and SD-backed
-flash persistence (non-blocking DMA autosave). All 37 guest tests are
+flash persistence (non-blocking DMA autosave). All 38 guest tests are
 green. The Phase-B debugging diary that used to live here (stack-VM
 patches, ResolveFault wrapper, matcher-mismatch hunts) is archived in
 git history; the durable findings are in `docs/STRUCTURES.md` and
@@ -64,9 +64,9 @@ git history; the durable findings are in `docs/STRUCTURES.md` and
 3. Cross-reference with Einstein (`build/NewtonProbe baremetal/roms/
    newton.rom _Data_/Einstein.rex 30`) so we have a known-good oracle.
 4. Decide where the fix belongs:
-   - **Hypervisor handler gap** — `src/peripherals/*.rs`, `src/trap/`.
+   - **Hypervisor handler gap** — `src/peripherals/*.rs`, `src/hv/trap/`.
    - **Einstein behavioural quirk** — port the matching logic.
-   - **ROM patch** — `src/rom_patches.rs`. Only when no other layer can
+   - **ROM patch** — `src/newton/rom_patches.rs`. Only when no other layer can
      host the fix.
 5. Re-run, confirm the wedge is gone, repeat for the next stop.
 
@@ -125,42 +125,42 @@ git history; the durable findings are in `docs/STRUCTURES.md` and
 
 ### Tests
 
-`baremetal/guest-tests/scripts/run-all.sh` runs the 37 guest tests on
+`baremetal/guest-tests/scripts/run-all.sh` runs the 38 guest tests on
 QEMU; `--platform fvp` on the FVP. Both must stay green. Set
-`CHECK_MATRIX=1` to also run `scripts/check-matrix.sh` (10 feature
-combos) at the top of the run.
+`CHECK_MATRIX=1` to also run `scripts/check-matrix.sh` (17 feature
+combos + the layering/rom-addr lints) at the top of the run.
 
 ## Critical files
 
-- `src/guest_mem.rs` — ROM load + byteswap; `fix_stage1_xn_bits`
+- `src/newton/loader.rs` — ROM load + byteswap; `src/newton/os.rs` — `fix_stage1_xn_bits`
   flattens ARMv4 subpage-AP to AP=011, clears XN, rewrites fine-table
   L1 placeholders to fault; CP15-encoding rewrites.
-- `src/guest_trampolines.rs` — UND/DABT/PABT vector trampolines + the
+- `src/newton/guest_trampolines.rs` — UND/DABT/PABT vector trampolines + the
   hypervisor-code range predicate.
-- `src/guest_regions.rs` — the single region manifest (ipa/size/
+- `src/hv/layout.rs` — the single region manifest (ipa/size/
   host_pa/perms/snapshot) driving stage2, host_addr_for, and snapshot.
-- `src/trap/` — `mod.rs` (sync-trap + IRQ dispatch, same-EL slim ISR),
+- `src/hv/trap/` — `mod.rs` (sync-trap + IRQ dispatch, same-EL slim ISR),
   `dabt.rs` (`handle_data_abort` with kernel-DABT forwarding for lazy
   stack growth), `und.rs`, `cp15.rs` (CP15 shim), `hvc.rs` (tag
-  dispatch); `src/probes.rs` for the Newton-ROM probe handler bodies.
-- `src/host_dma.rs` — host-side BCM2835 DMA driver (UART TX, MAI, SD).
-- `src/guest.rs` — HCR_EL2 (TVM, TIDCP, TSW, TPC, TPU, IMO, FMO, AMO,
+  dispatch); `src/newton/probes.rs` for the Newton-ROM probe handler bodies.
+- `src/host/host_dma.rs` — host-side BCM2835 DMA driver (UART TX, MAI, SD).
+- `src/hv/guest.rs` — HCR_EL2 (TVM, TIDCP, TSW, TPC, TPU, IMO, FMO, AMO,
   DC); CPTR_EL2.TFP for CP10/11.
-- `src/stage2.rs` — stage-2 L1/L2/L3.
-- `src/banked.rs` — AArch32 banked-register access from EL2 (Table
+- `src/hv/stage2.rs` — stage-2 L1/L2/L3.
+- `src/arch/banked.rs` — AArch32 banked-register access from EL2 (Table
   D1-79).
-- `src/rom_patches.rs` — Einstein word-write patches; HVC injection
+- `src/newton/rom_patches.rs` — Einstein word-write patches; HVC injection
   helpers; canaries; ResolveFault wrapper.
 - `src/peripherals/*` — Newton driver / native-primitive surface.
-- `src/snapshot.rs` — rolling ring under `/tmp/newton-snapshot-*.bin`.
-- `src/flash_persist/` + `src/sd/` — SD-backed flash persistence with
+- `src/hv/snapshot.rs` — rolling ring under `/tmp/newton-snapshot-*.bin`.
+- `src/host/flash_persist/` + `src/host/sd/` — SD-backed flash persistence with
   DMA autosave (`docs/SD_DMA_AUTOSAVE.md`).
-- `src/usb/` + `src/input/` — DWC2 USB host + MTouch pen input.
-- `src/audio/` — VC4 HDMI MAI sound output.
-- `src/tracer.rs` — function-level tracer.
-- `src/guest_bp.rs` — `bp <addr>` for the gdb workflow.
-- `src/task_dump.rs` — `TScheduler` / `TTask` dumps from EL2.
-- `guest-tests/tests/` — 37 tests; `guest-tests/scripts/run-all.sh`.
+- `src/host/usb/` + `src/host/input/` — DWC2 USB host + MTouch pen input.
+- `src/host/audio/` — VC4 HDMI MAI sound output.
+- `src/diag/tracer.rs` — function-level tracer.
+- `src/diag/guest_bp.rs` — `bp <addr>` for the gdb workflow.
+- `src/diag/task_dump.rs` — `TScheduler` / `TTask` dumps from EL2.
+- `guest-tests/tests/` — 38 tests; `guest-tests/scripts/run-all.sh`.
 
 ## Verification
 
@@ -170,7 +170,7 @@ Every commit:
 baremetal/guest-tests/scripts/run-all.sh
 ```
 
-All 37 tests must pass.
+All 38 tests must pass.
 
 ## Non-goals
 

@@ -1,9 +1,10 @@
 @ tests/test_hello.S
 @
 @ Smoke test for the guest-side test framework itself. Prints "HELLO\n"
-@ one byte at a time via HVC #1, then HVC #2 prints a hex word, then
-@ HVC #3 signals pass. If the hypervisor reports "guest test PASSED",
-@ the HVC trap path + test-image loader are working.
+@ one byte at a time via HVC_PRINT_BYTE, then HVC_PRINT_HEX prints a
+@ hex word, then HVC_PASS signals pass. If the hypervisor reports
+@ "guest test PASSED", the HVC trap path + test-image loader are
+@ working.
 
 #include "../common/test_runtime.S"
 

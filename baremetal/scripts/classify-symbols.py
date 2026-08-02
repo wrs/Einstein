@@ -40,14 +40,15 @@ ROM_APERTURE = 0x0100_0000  # 16 MiB ROM+REX aperture
 OUT_DIR = SCRIPT_DIR / "classify-out"
 
 
-def load_rom_words() -> list[int | None]:
+def load_rom_words(rom_path: Path = ROM_PATH,
+                   rex_path: Path = REX_PATH) -> list[int | None]:
     """Return 16 MiB ROM aperture as a word array (None = unmapped)."""
     words: list[int | None] = [None] * (ROM_APERTURE // 4)
-    rom = ROM_PATH.read_bytes()
+    rom = rom_path.read_bytes()
     for i in range(len(rom) // 4):
         # MSB-first on disk → LE word the guest reads.
         words[i] = struct.unpack(">I", rom[i*4 : i*4+4])[0]
-    rex = REX_PATH.read_bytes()
+    rex = rex_path.read_bytes()
     rex_base = REX_PA_OFFSET // 4
     for i in range(len(rex) // 4):
         words[rex_base + i] = struct.unpack(">I", rex[i*4 : i*4+4])[0]
@@ -348,13 +349,20 @@ def main() -> int:
                     help="dump this bucket to stdout instead of writing files")
     ap.add_argument("--symbols", default=str(SYMBOLS_PATH),
                     help="path to demangled_symbols.txt")
+    ap.add_argument("--rom", default=str(ROM_PATH),
+                    help="path to the ROM image")
+    ap.add_argument("--rex", default=str(REX_PATH),
+                    help="path to the REx image")
+    ap.add_argument("--code-symbols-out", default=str(OUT_DIR / "code-symbols.txt"),
+                    help="where to write the curated code-only list "
+                         "(build.rs symbol-table / tracer input)")
     args = ap.parse_args()
 
     syms = load_symbols(Path(args.symbols))
     if not syms:
         print(f"no symbols loaded from {args.symbols}", file=sys.stderr)
         return 1
-    words = load_rom_words()
+    words = load_rom_words(Path(args.rom), Path(args.rex))
 
     buckets: dict[str, list[tuple[int, str, str]]] = {
         "code": [], "data": [], "uncertain": [], "drop": [],
@@ -380,7 +388,8 @@ def main() -> int:
         # _Data_/demangled_symbols.txt so classify-rom can consume
         # it directly via --symbols. Keeps classify-rom's root
         # selection out of the symbol-classification business.
-        code_syms_path = OUT_DIR / "code-symbols.txt"
+        code_syms_path = Path(args.code_symbols_out)
+        code_syms_path.parent.mkdir(parents=True, exist_ok=True)
         with code_syms_path.open("w") as f:
             for addr, name, _ in buckets["code"]:
                 f.write(f"0x{addr:08X}\t{name}\n")
@@ -407,6 +416,7 @@ def main() -> int:
 
     if not args.summary:
         print(f"\nwrote {OUT_DIR}/{{code,data,uncertain,drop}}.txt")
+        print(f"wrote {args.code_symbols_out}")
         if buckets["uncertain"]:
             print("\nfirst 30 uncertain (propose rules for these):")
             for addr, name, _ in buckets["uncertain"][:30]:

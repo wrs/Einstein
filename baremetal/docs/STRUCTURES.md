@@ -381,7 +381,7 @@ bl  Add__17TDoubleQContainerFPv
 the caller is willing to block, it adds the receiver-msg to +0x24.
 
 **Identifying who is blocked on a port:** walk `port+0x24` (or use
-`walk_dqc` in `src/task_dump.rs`); each entry is a TSharedMemMsg
+`walk_dqc` in `src/diag/task_dump.rs`); each entry is a TSharedMemMsg
 whose `+0x70` field is the receiving task's ID. Resolve via
 `gObjectTable[bucket((id>>4)&0x7F)]` to the TTask\*. See the
 TSharedMemMsg layout above for the full field list.
@@ -1560,7 +1560,7 @@ Fault(stackmgr) procst[+0x40..+0x60]: 20000110 0c647003 00000047 \
 decodes to N=0 Z=0 C=1 V=0, mode=0x10 (USR). To recover the actual
 faulting USR PC from EL2, use `lr_abt - 8` (or, when the fault came
 through the SBA stub pool, decode slot 14 of the containing stub for
-the original ROM PC; see `src/trap.rs::handle_data_abort` forwarding
+the original ROM PC; see `src/hv/trap/dabt.rs::handle_data_abort` forwarding
 path).
 
 ## TUnicodeCompressor (ROM `Sizeof` at `0x00256C74`)
@@ -1728,7 +1728,7 @@ The constructed `TObjectHeap*` is stored in a global at IPA
 `InitObjects__Fv`'s `str r0, [r4]`). Reading `*0x0c105548` after
 `InitObjects__Fv` has run gives a live pointer; before, it's zero
 (useful as an "is the NS runtime up?" sentinel). Used by the
-hypervisor's `src/heap_check.rs` to classify Refs at probe time.
+hypervisor's `src/diag/heap_check.rs` to classify Refs at probe time.
 
 Observed extent on a 717006 cold boot stalled at
 `evt.ex.fr.intrp;type.ref.frame`:
@@ -1774,7 +1774,7 @@ After the 8-byte header:
 The on-disk package format and the in-memory runtime use the same
 layout, so the `newton-objects` parser handles both. The runtime
 encoding is little-endian on Cortex-A53; package-format is
-big-endian. `src/heap_check.rs::dump_object` reads runtime bytes
+big-endian. `src/diag/heap_check.rs::dump_object` reads runtime bytes
 into a stack buffer via `to_be_bytes` so the parser sees the
 original byte order, then parses with `Endian::Big`.
 
@@ -2052,7 +2052,7 @@ Cross-references:
 
 - `docs/DISASM.md` "Jump-table aliasing" — DON'T mistake a thunk
   for the body when reading disassembly.
-- `src/task_dump.rs::jt_target` (line ~393) — runtime decoder.
+- `src/diag/task_dump.rs::jt_target` (line ~393) — runtime decoder.
 - `Emulator/TMMU.cpp:1164-1190` — the table above, copied from
   Einstein's reference dump.
 
@@ -2060,7 +2060,7 @@ Cross-references:
 
 ## See also
 
-- `src/task_dump.rs` — runtime walker that materializes the above
+- `src/diag/task_dump.rs` — runtime walker that materializes the above
 - `docs/DISASM.md` — how to use `scripts/disasm-out/rom.dis`
 - `/Users/walter/Projects/newton/ghidra/DDKIncludes/OS600/` — public
   DDK headers (Apple, 1995). Useful for class names and high-level

@@ -25,7 +25,7 @@ on QEMU, on FVP, and on a real Pi Zero 2 W.**
   and flash persistence to SD card (`flash-persist-sd`) with
   non-blocking DMA autosave. See
   [`docs/REAL_HW_BRINGUP.md`](docs/REAL_HW_BRINGUP.md).
-- 37 guest tests exercise the handler surface in isolation; all green
+- 38 guest tests exercise the handler surface in isolation; all green
   on both QEMU and FVP.
 
 The known functional gap is **add-on app packages** — the ROM and
@@ -53,15 +53,15 @@ What's working end-to-end:
   in/out translators) port Einstein's C++ state machines into Rust.
   See [`docs/peripherals.md`](docs/peripherals.md).
 - **BE-8 mode + selective ROM byteswap.** The guest runs with
-  `CPSR.E=1` and `SCTLR_EL1.EE=1`. `src/guest_mem.rs::load_newton_rom`
-  consults the classifier `reach.bitmap` per word: code → byteswap
-  to LE on load (so AArch32 fetch works); data → leave BE-natural
-  (so a CPSR.E=1 LDR returns the kernel's intended numerical
-  value). `src/guest_endian.rs` is the EL2-side bottleneck for
-  reads/writes of guest data.
+  `CPSR.E=1` and `SCTLR_EL1.EE=1`. `load_newton_rom` in
+  `src/newton/loader.rs` consults the classifier `reach.bitmap` per
+  word: code → byteswap to LE on load (so AArch32 fetch works);
+  data → leave BE-natural (so a CPSR.E=1 LDR returns the kernel's
+  intended numerical value). `src/hv/guest_endian.rs` is the
+  EL2-side bottleneck for reads/writes of guest data.
 - **Stage-1 normalisation.** The kernel uses ARMv4 subpage-AP
   semantics that ARMv8 doesn't natively support.
-  `fix_stage1_xn_bits` in `src/guest_mem.rs`, run on every guest
+  `fix_stage1_xn_bits` in `src/newton/os.rs`, run on every guest
   TTBR0 install, edits the guest's own L1/L2 descriptors in place:
   it flattens subpage-AP to AP=011, clears the XN bits ARMv7
   reinterprets from ARMv4 SBZ, and rewrites the ROM's fine-table L1
@@ -86,13 +86,13 @@ What's working end-to-end:
   fired-bitmap if you want first-touch only. Used end-to-end to
   bisect boot stalls against Einstein.
 - **Live display + pen input.** Each `screen::blit` is forwarded
-  through `src/host_io/` to a companion viewer at
+  through `src/host/host_io/` to a companion viewer at
   `tools/host-viewer/`, which opens a window via softbuffer + winit,
   applies the blit stream to its own 320×480 2 bpp backing store, and
   posts mouse events back as Newton pen samples. Selected with
   `--features host-io-semihost`; the default `host-io-null` backend
   is a no-op (used by guest-tests and CI).
-- **Guest-test tier** under `guest-tests/` — 37 small AArch32
+- **Guest-test tier** under `guest-tests/` — 38 small AArch32
   binaries against a shared runtime, with an HVC protocol for
   pass/fail/print. Cover every handler (CP15, VIC, DMA, flash,
   serial, screen blit, native primitives, tablet, PCMCIA, snapshot
@@ -100,7 +100,7 @@ What's working end-to-end:
 - **Diagnostic scaffolding.** DABT/PABT DIAG vectors at ROM offsets
   `0x10` / `0x0C`, BootOS / PowerOff / Reboot canaries (semihost/dev
   builds only, gated on `cfg(nh_loud_halt_canaries)`), kernel struct
-  dumps (`task_dump.rs` walks `TScheduler` / `TTask`).
+  dumps (`src/diag/task_dump.rs` walks `TScheduler` / `TTask`).
 
 ## Prerequisites
 
@@ -140,7 +140,7 @@ ARM FVP `FVP_Base_RevC-2xAEMvA` (accurate reference model):
 ```
 rm -f /tmp/newton-snapshot-*.bin
 cargo build --release --no-default-features \
-    --features "platform-fvp-base rom-717006 quiet"
+    --features "platform-fvp-base rom-717006 quiet diag"
 scripts/fvp --timeout=90 \
     target/aarch64-unknown-none-softfloat/release/newton-hypervisor
 ```
@@ -262,8 +262,10 @@ one platform, at most one backend per axis) and falls back to the
 | `trace`                | no      | Function-level execution trace via per-entry HVC trampolines.                        |
 | `trace_once`           | no      | First-touch variant of `trace`. Trampolines still fire; only the SEQ line is gated.  |
 | `quiet`                | no      | Silence recurring diag log lines (`fix_stage1_xn_bits:` summaries, etc.).            |
+| `diag`                 | yes     | Diagnostics layer (`src/diag/`): trap histograms, task/heap dumps, guest BPs, the ~743 KiB symbol tables. Off swaps in no-op stubs with the same surface. |
 | `log_*`                | partial | Per-subsystem diagnostic logging. Default carries the low-volume tier (`log_traps`, `log_irqs`, `log_host_io`); the investigation tiers (`log_mmu`, `log_unaligned`, `log_tasks`, `log_store`) are opt-in. |
-| `sd-probe`, `fb-probe`, `usb-probe` | no | Standalone real-hw bring-up probes (boot, test one peripheral, exit).      |
+| `ns_trace`             | no      | Open the kernel's TInterpreter trace gates (NS-level DoSend/DoCall logging).         |
+| `sd-probe`, `fb-probe` | no      | Standalone real-hw bring-up probes (boot, test one peripheral, halt).                |
 
 Aggregates for real hardware (`pi-bare-metal`, `pi-bare-metal-sd`,
 `pi-bare-metal-display`, `pi-bare-metal-input`) roll up
@@ -278,7 +280,7 @@ cargo run --release                                    # default: QEMU, full dia
 cargo run --release --features quiet                   # QEMU, no diag noise
 cargo run --release --features trace,quiet             # QEMU, clean function trace
 cargo build --release --no-default-features \
-    --features "platform-fvp-base rom-717006 quiet"               # FVP build (then scripts/fvp)
+    --features "platform-fvp-base rom-717006 quiet diag"               # FVP build (then scripts/fvp)
 PI_CARGO_FEATURES=pi-bare-metal-input scripts/build-sd.sh /Volumes/PIBOOT
                                                        # bootable SD for the Pi Zero 2 W
 ```
@@ -303,7 +305,7 @@ ten trace lines. Address list comes from
 `scripts/classify-out/code-symbols.txt`, the curated code-only set
 produced by `scripts/classify-symbols.py`. Mechanism (5-word in-ROM
 trampoline per function, original first instruction copied or rewritten
-in slot[1], branch-back at slot[4]) is in `src/tracer.rs`. To diff a
+in slot[1], branch-back at slot[4]) is in `src/diag/tracer.rs`. To diff a
 hypervisor trace against an Einstein trace of the same boot, use
 `scripts/trace-diff.sh`.
 
@@ -313,26 +315,27 @@ An ARM-guest test framework lives in [`guest-tests/`](guest-tests/) —
 each test is a small AArch32 binary linked to a shared runtime
 (`common/test_runtime.S`) that sets up SVC / IRQ / FIQ stacks, installs
 an IRQ handler, and exposes an HVC protocol the hypervisor understands
-(`HVC #1` = putchar, `HVC #3` = PASS, `HVC #4` = FAIL, `HVC #5` =
-mark/progress). The hypervisor is built with `NH_GUEST_TEST=<bin>` set
-in the environment so guest memory is populated with the test instead
-of the ROM.
+(`HVC #0x10` = putchar, `HVC #0x12` = PASS, `HVC #0x13` = FAIL,
+`HVC #0x14` = mark/progress). The hypervisor is built with
+`NH_GUEST_TEST` set in the environment so guest memory is populated
+with the test instead of the ROM.
 
 ```
 guest-tests/scripts/build-tests.sh                # build everything in MANIFEST
 guest-tests/scripts/run-test.sh test_vic          # build + run one test
-guest-tests/scripts/run-all.sh                    # run all 37 tests on QEMU
-guest-tests/scripts/run-all.sh --platform fvp     # run all 37 tests on FVP
+guest-tests/scripts/run-all.sh                    # run all 38 tests on QEMU
+guest-tests/scripts/run-all.sh --platform fvp     # run all 38 tests on FVP
 ```
 
 Add a new test by dropping `tests/<name>.S` in place, appending the
 name to `tests/MANIFEST`, and rerunning. See `guest-tests/README.md`
 for the full HVC protocol.
 
-**Every commit must pass `guest-tests/scripts/run-all.sh`.** All 37
+**Every commit must pass `guest-tests/scripts/run-all.sh`.** All 38
 tests must stay green. (Probe-only iterations that touch nothing
-outside `src/rom_patches.rs` and the dispatch in `src/trap/` can
-skip the run — see the note in `CLAUDE.md`.)
+outside `src/newton/rom_patches.rs`, `src/hv/trap/hvc.rs`, and
+`src/newton/probes.rs` can skip the run — see the note in
+`CLAUDE.md`.)
 
 ## Debug with gdb
 
@@ -361,7 +364,7 @@ hypervisor:
 ```
 (gdb) break kmain
 (gdb) break trap_sync_lower_aarch32
-(gdb) break src/trap/mod.rs:103
+(gdb) break src/hv/trap/mod.rs:103
 (gdb) continue
 ```
 
@@ -377,7 +380,7 @@ The hypervisor side fills the gap:
   trapped CP15). Does not catch UND-class traps because the UND
   trampoline HVCs into EL2 first.
 - **`bp <addr>`** — installs a one-shot guest software breakpoint
-  (see `src/guest_bp.rs`). Patches the ROM word with `UDF #0xFFFE`
+  (see `src/diag/guest_bp.rs`). Patches the ROM word with `UDF #0xFFFE`
   and stops in `handle_user_bp_und` with `faulting_pc` set to the
   guest PC. Works for any ROM-range PC. Snapshot autosaves are
   gated while any BP is live, so a debug session never corrupts a
@@ -418,87 +421,92 @@ Consult these before re-deriving state from disassembly:
 baremetal/
   Cargo.toml             crate manifest (no_std, panic=abort)
   rust-toolchain.toml    pinned toolchain + target
-  build.rs               linker-script selection, symbol-blob embed
+  build.rs               platform/ROM-version resolution, linker-script
+                         templating, symbol-blob + bitmap staging
   .cargo/config.toml     build target, rustflags, cargo-run runner
-  linker.ld              raspi3b image layout
-  linker-fvp.ld          FVP-base image layout
+  linker.ld.in           image-layout template; build.rs substitutes the
+                         per-platform load address (raspi3b 0x80000,
+                         FVP 0x80000000) into OUT_DIR/linker.ld
   scripts/
     run-qemu.sh          cargo runner for QEMU
     boot-check.sh        marker-based QEMU boot verifier (kills QEMU
                          once the boot milestone appears in the log)
     fvp                  cargo-runner-equivalent for FVP (dockerised)
     gdb-init             gdb helpers (bg, bp, tt, guest-state, …)
+    check-matrix.sh      cargo-check every supported feature combo
+                         (runs the two lints below first)
+    check-layering.sh    import-discipline lint for the src/ layers
+    check-rom-addrs.sh   ROM-address containment lint (hex literals
+                         belong in src/newton/rom_ver/)
     classify-symbols.py  ROM symbol partitioner (code/data/drop)
     classify-out/        curated symbol lists
     disasm-out/          rom.dis + indices
     trace-diff.sh        diff Einstein vs hypervisor function traces
     build-sd.sh          assemble a bootable Pi SD card
-    regen-classify.sh    regenerate the classifier reach.bitmap
+    regen-classify.sh    regenerate code-symbols.txt + reach.bitmap
+                         for a ROM version (default 717006)
   src/
-    main.rs              kmain: MMU, stage-2, vectors, VIC, timer; ERET
-    boot.s               _start
-    vectors.s            EL2 exception vectors, context save/restore
-    cpu.rs / uart.rs / panic.rs / mmu.rs   bring-up; uart.rs holds the
-                                           PL011 wire (routed to the
-                                           guest's extr serial port via
-                                           dma.rs) and the semihosting
-                                           SYS_WRITE path for kprintln
-    stage2.rs            stage-2 L1/L2/L3 tables
-    guest.rs             ERET to AArch32 EL1 SVC at guest IPA 0
-    guest_mem.rs         ROM load + byteswap + CP15 patch +
-                         fix_stage1_xn_bits (stage-1 normalisation)
-    guest_endian.rs      BE-8 byte-order-aware guest memory accessors
-    guest_regions.rs     single region manifest (ipa/size/host_pa/
-                         perms/snapshot) for stage2 + host_addr_for +
-                         snapshot
-    guest_trampolines.rs UND/DABT vector trampolines + hypervisor-code
-                         range predicate
-    aarch32_emit.rs      AArch32 branch/literal encoders + install_patch
-    trap/                sync-trap dispatch (mod.rs), per-EC handlers
-                         (dabt.rs, und.rs, cp15.rs, hvc.rs, diag.rs),
-                         trap_irq + slim ISR, update_virq, HVC tag table
-    trap_context.rs      TrapContext + read_sysreg! macros + describe_ec
-    probes.rs            Newton-ROM probe handler bodies
-    slim_isr.rs          slim-ISR state ownership (IrqCap token)
-    host_dma.rs          host-side BCM2835 DMA driver (UART TX, MAI, SD)
-    mmio.rs              IPA dispatch into peripherals/ (MmioPeripheral)
-    peripherals/         battery, dma, flash[_driver], host_call,
-                         native_primitives, network, pcmcia, platform,
-                         printer, screen, serial[_driver], sound,
-                         tablet, vic, in_translator, out_translator
-    platform/            raspi3b.rs, fvp_base.rs, gicv3.rs (FVP)
-    timer.rs             CNTHP driver
-    banked.rs            AArch32 banked-reg access from EL2
-    rom_patches.rs       Einstein word-write patches; HVC injection;
-                         canaries; ResolveFault wrapper
-    shadow_stub.rs       in-ROM stub-pool + per-stub scratch-pool
-    snapshot.rs          rolling 4-slot snapshot ring (semihosting I/O)
-    tracer.rs            in-ROM HVC-trampoline tracer (--features trace)
-    guest_bp.rs          one-shot guest software BPs (gdb 'bp <addr>')
-    host_io/             live display + pen-input plumbing
-                         (null / semihost / pi-fb backends)
-    flash_persist/       flash persistence backends
-                         (null / semihost / sd)
-    sd/                  BCM2835 SDHOST driver + block device
-                         + bring-up probe
-    usb/                 DWC2 USB host stack (enumeration, HID)
-    input/               pen-input backends (null / mtouch) +
-                         touch calibration
-    audio/               sound backends (null / pi_hdmi —
-                         VC4 HDMI MAI)
-    display/             VC4 mailbox framebuffer + boot splash
-    mailbox.rs           VC firmware mailbox interface
-    task_dump.rs         TScheduler / TTask walker
-    unaligned.rs         unaligned-load fixup
-    tarmac.rs            FVP Tarmac plugin window markers
+    main.rs              kmain: boot narrative — MMU, stage-2, vectors,
+                         peripherals, backends, timer; ERET to guest
+    panic.rs             panic handler → loud halt
+    arch/                pure AArch64/AArch32 mechanism, no upward deps:
+                         boot.s (_start), vectors.s (EL2 exception
+                         vectors + context save/restore), trap_context.rs
+                         (TrapContext + read_sysreg!), mmu.rs, cpu.rs,
+                         banked.rs (AArch32 banked regs from EL2),
+                         arm_decode.rs, aarch32_emit.rs (branch/literal
+                         encoders + install_patch), slim_isr.rs (IrqCap)
+    hv/                  generic hypervisor core: stage2.rs (stage-2
+                         tables), guest.rs (ERET to AArch32 EL1),
+                         guest_mem.rs, guest_endian.rs (BE-8 accessors),
+                         be8.rs (lane math), layout.rs (single manifest
+                         of guest regions + MMIO windows + hyp-code
+                         ranges), mmio.rs (router into peripherals),
+                         timer.rs (CNTHP), snapshot.rs (4-slot ring),
+                         hvc_imm.rs (HVC tag table), hooks.rs (GuestOs
+                         trait — the hv→newton seam), trap/ (mod.rs
+                         dispatch + trap_irq, dabt.rs, und.rs, cp15.rs,
+                         hvc.rs)
+    newton/              Newton-OS-specific logic: os.rs (GuestOs hook
+                         impls, incl. fix_stage1_xn_bits + the MMU-
+                         enable ritual), loader.rs (ROM load + selective
+                         byteswap + CP15 rewrite), rom_patches.rs,
+                         probes.rs (probe handler bodies),
+                         shadow_stub.rs (in-ROM stub pool),
+                         guest_trampolines.rs (UND/DABT vector
+                         trampolines), unaligned.rs + unaligned_inline.rs
+                         (unaligned-access fixups), rom_ver/ (per-ROM-
+                         version constants: r717006 full, r710031
+                         skeleton)
+    peripherals/         guest device models: asic, battery, console
+                         (guest-serial ↔ host-console seam), dma,
+                         flash + flash_driver, guest_access, host_call,
+                         in/out_translator, native_primitives, network,
+                         pcmcia, platform, printer, screen,
+                         serial + serial_driver, sound, tablet, vic
+    host/                host drivers + backends: console.rs (PL011 /
+                         semihost console) + macros.rs (kprintln!,
+                         log_*!), platform/ (raspi3b, fvp_base, gicv3),
+                         mailbox.rs, host_dma.rs (BCM2835 DMA), sd/,
+                         usb/ (DWC2 + HID), display/, audio/
+                         (null / pi_hdmi), input/ (null / mtouch),
+                         host_io/ (null / semihost / pi_fb),
+                         flash_persist/ (null / semihost / sd)
+    diag/                diagnostics layer (feature `diag`, on by
+                         default; no-op stubs when off): trap_diag.rs,
+                         trap_hist.rs, task_dump.rs, heap_check.rs,
+                         rep_print.rs, symbols.rs (PC→name tables),
+                         guest_bp.rs (gdb 'bp <addr>'), tracer.rs
+                         (--features trace), tarmac.rs, diag_util.rs
   guest-tests/
     common/              shared runtime, linker script, HVC macros
-    tests/               35 .S files + MANIFEST
+    tests/               38 .S files + MANIFEST
     scripts/             build-tests.sh, run-test.sh, run-all.sh
     README.md            HVC protocol, how to add a test
   probe/                 instrumented-Einstein oracle build
   docs/                  reference docs (see above)
   classify/              cached classifier output (reach.bitmap per ROM hash)
+  roms/                  ROM images (gitignored) + per-version input dirs
   tools/                 classify-rom, host-viewer, romdump
   vendor/                vendored embedded-sdmmc 0.9.0 (path dep,
                          local changes listed in VENDOR.md)
@@ -509,6 +517,37 @@ baremetal/
   IMPLEMENTATION.md      pure-Rust plan, language/tooling rationale
   CLAUDE.md              hypervisor notes (auto-loaded by Claude Code)
 ```
+
+## Layering
+
+`src/` is one crate in six layer directories, dependency direction
+enforced by `scripts/check-layering.sh` (its header comment is the
+authoritative statement of the rules and the sanctioned exceptions):
+
+- **arch** ← **hv** ← **newton** is the upward import direction;
+  `main.rs` / `panic.rs` wire everything and may import all layers.
+- **peripherals** (guest device models) is reached from hv only through
+  the `mmio.rs` router's closed `PeriphId` enum; **newton** may use it
+  freely.
+- **hv → newton** crosses only at `src/hv/hooks.rs`: the `GuestOs`
+  trait with `type ActiveGuest = newton::NewtonOs` — guest-OS behavior
+  (SCTLR massaging, MMU-enable ritual, probe HVCs, IRQ-tail pumps)
+  plugs in there rather than being called from generic trap code.
+- **host** (drivers/backends) sits below `main.rs` and is not imported
+  by guest-facing layers; backends are selected per axis by `build.rs`
+  cfgs (`nh_host_io_*`, `nh_flash_persist_*`, `nh_input_*`,
+  `nh_audio_*`). Sanctioned upward edges: event injection into
+  `peripherals::vic`/`queue`, and reads through `hv::guest_mem` /
+  `guest_endian`. `host/platform` is the board API, importable from
+  any layer. Other seams: `peripherals/console.rs` carries guest-serial
+  bytes to the host console via installed fn pointers.
+- **diag** is importable from anywhere; with the `diag` feature off it
+  compiles to no-op stubs with the identical surface.
+
+Three structure lints keep this true: `scripts/check-layering.sh`
+(import discipline), `scripts/check-rom-addrs.sh` (ROM addresses live
+in `src/newton/rom_ver/`), and `scripts/check-matrix.sh` (every
+supported feature combination builds; runs the other two first).
 
 ## Running on real hardware
 
@@ -542,7 +581,7 @@ guest-tests/scripts/run-test.sh test_vic      # one test, verbose output in /tmp
 
 # FVP cold boot
 rm -f /tmp/newton-snapshot-*.bin
-cargo build --release --no-default-features --features "platform-fvp-base rom-717006 quiet"
+cargo build --release --no-default-features --features "platform-fvp-base rom-717006 quiet diag"
 scripts/fvp --timeout=90 \
     target/aarch64-unknown-none-softfloat/release/newton-hypervisor
 

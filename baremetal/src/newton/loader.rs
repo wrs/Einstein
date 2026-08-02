@@ -296,7 +296,7 @@ pub unsafe fn load_newton_rom() {
         kprintln!(
             "*** loader: no ROM image staged for version {} — place the \
              image at roms/<ver>/newton.rom and regenerate the classifier \
-             bitmap (scripts/regen-classify.sh); halting",
+             bitmap (scripts/regen-classify.sh <ver>); halting",
             super::rom_ver::NAME,
         );
         crate::arch::cpu::halt();

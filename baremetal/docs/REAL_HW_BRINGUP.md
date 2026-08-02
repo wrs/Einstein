@@ -67,8 +67,8 @@ This is conditional on:
 On the Pi Zero 2 W, **PL011 (UART0) is wired to the onboard
 Bluetooth chip by default**, not to GPIO 14/15; without intervention
 the GPIO header carries the mini-UART (UART1/ttyS0). The hypervisor
-drives PL011 at `0x3F20_1000` (`src/uart.rs`,
-`src/platform/raspi3b.rs`), so `dtoverlay=disable-bt` in `config.txt`
+drives PL011 at `0x3F20_1000` (`src/host/console.rs`,
+`src/host/platform/raspi3b.rs`), so `dtoverlay=disable-bt` in `config.txt`
 is required to route PL011 to GPIO 14/15.
 
 - `enable_uart=1` — requests the GPIO 14/15 serial console path.
@@ -89,7 +89,7 @@ is required to route PL011 to GPIO 14/15.
   `arm_64bit=1`, `enable_uart=1`, `uart_2ndstage=1`,
   `dtoverlay=disable-bt`, `gpu_mem=16`, HDMI knobs below).
 - `kernel8.img` — our raw image loaded at `0x80000` (must match
-  `linker.ld`).
+  `linker.ld.in`'s raspi3b load address).
 - `NEWTON.BIN` — the persisted 8 MiB guest flash (created on first
   save).
 
@@ -97,7 +97,7 @@ Firmware blobs are pinned to raspberrypi/firmware commit
 `8fce67a9ec5668fb8d42d215c9ec4c199340bf41` and cached under
 `target/pi-firmware-cache/` by `scripts/build-sd.sh`.
 
-Linker note: `.eh_frame_hdr` is in the linker scripts' DISCARD list.
+Linker note: `.eh_frame_hdr` is in the linker template's DISCARD list.
 A binary with no `.rodata` (string literals folded into `.text`)
 otherwise gets `.eh_frame_hdr` placed at VMA 0x80000, shifting
 `_start` and crashing on the leading UDFs.
@@ -126,7 +126,7 @@ backends selected by aggregate features:
 | `pi-bare-metal-input` | off | sd | pi-fb | mtouch | pi-hdmi | real-hw, display + touch + audio |
 | `platform-fvp-base` | on | semihost | null | null | null | FVP cycle-accurate runs |
 
-Probe features (`sd-probe`, `fb-probe`, `usb-probe`) are additive on
+Probe features (`sd-probe`, `fb-probe`) are additive on
 top of any aggregate; each boots, tests one peripheral, and parks. The
 build script accepts `PI_CARGO_FEATURES` to override the base and
 `PI_EXTRA_FEATURES` to append.
@@ -307,14 +307,14 @@ split transactions, no isochronous or bulk transfers, no
 device-mode, no suspend/resume. Control + interrupt transfers only.
 
 ```
-  src/input/         PenSource seam + backends
+  src/host/input/    PenSource seam + backends
     mod.rs           PenEvent enum, drain_into_queue
     null.rs          no-op (default for every QEMU/FVP build)
     mtouch.rs        TSTP MTouch driver — activation handshake,
                      IRQ-driven interrupt-IN, slot-0 decode, ring
     calibrate.rs     panel 1024x600 → Newton 320x480 (inverse of
                      the display transform); compile-time checks
-  src/usb/
+  src/host/usb/
     mod.rs           shared types: SetupPacket, UsbError, request
                      codes, descriptor type constants
     descriptor.rs    Device/Config/Interface/Endpoint/HID parsers +
@@ -326,9 +326,6 @@ device-mode, no suspend/resume. Control + interrupt transfers only.
     host/dwc2/       Synopsys DWC2 driver — host-mode init, control
                      transfers, IRQ-driven interrupt-IN, per-endpoint
                      DATA0/DATA1 toggle tracking
-    dispatch.rs      UsbDeviceDriver trait (device seam)
-  src/usb_probe.rs   standalone bin — reads DWC2 GSNPSID, confirms
-                     the OTG core is alive
 ```
 
 Wiring: the touchscreen's interrupt-IN endpoint is IRQ-driven —
@@ -342,7 +339,7 @@ source. The DWC2 implementation is cross-checked against Circle's
 `lib/usb/{dwhcidevice.cpp, dwhcixferstagedata.cpp, usbendpoint.cpp,
 usbhostcontroller.cpp}` + `include/circle/usb/dwhci.h`.
 
-Calibration (`src/input/calibrate.rs`): touch 0..1024 × 0..600 maps
+Calibration (`src/host/input/calibrate.rs`): touch 0..1024 × 0..600 maps
 to the 1280×720 panel; Newton paints the centre 480×720. Letterbox
 bands (touch X < 320 or ≥ 704) are dropped; in-region,
 `newton_x = (touch_x - 320) * 320 / 384`,
@@ -389,17 +386,17 @@ HDMI audio on Pi 0–3 goes through the VC4 HDMI block's MAI
 SPDIF / IEC 60958 subframes that the HDMI encoder embeds into the
 video blanking interval. It does **not** go through the BCM2835
 PCM/I2S peripheral at `0x3F20_3000` — that block only reaches
-GPIO 18–21 (external I²S DAC). `src/audio/pi_hdmi.rs` drives the MAI
+GPIO 18–21 (external I²S DAC). `src/host/audio/pi_hdmi.rs` drives the MAI
 path. References: Circle `lib/sound/hdmisoundbasedevice.cpp`, Linux
 `drivers/gpu/drm/vc4/vc4_hdmi.c`.
 
 The stack:
 
-1. **`audio` module seam** (`src/audio/mod.rs`) — same shape as the
+1. **`audio` module seam** (`src/host/audio/mod.rs`) — same shape as the
    `host_io` / `input` axes; backend selected by `audio-*` features,
    resolved in `build.rs` to `cfg(nh_audio_*)`. Null default for
    QEMU/FVP.
-2. **VC4 HDMI MAI bring-up** (`src/audio/pi_hdmi.rs`) — MAI_CTL
+2. **VC4 HDMI MAI bring-up** (`src/host/audio/pi_hdmi.rs`) — MAI_CTL
    reset + flush, MAI_FMT = 44.1 kHz PCM, MAI_CONFIG bit-reverse +
    format-reverse + channel-mask = stereo, MAI_CHANNEL_MAP =
    0b001000 (Pi ≤3 stereo L+R), AUDIO_PACKET_CONFIG = stereo +
@@ -458,12 +455,12 @@ its baud-rate ceiling.
    blank are cross-checked against Circle's `bcm2835int.h`).
    Channel 5 = UART TX (also: channel 4 = HDMI MAI, channel 6 = SD —
    see the respective sections).
-2. **`src/platform/raspi3b.rs`** — `enable_bcm2835_irq` /
+2. **`src/host/platform/raspi3b.rs`** — `enable_bcm2835_irq` /
    `bcm2835_irq_pending_1` for the ARM Peripherals IC at
    `0x3F00_B000`. DMA channel N → GPU IRQ source `16 + N`. CNTHP
    still arrives via the BCM2836 local-peripheral block at
    `0x4000_0040`.
-3. **`src/uart.rs::tx_dma`** — 16384-slot ring. `enqueue` masks
+3. **`src/host/console.rs::tx_dma`** — 16384-slot ring. `enqueue` masks
    DAIF, copies bytes in, `maybe_kick` builds one CB per contiguous
    tail→end-of-ring segment; completion-IRQ dispatch in `trap_irq`
    acks `CS.INT`/`END`, advances tail, re-kicks. Drop-newest with a

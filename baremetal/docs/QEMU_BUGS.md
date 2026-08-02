@@ -19,7 +19,7 @@ update `MANIFEST` so the bug stays observable across QEMU upgrades.
 ### Symptom
 
 When EL2 Rust does `msr spsr_el2, <val>` (e.g. via `return_to_guest`
-in `src/trap.rs`) and then ERETs to AArch32, QEMU additionally writes
+in `src/hv/trap/mod.rs`) and then ERETs to AArch32, QEMU additionally writes
 `<val>` into the storage backing the AArch32 banked SPSR_svc (almost
 certainly `env->banked_spsr[1]`). The CPSR-on-ERET is correct; the
 side effect is that the guest's banked SPSR_svc is silently
@@ -91,7 +91,7 @@ out to require invasive rework.
 
 ## Pre-existing characterized issues
 
-These are documented in `CLAUDE.md` and `src/trap.rs` comments and
+These are documented in `CLAUDE.md` and `src/hv/trap/` comments and
 listed here for completeness; they pre-date this file.
 
 - **gdbstub is aarch64-only.** Guest AArch32 software breakpoints

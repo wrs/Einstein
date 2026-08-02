@@ -12,10 +12,10 @@ dynamic stage-2 rescan path guarantees, and how to triage a wedge whose
 PC is above the ROM aperture — because the bitmap-first doctrine in
 `CLAUDE.md` does **not** apply there.
 
-Grounded in: `src/shadow_stub.rs`, `src/stage2.rs`
+Grounded in: `src/newton/shadow_stub.rs`, `src/hv/stage2.rs`
 (`set_ram_page_ro_x` / `set_ram_page_rw_xn`, `ram_l3_entry_ptr`),
-`src/trap/mod.rs::handle_instruction_abort`, `src/trap/dabt.rs`,
-`src/guest_endian.rs`, `tools/classify-rom`.
+`src/hv/trap/mod.rs::handle_instruction_abort`, `src/hv/trap/dabt.rs`,
+`src/hv/guest_endian.rs`, `tools/classify-rom`.
 
 ## What "real code" means today, and where the definition stops
 

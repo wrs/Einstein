@@ -1,15 +1,27 @@
 /*
- * Link layout for the Newton hypervisor.
+ * Link layout for the Newton hypervisor — template shared by both host
+ * platforms. The platforms differ only in the load address; build.rs
+ * substitutes @IMAGE_BASE@ per the selected platform-* feature and
+ * writes the resolved script to OUT_DIR/linker.ld:
  *
- * QEMU raspi3b (and the real Pi 3B / Zero 2 W firmware) load the aarch64
- * kernel image at 0x80000 and jump to its first byte with all cores.
+ *   platform-raspi3b  — 0x80000. QEMU raspi3b (and the real Pi 3B /
+ *                       Zero 2 W firmware) load the aarch64 kernel
+ *                       image at 0x80000 and jump to its first byte
+ *                       with all cores.
+ *   platform-fvp-base — 0x80000000. FVP loads an ELF via
+ *                       `-a cluster0.cpu0=image.elf` by program-header
+ *                       PA. Non-secure DRAM on the Base Platform
+ *                       memory map starts at 0x80000000 and is 2 GiB
+ *                       deep; we land the image at DRAM base and set
+ *                       the FVP's cluster0.cpu0.RVBAR to match, giving
+ *                       a direct EL2 entry when cluster0.has_el3=0.
  */
 
 ENTRY(_start)
 
 SECTIONS
 {
-    . = 0x80000;
+    . = @IMAGE_BASE@;
     __image_start = .;
 
     .text.boot : { KEEP(*(.text.boot)) }

@@ -42,7 +42,7 @@ test_rep_print
 # it must not be dispatched there. build-tests.sh still builds it.
 test_snapshot_resume
 # ---- host_dma (BCM2835 DMA engine) — NO QEMU test, by platform limit ----
-# src/host_dma.rs (UART/MAI/SD-TX CB-chain arming) is #![cfg(nh_real_hw)]
+# src/host/host_dma.rs (UART/MAI/SD-TX CB-chain arming) is #![cfg(nh_real_hw)]
 # (no-semihost + platform-raspi3b) and is therefore not even compiled
 # into the QEMU guest-test build (default = semihost). Beyond the cfg,
 # QEMU raspi3b's BCM2835 DMA model (hw/dma/bcm2835_dma.c, QEMU 10.1.1)
@@ -59,7 +59,7 @@ test_snapshot_resume
 # the DREQ pacing and peripheral-FIFO delivery, exactly the parts a
 # UART-TX-DMA completion test would assert.)
 # Documented validation route: the sd-probe hardware probe
-# (src/sd/probe.rs, built with `--features "pi-bare-metal sd-probe"`,
+# (src/host/sd/probe.rs, built with `--features "pi-bare-metal sd-probe"`,
 # run on a real Pi Zero 2 W) exercises host_dma's CB-chain arming via
 # the SD-TX channel (write_block_dma -> arm_sd_tx) AND a dedicated
 # RAM-to-RAM self-check on the same channel

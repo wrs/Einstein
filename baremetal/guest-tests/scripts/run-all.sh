@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build every ARM-guest test and run it under the chosen host (QEMU
 # raspi3b by default, ARM FVP_Base_RevC with --platform fvp). Exits 0
-# only if all tests report PASSED via HVC #3.
+# only if all tests report PASSED via HVC_PASS (HVC #0x12).
 set -euo pipefail
 
 platform="qemu"

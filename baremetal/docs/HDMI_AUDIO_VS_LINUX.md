@@ -11,14 +11,14 @@ against the Linux drivers that run on the same SoC (BCM2837 / Pi Zero
 
 Files reviewed on our side:
 
-- `src/audio/mod.rs` — backend selection + the sound-driver contract.
-- `src/audio/pi_hdmi.rs` (~2000 lines) — VC4 HDMI/MAI driver, IEC
+- `src/host/audio/mod.rs` — backend selection + the sound-driver contract.
+- `src/host/audio/pi_hdmi.rs` (~2000 lines) — VC4 HDMI/MAI driver, IEC
   encoder, cyclic-DMA chain, audio infoframe.
 - `src/host_dma.rs` — BCM2835 DMA driver shared with the
   PL011 TX path.
-- `src/platform/` — owns the BCM2835 pending-register IRQ dispatch
+- `src/host/platform/` — owns the BCM2835 pending-register IRQ dispatch
   (`bcm2835_irq_pending_1` → DMA channel N's `on_completion`); the
-  generic IRQ path in `src/trap/mod.rs` calls into `platform::`
+  generic IRQ path in `src/hv/trap/mod.rs` calls into `platform::`
   rather than carrying platform cfg blocks.
 
 ## 1. Linux architecture (the reference)
@@ -89,7 +89,7 @@ BCM2835-DMA cyclic chain:
 Newton guest (BE-S16 mono PCM @ 22.05 kHz, ping-pong 1872-frame buffers)
    │  HVC subfn 0x07 (ScheduleOutput)
    ▼
-audio::pi_hdmi::schedule_output  (src/audio/pi_hdmi.rs)
+audio::pi_hdmi::schedule_output  (src/host/audio/pi_hdmi.rs)
    │  read guest buffer via guest_read_u16_va, 2× upsample (S&H),
    │  duplicate mono→stereo, write into stereo RING (8192 frames)
    │  → immediately call refill_mai_dma_ring()

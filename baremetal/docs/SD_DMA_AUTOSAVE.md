@@ -24,7 +24,7 @@ same-EL ISR (`trap::irq_from_el2` / `host_dma::on_completion`).
   `src/host_dma.rs`. Helpers there: `init_sd_tx`,
   `arm_sd_tx`, `sd_tx_active`, `sd_tx_error`, `sd_tx_abort`. Bare-DREQ
   CS flags (SD yields to MAI's higher AXI priority — intended).
-- **SDHOST DMA writes** in `src/sd/sdhost.rs`:
+- **SDHOST DMA writes** in `src/host/sd/sdhost.rs`:
   - `write_block_dma(lba, &[u8;512])` — single block, polled.
   - `write_sectors_dma(lba, &[u8])` — N sectors via `CMD25` +
     DREQ-paced DMA + `CMD12`, polled. Kept for isolated bring-up.
@@ -53,11 +53,11 @@ same-EL ISR (`trap::irq_from_el2` / `host_dma::on_completion`).
 
   The map is per-cluster, not a single extent, because the file can
   be fragmented. Do NOT assume dirty block == cluster: the dirty unit
-  `BLOCK_SIZE = 64 KiB` (`src/flash_persist/sd.rs`) typically spans
+  `BLOCK_SIZE = 64 KiB` (`src/host/flash_persist/sd.rs`) typically spans
   2+ clusters (e.g. 32 KiB clusters on the bench card), and clusters
   can also be larger than `BLOCK_SIZE`.
 - **Save trigger:** `snapshot::maybe_autosave` →
-  `maybe_flash_autosave` (`src/snapshot.rs`, every
+  `maybe_flash_autosave` (`src/hv/snapshot.rs`, every
   `AUTOSAVE_INTERVAL_MS = 2000`) →
   `with_irqs_unmasked(flash_persist::maybe_save)`.
 - **Completion IRQ plumbing:** `host_dma::on_completion(ch)`
@@ -67,7 +67,7 @@ same-EL ISR (`trap::irq_from_el2` / `host_dma::on_completion`).
 
 ## The save state machine
 
-In `src/flash_persist/sd.rs` (`SAVE_ACTIVE` / `SAVE_CLUSTER` /
+In `src/host/flash_persist/sd.rs` (`SAVE_ACTIVE` / `SAVE_CLUSTER` /
 `SAVE_PENDING_CL` bitmap / `SAVE_SNAPSHOT`):
 
 - `maybe_save` tick: when `valid && FLASH_NUM_CLUSTERS != 0`,

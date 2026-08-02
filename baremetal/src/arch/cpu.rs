@@ -107,13 +107,18 @@ read_sysreg!(id_aa64isar0_el1, "ID_AA64ISAR0_EL1");
 read_sysreg!(midr_el1, "MIDR_EL1");
 read_sysreg!(hcr_el2, "HCR_EL2");
 
-/// Invalidate one icache line by virtual address (`IC IVAU`) and fence.
+/// Publish one freshly-written code line to the Point of Unification:
+/// `DC CVAU; DSB ISH; IC IVAU; DSB ISH; ISB`. Both halves are needed —
+/// the clean pushes the instruction bytes out of the D-cache, the
+/// invalidate drops any stale I-cache copy (ARM ARM: "clean data cache
+/// entry by address, invalidate instruction cache entry by address").
+///
 /// The VA must be accessible to EL2 — on our setup EL2's stage-1 identity
 /// map covers the host view of the ROM backing, so passing the host VA
 /// of the patched word works. A53's icache is PIPT so invalidating via
 /// the host VA invalidates any guest alias to the same PA.
 #[inline]
-pub fn ic_ivau(va: u64) {
+pub fn icache_publish_line(va: u64) {
     // SAFETY: cache maintenance; `dsb ish` + `isb` fence the effect.
     unsafe {
         core::arch::asm!(
@@ -137,8 +142,8 @@ pub fn ic_ivau(va: u64) {
 /// non-coherent (Cortex-A53, AEM v8-A — i.e. both QEMU raspi3b and FVP
 /// Base RevC).
 ///
-/// This walks the range one cache line at a time and issues
-/// `DC CVAU; DSB ISH; IC IVAU; DSB ISH; ISB` per line. Cache line size
+/// This walks the range one cache line at a time, calling
+/// [`icache_publish_line`] on each. Cache line size
 /// hard-coded to 64 bytes — the value for both A53 and AEMvA. (If we
 /// ever target a part with a different `CTR_EL0.IminLine`, query CTR
 /// for line size instead.)
@@ -148,7 +153,7 @@ pub fn icache_publish_range(va: u64, len: usize) {
     let end = (va + len as u64 + LINE - 1) & !(LINE - 1);
     let mut p = start;
     while p < end {
-        ic_ivau(p);
+        icache_publish_line(p);
         p += LINE;
     }
 }

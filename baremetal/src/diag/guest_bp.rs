@@ -254,7 +254,7 @@ unsafe fn install_locked(ipa: u32) -> i32 {
             options(nostack, preserves_flags),
         );
     }
-    cpu::ic_ivau(host_va);
+    cpu::icache_publish_line(host_va);
     // SAFETY: cache ops, publish stores.
     unsafe {
         core::arch::asm!(
@@ -309,7 +309,7 @@ fn restore_word(ipa: u32, orig: u32) {
             options(nostack, preserves_flags),
         );
     }
-    cpu::ic_ivau(host_va);
+    cpu::icache_publish_line(host_va);
     // SAFETY: cache op.
     unsafe {
         core::arch::asm!(

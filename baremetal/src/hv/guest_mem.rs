@@ -141,7 +141,7 @@ pub unsafe fn write_rom_data_word(rom_ptr: *mut u32, idx: usize, value: u32) {
     }
 }
 
-/// Convenience: dispatch by the classifier bitmap. `apply_717006_patches`
+/// Convenience: dispatch by the classifier bitmap. `apply_rom_patches`
 /// uses this so each entry's code-vs-data decision is data-driven.
 pub unsafe fn write_rom_word_by_kind(rom_ptr: *mut u32, idx: usize, value: u32) {
     if rom_word_is_code(idx) {

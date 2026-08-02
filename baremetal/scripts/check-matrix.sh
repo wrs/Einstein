@@ -26,24 +26,27 @@ cd "$root"
 # incremental cache of interactive `cargo build`/`cargo run` sessions.
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$root/target/check-matrix}"
 
-# Import-discipline lint (cheap, always run — it guards structure
-# rather than a combo).
-if bash "$here/check-layering.sh" >/tmp/check-matrix-last.log 2>&1; then
-    printf "  \e[32mPASS\e[0m  %-24s\n" "check-layering"
-else
-    printf "  \e[31mFAIL\e[0m  %-24s\n" "check-layering"
-    sed 's/^/        /' /tmp/check-matrix-last.log
-    exit 1
-fi
+# Structure lints (cheap, always run — they guard structure rather
+# than a combo): import discipline + ROM-address containment.
+for lint in check-layering check-rom-addrs; do
+    if bash "$here/$lint.sh" >/tmp/check-matrix-last.log 2>&1; then
+        printf "  \e[32mPASS\e[0m  %-24s\n" "$lint"
+    else
+        printf "  \e[31mFAIL\e[0m  %-24s\n" "$lint"
+        sed 's/^/        /' /tmp/check-matrix-last.log
+        exit 1
+    fi
+done
 
 # Each entry: "label::<cargo check args>". Args are eval'd so quoted
 # feature lists survive. Env-prefixed entries (NH_GUEST_TEST=1) set the
 # guest-test cfg the same way run-test.sh does.
 combos=(
     "default::cargo check --release"
-    "no-diag::cargo check --release --no-default-features --features \"platform-raspi3b log_traps log_irqs log_host_io\""
-    "platform-fvp-base::cargo check --release --no-default-features --features \"platform-fvp-base quiet diag\""
-    "fvp-no-diag::cargo check --release --no-default-features --features \"platform-fvp-base quiet\""
+    "no-diag::cargo check --release --no-default-features --features \"platform-raspi3b rom-717006 log_traps log_irqs log_host_io\""
+    "platform-fvp-base::cargo check --release --no-default-features --features \"platform-fvp-base rom-717006 quiet diag\""
+    "fvp-no-diag::cargo check --release --no-default-features --features \"platform-fvp-base rom-717006 quiet\""
+    "rom-710031::cargo check --release --no-default-features --features \"platform-raspi3b rom-710031 diag log_traps log_irqs log_host_io\""
     "pi-bare-metal::cargo check --release --no-default-features --features pi-bare-metal"
     "pi-bare-metal-sd::cargo check --release --no-default-features --features pi-bare-metal-sd"
     "pi-bare-metal-display::cargo check --release --no-default-features --features pi-bare-metal-display"

@@ -24,7 +24,7 @@ use core::ptr::addr_of_mut;
 
 use super::guest_trampolines;
 use super::probes::{self, ThunkKind};
-use super::rom_patches;
+use super::rom_ver;
 use super::unaligned;
 
 /// The Newton OS 2.x guest. Zero-sized; every hook is an associated
@@ -493,7 +493,7 @@ fn drop_flash_write(ctx: &mut TrapContext, iss: u32, elr: u32) -> bool {
 ///     fault.
 ///   * Forwardable DFSC (translation / permission / access-flag,
 ///     codes 0x03 / 0x05 / 0x06 / 0x07 / 0x0D / 0x0F) — forward to
-///     the kernel's `DataAbortHandler` at VA `0x0039_3114` (the
+///     the kernel's `DataAbortHandler` (`rom_ver::DATA_ABORT_HANDLER_VA`, the
 ///     original target of the ROM's VA 0x10 branch before our DABT
 ///     trampoline insertion). Lets the kernel handle routine faults
 ///     like stack-collision growth without the hypervisor needing
@@ -541,6 +541,14 @@ fn handle_dabt_dispatch(ctx: &mut TrapContext) {
         handle_diag(ctx);
         return;
     }
+    // Forwarding needs the kernel's DataAbortHandler VA. A version
+    // module without it (`rom_ver::DATA_ABORT_HANDLER_VA = None`)
+    // stays on the slow HVC-only DABT path — alignment faults above
+    // are still emulated, everything else halts loudly here.
+    let Some(dah_va) = rom_ver::DATA_ABORT_HANDLER_VA else {
+        handle_diag(ctx);
+        return;
+    };
 
     if dfsc == 0x05 || dfsc == 0x07 || dfsc == 0x0D || dfsc == 0x0F {
         let l1_pa = 0x0400_0000u32 + ((far as u32) >> 20) * 4;
@@ -595,12 +603,11 @@ fn handle_dabt_dispatch(ctx: &mut TrapContext) {
     }
     ctx.x[0] = saved_r0;
     ctx.x[1] = saved_r1;
-    const DATA_ABORT_HANDLER_VA: u32 = 0x0039_3114;
     unsafe {
         core::arch::asm!(
             "msr elr_el2, {elr}",
             "isb",
-            elr = in(reg) DATA_ABORT_HANDLER_VA as u64,
+            elr = in(reg) dah_va as u64,
             options(nostack, preserves_flags),
         );
     }
@@ -813,7 +820,7 @@ impl GuestOs for NewtonOs {
         // at 0x04004000) would otherwise have RAM[0..0x4000]
         // (stack / scratch) corrupted by the walker. Gate on
         // the live TTBR0 value.
-        if (ttbr0 & 0xFFFF_C000) == 0x0400_0000 {
+        if (ttbr0 & 0xFFFF_C000) == rom_ver::KERNEL_TTBR0_BASE {
             let rom_dirty = fix_stage1_xn_bits();
             install_scratch_pool_l1_section();
             if rom_dirty {
@@ -862,7 +869,7 @@ impl GuestOs for NewtonOs {
             TTBR_FIXED = true;
             v
         };
-        if !already && (raw & 0xFFFF_C000) == 0x0400_0000 {
+        if !already && (raw & 0xFFFF_C000) == rom_ver::KERNEL_TTBR0_BASE {
             let rom_dirty = fix_stage1_xn_bits();
             install_scratch_pool_l1_section();
             if rom_dirty {
@@ -878,15 +885,15 @@ impl GuestOs for NewtonOs {
         spsr_und: u64,
     ) -> UndHvcOutcome {
         match insn {
-            // BootOs / ROMBoot canary (rom_patches::BOOTOS_PC = 0x0001_8688).
-            // The initial hypervisor-ERET lands here in SVC mode (HVC traps
+            // BootOs / ROMBoot canary (`rom_ver::BOOT`). The initial
+            // hypervisor-ERET lands here in SVC mode (HVC traps
             // normally to EL2). Any later entry from USR mode is a software
             // reset reached via a task branching to the reset vector — HVC
             // from EL0 is UNDEFINED and arrives here instead of handle_hvc.
             // Route into the same handler so the canary's "2nd+ entry →
             // halt" logic applies regardless of the source mode.
             _ if insn == HvcImm::BootOs.insn()
-                && faulting_pc == rom_patches::BOOTOS_PC =>
+                && rom_ver::BOOT.is_some_and(|b| b.bootos.pc == faulting_pc) =>
             {
                 probes::handle_bootos_canary(ctx);
                 UndHvcOutcome::Done
@@ -1080,5 +1087,17 @@ impl GuestOs for NewtonOs {
             return false;
         }
         drop_flash_write(ctx, iss, elr)
+    }
+
+    fn fpe_redirect_va() -> Option<u32> {
+        rom_ver::FPE_JT_VA
+    }
+
+    fn und_diag_hints() -> Option<crate::hv::hooks::UndDiagHints> {
+        rom_ver::WEDGE_DIAG
+    }
+
+    fn und_tramp_base() -> u32 {
+        rom_ver::ROM_TAIL.und_tramp
     }
 }

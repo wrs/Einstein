@@ -31,11 +31,27 @@
 use crate::hv::guest_endian::guest_read_u32_va as read_word_va;
 use crate::kprintln;
 
-const G_SCHEDULER_PTR: u32 = 0x0c10_0fd0;
-const G_CURRENT_TASK:  u32 = 0x0c10_1000;
-const G_WANT_SCHED:    u32 = 0x0c10_0fd4;
-const G_HOLD_SCHED:    u32 = 0x0c10_0fd8;
-const G_CURRENT_GLOB:  u32 = 0x0c10_105c;
+use crate::newton::rom_ver;
+
+/// Kernel-global VAs for the selected ROM version. `None` (a skeleton
+/// version module) makes every entry point here print an
+/// "unavailable" one-liner (via [`kg_gate`]) or return empty (internal
+/// helpers) — the dump machinery is inert without its anchors.
+fn kg() -> Option<rom_ver::types::KernelGlobals> {
+    rom_ver::KERNEL_GLOBALS
+}
+
+/// Entry-point gate: kernel globals, or a logged one-liner and `None`.
+fn kg_gate(what: &str) -> Option<rom_ver::types::KernelGlobals> {
+    let kg = rom_ver::KERNEL_GLOBALS;
+    if kg.is_none() {
+        kprintln!(
+            "{}: unavailable for ROM {} (no kernel globals)",
+            what, rom_ver::NAME
+        );
+    }
+    kg
+}
 
 /// `gObjectTable` is a TObjectTable instance at this VA. We saw it as
 /// `r0=0x0c10fc34` in the trace for `TObjectTable::Get`.
@@ -60,7 +76,8 @@ const G_CURRENT_GLOB:  u32 = 0x0c10_105c;
 ///               "Kernel object IDs" for citations.
 ///   bits[31:4]  per-type sequence number (NextGlobalUniqueId)
 /// Hash bucket index = (id >> 4) & 0x7F
-const G_OBJECT_TABLE:  u32 = 0x0c10_fc34;
+///
+/// The instance VA is `rom_ver::KERNEL_GLOBALS.object_table`.
 const OT_BUCKETS_BASE: u32 = 0x10;
 const OT_NUM_BUCKETS:  u32 = 128;
 const OBJ_TYPE_TASK:   u32 = 3;
@@ -241,11 +258,12 @@ fn task_state(task_va: u32, current: u32) -> &'static str {
 /// Walk the object table and dump every TASK entry. Use when we want
 /// to see the population of tasks beyond the run queue.
 fn dump_object_table_tasks(current: u32) {
+    let Some(kg) = kg() else { return; };
     let mut total: u32 = 0;
     let mut tasks: u32 = 0;
     let mut by_type: [u32; 16] = [0; 16];
     for bucket in 0..OT_NUM_BUCKETS {
-        let head_va = G_OBJECT_TABLE + OT_BUCKETS_BASE + bucket * 4;
+        let head_va = kg.object_table + OT_BUCKETS_BASE + bucket * 4;
         let mut node = match rd(head_va) {
             Some(v) => v,
             None => continue,
@@ -316,17 +334,18 @@ fn dump_object_table_tasks(current: u32) {
 
 /// Top-level dump entry. Called from `trap_irq` periodically.
 pub fn dump() {
-    let sched = match rd(G_SCHEDULER_PTR) {
+    let Some(kg) = kg_gate("task_dump") else { return; };
+    let sched = match rd(kg.scheduler_ptr) {
         Some(v) if v != 0 => v,
         _ => {
             kprintln!("task_dump: gScheduler unset");
             return;
         }
     };
-    let curr = rd(G_CURRENT_TASK).unwrap_or(0);
-    let want = rd(G_WANT_SCHED).unwrap_or(u32::MAX);
-    let hold = rd(G_HOLD_SCHED).unwrap_or(u32::MAX);
-    let glob = rd(G_CURRENT_GLOB).unwrap_or(u32::MAX);
+    let curr = rd(kg.current_task).unwrap_or(0);
+    let want = rd(kg.want_schedule).unwrap_or(u32::MAX);
+    let hold = rd(kg.hold_schedule).unwrap_or(u32::MAX);
+    let glob = rd(kg.current_globals).unwrap_or(u32::MAX);
     let highest = rd(sched + TS_HIGHEST_PRI).unwrap_or(u32::MAX);
     let bitmap  = rd(sched + TS_PRI_BITMAP).unwrap_or(u32::MAX);
     let last    = rd(sched + TS_LAST_REMOVED).unwrap_or(u32::MAX);
@@ -452,7 +471,7 @@ pub(crate) fn fmt_pc_name(pc: u32) -> ([u8; 96], usize) {
         if let Some(target) = jt_target(pc) {
             // Recurse-by-hand: render the resolved target as if it
             // were a normal ROM PC, then tag with `[JT]`.
-            if target < 0x0090_0000 {
+            if target < rom_ver::ROM_TAIL.tracer_pool_base {
                 render_rom_pc(target, &mut buf, &mut n);
                 push_str(" [JT]", &mut buf, &mut n);
             } else {
@@ -471,7 +490,7 @@ pub(crate) fn fmt_pc_name(pc: u32) -> ([u8; 96], usize) {
         push(b'>', &mut buf, &mut n);
         return (buf, n);
     }
-    if pc >= 0x0090_0000 {
+    if pc >= rom_ver::ROM_TAIL.tracer_pool_base {
         push_str("<noncode 0x", &mut buf, &mut n);
         push_hex(pc, &mut buf, &mut n);
         push(b'>', &mut buf, &mut n);
@@ -514,7 +533,7 @@ const SEMAPHORE_OP_GLUE_HI: u32 = 0x003a_e204;
 fn find_object_by_id(obj_id: u32) -> Option<u32> {
     if obj_id == 0 || obj_id == u32::MAX { return None; }
     let bucket = (obj_id >> 4) & 0x7F;
-    let head_va = G_OBJECT_TABLE + OT_BUCKETS_BASE + bucket * 4;
+    let head_va = kg()?.object_table + OT_BUCKETS_BASE + bucket * 4;
     let mut node = rd(head_va)?;
     let mut steps = 0u32;
     while node != 0 && steps < 128 {
@@ -647,10 +666,11 @@ fn print_chain_frame(depth: usize, frame: u32, pc: u32) {
 /// "where is newt stuck?" without spamming the per-task save-area
 /// dump.
 fn dump_blocked_pcs() {
-    let curr = rd(G_CURRENT_TASK).unwrap_or(0);
+    let Some(kg) = kg() else { return; };
+    let curr = rd(kg.current_task).unwrap_or(0);
     let mut printed = false;
     for bucket in 0..OT_NUM_BUCKETS {
-        let head_va = G_OBJECT_TABLE + OT_BUCKETS_BASE + bucket * 4;
+        let head_va = kg.object_table + OT_BUCKETS_BASE + bucket * 4;
         let mut node = match rd(head_va) { Some(v) => v, None => continue };
         let mut steps = 0u32;
         while node != 0 && steps < 128 {
@@ -723,9 +743,10 @@ fn dump_blocked_pcs() {
 /// a guess at the parent TSemaphore VA. Used to identify which
 /// semaphore is holding the task.
 fn dump_semaphore_waits() {
+    let Some(kg) = kg() else { return; };
     let mut printed = false;
     for bucket in 0..OT_NUM_BUCKETS {
-        let head_va = G_OBJECT_TABLE + OT_BUCKETS_BASE + bucket * 4;
+        let head_va = kg.object_table + OT_BUCKETS_BASE + bucket * 4;
         let mut node = match rd(head_va) { Some(v) => v, None => continue };
         let mut steps = 0u32;
         while node != 0 && steps < 128 {
@@ -940,12 +961,13 @@ pub fn dump_save_area(label: &str, task_va: u32) {
 /// kept for gdb / future hunts; no in-tree caller today.
 #[allow(dead_code)]
 pub fn dump_save_area_for_named(name_match: &[u8; 4]) {
-    let curr = rd(G_CURRENT_TASK).unwrap_or(0);
+    let Some(kg) = kg_gate("dump_save_area_for_named") else { return; };
+    let curr = rd(kg.current_task).unwrap_or(0);
     if curr != 0 {
         dump_save_area("CURR", curr);
     }
     for bucket in 0..OT_NUM_BUCKETS {
-        let head_va = G_OBJECT_TABLE + OT_BUCKETS_BASE + bucket * 4;
+        let head_va = kg.object_table + OT_BUCKETS_BASE + bucket * 4;
         let mut node = match rd(head_va) {
             Some(v) => v,
             None => continue,
@@ -1028,7 +1050,7 @@ fn find_task_by_id(task_id: u32) -> Option<(u32, [u8; 4])> {
         return None;
     }
     let bucket = (task_id >> 4) & 0x7F;
-    let head_va = G_OBJECT_TABLE + OT_BUCKETS_BASE + bucket * 4;
+    let head_va = kg()?.object_table + OT_BUCKETS_BASE + bucket * 4;
     let mut node = rd(head_va)?;
     let mut steps = 0u32;
     while node != 0 && steps < 128 {
@@ -1097,8 +1119,9 @@ pub fn dump_port(port_va: u32) {
 /// safety net against corrupted hash chains.
 fn for_each_object_of_kind<F: FnMut(u32, u32)>(kind: u32, mut f: F) {
     const MAX_PER_BUCKET: u32 = 128;
+    let Some(kg) = kg() else { return; };
     for bucket in 0..OT_NUM_BUCKETS {
-        let head_va = G_OBJECT_TABLE + OT_BUCKETS_BASE + bucket * 4;
+        let head_va = kg.object_table + OT_BUCKETS_BASE + bucket * 4;
         let mut node = match rd(head_va) { Some(v) => v, None => continue };
         let mut steps = 0u32;
         while node != 0 && steps < MAX_PER_BUCKET {
@@ -1155,9 +1178,10 @@ pub fn dump_all_monitors() {
 /// Dump a single object by id. Routes to the appropriate per-type
 /// dumper based on the low 4 bits.
 pub fn dump_object_by_id(id: u32) {
+    let Some(kg) = kg_gate("dump_object_by_id") else { return; };
     let kind = (id & 0xF) as usize;
     let bucket = (id >> 4) & 0x7F;
-    let head_va = G_OBJECT_TABLE + OT_BUCKETS_BASE + bucket * 4;
+    let head_va = kg.object_table + OT_BUCKETS_BASE + bucket * 4;
     let mut node = match rd(head_va) {
         Some(v) => v,
         None => { kprintln!("dump_object_by_id({:#x}): bucket head unreadable", id); return; }
@@ -1264,16 +1288,17 @@ fn read_object_table_ptr(globals_va: u32) -> u32 {
 }
 
 /// Dump every TPhys in all three known kernel object tables. The
-/// primary `gObjectTable` at 0x0c10fc34 holds user-side TPhys (e.g.
-/// PCMCIA MMIO regions), while RAM-page TPhys are in the additional
-/// tables `*(0x0c101164)` and `*(0x0c100fc8)` (see `GetPhys` at ROM
-/// 0x11c168 — it tries all three before failing).
+/// primary `gObjectTable` holds user-side TPhys (e.g. PCMCIA MMIO
+/// regions), while RAM-page TPhys are in the additional tables behind
+/// the `object_table_a_ptr` / `object_table_b_ptr` slots (see
+/// `GetPhys` at ROM 0x11c168 — it tries all three before failing).
 pub fn dump_all_phys() {
-    let table_a = read_object_table_ptr(0x0c10_1164);
-    let table_b = read_object_table_ptr(0x0c10_0fc8);
+    let Some(kg) = kg_gate("dump_all_phys") else { return; };
+    let table_a = read_object_table_ptr(kg.object_table_a_ptr);
+    let table_b = read_object_table_ptr(kg.object_table_b_ptr);
     kprintln!(
         "=== all phys (KernelType=11) — gObjectTable=0x{:x} TblA=0x{:x} TblB=0x{:x} ===",
-        G_OBJECT_TABLE, table_a, table_b
+        kg.object_table, table_a, table_b
     );
 
     let mut count_a = 0u32;
@@ -1281,20 +1306,20 @@ pub fn dump_all_phys() {
     let mut count_g = 0u32;
 
     if table_a != 0 && table_a != u32::MAX {
-        kprintln!("--- TblA (*0x0c101164) ---");
+        kprintln!("--- TblA (*{:#010x}) ---", kg.object_table_a_ptr);
         for_each_in_table(table_a, OBJ_TYPE_PHYS, |va, _id| {
             dump_phys(va);
             count_a += 1;
         });
     }
     if table_b != 0 && table_b != u32::MAX && table_b != table_a {
-        kprintln!("--- TblB (*0x0c100fc8) ---");
+        kprintln!("--- TblB (*{:#010x}) ---", kg.object_table_b_ptr);
         for_each_in_table(table_b, OBJ_TYPE_PHYS, |va, _id| {
             dump_phys(va);
             count_b += 1;
         });
     }
-    kprintln!("--- gObjectTable ({:#x}) ---", G_OBJECT_TABLE);
+    kprintln!("--- gObjectTable ({:#x}) ---", kg.object_table);
     for_each_object_of_kind(OBJ_TYPE_PHYS, |va, _id| {
         dump_phys(va);
         count_g += 1;
@@ -1407,7 +1432,7 @@ pub extern "C" fn dump_chain_at(ctx: &crate::arch::trap_context::TrapContext, pc
     // garbage. Treat curr==0 (and any read failure) as "no task yet"
     // and skip the task-identity header — the chain itself is the
     // useful part either way.
-    let curr = rd(G_CURRENT_TASK).unwrap_or(0);
+    let curr = kg().and_then(|kg| rd(kg.current_task)).unwrap_or(0);
     if curr == 0 {
         kprintln!(
             "  current task <none — scheduler not yet up>  mode={:#x}  [pc={:#x} lr={:#x} sp={:#x} fp={:#x}]",

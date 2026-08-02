@@ -260,6 +260,7 @@ fn print_banner() {
     kprintln!("===============================================");
     kprintln!(" Newton Hypervisor v{}  (baremetal, M0)", VERSION);
     kprintln!(" Target: {}", host::platform::NAME);
+    kprintln!(" ROM:    {}", newton::rom_ver::NAME);
     kprintln!("===============================================");
     kprintln!("Current EL: {}", arch::cpu::current_el());
     kprintln!("Core ID:    {}", arch::cpu::core_id());

@@ -11,7 +11,26 @@ name = "newton-hypervisor"
 path = "src/main.rs"
 
 [features]
-default = ["platform-raspi3b", "log_traps", "log_irqs", "log_host_io", "diag"]
+default = ["platform-raspi3b", "rom-717006", "log_traps", "log_irqs", "log_host_io", "diag"]
+
+# Guest-ROM-version selection. Exactly one must be enabled; build.rs
+# panics otherwise (mirrors the platform-* axis). The selected feature
+# picks the `src/newton/rom_ver/` constants module (code addresses,
+# kernel globals, probe PCs, ROM-tail placement budgets) and the
+# build-time inputs (ROM image path, REx path, symbol tables, flash
+# filename) via `resolve_rom_version()` in build.rs.
+#
+#   rom-717006 — MP2100 US, the fully-supported version. Inputs stay
+#                at their historical locations (roms/newton.rom,
+#                ../_Data_/Einstein.rex, ../_Data_/symbols.txt); a
+#                per-version override at roms/717006/newton.rom is
+#                honoured when present.
+#   rom-710031 — skeleton seam-proof: Tier-1 constants only, all
+#                probe/patch groups None/empty, no ROM image checked
+#                in. Compiles (build.rs stages a zero-length ROM
+#                placeholder); booting halts loudly in the loader.
+rom-717006 = []
+rom-710031 = []
 
 # Diagnostics layer (src/diag/): trap histograms, task/heap dumps, REP
 # output rendering, guest breakpoints, the ROM symbol tables backing
@@ -186,20 +205,21 @@ no-semihost = []
 # host-fs-backed flash. host-io defaults to null already, so it's
 # omitted here. Build with:
 #   cargo build --release --no-default-features --features pi-bare-metal
-pi-bare-metal = ["platform-raspi3b", "no-semihost", "flash-persist-null", "diag"]
+pi-bare-metal = ["platform-raspi3b", "rom-717006", "no-semihost", "flash-persist-null", "diag"]
 
 # Real-Pi build with persistent flash backed by the SD card's FAT32
 # boot partition. Identical to `pi-bare-metal` except the flash
 # backend is `sd` instead of `null`. Build:
 #   cargo build --release --no-default-features \
 #     --features pi-bare-metal-sd
-pi-bare-metal-sd = ["platform-raspi3b", "no-semihost", "flash-persist-sd", "diag"]
+pi-bare-metal-sd = ["platform-raspi3b", "rom-717006", "no-semihost", "flash-persist-sd", "diag"]
 
 # Full real-Pi build: SD-backed flash + HDMI framebuffer output.
 # Newton boots and paints to a mini-HDMI monitor. Pen input is
 # still unwired (Phase 5).
 pi-bare-metal-display = [
     "platform-raspi3b",
+    "rom-717006",
     "no-semihost",
     "flash-persist-sd",
     "host-io-pi-fb",
@@ -213,6 +233,7 @@ pi-bare-metal-display = [
 #     --features pi-bare-metal-input
 pi-bare-metal-input = [
     "platform-raspi3b",
+    "rom-717006",
     "no-semihost",
     "flash-persist-sd",
     "host-io-pi-fb",

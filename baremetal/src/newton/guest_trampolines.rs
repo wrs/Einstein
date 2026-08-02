@@ -31,6 +31,8 @@ use crate::hv::guest_mem::{rom_host_pa, write_rom_code_word, write_rom_data_word
 use crate::hv::hvc_imm::HvcImm;
 use crate::kprintln;
 
+use super::rom_ver;
+
 /// Install the AArch32 UND-vector trampoline.
 ///
 /// The trampoline body lives in the 16 MiB ROM region at offset
@@ -117,7 +119,7 @@ use crate::kprintln;
 ///
 /// Safety: caller must hold exclusive access to the ROM backing
 /// store. Writes 13 words at the trampoline offset + 1 word at 0x04.
-const UND_TRAMP_OFFSET: usize = 0x00FF_FF00;
+const UND_TRAMP_OFFSET: usize = rom_ver::ROM_TAIL.und_tramp as usize;
 
 /// FPA-class UND bypass stub at `0x00FF_FEC0`. The UND vector at IPA
 /// 0x04 branches here first; the stub checks if the faulting instruction
@@ -162,7 +164,7 @@ const UND_TRAMP_OFFSET: usize = 0x00FF_FF00;
 /// original USR value when it executes its own `mcr p15,0,r12,...`-
 /// less prologue. SP_und / LR_und / SPSR_und are untouched — exactly
 /// the architectural state SA-110 hardware delivered to the FPE.
-pub const FPA_BYPASS_STUB_OFFSET: usize = 0x00FF_FEC0;
+pub const FPA_BYPASS_STUB_OFFSET: usize = rom_ver::ROM_TAIL.fpa_bypass_stub as usize;
 
 /// DABT-vector trampoline body. Installed at ROM offset 0x00FF_FFA8.
 /// Saves LR_abt/SP_abt/SPSR_abt natively from
@@ -186,7 +188,7 @@ pub const FPA_BYPASS_STUB_OFFSET: usize = 0x00FF_FEC0;
 ///   +0x0C: SP_svc
 ///   +0x10: SPSR_svc
 ///   +0x14: LR_svc
-pub const DABT_TRAMP_OFFSET: usize = 0x00FF_FFA8;
+pub const DABT_TRAMP_OFFSET: usize = rom_ver::ROM_TAIL.dabt_tramp as usize;
 
 /// iter-59: AArch32-side fast-forward DABT trampoline. Installed in
 /// the head of the SBA stub pool (which has plenty of free space).
@@ -194,11 +196,11 @@ pub const DABT_TRAMP_OFFSET: usize = 0x00FF_FFA8;
 /// Routes by DFSC straight from AArch32 ABT mode without an EL2 round
 /// trip in the common kernel-handled cases:
 ///
-///   DFSC == 0x07 (translation, page)     → branch DAH @ 0x00393114
-///   DFSC == 0x0F (permission, page)      → branch DAH @ 0x00393114
-///   DFSC == 0x0D (permission, section)   → branch DAH @ 0x00393114
-///   DFSC == 0x06 (access flag, page)     → branch DAH @ 0x00393114
-///   DFSC == 0x03 (access flag, section)  → branch DAH @ 0x00393114
+///   DFSC == 0x07 (translation, page)     → branch kernel DAH
+///   DFSC == 0x0F (permission, page)      → branch kernel DAH
+///   DFSC == 0x0D (permission, section)   → branch kernel DAH
+///   DFSC == 0x06 (access flag, page)     → branch kernel DAH
+///   DFSC == 0x03 (access flag, section)  → branch kernel DAH
 ///   anything else                        → fall through to DABT_TRAMP_OFFSET
 ///                                          (slow EL2 path: DFSC=0x05
 ///                                          translation-section needs
@@ -217,21 +219,12 @@ pub const DABT_TRAMP_OFFSET: usize = 0x00FF_FFA8;
 /// Located in the unused tail between Einstein.rex (ends ~0x847000)
 /// and the tracer trampoline pool (starts at 0x900000). 64 words
 /// reserved; the trampoline body uses ~16.
-pub const DABT_FAST_TRAMP_OFFSET: usize = 0x008F_FF00;
-pub const DABT_FAST_TRAMP_DAH_TARGET: u32 = 0x0039_3114;
+pub const DABT_FAST_TRAMP_OFFSET: usize = rom_ver::ROM_TAIL.dabt_fast_tramp as usize;
 /// Save area for the DABT trampoline, at `HYP_TRAMP_SCRATCH_BASE + 0xA0`
 /// = IPA 0x0600_00A0 (the first page of the SCRATCH_POOL). Identity-
 /// mapped, so the same address works pre-MMU and post-MMU and no
 /// literal swap is required. See `trap::HYP_TRAMP_SCRATCH_BASE`.
 pub const DABT_SAVE_PA: u32 = crate::hv::trap::HYP_TRAMP_SCRATCH_BASE + 0xA0;
-
-/// Upper bound of the contiguous patch-stub / FPA-bypass / UND-return /
-/// UND-trampoline code region in the ROM aperture tail. The region runs
-/// from `rom_patches::PATCH_STUB_ARENA_BASE` (0x00FF_FD80) up to the top
-/// of the 16 MiB ROM aperture; it holds, in order, the patch-stub arena,
-/// the FPA bypass stub (`FPA_BYPASS_STUB_OFFSET`), the UND-return stub
-/// (`UND_RETURN_STUB_OFFSET`), and the UND trampoline (0x00FF_FF00).
-pub const ROM_TAIL_STUBS_END: u32 = 0x0100_0000;
 
 // ---------------------------------------------------------------------
 // UND-path guest resume (through the UND-return stub above)
@@ -267,7 +260,8 @@ pub fn return_to_guest_from_und(_ctx: &mut crate::arch::trap_context::TrapContex
     // ERET target.
     let mode = (_spsr as u32) & 0x1F;
     let elr32 = elr as u32;
-    let in_und_tramp = elr32 >= 0x00FF_FF00 && elr32 < 0x00FF_FF60;
+    let in_und_tramp = elr32 >= UND_TRAMP_OFFSET as u32
+        && elr32 < (UND_TRAMP_OFFSET as u32 + 0x60);
     let in_fpa_bypass = elr32 >= FPA_BYPASS_STUB_OFFSET as u32
         && elr32 < (FPA_BYPASS_STUB_OFFSET as u32 + 0x40);
     if mode == 0x10 && (in_und_tramp || in_fpa_bypass) {
@@ -345,32 +339,31 @@ pub fn return_to_guest_from_und(_ctx: &mut crate::arch::trap_context::TrapContex
 /// `guest_endian`, so the byte-order predicate and the autosave-gating
 /// predicate want exactly the same set.
 pub fn register_hyp_code_ranges() {
-    // Tracer trampoline pool, `tracer::TRAMPOLINE_IPA..TRAMPOLINE_END`.
-    // Hardcoded here (not via `crate::diag::tracer`) because the `tracer`
+    // Tracer trampoline pool. Registered from the `rom_ver::ROM_TAIL`
+    // fields (not via `crate::diag::tracer`) because the `tracer`
     // module is `#[cfg(feature = "trace")]`-only, while these ranges
     // must be registered in every build. The pool is empty ROM tail when
     // the feature is off, so registering the range unconditionally is
     // harmless.
-    const TRACER_POOL_BASE: u32 = 0x0090_0000;
-    const TRACER_POOL_END: u32 = 0x00E0_0000;
+    let tail = rom_ver::ROM_TAIL;
 
     // DABT fast trampoline (between Einstein.rex tail and tracer pool).
     crate::hv::layout::register_hyp_code_range(
         "DABT fast trampoline",
-        DABT_FAST_TRAMP_OFFSET as u32,
-        TRACER_POOL_BASE,
+        tail.dabt_fast_tramp,
+        tail.tracer_pool_base,
     );
     crate::hv::layout::register_hyp_code_range(
         "tracer trampoline pool",
-        TRACER_POOL_BASE,
-        TRACER_POOL_END,
+        tail.tracer_pool_base,
+        tail.tracer_pool_end,
     );
-    // Patch-stub arena → FPA bypass stub → UND-return stub → UND
-    // trampoline, all contiguous in the ROM aperture tail.
+    // Patch-stub arena → FPA bypass stub → UND trampoline → UND-return
+    // stub, all contiguous in the ROM aperture tail.
     crate::hv::layout::register_hyp_code_range(
         "patch-stub arena + ROM-tail stubs",
-        crate::newton::rom_patches::PATCH_STUB_ARENA_BASE,
-        ROM_TAIL_STUBS_END,
+        tail.patch_stub_arena_base,
+        tail.stubs_end,
     );
 }
 
@@ -424,14 +417,24 @@ pub fn register_hyp_code_ranges() {
 /// reserved region; caller must own the ROM backing.
 pub unsafe fn patch_dabt_vector(rom_ptr: *mut u32) {
     unsafe {
-        // VA 0x10 → branch to the iter-59 fast trampoline (which
-        // dispatches by DFSC; common cases jump straight to kernel
-        // DAH; uncommon cases fall through to the slow DABT_TRAMP).
-        let imm24 = ((DABT_FAST_TRAMP_OFFSET as u32).wrapping_sub(0x10 + 8) / 4) & 0x00FF_FFFF;
-        let branch_insn = 0xEA00_0000 | imm24;
-        write_rom_code_word(rom_ptr, 4, branch_insn);    // 0x10: b DABT_FAST_TRAMP_OFFSET
+        if let Some(dah_va) = rom_ver::DATA_ABORT_HANDLER_VA {
+            // VA 0x10 → branch to the iter-59 fast trampoline (which
+            // dispatches by DFSC; common cases jump straight to kernel
+            // DAH; uncommon cases fall through to the slow DABT_TRAMP).
+            let imm24 = ((DABT_FAST_TRAMP_OFFSET as u32).wrapping_sub(0x10 + 8) / 4) & 0x00FF_FFFF;
+            let branch_insn = 0xEA00_0000 | imm24;
+            write_rom_code_word(rom_ptr, 4, branch_insn);    // 0x10: b DABT_FAST_TRAMP_OFFSET
 
-        install_dabt_fast_trampoline(rom_ptr);
+            install_dabt_fast_trampoline(rom_ptr, dah_va);
+        } else {
+            // The kernel's DataAbortHandler VA is unknown for this ROM
+            // version — no fast-forward path. VA 0x10 branches straight
+            // at the slow trampoline: every DABT takes the EL2 HVC path
+            // (`GuestOs::handle_dabt_dispatch`), whose forwardable arms
+            // halt loudly in turn.
+            let imm24 = ((DABT_TRAMP_OFFSET as u32).wrapping_sub(0x10 + 8) / 4) & 0x00FF_FFFF;
+            write_rom_code_word(rom_ptr, 4, 0xEA00_0000 | imm24);
+        }
 
         let db = DABT_TRAMP_OFFSET / 4;
         write_rom_code_word(rom_ptr, db +  0, 0xEE0D_0F50); // mcr p15,0,r0,c13,c0,2
@@ -528,7 +531,7 @@ pub unsafe fn patch_dabt_vector(rom_ptr: *mut u32) {
 ///   ft+31: mrc p15,0,r0,c13,c0,2     ; restore R0 from TPIDRURW
 ///   ft+32: mrc p15,0,r1,c13,c0,3     ; restore R1 from TPIDRRO
 ///   ft+33: ldr pc, [pc, #-4]         ; pc+8-4 = ft+33+4 → literal at ft+34
-///   ft+34: literal: 0x00393114       ; kernel DataAbortHandler VA
+///   ft+34: literal: DAH VA           ; rom_ver::DATA_ABORT_HANDLER_VA
 ///   ; C7_NOOP:
 ///   ft+35: mrc p15,0,r0,c13,c0,2     ; restore R0
 ///   ft+36: mrc p15,0,r1,c13,c0,3     ; restore R1
@@ -565,7 +568,7 @@ pub unsafe fn patch_dabt_vector(rom_ptr: *mut u32) {
 ///
 /// SAFETY: writes 41 words in the reserved range
 /// `DABT_FAST_TRAMP_OFFSET .. + 41*4`. Caller owns the ROM backing.
-pub unsafe fn install_dabt_fast_trampoline(rom_ptr: *mut u32) {
+pub unsafe fn install_dabt_fast_trampoline(rom_ptr: *mut u32, dah_va: u32) {
     unsafe {
         let ft = DABT_FAST_TRAMP_OFFSET / 4;
 
@@ -649,7 +652,7 @@ pub unsafe fn install_dabt_fast_trampoline(rom_ptr: *mut u32) {
         write_rom_code_word(rom_ptr, ft + 31, 0xEE1D_0F50); // mrc p15,0,r0,c13,c0,2 (restore R0)
         write_rom_code_word(rom_ptr, ft + 32, 0xEE1D_1F70); // mrc p15,0,r1,c13,c0,3 (restore R1)
         write_rom_code_word(rom_ptr, ft + 33, 0xE51F_F004); // ldr pc, [pc, #-4]
-        write_rom_data_word(rom_ptr, ft + 34, DABT_FAST_TRAMP_DAH_TARGET);
+        write_rom_data_word(rom_ptr, ft + 34, dah_va);
         // C7_NOOP: cache-maintenance MCR is a no-op on a coherent
         // host. Restore the registers we stashed and ERET to
         // faulting_PC + 4 in the pre-abt mode (LR_abt = pc + 8 at
@@ -680,7 +683,7 @@ pub unsafe fn install_dabt_fast_trampoline(rom_ptr: *mut u32) {
 /// EQ-conditional LDC that the TCG model treated as a NOP. On FVP Base
 /// RevC the same encoding raises an UNDEFINED exception, so the UND
 /// return path halted with an "unrecognised UND" in early boot.
-pub const UND_RETURN_STUB_OFFSET: usize = 0x00FF_FFE4;
+pub const UND_RETURN_STUB_OFFSET: usize = rom_ver::ROM_TAIL.und_return_stub as usize;
 pub const UND_RETURN_STUB_VA: u32 = UND_RETURN_STUB_OFFSET as u32;
 /// Offset of the target-PC literal inside the stub (written by Rust
 /// handler before ERET).
@@ -707,52 +710,62 @@ pub unsafe fn patch_und_vector(rom: *mut u32) {
         ((FPA_BYPASS_STUB_OFFSET as u32 - 0x0C) / 4) & 0x00FF_FFFF;
     let branch_to_bypass = 0xEA00_0000 | imm24_to_bypass;
 
-    // SAFETY: offsets below all sit in 0x00FF_FEC0..0x00FF_FF60,
-    // well under ROM_SIZE (= 16 MiB = 0x0100_0000) and inside the
-    // reserved window checked by `tracer::in_reserved_range`.
+    // SAFETY: offsets below all sit inside the reserved ROM-tail
+    // window (`rom_ver::ROM_TAIL`), well under ROM_SIZE (= 16 MiB)
+    // and inside the range checked by `tracer::in_reserved_range`.
     unsafe {
-        write_rom_code_word(rom, 1, branch_to_bypass);   // 0x04: b FPA_BYPASS_STUB_OFFSET
+        if let Some(fpe_jt) = rom_ver::FPE_JT_VA {
+            write_rom_code_word(rom, 1, branch_to_bypass);   // 0x04: b FPA_BYPASS_STUB_OFFSET
 
-        // FPA-class UND bypass stub. See `FPA_BYPASS_STUB_OFFSET`
-        // doc comment for the per-word commentary; reproduced here
-        // alongside the encodings.
-        //
-        // Two-stage check: bits[27:24] in {0xC, 0xD, 0xE} (LDC/STC/CDP/MCR),
-        // *then* bits[11:8] in {1, 2} (FPA cp_num). The first stage rules
-        // out UDF (bits[27:24]=0x7), software breakpoints, tracer UDFs,
-        // shadow-byte-access UDFs (all bits[27:24]=0x7), and other
-        // non-coprocessor UND-causing insns. The second stage rules out
-        // VFP/Advanced-SIMD (cp_num 10/11) — though those don't appear
-        // in 717006 ROM, the check keeps the stub future-proof.
-        let s = FPA_BYPASS_STUB_OFFSET / 4;
-        write_rom_code_word(rom, s +  0, 0xEE0D_CF50);  // mcr p15,0,r12,c13,c0,2
-        write_rom_code_word(rom, s +  1, 0xE51E_C004);  // ldr r12, [lr, #-4]
-        write_rom_code_word(rom, s +  2, 0xE20C_C40F);  // and r12, r12, #0x0F000000
-        write_rom_code_word(rom, s +  3, 0xE35C_040C);  // cmp r12, #0x0C000000
-        write_rom_code_word(rom, s +  4, 0x135C_040D);  // cmpne r12, #0x0D000000
-        write_rom_code_word(rom, s +  5, 0x135C_040E);  // cmpne r12, #0x0E000000
-        write_rom_code_word(rom, s +  6, 0x1A00_0006);  // bne stub+0x38 (fall_through)
-        write_rom_code_word(rom, s +  7, 0xE51E_C004);  // ldr r12, [lr, #-4]  (reload)
-        write_rom_code_word(rom, s +  8, 0xE20C_CC0F);  // and r12, r12, #0xF00
-        write_rom_code_word(rom, s +  9, 0xE35C_0C01);  // cmp r12, #0x100
-        write_rom_code_word(rom, s + 10, 0x135C_0C02);  // cmpne r12, #0x200
-        write_rom_code_word(rom, s + 11, 0x1A00_0001);  // bne stub+0x38 (fall_through)
-        write_rom_code_word(rom, s + 12, 0xEE1D_CF50);  // mrc p15,0,r12,c13,c0,2  (FPA)
-        // b FPE_JT (0x38d874). PC at this insn = stub+0x34.
-        // PC+8 = stub+0x3C. imm24 = (target - PC+8) / 4.
-        let pc_plus_8 = (FPA_BYPASS_STUB_OFFSET + 0x34 + 8) as i32;
-        let target_fpe = 0x0038_D874_i32;
-        let imm24_fpe =
-            (((target_fpe - pc_plus_8) >> 2) as u32) & 0x00FF_FFFF;
-        write_rom_code_word(rom, s + 13, 0xEA00_0000 | imm24_fpe); // b FPE_JT
-        write_rom_code_word(rom, s + 14, 0xEE1D_CF50);  // mrc p15,0,r12,c13,c0,2  (fall_through)
-        // b UND_TRAMP_OFFSET. PC+8 = stub+0x44 = 0x00FF_FF04. Target =
-        // 0x00FF_FF00. offset = -4 bytes = -1 word; imm24 = 0xFFFFFF.
-        let pc_plus_8b = (FPA_BYPASS_STUB_OFFSET + 0x3C + 8) as i32;
-        let target_tramp = UND_TRAMP_OFFSET as i32;
-        let imm24_tramp =
-            (((target_tramp - pc_plus_8b) >> 2) as u32) & 0x00FF_FFFF;
-        write_rom_code_word(rom, s + 15, 0xEA00_0000 | imm24_tramp); // b UND_TRAMP
+            // FPA-class UND bypass stub. See `FPA_BYPASS_STUB_OFFSET`
+            // doc comment for the per-word commentary; reproduced here
+            // alongside the encodings.
+            //
+            // Two-stage check: bits[27:24] in {0xC, 0xD, 0xE} (LDC/STC/CDP/MCR),
+            // *then* bits[11:8] in {1, 2} (FPA cp_num). The first stage rules
+            // out UDF (bits[27:24]=0x7), software breakpoints, tracer UDFs,
+            // shadow-byte-access UDFs (all bits[27:24]=0x7), and other
+            // non-coprocessor UND-causing insns. The second stage rules out
+            // VFP/Advanced-SIMD (cp_num 10/11) — though those don't appear
+            // in 717006 ROM, the check keeps the stub future-proof.
+            let s = FPA_BYPASS_STUB_OFFSET / 4;
+            write_rom_code_word(rom, s +  0, 0xEE0D_CF50);  // mcr p15,0,r12,c13,c0,2
+            write_rom_code_word(rom, s +  1, 0xE51E_C004);  // ldr r12, [lr, #-4]
+            write_rom_code_word(rom, s +  2, 0xE20C_C40F);  // and r12, r12, #0x0F000000
+            write_rom_code_word(rom, s +  3, 0xE35C_040C);  // cmp r12, #0x0C000000
+            write_rom_code_word(rom, s +  4, 0x135C_040D);  // cmpne r12, #0x0D000000
+            write_rom_code_word(rom, s +  5, 0x135C_040E);  // cmpne r12, #0x0E000000
+            write_rom_code_word(rom, s +  6, 0x1A00_0006);  // bne stub+0x38 (fall_through)
+            write_rom_code_word(rom, s +  7, 0xE51E_C004);  // ldr r12, [lr, #-4]  (reload)
+            write_rom_code_word(rom, s +  8, 0xE20C_CC0F);  // and r12, r12, #0xF00
+            write_rom_code_word(rom, s +  9, 0xE35C_0C01);  // cmp r12, #0x100
+            write_rom_code_word(rom, s + 10, 0x135C_0C02);  // cmpne r12, #0x200
+            write_rom_code_word(rom, s + 11, 0x1A00_0001);  // bne stub+0x38 (fall_through)
+            write_rom_code_word(rom, s + 12, 0xEE1D_CF50);  // mrc p15,0,r12,c13,c0,2  (FPA)
+            // b FPE_JT (`rom_ver::FPE_JT_VA`). PC at this insn = stub+0x34.
+            // PC+8 = stub+0x3C. imm24 = (target - PC+8) / 4.
+            let pc_plus_8 = (FPA_BYPASS_STUB_OFFSET + 0x34 + 8) as i32;
+            let target_fpe = fpe_jt as i32;
+            let imm24_fpe =
+                (((target_fpe - pc_plus_8) >> 2) as u32) & 0x00FF_FFFF;
+            write_rom_code_word(rom, s + 13, 0xEA00_0000 | imm24_fpe); // b FPE_JT
+            write_rom_code_word(rom, s + 14, 0xEE1D_CF50);  // mrc p15,0,r12,c13,c0,2  (fall_through)
+            // b UND_TRAMP_OFFSET. PC+8 = stub+0x44. offset = -4 bytes
+            // = -1 word; imm24 = 0xFFFFFF.
+            let pc_plus_8b = (FPA_BYPASS_STUB_OFFSET + 0x3C + 8) as i32;
+            let target_tramp = UND_TRAMP_OFFSET as i32;
+            let imm24_tramp =
+                (((target_tramp - pc_plus_8b) >> 2) as u32) & 0x00FF_FFFF;
+            write_rom_code_word(rom, s + 15, 0xEA00_0000 | imm24_tramp); // b UND_TRAMP
+        } else {
+            // The kernel FPE entry is unknown for this ROM version —
+            // skip the FPA bypass stub and point the UND vector
+            // straight at the trampoline; FPA-class UNDs reach EL2 and
+            // halt loudly there.
+            let imm24_to_tramp =
+                ((UND_TRAMP_OFFSET as u32 - 0x0C) / 4) & 0x00FF_FFFF;
+            write_rom_code_word(rom, 1, 0xEA00_0000 | imm24_to_tramp);
+        }
 
         let base = UND_TRAMP_OFFSET / 4;
         write_rom_code_word(rom, base +  0, 0xEE0D_CF50);  // mcr p15,0,r12,c13,c0,2

@@ -29,6 +29,27 @@ pub enum UndHvcOutcome {
     NotMine,
 }
 
+/// Guest-OS-supplied hints for the UND-history caller-LR heuristic in
+/// `trap::und::record_und_history`: the semaphore `Swap` helper's PC
+/// plus the Acquire/Release return-LR signatures and the stack offsets
+/// their compiled prologues put the caller LRs at. Pure diagnostics —
+/// `None` just drops the caller columns from the UND history dump.
+#[derive(Copy, Clone)]
+pub struct UndDiagHints {
+    /// The SWP-bearing semaphore `Swap` helper's PC.
+    pub swap_helper_pc: u32,
+    /// LR_usr value identifying a Swap call from `Acquire`.
+    pub acquire_ret_lr: u32,
+    /// Stack offset of Acquire's caller LR (the Grabber constructor).
+    pub acquire_caller_sp_off: u32,
+    /// Stack offset of the Grabber constructor's own caller LR.
+    pub acquire_outer_sp_off: u32,
+    /// LR_usr value identifying a Swap call from `Release`.
+    pub release_ret_lr: u32,
+    /// Stack offset of Release's caller LR.
+    pub release_caller_sp_off: u32,
+}
+
 /// Guest-OS extension points consumed by the hv core. Implemented by
 /// the zero-sized [`crate::newton::NewtonOs`]; a future guest (or a
 /// null guest for bring-up) swaps in by retargeting [`ActiveGuest`].
@@ -111,6 +132,20 @@ pub trait GuestOs {
     /// when the write was recognised and dropped — caller advances
     /// ELR; false falls through to the generic DABT paths.
     fn maybe_drop_flash_write(ctx: &mut TrapContext, iss: u32, ipa: u64, elr: u32) -> bool;
+
+    /// Guest VA the guest OS wants FPA-class UND instructions routed
+    /// to (the kernel's floating-point emulator entry). `None` — the
+    /// address isn't known for this ROM version — makes `handle_und`
+    /// halt loudly on the first FPA-class UND instead of ERETing into
+    /// the wrong place.
+    fn fpe_redirect_va() -> Option<u32>;
+
+    /// Diagnostic hints for the UND-history caller-LR heuristic.
+    fn und_diag_hints() -> Option<UndDiagHints>;
+
+    /// Base of the guest-side UND trampoline, for the unrecognised-UND
+    /// halt path's trampoline-area dump.
+    fn und_tramp_base() -> u32;
 }
 
 /// The guest OS this build runs. The single sanctioned hv → newton

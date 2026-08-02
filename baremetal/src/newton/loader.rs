@@ -20,17 +20,22 @@ use crate::kprintln;
 
 // Big-endian ROM dump captured from hardware. Each 32-bit word is stored
 // with the MSB first in memory. Guest runs little-endian, so we byteswap
-// word-by-word during load.
+// word-by-word during load. The path is resolved per ROM version by
+// `resolve_rom_version()` in build.rs; when the selected version's ROM
+// image isn't present on disk, build.rs stages a zero-length placeholder
+// (so `cargo check` of a skeleton version stays green) and
+// `load_newton_rom` halts loudly at boot instead.
 #[cfg(not(nh_guest_test))]
-static ROM_BE: &[u8] = include_bytes!("../../roms/newton.rom");
+static ROM_BE: &[u8] = include_bytes!(env!("NH_ROM_PATH"));
 
 // Einstein's REx goes into the second 8 MB of the 16 MB ROM region, at
-// PA 0x00800000..0x01000000. Same big-endian → little-endian byteswap as
+// `rom_ver::REX.pa_offset`. Same big-endian → little-endian byteswap as
 // the main ROM. Maps the Newton kernel's high-half VA 0x01000000 onwards
 // once the guest programs its stage-1 to point there.
 // See Emulator/ROM/TFlatROMImageWithREX.cpp:139-178 for the layout.
+// Path resolved by build.rs alongside the ROM image.
 #[cfg(not(nh_guest_test))]
-static REX_BE: &[u8] = include_bytes!("../../../_Data_/Einstein.rex");
+static REX_BE: &[u8] = include_bytes!(env!("NH_REX_PATH"));
 
 // Guest-test mode: `build.rs` picked up $NH_GUEST_TEST and set this cfg.
 // The test binary is an AArch32 flat binary with reset vector at offset
@@ -283,6 +288,27 @@ pub unsafe fn load_guest_test() {
 
 #[cfg(not(nh_guest_test))]
 pub unsafe fn load_newton_rom() {
+    // A zero-length ROM_BE is build.rs's placeholder for a ROM version
+    // whose image isn't checked in (see `resolve_rom_version`). The
+    // build compiles — proving the version contract — but there is
+    // nothing to boot.
+    if ROM_BE.is_empty() {
+        kprintln!(
+            "*** loader: no ROM image staged for version {} — place the \
+             image at roms/<ver>/newton.rom and regenerate the classifier \
+             bitmap (scripts/regen-classify.sh); halting",
+            super::rom_ver::NAME,
+        );
+        crate::arch::cpu::halt();
+    }
+    if ROM_BE.len() != super::rom_ver::ROM_IMAGE_SIZE {
+        kprintln!(
+            "*** loader: ROM image is {} bytes but rom_ver::ROM_IMAGE_SIZE \
+             for {} is {:#x}; wrong image? halting",
+            ROM_BE.len(), super::rom_ver::NAME, super::rom_ver::ROM_IMAGE_SIZE,
+        );
+        crate::arch::cpu::halt();
+    }
     let rom_ptr = rom_host_pa() as *mut u32;
     let be_words = ROM_BE.len() / 4;
 
@@ -321,18 +347,18 @@ pub unsafe fn load_newton_rom() {
         }
     }
 
-    // Load Einstein's REx at PA 0x00800000 (= the second 8 MB of the 16 MB
-    // ROM region). The kernel's stage-1 MMU maps this to VA 0x01000000
-    // once it programs its page tables. Same BE->LE byteswap as the main
-    // ROM, because the guest runs little-endian.
-    const REX_PA_OFFSET: usize = 0x00800000;
+    // Load Einstein's REx at `rom_ver::REX.pa_offset` (= the second
+    // 8 MB of the 16 MB ROM region). The kernel's stage-1 MMU maps this
+    // to VA 0x01000000 once it programs its page tables. Same BE->LE
+    // byteswap as the main ROM, because the guest runs little-endian.
+    let rex_pa_offset: usize = super::rom_ver::REX.pa_offset as usize;
     let rex_words = REX_BE.len() / 4;
     kprintln!(
         "loader: loading {} bytes of Einstein.rex at PA {:#x} (BE-8: code-vs-data per bitmap)",
-        REX_BE.len(), REX_PA_OFFSET,
+        REX_BE.len(), rex_pa_offset,
     );
-    assert!(REX_BE.len() <= ROM_SIZE - REX_PA_OFFSET);
-    let rex_base_word = REX_PA_OFFSET / 4;
+    assert!(REX_BE.len() <= ROM_SIZE - rex_pa_offset);
+    let rex_base_word = rex_pa_offset / 4;
     for i in 0..rex_words {
         let off = i * 4;
         let on_disk = [
@@ -357,16 +383,17 @@ pub unsafe fn load_newton_rom() {
     }
 
     // Patch the external REx's id field to one past the last embedded-REx
-    // id. Mirrors Einstein/Emulator/ROM/TROMImage.cpp::LookForREXes
-    // (line 311-313): "Patch the REx to have a sequential ID, or NewtonOS
-    // will be very confused and erase the user's Flash image." The 717006
-    // ROM has exactly one embedded REx (id=0) living at base_size
-    // 0x71FC4C, so the first external REx at 0x00800000 must claim id=1.
-    // Without the patch, NewtonOS's PrimNextRExConfigEntry indexes a
-    // per-id config table and never finds our REx — SearchForFlashDrivers
-    // therefore never sees the 'fdrv' entry that registers
-    // TEinsteinFlashDriver, and the kernel falls back to the built-in
-    // T28F016_SA_SVDriver whose Identify fails against our stub flash.
+    // id (`rom_ver::REX.num_embedded_rexes`). Mirrors
+    // Einstein/Emulator/ROM/TROMImage.cpp::LookForREXes (line 311-313):
+    // "Patch the REx to have a sequential ID, or NewtonOS will be very
+    // confused and erase the user's Flash image." The 717006 ROM has
+    // exactly one embedded REx (id=0), so its first external REx claims
+    // id=1. Without the patch, NewtonOS's PrimNextRExConfigEntry indexes
+    // a per-id config table and never finds our REx —
+    // SearchForFlashDrivers therefore never sees the 'fdrv' entry that
+    // registers TEinsteinFlashDriver, and the kernel falls back to the
+    // built-in T28F016_SA_SVDriver whose Identify fails against our
+    // stub flash.
     //
     // REx header layout (offsets from block start):
     //   +0x00 "RExBlock" magic (8 bytes)
@@ -378,7 +405,7 @@ pub unsafe fn load_newton_rom() {
     //   +0x1C id             <-- the field we patch
     //   +0x20 startAddr
     //   +0x24 numEntries
-    const NUM_EMBEDDED_REXES_717006: u32 = 1;
+    let next_rex_id: u32 = super::rom_ver::REX.num_embedded_rexes;
     let rex_id_word_index = rex_base_word + (0x1C / 4);
     // SAFETY: rex_id_word_index < rex_base_word + 8 < ROM_SIZE / 4 (checked by assert above).
     // The REx id field is data — under BE-8 the kernel reads it via LDR
@@ -387,10 +414,10 @@ pub unsafe fn load_newton_rom() {
     // but using `write_rom_word_by_kind` is robust either way.)
     unsafe {
         let old_id = rom_ptr.add(rex_id_word_index).read();
-        write_rom_word_by_kind(rom_ptr, rex_id_word_index, NUM_EMBEDDED_REXES_717006);
+        write_rom_word_by_kind(rom_ptr, rex_id_word_index, next_rex_id);
         kprintln!(
             "loader: Einstein.rex id patch host_was={:#010x} -> id={} (first free slot after embedded REx)",
-            old_id, NUM_EMBEDDED_REXES_717006,
+            old_id, next_rex_id,
         );
     }
 
@@ -436,8 +463,8 @@ pub unsafe fn load_newton_rom() {
     unsafe {
         let patched = patch_native_prim_mcr_lr_to_r12(
             rom_ptr,
-            REX_PA_OFFSET as u32,
-            (REX_PA_OFFSET + REX_BE.len()) as u32,
+            rex_pa_offset as u32,
+            (rex_pa_offset + REX_BE.len()) as u32,
         );
         kprintln!(
             "loader: rewrote {} NATIVE_PRIM MCR/MOV/ADD/LDR sites in REx (Rd=lr → Rd=r12)",
@@ -464,8 +491,9 @@ pub unsafe fn load_newton_rom() {
 
     // Phase A baseline: Einstein's word-write ROM patches. Skipping
     // these left the kernel in the wrong boot path during Phase B —
-    // see src/newton/rom_patches.rs for the list and rationale.
-    unsafe { super::rom_patches::apply_717006_patches(rom_ptr); }
+    // see `rom_ver::PATCHES` for the list and `rom_patches` for the
+    // installer.
+    unsafe { super::rom_patches::apply_rom_patches(rom_ptr); }
 
     // UND vector (VA 0x04) + trampoline body: overwrite the ROM's
     // branch-to-REx-handler with a branch to the FPA-bypass stub and

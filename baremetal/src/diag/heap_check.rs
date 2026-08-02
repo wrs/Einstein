@@ -26,8 +26,13 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-/// Address of the global `TObjectHeap*` written by `InitObjects__Fv`.
-const G_OBJECT_HEAP: u32 = 0x0c10_5548;
+/// Address of the global `TObjectHeap*` written by `InitObjects__Fv`
+/// (`rom_ver::KERNEL_GLOBALS.object_heap_ptr`); `None` when the
+/// version module has no kernel globals — heap classification then
+/// degrades to tag-only.
+fn g_object_heap() -> Option<u32> {
+    crate::newton::rom_ver::KERNEL_GLOBALS.map(|kg| kg.object_heap_ptr)
+}
 
 /// Cached `(lo, hi)` from the last successful `heap_bounds()` read.
 /// Never goes stale once populated — the heap's outer extent is
@@ -47,7 +52,7 @@ fn read_word(va: u32) -> Option<u32> {
 /// The result is cached permanently once read, so the dependent
 /// reads go through the stage-1 VA walk only — never the PA
 /// fallback `read_word` uses. A PA-fallback read of a kernel-VA
-/// global like `G_OBJECT_HEAP` lands on unrelated physical memory
+/// global like the `TObjectHeap*` slot lands on unrelated physical memory
 /// and would poison the permanent cache with garbage bounds.
 pub fn heap_bounds() -> Option<(u32, u32)> {
     use crate::hv::guest_endian::guest_read_u32_va;
@@ -56,7 +61,7 @@ pub fn heap_bounds() -> Option<(u32, u32)> {
     if cached_lo != 0 || cached_hi != 0 {
         return Some((cached_lo, cached_hi));
     }
-    let heap_ptr = guest_read_u32_va(G_OBJECT_HEAP)?;
+    let heap_ptr = guest_read_u32_va(g_object_heap()?)?;
     if heap_ptr == 0 {
         return None;
     }
@@ -87,31 +92,29 @@ pub fn log_heap_bounds_once() {
         LOGGED.store(1, Ordering::Relaxed);
         crate::kprintln!(
             "heap_check: TObjectHeap @{:#010x} → [{:#010x}, {:#010x}) ({} KiB)",
-            read_word(G_OBJECT_HEAP).unwrap_or(0),
+            g_object_heap().and_then(read_word).unwrap_or(0),
             lo,
             hi,
             (hi - lo) / 1024,
         );
-        #[cfg(feature = "ns_trace")]
-        force_interpreter_trace_on();
+        if cfg!(feature = "ns_trace") {
+            force_interpreter_trace_on();
+        }
     }
     // If `heap_bounds()` returned None (heap not yet up), leave the
     // latch clear so a later poll can succeed.
 }
 
 // `gInterpreter[124]` — the byte at offset `+0x7C` in the
-// `TInterpreter` singleton (`gInterpreter` is reachable as
-// `*0x0c105458`, cf. DoSend's literal at `0x2f06a4`). When non-zero,
-// every `DoSend / DoMessage / DoFastApply` calls `TraceSend /
-// TraceCall / TraceApply`, which funnel into `TraceMethod →
-// Print(POutTranslator*, fmt, ...)`. With the `ns_trace` Print thunk
-// hook in place that surfaces every NS-level call into the EL2 UART.
-#[cfg(feature = "ns_trace")]
-const G_INTERPRETER_PTR: u32 = 0x0c10_5458;
-#[cfg(feature = "ns_trace")]
+// `TInterpreter` singleton (`gInterpreter` is reachable via the
+// `rom_ver::KERNEL_GLOBALS.interpreter_ptr` slot, cf. DoSend's
+// literal). When non-zero, every `DoSend / DoMessage / DoFastApply`
+// calls `TraceSend / TraceCall / TraceApply`, which funnel into
+// `TraceMethod → Print(POutTranslator*, fmt, ...)`. With the
+// `ns_trace` Print thunk hook in place that surfaces every NS-level
+// call into the EL2 UART.
 const TINTERPRETER_TRACE_OFF: u32 = 124;
 
-#[cfg(feature = "ns_trace")]
 fn write_word(va: u32, value: u32) -> bool {
     if crate::hv::guest_endian::guest_write_u32_va(va, value) {
         return true;
@@ -126,9 +129,15 @@ fn write_word(va: u32, value: u32) -> bool {
 /// running in UND mode, where the debug ring-buffer pointer at
 /// obj[28] is NULL → strb to address 0 → unknown-MMIO halt at
 /// PC=0x199ce8.
-#[cfg(feature = "ns_trace")]
 fn force_interpreter_trace_on() {
-    match read_word(G_INTERPRETER_PTR) {
+    let Some(kg) = crate::newton::rom_ver::KERNEL_GLOBALS else {
+        crate::kprintln!(
+            "force_diag: TInterp_trace unavailable for ROM {} (no kernel globals)",
+            crate::newton::rom_ver::NAME
+        );
+        return;
+    };
+    match read_word(kg.interpreter_ptr) {
         Some(p) if p != 0 => {
             if write_word(p.wrapping_add(TINTERPRETER_TRACE_OFF), 1) {
                 crate::kprintln!(

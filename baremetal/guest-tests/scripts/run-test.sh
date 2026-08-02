@@ -101,7 +101,7 @@ else
     rm -f /tmp/newton-snapshot-*.bin
     bin_abs="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
     NH_GUEST_TEST="$bin_abs" cargo build --release \
-        --no-default-features --features "platform-fvp-base diag" 2>&1 | tail -5
+        --no-default-features --features "platform-fvp-base rom-717006 diag" 2>&1 | tail -5
     elf=target/aarch64-unknown-none-softfloat/release/newton-hypervisor
     scripts/fvp --timeout=300 "$elf" > "$log" 2>&1 || true
 fi

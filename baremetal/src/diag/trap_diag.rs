@@ -132,8 +132,14 @@ pub fn irq_heartbeat(ctx: &TrapContext, intid: u32) {
 fn dump_tstacks_and_check_invariants(marker_far: u32) {
     use crate::hv::guest_endian::guest_read_u32_va as rd;
 
-    const G_STACK_MGR_HEAP_LITERAL: u32 = 0x0c10_4c08;
-    let tsm = rd(G_STACK_MGR_HEAP_LITERAL.wrapping_add(4)).unwrap_or(0);
+    let Some(kg) = crate::newton::rom_ver::KERNEL_GLOBALS else {
+        kprintln!(
+            "tstack-dump: unavailable for ROM {} (no kernel globals)",
+            crate::newton::rom_ver::NAME
+        );
+        return;
+    };
+    let tsm = rd(kg.stack_mgr_heap_literal.wrapping_add(4)).unwrap_or(0);
     if tsm == 0 || tsm < 0x0c00_0000 || tsm >= 0x0d00_0000 {
         kprintln!(
             "tstack-dump: gStackManagerHeap[+4]={:#010x} doesn't look like a heap pointer; skipping",
@@ -335,21 +341,12 @@ pub(crate) fn handle_loud_halt(ctx: &TrapContext) -> ! {
     // trampoline emits its HVC). Pick whichever matches a known site.
     let pc_from_elr = elr_el2.wrapping_sub(4);
     let pc_from_lr = caller_lr.wrapping_sub(4);
-    let known = |pc: u32| matches!(pc,
-        crate::newton::rom_patches::REBOOT_PC
-        | crate::newton::rom_patches::POWEROFF_REBOOT_PC
-        | crate::newton::rom_patches::STOP_IMAGE_PC
-        | crate::newton::rom_patches::BUS_ERROR_THROW_PC);
+    let known = |pc: u32| crate::newton::rom_ver::loud_halt_site_name(pc).is_some();
     let site_pc = if known(pc_from_elr) { pc_from_elr }
                   else if known(pc_from_lr) { pc_from_lr }
                   else { pc_from_elr };
-    let site = match site_pc {
-        crate::newton::rom_patches::REBOOT_PC => "Reboot",
-        crate::newton::rom_patches::POWEROFF_REBOOT_PC => "PowerOffAndReboot",
-        crate::newton::rom_patches::STOP_IMAGE_PC => "StopImage",
-        crate::newton::rom_patches::BUS_ERROR_THROW_PC => "BusErrorThrow",
-        _ => "LoudHalt",
-    };
+    let site = crate::newton::rom_ver::loud_halt_site_name(site_pc)
+        .unwrap_or("LoudHalt");
     kprintln!();
     kprintln!(
         "*** LoudHalt canary fired at {} (PC={:#010x}, ELR={:#010x}) ***",
@@ -371,7 +368,9 @@ pub(crate) fn handle_loud_halt(ctx: &TrapContext) -> ! {
     // ResolveFault return value, e.g. -10203/-10204), the FAR_EL1
     // (= the original fault VA), and the relevant TStackInfo bounds
     // so we can identify which stack overflowed.
-    if site_pc == crate::newton::rom_patches::BUS_ERROR_THROW_PC {
+    if crate::newton::rom_ver::LOUD_HALT
+        .is_some_and(|lh| site_pc == lh.bus_error_throw.pc)
+    {
         let far = read_sysreg!("far_el1") as u32;
         // Walk all TStacks and check invariants — output goes BEFORE
         // the per-register dump so the structural picture is visible.

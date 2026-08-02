@@ -1,0 +1,75 @@
+# Tolerated ROM-shaped hex literals outside src/newton/rom_ver/, one
+# per line:
+#
+#   <file> <normalized-literal> # note
+#
+# check-rom-addrs.sh flags any in-range literal NOT matched here, and
+# fails on stale entries (a listed literal that no longer appears must
+# be deleted in the same change). This list was seeded with the
+# phase-8 post-migration residue and may only shrink.
+#
+# Residue categories:
+#   [enc]  instruction-encoding masks / patterns whose numeric value
+#          happens to land in the ROM range — not addresses at all.
+#   [hw]   host-hardware constants (VC mailbox tag IDs, semihosting
+#          reason codes, SDHOST fields) — unrelated to the guest ROM.
+#   [test] compile-time encoder self-test vectors.
+#   [diag] 717006 diagnostic heuristics not yet lifted into rom_ver
+#          (candidates for a future migration; deleting the code or
+#          migrating the constant shrinks this list).
+#   [einstein] Einstein-verbatim model constants in the peripherals
+#          layer (which the layering forbids from importing newton) —
+#          flash-driver vtable PCs, battery ADC scaling, screen
+#          geometry words, kernel-VA window checks.
+
+src/arch/aarch32_emit.rs 0x008fff00 # [test] b() far-branch self-test vector
+src/arch/aarch32_emit.rs 0x00ffffa8 # [test] b() far-branch self-test vector
+src/arch/cpu.rs 0x20026 # [hw] semihosting ADP_Stopped_ApplicationExit
+src/diag/task_dump.rs 0x003ae1fc # [diag] SemaphoreOpGlue range lo (717006)
+src/diag/task_dump.rs 0x003ae204 # [diag] SemaphoreOpGlue range hi (717006)
+src/diag/task_dump.rs 0x0c000000 # [diag] kernel-VA space lower bound
+src/diag/task_dump.rs 0x1ae40 # [diag] TSemaphore [+0x10] signature word (717006)
+src/diag/tracer.rs 0x0034f7e0 # [diag] putc fn addr — line-buffered trace (717006)
+src/diag/trap_diag.rs 0x0008ea8c # [diag] splash-probe VA dump list
+src/diag/trap_diag.rs 0x0008eb00 # [diag] splash-probe VA dump list
+src/diag/trap_diag.rs 0x0008eb08 # [diag] splash-probe VA dump list
+src/diag/trap_diag.rs 0x00ffff00 # [diag] VA dump list (UND trampoline base)
+src/diag/trap_diag.rs 0x0c000000 # [diag] kernel-VA space lower bound
+src/diag/trap_diag.rs 0x0c004c00 # [diag] VA dump list entry
+src/diag/trap_diag.rs 0x0c100000 # [diag] VA dump list entry (kernel globals)
+src/diag/trap_diag.rs 0x0c100800 # [diag] VA dump list entry
+src/diag/trap_diag.rs 0x0c104000 # [diag] VA dump list entry
+src/host/mailbox.rs 0x00028001 # [hw] VC mailbox tag id
+src/host/mailbox.rs 0x00030002 # [hw] VC mailbox tag id
+src/host/mailbox.rs 0x00030047 # [hw] VC mailbox tag id
+src/host/mailbox.rs 0x00038002 # [hw] VC mailbox tag id
+src/host/mailbox.rs 0x00040001 # [hw] VC mailbox tag id
+src/host/mailbox.rs 0x00040002 # [hw] VC mailbox tag id
+src/host/mailbox.rs 0x00040003 # [hw] VC mailbox tag id
+src/host/mailbox.rs 0x00040008 # [hw] VC mailbox tag id
+src/host/mailbox.rs 0x00048001 # [hw] VC mailbox tag id
+src/host/mailbox.rs 0x00048003 # [hw] VC mailbox tag id
+src/host/mailbox.rs 0x00048004 # [hw] VC mailbox tag id
+src/host/mailbox.rs 0x00048005 # [hw] VC mailbox tag id
+src/host/mailbox.rs 0x00048006 # [hw] VC mailbox tag id
+src/host/mailbox.rs 0x00048009 # [hw] VC mailbox tag id
+src/host/sd/sdhost.rs 0xf00000 # [hw] SDHOST HC_VER field mask
+src/newton/loader.rs 0x000cc000 # [enc] Rd+Rn=R12 rewrite bits (NATIVE_PRIM)
+src/newton/loader.rs 0x000ff000 # [enc] Rd+Rn field mask (NATIVE_PRIM)
+src/newton/os.rs 0x004000b0 # [enc] STRH (immediate, A1) pattern
+src/newton/shadow_stub.rs 0x00800090 # [enc] UMULL/SMULL/UMLAL/SMLAL pattern
+src/peripherals/battery.rs 0x000587c0 # [einstein] ADC scaling constant
+src/peripherals/battery.rs 0x001a2f28 # [einstein] ADC scaling constant
+src/peripherals/battery.rs 0x001a8d79 # [einstein] ADC scaling constant
+src/peripherals/battery.rs 0x005c0000 # [einstein] ADC scaling constant
+src/peripherals/battery.rs 0x006cf999 # [einstein] ADC scaling constant
+src/peripherals/battery.rs 0x00e19000 # [einstein] ADC scaling constant
+src/peripherals/battery.rs 0x0c97d000 # [einstein] ADC scaling constant
+src/peripherals/flash_driver.rs 0x0001e180 # [einstein] flash-driver vtable PC (EM300/2100D set)
+src/peripherals/flash_driver.rs 0x0001e3d4 # [einstein] flash-driver vtable PC (717006 32-bit)
+src/peripherals/flash_driver.rs 0x0001e3e0 # [einstein] flash-driver vtable PC
+src/peripherals/flash_driver.rs 0x00ff0000 # [enc] block-address field mask
+src/peripherals/pcmcia.rs 0x0c000000 # [einstein] kernel-VA window check
+src/peripherals/pcmcia.rs 0x0c004400 # [einstein] kernel-VA window check
+src/peripherals/platform.rs 0x00010003 # [einstein] platform-version register value
+src/peripherals/screen.rs 0x00640064 # [einstein] packed 100x100 resolution word

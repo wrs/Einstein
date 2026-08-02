@@ -56,10 +56,11 @@ const HW_RAM_SIZE_2: u64 = 0x0F00_1C00;
 // CheckSerialNumber bytecode and routes the boot through an
 // uninitialised-gLocaleCache crash.
 //
-// These constants are per-device identity, not ROM-version facts: an
-// existing flash store's signature was seeded from them, so they must
-// stay stable for that store to keep validating (Phase 8 keeps them
-// out of `rom_ver/` for the same reason).
+// These constants are per-DEVICE identity, not ROM-version facts —
+// they model the physical serial-number chip, and an existing flash
+// store's signature was seeded from them, so they must stay stable
+// for that store to keep validating. That is why they live here and
+// not in `newton::rom_ver`.
 const ROM_SERIAL_CHIP_IPA: u64 = 0x0F24_3000;
 const ROM_SERIAL_NUMBER_0: u32 = 0x5C4E_6577;
 const ROM_SERIAL_NUMBER_1: u32 = 0x746F_6E01;

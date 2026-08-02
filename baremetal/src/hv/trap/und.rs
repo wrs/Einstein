@@ -63,38 +63,36 @@ fn record_und_history(faulting_pc: u32, insn: u32, spsr_und: u32, ctx: &TrapCont
     // the faulting code's stack was. lr_usr is ctx.x[14]; for non-USR
     // sources it's still informative as the user-space caller LR.
     let sp = crate::arch::banked::sp_for_mode(ctx, spsr_und);
-    // Heuristic caller-LR capture: SWP at the TULockingSemaphore::Swap
-    // helper (0x003ae204) is the wedge signature in `Phase-B stall after
-    // TSoundServer::TheMain stack-collision`. Acquire's prologue pushes
-    // 10 words (`push {r4-r9, fp, ip, lr, pc}`) and calls Swap with no
-    // intervening stack changes; Release's prologue pushes 5 words.
-    // Distinguish by lr_usr (= the bl-Swap return PC):
-    //   0x0025a2c8 → Acquire → caller LR at SP+32
-    //   0x0025a338 → Release → caller LR at SP+12
-    // For Acquire, the immediate caller is TULockingSemaphoreGrabber::ct
-    // (RAII helper at 0x0013b6d4). To find the outer function that
-    // constructed the Grabber we walk one more frame: Grabber::ct's
-    // own pushed LR sits at SP+(40+16) = SP+56, and the function that
-    // CALLED that constructor (i.e. TNewInternalFlash::Read, TMuxStore::Read,
-    // etc.) lives at SP+(64+24+4) = SP+92 — Read pushes 8 words then
-    // `sub sp,#4` before bl Grabber::ct.
+    // Heuristic caller-LR capture: SWP at the guest OS's semaphore
+    // `Swap` helper is the wedge signature in `Phase-B stall after
+    // TSoundServer::TheMain stack-collision`. The helper PC, the
+    // Acquire/Release return-LR signatures, and the compiled-prologue
+    // stack offsets of the caller LRs are ROM-version facts supplied
+    // through `ActiveGuest::und_diag_hints()` (Acquire pushes 10 words
+    // → caller at SP+32, outer Grabber-constructor caller at SP+92;
+    // Release pushes 5 → SP+12, for 717006).
     let lr_usr_raw = ctx.x[14] as u32;
-    let (caller_lr, outer_caller_lr) = if faulting_pc == 0x003a_e204 {
-        if lr_usr_raw == 0x0025_a2c8 {
-            // SWP inside Acquire: SP+32 = caller of Acquire (= Grabber::ct),
-            // SP+92 = caller of Grabber::ct (= the Read function).
-            let c = crate::hv::guest_endian::guest_read_u32_va(sp.wrapping_add(32)).unwrap_or(0);
-            let o = crate::hv::guest_endian::guest_read_u32_va(sp.wrapping_add(92)).unwrap_or(0);
-            (c, o)
-        } else if lr_usr_raw == 0x0025_a338 {
-            // SWP inside Release: SP+12 = caller of Release (= Grabber::dt).
-            let c = crate::hv::guest_endian::guest_read_u32_va(sp.wrapping_add(12)).unwrap_or(0);
-            (c, 0)
-        } else {
-            (0, 0)
+    let hints = ActiveGuest::und_diag_hints();
+    let (caller_lr, outer_caller_lr) = match hints {
+        Some(h) if faulting_pc == h.swap_helper_pc => {
+            if lr_usr_raw == h.acquire_ret_lr {
+                // SWP inside Acquire: caller of Acquire (= Grabber::ct)
+                // and the caller of Grabber::ct (= the Read function).
+                let c = crate::hv::guest_endian::guest_read_u32_va(
+                    sp.wrapping_add(h.acquire_caller_sp_off)).unwrap_or(0);
+                let o = crate::hv::guest_endian::guest_read_u32_va(
+                    sp.wrapping_add(h.acquire_outer_sp_off)).unwrap_or(0);
+                (c, o)
+            } else if lr_usr_raw == h.release_ret_lr {
+                // SWP inside Release: caller of Release (= Grabber::dt).
+                let c = crate::hv::guest_endian::guest_read_u32_va(
+                    sp.wrapping_add(h.release_caller_sp_off)).unwrap_or(0);
+                (c, 0)
+            } else {
+                (0, 0)
+            }
         }
-    } else {
-        (0, 0)
+        _ => (0, 0),
     };
     let entry = UndHistEntry {
         faulting_pc,
@@ -206,7 +204,7 @@ pub(crate) fn handle_und(ctx: &mut TrapContext) {
     // USR-mode HVC probe re-route: HVC is UNDEFINED at EL0, so a guest
     // ROM probe patched as `HVC #imm` and executed from USR mode raises
     // UND and arrives here instead of `handle_hvc`. The probe set (and
-    // the BOOTOS_PC guard) is guest-OS knowledge — consult the hook
+    // the BootOS-site guard) is guest-OS knowledge — consult the hook
     // first; its instruction set is disjoint from every generic arm
     // below, so `NotMine` falls through with unchanged semantics.
     match ActiveGuest::handle_und_hvc(ctx, insn, faulting_pc, spsr_und) {
@@ -456,7 +454,7 @@ pub(crate) fn handle_und(ctx: &mut TrapContext) {
         // post-MMU FPA UND reaches handle_und via UND_TRAMP), and the
         // halt-on-arrival behaviour from iter-83/84/85 era is now the
         // boot stall. Replicate the bypass-stub semantics from EL2:
-        // ERET into UND mode at FPE_JT (= 0x0038_D874).
+        // ERET into UND mode at FPE_JT (`ActiveGuest::fpe_redirect_va`).
         //
         // SPSR_EL2 is left as the natural HVC-from-UND-mode capture,
         // so the ERET drops back to AArch32 EL1 in UND mode. ELR_EL2
@@ -490,8 +488,19 @@ pub(crate) fn handle_und(ctx: &mut TrapContext) {
                 return_to_guest_from_und(ctx, (faulting_pc + 4) as u64, spsr_und);
                 return;
             }
+            // The FPE entry VA is guest-OS knowledge
+            // (`ActiveGuest::fpe_redirect_va`, = rom_ver::FPE_JT_VA).
+            // A version module without it cannot service FPA UNDs —
+            // halt loudly rather than ERET into the wrong place.
+            let Some(fpe_jt) = ActiveGuest::fpe_redirect_va() else {
+                kprintln!(
+                    "*** FPA-class UND insn={:#010x} at PC={:#x} but the guest \
+                     OS has no FPE redirect target (rom_ver::FPE_JT_VA is None)",
+                    insn, faulting_pc,
+                );
+                cpu::halt();
+            };
             log_fpa_bypass_miss(faulting_pc, insn);
-            const FPE_JT_VA: u64 = 0x0038_D874;
             // SAFETY: ELR_EL2 is the AArch64 system register that the
             // sync-trap dispatcher's ERET stub will consume. SPSR_EL2
             // is unchanged (still the AArch32-UND mode the HVC
@@ -500,7 +509,7 @@ pub(crate) fn handle_und(ctx: &mut TrapContext) {
                 core::arch::asm!(
                     "msr elr_el2, {pc}",
                     "isb",
-                    pc = in(reg) FPE_JT_VA,
+                    pc = in(reg) fpe_jt as u64,
                     options(nostack, preserves_flags),
                 );
             }
@@ -591,10 +600,11 @@ pub(crate) fn handle_und(ctx: &mut TrapContext) {
                 }
             }
             // Also dump the trampoline area so we can verify the HVC
-            // is at 0xffff54.
+            // is at the expected trampoline slot.
             kprintln!("trampoline area:");
+            let tramp_base = ActiveGuest::und_tramp_base();
             for off in [0u32, 4, 8, 0x40, 0x44, 0x50, 0x54, 0x58, 0x5C].iter() {
-                let addr = 0x00FF_FF00u32.wrapping_add(*off);
+                let addr = tramp_base.wrapping_add(*off);
                 let v = read_va(addr).unwrap_or(0xDEAD_BEEF);
                 kprintln!("  insn at {:#010x} = {:#010x}", addr, v);
             }

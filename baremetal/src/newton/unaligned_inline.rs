@@ -149,7 +149,7 @@ pub fn try_install_at(faulting_pc: u32) -> bool {
     // tangle our stub mechanism with the tracer's, or modify the SBA
     // pool itself. Newton 717006 + REX fits in the first 8-9 MiB of
     // the ROM aperture.
-    const ALIGN_INLINE_PC_LIMIT: u32 = 0x0090_0000;
+    const ALIGN_INLINE_PC_LIMIT: u32 = crate::newton::rom_ver::ROM_TAIL.tracer_pool_base;
     if faulting_pc & 3 != 0 || faulting_pc >= ALIGN_INLINE_PC_LIMIT {
         REJ_OUTSIDE_ROM.fetch_add(1, Ordering::Relaxed);
         STUBS_REJECTED.fetch_add(1, Ordering::Relaxed);

@@ -66,8 +66,9 @@ pub const TABLE_SIZE: usize = 16;
 /// enough to distinguish from tracer UDFs (which use `imm16 < FN_COUNT`).
 pub const BP_UDF_INSN: u32 = 0xE7FF_F0FE;
 
-/// Top of the ROM stage-2 window; `install` rejects higher addresses.
-const ROM_LIMIT: u32 = guest_mem::ROM_SIZE as u32;
+/// End of the version's ROM code addresses; `install` rejects higher
+/// addresses (breakpoints target ROM-resident code).
+const ROM_LIMIT: u32 = crate::newton::rom_ver::ROM_CODE_END;
 
 /// One entry in the breakpoint table. `ipa == 0` means "empty" (PC 0 is
 /// the reset vector — the hypervisor itself jumps here at boot and we
@@ -265,10 +266,11 @@ unsafe fn install_locked(ipa: u32) -> i32 {
 
     table[slot_idx] = Slot { ipa, orig };
     // Suppress the per-install kprintln for the SearchFreeList re-arm
-    // path — handle_user_bp_und re-installs on every benign walk and
-    // would otherwise saturate the log. Genuine bp installations from
-    // gdb/main land here only once and stay loud.
-    if ipa != 0x0031_3308 {
+    // path (`rom_ver::BP_REARM_QUIET_IPA`) — handle_user_bp_und
+    // re-installs on every benign walk and would otherwise saturate
+    // the log. Genuine bp installations from gdb/main land here only
+    // once and stay loud.
+    if crate::newton::rom_ver::BP_REARM_QUIET_IPA != Some(ipa) {
         kprintln!(
             "guest_bp: installed at {:#010x} (slot {}, orig={:#010x})",
             ipa, slot_idx, orig

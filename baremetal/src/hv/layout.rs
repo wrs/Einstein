@@ -201,10 +201,12 @@ pub const SCRATCH_POOL_SIZE: usize = 384 * 1024; // 96 × 4 KiB pages
 
 /// Einstein's `kHighROMEnd`: the MP2x00 ROM bus aperture is IPA
 /// 0..16 MiB; writes below this are absorbed (mask ROM ignores them on
-/// real hardware). This is a *hardware* aperture constant, not a
-/// ROM-version fact — it stays the same for any ROM image on MP2x00
-/// silicon (Phase 8 may re-home it to `newton/hw.rs` alongside the
-/// other shared hardware constants).
+/// real hardware). This is a *hardware* aperture constant — the same
+/// for any ROM image on MP2x00 silicon — which is why it lives in the
+/// layout manifest and not in `newton::rom_ver`. The per-version
+/// `rom_ver::ROM_CODE_END` is the semantically distinct "where this
+/// ROM build's own code addresses end" bound (numerically equal for
+/// 717006, but a version fact rather than an address-map fact).
 const HIGH_ROM_END: u64 = 0x0100_0000;
 
 /// Upper bound of the ROM write-absorb aperture (`kHighROMEnd`).

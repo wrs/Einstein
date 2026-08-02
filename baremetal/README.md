@@ -140,7 +140,7 @@ ARM FVP `FVP_Base_RevC-2xAEMvA` (accurate reference model):
 ```
 rm -f /tmp/newton-snapshot-*.bin
 cargo build --release --no-default-features \
-    --features "platform-fvp-base quiet"
+    --features "platform-fvp-base rom-717006 quiet"
 scripts/fvp --timeout=90 \
     target/aarch64-unknown-none-softfloat/release/newton-hypervisor
 ```
@@ -253,6 +253,7 @@ one platform, at most one backend per axis) and falls back to the
 |------------------------|---------|--------------------------------------------------------------------------------------|
 | `platform-raspi3b`     | yes     | QEMU raspi3b host (and real Pi Zero 2 W). BCM2835 VIC, PL011 at 0x3F201000.          |
 | `platform-fvp-base`    | no      | FVP `FVP_Base_RevC-2xAEMvA` host. GICv3 brought up through an EL3 stub.              |
+| `rom-{717006,710031}`  | 717006  | Guest-ROM version: selects the `src/newton/rom_ver/` constants module + build inputs. Exactly one required. |
 | `host-io-{null,semihost,pi-fb}` | null | Display + pen seam: no-op, semihost viewer IPC, or real VC4 framebuffer.      |
 | `flash-persist-{null,semihost,sd}` | semihost | Flash persistence: volatile, `/tmp` file via semihosting, or FAT32 SD card. |
 | `input-{null,mtouch}`  | null    | Pen-input seam: no-op or TSTP MTouch USB touchscreen (real hw).                      |
@@ -277,7 +278,7 @@ cargo run --release                                    # default: QEMU, full dia
 cargo run --release --features quiet                   # QEMU, no diag noise
 cargo run --release --features trace,quiet             # QEMU, clean function trace
 cargo build --release --no-default-features \
-    --features "platform-fvp-base quiet"               # FVP build (then scripts/fvp)
+    --features "platform-fvp-base rom-717006 quiet"               # FVP build (then scripts/fvp)
 PI_CARGO_FEATURES=pi-bare-metal-input scripts/build-sd.sh /Volumes/PIBOOT
                                                        # bootable SD for the Pi Zero 2 W
 ```
@@ -541,7 +542,7 @@ guest-tests/scripts/run-test.sh test_vic      # one test, verbose output in /tmp
 
 # FVP cold boot
 rm -f /tmp/newton-snapshot-*.bin
-cargo build --release --no-default-features --features "platform-fvp-base quiet"
+cargo build --release --no-default-features --features "platform-fvp-base rom-717006 quiet"
 scripts/fvp --timeout=90 \
     target/aarch64-unknown-none-softfloat/release/newton-hypervisor
 

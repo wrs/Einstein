@@ -7,6 +7,7 @@ pub mod loader;
 pub mod os;
 pub mod probes;
 pub mod rom_patches;
+pub mod rom_ver;
 pub mod shadow_stub;
 pub mod unaligned;
 pub mod unaligned_inline;

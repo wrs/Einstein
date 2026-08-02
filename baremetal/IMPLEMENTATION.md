@@ -411,10 +411,10 @@ padding → byte-copy verbatim. Same logic for Einstein.rex. ROM
 patches that write into the host backing go through
 `guest_mem::write_rom_code_word` (verbatim, for instruction
 encodings) or `write_rom_data_word` (swap, so a BE-8 LDR returns
-the kernel's intended numerical value). `apply_717006_patches`
-uses `write_rom_word_by_kind`, which dispatches on the bitmap so
-the table can mix code overrides (`MOV PC, LR`) and data overrides
-(`gDebugger`, time-base constants) cleanly.
+the kernel's intended numerical value). `apply_rom_patches`
+dispatches on the bitmap so the version's patch table
+(`newton::rom_ver::PATCHES`) can mix code overrides (`MOV PC, LR`)
+and data overrides (`gDebugger`, time-base constants) cleanly.
 
 EL2 reads of guest data go through `crate::guest_endian`. Helpers
 byteswap on read/write for data PAs and pass-through for ROM-code

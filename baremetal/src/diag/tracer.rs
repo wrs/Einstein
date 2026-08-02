@@ -75,8 +75,8 @@ use crate::diag::symbols::{FN_COUNT, fn_addr, fn_name};
 /// sites with a ±32 MiB `B` instruction AND doesn't require any extra
 /// stage-2 mapping. Well past the REx tail at ~0x0088_E500 and well
 /// before the UND-trampoline / ROM-patch injection stubs at 0x00FF_FF00.
-pub const TRAMPOLINE_IPA: u32 = 0x0090_0000;
-pub const TRAMPOLINE_END: u32 = 0x00E0_0000;
+pub const TRAMPOLINE_IPA: u32 = crate::newton::rom_ver::ROM_TAIL.tracer_pool_base;
+pub const TRAMPOLINE_END: u32 = crate::newton::rom_ver::ROM_TAIL.tracer_pool_end;
 
 const SLOT_WORDS: usize = 5;
 const SLOT_SIZE: u32 = (SLOT_WORDS as u32) * 4;
@@ -129,13 +129,14 @@ static mut INITIALISED: bool = false;
 ///     emulation (reachable from every ROM call site via a ±32 MiB
 ///     `B`). Sits between the tracer pool (0x0090_0000..0x00E0_0000)
 ///     and the ROM-tail trampoline cluster below.
-///   - VA 0x00FF_FF00..0x00FF_FFF0: UND trampoline (0xFF00..0xFF60) +
-///     DABT diagnostic trampoline (0xFFA8..0xFFE4) + UND return stub
-///     (0xFFE4..0xFFF0). See guest_mem::patch_und_vector,
-///     rom_patches::*, and the layout notes at UND_RETURN_STUB_OFFSET.
+///   - The `rom_ver::ROM_TAIL` stub cluster (patch-stub arena, FPA
+///     bypass stub, UND trampoline, DABT diagnostic trampoline, UND
+///     return stub). See `guest_trampolines::patch_und_vector` and the
+///     layout notes at `UND_RETURN_STUB_OFFSET`.
 ///   - PowerOffAndReboot: rom_patches installs a one-word HVC canary
 ///     there; the tracer overwriting it would silently mask the trap.
 pub fn in_reserved_range(addr: u32) -> bool {
+    use crate::newton::rom_ver;
     if addr < 0x0000_0020 { return true; }
     if (crate::newton::shadow_stub::SBA_STUB_POOL_IPA
         ..crate::newton::shadow_stub::SBA_STUB_POOL_END)
@@ -143,14 +144,17 @@ pub fn in_reserved_range(addr: u32) -> bool {
     {
         return true;
     }
-    if (0x00FF_FF00..0x00FF_FFF0).contains(&addr) { return true; }
-    // FPA-class UND bypass stub at 0x00FF_FEC0..0x00FF_FEE0 (8 words).
-    // Routes FPA UNDs straight to the kernel FPE; falls through to the
-    // main UND trampoline for non-FPA UNDs.
-    if (0x00FF_FEC0..0x00FF_FEE0).contains(&addr) { return true; }
-    if addr == crate::newton::rom_patches::POWEROFF_REBOOT_PC { return true; }
-    if addr == crate::newton::rom_patches::REBOOT_PC { return true; }
-    if addr == crate::newton::rom_patches::BOOTOS_PC { return true; }
+    // The contiguous ROM-tail cluster: patch-stub arena, FPA-class UND
+    // bypass stub, UND trampoline, DABT trampoline, UND return stub.
+    if (rom_ver::ROM_TAIL.patch_stub_arena_base..rom_ver::ROM_TAIL.stubs_end)
+        .contains(&addr)
+    {
+        return true;
+    }
+    if let Some(lh) = rom_ver::LOUD_HALT {
+        if addr == lh.poweroff_reboot.pc || addr == lh.reboot.pc { return true; }
+    }
+    if rom_ver::BOOT.is_some_and(|b| b.bootos.pc == addr) { return true; }
     false
 }
 

@@ -41,8 +41,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 // Sits between the tracer pool (0x0090_0000..0x00E0_0000) and the
 // ROM-tail trampoline cluster (0x00FF_FF00..0x00FF_FFF0); tracer's
 // `in_reserved_range` excludes this window too.
-pub const SBA_STUB_POOL_IPA: u32 = 0x00E0_0000;
-pub const SBA_STUB_POOL_END: u32 = 0x00FF_FF00;
+pub const SBA_STUB_POOL_IPA: u32 = crate::newton::rom_ver::ROM_TAIL.sba_stub_pool_base;
+pub const SBA_STUB_POOL_END: u32 = crate::newton::rom_ver::ROM_TAIL.sba_stub_pool_end;
 pub const SBA_STUB_WORDS: usize = 16;
 pub const SBA_STUB_BYTES: u32 = (SBA_STUB_WORDS as u32) * 4;
 pub const SBA_STUB_MAX: usize =
@@ -100,7 +100,7 @@ fn code_write_word(ipa: u32, word: u32) -> Result<(), &'static str> {
 
 /// Read the ORIGINAL pre-patch instruction at `ipa`. The liveness
 /// analyser uses this so probe HVCs installed by
-/// `rom_patches::apply_717006_patches` don't confuse it.
+/// `rom_patches::apply_rom_patches` don't confuse it.
 fn code_read_word_original_first(ipa: u32) -> Option<u32> {
     if let Some(orig) = crate::newton::rom_patches::read_original(ipa) {
         return Some(orig);

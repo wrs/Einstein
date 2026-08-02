@@ -25,9 +25,15 @@ pub(crate) fn handle_bootos_canary(ctx: &mut TrapContext) {
     if n == 1 {
         // First boot. Emulate `mov r0, #0xb0` (the word we overwrote
         // with the HVC) and ERET to BootOS + 4 so the kernel runs
-        // through its normal boot sequence.
+        // through its normal boot sequence. The handler only fires via
+        // the patch `apply_bootos_trap` installs, so the site is
+        // guaranteed present; a missing group here is a wiring bug.
+        let Some(boot) = crate::newton::rom_ver::BOOT else {
+            kprintln!("*** BootOS canary fired but rom_ver::BOOT is None — wiring bug");
+            cpu::halt();
+        };
         ctx.x[0] = 0xb0;
-        let next_pc = (crate::newton::rom_patches::BOOTOS_PC + 4) as u64;
+        let next_pc = (boot.bootos.pc + 4) as u64;
         // SAFETY: ELR_EL2 controls the post-ERET guest PC.
         unsafe {
             core::arch::asm!(

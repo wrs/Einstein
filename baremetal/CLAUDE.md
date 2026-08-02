@@ -11,13 +11,13 @@ guest ISA and modelled Newton hardware are identical on both.
   (see `docs/QEMU_BUGS.md`).
 - **ARM FVP `FVP_Base_RevC-2xAEMvA`** — the accurate reference model.
   Selected with `--no-default-features --features "platform-fvp-base
-  diag"`. Uses GICv3 (the hypervisor brings it up through an EL3
+  rom-717006 diag"`. Uses GICv3 (the hypervisor brings it up through an EL3
   stub). Runs via `scripts/fvp <elf>` — the script wraps a dockerised
   FVP (OrbStack + `armswdev/aemfvp-cca-v2-image`). Typical cold boot:
   ```bash
   rm -f /tmp/newton-snapshot-*.bin
   cargo build --release --no-default-features \
-    --features "platform-fvp-base quiet diag"
+    --features "platform-fvp-base rom-717006 quiet diag"
   scripts/fvp --timeout=90 \
     target/aarch64-unknown-none-softfloat/release/newton-hypervisor
   ```
@@ -26,10 +26,11 @@ guest ISA and modelled Newton hardware are identical on both.
   `build.rs` falls back to `host-io-null` + `flash-persist-semihost`.
   Add `--features host-io-semihost` to swap the host-IO backend
   without re-listing everything. `diag` (the diagnostics layer —
-  REP output, trap histograms, task dumps, symbolicated halts) is in
-  `default` but `--no-default-features` drops it, so list it
-  explicitly for any debugging build; omit it to prove the stubbed
-  no-diag configuration.
+  REP output, trap histograms, task dumps, symbolicated halts) and
+  `rom-717006` (the guest-ROM-version selection; exactly one `rom-*`
+  is required, like `platform-*`) are in `default` but
+  `--no-default-features` drops them, so list both explicitly; omit
+  `diag` to prove the stubbed no-diag configuration.
 
   Add `--gdb` for an Iris debug server on host port 7100; add
   `--features trace` for the function-level tracer. FVP runs the

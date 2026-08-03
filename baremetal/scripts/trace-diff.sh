@@ -61,7 +61,8 @@ echo "==> Einstein: $einstein_seconds wall-seconds -> $einstein_log" >&2
 
 # --- Baremetal side --------------------------------------------------------
 # trace feature shifts ROM bytes, so old snapshots are invalid — remove
-# before cold-booting (see baremetal/CLAUDE.md "Gotchas").
+# before cold-booting (see the ROM fingerprint in
+# baremetal/docs/SNAPSHOT_RESUME_CONTRACT.md).
 rm -f /tmp/newton-snapshot-*.bin
 
 baremetal_raw="$out_dir/baremetal-raw.log"

@@ -84,7 +84,7 @@ on hardware, thermal re-verification) are tracked in
 1. Reproduce the stall on QEMU and capture the loud-halt context dump.
 2. **Bitmap-first triage** when the wedge names a guest PC in ROM:
    check whether that address is marked as code in the classifier
-   bitmap before digging into trap state (see `CLAUDE.md`). If it
+   bitmap before digging into trap state (see `docs/DEBUGGING.md`). If it
    isn't, the fix is a classifier seeder, not a runtime handler.
 3. Identify the kernel-side code at the wedge PC from
    `scripts/disasm-out/rom.dis`, and instrument the entry point with

@@ -91,7 +91,7 @@ out to require invasive rework.
 
 ## Pre-existing characterized issues
 
-These are documented in `CLAUDE.md` and `src/hv/trap/` comments and
+These are documented in `DEBUGGING.md` and `src/hv/trap/` comments and
 listed here for completeness; they pre-date this file.
 
 - **gdbstub is aarch64-only.** Guest AArch32 software breakpoints

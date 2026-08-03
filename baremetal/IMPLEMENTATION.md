@@ -191,7 +191,7 @@ built by two host-side tools:
 717006): it runs `classify-symbols.py`, rebuilds the classifier, and
 runs it with the curated inputs. `scripts/dump-data-regions.py`
 refreshes `code-regions.txt`, which is what the bitmap-first triage in
-[`CLAUDE.md`](CLAUDE.md) greps.
+[`docs/DEBUGGING.md`](docs/DEBUGGING.md) greps.
 
 ## 6. ROM patching and fault-path stubs
 

@@ -1,425 +1,83 @@
 # Hypervisor notes for Claude
 
 Newton Hypervisor — pure-Rust Type-1 hypervisor running an unmodified
-Newton OS 2.x ROM on Cortex-A53. Two host platforms are supported; the
-guest ISA and modelled Newton hardware are identical on both.
+Newton OS 2.x ROM on Cortex-A53. The 717006 ROM boots to the Welcome UI
+and the builtin apps work on all three hosts (QEMU `raspi3b`, ARM FVP,
+real Pi Zero 2 W); add-on app packages are the known gap. Day-to-day
+work is "run, see where it stops, fix, rerun".
 
-- **QEMU `raspi3b`** — the original target. Selected with
-  `--features platform-raspi3b` (default). Runs via
-  `cargo run --release` (wraps `scripts/run-qemu.sh`). Uses a legacy
-  BCM2835 VIC; AArch32↔AArch64 banked-register plumbing is flaky
-  (see `docs/QEMU_BUGS.md`).
-- **ARM FVP `FVP_Base_RevC-2xAEMvA`** — the accurate reference model.
-  Selected with `--no-default-features --features "platform-fvp-base
-  rom-717006 diag"`. Uses GICv3 (the hypervisor brings it up through an EL3
-  stub). Runs via `scripts/fvp <elf>` — the script wraps a dockerised
-  FVP (OrbStack + `armswdev/aemfvp-cca-v2-image`). Typical cold boot:
-  ```bash
-  rm -f /tmp/newton-snapshot-*.bin
-  cargo build --release --no-default-features \
-    --features "platform-fvp-base rom-717006 quiet diag"
-  scripts/fvp --timeout=90 \
-    target/aarch64-unknown-none-softfloat/release/newton-hypervisor
-  ```
-  `host-io-*` and `flash-persist-*` are opt-in features (not in
-  `default`), so they don't need to be listed for a minimal FVP build —
-  `build.rs` falls back to `host-io-null` + `flash-persist-semihost`.
-  Add `--features host-io-semihost` to swap the host-IO backend
-  without re-listing everything. `diag` (the diagnostics layer —
-  REP output, trap histograms, task dumps, symbolicated halts) and
-  `rom-717006` (the guest-ROM-version selection; exactly one `rom-*`
-  is required, like `platform-*`) are in `default` but
-  `--no-default-features` drops them, so list both explicitly; omit
-  `diag` to prove the stubbed no-diag configuration.
+This file is doctrine and an index only. The detail lives in the docs
+below — read the relevant one before acting, don't re-derive it.
 
-  Add `--gdb` for an Iris debug server on host port 7100; add
-  `--features trace` for the function-level tracer. FVP runs the
-  generic timer + cache model accurately, so wall-clock is much
-  slower than QEMU TCG — use longer timeouts.
+| Question | Read |
+|---|---|
+| What is this, how do I build/run/test it, what does each feature do | [`README.md`](README.md) |
+| Architecture — memory model, traps, endianness, peripherals | [`HIGHLEVEL.md`](HIGHLEVEL.md) |
+| Build system, source layout, classifier pipeline, test tiers | [`IMPLEMENTATION.md`](IMPLEMENTATION.md) |
+| Current state, remaining work, per-stop workflow | [`PLAN.md`](PLAN.md) |
+| Wedge triage, gdb, guest breakpoints, what to run before committing | [`docs/DEBUGGING.md`](docs/DEBUGGING.md) |
+| ARM architecture facts (ARMv7 / AArch64 reference text) | `docs/ARM_Reference.txt`, `docs/ARM_aarch_Reference.txt` |
+| Reading the ROM — annotated disassembly | [`docs/DISASM.md`](docs/DISASM.md) |
+| Newton internals — APCS, object dispatch, ROM jump-table, DDK headers | [`docs/NEWTON_INTERNALS.md`](docs/NEWTON_INTERNALS.md) |
+| Kernel struct layouts (TScheduler, TTask, TObjectTable, task census) | [`docs/STRUCTURES.md`](docs/STRUCTURES.md) |
+| QEMU raspi3b quirks, especially banked registers | [`docs/QEMU_BUGS.md`](docs/QEMU_BUGS.md) |
+| Working style — assembler round-trips, Einstein-port review, test-per-feature | [`docs/WORKFLOW.md`](docs/WORKFLOW.md) |
+| Peripheral models (Newton-side spec + Einstein cross-refs) | [`docs/peripherals.md`](docs/peripherals.md) |
+| Real hardware — Pi Zero 2 W firmware, SD/display/USB/audio stacks | [`docs/REAL_HW_BRINGUP.md`](docs/REAL_HW_BRINGUP.md), [`docs/MTOUCH.md`](docs/MTOUCH.md), [`docs/SD_DMA_AUTOSAVE.md`](docs/SD_DMA_AUTOSAVE.md) |
+| Endianness conventions (BE-32 word-invariant) | [`docs/ENDIAN_FIXES.md`](docs/ENDIAN_FIXES.md) |
+| Native code in add-on packages; triaging a wedge PC in RAM | [`docs/PACKAGE_NATIVE_CODE.md`](docs/PACKAGE_NATIVE_CODE.md) |
+| What a snapshot does and does not restore | [`docs/SNAPSHOT_RESUME_CONTRACT.md`](docs/SNAPSHOT_RESUME_CONTRACT.md) |
+| Oracle: what a fully-booted Newton actually does | `probe/FINDINGS.md` |
 
-Both platforms must stay green: `guest-tests/scripts/run-all.sh` runs
-the guest tests on QEMU, and any new divergence should be tracked
-down rather than papered over with a feature gate.
+## Rules
 
-See `README.md` for the user-facing project overview,
-`HIGHLEVEL.md` / `IMPLEMENTATION.md` for the architecture and the
-implementation decisions, and `PLAN.md` for current state and
-remaining work.
+- **Don't trust your memory for ARM architecture details** — especially
+  EL2 registers and coprocessor encodings. Check `docs/ARM_Reference.txt`.
+  Round-trip every instruction encoding you write through
+  `arm-none-eabi-as` + `objdump`; hand-computed imm12 rotations are
+  silently wrong (`docs/WORKFLOW.md`).
+- **Never silence a loud halt.** Unknown inputs on emulation paths halt
+  with a context dump that names the table entry to extend. Adding a
+  silent default destroys the trip-wire.
+- **Bitmap-first triage.** When a wedge names a guest PC in ROM, check
+  whether that address is marked as code in the classifier bitmap
+  *before* investigating trap state, banked registers or the ERET path.
+  If it isn't, the fix is a classifier seeder, not a runtime handler.
+  Recipe in [`docs/DEBUGGING.md`](docs/DEBUGGING.md).
+- **Banked registers are not a QEMU bug.** `ctx.x[14]` is `LR_usr`,
+  `LR_abt` is `ctx.x[20]`, per ARM ARM Table D1-79. This has been
+  misdiagnosed repeatedly — read `docs/QEMU_BUGS.md` first.
+- **Always cold-boot** (`rm -f /tmp/newton-snapshot-*.bin`). Resuming a
+  Newton-ROM snapshot wedges the guest in a prefetch-abort loop, and the
+  2 s autosave then overwrites every slot with the wedged state. Never
+  treat a resumed run as a verification signal. Fix-or-remove is item 2
+  in `PLAN.md`.
+- **Both emulated platforms stay green.** `guest-tests/scripts/run-all.sh`
+  before any commit that touches hypervisor functionality; track down
+  QEMU/FVP divergence rather than gating it behind a feature. The one
+  exception (probe-only iterations) is spelled out in
+  [`docs/DEBUGGING.md`](docs/DEBUGGING.md).
+- **Route recurring diagnostic logs through `dprintln!`**, not
+  `kprintln!` (`src/host/macros.rs`) — `dprintln!` is a no-op under the
+  `quiet` feature, which is what keeps trace runs readable.
+- **Extend `docs/STRUCTURES.md`** whenever you decode another kernel
+  struct from the disasm. That's how debugging stays cumulative.
 
-The 717006 ROM boots through the kernel + scheduler + NewtonScript
-interpreter to the Welcome UI, and the builtin apps work — on QEMU,
-FVP, and a real Pi Zero 2 W (display, USB touch, HDMI audio, SD
-flash persistence; see `docs/REAL_HW_BRINGUP.md`). The known
-functional gap is add-on app packages. Debugging work is
-"run, see where it stops, fix, rerun".
-
-**Important:** Do not trust your memory for details of ARM architecture,
-especially EL2-related registers and coprocessor instruction encodings.
-ALWAYS check against the actual ARMv7 reference, which is in
-docs/ARM_Reference.txt.
-
-## Snapshots
-
-`src/hv/snapshot.rs` rolls four guest-state snapshots on disk at
-`/tmp/newton-snapshot-{0..3}.bin`. On every hypervisor startup we
-try to resume from the newest valid slot; missing or mismatched
-files fall through to a cold boot.
-
-**Resuming a Newton-ROM snapshot is broken** — the guest ERETs to the
-saved PC and wedges in a prefetch-abort loop at the vector page, and
-the 2 s autosave then overwrites every slot with the wedged state.
-Saving works, and the two-run `test_snapshot_resume` guest test
-resumes correctly. **Always cold-boot** (`rm -f
-/tmp/newton-snapshot-*.bin` first), and never treat a resumed run as
-a verification signal. Fix-or-remove is tracked in `PLAN.md`.
-
-### Commands
+## Commands
 
 ```bash
-# Cold boot (fresh, ignore any existing snapshots).
-rm -f /tmp/newton-snapshot-*.bin
-cargo run --release
+rm -f /tmp/newton-snapshot-*.bin && cargo run --release   # cold boot on QEMU
+scripts/boot-check.sh --cold                              # headless boot verify
+guest-tests/scripts/run-all.sh                            # 38 guest tests (QEMU)
+guest-tests/scripts/run-all.sh --platform fvp             # same on FVP
+scripts/check-matrix.sh                                   # 18 build combos + lints
 
-# Normal run — loads the newest slot if any exist, else cold-boots.
-cargo run --release
-
-# Force cold boot without deleting, by making slots unreadable:
-chmod 000 /tmp/newton-snapshot-*.bin && cargo run --release
-# (then chmod 644 to restore)
-
-# Inspect slots (size + mtime).
-ls -la /tmp/newton-snapshot-*.bin
-
-# Headless boot verification: run QEMU with the log redirected, poll
-# for the Welcome-UI markers, SIGKILL QEMU the moment they appear
-# (exit 0), or exit 1 on --timeout with the log tail. Use this
-# instead of hand-rolled `timeout N cargo run … ; pkill` recipes —
-# QEMU defers SIGTERM while the guest is busy (docs/QEMU_BUGS.md).
-scripts/boot-check.sh --cold          # forces a cold boot first
-scripts/boot-check.sh --marker 'some other log line'
-```
-
-### Save triggers
-
-- **Periodic (default):** every `AUTOSAVE_INTERVAL_MS = 2000` ms of
-  wall time, hooked into `trap_irq` (timer IRQ) in `src/hv/trap/mod.rs`.
-  Wall-clock pacing, not trap count — a pathological abort loop
-  won't thrash saves.
-- **Guest-triggered:** `HVC #0x18` (`HvcImm::Snapshot`) from the guest issues an
-  immediate save. Handy for guest tests that want to snapshot at
-  a specific PC.
-
-### Slot selection
-
-The loader picks the file with the highest `seq`. Copying an older
-file over a newer slot (`cp /tmp/newton-snapshot-2.bin
-/tmp/newton-snapshot-0.bin`) carries its own seq with it, so the older
-state wins — useful once resume works again.
-
-### What a save contains
-
-Only guest-visible state: GUEST_RAM, GUEST_FB, the
-inline_patch SCRATCH_POOL, the EL1 CP15 regs we can reach from
-AArch64 EL2, and all 31 AArch64 GPRs (x0..x30) of the guest.
-Persistent flash is not in the snapshot file (it lives in
-`$HOME/.newton/flash.bin`); the header carries an FNV-1a
-fingerprint of GUEST_FLASH so a resume cold-boots if the on-disk
-flash has diverged from the saved CPU/RAM state. Because x0..x30
-alias every AArch32 banked R0..R14 per ARM ARM Table D1-79,
-capturing all 31 also captures the per-mode banked SP/LR.
-Hypervisor-side EL2 code addresses, trap tables, VIC state, timer
-deadlines, and so on are fresh each boot — see
-`docs/SNAPSHOT_RESUME_CONTRACT.md` for which guest-visible peripheral
-state is deliberately reset on resume and why.
-
-### ROM fingerprint
-
-The snapshot header embeds a FNV-1a hash of the first 1 KiB of
-GUEST_ROM after load-time patches. If you swap a guest-test
-binary for the ROM (or vice versa), the loader notices the
-mismatch and cold-boots instead of ERET-ing into someone else's
-code. Same applies across Einstein.rex changes that shift the
-early ROM bytes.
-
-### Known limitations
-
-- Each save is ~6 MiB (4 MiB RAM + 2 MiB FB + 384 KiB SCRATCH_POOL +
-  header) through semihosting SYS_WRITE. Flash is no longer in the
-  file. Fast enough at 2 s cadence but will become painful if the
-  cadence tightens.
-- The autosave hook runs from `trap_irq`, so a guest that never
-  takes a timer IRQ won't produce fresh snapshots. In practice
-  the Newton kernel arms its match registers very early and
-  CNTHP fires steadily; this hasn't been an issue.
-
-## gdb workflow
-
-```bash
-# term 1
-DEBUG=1 cargo run --release
-
-# term 2 (Linux: gdb-multiarch; macOS: aarch64-elf-gdb)
-aarch64-elf-gdb -x scripts/gdb-init \
+# FVP (accurate reference model; much slower than QEMU — long timeouts)
+cargo build --release --no-default-features \
+  --features "platform-fvp-base rom-717006 quiet diag"
+scripts/fvp --timeout=90 \
   target/aarch64-unknown-none-softfloat/release/newton-hypervisor
 ```
 
-- EL2 hypervisor breakpoints (`break kmain`, `break
-  trap_sync_lower_aarch32`, source-line, `stepi`, `bt`, locals) all
-  work. Stack unwinding is reliable within Rust frames; it degrades
-  across the EL2 exception vector boundary because the asm stubs have
-  no DWARF.
-- **Guest AArch32 breakpoints don't work directly** —
-  qemu-system-aarch64's gdbstub is aarch64-only and drops the mode
-  switch. Use the helpers in `scripts/gdb-init`:
-  - **`bg <addr>`** — conditional stop at `trap_sync_lower_aarch32`
-    when `$ELR_EL2 == <addr>`. Fires only at naturally-trapping guest
-    instructions (data/insn abort, SVC/HVC, CP15). Does **not** catch
-    UND-class traps because the UND trampoline HVCs into EL2 — by the
-    time we're at trap_sync entry, `ELR_EL2` points at the trampoline,
-    not the original PC.
-  - **`bp <addr>`** — install a one-shot guest software BP (see
-    `src/diag/guest_bp.rs`). Patches the ROM word with `UDF #0xFF0E` and
-    stops in `handle_user_bp_und` with `faulting_pc` = the guest PC.
-    Works for any ROM-range PC regardless of whether it naturally
-    traps. One-shot: `bp <addr>` again to re-arm. Snapshot autosaves
-    are gated while any BP is live, so a debug session never corrupts
-    a persisted snapshot.
-  - `tt N`, `guest-state`, `bp-clear`, `bp-list` — convenience.
-
-### Breakpoint pattern for agents
-
-The typical recipe:
-
-```bash
-# term 1
-DEBUG=1 cargo run --release
-
-# term 2
-aarch64-elf-gdb -x scripts/gdb-init \
-  target/aarch64-unknown-none-softfloat/release/newton-hypervisor
-(gdb) break trap_sync_lower_aarch32     # land anywhere in EL2 context
-(gdb) c                                  # stop at first guest sync-trap
-(gdb) bp 0x<guest_pc_of_interest>        # install sw BP + arm stop
-(gdb) delete 1                           # remove the trap_sync bp
-(gdb) c                                  # run until guest hits your BP
-(gdb) p/x faulting_pc                    # which BP fired
-(gdb) guest-state                        # ELR/ESR/FAR/CPSR at trap
-(gdb) c                                  # resume (handler restores word)
-```
-
-For a guest PC that naturally traps (e.g., the MMIO access you already
-saw in a log), skip the install: `bg <addr>` and `c` is enough.
-
-## Debugging a wedge
-
-- **Bitmap-first triage.** Whenever a wedge points at a specific
-  guest PC (UND at `PC=X`, PABT at `X`, "wild branch to X", an
-  instruction at `X` decoding as garbage), check **first** whether
-  `X` is marked as code in the classifier's reach bitmap before
-  digging into trap state, banked registers, or the ERET path. If
-  `X` isn't marked, the loader didn't byteswap the word at load
-  time, the guest fetches BE bytes as LE, and the decode IS
-  garbage — no further debugging needed at the runtime layer.
-  Quick check:
-  ```bash
-  grep -E "^  $(printf '%08x' $X | cut -c1-6)" \
-    baremetal/classify/*/code-regions.txt
-  ```
-  If `X` is missing, the fix lives in `tools/classify-rom/src/main.rs`
-  (add a seeder for the structure that contains `X`), not in
-  `src/hv/trap/`. After regenerating the bitmap with
-  `scripts/regen-classify.sh [ver]` (default 717006; also refreshes
-  `code-symbols.txt`), `scripts/dump-data-regions.py`
-  refreshes `code-regions.txt` so the same grep verifies the fix.
-- Every handler in `src/hv/trap/` / `src/peripherals/*` halts
-  loudly on unknown inputs with a context dump. When a ROM boot
-  trips one, the halt message points at exactly the table entry
-  that needs adding. **Don't paper over it** by adding a silent
-  default — the loud halt is the trip-wire.
-- Before extending a handler, cross-check Einstein's behaviour
-  at `Emulator/TNativePrimitives.cpp`, `Emulator/Serial/*`,
-  `Emulator/TEmulator.cpp`, etc. — those are the oracles.
-- `probe/FINDINGS.md` is the capture of what a fully-booted
-  Newton actually does; consult it before guessing. Regenerate
-  with `cmake --build build --target NewtonProbe` and
-  `build/NewtonProbe baremetal/roms/newton.rom - 90`.
-- Guest tests in `guest-tests/tests/` exercise each handler in
-  isolation. A regression in handler code should show up as a
-  failing test; run `guest-tests/scripts/run-all.sh` before
-  committing.
-- **Feature-matrix build check.** `scripts/check-matrix.sh` first
-  runs the two structure lints (`check-layering.sh` import
-  discipline, `check-rom-addrs.sh` ROM-address containment), then
-  `cargo check`s all 18 supported build combinations (default,
-  no-diag variants, both platforms, `rom-710031`, the four
-  `pi-bare-metal*` aggregates, trace/probe/log combos, the
-  guest-test cfg) in one shared target dir and prints a per-combo
-  PASS/FAIL summary (~10 s warm). Run it after touching `build.rs`,
-  feature gates, or any cfg-dispatched backend. It's also wired into
-  `run-all.sh` as an opt-in step gated on `CHECK_MATRIX=1`
-  (`CHECK_MATRIX=1 guest-tests/scripts/run-all.sh`) — off by default so
-  the normal test loop doesn't pay the extra checks. Cross-axis
-  constraints are Cargo feature dependencies (hardware backends imply
-  `platform-raspi3b`; `sd-probe` implies `no-semihost` too), so a
-  forbidden `--features` set drags in the second platform and fails
-  build.rs's platform mutual-exclusion check with a named message,
-  not a deep compile error.
-- **Skip the guest-tests run** when an iteration's only changes
-  are a Newton-ROM probe (a new HVC immediate at a Newton-ROM PC
-  in `src/newton/rom_patches.rs` + a dispatch arm in `src/hv/trap/hvc.rs` +
-  a handler body in `src/newton/probes.rs` that emulates the original
-  instruction). The guest tests run isolated test ELFs that don't
-  include the Newton ROM, so probe-only changes can't regress them.
-  Walter has called this out as wasted time. Run them when
-  changes touch `src/newton/inline_patch.rs`, `src/newton/unaligned.rs`,
-  `src/peripherals/*`, `src/arch/banked.rs`, `src/hv/stage2.rs`,
-  `src/hv/guest.rs`, the generic SBA/UND/DABT/IRQ paths in
-  `src/hv/trap/` (`mod.rs`, `dabt.rs`, `und.rs`, `cp15.rs`), or
-  `guest-tests/` itself.
-
-## Function-level execution trace
-
-`cargo run --release --features trace,quiet` produces a chronological
-log of *every* call to a recognised Newton function, with the
-argument registers at the moment of entry:
-
-```
-trace     1 0x000188f8 FlushTheCache (svc) r0=0x... r1=0x... r2=0x... r3=0x...
-trace     2 0x00045b78 HandleDebugCard (svc) r0=0x... r1=0x... r2=0x... r3=0x...
-...
-```
-
-Every call, not first-touch — a function that's invoked ten times
-produces ten trace lines. Useful for bisecting a stall: you see not
-just *which* function is at the top of the stall, but what arguments
-it's being called with over time (loop counter advancing, page index,
-etc.).
-
-### Mechanism (`src/diag/tracer.rs`)
-
-1. `build.rs` reads the selected ROM version's `code-symbols.txt`
-   (for 717006: `scripts/classify-out/code-symbols.txt`, unless a
-   `roms/717006/` override exists) — the curated code-only symbol
-   list produced by `classify-symbols.py`, i.e. the same vetted list
-   the inline-patch classifier's walker
-   uses as its root set — and emits `fn_addrs.bin`,
-   `fn_name_offs.bin`, `fn_names.bin` into OUT_DIR. The address list
-   is trusted — no runtime prologue heuristic, no "does this word
-   look like a function start" check.
-2. At ROM load time (after rom_patches have been applied)
-   `tracer::init()` installs a 5-word trampoline per function inside
-   the ROM backing store at IPA 0x00900000..0x00E00000 (past the REx
-   tail, before the UND-trampoline region at 0x00FFFF00), and
-   rewrites each function's first word to `B trampoline_slot`.
-3. Trampoline layout per slot (20 bytes):
-   - slot[0]: `HVC #TRACE_TAG`  — log + args
-   - slot[1]: original first insn, rewritten if PC-relative:
-     `LDR Rd, [pc, #imm]` → `LDR Rd, [pc, #0]` + literal at slot[3];
-     `B <label>`         → `LDR PC, [pc, #0]` + target at slot[3].
-     Anything else copies verbatim.
-   - slot[2]: `LDR PC, [pc, #0]`  — loads branch-back target
-   - slot[3]: literal (only used by rewrite cases)
-   - slot[4]: `orig_pc + 4`  — branch-back target
-4. At HVC-entry time, `handle_trace_hvc` derives the slot index from
-   ELR_EL2, looks up the function name, prints `seq PC name (mode)
-   r0..r3`, and returns. Natural ERET resumes at slot[1] — the
-   original first instruction — and the trampoline falls through to
-   the branch-back at slot[4]. The trampoline never disarms itself,
-   so every subsequent call retraces.
-
-### Why the classifier list, not prologue detection
-
-The prior implementation filtered `demangled_symbols.txt` entries by
-first-word shape (must match PUSH / SUB sp / MOV imm / …). That was
-a heuristic fence against mislabelled data entries. The classifier's
-`code-symbols.txt` has already partitioned symbols into code / data /
-drop; using it directly removes an independent heuristic and keeps
-the tracer's coverage in lock-step with inline_patch's definition of
-"real code".
-
-### Logging budget
-
-- `quiet` feature silences `fix_stage1_xn_bits:` summaries via
-  `dprintln!` in `src/host/macros.rs`. Route further recurring diagnostic
-  logs through `dprintln!` (not `kprintln!`) to keep trace output
-  readable. `dprintln!` is a no-op under `quiet`; `kprintln!` is
-  always emitted.
-
-### Gotchas
-
-- `trace` mutates many ROM words (both the function first-word
-  patches and the in-ROM trampoline slots), so snapshots saved with
-  trace off are rejected on load, and vice-versa. Tracing runs are
-  cold-boot runs — clear `/tmp/newton-snapshot-*.bin` before the
-  first boot.
-- Functions called before the hypervisor's `tracer::init()` completes
-  (i.e. before the ROM is handed off to the guest) obviously can't
-  fire. In practice all Newton functions are called after
-  handover — the reset vector runs guest-side.
-- If `code-symbols.txt` lists an address whose first word is a PC-
-  relative form the rewriter can't handle (very rare, e.g. an
-  indirect-to-PC via register), that entry is counted in the
-  `rewrite-skip` column at install time and left unpatched. The
-  function still runs correctly; it just isn't traced.
-- Every call fires an HVC. On a long boot the trace volume can
-  saturate the console UART; lean on `quiet` and/or grep.
-- *Don't* rely on your ability to handle exact ARM instruction encodings, always
-  double check with the actual assembler/disassembler.
-
-## Reference docs
-
-When debugging or investigating, consult these FIRST before
-re-deriving state from disassembly or tool output:
-
-- [`docs/DISASM.md`](docs/DISASM.md) — how to use
-  `scripts/disasm-out/rom.dis`, the full symbol-annotated ROM+REx
-  disassembly. **Don't hex-decode ROM bytes by hand; use the disasm.**
-- [`docs/NEWTON_INTERNALS.md`](docs/NEWTON_INTERNALS.md) — APCS
-  calling convention, two-level object dispatch, ROM jump-table
-  (0x01A00000..0x01C20000) as the post-ship patch mechanism, DDK
-  header locations.
-- [`docs/QEMU_BUGS.md`](docs/QEMU_BUGS.md) — QEMU raspi3b bugs at
-  the AArch64↔AArch32 boundary. Grep this before suspecting our
-  own code at that boundary. **Especially relevant for banked
-  registers at AArch32 EL1 ↔ AArch64 EL2 exception entry — the
-  apparent "flaky `ctx.x[13]` / `ctx.x[14]`" has been
-  misdiagnosed as a QEMU bug multiple times; it is architected
-  behaviour per ARM ARM Table D1-79. `ctx.x[14]` is `LR_usr`,
-  `LR_abt` lives in `ctx.x[20]`, etc. Read the file before
-  assuming banked-reg weirdness is a bug.**
-- [`docs/WORKFLOW.md`](docs/WORKFLOW.md) — process notes: review
-  Einstein-driver ports with a sub-agent, test-per-feature rule.
-- [`docs/peripherals.md`](docs/peripherals.md) — peripheral
-  implementations.
-- [`docs/STRUCTURES.md`](docs/STRUCTURES.md) — Newton kernel data
-  structure layouts (TScheduler, TTask, TObjectTable, kernel ID
-  encoding, observed task census). Always extend this when you
-  decode another kernel struct from the disasm — it's how
-  debugging keeps cumulative.
-- [`docs/REAL_HW_BRINGUP.md`](docs/REAL_HW_BRINGUP.md) — real
-  hardware (Pi Zero 2 W) reference: firmware contracts, the
-  as-built SDHOST / display / USB / audio / log-DMA stacks, and
-  porting notes. The Pi 3B is **not** a stepping stone — same SoC,
-  same image; only the form factor differs. Skip the detour.
-- [`docs/MTOUCH.md`](docs/MTOUCH.md) — TSTP MTouch USB touchscreen
-  (VID 0x0416 / PID 0xC168) characterization: USB topology, HID
-  report descriptor decode, activation handshake, Report ID 1
-  wire format.
-- [`docs/SD_DMA_AUTOSAVE.md`](docs/SD_DMA_AUTOSAVE.md) — the
-  non-blocking flash autosave: multi-block `CMD25`/`CMD12` DMA
-  writes (DREQ 13) driven cluster-by-cluster from the completion
-  IRQ, with the file's per-cluster LBA map resolved through the
-  vendored embedded-sdmmc. The only open item is the optional
-  `WaitBusy` refinement noted in the doc.
-- [`docs/SNAPSHOT_RESUME_CONTRACT.md`](docs/SNAPSHOT_RESUME_CONTRACT.md)
-  — what a snapshot save/load restores, and which peripheral-model
-  statics are guest-visible-but-deliberately-not-saved (VIC, serial
-  DMA, tablet, sound, null-audio completion, PCMCIA) with the reason
-  reset-on-resume is safe for each — and the two lossy edges that are
-  out of contract.
-- [`docs/PACKAGE_NATIVE_CODE.md`](docs/PACKAGE_NATIVE_CODE.md) —
-  design note for native code inside add-on packages: which
-  `inline_patch` "real code" invariants extend above the ROM aperture,
-  what the stage-2 RW+XN ↔ RO+X rescan path guarantees, and the
-  triage recipe when a wedge PC is in RAM (where the bitmap-first
-  doctrine does not apply).
+`README.md` has the full cheatsheet, the feature table, and the
+live-display/pen-input setup.

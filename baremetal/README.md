@@ -306,6 +306,12 @@ rewritten in slot[1], branch-back at slot[4]) is in
 `src/diag/tracer.rs`. To diff a hypervisor trace against an Einstein
 trace of the same boot, use `scripts/trace-diff.sh`.
 
+Every call fires an HVC, so a long boot can saturate the console UART —
+pair `trace` with `quiet` and grep. Entries whose first word is a
+PC-relative form the rewriter can't handle are counted in the
+`rewrite-skip` column at install time and left untraced; the function
+still runs correctly.
+
 ## Guest-test tier
 
 An ARM-guest test framework lives in [`guest-tests/`](guest-tests/) —
@@ -333,7 +339,7 @@ for the full HVC protocol.
 tests must stay green. (Probe-only iterations that touch nothing
 outside `src/newton/rom_patches.rs`, `src/hv/trap/hvc.rs`, and
 `src/newton/probes.rs` can skip the run — see the note in
-`CLAUDE.md`.)
+[`docs/DEBUGGING.md`](docs/DEBUGGING.md).)
 
 ## Debug with gdb
 
@@ -384,12 +390,14 @@ The hypervisor side fills the gap:
   gated while any BP is live, so a debug session never corrupts a
   persisted snapshot.
 
-Typical recipe is in `CLAUDE.md` under "Breakpoint pattern for agents".
+Typical recipe is in [`docs/DEBUGGING.md`](docs/DEBUGGING.md).
 
 ## Reference docs
 
 Consult these before re-deriving state from disassembly:
 
+- [`docs/DEBUGGING.md`](docs/DEBUGGING.md) — wedge triage (bitmap-first),
+  gdb and guest-breakpoint recipes, what to run before committing.
 - [`docs/DISASM.md`](docs/DISASM.md) — `scripts/disasm-out/rom.dis`,
   the symbol-annotated ROM+REx disassembly.
 - [`docs/NEWTON_INTERNALS.md`](docs/NEWTON_INTERNALS.md) — APCS calling

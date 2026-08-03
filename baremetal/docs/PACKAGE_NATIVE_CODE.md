@@ -10,7 +10,7 @@ of the BE-8 code/data discipline leans on. This note states which
 `inline_patch` "real code" invariants extend to that code, what the
 dynamic stage-2 rescan path guarantees, and how to triage a wedge whose
 PC is above the ROM aperture — because the bitmap-first doctrine in
-`CLAUDE.md` does **not** apply there.
+`DEBUGGING.md` does **not** apply there.
 
 Grounded in: `src/newton/inline_patch.rs`, `src/hv/stage2.rs`
 (`set_ram_page_ro_x` / `set_ram_page_rw_xn`, `ram_l3_entry_ptr`),
@@ -116,7 +116,7 @@ What it explicitly does **not** guarantee:
 
 ## Triage recipe when a wedge PC is above the aperture
 
-The **bitmap-first triage** in `CLAUDE.md` ("is PC X marked as code in
+The **bitmap-first triage** in `DEBUGGING.md` ("is PC X marked as code in
 the reach bitmap? if not, the loader byteswapped it wrong") is a
 ROM-aperture procedure. It is silently meaningless for a PC ≥
 `0x0100_0000` or in the RAM aperture — there is no bit to check. For a

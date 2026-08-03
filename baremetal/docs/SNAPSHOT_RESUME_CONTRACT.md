@@ -2,15 +2,47 @@
 
 What a snapshot save/load round-trip restores, and — more importantly
 — which guest-visible state it deliberately does **not** restore, with
-the reason reset-on-resume is safe for each. This is the companion to
-the workflow notes in `CLAUDE.md` (§Snapshot / resume workflow) and the
-field-level layout documented in `src/hv/snapshot.rs`.
+the reason reset-on-resume is safe for each. The field-level layout is
+documented in `src/hv/snapshot.rs`.
 
 **Caveat:** this describes the intended contract. Resuming a
 *Newton-ROM* snapshot currently wedges the guest in a prefetch-abort
 loop at the vector page; only the two-run `test_snapshot_resume` guest
-test resumes correctly. Fixing or removing the resume path is tracked
-in [`../PLAN.md`](../PLAN.md).
+test resumes correctly. Cold-boot every run whose result you intend to
+trust (`rm -f /tmp/newton-snapshot-*.bin`). Fixing or removing the
+resume path is tracked in [`../PLAN.md`](../PLAN.md).
+
+## The ring
+
+`src/hv/snapshot.rs` rolls four slots at
+`/tmp/newton-snapshot-{0..3}.bin`. On startup the loader picks the file
+with the highest `seq`; missing or mismatched files fall through to a
+cold boot. Copying an older file over a newer slot carries its own seq
+with it, so the older state wins — useful once resume works again.
+
+Two save triggers:
+
+- **Periodic (default):** every `AUTOSAVE_INTERVAL_MS = 2000` ms of wall
+  time, hooked into `trap_irq` (timer IRQ) in `src/hv/trap/mod.rs`.
+  Wall-clock pacing, not trap count, so a pathological abort loop won't
+  thrash saves. A guest that never takes a timer IRQ produces no fresh
+  snapshots; in practice the Newton kernel arms its match registers very
+  early and CNTHP fires steadily.
+- **Guest-triggered:** `HVC #0x18` (`HvcImm::Snapshot`) saves
+  immediately — handy for a guest test that wants to snapshot at a
+  specific PC.
+
+Two fingerprints in the header reject a mismatched resume: an FNV-1a
+hash of the first 1 KiB of `GUEST_ROM` after load-time patches (so
+swapping a guest-test binary for the ROM, or shifting early ROM bytes
+via an Einstein.rex change, cold-boots instead of ERET-ing into someone
+else's code), and one of `GUEST_FLASH`. Features that mutate ROM words
+— `trace`, `log_store`, `ns_trace` — change the ROM fingerprint, so
+toggling them forces a cold boot.
+
+Each save is ~6 MiB (4 MiB RAM + 2 MiB FB + 384 KiB SCRATCH_POOL +
+header) through semihosting `SYS_WRITE`. Fast enough at a 2 s cadence,
+but it would become painful if the cadence tightened.
 
 ## What is saved
 

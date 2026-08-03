@@ -49,15 +49,6 @@ HalfwordAndSignedDataTransferReg_Template(BITS_FLAGS, Rn, Rd)
 
 	POPPC();
 
-	// Endianness-patch classifier: record LDRH/STRH/LDRSB/LDRSH, exactly
-	// the (S,H) combinations that baremetal/src/shadow_stub.rs:326-334
-	// accepts. LDRD (S=1,H=0,L=0) and STRD (S=1,H=1,L=0) are excluded —
-	// the patcher's decode() returns None for those, and recording them
-	// would make the oracle ⊈ classify-rom static bitmap.
-#if (!FLAG_S && FLAG_H) || (FLAG_S && FLAG_L)
-	probe_record_ba_site(GETPC() - 8, 1);
-#endif
-
 	TMemory* theMemoryInterface = ioCPU->GetMemory();
 
 #if FLAG_P || (WRITEBACK && Rn != 15)

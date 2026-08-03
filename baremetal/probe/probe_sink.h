@@ -45,13 +45,6 @@ void probe_record_data_abort(uint32_t pc, uint32_t far, uint32_t fsr, uint32_t m
 /// fault status register, `mode` the pre-abort CPSR mode[4:0].
 void probe_record_prefetch_abort(uint32_t pc, uint32_t ifsr, uint32_t mode);
 
-/// Endianness-patch classifier: the JIT ran an endianness-sensitive
-/// subword access instruction (LDRB / STRB / LDRH / STRH / LDRSB / LDRSH /
-/// LDRD / STRD / SWPB) whose condition was satisfied, at guest ROM PC `pc`.
-/// `kind` in {0=byte (LDRB/STRB), 1=halfword/signed/dword, 3=swpb}. Called
-/// from the JIT unit templates at execute time, once per actual execution.
-void probe_record_ba_site(uint32_t pc, uint32_t kind);
-
 /// Function call (BL) entered. `target_pc` is the destination PC, `lr` is
 /// the saved link register (= return address), `r0..r3` are the AAPCS args.
 /// Called from BranchWithLink JIT handlers; the probe selects which target
@@ -72,7 +65,6 @@ void probe_record_call(uint32_t target_pc, uint32_t lr,
 #define probe_record_rom_write(pc, vaddr, value) ((void) 0)
 #define probe_record_data_abort(pc, far, fsr, mode) ((void) 0)
 #define probe_record_prefetch_abort(pc, ifsr, mode) ((void) 0)
-#define probe_record_ba_site(pc, kind) ((void) 0)
 #define probe_record_call(target_pc, lr, r0, r1, r2, r3) ((void) 0)
 
 #endif

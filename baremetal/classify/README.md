@@ -1,96 +1,60 @@
-# Endianness-patch classifier artifacts
+# Code/data classifier artifacts
 
-Per-ROM-hash bitmaps of every ARM instruction in `newton.rom` + `Einstein.rex`
-that a sub-word endianness fix-up would have applied to (LDRB / STRB /
-LDRH / STRH / LDRSB / LDRSH / SWPB).
+Per-ROM-hash bitmap partitioning every 32-bit word of `newton.rom` +
+`Einstein.rex` into code and data. The hypervisor stages it into its image and
+uses it to pick each ROM word's storage layout at load: code words
+byte-reversed for the always-LE instruction fetcher, data words verbatim for
+the BE-8 guest. See [`../docs/ENDIAN_FIXES.md`](../docs/ENDIAN_FIXES.md) for why
+that is the whole endianness strategy, and `src/hv/guest_mem.rs` for the
+`include_bytes!` site.
 
-**These byte-access bitmaps are vestigial.** They were produced for a
-design that rewrote every such instruction to a trapping marker; that
-mechanism was deleted once the guest was switched to BE-8, which makes
-sub-word access work natively (see [`../docs/ENDIAN_FIXES.md`](../docs/ENDIAN_FIXES.md)).
-Nothing in the hypervisor consumes them. The only bitmap the build
-stages into the image is `reach.bitmap`, the code/data partition —
-see `src/hv/guest_mem.rs`.
+Misclassification is silent and ugly: a data word marked as code gets stored
+reversed, so every guest read of it returns mojibake; a code word marked as
+data won't decode. The bitmap-first triage recipe in
+[`../docs/DEBUGGING.md`](../docs/DEBUGGING.md) is the standing response to a
+wedge whose PC lands in ROM.
 
 ## Layout
 
 ```
-<hash>/                       # FNV-1a-32 of raw on-disk rom || rex bytes
-├── byte-access.bitmap        # oracle — JIT execute-time record, from NewtonProbe
-├── byte-access-static.bitmap # static — classify-rom walker output (authoritative)
-└── summary.txt               # counts, walker stats, invariant status
+<hash>/                # FNV-1a-32 of raw on-disk rom || rex bytes
+├── reach.bitmap       # the partition — 1 bit per word, set = code
+└── summary.txt        # walker stats: roots, seeders, popcount
 ```
 
-Both bitmaps: 524 288 bytes = 1 bit per 32-bit word across 16 MiB of guest
+`reach.bitmap` is 524 288 bytes = 1 bit per 32-bit word across 16 MiB of guest
 ROM space (PA 0x00000000..0x01000000). Bit index `= addr / 4`; byte index
 `= bit / 8`; within-byte position `= bit % 8`, LSB-first.
 
-## Producing the data
+The `code-regions.txt` / `data-regions.txt` dumps that may also appear here are
+human-readable renderings produced by `scripts/dump-data-regions.py`.
+
+## Regenerating
 
 ```
-# Oracle — instrument the JIT, boot for 90 s, dump byte-access.bitmap
-cmake --build build --target NewtonProbe -j 8
-build/NewtonProbe baremetal/roms/newton.rom _Data_/Einstein.rex 90
-
-# Static — walk every reachable word, decode byte-access, dump byte-access-static.bitmap
-(cd baremetal/tools/classify-rom && cargo build --release)
-baremetal/tools/classify-rom/target/aarch64-apple-darwin/release/classify-rom \
-  --rom baremetal/roms/newton.rom --rex _Data_/Einstein.rex \
-  --symbols _Data_/demangled_symbols.txt --out baremetal/classify
+scripts/regen-classify.sh 717006
 ```
 
-NewtonProbe resolves its output root by looking for an existing `classify`
-directory — `baremetal/classify` first, then `classify` — so it can be run
-from either the Einstein root or `baremetal/`. From anywhere else it refuses
-to write and says so; pass `--out <dir>` to be explicit. It never creates the
-root itself, because doing that is what silently produced a stray
-`baremetal/baremetal/classify/` when it was run from the wrong directory.
+Two chained passes: `scripts/classify-symbols.py` partitions the demangled
+symbol table into the curated code-only root list, then `tools/classify-rom`
+walks from those roots and writes the bitmap. Run it whenever the ROM, the
+REx, or the symbol tables change — `build.rs` panics with the exact command
+if the bitmap for the current ROM+REx hash is missing.
 
-classify-rom checks `oracle ⊆ static` as a hard post-condition *when the
-oracle is present*. If an oracle bit is missing from static, it exits
-non-zero and lists the offending PCs — that means either the walker lost
-reachability to a real call site or the JIT hook records something
-`is_byte_access` doesn't (drift from the sub-word decoder the deleted
-patcher used).
+## How reachability is built
 
-The oracle costs a 90 s boot and won't exist the first time a ROM hash is
-classified, so its absence is not fatal — but it is not silent either.
-classify-rom warns on stderr and writes `invariant check (oracle ⊆ static):
-NOT RUN` into `summary.txt`. Check that line before trusting a bitmap: a
-summary that merely omits the check reads the same as one where it passed.
-
-## Oracle source
-
-`baremetal/probe/probe.cpp` + `baremetal/probe/probe_sink.h::probe_record_ba_site`,
-called from three JIT unit templates at execute time (not translate time —
-translation happens per-page regardless of reach and would fire on
-literal-pool words that look like byte accesses):
-
-- `Emulator/JIT/Generic/TJITGeneric_SingleDataTransfer_template.h` — `#if FLAG_B`
-- `Emulator/JIT/Generic/TJITGeneric_HalfwordAndSignedDataTransfer_template.h` — everything except LDRD/STRD
-- `Emulator/JIT/Generic/TJITGeneric_SingleDataSwap_template.h` — `#if FLAG_B && (Rd != Rm)`
-
-The carve-outs (LDRD/STRD, SWPB Rt==Rm) mirrored the refusal set of the
-patcher's own decoder, so the acceptance sets matched and the invariant
-was preservable. That decoder no longer exists.
-
-## Static source
-
-`baremetal/tools/classify-rom/src/main.rs` — standalone host Rust crate.
-Walks every reachable word, runs `is_byte_access` — a port of the
-deleted patcher's decoder — and sets bits for accepted words.
-
-Reachability is built in three passes, re-running to a fixed point:
+`tools/classify-rom` walks every reachable word in three passes, re-running to
+a fixed point:
 
 1. Direct recursive-descent from every non-linker-marker symbol in
    `demangled_symbols.txt` + the 8 exception vectors. Follows B/BL/Bcc and
    fall-through. Terminates at unconditional B/BX, PC-writing DP/LDR, LDM
    with PC, SWI, UDF.
-2. Indirect-target recovery: every word-aligned value that points at a
+2. Indirect-target recovery: every word-aligned value pointing at a
    prologue-shaped target (`tracer.rs`'s allowlist) is seeded as a root.
    Catches vtables, dispatch tables, callback arrays.
 3. Prologue sweep: any unreached word whose content is itself a
-   prologue-shaped instruction is seeded. Covers REX code (no symbol file
+   prologue-shaped instruction is seeded. Covers REx code (no symbol file
    covers our `Einstein.rex`) and cold code reachable only via indirect
    calls the walker can't follow.
 
@@ -108,7 +72,7 @@ Newton-specific control-flow idioms the walker understands:
 Regeneratable, `.gitignore`d. The checked-in files are this README, the
 `.gitignore`, and nothing else.
 
-That `.gitignore` is `*` with only these two re-included, so a clean wipes
+That `.gitignore` is `*` with only those two re-included, so a clean wipes
 every `<hash>/` directory. `reach.bitmap` going missing is a hard `build.rs`
 panic naming the fix, but the sibling `code-symbols.txt` loss only downgrades
 to a `cargo:warning` and silently empties the diag symbol tables (hex-only

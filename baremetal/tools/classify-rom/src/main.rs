@@ -1,20 +1,14 @@
-//! Host-side byte/halfword-access classifier for Newton 2.x ROM + Einstein.rex.
+//! Host-side code/data classifier for Newton 2.x ROM + Einstein.rex.
 //!
 //! Produces a single bitmap, one bit per 32-bit word across 16 MiB of guest
 //! ROM space (0..0x01000000):
 //!
-//!   byte-access-static.bitmap — bit set iff the word is reachable as code
-//!   AND decodes as an endianness-sensitive subword access (LDRB / STRB /
-//!   LDRH / STRH / LDRSB / LDRSH / SWPB).
+//!   reach.bitmap — bit set iff the walker reached the word as code.
 //!
-//! This is the authoritative patch list for the endianness pre-patching
-//! pass. By construction every bit set corresponds to an instruction that
-//! baremetal/src/inline_patch.rs::decode would accept.
-//!
-//! Invariant (when the oracle bitmap is present): every bit set in
-//! byte-access.bitmap (oracle, from NewtonProbe) must be set in
-//! byte-access-static.bitmap. A violation is either a walker reachability
-//! gap or a decoder-alignment bug and is reported as a hard error.
+//! The hypervisor stages this into its image and uses it to pick each ROM
+//! word's storage layout at load: code words byte-reversed for the
+//! always-LE instruction fetcher, data words verbatim for the BE-8 guest.
+//! See baremetal/docs/ENDIAN_FIXES.md.
 
 use std::collections::HashSet;
 use std::fs;
@@ -881,8 +875,7 @@ const MANUAL_CODE_ROOTS: &[u32] = &[
 /// Each range is verified against the disasm by inspection. Padding
 /// words inside a listed range (e.g. zero-fills between adjacent
 /// functions) are harmless — they decode as `andeq r0, r0, r0` /
-/// `0x00000000`, neither byte-swapped form changes them, and they
-/// don't trigger byte-access patches.
+/// `0x00000000`, and neither byte-swapped form changes them.
 const MANUAL_CODE_RANGES: &[(u32, u32)] = &[
     // FP emulator helpers — handwritten ARM asm in the FPE block at
     // 0x39255x..0x39289x. The walker doesn't reach these because the
@@ -1010,55 +1003,6 @@ fn is_known_function_start(w: u32) -> bool {
     false
 }
 
-/// Byte/halfword-access decoder. MUST match the acceptance set of
-/// baremetal/src/inline_patch.rs::decode (lines 259-377). Divergence is
-/// caught by the oracle ⊆ static invariant check at run end.
-///
-/// Returns true iff `insn` is an endianness-sensitive subword access that
-/// the patcher would accept.
-fn is_byte_access(insn: u32) -> bool {
-    let cond = (insn >> 28) & 0xF;
-    if cond == 0xF {
-        return false;
-    }
-
-    // Form 1a: LDRB/STRB immediate (bits[27:25]=010, B=1).
-    if (insn & 0x0E00_0000) == 0x0400_0000 && (insn & (1 << 22)) != 0 {
-        return true;
-    }
-    // Form 1b: LDRB/STRB register, bit 4 == 0 (bits[27:25]=011, B=1).
-    if (insn & 0x0E00_0010) == 0x0600_0000 && (insn & (1 << 22)) != 0 {
-        return true;
-    }
-
-    // Form 2: extra load/store (halfword / signed byte / signed halfword).
-    // Keyed on bits[27:25]=000, bit 7=1, bit 4=1, op=(bits[6:5])!=0.
-    // Excludes LDRD (op=10, L=0) and STRD (op=11, L=0) — inline_patch::decode
-    // returns None for those.
-    if (insn & 0x0E00_0090) == 0x0000_0090 {
-        let op = (insn >> 5) & 0x3;
-        let l = (insn >> 20) & 1 != 0;
-        return match (op, l) {
-            (0b01, _) => true,      // LDRH / STRH
-            (0b10, true) => true,   // LDRSB
-            (0b10, false) => false, // LDRD
-            (0b11, true) => true,   // LDRSH
-            (0b11, false) => false, // STRD
-            _ => false,             // op=00 falls to sync primitives
-        };
-    }
-
-    // Form 3: SWPB. cond 0001 0100 Rn Rt 0000 1001 Rm.
-    // inline_patch::decode refuses Rt == Rm (UNPREDICTABLE); match that.
-    if (insn & 0x0FF0_0FF0) == 0x0140_0090 {
-        let rt = (insn >> 12) & 0xF;
-        let rm = insn & 0xF;
-        return rt != rm;
-    }
-
-    false
-}
-
 struct Bitmap {
     bits: Vec<u8>,
 }
@@ -1068,13 +1012,6 @@ impl Bitmap {
         Self {
             bits: vec![0u8; BITMAP_BYTES],
         }
-    }
-
-    fn from_bytes(b: Vec<u8>) -> Result<Self, String> {
-        if b.len() != BITMAP_BYTES {
-            return Err(format!("expected {} bytes, got {}", BITMAP_BYTES, b.len()));
-        }
-        Ok(Self { bits: b })
     }
 
     fn set_word(&mut self, addr: u32) {
@@ -1675,9 +1612,8 @@ fn is_pc_write(w: u32) -> bool {
     false
 }
 
-/// Decode one ARM word for the walker's control-flow purposes. Data-flow
-/// classification (byte/halfword access) is a separate check via
-/// `is_byte_access`. `manual_bl` says the walker has tracked a recent
+/// Decode one ARM word for the walker's control-flow purposes.
+/// `manual_bl` says the walker has tracked a recent
 /// `mov lr, pc` / `add lr, pc, #imm` whose target equals `pc + 4` —
 /// any PC-write at `pc` is therefore a call returning at `pc + 4`,
 /// not a terminal jump. `in_table` says the walker is currently
@@ -1791,9 +1727,8 @@ fn step(w: u32, _pc: u32, manual_bl: bool, in_table: bool) -> Step {
     // return; the bytes after it are an ASCII null-terminated message
     // padded to 4-byte alignment, NOT instructions. Without recognising
     // it the walker falls through into the message and marks string
-    // words as code (string chars happen to decode as LDRB/STRB shape
-    // with Rn=PC, then leak into the byte-access bitmap and force
-    // inline_patch to skip them at install time).
+    // words as code, so the loader stores them byte-reversed and every
+    // guest read of the message returns mojibake.
     if w == 0xE600_0510 {
         return Step::Stop;
     }
@@ -1851,8 +1786,7 @@ struct WalkStats {
 
 /// Walk from roots, closing over indirect-targets by scanning unreached
 /// word-aligned values for function-pointer-shaped data. Returns the
-/// reachable-code bitmap. The caller then intersects with
-/// `is_byte_access` to produce the final byte-access-static bitmap.
+/// reachable-code bitmap, which the caller writes as reach.bitmap.
 ///
 /// `stats` is supplied by the caller (rather than constructed here) so
 /// pre-walk seeders like `rex_header_roots` can record their own
@@ -1997,7 +1931,7 @@ fn walk(
                 // between dispatch and table entries, walks past the
                 // epilogue, and falls into the literal pool. That's how
                 // a function-pointer literal at `function_end + 0` ends
-                // up classified as a byte-access instruction
+                // up misclassified as code
                 // (iter-69: 0x35c49c → 0x01b494f4 corruption).
                 let cond = (w >> 28) & 0xF;
                 let is_b_al = ((w >> 25) & 0b111) == 0b101 && cond == 0xE && ((w >> 24) & 1) == 0;
@@ -3236,35 +3170,6 @@ fn write_bitmap(path: &Path, bm: &Bitmap) -> Result<(), String> {
     fs::write(path, &bm.bits).map_err(|e| format!("write {}: {}", path.display(), e))
 }
 
-struct InvariantReport {
-    oracle_popcount: u64,
-    static_popcount: u64,
-    oracle_only_count: u64,
-    oracle_only_samples: Vec<u32>,
-}
-
-fn check_invariant(oracle: &Bitmap, static_bm: &Bitmap) -> InvariantReport {
-    let mut oracle_only_count: u64 = 0;
-    let mut oracle_only_samples: Vec<u32> = Vec::new();
-    for i in 0..ROM_WORD_COUNT {
-        let addr = (i as u32) * 4;
-        let in_oracle = oracle.get_word(addr);
-        let in_static = static_bm.get_word(addr);
-        if in_oracle && !in_static {
-            oracle_only_count += 1;
-            if oracle_only_samples.len() < 32 {
-                oracle_only_samples.push(addr);
-            }
-        }
-    }
-    InvariantReport {
-        oracle_popcount: oracle.popcount(),
-        static_popcount: static_bm.popcount(),
-        oracle_only_count,
-        oracle_only_samples,
-    }
-}
-
 fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(a) => a,
@@ -3396,48 +3301,15 @@ fn run(args: Args) -> Result<(), String> {
     // the original count for the summary stat.)
     let _ = rex_header_root_count;
 
-    // Build byte-access-static: reach ∧ is_byte_access(insn).
-    let mut ba_static = Bitmap::new();
-    let mut kind_counts: [u64; 3] = [0, 0, 0]; // byte / halfword-ish / swpb (informational)
-    for i in 0..ROM_WORD_COUNT {
-        let addr = (i as u32) * 4;
-        if !reach.get_word(addr) {
-            continue;
-        }
-        let w = words[i];
-        if !is_byte_access(w) {
-            continue;
-        }
-        ba_static.set_word(addr);
-        let classify = classify_kind(w);
-        kind_counts[classify] += 1;
-    }
-
     let out_dir: PathBuf = args.out_root.join(&hash_str);
     fs::create_dir_all(&out_dir).map_err(|e| format!("mkdir {}: {}", out_dir.display(), e))?;
 
-    write_bitmap(&out_dir.join("byte-access-static.bitmap"), &ba_static)?;
     write_bitmap(&out_dir.join("reach.bitmap"), &reach)?;
-
-    // Invariant check vs the oracle bitmap. The oracle is optional — it
-    // costs a 90 s NewtonProbe boot and won't exist the first time a ROM
-    // hash is classified — so its absence isn't fatal, but it is reported
-    // on stderr and recorded in summary.txt. A summary that merely omits
-    // the check reads the same as one where the check passed.
-    let oracle_path = out_dir.join("byte-access.bitmap");
-    let invariant = match fs::read(&oracle_path) {
-        Ok(bytes) => {
-            let oracle = Bitmap::from_bytes(bytes)
-                .map_err(|e| format!("read {}: {}", oracle_path.display(), e))?;
-            Some(check_invariant(&oracle, &ba_static))
-        }
-        Err(_) => None,
-    };
 
     let summary_path = out_dir.join("summary.txt");
     let mut f = fs::File::create(&summary_path)
         .map_err(|e| format!("create {}: {}", summary_path.display(), e))?;
-    writeln!(f, "classify-rom byte-access-static summary").ok();
+    writeln!(f, "classify-rom reach summary").ok();
     writeln!(f, "  inputs:").ok();
     writeln!(f, "    rom     = {}", args.rom.display()).ok();
     writeln!(f, "    rex     = {}", args.rex.display()).ok();
@@ -3660,116 +3532,7 @@ fn run(args: Args) -> Result<(), String> {
     )
     .ok();
     writeln!(f, "    reachable-code popcount: {}", reach.popcount()).ok();
-    writeln!(
-        f,
-        "  byte-access-static.bitmap popcount = {}",
-        ba_static.popcount()
-    )
-    .ok();
-    writeln!(
-        f,
-        "    of which byte (LDRB/STRB):              {}",
-        kind_counts[0]
-    )
-    .ok();
-    writeln!(
-        f,
-        "    of which halfword/signed (LDRH/...):    {}",
-        kind_counts[1]
-    )
-    .ok();
-    writeln!(
-        f,
-        "    of which swpb:                          {}",
-        kind_counts[2]
-    )
-    .ok();
-    if let Some(rep) = &invariant {
-        writeln!(f, "  invariant check (oracle ⊆ static): RAN").ok();
-        writeln!(f, "    oracle popcount = {}", rep.oracle_popcount).ok();
-        writeln!(f, "    static popcount = {}", rep.static_popcount).ok();
-        writeln!(
-            f,
-            "    oracle bits missing from static = {}",
-            rep.oracle_only_count
-        )
-        .ok();
-        if !rep.oracle_only_samples.is_empty() {
-            writeln!(
-                f,
-                "    first {} offending PCs:",
-                rep.oracle_only_samples.len()
-            )
-            .ok();
-            for pc in &rep.oracle_only_samples {
-                let w = words[(*pc >> 2) as usize];
-                writeln!(f, "      0x{:08x}  insn=0x{:08x}", pc, w).ok();
-            }
-        }
-    } else {
-        writeln!(f, "  invariant check (oracle ⊆ static): NOT RUN").ok();
-        writeln!(f, "    no oracle bitmap at {}", oracle_path.display()).ok();
-        writeln!(
-            f,
-            "    byte-access-static.bitmap below is UNVALIDATED — generate the \
-             oracle with NewtonProbe (see classify/README.md) and re-run."
-        )
-        .ok();
-    }
-
     println!("classify-rom: wrote {}", out_dir.display());
-    println!("  byte-access-static popcount = {}", ba_static.popcount());
-    println!(
-        "  (byte={} halfword={} swpb={})",
-        kind_counts[0], kind_counts[1], kind_counts[2]
-    );
-    match invariant {
-        Some(rep) if rep.oracle_only_count == 0 => {
-            println!(
-                "  invariant OK: oracle {} ⊆ static {}",
-                rep.oracle_popcount, rep.static_popcount
-            );
-            Ok(())
-        }
-        Some(rep) => {
-            eprintln!(
-                "classify-rom: INVARIANT VIOLATED — {} oracle bits missing from static",
-                rep.oracle_only_count
-            );
-            eprintln!("  first offending PCs (see summary.txt for details):");
-            for pc in rep.oracle_only_samples.iter().take(8) {
-                let w = words[(*pc >> 2) as usize];
-                eprintln!("    0x{:08x}  insn=0x{:08x}", pc, w);
-            }
-            Err("invariant violated".into())
-        }
-        None => {
-            eprintln!(
-                "classify-rom: WARNING — no oracle bitmap at {}",
-                oracle_path.display()
-            );
-            eprintln!(
-                "  the oracle ⊆ static invariant was NOT checked; \
-                 byte-access-static.bitmap is unvalidated."
-            );
-            eprintln!("  Generate the oracle with NewtonProbe — see classify/README.md.");
-            Ok(())
-        }
-    }
-}
-
-fn classify_kind(w: u32) -> usize {
-    // LDRB/STRB immediate or register.
-    if (w & 0x0E00_0000) == 0x0400_0000 && (w & (1 << 22)) != 0 {
-        return 0;
-    }
-    if (w & 0x0E00_0010) == 0x0600_0000 && (w & (1 << 22)) != 0 {
-        return 0;
-    }
-    // SWPB.
-    if (w & 0x0FF0_0FF0) == 0x0140_0090 {
-        return 2;
-    }
-    // Halfword/signed — everything else accepted by is_byte_access.
-    1
+    println!("  reach.bitmap popcount = {}", reach.popcount());
+    Ok(())
 }

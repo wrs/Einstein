@@ -33,15 +33,6 @@ SingleDataSwap_Template(FLAG_B, Rn, Rd, Rm)
 
 	probe_record_swp(ioCPU->mCurrentRegisters[15] - 8, FLAG_B);
 
-#if FLAG_B && (Rd != Rm)
-	// Endianness-patch classifier: SWPB is byte-access and needs patching.
-	// Plain SWP (word) is endianness-neutral and not recorded.
-	// Rd == Rm is UNPREDICTABLE in AArch32; shadow_stub::decode
-	// (baremetal/src/shadow_stub.rs:360) returns None for that case, so we
-	// skip it here to keep the oracle ⊆ classify-rom static bitmap.
-	probe_record_ba_site(GETPC() - 8, 3);
-#endif
-
 	TMemory* theMemoryInterface = ioCPU->GetMemory();
 	TMemory::VAddr theAddress = (TMemory::VAddr) ioCPU->mCurrentRegisters[Rn];
 #if FLAG_B

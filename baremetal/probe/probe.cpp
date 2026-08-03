@@ -18,8 +18,6 @@
 #include <map>
 #include <mutex>
 #include <set>
-#include <sys/stat.h>
-#include <sys/types.h>
 #include <thread>
 #include <tuple>
 #include <vector>
@@ -132,17 +130,6 @@ struct PabortEvent {
 std::vector<PabortEvent> pabort_first;
 uint64_t pabort_total { 0 };
 
-// Endianness-patch classifier bitmap. One bit per 32-bit word in guest ROM
-// space (0..0x01000000). Index = addr / 4; LSB-first within each byte.
-// 16 MiB / 4 bytes / 8 bits = 524 288 bytes. Bit set ≡ the JIT actually
-// executed an endianness-sensitive subword access instruction at this PC.
-constexpr size_t kClassifyWordCount = (16u * 1024u * 1024u) / 4u; // 4 Mi words
-constexpr size_t kClassifyBitmapBytes = kClassifyWordCount / 8u;  // 524 288
-std::vector<uint8_t> ba_site_bitmap(kClassifyBitmapBytes, 0);
-uint64_t ba_site_records { 0 };
-// Per-kind tallies for the byte/halfword/swpb breakdown in summary.
-uint64_t ba_site_by_kind[4] { 0, 0, 0, 0 };
-
 } // namespace probe_state
 
 extern "C" void probe_record_cp15(uint32_t pc, uint32_t cpopc, uint32_t crn,
@@ -195,15 +182,6 @@ extern "C" void probe_record_prefetch_abort(uint32_t pc, uint32_t ifsr,
 			{probe_state::pabort_total, pc, ifsr, mode});
 	}
 	probe_state::pabort_total++;
-}
-
-extern "C" void probe_record_ba_site(uint32_t pc, uint32_t kind) {
-	if (pc >= 16u * 1024u * 1024u || (pc & 3u) != 0) return;
-	const uint32_t word_idx = pc >> 2;
-	std::lock_guard<std::mutex> lock(probe_state::mu);
-	probe_state::ba_site_bitmap[word_idx >> 3] |= uint8_t(1u << (word_idx & 7u));
-	probe_state::ba_site_records++;
-	if (kind < 4) probe_state::ba_site_by_kind[kind]++;
 }
 
 // Heap allocator call log. We watch BL targets equal to NewPtr/NewHandle/
@@ -347,134 +325,6 @@ void dump_instrumentation(FILE* f) {
 	}
 
 	std::fprintf(f, "<===== End of instrumentation summary\n");
-}
-
-// ==========================================================================
-//  Classifier bitmap dump
-// ==========================================================================
-
-// FNV-1a-32. Streamed via a state parameter so we can hash ROM+REX in sequence.
-uint32_t fnv1a_32(const void* data, size_t len, uint32_t state = 0x811C9DC5u) {
-	const uint8_t* p = static_cast<const uint8_t*>(data);
-	for (size_t i = 0; i < len; ++i) {
-		state ^= p[i];
-		state *= 0x01000193u;
-	}
-	return state;
-}
-
-bool read_file_bytes(const char* path, std::vector<uint8_t>& out) {
-	std::FILE* f = std::fopen(path, "rb");
-	if (!f) return false;
-	std::fseek(f, 0, SEEK_END);
-	long sz = std::ftell(f);
-	std::fseek(f, 0, SEEK_SET);
-	if (sz < 0) { std::fclose(f); return false; }
-	out.resize(static_cast<size_t>(sz));
-	size_t got = std::fread(out.data(), 1, out.size(), f);
-	std::fclose(f);
-	return got == out.size();
-}
-
-// mkdir -p for a single path. Returns true on success (created or existed).
-bool mkdir_p(const char* path) {
-	std::string buf(path);
-	for (size_t i = 1; i < buf.size(); ++i) {
-		if (buf[i] == '/') {
-			buf[i] = 0;
-			if (::mkdir(buf.c_str(), 0755) != 0 && errno != EEXIST) return false;
-			buf[i] = '/';
-		}
-	}
-	if (::mkdir(buf.c_str(), 0755) != 0 && errno != EEXIST) return false;
-	return true;
-}
-
-uint64_t popcount_bytes(const std::vector<uint8_t>& b) {
-	uint64_t n = 0;
-	for (uint8_t x : b) n += __builtin_popcount(x);
-	return n;
-}
-
-bool write_file(const char* path, const void* data, size_t len) {
-	std::FILE* f = std::fopen(path, "wb");
-	if (!f) return false;
-	size_t got = std::fwrite(data, 1, len, f);
-	std::fclose(f);
-	return got == len;
-}
-
-// Resolve the classify output root. An explicit --out wins. Otherwise the
-// root is found by probing the two cwds the docs use — the Einstein root
-// and baremetal/ — and requiring the directory to already exist. classify/
-// is checked in (README + .gitignore), so "exists" is a reliable marker;
-// creating it on demand instead is what produced baremetal/baremetal/
-// classify/ when the probe was run from the wrong directory.
-const char* resolve_classify_root(const char* outOverride) {
-	if (outOverride) return outOverride;
-	static const char* const kCandidates[] = { "baremetal/classify", "classify" };
-	for (const char* c : kCandidates) {
-		struct stat st;
-		if (::stat(c, &st) == 0 && S_ISDIR(st.st_mode)) return c;
-	}
-	return nullptr;
-}
-
-// Dump the classifier bitmaps to <classify-root>/<hash>/. Returns 0 on
-// success, nonzero on failure (caller logs but continues shutdown).
-int dump_classifier_bitmaps(const char* romPath, const char* rexPath, const char* outOverride) {
-	std::vector<uint8_t> romBytes;
-	if (!read_file_bytes(romPath, romBytes)) {
-		std::fprintf(stderr, "classify: failed to read %s for hashing\n", romPath);
-		return 1;
-	}
-	uint32_t hash = fnv1a_32(romBytes.data(), romBytes.size());
-	if (rexPath) {
-		std::vector<uint8_t> rexBytes;
-		if (!read_file_bytes(rexPath, rexBytes)) {
-			std::fprintf(stderr, "classify: failed to read %s for hashing\n", rexPath);
-			return 1;
-		}
-		hash = fnv1a_32(rexBytes.data(), rexBytes.size(), hash);
-	}
-
-	const char* root = resolve_classify_root(outOverride);
-	if (!root) {
-		std::fprintf(stderr,
-			"\nclassify: no classify/ directory found from cwd — run NewtonProbe from the\n"
-			"          Einstein root or baremetal/, or pass --out <dir>. Bitmap NOT written.\n");
-		return 1;
-	}
-
-	char dir[256];
-	std::snprintf(dir, sizeof(dir), "%s/%08x", root, hash);
-	if (!mkdir_p(dir)) {
-		std::fprintf(stderr, "classify: mkdir_p(%s) failed: %s\n", dir, std::strerror(errno));
-		return 1;
-	}
-
-	std::lock_guard<std::mutex> lock(probe_state::mu);
-	uint64_t ba_bits = popcount_bytes(probe_state::ba_site_bitmap);
-
-	char p1[320];
-	std::snprintf(p1, sizeof(p1), "%s/byte-access.bitmap", dir);
-	if (!write_file(p1, probe_state::ba_site_bitmap.data(), probe_state::ba_site_bitmap.size())) {
-		std::fprintf(stderr, "classify: write %s failed\n", p1);
-		return 1;
-	}
-
-	std::fprintf(stdout,
-		"\n=====> Endianness-patch classifier bitmap written to %s/\n"
-		"  rom+rex fnv1a32 = 0x%08x%s\n"
-		"  byte-access.bitmap popcount=%llu  executions=%llu\n"
-		"    (byte=%llu  halfword/signed/dword=%llu  swpb=%llu)\n",
-		dir, hash, rexPath ? "" : " (rom only; no rex on cmdline)",
-		static_cast<unsigned long long>(ba_bits),
-		static_cast<unsigned long long>(probe_state::ba_site_records),
-		static_cast<unsigned long long>(probe_state::ba_site_by_kind[0]),
-		static_cast<unsigned long long>(probe_state::ba_site_by_kind[1]),
-		static_cast<unsigned long long>(probe_state::ba_site_by_kind[3]));
-	return 0;
 }
 
 } // namespace
@@ -991,39 +841,21 @@ void locale_dump(TMemory* mem, const char* tag) {
 
 void usage(const char* argv0) {
 	std::fprintf(stderr,
-		"usage: %s <rom.bin> [rex.bin|-] [wall-seconds] [--out <dir>]\n"
+		"usage: %s <rom.bin> [rex.bin|-] [wall-seconds]\n"
 		"  rom.bin        path to the Newton ROM dump (8 MiB, big-endian as captured)\n"
 		"  rex.bin        path to Einstein.rex, or - for the builtin (default: -)\n"
-		"  wall-seconds   host wall-clock seconds to let the ROM run (default: %u)\n"
-		"  --out <dir>    classify output root; <dir>/<rom+rex hash>/byte-access.bitmap\n"
-		"                 is written there (default: the existing baremetal/classify\n"
-		"                 or classify directory, relative to cwd)\n",
+		"  wall-seconds   host wall-clock seconds to let the ROM run (default: %u)\n",
 		argv0, kDefaultBootSeconds);
 }
 
 }
 
 int main(int argc, char** argv) {
-	// Pull --out <dir> out of argv, then treat what's left as the three
-	// historical positionals.
-	const char* outOverride = nullptr;
-	const char* pos[3] = { nullptr, nullptr, nullptr };
-	int nPos = 0;
-	for (int i = 1; i < argc; ++i) {
-		if (std::strcmp(argv[i], "--out") == 0) {
-			if (++i >= argc) { usage(argv[0]); return 2; }
-			outOverride = argv[i];
-		} else if (nPos < 3) {
-			pos[nPos++] = argv[i];
-		} else {
-			usage(argv[0]); return 2;
-		}
-	}
-	if (nPos < 1) { usage(argv[0]); return 2; }
+	if (argc < 2 || argc > 4) { usage(argv[0]); return 2; }
 
-	const char* romPath = pos[0];
-	const char* rexPath = (nPos >= 2 && std::strcmp(pos[1], "-") != 0) ? pos[1] : nullptr;
-	unsigned wallSeconds = (nPos >= 3) ? static_cast<unsigned>(std::strtoul(pos[2], nullptr, 0)) : kDefaultBootSeconds;
+	const char* romPath = argv[1];
+	const char* rexPath = (argc >= 3 && std::strcmp(argv[2], "-") != 0) ? argv[2] : nullptr;
+	unsigned wallSeconds = (argc >= 4) ? static_cast<unsigned>(std::strtoul(argv[3], nullptr, 0)) : kDefaultBootSeconds;
 
 	// We intentionally allocate the flash file under /tmp so repeated runs
 	// don't accumulate state anywhere persistent; the probe is a read-only
@@ -1138,7 +970,6 @@ int main(int argc, char** argv) {
 
 	mmu->FDump(stdout);
 	dump_instrumentation(stdout);
-	dump_classifier_bitmaps(romPath, rexPath, outOverride);
 	std::fflush(stdout);
 
 	// Skip destructors: the interrupt-manager thread + network thread need

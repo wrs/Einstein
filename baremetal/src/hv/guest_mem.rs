@@ -594,18 +594,14 @@ pub(crate) fn resolve_guest_pa(addr: u32) -> Option<u32> {
 /// doesn't infinite-loop.
 /// Log a guest C string pointed to by `addr`.
 ///
-/// The Newton 717006 ROM is stored big-endian in the image file and
-/// byteswapped per word at load time so LDR in our LE guest returns
-/// the u32 the original BE CPU saw (see `newton::loader::load_newton_rom`).
-/// Bytes within each 4-byte word end up reversed in host memory: a
-/// word originally `0x48 0x65 0x6C 0x6C` ("Hell" in BE) is laid out
-/// as `0x6C 0x6C 0x65 0x48` in host LE memory. To recover the
-/// original byte sequence we re-swap each loaded word via
-/// `to_be_bytes()`.
+/// `read_guest_word_pa` returns the Newton-side *numerical* value of
+/// the word, whatever the host byte layout is. A Newton string is a
+/// big-endian byte sequence within that word — `0x48656C6C` is "Hell"
+/// — so `to_be_bytes()` recovers the characters in order.
 ///
-/// Guest-test binaries are LE-native (no ROM byteswap on load), so
-/// the bytes in host memory are already in natural order — use
-/// `to_le_bytes()`. We pick at compile time via `nh_guest_test`.
+/// Guest-test binaries run the guest LE, where the same word holds its
+/// characters in the opposite order — use `to_le_bytes()`. We pick at
+/// compile time via `nh_guest_test`.
 pub(crate) fn log_guest_string(prefix: &'static str, addr: u32) {
     const CAP: usize = 256;
     let mut buf = [0u8; CAP];

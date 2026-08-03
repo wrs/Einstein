@@ -10,8 +10,9 @@
 //!
 //! Routing the CNTHP PPI to the CPU's IRQ input is host-specific:
 //!   raspi3b  — BCM2836 per-core "ARM local" peripheral at 0x4000_0040.
-//!   fvp-base — GICv3 (brought up by `platform::fvp_base`, which calls
-//!              `gicv3::init` + `enable_ppi(INTID_CNTHP)`).
+//!   fvp-base — GICv3 (brought up by the platform layer's `fvp_base.rs`
+//!              backend, which calls `gicv3::init` +
+//!              `enable_ppi(INTID_CNTHP)`).
 //! See `crate::host::platform::install_cnthp_irq_routing`.
 
 use crate::hv::hooks::{ActiveGuest, GuestOs};
@@ -85,7 +86,7 @@ fn program_cval(cval: u64) {
 
 /// Reprogram CNTHP_CVAL_EL2 for the next 16 ms heartbeat. The
 /// heartbeat exists purely to give the EL2 IRQ vector control
-/// periodically — primarily so `tick_page::update` runs even when the
+/// periodically — primarily so `tick_page::publish` runs even when the
 /// guest is in a non-trapping loop, and so `poll_timer_matches` runs
 /// even when no sync trap has fired recently.
 ///

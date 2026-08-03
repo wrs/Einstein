@@ -99,11 +99,11 @@ use super::rom_ver;
 /// TPIDRURW (TPIDR_EL0 in AArch64); `handle_und` reads `tpidr_el0` and
 /// restores `ctx.x[12]`. TPIDRURW is ARMv6+ architectural state that
 /// SA-1100 (ARMv4) did not have, and the Newton ROM never touches it,
-/// so claiming it as the R12 save slot is safe. This matters for the
-/// shadow-byte-access UDF-trap path, where the faulting instruction
-/// can legitimately use R12 as base/data/offset; the tracer's
+/// so claiming it as the R12 save slot is safe. This matters for
+/// mid-function UDF sites, where the faulting instruction can
+/// legitimately use R12 as base/data/offset; the tracer's
 /// function-entry assumption (`MOV R12, R13` on every prologue) does
-/// not hold for mid-function sites.
+/// not hold there.
 ///
 /// Branch encoding at VA 0x04: `b UND_TRAMP_OFFSET`.
 ///   imm24 = (UND_TRAMP_OFFSET - (0x04 + 8)) / 4
@@ -719,9 +719,9 @@ pub unsafe fn patch_und_vector(rom: *mut u32) {
             //
             // Two-stage check: bits[27:24] in {0xC, 0xD, 0xE} (LDC/STC/CDP/MCR),
             // *then* bits[11:8] in {1, 2} (FPA cp_num). The first stage rules
-            // out UDF (bits[27:24]=0x7), software breakpoints, tracer UDFs,
-            // shadow-byte-access UDFs (all bits[27:24]=0x7), and other
-            // non-coprocessor UND-causing insns. The second stage rules out
+            // out UDF (bits[27:24]=0x7), software breakpoints and tracer
+            // UDFs (also bits[27:24]=0x7), and other non-coprocessor
+            // UND-causing insns. The second stage rules out
             // VFP/Advanced-SIMD (cp_num 10/11) — though those don't appear
             // in 717006 ROM, the check keeps the stub future-proof.
             let s = FPA_BYPASS_STUB_OFFSET / 4;

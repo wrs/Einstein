@@ -304,13 +304,10 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
     // 2 bpp packing: each byte holds 4 pixels (pixel 0 in bits 7..6,
     // pixel 1 in 5..4, pixel 2 in 3..2, pixel 3 in 1..0).
     //
-    // BE-32 word-invariant byte access: the Newton kernel writes
-    // pixmap data as BE-32, so logical byte N at PA `p` lives at
-    // host PA `p ^ 3` (within each 4-byte word). Same lane convention
-    // as the sub-word MMIO path in `hv::be8` (see `unxor_sub_word`
-    // and its `XOR_LIMIT`). The FB itself is
-    // hypervisor-managed linear-LE — host byte N is pixel byte N in
-    // display order — so FB writes don't XOR.
+    // The guest is BE-8, so pixmap byte N lives at host PA `p + N` with
+    // no lane transform — `guest_read_u8_pa` is a plain byte read. The
+    // FB is hypervisor-managed linear-LE, host byte N being pixel byte N
+    // in display order, so FB writes need no transform either.
     let src_width_pixels = (src_right - src_left) as u32;
     let fb_row_bytes = fb_row_bytes();
 

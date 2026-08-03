@@ -19,8 +19,11 @@ use crate::hv::guest_mem::{
 use crate::kprintln;
 
 // Big-endian ROM dump captured from hardware. Each 32-bit word is stored
-// with the MSB first in memory. Guest runs little-endian, so we byteswap
-// word-by-word during load. The path is resolved per ROM version by
+// with the MSB first in memory. The guest runs BE-8, so the load layout
+// is per-word and depends on the classifier: code words are byte-reversed
+// (instruction fetch is always LE on A53), data words go down verbatim
+// (the CPU's BE-8 reversal recovers the value). See docs/ENDIAN_FIXES.md.
+// The path is resolved per ROM version by
 // `resolve_rom_version()` in build.rs; when the selected version's ROM
 // image isn't present on disk, build.rs stages a zero-length placeholder
 // (so `cargo check` of a skeleton version stays green) and
@@ -29,8 +32,8 @@ use crate::kprintln;
 static ROM_BE: &[u8] = include_bytes!(env!("NH_ROM_PATH"));
 
 // Einstein's REx goes into the second 8 MB of the 16 MB ROM region, at
-// `rom_ver::REX.pa_offset`. Same big-endian → little-endian byteswap as
-// the main ROM. Maps the Newton kernel's high-half VA 0x01000000 onwards
+// `rom_ver::REX.pa_offset`. Same per-word load layout as the main ROM.
+// Maps the Newton kernel's high-half VA 0x01000000 onwards
 // once the guest programs its stage-1 to point there.
 // See Emulator/ROM/TFlatROMImageWithREX.cpp:139-178 for the layout.
 // Path resolved by build.rs alongside the ROM image.
@@ -274,8 +277,8 @@ pub unsafe fn load_guest_test() {
         rom_host_pa(),
         ram_host_pa()
     );
-    // Install the UND trampoline so shadow-byte-access UDF markers,
-    // guest_bp UDFs, and tracer USR-fallback UDFs reach EL2. The ROM
+    // Install the UND trampoline so guest_bp UDFs and tracer
+    // USR-fallback UDFs reach EL2. The ROM
     // patching that `load_newton_rom` does to rewrite CP15 encodings
     // is still skipped — guest-test binaries are already ARMv7-correct.
     unsafe {

@@ -29,7 +29,7 @@ pub const DRAM_1GIB_BLOCK: Option<u64> = None;
 /// raspi3b) is rate-converted in `vic::ticks()`.
 ///
 /// No rate scaling is applied: with the 16 ms CNTHP heartbeat in
-/// `timer.rs` driving `tick_page::update()`, the guest sees ticks
+/// `timer.rs` driving `tick_page::publish()`, the guest sees ticks
 /// advance even during tight non-trapping polls, so early calibrated
 /// delay loops finish promptly without one. Keeping the
 /// natural rate matches what the kernel computes from `kFreqGenFreq`

@@ -450,8 +450,9 @@ baremetal/
     check-layering.sh    import-discipline lint for the src/ layers
     check-rom-addrs.sh   ROM-address containment lint (hex literals
                          belong in src/newton/rom_ver/)
-    check-doc-symbols.py doc code-reference lint (every code path cited
-                         in the docs resolves, and to the module named)
+    check-doc-symbols.py code-reference lint (every code path cited in
+                         the docs *and in source comments* resolves,
+                         and to the module named)
     classify-symbols.py  ROM symbol partitioner (code/data/drop)
     regen-classify.sh    regenerate code-symbols.txt + reach.bitmap
                          for a ROM version (default 717006)

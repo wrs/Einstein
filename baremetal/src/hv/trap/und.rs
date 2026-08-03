@@ -141,12 +141,11 @@ pub(crate) fn handle_und(ctx: &mut TrapContext) {
     // save-slot base. TPIDRURW is ARMv6+ state the SA-1100-era Newton
     // ROM never touches, so using it as the R12 save slot is safe.
     //
-    // Restoring R12 matters for the shadow-byte-access UDF-trap path,
-    // where the faulting instruction can legitimately use R12 as base
-    // / data / offset. The tracer's function-entry UDF sites don't
-    // need R12 (every Newton 2.x prologue begins `MOV R12, R13`), but
-    // doing the restore unconditionally is cheaper than branching on
-    // the UDF kind.
+    // Restoring R12 matters for mid-function UDF sites, where the
+    // faulting instruction can legitimately use R12 as base / data /
+    // offset. The tracer's function-entry UDF sites don't need R12
+    // (every Newton 2.x prologue begins `MOV R12, R13`), but doing the
+    // restore unconditionally is cheaper than branching on the UDF kind.
     ctx.x[0] = match read_guest_word_pa(UND_SAVE_R0_IPA) {
         Some(v) => v as u64,
         None => {

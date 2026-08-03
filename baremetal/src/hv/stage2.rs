@@ -87,7 +87,7 @@ static mut S2_L3_RAM_1: PageTable = PageTable([0; 512]);
 // backing, reads become cache-coherent loads from the guest's
 // perspective, no trap. EL2 periodically writes the current
 // `vic::ticks()` value into offset 0x800 from the CNTHP IRQ handler
-// and from a few other forward-progress hooks; see `tick_page::update`.
+// and from a few other forward-progress hooks; see `tick_page::publish`.
 //
 // Offsets 0x000 (calendar) and 0x400 (alarm) also live in this page;
 // they currently always read as 0 from `vic::read`, which matches the
@@ -311,7 +311,7 @@ pub unsafe fn init() {
 
     // Refine one 2 MiB L2 slot into 4 KiB pages so we can plant the
     // non-trapping tick register inside the otherwise-MMIO peripheral
-    // window. See TICK_PAGE / tick_page::update for the rationale.
+    // window. See TICK_PAGE / tick_page::publish for the rationale.
     // SAFETY: see the called helper's contract.
     unsafe {
         install_tick_page();

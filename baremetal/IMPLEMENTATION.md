@@ -239,7 +239,8 @@ guest tests and the boot.
 
 `scripts/check-matrix.sh` runs the three structure lints
 (`check-layering.sh` import discipline, `check-rom-addrs.sh` ROM-address
-containment, `check-doc-symbols.py` doc code-references) and then
+containment, `check-doc-symbols.py` code references in docs and
+comments) and then
 `cargo check`s all 18 supported build
 combinations — default, the no-diag variants, both platforms,
 `rom-710031`, the four `pi-bare-metal*` aggregates, trace/probe/log

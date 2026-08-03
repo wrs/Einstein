@@ -2,14 +2,16 @@
 # /// script
 # requires-python = ">=3.11"
 # ///
-"""Check that code references in the docs still resolve.
+"""Check that code references in docs and source comments still resolve.
 
-Markdown prose cites our own code as `module::item` or
-`path/file.rs::item`. Those citations rot silently: a rename sweep that
-rewrites the namespace in prose without checking the item moved with it
-leaves a reference that looks freshly maintained and is wrong. Worse, it
-can point at a real module that happens not to define the item, which
-reads as more authoritative than a dangling reference to a deleted one.
+Prose cites our own code as `module::item` or `path/file.rs::item`, in
+markdown and in `//` comments alike. Those citations rot silently: a
+rename sweep that rewrites the namespace in prose without checking the
+item moved with it leaves a reference that looks freshly maintained and
+is wrong. Worse, it can point at a real module that happens not to
+define the item, which reads as more authoritative than a dangling
+reference to a deleted one. Source comments are the worst place for
+this, because they sit next to the code and so are trusted most.
 
 Two checks, both over inline code spans only (unquoted prose is too
 noisy to parse):
@@ -35,8 +37,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 # Put this on a line whose `module::item` names something intentionally
-# not yet implemented; the line is then skipped.
-PROPOSED_MARKER = "<!-- doc-symbols: proposed -->"
+# not yet implemented; the line is then skipped. Markdown wraps it in an
+# HTML comment (`<!-- doc-symbols: proposed -->`); Rust just puts it in
+# the comment text.
+PROPOSED_MARKER = "doc-symbols: proposed"
 SRC_DIRS = ["src", "tools", "newton-objects"]
 SKIP_DIRS = {"target", "vendor", ".git", ".jj", "build"}
 
@@ -59,7 +63,9 @@ def def_re(sym: str) -> re.Pattern:
         rf"(?:^|\s){vis}(?:unsafe\s+|extern\s+\"[^\"]*\"\s+|async\s+)*"
         rf"(?:fn|struct|enum|trait|type|union|mod)\s+{s}\b"
         rf"|(?:^|\s){vis}(?:const|static)\s+(?:mut\s+)?{s}\b"
-        rf"|macro_rules!\s+{s}\b",
+        rf"|macro_rules!\s+{s}\b"
+        # Struct fields are cited too (`vic::int_present`).
+        rf"|^\s+{vis}{s}\s*:\s*[A-Za-z_&\[]",
         re.M,
     )
 
@@ -86,6 +92,10 @@ def source_files() -> list[Path]:
         for p in base.rglob("*.rs"):
             if not any(part in SKIP_DIRS for part in p.parts):
                 out.append(p)
+    # build.rs is cited by name (`build.rs::resolve_audio_backend`) from
+    # the backend modules whose cfgs it emits.
+    if (ROOT / "build.rs").exists():
+        out.append(ROOT / "build.rs")
     return sorted(out)
 
 
@@ -113,18 +123,17 @@ def module_index(blobs: dict[Path, str]) -> dict[str, list[tuple[Path, str]]]:
     """
     mods: dict[str, list[tuple[Path, str]]] = {}
     inline = re.compile(r"^[ \t]*(?:pub(?:\([^)]*\))?\s+)?mod\s+([a-z][a-z0-9_]*)\s*\{", re.M)
-    glob_reexport = re.compile(r"^\s*pub\s+use\s+[\w:]*\*\s*;", re.M)
     for p, text in blobs.items():
         name = p.parent.name if p.stem == "mod" else p.stem
         mods.setdefault(name, []).append((p, text))
         for m in inline.finditer(text):
             body = block_at(text, m.end() - 1)
             mods.setdefault(m.group(1), []).append((p, body))
-        # A module that glob-re-exports (`pub use imp::*;`, where `imp`
-        # is a cfg-selected backend) publishes its siblings' items under
-        # its own path, so `platform::enable_bcm2835_irq` is a valid
-        # citation even though the fn is defined in platform/raspi3b.rs.
-        if p.stem == "mod" and glob_reexport.search(text):
+        # A directory module owns its submodules, and prose names them
+        # through the parent (`trap::handle_und` for trap/und.rs,
+        # `platform::enable_bcm2835_irq` for a glob-re-exported
+        # platform/raspi3b.rs). Treat the whole directory as the module.
+        if p.stem == "mod":
             for sib in p.parent.rglob("*.rs"):
                 if sib != p:
                     mods[name].append((sib, blobs.get(sib, sib.read_text(errors="replace"))))
@@ -140,59 +149,77 @@ def main() -> int:
 
     docs = sorted(p for p in ROOT.rglob("*.md") if not any(x in SKIP_DIRS for x in p.parts))
 
-    sym_re = re.compile(r"`([A-Za-z_][\w/.]*(?:\.rs)?)::([A-Za-z_]\w*)")
+    # The trailing guard rejects deliberate family citations —
+    # `guest_mem::load_*`, `guest_endian::guest_read/write_u32_va` —
+    # where the captured item is only a prefix of a real name.
+    sym_re = re.compile(r"`([A-Za-z_][\w/.]*(?:\.rs)?)::([A-Za-z_]\w*)(?![\w*/])")
     path_re = re.compile(r"`((?:src|tools|scripts|probe|guest-tests|newton-objects)/[\w./-]+)`")
 
     unresolved: list[str] = []
     misattributed: list[str] = []
     badpaths: list[str] = []
 
-    for doc in docs:
-        rel = doc.relative_to(ROOT)
-        for lineno, line in enumerate(doc.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
-            # Docs legitimately name things that do not exist yet, when
-            # proposing them ("a `host_dma::abort_channel` helper would
-            # be worth adding"). Marking the line says that is deliberate
-            # rather than rotted.
-            if PROPOSED_MARKER in line:
+    def check_line(origin: Path, rel: str, lineno: int, line: str, is_doc: bool) -> None:
+        # Prose legitimately names things that do not exist yet, when
+        # proposing them ("a `host_dma::abort_channel` helper would be
+        # worth adding"). Marking the line says that is deliberate
+        # rather than rotted.
+        if PROPOSED_MARKER in line:
+            return
+        for owner, sym in sym_re.findall(line):
+            if owner in NOT_OUR_MODULES or sym == "mod":
                 continue
-            for owner, sym in sym_re.findall(line):
-                if owner in NOT_OUR_MODULES or sym == "mod":
-                    continue
-                # Only our own Rust naming shape.
-                if not (owner.endswith(".rs") or re.fullmatch(r"[a-z][a-z0-9_]*", owner)):
-                    continue
-                if not re.fullmatch(r"[a-z][a-z0-9_]*|[A-Z][A-Z0-9_]*", sym):
-                    continue
+            # Only our own Rust naming shape.
+            if not (owner.endswith(".rs") or re.fullmatch(r"[a-z][a-z0-9_]*", owner)):
+                continue
+            if not re.fullmatch(r"[a-z][a-z0-9_]*|[A-Z][A-Z0-9_]*", sym):
+                continue
 
-                pat = def_re(sym)
-                if not pat.search(allsrc):
-                    unresolved.append(f"  {rel}:{lineno}  {owner}::{sym}")
-                    continue
+            pat = def_re(sym)
+            if not pat.search(allsrc):
+                unresolved.append(f"  {rel}:{lineno}  {owner}::{sym}")
+                continue
 
-                name = owner[:-3] if owner.endswith(".rs") else owner
-                parts = name.split("/")
-                name = parts[-1]
-                # `src/hv/trap/mod.rs::foo` names the `trap` module, not
-                # a module called `mod`.
-                if name == "mod" and len(parts) >= 2:
-                    name = parts[-2]
-                owners = mods.get(name, [])
-                if not owners:
-                    misattributed.append(f"  {rel}:{lineno}  {owner}::{sym}  -- no module named '{name}'")
-                elif re.search(rf"\b{re.escape(sym)}\b", reexports.get(name, "")):
-                    pass  # published by name from another module
-                elif not any(pat.search(t) for _, t in owners):
-                    where = [str(p.relative_to(ROOT)) for p in srcs if pat.search(blobs[p])]
-                    misattributed.append(
-                        f"  {rel}:{lineno}  {owner}::{sym}  -- defined in {', '.join(where[:3])}"
-                    )
+            name = owner[:-3] if owner.endswith(".rs") else owner
+            parts = name.split("/")
+            name = parts[-1]
+            # `src/hv/trap/mod.rs::foo` names the `trap` module, not a
+            # module called `mod`.
+            if name == "mod" and len(parts) >= 2:
+                name = parts[-2]
+            owners = mods.get(name, [])
+            if not owners:
+                misattributed.append(f"  {rel}:{lineno}  {owner}::{sym}  -- no module named '{name}'")
+            elif re.search(rf"\b{re.escape(sym)}\b", reexports.get(name, "")):
+                pass  # published by name from another module
+            elif not any(pat.search(t) for _, t in owners):
+                where = [str(p.relative_to(ROOT)) for p in srcs if pat.search(blobs[p])]
+                misattributed.append(
+                    f"  {rel}:{lineno}  {owner}::{sym}  -- defined in {', '.join(where[:3])}"
+                )
 
-            for path in path_re.findall(line):
-                # Doc-relative first (guest-tests/README.md says
-                # `scripts/build-tests.sh`, meaning its own sibling).
-                if not (doc.parent / path).exists() and not (ROOT / path).exists():
-                    badpaths.append(f"  {rel}:{lineno}  {path}")
+        if not is_doc:
+            return
+        for path in path_re.findall(line):
+            # Doc-relative first (guest-tests/README.md says
+            # `scripts/build-tests.sh`, meaning its own sibling).
+            if not (origin.parent / path).exists() and not (ROOT / path).exists():
+                badpaths.append(f"  {rel}:{lineno}  {path}")
+
+    for doc in docs:
+        rel = str(doc.relative_to(ROOT))
+        for lineno, line in enumerate(doc.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            check_line(doc, rel, lineno, line, True)
+
+    # Source comments rot the same way, and are the citations a reader
+    # trusts most — they sit next to the code they describe. Line
+    # comments only; the tree has no `/* */` doc prose.
+    for p, text in blobs.items():
+        rel = str(p.relative_to(ROOT))
+        for lineno, line in enumerate(text.splitlines(), 1):
+            stripped = line.lstrip()
+            if stripped.startswith("//"):
+                check_line(p, rel, lineno, stripped, False)
 
     for title, items in (
         ("UNRESOLVED — no definition anywhere in the tree", unresolved),
@@ -205,7 +232,7 @@ def main() -> int:
             print()
 
     total = len(unresolved) + len(misattributed) + len(badpaths)
-    print(f"check-doc-symbols: {len(docs)} docs, {len(srcs)} source files, {total} problem(s)")
+    print(f"check-doc-symbols: {len(docs)} docs + {len(srcs)} source files, {total} problem(s)")
     return 1 if total else 0
 
 

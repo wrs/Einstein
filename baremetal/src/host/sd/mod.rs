@@ -10,7 +10,8 @@
 //!   the vendored `embedded-sdmmc`, which reaches partition 1 (the
 //!   FAT32 boot partition) through this impl.
 //! - Consumers: `flash_persist::sd` (Phase 2 of the real-hardware
-//!   bring-up) and eventually `snapshot::sd` (Phase 3).
+//!   bring-up) and eventually, in Phase 3, a snapshot-to-SD backend
+//!   (`snapshot::sd`, not yet written — doc-symbols: proposed).
 //!
 //! See `docs/REAL_HW_BRINGUP.md` for the phase plan and the rationale
 //! behind picking `embedded-sdmmc` over `fatfs`.

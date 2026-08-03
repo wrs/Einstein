@@ -9,8 +9,8 @@
 //!
 //! The explicit re-export list below IS the version contract: a new
 //! version module that misses an item fails to compile naming it.
-//! `mod imp` is private — consumers name `rom_ver::ITEM`, never a
-//! version module directly.
+//! `mod imp` is private — consumers name items through `rom_ver`, never
+//! a version module directly.
 //!
 //! Layering: `newton::rom_ver` is newton-layer. `hv` reaches the few
 //! values it needs (FPE redirect target, UND diag hints) through the

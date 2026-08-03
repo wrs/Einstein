@@ -645,8 +645,8 @@ unsafe fn patch_probe(
 /// PCs that `patch_probe` has overwritten with an HVC. inline_patch's
 /// liveness analyser consults this table via `read_original` so it
 /// sees the pre-patch instruction stream — necessary because
-/// `apply_rom_patches` runs BEFORE `inline_patch::patch_rom_from_bitmap`,
-/// and without this table the analyser misclassifies probe-HVCs
+/// `apply_rom_patches` runs before any inline stub is installed, and
+/// without this table the analyser misclassifies probe-HVCs
 /// (e.g. picks R12 as scratch_ea at FindSuperceeder body's
 /// 0x001488ac because the original `mov r0, ip` at 0x001488c4 has
 /// been replaced with HVC #0x6E for the FINDSUPER_MID probe).
@@ -805,7 +805,7 @@ unsafe fn write_stub_words(rom_ptr: *mut u32, base: u32, words: &[u32]) {
 
 /// Replace `RealClockSeconds` with a 4-word stub that reads the MMIO
 /// calendar register (populated by `peripherals::vic::calendar_seconds`
-/// via `stage2::tick_page::update`) and returns. Einstein's equivalent
+/// via `stage2::tick_page::publish`) and returns. Einstein's equivalent
 /// is the native-call patch at `TJITGenericROMPatch.cpp:110` that calls
 /// host `time()`; we serve the same value from a different layer, so
 /// the callback is a simple read-register-then-return.

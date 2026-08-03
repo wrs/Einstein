@@ -27,9 +27,11 @@ cd "$root"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$root/target/check-matrix}"
 
 # Structure lints (cheap, always run — they guard structure rather
-# than a combo): import discipline + ROM-address containment.
-for lint in check-layering check-rom-addrs; do
-    if bash "$here/$lint.sh" >/tmp/check-matrix-last.log 2>&1; then
+# than a combo): import discipline, ROM-address containment, and doc
+# code-references. Run each directly rather than through `bash` so the
+# list can mix shell and uv-shebang Python.
+for lint in check-layering.sh check-rom-addrs.sh check-doc-symbols.py; do
+    if "$here/$lint" >/tmp/check-matrix-last.log 2>&1; then
         printf "  \e[32mPASS\e[0m  %-24s\n" "$lint"
     else
         printf "  \e[31mFAIL\e[0m  %-24s\n" "$lint"

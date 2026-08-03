@@ -81,7 +81,8 @@ The save path makes this safe by construction:
    not from a nested EL2 timer IRQ; and
 2. the guest `ELR_EL2` is **not** inside a hypervisor-owned trampoline /
    stub (`pc_in_hypervisor_transient_region`, delegating to
-   `guest_trampolines::is_hypervisor_code_region`); and
+   `layout::is_hyp_code`, whose ranges are registered by
+   `guest_trampolines::register_hyp_code_ranges`); and
 3. no guest software breakpoint is installed (`guest_bp::any_installed`).
 
 So a saved PC is always a guest instruction boundary reached via a timer

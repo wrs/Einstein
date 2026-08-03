@@ -237,9 +237,10 @@ guest tests and the boot.
 
 ### 7.1 Structural — build matrix and lints
 
-`scripts/check-matrix.sh` runs the two structure lints
+`scripts/check-matrix.sh` runs the three structure lints
 (`check-layering.sh` import discipline, `check-rom-addrs.sh` ROM-address
-containment) and then `cargo check`s all 18 supported build
+containment, `check-doc-symbols.py` doc code-references) and then
+`cargo check`s all 18 supported build
 combinations — default, the no-diag variants, both platforms,
 `rom-710031`, the four `pi-bare-metal*` aggregates, trace/probe/log
 combos, and the guest-test cfg — in one shared target dir, printing a

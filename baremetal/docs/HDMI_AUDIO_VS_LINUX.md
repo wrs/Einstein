@@ -294,7 +294,7 @@ it brings us bit-for-bit identical to Linux's TI word.
 
 No `bcm2835_dma_terminate_all` analog. The hypervisor doesn't need
 one in normal operation (MAI runs for the lifetime of the SoC, by
-design), but a `host_dma::abort_channel` helper following the Linux
+design), but a `host_dma::abort_channel` helper <!-- doc-symbols: proposed --> following the Linux
 `NEXTCONBK=0 → ABORT|ACTIVE → poll → ~ACTIVE → RESET` recipe would be
 worth adding the day we have a use case (e.g., reseating the HDMI link
 intentionally during a guest power-cycle).
@@ -361,7 +361,7 @@ layout, same loop closure, same DREQ-paced TI configuration, same
 period-IRQ cadence. Two small mechanical bit-cleanups worth doing:
 
 1. `TI.BURST_LENGTH` field: `2` → `3` (§4.B).
-2. Add a `host_dma::abort_channel` helper for future stop/restart
+2. Add a `host_dma::abort_channel` helper <!-- doc-symbols: proposed --> for future stop/restart
    needs (§4.C).
 
 Two architectural divergences are intentional and must stay:

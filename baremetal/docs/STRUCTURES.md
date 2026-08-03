@@ -1772,11 +1772,17 @@ After the 8-byte header:
   slots), then `(size - 12) / 4` value Refs.
 
 The on-disk package format and the in-memory runtime use the same
-layout, so the `newton-objects` parser handles both. The runtime
-encoding is little-endian on Cortex-A53; package-format is
-big-endian. `src/diag/heap_check.rs::dump_object` reads runtime bytes
-into a stack buffer via `to_be_bytes` so the parser sees the
-original byte order, then parses with `Endian::Big`.
+layout, and both are big-endian: package files are BE on disk, and the
+guest runs BE-8 so it stores BE in RAM too (see
+[`ENDIAN_FIXES.md`](ENDIAN_FIXES.md)). `newton_objects::Heap`
+therefore defaults to `Endian::Big` for both;
+`newton_objects::Heap::with_endian` exists but has no callers.
+
+In-hypervisor dumping does not use that parser at all:
+`heap_check::pretty_print_ref_inline` reads guest words one at a time
+and hand-decodes headers in `heap_check::read_obj_header`, using
+`newton_objects` only for the `Ref` / `RefKind` constants. The offline
+dumper `tools/romdump/src/main.rs` is what drives `Heap` directly.
 
 Citation: `__ct__11TObjectHeapFlT1` (`0x31cafc`) constructs the
 initial free block whose first word is `(size << 8) | flags` with

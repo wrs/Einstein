@@ -406,10 +406,12 @@ The stack:
 4. **Newton sample feed** — Newton's 22.05 kHz mono BE-S16 is
    sample-and-hold upsampled to 44.1 kHz stereo (exact 2× ratio, no
    interpolator), pushed into a ring from `sound::handle` subfn 0x07.
-5. **SPDIF encoding** — `audio::pump` (trap-IRQ and sync-trap tails)
-   builds two IEC 60958 subframes per frame (24-bit sample in bits
-   27..4, parity in bit 31, B-preamble each 192-frame block) into
-   the DMA TX ring.
+5. **SPDIF encoding** — `pi_hdmi::refill_mai_dma_ring`, called from
+   `schedule_output` (subfn 0x07) and from `on_mai_dma_done` on
+   period completion, builds two IEC 60958 subframes per frame
+   (24-bit sample in bits 27..4, parity in bit 31, B-preamble each
+   192-frame block) into the DMA TX ring via
+   `pi_hdmi::encode_iec958_pair`.
 6. **Cyclic DMA feed** — the MAI FIFO is drained by BCM2835 DMA
    channel 4 paced by the HDMI DREQ (17), a looped CB chain that
    never stops (silence subframes between clips keep the receiver
@@ -483,7 +485,7 @@ Gotchas:
   to `LDXR/STXR` on v8.0), so an early `enqueue` aborts with no
   vector installed.
 
-Debug facility: `uart::write_str_polled` + `raw_print!` /
+Debug facility: `console::write_str_polled` + `raw_print!` /
 `raw_println!` bypass the ring via busy-wait — for when the DMA path
 itself is suspect.
 

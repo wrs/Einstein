@@ -1,10 +1,16 @@
 # Endianness-patch classifier artifacts
 
 Per-ROM-hash bitmaps of every ARM instruction in `newton.rom` + `Einstein.rex`
-that needs the inline-patch endianness fix-up (LDRB / STRB / LDRH / STRH /
-LDRSB / LDRSH / SWPB). Eventual intent: drive a pre-launch patching pass
-that pre-computes every stub, eliminating `inline_patch::patch_code_range`'s
-runtime linear scan from the hypervisor entirely.
+that a sub-word endianness fix-up would have applied to (LDRB / STRB /
+LDRH / STRH / LDRSB / LDRSH / SWPB).
+
+**These byte-access bitmaps are vestigial.** They were produced for a
+design that rewrote every such instruction to a trapping marker; that
+mechanism was deleted once the guest was switched to BE-8, which makes
+sub-word access work natively (see [`../docs/ENDIAN_FIXES.md`](../docs/ENDIAN_FIXES.md)).
+Nothing in the hypervisor consumes them. The only bitmap the build
+stages into the image is `reach.bitmap`, the code/data partition —
+see `src/hv/guest_mem.rs`.
 
 ## Layout
 
@@ -44,7 +50,8 @@ classify-rom checks `oracle ⊆ static` as a hard post-condition *when the
 oracle is present*. If an oracle bit is missing from static, it exits
 non-zero and lists the offending PCs — that means either the walker lost
 reachability to a real call site or the JIT hook records something
-`is_byte_access` doesn't (drift from `inline_patch::decode`).
+`is_byte_access` doesn't (drift from the sub-word decoder the deleted
+patcher used).
 
 The oracle costs a 90 s boot and won't exist the first time a ROM hash is
 classified, so its absence is not fatal — but it is not silent either.
@@ -63,15 +70,15 @@ literal-pool words that look like byte accesses):
 - `Emulator/JIT/Generic/TJITGeneric_HalfwordAndSignedDataTransfer_template.h` — everything except LDRD/STRD
 - `Emulator/JIT/Generic/TJITGeneric_SingleDataSwap_template.h` — `#if FLAG_B && (Rd != Rm)`
 
-The carve-outs (LDRD/STRD, SWPB Rt==Rm) mirror the refusal set of
-`baremetal/src/inline_patch.rs::decode`, which is what the patcher will
-actually consult. Identical acceptance sets = invariant preservable.
+The carve-outs (LDRD/STRD, SWPB Rt==Rm) mirrored the refusal set of the
+patcher's own decoder, so the acceptance sets matched and the invariant
+was preservable. That decoder no longer exists.
 
 ## Static source
 
 `baremetal/tools/classify-rom/src/main.rs` — standalone host Rust crate.
-Walks every reachable word, runs a line-for-line port of
-`inline_patch::decode` (as `is_byte_access`), sets bits for accepted words.
+Walks every reachable word, runs `is_byte_access` — a port of the
+deleted patcher's decoder — and sets bits for accepted words.
 
 Reachability is built in three passes, re-running to a fixed point:
 

@@ -1,11 +1,12 @@
-# Endianness mitigations: BE-32 ROM on a little-endian A53
+# Endianness: a BE-32 ROM on an A53 that has no BE-32
 
 The Newton 717006 ROM was assembled for the SA-1100 in ARMv4 **BE-32**
 (word-invariant big-endian) mode. Cortex-A53 AArch32 supports only LE
 and BE-8 — there is no BE-32. This note is the reference for how the
-hypervisor makes a BE-32 guest work on an LE host, grounded in the
-ARMv4 spec, and an audit confirming every B-bit-visible behavior is
-mitigated.
+hypervisor closes that gap: it runs the guest in **BE-8** and picks
+each ROM word's storage layout to suit how that word is used. Grounded
+in the ARMv4 spec, with an audit confirming every B-bit-visible
+behaviour is accounted for.
 
 ## ARMv4 B-bit (CP15 c1, bit 7): exact behavioral differences
 
@@ -103,101 +104,165 @@ a difference between ARMv4 and ARMv7/v8, not between B=1 and B=0
 kind of mismatch a BE-32 ROM expects against modern hardware, so it's
 flagged below.
 
-## Audit: how the hypervisor mitigates every difference
+## How the hypervisor handles this
 
-Strategy:
+The strategy is to run the guest in **BE-8** and choose each ROM word's
+storage layout so that both instruction fetch and BE-8 data access read
+it correctly. No guest instruction is rewritten for endianness, and
+there is no per-access trap.
 
-1. **Guest runs in LE the whole time.** `guest::eret_to_guest` sets
-   `SPSR_EL2 = 0x1D3` (SVC, I=F=A=1, E=0). The guest's `CPSR.E` stays
-   0 and `SCTLR_EL1.EE` is never set — LE data endian throughout.
-   See `src/hv/guest.rs`.
+### 1. The guest runs BE-8
 
-2. **ROM + REx are byte-swapped per word at load.**
-   `guest_mem::load_newton_rom` reverses every 32-bit word so the LE
-   guest sees the same word value a BE-32 guest would. See
-   `src/newton/loader.rs`.
+`src/hv/guest.rs:177-180` sets `SPSR_EL2 = 0x3D3` before the first
+ERET — SVC mode, `I=F=A=1`, and **bit 9 (E) set**. `src/hv/guest.rs:145-150`
+sets `SCTLR_EL1.EE | E0E` (bits 25 and 24) as part of cold-boot EL1
+state. So `CPSR.E=1` and `SCTLR_EL1.EE=1` from the first guest
+instruction.
 
-3. **Every sub-word access in the ROM is rewritten.**
-   `inline_patch::patch_rom_from_bitmap` walks a build-time classifier
-   bitmap and replaces every `LDRB` / `STRB` / `LDRH` / `STRH` /
-   `LDRSB` / `LDRSH` / `SWPB` with `UDF #(0x8000|idx)`. The UND
-   trampoline drops into `handle_sba_udf`, which recomputes the
-   effective address and does `phys[A ^ 3]` (byte) or `phys[A ^ 2]`
-   (halfword), then ERETs past the UDF with CPSR flags intact. See
-   `src/newton/inline_patch.rs`.
+The kernel's own `SCTLR` writes never set `EE`, so they would drop the
+guest back to LE. They can't: `HCR_EL2.TVM` traps them to
+`src/hv/trap/cp15.rs:121-140`, which routes through
+`src/newton/os.rs:815-832` (`massage_sctlr`) and re-ORs `A | EE | E0E`
+into every value the guest writes.
+
+A consequence worth knowing: with `SCTLR_EL1.EE=1` the **hardware
+page-table walker reads big-endian**, so EL2's page-table accessors
+byte-swap (`src/hv/guest_mem.rs:77-104`).
+
+> **Guest-test builds are the exception.** Under the `nh_guest_test`
+> cfg the SPSR is `0x1D3` and `SCTLR_EL1.EE` stays 0 — the guest runs
+> **LE**, and the XOR-lane helpers in `src/hv/be8.rs:82-93` and the
+> `^3`/`^2` arms of `src/hv/guest_endian.rs` compile in. None of that
+> is in the ROM build, so read the `not(nh_guest_test)` arm when you
+> want to know what the hypervisor does with the Newton ROM.
+
+### 2. ROM and REx are stored per word, by classification
+
+`src/newton/loader.rs:326-356` (ROM) and `:371-394` (REx) branch on
+`guest_mem::rom_word_is_code(index)`:
+
+- **Code word** → `u32::from_be_bytes(on_disk)` written natively, i.e.
+  the on-disk bytes **reversed** in host memory. AArch32 instruction
+  fetch on Cortex-A53 is always little-endian regardless of
+  `SCTLR.EE`, so the fetcher must see the LE encoding of the numerical
+  instruction value the BE-32 ROM held.
+- **Data word** → the four on-disk bytes stored **verbatim**. Under
+  `CPSR.E=1` the CPU byte-reverses on every `LDR`/`STR`, so a
+  BE-encoded host word yields the original numerical value.
+
+The discriminator is the classifier's `reach.bitmap`
+(`src/hv/guest_mem.rs:42-58`), one bit per 32-bit word across the
+16 MiB aperture, `include_bytes!`d into the image. It is the sole input
+to this decision, and out-of-range indices are treated as data.
+
+### 3. Sub-word access needs no mitigation on data words
+
+This is the whole trick, and it is why no instruction rewriting is
+needed. Under BE-8 the CPU performs the byte-lane transform on every
+multi-byte transfer, while a single-byte access simply addresses
+`mem[A]`. For a data word holding on-disk bytes `b0 b1 b2 b3`:
+
+- `LDRB` at offset 0 reads `host[W+0] = b0` — the Newton-logical MSB,
+  which is exactly what BE-32 would return. Correct with zero
+  transform.
+- `LDR` on the same word returns `from_be_bytes(b0..b3)` because the
+  CPU reverses on load — the original BE numerical value.
+- `LDRH` at offset 0 returns `(b0<<8)|b1`, the BE halfword.
+
+One storage layout satisfies all three. `src/hv/guest_endian.rs:110-113`
+reflects this: the EL2-side `guest_read_u8_pa` is a plain byte read in
+the ROM build.
 
 Verification against the difference table above:
 
-| Difference class | Mitigation | Status |
+| Difference class | How it is handled | Status |
 |---|---|---|
-| `LDRB` / `LDRBT` / `LDRSB` / `LDRSBT` | `inline_patch::decode` Form 1 (cond 010…B=1) catches `LDRB`/`LDRBT`. Form 2 (op=10, L=1) catches `LDRSB`/`LDRSBT`. XOR 3 applied in Rust. `src/newton/inline_patch.rs`. | ✅ |
-| `STRB` / `STRBT` | Form 1, L=0 path. XOR 3. | ✅ |
-| `LDRH` / `LDRHT` / `LDRSH` / `LDRSHT` | Form 2, op=01 and op=11. XOR 2. | ✅ |
-| `STRH` / `STRHT` | Form 2, op=01, L=0. XOR 2. | ✅ |
-| `SWPB` | Form 3 (`0x0140_0090` pattern). XOR 3 on the atomic byte swap. `src/newton/inline_patch.rs`. | ✅ |
-| Word-aligned `LDR`/`STR`/`LDM`/`STM`/`LDRD`/`STRD`/`SWP` | No action needed — word access is architecturally identical. Byteswap-at-load makes LE `Word[X]` = BE-32 `Word[X]`. | ✅ |
-| Unaligned `LDR` rotate | Not a B-bit difference, but an ARMv4↔ARMv7 mismatch that any BE-32 ROM running on A53 hits. Handled **systematically via SCTLR.A=1 alignment-fault emulation**. The CP15 shim at `src/hv/trap/cp15.rs` ORs `A=1` into every guest SCTLR write, so any unaligned LDR/STR raises an alignment fault at EL1; the DABT-vector trampoline (`src/newton/guest_trampolines.rs::patch_dabt_vector`) fast-paths `DFSR.FS[3:0]==1` to `HVC #ALIGN_TAG`, and `src/newton/unaligned.rs::handle_align_fault` decodes the faulting instruction and performs the aligned word load + ROR in EL2 Rust. Covers every static unaligned LDR imm + every `[Rn, Rm, LSL #1]` site without needing a ROM-patch whitelist. | ✅ |
-| Instruction fetch / exception vector fetch / PTW | Word-aligned — identical. No mitigation needed. | ✅ |
-| Thumb instruction fetch / Thumb halfword fetch | Newton 2.x ROM is pure ARMv4 (SA-1100 target), no Thumb. Unused. | ✅ (by absence) |
-| MMIO sub-word accesses | Two regimes: IPAs `< 0x1000_0000` (includes the tick-page at `0x0F18_1000`) are stage-2-mapped RAM and the inline-patch XOR applies uniformly. Trapped MMIO at `≥ 0x1000_0000` is not XOR'd by inline_patch; peripheral byte accesses are documented as not used in this band (see `src/newton/inline_patch.rs`). `src/hv/mmio.rs` handles the word/halfword/byte SAS from ESR syndrome. | ✅ for the ROM as observed; fragile assumption for new peripheral code |
-| Guest write of B bit (`MCR p15, 0, Rd, c1, c0`) | Trapped, forwarded to `SCTLR_EL1`. Bit 7 of `SCTLR_EL1` is ITD (not B), so the write is architecturally a no-op for endianness on A53 — exactly the behavior we want, since inline_patch + byteswap make the CPU *already* appear BE-32 to the ROM regardless of what the ROM programs. `src/hv/trap/cp15.rs`. | ✅ |
-| Guest write of `CPSR.E` / `SCTLR.EE` | ARMv4 code never issues `SETEND` and doesn't touch bits 25/9 of SCTLR. Not observed in the ROM. | ✅ (by absence) |
+| `LDRB` / `LDRBT` / `LDRSB` / `LDRSBT` | Nothing to do on data words — BE-8 byte addressing already matches BE-32. `src/newton/loader.rs:344-355`. | ✅ |
+| `STRB` / `STRBT` | Same. | ✅ |
+| `LDRH` / `LDRHT` / `LDRSH` / `LDRSHT` | Same — the CPU's BE-8 halfword reversal reproduces the BE-32 halfword. | ✅ |
+| `STRH` / `STRHT` | Same. | ✅ |
+| `SWPB` | `SCTLR_EL1.SW` is never set, so `SWP`/`SWPB` trap as UND and are emulated at EL2: `src/hv/trap/und.rs:794-877`. The byte path uses raw `read_byte_pa`/`write_byte_pa` (no lane transform, BE-8-natural); the word path goes through the swapping `guest_endian` accessors. ROM-aperture targets are absorbed separately in `src/hv/trap/dabt.rs:419-471`. | ✅ |
+| Word-aligned `LDR`/`STR`/`LDM`/`STM`/`LDRD`/`STRD`/`SWP` | Architecturally identical under word-invariant BE; the verbatim data-word layout plus BE-8 reversal reproduces the value. | ✅ |
+| Unaligned `LDR` rotate | Not a B-bit difference but an ARMv4↔ARMv7 mismatch. `SCTLR.A=1` is forced by `massage_sctlr` (`src/newton/os.rs:815-832`) so unaligned LDR/STR fault at EL1; the DABT-vector trampoline (`src/newton/guest_trampolines.rs:418-460`) fast-paths `DFSR.FS[3:0]==1` to `HVC #Align`; `src/newton/unaligned.rs:250-267` does the aligned load + `rotate_right(8·(addr&3))`. A lazy inline stub (`src/newton/unaligned_inline.rs:311-352`) then removes the trap for that PC. The stub does no endianness work — BE-8 makes address+rotate sufficient. | ✅ |
+| Instruction fetch / exception vector fetch | Word-aligned, and code words are stored LE-reversed precisely for this. | ✅ |
+| MMU page-table walks | `SCTLR_EL1.EE=1` makes the walker read BE; EL2 accessors swap to match (`src/hv/guest_mem.rs:77-104`). | ✅ |
+| Thumb instruction fetch | Newton 2.x ROM is pure ARMv4 (SA-1100 target), no Thumb. | ✅ (by absence) |
+| MMIO sub-word accesses | Handled with BE-8 lane math, not address XOR. `src/hv/mmio.rs:111-152` reads the aligned word side-effect-free and extracts the lane via `be8::extract_sub_word`; writes splice via `be8::splice_byte`/`splice_halfword` (`:184-249`). Lane 0 is bits[31:24] (`src/hv/be8.rs:27-76`), the BE-8 convention, with const-eval round-trip assertions at `be8.rs:110-135`. Serial windows bypass at natural offset, mirroring Einstein's `TMemory::ReadBP`. | ✅ |
+| Guest write of B bit (`MCR p15, 0, Rd, c1, c0`) | Trapped and forwarded to `SCTLR_EL1`, where bit 7 is ITD, not B — architecturally a no-op for endianness on A53. The guest is already BE-8 regardless of what the ROM programs. `src/hv/trap/cp15.rs`. | ✅ |
+| Guest write of `CPSR.E` / `SCTLR.EE` | ARMv4 code has no `SETEND` and doesn't touch SCTLR bits 25/24. `massage_sctlr` re-ORs `EE|E0E` anyway, so a stray write can't take effect. | ✅ |
 
 ## Gaps and caveats worth knowing
 
-1. **`inline_patch` skips FIQ mode.** `src/newton/inline_patch.rs`
-   documents it: the UND trampoline and the AArch64-view-of-AArch32-
-   R8..R12 path don't cover FIQ. The Newton FIQ handler doesn't do
-   sub-word access in observed runs, but it's an open edge.
+1. **Byte reads of *code* words are wrong, deliberately.** A code word
+   is stored byte-reversed, so a guest `LDRB` against one returns
+   `on_disk[A ^ 3]`. Nothing compensates at runtime. The design
+   assumes the ROM never reads its own instruction stream as sub-word
+   data.
 
-2. **Unaligned-LDR emulator covers R0-R14 Rn/Rt/Rm but halts on
-   R15 (PC) as an operand.** Rare in rotate-LDR idioms and
-   unreachable in the 717006 ROM we've run; extend
-   `src/newton/unaligned.rs::handle_align_fault` if we ever see one.
-   Banked-register access is correct across all AArch32 modes per
-   ARM ARM Table D1-79 (see `src/newton/unaligned.rs::ctx_slot_for_reg`).
+   Where the ROM reads code as a **word**, it is patched per site:
+   `src/newton/rom_patches.rs:507-570` rewrites each entry in
+   `rom_ver::INSN_AS_DATA_LDRS` (`src/newton/rom_ver/r717006/mod.rs:144-172`
+   — the DataAbort and UndefinedInstruction handlers reading their own
+   faulting instruction, two SWIBoot sites, plus an FPE pair) into
+   `B stub`, where the stub is `<orig LDR>; REV Rd,Rd; B resume`. The
+   hypervisor's own AArch32 trampolines use the same idiom
+   (`src/newton/guest_trampolines.rs:488-500`). There is no equivalent
+   for byte-granular reads of code words; if one is ever needed it
+   does not exist yet.
 
-3. **Unaligned `STR` is emulated as "store aligned word".**
-   ARMv4 `STR` to unaligned address is UNPREDICTABLE; SA-1100
-   stores to the aligned word with no rotation, which matches what
-   the emulator does. The ROM shouldn't actually hit this in
-   practice — rotate-STR is not an idiom.
+2. **Unaligned-LDR emulator halts on R15 (PC) as an operand.** Rare in
+   rotate-LDR idioms and unreachable in the 717006 ROM we've run;
+   extend `src/newton/unaligned.rs` if one appears. Banked-register
+   access is correct across all AArch32 modes per ARM ARM Table D1-79
+   (`src/arch/banked.rs`).
 
-4. **Unaligned `LDM` / `STM` / `LDRD` / `STRD` are not emulated.**
-   The alignment-fault handler only recognises the LDR/STR A1
-   immediate-offset and register-offset forms. ARMv4 requires
-   LDM/STM to be word-aligned and LDRD/STRD to be 8-byte-aligned,
-   so SCTLR.A=1 faults on unaligned here are latent bugs in guest
-   code; we halt loudly in the align handler rather than emulate.
+3. **Unaligned `STR` is emulated as "store aligned word".** ARMv4
+   `STR` to an unaligned address is UNPREDICTABLE; SA-1100 stores to
+   the aligned word with no rotation, which is what
+   `src/newton/unaligned.rs:268-281` does.
 
-5. **`Rt==Rm` `SWPB` is refused at patch time**
-   (`src/newton/inline_patch.rs`) — architecturally `UNPREDICTABLE`,
-   so refusing is correct, but worth knowing.
+4. **Unaligned `LDM` / `STM` / `LDRD` / `STRD` are not emulated.** The
+   alignment-fault handler recognises only the LDR/STR A1
+   immediate- and register-offset forms. ARMv4 requires those to be
+   aligned, so a fault there is a latent guest-code bug; we halt
+   loudly rather than emulate.
 
-6. **Trapped MMIO above `XOR_LIMIT` (0x1000_0000) is not XOR'd.** The
-   design assumes no sub-word MMIO accesses land there, which is
-   currently true for the Newton peripheral map — adding a new
-   byte-level MMIO register above that boundary would silently
-   mishandle endianness. Documented at `src/newton/inline_patch.rs`.
+5. **`SWP`/`SWPB` with an operand ≥ r13 halts loudly**
+   (`src/hv/trap/und.rs:803-809`).
+
+6. **`SBA_*` does not mean what it says.** The stub pool at
+   `src/newton/inline_patch.rs:44-49` is named `SBA_STUB_POOL_*` for
+   "shadow byte access", but it has nothing to do with byte access: it
+   holds `unaligned_inline`'s rotate-LDR stubs and the DABT
+   trampoline. Read the name as "the stub pool".
 
 ## Bottom line
 
-Every architectural divergence between B=1 and B=0 on ARMv4 — i.e.
-the seven sub-word memory-access forms — is mitigated by the
-combination of load-time per-word byteswap and inline_patch's
-UDF-trap emulation with `A^3` / `A^2`. Word-sized accesses need no
-mitigation because they are bit-identical under word-invariant BE.
+Every architectural divergence between B=1 and B=0 on ARMv4 — the
+seven sub-word memory-access forms — is handled by running the guest
+BE-8 and storing each ROM word in the layout its use requires: code
+words byte-reversed for the always-LE instruction fetcher, data words
+verbatim so BE-8 access reproduces BE-32 semantics. Word-sized
+accesses need nothing because they are bit-identical under
+word-invariant BE. No guest instruction is rewritten for endianness,
+and there is no per-access trap.
 
-The non-endian ARMv4↔ARMv7 unaligned-LDR rotate difference is also
-handled, systematically: `SCTLR.A=1` forces every unaligned LDR/STR
-to alignment-fault, the DABT trampoline fast-paths these to
-`HVC #ALIGN_TAG`, and `src/newton/unaligned.rs` emulates with SA-1100
-semantics in EL2 Rust. No per-site ROM-patch whitelist needed.
+The one asymmetry is that byte access to a *code* word is not
+correct; word-sized reads of code are fixed by a small per-site patch
+list, and byte-sized ones are assumed not to occur.
+
+The non-endian ARMv4↔ARMv7 unaligned-LDR rotate difference is handled
+separately and systematically: `SCTLR.A=1` forces the fault, the DABT
+trampoline fast-paths it to `HVC #Align`, EL2 emulates SA-1100
+semantics, and a lazy inline stub retires the trap per PC.
 
 ## Sources
 
 - ARM Architecture Reference Manual, ARM DDI 0100I (Rev I, 2005) —
   covers ARMv4 through ARMv6, including the full BE-32 legacy spec.
-- `src/hv/guest.rs`, `src/hv/guest_mem.rs` + `src/newton/loader.rs`,
-  `src/newton/inline_patch.rs`, `src/newton/rom_patches.rs`,
-  `src/hv/trap/`, `src/hv/mmio.rs` in this tree.
+- `src/hv/guest.rs` (SPSR/SCTLR at ERET), `src/newton/loader.rs` +
+  `src/hv/guest_mem.rs` (per-word load layout), `src/newton/os.rs`
+  (`massage_sctlr`), `src/hv/be8.rs` + `src/hv/mmio.rs` (lane math),
+  `src/hv/trap/und.rs` (SWP/SWPB), `src/newton/unaligned.rs` +
+  `src/newton/unaligned_inline.rs` (rotate-LDR),
+  `src/newton/rom_patches.rs` (code-read-as-data sites).

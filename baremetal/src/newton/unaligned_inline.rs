@@ -11,7 +11,7 @@
 //! first time we see it, so subsequent executions of the same word LDR
 //! run natively in AArch32 without trapping. The mechanism is the same
 //! as `inline_patch` (B-to-stub, body, B-back-to-`orig_pc + 4`, in the
-//! shared SBA stub pool); only the stub body differs.
+//! shared stub pool); only the stub body differs.
 //!
 //! Stub body for `LDR{cond} Rt, [Rn, ±#imm]` or `[Rn, ±Rm, shift]`:
 //!
@@ -56,7 +56,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::newton::inline_patch::{
     alloc_stub_slot, encode, install_inline_at, live_regs_at, read_insn_original_first,
-    SBA_STUB_WORDS,
+    STUB_WORDS,
 };
 use crate::newton::unaligned::{decode, Decoded, OffsetForm};
 
@@ -152,8 +152,8 @@ const PERIODIC_STATS_EVERY: u32 = 100;
 pub fn try_install_at(faulting_pc: u32) -> bool {
     // The faulting PC must be in the Newton ROM/REX region — i.e.
     // strictly below the tracer trampoline pool (0x00900000) and the
-    // SBA stub pool (0x00E00000). Patching code in those pools would
-    // tangle our stub mechanism with the tracer's, or modify the SBA
+    // stub pool (0x00E00000). Patching code in those pools would
+    // tangle our stub mechanism with the tracer's, or modify the stub
     // pool itself. Newton 717006 + REX fits in the first 8-9 MiB of
     // the ROM aperture.
     const ALIGN_INLINE_PC_LIMIT: u32 = crate::newton::rom_ver::ROM_TAIL.tracer_pool_base;
@@ -306,7 +306,7 @@ fn pick_scratches(d: &Decoded, orig_pc: u32) -> Option<(u32, u32)> {
     None
 }
 
-/// Build the stub words. Layout fits in `SBA_STUB_WORDS == 16` slots;
+/// Build the stub words. Layout fits in `STUB_WORDS == 16` slots;
 /// trailing slots are NOPs.
 fn build_stub_words(
     d: &Decoded,
@@ -314,8 +314,8 @@ fn build_stub_words(
     stub_ipa: u32,
     sea: u32,
     ssh: u32,
-) -> Result<[u32; SBA_STUB_WORDS], &'static str> {
-    let mut out = [encode::nop(); SBA_STUB_WORDS];
+) -> Result<[u32; STUB_WORDS], &'static str> {
+    let mut out = [encode::nop(); STUB_WORDS];
 
     // Slots 0/1: compute EA into `sea`.
     let (slot0, slot1) = match d.offset {

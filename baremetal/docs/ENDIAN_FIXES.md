@@ -230,12 +230,6 @@ Verification against the difference table above:
 5. **`SWP`/`SWPB` with an operand ≥ r13 halts loudly**
    (`src/hv/trap/und.rs:803-809`).
 
-6. **`SBA_*` does not mean what it says.** The stub pool at
-   `src/newton/inline_patch.rs:44-49` is named `SBA_STUB_POOL_*` for
-   "shadow byte access", but it has nothing to do with byte access: it
-   holds `unaligned_inline`'s rotate-LDR stubs and the DABT
-   trampoline. Read the name as "the stub pool".
-
 ## Bottom line
 
 Every architectural divergence between B=1 and B=0 on ARMv4 — the

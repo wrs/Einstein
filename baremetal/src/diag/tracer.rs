@@ -137,8 +137,8 @@ pub fn in_reserved_range(addr: u32) -> bool {
     if addr < 0x0000_0020 {
         return true;
     }
-    if (crate::newton::inline_patch::SBA_STUB_POOL_IPA
-        ..crate::newton::inline_patch::SBA_STUB_POOL_END)
+    if (crate::newton::inline_patch::STUB_POOL_IPA
+        ..crate::newton::inline_patch::STUB_POOL_END)
         .contains(&addr)
     {
         return true;

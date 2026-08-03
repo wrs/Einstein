@@ -461,9 +461,9 @@ fn maybe_autosave_via_semihost(ctx: &TrapContext) {
     //      slot was written to assume.
     //
     //    - Hypervisor ROM tail 0x00FFFF00..0x01000000: UND trampoline,
-    //      SBA post-emulation trampoline, DABT-bounce trampoline, UND
-    //      return stub. These depend on TPIDRURW scratch and RAM save
-    //      slots staged immediately before ERET.
+    //      FPA-bypass stub, DABT trampoline and DABT fast trampoline,
+    //      UND return stub. These depend on TPIDRURW scratch and RAM
+    //      save slots staged immediately before ERET.
     //
     // Banked SP/LR for non-USR modes are NOT a reason to skip: the
     // trap context already captures all 31 X registers, which alias

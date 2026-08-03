@@ -1493,9 +1493,9 @@ fn enumerate_pc_rel_jump_table(
     // starts at 0x3ad568. Without a CMP bound and without a function-
     // boundary clamp, the unbounded 64-slot seeding walked into the
     // SWIBoot handler-pointer table at 0x3ad568..0x3ad5f4, classifying
-    // those data words as code and producing UDF-marker corruption at
-    // 0x003ad580/0x003ad584/0x003ad58c (slots 0x486/0x487/0x488 in the
-    // SBA site table). The cond-code emulator at 0x3add80 still works
+    // those data words as code — which stores them byte-reversed at
+    // load, corrupting the pointers at 0x003ad580 / 0x003ad584 /
+    // 0x003ad58c. The cond-code emulator at 0x3add80 still works
     // because its containing function (SWIBoot, 0x3ad698..0x3ae158) is
     // large enough to fully contain its 64-slot table.
     let fn_end = find_fn_range(fn_ranges, pc_of_dispatch).map(|(_, e)| e);

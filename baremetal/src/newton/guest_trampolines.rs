@@ -128,8 +128,8 @@ const UND_TRAMP_OFFSET: usize = rom_ver::ROM_TAIL.und_tramp as usize;
 /// `b 0x1a031f4` which thunked through 0x38d874 to FP_UndefHandlers_Start
 /// at 0x38d8dc). Non-FPA UNDs fall through to the existing trampoline
 /// at `UND_TRAMP_OFFSET`, which captures source-mode banked state and
-/// HVCs into EL2 for the rest of our handlers (tracer UDFs, shadow-byte-
-/// access, software breakpoints, deprecated CP15, etc.).
+/// HVCs into EL2 for the rest of our handlers (tracer UDFs, software
+/// breakpoints, SWP/SWPB, deprecated CP15, etc.).
 ///
 /// Stub layout (16 words = 64 bytes):
 ///   +0x00: ee0d_cf50  mcr p15,0,r12,c13,c0,2  ; save R12 → TPIDRURW
@@ -189,7 +189,7 @@ pub const FPA_BYPASS_STUB_OFFSET: usize = rom_ver::ROM_TAIL.fpa_bypass_stub as u
 pub const DABT_TRAMP_OFFSET: usize = rom_ver::ROM_TAIL.dabt_tramp as usize;
 
 /// iter-59: AArch32-side fast-forward DABT trampoline. Installed in
-/// the head of the SBA stub pool (which has plenty of free space).
+/// the head of the stub pool (which has plenty of free space).
 ///
 /// Routes by DFSC straight from AArch32 ABT mode without an EL2 round
 /// trip in the common kernel-handled cases:

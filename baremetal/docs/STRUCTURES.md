@@ -1559,7 +1559,7 @@ Fault(stackmgr) procst[+0x40..+0x60]: 20000110 0c647003 00000047 \
 `pc=0x20000110` here is the *saved CPSR*, not a PC — `0x20000110`
 decodes to N=0 Z=0 C=1 V=0, mode=0x10 (USR). To recover the actual
 faulting USR PC from EL2, use `lr_abt - 8` (or, when the fault came
-through the SBA stub pool, decode slot 14 of the containing stub for
+through the stub pool, decode slot 14 of the containing stub for
 the original ROM PC; see `src/hv/trap/dabt.rs::handle_data_abort` forwarding
 path).
 

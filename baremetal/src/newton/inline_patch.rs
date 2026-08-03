@@ -41,12 +41,12 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 // Sits between the tracer pool (0x0090_0000..0x00E0_0000) and the
 // ROM-tail trampoline cluster (0x00FF_FF00..0x00FF_FFF0); tracer's
 // `in_reserved_range` excludes this window too.
-pub const SBA_STUB_POOL_IPA: u32 = crate::newton::rom_ver::ROM_TAIL.sba_stub_pool_base;
-pub const SBA_STUB_POOL_END: u32 = crate::newton::rom_ver::ROM_TAIL.sba_stub_pool_end;
-pub const SBA_STUB_WORDS: usize = 16;
-pub const SBA_STUB_BYTES: u32 = (SBA_STUB_WORDS as u32) * 4;
-pub const SBA_STUB_MAX: usize =
-    ((SBA_STUB_POOL_END - SBA_STUB_POOL_IPA) / SBA_STUB_BYTES) as usize;
+pub const STUB_POOL_IPA: u32 = crate::newton::rom_ver::ROM_TAIL.stub_pool_base;
+pub const STUB_POOL_END: u32 = crate::newton::rom_ver::ROM_TAIL.stub_pool_end;
+pub const STUB_WORDS: usize = 16;
+pub const STUB_BYTES: u32 = (STUB_WORDS as u32) * 4;
+pub const STUB_MAX: usize =
+    ((STUB_POOL_END - STUB_POOL_IPA) / STUB_BYTES) as usize;
 
 static NEXT_STUB: AtomicUsize = AtomicUsize::new(0);
 
@@ -790,16 +790,16 @@ pub fn live_regs_at(start_pc: u32, max_instrs: u32) -> u16 {
 /// `(slot_idx, stub_ipa)`. None if the pool is exhausted.
 pub fn alloc_stub_slot() -> Option<(usize, u32)> {
     let slot_ix = NEXT_STUB.fetch_add(1, Ordering::SeqCst);
-    if slot_ix >= SBA_STUB_MAX {
+    if slot_ix >= STUB_MAX {
         return None;
     }
-    let stub_ipa = SBA_STUB_POOL_IPA + (slot_ix as u32) * SBA_STUB_BYTES;
+    let stub_ipa = STUB_POOL_IPA + (slot_ix as u32) * STUB_BYTES;
     Some((slot_ix, stub_ipa))
 }
 
 /// Install an inline stub at a previously-allocated slot.
 ///
-/// `words.len()` must be ≤ `SBA_STUB_WORDS`; trailing slots are filled
+/// `words.len()` must be ≤ `STUB_WORDS`; trailing slots are filled
 /// with NOPs. Writes the stub words first, then patches `orig_pc` with
 /// `B stub_ipa`, then icache-flushes both ranges.
 ///
@@ -809,8 +809,8 @@ pub fn alloc_stub_slot() -> Option<(usize, u32)> {
 pub fn install_inline_at(
     orig_pc: u32, stub_ipa: u32, words: &[u32],
 ) -> Result<(), &'static str> {
-    if words.len() > SBA_STUB_WORDS {
-        return Err("install_inline_at: words exceeds SBA_STUB_WORDS");
+    if words.len() > STUB_WORDS {
+        return Err("install_inline_at: words exceeds STUB_WORDS");
     }
     let br = match encode::b(orig_pc, stub_ipa) {
         Some(w) => w,
@@ -819,7 +819,7 @@ pub fn install_inline_at(
 
     // Write the full slot — supplied words first, NOPs for the rest.
     let nop = encode::nop();
-    for i in 0..SBA_STUB_WORDS {
+    for i in 0..STUB_WORDS {
         let w = words.get(i).copied().unwrap_or(nop);
         let ipa = stub_ipa.wrapping_add((i as u32) * 4);
         code_write_word(ipa, w)?;
@@ -834,7 +834,7 @@ pub fn install_inline_at(
         Some(h) => h,
         None => return Err("install_inline_at: stub_ipa not in ROM/RAM backing"),
     };
-    icache_sync_range(stub_host, SBA_STUB_WORDS * 4);
+    icache_sync_range(stub_host, STUB_WORDS * 4);
     let orig_host = match orig_pc_to_host(orig_pc) {
         Some(h) => h,
         None => return Err("install_inline_at: orig_pc not in ROM/RAM backing"),

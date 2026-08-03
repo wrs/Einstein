@@ -54,7 +54,7 @@ pub struct RexInfo {
 /// Consumers: `rom_patches` (patch-stub arena), `guest_trampolines`
 /// (trampoline installers + `register_hyp_code_ranges`, which feeds
 /// both `guest_endian`'s byte-order predicate and the snapshot
-/// autosave gate), `inline_patch` (SBA stub pool), `diag::tracer`
+/// autosave gate), `inline_patch` (stub pool), `diag::tracer`
 /// (trampoline pool), and `unaligned_inline` (its inline-patch PC
 /// limit is `tracer_pool_base`).
 #[derive(Copy, Clone)]
@@ -65,9 +65,9 @@ pub struct RomTailLayout {
     /// Tracer trampoline pool (5-word slots, one per traced function).
     pub tracer_pool_base: u32,
     pub tracer_pool_end: u32,
-    /// inline-patch SBA stub pool (16-word slots).
-    pub sba_stub_pool_base: u32,
-    pub sba_stub_pool_end: u32,
+    /// inline-patch stub pool (16-word slots).
+    pub stub_pool_base: u32,
+    pub stub_pool_end: u32,
     /// Patch-stub arena (`rom_patches::alloc_patch_stub`).
     pub patch_stub_arena_base: u32,
     pub patch_stub_arena_end: u32,

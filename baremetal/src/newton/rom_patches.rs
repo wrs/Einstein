@@ -657,7 +657,7 @@ unsafe fn patch_probe(
 /// the HVC probe sites. When the table fills, `record_original` halts
 /// loudly — silently dropping entries makes `inline_patch`'s liveness
 /// analyser see the patched HVC instead of the original, leading to
-/// subtle scratch-register misanalysis at nearby SBA / unaligned-inline
+/// subtle scratch-register misanalysis at nearby inline
 /// stub sites. Single-threaded boot use, so a plain `static mut` with
 /// index counter is safe.
 const ORIG_CAP: usize = 256;
@@ -677,7 +677,7 @@ fn record_original(pc: u32, orig: u32) {
             // Silently dropping entries causes inline_patch's liveness
             // analyser to see the patched HVC instead of the original
             // instruction at this PC, leading to mis-classified scratch
-            // registers at nearby SBA / unaligned-inline stub sites and
+            // registers at nearby inline stub sites and
             // hard-to-diagnose downstream corruption. Bump ORIG_CAP and
             // rebuild rather than letting boot continue with a partial
             // table.

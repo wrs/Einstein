@@ -138,6 +138,6 @@ instruction. The guest tests run isolated test ELFs that don't include
 the Newton ROM, so probe-only changes can't regress them. Run the
 tests when changes touch `src/newton/inline_patch.rs`,
 `src/newton/unaligned.rs`, `src/peripherals/*`, `src/arch/banked.rs`,
-`src/hv/stage2.rs`, `src/hv/guest.rs`, the generic SBA/UND/DABT/IRQ
+`src/hv/stage2.rs`, `src/hv/guest.rs`, the generic UND/DABT/IRQ
 paths in `src/hv/trap/` (`mod.rs`, `dabt.rs`, `und.rs`, `cp15.rs`), or
 `guest-tests/` itself.

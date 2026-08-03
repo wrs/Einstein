@@ -3419,7 +3419,11 @@ fn run(args: Args) -> Result<(), String> {
     write_bitmap(&out_dir.join("byte-access-static.bitmap"), &ba_static)?;
     write_bitmap(&out_dir.join("reach.bitmap"), &reach)?;
 
-    // Invariant check vs the oracle bitmap, if it exists.
+    // Invariant check vs the oracle bitmap. The oracle is optional — it
+    // costs a 90 s NewtonProbe boot and won't exist the first time a ROM
+    // hash is classified — so its absence isn't fatal, but it is reported
+    // on stderr and recorded in summary.txt. A summary that merely omits
+    // the check reads the same as one where the check passed.
     let oracle_path = out_dir.join("byte-access.bitmap");
     let invariant = match fs::read(&oracle_path) {
         Ok(bytes) => {
@@ -3681,7 +3685,7 @@ fn run(args: Args) -> Result<(), String> {
     )
     .ok();
     if let Some(rep) = &invariant {
-        writeln!(f, "  invariant check (oracle ⊆ static):").ok();
+        writeln!(f, "  invariant check (oracle ⊆ static): RAN").ok();
         writeln!(f, "    oracle popcount = {}", rep.oracle_popcount).ok();
         writeln!(f, "    static popcount = {}", rep.static_popcount).ok();
         writeln!(
@@ -3702,6 +3706,15 @@ fn run(args: Args) -> Result<(), String> {
                 writeln!(f, "      0x{:08x}  insn=0x{:08x}", pc, w).ok();
             }
         }
+    } else {
+        writeln!(f, "  invariant check (oracle ⊆ static): NOT RUN").ok();
+        writeln!(f, "    no oracle bitmap at {}", oracle_path.display()).ok();
+        writeln!(
+            f,
+            "    byte-access-static.bitmap below is UNVALIDATED — generate the \
+             oracle with NewtonProbe (see classify/README.md) and re-run."
+        )
+        .ok();
     }
 
     println!("classify-rom: wrote {}", out_dir.display());
@@ -3731,10 +3744,15 @@ fn run(args: Args) -> Result<(), String> {
             Err("invariant violated".into())
         }
         None => {
-            println!(
-                "  (no oracle bitmap at {} — invariant not checked)",
+            eprintln!(
+                "classify-rom: WARNING — no oracle bitmap at {}",
                 oracle_path.display()
             );
+            eprintln!(
+                "  the oracle ⊆ static invariant was NOT checked; \
+                 byte-access-static.bitmap is unvalidated."
+            );
+            eprintln!("  Generate the oracle with NewtonProbe — see classify/README.md.");
             Ok(())
         }
     }

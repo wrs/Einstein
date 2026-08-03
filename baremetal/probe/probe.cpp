@@ -404,9 +404,25 @@ bool write_file(const char* path, const void* data, size_t len) {
 	return got == len;
 }
 
-// Dump the classifier bitmaps to baremetal/classify/<hash>/. Returns 0 on
+// Resolve the classify output root. An explicit --out wins. Otherwise the
+// root is found by probing the two cwds the docs use — the Einstein root
+// and baremetal/ — and requiring the directory to already exist. classify/
+// is checked in (README + .gitignore), so "exists" is a reliable marker;
+// creating it on demand instead is what produced baremetal/baremetal/
+// classify/ when the probe was run from the wrong directory.
+const char* resolve_classify_root(const char* outOverride) {
+	if (outOverride) return outOverride;
+	static const char* const kCandidates[] = { "baremetal/classify", "classify" };
+	for (const char* c : kCandidates) {
+		struct stat st;
+		if (::stat(c, &st) == 0 && S_ISDIR(st.st_mode)) return c;
+	}
+	return nullptr;
+}
+
+// Dump the classifier bitmaps to <classify-root>/<hash>/. Returns 0 on
 // success, nonzero on failure (caller logs but continues shutdown).
-int dump_classifier_bitmaps(const char* romPath, const char* rexPath) {
+int dump_classifier_bitmaps(const char* romPath, const char* rexPath, const char* outOverride) {
 	std::vector<uint8_t> romBytes;
 	if (!read_file_bytes(romPath, romBytes)) {
 		std::fprintf(stderr, "classify: failed to read %s for hashing\n", romPath);
@@ -422,8 +438,16 @@ int dump_classifier_bitmaps(const char* romPath, const char* rexPath) {
 		hash = fnv1a_32(rexBytes.data(), rexBytes.size(), hash);
 	}
 
+	const char* root = resolve_classify_root(outOverride);
+	if (!root) {
+		std::fprintf(stderr,
+			"\nclassify: no classify/ directory found from cwd — run NewtonProbe from the\n"
+			"          Einstein root or baremetal/, or pass --out <dir>. Bitmap NOT written.\n");
+		return 1;
+	}
+
 	char dir[256];
-	std::snprintf(dir, sizeof(dir), "baremetal/classify/%08x", hash);
+	std::snprintf(dir, sizeof(dir), "%s/%08x", root, hash);
 	if (!mkdir_p(dir)) {
 		std::fprintf(stderr, "classify: mkdir_p(%s) failed: %s\n", dir, std::strerror(errno));
 		return 1;
@@ -967,21 +991,39 @@ void locale_dump(TMemory* mem, const char* tag) {
 
 void usage(const char* argv0) {
 	std::fprintf(stderr,
-		"usage: %s <rom.bin> [rex.bin|-] [wall-seconds]\n"
+		"usage: %s <rom.bin> [rex.bin|-] [wall-seconds] [--out <dir>]\n"
 		"  rom.bin        path to the Newton ROM dump (8 MiB, big-endian as captured)\n"
 		"  rex.bin        path to Einstein.rex, or - for the builtin (default: -)\n"
-		"  wall-seconds   host wall-clock seconds to let the ROM run (default: %u)\n",
+		"  wall-seconds   host wall-clock seconds to let the ROM run (default: %u)\n"
+		"  --out <dir>    classify output root; <dir>/<rom+rex hash>/byte-access.bitmap\n"
+		"                 is written there (default: the existing baremetal/classify\n"
+		"                 or classify directory, relative to cwd)\n",
 		argv0, kDefaultBootSeconds);
 }
 
 }
 
 int main(int argc, char** argv) {
-	if (argc < 2 || argc > 4) { usage(argv[0]); return 2; }
+	// Pull --out <dir> out of argv, then treat what's left as the three
+	// historical positionals.
+	const char* outOverride = nullptr;
+	const char* pos[3] = { nullptr, nullptr, nullptr };
+	int nPos = 0;
+	for (int i = 1; i < argc; ++i) {
+		if (std::strcmp(argv[i], "--out") == 0) {
+			if (++i >= argc) { usage(argv[0]); return 2; }
+			outOverride = argv[i];
+		} else if (nPos < 3) {
+			pos[nPos++] = argv[i];
+		} else {
+			usage(argv[0]); return 2;
+		}
+	}
+	if (nPos < 1) { usage(argv[0]); return 2; }
 
-	const char* romPath = argv[1];
-	const char* rexPath = (argc >= 3 && std::strcmp(argv[2], "-") != 0) ? argv[2] : nullptr;
-	unsigned wallSeconds = (argc >= 4) ? static_cast<unsigned>(std::strtoul(argv[3], nullptr, 0)) : kDefaultBootSeconds;
+	const char* romPath = pos[0];
+	const char* rexPath = (nPos >= 2 && std::strcmp(pos[1], "-") != 0) ? pos[1] : nullptr;
+	unsigned wallSeconds = (nPos >= 3) ? static_cast<unsigned>(std::strtoul(pos[2], nullptr, 0)) : kDefaultBootSeconds;
 
 	// We intentionally allocate the flash file under /tmp so repeated runs
 	// don't accumulate state anywhere persistent; the probe is a read-only
@@ -1096,7 +1138,7 @@ int main(int argc, char** argv) {
 
 	mmu->FDump(stdout);
 	dump_instrumentation(stdout);
-	dump_classifier_bitmaps(romPath, rexPath);
+	dump_classifier_bitmaps(romPath, rexPath, outOverride);
 	std::fflush(stdout);
 
 	// Skip destructors: the interrupt-manager thread + network thread need

@@ -40,11 +40,27 @@ while read -r name; do
     else
         runner=("$here/run-test.sh" --platform "$platform" "$name")
     fi
-    if "${runner[@]}" </dev/null >/dev/null 2>&1; then
-        printf "  \e[32mPASS\e[0m  %s\n" "$name"
+    # Keep each runner's output. A bare PASS/FAIL column with the output
+    # discarded makes a failure undiagnosable after the fact, and the
+    # per-test log run-test.sh writes is overwritten by the next run of
+    # the same test.
+    out="/tmp/guest-run-${platform}-${name}.log"
+    if "${runner[@]}" </dev/null > "$out" 2>&1; then
+        printf "  \e[32m%-10s\e[0m %s\n" "PASS" "$name"
         pass=$((pass+1))
     else
-        printf "  \e[31mFAIL\e[0m  %s\n" "$name"
+        # run-test.sh exits 1 on an explicit HVC_FAIL and 2 when the run
+        # produced no verdict at all (hang, halt, host-side error). Those
+        # are different problems, so don't collapse them into one label.
+        rc=$?
+        case "$rc" in
+            1) label="FAIL" ;;
+            2) label="NO-VERDICT" ;;
+            *) label="ERROR($rc)" ;;
+        esac
+        printf "  \e[31m%-10s\e[0m %s\n" "$label" "$name"
+        tail -25 "$out" | sed 's/^/        | /'
+        printf "        (full output: %s)\n" "$out"
         fail=$((fail+1))
     fi
 done < "$root/tests/MANIFEST"

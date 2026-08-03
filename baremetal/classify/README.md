@@ -33,11 +33,24 @@ baremetal/tools/classify-rom/target/aarch64-apple-darwin/release/classify-rom \
   --symbols _Data_/demangled_symbols.txt --out baremetal/classify
 ```
 
-classify-rom checks `oracle ⊆ static` as a hard post-condition. If an oracle
-bit is missing from static, it exits non-zero and lists the offending PCs —
-that means either the walker lost reachability to a real call site or the
-JIT hook records something `is_byte_access` doesn't (drift from
-`inline_patch::decode`).
+NewtonProbe resolves its output root by looking for an existing `classify`
+directory — `baremetal/classify` first, then `classify` — so it can be run
+from either the Einstein root or `baremetal/`. From anywhere else it refuses
+to write and says so; pass `--out <dir>` to be explicit. It never creates the
+root itself, because doing that is what silently produced a stray
+`baremetal/baremetal/classify/` when it was run from the wrong directory.
+
+classify-rom checks `oracle ⊆ static` as a hard post-condition *when the
+oracle is present*. If an oracle bit is missing from static, it exits
+non-zero and lists the offending PCs — that means either the walker lost
+reachability to a real call site or the JIT hook records something
+`is_byte_access` doesn't (drift from `inline_patch::decode`).
+
+The oracle costs a 90 s boot and won't exist the first time a ROM hash is
+classified, so its absence is not fatal — but it is not silent either.
+classify-rom warns on stderr and writes `invariant check (oracle ⊆ static):
+NOT RUN` into `summary.txt`. Check that line before trusting a bitmap: a
+summary that merely omits the check reads the same as one where it passed.
 
 ## Oracle source
 
@@ -87,3 +100,9 @@ Newton-specific control-flow idioms the walker understands:
 
 Regeneratable, `.gitignore`d. The checked-in files are this README, the
 `.gitignore`, and nothing else.
+
+That `.gitignore` is `*` with only these two re-included, so a clean wipes
+every `<hash>/` directory. `reach.bitmap` going missing is a hard `build.rs`
+panic naming the fix, but the sibling `code-symbols.txt` loss only downgrades
+to a `cargo:warning` and silently empties the diag symbol tables (hex-only
+backtraces, inert tracer). `scripts/regen-classify.sh 717006` restores both.

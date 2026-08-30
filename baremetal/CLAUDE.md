@@ -73,6 +73,12 @@ guest-tests/scripts/run-all.sh                            # 38 guest tests (QEMU
 guest-tests/scripts/run-all.sh --platform fvp             # same on FVP
 scripts/check-matrix.sh                                   # 19 build combos + lints
 
+# Real Pi: build, power-cycle, upload the delta over serial, boot, capture
+cargo build --release --no-default-features --features pi-bare-metal-input
+scripts/pi-upload.py --kernel target/aarch64-unknown-none-softfloat/release/newton-hypervisor \
+  --until 'Welcome to NewtonScript' --timeout 120          # console → stdout + /tmp/newton-claude/serial.log
+scripts/pi-upload.py --no-upload                          # power-cycle and watch until Ctrl-C
+
 # FVP (accurate reference model; much slower than QEMU — long timeouts)
 cargo build --release --no-default-features \
   --features "platform-fvp-base rom-717006 quiet diag"

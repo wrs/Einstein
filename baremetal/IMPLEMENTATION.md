@@ -64,7 +64,11 @@ authoritative.
 1. **Platform.** Instantiates `linker.ld.in` with the platform's load
    address (raspi3b `0x80000`, FVP `0x80000000`) into `OUT_DIR` and
    links against the result — one script, one placeholder, no
-   per-platform copies.
+   per-platform copies. The script places the embedded ROM + REx
+   (`.rom_blob`, owned arrays in `src/newton/loader.rs`) at image
+   offset 0x1000, ahead of `.text`, so the blob's position never
+   depends on code size — the serial loader's delta persist relies
+   on that (`docs/REAL_HW_BRINGUP.md`, "Serial image upload").
 2. **ROM version.** `resolve_rom_version()` maps the `rom-*` feature to
    its build inputs (ROM/REx paths, symbol tables, flash filename) and
    its `src/newton/rom_ver/` constants module.

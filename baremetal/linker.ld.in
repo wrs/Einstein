@@ -25,6 +25,25 @@ SECTIONS
     __image_start = .;
 
     .text.boot : { KEEP(*(.text.boot)) }
+
+    /*
+     * The embedded Newton ROM + REx (src/newton/loader.rs) sit right
+     * after the boot stub, at a fixed 4 KiB offset from the image base,
+     * ahead of everything that changes from build to build. The blob
+     * is ~8.3 MiB and never changes for a given ROM version, so keeping
+     * its image offset stable lets the serial loader's delta persist
+     * (nhboot/src/persist.rs) leave those sectors of HYPERV.IMG alone;
+     * placed after .text/.rodata it would shift on every code change.
+     * Nothing depends on .text following .text.boot directly: boot.s
+     * reaches the rest of the image with adrp/bl (±4 GiB / ±128 MiB).
+     */
+    . = ALIGN(4096);
+    ASSERT(. - __image_start == 0x1000, ".text.boot must fit in the first 4 KiB")
+    __rom_blob_start = .;
+    .rom_blob  : { KEEP(*(.rom_blob.rom)) KEEP(*(.rom_blob.rex)) }
+    __rom_blob_end = .;
+
+    . = ALIGN(2048);   /* .text.vectors wants a 2 KiB-aligned VBAR. */
     .text      : { *(.text .text.*) }
 
     . = ALIGN(16);

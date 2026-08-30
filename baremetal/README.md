@@ -608,8 +608,12 @@ scripts/pi-upload.py --no-upload --until 'DMA save complete' --timeout 60   # po
 `pi-upload.py` power-cycles the board through the `Pi Off`/`Pi On`
 Shortcuts, sends only the bytes that changed (an rsync-style delta
 against the image on the card), waits for nhboot to write the result
-back to `HYPERV.IMG`, then streams the console to stdout and a log
-until `--until` matches or `--timeout` expires.
+back to `HYPERV.IMG`, then streams the console to stdout and
+`/tmp/newton-claude/serial.log` until `--until` matches or `--timeout`
+expires — without either it keeps streaming until Ctrl-C. The script
+is the serial terminal: once it exits nothing is listening, so read
+the log for what came after the marker, or `tail -f` the log from a
+second terminal to watch live while it runs.
 
 See [`docs/REAL_HW_BRINGUP.md`](docs/REAL_HW_BRINGUP.md) for the
 hardware specifics — `config.txt`, UART routing, the TSTP MTouch

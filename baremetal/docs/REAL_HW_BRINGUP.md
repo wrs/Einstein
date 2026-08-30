@@ -273,6 +273,50 @@ error, 130 on Ctrl-C. The raw console is appended to `--log` (default
 `/tmp/newton-claude/serial.log`); only one process can hold the port,
 so stop any `miniterm`/`screen` on it first.
 
+**Watching the console.** The script is the serial terminal: while it
+runs, everything the board prints goes to its stdout and to the log
+file; when it exits (match, timeout, Ctrl-C) it releases the port and
+nothing is listening any more, although the board keeps running. So:
+
+- A bounded check (`--until REGEX --timeout N`) captures the boot up
+  to the marker and stops — read the rest from the log afterwards.
+  Each run starts with a `===== pi-upload.py run <timestamp> =====`
+  line, so the last run is everything after the last such line.
+- To keep watching, run without `--until` (and `--timeout 0`, the
+  default): it streams until Ctrl-C, holding the port. Stop it before
+  the next upload.
+- A second terminal can follow the same output live with
+  `tail -f /tmp/newton-claude/serial.log`, whichever mode the script
+  is in — that is the intended split between an agent driving the
+  script and a person watching.
+- A soak (N cold boots, each judged by markers) is a shell loop around
+  `--no-upload`; this replaces the earlier `cycle.sh` + `miniterm | tee
+  /tmp/serial.txt` harness from the SD-DMA investigation
+  (`INVESTIGATION.md`, "Round 7 harness"), and unlike it verifies that
+  the switch really cycled:
+
+  ```bash
+  L=/tmp/newton-claude/serial.log
+  for i in $(seq 1 20); do
+      scripts/pi-upload.py --no-upload --timeout 45 \
+          --until '\*\*\* HALTED|!!!panic|REP> Welcome to NewtonScript' >/dev/null
+      slice=$(awk '/^===== pi-upload.py run/{s=""} {s=s $0 "\n"} END{printf "%s", s}' "$L")
+      if grep -q '\*\*\* HALTED\|!!!panic' <<<"$slice"; then echo "boot $i: HALT"; break; fi
+      grep -q 'Welcome to NewtonScript' <<<"$slice" || { echo "boot $i: stall"; break; }
+      echo "boot $i: clean"
+  done
+  ```
+
+  (`--until` is an alternation so the run ends at the first decisive
+  line either way; the verdict comes from grepping the run's slice of
+  the log, which the `awk` extracts as everything after the last run
+  header.) Add the dwell the investigation needs via `--timeout` and a
+  later marker.
+- A plain serial terminal still works for watching without uploading
+  (`uv run --with pyserial python -m serial.tools.miniterm --eol LF
+  /dev/cu.usbserial-BG03U2PN 115200`), but it holds the port: close it
+  before the next `pi-upload.py`.
+
 Power cycling goes through the Shortcuts app: `Pi Off` / `Pi On` each
 run a Home action on the switch the Pi is plugged into. The script
 runs them with stdin closed (`shortcuts run` otherwise blocks on
@@ -311,10 +355,12 @@ exercise the persist-failure path.)
   affects nhboot.
 - nhboot itself, `config.txt` and the firmware are updated only by a
   card write (`build-sd.sh <dest> <mount>`).
-- A rebuild that shifts the ROM blob still rewrites most of the
-  file's sectors on the card (~15 s of PIO at ~700 KB/s); the persist
-  step, not the transfer, is the visible cost. `PLAN.md` item 8
-  (link-time alignment of the blob) is the fix.
+- The card write is per changed 512-byte sector at ~700 KB/s of PIO.
+  `linker.ld.in` pins the ROM + REx blob (8.3 MiB, `.rom_blob`) at
+  image offset 0x1000, ahead of `.text`/`.rodata`, so a code change
+  moves only the code and data behind it; a full rewrite (~15 s)
+  happens only when the blob itself changes (a different ROM
+  version).
 - No flow control on the link: nhboot's receive loop is tight (no
   printing inside a message) and the PL011 FIFO is 16 deep; a
   dropped byte costs one 64 KiB retry.
@@ -330,8 +376,12 @@ driven by `pi-upload.py` from the Mac with no hands on the board:
   power-on to `DONE` at 1.5 M.
 - Real rebuild (the `quiet` variant over the input build): 16 ops,
   400 KB sent (3.8 %), 5.0 s transfer, 12.7 s from power-on to the
-  COMMIT; persist rewrote 19676 of 20639 sectors in 15.7 s (the ROM
-  blob shifted — `PLAN.md` item 8), Welcome UI at 38 s.
+  COMMIT. With the blob still inside `.rodata` at the time, persist
+  rewrote 19676 of 20639 sectors in 15.7 s (Welcome UI at 38 s); with
+  the blob pinned at offset 0x1000 the same rebuild rewrites 2886
+  sectors in 6.3 s (Welcome UI at 28 s) — `quiet` touches most of
+  `.text`, so that is the ceiling for a code change; a small edit
+  moves far less.
 - Persistence: a plain power-cycle (`--no-upload`) booted the
   uploaded build from the card.
 - 1.5 M and 3 M baud both work. The one host-side pitfall found:

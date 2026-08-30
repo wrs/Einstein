@@ -28,8 +28,18 @@ use crate::kprintln;
 // image isn't present on disk, build.rs stages a zero-length placeholder
 // (so `cargo check` of a skeleton version stays green) and
 // `load_newton_rom` halts loudly at boot instead.
+//
+// Both blobs are owned arrays in the `.rom_blob.*` sections, which
+// linker.ld.in places at a fixed offset right after the boot stub so
+// that a code change never moves them inside the image (the serial
+// loader's delta persist then leaves their sectors on the card alone).
+// A `&[u8]` static would let rustc drop the bytes into `.rodata`
+// wherever it likes.
 #[cfg(not(nh_guest_test))]
-static ROM_BE: &[u8] = include_bytes!(env!("NH_ROM_PATH"));
+const ROM_LEN: usize = include_bytes!(env!("NH_ROM_PATH")).len();
+#[cfg(not(nh_guest_test))]
+#[link_section = ".rom_blob.rom"]
+static ROM_BE: [u8; ROM_LEN] = *include_bytes!(env!("NH_ROM_PATH"));
 
 // Einstein's REx goes into the second 8 MB of the 16 MB ROM region, at
 // `rom_ver::REX.pa_offset`. Same per-word load layout as the main ROM.
@@ -38,7 +48,10 @@ static ROM_BE: &[u8] = include_bytes!(env!("NH_ROM_PATH"));
 // See Emulator/ROM/TFlatROMImageWithREX.cpp:139-178 for the layout.
 // Path resolved by build.rs alongside the ROM image.
 #[cfg(not(nh_guest_test))]
-static REX_BE: &[u8] = include_bytes!(env!("NH_REX_PATH"));
+const REX_LEN: usize = include_bytes!(env!("NH_REX_PATH")).len();
+#[cfg(not(nh_guest_test))]
+#[link_section = ".rom_blob.rex"]
+static REX_BE: [u8; REX_LEN] = *include_bytes!(env!("NH_REX_PATH"));
 
 // Guest-test mode: `build.rs` picked up $NH_GUEST_TEST and set this cfg.
 // The test binary is an AArch32 flat binary with reset vector at offset

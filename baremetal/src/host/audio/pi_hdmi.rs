@@ -504,14 +504,33 @@ static mut MAI_TX_CBS: MaiCbChain =
 /// Producer cursor in subframes since cyclic-DMA arm. Monotonic u64
 /// (wraps in practice never — 2^64 subframes is millions of years
 /// of audio). Ring index = `(MAI_TX_HEAD.load() % MAI_TX_RING_LEN) as usize`.
-/// Advanced only by `refill_mai_dma_ring` after it writes new content.
+/// Marks the furthest position holding *any* valid content — real
+/// audio or silence pad — and never rewinds. Advanced only by
+/// `refill_mai_dma_ring` after it writes new content.
 static MAI_TX_HEAD: AtomicU64 = AtomicU64::new(0);
 
-/// Count of period-completion IRQs received since cyclic DMA was
-/// armed. Each IRQ means "the period the DMA *just finished* is now
-/// safe for `refill_mai_dma_ring` to overwrite." The consumer cursor (in subframes)
-/// is `MAI_PERIODS_DONE * PERIOD_SLOTS`. Monotonic u64 — same
+/// Furthest subframe position holding *real* guest audio (same
+/// monotonic coordinate as `MAI_TX_HEAD`). Everything in
+/// `[MAI_REAL_HEAD, MAI_TX_HEAD)` is silence pad, and
+/// `refill_mai_dma_ring` overwrites it in place when the guest's next
+/// buffer arrives — late guest audio must never queue *behind* pad
+/// that was staged while waiting for it (that was an audible mid-clip
+/// gap of up to the full ring). May lag arbitrarily far behind
+/// `MAI_TX_HEAD` (e.g. across idle stretches); the refill clamps it
+/// up to the safe write floor before use.
+static MAI_REAL_HEAD: AtomicU64 = AtomicU64::new(0);
+
+/// Completed-period count since cyclic DMA was armed. The consumer
+/// cursor (in subframes) is `MAI_PERIODS_DONE * PERIOD_SLOTS`; the
+/// DMA is currently reading the period at
+/// `[consumer, consumer + PERIOD_SLOTS)`. Monotonic u64 — same
 /// rationale as `MAI_TX_HEAD` for not worrying about wrap.
+///
+/// Advanced ONLY by `observe_consumer_periods`, which derives the
+/// current period from the channel's live CONBLK_AD register — the
+/// period-completion IRQ carries no count of its own (a late dispatch
+/// coalesces several completions into one delivery, which is exactly
+/// when an IRQ-counting estimate would fall behind for good).
 static MAI_PERIODS_DONE: AtomicU64 = AtomicU64::new(0);
 
 /// True once the cyclic chain has been armed. Before this,
@@ -526,9 +545,19 @@ static OUTPUT_VOLUME: AtomicU32 = AtomicU32::new(0);
 /// The two ping-pong buffer addresses passed to subfn 0x05.
 static BUF1_ADDR: AtomicU32 = AtomicU32::new(0);
 static BUF2_ADDR: AtomicU32 = AtomicU32::new(0);
-/// IEC 60958 frame counter (mod 192). Used to set the B-frame
-/// preamble bits on the first subframe of each block.
-static IEC_FRAME_CTR: AtomicU32 = AtomicU32::new(0);
+/// IEC 60958 block phase for the subframe pair at monotonic position
+/// `pos` (the `MAI_TX_HEAD` coordinate): frame index within the
+/// 192-frame channel-status block, used to place the B-preamble.
+/// Deriving the phase from stream *position* (rather than a counter
+/// advanced per write) keeps the on-wire block cadence intact when a
+/// refill rewrites pad slots in place or the safe-floor clamp skips
+/// positions without writing them: whatever lands at position `pos`
+/// always carries the phase the receiver expects there. The boot-time
+/// pre-fill starts at position 0, so phase 0 is anchored to the first
+/// subframe the wire ever carries.
+fn iec_block_phase(pos_subframes: u64) -> u32 {
+    ((pos_subframes / 2) % IEC958_BLOCK_FRAMES as u64) as u32
+}
 /// IEC 60958-3 consumer channel-status, 192 bits = 24 bytes, one bit
 /// per frame mapped into bit 30 (C) of each subframe across a block.
 ///
@@ -814,17 +843,20 @@ pub fn schedule_output(which: u32, byte_count: u32) {
 /// "refill the period that just completed" chain.
 ///
 /// Phases:
-/// 1. Drain any real stereo frames the kernel queued via
-///    `schedule_output` and SPDIF-encode them into the MAI ring.
-/// 2. Pad with silence subframes until the ring is `TARGET_AHEAD`
-///    subframes ahead of the consumer. The DMA never sees an
-///    underrun — between clips it reads the silence we wrote.
+/// 1. Drain real stereo frames the kernel queued via
+///    `schedule_output` and SPDIF-encode them into the MAI ring,
+///    starting at `MAI_REAL_HEAD` — *overwriting* any silence pad
+///    staged past that point while we were waiting for the guest.
+/// 2. Pad with silence subframes beyond all real content so the DMA
+///    never reads stale slots: up to the active cushion while a clip
+///    is in flight, or the whole safe window when output is idle.
+///    The DMA never sees an underrun — between clips it reads the
+///    silence we wrote.
 fn refill_mai_dma_ring() {
     if !INIT_DONE.load(Ordering::Acquire) {
         return;
     }
-    let mai_armed = MAI_CYCLIC_ARMED.load(Ordering::Acquire);
-    if !mai_armed {
+    if !MAI_CYCLIC_ARMED.load(Ordering::Acquire) {
         return;
     }
 
@@ -832,73 +864,57 @@ fn refill_mai_dma_ring() {
     let head_stereo = ring.head.load(Ordering::Acquire);
     let mut tail_stereo = ring.tail.load(Ordering::Acquire);
 
-    // Consumer cursor in subframes, monotonic u64. After
-    // `periods_done` period-completion IRQs the DMA has finished
-    // periods [0..periods_done) and is now reading the period at
-    // [periods_done * PERIOD_SLOTS, (periods_done+1) * PERIOD_SLOTS).
-    // That entire period is OFF-LIMITS to writes — racing with the
+    // Consumer cursor in subframes, monotonic u64, resynced from the
+    // DMA channel's live CONBLK_AD so it tracks the hardware even
+    // when the period IRQ is late (see `observe_consumer_periods`).
+    // The DMA is reading [consumer, consumer + PERIOD_SLOTS) right
+    // now; that entire period is OFF-LIMITS to writes — racing the
     // DMA's current read produces torn IEC subframes (audible as a
     // periodic click at the period rate, ~43 Hz).
-    let periods_done = MAI_PERIODS_DONE.load(Ordering::Acquire);
+    let periods_done = observe_consumer_periods("refill");
     let consumer = periods_done.saturating_mul(PERIOD_SLOTS as u64);
-    // Minimum-safe producer position: one full period AHEAD of the
-    // period the DMA is currently reading (DMA reads
-    // [consumer, consumer + PERIOD_SLOTS); safe writes start at
-    // consumer + PERIOD_SLOTS). If `head` has fallen below this
-    // (e.g. after a long EL2 stall that swallowed several period
-    // IRQs), advance it. The slots we skip retain whatever
-    // subframe pattern they already held from earlier refills (or
-    // from `mai_dma_init_cyclic`'s pre-fill at boot) — still valid
-    // IEC, just from a previous cycle.
-    let safe_head_min = consumer.saturating_add(PERIOD_SLOTS as u64);
+    // Minimum-safe write position: one full period ahead of the
+    // period the DMA is currently reading.
+    let safe_floor = consumer.saturating_add(PERIOD_SLOTS as u64);
+    // Maximum write position: keep the write tail from wrapping into
+    // the DMA's current period from behind.
+    let write_cap = consumer.saturating_add((MAI_TX_RING_LEN - PERIOD_SLOTS) as u64);
+
     let mut head = MAI_TX_HEAD.load(Ordering::Relaxed);
     let original_head = head;
-    let adjusted_for_consumer = head < safe_head_min;
+    // If `head` has fallen below the floor (a long EL2 stall let the
+    // DMA lap the producer), skip forward. The skipped slots retain
+    // whatever subframe pattern they already held from earlier laps —
+    // still valid IEC, just stale content.
+    let adjusted_for_consumer = head < safe_floor;
     if adjusted_for_consumer {
-        head = safe_head_min;
-        MAI_TX_HEAD.store(head, Ordering::Release);
+        head = safe_floor;
     }
-    let ahead_subframes = (head - consumer) as usize;
-    let head_slot = (head % MAI_TX_RING_LEN as u64) as usize;
-    // Max legitimate `ahead` is RING_LEN - PERIOD_SLOTS (so the
-    // tail of our write doesn't wrap into the DMA's current period).
-    let max_ahead = MAI_TX_RING_LEN - PERIOD_SLOTS;
-    let writable_subframes = max_ahead.saturating_sub(ahead_subframes);
-    let writable_pairs = writable_subframes / 2;
 
-    // Target enough ahead-of-consumer audio that the next refill finds
-    // the ring well-fed even if EL2 is momentarily busy.
-    //
-    // When guest samples are queued, keep to a two-period cushion to
-    // avoid adding unnecessary playback latency. When the guest has no
-    // samples queued, treat the hardware side like CoreAudio's idle
-    // stream and fill the entire safe window with deterministic idle
-    // audio. That makes "no guest audio" independent of guest progress:
-    // the cyclic DMA can keep looping valid, seamless content.
-    const ACTIVE_TARGET_AHEAD_SUBFRAMES: usize = 2 * PERIOD_SLOTS;
-    let idle_only = head_stereo == tail_stereo;
-    let target_ahead_subframes = if idle_only {
-        max_ahead
-    } else {
-        ACTIVE_TARGET_AHEAD_SUBFRAMES
-    };
-    let want_pairs = if ahead_subframes < target_ahead_subframes {
-        (target_ahead_subframes - ahead_subframes) / 2
-    } else {
-        0
-    };
-    let mut to_write_pairs = core::cmp::min(want_pairs, writable_pairs);
+    // Cushion of staged content ahead of the consumer while a clip is
+    // in flight. Must cover the longest gap between refill
+    // opportunities or the DMA reaches slots we haven't written: EL2
+    // stalls up to ~71 ms between period-IRQ dispatches have been
+    // captured on hardware, so 4 periods (~93 ms; ~70 ms beyond the
+    // period being read) rides those out. The cost is stop latency:
+    // SPDIF-encoded real audio can't be recalled, so a clip the
+    // kernel stops keeps sounding for up to the cushion depth.
+    const ACTIVE_TARGET_AHEAD_SUBFRAMES: usize = 4 * PERIOD_SLOTS;
+    let active_target_end = consumer
+        .saturating_add(ACTIVE_TARGET_AHEAD_SUBFRAMES as u64)
+        .min(write_cap);
 
-    let mut mai_head = head_slot;
-    let mut pairs_written = 0usize;
-
-    // Phase 1: drain real samples from the stereo ring. No
-    // OUTPUT_RUNNING gate — the kernel calls subfn 0x07
-    // ScheduleOutputBuffer *before* subfn 0x0D StartOutput, so we
-    // need to start staging the first buffer's worth of audio
-    // before OUTPUT_RUNNING is true. If the stereo ring is empty,
-    // the loop simply doesn't execute.
-    while tail_stereo != head_stereo && pairs_written < to_write_pairs {
+    // Phase 1: drain real samples from the stereo ring, starting
+    // where real content last ended — rewound below `head` when
+    // silence pad was staged past it, so late guest audio is never
+    // parked behind queued silence. No OUTPUT_RUNNING gate — the
+    // kernel calls subfn 0x07 ScheduleOutputBuffer *before* subfn
+    // 0x0D StartOutput, so the first buffer must stage before
+    // OUTPUT_RUNNING is true. If the stereo ring is empty the loop
+    // simply doesn't execute.
+    let real_start = MAI_REAL_HEAD.load(Ordering::Relaxed).max(safe_floor);
+    let mut real_pos = real_start;
+    while tail_stereo != head_stereo && real_pos + 2 <= active_target_end {
         // SAFETY: tail_stereo < head_stereo was the invariant
         // when we entered; the slot we read is the consumer's
         // exclusive domain until we advance `tail_stereo`.
@@ -909,97 +925,157 @@ fn refill_mai_dma_ring() {
         };
         let left = (frame & 0xFFFF) as i16;
         let right = ((frame >> 16) & 0xFFFF) as i16;
-        let frame_idx_in_block = IEC_FRAME_CTR.load(Ordering::Relaxed);
-        let (sf_l, sf_r) = encode_iec958_pair(left, right, frame_idx_in_block);
-        // SAFETY: we hold exclusive access to slots
-        // [mai_head .. mai_head + 2) — they're inside the
-        // pre-validated writable window (`to_write_pairs * 2`
-        // subframes ahead of HEAD, all safely away from the
-        // consumer).
-        unsafe {
-            let buf = &mut *MAI_TX_RING.0.get();
-            buf[mai_head] = sf_l;
-            buf[(mai_head + 1) % MAI_TX_RING_LEN] = sf_r;
-        }
-        mai_head = (mai_head + 2) % MAI_TX_RING_LEN;
-        IEC_FRAME_CTR.store(
-            (frame_idx_in_block + 1) % IEC958_BLOCK_FRAMES,
-            Ordering::Relaxed,
-        );
+        write_iec_pair_at(real_pos, left, right);
+        real_pos += 2;
         tail_stereo = tail_stereo.wrapping_add(1);
-        pairs_written += 1;
     }
     ring.tail.store(tail_stereo, Ordering::Release);
+    if real_pos > real_start {
+        MAI_REAL_HEAD.store(real_pos, Ordering::Release);
+        flush_ring_range(real_start, real_pos);
+    }
+    if real_pos > head {
+        head = real_pos;
+    }
 
-    // Phase 2: pad with digital silence to reach the ahead-of-consumer
-    // target. Between clips the DMA reads these valid silent IEC
-    // subframes, so the wire stays continuous and the receiver never
+    // Phase 2: pad with digital silence beyond all valid content.
+    // While a clip is in flight, pad only to the active cushion —
+    // phase 1 overwrites the pad in place if the guest's next buffer
+    // arrives before the DMA gets there, so it is only audible on
+    // true starvation. With output stopped and the stereo ring
+    // drained, fill the whole safe window: idle audio then keeps
+    // looping independent of guest progress, and the receiver never
     // sees a stream interruption.
-    to_write_pairs = to_write_pairs.saturating_sub(pairs_written);
-    let real_pairs_written = pairs_written;
-    for _ in 0..to_write_pairs {
-        let frame_idx_in_block = IEC_FRAME_CTR.load(Ordering::Relaxed);
-        let (sf_l, sf_r) = encode_iec958_pair(0, 0, frame_idx_in_block);
-        // SAFETY: same exclusive-producer invariant as Phase 1.
-        unsafe {
-            let buf = &mut *MAI_TX_RING.0.get();
-            buf[mai_head] = sf_l;
-            buf[(mai_head + 1) % MAI_TX_RING_LEN] = sf_r;
-        }
-        mai_head = (mai_head + 2) % MAI_TX_RING_LEN;
-        IEC_FRAME_CTR.store(
-            (frame_idx_in_block + 1) % IEC958_BLOCK_FRAMES,
-            Ordering::Relaxed,
-        );
-        pairs_written += 1;
+    let idle = !OUTPUT_RUNNING.load(Ordering::Acquire) && tail_stereo == head_stereo;
+    let pad_target_end = if idle { write_cap } else { active_target_end };
+    let pad_start = head;
+    let mut pad_pos = pad_start;
+    while pad_pos + 2 <= pad_target_end {
+        write_iec_pair_at(pad_pos, 0, 0);
+        pad_pos += 2;
+    }
+    if pad_pos > pad_start {
+        flush_ring_range(pad_start, pad_pos);
+        head = pad_pos;
     }
 
     // A consumer-driven head adjustment means an EL2 stall let the
     // DMA lap our producer cursor — always worth a line.
     if adjusted_for_consumer {
         kprintln!(
-            "audio_pi_hdmi: refill head adjusted {} -> {} (consumer={}, real_pairs={}, fill_pairs={})",
+            "audio_pi_hdmi: refill head adjusted {} -> {} (consumer={}, real_end={}, pad_end={})",
             original_head,
-            safe_head_min,
+            safe_floor,
             consumer,
-            real_pairs_written,
-            pairs_written.saturating_sub(real_pairs_written)
+            real_pos,
+            pad_pos
         );
     }
 
-    if pairs_written == 0 {
+    if head != original_head {
+        MAI_TX_HEAD.store(head, Ordering::Release);
+    }
+}
+
+/// SPDIF-encode one stereo pair and write it into the MAI TX ring at
+/// monotonic position `pos`. `pos` is always even (the safe floor is
+/// period-aligned and every write advances by 2), and the ring length
+/// is even, so a pair never straddles the ring end. The caller is
+/// responsible for cache-flushing the written range.
+fn write_iec_pair_at(pos: u64, left: i16, right: i16) {
+    let (sf_l, sf_r) = encode_iec958_pair(left, right, iec_block_phase(pos));
+    let slot = (pos % MAI_TX_RING_LEN as u64) as usize;
+    // SAFETY: callers stage only positions in
+    // [consumer + PERIOD_SLOTS, consumer + RING_LEN - PERIOD_SLOTS),
+    // away from the period the DMA is reading; single-CPU EL2
+    // serialises the producer and IRQ paths as documented on
+    // `MaiTxRing`.
+    unsafe {
+        let buf = &mut *MAI_TX_RING.0.get();
+        buf[slot] = sf_l;
+        buf[slot + 1] = sf_r;
+    }
+}
+
+/// Push the ring slots covering monotonic positions `[start, end)`
+/// out of L1/L2 to RAM so the DMA, which reads via the uncached bus
+/// alias (BCM2835 §1.2.3), sees what we wrote rather than stale
+/// cache. `end - start` never exceeds the ring length (writes are
+/// capped a period short of the consumer's lap), so at most one wrap
+/// split is needed.
+fn flush_ring_range(start: u64, end: u64) {
+    if end <= start {
         return;
     }
-
-    // Push the just-written slots out of L1/L2 to RAM so the DMA,
-    // which reads via the uncached bus alias (BCM2835 §1.2.3), sees
-    // what we wrote rather than stale cache.
     let ring_arm_phys = unsafe { (*MAI_TX_RING.0.get()).as_ptr() } as u64;
-    let start_slot = head_slot;
-    let end_slot = mai_head;
-    if end_slot > start_slot {
+    let word = core::mem::size_of::<u32>();
+    let len = (end - start) as usize;
+    let start_slot = (start % MAI_TX_RING_LEN as u64) as usize;
+    if start_slot + len <= MAI_TX_RING_LEN {
         crate::arch::cpu::dc_civac_range(
-            ring_arm_phys + (start_slot * core::mem::size_of::<u32>()) as u64,
-            (end_slot - start_slot) * core::mem::size_of::<u32>(),
+            ring_arm_phys + (start_slot * word) as u64,
+            len * word,
         );
     } else {
-        // Wrapped past the ring end — flush in two halves.
+        let first = MAI_TX_RING_LEN - start_slot;
         crate::arch::cpu::dc_civac_range(
-            ring_arm_phys + (start_slot * core::mem::size_of::<u32>()) as u64,
-            (MAI_TX_RING_LEN - start_slot) * core::mem::size_of::<u32>(),
+            ring_arm_phys + (start_slot * word) as u64,
+            first * word,
         );
-        if end_slot > 0 {
-            crate::arch::cpu::dc_civac_range(
-                ring_arm_phys,
-                end_slot * core::mem::size_of::<u32>(),
+        crate::arch::cpu::dc_civac_range(ring_arm_phys, (len - first) * word);
+    }
+}
+
+/// Advance `MAI_PERIODS_DONE` to match the period the DMA channel is
+/// actually reading, per its live CONBLK_AD (the bus address of the
+/// CB the channel is executing right now). This is the ONLY place the
+/// consumer advances: the period-completion IRQ carries no count of
+/// its own — a late dispatch coalesces several completions into one
+/// delivery, which is exactly when an IRQ-counting estimate falls
+/// behind and every refill writes into the period the DMA is reading
+/// (persistent torn audio). Deriving the count from CONBLK on every
+/// observation (each period IRQ *and* each refill) also means the
+/// count can never *lead* the hardware, so the old non-converging
+/// "estimate leads CONBLK" state cannot arise.
+///
+/// The observation is modular (which of the `N_PERIODS` CBs), so a
+/// stall long enough to lap the whole ring (> ~186 ms) folds; the
+/// safe-floor clamp in `refill_mai_dma_ring` self-heals the ring
+/// state either way. A jump of 2+ periods in one observation means a
+/// full period passed with no IRQ dispatch and no refill — an EL2
+/// stall exceeded ~23 ms — and is worth a line naming the observer.
+fn observe_consumer_periods(source: &str) -> u64 {
+    let mut periods_done = MAI_PERIODS_DONE.load(Ordering::Acquire);
+    let conblk = crate::host::host_dma::mai_tx_conblk();
+    let mut found = None;
+    for i in 0..N_PERIODS {
+        // SAFETY: address-of only — single-threaded EL2, and the CB
+        // array is never moved after init.
+        let cb_addr = unsafe { core::ptr::addr_of!(MAI_TX_CBS.0[i]) } as u64;
+        if crate::host::host_dma::bus_addr_ram(cb_addr) == conblk {
+            found = Some(i);
+            break;
+        }
+    }
+    let Some(actual) = found else {
+        // Channel paused, or CONBLK read mid-CB-load; keep the last
+        // count and let the next observation catch up.
+        return periods_done;
+    };
+    let expected = (periods_done % N_PERIODS as u64) as usize;
+    let lag = (actual + N_PERIODS - expected) % N_PERIODS;
+    if lag != 0 {
+        periods_done = MAI_PERIODS_DONE.fetch_add(lag as u64, Ordering::AcqRel) + lag as u64;
+        if lag >= 2 {
+            kprintln!(
+                "audio_pi_hdmi: consumer jumped {} periods to {} (seen at {}) — EL2 stall exceeded a period",
+                lag,
+                periods_done,
+                source
             );
         }
     }
-    // Advance the monotonic counter by `pairs_written * 2`
-    // subframes. mai_head (the modular ring index) doesn't have
-    // enough information to recover the true monotonic value
-    // when it wraps.
-    MAI_TX_HEAD.store(head + (pairs_written as u64) * 2, Ordering::Release);
+    periods_done
 }
 
 /// Raise the kernel-side "give us more" IRQ when the stereo ring is
@@ -1195,22 +1271,17 @@ fn mai_dma_init_cyclic() -> bool {
     let ring_ptr = unsafe { (*MAI_TX_RING.0.get()).as_mut_ptr() };
     unsafe {
         let buf = &mut *MAI_TX_RING.0.get();
-        // Iterate in stereo pairs (L then R), driving IEC_FRAME_CTR
-        // through the 192-frame block boundaries so the receiver
-        // sees a proper Z/X/Y preamble cadence from the first
-        // subframe.
+        // Iterate in stereo pairs (L then R); `iec_block_phase`
+        // anchors phase 0 to position 0, so the receiver sees a
+        // proper Z/X/Y preamble cadence from the first subframe.
         for i in (0..MAI_TX_RING_LEN).step_by(2) {
-            let frame_idx_in_block = IEC_FRAME_CTR.load(Ordering::Relaxed);
-            let (sf_l, sf_r) = encode_iec958_pair(0, 0, frame_idx_in_block);
+            let (sf_l, sf_r) = encode_iec958_pair(0, 0, iec_block_phase(i as u64));
             buf[i] = sf_l;
             buf[i + 1] = sf_r;
-            IEC_FRAME_CTR.store(
-                (frame_idx_in_block + 1) % IEC958_BLOCK_FRAMES,
-                Ordering::Relaxed,
-            );
         }
     }
     MAI_TX_HEAD.store(MAI_TX_RING_LEN as u64, Ordering::Release);
+    MAI_REAL_HEAD.store(0, Ordering::Release);
     MAI_PERIODS_DONE.store(0, Ordering::Release);
 
     // Build the CB chain.
@@ -1281,8 +1352,9 @@ fn mai_dma_init_cyclic() -> bool {
 /// Called from `host_dma::on_completion` when the MAI TX channel
 /// raises its IRQ at a CB boundary. The hardware has already
 /// advanced through the chain on its own; we
-///   1. bump the period counter (so `refill_mai_dma_ring` knows how
-///      much of the ring is safe to overwrite),
+///   1. resync the period counter from the channel's CONBLK_AD (so
+///      `refill_mai_dma_ring` knows how much of the ring is safe to
+///      overwrite),
 ///   2. refill the freed period from the stereo ring + silence,
 ///   3. decide whether to nudge the kernel for more audio.
 /// This shape mirrors Linux's `vchan_cyclic_callback` →
@@ -1297,72 +1369,11 @@ pub fn on_mai_dma_done() {
     } else {
         now.wrapping_sub(last).saturating_mul(1_000_000) / freq.max(1)
     };
-    let mut periods_done = MAI_PERIODS_DONE.fetch_add(1u64, Ordering::AcqRel) + 1;
-
-    // Drift check: the IRQ-counted consumer estimate assumes one
-    // dispatched completion per CB boundary. If EL2 ever services the
-    // IRQ a full period late, two CBs have completed but CS.INT only
-    // records one — the estimate then lags the hardware FOREVER, and
-    // every refill writes into the period the DMA is actually
-    // reading (persistent torn audio). CONBLK_AD is ground truth:
-    // it holds the bus address of the CB the channel is executing
-    // right now, i.e. the true current period. Resync forward (the
-    // estimate can only lag, never lead) and log loudly — this
-    // firing at all means an EL2 stall exceeded one period (~23 ms).
-    let conblk = crate::host::host_dma::mai_tx_conblk();
-    let actual_period = {
-        let mut found = None;
-        for i in 0..N_PERIODS {
-            // SAFETY: address-of only — single-threaded EL2, and the
-            // CB array is never moved after init.
-            let cb_addr = unsafe { core::ptr::addr_of!(MAI_TX_CBS.0[i]) } as u64;
-            let cb_bus = crate::host::host_dma::bus_addr_ram(cb_addr);
-            if cb_bus == conblk {
-                found = Some(i);
-                break;
-            }
-        }
-        found
-    };
-    if let Some(actual) = actual_period {
-        let expected = (periods_done % N_PERIODS as u64) as usize;
-        if actual != expected {
-            let lag = (actual + N_PERIODS - expected) % N_PERIODS;
-            // Cap the accepted lag at half the ring: an apparent lag
-            // of N-1 is indistinguishable from reading CONBLK_AD in
-            // the (theoretical) window before the controller loads
-            // the next CB. A genuine stall longer than N/2 periods
-            // still converges — the next IRQ re-detects the residue.
-            if lag <= N_PERIODS / 2 {
-                periods_done = MAI_PERIODS_DONE
-                    .fetch_add(lag as u64, Ordering::AcqRel)
-                    + lag as u64;
-                kprintln!(
-                    "audio_pi_hdmi: period-IRQ coalesced — CONBLK says period {} but estimate said {} (lag {}); resynced periods_done to {}",
-                    actual,
-                    expected,
-                    lag,
-                    periods_done
-                );
-            } else {
-                // An estimate that *leads* CONBLK (apparent lag N-1)
-                // never converges on its own, so this would otherwise
-                // print once per period for the rest of the boot.
-                static NOT_RESYNCED: AtomicU64 = AtomicU64::new(0);
-                let n = NOT_RESYNCED.fetch_add(1, Ordering::Relaxed);
-                if n < 8 || n % 256 == 0 {
-                    kprintln!(
-                        "audio_pi_hdmi: CONBLK period {} vs estimate {} (apparent lag {} > {}); not resyncing (occurrence #{})",
-                        actual,
-                        expected,
-                        lag,
-                        N_PERIODS / 2,
-                        n + 1
-                    );
-                }
-            }
-        }
-    }
+    // CONBLK_AD is the sole consumer authority (see
+    // `observe_consumer_periods`); the IRQ is just the guaranteed
+    // observation point — and the audio clock for the watermark
+    // nudge below.
+    let periods_done = observe_consumer_periods("period-irq");
 
     refill_mai_dma_ring();
     maybe_raise_watermark_irq();

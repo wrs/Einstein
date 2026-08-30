@@ -95,11 +95,17 @@ build combinations in `scripts/check-matrix.sh` pass.
    windows per second. Until then, §4.4's TLBI rule stands: the DC
    toggle without TLB maintenance corrupts guest memory.
 
-10. **`pi_hdmi` consumer-estimate resync.** In
-    `src/host/audio/pi_hdmi.rs`, when the period estimate *leads*
-    CONBLK (apparent lag > half the ring) the "not resyncing" state
-    never converges on its own; the log rate limit keeps the line
-    from flooding the UART but does not fix the estimator.
+10. **Attribute the EL2 IRQ-masked stalls.** Serial captures show
+    MAI period-IRQ dispatch gaps of 40-71 ms (vs the 23 ms period),
+    i.e. something runs at EL2 with IRQs masked for 2-3 periods,
+    clustered with bursts of guest activity. `pi_hdmi` now rides
+    them out (CONBLK-authoritative consumer + 4-period cushion,
+    which also removed the old non-converging period estimator),
+    but the stalls themselves are unexplained. Candidates: the
+    item-9 `SCTLR.M`-window DC-toggle/TLBI/`fix_stage1_xn_bits`
+    path, the flash-persist dirty scan. Instrument: extend the
+    "late period" line with the longest single IRQs-masked stretch
+    since the previous period and the last sync-trap EC/PC.
 
 Real-hardware specifics (cores 1–3 left parked, snapshot ring deferred
 on hardware, thermal re-verification) are tracked in

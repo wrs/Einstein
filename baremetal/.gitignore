@@ -29,3 +29,4 @@ docs/ARM_*
 !/roms/README.md
 *.rom
 *.rex
+nhboot/target

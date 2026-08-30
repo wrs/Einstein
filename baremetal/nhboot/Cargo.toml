@@ -1,0 +1,31 @@
+[package]
+name = "nhboot"
+version = "0.1.0"
+edition = "2021"
+description = "Serial-upload bootloader for the Newton hypervisor on the Pi Zero 2 W"
+
+# Standalone package, deliberately NOT a workspace member of the
+# hypervisor crate (same nesting pattern as vendor/embedded-sdmmc):
+# it links at a different address, carries none of the hypervisor's
+# features, and must keep building while the hypervisor is mid-debug.
+# Built by scripts/build-sd.sh into kernel8.img.
+
+[[bin]]
+name = "nhboot"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+debug = 2
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+debug = 2
+strip = false

@@ -75,6 +75,10 @@ guest-tests/scripts/run-all.sh --platform fvp             # same on FVP
 scripts/check-matrix.sh                                   # 19 build combos + lints
 
 # Real Pi: build, power-cycle, upload the delta over serial, boot, capture
+# The cargo build MUST be the last build before pi-upload: any
+# default-features build (cargo run, boot-check.sh) replaces the same
+# artifact with a semihost binary that hangs silently on hardware.
+# pi-upload refuses those (no pinned ROM blob), but don't rely on it.
 cargo build --release --no-default-features --features pi-bare-metal-input
 scripts/pi-upload.py --kernel target/aarch64-unknown-none-softfloat/release/newton-hypervisor \
   --until 'Welcome to NewtonScript' --timeout 120          # console → stdout + /tmp/newton-claude/serial.log

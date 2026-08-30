@@ -122,12 +122,39 @@ def elf_to_binary(elf: Path, out: Path) -> bytes:
     return out.read_bytes()
 
 
+# A real-hardware hypervisor build embeds the ~8.3 MiB Newton ROM +
+# REx blob at a fixed 4 KiB image offset (linker.ld.in `.rom_blob`).
+# A default/QEMU-features build loads the ROM via semihosting instead
+# and objcopy's to ~1 MiB — on the Pi it hangs silently before the
+# first UART byte. That exact mistake (some other cargo invocation —
+# guest tests, boot-check, plain `cargo run` — replacing
+# target/.../release/newton-hypervisor between the pi build and the
+# upload) has shipped the wrong binary repeatedly, so refuse payloads
+# that can't possibly contain the blob.
+MIN_REAL_HW_PAYLOAD = 4 << 20
+
+
+def check_payload_shape(payload: bytes, args: argparse.Namespace) -> None:
+    if args.allow_small_payload or len(payload) >= MIN_REAL_HW_PAYLOAD:
+        return
+    sys.exit(
+        f"error: payload is {len(payload)} bytes — too small to contain the "
+        f"pinned ROM/REx blob, so this is not a real-hardware build.\n"
+        f"hint: the artifact was probably replaced by a QEMU-features build "
+        f"(guest tests, boot-check.sh, or plain `cargo run`). Rebuild with:\n"
+        f"  cargo build --release --no-default-features --features pi-bare-metal-input\n"
+        f"and re-run. (--allow-small-payload overrides, e.g. for nhboot tests.)")
+
+
 def load_payload(args: argparse.Namespace, workdir: Path) -> bytes:
     if args.kernel:
-        return elf_to_binary(Path(args.kernel), workdir / "kernel8.img")
-    if args.payload:
-        return Path(args.payload).read_bytes()
-    return FORMAT.unwrap(Path(args.image).read_bytes())
+        payload = elf_to_binary(Path(args.kernel), workdir / "kernel8.img")
+    elif args.payload:
+        payload = Path(args.payload).read_bytes()
+    else:
+        payload = FORMAT.unwrap(Path(args.image).read_bytes())
+    check_payload_shape(payload, args)
+    return payload
 
 
 def cmd_make_image(args: argparse.Namespace) -> int:
@@ -646,6 +673,8 @@ def main() -> int:
                      help="seconds of capture before exiting 1 (0 = forever)")
     run.add_argument("--log", type=Path, default=DEFAULT_LOG,
                      help=f"append the raw console here (default {DEFAULT_LOG})")
+    p.add_argument("--allow-small-payload", action="store_true",
+                   help="skip the pinned-ROM size sanity check (see check_payload_shape)")
     p.add_argument("--debug-corrupt", type=int, default=0, metavar="N", help=argparse.SUPPRESS)
     args = p.parse_args()
 

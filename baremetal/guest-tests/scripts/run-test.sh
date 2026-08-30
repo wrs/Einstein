@@ -43,6 +43,14 @@ if [[ ! -f "$bin" ]]; then
 fi
 
 cd "$here/../../"
+
+# Hypervisor builds for guest tests get their own target dir (same
+# pattern as scripts/check-matrix.sh). Sharing the default dir used to
+# replace target/.../release/newton-hypervisor with a QEMU-features
+# build, which scripts/pi-upload.py would then upload to the Pi — a
+# ~1 MiB semihost binary that hangs silently before the first UART
+# byte. Costs one extra warm cache under target/guest-tests.
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target/guest-tests}"
 # iter-86: prefer the semihost-load mode by default. The hypervisor is
 # built once with `NH_GUEST_TEST=1` (no path); the test binary is loaded
 # at boot via Arm semihosting from the path passed in QEMU's
@@ -62,7 +70,7 @@ log=/tmp/guest-${platform}-${test_name}.out
 
 if [[ "$platform" == "qemu" ]]; then
     cargo build --release 2>&1 | tail -5
-    elf=target/aarch64-unknown-none-softfloat/release/newton-hypervisor
+    elf="$CARGO_TARGET_DIR"/aarch64-unknown-none-softfloat/release/newton-hypervisor
     img=/tmp/kernel8-guest-${test_name}.img
     objcopy="$(find "$(rustc --print sysroot)" -name llvm-objcopy -print -quit)"
     "$objcopy" -O binary "$elf" "$img"
@@ -102,7 +110,7 @@ else
     bin_abs="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
     NH_GUEST_TEST="$bin_abs" cargo build --release \
         --no-default-features --features "platform-fvp-base rom-717006 diag" 2>&1 | tail -5
-    elf=target/aarch64-unknown-none-softfloat/release/newton-hypervisor
+    elf="$CARGO_TARGET_DIR"/aarch64-unknown-none-softfloat/release/newton-hypervisor
     scripts/fvp --timeout=300 "$elf" > "$log" 2>&1 || true
 fi
 

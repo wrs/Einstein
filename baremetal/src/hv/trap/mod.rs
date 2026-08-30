@@ -52,6 +52,15 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
 
     crate::diag::trap_hist::record_sync(ec);
 
+    // IRQs stay masked for this whole handler (minus any
+    // `with_irqs_unmasked` window inside it); time it for the
+    // IRQ-latency stall watermark. Guard covers every return path.
+    let _stretch = crate::diag::stall::trap_stretch(
+        crate::diag::stall::KIND_SYNC,
+        ec,
+        read_sysreg!("elr_el2") as u32,
+    );
+
     match ec {
         EC_DATA_ABORT_LOWER => handle_data_abort(ctx, iss),
         EC_INSN_ABORT_LOWER => handle_instruction_abort(ctx, iss),
@@ -115,6 +124,15 @@ pub extern "C" fn trap_irq(ctx: &mut TrapContext) {
     let spsr = read_sysreg!("spsr_el2");
     let aarch32 = (spsr & (1 << 4)) != 0;
     let el2 = !aarch32 && ((spsr & 0b1100) == 0b1000);
+
+    // Stall-watermark stretch for the IRQ path itself (the tag's PC
+    // is where the interruptee was). Guard covers the USB fast-path
+    // early return.
+    let _stretch = crate::diag::stall::trap_stretch(
+        crate::diag::stall::KIND_IRQ,
+        0,
+        read_sysreg!("elr_el2") as u32,
+    );
 
     // Slim USB interrupt-IN fast path (real-hw touchscreen) — the
     // platform layer owns the BCM2835 pending-register decode and the

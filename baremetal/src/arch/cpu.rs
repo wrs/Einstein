@@ -334,6 +334,10 @@ pub fn with_irqs_unmasked<R>(f: impl FnOnce() -> R) -> R {
             out(reg) saved_daif,
             options(nomem, nostack, preserves_flags),
         );
+        // IRQ latency is no longer bounded by the enclosing handler
+        // once we unmask — close its stall-watermark stretch first so
+        // the window's open time isn't attributed to it.
+        crate::diag::stall::window_open();
         core::arch::asm!("msr daifclr, #2", options(nostack, preserves_flags));
     }
 
@@ -354,6 +358,12 @@ pub fn with_irqs_unmasked<R>(f: impl FnOnce() -> R) -> R {
             in(reg) saved_spsr,
             options(nostack, preserves_flags),
         );
+    }
+
+    // The remainder of the enclosing handler is a fresh masked
+    // stretch — unless this was a nested window and I stays clear.
+    if saved_daif & (1 << 7) != 0 {
+        crate::diag::stall::window_close();
     }
 
     r

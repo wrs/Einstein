@@ -1389,6 +1389,12 @@ pub fn on_mai_dma_done() {
     // on top of the 23.2 ms period puts worst-case healthy dt at
     // ~33 ms (the 30.06 ms lines in earlier captures were false
     // positives at a 30 ms threshold).
+    // Take-and-reset the IRQs-masked stretch watermark every period,
+    // so a late dispatch's line names the longest masked stretch
+    // since the PREVIOUS dispatch — which is the stall that delayed
+    // this one (the culprit handler exited before this IRQ could be
+    // taken, so its stretch is already recorded).
+    let stall = crate::diag::stall::take_max_us();
     if delta_us > 40_000 {
         // SAFETY: MMIO read.
         let ctl = unsafe { read_volatile(HDMI_MAI_CTL as *const u32) };
@@ -1399,15 +1405,20 @@ pub fn on_mai_dma_done() {
         let mai_head = MAI_TX_HEAD.load(Ordering::Acquire);
         let consumer = periods_done.saturating_mul(PERIOD_SLOTS as u64);
         let (dma_cs, dma_dbg) = crate::host::host_dma::mai_tx_diag();
+        let (stall_us, kind, ec, pc) = stall.unwrap_or((0, 0, 0, 0));
         kprintln!(
-            "audio_pi_hdmi: late period {} queued={} MAI_CTL={:#x} dt_us={} ahead={} dma_cs={:#x} dma_dbg={:#x}",
+            "audio_pi_hdmi: late period {} queued={} MAI_CTL={:#x} dt_us={} ahead={} dma_cs={:#x} dma_dbg={:#x} max_masked_us={} in={} ec={:#x} pc={:#x}",
             periods_done,
             queued,
             ctl,
             delta_us,
             mai_head.saturating_sub(consumer),
             dma_cs,
-            dma_dbg
+            dma_dbg,
+            stall_us,
+            crate::diag::stall::kind_label(kind),
+            ec,
+            pc
         );
     }
 }

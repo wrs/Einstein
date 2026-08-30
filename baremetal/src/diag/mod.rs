@@ -30,6 +30,8 @@ pub mod rep_print;
 // inside diag, so the module simply vanishes with the feature — and
 // with it the symbol-table rodata.
 #[cfg(nh_diag)]
+pub mod stall;
+#[cfg(nh_diag)]
 pub mod symbols;
 #[cfg(all(nh_diag, feature = "platform-fvp-base"))]
 pub mod tarmac;
@@ -154,6 +156,40 @@ pub mod tarmac {
 
     #[inline(always)]
     pub fn emit_stop() {}
+}
+
+#[cfg(not(nh_diag))]
+pub mod stall {
+    //! Stub: no IRQs-masked stretch watermark without `diag`.
+
+    pub const KIND_SYNC: u8 = 1;
+    pub const KIND_IRQ: u8 = 2;
+
+    pub struct StretchGuard(());
+
+    /// No-op guard; `Drop` is trivial so the whole mechanism
+    /// compiles out.
+    #[must_use]
+    #[inline(always)]
+    pub fn trap_stretch(_kind: u8, _ec: u32, _pc: u32) -> StretchGuard {
+        StretchGuard(())
+    }
+
+    #[inline(always)]
+    pub fn window_open() {}
+
+    #[inline(always)]
+    pub fn window_close() {}
+
+    #[inline(always)]
+    pub fn take_max_us() -> Option<(u64, u8, u32, u32)> {
+        None
+    }
+
+    #[inline(always)]
+    pub fn kind_label(_kind: u8) -> &'static str {
+        "?"
+    }
 }
 
 #[cfg(not(nh_diag))]

@@ -8,9 +8,10 @@
 //!    nhboot →  NHUP-OK <baud>\n         then both sides switch baud
 //!
 //!  framed messages (binary, little-endian, one tag byte first)
-//!    nhboot →  T  u32 n, n×{u32 adler32, u32 crc32}, u32 crc32(table)
+//!    nhboot →  T  u32 n, n×{u32 adler32, u32 crc32}, u32 crc32(entries)
+//!                 (one entry per full 4 KiB block of the old payload)
 //!    host   →  D  u32 offset, u32 len, u32 crc32, len bytes
-//!    host   →  C  u32 new_offset, u32 old_offset, u32 len
+//!    host   →  C  u32 new_offset, u32 old_offset, u32 len, u32 crc32(those 12 bytes)
 //!    host   →  K  u32 payload_len, u32 payload_crc
 //!    nhboot →  A  u32 echo                   (offset for D/C, len for K)
 //!    nhboot →  N  u32 echo, u8 reason
@@ -25,7 +26,7 @@
 //! payload byte, and the COMMIT CRC covers the whole payload, so
 //! anything not written is caught rather than assumed.
 
-use crate::crc::crc32;
+use crate::crc::{adler32, crc32};
 use crate::image::{self, HDR_SIZE, MAX_PAYLOAD, NEW_BASE};
 use crate::time::{elapsed_us, now_us};
 use crate::{persist, println, uart};
@@ -48,6 +49,11 @@ const MIN_BAUD: u32 = 115_200;
 const MAX_BAUD: u32 = 3_000_000;
 /// Largest DATA message the host may send.
 const MAX_DATA_LEN: u32 = 65_536;
+/// TABLE block size: the old payload is fingerprinted in blocks of
+/// this many bytes (the partial tail is not listed). The host mirrors
+/// it (`TABLE_BLOCK` in pi-upload.py) — it sizes the windows it
+/// slides over the new image, so the two must agree.
+const TABLE_BLOCK: usize = 4096;
 
 const TAG_TABLE: u8 = b'T';
 const TAG_DATA: u8 = b'D';
@@ -64,8 +70,10 @@ const NAK_UNKNOWN_TAG: u8 = 5;
 
 /// Drain RX for the handshake. With a bootable image (`image_ok`)
 /// this gives up after [`HANDSHAKE_WINDOW_US`] and returns `None`;
-/// without one it waits indefinitely. On a good `NHUP` line the baud
-/// has already been switched when this returns `Some(baud)`.
+/// without one it waits indefinitely. Returns the baud a good `NHUP`
+/// line asked for; the reply and the switch happen in [`receive`],
+/// after the TABLE has been prepared, because the host expects the
+/// `T` tag to be the first thing after the switch.
 pub fn handshake_window(image_ok: bool) -> Option<u32> {
     let start = now_us();
     let mut last_note = start;
@@ -85,9 +93,6 @@ pub fn handshake_window(image_ok: bool) -> Option<u32> {
                     synced = false;
                     match parse_handshake(&line[..n]) {
                         Some(baud) if (MIN_BAUD..=MAX_BAUD).contains(&baud) => {
-                            println!("NHUP-OK {}", baud);
-                            uart::set_baud(baud);
-                            drain_until_quiet(HANDSHAKE_SETTLE_US);
                             return Some(baud);
                         }
                         Some(_) => println!("NHUP-ERR baud"),
@@ -138,13 +143,20 @@ fn parse_handshake(line: &[u8]) -> Option<u32> {
 /// the COPY source. Returns the committed payload length; the new
 /// container at [`NEW_BASE`] carries a freshly written header, and the
 /// console is back at 115200.
-pub fn receive(old: Option<(usize, u32)>) -> u32 {
+pub fn receive(old: Option<(usize, u32)>, baud: u32) -> u32 {
     // Clear the header so a stale container can't validate by
     // accident; the payload area is covered by the COMMIT CRC.
     // SAFETY: NEW_BASE..+HDR_SIZE is nhboot's own staging RAM.
     unsafe { core::slice::from_raw_parts_mut(NEW_BASE as *mut u8, HDR_SIZE).fill(0) };
 
-    send_table();
+    // Fingerprint the old image while the console is still a console
+    // (the timing line is the last free-form text before the framed
+    // stream), then answer the hello and switch.
+    let n = build_table(old);
+    println!("NHUP-OK {}", baud);
+    uart::set_baud(baud);
+    drain_until_quiet(HANDSHAKE_SETTLE_US);
+    send_table(n);
 
     // Nothing is printed from here until the COMMIT is acknowledged:
     // the console *is* the protocol link, and the host parses every
@@ -178,7 +190,7 @@ pub fn receive(old: Option<(usize, u32)>) -> u32 {
                 ack(offset);
             }
             TAG_COPY => {
-                let mut hdr = [0u8; 12];
+                let mut hdr = [0u8; 16];
                 if read_exact(&mut hdr).is_err() {
                     nak(0, NAK_RX_TIMEOUT);
                     continue;
@@ -186,6 +198,14 @@ pub fn receive(old: Option<(usize, u32)>) -> u32 {
                 let new_off = u32_at(&hdr, 0);
                 let old_off = u32_at(&hdr, 4);
                 let len = u32_at(&hdr, 8);
+                // A COPY carries no payload for the COMMIT CRC to
+                // vouch for until the very end, so its header gets
+                // its own CRC: a line error here is retried now, not
+                // discovered as an unexplained COMMIT failure.
+                if crc32(&hdr[..12]) != u32_at(&hdr, 12) {
+                    nak(new_off, NAK_BAD_CRC);
+                    continue;
+                }
                 let Some((old_base, old_len)) = old else {
                     nak(new_off, NAK_NO_OLD_IMAGE);
                     continue;
@@ -255,13 +275,60 @@ pub fn receive(old: Option<(usize, u32)>) -> u32 {
     }
 }
 
-/// TABLE: block fingerprints of the old payload for the host's delta
-/// search. Empty until the delta phase — `n = 0` and the CRC of zero
-/// bytes.
-fn send_table() {
+/// TABLE entries live in .bss: `{adler32, crc32}` per full
+/// [`TABLE_BLOCK`] of the old payload, at most `MAX_PAYLOAD / TABLE_BLOCK`
+/// of them (32 KiB — too much for the 16 KiB stack).
+struct TableCell(core::cell::UnsafeCell<[[u32; 2]; MAX_PAYLOAD / TABLE_BLOCK]>);
+// SAFETY: single core, no interrupts; only `build_table`/`send_table` touch it.
+unsafe impl Sync for TableCell {}
+static TABLE: TableCell = TableCell(core::cell::UnsafeCell::new([[0; 2]; MAX_PAYLOAD / TABLE_BLOCK]));
+
+/// Fingerprint the old payload into [`TABLE`]; returns the entry
+/// count (0 without a valid old image). Each entry is the
+/// `{adler32, crc32}` of one full block, so the host can find where
+/// the new image repeats it at *any* byte offset (the 8 MiB ROM blob
+/// shifts whenever the code before it grows) and replace those
+/// stretches with COPY messages. Uncached reads make the pass a few
+/// hundred ms on the A53; the timing is printed for the record.
+fn build_table(old: Option<(usize, u32)>) -> usize {
+    let Some((base, len)) = old else { return 0 };
+    let n = len as usize / TABLE_BLOCK;
+    let t0 = now_us();
+    // SAFETY: see `TableCell`.
+    let table = unsafe { &mut *TABLE.0.get() };
+    for (j, entry) in table.iter_mut().enumerate().take(n) {
+        // SAFETY: `j < len / TABLE_BLOCK`, inside the validated old payload.
+        let block: &[u8] = unsafe {
+            core::slice::from_raw_parts(
+                (base + HDR_SIZE + j * TABLE_BLOCK) as *const u8,
+                TABLE_BLOCK,
+            )
+        };
+        *entry = [adler32(block), crc32(block)];
+    }
+    println!("xfer: table n={} in {} ms", n, elapsed_us(t0) / 1000);
+    n
+}
+
+/// Send the `T` message: `u32 n`, the `n` entries, then the CRC-32 of
+/// the `8·n` entry bytes (the `n` field excluded; with no old image
+/// that is the CRC of nothing).
+fn send_table(n: usize) {
+    // SAFETY: see `TableCell`; `build_table` ran first.
+    let table = unsafe { &*TABLE.0.get() };
     uart::putc(TAG_TABLE);
-    put_u32(0);
-    put_u32(crc32(&[]));
+    put_u32(n as u32);
+    let mut table_crc = 0xFFFF_FFFFu32;
+    for entry in table.iter().take(n) {
+        for v in entry {
+            let bytes = v.to_le_bytes();
+            table_crc = crate::crc::crc32_update(table_crc, &bytes);
+            for b in bytes {
+                uart::putc(b);
+            }
+        }
+    }
+    put_u32(table_crc ^ 0xFFFF_FFFF);
 }
 
 fn ack(echo: u32) {

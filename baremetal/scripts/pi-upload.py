@@ -311,7 +311,14 @@ NAK_REASONS = {1: "bad crc", 2: "bad offset/len", 3: "rx timeout", 4: "no old im
                5: "unknown tag"}
 DATA_CHUNK = 65_536
 MAX_RETRIES = 3
+# Also covers a COPY of the whole ~10 MiB payload: an uncached memcpy
+# on the A53 takes ~0.3 s.
 ACK_TIMEOUT = 10.0
+# Block size of nhboot's TABLE (`TABLE_BLOCK` in xfer.rs): the old
+# payload is fingerprinted per full block, and the delta search slides
+# a window of the same size over the new payload.
+TABLE_BLOCK = 4096
+ADLER_MOD = 65_521
 # After the COMMIT ACK nhboot writes the card: a first-time create of the
 # 16 MiB file through the FAT layer runs at PIO speed (~700 KB/s → ~25 s);
 # an in-place rewrite of the changed sectors is a few seconds. Leave a
@@ -372,11 +379,17 @@ def send_msg(link: Link, tag: bytes, header: bytes, data: bytes, echo: int,
     """Stop-and-wait with retries. `corrupt` flips one data byte on the
     first attempt (fault injection for --debug-corrupt)."""
     for attempt in range(1, MAX_RETRIES + 2):
-        body = data
+        body, head = data, header
         if corrupt and attempt == 1:
-            body = bytes([data[0] ^ 0x55]) + data[1:]
+            # A DATA message: flip a payload byte. A COPY: flip a
+            # header byte (it has no payload; its header CRC must
+            # catch this).
+            if data:
+                body = bytes([data[0] ^ 0x55]) + data[1:]
+            else:
+                head = bytes([header[0] ^ 0x55]) + header[1:]
             print(f"xfer: corrupting {what} on purpose", flush=True)
-        link.write(tag + header + body)
+        link.write(tag + head + body)
         try:
             ok, got, reason = recv_ack(link)
         except TimeoutError as e:
@@ -393,23 +406,175 @@ def send_msg(link: Link, tag: bytes, header: bytes, data: bytes, echo: int,
     raise ProtocolError(f"{what}: gave up after {MAX_RETRIES} retries")
 
 
+# ---------------------------------------------------------------- delta
+# rsync in miniature. nhboot's TABLE lists {adler32, crc32} for every
+# full TABLE_BLOCK of the image it already holds. We evaluate the same
+# adler32 for the window starting at *every byte offset* of the new
+# payload (vectorised prefix sums — a pure-Python walk over 10 MiB is
+# far too slow), verify the candidates the weak hash proposes with
+# crc32, and turn the matches into COPY runs; whatever is left is sent
+# as DATA. Offset independence is the point: the 8 MiB ROM+REx blob
+# inside the hypervisor image shifts whenever the code before it
+# grows, and would otherwise be re-sent every build.
+
+@dataclass(frozen=True)
+class Copy:
+    new_off: int
+    old_off: int
+    len: int
+
+
+@dataclass(frozen=True)
+class Data:
+    new_off: int
+    len: int
+
+
+def window_adler32(new: bytes, block: int):
+    """adler32 of new[p:p+block] for every p in [0, len-block], as a
+    uint32 numpy array. With x the bytes as int64:
+        a(p) = 1 + Σ x[p..p+B)
+        b(p) = B + Σ_{i<B} (B-i)·x[p+i]
+             = B + (p+B)·Σ x[p..p+B) - Σ k·x[k] for k in [p, p+B)
+    int64 is safe: 255·4096·(10·2^20) < 2^63."""
+    import numpy as np
+
+    x = np.frombuffer(new, dtype=np.uint8).astype(np.int64)
+    n = len(x)
+    if n < block:
+        return np.zeros(0, dtype=np.uint32)
+    s1 = np.concatenate(([0], np.cumsum(x)))
+    s2 = np.concatenate(([0], np.cumsum(np.arange(n, dtype=np.int64) * x)))
+    p = np.arange(n - block + 1, dtype=np.int64)
+    win_sum = s1[p + block] - s1[p]
+    win_ksum = s2[p + block] - s2[p]
+    a = (1 + win_sum) % ADLER_MOD
+    b = (block + (p + block) * win_sum - win_ksum) % ADLER_MOD
+    return ((b << 16) | a).astype(np.uint32)
+
+
+def check_window_adler32(new: bytes, count: int = 5) -> None:
+    """Spot-check the vectorised adler32 against zlib on random windows
+    (cheap; runs once per upload so a numpy dtype slip can't silently
+    turn every block into a DATA op)."""
+    import random
+
+    if len(new) < TABLE_BLOCK:
+        return
+    ad = window_adler32(new, TABLE_BLOCK)
+    for p in random.sample(range(len(new) - TABLE_BLOCK + 1), min(count, len(ad))):
+        want = zlib.adler32(new[p : p + TABLE_BLOCK])
+        if int(ad[p]) != want:
+            raise AssertionError(f"window_adler32 mismatch at {p}: {ad[p]:#x} != {want:#x}")
+
+
+def compute_delta(new: bytes, table: list[tuple[int, int]]) -> list[Copy | Data]:
+    """COPY/DATA ops that rebuild `new` from the old payload `table`
+    describes. Greedy: at a verified block match, extend the COPY while
+    the next window matches the next old block; otherwise the byte is
+    DATA and the walk moves on to the next candidate position."""
+    import numpy as np
+
+    b = TABLE_BLOCK
+    n = len(new)
+    ops: list[Copy | Data] = []
+    if not table or n < b:
+        return [Data(off, min(DATA_CHUNK, n - off)) for off in range(0, n, DATA_CHUNK)]
+
+    by_adler: dict[int, list[tuple[int, int]]] = {}
+    for j, (ad, crc) in enumerate(table):
+        by_adler.setdefault(ad, []).append((j, crc))
+    ad_all = window_adler32(new, b)
+    candidate = np.isin(ad_all, np.fromiter(by_adler.keys(), dtype=np.uint32))
+    cand_pos = np.flatnonzero(candidate)  # ascending window starts
+
+    def match_at(p: int) -> int | None:
+        """Old block index whose crc verifies at new offset p, or None."""
+        if p + b > n or not candidate[p]:
+            return None
+        crc = zlib.crc32(new[p : p + b])
+        for j, c in by_adler[int(ad_all[p])]:
+            if c == crc:
+                return j
+        return None
+
+    def matches_block(p: int, j: int) -> bool:
+        """Does old block j (specifically — an image has many identical
+        zero blocks, and `match_at` would name the first of them) sit
+        at new offset p?"""
+        if j >= len(table) or p + b > n or not candidate[p]:
+            return False
+        ad, crc = table[j]
+        return int(ad_all[p]) == ad and zlib.crc32(new[p : p + b]) == crc
+
+    def flush_data(start: int, end: int) -> None:
+        for off in range(start, end, DATA_CHUNK):
+            ops.append(Data(off, min(DATA_CHUNK, end - off)))
+
+    p = 0
+    data_start = 0
+    ci = 0  # index into cand_pos
+    while p + b <= n:
+        # Skip to the next candidate at or after p.
+        ci = int(np.searchsorted(cand_pos, p))
+        if ci >= len(cand_pos):
+            break
+        q = int(cand_pos[ci])
+        j = match_at(q)
+        if j is None:
+            p = q + 1
+            continue
+        # A verified match at q for old block j: extend.
+        run_start, run_j, run_blocks = q, j, 1
+        while matches_block(q + run_blocks * b, run_j + run_blocks):
+            run_blocks += 1
+        if run_start > data_start:
+            flush_data(data_start, run_start)
+        ops.append(Copy(run_start, run_j * b, run_blocks * b))
+        p = run_start + run_blocks * b
+        data_start = p
+    if data_start < n:
+        flush_data(data_start, n)
+    return ops
+
+
 def upload(link: Link, console: Console, payload: bytes, baud: int,
-           corrupt_msg: int = 0) -> None:
+           corrupt_msg: int = 0, full: bool = False) -> None:
     FORMAT.check_payload(payload)
     t0 = time.monotonic()
     handshake(link, console, baud, timeout=30)
     table = read_table(link)
     print(f"xfer: handshake ok at {baud} baud; old image table has {len(table)} blocks",
           flush=True)
+    if full or not table:
+        ops: list[Copy | Data] = [Data(off, min(DATA_CHUNK, len(payload) - off))
+                                  for off in range(0, len(payload), DATA_CHUNK)]
+    else:
+        td = time.monotonic()
+        check_window_adler32(payload)
+        ops = compute_delta(payload, table)
+        td = time.monotonic() - td
+        copied = sum(op.len for op in ops if isinstance(op, Copy))
+        sent = sum(op.len for op in ops if isinstance(op, Data))
+        print(f"delta: {len(ops)} ops, {copied} bytes copied, {sent} bytes sent "
+              f"({100 * sent / len(payload):.1f}%), computed in {td:.2f} s", flush=True)
     t1 = time.monotonic()
-    n = 0
-    for off in range(0, len(payload), DATA_CHUNK):
-        chunk = payload[off : off + DATA_CHUNK]
-        n += 1
-        if off and off % (1 << 20) == 0:
-            print(f"xfer: {off >> 10} KiB sent, {time.monotonic() - t1:.1f} s", flush=True)
-        send_msg(link, TAG_DATA, struct.pack("<III", off, len(chunk), zlib.crc32(chunk)),
-                 chunk, off, f"DATA #{n} @{off:#x}", corrupt=(n == corrupt_msg))
+    sent_bytes = 0
+    for n, op in enumerate(ops, 1):
+        if sent_bytes and sent_bytes % (1 << 20) < DATA_CHUNK and isinstance(op, Data):
+            print(f"xfer: {sent_bytes >> 10} KiB sent, {time.monotonic() - t1:.1f} s",
+                  flush=True)
+        if isinstance(op, Copy):
+            hdr = struct.pack("<III", op.new_off, op.old_off, op.len)
+            send_msg(link, TAG_COPY, hdr + struct.pack("<I", zlib.crc32(hdr)), b"",
+                     op.new_off, f"COPY #{n} @{op.new_off:#x}", corrupt=(n == corrupt_msg))
+        else:
+            chunk = payload[op.new_off : op.new_off + op.len]
+            send_msg(link, TAG_DATA,
+                     struct.pack("<III", op.new_off, op.len, zlib.crc32(chunk)),
+                     chunk, op.new_off, f"DATA #{n} @{op.new_off:#x}",
+                     corrupt=(n == corrupt_msg))
+            sent_bytes += op.len
     send_msg(link, TAG_COMMIT, struct.pack("<II", len(payload), zlib.crc32(payload)), b"",
              len(payload), "COMMIT")
     t2 = time.monotonic()
@@ -418,9 +583,9 @@ def upload(link: Link, console: Console, payload: bytes, baud: int,
     link.set_baud(CONSOLE_BAUD)
     console.pending = b""
     dt = t2 - t1
-    print(f"\nxfer: {len(payload)} bytes in {n} messages, {dt:.1f} s "
-          f"({len(payload) / dt / 1024:.0f} KiB/s), {t2 - t0:.1f} s incl. handshake",
-          flush=True)
+    print(f"\nxfer: {len(payload)} bytes as {len(ops)} messages, {sent_bytes} sent, "
+          f"{dt:.1f} s ({sent_bytes / dt / 1024:.0f} KiB/s of sent bytes), "
+          f"{t2 - t0:.1f} s incl. handshake", flush=True)
 
 
 # -------------------------------------------------------------- capture
@@ -458,6 +623,8 @@ def main() -> int:
                      help="don't toggle the HomeKit switch first")
     run.add_argument("--no-upload", action="store_true",
                      help="just (power-cycle and) capture the console")
+    run.add_argument("--full", action="store_true",
+                     help="send every byte instead of a delta against the image on the card")
     run.add_argument("--until", metavar="REGEX",
                      help="exit 0 when a console line matches")
     run.add_argument("--timeout", type=float, default=0,
@@ -492,7 +659,8 @@ def main() -> int:
         if not args.no_power_cycle:
             power_cycle(link, console)
         if payload is not None:
-            upload(link, console, payload, args.baud, corrupt_msg=args.debug_corrupt)
+            upload(link, console, payload, args.baud, corrupt_msg=args.debug_corrupt,
+                   full=args.full)
         return capture(link, console, args.until, args.timeout)
     except (ProtocolError, LinkError, TimeoutError, OSError) as e:
         print(f"\npi-upload: error: {e}", file=sys.stderr, flush=True)

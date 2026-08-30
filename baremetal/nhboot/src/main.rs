@@ -107,8 +107,8 @@ pub extern "C" fn main(dtb: u64, entered_at: u64) -> ! {
     // first second; otherwise a valid image boots. Without a valid
     // image the window never closes.
     let (base, len) = match xfer::handshake_window(old.is_some()) {
-        Some(_baud) => {
-            let len = xfer::receive(old);
+        Some(baud) => {
+            let len = xfer::receive(old, baud);
             match image::inspect(image::NEW_BASE) {
                 ImageState::Valid { len: l, .. } if l == len => (image::NEW_BASE, len),
                 other => {

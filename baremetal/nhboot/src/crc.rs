@@ -79,3 +79,26 @@ const fn crc32_sw(mut crc: u32, data: &[u8]) -> u32 {
 
 // The check vector every CRC-32 implementation is tested against.
 const _: () = assert!(crc32_sw(0xFFFF_FFFF, b"123456789") ^ 0xFFFF_FFFF == 0xCBF4_3926);
+
+/// Adler-32 (zlib's: `a` starts at 1, `b` at 0, both mod 65521,
+/// result `b << 16 | a`). The weak, offset-independent fingerprint
+/// in the TABLE message — cheap enough to compute for every 4 KiB
+/// block of a 10 MiB image, and the host can evaluate it at every
+/// byte offset of the new image with prefix sums.
+pub const fn adler32(data: &[u8]) -> u32 {
+    const MOD: u32 = 65_521;
+    let mut a: u32 = 1;
+    let mut b: u32 = 0;
+    // `while`: const fn. The modulo per byte keeps this trivially
+    // overflow-free; the bootloader is not throughput-bound here.
+    let mut i = 0;
+    while i < data.len() {
+        a = (a + data[i] as u32) % MOD;
+        b = (b + a) % MOD;
+        i += 1;
+    }
+    (b << 16) | a
+}
+
+// zlib's documented example.
+const _: () = assert!(adler32(b"Wikipedia") == 0x11E6_0398);

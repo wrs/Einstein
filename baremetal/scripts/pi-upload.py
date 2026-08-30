@@ -312,6 +312,11 @@ NAK_REASONS = {1: "bad crc", 2: "bad offset/len", 3: "rx timeout", 4: "no old im
 DATA_CHUNK = 65_536
 MAX_RETRIES = 3
 ACK_TIMEOUT = 10.0
+# After the COMMIT ACK nhboot writes the card: a first-time create of the
+# 16 MiB file through the FAT layer runs at PIO speed (~700 KB/s → ~25 s);
+# an in-place rewrite of the changed sectors is a few seconds. Leave a
+# wide margin — a slow card must not be mistaken for a hang.
+DONE_TIMEOUT = 300.0
 
 
 class ProtocolError(Exception):
@@ -408,7 +413,7 @@ def upload(link: Link, console: Console, payload: bytes, baud: int,
     send_msg(link, TAG_COMMIT, struct.pack("<II", len(payload), zlib.crc32(payload)), b"",
              len(payload), "COMMIT")
     t2 = time.monotonic()
-    if not wait_for(link, console, b"DONE", 90):
+    if not wait_for(link, console, b"DONE", DONE_TIMEOUT):
         raise ProtocolError("no DONE after COMMIT")
     link.set_baud(CONSOLE_BAUD)
     console.pending = b""

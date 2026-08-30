@@ -22,7 +22,10 @@
 
 mod crc;
 mod image;
+mod mailbox;
 mod panic;
+mod persist;
+mod sd;
 mod time;
 mod uart;
 mod xfer;

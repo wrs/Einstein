@@ -14,7 +14,8 @@
 //!    host   →  K  u32 payload_len, u32 payload_crc
 //!    nhboot →  A  u32 echo                   (offset for D/C, len for K)
 //!    nhboot →  N  u32 echo, u8 reason
-//!  then, after the K's ACK:  DONE\n  (text), baud back to 115200.
+//!  then, after the K's ACK: text lines (the SD write's progress),
+//!  DONE\n, and the baud goes back to 115200.
 //! ```
 //!
 //! The new container is assembled at [`image::NEW_BASE`] while the
@@ -27,7 +28,7 @@
 use crate::crc::crc32;
 use crate::image::{self, HDR_SIZE, MAX_PAYLOAD, NEW_BASE};
 use crate::time::{elapsed_us, now_us};
-use crate::{println, uart};
+use crate::{persist, println, uart};
 
 /// How long a valid image waits for a host before booting.
 const HANDSHAKE_WINDOW_US: u64 = 1_000_000;
@@ -226,7 +227,22 @@ pub fn receive(old: Option<(usize, u32)>) -> u32 {
                 }
                 image::write_header(NEW_BASE, len, crc);
                 ack(len);
+                // From here on the console is plain text again; the
+                // host echoes it while it waits for DONE.
                 println!("xfer: commit ok, {} bytes, crc32 {:08x}", len, crc);
+                match persist::persist(NEW_BASE, len, old.map(|(b, _)| b)) {
+                    Ok(st) => println!(
+                        "persist: wrote {}/{} sectors{} in {} ms",
+                        st.sectors_written,
+                        st.sectors_total,
+                        if st.created { " (file created)" } else { "" },
+                        st.ms
+                    ),
+                    Err(e) => println!(
+                        "persist: FAILED ({}) — image boots from RAM only this time",
+                        e
+                    ),
+                }
                 println!("DONE");
                 uart::set_baud(uart::CONSOLE_BAUD);
                 return len;

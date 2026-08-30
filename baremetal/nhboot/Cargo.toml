@@ -17,6 +17,10 @@ test = false
 bench = false
 
 [dependencies]
+# FAT32 read+write on the boot partition, for rewriting HYPERV.IMG in
+# place (persist.rs). The hypervisor's vendored copy, with its
+# `file_cluster_lbas` addition — see vendor/embedded-sdmmc/VENDOR.md.
+embedded-sdmmc = { path = "../vendor/embedded-sdmmc", default-features = false }
 
 [profile.dev]
 panic = "abort"

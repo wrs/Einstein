@@ -247,52 +247,64 @@ fn push_blit(ev: &BlitEvent, _payload: &[u8]) {
     let pitch_words = (fb.pitch / 4) as usize;
     let panel_ptr = fb.pa as *mut u32;
 
-    for py in p_top..p_bottom {
-        let ny_q = py * inv_y;
-        let ny_i = (ny_q >> 16) as usize;
-        let ny_f = (ny_q >> 8) & 0xFF;
-        let panel_y = py as usize + offset_y;
+    // The bilinear upscale runs 4 guest-FB samples + one volatile
+    // panel write per painted pixel, plus a row-range cache flush — a
+    // full-screen Newton update measures 22–33 ms (the EL2 stall
+    // watermark attributed the audio "late period" stalls to exactly
+    // this handler). That is far past the audio pump's tolerance, so
+    // paint with IRQs unmasked, the same shape as the flash save: the
+    // slim EL2 ISR keeps CNTHP and the MAI DMA refills serviced while
+    // we loop. Nothing here touches slim-ISR-owned state (panel FB
+    // writes, guest FB reads, pi_fb scaling atomics), and the guest
+    // is not running while EL2 paints, so nothing re-enters.
+    crate::arch::cpu::with_irqs_unmasked(|| {
+        for py in p_top..p_bottom {
+            let ny_q = py * inv_y;
+            let ny_i = (ny_q >> 16) as usize;
+            let ny_f = (ny_q >> 8) & 0xFF;
+            let panel_y = py as usize + offset_y;
 
-        for px in p_left..p_right {
-            let nx_q = px * inv_x;
-            let nx_i = (nx_q >> 16) as usize;
-            let nx_f = (nx_q >> 8) & 0xFF;
-            let panel_x = px as usize + offset_x;
+            for px in p_left..p_right {
+                let nx_q = px * inv_x;
+                let nx_i = (nx_q >> 16) as usize;
+                let nx_f = (nx_q >> 8) & 0xFF;
+                let panel_x = px as usize + offset_x;
 
-            // Sample 4 Newton neighbors. `newton_gray` clamps at the
-            // far edge so we don't read past the framebuffer.
-            let g00 = newton_gray(guest_fb, stride, nx_i, ny_i);
-            let g01 = newton_gray(guest_fb, stride, nx_i + 1, ny_i);
-            let g10 = newton_gray(guest_fb, stride, nx_i, ny_i + 1);
-            let g11 = newton_gray(guest_fb, stride, nx_i + 1, ny_i + 1);
+                // Sample 4 Newton neighbors. `newton_gray` clamps at the
+                // far edge so we don't read past the framebuffer.
+                let g00 = newton_gray(guest_fb, stride, nx_i, ny_i);
+                let g01 = newton_gray(guest_fb, stride, nx_i + 1, ny_i);
+                let g10 = newton_gray(guest_fb, stride, nx_i, ny_i + 1);
+                let g11 = newton_gray(guest_fb, stride, nx_i + 1, ny_i + 1);
 
-            // Bilinear blend in 8-bit grayscale. Weights are Q0.8
-            // (so each multiply stays in u32; the final >> 16
-            // collapses the two Q0.8 levels back to 8-bit).
-            let top = g00 * (256 - nx_f) + g01 * nx_f;
-            let bot = g10 * (256 - nx_f) + g11 * nx_f;
-            let g = (top * (256 - ny_f) + bot * ny_f) >> 16;
-            let g8 = g.min(255) as u8;
-            let color = u32::from_le_bytes([g8, g8, g8, 0]);
+                // Bilinear blend in 8-bit grayscale. Weights are Q0.8
+                // (so each multiply stays in u32; the final >> 16
+                // collapses the two Q0.8 levels back to 8-bit).
+                let top = g00 * (256 - nx_f) + g01 * nx_f;
+                let bot = g10 * (256 - nx_f) + g11 * nx_f;
+                let g = (top * (256 - ny_f) + bot * ny_f) >> 16;
+                let g8 = g.min(255) as u8;
+                let color = u32::from_le_bytes([g8, g8, g8, 0]);
 
-            // SAFETY: panel_x < painted_w + offset_x ≤ fb.width,
-            // panel_y < painted_h + offset_y ≤ fb.height (set in
-            // `init`). pitch_words = fb.pitch / 4.
-            unsafe {
-                panel_ptr
-                    .add(panel_y * pitch_words + panel_x)
-                    .write_volatile(color);
+                // SAFETY: panel_x < painted_w + offset_x ≤ fb.width,
+                // panel_y < painted_h + offset_y ≤ fb.height (set in
+                // `init`). pitch_words = fb.pitch / 4.
+                unsafe {
+                    panel_ptr
+                        .add(panel_y * pitch_words + panel_x)
+                        .write_volatile(color);
+                }
             }
         }
-    }
 
-    // Flush the rows we touched so the VC scan picks them up.
-    let flush_y0 = p_top as usize + offset_y;
-    let flush_y1 = ((p_bottom as usize) + offset_y).min(fb.height as usize);
-    let row_bytes_panel = pitch_words * 4;
-    let flush_pa = fb.pa.wrapping_add((flush_y0 * row_bytes_panel) as u64);
-    let flush_len = (flush_y1 - flush_y0) * row_bytes_panel;
-    crate::arch::cpu::dc_civac_range(flush_pa, flush_len);
+        // Flush the rows we touched so the VC scan picks them up.
+        let flush_y0 = p_top as usize + offset_y;
+        let flush_y1 = ((p_bottom as usize) + offset_y).min(fb.height as usize);
+        let row_bytes_panel = pitch_words * 4;
+        let flush_pa = fb.pa.wrapping_add((flush_y0 * row_bytes_panel) as u64);
+        let flush_len = (flush_y1 - flush_y0) * row_bytes_panel;
+        crate::arch::cpu::dc_civac_range(flush_pa, flush_len);
+    });
 }
 
 /// 8-bit grayscale value at Newton FB pixel (x, y). Clamps at the

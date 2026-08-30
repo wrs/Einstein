@@ -95,17 +95,17 @@ build combinations in `scripts/check-matrix.sh` pass.
    windows per second. Until then, §4.4's TLBI rule stands: the DC
    toggle without TLB maintenance corrupts guest memory.
 
-10. **Attribute the EL2 IRQ-masked stalls.** Serial captures show
-    MAI period-IRQ dispatch gaps of 40-71 ms (vs the 23 ms period),
-    i.e. something runs at EL2 with IRQs masked for 2-3 periods,
-    clustered with bursts of guest activity. `pi_hdmi` now rides
-    them out (CONBLK-authoritative consumer + 4-period cushion,
-    which also removed the old non-converging period estimator),
-    but the stalls themselves are unexplained. Candidates: the
-    item-9 `SCTLR.M`-window DC-toggle/TLBI/`fix_stage1_xn_bits`
-    path, the flash-persist dirty scan. Instrument: extend the
-    "late period" line with the longest single IRQs-masked stretch
-    since the previous period and the last sync-trap EC/PC.
+10. **Cheapen the pi_fb blit upscale.** The EL2 stall watermark
+    (`diag::stall`, reported on the `late period` line) attributed
+    the 40-71 ms audio IRQ-dispatch gaps to `pi_fb::push_blit`: the
+    software-bilinear panel repaint runs 22-33 ms of EL2 CPU for a
+    full-screen Newton update. It now paints inside
+    `with_irqs_unmasked` so audio/timer IRQs are serviced mid-blit,
+    but the CPU cost itself remains — it stalls the *guest* for the
+    duration and bounds UI repaint rate. Options if that matters:
+    precomputed per-axis sample/weight tables, nearest-neighbor for
+    small rects, or the VC4 HVS scaler. Watch new captures for any
+    other `max_masked_us` culprit the watermark surfaces.
 
 Real-hardware specifics (cores 1–3 left parked, snapshot ring deferred
 on hardware, thermal re-verification) are tracked in

@@ -110,8 +110,25 @@ unsafe fn configure_el2_traps() {
 /// suppressed from EL2's side (DDI 0487 D13.2.50), which breaks every
 /// guest VA→IPA that differs from identity — e.g. the post-MMU UND
 /// trampoline's save slot at VA 0x0C00_4F00 → IPA 0x0400_5F00.
+///
+/// Every change is followed by `TLBI VMALLE1`. DDI 0487 (HCR_EL2.DC):
+/// "This bit is permitted to be cached in a TLB", and the general TLB
+/// maintenance requirements: "software must perform TLB maintenance
+/// after updating the System registers if the update means that the
+/// TLB might hold information that applies to a current translation
+/// context, but is no longer valid for that context" — control fields
+/// so described may be cached "even when any or all of the stages of
+/// translation are disabled". The Newton kernel toggles its MMU off
+/// and on around every page-table read and write
+/// (`LoadFromPhysAddress` / `StoreToPhysAddress`); without this
+/// invalidation a stage-1 entry cached under DC=0 serves the MMU-off
+/// "physical" access, which then reads or writes whatever the kernel
+/// maps at that VA instead of the page table (`HIGHLEVEL.md`; observed
+/// on hardware: `LoadFromPhysAddress(0x04001000)` returned ROM[0x1000]
+/// through the kernel's VA 0x0400_0000 → ROM section).
 pub fn set_dc_for_stage1_off(enable: bool) {
-    // SAFETY: single bit in HCR_EL2; read-modify-write, ISB barrier.
+    // SAFETY: single bit in HCR_EL2; read-modify-write, then TLB
+    // invalidation for the EL1&0 regime, with the required barriers.
     unsafe {
         let mut hcr: u64;
         asm!("mrs {}, hcr_el2", out(reg) hcr,
@@ -121,7 +138,13 @@ pub fn set_dc_for_stage1_off(enable: bool) {
         } else {
             hcr &= !(1u64 << 12);
         }
-        asm!("msr hcr_el2, {}", "isb", in(reg) hcr,
+        asm!(
+            "msr hcr_el2, {}",
+            "isb",
+            "tlbi vmalle1",
+            "dsb ish",
+            "isb",
+            in(reg) hcr,
             options(nostack, preserves_flags));
     }
 }

@@ -162,6 +162,46 @@ RAM pages additionally carry a stage-2 RW+XN ↔ RO+X state machine
 rewrites it, so a page flips to executable on first fetch and back to
 writable on first write, with a code rescan in between.
 
+### 4.4 MMU-off windows and `HCR_EL2.DC`
+
+The kernel performs every "physical" memory access — above all its
+page-table reads and writes — by turning its stage-1 MMU off and back
+on around the access (ROM routines `LoadFromPhysAddress` `0x18CA4`,
+`StoreToPhysAddress` `0x18CE0`, and the byte variants `0x18D1C` /
+`0x18D58`); once the store is busy there are thousands of these
+windows per second. Both `SCTLR.M` writes trap via `HCR_EL2.TVM` and
+reach the `on_stage1_mmu_disable` / `on_stage1_mmu_enable` hooks
+(`src/newton/os.rs`), which call `hv::guest::set_dc_for_stage1_off`:
+
+- **Falling edge (M=1→0):** set `HCR_EL2.DC`, so the MMU-off data
+  accesses are Normal-WB cacheable — coherent with the hypervisor's
+  own view of DRAM and with the stage-1 walker's WB attributes —
+  instead of Non-cacheable/Device.
+- **Rising edge (M=0→1):** clear DC — with DC=1, `SCTLR_EL1.M` behaves
+  as 0 from EL2's side (DDI 0487 D13.2.50), which would break every
+  non-identity guest mapping — then re-run the descriptor
+  normalisation of §4.3 (`fix_stage1_xn_bits` + the scratch-pool L1
+  section), since the kernel may have rewritten descriptors during
+  the window.
+
+**Every DC change is followed by `TLBI VMALLE1; DSB ISH; ISB`
+(`hv::guest::set_dc_for_stage1_off`). Do not "optimise away" that
+TLBI.** Per DDI 0487, `HCR_EL2.DC` "is permitted to be cached in a
+TLB"; a TLB may cache such control fields "even when any or all of
+the stages of translation are disabled"; and "software must perform
+TLB maintenance after updating the System registers" when the update
+invalidates what a TLB may hold for the current translation context.
+Without the invalidation, a stage-1 entry cached under DC=0 can serve
+a later MMU-off access: the kernel's "physical" `ldr`/`str` is then
+translated through its own VA mapping instead of flat-mapped — a
+page-table read returns a data page's contents as a descriptor, and a
+page-table write lands in whatever data page the kernel maps at that
+address. On the Pi Zero 2 W this was the root cause of months of
+intermittent, timing-dependent heap/page-table/store corruption
+(`docs/project-history.md` §9). QEMU does not cache DC in a TLB and
+never reproduces the failure mode, so a hardware-only symptom in this
+area should be checked against this rule first.
+
 ## 5. CPU and mode handling
 
 The guest executes natively at EL1 AArch32. No JIT, no interpreter.

@@ -29,6 +29,7 @@ below — read the relevant one before acting, don't re-derive it.
 | Native code in add-on packages; triaging a wedge PC in RAM | [`docs/PACKAGE_NATIVE_CODE.md`](docs/PACKAGE_NATIVE_CODE.md) |
 | What a snapshot does and does not restore | [`docs/SNAPSHOT_RESUME_CONTRACT.md`](docs/SNAPSHOT_RESUME_CONTRACT.md) |
 | Oracle: what a fully-booted Newton actually does | `probe/FINDINGS.md` |
+| How the project was built — the historical record (the one doc allowed to narrate the past) | [`docs/project-history.md`](docs/project-history.md) |
 
 ## Rules
 

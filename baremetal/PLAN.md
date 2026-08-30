@@ -6,8 +6,9 @@ The 717006 ROM boots through kernel, scheduler and NewtonScript
 interpreter to the Welcome UI, and the builtin apps work
 interactively — on QEMU `raspi3b`, on ARM FVP, and on a real
 Pi Zero 2 W with HDMI display, USB touch, HDMI audio and SD-backed
-flash persistence. All 38 guest tests are green on both emulated
-hosts; all 18 build combinations in `scripts/check-matrix.sh` pass.
+flash persistence. All 38 guest tests are green on QEMU; on FVP 37 of
+38 (`test_swp_rom_aperture` gives NO-VERDICT — item 8 below); all
+build combinations in `scripts/check-matrix.sh` pass.
 
 ## Standing rules
 
@@ -74,6 +75,31 @@ hosts; all 18 build combinations in `scripts/check-matrix.sh` pass.
 7. **Performance and polish.** No measurement against the real
    162 MHz StrongARM has been done. Display-scaling quality on real
    hardware is the other polish item.
+
+8. **FVP SWP divergence.** `test_swp_rom_aperture` gives NO-VERDICT
+   on FVP: SWP takes the UND route there, and `hv/trap/und.rs`'s SWP
+   emulation halts on a ROM target ("address not writable"), while
+   the ROM-aperture absorb for SWP lives only in `hv/trap/dabt.rs`
+   (the stage-2 route QEMU takes). The UND-path emulation needs the
+   same mask-ROM aperture behaviour.
+
+9. **Emulate the kernel's MMU-off access routines in EL2.** The three
+   ROM routines behind every page-table access (`LoadFromPhysAddress`
+   `0x18CA4`, `StoreToPhysAddress` `0x18CE0`, `Load`/
+   `StorePhysicalByte` `0x18D1C`/`0x18D58`) could be emulated at
+   their entry probes: perform the access through EL2's coherent
+   mapping and return to `lr`. Per window that removes the two
+   `SCTLR.M` traps, the `HCR_EL2.DC` toggle with its two
+   `TLBI VMALLE1`s, and the rising-edge `fix_stage1_xn_bits` L1/L2
+   walk (`HIGHLEVEL.md` §4.4) — a large saving at thousands of
+   windows per second. Until then, §4.4's TLBI rule stands: the DC
+   toggle without TLB maintenance corrupts guest memory.
+
+10. **`pi_hdmi` consumer-estimate resync.** In
+    `src/host/audio/pi_hdmi.rs`, when the period estimate *leads*
+    CONBLK (apparent lag > half the ring) the "not resyncing" state
+    never converges on its own; the log rate limit keeps the line
+    from flooding the UART but does not fix the estimator.
 
 Real-hardware specifics (cores 1–3 left parked, snapshot ring deferred
 on hardware, thermal re-verification) are tracked in

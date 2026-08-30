@@ -290,10 +290,13 @@ nothing is listening any more, although the board keeps running. So:
   is in — that is the intended split between an agent driving the
   script and a person watching.
 - A soak (N cold boots, each judged by markers) is a shell loop around
-  `--no-upload`; this replaces the earlier `cycle.sh` + `miniterm | tee
-  /tmp/serial.txt` harness from the SD-DMA investigation
-  (`INVESTIGATION.md`, "Round 7 harness"), and unlike it verifies that
-  the switch really cycled:
+  `--no-upload`. Unattended soaking is the tool for intermittent
+  hardware-only bugs: it turns "fails sometimes" into a measured rate,
+  and a fix into a statistical verdict (a ~1-in-5 failure needs ~20
+  clean boots for P ≈ 1 % that it is still there; the SD-save
+  corruption hunt closed on 39 of 39 clean, `docs/project-history.md`
+  §9). Unlike a bare power-toggle loop, `--no-upload` also verifies
+  that the switch really cycled (it waits for the bootcode banner):
 
   ```bash
   L=/tmp/newton-claude/serial.log

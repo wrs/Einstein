@@ -4,14 +4,21 @@
 #
 # Usage:
 #   scripts/build-sd.sh <dest-dir>
-#       Build the hypervisor binary, fetch the Pi firmware blobs (cached
-#       under target/pi-firmware-cache/), and assemble a complete boot-
+#       Build nhboot (the bootloader that becomes kernel8.img) and the
+#       hypervisor (wrapped into the HYPERV.IMG container nhboot
+#       boots), fetch the Pi firmware blobs (cached under
+#       target/pi-firmware-cache/), and assemble a complete boot-
 #       partition layout under <dest-dir>. The user then copies the
 #       contents to the root of a FAT32-formatted SD card.
 #
+#       This is the first-time (and firmware/config/nhboot-change)
+#       path. Hypervisor rebuilds go over the serial cable instead:
+#           scripts/pi-upload.py --kernel <elf>
+#       (docs/REAL_HW_BRINGUP.md, "Serial image upload").
+#
 # Env vars:
 #   PI_FIRMWARE_CACHE   override the default cache location
-#   PI_KERNEL_BIN       which [[bin]] to use as kernel8.img
+#   PI_KERNEL_BIN       which [[bin]] to wrap into HYPERV.IMG
 #                       (default: newton-hypervisor — the full
 #                       hypervisor, which boots to the Welcome UI on
 #                       the Pi)
@@ -61,11 +68,14 @@ usage: scripts/build-sd.sh <dest-dir> [<sd-mount>]
   <dest-dir>  will contain a complete boot-partition layout.
   <sd-mount>  if given, also rsync the layout to that path — typically
               the mounted SD card (e.g. /Volumes/bootfs on macOS).
-              Only files whose mtime+size differ are written, so
-              re-running after a small kernel rebuild touches just
-              kernel8.img.
+              Only files whose mtime+size differ are written; the
+              16 MiB HYPERV.IMG is rewritten only when its content
+              changed.
 
-  Set PI_KERNEL_BIN to pick a different [[bin]] (default: newton-hypervisor).
+  Set PI_KERNEL_BIN to pick a different hypervisor [[bin]] (default: newton-hypervisor).
+
+  After the first card write, rebuilds of the hypervisor go over serial:
+      scripts/pi-upload.py --kernel target/aarch64-unknown-none-softfloat/release/newton-hypervisor
 EOF
     exit 1
 }
@@ -89,7 +99,21 @@ for f in "${FW_FILES[@]}"; do
     fi
 done
 
-# --- 2. Build the chosen [[bin]] ---------------------------------------
+# --- 2. Build nhboot — the bootloader that is kernel8.img -------------
+#
+# nhboot is a standalone package (nhboot/Cargo.toml) with its own
+# target pin. It self-relocates out of 0x80000, validates HYPERV.IMG
+# (loaded by the firmware at 0x02000000 via the `initramfs` line in
+# config.txt) and enters the hypervisor at 0x80000; with a host on
+# the serial cable it receives a new image first.
+echo "build: nhboot"
+(
+    cd "$repo_root/nhboot"
+    cargo build --release
+)
+nhboot_elf="${repo_root}/nhboot/target/aarch64-unknown-none-softfloat/release/nhboot"
+
+# --- 2b. Build the chosen hypervisor [[bin]] ---------------------------
 #
 # Default to the `pi-bare-metal-input` aggregate for the full
 # hypervisor (display + touch + audio + SD-flash on top of
@@ -106,7 +130,7 @@ echo "build: cargo --release --no-default-features --features '$features' --bin 
 
 elf="${repo_root}/target/aarch64-unknown-none-softfloat/release/${kernel_bin}"
 
-# --- 3. Convert ELF → raw kernel8.img ----------------------------------
+# --- 3. nhboot ELF → raw kernel8.img -----------------------------------
 sysroot="$(rustc --print sysroot)"
 objcopy="$(find "$sysroot" -name 'llvm-objcopy' -print -quit)"
 if [[ -z "$objcopy" ]]; then
@@ -114,8 +138,16 @@ if [[ -z "$objcopy" ]]; then
     echo "hint: run 'rustup component add llvm-tools-preview'" >&2
     exit 1
 fi
-echo "objcopy: $kernel_bin → kernel8.img"
-"$objcopy" -O binary "$elf" "$dest/kernel8.img"
+echo "objcopy: nhboot → kernel8.img"
+"$objcopy" -O binary "$nhboot_elf" "$dest/kernel8.img"
+
+# --- 3b. Hypervisor ELF → HYPERV.IMG container -------------------------
+#
+# pi-upload.py does the objcopy itself and wraps the raw image in the
+# fixed 16 MiB container nhboot validates (header: magic, payload
+# length, CRC-32s). The same script uploads over serial later.
+echo "make-image: $kernel_bin → HYPERV.IMG"
+"${repo_root}/scripts/pi-upload.py" --make-image "$dest/HYPERV.IMG" --kernel "$elf"
 
 # --- 4. Sync firmware + config into the staging dir ----------------
 # rsync (default mtime+size compare) skips files that haven't
@@ -150,7 +182,7 @@ next steps:
   2. Sync the contents of $dest to the SD card. Either:
        - re-run this script with the mount path as the second arg:
            scripts/build-sd.sh "$dest" /Volumes/<SD-card-name>
-         (only changed files are written; safe to do every rebuild)
+         (only changed files are written)
        - or rsync manually:
            rsync -a "$dest"/ /Volumes/<SD-card-name>/
   3. Eject, insert into the Pi Zero 2 W (note: PWR IN port for power).
@@ -160,10 +192,15 @@ next steps:
        Pi pin 10  (GPIO 15 RX) <--  cable TX
      Leave the cable's 5V/VCC pin disconnected.
      Open serial at 115200 8N1, then power on the Pi.
-  4. Expect serial output from kernel8.img ($kernel_bin) on the wire:
-     the M0 banner, capability dump, MMU init, stage-2 init, and
-     progress into the Newton ROM boot. Use --features trace,quiet
-     for a function-level trace of the ROM execution.
+  4. Expect on the wire: the firmware's uart_2ndstage lines, the
+     nhboot banner ("nhboot v1 ... image: valid ..."), then the
+     hypervisor ($kernel_bin): M0 banner, capability dump, MMU init,
+     stage-2 init, and progress into the Newton ROM boot.
+  5. From then on, rebuild and reload without touching the card:
+       scripts/pi-upload.py --kernel $elf --until 'Welcome to NewtonScript' --timeout 120
+     (power-cycles via the "Pi Off"/"Pi On" Shortcuts, uploads a delta
+     of the image over the cable, boots it, captures the console).
+     Re-run this script only for a firmware, config.txt or nhboot change.
 
   See docs/REAL_HW_BRINGUP.md if it doesn't print.
 EOF

@@ -41,7 +41,7 @@ ROOT = Path(__file__).resolve().parent.parent
 # HTML comment (`<!-- doc-symbols: proposed -->`); Rust just puts it in
 # the comment text.
 PROPOSED_MARKER = "doc-symbols: proposed"
-SRC_DIRS = ["src", "tools", "newton-objects"]
+SRC_DIRS = ["src", "tools", "newton-objects", "nhboot"]
 SKIP_DIRS = {"target", "vendor", ".git", ".jj", "build"}
 
 # Namespaces that are not modules in this tree: primitives (`u32::MAX`),

@@ -17,7 +17,8 @@ Remaining work: Newton's serial port and PCMCIA images (see
 ## Hardware kit
 
 - Pi Zero 2 W board.
-- Micro-SD card (FAT32 boot partition; firmware + image + `NEWTON.BIN`).
+- Micro-SD card (FAT32 boot partition; firmware + `kernel8.img` (the
+  nhboot bootloader) + `HYPERV.IMG` (the hypervisor) + `NEWTON.BIN`).
 - USB-TTL serial cable (3.3 V CMOS, NOT 5 V RS-232). GPIO 14 = TXD,
   GPIO 15 = RXD, common GND on GPIO 6/9/14/20/25/30/34/39.
 - Micro-USB power supply (the data port; the Zero 2 W has no
@@ -27,7 +28,11 @@ Remaining work: Newton's serial port and PCMCIA images (see
   integrated TSTP MTouch USB touchscreen (see
   [`MTOUCH.md`](MTOUCH.md)).
 - USB OTG adapter for the touchscreen.
-- Host machine running `minicom` / `picocom` / `screen` for serial.
+- Host machine (this Mac) with `scripts/pi-upload.py` on the serial
+  cable — it uploads images, captures the console, and power-cycles
+  the board through a HomeKit switch (Shortcuts `Pi On` / `Pi Off`).
+  Any terminal program works for plain watching, but only one process
+  can hold the port.
 
 ## Pi firmware facts
 
@@ -88,8 +93,14 @@ is required to route PL011 to GPIO 14/15.
 - `config.txt` — our settings (`boot-pi/config.txt` in this repo:
   `arm_64bit=1`, `enable_uart=1`, `uart_2ndstage=1`,
   `dtoverlay=disable-bt`, `gpu_mem=16`, HDMI knobs below).
-- `kernel8.img` — our raw image loaded at `0x80000` (must match
-  `linker.ld.in`'s raspi3b load address).
+- `kernel8.img` — the nhboot bootloader (`nhboot/`, ~90 KiB), loaded at
+  `0x80000` and entered at EL2. It relocates itself to `0x10000000`,
+  validates `HYPERV.IMG` and copies the hypervisor to `0x80000` (the
+  load address in `linker.ld.in` for raspi3b) — see "Serial image
+  upload" below.
+- `HYPERV.IMG` — the hypervisor, in a fixed 16 MiB container (4 KiB
+  header + raw image). The firmware loads it at `0x02000000` via
+  `initramfs HYPERV.IMG 0x02000000` in `config.txt`.
 - `NEWTON.BIN` — the persisted 8 MiB guest flash (created on first
   save).
 
@@ -109,8 +120,227 @@ PI_CARGO_FEATURES=pi-bare-metal-input scripts/build-sd.sh <dest> [sd-mount]
 ```
 
 assembles the full boot partition (pinned firmware + `config.txt` +
-`kernel8.img`) under `<dest>` and optionally rsyncs it to a mounted
-card.
+`kernel8.img` = nhboot + `HYPERV.IMG` = the hypervisor) under `<dest>`
+and optionally rsyncs it to a mounted card. That is the first-time
+path; after it, a hypervisor rebuild is loaded over the serial cable
+(next section) and the card is rewritten only for a firmware,
+`config.txt` or nhboot change.
+
+## Serial image upload — nhboot
+
+Rebuilding the hypervisor does not involve the SD card: `kernel8.img`
+is a small permanent bootloader, `nhboot`, and the hypervisor lives in
+a second file it boots, `HYPERV.IMG`, which `scripts/pi-upload.py`
+replaces over the USB-TTL cable. The bootloader never changes with a
+hypervisor rebuild, so a broken build cannot take the update path
+down with it: a power cycle and a re-upload recover from anything.
+
+### What is on the card
+
+| File | What | Size |
+|---|---|---|
+| `kernel8.img` | nhboot (`nhboot/`, its own package) | ~90 KiB |
+| `HYPERV.IMG` | container: 4 KiB header + raw hypervisor image + zero pad | 16 MiB, fixed |
+| `NEWTON.BIN` | guest flash (unchanged by any of this) | 8 MiB |
+| `config.txt` | + `initramfs HYPERV.IMG 0x02000000` | |
+
+The file is a fixed size so that an upload can rewrite individual
+sectors in place without ever touching the FAT allocation.
+
+Header (`nhboot/src/image.rs`, mirrored by `ImageFormat` in
+`scripts/pi-upload.py`; little-endian):
+
+```
+0x000  "NHIMG001"
+0x008  u32 payload_len      raw image bytes after the header
+0x00C  u32 payload_crc      CRC-32 (zlib) of the payload
+0x010  u32 hdr_crc          CRC-32 of bytes [0x000, 0x010)
+       zero to 0x1000, then the payload
+```
+
+### Boot sequence and RAM map
+
+1. Firmware loads `kernel8.img` at `0x80000` and `HYPERV.IMG` at
+   `0x02000000` (`initramfs <file> <addr>` — the option Linux uses
+   for its initrd; it "performs the actions of both ramfsfile and
+   ramfsaddr" per raspberrypi.com's config.txt reference, and is
+   written without an `=`), then enters nhboot at EL2 with x0 = the
+   DTB pointer.
+2. `nhboot/src/boot.s` parks cores 1–3, copies the bootloader to its
+   link address `0x10000000` (the prologue is position-independent),
+   `IC IALLU`, branches there, sets up stack/guard/bss.
+3. `main` brings up the PL011 at 115200, prints its banner (`nhboot v1
+   el=2 dtb=… entered_at=0x80000 linked_at=0x10000000`) and the
+   container's state (`image::inspect` — magic, header CRC, length,
+   payload CRC).
+4. Handshake window: with a valid image nhboot listens 1 s for a host
+   hello and otherwise boots; without one it waits forever, printing
+   `nhboot: no bootable image; waiting for upload` every 5 s.
+5. Boot: the payload is copied to `0x80000`, `IC IALLU`, and entered
+   with x0 = the DTB pointer, exactly as the firmware would have
+   entered it (the hypervisor's `_start` ignores x0).
+
+```
+0x0008_0000  nhboot as loaded; then the hypervisor (copied here in step 5)
+0x0200_0000  HYPERV.IMG as loaded by the firmware ("old" image)
+0x0300_0000  staging for an upload ("new" image), same container layout
+0x1000_0000  nhboot after self-relocation (+ 16 KiB stack, .bss)
+```
+
+The MMU stays off in nhboot (all RAM Non-cacheable, MMIO Device):
+polled drivers, a one-shot 10 MiB memcpy and CRC-32 via the ARMv8
+`crc32x` instructions (~0.3 s) need nothing more.
+
+### Protocol (`nhboot/src/xfer.rs` ↔ `scripts/pi-upload.py`)
+
+```
+host   →  \x01NHUP <baud>\n          text, 115200, repeated every 100 ms
+nhboot →  NHUP-OK <baud>\n           after fingerprinting the old image;
+                                     both sides switch to <baud>
+nhboot →  T  u32 n, n×{u32 adler32, u32 crc32}, u32 crc32(entries)
+                                     one entry per full 4 KiB block of the
+                                     old payload (n = 0 without one)
+host   →  D  u32 offset, u32 len(≤64 KiB), u32 crc32, bytes    DATA
+host   →  C  u32 new_off, u32 old_off, u32 len, u32 crc32      COPY (old→new)
+host   →  K  u32 payload_len, u32 payload_crc                  COMMIT
+nhboot →  A  u32 echo            ACK   (offset for D/C, len for K)
+nhboot →  N  u32 echo, u8 reason NAK   1 bad crc, 2 bad offset/len,
+                                       3 rx timeout, 4 no old image,
+                                       5 unknown tag
+nhboot →  text: persist: … lines, then DONE\n; baud back to 115200
+```
+
+Stop-and-wait; the host retries a NAK'd or unanswered message three
+times. nhboot prints nothing between `T` and the COMMIT ACK because
+the console *is* the link. A byte gap of 2 s inside a message
+abandons it (NAK 3); after an unknown tag nhboot drains input until
+100 ms of silence so garbage costs one NAK, not one per byte. The
+transfer baud is the host's choice (default 1.5 M; the PL011's 48 MHz
+reference and the FTDI cable both allow 3 M = clk/16).
+
+### Persistence (`nhboot/src/persist.rs`)
+
+After the COMMIT ACK, nhboot brings up the SD card with a PIO-only
+copy of the SDHOST driver (CMD17/CMD24 — deliberately no DMA, so the
+bootloader is independent of the hypervisor's DMA save path; the
+copy is kept in step by hand), mounts the FAT32 volume with the
+vendored `embedded-sdmmc`, and:
+
+- opens `HYPERV.IMG`; if it is missing or not 16 MiB it is recreated
+  through the FAT API (the slow fallback — `build-sd.sh` puts a
+  correctly sized file on a fresh card);
+- resolves every sector's LBA through the cluster chain
+  (`file_cluster_lbas`, the vendored addition), so fragmentation
+  doesn't matter;
+- writes only the sectors that differ from the firmware-loaded copy
+  (those are, by construction, the bytes on the card), **header
+  sector last** — a power cut mid-write leaves a container whose CRC
+  fails, and nhboot then waits for a re-upload instead of booting a
+  half-written image.
+
+An SD failure is reported (`persist: FAILED (…) — image boots from RAM
+only this time`) and the uploaded image still boots for that run.
+
+### Delta
+
+The 8 MiB ROM + REx blob inside the image is identical build to
+build but moves whenever the code before it grows, so the delta is
+offset-independent (the rsync algorithm): nhboot fingerprints each
+4 KiB block of the old payload (adler32 + crc32, ~2500 entries), the
+host computes the adler32 of every 4 KiB window of the new image at
+every byte offset with numpy prefix sums (~1 s), verifies the
+candidates by crc32 and walks greedily into merged COPY runs and DATA
+runs. A one-line rebuild sends a few hundred KiB (3 % of the image);
+an identical image sends one COPY and writes nothing. `--full`
+forces DATA-only.
+
+### Host tool cheatsheet
+
+```bash
+# The loop: build, power-cycle, upload the delta, boot, capture until the marker.
+cargo build --release --no-default-features --features pi-bare-metal-input
+scripts/pi-upload.py --kernel target/aarch64-unknown-none-softfloat/release/newton-hypervisor \
+    --until 'Welcome to NewtonScript' --timeout 120
+
+scripts/pi-upload.py --no-upload --until 'DMA save complete' --timeout 60   # power-cycle + capture
+scripts/pi-upload.py --no-power-cycle --kernel <elf>        # board already off/on by hand
+scripts/pi-upload.py --baud 3000000 --kernel <elf>          # faster link (see status below)
+scripts/pi-upload.py --make-image out/HYPERV.IMG --kernel <elf>   # container only (build-sd.sh)
+```
+
+Exit status: 0 when `--until` matched, 1 on `--timeout` or a protocol
+error, 130 on Ctrl-C. The raw console is appended to `--log` (default
+`/tmp/newton-claude/serial.log`); only one process can hold the port,
+so stop any `miniterm`/`screen` on it first.
+
+Power cycling goes through the Shortcuts app: `Pi Off` / `Pi On` each
+run a Home action on the switch the Pi is plugged into. The script
+runs them with stdin closed (`shortcuts run` otherwise blocks on
+stdin forever and the Off never happens) and does not trust their
+exit status: it waits for the firmware's `uart_2ndstage` banner
+(`Raspberry Pi Bootcode`) on the wire, retries the cycle once, and
+fails loudly if the board never rebooted.
+
+Under QEMU the same script talks to a socket serial, which is how the
+protocol and the SD path are tested without hardware:
+
+```bash
+# FAT32 disk image (MBR partition, as the firmware expects), 64 MB is plenty
+hdiutil create -size 64m -fs "MS-DOS FAT32" -volname NHTEST -layout MBRSPUD sd.dmg
+hdiutil attach sd.dmg && cp HYPERV.IMG /Volumes/NHTEST/ && hdiutil detach /Volumes/NHTEST
+
+qemu-system-aarch64 -M raspi3b -kernel nhboot.bin \
+    -device loader,file=HYPERV.IMG,addr=0x02000000 \        # what the firmware's initramfs does
+    -drive if=sd,file=sd.dmg,format=raw \
+    -chardev socket,id=s0,path=serial.sock,server=on,wait=on -serial chardev:s0 \
+    -display none -no-reboot -monitor none
+scripts/pi-upload.py --port unix:serial.sock --no-power-cycle --kernel <elf> \
+    --until 'Welcome to NewtonScript' --timeout 120
+```
+
+(`nhboot.bin` is `llvm-objcopy -O binary` of
+`nhboot/target/aarch64-unknown-none-softfloat/release/nhboot`; leave
+out `-device loader` to exercise the no-image path, `-drive` to
+exercise the persist-failure path.)
+
+### Recovery and limits
+
+- A bad upload (line noise past the CRCs, a power cut during the
+  card write) leaves a container that fails validation; nhboot says
+  so and waits for an upload. Nothing a hypervisor build can do
+  affects nhboot.
+- nhboot itself, `config.txt` and the firmware are updated only by a
+  card write (`build-sd.sh <dest> <mount>`).
+- A rebuild that shifts the ROM blob still rewrites most of the
+  file's sectors on the card (~15 s of PIO at ~700 KB/s); the persist
+  step, not the transfer, is the visible cost. `PLAN.md` item 8
+  (link-time alignment of the blob) is the fix.
+- No flow control on the link: nhboot's receive loop is tight (no
+  printing inside a message) and the PL011 FIFO is 16 deep; a
+  dropped byte costs one 64 KiB retry.
+
+**Hardware status.** Verified on the Pi Zero 2 W (2026-08-29), all
+driven by `pi-upload.py` from the Mac with no hands on the board:
+
+- The firmware honours `initramfs HYPERV.IMG 0x02000000` — nhboot
+  finds the magic at 0x02000000 and boots the hypervisor to the
+  Welcome UI (~15 s after power-on, the same as a direct
+  `kernel8.img` boot).
+- Identical image: 2 ops, 3 KiB sent, 0 sectors written, 9.5 s from
+  power-on to `DONE` at 1.5 M.
+- Real rebuild (the `quiet` variant over the input build): 16 ops,
+  400 KB sent (3.8 %), 5.0 s transfer, 12.7 s from power-on to the
+  COMMIT; persist rewrote 19676 of 20639 sectors in 15.7 s (the ROM
+  blob shifted — `PLAN.md` item 8), Welcome UI at 38 s.
+- Persistence: a plain power-cycle (`--no-upload`) booted the
+  uploaded build from the card.
+- 1.5 M and 3 M baud both work. The one host-side pitfall found:
+  reassigning pyserial's `timeout` re-runs `tcsetattr`, and on
+  macOS's FTDI driver that re-programs a non-standard speed and drops
+  buffered RX — `Link` sets the timeout once and polls `in_waiting`.
+
+Verified under QEMU only: boot with `HYPERV.IMG` absent (the firmware
+side of that case has not been observed on the board).
 
 ### Feature aggregates
 

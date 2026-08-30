@@ -245,6 +245,15 @@ pub fn receive(old: Option<(usize, u32)>, baud: u32) -> u32 {
                     nak(len, NAK_BAD_CRC);
                     continue;
                 }
+                // Zero the pad up to the next 4 KiB boundary: the
+                // staging RAM is whatever was there before (stale
+                // across a power cycle), and persist.rs compares whole
+                // sectors, so an unzeroed pad would be written to the
+                // card as a spurious differing sector.
+                let padded = (len as usize).next_multiple_of(4096).min(MAX_PAYLOAD) as u32;
+                if padded > len {
+                    new_payload_slice(len, padded - len).fill(0);
+                }
                 image::write_header(NEW_BASE, len, crc);
                 ack(len);
                 // From here on the console is plain text again; the

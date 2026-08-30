@@ -75,6 +75,14 @@ hosts; all 18 build combinations in `scripts/check-matrix.sh` pass.
    162 MHz StrongARM has been done. Display-scaling quality on real
    hardware is the other polish item.
 
+8. **ROM-blob alignment for the serial loader.** The delta upload
+   sends only changed bytes, but a rebuild that grows the code before
+   the embedded ROM + REx blob shifts the blob inside `HYPERV.IMG`,
+   so nhboot rewrites most of the file's sectors (~15 s of PIO). A
+   link-time alignment of the blob (own section, 64 KiB alignment in
+   `linker.ld.in`) would keep it at a stable file offset and make the
+   persist step as small as the delta.
+
 Real-hardware specifics (cores 1–3 left parked, snapshot ring deferred
 on hardware, thermal re-verification) are tracked in
 [`docs/REAL_HW_BRINGUP.md`](docs/REAL_HW_BRINGUP.md).
@@ -106,8 +114,14 @@ on hardware, thermal re-verification) are tracked in
 - **ARM FVP `FVP_Base_RevC-2xAEMvA`** — `scripts/fvp <elf>`. GICv3,
   accurate timer + cache model. Build with `--no-default-features
   --features "platform-fvp-base rom-717006 quiet diag"`.
-- **Pi Zero 2 W** — `PI_CARGO_FEATURES=pi-bare-metal-input
-  scripts/build-sd.sh <dest>`; see `docs/REAL_HW_BRINGUP.md`.
+- **Pi Zero 2 W** — first card: `PI_CARGO_FEATURES=pi-bare-metal-input
+  scripts/build-sd.sh <dest>`; every rebuild after that:
+  `scripts/pi-upload.py --kernel <elf> --until 'Welcome to
+  NewtonScript' --timeout 120` (power-cycles the board through the
+  `Pi Off`/`Pi On` Shortcuts, sends a delta of the image over the
+  USB-TTL cable to the nhboot bootloader, captures the console);
+  `--no-upload` is power-cycle + capture. See `docs/REAL_HW_BRINGUP.md`,
+  "Serial image upload".
 
 ### Trace and observation
 

@@ -279,7 +279,9 @@ cargo run --release --features trace,quiet             # QEMU, clean function tr
 cargo build --release --no-default-features \
     --features "platform-fvp-base rom-717006 quiet diag"   # FVP build (then scripts/fvp)
 PI_CARGO_FEATURES=pi-bare-metal-input scripts/build-sd.sh /Volumes/PIBOOT
-                                                       # bootable SD for the Pi Zero 2 W
+                                                       # bootable SD for the Pi Zero 2 W (first time)
+scripts/pi-upload.py --kernel target/aarch64-unknown-none-softfloat/release/newton-hypervisor
+                                                       # every rebuild after that: over serial
 ```
 
 `trace`, `log_store` and `ns_trace` mutate ROM words, which changes the
@@ -439,6 +441,11 @@ baremetal/
   linker.ld.in           image-layout template; build.rs substitutes the
                          per-platform load address (raspi3b 0x80000,
                          FVP 0x80000000) into OUT_DIR/linker.ld
+  nhboot/                the Pi Zero 2 W bootloader (its own package):
+                         kernel8.img on the card; validates and enters
+                         the HYPERV.IMG hypervisor container, or receives
+                         a new one over the serial cable and writes it
+                         back to the card (docs/REAL_HW_BRINGUP.md)
   scripts/
     run-qemu.sh          cargo runner for QEMU
     boot-check.sh        marker-based QEMU boot verifier (kills QEMU
@@ -459,7 +466,13 @@ baremetal/
     dump-data-regions.py refresh code-regions.txt for bitmap triage
     build-rom-disasm.sh  regenerate the annotated ROM disassembly
     trace-diff.sh        diff Einstein vs hypervisor function traces
-    build-sd.sh          assemble a bootable Pi SD card
+    build-sd.sh          assemble a bootable Pi SD card (first time /
+                         firmware, config.txt or nhboot change)
+    pi-upload.py         host side of the serial loader: power-cycle
+                         the Pi (HomeKit Shortcuts), upload a delta of
+                         the hypervisor image to nhboot, capture the
+                         console (--until/--timeout); --make-image
+                         builds the HYPERV.IMG container
     classify-out/        curated symbol lists
     disasm-out/          rom.dis + indices
   src/
@@ -575,16 +588,34 @@ hardware-validated: EL2 handoff, ROM boot, HDMI display, USB
 touchscreen, HDMI audio, and SD-card flash persistence with
 non-blocking DMA autosave.
 
-Build a bootable SD card with:
+Build a bootable SD card once with:
 
 ```
 PI_CARGO_FEATURES=pi-bare-metal-input scripts/build-sd.sh <dest> [sd-mount]
 ```
 
+That puts the `nhboot` bootloader on the card as `kernel8.img` and the
+hypervisor in the `HYPERV.IMG` container it boots. Every rebuild after
+that goes over the USB-TTL cable, no card handling:
+
+```
+cargo build --release --no-default-features --features pi-bare-metal-input
+scripts/pi-upload.py --kernel target/aarch64-unknown-none-softfloat/release/newton-hypervisor \
+    --until 'Welcome to NewtonScript' --timeout 120
+scripts/pi-upload.py --no-upload --until 'DMA save complete' --timeout 60   # power-cycle + capture only
+```
+
+`pi-upload.py` power-cycles the board through the `Pi Off`/`Pi On`
+Shortcuts, sends only the bytes that changed (an rsync-style delta
+against the image on the card), waits for nhboot to write the result
+back to `HYPERV.IMG`, then streams the console to stdout and a log
+until `--until` matches or `--timeout` expires.
+
 See [`docs/REAL_HW_BRINGUP.md`](docs/REAL_HW_BRINGUP.md) for the
 hardware specifics — `config.txt`, UART routing, the TSTP MTouch
-panel, SDHOST details. The guest serial port and PCMCIA card images
-are the remaining unported peripherals.
+panel, SDHOST details, and the serial loader's container format and
+protocol. The guest serial port and PCMCIA card images are the
+remaining unported peripherals.
 
 ## Cheatsheet
 
@@ -598,6 +629,8 @@ guest-tests/scripts/run-all.sh --platform fvp # run every guest test on FVP
 guest-tests/scripts/run-test.sh test_vic      # one test, verbose output in /tmp
 scripts/check-matrix.sh                       # every supported build combo + lints
 scripts/boot-check.sh --cold                  # cold boot, verify the Welcome UI markers
+scripts/pi-upload.py --kernel <elf> --until 'Welcome to NewtonScript' --timeout 120
+                                              # real Pi: power-cycle, upload over serial, boot, capture
 
 # FVP boot
 cargo build --release --no-default-features --features "platform-fvp-base rom-717006 quiet diag"

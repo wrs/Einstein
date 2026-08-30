@@ -24,6 +24,7 @@ below — read the relevant one before acting, don't re-derive it.
 | Working style — assembler round-trips, Einstein-port review, test-per-feature | [`docs/WORKFLOW.md`](docs/WORKFLOW.md) |
 | Peripheral models (Newton-side spec + Einstein cross-refs) | [`docs/peripherals.md`](docs/peripherals.md) |
 | Real hardware — Pi Zero 2 W firmware, SD/display/USB/audio stacks | [`docs/REAL_HW_BRINGUP.md`](docs/REAL_HW_BRINGUP.md), [`docs/MTOUCH.md`](docs/MTOUCH.md), [`docs/SD_DMA_AUTOSAVE.md`](docs/SD_DMA_AUTOSAVE.md) |
+| Load a new image onto the Pi over serial, power-cycle it, capture its console (`scripts/pi-upload.py`, nhboot) | [`docs/REAL_HW_BRINGUP.md`](docs/REAL_HW_BRINGUP.md) "Serial image upload" |
 | Endianness — a BE-32 ROM run by a BE-8 guest | [`docs/ENDIAN_FIXES.md`](docs/ENDIAN_FIXES.md) |
 | Native code in add-on packages; triaging a wedge PC in RAM | [`docs/PACKAGE_NATIVE_CODE.md`](docs/PACKAGE_NATIVE_CODE.md) |
 | What a snapshot does and does not restore | [`docs/SNAPSHOT_RESUME_CONTRACT.md`](docs/SNAPSHOT_RESUME_CONTRACT.md) |
@@ -70,7 +71,7 @@ rm -f /tmp/newton-snapshot-*.bin && cargo run --release   # cold boot on QEMU
 scripts/boot-check.sh --cold                              # headless boot verify
 guest-tests/scripts/run-all.sh                            # 38 guest tests (QEMU)
 guest-tests/scripts/run-all.sh --platform fvp             # same on FVP
-scripts/check-matrix.sh                                   # 18 build combos + lints
+scripts/check-matrix.sh                                   # 19 build combos + lints
 
 # FVP (accurate reference model; much slower than QEMU — long timeouts)
 cargo build --release --no-default-features \

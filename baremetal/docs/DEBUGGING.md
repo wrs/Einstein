@@ -120,7 +120,7 @@ in handler code shows up as a failing test. Run
 
 `scripts/check-matrix.sh` runs the two structure lints
 (`check-layering.sh` import discipline, `check-rom-addrs.sh` ROM-address
-containment) and then `cargo check`s all 18 supported build
+containment) and then `cargo check`s all 19 supported build
 combinations in one shared target dir (~10 s warm). Run it after
 touching `build.rs`, feature gates, or any cfg-dispatched backend; it is
 also available as `CHECK_MATRIX=1 guest-tests/scripts/run-all.sh`.

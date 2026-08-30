@@ -133,7 +133,9 @@ def load_payload(args: argparse.Namespace, workdir: Path) -> bytes:
 def cmd_make_image(args: argparse.Namespace) -> int:
     out = Path(args.make_image)
     out.parent.mkdir(parents=True, exist_ok=True)
-    payload = load_payload(args, out.parent)
+    # The objcopy intermediate goes to the scratch dir, not next to OUT:
+    # build-sd.sh's OUT dir already holds nhboot as kernel8.img.
+    payload = load_payload(args, WORKDIR)
     img = FORMAT.wrap(payload)
     tmp = out.with_suffix(out.suffix + ".tmp")
     tmp.write_bytes(img)
@@ -156,6 +158,8 @@ class Link:
     stream socket (`unix:/path`, QEMU `-serial unix:…,server`), on
     which baud changes are no-ops."""
 
+    POLL = 0.02  # pyserial read timeout, set once at open (see __init__)
+
     def __init__(self, port: str, baud: int) -> None:
         self.port = port
         self.baud = baud
@@ -168,7 +172,13 @@ class Link:
             import serial  # pyserial
 
             self.sock = None
-            self.ser = serial.Serial(port, baud, timeout=0.1, write_timeout=5)
+            # The read timeout is fixed here and never reassigned:
+            # every pyserial `timeout` assignment re-runs tcsetattr,
+            # and on macOS's FTDI driver that re-programs a
+            # non-standard speed and discards buffered RX — at 1.5 M
+            # it lost most of nhboot's TABLE. `read` polls in
+            # POLL-second slices instead.
+            self.ser = serial.Serial(port, baud, timeout=self.POLL, write_timeout=5)
 
     def set_baud(self, baud: int) -> None:
         self.baud = baud
@@ -197,12 +207,17 @@ class Link:
             data, self.unread_buf = self.unread_buf[:n], self.unread_buf[n:]
             return data
         if self.ser is not None:
-            self.ser.timeout = timeout
-            data = self.ser.read(1)
-            if data and n > 1:
-                self.ser.timeout = 0
-                data += self.ser.read(n - 1)
-            return data
+            deadline = time.monotonic() + timeout
+            while True:
+                data = self.ser.read(1)
+                if data:
+                    if n > 1:
+                        pending = min(self.ser.in_waiting, n - 1)
+                        if pending:
+                            data += self.ser.read(pending)
+                    return data
+                if time.monotonic() >= deadline:
+                    return b""
         self.sock.settimeout(timeout)
         try:
             data = self.sock.recv(n)

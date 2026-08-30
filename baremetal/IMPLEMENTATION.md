@@ -124,6 +124,19 @@ src/
                  guest_bp, tracer, tarmac, diag_util
 ```
 
+`nhboot/` is a second, standalone package (not a workspace member;
+same nesting as `vendor/embedded-sdmmc`): the Pi bootloader that is
+`kernel8.img` on the card. It is linked at `0x10000000` and relocates
+itself there from the firmware's `0x80000` so the hypervisor can be
+copied to `0x80000` and entered; it runs with the MMU off and talks
+only to the PL011 and the SD card. It shares `src/host/sd/regs.rs` and
+`block_device.rs` by `#[path]` and carries a PIO-only *copy* of the
+SDHOST driver (CMD17/CMD24, no DMA) so the bootloader stays
+independent of the hypervisor's DMA save path; the two copies are kept
+in step by hand when the PIO path changes. `scripts/pi-upload.py` is
+its host side. `docs/REAL_HW_BRINGUP.md`, "Serial image upload", has
+the container format, protocol and memory map.
+
 The seams that matter:
 
 - **hv → newton** crosses only at `src/hv/hooks.rs`: the `GuestOs`
@@ -241,11 +254,11 @@ guest tests and the boot.
 (`check-layering.sh` import discipline, `check-rom-addrs.sh` ROM-address
 containment, `check-doc-symbols.py` code references in docs and
 comments) and then
-`cargo check`s all 18 supported build
+`cargo check`s all 19 supported build
 combinations — default, the no-diag variants, both platforms,
 `rom-710031`, the four `pi-bare-metal*` aggregates, trace/probe/log
-combos, and the guest-test cfg — in one shared target dir, printing a
-PASS/FAIL line per combo (~10 s warm). Run it after touching
+combos, the guest-test cfg, and the `nhboot/` package — in one shared
+target dir, printing a PASS/FAIL line per combo (~10 s warm). Run it after touching
 `build.rs`, feature gates, or any cfg-dispatched backend. It is wired
 into `run-all.sh` behind `CHECK_MATRIX=1`.
 

@@ -37,8 +37,30 @@ gpu_mem=16
 # takes over from the moment `display::splash::init` runs in kmain.
 disable_splash=1
 
-# Our binary (built by scripts/build-sd.sh from the pi-probe [[bin]]).
+# The bootloader (nhboot/, built by scripts/build-sd.sh). The firmware
+# loads it at 0x80000 and enters it at EL2; it relocates itself to
+# 0x10000000, validates the hypervisor container loaded by the
+# `initramfs` line below, copies the hypervisor payload to 0x80000 and
+# enters it there — or, when scripts/pi-upload.py is talking on the
+# serial cable, receives a new image first and writes it back to
+# HYPERV.IMG. See docs/REAL_HW_BRINGUP.md, "Serial image upload".
 kernel=kernel8.img
+
+# The hypervisor image, as the fixed 16 MiB HYPERV.IMG container (4 KiB
+# header with magic, length and CRC-32s, then the raw kernel image).
+# `initramfs <file> <addr>` makes the firmware load an arbitrary file
+# to a physical address — the same mechanism Linux uses for its
+# initrd; per raspberrypi.com/documentation/computers/config_txt.html
+# it "performs the actions of both ramfsfile and ramfsaddr", and it is
+# the one config.txt option written without an `=`. The address is a
+# contract with `nhboot/src/image.rs::IMAGE_ADDR`.
+#
+# RAM at nhboot entry:
+#   0x00080000  nhboot as loaded (kernel8.img); later the hypervisor
+#   0x02000000  HYPERV.IMG as loaded (this line)
+#   0x03000000  staging for an image received over serial
+#   0x10000000  nhboot after relocating itself out of the way
+initramfs HYPERV.IMG 0x02000000
 
 # Enable a serial console on GPIO 14/15 (header pins 8 and 10).
 enable_uart=1

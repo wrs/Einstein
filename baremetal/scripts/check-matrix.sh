@@ -65,6 +65,11 @@ combos=(
     "ns_trace::cargo check --release --features ns_trace"
     "log-all::cargo check --release --features \"log_mmu log_tasks log_unaligned log_store\""
     "guest-test::NH_GUEST_TEST=1 cargo check --release"
+    # The Pi bootloader is its own package (nhboot/Cargo.toml); its
+    # .cargo/config.toml pins the bare-metal target. Checked here so a
+    # change to the shared sd/regs.rs or block_device.rs (which nhboot
+    # includes by #[path]) can't break the card image unnoticed.
+    "nhboot::(cd nhboot && cargo check --release)"
 )
 
 pass=0

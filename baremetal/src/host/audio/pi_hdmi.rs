@@ -1345,13 +1345,21 @@ pub fn on_mai_dma_done() {
                     periods_done
                 );
             } else {
-                kprintln!(
-                    "audio_pi_hdmi: CONBLK period {} vs estimate {} (apparent lag {} > {}); not resyncing",
-                    actual,
-                    expected,
-                    lag,
-                    N_PERIODS / 2
-                );
+                // An estimate that *leads* CONBLK (apparent lag N-1)
+                // never converges on its own, so this would otherwise
+                // print once per period for the rest of the boot.
+                static NOT_RESYNCED: AtomicU64 = AtomicU64::new(0);
+                let n = NOT_RESYNCED.fetch_add(1, Ordering::Relaxed);
+                if n < 8 || n % 256 == 0 {
+                    kprintln!(
+                        "audio_pi_hdmi: CONBLK period {} vs estimate {} (apparent lag {} > {}); not resyncing (occurrence #{})",
+                        actual,
+                        expected,
+                        lag,
+                        N_PERIODS / 2,
+                        n + 1
+                    );
+                }
             }
         }
     }

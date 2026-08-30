@@ -25,7 +25,6 @@ const UART_IMSC: *mut u32 = (UART_BASE + 0x38) as *mut u32;
 const UART_ICR: *mut u32 = (UART_BASE + 0x44) as *mut u32;
 
 const FR_BUSY: u32 = 1 << 3;
-#[allow(dead_code)] // RX side: consumed by the upload protocol (xfer.rs).
 const FR_RXFE: u32 = 1 << 4;
 const FR_TXFF: u32 = 1 << 5;
 const LCRH_FEN: u32 = 1 << 4;
@@ -93,7 +92,6 @@ pub fn flush() {
 /// Re-program the baud. Drains TX first; the receive FIFO is left
 /// alone (the caller decides what to do with bytes that arrived at
 /// the old rate).
-#[allow(dead_code)] // Used by the upload protocol (xfer.rs).
 pub fn set_baud(baud: u32) {
     flush();
     init(baud);
@@ -111,7 +109,6 @@ pub fn putc(b: u8) {
 /// Non-blocking receive: `None` when the RX FIFO is empty. The upper
 /// DR bits carry framing/parity/overrun flags; they are dropped here
 /// and the protocol's CRCs catch the damage instead.
-#[allow(dead_code)] // RX side: consumed by the upload protocol (xfer.rs).
 pub fn getc_nonblock() -> Option<u8> {
     // SAFETY: MMIO at the documented PL011 base.
     unsafe {

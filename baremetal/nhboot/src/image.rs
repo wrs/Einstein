@@ -36,6 +36,11 @@ pub const MAX_PAYLOAD: usize = FILE_SIZE - HDR_SIZE;
 /// platform-raspi3b).
 pub const LOAD_ADDR: usize = 0x8_0000;
 
+/// Staging area for an image arriving over the serial link (xfer.rs):
+/// the "new" container is assembled here while the firmware-loaded
+/// "old" one at [`IMAGE_ADDR`] stays intact as the COPY source.
+pub const NEW_BASE: usize = 0x0300_0000;
+
 const MAGIC: &[u8; 8] = b"NHIMG001";
 const OFF_LEN: usize = 8;
 const OFF_CRC: usize = 12;
@@ -44,6 +49,10 @@ const OFF_HDR_CRC: usize = 16;
 // The payload is copied down to LOAD_ADDR; it must not reach back into
 // its own source at IMAGE_ADDR.
 const _: () = assert!(LOAD_ADDR + MAX_PAYLOAD <= IMAGE_ADDR);
+// The two containers must not overlap each other or nhboot itself
+// (linked at 0x1000_0000, linker.ld).
+const _: () = assert!(NEW_BASE >= IMAGE_ADDR + FILE_SIZE);
+const _: () = assert!(NEW_BASE + FILE_SIZE <= 0x1000_0000);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageState {
@@ -84,6 +93,21 @@ pub fn inspect(base: usize) -> ImageState {
         return ImageState::BadPayloadCrc { expected, actual };
     }
     ImageState::Valid { len, crc: expected }
+}
+
+/// Write a container header at `base` for a payload of `len` bytes
+/// with CRC `crc` — the same bytes `scripts/pi-upload.py --make-image`
+/// produces. The rest of the header is zero-filled.
+pub fn write_header(base: usize, len: u32, crc: u32) {
+    // SAFETY: `base` is the start of one of the two container areas,
+    // which nothing else in the bootloader aliases.
+    let hdr: &mut [u8] = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, HDR_SIZE) };
+    hdr.fill(0);
+    hdr[..MAGIC.len()].copy_from_slice(MAGIC);
+    hdr[OFF_LEN..OFF_LEN + 4].copy_from_slice(&len.to_le_bytes());
+    hdr[OFF_CRC..OFF_CRC + 4].copy_from_slice(&crc.to_le_bytes());
+    let hdr_crc = crc32(&hdr[..OFF_HDR_CRC]);
+    hdr[OFF_HDR_CRC..OFF_HDR_CRC + 4].copy_from_slice(&hdr_crc.to_le_bytes());
 }
 
 /// Copy the payload at `base` to [`LOAD_ADDR`] and enter it the way

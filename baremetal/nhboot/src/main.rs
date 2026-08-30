@@ -23,7 +23,9 @@
 mod crc;
 mod image;
 mod panic;
+mod time;
 mod uart;
+mod xfer;
 
 use image::ImageState;
 
@@ -83,22 +85,42 @@ pub extern "C" fn main(dtb: u64, entered_at: u64) -> ! {
     }
     println!();
 
-    match image::inspect(image::IMAGE_ADDR) {
+    let old = match image::inspect(image::IMAGE_ADDR) {
         ImageState::Valid { len, crc } => {
-            println!("image: valid, {} bytes, crc32 {:08x}; booting @{:#x}", len, crc, image::LOAD_ADDR);
-            uart::flush();
-            // SAFETY: just validated.
-            unsafe { image::boot(image::IMAGE_ADDR, len, dtb) }
+            println!("image: valid, {} bytes, crc32 {:08x}", len, crc);
+            Some((image::IMAGE_ADDR, len))
         }
         ImageState::BadPayloadCrc { expected, actual } => {
             println!("image: BadPayloadCrc (header says {:08x}, payload is {:08x})", expected, actual);
-            println!("nhboot: no bootable image — upload protocol not implemented yet (phase 2)");
-            park()
+            None
         }
         other => {
             println!("image: {:?}", other);
-            println!("nhboot: no bootable image — upload protocol not implemented yet (phase 2)");
-            park()
+            None
         }
-    }
+    };
+
+    // A host that wants to replace the image announces itself in the
+    // first second; otherwise a valid image boots. Without a valid
+    // image the window never closes.
+    let (base, len) = match xfer::handshake_window(old.is_some()) {
+        Some(_baud) => {
+            let len = xfer::receive(old);
+            match image::inspect(image::NEW_BASE) {
+                ImageState::Valid { len: l, .. } if l == len => (image::NEW_BASE, len),
+                other => {
+                    // Cannot happen if receive() verified the CRC and
+                    // wrote the header — a RAM fault would show here.
+                    println!("nhboot: uploaded image failed validation: {:?}", other);
+                    park()
+                }
+            }
+        }
+        None => old.expect("handshake_window returns None only with a valid image"),
+    };
+
+    println!("nhboot: booting {} bytes from {:#x} @{:#x}", len, base, image::LOAD_ADDR);
+    uart::flush();
+    // SAFETY: the container at `base` was validated above.
+    unsafe { image::boot(base, len, dtb) }
 }

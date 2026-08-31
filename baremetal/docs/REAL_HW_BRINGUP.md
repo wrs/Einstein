@@ -525,11 +525,12 @@ Peripherals manual):
 ```
   ┌─────────────────────────────────────────────────────┐
   │ host_io::pi_fb::push_blit                           │   ← consumes
-  │   2 bpp Newton FB rect → 32 bpp panel rect          │     screen.rs
-  │   nearest-neighbor 1.5x, centre-x offset            │     blits
+  │   2 bpp Newton FB rect → 32 bpp surface rect        │     screen.rs
+  │   VC-scaled: 1:1 LUT expand; fallback: bilinear     │     blits
   ├─────────────────────────────────────────────────────┤
-  │ display::fb::alloc_native + FbInfo                  │   ← per-boot
-  │   panel native size, 32 bpp RGB, 4 KiB align        │     allocation
+  │ display::fb::alloc_guest_surface + FbInfo           │   ← per-boot
+  │   small VC-scaled surface (probe + runtime          │     allocation
+  │   fallback to panel-native), 32 bpp RGB, 4 KiB      │
   ├─────────────────────────────────────────────────────┤
   │ mailbox::fb_setup_and_allocate (single batched msg) │   ← VC property
   ├─────────────────────────────────────────────────────┤
@@ -538,9 +539,19 @@ Peripherals manual):
   └─────────────────────────────────────────────────────┘
 ```
 
-Newton's 320×480 2 bpp framebuffer scales 1.5× → 480×720, painted
-centred horizontally on a 1280×720 panel (vertical fills exactly;
-400 px black bands left and right).
+The framebuffer's *physical* size is deliberately smaller than the
+HDMI mode: `fb_h ≈ 480` (Newton's height, inflated slightly for the
+`FIRMWARE_TOP_BAR_PX` allowance) and `fb_w` at the panel's aspect —
+866×487 for a 1920×1080 mode. Newton's 320×480 2 bpp framebuffer is
+painted into it **1:1** (centred horizontally, letterboxed black) and
+the firmware/HVS scales the surface to the unchanged HDMI mode on
+scan-out, so the CPU never resamples a pixel. At boot,
+`alloc_guest_surface` verifies the firmware honoured the small
+physical size without re-modesetting (returned geometry + HDMI
+pixel-clock readback); any surprise falls back at runtime to a
+panel-native surface with the old CPU software-bilinear scaler
+(force that path for A/B testing with the `pi-fb-force-cpu-scale`
+feature).
 
 ### Porting notes
 
@@ -569,12 +580,12 @@ centred horizontally on a 1280×720 panel (vertical fills exactly;
 
 ### Polish candidates (none blocking)
 
-- 1.5× nearest-neighbor produces visible jaggies; bilinear or
-  2×-integer-with-letterbox would look cleaner.
-- The FB region is Normal-WB with `dc_civac` per blit; if a profile
+- HVS scaling filter quality vs the old CPU bilinear is untuned
+  (`scaling_kernel` in config.txt selects the firmware's kernel);
+  speed was chosen first — tune quality afterwards.
+- The FB region is Normal-WB with `dc cvac` per damaged row range on
+  the VC path (`dc civac` full rows on the fallback); if a profile
   shows the maintenance dominating, remap Normal Non-Cacheable.
-- The 1.5× factor assumes a 720-line output; a 1080p panel wants
-  2.25× or a different scaler.
 
 ## USB input — DWC2 + TSTP MTouch
 

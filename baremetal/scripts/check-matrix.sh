@@ -57,6 +57,9 @@ combos=(
     "pi-bare-metal-sd::cargo check --release --no-default-features --features pi-bare-metal-sd"
     "pi-bare-metal-display::cargo check --release --no-default-features --features pi-bare-metal-display"
     "pi-bare-metal-input::cargo check --release --no-default-features --features pi-bare-metal-input"
+    # The debug-deploy shape: serial pen injector + forced CPU-scale
+    # fallback (the A/B switch for the VC-scaled surface).
+    "pi-fb-force-cpu-scale::cargo check --release --no-default-features --features \"pi-bare-metal-input serial-pen-inject pi-fb-force-cpu-scale\""
     "trace,quiet::cargo check --release --features \"trace quiet\""
     "trace_once::cargo check --release --features \"trace_once quiet\""
     "host-io-semihost::cargo check --release --features host-io-semihost"

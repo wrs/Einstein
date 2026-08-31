@@ -313,6 +313,18 @@ trace_once = ["trace"]
 #     --features "pi-bare-metal-input serial-pen-inject"
 serial-pen-inject = []
 
+# Force the Pi framebuffer backend onto the panel-native surface +
+# CPU bilinear scaler, skipping the VC-scaled small-surface attempt
+# entirely (`display::fb::alloc_guest_surface`). The VC-scaled path
+# is the default and falls back to CPU scaling at runtime when the
+# firmware refuses the geometry; this feature exists for A/B
+# performance comparison on hardware and for reproducing the
+# fallback path on a firmware that would otherwise honour the small
+# surface. Only meaningful together with `host-io-pi-fb`:
+#   cargo build --release --no-default-features \
+#     --features "pi-bare-metal-input pi-fb-force-cpu-scale"
+pi-fb-force-cpu-scale = []
+
 # Silence recurring diagnostic logs that otherwise dominate the console
 # (stage-1 XN re-walks on every MMU toggle, etc.).
 # Off by default; enable with `--features quiet` alongside `trace` to

@@ -9,23 +9,30 @@
 //! transitions, etc. with debris past the OS-believed left half of
 //! the screen.
 //!
-//! Newton 320×480 is scaled with **software bilinear** to an
-//! aspect-preserving rectangle that fills one axis of the panel
-//! (typically the height — the panel is wider than 2:3). Bilinear
-//! sampling gives us smooth non-integer scaling without going
-//! through the panel's own scaler, which produces visibly-bad
-//! resampling on cheap HDMI monitors. Compared to the HVS scaler:
-//! cheaper to bring up (no DispmanX from bare metal), comparable
-//! quality at our pixel counts; the cost is ~30 ms for a full-
-//! screen repaint at 512×768, which only happens on resume.
+//! Two paint paths, chosen at boot by
+//! `display::fb::alloc_guest_surface` (which the splash calls with
+//! this module's geometry constants):
 //!
-//! On each `push_blit` we recompute only the panel rect affected
-//! by the dst Newton rect (forward-mapped through the scale), then
-//! bilinear-sample from `guest_mem::fb_host_pa()` — by the time
-//! `push_blit` runs, `peripherals::screen::blit` has already
-//! written the new 2 bpp pixels into `GUEST_FB`, so reading from
-//! there picks up the latest content (and naturally blends with
-//! the existing surround at the edges of a partial blit).
+//! - **VC-scaled (primary).** The framebuffer is a *small* surface
+//!   whose height maps Newton 1:1 (e.g. 866×487 for a 1920×1080
+//!   mode) and the firmware/HVS scales it to the unchanged HDMI mode
+//!   on scan-out. `push_blit` then does no resampling at all: each
+//!   2 bpp GUEST_FB byte expands through a 4 KiB LUT into four XRGB
+//!   pixels copied as one 16-byte run, and only the damaged column
+//!   range per row is cache-cleaned (`dc cvac`, clean-only). Newton
+//!   sits centered horizontally, letterboxed black.
+//! - **CPU bilinear (runtime fallback + `pi-fb-force-cpu-scale`).**
+//!   The pre-VC-path behavior: panel-native surface, Newton scaled
+//!   with software bilinear to an aspect-preserving rectangle
+//!   (~709×1064 on a 1080p panel, ~22–33 ms per full-screen paint).
+//!   Engaged when the firmware refuses the small-physical /
+//!   large-mode split — see `alloc_guest_surface`'s probe.
+//!
+//! On each `push_blit` we repaint only the surface rect affected by
+//! the dst Newton rect, sampling from `guest_mem::fb_host_pa()` —
+//! by the time `push_blit` runs, `peripherals::screen::blit` has
+//! already written the new 2 bpp pixels into `GUEST_FB`, so reading
+//! from there picks up the latest content.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -37,8 +44,12 @@ use crate::kprintln;
 /// avoid ROM landscape-mode quirks. The OS-layer would accept other
 /// sizes; the ROM does not. Reported to `peripherals::screen` through
 /// [`super::HostIo::panel_geometry`] (pulled by `main.rs` at boot).
-const NEWTON_W: u32 = 320;
-const NEWTON_H: u32 = 480;
+/// `pub`: `display::splash` passes these to
+/// `display::fb::alloc_guest_surface` as the VC-scaled surface's
+/// content geometry (the geometry policy lives here; the splash only
+/// allocates first).
+pub const NEWTON_W: u32 = 320;
+pub const NEWTON_H: u32 = 480;
 /// 2 bpp grayscale — the MP2x00 panel depth `peripherals::screen`
 /// models.
 const NEWTON_BPP: u32 = 2;
@@ -103,21 +114,59 @@ pub static BACKEND: PiFbBackend = PiFbBackend;
 ///
 /// Tune up if the Newton image still clips at the bottom, down if
 /// a black gap appears between the bar and the image.
-const FIRMWARE_TOP_BAR_PX: u32 = 16;
+///
+/// Both paint paths honour it: the CPU-bilinear path shrinks its
+/// effective panel height by this much (below); the VC-scaled path
+/// bakes the same shrink into the surface geometry
+/// (`display::fb::alloc_guest_surface` inflates the surface height
+/// so Newton's 480 rows scale to `panel_h - FIRMWARE_TOP_BAR_PX`
+/// visible rows — identical on-screen geometry either way). On the
+/// HDMI-digitizer sink no bar is drawn and the fudge is a benign
+/// 16-row bottom margin (capture-verified).
+pub const FIRMWARE_TOP_BAR_PX: u32 = 16;
 
 /// 8-bit grayscale for each of the four 2 bpp Newton pixel values.
 /// 0 = white, 3 = black, intermediates are linear grays. Used by
-/// `newton_gray` as the input to bilinear blending.
+/// `newton_gray` as the input to bilinear blending and by
+/// [`EXPAND_LUT`] for the 1:1 path.
 const GRAY_TABLE: [u32; 4] = [255, 170, 85, 0];
 
+/// 1:1 expansion LUT for the VC-scaled path: one packed 2 bpp source
+/// byte (4 Newton pixels, MSB-first — pixel 0 in bits 7..6, matching
+/// `newton_gray`'s shift) → four XRGB u32 panel pixels, copied into
+/// the row as a single 16-byte run. 4 KiB, lives in .rodata.
+static EXPAND_LUT: [[u32; 4]; 256] = build_expand_lut();
+
+const fn build_expand_lut() -> [[u32; 4]; 256] {
+    let mut lut = [[0u32; 4]; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        let mut i = 0usize;
+        while i < 4 {
+            let v = (b >> (6 - 2 * i)) & 0x3;
+            let g = GRAY_TABLE[v] as u8;
+            lut[b][i] = u32::from_le_bytes([g, g, g, 0]);
+            i += 1;
+        }
+        b += 1;
+    }
+    lut
+}
+
 static INIT_DONE: AtomicBool = AtomicBool::new(false);
+/// `true` when the surface is the small VC-scaled one and `push_blit`
+/// paints 1:1; `false` selects the CPU-bilinear fallback. Mirrors
+/// `display::fb::guest_surface_kind()` at init time.
+static VC_SCALED: AtomicBool = AtomicBool::new(false);
 /// FbInfo captured from `display::splash`. `static mut` is safe
 /// because we're single-core EL2 and `INIT_DONE` gates access.
 static mut FB: Option<FbInfo> = None;
-/// Painted region inside the panel, in panel pixels. Aspect 320:480.
+/// Painted region inside the scan-out surface, in surface pixels
+/// (VC-scaled: exactly NEWTON_W×NEWTON_H; panel-native: the
+/// aspect-preserving bilinear target). Aspect 320:480 either way.
 static PAINTED_W: AtomicU32 = AtomicU32::new(0);
 static PAINTED_H: AtomicU32 = AtomicU32::new(0);
-/// Top-left of the painted region inside the panel.
+/// Top-left of the painted region inside the surface.
 static OFFSET_X: AtomicU32 = AtomicU32::new(0);
 static OFFSET_Y: AtomicU32 = AtomicU32::new(0);
 /// Inverse scale in Q16.16: `newton_pixel_q16 = painted_pixel * inv`.
@@ -152,6 +201,50 @@ fn init() {
         }
     };
 
+    // VC-scaled surface: Newton lands 1:1, centered horizontally,
+    // top-aligned (the surface height already carries the
+    // FIRMWARE_TOP_BAR_PX allowance — see `alloc_guest_surface`).
+    // The HVS scales the whole surface to the panel mode.
+    if crate::host::display::fb::guest_surface_kind()
+        == crate::host::display::fb::SurfaceKind::VcScaled
+    {
+        let offset_x = info.width.saturating_sub(NEWTON_W) / 2;
+        // SAFETY: single-core EL2, called once from kmain before any
+        // other code touches these statics.
+        unsafe {
+            #[allow(static_mut_refs)]
+            {
+                FB = Some(info);
+            }
+        }
+        PAINTED_W.store(NEWTON_W, Ordering::Relaxed);
+        PAINTED_H.store(NEWTON_H, Ordering::Relaxed);
+        OFFSET_X.store(offset_x, Ordering::Relaxed);
+        OFFSET_Y.store(0, Ordering::Relaxed);
+        // 1:1 — inverse scale is exactly one Newton pixel per painted
+        // pixel. Unused by the 1:1 paint loop, but keeps
+        // painted_region consumers' math uniform.
+        INV_SCALE_X_Q16.store(1 << 16, Ordering::Relaxed);
+        INV_SCALE_Y_Q16.store(1 << 16, Ordering::Relaxed);
+        VC_SCALED.store(true, Ordering::Relaxed);
+        INIT_DONE.store(true, Ordering::Relaxed);
+        // Boot-once geometry line — deliberately `kprintln!`, see the
+        // fallback arm's comment.
+        kprintln!(
+            "host_io_pi_fb: ready ({}x{} @ pa=0x{:x}, vc-scaled 1:1, newton {}x{} @ {},0)",
+            info.width,
+            info.height,
+            info.pa,
+            NEWTON_W,
+            NEWTON_H,
+            offset_x,
+        );
+        return;
+    }
+
+    // Panel-native surface (runtime fallback / pi-fb-force-cpu-scale):
+    // CPU bilinear scaling, pre-Phase-3 behavior.
+    //
     // The firmware reserves `FIRMWARE_TOP_BAR_PX` rows at the top
     // of the scan-out region; FB row 0 lands at panel row
     // `FIRMWARE_TOP_BAR_PX`, so the visible portion of the FB is
@@ -225,14 +318,88 @@ fn push_blit(ev: &BlitEvent, _payload: &[u8]) {
         crate::host::display::fb::fill_solid(fb, 0x0000_0000);
     }
 
-    let dst_left = ev.dst_left as u32;
-    let dst_top = ev.dst_top as u32;
-    let dst_right = ev.dst_right as u32;
-    let dst_bottom = ev.dst_bottom as u32;
+    // Clamp the Newton dst rect to the pinned geometry — both paint
+    // paths index GUEST_FB and the surface with it.
+    let dst_left = (ev.dst_left as u32).min(NEWTON_W);
+    let dst_top = (ev.dst_top as u32).min(NEWTON_H);
+    let dst_right = (ev.dst_right as u32).min(NEWTON_W);
+    let dst_bottom = (ev.dst_bottom as u32).min(NEWTON_H);
     if dst_right <= dst_left || dst_bottom <= dst_top {
         return;
     }
 
+    // A full-screen CPU-bilinear paint measures 22–33 ms (the EL2
+    // stall watermark attributed the audio "late period" stalls to
+    // exactly this handler) — far past the audio pump's tolerance, so
+    // paint with IRQs unmasked, the same shape as the flash save: the
+    // slim EL2 ISR keeps CNTHP and the MAI DMA refills serviced while
+    // we loop. The 1:1 path is ~10× cheaper but the wrapper costs
+    // nothing, so both paths keep it. Nothing here touches
+    // slim-ISR-owned state (panel FB writes, guest FB reads, pi_fb
+    // scaling atomics), and the guest is not running while EL2
+    // paints, so nothing re-enters.
+    crate::arch::cpu::with_irqs_unmasked(|| {
+        if VC_SCALED.load(Ordering::Relaxed) {
+            paint_1to1(fb, dst_left, dst_top, dst_right, dst_bottom);
+        } else {
+            paint_bilinear(fb, dst_left, dst_top, dst_right, dst_bottom);
+        }
+    });
+}
+
+/// VC-scaled path: expand the damaged GUEST_FB bytes 1:1 onto the
+/// small surface — no resampling. One [`EXPAND_LUT`] lookup + one
+/// 16-byte copy per 2 bpp source byte; per row, clean only the
+/// damaged column range (`dc cvac`, clean-only — the surface lines
+/// stay cache-resident for the next frame; the VC reads DRAM, never
+/// writes, so there is nothing to invalidate).
+///
+/// Painting whole source bytes may redraw up to 3 pixels beyond each
+/// horizontal edge of the dst rect; they repaint with their current
+/// GUEST_FB value, so this is idempotent.
+fn paint_1to1(fb: &FbInfo, dst_left: u32, dst_top: u32, dst_right: u32, dst_bottom: u32) {
+    let offset_x = OFFSET_X.load(Ordering::Relaxed) as usize;
+    let offset_y = OFFSET_Y.load(Ordering::Relaxed) as usize;
+
+    let guest_fb = crate::hv::guest_mem::fb_host_pa() as *const u8;
+    let stride = (NEWTON_W / 4) as usize;
+    let pitch_words = (fb.pitch / 4) as usize;
+    let panel_ptr = fb.pa as *mut u32;
+
+    let xb0 = (dst_left / 4) as usize;
+    let xb1 = (dst_right as usize).div_ceil(4).min(stride);
+    let n_bytes = xb1 - xb0;
+    let row_px0 = offset_x + xb0 * 4;
+
+    for y in dst_top as usize..dst_bottom as usize {
+        // SAFETY: y < NEWTON_H, xb0..xb1 ≤ stride — inside the
+        // GUEST_FB backing (≥ NEWTON_H*stride bytes). Dst: init
+        // guarantees offset_x + NEWTON_W ≤ fb.width and offset_y (=0)
+        // + NEWTON_H ≤ fb.height for the VC-scaled surface
+        // (`alloc_guest_surface` sizes it that way), so every write
+        // lands inside [fb.pa, fb.pa+size).
+        unsafe {
+            let src = guest_fb.add(y * stride + xb0);
+            let dst = panel_ptr.add((y + offset_y) * pitch_words + row_px0);
+            for i in 0..n_bytes {
+                let b = *src.add(i);
+                core::ptr::copy_nonoverlapping(
+                    EXPAND_LUT[b as usize].as_ptr(),
+                    dst.add(i * 4),
+                    4,
+                );
+            }
+        }
+        let row_pa = fb
+            .pa
+            .wrapping_add(((y + offset_y) * pitch_words + row_px0) as u64 * 4);
+        crate::arch::cpu::dc_cvac_range(row_pa, n_bytes * 16);
+    }
+}
+
+/// Panel-native fallback path: software bilinear upscale, 4 GUEST_FB
+/// samples + one volatile surface write per painted pixel.
+fn paint_bilinear(fb: &FbInfo, dst_left: u32, dst_top: u32, dst_right: u32, dst_bottom: u32) {
     let painted_w = PAINTED_W.load(Ordering::Relaxed);
     let painted_h = PAINTED_H.load(Ordering::Relaxed);
     let inv_x = INV_SCALE_X_Q16.load(Ordering::Relaxed);
@@ -257,64 +424,52 @@ fn push_blit(ev: &BlitEvent, _payload: &[u8]) {
     let pitch_words = (fb.pitch / 4) as usize;
     let panel_ptr = fb.pa as *mut u32;
 
-    // The bilinear upscale runs 4 guest-FB samples + one volatile
-    // panel write per painted pixel, plus a row-range cache flush — a
-    // full-screen Newton update measures 22–33 ms (the EL2 stall
-    // watermark attributed the audio "late period" stalls to exactly
-    // this handler). That is far past the audio pump's tolerance, so
-    // paint with IRQs unmasked, the same shape as the flash save: the
-    // slim EL2 ISR keeps CNTHP and the MAI DMA refills serviced while
-    // we loop. Nothing here touches slim-ISR-owned state (panel FB
-    // writes, guest FB reads, pi_fb scaling atomics), and the guest
-    // is not running while EL2 paints, so nothing re-enters.
-    crate::arch::cpu::with_irqs_unmasked(|| {
-        for py in p_top..p_bottom {
-            let ny_q = py * inv_y;
-            let ny_i = (ny_q >> 16) as usize;
-            let ny_f = (ny_q >> 8) & 0xFF;
-            let panel_y = py as usize + offset_y;
+    for py in p_top..p_bottom {
+        let ny_q = py * inv_y;
+        let ny_i = (ny_q >> 16) as usize;
+        let ny_f = (ny_q >> 8) & 0xFF;
+        let panel_y = py as usize + offset_y;
 
-            for px in p_left..p_right {
-                let nx_q = px * inv_x;
-                let nx_i = (nx_q >> 16) as usize;
-                let nx_f = (nx_q >> 8) & 0xFF;
-                let panel_x = px as usize + offset_x;
+        for px in p_left..p_right {
+            let nx_q = px * inv_x;
+            let nx_i = (nx_q >> 16) as usize;
+            let nx_f = (nx_q >> 8) & 0xFF;
+            let panel_x = px as usize + offset_x;
 
-                // Sample 4 Newton neighbors. `newton_gray` clamps at the
-                // far edge so we don't read past the framebuffer.
-                let g00 = newton_gray(guest_fb, stride, nx_i, ny_i);
-                let g01 = newton_gray(guest_fb, stride, nx_i + 1, ny_i);
-                let g10 = newton_gray(guest_fb, stride, nx_i, ny_i + 1);
-                let g11 = newton_gray(guest_fb, stride, nx_i + 1, ny_i + 1);
+            // Sample 4 Newton neighbors. `newton_gray` clamps at the
+            // far edge so we don't read past the framebuffer.
+            let g00 = newton_gray(guest_fb, stride, nx_i, ny_i);
+            let g01 = newton_gray(guest_fb, stride, nx_i + 1, ny_i);
+            let g10 = newton_gray(guest_fb, stride, nx_i, ny_i + 1);
+            let g11 = newton_gray(guest_fb, stride, nx_i + 1, ny_i + 1);
 
-                // Bilinear blend in 8-bit grayscale. Weights are Q0.8
-                // (so each multiply stays in u32; the final >> 16
-                // collapses the two Q0.8 levels back to 8-bit).
-                let top = g00 * (256 - nx_f) + g01 * nx_f;
-                let bot = g10 * (256 - nx_f) + g11 * nx_f;
-                let g = (top * (256 - ny_f) + bot * ny_f) >> 16;
-                let g8 = g.min(255) as u8;
-                let color = u32::from_le_bytes([g8, g8, g8, 0]);
+            // Bilinear blend in 8-bit grayscale. Weights are Q0.8
+            // (so each multiply stays in u32; the final >> 16
+            // collapses the two Q0.8 levels back to 8-bit).
+            let top = g00 * (256 - nx_f) + g01 * nx_f;
+            let bot = g10 * (256 - nx_f) + g11 * nx_f;
+            let g = (top * (256 - ny_f) + bot * ny_f) >> 16;
+            let g8 = g.min(255) as u8;
+            let color = u32::from_le_bytes([g8, g8, g8, 0]);
 
-                // SAFETY: panel_x < painted_w + offset_x ≤ fb.width,
-                // panel_y < painted_h + offset_y ≤ fb.height (set in
-                // `init`). pitch_words = fb.pitch / 4.
-                unsafe {
-                    panel_ptr
-                        .add(panel_y * pitch_words + panel_x)
-                        .write_volatile(color);
-                }
+            // SAFETY: panel_x < painted_w + offset_x ≤ fb.width,
+            // panel_y < painted_h + offset_y ≤ fb.height (set in
+            // `init`). pitch_words = fb.pitch / 4.
+            unsafe {
+                panel_ptr
+                    .add(panel_y * pitch_words + panel_x)
+                    .write_volatile(color);
             }
         }
+    }
 
-        // Flush the rows we touched so the VC scan picks them up.
-        let flush_y0 = p_top as usize + offset_y;
-        let flush_y1 = ((p_bottom as usize) + offset_y).min(fb.height as usize);
-        let row_bytes_panel = pitch_words * 4;
-        let flush_pa = fb.pa.wrapping_add((flush_y0 * row_bytes_panel) as u64);
-        let flush_len = (flush_y1 - flush_y0) * row_bytes_panel;
-        crate::arch::cpu::dc_civac_range(flush_pa, flush_len);
-    });
+    // Flush the rows we touched so the VC scan picks them up.
+    let flush_y0 = p_top as usize + offset_y;
+    let flush_y1 = ((p_bottom as usize) + offset_y).min(fb.height as usize);
+    let row_bytes_panel = pitch_words * 4;
+    let flush_pa = fb.pa.wrapping_add((flush_y0 * row_bytes_panel) as u64);
+    let flush_len = (flush_y1 - flush_y0) * row_bytes_panel;
+    crate::arch::cpu::dc_civac_range(flush_pa, flush_len);
 }
 
 /// 8-bit grayscale value at Newton FB pixel (x, y). Clamps at the

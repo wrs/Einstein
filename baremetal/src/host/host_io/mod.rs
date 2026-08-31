@@ -92,19 +92,28 @@ pub trait HostIo: Sync {
     }
 }
 
-/// Geometry of the painted Newton region on a physical panel, all in
-/// panel pixels. Produced by [`HostIo::painted_region`]; consumed by
-/// `input::calibrate`.
+/// Geometry of the painted Newton region on the backend's scan-out
+/// surface, all in *surface* pixels. Produced by
+/// [`HostIo::painted_region`]; consumed by `input::calibrate`.
+///
+/// The surface may be smaller than the physical panel mode (pi_fb's
+/// VC-scaled surface, which the firmware/HVS upscales to the panel on
+/// scan-out) — that's transparent to calibration because the whole
+/// surface maps linearly onto the whole visible panel, so a linear
+/// touch→surface map composed with offset/size below stays correct
+/// in either case.
 #[cfg(nh_input_mtouch)]
 #[derive(Copy, Clone)]
 pub struct PaintedRegion {
-    /// Full panel size.
+    /// Full scan-out surface size (= panel mode size for a
+    /// panel-native surface).
     pub panel_w: u32,
     pub panel_h: u32,
-    /// Top-left of the painted Newton region inside the panel.
+    /// Top-left of the painted Newton region inside the surface.
     pub offset_x: u32,
     pub offset_y: u32,
-    /// Painted Newton region size (after aspect-preserving scale).
+    /// Painted Newton region size (1:1 = Newton size on a VC-scaled
+    /// surface; after aspect-preserving scale on a native one).
     pub painted_w: u32,
     pub painted_h: u32,
 }

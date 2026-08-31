@@ -5,11 +5,15 @@
 //! `docs/MTOUCH.md` §Coordinate space). The touch surface is
 //! physically coincident with the HDMI display surface, so touch
 //! (0..1024, 0..600) maps linearly across the panel's display area
-//! at whatever resolution we drive HDMI. Inside that area the
-//! painted Newton region is described by the active host-IO
-//! backend's `host_io::painted_region()` report — with a backend
-//! that owns no physical panel (null, semihost) the report is
-//! `None` and every touch is dropped, so `input-mtouch` does not
+//! at whatever resolution we drive HDMI — and equally linearly onto
+//! the backend's *scan-out surface*, even when that surface is
+//! smaller than the panel mode and HVS-upscaled to it (pi_fb's
+//! VC-scaled surface): the linear touch→panel and panel→surface
+//! maps compose into the single linear map below. Inside the
+//! surface the painted Newton region is described by the active
+//! host-IO backend's `host_io::painted_region()` report — with a
+//! backend that owns no physical panel (null, semihost) the report
+//! is `None` and every touch is dropped, so `input-mtouch` does not
 //! require the `host-io-pi-fb` backend at build time.
 
 use crate::host::host_io;

@@ -93,7 +93,19 @@ pub fn init() -> Option<FbInfo> {
         return fb_info().copied();
     }
 
-    let info = match fb::alloc_native() {
+    // The splash allocates the surface the *guest* will scan out of
+    // for the rest of the run (pi_fb adopts it via `fb_info`), so it
+    // allocates via `alloc_guest_surface` with pi_fb's geometry
+    // policy: preferably a small VC-scaled surface (firmware/HVS
+    // upscales to the panel mode; pi_fb paints 1:1), panel-native as
+    // the runtime fallback. The splash's own layout is relative to
+    // the returned FbInfo either way, so boot visuals work on both —
+    // on the small surface they're simply HVS-upscaled.
+    let info = match fb::alloc_guest_surface(
+        crate::host::host_io::pi_fb::NEWTON_W,
+        crate::host::host_io::pi_fb::NEWTON_H,
+        crate::host::host_io::pi_fb::FIRMWARE_TOP_BAR_PX,
+    ) {
         Ok(i) => i,
         Err(e) => {
             kprintln!("splash: FB init FAILED: {:?}", e);

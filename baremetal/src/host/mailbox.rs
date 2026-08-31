@@ -324,7 +324,7 @@ pub fn set_clock_rate(clock_id: u32, hz: u32) -> Result<u32, MailboxError> {
 // fails, the call that returned the error is the one that failed.
 
 /// Release the firmware's currently-allocated framebuffer. Used by
-/// `display::fb::alloc_native` to provoke a fresh modeset after the
+/// `display::fb::alloc_with_reset` to provoke a fresh modeset after the
 /// initial firmware-stage modeset (which, on the Pi Zero 2 W +
 /// 1024×600 HDMI panel, leaves a thin white bar and intermittent
 /// flicker until something forces a re-modeset). Raspbian's KMS

@@ -214,7 +214,9 @@ pub fn dc_civac_range(va: u64, len: usize) {
 /// every autosave. `dsb sy` fences the writeback against the subsequent
 /// DMA arm. (Invalidate is only needed for the *inbound* direction,
 /// where a device wrote the buffer and the CPU must drop stale lines.)
-#[cfg(nh_real_hw)] // Only caller: `sdhost::arm_sd_dma`.
+// Callers: `sdhost::arm_sd_dma` (real hw) and `host_io::pi_fb`'s
+// VC-scaled paint (any host-io-pi-fb build).
+#[cfg(any(nh_real_hw, nh_host_io_pi_fb))]
 pub fn dc_cvac_range(va: u64, len: usize) {
     const LINE: u64 = 64;
     let start = va & !(LINE - 1);

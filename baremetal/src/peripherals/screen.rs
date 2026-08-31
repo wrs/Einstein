@@ -117,7 +117,7 @@ fn get_feature(ctx: &mut TrapContext) {
 /// (`Emulator/Screen/TScreenManager.h:122`), and the iOS app picks
 /// `screenBounds / 2` for "Fit to Screen" at
 /// `app/iEinstein/.../iEinsteinViewController.mm:362-367`.
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 static SCREEN_W: AtomicU32 = AtomicU32::new(320);
 static SCREEN_H: AtomicU32 = AtomicU32::new(480);
 
@@ -181,11 +181,49 @@ unsafe impl Sync for BlitSinkCell {}
 
 static BLIT_SINK: BlitSinkCell = BlitSinkCell(core::cell::UnsafeCell::new(blit_sink_drop));
 
-/// Install the host blit sink. Called once from `main.rs` boot wiring.
-pub fn install_blit_sink(sink: BlitSink) {
+/// Whether the installed sink consumes the packed payload slice.
+/// Backends that repaint from GUEST_FB directly (pi_fb) or drop blits
+/// (null) report false through `HostIo::wants_payload`; `blit` then
+/// skips payload assembly and hands the sink an empty slice (the
+/// blit-parameter metadata still flows).
+static WANTS_PAYLOAD: AtomicBool = AtomicBool::new(true);
+
+/// Install the host blit sink. Called once from `main.rs` boot wiring;
+/// `wants_payload` carries the active backend's
+/// `HostIo::wants_payload` answer down to `blit`.
+pub fn install_blit_sink(sink: BlitSink, wants_payload: bool) {
     // SAFETY: single-core EL2, called before any blit can run.
     unsafe {
         *BLIT_SINK.0.get() = sink;
+    }
+    WANTS_PAYLOAD.store(wants_payload, Ordering::Relaxed);
+}
+
+/// Per-page stage-1 translation cache for the blit source walk. The
+/// source address advances contiguously along a row, so a translation
+/// stays valid until the VA crosses a 4 KiB page boundary; every
+/// short-descriptor mapping size (section, large page, small page)
+/// passes VA bits 11..0 through, so translating the page base once
+/// covers the whole page. Keeps `translate_va`'s MMU-off identity
+/// fallback (None → the VA is the PA).
+struct PageTranslate {
+    va_page: u32,
+    pa_page: u32,
+}
+
+impl PageTranslate {
+    fn new() -> Self {
+        // u32::MAX is not 4 KiB-aligned, so the first lookup misses.
+        Self { va_page: u32::MAX, pa_page: 0 }
+    }
+
+    fn pa_for(&mut self, va: u32) -> u32 {
+        let page = va & !0xFFF;
+        if page != self.va_page {
+            self.pa_page = guest_mem::translate_va(page).unwrap_or(page);
+            self.va_page = page;
+        }
+        self.pa_page | (va & 0xFFF)
     }
 }
 
@@ -245,8 +283,8 @@ fn get_screen_info(ctx: &mut TrapContext, pc: u32) {
 /// GUEST_FB. `rowBytes` already encodes the pixel-to-byte packing
 /// (4 px/byte on a 2 bpp panel), so a byte-wise copy is correct
 /// when `src.left` lands on a multiple of 4 px; sub-byte source
-/// rects (text glyphs, narrow icons) fall to a slow per-pixel
-/// path.
+/// rects (text glyphs, narrow icons) and mode-1 merges fall to a
+/// slow path that merges a destination byte at a time.
 fn blit(ctx: &mut TrapContext, pc: u32) {
     // Emulation-cost accumulator (`nh_diag`): entry up to the host-io
     // push, so the paint cost (timed separately in
@@ -332,8 +370,8 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
     // byte-granular GUEST_FB writes, which requires BOTH source and
     // destination to land on a 4-pixel boundary; otherwise we'd
     // corrupt pixels left of `dst_left` (or right of dst_left+width-1).
-    // Mode 1 also forces the slow path because it needs per-pixel
-    // dst read for the max() operation.
+    // Mode 1 also forces the slow path because its max() merge needs
+    // the current dst pixels.
     let byte_aligned =
         mode == 0
         && (pixmap_src_left & 0x3) == 0
@@ -344,7 +382,10 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
     // gets forwarded to the host viewer at the end. Sized for the
     // worst case (full-screen redraw at the upper bound the runtime
     // screen size is allowed to reach). Single-threaded EL2 access,
-    // no contention.
+    // no contention. Assembled only when the active sink consumes it
+    // (`HostIo::wants_payload` — pi_fb repaints from GUEST_FB and null
+    // drops blits, so both skip the whole write stream); the sink then
+    // gets an empty payload slice with the metadata intact.
     const SCRATCH_LEN: usize = (MAX_SCREEN_W * MAX_SCREEN_H / 4) as usize;
     struct ScratchCell(core::cell::UnsafeCell<[u8; SCRATCH_LEN]>);
     // SAFETY: single-threaded EL2 trap handler.
@@ -352,9 +393,13 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
     static SCRATCH: ScratchCell = ScratchCell(core::cell::UnsafeCell::new([0; SCRATCH_LEN]));
     // SAFETY: see ScratchCell.
     let scratch = unsafe { &mut *SCRATCH.0.get() };
+    let wants_payload = WANTS_PAYLOAD.load(Ordering::Relaxed);
 
     let payload_row_bytes = (src_width_pixels * SCREEN_BPP).div_ceil(8) as usize;
     let payload_len = payload_row_bytes * height as usize;
+    // Geometry tripwire — kept independent of `wants_payload` so a
+    // blit that would overflow the scratch halts identically on every
+    // backend.
     if payload_len > scratch.len() {
         kprintln!(
             "*** screen.blit: payload {} bytes exceeds scratch {}",
@@ -362,78 +407,102 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
         );
         cpu::halt();
     }
-    // Clear only the bytes we may touch via OR in the slow path.
-    for b in &mut scratch[..payload_len] { *b = 0; }
 
     if !byte_aligned {
-        // Sub-byte rect (Newton UI passes 1-pixel-aligned glyph blits).
-        // Per-pixel read/write: extract 2 bits from src, place at the
-        // matching 2-bit position in the dst byte. Slow vs Einstein's
-        // word-mask Blit_0 but we hit this rarely.
-        for row in 0..height {
-            let src_row_pa_off = (pixmap_src_top as u32 + row) * row_bytes;
-            for col_pix in 0..src_width_pixels {
-                let abs_src_pix = pixmap_src_left as u32 + col_pix;
-                let src_va = addy + src_row_pa_off + abs_src_pix / 4;
-                let src_pa = guest_mem::translate_va(src_va).unwrap_or(src_va);
-                let byte = match crate::hv::guest_endian::guest_read_u8_pa(src_pa) {
-                    Some(b) => b,
-                    None => {
-                        kprintln!(
-                            "*** screen.blit: src VA {:#x} → PA {:#x} outside mapped regions",
-                            src_va, src_pa
-                        );
-                        cpu::halt();
-                    }
-                };
-                let src_shift = 6 - 2 * (abs_src_pix & 3) as u8;
-                let src_2bit = (byte >> src_shift) & 0x3;
+        // Sub-byte rect (Newton UI passes 1-pixel-aligned glyph blits)
+        // or a mode-1 ink merge. Works a destination byte at a time:
+        // read the dst byte once, merge up to 4 2-bpp pixels with
+        // shift/mask, write once. The per-pixel combining rule is
+        // mode 1 = max(src, dst) under the 0=white..3=black
+        // convention; everything else is srcCopy.
+        if wants_payload {
+            // Zero so the edge bytes' out-of-range pixel slots start
+            // from a known state under the masked merges below.
+            for b in &mut scratch[..payload_len] { *b = 0; }
+        }
+        let mut xlate = PageTranslate::new();
+        if src_width_pixels > 0 {
+            // Absolute dst pixel range covered by the blit (inclusive).
+            let dst_first = dst_left as u32;
+            let dst_last = dst_first + src_width_pixels - 1;
+            for row in 0..height {
+                let src_row_off = (pixmap_src_top as u32 + row) * row_bytes;
+                let fb_row_base = (dst_top as u32 + row) * fb_row_bytes;
+                let pay_row_off = row as usize * payload_row_bytes;
+                // Consecutive pixels share a source byte — refetch
+                // only when the byte offset moves.
+                let mut src_off_cached = u32::MAX;
+                let mut src_byte = 0u8;
+                for dst_byte_idx in (dst_first / 4)..=(dst_last / 4) {
+                    let fb_ipa = guest_mem::FB_IPA_BASE
+                        .wrapping_add(fb_row_base + dst_byte_idx);
+                    // The dst byte feeds the mode-1 max() merge and
+                    // carries an edge byte's out-of-rect pixels — an
+                    // out-of-range dst rect must halt (mirroring the
+                    // src read below), not merge against a fabricated 0.
+                    let mut fb_byte = match guest_mem::read_byte_pa(fb_ipa) {
+                        Some(b) => b,
+                        None => {
+                            kprintln!(
+                                "*** screen.blit: dst FB IPA {:#x} outside mapped regions",
+                                fb_ipa
+                            );
+                            cpu::halt();
+                        }
+                    };
+                    let pix_first = (dst_byte_idx * 4).max(dst_first);
+                    let pix_last = (dst_byte_idx * 4 + 3).min(dst_last);
+                    for dst_pix in pix_first..=pix_last {
+                        let col_pix = dst_pix - dst_first;
+                        let abs_src_pix = pixmap_src_left as u32 + col_pix;
+                        let src_off = src_row_off + abs_src_pix / 4;
+                        if src_off != src_off_cached {
+                            let src_va = addy + src_off;
+                            let src_pa = xlate.pa_for(src_va);
+                            src_byte = match crate::hv::guest_endian::guest_read_u8_pa(src_pa) {
+                                Some(b) => b,
+                                None => {
+                                    kprintln!(
+                                        "*** screen.blit: src VA {:#x} → PA {:#x} outside mapped regions",
+                                        src_va, src_pa
+                                    );
+                                    cpu::halt();
+                                }
+                            };
+                            src_off_cached = src_off;
+                        }
+                        let src_shift = 6 - 2 * (abs_src_pix & 3) as u8;
+                        let src_2bit = (src_byte >> src_shift) & 0x3;
+                        let dst_shift = 6 - 2 * (dst_pix & 3) as u8;
+                        let cur_dst_2bit = (fb_byte >> dst_shift) & 0x3;
 
-                // Read current dst pixel (needed for mode 1 max()).
-                let dst_pix = dst_left as u32 + col_pix;
-                let fb_off = (dst_top as u32 + row) * fb_row_bytes + dst_pix / 4;
-                let fb_ipa = guest_mem::FB_IPA_BASE.wrapping_add(fb_off);
-                // The dst byte feeds the mode-1 max() merge — an
-                // out-of-range dst rect must halt (mirroring the src
-                // read above), not merge against a fabricated 0.
-                let mut fb_byte = match guest_mem::read_byte_pa(fb_ipa) {
-                    Some(b) => b,
-                    None => {
+                        // Combine per blit mode.
+                        let final_2bit = match mode {
+                            1 => src_2bit.max(cur_dst_2bit),
+                            _ => src_2bit,
+                        };
+                        fb_byte = (fb_byte & !(0x3 << dst_shift))
+                            | (final_2bit << dst_shift);
+
+                        // Merge into payload scratch (replaces, not
+                        // ORs — so mode-1 "no change" pixels carry the
+                        // existing dst value through to the host
+                        // viewer).
+                        if wants_payload {
+                            let pay_off = pay_row_off + (col_pix / 4) as usize;
+                            let pay_shift = 6 - 2 * (col_pix & 3) as u8;
+                            scratch[pay_off] = (scratch[pay_off] & !(0x3 << pay_shift))
+                                | (final_2bit << pay_shift);
+                        }
+                    }
+                    // Write the merged byte into GUEST_FB.
+                    if !guest_mem::write_byte_pa(fb_ipa, fb_byte) {
                         kprintln!(
-                            "*** screen.blit: dst FB IPA {:#x} outside mapped regions",
+                            "*** screen.blit: FB IPA {:#x} outside framebuffer",
                             fb_ipa
                         );
                         cpu::halt();
                     }
-                };
-                let dst_shift = 6 - 2 * (dst_pix & 3) as u8;
-                let dst_mask = 0x3u8 << dst_shift;
-                let cur_dst_2bit = (fb_byte >> dst_shift) & 0x3;
-
-                // Combine per blit mode.
-                let final_2bit = match mode {
-                    1 => src_2bit.max(cur_dst_2bit),
-                    _ => src_2bit,
-                };
-
-                // Write final pixel into payload scratch (replaces, not
-                // ORs — so mode-1 "no change" pixels carry the existing
-                // dst value through to the host viewer).
-                let pay_off =
-                    row as usize * payload_row_bytes + (col_pix / 4) as usize;
-                let pay_shift = 6 - 2 * (col_pix & 3) as u8;
-                let pay_mask = 0x3u8 << pay_shift;
-                scratch[pay_off] = (scratch[pay_off] & !pay_mask)
-                    | (final_2bit << pay_shift);
-
-                // Write final pixel into GUEST_FB.
-                fb_byte = (fb_byte & !dst_mask) | (final_2bit << dst_shift);
-                if !guest_mem::write_byte_pa(fb_ipa, fb_byte) {
-                    kprintln!(
-                        "*** screen.blit: FB IPA {:#x} outside framebuffer",
-                        fb_ipa
-                    );
-                    cpu::halt();
                 }
             }
         }
@@ -446,53 +515,121 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
             mode,
             src_top, src_left, src_bottom, src_right,
             dst_top, dst_left, dst_bottom, dst_right,
-            payload_row_bytes as u16, &scratch[..payload_len],
+            payload_row_bytes as u16,
+            if wants_payload { &scratch[..payload_len] } else { &[] },
         );
         ctx.x[0] = 0;
         return;
     }
 
-    // Byte-aligned fast path.
+    // Byte-aligned fast path: one stage-1 translation per source page
+    // (the row address is a guest VA when stage-1 is on; when it's off
+    // — the guest-test runtime — `PageTranslate` keeps the identity
+    // fallback) and one region lookup per contiguous span, copied in
+    // bulk.
     let src_col0_byte = pixmap_src_left as u32 / 4;
     let src_width_bytes = src_width_pixels / 4;
 
+    let mut xlate = PageTranslate::new();
     let mut copied = 0u32;
     for row in 0..height {
-        let src_row = addy + (pixmap_src_top as u32 + row) * row_bytes + src_col0_byte;
+        let src_row_va = addy + (pixmap_src_top as u32 + row) * row_bytes + src_col0_byte;
+        let fb_row_ipa = guest_mem::FB_IPA_BASE.wrapping_add(
+            (dst_top as u32 + row) * fb_row_bytes + ((dst_left as u32) / 4),
+        );
         let pay_row_off = row as usize * payload_row_bytes;
-        for col in 0..src_width_bytes {
-            let src_va = src_row + col;
-            // src_va is a guest VA when stage-1 is on (post-MMU
-            // Newton boot); when stage-1 is off (guest-test runtime),
-            // VA is treated as PA via the identity. translate_va
-            // returns None in the MMU-off case; fall back to identity
-            // so guest-tests' MMU-off paths still work.
-            let src_pa = guest_mem::translate_va(src_va).unwrap_or(src_va);
-            let byte = match crate::hv::guest_endian::guest_read_u8_pa(src_pa) {
-                Some(b) => b,
-                None => {
-                    kprintln!(
-                        "*** screen.blit: src VA {:#x} → PA {:#x} outside mapped regions",
-                        src_va, src_pa
-                    );
-                    cpu::halt();
+        // The GUEST_FB destination row is contiguous and never crosses
+        // a region boundary; a failed resolve falls through to the
+        // per-byte writes below, whose halt names the exact byte.
+        let dst_host =
+            guest_mem::host_slice_for(fb_row_ipa, src_width_bytes as usize, /*for_write=*/ true);
+        // Walk the row in spans bounded by 4 KiB source pages — the
+        // VA→PA translation is constant within a page.
+        let mut done = 0u32;
+        while done < src_width_bytes {
+            let seg_va = src_row_va.wrapping_add(done);
+            let seg_len = (0x1000 - (seg_va & 0xFFF)).min(src_width_bytes - done);
+            let seg_pa = xlate.pa_for(seg_va);
+            let src_host =
+                guest_mem::host_slice_for(seg_pa, seg_len as usize, /*for_write=*/ false);
+            let bulk = match (src_host, dst_host) {
+                (Some(s), Some(d)) => {
+                    let d = d + done as usize;
+                    // A source span overlapping the destination row
+                    // (an FB→FB self-blit) keeps the per-byte
+                    // ascending copy order.
+                    let overlap =
+                        s < d + seg_len as usize && d < s + seg_len as usize;
+                    if overlap { None } else { Some((s, d)) }
                 }
+                _ => None,
             };
-            // Stash into payload scratch for the host-viewer push.
-            scratch[pay_row_off + col as usize] = byte;
-            // Mirror into GUEST_FB.
-            let fb_off = (dst_top as u32 + row) * fb_row_bytes
-                + ((dst_left as u32) / 4) + col;
-            let fb_ipa = guest_mem::FB_IPA_BASE.wrapping_add(fb_off);
-            if !guest_mem::write_byte_pa(fb_ipa, byte) {
-                kprintln!(
-                    "*** screen.blit: FB IPA {:#x} outside framebuffer",
-                    fb_ipa
-                );
-                cpu::halt();
+            match bulk {
+                Some((s, d)) => {
+                    // SAFETY: both spans are bounds-checked by
+                    // host_slice_for against their backing regions and
+                    // proven non-overlapping above.
+                    let ok = unsafe {
+                        crate::hv::guest_endian::guest_copy_from_pa(
+                            s as *const u8, seg_pa, d as *mut u8, seg_len as usize,
+                        )
+                    };
+                    if !ok {
+                        kprintln!(
+                            "*** screen.blit: src VA {:#x} → PA {:#x} outside mapped regions",
+                            seg_va, seg_pa
+                        );
+                        cpu::halt();
+                    }
+                    if wants_payload {
+                        // The payload mirrors GUEST_FB byte-for-byte on
+                        // the aligned path — copy from the freshly
+                        // written destination span.
+                        // SAFETY: pay_row_off + done + seg_len ≤
+                        // payload_len ≤ SCRATCH_LEN (guarded above);
+                        // scratch and GUEST_FB are distinct statics.
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                d as *const u8,
+                                scratch.as_mut_ptr().add(pay_row_off + done as usize),
+                                seg_len as usize,
+                            );
+                        }
+                    }
+                }
+                None => {
+                    // Span outside a single region (or self-overlapping)
+                    // — per-byte copy, halting on the exact failing byte.
+                    for i in 0..seg_len {
+                        let src_va = seg_va.wrapping_add(i);
+                        let src_pa = seg_pa.wrapping_add(i);
+                        let byte = match crate::hv::guest_endian::guest_read_u8_pa(src_pa) {
+                            Some(b) => b,
+                            None => {
+                                kprintln!(
+                                    "*** screen.blit: src VA {:#x} → PA {:#x} outside mapped regions",
+                                    src_va, src_pa
+                                );
+                                cpu::halt();
+                            }
+                        };
+                        if wants_payload {
+                            scratch[pay_row_off + (done + i) as usize] = byte;
+                        }
+                        let fb_ipa = fb_row_ipa.wrapping_add(done + i);
+                        if !guest_mem::write_byte_pa(fb_ipa, byte) {
+                            kprintln!(
+                                "*** screen.blit: FB IPA {:#x} outside framebuffer",
+                                fb_ipa
+                            );
+                            cpu::halt();
+                        }
+                    }
+                }
             }
-            copied += 1;
+            done += seg_len;
         }
+        copied += src_width_bytes;
     }
 
     log_blit(pc, addy, row_bytes, height,
@@ -505,7 +642,8 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
         mode,
         src_top, src_left, src_bottom, src_right,
         dst_top, dst_left, dst_bottom, dst_right,
-        payload_row_bytes as u16, &scratch[..payload_len],
+        payload_row_bytes as u16,
+        if wants_payload { &scratch[..payload_len] } else { &[] },
     );
 
     ctx.x[0] = 0;

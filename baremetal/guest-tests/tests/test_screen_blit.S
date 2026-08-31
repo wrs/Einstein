@@ -38,15 +38,27 @@
 @     (NOT the source rowBytes).
 @ So row 0 (4 src bytes) lands at FB[0..4], row 1 lands at FB[80..84],
 @ with each byte preserved unchanged.
+@
+@ Two further blits cover the handler's other paths:
+@   B — mode 1 ("darken only" ink merge) into a dst rect at left=2,
+@       exercising the slow byte-merge path: per pixel the result is
+@       max(src, dst), and pixels outside the rect within the touched
+@       dst bytes must survive.
+@   C — mode 0, byte-aligned, with a source row that straddles a
+@       4 KiB page boundary, exercising the fast path's per-page span
+@       split.
 
 #include "common/test_runtime.S"
 
-    .equ PIXMAP_VA,      0x04020000
-    .equ PIXMAP_DATA_VA, 0x04021000
-    .equ SRC_RECT_VA,    0x04030000
-    .equ DST_RECT_VA,    0x04030010
-    .equ FB_VA,          0x0E000000
-    .equ BLIT_CODE,      0x0407       @ driver=4, subfn=7
+    .equ PIXMAP_VA,       0x04020000
+    .equ PIXMAP_DATA_VA,  0x04021000
+    .equ PIXMAP_DATA2_VA, 0x04021100  @ mode-1 merge source (blit B)
+    .equ PIXMAP_DATA3_VA, 0x04021FF8  @ row crosses the 4 KiB boundary
+                                      @ at 0x04022000 (blit C)
+    .equ SRC_RECT_VA,     0x04030000
+    .equ DST_RECT_VA,     0x04030010
+    .equ FB_VA,           0x0E000000
+    .equ BLIT_CODE,       0x0407      @ driver=4, subfn=7
 
     .section .text, "ax"
     .global test_main
@@ -138,6 +150,131 @@ test_main:
     mov     r0, #2
     hvc     #HVC_MARK                       @ mark 2: FB has expected bytes
 
+    @ ==== Blit B: mode 1 (max/ink merge) over a sub-byte dst rect ====
+    @ Source: 1 row x 4 pixels, byte 0x3D = pixels (0,3,3,1).
+    @ Dst rect {0,2,1,6} — dst_left=2 is not a multiple of 4, so this
+    @ takes the slow byte-merge path; mode 1 combines per pixel as
+    @ max(src, dst) over the FB content blit A left behind:
+    @   FB byte0 0xDE = (3,1,3,2), byte1 0xAD = (2,2,3,1)
+    @   dst pix 2..5 = (3,2,2,2) max src (0,3,3,1) → (3,3,3,2)
+    @ → byte0 (3,1,3,3) = 0xDF, byte1 (3,2,3,1) = 0xED, and the FB
+    @ word at +0 reads back 0xEFBEEDDF.
+    ldr     r6, =PIXMAP_VA
+    ldr     r0, =PIXMAP_DATA2_VA
+    str     r0, [r6, #0x00]          @ addy → merge source bytes
+
+    ldr     r6, =PIXMAP_DATA2_VA
+    ldr     r0, =0x3D000000          @ BE-view byte 0 = 0x3D
+    str     r0, [r6, #0]
+
+    ldr     r6, =SRC_RECT_VA
+    mov     r0, #0
+    str     r0, [r6, #0]             @ src {top=0, left=0}
+    mov     r0, #1
+    lsl     r0, r0, #16
+    orr     r0, r0, #4
+    str     r0, [r6, #4]             @ src {bottom=1, right=4}
+
+    ldr     r6, =DST_RECT_VA
+    mov     r0, #2
+    str     r0, [r6, #0]             @ dst {top=0, left=2}
+    mov     r0, #1
+    lsl     r0, r0, #16
+    orr     r0, r0, #6
+    str     r0, [r6, #4]             @ dst {bottom=1, right=6}
+
+    @ Mode word lives at [SP+4] (the native ABI's 4th argument slot).
+    sub     sp, sp, #8
+    mov     r0, #1
+    str     r0, [sp, #4]             @ mode = 1 (darken-only merge)
+    ldr     r1, =PIXMAP_VA
+    ldr     r2, =SRC_RECT_VA
+    ldr     r3, =DST_RECT_VA
+    ldr     r5, =BLIT_CODE
+    .inst   0xEE005A10               @ MCR p10, 0, r5, c0, c0, 0
+    add     sp, sp, #8
+
+    cmp     r0, #0
+    bne     .Lfail_not_zero
+
+    ldr     r6, =FB_VA
+    ldr     r0, [r6, #0]
+    ldr     r1, =0xEFBEEDDF
+    cmp     r0, r1
+    bne     .Lfail_fb_merge
+
+    mov     r0, #3
+    hvc     #HVC_MARK                       @ mark 3: mode-1 merge correct
+
+    @ ==== Blit C: aligned fast path with a page-crossing source ====
+    @ Source row = 16 bytes at 0x04021FF8..0x04022008, straddling the
+    @ 4 KiB boundary at 0x04022000 so the per-page span walk has to
+    @ split the row into two segments. Copied verbatim (mode 0) into
+    @ FB row 4 (byte offset 4 * 80 = 320).
+    ldr     r6, =PIXMAP_VA
+    ldr     r0, =PIXMAP_DATA3_VA
+    str     r0, [r6, #0x00]          @ addy → page-straddling bytes
+    mov     r0, #16
+    lsl     r0, r0, #16
+    str     r0, [r6, #0x04]          @ rowBytes_packed = (16<<16)
+
+    ldr     r6, =PIXMAP_DATA3_VA
+    ldr     r0, =0x01234567          @ BE-view bytes 01 23 45 67
+    str     r0, [r6, #0]
+    ldr     r0, =0x89ABCDEF          @ BE-view bytes 89 AB CD EF
+    str     r0, [r6, #4]
+    ldr     r0, =0x11223344          @ BE-view bytes 11 22 33 44
+    str     r0, [r6, #8]
+    ldr     r0, =0x55667788          @ BE-view bytes 55 66 77 88
+    str     r0, [r6, #12]
+
+    ldr     r6, =SRC_RECT_VA
+    mov     r0, #0
+    str     r0, [r6, #0]             @ src {top=0, left=0}
+    mov     r0, #1
+    lsl     r0, r0, #16
+    orr     r0, r0, #64
+    str     r0, [r6, #4]             @ src {bottom=1, right=64}
+
+    ldr     r6, =DST_RECT_VA
+    mov     r0, #4
+    lsl     r0, r0, #16
+    str     r0, [r6, #0]             @ dst {top=4, left=0}
+    mov     r0, #5
+    lsl     r0, r0, #16
+    orr     r0, r0, #64
+    str     r0, [r6, #4]             @ dst {bottom=5, right=64}
+
+    sub     sp, sp, #8
+    mov     r0, #0
+    str     r0, [sp, #4]             @ mode = 0 (srcCopy → fast path)
+    ldr     r1, =PIXMAP_VA
+    ldr     r2, =SRC_RECT_VA
+    ldr     r3, =DST_RECT_VA
+    ldr     r5, =BLIT_CODE
+    .inst   0xEE005A10               @ MCR p10, 0, r5, c0, c0, 0
+    add     sp, sp, #8
+
+    cmp     r0, #0
+    bne     .Lfail_not_zero
+
+    @ FB row 4 starts at +320: first word = bytes 01 23 45 67
+    @ (host LE 0x67452301), last word at +332 = bytes 55 66 77 88
+    @ (host LE 0x88776655) — the tail lands past the source's page
+    @ boundary, proving the second segment copied too.
+    ldr     r6, =FB_VA
+    ldr     r0, [r6, #320]
+    ldr     r1, =0x67452301
+    cmp     r0, r1
+    bne     .Lfail_fb_cross0
+    ldr     r0, [r6, #332]
+    ldr     r1, =0x88776655
+    cmp     r0, r1
+    bne     .Lfail_fb_cross1
+
+    mov     r0, #4
+    hvc     #HVC_MARK                       @ mark 4: page-crossing copy correct
+
     hvc     #HVC_PASS                       @ PASS
     bx      lr
 
@@ -152,4 +289,16 @@ test_main:
 .Lfail_fb1:
     hvc     #HVC_PRINT_HEX
     mov     r0, #0xD2
+    hvc     #HVC_FAIL
+.Lfail_fb_merge:
+    hvc     #HVC_PRINT_HEX
+    mov     r0, #0xD3
+    hvc     #HVC_FAIL
+.Lfail_fb_cross0:
+    hvc     #HVC_PRINT_HEX
+    mov     r0, #0xD4
+    hvc     #HVC_FAIL
+.Lfail_fb_cross1:
+    hvc     #HVC_PRINT_HEX
+    mov     r0, #0xD5
     hvc     #HVC_FAIL

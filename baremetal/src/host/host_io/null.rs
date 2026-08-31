@@ -10,6 +10,10 @@ impl HostIo for NullBackend {
     fn init(&self) {}
     fn on_resume(&self) {}
     fn push_blit(&self, _ev: &super::BlitEvent, _payload: &[u8]) {}
+    fn wants_payload(&self) -> bool {
+        // Blits are dropped whole — no point assembling a payload.
+        false
+    }
     fn pump_input(&self) {}
 }
 

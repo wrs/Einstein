@@ -201,6 +201,16 @@ pub fn host_pa_for_ipa(ipa: u64, for_write: bool) -> Option<usize> {
     host_addr_for(ipa as usize, 4, for_write)
 }
 
+/// Resolve a whole guest-PA span to a host pointer with a single
+/// `layout::region_for` lookup. Returns `None` when `[pa, pa+len)` is
+/// not fully contained in one `host_addr_for`-reachable region (or the
+/// region is read-only and `for_write` is set) — callers fall back to
+/// the per-byte accessors, whose failures name the exact byte. Bulk
+/// consumer: the `screen::blit` row copies.
+pub fn host_slice_for(pa: u32, len: usize, for_write: bool) -> Option<usize> {
+    host_addr_for(pa as usize, len, for_write)
+}
+
 fn host_addr_for(pa: usize, size: usize, for_write: bool) -> Option<usize> {
     let r = crate::hv::layout::region_for(pa as u64, size as u64)?;
     if !r.host_addr_for {

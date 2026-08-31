@@ -117,6 +117,42 @@ pub fn guest_read_u8_pa(pa: u32) -> Option<u8> {
     guest_mem::read_byte_pa(pa ^ 3)
 }
 
+/// Copy `len` guest logical bytes starting at guest PA `pa` into
+/// `dst`. `src_host` is the host pointer for `pa`, resolved by the
+/// caller via `guest_mem::host_slice_for`. Under BE-8 (CPSR.E=1) the
+/// CPU stores each byte at its natural offset, so the logical byte
+/// stream is one bulk copy of the host bytes. Returns false when a
+/// byte is unreadable.
+///
+/// # Safety
+///
+/// `src_host` must be valid for `len` reads (`host_slice_for`
+/// bounds-checks the span against its backing region), `dst` must be
+/// valid for `len` writes, and the two ranges must not overlap.
+#[cfg(not(nh_guest_test))]
+pub unsafe fn guest_copy_from_pa(
+    src_host: *const u8, _pa: u32, dst: *mut u8, len: usize,
+) -> bool {
+    unsafe { core::ptr::copy_nonoverlapping(src_host, dst, len); }
+    true
+}
+
+/// Guest-test variant: keeps the XOR-3 byte-lane transform by going
+/// through `guest_read_u8_pa` a byte at a time (test blits are tiny;
+/// reusing the lane math beats duplicating it here).
+#[cfg(nh_guest_test)]
+pub unsafe fn guest_copy_from_pa(
+    _src_host: *const u8, pa: u32, dst: *mut u8, len: usize,
+) -> bool {
+    for i in 0..len {
+        match guest_read_u8_pa(pa.wrapping_add(i as u32)) {
+            Some(b) => unsafe { dst.add(i).write(b) },
+            None => return false,
+        }
+    }
+    true
+}
+
 /// Read a single byte from a guest VA at the given Newton-side logical
 /// byte address. Walks stage-1 to find the PA, then delegates. Sole
 /// consumer is `diag::rep_print`'s guest-format-string reader, hence

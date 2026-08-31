@@ -59,6 +59,15 @@ pub trait HostIo: Sync {
     /// blocking.
     fn push_blit(&self, ev: &BlitEvent, payload: &[u8]);
 
+    /// True when this backend consumes the packed 2 bpp payload slice
+    /// passed to [`push_blit`]. Backends that render from GUEST_FB
+    /// directly (pi_fb) or drop blits (null) return false, which lets
+    /// `screen::blit` skip assembling the payload entirely; the
+    /// `BlitEvent` metadata still flows (with `payload_len` = 0).
+    fn wants_payload(&self) -> bool {
+        true
+    }
+
     /// Pump the backend's input transport: drain newly-arrived host
     /// pen events, enqueue them as Newton-format samples, and raise
     /// `INT_TABLET`. Called from the trap-return tail (`hv::trap`).
@@ -264,6 +273,13 @@ pub fn pop_pen_sample() -> Option<(u32, u32)> {
 /// Pump the backend's input transport — see [`HostIo::pump_input`].
 pub fn pump_input() {
     BACKEND.pump_input();
+}
+
+/// Whether the active backend consumes blit payloads — see
+/// [`HostIo::wants_payload`]. Pulled once by `main.rs` at boot and
+/// installed into `peripherals::screen` alongside the blit sink.
+pub fn wants_payload() -> bool {
+    BACKEND.wants_payload()
 }
 
 /// The Newton screen geometry the active backend mandates — see

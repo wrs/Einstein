@@ -102,7 +102,10 @@ pub extern "C" fn kmain() -> ! {
         #[cfg(feature = "serial-pen-inject")]
         rx: host::serial_pen::read_byte_nonblock,
     });
-    peripherals::screen::install_blit_sink(host::host_io::push_guest_blit);
+    peripherals::screen::install_blit_sink(
+        host::host_io::push_guest_blit,
+        host::host_io::wants_payload(),
+    );
     peripherals::tablet::install_pen_source(host::host_io::pop_pen_sample);
     peripherals::sound::install_audio_ops(peripherals::sound::AudioOps {
         set_interrupt_mask: host::audio::set_interrupt_mask,

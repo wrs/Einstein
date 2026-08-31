@@ -57,6 +57,11 @@ impl super::HostIo for PiFbBackend {
     fn push_blit(&self, ev: &super::BlitEvent, payload: &[u8]) {
         push_blit(ev, payload)
     }
+    fn wants_payload(&self) -> bool {
+        // `push_blit` samples pixels from GUEST_FB, never from the
+        // payload — let `screen::blit` skip assembling it.
+        false
+    }
     fn pump_input(&self) {
         // No input source on this backend directly; see `input::mtouch`.
     }

@@ -60,6 +60,10 @@ combos=(
     # The debug-deploy shape: serial pen injector + forced CPU-scale
     # fallback (the A/B switch for the VC-scaled surface).
     "pi-fb-force-cpu-scale::cargo check --release --no-default-features --features \"pi-bare-metal-input serial-pen-inject pi-fb-force-cpu-scale\""
+    # Rotation plumbing (default off): compile-level verification of
+    # the Rot90 combo — enabling it on hardware also needs the
+    # config.txt display_hdmi_rotate=1 pairing (docs/REAL_HW_BRINGUP.md).
+    "pi-fb-rot90::cargo check --release --no-default-features --features \"pi-bare-metal-input serial-pen-inject pi-fb-rot90\""
     "trace,quiet::cargo check --release --features \"trace quiet\""
     "trace_once::cargo check --release --features \"trace_once quiet\""
     "host-io-semihost::cargo check --release --features host-io-semihost"

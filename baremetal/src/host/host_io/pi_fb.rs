@@ -28,6 +28,14 @@
 //!   Engaged when the firmware refuses the small-physical /
 //!   large-mode split — see `alloc_guest_surface`'s probe.
 //!
+//! Portrait rotation ([`ROTATION`], `pi-fb-rot90` feature, default
+//! off) rides the VC path: the surface is allocated transposed, the
+//! paint loop is byte-identical (Newton rows stay 1:1 row-major),
+//! and the firmware rotates on scan-out (`display_hdmi_rotate=1` in
+//! config.txt — the feature asserts what config.txt does; no
+//! runtime readback exists). The CPU-bilinear fallback stays
+//! landscape-only. See docs/REAL_HW_BRINGUP.md "Portrait rotation".
+//!
 //! Painting is decoupled from the guest's blit calls: `push_blit`
 //! unions the dst Newton rect into a pending dirty rect and paints
 //! at most once per [`PAINT_INTERVAL_MS`] (~60 Hz). An isolated blit
@@ -61,6 +69,23 @@ pub const NEWTON_H: u32 = 480;
 /// 2 bpp grayscale — the MP2x00 panel depth `peripherals::screen`
 /// models.
 const NEWTON_BPP: u32 = 2;
+
+/// Scan-out rotation this build asserts the firmware applies —
+/// see [`super::Rotation`] for why it's a build assertion
+/// (`pi-fb-rot90` feature) rather than a runtime probe. `Rot0` by
+/// default. `Rot90` reshapes the VC-scaled surface transposed
+/// (`display::fb::alloc_guest_surface`), realigns the painted
+/// region here, and flips the touch map (`input::calibrate`) — the
+/// paint loop itself is unchanged (Newton rows stay 1:1 row-major;
+/// the firmware rotates on scan-out). The CPU-bilinear fallback is
+/// landscape-only: with `Rot90` selected it logs loudly at init and
+/// paints unrotated. UNVERIFIED ON HARDWARE — see
+/// docs/REAL_HW_BRINGUP.md "Portrait rotation".
+pub const ROTATION: super::Rotation = if cfg!(feature = "pi-fb-rot90") {
+    super::Rotation::Rot90
+} else {
+    super::Rotation::Rot0
+};
 
 pub struct PiFbBackend;
 
@@ -105,6 +130,12 @@ impl super::HostIo for PiFbBackend {
             offset_y: OFFSET_Y.load(Ordering::Relaxed),
             painted_w: PAINTED_W.load(Ordering::Relaxed),
             painted_h: PAINTED_H.load(Ordering::Relaxed),
+            // The scan-out rotation is a firmware property this build
+            // asserts, independent of which paint path won — even the
+            // (landscape-only) fallback scans out through the same
+            // firmware transform, so calibration must invert it
+            // either way.
+            rotation: ROTATION,
         })
     }
 }
@@ -232,14 +263,25 @@ fn init() {
         }
     };
 
-    // VC-scaled surface: Newton lands 1:1, centered horizontally,
-    // top-aligned (the surface height already carries the
-    // FIRMWARE_TOP_BAR_PX allowance — see `alloc_guest_surface`).
-    // The HVS scales the whole surface to the panel mode.
+    // VC-scaled surface: Newton lands 1:1; the HVS scales (and, under
+    // Rot90, rotates) the whole surface to the panel mode.
     if crate::host::display::fb::guest_surface_kind()
         == crate::host::display::fb::SurfaceKind::VcScaled
     {
-        let offset_x = info.width.saturating_sub(NEWTON_W) / 2;
+        let (offset_x, offset_y) = match ROTATION {
+            // Landscape: centered horizontally, top-aligned — the
+            // surface height carries the FIRMWARE_TOP_BAR_PX
+            // allowance (see `alloc_guest_surface`), so the spare
+            // rows sit at the bottom, where the bar-shifted scan-out
+            // clips.
+            super::Rotation::Rot0 => (info.width.saturating_sub(NEWTON_W) / 2, 0),
+            // Rot90: the bar allowance lives on the surface x axis
+            // (columns scan out as panel rows, column 0 at the panel
+            // top under the asserted 90° CW rotation) — left-align so
+            // the spare columns sit at the clipped panel-bottom edge,
+            // and center along y (rows scan out as panel columns).
+            super::Rotation::Rot90 => (0, info.height.saturating_sub(NEWTON_H) / 2),
+        };
         // SAFETY: single-core EL2, called once from kmain before any
         // other code touches these statics.
         unsafe {
@@ -251,7 +293,7 @@ fn init() {
         PAINTED_W.store(NEWTON_W, Ordering::Relaxed);
         PAINTED_H.store(NEWTON_H, Ordering::Relaxed);
         OFFSET_X.store(offset_x, Ordering::Relaxed);
-        OFFSET_Y.store(0, Ordering::Relaxed);
+        OFFSET_Y.store(offset_y, Ordering::Relaxed);
         // 1:1 — inverse scale is exactly one Newton pixel per painted
         // pixel. Unused by the 1:1 paint loop, but keeps
         // painted_region consumers' math uniform.
@@ -262,15 +304,37 @@ fn init() {
         // Boot-once geometry line — deliberately `kprintln!`, see the
         // fallback arm's comment.
         kprintln!(
-            "host_io_pi_fb: ready ({}x{} @ pa=0x{:x}, vc-scaled 1:1, newton {}x{} @ {},0)",
+            "host_io_pi_fb: ready ({}x{} @ pa=0x{:x}, vc-scaled 1:1{}, newton {}x{} @ {},{})",
             info.width,
             info.height,
             info.pa,
+            if ROTATION == super::Rotation::Rot90 {
+                " rot90"
+            } else {
+                ""
+            },
             NEWTON_W,
             NEWTON_H,
             offset_x,
+            offset_y,
         );
         return;
+    }
+
+    // The CPU-bilinear fallback cannot rotate (a rotating software
+    // blit writes down panel columns — the cache-miss-per-store
+    // pattern `display::fb::fill_h_gradient`'s doc records as a
+    // ~0.5 s full-screen fill — so it was deliberately not built).
+    // The firmware still rotates scan-out per config.txt, so the
+    // panel image will be sideways and anisotropically squashed
+    // until the VC-scaled path works again. Degraded diagnostic
+    // state: log loudly, paint landscape.
+    if ROTATION == super::Rotation::Rot90 {
+        kprintln!(
+            "host_io_pi_fb: WARNING: pi-fb-rot90 selected but the VC-scaled \
+             surface fell back to panel-native; the CPU-bilinear fallback is \
+             landscape-only — painting UNROTATED under a rotated scan-out"
+        );
     }
 
     // Panel-native surface (runtime fallback / pi-fb-force-cpu-scale):
@@ -468,10 +532,10 @@ fn paint_1to1(fb: &FbInfo, dst_left: u32, dst_top: u32, dst_right: u32, dst_bott
     for y in dst_top as usize..dst_bottom as usize {
         // SAFETY: y < NEWTON_H, xb0..xb1 ≤ stride — inside the
         // GUEST_FB backing (≥ NEWTON_H*stride bytes). Dst: init
-        // guarantees offset_x + NEWTON_W ≤ fb.width and offset_y (=0)
-        // + NEWTON_H ≤ fb.height for the VC-scaled surface
-        // (`alloc_guest_surface` sizes it that way), so every write
-        // lands inside [fb.pa, fb.pa+size).
+        // guarantees offset_x + NEWTON_W ≤ fb.width and offset_y
+        // + NEWTON_H ≤ fb.height for the VC-scaled surface in both
+        // rotations (`alloc_guest_surface` sizes it that way), so
+        // every write lands inside [fb.pa, fb.pa+size).
         unsafe {
             let src = guest_fb.add(y * stride + xb0);
             let dst = panel_ptr.add((y + offset_y) * pitch_words + row_px0);

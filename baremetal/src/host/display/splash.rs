@@ -105,6 +105,12 @@ pub fn init() -> Option<FbInfo> {
         crate::host::host_io::pi_fb::NEWTON_W,
         crate::host::host_io::pi_fb::NEWTON_H,
         crate::host::host_io::pi_fb::FIRMWARE_TOP_BAR_PX,
+        // Under rot90 the splash's own layout is NOT rotated — it
+        // paints row-major into the transposed surface and shows
+        // sideways until the guest's first blit. Cosmetic, accepted:
+        // the splash lives for a few seconds and rotating its layout
+        // would duplicate the geometry policy here.
+        crate::host::host_io::pi_fb::ROTATION == crate::host::host_io::Rotation::Rot90,
     ) {
         Ok(i) => i,
         Err(e) => {

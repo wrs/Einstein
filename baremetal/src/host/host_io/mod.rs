@@ -95,6 +95,25 @@ pub trait HostIo: Sync {
     }
 }
 
+/// Rotation the firmware applies between the scan-out surface and
+/// the physical panel (`display_hdmi_rotate` in boot-pi/config.txt).
+/// The build asserts it via the `pi-fb-rot90` feature (see
+/// `pi_fb::ROTATION`): the mailbox property catalogue documents no
+/// rotation-readback tag, so there is nothing to probe at runtime —
+/// the feature and the config.txt line are deployed together.
+///
+/// `Rot90` means the firmware rotates the surface 90° clockwise onto
+/// the panel mode (for a physically portrait-mounted monitor):
+/// surface columns scan out as panel rows (column 0 at the panel
+/// top), surface rows as panel columns (row 0 at the panel right).
+/// Only `Rot0` and `Rot90` exist — 180°/270° are out of scope.
+#[cfg(any(nh_host_io_pi_fb, nh_input_mtouch))]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Rotation {
+    Rot0,
+    Rot90,
+}
+
 /// Geometry of the painted Newton region on the backend's scan-out
 /// surface, all in *surface* pixels. Produced by
 /// [`HostIo::painted_region`]; consumed by `input::calibrate`.
@@ -119,6 +138,11 @@ pub struct PaintedRegion {
     /// surface; after aspect-preserving scale on a native one).
     pub painted_w: u32,
     pub painted_h: u32,
+    /// Scan-out rotation between this surface and the physical
+    /// panel. Touch samples arrive in *panel* orientation, so
+    /// `input::calibrate` inverts this before applying the
+    /// offset/size transform above.
+    pub rotation: Rotation,
 }
 
 #[cfg(nh_host_io_null)]

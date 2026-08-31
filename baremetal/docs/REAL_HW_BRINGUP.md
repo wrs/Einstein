@@ -553,6 +553,65 @@ panel-native surface with the old CPU software-bilinear scaler
 (force that path for A/B testing with the `pi-fb-force-cpu-scale`
 feature).
 
+### Portrait rotation (designed, default off — UNVERIFIED on hardware)
+
+The reason VC-first matters: with the firmware scaling scan-out, a
+90° rotation for a physically portrait-mounted monitor costs the CPU
+nothing — the paint loop is byte-identical, only the surface shape
+and the touch map change. The plumbing is wired end-to-end but OFF
+by default; **nothing below the config.txt line has ever run on
+hardware.**
+
+- **Selection: the `pi-fb-rot90` Cargo feature**, paired with
+  `display_hdmi_rotate=1` in `boot-pi/config.txt` (a commented-out
+  block sits there ready). A build feature rather than a runtime
+  probe because the mailbox property catalogue (the firmware-wiki
+  page `src/host/mailbox.rs` cites) documents no rotation/transform
+  readback tag — and config.txt can't be changed over the
+  serial-upload path anyway, so flipping rotation always means SD
+  card in hand; flip both together. A mismatched pair paints wrong
+  in either direction (there is nothing to detect it with).
+- **Geometry** (`display::fb::alloc_guest_surface`, `rot90` arm):
+  the surface is allocated with the panel's *transposed* aspect and
+  Newton's *width* pinned to the reserved-top allowance, since
+  surface columns scan out as panel rows:
+  `fb_w = content_w × panel_h / (panel_h − reserved_top_px)`,
+  `fb_h = panel_w × fb_w / panel_h`. For a 1920×1080 mode:
+  **325×578**, Newton 320×480 at offset (0, 49), HVS scale ×3.32 —
+  Newton spans ~1063 of 1080 panel rows and ~1595 of 1920 panel
+  columns (vs 709×1064 unrotated: ~2.2× the pixels).
+- **Painting** is unchanged: Newton rows land 1:1 row-major
+  (`pi_fb::paint_1to1`); the firmware rotates on scan-out. Newton is
+  left-aligned on the surface x axis (the bar-allowance columns sit
+  at the far edge) and centered on y. The boot splash is *not*
+  rotated — it shows sideways for its few seconds of life.
+- **Touch** (`input::calibrate`): the painted-region report carries
+  the `host_io::Rotation`, and the touch→surface map inverts it —
+  surface x from touch y, surface y from mirrored touch x (assuming
+  `display_hdmi_rotate=1` = 90° **clockwise**; if hardware shows it
+  is CCW, the mirror moves to the other axis).
+- **The CPU-bilinear fallback stays landscape-only** (a rotating
+  software blit writes down panel columns — the cache-miss-per-store
+  pattern that cost ~0.5 s per full fill pre-VC). If rot90 is
+  selected and the VC probe falls back, `pi_fb::init` logs a loud
+  WARNING and paints unrotated under the still-rotated scan-out.
+
+Known risks to retire when someone flips the config (both flagged
+in the plan, neither verified):
+
+1. **GPU memory.** 90°/270° firmware rotation is documented as
+   needing more GPU memory than `gpu_mem=16` — i.e. the full
+   `start.elf` instead of the shipped `start_cd.elf`. The full
+   firmware was tried once during the white-bar hunt so the SD-card
+   side is known workable, but rotation-under-full-firmware has not
+   been.
+2. **`FIRMWARE_TOP_BAR_PX`** (16 rows) must be re-measured under
+   rotation: the geometry assumes the bar still occupies the top
+   panel rows and shifts the scan region the same way, which maps to
+   surface *columns* (column 0 at panel top under 90° CW). The
+   left-align + spare-column choice mirrors the landscape top-align
+   + spare-row choice and rests on that assumption.
+
 ### Porting notes
 
 - **Batch all FB setup tags in a single mailbox message.** The Pi
@@ -633,12 +692,15 @@ source. The DWC2 implementation is cross-checked against Circle's
 `lib/usb/{dwhcidevice.cpp, dwhcixferstagedata.cpp, usbendpoint.cpp,
 usbhostcontroller.cpp}` + `include/circle/usb/dwhci.h`.
 
-Calibration (`src/host/input/calibrate.rs`): touch 0..1024 × 0..600 maps
-to the 1280×720 panel; Newton paints the centre 480×720. Letterbox
-bands (touch X < 320 or ≥ 704) are dropped; in-region,
-`newton_x = (touch_x - 320) * 320 / 384`,
-`newton_y = touch_y * 480 / 600`. Compile-time spot checks assert
-corners + centre.
+Calibration (`src/host/input/calibrate.rs`): the MTouch always
+reports in its 1024×600 logical space, physically coincident with
+the panel. `host_io::painted_region()` describes where Newton landed
+on the scan-out surface (offset + painted size, in surface pixels,
+plus the firmware's scan-out rotation); calibrate maps touch →
+surface (inverting the rotation when one is asserted) → painted
+region → Newton pixel, dropping touches in the letterbox bands. The
+same code serves the VC-scaled surface and the panel-native
+fallback — the linear maps compose either way.
 
 ### Porting notes (each cost a real-hw round-trip)
 

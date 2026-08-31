@@ -166,6 +166,26 @@ fn div_round(n: u32, d: u32) -> u32 {
 /// 866×487, content at x=(866-320)/2, scaled ×2.218 → visually
 /// ~709×1064 — the exact geometry the CPU bilinear path produced.
 ///
+/// **`rot90`** (the `pi-fb-rot90` build assertion — see
+/// `host_io::pi_fb::ROTATION`): the firmware rotates the surface 90°
+/// onto the unchanged panel mode (`display_hdmi_rotate=1`), so the
+/// surface gets the panel's *transposed* aspect and the content axis
+/// that spans the reserved-top panel rows is the content *width*
+/// (surface columns scan out as panel rows). Same formula, axes
+/// swapped:
+///
+/// ```text
+/// fb_w = content_w * panel_h / (panel_h - reserved_top_px)   (≈ content_w)
+/// fb_h = panel_w * fb_w / panel_h            (panel aspect, transposed)
+/// ```
+///
+/// For a 1920×1080 mode and 320×480 content with 16 reserved rows:
+/// 325×578, content at x=0 (bar-allowance columns spare on the
+/// right), y=(578-480)/2, scaled ×3.323 → Newton spans ~1063 of the
+/// 1080 panel rows and ~1595 of the 1920 panel columns. UNVERIFIED
+/// ON HARDWARE (needs the config.txt flip + full start.elf — see
+/// docs/REAL_HW_BRINGUP.md "Portrait rotation").
+///
 /// **Runtime probe + fallback.** After allocating, verify the
 /// firmware honoured the small physical size (returned w/h/pitch
 /// match) *and* kept the HDMI mode (pixel-clock readback unchanged —
@@ -179,6 +199,7 @@ pub fn alloc_guest_surface(
     content_w: u32,
     content_h: u32,
     reserved_top_px: u32,
+    rot90: bool,
 ) -> Result<FbInfo, FbError> {
     let (panel_w, panel_h) = mailbox::fb_get_physical_size()?;
     VC_SCALED_SURFACE.store(false, Ordering::Relaxed);
@@ -190,7 +211,11 @@ pub fn alloc_guest_surface(
     }
 
     let eff_h = panel_h.saturating_sub(reserved_top_px);
-    if panel_w == 0 || panel_h == 0 || eff_h < content_h {
+    // The content axis that scan-out maps onto panel rows: height in
+    // landscape; width under a 90° rotation (surface columns become
+    // panel rows).
+    let content_along_panel_h = if rot90 { content_w } else { content_h };
+    if panel_w == 0 || panel_h == 0 || eff_h < content_along_panel_h {
         kprintln!(
             "display: panel {}x{} unusable for a VC-scaled {}x{} surface; using panel-native",
             panel_w, panel_h, content_w, content_h
@@ -199,9 +224,21 @@ pub fn alloc_guest_surface(
         return alloc_with_reset(w, h);
     }
 
-    let fb_h = div_round(content_h * panel_h, eff_h);
-    let fb_w = div_round(panel_w * fb_h, panel_h);
-    if fb_w < content_w || fb_w > panel_w || fb_h > panel_h {
+    let (fb_w, fb_h) = if rot90 {
+        // Transposed formula (see the doc comment): content_w spans
+        // eff_h panel rows; surface aspect = panel aspect transposed.
+        let w = div_round(content_w * panel_h, eff_h);
+        let h = div_round(panel_w * w, panel_h);
+        (w, h)
+    } else {
+        let h = div_round(content_h * panel_h, eff_h);
+        let w = div_round(panel_w * h, panel_h);
+        (w, h)
+    };
+    // Range sanity against the axis each surface dimension scans out
+    // to (swapped under rot90).
+    let (scan_w, scan_h) = if rot90 { (panel_h, panel_w) } else { (panel_w, panel_h) };
+    if fb_w < content_w || fb_h < content_h || fb_w > scan_w || fb_h > scan_h {
         kprintln!(
             "display: VC-scaled geometry {}x{} out of range for panel {}x{}; using panel-native",
             fb_w, fb_h, panel_w, panel_h

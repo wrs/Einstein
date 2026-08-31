@@ -15,6 +15,12 @@
 //! backend that owns no physical panel (null, semihost) the report
 //! is `None` and every touch is dropped, so `input-mtouch` does not
 //! require the `host-io-pi-fb` backend at build time.
+//!
+//! The report also carries the firmware's scan-out
+//! [`host_io::Rotation`]: touch samples arrive in *panel*
+//! orientation, so under `Rot90` the touch→surface map is the
+//! rotation's inverse — a transpose plus one mirrored axis — before
+//! the (surface-space) offset/size transform runs unchanged.
 
 use crate::host::host_io;
 
@@ -35,12 +41,32 @@ pub fn panel_to_newton(touch_x: u16, touch_y: u16) -> Option<(u16, u16)> {
         return None;
     }
 
-    // Touch logical → panel pixel (linear; touch surface is
-    // physically coincident with the panel display area).
-    let panel_x = (touch_x as u32) * region.panel_w / TOUCH_W;
-    let panel_y = (touch_y as u32) * region.panel_h / TOUCH_H;
-    let px = panel_x as usize;
-    let py = panel_y as usize;
+    // Touch logical → surface pixel. The touch surface is physically
+    // coincident with the panel display area and reports in *panel*
+    // orientation; invert the firmware's surface→panel scan-out
+    // rotation to land in surface coordinates.
+    let (surf_x, surf_y) = match region.rotation {
+        // Identity scan-out: plain per-axis linear map (panel and
+        // surface axes coincide up to the HVS upscale, which the
+        // per-axis division absorbs).
+        host_io::Rotation::Rot0 => (
+            (touch_x as u32) * region.panel_w / TOUCH_W,
+            (touch_y as u32) * region.panel_h / TOUCH_H,
+        ),
+        // 90° CW scan-out: surface column 0 lands at the panel top
+        // and surface row 0 at the panel right, so surface x advances
+        // *down* the panel (from touch y) and surface y advances
+        // right-to-left (from mirrored touch x).
+        host_io::Rotation::Rot90 => (
+            (touch_y as u32) * region.panel_w / TOUCH_H,
+            region
+                .panel_h
+                .saturating_sub(1)
+                .saturating_sub((touch_x as u32) * region.panel_h / TOUCH_W),
+        ),
+    };
+    let px = surf_x as usize;
+    let py = surf_y as usize;
     let offset_x = region.offset_x as usize;
     let offset_y = region.offset_y as usize;
     if px < offset_x || py < offset_y {

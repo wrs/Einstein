@@ -325,6 +325,25 @@ serial-pen-inject = []
 #     --features "pi-bare-metal-input pi-fb-force-cpu-scale"
 pi-fb-force-cpu-scale = []
 
+# Assert that the Pi firmware rotates scan-out 90 degrees
+# (`display_hdmi_rotate=1` in boot-pi/config.txt) and shape the
+# VC-scaled surface for it: allocated transposed (panel aspect
+# swapped), Newton still painted 1:1 row-major, the HVS rotates +
+# scales on scan-out, and touch calibration inverts the rotation.
+# A build feature rather than a runtime probe because the mailbox
+# property catalogue documents no rotation-readback tag, and the
+# config.txt line can't be deployed over the serial-upload path
+# anyway — the feature and the config line must be flipped together
+# (SD card in hand). OFF by default; plumbing is verified at compile
+# level only. UNVERIFIED ON HARDWARE — see docs/REAL_HW_BRINGUP.md
+# "Portrait rotation" for the gpu_mem / FIRMWARE_TOP_BAR_PX caveats.
+# Only meaningful together with `host-io-pi-fb`; ignored by the
+# CPU-bilinear fallback path (landscape-only — it logs loudly and
+# paints unrotated).
+#   cargo build --release --no-default-features \
+#     --features "pi-bare-metal-input pi-fb-rot90"
+pi-fb-rot90 = []
+
 # Silence recurring diagnostic logs that otherwise dominate the console
 # (stage-1 XN re-walks on every MMU toggle, etc.).
 # Off by default; enable with `--features quiet` alongside `trace` to

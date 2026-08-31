@@ -95,20 +95,22 @@ build combinations in `scripts/check-matrix.sh` pass.
    windows per second. Until then, §4.4's TLBI rule stands: the DC
    toggle without TLB maintenance corrupts guest memory.
 
-10. **Video path — remaining latency is guest-side.** The EL2 cost
-    the stall watermark attributed to `pi_fb::push_blit` (22-33 ms
-    per full-screen paint, the 40-71 ms audio IRQ-dispatch gaps) is
-    fixed: `screen::blit` runs per-page walks + bulk copies
-    (avg 3.0 ms → ~0.1 ms), the panel is a small VC-scaled surface
-    painted 1:1 and HVS-upscaled (push_blit avg 6.9 ms → ~0.1-0.4 ms,
-    max 23 ms → ~1 ms), and paints coalesce through a dirty rect at
-    ~60 Hz. Measured with the `blit_timing` counters and the
-    digitizer/serial-tap harness (`docs/REAL_HW_BRINGUP.md` "Serial
-    pen injection"). What remains:
-    - Tap-to-quiescent for a drawer animation is still 1.2-2.0 s
-      wall time across only ~4 blits — the latency sits *between*
-      blits, in the guest view system, not in EL2. Attacking it
-      means profiling the guest, not the paint path.
+10. **Video path — follow-ups.** The paint layers are cheap
+    (`screen::blit` per-page walks + bulk copies, ~0.1 ms avg;
+    `push_blit` 1:1 onto the VC-scaled surface, ~0.1-0.4 ms avg,
+    coalesced at ~60 Hz) and the animation stall is fixed (the
+    alignment-fault install path's rejected-PC bitmap; NewtTest
+    open 0.87 s, Extras 0.37 s — the hunt is in
+    `docs/project-history.md` §10). Attribution tooling: the
+    `blit_timing` counters, the digitizer/serial-tap harness
+    (`docs/REAL_HW_BRINGUP.md` "Serial pen injection"), and the
+    trap-hist per-window masked-EL2-time line. What remains:
+    - A window-open still bursts ~140k alignment faults (~0.15 s of
+      EL2 at ~0.9 us each) through a handful of no-dead-scratch
+      sites (0xe863c/0xe865c top). Eliminating the trap needs
+      spill-based inline stubs (save/restore a register via a
+      per-stub pool slot instead of requiring dead scratches) —
+      re-entrancy vs IRQs needs thought before building it.
     - Portrait rotation is plumbed end-to-end (`pi-fb-rot90` +
       `display_hdmi_rotate=1`, flipped together, SD card in hand)
       but UNVERIFIED on hardware: gpu_mem/full-start.elf need,

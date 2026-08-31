@@ -49,6 +49,11 @@ use crate::arch::trap_context::TrapContext;
 pub fn handle_align_fault(ctx: &mut TrapContext) {
     use core::sync::atomic::{AtomicU32, Ordering};
     static N: AtomicU32 = AtomicU32::new(0);
+    // Wall-clock accumulator for the whole emulation (µs since the
+    // last stats dump) — `unaligned_inline::log_stats` prints
+    // and resets it, attributing the Align share of EL2 time.
+    let t0 = crate::newton::unaligned_inline::now_us();
+    let _t = crate::newton::unaligned_inline::AlignTimeGuard(t0);
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
     // Throttle the per-fault decode diagnostic to the first N faults —
     // alignment faults fire millions of times over a boot, so unbounded

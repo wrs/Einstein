@@ -270,7 +270,11 @@ fn dump_and_reset() {
         return;
     }
 
-    kprintln!("trap-hist: total={} sync traps in window", total);
+    let (el2_total_us, el2_ec_us) = crate::diag::stall::take_window_ec_us();
+    kprintln!(
+        "trap-hist: total={} sync traps in window, {}us masked-EL2 time",
+        total, el2_total_us
+    );
 
     // EC entries sorted desc, nonzero only.
     let mut ec_idx: [usize; EC_BUCKETS] = [0; EC_BUCKETS];
@@ -288,10 +292,11 @@ fn dump_and_reset() {
         let i = ec_idx[k];
         if ec[i] == 0 { break; }
         kprintln!(
-            "  EC={:#04x} {}: {}",
+            "  EC={:#04x} {}: {} ({}us)",
             i,
             crate::arch::trap_context::describe_ec(i as u32),
-            ec[i]
+            ec[i],
+            el2_ec_us[i]
         );
     }
 

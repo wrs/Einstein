@@ -119,20 +119,39 @@ const REJ_TOPK: usize = 16;
 static mut REJ_NO_DEAD_PCS: crate::diag::diag_util::TopK<REJ_TOPK> =
     crate::diag::diag_util::TopK::new();
 
-/// Known-rejected-PC cache. A PC that fails `pick_scratches`
-/// (no_dead_scratches) is rejected *deterministically*: the rejection
-/// depends only on the code at that PC — the decoded operands and the
-/// CFG-liveness set at PC+4 — never on dynamic state (see
-/// `try_install_at`). So once a PC is known rejected, re-running the
-/// decode + `live_regs_at` CFG walk on every subsequent alignment fault
-/// at that PC is pure waste. Cache up to `REJ_CACHE_N` such PCs and
-/// short-circuit them at entry. Capacity-bounded: once full, new
-/// rejected PCs aren't cached (they just keep paying the walk), which is
-/// correct, just slower for the tail. Single-core-EL2 safety is
-/// documented on `diag_util::SeenSet`.
-const REJ_CACHE_N: usize = 32;
-static mut REJECTED_PC_CACHE: crate::diag::diag_util::SeenSet<u32, REJ_CACHE_N> =
-    crate::diag::diag_util::SeenSet::new(0);
+/// Known-rejected-PC bitmap: one bit per ROM word below the install
+/// limit. A PC that fails `pick_scratches` (no_dead_scratches) is
+/// rejected *deterministically*: the rejection depends only on the
+/// code at that PC — the decoded operands and the CFG-liveness set at
+/// PC+4 — never on dynamic state (see `try_install_at`). Once a PC is
+/// known rejected, re-running the decode + `live_regs_at` CFG walk
+/// (~40 µs) on every subsequent alignment fault at that PC is pure
+/// waste — and a hot guest loop with one such site would spend nearly
+/// all of its wall time in that walk. The record must therefore be
+/// exact and never-full: the ROM holds far more no-dead-scratch LDR
+/// sites than any small cache, so this is a bitmap over the whole
+/// patchable range (288 KiB of .bss), O(1) per probe, no eviction.
+/// SAFETY: single-core EL2, touched only from the trap path.
+const REJ_BITMAP_BYTES: usize =
+    (crate::newton::rom_ver::ROM_TAIL.tracer_pool_base as usize / 4).div_ceil(8);
+static mut REJECTED_PC_BITMAP: [u8; REJ_BITMAP_BYTES] = [0; REJ_BITMAP_BYTES];
+
+/// True when `pc` (word-aligned, below the install limit) has a
+/// recorded deterministic no-dead-scratches rejection.
+fn rejected_pc_contains(pc: u32) -> bool {
+    let idx = pc as usize / 4;
+    // SAFETY: single-core EL2 (see REJECTED_PC_BITMAP); idx bounded by
+    // the caller's ALIGN_INLINE_PC_LIMIT check.
+    unsafe { ((*core::ptr::addr_of!(REJECTED_PC_BITMAP))[idx / 8] >> (idx % 8)) & 1 != 0 }
+}
+
+fn rejected_pc_insert(pc: u32) {
+    let idx = pc as usize / 4;
+    // SAFETY: as above.
+    unsafe {
+        (*core::ptr::addr_of_mut!(REJECTED_PC_BITMAP))[idx / 8] |= 1 << (idx % 8);
+    }
+}
 
 /// Detailed-log budget: log every install up to this count, then
 /// summary-only. Matches `unaligned::LOG_FIRST`'s convention.
@@ -142,6 +161,41 @@ const LOG_FIRST_INSTALLS: u32 = 40;
 /// every N installs. 0 disables the periodic line.
 const PERIODIC_STATS_EVERY: u32 = 100;
 
+/// CNTPCT-derived µs, read locally (the layering lint bars newton
+/// from importing host::console's equivalent).
+pub fn now_us() -> u64 {
+    let ticks: u64;
+    let freq: u64;
+    // SAFETY: read-only sysregs.
+    unsafe {
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) ticks,
+            options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq,
+            options(nomem, nostack, preserves_flags));
+    }
+    ticks.saturating_mul(1_000_000) / freq.max(1)
+}
+
+/// Accumulated µs inside `handle_align_fault` (entry to return,
+/// including the `try_install_at` tail) since the last stats dump.
+pub static ALIGN_TOTAL_US: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Accumulated µs inside `try_install_at` since the last stats dump.
+pub static INSTALL_TOTAL_US: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// RAII guard: adds the elapsed time since construction to
+/// [`ALIGN_TOTAL_US`] on every `handle_align_fault` exit path.
+pub struct AlignTimeGuard(pub u64);
+impl Drop for AlignTimeGuard {
+    fn drop(&mut self) {
+        ALIGN_TOTAL_US.fetch_add(
+            now_us().wrapping_sub(self.0),
+            Ordering::Relaxed,
+        );
+    }
+}
+
 /// Try to install an inline stub at `faulting_pc`. The EL2 emulator
 /// must still complete *this* fault; the installed stub takes effect
 /// on the next execution of `faulting_pc`.
@@ -150,6 +204,16 @@ const PERIODIC_STATS_EVERY: u32 = 100;
 /// caller (`unaligned::handle_align_fault`) doesn't care — partial
 /// coverage is fine.
 pub fn try_install_at(faulting_pc: u32) -> bool {
+    let t0 = now_us();
+    let r = try_install_at_inner(faulting_pc);
+    INSTALL_TOTAL_US.fetch_add(
+        now_us().wrapping_sub(t0),
+        Ordering::Relaxed,
+    );
+    r
+}
+
+fn try_install_at_inner(faulting_pc: u32) -> bool {
     // The faulting PC must be in the Newton ROM/REX region — i.e.
     // strictly below the tracer trampoline pool (0x00900000) and the
     // stub pool (0x00E00000). Patching code in those pools would
@@ -166,7 +230,7 @@ pub fn try_install_at(faulting_pc: u32) -> bool {
     // Short-circuit PCs we've already deterministically rejected for
     // no_dead_scratches: skip the decode + CFG-liveness walk entirely.
     // SAFETY: single-core EL2; see diag_util module docs.
-    if unsafe { (*core::ptr::addr_of!(REJECTED_PC_CACHE)).contains(faulting_pc) } {
+    if rejected_pc_contains(faulting_pc) {
         REJ_NO_DEAD_SCRATCHES.fetch_add(1, Ordering::Relaxed);
         STUBS_REJECTED.fetch_add(1, Ordering::Relaxed);
         return false;
@@ -221,15 +285,15 @@ pub fn try_install_at(faulting_pc: u32) -> bool {
             REJ_NO_DEAD_SCRATCHES.fetch_add(1, Ordering::Relaxed);
             STUBS_REJECTED.fetch_add(1, Ordering::Relaxed);
             // SAFETY: single-core EL2; the REJ_NO_DEAD_PCS top-K is also
-            // touched by the dump's snapshot+reset, the REJECTED_PC_CACHE
-            // only by the entry probe above — all on core 0 in-trap.
+            // touched by the dump's snapshot+reset — all on core 0
+            // in-trap.
             unsafe {
                 (*core::ptr::addr_of_mut!(REJ_NO_DEAD_PCS)).record(faulting_pc);
-                // Cache this PC so the next fault here skips the decode +
-                // CFG walk. Deterministic: the rejection is a function of
-                // the code at `faulting_pc` alone.
-                (*core::ptr::addr_of_mut!(REJECTED_PC_CACHE)).insert(faulting_pc);
             }
+            // Record this PC so the next fault here skips the decode +
+            // CFG walk. Deterministic: the rejection is a function of
+            // the code at `faulting_pc` alone.
+            rejected_pc_insert(faulting_pc);
             return false;
         }
     };
@@ -478,11 +542,14 @@ pub fn log_stats() {
     let d_imm = imm_too_big.wrapping_sub(prev.rej_offset_imm);
 
     crate::kprintln!(
-        "unaligned_inline: installed={} (+{}) rejected={} (+{}) since boot",
+        "unaligned_inline: installed={} (+{}) rejected={} (+{}) since boot, \
+         align_emu={}us (install={}us) in window",
         installed,
         d_installed,
         rejected,
-        d_rejected
+        d_rejected,
+        ALIGN_TOTAL_US.swap(0, Ordering::Relaxed),
+        INSTALL_TOTAL_US.swap(0, Ordering::Relaxed)
     );
     if d_rejected != 0 {
         crate::kprintln!(

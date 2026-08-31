@@ -42,6 +42,14 @@ static CUR_TAG: AtomicU64 = AtomicU64::new(0);
 static MAX_TICKS: AtomicU64 = AtomicU64::new(0);
 /// Tag of that longest stretch.
 static MAX_TAG: AtomicU64 = AtomicU64::new(0);
+/// Accumulated masked-EL2 time since the last `take_window_ec_us`,
+/// total and split by sync-trap EC — `trap_hist`'s ~2 s window dump
+/// consumes these, turning the trap-rate histogram into a time-share
+/// answer (how much of the window the CPU spent inside EL2 handlers
+/// vs running the guest). IRQ and window-tail stretches land in the
+/// total only.
+static WINDOW_TOTAL_TICKS: AtomicU64 = AtomicU64::new(0);
+static WINDOW_SYNC_EC_TICKS: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
 
 fn pack_tag(kind: u8, ec: u32, pc: u32) -> u64 {
     ((kind as u64) << 40) | (((ec & 0x3f) as u64) << 32) | pc as u64
@@ -73,9 +81,15 @@ pub fn stretch_end() {
         return;
     }
     let dur = cntpct().wrapping_sub(start);
+    let tag = CUR_TAG.load(Ordering::Relaxed);
     if dur > MAX_TICKS.load(Ordering::Relaxed) {
         MAX_TICKS.store(dur, Ordering::Relaxed);
-        MAX_TAG.store(CUR_TAG.load(Ordering::Relaxed), Ordering::Relaxed);
+        MAX_TAG.store(tag, Ordering::Relaxed);
+    }
+    WINDOW_TOTAL_TICKS.fetch_add(dur, Ordering::Relaxed);
+    if ((tag >> 40) & 0xff) as u8 == KIND_SYNC {
+        WINDOW_SYNC_EC_TICKS[((tag >> 32) & 0x3f) as usize]
+            .fetch_add(dur, Ordering::Relaxed);
     }
 }
 
@@ -130,6 +144,27 @@ pub fn take_max_us() -> Option<(u64, u8, u32, u32)> {
         ((tag >> 32) & 0x3f) as u32,
         tag as u32,
     ))
+}
+
+/// Take-and-reset the accumulated masked-EL2 window time:
+/// `(total_us, per_sync_ec_us)`. Consumed by `trap_hist`'s window
+/// dump; the reset keeps its window semantics (each dump covers the
+/// time since the previous one).
+pub fn take_window_ec_us() -> (u64, [u64; 64]) {
+    let freq: u64;
+    // SAFETY: read-only sysreg.
+    unsafe {
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq,
+            options(nomem, nostack, preserves_flags));
+    }
+    let freq = freq.max(1);
+    let total = WINDOW_TOTAL_TICKS.swap(0, Ordering::Relaxed)
+        .saturating_mul(1_000_000) / freq;
+    let mut ec = [0u64; 64];
+    for (i, slot) in WINDOW_SYNC_EC_TICKS.iter().enumerate() {
+        ec[i] = slot.swap(0, Ordering::Relaxed).saturating_mul(1_000_000) / freq;
+    }
+    (total, ec)
 }
 
 /// Short label for a stretch kind, for log lines.

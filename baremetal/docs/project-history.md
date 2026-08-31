@@ -493,6 +493,33 @@ and ten rounds by the end, never committed — was distilled into
   fixed in June) and the `WaitBusy` refactor that removed the last
   in-IRQ busy-wait. The background save ships unconditionally on.
 
+## 10. The video-path phases and the quadratic animation (08-30)
+
+The written five-phase video plan was executed by one subagent per
+phase (measurement loop, `screen::blit` fast path, VC-scaled 1:1
+surface, dirty-rect coalescing, rotation plumbing), each hardware-
+validated against a digitizer+serial-tap benchmark built in Phase 1.
+EL2 paint cost fell ~20-50x per layer — and the original complaint
+(a full-width window opening over several seconds, per-frame time
+growing quadratically) did not move at all. The wrap-up's "the
+latency sits guest-side between blits" conclusion survived less than
+an hour of contact with the user: a new per-window masked-EL2-time
+metric (accumulated through the existing stall-stretch guards and
+printed by the trap-hist dump) showed 97-99% of wall time inside the
+HVC Align path, ~45 us per alignment fault. Of that, ~41 us was
+`try_install_at` re-running its CFG liveness walk on every fault:
+the 32-entry rejected-PC cache had been silently full since boot,
+and the animation's hot loop (`ldr r2, [ip, r2, lsl #1]` halfword-
+table reads at 0xe863c/0xe865c) was in the uncached tail. Each
+animation step reads linearly more table entries → linearly more
+45 us faults per step → the quadratic feel. The fix is an exact
+one-bit-per-ROM-word rejection bitmap (288 KiB, no eviction):
+0.9 us per fault, NewtTest open 6.5-10.6 s → 0.87 s, Extras drawer
+0.37 s. Two lessons the rules already knew, re-learned: a
+capacity-bounded cache that degrades silently is a trip-wire
+removed, and "the guest is just slow" is a conclusion only a
+time-share measurement can license — a trap-rate histogram cannot.
+
 ## The hardest investigations
 
 | When | Symptom | How it was cracked | Root cause | Effort |

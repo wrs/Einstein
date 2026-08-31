@@ -350,6 +350,31 @@ scripts/pi-upload.py --port unix:serial.sock --no-power-cycle --kernel <elf> \
 out `-device loader` to exercise the no-image path, `-drive` to
 exercise the persist-failure path.)
 
+### Serial pen injection + capture-side measurement
+
+The see-and-measure loop for display work runs over the same wire and
+a USB HDMI digitizer on the Pi's HDMI output:
+
+- **`serial-pen-inject`** (Cargo feature, deliberately not in any
+  `pi-bare-metal*` aggregate): an escape shim on the guest
+  external-serial RX seam turns `~p<x>,<y>[,<hold_ms>]\n` lines from
+  the host console into pen taps on the same queue mtouch feeds
+  (`src/host/serial_pen.rs`). Newton coordinates (320x480). With the
+  feature off the RX wiring is byte-identical to a build without it,
+  so production builds cannot be driven from the wire.
+- **`scripts/capture-timing.py`**: records the digitizer via ffmpeg
+  avfoundation (device resolved by name, never index) and prints a
+  per-frame change timeline; `grab` computes a luma-threshold bounding
+  box of the painted region (the geometry regression check); `record
+  --tap x,y` sends a pen tap over the serial port mid-capture, so
+  tap-to-quiescent for a UI animation becomes a number.
+- **`blit_timing`** (`src/diag/blit_timing.rs`, `diag` builds): per-16
+  window count/total/avg/max lines for `screen.blit` (emulation) and
+  `push_blit` (paint), separately attributable.
+
+The standard benchmark: `record --seconds 15 --tap 18,453` (opens the
+Extras drawer), `--tap 306,421` (closes it), `grab` for the bbox.
+
 ### Recovery and limits
 
 - A bad upload (line noise past the CRCs, a power cut during the

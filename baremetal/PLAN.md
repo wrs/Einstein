@@ -95,17 +95,39 @@ build combinations in `scripts/check-matrix.sh` pass.
    windows per second. Until then, §4.4's TLBI rule stands: the DC
    toggle without TLB maintenance corrupts guest memory.
 
-10. **Cheapen the pi_fb blit upscale.** The EL2 stall watermark
-    (`diag::stall`, reported on the `late period` line) attributed
-    the 40-71 ms audio IRQ-dispatch gaps to `pi_fb::push_blit`: the
-    software-bilinear panel repaint runs 22-33 ms of EL2 CPU for a
-    full-screen Newton update. It now paints inside
-    `with_irqs_unmasked` so audio/timer IRQs are serviced mid-blit,
-    but the CPU cost itself remains — it stalls the *guest* for the
-    duration and bounds UI repaint rate. Options if that matters:
-    precomputed per-axis sample/weight tables, nearest-neighbor for
-    small rects, or the VC4 HVS scaler. Watch new captures for any
-    other `max_masked_us` culprit the watermark surfaces.
+10. **Video path — remaining latency is guest-side.** The EL2 cost
+    the stall watermark attributed to `pi_fb::push_blit` (22-33 ms
+    per full-screen paint, the 40-71 ms audio IRQ-dispatch gaps) is
+    fixed: `screen::blit` runs per-page walks + bulk copies
+    (avg 3.0 ms → ~0.1 ms), the panel is a small VC-scaled surface
+    painted 1:1 and HVS-upscaled (push_blit avg 6.9 ms → ~0.1-0.4 ms,
+    max 23 ms → ~1 ms), and paints coalesce through a dirty rect at
+    ~60 Hz. Measured with the `blit_timing` counters and the
+    digitizer/serial-tap harness (`docs/REAL_HW_BRINGUP.md` "Serial
+    pen injection"). What remains:
+    - Tap-to-quiescent for a drawer animation is still 1.2-2.0 s
+      wall time across only ~4 blits — the latency sits *between*
+      blits, in the guest view system, not in EL2. Attacking it
+      means profiling the guest, not the paint path.
+    - Portrait rotation is plumbed end-to-end (`pi-fb-rot90` +
+      `display_hdmi_rotate=1`, flipped together, SD card in hand)
+      but UNVERIFIED on hardware: gpu_mem/full-start.elf need,
+      `FIRMWARE_TOP_BAR_PX` under rotation, rotation direction.
+    - Deferred, in likely-value order: 8 bpp paletted surface
+      (needs `SET_PALETTE` in mailbox.rs; quarters write
+      bandwidth), double-buffered flips (`fb_set_virtual_offset`
+      is implemented and unused), DMA offload (host_dma.rs lacks
+      `TI_DEST_INC`/`TI_TDMODE`; low value while the CPU
+      format-converts), Normal-NC framebuffer remap (only if cache
+      maintenance ever dominates again).
+
+11. **HDMI audio CTS mis-derived on high-clock sinks.**
+    `cts_pixel_clock_hz` treats any >=80 MHz pixel-clock readback as
+    the known-bad PLL artifact and substitutes the 51.2 MHz panel
+    constant — but a genuine 1080p sink (the capture digitizer)
+    really runs 148.5 MHz, so audio CTS is computed from the wrong
+    clock there. Needs a discriminator better than a threshold
+    (e.g. compare against the mode geometry the firmware reports).
 
 Real-hardware specifics (cores 1–3 left parked, snapshot ring deferred
 on hardware, thermal re-verification) are tracked in

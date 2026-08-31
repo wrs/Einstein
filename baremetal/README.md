@@ -263,6 +263,9 @@ unspecified.
 | `log_*`                | partial | Per-subsystem diagnostic logging. Default carries the low-volume tier (`log_traps`, `log_irqs`, `log_host_io`); the investigation tiers (`log_mmu`, `log_unaligned`, `log_tasks`, `log_store`) are opt-in. |
 | `ns_trace`             | no      | Open the kernel's TInterpreter trace gates (NS-level DoSend/DoCall logging).         |
 | `sd-probe`, `fb-probe` | no      | Standalone real-hw bring-up probes (boot, test one peripheral, halt).                |
+| `serial-pen-inject`    | no      | Debug pen injector: `~p<x>,<y>` lines on the host console inject taps (real hw; not in any aggregate — see `docs/REAL_HW_BRINGUP.md`). |
+| `pi-fb-force-cpu-scale`| no      | Skip the VC-scaled surface; force the panel-native CPU-bilinear path (hardware A/B). |
+| `pi-fb-rot90`          | no      | Assert firmware 90° scan-out rotation (`display_hdmi_rotate=1` pairing); transposed VC surface + rotated touch map. UNVERIFIED on hardware. |
 
 Aggregates for real hardware (`pi-bare-metal`, `pi-bare-metal-sd`,
 `pi-bare-metal-display`, `pi-bare-metal-input`) roll up

@@ -70,7 +70,12 @@ impl BlitTimer {
 /// `peripherals::screen::blit` emulation cost — function entry up to
 /// (excluding) the push into the host-io sink.
 pub static EMULATE: BlitTimer = BlitTimer::new("screen.blit");
-/// Active host-io backend `push_blit` paint cost.
+/// Active host-io backend paint cost. semihost records around each
+/// `push_blit` call; pi_fb defers painting (dirty-rect coalescing)
+/// and records around each *actual* paint instead — immediate or
+/// trap-tail flush — so one record may cover several coalesced
+/// blits. The label stays `push_blit` so hardware windows remain
+/// comparable across phases.
 pub static PAINT: BlitTimer = BlitTimer::new("push_blit");
 
 /// Start-of-measurement timestamp in µs. Pair with

@@ -28,13 +28,21 @@
 //!   Engaged when the firmware refuses the small-physical /
 //!   large-mode split — see `alloc_guest_surface`'s probe.
 //!
-//! On each `push_blit` we repaint only the surface rect affected by
-//! the dst Newton rect, sampling from `guest_mem::fb_host_pa()` —
-//! by the time `push_blit` runs, `peripherals::screen::blit` has
-//! already written the new 2 bpp pixels into `GUEST_FB`, so reading
-//! from there picks up the latest content.
+//! Painting is decoupled from the guest's blit calls: `push_blit`
+//! unions the dst Newton rect into a pending dirty rect and paints
+//! at most once per [`PAINT_INTERVAL_MS`] (~60 Hz). An isolated blit
+//! (pen ink, a clock tick) paints synchronously — the interval since
+//! the last paint has long passed — while an animation's blit burst
+//! accumulates and is flushed from the trap-return tail
+//! ([`super::HostIo::pump_input`] runs there in every pi build
+//! variant, with or without `serial-pen-inject`). Deferral has no
+//! correctness cost: both paint paths sample from
+//! `guest_mem::fb_host_pa()` — by the time `push_blit` runs,
+//! `peripherals::screen::blit` has already written the new 2 bpp
+//! pixels into `GUEST_FB` — so a later paint of the unioned rect
+//! always shows the current content.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use super::BlitEvent;
 use crate::host::display::fb::FbInfo;
@@ -61,8 +69,11 @@ impl super::HostIo for PiFbBackend {
         init()
     }
     fn on_resume(&self) {
-        // Repaint the panel from the restored GUEST_FB. No host-side
-        // state of our own to reset beyond that.
+        // Repaint the panel from the restored GUEST_FB. Force the
+        // paint-interval window open first so the repaint paints
+        // synchronously instead of waiting out a pre-snapshot
+        // deadline (CNTPCT keeps running across a restore).
+        NEXT_PAINT_CNTPCT.store(0, Ordering::Relaxed);
         super::push_full_repaint(NEWTON_W, NEWTON_H, NEWTON_BPP);
     }
     fn push_blit(&self, ev: &super::BlitEvent, payload: &[u8]) {
@@ -74,7 +85,10 @@ impl super::HostIo for PiFbBackend {
         false
     }
     fn pump_input(&self) {
-        // No input source on this backend directly; see `input::mtouch`.
+        // No input source on this backend directly (pen input is
+        // `input::mtouch`); the trap-tail cadence instead drives the
+        // deferred dirty-rect flush.
+        flush_deferred();
     }
     fn panel_geometry(&self) -> Option<(u32, u32)> {
         // The pin is a compile-time property of this backend, not an
@@ -174,6 +188,23 @@ static OFFSET_Y: AtomicU32 = AtomicU32::new(0);
 /// are equal in practice — kept separate to keep the math local).
 static INV_SCALE_X_Q16: AtomicU32 = AtomicU32::new(0);
 static INV_SCALE_Y_Q16: AtomicU32 = AtomicU32::new(0);
+
+/// Pending dirty rect in Newton pixels, awaiting a paint. Empty iff
+/// `DIRTY_RIGHT <= DIRTY_LEFT` (the reset state: left/top at MAX,
+/// right/bottom at 0, so `fetch_min`/`fetch_max` union correctly
+/// from empty). Written by `push_blit`, consumed by `flush_pending`.
+/// Single-core EL2, and the slim same-EL ISR runs no host-io pumps
+/// (`hv::trap::irq_from_el2`'s contract), so a paint's
+/// `with_irqs_unmasked` window cannot race these.
+static DIRTY_LEFT: AtomicU32 = AtomicU32::new(u32::MAX);
+static DIRTY_TOP: AtomicU32 = AtomicU32::new(u32::MAX);
+static DIRTY_RIGHT: AtomicU32 = AtomicU32::new(0);
+static DIRTY_BOTTOM: AtomicU32 = AtomicU32::new(0);
+/// Earliest CNTPCT at which the next paint may run; 0 = paint now.
+/// Same throttle shape as `semihost`'s `NEXT_PUMP_CNTPCT`.
+static NEXT_PAINT_CNTPCT: AtomicU64 = AtomicU64::new(0);
+/// Minimum wall time between paints (~60 Hz).
+const PAINT_INTERVAL_MS: u64 = 16;
 
 #[allow(static_mut_refs)]
 fn fb() -> Option<&'static FbInfo> {
@@ -328,6 +359,46 @@ fn push_blit(ev: &BlitEvent, _payload: &[u8]) {
         return;
     }
 
+    // Coalesce: union into the pending dirty rect. GUEST_FB already
+    // holds the new pixels, so deferring just means a later flush
+    // paints a superset.
+    DIRTY_LEFT.fetch_min(dst_left, Ordering::Relaxed);
+    DIRTY_TOP.fetch_min(dst_top, Ordering::Relaxed);
+    DIRTY_RIGHT.fetch_max(dst_right, Ordering::Relaxed);
+    DIRTY_BOTTOM.fetch_max(dst_bottom, Ordering::Relaxed);
+
+    // Paint policy: paint synchronously when [`PAINT_INTERVAL_MS`]
+    // has already elapsed since the last paint — an isolated blit
+    // (pen ink, a clock tick) pays no added latency. Inside the
+    // interval the rect only accumulates; `pump_input` flushes it
+    // from the trap-return tail once the interval expires, so a
+    // burst's final blit is painted at most one trap late.
+    let now = cntpct();
+    let next = NEXT_PAINT_CNTPCT.load(Ordering::Relaxed);
+    if next == 0 || now >= next {
+        flush_pending(fb, now);
+    }
+}
+
+/// Paint the pending dirty rect, if any, and start a new
+/// [`PAINT_INTERVAL_MS`] window. `now` is the caller's CNTPCT read.
+///
+/// This is where `diag::blit_timing::PAINT` records — once per
+/// *actual* paint, whether immediate or trap-tail-deferred, so a
+/// window line keeps measuring paint work (one record may cover
+/// several coalesced blits). `host_io::push_guest_blit` skips its
+/// generic PAINT wrapper for this backend.
+fn flush_pending(fb: &FbInfo, now: u64) {
+    let dst_left = DIRTY_LEFT.swap(u32::MAX, Ordering::Relaxed);
+    let dst_top = DIRTY_TOP.swap(u32::MAX, Ordering::Relaxed);
+    let dst_right = DIRTY_RIGHT.swap(0, Ordering::Relaxed);
+    let dst_bottom = DIRTY_BOTTOM.swap(0, Ordering::Relaxed);
+    if dst_right <= dst_left || dst_bottom <= dst_top {
+        return;
+    }
+    let interval = (PAINT_INTERVAL_MS * cntfrq()) / 1_000;
+    NEXT_PAINT_CNTPCT.store(now.wrapping_add(interval), Ordering::Relaxed);
+
     // A full-screen CPU-bilinear paint measures 22–33 ms (the EL2
     // stall watermark attributed the audio "late period" stalls to
     // exactly this handler) — far past the audio pump's tolerance, so
@@ -336,8 +407,9 @@ fn push_blit(ev: &BlitEvent, _payload: &[u8]) {
     // we loop. The 1:1 path is ~10× cheaper but the wrapper costs
     // nothing, so both paths keep it. Nothing here touches
     // slim-ISR-owned state (panel FB writes, guest FB reads, pi_fb
-    // scaling atomics), and the guest is not running while EL2
-    // paints, so nothing re-enters.
+    // scaling and dirty-rect atomics), and the guest is not running
+    // while EL2 paints, so nothing re-enters.
+    let t_paint = crate::diag::blit_timing::begin();
     crate::arch::cpu::with_irqs_unmasked(|| {
         if VC_SCALED.load(Ordering::Relaxed) {
             paint_1to1(fb, dst_left, dst_top, dst_right, dst_bottom);
@@ -345,6 +417,28 @@ fn push_blit(ev: &BlitEvent, _payload: &[u8]) {
             paint_bilinear(fb, dst_left, dst_top, dst_right, dst_bottom);
         }
     });
+    crate::diag::blit_timing::PAINT.record_since(t_paint);
+}
+
+/// Trap-tail flush: paint the pending dirty rect once the paint
+/// interval has expired. Runs from `pump_input` on every sync-trap
+/// exit and guest-IRQ tail; even an otherwise idle guest gets the
+/// ~16 ms CNTHP heartbeat, which bounds how late a deferred paint
+/// can land.
+fn flush_deferred() {
+    // Cheap emptiness gate — keeps the per-trap cost at two loads.
+    if DIRTY_RIGHT.load(Ordering::Relaxed) <= DIRTY_LEFT.load(Ordering::Relaxed) {
+        return;
+    }
+    let now = cntpct();
+    let next = NEXT_PAINT_CNTPCT.load(Ordering::Relaxed);
+    if next != 0 && now < next {
+        return;
+    }
+    let Some(fb) = fb() else {
+        return;
+    };
+    flush_pending(fb, now);
 }
 
 /// VC-scaled path: expand the damaged GUEST_FB bytes 1:1 onto the
@@ -485,5 +579,25 @@ fn newton_gray(fb: *const u8, stride: usize, x: usize, y: usize) -> u32 {
     let shift = 6 - 2 * ((x as u32) % 4);
     let v = ((byte >> shift) & 0x3) as usize;
     GRAY_TABLE[v]
+}
+
+fn cntpct() -> u64 {
+    let v: u64;
+    // SAFETY: sysreg read, side-effect free.
+    unsafe {
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) v,
+            options(nomem, nostack, preserves_flags));
+    }
+    v
+}
+
+fn cntfrq() -> u64 {
+    let v: u64;
+    // SAFETY: sysreg read.
+    unsafe {
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) v,
+            options(nomem, nostack, preserves_flags));
+    }
+    v
 }
 

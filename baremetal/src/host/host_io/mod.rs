@@ -71,6 +71,9 @@ pub trait HostIo: Sync {
     /// Pump the backend's input transport: drain newly-arrived host
     /// pen events, enqueue them as Newton-format samples, and raise
     /// `INT_TABLET`. Called from the trap-return tail (`hv::trap`).
+    /// Backends without an input transport may hang other trap-tail
+    /// cadence work here (pi_fb flushes its deferred dirty-rect
+    /// paint).
     fn pump_input(&self);
 
     /// The Newton guest screen geometry `(width, height)` this backend
@@ -231,9 +234,15 @@ pub fn push_guest_blit(
         payload_len: payload.len() as u16,
     };
     // Paint-cost accumulator (`nh_diag`) — counterpart of the
-    // emulation-cost timer in `peripherals::screen::blit`.
+    // emulation-cost timer in `peripherals::screen::blit`. Not used
+    // for pi_fb: that backend coalesces blits into a deferred
+    // dirty-rect paint and records PAINT itself around each actual
+    // paint (`pi_fb::flush_pending`) — timing the call here would
+    // count cheap rect unions and miss the trap-tail flushes.
+    #[cfg(not(nh_host_io_pi_fb))]
     let t_paint = crate::diag::blit_timing::begin();
     BACKEND.push_blit(&ev, payload);
+    #[cfg(not(nh_host_io_pi_fb))]
     crate::diag::blit_timing::PAINT.record_since(t_paint);
 }
 

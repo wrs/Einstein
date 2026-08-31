@@ -135,6 +135,17 @@ build combinations in `scripts/check-matrix.sh` pass.
     clock there. Needs a discriminator better than a threshold
     (e.g. compare against the mode geometry the firmware reports).
 
+12. **Patch out the store's ROM-identity check.** NewtonOS erases the
+    internal store at boot ("a different ROM has been installed")
+    whenever its ROM identity input changes — and under the
+    hypervisor that input shifts with every build whose in-ROM patch
+    population differs (inline stubs, trampolines, RomPatches), so
+    routine deploys wipe the store and force setup + package
+    reinstall. The ROM is never actually corrupted here; find the
+    check via the alert string / its xrefs in rom.dis and feed it a
+    stable hypervisor-owned version number instead (bump it only
+    when a wipe is genuinely wanted).
+
 Real-hardware specifics (cores 1–3 left parked, snapshot ring deferred
 on hardware, thermal re-verification) are tracked in
 [`docs/REAL_HW_BRINGUP.md`](docs/REAL_HW_BRINGUP.md).

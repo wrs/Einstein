@@ -61,6 +61,27 @@ pub(super) const PATCHES_717006: &[RomPatch] = &[
     RomPatch { offset: 0x003A_D430, orig: 0x9281_1001, value: 0x3281_1001, name: "GetClock wrap-detect ls→cc" },
     RomPatch { offset: 0x003A_D46C, orig: 0x9282_2001, value: 0x3282_2001, name: "SetAlarm wrap-detect (1/2) ls→cc" },
     RomPatch { offset: 0x003A_D49C, orig: 0x9282_2001, value: 0x3282_2001, name: "SetAlarm wrap-detect (2/2) ls→cc" },
+    // ExpandIMA (TIMACodec's IMA-ADPCM decode loop, 0xE8500): the
+    // compiler reads signed halfwords from the step-size table
+    // (0x3716A4, indexed by the step index) and the index-adjust table
+    // (0x371684, indexed by the nibble code) with the ARMv4 rotate-LDR
+    // idiom — `ldr Rd, [Rb, Ri, lsl #1]` + `asr Rd, Rd, #16`. Half of
+    // those loads (odd index) are unaligned and trap to the EL2
+    // rotate-LDR emulator once per decoded sample, making 0xE863C the
+    // top unaligned-fault hotspot during sound playback. Each pair is
+    // replaced in place with `add Rd, Rb, Ri, lsl #1` + `ldrsh Rd,
+    // [Rd]` — the same signed BE halfword read at `base + 2*i`
+    // (aligned, so it never traps), byte-for-byte equivalent to the
+    // emulator's `ROR 8*(addr&3)` + `asr #16` result in both the
+    // even- and odd-index case. No branch in the ROM targets the
+    // second word of any pair. The compressor's twin sites (0xE83xx)
+    // are left alone — only the decode loop is hot.
+    RomPatch { offset: 0x000E_858C, orig: 0xE792_E081, value: 0xE082_E081, name: "ExpandIMA: add lr, r2, r1, lsl #1 (was rotate-LDR, step table entry)" },
+    RomPatch { offset: 0x000E_8590, orig: 0xE1A0_E84E, value: 0xE1DE_E0F0, name: "ExpandIMA: ldrsh lr, [lr] (was asr lr, lr, #16, step table entry)" },
+    RomPatch { offset: 0x000E_863C, orig: 0xE79C_2082, value: 0xE08C_2082, name: "ExpandIMA: add r2, ip, r2, lsl #1 (was rotate-LDR, index-adjust)" },
+    RomPatch { offset: 0x000E_8640, orig: 0xE1A0_2842, value: 0xE1D2_20F0, name: "ExpandIMA: ldrsh r2, [r2] (was asr r2, r2, #16, index-adjust)" },
+    RomPatch { offset: 0x000E_865C, orig: 0xE792_E081, value: 0xE082_E081, name: "ExpandIMA: add lr, r2, r1, lsl #1 (was rotate-LDR, step re-lookup)" },
+    RomPatch { offset: 0x000E_8660, orig: 0xE1A0_E84E, value: 0xE1DE_E0F0, name: "ExpandIMA: ldrsh lr, [lr] (was asr lr, lr, #16, step re-lookup)" },
     // SWIBoot's second instruction-as-data LDR at 0x003ad738 is
     // patched separately, via `INSN_AS_DATA_LDRS`, as a B-to-stub —
     // a full LDR-byteswap stub mirroring the site at 0x003ad69c, so

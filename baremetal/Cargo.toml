@@ -297,6 +297,22 @@ trace = ["diag"]
 # loop-spam from re-entries. Implies `trace`.
 trace_once = ["trace"]
 
+# Serial debug pen injector: wrap the guest external-serial RX seam in
+# a shim that recognises an escape-prefixed line protocol on the host
+# console wire and injects synthetic pen taps into the host_io pen
+# queue (the same queue mtouch feeds). Protocol (see
+# src/host/serial_pen.rs):
+#   ~p<x>,<y>\n        tap at Newton coords (x, y), default hold
+#   ~p<x>,<y>,<ms>\n   tap held for <ms> milliseconds
+#   ~~                 literal '~' forwarded to the guest
+# Consumed bytes never reach the guest; with the feature OFF the RX
+# path is byte-identical to a build without this code. Debug-only —
+# deliberately NOT in any `pi-bare-metal*` aggregate, so production
+# builds cannot be driven from the wire; add it explicitly:
+#   cargo build --release --no-default-features \
+#     --features "pi-bare-metal-input serial-pen-inject"
+serial-pen-inject = []
+
 # Silence recurring diagnostic logs that otherwise dominate the console
 # (stage-1 XN re-walks on every MMU toggle, etc.).
 # Off by default; enable with `--features quiet` alongside `trace` to

@@ -91,9 +91,16 @@ pub extern "C" fn kmain() -> ! {
     // here, so the lower layers stay free of upward imports. All of
     // these must be wired before the guest runs; the flash-persist
     // backing additionally before `flash_persist::try_load` below.
+    // With `serial-pen-inject`, the RX seam is wrapped in the escape
+    // shim (`host::serial_pen`) so `~p<x>,<y>` lines on the console
+    // wire inject pen taps instead of reaching the guest; without the
+    // feature the wiring is byte-identical to before.
     peripherals::console::install(peripherals::console::GuestConsoleOps {
         tx: host::console::write_byte,
+        #[cfg(not(feature = "serial-pen-inject"))]
         rx: host::console::read_byte_nonblock,
+        #[cfg(feature = "serial-pen-inject")]
+        rx: host::serial_pen::read_byte_nonblock,
     });
     peripherals::screen::install_blit_sink(host::host_io::push_guest_blit);
     peripherals::tablet::install_pen_source(host::host_io::pop_pen_sample);
@@ -120,6 +127,12 @@ pub extern "C" fn kmain() -> ! {
     // Host pumps the NewtonOs trap-tail hooks drive (newton must not
     // import host directly): input pumps, audio tick, splash progress.
     newton::os::install_host_pumps(newton::os::HostPumpOps {
+        // The injector needs a trap-tail pump of its own: the RX seam
+        // above is only polled while the guest keeps serial RX DMA
+        // armed, which a booted Newton doesn't guarantee.
+        #[cfg(feature = "serial-pen-inject")]
+        host_io_pump_input: host::serial_pen::pump_and_host_io_input,
+        #[cfg(not(feature = "serial-pen-inject"))]
         host_io_pump_input: host::host_io::pump_input,
         input_pump: host::input::pump,
         audio_tick: host::audio::tick,

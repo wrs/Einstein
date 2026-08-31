@@ -212,7 +212,11 @@ pub fn push_guest_blit(
         row_bytes,
         payload_len: payload.len() as u16,
     };
+    // Paint-cost accumulator (`nh_diag`) — counterpart of the
+    // emulation-cost timer in `peripherals::screen::blit`.
+    let t_paint = crate::diag::blit_timing::begin();
     BACKEND.push_blit(&ev, payload);
+    crate::diag::blit_timing::PAINT.record_since(t_paint);
 }
 
 /// Synthesise and push a full-screen repaint of the guest framebuffer
@@ -279,9 +283,14 @@ pub fn painted_region() -> Option<PaintedRegion> {
 /// Encode pen event into Einstein's packed sample format. Mirrors
 /// `TScreenManager::PenDown` in `Emulator/Screen/TScreenManager.cpp`:
 /// `((x & 0x7FF) << 21) | ((y & 0x7FF) << 7) | (pressure & 0x0F)`.
-/// Compiled only for the two pen-event producers (the semihost
-/// host-IO backend and the mtouch input backend).
-#[cfg(any(nh_host_io_semihost, nh_input_mtouch))]
+/// Compiled only for the pen-event producers (the semihost host-IO
+/// backend, the mtouch input backend, and the serial debug pen
+/// injector).
+#[cfg(any(
+    nh_host_io_semihost,
+    nh_input_mtouch,
+    feature = "serial-pen-inject"
+))]
 pub fn pack_pen_sample(x: u16, y: u16, pressure: u16) -> u32 {
     ((x as u32 & 0x7FF) << 21) | ((y as u32 & 0x7FF) << 7) | (pressure as u32 & 0x0F)
 }
@@ -289,7 +298,15 @@ pub fn pack_pen_sample(x: u16, y: u16, pressure: u16) -> u32 {
 /// Einstein's `kPenDownSample` / `kPenUpSample` markers from
 /// `TScreenManager.cpp:932-940` — inserted before a x/y packed sample
 /// at the pen-down edge / on pen-up.
-#[cfg(any(nh_host_io_semihost, nh_input_mtouch))]
+#[cfg(any(
+    nh_host_io_semihost,
+    nh_input_mtouch,
+    feature = "serial-pen-inject"
+))]
 pub const PEN_DOWN_SAMPLE_MARKER: u32 = 0x0000_000D;
-#[cfg(any(nh_host_io_semihost, nh_input_mtouch))]
+#[cfg(any(
+    nh_host_io_semihost,
+    nh_input_mtouch,
+    feature = "serial-pen-inject"
+))]
 pub const PEN_UP_SAMPLE_MARKER: u32 = 0x0000_000E;

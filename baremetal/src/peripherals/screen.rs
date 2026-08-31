@@ -248,6 +248,10 @@ fn get_screen_info(ctx: &mut TrapContext, pc: u32) {
 /// rects (text glyphs, narrow icons) fall to a slow per-pixel
 /// path.
 fn blit(ctx: &mut TrapContext, pc: u32) {
+    // Emulation-cost accumulator (`nh_diag`): entry up to the host-io
+    // push, so the paint cost (timed separately in
+    // `host_io::push_guest_blit`) stays attributable on its own.
+    let t_emu = crate::diag::blit_timing::begin();
     let pixmap_va = ctx.x[1] as u32;
     let src_rect_va = ctx.x[2] as u32;
     let dst_rect_va = ctx.x[3] as u32;
@@ -437,6 +441,7 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
             src_top, src_left, src_bottom, src_right,
             dst_top, dst_left, dst_bottom, dst_right,
             src_width_pixels * height);
+        crate::diag::blit_timing::EMULATE.record_since(t_emu);
         push_blit_event(
             mode,
             src_top, src_left, src_bottom, src_right,
@@ -495,6 +500,7 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
         dst_top, dst_left, dst_bottom, dst_right,
         copied);
 
+    crate::diag::blit_timing::EMULATE.record_since(t_emu);
     push_blit_event(
         mode,
         src_top, src_left, src_bottom, src_right,

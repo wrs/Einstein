@@ -21,6 +21,8 @@
 pub mod diag_util;
 
 #[cfg(nh_diag)]
+pub mod blit_timing;
+#[cfg(nh_diag)]
 pub mod guest_bp;
 #[cfg(nh_diag)]
 pub mod heap_check;
@@ -68,6 +70,26 @@ pub fn vic_raw_summary() -> (u32, u32) {
 // pays for a value that only diagnostics would consume.
 // ---------------------------------------------------------------------
 
+
+#[cfg(not(nh_diag))]
+pub mod blit_timing {
+    //! Stub: no blit timing accumulators without `diag`.
+
+    pub struct BlitTimer;
+
+    impl BlitTimer {
+        #[inline(always)]
+        pub fn record_since(&self, _t0_us: u64) {}
+    }
+
+    pub static EMULATE: BlitTimer = BlitTimer;
+    pub static PAINT: BlitTimer = BlitTimer;
+
+    #[inline(always)]
+    pub fn begin() -> u64 {
+        0
+    }
+}
 
 #[cfg(not(nh_diag))]
 pub mod guest_bp {

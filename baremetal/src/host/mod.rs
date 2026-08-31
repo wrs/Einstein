@@ -13,6 +13,8 @@ pub mod macros;
 #[cfg(feature = "platform-raspi3b")]
 pub mod mailbox;
 pub mod platform;
+#[cfg(feature = "serial-pen-inject")]
+pub mod serial_pen;
 #[cfg(feature = "platform-raspi3b")]
 pub mod sd;
 #[cfg(nh_input_mtouch)]

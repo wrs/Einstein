@@ -327,9 +327,14 @@ static POWERED_OFF: AtomicBool = AtomicBool::new(false);
 /// set `WAKE_REQUEST` so `pause_system` returns to the guest — `kGPIOIntMask`
 /// is not in `kPowerOffMask` (0x0C400000), so the IRQ would otherwise stay
 /// invisible while the system is in PowerOff state. Compiled only for
-/// the two transports that deliver power-switch presses (the semihost
-/// host viewer and the mtouch first-tap-wakes hack).
-#[cfg(any(nh_host_io_semihost, nh_input_mtouch))]
+/// the transports that deliver power-switch presses (the semihost
+/// host viewer, the mtouch first-tap-wakes hack, and the serial debug
+/// pen injector's copy of that hack).
+#[cfg(any(
+    nh_host_io_semihost,
+    nh_input_mtouch,
+    feature = "serial-pen-inject"
+))]
 pub fn raise_power_switch() {
     // SAFETY: single-threaded.
     let s = unsafe { &mut *VIC.0.get() };
@@ -353,8 +358,9 @@ pub fn set_powered_off(v: bool) {
 }
 
 /// True while the guest is in subfn 0x0E `PowerOffSystem` WFI. Only
-/// the mtouch backend's first-tap-wakes hack consults it.
-#[cfg(nh_input_mtouch)]
+/// the first-tap-wakes hacks (mtouch backend and the serial debug pen
+/// injector) consult it.
+#[cfg(any(nh_input_mtouch, feature = "serial-pen-inject"))]
 pub fn is_powered_off() -> bool {
     POWERED_OFF.load(Ordering::Acquire)
 }

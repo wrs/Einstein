@@ -31,7 +31,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::BlitEvent;
 use crate::host::display::fb::FbInfo;
-use crate::log_host_io;
+use crate::kprintln;
 
 /// Newton's screen dimensions, pinned to MP2100 native 320×480 to
 /// avoid ROM landscape-mode quirks. The OS-layer would accept other
@@ -142,7 +142,7 @@ fn init() {
     let info = match crate::host::display::splash::fb_info() {
         Some(i) => *i,
         None => {
-            log_host_io!("host_io_pi_fb: splash didn't run; no FB available");
+            kprintln!("host_io_pi_fb: splash didn't run; no FB available");
             return;
         }
     };
@@ -186,7 +186,12 @@ fn init() {
     INV_SCALE_X_Q16.store(inv_x, Ordering::Relaxed);
     INV_SCALE_Y_Q16.store(inv_y, Ordering::Relaxed);
     INIT_DONE.store(true, Ordering::Relaxed);
-    log_host_io!(
+    // Boot-once geometry line, deliberately `kprintln!` (not
+    // `log_host_io!`): the deployed `pi-bare-metal-input` build omits
+    // `log_host_io`, and this line is the only place the negotiated
+    // panel mode and painted-region geometry reach a hardware boot
+    // capture. One-shot, so the recurring-log doctrine doesn't apply.
+    kprintln!(
         "host_io_pi_fb: ready ({}x{} @ pa=0x{:x}, newton {}x{} bilinear → painted {}x{} @ {},{}, scale Q16 x={} y={})",
         info.width,
         info.height,

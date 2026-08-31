@@ -105,12 +105,16 @@ build combinations in `scripts/check-matrix.sh` pass.
     `blit_timing` counters, the digitizer/serial-tap harness
     (`docs/REAL_HW_BRINGUP.md` "Serial pen injection"), and the
     trap-hist per-window masked-EL2-time line. What remains:
-    - A window-open still bursts ~140k alignment faults (~0.15 s of
-      EL2 at ~0.9 us each) through a handful of no-dead-scratch
-      sites (0xe863c/0xe865c top). Eliminating the trap needs
-      spill-based inline stubs (save/restore a register via a
-      per-stub pool slot instead of requiring dead scratches) —
-      re-entrancy vs IRQs needs thought before building it.
+    - Alignment-fault storms are gone: spill-based inline stubs
+      (scratches pushed/popped on the guest stack) cover the
+      no-dead-scratch sites, so every site faults once, ever
+      (hardware: 0-6 Align faults per 2 s window after warmup,
+      ~655 stubs / 272 spill). The only stub-less form left is
+      Rm == SP.
+    - The remaining steady trap load is the domain-fault machinery
+      (~7-10k faults/s: DACR write pairs at 0x3ad6f0/0x3adb08 + the
+      0x800a08 native call + IntCtrl polling) — item 9 territory if
+      it ever matters.
     - Portrait rotation is plumbed end-to-end (`pi-fb-rot90` +
       `display_hdmi_rotate=1`, flipped together, SD card in hand)
       but UNVERIFIED on hardware: gpu_mem/full-start.elf need,

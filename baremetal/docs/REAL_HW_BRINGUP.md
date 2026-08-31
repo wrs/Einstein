@@ -350,6 +350,17 @@ scripts/pi-upload.py --port unix:serial.sock --no-power-cycle --kernel <elf> \
 out `-device loader` to exercise the no-image path, `-drive` to
 exercise the persist-failure path.)
 
+### Store-erase alert on a new build
+
+A hypervisor build whose in-ROM patch population differs from the
+previous boot's (new inline stubs, new trampolines) can trip
+NewtonOS's ROM-compatibility check: the guest boots to "The internal
+store was erased because a different ROM has been installed" and the
+first-boot setup wizard. This is benign and known — dismiss the
+alert, tap through setup, reinstall any add-on packages (Dock). It
+is NOT store corruption; don't start a corruption hunt off this
+alert alone.
+
 ### Serial pen injection + capture-side measurement
 
 The see-and-measure loop for display work runs over the same wire and

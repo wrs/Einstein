@@ -41,7 +41,7 @@ use crate::arch::cpu;
 use crate::kprintln;
 use crate::arch::trap_context::TrapContext;
 
-/// HVC handler for `ALIGN_TAG` (0x13). Called from `handle_hvc` when
+/// HVC handler for `ALIGN_TAG` (`HvcImm::Align`, 0x17). Called from `handle_hvc` when
 /// the DABT trampoline's alignment-fault fast path fires. Emulates the
 /// faulting instruction in place and overrides ELR_EL2 / SPSR_EL2 so
 /// the subsequent ERET returns the guest to the pre-abt mode at

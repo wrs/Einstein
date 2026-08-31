@@ -6,7 +6,9 @@
 @ handler at VA 0x10 that matches the hypervisor's production
 @ trampoline shape (src/guest_mem.rs::patch_dabt_vector) — save
 @ R0 → TPIDRURW, R1 → TPIDRRO, and LR / SP / SPSR to the DABT_SAVE
-@ slot at 0x0400_5FA0 — then HVCs `#ALIGN_TAG` (0x13) to enter EL2.
+@ slot at 0x0600_00A0 (`guest_trampolines::DABT_SAVE_PA`, in the
+@ identity-mapped scratch pool) — then HVCs `#ALIGN_TAG` (0x17) to
+@ enter EL2.
 @ The EL2 emulator decodes the faulting LDR, performs the aligned
 @ word load + rotate-right, writes the result to ctx.x[Rt], and ERETs
 @ past the faulting insn.
@@ -26,7 +28,7 @@
 
 #include "../common/hvc_abi.S"
 
-    .equ DABT_SAVE_PA,  0x04005FA0
+    .equ DABT_SAVE_PA,  0x060000A0
 
     .equ SRC_ADDR,      0x04010000
     .equ SRC_WORD,      0x11223344

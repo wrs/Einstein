@@ -34,6 +34,29 @@
 //! clobber the liveness-proved-dead scratches `sea` and `ssh`
 //! regardless of cond — fine, they are dead at orig_pc+4 in both paths.
 //!
+//! **Spill stub** — for sites where no two candidates are dead at
+//! orig_pc+4 (the kernel's hot halfword-table LDRs keep R0..R3 and
+//! R12 all live), the same body is bracketed with a push/pop of the
+//! scratches on the *guest stack*:
+//!
+//!   STMDB sp!, {sea, ssh}       ; spill
+//!   [ADD sea, sp, #8]           ; only when Rn == SP: pre-push base
+//!   <EA compute>  <AND/BIC/LDR/LSL/ROR core as above>
+//!   LDMIA sp!, {sea, ssh}       ; restore
+//!   B orig_pc + 4
+//!
+//! SP is actually moved, so the spill is architecturally part of the
+//! stack: a task switch mid-stub parks it with the task's stack, an
+//! IRQ/FIQ uses its own banked SP, user-level exception delivery
+//! pushes below it, and a push into the stack guard page takes the
+//! kernel's normal stack-extension fault + restart. Scratches only
+//! need to be non-operands ({R12, R0..R3} minus ≤3 operands always
+//! leaves two), so no liveness proof is required. The one form the
+//! spill cannot carry is Rm == SP (the push moves SP before the
+//! offset is read); Rn == SP is handled by the pre-push base fixup.
+//! A cond-fail pass through the stub is push → scratch clobber →
+//! skipped LDR/ROR → pop: net identity, matching the original NOP.
+//!
 //! Eligibility (anything not eligible falls through to the existing
 //! EL2 emulator, no harm done):
 //!   - LDR only. STR-unaligned is architecturally UNPREDICTABLE on
@@ -45,8 +68,9 @@
 //!     the stub pool). RAM-resident faulting PCs go through EL2.
 //!   - Imm offset ≤ 0xFFF (always true for the ARM A1 form, but the
 //!     2-step ADD path needs the high/low split to encode).
-//!   - Liveness analysis must find 2 dead scratches in {R0..R3, R12}
-//!     that aren't operands of the access.
+//!   - Scratches: two dead non-operand regs in {R0..R3, R12} when
+//!     liveness finds them (shorter stub, no stack traffic); the
+//!     spill stub otherwise. Only Rm == SP has no stub form.
 //!
 //! Lazy install means partial coverage already wins. Sites that fail
 //! eligibility keep paying the EL2 round-trip; sites that pass pay it
@@ -62,6 +86,10 @@ use crate::newton::unaligned::{decode, Decoded, OffsetForm};
 
 /// Counter of stubs installed by this module.
 static STUBS_INSTALLED: AtomicU32 = AtomicU32::new(0);
+
+/// Of [`STUBS_INSTALLED`], how many are spill stubs (scratches
+/// preserved on the guest stack rather than proved dead).
+static STUBS_SPILL: AtomicU32 = AtomicU32::new(0);
 
 /// Counter of install attempts that were rejected (any reason).
 static STUBS_REJECTED: AtomicU32 = AtomicU32::new(0);
@@ -120,17 +148,17 @@ static mut REJ_NO_DEAD_PCS: crate::diag::diag_util::TopK<REJ_TOPK> =
     crate::diag::diag_util::TopK::new();
 
 /// Known-rejected-PC bitmap: one bit per ROM word below the install
-/// limit. A PC that fails `pick_scratches` (no_dead_scratches) is
-/// rejected *deterministically*: the rejection depends only on the
-/// code at that PC — the decoded operands and the CFG-liveness set at
-/// PC+4 — never on dynamic state (see `try_install_at`). Once a PC is
-/// known rejected, re-running the decode + `live_regs_at` CFG walk
-/// (~40 µs) on every subsequent alignment fault at that PC is pure
-/// waste — and a hot guest loop with one such site would spend nearly
-/// all of its wall time in that walk. The record must therefore be
-/// exact and never-full: the ROM holds far more no-dead-scratch LDR
-/// sites than any small cache, so this is a bitmap over the whole
-/// patchable range (288 KiB of .bss), O(1) per probe, no eviction.
+/// limit. A PC that fails both scratch pickers (no dead scratches AND
+/// the spill stub can't carry the form — Rm == SP) is rejected
+/// *deterministically*: the rejection depends only on the code at
+/// that PC — the decoded operands and the CFG-liveness set at PC+4 —
+/// never on dynamic state (see `try_install_at`). Once a PC is known
+/// rejected, re-running the decode + `live_regs_at` CFG walk (~40 µs)
+/// on every subsequent alignment fault at that PC is pure waste — and
+/// a hot guest loop with one such site would spend nearly all of its
+/// wall time in that walk. The record must therefore be exact and
+/// never-full: this is a bitmap over the whole patchable range
+/// (288 KiB of .bss), O(1) per probe, no eviction.
 /// SAFETY: single-core EL2, touched only from the trap path.
 const REJ_BITMAP_BYTES: usize =
     (crate::newton::rom_ver::ROM_TAIL.tracer_pool_base as usize / 4).div_ceil(8);
@@ -279,23 +307,31 @@ fn try_install_at_inner(faulting_pc: u32) -> bool {
         }
     }
 
-    let (sea, ssh) = match pick_scratches(&d, faulting_pc) {
-        Some(p) => p,
-        None => {
-            REJ_NO_DEAD_SCRATCHES.fetch_add(1, Ordering::Relaxed);
-            STUBS_REJECTED.fetch_add(1, Ordering::Relaxed);
-            // SAFETY: single-core EL2; the REJ_NO_DEAD_PCS top-K is also
-            // touched by the dump's snapshot+reset — all on core 0
-            // in-trap.
-            unsafe {
-                (*core::ptr::addr_of_mut!(REJ_NO_DEAD_PCS)).record(faulting_pc);
+    // Prefer the dead-scratch stub (shorter, no stack traffic); fall
+    // back to the spill stub, whose scratches only need to be
+    // non-operands. Rm == SP is the one form the spill can't carry
+    // (the push moves SP before the offset is read).
+    let rm_is_sp = matches!(d.offset, OffsetForm::Reg { rm: 13, .. });
+    let (sea, ssh, spill) = match pick_scratches(&d, faulting_pc) {
+        Some((a, b)) => (a, b, false),
+        None => match if rm_is_sp { None } else { pick_spill_scratches(&d) } {
+            Some((a, b)) => (a, b, true),
+            None => {
+                REJ_NO_DEAD_SCRATCHES.fetch_add(1, Ordering::Relaxed);
+                STUBS_REJECTED.fetch_add(1, Ordering::Relaxed);
+                // SAFETY: single-core EL2; the REJ_NO_DEAD_PCS top-K is
+                // also touched by the dump's snapshot+reset — all on
+                // core 0 in-trap.
+                unsafe {
+                    (*core::ptr::addr_of_mut!(REJ_NO_DEAD_PCS)).record(faulting_pc);
+                }
+                // Record this PC so the next fault here skips the decode
+                // + CFG walk. Deterministic: the rejection is a function
+                // of the code at `faulting_pc` alone.
+                rejected_pc_insert(faulting_pc);
+                return false;
             }
-            // Record this PC so the next fault here skips the decode +
-            // CFG walk. Deterministic: the rejection is a function of
-            // the code at `faulting_pc` alone.
-            rejected_pc_insert(faulting_pc);
-            return false;
-        }
+        },
     };
 
     let (slot_idx, stub_ipa) = match alloc_stub_slot() {
@@ -307,7 +343,11 @@ fn try_install_at_inner(faulting_pc: u32) -> bool {
         }
     };
 
-    let words = match build_stub_words(&d, faulting_pc, stub_ipa, sea, ssh) {
+    let words = match if spill {
+        build_spill_stub_words(&d, faulting_pc, stub_ipa, sea, ssh)
+    } else {
+        build_stub_words(&d, faulting_pc, stub_ipa, sea, ssh)
+    } {
         Ok(ws) => ws,
         Err(_) => {
             REJ_OFFSET_IMM_TOO_BIG.fetch_add(1, Ordering::Relaxed);
@@ -323,14 +363,18 @@ fn try_install_at_inner(faulting_pc: u32) -> bool {
     }
 
     let n = STUBS_INSTALLED.fetch_add(1, Ordering::Relaxed) + 1;
+    if spill {
+        STUBS_SPILL.fetch_add(1, Ordering::Relaxed);
+    }
     if n <= LOG_FIRST_INSTALLS {
         crate::kprintln!(
-            "unaligned_inline[{}]: installed (slot_ix={}, PC={:#010x}, sea=R{} ssh=R{})",
+            "unaligned_inline[{}]: installed (slot_ix={}, PC={:#010x}, sea=R{} ssh=R{}{})",
             n,
             slot_idx,
             faulting_pc,
             sea,
-            ssh
+            ssh,
+            if spill { ", spill" } else { "" }
         );
     } else if PERIODIC_STATS_EVERY != 0 && n % PERIODIC_STATS_EVERY == 0 {
         crate::kprintln!(
@@ -368,6 +412,107 @@ fn pick_scratches(d: &Decoded, orig_pc: u32) -> Option<(u32, u32)> {
         }
     }
     None
+}
+
+/// Scratch picker for the spill stub: two regs in {R12, R0..R3} that
+/// are not operands of the access. No liveness requirement — the stub
+/// preserves them on the guest stack. At most three operands leave at
+/// least two of the five candidates, so this fails only on a decoder
+/// surprise.
+fn pick_spill_scratches(d: &Decoded) -> Option<(u32, u32)> {
+    const CANDIDATES: &[u32] = &[12, 0, 1, 2, 3];
+    let mut operand_mask: u16 = (1u16 << d.rt) | (1u16 << d.rn);
+    if let OffsetForm::Reg { rm, .. } = d.offset {
+        operand_mask |= 1u16 << rm;
+    }
+    let mut picks = [u32::MAX; 2];
+    let mut n = 0;
+    for &r in CANDIDATES {
+        if (1u16 << r) & operand_mask != 0 {
+            continue;
+        }
+        picks[n] = r;
+        n += 1;
+        if n == 2 {
+            return Some((picks[0], picks[1]));
+        }
+    }
+    None
+}
+
+/// STMDB sp!, {ra, rb} — the spill push. Unconditional, S=0.
+fn encode_push_pair(ra: u32, rb: u32) -> u32 {
+    0xE92D_0000 | (1 << ra) | (1 << rb)
+}
+
+/// LDMIA sp!, {ra, rb} — the spill restore. Unconditional, S=0.
+fn encode_pop_pair(ra: u32, rb: u32) -> u32 {
+    0xE8BD_0000 | (1 << ra) | (1 << rb)
+}
+
+/// Build the spill-stub words: [`build_stub_words`]'s body bracketed
+/// with a push/pop of the scratches on the guest stack, plus the
+/// Rn == SP base fixup (after the push, the original base is sp + 8).
+/// Caller guarantees Rm != SP. Fixed layout (cursor advances by a
+/// constant per section) so the closing B's slot is static:
+///
+///   0:      STMDB sp!, {sea, ssh}
+///   1:      ADD sea, sp, #8            (Rn == SP only; else NOP)
+///   2/3:    EA compute into sea        (base = slot-1 result or Rn)
+///   4..8:   AND / BIC / LDR{c} / LSL / ROR{c}   (shared core shape)
+///   9:      LDMIA sp!, {sea, ssh}
+///   10:     B orig_pc + 4
+fn build_spill_stub_words(
+    d: &Decoded,
+    orig_pc: u32,
+    stub_ipa: u32,
+    sea: u32,
+    ssh: u32,
+) -> Result<[u32; STUB_WORDS], &'static str> {
+    let mut out = [encode::nop(); STUB_WORDS];
+
+    out[0] = encode_push_pair(sea, ssh);
+
+    // EA base: Rn, unless Rn is SP — the push moved it down 8.
+    let base = if d.rn == 13 {
+        let imm8 = encode::arm_imm12(8).expect("8 is modified-imm encodable");
+        out[1] = encode::add_imm(encode::AL, sea, 13, imm8);
+        sea
+    } else {
+        d.rn
+    };
+
+    let (slot2, slot3) = match d.offset {
+        OffsetForm::Imm(imm) => encode_ea_imm(d.u, sea, base, imm)?,
+        OffsetForm::Reg {
+            rm,
+            shift_type,
+            shift_amount,
+        } => {
+            let s = if d.u {
+                encode::add_reg_shifted(encode::AL, sea, base, rm, shift_type, shift_amount)
+            } else {
+                encode::sub_reg_shifted(encode::AL, sea, base, rm, shift_type, shift_amount)
+            };
+            (s, encode::nop())
+        }
+    };
+    out[2] = slot2;
+    out[3] = slot3;
+
+    out[4] = encode_and_imm(encode::AL, ssh, sea, 3);
+    out[5] = encode_bic_imm(encode::AL, sea, sea, 3);
+    out[6] = encode_ldr_zero(d.cond, d.rt, sea);
+    out[7] = encode_mov_reg_lsl_imm(encode::AL, ssh, ssh, 3);
+    out[8] = encode_mov_reg_ror_reg(d.cond, d.rt, d.rt, ssh);
+
+    out[9] = encode_pop_pair(sea, ssh);
+
+    let slot10_pc = stub_ipa.wrapping_add(10 * 4);
+    let target = orig_pc.wrapping_add(4);
+    out[10] = encode::b(slot10_pc, target).ok_or("B back out of imm24 range")?;
+
+    Ok(out)
 }
 
 /// Build the stub words. Layout fits in `STUB_WORDS == 16` slots;
@@ -542,9 +687,10 @@ pub fn log_stats() {
     let d_imm = imm_too_big.wrapping_sub(prev.rej_offset_imm);
 
     crate::kprintln!(
-        "unaligned_inline: installed={} (+{}) rejected={} (+{}) since boot, \
+        "unaligned_inline: installed={} ({} spill, +{}) rejected={} (+{}) since boot, \
          align_emu={}us (install={}us) in window",
         installed,
+        STUBS_SPILL.load(Ordering::Relaxed),
         d_installed,
         rejected,
         d_rejected,

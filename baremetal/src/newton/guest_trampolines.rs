@@ -402,8 +402,8 @@ pub fn register_hyp_code_ranges() {
 ///   +0x34: eaff_fffe  b .                    ; guard
 ///   +0x38: literal     DABT_SAVE_VA
 ///
-/// DABT_SAVE layout at IPA 0x0400_5FA0 (pre-MMU) / VA 0x0C00_4FA0
-/// (post-MMU):
+/// DABT_SAVE layout at [`DABT_SAVE_PA`] (scratch pool + 0xA0;
+/// identity-mapped, so the address is the same pre- and post-MMU):
 ///   +0x00: LR_abt    (= faulting_pc + 8 for ARM DABT)
 ///   +0x04: SP_abt
 ///   +0x08: SPSR_abt  (= pre-abt CPSR)
@@ -674,11 +674,10 @@ pub unsafe fn install_dabt_fast_trampoline(rom_ptr: *mut u32, dah_va: u32) {
 ///
 /// The overlap matters even when it looks harmless: at 0x00FF_FFE0 the
 /// stub coincides byte-for-byte with the DABT-trampoline's literal
-/// slot, and the clobbered first word (0x0400_5FA0 / 0x0C00_4FA0,
-/// written by `install_und_vector_swap_*`) decodes as an
-/// EQ-conditional LDC. QEMU raspi3b's TCG model treats that as a NOP;
-/// FVP Base RevC raises an UNDEFINED exception, so the UND return path
-/// halts with an "unrecognised UND" in early boot.
+/// slot — a data word (the `DABT_SAVE_PA` literal) executed as an
+/// instruction. QEMU raspi3b's TCG model NOPs such encodings where
+/// FVP Base RevC raises an UNDEFINED exception, so the UND return
+/// path halts with an "unrecognised UND" in early boot.
 pub const UND_RETURN_STUB_OFFSET: usize = rom_ver::ROM_TAIL.und_return_stub as usize;
 pub const UND_RETURN_STUB_VA: u32 = UND_RETURN_STUB_OFFSET as u32;
 /// Offset of the target-PC literal inside the stub (written by Rust

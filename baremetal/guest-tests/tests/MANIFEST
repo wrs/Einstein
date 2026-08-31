@@ -66,3 +66,4 @@ test_snapshot_resume
 # (host_dma::sd_tx_dma_selfcheck — the UART-TX channel is off limits
 # for the check, since it is live as the console backend by probe
 # time). See docs/SD_DMA_AUTOSAVE.md and the sd-probe write-up.
+test_unaligned_spill

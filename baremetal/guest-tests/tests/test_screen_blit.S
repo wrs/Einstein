@@ -47,6 +47,10 @@
 @   C — mode 0, byte-aligned, with a source row that straddles a
 @       4 KiB page boundary, exercising the fast path's per-page span
 @       split.
+@
+@ The orientation section then covers SetFeature(4)/GetFeature(4),
+@ the GetScreenInfo geometry swap, the rotated blit path (D), and
+@ the pen-sample rotation into screen space.
 
 #include "common/test_runtime.S"
 
@@ -57,8 +61,19 @@
                                       @ at 0x04022000 (blit C)
     .equ SRC_RECT_VA,     0x04030000
     .equ DST_RECT_VA,     0x04030010
+    .equ INFO_VA,         0x04030020  @ GetScreenInfo out / pen out slots
+    .equ PIXMAP_DATA4_VA, 0x04021200  @ rotated blit source (blit D)
     .equ FB_VA,           0x0E000000
     .equ BLIT_CODE,       0x0407      @ driver=4, subfn=7
+    .equ INFO_CODE,       0x0403      @ driver=4, subfn=3 GetScreenInfo
+    .equ GETF_CODE,       0x0408      @ driver=4, subfn=8 GetFeature
+    .equ SETF_CODE,       0x0409      @ driver=4, subfn=9 SetFeature
+    .equ DRAIN_CODE,      0x0516      @ driver=5, subfn=0x16 NativeGetSample
+    @ Injected portrait-panel pen sample (x=10, y=20, pressure=4) and
+    @ its expected screen-space rotation under orientation 1
+    @ (xs = 480-1-y = 459, ys = x = 10).
+    .equ PEN_IN,          0x01400A04  @ (10<<21)|(20<<7)|4
+    .equ PEN_OUT,         0x39600504  @ (459<<21)|(10<<7)|4
 
     .section .text, "ax"
     .global test_main
@@ -275,6 +290,147 @@ test_main:
     mov     r0, #4
     hvc     #HVC_MARK                       @ mark 4: page-crossing copy correct
 
+    @ ==== Orientation: SetFeature(4, 1) → landscape ====
+    @ Portrait baseline is 0; bit 0 set = landscape (the MP2x00
+    @ native orientation the ROM asserts at UI start).
+    mov     r1, #4                   @ feature 4 = orientation
+    mov     r2, #1                   @ value 1 = landscape
+    ldr     r5, =SETF_CODE
+    .inst   0xEE005A10
+    cmp     r0, #0
+    bne     .Lfail_not_zero
+
+    @ GetFeature(4) reads the stored orientation back.
+    mov     r1, #4
+    ldr     r5, =GETF_CODE
+    .inst   0xEE005A10
+    cmp     r0, #1
+    bne     .Lfail_orient_get
+
+    @ GetScreenInfo now reports the swapped geometry:
+    @ height=320 @ +0, width=480 @ +4.
+    ldr     r1, =INFO_VA
+    ldr     r5, =INFO_CODE
+    .inst   0xEE005A10
+    cmp     r0, #0
+    bne     .Lfail_not_zero
+    ldr     r6, =INFO_VA
+    ldr     r0, [r6, #0]
+    ldr     r1, =320
+    cmp     r0, r1
+    bne     .Lfail_info_h
+    ldr     r0, [r6, #4]
+    ldr     r1, =480
+    cmp     r0, r1
+    bne     .Lfail_info_w
+
+    mov     r0, #5
+    hvc     #HVC_MARK                       @ mark 5: orientation stored + info swapped
+
+    @ ==== Blit D: rotated blit under orientation 1 ====
+    @ Source: 1 row x 4 px, byte 0xE4 = pixels (3,2,1,0), blitted to
+    @ landscape dst {0,0,1,4}. Orientation 1 maps screen pixel
+    @ (xs, ys) to portrait (ys, 479-xs), so (xs, 0) lands at column
+    @ 0 of row 479-xs: FB byte offset (479-xs)*80, pixel slot 0
+    @ (bits 7..6). Expect FB[38320]=0xC0 (pixel 3), FB[38240]=0x80
+    @ (2), FB[38160]=0x40 (1), FB[38080]=0x00 (0).
+    ldr     r6, =PIXMAP_VA
+    ldr     r0, =PIXMAP_DATA4_VA
+    str     r0, [r6, #0x00]          @ addy → rotated-blit source
+    mov     r0, #4
+    lsl     r0, r0, #16
+    str     r0, [r6, #0x04]          @ rowBytes_packed = (4<<16)
+
+    ldr     r6, =PIXMAP_DATA4_VA
+    ldr     r0, =0xE4000000          @ BE-view byte 0 = 0xE4
+    str     r0, [r6, #0]
+
+    ldr     r6, =SRC_RECT_VA
+    mov     r0, #0
+    str     r0, [r6, #0]             @ src {top=0, left=0}
+    mov     r0, #1
+    lsl     r0, r0, #16
+    orr     r0, r0, #4
+    str     r0, [r6, #4]             @ src {bottom=1, right=4}
+
+    ldr     r6, =DST_RECT_VA
+    mov     r0, #0
+    str     r0, [r6, #0]             @ dst {top=0, left=0}
+    mov     r0, #1
+    lsl     r0, r0, #16
+    orr     r0, r0, #4
+    str     r0, [r6, #4]             @ dst {bottom=1, right=4}
+
+    sub     sp, sp, #8
+    mov     r0, #0
+    str     r0, [sp, #4]             @ mode = 0
+    ldr     r1, =PIXMAP_VA
+    ldr     r2, =SRC_RECT_VA
+    ldr     r3, =DST_RECT_VA
+    ldr     r5, =BLIT_CODE
+    .inst   0xEE005A10               @ MCR p10, 0, r5, c0, c0, 0
+    add     sp, sp, #8
+    cmp     r0, #0
+    bne     .Lfail_not_zero
+
+    @ Each target byte is host byte 0 of its aligned FB word (bits
+    @ 7..0 of the LDR); the other three bytes were never written.
+    ldr     r6, =FB_VA
+    ldr     r1, =38320
+    ldr     r0, [r6, r1]
+    cmp     r0, #0xC0
+    bne     .Lfail_rot0
+    ldr     r1, =38240
+    ldr     r0, [r6, r1]
+    cmp     r0, #0x80
+    bne     .Lfail_rot1
+    ldr     r1, =38160
+    ldr     r0, [r6, r1]
+    cmp     r0, #0x40
+    bne     .Lfail_rot2
+
+    mov     r0, #6
+    hvc     #HVC_MARK                       @ mark 6: rotated blit landed transposed
+
+    @ ==== Pen sample rotated into screen space ====
+    @ Inject a portrait-panel sample; NativeGetSample must return it
+    @ rotated into the landscape screen space (PEN_IN → PEN_OUT).
+    ldr     r0, =PEN_IN
+    ldr     r1, =0x00012345
+    hvc     #HVC_INJECT_PEN
+    ldr     r1, =INFO_VA             @ reuse as sample/ticks out slots
+    add     r2, r1, #4
+    ldr     r5, =DRAIN_CODE
+    .inst   0xEE005A10
+    cmp     r0, #1
+    bne     .Lfail_pen_drain
+    ldr     r0, [r1]
+    ldr     r3, =PEN_OUT
+    cmp     r0, r3
+    bne     .Lfail_pen_val
+
+    mov     r0, #7
+    hvc     #HVC_MARK                       @ mark 7: pen sample rotated
+
+    @ ==== Restore the portrait baseline and confirm ====
+    mov     r1, #4
+    mov     r2, #0
+    ldr     r5, =SETF_CODE
+    .inst   0xEE005A10
+    cmp     r0, #0
+    bne     .Lfail_not_zero
+    ldr     r1, =INFO_VA
+    ldr     r5, =INFO_CODE
+    .inst   0xEE005A10
+    ldr     r6, =INFO_VA
+    ldr     r0, [r6, #0]
+    ldr     r1, =480
+    cmp     r0, r1
+    bne     .Lfail_info_restore
+
+    mov     r0, #8
+    hvc     #HVC_MARK                       @ mark 8: portrait restored
+
     hvc     #HVC_PASS                       @ PASS
     bx      lr
 
@@ -301,4 +457,40 @@ test_main:
 .Lfail_fb_cross1:
     hvc     #HVC_PRINT_HEX
     mov     r0, #0xD5
+    hvc     #HVC_FAIL
+.Lfail_orient_get:
+    hvc     #HVC_PRINT_HEX
+    mov     r0, #0xD6
+    hvc     #HVC_FAIL
+.Lfail_info_h:
+    hvc     #HVC_PRINT_HEX
+    mov     r0, #0xD7
+    hvc     #HVC_FAIL
+.Lfail_info_w:
+    hvc     #HVC_PRINT_HEX
+    mov     r0, #0xD8
+    hvc     #HVC_FAIL
+.Lfail_rot0:
+    hvc     #HVC_PRINT_HEX
+    mov     r0, #0xD9
+    hvc     #HVC_FAIL
+.Lfail_rot1:
+    hvc     #HVC_PRINT_HEX
+    mov     r0, #0xDA
+    hvc     #HVC_FAIL
+.Lfail_rot2:
+    hvc     #HVC_PRINT_HEX
+    mov     r0, #0xDB
+    hvc     #HVC_FAIL
+.Lfail_pen_drain:
+    hvc     #HVC_PRINT_HEX
+    mov     r0, #0xDC
+    hvc     #HVC_FAIL
+.Lfail_pen_val:
+    hvc     #HVC_PRINT_HEX
+    mov     r0, #0xDD
+    hvc     #HVC_FAIL
+.Lfail_info_restore:
+    hvc     #HVC_PRINT_HEX
+    mov     r0, #0xDE
     hvc     #HVC_FAIL

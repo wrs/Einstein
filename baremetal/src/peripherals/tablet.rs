@@ -152,8 +152,15 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
                     which, 0x0320_0000, "tablet.GetTabletResolution", pc);
             }
         }
-        // TabSetOrientation — r0 = 0.
+        // TabSetOrientation(orientation=r1) — r0 = 0. Einstein
+        // stores this into its screen manager's tablet orientation
+        // (TNativePrimitives.cpp:1924-1931), which only its
+        // fullscreen pen transform consumes; our pen transform keys
+        // off the screen orientation (screen::pen_to_screen via the
+        // `pen_source_oriented` wiring in main.rs), so here the value
+        // is only logged for cross-checking against SetFeature(4).
         0x0D => {
+            kprintln!("tablet.TabSetOrientation: {}", ctx.x[1] as u32);
             ctx.x[0] = 0;
         }
         // GetTabletState — r0 = 0 (no pen state).

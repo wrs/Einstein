@@ -70,10 +70,7 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
             get_feature(ctx);
         }
         0x09 => {
-            // SetFeature: contrast/backlight/orientation. We don't
-            // have a display backend that distinguishes these, so just
-            // accept the write (return 0).
-            ctx.x[0] = 0;
+            set_feature(ctx, pc);
         }
         _ => crate::diag::diag_util::halt_unknown_subfn(
             "screen", subfn, pc,
@@ -83,11 +80,12 @@ fn handle(ctx: &mut TrapContext, subfn: u32, pc: u32) {
 }
 
 /// `TMainDisplayDriver::GetFeature(feature_id)` — Einstein's table at
-/// `Emulator/TNativePrimitives.cpp:1662`. We don't model contrast /
-/// backlight / orientation runtime knobs, so we return the same
-/// constants Einstein returns for a default un-configured ScreenManager:
-/// contrast/backlight/orientation default to 0, "display present" = 1,
-/// feature 5 = 0xA, anything else = 0xFFFFFFFF.
+/// `Emulator/TNativePrimitives.cpp:1662`. Orientation (4) reads back
+/// the value stored by `set_feature`; contrast / backlight have no
+/// hardware behind them, so we return the same constants Einstein
+/// returns for a default un-configured ScreenManager: contrast /
+/// backlight default to 0, "display present" = 1, feature 5 = 0xA,
+/// anything else = 0xFFFFFFFF.
 fn get_feature(ctx: &mut TrapContext) {
     let feature = ctx.x[1] as u32;
     let value: u32 = match feature {
@@ -95,11 +93,40 @@ fn get_feature(ctx: &mut TrapContext) {
         1 => 1,           // display present
         2 => 0,           // backlight (default off)
         3 => 0,
-        4 => 0,           // orientation (default upright)
+        4 => orientation(),
         5 => 0xA,
         _ => 0xFFFF_FFFF, // unknown feature
     };
     ctx.x[0] = value as u64;
+}
+
+/// `TMainDisplayDriver::SetFeature(feature=r1, value=r2)` — Einstein's
+/// `Emulator/TNativePrimitives.cpp:1697`. Contrast (0) and backlight
+/// (2) have no hardware behind them and are accepted-and-dropped as
+/// before; orientation (4) is stored and drives the GetScreenInfo
+/// geometry swap, the `blit` rotation into the portrait GUEST_FB, and
+/// the pen-sample transform (`pen_to_screen`). An orientation value
+/// outside Einstein's EOrientation range halts loudly — that's a
+/// contract change we need to see, not accept.
+fn set_feature(ctx: &mut TrapContext, pc: u32) {
+    let feature = ctx.x[1] as u32;
+    let value = ctx.x[2] as u32;
+    if feature == 4 {
+        if value > 3 {
+            kprintln!(
+                "*** screen.SetFeature: unknown orientation {} @PC={:#x}",
+                value, pc
+            );
+            cpu::halt();
+        }
+        let old = ORIENTATION.swap(value, Ordering::Relaxed);
+        if old != value {
+            // One line per user-initiated rotate — not a recurring
+            // diagnostic.
+            kprintln!("screen.SetFeature: orientation {} -> {}", old, value);
+        }
+    }
+    ctx.x[0] = 0;
 }
 
 /// Geometry advertised to the guest on GetScreenInfo. Runtime so a
@@ -120,6 +147,78 @@ fn get_feature(ctx: &mut TrapContext) {
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 static SCREEN_W: AtomicU32 = AtomicU32::new(320);
 static SCREEN_H: AtomicU32 = AtomicU32::new(480);
+
+/// Screen orientation as set by the guest through SetFeature(4).
+/// Values are Einstein's `TScreenManager::EOrientation`
+/// (`Screen/TScreenManager.h:71`): 0 = AppleTop, 1 = AppleRight,
+/// 2 = AppleBottom, 3 = AppleLeft; **bit 0 set = landscape**. The
+/// MP2x00's native UI is landscape — the 717006 ROM requests
+/// `SetFeature(4, 1)` + `TabSetOrientation(1)` at every UI start
+/// (hardware-observed). The old accept-and-discard stub silently
+/// vetoed that request (GetFeature(4) kept answering 0), which is
+/// why this hypervisor historically booted into the portrait UI;
+/// with the store honest, the ROM's orientation preference takes
+/// effect and the Extras Rotate button cycles it.
+///
+/// GUEST_FB stays in physical portrait geometry at every orientation
+/// — like the fixed panel on real hardware — so the host paint
+/// paths and the touch map are orientation-blind. `blit` rotates
+/// guest screen-space rects into the portrait framebuffer
+/// ([`to_portrait`]) and pen samples take the inverse transform
+/// ([`pen_to_screen`]).
+static ORIENTATION: AtomicU32 = AtomicU32::new(0);
+
+pub fn orientation() -> u32 {
+    ORIENTATION.load(Ordering::Relaxed)
+}
+
+/// Screen geometry as the guest sees it via GetScreenInfo: the
+/// physical portrait size, swapped under a landscape orientation
+/// (bit 0 set — see [`ORIENTATION`]).
+fn guest_screen_size() -> (u32, u32) {
+    let (w, h) = (screen_width(), screen_height());
+    if orientation() & 1 != 0 { (h, w) } else { (w, h) }
+}
+
+/// Map a guest screen-space pixel to the physical portrait GUEST_FB
+/// pixel under orientation `o`: 0 is the identity, 1 and 3 the two
+/// landscape rotations, 2 upside-down portrait. The direction of the
+/// 1-rotation is fixed by hardware observation: it must put the
+/// landscape UI upright on the rot90-scanned panel (the inverse
+/// choice renders it 180° off). `pw`/`ph` are the portrait geometry.
+/// An out-of-range screen coordinate wraps into an out-of-range
+/// portrait coordinate; the FB bounds check at the write site is the
+/// loud halt for that.
+#[inline]
+fn to_portrait(o: u32, pw: u32, ph: u32, xs: u32, ys: u32) -> (u32, u32) {
+    match o {
+        1 => (ys, ph.wrapping_sub(1).wrapping_sub(xs)),
+        3 => (pw.wrapping_sub(1).wrapping_sub(ys), xs),
+        2 => (
+            pw.wrapping_sub(1).wrapping_sub(xs),
+            ph.wrapping_sub(1).wrapping_sub(ys),
+        ),
+        _ => (xs, ys),
+    }
+}
+
+/// Inverse of [`to_portrait`]: map a physical portrait-panel pixel (a
+/// pen sample from the fixed digitizer) into guest screen space under
+/// the current orientation. Called from the pen-source wiring in
+/// `main.rs`, which owns the packed-sample format.
+pub fn pen_to_screen(x: u32, y: u32) -> (u32, u32) {
+    let pw = screen_width();
+    let ph = screen_height();
+    match orientation() {
+        1 => (ph.wrapping_sub(1).wrapping_sub(y), x),
+        3 => (y, pw.wrapping_sub(1).wrapping_sub(x)),
+        2 => (
+            pw.wrapping_sub(1).wrapping_sub(x),
+            ph.wrapping_sub(1).wrapping_sub(y),
+        ),
+        _ => (x, y),
+    }
+}
 
 pub const SCREEN_BPP: u32 = 2;
 
@@ -245,10 +344,14 @@ pub const MAX_SCREEN_H: u32 = 960;
 
 fn get_screen_info(ctx: &mut TrapContext, pc: u32) {
     let info_addr = ctx.x[1] as u32;
-    // Layout per TNativePrimitives.cpp:1590-1598.
+    // Layout per TNativePrimitives.cpp:1590-1598. Geometry is the
+    // guest-visible one — swapped under a landscape orientation
+    // (Einstein returns GetScreenHeight/Width, which swap on the
+    // landscape bit, TScreenManager.h:406-431).
+    let (guest_w, guest_h) = guest_screen_size();
     let fields = [
-        (0x00, screen_height()),
-        (0x04, screen_width()),
+        (0x00, guest_h),
+        (0x04, guest_w),
         (0x08, SCREEN_BPP),
         (0x0C, 0x0000_0037), // unknown (Einstein verbatim)
         (0x10, 0x0064_0064), // resolution 100x100
@@ -401,6 +504,135 @@ fn blit(ctx: &mut TrapContext, pc: u32) {
     // SAFETY: see ScratchCell.
     let scratch = unsafe { &mut *SCRATCH.0.get() };
     let wants_payload = WANTS_PAYLOAD.load(Ordering::Relaxed);
+
+    // A non-baseline orientation rotates every blit: the guest draws
+    // in its rotated screen space and each pixel lands transformed in
+    // the portrait GUEST_FB. The straight-copy paths below assume
+    // screen space == framebuffer space, so this path replaces them
+    // wholesale — per-pixel, which is fine for the one full-screen
+    // redraw after a rotate plus ordinary incremental UI blits.
+    let orient = orientation();
+    if orient != 0 {
+        let pw = screen_width();
+        let ph = screen_height();
+        if src_width_pixels > 0 && height > 0 {
+            let mut xlate = PageTranslate::new();
+            for r in 0..height {
+                let src_row_off = (pixmap_src_top as u32 + r) * row_bytes;
+                let ys = dst_top as u32 + r;
+                let mut src_off_cached = u32::MAX;
+                let mut src_byte = 0u8;
+                for c in 0..src_width_pixels {
+                    let abs_src_pix = pixmap_src_left as u32 + c;
+                    let src_off = src_row_off + abs_src_pix / 4;
+                    if src_off != src_off_cached {
+                        let src_va = addy + src_off;
+                        let src_pa = xlate.pa_for(src_va);
+                        src_byte = match crate::hv::guest_endian::guest_read_u8_pa(src_pa) {
+                            Some(b) => b,
+                            None => {
+                                kprintln!(
+                                    "*** screen.blit: src VA {:#x} → PA {:#x} outside mapped regions",
+                                    src_va, src_pa
+                                );
+                                cpu::halt();
+                            }
+                        };
+                        src_off_cached = src_off;
+                    }
+                    let src_shift = 6 - 2 * (abs_src_pix & 3) as u8;
+                    let src_2bit = (src_byte >> src_shift) & 0x3;
+
+                    let (xp, yp) = to_portrait(orient, pw, ph, dst_left as u32 + c, ys);
+                    let fb_ipa = guest_mem::FB_IPA_BASE.wrapping_add(
+                        yp.wrapping_mul(fb_row_bytes).wrapping_add(xp / 4),
+                    );
+                    let cur = match guest_mem::read_byte_pa(fb_ipa) {
+                        Some(b) => b,
+                        None => {
+                            kprintln!(
+                                "*** screen.blit: dst FB IPA {:#x} outside mapped regions",
+                                fb_ipa
+                            );
+                            cpu::halt();
+                        }
+                    };
+                    let dst_shift = 6 - 2 * (xp & 3) as u8;
+                    let final_2bit = match mode {
+                        1 => src_2bit.max((cur >> dst_shift) & 0x3),
+                        _ => src_2bit,
+                    };
+                    let merged = (cur & !(0x3 << dst_shift)) | (final_2bit << dst_shift);
+                    if !guest_mem::write_byte_pa(fb_ipa, merged) {
+                        kprintln!(
+                            "*** screen.blit: FB IPA {:#x} outside framebuffer",
+                            fb_ipa
+                        );
+                        cpu::halt();
+                    }
+                }
+            }
+
+            // Portrait-space dirty rect for the host sink: transform
+            // the inclusive dst corners, normalise, then widen to the
+            // 4-pixel byte grid so the payload (when wanted) is a
+            // straight FB byte copy.
+            let (ax, ay) = to_portrait(orient, pw, ph, dst_left as u32, dst_top as u32);
+            let (bx, by) = to_portrait(
+                orient, pw, ph,
+                dst_left as u32 + src_width_pixels - 1,
+                dst_top as u32 + height - 1,
+            );
+            let p_left = ax.min(bx) & !3;
+            let p_right = (ax.max(bx) + 4) & !3;
+            let p_top = ay.min(by);
+            let p_bottom = ay.max(by) + 1;
+            let rot_row_bytes = ((p_right - p_left) / 4) as usize;
+            let rot_len = rot_row_bytes * (p_bottom - p_top) as usize;
+            if rot_len > scratch.len() {
+                kprintln!(
+                    "*** screen.blit: rotated payload {} bytes exceeds scratch {}",
+                    rot_len, scratch.len()
+                );
+                cpu::halt();
+            }
+            if wants_payload {
+                for (i, row) in (p_top..p_bottom).enumerate() {
+                    for b in 0..rot_row_bytes {
+                        let fb_ipa = guest_mem::FB_IPA_BASE.wrapping_add(
+                            row * fb_row_bytes + p_left / 4 + b as u32,
+                        );
+                        scratch[i * rot_row_bytes + b] = match guest_mem::read_byte_pa(fb_ipa) {
+                            Some(v) => v,
+                            None => {
+                                kprintln!(
+                                    "*** screen.blit: rotated payload FB IPA {:#x} outside mapped regions",
+                                    fb_ipa
+                                );
+                                cpu::halt();
+                            }
+                        };
+                    }
+                }
+            }
+            log_blit(pc, addy, row_bytes, height,
+                src_top, src_left, src_bottom, src_right,
+                p_top as u16, p_left as u16, p_bottom as u16, p_right as u16,
+                src_width_pixels * height);
+            crate::diag::blit_timing::EMULATE.record_since(t_emu);
+            push_blit_event(
+                mode,
+                p_top as u16, p_left as u16, p_bottom as u16, p_right as u16,
+                p_top as u16, p_left as u16, p_bottom as u16, p_right as u16,
+                rot_row_bytes as u16,
+                if wants_payload { &scratch[..rot_len] } else { &[] },
+            );
+        } else {
+            crate::diag::blit_timing::EMULATE.record_since(t_emu);
+        }
+        ctx.x[0] = 0;
+        return;
+    }
 
     let payload_row_bytes = (src_width_pixels * SCREEN_BPP).div_ceil(8) as usize;
     let payload_len = payload_row_bytes * height as usize;

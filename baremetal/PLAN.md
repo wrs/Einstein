@@ -130,9 +130,15 @@ build combinations in `scripts/check-matrix.sh` pass.
       logo off-center, trash-crumple erase bounded to y<480, Dates
       opens 480 tall). Findings + resume plan (Einstein oracle at
       540×960, then hunt the constants in rom.dis) in
-      `docs/REAL_HW_BRINGUP.md` "Hires Newton geometry". The
-      Extras Rotate button no-op is the adjacent
-      `SetFeature`(orientation) stub in `peripherals/screen.rs`.
+      `docs/REAL_HW_BRINGUP.md` "Hires Newton geometry".
+    - `SetFeature`(orientation) is real: the Extras Rotate button
+      cycles all four `EOrientation` values (stored orientation,
+      GetScreenInfo swap, rotated blits into the portrait
+      GUEST_FB, inverse pen transform), hardware-verified through
+      two full rotations. Note the MP2x00's native UI is
+      landscape — the ROM asserts `SetFeature(4,1)` at UI start,
+      so a fresh store now first boots landscape until rotated
+      (the old accept-and-discard stub was silently vetoing it).
     - The 8 bpp paletted surface is in: guest scan-out surfaces
       allocate at 8 bpp with a shared palette (`SET_PALETTE` in
       mailbox.rs, gray ramp + color cube in `display/fb.rs`), loud

@@ -385,6 +385,10 @@ a USB HDMI digitizer on the Pi's HDMI output:
 
 The standard benchmark: `record --seconds 15 --tap 18,453` (opens the
 Extras drawer), `--tap 306,421` (closes it), `grab` for the bbox.
+Taps are physical portrait-panel coordinates, so these two mean
+"Extras" only while the guest is in upright portrait
+(`SetFeature`(orientation) = 0) — check the UI with `grab` first if
+the store's orientation pref may have changed.
 
 ### Recovery and limits
 
@@ -714,8 +718,10 @@ matches, they're inherent ROM behaviour and only a ROM patch — the
 last-resort layer — could fix them); hunt Dates' 480 and the
 animation save-under bounds in `rom.dis` (they may share one cached
 screen-bounds global); note the OS-side Rotate button is the
-related-but-separate `SetFeature`(orientation) stub in
-`peripherals::screen`.
+related-but-separate `SetFeature`(orientation) support in
+`peripherals::screen` (implemented — rotation happens in guest
+screen space against the fixed portrait GUEST_FB, so hires geometry
+and orientation compose without interacting).
 
 ### Porting notes
 

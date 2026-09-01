@@ -106,7 +106,7 @@ pub extern "C" fn kmain() -> ! {
         host::host_io::push_guest_blit,
         host::host_io::wants_payload(),
     );
-    peripherals::tablet::install_pen_source(host::host_io::pop_pen_sample);
+    peripherals::tablet::install_pen_source(pen_source_oriented);
     peripherals::sound::install_audio_ops(peripherals::sound::AudioOps {
         set_interrupt_mask: host::audio::set_interrupt_mask,
         set_output_buffers: host::audio::set_output_buffers,
@@ -259,6 +259,36 @@ pub extern "C" fn kmain() -> ! {
     // If we ever reach this (we won't) — halt so the machine is safe.
     #[allow(unreachable_code)]
     arch::cpu::halt();
+}
+
+/// Pen source installed into the tablet driver: pops physical
+/// portrait-panel samples from the host queue and rotates them into
+/// the guest's current screen orientation
+/// (`peripherals::screen::pen_to_screen`). Lives here because it
+/// bridges layers: the packed-sample format and the up/down markers
+/// belong to `host::host_io`, the orientation to `peripherals`. The
+/// markers carry no coordinates and pass through untouched.
+fn pen_source_oriented() -> Option<(u32, u32)> {
+    let (sample, ticks) = host::host_io::pop_pen_sample()?;
+    // Portrait orientation 0 is the identity transform — hand the
+    // sample through bit-exact (repacking would strip bits outside
+    // the x/y/pressure fields, which the tablet guest test injects
+    // and reads back verbatim).
+    if peripherals::screen::orientation() == 0 {
+        return Some((sample, ticks));
+    }
+    if sample == host::host_io::PEN_DOWN_SAMPLE_MARKER
+        || sample == host::host_io::PEN_UP_SAMPLE_MARKER
+    {
+        return Some((sample, ticks));
+    }
+    let x = (sample >> 21) & 0x7FF;
+    let y = (sample >> 7) & 0x7FF;
+    let (xs, ys) = peripherals::screen::pen_to_screen(x, y);
+    Some((
+        host::host_io::pack_pen_sample(xs as u16, ys as u16, (sample & 0x0F) as u16),
+        ticks,
+    ))
 }
 
 fn install_vectors() {

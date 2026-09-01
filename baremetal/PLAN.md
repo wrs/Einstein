@@ -144,11 +144,19 @@ build combinations in `scripts/check-matrix.sh` pass.
       mailbox.rs, gray ramp + color cube in `display/fb.rs`), loud
       32 bpp fallback. Hardware-verified; Extras-animation
       `push_blit` avg 679 → 312 µs.
-    - Deferred, in likely-value order: double-buffered flips
-      (`fb_set_virtual_offset` is implemented and unused), DMA
-      offload (host_dma.rs lacks `TI_DEST_INC`/`TI_TDMODE`; low
-      value while the CPU format-converts), Normal-NC framebuffer
-      remap (only if cache maintenance ever dominates again).
+    - Tear-free display: investigated and CLOSED as unreachable
+      from this layer. Firmware `SET_VIRTUAL_OFFSET` pans latch
+      mid-scan (every pan produces exactly one seamed frame at any
+      rate, hardware-measured) and block 21–42 ms; `SET_VSYNC`
+      blocks ~50 ms. Double-buffered flips would guarantee a seam
+      per presentation — worse than the occasional paint-race
+      tear. The workable mechanism is KMS-scale HVS ownership.
+      Evidence + reproduction protocol in
+      `docs/REAL_HW_BRINGUP.md` "Tearing".
+    - Deferred, in likely-value order: DMA offload (host_dma.rs
+      lacks `TI_DEST_INC`/`TI_TDMODE`; low value while the CPU
+      format-converts), Normal-NC framebuffer remap (only if cache
+      maintenance ever dominates again).
 
 11. **HDMI audio CTS mis-derived on high-clock sinks.**
     `cts_pixel_clock_hz` treats any >=80 MHz pixel-clock readback as

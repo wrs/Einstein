@@ -723,6 +723,63 @@ related-but-separate `SetFeature`(orientation) support in
 screen space against the fixed portrait GUEST_FB, so hires geometry
 and orientation compose without interacting).
 
+### Tearing — no tear-free mechanism on this stack (investigated 2026-08-31)
+
+`push_blit` writes into the live scan-out surface, so a paint racing
+the raster can leave a one-frame seam (visible when dragging
+windows). Every candidate fix available from this layer was run to
+ground on the bench hardware (Pi Zero 2 W, full `start.elf`,
+1080p60 sink, `display_hdmi_rotate=1`, 8 bpp VC-scaled surface) and
+disqualified:
+
+- **`SET_VIRTUAL_OFFSET` page flips (double buffering): pans latch
+  mid-scan.** The firmware grants a 2×-height 8 bpp virtual buffer
+  (palette, VC scale and rot90 all preserved; offsets honoured and
+  read back exactly), but a pan applies *mid-frame*: the frame being
+  scanned shows old content on one side of a seam (diagonal, under
+  the rotated raster) and new on the other. Measured with an
+  alternating black/white fill+pan stress against the HDMI
+  digitizer: **every pan produced exactly one seamed frame** — at
+  maximum rate (~24 pans/s, ~40 % of captured frames seamed) *and*
+  throttled to one pan per 100 ms (clean `WWW T KKK T WWW…` capture
+  pattern, one torn frame per transition). Flipping per paint would
+  therefore *guarantee* a seam per presentation — worse than the
+  status quo, where only a paint that races the raster tears. The
+  pan call also *blocks* 21–42 ms in the mailbox, unusable per
+  frame on latency grounds alone.
+- **`SET_VSYNC` (0x0004800E) as a frame-sync primitive: blocks
+  ~50 ms per call** (first call 32 ms, then a flat 49.99 ms —
+  a firmware throttle, not a 16.7 ms vsync wait). Even with a true
+  vsync wait, in-place paints would have to fit in the ~0.45 ms
+  1080p60 blanking interval; typical paints (avg ~0.3 ms, max
+  1–2 ms) don't reliably fit, and the wait itself stalls EL2.
+- **In-place writes tear, spectacularly, under stress** (the
+  control arm): full-surface fills at ~4.5 kHz captured as dense
+  stripes — many fill states interleaved per scanned frame.
+- **Driving the HVS display list directly** (what KMS does: write a
+  new list, sync on the SCALER vsync interrupt) is the mechanism
+  that would actually work, but the firmware owns the display list
+  and the CRTC from this layer (same boundary as the
+  `FIRMWARE_TOP_BAR_PX` note) — that's a KMS-scale takeover, not a
+  display-path patch.
+
+Reproduction: allocate the guest surface with `virt_height = 2×h`
+(one extra word in `fb_setup_and_allocate`'s SET_VIRTUAL_W_H tag),
+fill page/pan via `fb_set_virtual_offset`, alternate black/white
+~6 s per arm, record the digitizer at 30 fps
+(`capture-timing.py record --save-raw`) and classify frames by
+black/white row fraction. Untested variable: a non-rotated
+(landscape) scan-out — needs a config.txt card write; the seam
+would likely persist (same firmware pan path) but the diagonal
+shape is the transpose unit's.
+
+What *is* in place: paints are coalesced to ≤60 Hz and the damaged
+rect is written top-to-bottom in one tight pass (~0.3 ms avg), so
+the race window per paint is small; tearing is occasional and
+one-frame. Accepting a mechanism that cannot be fixed from this
+layer is recorded here so the next pass starts at the HVS/KMS
+boundary, not at the mailbox.
+
 ### Porting notes
 
 - **Batch all FB setup tags in a single mailbox message.** The Pi

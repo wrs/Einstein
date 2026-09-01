@@ -29,6 +29,12 @@ const BG: u32 = u32::from_le_bytes([0xA0, 0xC8, 0xE8, 0x00]);
 const BAR_BG: u32 = u32::from_le_bytes([0x00, 0x00, 0x00, 0x00]);
 const BAR_FG: u32 = u32::from_le_bytes([0xFF, 0xFF, 0xFF, 0x00]);
 
+/// Logical bar width: progress arithmetic ([`update_progress`],
+/// [`set_load_progress`], `BAR_FILLED`) runs in this domain. The
+/// *painted* width is `BAR_W.min(width * 5/8)` — the same ~5/8
+/// proportion this constant gives the 866-wide landscape surface —
+/// so the bar keeps side margins on the narrow rot90 surface
+/// (320 → 200 painted px) instead of clipping edge-to-edge.
 const BAR_W: u32 = 500;
 const BAR_H: u32 = 16;
 
@@ -84,6 +90,8 @@ static mut FB: Option<FbInfo> = None;
 /// Panel coordinates of the bar's top-left corner.
 static mut BAR_X: u32 = 0;
 static mut BAR_Y: u32 = 0;
+/// Painted bar width (`BAR_W` scaled to fit the surface).
+static mut BAR_W_PAINTED: u32 = BAR_W;
 
 /// Allocate the framebuffer, paint background + logo + empty bar, and
 /// flush. Returns the [`FbInfo`] so callers (kmain) can wire it
@@ -104,12 +112,12 @@ pub fn init() -> Option<FbInfo> {
     let info = match fb::alloc_guest_surface(
         crate::host::host_io::pi_fb::NEWTON_W,
         crate::host::host_io::pi_fb::NEWTON_H,
-        crate::host::host_io::pi_fb::FIRMWARE_TOP_BAR_PX,
-        // Under rot90 the splash's own layout is NOT rotated — it
-        // paints row-major into the transposed surface and shows
-        // sideways until the guest's first blit. Cosmetic, accepted:
-        // the splash lives for a few seconds and rotating its layout
-        // would duplicate the geometry policy here.
+        crate::host::host_io::pi_fb::RESERVED_TOP_PX,
+        // Under rot90 the splash needs no rotation of its own: it
+        // paints row-major into the transposed surface through the
+        // same transform chain as guest blits, so its layout shows
+        // upright on the portrait-mounted panel (hardware-verified).
+        // Only the element sizes adapt — see BAR_W.
         crate::host::host_io::pi_fb::ROTATION == crate::host::host_io::Rotation::Rot90,
     ) {
         Ok(i) => i,
@@ -123,7 +131,7 @@ pub fn init() -> Option<FbInfo> {
     if LOGO_W != 0 && LOGO_H != 0 {
         paint_logo(&info);
     }
-    let (bx, by) = paint_empty_bar(&info);
+    let (bx, by, bw) = paint_empty_bar(&info);
 
     // Flush the whole framebuffer once so the VC scan sees the splash.
     crate::arch::cpu::dc_civac_range(info.pa, info.size as usize);
@@ -135,6 +143,7 @@ pub fn init() -> Option<FbInfo> {
             FB = Some(info);
             BAR_X = bx;
             BAR_Y = by;
+            BAR_W_PAINTED = bw;
         }
     }
     INIT_DONE.store(true, Ordering::Relaxed);
@@ -144,7 +153,7 @@ pub fn init() -> Option<FbInfo> {
         info.height,
         bx,
         by,
-        BAR_W,
+        bw,
         BAR_H,
         LOGO_W,
         LOGO_H,
@@ -218,9 +227,16 @@ fn advance_bar(target: u32) {
         return;
     }
 
-    // SAFETY: single-core EL2; BAR_X/BAR_Y immutable post-init.
-    let (bx, by) = unsafe { (BAR_X, BAR_Y) };
-    fill_rect(fb, bx + current, by, target - current, BAR_H, BAR_FG);
+    // SAFETY: single-core EL2; BAR_X/BAR_Y/BAR_W_PAINTED immutable
+    // post-init.
+    let (bx, by, bw) = unsafe { (BAR_X, BAR_Y, BAR_W_PAINTED) };
+    // Progress runs in the logical 0..BAR_W domain; scale to painted
+    // pixels only here.
+    let cur_px = current * bw / BAR_W;
+    let tgt_px = target * bw / BAR_W;
+    if tgt_px > cur_px {
+        fill_rect(fb, bx + cur_px, by, tgt_px - cur_px, BAR_H, BAR_FG);
+    }
 
     let row_bytes = fb.pitch as u64;
     let flush_pa = fb.pa + by as u64 * row_bytes;
@@ -249,13 +265,12 @@ fn paint_logo(fb: &FbInfo) {
     blit_logo(fb, logo_x as u32, logo_y as u32);
 }
 
-fn paint_empty_bar(fb: &FbInfo) -> (u32, u32) {
-    let bx = (fb.width as i32 - BAR_W as i32) / 2;
-    let by = (fb.height as i32) * 2 / 3 - (BAR_H as i32) / 2;
-    let bx = bx.max(0) as u32;
-    let by = by.max(0) as u32;
-    fill_rect(fb, bx, by, BAR_W, BAR_H, BAR_BG);
-    (bx, by)
+fn paint_empty_bar(fb: &FbInfo) -> (u32, u32, u32) {
+    let bw = BAR_W.min(fb.width * 5 / 8);
+    let bx = (fb.width - bw) / 2;
+    let by = ((fb.height as i32) * 2 / 3 - (BAR_H as i32) / 2).max(0) as u32;
+    fill_rect(fb, bx, by, bw, BAR_H, BAR_BG);
+    (bx, by, bw)
 }
 
 /// Fill an axis-aligned rectangle with `color`. Clips to FB bounds.

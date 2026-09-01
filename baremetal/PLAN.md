@@ -115,10 +115,14 @@ build combinations in `scripts/check-matrix.sh` pass.
       (~7-10k faults/s: DACR write pairs at 0x3ad6f0/0x3adb08 + the
       0x800a08 native call + IntCtrl polling) — item 9 territory if
       it ever matters.
-    - Portrait rotation is plumbed end-to-end (`pi-fb-rot90` +
-      `display_hdmi_rotate=1`, flipped together, SD card in hand)
-      but UNVERIFIED on hardware: gpu_mem/full-start.elf need,
-      `FIRMWARE_TOP_BAR_PX` under rotation, rotation direction.
+    - Portrait rotation is verified on hardware (`pi-fb-rot90` +
+      `display_hdmi_rotate=1` + full `start.elf`/`gpu_mem=64`):
+      direction is 90° CW as the touch map assumed, taps land,
+      Newton spans all 1080 panel rows (rot90 drops the top-bar
+      allowance — it lands at the panel bottom and dodges nothing),
+      and the firmware's transposed physical-size readback both
+      fixes the geometry and detects the mismatched-pair case.
+      Details in `docs/REAL_HW_BRINGUP.md` "Portrait rotation".
     - Deferred, in likely-value order: 8 bpp paletted surface
       (needs `SET_PALETTE` in mailbox.rs; quarters write
       bandwidth), double-buffered flips (`fb_set_virtual_offset`

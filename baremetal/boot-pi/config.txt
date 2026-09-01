@@ -23,14 +23,17 @@ arm_64bit=1
 # Per the config.txt docs: "Cut-down firmware (start*cd.elf and
 # fixup*cd.dat) cannot be selected this way [via start_file=] - the
 # system will fail to boot. The only way to enable the cut-down
-# firmware is to specify gpu_mem=16." We ship start_cd.elf, so this
-# line is mandatory — otherwise the firmware looks for start.elf
-# (which isn't on the SD) and halts after reading config.txt.
+# firmware is to specify gpu_mem=16." Any other value selects the
+# full pair (start.elf + fixup.dat) — build-sd.sh ships both pairs,
+# so either setting boots.
 #
-# We tested the full firmware (gpu_mem=64, ships start.elf): it did
-# not clear the persistent top-row white bar, so we stayed on the
-# cut-down variant. See `host_io::pi_fb::FIRMWARE_TOP_BAR_PX` for
-# the workaround.
+# We tested the full firmware (gpu_mem=64) for the white-bar hunt:
+# it did not clear the persistent top-row white bar, so landscape
+# stays on the cut-down variant (see
+# `host_io::pi_fb::FIRMWARE_TOP_BAR_PX` for the workaround).
+# Portrait rotation is documented as needing more GPU memory than
+# gpu_mem=16 and is verified working with gpu_mem=64 — set that
+# together with the rotation pair below.
 gpu_mem=16
 
 # Suppress the firmware's rainbow boot splash. Our own boot splash
@@ -92,18 +95,19 @@ disable_overscan=1
 # side scaling, no resampling. See `host_io::pi_fb::init`.
 display_auto_detect=1
 
-# Portrait rotation pairing for the `pi-fb-rot90` build feature
-# (Phase 5 rotation plumbing — designed, OFF by default). Uncomment
-# together with a `pi-fb-rot90` build ONLY; there is no mailbox
-# readback for the firmware's rotation, so a mismatched pair paints
-# wrong either way round. UNVERIFIED ON HARDWARE, two known risks:
-# 90/270-degree rotation is documented as needing more GPU memory
-# than gpu_mem=16 — i.e. a switch to the full start.elf (see the
-# gpu_mem note above; the full firmware was tried once for the
-# white-bar hunt, so the SD-card side is known workable) — and
-# `host_io::pi_fb::FIRMWARE_TOP_BAR_PX` must be re-measured under
-# both the VC-scaled surface and rotation before trusting the
-# geometry. See docs/REAL_HW_BRINGUP.md "Portrait rotation".
+# Portrait rotation pairing for the `pi-fb-rot90` build feature —
+# hardware-verified (90° clockwise), OFF by default because it
+# depends on how the monitor is physically mounted. Uncomment
+# together with gpu_mem=64 (above) and a `pi-fb-rot90` build ONLY.
+# The firmware's physical-size readback comes back transposed while
+# rotation is active; `display::fb::alloc_guest_surface` keys off
+# that, so a rot90 build under an unrotated firmware fails loudly to
+# the landscape fallback (the reverse mismatch still paints
+# sideways). See docs/REAL_HW_BRINGUP.md "Portrait rotation".
+#
+# NOTE for a card currently running rotated: re-syncing this file
+# (scripts/build-sd.sh with a mount arg) reverts it to landscape —
+# re-apply gpu_mem=64 + this line after the sync.
 #display_hdmi_rotate=1
 
 # Force HDMI mode with audio support (vs DVI mode, which strips audio

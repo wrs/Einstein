@@ -170,6 +170,19 @@ pub static BACKEND: PiFbBackend = PiFbBackend;
 /// 16-row bottom margin (capture-verified).
 pub const FIRMWARE_TOP_BAR_PX: u32 = 16;
 
+/// Reserved-top allowance for the scan-out surface geometry
+/// (`display::fb::alloc_guest_surface`): [`FIRMWARE_TOP_BAR_PX`] in
+/// landscape, 0 under rot90. Under a 90° CW rotation surface column
+/// 0 scans out at the panel *top*, so the far-edge spare columns the
+/// allowance would buy land at the panel bottom — it cannot dodge a
+/// top bar there and only shrinks Newton. Capture-verified on the
+/// digitizer sink: without it Newton spans all 1080 panel rows.
+pub const RESERVED_TOP_PX: u32 = if cfg!(feature = "pi-fb-rot90") {
+    0
+} else {
+    FIRMWARE_TOP_BAR_PX
+};
+
 /// 8-bit grayscale for each of the four 2 bpp Newton pixel values.
 /// 0 = white, 3 = black, intermediates are linear grays. Used by
 /// `newton_gray` as the input to bilinear blending and by

@@ -589,14 +589,14 @@ panel-native surface with the old CPU software-bilinear scaler
 (force that path for A/B testing with the `pi-fb-force-cpu-scale`
 feature).
 
-### Portrait rotation (designed, default off — UNVERIFIED on hardware)
+### Portrait rotation (default off — verified on hardware)
 
 The reason VC-first matters: with the firmware scaling scan-out, a
 90° rotation for a physically portrait-mounted monitor costs the CPU
 nothing — the paint loop is byte-identical, only the surface shape
-and the touch map change. The plumbing is wired end-to-end but OFF
-by default; **nothing below the config.txt line has ever run on
-hardware.**
+and the touch map change. Verified end-to-end on the Zero 2 W
+(digitizer capture + tap test); OFF by default because it depends on
+how the monitor is physically mounted.
 
 - **Selection: the `pi-fb-rot90` Cargo feature**, paired with
   `display_hdmi_rotate=1` in `boot-pi/config.txt` (a commented-out
@@ -605,8 +605,18 @@ hardware.**
   page `src/host/mailbox.rs` cites) documents no rotation/transform
   readback tag — and config.txt can't be changed over the
   serial-upload path anyway, so flipping rotation always means SD
-  card in hand; flip both together. A mismatched pair paints wrong
-  in either direction (there is nothing to detect it with).
+  card in hand; flip both together.
+- **The physical-size readback is transposed under an active
+  rotation** — `fb_get_physical_size` returns 1080×1920 for a
+  1920×1080 mode. That is the one observable signal the rotation is
+  on: `alloc_guest_surface` normalises it back to landscape for the
+  geometry formulas, and treats a *landscape* readback with `rot90`
+  asserted as the mismatched-pair case (feature on, config.txt line
+  off) — loud log, panel-native fallback, with a note that the touch
+  map is still rotated. The reverse mismatch (config.txt on, feature
+  off) still paints wrong: the geometry checks reject the transposed
+  readback and the CPU fallback paints landscape under a rotated
+  scan-out.
 - **Geometry** (`display::fb::alloc_guest_surface`, `rot90` arm):
   the surface is allocated with the panel's *transposed* aspect and
   Newton's *width* pinned to the reserved-top allowance, since
@@ -615,38 +625,48 @@ hardware.**
   `fb_h = panel_w × fb_w / panel_h`. For a 1920×1080 mode:
   **325×578**, Newton 320×480 at offset (0, 49), HVS scale ×3.32 —
   Newton spans ~1063 of 1080 panel rows and ~1595 of 1920 panel
-  columns (vs 709×1064 unrotated: ~2.2× the pixels).
+  columns (vs 709×1064 unrotated: ~2.2× the pixels). Digitizer
+  capture measured 1587×1064 at x 161–1747, y 0–1063 — the design
+  numbers within a pixel of rounding.
 - **Painting** is unchanged: Newton rows land 1:1 row-major
   (`pi_fb::paint_1to1`); the firmware rotates on scan-out. Newton is
-  left-aligned on the surface x axis (the bar-allowance columns sit
-  at the far edge) and centered on y. The boot splash is *not*
-  rotated — it shows sideways for its few seconds of life.
-- **Touch** (`input::calibrate`): the painted-region report carries
-  the `host_io::Rotation`, and the touch→surface map inverts it —
-  surface x from touch y, surface y from mirrored touch x (assuming
-  `display_hdmi_rotate=1` = 90° **clockwise**; if hardware shows it
-  is CCW, the mirror moves to the other axis).
+  left-aligned on the surface x axis and centered on y. The boot
+  splash needs no rotation of its own either — it paints row-major
+  into the same surface, so it shows upright on the portrait-mounted
+  panel (the design-phase "shows sideways" note was wrong); only its
+  progress-bar width scales down to the narrow surface.
+- **Rotation direction is 90° clockwise**, confirmed by capture:
+  content top (title bar) lands on the signal's right edge,
+  content-left at signal-top. The touch map's inversion — surface x
+  from touch y, surface y from mirrored touch x
+  (`input::calibrate`) — assumes exactly this and tap tests land
+  correctly.
 - **The CPU-bilinear fallback stays landscape-only** (a rotating
   software blit writes down panel columns — the cache-miss-per-store
   pattern that cost ~0.5 s per full fill pre-VC). If rot90 is
   selected and the VC probe falls back, `pi_fb::init` logs a loud
   WARNING and paints unrotated under the still-rotated scan-out.
 
-Known risks to retire when someone flips the config (both flagged
-in the plan, neither verified):
+Findings from the hardware pass (2026-08-31), retiring the two
+flagged risks:
 
-1. **GPU memory.** 90°/270° firmware rotation is documented as
-   needing more GPU memory than `gpu_mem=16` — i.e. the full
-   `start.elf` instead of the shipped `start_cd.elf`. The full
-   firmware was tried once during the white-bar hunt so the SD-card
-   side is known workable, but rotation-under-full-firmware has not
-   been.
-2. **`FIRMWARE_TOP_BAR_PX`** (16 rows) must be re-measured under
-   rotation: the geometry assumes the bar still occupies the top
-   panel rows and shifts the scan region the same way, which maps to
-   surface *columns* (column 0 at panel top under 90° CW). The
-   left-align + spare-column choice mirrors the landscape top-align
-   + spare-row choice and rests on that assumption.
+1. **GPU memory.** Confirmed: rotation needs the full `start.elf` +
+   `fixup.dat` with `gpu_mem=64` (the cut-down `start_cd.elf` pair
+   is only selectable via `gpu_mem=16`). `scripts/build-sd.sh` ships
+   both pairs from the same pinned firmware commit; config.txt's
+   `gpu_mem` selects at boot.
+2. **`FIRMWARE_TOP_BAR_PX` under rotation: dropped.** The capture
+   shows the allowance's spare columns landing at the panel *bottom*
+   (surface column 0 scans out at the panel top under 90° CW, and
+   Newton is left-aligned at column 0), while the firmware bar —
+   where a sink shows one at all; the digitizer never does — lives
+   at the top. So under rotation the allowance cannot dodge the bar
+   on any sink; it only shrinks Newton. `pi_fb::RESERVED_TOP_PX` is
+   therefore 0 under rot90 (surface 320×569, Newton spanning all
+   1080 panel rows) and `FIRMWARE_TOP_BAR_PX` in landscape. If a
+   bench-panel-style bar ever needs dodging under rotation, the fix
+   is right-aligning Newton on the surface x axis (spare columns at
+   the panel top), not the allowance.
 
 ### Porting notes
 

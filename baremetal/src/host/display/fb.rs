@@ -171,8 +171,12 @@ fn div_round(n: u32, d: u32) -> u32 {
 /// onto the unchanged panel mode (`display_hdmi_rotate=1`), so the
 /// surface gets the panel's *transposed* aspect and the content axis
 /// that spans the reserved-top panel rows is the content *width*
-/// (surface columns scan out as panel rows). Same formula, axes
-/// swapped:
+/// (surface columns scan out as panel rows). Under an active
+/// rotation the firmware's physical-size readback is itself
+/// transposed (1080x1920 for a 1920x1080 mode) — the formulas below
+/// use the normalised landscape values, and a *landscape* readback
+/// with `rot90` asserted is the mismatched-pair signal (feature on,
+/// `display_hdmi_rotate` off). Same formula, axes swapped:
 ///
 /// ```text
 /// fb_w = content_w * panel_h / (panel_h - reserved_top_px)   (≈ content_w)
@@ -201,14 +205,43 @@ pub fn alloc_guest_surface(
     reserved_top_px: u32,
     rot90: bool,
 ) -> Result<FbInfo, FbError> {
-    let (panel_w, panel_h) = mailbox::fb_get_physical_size()?;
+    // What the firmware reports — under `display_hdmi_rotate=1` this
+    // comes back *transposed* (1080x1920 for a 1920x1080 mode): the
+    // logical framebuffer shape, and the only observable evidence
+    // that the scan-out rotation is actually active. Panel-native
+    // fallbacks allocate this shape verbatim.
+    let (rep_w, rep_h) = mailbox::fb_get_physical_size()?;
     VC_SCALED_SURFACE.store(false, Ordering::Relaxed);
 
     if cfg!(feature = "pi-fb-force-cpu-scale") {
         kprintln!("display: pi-fb-force-cpu-scale set; using panel-native surface");
-        let (w, h) = native_size_or_default(panel_w, panel_h);
+        let (w, h) = native_size_or_default(rep_w, rep_h);
         return alloc_with_reset(w, h);
     }
+
+    // The VC-geometry formulas below want the *landscape* mode. A
+    // landscape readback with rot90 asserted means the firmware is
+    // not rotating (`display_hdmi_rotate` missing from config.txt —
+    // the mismatched-pair case): fall back to panel-native rather
+    // than paint for a rotation that isn't happening. Note the touch
+    // map still asserts Rot90 and will be wrong until the pair is
+    // fixed.
+    let (panel_w, panel_h) = if rot90 {
+        if rep_h > rep_w {
+            (rep_h, rep_w)
+        } else {
+            kprintln!(
+                "display: pi-fb-rot90 asserted but the firmware reports a landscape \
+                 mode {}x{} — display_hdmi_rotate missing from config.txt? \
+                 Using panel-native (touch map will be rotated wrong)",
+                rep_w, rep_h
+            );
+            let (w, h) = native_size_or_default(rep_w, rep_h);
+            return alloc_with_reset(w, h);
+        }
+    } else {
+        (rep_w, rep_h)
+    };
 
     let eff_h = panel_h.saturating_sub(reserved_top_px);
     // The content axis that scan-out maps onto panel rows: height in
@@ -220,7 +253,7 @@ pub fn alloc_guest_surface(
             "display: panel {}x{} unusable for a VC-scaled {}x{} surface; using panel-native",
             panel_w, panel_h, content_w, content_h
         );
-        let (w, h) = native_size_or_default(panel_w, panel_h);
+        let (w, h) = native_size_or_default(rep_w, rep_h);
         return alloc_with_reset(w, h);
     }
 
@@ -243,7 +276,7 @@ pub fn alloc_guest_surface(
             "display: VC-scaled geometry {}x{} out of range for panel {}x{}; using panel-native",
             fb_w, fb_h, panel_w, panel_h
         );
-        return alloc_with_reset(panel_w, panel_h);
+        return alloc_with_reset(rep_w, rep_h);
     }
 
     let pc_before = pixel_clock_hz();
@@ -260,7 +293,7 @@ pub fn alloc_guest_surface(
                 if let Err(e) = mailbox::fb_release() {
                     kprintln!("display: fb_release after refused surface failed: {:?}", e);
                 }
-                return alloc_with_reset(panel_w, panel_h);
+                return alloc_with_reset(rep_w, rep_h);
             }
             VC_SCALED_SURFACE.store(true, Ordering::Relaxed);
             kprintln!(
@@ -278,7 +311,7 @@ pub fn alloc_guest_surface(
             if let Err(e) = mailbox::fb_release() {
                 kprintln!("display: fb_release after failed surface alloc failed: {:?}", e);
             }
-            alloc_with_reset(panel_w, panel_h)
+            alloc_with_reset(rep_w, rep_h)
         }
     }
 }

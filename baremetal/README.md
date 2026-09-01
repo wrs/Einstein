@@ -265,7 +265,7 @@ unspecified.
 | `sd-probe`, `fb-probe` | no      | Standalone real-hw bring-up probes (boot, test one peripheral, halt).                |
 | `serial-pen-inject`    | no      | Debug pen injector: `~p<x>,<y>` lines on the host console inject taps (real hw; not in any aggregate — see `docs/REAL_HW_BRINGUP.md`). |
 | `pi-fb-force-cpu-scale`| no      | Skip the VC-scaled surface; force the panel-native CPU-bilinear path (hardware A/B). |
-| `pi-fb-rot90`          | no      | Assert firmware 90° scan-out rotation (`display_hdmi_rotate=1` pairing); transposed VC surface + rotated touch map. UNVERIFIED on hardware. |
+| `pi-fb-rot90`          | no      | Assert firmware 90° CW scan-out rotation (`display_hdmi_rotate=1` + full `start.elf`/`gpu_mem=64` pairing); transposed VC surface + rotated touch map. Hardware-verified; see `docs/REAL_HW_BRINGUP.md` "Portrait rotation". |
 
 Aggregates for real hardware (`pi-bare-metal`, `pi-bare-metal-sd`,
 `pi-bare-metal-display`, `pi-bare-metal-input`) roll up

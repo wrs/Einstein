@@ -156,6 +156,25 @@ pub struct RealClockSite {
 /// replaced with a branch to an arena stub that re-does the displaced
 /// work plus the injection, then branches to `resume_pc`.
 #[derive(Copy, Clone)]
+/// `TROMDomainManager1K` (the 1 KiB-subpage package pager) whole-page
+/// fault fill. The `bl DecompressAndMap` inside its `Fault` method is
+/// redirected to an arena stub that decompresses all four 1 KiB
+/// subpages of the faulting 4 KiB page (each resolved to its own large
+/// object with `GetObjectPtr`), because ARMv7 has no subpage AP: an
+/// absent subpage cannot fault, so it must never be left unfilled.
+pub struct PackagePagerSite {
+    /// The `bl DecompressAndMap` word inside `Fault`.
+    pub fault_bl: ProbeSite,
+    /// `DecompressAndMap__19TROMDomainManager1KFUlP12PackageChunk`.
+    pub decompress_and_map: u32,
+    /// `GetObjectPtr__19TROMDomainManager1KFUl` (returns 0 for a VA
+    /// outside every object).
+    pub get_object_ptr: u32,
+    /// `Read__15TStoreCompanderFUlPclT1` — the compander read
+    /// DecompressAndMap uses: `Read(this, offset, dst, len, obj_base)`.
+    pub compander_read: u32,
+}
+
 pub struct InjectionSite {
     pub patch: ProbeSite,
     pub resume_pc: u32,

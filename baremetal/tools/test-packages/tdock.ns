@@ -1,0 +1,18 @@
+constant src := {
+    class: 'PackageHeader, type: 0x78787878, pkg_version: 1, version: 1,
+    copyright: "none", name: "TDock:NHV", flags: 0,
+    parts: [ {
+        class: 'PackagePart,
+        info: MakeBinaryFromHex("41204E6577746F6E20546F6F6C6B6974206170706C69636174696F6E", 'binary),
+        flags: 0x81, type: 0x666F726D, align: 4,
+        data: {
+            app: '|TDock:NHV|, text: "TDock",
+            icon: { mask: MakeBinaryFromHex("000000000004000000000000001B0018000000000000000000001C0000003F0000003F001FFF7F003FFF7E003FFFFE003FFFFC003FFFFC003FFFF8003FFFF8003FFFF0003FFFF0003FFFE0003FFFE0003FFFC0003FFFC0003FFF80003FFF00003FFF80003FFF80003FFF80001FFF00001FFF00000FFE000000000000", 'mask), bits: MakeBinaryFromHex("000000000004000000000000001B0018000000000000000000001C0000003F00000033001FFF7B003FFF6E003000CE0037FCCC0037FD9C0034059800355338003403300035567000340660003554E000340CC000354FC000340B8000360F000037FE800037FD8000300B8000180300001FFF00000FFE000000000000", 'bits), bounds: { left: 0, top: 0, right: 24, bottom: 27 } },
+            theForm: { title: "TDock:NHV", viewBounds: { left: 0, top: 10, right: 200, bottom: 100 },
+                       viewFormat: 83951953, _proto: @180, stepChildren: [] }
+        }
+    } ]
+};
+pkg := MakePkg(src);
+SaveBinary(pkg, "tdock.pkg");
+p(Length(pkg));

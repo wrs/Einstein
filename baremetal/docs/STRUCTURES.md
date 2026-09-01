@@ -2071,3 +2071,100 @@ Cross-references:
 - `/Users/walter/Projects/newton/ghidra/DDKIncludes/OS600/` — public
   DDK headers (Apple, 1995). Useful for class names and high-level
   shape; **field offsets must be verified against 717006 binary.**
+
+---
+
+## TROMDomainManager1K — the package / large-object pager (ROM `0x001AEEDC` Fault)
+
+Store-backed large objects (packages, VBOs) live in a dedicated VA
+range (data area, `this+0x40` base / `this+0x44` size; observed
+`0x6000_0000`) and are demand-paged by `TROMDomainManager1K` at
+**1 KiB subpage** granularity. Each working-set physical page is split
+into four slots; a slot records which *VA page* it currently backs.
+Different VA pages therefore share one physical page, each seeing only
+its own 1 KiB through ARMv4 subpage AP. This is the third instance of
+the subpage-AP problem (after stacks and heaps) and is patched the same
+way — see `rom_ver/r717006/patches.rs` "Package pager".
+
+```c
+struct TROMDomainManager1K /* : TUDomainManager */ {
+    // +0x10   monitor id used by Fault's MonitorFlushSWI
+    ULong   data_area_base;      // +0x40  VA base of the large-object area
+    ULong   data_area_size;      // +0x44
+    CDynamicArray* objects;      // +0x48  PackageChunk[] sorted by base
+                                 //        ([0]=count, [+4]=elem size,
+                                 //        [+0x10]=elements) — GetObjectPtr
+                                 //        binary-searches it
+    PageTableChunk* pages;       // +0x4c  working-set page table, 16 B/page
+    ULong   used_slots;          // +0x58  bumped by AddPageTableEntry
+    ULong   num_pages;           // +0x64  working-set page count
+    ULong   fit_cost[16];        // +0x6c  FindSubPage cost per free-slot map
+    ULong   fit_limit;           // +0xac
+    UByte   want_write;          // +0xd8  fault was a write (FSR 13/15)
+    UByte   object_writable;     // +0xd9  !compander->IsReadOnly()
+    ULong   xip_boundary;        // +0xdc  FAR below this → XIPFault
+};
+
+struct PageTableChunk {          // 16 B, one per working-set physical page
+    ULong   paddr;               // +0x00  physical page (Remember/Forget arg)
+    UShort  slot[4];             // +0x04  VA page index ((va - base) >> 12)
+                                 //        backed by this 1 KiB slot;
+                                 //        0xFFFF = free
+    UByte   rw[4];               // +0x0c  1 → AP 3 (RW), 0 → AP 2 (RO)
+};
+
+struct PackageChunk {            // one per large object
+    // +0x0c  TStoreCompander*   (Read(offset, dst, len, base), IsReadOnly)
+    // +0x20  ULong base_va      (GetObjectPtr / DecompressAndMap)
+    // +0x24  ULong size
+};
+```
+
+Decoded call chain (citations: `Fault` `0x1AEEDC`, `DecompressAndMap`
+`0x1AF024`, `GetSubPage` `0x1B04A4`, `FindSubPage` `0x1B03F8`,
+`SubPageMap` `0x1B00E0`, `MakePermissions` `0x1B0C50`,
+`AddPageTableEntry` `0x1AF3E8` (2-arg) / `0x1AF428` (3-arg),
+`AddPgPAndPerm` `0x15A8F0`, `AllocatePackageEntry` `0x1B16A0`):
+
+- **Fault(this, TProcessorState&)**: FAR = state+0x44; below
+  `xip_boundary` → XIPFault. `GetObjectPtr(FAR)` → chunk (0 → throws
+  exPermissionViolation −10061). Records want_write / writable, then
+  `DecompressAndMap(this, FAR & ~0x3FF, chunk)` and `MonitorFlushSWI`.
+- **DecompressAndMap(this, sub_va, chunk)**: `GetSubPage(sub_va,
+  &page, chunk)`; `MakePermissions(page, subIdx, exclude=1)` +
+  `Remember(sub_va, paddr, perms)` (maps the page *without* the
+  target subpage); `compander->Read(sub_va - base, sub_va, 1024,
+  base)` under an exBusError handler; then `MakePermissions(page,
+  subIdx, 0)` + `Remember` again to expose it. Errors →
+  `FreeSubPages(page, 0xF)`, `ClearTableEntry`, `ReleasePageTableEntry`.
+- **GetSubPage(this, va, &page, chunk)**: subIdx = (va >> 10) & 3.
+  `VAddrToPageIndex(va)` finds a page already backing this VA page
+  (slot == VA page index). None → `FindSubPage(&page, 1 << subIdx)`
+  (patched to 0xF), possibly `Get__15TUDomainManager` for a fresh
+  physical page + `AddPage`, then `AddPageTableEntry(page, va)` (2-arg,
+  sole caller; patched to fill all four slots). A slot that already
+  records this VA page means "already mapped": for a writable object
+  the perms are upgraded, for a read-only one it throws exAbort −10061
+  — which is why the whole-page fill stub must not re-enter
+  DecompressAndMap.
+- **MakePermissions(this, page, subIdx, exclude)**: builds the 8-bit
+  perm byte, 2 bits per slot: slots whose `slot[i]` equals this VA page
+  get 3 (rw[i]) or 2, everything else 00 (no access). `exclude` drops
+  `subIdx` itself.
+- **AddPgPAndPerm(va, perm8, paddr, cacheable)** writes the L2 small
+  page entry `paddr | (cacheable ? 0xC : 0) | 2 | perm8 << 4`: the perm
+  byte lands in bits [11:4] = the four ARMv4 subpage AP fields. On the
+  A53 only bits [5:4] act as AP; bits [11:6] alias TEX/AP[2]/S/nG, so an
+  "absent" subpage is readable (stale) and never faults. Example entry
+  seen for a new package: `0x040bd03e` (slot 0 present, 1–3 absent).
+- **AllocatePackageEntry(this, chunk, &index)**: walks `objects`,
+  placing the new object at `prev.base + roundup(prev.size, 1024)`
+  (patched to 4096) in the first gap that fits; empty table → data
+  area base.
+- **FindSubPage(this, &page, wanted)**: first page whose
+  `SubPageMap` (bit i = slot i free) covers `wanted`, preferring the
+  lowest `fit_cost[map]`. `SubPageFree(page, i)` ⇔ `slot[i] == 0xFFFF`.
+- **FreeSubPages(page, mask)**: per slot `Collect`, then `Forget(base +
+  slot[i] << 12, paddr)` when the page is empty, else `Remember` with
+  reduced perms.
+

@@ -144,6 +144,16 @@ pub const FDATE_FROM_SECONDS: Option<InjectionSite> = Some(InjectionSite {
     resume_pc: 0x0008_A8AC,
 });
 
+/// Package pager whole-page fill (see `types::PackagePagerSite` and
+/// the `TROMDomainManager1K` entries in `patches.rs`). Fault body at
+/// 0x001A_EEDC; its `bl DecompressAndMap` at 0x001A_EFDC.
+pub const PACKAGE_PAGER: Option<PackagePagerSite> = Some(PackagePagerSite {
+    fault_bl: ProbeSite { pc: 0x001A_EFDC, orig_insn: 0xEB65_7DDA },
+    decompress_and_map: 0x001A_F024,
+    get_object_ptr: 0x001B_0064,
+    compander_read: 0x0038_73BC,
+});
+
 /// The kernel's four `LDR` sites that read a (byteswapped-at-load)
 /// instruction word as data — each redirected to a 3-word
 /// LDR + REV + branch-back stub. See `types::InsnAsDataLdr`.

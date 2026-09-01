@@ -297,6 +297,7 @@ pub unsafe fn apply_rom_patches(rom_ptr: *mut u32) {
         apply_real_clock_seconds_patch(rom_ptr);
         apply_ftime_in_seconds_patch(rom_ptr);
         apply_fdate_from_seconds_patch(rom_ptr);
+        apply_package_pager_patch(rom_ptr);
         // Loud-halt canaries are dev-only tripwires: on real hardware a
         // user reset or idle/sleep entry would halt the hypervisor.
         // build.rs emits `nh_loud_halt_canaries` for semihost/dev
@@ -1008,7 +1009,113 @@ unsafe fn apply_ftime_in_seconds_patch(rom_ptr: *mut u32) {
     }
 }
 
-/// FDateFromSeconds injection patch: replace the `MOV r0, sp` at the
+/// Package pager whole-page fill (`rom_ver::PACKAGE_PAGER`; rationale
+/// with the word patches in `rom_ver/r717006/patches.rs`). Replaces
+/// the `bl DecompressAndMap(this, subpage_va, chunk)` inside
+/// `TROMDomainManager1K::Fault` with a `bl` to a 36-word arena stub
+/// that runs the original call (which, with the GetSubPage /
+/// AddPageTableEntry word patches, claims a whole physical page for
+/// the VA page and fills the faulting 1 KiB subpage) and then fills
+/// the page's other three subpages with the same compander read
+/// DecompressAndMap uses — `Read(compander, va - base, va, len,
+/// base)` — resolving each subpage's own large object with
+/// GetObjectPtr (adjacent objects can share a VA page), skipping
+/// holes, and clamping `len` to the object end. It must not re-enter
+/// DecompressAndMap for those subpages: GetSubPage treats a fault on a
+/// slot it already records as "already mapped" and, for a read-only
+/// object, throws evt.ex.abt (-10061).
+///
+///   push {r4-r9, lr}
+///   mov  r4, r0 ; mov r6, r1 ; mov r7, r2
+///   bl   DecompressAndMap        ; original call, args untouched
+///   cmp  r0, #0 ; bne done
+///   bic  r5, r6, #0xC00          ; 4 KiB page base
+///   mov  r8, #0
+/// loop:
+///   add  r9, r5, r8, lsl #10     ; subpage VA
+///   cmp  r9, r6 ; beq next       ; the one DecompressAndMap did
+///   mov  r0, r4 ; mov r1, r9 ; bl GetObjectPtr
+///   cmp  r0, #0 ; beq next       ; hole
+///   ldr  r3, [r0, #0x20]         ; object base VA
+///   sub  r1, r9, r3              ; offset
+///   ldr  r2, [r0, #0x24]         ; object size
+///   cmp  r1, r2 ; bcs next       ; past the end
+///   sub  r2, r2, r1 ; cmp r2, #1024 ; movcs r2, #1024
+///   push {r3} ; mov r3, r2 ; mov r2, r9 ; ldr r0, [r0, #0xc]
+///   bl   Read ; add sp, sp, #4
+/// next:
+///   add  r8, r8, #1 ; cmp r8, #4 ; blt loop
+///   mov  r0, #0
+/// done:
+///   pop  {r4-r9, pc}
+///
+/// Fault ignores DecompressAndMap's return value and only relies on
+/// r4-r9 surviving the call (callee-saved; the stub preserves them).
+/// Encodings assembler-verified.
+unsafe fn apply_package_pager_patch(rom_ptr: *mut u32) {
+    let Some(site) = rom_ver::PACKAGE_PAGER else {
+        return;
+    };
+    let stub_pc = alloc_patch_stub(36, "package pager stub");
+    let bl = |from: u32, to: u32| arm_b(from, to) | 0x0100_0000;
+    let stub: [u32; 36] = [
+        0xE92D_43F0,                                   // push {r4-r9, lr}
+        0xE1A0_4000,                                   // mov r4, r0
+        0xE1A0_6001,                                   // mov r6, r1
+        0xE1A0_7002,                                   // mov r7, r2
+        bl(stub_pc + 0x10, site.decompress_and_map),   // bl DecompressAndMap
+        0xE350_0000,                                   // cmp r0, #0
+        0x1A00_001B,                                   // bne done
+        0xE3C6_5B03,                                   // bic r5, r6, #0xC00
+        0xE3A0_8000,                                   // mov r8, #0
+        0xE085_9508,                                   // loop: add r9, r5, r8, lsl #10
+        0xE159_0006,                                   // cmp r9, r6
+        0x0A00_0012,                                   // beq next
+        0xE1A0_0004,                                   // mov r0, r4
+        0xE1A0_1009,                                   // mov r1, r9
+        bl(stub_pc + 0x38, site.get_object_ptr),       // bl GetObjectPtr
+        0xE350_0000,                                   // cmp r0, #0
+        0x0A00_000D,                                   // beq next
+        0xE590_3020,                                   // ldr r3, [r0, #0x20]
+        0xE049_1003,                                   // sub r1, r9, r3
+        0xE590_2024,                                   // ldr r2, [r0, #0x24]
+        0xE151_0002,                                   // cmp r1, r2
+        0x2A00_0008,                                   // bcs next
+        0xE042_2001,                                   // sub r2, r2, r1
+        0xE352_0B01,                                   // cmp r2, #1024
+        0x23A0_2B01,                                   // movcs r2, #1024
+        0xE52D_3004,                                   // push {r3}
+        0xE1A0_3002,                                   // mov r3, r2
+        0xE1A0_2009,                                   // mov r2, r9
+        0xE590_000C,                                   // ldr r0, [r0, #0xc]
+        bl(stub_pc + 0x74, site.compander_read),       // bl Read
+        0xE28D_D004,                                   // add sp, sp, #4
+        0xE288_8001,                                   // next: add r8, r8, #1
+        0xE358_0004,                                   // cmp r8, #4
+        0xBAFF_FFE6,                                   // blt loop
+        0xE3A0_0000,                                   // mov r0, #0
+        0xE8BD_83F0,                                   // done: pop {r4-r9, pc}
+    ];
+    let patch_insn = bl(site.fault_bl.pc, stub_pc);
+    unsafe {
+        install_patch(rom_ptr, stub_pc, WordKind::Code, None, &stub, false, "package pager stub");
+        install_patch(
+            rom_ptr,
+            site.fault_bl.pc,
+            WordKind::Code,
+            Some(site.fault_bl.orig_insn),
+            &[patch_insn],
+            false,
+            "TROMDomainManager1K::Fault: bl whole-page fill stub",
+        );
+    }
+    kprintln!(
+        "rom_patch: {:#010x}: {:#010x} -> {:#010x}  (TROMDomainManager1K::Fault: BL {:#x}, 36-word whole-page fill stub)",
+        site.fault_bl.pc, site.fault_bl.orig_insn, patch_insn, stub_pc,
+    );
+}
+
+
 /// patch site with a branch to a stub that adds
 /// `safeIntervalDeltaSeconds` to r1, re-executes `MOV r0, sp`, and
 /// branches to the instruction after the patch site. Einstein's

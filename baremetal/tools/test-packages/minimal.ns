@@ -1,0 +1,33 @@
+// Minimal NewtonScript-only package: one 'form part, no icon, no native code.
+constant src := {
+    class: 'PackageHeader,
+    type: 0x78787878,        // "xxxx"
+    pkg_version: 1,
+    version: 1,
+    copyright: "none",
+    name: "MinTest:NHV",
+    flags: 0,
+    parts: [
+        {
+            class: 'PackagePart,
+            info: MakeBinaryFromHex("41204E6577746F6E20546F6F6C6B6974206170706C69636174696F6E", 'binary),
+            flags: 0x81,          // kNOSPart | kNotifyFlag
+            type: 0x666F726D,     // "form"
+            align: 4,
+            data: {
+                app: '|MinTest:NHV|,
+                text: "MinTest",
+                theForm: {
+                    title: "MinTest",
+                    viewBounds: { left: 0, top: 10, right: 200, bottom: 100 },
+                    viewFormat: 83951953,
+                    _proto: @180,   // protoFloatNGo
+                    stepChildren: []
+                }
+            }
+        }
+    ]
+};
+pkg := MakePkg(src);
+SaveBinary(pkg, "minimal.pkg");
+p(Length(pkg));

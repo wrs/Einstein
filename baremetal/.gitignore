@@ -33,3 +33,4 @@ docs/ARM_*
 *.rom
 *.rex
 nhboot/target
+tools/test-packages/*.pkg

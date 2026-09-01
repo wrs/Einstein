@@ -1,0 +1,18 @@
+constant src := {
+    class: 'PackageHeader, type: 0x78787878, pkg_version: 1, version: 1,
+    copyright: "none", name: "TFunc:NHV", flags: 0x10000000,
+    parts: [ {
+        class: 'PackagePart,
+        info: MakeBinaryFromHex("41204E6577746F6E20546F6F6C6B6974206170706C69636174696F6E", 'binary),
+        flags: 0x81, type: 0x666F726D, align: 4,
+        data: {
+            app: '|TFunc:NHV|, text: "TFunc",
+            helper: func(x) begin x + 1 end,
+            theForm: { title: "TFunc:NHV", viewBounds: { left: 0, top: 10, right: 200, bottom: 100 },
+                       viewFormat: 83951953, _proto: @180, stepChildren: [] }
+        }
+    } ]
+};
+pkg := MakePkg(src);
+SaveBinary(pkg, "tfuncnc.pkg");
+p(Length(pkg));

@@ -27,24 +27,48 @@ build combinations in `scripts/check-matrix.sh` pass.
 
 ## Remaining work
 
-1. **Add-on app packages.** The main functional gap. The `.pkg`
-   installation flow — soup storage, package loader, and native code
-   inside packages — is unexercised. Needs an investigation pass:
-   install a known-simple package, see where it stops, fix, repeat.
-   The design note for the native-code half (which `inline_patch`
-   "real code" invariants extend above the ROM aperture, what the
-   stage-2 RW+XN ↔ RO+X rescan guarantees, how to triage a wedge PC in
-   RAM) is [`docs/PACKAGE_NATIVE_CODE.md`](docs/PACKAGE_NATIVE_CODE.md).
+1. **Add-on app packages.** Install now works through the store path.
+   Root cause of the `-10606` / `-48402` / `-48421` / `-48200` install
+   failures was the package pager, `TROMDomainManager1K`: it demand-
+   pages store-backed large objects at 1 KiB granularity using ARMv4
+   subpage AP (absent subpages = AP 00, so the first touch faults and
+   `Fault -> DecompressAndMap` fills that 1 KiB). ARMv7 has no subpage
+   AP, so an absent subpage read as stale RAM instead of faulting and
+   `IsPackageHeader` saw zeros in the freshly installed package. Fixed
+   like the stack/heap allocators, with kernel ROM patches
+   (`rom_ver/r717006/patches.rs` "Package pager", `rom_patches.rs`
+   `apply_package_pager_patch`): GetSubPage claims whole physical
+   pages, Fault fills all four subpages, AllocatePackageEntry places
+   objects on 4 KiB-aligned VAs. Decoded structures in
+   `docs/STRUCTURES.md` "TROMDomainManager1K".
 
-   Delivery is no longer the blocker: packages now arrive over the
-   guest serial port (README "External serial port" — UnixNPI +
-   `scripts/serial-pty-bridge.py`, UI driven headlessly with
-   `scripts/host-io-tool.py`). First datapoints, both with
-   byte-perfect transfer, per-frame MNP acks and a clean Dock
-   teardown: `Ser115200.pkg` (NewtDevEnv-built) → `kDResult`
-   −48402 "Expected a string"; `ROMDumper.pkg` → −10606 "Object not
-   found". The failure is in the guest-side install/activation path,
-   after the bytes land.
+   Verified on QEMU via `scripts/pkg-repl-install.py` (uploads a .pkg
+   through the NewtonScript REPL and calls the store's own
+   `SuckPackageFromBinary`, the call the ROM's restore path makes):
+   five packages back to back (NTK-built ROMDumper.pkg, 8 KiB, with
+   an installScript and bytecode functions; plus four newt64-built
+   test packages from `tools/test-packages/`), package count 26 -> 31, entries persist across a
+   reboot with their titles and show up in Extras with their icons.
+   Also verified through the real path: UnixNPI (built from
+   github.com/chuma/unixnpi) -> `scripts/serial-pty-bridge.py` ->
+   Dock "Connect via Serial" installs a package that then appears in
+   Extras. Not yet verified on real hardware. Native code inside packages remains untested
+   ([`docs/PACKAGE_NATIVE_CODE.md`](docs/PACKAGE_NATIVE_CODE.md)).
+
+   Open follow-ups from the same investigation:
+   - An exception escaping `SuckPackageFromBinary` (e.g. a bad
+     package) leaves the source binary's `TObjectPtr` lock leaked;
+     the next heap growth then parks the newt task forever inside
+     `LockHeapRange -> MonitorDispatchSWI` (UI and REP dead, system
+     idle). Repro: install a package that throws, then `MakeBinary`
+     a few KiB. Real-hardware NewtonOS would only have one 1 KiB
+     subpage locked; our 4 KiB chunking widens the lock. Triage
+     recipe in `docs/DEBUGGING.md` "Parked newt task".
+   - The working set now spends 4 KiB per cached VA page instead of
+     1 KiB; no eviction-path testing yet (`FreeAnySubPages`,
+     `ShuffleSubPages`, writable large objects / `ResizeObject`).
+   - `GetPackages()` returns info frames (`title`, `pssid`, `store`),
+     not package refs; `GetPkgRefInfo` wants the ref.
 
 2. **Snapshot resume — fix or remove.** The ring is now behind the
    default-off `snapshot` cargo feature (`resolve_snapshot` in

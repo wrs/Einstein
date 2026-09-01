@@ -99,6 +99,81 @@ switch, so guest breakpoints need the helpers in `scripts/gdb-init`:
 For a guest PC that naturally traps (e.g. an MMIO access you already
 saw in a log), skip the install: `bg <addr>` then `c`.
 
+### gdb-callable dump shims
+
+`diag` builds export four `#[no_mangle]` C-ABI entry points in
+`src/diag/task_dump.rs` (pinned with `#[used]` so LTO keeps them).
+They read guest memory through the live stage-1 walker, which gdb
+itself cannot do from EL2, and print to the kernel log. Stop at any
+EL2 trap first (`break trap_sync_lower_aarch32`, `continue`) so the
+walker sees a consistent TTBR, then `set language c` and:
+
+```
+call ((void(*)())diag_dump_current_task_chain)()          # gCurrentTask save area + APCS chain (dump() skips the current task)
+call ((void(*)(unsigned))diag_dump_task_chain)(0xc124c98)  # same for one TTask VA
+call ((void(*)(unsigned,unsigned))diag_dump_words)(0xc10155c, 8)   # hex-dump guest VAs
+call ((void(*)(unsigned,unsigned))diag_dump_refvar)(ctx->x[1], 24) # follow a RefVar* (RC6RefVar ABI) to its object
+call ((void(*)(unsigned,unsigned))diag_dump_refvar_deep)(ctx->x[1], 24) # ...and dump any large-object VAddr it holds
+```
+
+`dump_current_chain(ctx)` / `dump_chain_at(ctx, pc)` (existing) render
+the *trap* context; the `diag_dump_*task_chain` pair render the
+*kernel save area*, which is what you want for a task that is parked
+in a SWI. `scripts/gdb-init`'s `bp`/`bp-clear` call the unmangled
+`install_guest_bp` / `remove_guest_bp` symbols; run `set language c`
+before `source scripts/gdb-init` in a batch script.
+
+A minimal batch session that arms a guest BP on a ROM function and
+dumps the chain when it fires (used to find the `-48421` throw site):
+
+```
+set language c
+source scripts/gdb-init
+break trap_sync_lower_aarch32
+continue
+delete
+bp 0x31a0dc                      # ThrowBadTypeWithFrameData
+continue
+frame 1
+call ((void(*)(void*,unsigned))dump_chain_at)(ctx, faulting_pc)
+call ((void(*)(unsigned,unsigned))diag_dump_refvar)((unsigned)ctx->x[1], 24)
+detach
+```
+
+### Parked newt task ("the REPL / UI went dead")
+
+Symptom: `scripts/newton-repl.py` gets no replies, the UI ignores
+taps, the guest idles in `pause_system`. `task_dump` shows the newt
+task as current with `[pc=MonitorDispatchSWI+4 lr=LockHeapRange+0x34]`
+and nothing runnable — it is waiting on the STKU monitor for a heap
+range lock that never completes. Known trigger: an exception escaping
+`SuckPackageFromBinary` (a rejected package) leaks the source
+binary's `TObjectPtr` lock; the next heap growth (`MakeBinary` of a
+few KiB) parks the task. Plain NS exceptions and successful sucks do
+not trigger it. Only a reboot recovers. Note the monitor tasks'
+(`PTBL`, `STKF`, `STKU`) save-area chains look identical in a healthy
+census (stale idle signatures) — only the newt task's state is
+evidence.
+
+### Package install without the Dock
+
+`scripts/pkg-repl-install.py MyApp.pkg` (test packages:
+`tools/test-packages/`, `./build.sh` there) uploads a package through the
+REPL (`MakeBinary` + `StuffByte` chunks, byte-sum verified) and calls
+`GetDefaultStore():SuckPackageFromBinary(pkg, nil)` — the same call the
+ROM's restore path makes — reporting the package count before/after
+and any exception (name + errorCode, via `platform.Log`). It isolates
+the store/pager/RegisterNewPackage half of an install from the
+serial/MNP/Dock half. For the real path, build UnixNPI from
+github.com/chuma/unixnpi (`command git clone`, `make`) and follow
+README "External serial port"; the Dock's Connect button gives up
+after ~20 s, so start UnixNPI first. REP quirks it works around: the REP's parser
+does not know the `nil` keyword (`{}.x` yields nil), a `for` loop
+counter is undefined inside a REP-compiled function (use `foreach`
+or `while`), a top-level `x := ...` inside `begin/end` is local (use
+`DefGlobalVar`/`DefGlobalFn`), and `Print` output lands in the
+kernel log as `platform.Log`, not on the REP echo line.
+
 ## Headless boot verification
 
 ```bash

@@ -308,6 +308,68 @@ pub(super) const PATCHES_717006: &[RomPatch] = &[
     // per-1-KiB lock loop.
     RomPatch { offset: 0x001F_7A0C, orig: 0xE3A0_0001, value: 0xE3A0_000F, name: "ResolveFault: mov r0, #15 (whole-page bitmap)" },
     RomPatch { offset: 0x001F_7A10, orig: 0xE1A0_3810, value: 0xE1A0_3000, name: "ResolveFault: mov r3, r0 (drop sub-idx shift)" },
+
+    // ---- Package pager (TROMDomainManager1K): whole 4 KiB pages ----
+    //
+    // Packages and other store-backed large objects are demand-paged
+    // by TROMDomainManager1K at 1 KiB granularity: each working-set
+    // physical page is split into four slots, each slot records the
+    // VA page it currently backs (page-table chunk = {paddr, u16
+    // slot[4], u8 rw[4]} at this+0x4C, 16 B per page), and
+    // MakePermissions gives a VA page AP=RW/RO only on the slots that
+    // are its own and AP=00 (no access) on the rest, so the first
+    // touch of an absent subpage permission-faults into Fault ->
+    // DecompressAndMap for that one subpage. ARMv7 has no subpage
+    // AP: bits [5:4] (slot 0's field) govern the whole page and the
+    // other fields alias TEX/AP[2]/S/nG, so an absent subpage reads
+    // as stale RAM instead of faulting -- `IsPackageHeader` then sees
+    // zeros in the just-installed package and RegisterNewPackage
+    // throws -48421 (or -48200 / -10606 further along).
+    //
+    // Same cure as the stack/heap allocators above: never share a
+    // physical page between VA pages, and never leave a subpage
+    // unfilled.
+    //
+    // (A) GetSubPage 0x001B_0508: the requested-slot mask handed to
+    //     FindSubPage is `1 << subIdx` (`lsl r2, r7, sl`); make it
+    //     0xF so only fully-free pages qualify.
+    // (B) AddPageTableEntry(page, vaddr) (2-arg form, sole caller is
+    //     GetSubPage) records the VA page index in one slot; rewrite
+    //     the body in place to record it in all four slots and bump
+    //     the used-slot count (+0x58) by 4. The first three words
+    //     (compute the VA page index) are unchanged; two trailing
+    //     words become unreachable.
+    // (C) Fault's `bl DecompressAndMap` is redirected to an arena stub
+    //     that fills all four subpages of the page (rom_patches.rs
+    //     `apply_package_pager_patch`, `rom_ver::PACKAGE_PAGER`).
+    //
+    // Encodings assembler-verified (arm-none-eabi-as, docs/WORKFLOW.md).
+    RomPatch { offset: 0x001B_0508, orig: 0xE1A0_2A17, value: 0xE3A0_200F, name: "TROMDomainManager1K::GetSubPage: mov r2, #15 (want all four slots)" },
+    RomPatch { offset: 0x001A_F3F4, orig: 0xE3A0_C003, value: 0xE590_C04C, name: "TROMDomainManager1K::AddPageTableEntry: ldr ip, [r0, #0x4c]" },
+    RomPatch { offset: 0x001A_F3F8, orig: 0xE00C_2522, value: 0xE08C_1201, name: "TROMDomainManager1K::AddPageTableEntry: add r1, ip, r1, lsl #4" },
+    RomPatch { offset: 0x001A_F3FC, orig: 0xE590_C04C, value: 0xE1C1_30B4, name: "TROMDomainManager1K::AddPageTableEntry: strh r3, [r1, #4]" },
+    RomPatch { offset: 0x001A_F400, orig: 0xE08C_1201, value: 0xE1C1_30B6, name: "TROMDomainManager1K::AddPageTableEntry: strh r3, [r1, #6]" },
+    RomPatch { offset: 0x001A_F404, orig: 0xE081_1082, value: 0xE1C1_30B8, name: "TROMDomainManager1K::AddPageTableEntry: strh r3, [r1, #8]" },
+    RomPatch { offset: 0x001A_F408, orig: 0xE5C1_3005, value: 0xE1C1_30BA, name: "TROMDomainManager1K::AddPageTableEntry: strh r3, [r1, #10]" },
+    RomPatch { offset: 0x001A_F40C, orig: 0xE1A0_2423, value: 0xE590_2058, name: "TROMDomainManager1K::AddPageTableEntry: ldr r2, [r0, #0x58]" },
+    RomPatch { offset: 0x001A_F410, orig: 0xE5C1_2004, value: 0xE282_2004, name: "TROMDomainManager1K::AddPageTableEntry: add r2, r2, #4" },
+    RomPatch { offset: 0x001A_F414, orig: 0xE590_1058, value: 0xE580_2058, name: "TROMDomainManager1K::AddPageTableEntry: str r2, [r0, #0x58]" },
+    RomPatch { offset: 0x001A_F418, orig: 0xE281_1001, value: 0xE3A0_0000, name: "TROMDomainManager1K::AddPageTableEntry: mov r0, #0" },
+    RomPatch { offset: 0x001A_F41C, orig: 0xE5A0_1058, value: 0xE1A0_F00E, name: "TROMDomainManager1K::AddPageTableEntry: mov pc, lr" },
+    // (D) AllocatePackageEntry places each new large object right
+    //     after its predecessor, rounding the predecessor's footprint
+    //     to 1 KiB (`(size - 1 + 1024) >> 10 << 10`, or 1024 for an
+    //     empty object). Two objects could therefore share a 4 KiB VA
+    //     page; the second one's subpages then never fault (its page
+    //     was mapped, whole, by the first object's fill) and read as
+    //     stale zeros. Round to 4 KiB instead so every object owns its
+    //     VA pages outright (the data area base is page-aligned, and
+    //     each base inherits the alignment of the previous one).
+    RomPatch { offset: 0x001B_1730, orig: 0xE29E_EB01, value: 0xE29E_EA01, name: "TROMDomainManager1K::AllocatePackageEntry: adds lr, lr, #4096 (was 1024)" },
+    RomPatch { offset: 0x001B_1738, orig: 0x428E_EB01, value: 0x428E_EA01, name: "TROMDomainManager1K::AllocatePackageEntry: addmi lr, lr, #4096 (was 1024)" },
+    RomPatch { offset: 0x001B_173C, orig: 0xE1A0_E54E, value: 0xE1A0_E64E, name: "TROMDomainManager1K::AllocatePackageEntry: asr lr, lr, #12 (was 10)" },
+    RomPatch { offset: 0x001B_1740, orig: 0xE1A0_E50E, value: 0xE1A0_E60E, name: "TROMDomainManager1K::AllocatePackageEntry: lsl lr, lr, #12 (was 10)" },
+    RomPatch { offset: 0x001B_1748, orig: 0xE3A0_EB01, value: 0xE3A0_EA01, name: "TROMDomainManager1K::AllocatePackageEntry: mov lr, #4096 (was 1024)" },
 ];
 
 /// ns_trace gate patch: trick `TraceSetOptions__12TInterpreterFv` into

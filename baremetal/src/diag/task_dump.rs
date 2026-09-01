@@ -660,6 +660,88 @@ fn print_chain_frame(depth: usize, frame: u32, pc: u32) {
     kprintln!("        #{:<2} frame={:#010x} pc={:#010x}  {}", depth, frame, pc, name);
 }
 
+/// Print one task's suspended call chain from its SWIBoot save area
+/// (saved PC, LR, then the APCS frames walked from fp_usr). Shared by
+/// `dump_blocked_pcs` and the gdb entry points below.
+fn print_task_chain(node: u32, id: u32) {
+    let saved_pc   = rd(node + 0x4c).unwrap_or(u32::MAX);
+    let saved_spsr = rd(node + 0x50).unwrap_or(u32::MAX);
+    let sp_usr     = rd(node + 0x44).unwrap_or(u32::MAX);
+    let lr_usr     = rd(node + 0x48).unwrap_or(u32::MAX);
+    let glob = rd(node + TT_GLOBALS).unwrap_or(0);
+    let (n0,n1,n2,n3) = match find_task_name(glob) {
+        Some((_,v)) => ((v>>24) as u8,(v>>16) as u8,(v>>8) as u8,v as u8),
+        None => (b'?',b'?',b'?',b'?'),
+    };
+    let fp_usr = rd(node + 0x3c).unwrap_or(u32::MAX);
+    kprintln!(
+        "    task {:#x} ({}{}{}{}) id={:#x} SPSR={:#x}  [pc={:#x} lr={:#x} sp={:#x} fp={:#x}]",
+        node, n0 as char, n1 as char, n2 as char, n3 as char,
+        id, saved_spsr,
+        saved_pc, lr_usr, sp_usr, fp_usr,
+    );
+    // Call chain, one function per line:
+    //   #0 = currently-suspended PC (saved_pc reg)
+    //   #1 = where the leaf will return — saved LR reg.
+    //        For a SWI-stub leaf (e.g. PortReceiveSWI) the
+    //        leaf has no APCS frame, so this is the
+    //        leaf-caller's resume address.
+    //   #N (N≥2) = the saved LR at each successive APCS
+    //        frame, walked from fp_usr. Each frame's
+    //        saved LR identifies the next function up the
+    //        chain at its active call site (mid-function
+    //        offset, more useful than the prologue-stored
+    //        saved PC). 12-frame cap guards against a
+    //        corrupt chain spamming the log.
+    print_chain_frame(0, sp_usr, saved_pc);
+    if lr_usr != 0 && lr_usr != u32::MAX {
+        print_chain_frame(1, fp_usr, lr_usr);
+    }
+    if fp_usr != 0 && fp_usr != u32::MAX && (fp_usr & 3) == 0 {
+        let mut depth = 2usize;
+        walk_apcs_frames(fp_usr, 12, |frame_lr, frame_fp| {
+            print_chain_frame(depth, frame_fp, frame_lr);
+            depth += 1;
+        });
+    }
+    // If parked in SemaphoreOpGlue, decode the OpList:
+    // saved r0 = TSemaphoreGroup* (kernel), saved r1 =
+    // TSemaphoreOpList* (kernel), both live in the
+    // SWIBoot save area (task+0x10 and task+0x14).
+    if (SEMAPHORE_OP_GLUE_LO..SEMAPHORE_OP_GLUE_HI).contains(&saved_pc) {
+        let r0 = rd(node + 0x10).unwrap_or(0);
+        let r1 = rd(node + 0x14).unwrap_or(0);
+        dump_oplist(r0, r1, "      ");
+    }
+}
+
+/// gdb entry point (not inlined, C ABI): dump the save area and call
+/// chain of `gCurrentTask`, which `dump()` deliberately skips. From
+/// gdb, stopped at an EL2 trap: `set language c` then
+/// `call ((void(*)())diag_dump_current_task_chain)()`.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn diag_dump_current_task_chain() {
+    let Some(kg) = kg_gate("diag_dump_current_task_chain") else { return; };
+    let curr = rd(kg.current_task).unwrap_or(0);
+    if curr == 0 {
+        kprintln!("diag_dump_current_task_chain: gCurrentTask unset");
+        return;
+    }
+    dump_save_area("CURR", curr);
+    let id = rd(curr).unwrap_or(u32::MAX);
+    print_task_chain(curr, id);
+}
+
+/// gdb entry point: save area + call chain of one task by VA.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn diag_dump_task_chain(task_va: u32) {
+    dump_save_area("TASK", task_va);
+    let id = rd(task_va).unwrap_or(u32::MAX);
+    print_task_chain(task_va, id);
+}
+
 /// For each task that's not RUN and has q.prev or wq1/wq2 non-zero
 /// (i.e. it's blocked somewhere), print its saved PC + SP_usr from the
 /// SWIBoot save area at task+0x4c / task+0x44. Useful for seeing
@@ -676,60 +758,13 @@ fn dump_blocked_pcs() {
         while node != 0 && steps < 128 {
             let id = match rd(node) { Some(v) => v, None => break };
             if (id & 0xF) == OBJ_TYPE_TASK && node != curr {
-                let saved_pc   = rd(node + 0x4c).unwrap_or(u32::MAX);
-                let saved_spsr = rd(node + 0x50).unwrap_or(u32::MAX);
-                let sp_usr     = rd(node + 0x44).unwrap_or(u32::MAX);
-                let lr_usr     = rd(node + 0x48).unwrap_or(u32::MAX);
+                let saved_pc = rd(node + 0x4c).unwrap_or(u32::MAX);
                 if saved_pc != 0 && saved_pc != u32::MAX {
                     if !printed {
                         kprintln!("  blocked-task saved PCs (from SWIBoot save area):");
                         printed = true;
                     }
-                    let glob = rd(node + TT_GLOBALS).unwrap_or(0);
-                    let (n0,n1,n2,n3) = match find_task_name(glob) {
-                        Some((_,v)) => ((v>>24) as u8,(v>>16) as u8,(v>>8) as u8,v as u8),
-                        None => (b'?',b'?',b'?',b'?'),
-                    };
-                    let fp_usr = rd(node + 0x3c).unwrap_or(u32::MAX);
-                    kprintln!(
-                        "    task {:#x} ({}{}{}{}) id={:#x} SPSR={:#x}  [pc={:#x} lr={:#x} sp={:#x} fp={:#x}]",
-                        node, n0 as char, n1 as char, n2 as char, n3 as char,
-                        id, saved_spsr,
-                        saved_pc, lr_usr, sp_usr, fp_usr,
-                    );
-                    // Call chain, one function per line:
-                    //   #0 = currently-suspended PC (saved_pc reg)
-                    //   #1 = where the leaf will return — saved LR reg.
-                    //        For a SWI-stub leaf (e.g. PortReceiveSWI) the
-                    //        leaf has no APCS frame, so this is the
-                    //        leaf-caller's resume address.
-                    //   #N (N≥2) = the saved LR at each successive APCS
-                    //        frame, walked from fp_usr. Each frame's
-                    //        saved LR identifies the next function up the
-                    //        chain at its active call site (mid-function
-                    //        offset, more useful than the prologue-stored
-                    //        saved PC). 12-frame cap guards against a
-                    //        corrupt chain spamming the log.
-                    print_chain_frame(0, sp_usr, saved_pc);
-                    if lr_usr != 0 && lr_usr != u32::MAX {
-                        print_chain_frame(1, fp_usr, lr_usr);
-                    }
-                    if fp_usr != 0 && fp_usr != u32::MAX && (fp_usr & 3) == 0 {
-                        let mut depth = 2usize;
-                        walk_apcs_frames(fp_usr, 12, |frame_lr, frame_fp| {
-                            print_chain_frame(depth, frame_fp, frame_lr);
-                            depth += 1;
-                        });
-                    }
-                    // If parked in SemaphoreOpGlue, decode the OpList:
-                    // saved r0 = TSemaphoreGroup* (kernel), saved r1 =
-                    // TSemaphoreOpList* (kernel), both live in the
-                    // SWIBoot save area (task+0x10 and task+0x14).
-                    if (SEMAPHORE_OP_GLUE_LO..SEMAPHORE_OP_GLUE_HI).contains(&saved_pc) {
-                        let r0 = rd(node + 0x10).unwrap_or(0);
-                        let r1 = rd(node + 0x14).unwrap_or(0);
-                        dump_oplist(r0, r1, "      ");
-                    }
+                    print_task_chain(node, id);
                 }
             }
             node = match rd(node + 4) { Some(v) => v, None => break };
@@ -1474,3 +1509,72 @@ static DUMP_CHAIN_FORCE_KEEP: (
     extern "C" fn(&crate::arch::trap_context::TrapContext),
     extern "C" fn(&crate::arch::trap_context::TrapContext, u32),
 ) = (dump_current_chain, dump_chain_at);
+
+/// gdb entry point: hex-dump `n` guest words starting at VA `va`
+/// through the live stage-1 walker (gdb itself cannot read guest VAs
+/// from EL2). `call ((void(*)(unsigned,unsigned))diag_dump_words)(0xc101560, 8)`.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn diag_dump_words(va: u32, n: u32) {
+    let n = n.min(256);
+    let mut i = 0u32;
+    while i < n {
+        let a = va.wrapping_add(i * 4);
+        let mut line = [0u32; 4];
+        let mut got = 0usize;
+        for (k, slot) in line.iter_mut().enumerate() {
+            if i + k as u32 >= n { break; }
+            *slot = rd(a.wrapping_add(k as u32 * 4)).unwrap_or(0xDEAD_BEEF);
+            got += 1;
+        }
+        match got {
+            4 => kprintln!("    {:#010x}: {:#010x} {:#010x} {:#010x} {:#010x}", a, line[0], line[1], line[2], line[3]),
+            3 => kprintln!("    {:#010x}: {:#010x} {:#010x} {:#010x}", a, line[0], line[1], line[2]),
+            2 => kprintln!("    {:#010x}: {:#010x} {:#010x}", a, line[0], line[1]),
+            _ => kprintln!("    {:#010x}: {:#010x}", a, line[0]),
+        }
+        i += 4;
+    }
+}
+
+/// gdb entry point: follow a `RefVar*` (the `RC6RefVar` ABI — a pointer
+/// to a `RefHandle*`, whose first word is the Ref) and dump the object
+/// it names: the 3-word header and the first `n` data words.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn diag_dump_refvar(refvar_va: u32, n: u32) {
+    let handle = rd(refvar_va).unwrap_or(0);
+    let r = rd(handle).unwrap_or(0);
+    kprintln!("    refvar {:#010x} -> handle {:#010x} -> ref {:#010x} (tag {})", refvar_va, handle, r, r & 3);
+    if r & 3 != 1 { return; }
+    let obj = r & !3;
+    diag_dump_words(obj, 3 + n);
+}
+
+/// gdb entry point: like `diag_dump_refvar`, then for every data word
+/// that looks like a large-object VAddr (top nibble 6) dump 16 words
+/// there too — shows what the mapped package region actually reads as.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn diag_dump_refvar_deep(refvar_va: u32, n: u32) {
+    diag_dump_refvar(refvar_va, n);
+    let handle = rd(refvar_va).unwrap_or(0);
+    let r = rd(handle).unwrap_or(0);
+    if r & 3 != 1 { return; }
+    let obj = r & !3;
+    for i in 0..n {
+        let w = rd(obj + 12 + i * 4).unwrap_or(0);
+        if w >> 28 == 6 {
+            kprintln!("    -- word +{:#x} = {:#010x} looks like a LO VAddr; contents:", 12 + i * 4, w);
+            crate::hv::guest_mem::dump_stage1_walk(w);
+            diag_dump_words(w, 16);
+        }
+    }
+}
+
+/// Same pin for the save-area / word-dump entry points
+/// (`diag_dump_current_task_chain`, `diag_dump_task_chain`,
+/// `diag_dump_words`), which have no in-tree caller.
+#[used]
+static DIAG_TASK_CHAIN_FORCE_KEEP: (extern "C" fn(), extern "C" fn(u32), extern "C" fn(u32, u32), extern "C" fn(u32, u32), extern "C" fn(u32, u32)) =
+    (diag_dump_current_task_chain, diag_dump_task_chain, diag_dump_words, diag_dump_refvar, diag_dump_refvar_deep);

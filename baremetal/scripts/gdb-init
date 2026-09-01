@@ -75,7 +75,7 @@ define bp
   # mangled version and the unmangled #[no_mangle] symbol both exist;
   # we qualify by module path so gdb picks the Rust signature with
   # DWARF types.
-  set $_rc = newton_hypervisor::guest_bp::install_guest_bp($arg0)
+  set $_rc = ((int(*)(unsigned))install_guest_bp)($arg0)
   if $_rc < 0
     printf "install_guest_bp(0x%x) failed: rc=%d (see src/diag/guest_bp.rs for codes)\n", $arg0, $_rc
   else
@@ -122,7 +122,7 @@ end
 
 # `bp-clear ADDR` — remove a previously installed BP.
 define bp-clear
-  set $_rc = newton_hypervisor::guest_bp::remove_guest_bp($arg0)
+  set $_rc = ((int(*)(unsigned))remove_guest_bp)($arg0)
   if $_rc < 0
     printf "remove_guest_bp(0x%x) failed: rc=%d\n", $arg0, $_rc
   else

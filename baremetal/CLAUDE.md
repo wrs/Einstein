@@ -49,11 +49,16 @@ below — read the relevant one before acting, don't re-derive it.
 - **Banked registers are not a QEMU bug.** `ctx.x[14]` is `LR_usr`,
   `LR_abt` is `ctx.x[20]`, per ARM ARM Table D1-79. This has been
   misdiagnosed repeatedly — read `docs/QEMU_BUGS.md` first.
-- **Always cold-boot** (`rm -f /tmp/newton-snapshot-*.bin`). Resuming a
-  Newton-ROM snapshot wedges the guest in a prefetch-abort loop, and the
-  2 s autosave then overwrites every slot with the wedged state. Never
-  treat a resumed run as a verification signal. Fix-or-remove is item 2
-  in `PLAN.md`.
+- **The snapshot ring is off by default** (behind the default-off
+  `snapshot` cargo feature). A normal build never writes
+  `/tmp/newton-snapshot-*.bin` and always cold-boots — no `rm -f`
+  needed. Only turn it on (`--features snapshot`) if you're working on
+  the ring itself; resuming a Newton-ROM snapshot still wedges the
+  guest in a prefetch-abort loop (item 2 in `PLAN.md`), so with the
+  feature on you're back to `rm -f /tmp/newton-snapshot-*.bin` before
+  each run and must never treat a resumed run as a verification signal.
+  Flash persistence (`~/.newton/flash.bin`, SD store) is independent of
+  this feature and keeps working either way.
 - **Both emulated platforms stay green.** `guest-tests/scripts/run-all.sh`
   before any commit that touches hypervisor functionality; track down
   QEMU/FVP divergence rather than gating it behind a feature. The one
@@ -68,7 +73,7 @@ below — read the relevant one before acting, don't re-derive it.
 ## Commands
 
 ```bash
-rm -f /tmp/newton-snapshot-*.bin && cargo run --release   # cold boot on QEMU
+cargo run --release                                      # cold boot on QEMU (ring off by default)
 scripts/boot-check.sh --cold                              # headless boot verify
 guest-tests/scripts/run-all.sh                            # 39 guest tests (QEMU)
 guest-tests/scripts/run-all.sh --platform fvp             # same on FVP

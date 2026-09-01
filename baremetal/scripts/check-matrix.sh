@@ -69,6 +69,9 @@ combos=(
     "trace,quiet::cargo check --release --features \"trace quiet\""
     "trace_once::cargo check --release --features \"trace_once quiet\""
     "host-io-semihost::cargo check --release --features host-io-semihost"
+    # Snapshot ring (default off): compile-level check of the feature-on
+    # path so the gated slot save/resume code stays built.
+    "snapshot::cargo check --release --features \"host-io-semihost snapshot\""
     "sd-probe::cargo check --release --no-default-features --features \"pi-bare-metal sd-probe\""
     "fb-probe::cargo check --release --no-default-features --features \"pi-bare-metal fb-probe\""
     "ns_trace::cargo check --release --features ns_trace"

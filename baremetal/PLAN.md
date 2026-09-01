@@ -46,18 +46,24 @@ build combinations in `scripts/check-matrix.sh` pass.
    found". The failure is in the guest-side install/activation path,
    after the bytes land.
 
-2. **Snapshot resume — fix or remove.** Saving works, and the two-run
-   `test_snapshot_resume` guest test resumes correctly; resuming the
-   *Newton ROM* does not. The resumed guest ERETs to the saved PC and
-   immediately wedges in a prefetch-abort loop at the vector page
-   (`ELR = IFAR = 0xc`, ABT mode), after which the 2 s autosave
-   overwrites all four slots with the wedged state within ~8 s.
-   Until this is resolved, cold-boot for every run and do not use
-   resume as a verification signal. Decide between fixing the restore
-   path (`src/hv/snapshot.rs`, and the state it deliberately does not
+2. **Snapshot resume — fix or remove.** The ring is now behind the
+   default-off `snapshot` cargo feature (`resolve_snapshot` in
+   build.rs → `nh_snapshot`), so a normal build cold-boots and never
+   writes a slot — the interim mitigation for the fact that resume is
+   broken. Saving works, and the two-run `test_snapshot_resume` guest
+   test resumes correctly (guest-test builds force the ring on);
+   resuming the *Newton ROM* does not. The resumed guest ERETs to the
+   saved PC and immediately wedges in a prefetch-abort loop at the
+   vector page (`ELR = IFAR = 0xc`, ABT mode), after which the 2 s
+   autosave overwrites all four slots with the wedged state within
+   ~8 s — so with `--features snapshot` on, still cold-boot each run
+   and never use resume as a verification signal. The remaining
+   decision is fix vs. delete: fix the restore path
+   (`src/hv/snapshot.rs`, and the state it deliberately does not
    restore — see
-   [`docs/SNAPSHOT_RESUME_CONTRACT.md`](docs/SNAPSHOT_RESUME_CONTRACT.md))
-   and deleting the mechanism.
+   [`docs/SNAPSHOT_RESUME_CONTRACT.md`](docs/SNAPSHOT_RESUME_CONTRACT.md)),
+   or remove the ring entirely (the feature gate makes deletion a
+   contained change now).
 
 3. **Guest serial port on real hardware.** PL011 carries the kernel
    log; the guest's own serial port needs a separate host-side

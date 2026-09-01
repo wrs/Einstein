@@ -170,7 +170,6 @@ crates.io, so you need network on first build:
 ```
 # term 1 — hypervisor with the semihost backend.
 cd /path/to/baremetal
-rm -f /tmp/newton-snapshot-*.bin
 cargo run --release --no-default-features \
     --features 'platform-raspi3b rom-717006 diag host-io-semihost'
 
@@ -228,7 +227,6 @@ Install a package with [UnixNPI](https://github.com/chuma/unixnpi):
 
 ```
 # term 1 — hypervisor (same build as the live-display setup)
-rm -f /tmp/newton-snapshot-*.bin
 cargo run --release --no-default-features \
     --features 'platform-raspi3b rom-717006 diag host-io-semihost'
 
@@ -288,22 +286,28 @@ package-loader gap, now unblocked for investigation.
 
 ### Snapshots
 
+The guest-state snapshot ring is **off by default**, behind the
+default-off `snapshot` cargo feature. Build with it
+(`cargo run --release --features snapshot`) and
 `/tmp/newton-snapshot-{0..3}.bin` holds a rolling ring of four
-guest-state snapshots, autosaved every 2 s of wall time from the
-timer-IRQ hook (and on demand from the guest via `HVC #0x18`). Each
-save carries guest-visible state only — RAM, framebuffer, the
-inline-stub scratch pool, the EL1 CP15 registers reachable from EL2,
-and all 31 AArch64 GPRs (which alias every AArch32 banked R0..R14 per
-ARM ARM Table D1-79) — plus ROM and flash fingerprints so a mismatched
-binary or a diverged flash image is rejected.
+snapshots, autosaved every 2 s of wall time from the timer-IRQ hook
+(and on demand from the guest via `HVC #0x18`). Each save carries
+guest-visible state only — RAM, framebuffer, the inline-stub scratch
+pool, the EL1 CP15 registers reachable from EL2, and all 31 AArch64
+GPRs (which alias every AArch32 banked R0..R14 per ARM ARM Table
+D1-79) — plus ROM and flash fingerprints so a mismatched binary or a
+diverged flash image is rejected. (Flash persistence,
+`~/.newton/flash.bin`, is a separate mechanism and is unaffected by
+this feature.)
 
 **Resuming a Newton-ROM snapshot is currently broken**: the guest
 ERETs to the saved PC and immediately wedges in a prefetch-abort loop
-at the vector page. Cold-boot for any run whose result you intend to
-trust:
+at the vector page. That's why the ring defaults off — a normal build
+just cold-boots, no `rm -f` ritual. If you enable the feature to work
+on the ring itself, cold-boot each run you intend to trust:
 
 ```
-rm -f /tmp/newton-snapshot-*.bin && cargo run --release
+rm -f /tmp/newton-snapshot-*.bin && cargo run --release --features snapshot
 ```
 
 Fixing or removing the resume path is tracked in
@@ -328,6 +332,7 @@ unspecified.
 | `input-{null,mtouch}`  | null    | Pen-input seam: no-op or TSTP MTouch USB touchscreen (real hw).                      |
 | `audio-{null,pi-hdmi}` | null    | Sound seam: null (no output, but arms timer-paced DMA-completion IRQs) or VC4 HDMI MAI audio (real hw). |
 | `no-semihost`          | no      | No semihosting host is listening: no `HLT #0xF000` calls anywhere. Negative because Cargo features only add; `build.rs` inverts it to `cfg(nh_semihost)` for source to read. |
+| `snapshot`             | no      | Guest-state snapshot ring (`/tmp/newton-snapshot-*.bin` save + resume). Off by default because ROM resume is broken (PLAN item 2), so a normal build cold-boots with no `rm -f` ritual. Guest-test builds force it on. Independent of flash persistence. |
 | `trace`                | no      | Function-level execution trace via per-entry HVC trampolines.                        |
 | `trace_once`           | no      | First-touch variant of `trace`. Trampolines still fire; only the SEQ line is gated.  |
 | `quiet`                | no      | Silence recurring diag log lines (`fix_stage1_xn_bits:` summaries, etc.).            |
@@ -717,8 +722,9 @@ cargo build --release --no-default-features --features "platform-fvp-base rom-71
 scripts/fvp --timeout=90 \
     target/aarch64-unknown-none-softfloat/release/newton-hypervisor
 
-# Force cold boot of a QEMU run
-rm -f /tmp/newton-snapshot-*.bin && cargo run --release
+# Cold boot is the default (snapshot ring off); only needed with
+# --features snapshot:
+rm -f /tmp/newton-snapshot-*.bin && cargo run --release --features snapshot
 
 # Probe real Einstein against the 717006 ROM for oracle behaviour
 cmake --build build --target NewtonProbe

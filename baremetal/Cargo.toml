@@ -205,6 +205,20 @@ audio-pi-hdmi = ["platform-raspi3b"]
 # flash-persist-* axes — pick the right backends explicitly alongside.
 no-semihost = []
 
+# Guest-state snapshot ring (default OFF). When absent, the hypervisor
+# never writes `/tmp/newton-snapshot-*.bin` and never resumes from one
+# — every boot is a cold boot, so the "rm the snapshot files first"
+# ritual is unnecessary. Off by default because resuming a Newton-ROM
+# snapshot is broken (wedges in a prefetch-abort loop; PLAN item 2),
+# and the 2 s autosave otherwise overwrites every slot with the wedged
+# state. Positive polarity is correct here: the feature is off by
+# default and only turns the ring on when explicitly requested, so it
+# survives `--no-default-features` unchanged. Requires a semihosting
+# host (the ring is file-backed); build.rs warns if combined with
+# `no-semihost`. Independent of flash persistence, which keeps
+# autosaving on its own cadence regardless of this feature.
+snapshot = []
+
 # Aggregate feature for "build for a real Pi Zero 2 W": same SoC as
 # QEMU raspi3b (so platform-raspi3b is fine), no semihosting host, no
 # host-fs-backed flash. host-io defaults to null already, so it's

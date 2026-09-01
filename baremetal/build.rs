@@ -48,11 +48,13 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(nh_audio_pi_hdmi)");
     println!("cargo:rustc-check-cfg=cfg(nh_loud_halt_canaries)");
     println!("cargo:rustc-check-cfg=cfg(nh_semihost)");
+    println!("cargo:rustc-check-cfg=cfg(nh_snapshot)");
     println!("cargo:rustc-check-cfg=cfg(nh_real_hw)");
     println!("cargo:rustc-check-cfg=cfg(nh_diag)");
 
     resolve_loud_halt_canaries();
     resolve_semihost();
+    resolve_snapshot();
     resolve_real_hw();
     resolve_diag();
 
@@ -477,6 +479,31 @@ fn select_platform_linker_script() {
 fn resolve_semihost() {
     if env::var("CARGO_FEATURE_NO_SEMIHOST").is_err() {
         println!("cargo:rustc-cfg=nh_semihost");
+    }
+}
+
+/// Emit `cfg(nh_snapshot)` when the default-off `snapshot` feature is
+/// on. The guest-state snapshot ring (`/tmp/newton-snapshot-*.bin`
+/// save + resume) is compiled only then; otherwise the hypervisor
+/// always cold-boots and never writes a slot. The ring is file-backed
+/// via semihosting, so it's inert without `nh_semihost` — warn if the
+/// feature is requested on a no-semihost build so a real-hardware
+/// build doesn't silently do nothing.
+fn resolve_snapshot() {
+    // Guest-test builds always get the ring: `test_snapshot_resume`
+    // exercises the HVC #0x18 save + resume path, and those builds
+    // run on QEMU/FVP with a semihosting host. Independent of the
+    // user-facing `snapshot` feature (which stays off for the default
+    // product build).
+    let guest_test = env::var("NH_GUEST_TEST").map_or(false, |v| !v.is_empty());
+    if env::var("CARGO_FEATURE_SNAPSHOT").is_ok() || guest_test {
+        println!("cargo:rustc-cfg=nh_snapshot");
+        if env::var("CARGO_FEATURE_NO_SEMIHOST").is_ok() && !guest_test {
+            println!(
+                "cargo:warning=nh-baremetal: `snapshot` feature has no effect on a \
+                 no-semihost build (the snapshot ring is semihosting-file-backed)"
+            );
+        }
     }
 }
 

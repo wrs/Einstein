@@ -56,13 +56,17 @@
 //! current persistent flash and cold-boot instead. See
 //! `src/host/flash_persist/`.
 
-// Without `nh_semihost` the public entry points early-return, so
-// every private helper below (`open`, `peek_seq`, `build_header`,
-// `cntpct`, `load`, …) is unreachable. They're still useful to keep
-// in the source so swapping back to the semihost-host build path is
-// a feature-flag toggle — silence dead-code warnings for them
-// in that configuration.
-#![cfg_attr(not(nh_semihost), allow(dead_code))]
+// The snapshot *ring* (slot save + resume) is built only with both a
+// semihosting host and the default-off `snapshot` feature. Without
+// that combination the public entry points early-return and every
+// private ring helper below (`open`, `peek_seq`, `build_header`,
+// `load`, `save_via_semihost`, …) is unreachable — but the flash-
+// persist autosave path still uses a few of them (`cntpct`,
+// `flash_provider`, the sysreg readers in the save gates). Keep the
+// whole ring in the source so turning it on is a feature-flag toggle,
+// and silence dead-code warnings for whatever ends up unused when the
+// ring is off.
+#![cfg_attr(not(all(nh_semihost, nh_snapshot)), allow(dead_code))]
 
 use core::arch::asm;
 #[cfg(nh_semihost)]
@@ -350,9 +354,9 @@ pub fn current_seq() -> u64 {
 /// Without `nh_semihost` there is no host filesystem
 /// to scan; the whole snapshot subsystem is inert.
 pub fn init() {
-    #[cfg(not(nh_semihost))]
+    #[cfg(not(all(nh_semihost, nh_snapshot)))]
     return;
-    #[cfg(nh_semihost)]
+    #[cfg(all(nh_semihost, nh_snapshot))]
     {
         let mut max_seq: u64 = 0;
         for slot in 0..NUM_SLOTS {
@@ -492,11 +496,25 @@ fn maybe_autosave_via_semihost(ctx: &TrapContext) {
     // unaffected.
     crate::arch::cpu::with_irqs_unmasked(flash_provider().maybe_save);
 
-    let mut gprs = [0u64; 31];
-    for i in 0..31 {
-        gprs[i] = ctx.x[i];
+    // The snapshot ring itself is built only with the `snapshot`
+    // feature. Without it the flash flush above is the whole job —
+    // commit the cadence so the next flush is one interval out. The
+    // save-integrity gates above (guest_bp / nested-EL2 / transient-
+    // PC) still run so flash-persist cadence is unchanged from the
+    // days when the ring and flash shared this tick.
+    #[cfg(nh_snapshot)]
+    {
+        let mut gprs = [0u64; 31];
+        for i in 0..31 {
+            gprs[i] = ctx.x[i];
+        }
+        if save(&gprs).is_ok() {
+            LAST_SAVE_TICKS.store(now, Ordering::Relaxed);
+        }
     }
-    if save(&gprs).is_ok() {
+    #[cfg(not(nh_snapshot))]
+    {
+        let _ = ctx;
         LAST_SAVE_TICKS.store(now, Ordering::Relaxed);
     }
 }
@@ -529,12 +547,12 @@ fn pc_in_hypervisor_transient_region(pc: u32) -> bool {
 /// Table D1-79); ELR_EL2 and SPSR_EL2 give the PC and CPSR to resume
 /// at.
 pub fn save(gprs: &[u64; 31]) -> Result<(), &'static str> {
-    #[cfg(not(nh_semihost))]
+    #[cfg(not(all(nh_semihost, nh_snapshot)))]
     {
         let _ = gprs;
-        return Err("snapshot unavailable on no-semihost builds");
+        return Err("snapshot ring not built (needs the `snapshot` feature + a semihosting host)");
     }
-    #[cfg(nh_semihost)]
+    #[cfg(all(nh_semihost, nh_snapshot))]
     save_via_semihost(gprs)
 }
 
@@ -687,9 +705,9 @@ pub struct RestoreState {
 /// silently; if no slot qualifies we return None and the caller
 /// cold-boots.
 pub fn load_latest() -> Option<RestoreState> {
-    #[cfg(not(nh_semihost))]
+    #[cfg(not(all(nh_semihost, nh_snapshot)))]
     return None;
-    #[cfg(nh_semihost)]
+    #[cfg(all(nh_semihost, nh_snapshot))]
     {
         let mut best: Option<(u64, &[u8])> = None;
         for slot in 0..NUM_SLOTS {

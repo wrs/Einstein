@@ -64,6 +64,8 @@ combos=(
     # the Rot90 combo — enabling it on hardware also needs the
     # config.txt display_hdmi_rotate=1 pairing (docs/REAL_HW_BRINGUP.md).
     "pi-fb-rot90::cargo check --release --no-default-features --features \"pi-bare-metal-input serial-pen-inject pi-fb-rot90\""
+    # Hires geometry experiment (default off): the rotated bench shape.
+    "pi-fb-hires::cargo check --release --no-default-features --features \"pi-bare-metal-input pi-fb-rot90 pi-fb-hires\""
     "trace,quiet::cargo check --release --features \"trace quiet\""
     "trace_once::cargo check --release --features \"trace_once quiet\""
     "host-io-semihost::cargo check --release --features host-io-semihost"

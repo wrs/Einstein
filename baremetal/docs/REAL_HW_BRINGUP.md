@@ -668,6 +668,53 @@ flagged risks:
    is right-aligning Newton on the surface x axis (spare columns at
    the panel top), not the allowance.
 
+### Hires Newton geometry (`pi-fb-hires` — experiment, DEFERRED)
+
+The ROM learns its screen size from us: the display driver is the
+Einstein-style REx driver whose `GetScreenInfo` we serve as a native
+primitive (`peripherals::screen`), and `main.rs` feeds the model
+whatever the host-IO backend mandates (`set_screen_size`, before the
+guest's ERET). The `pi-fb-hires` feature derives the mandate from
+the firmware panel readback — half the logical scan-out shape, so
+the VC path keeps an exact ×2 HVS scale: 540×960 on the rotated
+1080×1920 bench panel. Fully implemented and hardware-tested
+(2026-08-31), then **deferred**; what we learned:
+
+- **The OS reflows.** At 540×960 the ROM boots to the Welcome UI
+  (QEMU and hardware), Notes lays out to the full screen, touch maps
+  correctly (`input::calibrate` follows `panel_geometry()`), ink
+  drawn at 320×480 comes back from the store at its coordinates, and
+  the store survives the size change. ~2.8× the screen area at a
+  crisp integer scale, zero added CPU cost.
+- **Three native-size quirks**, all the same species — a specific
+  position/bounds computation assumes 320×480 while the general
+  drawing path honours the reported geometry:
+  1. The ROM boot screen (Newton logo + copyright) fills its black
+     background over the full screen but draws the logo block far
+     off-center (portrait x 420–540, y 140–460). Cosmetic, ~2 s.
+  2. Trash-crumple animation frames below Newton y=480 are never
+     erased — debris until the next full redraw of that area. The
+     erase machinery honours only the native height.
+  3. Dates opens 480 rows tall with Notes visible beneath — a
+     view-bounds assumption in the builtin app. The one functional
+     annoyance.
+- **The old "the ROM does not accept other sizes" claim** (early
+  pi_fb, phase-0) traced to landscape-geometry experiments
+  (animation debris "past the left half"). Portrait scaling works
+  modulo the quirks above; landscape geometry remains untested.
+- The screen model bounds the mandate at `MAX_SCREEN_W/H`
+  (1280×960, blit-scratch sizing — `set_screen_size` halts loudly
+  beyond it); GUEST_FB (2 MiB) fits any allowed geometry.
+
+Next steps when resumed, in information-per-effort order: run
+Einstein at 540×960 as the oracle on the same three quirks (if it
+matches, they're inherent ROM behaviour and only a ROM patch — the
+last-resort layer — could fix them); hunt Dates' 480 and the
+animation save-under bounds in `rom.dis` (they may share one cached
+screen-bounds global); note the OS-side Rotate button is the
+related-but-separate `SetFeature`(orientation) stub in
+`peripherals::screen`.
+
 ### Porting notes
 
 - **Batch all FB setup tags in a single mailbox message.** The Pi

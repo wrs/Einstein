@@ -334,15 +334,28 @@ pi-fb-force-cpu-scale = []
 # property catalogue documents no rotation-readback tag, and the
 # config.txt line can't be deployed over the serial-upload path
 # anyway — the feature and the config line must be flipped together
-# (SD card in hand). OFF by default; plumbing is verified at compile
-# level only. UNVERIFIED ON HARDWARE — see docs/REAL_HW_BRINGUP.md
-# "Portrait rotation" for the gpu_mem / FIRMWARE_TOP_BAR_PX caveats.
-# Only meaningful together with `host-io-pi-fb`; ignored by the
-# CPU-bilinear fallback path (landscape-only — it logs loudly and
-# paints unrotated).
+# (SD card in hand). OFF by default. Hardware-verified (90° CW) —
+# see docs/REAL_HW_BRINGUP.md "Portrait rotation" for the gpu_mem /
+# full-start.elf pairing. Only meaningful together with
+# `host-io-pi-fb`; ignored by the CPU-bilinear fallback path
+# (landscape-only — it logs loudly and paints unrotated).
 #   cargo build --release --no-default-features \
 #     --features "pi-bare-metal-input pi-fb-rot90"
 pi-fb-rot90 = []
+
+# Experiment (DEFERRED): derive the Newton screen geometry from the
+# panel instead of the MP2100-native 320×480 — half the logical
+# scan-out shape, so the VC-scaled path keeps an exact ×2 HVS scale
+# (540×960 on a rotated 1080×1920 panel, 960×540 landscape).
+# Hardware-tested: the OS reflows fully, but a few ROM paths compute
+# positions/bounds from the native size (boot logo, animation erase,
+# Dates' view height) — quirk inventory + resume plan in
+# docs/REAL_HW_BRINGUP.md "Hires Newton geometry". Opt-in; the
+# default stays pinned. Only meaningful together with
+# `host-io-pi-fb`.
+#   cargo build --release --no-default-features \
+#     --features "pi-bare-metal-input pi-fb-rot90 pi-fb-hires"
+pi-fb-hires = []
 
 # Silence recurring diagnostic logs that otherwise dominate the console
 # (stage-1 XN re-walks on every MMU toggle, etc.).

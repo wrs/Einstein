@@ -56,16 +56,61 @@ use super::BlitEvent;
 use crate::host::display::fb::FbInfo;
 use crate::kprintln;
 
-/// Newton's screen dimensions, pinned to MP2100 native 320×480 to
-/// avoid ROM landscape-mode quirks. The OS-layer would accept other
-/// sizes; the ROM does not. Reported to `peripherals::screen` through
-/// [`super::HostIo::panel_geometry`] (pulled by `main.rs` at boot).
-/// `pub`: `display::splash` passes these to
-/// `display::fb::alloc_guest_surface` as the VC-scaled surface's
-/// content geometry (the geometry policy lives here; the splash only
-/// allocates first).
-pub const NEWTON_W: u32 = 320;
-pub const NEWTON_H: u32 = 480;
+/// Newton's screen dimensions as reported to `peripherals::screen`
+/// through [`super::HostIo::panel_geometry`] (pulled by `main.rs` at
+/// boot) and used by both paint paths. Default: MP2100-native
+/// 320×480. The `pi-fb-hires` feature instead derives them from the
+/// firmware panel readback at splash time ([`choose_newton_geometry`]
+/// — half the logical scan-out shape, so the VC path keeps an exact
+/// ×2 HVS scale; 540×960 on a rotated 1080×1920 panel).
+///
+/// The OS reflows to whatever GetScreenInfo reports —
+/// hardware-verified at 540×960 (full UI layout, touch, store) —
+/// but a few ROM code paths compute positions/bounds from the
+/// native 320×480 (boot logo placement, animation erase, Dates'
+/// view height), which is why hires is a DEFERRED opt-in experiment
+/// and the default stays pinned. Quirk inventory + resume plan:
+/// docs/REAL_HW_BRINGUP.md "Hires Newton geometry".
+static NEWTON_W_RT: AtomicU32 = AtomicU32::new(320);
+static NEWTON_H_RT: AtomicU32 = AtomicU32::new(480);
+
+pub fn newton_w() -> u32 {
+    NEWTON_W_RT.load(Ordering::Relaxed)
+}
+pub fn newton_h() -> u32 {
+    NEWTON_H_RT.load(Ordering::Relaxed)
+}
+
+/// Under `pi-fb-hires`, pick the Newton geometry from the firmware's
+/// physical-size readback (already transposed when a rot90 scan-out
+/// is active, i.e. always the logical scan-out shape): half each
+/// axis, width aligned down to the 2 bpp 4-pixel packing, halving
+/// again while the result exceeds the screen model's scratch ceiling
+/// (`peripherals::screen::MAX_SCREEN_W/H`). Must run before the
+/// splash allocates the surface — `display::splash::init` calls it
+/// with the readback it makes for exactly this purpose. Without the
+/// feature (or on a zero readback) the 320×480 default stands.
+pub fn choose_newton_geometry(rep_w: u32, rep_h: u32) {
+    if !cfg!(feature = "pi-fb-hires") || rep_w == 0 || rep_h == 0 {
+        return;
+    }
+    // Ceiling on the derived geometry. Must not exceed
+    // `peripherals::screen::MAX_SCREEN_W/H` (the screen model's blit
+    // scratch — it halts the boot on a larger mandate); kept as
+    // local constants because host code must not import peripherals
+    // (scripts/check-layering.sh).
+    const HIRES_MAX_W: u32 = 1280;
+    const HIRES_MAX_H: u32 = 960;
+    let mut div = 2;
+    while rep_w / div > HIRES_MAX_W || rep_h / div > HIRES_MAX_H {
+        div *= 2;
+    }
+    let w = (rep_w / div) & !3;
+    let h = rep_h / div;
+    NEWTON_W_RT.store(w, Ordering::Relaxed);
+    NEWTON_H_RT.store(h, Ordering::Relaxed);
+    kprintln!("host_io_pi_fb: hires newton geometry {}x{} (panel readback {}x{})", w, h, rep_w, rep_h);
+}
 /// 2 bpp grayscale — the MP2x00 panel depth `peripherals::screen`
 /// models.
 const NEWTON_BPP: u32 = 2;
@@ -99,7 +144,7 @@ impl super::HostIo for PiFbBackend {
         // synchronously instead of waiting out a pre-snapshot
         // deadline (CNTPCT keeps running across a restore).
         NEXT_PAINT_CNTPCT.store(0, Ordering::Relaxed);
-        super::push_full_repaint(NEWTON_W, NEWTON_H, NEWTON_BPP);
+        super::push_full_repaint(newton_w(), newton_h(), NEWTON_BPP);
     }
     fn push_blit(&self, ev: &super::BlitEvent, payload: &[u8]) {
         push_blit(ev, payload)
@@ -116,9 +161,10 @@ impl super::HostIo for PiFbBackend {
         flush_deferred();
     }
     fn panel_geometry(&self) -> Option<(u32, u32)> {
-        // The pin is a compile-time property of this backend, not an
-        // outcome of panel bring-up — report it unconditionally.
-        Some((NEWTON_W, NEWTON_H))
+        // Decided by splash-time geometry choice (default pin or
+        // `pi-fb-hires` derivation), well before `main.rs` pulls
+        // this — report it unconditionally.
+        Some((newton_w(), newton_h()))
     }
     #[cfg(nh_input_mtouch)]
     fn painted_region(&self) -> Option<super::PaintedRegion> {
@@ -287,13 +333,13 @@ fn init() {
             // allowance (see `alloc_guest_surface`), so the spare
             // rows sit at the bottom, where the bar-shifted scan-out
             // clips.
-            super::Rotation::Rot0 => (info.width.saturating_sub(NEWTON_W) / 2, 0),
+            super::Rotation::Rot0 => (info.width.saturating_sub(newton_w()) / 2, 0),
             // Rot90: the bar allowance lives on the surface x axis
             // (columns scan out as panel rows, column 0 at the panel
             // top under the asserted 90° CW rotation) — left-align so
             // the spare columns sit at the clipped panel-bottom edge,
             // and center along y (rows scan out as panel columns).
-            super::Rotation::Rot90 => (0, info.height.saturating_sub(NEWTON_H) / 2),
+            super::Rotation::Rot90 => (0, info.height.saturating_sub(newton_h()) / 2),
         };
         // SAFETY: single-core EL2, called once from kmain before any
         // other code touches these statics.
@@ -303,8 +349,8 @@ fn init() {
                 FB = Some(info);
             }
         }
-        PAINTED_W.store(NEWTON_W, Ordering::Relaxed);
-        PAINTED_H.store(NEWTON_H, Ordering::Relaxed);
+        PAINTED_W.store(newton_w(), Ordering::Relaxed);
+        PAINTED_H.store(newton_h(), Ordering::Relaxed);
         OFFSET_X.store(offset_x, Ordering::Relaxed);
         OFFSET_Y.store(offset_y, Ordering::Relaxed);
         // 1:1 — inverse scale is exactly one Newton pixel per painted
@@ -326,8 +372,8 @@ fn init() {
             } else {
                 ""
             },
-            NEWTON_W,
-            NEWTON_H,
+            newton_w(),
+            newton_h(),
             offset_x,
             offset_y,
         );
@@ -360,8 +406,9 @@ fn init() {
     // the effective panel height for the aspect-preserving fit.
     let effective_panel_h = info.height.saturating_sub(FIRMWARE_TOP_BAR_PX);
 
-    let painted_w_if_height_limited = effective_panel_h * NEWTON_W / NEWTON_H;
-    let painted_h_if_width_limited = info.width * NEWTON_H / NEWTON_W;
+    let (nw, nh) = (newton_w(), newton_h());
+    let painted_w_if_height_limited = effective_panel_h * nw / nh;
+    let painted_h_if_width_limited = info.width * nh / nw;
     let (painted_w, painted_h) = if painted_w_if_height_limited <= info.width {
         (painted_w_if_height_limited, effective_panel_h)
     } else {
@@ -374,8 +421,8 @@ fn init() {
     let offset_y = (effective_panel_h - painted_h) / 2;
 
     // Inverse scale: newton-pixel-q16 per painted pixel.
-    let inv_x = (NEWTON_W << 16) / painted_w.max(1);
-    let inv_y = (NEWTON_H << 16) / painted_h.max(1);
+    let inv_x = (nw << 16) / painted_w.max(1);
+    let inv_y = (nh << 16) / painted_h.max(1);
 
     // SAFETY: single-core EL2, called once from kmain before any
     // other code touches these statics.
@@ -402,8 +449,8 @@ fn init() {
         info.width,
         info.height,
         info.pa,
-        NEWTON_W,
-        NEWTON_H,
+        nw,
+        nh,
         painted_w,
         painted_h,
         offset_x,
@@ -426,12 +473,13 @@ fn push_blit(ev: &BlitEvent, _payload: &[u8]) {
         crate::host::display::fb::fill_solid(fb, 0x0000_0000);
     }
 
-    // Clamp the Newton dst rect to the pinned geometry — both paint
+    // Clamp the Newton dst rect to the chosen geometry — both paint
     // paths index GUEST_FB and the surface with it.
-    let dst_left = (ev.dst_left as u32).min(NEWTON_W);
-    let dst_top = (ev.dst_top as u32).min(NEWTON_H);
-    let dst_right = (ev.dst_right as u32).min(NEWTON_W);
-    let dst_bottom = (ev.dst_bottom as u32).min(NEWTON_H);
+    let (nw, nh) = (newton_w(), newton_h());
+    let dst_left = (ev.dst_left as u32).min(nw);
+    let dst_top = (ev.dst_top as u32).min(nh);
+    let dst_right = (ev.dst_right as u32).min(nw);
+    let dst_bottom = (ev.dst_bottom as u32).min(nh);
     if dst_right <= dst_left || dst_bottom <= dst_top {
         return;
     }
@@ -533,7 +581,7 @@ fn paint_1to1(fb: &FbInfo, dst_left: u32, dst_top: u32, dst_right: u32, dst_bott
     let offset_y = OFFSET_Y.load(Ordering::Relaxed) as usize;
 
     let guest_fb = crate::hv::guest_mem::fb_host_pa() as *const u8;
-    let stride = (NEWTON_W / 4) as usize;
+    let stride = (newton_w() / 4) as usize;
     let pitch_words = (fb.pitch / 4) as usize;
     let panel_ptr = fb.pa as *mut u32;
 
@@ -543,10 +591,10 @@ fn paint_1to1(fb: &FbInfo, dst_left: u32, dst_top: u32, dst_right: u32, dst_bott
     let row_px0 = offset_x + xb0 * 4;
 
     for y in dst_top as usize..dst_bottom as usize {
-        // SAFETY: y < NEWTON_H, xb0..xb1 ≤ stride — inside the
-        // GUEST_FB backing (≥ NEWTON_H*stride bytes). Dst: init
-        // guarantees offset_x + NEWTON_W ≤ fb.width and offset_y
-        // + NEWTON_H ≤ fb.height for the VC-scaled surface in both
+        // SAFETY: y < newton_h(), xb0..xb1 ≤ stride — inside the
+        // GUEST_FB backing (≥ newton_h()*stride bytes). Dst: init
+        // guarantees offset_x + newton_w() ≤ fb.width and offset_y
+        // + newton_h() ≤ fb.height for the VC-scaled surface in both
         // rotations (`alloc_guest_surface` sizes it that way), so
         // every write lands inside [fb.pa, fb.pa+size).
         unsafe {
@@ -585,13 +633,14 @@ fn paint_bilinear(fb: &FbInfo, dst_left: u32, dst_top: u32, dst_right: u32, dst_
     // on the top-left (floor), exclusive on the bottom-right (ceil
     // via div_ceil) so we cover every panel pixel whose bilinear
     // footprint overlaps the dst rect.
-    let p_left = dst_left * painted_w / NEWTON_W;
-    let p_top = dst_top * painted_h / NEWTON_H;
-    let p_right = (dst_right * painted_w).div_ceil(NEWTON_W).min(painted_w);
-    let p_bottom = (dst_bottom * painted_h).div_ceil(NEWTON_H).min(painted_h);
+    let (nw, nh) = (newton_w(), newton_h());
+    let p_left = dst_left * painted_w / nw;
+    let p_top = dst_top * painted_h / nh;
+    let p_right = (dst_right * painted_w).div_ceil(nw).min(painted_w);
+    let p_bottom = (dst_bottom * painted_h).div_ceil(nh).min(painted_h);
 
     let guest_fb = crate::hv::guest_mem::fb_host_pa() as *const u8;
-    let stride = (NEWTON_W / 4) as usize;
+    let stride = (nw / 4) as usize;
     let pitch_words = (fb.pitch / 4) as usize;
     let panel_ptr = fb.pa as *mut u32;
 
@@ -609,10 +658,10 @@ fn paint_bilinear(fb: &FbInfo, dst_left: u32, dst_top: u32, dst_right: u32, dst_
 
             // Sample 4 Newton neighbors. `newton_gray` clamps at the
             // far edge so we don't read past the framebuffer.
-            let g00 = newton_gray(guest_fb, stride, nx_i, ny_i);
-            let g01 = newton_gray(guest_fb, stride, nx_i + 1, ny_i);
-            let g10 = newton_gray(guest_fb, stride, nx_i, ny_i + 1);
-            let g11 = newton_gray(guest_fb, stride, nx_i + 1, ny_i + 1);
+            let g00 = newton_gray(guest_fb, stride, nw as usize, nh as usize, nx_i, ny_i);
+            let g01 = newton_gray(guest_fb, stride, nw as usize, nh as usize, nx_i + 1, ny_i);
+            let g10 = newton_gray(guest_fb, stride, nw as usize, nh as usize, nx_i, ny_i + 1);
+            let g11 = newton_gray(guest_fb, stride, nw as usize, nh as usize, nx_i + 1, ny_i + 1);
 
             // Bilinear blend in 8-bit grayscale. Weights are Q0.8
             // (so each multiply stays in u32; the final >> 16
@@ -644,14 +693,16 @@ fn paint_bilinear(fb: &FbInfo, dst_left: u32, dst_top: u32, dst_right: u32, dst_
 }
 
 /// 8-bit grayscale value at Newton FB pixel (x, y). Clamps at the
-/// far edges so the bilinear sampler doesn't fall off the buffer
-/// when the (x+1, y+1) neighbor sits exactly at the boundary.
-fn newton_gray(fb: *const u8, stride: usize, x: usize, y: usize) -> u32 {
-    let x = x.min(NEWTON_W as usize - 1);
-    let y = y.min(NEWTON_H as usize - 1);
-    // SAFETY: x < NEWTON_W and y < NEWTON_H by the clamp; stride =
-    // NEWTON_W/4. The GUEST_FB backing is at least NEWTON_H*stride
-    // bytes (guest_mem::FRAMEBUFFER_SIZE = 2 MiB ≫ 320×480/4).
+/// far edges (`nw`/`nh` = the Newton geometry) so the bilinear
+/// sampler doesn't fall off the buffer when the (x+1, y+1) neighbor
+/// sits exactly at the boundary.
+fn newton_gray(fb: *const u8, stride: usize, nw: usize, nh: usize, x: usize, y: usize) -> u32 {
+    let x = x.min(nw - 1);
+    let y = y.min(nh - 1);
+    // SAFETY: x < nw and y < nh by the clamp; stride = nw/4. The
+    // GUEST_FB backing is at least nh*stride bytes
+    // (guest_mem::FRAMEBUFFER_SIZE = 2 MiB ≫ any geometry within
+    // screen::MAX_SCREEN_W/H at 2 bpp).
     let byte = unsafe { *fb.add(y * stride + x / 4) };
     let shift = 6 - 2 * ((x as u32) % 4);
     let v = ((byte >> shift) & 0x3) as usize;

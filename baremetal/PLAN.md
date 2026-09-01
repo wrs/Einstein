@@ -123,6 +123,16 @@ build combinations in `scripts/check-matrix.sh` pass.
       and the firmware's transposed physical-size readback both
       fixes the geometry and detects the mismatched-pair case.
       Details in `docs/REAL_HW_BRINGUP.md` "Portrait rotation".
+    - Hires Newton geometry: implemented behind `pi-fb-hires`
+      (540×960 on the rotated bench panel, exact ×2 HVS scale) and
+      hardware-tested — the OS reflows fully, touch and store are
+      fine — but DEFERRED over three ROM native-size quirks (boot
+      logo off-center, trash-crumple erase bounded to y<480, Dates
+      opens 480 tall). Findings + resume plan (Einstein oracle at
+      540×960, then hunt the constants in rom.dis) in
+      `docs/REAL_HW_BRINGUP.md` "Hires Newton geometry". The
+      Extras Rotate button no-op is the adjacent
+      `SetFeature`(orientation) stub in `peripherals/screen.rs`.
     - Deferred, in likely-value order: 8 bpp paletted surface
       (needs `SET_PALETTE` in mailbox.rs; quarters write
       bandwidth), double-buffered flips (`fb_set_virtual_offset`

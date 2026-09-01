@@ -145,6 +145,13 @@ pub fn fb_row_bytes() -> u32 {
 /// 320×480 default stays in effect.
 pub fn set_screen_size(w: u32, h: u32) {
     let w = w & !3;
+    if w > MAX_SCREEN_W || h > MAX_SCREEN_H {
+        kprintln!(
+            "*** screen.set_screen_size: {}x{} exceeds the blit scratch bound {}x{}",
+            w, h, MAX_SCREEN_W, MAX_SCREEN_H
+        );
+        cpu::halt();
+    }
     SCREEN_W.store(w, Ordering::Relaxed);
     SCREEN_H.store(h, Ordering::Relaxed);
 }

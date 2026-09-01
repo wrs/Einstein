@@ -109,9 +109,16 @@ pub fn init() -> Option<FbInfo> {
     // the runtime fallback. The splash's own layout is relative to
     // the returned FbInfo either way, so boot visuals work on both —
     // on the small surface they're simply HVS-upscaled.
+    //
+    // Give pi_fb the panel readback first — under `pi-fb-hires` it
+    // derives the Newton geometry from it (no-op otherwise, and on a
+    // failed readback the default geometry stands).
+    if let Ok((rw, rh)) = crate::host::mailbox::fb_get_physical_size() {
+        crate::host::host_io::pi_fb::choose_newton_geometry(rw, rh);
+    }
     let info = match fb::alloc_guest_surface(
-        crate::host::host_io::pi_fb::NEWTON_W,
-        crate::host::host_io::pi_fb::NEWTON_H,
+        crate::host::host_io::pi_fb::newton_w(),
+        crate::host::host_io::pi_fb::newton_h(),
         crate::host::host_io::pi_fb::RESERVED_TOP_PX,
         // Under rot90 the splash needs no rotation of its own: it
         // paints row-major into the transposed surface through the

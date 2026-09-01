@@ -1052,6 +1052,22 @@ impl GuestOs for NewtonOs {
                     spsr: spsr_und,
                 }
             }
+            // PHammerInTranslator patches — the REP task polls its
+            // input translator from USR, so these fire as UNDs too.
+            _ if insn == HvcImm::HammerFrameAvailable.insn() => {
+                probes::handle_hammer_frame_available(ctx);
+                UndHvcOutcome::Resume {
+                    pc: (faulting_pc + 4) as u64,
+                    spsr: spsr_und,
+                }
+            }
+            _ if insn == HvcImm::HammerFgets.insn() => {
+                probes::handle_hammer_fgets(ctx);
+                UndHvcOutcome::Resume {
+                    pc: (faulting_pc + 4) as u64,
+                    spsr: spsr_und,
+                }
+            }
             _ => UndHvcOutcome::NotMine,
         }
     }
@@ -1119,6 +1135,12 @@ impl GuestOs for NewtonOs {
             }
             v if v == HvcImm::HammerExceptionNotify as u32 => {
                 probes::handle_hammer_thunk(ctx, ThunkKind::ExceptionNotify);
+            }
+            v if v == HvcImm::HammerFrameAvailable as u32 => {
+                probes::handle_hammer_frame_available(ctx);
+            }
+            v if v == HvcImm::HammerFgets as u32 => {
+                probes::handle_hammer_fgets(ctx);
             }
             v if v == HvcImm::GpioTrigger as u32 => {
                 vic::raise(vic::INT_GPIO);

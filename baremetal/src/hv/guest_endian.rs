@@ -168,8 +168,8 @@ pub fn guest_read_u8_va(va: u32) -> Option<u8> {
 /// `guest_write_u8_pa` so the byte-lane transform matches the
 /// `guest_read_u8_va` read side. Used by the `nh_guest_test`
 /// `GuestTestRepRender` HVC to deposit rendered bytes back into a
-/// guest buffer the test then reads with ordinary loads.
-#[cfg(nh_guest_test)]
+/// guest buffer the test then reads with ordinary loads, and by the
+/// REP-input fgets probe to fill `PHammerInTranslator`'s line buffer.
 pub fn guest_write_u8_va(va: u32, value: u8) -> bool {
     let pa = guest_mem::translate_va(va).unwrap_or(va);
     guest_write_u8_pa(pa, value)

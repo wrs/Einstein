@@ -136,6 +136,14 @@ pub extern "C" fn kmain() -> ! {
         fingerprint: host::flash_persist::fingerprint,
     });
     hv::trap::hvc::install_pen_inject(host::host_io::queue::enqueue_pen_sample);
+    // REP input lines flow from the host-io backend's `rep-in` file to
+    // the patched PHammerInTranslator (no-op on backends without a
+    // REP transport — the defaults report "no line", leaving the REP
+    // idle exactly as before).
+    newton::probes::install_rep_input(newton::probes::RepInputOps {
+        line_available: host::host_io::rep_line_available,
+        take_line: host::host_io::rep_take_line,
+    });
     // The guest interrupt model rearms the EL2 timer deadline through
     // this sink when the kernel reprograms a match register.
     peripherals::vic::install_match_rearm(hv::timer::rearm);

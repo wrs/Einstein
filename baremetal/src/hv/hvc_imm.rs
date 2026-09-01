@@ -173,6 +173,19 @@ pub enum HvcImm {
     /// Entry probe at `ActionErrorNotify(long err, long id)` (ROM
     /// 0x0014_6648). Same shape as `ErrorNotifyEntry`.
     ActionErrorNotifyEntry,
+    /// `PHammerInTranslator::FrameAvailable` body — REP input poll.
+    /// Body replaced with `HVC` + `mov pc, lr`; the handler sets
+    /// r0 = 1 when the host has a complete REP input line queued
+    /// (`gREPin` is a PHammerInTranslator on every boot, same
+    /// gNewtConfig reasoning as `HammerPrint`).
+    HammerFrameAvailable,
+    /// `PHammerInTranslator::ProduceFrame` fgets call site. Replaces
+    /// `bl fgets`; the handler copies the queued host line
+    /// NUL-terminated into the translator's line buffer (r0, size
+    /// r1) and returns r0 = buffer, or r0 = 0 when no line is
+    /// queued. The rest of ProduceFrame (`MakeString` +
+    /// `ParseString`) runs natively on the filled buffer.
+    HammerFgets,
 }
 
 impl HvcImm {

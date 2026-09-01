@@ -255,6 +255,32 @@ same IPC files (`screen` renders the blit stream to a PNG; `tap` /
 `drag` / `power` inject pen and power events) — useful for scripted
 Dock sessions without the viewer.
 
+### NewtonScript REPL
+
+The ROM's own read-eval-print loop is wired to the host — no NTK, no
+package install. The `PHammerInTranslator` input path (ROM 0xE6824 /
+0xE6880) is patched to read lines from `/tmp/newton-host-io/rep-in`,
+and rendered REP output is mirrored to `rep-out`. With a
+`host-io-semihost` build booted to the `REP> Welcome to NewtonScript!`
+banner:
+
+```
+scripts/newton-repl.py                 # interactive prompt
+scripts/newton-repl.py --eval '3+4'    # one-shot
+```
+
+```
+newton> call func(x) begin x*x end with (9)
+#144        ← 0x144 >> 2 = 81
+```
+
+Evaluation is the real interpreter (arithmetic, `GetRoot()`,
+`Gestalt`, function definitions, assignment). Two formatting caveats:
+results auto-echo as raw tagged Refs (`#1C` is integer 7, i.e.
+`7 << 2`) rather than decoded, and `Print()`'s own output is teed to
+`rep-out` only on complete lines. Both are display nuances; the
+evaluated values are correct.
+
 Transfer works end-to-end (multi-KiB packages arrive byte-perfect,
 clean session teardown); actually *activating* an installed package
 still fails inside the guest — that's PLAN.md item 1, the known

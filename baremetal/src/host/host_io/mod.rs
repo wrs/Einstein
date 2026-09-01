@@ -105,6 +105,23 @@ pub trait HostIo: Sync {
         None
     }
 
+    /// True when a complete REP input line (terminated by `\n`) is
+    /// queued on the backend's REP transport.
+    fn rep_line_available(&self) -> bool {
+        false
+    }
+
+    /// Copy one queued REP input line (including its `\n`, no NUL)
+    /// into `buf`; returns the byte count, 0 when nothing is queued.
+    /// A line longer than `buf` is returned in `buf`-sized pieces.
+    fn rep_take_line(&self, _buf: &mut [u8]) -> usize {
+        0
+    }
+
+    /// Mirror one rendered REP output line to the backend's REP
+    /// transport (the console log keeps its copy regardless).
+    fn rep_out(&self, _line: &[u8]) {}
+
     /// Where the Newton surface lands on the backend's physical panel,
     /// for the touch-input calibration transform. `None` when the
     /// backend has no physical panel (null, semihost) or the panel
@@ -351,6 +368,21 @@ pub fn serial_tx(b: u8) {
 #[cfg(nh_host_io_semihost)]
 pub fn serial_rx() -> Option<u8> {
     BACKEND.serial_rx()
+}
+
+/// REP input-line poll — see [`HostIo::rep_line_available`].
+pub fn rep_line_available() -> bool {
+    BACKEND.rep_line_available()
+}
+
+/// Take one REP input line — see [`HostIo::rep_take_line`].
+pub fn rep_take_line(buf: &mut [u8]) -> usize {
+    BACKEND.rep_take_line(buf)
+}
+
+/// Mirror one REP output line — see [`HostIo::rep_out`].
+pub fn rep_out(line: &[u8]) {
+    BACKEND.rep_out(line)
 }
 
 /// Whether the active backend consumes blit payloads — see

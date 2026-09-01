@@ -58,6 +58,15 @@ const IN_PATH: &[u8] = b"/tmp/newton-host-io/in\0";
 const SERIAL_OUT_PATH: &[u8] = b"/tmp/newton-host-io/serial-out\0";
 const SERIAL_IN_PATH: &[u8] = b"/tmp/newton-host-io/serial-in\0";
 
+// REP (NewtonScript listener) line channel: the host appends input
+// lines to `rep-in` (tailed like the pen `in` file, delivered to the
+// patched PHammerInTranslator via `newton::probes`); rendered REP
+// output lines are mirrored to `rep-out` so a host REPL script
+// (`scripts/newton-repl.py`) can show them inline. The console log
+// keeps its `REP>` copy regardless.
+const REP_IN_PATH: &[u8] = b"/tmp/newton-host-io/rep-in\0";
+const REP_OUT_PATH: &[u8] = b"/tmp/newton-host-io/rep-out\0";
+
 const PUMP_INTERVAL_MS: u64 = 16;
 
 /// TX bytes buffered between flushes. A Dock/MNP frame is ≤ ~560
@@ -67,6 +76,10 @@ const SERIAL_TX_BUF: usize = 4096;
 /// RX ring for bytes read from `serial-in` but not yet popped by the
 /// guest's DMA model.
 const SERIAL_RX_BUF: usize = 4096;
+
+/// REP input ring — sized to hold a few of the translator's
+/// 1024-byte lines.
+const REP_RX_BUF: usize = 4096;
 
 struct State {
     out_fh: i64,
@@ -80,6 +93,12 @@ struct State {
     ser_rx: [u8; SERIAL_RX_BUF],
     ser_rx_head: usize,
     ser_rx_len: usize,
+    rep_in_fh: i64,
+    rep_out_fh: i64,
+    rep_in_pos: u64,
+    rep_rx: [u8; REP_RX_BUF],
+    rep_rx_head: usize,
+    rep_rx_len: usize,
 }
 
 struct StateCell(UnsafeCell<State>);
@@ -98,6 +117,12 @@ static STATE: StateCell = StateCell(UnsafeCell::new(State {
     ser_rx: [0; SERIAL_RX_BUF],
     ser_rx_head: 0,
     ser_rx_len: 0,
+    rep_in_fh: -1,
+    rep_out_fh: -1,
+    rep_in_pos: 0,
+    rep_rx: [0; REP_RX_BUF],
+    rep_rx_head: 0,
+    rep_rx_len: 0,
 }));
 
 static INITIALISED: AtomicBool = AtomicBool::new(false);
@@ -132,6 +157,15 @@ impl super::HostIo for SemihostBackend {
     }
     fn serial_rx(&self) -> Option<u8> {
         serial_rx()
+    }
+    fn rep_line_available(&self) -> bool {
+        rep_line_available()
+    }
+    fn rep_take_line(&self, buf: &mut [u8]) -> usize {
+        rep_take_line(buf)
+    }
+    fn rep_out(&self, line: &[u8]) {
+        rep_out(line)
     }
 }
 
@@ -171,6 +205,17 @@ fn init() {
     s.ser_in_fh = ser_in;
     s.ser_in_pos = if ser_in >= 0 {
         let n = sh_flen(ser_in);
+        if n >= 0 { n as u64 } else { 0 }
+    } else {
+        0
+    };
+    // REP line channel — same open/tail discipline as the serial pair.
+    let rep_out = sh_open(REP_OUT_PATH, MODE_WRITE_BINARY);
+    let rep_in = sh_open(REP_IN_PATH, MODE_READ_BINARY);
+    s.rep_out_fh = rep_out;
+    s.rep_in_fh = rep_in;
+    s.rep_in_pos = if rep_in >= 0 {
+        let n = sh_flen(rep_in);
         if n >= 0 { n as u64 } else { 0 }
     } else {
         0
@@ -218,6 +263,15 @@ fn on_resume() {
             s.ser_in_pos = len as u64;
         }
     }
+    // Same for queued REP input lines.
+    s.rep_rx_len = 0;
+    s.rep_rx_head = 0;
+    if s.rep_in_fh >= 0 {
+        let len = sh_flen(s.rep_in_fh);
+        if len >= 0 {
+            s.rep_in_pos = len as u64;
+        }
+    }
 }
 
 fn push_blit(ev: &super::BlitEvent, payload: &[u8]) {
@@ -256,10 +310,11 @@ fn pump_input() {
 
     // SAFETY: STATE accessed under EL2 single-threaded invariant.
     let s = unsafe { &mut *STATE.0.get() };
-    // Serial wire shares the pump cadence: flush buffered TX, refill
-    // the RX ring. Runs before the pen-event early-outs below so a
-    // missing pen `in` file can't stall the serial stream.
+    // Serial wire and REP line channel share the pump cadence: flush
+    // buffered TX, refill the RX rings. Runs before the pen-event
+    // early-outs below so a missing pen `in` file can't stall them.
     pump_serial(s);
+    pump_rep(s);
     if s.in_fh < 0 {
         return;
     }
@@ -438,6 +493,104 @@ fn pump_serial(s: &mut State) {
     log_host_io!("host_io: serial rx +{} B (ring={})", got, s.ser_rx_len);
 }
 
+// ---- REP line channel ------------------------------------------------
+
+/// True when the REP input ring holds at least one complete line.
+fn rep_line_available() -> bool {
+    if !INITIALISED.load(Ordering::Acquire) {
+        return false;
+    }
+    // SAFETY: single-threaded EL2 (see STATE).
+    let s = unsafe { &*STATE.0.get() };
+    // A full ring with no newline still counts as "available" so an
+    // over-long line drains in pieces instead of deadlocking.
+    if s.rep_rx_len == REP_RX_BUF {
+        return true;
+    }
+    (0..s.rep_rx_len).any(|i| s.rep_rx[(s.rep_rx_head + i) % REP_RX_BUF] == b'\n')
+}
+
+/// Copy one queued line (through its `\n`) into `buf`; returns the
+/// byte count. With no complete line queued, returns 0 — except that
+/// a completely full ring drains `buf`-sized pieces (see above).
+fn rep_take_line(buf: &mut [u8]) -> usize {
+    if !INITIALISED.load(Ordering::Acquire) || buf.is_empty() {
+        return 0;
+    }
+    // SAFETY: single-threaded EL2 (see STATE).
+    let s = unsafe { &mut *STATE.0.get() };
+    let mut line_len = None;
+    for i in 0..s.rep_rx_len {
+        if s.rep_rx[(s.rep_rx_head + i) % REP_RX_BUF] == b'\n' {
+            line_len = Some(i + 1);
+            break;
+        }
+    }
+    let take = match line_len {
+        Some(n) => n.min(buf.len()),
+        None if s.rep_rx_len == REP_RX_BUF => buf.len().min(REP_RX_BUF),
+        None => return 0,
+    };
+    for slot in buf.iter_mut().take(take) {
+        *slot = s.rep_rx[s.rep_rx_head];
+        s.rep_rx_head = (s.rep_rx_head + 1) % REP_RX_BUF;
+        s.rep_rx_len -= 1;
+    }
+    take
+}
+
+/// Mirror one rendered REP output line (newline appended) to
+/// `rep-out` for the host REPL script.
+fn rep_out(line: &[u8]) {
+    if !INITIALISED.load(Ordering::Acquire) {
+        return;
+    }
+    // SAFETY: single-threaded EL2 (see STATE).
+    let s = unsafe { &*STATE.0.get() };
+    if s.rep_out_fh < 0 {
+        return;
+    }
+    let _ = sh_write(s.rep_out_fh, line);
+    let _ = sh_write(s.rep_out_fh, b"\n");
+}
+
+/// Refill the REP input ring from `rep-in`. Shares `pump_serial`'s
+/// call site and discipline.
+fn pump_rep(s: &mut State) {
+    if s.rep_in_fh < 0 || s.rep_rx_len == REP_RX_BUF {
+        return;
+    }
+    let len = sh_flen(s.rep_in_fh);
+    if len < 0 {
+        return;
+    }
+    let len = len as u64;
+    if len < s.rep_in_pos {
+        s.rep_in_pos = 0;
+    }
+    if len <= s.rep_in_pos {
+        return;
+    }
+    let space = REP_RX_BUF - s.rep_rx_len;
+    let want = (len - s.rep_in_pos).min(space as u64).min(BUF_LEN as u64) as usize;
+    if sh_seek(s.rep_in_fh, s.rep_in_pos as i64) < 0 {
+        return;
+    }
+    let buf = scratch_buf();
+    let n = sh_read(s.rep_in_fh, &mut buf[..want]);
+    let got = want.saturating_sub(n);
+    if got == 0 {
+        return;
+    }
+    s.rep_in_pos = s.rep_in_pos.wrapping_add(got as u64);
+    for &b in &buf[..got] {
+        let tail = (s.rep_rx_head + s.rep_rx_len) % REP_RX_BUF;
+        s.rep_rx[tail] = b;
+        s.rep_rx_len += 1;
+    }
+    log_host_io!("host_io: rep-in +{} B (ring={})", got, s.rep_rx_len);
+}
+
 // ---- scratch + semihosting helpers ----
 
 const BUF_LEN: usize = 4096;
@@ -461,7 +614,7 @@ fn ensure_output_dir() {
     // opens fire — otherwise a first-run with the viewer not yet
     // started leaves the inbound channel disabled until the next
     // reboot.
-    let cmd = b"mkdir -p /tmp/newton-host-io && touch /tmp/newton-host-io/in /tmp/newton-host-io/out /tmp/newton-host-io/serial-in /tmp/newton-host-io/serial-out\0";
+    let cmd = b"mkdir -p /tmp/newton-host-io && touch /tmp/newton-host-io/in /tmp/newton-host-io/out /tmp/newton-host-io/serial-in /tmp/newton-host-io/serial-out /tmp/newton-host-io/rep-in /tmp/newton-host-io/rep-out\0";
     let args: [u64; 2] = [cmd.as_ptr() as u64, (cmd.len() - 1) as u64];
     let _ = unsafe { semihost(SYS_SYSTEM, args.as_ptr()) };
 }

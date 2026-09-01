@@ -186,8 +186,17 @@ struct LineBuf {
 
 static mut LINE: LineBuf = LineBuf { bytes: [0; LINE_CAP], n: 0 };
 
+/// Emit one completed line: `kprintln!` for the console log, plus a
+/// mirror to the host-io REP transport (`rep-out`, read by
+/// `scripts/newton-repl.py`; no-op on backends without one).
+fn emit_line(prefix: &str, bytes: &[u8], suffix: &str) {
+    let s = core::str::from_utf8(bytes).unwrap_or("<non-utf8>");
+    crate::kprintln!("{}{}{}", prefix, s, suffix);
+    crate::host::host_io::rep_out(bytes);
+}
+
 /// Append a chunk of rendered output. Splits at `\n`: complete lines
-/// flush via `kprintln!` (with `prefix` prepended); a trailing
+/// flush via [`emit_line`] (with `prefix` prepended); a trailing
 /// fragment without a newline is buffered for the next call.
 pub fn append_to_line(prefix: &str, chunk: &[u8]) {
     // SAFETY: single-threaded EL2.
@@ -196,9 +205,7 @@ pub fn append_to_line(prefix: &str, chunk: &[u8]) {
         for &b in chunk {
             if b == b'\n' || b == b'\r' {
                 if line.n > 0 {
-                    let s = core::str::from_utf8(&line.bytes[..line.n])
-                        .unwrap_or("<non-utf8>");
-                    crate::kprintln!("{}{}", prefix, s);
+                    emit_line(prefix, &line.bytes[..line.n], "");
                     line.n = 0;
                 }
                 continue;
@@ -207,9 +214,7 @@ pub fn append_to_line(prefix: &str, chunk: &[u8]) {
                 line.bytes[line.n] = b;
                 line.n += 1;
             } else {
-                let s = core::str::from_utf8(&line.bytes[..line.n])
-                    .unwrap_or("<non-utf8>");
-                crate::kprintln!("{}{} [buf-full]", prefix, s);
+                emit_line(prefix, &line.bytes[..line.n], " [buf-full]");
                 line.n = 0;
                 line.bytes[0] = b;
                 line.n = 1;
@@ -225,9 +230,7 @@ pub fn flush_line(prefix: &str) {
     unsafe {
         let line = &mut *core::ptr::addr_of_mut!(LINE);
         if line.n > 0 {
-            let s = core::str::from_utf8(&line.bytes[..line.n])
-                .unwrap_or("<non-utf8>");
-            crate::kprintln!("{}{}", prefix, s);
+            emit_line(prefix, &line.bytes[..line.n], "");
             line.n = 0;
         }
     }

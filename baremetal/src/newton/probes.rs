@@ -8,6 +8,99 @@ use crate::kprintln;
 use crate::hv::trap::und::read_banked_spsr;
 use crate::hv::guest_mem::read_cstr_at;
 
+// ---- REP input (PHammerInTranslator) ---------------------------------
+//
+// Host endpoints for the kernel's REP input line queue, installed by
+// `main.rs` (newton must not import host directly — same inversion as
+// `peripherals::console`). Defaults are inert: no line is ever
+// available, which leaves the REP idle exactly as an unpatched boot.
+
+/// Host endpoints for REP input.
+pub struct RepInputOps {
+    /// True when a complete input line is queued on the host side.
+    pub line_available: fn() -> bool,
+    /// Copy one queued line (including its trailing `\n`, no NUL)
+    /// into `buf`; returns the byte count, 0 when nothing is queued.
+    /// A line longer than `buf` is split, fgets-style.
+    pub take_line: fn(&mut [u8]) -> usize,
+}
+
+fn rep_no_line() -> bool {
+    false
+}
+fn rep_take_none(_buf: &mut [u8]) -> usize {
+    0
+}
+
+struct RepOpsCell(core::cell::UnsafeCell<RepInputOps>);
+// SAFETY: written once by `install_rep_input` from kmain on core 0
+// before the guest runs; read-only afterwards from the trap handler.
+unsafe impl Sync for RepOpsCell {}
+
+static REP_OPS: RepOpsCell = RepOpsCell(core::cell::UnsafeCell::new(RepInputOps {
+    line_available: rep_no_line,
+    take_line: rep_take_none,
+}));
+
+/// Install the host REP-input endpoints. Called once from `main.rs`
+/// during boot wiring.
+pub fn install_rep_input(ops: RepInputOps) {
+    // SAFETY: single-core EL2, before any trap handler reads REP_OPS.
+    unsafe {
+        *REP_OPS.0.get() = ops;
+    }
+}
+
+fn rep_ops() -> &'static RepInputOps {
+    // SAFETY: see RepOpsCell.
+    unsafe { &*REP_OPS.0.get() }
+}
+
+/// `PHammerInTranslator::FrameAvailable` body (patched to `HVC` +
+/// `mov pc, lr`): r0 = 1 when the host has a complete line queued.
+pub(crate) fn handle_hammer_frame_available(ctx: &mut TrapContext) {
+    ctx.x[0] = ((rep_ops().line_available)()) as u64;
+}
+
+/// The `bl fgets` inside `PHammerInTranslator::ProduceFrame`, patched
+/// to an HVC. fgets semantics against the host line queue:
+/// r0 = destination buffer (guest VA), r1 = buffer size. On success
+/// the buffer holds the line (with `\n`) NUL-terminated and r0 is
+/// returned unchanged; with nothing queued r0 = 0 (the native
+/// ProduceFrame tail then returns NILREF and the REP idles on).
+pub(crate) fn handle_hammer_fgets(ctx: &mut TrapContext) {
+    let buf_va = ctx.x[0] as u32;
+    let size = ctx.x[1] as usize;
+    if buf_va == 0 || size < 2 {
+        ctx.x[0] = 0;
+        return;
+    }
+    // The translator's buffer is 1024 bytes (CreateHammerInTranslator
+    // passes {name, 0x400} to Init); a local staging buffer of the
+    // same size always suffices.
+    let mut tmp = [0u8; 1024];
+    let cap = (size - 1).min(tmp.len());
+    let n = (rep_ops().take_line)(&mut tmp[..cap]);
+    if n == 0 {
+        ctx.x[0] = 0;
+        return;
+    }
+    for (i, &b) in tmp[..n].iter().enumerate() {
+        if !crate::hv::guest_endian::guest_write_u8_va(buf_va + i as u32, b) {
+            kprintln!(
+                "rep-in: guest_write_u8_va failed at VA {:#010x} (+{}); dropping line",
+                buf_va, i
+            );
+            ctx.x[0] = 0;
+            return;
+        }
+    }
+    crate::hv::guest_endian::guest_write_u8_va(buf_va + n as u32, 0);
+    // fgets returns its buffer argument on success; r0 already holds
+    // it, but be explicit for the reader.
+    ctx.x[0] = buf_va as u64;
+}
+
 
 /// Canary handler for `BootOS` / `ROMBoot` (0x0001_8688). The AArch32
 /// reset vector at VA 0 branches here, so the first entry after the

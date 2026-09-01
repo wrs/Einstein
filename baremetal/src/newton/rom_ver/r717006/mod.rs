@@ -83,6 +83,12 @@ pub const HAMMER: Option<HammerSites> = Some(HammerSites {
     flush:            ProbeSite { pc: 0x000E_6A50, orig_insn: 0xE1A0_C00D },
     stack_trace:      ProbeSite { pc: 0x000E_6954, orig_insn: 0xE1A0_0001 },
     exception_notify: ProbeSite { pc: 0x000E_695C, orig_insn: 0xE1A0_0001 },
+    // PHammerInTranslator: FrameAvailable entry (`mov r1, #0`), the
+    // ProduceFrame `bl fgets` (to 0x0034F84C), and the ProduceFrame
+    // `beq 0xE68C0` FILE*-NULL gate two words earlier.
+    in_frame_available: ProbeSite { pc: 0x000E_6824, orig_insn: 0xE3A0_1000 },
+    in_fgets:           ProbeSite { pc: 0x000E_6880, orig_insn: 0xEB09_A3F1 },
+    in_file_gate:       ProbeSite { pc: 0x000E_6874, orig_insn: 0x0A00_0011 },
 });
 
 /// `UnhandledException` / `UnhandledNonUserModeException` entries —

@@ -102,8 +102,9 @@ pub struct LoudHaltSites {
     pub bus_error_throw: ProbeSite,
 }
 
-/// `PHammerOutTranslator` concrete-body patch sites (the kernel's REP
-/// output path, rerouted into the EL2 UART).
+/// `PHammerOutTranslator` / `PHammerInTranslator` concrete-body patch
+/// sites (the kernel's REP output path rerouted into the EL2 UART,
+/// and its input path fed from the host).
 #[derive(Copy, Clone)]
 pub struct HammerSites {
     pub print: ProbeSite,
@@ -111,6 +112,19 @@ pub struct HammerSites {
     pub flush: ProbeSite,
     pub stack_trace: ProbeSite,
     pub exception_notify: ProbeSite,
+    /// `PHammerInTranslator::FrameAvailable` body entry — replaced
+    /// with `HVC` + `mov pc, lr`; the handler reports whether the
+    /// host has a complete REP input line queued.
+    pub in_frame_available: ProbeSite,
+    /// The `bl fgets` inside `PHammerInTranslator::ProduceFrame` —
+    /// replaced with an HVC that fills the translator's line buffer
+    /// (r0, size r1) from the host queue, fgets-style.
+    pub in_fgets: ProbeSite,
+    /// The `beq` in `ProduceFrame` that skips the fgets when the
+    /// translator's `fopen("%NewtonScript Listener")` FILE* is NULL
+    /// (it is on this hypervisor — there's no Hammer console device).
+    /// NOPed so the flow always reaches the patched fgets site.
+    pub in_file_gate: ProbeSite,
 }
 
 /// `UnhandledException` / `UnhandledNonUserModeException` entry

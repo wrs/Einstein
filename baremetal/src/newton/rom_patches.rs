@@ -543,6 +543,56 @@ unsafe fn apply_pouttranslator_patches(rom_ptr: *mut u32) {
             "PHammerOutTranslator::ExceptionNotify body (mov r0,r1 → HVC)",
         );
     }
+
+    // PHammerInTranslator — the REP input path, fed from the host.
+    //
+    // FrameAvailable: 2-word body replacement (`HVC` + `mov pc, lr`);
+    // the handler sets r0 = "host line queued".
+    // SAFETY: rom_ptr backs the full main ROM; the sites are in it.
+    unsafe {
+        install_patch(
+            rom_ptr,
+            hammer.in_frame_available.pc,
+            WordKind::Code,
+            Some(hammer.in_frame_available.orig_insn),
+            &[HvcImm::HammerFrameAvailable.insn(), MOV_PC_LR],
+            /*optional=*/ false,
+            "PHammerInTranslator::FrameAvailable body",
+        );
+    }
+    kprintln!(
+        "rom_patch: {:#010x}: {:#010x} -> HVC #{:#x} + mov pc,lr  (PHammerInTranslator::FrameAvailable body)",
+        hammer.in_frame_available.pc,
+        hammer.in_frame_available.orig_insn,
+        HvcImm::HammerFrameAvailable as u32,
+    );
+
+    // ProduceFrame: NOP the FILE*-NULL gate (fopen of the Hammer
+    // console device fails here, leaving FILE* = 0, and the original
+    // `beq` would skip the read), then replace the `bl fgets` with an
+    // HVC whose handler fills the line buffer from the host queue.
+    // The rest of ProduceFrame (MakeString + ParseString) runs
+    // natively on the filled buffer.
+    const NOP_MOV_R0_R0: u32 = 0xE1A0_0000;
+    // SAFETY: as above.
+    unsafe {
+        install_patch(
+            rom_ptr,
+            hammer.in_file_gate.pc,
+            WordKind::Code,
+            Some(hammer.in_file_gate.orig_insn),
+            &[NOP_MOV_R0_R0],
+            /*optional=*/ false,
+            "PHammerInTranslator::ProduceFrame FILE* gate (beq → nop)",
+        );
+        patch_probe(
+            rom_ptr,
+            hammer.in_fgets.pc,
+            hammer.in_fgets.orig_insn,
+            HvcImm::HammerFgets,
+            "PHammerInTranslator::ProduceFrame fgets (bl → HVC)",
+        );
+    }
 }
 
 /// Patch the kernel's known `LDR` sites that read the faulting

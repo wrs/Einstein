@@ -52,7 +52,7 @@ if [[ ${#markers[@]} -eq 0 ]]; then
     else
         markers=(
             'REP> Welcome to NewtonScript!'
-            'copied=38400'
+            'copied=(38400|153600)'
         )
     fi
 fi

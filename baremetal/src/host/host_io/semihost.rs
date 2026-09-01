@@ -41,12 +41,45 @@ const MODE_WRITE_BINARY: u64 = 0x05; // "wb"
 const OUT_PATH: &[u8] = b"/tmp/newton-host-io/out\0";
 const IN_PATH: &[u8] = b"/tmp/newton-host-io/in\0";
 
+// Guest external-serial (`extr`) wire, as a second file pair in the
+// same directory: TX bytes append to `serial-out`, RX bytes are read
+// from `serial-in` at a tracked offset (same append-log discipline as
+// the pen `in` file). `scripts/serial-pty-bridge.py` bridges the pair
+// to a pty or TCP endpoint for NCX / UnixNPI / NTK.
+//
+// This exists because the obvious alternative — routing the guest
+// serial through the QEMU PL011 chardev — has a host-visible RX
+// liveness problem: under this hypervisor's trap-heavy, semihosting-
+// heavy load, QEMU's iothread can go many seconds without moving
+// chardev socket bytes into the PL011 RX FIFO (observed: a 31-byte
+// reply sat undelivered for 9 s while the guest's MNP timer expired).
+// The semihosting file path is pumped from our own trap tail, so
+// liveness is ours to guarantee.
+const SERIAL_OUT_PATH: &[u8] = b"/tmp/newton-host-io/serial-out\0";
+const SERIAL_IN_PATH: &[u8] = b"/tmp/newton-host-io/serial-in\0";
+
 const PUMP_INTERVAL_MS: u64 = 16;
+
+/// TX bytes buffered between flushes. A Dock/MNP frame is ≤ ~560
+/// bytes; 4 KiB comfortably holds a burst from one `drain_tx_channel`
+/// call (which caps itself at 4 KiB).
+const SERIAL_TX_BUF: usize = 4096;
+/// RX ring for bytes read from `serial-in` but not yet popped by the
+/// guest's DMA model.
+const SERIAL_RX_BUF: usize = 4096;
 
 struct State {
     out_fh: i64,
     in_fh: i64,
     in_pos: u64,
+    ser_out_fh: i64,
+    ser_in_fh: i64,
+    ser_in_pos: u64,
+    ser_tx: [u8; SERIAL_TX_BUF],
+    ser_tx_len: usize,
+    ser_rx: [u8; SERIAL_RX_BUF],
+    ser_rx_head: usize,
+    ser_rx_len: usize,
 }
 
 struct StateCell(UnsafeCell<State>);
@@ -57,6 +90,14 @@ static STATE: StateCell = StateCell(UnsafeCell::new(State {
     out_fh: -1,
     in_fh: -1,
     in_pos: 0,
+    ser_out_fh: -1,
+    ser_in_fh: -1,
+    ser_in_pos: 0,
+    ser_tx: [0; SERIAL_TX_BUF],
+    ser_tx_len: 0,
+    ser_rx: [0; SERIAL_RX_BUF],
+    ser_rx_head: 0,
+    ser_rx_len: 0,
 }));
 
 static INITIALISED: AtomicBool = AtomicBool::new(false);
@@ -86,6 +127,12 @@ impl super::HostIo for SemihostBackend {
     fn pump_input(&self) {
         pump_input()
     }
+    fn serial_tx(&self, b: u8) {
+        serial_tx(b)
+    }
+    fn serial_rx(&self) -> Option<u8> {
+        serial_rx()
+    }
 }
 
 pub static BACKEND: SemihostBackend = SemihostBackend;
@@ -110,6 +157,24 @@ fn init() {
     }
     s.out_fh = out;
     s.in_fh = inh;
+    // Serial wire files. `serial-out` is truncated each boot (a fresh
+    // session's TX stream); `serial-in` is an append log we tail from
+    // its current end, mirroring the pen `in` handling below.
+    let ser_out = sh_open(SERIAL_OUT_PATH, MODE_WRITE_BINARY);
+    let ser_in = sh_open(SERIAL_IN_PATH, MODE_READ_BINARY);
+    if ser_out >= 0 && ser_in >= 0 {
+        log_host_io!("host_io: serial   /tmp/newton-host-io/serial-{{out,in}} fh={}/{}", ser_out, ser_in);
+    } else {
+        log_host_io!("host_io: serial file open failed (out fh={} in fh={}); guest serial disabled", ser_out, ser_in);
+    }
+    s.ser_out_fh = ser_out;
+    s.ser_in_fh = ser_in;
+    s.ser_in_pos = if ser_in >= 0 {
+        let n = sh_flen(ser_in);
+        if n >= 0 { n as u64 } else { 0 }
+    } else {
+        0
+    };
     // Start reading from end-of-file. /tmp/newton-host-io/in is a
     // FIFO-ish append log shared across sessions: the host viewer
     // appends pen events to it, but the file isn't cleared between
@@ -140,6 +205,17 @@ fn on_resume() {
         let len = sh_flen(s.in_fh);
         if len >= 0 {
             s.in_pos = len as u64;
+        }
+    }
+    // Serial bytes spanning the snapshot are stale mid-stream state:
+    // drop buffered TX, drain the RX ring, re-tail `serial-in`.
+    s.ser_tx_len = 0;
+    s.ser_rx_len = 0;
+    s.ser_rx_head = 0;
+    if s.ser_in_fh >= 0 {
+        let len = sh_flen(s.ser_in_fh);
+        if len >= 0 {
+            s.ser_in_pos = len as u64;
         }
     }
 }
@@ -180,6 +256,10 @@ fn pump_input() {
 
     // SAFETY: STATE accessed under EL2 single-threaded invariant.
     let s = unsafe { &mut *STATE.0.get() };
+    // Serial wire shares the pump cadence: flush buffered TX, refill
+    // the RX ring. Runs before the pen-event early-outs below so a
+    // missing pen `in` file can't stall the serial stream.
+    pump_serial(s);
     if s.in_fh < 0 {
         return;
     }
@@ -271,6 +351,93 @@ fn pump_input() {
     }
 }
 
+// ---- guest external-serial wire (file pair) ----
+
+/// Buffer one guest TX byte; flush to `serial-out` when the buffer
+/// fills. The regular flush happens on the pump cadence
+/// (`pump_serial`, ≤16 ms later), so a full MNP frame usually leaves
+/// in one SYS_WRITE.
+fn serial_tx(b: u8) {
+    if !INITIALISED.load(Ordering::Acquire) {
+        return;
+    }
+    // SAFETY: single-threaded EL2 (see STATE).
+    let s = unsafe { &mut *STATE.0.get() };
+    if s.ser_out_fh < 0 {
+        return;
+    }
+    if s.ser_tx_len == SERIAL_TX_BUF {
+        serial_flush_tx(s);
+    }
+    s.ser_tx[s.ser_tx_len] = b;
+    s.ser_tx_len += 1;
+}
+
+fn serial_flush_tx(s: &mut State) {
+    if s.ser_tx_len == 0 || s.ser_out_fh < 0 {
+        return;
+    }
+    let _ = sh_write(s.ser_out_fh, &s.ser_tx[..s.ser_tx_len]);
+    s.ser_tx_len = 0;
+}
+
+/// Pop one host→guest serial byte from the RX ring.
+fn serial_rx() -> Option<u8> {
+    if !INITIALISED.load(Ordering::Acquire) {
+        return None;
+    }
+    // SAFETY: single-threaded EL2 (see STATE).
+    let s = unsafe { &mut *STATE.0.get() };
+    if s.ser_rx_len == 0 {
+        return None;
+    }
+    let b = s.ser_rx[s.ser_rx_head];
+    s.ser_rx_head = (s.ser_rx_head + 1) % SERIAL_RX_BUF;
+    s.ser_rx_len -= 1;
+    Some(b)
+}
+
+/// Flush pending TX and refill the RX ring from `serial-in`. Called
+/// from `pump_input` on its 16 ms cadence.
+fn pump_serial(s: &mut State) {
+    serial_flush_tx(s);
+    if s.ser_in_fh < 0 || s.ser_rx_len == SERIAL_RX_BUF {
+        return;
+    }
+    let len = sh_flen(s.ser_in_fh);
+    if len < 0 {
+        return;
+    }
+    let len = len as u64;
+    // A restarted bridge truncates `serial-in`; re-tail from the new
+    // beginning rather than waiting for the file to outgrow the stale
+    // offset.
+    if len < s.ser_in_pos {
+        s.ser_in_pos = 0;
+    }
+    if len <= s.ser_in_pos {
+        return;
+    }
+    let space = SERIAL_RX_BUF - s.ser_rx_len;
+    let want = (len - s.ser_in_pos).min(space as u64).min(BUF_LEN as u64) as usize;
+    if sh_seek(s.ser_in_fh, s.ser_in_pos as i64) < 0 {
+        return;
+    }
+    let buf = scratch_buf();
+    let n = sh_read(s.ser_in_fh, &mut buf[..want]);
+    let got = want.saturating_sub(n);
+    if got == 0 {
+        return;
+    }
+    s.ser_in_pos = s.ser_in_pos.wrapping_add(got as u64);
+    for &b in &buf[..got] {
+        let tail = (s.ser_rx_head + s.ser_rx_len) % SERIAL_RX_BUF;
+        s.ser_rx[tail] = b;
+        s.ser_rx_len += 1;
+    }
+    log_host_io!("host_io: serial rx +{} B (ring={})", got, s.ser_rx_len);
+}
+
 // ---- scratch + semihosting helpers ----
 
 const BUF_LEN: usize = 4096;
@@ -294,7 +461,7 @@ fn ensure_output_dir() {
     // opens fire — otherwise a first-run with the viewer not yet
     // started leaves the inbound channel disabled until the next
     // reboot.
-    let cmd = b"mkdir -p /tmp/newton-host-io && touch /tmp/newton-host-io/in /tmp/newton-host-io/out\0";
+    let cmd = b"mkdir -p /tmp/newton-host-io && touch /tmp/newton-host-io/in /tmp/newton-host-io/out /tmp/newton-host-io/serial-in /tmp/newton-host-io/serial-out\0";
     let args: [u64; 2] = [cmd.as_ptr() as u64, (cmd.len() - 1) as u64];
     let _ = unsafe { semihost(SYS_SYSTEM, args.as_ptr()) };
 }

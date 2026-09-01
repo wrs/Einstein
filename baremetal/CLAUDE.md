@@ -70,7 +70,7 @@ below — read the relevant one before acting, don't re-derive it.
 ```bash
 rm -f /tmp/newton-snapshot-*.bin && cargo run --release   # cold boot on QEMU
 scripts/boot-check.sh --cold                              # headless boot verify
-guest-tests/scripts/run-all.sh                            # 38 guest tests (QEMU)
+guest-tests/scripts/run-all.sh                            # 39 guest tests (QEMU)
 guest-tests/scripts/run-all.sh --platform fvp             # same on FVP
 scripts/check-matrix.sh                                   # 19 build combos + lints
 

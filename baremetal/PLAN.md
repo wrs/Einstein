@@ -6,8 +6,8 @@ The 717006 ROM boots through kernel, scheduler and NewtonScript
 interpreter to the Welcome UI, and the builtin apps work
 interactively — on QEMU `raspi3b`, on ARM FVP, and on a real
 Pi Zero 2 W with HDMI display, USB touch, HDMI audio and SD-backed
-flash persistence. All 38 guest tests are green on QEMU; on FVP 37 of
-38 (`test_swp_rom_aperture` gives NO-VERDICT — item 8 below); all
+flash persistence. All 39 guest tests are green on QEMU; on FVP 38 of
+39 (`test_swp_rom_aperture` gives NO-VERDICT — item 8 below); all
 build combinations in `scripts/check-matrix.sh` pass.
 
 ## Standing rules
@@ -19,7 +19,7 @@ build combinations in `scripts/check-matrix.sh` pass.
   incompatibilities are resolved by normalising the guest's own
   descriptors in place (`HIGHLEVEL.md` §4.3).
 - Every commit that touches hypervisor functionality (not merely
-  diagnostics) must pass `guest-tests/scripts/run-all.sh`, all 38
+  diagnostics) must pass `guest-tests/scripts/run-all.sh`, all 39
   tests. Fix warnings before committing.
 - Unknown inputs on emulation paths halt loudly with a context dump.
   Never add a silent default to quiet a halt — the halt is the
@@ -36,6 +36,16 @@ build combinations in `scripts/check-matrix.sh` pass.
    stage-2 RW+XN ↔ RO+X rescan guarantees, how to triage a wedge PC in
    RAM) is [`docs/PACKAGE_NATIVE_CODE.md`](docs/PACKAGE_NATIVE_CODE.md).
 
+   Delivery is no longer the blocker: packages now arrive over the
+   guest serial port (README "External serial port" — UnixNPI +
+   `scripts/serial-pty-bridge.py`, UI driven headlessly with
+   `scripts/host-io-tool.py`). First datapoints, both with
+   byte-perfect transfer, per-frame MNP acks and a clean Dock
+   teardown: `Ser115200.pkg` (NewtDevEnv-built) → `kDResult`
+   −48402 "Expected a string"; `ROMDumper.pkg` → −10606 "Object not
+   found". The failure is in the guest-side install/activation path,
+   after the bytes land.
+
 2. **Snapshot resume — fix or remove.** Saving works, and the two-run
    `test_snapshot_resume` guest test resumes correctly; resuming the
    *Newton ROM* does not. The resumed guest ERETs to the saved PC and
@@ -51,8 +61,13 @@ build combinations in `scripts/check-matrix.sh` pass.
 
 3. **Guest serial port on real hardware.** PL011 carries the kernel
    log; the guest's own serial port needs a separate host-side
-   sink/source. Channels 0/1 already route through the guest DMA model
-   on the emulated hosts.
+   sink/source. On the emulated hosts this is done: the extr port
+   flows through the `host-io-semihost` file pair and
+   `scripts/serial-pty-bridge.py` (README "External serial port";
+   transport verified end-to-end with UnixNPI). On the Pi the
+   remaining options are a mini-UART driver (second physical port —
+   none exists in `src/` today) or framed multiplexing on the single
+   PL011 alongside the kernel log, `serial_pen.rs`-style.
 
 4. **PCMCIA card images.** Newton flash-card images map naturally onto
    files on the SD card through the existing `flash_persist` backend;
@@ -265,12 +280,12 @@ files); the viewer posts mouse events back as pen samples. Enable with
 - `src/host/{sd,usb,input,audio,display,host_dma}` — real-hardware
   stacks; `src/host/flash_persist/` — SD-backed flash with DMA
   autosave.
-- `guest-tests/tests/` — 38 tests; `guest-tests/scripts/run-all.sh`.
+- `guest-tests/tests/` — 39 tests; `guest-tests/scripts/run-all.sh`.
 
 ## Verification
 
 ```
-guest-tests/scripts/run-all.sh                 # 38 tests, QEMU
+guest-tests/scripts/run-all.sh                 # 39 tests, QEMU
 guest-tests/scripts/run-all.sh --platform fvp  # same on FVP
 CHECK_MATRIX=1 guest-tests/scripts/run-all.sh  # + the 18-combo build matrix
 scripts/boot-check.sh --cold                   # ROM boot to the Welcome UI

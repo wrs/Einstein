@@ -45,8 +45,18 @@ if [[ "${DEBUG:-0}" == "1" || "$gdb_flag" == "1" ]]; then
 fi
 
 # QEMU's raspi3b routes the first `-serial` to the PL011 and the second to
-# the mini-UART. We use PL011 for the console.
-#
+# the mini-UART. The PL011 is the guest's external serial port (`extr`);
+# the debug log goes out over semihosting, so redirecting the PL011
+# chardev exposes the Newton's serial wire to host tools without
+# touching the log. NH_SERIAL0 overrides the chardev spec:
+#   NH_SERIAL0=pty                        pty for NCX / UnixNPI / minicom
+#   NH_SERIAL0=tcp:127.0.0.1:3679        client, e.g. NTK in BasiliskII
+#                                         (seriala tcp:3679)
+#   NH_SERIAL0=telnet:127.0.0.1:5556,server,nowait   ad-hoc poking
+# Default keeps the historic behaviour (serial + monitor muxed on stdio,
+# which boot-check.sh and the guest-test harness grep).
+serial0="${NH_SERIAL0:-mon:stdio}"
+
 # Semihosting is enabled so the hypervisor can save/load snapshots via
 # HLT #0xF000 (see src/hv/snapshot.rs). target=native makes the hypervisor
 # itself own the semihosting surface; paths are resolved against the
@@ -54,7 +64,7 @@ fi
 exec qemu-system-aarch64 \
     -M raspi3b \
     -kernel "$img" \
-    -serial mon:stdio \
+    -serial "$serial0" \
     -display none \
     -no-reboot \
     -semihosting-config enable=on,target=native \

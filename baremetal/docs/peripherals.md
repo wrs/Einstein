@@ -150,7 +150,12 @@ Shape:
 
 - Bank 1 channel regs: `0x0F08_0000` .. `0x0F08_FBFF` (8 channels × 8
   regs, 4 B each, channel stride = 0x2000, reg stride = 0x400).
-- Bank 2 channel regs: `0x0F09_0000` .. `0x0F09_7FFF` (same layout).
+- Bank 2 channel regs: `0x0F09_0000` .. `0x0F09_7FFF` — **not** the
+  same layout: channel stride = 0x1000, 4 regs
+  (`channel = addr >> 12`, `reg = (addr & 0x0C00) >> 10`, Einstein
+  `TMemory.cpp:884-888`). Decoding bank 2 with bank 1's stride
+  misroutes the TX-channel control writes (`ch1 b2r0`) into phantom
+  ch0 registers and the extr port never transmits.
 - Chip-wide:
   - `0x0F08_FC00` — channel-assignment register (R/W).
   - `0x0F09_8000` — enable / status (W-enable, R-status).
@@ -181,18 +186,30 @@ meanings match Einstein's `TBasicSerialPortManager::{Read,Write}
 642-891`):
 
 - bank 1 reg 0 — buffer base PA
-- bank 1 reg 1 — current data PA (advanced per byte, wraps at
-  `buf_start + buf_size`)
+- bank 1 reg 1 — current data PA (advanced per byte)
 - bank 1 reg 4 — countdown (bytes remaining)
-- bank 1 reg 5 — ring size
+- bank 1 reg 5 — bytes until the ring's wrap point, measured from the
+  reg-1 pointer current at write time (the kernel writes reg 1 before
+  reg 5). The model latches `ring_end = data_ptr + value`; when the
+  advancing pointer reaches it, the pointer wraps to `buf_start` and
+  the distance resets to the full ring. Einstein instead decrements
+  its size counter, wraps when it hits zero, and never resets it —
+  after one ring's worth of data its pointer runs off the buffer end
+  and silently corrupts adjacent guest RAM (that latent bug is why a
+  >1 KiB Dock package transfer failed here until the wrap point was
+  made explicit).
 - bank 2 reg 0 — control (bit `0x02` = "DMA enabled")
 - bank 2 reg 1 — event/interrupt-reason (RX completion = `0x40`,
   TX completion = `0x80`)
 - bank 2 reg 2 — write-to-clear of bank 2 reg 1
 
 TX (ch1) drains synchronously on the chip-wide enable-register
-write; RX (ch0) is polled from `trap_irq` and deposits bytes when
-the host UART has data and the channel is armed. Completion IRQs
+write; RX (ch0) is polled from the trap tails — the sync-trap tail
+as well as `trap_irq`, because guest IRQs are delivered as
+`HCR_EL2.VI` virtual interrupts without an EL2 trap, so during a
+serial session the IRQ tail alone can go seconds without running
+while the guest's MNP link timer expects a reply within its
+retransmit window. Completion IRQs
 (`INT_DMA_CH0 = 0x80`, `INT_DMA_CH1 = 0x100`) fire only when bytes
 actually move — **not** on the bare enable write, since the
 kernel re-arms DMA from inside its own FIQ handler and a
@@ -202,6 +219,31 @@ This is important: the Newton kernel's DMA driver manages the
 transfer state machine in software; Einstein's model is almost an
 API stub for chip-wide registers but stateful for the per-channel
 serial registers.
+
+### External-serial host transport
+
+The byte endpoints behind channels 0/1 are the
+`peripherals::console` seam, and which host wire it lands on depends
+on the host-io backend (`main.rs` boot wiring):
+
+- **`host-io-semihost` (QEMU / FVP)** — the
+  `/tmp/newton-host-io/serial-{out,in}` file pair, pumped on the
+  16 ms host-io cadence (`host_io/semihost.rs`).
+  `scripts/serial-pty-bridge.py` exposes the pair as a pty (NCX,
+  UnixNPI, minicom) or an outbound TCP connection (NTK in BasiliskII
+  listening on 3679). The QEMU PL011 chardev is deliberately *not*
+  used: its RX side starves under this hypervisor's load (see
+  `docs/QEMU_BUGS.md` "PL011 chardev RX starvation").
+- **everything else** — the host PL011 (`host::console::write_byte` /
+  `read_byte_nonblock`), i.e. the physical UART on real hardware.
+  This is PLAN.md item 3: on the Pi the same PL011 also carries the
+  kernel log.
+
+Traffic on the wire is the Newton's own MNP-framed Dock protocol —
+the transport moves bytes; MNP/Dock live in the ROM and in the
+desktop tool. Verified end-to-end with UnixNPI: full Dock handshake
+(LR/LR-resp, `rtdk`/`dock`/`stim`/`dres`), multi-KiB `lpkg` package
+transfer with per-frame LA acks, clean `disc`/LD teardown.
 
 ## ARM processor interrupt callbacks
 
@@ -214,9 +256,11 @@ method call is needed.
 ## Things we deliberately don't model yet
 
 - `TSerialPorts` for the non-extr ports (`infr`, `tblt`, `mdem`) —
-  the external-serial port (`extr`) is wired through to the host
-  PL011 via DMA channels 0/1; the other three TSerialChipVoyager
-  windows still return idle/no-data.
+  the external-serial port (`extr`) is wired through the
+  `peripherals::console` seam via DMA channels 0/1 (host-io serial
+  files on QEMU/FVP, PL011 otherwise — see "External-serial host
+  transport" above); the other three TSerialChipVoyager windows
+  still return idle/no-data.
 - `TPCMCIAController` — two 256 MiB socket windows at
   `0x3000_0000..0x4000_0000` (slot 0, `kPCMCIA0Base`) and
   `0x4000_0000..0x5000_0000` (slot 1, `kPCMCIA1Base`). Einstein

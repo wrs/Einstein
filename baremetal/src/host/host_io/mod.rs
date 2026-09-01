@@ -84,6 +84,27 @@ pub trait HostIo: Sync {
         None
     }
 
+    /// Emit one guest external-serial (`extr`) TX byte on the
+    /// backend's serial transport. Backends without one drop the byte
+    /// — same contract as an uninstalled `peripherals::console` seam
+    /// (an unplugged cable, not a fault). Must be non-blocking beyond
+    /// a bounded buffer flush: callers run inside trap handlers.
+    ///
+    /// Only the semihost backend routes the guest serial wire through
+    /// host-io (the file-pair transport); every other backend keeps it
+    /// on the PL011 (`main.rs` wires the `peripherals::console` seam
+    /// accordingly), so these two methods exist only there.
+    #[cfg(nh_host_io_semihost)]
+    fn serial_tx(&self, _b: u8) {}
+
+    /// Non-blocking pop of one host→guest external-serial byte, or
+    /// `None` when no data is pending (or the backend has no serial
+    /// transport).
+    #[cfg(nh_host_io_semihost)]
+    fn serial_rx(&self) -> Option<u8> {
+        None
+    }
+
     /// Where the Newton surface lands on the backend's physical panel,
     /// for the touch-input calibration transform. `None` when the
     /// backend has no physical panel (null, semihost) or the panel
@@ -315,6 +336,21 @@ pub fn pop_pen_sample() -> Option<(u32, u32)> {
 /// Pump the backend's input transport — see [`HostIo::pump_input`].
 pub fn pump_input() {
     BACKEND.pump_input();
+}
+
+/// Guest external-serial TX byte → backend serial transport — see
+/// [`HostIo::serial_tx`]. Installed as the `peripherals::console` TX
+/// endpoint by `main.rs` on the semihost backend (the only one that
+/// routes guest serial through host-io).
+#[cfg(nh_host_io_semihost)]
+pub fn serial_tx(b: u8) {
+    BACKEND.serial_tx(b);
+}
+
+/// Non-blocking host→guest serial byte — see [`HostIo::serial_rx`].
+#[cfg(nh_host_io_semihost)]
+pub fn serial_rx() -> Option<u8> {
+    BACKEND.serial_rx()
 }
 
 /// Whether the active backend consumes blit payloads — see

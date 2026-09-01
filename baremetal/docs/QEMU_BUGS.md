@@ -202,3 +202,39 @@ The Ctrl-C symptom in interactive runs has the same root cause —
 `scripts/run-qemu.sh` was updated in iter-58 from `-serial stdio`
 to `-serial mon:stdio` so Ctrl-A x quits cleanly; Ctrl-C still
 won't reliably kill semihosting QEMU.
+
+## PL011 chardev RX starvation under trap-heavy vCPU load
+
+Symptom: with the guest's `extr` serial routed to the PL011 and the
+PL011 chardev redirected off stdio (`NH_SERIAL0=pty` or
+`tcp:...,server=on`), guest→host TX flows normally but host→guest
+bytes are delivered into the PL011 RX FIFO only sporadically — in
+practice only when they race back within the same instant the vCPU
+is already busy on PL011 MMIO. A 31-byte MNP reply written to the
+socket sat undelivered for 9+ s (FR stayed RXFE-empty across the
+whole window) while the guest's MNP link timer expired and the Dock
+connect failed. Verified against qemu 10.1.1: `pl011_can_receive`
+gates only on FIFO fill, so the stall is in chardev→frontend
+delivery, i.e. the iothread not getting to run its poll loop while
+our vCPU thread hammers semihosting calls and MMIO traps (each of
+which bounces the BQL).
+
+Consequences:
+
+- Do not build guest-serial RX on the QEMU PL011 chardev. The
+  `host-io-semihost` backend carries the extr wire over the
+  `/tmp/newton-host-io/serial-{out,in}` file pair instead, pumped
+  from our own trap tail (`src/host/host_io/semihost.rs`), which
+  makes RX liveness independent of QEMU's iothread scheduling.
+- `NH_SERIAL0` in `scripts/run-qemu.sh` still lets you redirect the
+  PL011 chardev for experiments; expect TX-only to be reliable.
+
+Discovered 2026-09-01 while bringing up the Dock/NTK serial
+transport; also the reason `~p` pen injection (`serial-pen-inject`)
+is a real-hardware feature, not a QEMU one.
+
+Related pty pitfall (host-side, not QEMU): a bridge built on
+`os.openpty()` must put the pty in raw mode (`tty.setraw`) — the
+default line discipline ECHOes every byte written into the master
+back to the master, which bounces all Newton-bound traffic straight
+back into the guest and garbles the MNP stream.

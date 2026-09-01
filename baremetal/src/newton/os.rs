@@ -735,6 +735,15 @@ impl GuestOs for NewtonOs {
         // heartbeat. Cheap: backend self-throttles to 16 ms wall.
         (host_pumps().host_io_pump_input)();
         (host_pumps().input_pump)();
+        // Serial RX/TX pumps must run from the sync tail, not just the
+        // IRQ tail: guest interrupts are delivered as HCR_EL2.VI
+        // virtual IRQs without trapping to EL2, so `on_irq_tail` fires
+        // only on EL2-physical timer events — during a serial session
+        // that can be seconds apart, while the guest's MNP link timer
+        // expects replies within its retransmit window. Both calls
+        // no-op unless the guest has the DMA channel armed.
+        crate::peripherals::dma::poll_rx();
+        crate::peripherals::dma::poll_tx();
         // (Audio is deliberately not pumped from the trap tail. Cyclic
         // DMA drives MAI from a hardware-paced CB chain, so refills
         // happen from `audio::on_mai_dma_done` — the DMA

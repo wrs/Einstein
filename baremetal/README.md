@@ -214,6 +214,52 @@ the same paths work — start the FVP run with `scripts/fvp` from
 term 1, viewer from term 2 on the host. Path resolution goes
 through semihosting in both cases.
 
+### External serial port — package install, NCX, NTK
+
+With the `host-io-semihost` backend the guest's external serial port
+(`extr`) is carried over a second file pair in the same IPC
+directory, `/tmp/newton-host-io/serial-{out,in}`, and
+`scripts/serial-pty-bridge.py` exposes it to desktop tools. The wire
+speaks the Newton's own MNP-framed Dock protocol; the hypervisor
+just moves bytes. (Don't route it through the QEMU PL011 chardev —
+RX starves; see `docs/QEMU_BUGS.md`.)
+
+Install a package with [UnixNPI](https://github.com/chuma/unixnpi):
+
+```
+# term 1 — hypervisor (same build as the live-display setup)
+rm -f /tmp/newton-snapshot-*.bin
+cargo run --release --no-default-features \
+    --features 'platform-raspi3b rom-717006 diag host-io-semihost'
+
+# term 2 — pty bridge (leave running)
+scripts/serial-pty-bridge.py            # -> /tmp/newton-host-io/extr.pty
+
+# term 3 — start the installer, THEN tap Connect in the Dock app
+unixnpi -d /tmp/newton-host-io/extr.pty MyApp.pkg
+```
+
+On the Newton: Extras → Dock → "Connect via Serial" → Connect. Start
+the desktop tool first — the Dock gives up after ~20 s without a
+response. NCX's Einstein named-pipe endpoint doesn't apply here; use
+its serial mode against the pty, or UnixNPI.
+
+For NTK, run Matthias Melcher's BasiliskII build with
+`seriala tcp:3679` in `~/.basilisk_ii_prefs` and bridge with
+`scripts/serial-pty-bridge.py --connect 127.0.0.1:3679` (the same
+topology as Einstein's TCP serial driver; see
+messagepad.org/Newton_Script_NTK.html for the NTK-side walkthrough).
+
+`scripts/host-io-tool.py` drives the guest UI headlessly against the
+same IPC files (`screen` renders the blit stream to a PNG; `tap` /
+`drag` / `power` inject pen and power events) — useful for scripted
+Dock sessions without the viewer.
+
+Transfer works end-to-end (multi-KiB packages arrive byte-perfect,
+clean session teardown); actually *activating* an installed package
+still fails inside the guest — that's PLAN.md item 1, the known
+package-loader gap, now unblocked for investigation.
+
 ### Snapshots
 
 `/tmp/newton-snapshot-{0..3}.bin` holds a rolling ring of four

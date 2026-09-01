@@ -95,6 +95,18 @@ pub extern "C" fn kmain() -> ! {
     // shim (`host::serial_pen`) so `~p<x>,<y>` lines on the console
     // wire inject pen taps instead of reaching the guest; without the
     // feature the wiring is byte-identical to before.
+    //
+    // On the semihost host-io backend the guest serial wire is the
+    // `serial-{out,in}` file pair (see `host_io/semihost.rs` for why
+    // the PL011 chardev is not usable for RX there), bridged to a pty
+    // or TCP endpoint by `scripts/serial-pty-bridge.py`. Everywhere
+    // else it stays the PL011.
+    #[cfg(nh_host_io_semihost)]
+    peripherals::console::install(peripherals::console::GuestConsoleOps {
+        tx: host::host_io::serial_tx,
+        rx: host::host_io::serial_rx,
+    });
+    #[cfg(not(nh_host_io_semihost))]
     peripherals::console::install(peripherals::console::GuestConsoleOps {
         tx: host::console::write_byte,
         #[cfg(not(feature = "serial-pen-inject"))]

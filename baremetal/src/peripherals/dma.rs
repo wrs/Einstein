@@ -21,7 +21,9 @@
 //!   bank1 reg 1 — mRx/TxDMAPhysicalData (current PA)
 //!   bank1 reg 3 — written 0x80 (RX) / 0xC0 (TX) — ignored (purpose unknown)
 //!   bank1 reg 4 — mRx/TxDMADataCountdown (bytes left)
-//!   bank1 reg 5 — mRx/TxDMABufferSize (ring size, wraps at end)
+//!   bank1 reg 5 — mRx/TxDMABufferSize (bytes until the ring wrap
+//!                 point; see `ChannelState::ring_end` for where our
+//!                 wrap handling deliberately diverges from Einstein's)
 //!   bank1 reg 6 — RX writes 0xFF, TX writes 0 — ignored
 //!   bank2 reg 0 — mRx/TxDMAControl (bit 0x02 = "DMA enabled")
 //!   bank2 reg 1 — mRx/TxDMAEvent (RX completion = 0x40, TX completion = 0x80)
@@ -70,7 +72,12 @@ const BANK1_END: u64 = 0x0F08_FC00;
 /// return the last write. Einstein `TDMAManager.cpp:69-95`.
 const K_HDWR_ASSIGN: u64 = 0x0F08_FC00;
 
-/// Bank 2 channel-register window (same layout as bank 1).
+/// Bank 2 channel-register window. NOT the same layout as bank 1:
+/// the channel stride is 0x1000 with 4 registers (Einstein
+/// `TMemory.cpp:884-888` decodes `channel = addr >> 12`,
+/// `reg = (addr & 0x0C00) >> 10`). Getting this wrong misroutes the
+/// TX-channel control writes (`ch1 b2r0`) into phantom ch0 registers
+/// and the port never transmits.
 const BANK2_BASE: u64 = 0x0F09_0000;
 const BANK2_END: u64 = 0x0F09_8000;
 
@@ -106,9 +113,18 @@ struct ChannelState {
     /// Bank 1 register 4 — bytes remaining in this DMA request. Hits 0
     /// → completion IRQ fires.
     countdown: u32,
-    /// Bank 1 register 5 — ring buffer size in bytes (used to wrap
-    /// `data_ptr`).
+    /// Bank 1 register 5 — bytes until the ring's wrap point from the
+    /// `data_ptr` current at write time. Decrements per byte moved;
+    /// reset to the full ring length (`ring_end - buf_start`) on wrap.
     buf_size: u32,
+    /// Wrap point PA: `data_ptr + buf_size` latched when bank 1
+    /// register 5 is written (the kernel writes reg 1 before reg 5).
+    /// Einstein instead wraps when its decremented size counter hits 0
+    /// and never resets it — after the first wrap its ring pointer
+    /// runs off the end of the buffer, silently corrupting whatever
+    /// follows once a session moves more than one ring's worth of
+    /// data. The explicit wrap point avoids that.
+    ring_end: u32,
     /// Bank 2 register 0 — control register. Bit `0x02` = "DMA
     /// enabled" (Einstein `TPtySerialPortManager.cpp:194` checks
     /// `mTxDMAControl & 0x00000002`).
@@ -150,6 +166,7 @@ static DMA: DmaCell = DmaCell(UnsafeCell::new(DmaState {
         data_ptr: 0,
         countdown: 0,
         buf_size: 0,
+        ring_end: 0,
         control: 0,
         event: 0,
         armed: false,
@@ -184,18 +201,19 @@ fn is_channel_reg(ipa: u64) -> bool {
 }
 
 /// Decode a per-channel-register IPA into `(bank, channel, register)`.
-/// Bank is 1 or 2; channel is 0..7; register is 0..7. Caller must have
-/// already verified `is_channel_reg(ipa)`.
+/// Bank is 1 or 2; channel is 0..7. The two banks have different
+/// layouts (Einstein `TMemory.cpp:877-888`): bank 1 has a 0x2000
+/// channel stride with 8 registers (`reg = (addr & 0x1C00) >> 10`),
+/// bank 2 a 0x1000 stride with 4 (`reg = (addr & 0x0C00) >> 10`).
+/// Caller must have already verified `is_channel_reg(ipa)`.
 fn split_channel_reg(ipa: u64) -> (u32, u32, u32) {
-    let (bank, base) = if (BANK1_BASE..BANK1_END).contains(&ipa) {
-        (1u32, BANK1_BASE)
+    if (BANK1_BASE..BANK1_END).contains(&ipa) {
+        let rel = ipa - BANK1_BASE;
+        (1, (rel >> 13) as u32, ((rel & 0x1C00) >> 10) as u32)
     } else {
-        (2u32, BANK2_BASE)
-    };
-    let rel = ipa - base;
-    let channel = (rel / 0x2000) as u32;
-    let register = ((rel % 0x2000) / 0x400) as u32;
-    (bank, channel, register)
+        let rel = ipa - BANK2_BASE;
+        (2, (rel >> 12) as u32, ((rel & 0x0C00) >> 10) as u32)
+    }
 }
 
 fn read(ipa: u64) -> u32 {
@@ -270,7 +288,12 @@ fn write_channel_reg(s: &mut DmaState, bank: u32, channel: u32, register: u32, v
         (1, 1) => ch.data_ptr = value,
         (1, 3) | (1, 6) => { /* purpose unknown per Einstein; ignored */ }
         (1, 4) => ch.countdown = value,
-        (1, 5) => ch.buf_size = value,
+        (1, 5) => {
+            ch.buf_size = value;
+            // Latch the wrap point (see `ChannelState::ring_end`); the
+            // kernel writes reg 1 (current PA) before reg 5.
+            ch.ring_end = ch.data_ptr.wrapping_add(value);
+        }
         (2, 0) => ch.control = value,
         (2, 1) => ch.event = value,
         (2, 2) => ch.event &= !value, // write-to-clear (Einstein TBSPM.cpp:751,881)
@@ -368,10 +391,12 @@ fn drain_tx_channel(s: &mut DmaState, ch_idx: u32) {
         console::tx(byte);
         ch.data_ptr = ch.data_ptr.wrapping_add(1);
         ch.buf_size = ch.buf_size.wrapping_sub(1);
-        if ch.buf_size == 0 {
-            // Wrap back to the buffer's start PA, matching Einstein's
-            // `mTxDMAPhysicalData = mTxDMAPhysicalBufferStart`.
+        if ch.data_ptr == ch.ring_end {
+            // Wrap back to the buffer's start PA; the next wrap is a
+            // full ring away (see `ChannelState::ring_end` for why
+            // this diverges from Einstein's size-counter wrap).
             ch.data_ptr = ch.buf_start;
+            ch.buf_size = ch.ring_end.wrapping_sub(ch.buf_start);
         }
         ch.countdown = ch.countdown.wrapping_sub(1);
         drained += 1;
@@ -380,6 +405,12 @@ fn drain_tx_channel(s: &mut DmaState, ch_idx: u32) {
         if drained >= 4096 {
             break;
         }
+    }
+    if drained > 0 {
+        crate::dprintln!(
+            "dma[ch1] TX -{} B (ptr={:#010x} cnt={:#x} size={:#x})",
+            drained, ch.data_ptr, ch.countdown, ch.buf_size
+        );
     }
     if ch.countdown == 0 {
         // Buffer empty — fire TX completion. mTxDMAEvent=0x80,
@@ -402,13 +433,19 @@ pub fn poll_rx() {
         return;
     }
     let mut deposited = 0u32;
+    let mut peek = [0u8; 24];
     while ch.countdown > 0 {
         let Some(byte) = console::rx() else { break };
+        if (deposited as usize) < peek.len() {
+            peek[deposited as usize] = byte;
+        }
         guest_endian::guest_write_u8_pa(ch.data_ptr, byte);
         ch.data_ptr = ch.data_ptr.wrapping_add(1);
         ch.buf_size = ch.buf_size.wrapping_sub(1);
-        if ch.buf_size == 0 {
+        if ch.data_ptr == ch.ring_end {
+            // See the TX-side wrap comment in `drain_tx_channel`.
             ch.data_ptr = ch.buf_start;
+            ch.buf_size = ch.ring_end.wrapping_sub(ch.buf_start);
         }
         ch.countdown = ch.countdown.wrapping_sub(1);
         deposited += 1;
@@ -419,6 +456,11 @@ pub fn poll_rx() {
         }
     }
     if deposited > 0 {
+        crate::dprintln!(
+            "dma[ch0] RX +{} B (ptr={:#010x} cnt={:#x} size={:#x}) head={:02x?}",
+            deposited, ch.data_ptr, ch.countdown, ch.buf_size,
+            &peek[..(deposited as usize).min(peek.len())]
+        );
         ch.event |= 0x0000_0040;
         vic::raise(INT_DMA_CH0);
     }

@@ -51,6 +51,10 @@ mod reg {
     // bit 6: RX FIFO full, bit 5: RX byte available, bit 4: DCD, bit 3: CTS
     // — all left clear (idle line, no data waiting).
 
+    // Bit 0 of the +0x4800 RX-error/AllSent register: TX shift
+    // register drained.
+    pub const RX_ERR_ALL_SENT: u32 = 1 << 0;
+
     /// Control / interrupt-enable register offsets the kernel touches
     /// during `BasicBusControlRegInit` and the per-port
     /// `TVoyagerSerialPort` setup. The Newton 2.x kernel
@@ -110,8 +114,14 @@ fn read(ipa: u64) -> u32 {
         // immediately; "wait for RX byte" reading bit 5 never clears.
         reg::CTRL_4400_STATUS => reg::STATUS_TX_EMPTY,
 
-        // RX error status — no errors ever.
-        reg::CTRL_4800_RX_ERR => 0,
+        // RX error status (bits 7..4) — no errors ever. Bit 0 is
+        // AllSent: with no modeled TX FIFO depth every byte is on the
+        // wire the moment it's written, so the shifter is always
+        // drained. Einstein returns the same constant
+        // (`TBasicSerialPortManager::ReadRegister`, serialReg 0x4800
+        // → 0x01); the ROM's AllSent poll at 0x001D7A5C spins until
+        // this bit sets, so returning 0 wedges an output flush.
+        reg::CTRL_4800_RX_ERR => reg::RX_ERR_ALL_SENT,
 
         // No pending byte — a read of the RX FIFO returns 0 and
         // leaves the (empty) RX FIFO empty.

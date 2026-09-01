@@ -680,11 +680,18 @@ hypervisor in the `HYPERV.IMG` container it boots. Every rebuild after
 that goes over the USB-TTL cable, no card handling:
 
 ```
-cargo build --release --no-default-features --features pi-bare-metal-input
+cargo build --release --no-default-features --features "pi-bare-metal-input pi-fb-rot90"
 scripts/pi-upload.py --kernel target/aarch64-unknown-none-softfloat/release/newton-hypervisor \
     --until 'Welcome to NewtonScript' --timeout 120
 scripts/pi-upload.py --no-upload --until 'DMA save complete' --timeout 60   # power-cycle + capture only
 ```
+
+`pi-fb-rot90` pairs with the bench card's `display_hdmi_rotate=1`
+(portrait-mounted monitor); a build without it on a rotated card still
+*displays* correctly through the CPU-bilinear fallback but maps every
+touch transposed — flip the feature and the config.txt line together
+(see [`docs/REAL_HW_BRINGUP.md`](docs/REAL_HW_BRINGUP.md) "Portrait
+rotation").
 
 `pi-upload.py` power-cycles the board through the `Pi Off`/`Pi On`
 Shortcuts, sends only the bytes that changed (an rsync-style delta

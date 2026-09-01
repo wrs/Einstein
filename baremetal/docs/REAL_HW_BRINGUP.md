@@ -620,9 +620,16 @@ how the monitor is physically mounted.
   asserted as the mismatched-pair case (feature on, config.txt line
   off) — loud log, panel-native fallback, with a note that the touch
   map is still rotated. The reverse mismatch (config.txt on, feature
-  off) still paints wrong: the geometry checks reject the transposed
-  readback and the CPU fallback paints landscape under a rotated
-  scan-out.
+  off) is **deceptively quiet** (hardware-observed 2026-09-01): the
+  geometry checks reject the transposed readback, but the CPU
+  fallback then adopts the transposed 1080×1920 readback as its
+  panel-native surface and paints portrait — which the firmware's
+  scan-out rotation puts upright on the portrait-mounted panel, so
+  the picture looks *correct*. The only broken thing is touch: the
+  `Rot0` touch map inverts no rotation, so every tap lands
+  transposed. `pi_fb::init` detects the portrait readback under an
+  asserted `Rot0` and logs a loud WARNING naming the missing
+  feature.
 - **Geometry** (`display::fb::alloc_guest_surface`, `rot90` arm):
   the surface is allocated with the panel's *transposed* aspect and
   Newton's *width* pinned to the reserved-top allowance, since

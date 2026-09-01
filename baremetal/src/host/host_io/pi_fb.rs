@@ -423,6 +423,25 @@ fn init() {
         );
     }
 
+    // Reverse mismatch (config.txt rotation on, feature off): the one
+    // observable signal is the transposed physical-size readback, which
+    // reaches us here as a portrait panel-native surface. The picture
+    // happens to come out right — the fallback paints the portrait
+    // surface and the firmware's scan-out rotation puts it upright on
+    // the portrait-mounted panel — so without this line the only
+    // symptom is a transposed touch map (`input::calibrate` inverts
+    // the Rot0 identity instead of the active 90° CW scan-out).
+    if ROTATION == super::Rotation::Rot0 && info.height > info.width {
+        kprintln!(
+            "host_io_pi_fb: WARNING: portrait panel readback ({}x{}) means \
+             display_hdmi_rotate=1 is active in config.txt but this build \
+             lacks pi-fb-rot90 — the display will look correct but every \
+             touch will map TRANSPOSED; rebuild with pi-fb-rot90",
+            info.width,
+            info.height,
+        );
+    }
+
     // Panel-native surface (runtime fallback / pi-fb-force-cpu-scale):
     // CPU bilinear scaling, pre-Phase-3 behavior.
     //

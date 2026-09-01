@@ -84,7 +84,11 @@ scripts/check-matrix.sh                                   # 19 build combos + li
 # default-features build (cargo run, boot-check.sh) replaces the same
 # artifact with a semihost binary that hangs silently on hardware.
 # pi-upload refuses those (no pinned ROM blob), but don't rely on it.
-cargo build --release --no-default-features --features pi-bare-metal-input
+# pi-fb-rot90 matches the bench card's config.txt (display_hdmi_rotate=1,
+# portrait-mounted monitor) — without it the picture still looks right
+# but every touch maps transposed (docs/REAL_HW_BRINGUP.md "Portrait
+# rotation"); drop it only together with the config.txt line.
+cargo build --release --no-default-features --features "pi-bare-metal-input pi-fb-rot90"
 scripts/pi-upload.py --kernel target/aarch64-unknown-none-softfloat/release/newton-hypervisor \
   --until 'Welcome to NewtonScript' --timeout 120          # console → stdout + /tmp/newton-claude/serial.log
 scripts/pi-upload.py --no-upload                          # power-cycle and watch until Ctrl-C

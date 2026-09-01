@@ -112,6 +112,8 @@ pub const TAG_FB_SET_DEPTH: u32 = 0x0004_8005;
 pub const TAG_FB_SET_PIXEL_ORDER: u32 = 0x0004_8006;
 pub const TAG_FB_GET_PITCH: u32 = 0x0004_0008;
 pub const TAG_FB_SET_VIRTUAL_OFFSET: u32 = 0x0004_8009;
+pub const TAG_FB_GET_PALETTE: u32 = 0x0004_000B;
+pub const TAG_FB_SET_PALETTE: u32 = 0x0004_800B;
 
 /// Power-state tag — request `(device, state)`, response same
 /// shape. State bit 0 = on(1)/off(0), bit 1 = block until the
@@ -387,6 +389,39 @@ pub fn fb_set_pixel_order(order: u32) -> Result<u32, MailboxError> {
     let mut p = [order];
     send_one_tag(TAG_FB_SET_PIXEL_ORDER, &mut p)?;
     Ok(p[0])
+}
+
+/// Program `entries` into the 8 bpp palette starting at palette
+/// index `offset`. Each entry is a 32-bit RGBA value laid out as
+/// `u32::from_le_bytes([r, g, b, a])`; the HVS resolves each 8 bpp
+/// framebuffer byte through this table on scan-out.
+///
+/// Request payload per the property-interface spec: `offset`,
+/// `length`, then `length` palette words. The response's first value
+/// word is a validity flag — 0 = valid, 1 = invalid (out-of-range
+/// offset/length) — distinct from the per-tag bit-31 ack that
+/// `send_one_tag` already checks, so a nonzero flag is reported as
+/// `FirmwareError`. Chunked so each message fits [`Buffer`]:
+/// `send_one_tag` needs `2 + 3 + (2 + n) + 1 ≤ 64` words, so n ≤ 56
+/// entries per call.
+pub fn fb_set_palette(offset: u32, entries: &[u32]) -> Result<(), MailboxError> {
+    const CHUNK: usize = 56;
+    // 2 header words + CHUNK palette words.
+    let mut payload = [0u32; 2 + CHUNK];
+    let mut done = 0usize;
+    while done < entries.len() {
+        let n = (entries.len() - done).min(CHUNK);
+        payload[0] = offset + done as u32;
+        payload[1] = n as u32;
+        payload[2..2 + n].copy_from_slice(&entries[done..done + n]);
+        let p = &mut payload[..2 + n];
+        send_one_tag(TAG_FB_SET_PALETTE, p)?;
+        if p[0] != 0 {
+            return Err(MailboxError::FirmwareError);
+        }
+        done += n;
+    }
+    Ok(())
 }
 
 /// Set the virtual-offset (pan) of the visible region in the

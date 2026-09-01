@@ -17,10 +17,12 @@
 //!   whose height maps Newton 1:1 (e.g. 866×487 for a 1920×1080
 //!   mode) and the firmware/HVS scales it to the unchanged HDMI mode
 //!   on scan-out. `push_blit` then does no resampling at all: each
-//!   2 bpp GUEST_FB byte expands through a 4 KiB LUT into four XRGB
-//!   pixels copied as one 16-byte run, and only the damaged column
-//!   range per row is cache-cleaned (`dc cvac`, clean-only). Newton
-//!   sits centered horizontally, letterboxed black.
+//!   2 bpp GUEST_FB byte expands through a LUT into four panel
+//!   pixels — one u32 of gray-ramp palette indices on the 8 bpp
+//!   paletted surface (the default; see `display::fb`), or four XRGB
+//!   u32s on the 32 bpp fallback — and only the damaged column range
+//!   per row is cache-cleaned (`dc cvac`, clean-only). Newton sits
+//!   centered horizontally, letterboxed black.
 //! - **CPU bilinear (runtime fallback + `pi-fb-force-cpu-scale`).**
 //!   The pre-VC-path behavior: panel-native surface, Newton scaled
 //!   with software bilinear to an aspect-preserving rectangle
@@ -235,10 +237,11 @@ pub const RESERVED_TOP_PX: u32 = if cfg!(feature = "pi-fb-rot90") {
 /// [`EXPAND_LUT`] for the 1:1 path.
 const GRAY_TABLE: [u32; 4] = [255, 170, 85, 0];
 
-/// 1:1 expansion LUT for the VC-scaled path: one packed 2 bpp source
-/// byte (4 Newton pixels, MSB-first — pixel 0 in bits 7..6, matching
-/// `newton_gray`'s shift) → four XRGB u32 panel pixels, copied into
-/// the row as a single 16-byte run. 4 KiB, lives in .rodata.
+/// 1:1 expansion LUT for the VC-scaled path on a 32 bpp surface: one
+/// packed 2 bpp source byte (4 Newton pixels, MSB-first — pixel 0 in
+/// bits 7..6, matching `newton_gray`'s shift) → four XRGB u32 panel
+/// pixels, copied into the row as a single 16-byte run. 4 KiB, lives
+/// in .rodata.
 static EXPAND_LUT: [[u32; 4]; 256] = build_expand_lut();
 
 const fn build_expand_lut() -> [[u32; 4]; 256] {
@@ -252,6 +255,29 @@ const fn build_expand_lut() -> [[u32; 4]; 256] {
             lut[b][i] = u32::from_le_bytes([g, g, g, 0]);
             i += 1;
         }
+        b += 1;
+    }
+    lut
+}
+
+/// 1:1 expansion LUT for the 8 bpp paletted surface (the default —
+/// see `display::fb::alloc_guest_at`): one packed 2 bpp source byte →
+/// four gray-ramp palette indices, written as a single u32. A quarter
+/// of [`EXPAND_LUT`]'s write bandwidth. 1 KiB, lives in .rodata.
+static EXPAND_LUT8: [u32; 256] = build_expand_lut8();
+
+const fn build_expand_lut8() -> [u32; 256] {
+    let mut lut = [0u32; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        let mut bytes = [0u8; 4];
+        let mut i = 0usize;
+        while i < 4 {
+            let v = (b >> (6 - 2 * i)) & 0x3;
+            bytes[i] = crate::host::display::fb::gray_ramp_index(GRAY_TABLE[v]);
+            i += 1;
+        }
+        lut[b] = u32::from_le_bytes(bytes);
         b += 1;
     }
     lut
@@ -363,9 +389,10 @@ fn init() {
         // Boot-once geometry line — deliberately `kprintln!`, see the
         // fallback arm's comment.
         kprintln!(
-            "host_io_pi_fb: ready ({}x{} @ pa=0x{:x}, vc-scaled 1:1{}, newton {}x{} @ {},{})",
+            "host_io_pi_fb: ready ({}x{} {} bpp @ pa=0x{:x}, vc-scaled 1:1{}, newton {}x{} @ {},{})",
             info.width,
             info.height,
+            info.bpp,
             info.pa,
             if ROTATION == super::Rotation::Rot90 {
                 " rot90"
@@ -445,9 +472,10 @@ fn init() {
     // panel mode and painted-region geometry reach a hardware boot
     // capture. One-shot, so the recurring-log doctrine doesn't apply.
     kprintln!(
-        "host_io_pi_fb: ready ({}x{} @ pa=0x{:x}, newton {}x{} bilinear → painted {}x{} @ {},{}, scale Q16 x={} y={})",
+        "host_io_pi_fb: ready ({}x{} {} bpp @ pa=0x{:x}, newton {}x{} bilinear → painted {}x{} @ {},{}, scale Q16 x={} y={})",
         info.width,
         info.height,
+        info.bpp,
         info.pa,
         nw,
         nh,
@@ -582,13 +610,40 @@ fn paint_1to1(fb: &FbInfo, dst_left: u32, dst_top: u32, dst_right: u32, dst_bott
 
     let guest_fb = crate::hv::guest_mem::fb_host_pa() as *const u8;
     let stride = (newton_w() / 4) as usize;
-    let pitch_words = (fb.pitch / 4) as usize;
-    let panel_ptr = fb.pa as *mut u32;
 
     let xb0 = (dst_left / 4) as usize;
     let xb1 = (dst_right as usize).div_ceil(4).min(stride);
     let n_bytes = xb1 - xb0;
     let row_px0 = offset_x + xb0 * 4;
+
+    if fb.bpp == 8 {
+        // Paletted surface: one u32 of four palette-index bytes per
+        // source byte. The dst address is byte-granular (offset_x
+        // need not be 4-aligned), so write_unaligned — AArch64
+        // Normal-WB memory takes unaligned stores natively.
+        let pitch = fb.pitch as usize;
+        let panel_ptr = fb.pa as *mut u8;
+        for y in dst_top as usize..dst_bottom as usize {
+            // SAFETY: src as in the 32 bpp arm below. Dst: init
+            // guarantees offset_x + newton_w() ≤ fb.width ≤ pitch and
+            // offset_y + newton_h() ≤ fb.height, so every write lands
+            // inside [fb.pa, fb.pa+size).
+            unsafe {
+                let src = guest_fb.add(y * stride + xb0);
+                let dst = panel_ptr.add((y + offset_y) * pitch + row_px0);
+                for i in 0..n_bytes {
+                    let b = *src.add(i);
+                    (dst.add(i * 4) as *mut u32).write_unaligned(EXPAND_LUT8[b as usize]);
+                }
+            }
+            let row_pa = fb.pa.wrapping_add(((y + offset_y) * pitch + row_px0) as u64);
+            crate::arch::cpu::dc_cvac_range(row_pa, n_bytes * 4);
+        }
+        return;
+    }
+
+    let pitch_words = (fb.pitch / 4) as usize;
+    let panel_ptr = fb.pa as *mut u32;
 
     for y in dst_top as usize..dst_bottom as usize {
         // SAFETY: y < newton_h(), xb0..xb1 ≤ stride — inside the
@@ -643,6 +698,7 @@ fn paint_bilinear(fb: &FbInfo, dst_left: u32, dst_top: u32, dst_right: u32, dst_
     let stride = (nw / 4) as usize;
     let pitch_words = (fb.pitch / 4) as usize;
     let panel_ptr = fb.pa as *mut u32;
+    let pal8 = fb.bpp == 8;
 
     for py in p_top..p_bottom {
         let ny_q = py * inv_y;
@@ -669,16 +725,26 @@ fn paint_bilinear(fb: &FbInfo, dst_left: u32, dst_top: u32, dst_right: u32, dst_
             let top = g00 * (256 - nx_f) + g01 * nx_f;
             let bot = g10 * (256 - nx_f) + g11 * nx_f;
             let g = (top * (256 - ny_f) + bot * ny_f) >> 16;
-            let g8 = g.min(255) as u8;
-            let color = u32::from_le_bytes([g8, g8, g8, 0]);
+            let g8 = g.min(255);
 
             // SAFETY: panel_x < painted_w + offset_x ≤ fb.width,
             // panel_y < painted_h + offset_y ≤ fb.height (set in
-            // `init`). pitch_words = fb.pitch / 4.
-            unsafe {
-                panel_ptr
-                    .add(panel_y * pitch_words + panel_x)
-                    .write_volatile(color);
+            // `init`). pitch_words = fb.pitch / 4; on the paletted
+            // surface fb.width ≤ fb.pitch.
+            if pal8 {
+                unsafe {
+                    (fb.pa as *mut u8)
+                        .add(panel_y * fb.pitch as usize + panel_x)
+                        .write_volatile(crate::host::display::fb::gray_ramp_index(g8));
+                }
+            } else {
+                let g8 = g8 as u8;
+                let color = u32::from_le_bytes([g8, g8, g8, 0]);
+                unsafe {
+                    panel_ptr
+                        .add(panel_y * pitch_words + panel_x)
+                        .write_volatile(color);
+                }
             }
         }
     }
@@ -686,7 +752,7 @@ fn paint_bilinear(fb: &FbInfo, dst_left: u32, dst_top: u32, dst_right: u32, dst_
     // Flush the rows we touched so the VC scan picks them up.
     let flush_y0 = p_top as usize + offset_y;
     let flush_y1 = ((p_bottom as usize) + offset_y).min(fb.height as usize);
-    let row_bytes_panel = pitch_words * 4;
+    let row_bytes_panel = fb.pitch as usize;
     let flush_pa = fb.pa.wrapping_add((flush_y0 * row_bytes_panel) as u64);
     let flush_len = (flush_y1 - flush_y0) * row_bytes_panel;
     crate::arch::cpu::dc_civac_range(flush_pa, flush_len);

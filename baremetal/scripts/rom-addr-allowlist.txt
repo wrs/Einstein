@@ -47,12 +47,14 @@ src/host/mailbox.rs 0x00040001 # [hw] VC mailbox tag id
 src/host/mailbox.rs 0x00040002 # [hw] VC mailbox tag id
 src/host/mailbox.rs 0x00040003 # [hw] VC mailbox tag id
 src/host/mailbox.rs 0x00040008 # [hw] VC mailbox tag id
+src/host/mailbox.rs 0x0004000b # [hw] VC mailbox tag id
 src/host/mailbox.rs 0x00048001 # [hw] VC mailbox tag id
 src/host/mailbox.rs 0x00048003 # [hw] VC mailbox tag id
 src/host/mailbox.rs 0x00048004 # [hw] VC mailbox tag id
 src/host/mailbox.rs 0x00048005 # [hw] VC mailbox tag id
 src/host/mailbox.rs 0x00048006 # [hw] VC mailbox tag id
 src/host/mailbox.rs 0x00048009 # [hw] VC mailbox tag id
+src/host/mailbox.rs 0x0004800b # [hw] VC mailbox tag id
 src/host/sd/sdhost.rs 0xf00000 # [hw] SDHOST HC_VER field mask
 src/newton/loader.rs 0x000cc000 # [enc] Rd+Rn=R12 rewrite bits (NATIVE_PRIM)
 src/newton/loader.rs 0x000ff000 # [enc] Rd+Rn field mask (NATIVE_PRIM)

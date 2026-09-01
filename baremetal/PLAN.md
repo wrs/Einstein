@@ -133,13 +133,16 @@ build combinations in `scripts/check-matrix.sh` pass.
       `docs/REAL_HW_BRINGUP.md` "Hires Newton geometry". The
       Extras Rotate button no-op is the adjacent
       `SetFeature`(orientation) stub in `peripherals/screen.rs`.
-    - Deferred, in likely-value order: 8 bpp paletted surface
-      (needs `SET_PALETTE` in mailbox.rs; quarters write
-      bandwidth), double-buffered flips (`fb_set_virtual_offset`
-      is implemented and unused), DMA offload (host_dma.rs lacks
-      `TI_DEST_INC`/`TI_TDMODE`; low value while the CPU
-      format-converts), Normal-NC framebuffer remap (only if cache
-      maintenance ever dominates again).
+    - The 8 bpp paletted surface is in: guest scan-out surfaces
+      allocate at 8 bpp with a shared palette (`SET_PALETTE` in
+      mailbox.rs, gray ramp + color cube in `display/fb.rs`), loud
+      32 bpp fallback. Hardware-verified; Extras-animation
+      `push_blit` avg 679 → 312 µs.
+    - Deferred, in likely-value order: double-buffered flips
+      (`fb_set_virtual_offset` is implemented and unused), DMA
+      offload (host_dma.rs lacks `TI_DEST_INC`/`TI_TDMODE`; low
+      value while the CPU format-converts), Normal-NC framebuffer
+      remap (only if cache maintenance ever dominates again).
 
 11. **HDMI audio CTS mis-derived on high-clock sinks.**
     `cts_pixel_clock_hz` treats any >=80 MHz pixel-clock readback as

@@ -561,12 +561,14 @@ Peripherals manual):
 ```
   ┌─────────────────────────────────────────────────────┐
   │ host_io::pi_fb::push_blit                           │   ← consumes
-  │   2 bpp Newton FB rect → 32 bpp surface rect        │     screen.rs
-  │   VC-scaled: 1:1 LUT expand; fallback: bilinear     │     blits
+  │   2 bpp Newton FB rect → surface rect (8 bpp        │     screen.rs
+  │   palette indices; 32 bpp XRGB on fallback)         │     blits
+  │   VC-scaled: 1:1 LUT expand; fallback: bilinear     │
   ├─────────────────────────────────────────────────────┤
   │ display::fb::alloc_guest_surface + FbInfo           │   ← per-boot
   │   small VC-scaled surface (probe + runtime          │     allocation
-  │   fallback to panel-native), 32 bpp RGB, 4 KiB      │
+  │   fallback to panel-native), 8 bpp paletted         │
+  │   (SET_PALETTE gray ramp; loud 32 bpp fallback)     │
   ├─────────────────────────────────────────────────────┤
   │ mailbox::fb_setup_and_allocate (single batched msg) │   ← VC property
   ├─────────────────────────────────────────────────────┤

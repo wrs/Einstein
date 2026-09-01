@@ -2,9 +2,22 @@
 //!
 //! Setup is straightforward: query the panel's native size, ask VC
 //! to give us a framebuffer of that geometry, then talk to the
-//! returned base address. We use 32 bpp (XRGB / RGB888-with-pad)
-//! because that's what `host_io`'s blit path will eventually want
-//! and it avoids a bpp-conversion step per pixel.
+//! returned base address.
+//!
+//! Two pixel formats are in play:
+//!
+//! - **Guest scan-out surfaces** ([`alloc_guest_surface`]) are
+//!   **8 bpp paletted**: one byte per pixel, resolved through
+//!   [`PALETTE`] (a 6×6×6 color cube + 40-step gray ramp, programmed
+//!   via `mailbox::fb_set_palette`) by the HVS on scan-out. Newton
+//!   content is grayscale, so this quarters the paint path's write
+//!   bandwidth vs 32 bpp with no fidelity loss — the four Newton
+//!   gray levels land exactly on gray-ramp entries. If the firmware
+//!   refuses 8 bpp (or the palette write fails) the allocation falls
+//!   back loudly to 32 bpp; writers dispatch on [`FbInfo::bpp`].
+//! - **The probe surface** ([`alloc_native`], `fb-probe`) stays
+//!   32 bpp XRGB — it exists to validate channel packing, which a
+//!   palette would mask.
 //!
 //! VC returns a *bus* address. On the BCM2710 with `arm_64bit=1`
 //! the VC L2 cache is disabled, so:
@@ -35,9 +48,9 @@ pub struct FbInfo {
     pub width: u32,
     /// Height in pixels.
     pub height: u32,
-    /// Bytes per scanline. ≥ `width * 4` (firmware may pad rows).
+    /// Bytes per scanline. ≥ `width * bpp / 8` (firmware may pad rows).
     pub pitch: u32,
-    /// Bits per pixel. We always request 32.
+    /// Bits per pixel: 8 (paletted guest surface) or 32 (XRGB).
     pub bpp: u32,
     /// Total allocation size in bytes.
     pub size: u32,
@@ -55,6 +68,69 @@ impl From<mailbox::MailboxError> for FbError {
     fn from(e: mailbox::MailboxError) -> Self {
         FbError::Mailbox(e)
     }
+}
+
+/// Number of entries in the color-cube segment of [`PALETTE`]:
+/// indices `0..216` are a 6×6×6 RGB cube (channel levels 0, 51, …,
+/// 255; index = 36·r' + 6·g' + b').
+const CUBE_ENTRIES: u32 = 216;
+/// Number of entries in the gray-ramp segment: indices `216..256`
+/// are a 40-step ramp, gray = (i − 216) · 255 / 39. Newton's four
+/// 2 bpp gray levels (0, 85, 170, 255) land exactly on ramp steps
+/// 0, 13, 26, 39.
+const GRAY_ENTRIES: u32 = 40;
+
+/// The palette programmed into every 8 bpp guest surface. Entry
+/// layout matches `mailbox::fb_set_palette`: RGBA as
+/// `u32::from_le_bytes([r, g, b, a])`, alpha fixed at 0xFF (the HVS
+/// honours palette alpha; anything less dims the scan-out).
+pub const PALETTE: [u32; 256] = build_palette();
+
+const fn build_palette() -> [u32; 256] {
+    let mut p = [0u32; 256];
+    let mut i = 0u32;
+    while i < CUBE_ENTRIES {
+        let r = (i / 36) * 51;
+        let g = ((i / 6) % 6) * 51;
+        let b = (i % 6) * 51;
+        p[i as usize] = u32::from_le_bytes([r as u8, g as u8, b as u8, 0xFF]);
+        i += 1;
+    }
+    while i < 256 {
+        let g = ((i - CUBE_ENTRIES) * 255 / (GRAY_ENTRIES - 1)) as u8;
+        p[i as usize] = u32::from_le_bytes([g, g, g, 0xFF]);
+        i += 1;
+    }
+    p
+}
+
+/// Palette index of the gray-ramp entry nearest to 8-bit gray `g8`.
+/// Exact for Newton's four gray levels (see [`GRAY_ENTRIES`]).
+pub const fn gray_ramp_index(g8: u32) -> u8 {
+    (CUBE_ENTRIES + (g8 * (GRAY_ENTRIES - 1) + 127) / 255) as u8
+}
+
+/// Palette index nearest to an XRGB color (byte 0 = R, byte 1 = G,
+/// byte 2 = B — the same packing the 32 bpp writers use). Considers
+/// both palette segments and picks the smaller squared-distance
+/// candidate, so near-grays resolve to the finer gray ramp.
+pub fn quantize_rgb(color: u32) -> u8 {
+    let [r, g, b, _] = color.to_le_bytes();
+    let (r, g, b) = (r as i32, g as i32, b as i32);
+
+    // Cube candidate: round each channel to the nearest 51-multiple.
+    let (rq, gq, bq) = ((r + 25) / 51, (g + 25) / 51, (b + 25) / 51);
+    let cube_idx = (36 * rq + 6 * gq + bq) as u8;
+    let (cr, cg, cb) = (rq * 51, gq * 51, bq * 51);
+    let cube_d = (r - cr).pow(2) + (g - cg).pow(2) + (b - cb).pow(2);
+
+    // Gray candidate from the mean luma.
+    let luma = ((r + g + b) / 3) as u32;
+    let gray_idx = gray_ramp_index(luma);
+    let gv = ((gray_idx as u32 - CUBE_ENTRIES) * 255 / (GRAY_ENTRIES - 1)) as i32;
+    let gray_d = (r - gv).pow(2) + (g - gv).pow(2) + (b - gv).pow(2);
+
+    if gray_d <= cube_d { gray_idx } else { cube_idx }
 }
 
 /// Which scan-out surface [`alloc_guest_surface`] ended up with.
@@ -95,7 +171,7 @@ pub fn guest_surface_kind() -> SurfaceKind {
 pub fn alloc_native() -> Result<FbInfo, FbError> {
     let (panel_w, panel_h) = mailbox::fb_get_physical_size()?;
     let (w, h) = native_size_or_default(panel_w, panel_h);
-    alloc_with_reset(w, h)
+    alloc_with_reset(w, h, 32)
 }
 
 fn native_size_or_default(panel_w: u32, panel_h: u32) -> (u32, u32) {
@@ -118,16 +194,45 @@ fn native_size_or_default(panel_w: u32, panel_h: u32) -> (u32, u32) {
 /// a fresh modeset that comes out clean. Cheap (two extra mailbox
 /// round-trips); no-op on platforms where the firmware modeset is
 /// already good.
-fn alloc_with_reset(w: u32, h: u32) -> Result<FbInfo, FbError> {
+fn alloc_with_reset(w: u32, h: u32, depth: u32) -> Result<FbInfo, FbError> {
     // First pass: forces the firmware's initial modeset. We
     // immediately discard the result — the FB it backs is the one
     // that exhibits the white-bar / flicker symptoms.
-    let _ = alloc(w, h)?;
+    let _ = alloc(w, h, depth)?;
     if let Err(e) = mailbox::fb_release() {
         kprintln!("display: fb_release after first alloc failed: {:?}", e);
     }
     // Second pass: the fresh modeset. Use the returned FbInfo.
-    alloc(w, h)
+    alloc(w, h, depth)
+}
+
+/// Allocate a **guest** scan-out surface at `(w, h)`: 8 bpp with
+/// [`PALETTE`] programmed, falling back loudly to 32 bpp when the
+/// firmware refuses the depth or the palette write fails. Callers
+/// (the paint paths, the splash) dispatch on the returned
+/// [`FbInfo::bpp`].
+fn alloc_guest_at(w: u32, h: u32) -> Result<FbInfo, FbError> {
+    match alloc_with_reset(w, h, 8) {
+        Ok(info) if info.bpp == 8 => match mailbox::fb_set_palette(0, &PALETTE) {
+            Ok(()) => return Ok(info),
+            Err(e) => kprintln!(
+                "display: SET_PALETTE failed ({:?}); falling back to 32 bpp",
+                e
+            ),
+        },
+        Ok(info) => kprintln!(
+            "display: firmware refused 8 bpp (returned {} bpp); falling back to 32 bpp",
+            info.bpp
+        ),
+        Err(e) => kprintln!(
+            "display: 8 bpp allocation failed ({:?}); falling back to 32 bpp",
+            e
+        ),
+    }
+    if let Err(e) = mailbox::fb_release() {
+        kprintln!("display: fb_release after refused 8 bpp failed: {:?}", e);
+    }
+    alloc_with_reset(w, h, 32)
 }
 
 /// Best-effort HDMI pixel-clock readback (Hz; 0 = unreadable). Same
@@ -216,7 +321,7 @@ pub fn alloc_guest_surface(
     if cfg!(feature = "pi-fb-force-cpu-scale") {
         kprintln!("display: pi-fb-force-cpu-scale set; using panel-native surface");
         let (w, h) = native_size_or_default(rep_w, rep_h);
-        return alloc_with_reset(w, h);
+        return alloc_guest_at(w, h);
     }
 
     // The VC-geometry formulas below want the *landscape* mode. A
@@ -237,7 +342,7 @@ pub fn alloc_guest_surface(
                 rep_w, rep_h
             );
             let (w, h) = native_size_or_default(rep_w, rep_h);
-            return alloc_with_reset(w, h);
+            return alloc_guest_at(w, h);
         }
     } else {
         (rep_w, rep_h)
@@ -254,7 +359,7 @@ pub fn alloc_guest_surface(
             panel_w, panel_h, content_w, content_h
         );
         let (w, h) = native_size_or_default(rep_w, rep_h);
-        return alloc_with_reset(w, h);
+        return alloc_guest_at(w, h);
     }
 
     let (fb_w, fb_h) = if rot90 {
@@ -276,11 +381,11 @@ pub fn alloc_guest_surface(
             "display: VC-scaled geometry {}x{} out of range for panel {}x{}; using panel-native",
             fb_w, fb_h, panel_w, panel_h
         );
-        return alloc_with_reset(rep_w, rep_h);
+        return alloc_guest_at(rep_w, rep_h);
     }
 
     let pc_before = pixel_clock_hz();
-    let attempt = alloc_with_reset(fb_w, fb_h);
+    let attempt = alloc_guest_at(fb_w, fb_h);
     match attempt {
         Ok(info) => {
             let pc_after = pixel_clock_hz();
@@ -293,7 +398,7 @@ pub fn alloc_guest_surface(
                 if let Err(e) = mailbox::fb_release() {
                     kprintln!("display: fb_release after refused surface failed: {:?}", e);
                 }
-                return alloc_with_reset(rep_w, rep_h);
+                return alloc_guest_at(rep_w, rep_h);
             }
             VC_SCALED_SURFACE.store(true, Ordering::Relaxed);
             kprintln!(
@@ -311,7 +416,7 @@ pub fn alloc_guest_surface(
             if let Err(e) = mailbox::fb_release() {
                 kprintln!("display: fb_release after failed surface alloc failed: {:?}", e);
             }
-            alloc_with_reset(rep_w, rep_h)
+            alloc_guest_at(rep_w, rep_h)
         }
     }
 }
@@ -329,8 +434,9 @@ fn vc_surface_surprise(
     if info.width != req_w || info.height != req_h {
         return Some("returned geometry differs from request");
     }
-    if info.pitch < req_w * 4 || info.pitch > req_w * 4 + 4096 {
-        return Some("returned pitch not sane for 32 bpp");
+    let bytes_pp = info.bpp / 8;
+    if info.pitch < req_w * bytes_pp || info.pitch > req_w * bytes_pp + 4096 {
+        return Some("returned pitch not sane for the depth");
     }
     if (info.size as u64) < info.pitch as u64 * req_h as u64 {
         return Some("returned size smaller than pitch*height");
@@ -344,7 +450,8 @@ fn vc_surface_surprise(
     None
 }
 
-/// Allocate a framebuffer at the given dimensions, 32 bpp RGB.
+/// Allocate a framebuffer at the given dimensions and depth (bits
+/// per pixel — 8 paletted or 32 XRGB), RGB pixel order.
 ///
 /// All setup tags + the allocation go through `fb_setup_and_allocate`
 /// in a single mailbox message. Splitting them across messages
@@ -352,9 +459,12 @@ fn vc_surface_surprise(
 /// and the second message doesn't inherit the first's geometry, so
 /// allocation lands at firmware defaults (typically size=512,
 /// pitch=32 — a useless degenerate framebuffer).
-pub fn alloc(w: u32, h: u32) -> Result<FbInfo, FbError> {
-    // 32 bpp, RGB pixel order (1), 4 KiB alignment.
-    let a = mailbox::fb_setup_and_allocate(w, h, 32, 1, 4096)?;
+///
+/// The returned [`FbInfo::bpp`] is the firmware's answer, which may
+/// differ from `depth` — callers that care must check it.
+pub fn alloc(w: u32, h: u32, depth: u32) -> Result<FbInfo, FbError> {
+    // RGB pixel order (1), 4 KiB alignment.
+    let a = mailbox::fb_setup_and_allocate(w, h, depth, 1, 4096)?;
     if a.bus_addr == 0 || a.size == 0 {
         return Err(FbError::EmptyAllocation);
     }
@@ -374,29 +484,47 @@ pub fn alloc(w: u32, h: u32) -> Result<FbInfo, FbError> {
     })
 }
 
-/// Fill the entire framebuffer with a single 32-bit pixel value.
-/// Packing: byte 0 = R, byte 1 = G, byte 2 = B, byte 3 = X
-/// (firmware was asked for RGB pixel order). `0x00FF_0000` is red.
-///
-/// Walks one u32 per pixel via raw volatile writes — no cache
-/// maintenance per-write; one `dc_civac_range` over the full FB at
-/// the end ensures the VC's next refresh sees our bytes.
-pub fn fill_solid(fb: &FbInfo, pixel: u32) {
-    // SAFETY: framebuffer PA is identity-mapped Normal-WB by
-    // mmu::init for the 0..1 GiB DRAM block; the firmware allocated
-    // [pa, pa+size) for our use, no other code touches it.
-    let ptr = fb.pa as *mut u32;
-    let pixels_per_row = (fb.pitch / 4) as usize;
-    for y in 0..fb.height as usize {
-        for x in 0..fb.width as usize {
-            // SAFETY: in-bounds by construction; ptr is aligned to
-            // u32 (pitch is bytes-per-row, always multiple of 4 for
-            // a 32 bpp surface).
+/// Fill rows `y0..y_end` with a single XRGB color (byte 0 = R,
+/// byte 1 = G, byte 2 = B, byte 3 = X). On an 8 bpp surface the
+/// color is quantized to [`PALETTE`] once and written as bytes; on
+/// 32 bpp the u32 is written verbatim. No cache maintenance —
+/// callers flush the rows they touched.
+fn fill_rows(fb: &FbInfo, y0: u32, y_end: u32, pixel: u32) {
+    let y0 = y0.min(fb.height) as usize;
+    let y_end = y_end.min(fb.height) as usize;
+    if fb.bpp == 8 {
+        let idx = quantize_rgb(pixel);
+        let ptr = fb.pa as *mut u8;
+        for y in y0..y_end {
+            // SAFETY: framebuffer PA is identity-mapped Normal-WB by
+            // mmu::init for the 0..1 GiB DRAM block; the firmware
+            // allocated [pa, pa+size) for our use; rows/columns are
+            // clamped to fb bounds.
             unsafe {
-                ptr.add(y * pixels_per_row + x).write_volatile(pixel);
+                core::ptr::write_bytes(ptr.add(y * fb.pitch as usize), idx, fb.width as usize);
+            }
+        }
+    } else {
+        let ptr = fb.pa as *mut u32;
+        let pixels_per_row = (fb.pitch / 4) as usize;
+        for y in y0..y_end {
+            for x in 0..fb.width as usize {
+                // SAFETY: as above; ptr is u32-aligned (pitch is a
+                // multiple of 4 for a 32 bpp surface).
+                unsafe {
+                    ptr.add(y * pixels_per_row + x).write_volatile(pixel);
+                }
             }
         }
     }
+}
+
+/// Fill the entire framebuffer with a single XRGB color (quantized
+/// to the palette on an 8 bpp surface — see [`fill_rows`]). One
+/// `dc_civac_range` over the full FB at the end ensures the VC's
+/// next refresh sees our bytes.
+pub fn fill_solid(fb: &FbInfo, pixel: u32) {
+    fill_rows(fb, 0, fb.height, pixel);
     crate::arch::cpu::dc_civac_range(fb.pa, fb.size as usize);
 }
 
@@ -404,20 +532,9 @@ pub fn fill_solid(fb: &FbInfo, pixel: u32) {
 /// value. Used as an overlay-vs-paint diagnostic: paint a known
 /// distinctive colour, see whether the disputed bar covers it.
 pub fn fill_top_rows(fb: &FbInfo, n: u32, pixel: u32) {
-    let ptr = fb.pa as *mut u32;
-    let pixels_per_row = (fb.pitch / 4) as usize;
-    let rows = n.min(fb.height) as usize;
-    for y in 0..rows {
-        for x in 0..fb.width as usize {
-            // SAFETY: in-bounds by construction (rows ≤ fb.height,
-            // x < fb.width, ptr at fb.pa is fb.size bytes valid).
-            unsafe {
-                ptr.add(y * pixels_per_row + x).write_volatile(pixel);
-            }
-        }
-    }
-    let row_bytes = pixels_per_row * 4;
-    crate::arch::cpu::dc_civac_range(fb.pa, rows * row_bytes);
+    let rows = n.min(fb.height);
+    fill_rows(fb, 0, rows, pixel);
+    crate::arch::cpu::dc_civac_range(fb.pa, rows as usize * fb.pitch as usize);
 }
 
 /// Fill with a horizontal gradient — left = `left`, right = `right`.
@@ -435,8 +552,6 @@ pub fn fill_top_rows(fb: &FbInfo, n: u32, pixel: u32) {
 /// of stack we'd otherwise consume (boot stack is 16 KiB total).
 /// Total fill at 1280×720 is well under 50 ms either way.
 pub fn fill_h_gradient(fb: &FbInfo, left: u32, right: u32) {
-    let ptr = fb.pa as *mut u32;
-    let pixels_per_row = (fb.pitch / 4) as usize;
     let w = fb.width as usize;
     let l = left.to_le_bytes();
     let r = right.to_le_bytes();
@@ -447,7 +562,6 @@ pub fn fill_h_gradient(fb: &FbInfo, left: u32, right: u32) {
     };
 
     for y in 0..fb.height as usize {
-        let row_base = y * pixels_per_row;
         for x in 0..w {
             let t_num = x as u32;
             let px = u32::from_le_bytes([
@@ -456,9 +570,20 @@ pub fn fill_h_gradient(fb: &FbInfo, left: u32, right: u32) {
                 mix(l[2], r[2], t_num),
                 mix(l[3], r[3], t_num),
             ]);
-            // SAFETY: see fill_solid.
-            unsafe {
-                ptr.add(row_base + x).write_volatile(px);
+            if fb.bpp == 8 {
+                // SAFETY: see fill_rows.
+                unsafe {
+                    (fb.pa as *mut u8)
+                        .add(y * fb.pitch as usize + x)
+                        .write_volatile(quantize_rgb(px));
+                }
+            } else {
+                // SAFETY: see fill_rows.
+                unsafe {
+                    (fb.pa as *mut u32)
+                        .add(y * (fb.pitch / 4) as usize + x)
+                        .write_volatile(px);
+                }
             }
         }
     }

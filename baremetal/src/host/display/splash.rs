@@ -23,8 +23,9 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use crate::host::display::fb::{self, FbInfo};
 use crate::kprintln;
 
-/// Soft sky blue. Byte order matches `pi_fb`'s PALETTE: byte 0 = R,
-/// byte 1 = G, byte 2 = B, byte 3 = pad (RGB pixel-order from VC).
+/// Soft sky blue, as XRGB: byte 0 = R, byte 1 = G, byte 2 = B,
+/// byte 3 = pad. Written verbatim on a 32 bpp surface; quantized to
+/// `fb::PALETTE` on the 8 bpp one (`fill_rect`).
 const BG: u32 = u32::from_le_bytes([0xA0, 0xC8, 0xE8, 0x00]);
 const BAR_BG: u32 = u32::from_le_bytes([0x00, 0x00, 0x00, 0x00]);
 const BAR_FG: u32 = u32::from_le_bytes([0xFF, 0xFF, 0xFF, 0x00]);
@@ -280,10 +281,11 @@ fn paint_empty_bar(fb: &FbInfo) -> (u32, u32, u32) {
     (bx, by, bw)
 }
 
-/// Fill an axis-aligned rectangle with `color`. Clips to FB bounds.
-/// No cache maintenance — caller flushes.
+/// Fill an axis-aligned rectangle with an XRGB `color`. Clips to FB
+/// bounds. On an 8 bpp surface the color is quantized to the shared
+/// palette once and written as index bytes. No cache maintenance —
+/// caller flushes.
 fn fill_rect(fb: &FbInfo, x: u32, y: u32, w: u32, h: u32, color: u32) {
-    let pixels_per_row = (fb.pitch / 4) as usize;
     let x_end = (x + w).min(fb.width) as usize;
     let y_end = (y + h).min(fb.height) as usize;
     let x = x as usize;
@@ -291,14 +293,30 @@ fn fill_rect(fb: &FbInfo, x: u32, y: u32, w: u32, h: u32, color: u32) {
     if x >= x_end || y >= y_end {
         return;
     }
-    let ptr = fb.pa as *mut u32;
-    for py in y..y_end {
-        let row_base = py * pixels_per_row;
-        for px in x..x_end {
-            // SAFETY: x_end ≤ fb.width and y_end ≤ fb.height by the
-            // clamps above; ptr at fb.pa is fb.size bytes valid.
+    if fb.bpp == 8 {
+        let idx = fb::quantize_rgb(color);
+        let ptr = fb.pa as *mut u8;
+        for py in y..y_end {
+            // SAFETY: x_end ≤ fb.width ≤ pitch and y_end ≤ fb.height
+            // by the clamps above; ptr at fb.pa is fb.size bytes valid.
             unsafe {
-                ptr.add(row_base + px).write_volatile(color);
+                core::ptr::write_bytes(
+                    ptr.add(py * fb.pitch as usize + x),
+                    idx,
+                    x_end - x,
+                );
+            }
+        }
+    } else {
+        let pixels_per_row = (fb.pitch / 4) as usize;
+        let ptr = fb.pa as *mut u32;
+        for py in y..y_end {
+            let row_base = py * pixels_per_row;
+            for px in x..x_end {
+                // SAFETY: as above.
+                unsafe {
+                    ptr.add(row_base + px).write_volatile(color);
+                }
             }
         }
     }
@@ -306,24 +324,33 @@ fn fill_rect(fb: &FbInfo, x: u32, y: u32, w: u32, h: u32, color: u32) {
 
 /// Blit the raw RGB logo blob onto the FB at `(x0, y0)`. Source layout:
 /// row-major, LOGO_W*3 bytes per row, byte 0 = R, byte 1 = G, byte 2 = B.
+/// On an 8 bpp surface each pixel is quantized to the shared palette.
 fn blit_logo(fb: &FbInfo, x0: u32, y0: u32) {
-    let pixels_per_row = (fb.pitch / 4) as usize;
-    let ptr = fb.pa as *mut u32;
     let row_bytes = LOGO_W as usize * 3;
     let x_end = (x0 + LOGO_W).min(fb.width) as usize;
     let y_end = (y0 + LOGO_H).min(fb.height) as usize;
     for py in y0 as usize..y_end {
         let src_row = (py - y0 as usize) * row_bytes;
-        let dst_row = py * pixels_per_row;
         for px in x0 as usize..x_end {
             let src_off = src_row + (px - x0 as usize) * 3;
             let r = LOGO_BYTES[src_off];
             let g = LOGO_BYTES[src_off + 1];
             let b = LOGO_BYTES[src_off + 2];
             let color = u32::from_le_bytes([r, g, b, 0]);
-            // SAFETY: x_end / y_end clamped to fb bounds above.
-            unsafe {
-                ptr.add(dst_row + px).write_volatile(color);
+            if fb.bpp == 8 {
+                // SAFETY: x_end / y_end clamped to fb bounds above.
+                unsafe {
+                    (fb.pa as *mut u8)
+                        .add(py * fb.pitch as usize + px)
+                        .write_volatile(fb::quantize_rgb(color));
+                }
+            } else {
+                // SAFETY: as above.
+                unsafe {
+                    (fb.pa as *mut u32)
+                        .add(py * (fb.pitch / 4) as usize + px)
+                        .write_volatile(color);
+                }
             }
         }
     }

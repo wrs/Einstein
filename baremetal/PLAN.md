@@ -219,16 +219,19 @@ build combinations in `scripts/check-matrix.sh` pass.
     clock there. Needs a discriminator better than a threshold
     (e.g. compare against the mode geometry the firmware reports).
 
-12. **Patch out the store's ROM-identity check.** NewtonOS erases the
-    internal store at boot ("a different ROM has been installed")
-    whenever its ROM identity input changes — and under the
-    hypervisor that input shifts with every build whose in-ROM patch
-    population differs (inline stubs, trampolines, RomPatches), so
-    routine deploys wipe the store and force setup + package
-    reinstall. The ROM is never actually corrupted here; find the
-    check via the alert string / its xrefs in rom.dis and feed it a
-    stable hypervisor-owned version number instead (bump it only
-    when a wipe is genuinely wanted).
+12. **Store ROM-identity check — done.** NewtonOS erases the internal
+    store at boot ("a different ROM has been installed") when the
+    ROM/REx checksums stored in the flash's reserved block differ
+    from freshly computed ones, and the computation reads the
+    patched ROM, so every build with a different in-ROM patch
+    population wiped the store. The check is `TReservedBlockAccessor::
+    CheckIfRecoveryIsNeeded` comparing `TROMREXCheckSums`
+    (`docs/STRUCTURES.md` "Reserved-block calibration parameters");
+    `rom_patches::apply_rom_rex_checksums_patch` now replaces
+    `CalculateROMREXCheckSums(TROMREXCheckSums&)` with stores of the
+    constant `rom_patches::STORE_ROM_IDENTITY`. The first boot after
+    this change wipes once (stored sums → constant); bump the
+    constant only when a wipe is genuinely wanted.
 
 Real-hardware specifics (cores 1–3 left parked, snapshot ring deferred
 on hardware, thermal re-verification) are tracked in

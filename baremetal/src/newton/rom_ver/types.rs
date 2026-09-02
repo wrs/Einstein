@@ -180,6 +180,16 @@ pub struct InjectionSite {
     pub resume_pc: u32,
 }
 
+/// `OSCalibrationParameters::CalculateROMREXCheckSums(TROMREXCheckSums&)`
+/// body-replacement site (`docs/STRUCTURES.md` "Reserved-block
+/// calibration parameters"): the entry PC and the 13 words the
+/// replacement overwrites, all verified at install time.
+#[derive(Copy, Clone)]
+pub struct RomRexChecksumsSite {
+    pub entry: u32,
+    pub origs: [u32; 13],
+}
+
 /// A kernel `LDR` that reads an instruction word *as data* (fault
 /// handlers decoding the faulting insn). Under the load-time BE-8
 /// byteswap of code-marked words the read returns byteswapped bytes;

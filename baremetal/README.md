@@ -346,7 +346,7 @@ unspecified.
 | `platform-fvp-base`    | no      | FVP `FVP_Base_RevC-2xAEMvA` host. GICv3 brought up through an EL3 stub.              |
 | `rom-{717006,710031}`  | 717006  | Guest-ROM version: selects the `src/newton/rom_ver/` constants module + build inputs. Exactly one required. |
 | `host-io-{null,semihost,pi-fb}` | null | Display + pen seam: no-op, semihost viewer IPC, or real VC4 framebuffer.      |
-| `flash-persist-{null,semihost,sd}` | semihost | Flash persistence: volatile, `$HOME/.newton/flash.bin` via semihosting, or FAT32 SD card. |
+| `flash-persist-{null,semihost,sd}` | semihost | Flash persistence: volatile, `$HOME/.newton/flash.bin` via semihosting, or FAT32 SD card. The store's boot-time ROM-identity check is fed a hypervisor constant (`rom_patches::STORE_ROM_IDENTITY`) instead of a checksum over the patched ROM, so a build with a different in-ROM patch set no longer erases the store; bump the constant when a wipe is wanted. |
 | `input-{null,mtouch}`  | null    | Pen-input seam: no-op or TSTP MTouch USB touchscreen (real hw).                      |
 | `audio-{null,pi-hdmi}` | null    | Sound seam: null (no output, but arms timer-paced DMA-completion IRQs) or VC4 HDMI MAI audio (real hw). |
 | `no-semihost`          | no      | No semihosting host is listening: no `HLT #0xF000` calls anywhere. Negative because Cargo features only add; `build.rs` inverts it to `cfg(nh_semihost)` for source to read. |

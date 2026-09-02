@@ -2168,3 +2168,57 @@ Decoded call chain (citations: `Fault` `0x1AEEDC`, `DecompressAndMap`
   slot[i] << 12, paddr)` when the page is empty, else `Remember` with
   reduced perms.
 
+
+## Reserved-block calibration parameters — the store's ROM identity
+
+The internal flash's *reserved block* (`TReservedBlockAccessor`,
+ROM `0x001A73EC`.., accessed through `TNewInternalFlash::
+AllocateReservedBlockRange`) holds an `OSCalibrationParameters`
+record, 0x10C bytes, in block 0 (flash offset 0) with a copy in
+block 1 (`TFlashRange+0x3C` bytes in). `CheckIfRecoveryIsNeeded`
+(`0x001A7FC8`) is the boot-time check: it builds a fresh record with
+`SetDefaultValues` (`0x001A7D78`), reads block 0, and compares the
+stored ROM/REx checksums with the freshly computed ones; a mismatch
+runs `TNewInternalFlash::InternalClobber` and returns `-10084`, the
+"internal store was erased because a different ROM has been
+installed" alert (error-string table at ROM `0x0063D0AC`).
+
+```text
+OSCalibrationParameters (0x10C bytes)
+  +0x00  'DLDS' magic                (0x444C4453)
+  +0x04  'OSCD' magic                (0x4F534344)
+  +0x08  record size = 0x10C
+  +0x0C  0
+  +0x10..+0x1C  0
+  +0x24  0x3916
+  +0x34  0x465A
+  +0x3C  0x8000
+  +0x44, +0x48  0xE00
+  +0x4C  size, +0x50 magic (copies of +0x08 / +0x00)
+  +0x54  TReservedBlockAccessor::Checksum over the first 0x54 bytes
+  +0x58  store-state word: -2 default, -4 = MarkStoreAsValid,
+         -16 / -8 / -1 recovery states (CheckIfRecoveryIsNeeded)
+  +0x5C  system-patch offset      (ValidatePatchCheckSum)
+  +0x60  system-patch checksum    (ChecksumFlash(offset, 0x10C))
+  +0x64  TROMREXCheckSums (40 bytes, below)
+  +0x8C..+0x10B  0xFFFFFFFF fill
+  +0x94  'hjcr' written by UpdateBlock0FromBlock1
+
+TROMREXCheckSums = TOSCheckSum[5]   // ROM, then REx ids 0..3
+TOSCheckSum
+  +0x00  sum of the high 16-bit halves of every word
+  +0x04  sum of the low 16-bit halves of every word
+                                     // unused REx slots hold 0xFFFFFFFF
+```
+
+`OSCalibrationParameters::CalculateROMREXCheckSums(TROMREXCheckSums&)`
+(`0x001A7840`) fills the struct: the ROM sum runs over
+`[0, ROM$$Size = 0x71FC4C)` and each REx sum over the REx registered
+in `gGlobalsThatLiveAcrossReboot+0x2E8+4i` (size at REx+0x18), all
+read through a temporary `kPCMCIA1Base` (0x4000_0000) section window
+onto physical ROM (`CalculateROMREXCheckSums(ULong, ULong,
+TOSCheckSum&)`, `0x001A71B8`). Under the hypervisor those bytes
+include every load-time ROM patch, so the "identity" moved with each
+build's patch population; `rom_patches::apply_rom_rex_checksums_patch`
+replaces the function body with ten stores of
+`rom_patches::STORE_ROM_IDENTITY` (see PLAN item 12).

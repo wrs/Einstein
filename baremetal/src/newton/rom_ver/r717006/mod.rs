@@ -154,6 +154,21 @@ pub const PACKAGE_PAGER: Option<PackagePagerSite> = Some(PackagePagerSite {
     compander_read: 0x0038_73BC,
 });
 
+/// `OSCalibrationParameters::CalculateROMREXCheckSums(TROMREXCheckSums&)`
+/// at 0x001A_7840 — the store's ROM-identity input, body replaced
+/// with constant stores (`rom_patches::apply_rom_rex_checksums_patch`).
+/// Its one caller is `SetDefaultValues` (`bl` at 0x001A_7E30). `origs`
+/// are the 13 displaced words (prologue, the ROM-sum call, the REx
+/// loop head), verified at install.
+pub const ROM_REX_CHECKSUMS: Option<RomRexChecksumsSite> = Some(RomRexChecksumsSite {
+    entry: 0x001A_7840,
+    origs: [
+        0xE1A0_C00D, 0xE92D_D8F0, 0xE24C_B004, 0xE1A0_4000, 0xE1A0_2000,
+        0xE59F_1050, 0xE3A0_0000, 0xEB62_FEC9, 0xE3A0_5000, 0xE3E0_7000,
+        0xE59F_6040, 0xE086_0105, 0xE590_12E8,
+    ],
+});
+
 /// The kernel's four `LDR` sites that read a (byteswapped-at-load)
 /// instruction word as data — each redirected to a 3-word
 /// LDR + REV + branch-back stub. See `types::InsnAsDataLdr`.

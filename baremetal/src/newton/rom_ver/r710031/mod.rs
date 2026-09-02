@@ -64,6 +64,7 @@ pub const REAL_CLOCK_SECONDS: Option<RealClockSite> = None;
 pub const FTIME_IN_SECONDS: Option<InjectionSite> = None;
 pub const FDATE_FROM_SECONDS: Option<InjectionSite> = None;
 pub const PACKAGE_PAGER: Option<PackagePagerSite> = None;
+pub const ROM_REX_CHECKSUMS: Option<RomRexChecksumsSite> = None;
 pub const INSN_AS_DATA_LDRS: &[InsnAsDataLdr] = &[];
 pub const FPE_LDRS: Option<FpeLdrSites> = None;
 pub const STORE_PROBES: Option<StoreProbeSites> = None;

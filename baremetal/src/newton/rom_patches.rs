@@ -298,6 +298,7 @@ pub unsafe fn apply_rom_patches(rom_ptr: *mut u32) {
         apply_ftime_in_seconds_patch(rom_ptr);
         apply_fdate_from_seconds_patch(rom_ptr);
         apply_package_pager_patch(rom_ptr);
+        apply_rom_rex_checksums_patch(rom_ptr);
         // Loud-halt canaries are dev-only tripwires: on real hardware a
         // user reset or idle/sleep entry would halt the hypervisor.
         // build.rs emits `nh_loud_halt_canaries` for semihost/dev
@@ -331,7 +332,7 @@ pub unsafe fn apply_rom_patches(rom_ptr: *mut u32) {
     const CANARIES: &str = " + loud-halt canaries";
     #[cfg(not(nh_loud_halt_canaries))]
     const CANARIES: &str = "";
-    kprintln!("rom_patch: applied {} simple patches + 5 native-call/injection ROM patches{} + BootOS + load-bearing HVC patches + fault-handler LDR byteswap stubs", applied, CANARIES);
+    kprintln!("rom_patch: applied {} simple patches + 6 native-call/injection/body ROM patches{} + BootOS + load-bearing HVC patches + fault-handler LDR byteswap stubs", applied, CANARIES);
 }
 
 /// Install the load-bearing HVC patches: the Remember-post-SWI
@@ -964,6 +965,67 @@ unsafe fn apply_real_clock_seconds_patch(rom_ptr: *mut u32) {
             literal,
         );
     }
+}
+
+/// The value every slot of the store's `TROMREXCheckSums` is filled
+/// with instead of a checksum over the (patched) ROM and REx — the
+/// internal store's ROM identity under this hypervisor. Stable across
+/// builds by construction; bump it only to force a one-time store
+/// wipe (`CheckIfRecoveryIsNeeded` erases the store when the value
+/// it finds in the flash's reserved block differs). `'NH'` + version.
+pub const STORE_ROM_IDENTITY: u32 = 0x4E48_0001;
+
+/// Replace the body of
+/// `OSCalibrationParameters::CalculateROMREXCheckSums(TROMREXCheckSums&)`
+/// (`rom_ver::ROM_REX_CHECKSUMS`) so the store's boot-time ROM-identity
+/// check compares a constant instead of a checksum over ROM+REx bytes
+/// that include every load-time patch — otherwise each build with a
+/// different patch population (inline stubs, trampolines, this table)
+/// "installs a different ROM" and NewtonOS erases the internal store
+/// (`docs/STRUCTURES.md` "Reserved-block calibration parameters").
+///
+/// The original sums 0x71FC4C bytes of ROM plus each REx through a
+/// temporary 0x4000_0000 section window; the replacement writes
+/// [`STORE_ROM_IDENTITY`] into all five `{hi, lo}` sum pairs
+/// (r0 = &TROMREXCheckSums, 40 bytes):
+///
+///   movw r1, #lo16(STORE_ROM_IDENTITY)
+///   movt r1, #hi16(STORE_ROM_IDENTITY)
+///   str  r1, [r0, #0] … str r1, [r0, #36]
+///   mov  pc, lr
+///
+/// 13 words over the 29-word body; no literal pool, so no data-word
+/// byte-order special case. Encodings assembler-verified.
+unsafe fn apply_rom_rex_checksums_patch(rom_ptr: *mut u32) {
+    let Some(site) = rom_ver::ROM_REX_CHECKSUMS else {
+        return;
+    };
+    // MOVW/MOVT Rd=r1: imm4 in [19:16], imm12 in [11:0].
+    let mov16 = |op: u32, imm: u32| op | ((imm >> 12) & 0xF) << 16 | (1 << 12) | (imm & 0xFFF);
+    let mut words = [0u32; 13];
+    words[0] = mov16(0xE300_0000, STORE_ROM_IDENTITY & 0xFFFF); // movw r1, #lo
+    words[1] = mov16(0xE340_0000, STORE_ROM_IDENTITY >> 16); // movt r1, #hi
+    for i in 0..10 {
+        words[2 + i] = 0xE580_1000 | (i as u32 * 4); // str r1, [r0, #4i]
+    }
+    words[12] = 0xE1A0_F00E; // mov pc, lr
+    unsafe {
+        for (i, (&w, &orig)) in words.iter().zip(site.origs.iter()).enumerate() {
+            install_patch(
+                rom_ptr,
+                site.entry + (i as u32) * 4,
+                WordKind::Code,
+                Some(orig),
+                &[w],
+                /*optional=*/ false,
+                "CalculateROMREXCheckSums body",
+            );
+        }
+    }
+    kprintln!(
+        "rom_patch: {:#010x}: CalculateROMREXCheckSums body -> constant store identity {:#010x} (13 words)",
+        site.entry, STORE_ROM_IDENTITY,
+    );
 }
 
 /// FTimeInSeconds injection patch: replace the last shift before the

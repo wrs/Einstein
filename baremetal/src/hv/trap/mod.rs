@@ -65,6 +65,12 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
         EC_DATA_ABORT_LOWER => handle_data_abort(ctx, iss),
         EC_INSN_ABORT_LOWER => handle_instruction_abort(ctx, iss),
         EC_HVC_A32 => handle_hvc(ctx, iss),
+        // A trapped conditional A32 instruction whose condition failed
+        // is a NOP to the guest; emulating it executes something the
+        // guest never did. Skip it (see `aarch32_condition_passes`).
+        EC_TRAPPED_CP15 | EC_FP_SIMD if !aarch32_condition_passes(iss) => {
+            skip_failed_conditional(ec, iss);
+        }
         EC_TRAPPED_CP15 => handle_cp15_trap(ctx, iss),
         EC_FP_SIMD => handle_fp_simd(ctx, iss),
         EC_UNKNOWN => handle_unknown(iss),
@@ -96,6 +102,73 @@ pub extern "C" fn trap_sync_lower_aarch32(ctx: &mut TrapContext) {
     // call per sync trap into the diag surface; stubbed to nothing
     // without the `diag` feature.
     crate::diag::trap_diag::sync_trap_beacon();
+}
+
+/// Whether the trapped AArch32 instruction passed its condition code.
+///
+/// ESR_EL2.ISS for a trapped A32 instruction carries CV (bit 24) and
+/// COND (bits 23:20) precisely because an implementation may take the
+/// trap *before* evaluating the condition (ARM DDI 0487, ESR_EL2 —
+/// "a conditional A32 instruction that is known to pass its condition
+/// code check can be presented either with COND set to 0b1110 or with
+/// the COND value held in the instruction"; only some implementations
+/// trap failing instructions at all). QEMU is one of the
+/// evaluate-first implementations, so every trap it delivers passed;
+/// the Cortex-A53 is not — it trapped FIQCleanUp's `mcrne p15, DACR`
+/// with Z set, the hypervisor emulated the write with r0 = 0, every
+/// domain went no-access and the guest spun at the PABT vector.
+/// The NZCV the instruction was evaluated against is the guest's,
+/// i.e. SPSR_EL2[31:28].
+fn aarch32_condition_passes(iss: u32) -> bool {
+    if iss & (1 << 24) == 0 {
+        return true;
+    }
+    let spsr = read_sysreg!("spsr_el2");
+    let n = spsr & (1 << 31) != 0;
+    let z = spsr & (1 << 30) != 0;
+    let c = spsr & (1 << 29) != 0;
+    let v = spsr & (1 << 28) != 0;
+    match (iss >> 20) & 0xF {
+        0x0 => z,
+        0x1 => !z,
+        0x2 => c,
+        0x3 => !c,
+        0x4 => n,
+        0x5 => !n,
+        0x6 => v,
+        0x7 => !v,
+        0x8 => c && !z,
+        0x9 => !c || z,
+        0xA => n == v,
+        0xB => n != v,
+        0xC => !z && n == v,
+        0xD => z || n != v,
+        _ => true, // 0b1110 always; 0b1111 is unconditional in A32
+    }
+}
+
+/// Step the guest past a trapped instruction whose condition failed.
+/// A32 only: the Newton ROM never runs T32, and a T32 skip would also
+/// have to advance ITSTATE, so a Thumb interruptee halts loudly rather
+/// than being stepped by the wrong width.
+fn skip_failed_conditional(ec: u32, iss: u32) {
+    let spsr = read_sysreg!("spsr_el2");
+    if spsr & (1 << 5) != 0 {
+        kprintln!(
+            "*** failed-condition trap EC={:#x} ISS={:#x} from T32 at ELR={:#x} — no T32 skip path",
+            ec, iss, read_sysreg!("elr_el2")
+        );
+        cpu::halt();
+    }
+    static COND_SKIPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let n = COND_SKIPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if n < 8 {
+        crate::dprintln!(
+            "trap: skipped failed-condition A32 insn EC={:#x} COND={:#x} at ELR={:#x} (#{})",
+            ec, (iss >> 20) & 0xF, read_sysreg!("elr_el2"), n + 1
+        );
+    }
+    crate::arch::trap_context::advance_elr(4);
 }
 
 /// Asynchronous IRQ taken at EL2. Dispatched by interruptee: an IRQ
@@ -191,6 +264,9 @@ fn irq_from_el2(cap: crate::arch::slim_isr::IrqCap) {
     // 16+N. UART-TX owns ch 5, MAI-TX owns ch 4. Platform-owned; a
     // no-op on FVP and on QEMU raspi3b (no BCM2835 DMA engine there).
     platform::dispatch_dma_completions(cap);
+    // PL011 RX for the guest-serial multiplexer (`serial-mux` on real
+    // hardware); same platform-owned pending-register decode.
+    platform::dispatch_uart_rx(cap);
 
     // CNTHP is level-triggered; not rearming it would storm. Calling
     // it when the real source was a DMA channel is harmless — it is
@@ -223,6 +299,9 @@ fn irq_from_guest(ctx: &mut TrapContext, cap: crate::arch::slim_isr::IrqCap) {
     // ARM_IRQ_DMA0 = 16). UART-TX owns ch 5, MAI-TX owns ch 4.
     // Platform-owned; a no-op off real hardware.
     platform::dispatch_dma_completions(cap);
+    // PL011 RX for the guest-serial multiplexer (`serial-mux` on real
+    // hardware); same platform-owned pending-register decode.
+    platform::dispatch_uart_rx(cap);
 
     // Advance the background flash-DMA save's CMD12 `WaitBusy` poll. The
     // completion IRQ above only *issues* CMD12 and returns; the card's

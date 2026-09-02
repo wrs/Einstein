@@ -239,7 +239,27 @@ pub(crate) fn handle_cp15_trap(ctx: &mut TrapContext, iss: u32) {
             // reseed) is guest-OS ritual — see the hook impl.
             crate::hv::hooks::ActiveGuest::on_stage1_ttbr0_write(raw);
         }
-        (0, 3, 0, 0, false) => cp15::write_dacr32(ctx.x[rt]),
+        (0, 3, 0, 0, false) => {
+            let value = ctx.x[rt] as u32;
+            // DACR=0 makes every domain "no access": the very next
+            // instruction fetch domain-faults, the PABT vector fetch
+            // faults too, and the guest spins at PC=0xc in ABT mode
+            // with I+F set — unrecoverable, and invisible from EL2
+            // (no stage-2 fault). Halt here with the writer's context
+            // instead; the kernel keeps a DACR shadow at
+            // gParamBlockFromImage+0xb0 that every writer stores first.
+            if value == 0 {
+                kprintln!(
+                    "*** trap: guest wrote DACR=0 from r{} at ELR={:#x} SPSR={:#x} ***",
+                    rt,
+                    read_sysreg!("elr_el2"),
+                    read_sysreg!("spsr_el2"),
+                );
+                crate::diag::trap_diag::dump_dacr_zero_context(ctx);
+                cpu::halt();
+            }
+            cp15::write_dacr32(ctx.x[rt])
+        }
         (0, 5, 0, 0, false) => {
             // Guest writes to DFSR — pass through to hardware so
             // subsequent guest reads see the intended value.

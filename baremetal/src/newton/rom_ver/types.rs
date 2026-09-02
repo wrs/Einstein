@@ -241,6 +241,11 @@ pub struct KernelGlobals {
     pub interpreter_ptr: u32,
     /// `gStackManagerHeap` literal; TStackManager* is at `+4`.
     pub stack_mgr_heap_literal: u32,
+    /// The kernel's DACR shadow word (`gParamBlockFromImage + 0xb0`):
+    /// every exception entry/exit path stores the value it is about to
+    /// write to DACR here first, and FIQ/IRQ exit from a non-user
+    /// interruptee restores DACR from it.
+    pub dacr_shadow: u32,
 }
 
 /// Notification entry probes: `Notify(RefVar const&)`,

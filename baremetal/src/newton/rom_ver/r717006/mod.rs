@@ -245,6 +245,10 @@ pub const KERNEL_GLOBALS: Option<KernelGlobals> = Some(KernelGlobals {
     object_heap_ptr:        0x0C10_5548,
     interpreter_ptr:        0x0C10_5458,
     stack_mgr_heap_literal: 0x0C10_4C08,
+    // `gParamBlockFromImage` (0x0C00_8400) + 0xb0 — the `str r0,
+    // [r1, #176]` before every `mcr p15, DACR` (SWIBoot, FIQHandler /
+    // FIQCleanUp, IRQCleanUp, DataAbortHandler, PrefetchAbortHandler).
+    dacr_shadow:            0x0C00_84B0,
 });
 
 /// UND-history caller-LR heuristics for the SWP wedge signature

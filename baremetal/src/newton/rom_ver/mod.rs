@@ -79,7 +79,7 @@ const _: () = {
                  kg.hold_schedule, kg.current_globals, kg.object_table,
                  kg.object_table_a_ptr, kg.object_table_b_ptr,
                  kg.object_heap_ptr, kg.interpreter_ptr,
-                 kg.stack_mgr_heap_literal);
+                 kg.stack_mgr_heap_literal, kg.dacr_shadow);
     }
 };
 

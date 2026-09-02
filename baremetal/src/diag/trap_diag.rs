@@ -30,6 +30,28 @@ pub fn sync_trap_beacon() {
     crate::diag::tarmac::maybe_emit_start(n);
 }
 
+/// Context for the `DACR=0` trip-wire in `hv::trap::cp15`: the guest
+/// register file, the banked LRs, and the kernel's DACR shadow word
+/// plus `gCurrentTask` (via `rom_ver::KERNEL_GLOBALS`) — the shadow is
+/// where every DACR writer in the kernel stores its value first, so a
+/// zero that is *not* in the shadow was never the guest's intent (the
+/// first such halt on the Pi was FIQCleanUp's `mcrne` trapped with a
+/// failed condition — see `hv::trap::aarch32_condition_passes`).
+pub fn dump_dacr_zero_context(ctx: &TrapContext) {
+    let kg = crate::newton::rom_ver::KERNEL_GLOBALS;
+    let shadow = kg.and_then(|kg| crate::hv::guest_endian::guest_read_u32_va(kg.dacr_shadow));
+    let cur_task = kg.and_then(|kg| crate::hv::guest_endian::guest_read_u32_va(kg.current_task));
+    kprintln!("    DACR shadow = {:x?}  gCurrentTask = {:x?}", shadow, cur_task);
+    for i in 0..15 {
+        kprintln!("    r{:<2} = {:#010x}", i, ctx.x[i] as u32);
+    }
+    // Banked LRs per ARM ARM Table D1-79.
+    kprintln!(
+        "    LR_svc={:#010x} LR_abt={:#010x} LR_irq={:#010x} LR_fiq={:#010x} LR_und={:#010x}",
+        ctx.x[18] as u32, ctx.x[20] as u32, ctx.x[16] as u32, ctx.x[30] as u32, ctx.x[22] as u32,
+    );
+}
+
 /// Diagnostic heartbeat for the guest-path IRQ flow: sample guest PC
 /// so we can see where it's executing when no MMIO traps are firing.
 ///
@@ -74,6 +96,38 @@ pub fn irq_heartbeat(ctx: &TrapContext, intid: u32) {
             "timer_irq[{}]: ELR={:#x} SPSR={:#x} SP_svc={:#x} LR_svc={:#x} FAR_EL1={:#x} intid={} VI={} ipres={:#x} ictrl={:#x} pend={}",
             tag, elr, spsr, sp_svc, lr_svc, far, intid, vi, int_present, int_ctrl, irq_pend
         );
+        // Prefetch-abort loop probe: a guest parked at the PABT vector
+        // in ABT mode is re-faulting on the vector fetch itself
+        // (IFAR = 0xc, FAR_EL1[63:32] for an AArch32 guest). Dump the
+        // translation state that decides whether VA 0 is fetchable —
+        // once as a healthy baseline (first late sample), once when
+        // the loop is detected — so the two can be diffed.
+        static mut TRANSLATION_DUMPS: u8 = 0;
+        let looping = elr == 0xc && (spsr & 0x1f) == 0x17;
+        // SAFETY: single-threaded.
+        let want = unsafe {
+            if (TRANSLATION_DUMPS == 0 && tag == "late") || (TRANSLATION_DUMPS == 1 && looping) {
+                TRANSLATION_DUMPS += 1;
+                true
+            } else {
+                false
+            }
+        };
+        if want {
+            let ifsr = read_sysreg!("ifsr32_el2");
+            let dfsr = read_sysreg!("esr_el1");
+            let sctlr = read_sysreg!("sctlr_el1");
+            let ttbr0 = read_sysreg!("ttbr0_el1");
+            let ttbr1 = read_sysreg!("ttbr1_el1");
+            let tcr = read_sysreg!("tcr_el1");
+            let dacr = read_sysreg!("dacr32_el2");
+            crate::log_irqs!(
+                "translation[{}]: IFSR={:#x} DFSR={:#x} SCTLR={:#x} TTBR0={:#x} TTBR1={:#x} TTBCR={:#x} DACR={:#x} HCR={:#x}",
+                if looping { "pabt-loop" } else { "baseline" },
+                ifsr, dfsr, sctlr, ttbr0, ttbr1, tcr, dacr, hcr
+            );
+            crate::hv::guest_mem::dump_stage1_walk(0xc);
+        }
     }
 }
 
@@ -649,12 +703,16 @@ pub(crate) fn handle_diag(ctx: &mut TrapContext) {
         "  ESR_EL2   = {:#010x}  EC={:#x} ISS={:#x}",
         esr, (esr >> 26) & 0x3F, esr & 0x1FFFFFF
     );
-    // ESR_EL1 holds the EL1 fault syndrome the CPU wrote when the
-    // guest took its own DABT. For AArch32 DABT, EC=0x24 with
-    // ISS[5:0] = DFSC (fault class).
+    // ESR_EL1 is the AArch32 DFSR the CPU wrote when the guest took
+    // its own DABT — short-descriptor format: FS[3:0] = bits[3:0],
+    // FS[4] = bit 10, Domain = bits[7:4] (UNKNOWN for faults without
+    // a domain; the Cortex-A53 fills in the L1 descriptor's bits).
     kprintln!(
-        "  ESR_EL1   = {:#010x}  EC={:#x} ISS={:#x}  DFSC={:#x}",
-        esr_el1, (esr_el1 >> 26) & 0x3F, esr_el1 & 0x1FFFFFF, esr_el1 & 0x3F
+        "  ESR_EL1   = {:#010x}  (DFSR: FS={:#x} domain={} WnR={})",
+        esr_el1,
+        (esr_el1 & 0xF) | ((esr_el1 >> 6) & 0x10),
+        (esr_el1 >> 4) & 0xF,
+        (esr_el1 >> 11) & 1,
     );
     kprintln!(
         "  SCTLR_EL1 = {:#010x}  (M={}, C={}, I={}, V={})",

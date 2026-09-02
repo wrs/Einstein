@@ -300,6 +300,7 @@ pub mod trap_diag {
 
     #[inline(always)]
     pub fn sync_trap_beacon() {}
+    pub fn dump_dacr_zero_context(_ctx: &crate::arch::trap_context::TrapContext) {}
 
     /// Stub: no IRQ-heartbeat PC sampling without `diag`.
     #[inline(always)]

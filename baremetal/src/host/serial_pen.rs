@@ -11,7 +11,10 @@
 //! `host::console::read_byte_nonblock` as the guest external-serial RX
 //! seam, and wires [`pump_and_host_io_input`] as the trap-tail host-io
 //! input pump. Every host-console RX byte funnels through one escape
-//! state machine:
+//! state machine (with the `serial-mux` feature, every *unframed*
+//! byte — the multiplexer hands framed guest traffic straight to the
+//! guest and this parser only sees the control channel, see
+//! `host::serial_mux`):
 //!
 //!   * `~p<x>,<y>\n` — tap at Newton screen coords (x, y) held for
 //!     [`DEFAULT_HOLD_MS`].
@@ -145,12 +148,19 @@ fn with_state<R, F: FnOnce(&mut State) -> R>(f: F) -> R {
 /// first, then pulls fresh wire bytes through the escape state
 /// machine. Installed by `main.rs` when `serial-pen-inject` is on.
 pub fn read_byte_nonblock() -> Option<u8> {
+    // Under the multiplexer the guest's own bytes arrive framed and
+    // bypass the parser entirely; the parser only sees the unframed
+    // control channel.
+    #[cfg(nh_serial_mux)]
+    if let Some(b) = crate::host::serial_mux::rx_guest() {
+        return Some(b);
+    }
     with_state(|s| {
         loop {
             if let Some(b) = s.pass_pop() {
                 return Some(b);
             }
-            let b = crate::host::console::read_byte_nonblock()?;
+            let b = wire_rx()?;
             feed(s, b);
             // feed() may have consumed the byte (escape traffic) or
             // parked it in the pass ring; loop to pick up either
@@ -185,7 +195,7 @@ pub fn pump() {
         // Bounded drain so the trap tail stays cheap even against a
         // babbling wire.
         for _ in 0..256 {
-            let Some(b) = crate::host::console::read_byte_nonblock() else {
+            let Some(b) = wire_rx() else {
                 break;
             };
             feed(s, b);
@@ -193,10 +203,26 @@ pub fn pump() {
     });
 }
 
+/// The parser's byte source: the raw console wire, or — under the
+/// serial multiplexer — its unframed control channel (framed guest
+/// traffic never passes through the escape parser, so a `~` inside
+/// an MNP frame cannot be mistaken for a command).
+fn wire_rx() -> Option<u8> {
+    #[cfg(nh_serial_mux)]
+    {
+        crate::host::serial_mux::rx_unframed()
+    }
+    #[cfg(not(nh_serial_mux))]
+    {
+        crate::host::console::read_byte_nonblock()
+    }
+}
+
 /// Trap-tail composite installed as `HostPumpOps::host_io_pump_input`
 /// when the feature is on: injector pump first (so a freshly enqueued
 /// pen sample's `INT_TABLET` reaches `update_virq` on this same trap
 /// exit), then the regular host-io input pump.
+#[cfg(not(nh_serial_mux))]
 pub fn pump_and_host_io_input() {
     pump();
     crate::host::host_io::pump_input();

@@ -50,6 +50,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(nh_semihost)");
     println!("cargo:rustc-check-cfg=cfg(nh_snapshot)");
     println!("cargo:rustc-check-cfg=cfg(nh_real_hw)");
+    println!("cargo:rustc-check-cfg=cfg(nh_serial_mux)");
     println!("cargo:rustc-check-cfg=cfg(nh_diag)");
 
     resolve_loud_halt_canaries();
@@ -522,6 +523,27 @@ fn resolve_real_hw() {
     }
 }
 
+/// Emit `cfg(nh_serial_mux)` when the `serial-mux` feature is on and
+/// the guest serial wire is the PL011 — every host-io backend except
+/// `semihost`, which carries the guest serial over its own file pair
+/// and has no console wire to share. Requested on a semihost-io build
+/// the feature warns and stays out, so `main.rs` keeps one wiring
+/// story per backend.
+fn resolve_serial_mux(host_io: &str) {
+    if env::var("CARGO_FEATURE_SERIAL_MUX").is_err() {
+        return;
+    }
+    if host_io == "semihost" {
+        println!(
+            "cargo:warning=nh-baremetal: `serial-mux` has no effect with \
+             `host-io-semihost` (the guest serial wire is the serial-{{out,in}} \
+             file pair there, not the PL011)"
+        );
+        return;
+    }
+    println!("cargo:rustc-cfg=nh_serial_mux");
+}
+
 /// Pick the active host-io backend and emit a `cfg(nh_host_io_*)`.
 ///
 /// Cargo features are additive — `default = [..., "host-io-null"]`
@@ -547,6 +569,7 @@ fn resolve_host_io_backend() {
         ),
     };
     println!("cargo:rustc-cfg=nh_host_io_{chosen}");
+    resolve_serial_mux(chosen);
 }
 
 /// Pick the active flash-persist backend and emit a

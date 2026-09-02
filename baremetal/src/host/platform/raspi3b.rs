@@ -181,6 +181,42 @@ pub fn dispatch_dma_completions(_cap: crate::arch::slim_isr::IrqCap) {
 #[inline]
 pub fn dispatch_dma_completions(_cap: crate::arch::slim_isr::IrqCap) {}
 
+/// BCM2835 GPU IRQ source of the PL011 (`uart_int`; Circle's
+/// `ARM_IRQ_UART` = 32 + 25). Lives in IRQ_PEND_2 bit 25.
+#[cfg(all(nh_real_hw, nh_serial_mux))]
+pub const IRQ_UART: u32 = 57;
+
+/// True if the PL011 IRQ line is pending at the BCM2835 controller
+/// (only ever set once `serial_mux::init` has enabled the source).
+#[cfg(all(nh_real_hw, nh_serial_mux))]
+#[inline]
+fn uart_irq_pending() -> bool {
+    bcm2835_irq_pending_2() & (1u32 << (IRQ_UART - 32)) != 0
+}
+
+#[cfg(all(nh_real_hw, not(nh_serial_mux)))]
+#[inline]
+fn uart_irq_pending() -> bool {
+    false
+}
+
+/// Service a pending PL011 RX / receive-timeout interrupt by handing
+/// it to the serial multiplexer's FIFO drain. Called from both the
+/// slim same-EL ISR and the guest-path IRQ body, next to the DMA
+/// dispatch; a no-op unless the mux is built and running on real
+/// hardware.
+#[cfg(all(nh_real_hw, nh_serial_mux))]
+#[inline]
+pub fn dispatch_uart_rx(cap: crate::arch::slim_isr::IrqCap) {
+    if uart_irq_pending() {
+        crate::host::serial_mux::on_rx_irq(cap);
+    }
+}
+
+#[cfg(not(all(nh_real_hw, nh_serial_mux)))]
+#[inline]
+pub fn dispatch_uart_rx(_cap: crate::arch::slim_isr::IrqCap) {}
+
 /// Advance the flash backend's background DMA save across a timer tick.
 /// Called from the guest-path IRQ body right after the completion
 /// dispatch above, which only *issues* the save's CMD12; the card's
@@ -215,7 +251,7 @@ pub fn poll_usb_fast_path() -> super::UsbFastPath {
         & ((1 << (16 + host_dma::UART_TX_CHANNEL))
             | (1 << (16 + host_dma::MAI_TX_CHANNEL))
             | (1 << (16 + host_dma::SD_TX_CHANNEL)));
-    if other_bcm == 0 && !cnthp_irq_pending() {
+    if other_bcm == 0 && !uart_irq_pending() && !cnthp_irq_pending() {
         super::UsbFastPath::UsbOnly { enqueued }
     } else {
         super::UsbFastPath::UsbCoPending

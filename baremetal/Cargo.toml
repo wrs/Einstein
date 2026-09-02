@@ -327,6 +327,25 @@ trace_once = ["trace"]
 #     --features "pi-bare-metal-input serial-pen-inject"
 serial-pen-inject = []
 
+# Share the host console PL011 between the kernel log and the guest's
+# external serial port (`extr`): guest bytes travel in length-prefixed
+# frames (`FF 01 <len> <payload>`, both directions), the log stays
+# plain text, and unframed host→Pi bytes are the control channel
+# (the `serial-pen-inject` escapes ride there). The Pi Zero 2 W has
+# no second UART on its header — both on-chip UARTs multiplex onto
+# GPIO 14/15 — so this is how a Dock / NTK session reaches the guest
+# over the one USB-TTL cable that also carries the log; on real
+# hardware the PL011 RX interrupt feeds the mux so bursts survive the
+# 16 ms heartbeat. `scripts/pi-upload.py --extr-pty` is the host-side
+# demultiplexer (and `--ctl-fifo` the control-channel injector).
+# Only meaningful where the guest serial wire is the PL011, i.e. not
+# with `host-io-semihost` (build.rs warns and leaves the mux out);
+# build.rs emits `cfg(nh_serial_mux)`. Off by default and in every
+# aggregate while it is being proven on the bench:
+#   cargo build --release --no-default-features \
+#     --features "pi-bare-metal-input pi-fb-rot90 serial-mux serial-pen-inject"
+serial-mux = []
+
 # Force the Pi framebuffer backend onto the panel-native surface +
 # CPU bilinear scaler, skipping the VC-scaled small-surface attempt
 # entirely (`display::fb::alloc_guest_surface`). The VC-scaled path

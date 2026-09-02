@@ -19,6 +19,19 @@ for the protocol this mirrors.
     scripts/pi-upload.py --make-image OUT (--kernel ELF | --payload BIN)
         Wrap a hypervisor image in the container (for build-sd.sh /
         first-time card setup).
+
+With a `serial-mux` hypervisor build the console wire also carries
+the guest's external serial port in `FF 01 <len> <payload>` frames
+(src/host/serial_mux.rs). Capture always strips those frames out of
+the log; `--extr-pty [PATH]` exposes them as a pty for desktop tools
+(`unixnpi -d PATH pkg.pkg`, NCX in serial mode) and frames the tool's
+bytes back up the wire, and `--ctl-fifo [PATH]` forwards whatever is
+written to a named pipe as unframed control-channel bytes — the
+`~p<x>,<y>` pen taps of a `serial-pen-inject` build:
+
+    scripts/pi-upload.py --no-upload --no-power-cycle --extr-pty --ctl-fifo &
+    unixnpi -d /tmp/newton-host-io/extr.pty tools/test-packages/tinst.pkg
+    printf '~p160,240\\n' > /tmp/newton-host-io/pi-ctl
 """
 
 from __future__ import annotations
@@ -32,6 +45,7 @@ import struct
 import subprocess
 import sys
 import time
+import tty
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +53,10 @@ from pathlib import Path
 WORKDIR = Path("/tmp/newton-claude/nhboot")
 DEFAULT_PORT = "/dev/cu.usbserial-BG03U2PN"
 DEFAULT_LOG = Path("/tmp/newton-claude/serial.log")
+# Same directory the QEMU/FVP `serial-pty-bridge.py` uses, so tool
+# invocations are identical across hosts.
+DEFAULT_EXTR_PTY = Path("/tmp/newton-host-io/extr.pty")
+DEFAULT_CTL_FIFO = Path("/tmp/newton-host-io/pi-ctl")
 CONSOLE_BAUD = 115_200
 DEFAULT_XFER_BAUD = 1_500_000
 WRITE_TIMEOUT = 30.0
@@ -288,6 +306,133 @@ class Console:
         self.pending += data
         *lines, self.pending = self.pending.split(b"\n")
         return [ln.decode("utf-8", "replace").rstrip("\r") for ln in lines]
+
+
+# ------------------------------------------------------------ serial mux
+
+MUX_SOF = 0xFF
+MUX_CH_EXTR = 0x01
+MUX_MAX_PAYLOAD = 255
+
+
+class Mux:
+    """The hypervisor's `serial-mux` wire format (src/host/serial_mux.rs):
+    kernel-log text interleaved with `FF <ch> <len> <payload>` frames,
+    channel 1 being the guest's external serial port. Downstream, bytes
+    outside a frame are log text. Upstream the same framing carries
+    guest-bound bytes; unframed bytes are the control channel."""
+
+    def __init__(self) -> None:
+        self.state = "sof"
+        self.ch = 0
+        self.left = 0
+        self.payload = bytearray()
+
+    def feed(self, data: bytes) -> tuple[bytes, list[tuple[int, bytes]]]:
+        """Split `data` into (log_text_bytes, [(channel, payload), ...])."""
+        log = bytearray()
+        frames: list[tuple[int, bytes]] = []
+        for b in data:
+            if self.state == "sof":
+                if b == MUX_SOF:
+                    self.state = "ch"
+                else:
+                    log.append(b)
+            elif self.state == "ch":
+                self.ch = b
+                self.state = "len"
+            elif self.state == "len":
+                if b == 0:
+                    self.state = "sof"
+                else:
+                    self.left = b
+                    self.payload = bytearray()
+                    self.state = "payload"
+            else:
+                self.payload.append(b)
+                self.left -= 1
+                if self.left == 0:
+                    frames.append((self.ch, bytes(self.payload)))
+                    self.state = "sof"
+        return bytes(log), frames
+
+    @staticmethod
+    def encode(ch: int, payload: bytes) -> bytes:
+        out = bytearray()
+        for off in range(0, len(payload), MUX_MAX_PAYLOAD):
+            chunk = payload[off : off + MUX_MAX_PAYLOAD]
+            out += bytes((MUX_SOF, ch, len(chunk))) + chunk
+        return bytes(out)
+
+
+class ExtrPty:
+    """A pty standing in for the guest's serial port: desktop tools open
+    the slave (via the symlink), we own the master. We also keep the
+    slave open ourselves so master reads never EIO while no tool is
+    attached, and so guest→host bytes queue in the tty until one is."""
+
+    def __init__(self, link_path: Path) -> None:
+        self.master, self.slave = os.openpty()
+        # Raw mode, ECHO off: the default line discipline would bounce
+        # every guest-bound byte straight back to the guest.
+        tty.setraw(self.slave)
+        os.set_blocking(self.master, False)
+        self.link_path = link_path
+        link_path.parent.mkdir(parents=True, exist_ok=True)
+        if link_path.is_symlink() or link_path.exists():
+            link_path.unlink()
+        link_path.symlink_to(os.ttyname(self.slave))
+        print(f"extr: {link_path} -> {os.ttyname(self.slave)}", flush=True)
+
+    def write(self, data: bytes) -> None:
+        n = 0
+        deadline = time.monotonic() + 0.5
+        while n < len(data):
+            try:
+                n += os.write(self.master, data[n:])
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    print(f"extr: tool not draining; dropped {len(data) - n} B",
+                          flush=True)
+                    return
+                time.sleep(0.005)
+
+    def read(self) -> bytes:
+        try:
+            return os.read(self.master, 4096)
+        except BlockingIOError:
+            return b""
+
+    def close(self) -> None:
+        try:
+            self.link_path.unlink()
+        except OSError:
+            pass
+        os.close(self.master)
+        os.close(self.slave)
+
+
+class CtlFifo:
+    """A named pipe whose bytes go up the wire unframed (the control
+    channel). Opened read-write so it never sees EOF between writers."""
+
+    def __init__(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            os.mkfifo(path)
+        elif not path.is_fifo():
+            raise OSError(f"{path} exists and is not a FIFO")
+        self.fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        print(f"ctl: {path} (unframed control channel)", flush=True)
+
+    def read(self) -> bytes:
+        try:
+            return os.read(self.fd, 4096)
+        except BlockingIOError:
+            return b""
+
+    def close(self) -> None:
+        os.close(self.fd)
 
 
 def wait_for(link: Link, console: Console, pattern: bytes, timeout: float,
@@ -632,14 +777,41 @@ def upload(link: Link, console: Console, payload: bytes, baud: int,
 
 # -------------------------------------------------------------- capture
 
-def capture(link: Link, console: Console, until: str | None, timeout: float) -> int:
+def capture(link: Link, console: Console, until: str | None, timeout: float,
+            extr: ExtrPty | None = None, ctl: CtlFifo | None = None) -> int:
+    """Stream the console, demultiplexing guest-serial frames off the
+    log: to the pty when one is attached, otherwise dropped (noted
+    once). Pty input is framed back up the wire; FIFO input goes up
+    unframed. `until` matches log lines only."""
     pat = re.compile(until) if until else None
     deadline = time.monotonic() + timeout if timeout > 0 else None
+    mux = Mux()
+    unrouted = 0
+    # Upstream latency is bounded by this read timeout when the wire is
+    # quiet, so poll faster while a tool endpoint is attached.
+    poll = 0.02 if (extr is not None or ctl is not None) else 0.2
     while deadline is None or time.monotonic() < deadline:
-        for line in console.feed(link.read(4096, 0.2)):
+        log, frames = mux.feed(link.read(4096, poll))
+        for ch, payload in frames:
+            if ch == MUX_CH_EXTR and extr is not None:
+                extr.write(payload)
+            else:
+                unrouted += 1
+                if unrouted == 1:
+                    print(f"\npi-upload: guest serial frame on the wire (ch {ch}, "
+                          f"{len(payload)} B) with no --extr-pty; dropping", flush=True)
+        for line in console.feed(log):
             if pat is not None and pat.search(line):
                 print(f"\npi-upload: matched /{until}/", flush=True)
                 return 0
+        if extr is not None:
+            up = extr.read()
+            if up:
+                link.write(Mux.encode(MUX_CH_EXTR, up))
+        if ctl is not None:
+            raw = ctl.read()
+            if raw:
+                link.write(raw)
     print(f"\npi-upload: timeout after {timeout:.0f} s", flush=True)
     return 1
 
@@ -673,6 +845,15 @@ def main() -> int:
                      help="seconds of capture before exiting 1 (0 = forever)")
     run.add_argument("--log", type=Path, default=DEFAULT_LOG,
                      help=f"append the raw console here (default {DEFAULT_LOG})")
+    mux = p.add_argument_group("serial mux (hypervisor built with `serial-mux`)")
+    mux.add_argument("--extr-pty", type=Path, nargs="?", const=DEFAULT_EXTR_PTY,
+                     metavar="PATH",
+                     help="expose the guest's serial port as a pty symlinked at PATH "
+                          f"(default {DEFAULT_EXTR_PTY}) for unixnpi / NCX")
+    mux.add_argument("--ctl-fifo", type=Path, nargs="?", const=DEFAULT_CTL_FIFO,
+                     metavar="PATH",
+                     help="forward bytes written to the named pipe PATH up the wire "
+                          f"unframed — `~p<x>,<y>` pen taps (default {DEFAULT_CTL_FIFO})")
     p.add_argument("--allow-small-payload", action="store_true",
                    help="skip the pinned-ROM size sanity check (see check_payload_shape)")
     p.add_argument("--debug-corrupt", type=int, default=0, metavar="N", help=argparse.SUPPRESS)
@@ -699,13 +880,18 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001 — report and exit, whatever pyserial raised
         sys.exit(f"error: cannot open {args.port}: {e}\n"
                  "hint: is another serial terminal (miniterm/screen) holding it?")
+    extr = ctl = None
     try:
         if not args.no_power_cycle:
             power_cycle(link, console)
         if payload is not None:
             upload(link, console, payload, args.baud, corrupt_msg=args.debug_corrupt,
                    full=args.full)
-        return capture(link, console, args.until, args.timeout)
+        if args.extr_pty is not None:
+            extr = ExtrPty(args.extr_pty)
+        if args.ctl_fifo is not None:
+            ctl = CtlFifo(args.ctl_fifo)
+        return capture(link, console, args.until, args.timeout, extr=extr, ctl=ctl)
     except (ProtocolError, LinkError, TimeoutError, OSError) as e:
         print(f"\npi-upload: error: {e}", file=sys.stderr, flush=True)
         if os.environ.get("PI_UPLOAD_DEBUG"):
@@ -716,6 +902,11 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\npi-upload: interrupted", flush=True)
         return 130
+    finally:
+        if extr is not None:
+            extr.close()
+        if ctl is not None:
+            ctl.close()
 
 
 if __name__ == "__main__":

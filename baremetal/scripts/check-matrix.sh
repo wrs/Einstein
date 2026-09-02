@@ -66,6 +66,12 @@ combos=(
     "pi-fb-rot90::cargo check --release --no-default-features --features \"pi-bare-metal-input serial-pen-inject pi-fb-rot90\""
     # Hires geometry experiment (default off): the rotated bench shape.
     "pi-fb-hires::cargo check --release --no-default-features --features \"pi-bare-metal-input pi-fb-rot90 pi-fb-hires\""
+    # Guest-serial multiplexer: real-hw (PL011 RX irq producer) with
+    # and without the pen injector riding its control channel, and
+    # the semihost-console QEMU shape (trap-tail poll producer).
+    "serial-mux::cargo check --release --no-default-features --features \"pi-bare-metal-input pi-fb-rot90 serial-mux serial-pen-inject\""
+    "serial-mux-nopen::cargo check --release --no-default-features --features \"pi-bare-metal-input serial-mux\""
+    "serial-mux-qemu::cargo check --release --features serial-mux"
     "trace,quiet::cargo check --release --features \"trace quiet\""
     "trace_once::cargo check --release --features \"trace_once quiet\""
     "host-io-semihost::cargo check --release --features host-io-semihost"

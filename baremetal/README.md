@@ -248,6 +248,24 @@ For NTK, run Matthias Melcher's BasiliskII build with
 topology as Einstein's TCP serial driver; see
 messagepad.org/Newton_Script_NTK.html for the NTK-side walkthrough).
 
+**Real Pi.** The Zero 2 W has one UART on its header (both on-chip
+UARTs multiplex onto GPIO 14/15) and it carries the kernel log. A
+`serial-mux` build shares it: guest serial bytes travel in
+`FF 01 <len> <payload>` frames in both directions, the log stays
+plain text, and `scripts/pi-upload.py` demultiplexes — a pty for the
+desktop tool, a named pipe for unframed control bytes such as the
+`serial-pen-inject` taps (`src/host/serial_mux.rs`;
+`docs/REAL_HW_BRINGUP.md` "Guest serial over the console wire"):
+
+```
+cargo build --release --no-default-features \
+    --features "pi-bare-metal-input pi-fb-rot90 serial-mux serial-pen-inject"
+scripts/pi-upload.py --kernel target/aarch64-unknown-none-softfloat/release/newton-hypervisor \
+    --extr-pty --ctl-fifo           # boot, then keep the port open: pty + control fifo
+unixnpi -d /tmp/newton-host-io/extr.pty MyApp.pkg          # another terminal
+printf '~p160,240\n' > /tmp/newton-host-io/pi-ctl          # pen tap via the control channel
+```
+
 `scripts/host-io-tool.py` drives the guest UI headlessly against the
 same IPC files (`screen` renders the blit stream to a PNG; `tap` /
 `drag` / `power` inject pen and power events) — useful for scripted
@@ -341,6 +359,7 @@ unspecified.
 | `ns_trace`             | no      | Open the kernel's TInterpreter trace gates (NS-level DoSend/DoCall logging).         |
 | `sd-probe`, `fb-probe` | no      | Standalone real-hw bring-up probes (boot, test one peripheral, halt).                |
 | `serial-pen-inject`    | no      | Debug pen injector: `~p<x>,<y>` lines on the host console inject taps (real hw; not in any aggregate — see `docs/REAL_HW_BRINGUP.md`). |
+| `serial-mux`           | no      | Share the console PL011 with the guest's external serial port: guest bytes ride in `FF 01 <len> <payload>` frames, the log stays plain text, `scripts/pi-upload.py --extr-pty` demultiplexes (real hw; see "External serial port"). |
 | `pi-fb-force-cpu-scale`| no      | Skip the VC-scaled surface; force the panel-native CPU-bilinear path (hardware A/B). |
 | `pi-fb-rot90`          | no      | Assert firmware 90° CW scan-out rotation (`display_hdmi_rotate=1` + full `start.elf`/`gpu_mem=64` pairing); transposed VC surface + rotated touch map. Hardware-verified; see `docs/REAL_HW_BRINGUP.md` "Portrait rotation". |
 | `pi-fb-hires`          | no      | Experiment (deferred): derive Newton's screen size from the panel (half the scan-out shape, exact ×2 HVS scale — 540×960 rotated). The OS reflows fully; three ROM native-size quirks documented in `docs/REAL_HW_BRINGUP.md` "Hires Newton geometry". |

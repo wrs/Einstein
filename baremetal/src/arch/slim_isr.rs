@@ -19,6 +19,11 @@
 //!     (`flash_persist::on_sd_dma_done`).
 //!   - the GIC CPU interface, via `platform::irq_ack` / `irq_eoi`
 //!     (idempotent hardware acknowledge).
+//!   - the PL011 RX FIFO and the *producer* side of the serial
+//!     multiplexer's raw RX ring, via `serial_mux::on_rx_irq`, reached
+//!     through [`platform::dispatch_uart_rx`] (`serial-mux` on real
+//!     hardware). The ring is SPSC: its consumer (the trap-tail
+//!     decoder) never runs inside an unmasked window.
 //!   - `kprintln`'s own uart ring (it masks IRQs around its critical
 //!     section, so it is re-entrant-safe from here).
 //!

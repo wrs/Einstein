@@ -235,9 +235,19 @@ on the host-io backend (`main.rs` boot wiring):
   used: its RX side starves under this hypervisor's load (see
   `docs/QEMU_BUGS.md` "PL011 chardev RX starvation").
 - **everything else** — the host PL011 (`host::console::write_byte` /
-  `read_byte_nonblock`), i.e. the physical UART on real hardware.
-  This is PLAN.md item 3: on the Pi the same PL011 also carries the
-  kernel log.
+  `read_byte_nonblock`), i.e. the physical UART on real hardware,
+  where the same PL011 also carries the kernel log. With the
+  `serial-mux` feature (`cfg(nh_serial_mux)`) the two share the wire
+  by framing: the seam endpoints become `host::serial_mux::{tx,
+  rx_guest}`, guest bytes travel as `FF 01 <len> <payload>` frames
+  in both directions (emitted through the console's own DMA TX ring
+  as one all-or-nothing enqueue, so a frame never splits a log
+  line), unframed host→Pi bytes are the control channel the
+  `serial-pen-inject` parser reads, and on real hardware the PL011
+  RX / receive-timeout interrupt (BCM2835 source 57) fills the mux's
+  raw ring so a burst survives the 16 ms heartbeat.
+  `scripts/pi-upload.py --extr-pty / --ctl-fifo` is the host side
+  (`docs/REAL_HW_BRINGUP.md` "Guest serial over the console wire").
 
 Traffic on the wire is the Newton's own MNP-framed Dock protocol —
 the transport moves bytes; MNP/Dock live in the ROM and in the

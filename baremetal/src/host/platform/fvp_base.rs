@@ -89,6 +89,12 @@ pub fn irq_spurious() -> u32 {
 #[inline]
 pub fn dispatch_dma_completions(_cap: crate::arch::slim_isr::IrqCap) {}
 
+/// PL011 RX interrupt dispatch for the serial multiplexer — only
+/// wired on real Pi hardware; the FVP mux (if built) polls from the
+/// trap tail.
+#[inline]
+pub fn dispatch_uart_rx(_cap: crate::arch::slim_isr::IrqCap) {}
+
 #[inline]
 pub fn poll_dma_save() {
     // Forwarded like raspi3b so the backend-side no-op stays reachable

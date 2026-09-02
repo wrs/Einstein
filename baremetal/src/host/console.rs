@@ -32,6 +32,10 @@ use crate::host::platform::{UART_BASE, UART_CLOCK_HZ};
 // ---- PL011 (raw wire) --------------------------------------------------
 
 const UART_DR: *mut u32 = (UART_BASE + 0x00) as *mut u32;
+/// Receive status (read) / error clear (write): FE/PE/BE/OE of the
+/// most recent character, sticky until a write to ECR.
+#[cfg(nh_serial_mux)]
+const UART_RSR_ECR: *mut u32 = (UART_BASE + 0x04) as *mut u32;
 const UART_FR: *mut u32 = (UART_BASE + 0x18) as *mut u32;
 const UART_IBRD: *mut u32 = (UART_BASE + 0x24) as *mut u32;
 const UART_FBRD: *mut u32 = (UART_BASE + 0x28) as *mut u32;
@@ -44,6 +48,12 @@ const UART_DMACR: *mut u32 = (UART_BASE + 0x48) as *mut u32;
 
 const FR_RXFE: u32 = 1 << 4; // Receive FIFO empty.
 const FR_TXFF: u32 = 1 << 5; // Transmit FIFO full.
+#[cfg(nh_serial_mux)]
+const RSR_OE: u32 = 1 << 3; // Overrun error (RX FIFO was full).
+#[cfg(all(nh_real_hw, nh_serial_mux))]
+const INT_RX: u32 = 1 << 4; // RXIM / RXIC: RX FIFO reached its trigger level.
+#[cfg(all(nh_real_hw, nh_serial_mux))]
+const INT_RT: u32 = 1 << 6; // RTIM / RTIC: RX FIFO non-empty and idle 32 bit-times.
 const LCRH_FEN: u32 = 1 << 4; // Enable TX/RX FIFOs.
 const LCRH_WLEN_8: u32 = 0b11 << 5; // 8-bit word length.
 const CR_UARTEN: u32 = 1 << 0;
@@ -132,6 +142,48 @@ pub fn read_byte_nonblock() -> Option<u8> {
             // for the host-console use case.
             Some((read_volatile(UART_DR) & 0xFF) as u8)
         }
+    }
+}
+
+/// True if the PL011 recorded an RX FIFO overrun since the last call;
+/// clears the sticky flag. Lets an RX consumer count wire bytes it
+/// never saw (PL011 TRM §3.3.2, UARTRSR/UARTECR).
+#[cfg(nh_serial_mux)]
+pub fn rx_overrun_take() -> bool {
+    // SAFETY: MMIO at a fixed, documented address. Volatile access.
+    unsafe {
+        if read_volatile(UART_RSR_ECR) & RSR_OE != 0 {
+            write_volatile(UART_RSR_ECR, 0);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Unmask the PL011 RX-trigger and receive-timeout interrupts. The RX
+/// FIFO trigger level stays at the reset default (half full, 8 of 16
+/// bytes); the receive-timeout interrupt delivers a short tail that
+/// never reaches it. Routing the PL011's IRQ line to the EL2 IRQ entry
+/// is the platform layer's job (`platform::enable_bcm2835_irq`).
+#[cfg(all(nh_real_hw, nh_serial_mux))]
+pub fn enable_rx_irq() {
+    // SAFETY: MMIO at a fixed, documented address; read-modify-write
+    // of the mask register from the single boot core.
+    unsafe {
+        write_volatile(UART_ICR, INT_RX | INT_RT);
+        let imsc = read_volatile(UART_IMSC);
+        write_volatile(UART_IMSC, imsc | INT_RX | INT_RT);
+    }
+}
+
+/// Acknowledge the RX-trigger / receive-timeout interrupt after the
+/// FIFO has been drained.
+#[cfg(all(nh_real_hw, nh_serial_mux))]
+pub fn clear_rx_irq() {
+    // SAFETY: MMIO write to the interrupt-clear register.
+    unsafe {
+        write_volatile(UART_ICR, INT_RX | INT_RT);
     }
 }
 
@@ -284,6 +336,58 @@ pub fn write_str(s: &str) {
             }
         }
     }
+}
+
+/// Byte-slice twin of [`write_str`]: same destination, same fallback
+/// order, no UTF-8 requirement. The `serial_mux` frames ride on this
+/// so they interleave with the log at frame granularity.
+#[cfg(nh_serial_mux)]
+pub fn write_bytes(s: &[u8]) {
+    #[cfg(nh_real_hw)]
+    {
+        if tx_dma::enqueue(s) {
+            return;
+        }
+        for &b in s {
+            write_byte(b);
+        }
+        return;
+    }
+    #[cfg(all(not(nh_semihost), not(nh_real_hw)))]
+    {
+        for &b in s {
+            write_byte(b);
+        }
+        return;
+    }
+    #[cfg(nh_semihost)]
+    {
+        let fh = sh::STDOUT_FH.load(Ordering::Acquire);
+        if fh >= 0 {
+            sh::write_bytes(fh, s);
+        } else {
+            for &b in s {
+                sh::writec(b);
+            }
+        }
+    }
+}
+
+/// [`write_bytes`] that either delivers every byte or none of them,
+/// returning whether it did. On the DMA ring this refuses instead of
+/// truncating when the ring lacks room (the ring's own policy is
+/// drop-newest, which would cut a frame in half); the polled and
+/// semihosting paths never drop, so there it is plain `write_bytes`.
+#[cfg(nh_serial_mux)]
+pub fn write_bytes_all_or_nothing(s: &[u8]) -> bool {
+    #[cfg(nh_real_hw)]
+    {
+        if tx_dma::is_ready() {
+            return tx_dma::enqueue_all_or_nothing(s);
+        }
+    }
+    write_bytes(s);
+    true
 }
 
 /// DMA-completion hook called from `host_dma::on_completion`
@@ -510,6 +614,44 @@ mod tx_dma {
     /// `host_dma::on_completion`. Advances `TAIL` by
     /// the just-finished length, and kicks the next contiguous
     /// segment if more bytes are queued.
+    /// Whether the ring is up (`init` succeeded), i.e. whether
+    /// `enqueue` would take the bytes rather than report "not ready".
+    #[cfg(nh_serial_mux)]
+    pub fn is_ready() -> bool {
+        READY.load(Ordering::Acquire)
+    }
+
+    /// `enqueue` that refuses (returns `false`, writes nothing) when
+    /// the ring cannot take all of `s`. For producers whose bytes only
+    /// make sense as a unit — a `serial_mux` frame, which the host
+    /// decoder would mis-sync on if truncated.
+    #[cfg(nh_serial_mux)]
+    pub fn enqueue_all_or_nothing(s: &[u8]) -> bool {
+        if !READY.load(Ordering::Acquire) {
+            return false;
+        }
+        if s.is_empty() {
+            return true;
+        }
+        let daif = mask_irqs();
+        if IN_FLIGHT_LEN.load(Ordering::Acquire) != 0
+            && host_dma::uart_tx_pending()
+        {
+            host_dma::on_completion(host_dma::UART_TX_CHANNEL);
+        }
+        let head = HEAD.load(Ordering::Relaxed) as usize;
+        let tail = TAIL.load(Ordering::Acquire) as usize;
+        let used = (head + RING_LEN - tail) % RING_LEN;
+        let free = RING_LEN - used - 1;
+        let fits = s.len() <= free;
+        if fits {
+            write_unmasked(s);
+            maybe_kick();
+        }
+        unmask_irqs(daif);
+        fits
+    }
+
     pub fn on_done() {
         let len = IN_FLIGHT_LEN.swap(0, Ordering::AcqRel);
         if len == 0 {

@@ -89,15 +89,23 @@ build combinations in `scripts/check-matrix.sh` pass.
    or remove the ring entirely (the feature gate makes deletion a
    contained change now).
 
-3. **Guest serial port on real hardware.** PL011 carries the kernel
-   log; the guest's own serial port needs a separate host-side
-   sink/source. On the emulated hosts this is done: the extr port
-   flows through the `host-io-semihost` file pair and
+3. **Guest serial port on real hardware.** On the emulated hosts the
+   extr port flows through the `host-io-semihost` file pair and
    `scripts/serial-pty-bridge.py` (README "External serial port";
-   transport verified end-to-end with UnixNPI). On the Pi the
-   remaining options are a mini-UART driver (second physical port —
-   none exists in `src/` today) or framed multiplexing on the single
-   PL011 alongside the kernel log, `serial_pen.rs`-style.
+   verified end-to-end with UnixNPI). On the Pi the `serial-mux`
+   feature shares the console PL011 with the kernel log by framing
+   the guest bytes (`src/host/serial_mux.rs`, PL011 RX interrupt
+   fed; `scripts/pi-upload.py --extr-pty / --ctl-fifo` on the host —
+   `docs/REAL_HW_BRINGUP.md` "Guest serial over the console wire").
+   Bench-verified 2026-09-01: UnixNPI installed `tdock.pkg` on the
+   Pi Zero 2 W over the shared wire, pen taps injected through the
+   control channel. Opt-in, not yet in the `pi-bare-metal-*`
+   aggregates. A second
+   *physical* port is still wanted for tools that must own a tty
+   without the log; it cannot be the mini-UART (both on-chip UARTs
+   reach the Zero 2 W header only on GPIO 14/15), so it means a USB
+   CDC-ACM/FTDI adapter on the DWC2 host stack or an SPI/I²C UART
+   bridge, installed on the same `peripherals::console` seam.
 
 4. **PCMCIA card images.** Newton flash-card images map naturally onto
    files on the SD card through the existing `flash_persist` backend;

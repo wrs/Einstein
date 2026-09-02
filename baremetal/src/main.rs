@@ -106,13 +106,23 @@ pub extern "C" fn kmain() -> ! {
         tx: host::host_io::serial_tx,
         rx: host::host_io::serial_rx,
     });
+    //
+    // With `serial-mux` (`nh_serial_mux`) the PL011 wire is shared with
+    // the kernel log: guest bytes travel framed through
+    // `host::serial_mux`, whose RX side also feeds the pen-inject
+    // parser's control channel.
     #[cfg(not(nh_host_io_semihost))]
     peripherals::console::install(peripherals::console::GuestConsoleOps {
+        #[cfg(nh_serial_mux)]
+        tx: host::serial_mux::tx,
+        #[cfg(not(nh_serial_mux))]
         tx: host::console::write_byte,
-        #[cfg(not(feature = "serial-pen-inject"))]
-        rx: host::console::read_byte_nonblock,
         #[cfg(feature = "serial-pen-inject")]
         rx: host::serial_pen::read_byte_nonblock,
+        #[cfg(all(not(feature = "serial-pen-inject"), nh_serial_mux))]
+        rx: host::serial_mux::rx_guest,
+        #[cfg(all(not(feature = "serial-pen-inject"), not(nh_serial_mux)))]
+        rx: host::console::read_byte_nonblock,
     });
     peripherals::screen::install_blit_sink(
         host::host_io::push_guest_blit,
@@ -153,9 +163,14 @@ pub extern "C" fn kmain() -> ! {
         // The injector needs a trap-tail pump of its own: the RX seam
         // above is only polled while the guest keeps serial RX DMA
         // armed, which a booted Newton doesn't guarantee.
-        #[cfg(feature = "serial-pen-inject")]
+        // The multiplexer's composite folds the injector's pump in
+        // when both are built (its RX ring is the injector's byte
+        // source there).
+        #[cfg(nh_serial_mux)]
+        host_io_pump_input: host::serial_mux::pump_and_host_io_input,
+        #[cfg(all(not(nh_serial_mux), feature = "serial-pen-inject"))]
         host_io_pump_input: host::serial_pen::pump_and_host_io_input,
-        #[cfg(not(feature = "serial-pen-inject"))]
+        #[cfg(all(not(nh_serial_mux), not(feature = "serial-pen-inject")))]
         host_io_pump_input: host::host_io::pump_input,
         input_pump: host::input::pump,
         audio_tick: host::audio::tick,
@@ -197,6 +212,10 @@ pub extern "C" fn kmain() -> ! {
     // `hv::trap::irq_from_el2` instead of cooperative polls. This is what
     // lets the 5-second SD flash load (and other long EL2 operations)
     // run without starving the HDMI audio ring.
+    // Guest-serial multiplexer RX: on real hardware this unmasks the
+    // PL011 RX interrupt, so it goes in just before IRQs open.
+    #[cfg(nh_serial_mux)]
+    host::serial_mux::init();
     arch::cpu::unmask_irqs_el2();
 
     // Seed the Newton flash filesystem header before stage-2 exposes

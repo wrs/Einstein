@@ -390,6 +390,59 @@ Taps are physical portrait-panel coordinates, so these two mean
 (`SetFeature`(orientation) = 0) — check the UI with `grab` first if
 the store's orientation pref may have changed.
 
+### Guest serial over the console wire
+
+The guest's external serial port (`extr` — Dock, NCX, NTK, package
+install) needs a host endpoint, and on the Zero 2 W there is only one
+UART to be had on the 40-pin header: PL011 (UART0) reaches GPIO 14/15
+as ALT0 and the mini-UART (UART1) reaches the same two pins as ALT5;
+their other pin options (GPIO 32/33 for both, 36/37 for PL011, 40/41
+for the mini-UART) are not brought out on this board. So a second
+physical port cannot come from the mini-UART — it would have to be a
+USB CDC-ACM / FTDI adapter on the DWC2 host stack (`src/host/usb`)
+or an SPI/I²C UART bridge — and the console PL011 is shared instead.
+
+- **`serial-mux`** (Cargo feature, `cfg(nh_serial_mux)`; not in any
+  aggregate yet): `src/host/serial_mux.rs` frames the guest bytes on
+  the same wire as the kernel log, `FF <ch> <len> <payload>` with
+  channel 1 = `extr`, in both directions. `0xFF` is not a valid
+  UTF-8 byte so the log needs no escaping; a length prefix means the
+  payload needs none. Frames go out through the console DMA ring as
+  a single all-or-nothing enqueue (a truncated frame would desync the
+  host decoder), so the log and the Dock traffic interleave at frame
+  granularity. Upstream, the PL011 RX-trigger and receive-timeout
+  interrupts (BCM2835 IRQ source 57, `platform::dispatch_uart_rx`)
+  drain the 16-byte FIFO into a 4 KiB raw ring from the EL2 IRQ
+  entry; the trap-tail decoder sorts bytes into the guest ring and
+  the control channel, and the guest ring is released to the RX DMA
+  model only once the wire has been idle for 1 ms (or holds 256 B),
+  so one host write is one RX completion — unbatched, every byte was
+  a completion FIQ plus a `dma[ch0] RX` log line, and the log alone
+  starved the shared wire. Unframed host→Pi bytes are that control
+  channel: the `serial-pen-inject` `~p` parser reads it (framed
+  guest traffic never passes through the parser), and without the
+  injector it is discarded. Every loss — raw-ring overflow, FIFO
+  overrun (PL011 RSR.OE), dropped TX frame, unknown channel,
+  discarded control byte — is counted and reported as a
+  `serial_mux: loss —` line at most every 5 s.
+- **Host side**: `scripts/pi-upload.py` always strips frames out of
+  the captured log; `--extr-pty [PATH]` exposes channel 1 as a pty
+  (default `/tmp/newton-host-io/extr.pty`, the same path the
+  QEMU/FVP bridge uses, so `unixnpi -d …` / NCX invocations are
+  identical) and frames the tool's bytes back up the wire;
+  `--ctl-fifo [PATH]` forwards anything written to a named pipe
+  (default `/tmp/newton-host-io/pi-ctl`) unframed, which is how a
+  `~p<x>,<y>` tap is injected while the upload script holds the port:
+
+  ```
+  cargo build --release --no-default-features \
+      --features "pi-bare-metal-input pi-fb-rot90 serial-mux serial-pen-inject"
+  scripts/pi-upload.py --kernel target/aarch64-unknown-none-softfloat/release/newton-hypervisor \
+      --extr-pty --ctl-fifo
+  unixnpi -d /tmp/newton-host-io/extr.pty tools/test-packages/tinst.pkg
+  printf '~p18,453\n' > /tmp/newton-host-io/pi-ctl
+  ```
+
 ### Recovery and limits
 
 - A bad upload (line noise past the CRCs, a power cut during the

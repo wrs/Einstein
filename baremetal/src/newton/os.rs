@@ -543,7 +543,15 @@ fn drop_flash_write(ctx: &mut TrapContext, iss: u32, elr: u32) -> bool {
 fn handle_dabt_dispatch(ctx: &mut TrapContext) {
     let far = read_sysreg!("far_el1");
     let esr_el1 = read_sysreg!("esr_el1");
-    let dfsc = (esr_el1 & 0x3F) as u32;
+    // ESR_EL1 is the AArch32 DFSR here, in the short-descriptor format
+    // the kernel's translation regime uses (ARM ARM G8.2.41 DFSR):
+    // FS[3:0] = bits[3:0], FS[4] = bit 10, Domain = bits[7:4]. The
+    // domain bits must not leak into the status decode: ARMv7 leaves
+    // Domain UNKNOWN for faults that have none — QEMU reports 0, the
+    // Cortex-A53 reports the L1 descriptor's domain bits — so a
+    // section translation fault in a domain-7 section reads 0x75 on
+    // real hardware and 0x05 on QEMU.
+    let dfsc = ((esr_el1 & 0xF) | ((esr_el1 >> 6) & 0x10)) as u32;
 
     if dfsc == 0x01 {
         unaligned::handle_align_fault(ctx);

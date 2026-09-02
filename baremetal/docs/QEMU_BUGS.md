@@ -238,3 +238,41 @@ Related pty pitfall (host-side, not QEMU): a bridge built on
 default line discipline ECHOes every byte written into the master
 back to the master, which bounces all Newton-bound traffic straight
 back into the guest and garbles the MNP stream.
+
+## Leniencies — real Cortex-A53 behaviour that QEMU hides
+
+Not QEMU bugs: places where QEMU picks the forgiving side of an
+IMPLEMENTATION DEFINED choice, so a hypervisor gap only shows on the
+Pi. Both were found on 2026-09-01 bringing up the Dock over the
+`serial-mux` wire — the first host→guest serial traffic ever to reach
+the guest on real hardware.
+
+### Trapped conditional A32 instructions that fail their condition
+
+ESR_EL2.ISS carries CV (bit 24) and COND (bits 23:20) for trapped
+AArch32 instructions because an implementation may take the trap
+*before* evaluating the condition (ARM DDI 0487, ESR_EL2). QEMU
+evaluates first and never traps a failing instruction; the A53 traps
+it and reports the condition. `FIQCleanUp` ends with `mcrne p15, DACR,
+r0` for a non-user interruptee; on the Pi, a FIQ that interrupted user
+mode trapped that `mcrne` with Z set, the hypervisor wrote the
+user-path r0 (0) to `DACR32_EL2`, every domain went no-access, and the
+guest spun at the PABT vector (ELR = IFAR = 0xc, ABT mode, I+F set —
+the same signature as the snapshot-resume wedge in PLAN item 2).
+`hv::trap::aarch32_condition_passes` now evaluates COND against
+SPSR_EL2.NZCV for EC 0x03 / 0x07 and skips the instruction when it
+fails; `DACR=0` writes halt loudly with the writer's context
+(`hv::trap::cp15`), since no kernel path ever intends one.
+
+### DFSR.Domain on faults that have no domain
+
+For a section translation fault (FS = 0b00101) and an alignment fault
+ARMv7 leaves DFSR.Domain UNKNOWN. QEMU reports 0; the A53 reports the
+L1 descriptor's domain bits — a fault descriptor's bits [8:5] included.
+The DABT slow path decoded the status as `ESR_EL1 & 0x3F`, which is
+the long-descriptor DFSC layout and takes two domain bits with it: the
+kernel's `IsPackageHeader` probe of 0x6000_0000 (a deliberate fault
+inside a `SetExceptionHandler` frame during package install) read
+0x75 → "0x35", was not forwardable, and hit the DIAG halt. The decode
+is now the short-descriptor one (FS[3:0] = bits [3:0], FS[4] = bit 10;
+`newton::os::handle_dabt_dispatch`).
